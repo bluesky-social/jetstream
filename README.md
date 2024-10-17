@@ -35,7 +35,7 @@ This will pull the latest built image from GHCR and start a Jetstream instance a
 
 Once started, you can connect to the event stream at: `ws://localhost:6008/subscribe`
 
-Prometheus metrics are exposed at `http://localhost:6008/metrics`
+Prometheus metrics are exposed at `http://localhost:6009/metrics`
 
 A [Grafana Dashboard](#dashboard-preview) for Jetstream is available at `./grafana-dashboard.json` and should be easy to copy/paste into Grafana's dashboard import prompt.
 
