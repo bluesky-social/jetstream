@@ -94,7 +94,7 @@ func (c *Consumer) PersistEvent(ctx context.Context, evt *models.Event, asJSON, 
 	// Key structure for events in PebbleDB
 	// {{event_time_us}}_{{repo}}_{{collection}}
 	var key []byte
-	if evt.EventType == models.EventCommit && evt.Commit != nil {
+	if evt.Kind == models.EventKindCommit && evt.Commit != nil {
 		key = []byte(fmt.Sprintf("%d_%s_%s", evt.TimeUS, evt.Did, evt.Commit.Collection))
 	} else {
 		key = []byte(fmt.Sprintf("%d_%s", evt.TimeUS, evt.Did))

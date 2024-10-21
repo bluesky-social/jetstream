@@ -31,6 +31,10 @@ func main() {
 	config.WebsocketURL = serverAddr
 	config.Compress = true
 
+	h := &handler{
+		seenSeqs: make(map[int64]struct{}),
+	}
+
 	scheduler := sequential.NewScheduler("jetstream_localdev", logger, h.HandleEvent)
 
 	c, err := client.NewClient(config, logger, scheduler)
@@ -38,7 +42,7 @@ func main() {
 		log.Fatalf("failed to create client: %v", err)
 	}
 
-	cursor := time.Now().Add(90 * -time.Minute).UnixMicro()
+	cursor := time.Now().Add(5 * -time.Minute).UnixMicro()
 
 	// Every 5 seconds print the events read and bytes read and average event size
 	go func() {

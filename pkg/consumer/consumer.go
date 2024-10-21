@@ -144,10 +144,9 @@ func (c *Consumer) HandleStreamEvent(ctx context.Context, xe *events.XRPCStreamE
 
 		// Emit identity update
 		e := models.Event{
-			Did:       xe.RepoIdentity.Did,
-			Kind:      models.EventKindIdentity,
-			EventType: models.EventIdentity,
-			Identity:  xe.RepoIdentity,
+			Did:      xe.RepoIdentity.Did,
+			Kind:     models.EventKindIdentity,
+			Identity: xe.RepoIdentity,
 		}
 		// Send to the sequencer
 		c.buf <- &e
@@ -168,10 +167,9 @@ func (c *Consumer) HandleStreamEvent(ctx context.Context, xe *events.XRPCStreamE
 
 		// Emit account update
 		e := models.Event{
-			Did:       xe.RepoAccount.Did,
-			Kind:      models.EventKindAccount,
-			EventType: models.EventAccount,
-			Account:   xe.RepoAccount,
+			Did:     xe.RepoAccount.Did,
+			Kind:    models.EventKindAccount,
+			Account: xe.RepoAccount,
 		}
 		// Send to the sequencer
 		c.buf <- &e
@@ -234,9 +232,8 @@ func (c *Consumer) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSub
 		span.SetAttributes(attribute.String("event_kind", op.Action))
 
 		e := models.Event{
-			Did:       evt.Repo,
-			EventType: models.EventCommit,
-			Kind:      models.EventKindCommit,
+			Did:  evt.Repo,
+			Kind: models.EventKindCommit,
 		}
 
 		switch ek {
@@ -273,7 +270,6 @@ func (c *Consumer) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSub
 			e.Commit = &models.Commit{
 				Rev:        evt.Rev,
 				Operation:  models.CommitOperationCreate,
-				OpType:     models.CommitCreateRecord,
 				Collection: collection,
 				RKey:       rkey,
 				Record:     recJSON,
@@ -312,7 +308,6 @@ func (c *Consumer) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSub
 			e.Commit = &models.Commit{
 				Rev:        evt.Rev,
 				Operation:  models.CommitOperationUpdate,
-				OpType:     models.CommitUpdateRecord,
 				Collection: collection,
 				RKey:       rkey,
 				Record:     recJSON,
@@ -323,7 +318,6 @@ func (c *Consumer) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSub
 			e.Commit = &models.Commit{
 				Rev:        evt.Rev,
 				Operation:  models.CommitOperationDelete,
-				OpType:     models.CommitDeleteRecord,
 				Collection: collection,
 				RKey:       rkey,
 			}

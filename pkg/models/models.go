@@ -12,18 +12,16 @@ import (
 var ZSTDDictionary []byte
 
 type Event struct {
-	Did       string                                  `json:"did"`
-	TimeUS    int64                                   `json:"time_us"`
-	EventType string                                  `json:"type"`
-	Kind      string                                  `json:"kind,omitempty"`
-	Commit    *Commit                                 `json:"commit,omitempty"`
-	Account   *comatproto.SyncSubscribeRepos_Account  `json:"account,omitempty"`
-	Identity  *comatproto.SyncSubscribeRepos_Identity `json:"identity,omitempty"`
+	Did      string                                  `json:"did"`
+	TimeUS   int64                                   `json:"time_us"`
+	Kind     string                                  `json:"kind,omitempty"`
+	Commit   *Commit                                 `json:"commit,omitempty"`
+	Account  *comatproto.SyncSubscribeRepos_Account  `json:"account,omitempty"`
+	Identity *comatproto.SyncSubscribeRepos_Identity `json:"identity,omitempty"`
 }
 
 type Commit struct {
 	Rev        string          `json:"rev,omitempty"`
-	OpType     string          `json:"type"`
 	Operation  string          `json:"operation,omitempty"`
 	Collection string          `json:"collection,omitempty"`
 	RKey       string          `json:"rkey,omitempty"`
@@ -32,14 +30,6 @@ type Commit struct {
 }
 
 var (
-	EventCommit   = "com"
-	EventAccount  = "acc"
-	EventIdentity = "id"
-
-	CommitCreateRecord = "c"
-	CommitUpdateRecord = "u"
-	CommitDeleteRecord = "d"
-
 	EventKindCommit   = "commit"
 	EventKindAccount  = "account"
 	EventKindIdentity = "identity"
