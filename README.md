@@ -67,7 +67,7 @@ The following Query Parameters are supported:
 A simple example that hits the public instance looks like:
 
 ```bash
-$ websocat wss://jetstream2.us-east.bsky.network/subscribe\?wantedCollections=app.bsky.feed.post
+$ websocat wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post
 ```
 
 A maximal example using all parameters looks like:
