@@ -17,15 +17,17 @@ import (
 	"github.com/labstack/echo/v4"
 	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/time/rate"
 )
 
 type Server struct {
-	Subscribers map[int64]*Subscriber
-	lk          sync.RWMutex
-	nextSub     int64
-	Consumer    *consumer.Consumer
-	maxSubRate  float64
-	seq         int64
+	Subscribers   map[int64]*Subscriber
+	lk            sync.RWMutex
+	nextSub       int64
+	Consumer      *consumer.Consumer
+	maxSubRate    float64
+	seq           int64
+	perIPLimiters map[string]*rate.Limiter
 }
 
 var upgrader = websocket.Upgrader{
@@ -40,8 +42,9 @@ var tracer = otel.Tracer("jetstream-server")
 
 func NewServer(maxSubRate float64) (*Server, error) {
 	s := Server{
-		Subscribers: make(map[int64]*Subscriber),
-		maxSubRate:  maxSubRate,
+		Subscribers:   make(map[int64]*Subscriber),
+		maxSubRate:    maxSubRate,
+		perIPLimiters: make(map[string]*rate.Limiter),
 	}
 
 	return &s, nil

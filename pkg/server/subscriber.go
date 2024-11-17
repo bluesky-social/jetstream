@@ -204,6 +204,12 @@ func (s *Server) AddSubscriber(ws *websocket.Conn, realIP string, opts *Subscrib
 	s.lk.Lock()
 	defer s.lk.Unlock()
 
+	lim := s.perIPLimiters[realIP]
+	if lim == nil {
+		lim = rate.NewLimiter(rate.Limit(s.maxSubRate), int(s.maxSubRate))
+		s.perIPLimiters[realIP] = lim
+	}
+
 	sub := Subscriber{
 		ws:                ws,
 		realIP:            realIP,
@@ -216,7 +222,7 @@ func (s *Server) AddSubscriber(ws *websocket.Conn, realIP string, opts *Subscrib
 		compress:          opts.Compress,
 		deliveredCounter:  eventsDelivered.WithLabelValues(realIP),
 		bytesCounter:      bytesDelivered.WithLabelValues(realIP),
-		rl:                rate.NewLimiter(rate.Limit(s.maxSubRate), int(s.maxSubRate)),
+		rl:                lim,
 	}
 
 	s.Subscribers[s.nextSub] = &sub
