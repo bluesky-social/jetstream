@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -121,15 +122,17 @@ func (c *Client) ConnectAndRead(ctx context.Context, cursor *int64) error {
 
 	c.con = con
 
+	var readErr error = nil
 	if err := c.readLoop(ctx); err != nil {
-		return fmt.Errorf("read loop failed: %w", err)
+		readErr = fmt.Errorf("read loop failed: %w", err)
 	}
 
+	var closeErr error = nil
 	if err := c.con.Close(); err != nil {
-		return fmt.Errorf("failed to close connection: %w", err)
+		closeErr = fmt.Errorf("failed to close connection: %w", err)
 	}
 
-	return nil
+	return errors.Join(readErr, closeErr)
 }
 
 func (c *Client) readLoop(ctx context.Context) error {
