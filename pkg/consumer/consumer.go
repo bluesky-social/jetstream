@@ -274,6 +274,7 @@ func (c *Consumer) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSub
 				RKey:       rkey,
 				Record:     recJSON,
 				CID:        recCid,
+				Seq:	    evt.Seq,
 			}
 		case repomgr.EvtKindUpdateRecord:
 			if op.Cid == nil {
@@ -312,6 +313,7 @@ func (c *Consumer) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSub
 				RKey:       rkey,
 				Record:     recJSON,
 				CID:        recCid,
+				Seq:	    evt.Seq,
 			}
 		case repomgr.EvtKindDeleteRecord:
 			// Emit the delete
@@ -320,6 +322,7 @@ func (c *Consumer) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSub
 				Operation:  models.CommitOperationDelete,
 				Collection: collection,
 				RKey:       rkey,
+				Seq:	    evt.Seq,
 			}
 		default:
 			log.Warn("unknown event kind from op action", "kind", op.Action)

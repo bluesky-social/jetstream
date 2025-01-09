@@ -14,6 +14,11 @@ run: .env
 	@echo "Running Jetstream..."
 	$(GO_CMD_W_CGO) run cmd/jetstream/*.go
 
+.PHONY: test
+test:
+	@echo "Testing Jestream..."
+	$(GO_CMD_W_CGO) test ./...
+
 .PHONY: up
 up:
 	@echo "Starting Jetstream..."

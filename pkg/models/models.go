@@ -27,6 +27,7 @@ type Commit struct {
 	RKey       string          `json:"rkey,omitempty"`
 	Record     json.RawMessage `json:"record,omitempty"`
 	CID        string          `json:"cid,omitempty"`
+	Seq	   int64	   `json:"seq,omitempty"`
 }
 
 var (

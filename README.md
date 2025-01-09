@@ -110,7 +110,8 @@ Jetstream Commits have 3 `operations`:
         "uri": "at://did:plc:wa7b35aakoll7hugkrjtf3xf/app.bsky.feed.post/3l3pte3p2e325"
       }
     },
-    "cid": "bafyreidwaivazkwu67xztlmuobx35hs2lnfh3kolmgfmucldvhd3sgzcqi"
+    "cid": "bafyreidwaivazkwu67xztlmuobx35hs2lnfh3kolmgfmucldvhd3sgzcqi",
+    "seq": 3012084059
   }
 }
 ```
@@ -126,7 +127,8 @@ Jetstream Commits have 3 `operations`:
     "rev": "3l3f6nzl3cv2s",
     "operation": "delete",
     "collection": "app.bsky.graph.follow",
-    "rkey": "3l3dn7tku762u"
+    "rkey": "3l3dn7tku762u",
+    "seq": 3012071933
   }
 }
 ```
