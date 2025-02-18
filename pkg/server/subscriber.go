@@ -9,12 +9,15 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
 )
+
+const OUTBOX_SIZE = 10_000
 
 type WantedCollections struct {
 	Prefixes  []string
@@ -59,6 +62,12 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 		if _, ok := sub.wantedDids[did]; !ok {
 			return nil
 		}
+	}
+
+	// slow down replay emits if the outbox is getting filled up
+	// blocking here is ONLY allowable during replay/playback, never live tailing!
+	if playback && len(sub.outbox) > (OUTBOX_SIZE/3) {
+		time.Sleep(100 * time.Millisecond) // sketch but 🤷🏻‍♀️
 	}
 
 	// Skip events that are older than the subscriber's last seen event
@@ -229,7 +238,7 @@ func (s *Server) AddSubscriber(ws *websocket.Conn, realIP string, opts *Subscrib
 	sub := Subscriber{
 		ws:                ws,
 		realIP:            realIP,
-		outbox:            make(chan *[]byte, 10_000),
+		outbox:            make(chan *[]byte, OUTBOX_SIZE),
 		hello:             make(chan struct{}),
 		id:                s.nextSub,
 		wantedCollections: opts.WantedCollections,
