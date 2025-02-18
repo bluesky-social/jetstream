@@ -89,6 +89,9 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 			moreCurrentSeq := sub.seq.Swap(timeUS)
 			if moreCurrentSeq != currentSeq {
 				log.Warn("subscriber sequence updated while we were using it", "warning", "emit collision", "subscriber", sub.id, "playback", playback)
+				if moreCurrentSeq > timeUS { // it's possible that it didn't lead to out-of-order events this time
+					log.Error("emitted to subscriber out of order", "error", "emitted out of order", "subscriber", sub.id, "playback", playback)
+				}
 			}
 			sub.deliveredCounter.Inc()
 			sub.bytesCounter.Add(float64(len(evtBytes)))
@@ -108,6 +111,9 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 			moreCurrentSeq := sub.seq.Swap(timeUS)
 			if moreCurrentSeq != currentSeq {
 				log.Warn("subscriber sequence updated while we were using it", "warning", "emit collision", "subscriber", sub.id, "playback", playback)
+				if moreCurrentSeq > timeUS { // it's possible that it didn't lead to out-of-order events this time
+					log.Error("emitted to subscriber out of order", "error", "emitted out of order", "subscriber", sub.id, "playback", playback)
+				}
 			}
 			sub.deliveredCounter.Inc()
 			sub.bytesCounter.Add(float64(len(evtBytes)))
