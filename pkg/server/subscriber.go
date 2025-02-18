@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/gorilla/websocket"
@@ -25,7 +26,7 @@ type Subscriber struct {
 	conLk       sync.Mutex
 	realIP      string
 	lk          sync.Mutex
-	seq         int64
+	seq         atomic.Int64
 	outbox      chan *[]byte
 	hello       chan struct{}
 	id          int64
@@ -61,7 +62,8 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 	}
 
 	// Skip events that are older than the subscriber's last seen event
-	if timeUS <= sub.seq {
+	currentSeq := sub.seq.Load()
+	if timeUS <= currentSeq {
 		return nil
 	}
 
@@ -84,7 +86,10 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 			}
 			return ctx.Err()
 		case sub.outbox <- &evtBytes:
-			sub.seq = timeUS
+			moreCurrentSeq := sub.seq.Swap(timeUS)
+			if moreCurrentSeq != currentSeq {
+				log.Warn("subscriber sequence updated while we were using it", "warning", "emit collision", "subscriber", sub.id, "playback", playback)
+			}
 			sub.deliveredCounter.Inc()
 			sub.bytesCounter.Add(float64(len(evtBytes)))
 		}
@@ -100,7 +105,10 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 			}
 			return ctx.Err()
 		case sub.outbox <- &evtBytes:
-			sub.seq = timeUS
+			moreCurrentSeq := sub.seq.Swap(timeUS)
+			if moreCurrentSeq != currentSeq {
+				log.Warn("subscriber sequence updated while we were using it", "warning", "emit collision", "subscriber", sub.id, "playback", playback)
+			}
 			sub.deliveredCounter.Inc()
 			sub.bytesCounter.Add(float64(len(evtBytes)))
 		default:
