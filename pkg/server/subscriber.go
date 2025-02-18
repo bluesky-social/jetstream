@@ -221,7 +221,9 @@ func (s *Server) AddSubscriber(ws *websocket.Conn, realIP string, opts *Subscrib
 	lim := s.perIPLimiters[realIP]
 	if lim == nil {
 		lim = rate.NewLimiter(rate.Limit(s.maxSubRate), int(s.maxSubRate))
-		s.perIPLimiters[realIP] = lim
+		if s.limitPerIP {
+			s.perIPLimiters[realIP] = lim
+		}
 	}
 
 	sub := Subscriber{

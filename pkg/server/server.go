@@ -27,6 +27,7 @@ type Server struct {
 	Consumer      *consumer.Consumer
 	maxSubRate    float64
 	seq           int64
+	limitPerIP    bool
 	perIPLimiters map[string]*rate.Limiter
 }
 
@@ -40,9 +41,10 @@ var maxConcurrentEmits = int64(100)
 var cutoverThresholdUS = int64(1_000_000)
 var tracer = otel.Tracer("jetstream-server")
 
-func NewServer(maxSubRate float64) (*Server, error) {
+func NewServer(maxSubRate float64, perIPLimit bool) (*Server, error) {
 	s := Server{
 		Subscribers:   make(map[int64]*Subscriber),
+		limitPerIP:    perIPLimit,
 		maxSubRate:    maxSubRate,
 		perIPLimiters: make(map[string]*rate.Limiter),
 	}
@@ -224,7 +226,7 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 					return
 				}
 				serverLastSeq := s.GetSeq()
-				log.Info("finished replaying events", "replay_last_time", time.UnixMicro(lastSeq), "server_last_time", time.UnixMicro(serverLastSeq))
+				log.Info("finished replaying events", "replay_last_time", time.UnixMicro(lastSeq), "server_last_time", time.UnixMicro(serverLastSeq), "diff", (serverLastSeq - lastSeq) / 1_000)
 
 				// If last event replayed is close enough to the last live event, start live tailing
 				if lastSeq > serverLastSeq-(cutoverThresholdUS/2) {
@@ -232,6 +234,7 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 				}
 
 				// Otherwise, update the cursor and replay again
+				log.Info("restarting replay", "cursor diff", (lastSeq - *sub.cursor) / 1000)
 				lastSeq++
 				sub.SetCursor(&lastSeq)
 			}
