@@ -151,7 +151,7 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 				log.Info("received text message from client, parsing as subscriber options update")
 				log.Debug("text message from client content", "msg", string(msgBytes))
 
-				var subMessage SubscriberSourcedMessage
+				var subMessage models.SubscriberSourcedMessage
 				if err := json.Unmarshal(msgBytes, &subMessage); err != nil {
 					log.Error("failed to unmarshal subscriber sourced message", "error", err, "msg", string(msgBytes))
 					sub.Terminate(fmt.Sprintf("failed to unmarshal subscriber sourced message: %v", err))
@@ -160,8 +160,8 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 				}
 
 				switch subMessage.Type {
-				case SubMessageOptionsUpdate:
-					var subOptsUpdate SubscriberOptionsUpdatePayload
+				case models.SubMessageOptionsUpdate:
+					var subOptsUpdate models.SubscriberOptionsUpdatePayload
 					if err := json.Unmarshal(subMessage.Payload, &subOptsUpdate); err != nil {
 						log.Error("failed to unmarshal subscriber options update", "error", err, "msg", string(msgBytes))
 						sub.Terminate(fmt.Sprintf("failed to unmarshal subscriber options update: %v", err))

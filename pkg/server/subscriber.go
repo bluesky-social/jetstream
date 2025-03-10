@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -120,19 +119,6 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 	}
 
 	return nil
-}
-
-var SubMessageOptionsUpdate = "options_update"
-
-type SubscriberSourcedMessage struct {
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
-}
-
-type SubscriberOptionsUpdatePayload struct {
-	WantedCollections   []string `json:"wantedCollections"`
-	WantedDIDs          []string `json:"wantedDids"`
-	MaxMessageSizeBytes int      `json:"maxMessageSizeBytes"`
 }
 
 type SubscriberOptions struct {
