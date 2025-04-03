@@ -123,6 +123,7 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 }
 
 var SubMessageOptionsUpdate = "options_update"
+var SubMessageHeartbeat = "heartbeat"
 
 type SubscriberSourcedMessage struct {
 	Type    string          `json:"type"`
@@ -133,6 +134,13 @@ type SubscriberOptionsUpdatePayload struct {
 	WantedCollections   []string `json:"wantedCollections"`
 	WantedDIDs          []string `json:"wantedDids"`
 	MaxMessageSizeBytes int      `json:"maxMessageSizeBytes"`
+}
+
+type SubscriberHeartbeatPayload = string;
+
+type SubscriberHeartbeatServerEvent struct {
+	Kind	string `json:"kind"`
+	Payload SubscriberHeartbeatPayload `json:"payload"`
 }
 
 type SubscriberOptions struct {

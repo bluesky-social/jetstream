@@ -78,11 +78,12 @@ $ websocat "ws://localhost:6008/subscribe?wantedCollections=app.bsky.feed.post&w
 
 ### Example events:
 
-Jetstream events have 3 `kinds`s (so far):
+Jetstream events have 4 `kinds`s (so far):
 
 - `commit`: a Commit to a repo which involves either a create, update, or delete of a record
 - `identity`: an Identity update for a DID which indicates that you may want to purge an identity cache and revalidate the DID doc and handle
 - `account`: an Account event that indicates a change in account status i.e. from `active` to `deactivated`, or to `takendown` if the PDS has taken down the repo.
+- `heartbeat`: a special event in response to a client sending a `heartbeat` message, for clients whose websocket implementations don't expose the ability to manually send websocket `Ping` frames.
 
 Jetstream Commits have 3 `operations`:
 
@@ -163,6 +164,19 @@ Jetstream Commits have 3 `operations`:
 }
 ```
 
+#### A heartbeat response
+
+```json
+{
+  "kind": "heartbeat",
+  "payload": ""
+}
+```
+
+The `payload` property is a verbatim copy of the `payload` string submitted by the client `heartbeat` message.
+
+See `Heartbeats` below for a sample client heartbeat message.
+
 ### Compression
 
 Jetstream supports `zstd`-based compression of messages. Jetstream uses a custom dictionary for compression that can be found in `pkg/models/zstd_dictionary` and is required to decode compressed messages from the server.
@@ -187,6 +201,7 @@ type SubscriberSourcedMessage struct {
 The supported message types are as follows:
 
 - `options_update`
+- `heartbeat`
 
 #### Options Updates
 
@@ -226,6 +241,28 @@ An example Subscriber Sourced Message with an Options Update payload is as follo
 ```
 
 The above payload will filter such that a client receives only posts, and only from a the specified DID.
+
+#### Heartbeats
+
+A client can send a `heartbeat` message to keep their WebSocket connection healthy if they are filtering a narrow subset of collections and DIDs that leads to long pauses between messages.
+
+**Clients should use WebSocket `ping` frames where possible instead of sending `heartbeat` messages**, but some WebSocket clients do not expose this facility, notably web browsers and some JavaScript runtimes.
+
+The client can choose to include a text message with the heartbeat as the `payload` property on the message.
+Similar to a `ping` frame, this payload will be included in the server `heartbeat` response. `payload` must be a string with maximum lenth `81 bytes` to ensure it fits in a single WebSocket frame.
+
+An example Subscriber Sourced Message with a Heartbeat payload is as as follows:
+
+```json
+{
+  "type": "heartbeat",
+  "payload": ""
+}
+```
+
+Note that the server response event will specify `"kind": "heartbeat"` instead of `"type"`, to maintain a consistent property to determine the type of a server message; similarly the client payload uses `"type"` and not `"kind"` for consistency with other Server Sourced Messages.
+
+See `Example events` above for a sample heartbeat response.
 
 ### Dashboard Preview
 
