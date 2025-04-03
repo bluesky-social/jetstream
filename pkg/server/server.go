@@ -206,8 +206,8 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 						cancel()
 						return
 					}
-					eventJSON, err := json.Marshal(SubscriberHeartbeatServerEvent {
-						Kind: SubMessageHeartbeat,
+					eventJSON, err := json.Marshal(SubscriberHeartbeatServerEvent{
+						Kind:    SubMessageHeartbeat,
 						Payload: subHeartbeatPayload,
 					})
 					if err != nil {

@@ -136,10 +136,10 @@ type SubscriberOptionsUpdatePayload struct {
 	MaxMessageSizeBytes int      `json:"maxMessageSizeBytes"`
 }
 
-type SubscriberHeartbeatPayload = string;
+type SubscriberHeartbeatPayload = string
 
 type SubscriberHeartbeatServerEvent struct {
-	Kind	string `json:"kind"`
+	Kind    string                     `json:"kind"`
 	Payload SubscriberHeartbeatPayload `json:"payload"`
 }
 
