@@ -8,12 +8,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
 )
+
+const OUTBOX_SIZE = 10_000
 
 type WantedCollections struct {
 	Prefixes  []string
@@ -25,7 +29,7 @@ type Subscriber struct {
 	conLk       sync.Mutex
 	realIP      string
 	lk          sync.Mutex
-	seq         int64
+	seq         atomic.Int64
 	outbox      chan *[]byte
 	hello       chan struct{}
 	id          int64
@@ -60,8 +64,15 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 		}
 	}
 
+	// slow down replay emits if the outbox is getting filled up
+	// blocking here is ONLY allowable during replay/playback, never live tailing!
+	if playback && len(sub.outbox) > (OUTBOX_SIZE/3) {
+		time.Sleep(100 * time.Millisecond) // sketch but 🤷🏻‍♀️
+	}
+
 	// Skip events that are older than the subscriber's last seen event
-	if timeUS <= sub.seq {
+	currentSeq := sub.seq.Load()
+	if timeUS <= currentSeq {
 		return nil
 	}
 
@@ -84,7 +95,13 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 			}
 			return ctx.Err()
 		case sub.outbox <- &evtBytes:
-			sub.seq = timeUS
+			moreCurrentSeq := sub.seq.Swap(timeUS)
+			if moreCurrentSeq != currentSeq {
+				log.Warn("subscriber sequence updated while we were using it", "warning", "emit collision", "subscriber", sub.id, "playback", playback)
+				if moreCurrentSeq > timeUS { // it's possible that it didn't lead to out-of-order events this time
+					log.Error("emitted to subscriber out of order", "error", "emitted out of order", "subscriber", sub.id, "playback", playback)
+				}
+			}
 			sub.deliveredCounter.Inc()
 			sub.bytesCounter.Add(float64(len(evtBytes)))
 		}
@@ -100,7 +117,13 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 			}
 			return ctx.Err()
 		case sub.outbox <- &evtBytes:
-			sub.seq = timeUS
+			moreCurrentSeq := sub.seq.Swap(timeUS)
+			if moreCurrentSeq != currentSeq {
+				log.Warn("subscriber sequence updated while we were using it", "warning", "emit collision", "subscriber", sub.id, "playback", playback)
+				if moreCurrentSeq > timeUS { // it's possible that it didn't lead to out-of-order events this time
+					log.Error("emitted to subscriber out of order", "error", "emitted out of order", "subscriber", sub.id, "playback", playback)
+				}
+			}
 			sub.deliveredCounter.Inc()
 			sub.bytesCounter.Add(float64(len(evtBytes)))
 		default:
@@ -207,13 +230,15 @@ func (s *Server) AddSubscriber(ws *websocket.Conn, realIP string, opts *Subscrib
 	lim := s.perIPLimiters[realIP]
 	if lim == nil {
 		lim = rate.NewLimiter(rate.Limit(s.maxSubRate), int(s.maxSubRate))
-		s.perIPLimiters[realIP] = lim
+		if s.limitPerIP {
+			s.perIPLimiters[realIP] = lim
+		}
 	}
 
 	sub := Subscriber{
 		ws:                ws,
 		realIP:            realIP,
-		outbox:            make(chan *[]byte, 10_000),
+		outbox:            make(chan *[]byte, OUTBOX_SIZE),
 		hello:             make(chan struct{}),
 		id:                s.nextSub,
 		wantedCollections: opts.WantedCollections,
