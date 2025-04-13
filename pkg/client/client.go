@@ -22,6 +22,7 @@ type ClientConfig struct {
 	WantedCollections []string
 	MaxSize           uint32
 	ExtraHeaders      map[string]string
+	RequireHello      bool
 }
 
 type Scheduler interface {
@@ -78,6 +79,23 @@ func NewClient(config *ClientConfig, logger *slog.Logger, scheduler Scheduler) (
 	return &c, nil
 }
 
+func (c *Client) SendOptionsUpdate(opts models.SubscriberOptionsUpdatePayload) error {
+	payload, err := json.Marshal(opts)
+	if err != nil {
+		return fmt.Errorf("error marshalling options into json: %w", err)
+	}
+
+	msg, err := json.Marshal(models.SubscriberSourcedMessage{
+		Type:    models.SubMessageOptionsUpdate,
+		Payload: payload,
+	})
+	if err != nil {
+		return err
+	}
+
+	return c.con.WriteMessage(websocket.TextMessage, msg)
+}
+
 func (c *Client) ConnectAndRead(ctx context.Context, cursor *int64) error {
 	header := http.Header{}
 	for k, v := range c.config.ExtraHeaders {
@@ -86,6 +104,11 @@ func (c *Client) ConnectAndRead(ctx context.Context, cursor *int64) error {
 
 	fullURL := c.config.WebsocketURL
 	params := []string{}
+
+	if c.config.RequireHello {
+		params = append(params, "requireHello=true")
+	}
+
 	if cursor != nil {
 		params = append(params, fmt.Sprintf("cursor=%d", *cursor))
 	}
