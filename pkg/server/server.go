@@ -40,6 +40,10 @@ var maxConcurrentEmits = int64(100)
 var cutoverThresholdUS = int64(1_000_000)
 var tracer = otel.Tracer("jetstream-server")
 
+// WebSocket frame is 125 bytes and we need room for Text frame overhead + JSON
+// 81 is just a nice number.
+var maxHeartbeatPayload = int(81)
+
 func NewServer(maxSubRate float64) (*Server, error) {
 	s := Server{
 		Subscribers:   make(map[int64]*Subscriber),
@@ -189,6 +193,37 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 					if requireHello {
 						sub.hello <- struct{}{}
 						requireHello = false
+					}
+				case SubMessageHeartbeat:
+					payloadSize := len(subMessage.Payload)
+					if payloadSize > maxHeartbeatPayload {
+						log.Error("received heartbeat message with too-large payload", "len", payloadSize)
+						sub.Terminate(fmt.Sprintf("heartbeat payload of %d bytes is too large. maximum is %d", payloadSize, maxHeartbeatPayload))
+						cancel()
+						return
+					}
+					// we don't really *need* to force that it's a string (and not other JSON) but let's be strict
+					var subHeartbeatPayload SubscriberHeartbeatPayload
+					if err := json.Unmarshal(subMessage.Payload, &subHeartbeatPayload); err != nil {
+						log.Error("failed to unmarshal heartbeat payload", "error", err, "msg", string(msgBytes))
+						sub.Terminate(fmt.Sprintf("failed to unmarshal heartbeat payload: %v", err))
+						cancel()
+						return
+					}
+					eventJSON, err := json.Marshal(SubscriberHeartbeatServerEvent{
+						Kind:    SubMessageHeartbeat,
+						Payload: subHeartbeatPayload,
+					})
+					if err != nil {
+						log.Error("failed to marshal heartbeat event", "error", err, "payload", string(subHeartbeatPayload))
+						sub.Terminate(fmt.Sprintf("failed to marshal heartbeat payload: %v", err))
+						cancel()
+						return
+					}
+					if err := sub.WriteMessage(websocket.TextMessage, eventJSON); err != nil {
+						log.Error("failed to write heartbeat to websocket", "error", err)
+						cancel()
+						return
 					}
 				default:
 					log.Warn("received unexpected message type from client, ignoring", "type", subMessage.Type)
