@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/pkg/models"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -91,12 +92,12 @@ func TestParseSubscriberOptions(t *testing.T) {
 	testCases := []struct {
 		name     string
 		data     []byte
-		expected SubscriberOptionsUpdatePayload
+		expected models.SubscriberOptionsUpdatePayload
 	}{
 		{
 			name: "empty",
 			data: []byte(`{}`),
-			expected: SubscriberOptionsUpdatePayload{
+			expected: models.SubscriberOptionsUpdatePayload{
 				WantedCollections:   nil,
 				WantedDIDs:          nil,
 				MaxMessageSizeBytes: 0,
@@ -105,7 +106,7 @@ func TestParseSubscriberOptions(t *testing.T) {
 		{
 			name: "collection",
 			data: []byte(`{"wantedCollections":["foo"]}`),
-			expected: SubscriberOptionsUpdatePayload{
+			expected: models.SubscriberOptionsUpdatePayload{
 				WantedCollections:   []string{"foo"},
 				WantedDIDs:          nil,
 				MaxMessageSizeBytes: 0,
@@ -114,7 +115,7 @@ func TestParseSubscriberOptions(t *testing.T) {
 		{
 			name: "small",
 			data: []byte(`{"maxMessageSizeBytes":1000}`),
-			expected: SubscriberOptionsUpdatePayload{
+			expected: models.SubscriberOptionsUpdatePayload{
 				WantedCollections:   nil,
 				WantedDIDs:          nil,
 				MaxMessageSizeBytes: 1000,
@@ -124,7 +125,7 @@ func TestParseSubscriberOptions(t *testing.T) {
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			var subOptsUpdate SubscriberOptionsUpdatePayload
+			var subOptsUpdate models.SubscriberOptionsUpdatePayload
 			if err := json.Unmarshal(testCase.data, &subOptsUpdate); err != nil {
 				t.Errorf("failed to unmarshal subscriber options update: %v", err)
 			}
