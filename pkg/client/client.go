@@ -7,12 +7,17 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/bluesky-social/jetstream/pkg/models"
 	"github.com/goccy/go-json"
 	"github.com/gorilla/websocket"
 	"github.com/klauspost/compress/zstd"
 	"go.uber.org/atomic"
+)
+
+const (
+	DefaultWSReadTimeout = 1 * time.Minute
 )
 
 type ClientConfig struct {
@@ -22,6 +27,7 @@ type ClientConfig struct {
 	WantedCollections []string
 	MaxSize           uint32
 	ExtraHeaders      map[string]string
+	ReadTimeout       time.Duration
 }
 
 type Scheduler interface {
@@ -46,6 +52,7 @@ func DefaultClientConfig() *ClientConfig {
 		WebsocketURL:      "ws://localhost:6008/subscribe",
 		WantedDids:        []string{},
 		WantedCollections: []string{},
+		ReadTimeout:       DefaultWSReadTimeout,
 		MaxSize:           0,
 		ExtraHeaders: map[string]string{
 			"User-Agent": "jetstream-client/v0.0.1",
@@ -64,6 +71,10 @@ func NewClient(config *ClientConfig, logger *slog.Logger, scheduler Scheduler) (
 		shutdown:  make(chan chan struct{}),
 		logger:    logger,
 		Scheduler: scheduler,
+	}
+
+	if config.ExtraHeaders == nil {
+		config.ExtraHeaders = map[string]string{}
 	}
 
 	if config.Compress {
@@ -151,6 +162,7 @@ func (c *Client) readLoop(ctx context.Context) error {
 			s <- struct{}{}
 			return nil
 		default:
+			c.con.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
 			_, msg, err := c.con.ReadMessage()
 			if err != nil {
 				c.logger.Error("failed to read message from websocket", "error", err)
