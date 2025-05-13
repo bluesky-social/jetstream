@@ -73,6 +73,10 @@ func NewClient(config *ClientConfig, logger *slog.Logger, scheduler Scheduler) (
 		Scheduler: scheduler,
 	}
 
+	if config.ExtraHeaders == nil {
+		config.ExtraHeaders = map[string]string{}
+	}
+
 	if config.Compress {
 		c.config.ExtraHeaders["Socket-Encoding"] = "zstd"
 		dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(models.ZSTDDictionary))
