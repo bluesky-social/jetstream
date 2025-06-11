@@ -62,6 +62,15 @@ The following Query Parameters are supported:
 - `compress` - Set to `true` to enable `zstd` [compression](#compression)
 - `requireHello` - Set to `true` to pause replay/live-tail until the server recevies a [`SubscriberOptionsUpdatePayload`](#options-updates) over the socket in a [Subscriber Sourced Message](#subscriber-sourced-messages)
 
+The following enable server-side sharding of the event stream:
+
+- `shardingCount` - the number of sub-streams to split the event stream into
+  - Must be a power of two.
+- `shardingIndex` - the index of the sub-stream to consume for this connection
+  - Must be an integer between 0 and shardingCount-1.
+
+The sharding is based on a xxhash of the repository DID truncated by `shardingCount-1`.
+
 ### Examples
 
 A simple example that hits the public instance looks like:

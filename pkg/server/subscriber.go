@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/bits"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/bluesky-social/indigo/atproto/syntax"
+	"github.com/cespare/xxhash/v2"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
@@ -41,10 +44,70 @@ type Subscriber struct {
 	compress            bool
 	maxMessageSizeBytes uint32
 
+	sharder *Sharder
+
 	rl *rate.Limiter
 
 	deliveredCounter prometheus.Counter
 	bytesCounter     prometheus.Counter
+}
+
+type Sharder struct {
+	Index, Mask uint64
+}
+
+func NewSharder(index, count int) (*Sharder, error) {
+	if count <= 0 {
+		return nil, fmt.Errorf("count needs to be positive")
+	}
+	if bits.OnesCount(uint(count)) != 1 {
+		return nil, fmt.Errorf("count needs to be a power of two")
+	}
+	if index < 0 || index >= count {
+		return nil, fmt.Errorf("index needs to be in [0, count)")
+	}
+
+	return &Sharder{
+		Index: uint64(index),
+		Mask:  uint64(count) - 1,
+	}, nil
+}
+
+func NewSharderFromURL(values url.Values) (*Sharder, error) {
+	countS := values.Get("shardingCount")
+	if countS == "" {
+		return nil, nil
+	}
+
+	count, err := strconv.Atoi(countS)
+	if err != nil {
+		return nil, fmt.Errorf("shardingCount: %w", err)
+	}
+
+	indexS := values.Get("shardingIndex")
+	if indexS == "" {
+		return nil, fmt.Errorf("shardingIndex: must be specified when shardingCount is specified")
+	}
+
+	index, err := strconv.Atoi(indexS)
+	if err != nil {
+		return nil, fmt.Errorf("shardingIndex: %w", err)
+	}
+
+	sharder, err := NewSharder(index, count)
+	if err != nil {
+		return nil, fmt.Errorf("error building sharder: %w", err)
+	}
+
+	return sharder, nil
+}
+
+func (s *Sharder) matches(did string) bool {
+	if s == nil {
+		return true
+	}
+
+	return xxhash.Sum64String(did)&s.Mask == s.Index
 }
 
 // emitToSubscriber sends an event to a subscriber if the subscriber wants the event
@@ -59,6 +122,10 @@ func emitToSubscriber(ctx context.Context, log *slog.Logger, sub *Subscriber, ti
 		if _, ok := sub.wantedDids[did]; !ok {
 			return nil
 		}
+	}
+
+	if !sub.sharder.matches(did) {
+		return nil
 	}
 
 	// Skip events that are older than the subscriber's last seen event
@@ -142,6 +209,7 @@ type SubscriberOptions struct {
 	MaxMessageSizeBytes uint32
 	Compress            bool
 	Cursor              *int64
+	Sharder             *Sharder
 }
 
 // ErrInvalidOptions is returned when the subscriber options are invalid
@@ -221,6 +289,7 @@ func (s *Server) AddSubscriber(ws *websocket.Conn, realIP string, opts *Subscrib
 		wantedDids:          opts.WantedDIDs,
 		cursor:              opts.Cursor,
 		compress:            opts.Compress,
+		sharder:             opts.Sharder,
 		maxMessageSizeBytes: opts.MaxMessageSizeBytes,
 		deliveredCounter:    eventsDelivered.WithLabelValues(realIP),
 		bytesCounter:        bytesDelivered.WithLabelValues(realIP),

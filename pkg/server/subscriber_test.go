@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -132,4 +133,102 @@ func TestParseSubscriberOptions(t *testing.T) {
 		})
 	}
 
+}
+
+func TestSharder(t *testing.T) {
+	type testCase struct {
+		name        string
+		input       url.Values
+		mask, index uint64
+		error       string
+
+		valid   []string
+		invalid []string
+	}
+
+	testCases := []testCase{
+		{
+			input: url.Values{},
+			valid: []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"},
+		},
+		{
+			input: url.Values{
+				"shardingCount": []string{"foo"},
+			},
+			error: `shardingCount: strconv.Atoi: parsing "foo": invalid syntax`,
+		},
+		{
+			input: url.Values{
+				"shardingCount": []string{"4"},
+			},
+			error: `shardingIndex: must be specified when shardingCount is specified`,
+		},
+		{
+			input: url.Values{
+				"shardingCount": []string{"4"},
+				"shardingIndex": []string{"foo"},
+			},
+			error: `shardingIndex: strconv.Atoi: parsing "foo": invalid syntax`,
+		},
+		{
+			input: url.Values{
+				"shardingCount": []string{"5"},
+				"shardingIndex": []string{"3"},
+			},
+			error: `error building sharder: count needs to be a power of two`,
+		},
+		{
+			input: url.Values{
+				"shardingCount": []string{"-4"},
+				"shardingIndex": []string{"3"},
+			},
+			error: `error building sharder: count needs to be positive`,
+		},
+		{
+			input: url.Values{
+				"shardingCount": []string{"4"},
+				"shardingIndex": []string{"4"},
+			},
+			error: `error building sharder: index needs to be in [0, count)`,
+		},
+		{
+			input: url.Values{
+				"shardingCount": []string{"4"},
+				"shardingIndex": []string{"3"},
+			},
+			mask:    0b11,
+			index:   3,
+			valid:   []string{"2", "6", "7", "a", "b"}, // hashing returns 5 valid out of 16
+			invalid: []string{"0", "1", "3", "4", "5", "8", "9", "c", "d", "e", "f"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			s, err := NewSharderFromURL(tc.input)
+			if tc.error != "" {
+				assert.NotNil(err)
+				assert.Equal(tc.error, err.Error())
+			} else {
+				assert.NoError(err)
+			}
+
+			if tc.mask != 0 {
+				assert.Equal(tc.index, s.Index)
+				assert.Equal(tc.mask, s.Mask)
+			} else {
+				assert.Nil(s)
+			}
+
+			for _, valid := range tc.valid {
+				assert.True(s.matches(valid), "valid: %s", valid)
+			}
+
+			for _, invalid := range tc.invalid {
+				assert.False(s.matches(invalid), "invalid: %s", invalid)
+			}
+		})
+	}
 }

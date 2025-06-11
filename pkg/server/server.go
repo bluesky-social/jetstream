@@ -104,6 +104,12 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 		return err
 	}
 
+	subscriberOpts.Sharder, err = NewSharderFromURL(c.Request().URL.Query())
+	if err != nil {
+		c.String(http.StatusBadRequest, err.Error())
+		return err
+	}
+
 	subIP := c.RealIP()
 
 	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
