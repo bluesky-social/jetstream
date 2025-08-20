@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -100,6 +101,24 @@ func main() {
 			Value:   15 * time.Second,
 			EnvVars: []string{"JETSTREAM_LIVENESS_TTL"},
 		},
+		&cli.BoolFlag{
+			Name:    "should-emit-identity",
+			Usage:   "whether to emit identity events",
+			Value:   true,
+			EnvVars: []string{"JETSTREAM_SHOULD_EMIT_IDENTITY"},
+		},
+		&cli.BoolFlag{
+			Name:    "should-emit-account",
+			Usage:   "whether to emit account events",
+			Value:   true,
+			EnvVars: []string{"JETSTREAM_SHOULD_EMIT_ACCOUNT"},
+		},
+		&cli.StringFlag{
+			Name:    "wanted-collections",
+			Usage:   "Collections this Jetstream should emit, space delimited",
+			Value:   ".*",
+			EnvVars: []string{"JETSTREAM_WANTED_COLLECTIONS"},
+		},
 	}
 
 	app.Action = Jetstream
@@ -129,12 +148,17 @@ func Jetstream(cctx *cli.Context) error {
 		return fmt.Errorf("failed to create server: %w", err)
 	}
 
+	var wantedCollections = strings.Split(cctx.String("wanted-collections"), " ")
+
 	c, err := consumer.NewConsumer(
 		ctx,
 		log,
 		u.String(),
 		cctx.String("data-dir"),
 		cctx.Duration("event-ttl"),
+		wantedCollections,
+		cctx.Bool("should-emit-identity"),
+		cctx.Bool("should-emit-account"),
 		s.Emit,
 	)
 	if err != nil {

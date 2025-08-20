@@ -10,6 +10,7 @@ import (
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/data"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/repo"
 	"github.com/bluesky-social/indigo/repomgr"
@@ -23,19 +24,30 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
+type WantedCollections struct {
+	Prefixes  []string
+	FullPaths map[string]struct{}
+}
+
+// ErrInvalidOptions is returned when the consumer options are invalid
+var ErrInvalidOptions = fmt.Errorf("invalid consumer options")
+
 // Consumer is the consumer of the firehose
 type Consumer struct {
-	SocketURL         string
-	Progress          *Progress
-	Emit              func(context.Context, *models.Event, []byte, []byte) error
-	UncompressedDB    *pebble.DB
-	CompressedDB      *pebble.DB
-	encoder           *zstd.Encoder
-	EventTTL          time.Duration
-	logger            *slog.Logger
-	clock             *monotonic.Clock
-	buf               chan *models.Event
-	sequencerShutdown chan chan struct{}
+	SocketURL          string
+	Progress           *Progress
+	Emit               func(context.Context, *models.Event, []byte, []byte) error
+	UncompressedDB     *pebble.DB
+	CompressedDB       *pebble.DB
+	encoder            *zstd.Encoder
+	EventTTL           time.Duration
+	logger             *slog.Logger
+	clock              *monotonic.Clock
+	buf                chan *models.Event
+	sequencerShutdown  chan chan struct{}
+	wantedCollections  *WantedCollections
+	shouldEmitIdentity bool
+	shouldEmitAccount  bool
 
 	sequenced prometheus.Counter
 	persisted prometheus.Counter
@@ -51,6 +63,9 @@ func NewConsumer(
 	socketURL string,
 	dataDir string,
 	eventTTL time.Duration,
+	wantedCollectionsProvided []string,
+	shouldEmitIdentity bool,
+	shouldEmitAccount bool,
 	emit func(context.Context, *models.Event, []byte, []byte) error,
 ) (*Consumer, error) {
 	uDBPath := dataDir + "/jetstream.uncompressed.db"
@@ -78,20 +93,45 @@ func NewConsumer(
 		return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
 	}
 
+	var wantedCol *WantedCollections
+	if len(wantedCollectionsProvided) > 0 {
+		wantedCol = &WantedCollections{
+			Prefixes:  []string{},
+			FullPaths: make(map[string]struct{}),
+		}
+
+		for _, providedCol := range wantedCollectionsProvided {
+			if strings.HasSuffix(providedCol, ".*") {
+				wantedCol.Prefixes = append(wantedCol.Prefixes, strings.TrimSuffix(providedCol, "*"))
+				continue
+			}
+
+			col, err := syntax.ParseNSID(providedCol)
+			if err != nil {
+
+				return nil, fmt.Errorf("%w: invalid collection: %s", ErrInvalidOptions, providedCol)
+			}
+			wantedCol.FullPaths[col.String()] = struct{}{}
+		}
+	}
+
 	c := Consumer{
 		SocketURL: socketURL,
 		Progress: &Progress{
 			LastSeq: -1,
 		},
-		EventTTL:          eventTTL,
-		Emit:              emit,
-		UncompressedDB:    uDB,
-		CompressedDB:      cDB,
-		encoder:           encoder,
-		logger:            log,
-		clock:             clock,
-		buf:               make(chan *models.Event, 10_000),
-		sequencerShutdown: make(chan chan struct{}),
+		EventTTL:           eventTTL,
+		Emit:               emit,
+		UncompressedDB:     uDB,
+		CompressedDB:       cDB,
+		encoder:            encoder,
+		logger:             log,
+		clock:              clock,
+		buf:                make(chan *models.Event, 10_000),
+		sequencerShutdown:  make(chan chan struct{}),
+		wantedCollections:  wantedCol,
+		shouldEmitIdentity: shouldEmitIdentity,
+		shouldEmitAccount:  shouldEmitAccount,
 
 		sequenced: eventsSequencedCounter.WithLabelValues(socketURL),
 		persisted: eventsPersistedCounter.WithLabelValues(socketURL),
@@ -132,6 +172,9 @@ func (c *Consumer) HandleStreamEvent(ctx context.Context, xe *events.XRPCStreamE
 		}
 		return c.HandleRepoCommit(ctx, xe.RepoCommit)
 	case xe.RepoIdentity != nil:
+		if !c.shouldEmitIdentity {
+			return nil
+		}
 		eventsProcessedCounter.WithLabelValues("identity", c.SocketURL).Inc()
 		now := time.Now()
 		c.Progress.Update(xe.RepoIdentity.Seq, now)
@@ -155,6 +198,9 @@ func (c *Consumer) HandleStreamEvent(ctx context.Context, xe *events.XRPCStreamE
 		lastEvtCreatedEvtProcessedGapGauge.WithLabelValues(c.SocketURL).Set(float64(now.Sub(t).Seconds()))
 		lastSeqGauge.WithLabelValues(c.SocketURL).Set(float64(xe.RepoIdentity.Seq))
 	case xe.RepoAccount != nil:
+		if !c.shouldEmitAccount {
+			return nil
+		}
 		eventsProcessedCounter.WithLabelValues("account", c.SocketURL).Inc()
 		now := time.Now()
 		c.Progress.Update(xe.RepoAccount.Seq, now)
@@ -217,6 +263,10 @@ func (c *Consumer) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSub
 
 	for _, op := range evt.Ops {
 		collection := strings.Split(op.Path, "/")[0]
+		if !c.WantsCollection(collection) {
+			continue
+		}
+
 		rkey := strings.Split(op.Path, "/")[1]
 
 		ek := repomgr.EventKind(op.Action)
@@ -392,4 +442,32 @@ func (c *Consumer) Shutdown() {
 	case <-shutdown:
 		c.logger.Info("sequencer shutdown complete")
 	}
+}
+
+// WantsCollection returns true if the consumer wants the given collection
+func (c *Consumer) WantsCollection(collection string) bool {
+	if c.wantedCollections == nil || collection == "" {
+		return true
+	}
+
+	// Check for the root wildcard first, indicating all collections
+	if len(c.wantedCollections.Prefixes) == 1 && c.wantedCollections.Prefixes[0] == "." {
+		return true
+	}
+
+	// Next full paths for fast lookup
+	if len(c.wantedCollections.FullPaths) > 0 {
+		if _, match := c.wantedCollections.FullPaths[collection]; match {
+			return true
+		}
+	}
+
+	// Check the prefixes (shortest first)
+	for _, prefix := range c.wantedCollections.Prefixes {
+		if strings.HasPrefix(collection, prefix) {
+			return true
+		}
+	}
+
+	return false
 }
