@@ -51,7 +51,7 @@ The following Query Parameters are supported:
 
 - `wantedCollections` - An array of [Collection NSIDs](https://atproto.com/specs/nsid) to filter which records you receive on your stream (default empty = all collections)
   - `wantedCollections` supports NSID path prefixes i.e. `app.bsky.graph.*`, or `app.bsky.*`. The prefix before the `.*` must pass NSID validation and Jetstream **does not** support incomplete prefixes i.e. `app.bsky.graph.fo*`.
-  - Regardless of desired collections, all subscribers recieve Account and Identity events.
+  - Regardless of desired collections, all subscribers receive Account and Identity events.
   - You can specify at most 100 wanted collections/prefixes.
 - `wantedDids` - An array of Repo DIDs to filter which records you receive on your stream (Default empty = all repos)
   - You can specify at most 10,000 wanted DIDs.
@@ -60,7 +60,7 @@ The following Query Parameters are supported:
   - An absent cursor or a cursor from the future will result in live-tail operation
   - When reconnecting, use the `time_us` from your most recently processed event and maybe provide a negative buffer (i.e. subtract a few seconds) to ensure gapless playback
 - `compress` - Set to `true` to enable `zstd` [compression](#compression)
-- `requireHello` - Set to `true` to pause replay/live-tail until the server recevies a [`SubscriberOptionsUpdatePayload`](#options-updates) over the socket in a [Subscriber Sourced Message](#subscriber-sourced-messages)
+- `requireHello` - Set to `true` to pause replay/live-tail until the server receives a [`SubscriberOptionsUpdatePayload`](#options-updates) over the socket in a [Subscriber Sourced Message](#subscriber-sourced-messages)
 
 ### Examples
 
