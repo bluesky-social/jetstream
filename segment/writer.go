@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -152,7 +153,7 @@ func resumeExistingSegment(f *os.File, size int64, path string) error {
 	if _, err := f.ReadAt(head, 0); err != nil {
 		return fmt.Errorf("segment: read magic: %w", err)
 	}
-	if string(head) != string(segmentMagic) {
+	if !bytes.Equal(head, segmentMagic) {
 		return fmt.Errorf("%w: %s: bad magic %q", ErrCorruptSegment, path, head)
 	}
 
