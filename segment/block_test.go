@@ -1,6 +1,8 @@
 package segment
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"math"
 	"strings"
@@ -77,4 +79,71 @@ func TestValidateRejectsOversizedFields(t *testing.T) {
 				"expected ErrFieldTooLong, got %v", err)
 		})
 	}
+}
+
+func TestEncodeBlockUncompressedHandcrafted(t *testing.T) {
+	t.Parallel()
+
+	events := []Event{
+		{
+			Seq: 1, IndexedAt: 100, RenderedAt: 0, Kind: KindCreate,
+			DID: "d1", Collection: "c1", Rkey: "r1", Rev: "v1",
+			Payload: []byte{0xAA, 0xBB},
+		},
+		{
+			Seq: 2, IndexedAt: 200, RenderedAt: 250, Kind: KindIdentity,
+			DID: "d22", Collection: "", Rkey: "", Rev: "",
+			Payload: nil,
+		},
+	}
+
+	got, err := encodeBlock(events)
+	require.NoError(t, err)
+
+	// Build the expected bytes by hand to pin the layout.
+	var want bytes.Buffer
+	w := func(v any) {
+		require.NoError(t, binary.Write(&want, binary.LittleEndian, v))
+	}
+
+	w(uint32(2)) // event_count
+
+	// Fixed-size columns, in spec order:
+	w(uint64(1))
+	w(uint64(2)) // seq[]
+	w(int64(100))
+	w(int64(200)) // indexed_at[]
+	w(int64(0))
+	w(int64(250)) // rendered_at[]
+	w(uint8(KindCreate))
+	w(uint8(KindIdentity)) // kind[]
+	w(uint8(2))
+	w(uint8(0)) // collection_len[]
+	w(uint16(2))
+	w(uint16(3)) // did_len[]
+	w(uint8(2))
+	w(uint8(0)) // rkey_len[]
+	w(uint8(2))
+	w(uint8(0)) // rev_len[]
+	w(uint32(2))
+	w(uint32(0)) // event_len[]
+
+	// Variable-length blobs, in spec order:
+	want.WriteString("c1")         // collections
+	want.WriteString("d1d22")      // dids
+	want.WriteString("r1")         // rkeys
+	want.WriteString("v1")         // revs
+	want.Write([]byte{0xAA, 0xBB}) // payloads
+
+	require.Equal(t, want.Bytes(), got)
+}
+
+func TestEncodeBlockEmptyReturnsError(t *testing.T) {
+	t.Parallel()
+
+	// Zero events is not a meaningful block; the writer's Flush is
+	// the no-op layer. encodeBlock itself rejects empty input so a
+	// caller can never accidentally write a zero-event block.
+	_, err := encodeBlock(nil)
+	require.Error(t, err)
 }
