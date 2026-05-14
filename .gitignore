@@ -34,3 +34,4 @@ go.work.sum
 
 # Files not for distribution
 DESIGN.md
+/docs/
