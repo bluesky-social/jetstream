@@ -1,0 +1,36 @@
+version: "2"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  enable:
+    - bodyclose
+    - durationcheck
+    - errorlint
+    - fatcontext
+    - misspell
+    - musttag
+    - nakedret
+    - nilerr
+    - noctx
+    - paralleltest
+    - unconvert
+    - wastedassign
+  settings:
+    errcheck:
+      check-type-assertions: true
+    gocritic:
+      enable-all: true
+    paralleltest:
+      ignore-missing-subtests: true
+
+formatters:
+  enable:
+    - gofmt
+  settings:
+    gofmt:
+      rewrite-rules:
+        - pattern: 'interface{}'
+          replacement: 'any'

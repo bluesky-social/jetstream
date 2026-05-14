@@ -1,0 +1,33 @@
+# Dependabot configuration.
+#
+# We pin every action in .github/workflows/* to a full commit SHA for
+# supply-chain safety. Without an automated bump mechanism, SHA pinning
+# becomes its own security risk — pinned versions silently age into
+# unpatched CVEs. Dependabot solves that by opening PRs we can review,
+# updating both the SHA and the trailing `# vX.Y.Z` tag comment together.
+#
+# Go modules get the same treatment: weekly grouped PRs keep us close to
+# upstream without a flood of single-package noise.
+
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Group all action bumps into a single PR per week so review effort
+    # scales with calendar time, not with how many actions we use.
+    groups:
+      github-actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-deps:
+        patterns: ["*"]
+    open-pull-requests-limit: 5

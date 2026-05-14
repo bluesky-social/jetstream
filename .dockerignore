@@ -1,0 +1,28 @@
+# Keep the build context small and reproducible. Anything not needed by
+# `go build` or by build-time tooling stays out.
+
+.git
+.gitignore
+.github
+
+# Local build artifacts
+bin/
+*.test
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Project docs not needed at build time
+*.md
+
+# Local secrets / env files
+.env
+
+# Docker bookkeeping
+Dockerfile
+.dockerignore
