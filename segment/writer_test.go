@@ -300,3 +300,35 @@ func walkFramedBlocks(t *testing.T, body []byte) [][]Event {
 	}
 	return out
 }
+
+func TestCloseFlushesPending(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 4})
+	require.NoError(t, err)
+
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "d", Payload: []byte("x")})
+	require.NoError(t, err)
+
+	require.NoError(t, w.Close())
+
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Greater(t, len(contents), reservedHeaderBytes+8,
+		"Close must flush pending events before closing the file")
+}
+
+func TestCloseIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path})
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	require.NoError(t, w.Close(), "second Close should be a no-op")
+}
