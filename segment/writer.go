@@ -7,16 +7,24 @@ import (
 	"os"
 )
 
-// DefaultMaxEventsPerBlock matches DESIGN.md §3.2.
-const DefaultMaxEventsPerBlock = 4096
+const (
+	// The default number of events to store in a single segment block. This
+	// value is just the default, and is configurable by the user.
+	DefaultMaxEventsPerBlock = 4096
 
-// reservedHeaderBytes is the 256-byte placeholder region at the
-// start of an active segment file (DESIGN.md §3.1.2). It stays
-// zero in this slice; the future Seal step writes the real header.
-const reservedHeaderBytes = 256
+	// reservedHeaderBytes is the size of the fixed header at the
+	// start of every segment file (DESIGN.md §3.1.2): the first
+	// len(segmentMagic) bytes are the magic, the remainder is
+	// zero-filled placeholder for the future Seal step. It is also
+	// the byte offset at which the framed-block region begins.
+	reservedHeaderBytes = 256
+)
 
-// sealedMagic marks a sealed segment file. New rejects sealed files.
-var sealedMagic = []byte("jss0")
+// segmentMagic is written at offset 0 of every segment file at
+// creation time; it identifies the file as a jetstream segment.
+// It does NOT indicate sealing — sealed-vs-active is determined
+// by the (future) checksum trailer, not by a magic comparison.
+var segmentMagic = []byte("jss0")
 
 // Config controls writer behavior. Path is required.
 type Config struct {
@@ -60,6 +68,7 @@ func New(cfg Config) (*Writer, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+
 	if cfg.MaxEventsPerBlock == 0 {
 		cfg.MaxEventsPerBlock = DefaultMaxEventsPerBlock
 	}
@@ -72,63 +81,94 @@ func New(cfg Config) (*Writer, error) {
 		return nil, fmt.Errorf("segment: open %s: %w", cfg.Path, err)
 	}
 
+	success := false
+	defer func() {
+		if !success {
+			_ = f.Close()
+		}
+	}()
+
 	info, err := f.Stat()
 	if err != nil {
-		_ = f.Close()
 		return nil, fmt.Errorf("segment: stat %s: %w", cfg.Path, err)
 	}
 
 	if info.Size() == 0 {
-		// Brand-new file: write 256 zero bytes for the reserved header.
-		if _, err := f.Write(make([]byte, reservedHeaderBytes)); err != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("segment: write header: %w", err)
-		}
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("segment: fsync header: %w", err)
-		}
-	} else {
-		if info.Size() < reservedHeaderBytes {
-			_ = f.Close()
-			return nil, fmt.Errorf("%w: %s is %d bytes",
-				ErrCorruptSegment, cfg.Path, info.Size())
-		}
-		// Read the first 4 bytes to check for the sealed magic.
-		head := make([]byte, len(sealedMagic))
-		if _, err := f.ReadAt(head, 0); err != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("segment: read magic: %w", err)
-		}
-		if string(head) == string(sealedMagic) {
-			_ = f.Close()
-			return nil, fmt.Errorf("%w: %s", ErrSegmentSealed, cfg.Path)
-		}
-		// Active file: walk the framed-block region from offset
-		// reservedHeaderBytes forward, find the last fully-durable
-		// block boundary, and truncate any torn tail before
-		// appending. Without this, a crash mid-Write leaves bytes
-		// past the last good frame that a future recovery walker
-		// would interpret as a malformed block, masking everything
-		// after it.
-		end, err := lastGoodOffset(f, info.Size())
-		if err != nil {
-			_ = f.Close()
+		if err := initializeNewSegment(f); err != nil {
 			return nil, err
 		}
-		if end < info.Size() {
-			if err := f.Truncate(end); err != nil {
-				_ = f.Close()
-				return nil, fmt.Errorf("segment: truncate torn tail: %w", err)
-			}
-		}
-		if _, err := f.Seek(end, io.SeekStart); err != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("segment: seek end: %w", err)
+	} else {
+		if err := resumeExistingSegment(f, info.Size(), cfg.Path); err != nil {
+			return nil, err
 		}
 	}
 
+	success = true
 	return &Writer{cfg: cfg, file: f}, nil
+}
+
+// initializeNewSegment writes the fixed reserved header to a
+// brand-new (zero-length) segment file and fsyncs it. The header
+// is segmentMagic followed by enough zero-filled padding to reach
+// reservedHeaderBytes total. The returned error is already wrapped
+// for the caller; the caller is responsible for closing f on
+// failure.
+func initializeNewSegment(f *os.File) error {
+	header := make([]byte, reservedHeaderBytes)
+	copy(header, segmentMagic)
+
+	if _, err := f.Write(header); err != nil {
+		return fmt.Errorf("segment: write header: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("segment: fsync header: %w", err)
+	}
+
+	return nil
+}
+
+// resumeExistingSegment validates that f is a well-formed segment
+// file, truncates any torn tail past the last fully-durable block,
+// and positions the file offset at end-of-data so the next Write
+// extends the segment in place. Without the truncate, a crash
+// mid-Write leaves bytes past the last good frame that a future
+// recovery walker would interpret as a malformed block, masking
+// everything after it. The caller is responsible for closing f on
+// failure.
+//
+// Sealed-vs-active is intentionally not checked here: in this slice
+// every successfully-initialized segment carries segmentMagic at
+// offset 0, and the sealed marker is the (future) checksum trailer.
+// kaizen: once the trailer format lands, this function should also
+// reject sealed segments with ErrSegmentSealed.
+func resumeExistingSegment(f *os.File, size int64, path string) error {
+	if size < reservedHeaderBytes {
+		return fmt.Errorf("%w: %s is %d bytes",
+			ErrCorruptSegment, path, size)
+	}
+
+	head := make([]byte, len(segmentMagic))
+	if _, err := f.ReadAt(head, 0); err != nil {
+		return fmt.Errorf("segment: read magic: %w", err)
+	}
+	if string(head) != string(segmentMagic) {
+		return fmt.Errorf("%w: %s: bad magic %q", ErrCorruptSegment, path, head)
+	}
+
+	end, err := lastGoodOffset(f, size)
+	if err != nil {
+		return err
+	}
+	if end < size {
+		if err := f.Truncate(end); err != nil {
+			return fmt.Errorf("segment: truncate torn tail: %w", err)
+		}
+	}
+	if _, err := f.Seek(end, io.SeekStart); err != nil {
+		return fmt.Errorf("segment: seek end: %w", err)
+	}
+	return nil
 }
 
 // lastGoodOffset walks the framed-block region of an active segment

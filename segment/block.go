@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-
-	"github.com/klauspost/compress/zstd"
 )
 
 // validate checks that ev's fields fit the on-disk column widths and
@@ -16,24 +14,19 @@ func validate(ev Event) error {
 		return fmt.Errorf("%w: %d", ErrInvalidKind, ev.Kind)
 	}
 	if len(ev.DID) > math.MaxUint16 {
-		return fmt.Errorf("%w: did is %d bytes (max %d)",
-			ErrFieldTooLong, len(ev.DID), math.MaxUint16)
+		return fmt.Errorf("%w: did is %d bytes (max %d)", ErrFieldTooLong, len(ev.DID), math.MaxUint16)
 	}
 	if len(ev.Collection) > math.MaxUint8 {
-		return fmt.Errorf("%w: collection is %d bytes (max %d)",
-			ErrFieldTooLong, len(ev.Collection), math.MaxUint8)
+		return fmt.Errorf("%w: collection is %d bytes (max %d)", ErrFieldTooLong, len(ev.Collection), math.MaxUint8)
 	}
 	if len(ev.Rkey) > math.MaxUint8 {
-		return fmt.Errorf("%w: rkey is %d bytes (max %d)",
-			ErrFieldTooLong, len(ev.Rkey), math.MaxUint8)
+		return fmt.Errorf("%w: rkey is %d bytes (max %d)", ErrFieldTooLong, len(ev.Rkey), math.MaxUint8)
 	}
 	if len(ev.Rev) > math.MaxUint8 {
-		return fmt.Errorf("%w: rev is %d bytes (max %d)",
-			ErrFieldTooLong, len(ev.Rev), math.MaxUint8)
+		return fmt.Errorf("%w: rev is %d bytes (max %d)", ErrFieldTooLong, len(ev.Rev), math.MaxUint8)
 	}
 	if len(ev.Payload) > math.MaxUint32 {
-		return fmt.Errorf("%w: payload is %d bytes (max %d)",
-			ErrFieldTooLong, len(ev.Payload), math.MaxUint32)
+		return fmt.Errorf("%w: payload is %d bytes (max %d)", ErrFieldTooLong, len(ev.Payload), math.MaxUint32)
 	}
 	return nil
 }
@@ -71,16 +64,14 @@ func encodeBlockColumns(c columns) []byte {
 	}
 
 	const fixedPerEvent = 8 + 8 + 8 + 1 + 1 + 2 + 1 + 1 + 4
-	totalSize := 4 + n*fixedPerEvent +
-		totalCollLen + totalDIDLen + totalRkeyLen + totalRevLen + totalPayloadLen
+	totalSize := 4 + n*fixedPerEvent + totalCollLen + totalDIDLen + totalRkeyLen + totalRevLen + totalPayloadLen
 
 	buf := make([]byte, 0, totalSize)
 	le := binary.LittleEndian
 
 	buf = le.AppendUint32(buf, uint32(n))
 
-	// Fixed-size columns, in spec order. One loop per column gives
-	// the CPU a clean prefetch stride.
+	// Fixed-size columns, in spec order
 	for i := range n {
 		buf = le.AppendUint64(buf, c.Seq(i))
 	}
@@ -145,16 +136,13 @@ func (e eventColumns) Rev(i int) string        { return e[i].Rev }
 func (e eventColumns) Payload(i int) []byte    { return e[i].Payload }
 
 // encodeBlock writes the uncompressed columnar body for the given
-// events. Callers must pass at least one event.
+// events. Callers must pass at least one event. Events must be
+// validated before this call.
 func encodeBlock(events []Event) ([]byte, error) {
 	if len(events) == 0 {
 		return nil, fmt.Errorf("segment: encodeBlock called with zero events")
 	}
-	for i := range events {
-		if err := validate(events[i]); err != nil {
-			return nil, fmt.Errorf("event %d: %w", i, err)
-		}
-	}
+
 	return encodeBlockColumns(eventColumns(events)), nil
 }
 
@@ -170,7 +158,7 @@ var errTruncatedBlock = errors.New("segment: truncated or malformed block")
 // the int32 ceiling (2_147_483_647) that would otherwise trip
 // int(nEvents64) on a 32-bit build. It also caps the up-front
 // allocation a hostile header can force.
-const maxBlockEventsLimit = 1 << 24 // 16,777,216
+const maxBlockEventsLimit = 1 << 18 // 262,144
 
 // decodeBlock is the inverse of encodeBlock. It validates input
 // length at every step so a malicious header cannot provoke an
@@ -181,6 +169,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	if len(buf) < 4 {
 		return nil, errTruncatedBlock
 	}
+
 	le := binary.LittleEndian
 	nEvents64 := uint64(le.Uint32(buf[:4]))
 	off := 4
@@ -368,53 +357,4 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	}
 
 	return events, nil
-}
-
-// blockEncoder is a process-wide reusable zstd encoder at the
-// default level (klauspost's SpeedDefault, which is zstd level 3 —
-// the format default). zstd.Encoder.EncodeAll is documented as
-// safe for concurrent calls, which makes a single instance fine
-// despite the package being single-writer.
-//
-// Construction takes a static, known-good option set; failure
-// indicates a programming error (or a broken klauspost build) so
-// we panic in init rather than make every caller check a sentinel.
-var (
-	blockEncoder *zstd.Encoder
-	blockDecoder *zstd.Decoder
-)
-
-func init() {
-	enc, err := zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedDefault),
-		zstd.WithEncoderCRC(true),
-	)
-	if err != nil {
-		panic(fmt.Sprintf("segment: zstd encoder init failed: %v", err))
-	}
-	dec, err := zstd.NewReader(nil)
-	if err != nil {
-		panic(fmt.Sprintf("segment: zstd decoder init failed: %v", err))
-	}
-	blockEncoder = enc
-	blockDecoder = dec
-}
-
-// encodeBlockCompressed encodes events with encodeBlock, then wraps
-// the result in a single zstd frame with content checksums enabled.
-func encodeBlockCompressed(events []Event) ([]byte, error) {
-	body, err := encodeBlock(events)
-	if err != nil {
-		return nil, err
-	}
-	return blockEncoder.EncodeAll(body, nil), nil
-}
-
-// decodeBlockCompressed is the inverse: decompress, then decodeBlock.
-func decodeBlockCompressed(frame []byte) ([]Event, error) {
-	body, err := blockDecoder.DecodeAll(frame, nil)
-	if err != nil {
-		return nil, fmt.Errorf("segment: zstd decompress: %w", err)
-	}
-	return decodeBlock(body)
 }

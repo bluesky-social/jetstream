@@ -9,11 +9,12 @@ var (
 
 	// ErrCorruptSegment is returned by New when an existing segment
 	// file is smaller than the 256-byte reserved header region.
-	ErrCorruptSegment = errors.New("segment: file is smaller than reserved header")
+	ErrCorruptSegment = errors.New("segment: file is corrupt")
 
-	// ErrSegmentSealed is returned by New when the file's first 4
-	// bytes are the sealed magic "jss0". Sealing is implemented in a
-	// later slice; for now we reject sealed files cleanly.
+	// ErrSegmentSealed will be returned by New when the file carries
+	// a sealed checksum trailer. The seal/unseal mechanism lands in a
+	// later slice; the sentinel is reserved here so callers can already
+	// switch on it.
 	ErrSegmentSealed = errors.New("segment: file is already sealed")
 
 	// ErrFieldTooLong is returned by Append when a string or Payload

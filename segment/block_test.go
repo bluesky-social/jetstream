@@ -16,7 +16,7 @@ import (
 func TestValidateAcceptsHappyPath(t *testing.T) {
 	t.Parallel()
 
-	ev := Event{
+	require.NoError(t, validate(Event{
 		Seq:        42,
 		IndexedAt:  1_700_000_000_000_000,
 		RenderedAt: 0,
@@ -25,9 +25,8 @@ func TestValidateAcceptsHappyPath(t *testing.T) {
 		Collection: "app.bsky.feed.post",
 		Rkey:       "3l3qo2vuowo2b",
 		Rev:        "3l3qo2vutsw2b",
-		Payload:    []byte("any drisl bytes"),
-	}
-	require.NoError(t, validate(ev))
+		Payload:    []byte("any DRISL bytes"),
+	}))
 }
 
 func TestValidateRejectsInvalidKind(t *testing.T) {
@@ -108,27 +107,26 @@ func TestEncodeBlockUncompressedHandcrafted(t *testing.T) {
 		require.NoError(t, binary.Write(&want, binary.LittleEndian, v))
 	}
 
+	// In spec order:
 	w(uint32(2)) // event_count
-
-	// Fixed-size columns, in spec order:
-	w(uint64(1))
-	w(uint64(2)) // seq[]
-	w(int64(100))
-	w(int64(200)) // indexed_at[]
-	w(int64(0))
-	w(int64(250)) // rendered_at[]
-	w(uint8(KindCreate))
-	w(uint8(KindIdentity)) // kind[]
-	w(uint8(2))
-	w(uint8(0)) // collection_len[]
-	w(uint16(2))
-	w(uint16(3)) // did_len[]
-	w(uint8(2))
-	w(uint8(0)) // rkey_len[]
-	w(uint8(2))
-	w(uint8(0)) // rev_len[]
-	w(uint32(2))
-	w(uint32(0)) // event_len[]
+	w(uint64(1)) // seq[]
+	w(uint64(2))
+	w(int64(100)) // indexed_at[]
+	w(int64(200))
+	w(int64(0)) // rendered_at[]
+	w(int64(250))
+	w(uint8(KindCreate)) // kind[]
+	w(uint8(KindIdentity))
+	w(uint8(2)) // collection_len[]
+	w(uint8(0))
+	w(uint16(2)) // did_len[]
+	w(uint16(3))
+	w(uint8(2)) // rkey_len[]
+	w(uint8(0))
+	w(uint8(2)) // rev_len[]
+	w(uint8(0))
+	w(uint32(2)) // event_len[]
+	w(uint32(0))
 
 	// Variable-length blobs, in spec order:
 	want.WriteString("c1")         // collections

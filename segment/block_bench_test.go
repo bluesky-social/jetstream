@@ -142,6 +142,7 @@ func BenchmarkFlushToTmpfs(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
+
 		for j := range events {
 			if _, err := w.Append(events[j]); err != nil {
 				b.Fatal(err)

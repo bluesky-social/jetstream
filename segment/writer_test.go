@@ -22,12 +22,16 @@ func TestNewCreatesEmpty256ByteFile(t *testing.T) {
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	require.EqualValues(t, 256, info.Size())
+	require.EqualValues(t, reservedHeaderBytes, info.Size())
 
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
-	for i, b := range contents {
-		require.Zerof(t, b, "byte %d should be zero", i)
+
+	// Layout: segmentMagic + zero padding to reservedHeaderBytes.
+	require.Equal(t, segmentMagic, contents[:len(segmentMagic)],
+		"first %d bytes must be segmentMagic", len(segmentMagic))
+	for i, b := range contents[len(segmentMagic):] {
+		require.Zerof(t, b, "padding byte %d should be zero", i+len(segmentMagic))
 	}
 }
 
@@ -59,17 +63,25 @@ func TestNewRejectsTooSmallFile(t *testing.T) {
 	require.True(t, errors.Is(err, ErrCorruptSegment))
 }
 
-func TestNewRejectsSealedFile(t *testing.T) {
+// TestNewRejectsBadMagic covers the magic-validation path in
+// resumeExistingSegment: a header-sized file whose first 4 bytes
+// are not segmentMagic must be rejected as corrupt.
+//
+// kaizen: when the seal/unseal trailer format lands, add a
+// dedicated TestNewRejectsSealedFile that builds a real sealed
+// segment (via the future Seal API) and expects ErrSegmentSealed.
+// Until then ErrSegmentSealed has no producer in this slice.
+func TestNewRejectsBadMagic(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg.jss")
-	header := make([]byte, 256)
-	copy(header, []byte("jss0"))
+	header := make([]byte, reservedHeaderBytes)
+	copy(header, []byte("XXXX"))
 	require.NoError(t, os.WriteFile(path, header, 0o644))
 
 	_, err := New(Config{Path: path})
-	require.True(t, errors.Is(err, ErrSegmentSealed))
+	require.True(t, errors.Is(err, ErrCorruptSegment))
 }
 
 func TestNewRejectsInvalidConfig(t *testing.T) {
