@@ -8,8 +8,12 @@
 #
 #   1. Every third-party action is pinned to a full 40-character commit SHA,
 #      not a mutable tag. Tags can be force-pushed (cf. the tj-actions/
-#      changed-files compromise of March 2025); commit SHAs cannot. Dependabot
-#      is configured separately to update these in PRs we can review.
+#      changed-files compromise of March 2025); commit SHAs cannot. We
+#      bump these by hand on a periodic cadence — Dependabot is intentionally
+#      not used, since it runs as a privileged actor in the repo, opens PRs
+#      that touch sensitive build configuration, and has its own history of
+#      supply-chain incidents (e.g. the 2023 Dependabot impersonation issue).
+#      Manual review of each upgrade is cheap at this dependency footprint.
 #
 #   2. The workflow-level `permissions:` block grants nothing. Each job adds
 #      only the scopes it needs. The default GITHUB_TOKEN on older repos can
