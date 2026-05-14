@@ -56,7 +56,7 @@ func BenchmarkEncodeBlock(b *testing.B) {
 			events := makeBenchEvents(b, tc.n, tc.opts)
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				out, err := encodeBlockCompressed(events)
 				if err != nil {
 					b.Fatal(err)
@@ -87,7 +87,7 @@ func BenchmarkDecodeBlock(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(frame)))
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				if _, err := decodeBlockCompressed(frame); err != nil {
 					b.Fatal(err)
 				}
@@ -117,8 +117,8 @@ func BenchmarkAppend(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for i := 0; b.Loop(); i++ {
 		template.Seq = uint64(i)
 		if _, err := w.Append(template); err != nil {
 			b.Fatal(err)
@@ -134,8 +134,8 @@ func BenchmarkFlushToTmpfs(b *testing.B) {
 	events := makeBenchEvents(b, 4096, benchOpts{})
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		dir := b.TempDir()
 		path := filepath.Join(dir, "seg.jss")
 		w, err := New(Config{Path: path})

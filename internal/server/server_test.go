@@ -130,7 +130,7 @@ func TestServer_RecordsMetricsForPublicRequests(t *testing.T) {
 	// `commit` was deliberately removed from the histogram (it duplicates
 	// build_info and resets every series on deploy); if it ever comes
 	// back, scan the histogram lines specifically.
-	for _, line := range strings.Split(metrics, "\n") {
+	for line := range strings.SplitSeq(metrics, "\n") {
 		if !strings.HasPrefix(line, "jetstream_http_request_duration_seconds") {
 			continue
 		}

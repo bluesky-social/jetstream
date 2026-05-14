@@ -38,7 +38,7 @@ func requireHistogramHasObservation(t *testing.T, m *obs.Metrics, handler, metho
 		`jetstream_http_request_duration_seconds_count{code=%q,handler=%q,method=%q} `,
 		code, handler, method,
 	)
-	for _, line := range strings.Split(string(body), "\n") {
+	for line := range strings.SplitSeq(string(body), "\n") {
 		if strings.HasPrefix(line, want) {
 			return
 		}

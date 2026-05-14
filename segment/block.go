@@ -62,7 +62,7 @@ func encodeBlockColumns(c columns) []byte {
 	n := c.Len()
 
 	var totalCollLen, totalDIDLen, totalRkeyLen, totalRevLen, totalPayloadLen int
-	for i := 0; i < n; i++ {
+	for i := range n {
 		totalCollLen += len(c.Collection(i))
 		totalDIDLen += len(c.DID(i))
 		totalRkeyLen += len(c.Rkey(i))
@@ -81,48 +81,48 @@ func encodeBlockColumns(c columns) []byte {
 
 	// Fixed-size columns, in spec order. One loop per column gives
 	// the CPU a clean prefetch stride.
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = le.AppendUint64(buf, c.Seq(i))
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = le.AppendUint64(buf, uint64(c.IndexedAt(i)))
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = le.AppendUint64(buf, uint64(c.RenderedAt(i)))
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = append(buf, c.Kind(i))
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = append(buf, uint8(len(c.Collection(i))))
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = le.AppendUint16(buf, uint16(len(c.DID(i))))
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = append(buf, uint8(len(c.Rkey(i))))
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = append(buf, uint8(len(c.Rev(i))))
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = le.AppendUint32(buf, uint32(len(c.Payload(i))))
 	}
 
 	// Variable-length blobs, in spec order.
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = append(buf, c.Collection(i)...)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = append(buf, c.DID(i)...)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = append(buf, c.Rkey(i)...)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = append(buf, c.Rev(i)...)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buf = append(buf, c.Payload(i)...)
 	}
 
@@ -221,7 +221,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; i < nEvents; i++ {
+	for i := range nEvents {
 		events[i].Seq = le.Uint64(chunk[i*8 : i*8+8])
 	}
 
@@ -230,7 +230,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; i < nEvents; i++ {
+	for i := range nEvents {
 		events[i].IndexedAt = int64(le.Uint64(chunk[i*8 : i*8+8]))
 	}
 
@@ -239,7 +239,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; i < nEvents; i++ {
+	for i := range nEvents {
 		events[i].RenderedAt = int64(le.Uint64(chunk[i*8 : i*8+8]))
 	}
 
@@ -248,7 +248,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; i < nEvents; i++ {
+	for i := range nEvents {
 		k := Kind(chunk[i])
 		if k < KindCreate || k > KindSync {
 			return nil, errTruncatedBlock
@@ -268,7 +268,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 		return nil, err
 	}
 	didLen := make([]uint16, nEvents)
-	for i := 0; i < nEvents; i++ {
+	for i := range nEvents {
 		didLen[i] = le.Uint16(chunk[i*2 : i*2+2])
 	}
 
@@ -290,7 +290,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 		return nil, err
 	}
 	eventLen := make([]uint32, nEvents)
-	for i := 0; i < nEvents; i++ {
+	for i := range nEvents {
 		eventLen[i] = le.Uint32(chunk[i*4 : i*4+4])
 	}
 
@@ -299,7 +299,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	readStringField := func(lengths func(i int) int) ([]string, error) {
 		out := make([]string, nEvents)
 		var total int
-		for i := 0; i < nEvents; i++ {
+		for i := range nEvents {
 			total += lengths(i)
 		}
 		blob, err := read(total)
@@ -307,7 +307,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 			return nil, err
 		}
 		var cur int
-		for i := 0; i < nEvents; i++ {
+		for i := range nEvents {
 			n := lengths(i)
 			out[i] = string(blob[cur : cur+n])
 			cur += n
@@ -334,7 +334,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 
 	// payloads[]: same shape but []byte, and Payload == nil for zero-length.
 	var totalPayload int
-	for i := 0; i < nEvents; i++ {
+	for i := range nEvents {
 		totalPayload += int(eventLen[i])
 	}
 	payloadBlob, err := read(totalPayload)
@@ -349,7 +349,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	}
 
 	var pcur int
-	for i := 0; i < nEvents; i++ {
+	for i := range nEvents {
 		events[i].Collection = collections[i]
 		events[i].DID = dids[i]
 		events[i].Rkey = rkeys[i]

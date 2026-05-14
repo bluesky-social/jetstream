@@ -95,7 +95,7 @@ func TestAppendBuffersEvents(t *testing.T) {
 	require.Equal(t, 0, w.Pending())
 	require.Equal(t, DefaultMaxEventsPerBlock, w.Cap())
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		full, err := w.Append(Event{
 			Seq: uint64(i + 1), Kind: KindCreate, DID: "did:plc:a",
 		})

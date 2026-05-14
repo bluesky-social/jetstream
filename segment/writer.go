@@ -254,7 +254,7 @@ func (p *pendingBlock) Kind(i int) uint8       { return p.kind[i] }
 
 func (p *pendingBlock) Collection(i int) string {
 	var off int
-	for j := 0; j < i; j++ {
+	for j := range i {
 		off += int(p.collLen[j])
 	}
 	return string(p.collections[off : off+int(p.collLen[i])])
@@ -262,7 +262,7 @@ func (p *pendingBlock) Collection(i int) string {
 
 func (p *pendingBlock) DID(i int) string {
 	var off int
-	for j := 0; j < i; j++ {
+	for j := range i {
 		off += int(p.didLen[j])
 	}
 	return string(p.dids[off : off+int(p.didLen[i])])
@@ -270,7 +270,7 @@ func (p *pendingBlock) DID(i int) string {
 
 func (p *pendingBlock) Rkey(i int) string {
 	var off int
-	for j := 0; j < i; j++ {
+	for j := range i {
 		off += int(p.rkeyLen[j])
 	}
 	return string(p.rkeys[off : off+int(p.rkeyLen[i])])
@@ -278,7 +278,7 @@ func (p *pendingBlock) Rkey(i int) string {
 
 func (p *pendingBlock) Rev(i int) string {
 	var off int
-	for j := 0; j < i; j++ {
+	for j := range i {
 		off += int(p.revLen[j])
 	}
 	return string(p.revs[off : off+int(p.revLen[i])])
@@ -286,7 +286,7 @@ func (p *pendingBlock) Rev(i int) string {
 
 func (p *pendingBlock) Payload(i int) []byte {
 	var off int
-	for j := 0; j < i; j++ {
+	for j := range i {
 		off += int(p.eventLen[j])
 	}
 	return p.payloads[off : off+int(p.eventLen[i])]

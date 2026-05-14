@@ -6,10 +6,15 @@ default: lint test
 install-tools:
     go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1
     go install gotest.tools/gotestsum@v1.13.0
+    go install golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.20.0
 
 # Lints the code
 lint:
     golangci-lint run --timeout 1m ./...
+
+# Apply Go modernization rewrites
+modernize *ARGS="./...":
+    modernize -fix -test {{ARGS}}
 
 # Run jetstream with arbitrary args, e.g. `just run --version` or `just run serve --addr :9090`.
 run *ARGS:

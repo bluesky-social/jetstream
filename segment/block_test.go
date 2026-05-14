@@ -184,7 +184,7 @@ func TestDecodeBlockTruncatedReturnsError(t *testing.T) {
 	encoded, err := encodeBlock(events)
 	require.NoError(t, err)
 
-	for cut := 0; cut < len(encoded); cut++ {
+	for cut := range encoded {
 		// Every prefix shorter than the full block must produce an
 		// error, never a panic and never a wrong-but-non-erroring decode.
 		_, err := decodeBlock(encoded[:cut])
@@ -346,13 +346,7 @@ func pickPayloadLen(r *rand.Rand) int {
 		return 0
 	}
 	// Geometric-ish: most around 500, occasional much larger.
-	n := int(r.NormFloat64()*250 + 500)
-	if n < 0 {
-		n = 0
-	}
-	if n > 16*1024 {
-		n = 16 * 1024
-	}
+	n := min(max(int(r.NormFloat64()*250+500), 0), 16*1024)
 	return n
 }
 
