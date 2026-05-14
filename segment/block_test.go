@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"math/rand"
 	"strings"
 	"testing"
+	"testing/quick"
 
 	"github.com/stretchr/testify/require"
 )
@@ -235,4 +237,147 @@ func mustEncode(t *testing.T, events []Event) []byte {
 	out, err := encodeBlock(events)
 	require.NoError(t, err)
 	return out
+}
+
+// genEvent produces one Event with realistic length distributions.
+// Uses *rand.Rand so the generator is deterministic given a seed.
+func genEvent(r *rand.Rand) Event {
+	// Length distributions chosen to mostly match production atproto
+	// shapes while still occasionally exercising the upper bounds.
+	didLen := pickLen(r, 32, math.MaxUint16, 0.001)
+	collLen := pickLen(r, 24, math.MaxUint8, 0.005)
+	rkeyLen := pickLen(r, 13, math.MaxUint8, 0.005)
+	revLen := pickLen(r, 13, math.MaxUint8, 0.005)
+	payloadLen := pickPayloadLen(r)
+
+	return Event{
+		Seq:        r.Uint64(),
+		IndexedAt:  int64(r.Uint64()),
+		RenderedAt: int64(r.Uint64()),
+		Kind:       Kind(1 + r.Intn(6)),
+		DID:        randString(r, didLen),
+		Collection: randString(r, collLen),
+		Rkey:       randString(r, rkeyLen),
+		Rev:        randString(r, revLen),
+		Payload:    randBytes(r, payloadLen),
+	}
+}
+
+// pickLen picks a length centered at typical with rare excursions to max.
+func pickLen(r *rand.Rand, typical, max int, rareProb float64) int {
+	if r.Float64() < rareProb {
+		return max
+	}
+	// Long-tailed but bounded around typical.
+	n := typical + r.Intn(typical/2+1) - typical/4
+	if n < 0 {
+		n = 0
+	}
+	if n > max {
+		n = max
+	}
+	return n
+}
+
+// pickPayloadLen yields nil ~10% of the time (non-commit kinds),
+// most-common around ~500 B, with a long tail up to ~16 KB.
+func pickPayloadLen(r *rand.Rand) int {
+	if r.Float64() < 0.10 {
+		return 0
+	}
+	// Geometric-ish: most around 500, occasional much larger.
+	n := int(r.NormFloat64()*250 + 500)
+	if n < 0 {
+		n = 0
+	}
+	if n > 16*1024 {
+		n = 16 * 1024
+	}
+	return n
+}
+
+func randString(r *rand.Rand, n int) string {
+	if n == 0 {
+		return ""
+	}
+	b := make([]byte, n)
+	for i := range b {
+		// Printable-ish ASCII; the encoder doesn't care about content,
+		// but readable bytes make test failures easier to debug.
+		b[i] = byte(0x20 + r.Intn(0x5F))
+	}
+	return string(b)
+}
+
+func randBytes(r *rand.Rand, n int) []byte {
+	if n == 0 {
+		return nil
+	}
+	b := make([]byte, n)
+	r.Read(b)
+	return b
+}
+
+func TestEncodeBlockRoundtripProperty(t *testing.T) {
+	t.Parallel()
+
+	cfg := &quick.Config{MaxCount: 200}
+
+	prop := func(seed int64, n uint16) bool {
+		// Map n into [1, 256] for fast tests. The swarm test covers
+		// up to 4096; this property is about correctness, not size.
+		size := 1 + int(n%256)
+		r := rand.New(rand.NewSource(seed))
+		events := make([]Event, size)
+		for i := range events {
+			events[i] = genEvent(r)
+		}
+
+		encoded, err := encodeBlockCompressed(events)
+		if err != nil {
+			t.Logf("encode failed: %v", err)
+			return false
+		}
+		decoded, err := decodeBlockCompressed(encoded)
+		if err != nil {
+			t.Logf("decode failed: %v", err)
+			return false
+		}
+		if len(decoded) != len(events) {
+			return false
+		}
+		for i := range events {
+			if !eventsEqual(events[i], decoded[i]) {
+				t.Logf("mismatch at %d: got %+v want %+v", i, decoded[i], events[i])
+				return false
+			}
+		}
+		return true
+	}
+
+	if err := quick.Check(prop, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// eventsEqual is reflect.DeepEqual with the one wrinkle that
+// nil-vs-empty Payload should be treated as equal during property
+// testing — though our decoder produces nil for zero-length, we
+// guard against test-helper drift.
+func eventsEqual(a, b Event) bool {
+	if a.Seq != b.Seq || a.IndexedAt != b.IndexedAt ||
+		a.RenderedAt != b.RenderedAt || a.Kind != b.Kind ||
+		a.DID != b.DID || a.Collection != b.Collection ||
+		a.Rkey != b.Rkey || a.Rev != b.Rev {
+		return false
+	}
+	if len(a.Payload) != len(b.Payload) {
+		return false
+	}
+	for i := range a.Payload {
+		if a.Payload[i] != b.Payload[i] {
+			return false
+		}
+	}
+	return true
 }
