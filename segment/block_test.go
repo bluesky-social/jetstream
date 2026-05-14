@@ -147,3 +147,56 @@ func TestEncodeBlockEmptyReturnsError(t *testing.T) {
 	_, err := encodeBlock(nil)
 	require.Error(t, err)
 }
+
+func TestDecodeBlockRoundtripHandcrafted(t *testing.T) {
+	t.Parallel()
+
+	events := []Event{
+		{
+			Seq: 1, IndexedAt: 100, RenderedAt: 0, Kind: KindCreate,
+			DID: "d1", Collection: "c1", Rkey: "r1", Rev: "v1",
+			Payload: []byte{0xAA, 0xBB},
+		},
+		{
+			Seq: 2, IndexedAt: 200, RenderedAt: 250, Kind: KindIdentity,
+			DID: "d22", Collection: "", Rkey: "", Rev: "",
+			Payload: nil,
+		},
+	}
+
+	encoded, err := encodeBlock(events)
+	require.NoError(t, err)
+
+	decoded, err := decodeBlock(encoded)
+	require.NoError(t, err)
+
+	// The roundtrip must be deep-equal, including Payload == nil
+	// (not []byte{}) for the zero-length case.
+	require.Equal(t, events, decoded)
+}
+
+func TestDecodeBlockTruncatedReturnsError(t *testing.T) {
+	t.Parallel()
+
+	events := []Event{{Seq: 1, Kind: KindCreate, DID: "d", Payload: []byte("x")}}
+	encoded, err := encodeBlock(events)
+	require.NoError(t, err)
+
+	for cut := 0; cut < len(encoded); cut++ {
+		// Every prefix shorter than the full block must produce an
+		// error, never a panic and never a wrong-but-non-erroring decode.
+		_, err := decodeBlock(encoded[:cut])
+		require.Error(t, err, "expected error at cut=%d", cut)
+	}
+}
+
+func TestDecodeBlockBoundedAllocation(t *testing.T) {
+	t.Parallel()
+
+	// A header claiming 1 billion events must not provoke a giant
+	// allocation; the decoder must validate against input length.
+	hostile := make([]byte, 4)
+	binary.LittleEndian.PutUint32(hostile, 1_000_000_000)
+	_, err := decodeBlock(hostile)
+	require.Error(t, err)
+}

@@ -2,6 +2,7 @@ package segment
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 )
@@ -153,4 +154,206 @@ func encodeBlock(events []Event) ([]byte, error) {
 		}
 	}
 	return encodeBlockColumns(eventColumns(events)), nil
+}
+
+// errTruncatedBlock is the sentinel for any malformed uncompressed
+// block body: short reads, length-column overflows, anything that
+// would cause the decoder to read past the input. It stays
+// unexported because the decoder itself stays unexported in this
+// slice; the future Reader type will promote it to a public sentinel.
+var errTruncatedBlock = errors.New("segment: truncated or malformed block")
+
+// decodeBlock is the inverse of encodeBlock. It validates input
+// length at every step so a malicious header cannot provoke an
+// unbounded allocation.
+func decodeBlock(buf []byte) ([]Event, error) {
+	const fixedPerEvent = 8 + 8 + 8 + 1 + 1 + 2 + 1 + 1 + 4
+
+	if len(buf) < 4 {
+		return nil, errTruncatedBlock
+	}
+	le := binary.LittleEndian
+	nEvents64 := uint64(le.Uint32(buf[:4]))
+	off := 4
+
+	// Reject impossible event counts up front. We need at least
+	// fixedPerEvent bytes per event before any variable-length
+	// data; if the remaining input can't cover that, the header is
+	// lying.
+	if uint64(len(buf)-off) < nEvents64*fixedPerEvent {
+		return nil, errTruncatedBlock
+	}
+	nEvents := int(nEvents64)
+
+	if nEvents == 0 {
+		// encodeBlock refuses empty input; a zero-event block on the
+		// wire is corruption.
+		return nil, errTruncatedBlock
+	}
+
+	events := make([]Event, nEvents)
+
+	// Helper: read N bytes starting at off, advance off, return
+	// errTruncatedBlock if the input is too short.
+	read := func(n int) ([]byte, error) {
+		if off+n > len(buf) {
+			return nil, errTruncatedBlock
+		}
+		s := buf[off : off+n]
+		off += n
+		return s, nil
+	}
+
+	// seq[]
+	chunk, err := read(nEvents * 8)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < nEvents; i++ {
+		events[i].Seq = le.Uint64(chunk[i*8 : i*8+8])
+	}
+
+	// indexed_at[]
+	chunk, err = read(nEvents * 8)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < nEvents; i++ {
+		events[i].IndexedAt = int64(le.Uint64(chunk[i*8 : i*8+8]))
+	}
+
+	// rendered_at[]
+	chunk, err = read(nEvents * 8)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < nEvents; i++ {
+		events[i].RenderedAt = int64(le.Uint64(chunk[i*8 : i*8+8]))
+	}
+
+	// kind[]
+	chunk, err = read(nEvents)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < nEvents; i++ {
+		k := Kind(chunk[i])
+		if k < KindCreate || k > KindSync {
+			return nil, errTruncatedBlock
+		}
+		events[i].Kind = k
+	}
+
+	// collection_len[]
+	collLen, err := read(nEvents)
+	if err != nil {
+		return nil, err
+	}
+
+	// did_len[]
+	chunk, err = read(nEvents * 2)
+	if err != nil {
+		return nil, err
+	}
+	didLen := make([]uint16, nEvents)
+	for i := 0; i < nEvents; i++ {
+		didLen[i] = le.Uint16(chunk[i*2 : i*2+2])
+	}
+
+	// rkey_len[]
+	rkeyLen, err := read(nEvents)
+	if err != nil {
+		return nil, err
+	}
+
+	// rev_len[]
+	revLen, err := read(nEvents)
+	if err != nil {
+		return nil, err
+	}
+
+	// event_len[]
+	chunk, err = read(nEvents * 4)
+	if err != nil {
+		return nil, err
+	}
+	eventLen := make([]uint32, nEvents)
+	for i := 0; i < nEvents; i++ {
+		eventLen[i] = le.Uint32(chunk[i*4 : i*4+4])
+	}
+
+	// Variable-length blobs. Each is a single contiguous run; we
+	// slice it into per-event substrings.
+	readStringField := func(lengths func(i int) int) ([]string, error) {
+		out := make([]string, nEvents)
+		var total int
+		for i := 0; i < nEvents; i++ {
+			total += lengths(i)
+		}
+		blob, err := read(total)
+		if err != nil {
+			return nil, err
+		}
+		var cur int
+		for i := 0; i < nEvents; i++ {
+			n := lengths(i)
+			out[i] = string(blob[cur : cur+n])
+			cur += n
+		}
+		return out, nil
+	}
+
+	collections, err := readStringField(func(i int) int { return int(collLen[i]) })
+	if err != nil {
+		return nil, err
+	}
+	dids, err := readStringField(func(i int) int { return int(didLen[i]) })
+	if err != nil {
+		return nil, err
+	}
+	rkeys, err := readStringField(func(i int) int { return int(rkeyLen[i]) })
+	if err != nil {
+		return nil, err
+	}
+	revs, err := readStringField(func(i int) int { return int(revLen[i]) })
+	if err != nil {
+		return nil, err
+	}
+
+	// payloads[]: same shape but []byte, and Payload == nil for zero-length.
+	var totalPayload int
+	for i := 0; i < nEvents; i++ {
+		totalPayload += int(eventLen[i])
+	}
+	payloadBlob, err := read(totalPayload)
+	if err != nil {
+		return nil, err
+	}
+
+	// Refuse trailing bytes. encodeBlock produces an exact-length
+	// buffer; anything left is corruption.
+	if off != len(buf) {
+		return nil, errTruncatedBlock
+	}
+
+	var pcur int
+	for i := 0; i < nEvents; i++ {
+		events[i].Collection = collections[i]
+		events[i].DID = dids[i]
+		events[i].Rkey = rkeys[i]
+		events[i].Rev = revs[i]
+		n := int(eventLen[i])
+		if n > 0 {
+			// Copy so callers can't mutate the input by writing into
+			// Payload, and so the decoded events outlive buf.
+			p := make([]byte, n)
+			copy(p, payloadBlob[pcur:pcur+n])
+			events[i].Payload = p
+		} else {
+			events[i].Payload = nil
+		}
+		pcur += n
+	}
+
+	return events, nil
 }
