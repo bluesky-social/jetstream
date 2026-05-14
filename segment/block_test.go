@@ -200,3 +200,39 @@ func TestDecodeBlockBoundedAllocation(t *testing.T) {
 	_, err := decodeBlock(hostile)
 	require.Error(t, err)
 }
+
+func TestEncodeBlockCompressedRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	events := []Event{
+		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, IndexedAt: 200, Kind: KindCreate, DID: "did:plc:b", Payload: []byte("x")},
+	}
+
+	frame, err := encodeBlockCompressed(events)
+	require.NoError(t, err)
+	require.NotEmpty(t, frame)
+
+	// The frame is a real zstd frame, not the raw body.
+	require.NotEqual(t, mustEncode(t, events), frame)
+
+	got, err := decodeBlockCompressed(frame)
+	require.NoError(t, err)
+	require.Equal(t, events, got)
+}
+
+func TestDecodeBlockCompressedRejectsGarbage(t *testing.T) {
+	t.Parallel()
+
+	_, err := decodeBlockCompressed([]byte("not a zstd frame"))
+	require.Error(t, err)
+}
+
+// mustEncode is a test helper; it lives here because it has no
+// non-test consumers.
+func mustEncode(t *testing.T, events []Event) []byte {
+	t.Helper()
+	out, err := encodeBlock(events)
+	require.NoError(t, err)
+	return out
+}

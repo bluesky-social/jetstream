@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // validate checks that ev's fields fit the on-disk column widths and
@@ -356,4 +358,53 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	}
 
 	return events, nil
+}
+
+// blockEncoder is a process-wide reusable zstd encoder at the
+// default level (klauspost's SpeedDefault, which is zstd level 3 —
+// the format default). zstd.Encoder.EncodeAll is documented as
+// safe for concurrent calls, which makes a single instance fine
+// despite the package being single-writer.
+//
+// Construction can fail (rare; only on configuration errors) so we
+// initialize lazily through encoderOnce rather than in init() to
+// keep the failure mode visible at the call site.
+var (
+	blockEncoder     *zstd.Encoder
+	blockEncoderInit error
+	blockDecoder     *zstd.Decoder
+	blockDecoderInit error
+)
+
+func init() {
+	blockEncoder, blockEncoderInit = zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithEncoderCRC(true),
+	)
+	blockDecoder, blockDecoderInit = zstd.NewReader(nil)
+}
+
+// encodeBlockCompressed encodes events with encodeBlock, then wraps
+// the result in a single zstd frame with content checksums enabled.
+func encodeBlockCompressed(events []Event) ([]byte, error) {
+	if blockEncoderInit != nil {
+		return nil, fmt.Errorf("segment: zstd encoder init failed: %w", blockEncoderInit)
+	}
+	body, err := encodeBlock(events)
+	if err != nil {
+		return nil, err
+	}
+	return blockEncoder.EncodeAll(body, nil), nil
+}
+
+// decodeBlockCompressed is the inverse: decompress, then decodeBlock.
+func decodeBlockCompressed(frame []byte) ([]Event, error) {
+	if blockDecoderInit != nil {
+		return nil, fmt.Errorf("segment: zstd decoder init failed: %w", blockDecoderInit)
+	}
+	body, err := blockDecoder.DecodeAll(frame, nil)
+	if err != nil {
+		return nil, fmt.Errorf("segment: zstd decompress: %w", err)
+	}
+	return decodeBlock(body)
 }
