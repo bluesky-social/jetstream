@@ -3,6 +3,7 @@ package segment
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -44,6 +45,13 @@ type Writer struct {
 	file    *os.File
 	pending pendingBlock
 	closed  bool
+
+	// stickyErr is latched the first time a flush write or fsync
+	// fails. Once set, every subsequent Append/Flush returns it so
+	// the caller cannot accidentally retry into a partially-durable
+	// frame and produce duplicate rows on disk. The caller must
+	// Close the writer and start over.
+	stickyErr error
 }
 
 // New opens or creates the active segment at cfg.Path. See package
@@ -96,14 +104,68 @@ func New(cfg Config) (*Writer, error) {
 			_ = f.Close()
 			return nil, fmt.Errorf("%w: %s", ErrSegmentSealed, cfg.Path)
 		}
-		// Active file: seek to end so the next Write appends.
-		if _, err := f.Seek(0, 2); err != nil {
+		// Active file: walk the framed-block region from offset
+		// reservedHeaderBytes forward, find the last fully-durable
+		// block boundary, and truncate any torn tail before
+		// appending. Without this, a crash mid-Write leaves bytes
+		// past the last good frame that a future recovery walker
+		// would interpret as a malformed block, masking everything
+		// after it.
+		end, err := lastGoodOffset(f, info.Size())
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if end < info.Size() {
+			if err := f.Truncate(end); err != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("segment: truncate torn tail: %w", err)
+			}
+		}
+		if _, err := f.Seek(end, io.SeekStart); err != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("segment: seek end: %w", err)
 		}
 	}
 
 	return &Writer{cfg: cfg, file: f}, nil
+}
+
+// lastGoodOffset walks the framed-block region of an active segment
+// file (everything after the 256-byte reserved header) and returns
+// the byte offset of the end of the last fully-readable
+// [uint64 LE compressed_len][zstd frame] pair. If the tail is torn
+// (length prefix promises more bytes than the file holds, or the
+// length prefix itself is truncated), that tail is reported as
+// recoverable bytes-to-discard via the difference between the
+// returned offset and size.
+//
+// We only check framing here; we do not decompress or decode the
+// frames themselves. A frame whose bytes are all present but whose
+// zstd payload was corrupted in flight is left in place — the
+// reader path is responsible for surfacing that as decode errors.
+// This keeps recovery O(blocks) rather than O(uncompressed bytes).
+func lastGoodOffset(f *os.File, size int64) (int64, error) {
+	off := int64(reservedHeaderBytes)
+	var lenBuf [8]byte
+	for off < size {
+		if size-off < int64(len(lenBuf)) {
+			// Torn length prefix.
+			return off, nil
+		}
+		if _, err := f.ReadAt(lenBuf[:], off); err != nil {
+			return 0, fmt.Errorf("segment: read frame length at %d: %w", off, err)
+		}
+		frameLen := binary.LittleEndian.Uint64(lenBuf[:])
+		next := off + int64(len(lenBuf)) + int64(frameLen)
+		if frameLen > uint64(size-off-int64(len(lenBuf))) || next < off {
+			// frame_len overruns the file (torn frame body) or
+			// integer-overflows on extremely hostile input.
+			return off, nil
+		}
+		off = next
+	}
+	return off, nil
 }
 
 // pendingBlock is the in-memory accumulator for the active block.
@@ -237,38 +299,51 @@ func (w *Writer) Flush() error {
 	if w.closed {
 		return ErrClosed
 	}
+	if w.stickyErr != nil {
+		return w.stickyErr
+	}
 	return w.flushLocked()
 }
 
-// flushLocked is the no-buffer-state-change-on-error flush body,
-// shared by Flush and Close.
+// flushLocked is the flush body shared by Flush and Close.
+//
+// Durability contract: once Write returns success, the bytes are
+// in the kernel's page cache and a subsequent recovery walker will
+// see the frame on the file (per lastGoodOffset). It is therefore
+// not safe to "retry" the same pending buffer on a Sync failure —
+// doing so would write the frame twice. We instead reset pending
+// immediately after Write succeeds, then attempt Sync; if Sync
+// fails we latch stickyErr so the caller cannot Append further
+// without observing the failure.
 func (w *Writer) flushLocked() error {
 	if w.pending.count() == 0 {
 		return nil
 	}
 
-	if blockEncoderInit != nil {
-		return fmt.Errorf("segment: zstd encoder init failed: %w", blockEncoderInit)
-	}
 	body := encodeBlockColumns(&w.pending)
 	frame := blockEncoder.EncodeAll(body, nil)
 
 	// Frame the block as [uint64 LE compressed_len][frame] and
 	// concatenate so we issue a single Write — a partial-write tear
-	// then leaves us at most one torn frame at the tail (recovery
-	// is a later slice's job).
+	// then leaves us at most one torn frame at the tail, which the
+	// next New() call will truncate via lastGoodOffset.
 	combined := make([]byte, 8+len(frame))
 	binary.LittleEndian.PutUint64(combined[:8], uint64(len(frame)))
 	copy(combined[8:], frame)
 
 	if _, err := w.file.Write(combined); err != nil {
-		return fmt.Errorf("segment: write block: %w", err)
+		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
+		return w.stickyErr
 	}
-	if err := w.file.Sync(); err != nil {
-		return fmt.Errorf("segment: fsync block: %w", err)
-	}
-
+	// Write succeeded: the bytes are owned by the file. Drop the
+	// pending buffer so a Sync failure cannot re-encode the same
+	// rows on a retry.
 	w.pending.reset()
+
+	if err := w.file.Sync(); err != nil {
+		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
+		return w.stickyErr
+	}
 	return nil
 }
 
@@ -280,6 +355,9 @@ func (w *Writer) flushLocked() error {
 func (w *Writer) Append(ev Event) (full bool, err error) {
 	if w.closed {
 		return false, ErrClosed
+	}
+	if w.stickyErr != nil {
+		return false, w.stickyErr
 	}
 	if w.pending.count() >= w.cfg.MaxEventsPerBlock {
 		return false, ErrBufferFull

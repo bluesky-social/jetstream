@@ -41,7 +41,12 @@ func TestParseLogFormat(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, obs.LogFormatJSON, got)
 
+	// Empty string maps to JSON to match the CLI flag default.
 	got, err = obs.ParseLogFormat("")
+	require.NoError(t, err)
+	require.Equal(t, obs.LogFormatJSON, got)
+
+	got, err = obs.ParseLogFormat("text")
 	require.NoError(t, err)
 	require.Equal(t, obs.LogFormatText, got)
 

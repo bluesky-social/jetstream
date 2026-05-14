@@ -39,12 +39,18 @@ func NewMetrics() *Metrics {
 	buildInfo.WithLabelValues(info.Version, info.Commit, info.Date).Set(1)
 	reg.MustRegister(buildInfo)
 
+	// Labels are deliberately minimal. `commit` is intentionally not
+	// a label here even though every request runs under one commit:
+	// it would be process-static, duplicate the build_info gauge,
+	// and force every Grafana panel to `sum without(commit)` after
+	// a deploy when histogram series reset under the new label.
+	// Consumers join on build_info when they need build context.
 	httpDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:      "http_request_duration_seconds",
 		Namespace: namespace,
 		Help:      "HTTP request latency for the public server.",
 		Buckets:   prometheus.DefBuckets,
-	}, []string{"commit", "handler", "method", "code"})
+	}, []string{"handler", "method", "code"})
 	reg.MustRegister(httpDur)
 
 	return &Metrics{

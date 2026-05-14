@@ -34,9 +34,17 @@ func ParseLogLevel(s string) (slog.Level, error) {
 }
 
 // ParseLogFormat validates a format name.
+//
+// The empty string maps to LogFormatJSON to match the CLI flag's
+// default. Without that mapping, users clearing JETSTREAM_LOG_FORMAT
+// (e.g. setting the env var to "") would silently land on text
+// format, contradicting both the documented default and what they
+// see in `--help`.
 func ParseLogFormat(s string) (LogFormat, error) {
 	switch LogFormat(strings.ToLower(strings.TrimSpace(s))) {
-	case LogFormatText, "":
+	case "":
+		return LogFormatJSON, nil
+	case LogFormatText:
 		return LogFormatText, nil
 	case LogFormatJSON:
 		return LogFormatJSON, nil

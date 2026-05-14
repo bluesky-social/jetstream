@@ -95,11 +95,19 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 	//     /debug/pprof/profile and /trace endpoints accept a `seconds` query
 	//     param and intentionally hold the response open for that long, so
 	//     a WriteTimeout here would silently truncate profiles.
+	// Route http.Server's internal error log through slog so panic
+	// recovery, TLS handshake failures, and other server-internal
+	// messages share the same JSON-friendly pipeline as everything
+	// else. Without this they go through the standard log package
+	// to stderr as unstructured text and bypass log shipping.
+	stdErrLog := slog.NewLogLogger(logger.Handler(), slog.LevelError)
+
 	s.srv = &http.Server{
 		Addr:              cfg.PublicAddr,
 		Handler:           s.publicMux(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+		ErrorLog:          stdErrLog,
 	}
 
 	s.dbgSrv = &http.Server{
@@ -107,6 +115,7 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 		Handler:           s.debugMux(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+		ErrorLog:          stdErrLog,
 	}
 
 	return s
@@ -153,15 +162,32 @@ func (s *Server) Run(ctx context.Context) error {
 	go func() { errs <- serveOrIgnoreClosed(s.srv, publicLn) }()
 	go func() { errs <- serveOrIgnoreClosed(s.dbgSrv, debugLn) }()
 
+	// Best-effort: if either Serve has already failed by the time we
+	// reach this line, don't claim readiness even for the brief
+	// window before the select below catches the error. This closes
+	// a race where /readyz could answer 200 to a probe scheduled
+	// between Store(true) and the err-channel branch firing.
+	select {
+	case err := <-errs:
+		s.logger.Error("server failed during startup", "err", err)
+		_ = s.shutdown()
+		// Drain the second goroutine.
+		<-errs
+		return err
+	default:
+	}
+
 	s.ready.Store(true)
 
 	// Wait for either a serve error or context cancellation. Either path
 	// proceeds to graceful shutdown.
 	var firstErr error
+	receivedFromErrs := 0
 	select {
 	case <-ctx.Done():
 		s.logger.Info("server shutdown requested", "timeout", s.cfg.ShutdownTimeout)
 	case err := <-errs:
+		receivedFromErrs = 1
 		// One server failed; treat as fatal and tear the other down.
 		firstErr = err
 		s.logger.Error("server exited unexpectedly", "err", err)
@@ -172,9 +198,15 @@ func (s *Server) Run(ctx context.Context) error {
 		firstErr = shutdownErr
 	}
 
-	// Drain remaining serve goroutine result so we don't leak.
-	if err := <-errs; err != nil && firstErr == nil {
-		firstErr = err
+	// Drain the remaining serve goroutine results. Both goroutines
+	// always send exactly one value, so we always read exactly two
+	// total — otherwise a second concurrent failure during shutdown
+	// would be silently dropped on the floor.
+	for receivedFromErrs < 2 {
+		if err := <-errs; err != nil && firstErr == nil {
+			firstErr = err
+		}
+		receivedFromErrs++
 	}
 
 	return firstErr
@@ -259,7 +291,10 @@ func (s *Server) debugMux() http.Handler {
 	// pprof. Index dispatches to the per-profile handlers based on path, so
 	// the trailing-slash route covers /debug/pprof/heap, /debug/pprof/goroutine,
 	// etc. The four explicit routes below are the special-cased non-profile
-	// endpoints that need their own handler functions.
+	// endpoints that need their own handler functions. We deliberately do
+	// not method-restrict any of these: pprof.Index uses its own path
+	// matching for sub-profile dispatch, and pprof.Symbol legitimately
+	// accepts POST for large symbol resolution requests from go tool pprof.
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)

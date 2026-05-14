@@ -165,6 +165,13 @@ func encodeBlock(events []Event) ([]byte, error) {
 // slice; the future Reader type will promote it to a public sentinel.
 var errTruncatedBlock = errors.New("segment: truncated or malformed block")
 
+// maxBlockEventsLimit is a hard ceiling on the event_count header.
+// It is well above the configurable default (4096) but well below
+// the int32 ceiling (2_147_483_647) that would otherwise trip
+// int(nEvents64) on a 32-bit build. It also caps the up-front
+// allocation a hostile header can force.
+const maxBlockEventsLimit = 1 << 24 // 16,777,216
+
 // decodeBlock is the inverse of encodeBlock. It validates input
 // length at every step so a malicious header cannot provoke an
 // unbounded allocation.
@@ -182,6 +189,9 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	// fixedPerEvent bytes per event before any variable-length
 	// data; if the remaining input can't cover that, the header is
 	// lying.
+	if nEvents64 > maxBlockEventsLimit {
+		return nil, errTruncatedBlock
+	}
 	if uint64(len(buf)-off) < nEvents64*fixedPerEvent {
 		return nil, errTruncatedBlock
 	}
@@ -366,30 +376,33 @@ func decodeBlock(buf []byte) ([]Event, error) {
 // safe for concurrent calls, which makes a single instance fine
 // despite the package being single-writer.
 //
-// Construction can fail (rare; only on configuration errors) so we
-// initialize lazily through encoderOnce rather than in init() to
-// keep the failure mode visible at the call site.
+// Construction takes a static, known-good option set; failure
+// indicates a programming error (or a broken klauspost build) so
+// we panic in init rather than make every caller check a sentinel.
 var (
-	blockEncoder     *zstd.Encoder
-	blockEncoderInit error
-	blockDecoder     *zstd.Decoder
-	blockDecoderInit error
+	blockEncoder *zstd.Encoder
+	blockDecoder *zstd.Decoder
 )
 
 func init() {
-	blockEncoder, blockEncoderInit = zstd.NewWriter(nil,
+	enc, err := zstd.NewWriter(nil,
 		zstd.WithEncoderLevel(zstd.SpeedDefault),
 		zstd.WithEncoderCRC(true),
 	)
-	blockDecoder, blockDecoderInit = zstd.NewReader(nil)
+	if err != nil {
+		panic(fmt.Sprintf("segment: zstd encoder init failed: %v", err))
+	}
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		panic(fmt.Sprintf("segment: zstd decoder init failed: %v", err))
+	}
+	blockEncoder = enc
+	blockDecoder = dec
 }
 
 // encodeBlockCompressed encodes events with encodeBlock, then wraps
 // the result in a single zstd frame with content checksums enabled.
 func encodeBlockCompressed(events []Event) ([]byte, error) {
-	if blockEncoderInit != nil {
-		return nil, fmt.Errorf("segment: zstd encoder init failed: %w", blockEncoderInit)
-	}
 	body, err := encodeBlock(events)
 	if err != nil {
 		return nil, err
@@ -399,9 +412,6 @@ func encodeBlockCompressed(events []Event) ([]byte, error) {
 
 // decodeBlockCompressed is the inverse: decompress, then decodeBlock.
 func decodeBlockCompressed(frame []byte) ([]Event, error) {
-	if blockDecoderInit != nil {
-		return nil, fmt.Errorf("segment: zstd decoder init failed: %w", blockDecoderInit)
-	}
 	body, err := blockDecoder.DecodeAll(frame, nil)
 	if err != nil {
 		return nil, fmt.Errorf("segment: zstd decompress: %w", err)

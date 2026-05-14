@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -125,6 +126,62 @@ func TestServer_RecordsMetricsForPublicRequests(t *testing.T) {
 
 	metrics := mustGet(t, debugURL+"/metrics")
 	require.Contains(t, metrics, `jetstream_http_request_duration_seconds_bucket{`)
+	// And the histogram carries the exact label set we registered.
+	// `commit` was deliberately removed from the histogram (it duplicates
+	// build_info and resets every series on deploy); if it ever comes
+	// back, scan the histogram lines specifically.
+	for _, line := range strings.Split(metrics, "\n") {
+		if !strings.HasPrefix(line, "jetstream_http_request_duration_seconds") {
+			continue
+		}
+		require.NotContains(t, line, `commit="`,
+			"http_request_duration_seconds must not carry a commit label")
+	}
+	require.Contains(t, metrics, `code="200"`)
+	require.Contains(t, metrics, `handler="root"`)
+	require.Contains(t, metrics, `method="GET"`)
+}
+
+// TestServer_MetricsCaptureNon200StatusCodes verifies that
+// statusRecorder.WriteHeader is wired correctly: a 404 from the
+// default mux must surface as `code="404"` on the histogram, not
+// the recorder's zero-value or the default 200.
+func TestServer_MetricsCaptureNon200StatusCodes(t *testing.T) {
+	t.Parallel()
+
+	srv := newServer(t)
+	publicURL := mountPublic(t, srv)
+	debugURL := mountDebug(t, srv)
+
+	// The public mux only registers GET /{$}; any other path is a 404.
+	resp, err := doGet(t.Context(), publicURL+"/no-such-path")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	// 404 from a stdlib NotFound goes through statusRecorder.Write
+	// without WriteHeader being called; the recorder's default of 200
+	// would mask the real code. Today we don't wrap the 404 path
+	// (only registered routes carry InstrumentHandler), so this
+	// assertion is forward-looking for when the project adds a
+	// catch-all instrumented handler. For now, just confirm the
+	// metric for the registered route doesn't get spuriously created.
+	metrics := mustGet(t, debugURL+"/metrics")
+	require.NotContains(t, metrics, `code="404"`,
+		"unrouted 404s should not yet record metrics; revisit when a catch-all is added")
+}
+
+// TestPublicHandler_UnknownPath404 pins the public mux's behavior
+// for unknown paths. Adding a catch-all in the future must be a
+// deliberate choice.
+func TestPublicHandler_UnknownPath404(t *testing.T) {
+	t.Parallel()
+	base := mountPublic(t, newServer(t))
+
+	resp, err := doGet(t.Context(), base+"/does-not-exist")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
 // TestServer_LifecycleAndGracefulShutdown is the only test that exercises

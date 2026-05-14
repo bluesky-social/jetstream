@@ -60,6 +60,10 @@ func SetupTracing(ctx context.Context, cfg TracingConfig) (TracerShutdown, error
 		),
 	)
 	if err != nil {
+		// Exporter has already started its background batch
+		// processor and TCP pool; tear it down before bailing so
+		// we don't leak goroutines/fds on a config error.
+		_ = exp.Shutdown(ctx)
 		return nil, fmt.Errorf("build OTEL resource: %w", err)
 	}
 

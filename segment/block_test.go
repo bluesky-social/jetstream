@@ -203,6 +203,66 @@ func TestDecodeBlockBoundedAllocation(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestDecodeBlockRejectsTrailingBytes pins the trailing-bytes
+// check in decodeBlock. Without it, encoded-then-padded buffers
+// would round-trip as if they were valid, which would mask
+// upstream bugs and risk ambiguous-trailer attacks against
+// future Reader code.
+func TestDecodeBlockRejectsTrailingBytes(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := encodeBlock([]Event{
+		{Seq: 1, Kind: KindCreate, DID: "d", Payload: []byte("p")},
+	})
+	require.NoError(t, err)
+
+	padded := append([]byte{}, encoded...)
+	padded = append(padded, 0x00)
+	_, err = decodeBlock(padded)
+	require.ErrorIs(t, err, errTruncatedBlock)
+}
+
+// TestDecodeBlockRejectsOutOfRangeKind verifies the per-row Kind
+// guard in the decoder (block.go:243-ish) rejects kinds that the
+// validator catches on the encode side. A round-trip cannot
+// produce one, but a hostile or corrupt buffer can; the decoder
+// must not happily emit Kind(0) or Kind(7).
+func TestDecodeBlockRejectsOutOfRangeKind(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := encodeBlock([]Event{
+		{Seq: 1, Kind: KindCreate, DID: "d", Payload: []byte("p")},
+	})
+	require.NoError(t, err)
+
+	// Locate and corrupt the kind[] byte. encodeBlock writes:
+	//   event_count u32 (4) + seq u64 (8) + indexed_at i64 (8) +
+	//   rendered_at i64 (8) + kind u8 (1) ...
+	// So kind[0] is at offset 4 + 8 + 8 + 8 = 28.
+	const kindOffset = 4 + 8 + 8 + 8
+	corrupted := append([]byte{}, encoded...)
+	corrupted[kindOffset] = 0
+	_, err = decodeBlock(corrupted)
+	require.ErrorIs(t, err, errTruncatedBlock)
+
+	corrupted[kindOffset] = 7
+	_, err = decodeBlock(corrupted)
+	require.ErrorIs(t, err, errTruncatedBlock)
+}
+
+// TestDecodeBlockRejectsAbsurdEventCount targets the
+// maxBlockEventsLimit guard. A header claiming more events than
+// the cap (and which would also overflow int on 32-bit builds)
+// must be rejected before we attempt allocation.
+func TestDecodeBlockRejectsAbsurdEventCount(t *testing.T) {
+	t.Parallel()
+
+	hostile := make([]byte, 4)
+	binary.LittleEndian.PutUint32(hostile, uint32(maxBlockEventsLimit+1))
+	_, err := decodeBlock(hostile)
+	require.ErrorIs(t, err, errTruncatedBlock)
+}
+
 func TestEncodeBlockCompressedRoundtrip(t *testing.T) {
 	t.Parallel()
 

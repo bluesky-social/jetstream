@@ -332,3 +332,135 @@ func TestCloseIsIdempotent(t *testing.T) {
 	require.NoError(t, w.Close())
 	require.NoError(t, w.Close(), "second Close should be a no-op")
 }
+
+// TestNewResumeAppendsAfterExistingBlocks is the regression test
+// for a torn `f.Seek(0, end)` replacement: reopening a writer
+// against a file that already holds a real block must continue to
+// append after that block, not overwrite it.
+func TestNewResumeAppendsAfterExistingBlocks(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	first := []Event{
+		{Seq: 1, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, Kind: KindCreate, DID: "did:plc:b"},
+	}
+	w1, err := New(Config{Path: path, MaxEventsPerBlock: 4})
+	require.NoError(t, err)
+	for _, ev := range first {
+		_, err := w1.Append(ev)
+		require.NoError(t, err)
+	}
+	require.NoError(t, w1.Flush())
+	require.NoError(t, w1.Close())
+
+	second := []Event{
+		{Seq: 3, Kind: KindUpdate, DID: "did:plc:c"},
+	}
+	w2, err := New(Config{Path: path, MaxEventsPerBlock: 4})
+	require.NoError(t, err)
+	for _, ev := range second {
+		_, err := w2.Append(ev)
+		require.NoError(t, err)
+	}
+	require.NoError(t, w2.Flush())
+	require.NoError(t, w2.Close())
+
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	walked := walkFramedBlocks(t, contents[reservedHeaderBytes:])
+	require.Len(t, walked, 2, "expected one block from each writer")
+	require.Len(t, walked[0], 2)
+	require.Len(t, walked[1], 1)
+	require.True(t, eventsEqual(first[0], walked[0][0]))
+	require.True(t, eventsEqual(first[1], walked[0][1]))
+	require.True(t, eventsEqual(second[0], walked[1][0]))
+}
+
+// TestNewTruncatesTornFrameTail simulates a crash mid-Write: a
+// length prefix is on disk but only some of the frame body
+// landed. The next New() must truncate the torn tail before
+// allowing further appends, otherwise a subsequent Reader walking
+// length prefixes would mis-interpret the next real frame as
+// being inside the torn one.
+func TestNewTruncatesTornFrameTail(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	good := []Event{{Seq: 1, Kind: KindCreate, DID: "did:plc:a"}}
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 4})
+	require.NoError(t, err)
+	_, err = w.Append(good[0])
+	require.NoError(t, err)
+	require.NoError(t, w.Flush())
+	require.NoError(t, w.Close())
+
+	// Append a torn frame: an 8-byte length prefix claiming 1024
+	// bytes of frame body, but only 100 actual bytes follow.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o644)
+	require.NoError(t, err)
+	var lenBuf [8]byte
+	binary.LittleEndian.PutUint64(lenBuf[:], 1024)
+	_, err = f.Write(lenBuf[:])
+	require.NoError(t, err)
+	_, err = f.Write(make([]byte, 100))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	preInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	tornSize := preInfo.Size()
+
+	// Reopen — torn tail must be truncated.
+	w2, err := New(Config{Path: path})
+	require.NoError(t, err)
+	require.NoError(t, w2.Close())
+
+	postInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Less(t, postInfo.Size(), tornSize,
+		"reopen must shrink the file by the torn-tail length")
+
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	walked := walkFramedBlocks(t, contents[reservedHeaderBytes:])
+	require.Len(t, walked, 1, "only the original good block should remain")
+	require.True(t, eventsEqual(good[0], walked[0][0]))
+}
+
+// TestNewTruncatesTornLengthPrefix is the edge case where the
+// crash interrupted the 8-byte length prefix itself (e.g. only
+// 3 bytes of it landed). lastGoodOffset must treat any
+// non-8-byte trailer as a torn prefix and truncate.
+func TestNewTruncatesTornLengthPrefix(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 4})
+	require.NoError(t, err)
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:a"})
+	require.NoError(t, err)
+	require.NoError(t, w.Flush())
+	require.NoError(t, w.Close())
+
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o644)
+	require.NoError(t, err)
+	_, err = f.Write([]byte{0xAA, 0xBB, 0xCC}) // partial uint64 length prefix
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	w2, err := New(Config{Path: path})
+	require.NoError(t, err)
+	require.NoError(t, w2.Close())
+
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	walked := walkFramedBlocks(t, contents[reservedHeaderBytes:])
+	require.Len(t, walked, 1)
+}

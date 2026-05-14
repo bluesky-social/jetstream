@@ -14,7 +14,7 @@ just                 # lint + test, the default recipe
 ## Running it
 
 ```sh
-just run serve              # starts the HTTP server on :8080 (debug on :8081)
+just run serve              # starts the HTTP server on :8080 (debug on :6060)
 just run-race serve         # same thing with the race detector on
 ```
 
