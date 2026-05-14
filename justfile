@@ -1,6 +1,6 @@
 set shell := ["bash", "-cu"]
 
-default: lint test-short
+default: lint test
 
 # Ensures that all tools required for local development are installed
 install-tools:
@@ -19,17 +19,17 @@ run *ARGS:
 run-race *ARGS:
     just run -race {{ARGS}}
 
-# Runs the tests in -short mode (skips long-running swarm/integration tests).
-test-short *ARGS="./...":
-    gotestsum --format-hide-empty-pkg --format-icons hivis -- -short -count=1 {{ARGS}}
-
-# Runs the tests
-test *ARGS="./...":
+# Runs the full, long test suite
+test-long *ARGS="./...":
     gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 {{ARGS}}
+
+# Runs the tests in -short mode.
+test *ARGS="./...":
+    just test-long -short {{ARGS}}
 
 # Runs the tests with the race detector enabled
 test-race *ARGS="./...":
-    gotestsum --format-hide-empty-pkg --format-icons hivis -- -race -count=1 {{ARGS}}
+    just test-long -race {{ARGS}}
 
 # Build the jetstream binary into ./bin/jetstream.
 build:

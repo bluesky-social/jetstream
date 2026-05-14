@@ -49,11 +49,11 @@ func (f swarmFlags) any() bool {
 
 func TestSwarm(t *testing.T) {
 	t.Parallel()
-	if testing.Short() {
-		t.Skip("swarm test runs without -short")
-	}
 
-	const iterations = 50
+	iterations := 50
+	if !testing.Short() {
+		iterations = 1000
+	}
 
 	for iter := 0; iter < iterations; iter++ {
 		// Each iteration uses its own deterministic seed so a failure
