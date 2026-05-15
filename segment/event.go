@@ -42,5 +42,10 @@ type Event struct {
 	Rkey       string
 	Rev        string
 
-	Payload []byte // raw DAG-CBOR record bytes
+	// Payload holds the raw DAG-CBOR record bytes. Treat as
+	// read-only: on the decode path Payload aliases the decompressed
+	// block buffer, so mutating it would mutate the source for every
+	// other event sharing that block. Callers that need to modify
+	// must clone via append([]byte(nil), p...) first.
+	Payload []byte
 }

@@ -40,6 +40,108 @@ type benchOpts struct {
 	identicalPayload bool
 }
 
+// BenchmarkEncodeColumns isolates the columnar encoder from zstd
+// so we can see the per-byte rate of just the layout step. The
+// compressed benchmarks below mix in zstd time, which on random
+// payloads dominates wall-clock — but in production the writer
+// reuses a scratch buffer and the columnar step is what we have
+// the most control over.
+func BenchmarkEncodeColumns(b *testing.B) {
+	cases := []struct {
+		name string
+		n    int
+		opts benchOpts
+	}{
+		{"256_events_random", 256, benchOpts{}},
+		{"4096_events_random", 4096, benchOpts{}},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			events := makeBenchEvents(b, tc.n, tc.opts)
+			scratch := make([]byte, 0, 8<<20)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				scratch = encodeBlockInto(scratch[:0], eventColumns(events))
+				b.SetBytes(int64(len(scratch)))
+			}
+		})
+	}
+}
+
+// BenchmarkEncodeColumnsPending exercises the writer's hot path:
+// the pendingBlock columns implementation backed by parallel slices.
+// This is what production Append/Flush actually feeds the encoder.
+func BenchmarkEncodeColumnsPending(b *testing.B) {
+	cases := []struct {
+		name string
+		n    int
+		opts benchOpts
+	}{
+		{"4096_events_random", 4096, benchOpts{}},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			events := makeBenchEvents(b, tc.n, tc.opts)
+			var p pendingBlock
+			p.preallocate(tc.n)
+			for _, ev := range events {
+				p.seq = append(p.seq, ev.Seq)
+				p.indexedAt = append(p.indexedAt, ev.IndexedAt)
+				p.renderedAt = append(p.renderedAt, ev.RenderedAt)
+				p.kind = append(p.kind, uint8(ev.Kind))
+				p.collLen = append(p.collLen, uint8(len(ev.Collection)))
+				p.didLen = append(p.didLen, uint16(len(ev.DID)))
+				p.rkeyLen = append(p.rkeyLen, uint8(len(ev.Rkey)))
+				p.revLen = append(p.revLen, uint8(len(ev.Rev)))
+				p.eventLen = append(p.eventLen, uint32(len(ev.Payload)))
+				p.collections = append(p.collections, ev.Collection...)
+				p.dids = append(p.dids, ev.DID...)
+				p.rkeys = append(p.rkeys, ev.Rkey...)
+				p.revs = append(p.revs, ev.Rev...)
+				p.payloads = append(p.payloads, ev.Payload...)
+			}
+			scratch := make([]byte, 0, 8<<20)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				scratch = encodeBlockInto(scratch[:0], &p)
+				b.SetBytes(int64(len(scratch)))
+			}
+		})
+	}
+}
+
+// BenchmarkDecodeColumns isolates the uncompressed-body decoder from
+// zstd so we can see the cost of the parsing step alone.
+func BenchmarkDecodeColumns(b *testing.B) {
+	cases := []struct {
+		name string
+		n    int
+		opts benchOpts
+	}{
+		{"256_events_random", 256, benchOpts{}},
+		{"4096_events_random", 4096, benchOpts{}},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			events := makeBenchEvents(b, tc.n, tc.opts)
+			body, err := encodeBlock(events)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(body)))
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := decodeBlock(body); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkEncodeBlock(b *testing.B) {
 	cases := []struct {
 		name string
@@ -96,18 +198,16 @@ func BenchmarkDecodeBlock(b *testing.B) {
 	}
 }
 
-// BenchmarkAppend measures the per-event amortized cost of Append
-// with a writer configured large enough that Flush never fires.
-//
-// This benchmark deliberately uses the classic b.N loop instead of
-// b.Loop(): we need to size MaxEventsPerBlock from the iteration
-// count up front so the pending buffer never reaches capacity during
-// the measured loop, and b.Loop() does not expose its iteration
-// count ahead of time.
+// BenchmarkAppend measures the per-event amortized cost of Append.
+// We isolate Append cost from Flush by resetting the pending buffer
+// in-place when it reaches cap, rather than calling Flush (which
+// would mix in zstd + write + fsync time). This lets the benchmark
+// reflect the steady-state Append hot path across arbitrary b.N
+// without bumping into the decoder cap on MaxEventsPerBlock.
 func BenchmarkAppend(b *testing.B) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "seg.jss")
-	w, err := New(Config{Path: path, MaxEventsPerBlock: b.N + 1})
+	w, err := New(Config{Path: path, MaxEventsPerBlock: DefaultMaxEventsPerBlock})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -126,8 +226,40 @@ func BenchmarkAppend(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		if w.pending.count() >= w.cfg.MaxEventsPerBlock {
+			w.pending.reset()
+		}
 		template.Seq = uint64(i)
 		if _, err := w.Append(template); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSteadyFlush measures the production hot path: one
+// already-open writer flushing block after block. This is what the
+// firehose ingester actually does; BenchmarkFlushToTmpfs below
+// includes file-open/teardown and gives a less useful picture of
+// per-block cost.
+func BenchmarkSteadyFlush(b *testing.B) {
+	dir := b.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+	w, err := New(Config{Path: path})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	events := makeBenchEvents(b, DefaultMaxEventsPerBlock, benchOpts{})
+	b.ReportAllocs()
+
+	for b.Loop() {
+		for j := range events {
+			if _, err := w.Append(events[j]); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := w.Flush(); err != nil {
 			b.Fatal(err)
 		}
 	}

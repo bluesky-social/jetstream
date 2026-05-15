@@ -16,6 +16,14 @@ lint:
 modernize *ARGS="./...":
     modernize -fix -test {{ARGS}}
 
+# Build the jetstream binary into ./bin/jetstream.
+build:
+    go build -trimpath -o bin/jetstream ./cmd/jetstream
+
+# Remove build artifacts.
+clean:
+    rm -rf bin
+
 # Run jetstream with arbitrary args, e.g. `just run --version` or `just run serve --addr :9090`.
 run *ARGS:
     go run ./cmd/jetstream {{ARGS}}
@@ -40,10 +48,15 @@ test-race *ARGS="./...":
 bench *ARGS="./...":
     go test -bench=. -benchmem -count=1 -run='^$' {{ARGS}}
 
-# Build the jetstream binary into ./bin/jetstream.
-build:
-    go build -trimpath -o bin/jetstream ./cmd/jetstream
-
-# Remove build artifacts.
-clean:
-    rm -rf bin
+# Runs fuzz tests for the given duration (default 10s per target)
+fuzz DURATION="10s" *ARGS="./...":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pkgs="{{ARGS}}"
+    for pkg in $(go list $pkgs); do
+        targets=$(go test "$pkg" -list '^Fuzz' -run '^$' -count=1 2>/dev/null | grep '^Fuzz' || true)
+        for t in $targets; do
+            echo "=== FUZZ $t ($pkg) ==="
+            go test "$pkg" -run='^$' -fuzz="^${t}$" -fuzztime={{DURATION}}
+        done
+    done

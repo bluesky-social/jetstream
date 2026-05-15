@@ -53,6 +53,11 @@ func encodeBlockCompressed(events []Event) ([]byte, error) {
 }
 
 // decodeBlockCompressed is the inverse: decompress, then decodeBlock.
+//
+// We pass a fresh `nil` dst to DecodeAll so body is a private
+// allocation; that satisfies decodeBlock's buffer-aliasing contract
+// (the returned events alias body for their string columns and we
+// never mutate body afterwards).
 func decodeBlockCompressed(frame []byte) ([]Event, error) {
 	body, err := blockDecoder.DecodeAll(frame, nil)
 	if err != nil {

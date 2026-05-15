@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"unsafe"
 )
 
 // validate checks that ev's fields fit the on-disk column widths and
@@ -252,13 +253,18 @@ const maxBlockEventsLimit = 1 << 18 // 262,144
 // length at every step so a malicious header cannot provoke an
 // unbounded allocation.
 //
-// Allocation strategy: we allocate exactly the output []Event slice,
-// one shared []byte backing buffer for all decoded payloads, and one
-// shared string backing for each variable-length string column. The
-// decoded events outlive buf because each variable column is copied
-// once into a freshly-allocated string/[]byte; the per-event
-// substrings/sub-slices then share that backing without further
-// allocation.
+// Buffer-aliasing contract (callers MUST honor):
+// the returned events alias buf for their string columns (DID,
+// Collection, Rkey, Rev) and for Payload. Strings are immutable in
+// Go; Payload is []byte by API necessity but is documented (event.go)
+// as read-only DAG-CBOR record bytes — callers that need to mutate
+// must clone first. If a caller later writes through buf they will
+// observe the same write through the events. Both production call
+// sites pass a freshly-allocated zstd output buffer that they never
+// touch again, which makes the aliasing safe and saves five
+// allocations plus a full copy of the variable region per block.
+// On a 4096-event production block this is ~3 MB of garbage avoided
+// per decoded block, which is meaningful at firehose throughput.
 func decodeBlock(buf []byte) ([]Event, error) {
 	const fixedPerEvent = 8 + 8 + 8 + 1 + 1 + 2 + 1 + 1 + 4
 
@@ -422,25 +428,20 @@ func decodeBlock(buf []byte) ([]Event, error) {
 		return nil, errTruncatedBlock
 	}
 
-	// Build one immutable string per variable-length column. All
-	// per-event values are zero-alloc substrings of this single
-	// string; the substring shares the backing storage. This relies
-	// on string immutability — callers can't mutate the input via
-	// the returned events (Event.Payload is the only mutable field
-	// and is handled separately below).
-	collStr := string(collBlob)
-	didStr := string(didBlob)
-	rkeyStr := string(rkeyBlob)
-	revStr := string(revBlob)
+	// Alias buf for the four immutable string columns. Per the
+	// buffer-aliasing contract above, the returned events keep buf
+	// alive but never copy from it for the string columns. Each
+	// per-event Collection/DID/Rkey/Rev is a substring of the column
+	// blob, which is itself a sub-string view of buf via unsafeBytesToString.
+	collStr := unsafeBytesToString(collBlob)
+	didStr := unsafeBytesToString(didBlob)
+	rkeyStr := unsafeBytesToString(rkeyBlob)
+	revStr := unsafeBytesToString(revBlob)
 
-	// Decoded payloads share a single freshly-copied backing []byte
-	// so callers can't mutate buf by writing into Payload. The
-	// per-event slices alias subranges of this one allocation.
-	var payloadBacking []byte
-	if totalPayloadLen > 0 {
-		payloadBacking = make([]byte, totalPayloadLen)
-		copy(payloadBacking, payloadBlob)
-	}
+	// Decoded payloads alias the input buffer per the
+	// buffer-aliasing contract above. Saves a memcpy of every
+	// payload byte and one allocation of size sum(payload_len).
+	payloadBacking := payloadBlob
 
 	var collOff, didOff, rkeyOff, revOff, pOff int
 	for i := range nEvents {
@@ -501,6 +502,19 @@ func sumU16(b []byte) (int, error) {
 		t = nt
 	}
 	return t, nil
+}
+
+// unsafeBytesToString returns a string header that aliases b's
+// backing array. The Go runtime treats the result as an immutable
+// string for GC and == purposes — it is the standard idiom for
+// avoiding a memcpy when the caller can prove b is never mutated
+// after the call. decodeBlock's contract (see its docstring)
+// ensures both production call sites satisfy that.
+func unsafeBytesToString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(&b[0], len(b))
 }
 
 func sumU32(b []byte) (int, error) {
