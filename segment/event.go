@@ -42,5 +42,5 @@ type Event struct {
 	Rkey       string
 	Rev        string
 
-	Payload []byte // raw drisl (the DAG-CBOR subset used by atproto)
+	Payload []byte // raw DAG-CBOR record bytes
 }

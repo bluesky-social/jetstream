@@ -94,6 +94,20 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 	require.True(t, errors.Is(err, ErrInvalidConfig))
 }
 
+// A MaxEventsPerBlock setting larger than the decoder's hard cap
+// would silently produce blocks unreadable by the same package's
+// decoder, so the writer must refuse it up front.
+func TestNewRejectsMaxEventsPerBlockAboveDecoderCap(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	_, err := New(Config{Path: path, MaxEventsPerBlock: maxBlockEventsLimit + 1})
+	require.True(t, errors.Is(err, ErrInvalidConfig),
+		"writer cap above decoder cap must be rejected")
+}
+
 func TestAppendBuffersEvents(t *testing.T) {
 	t.Parallel()
 

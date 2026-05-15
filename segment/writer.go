@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -43,6 +44,12 @@ func (c Config) validate() error {
 	}
 	if c.MaxEventsPerBlock < 0 {
 		return fmt.Errorf("%w: MaxEventsPerBlock must be >= 0", ErrInvalidConfig)
+	}
+	// The decoder enforces maxBlockEventsLimit on read; refuse a writer
+	// that could produce blocks the same package cannot read back.
+	if c.MaxEventsPerBlock > maxBlockEventsLimit {
+		return fmt.Errorf("%w: MaxEventsPerBlock %d exceeds decoder cap %d",
+			ErrInvalidConfig, c.MaxEventsPerBlock, maxBlockEventsLimit)
 	}
 	return nil
 }
@@ -113,6 +120,15 @@ func New(cfg Config) (*Writer, error) {
 		if err := initializeNewSegment(f); err != nil {
 			return nil, err
 		}
+		// On POSIX filesystems, the directory entry that names a freshly
+		// created file is not durable until the parent directory itself
+		// is fsynced. Without this, a crash immediately after creation
+		// can drop the entire segment file even though we fsynced its
+		// contents — violating the "no data loss" invariant in §2 of
+		// the spec.
+		if err := syncParentDir(cfg.Path); err != nil {
+			return nil, err
+		}
 	} else {
 		if err := resumeExistingSegment(f, info.Size(), cfg.Path); err != nil {
 			return nil, err
@@ -123,6 +139,22 @@ func New(cfg Config) (*Writer, error) {
 	w := &Writer{cfg: cfg, file: f}
 	w.pending.preallocate(cfg.MaxEventsPerBlock)
 	return w, nil
+}
+
+// syncParentDir opens and fsyncs the parent directory of path so
+// the dirent for a freshly-created or truncated file is durable.
+// On filesystems where this is a no-op (e.g. some Windows configs)
+// the call is still cheap.
+func syncParentDir(path string) error {
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("segment: open parent dir: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("segment: fsync parent dir: %w", err)
+	}
+	return nil
 }
 
 // initializeNewSegment writes the fixed reserved header to a
@@ -182,6 +214,14 @@ func resumeExistingSegment(f *os.File, size int64, path string) error {
 		if err := f.Truncate(end); err != nil {
 			return fmt.Errorf("segment: truncate torn tail: %w", err)
 		}
+		// fsync the truncate so a second crash before any further
+		// writes cannot resurrect the torn bytes. The file's metadata
+		// (size) lives in the inode, so file Sync is the right scope
+		// here; we don't need a directory fsync because the dirent
+		// already exists.
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("segment: fsync truncate: %w", err)
+		}
 	}
 	if _, err := f.Seek(end, io.SeekStart); err != nil {
 		return fmt.Errorf("segment: seek end: %w", err)
@@ -227,10 +267,10 @@ func lastGoodOffset(f *os.File, size int64) (int64, error) {
 }
 
 // pendingBlock is the in-memory accumulator for the active block.
-// Per the spec §5.1: parallel column slices, not a []Event, so
-// steady-state Append has zero allocations once the underlying
-// arrays grow once. Every slice is reset via s = s[:0] on flush
-// to retain capacity.
+// Per the spec §3.2 columnar layout: parallel column slices, not a
+// []Event, so steady-state Append has zero allocations once the
+// underlying arrays grow once. Every slice is reset via s = s[:0]
+// on flush to retain capacity.
 type pendingBlock struct {
 	seq        []uint64
 	indexedAt  []int64

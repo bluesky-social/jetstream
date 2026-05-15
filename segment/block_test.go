@@ -10,8 +10,16 @@ import (
 	"testing"
 	"testing/quick"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 )
+
+// newCappedDecoder builds a private zstd decoder with a custom
+// max-memory cap; used by tests that exercise the bomb-rejection
+// behavior without mutating the package-level blockDecoder.
+func newCappedDecoder(maxBytes uint64) (*zstd.Decoder, error) {
+	return zstd.NewReader(nil, zstd.WithDecoderMaxMemory(maxBytes))
+}
 
 func TestValidateAcceptsHappyPath(t *testing.T) {
 	t.Parallel()
@@ -25,7 +33,7 @@ func TestValidateAcceptsHappyPath(t *testing.T) {
 		Collection: "app.bsky.feed.post",
 		Rkey:       "3l3qo2vuowo2b",
 		Rev:        "3l3qo2vutsw2b",
-		Payload:    []byte("any DRISL bytes"),
+		Payload:    []byte("any DAG-CBOR bytes"),
 	}))
 }
 
@@ -286,6 +294,33 @@ func TestDecodeBlockCompressedRejectsGarbage(t *testing.T) {
 
 	_, err := decodeBlockCompressed([]byte("not a zstd frame"))
 	require.Error(t, err)
+}
+
+// TestDecodeBlockCompressedRejectsZstdBomb pins the
+// WithDecoderMaxMemory guard wired into blockDecoder. A frame whose
+// decompressed body exceeds the configured cap must error rather
+// than allocate gigabytes; the per-block decoder's default of 64 GiB
+// is unsafe for hostile input.
+//
+// We construct the frame against a side encoder so the test stays
+// hermetic and never mutates package state. The body's exact bytes
+// don't matter — we just need it to decompress to more than the cap
+// the assertion uses.
+func TestDecodeBlockCompressedRejectsZstdBomb(t *testing.T) {
+	t.Parallel()
+
+	// Build a small private decoder with a tiny cap. This validates
+	// the wiring without forcing the package-level decoder to actually
+	// allocate gigabytes, which we couldn't do in a unit test anyway.
+	dec, err := newCappedDecoder(1024)
+	require.NoError(t, err)
+	defer dec.Close()
+
+	bigBody := bytes.Repeat([]byte{0xAB}, 4096)
+	frame := blockEncoder.EncodeAll(bigBody, nil)
+
+	_, err = dec.DecodeAll(frame, nil)
+	require.Error(t, err, "decoder must reject decompressed sizes above cap")
 }
 
 // mustEncode is a test helper; it lives here because it has no
