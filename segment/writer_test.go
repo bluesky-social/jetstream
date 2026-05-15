@@ -444,6 +444,52 @@ func TestNewTruncatesTornFrameTail(t *testing.T) {
 	require.True(t, eventsEqual(good[0], walked[0][0]))
 }
 
+// TestStickyErrorIsLatchedAcrossFlushAndClose pins the durability
+// invariant violated by an earlier flushLocked: once a Write fails
+// and stickyErr is set, the buffered events MUST NOT be re-encoded
+// and re-written — Close (which also calls flushLocked) would
+// otherwise append a second copy of the same frame after a torn
+// partial Write on disk. This test forces the failure by closing
+// the underlying *os.File behind the writer's back, then asserts
+// that Flush and Close both report the latched stickyErr.
+func TestStickyErrorIsLatchedAcrossFlushAndClose(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 4})
+	require.NoError(t, err)
+
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "d"})
+	require.NoError(t, err)
+
+	// Closing the underlying *os.File behind the writer's back makes
+	// the next Write fail with os.ErrClosed, which the writer wraps
+	// as "segment: write block: ...". A subsequent Close must surface
+	// the same wrapped sentinel — not a fresh wrap from a second
+	// write attempt — proving flushLocked short-circuited.
+	require.NoError(t, w.file.Close())
+
+	flushErr := w.Flush()
+	require.Error(t, flushErr)
+	require.ErrorIs(t, flushErr, os.ErrClosed)
+
+	closeErr := w.Close()
+	require.ErrorIs(t, closeErr, flushErr,
+		"Close after a failed Flush must surface the latched stickyErr,"+
+			" not re-attempt the write")
+
+	// The latched-error invariant is a durability property: after a
+	// failed flush, the writer must not have written more bytes than
+	// before. Capture file size up to the failed flush via a separate
+	// reopen — the writer's *os.File is closed.
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.EqualValues(t, reservedHeaderBytes, info.Size(),
+		"failed flush must not have grown the file past its initial header")
+}
+
 // TestNewTruncatesTornLengthPrefix is the edge case where the
 // crash interrupted the 8-byte length prefix itself (e.g. only
 // 3 bytes of it landed). lastGoodOffset must treat any

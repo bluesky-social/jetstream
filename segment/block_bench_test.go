@@ -98,6 +98,12 @@ func BenchmarkDecodeBlock(b *testing.B) {
 
 // BenchmarkAppend measures the per-event amortized cost of Append
 // with a writer configured large enough that Flush never fires.
+//
+// This benchmark deliberately uses the classic b.N loop instead of
+// b.Loop(): we need to size MaxEventsPerBlock from the iteration
+// count up front so the pending buffer never reaches capacity during
+// the measured loop, and b.Loop() does not expose its iteration
+// count ahead of time.
 func BenchmarkAppend(b *testing.B) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "seg.jss")
@@ -117,8 +123,9 @@ func BenchmarkAppend(b *testing.B) {
 	}
 
 	b.ReportAllocs()
+	b.ResetTimer()
 
-	for i := 0; b.Loop(); i++ {
+	for i := 0; i < b.N; i++ {
 		template.Seq = uint64(i)
 		if _, err := w.Append(template); err != nil {
 			b.Fatal(err)

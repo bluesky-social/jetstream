@@ -36,6 +36,10 @@ test *ARGS="./...":
 test-race *ARGS="./...":
     just test-long -race {{ARGS}}
 
+# Runs performance benchmarks.
+bench *ARGS="./...":
+    go test -bench=. -benchmem -count=1 -run='^$' {{ARGS}}
+
 # Build the jetstream binary into ./bin/jetstream.
 build:
     go build -trimpath -o bin/jetstream ./cmd/jetstream

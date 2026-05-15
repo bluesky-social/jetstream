@@ -55,6 +55,21 @@ type Writer struct {
 	pending pendingBlock
 	closed  bool
 
+	// Reusable per-flush scratch buffers. Sizing them once on the
+	// first flush avoids n-allocations-per-block on the hot path:
+	//
+	//   bodyScratch : uncompressed columnar block body
+	//   wireScratch : the bytes handed to file.Write — laid out as
+	//                 [8-byte LE compressed_len placeholder][zstd frame].
+	//                 We encode zstd directly into wireScratch[8:] and
+	//                 patch the length prefix in place once known,
+	//                 avoiding a second buffer + memcpy of the frame.
+	//
+	// Each is reset to zero-length before reuse; capacity is
+	// retained. They never escape the writer goroutine.
+	bodyScratch []byte
+	wireScratch []byte
+
 	// stickyErr is latched the first time a flush write or fsync
 	// fails. Once set, every subsequent Append/Flush returns it so
 	// the caller cannot accidentally retry into a partially-durable
@@ -105,7 +120,9 @@ func New(cfg Config) (*Writer, error) {
 	}
 
 	success = true
-	return &Writer{cfg: cfg, file: f}, nil
+	w := &Writer{cfg: cfg, file: f}
+	w.pending.preallocate(cfg.MaxEventsPerBlock)
+	return w, nil
 }
 
 // initializeNewSegment writes the fixed reserved header to a
@@ -237,6 +254,29 @@ type pendingBlock struct {
 // together).
 func (p *pendingBlock) count() int { return len(p.seq) }
 
+// preallocate sizes every column slice up front so steady-state
+// Append never reallocates a column. Capacity for the variable-
+// length blob buffers is sized from typical atproto event shapes
+// (collection ~24 B, did ~32 B, rkey/rev ~13 B, payload ~512 B);
+// over- or under-shooting only changes the first few Append calls'
+// growth pattern — append still amortizes cleanly.
+func (p *pendingBlock) preallocate(cap int) {
+	p.seq = make([]uint64, 0, cap)
+	p.indexedAt = make([]int64, 0, cap)
+	p.renderedAt = make([]int64, 0, cap)
+	p.kind = make([]uint8, 0, cap)
+	p.collLen = make([]uint8, 0, cap)
+	p.didLen = make([]uint16, 0, cap)
+	p.rkeyLen = make([]uint8, 0, cap)
+	p.revLen = make([]uint8, 0, cap)
+	p.eventLen = make([]uint32, 0, cap)
+	p.collections = make([]byte, 0, cap*24)
+	p.dids = make([]byte, 0, cap*32)
+	p.rkeys = make([]byte, 0, cap*13)
+	p.revs = make([]byte, 0, cap*13)
+	p.payloads = make([]byte, 0, cap*512)
+}
+
 // reset truncates every column slice to zero length while retaining
 // capacity. Callers use this after a successful flush.
 func (p *pendingBlock) reset() {
@@ -275,6 +315,14 @@ func (w *Writer) Close() error {
 
 // pendingBlock satisfies the columns interface (defined in block.go)
 // so flushLocked can encode without materializing []Event.
+//
+// The variable-length blob accessors are AppendXxx — they copy
+// the writer's contiguous buffer wholesale. The previous design
+// exposed per-event Collection(i)/DID(i)/etc. accessors that walked
+// the length column from 0..i to compute each row's offset, which
+// made a single encode O(n²) in the lengths-summing cost. The new
+// columns contract sidesteps that by appending the entire variable
+// region as one operation per column.
 
 func (p *pendingBlock) Len() int               { return p.count() }
 func (p *pendingBlock) Seq(i int) uint64       { return p.seq[i] }
@@ -282,56 +330,25 @@ func (p *pendingBlock) IndexedAt(i int) int64  { return p.indexedAt[i] }
 func (p *pendingBlock) RenderedAt(i int) int64 { return p.renderedAt[i] }
 func (p *pendingBlock) Kind(i int) uint8       { return p.kind[i] }
 
-// The variable-length accessors slice into the contiguous byte
-// buffers using the per-row length columns. Each accessor walks the
-// length column from 0 to i to compute the offset of row i; this is
-// O(i) per call, and encodeBlockColumns calls each accessor exactly
-// once per row in column-major order, so a full encode is O(n²) in
-// the lengths-summing cost. For 4096 events × 5 variable columns the
-// cost is ~10⁵ trivial integer adds, dwarfed by the zstd compression
-// that follows. Task 17's benchmarks measure this; if it's ever a
-// real cost we replace the per-call sum with a prefix-sum maintained
-// during Append.
+func (p *pendingBlock) CollectionLen(i int) uint8 { return p.collLen[i] }
+func (p *pendingBlock) DIDLen(i int) uint16       { return p.didLen[i] }
+func (p *pendingBlock) RkeyLen(i int) uint8       { return p.rkeyLen[i] }
+func (p *pendingBlock) RevLen(i int) uint8        { return p.revLen[i] }
+func (p *pendingBlock) PayloadLen(i int) uint32   { return p.eventLen[i] }
 
-func (p *pendingBlock) Collection(i int) string {
-	var off int
-	for j := range i {
-		off += int(p.collLen[j])
-	}
-	return string(p.collections[off : off+int(p.collLen[i])])
+func (p *pendingBlock) AppendCollections(dst []byte) []byte {
+	return append(dst, p.collections...)
 }
+func (p *pendingBlock) AppendDIDs(dst []byte) []byte     { return append(dst, p.dids...) }
+func (p *pendingBlock) AppendRkeys(dst []byte) []byte    { return append(dst, p.rkeys...) }
+func (p *pendingBlock) AppendRevs(dst []byte) []byte     { return append(dst, p.revs...) }
+func (p *pendingBlock) AppendPayloads(dst []byte) []byte { return append(dst, p.payloads...) }
 
-func (p *pendingBlock) DID(i int) string {
-	var off int
-	for j := range i {
-		off += int(p.didLen[j])
-	}
-	return string(p.dids[off : off+int(p.didLen[i])])
-}
-
-func (p *pendingBlock) Rkey(i int) string {
-	var off int
-	for j := range i {
-		off += int(p.rkeyLen[j])
-	}
-	return string(p.rkeys[off : off+int(p.rkeyLen[i])])
-}
-
-func (p *pendingBlock) Rev(i int) string {
-	var off int
-	for j := range i {
-		off += int(p.revLen[j])
-	}
-	return string(p.revs[off : off+int(p.revLen[i])])
-}
-
-func (p *pendingBlock) Payload(i int) []byte {
-	var off int
-	for j := range i {
-		off += int(p.eventLen[j])
-	}
-	return p.payloads[off : off+int(p.eventLen[i])]
-}
+func (p *pendingBlock) TotalCollectionsLen() int { return len(p.collections) }
+func (p *pendingBlock) TotalDIDsLen() int        { return len(p.dids) }
+func (p *pendingBlock) TotalRkeysLen() int       { return len(p.rkeys) }
+func (p *pendingBlock) TotalRevsLen() int        { return len(p.revs) }
+func (p *pendingBlock) TotalPayloadsLen() int    { return len(p.payloads) }
 
 // Flush encodes the pending block, writes it to the file as
 // [uint64 LE compressed_len][zstd frame], and fsyncs before
@@ -356,23 +373,39 @@ func (w *Writer) Flush() error {
 // immediately after Write succeeds, then attempt Sync; if Sync
 // fails we latch stickyErr so the caller cannot Append further
 // without observing the failure.
+//
+// We must also refuse to do anything once stickyErr is set: a
+// previous Write failure may have partially written a torn frame
+// to disk, in which case re-encoding the (still-buffered) events
+// here would append duplicate bytes after the torn tail. Close
+// reaches us via flushLocked too, so without this guard a
+// Close-after-Flush-failure would silently corrupt the file.
 func (w *Writer) flushLocked() error {
+	if w.stickyErr != nil {
+		return w.stickyErr
+	}
 	if w.pending.count() == 0 {
 		return nil
 	}
 
-	body := encodeBlockColumns(&w.pending)
-	frame := blockEncoder.EncodeAll(body, nil)
+	// Reuse the scratch buffers across flushes. encodeBlockInto and
+	// zstd.EncodeAll both grow their dst slice as needed; we only
+	// need to reset length to zero between calls.
+	w.bodyScratch = encodeBlockInto(w.bodyScratch[:0], &w.pending)
 
-	// Frame the block as [uint64 LE compressed_len][frame] and
-	// concatenate so we issue a single Write — a partial-write tear
+	// Lay out the wire frame as [uint64 LE compressed_len][frame] in
+	// a single buffer so we issue one Write — a partial-write tear
 	// then leaves us at most one torn frame at the tail, which the
 	// next New() call will truncate via lastGoodOffset.
-	combined := make([]byte, 8+len(frame))
-	binary.LittleEndian.PutUint64(combined[:8], uint64(len(frame)))
-	copy(combined[8:], frame)
+	//
+	// We encode the zstd frame directly into wireScratch[8:] and
+	// patch the length prefix in place once it's known, which saves
+	// the second-buffer-plus-memcpy the previous design needed.
+	w.wireScratch = append(w.wireScratch[:0], 0, 0, 0, 0, 0, 0, 0, 0)
+	w.wireScratch = blockEncoder.EncodeAll(w.bodyScratch, w.wireScratch)
+	binary.LittleEndian.PutUint64(w.wireScratch[:8], uint64(len(w.wireScratch)-8))
 
-	if _, err := w.file.Write(combined); err != nil {
+	if _, err := w.file.Write(w.wireScratch); err != nil {
 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 		return w.stickyErr
 	}
