@@ -1,0 +1,63 @@
+package store_test
+
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/cockroachdb/pebble"
+	"github.com/stretchr/testify/require"
+)
+
+// TestOpen_RequiresDataDir pins the documented input contract.
+func TestOpen_RequiresDataDir(t *testing.T) {
+	t.Parallel()
+	_, err := store.Open("")
+	require.ErrorContains(t, err, "data dir is required")
+}
+
+// TestOpen_CreatesPebbleSubdir is the basic happy-path test: a
+// fresh data directory should result in <data-dir>/meta.pebble/
+// being populated by pebble. We don't rely on pebble's specific
+// filenames beyond the LOCK file, which is the most stable
+// observable signal that the db opened successfully.
+func TestOpen_CreatesPebbleSubdir(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+
+	s, err := store.Open(dataDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	_, err = filepath.EvalSymlinks(filepath.Join(dataDir, store.PebbleSubdir, "LOCK"))
+	require.NoError(t, err, "pebble LOCK file should exist after Open")
+}
+
+// TestStore_RoundTripViaEmbeddedDB confirms that callers can use
+// the embedded *pebble.DB directly. This is the contract that lets
+// keyspace-owning packages (backfill, etc.) reuse Store without
+// a wrapper.
+func TestStore_RoundTripViaEmbeddedDB(t *testing.T) {
+	t.Parallel()
+	s, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	require.NoError(t, s.Set([]byte("hello"), []byte("world"), pebble.Sync))
+
+	val, closer, err := s.Get([]byte("hello"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = closer.Close() })
+	require.Equal(t, "world", string(val))
+}
+
+// TestStore_CloseIsIdempotent guards the documented contract; the
+// serve command's deferred close needs to be safe to call after a
+// startup failure has already closed the store.
+func TestStore_CloseIsIdempotent(t *testing.T) {
+	t.Parallel()
+	s, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	require.NoError(t, s.Close())
+}

@@ -54,6 +54,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -61,10 +62,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
+	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -172,23 +176,28 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_SHUTDOWN_TIMEOUT"),
 				Value:   30 * time.Second,
 			},
+			&cli.StringFlag{
+				Name:    "relay-url",
+				Usage:   "Base URL of the upstream relay",
+				Sources: cli.EnvVars("JETSTREAM_RELAY_URL"),
+				Value:   "https://bsky.network",
+			},
+			&cli.StringFlag{
+				Name:    "data-dir",
+				Usage:   "Path to the data directory; the metadata store lives at <data-dir>/meta.pebble",
+				Sources: cli.EnvVars("JETSTREAM_DATA_DIR"),
+				Value:   "./data",
+			},
 		},
 		Action: runServe,
 	}
 }
 
 func runServe(ctx context.Context, cmd *cli.Command) error {
-	level, err := obs.ParseLogLevel(cmd.String("log-level"))
+	logger, err := obs.BuildLoggerFromStrings(os.Stderr, cmd.String("log-level"), cmd.String("log-format"))
 	if err != nil {
 		return err
 	}
-
-	format, err := obs.ParseLogFormat(cmd.String("log-format"))
-	if err != nil {
-		return err
-	}
-
-	logger := obs.NewLogger(os.Stderr, level, format)
 	slog.SetDefault(logger)
 
 	info := version.Get()
@@ -207,6 +216,23 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 
 	metrics := obs.NewMetrics()
 
+	dataDir := cmd.String("data-dir")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return fmt.Errorf("serve: create data dir %s: %w", dataDir, err)
+	}
+
+	metaStore, err := store.Open(dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := metaStore.Close(); cerr != nil {
+			logger.Error("close metadata store", "err", cerr)
+		}
+	}()
+
+	seedMetrics := backfill.NewSeedMetrics(metrics.Registry)
+
 	srv := server.New(server.Config{
 		PublicAddr:      cmd.String("addr"),
 		DebugAddr:       cmd.String("debug-addr"),
@@ -215,11 +241,39 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 
 	// Cancel runCtx on SIGINT/SIGTERM. signal.NotifyContext gives us a clean
 	// idiomatic way to propagate the signal as a context cancellation, which
-	// the server's Run loop already knows how to handle.
+	// both the server's Run loop and the bootstrap pipeline already know how
+	// to handle.
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	runErr := srv.Run(runCtx)
+	// Run the HTTP server and the bootstrap pipeline as siblings under one
+	// errgroup. Either failing cancels the other — we don't want a server
+	// that's silently serving 503s while bootstrap has died, and we don't
+	// want to keep enumerating the relay if the public listener is dead.
+	//
+	// Once steady-state ingest lands, the cutover happens by adding a
+	// third worker (the firehose consumer) into this same group; the
+	// bootstrap goroutine returning is the signal that flips the public
+	// surface from "503 — bootstrapping" to live serving.
+	g, gctx := errgroup.WithContext(runCtx)
+	g.Go(func() error { return srv.Run(gctx) })
+	g.Go(func() error {
+		return backfill.Run(gctx, backfill.Config{
+			Store:    metaStore,
+			RelayURL: cmd.String("relay-url"),
+			Metrics:  seedMetrics,
+			Logger:   logger,
+		})
+	})
+
+	runErr := g.Wait()
+	// A signal-driven shutdown surfaces as context.Canceled from the
+	// bootstrap goroutine because the HTTP server intercepts it as a
+	// graceful shutdown. We don't want the user to see "context canceled"
+	// when they hit Ctrl-C.
+	if errors.Is(runErr, context.Canceled) && runCtx.Err() != nil {
+		runErr = nil
+	}
 
 	// Shut tracing down with a fresh, bounded context so we can still flush
 	// pending spans even though runCtx has been cancelled.

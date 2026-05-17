@@ -68,3 +68,19 @@ func NewLogger(w io.Writer, level slog.Level, format LogFormat) *slog.Logger {
 
 	return slog.New(h)
 }
+
+// BuildLoggerFromStrings parses level and format strings (typically
+// from CLI flags / env vars) and returns a logger that writes to w.
+// Centralizes the parse-and-construct flow so every subcommand wires
+// logging the same way.
+func BuildLoggerFromStrings(w io.Writer, levelStr, formatStr string) (*slog.Logger, error) {
+	level, err := ParseLogLevel(levelStr)
+	if err != nil {
+		return nil, err
+	}
+	format, err := ParseLogFormat(formatStr)
+	if err != nil {
+		return nil, err
+	}
+	return NewLogger(w, level, format), nil
+}
