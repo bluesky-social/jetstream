@@ -24,8 +24,6 @@ const (
 
 // segmentMagic is written at offset 0 of every segment file at
 // creation time; it identifies the file as a jetstream segment.
-// It does NOT indicate sealing — sealed-vs-active is determined
-// by the (future) checksum trailer, not by a magic comparison.
 var segmentMagic = []byte("jss0")
 
 // Config controls writer behavior. Path is required.
