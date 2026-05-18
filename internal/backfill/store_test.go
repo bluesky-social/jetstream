@@ -290,3 +290,30 @@ func TestStore_OnFail_AfterPriorComplete(t *testing.T) {
 	require.Equal(t, "rev-good", rs.Backfill.Rev)
 	require.False(t, rs.Backfill.CompletedAt.IsZero(), "prior CompletedAt preserved")
 }
+
+// TestStore_OnComplete_ClearsLastError is the symmetric partner to
+// TestStore_OnFail_AfterPriorComplete: a Failed -> Complete transition
+// must scrub the stale LastError so observers don't see a zombie
+// diagnostic on a healthy row. Without an explicit test, a future
+// refactor of OnComplete could silently drop the LastError = "" line.
+func TestStore_OnComplete_ClearsLastError(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:recovered")
+
+	require.NoError(t, s.OnDiscover(context.Background(), atmossync.ListReposEntry{
+		DID: did, Active: true,
+	}))
+	require.NoError(t, s.OnFail(context.Background(), did, errors.New("transient"), 4))
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, "transient", rs.Backfill.LastError, "precondition: failure left a LastError")
+
+	require.NoError(t, s.OnComplete(context.Background(), did, &repo.Commit{DID: string(did), Rev: "rev-recovered"}))
+
+	rs, err = s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, "", rs.Backfill.LastError, "OnComplete must clear LastError")
+	require.Equal(t, StatusComplete, rs.Backfill.Status)
+}

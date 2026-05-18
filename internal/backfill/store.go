@@ -188,6 +188,7 @@ func (s *Store) OnComplete(_ context.Context, did atmos.DID, commit *repo.Commit
 func (s *Store) OnFail(_ context.Context, did atmos.DID, failErr error, attempts int) error {
 	rs, err := s.readRepoStatus(did)
 	if err != nil {
+		s.metrics.incOnFailErrors()
 		return err
 	}
 	if rs == nil {
@@ -197,6 +198,7 @@ func (s *Store) OnFail(_ context.Context, did atmos.DID, failErr error, attempts
 	rs.Backfill.LastError = failErr.Error()
 	rs.Backfill.Attempts = attempts
 	if err := s.putRepoStatus(did, rs); err != nil {
+		s.metrics.incOnFailErrors()
 		return err
 	}
 	s.metrics.incFailed()
