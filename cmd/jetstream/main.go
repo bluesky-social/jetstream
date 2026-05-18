@@ -67,7 +67,6 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
-	"github.com/jcalabro/gt"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
 )
@@ -232,7 +231,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
-	seedMetrics := backfill.NewSeedMetrics(metrics.Registry)
+	bfMetrics := backfill.NewMetrics(metrics.Registry)
 
 	srv := server.New(server.Config{
 		PublicAddr:      cmd.String("addr"),
@@ -263,14 +262,17 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		return srv.Run(gctx)
 	})
 
-	// Start the backfiller to do initial repo download for
-	// a fresh jetstream instance
+	// Start the backfiller to do initial repo download for a fresh
+	// jetstream instance, or resume from where a prior process left
+	// off (DESIGN.md §4.1). On clean drain this goroutine returns nil
+	// and the HTTP server keeps running; on engine failure the
+	// errgroup cancels the server too.
 	g.Go(func() error {
 		return backfill.Run(gctx, backfill.Config{
 			Store:    metaStore,
 			RelayURL: cmd.String("relay-url"),
-			Metrics:  seedMetrics,
-			Logger:   gt.Some(logger),
+			Logger:   logger,
+			Metrics:  bfMetrics,
 		})
 	})
 
