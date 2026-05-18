@@ -119,12 +119,28 @@ func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) er
 	return nil
 }
 
-// OnUpdate, OnComplete, OnFail are added in subsequent tasks.
+// OnComplete, OnFail are added in subsequent tasks.
 // Compile-time assertion above will fail until they're done;
 // stub them now so the package builds while we work.
 
-func (s *Store) OnUpdate(_ context.Context, _ atmossync.ListReposEntry) error {
-	panic("OnUpdate not yet implemented")
+// OnUpdate flips the Active flag on an existing row. The lifecycle
+// Status is preserved — atmos fires OnUpdate only when the
+// listRepos.Active value differs from what the Store last saw, and
+// it never changes the Status as a side effect.
+func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) error {
+	rs, err := s.readRepoStatus(entry.DID)
+	if err != nil {
+		return err
+	}
+	if rs == nil {
+		return fmt.Errorf("backfill: on_update %s: missing row (atmos invariant violation)", entry.DID)
+	}
+	rs.Active = entry.Active
+	if err := s.putRepoStatus(entry.DID, rs); err != nil {
+		return err
+	}
+	s.metrics.incActiveFlips()
+	return nil
 }
 
 func (s *Store) OnComplete(_ context.Context, _ atmos.DID, _ *repo.Commit) error {

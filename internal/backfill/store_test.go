@@ -148,3 +148,39 @@ func TestStore_OnDiscover_InactiveDID(t *testing.T) {
 	require.Equal(t, atmosbackfill.StateDiscovered, got.State)
 	require.False(t, got.Active)
 }
+
+// TestStore_OnUpdate_FlipsActive_PreservesStatus exercises the
+// active-flip path: an account flipping inactive must update Active
+// in pebble without clobbering the lifecycle Status. atmos uses this
+// callback to tell us "the relay's view of activeness changed".
+func TestStore_OnUpdate_FlipsActive_PreservesStatus(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:flip")
+
+	require.NoError(t, s.OnDiscover(context.Background(), atmossync.ListReposEntry{
+		DID: did, Active: true,
+	}))
+
+	require.NoError(t, s.OnUpdate(context.Background(), atmossync.ListReposEntry{
+		DID: did, Active: false,
+	}))
+
+	got, err := s.Lookup(context.Background(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateDiscovered, got.State, "Status must not flip on OnUpdate")
+	require.False(t, got.Active, "Active must be updated to false")
+}
+
+// TestStore_OnUpdate_MissingRow is a sanity check: atmos only fires
+// OnUpdate for DIDs whose Lookup found a row, so the row should
+// always exist. If somehow it doesn't, we want a hard error rather
+// than a silent recreate.
+func TestStore_OnUpdate_MissingRow(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	err := s.OnUpdate(context.Background(), atmossync.ListReposEntry{
+		DID: atmos.DID("did:plc:nobody"), Active: true,
+	})
+	require.ErrorContains(t, err, "missing row")
+}
