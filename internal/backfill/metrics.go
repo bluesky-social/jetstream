@@ -5,7 +5,7 @@ import "github.com/prometheus/client_golang/prometheus"
 const metricsNamespace = "jetstream"
 const metricsSubsystem = "backfill"
 
-// Metrics owns the prometheus counters/gauges for the backfill engine.
+// Metrics owns the prometheus counters for the backfill engine.
 // A nil *Metrics is a valid zero-value: every method is a no-op,
 // which lets tests skip metric registration entirely.
 type Metrics struct {
@@ -19,6 +19,11 @@ type Metrics struct {
 // NewMetrics registers the backfill counters against reg. Pass the
 // shared *prometheus.Registry from internal/obs.Metrics so every
 // counter shows up on /metrics.
+//
+// Calls reg.MustRegister, which panics if these counters are already
+// registered against reg. Construct exactly once per process; tests
+// that don't need metrics should pass a nil *Metrics into NewStore
+// rather than building a separate registry.
 func NewMetrics(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
 		Discovered: prometheus.NewCounter(prometheus.CounterOpts{
@@ -51,7 +56,9 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	return m
 }
 
-// incDiscovered, etc. are nil-safe helpers used internally.
+// Nil-safe inc* helpers centralize the nil-Metrics check so callers
+// in store.go don't have to repeat it (and can't forget it). They're
+// unexported because every caller lives in this package.
 func (m *Metrics) incDiscovered() {
 	if m != nil {
 		m.Discovered.Inc()
