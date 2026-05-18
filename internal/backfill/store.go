@@ -119,9 +119,9 @@ func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) er
 	return nil
 }
 
-// OnComplete, OnFail are added in subsequent tasks.
-// Compile-time assertion above will fail until they're done;
-// stub them now so the package builds while we work.
+// OnFail is added in a subsequent task.
+// Compile-time assertion above will fail until it's done;
+// stub it now so the package builds while we work.
 
 // OnUpdate flips the Active flag on an existing row. The lifecycle
 // Status is preserved — atmos fires OnUpdate only when the
@@ -143,8 +143,41 @@ func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) erro
 	return nil
 }
 
-func (s *Store) OnComplete(_ context.Context, _ atmos.DID, _ *repo.Commit) error {
-	panic("OnComplete not yet implemented")
+// OnComplete records a successful repo download. The commit's rev is
+// stored in both Backfill.Rev (the rev at end of initial download
+// per DESIGN.md §3.5) and the top-level Rev (the latest known rev).
+// They're equal here because initial backfill is the only thing
+// updating Rev in this PR; steady-state ingest will diverge them.
+//
+// We RMW rather than write fresh so a future field on RepoStatus
+// (RecordCount, TotalBytes) added between OnDiscover and OnComplete
+// survives. atmos's no-concurrent-callback guarantee per-DID makes
+// the RMW race-free.
+func (s *Store) OnComplete(_ context.Context, did atmos.DID, commit *repo.Commit) error {
+	rs, err := s.readRepoStatus(did)
+	if err != nil {
+		return err
+	}
+	if rs == nil {
+		// Defensive: the engine only fires OnComplete after a Lookup
+		// returned Discovered/Failed, so the row exists. If somehow
+		// it doesn't, recreate it rather than failing the run — the
+		// download already happened and we don't want to lose the
+		// progress signal.
+		rs = &RepoStatus{}
+	}
+	now := timeNow()
+	rs.Backfill.Status = StatusComplete
+	rs.Backfill.Rev = commit.Rev
+	rs.Backfill.CompletedAt = now
+	rs.Backfill.LastError = ""
+	rs.Rev = commit.Rev
+	rs.UpdatedAt = now
+	if err := s.putRepoStatus(did, rs); err != nil {
+		return err
+	}
+	s.metrics.incCompleted()
+	return nil
 }
 
 func (s *Store) OnFail(_ context.Context, _ atmos.DID, _ error, _ int) error {

@@ -8,6 +8,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
+	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
 )
@@ -183,4 +184,57 @@ func TestStore_OnUpdate_MissingRow(t *testing.T) {
 		DID: atmos.DID("did:plc:nobody"), Active: true,
 	})
 	require.ErrorContains(t, err, "missing row")
+}
+
+// TestStore_OnComplete_WritesComplete is the success path: a
+// successful download lands the row at Complete with the commit rev
+// recorded both at top-level Rev and in Backfill.Rev (per
+// DESIGN.md §3.5 — both fields exist; Rev is the latest, Backfill.Rev
+// is the rev at end of initial download).
+func TestStore_OnComplete_WritesComplete(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:done")
+
+	require.NoError(t, s.OnDiscover(context.Background(), atmossync.ListReposEntry{
+		DID: did, Active: true,
+	}))
+
+	commit := &repo.Commit{DID: string(did), Rev: "rev-final"}
+	require.NoError(t, s.OnComplete(context.Background(), did, commit))
+
+	got, err := s.Lookup(context.Background(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateComplete, got.State)
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, "rev-final", rs.Backfill.Rev)
+	require.Equal(t, "rev-final", rs.Rev)
+	require.False(t, rs.Backfill.CompletedAt.IsZero())
+	require.False(t, rs.UpdatedAt.IsZero())
+}
+
+// TestStore_OnComplete_PreservesExtraFields locks in the RMW
+// guarantee: a future PR may add fields like RecordCount; OnComplete
+// must not clobber them. We simulate this by writing a row with a
+// non-zero RecordCount directly, then calling OnComplete.
+func TestStore_OnComplete_PreservesExtraFields(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:rmv")
+
+	require.NoError(t, s.putRepoStatus(did, &RepoStatus{
+		Backfill:    RepoBackfillStatus{Status: StatusNotStarted},
+		RecordCount: 42,
+		Active:      true,
+	}))
+
+	commit := &repo.Commit{DID: string(did), Rev: "rev-z"}
+	require.NoError(t, s.OnComplete(context.Background(), did, commit))
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, int64(42), rs.RecordCount, "RMW must preserve RecordCount")
+	require.Equal(t, StatusComplete, rs.Backfill.Status)
 }
