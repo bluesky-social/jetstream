@@ -57,7 +57,7 @@ func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEnt
 
 	rs, err := decodeRepoStatus(val)
 	if err != nil {
-		return atmosbackfill.StoreEntry{}, err
+		return atmosbackfill.StoreEntry{}, fmt.Errorf("backfill: lookup %s: %w", did, err)
 	}
 
 	var st atmosbackfill.State

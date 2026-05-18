@@ -79,3 +79,25 @@ func TestStore_Lookup_CorruptRow(t *testing.T) {
 	_, err := s.Lookup(context.Background(), did)
 	require.ErrorContains(t, err, "decode RepoStatus")
 }
+
+// TestStore_Lookup_UnknownStatus pins the forward-compat trap: if
+// pebble holds a status string the current binary doesn't recognize
+// (e.g. a future StatusInProgress added by a newer version),
+// Lookup must abort the Run rather than silently mapping it to
+// StateUnknown — that would let the engine clobber the unfamiliar row
+// via OnDiscover.
+func TestStore_Lookup_UnknownStatus(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:abc")
+
+	rs := &RepoStatus{
+		Backfill: RepoBackfillStatus{Status: Status("future")},
+		Active:   true,
+	}
+	require.NoError(t, s.putRepoStatus(did, rs))
+
+	_, err := s.Lookup(context.Background(), did)
+	require.ErrorContains(t, err, "unknown status")
+	require.ErrorContains(t, err, "future")
+}
