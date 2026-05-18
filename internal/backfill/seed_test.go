@@ -55,13 +55,12 @@ func dids(raw ...string) []atmossync.ListReposEntry {
 func TestSeedRepos_HappyPath(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
-	metrics := NewSeedMetrics(nil)
 
 	lister := &fakeLister{
 		entries: dids("did:plc:aaa", "did:plc:bbb", "did:plc:ccc"),
 	}
 
-	res, err := seedReposImpl(t.Context(), s, lister, metrics, nil)
+	res, err := seedReposImpl(t.Context(), s, lister, NewSeedMetrics(nil), nil)
 	require.NoError(t, err)
 	require.Equal(t, SeedResult{Enumerated: 3, Seeded: 3}, res)
 
@@ -96,9 +95,8 @@ func TestSeedRepos_Idempotent(t *testing.T) {
 	}))
 
 	lister := &fakeLister{entries: dids(string(did), "did:plc:new")}
-	metrics := NewSeedMetrics(nil)
 
-	res, err := seedReposImpl(t.Context(), s, lister, metrics, nil)
+	res, err := seedReposImpl(t.Context(), s, lister, NewSeedMetrics(nil), nil)
 	require.NoError(t, err)
 	require.Equal(t, SeedResult{Enumerated: 2, Seeded: 1, SkippedExisting: 1}, res)
 
@@ -129,7 +127,7 @@ func TestSeedRepos_PropagatesListerError(t *testing.T) {
 		err:     boom,
 	}
 
-	res, err := seedReposImpl(t.Context(), s, lister, nil, nil)
+	res, err := seedReposImpl(t.Context(), s, lister, NewSeedMetrics(nil), nil)
 	require.ErrorIs(t, err, boom)
 	require.Equal(t, int64(2), res.Enumerated)
 
@@ -151,7 +149,7 @@ func TestSeedRepos_RespectsContextCancel(t *testing.T) {
 	cancel() // cancel before the loop even starts
 
 	lister := &fakeLister{entries: dids("did:plc:aaa", "did:plc:bbb")}
-	res, err := seedReposImpl(ctx, s, lister, nil, nil)
+	res, err := seedReposImpl(ctx, s, lister, NewSeedMetrics(nil), nil)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, int64(0), res.Seeded)
 }
@@ -207,7 +205,7 @@ func TestSeedRepos_AgainstRelay(t *testing.T) {
 	}
 	sc := atmossync.NewClient(atmossync.Options{Client: xc})
 
-	res, err := SeedRepos(t.Context(), s, sc, nil, nil)
+	res, err := SeedRepos(t.Context(), s, sc, NewSeedMetrics(nil), nil)
 	require.NoError(t, err)
 	require.Equal(t, SeedResult{Enumerated: 3, Seeded: 3}, res)
 

@@ -27,6 +27,7 @@ type fakeRelayRepo struct {
 	Rev    string `json:"rev"`
 	Active bool   `json:"active"`
 }
+
 type fakeRelayPage struct {
 	Cursor string          `json:"cursor,omitempty"`
 	Repos  []fakeRelayRepo `json:"repos"`
@@ -66,6 +67,7 @@ func TestRun_FirstBootRunsSeedAndCompletes(t *testing.T) {
 	err := Run(t.Context(), Config{
 		Store:    s,
 		RelayURL: fr.server.URL,
+		Metrics:  NewSeedMetrics(nil),
 	})
 	require.NoError(t, err)
 
@@ -98,6 +100,7 @@ func TestRun_AlreadyCompleteIsNoop(t *testing.T) {
 	err := Run(t.Context(), Config{
 		Store:    s,
 		RelayURL: fr.server.URL,
+		Metrics:  NewSeedMetrics(nil),
 	})
 	require.NoError(t, err)
 
@@ -128,6 +131,7 @@ func TestRun_ResumesInterruptedSeed(t *testing.T) {
 	err := Run(t.Context(), Config{
 		Store:    s,
 		RelayURL: fr.server.URL,
+		Metrics:  NewSeedMetrics(nil),
 	})
 	require.NoError(t, err)
 
@@ -147,13 +151,19 @@ func TestRun_RequiresStoreAndRelay(t *testing.T) {
 
 	t.Run("missing store", func(t *testing.T) {
 		t.Parallel()
-		err := Run(context.Background(), Config{RelayURL: "https://relay.example.com"})
+		err := Run(context.Background(), Config{
+			RelayURL: "https://relay.example.com",
+			Metrics:  NewSeedMetrics(nil),
+		})
 		require.ErrorContains(t, err, "Store is required")
 	})
 	t.Run("missing relay", func(t *testing.T) {
 		t.Parallel()
 		s := newTestStore(t)
-		err := Run(context.Background(), Config{Store: s})
+		err := Run(context.Background(), Config{
+			Store:   s,
+			Metrics: NewSeedMetrics(nil),
+		})
 		require.ErrorContains(t, err, "RelayURL is required")
 	})
 }

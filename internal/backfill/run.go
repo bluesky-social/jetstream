@@ -9,6 +9,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 )
 
 // Config controls a single bootstrap pipeline run.
@@ -26,12 +27,12 @@ type Config struct {
 	// "https://relay1.us-east.bsky.network"). Required.
 	RelayURL string
 
-	// Pass nil to skip metrics tracking.
+	// Metrics for tracking initial backfill progress. Required.
 	Metrics *Metrics
 
 	// Logger receives lifecycle events. nil falls back to
 	// slog.Default().
-	Logger *slog.Logger
+	Logger gt.Option[*slog.Logger]
 }
 
 // Run drives the bootstrap pipeline (DESIGN.md §4.1) to completion
@@ -48,16 +49,16 @@ type Config struct {
 // Future iterations will chain PhaseDownload and PhaseMerge in the
 // same state machine.
 func Run(ctx context.Context, cfg Config) error {
+	logger := cfg.Logger.ValOr(slog.Default())
+
 	if cfg.Store == nil {
 		return fmt.Errorf("backfill: Run: Store is required")
 	}
 	if cfg.RelayURL == "" {
 		return fmt.Errorf("backfill: Run: RelayURL is required")
 	}
-
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
+	if cfg.Metrics == nil {
+		return fmt.Errorf("backfill: Run: Metrics is required")
 	}
 
 	state, err := GetBootstrapState(cfg.Store)
@@ -72,12 +73,13 @@ func Run(ctx context.Context, cfg Config) error {
 		return nil
 	}
 
+	// Update the stored phase and timestamps
 	now := time.Now().UTC()
 	if state.StartedAt.IsZero() {
 		state.StartedAt = now
 	}
-	state.Phase = PhaseSeed
 	state.UpdatedAt = now
+	state.Phase = PhaseSeed
 	if err := PutBootstrapState(cfg.Store, state); err != nil {
 		return err
 	}
@@ -110,5 +112,6 @@ func Run(ctx context.Context, cfg Config) error {
 		"skipped_existing", res.SkippedExisting,
 		"duration", completedAt.Sub(state.StartedAt),
 	)
+
 	return nil
 }

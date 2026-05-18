@@ -67,6 +67,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/jcalabro/gt"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
 )
@@ -256,13 +257,20 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	// bootstrap goroutine returning is the signal that flips the public
 	// surface from "503 — bootstrapping" to live serving.
 	g, gctx := errgroup.WithContext(runCtx)
-	g.Go(func() error { return srv.Run(gctx) })
+
+	// Start the main web server
+	g.Go(func() error {
+		return srv.Run(gctx)
+	})
+
+	// Start the backfiller to do initial repo download for
+	// a fresh jetstream instance
 	g.Go(func() error {
 		return backfill.Run(gctx, backfill.Config{
 			Store:    metaStore,
 			RelayURL: cmd.String("relay-url"),
 			Metrics:  seedMetrics,
-			Logger:   logger,
+			Logger:   gt.Some(logger),
 		})
 	})
 

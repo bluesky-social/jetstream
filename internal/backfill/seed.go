@@ -126,7 +126,7 @@ type SeedResult struct {
 	SkippedExisting int64
 }
 
-func seedReposImpl(ctx context.Context, s *store.Store, lister SeedReposLister, m *Metrics, logger *slog.Logger) (SeedResult, error) {
+func seedReposImpl(ctx context.Context, s *store.Store, lister SeedReposLister, met *Metrics, logger *slog.Logger) (SeedResult, error) {
 	now := time.Now().UTC()
 	if logger == nil {
 		logger = slog.Default()
@@ -135,7 +135,11 @@ func seedReposImpl(ctx context.Context, s *store.Store, lister SeedReposLister, 
 	logger.Info("backfill: seeding repo list from relay", "page_limit", listReposPageLimit)
 
 	batch := s.NewBatch()
-	defer func() { _ = batch.Close() }()
+	defer func() {
+		if err := batch.Close(); err != nil {
+			logger.Error("backfill: failed to close batch", "err", err)
+		}
+	}()
 
 	pendingInBatch := 0
 	var res SeedResult
@@ -145,8 +149,18 @@ func seedReposImpl(ctx context.Context, s *store.Store, lister SeedReposLister, 
 			return nil
 		}
 
-		if err := batch.Commit(pebble.Sync); err != nil {
-			return fmt.Errorf("backfill: commit seed batch: %w", err)
+		const maxRetries = 3
+		for retry := range maxRetries {
+			err := batch.Commit(pebble.Sync)
+			if err == nil {
+				break
+			}
+
+			if retry == maxRetries-1 {
+				return fmt.Errorf("backfill: commit seed batch: %w", err)
+			}
+
+			time.Sleep(250 * time.Millisecond)
 		}
 
 		batch.Reset()
@@ -167,15 +181,9 @@ func seedReposImpl(ctx context.Context, s *store.Store, lister SeedReposLister, 
 		}
 
 		res.Enumerated++
-		if m != nil {
-			m.EnumeratedTotal.Inc()
-		}
+		met.EnumeratedTotal.Inc()
 
-		// Skip DIDs we've already recorded. We deliberately do not
-		// touch existing rows here: a DID that's already
-		// StatusComplete or StatusFailed is steady-state's concern,
-		// and clobbering it with StatusNotStarted would silently lose
-		// progress.
+		// Skip DIDs we've already recorded
 		exists, err := HasRepo(s, entry.DID)
 		if err != nil {
 			_ = flush()
@@ -183,9 +191,7 @@ func seedReposImpl(ctx context.Context, s *store.Store, lister SeedReposLister, 
 		}
 		if exists {
 			res.SkippedExisting++
-			if m != nil {
-				m.SkippedExistingTotal.Inc()
-			}
+			met.SkippedExistingTotal.Inc()
 			continue
 		}
 
@@ -209,9 +215,7 @@ func seedReposImpl(ctx context.Context, s *store.Store, lister SeedReposLister, 
 
 		res.Seeded++
 		pendingInBatch++
-		if m != nil {
-			m.SeededTotal.Inc()
-		}
+		met.SeededTotal.Inc()
 
 		if pendingInBatch >= seedBatchSize {
 			if err := flush(); err != nil {

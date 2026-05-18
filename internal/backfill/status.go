@@ -2,15 +2,13 @@ package backfill
 
 import "time"
 
-// Status is the per-DID backfill state machine value from DESIGN.md
-// §3.5. Values are the on-disk strings; the order they're declared
-// in is also the order they progress through.
+// Status is the per-DID backfill state machine value.
 type Status string
 
 const (
 	// StatusNotStarted is the initial state: the DID is known to the
-	// relay (it appeared in com.atproto.sync.listRepos) but we have
-	// not yet attempted to download its repo.
+	// relay (i.e. it appeared in com.atproto.sync.listRepos) but we
+	// have not yet attempted to download its repo.
 	StatusNotStarted Status = "not_started"
 
 	// StatusComplete means the initial repo download finished
@@ -21,7 +19,7 @@ const (
 
 	// StatusFailed means the initial repo download exhausted its
 	// retry budget. The steady-state phase periodically retries
-	// failed DIDs with backoff (DESIGN.md §4.3).
+	// failed DIDs with backoff.
 	StatusFailed Status = "failed"
 )
 
@@ -50,9 +48,7 @@ type RepoStatus struct {
 	UpdatedAt time.Time `json:"updated_at,omitzero"`
 
 	// RecordCount and TotalBytes are running totals across the DID's
-	// segment-resident events. They're maintained by the steady-state
-	// ingest path; the bootstrap step in this package leaves them at
-	// zero.
+	// segment-resident events.
 	RecordCount int64 `json:"record_count,omitempty"`
 	TotalBytes  int64 `json:"total_bytes,omitempty"`
 }
