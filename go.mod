@@ -4,8 +4,8 @@ go 1.26
 
 require (
 	github.com/cockroachdb/pebble v1.1.2
-	github.com/jcalabro/atmos v0.0.14
-	github.com/jcalabro/gt v0.0.11
+	github.com/jcalabro/atmos v0.0.15
+	github.com/jcalabro/gt v0.0.12
 	github.com/klauspost/compress v1.18.6
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
@@ -37,7 +37,7 @@ require (
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
-	github.com/jcalabro/jttp v0.0.1 // indirect
+	github.com/jcalabro/jttp v0.0.2 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mr-tron/base58 v1.2.0 // indirect
