@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"sort"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -150,7 +150,7 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 		for did := range s.fixtures {
 			dids = append(dids, did)
 		}
-		sort.Slice(dids, func(i, j int) bool { return dids[i] < dids[j] })
+		slices.Sort(dids)
 		page := listPage{}
 		for _, d := range dids {
 			page.Repos = append(page.Repos, listEntry{
