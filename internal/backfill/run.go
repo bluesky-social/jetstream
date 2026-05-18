@@ -99,12 +99,24 @@ func runWithDirectory(ctx context.Context, cfg Config, httpClient *http.Client, 
 	handler := NewLogHandler(cfg.Logger)
 	logger := cfg.Logger
 
+	startCursor, err := LoadListReposCursor(cfg.Store)
+	if err != nil {
+		return fmt.Errorf("backfill: %w", err)
+	}
+	if startCursor != "" {
+		logger.Info("backfill: resuming from saved cursor", "cursor", startCursor)
+	}
+
 	engine := atmosbackfill.NewEngine(atmosbackfill.Options{
-		SyncClient: sc,
-		Store:      st,
-		Handler:    handler,
-		Directory:  gt.Some(dir),
-		HTTPClient: gt.Some(httpClient),
+		SyncClient:  sc,
+		Store:       st,
+		Handler:     handler,
+		Directory:   gt.Some(dir),
+		HTTPClient:  gt.Some(httpClient),
+		StartCursor: gt.Some(startCursor),
+		OnPageComplete: gt.Some(func(cursor string) error {
+			return SaveListReposCursor(cfg.Store, cursor)
+		}),
 		OnError: gt.Some(func(did atmos.DID, err error) {
 			logger.Warn("backfill: repo failed", "did", string(did), "err", err)
 		}),
@@ -116,8 +128,7 @@ func runWithDirectory(ctx context.Context, cfg Config, httpClient *http.Client, 
 	})
 
 	logger.Info("backfill: starting", "relay", cfg.RelayURL)
-	err := engine.Run(ctx)
-	if err != nil {
+	if err := engine.Run(ctx); err != nil {
 		logger.Error("backfill: engine returned error", "err", err)
 		return fmt.Errorf("backfill: %w", err)
 	}
