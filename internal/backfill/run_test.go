@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -120,6 +121,13 @@ type stubServer struct {
 	// the listed DIDs.
 	failGetRepo     map[atmos.DID]bool
 	failGetRepoCode int
+
+	// firstListReposCursor records the cursor query param the relay
+	// saw on its first listRepos request. Lets tests verify that a
+	// pre-seeded resume cursor is passed through correctly.
+	firstListReposCursor   string
+	firstListReposCursorMu sync.Mutex
+	firstListReposCursorOK bool
 }
 
 func newStubServer(t *testing.T, fixtures map[atmos.DID]repoFixture) *stubServer {
@@ -145,6 +153,12 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/xrpc/com.atproto.sync.listRepos":
 		s.listReposHit.Add(1)
+		s.firstListReposCursorMu.Lock()
+		if !s.firstListReposCursorOK {
+			s.firstListReposCursor = r.URL.Query().Get("cursor")
+			s.firstListReposCursorOK = true
+		}
+		s.firstListReposCursorMu.Unlock()
 		// Stable order so tests that count fail-vs-not are deterministic.
 		dids := make([]atmos.DID, 0, len(s.fixtures))
 		for did := range s.fixtures {
@@ -299,4 +313,61 @@ func TestRun_FailedRepoIsRetriable(t *testing.T) {
 	got, err = bf.Lookup(context.Background(), did)
 	require.NoError(t, err)
 	require.Equal(t, atmosbackfill.StateComplete, got.State)
+}
+
+// TestRun_PersistsCursorAfterDrain confirms the post-drain cursor
+// (empty string) is durably saved to pebble. Following the existing
+// HappyPath: after Run returns, the cursor key exists in pebble with
+// value "" — atmos fires OnPageComplete("") after the terminator
+// page. Without this assertion, the cursor optimization could
+// silently no-op.
+func TestRun_PersistsCursorAfterDrain(t *testing.T) {
+	t.Parallel()
+
+	dids := []atmos.DID{"did:plc:aaa", "did:plc:bbb"}
+	fixtures := make(map[atmos.DID]repoFixture, len(dids))
+	for _, d := range dids {
+		fixtures[d] = buildRepoFixture(t, d)
+	}
+	srv := newStubServer(t, fixtures)
+
+	db, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	require.NoError(t, runWithStub(t, t.Context(), srv, db))
+
+	// The cursor key must exist after a clean drain. Value is the
+	// terminator-page cursor, which is empty for the stub (it returns
+	// all DIDs in one page then no more).
+	got, err := LoadListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "", got, "post-drain cursor is empty")
+}
+
+// TestRun_PassesSavedCursorToRelay confirms the resume path: a
+// cursor pre-seeded into pebble is passed to the relay's listRepos
+// as the startCursor on the first request of a new Run. Without
+// this, the cursor optimization is dead weight on restart.
+func TestRun_PassesSavedCursorToRelay(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:aaa")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+
+	db, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Pre-seed a cursor as if a prior Run got partway through.
+	require.NoError(t, SaveListReposCursor(db, "pretend-this-is-page-7"))
+
+	require.NoError(t, runWithStub(t, t.Context(), srv, db))
+
+	srv.firstListReposCursorMu.Lock()
+	defer srv.firstListReposCursorMu.Unlock()
+	require.True(t, srv.firstListReposCursorOK, "stub should have seen at least one listRepos request")
+	require.Equal(t, "pretend-this-is-page-7", srv.firstListReposCursor,
+		"first listRepos request must use the pre-seeded cursor as startCursor")
 }
