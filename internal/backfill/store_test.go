@@ -2,6 +2,7 @@ package backfill
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -237,4 +238,55 @@ func TestStore_OnComplete_PreservesExtraFields(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(42), rs.RecordCount, "RMW must preserve RecordCount")
 	require.Equal(t, StatusComplete, rs.Backfill.Status)
+}
+
+// TestStore_OnFail_RecordsFailure pins the failure path. attempts is
+// the count for the current Run only — atmos passes initial+retries
+// from processRepo, and we overwrite rather than accumulate across
+// Runs (per DESIGN.md §6.3, this cosmetic regression is intentional).
+func TestStore_OnFail_RecordsFailure(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:bad")
+
+	require.NoError(t, s.OnDiscover(context.Background(), atmossync.ListReposEntry{
+		DID: did, Active: true,
+	}))
+
+	failErr := errors.New("upstream 500")
+	require.NoError(t, s.OnFail(context.Background(), did, failErr, 6))
+
+	got, err := s.Lookup(context.Background(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateFailed, got.State)
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, "upstream 500", rs.Backfill.LastError)
+	require.Equal(t, 6, rs.Backfill.Attempts)
+	require.False(t, rs.Backfill.StartedAt.IsZero(), "StartedAt set by OnDiscover must survive")
+	require.True(t, rs.Backfill.CompletedAt.IsZero(), "OnFail must not stamp CompletedAt")
+}
+
+// TestStore_OnFail_AfterPriorComplete documents (and locks in) the
+// defensive behavior: a Run never re-attempts a Complete row in this
+// PR, but if it ever did, OnFail keeps Backfill.CompletedAt and Rev
+// from the prior run rather than zeroing them.
+func TestStore_OnFail_AfterPriorComplete(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:flake")
+
+	require.NoError(t, s.OnDiscover(context.Background(), atmossync.ListReposEntry{
+		DID: did, Active: true,
+	}))
+	require.NoError(t, s.OnComplete(context.Background(), did, &repo.Commit{DID: string(did), Rev: "rev-good"}))
+
+	require.NoError(t, s.OnFail(context.Background(), did, errors.New("boom"), 3))
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusFailed, rs.Backfill.Status)
+	require.Equal(t, "rev-good", rs.Backfill.Rev)
+	require.False(t, rs.Backfill.CompletedAt.IsZero(), "prior CompletedAt preserved")
 }

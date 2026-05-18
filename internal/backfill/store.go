@@ -119,10 +119,6 @@ func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) er
 	return nil
 }
 
-// OnFail is added in a subsequent task.
-// Compile-time assertion above will fail until it's done;
-// stub it now so the package builds while we work.
-
 // OnUpdate flips the Active flag on an existing row. The lifecycle
 // Status is preserved — atmos fires OnUpdate only when the
 // listRepos.Active value differs from what the Store last saw, and
@@ -180,8 +176,31 @@ func (s *Store) OnComplete(_ context.Context, did atmos.DID, commit *repo.Commit
 	return nil
 }
 
-func (s *Store) OnFail(_ context.Context, _ atmos.DID, _ error, _ int) error {
-	panic("OnFail not yet implemented")
+// OnFail records a failed repo download. atmos passes the total
+// attempt count for the current Run (initial + retries). We overwrite
+// rather than accumulate across Runs — DESIGN.md §6.3 calls out
+// resetting Attempts on failover as an acceptable cosmetic regression.
+//
+// CompletedAt and Backfill.Rev from a prior successful Run are
+// preserved. This is defensive — within this PR the engine never
+// retries a StateComplete DID — but it keeps a hypothetical future
+// "complete then later failed" trail intact.
+func (s *Store) OnFail(_ context.Context, did atmos.DID, failErr error, attempts int) error {
+	rs, err := s.readRepoStatus(did)
+	if err != nil {
+		return err
+	}
+	if rs == nil {
+		rs = &RepoStatus{}
+	}
+	rs.Backfill.Status = StatusFailed
+	rs.Backfill.LastError = failErr.Error()
+	rs.Backfill.Attempts = attempts
+	if err := s.putRepoStatus(did, rs); err != nil {
+		return err
+	}
+	s.metrics.incFailed()
+	return nil
 }
 
 // timeNow is a package var so tests can pin wall-clock values.
