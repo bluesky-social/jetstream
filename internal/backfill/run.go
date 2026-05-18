@@ -90,6 +90,10 @@ func Run(ctx context.Context, cfg Config) error {
 // Tests inject a stub resolver via the Directory parameter so we can
 // avoid spinning up a real PLC.
 func runWithDirectory(ctx context.Context, cfg Config, httpClient *http.Client, dir *identity.Directory) error {
+	// Per atmos Options.SyncClient docs: disable xrpc retries because
+	// the engine's retry/backoff loop is the only retry source we
+	// want. Otherwise xrpc and the engine compound retries on
+	// transient 503s, multiplying load against PDSes.
 	xc := &xrpc.Client{
 		Host:       cfg.RelayURL,
 		HTTPClient: gt.Some(httpClient),
