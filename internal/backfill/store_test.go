@@ -8,6 +8,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
+	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
 )
 
@@ -100,4 +101,50 @@ func TestStore_Lookup_UnknownStatus(t *testing.T) {
 	_, err := s.Lookup(context.Background(), did)
 	require.ErrorContains(t, err, "unknown status")
 	require.ErrorContains(t, err, "future")
+}
+
+// TestStore_OnDiscover_WritesNotStarted is the producer-side hot
+// path: every DID returned by listRepos for the first time gets a
+// fresh row at not_started with the listRepos.Active flag preserved.
+func TestStore_OnDiscover_WritesNotStarted(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:abc")
+
+	err := s.OnDiscover(context.Background(), atmossync.ListReposEntry{
+		DID:    did,
+		Active: true,
+	})
+	require.NoError(t, err)
+
+	got, err := s.Lookup(context.Background(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateDiscovered, got.State)
+	require.True(t, got.Active)
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.NotNil(t, rs)
+	require.Equal(t, StatusNotStarted, rs.Backfill.Status)
+	require.False(t, rs.Backfill.StartedAt.IsZero(), "StartedAt must be set on first discovery")
+}
+
+// TestStore_OnDiscover_InactiveDID confirms an inactive DID still
+// gets a row written so we can re-attempt later if it flips active.
+// Active flips are tracked by Store, not by absence of a row.
+func TestStore_OnDiscover_InactiveDID(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:tomb")
+
+	err := s.OnDiscover(context.Background(), atmossync.ListReposEntry{
+		DID:    did,
+		Active: false,
+	})
+	require.NoError(t, err)
+
+	got, err := s.Lookup(context.Background(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateDiscovered, got.State)
+	require.False(t, got.Active)
 }

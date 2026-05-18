@@ -101,12 +101,27 @@ func (s *Store) readRepoStatus(did atmos.DID) (*RepoStatus, error) {
 	return decodeRepoStatus(val)
 }
 
-// OnDiscover, OnUpdate, OnComplete, OnFail are added in subsequent
-// tasks. Compile-time assertion above will fail until they're done;
-// stub them now so the package builds while we work.
-func (s *Store) OnDiscover(_ context.Context, _ atmossync.ListReposEntry) error {
-	panic("OnDiscover not yet implemented")
+// OnDiscover writes a fresh RepoStatus at status=not_started for a
+// DID the engine has never seen. atmos guarantees this fires at most
+// once per DID per Lookup-StateUnknown path.
+func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) error {
+	rs := &RepoStatus{
+		Backfill: RepoBackfillStatus{
+			Status:    StatusNotStarted,
+			StartedAt: timeNow(),
+		},
+		Active: entry.Active,
+	}
+	if err := s.putRepoStatus(entry.DID, rs); err != nil {
+		return err
+	}
+	s.metrics.incDiscovered()
+	return nil
 }
+
+// OnUpdate, OnComplete, OnFail are added in subsequent tasks.
+// Compile-time assertion above will fail until they're done;
+// stub them now so the package builds while we work.
 
 func (s *Store) OnUpdate(_ context.Context, _ atmossync.ListReposEntry) error {
 	panic("OnUpdate not yet implemented")
