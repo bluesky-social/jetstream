@@ -231,8 +231,6 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
-	bfMetrics := backfill.NewMetrics(metrics.Registry)
-
 	srv := server.New(server.Config{
 		PublicAddr:      cmd.String("addr"),
 		DebugAddr:       cmd.String("debug-addr"),
@@ -272,15 +270,15 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 			Store:    metaStore,
 			RelayURL: cmd.String("relay-url"),
 			Logger:   logger,
-			Metrics:  bfMetrics,
+			Metrics:  backfill.NewMetrics(metrics.Registry),
 		})
 	})
 
-	runErr := g.Wait()
 	// A signal-driven shutdown surfaces as context.Canceled from the
 	// bootstrap goroutine because the HTTP server intercepts it as a
 	// graceful shutdown. We don't want the user to see "context canceled"
 	// when they hit Ctrl-C.
+	runErr := g.Wait()
 	if errors.Is(runErr, context.Canceled) && runCtx.Err() != nil {
 		runErr = nil
 	}

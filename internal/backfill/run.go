@@ -37,11 +37,6 @@ type Config struct {
 	// Metrics is optional; nil means we still run, just without
 	// /metrics counters incrementing.
 	Metrics *Metrics
-
-	// HTTPClient is shared across the relay xrpc client, the identity
-	// resolver, and the per-PDS pool inside the engine. nil = a fresh
-	// 30s-timeout default client.
-	HTTPClient *http.Client
 }
 
 // progressLogInterval bounds how chatty the INFO progress log is. We
@@ -71,19 +66,14 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
-	}
-
 	dir := &identity.Directory{
 		Resolver: &identity.DefaultResolver{
-			HTTPClient: gt.Some(httpClient),
+			HTTPClient: gt.Some(xrpc.NewHTTPClient(30 * time.Second)),
 		},
 		Cache: identity.NewLRUCache(directoryCacheCapacity, directoryCacheTTL),
 	}
 
-	return runWithDirectory(ctx, cfg, httpClient, dir)
+	return runWithDirectory(ctx, cfg, xrpc.NewHTTPClient(2*time.Minute), dir)
 }
 
 // runWithDirectory is the production entry point's internal worker.
@@ -99,6 +89,7 @@ func runWithDirectory(ctx context.Context, cfg Config, httpClient *http.Client, 
 		HTTPClient: gt.Some(httpClient),
 		Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
 	}
+
 	sc := atmossync.NewClient(atmossync.Options{
 		Client:    xc,
 		Directory: gt.Some(dir),
@@ -130,6 +121,7 @@ func runWithDirectory(ctx context.Context, cfg Config, httpClient *http.Client, 
 		logger.Error("backfill: engine returned error", "err", err)
 		return fmt.Errorf("backfill: %w", err)
 	}
+
 	logger.Info("backfill: engine drained")
 	return nil
 }

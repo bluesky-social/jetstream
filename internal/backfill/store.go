@@ -71,6 +71,7 @@ func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEnt
 	default:
 		return atmosbackfill.StoreEntry{}, fmt.Errorf("backfill: lookup %s: unknown status %q", did, rs.Backfill.Status)
 	}
+
 	return atmosbackfill.StoreEntry{State: st, Active: rs.Active}, nil
 }
 

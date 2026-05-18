@@ -36,8 +36,8 @@ type RepoBackfillStatus struct {
 	Rev         string    `json:"rev,omitempty"`
 	Attempts    int       `json:"attempts,omitempty"`
 	LastError   string    `json:"last_error,omitempty"`
-	StartedAt   time.Time `json:"started_at,omitempty"`
-	CompletedAt time.Time `json:"completed_at,omitempty"`
+	StartedAt   time.Time `json:"started_at,omitzero"`
+	CompletedAt time.Time `json:"completed_at,omitzero"`
 }
 
 // RepoStatus is the JSON value stored at repo/<did>. The shape matches
@@ -55,7 +55,7 @@ type RepoStatus struct {
 	Backfill    RepoBackfillStatus `json:"backfill"`
 	PDS         string             `json:"pds,omitempty"`
 	Rev         string             `json:"rev,omitempty"`
-	UpdatedAt   time.Time          `json:"updated_at,omitempty"`
+	UpdatedAt   time.Time          `json:"updated_at,omitzero"`
 	RecordCount int64              `json:"record_count,omitempty"`
 	TotalBytes  int64              `json:"total_bytes,omitempty"`
 	Active      bool               `json:"active"`

@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/cockroachdb/pebble v1.1.2
-	github.com/jcalabro/atmos v0.0.15
+	github.com/jcalabro/atmos v0.0.16
 	github.com/jcalabro/gt v0.0.12
 	github.com/klauspost/compress v1.18.6
 	github.com/prometheus/client_golang v1.23.2
