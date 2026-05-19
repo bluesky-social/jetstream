@@ -10,7 +10,7 @@ install-tools:
 
 # Lints the code
 lint:
-    golangci-lint run --timeout 1m ./...
+    golangci-lint run --timeout 5m ./...
 
 # Apply Go modernization rewrites
 modernize *ARGS="./...":
