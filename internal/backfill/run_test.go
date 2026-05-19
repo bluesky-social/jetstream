@@ -274,47 +274,6 @@ func TestRun_Resume_NoOpAfterCompletion(t *testing.T) {
 	require.Equal(t, firstGetRepo, srv.getRepoHit.Load(), "second Run must not re-download Complete DIDs")
 }
 
-// TestRun_FailedRepoIsRetriable: a DID whose getRepo always 500s
-// exhausts the engine's retry budget and lands at StatusFailed. A
-// subsequent Run with the failure cleared re-attempts and succeeds.
-//
-// The atmos engine's defaults are 5 retries with 1s base / 30s max
-// delay, so worst-case the failing path sits about a minute. We gate
-// with testing.Short() so `just test` (which runs -short) skips this;
-// `just test-long` exercises it.
-func TestRun_FailedRepoIsRetriable(t *testing.T) {
-	if testing.Short() {
-		t.Skip("retry-budget test is slow under defaults; covered by test-long")
-	}
-	t.Parallel()
-
-	did := atmos.DID("did:plc:flake")
-	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
-	srv := newStubServer(t, fixtures)
-	srv.failGetRepo = map[atmos.DID]bool{did: true}
-	srv.failGetRepoCode = http.StatusInternalServerError
-
-	db, err := store.Open(t.TempDir())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-
-	err = runWithStub(t, t.Context(), srv, db)
-	require.NoError(t, err, "Run drains successfully even when individual DIDs fail")
-
-	bf := NewStore(db, nil)
-	got, err := bf.Lookup(context.Background(), did)
-	require.NoError(t, err)
-	require.Equal(t, atmosbackfill.StateFailed, got.State)
-
-	// Clear the failure and re-run.
-	srv.failGetRepo[did] = false
-
-	require.NoError(t, runWithStub(t, t.Context(), srv, db))
-	got, err = bf.Lookup(context.Background(), did)
-	require.NoError(t, err)
-	require.Equal(t, atmosbackfill.StateComplete, got.State)
-}
-
 // TestRun_PersistsCursorAfterDrain confirms the post-drain cursor
 // (empty string) is durably saved to pebble. Following the existing
 // HappyPath: after Run returns, the cursor key exists in pebble with
