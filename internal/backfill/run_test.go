@@ -42,7 +42,7 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = st.Close() })
 		w, err := ingest.Open(ingest.Config{
-			SegmentsDir:         filepath.Join(dir, "segments"),
+			SegmentsDir:       filepath.Join(dir, "segments"),
 			Store:             st,
 			Logger:            logger,
 			MaxEventsPerBlock: 4,
@@ -266,7 +266,7 @@ func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.S
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	segDir := filepath.Join(t.TempDir(), "segments")
 	w, err := ingest.Open(ingest.Config{
-		SegmentsDir:         segDir,
+		SegmentsDir:       segDir,
 		Store:             db,
 		Logger:            logger,
 		MaxEventsPerBlock: 4,
@@ -412,7 +412,7 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	segDir := filepath.Join(dataDir, "segments")
 	w, err := ingest.Open(ingest.Config{
-		SegmentsDir:         segDir,
+		SegmentsDir:       segDir,
 		Store:             db,
 		Logger:            logger,
 		MaxEventsPerBlock: 2, // two records each, so each repo fills a block

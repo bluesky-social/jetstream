@@ -237,9 +237,9 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	ingestMetrics := ingest.NewMetrics(metrics.Registry)
 	ingestWriter, err := ingest.Open(ingest.Config{
 		SegmentsDir: filepath.Join(dataDir, "segments"),
-		Store:     metaStore,
-		Logger:    logger,
-		Metrics:   ingestMetrics,
+		Store:       metaStore,
+		Logger:      logger,
+		Metrics:     ingestMetrics,
 	})
 	if err != nil {
 		return fmt.Errorf("ingest open: %w", err)

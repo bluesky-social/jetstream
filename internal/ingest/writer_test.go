@@ -35,9 +35,9 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 
 	cfg := Config{
 		SegmentsDir: segDir,
-		Store:     newTestStore(t),
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Metrics:   NewMetrics(prometheus.NewRegistry()),
+		Store:       newTestStore(t),
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:     NewMetrics(prometheus.NewRegistry()),
 	}
 	if overrides.MaxSegmentBytes != 0 {
 		cfg.MaxSegmentBytes = overrides.MaxSegmentBytes
@@ -230,7 +230,7 @@ func TestResume_ExistingActive(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	cfg := Config{
-		SegmentsDir:         segDir,
+		SegmentsDir:       segDir,
 		Store:             st,
 		Logger:            logger,
 		MaxEventsPerBlock: blockSize,
@@ -275,7 +275,7 @@ func TestResume_SealedSkipsToNext(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	cfg := Config{
-		SegmentsDir:         segDir,
+		SegmentsDir:       segDir,
 		Store:             st,
 		Logger:            logger,
 		MaxEventsPerBlock: blockSize,
@@ -333,7 +333,7 @@ func TestOpen_ReconcilesDriftedPebble(t *testing.T) {
 	st := newTestStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
-		SegmentsDir:         segDir,
+		SegmentsDir:       segDir,
 		Store:             st,
 		Logger:            logger,
 		MaxEventsPerBlock: blockSize,
@@ -374,7 +374,7 @@ func TestOpen_RecoversFromTornTail(t *testing.T) {
 	st := newTestStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
-		SegmentsDir:         segDir,
+		SegmentsDir:       segDir,
 		Store:             st,
 		Logger:            logger,
 		MaxEventsPerBlock: blockSize,

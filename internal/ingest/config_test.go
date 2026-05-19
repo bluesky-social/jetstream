@@ -53,7 +53,7 @@ func TestConfigValidate_RejectsNegativeBytes(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
-		SegmentsDir:       "/tmp/x",
+		SegmentsDir:     "/tmp/x",
 		Store:           &store.Store{},
 		Logger:          logger,
 		MaxSegmentBytes: -1,

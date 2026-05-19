@@ -52,7 +52,7 @@ func runOneSwarm(t *testing.T, rng *rand.Rand) {
 	totalAppends := 1 + rng.IntN(2048)
 
 	cfg := Config{
-		SegmentsDir:         filepath.Join(dataDir, "segments"),
+		SegmentsDir:       filepath.Join(dataDir, "segments"),
 		Store:             st,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MaxEventsPerBlock: maxBlock,
