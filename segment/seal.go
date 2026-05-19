@@ -3,6 +3,7 @@ package segment
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"os"
 
@@ -200,23 +201,36 @@ type blockWalkResult struct {
 }
 
 // walkBlocks walks the framed-block region of the active file from
-// reservedHeaderBytes to footerOffset, decompressing each frame and
-// gathering per-block stats.
+// reservedHeaderBytes to footerOffset. Wrapper around walkActiveFrames
+// so the seal path keeps its existing call shape.
 func (w *Writer) walkBlocks(footerOffset int64) (blockWalkResult, error) {
+	return walkActiveFrames(w.file, footerOffset)
+}
+
+// walkActiveFrames walks the framed-block region of a segment file
+// from reservedHeaderBytes to maxOffset, decompressing each frame
+// and gathering per-block stats. Used by Writer.Seal during sealing
+// and by Inspect when reporting on an active (unsealed) file.
+//
+// On a torn tail (a frame whose length prefix points past maxOffset)
+// the partial blockWalkResult accumulated up to that frame is
+// returned alongside an ErrCorruptSegment-wrapped error so callers
+// that want the partial result can recover it.
+func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 	res := blockWalkResult{
 		uniqueDIDs:         map[string]struct{}{},
 		collectionIDByName: map[string]uint32{},
 	}
 	off := int64(reservedHeaderBytes)
-	for off < footerOffset {
-		frame, frameSize, err := w.readFrameAt(off, footerOffset)
+	for off < maxOffset {
+		frame, frameSize, err := readFrameAt(f, off, maxOffset)
 		if err != nil {
-			return blockWalkResult{}, err
+			return res, err
 		}
 
 		events, uncompressedSize, err := decodeBlockCompressedSized(frame)
 		if err != nil {
-			return blockWalkResult{}, fmt.Errorf("segment: decode block at %d: %w",
+			return res, fmt.Errorf("segment: decode block at %d: %w",
 				off, err)
 		}
 
@@ -283,7 +297,7 @@ func (w *Writer) walkBlocks(footerOffset int64) (blockWalkResult, error) {
 				id, ok := res.collectionIDByName[ev.Collection]
 				if !ok {
 					if uint64(len(res.collectionStringTable)) >= math.MaxUint32 {
-						return blockWalkResult{}, fmt.Errorf(
+						return res, fmt.Errorf(
 							"%w: too many distinct collections", ErrInvalidFooter)
 					}
 					col := string([]byte(ev.Collection))
@@ -302,8 +316,6 @@ func (w *Writer) walkBlocks(footerOffset int64) (blockWalkResult, error) {
 		for id := range blockCollections {
 			ids = append(ids, id)
 		}
-		// Sort ids ascending for deterministic bitmask emission and
-		// downstream BlockCollections() output.
 		sortUint32(ids)
 		res.perBlockCollections = append(res.perBlockCollections, ids)
 
@@ -436,18 +448,18 @@ func (w *Writer) truncateFooterTail(footerOffset int64) error {
 // readFrameAt reads a single [uint64 LE compressed_len][zstd frame]
 // pair starting at fileOffset, bounded by maxOffset so a torn or
 // hostile length prefix can't drive an unbounded allocation.
-// Used by the seal walk.
-func (w *Writer) readFrameAt(fileOffset, maxOffset int64) (frame []byte, frameLen int, err error) {
+// Used by the seal walk and by Inspect's active-file path.
+func readFrameAt(f io.ReaderAt, fileOffset, maxOffset int64) (frame []byte, frameLen int, err error) {
 	var lenBuf [8]byte
-	if _, err := w.file.ReadAt(lenBuf[:], fileOffset); err != nil {
+	if _, err := f.ReadAt(lenBuf[:], fileOffset); err != nil {
 		return nil, 0, fmt.Errorf("segment: read frame length at %d: %w",
 			fileOffset, err)
 	}
 	frameSize := binary.LittleEndian.Uint64(lenBuf[:])
-	// Reject frames that would extend past the (active-state) end of
+	// Reject frames that would extend past the active-state end of
 	// the framed-block region. The writer's own resumeExistingSegment
-	// path already truncates torn tails, so this should never fire on
-	// a well-behaved file; treat a hit here as corruption.
+	// path already truncates torn tails, so a hit on a well-behaved
+	// file means corruption.
 	remaining := uint64(maxOffset - fileOffset - int64(len(lenBuf)))
 	if frameSize > remaining {
 		return nil, 0, fmt.Errorf(
@@ -455,7 +467,7 @@ func (w *Writer) readFrameAt(fileOffset, maxOffset int64) (frame []byte, frameLe
 			ErrCorruptSegment, fileOffset, frameSize, remaining)
 	}
 	frame = make([]byte, frameSize)
-	if _, err := w.file.ReadAt(frame, fileOffset+8); err != nil {
+	if _, err := f.ReadAt(frame, fileOffset+8); err != nil {
 		return nil, 0, fmt.Errorf("segment: read frame body at %d: %w",
 			fileOffset+8, err)
 	}

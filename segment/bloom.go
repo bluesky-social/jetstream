@@ -116,6 +116,7 @@ func decodeBlockBloomFromRegion(region []byte, sizeBytes uint32, idx int) (*gloo
 	if idx < 0 {
 		return nil, fmt.Errorf("%w: idx %d < 0", ErrBlockOutOfRange, idx)
 	}
+
 	body := region[blockBloomsRegionHeaderSize:]
 	start := idx * int(sizeBytes)
 	end := start + int(sizeBytes)
@@ -123,6 +124,7 @@ func decodeBlockBloomFromRegion(region []byte, sizeBytes uint32, idx int) (*gloo
 		return nil, fmt.Errorf("%w: idx %d past region (size %d)",
 			ErrBlockOutOfRange, idx, len(body)/int(sizeBytes))
 	}
+
 	f, err := gloom.UnmarshalBinary(body[start:end])
 	if err != nil {
 		return nil, fmt.Errorf("segment: unmarshal block bloom %d: %w", idx, err)

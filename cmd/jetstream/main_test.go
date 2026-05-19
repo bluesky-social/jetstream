@@ -49,3 +49,27 @@ func TestNewApp_VersionCommandPrintsToStdout(t *testing.T) {
 	require.Contains(t, out, "commit")
 	require.Contains(t, out, "built")
 }
+
+func TestNewApp_InspectSegmentHelpDoesNotError(t *testing.T) {
+	t.Parallel()
+
+	err := newApp().Run(t.Context(), []string{"jetstream", "inspect-segment", "--help"})
+	require.NoError(t, err)
+}
+
+func TestNewApp_InspectSegmentRunsAgainstSealedFile(t *testing.T) {
+	t.Parallel()
+
+	path := makeSealedFixture(t)
+
+	var buf bytes.Buffer
+	app := newApp()
+	app.Writer = &buf
+
+	err := app.Run(t.Context(), []string{"jetstream", "inspect-segment", path})
+	require.NoError(t, err)
+
+	out := buf.String()
+	require.Contains(t, out, "state: sealed")
+	require.Contains(t, out, path)
+}

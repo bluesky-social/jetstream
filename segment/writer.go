@@ -381,13 +381,11 @@ func (p *pendingBlock) RkeyLen(i int) uint8       { return p.rkeyLen[i] }
 func (p *pendingBlock) RevLen(i int) uint8        { return p.revLen[i] }
 func (p *pendingBlock) PayloadLen(i int) uint32   { return p.eventLen[i] }
 
-func (p *pendingBlock) AppendCollections(dst []byte) []byte {
-	return append(dst, p.collections...)
-}
-func (p *pendingBlock) AppendDIDs(dst []byte) []byte     { return append(dst, p.dids...) }
-func (p *pendingBlock) AppendRkeys(dst []byte) []byte    { return append(dst, p.rkeys...) }
-func (p *pendingBlock) AppendRevs(dst []byte) []byte     { return append(dst, p.revs...) }
-func (p *pendingBlock) AppendPayloads(dst []byte) []byte { return append(dst, p.payloads...) }
+func (p *pendingBlock) AppendCollections(dst []byte) []byte { return append(dst, p.collections...) }
+func (p *pendingBlock) AppendDIDs(dst []byte) []byte        { return append(dst, p.dids...) }
+func (p *pendingBlock) AppendRkeys(dst []byte) []byte       { return append(dst, p.rkeys...) }
+func (p *pendingBlock) AppendRevs(dst []byte) []byte        { return append(dst, p.revs...) }
+func (p *pendingBlock) AppendPayloads(dst []byte) []byte    { return append(dst, p.payloads...) }
 
 func (p *pendingBlock) TotalCollectionsLen() int { return len(p.collections) }
 func (p *pendingBlock) TotalDIDsLen() int        { return len(p.dids) }
