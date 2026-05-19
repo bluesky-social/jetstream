@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -140,8 +141,19 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 				nsidWidth = len(n)
 			}
 		}
-		for i, n := range ins.Collections {
-			bw.printf("  [%3d] %-*s  blocks: %d\n", i, nsidWidth, n, counts[i])
+		// Sort by descending block-occurrence count so the operator's eye
+		// lands on the noisy collections first. The original index in
+		// ins.Collections is preserved as the printed [id] so cross-refs
+		// to per-block "collections:" lists in --blocks=full still match.
+		order := make([]int, len(ins.Collections))
+		for i := range order {
+			order[i] = i
+		}
+		sort.SliceStable(order, func(a, b int) bool {
+			return counts[order[a]] > counts[order[b]]
+		})
+		for _, i := range order {
+			bw.printf("  [%3d] %-*s  blocks: %d\n", i, nsidWidth, ins.Collections[i], counts[i])
 		}
 	}
 

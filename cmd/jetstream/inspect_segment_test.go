@@ -171,6 +171,50 @@ func TestRenderInspection_BlockTruncation(t *testing.T) {
 	require.Contains(t, out, "rows omitted")
 }
 
+func TestRenderInspection_CollectionsSortedByBlockCountDesc(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "multi.jss")
+	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+
+	// Each Append+Flush produces one block. Collection occurrences (in
+	// blocks) end up: rare=1, common=3, mid=2. Insertion order is
+	// rare, common, mid — so a sort that ignored counts would print them
+	// in that order. We expect descending: common, mid, rare.
+	collections := []string{"rare", "common", "common", "common", "mid", "mid"}
+	for i, c := range collections {
+		full, err := w.Append(segment.Event{
+			Seq:        uint64(i + 1),
+			Kind:       segment.KindCreate,
+			DID:        "d",
+			Collection: c,
+			Rkey:       "r",
+			Rev:        "v",
+		})
+		require.NoError(t, err)
+		require.True(t, full)
+		require.NoError(t, w.Flush())
+	}
+	_, err = w.Seal()
+	require.NoError(t, err)
+
+	ins, err := segment.Inspect(path)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, renderInspection(&buf, ins, "summary", 0))
+	out := buf.String()
+
+	commonIdx := bytes.Index([]byte(out), []byte("common"))
+	midIdx := bytes.Index([]byte(out), []byte("mid"))
+	rareIdx := bytes.Index([]byte(out), []byte("rare"))
+	require.Greater(t, commonIdx, 0)
+	require.Greater(t, midIdx, commonIdx, "mid should follow common")
+	require.Greater(t, rareIdx, midIdx, "rare should follow mid")
+}
+
 func TestInspectSegmentCommand_EndToEndAgainstRealFile(t *testing.T) {
 	t.Parallel()
 
