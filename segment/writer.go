@@ -184,12 +184,6 @@ func initializeNewSegment(f *os.File) error {
 // recovery walker would interpret as a malformed block, masking
 // everything after it. The caller is responsible for closing f on
 // failure.
-//
-// Sealed-vs-active is intentionally not checked here: in this slice
-// every successfully-initialized segment carries segmentMagic at
-// offset 0, and the sealed marker is the (future) checksum trailer.
-// kaizen: once the trailer format lands, this function should also
-// reject sealed segments with ErrSegmentSealed.
 func resumeExistingSegment(f *os.File, size int64, path string) error {
 	if size < reservedHeaderBytes {
 		return fmt.Errorf("%w: %s is %d bytes",
@@ -202,6 +196,19 @@ func resumeExistingSegment(f *os.File, size int64, path string) error {
 	}
 	if !bytes.Equal(head, segmentMagic) {
 		return fmt.Errorf("%w: %s: bad magic %q", ErrCorruptSegment, path, head)
+	}
+
+	// Sealed-vs-active detection: bytes 4..11 are zero on an active
+	// file (initializeNewSegment writes only the magic into the
+	// reserved 256-byte header) and non-zero on a sealed file (Seal
+	// patches in the xxh3 checksum). DESIGN.md §3.1.2 names this the
+	// "checksum at offset 4" signal; spec §8 documents the convention.
+	var checksumBuf [8]byte
+	if _, err := f.ReadAt(checksumBuf[:], 4); err != nil {
+		return fmt.Errorf("segment: read checksum: %w", err)
+	}
+	if binary.LittleEndian.Uint64(checksumBuf[:]) != 0 {
+		return fmt.Errorf("%w: %s", ErrSegmentSealed, path)
 	}
 
 	end, err := lastGoodOffset(f, size)

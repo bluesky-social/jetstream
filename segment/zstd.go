@@ -66,3 +66,24 @@ func decodeBlockCompressed(frame []byte) ([]Event, error) {
 
 	return decodeBlock(body)
 }
+
+// decodeBlockCompressedSized is like decodeBlockCompressed but also
+// returns the decompressed body length. Seal needs the size to
+// populate BlockInfo.UncompressedSize for the block index without a
+// second decompress.
+//
+// The buffer-aliasing contract from decodeBlock applies: the returned
+// events alias the (private) decompressed body for their string and
+// payload columns. Callers that need to retain string fields beyond
+// the events' lifetime must clone.
+func decodeBlockCompressedSized(frame []byte) ([]Event, int, error) {
+	body, err := blockDecoder.DecodeAll(frame, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("segment: zstd decompress: %w", err)
+	}
+	events, err := decodeBlock(body)
+	if err != nil {
+		return nil, 0, err
+	}
+	return events, len(body), nil
+}

@@ -31,4 +31,25 @@ var (
 
 	// ErrClosed is returned by Append, Flush, and (re-)Close after Close.
 	ErrClosed = errors.New("segment: writer is closed")
+
+	// ErrChecksumMismatch is returned by Reader.Open when the file's
+	// xxh3 checksum disagrees with the value in its fixed header. The
+	// likely contributing factors are bit rot, a partial CDN download,
+	// or replication corruption.
+	ErrChecksumMismatch = errors.New("segment: checksum mismatch")
+
+	// ErrInvalidFooter is returned by Reader.Open when the variable-
+	// length footer fails structural validation: a section length
+	// would overrun the file, internal pointers don't agree, or a
+	// length-prefixed sub-region is truncated.
+	ErrInvalidFooter = errors.New("segment: invalid footer")
+
+	// ErrInvalidBlockIndex is returned by Reader.Open when a block
+	// index entry's offset/size pair doesn't fit within the file.
+	ErrInvalidBlockIndex = errors.New("segment: invalid block index")
+
+	// ErrBlockOutOfRange is returned by Reader.DecodeBlock,
+	// Reader.BlockBloom, and Reader.BlockCollections when the requested
+	// block index is past BlockCount.
+	ErrBlockOutOfRange = errors.New("segment: block index out of range")
 )

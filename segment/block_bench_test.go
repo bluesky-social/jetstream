@@ -223,9 +223,8 @@ func BenchmarkAppend(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		if w.pending.count() >= w.cfg.MaxEventsPerBlock {
 			w.pending.reset()
 		}

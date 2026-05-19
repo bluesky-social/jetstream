@@ -66,11 +66,6 @@ func TestNewRejectsTooSmallFile(t *testing.T) {
 // TestNewRejectsBadMagic covers the magic-validation path in
 // resumeExistingSegment: a header-sized file whose first 4 bytes
 // are not segmentMagic must be rejected as corrupt.
-//
-// kaizen: when the seal/unseal trailer format lands, add a
-// dedicated TestNewRejectsSealedFile that builds a real sealed
-// segment (via the future Seal API) and expects ErrSegmentSealed.
-// Until then ErrSegmentSealed has no producer in this slice.
 func TestNewRejectsBadMagic(t *testing.T) {
 	t.Parallel()
 
@@ -82,6 +77,29 @@ func TestNewRejectsBadMagic(t *testing.T) {
 
 	_, err := New(Config{Path: path})
 	require.True(t, errors.Is(err, ErrCorruptSegment))
+}
+
+// TestNewRejectsSealedFile verifies that the sealed-vs-active
+// detection logic in resumeExistingSegment returns ErrSegmentSealed
+// for a file whose checksum bytes (offset 4..11) are non-zero. We
+// build the fixture by hand here rather than via the public Seal API
+// because Seal lives in a sibling package file and we want this test
+// to cover detection in isolation; an end-to-end test that round-
+// trips through Seal lives in seal_test.go.
+func TestNewRejectsSealedFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	header := make([]byte, reservedHeaderBytes)
+	copy(header, segmentMagic)
+	// Any non-zero value at offset 4..11 trips the detection.
+	binary.LittleEndian.PutUint64(header[4:12], 0xCAFEBABE)
+	require.NoError(t, os.WriteFile(path, header, 0o644))
+
+	_, err := New(Config{Path: path})
+	require.True(t, errors.Is(err, ErrSegmentSealed))
 }
 
 func TestNewRejectsInvalidConfig(t *testing.T) {

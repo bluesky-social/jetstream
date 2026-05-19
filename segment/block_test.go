@@ -468,3 +468,24 @@ func eventsEqual(a, b Event) bool {
 	}
 	return true
 }
+
+func TestDecodeBlockCompressedSizedReturnsBodyLen(t *testing.T) {
+	t.Parallel()
+
+	events := []Event{
+		{Seq: 1, Kind: KindCreate, DID: "did:plc:a", Payload: []byte("p1")},
+		{Seq: 2, Kind: KindCreate, DID: "did:plc:b", Payload: []byte("p2")},
+	}
+	frame, err := encodeBlockCompressed(events)
+	require.NoError(t, err)
+
+	gotEvents, gotSize, err := decodeBlockCompressedSized(frame)
+	require.NoError(t, err)
+	require.Len(t, gotEvents, len(events))
+
+	// Cross-check: the body length should equal what encodeBlock
+	// produced before zstd-wrapping.
+	body, err := encodeBlock(events)
+	require.NoError(t, err)
+	require.Equal(t, len(body), gotSize)
+}
