@@ -30,7 +30,7 @@ func TestEncodeHeaderRoundtrip(t *testing.T) {
 	}
 
 	buf := encodeHeader(h)
-	require.Len(t, buf, reservedHeaderBytes)
+	require.Len(t, buf, ReservedHeaderBytes)
 
 	got, err := decodeHeader(buf)
 	require.NoError(t, err)
@@ -94,7 +94,7 @@ func TestEncodeHeaderFieldOffsets(t *testing.T) {
 
 	// Reserved padding (bytes 98..256) must be zero so future
 	// extensions can land without breaking older readers.
-	for i := 98; i < reservedHeaderBytes; i++ {
+	for i := 98; i < ReservedHeaderBytes; i++ {
 		require.Zerof(t, buf[i], "reserved byte %d must be zero", i)
 	}
 }
@@ -102,14 +102,14 @@ func TestEncodeHeaderFieldOffsets(t *testing.T) {
 func TestDecodeHeaderRejectsShort(t *testing.T) {
 	t.Parallel()
 
-	_, err := decodeHeader(make([]byte, reservedHeaderBytes-1))
+	_, err := decodeHeader(make([]byte, ReservedHeaderBytes-1))
 	require.True(t, errors.Is(err, ErrInvalidFooter))
 }
 
 func TestDecodeHeaderRejectsBadMagic(t *testing.T) {
 	t.Parallel()
 
-	buf := make([]byte, reservedHeaderBytes)
+	buf := make([]byte, ReservedHeaderBytes)
 	copy(buf, []byte("XXXX"))
 	_, err := decodeHeader(buf)
 	require.True(t, errors.Is(err, ErrCorruptSegment))
@@ -121,7 +121,7 @@ func TestDecodeHeaderRejectsZeroChecksum(t *testing.T) {
 	// Zero checksum at offset 4 means "active file" by our active/sealed
 	// convention. decodeHeader is only ever called on what should be a
 	// sealed file, so a zero checksum is an unambiguous error.
-	buf := make([]byte, reservedHeaderBytes)
+	buf := make([]byte, ReservedHeaderBytes)
 	copy(buf, segmentMagic)
 	binary.LittleEndian.PutUint16(buf[12:14], 1) // version
 	_, err := decodeHeader(buf)
@@ -131,7 +131,7 @@ func TestDecodeHeaderRejectsZeroChecksum(t *testing.T) {
 func TestDecodeHeaderRejectsBadVersion(t *testing.T) {
 	t.Parallel()
 
-	buf := make([]byte, reservedHeaderBytes)
+	buf := make([]byte, ReservedHeaderBytes)
 	copy(buf, segmentMagic)
 	binary.LittleEndian.PutUint64(buf[4:12], 0xCAFE) // non-zero checksum
 	binary.LittleEndian.PutUint16(buf[12:14], 99)    // future version
@@ -142,7 +142,7 @@ func TestDecodeHeaderRejectsBadVersion(t *testing.T) {
 func TestXxh3HeaderFooter(t *testing.T) {
 	t.Parallel()
 
-	headerBytes := bytes.Repeat([]byte{0xAB}, reservedHeaderBytes)
+	headerBytes := bytes.Repeat([]byte{0xAB}, ReservedHeaderBytes)
 	footerBytes := []byte("hello, footer")
 	got := xxh3HeaderFooter(headerBytes, footerBytes)
 	require.NotZero(t, got)

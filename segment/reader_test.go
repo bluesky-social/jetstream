@@ -381,7 +381,7 @@ func TestReaderOpenRejectsOverlappingBlockIndex(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = f.Close() })
 
-	headerBytes := make([]byte, reservedHeaderBytes)
+	headerBytes := make([]byte, ReservedHeaderBytes)
 	_, err = f.ReadAt(headerBytes, 0)
 	require.NoError(t, err)
 	hdr, err := decodeHeader(headerBytes)
@@ -391,7 +391,7 @@ func TestReaderOpenRejectsOverlappingBlockIndex(t *testing.T) {
 	// first block. blockIndexEntrySize=36, the offset field is at
 	// the entry's offset 0..8.
 	var bad [8]byte
-	binary.LittleEndian.PutUint64(bad[:], uint64(reservedHeaderBytes))
+	binary.LittleEndian.PutUint64(bad[:], uint64(ReservedHeaderBytes))
 	secondOffsetField := int64(hdr.BlockIndexOffset) + int64(blockIndexEntrySize)
 	_, err = f.WriteAt(bad[:], secondOffsetField)
 	require.NoError(t, err)

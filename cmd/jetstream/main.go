@@ -59,10 +59,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -232,6 +234,22 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
+	ingestMetrics := ingest.NewMetrics(metrics.Registry)
+	ingestWriter, err := ingest.Open(ingest.Config{
+		ShardsDir: filepath.Join(dataDir, "shards"),
+		Store:     metaStore,
+		Logger:    logger,
+		Metrics:   ingestMetrics,
+	})
+	if err != nil {
+		return fmt.Errorf("ingest open: %w", err)
+	}
+	defer func() {
+		if cerr := ingestWriter.Close(); cerr != nil {
+			logger.Error("close ingest writer", "err", cerr)
+		}
+	}()
+
 	srv := server.New(server.Config{
 		PublicAddr:      cmd.String("addr"),
 		DebugAddr:       cmd.String("debug-addr"),
@@ -269,6 +287,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	g.Go(func() error {
 		return backfill.Run(gctx, backfill.Config{
 			Store:    metaStore,
+			Writer:   ingestWriter,
 			RelayURL: cmd.String("relay-url"),
 			Logger:   logger,
 			Metrics:  backfill.NewMetrics(metrics.Registry),

@@ -179,7 +179,7 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 		}
 	} else {
 		half := blocksTruncate / 2
-		for i := 0; i < half; i++ {
+		for i := range half {
 			emitRow(i)
 		}
 		bw.printf("  ... (%d rows omitted) ...\n", n-2*half)

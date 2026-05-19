@@ -92,12 +92,12 @@ func Inspect(path string) (*Inspection, error) {
 		return nil, fmt.Errorf("segment: stat %s: %w", path, err)
 	}
 	fileSize := stat.Size()
-	if fileSize < int64(reservedHeaderBytes) {
+	if fileSize < int64(ReservedHeaderBytes) {
 		return nil, fmt.Errorf("%w: %s is %d bytes (need >= %d for header)",
-			ErrCorruptSegment, path, fileSize, reservedHeaderBytes)
+			ErrCorruptSegment, path, fileSize, ReservedHeaderBytes)
 	}
 
-	headerBytes := make([]byte, reservedHeaderBytes)
+	headerBytes := make([]byte, ReservedHeaderBytes)
 	if _, err := f.ReadAt(headerBytes, 0); err != nil {
 		return nil, fmt.Errorf("segment: read header: %w", err)
 	}
@@ -194,7 +194,7 @@ func verifySealedChecksum(path string, fileSize int64, headerBytes []byte, heade
 		return false, fmt.Errorf("segment: read footer for checksum: %w", err)
 	}
 
-	headerForHash := make([]byte, reservedHeaderBytes)
+	headerForHash := make([]byte, ReservedHeaderBytes)
 	copy(headerForHash, headerBytes)
 	for i := 4; i < 12; i++ {
 		headerForHash[i] = 0

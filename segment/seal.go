@@ -201,14 +201,14 @@ type blockWalkResult struct {
 }
 
 // walkBlocks walks the framed-block region of the active file from
-// reservedHeaderBytes to footerOffset. Wrapper around walkActiveFrames
+// ReservedHeaderBytes to footerOffset. Wrapper around walkActiveFrames
 // so the seal path keeps its existing call shape.
 func (w *Writer) walkBlocks(footerOffset int64) (blockWalkResult, error) {
 	return walkActiveFrames(w.file, footerOffset)
 }
 
 // walkActiveFrames walks the framed-block region of a segment file
-// from reservedHeaderBytes to maxOffset, decompressing each frame
+// from ReservedHeaderBytes to maxOffset, decompressing each frame
 // and gathering per-block stats. Used by Writer.Seal during sealing
 // and by Inspect when reporting on an active (unsealed) file.
 //
@@ -221,7 +221,7 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 		uniqueDIDs:         map[string]struct{}{},
 		collectionIDByName: map[string]uint32{},
 	}
-	off := int64(reservedHeaderBytes)
+	off := int64(ReservedHeaderBytes)
 	for off < maxOffset {
 		frame, frameSize, err := readFrameAt(f, off, maxOffset)
 		if err != nil {

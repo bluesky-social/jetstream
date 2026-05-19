@@ -14,12 +14,16 @@ const (
 	// value is just the default, and is configurable by the user.
 	DefaultMaxEventsPerBlock = 4096
 
-	// reservedHeaderBytes is the size of the fixed header at the
-	// start of every segment file (DESIGN.md §3.1.2): the first
-	// len(segmentMagic) bytes are the magic, the remainder is
-	// zero-filled placeholder for the future Seal step. It is also
+	// ReservedHeaderBytes is the size of the fixed header at the start
+	// of every segment file (DESIGN.md §3.1.2). The first len(segmentMagic)
+	// bytes are the magic; the remainder is zero-filled placeholder until
+	// Seal populates the finalized header. ReservedHeaderBytes is also
 	// the byte offset at which the framed-block region begins.
-	reservedHeaderBytes = 256
+	//
+	// Exported so callers that own the active-segment lifecycle (e.g.
+	// internal/ingest) can compute byte offsets without duplicating the
+	// constant.
+	ReservedHeaderBytes = 256
 )
 
 // segmentMagic is written at offset 0 of every segment file at
@@ -158,11 +162,11 @@ func syncParentDir(path string) error {
 // initializeNewSegment writes the fixed reserved header to a
 // brand-new (zero-length) segment file and fsyncs it. The header
 // is segmentMagic followed by enough zero-filled padding to reach
-// reservedHeaderBytes total. The returned error is already wrapped
+// ReservedHeaderBytes total. The returned error is already wrapped
 // for the caller; the caller is responsible for closing f on
 // failure.
 func initializeNewSegment(f *os.File) error {
-	header := make([]byte, reservedHeaderBytes)
+	header := make([]byte, ReservedHeaderBytes)
 	copy(header, segmentMagic)
 
 	if _, err := f.Write(header); err != nil {
@@ -185,7 +189,7 @@ func initializeNewSegment(f *os.File) error {
 // everything after it. The caller is responsible for closing f on
 // failure.
 func resumeExistingSegment(f *os.File, size int64, path string) error {
-	if size < reservedHeaderBytes {
+	if size < ReservedHeaderBytes {
 		return fmt.Errorf("%w: %s is %d bytes",
 			ErrCorruptSegment, path, size)
 	}
@@ -249,7 +253,7 @@ func resumeExistingSegment(f *os.File, size int64, path string) error {
 // reader path is responsible for surfacing that as decode errors.
 // This keeps recovery O(blocks) rather than O(uncompressed bytes).
 func lastGoodOffset(f *os.File, size int64) (int64, error) {
-	off := int64(reservedHeaderBytes)
+	off := int64(ReservedHeaderBytes)
 	var lenBuf [8]byte
 	for off < size {
 		if size-off < int64(len(lenBuf)) {

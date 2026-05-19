@@ -8,13 +8,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/crypto"
@@ -30,18 +33,63 @@ import (
 func TestRun_RejectsInvalidConfig(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Helper for cases that need a non-nil Writer (real, opened).
+	newWriter := func(t *testing.T) *ingest.Writer {
+		t.Helper()
+		dir := t.TempDir()
+		st, err := store.Open(dir)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = st.Close() })
+		w, err := ingest.Open(ingest.Config{
+			ShardsDir:         filepath.Join(dir, "shards"),
+			Store:             st,
+			Logger:            logger,
+			MaxEventsPerBlock: 4,
+			MaxSegmentBytes:   1 << 30,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = w.Close() })
+		return w
+	}
+
 	tests := []struct {
 		name    string
-		cfg     Config
+		build   func(t *testing.T) Config
 		errPart string
 	}{
-		{"missing Store", Config{RelayURL: "x", Logger: logger}, "Config.Store"},
-		{"missing RelayURL", Config{Store: &store.Store{}, Logger: logger}, "Config.RelayURL"},
-		{"missing Logger", Config{Store: &store.Store{}, RelayURL: "x"}, "Config.Logger"},
+		{
+			name: "missing Store",
+			build: func(t *testing.T) Config {
+				return Config{Writer: newWriter(t), RelayURL: "x", Logger: logger}
+			},
+			errPart: "Config.Store",
+		},
+		{
+			name: "missing Writer",
+			build: func(t *testing.T) Config {
+				return Config{Store: &store.Store{}, RelayURL: "x", Logger: logger}
+			},
+			errPart: "Config.Writer",
+		},
+		{
+			name: "missing RelayURL",
+			build: func(t *testing.T) Config {
+				return Config{Store: &store.Store{}, Writer: newWriter(t), Logger: logger}
+			},
+			errPart: "Config.RelayURL",
+		},
+		{
+			name: "missing Logger",
+			build: func(t *testing.T) Config {
+				return Config{Store: &store.Store{}, Writer: newWriter(t), RelayURL: "x"}
+			},
+			errPart: "Config.Logger",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := Run(context.Background(), tc.cfg)
+			err := Run(context.Background(), tc.build(t))
 			require.ErrorContains(t, err, tc.errPart)
 		})
 	}
@@ -215,10 +263,23 @@ func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.S
 	}
 	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
 
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	shards := filepath.Join(t.TempDir(), "shards")
+	w, err := ingest.Open(ingest.Config{
+		ShardsDir:         shards,
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
 	cfg := Config{
 		Store:    db,
+		Writer:   w,
 		RelayURL: srv.srv.URL,
-		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:   logger,
 	}
 	return runWithDirectory(ctx, cfg, &http.Client{Timeout: 5 * time.Second}, dir)
 }
@@ -329,4 +390,60 @@ func TestRun_PassesSavedCursorToRelay(t *testing.T) {
 	require.True(t, srv.firstListReposCursorOK, "stub should have seen at least one listRepos request")
 	require.Equal(t, "pretend-this-is-page-7", srv.firstListReposCursor,
 		"first listRepos request must use the pre-seeded cursor as startCursor")
+}
+
+// TestRun_WritesSegmentFile confirms that backfilling a non-empty
+// fixture leaves a real seg_*.jss on disk with at least one event.
+func TestRun_WritesSegmentFile(t *testing.T) {
+	t.Parallel()
+
+	dids := []atmos.DID{"did:plc:aaa", "did:plc:bbb"}
+	fixtures := make(map[atmos.DID]repoFixture, len(dids))
+	for _, d := range dids {
+		fixtures[d] = buildRepoFixture(t, d)
+	}
+	srv := newStubServer(t, fixtures)
+
+	dataDir := t.TempDir()
+	db, err := store.Open(dataDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	shards := filepath.Join(dataDir, "shards")
+	w, err := ingest.Open(ingest.Config{
+		ShardsDir:         shards,
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 2, // two records each, so each repo fills a block
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+
+	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
+	for did, f := range fixtures {
+		docs[did] = &identity.DIDDocument{
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		}
+	}
+	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
+
+	cfg := Config{Store: db, Writer: w, RelayURL: srv.srv.URL, Logger: logger}
+	require.NoError(t, runWithDirectory(t.Context(), cfg, &http.Client{Timeout: 5 * time.Second}, dir))
+	require.NoError(t, w.Close())
+
+	// At least one fully-flushed event per DID. Each fixture has 1
+	// record, so we expect 2 events total. NextSeq advances even past
+	// Close because Close does not seal.
+	maxSeq, found, err := segment.ScanMaxSeq(filepath.Join(shards, "seg_0000000000.jss"))
+	require.NoError(t, err)
+	require.True(t, found, "segment must contain at least one block")
+	require.GreaterOrEqual(t, maxSeq, uint64(1),
+		"two repos × 1 record each = 2 events; max seq must be at least 1")
 }

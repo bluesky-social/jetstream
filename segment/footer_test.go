@@ -14,7 +14,7 @@ func TestEncodeBlockIndexRoundtrip(t *testing.T) {
 
 	infos := []BlockInfo{
 		{
-			Offset:           reservedHeaderBytes,
+			Offset:           ReservedHeaderBytes,
 			CompressedSize:   1024,
 			UncompressedSize: 4096,
 			EventCount:       16,
@@ -22,7 +22,7 @@ func TestEncodeBlockIndexRoundtrip(t *testing.T) {
 			MaxSeq:           16,
 		},
 		{
-			Offset:           reservedHeaderBytes + 1024 + 8,
+			Offset:           ReservedHeaderBytes + 1024 + 8,
 			CompressedSize:   2048,
 			UncompressedSize: 8192,
 			EventCount:       32,

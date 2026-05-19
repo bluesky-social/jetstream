@@ -37,7 +37,7 @@ func TestRecoveryFromCrashAfterFooterFsyncBeforeHeaderPwrite(t *testing.T) {
 	// Roll back the header to active-state by re-zeroing bytes 4..256.
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	require.NoError(t, err)
-	zero := make([]byte, reservedHeaderBytes-4)
+	zero := make([]byte, ReservedHeaderBytes-4)
 	_, err = f.WriteAt(zero, 4)
 	require.NoError(t, err)
 	require.NoError(t, f.Sync())

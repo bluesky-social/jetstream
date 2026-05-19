@@ -1,43 +1,109 @@
-// Package backfill: handler.go provides the placeholder Handler used
-// by the bootstrap PR. It does no segment writing — that comes in a
-// later PR. The point is to prove the engine wiring (listRepos ->
-// download -> handler -> Store) works end to end.
+// Package backfill: handler.go provides SegmentHandler, the atmos
+// backfill.Handler that walks each downloaded repo's MST and emits
+// one segment.KindCreate event per record into the shared
+// ingest.Writer.
 package backfill
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
+	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/repo"
 )
 
-// LogHandler is a no-op atmos backfill.Handler that logs each handled
-// repo at debug level. It exists so we can prove the engine wiring
-// works without committing to segment file format details from this
-// PR.
-type LogHandler struct {
+// SegmentHandler walks each downloaded repo's MST and emits one
+// KindCreate event per record into the writer. atmos guarantees no
+// two HandleRepo calls overlap for the same DID; ingest.Writer is
+// safe across DIDs.
+type SegmentHandler struct {
+	writer *ingest.Writer
 	logger *slog.Logger
+	now    func() time.Time
 }
 
 // Compile-time assertion.
-var _ atmosbackfill.Handler = (*LogHandler)(nil)
+var _ atmosbackfill.Handler = (*SegmentHandler)(nil)
 
-// NewLogHandler returns a LogHandler. nil logger uses slog.Default().
-func NewLogHandler(logger *slog.Logger) *LogHandler {
+// NewSegmentHandler returns a handler that writes events into writer.
+// nil logger uses slog.Default(); writer is required.
+func NewSegmentHandler(writer *ingest.Writer, logger *slog.Logger) *SegmentHandler {
+	if writer == nil {
+		panic("backfill: NewSegmentHandler: writer is required")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &LogHandler{logger: logger}
+	return &SegmentHandler{
+		writer: writer,
+		logger: logger,
+		now:    time.Now,
+	}
 }
 
-// HandleRepo logs the (did, rev) pair and returns nil. The atmos
-// engine then advances the DID via Store.OnComplete.
-func (h *LogHandler) HandleRepo(_ context.Context, did atmos.DID, _ *repo.Repo, commit *repo.Commit) error {
-	h.logger.Debug("backfill: repo handled",
-		"did", string(did),
-		"rev", commit.Rev,
-	)
+// HandleRepo emits one segment event per record in r.Tree. The
+// IndexedAt timestamp is the same for every event in this repo: it
+// is the wall-clock instant at which jetstream observed this repo.
+// Per-record timestamps would imply a false ordering.
+func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit) error {
+	ctx, span := obs.Tracer("backfill").Start(ctx, "backfill.handle_repo")
+	defer span.End()
+
+	indexedAt := h.now().UnixMicro()
+
+	walkErr := r.Tree.Walk(func(key string, cid cbor.CID) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		collection, rkey, err := splitMSTKey(key)
+		if err != nil {
+			return fmt.Errorf("backfill: did=%s: %w", did, err)
+		}
+		payload, err := r.Store.GetBlock(cid)
+		if err != nil {
+			return fmt.Errorf("backfill: did=%s get block %s/%s: %w", did, collection, rkey, err)
+		}
+
+		ev := segment.Event{
+			IndexedAt:  indexedAt,
+			Kind:       segment.KindCreate,
+			DID:        string(did),
+			Collection: collection,
+			Rkey:       rkey,
+			Rev:        commit.Rev,
+			Payload:    payload,
+		}
+		if err := h.writer.Append(ctx, &ev); err != nil {
+			return fmt.Errorf("backfill: did=%s append %s/%s: %w", did, collection, rkey, err)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		span.RecordError(walkErr)
+		return walkErr
+	}
 	return nil
+}
+
+// splitMSTKey splits "collection/rkey" into its parts. The MST
+// validates the key shape on insert (atmos/mst.IsValidMstKey), so a
+// malformed key here is a data-integrity violation we surface
+// rather than swallow.
+func splitMSTKey(key string) (collection, rkey string, err error) {
+	idx := strings.IndexByte(key, '/')
+	if idx <= 0 || idx == len(key)-1 {
+		return "", "", fmt.Errorf("malformed MST key %q (expected collection/rkey)", key)
+	}
+	if strings.Contains(key[idx+1:], "/") {
+		return "", "", fmt.Errorf("MST key %q has more than one slash", key)
+	}
+	return key[:idx], key[idx+1:], nil
 }

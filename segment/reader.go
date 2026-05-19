@@ -93,13 +93,13 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 		return nil, fmt.Errorf("segment: stat %s: %w", cfg.Path, err)
 	}
 	fileSize := info.Size()
-	if fileSize < int64(reservedHeaderBytes) {
+	if fileSize < int64(ReservedHeaderBytes) {
 		return nil, fmt.Errorf("%w: %s is %d bytes",
 			ErrCorruptSegment, cfg.Path, fileSize)
 	}
 
 	// 1. Fixed header.
-	headerBytes := make([]byte, reservedHeaderBytes)
+	headerBytes := make([]byte, ReservedHeaderBytes)
 	if _, err := f.ReadAt(headerBytes, 0); err != nil {
 		return nil, fmt.Errorf("segment: read header: %w", err)
 	}
@@ -185,7 +185,7 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 		}
 		// Header bytes with the checksum field zeroed: that's how it
 		// looked when seal computed xxh3.
-		headerForHash := make([]byte, reservedHeaderBytes)
+		headerForHash := make([]byte, ReservedHeaderBytes)
 		copy(headerForHash, headerBytes)
 		for i := 4; i < 12; i++ {
 			headerForHash[i] = 0
@@ -307,7 +307,7 @@ func (r *Reader) DecodeBlock(idx int) ([]Event, error) {
 // fits within the file and that the section ordering matches the
 // spec. Returns ErrInvalidFooter on any violation.
 func validateHeaderOffsets(h Header, fileSize uint64) error {
-	if h.FooterOffset < uint64(reservedHeaderBytes) {
+	if h.FooterOffset < uint64(ReservedHeaderBytes) {
 		return fmt.Errorf("%w: footer_offset %d < reserved header",
 			ErrInvalidFooter, h.FooterOffset)
 	}
@@ -382,7 +382,7 @@ func (r *Reader) LoadAllBlockBlooms() ([]*gloom.Filter, error) {
 // passes per-entry bounds checks but is internally inconsistent could
 // otherwise surface as confusing decode errors at DecodeBlock time.
 func validateBlockOffsets(blocks []BlockInfo, footerOffset uint64) error {
-	var prevEnd uint64 = reservedHeaderBytes
+	var prevEnd uint64 = ReservedHeaderBytes
 	for i, b := range blocks {
 		// Guard against b.CompressedSize+8 overflowing uint64 on
 		// hostile input.
@@ -391,11 +391,11 @@ func validateBlockOffsets(blocks []BlockInfo, footerOffset uint64) error {
 				ErrInvalidBlockIndex, i, b.CompressedSize, footerOffset)
 		}
 		end := b.Offset + 8 + uint64(b.CompressedSize)
-		if b.Offset < uint64(reservedHeaderBytes) || end > footerOffset {
+		if b.Offset < uint64(ReservedHeaderBytes) || end > footerOffset {
 			return fmt.Errorf(
 				"%w: block %d range [%d, %d) outside [%d, %d)",
 				ErrInvalidBlockIndex, i, b.Offset, end,
-				reservedHeaderBytes, footerOffset)
+				ReservedHeaderBytes, footerOffset)
 		}
 		if b.Offset < prevEnd {
 			return fmt.Errorf(

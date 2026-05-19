@@ -22,12 +22,12 @@ func TestNewCreatesEmpty256ByteFile(t *testing.T) {
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	require.EqualValues(t, reservedHeaderBytes, info.Size())
+	require.EqualValues(t, ReservedHeaderBytes, info.Size())
 
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 
-	// Layout: segmentMagic + zero padding to reservedHeaderBytes.
+	// Layout: segmentMagic + zero padding to ReservedHeaderBytes.
 	require.Equal(t, segmentMagic, contents[:len(segmentMagic)],
 		"first %d bytes must be segmentMagic", len(segmentMagic))
 	for i, b := range contents[len(segmentMagic):] {
@@ -71,7 +71,7 @@ func TestNewRejectsBadMagic(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg.jss")
-	header := make([]byte, reservedHeaderBytes)
+	header := make([]byte, ReservedHeaderBytes)
 	copy(header, []byte("XXXX"))
 	require.NoError(t, os.WriteFile(path, header, 0o644))
 
@@ -92,7 +92,7 @@ func TestNewRejectsSealedFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg.jss")
 
-	header := make([]byte, reservedHeaderBytes)
+	header := make([]byte, ReservedHeaderBytes)
 	copy(header, segmentMagic)
 	// Any non-zero value at offset 4..11 trips the detection.
 	binary.LittleEndian.PutUint64(header[4:12], 0xCAFEBABE)
@@ -230,7 +230,7 @@ func TestFlushEmptyIsNoOp(t *testing.T) {
 	// File should still be exactly 256 zero bytes.
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	require.EqualValues(t, reservedHeaderBytes, info.Size())
+	require.EqualValues(t, ReservedHeaderBytes, info.Size())
 }
 
 func TestFlushWritesFramedBlockAndFsyncs(t *testing.T) {
@@ -257,10 +257,10 @@ func TestFlushWritesFramedBlockAndFsyncs(t *testing.T) {
 	// Read the file back and walk the framing.
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.Greater(t, len(contents), reservedHeaderBytes+8,
+	require.Greater(t, len(contents), ReservedHeaderBytes+8,
 		"expected header + framed block")
 
-	body := contents[reservedHeaderBytes:]
+	body := contents[ReservedHeaderBytes:]
 	require.GreaterOrEqual(t, len(body), 8, "need at least the length prefix")
 
 	frameLen := binary.LittleEndian.Uint64(body[:8])
@@ -303,7 +303,7 @@ func TestFlushMultipleBlocks(t *testing.T) {
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 
-	walked := walkFramedBlocks(t, contents[reservedHeaderBytes:])
+	walked := walkFramedBlocks(t, contents[ReservedHeaderBytes:])
 	require.Len(t, walked, 2, "expected two framed blocks")
 	require.Len(t, walked[0], 2)
 	require.Len(t, walked[1], 1)
@@ -361,7 +361,7 @@ func TestCloseFlushesPending(t *testing.T) {
 
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.Greater(t, len(contents), reservedHeaderBytes+8,
+	require.Greater(t, len(contents), ReservedHeaderBytes+8,
 		"Close must flush pending events before closing the file")
 }
 
@@ -414,7 +414,7 @@ func TestNewResumeAppendsAfterExistingBlocks(t *testing.T) {
 
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
-	walked := walkFramedBlocks(t, contents[reservedHeaderBytes:])
+	walked := walkFramedBlocks(t, contents[ReservedHeaderBytes:])
 	require.Len(t, walked, 2, "expected one block from each writer")
 	require.Len(t, walked[0], 2)
 	require.Len(t, walked[1], 1)
@@ -471,7 +471,7 @@ func TestNewTruncatesTornFrameTail(t *testing.T) {
 
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
-	walked := walkFramedBlocks(t, contents[reservedHeaderBytes:])
+	walked := walkFramedBlocks(t, contents[ReservedHeaderBytes:])
 	require.Len(t, walked, 1, "only the original good block should remain")
 	require.True(t, eventsEqual(good[0], walked[0][0]))
 }
@@ -518,7 +518,7 @@ func TestStickyErrorIsLatchedAcrossFlushAndClose(t *testing.T) {
 	// reopen — the writer's *os.File is closed.
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	require.EqualValues(t, reservedHeaderBytes, info.Size(),
+	require.EqualValues(t, ReservedHeaderBytes, info.Size(),
 		"failed flush must not have grown the file past its initial header")
 }
 
@@ -551,6 +551,6 @@ func TestNewTruncatesTornLengthPrefix(t *testing.T) {
 
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
-	walked := walkFramedBlocks(t, contents[reservedHeaderBytes:])
+	walked := walkFramedBlocks(t, contents[ReservedHeaderBytes:])
 	require.Len(t, walked, 1)
 }

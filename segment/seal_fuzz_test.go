@@ -12,7 +12,7 @@ func FuzzReadHeader(f *testing.F) {
 		Checksum: 0xDEADBEEF,
 	})
 	f.Add(good)
-	f.Add(make([]byte, reservedHeaderBytes))
+	f.Add(make([]byte, ReservedHeaderBytes))
 	f.Add([]byte{}) // truncated
 	f.Add([]byte("jss0"))
 

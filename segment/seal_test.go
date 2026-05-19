@@ -39,7 +39,7 @@ func TestSealOnEmptyWriterProducesValidFile(t *testing.T) {
 	require.EqualValues(t, 0, res.BlockCount)
 	require.EqualValues(t, 0, res.EventCount)
 	require.NotZero(t, res.Checksum)
-	require.Greater(t, res.FileSize, int64(reservedHeaderBytes))
+	require.Greater(t, res.FileSize, int64(ReservedHeaderBytes))
 
 	// Subsequent calls report ErrClosed.
 	_, err = w.Seal()
@@ -115,7 +115,7 @@ func TestSealRoundtripSmallStream(t *testing.T) {
 	f, err := os.Open(path)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = f.Close() })
-	headerBytes := make([]byte, reservedHeaderBytes)
+	headerBytes := make([]byte, ReservedHeaderBytes)
 	_, err = f.ReadAt(headerBytes, 0)
 	require.NoError(t, err)
 	require.Equal(t, segmentMagic, headerBytes[0:4])

@@ -39,7 +39,7 @@ const currentHeaderVersion uint16 = 1
 // 12..97 are the metadata fields; bytes 98..255 are zero-filled
 // reserved padding.
 func encodeHeader(h Header) []byte {
-	buf := make([]byte, reservedHeaderBytes)
+	buf := make([]byte, ReservedHeaderBytes)
 	copy(buf[0:4], segmentMagic)
 	le := binary.LittleEndian
 	le.PutUint64(buf[4:12], h.Checksum)
@@ -61,7 +61,7 @@ func encodeHeader(h Header) []byte {
 }
 
 // decodeHeader parses a 256-byte slice into Header. It validates:
-//   - length == reservedHeaderBytes
+//   - length == ReservedHeaderBytes
 //   - magic == "jss0"
 //   - checksum field is non-zero (zero means "active file"; our
 //     contract is that decodeHeader is only ever fed sealed-file bytes)
@@ -69,9 +69,9 @@ func encodeHeader(h Header) []byte {
 //
 // On any failure decodeHeader returns a sentinel-wrapped error.
 func decodeHeader(buf []byte) (Header, error) {
-	if len(buf) != reservedHeaderBytes {
+	if len(buf) != ReservedHeaderBytes {
 		return Header{}, fmt.Errorf("%w: header is %d bytes, want %d",
-			ErrInvalidFooter, len(buf), reservedHeaderBytes)
+			ErrInvalidFooter, len(buf), ReservedHeaderBytes)
 	}
 	if !bytes.Equal(buf[0:4], segmentMagic) {
 		return Header{}, fmt.Errorf("%w: bad magic %q",

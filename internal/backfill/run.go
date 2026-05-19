@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -26,6 +27,9 @@ import (
 type Config struct {
 	// Store is the shared metadata pebble db.
 	Store *store.Store
+
+	// Writer is the active-segment writer used by SegmentHandler. Required.
+	Writer *ingest.Writer
 
 	// RelayURL is the upstream relay base URL (e.g. https://bsky.network).
 	RelayURL string
@@ -96,7 +100,7 @@ func runWithDirectory(ctx context.Context, cfg Config, httpClient *http.Client, 
 	})
 
 	st := NewStore(cfg.Store, cfg.Metrics)
-	handler := NewLogHandler(cfg.Logger)
+	handler := NewSegmentHandler(cfg.Writer, cfg.Logger)
 	logger := cfg.Logger
 
 	startCursor, err := LoadListReposCursor(cfg.Store)
@@ -140,6 +144,9 @@ func runWithDirectory(ctx context.Context, cfg Config, httpClient *http.Client, 
 func (cfg Config) validate() error {
 	if cfg.Store == nil {
 		return fmt.Errorf("backfill: Config.Store is required")
+	}
+	if cfg.Writer == nil {
+		return fmt.Errorf("backfill: Config.Writer is required")
 	}
 	if cfg.RelayURL == "" {
 		return fmt.Errorf("backfill: Config.RelayURL is required")
