@@ -42,7 +42,7 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = st.Close() })
 		w, err := ingest.Open(ingest.Config{
-			ShardsDir:         filepath.Join(dir, "shards"),
+			SegmentsDir:         filepath.Join(dir, "segments"),
 			Store:             st,
 			Logger:            logger,
 			MaxEventsPerBlock: 4,
@@ -264,9 +264,9 @@ func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.S
 	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	shards := filepath.Join(t.TempDir(), "shards")
+	segDir := filepath.Join(t.TempDir(), "segments")
 	w, err := ingest.Open(ingest.Config{
-		ShardsDir:         shards,
+		SegmentsDir:         segDir,
 		Store:             db,
 		Logger:            logger,
 		MaxEventsPerBlock: 4,
@@ -410,9 +410,9 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	shards := filepath.Join(dataDir, "shards")
+	segDir := filepath.Join(dataDir, "segments")
 	w, err := ingest.Open(ingest.Config{
-		ShardsDir:         shards,
+		SegmentsDir:         segDir,
 		Store:             db,
 		Logger:            logger,
 		MaxEventsPerBlock: 2, // two records each, so each repo fills a block
@@ -441,7 +441,7 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	// At least one fully-flushed event per DID. Each fixture has 1
 	// record, so we expect 2 events total. NextSeq advances even past
 	// Close because Close does not seal.
-	maxSeq, found, err := segment.ScanMaxSeq(filepath.Join(shards, "seg_0000000000.jss"))
+	maxSeq, found, err := segment.ScanMaxSeq(filepath.Join(segDir, "seg_0000000000.jss"))
 	require.NoError(t, err)
 	require.True(t, found, "segment must contain at least one block")
 	require.GreaterOrEqual(t, maxSeq, uint64(1),

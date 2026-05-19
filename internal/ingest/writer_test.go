@@ -27,14 +27,14 @@ func newTestStore(t *testing.T) *store.Store {
 	return st
 }
 
-// newTestWriter is the standard Writer fixture: fresh shards dir, a
+// newTestWriter is the standard Writer fixture: fresh segments dir, a
 // fresh pebble store, the provided overrides applied last.
 func newTestWriter(t *testing.T, overrides Config) *Writer {
 	t.Helper()
-	shards := filepath.Join(t.TempDir(), "shards")
+	segDir := filepath.Join(t.TempDir(), "segments")
 
 	cfg := Config{
-		ShardsDir: shards,
+		SegmentsDir: segDir,
 		Store:     newTestStore(t),
 		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:   NewMetrics(prometheus.NewRegistry()),
@@ -52,7 +52,7 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	return w
 }
 
-// TestOpen_FreshDir creates a fresh shards dir and confirms Open
+// TestOpen_FreshDir creates a fresh segments dir and confirms Open
 // initializes seg_0000000000.jss with the 256-byte reserved header
 // and starts at nextSeq=0.
 func TestOpen_FreshDir(t *testing.T) {
@@ -62,7 +62,7 @@ func TestOpen_FreshDir(t *testing.T) {
 	require.Equal(t, uint64(0), w.NextSeq())
 	require.Equal(t, uint64(0), w.ActiveIndex())
 
-	path := filepath.Join(w.cfg.ShardsDir, "seg_0000000000.jss")
+	path := filepath.Join(w.cfg.SegmentsDir, "seg_0000000000.jss")
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	require.Equal(t, int64(256), info.Size(), "fresh segment is exactly the reserved header")
@@ -202,12 +202,12 @@ func TestRotation_ByteThreshold(t *testing.T) {
 
 	require.Equal(t, uint64(1), w.ActiveIndex())
 
-	first := filepath.Join(w.cfg.ShardsDir, "seg_0000000000.jss")
+	first := filepath.Join(w.cfg.SegmentsDir, "seg_0000000000.jss")
 	r, err := segment.Open(segment.ReaderConfig{Path: first})
 	require.NoError(t, err, "first segment must be sealed")
 	require.NoError(t, r.Close())
 
-	second := filepath.Join(w.cfg.ShardsDir, "seg_0000000001.jss")
+	second := filepath.Join(w.cfg.SegmentsDir, "seg_0000000001.jss")
 	info, err := os.Stat(second)
 	require.NoError(t, err)
 	require.Equal(t, int64(segment.ReservedHeaderBytes), info.Size(),
@@ -225,12 +225,12 @@ func TestRotation_ByteThreshold(t *testing.T) {
 func TestResume_ExistingActive(t *testing.T) {
 	t.Parallel()
 	const blockSize = 4
-	shards := filepath.Join(t.TempDir(), "shards")
+	segDir := filepath.Join(t.TempDir(), "segments")
 	st := newTestStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	cfg := Config{
-		ShardsDir:         shards,
+		SegmentsDir:         segDir,
 		Store:             st,
 		Logger:            logger,
 		MaxEventsPerBlock: blockSize,
@@ -270,12 +270,12 @@ func TestResume_ExistingActive(t *testing.T) {
 func TestResume_SealedSkipsToNext(t *testing.T) {
 	t.Parallel()
 	const blockSize = 4
-	shards := filepath.Join(t.TempDir(), "shards")
+	segDir := filepath.Join(t.TempDir(), "segments")
 	st := newTestStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	cfg := Config{
-		ShardsDir:         shards,
+		SegmentsDir:         segDir,
 		Store:             st,
 		Logger:            logger,
 		MaxEventsPerBlock: blockSize,
@@ -298,7 +298,7 @@ func TestResume_SealedSkipsToNext(t *testing.T) {
 	// in-memory writer will not auto-seal on close, so we need a
 	// helper. Simulate the pre-conditions by sealing via the segment
 	// package directly:
-	seg1Path := filepath.Join(shards, "seg_0000000001.jss")
+	seg1Path := filepath.Join(segDir, "seg_0000000001.jss")
 	sw, err := segment.New(segment.Config{Path: seg1Path, MaxEventsPerBlock: blockSize})
 	require.NoError(t, err)
 	for range blockSize {
@@ -315,7 +315,7 @@ func TestResume_SealedSkipsToNext(t *testing.T) {
 		"highest is sealed; Open opens idx+1")
 	t.Cleanup(func() { _ = w2.Close() })
 
-	seg2Path := filepath.Join(shards, "seg_0000000002.jss")
+	seg2Path := filepath.Join(segDir, "seg_0000000002.jss")
 	info, err := os.Stat(seg2Path)
 	require.NoError(t, err)
 	require.Equal(t, int64(segment.ReservedHeaderBytes), info.Size(),
@@ -329,11 +329,11 @@ func TestResume_SealedSkipsToNext(t *testing.T) {
 func TestOpen_ReconcilesDriftedPebble(t *testing.T) {
 	t.Parallel()
 	const blockSize = 4
-	shards := filepath.Join(t.TempDir(), "shards")
+	segDir := filepath.Join(t.TempDir(), "segments")
 	st := newTestStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
-		ShardsDir:         shards,
+		SegmentsDir:         segDir,
 		Store:             st,
 		Logger:            logger,
 		MaxEventsPerBlock: blockSize,
@@ -370,11 +370,11 @@ func TestOpen_ReconcilesDriftedPebble(t *testing.T) {
 func TestOpen_RecoversFromTornTail(t *testing.T) {
 	t.Parallel()
 	const blockSize = 2
-	shards := filepath.Join(t.TempDir(), "shards")
+	segDir := filepath.Join(t.TempDir(), "segments")
 	st := newTestStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
-		ShardsDir:         shards,
+		SegmentsDir:         segDir,
 		Store:             st,
 		Logger:            logger,
 		MaxEventsPerBlock: blockSize,
@@ -390,7 +390,7 @@ func TestOpen_RecoversFromTornTail(t *testing.T) {
 	require.NoError(t, w1.Close())
 
 	// Inject a torn-tail by appending raw bytes after the last good frame.
-	path := filepath.Join(shards, "seg_0000000000.jss")
+	path := filepath.Join(segDir, "seg_0000000000.jss")
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
 	require.NoError(t, err)
 	var lenBuf [8]byte

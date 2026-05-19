@@ -32,7 +32,7 @@ type Writer struct {
 	closed      bool
 }
 
-// Open scans cfg.ShardsDir, resumes or creates the active segment,
+// Open scans cfg.SegmentsDir, resumes or creates the active segment,
 // and reconciles seq/next against any events in the resumed file so
 // a crash between block fsync and pebble batch commit can never
 // produce duplicate seq numbers.
@@ -42,11 +42,11 @@ func Open(cfg Config) (*Writer, error) {
 	}
 	cfg.applyDefaults()
 
-	if err := os.MkdirAll(cfg.ShardsDir, 0o755); err != nil {
-		return nil, fmt.Errorf("ingest: mkdir %s: %w", cfg.ShardsDir, err)
+	if err := os.MkdirAll(cfg.SegmentsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("ingest: mkdir %s: %w", cfg.SegmentsDir, err)
 	}
 
-	idx, hasExisting, err := scanShardsDir(cfg.ShardsDir)
+	idx, hasExisting, err := scanSegmentsDir(cfg.SegmentsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +57,7 @@ func Open(cfg Config) (*Writer, error) {
 	var foundEvents bool
 
 	if hasExisting {
-		path := filepath.Join(cfg.ShardsDir, segmentFilename(idx))
+		path := filepath.Join(cfg.SegmentsDir, segmentFilename(idx))
 		seg, segErr := segment.New(segment.Config{
 			Path:              path,
 			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
@@ -79,7 +79,7 @@ func Open(cfg Config) (*Writer, error) {
 			}
 		case errors.Is(segErr, segment.ErrSegmentSealed):
 			w.activeIdx = idx + 1
-			path = filepath.Join(cfg.ShardsDir, segmentFilename(w.activeIdx))
+			path = filepath.Join(cfg.SegmentsDir, segmentFilename(w.activeIdx))
 			seg, segErr = segment.New(segment.Config{
 				Path:              path,
 				MaxEventsPerBlock: cfg.MaxEventsPerBlock,
@@ -93,7 +93,7 @@ func Open(cfg Config) (*Writer, error) {
 			return nil, fmt.Errorf("ingest: open existing %s: %w", path, segErr)
 		}
 	} else {
-		path := filepath.Join(cfg.ShardsDir, segmentFilename(0))
+		path := filepath.Join(cfg.SegmentsDir, segmentFilename(0))
 		seg, segErr := segment.New(segment.Config{
 			Path:              path,
 			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
@@ -127,7 +127,7 @@ func Open(cfg Config) (*Writer, error) {
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
 
 	w.cfg.Logger.Info("ingest: opened",
-		"shards_dir", cfg.ShardsDir,
+		"segments_dir", cfg.SegmentsDir,
 		"active_index", w.activeIdx,
 		"active_bytes", w.activeBytes,
 		"next_seq", w.nextSeq,
@@ -229,7 +229,7 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 		return err
 	}
 
-	path := filepath.Join(w.cfg.ShardsDir, segmentFilename(w.activeIdx))
+	path := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
 	info, err := os.Stat(path)
 	if err != nil {
 		span.RecordError(err)
@@ -251,7 +251,7 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 	}
 
 	w.activeIdx++
-	nextPath := filepath.Join(w.cfg.ShardsDir, segmentFilename(w.activeIdx))
+	nextPath := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
 	next, err := segment.New(segment.Config{
 		Path:              nextPath,
 		MaxEventsPerBlock: w.cfg.MaxEventsPerBlock,
@@ -287,11 +287,11 @@ func (w *Writer) ActiveIndex() uint64 {
 	return w.activeIdx
 }
 
-// scanShardsDir lists cfg.ShardsDir and returns the highest seg_*
+// scanSegmentsDir lists cfg.SegmentsDir and returns the highest seg_*
 // index seen and whether any matching files exist. Files that don't
 // match the seg_<10 base36>.jss pattern are silently skipped — the
 // directory may legitimately contain other operator-placed files.
-func scanShardsDir(dir string) (idx uint64, has bool, err error) {
+func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, false, fmt.Errorf("ingest: readdir %s: %w", dir, err)

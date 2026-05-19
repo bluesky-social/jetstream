@@ -18,9 +18,9 @@ const defaultMaxEventsPerBlock = segment.DefaultMaxEventsPerBlock
 
 // Config controls Writer behavior.
 type Config struct {
-	// ShardsDir is the directory holding seg_*.jss files (typically
-	// <data-dir>/shards). Required. Created if missing.
-	ShardsDir string
+	// SegmentsDir is the directory holding seg_*.jss files (typically
+	// <data-dir>/segments). Required. Created if missing.
+	SegmentsDir string
 
 	// Store is the shared metadata pebble db. Required.
 	Store *store.Store
@@ -43,8 +43,8 @@ type Config struct {
 }
 
 func (c *Config) validate() error {
-	if c.ShardsDir == "" {
-		return fmt.Errorf("%w: ShardsDir is required", ErrInvalidConfig)
+	if c.SegmentsDir == "" {
+		return fmt.Errorf("%w: SegmentsDir is required", ErrInvalidConfig)
 	}
 	if c.Store == nil {
 		return fmt.Errorf("%w: Store is required", ErrInvalidConfig)

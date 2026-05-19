@@ -21,9 +21,9 @@ func TestConfigValidate_RequiresFields(t *testing.T) {
 		cfg  Config
 		want string
 	}{
-		{"missing ShardsDir", Config{Store: &store.Store{}, Logger: logger}, "ShardsDir"},
-		{"missing Store", Config{ShardsDir: "/tmp/x", Logger: logger}, "Store"},
-		{"missing Logger", Config{ShardsDir: "/tmp/x", Store: &store.Store{}}, "Logger"},
+		{"missing SegmentsDir", Config{Store: &store.Store{}, Logger: logger}, "SegmentsDir"},
+		{"missing Store", Config{SegmentsDir: "/tmp/x", Logger: logger}, "Store"},
+		{"missing Logger", Config{SegmentsDir: "/tmp/x", Store: &store.Store{}}, "Logger"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -39,7 +39,7 @@ func TestConfigValidate_RequiresFields(t *testing.T) {
 func TestConfigValidate_AppliesDefaults(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := Config{ShardsDir: "/tmp/x", Store: &store.Store{}, Logger: logger}
+	cfg := Config{SegmentsDir: "/tmp/x", Store: &store.Store{}, Logger: logger}
 	require.NoError(t, cfg.validate())
 
 	cfg.applyDefaults()
@@ -53,7 +53,7 @@ func TestConfigValidate_RejectsNegativeBytes(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
-		ShardsDir:       "/tmp/x",
+		SegmentsDir:       "/tmp/x",
 		Store:           &store.Store{},
 		Logger:          logger,
 		MaxSegmentBytes: -1,

@@ -236,7 +236,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 
 	ingestMetrics := ingest.NewMetrics(metrics.Registry)
 	ingestWriter, err := ingest.Open(ingest.Config{
-		ShardsDir: filepath.Join(dataDir, "shards"),
+		SegmentsDir: filepath.Join(dataDir, "segments"),
 		Store:     metaStore,
 		Logger:    logger,
 		Metrics:   ingestMetrics,

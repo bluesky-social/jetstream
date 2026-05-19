@@ -26,7 +26,7 @@ func newTestIngest(t *testing.T) *ingest.Writer {
 	t.Cleanup(func() { _ = st.Close() })
 
 	w, err := ingest.Open(ingest.Config{
-		ShardsDir:         filepath.Join(dir, "shards"),
+		SegmentsDir:         filepath.Join(dir, "segments"),
 		Store:             st,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MaxEventsPerBlock: 4,

@@ -52,7 +52,7 @@ func runOneSwarm(t *testing.T, rng *rand.Rand) {
 	totalAppends := 1 + rng.IntN(2048)
 
 	cfg := Config{
-		ShardsDir:         filepath.Join(dataDir, "shards"),
+		SegmentsDir:         filepath.Join(dataDir, "segments"),
 		Store:             st,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MaxEventsPerBlock: maxBlock,
@@ -82,7 +82,7 @@ func runOneSwarm(t *testing.T, rng *rand.Rand) {
 	// re-opened nextSeq dominates its max seq + 1. Sealed segments
 	// are verified by segment.ScanMaxSeq returning ErrSegmentSealed,
 	// which is the same path the segment.Reader test suite covers.
-	entries, err := os.ReadDir(cfg.ShardsDir)
+	entries, err := os.ReadDir(cfg.SegmentsDir)
 	require.NoError(t, err)
 
 	var maxSeqGlobal uint64
@@ -94,7 +94,7 @@ func runOneSwarm(t *testing.T, rng *rand.Rand) {
 		if _, ok := parseSegmentIndex(e.Name()); !ok {
 			continue
 		}
-		path := filepath.Join(cfg.ShardsDir, e.Name())
+		path := filepath.Join(cfg.SegmentsDir, e.Name())
 		max, ok, err := segment.ScanMaxSeq(path)
 		if err != nil {
 			// Sealed files return ErrSegmentSealed; that's expected
