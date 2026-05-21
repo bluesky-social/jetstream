@@ -132,7 +132,7 @@ func TestClose_PersistsNextSeq(t *testing.T) {
 	store := w.cfg.Store
 	require.NoError(t, w.Close())
 
-	got, err := loadNextSeq(store)
+	got, err := loadNextSeq(store, seqNextKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), got, "Close must persist nextSeq")
 }
@@ -350,7 +350,7 @@ func TestOpen_ReconcilesDriftedPebble(t *testing.T) {
 
 	// Simulate "pebble batch lost after segment fsync" by rewriting
 	// seq/next backwards.
-	require.NoError(t, saveNextSeq(st, 1))
+	require.NoError(t, saveNextSeq(st, seqNextKey, 1))
 
 	w2, err := Open(cfg)
 	require.NoError(t, err)
@@ -358,7 +358,7 @@ func TestOpen_ReconcilesDriftedPebble(t *testing.T) {
 	require.Equal(t, uint64(blockSize), w2.NextSeq(),
 		"reconcile: nextSeq must advance past the segment's max seq")
 
-	got, err := loadNextSeq(st)
+	got, err := loadNextSeq(st, seqNextKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(blockSize), got,
 		"reconcile must persist the corrected value")
@@ -441,4 +441,64 @@ func TestAppend_Concurrent(t *testing.T) {
 	wg.Wait()
 
 	require.Equal(t, uint64(goroutines*perGoroutine), w.NextSeq())
+}
+
+// TestOpen_HonorsCustomSeqKey verifies that two Writers with
+// different SeqKey values maintain independent counters in the same
+// pebble store. This is what enables the live_segments consumer to
+// share a metadata db with the backfill writer without their seq
+// counters colliding.
+func TestOpen_HonorsCustomSeqKey(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	mkWriter := func(subdir, key string) *Writer {
+		w, err := Open(Config{
+			SegmentsDir: filepath.Join(t.TempDir(), subdir),
+			Store:       st,
+			SeqKey:      key,
+			Logger:      logger,
+			Metrics:     NewMetrics(prometheus.NewRegistry()),
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = w.Close() })
+		return w
+	}
+
+	wA := mkWriter("a", "seq/next")
+	wB := mkWriter("b", "live_segments/seq/next")
+
+	for i := range 5 {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "x.y", Rkey: "r", Rev: "1", Payload: []byte{0x01}}
+		require.NoError(t, wA.Append(t.Context(), &ev))
+		require.Equal(t, uint64(i), ev.Seq)
+	}
+	for i := range 3 {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:b", Collection: "x.y", Rkey: "r", Rev: "1", Payload: []byte{0x02}}
+		require.NoError(t, wB.Append(t.Context(), &ev))
+		require.Equal(t, uint64(i), ev.Seq, "live writer's seq is independent of backfill writer's")
+	}
+
+	// Close the writers so their final nextSeq values are persisted
+	// to pebble, then read both keys back to confirm the two seq
+	// counters were durably stored under disjoint pebble keys.
+	require.NoError(t, wA.Close())
+	require.NoError(t, wB.Close())
+
+	persistedA, err := loadNextSeq(st, "seq/next")
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), persistedA)
+
+	persistedB, err := loadNextSeq(st, "live_segments/seq/next")
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), persistedB)
+}
+
+// TestOpen_DefaultSeqKey pins back-compat: zero-value SeqKey resolves
+// to "seq/next", which is what every existing caller relies on.
+func TestOpen_DefaultSeqKey(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{}) // SeqKey left zero
+	require.Equal(t, "seq/next", w.cfg.SeqKey)
 }

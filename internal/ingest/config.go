@@ -34,6 +34,13 @@ type Config struct {
 	// segment.DefaultMaxEventsPerBlock when zero.
 	MaxEventsPerBlock int
 
+	// SeqKey is the pebble key holding the writer's seq counter.
+	// Default "seq/next" preserves backfill-writer behavior. The
+	// live_segments consumer overrides this with
+	// "live_segments/seq/next" so the two counters do not collide
+	// when a single pebble store is shared between multiple writers.
+	SeqKey string
+
 	// Logger is required (no sensible default for an ingestion
 	// component whose failure modes need visibility).
 	Logger *slog.Logger
@@ -69,5 +76,8 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxEventsPerBlock == 0 {
 		c.MaxEventsPerBlock = defaultMaxEventsPerBlock
+	}
+	if c.SeqKey == "" {
+		c.SeqKey = "seq/next"
 	}
 }
