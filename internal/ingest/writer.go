@@ -230,6 +230,13 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 		return err
 	}
 
+	if w.cfg.OnAfterFlush != nil {
+		if err := w.cfg.OnAfterFlush(ctx); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("ingest: on_after_flush: %w", err)
+		}
+	}
+
 	path := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
 	info, err := os.Stat(path)
 	if err != nil {

@@ -1,12 +1,15 @@
 package ingest
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -501,4 +504,65 @@ func TestOpen_DefaultSeqKey(t *testing.T) {
 	t.Parallel()
 	w := newTestWriter(t, Config{}) // SeqKey left zero
 	require.Equal(t, "seq/next", w.cfg.SeqKey)
+}
+
+// TestFlush_InvokesOnAfterFlushHook pins the durability hook contract:
+// after each block flush the writer calls OnAfterFlush exactly once,
+// AFTER segment.Flush has fsynced and AFTER saveNextSeq has been
+// pebble.Sync'd. The live consumer uses this to durably advance the
+// upstream relay cursor with the same per-block cadence as seq/next.
+func TestFlush_InvokesOnAfterFlushHook(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
+		Store:             newTestStore(t),
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+		MaxEventsPerBlock: 2,
+		OnAfterFlush: func(_ context.Context) error {
+			calls.Add(1)
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	// Two events fill the block, triggering one flush.
+	for range 2 {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "x.y", Rkey: "r", Rev: "1", Payload: []byte{0x01}}
+		require.NoError(t, w.Append(t.Context(), &ev))
+	}
+	require.Equal(t, int32(1), calls.Load(), "exactly one flush hook fired")
+
+	// Two more events trigger a second flush.
+	for range 2 {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "x.y", Rkey: "r", Rev: "1", Payload: []byte{0x02}}
+		require.NoError(t, w.Append(t.Context(), &ev))
+	}
+	require.Equal(t, int32(2), calls.Load())
+}
+
+// TestFlush_OnAfterFlushErrorPropagates verifies that an error from
+// the hook surfaces back through Append so the errgroup can tear
+// the process down. PRACTICES.md: crashing > silent corruption.
+func TestFlush_OnAfterFlushErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	want := errors.New("hook boom")
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
+		Store:             newTestStore(t),
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+		MaxEventsPerBlock: 1,
+		OnAfterFlush:      func(_ context.Context) error { return want },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "x.y", Rkey: "r", Rev: "1", Payload: []byte{0xab}}
+	err = w.Append(t.Context(), &ev)
+	require.ErrorIs(t, err, want)
 }

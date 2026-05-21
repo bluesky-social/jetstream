@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 
@@ -40,6 +41,17 @@ type Config struct {
 	// "live_segments/seq/next" so the two counters do not collide
 	// when a single pebble store is shared between multiple writers.
 	SeqKey string
+
+	// OnAfterFlush, if non-nil, runs after each block flush has
+	// completed: segment.Flush has fsynced and SeqKey has been
+	// pebble.Sync'd. Errors propagate up through Append. A nil hook
+	// is a no-op. Used by the live consumer to advance "relay/cursor"
+	// with the same per-block cadence as seq/next.
+	//
+	// Hooks must not call back into the Writer (that would deadlock
+	// on the writer mutex) or perform unbounded I/O (that would stall
+	// every Append in the active worker pool).
+	OnAfterFlush func(ctx context.Context) error
 
 	// Logger is required (no sensible default for an ingestion
 	// component whose failure modes need visibility).
