@@ -46,7 +46,6 @@ type Config struct {
 	MaxEventsPerBlock int
 
 	// now is overridable for tests; production uses time.Now.
-	// nolint:unused // called by Open in Task 10
 	now func() time.Time
 }
 
@@ -72,7 +71,6 @@ func (c *Config) validate() error {
 	return nil
 }
 
-//nolint:unused // called by Open in Task 10
 func (c *Config) applyDefaults() {
 	if c.now == nil {
 		c.now = time.Now
