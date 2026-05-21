@@ -11,8 +11,13 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/jcalabro/atmos/streaming"
+	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/gt"
 )
 
 // Consumer drives the upstream firehose into a directory of
@@ -80,8 +85,19 @@ func (c *Consumer) Close() error {
 	if c.writer == nil {
 		return nil
 	}
+	// Flush the active segment and persist the next-seq counter.
 	if err := c.writer.Close(); err != nil {
 		return fmt.Errorf("livestream: close: %w", err)
+	}
+	// The writer.Close → segment.Close → flushLocked does not invoke
+	// OnAfterFlush (that's only called during Append's full-block
+	// path). Persist the final cursor explicitly.
+	cur := c.lastUpstream.Load()
+	if cur > 0 {
+		if err := SaveUpstreamCursor(c.cfg.Store, c.cfg.CursorKey, cur); err != nil {
+			return fmt.Errorf("livestream: close: save cursor: %w", err)
+		}
+		c.cfg.Metrics.setUpstreamCursor(cur)
 	}
 	return nil
 }
@@ -116,5 +132,123 @@ func (c *Consumer) onAfterFlush(ctx context.Context) error {
 		return err
 	}
 	c.cfg.Metrics.setUpstreamCursor(cur)
+	return nil
+}
+
+// Run subscribes to the upstream relay's subscribeRepos firehose
+// and pumps events into the underlying writer. Returns nil on
+// clean context cancellation; returns the underlying error on a
+// fatal write or pebble failure (so the errgroup can tear the
+// process down).
+//
+// Reconnects with exponential backoff are handled internally by
+// atmos's streaming.Client; Run does not see transient network
+// errors as terminal.
+func (c *Consumer) Run(ctx context.Context) error {
+	c.closeMu.Lock()
+	if c.closed {
+		c.closeMu.Unlock()
+		return ErrClosed
+	}
+	c.closeMu.Unlock()
+
+	wsURL, err := deriveSubscribeReposURL(c.cfg.RelayURL)
+	if err != nil {
+		return fmt.Errorf("livestream: %w", err)
+	}
+
+	startCursor, err := LoadUpstreamCursor(c.cfg.Store, c.cfg.CursorKey)
+	if err != nil {
+		return fmt.Errorf("livestream: load start cursor: %w", err)
+	}
+
+	c.cfg.Logger.Info("livestream: subscribing",
+		"url", wsURL,
+		"start_cursor", startCursor,
+	)
+
+	opts := streaming.Options{
+		URL:        wsURL,
+		Cursor:     gt.Some(startCursor),
+		SyncClient: gt.Some[*atmossync.Client](nil), // disable auto-resync; out of scope
+		OnReconnect: gt.Some(func(attempt int, delay time.Duration) {
+			c.cfg.Metrics.incReconnects()
+			c.cfg.Logger.Warn("livestream: reconnecting",
+				"attempt", attempt,
+				"delay", delay,
+			)
+		}),
+	}
+
+	client, err := streaming.NewClient(opts)
+	if err != nil {
+		return fmt.Errorf("livestream: new client: %w", err)
+	}
+	defer func() {
+		if cerr := client.Close(); cerr != nil {
+			c.cfg.Logger.Warn("livestream: client close", "err", cerr)
+		}
+	}()
+
+	tracer := obs.Tracer("livestream")
+
+	for batch, err := range client.Events(ctx) {
+		if err != nil {
+			// Decode / sequence-gap errors flow through here;
+			// atmos has already flushed the partial batch as nil
+			// + err. Log and continue — the next iteration will
+			// either reconnect or yield the next batch.
+			c.cfg.Metrics.incDecodeErrors()
+			c.cfg.Logger.Warn("livestream: stream error", "err", err)
+			continue
+		}
+
+		batchCtx, span := tracer.Start(ctx, "livestream.batch")
+		if perr := c.processBatch(batchCtx, batch); perr != nil {
+			span.RecordError(perr)
+			span.End()
+			return perr
+		}
+		span.End()
+	}
+
+	c.cfg.Logger.Info("livestream: stopped",
+		"last_upstream_seq", c.lastUpstream.Load(),
+	)
+	return ctx.Err()
+}
+
+// processBatch writes one batch of decoded events into the writer.
+// Crucially, lastUpstream is updated only AFTER all ops of an event
+// have been Append'd, so a flush triggered mid-event reads the
+// previous fully-buffered upstream seq and the persisted cursor
+// can never get ahead of the durable events.
+func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) error {
+	indexedAt := c.cfg.now().UnixMicro()
+
+	for _, evt := range batch {
+		c.cfg.Metrics.incEventsReceived()
+
+		segEvts, err := ConvertEvent(evt, indexedAt)
+		if err != nil {
+			c.cfg.Metrics.incDecodeErrors()
+			// Bad shape from upstream is a data-integrity issue;
+			// we surface it rather than silently dropping events.
+			return fmt.Errorf("livestream: convert: %w", err)
+		}
+
+		for i := range segEvts {
+			if err := c.writer.Append(ctx, &segEvts[i]); err != nil {
+				return fmt.Errorf("livestream: append: %w", err)
+			}
+			c.cfg.Metrics.incEventsConverted()
+		}
+
+		// Only AFTER every op for this upstream event is buffered.
+		if evt.Seq > 0 {
+			c.lastUpstream.Store(evt.Seq)
+		}
+	}
+
 	return nil
 }
