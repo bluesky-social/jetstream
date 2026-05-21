@@ -115,7 +115,7 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 		w.stickyErr = fmt.Errorf("segment: write footer: %w", err)
 		return SealResult{}, w.stickyErr
 	}
-	if err := w.file.Sync(); err != nil {
+	if err := syncFile(w.file); err != nil {
 		w.stickyErr = fmt.Errorf("segment: fsync footer: %w", err)
 		return SealResult{}, w.stickyErr
 	}
@@ -134,7 +134,7 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 		}
 		return SealResult{}, w.stickyErr
 	}
-	if err := w.file.Sync(); err != nil {
+	if err := syncFile(w.file); err != nil {
 		// Both writes happened but we couldn't confirm durability of
 		// the header. Don't truncate: the bytes may already be durable
 		// and truncating could destroy a valid sealed file. The Reader
@@ -439,7 +439,7 @@ func (w *Writer) truncateFooterTail(footerOffset int64) error {
 	if err := w.file.Truncate(footerOffset); err != nil {
 		return fmt.Errorf("segment: truncate footer: %w", err)
 	}
-	if err := w.file.Sync(); err != nil {
+	if err := syncFile(w.file); err != nil {
 		return fmt.Errorf("segment: fsync truncated file: %w", err)
 	}
 	return nil

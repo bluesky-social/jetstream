@@ -65,7 +65,7 @@ func LoadListReposCursor(db *store.Store) (string, error) {
 // the body of atmos's OnPageComplete callback; the synchronous fsync
 // guarantees a crash after the page completes can't lose the advance.
 func SaveListReposCursor(db *store.Store, cursor string) error {
-	if err := db.Set([]byte(listReposCursorKey), []byte(cursor), pebble.Sync); err != nil {
+	if err := db.Set([]byte(listReposCursorKey), []byte(cursor), store.SyncWrites); err != nil {
 		return fmt.Errorf("backfill: save list_repos_cursor: %w", err)
 	}
 	return nil

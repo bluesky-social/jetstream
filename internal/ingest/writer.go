@@ -336,7 +336,7 @@ func loadNextSeq(st *store.Store) (uint64, error) {
 func saveNextSeq(st *store.Store, v uint64) error {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], v)
-	if err := st.Set([]byte(seqNextKey), buf[:], pebble.Sync); err != nil {
+	if err := st.Set([]byte(seqNextKey), buf[:], store.SyncWrites); err != nil {
 		return fmt.Errorf("ingest: save %s: %w", seqNextKey, err)
 	}
 	return nil

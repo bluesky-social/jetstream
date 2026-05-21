@@ -153,7 +153,7 @@ func syncParentDir(path string) error {
 		return fmt.Errorf("segment: open parent dir: %w", err)
 	}
 	defer func() { _ = dir.Close() }()
-	if err := dir.Sync(); err != nil {
+	if err := syncFile(dir); err != nil {
 		return fmt.Errorf("segment: fsync parent dir: %w", err)
 	}
 	return nil
@@ -173,7 +173,7 @@ func initializeNewSegment(f *os.File) error {
 		return fmt.Errorf("segment: write header: %w", err)
 	}
 
-	if err := f.Sync(); err != nil {
+	if err := syncFile(f); err != nil {
 		return fmt.Errorf("segment: fsync header: %w", err)
 	}
 
@@ -228,7 +228,7 @@ func resumeExistingSegment(f *os.File, size int64, path string) error {
 		// (size) lives in the inode, so file Sync is the right scope
 		// here; we don't need a directory fsync because the dirent
 		// already exists.
-		if err := f.Sync(); err != nil {
+		if err := syncFile(f); err != nil {
 			return fmt.Errorf("segment: fsync truncate: %w", err)
 		}
 	}
@@ -461,7 +461,7 @@ func (w *Writer) flushLocked() error {
 	// rows on a retry.
 	w.pending.reset()
 
-	if err := w.file.Sync(); err != nil {
+	if err := syncFile(w.file); err != nil {
 		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
 		return w.stickyErr
 	}

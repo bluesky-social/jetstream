@@ -81,7 +81,7 @@ func (s *Store) putRepoStatus(did atmos.DID, rs *RepoStatus) error {
 	if err != nil {
 		return err
 	}
-	if err := s.db.Set(repoKey(did), enc, pebble.Sync); err != nil {
+	if err := s.db.Set(repoKey(did), enc, store.SyncWrites); err != nil {
 		return fmt.Errorf("backfill: write repo/%s: %w", did, err)
 	}
 	return nil
