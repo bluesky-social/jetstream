@@ -1,0 +1,80 @@
+package livestream
+
+import (
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/bluesky-social/jetstream-v2/internal/store"
+)
+
+// Config controls Consumer behavior.
+type Config struct {
+	// SegmentsDir is where the consumer writes seg_*.jss files.
+	// For bootstrap phase this is "<data-dir>/backfill/live_segments".
+	// Once the merge step lands, steady-state callers point this at
+	// "<data-dir>/segments".
+	SegmentsDir string
+
+	// Store is the shared metadata pebble db.
+	Store *store.Store
+
+	// SeqKey is the pebble key used by the underlying ingest.Writer
+	// for its seq counter. Bootstrap uses "live_segments/seq/next";
+	// steady state uses "seq/next".
+	SeqKey string
+
+	// CursorKey is the pebble key for the upstream relay cursor.
+	// Both phases use "relay/cursor" (the merge step will hand
+	// cursor ownership over without renaming the key).
+	CursorKey string
+
+	// RelayURL is the upstream relay HTTP base URL — the same value
+	// the operator passes via --relay-url. The consumer derives the
+	// WebSocket URL from this internally.
+	RelayURL string
+
+	// Logger is required.
+	Logger *slog.Logger
+
+	// Metrics is optional; nil means no /metrics counters incrementing.
+	Metrics *Metrics
+
+	// MaxSegmentBytes / MaxEventsPerBlock forward to ingest.Config.
+	// Zero means use ingest defaults.
+	MaxSegmentBytes   int64
+	MaxEventsPerBlock int
+
+	// now is overridable for tests; production uses time.Now.
+	// nolint:unused // called by Open in Task 10
+	now func() time.Time
+}
+
+func (c *Config) validate() error {
+	if c.SegmentsDir == "" {
+		return fmt.Errorf("%w: SegmentsDir is required", ErrInvalidConfig)
+	}
+	if c.Store == nil {
+		return fmt.Errorf("%w: Store is required", ErrInvalidConfig)
+	}
+	if c.SeqKey == "" {
+		return fmt.Errorf("%w: SeqKey is required", ErrInvalidConfig)
+	}
+	if c.CursorKey == "" {
+		return fmt.Errorf("%w: CursorKey is required", ErrInvalidConfig)
+	}
+	if c.RelayURL == "" {
+		return fmt.Errorf("%w: RelayURL is required", ErrInvalidConfig)
+	}
+	if c.Logger == nil {
+		return fmt.Errorf("%w: Logger is required", ErrInvalidConfig)
+	}
+	return nil
+}
+
+//nolint:unused // called by Open in Task 10
+func (c *Config) applyDefaults() {
+	if c.now == nil {
+		c.now = time.Now
+	}
+}
