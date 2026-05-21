@@ -65,6 +65,8 @@ import (
 
 	"github.com/bluesky-social/jetstream-v2/internal/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream-v2/internal/livestream"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -234,6 +236,20 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
+	phase, err := lifecycle.ReadPhase(metaStore)
+	if err != nil {
+		return fmt.Errorf("serve: read phase: %w", err)
+	}
+	if phase == "" {
+		phase = lifecycle.PhaseBootstrap
+		if err := lifecycle.WritePhase(metaStore, phase); err != nil {
+			return fmt.Errorf("serve: write phase: %w", err)
+		}
+	}
+	if phase == lifecycle.PhaseSteadyState {
+		return fmt.Errorf("serve: steady-state phase not yet supported; the merge step has not been implemented")
+	}
+
 	ingestMetrics := ingest.NewMetrics(metrics.Registry)
 	ingestWriter, err := ingest.Open(ingest.Config{
 		SegmentsDir: filepath.Join(dataDir, "segments"),
@@ -250,6 +266,24 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
+	liveConsumer, err := livestream.Open(livestream.Config{
+		SegmentsDir: filepath.Join(dataDir, "backfill", "live_segments"),
+		Store:       metaStore,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    cmd.String("relay-url"),
+		Logger:      logger,
+		Metrics:     livestream.NewMetrics(metrics.Registry),
+	})
+	if err != nil {
+		return fmt.Errorf("livestream open: %w", err)
+	}
+	defer func() {
+		if cerr := liveConsumer.Close(); cerr != nil {
+			logger.Error("close live consumer", "err", cerr)
+		}
+	}()
+
 	srv := server.New(server.Config{
 		PublicAddr:      cmd.String("addr"),
 		DebugAddr:       cmd.String("debug-addr"),
@@ -263,15 +297,15 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Run the HTTP server and the bootstrap pipeline as siblings under one
-	// errgroup. Either failing cancels the other — we don't want a server
-	// that's silently serving 503s while bootstrap has died, and we don't
-	// want to keep enumerating the relay if the public listener is dead.
+	// Run the HTTP server, the bootstrap pipeline, and the live firehose
+	// consumer as three siblings under one errgroup. Any one failing cancels
+	// the others — we don't want a server that's silently serving 503s while
+	// bootstrap has died, and we don't want to keep enumerating the relay if
+	// the public listener is dead.
 	//
-	// Once steady-state ingest lands, the cutover happens by adding a
-	// third worker (the firehose consumer) into this same group; the
-	// bootstrap goroutine returning is the signal that flips the public
-	// surface from "503 — bootstrapping" to live serving.
+	// During bootstrap phase, the backfill goroutine draining is the signal
+	// that flips the public surface from "503 — bootstrapping" to live
+	// serving.
 	g, gctx := errgroup.WithContext(runCtx)
 
 	// Start the main web server
@@ -292,6 +326,11 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 			Logger:   logger,
 			Metrics:  backfill.NewMetrics(metrics.Registry),
 		})
+	})
+
+	// Start the live firehose consumer, writing events to live_segments.
+	g.Go(func() error {
+		return liveConsumer.Run(gctx)
 	})
 
 	// A signal-driven shutdown surfaces as context.Canceled from the

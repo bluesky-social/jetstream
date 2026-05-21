@@ -9,12 +9,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/crypto"
@@ -59,6 +62,16 @@ func TestServe_BootstrapsAndShutsDownCleanly(t *testing.T) {
 	listReposDone := make(chan struct{})
 	var calls atomic.Int32
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Handle websocket upgrade for subscribeRepos (livestream consumer)
+		if strings.HasSuffix(r.URL.Path, "/com.atproto.sync.subscribeRepos") {
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.CloseNow() }()
+			<-r.Context().Done()
+			return
+		}
 		require.Equal(t, "/xrpc/com.atproto.sync.listRepos", r.URL.Path)
 		idx := int(calls.Add(1)) - 1
 		switch idx {
@@ -183,4 +196,107 @@ func preSeedComplete(dataDir string, dids []atmos.DID) error {
 		}
 	}
 	return nil
+}
+
+// TestServe_RefusesSteadyStatePhase pins that the server crashes
+// loudly when a data dir already shows phase=steady_state. The merge
+// step is not yet implemented; silently doing nothing would be a
+// silent-fallback failure mode.
+func TestServe_RefusesSteadyStatePhase(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+
+	// Pre-populate phase=steady_state.
+	{
+		s, err := store.Open(dataDir)
+		require.NoError(t, err)
+		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseSteadyState))
+		require.NoError(t, s.Close())
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	err := newApp().Run(ctx, []string{
+		"jetstream",
+		"--log-format=text",
+		"--log-level=warn",
+		"serve",
+		"--addr=127.0.0.1:0",
+		"--debug-addr=127.0.0.1:0",
+		"--data-dir=" + dataDir,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "steady-state phase not yet supported")
+}
+
+// TestServe_WritesBootstrapPhaseOnFreshDir pins the upgrade path:
+// a data dir with no phase key is treated as bootstrap, with the
+// phase key written before any goroutine starts.
+func TestServe_WritesBootstrapPhaseOnFreshDir(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Handle websocket upgrade for subscribeRepos (livestream consumer)
+		if strings.HasSuffix(r.URL.Path, "/com.atproto.sync.subscribeRepos") {
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.CloseNow() }()
+			<-r.Context().Done()
+			return
+		}
+		// Handle listRepos - empty list so backfill drains immediately.
+		if strings.HasSuffix(r.URL.Path, "/com.atproto.sync.listRepos") {
+			_, _ = w.Write([]byte(`{"repos":[]}`))
+			return
+		}
+	}))
+	t.Cleanup(relay.Close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- newApp().Run(ctx, []string{
+			"jetstream",
+			"--log-format=text",
+			"--log-level=warn",
+			"serve",
+			"--addr=127.0.0.1:0",
+			"--debug-addr=127.0.0.1:0",
+			"--shutdown-timeout=5s",
+			"--relay-url=" + relay.URL,
+			"--data-dir=" + dataDir,
+		})
+	}()
+
+	// Wait for pebble directory to be created. We can't open the store
+	// while serve has it locked, so we just check that the LOCK file exists.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(filepath.Join(dataDir, "meta.pebble", "LOCK"))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond, "metadata store was never created")
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve exited with unexpected error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not shut down")
+	}
+
+	// Now that serve has shut down and released the lock, verify the phase.
+	s, err := store.Open(dataDir)
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+	p, err := lifecycle.ReadPhase(s)
+	require.NoError(t, err)
+	require.Equal(t, lifecycle.PhaseBootstrap, p)
 }
