@@ -65,3 +65,29 @@ func TestDeriveSubscribeReposURL(t *testing.T) {
 		})
 	}
 }
+
+func TestDeriveRelayHTTPURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in, want string
+		wantErr  bool
+	}{
+		{"https://bsky.network", "https://bsky.network", false},
+		{"http://localhost:2470", "http://localhost:2470", false},
+		{"https://bsky.network/xrpc/com.atproto.sync.subscribeRepos", "https://bsky.network", false},
+		{"wss://bsky.network", "https://bsky.network", false},
+		{"ws://localhost:2470", "http://localhost:2470", false},
+		{"", "", true},
+		{"://no-scheme", "", true},
+		{"ftp://bad-scheme.example", "", true},
+	}
+	for _, tc := range cases {
+		got, err := DeriveRelayHTTPURL(tc.in)
+		if tc.wantErr {
+			require.Error(t, err, "input=%q", tc.in)
+			continue
+		}
+		require.NoError(t, err, "input=%q", tc.in)
+		require.Equal(t, tc.want, got, "input=%q", tc.in)
+	}
+}

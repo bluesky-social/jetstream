@@ -64,13 +64,20 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/identitycache"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/livestream"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/internal/syncstate"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/jcalabro/atmos/identity"
+	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
+	"github.com/jcalabro/jttp"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
 )
@@ -266,6 +273,64 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
+	// Sync 1.1 verifier graph. Construction lives here so the future
+	// merge-step consumer can share the same primitives.
+	//
+	// Defer registration order in this function determines shutdown
+	// order via LIFO unwind. The full chain, in unwind order, is:
+	//   1. liveConsumer.Close() — stops the firehose pump first so
+	//      no new events arrive at the verifier or ingest writer.
+	//   2. verifier.Close()      — drains the resync worker pool with
+	//      no inbound traffic; safe to do while metaStore is still
+	//      open, since workers hold references to syncstate.
+	//   3. ingestWriter.Close()  — flushes the active segment block.
+	//   4. metaStore.Close()     — last; releases the pebble db file
+	//      lock that all three above depend on.
+	relayHTTPURL, err := livestream.DeriveRelayHTTPURL(cmd.String("relay-url"))
+	if err != nil {
+		return fmt.Errorf("serve: derive relay HTTP URL: %w", err)
+	}
+
+	// BulkDownloadOpts (no wall-clock timeout, but TTFB / idle / min-rate
+	// guards) is required for getRepo against the largest accounts —
+	// some carry ~1 GiB of CAR data that would trip xrpc.NewHTTPClient's
+	// 30s default. atmos's atp reference impl uses the same pattern.
+	xrpcClient := &xrpc.Client{
+		Host:       relayHTTPURL,
+		HTTPClient: gt.Some(jttp.New(xrpc.BulkDownloadOpts()...)),
+	}
+
+	// SkipHandleVerification: the firehose verifier only needs the
+	// account's atproto signing key, which lives on the DID document.
+	// The bidirectional handle check (DNS plus an HTTPS GET to the
+	// user's domain) is the dominant per-resolution cost and is
+	// orthogonal to commit signature verification — turning it off is
+	// the single biggest throughput win for verifier consumers (atmos
+	// docs § identity.NewInMemoryDirectory).
+	directory := &identity.Directory{
+		Resolver:               &identity.DefaultResolver{},
+		Cache:                  identitycache.New(metaStore, identitycache.DefaultTTL),
+		SkipHandleVerification: true,
+	}
+
+	stateStore := syncstate.New(metaStore)
+
+	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
+
+	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
+		Directory:  directory,
+		StateStore: stateStore,
+		SyncClient: gt.Some(syncClient),
+	})
+	if err != nil {
+		return fmt.Errorf("serve: build verifier: %w", err)
+	}
+	defer func() {
+		if cerr := verifier.Close(); cerr != nil {
+			logger.Error("verifier close", "err", cerr)
+		}
+	}()
+
 	liveConsumer, err := livestream.Open(livestream.Config{
 		SegmentsDir: filepath.Join(dataDir, "backfill", "live_segments"),
 		Store:       metaStore,
@@ -274,6 +339,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		RelayURL:    cmd.String("relay-url"),
 		Logger:      logger,
 		Metrics:     livestream.NewMetrics(metrics.Registry),
+		Verifier:    verifier,
 	})
 	if err != nil {
 		return fmt.Errorf("livestream open: %w", err)
@@ -297,11 +363,12 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Run the HTTP server, the bootstrap pipeline, and the live firehose
-	// consumer as three siblings under one errgroup. Any one failing cancels
-	// the others — we don't want a server that's silently serving 503s while
-	// bootstrap has died, and we don't want to keep enumerating the relay if
-	// the public listener is dead.
+	// Run the HTTP server, the bootstrap pipeline, the live firehose
+	// consumer, and the verifier async-error drain as four siblings under
+	// one errgroup. Any one failing cancels the others — we don't want a
+	// server that's silently serving 503s while bootstrap has died, and
+	// we don't want to keep enumerating the relay if the public listener
+	// is dead.
 	//
 	// During bootstrap phase, the backfill goroutine draining is the signal
 	// that flips the public surface from "503 — bootstrapping" to live
@@ -331,6 +398,25 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	// Start the live firehose consumer, writing events to live_segments.
 	g.Go(func() error {
 		return liveConsumer.Run(gctx)
+	})
+
+	// Drain verifier async errors. Logs at WARN; does not abort the
+	// errgroup since AsyncErrors are diagnostic — a failed resync
+	// triggers another verification failure on the next commit, which
+	// is its own observability path. Returns nil on context cancel
+	// or channel close (verifier is closing).
+	g.Go(func() error {
+		for {
+			select {
+			case <-gctx.Done():
+				return nil
+			case err, ok := <-verifier.AsyncErrors():
+				if !ok {
+					return nil
+				}
+				logger.Warn("verifier async error", "err", err)
+			}
+		}
 	})
 
 	// A signal-driven shutdown surfaces as context.Canceled from the

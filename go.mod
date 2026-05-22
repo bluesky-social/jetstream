@@ -8,6 +8,7 @@ require (
 	github.com/jcalabro/atmos v0.1.0
 	github.com/jcalabro/gloom v0.0.3
 	github.com/jcalabro/gt v0.0.12
+	github.com/jcalabro/jttp v0.0.4
 	github.com/klauspost/compress v1.18.6
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
@@ -40,7 +41,6 @@ require (
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
-	github.com/jcalabro/jttp v0.0.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
