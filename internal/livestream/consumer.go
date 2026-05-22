@@ -147,11 +147,11 @@ func (c *Consumer) onAfterFlush(ctx context.Context) error {
 // errors as terminal.
 func (c *Consumer) Run(ctx context.Context) error {
 	c.closeMu.Lock()
-	if c.closed {
-		c.closeMu.Unlock()
+	closed := c.closed
+	c.closeMu.Unlock()
+	if closed {
 		return ErrClosed
 	}
-	c.closeMu.Unlock()
 
 	wsURL, err := deriveSubscribeReposURL(c.cfg.RelayURL)
 	if err != nil {
