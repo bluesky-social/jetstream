@@ -169,9 +169,21 @@ func (c *Consumer) Run(ctx context.Context) error {
 	)
 
 	opts := streaming.Options{
-		URL:        wsURL,
-		Cursor:     gt.Some(startCursor),
-		SyncClient: gt.Some[*atmossync.Client](nil), // disable auto-resync; out of scope
+		URL:    wsURL,
+		Cursor: gt.Some(startCursor),
+		// Verifier=nil opts out of the streaming layer's auto-attach.
+		// Sync 1.1 verification will be wired in a later commit; this
+		// commit only bumps the atmos version with no behavior change.
+		Verifier: gt.Some[*atmossync.Verifier](nil),
+		// Parallelism=1 preserves atmos v0.0.16's strict cross-DID
+		// seq ordering. atmos v0.1.0's default of 32 dispatches events
+		// across goroutines per DID and reorders cross-DID events at
+		// the consumer. The archive's per-DID ordering invariant
+		// (DESIGN.md §3.4) holds either way, but several existing
+		// tests assert seq order across DIDs in a single batch.
+		// We can revisit higher parallelism in a follow-up after
+		// measuring real-world throughput.
+		Parallelism: gt.Some(1),
 		OnReconnect: gt.Some(func(attempt int, delay time.Duration) {
 			c.cfg.Metrics.incReconnects()
 			c.cfg.Logger.Warn("livestream: reconnecting",

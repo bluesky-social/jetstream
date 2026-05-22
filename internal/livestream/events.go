@@ -64,8 +64,8 @@ func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error
 			IndexedAt:  indexedAt,
 			Kind:       kind,
 			DID:        commit.Repo,
-			Collection: op.Collection,
-			Rkey:       op.RKey,
+			Collection: string(op.Collection),
+			Rkey:       string(op.RKey),
 			Rev:        commit.Rev,
 		}
 		// Deletes have no record bytes; everything else carries the
