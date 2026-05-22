@@ -7,6 +7,7 @@ package livestream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -230,7 +231,19 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 		c.cfg.Metrics.incEventsReceived()
 
 		segEvts, err := ConvertEvent(evt, indexedAt)
-		if err != nil {
+		switch {
+		case errors.Is(err, ErrUnknownEventKind):
+			// Forward-compat hole: a future relay variant we don't
+			// know how to archive. Count it, log it, and crucially
+			// LEAVE lastUpstream WHERE IT IS so a later build that
+			// learns the kind can resume from this seq. Advancing
+			// here would create a permanent gap in the archive.
+			c.cfg.Metrics.incUnknownEvents()
+			c.cfg.Logger.Warn("livestream: unknown event kind",
+				"seq", evt.Seq,
+			)
+			continue
+		case err != nil:
 			c.cfg.Metrics.incDecodeErrors()
 			// Bad shape from upstream is a data-integrity issue;
 			// we surface it rather than silently dropping events.

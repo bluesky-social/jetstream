@@ -199,11 +199,16 @@ func TestConvertEvent_InfoEmits_Nothing(t *testing.T) {
 	require.Empty(t, got)
 }
 
-func TestConvertEvent_EmptyEvent_Nothing(t *testing.T) {
+// TestConvertEvent_EmptyEvent_UnknownKind: an event with no
+// recognized field set is reported as ErrUnknownEventKind so the Run
+// loop can refuse to advance the upstream cursor past frames a future
+// jetstream build might learn to decode. See the cursor-skip branch
+// in consumer.processBatch.
+func TestConvertEvent_EmptyEvent_UnknownKind(t *testing.T) {
 	t.Parallel()
-	got, err := ConvertEvent(streaming.Event{}, testIndexedAt)
-	require.NoError(t, err)
-	require.Empty(t, got)
+	got, err := ConvertEvent(streaming.Event{Seq: 7}, testIndexedAt)
+	require.ErrorIs(t, err, ErrUnknownEventKind)
+	require.Nil(t, got)
 }
 
 func TestConvertEvent_CommitDelete_PayloadNil(t *testing.T) {
@@ -246,6 +251,49 @@ func TestConvertEvent_CommitDelete_PayloadNil(t *testing.T) {
 	require.Equal(t, "app.bsky.feed.post", got[0].Collection)
 	require.Equal(t, "rec0", got[0].Rkey)
 	require.Nil(t, got[0].Payload)
+}
+
+// TestConvertEvent_CommitMissingCAR_Errors pins data-integrity
+// behavior for the case where a Create/Update op references a CID
+// that isn't in the commit's CAR block index. atmos surfaces this
+// silently as Operation.BlockData()==nil; convertCommit must refuse
+// rather than write a Create with nil payload (PRACTICES.md:
+// crashing > silent corruption).
+func TestConvertEvent_CommitMissingCAR_Errors(t *testing.T) {
+	t.Parallel()
+
+	did := "did:plc:missingcar"
+
+	key, err := crypto.GenerateP256()
+	require.NoError(t, err)
+	mstore := mst.NewMemBlockStore()
+	r := &atmosrepo.Repo{
+		DID:   atmosDIDFromString(t, did),
+		Clock: atmos.NewTIDClock(0),
+		Store: mstore,
+		Tree:  mst.NewTree(mstore),
+	}
+	// Empty repo CAR — no record blocks at all.
+	var carBuf bytes.Buffer
+	require.NoError(t, r.ExportCAR(&carBuf, key))
+
+	// Op references a CID that is NOT in the CAR.
+	commit := &comatproto.SyncSubscribeRepos_Commit{
+		Repo: did,
+		Rev:  "rev-missing",
+		Ops: []comatproto.SyncSubscribeRepos_RepoOp{{
+			Action: "create",
+			Path:   "app.bsky.feed.post/rec0",
+			CID: gt.Some(lextypes.LexCIDLink{
+				Link: "bafyreiabsentcidthatisnotinthecarfile00000000000000000",
+			}),
+		}},
+		Blocks: carBuf.Bytes(),
+	}
+
+	_, err = ConvertEvent(streaming.Event{Seq: 1, Commit: commit}, testIndexedAt)
+	require.Error(t, err, "create op with missing CAR block must surface as an error")
+	require.Contains(t, err.Error(), "did:plc:missingcar")
 }
 
 func TestConvertEvent_CommitUnknownAction_Errors(t *testing.T) {

@@ -15,6 +15,7 @@ type Metrics struct {
 	EventsConverted prometheus.Counter
 	Reconnects      prometheus.Counter
 	DecodeErrors    prometheus.Counter
+	UnknownEvents   prometheus.Counter
 	UpstreamCursor  prometheus.Gauge
 }
 
@@ -43,6 +44,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "decode_errors_total",
 			Help: "Number of upstream frames that failed to decode.",
 		}),
+		UnknownEvents: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "unknown_events_total",
+			Help: "Number of upstream events whose kind ConvertEvent did not recognize. " +
+				"These do NOT advance the upstream cursor so a future build can replay them.",
+		}),
 		UpstreamCursor: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "upstream_cursor",
@@ -51,7 +58,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.EventsReceived, m.EventsConverted, m.Reconnects,
-		m.DecodeErrors, m.UpstreamCursor,
+		m.DecodeErrors, m.UnknownEvents, m.UpstreamCursor,
 	)
 	return m
 }
@@ -77,6 +84,12 @@ func (m *Metrics) incReconnects() {
 func (m *Metrics) incDecodeErrors() {
 	if m != nil {
 		m.DecodeErrors.Inc()
+	}
+}
+
+func (m *Metrics) incUnknownEvents() {
+	if m != nil {
+		m.UnknownEvents.Inc()
 	}
 }
 

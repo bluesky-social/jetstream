@@ -33,9 +33,16 @@ func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error)
 	case evt.Sync != nil:
 		return convertSync(evt, indexedAt)
 	case evt.Info != nil:
-		return nil, nil // archival no-op; #info is informational
+		// #info is informational: archival no-op, but the seq is
+		// still ours to record so we let the caller advance the
+		// cursor past it.
+		return nil, nil
 	default:
-		return nil, nil // forward-compat: unknown frames already filtered upstream
+		// No recognized field set. Either atmos shipped a new event
+		// variant ahead of jetstream, or the wire shape changed.
+		// Either way the safe thing is to refuse to advance the
+		// cursor past this seq so a future build can replay it.
+		return nil, ErrUnknownEventKind
 	}
 }
 
@@ -62,9 +69,21 @@ func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error
 			Rev:        commit.Rev,
 		}
 		// Deletes have no record bytes; everything else carries the
-		// raw CBOR record block exactly as atmos extracted it.
+		// raw CBOR record block exactly as atmos extracted it from
+		// the commit's CAR. atmos returns BlockData()==nil silently
+		// when the op's CID is missing from the CAR diff (truncated
+		// CAR, hash mismatch, or relay bug). We refuse rather than
+		// archive a Create/Update with no payload — PRACTICES.md:
+		// crashing > silent corruption.
 		if kind != segment.KindDelete {
-			segEv.Payload = append([]byte(nil), op.BlockData()...)
+			block := op.BlockData()
+			if block == nil {
+				return nil, fmt.Errorf(
+					"livestream: did=%s collection=%s rkey=%s: %s op references CID missing from CAR diff",
+					commit.Repo, op.Collection, op.RKey, op.Action,
+				)
+			}
+			segEv.Payload = append([]byte(nil), block...)
 		}
 		ops = append(ops, segEv)
 	}

@@ -31,5 +31,6 @@ func TestMetrics_NilSafe(t *testing.T) {
 	m.incEventsConverted()
 	m.incReconnects()
 	m.incDecodeErrors()
+	m.incUnknownEvents()
 	m.setUpstreamCursor(42)
 }
