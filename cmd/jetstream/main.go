@@ -73,6 +73,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/syncstate"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
@@ -321,6 +322,20 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		Directory:  directory,
 		StateStore: stateStore,
 		SyncClient: gt.Some(syncClient),
+		// OnVerificationFailure surfaces every verification failure
+		// at WARN regardless of policy or whether a subsequent resync
+		// repairs the chain. This is the operator-visible audit trail
+		// for "verifier rejected something"; the downstream effect
+		// (drop, resync, etc.) is decided by Policy and observable
+		// via Stats() / AsyncErrors(). Per atmos's contract this hook
+		// fires AFTER the per-DID mutex is released, so it is safe to
+		// call other Verifier methods from inside; we only log.
+		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
+			logger.Warn("verifier failure",
+				"did", did,
+				"err", vErr,
+			)
+		}),
 	})
 	if err != nil {
 		return fmt.Errorf("serve: build verifier: %w", err)
