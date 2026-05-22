@@ -168,7 +168,7 @@ func assertSegmentInvariants(t *testing.T, iter int, desc string, j int, ev segm
 // cases land regularly.
 func nextSwarmCase(t *testing.T, r *rand.Rand) swarmCase {
 	t.Helper()
-	switch r.IntN(11) {
+	switch r.IntN(12) {
 	case 0, 1:
 		return wellFormedCommit(t, r)
 	case 2:
@@ -185,6 +185,8 @@ func nextSwarmCase(t *testing.T, r *rand.Rand) swarmCase {
 		return commitWithMissingCAR(t, r)
 	case 8:
 		return wellFormedInfo()
+	case 9:
+		return wellFormedResync(t, r)
 	default:
 		return adversarialUnknownEvent(r)
 	}
@@ -255,6 +257,45 @@ func wellFormedCommit(t *testing.T, r *rand.Rand) swarmCase {
 	}
 	return swarmCase{
 		desc:    "well-formed commit",
+		evt:     evt,
+		expectN: nOps,
+		expectK: kinds,
+	}
+}
+
+// wellFormedResync builds a #commit whose ops are all ActionResync
+// (the wire form of streaming.ActionResync). Atmos's verifier resync
+// worker emits these after a chain break, with the live record bytes
+// in the CAR. ConvertEvent maps ActionResync → KindCreate so the
+// archive records the post-resync state (a duplicate Create is
+// acceptable; the segment is an event log, not a state table).
+func wellFormedResync(t *testing.T, r *rand.Rand) swarmCase {
+	t.Helper()
+	did := randomDID(r)
+	rev := "3l3qo2vutsw2c"
+
+	nOps := 1 + r.IntN(3)
+	specs := make([]struct{ Coll, Rkey string }, nOps)
+	for i := range specs {
+		specs[i] = struct{ Coll, Rkey string }{
+			Coll: randomCollection(r),
+			Rkey: randomRkey(r),
+		}
+	}
+	evt, _ := buildCommit(t, did, rev, specs...)
+	// Mutate every op's Action from "create" to "resync". The
+	// payload bytes in the CAR remain valid and addressable; only
+	// the action label changes.
+	for i := range evt.Commit.Ops {
+		evt.Commit.Ops[i].Action = string(streaming.ActionResync)
+	}
+
+	kinds := make([]segment.Kind, nOps)
+	for i := range kinds {
+		kinds[i] = segment.KindCreate
+	}
+	return swarmCase{
+		desc:    "well-formed resync",
 		evt:     evt,
 		expectN: nOps,
 		expectK: kinds,

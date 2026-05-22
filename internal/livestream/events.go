@@ -99,11 +99,14 @@ func actionKind(a streaming.Action) (segment.Kind, error) {
 	case streaming.ActionDelete:
 		return segment.KindDelete, nil
 	case streaming.ActionResync:
-		// #sync resyncs synthesize ops with this action. We don't
-		// drive resyncs in this PR (atmos v0.0.16 doesn't support
-		// full sync 1.1), so reaching this path is a programming
-		// error rather than a data error.
-		return 0, fmt.Errorf("livestream: unexpected resync op (sync handling is disabled)")
+		// After Sync 1.1, atmos's verifier resync worker yields each
+		// record currently in the repo as ActionResync with the live
+		// record bytes. Mapping to KindCreate is the brainstorming-
+		// locked decision: the segment is an event log, not a state
+		// table, so emitting a duplicate Create over a record we've
+		// already archived is acceptable. Downstream consumers can
+		// dedupe on (DID, Collection, Rkey, Rev).
+		return segment.KindCreate, nil
 	default:
 		return 0, fmt.Errorf("livestream: unknown commit action %q", a)
 	}

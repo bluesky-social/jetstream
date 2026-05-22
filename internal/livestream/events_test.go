@@ -296,6 +296,34 @@ func TestConvertEvent_CommitMissingCAR_Errors(t *testing.T) {
 	require.Contains(t, err.Error(), "did:plc:missingcar")
 }
 
+// TestConvertEvent_CommitResync pins the post-Sync-1.1 mapping:
+// atmos's verifier triggers an async resync after a chain break,
+// and the resulting ops arrive with Action=ActionResync. They
+// carry the live record bytes; we map them to KindCreate so the
+// archive records the post-resync state.
+func TestConvertEvent_CommitResync(t *testing.T) {
+	t.Parallel()
+
+	did := "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	evt, payloads := buildCommit(t, did, "3l3qo2vutsw2c",
+		struct{ Coll, Rkey string }{"app.bsky.feed.post", "rec0"},
+	)
+	// Mutate the op action from "create" to "resync". This is exactly
+	// what atmos's resync worker pool produces after a chain-break
+	// resolution.
+	evt.Commit.Ops[0].Action = "resync"
+
+	got, err := ConvertEvent(evt, testIndexedAt)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, segment.KindCreate, got[0].Kind, "ActionResync must map to KindCreate")
+	require.Equal(t, did, got[0].DID)
+	require.Equal(t, "app.bsky.feed.post", got[0].Collection)
+	require.Equal(t, "rec0", got[0].Rkey)
+	require.Equal(t, "3l3qo2vutsw2c", got[0].Rev)
+	require.Equal(t, payloads[0], got[0].Payload, "resync ops carry the live record bytes")
+}
+
 func TestConvertEvent_CommitUnknownAction_Errors(t *testing.T) {
 	t.Parallel()
 
