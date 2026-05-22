@@ -13,9 +13,16 @@
 // writer's OnAfterFlush hook so persisted cursor ≤ durable events
 // holds for free, as DESIGN.md §3.1.1 requires.
 //
-// This package does not yet act on #sync events (atmos v0.0.16
-// does not implement full sync 1.1). #sync frames are archived
-// into the segment file as KindSync but no resync is triggered.
-// The opt-out is one line and will be removed when the atmos
-// dependency is upgraded.
+// Sync 1.1 verification is required: Config.Verifier must be a
+// non-nil *sync.Verifier or Open returns ErrInvalidConfig. The
+// verifier itself is not owned by this package — its resync worker
+// pool is a process-wide resource that cmd/jetstream constructs
+// (with a pebble-backed StateStore + identity cache) and shares
+// with any future steady-state consumer.
+//
+// #sync frames are archived as segment.KindSync. ActionResync ops
+// produced by the verifier's resync worker after a chain break
+// archive as segment.KindCreate carrying the live record bytes
+// (see events.go); downstream consumers can dedupe on
+// (DID, Collection, Rkey, Rev).
 package livestream

@@ -113,6 +113,7 @@ func TestProcessBatch_UnknownEventDoesNotAdvanceCursor(t *testing.T) {
 		CursorKey:   "relay/cursor",
 		RelayURL:    "https://example.invalid",
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
@@ -199,6 +200,7 @@ func TestConsumer_Run_HappyPath(t *testing.T) {
 		CursorKey:         "relay/cursor",
 		RelayURL:          srv.URL,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:          newTestVerifier(t),
 		MaxEventsPerBlock: 2, // force a block flush after every 2 events
 	})
 	require.NoError(t, err)
@@ -325,6 +327,7 @@ func TestConsumer_Run_ResumesFromPersistedCursor(t *testing.T) {
 		CursorKey:         "relay/cursor",
 		RelayURL:          srv.URL,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:          newTestVerifier(t),
 		MaxEventsPerBlock: 2,
 	}
 

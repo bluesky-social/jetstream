@@ -17,7 +17,6 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/jcalabro/atmos/streaming"
-	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/gt"
 )
 
@@ -171,10 +170,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 	opts := streaming.Options{
 		URL:    wsURL,
 		Cursor: gt.Some(startCursor),
-		// Verifier=nil opts out of the streaming layer's auto-attach.
-		// Sync 1.1 verification will be wired in a later commit; this
-		// commit only bumps the atmos version with no behavior change.
-		Verifier: gt.Some[*atmossync.Verifier](nil),
+		// Verifier is supplied by the caller via livestream.Config; the
+		// streaming layer would otherwise auto-attach an in-memory verifier
+		// that doesn't survive restart. cmd/jetstream constructs ours with
+		// a pebble-backed StateStore + identity cache.
+		Verifier: gt.Some(c.cfg.Verifier),
 		// Parallelism=1 preserves atmos v0.0.16's strict cross-DID
 		// seq ordering. atmos v0.1.0's default of 32 dispatches events
 		// across goroutines per DID and reorders cross-DID events at

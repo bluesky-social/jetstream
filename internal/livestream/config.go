@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	atmossync "github.com/jcalabro/atmos/sync"
 )
 
 // Config controls Consumer behavior.
@@ -40,6 +41,16 @@ type Config struct {
 	// Metrics is optional; nil means no /metrics counters incrementing.
 	Metrics *Metrics
 
+	// Verifier runs Sync 1.1 verification on every #commit and #sync
+	// before the consumer's Operations() iterator yields ops to the
+	// converter. Required.
+	//
+	// Construct via sync.NewVerifier in the cmd boundary; livestream
+	// does not own verifier lifecycle (the verifier's resync worker
+	// pool is a process-wide resource and is reusable across a
+	// future steady-state consumer).
+	Verifier *atmossync.Verifier
+
 	// MaxSegmentBytes / MaxEventsPerBlock forward to ingest.Config.
 	// Zero means use ingest defaults.
 	MaxSegmentBytes   int64
@@ -67,6 +78,9 @@ func (c *Config) validate() error {
 	}
 	if c.Logger == nil {
 		return fmt.Errorf("%w: Logger is required", ErrInvalidConfig)
+	}
+	if c.Verifier == nil {
+		return fmt.Errorf("%w: Verifier is required", ErrInvalidConfig)
 	}
 	return nil
 }

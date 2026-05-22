@@ -11,9 +11,33 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos/api/comatproto"
+	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/streaming"
+	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
+
+// newTestVerifier returns a non-nil *sync.Verifier suitable only
+// for satisfying validate() and exercising consumer wiring with
+// non-commit events. Built against MemStateStore + an in-memory
+// identity directory, so #identity / #account events flow through
+// without triggering plc.directory lookups. NOT suitable for
+// commit-event tests; those need a stub resolver.
+func newTestVerifier(t *testing.T) *atmossync.Verifier {
+	t.Helper()
+	v, err := atmossync.NewVerifier(atmossync.VerifierOptions{
+		Directory:  identity.NewInMemoryDirectory(),
+		StateStore: atmossync.NewMemStateStore(),
+		SyncClient: gt.Some(atmossync.NewClient(atmossync.Options{
+			Client: &xrpc.Client{Host: "http://example.invalid"},
+		})),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = v.Close() })
+	return v
+}
 
 func TestConfig_Validate(t *testing.T) {
 	t.Parallel()
@@ -30,6 +54,7 @@ func TestConfig_Validate(t *testing.T) {
 		CursorKey:   "relay/cursor",
 		RelayURL:    "https://bsky.network",
 		Logger:      logger,
+		Verifier:    newTestVerifier(t),
 	}
 
 	t.Run("happy", func(t *testing.T) {
@@ -90,6 +115,7 @@ func TestOpen_UsesConfiguredSeqKey(t *testing.T) {
 		CursorKey:   "relay/cursor",
 		RelayURL:    "https://bsky.network",
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
 	})
 	require.NoError(t, err)
 
@@ -139,6 +165,7 @@ func TestClose_Idempotent_AndPersistsCursor(t *testing.T) {
 		CursorKey:   "relay/cursor",
 		RelayURL:    "https://bsky.network",
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
 		// Big enough that no block ever flushes during the test.
 		MaxEventsPerBlock: 1024,
 	})
@@ -165,4 +192,22 @@ func TestClose_Idempotent_AndPersistsCursor(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(42), persisted,
 		"Close must durably write lastUpstream even when no block flush fired")
+}
+
+// TestConfig_Validate_RequiresVerifier pins that a livestream.Config
+// with no Verifier is rejected. The package's purpose is now Sync 1.1.
+func TestConfig_Validate_RequiresVerifier(t *testing.T) {
+	t.Parallel()
+	cfg := Config{
+		SegmentsDir: t.TempDir(),
+		Store:       newTestStore(t),
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://bsky.network",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// Verifier deliberately unset
+	}
+	err := cfg.validate()
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.Contains(t, err.Error(), "Verifier")
 }
