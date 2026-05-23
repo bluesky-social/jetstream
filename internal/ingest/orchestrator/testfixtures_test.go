@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/bluesky-social/jetstream-v2/segment"
@@ -20,10 +21,17 @@ import (
 // fakeRelay is a minimal stub combining the listRepos endpoint
 // (drains in one page) and the subscribeRepos WebSocket (accepts
 // the connection and holds it open).
+//
+// Subscribed is closed the first time the relay accepts a
+// subscribeRepos WebSocket. Tests use this as a deterministic
+// "live consumer is up" signal so they can cancel without waiting
+// on a timeout.
 type fakeRelay struct {
-	t     *testing.T
-	repos []listReposEntry
-	srv   *httptest.Server
+	t          *testing.T
+	repos      []listReposEntry
+	srv        *httptest.Server
+	Subscribed chan struct{}
+	subOnce    sync.Once
 }
 
 type listReposEntry struct {
@@ -40,7 +48,7 @@ type listReposPage struct {
 
 func newFakeRelay(t *testing.T, repos []listReposEntry) *fakeRelay {
 	t.Helper()
-	f := &fakeRelay{t: t, repos: repos}
+	f := &fakeRelay{t: t, repos: repos, Subscribed: make(chan struct{})}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -56,6 +64,7 @@ func (f *fakeRelay) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer func() { _ = conn.CloseNow() }()
+		f.subOnce.Do(func() { close(f.Subscribed) })
 		<-r.Context().Done()
 	case strings.HasSuffix(r.URL.Path, "/com.atproto.sync.listRepos"):
 		_ = json.NewEncoder(w).Encode(listReposPage{Repos: f.repos})

@@ -111,14 +111,32 @@ func TestRun_StartsCleanInSteadyState(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
-	err = o.Run(ctx)
-	// Steady-state consumer returns ctx.Err() (Canceled or DeadlineExceeded)
-	// on clean shutdown.
-	require.True(t, err == nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled),
-		"unexpected error: %v", err)
+	done := make(chan error, 1)
+	go func() { done <- o.Run(ctx) }()
+
+	// Cancel as soon as the steady-state consumer has actually
+	// reached the relay — that proves Run dispatched into the
+	// steady-state path. Bounded fallback timeout in case the
+	// consumer never gets there.
+	select {
+	case <-relay.Subscribed:
+	case err := <-done:
+		t.Fatalf("Run exited before steady-state consumer subscribed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("steady-state consumer never subscribed")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		require.True(t, err == nil || errors.Is(err, context.Canceled),
+			"unexpected error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
 
 	// Phase remains steady_state.
 	got, err := lifecycle.ReadPhase(st)
