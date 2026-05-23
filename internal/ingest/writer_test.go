@@ -566,3 +566,79 @@ func TestFlush_OnAfterFlushErrorPropagates(t *testing.T) {
 	err = w.Append(t.Context(), &ev)
 	require.ErrorIs(t, err, want)
 }
+
+// TestSealActiveAndClose_SealsAndCloses verifies the cutover-time
+// teardown path: after SealActiveAndClose, the trailing segment
+// file has a non-zero header checksum (sealed) and the writer
+// rejects further appends. seq/next is persisted.
+func TestSealActiveAndClose_SealsAndCloses(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{MaxEventsPerBlock: 2})
+
+	for i := range 3 {
+		ev := segment.Event{
+			IndexedAt: int64(i + 1),
+			Kind:      segment.KindCreate,
+			DID:       "did:plc:a",
+		}
+		require.NoError(t, w.Append(t.Context(), &ev))
+	}
+
+	require.NoError(t, w.SealActiveAndClose())
+
+	// Subsequent appends fail with ErrClosed.
+	err := w.Append(t.Context(), &segment.Event{
+		IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:a",
+	})
+	require.ErrorIs(t, err, ErrClosed)
+
+	path := filepath.Join(w.cfg.SegmentsDir, "seg_0000000000.jss")
+	ins, err := segment.Inspect(path)
+	require.NoError(t, err)
+	require.True(t, ins.Sealed, "expected the trailing segment to be sealed")
+
+	// nextSeq must be persisted to pebble at SeqKey. Reading it
+	// directly (rather than reopening the Writer, which would mask a
+	// bug via ScanMaxSeq reconciliation) is what locks in that
+	// SealActiveAndClose actually called saveNextSeq.
+	persisted, closer, err := w.cfg.Store.Get([]byte(seqNextKey))
+	require.NoError(t, err)
+	defer func() { _ = closer.Close() }()
+	require.Equal(t, uint64(3), binary.LittleEndian.Uint64(persisted))
+}
+
+// TestSealActiveAndClose_Idempotent verifies the second call is a
+// true no-op: returns nil and does not mutate the on-disk file.
+// Without this stronger assertion, an implementation that re-sealed
+// every call (e.g. forgot the closed flag) would still pass.
+func TestSealActiveAndClose_Idempotent(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{})
+
+	require.NoError(t, w.SealActiveAndClose())
+
+	path := filepath.Join(w.cfg.SegmentsDir, "seg_0000000000.jss")
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	require.NoError(t, w.SealActiveAndClose())
+
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "second SealActiveAndClose must not modify the file")
+}
+
+// TestSealActiveAndClose_FreshDir seals an empty active segment.
+// The seal path must handle a writer that never accepted any events.
+func TestSealActiveAndClose_FreshDir(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{})
+
+	require.NoError(t, w.SealActiveAndClose())
+
+	path := filepath.Join(w.cfg.SegmentsDir, "seg_0000000000.jss")
+	ins, err := segment.Inspect(path)
+	require.NoError(t, err)
+	require.True(t, ins.Sealed)
+	require.Zero(t, ins.Header.EventCount, "sealed empty segment carries no events")
+}

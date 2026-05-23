@@ -165,6 +165,49 @@ func (w *Writer) Close() error {
 	return nil
 }
 
+// SealActiveAndClose flushes any pending block, seals the active
+// segment file (writes the variable-length footer and finalizes the
+// 256-byte fixed header), persists nextSeq, and closes the writer.
+// Idempotent.
+//
+// Used by the orchestrator at cutover time to finalize the
+// bootstrap-phase live_segments writer's trailing active file so the
+// `backfill/live_segments/` tree is fully sealed once steady-state
+// begins. Steady-state callers should continue to use Close()
+// instead — sealing during normal operation is a rotation-time
+// concern handled inside flushAndRotateLocked.
+func (w *Writer) SealActiveAndClose() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if w.active == nil {
+		return nil
+	}
+	// segment.Writer.Seal handles flushing any pending events itself
+	// (and is a no-op on an empty pending block), so we don't have to
+	// pre-flush here. Seal closes the underlying file on success;
+	// failure paths leave the file open with stickyErr latched, so we
+	// release the fd ourselves below.
+	//
+	// Durability ordering matches Close (DESIGN.md §3.1.1): the segment
+	// fsyncs first, then we pebble.Sync nextSeq. A crash between the
+	// two leaves nextSeq lagging at most one block, which Open's
+	// ScanMaxSeq reconciles on next start.
+	if _, err := w.active.Seal(); err != nil {
+		if cerr := w.active.Close(); cerr != nil {
+			w.cfg.Logger.Warn("ingest: close after failed seal", "err", cerr)
+		}
+		return fmt.Errorf("ingest: seal active segment: %w", err)
+	}
+	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Append writes one event into the active segment. On success,
 // mutates ev.Seq in place to the allocated value; on error ev.Seq
 // is left untouched so callers can safely retry without observing

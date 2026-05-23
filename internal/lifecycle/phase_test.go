@@ -27,7 +27,7 @@ func TestPhase_RoundTrip(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 
-	for _, p := range []Phase{PhaseBootstrap, PhaseSteadyState} {
+	for _, p := range []Phase{PhaseBootstrap, PhaseMerging, PhaseSteadyState} {
 		require.NoError(t, WritePhase(st, p))
 		got, err := ReadPhase(st)
 		require.NoError(t, err)

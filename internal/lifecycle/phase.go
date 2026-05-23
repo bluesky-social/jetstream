@@ -17,10 +17,16 @@ const (
 	// live_segments consumer run in this phase.
 	PhaseBootstrap Phase = "bootstrap"
 
+	// PhaseMerging means initial backfill has drained but the merge
+	// step (DESIGN.md §4.2) has not yet completed. A process restart
+	// in this phase resumes the cutover state machine at the merge
+	// step; backfill and the bootstrap-phase live consumer are not
+	// restarted.
+	PhaseMerging Phase = "merging"
+
 	// PhaseSteadyState means backfill is complete and the merge step
 	// has folded live_segments into segments. Only the steady-state
-	// live consumer runs here. Setting this value is a future PR; for
-	// now cmd/jetstream refuses to start when it observes this phase.
+	// live consumer runs here.
 	PhaseSteadyState Phase = "steady_state"
 )
 
@@ -64,7 +70,7 @@ func WritePhase(s *store.Store, p Phase) error {
 
 func (p Phase) valid() bool {
 	switch p {
-	case PhaseBootstrap, PhaseSteadyState:
+	case PhaseBootstrap, PhaseMerging, PhaseSteadyState:
 		return true
 	default:
 		return false

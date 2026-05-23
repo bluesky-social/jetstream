@@ -59,7 +59,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -67,8 +66,8 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/orchestrator"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -244,70 +243,21 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
-	phase, err := lifecycle.ReadPhase(metaStore)
-	if err != nil {
-		return fmt.Errorf("serve: read phase: %w", err)
-	}
-	if phase == "" {
-		phase = lifecycle.PhaseBootstrap
-		if err := lifecycle.WritePhase(metaStore, phase); err != nil {
-			return fmt.Errorf("serve: write phase: %w", err)
-		}
-	}
-	if phase == lifecycle.PhaseSteadyState {
-		return fmt.Errorf("serve: steady-state phase not yet supported; the merge step has not been implemented")
-	}
-
-	ingestMetrics := ingest.NewMetrics(metrics.Registry)
-	ingestWriter, err := ingest.Open(ingest.Config{
-		SegmentsDir: filepath.Join(dataDir, "segments"),
-		Store:       metaStore,
-		Logger:      logger,
-		Metrics:     ingestMetrics,
-	})
-	if err != nil {
-		return fmt.Errorf("ingest open: %w", err)
-	}
-	defer func() {
-		if cerr := ingestWriter.Close(); cerr != nil {
-			logger.Error("close ingest writer", "err", cerr)
-		}
-	}()
-
-	// Sync 1.1 verifier graph. Construction lives here so the future
-	// merge-step consumer can share the same primitives.
-	//
-	// Defer registration order in this function determines shutdown
-	// order via LIFO unwind. The full chain, in unwind order, is:
-	//   1. liveConsumer.Close() — stops the firehose pump first so
-	//      no new events arrive at the verifier or ingest writer.
-	//   2. verifier.Close()      — drains the resync worker pool with
-	//      no inbound traffic; safe to do while metaStore is still
-	//      open, since workers hold references to syncstate.
-	//   3. ingestWriter.Close()  — flushes the active segment block.
-	//   4. metaStore.Close()     — last; releases the pebble db file
-	//      lock that all three above depend on.
+	// Verifier setup (shared across phases). The verifier itself is
+	// owned by the orchestrator's per-phase live consumers, but we
+	// construct it here because its async-error drain is a sibling
+	// goroutine in the top-level errgroup — it's a process-wide
+	// observability concern.
 	relayHTTPURL, err := live.DeriveRelayHTTPURL(cmd.String("relay-url"))
 	if err != nil {
 		return fmt.Errorf("serve: derive relay HTTP URL: %w", err)
 	}
 
-	// BulkDownloadOpts (no wall-clock timeout, but TTFB / idle / min-rate
-	// guards) is required for getRepo against the largest accounts —
-	// some carry ~1 GiB of CAR data that would trip xrpc.NewHTTPClient's
-	// 30s default. atmos's atp reference impl uses the same pattern.
 	xrpcClient := &xrpc.Client{
 		Host:       relayHTTPURL,
 		HTTPClient: gt.Some(jttp.New(xrpc.BulkDownloadOpts()...)),
 	}
 
-	// SkipHandleVerification: the firehose verifier only needs the
-	// account's atproto signing key, which lives on the DID document.
-	// The bidirectional handle check (DNS plus an HTTPS GET to the
-	// user's domain) is the dominant per-resolution cost and is
-	// orthogonal to commit signature verification — turning it off is
-	// the single biggest throughput win for verifier consumers (atmos
-	// docs § identity.NewInMemoryDirectory).
 	directory := &identity.Directory{
 		Resolver:               &identity.DefaultResolver{},
 		Cache:                  identcache.New(metaStore, identcache.DefaultTTL),
@@ -315,21 +265,12 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	stateStore := syncstate.New(metaStore)
-
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
 		Directory:  directory,
 		StateStore: stateStore,
 		SyncClient: gt.Some(syncClient),
-		// OnVerificationFailure surfaces every verification failure
-		// at WARN regardless of policy or whether a subsequent resync
-		// repairs the chain. This is the operator-visible audit trail
-		// for "verifier rejected something"; the downstream effect
-		// (drop, resync, etc.) is decided by Policy and observable
-		// via Stats() / AsyncErrors(). Per atmos's contract this hook
-		// fires AFTER the per-DID mutex is released, so it is safe to
-		// call other Verifier methods from inside; we only log.
 		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
 			logger.Warn("verifier failure",
 				"did", did,
@@ -346,24 +287,25 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
-	liveConsumer, err := live.Open(live.Config{
-		SegmentsDir: filepath.Join(dataDir, "backfill", "live_segments"),
-		Store:       metaStore,
-		SeqKey:      "live_segments/seq/next",
-		CursorKey:   "relay/cursor",
-		RelayURL:    cmd.String("relay-url"),
-		Logger:      logger,
-		Metrics:     live.NewMetrics(metrics.Registry),
-		Verifier:    verifier,
+	// The orchestrator owns all ingestion-lifecycle subsystems
+	// (backfill engine, bootstrap-time live consumer, steady-state
+	// live consumer). cmd/jetstream is no longer phase-aware.
+	orch, err := orchestrator.New(orchestrator.Config{
+		DataDir:         dataDir,
+		Store:           metaStore,
+		RelayURL:        cmd.String("relay-url"),
+		HTTPClient:      xrpcClient.HTTPClient.Val(),
+		Directory:       directory,
+		Verifier:        verifier,
+		Logger:          logger,
+		Metrics:         orchestrator.NewMetrics(metrics.Registry),
+		IngestMetrics:   ingest.NewMetrics(metrics.Registry),
+		LiveMetrics:     live.NewMetrics(metrics.Registry),
+		BackfillMetrics: backfill.NewMetrics(metrics.Registry),
 	})
 	if err != nil {
-		return fmt.Errorf("livestream open: %w", err)
+		return fmt.Errorf("serve: build orchestrator: %w", err)
 	}
-	defer func() {
-		if cerr := liveConsumer.Close(); cerr != nil {
-			logger.Error("close live consumer", "err", cerr)
-		}
-	}()
 
 	srv := server.New(server.Config{
 		PublicAddr:      cmd.String("addr"),
@@ -371,57 +313,24 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		ShutdownTimeout: cmd.Duration("shutdown-timeout"),
 	}, logger, metrics)
 
-	// Cancel runCtx on SIGINT/SIGTERM. signal.NotifyContext gives us a clean
-	// idiomatic way to propagate the signal as a context cancellation, which
-	// both the server's Run loop and the bootstrap pipeline already know how
-	// to handle.
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Run the HTTP server, the bootstrap pipeline, the live firehose
-	// consumer, and the verifier async-error drain as four siblings under
-	// one errgroup. Any one failing cancels the others — we don't want a
-	// server that's silently serving 503s while bootstrap has died, and
-	// we don't want to keep enumerating the relay if the public listener
-	// is dead.
-	//
-	// During bootstrap phase, the backfill goroutine draining is the signal
-	// that flips the public surface from "503 — bootstrapping" to live
-	// serving.
 	g, gctx := errgroup.WithContext(runCtx)
 
-	// Start the main web server
 	g.Go(func() error {
 		return srv.Run(gctx)
 	})
 
-	// Start the backfiller to do initial repo download for a fresh
-	// jetstream instance, or resume from where a prior process left
-	// off (DESIGN.md §4.1). On clean drain this goroutine returns nil
-	// and the HTTP server keeps running; on engine failure the
-	// errgroup cancels the server too.
 	g.Go(func() error {
-		return backfill.Run(gctx, backfill.Config{
-			Store:      metaStore,
-			HTTPClient: xrpcClient.HTTPClient.Val(),
-			Directory:  directory,
-			Writer:     ingestWriter,
-			RelayURL:   cmd.String("relay-url"),
-			Logger:     logger,
-			Metrics:    backfill.NewMetrics(metrics.Registry),
-		})
+		return orch.Run(gctx)
 	})
 
-	// Start the live firehose consumer, writing events to live_segments.
-	g.Go(func() error {
-		return liveConsumer.Run(gctx)
-	})
-
-	// Drain verifier async errors. Logs at WARN; does not abort the
-	// errgroup since AsyncErrors are diagnostic — a failed resync
-	// triggers another verification failure on the next commit, which
-	// is its own observability path. Returns nil on context cancel
-	// or channel close (verifier is closing).
+	// Verifier async-error drain. Verification failures are
+	// diagnostic, not fatal — they typically reflect adversarial or
+	// malformed PDS input, which is invalid user data, not a
+	// jetstream bug. We warn-log and the OnVerificationFailure hook
+	// fires for operator visibility, but never crash.
 	g.Go(func() error {
 		for {
 			select {
@@ -437,9 +346,9 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	})
 
 	// A signal-driven shutdown surfaces as context.Canceled from the
-	// bootstrap goroutine because the HTTP server intercepts it as a
-	// graceful shutdown. We don't want the user to see "context canceled"
-	// when they hit Ctrl-C.
+	// errgroup: the orchestrator's steady-state consumer and the HTTP
+	// server both return ctx.Err() on graceful shutdown. We don't want
+	// the user to see "context canceled" when they hit Ctrl-C.
 	runErr := g.Wait()
 	if errors.Is(runErr, context.Canceled) && runCtx.Err() != nil {
 		runErr = nil

@@ -9,6 +9,27 @@ import (
 	atmossync "github.com/jcalabro/atmos/sync"
 )
 
+// Pebble keys used by the live consumer. Exported so the orchestrator
+// can wire bootstrap-time and steady-state consumers to the right
+// counters without duplicating the literals.
+const (
+	// BootstrapSeqKey holds the throwaway seq counter for the
+	// live_segments/ tree written during bootstrap. Disjoint from
+	// SteadySeqKey so the bootstrap-time consumer cannot collide
+	// with the backfill writer's seq allocator on the segments/ tree.
+	BootstrapSeqKey = "live_segments/seq/next"
+
+	// SteadySeqKey is the seq counter for segments/. Shared with the
+	// backfill writer; the steady-state consumer resumes from where
+	// backfill left off.
+	SteadySeqKey = "seq/next"
+
+	// CursorKey is the persisted upstream relay firehose cursor.
+	// Shared across phases: bootstrap writes into it, steady-state
+	// resumes from it, and the merge step will not rewrite it.
+	CursorKey = "relay/cursor"
+)
+
 // Config controls Consumer behavior.
 type Config struct {
 	// SegmentsDir is where the consumer writes seg_*.jss files.
