@@ -63,7 +63,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/identitycache"
+	identcache "github.com/bluesky-social/jetstream-v2/internal/identity"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
@@ -310,7 +310,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	// docs § identity.NewInMemoryDirectory).
 	directory := &identity.Directory{
 		Resolver:               &identity.DefaultResolver{},
-		Cache:                  identitycache.New(metaStore, identitycache.DefaultTTL),
+		Cache:                  identcache.New(metaStore, identcache.DefaultTTL),
 		SkipHandleVerification: true,
 	}
 

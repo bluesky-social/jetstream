@@ -1,4 +1,4 @@
-// Package identitycache persists atmos identity.Cache resolutions in
+// package identity persists atmos identity.Cache resolutions in
 // pebble. It owns the key prefix "sync/identity/<did>" and stores
 // the JSON-encoded *identity.Identity preceded by an 8-byte big-endian
 // unix-nano expiry. Get treats expired or undecodable entries as
@@ -17,4 +17,4 @@
 // rate. Pebble's natural compaction keeps the working set on disk
 // modest, and a count-bound LRU would force read-modify-write cycles
 // on the hot path that the identity.Cache contract explicitly avoids.
-package identitycache
+package identity
