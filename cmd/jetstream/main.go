@@ -402,11 +402,13 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	// errgroup cancels the server too.
 	g.Go(func() error {
 		return backfill.Run(gctx, backfill.Config{
-			Store:    metaStore,
-			Writer:   ingestWriter,
-			RelayURL: cmd.String("relay-url"),
-			Logger:   logger,
-			Metrics:  backfill.NewMetrics(metrics.Registry),
+			Store:      metaStore,
+			HTTPClient: xrpcClient.HTTPClient.Val(),
+			Directory:  directory,
+			Writer:     ingestWriter,
+			RelayURL:   cmd.String("relay-url"),
+			Logger:     logger,
+			Metrics:    backfill.NewMetrics(metrics.Registry),
 		})
 	})
 
