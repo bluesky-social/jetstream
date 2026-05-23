@@ -20,9 +20,10 @@ modernize *ARGS="./...":
 build:
     go build -trimpath -o bin/jetstream ./cmd/jetstream
 
-# Remove build artifacts.
+# Remove build artifacts and local data.
 clean:
     rm -rf bin
+    rm -rf data
 
 # Run jetstream with arbitrary args, e.g. `just run --version` or `just run serve --addr :9090`.
 run *ARGS:

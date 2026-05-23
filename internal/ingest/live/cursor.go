@@ -3,11 +3,14 @@
 // durably-flushed block. DESIGN.md §3.1.1: persisted cursor must be
 // less than or equal to the latest durable event in the segment file.
 //
-// The encoding is little-endian uint64 bytes — the same shape used
-// by ingest.Writer for seq/next, so operators inspecting pebble see
-// a consistent layout. atmos exposes the cursor as int64; we cast
-// at the boundary and document the implicit non-negativity
-// constraint (atmos relays only emit positive seq values).
+// The on-disk encoding is [1B version][8B LE uint64]. The version
+// byte gives us a future evolution path (rename a relay, attach a
+// generation counter, ...) that a bare uint64 doesn't. The uint64
+// payload is little-endian to match ingest.Writer's seq/next layout
+// so operators inspecting pebble see a consistent shape. atmos
+// exposes the cursor as int64; we cast at the boundary and document
+// the implicit non-negativity constraint (atmos relays only emit
+// positive seq values).
 package live
 
 import (
@@ -17,6 +20,18 @@ import (
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/cockroachdb/pebble"
+)
+
+const (
+	// cursorV1 is the only currently-supported cursor format. A
+	// strict-equal check on read means a forward-incompatible writer
+	// surfaces as an explicit error rather than a silent
+	// misinterpretation of the payload bytes.
+	cursorV1 = 0x01
+
+	// cursorV1Len is the exact byte length of a v1 cursor value:
+	// 1 version byte + 8 little-endian uint64 bytes.
+	cursorV1Len = 1 + 8
 )
 
 // LoadUpstreamCursor reads the persisted relay cursor for key.
@@ -40,13 +55,26 @@ func LoadUpstreamCursor(s *store.Store, key string) (int64, error) {
 	}
 	defer func() { _ = closer.Close() }()
 
-	if len(val) != 8 {
-		return 0, fmt.Errorf("livestream: %s has wrong length %d (want 8)", key, len(val))
+	cur, err := decodeUpstreamCursor(val)
+	if err != nil {
+		return 0, fmt.Errorf("livestream: %s: %w", key, err)
 	}
-	raw := binary.LittleEndian.Uint64(val)
+	return cur, nil
+}
+
+// decodeUpstreamCursor parses the on-disk cursor payload. Pure
+// function so it can be fuzzed without a pebble dependency.
+func decodeUpstreamCursor(val []byte) (int64, error) {
+	if len(val) != cursorV1Len {
+		return 0, fmt.Errorf("wrong length %d (want %d)", len(val), cursorV1Len)
+	}
+	if val[0] != cursorV1 {
+		return 0, fmt.Errorf("unknown version 0x%02x (want 0x%02x)", val[0], cursorV1)
+	}
+	raw := binary.LittleEndian.Uint64(val[1:])
 	cur := int64(raw)
 	if cur < 0 {
-		return 0, fmt.Errorf("livestream: %s decodes to negative cursor (raw=0x%016x)", key, raw)
+		return 0, fmt.Errorf("decodes to negative cursor (raw=0x%016x)", raw)
 	}
 	return cur, nil
 }
@@ -63,8 +91,9 @@ func SaveUpstreamCursor(s *store.Store, key string, v int64) error {
 	if v < 0 {
 		return fmt.Errorf("livestream: refuse to save negative cursor %d to %s", v, key)
 	}
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], uint64(v))
+	var buf [cursorV1Len]byte
+	buf[0] = cursorV1
+	binary.LittleEndian.PutUint64(buf[1:], uint64(v))
 	if err := s.Set([]byte(key), buf[:], store.SyncWrites); err != nil {
 		return fmt.Errorf("livestream: save %s: %w", key, err)
 	}
