@@ -1,6 +1,6 @@
 - We test thoroughly, using all means available to us where helpful
     - Unit tests have limited utility, but are helpful for some small things. Use sparingly
-    - Integration tests are very valueable for testing happy paths
+    - Integration tests are very valuable for testing happy paths
     - Fuzz tests and property based tests are valuable for many things, notably handling untrusted user input, or finding edge cases you may not have thought of that violate your invariants
     - Swarm testing to generate some meaningful randomness, not just white noise randomness
     - Smoke tests against real, live, production data
