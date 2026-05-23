@@ -1,4 +1,4 @@
-// Package livestream: cursor.go persists the upstream relay firehose
+// package live: cursor.go persists the upstream relay firehose
 // cursor in pebble so a process restart resumes from the last
 // durably-flushed block. DESIGN.md §3.1.1: persisted cursor must be
 // less than or equal to the latest durable event in the segment file.
@@ -8,7 +8,7 @@
 // a consistent layout. atmos exposes the cursor as int64; we cast
 // at the boundary and document the implicit non-negativity
 // constraint (atmos relays only emit positive seq values).
-package livestream
+package live
 
 import (
 	"encoding/binary"

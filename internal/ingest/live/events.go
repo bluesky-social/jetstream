@@ -1,4 +1,4 @@
-// Package livestream: events.go is the pure converter from atmos's
+// package live: events.go is the pure converter from atmos's
 // upstream streaming event shape to the segment.Event shape jetstream
 // writes to disk. No I/O, no allocation beyond the result slice and
 // CBOR marshalling. Safe to fuzz against arbitrary input — every
@@ -10,7 +10,7 @@
 //
 // Seq is left zero on the returned events — ingest.Writer.Append
 // allocates the value at write time.
-package livestream
+package live
 
 import (
 	"fmt"

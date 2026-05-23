@@ -63,11 +63,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/identitycache"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/livestream"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -287,7 +287,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	//   3. ingestWriter.Close()  — flushes the active segment block.
 	//   4. metaStore.Close()     — last; releases the pebble db file
 	//      lock that all three above depend on.
-	relayHTTPURL, err := livestream.DeriveRelayHTTPURL(cmd.String("relay-url"))
+	relayHTTPURL, err := live.DeriveRelayHTTPURL(cmd.String("relay-url"))
 	if err != nil {
 		return fmt.Errorf("serve: derive relay HTTP URL: %w", err)
 	}
@@ -346,14 +346,14 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
-	liveConsumer, err := livestream.Open(livestream.Config{
+	liveConsumer, err := live.Open(live.Config{
 		SegmentsDir: filepath.Join(dataDir, "backfill", "live_segments"),
 		Store:       metaStore,
 		SeqKey:      "live_segments/seq/next",
 		CursorKey:   "relay/cursor",
 		RelayURL:    cmd.String("relay-url"),
 		Logger:      logger,
-		Metrics:     livestream.NewMetrics(metrics.Registry),
+		Metrics:     live.NewMetrics(metrics.Registry),
 		Verifier:    verifier,
 	})
 	if err != nil {

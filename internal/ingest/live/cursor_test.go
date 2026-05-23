@@ -1,4 +1,4 @@
-package livestream
+package live
 
 import (
 	"testing"

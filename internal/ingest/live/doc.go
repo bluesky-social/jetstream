@@ -1,4 +1,4 @@
-// Package livestream owns the consumer that pumps the upstream
+// package live owns the consumer that pumps the upstream
 // relay's com.atproto.sync.subscribeRepos firehose into a
 // directory of segment files. The package is deliberately generic:
 // it is used during the bootstrap phase to populate
@@ -25,4 +25,4 @@
 // archive as segment.KindCreate carrying the live record bytes
 // (see events.go); downstream consumers can dedupe on
 // (DID, Collection, Rkey, Rev).
-package livestream
+package live

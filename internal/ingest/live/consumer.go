@@ -1,9 +1,9 @@
-// Package livestream: consumer.go owns Consumer, the firehose-to-
+// package live: consumer.go owns Consumer, the firehose-to-
 // segments pump. Open builds the underlying *ingest.Writer with
 // the live-cursor advance hook wired in. Run subscribes to the
 // upstream firehose and pushes events through ConvertEvent into
 // the writer. Close flushes and tears everything down.
-package livestream
+package live
 
 import (
 	"context"
