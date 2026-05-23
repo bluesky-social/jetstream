@@ -8,13 +8,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/crypto"
@@ -59,6 +62,16 @@ func TestServe_BootstrapsAndShutsDownCleanly(t *testing.T) {
 	listReposDone := make(chan struct{})
 	var calls atomic.Int32
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Handle websocket upgrade for subscribeRepos (livestream consumer)
+		if strings.HasSuffix(r.URL.Path, "/com.atproto.sync.subscribeRepos") {
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.CloseNow() }()
+			<-r.Context().Done()
+			return
+		}
 		require.Equal(t, "/xrpc/com.atproto.sync.listRepos", r.URL.Path)
 		idx := int(calls.Add(1)) - 1
 		switch idx {
@@ -101,15 +114,24 @@ func TestServe_BootstrapsAndShutsDownCleanly(t *testing.T) {
 		})
 	}()
 
-	require.Eventually(t, func() bool {
-		_, err := os.Stat(filepath.Join(dataDir, "meta.pebble", "LOCK"))
-		return err == nil
-	}, 5*time.Second, 50*time.Millisecond, "metadata store was never created")
-
+	// Wait for the bootstrap to actually walk the relay's listRepos
+	// pagination. listReposDone is the deterministic signal that
+	// serve has fully wired itself up: HTTP server started, store
+	// opened, backfill goroutine launched, listRepos request reached
+	// our test relay. The previous "stat meta.pebble/LOCK" check was
+	// a no-op because preSeedComplete created that file before serve
+	// even ran.
 	select {
 	case <-listReposDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("bootstrap never drained listRepos pagination")
+		// If serve died early, surface that error rather than
+		// timing out with a generic message.
+		select {
+		case err := <-done:
+			t.Fatalf("serve exited before draining listRepos: %v", err)
+		default:
+			t.Fatal("bootstrap never drained listRepos pagination")
+		}
 	}
 
 	cancel()
@@ -183,4 +205,119 @@ func preSeedComplete(dataDir string, dids []atmos.DID) error {
 		}
 	}
 	return nil
+}
+
+// TestServe_RefusesSteadyStatePhase pins that the server crashes
+// loudly when a data dir already shows phase=steady_state. The merge
+// step is not yet implemented; silently doing nothing would be a
+// silent-fallback failure mode.
+func TestServe_RefusesSteadyStatePhase(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+
+	// Pre-populate phase=steady_state.
+	{
+		s, err := store.Open(dataDir)
+		require.NoError(t, err)
+		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseSteadyState))
+		require.NoError(t, s.Close())
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	err := newApp().Run(ctx, []string{
+		"jetstream",
+		"--log-format=text",
+		"--log-level=warn",
+		"serve",
+		"--addr=127.0.0.1:0",
+		"--debug-addr=127.0.0.1:0",
+		"--data-dir=" + dataDir,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "steady-state phase not yet supported")
+}
+
+// TestServe_WritesBootstrapPhaseOnFreshDir pins the upgrade path:
+// a data dir with no phase key is treated as bootstrap, with the
+// phase key written before any goroutine starts.
+func TestServe_WritesBootstrapPhaseOnFreshDir(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+
+	// listReposHit is closed the first time the backfill goroutine
+	// makes a listRepos request — a much stronger readiness signal
+	// than the pebble LOCK file (LOCK appears the moment store.Open
+	// returns, well before the lifecycle phase write that this test
+	// is actually asserting on).
+	listReposHit := make(chan struct{})
+	var hitOnce sync.Once
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/com.atproto.sync.subscribeRepos") {
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.CloseNow() }()
+			<-r.Context().Done()
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/com.atproto.sync.listRepos") {
+			hitOnce.Do(func() { close(listReposHit) })
+			_, _ = w.Write([]byte(`{"repos":[]}`))
+			return
+		}
+	}))
+	t.Cleanup(relay.Close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- newApp().Run(ctx, []string{
+			"jetstream",
+			"--log-format=text",
+			"--log-level=warn",
+			"serve",
+			"--addr=127.0.0.1:0",
+			"--debug-addr=127.0.0.1:0",
+			"--shutdown-timeout=5s",
+			"--relay-url=" + relay.URL,
+			"--data-dir=" + dataDir,
+		})
+	}()
+
+	// Wait until the backfill goroutine has actually reached the
+	// relay — that proves serve made it past lifecycle.WritePhase
+	// (which runs synchronously before the errgroup goroutines
+	// start) AND past store.Open + ingest.Open + livestream.Open.
+	select {
+	case <-listReposHit:
+	case err := <-done:
+		t.Fatalf("serve exited before reaching the relay: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("backfill goroutine never reached the relay")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve exited with unexpected error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not shut down")
+	}
+
+	// Now that serve has shut down and released the lock, verify the phase.
+	s, err := store.Open(dataDir)
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+	p, err := lifecycle.ReadPhase(s)
+	require.NoError(t, err)
+	require.Equal(t, lifecycle.PhaseBootstrap, p)
 }

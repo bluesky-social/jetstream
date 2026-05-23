@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -31,6 +30,13 @@ type Config struct {
 	// Writer is the active-segment writer used by SegmentHandler. Required.
 	Writer *ingest.Writer
 
+	// The HTTP client to use while fetching repos, talking to the relay, etc.
+	// Should be tuned for bulk repo downloads.
+	HTTPClient *http.Client
+
+	// The identity directory to use while doing backfill.
+	Directory *identity.Directory
+
 	// RelayURL is the upstream relay base URL (e.g. https://bsky.network).
 	RelayURL string
 
@@ -49,17 +55,6 @@ type Config struct {
 // which is reasonable.
 const progressLogInterval = 1_000
 
-// directoryCacheCapacity is the LRU size for the identity cache. The
-// network has ~30M DIDs; caching all of them is wasteful on a
-// bootstrap that will visit each at most a few times. 100k covers
-// any hot working set with plenty of headroom.
-const directoryCacheCapacity = 100_000
-
-// directoryCacheTTL keeps cache entries cheaply reusable for the
-// duration of a backfill without growing stale enough to miss key
-// rotations during the run.
-const directoryCacheTTL = 24 * time.Hour
-
 // Run drives the atmos backfill engine to completion. It blocks until
 // the engine drains or ctx is cancelled. Safe to call multiple times
 // across process restarts: each call constructs a fresh Engine
@@ -70,33 +65,19 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	dir := &identity.Directory{
-		Resolver: &identity.DefaultResolver{
-			HTTPClient: gt.Some(xrpc.NewHTTPClient(30 * time.Second)),
-		},
-		Cache: identity.NewLRUCache(directoryCacheCapacity, directoryCacheTTL),
-	}
-
-	return runWithDirectory(ctx, cfg, xrpc.NewHTTPClient(2*time.Minute), dir)
-}
-
-// runWithDirectory is the production entry point's internal worker.
-// Tests inject a stub resolver via the Directory parameter so we can
-// avoid spinning up a real PLC.
-func runWithDirectory(ctx context.Context, cfg Config, httpClient *http.Client, dir *identity.Directory) error {
 	// Per atmos Options.SyncClient docs: disable xrpc retries because
 	// the engine's retry/backoff loop is the only retry source we
 	// want. Otherwise xrpc and the engine compound retries on
 	// transient 503s, multiplying load against PDSes.
 	xc := &xrpc.Client{
 		Host:       cfg.RelayURL,
-		HTTPClient: gt.Some(httpClient),
+		HTTPClient: gt.Some(cfg.HTTPClient),
 		Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
 	}
 
 	sc := atmossync.NewClient(atmossync.Options{
 		Client:    xc,
-		Directory: gt.Some(dir),
+		Directory: gt.Some(cfg.Directory),
 	})
 
 	st := NewStore(cfg.Store, cfg.Metrics)
@@ -115,8 +96,8 @@ func runWithDirectory(ctx context.Context, cfg Config, httpClient *http.Client, 
 		SyncClient:  sc,
 		Store:       st,
 		Handler:     handler,
-		Directory:   gt.Some(dir),
-		HTTPClient:  gt.Some(httpClient),
+		Directory:   gt.Some(cfg.Directory),
+		HTTPClient:  gt.Some(cfg.HTTPClient),
 		StartCursor: gt.Some(startCursor),
 		OnPageComplete: gt.Some(func(cursor string) error {
 			return SaveListReposCursor(cfg.Store, cursor)
@@ -147,6 +128,12 @@ func (cfg Config) validate() error {
 	}
 	if cfg.Writer == nil {
 		return fmt.Errorf("backfill: Config.Writer is required")
+	}
+	if cfg.HTTPClient == nil {
+		return fmt.Errorf("backfill: Config.HTTPClient is required")
+	}
+	if cfg.Directory == nil {
+		return fmt.Errorf("backfill: Config.Directory is required")
 	}
 	if cfg.RelayURL == "" {
 		return fmt.Errorf("backfill: Config.RelayURL is required")

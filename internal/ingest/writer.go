@@ -15,8 +15,9 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
-// seqNextKey is the pebble key holding the next seq value to allocate.
-// Encoded as 8 little-endian bytes; missing means 0.
+// seqNextKey is the legacy default value for Config.SeqKey. Kept
+// as a constant to anchor the back-compat behavior of fresh data
+// dirs created before SeqKey existed.
 const seqNextKey = "seq/next"
 
 // Writer owns the active segment file and the seq counter. It is
@@ -105,7 +106,7 @@ func Open(cfg Config) (*Writer, error) {
 		w.activeBytes = 0
 	}
 
-	pebbleSeq, err := loadNextSeq(cfg.Store)
+	pebbleSeq, err := loadNextSeq(cfg.Store, cfg.SeqKey)
 	if err != nil {
 		_ = w.active.Close()
 		return nil, err
@@ -116,7 +117,7 @@ func Open(cfg Config) (*Writer, error) {
 		reconciled = maxSeq + 1
 	}
 	if reconciled > pebbleSeq {
-		if err := saveNextSeq(cfg.Store, reconciled); err != nil {
+		if err := saveNextSeq(cfg.Store, cfg.SeqKey, reconciled); err != nil {
 			_ = w.active.Close()
 			return nil, err
 		}
@@ -158,7 +159,7 @@ func (w *Writer) Close() error {
 	if err := w.active.Close(); err != nil {
 		return fmt.Errorf("ingest: close active segment: %w", err)
 	}
-	if err := saveNextSeq(w.cfg.Store, w.nextSeq); err != nil {
+	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
 		return err
 	}
 	return nil
@@ -224,9 +225,16 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 	}
 	w.cfg.Metrics.incBlocksFlushed()
 
-	if err := saveNextSeq(w.cfg.Store, w.nextSeq); err != nil {
+	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
 		span.RecordError(err)
 		return err
+	}
+
+	if w.cfg.OnAfterFlush != nil {
+		if err := w.cfg.OnAfterFlush(ctx); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("ingest: on_after_flush: %w", err)
+		}
 	}
 
 	path := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
@@ -312,32 +320,30 @@ func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
 	return idx, has, nil
 }
 
-// loadNextSeq reads the persisted seq/next counter. A missing key is
-// not an error; it means "fresh data dir" and reads as zero.
-func loadNextSeq(st *store.Store) (uint64, error) {
-	val, closer, err := st.Get([]byte(seqNextKey))
+// loadNextSeq reads the persisted seq/next counter for key. A missing
+// key is not an error; it means "fresh data dir" and reads as zero.
+func loadNextSeq(st *store.Store, key string) (uint64, error) {
+	val, closer, err := st.Get([]byte(key))
 	if errors.Is(err, pebble.ErrNotFound) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("ingest: load %s: %w", seqNextKey, err)
+		return 0, fmt.Errorf("ingest: load %s: %w", key, err)
 	}
 	defer func() { _ = closer.Close() }()
 
 	if len(val) != 8 {
-		return 0, fmt.Errorf("ingest: %s has wrong length %d (want 8)", seqNextKey, len(val))
+		return 0, fmt.Errorf("ingest: %s has wrong length %d (want 8)", key, len(val))
 	}
 	return binary.LittleEndian.Uint64(val), nil
 }
 
-// saveNextSeq durably persists the seq counter via pebble.Sync. The
-// fsync is the durability anchor for the per-block ordering DESIGN.md
-// §3.1.1 calls out.
-func saveNextSeq(st *store.Store, v uint64) error {
+// saveNextSeq durably persists the seq counter for key via pebble.Sync.
+func saveNextSeq(st *store.Store, key string, v uint64) error {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], v)
-	if err := st.Set([]byte(seqNextKey), buf[:], store.SyncWrites); err != nil {
-		return fmt.Errorf("ingest: save %s: %w", seqNextKey, err)
+	if err := st.Set([]byte(key), buf[:], store.SyncWrites); err != nil {
+		return fmt.Errorf("ingest: save %s: %w", key, err)
 	}
 	return nil
 }
