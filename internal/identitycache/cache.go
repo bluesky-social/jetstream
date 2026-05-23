@@ -15,8 +15,7 @@ import (
 // keyPrefix is the pebble key namespace this package owns.
 const keyPrefix = "sync/identity/"
 
-// DefaultTTL matches identity.InMemoryDirectoryTTL.
-const DefaultTTL = 6 * time.Hour
+const DefaultTTL = 24 * time.Hour
 
 // expiryHeaderLen is the inline 8-byte big-endian unix-nano expiry
 // stamp prepended to every cached value. We embed expiry in the value

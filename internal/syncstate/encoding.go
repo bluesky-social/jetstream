@@ -20,7 +20,7 @@ const (
 
 // encodeChainState serializes a sync.ChainState to a compact binary
 // shape. Refuses to encode a zero CID — the StateStore contract
-// returns (nil, nil) for absent state, so an explicit zero-CID save
+// returns (nil, nil) for absent state, since an explicit zero-CID save
 // would be ambiguous on read.
 func encodeChainState(s atmossync.ChainState) ([]byte, error) {
 	if !s.Data.Defined() {

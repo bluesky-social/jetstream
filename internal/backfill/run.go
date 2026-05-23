@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -55,17 +54,6 @@ type Config struct {
 // total, every 1k completions is ~30k log lines for a full backfill,
 // which is reasonable.
 const progressLogInterval = 1_000
-
-// directoryCacheCapacity is the LRU size for the identity cache. The
-// network has ~30M DIDs; caching all of them is wasteful on a
-// bootstrap that will visit each at most a few times. 100k covers
-// any hot working set with plenty of headroom.
-const directoryCacheCapacity = 100_000
-
-// directoryCacheTTL keeps cache entries cheaply reusable for the
-// duration of a backfill without growing stale enough to miss key
-// rotations during the run.
-const directoryCacheTTL = 24 * time.Hour
 
 // Run drives the atmos backfill engine to completion. It blocks until
 // the engine drains or ctx is cancelled. Safe to call multiple times

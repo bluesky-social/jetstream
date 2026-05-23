@@ -53,6 +53,9 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 		return w
 	}
 
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	dir := &identity.Directory{Resolver: &stubResolver{}}
+
 	tests := []struct {
 		name    string
 		build   func(t *testing.T) Config
@@ -61,28 +64,42 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 		{
 			name: "missing Store",
 			build: func(t *testing.T) Config {
-				return Config{Writer: newWriter(t), RelayURL: "x", Logger: logger}
+				return Config{Writer: newWriter(t), HTTPClient: httpClient, Directory: dir, RelayURL: "x", Logger: logger}
 			},
 			errPart: "Config.Store",
 		},
 		{
 			name: "missing Writer",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, RelayURL: "x", Logger: logger}
+				return Config{Store: &store.Store{}, HTTPClient: httpClient, Directory: dir, RelayURL: "x", Logger: logger}
 			},
 			errPart: "Config.Writer",
 		},
 		{
+			name: "missing HTTPClient",
+			build: func(t *testing.T) Config {
+				return Config{Store: &store.Store{}, Writer: newWriter(t), Directory: dir, RelayURL: "x", Logger: logger}
+			},
+			errPart: "Config.HTTPClient",
+		},
+		{
+			name: "missing Directory",
+			build: func(t *testing.T) Config {
+				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, RelayURL: "x", Logger: logger}
+			},
+			errPart: "Config.Directory",
+		},
+		{
 			name: "missing RelayURL",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, Writer: newWriter(t), Logger: logger}
+				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, Directory: dir, Logger: logger}
 			},
 			errPart: "Config.RelayURL",
 		},
 		{
 			name: "missing Logger",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, Writer: newWriter(t), RelayURL: "x"}
+				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, Directory: dir, RelayURL: "x"}
 			},
 			errPart: "Config.Logger",
 		},
@@ -276,12 +293,14 @@ func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.S
 	t.Cleanup(func() { _ = w.Close() })
 
 	cfg := Config{
-		Store:    db,
-		Writer:   w,
-		RelayURL: srv.srv.URL,
-		Logger:   logger,
+		Store:      db,
+		Directory:  dir,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Writer:     w,
+		RelayURL:   srv.srv.URL,
+		Logger:     logger,
 	}
-	return runWithDirectory(ctx, cfg, &http.Client{Timeout: 5 * time.Second}, dir)
+	return Run(ctx, cfg)
 }
 
 // TestRun_HappyPath_DownloadsAllRepos is the wiring smoke test: three
@@ -434,8 +453,15 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	}
 	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
 
-	cfg := Config{Store: db, Writer: w, RelayURL: srv.srv.URL, Logger: logger}
-	require.NoError(t, runWithDirectory(t.Context(), cfg, &http.Client{Timeout: 5 * time.Second}, dir))
+	cfg := Config{
+		Store:      db,
+		Directory:  dir,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Writer:     w,
+		RelayURL:   srv.srv.URL,
+		Logger:     logger,
+	}
+	require.NoError(t, Run(t.Context(), cfg))
 	require.NoError(t, w.Close())
 
 	// At least one fully-flushed event per DID. Each fixture has 1
