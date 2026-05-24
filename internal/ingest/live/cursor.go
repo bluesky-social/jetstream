@@ -19,7 +19,6 @@ import (
 	"fmt"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/cockroachdb/pebble"
 )
 
 const (
@@ -47,7 +46,7 @@ const (
 // data loss).
 func LoadUpstreamCursor(s *store.Store, key string) (int64, error) {
 	val, closer, err := s.Get([]byte(key))
-	if errors.Is(err, pebble.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) {
 		return 0, nil
 	}
 	if err != nil {

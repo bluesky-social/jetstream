@@ -18,7 +18,7 @@ import (
 func validBaseConfig(t *testing.T) Config {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir)
+	st, err := store.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

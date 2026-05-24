@@ -9,6 +9,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
@@ -66,6 +67,14 @@ type Config struct {
 	// BackfillMetrics is consumed by the backfill engine in the
 	// bootstrap phase only. Optional.
 	BackfillMetrics *backfill.Metrics
+
+	// SegmentMetrics is shared by every *ingest.Writer the orchestrator
+	// constructs (the bootstrap-time backfill writer, the bootstrap-time
+	// live consumer's internal writer, and the bootstrap-seal reopen).
+	// Optional. The same instance flows through to live.Config and
+	// ingest.Config so all segment.Writer instances under the
+	// orchestrator share the seal_duration histogram series.
+	SegmentMetrics *segment.Metrics
 }
 
 func (c *Config) validate() error {

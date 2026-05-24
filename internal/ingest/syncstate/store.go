@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
@@ -40,7 +39,7 @@ func hostKey(did atmos.DID) []byte {
 
 func (p *PebbleStateStore) LoadChain(_ context.Context, did atmos.DID) (*atmossync.ChainState, error) {
 	val, closer, err := p.s.Get(chainKey(did))
-	if errors.Is(err, pebble.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) {
 		return nil, nil
 	}
 	if err != nil {
@@ -68,7 +67,7 @@ func (p *PebbleStateStore) SaveChain(_ context.Context, did atmos.DID, state atm
 
 func (p *PebbleStateStore) LoadHosting(_ context.Context, did atmos.DID) (*atmossync.HostingState, error) {
 	val, closer, err := p.s.Get(hostKey(did))
-	if errors.Is(err, pebble.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) {
 		return nil, nil
 	}
 	if err != nil {
@@ -107,7 +106,7 @@ func (p *PebbleStateStore) Delete(_ context.Context, did atmos.DID) error {
 	if err := b.Delete(hostKey(did), nil); err != nil {
 		return fmt.Errorf("syncstate: delete hosting %s: %w", did, err)
 	}
-	if err := b.Commit(store.SyncWrites); err != nil {
+	if err := p.s.Commit(b, store.SyncWrites); err != nil {
 		return fmt.Errorf("syncstate: delete %s: %w", did, err)
 	}
 	return nil

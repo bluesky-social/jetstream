@@ -22,6 +22,11 @@ import (
 // ConvertEvent translates one atmos streaming.Event into zero or
 // more segment.Events. See the per-kind mapping in the spec
 // (§4.3 of the design doc).
+//
+// HOT PATH: must NOT call obs.Observe — invoked once per upstream
+// event (~10k/sec at full firehose load); per-event spans would
+// overwhelm any trace exporter. Per-batch spans live one frame up
+// in processBatchObserved.
 func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
 	switch {
 	case evt.Commit != nil:

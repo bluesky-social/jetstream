@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"time"
 
 	"github.com/jcalabro/gloom"
 )
@@ -45,6 +46,13 @@ type SealResult struct {
 //
 // Seal performs no goroutine work. It is safe to call from any
 // goroutine that already serializes access to this Writer.
+//
+// Seal does not open its own tracing span — it has no ctx parameter
+// to attach to a parent, and a context.Background() span would
+// orphan and lie about parentage. Callers that want a span around
+// the seal (ingest.Writer.rotateLocked, orchestrator.finishBootstrap)
+// already wrap with obs.Observe one frame up. Seal's contribution
+// to observability is the seal_duration_seconds histogram below.
 func (w *Writer) Seal() (SealResult, error) {
 	if w.closed {
 		return SealResult{}, ErrClosed
@@ -52,18 +60,24 @@ func (w *Writer) Seal() (SealResult, error) {
 	if w.stickyErr != nil {
 		return SealResult{}, w.stickyErr
 	}
+	// Capture start *after* the closed/stickyErr early-returns so the
+	// histogram measures real seal work, not no-op rejections. Per
+	// metrics.go: failed seals are not recorded — operators chase
+	// failures through error logs and trace status.
+	start := time.Now()
 	// Flush pending. flushLocked is a no-op if pending is empty.
 	if err := w.flushLocked(); err != nil {
 		return SealResult{}, err
 	}
-	res, err := w.sealAfterFlush()
+	r, err := w.sealAfterFlush()
 	if err != nil {
 		return SealResult{}, err
 	}
+	w.cfg.Metrics.ObserveSeal(start, nil)
 	// Mark the writer closed: Seal is terminal. The underlying file
 	// has already been Close()d by sealAfterFlush.
 	w.closed = true
-	return res, nil
+	return r, nil
 }
 
 // sealAfterFlush walks the active file's frames to gather per-block

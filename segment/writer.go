@@ -38,6 +38,10 @@ type Config struct {
 	// MaxEventsPerBlock triggers a "block full" signal from Append.
 	// Default DefaultMaxEventsPerBlock. Must be >= 1.
 	MaxEventsPerBlock int
+
+	// Metrics is optional; nil disables segment-package metrics
+	// (e.g. seal duration). The zero-value Metrics is a no-op.
+	Metrics *Metrics
 }
 
 func (c Config) validate() error {

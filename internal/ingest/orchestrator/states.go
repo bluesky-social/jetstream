@@ -18,7 +18,6 @@ func (o *Orchestrator) writeMergingPhase() error {
 	o.cfg.Metrics.observeState("write_phase_merging", time.Since(start).Seconds())
 	o.cfg.Metrics.incTransition(lifecycle.PhaseBootstrap, lifecycle.PhaseMerging)
 	o.cfg.Metrics.setPhase(PhaseGaugeMerging)
-	o.cfg.Logger.Info("orchestrator: phase=merging")
 	return nil
 }
 
@@ -32,6 +31,5 @@ func (o *Orchestrator) writeSteadyStatePhase() error {
 	o.cfg.Metrics.observeState("write_phase_steady", time.Since(start).Seconds())
 	o.cfg.Metrics.incTransition(lifecycle.PhaseMerging, lifecycle.PhaseSteadyState)
 	o.cfg.Metrics.setPhase(PhaseGaugeSteadyState)
-	o.cfg.Logger.Info("orchestrator: phase=steady_state")
 	return nil
 }

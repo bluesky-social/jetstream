@@ -146,7 +146,7 @@ func TestServe_BootstrapsAndShutsDownCleanly(t *testing.T) {
 	}
 
 	// Re-open and confirm both DIDs are still at Complete.
-	s, err := store.Open(dataDir)
+	s, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
@@ -171,7 +171,7 @@ func preSeedComplete(dataDir string, dids []atmos.DID) error {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return err
 	}
-	s, err := store.Open(dataDir)
+	s, err := store.Open(dataDir, nil)
 	if err != nil {
 		return err
 	}
@@ -218,7 +218,7 @@ func TestServe_StartsInSteadyStatePhase(t *testing.T) {
 
 	// Pre-populate phase=steady_state.
 	{
-		s, err := store.Open(dataDir)
+		s, err := store.Open(dataDir, nil)
 		require.NoError(t, err)
 		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseSteadyState))
 		require.NoError(t, s.Close())
@@ -280,7 +280,7 @@ func TestServe_StartsInSteadyStatePhase(t *testing.T) {
 	}
 
 	// Phase should still be steady_state.
-	s, err := store.Open(dataDir)
+	s, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 	p, err := lifecycle.ReadPhase(s)
@@ -297,7 +297,7 @@ func TestServe_AdvancesFromMergingToSteadyState(t *testing.T) {
 
 	dataDir := t.TempDir()
 	{
-		s, err := store.Open(dataDir)
+		s, err := store.Open(dataDir, nil)
 		require.NoError(t, err)
 		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseMerging))
 		require.NoError(t, s.Close())
@@ -355,7 +355,7 @@ func TestServe_AdvancesFromMergingToSteadyState(t *testing.T) {
 		t.Fatal("serve did not shut down")
 	}
 
-	s, err := store.Open(dataDir)
+	s, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 	p, err := lifecycle.ReadPhase(s)

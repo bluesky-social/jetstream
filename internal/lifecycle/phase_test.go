@@ -9,7 +9,7 @@ import (
 
 func newTestStore(t *testing.T) *store.Store {
 	t.Helper()
-	st, err := store.Open(t.TempDir())
+	st, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	return st

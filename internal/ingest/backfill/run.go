@@ -12,6 +12,7 @@ import (
 	"net/http"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -49,21 +50,17 @@ type Config struct {
 	Metrics *Metrics
 }
 
-// progressLogInterval bounds how chatty the INFO progress log is. We
-// can revisit this once we have real production data — at ~30M DIDs
-// total, every 1k completions is ~30k log lines for a full backfill,
-// which is reasonable.
-const progressLogInterval = 1_000
-
 // Run drives the atmos backfill engine to completion. It blocks until
 // the engine drains or ctx is cancelled. Safe to call multiple times
 // across process restarts: each call constructs a fresh Engine
 // (atmos engines are single-shot) and resumes by skipping rows
 // already at StatusComplete via Store.Lookup.
-func Run(ctx context.Context, cfg Config) error {
+func Run(ctx context.Context, cfg Config) (retErr error) {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
+	ctx, _, done := obs.Observe(ctx)
+	defer func() { done(retErr) }()
 
 	// Per atmos Options.SyncClient docs: disable xrpc retries because
 	// the engine's retry/backoff loop is the only retry source we
@@ -81,15 +78,15 @@ func Run(ctx context.Context, cfg Config) error {
 	})
 
 	st := NewStore(cfg.Store, cfg.Metrics)
-	handler := NewSegmentHandler(cfg.Writer, cfg.Logger)
-	logger := cfg.Logger
+	handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
+	logger := cfg.Logger.With(slog.String("component", "backfill/run"))
 
 	startCursor, err := LoadListReposCursor(cfg.Store)
 	if err != nil {
 		return fmt.Errorf("backfill: %w", err)
 	}
 	if startCursor != "" {
-		logger.Info("backfill: resuming from saved cursor", "cursor", startCursor)
+		logger.InfoContext(ctx, "resuming from saved cursor", "cursor", startCursor)
 	}
 
 	engine := atmosbackfill.NewEngine(atmosbackfill.Options{
@@ -103,22 +100,20 @@ func Run(ctx context.Context, cfg Config) error {
 			return SaveListReposCursor(cfg.Store, cursor)
 		}),
 		OnError: gt.Some(func(did atmos.DID, err error) {
-			logger.Warn("backfill: repo failed", "did", string(did), "err", err)
+			logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
 		}),
 		OnProgress: gt.Some(func(stats atmosbackfill.Stats) {
-			if stats.Completed%progressLogInterval == 0 {
-				logger.Info("backfill: progress", "completed", stats.Completed)
-			}
+			cfg.Metrics.setProgressCompleted(stats.Completed)
 		}),
 	})
 
-	logger.Info("backfill: starting", "relay", cfg.RelayURL)
+	logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL)
 	if err := engine.Run(ctx); err != nil {
-		logger.Error("backfill: engine returned error", "err", err)
+		logger.ErrorContext(ctx, "engine returned error", "err", err)
 		return fmt.Errorf("backfill: %w", err)
 	}
 
-	logger.Info("backfill: engine drained")
+	logger.InfoContext(ctx, "engine drained")
 	return nil
 }
 

@@ -30,7 +30,7 @@ func TestRun_EndToEnd_BootstrapToSteadyState(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir)
+	st, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

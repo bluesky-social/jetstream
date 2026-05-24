@@ -62,7 +62,7 @@ func cacheKey(did string) []byte {
 // row.
 func (c *PebbleCache) Get(_ context.Context, did string) (*identity.Identity, bool) {
 	val, closer, err := c.s.Get(cacheKey(did))
-	if errors.Is(err, pebble.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) {
 		return nil, false
 	}
 	if err != nil {

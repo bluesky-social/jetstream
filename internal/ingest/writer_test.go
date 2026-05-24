@@ -24,7 +24,7 @@ import (
 func newTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir)
+	st, err := store.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	return st

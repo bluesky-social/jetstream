@@ -19,7 +19,7 @@ import (
 // Store with no metrics.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	db, err := store.Open(t.TempDir())
+	db, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return NewStore(db, nil)

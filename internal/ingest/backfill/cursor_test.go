@@ -12,7 +12,7 @@ import (
 // so these tests don't depend on store_test.go's helper layout.
 func newCursorTestStore(t *testing.T) *store.Store {
 	t.Helper()
-	db, err := store.Open(t.TempDir())
+	db, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return db

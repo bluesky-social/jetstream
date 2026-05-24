@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
 
@@ -76,6 +77,10 @@ type Config struct {
 	// Zero means use ingest defaults.
 	MaxSegmentBytes   int64
 	MaxEventsPerBlock int
+
+	// SegmentMetrics flows through the consumer's internal *ingest.Writer
+	// to every segment.New it makes. Optional.
+	SegmentMetrics *segment.Metrics
 
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time

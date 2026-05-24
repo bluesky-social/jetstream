@@ -3,14 +3,23 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream-v2/internal/obs"
 )
 
 // Orchestrator owns the ingestion-lifecycle state machine. Construct
 // via New; call Run exactly once.
 type Orchestrator struct {
 	cfg Config
+	// logger is cfg.Logger pre-attributed with component=orchestrator
+	// for the orchestrator's own log lines. cfg.Logger itself is left
+	// bare (no component attribute) so child constructors (live.Open,
+	// ingest.Open, backfill.Run) can set their own `component`
+	// without slog stacking duplicate keys (slog appends; it does not
+	// replace).
+	logger *slog.Logger
 }
 
 // New validates cfg and returns an Orchestrator ready to Run.
@@ -18,7 +27,10 @@ func New(cfg Config) (*Orchestrator, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	return &Orchestrator{cfg: cfg}, nil
+	return &Orchestrator{
+		cfg:    cfg,
+		logger: cfg.Logger.With(slog.String("component", "orchestrator")),
+	}, nil
 }
 
 // Run reads the persisted lifecycle phase and dispatches to the
@@ -29,7 +41,10 @@ func New(cfg Config) (*Orchestrator, error) {
 // On a fresh data dir (no phase key), Run treats the data dir as
 // PhaseBootstrap and writes that value before starting any
 // subsystems. This matches the previous cmd/jetstream behavior.
-func (o *Orchestrator) Run(ctx context.Context) error {
+func (o *Orchestrator) Run(ctx context.Context) (retErr error) {
+	ctx, _, done := obs.Observe(ctx)
+	defer func() { done(retErr) }()
+
 	phase, err := lifecycle.ReadPhase(o.cfg.Store)
 	if err != nil {
 		return fmt.Errorf("orchestrator: read phase: %w", err)
@@ -41,7 +56,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		}
 	}
 
-	o.cfg.Logger.Info("orchestrator: starting", "phase", phase)
+	o.logger.InfoContext(ctx, "starting", "phase", phase)
 
 	switch phase {
 	case lifecycle.PhaseBootstrap:

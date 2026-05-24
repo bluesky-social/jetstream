@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"path/filepath"
 	"sync/atomic"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
+	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -42,7 +42,10 @@ import (
 // to the merge case. On any subsystem error before backfill drains,
 // the errgroup cancels both and the error is returned without
 // touching the phase.
-func (o *Orchestrator) runBootstrap(ctx context.Context) error {
+func (o *Orchestrator) runBootstrap(ctx context.Context) (retErr error) {
+	ctx, _, done := obs.Observe(ctx)
+	defer func() { done(retErr) }()
+
 	segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 	liveSegmentsDir := filepath.Join(o.cfg.DataDir, "backfill", "live_segments")
 
@@ -50,8 +53,12 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 	bw, err := ingest.Open(ingest.Config{
 		SegmentsDir: segmentsDir,
 		Store:       o.cfg.Store,
-		Logger:      o.cfg.Logger.With(slog.String("component", "orchestrator/backfill-ingest")),
-		Metrics:     o.cfg.IngestMetrics,
+		// Pass cfg.Logger bare; ingest.Open sets its own
+		// component=ingest/writer attribute. Stacking ours on top
+		// would emit duplicate `component` JSON keys.
+		Logger:         o.cfg.Logger,
+		Metrics:        o.cfg.IngestMetrics,
+		SegmentMetrics: o.cfg.SegmentMetrics,
 	})
 	if err != nil {
 		return fmt.Errorf("orchestrator: open backfill ingest writer: %w", err)
@@ -64,13 +71,15 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 		SeqKey:      live.BootstrapSeqKey,
 		CursorKey:   live.CursorKey,
 		RelayURL:    o.cfg.RelayURL,
-		Logger:      o.cfg.Logger.With(slog.String("component", "orchestrator/bootstrap-live")),
-		Metrics:     o.cfg.LiveMetrics,
-		Verifier:    o.cfg.Verifier,
+		// Bare cfg.Logger; live.Open sets its own component.
+		Logger:         o.cfg.Logger,
+		Metrics:        o.cfg.LiveMetrics,
+		Verifier:       o.cfg.Verifier,
+		SegmentMetrics: o.cfg.SegmentMetrics,
 	})
 	if err != nil {
 		if cerr := bw.Close(); cerr != nil {
-			o.cfg.Logger.Warn("orchestrator: backfill writer close after bootstrap-live open failure", "err", cerr)
+			o.logger.WarnContext(ctx, "backfill writer close after bootstrap-live open failure", "err", cerr)
 		}
 		return fmt.Errorf("orchestrator: open bootstrap-live consumer: %w", err)
 	}
@@ -112,7 +121,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 		// live consumer. The order matters: the phase write is the
 		// only durable signal that backfill has finished, and a crash
 		// after the phase write recovers via PhaseMerging restart.
-		o.cfg.Logger.Info("orchestrator: cutover begin")
+		o.logger.InfoContext(ctx, "cutover begin")
 		if err := o.writeMergingPhase(); err != nil {
 			return err
 		}
@@ -135,7 +144,6 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			if startNs := drainStartUnixNano.Load(); startNs != 0 {
 				o.cfg.Metrics.observeState("drain_bootstrap", time.Since(time.Unix(0, startNs)).Seconds())
 			}
-			o.cfg.Logger.Info("orchestrator: bootstrap consumer drained")
 			return nil
 		}
 		return err
@@ -145,10 +153,10 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 		// Best-effort cleanup. Close errors are logged, not returned,
 		// because the underlying error is what we want surfaced.
 		if cerr := bootstrapLive.Close(); cerr != nil {
-			o.cfg.Logger.Warn("orchestrator: bootstrap-live close after error", "err", cerr)
+			o.logger.WarnContext(ctx, "bootstrap-live close after error", "err", cerr)
 		}
 		if cerr := bw.Close(); cerr != nil {
-			o.cfg.Logger.Warn("orchestrator: backfill writer close after error", "err", cerr)
+			o.logger.WarnContext(ctx, "backfill writer close after error", "err", cerr)
 		}
 		return err
 	}
@@ -157,14 +165,21 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 	// even if an intermediate step fails, then return the first error.
 	// We must reach bw.Close() so its Flush+saveNextSeq run; a leaked
 	// bw also leaks fd/locking on data/segments.
-	return o.finishBootstrap(bootstrapLive, bw, liveSegmentsDir)
+	return o.finishBootstrap(ctx, bootstrapLive, bw, liveSegmentsDir)
 }
 
 // finishBootstrap drives States 3 and 4. Split out so the success
 // path's cleanup pattern is clear and uniform: every resource gets a
 // best-effort termination, the first error is reported, subsequent
 // errors are logged.
-func (o *Orchestrator) finishBootstrap(bootstrapLive *live.Consumer, bw *ingest.Writer, liveSegmentsDir string) (retErr error) {
+//
+// ctx is the parent runBootstrap context (NOT a fresh
+// context.Background); a fresh ctx would orphan finishBootstrap's
+// span from the runBootstrap span tree and break trace lineage.
+func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.Consumer, bw *ingest.Writer, liveSegmentsDir string) (retErr error) {
+	ctx, _, done := obs.Observe(ctx)
+	defer func() { done(retErr) }()
+
 	// State 4 cleanup runs last (LIFO). bw.Close persists nextSeq for
 	// the data/segments directory.
 	defer func() {
@@ -175,11 +190,10 @@ func (o *Orchestrator) finishBootstrap(bootstrapLive *live.Consumer, bw *ingest.
 			if retErr == nil {
 				retErr = fmt.Errorf("orchestrator: close backfill ingest writer: %w", err)
 			} else {
-				o.cfg.Logger.Warn("orchestrator: backfill writer close failed after earlier error", "err", err)
+				o.logger.WarnContext(ctx, "backfill writer close failed after earlier error", "err", err)
 			}
 			return
 		}
-		o.cfg.Logger.Info("orchestrator: backfill writer closed")
 	}()
 
 	// State 3: flush the bootstrap-live consumer and seal its trailing
@@ -201,12 +215,18 @@ func (o *Orchestrator) finishBootstrap(bootstrapLive *live.Consumer, bw *ingest.
 		SegmentsDir: liveSegmentsDir,
 		Store:       o.cfg.Store,
 		SeqKey:      live.BootstrapSeqKey,
-		Logger:      o.cfg.Logger.With(slog.String("component", "orchestrator/bootstrap-seal")),
+		// Bare cfg.Logger; ingest.Open sets its own component.
+		Logger: o.cfg.Logger,
 		// Metrics nil to match the bootstrap-live consumer convention
 		// (live/consumer.go Open): bootstrap-time live writes are not
 		// counted in steady-state ingest counters, and the trailing
 		// seal is a continuation of that lifetime.
 		Metrics: nil,
+		// SegmentMetrics IS shared though — the seal_duration
+		// histogram is a global concern and we want every
+		// segment.Writer in the process recording into the same
+		// series.
+		SegmentMetrics: o.cfg.SegmentMetrics,
 	})
 	if err != nil {
 		return fmt.Errorf("orchestrator: re-open bootstrap-live writer for seal: %w", err)
@@ -215,7 +235,6 @@ func (o *Orchestrator) finishBootstrap(bootstrapLive *live.Consumer, bw *ingest.
 		return fmt.Errorf("orchestrator: seal bootstrap-live segment: %w", err)
 	}
 	o.cfg.Metrics.observeState("seal_bootstrap", time.Since(start).Seconds())
-	o.cfg.Logger.Info("orchestrator: bootstrap segment sealed")
 
 	return nil
 }

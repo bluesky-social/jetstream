@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/jcalabro/gt"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
@@ -91,4 +93,27 @@ func otlpConfigured() bool {
 // keeps span library labels consistent across packages.
 func Tracer(name string) trace.Tracer {
 	return otel.Tracer("jetstream/" + name)
+}
+
+// repoPathPrefix is stripped from gt.CallerInfo.Package so tracer scopes
+// read as "ingest/live" rather than the full import path.
+const repoPathPrefix = "github.com/bluesky-social/jetstream-v2/"
+
+// fallbackTracerName is used when frame inspection produces an
+// unusable label. It is intentionally short so it shows up clearly in
+// trace UIs as "the path that lost provenance".
+const fallbackTracerName = "observe"
+
+// tracerForCallerInfo turns a gt.CallerInfo into the project-scoped
+// tracer for that frame. We trim the repo prefix and a leading
+// "internal/" so a span emitted from
+// github.com/bluesky-social/jetstream-v2/internal/ingest/live lands
+// under jetstream/ingest/live.
+func tracerForCallerInfo(info gt.CallerInfo) trace.Tracer {
+	pkg := strings.TrimPrefix(info.Package, repoPathPrefix)
+	pkg = strings.TrimPrefix(pkg, "internal/")
+	if pkg == "" || pkg == "unknown" {
+		pkg = fallbackTracerName
+	}
+	return Tracer(pkg)
 }

@@ -18,6 +18,7 @@ import (
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/repo"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // SegmentHandler walks each downloaded repo's MST and emits one
@@ -25,9 +26,10 @@ import (
 // two HandleRepo calls overlap for the same DID; ingest.Writer is
 // safe across DIDs.
 type SegmentHandler struct {
-	writer *ingest.Writer
-	logger *slog.Logger
-	now    func() time.Time
+	writer  *ingest.Writer
+	logger  *slog.Logger
+	now     func() time.Time
+	metrics *Metrics
 }
 
 // Compile-time assertion.
@@ -35,7 +37,7 @@ var _ atmosbackfill.Handler = (*SegmentHandler)(nil)
 
 // NewSegmentHandler returns a handler that writes events into writer.
 // nil logger uses slog.Default(); writer is required.
-func NewSegmentHandler(writer *ingest.Writer, logger *slog.Logger) *SegmentHandler {
+func NewSegmentHandler(writer *ingest.Writer, logger *slog.Logger, m *Metrics) *SegmentHandler {
 	if writer == nil {
 		panic("backfill: NewSegmentHandler: writer is required")
 	}
@@ -43,9 +45,10 @@ func NewSegmentHandler(writer *ingest.Writer, logger *slog.Logger) *SegmentHandl
 		logger = slog.Default()
 	}
 	return &SegmentHandler{
-		writer: writer,
-		logger: logger,
-		now:    time.Now,
+		writer:  writer,
+		logger:  logger.With(slog.String("component", "backfill/handler")),
+		now:     time.Now,
+		metrics: m,
 	}
 }
 
@@ -53,9 +56,13 @@ func NewSegmentHandler(writer *ingest.Writer, logger *slog.Logger) *SegmentHandl
 // IndexedAt timestamp is the same for every event in this repo: it
 // is the wall-clock instant at which jetstream observed this repo.
 // Per-record timestamps would imply a false ordering.
-func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit) error {
-	ctx, span := obs.Tracer("backfill").Start(ctx, "backfill.handle_repo")
-	defer span.End()
+func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit) (retErr error) {
+	ctx, span, done := obs.Observe(ctx)
+	defer func() { done(retErr) }()
+
+	span.SetAttributes(attribute.String("did", string(did)))
+	start := time.Now()
+	defer func() { h.metrics.observeHandleRepo(start, retErr) }()
 
 	indexedAt := h.now().UnixMicro()
 
@@ -87,7 +94,7 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 		return nil
 	})
 	if walkErr != nil {
-		span.RecordError(walkErr)
+		retErr = walkErr
 		return walkErr
 	}
 	return nil

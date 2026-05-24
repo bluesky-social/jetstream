@@ -35,7 +35,6 @@ import (
 	"fmt"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/cockroachdb/pebble"
 )
 
 // listReposCursorKey is the pebble key for the persisted listRepos
@@ -48,7 +47,7 @@ const listReposCursorKey = "relay/list_repos_cursor"
 // post-drain page that wrote ""). Errors only on pebble I/O failure.
 func LoadListReposCursor(db *store.Store) (string, error) {
 	val, closer, err := db.Get([]byte(listReposCursorKey))
-	if errors.Is(err, pebble.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) {
 		return "", nil
 	}
 	if err != nil {

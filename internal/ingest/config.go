@@ -59,6 +59,10 @@ type Config struct {
 
 	// Metrics is optional; nil means no /metrics counters incrementing.
 	Metrics *Metrics
+
+	// SegmentMetrics is forwarded to every segment.New call this writer
+	// makes (initial open, post-rotation new active). Optional.
+	SegmentMetrics *segment.Metrics
 }
 
 func (c *Config) validate() error {

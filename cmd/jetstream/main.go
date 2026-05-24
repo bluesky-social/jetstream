@@ -72,6 +72,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
@@ -206,14 +207,22 @@ func serveCommand() *cli.Command {
 }
 
 func runServe(ctx context.Context, cmd *cli.Command) error {
-	logger, err := obs.BuildLoggerFromStrings(os.Stderr, cmd.String("log-level"), cmd.String("log-format"))
+	processLogger, err := obs.BuildLoggerFromStrings(os.Stderr, cmd.String("log-level"), cmd.String("log-format"))
 	if err != nil {
 		return err
 	}
+	// processLogger is the bare per-process logger; downstream
+	// subsystems (orchestrator, server, verifier callback) receive it
+	// AS-IS so each can set its own `component` without slog stacking
+	// duplicate keys (slog.With appends rather than replacing).
+	//
+	// logger is a component=main wrapper for cmd/jetstream's own log
+	// lines.
+	logger := processLogger.With(slog.String("component", "main"))
 	slog.SetDefault(logger)
 
 	info := version.Get()
-	logger.Info("starting jetstream",
+	logger.Info("startup",
 		"version", info.Version,
 		"commit", info.Commit,
 		"built", info.Date,
@@ -227,13 +236,16 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	metrics := obs.NewMetrics()
+	storeMetrics := store.NewMetrics(metrics.Registry)
+	segmentMetrics := segment.NewMetrics(metrics.Registry)
+	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
 
 	dataDir := cmd.String("data-dir")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return fmt.Errorf("serve: create data dir %s: %w", dataDir, err)
 	}
 
-	metaStore, err := store.Open(dataDir)
+	metaStore, err := store.Open(dataDir, storeMetrics)
 	if err != nil {
 		return err
 	}
@@ -267,12 +279,14 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	stateStore := syncstate.New(metaStore)
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
+	verifierLogger := processLogger.With(slog.String("component", "verifier"))
 	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
 		Directory:  directory,
 		StateStore: stateStore,
 		SyncClient: gt.Some(syncClient),
 		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
-			logger.Warn("verifier failure",
+			verifierMetrics.IncFailure(obs.Classify(vErr))
+			verifierLogger.Warn("verification failure",
 				"did", did,
 				"err", vErr,
 			)
@@ -291,17 +305,21 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	// (backfill engine, bootstrap-time live consumer, steady-state
 	// live consumer). cmd/jetstream is no longer phase-aware.
 	orch, err := orchestrator.New(orchestrator.Config{
-		DataDir:         dataDir,
-		Store:           metaStore,
-		RelayURL:        cmd.String("relay-url"),
-		HTTPClient:      xrpcClient.HTTPClient.Val(),
-		Directory:       directory,
-		Verifier:        verifier,
-		Logger:          logger,
+		DataDir:    dataDir,
+		Store:      metaStore,
+		RelayURL:   cmd.String("relay-url"),
+		HTTPClient: xrpcClient.HTTPClient.Val(),
+		Directory:  directory,
+		Verifier:   verifier,
+		// Bare logger; orchestrator.New attaches component=orchestrator
+		// itself, and its children (live, ingest, backfill) attach
+		// their own component on top of the bare parent.
+		Logger:          processLogger,
 		Metrics:         orchestrator.NewMetrics(metrics.Registry),
 		IngestMetrics:   ingest.NewMetrics(metrics.Registry),
 		LiveMetrics:     live.NewMetrics(metrics.Registry),
 		BackfillMetrics: backfill.NewMetrics(metrics.Registry),
+		SegmentMetrics:  segmentMetrics,
 	})
 	if err != nil {
 		return fmt.Errorf("serve: build orchestrator: %w", err)
@@ -311,7 +329,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		PublicAddr:      cmd.String("addr"),
 		DebugAddr:       cmd.String("debug-addr"),
 		ShutdownTimeout: cmd.Duration("shutdown-timeout"),
-	}, logger, metrics)
+	}, processLogger, metrics)
 
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -340,7 +358,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 				if !ok {
 					return nil
 				}
-				logger.Warn("verifier async error", "err", err)
+				verifierLogger.Warn("async error", "err", err)
 			}
 		}
 	})

@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/cockroachdb/pebble"
 )
 
 // Phase names a single jetstream-process lifecycle state.
@@ -40,7 +39,7 @@ const phaseKey = "phase"
 // PRACTICES.md prefer crashing over data corruption.
 func ReadPhase(s *store.Store) (Phase, error) {
 	val, closer, err := s.Get([]byte(phaseKey))
-	if errors.Is(err, pebble.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) {
 		return "", nil
 	}
 	if err != nil {

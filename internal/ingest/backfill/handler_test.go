@@ -21,7 +21,7 @@ import (
 func newTestIngest(t *testing.T) *ingest.Writer {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir)
+	st, err := store.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -62,7 +62,7 @@ func TestSegmentHandler_EmitsOneEventPerRecord(t *testing.T) {
 	w := newTestIngest(t)
 
 	frozen := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
-	h := NewSegmentHandler(w, nil)
+	h := NewSegmentHandler(w, nil, nil)
 	h.now = func() time.Time { return frozen }
 
 	r, commit := buildSingleRecordRepo(t,
@@ -79,7 +79,7 @@ func TestSegmentHandler_EmitsOneEventPerRecord(t *testing.T) {
 // fast-fail invariant.
 func TestSegmentHandler_NilWriterPanics(t *testing.T) {
 	t.Parallel()
-	require.Panics(t, func() { _ = NewSegmentHandler(nil, nil) })
+	require.Panics(t, func() { _ = NewSegmentHandler(nil, nil, nil) })
 }
 
 // TestSegmentHandler_NilLoggerNoPanic guards the wiring: a caller
@@ -88,7 +88,7 @@ func TestSegmentHandler_NilLoggerNoPanic(t *testing.T) {
 	t.Parallel()
 	w := newTestIngest(t)
 	require.NotPanics(t, func() {
-		h := NewSegmentHandler(w, nil)
+		h := NewSegmentHandler(w, nil, nil)
 		require.NotNil(t, h)
 	})
 }

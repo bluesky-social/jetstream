@@ -66,7 +66,7 @@ func NewLogger(w io.Writer, level slog.Level, format LogFormat) *slog.Logger {
 		h = slog.NewTextHandler(w, opts)
 	}
 
-	return slog.New(h)
+	return slog.New(newTraceContextHandler(h))
 }
 
 // BuildLoggerFromStrings parses level and format strings (typically

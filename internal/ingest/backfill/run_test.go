@@ -38,7 +38,7 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 	newWriter := func(t *testing.T) *ingest.Writer {
 		t.Helper()
 		dir := t.TempDir()
-		st, err := store.Open(dir)
+		st, err := store.Open(dir, nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = st.Close() })
 		w, err := ingest.Open(ingest.Config{
@@ -316,7 +316,7 @@ func TestRun_HappyPath_DownloadsAllRepos(t *testing.T) {
 	}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir())
+	db, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -340,7 +340,7 @@ func TestRun_Resume_NoOpAfterCompletion(t *testing.T) {
 	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir())
+	db, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -370,7 +370,7 @@ func TestRun_PersistsCursorAfterDrain(t *testing.T) {
 	}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir())
+	db, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -395,7 +395,7 @@ func TestRun_PassesSavedCursorToRelay(t *testing.T) {
 	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir())
+	db, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -424,7 +424,7 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	srv := newStubServer(t, fixtures)
 
 	dataDir := t.TempDir()
-	db, err := store.Open(dataDir)
+	db, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 

@@ -1,6 +1,11 @@
 package backfill
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"time"
+
+	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 const metricsNamespace = "jetstream"
 const metricsSubsystem = "backfill"
@@ -9,11 +14,13 @@ const metricsSubsystem = "backfill"
 // A nil *Metrics is a valid zero-value: every method is a no-op,
 // which lets tests skip metric registration entirely.
 type Metrics struct {
-	Discovered   prometheus.Counter
-	Completed    prometheus.Counter
-	Failed       prometheus.Counter
-	ActiveFlips  prometheus.Counter
-	OnFailErrors prometheus.Counter
+	Discovered         prometheus.Counter
+	Completed          prometheus.Counter
+	Failed             prometheus.Counter
+	ActiveFlips        prometheus.Counter
+	OnFailErrors       prometheus.Counter
+	HandleRepoDuration prometheus.Histogram
+	ProgressCompleted  prometheus.Gauge
 }
 
 // NewMetrics registers the backfill counters against reg. Pass the
@@ -51,8 +58,22 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "on_fail_store_errors_total",
 			Help: "Number of times Store.OnFail itself failed to persist (data-integrity signal).",
 		}),
+		HandleRepoDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "handle_repo_duration_seconds",
+			Help:    "Duration of SegmentHandler.HandleRepo per repo. Successful repos only — failures are surfaced via error logs and trace status, not the success-time histogram.",
+			Buckets: obs.LatencyBucketsSlow,
+		}),
+		ProgressCompleted: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "progress_completed",
+			Help: "Number of repos the engine has reported complete in the current Run.",
+		}),
 	}
-	reg.MustRegister(m.Discovered, m.Completed, m.Failed, m.ActiveFlips, m.OnFailErrors)
+	reg.MustRegister(
+		m.Discovered, m.Completed, m.Failed, m.ActiveFlips, m.OnFailErrors,
+		m.HandleRepoDuration, m.ProgressCompleted,
+	)
 	return m
 }
 
@@ -86,5 +107,22 @@ func (m *Metrics) incActiveFlips() {
 func (m *Metrics) incOnFailErrors() {
 	if m != nil {
 		m.OnFailErrors.Inc()
+	}
+}
+
+// observeHandleRepo records a successful HandleRepo duration. Failed
+// repos are not recorded — operators chase failures through error
+// logs and trace status, not the success-time histogram. Matches
+// segment.Metrics.ObserveSeal's convention.
+func (m *Metrics) observeHandleRepo(start time.Time, err error) {
+	if m == nil || err != nil {
+		return
+	}
+	m.HandleRepoDuration.Observe(time.Since(start).Seconds())
+}
+
+func (m *Metrics) setProgressCompleted(v int64) {
+	if m != nil {
+		m.ProgressCompleted.Set(float64(v))
 	}
 }

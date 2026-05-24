@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/repo"
@@ -47,7 +46,7 @@ func NewStore(db *store.Store, metrics *Metrics) *Store {
 // how atmos tells the engine to fire OnDiscover.
 func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEntry, error) {
 	val, closer, err := s.db.Get(repoKey(did))
-	if errors.Is(err, pebble.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) {
 		return atmosbackfill.StoreEntry{State: atmosbackfill.StateUnknown}, nil
 	}
 	if err != nil {
@@ -92,7 +91,7 @@ func (s *Store) putRepoStatus(did atmos.DID, rs *RepoStatus) error {
 // decide whether absence is an error in their context.
 func (s *Store) readRepoStatus(did atmos.DID) (*RepoStatus, error) {
 	val, closer, err := s.db.Get(repoKey(did))
-	if errors.Is(err, pebble.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) {
 		return nil, nil
 	}
 	if err != nil {

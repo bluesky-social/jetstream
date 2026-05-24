@@ -1,6 +1,10 @@
 package orchestrator
 
-import "context"
+import (
+	"context"
+
+	"github.com/bluesky-social/jetstream-v2/internal/obs"
+)
 
 // runMerge is the cutover state machine's State 5: compact the
 // throwaway segment files in data/backfill/live_segments/ into
@@ -38,11 +42,13 @@ import "context"
 // in miniature: a long-running compaction must observe ctx.Done()
 // promptly, and pinning that into the stub keeps callers from
 // growing a dependency on "merge always returns immediately".
-func (o *Orchestrator) runMerge(ctx context.Context) error {
-	o.cfg.Logger.Info("orchestrator: merge begin (stub no-op)")
+func (o *Orchestrator) runMerge(ctx context.Context) (retErr error) {
+	ctx, _, done := obs.Observe(ctx)
+	defer func() { done(retErr) }()
+
 	if err := ctx.Err(); err != nil {
+		retErr = err
 		return err
 	}
-	o.cfg.Logger.Info("orchestrator: merge complete")
 	return nil
 }

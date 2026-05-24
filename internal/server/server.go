@@ -69,6 +69,7 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
+	logger = logger.With(slog.String("component", "server"))
 
 	s := &Server{cfg: cfg, logger: logger, metrics: metrics}
 
@@ -151,7 +152,7 @@ func (s *Server) Run(ctx context.Context) error {
 	debugAddr := debugLn.Addr().String()
 	s.debugAddr.Store(&debugAddr)
 
-	s.logger.Info("server listening",
+	s.logger.Info("listening",
 		"public", publicAddr,
 		"debug", debugAddr,
 	)
@@ -169,7 +170,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// between Store(true) and the err-channel branch firing.
 	select {
 	case err := <-errs:
-		s.logger.Error("server failed during startup", "err", err)
+		s.logger.Error("failed during startup", "err", err)
 		_ = s.shutdown()
 		// Drain the second goroutine.
 		<-errs
@@ -185,12 +186,12 @@ func (s *Server) Run(ctx context.Context) error {
 	receivedFromErrs := 0
 	select {
 	case <-ctx.Done():
-		s.logger.Info("server shutdown requested", "timeout", s.cfg.ShutdownTimeout)
+		s.logger.Info("shutdown requested", "timeout", s.cfg.ShutdownTimeout)
 	case err := <-errs:
 		receivedFromErrs = 1
 		// One server failed; treat as fatal and tear the other down.
 		firstErr = err
-		s.logger.Error("server exited unexpectedly", "err", err)
+		s.logger.Error("exited unexpectedly", "err", err)
 	}
 
 	s.ready.Store(false)

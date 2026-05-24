@@ -23,7 +23,7 @@ func TestRunBootstrap_DrainsAndAdvancesPhase(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir)
+	st, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -71,7 +71,7 @@ func TestRunBootstrap_BackfillErrorPropagates(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir)
+	st, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

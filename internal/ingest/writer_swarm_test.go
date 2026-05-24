@@ -43,7 +43,7 @@ func TestWriter_Swarm(t *testing.T) {
 func runOneSwarm(t *testing.T, rng *rand.Rand) {
 	t.Helper()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir)
+	st, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

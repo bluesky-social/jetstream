@@ -24,7 +24,13 @@ import (
 // segment files. Goroutine-safe to construct; Run is a
 // single-producer loop.
 type Consumer struct {
-	cfg    Config
+	cfg Config
+	// logger is cfg.Logger pre-attributed with
+	// component=livestream/consumer for the consumer's own log
+	// lines. cfg.Logger itself is left bare so child constructors
+	// (ingest.Open) can set their own `component` without slog
+	// stacking duplicate keys.
+	logger *slog.Logger
 	writer *ingest.Writer
 
 	// lastUpstream holds the highest upstream seq whose ops have ALL
@@ -48,7 +54,10 @@ func Open(cfg Config) (*Consumer, error) {
 	}
 	cfg.applyDefaults()
 
-	c := &Consumer{cfg: cfg}
+	c := &Consumer{
+		cfg:    cfg,
+		logger: cfg.Logger.With(slog.String("component", "livestream/consumer")),
+	}
 
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       cfg.SegmentsDir,
@@ -56,14 +65,17 @@ func Open(cfg Config) (*Consumer, error) {
 		SeqKey:            cfg.SeqKey,
 		MaxSegmentBytes:   cfg.MaxSegmentBytes,
 		MaxEventsPerBlock: cfg.MaxEventsPerBlock,
-		Logger:            cfg.Logger.With(slog.String("component", "livestream/ingest")),
+		// Bare cfg.Logger; ingest.Open sets its own
+		// component=ingest/writer attribute.
+		Logger: cfg.Logger,
 		// Metrics intentionally nil: per-writer ingest metrics for
 		// the live writer are not registered to avoid colliding with
 		// the backfill writer's series. The livestream-level Metrics
 		// (events received / converted, decode errors, reconnects,
 		// upstream cursor) live in cfg.Metrics.
-		Metrics:      nil,
-		OnAfterFlush: c.onAfterFlush,
+		Metrics:        nil,
+		OnAfterFlush:   c.onAfterFlush,
+		SegmentMetrics: cfg.SegmentMetrics,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("livestream: open writer: %w", err)
@@ -162,7 +174,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 		return fmt.Errorf("livestream: load start cursor: %w", err)
 	}
 
-	c.cfg.Logger.Info("livestream: subscribing",
+	c.logger.InfoContext(ctx, "subscribing",
 		"url", wsURL,
 		"start_cursor", startCursor,
 	)
@@ -186,7 +198,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 		Parallelism: gt.Some(1),
 		OnReconnect: gt.Some(func(attempt int, delay time.Duration) {
 			c.cfg.Metrics.incReconnects()
-			c.cfg.Logger.Warn("livestream: reconnecting",
+			c.logger.WarnContext(ctx, "reconnecting",
 				"attempt", attempt,
 				"delay", delay,
 			)
@@ -199,11 +211,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 	defer func() {
 		if cerr := client.Close(); cerr != nil {
-			c.cfg.Logger.Warn("livestream: client close", "err", cerr)
+			c.logger.WarnContext(ctx, "client close", "err", cerr)
 		}
 	}()
-
-	tracer := obs.Tracer("livestream")
 
 	for batch, err := range client.Events(ctx) {
 		if err != nil {
@@ -212,26 +222,34 @@ func (c *Consumer) Run(ctx context.Context) error {
 			// + err. Log and continue — the next iteration will
 			// either reconnect or yield the next batch.
 			c.cfg.Metrics.incDecodeErrors()
-			c.cfg.Logger.Warn("livestream: stream error", "err", err)
+			c.logger.WarnContext(ctx, "stream error", "err", err)
 			continue
 		}
 
-		batchCtx, span := tracer.Start(ctx, "livestream.batch")
-		if perr := c.processBatch(batchCtx, batch); perr != nil {
-			span.RecordError(perr)
-			span.End()
+		if perr := c.processBatchObserved(ctx, batch); perr != nil {
 			return perr
 		}
-		span.End()
 	}
 
-	c.cfg.Logger.Info("livestream: stopped",
-		"last_upstream_seq", c.lastUpstream.Load(),
-	)
 	return ctx.Err()
 }
 
+// processBatchObserved is a thin Observe wrapper around processBatch.
+// processBatch itself contains a per-event hot loop that must not be
+// span-instrumented; this wrapper provides the per-batch span at
+// the right granularity.
+func (c *Consumer) processBatchObserved(ctx context.Context, batch []streaming.Event) (retErr error) {
+	ctx, _, done := obs.Observe(ctx)
+	defer func() { done(retErr) }()
+	return c.processBatch(ctx, batch)
+}
+
 // processBatch writes one batch of decoded events into the writer.
+//
+// HOT PATH: must NOT call obs.Observe directly — the per-event loop
+// would balloon spans to billions/day at full network scale. The
+// per-batch span lives one frame up in processBatchObserved.
+//
 // Crucially, lastUpstream is updated only AFTER all ops of an event
 // have been Append'd, so a flush triggered mid-event reads the
 // previous fully-buffered upstream seq and the persisted cursor
@@ -251,7 +269,7 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			// learns the kind can resume from this seq. Advancing
 			// here would create a permanent gap in the archive.
 			c.cfg.Metrics.incUnknownEvents()
-			c.cfg.Logger.Warn("livestream: unknown event kind",
+			c.logger.WarnContext(ctx, "unknown event kind",
 				"seq", evt.Seq,
 			)
 			continue
