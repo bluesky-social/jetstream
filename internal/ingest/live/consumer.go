@@ -237,15 +237,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 // processBatch writes one batch of decoded events into the writer.
 // The per-batch span is opened inside this function (NOT the per-event
 // loop below — see HOT PATH note).
-//
-// HOT PATH: the inner per-event loop must NOT call obs.Span — it
-// would balloon spans to billions/day at full network scale. The
-// per-batch span here is the right granularity.
-//
-// Crucially, lastUpstream is updated only AFTER all ops of an event
-// have been Append'd, so a flush triggered mid-event reads the
-// previous fully-buffered upstream seq and the persisted cursor
-// can never get ahead of the durable events.
 func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
 		indexedAt := c.cfg.now().UnixMicro()
