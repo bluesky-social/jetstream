@@ -235,8 +235,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 }
 
 // processBatch writes one batch of decoded events into the writer.
-// The per-batch span is opened inside this function (NOT the per-event
-// loop below — see HOT PATH note).
 func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
 		indexedAt := c.cfg.now().UnixMicro()

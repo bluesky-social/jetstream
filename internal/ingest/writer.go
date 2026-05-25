@@ -218,12 +218,6 @@ func (w *Writer) SealActiveAndClose() error {
 // mutates ev.Seq in place to the allocated value; on error ev.Seq
 // is left untouched so callers can safely retry without observing
 // a phantom allocation. Goroutine-safe.
-//
-// HOT PATH: must NOT call obs.Span — per-event spans would
-// balloon to billions/day at full network scale and overwhelm any
-// trace exporter. Spans live at the per-block (flushAndRotateLocked)
-// and per-rotation (rotateLocked) granularity instead. See
-// internal/obs/observe.go.
 func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
