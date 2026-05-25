@@ -41,7 +41,7 @@ func TestRun_ResumeFromMerging_AdvancesToSteadyState(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseMerging))
+	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseMerging, time.Now().UTC()))
 
 	relay := newFakeRelay(t, nil)
 	verifier := newTestVerifier(t, relay.URL())
@@ -95,7 +95,7 @@ func TestRun_StartsCleanInSteadyState(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState))
+	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
 
 	relay := newFakeRelay(t, nil)
 	verifier := newTestVerifier(t, relay.URL())

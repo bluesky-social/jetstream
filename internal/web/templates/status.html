@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jetstream status</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #666;
+    --bg: #fafafa;
+    --card: #fff;
+    --border: #e0e0e0;
+    --accent: #2860c8;
+    --bar-bg: #eee;
+    --bar-fill: #2860c8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #eee;
+      --muted: #999;
+      --bg: #181818;
+      --card: #222;
+      --border: #333;
+      --accent: #6aa3ff;
+      --bar-bg: #333;
+      --bar-fill: #6aa3ff;
+    }
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    margin: 0; padding: 2rem 1rem;
+    color: var(--fg); background: var(--bg);
+    line-height: 1.5;
+  }
+  main { max-width: 1000px; margin: 0 auto; }
+  h1 { margin: 0 0 0.25rem 0; font-size: 1.75rem; }
+  h2 { margin: 0 0 0.75rem 0; font-size: 1.1rem; color: var(--accent); }
+  .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+  }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  @media (max-width: 700px) {
+    .grid2 { grid-template-columns: 1fr; }
+  }
+  .bar {
+    background: var(--bar-bg);
+    border-radius: 4px;
+    height: 12px;
+    overflow: hidden;
+    margin: 0.25rem 0 0.5rem 0;
+  }
+  .bar > div { background: var(--bar-fill); height: 100%; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+  .cursor {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85em;
+    color: var(--muted);
+    word-break: break-all;
+  }
+  .latest {
+    margin-top: 0.75rem; padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+  }
+  .latest h3 { margin: 0 0 0.5rem 0; font-size: 0.95rem; color: var(--muted); font-weight: 500; }
+</style>
+</head>
+<body>
+<main>
+  <h1>jetstream</h1>
+  <div class="sub">
+    {{.Process.Version}} (commit {{.Process.Commit}})
+    &middot; built {{.Process.BuiltAt}}
+    &middot; uptime {{humanDuration .Process.Uptime}}
+    &middot; generated {{relativeTime .GeneratedAt .Now}}
+  </div>
+
+  <section>
+    <h2>Phase</h2>
+    <dl>
+      <dt>State</dt>
+      <dd>{{if .Phase.Phase}}<code>{{.Phase.Phase}}</code>{{else}}starting{{end}}</dd>
+      <dt>Entered</dt>
+      <dd>
+        {{if .Phase.PhaseEnteredAt.IsZero}}
+          since process start
+        {{else}}
+          {{relativeTime .Phase.PhaseEnteredAt .Now}}
+        {{end}}
+      </dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Backfill</h2>
+    {{if eq .Backfill.TotalDIDs 0}}
+      <p class="sub">Backfill has not started.</p>
+    {{else if .Backfill.ListReposCursor}}
+      <dl>
+        <dt>State</dt>
+        <dd>enumerating repos</dd>
+        <dt>Discovered so far</dt>
+        <dd>{{humanInt .Backfill.TotalDIDs}}</dd>
+        <dt>Backfilled</dt>
+        <dd>{{humanInt .Backfill.Complete}}</dd>
+        <dt>Pending</dt>
+        <dd>{{humanInt .Backfill.Discovered}}</dd>
+        <dt>Failed</dt>
+        <dd>{{humanInt .Backfill.Failed}}</dd>
+        <dt>listRepos cursor</dt>
+        <dd class="cursor">{{.Backfill.ListReposCursor}}</dd>
+      </dl>
+    {{else}}
+      <div class="bar"><div style="width: {{percentString .Backfill.PercentComplete}}"></div></div>
+      <dl>
+        <dt>Progress</dt>
+        <dd>{{printf "%.2f%%" .Backfill.PercentComplete}}
+            ({{humanInt .Backfill.Complete}} / {{humanInt .Backfill.TotalDIDs}} DIDs)</dd>
+        <dt>Discovered</dt>
+        <dd>{{humanInt .Backfill.Discovered}}</dd>
+        <dt>Failed</dt>
+        <dd>{{humanInt .Backfill.Failed}}</dd>
+      </dl>
+    {{end}}
+  </section>
+
+  <section>
+    <h2>Live ingest</h2>
+    <dl>
+      <dt>Upstream cursor</dt>
+      <dd>{{if eq .Live.UpstreamCursor 0}}not yet started{{else}}{{humanInt64 .Live.UpstreamCursor}}{{end}}</dd>
+      <dt>Sequence allocated</dt>
+      <dd>{{humanInt .Live.NextSeq}} events</dd>
+      {{if gt .Live.BootstrapSeq 0}}
+      <dt>Bootstrap-time live seq</dt>
+      <dd>{{humanInt .Live.BootstrapSeq}}</dd>
+      {{end}}
+    </dl>
+  </section>
+
+  <section>
+    <h2>Segments</h2>
+    <div class="grid2">
+      {{template "tree" dict "Stats" .Segments "Now" .Now "Title" "segments/"}}
+      {{template "tree" dict "Stats" .LiveSegs "Now" .Now "Title" "backfill/live_segments/"}}
+    </div>
+  </section>
+
+  <section>
+    <h2>Metadata store</h2>
+    <dl>
+      <dt>On disk</dt>
+      <dd>{{humanBytes .Pebble.DiskBytes}}</dd>
+      {{range $prefix, $count := .Pebble.KeyspaceCounts}}
+      <dt><code>{{$prefix}}</code></dt>
+      <dd>{{humanInt $count}}</dd>
+      {{end}}
+    </dl>
+  </section>
+</main>
+</body>
+</html>
+
+{{define "tree"}}
+<div>
+  <h3 style="margin-top: 0; font-size: 0.95rem; color: var(--muted); font-weight: 500;">{{.Title}}</h3>
+  <dl>
+    <dt>Files</dt>
+    <dd>{{.Stats.SealedCount}} sealed{{if gt .Stats.ActiveCount 0}} + {{.Stats.ActiveCount}} active{{end}}</dd>
+    <dt>Compressed</dt>
+    <dd>{{humanBytes .Stats.CompressedBytes}}</dd>
+    <dt>Uncompressed</dt>
+    <dd>{{humanBytes .Stats.UncompressedBytes}}</dd>
+    {{if not .Stats.OldestMTime.IsZero}}
+    <dt>Oldest</dt>
+    <dd>{{relativeTime .Stats.OldestMTime .Now}}</dd>
+    <dt>Newest</dt>
+    <dd>{{relativeTime .Stats.NewestMTime .Now}}</dd>
+    {{end}}
+  </dl>
+  {{with .Stats.LatestSegment}}
+  <div class="latest">
+    <h3>Latest segment ({{if .Sealed}}sealed{{else}}active{{end}})</h3>
+    <dl>
+      <dt>Index</dt>
+      <dd>{{.Index}}</dd>
+      <dt>Events</dt>
+      <dd>{{humanInt .EventCount}}</dd>
+      <dt>Unique DIDs</dt>
+      <dd>{{humanInt64Cast .UniqueDIDCount}}</dd>
+      <dt>Blocks</dt>
+      <dd>{{humanInt64Cast .BlockCount}}</dd>
+      <dt>Collections</dt>
+      <dd>{{.CollectionCount}}</dd>
+      <dt>Seq range</dt>
+      <dd>[{{humanInt .MinSeq}}, {{humanInt .MaxSeq}}]</dd>
+      {{if not .MinIndexedAt.IsZero}}
+      <dt>Indexed range</dt>
+      <dd>{{.MinIndexedAt.Format "2006-01-02 15:04:05"}}<br>… {{.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>
+      {{end}}
+      <dt>Size</dt>
+      <dd>{{humanBytes .SizeBytes}}</dd>
+    </dl>
+  </div>
+  {{end}}
+</div>
+{{end}}

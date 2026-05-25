@@ -20,7 +20,7 @@ func TestSegmentFilename_BaseFormat(t *testing.T) {
 		{36, "seg_0000000010.jss"},
 	}
 	for _, tc := range tests {
-		require.Equal(t, tc.want, segmentFilename(tc.idx))
+		require.Equal(t, tc.want, SegmentFilename(tc.idx))
 	}
 }
 
@@ -28,7 +28,7 @@ func TestSegmentFilename_BaseFormat(t *testing.T) {
 func TestParseSegmentIndex(t *testing.T) {
 	t.Parallel()
 	for _, idx := range []uint64{0, 1, 35, 36, 1234, 1<<48 - 1} {
-		got, ok := parseSegmentIndex(segmentFilename(idx))
+		got, ok := ParseSegmentIndex(SegmentFilename(idx))
 		require.True(t, ok, "parse %d", idx)
 		require.Equal(t, idx, got)
 	}
@@ -47,7 +47,7 @@ func TestParseSegmentIndex_Rejects(t *testing.T) {
 		"seg_!@#$%^&*().jss",
 	}
 	for _, s := range bad {
-		_, ok := parseSegmentIndex(s)
+		_, ok := ParseSegmentIndex(s)
 		require.False(t, ok, "unexpected accept: %q", s)
 	}
 }

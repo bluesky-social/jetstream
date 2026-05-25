@@ -255,3 +255,36 @@ func mustGet(t *testing.T, url string) string {
 	require.NoError(t, err)
 	return string(body)
 }
+
+func TestPublicHandler_StatusUnwired(t *testing.T) {
+	t.Parallel()
+	base := mountPublic(t, newServer(t))
+
+	resp, err := doGet(t.Context(), base+"/status")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestPublicHandler_StatusWired(t *testing.T) {
+	t.Parallel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	metrics := obs.NewMetrics()
+	srv := New(Config{
+		PublicAddr:      "127.0.0.1:0",
+		DebugAddr:       "127.0.0.1:0",
+		ShutdownTimeout: 5 * time.Second,
+		StatusHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("ok"))
+		}),
+	}, logger, metrics)
+
+	ts := httptest.NewServer(srv.PublicHandler())
+	defer ts.Close()
+
+	resp, err := doGet(t.Context(), ts.URL+"/status")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}

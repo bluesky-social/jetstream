@@ -5,18 +5,16 @@ import (
 	"strings"
 )
 
-// segmentFilenamePrefix and segmentFilenameSuffix bracket the
-// 10-digit base-36 index in seg_<base36>.jss (DESIGN.md §3.4).
 const (
 	segmentFilenamePrefix = "seg_"
 	segmentFilenameSuffix = ".jss"
 	segmentIndexDigits    = 10
 )
 
-// segmentFilename formats idx as the on-disk segment filename.
-// Names sort lexicographically in creation order so a directory
-// scan reproduces the segment manifest.
-func segmentFilename(idx uint64) string {
+// SegmentFilename formats idx as the on-disk segment filename
+// "seg_<10-digit base36>.jss". Names sort lexicographically in
+// creation order so a directory scan reproduces the segment manifest.
+func SegmentFilename(idx uint64) string {
 	enc := strconv.FormatUint(idx, 36)
 	if len(enc) < segmentIndexDigits {
 		enc = strings.Repeat("0", segmentIndexDigits-len(enc)) + enc
@@ -24,10 +22,9 @@ func segmentFilename(idx uint64) string {
 	return segmentFilenamePrefix + enc + segmentFilenameSuffix
 }
 
-// parseSegmentIndex returns the index encoded in name and whether
-// the name has the expected segment shape. Used by Open's directory
-// scan to recover the highest active index.
-func parseSegmentIndex(name string) (uint64, bool) {
+// ParseSegmentIndex returns the index encoded in name and whether the
+// name has the expected segment shape.
+func ParseSegmentIndex(name string) (uint64, bool) {
 	if !strings.HasPrefix(name, segmentFilenamePrefix) {
 		return 0, false
 	}

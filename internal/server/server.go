@@ -39,6 +39,11 @@ type Config struct {
 	// ShutdownTimeout bounds how long graceful shutdown is allowed to take.
 	// After this elapses, in-flight requests are abandoned.
 	ShutdownTimeout time.Duration
+
+	// StatusHandler, if non-nil, is mounted at GET /status and HEAD
+	// /status on the public listener. cmd/jetstream constructs this via
+	// the web package; tests can pass any http.Handler.
+	StatusHandler http.Handler
 }
 
 // Server bundles the public and debug HTTP servers and the readiness flag
@@ -51,6 +56,8 @@ type Server struct {
 
 	srv    *http.Server
 	dbgSrv *http.Server
+
+	statusHandler http.Handler
 
 	// publicAddr and debugAddr hold the bound addresses once Run starts.
 	// They're stored as atomic pointers because they're written by the Run
@@ -71,7 +78,7 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 	}
 	logger = logger.With(slog.String("component", "server"))
 
-	s := &Server{cfg: cfg, logger: logger, metrics: metrics}
+	s := &Server{cfg: cfg, logger: logger, metrics: metrics, statusHandler: cfg.StatusHandler}
 
 	// Timeout policy:
 	//
@@ -255,6 +262,11 @@ func (s *Server) DebugAddr() string {
 func (s *Server) publicMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /{$}", s.metrics.InstrumentHandler("root", http.HandlerFunc(s.handleRoot)))
+	if s.statusHandler != nil {
+		instrumented := s.metrics.InstrumentHandler("status", s.statusHandler)
+		mux.Handle("GET /status", instrumented)
+		mux.Handle("HEAD /status", instrumented)
+	}
 	return mux
 }
 

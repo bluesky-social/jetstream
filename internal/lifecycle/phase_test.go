@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/stretchr/testify/require"
@@ -27,8 +28,9 @@ func TestPhase_RoundTrip(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 
+	now := time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC)
 	for _, p := range []Phase{PhaseBootstrap, PhaseMerging, PhaseSteadyState} {
-		require.NoError(t, WritePhase(st, p))
+		require.NoError(t, WritePhase(st, p, now))
 		got, err := ReadPhase(st)
 		require.NoError(t, err)
 		require.Equal(t, p, got)
@@ -49,7 +51,43 @@ func TestWritePhase_RejectsUnknown(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 
-	err := WritePhase(st, Phase("banana"))
+	err := WritePhase(st, Phase("banana"), time.Now())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "banana")
+}
+
+func TestPhaseEnteredAt_RoundTrip(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+
+	want := time.Date(2026, 5, 25, 12, 0, 0, 123456000, time.UTC)
+	require.NoError(t, WritePhase(st, PhaseBootstrap, want))
+
+	got, err := ReadPhaseEnteredAt(st)
+	require.NoError(t, err)
+	require.True(t, got.Equal(want), "got %s, want %s", got, want)
+}
+
+func TestReadPhaseEnteredAt_Empty(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	got, err := ReadPhaseEnteredAt(st)
+	require.NoError(t, err)
+	require.True(t, got.IsZero())
+}
+
+func TestWritePhase_AtomicWithEnteredAt(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+
+	want := time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, WritePhase(st, PhaseMerging, want))
+
+	gotPhase, err := ReadPhase(st)
+	require.NoError(t, err)
+	require.Equal(t, PhaseMerging, gotPhase)
+
+	gotAt, err := ReadPhaseEnteredAt(st)
+	require.NoError(t, err)
+	require.True(t, gotAt.Equal(want))
 }

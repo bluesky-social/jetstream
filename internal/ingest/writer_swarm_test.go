@@ -91,7 +91,7 @@ func runOneSwarm(t *testing.T, rng *rand.Rand) {
 		if e.IsDir() {
 			continue
 		}
-		if _, ok := parseSegmentIndex(e.Name()); !ok {
+		if _, ok := ParseSegmentIndex(e.Name()); !ok {
 			continue
 		}
 		path := filepath.Join(cfg.SegmentsDir, e.Name())

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
@@ -49,7 +50,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		}
 		if phase == "" {
 			phase = lifecycle.PhaseBootstrap
-			if err := lifecycle.WritePhase(o.cfg.Store, phase); err != nil {
+			if err := lifecycle.WritePhase(o.cfg.Store, phase, time.Now().UTC()); err != nil {
 				return fmt.Errorf("orchestrator: write initial phase: %w", err)
 			}
 		}

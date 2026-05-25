@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 )
@@ -29,14 +30,14 @@ const (
 	PhaseSteadyState Phase = "steady_state"
 )
 
-// phaseKey is the pebble key holding the persisted phase value.
-const phaseKey = "phase"
+const (
+	phaseKey          = "phase"
+	phaseEnteredAtKey = "phase/entered_at"
+)
 
-// ReadPhase returns the persisted phase. An empty value (no key
-// stored) is reported as "" with nil error so callers can decide
-// what to do on a fresh data dir. An unknown value crashes the read
-// rather than silently mapping to a default — DESIGN.md and
-// PRACTICES.md prefer crashing over data corruption.
+// ReadPhase returns the persisted phase. Empty on a fresh data dir.
+// An unknown value crashes the read rather than silently mapping to a
+// default.
 func ReadPhase(s *store.Store) (Phase, error) {
 	val, closer, err := s.Get([]byte(phaseKey))
 	if errors.Is(err, store.ErrNotFound) {
@@ -54,15 +55,45 @@ func ReadPhase(s *store.Store) (Phase, error) {
 	return p, nil
 }
 
-// WritePhase persists p with pebble.Sync. Rejects unknown values so
-// callers cannot accidentally write garbage that ReadPhase will
-// later reject.
-func WritePhase(s *store.Store, p Phase) error {
+// ReadPhaseEnteredAt returns the timestamp at which the current phase
+// was entered. Zero time + nil error means the key isn't present (fresh
+// data dir, or a process that pre-dates this field).
+func ReadPhaseEnteredAt(s *store.Store) (time.Time, error) {
+	val, closer, err := s.Get([]byte(phaseEnteredAtKey))
+	if errors.Is(err, store.ErrNotFound) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("lifecycle: read phase/entered_at: %w", err)
+	}
+	defer func() { _ = closer.Close() }()
+
+	t, err := time.Parse(time.RFC3339Nano, string(val))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("lifecycle: decode phase/entered_at %q: %w", string(val), err)
+	}
+	return t.UTC(), nil
+}
+
+// WritePhase atomically persists p and enteredAt with pebble.Sync.
+// Both keys land together via a single batch commit so a crash cannot
+// leave a phase value paired with the wrong timestamp.
+func WritePhase(s *store.Store, p Phase, enteredAt time.Time) error {
 	if !p.valid() {
 		return fmt.Errorf("lifecycle: refuse to write unrecognized phase %q", string(p))
 	}
-	if err := s.Set([]byte(phaseKey), []byte(p), store.SyncWrites); err != nil {
-		return fmt.Errorf("lifecycle: write phase: %w", err)
+	b := s.NewBatch()
+	defer func() { _ = b.Close() }()
+
+	if err := b.Set([]byte(phaseKey), []byte(p), nil); err != nil {
+		return fmt.Errorf("lifecycle: stage phase: %w", err)
+	}
+	tsBytes := []byte(enteredAt.UTC().Format(time.RFC3339Nano))
+	if err := b.Set([]byte(phaseEnteredAtKey), tsBytes, nil); err != nil {
+		return fmt.Errorf("lifecycle: stage phase/entered_at: %w", err)
+	}
+	if err := s.Commit(b, store.SyncWrites); err != nil {
+		return fmt.Errorf("lifecycle: commit phase write: %w", err)
 	}
 	return nil
 }

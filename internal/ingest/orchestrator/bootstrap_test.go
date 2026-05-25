@@ -27,7 +27,7 @@ func TestRunBootstrap_DrainsAndAdvancesPhase(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseBootstrap))
+	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseBootstrap, time.Now().UTC()))
 
 	relay := newFakeRelay(t, nil) // empty repo list => backfill drains immediately
 	verifier := newTestVerifier(t, relay.URL())
@@ -75,7 +75,7 @@ func TestRunBootstrap_BackfillErrorPropagates(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseBootstrap))
+	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseBootstrap, time.Now().UTC()))
 
 	// Point at a closed listener so listRepos fails fast.
 	const unreachable = "http://127.0.0.1:1" // port 1 is reserved/unused

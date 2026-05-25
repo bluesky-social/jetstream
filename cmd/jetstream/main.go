@@ -70,8 +70,10 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
+	"github.com/bluesky-social/jetstream-v2/internal/status"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/bluesky-social/jetstream-v2/internal/web"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
@@ -255,6 +257,22 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
+	statusCollector, err := status.New(status.Options{
+		Store:   metaStore,
+		DataDir: dataDir,
+	})
+	if err != nil {
+		return fmt.Errorf("serve: build status collector: %w", err)
+	}
+
+	statusHandler, err := web.New(web.Options{
+		Snapshotter: statusCollector,
+		Logger:      processLogger,
+	})
+	if err != nil {
+		return fmt.Errorf("serve: build status handler: %w", err)
+	}
+
 	// Verifier setup (shared across phases). The verifier itself is
 	// owned by the orchestrator's per-phase live consumers, but we
 	// construct it here because its async-error drain is a sibling
@@ -329,6 +347,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		PublicAddr:      cmd.String("addr"),
 		DebugAddr:       cmd.String("debug-addr"),
 		ShutdownTimeout: cmd.Duration("shutdown-timeout"),
+		StatusHandler:   statusHandler,
 	}, processLogger, metrics)
 
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)

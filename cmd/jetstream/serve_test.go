@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -220,7 +222,7 @@ func TestServe_StartsInSteadyStatePhase(t *testing.T) {
 	{
 		s, err := store.Open(dataDir, nil)
 		require.NoError(t, err)
-		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseSteadyState))
+		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseSteadyState, time.Now().UTC()))
 		require.NoError(t, s.Close())
 	}
 
@@ -299,7 +301,7 @@ func TestServe_AdvancesFromMergingToSteadyState(t *testing.T) {
 	{
 		s, err := store.Open(dataDir, nil)
 		require.NoError(t, err)
-		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseMerging))
+		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseMerging, time.Now().UTC()))
 		require.NoError(t, s.Close())
 	}
 
@@ -361,4 +363,106 @@ func TestServe_AdvancesFromMergingToSteadyState(t *testing.T) {
 	p, err := lifecycle.ReadPhase(s)
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseSteadyState, p)
+}
+
+func TestServe_StatusEndpoint(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	// Pre-bind a free port for the public listener so the test knows
+	// where to hit /status without parsing logs.
+	lc := net.ListenConfig{}
+	publicLn, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	publicAddr := publicLn.Addr().String()
+	require.NoError(t, publicLn.Close())
+
+	// Minimal relay stub — listRepos returns an empty page so backfill
+	// drains immediately, and subscribeRepos blocks until cancellation.
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/com.atproto.sync.subscribeRepos") {
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.CloseNow() }()
+			<-r.Context().Done()
+			return
+		}
+		// All other requests (listRepos): empty page → drains immediately.
+		_ = json.NewEncoder(w).Encode(struct {
+			Cursor string `json:"cursor,omitempty"`
+			Repos  []any  `json:"repos"`
+		}{})
+	}))
+	t.Cleanup(relay.Close)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- newApp().Run(ctx, []string{
+			"jetstream",
+			"--log-format=text",
+			"--log-level=warn",
+			"serve",
+			"--addr=" + publicAddr,
+			"--debug-addr=127.0.0.1:0",
+			"--shutdown-timeout=5s",
+			"--relay-url=" + relay.URL,
+			"--data-dir=" + dataDir,
+		})
+	}()
+
+	// Poll /status until it answers 200 or we time out. The endpoint
+	// is mounted before listenerless work starts, so a couple hundred
+	// ms is plenty even on a slow CI box.
+	url := "http://" + publicAddr + "/status"
+	deadline := time.Now().Add(5 * time.Second)
+	var resp *http.Response
+	client := &http.Client{Timeout: 2 * time.Second}
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		require.NoError(t, err)
+		resp, err = client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+			resp = nil
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("serve exited before /status came up: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	require.NotNil(t, resp, "/status never returned 200")
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "text/html; charset=utf-8", resp.Header.Get("Content-Type"))
+	require.Contains(t, resp.Header.Get("Cache-Control"), "max-age=")
+	require.NotEmpty(t, resp.Header.Get("X-Status-Generated-At"))
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	bodyStr := string(body)
+	require.Contains(t, bodyStr, "jetstream")
+	require.Contains(t, bodyStr, "Phase")
+	require.Contains(t, bodyStr, "Backfill")
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve exited with unexpected error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not shut down within deadline")
+	}
 }

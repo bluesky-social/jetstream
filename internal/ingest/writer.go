@@ -61,7 +61,7 @@ func Open(cfg Config) (*Writer, error) {
 	var foundEvents bool
 
 	if hasExisting {
-		path := filepath.Join(cfg.SegmentsDir, segmentFilename(idx))
+		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(idx))
 		seg, segErr := segment.New(segment.Config{
 			Path:              path,
 			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
@@ -84,7 +84,7 @@ func Open(cfg Config) (*Writer, error) {
 			}
 		case errors.Is(segErr, segment.ErrSegmentSealed):
 			w.activeIdx = idx + 1
-			path = filepath.Join(cfg.SegmentsDir, segmentFilename(w.activeIdx))
+			path = filepath.Join(cfg.SegmentsDir, SegmentFilename(w.activeIdx))
 			seg, segErr = segment.New(segment.Config{
 				Path:              path,
 				MaxEventsPerBlock: cfg.MaxEventsPerBlock,
@@ -99,7 +99,7 @@ func Open(cfg Config) (*Writer, error) {
 			return nil, fmt.Errorf("ingest: open existing %s: %w", path, segErr)
 		}
 	} else {
-		path := filepath.Join(cfg.SegmentsDir, segmentFilename(0))
+		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(0))
 		seg, segErr := segment.New(segment.Config{
 			Path:              path,
 			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
@@ -280,7 +280,7 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 			}
 		}
 
-		path := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
+		path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))
 		info, statErr := os.Stat(path)
 		if statErr != nil {
 			return fmt.Errorf("ingest: stat active segment: %w", statErr)
@@ -309,7 +309,7 @@ func (w *Writer) rotateLocked(ctx context.Context) error {
 		w.activeIdx++
 		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("active_idx", int64(w.activeIdx)))
 
-		nextPath := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
+		nextPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))
 		next, err := segment.New(segment.Config{
 			Path:              nextPath,
 			MaxEventsPerBlock: w.cfg.MaxEventsPerBlock,
@@ -357,7 +357,7 @@ func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
 		if e.IsDir() {
 			continue
 		}
-		i, ok := parseSegmentIndex(e.Name())
+		i, ok := ParseSegmentIndex(e.Name())
 		if !ok {
 			continue
 		}
@@ -372,19 +372,8 @@ func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
 // loadNextSeq reads the persisted seq/next counter for key. A missing
 // key is not an error; it means "fresh data dir" and reads as zero.
 func loadNextSeq(st *store.Store, key string) (uint64, error) {
-	val, closer, err := st.Get([]byte(key))
-	if errors.Is(err, store.ErrNotFound) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("ingest: load %s: %w", key, err)
-	}
-	defer func() { _ = closer.Close() }()
-
-	if len(val) != 8 {
-		return 0, fmt.Errorf("ingest: %s has wrong length %d (want 8)", key, len(val))
-	}
-	return binary.LittleEndian.Uint64(val), nil
+	v, _, err := st.GetUint64LE(key)
+	return v, err
 }
 
 // saveNextSeq durably persists the seq counter for key via pebble.Sync.

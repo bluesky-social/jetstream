@@ -12,7 +12,7 @@ import (
 // at the merge step.
 func (o *Orchestrator) writeMergingPhase() error {
 	start := time.Now()
-	if err := lifecycle.WritePhase(o.cfg.Store, lifecycle.PhaseMerging); err != nil {
+	if err := lifecycle.WritePhase(o.cfg.Store, lifecycle.PhaseMerging, start.UTC()); err != nil {
 		return fmt.Errorf("orchestrator: write phase=merging: %w", err)
 	}
 	o.cfg.Metrics.observeState("write_phase_merging", time.Since(start).Seconds())
@@ -25,7 +25,7 @@ func (o *Orchestrator) writeMergingPhase() error {
 // nil, the data dir is durably in PhaseSteadyState.
 func (o *Orchestrator) writeSteadyStatePhase() error {
 	start := time.Now()
-	if err := lifecycle.WritePhase(o.cfg.Store, lifecycle.PhaseSteadyState); err != nil {
+	if err := lifecycle.WritePhase(o.cfg.Store, lifecycle.PhaseSteadyState, start.UTC()); err != nil {
 		return fmt.Errorf("orchestrator: write phase=steady_state: %w", err)
 	}
 	o.cfg.Metrics.observeState("write_phase_steady", time.Since(start).Seconds())

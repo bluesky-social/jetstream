@@ -1,0 +1,249 @@
+package status_test
+
+import (
+	"context"
+	"encoding/binary"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
+	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream-v2/internal/status"
+	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/repo"
+	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCollect_FreshDataDir(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		TTL:     30 * time.Second,
+		Now:     func() time.Time { return time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC) },
+	})
+	require.NoError(t, err)
+
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, snap)
+
+	// Empty data dir: no segments, no phase, no cursors.
+	require.Equal(t, "", string(snap.Phase.Phase))
+	require.True(t, snap.Phase.PhaseEnteredAt.IsZero())
+	require.Equal(t, status.BackfillStats{}, snap.Backfill)
+	require.Equal(t, status.LiveStats{}, snap.Live)
+	require.Equal(t, 0, snap.Segments.SealedCount+snap.Segments.ActiveCount)
+	require.Equal(t, 0, snap.LiveSegs.SealedCount+snap.LiveSegs.ActiveCount)
+	require.Equal(t, filepath.Join(dataDir, "segments"), snap.Segments.Dir)
+	require.Equal(t, filepath.Join(dataDir, "backfill", "live_segments"), snap.LiveSegs.Dir)
+}
+
+func TestCollect_CacheReusesPointer(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC)
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		TTL:     30 * time.Second,
+		Now:     func() time.Time { return now },
+	})
+	require.NoError(t, err)
+
+	a, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+	b, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Same(t, a, b, "cached snapshot pointer should be reused")
+}
+
+func TestCollect_CacheExpiresAfterTTL(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var mu sync.Mutex
+	now := time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC)
+	clockFn := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		TTL:     30 * time.Second,
+		Now:     clockFn,
+	})
+	require.NoError(t, err)
+
+	a, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	// Advance the clock past TTL; the next call should build fresh.
+	mu.Lock()
+	now = now.Add(31 * time.Second)
+	mu.Unlock()
+
+	b, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.NotSame(t, a, b, "snapshot pointer should change after TTL")
+}
+
+func TestCollect_ConcurrentCallsCollapse(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		TTL:     30 * time.Second,
+	})
+	require.NoError(t, err)
+
+	const N = 64
+	var wg sync.WaitGroup
+	results := make([]*status.Snapshot, N)
+	wg.Add(N)
+	for i := range N {
+		go func() {
+			defer wg.Done()
+			snap, err := c.Snapshot(context.Background())
+			require.NoError(t, err)
+			results[i] = snap
+		}()
+	}
+	wg.Wait()
+
+	for i := 1; i < N; i++ {
+		require.Same(t, results[0], results[i])
+	}
+}
+
+func TestCollect_PhaseAndEnteredAt(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	enteredAt := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, enteredAt))
+
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		Now:     func() time.Time { return enteredAt.Add(24 * time.Hour) },
+	})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, lifecycle.PhaseSteadyState, snap.Phase.Phase)
+	require.True(t, snap.Phase.PhaseEnteredAt.Equal(enteredAt))
+}
+
+func TestCollect_BackfillCounts(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	bs := backfill.NewStore(st, nil)
+	ctx := context.Background()
+
+	for i := range 5 {
+		did := atmos.DID("did:plc:disc" + string(rune('a'+i)))
+		require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	}
+	for i := range 3 {
+		did := atmos.DID("did:plc:done" + string(rune('a'+i)))
+		require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+		require.NoError(t, bs.OnComplete(ctx, did, &repo.Commit{Rev: "abcdef"}))
+	}
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(ctx)
+	require.NoError(t, err)
+
+	require.Equal(t, uint64(8), snap.Backfill.TotalDIDs)
+	require.Equal(t, uint64(5), snap.Backfill.Discovered)
+	require.Equal(t, uint64(3), snap.Backfill.Complete)
+	require.Equal(t, uint64(0), snap.Backfill.Failed)
+	require.InDelta(t, 37.5, snap.Backfill.PercentComplete, 0.001)
+}
+
+func TestCollect_LiveCursors(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	require.NoError(t, live.SaveUpstreamCursor(st, live.CursorKey, 1234567))
+
+	var seqBuf [8]byte
+	binary.LittleEndian.PutUint64(seqBuf[:], 4242)
+	require.NoError(t, st.Set([]byte(live.SteadySeqKey), seqBuf[:], store.SyncWrites))
+	binary.LittleEndian.PutUint64(seqBuf[:], 1111)
+	require.NoError(t, st.Set([]byte(live.BootstrapSeqKey), seqBuf[:], store.SyncWrites))
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, int64(1234567), snap.Live.UpstreamCursor)
+	require.Equal(t, uint64(4242), snap.Live.NextSeq)
+	require.Equal(t, uint64(1111), snap.Live.BootstrapSeq)
+}
+
+func TestCollect_PebbleKeyspaces(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	require.NoError(t, st.Set([]byte("repo/a"), []byte("x"), store.SyncWrites))
+	require.NoError(t, st.Set([]byte("repo/b"), []byte("x"), store.SyncWrites))
+	require.NoError(t, st.Set([]byte("sync/chain/a"), []byte("x"), store.SyncWrites))
+	require.NoError(t, st.Set([]byte("sync/host/a"), []byte("x"), store.SyncWrites))
+	require.NoError(t, st.Set([]byte("relay/other"), []byte("x"), store.SyncWrites))
+	require.NoError(t, st.Set([]byte("sync/identity/a"), []byte("x"), store.SyncWrites))
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, uint64(2), snap.Pebble.KeyspaceCounts["repo/"])
+	require.Equal(t, uint64(1), snap.Pebble.KeyspaceCounts["sync/chain/"])
+	require.Equal(t, uint64(1), snap.Pebble.KeyspaceCounts["sync/host/"])
+	require.Equal(t, uint64(1), snap.Pebble.KeyspaceCounts["relay/"])
+	_, hasIdentity := snap.Pebble.KeyspaceCounts["sync/identity/"]
+	require.False(t, hasIdentity, "sync/identity/ must not be exposed")
+}
