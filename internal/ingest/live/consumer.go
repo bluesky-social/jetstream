@@ -33,14 +33,28 @@ type Consumer struct {
 	logger *slog.Logger
 	writer *ingest.Writer
 
-	// lastUpstream holds the highest upstream seq whose ops have ALL
-	// been buffered into the active segment via writer.Append. It is
-	// read by the OnAfterFlush hook to advance relay/cursor.
-	// atomic.Int64 because OnAfterFlush is invoked from the writer's
-	// internal goroutine (the caller of Append, but the writer holds
-	// the mutex during the hook); making it atomic future-proofs us
-	// for any later refactor that decouples them.
+	// lastUpstream is the highest upstream seq witnessed by
+	// processBatch. Under atmos's default Parallelism>1 the seqs in
+	// a single batch are in completion order, not seq order, so we
+	// take a max here. This is the value persisted to relay/cursor
+	// when no streaming.Client is attached yet (test paths that
+	// drive processBatch directly, or the very first Close before
+	// the client has yielded any events).
+	//
+	// In Run, we install `client` below and prefer client.Cursor()
+	// over lastUpstream, because atmos's watermark is the only
+	// safe-to-persist value: it stays behind any seq still being
+	// verified in another worker. Persisting lastUpstream from
+	// inside Run would risk skipping a still-in-flight smaller seq
+	// across a crash, dropping it from the archive permanently.
 	lastUpstream atomic.Int64
+
+	// client is set once at the top of Run after NewClient succeeds,
+	// and consulted by onAfterFlush and Close to read the
+	// watermark-correct cursor. nil before Run starts, after a Run
+	// failure that never reached client construction, and in tests
+	// that exercise processBatch in isolation.
+	client atomic.Pointer[streaming.Client]
 
 	closeMu sync.Mutex
 	closed  bool
@@ -104,7 +118,7 @@ func (c *Consumer) Close() error {
 	// The writer.Close → segment.Close → flushLocked does not invoke
 	// OnAfterFlush (that's only called during Append's full-block
 	// path). Persist the final cursor explicitly.
-	cur := c.lastUpstream.Load()
+	cur := c.cursorValue()
 	if cur > 0 {
 		if err := SaveUpstreamCursor(c.cfg.Store, c.cfg.CursorKey, cur); err != nil {
 			return fmt.Errorf("livestream: close: save cursor: %w", err)
@@ -112,6 +126,18 @@ func (c *Consumer) Close() error {
 		c.cfg.Metrics.setUpstreamCursor(cur)
 	}
 	return nil
+}
+
+// cursorValue returns the safe-to-persist upstream cursor: atmos's
+// watermark when a streaming.Client is attached, falling back to
+// lastUpstream otherwise (tests + early shutdown before any events
+// flow). The watermark is always <= the highest seq we've buffered,
+// so persisting it can never skip a still-in-flight smaller seq.
+func (c *Consumer) cursorValue() int64 {
+	if cl := c.client.Load(); cl != nil {
+		return cl.Cursor()
+	}
+	return c.lastUpstream.Load()
 }
 
 // LastUpstreamSeq returns the highest upstream seq whose ops have
@@ -126,13 +152,13 @@ func (c *Consumer) LastUpstreamSeq() int64 {
 }
 
 // onAfterFlush is the ingest.Writer hook that runs after every
-// block flush. Persists the highest fully-buffered upstream seq
-// to relay/cursor with pebble.Sync. The placement of
-// lastUpstream.Store in Run guarantees the value read here is
-// always less than or equal to the latest durable event in the
-// just-flushed block (DESIGN.md §3.1.1).
+// block flush. Persists atmos's safe watermark cursor to
+// relay/cursor with pebble.Sync. The watermark is the smallest
+// in-flight seq minus one (or the highest yielded seq when
+// nothing is in flight); persisting it can never skip a
+// still-being-verified smaller seq across a crash.
 func (c *Consumer) onAfterFlush(ctx context.Context) error {
-	cur := c.lastUpstream.Load()
+	cur := c.cursorValue()
 	if cur == 0 {
 		// Block flushed before any upstream event was fully
 		// processed (only possible during very early startup if
@@ -187,15 +213,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 		// that doesn't survive restart. cmd/jetstream constructs ours with
 		// a pebble-backed StateStore + identity cache.
 		Verifier: gt.Some(c.cfg.Verifier),
-		// Parallelism=1 preserves atmos v0.0.16's strict cross-DID
-		// seq ordering. atmos v0.1.0's default of 32 dispatches events
-		// across goroutines per DID and reorders cross-DID events at
-		// the consumer. The archive's per-DID ordering invariant
-		// (DESIGN.md §3.4) holds either way, but several existing
-		// tests assert seq order across DIDs in a single batch.
-		// We can revisit higher parallelism in a follow-up after
-		// measuring real-world throughput.
-		Parallelism: gt.Some(1),
 		OnReconnect: gt.Some(func(attempt int, delay time.Duration) {
 			c.cfg.Metrics.incReconnects()
 			c.logger.WarnContext(ctx, "reconnecting",
@@ -209,6 +226,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("livestream: new client: %w", err)
 	}
+	c.client.Store(client)
 	defer func() {
 		if cerr := client.Close(); cerr != nil {
 			c.logger.WarnContext(ctx, "client close", "err", cerr)
@@ -246,10 +264,18 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			switch {
 			case errors.Is(err, ErrUnknownEventKind):
 				// Forward-compat hole: a future relay variant we don't
-				// know how to archive. Count it, log it, and crucially
-				// LEAVE lastUpstream WHERE IT IS so a later build that
-				// learns the kind can resume from this seq. Advancing
-				// here would create a permanent gap in the archive.
+				// know how to archive. Count and log; the cursor we
+				// persist to relay/cursor comes from atmos's
+				// watermark, which advances past unknown kinds either
+				// way. A later build that learns this kind will
+				// re-fetch from cursor and any events at-or-after the
+				// last persisted watermark — under Parallelism>1 the
+				// watermark trails the highest yielded seq, so most
+				// near-real-time unknowns are still recoverable on
+				// restart, but events that fall behind the watermark
+				// before a restart are unreachable. Acceptable trade
+				// for cross-DID throughput; revisit if the unknown-
+				// event rate ever becomes non-trivial.
 				c.cfg.Metrics.incUnknownEvents()
 				c.logger.WarnContext(ctx, "unknown event kind",
 					"seq", evt.Seq,
@@ -269,9 +295,19 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				c.cfg.Metrics.incEventsConverted()
 			}
 
-			// Only AFTER every op for this upstream event is buffered.
+			// Track the highest seq we've witnessed. Under
+			// Parallelism>1 the seqs in this batch are in
+			// completion order, so we max rather than store
+			// blindly. lastUpstream is informational; the
+			// cursor we persist comes from cursorValue() which
+			// prefers atmos's watermark.
 			if evt.Seq > 0 {
-				c.lastUpstream.Store(evt.Seq)
+				for {
+					prev := c.lastUpstream.Load()
+					if evt.Seq <= prev || c.lastUpstream.CompareAndSwap(prev, evt.Seq) {
+						break
+					}
+				}
 			}
 		}
 
