@@ -51,7 +51,7 @@ type SealResult struct {
 // to attach to a parent, and a context.Background() span would
 // orphan and lie about parentage. Callers that want a span around
 // the seal (ingest.Writer.rotateLocked, orchestrator.finishBootstrap)
-// already wrap with obs.Observe one frame up. Seal's contribution
+// already wrap with obs.Span one frame up. Seal's contribution
 // to observability is the seal_duration_seconds histogram below.
 func (w *Writer) Seal() (SealResult, error) {
 	if w.closed {

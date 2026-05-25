@@ -28,40 +28,39 @@ import (
 // defaults; the upstream firehose resumes from the bootstrap-time
 // consumer's last persisted cursor and at-least-once delivery
 // covers the at-most-one-block overlap.
-func (o *Orchestrator) runSteadyState(ctx context.Context) (retErr error) {
-	ctx, _, done := obs.Observe(ctx)
-	defer func() { done(retErr) }()
+func (o *Orchestrator) runSteadyState(ctx context.Context) error {
+	return obs.Span(ctx, func(ctx context.Context) error {
+		// Set the phase gauge before any I/O. On the resume-from-
+		// PhaseSteadyState path Run dispatches here directly without
+		// going through writeSteadyStatePhase, so this is the only place
+		// the gauge gets set on that path.
+		o.cfg.Metrics.setPhase(PhaseGaugeSteadyState)
 
-	// Set the phase gauge before any I/O. On the resume-from-
-	// PhaseSteadyState path Run dispatches here directly without
-	// going through writeSteadyStatePhase, so this is the only place
-	// the gauge gets set on that path.
-	o.cfg.Metrics.setPhase(PhaseGaugeSteadyState)
+		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 
-	segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
-
-	c, err := live.Open(live.Config{
-		SegmentsDir: segmentsDir,
-		Store:       o.cfg.Store,
-		SeqKey:      live.SteadySeqKey,
-		CursorKey:   live.CursorKey,
-		RelayURL:    o.cfg.RelayURL,
-		// Bare cfg.Logger; live.Open sets its own component.
-		Logger:         o.cfg.Logger,
-		Metrics:        o.cfg.LiveMetrics,
-		Verifier:       o.cfg.Verifier,
-		SegmentMetrics: o.cfg.SegmentMetrics,
-	})
-	if err != nil {
-		return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)
-	}
-	defer func() {
-		if cerr := c.Close(); cerr != nil {
-			o.logger.ErrorContext(ctx, "close steady-state live consumer", "err", cerr)
+		c, err := live.Open(live.Config{
+			SegmentsDir: segmentsDir,
+			Store:       o.cfg.Store,
+			SeqKey:      live.SteadySeqKey,
+			CursorKey:   live.CursorKey,
+			RelayURL:    o.cfg.RelayURL,
+			// Bare cfg.Logger; live.Open sets its own component.
+			Logger:         o.cfg.Logger,
+			Metrics:        o.cfg.LiveMetrics,
+			Verifier:       o.cfg.Verifier,
+			SegmentMetrics: o.cfg.SegmentMetrics,
+		})
+		if err != nil {
+			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)
 		}
-	}()
+		defer func() {
+			if cerr := c.Close(); cerr != nil {
+				o.logger.ErrorContext(ctx, "close steady-state live consumer", "err", cerr)
+			}
+		}()
 
-	o.logger.InfoContext(ctx, "steady-state consumer running")
+		o.logger.InfoContext(ctx, "steady-state consumer running")
 
-	return c.Run(ctx)
+		return c.Run(ctx)
+	})
 }

@@ -3,7 +3,6 @@ package obs_test
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
@@ -27,10 +26,10 @@ func installRecorder(t *testing.T) *tracetest.SpanRecorder {
 	return rec
 }
 
-func observeHappyPath(ctx context.Context) error {
-	_, _, done := obs.Observe(ctx)
-	done(nil)
-	return nil
+func spanHappyPath(ctx context.Context) error {
+	return obs.Span(ctx, func(_ context.Context) error {
+		return nil
+	})
 }
 
 // These tests cannot run in parallel: installRecorder mutates the
@@ -38,100 +37,106 @@ func observeHappyPath(ctx context.Context) error {
 // and steal each other's recorded spans.
 
 //nolint:paralleltest // mutates global TracerProvider via installRecorder
-func TestObserve_HappyPathSetsOk(t *testing.T) {
+func TestSpan_HappyPathSetsOk(t *testing.T) {
 	rec := installRecorder(t)
-	require.NoError(t, observeHappyPath(context.Background()))
+	require.NoError(t, spanHappyPath(context.Background()))
 
 	spans := rec.Ended()
 	require.Len(t, spans, 1)
 	span := spans[0]
-	require.Equal(t, "observeHappyPath", span.Name())
+	require.Equal(t, "spanHappyPath", span.Name())
 	require.Equal(t, codes.Ok, span.Status().Code)
 }
 
-func observeErrorPath(ctx context.Context) error {
-	_, _, done := obs.Observe(ctx)
-	err := errors.New("boom")
-	done(err)
-	return err
+func spanErrorPath(ctx context.Context) error {
+	return obs.Span(ctx, func(_ context.Context) error {
+		return errors.New("boom")
+	})
 }
 
 //nolint:paralleltest // mutates global TracerProvider via installRecorder
-func TestObserve_ErrorPathSetsErrorAndRecords(t *testing.T) {
+func TestSpan_ErrorPathSetsErrorAndRecords(t *testing.T) {
 	rec := installRecorder(t)
-	_ = observeErrorPath(context.Background())
+	require.Error(t, spanErrorPath(context.Background()))
 
 	spans := rec.Ended()
 	require.Len(t, spans, 1)
 	span := spans[0]
-	require.Equal(t, "observeErrorPath", span.Name())
+	require.Equal(t, "spanErrorPath", span.Name())
 	require.Equal(t, codes.Error, span.Status().Code)
 	require.NotEmpty(t, span.Events(), "RecordError should attach an exception event")
 }
 
-func observeContextCanceled(ctx context.Context) {
-	_, _, done := obs.Observe(ctx)
-	done(context.Canceled)
+func spanContextCanceled(ctx context.Context) error {
+	return obs.Span(ctx, func(_ context.Context) error {
+		return context.Canceled
+	})
 }
 
 // Per spec section 5: context.Canceled is treated as a real error so
 // operators see it in span status.
 //
 //nolint:paralleltest // mutates global TracerProvider via installRecorder
-func TestObserve_ContextCanceledIsError(t *testing.T) {
+func TestSpan_ContextCanceledIsError(t *testing.T) {
 	rec := installRecorder(t)
-	observeContextCanceled(context.Background())
+	require.ErrorIs(t, spanContextCanceled(context.Background()), context.Canceled)
 	require.Equal(t, codes.Error, rec.Ended()[0].Status().Code)
 }
 
-func observeIdempotent(ctx context.Context) {
-	_, _, done := obs.Observe(ctx)
-	done(nil)
-	done(errors.New("would be wrong"))
-}
-
 //nolint:paralleltest // mutates global TracerProvider via installRecorder
-func TestObserve_DoneIsIdempotent(t *testing.T) {
+func TestSpan_TracerScopeFromCallerPackage(t *testing.T) {
 	rec := installRecorder(t)
-	observeIdempotent(context.Background())
-	spans := rec.Ended()
-	require.Len(t, spans, 1, "second done() must not re-end the span")
-	require.Equal(t, codes.Ok, spans[0].Status().Code, "second done() must not flip status")
-}
-
-//nolint:paralleltest // mutates global TracerProvider via installRecorder
-func TestObserve_TracerScopeFromCallerPackage(t *testing.T) {
-	rec := installRecorder(t)
-	require.NoError(t, observeHappyPath(context.Background()))
+	require.NoError(t, spanHappyPath(context.Background()))
 	spans := rec.Ended()
 	require.Len(t, spans, 1)
 	require.Equal(t, "jetstream/obs_test", spans[0].InstrumentationScope().Name)
 }
 
 //nolint:paralleltest // Mutates global TracerProvider.
-func TestObserve_TracerScopeFromForeignPackage(t *testing.T) {
+func TestSpan_TracerScopeFromForeignPackage(t *testing.T) {
 	rec := installRecorder(t)
-	observe_innertest.Inner(context.Background())
+	require.NoError(t, observe_innertest.Inner(context.Background()))
 	spans := rec.Ended()
 	require.Len(t, spans, 1)
 	require.Equal(t, "jetstream/obs/observe_innertest", spans[0].InstrumentationScope().Name)
 }
 
-//nolint:paralleltest // Mutates global TracerProvider.
-func TestObserve_DoneIsConcurrencySafe(t *testing.T) {
-	rec := installRecorder(t)
-	_, _, done := obs.Observe(context.Background())
+func spanReturnsValue(ctx context.Context) (int, error) {
+	return obs.Span1(ctx, func(_ context.Context) (int, error) {
+		return 42, nil
+	})
+}
 
-	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			done(nil)
-		}()
-	}
-	wg.Wait()
+//nolint:paralleltest // mutates global TracerProvider via installRecorder
+func TestSpan1_ReturnsValueAndSetsOk(t *testing.T) {
+	rec := installRecorder(t)
+	v, err := spanReturnsValue(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 42, v)
 
 	spans := rec.Ended()
-	require.Len(t, spans, 1, "concurrent done() must end the span exactly once")
+	require.Len(t, spans, 1)
+	require.Equal(t, "spanReturnsValue", spans[0].Name())
+	require.Equal(t, codes.Ok, spans[0].Status().Code)
+}
+
+func spanReturnsValueErr(ctx context.Context) (string, error) {
+	return obs.Span1(ctx, func(_ context.Context) (string, error) {
+		return "partial", errors.New("oops")
+	})
+}
+
+// Span1 returns the value alongside the error unmodified, even on the
+// error path — the tracing wrapper must not swallow either.
+//
+//nolint:paralleltest // mutates global TracerProvider via installRecorder
+func TestSpan1_ErrorPathReturnsValueAndError(t *testing.T) {
+	rec := installRecorder(t)
+	v, err := spanReturnsValueErr(context.Background())
+	require.Error(t, err)
+	require.Equal(t, "partial", v)
+
+	spans := rec.Ended()
+	require.Len(t, spans, 1)
+	require.Equal(t, codes.Error, spans[0].Status().Code)
 }

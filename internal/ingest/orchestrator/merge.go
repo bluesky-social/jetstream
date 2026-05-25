@@ -42,13 +42,11 @@ import (
 // in miniature: a long-running compaction must observe ctx.Done()
 // promptly, and pinning that into the stub keeps callers from
 // growing a dependency on "merge always returns immediately".
-func (o *Orchestrator) runMerge(ctx context.Context) (retErr error) {
-	ctx, _, done := obs.Observe(ctx)
-	defer func() { done(retErr) }()
-
-	if err := ctx.Err(); err != nil {
-		retErr = err
-		return err
-	}
-	return nil
+func (o *Orchestrator) runMerge(ctx context.Context) error {
+	return obs.Span(ctx, func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return nil
+	})
 }

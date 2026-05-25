@@ -19,6 +19,7 @@ import (
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/repo"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // SegmentHandler walks each downloaded repo's MST and emits one
@@ -56,48 +57,42 @@ func NewSegmentHandler(writer *ingest.Writer, logger *slog.Logger, m *Metrics) *
 // IndexedAt timestamp is the same for every event in this repo: it
 // is the wall-clock instant at which jetstream observed this repo.
 // Per-record timestamps would imply a false ordering.
-func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit) (retErr error) {
-	ctx, span, done := obs.Observe(ctx)
-	defer func() { done(retErr) }()
+func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit) error {
+	return obs.Span(ctx, func(ctx context.Context) (retErr error) {
+		trace.SpanFromContext(ctx).SetAttributes(attribute.String("did", string(did)))
+		start := time.Now()
+		defer func() { h.metrics.observeHandleRepo(start, retErr) }()
 
-	span.SetAttributes(attribute.String("did", string(did)))
-	start := time.Now()
-	defer func() { h.metrics.observeHandleRepo(start, retErr) }()
+		indexedAt := h.now().UnixMicro()
 
-	indexedAt := h.now().UnixMicro()
+		return r.Tree.Walk(func(key string, cid cbor.CID) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			collection, rkey, err := splitMSTKey(key)
+			if err != nil {
+				return fmt.Errorf("backfill: did=%s: %w", did, err)
+			}
+			payload, err := r.Store.GetBlock(cid)
+			if err != nil {
+				return fmt.Errorf("backfill: did=%s get block %s/%s: %w", did, collection, rkey, err)
+			}
 
-	walkErr := r.Tree.Walk(func(key string, cid cbor.CID) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		collection, rkey, err := splitMSTKey(key)
-		if err != nil {
-			return fmt.Errorf("backfill: did=%s: %w", did, err)
-		}
-		payload, err := r.Store.GetBlock(cid)
-		if err != nil {
-			return fmt.Errorf("backfill: did=%s get block %s/%s: %w", did, collection, rkey, err)
-		}
-
-		ev := segment.Event{
-			IndexedAt:  indexedAt,
-			Kind:       segment.KindCreate,
-			DID:        string(did),
-			Collection: collection,
-			Rkey:       rkey,
-			Rev:        commit.Rev,
-			Payload:    payload,
-		}
-		if err := h.writer.Append(ctx, &ev); err != nil {
-			return fmt.Errorf("backfill: did=%s append %s/%s: %w", did, collection, rkey, err)
-		}
-		return nil
+			ev := segment.Event{
+				IndexedAt:  indexedAt,
+				Kind:       segment.KindCreate,
+				DID:        string(did),
+				Collection: collection,
+				Rkey:       rkey,
+				Rev:        commit.Rev,
+				Payload:    payload,
+			}
+			if err := h.writer.Append(ctx, &ev); err != nil {
+				return fmt.Errorf("backfill: did=%s append %s/%s: %w", did, collection, rkey, err)
+			}
+			return nil
+		})
 	})
-	if walkErr != nil {
-		retErr = walkErr
-		return walkErr
-	}
-	return nil
 }
 
 // splitMSTKey splits "collection/rkey" into its parts. The MST

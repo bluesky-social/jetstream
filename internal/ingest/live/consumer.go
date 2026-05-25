@@ -226,7 +226,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 			continue
 		}
 
-		if perr := c.processBatchObserved(ctx, batch); perr != nil {
+		if perr := c.processBatch(ctx, batch); perr != nil {
 			return perr
 		}
 	}
@@ -234,64 +234,58 @@ func (c *Consumer) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// processBatchObserved is a thin Observe wrapper around processBatch.
-// processBatch itself contains a per-event hot loop that must not be
-// span-instrumented; this wrapper provides the per-batch span at
-// the right granularity.
-func (c *Consumer) processBatchObserved(ctx context.Context, batch []streaming.Event) (retErr error) {
-	ctx, _, done := obs.Observe(ctx)
-	defer func() { done(retErr) }()
-	return c.processBatch(ctx, batch)
-}
-
 // processBatch writes one batch of decoded events into the writer.
+// The per-batch span is opened inside this function (NOT the per-event
+// loop below — see HOT PATH note).
 //
-// HOT PATH: must NOT call obs.Observe directly — the per-event loop
+// HOT PATH: the inner per-event loop must NOT call obs.Span — it
 // would balloon spans to billions/day at full network scale. The
-// per-batch span lives one frame up in processBatchObserved.
+// per-batch span here is the right granularity.
 //
 // Crucially, lastUpstream is updated only AFTER all ops of an event
 // have been Append'd, so a flush triggered mid-event reads the
 // previous fully-buffered upstream seq and the persisted cursor
 // can never get ahead of the durable events.
 func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) error {
-	indexedAt := c.cfg.now().UnixMicro()
+	return obs.Span(ctx, func(ctx context.Context) error {
+		indexedAt := c.cfg.now().UnixMicro()
 
-	for _, evt := range batch {
-		c.cfg.Metrics.incEventsReceived()
+		for _, evt := range batch {
+			c.cfg.Metrics.incEventsReceived()
 
-		segEvts, err := ConvertEvent(evt, indexedAt)
-		switch {
-		case errors.Is(err, ErrUnknownEventKind):
-			// Forward-compat hole: a future relay variant we don't
-			// know how to archive. Count it, log it, and crucially
-			// LEAVE lastUpstream WHERE IT IS so a later build that
-			// learns the kind can resume from this seq. Advancing
-			// here would create a permanent gap in the archive.
-			c.cfg.Metrics.incUnknownEvents()
-			c.logger.WarnContext(ctx, "unknown event kind",
-				"seq", evt.Seq,
-			)
-			continue
-		case err != nil:
-			c.cfg.Metrics.incDecodeErrors()
-			// Bad shape from upstream is a data-integrity issue;
-			// we surface it rather than silently dropping events.
-			return fmt.Errorf("livestream: convert: %w", err)
-		}
-
-		for i := range segEvts {
-			if err := c.writer.Append(ctx, &segEvts[i]); err != nil {
-				return fmt.Errorf("livestream: append: %w", err)
+			segEvts, err := ConvertEvent(evt, indexedAt)
+			switch {
+			case errors.Is(err, ErrUnknownEventKind):
+				// Forward-compat hole: a future relay variant we don't
+				// know how to archive. Count it, log it, and crucially
+				// LEAVE lastUpstream WHERE IT IS so a later build that
+				// learns the kind can resume from this seq. Advancing
+				// here would create a permanent gap in the archive.
+				c.cfg.Metrics.incUnknownEvents()
+				c.logger.WarnContext(ctx, "unknown event kind",
+					"seq", evt.Seq,
+				)
+				continue
+			case err != nil:
+				c.cfg.Metrics.incDecodeErrors()
+				// Bad shape from upstream is a data-integrity issue;
+				// we surface it rather than silently dropping events.
+				return fmt.Errorf("livestream: convert: %w", err)
 			}
-			c.cfg.Metrics.incEventsConverted()
+
+			for i := range segEvts {
+				if err := c.writer.Append(ctx, &segEvts[i]); err != nil {
+					return fmt.Errorf("livestream: append: %w", err)
+				}
+				c.cfg.Metrics.incEventsConverted()
+			}
+
+			// Only AFTER every op for this upstream event is buffered.
+			if evt.Seq > 0 {
+				c.lastUpstream.Store(evt.Seq)
+			}
 		}
 
-		// Only AFTER every op for this upstream event is buffered.
-		if evt.Seq > 0 {
-			c.lastUpstream.Store(evt.Seq)
-		}
-	}
-
-	return nil
+		return nil
+	})
 }

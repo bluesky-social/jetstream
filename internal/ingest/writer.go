@@ -14,6 +14,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // seqNextKey is the legacy default value for Config.SeqKey. Kept
@@ -218,7 +219,7 @@ func (w *Writer) SealActiveAndClose() error {
 // is left untouched so callers can safely retry without observing
 // a phantom allocation. Goroutine-safe.
 //
-// HOT PATH: must NOT call obs.Observe — per-event spans would
+// HOT PATH: must NOT call obs.Span — per-event spans would
 // balloon to billions/day at full network scale and overwhelm any
 // trace exporter. Spans live at the per-block (flushAndRotateLocked)
 // and per-rotation (rotateLocked) granularity instead. See
@@ -268,81 +269,69 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 // Spans are emitted at the block-flush and rotation granularity
 // (~one per 4096 events / one per ~256MB respectively); per-Append
 // spans would balloon to ~1B/day at full network scale.
-func (w *Writer) flushAndRotateLocked(ctx context.Context) (retErr error) {
-	ctx, _, done := obs.Observe(ctx)
-	defer func() { done(retErr) }()
-
-	if err := w.active.Flush(); err != nil {
-		retErr = err
-		return fmt.Errorf("ingest: flush block: %w", err)
-	}
-	w.cfg.Metrics.incBlocksFlushed()
-
-	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
-		retErr = err
-		return err
-	}
-
-	if w.cfg.OnAfterFlush != nil {
-		if err := w.cfg.OnAfterFlush(ctx); err != nil {
-			retErr = err
-			return fmt.Errorf("ingest: on_after_flush: %w", err)
+func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
+	return obs.Span(ctx, func(ctx context.Context) error {
+		if err := w.active.Flush(); err != nil {
+			return fmt.Errorf("ingest: flush block: %w", err)
 		}
-	}
+		w.cfg.Metrics.incBlocksFlushed()
 
-	path := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
-	info, statErr := os.Stat(path)
-	if statErr != nil {
-		retErr = statErr
-		return fmt.Errorf("ingest: stat active segment: %w", retErr)
-	}
-	w.activeBytes = info.Size() - int64(segment.ReservedHeaderBytes)
-	w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
+		if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+			return err
+		}
 
-	if w.activeBytes < w.cfg.MaxSegmentBytes {
-		return nil
-	}
+		if w.cfg.OnAfterFlush != nil {
+			if err := w.cfg.OnAfterFlush(ctx); err != nil {
+				return fmt.Errorf("ingest: on_after_flush: %w", err)
+			}
+		}
 
-	if err := w.rotateLocked(ctx); err != nil {
-		retErr = err
-		return err
-	}
-	return nil
+		path := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return fmt.Errorf("ingest: stat active segment: %w", statErr)
+		}
+		w.activeBytes = info.Size() - int64(segment.ReservedHeaderBytes)
+		w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
+
+		if w.activeBytes < w.cfg.MaxSegmentBytes {
+			return nil
+		}
+
+		return w.rotateLocked(ctx)
+	})
 }
 
 // rotateLocked seals the active segment and opens the next one. The
 // caller MUST hold w.mu. Split out from flushAndRotateLocked so its
 // span (rotateLocked) is a clear child rather than buried inside the
 // parent.
-func (w *Writer) rotateLocked(ctx context.Context) (retErr error) {
-	ctx, span, done := obs.Observe(ctx)
-	defer func() { done(retErr) }()
+func (w *Writer) rotateLocked(ctx context.Context) error {
+	return obs.Span(ctx, func(ctx context.Context) error {
+		if _, err := w.active.Seal(); err != nil {
+			return fmt.Errorf("ingest: seal segment %d: %w", w.activeIdx, err)
+		}
 
-	if _, err := w.active.Seal(); err != nil {
-		retErr = err
-		return fmt.Errorf("ingest: seal segment %d: %w", w.activeIdx, err)
-	}
+		w.activeIdx++
+		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("active_idx", int64(w.activeIdx)))
 
-	w.activeIdx++
-	span.SetAttributes(attribute.Int64("active_idx", int64(w.activeIdx)))
+		nextPath := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
+		next, err := segment.New(segment.Config{
+			Path:              nextPath,
+			MaxEventsPerBlock: w.cfg.MaxEventsPerBlock,
+			Metrics:           w.cfg.SegmentMetrics,
+		})
+		if err != nil {
+			return fmt.Errorf("ingest: open new active segment %s: %w", nextPath, err)
+		}
+		w.active = next
+		w.activeBytes = 0
+		w.cfg.Metrics.setActiveSegBytes(0)
+		w.cfg.Metrics.incSegmentsRotated()
 
-	nextPath := filepath.Join(w.cfg.SegmentsDir, segmentFilename(w.activeIdx))
-	next, err := segment.New(segment.Config{
-		Path:              nextPath,
-		MaxEventsPerBlock: w.cfg.MaxEventsPerBlock,
-		Metrics:           w.cfg.SegmentMetrics,
+		w.cfg.Logger.InfoContext(ctx, "rotated segment", "new_index", w.activeIdx)
+		return nil
 	})
-	if err != nil {
-		retErr = err
-		return fmt.Errorf("ingest: open new active segment %s: %w", nextPath, err)
-	}
-	w.active = next
-	w.activeBytes = 0
-	w.cfg.Metrics.setActiveSegBytes(0)
-	w.cfg.Metrics.incSegmentsRotated()
-
-	w.cfg.Logger.InfoContext(ctx, "rotated segment", "new_index", w.activeIdx)
-	return nil
 }
 
 // NextSeq returns the next seq value the writer will allocate.

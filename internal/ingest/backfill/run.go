@@ -55,66 +55,66 @@ type Config struct {
 // across process restarts: each call constructs a fresh Engine
 // (atmos engines are single-shot) and resumes by skipping rows
 // already at StatusComplete via Store.Lookup.
-func Run(ctx context.Context, cfg Config) (retErr error) {
-	if err := cfg.validate(); err != nil {
-		return err
-	}
-	ctx, _, done := obs.Observe(ctx)
-	defer func() { done(retErr) }()
+func Run(ctx context.Context, cfg Config) error {
+	return obs.Span(ctx, func(ctx context.Context) error {
+		if err := cfg.validate(); err != nil {
+			return err
+		}
 
-	// Per atmos Options.SyncClient docs: disable xrpc retries because
-	// the engine's retry/backoff loop is the only retry source we
-	// want. Otherwise xrpc and the engine compound retries on
-	// transient 503s, multiplying load against PDSes.
-	xc := &xrpc.Client{
-		Host:       cfg.RelayURL,
-		HTTPClient: gt.Some(cfg.HTTPClient),
-		Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
-	}
+		// Per atmos Options.SyncClient docs: disable xrpc retries because
+		// the engine's retry/backoff loop is the only retry source we
+		// want. Otherwise xrpc and the engine compound retries on
+		// transient 503s, multiplying load against PDSes.
+		xc := &xrpc.Client{
+			Host:       cfg.RelayURL,
+			HTTPClient: gt.Some(cfg.HTTPClient),
+			Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+		}
 
-	sc := atmossync.NewClient(atmossync.Options{
-		Client:    xc,
-		Directory: gt.Some(cfg.Directory),
+		sc := atmossync.NewClient(atmossync.Options{
+			Client:    xc,
+			Directory: gt.Some(cfg.Directory),
+		})
+
+		st := NewStore(cfg.Store, cfg.Metrics)
+		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
+		logger := cfg.Logger.With(slog.String("component", "backfill/run"))
+
+		startCursor, err := LoadListReposCursor(cfg.Store)
+		if err != nil {
+			return fmt.Errorf("backfill: %w", err)
+		}
+		if startCursor != "" {
+			logger.InfoContext(ctx, "resuming from saved cursor", "cursor", startCursor)
+		}
+
+		engine := atmosbackfill.NewEngine(atmosbackfill.Options{
+			SyncClient:  sc,
+			Store:       st,
+			Handler:     handler,
+			Directory:   gt.Some(cfg.Directory),
+			HTTPClient:  gt.Some(cfg.HTTPClient),
+			StartCursor: gt.Some(startCursor),
+			OnPageComplete: gt.Some(func(cursor string) error {
+				return SaveListReposCursor(cfg.Store, cursor)
+			}),
+			OnError: gt.Some(func(did atmos.DID, err error) {
+				logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
+			}),
+			OnProgress: gt.Some(func(stats atmosbackfill.Stats) {
+				cfg.Metrics.setProgressCompleted(stats.Completed)
+			}),
+		})
+
+		logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL)
+		if err := engine.Run(ctx); err != nil {
+			logger.ErrorContext(ctx, "engine returned error", "err", err)
+			return fmt.Errorf("backfill: %w", err)
+		}
+
+		logger.InfoContext(ctx, "engine drained")
+		return nil
 	})
-
-	st := NewStore(cfg.Store, cfg.Metrics)
-	handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
-	logger := cfg.Logger.With(slog.String("component", "backfill/run"))
-
-	startCursor, err := LoadListReposCursor(cfg.Store)
-	if err != nil {
-		return fmt.Errorf("backfill: %w", err)
-	}
-	if startCursor != "" {
-		logger.InfoContext(ctx, "resuming from saved cursor", "cursor", startCursor)
-	}
-
-	engine := atmosbackfill.NewEngine(atmosbackfill.Options{
-		SyncClient:  sc,
-		Store:       st,
-		Handler:     handler,
-		Directory:   gt.Some(cfg.Directory),
-		HTTPClient:  gt.Some(cfg.HTTPClient),
-		StartCursor: gt.Some(startCursor),
-		OnPageComplete: gt.Some(func(cursor string) error {
-			return SaveListReposCursor(cfg.Store, cursor)
-		}),
-		OnError: gt.Some(func(did atmos.DID, err error) {
-			logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
-		}),
-		OnProgress: gt.Some(func(stats atmosbackfill.Stats) {
-			cfg.Metrics.setProgressCompleted(stats.Completed)
-		}),
-	})
-
-	logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL)
-	if err := engine.Run(ctx); err != nil {
-		logger.ErrorContext(ctx, "engine returned error", "err", err)
-		return fmt.Errorf("backfill: %w", err)
-	}
-
-	logger.InfoContext(ctx, "engine drained")
-	return nil
 }
 
 func (cfg Config) validate() error {
