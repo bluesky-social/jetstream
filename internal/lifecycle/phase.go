@@ -106,3 +106,16 @@ func (p Phase) valid() bool {
 		return false
 	}
 }
+
+// IsSteadyState returns true iff the persisted phase is PhaseSteadyState.
+// Any other state (empty, bootstrap, merging, corrupt) returns false. The
+// /subscribe endpoint uses this as a fail-closed gate: a corrupt phase or
+// missing key should surface as "service not ready" rather than as a
+// crashed handler.
+func IsSteadyState(s *store.Store) bool {
+	p, err := ReadPhase(s)
+	if err != nil {
+		return false
+	}
+	return p == PhaseSteadyState
+}

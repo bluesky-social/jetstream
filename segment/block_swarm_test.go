@@ -24,7 +24,7 @@ import (
 // so even the race-detector run completes in a few seconds.
 
 const (
-	axisTinyPayloads = iota
+	axisTinyPayloads = iota + 1
 	axisModeratePayloads
 	axisEmptyOptionals
 	axisMaxLengthDIDs

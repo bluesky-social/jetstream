@@ -15,7 +15,12 @@ import (
 )
 
 // PublicHandler returns the handler attached to the public listener.
-func (s *Server) PublicHandler() http.Handler { return s.srv.Handler }
+func (s *Server) PublicHandler() http.Handler {
+	if s.srv.Handler == nil {
+		s.srv.Handler = s.publicMux()
+	}
+	return s.srv.Handler
+}
 
 // DebugHandler returns the handler attached to the debug listener.
 func (s *Server) DebugHandler() http.Handler { return s.dbgSrv.Handler }
@@ -287,4 +292,42 @@ func TestPublicHandler_StatusWired(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestRegisterPublicRoute(t *testing.T) {
+	t.Parallel()
+
+	srv := New(Config{
+		PublicAddr:      "127.0.0.1:0",
+		DebugAddr:       "127.0.0.1:0",
+		ShutdownTimeout: 5 * time.Second,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), obs.NewMetrics())
+
+	srv.RegisterPublicRoute("GET /custom", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("custom-ok"))
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- srv.Run(ctx) }()
+
+	// Wait for binding.
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.PublicAddr() == "" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.NotEmpty(t, srv.PublicAddr())
+
+	resp, err := doGet(ctx, "http://"+srv.PublicAddr()+"/custom")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, "custom-ok", string(body))
+
+	cancel()
+	require.NoError(t, <-runErr)
 }

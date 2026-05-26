@@ -293,6 +293,12 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					return fmt.Errorf("livestream: append: %w", err)
 				}
 				c.cfg.Metrics.incEventsConverted()
+
+				// Forward to downstream subscribers AFTER durable append.
+				// segEvts[i].Seq has been populated by Append.
+				if c.cfg.OnEvent != nil {
+					c.cfg.OnEvent(&segEvts[i])
+				}
 			}
 
 			// Track the highest seq we've witnessed. Under

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
@@ -52,4 +53,15 @@ func TestConfig_Validate_MissingFields(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	require.Contains(t, err.Error(), "Store")
+}
+
+func TestConfig_OnEventField(t *testing.T) {
+	t.Parallel()
+	// Compile-time assertion: Config has the OnEvent field with the
+	// expected signature. The field flows through into the steady-state
+	// live.Consumer; see runSteadyState in steady.go.
+	cfg := Config{
+		OnEvent: func(*segment.Event) {},
+	}
+	require.NotNil(t, cfg.OnEvent)
 }

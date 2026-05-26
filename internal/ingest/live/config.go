@@ -82,6 +82,24 @@ type Config struct {
 	// to every segment.New it makes. Optional.
 	SegmentMetrics *segment.Metrics
 
+	// OnEvent is called once per segment.Event after it has been
+	// durably appended to the writer. The event passed in carries
+	// its assigned Seq.
+	//
+	// Optional. If nil, Consumer is a pure archive-only sink. If set,
+	// OnEvent must be non-blocking and goroutine-safe; the caller is
+	// expected to be a fan-out broadcaster that protects itself with
+	// bounded buffers.
+	//
+	// OnEvent runs synchronously in the per-batch loop, so a slow
+	// OnEvent will throttle the upstream firehose. Don't block here.
+	//
+	// Aliasing: the *segment.Event passed in points into processBatch's
+	// local slice. The hook MUST NOT retain the pointer past return —
+	// it must dereference and forward a fresh value (or copy) to any
+	// longer-lived consumer.
+	OnEvent func(*segment.Event)
+
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time
 }

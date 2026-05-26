@@ -49,6 +49,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			Metrics:        o.cfg.LiveMetrics,
 			Verifier:       o.cfg.Verifier,
 			SegmentMetrics: o.cfg.SegmentMetrics,
+			OnEvent:        o.cfg.OnEvent,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)

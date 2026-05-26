@@ -72,6 +72,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/status"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/internal/subscribe"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
 	"github.com/bluesky-social/jetstream-v2/internal/web"
 	"github.com/bluesky-social/jetstream-v2/segment"
@@ -241,6 +242,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	storeMetrics := store.NewMetrics(metrics.Registry)
 	segmentMetrics := segment.NewMetrics(metrics.Registry)
 	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
+	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
 
 	dataDir := cmd.String("data-dir")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
@@ -297,6 +299,14 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	stateStore := syncstate.New(metaStore)
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
+	broadcaster, err := subscribe.New(subscribe.Config{
+		Logger:  processLogger,
+		Metrics: subscribeMetrics,
+	})
+	if err != nil {
+		return fmt.Errorf("serve: build subscribe broadcaster: %w", err)
+	}
+
 	verifierLogger := processLogger.With(slog.String("component", "verifier"))
 	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
 		Directory:  directory,
@@ -338,6 +348,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		LiveMetrics:     live.NewMetrics(metrics.Registry),
 		BackfillMetrics: backfill.NewMetrics(metrics.Registry),
 		SegmentMetrics:  segmentMetrics,
+		OnEvent:         broadcaster.Publish,
 	})
 	if err != nil {
 		return fmt.Errorf("serve: build orchestrator: %w", err)
@@ -349,6 +360,13 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		ShutdownTimeout: cmd.Duration("shutdown-timeout"),
 		StatusHandler:   statusHandler,
 	}, processLogger, metrics)
+
+	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(
+		broadcaster,
+		metaStore,
+		processLogger,
+		subscribeMetrics,
+	))
 
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()

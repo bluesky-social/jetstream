@@ -75,6 +75,12 @@ type Config struct {
 	// ingest.Config so all segment.Writer instances under the
 	// orchestrator share the seal_duration histogram series.
 	SegmentMetrics *segment.Metrics
+
+	// OnEvent, if non-nil, is forwarded to the steady-state live.Consumer
+	// so live events can be fanned out to /subscribe websocket clients.
+	// Bootstrap-time consumers do NOT receive this hook because their
+	// events go to backfill/live_segments and are not user-visible.
+	OnEvent func(*segment.Event)
 }
 
 func (c *Config) validate() error {

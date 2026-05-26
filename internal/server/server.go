@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +47,11 @@ type Config struct {
 	StatusHandler http.Handler
 }
 
+type publicRoute struct {
+	pattern string
+	handler http.Handler
+}
+
 // Server bundles the public and debug HTTP servers and the readiness flag
 // they share. It is constructed via New and driven via Run.
 type Server struct {
@@ -68,6 +74,11 @@ type Server struct {
 	// ready is flipped to true once both listeners are bound and serving.
 	// /readyz reads it atomically.
 	ready atomic.Bool
+
+	// extraPublicRoutes is appended-to by RegisterPublicRoute. It's
+	// drained once when Run builds the public mux, so registrations
+	// after Run starts are not observed.
+	extraPublicRoutes []publicRoute
 }
 
 // New wires up the muxes for both listeners. It does not bind any sockets;
@@ -112,7 +123,6 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 
 	s.srv = &http.Server{
 		Addr:              cfg.PublicAddr,
-		Handler:           s.publicMux(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		ErrorLog:          stdErrLog,
@@ -129,6 +139,16 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 	return s
 }
 
+// RegisterPublicRoute attaches an additional handler to the public mux.
+// Must be called before Run; routes registered after Run starts are not
+// observed. Pattern uses Go 1.22+ ServeMux syntax (e.g. "GET /subscribe").
+func (s *Server) RegisterPublicRoute(pattern string, h http.Handler) {
+	s.extraPublicRoutes = append(s.extraPublicRoutes, publicRoute{
+		pattern: pattern,
+		handler: h,
+	})
+}
+
 // Run binds both listeners and serves until ctx is cancelled, at which point
 // it triggers graceful shutdown bounded by ShutdownTimeout. Run returns nil
 // if shutdown completed cleanly, or the first error encountered.
@@ -137,6 +157,10 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 // callers can rely on PublicAddr/DebugAddr having concrete addresses (if
 // they used :0) by the time Run is observable to be running.
 func (s *Server) Run(ctx context.Context) error {
+	// Build the public mux now so RegisterPublicRoute calls between
+	// New and Run are observed.
+	s.srv.Handler = s.publicMux()
+
 	// A zero-value ListenConfig matches the behavior of the package-level
 	// net.Listen but lets the bind respect ctx (e.g. cancelled while a
 	// reverse-resolved DNS lookup is in flight).
@@ -267,7 +291,26 @@ func (s *Server) publicMux() http.Handler {
 		mux.Handle("GET /status", instrumented)
 		mux.Handle("HEAD /status", instrumented)
 	}
+	for _, r := range s.extraPublicRoutes {
+		// Wrap each registered route in the same prom + OTEL middleware
+		// as the built-in / route, with a metric label derived from the
+		// pattern (last path segment).
+		mux.Handle(r.pattern, s.metrics.InstrumentHandler(routeLabel(r.pattern), r.handler))
+	}
 	return mux
+}
+
+// routeLabel derives a stable, low-cardinality metric label from a
+// servemux pattern such as "GET /subscribe" -> "subscribe".
+func routeLabel(pattern string) string {
+	if i := strings.IndexByte(pattern, ' '); i >= 0 {
+		pattern = pattern[i+1:]
+	}
+	pattern = strings.TrimPrefix(pattern, "/")
+	if pattern == "" || pattern == "{$}" {
+		return "root"
+	}
+	return pattern
 }
 
 // debugMux builds the operator-facing routes.

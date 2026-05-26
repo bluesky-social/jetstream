@@ -799,3 +799,53 @@ func TestConsumer_Run_VerifierRejectsChainBreak(t *testing.T) {
 	require.Equal(t, int64(1), persisted,
 		"relay/cursor must NOT advance past the last verified seq")
 }
+
+// TestProcessBatch_OnEventCalledAfterAppend pins the invariant that
+// the OnEvent hook fires once per segment.Event AFTER writer.Append
+// has succeeded (so the seq is populated and the data is durable).
+func TestProcessBatch_OnEventCalledAfterAppend(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+
+	var received []segment.Event
+	var mu sync.Mutex
+
+	c, err := Open(Config{
+		SegmentsDir: dir,
+		Store:       st,
+		SeqKey:      "seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "http://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		OnEvent: func(evt *segment.Event) {
+			mu.Lock()
+			defer mu.Unlock()
+			cp := *evt
+			cp.Payload = append([]byte(nil), evt.Payload...)
+			received = append(received, cp)
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Drive a single identity batch through processBatch directly.
+	idEvt := &comatproto.SyncSubscribeRepos_Identity{
+		DID:  "did:plc:test",
+		Seq:  42,
+		Time: "2026-05-25T00:00:00Z",
+	}
+	streamEvt := streaming.Event{
+		Seq:      42,
+		Identity: idEvt,
+	}
+	require.NoError(t, c.processBatch(context.Background(), []streaming.Event{streamEvt}))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, received, 1)
+	require.Equal(t, segment.KindIdentity, received[0].Kind)
+	require.Equal(t, uint64(0), received[0].Seq, "first event in an empty writer must be Seq=0")
+}

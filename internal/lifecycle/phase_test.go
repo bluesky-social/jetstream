@@ -91,3 +91,35 @@ func TestWritePhase_AtomicWithEnteredAt(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, gotAt.Equal(want))
 }
+
+func TestIsSteadyState_Empty(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.False(t, IsSteadyState(st))
+}
+
+func TestIsSteadyState_NotSteady(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	for _, p := range []Phase{PhaseBootstrap, PhaseMerging} {
+		require.NoError(t, WritePhase(st, p, time.Now().UTC()))
+		require.False(t, IsSteadyState(st), "phase=%s", p)
+	}
+}
+
+func TestIsSteadyState_SteadyState(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, WritePhase(st, PhaseSteadyState, time.Now().UTC()))
+	require.True(t, IsSteadyState(st))
+}
+
+func TestIsSteadyState_CorruptIsFalse(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Set([]byte("phase"), []byte("banana"), store.SyncWrites))
+	// Corrupt phase reads as not steady-state. The orchestrator's
+	// startup path will surface the underlying ReadPhase error
+	// separately; IsSteadyState's contract is "fail closed."
+	require.False(t, IsSteadyState(st))
+}
