@@ -1,4 +1,5 @@
 set shell := ["bash", "-cu"]
+set dotenv-load
 
 default: lint test
 
@@ -25,13 +26,29 @@ clean:
     rm -rf bin
     rm -rf data
 
-# Run jetstream with arbitrary args, e.g. `just run --version` or `just run serve --addr :9090`.
+# Run jetstream against the local simulator (default).
+# Picks up JETSTREAM_RELAY_URL and JETSTREAM_PLC_URL from .env.
 run *ARGS:
     go run ./cmd/jetstream {{ARGS}}
 
 # Run jetstream with the race detector enabled.
 run-race *ARGS:
     just run -race {{ARGS}}
+
+# Run jetstream against real production (bsky.network + plc.directory).
+# Useful for occasional smoke tests against the real network.
+run-prod *ARGS:
+    JETSTREAM_RELAY_URL=https://bsky.network \
+    JETSTREAM_PLC_URL=https://plc.directory \
+    go run ./cmd/jetstream {{ARGS}}
+
+# Run the local simulator (PLC + PDS + relay + firehose).
+simulator *ARGS:
+    go run ./cmd/simulator {{ARGS}}
+
+# Wipe the simulator's pebble db so the next `just simulator` re-bootstraps.
+simulator-reset:
+    rm -rf ./data/simulator
 
 # Runs the full, long test suite
 test-long *ARGS="./...":

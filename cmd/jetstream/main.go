@@ -199,6 +199,12 @@ func serveCommand() *cli.Command {
 				Value:   "https://bsky.network",
 			},
 			&cli.StringFlag{
+				Name:    "plc-url",
+				Usage:   "Base URL of the PLC directory; empty uses atmos's default (https://plc.directory)",
+				Sources: cli.EnvVars("JETSTREAM_PLC_URL"),
+				Value:   "",
+			},
+			&cli.StringFlag{
 				Name:    "data-dir",
 				Usage:   "Path to the data directory; the metadata store lives at <data-dir>/meta.pebble",
 				Sources: cli.EnvVars("JETSTREAM_DATA_DIR"),
@@ -290,8 +296,18 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		HTTPClient: gt.Some(jttp.New(xrpc.BulkDownloadOpts()...)),
 	}
 
+	resolver := &identity.DefaultResolver{}
+	if u := cmd.String("plc-url"); u != "" {
+		resolver.PLCURL = gt.Some(u)
+		// atmos's default resolver client enables jttp.WithStrictSSRFProtection,
+		// which refuses loopback even on the initial request. When the
+		// operator points us at a local PLC (e.g. the dev simulator at
+		// http://localhost:7777), use a non-strict client so the dial
+		// succeeds.
+		resolver.HTTPClient = gt.Some(jttp.New(xrpc.ATProtoOpts(10 * time.Second)...))
+	}
 	directory := &identity.Directory{
-		Resolver:               &identity.DefaultResolver{},
+		Resolver:               resolver,
 		Cache:                  identcache.New(metaStore, identcache.DefaultTTL),
 		SkipHandleVerification: true,
 	}

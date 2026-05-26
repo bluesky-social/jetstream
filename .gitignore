@@ -26,8 +26,8 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
-.env
+# Note: .env is intentionally committed at the repo root with
+# simulator-pointing dev defaults. Do not put secrets in it.
 
 # Editor/IDE
 # .idea/
