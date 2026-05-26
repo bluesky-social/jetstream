@@ -384,6 +384,82 @@ func TestRun_PersistsCursorAfterDrain(t *testing.T) {
 	require.Equal(t, "", got, "post-drain cursor is empty")
 }
 
+// TestRun_MaxRepos_StopsEarly is the debug-flag smoke test.
+// With MaxRepos=1 and several fixtures, Run must return nil
+// (not a context.Canceled error) so the orchestrator can advance
+// to the merge phase. We only assert that at least the limit was
+// reached and Run returned nil; how many extra repos completed
+// before the cancel propagated is implementation-dependent
+// (atmos worker-pool scheduling and HTTP timing) and not the
+// contract this test pins.
+func TestRun_MaxRepos_StopsEarly(t *testing.T) {
+	t.Parallel()
+
+	dids := []atmos.DID{
+		"did:plc:aaa", "did:plc:bbb", "did:plc:ccc",
+		"did:plc:ddd", "did:plc:eee",
+	}
+	fixtures := make(map[atmos.DID]repoFixture, len(dids))
+	for _, d := range dids {
+		fixtures[d] = buildRepoFixture(t, d)
+	}
+	srv := newStubServer(t, fixtures)
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
+	for did, f := range fixtures {
+		docs[did] = &identity.DIDDocument{
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		}
+	}
+	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	segDir := filepath.Join(t.TempDir(), "segments")
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       segDir,
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	cfg := Config{
+		Store:      db,
+		Directory:  dir,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Writer:     w,
+		RelayURL:   srv.srv.URL,
+		Logger:     logger,
+		MaxRepos:   1,
+	}
+	require.NoError(t, Run(t.Context(), cfg))
+
+	// At least one repo must have reached Complete; otherwise
+	// OnProgress never fired and the limit logic is dead code.
+	bf := NewStore(db, nil)
+	completed := 0
+	for _, did := range dids {
+		got, err := bf.Lookup(context.Background(), did)
+		require.NoError(t, err)
+		if got.State == atmosbackfill.StateComplete {
+			completed++
+		}
+	}
+	require.GreaterOrEqual(t, completed, 1, "MaxRepos=1 should have completed at least one repo")
+}
+
 // TestRun_PassesSavedCursorToRelay confirms the resume path: a
 // cursor pre-seeded into pebble is passed to the relay's listRepos
 // as the startCursor on the first request of a new Run. Without

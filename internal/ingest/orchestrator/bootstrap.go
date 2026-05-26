@@ -110,6 +110,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 				RelayURL:   o.cfg.RelayURL,
 				Logger:     o.cfg.Logger,
 				Metrics:    o.cfg.BackfillMetrics,
+				MaxRepos:   o.cfg.MaxBackfillRepos,
 			})
 			if err != nil {
 				return err

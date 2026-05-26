@@ -7,9 +7,11 @@ package backfill
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
@@ -48,6 +50,21 @@ type Config struct {
 	// Metrics is optional; nil means we still run, just without
 	// /metrics counters incrementing.
 	Metrics *Metrics
+
+	// MaxRepos, when > 0, is a debug-only ceiling on the number of
+	// repos this Run will fully download before stopping early and
+	// returning nil so the orchestrator can advance to the merge
+	// phase. Counts atmos progress callbacks (Stats.Completed), i.e.
+	// repos transitioned to StateComplete during this Run; pre-Complete
+	// repos from a prior Run are skipped before they reach the
+	// counter and do not count.
+	//
+	// Intended for fast local-dev iteration against the production
+	// relay (millions of users); leave 0 in production. The persisted
+	// listRepos cursor will not advance past the page on which the
+	// limit trips, so subsequent runs without the flag re-walk from
+	// the same point.
+	MaxRepos int
 }
 
 // Run drives the atmos backfill engine to completion. It blocks until
@@ -88,6 +105,19 @@ func Run(ctx context.Context, cfg Config) error {
 			logger.InfoContext(ctx, "resuming from saved cursor", "cursor", startCursor)
 		}
 
+		// runCtx is what we hand to the atmos engine. When MaxRepos is
+		// set we wrap ctx with a cancel we trip from OnProgress so the
+		// engine drains in the same "producer cancelled" path it uses
+		// for any other ctx cancellation. limitTripped distinguishes
+		// "we cancelled because the debug ceiling was reached" (return
+		// nil) from "the outer ctx was cancelled" (propagate).
+		runCtx, cancelRun := ctx, func() {}
+		if cfg.MaxRepos > 0 {
+			runCtx, cancelRun = context.WithCancel(ctx)
+		}
+		defer cancelRun()
+		var limitTripped atomic.Bool
+
 		engine := atmosbackfill.NewEngine(atmosbackfill.Options{
 			SyncClient:  sc,
 			Store:       st,
@@ -103,11 +133,27 @@ func Run(ctx context.Context, cfg Config) error {
 			}),
 			OnProgress: gt.Some(func(stats atmosbackfill.Stats) {
 				cfg.Metrics.setProgressCompleted(stats.Completed)
+				if cfg.MaxRepos > 0 && stats.Completed >= int64(cfg.MaxRepos) {
+					if limitTripped.CompareAndSwap(false, true) {
+						logger.WarnContext(ctx, "DEBUG: max-backfill-repos limit reached; stopping backfill early",
+							"limit", cfg.MaxRepos,
+							"completed", stats.Completed,
+						)
+						cancelRun()
+					}
+				}
 			}),
 		})
 
-		logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL)
-		if err := engine.Run(ctx); err != nil {
+		logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL, "max_repos", cfg.MaxRepos)
+		if err := engine.Run(runCtx); err != nil {
+			// Internal limit-driven cancel: the outer ctx is still healthy,
+			// only our derived runCtx was cancelled. Treat as a clean drain
+			// so the orchestrator advances to merge.
+			if limitTripped.Load() && errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				logger.InfoContext(ctx, "engine drained early via max-backfill-repos")
+				return nil
+			}
 			logger.ErrorContext(ctx, "engine returned error", "err", err)
 			return fmt.Errorf("backfill: %w", err)
 		}

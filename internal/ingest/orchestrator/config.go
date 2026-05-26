@@ -81,6 +81,13 @@ type Config struct {
 	// Bootstrap-time consumers do NOT receive this hook because their
 	// events go to backfill/live_segments and are not user-visible.
 	OnEvent func(*segment.Event)
+
+	// MaxBackfillRepos, when > 0, caps the bootstrap-phase backfill
+	// engine at this many fully-downloaded repos and then advances to
+	// the merge phase. Debug-only knob for fast local-dev iteration
+	// against a relay with millions of users; leave 0 in production.
+	// See backfill.Config.MaxRepos for the precise semantics.
+	MaxBackfillRepos int
 }
 
 func (c *Config) validate() error {
