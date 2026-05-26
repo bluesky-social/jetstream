@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/cockroachdb/pebble v1.1.2
 	github.com/coder/websocket v1.8.14
-	github.com/jcalabro/atmos v0.1.0
+	github.com/jcalabro/atmos v0.1.2
 	github.com/jcalabro/gloom v0.0.3
 	github.com/jcalabro/gt v0.0.13
 	github.com/jcalabro/jttp v0.0.4
