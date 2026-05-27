@@ -24,7 +24,7 @@ build:
 # Remove build artifacts and local data.
 clean:
     rm -rf bin
-    rm -rf data
+    rm -rf data*
 
 # Run jetstream against the local simulator (default).
 # Picks up JETSTREAM_RELAY_URL and JETSTREAM_PLC_URL from .env.
@@ -35,11 +35,11 @@ run *ARGS:
 run-race *ARGS:
     just run -race {{ARGS}}
 
-# Run jetstream against real production (bsky.network + plc.directory).
-# Useful for occasional smoke tests against the real network.
+# Run jetstream against real production services.
 run-prod *ARGS:
     JETSTREAM_RELAY_URL=https://bsky.network \
     JETSTREAM_PLC_URL=https://plc.directory \
+    JETSTREAM_DATA_DIR=./data-prod \
     go run ./cmd/jetstream {{ARGS}}
 
 # Run the local simulator (PLC + PDS + relay + firehose).
