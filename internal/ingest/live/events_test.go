@@ -257,7 +257,7 @@ func TestConvertEvent_CommitDelete_PayloadNil(t *testing.T) {
 // behavior for the case where a Create/Update op references a CID
 // that isn't in the commit's CAR block index. atmos surfaces this
 // silently as Operation.BlockData()==nil; convertCommit must refuse
-// rather than write a Create with nil payload (PRACTICES.md:
+// rather than write a Create with nil payload (AGENTS.md:
 // crashing > silent corruption).
 func TestConvertEvent_CommitMissingCAR_Errors(t *testing.T) {
 	t.Parallel()

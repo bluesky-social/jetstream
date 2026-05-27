@@ -42,7 +42,7 @@ const (
 // dial silently treats as "no cursor → live tail". A corrupted
 // cursor must surface as an error so the operator notices, not a
 // silent re-tail of the firehose that drops every historical event
-// between the corrupt seq and now (PRACTICES.md: crashing > silent
+// between the corrupt seq and now (AGENTS.md: crashing > silent
 // data loss).
 func LoadUpstreamCursor(s *store.Store, key string) (int64, error) {
 	val, closer, err := s.Get([]byte(key))

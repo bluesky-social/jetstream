@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,4 +131,21 @@ func TestEndToEnd_JetstreamConsumesSimulator(t *testing.T) {
 	require.True(t, json.Valid(msg), "unexpected non-JSON frame: %q", string(msg))
 	require.Contains(t, string(msg), `"did":"did:plc:`,
 		"expected DID in payload, got: %s", string(msg))
+
+	// Steady-state warning sentinels. The simulator is supposed to
+	// produce wire-valid #commit frames; jetstream is supposed to
+	// recognize every event variant atmos surfaces. Either of these
+	// log lines means something upstream is wrong. Pinning them in an
+	// E2E test catches regressions that unit tests miss because both
+	// involve cross-component behaviour (simulator emits a malformed
+	// commit / atmos's verifier resync emits a synthetic event with
+	// no public envelope).
+	logs := stderr.String()
+	for _, sentinel := range []string{
+		`"verification failure"`,
+		`"unknown event kind"`,
+	} {
+		require.Falsef(t, strings.Contains(logs, sentinel),
+			"jetstream emitted %s during E2E run; logs:\n%s", sentinel, logs)
+	}
 }

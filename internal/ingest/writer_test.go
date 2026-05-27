@@ -546,7 +546,7 @@ func TestFlush_InvokesOnAfterFlushHook(t *testing.T) {
 
 // TestFlush_OnAfterFlushErrorPropagates verifies that an error from
 // the hook surfaces back through Append so the errgroup can tear
-// the process down. PRACTICES.md: crashing > silent corruption.
+// the process down. AGENTS.md: crashing > silent corruption.
 func TestFlush_OnAfterFlushErrorPropagates(t *testing.T) {
 	t.Parallel()
 

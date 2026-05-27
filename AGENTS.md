@@ -4,7 +4,7 @@
 
 Jetstream v2 is a full-network archive and live-streaming service for atproto. It ingests every record from every known repo on a relay, transitions seamlessly to live, and serves clients either large HTTPS segment-file downloads (for backfill) or the same JSON websocket protocol as Jetstream v1 (for live tail).
 
-`DESIGN.md` is the source of truth for the system. Read it before making non-trivial changes — especially before touching any on-disk format. `PRACTICES.md` is the team's coding conventions. Both override anything inferred from existing code.
+`DESIGN.md` is the source of truth for the system. Read it before making non-trivial changes — especially before touching any on-disk format. The "Practices" section below is the team's coding conventions. Both override anything inferred from existing code.
 
 ## Common commands
 

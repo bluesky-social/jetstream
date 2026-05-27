@@ -38,12 +38,75 @@ func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error)
 		// cursor past it.
 		return nil, nil
 	default:
-		// No recognized field set. Either atmos shipped a new event
-		// variant ahead of jetstream, or the wire shape changed.
-		// Either way the safe thing is to refuse to advance the
-		// cursor past this seq so a future build can replay it.
+		// No public envelope is set. Two cases:
+		//
+		//   1. atmos's verifier resync worker emits a synthetic
+		//      streaming.Event with only its (unexported) verifiedOps
+		//      populated, after re-fetching a repo via getRepo to
+		//      recover from a verification failure (chain break,
+		//      duplicate-op-path, inversion failure). Operations()
+		//      yields the resync ops directly with per-op DID + Rev;
+		//      we map each to KindCreate, matching the
+		//      streaming.ActionResync handling used when ops arrive
+		//      inside a #commit envelope.
+		//
+		//   2. A future relay variant we don't know how to decode.
+		//      Operations() yields nothing in that case, so we fall
+		//      through to ErrUnknownEventKind and the consumer
+		//      refuses to advance its cursor past this seq.
+		return convertVerifiedOps(evt, indexedAt)
+	}
+}
+
+// convertVerifiedOps drains evt.Operations() and converts each op
+// into a segment.Event. Used for the verifier-resync emission path
+// where the upstream wire envelope is absent and the only signal is
+// the iterator yielding ops.
+func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
+	var out []segment.Event
+	for op, err := range evt.Operations() {
+		if err != nil {
+			return nil, fmt.Errorf("livestream: decode resync ops: %w", err)
+		}
+
+		kind, err := actionKind(op.Action)
+		if err != nil {
+			return nil, fmt.Errorf("livestream: did=%s: %w", op.Repo, err)
+		}
+
+		segEv := segment.Event{
+			IndexedAt:  indexedAt,
+			Kind:       kind,
+			DID:        string(op.Repo),
+			Collection: string(op.Collection),
+			Rkey:       string(op.RKey),
+			Rev:        string(op.Rev),
+		}
+		// Resync ops carry the live record bytes for create/update;
+		// deletes are not part of a resync result (atmos's resync
+		// worker only emits records present in the post-resync repo).
+		// Surface a missing payload rather than archive a Create with
+		// nil bytes — AGENTS.md: crashing > silent corruption.
+		if kind != segment.KindDelete {
+			block := op.BlockData()
+			if block == nil {
+				return nil, fmt.Errorf(
+					"livestream: did=%s collection=%s rkey=%s: %s op references CID missing from CAR diff",
+					op.Repo, op.Collection, op.RKey, op.Action,
+				)
+			}
+			segEv.Payload = append([]byte(nil), block...)
+		}
+		out = append(out, segEv)
+	}
+
+	if len(out) == 0 {
+		// Iterator yielded nothing — this is a true unknown event
+		// kind (no Commit/Sync/Identity/Account/Info, no verified
+		// ops). Refuse to advance the cursor past it.
 		return nil, ErrUnknownEventKind
 	}
+	return out, nil
 }
 
 func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
@@ -73,7 +136,7 @@ func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error
 		// the commit's CAR. atmos returns BlockData()==nil silently
 		// when the op's CID is missing from the CAR diff (truncated
 		// CAR, hash mismatch, or relay bug). We refuse rather than
-		// archive a Create/Update with no payload — PRACTICES.md:
+		// archive a Create/Update with no payload — AGENTS.md:
 		// crashing > silent corruption.
 		if kind != segment.KindDelete {
 			block := op.BlockData()

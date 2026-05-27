@@ -89,7 +89,7 @@ func TestLoadUpstreamCursor_RejectsUnknownVersion(t *testing.T) {
 // atmos's dial guards on `cursor > 0`, so a negative cursor would
 // silently degrade to "start from live tail" and lose every
 // historical event between the corrupt-but-meaningful seq and now.
-// PRACTICES.md prefers a crash to a silent fallback.
+// AGENTS.md prefers a crash to a silent fallback.
 func TestLoadUpstreamCursor_RejectsHighBitSet(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)

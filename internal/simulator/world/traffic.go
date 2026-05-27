@@ -85,16 +85,26 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 	// Apply N ops of the chosen action. v1 keeps actions homogeneous
 	// per commit — mixing actions per commit doesn't add useful test
 	// surface for our distributions.
+	//
+	// touched is the set of (collection/rkey) paths already mutated by
+	// this commit; applyOp skips them so we never emit two ops on the
+	// same path. atmos's verifier rejects duplicate paths in a single
+	// commit (DuplicatePathError) — real PDSes collapse intra-commit
+	// duplicates before publishing. A small repo + multi-op commit
+	// (~30%, via geometric distribution) makes collisions on
+	// update/delete likely without this guard.
 	action := weightedChoice(w.rng, actionMix)
 	nOps := geometricAtLeastOne(w.rng, 0.7)
 	wireOps := make([]comatproto.SyncSubscribeRepos_RepoOp, 0, nOps)
+	touched := make(map[string]struct{}, nOps)
 
 	for range nOps {
-		op, err := w.applyOp(rp, author.Index, action)
+		op, err := w.applyOp(rp, author.Index, action, touched)
 		if err != nil {
 			return nil, err
 		}
 		wireOps = append(wireOps, op)
+		touched[op.Path] = struct{}{}
 	}
 
 	// Persist the new state. commitAndPersist signs + flushes blocks
@@ -104,16 +114,26 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 
-	// Build a CAR diff containing only the blocks our diffStore
-	// captured (plus the commit block).
+	// Build a CAR diff containing every block our diffStore touched:
+	// writes (new MST nodes + new record blocks + the commit block)
+	// AND reads (existing MST nodes traversed during op application).
+	// atmos's verifier inverts each op against the post-state MST
+	// loaded from this CAR; reading a path back to an unchanged
+	// neighbor requires that neighbor be present in the diff.
 	commitData, err := store.GetBlock(newState.CommitCID)
 	if err != nil {
 		return nil, err
 	}
-	carBlocks := make([]car.Block, 0, len(store.writes)+1)
+	carBlocks := make([]car.Block, 0, len(store.writes)+len(store.reads)+1)
 	carBlocks = append(carBlocks, car.Block{CID: newState.CommitCID, Data: commitData})
 	for cid, data := range store.writes {
 		if cid == newState.CommitCID {
+			continue
+		}
+		carBlocks = append(carBlocks, car.Block{CID: cid, Data: data})
+	}
+	for cid, data := range store.reads {
+		if _, written := store.writes[cid]; written {
 			continue
 		}
 		carBlocks = append(carBlocks, car.Block{CID: cid, Data: data})
@@ -155,11 +175,13 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 }
 
 // applyOp performs a single create/update/delete on rp and returns
-// the corresponding wire RepoOp. update/delete fall back to create
-// when the repo is empty (initial bootstrap pre-populates 1 record
-// per account, so this is rare in practice but defensive in tests
-// using small initial counts).
-func (w *World) applyOp(rp *repo.Repo, authorIdx int, action string) (comatproto.SyncSubscribeRepos_RepoOp, error) {
+// the corresponding wire RepoOp. touched is the set of paths already
+// mutated within the current commit; update/delete skip them and fall
+// back to create when no eligible record remains. The fall-back also
+// covers the repo-empty case (initial bootstrap pre-populates
+// InitialRecords per account, so this is rare in steady state but
+// defensive for tests using small initial counts).
+func (w *World) applyOp(rp *repo.Repo, authorIdx int, action string, touched map[string]struct{}) (comatproto.SyncSubscribeRepos_RepoOp, error) {
 	switch action {
 	case "create":
 		coll := chooseCreateCollection(w.rng)
@@ -180,9 +202,9 @@ func (w *World) applyOp(rp *repo.Repo, authorIdx int, action string) (comatproto
 		}, nil
 
 	case "update":
-		coll, rkey, ok := w.pickExistingRecord(rp)
+		coll, rkey, ok := w.pickUntouchedRecord(rp, touched)
 		if !ok {
-			return w.applyOp(rp, authorIdx, "create")
+			return w.applyOp(rp, authorIdx, "create", touched)
 		}
 		prevCID, _, _ := rp.Get(coll, rkey)
 		rec := generateRecord(w.rng, coll, string(w.pickAnotherAccount(authorIdx).DID))
@@ -198,9 +220,9 @@ func (w *World) applyOp(rp *repo.Repo, authorIdx int, action string) (comatproto
 		}, nil
 
 	case "delete":
-		coll, rkey, ok := w.pickExistingRecord(rp)
+		coll, rkey, ok := w.pickUntouchedRecord(rp, touched)
 		if !ok {
-			return w.applyOp(rp, authorIdx, "create")
+			return w.applyOp(rp, authorIdx, "create", touched)
 		}
 		prevCID, _, _ := rp.Get(coll, rkey)
 		if err := rp.Delete(coll, rkey); err != nil {
@@ -230,12 +252,18 @@ func (w *World) pickAnotherAccount(notIdx int) account {
 	}
 }
 
-// pickExistingRecord chooses one (collection, rkey) at random from
-// the account's current MST. ok=false on an empty repo.
-func (w *World) pickExistingRecord(rp *repo.Repo) (collection, rkey string, ok bool) {
+// pickUntouchedRecord chooses one (collection, rkey) at random from
+// the account's current MST, excluding any path already in `touched`.
+// ok=false when the repo is empty or every record was already touched
+// by an earlier op in the same commit; callers fall back to create in
+// that case.
+func (w *World) pickUntouchedRecord(rp *repo.Repo, touched map[string]struct{}) (collection, rkey string, ok bool) {
 	type entry struct{ coll, rkey string }
 	var entries []entry
 	_ = rp.Tree.Walk(func(key string, _ cbor.CID) error {
+		if _, dup := touched[key]; dup {
+			return nil
+		}
 		c, k := repo.SplitMSTKey(key)
 		entries = append(entries, entry{c, k})
 		return nil
@@ -248,18 +276,40 @@ func (w *World) pickExistingRecord(rp *repo.Repo) (collection, rkey string, ok b
 }
 
 // diffStore wraps a base BlockStore (the persisted-blocks pebbleStore)
-// with a write-capture set: any block PutBlock'd during this commit
-// is recorded for later inclusion in the CAR diff.
+// and captures every block touched by this commit — both PutBlock'd
+// (newly written this commit) and GetBlock'd (read during op or
+// inversion-proof traversal). The combined set is the proof set for
+// the CAR diff: it carries every node atmos's verifier needs to (a)
+// walk the post-state MST and (b) invert ops back to the prev-state
+// MST root.
+//
+// Capturing only writes was insufficient: deletes/updates touch
+// existing nodes the verifier later needs to traverse during
+// `tree.Insert(prevCID)`, but those nodes are unchanged so the writes
+// map alone omitted them, which surfaced as
+// `mst: loading node ...: block not found` inversion failures.
 type diffStore struct {
 	base   mst.BlockStore
 	writes map[cbor.CID][]byte
+	reads  map[cbor.CID][]byte
 }
 
 func (s *diffStore) GetBlock(cid cbor.CID) ([]byte, error) {
 	if data, ok := s.writes[cid]; ok {
 		return data, nil
 	}
-	return s.base.GetBlock(cid)
+	if data, ok := s.reads[cid]; ok {
+		return data, nil
+	}
+	data, err := s.base.GetBlock(cid)
+	if err != nil {
+		return nil, err
+	}
+	if s.reads == nil {
+		s.reads = make(map[cbor.CID][]byte)
+	}
+	s.reads[cid] = append([]byte(nil), data...)
+	return data, nil
 }
 
 func (s *diffStore) PutBlock(cid cbor.CID, data []byte) error {

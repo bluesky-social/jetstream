@@ -9,12 +9,12 @@ import (
 
 // Bloom-filter sizing knobs. Both apply to DID blooms (segment-level
 // and per-block) per DESIGN.md §3.1.3 and the project FP-rate guidance
-// in PRACTICES.md/DESIGN.md.
+// in AGENTS.md/DESIGN.md.
 //
 // The 0.001 (0.1%) false-positive rate balances on-disk size
 // (negligible relative to a ~256 MB segment) against scan-time false
 // positives (each FP costs a full block decompress + column scan,
-// which is meaningfully expensive). PRACTICES.md and DESIGN.md
+// which is meaningfully expensive). AGENTS.md and DESIGN.md
 // document RAM as cheap on these servers, so we don't penny-pinch.
 const (
 	perBlockBloomFPRate = 0.001
