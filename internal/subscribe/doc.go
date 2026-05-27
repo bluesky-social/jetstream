@@ -60,9 +60,25 @@
 //   - A commit with an empty collection field bypasses the
 //     wantedCollections filter — matches v1's WantsCollection.
 //
+//   - ?requireHello=true blocks event delivery (the broadcaster
+//     Subscribe call is delayed) until the client sends a valid
+//     options_update over the websocket. Matches v1 README:
+//     "a client can connect with ?requireHello=true ... to pause
+//     replay/live-tail until the first Options Update message is
+//     sent by the client over the socket." Locked down by
+//     TestHandler_RequireHello_BlocksUntilOptionsUpdate. Invalid
+//     updates during the wait disconnect the client; locked down by
+//     TestHandler_RequireHello_InvalidUpdateDisconnects. Implementation
+//     note: events published during the wait are dropped, not queued
+//     — we delay Subscribe rather than registering and buffering. v1
+//     registers the subscriber on connect and buffers into the outbox
+//     during the wait; v2's behavior is observable in the visible
+//     contract (the first event a hello-mode client sees is one
+//     published after its hello), and TestHandler_RequireHello_-
+//     BlocksUntilOptionsUpdate locks the drop semantics down.
+//
 // Out of scope for this v1-compat surface: cursor replay, zstd
-// compression, requireHello. We accept those query params
-// (silently ignored for cursor; absent for requireHello) so that v1
-// clients that send them aren't rejected. Future v2-native endpoints
-// will live alongside this package or in a sibling.
+// compression. We silently ignore the cursor query param so that
+// v1 clients that send it aren't rejected. Future v2-native
+// endpoints will live alongside this package or in a sibling.
 package subscribe

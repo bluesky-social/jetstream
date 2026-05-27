@@ -432,3 +432,32 @@ func TestParseMaxMsgSize_V1Compat(t *testing.T) {
 		}
 	})
 }
+
+func TestParseRequireHello(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"true", true},
+		{"True", false},
+		{"TRUE", false},
+		{"false", false},
+		{"1", false},
+		{"", false},
+		{"yes", false},
+		{"true ", false},
+		{" true", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			values := url.Values{}
+			if tc.in != "" {
+				values.Set("requireHello", tc.in)
+			}
+			require.Equal(t, tc.want, parseRequireHello(values))
+		})
+	}
+}

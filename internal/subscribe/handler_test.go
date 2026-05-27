@@ -763,6 +763,232 @@ func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
 	require.Equal(t, "identity", got["kind"])
 }
 
+func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?requireHello=true"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	// Give the handler time to start the reader goroutine but NOT
+	// time to subscribe (it shouldn't subscribe until hello).
+	time.Sleep(50 * time.Millisecond)
+
+	// Publish a matching event. Because Subscribe() hasn't been called
+	// yet, the broadcaster has no per-connection channel to queue this
+	// into — the event must be dropped silently.
+	publishIdentity(t, b, "did:plc:pre-hello", 1)
+
+	// Wait long enough to ensure that IF the event were going to be
+	// delivered, it would have been (but it won't be, because we
+	// haven't sent hello yet).
+	time.Sleep(50 * time.Millisecond)
+
+	// Send the hello.
+	hello := SubscriberSourcedMessage{
+		Type:    SubMessageTypeOptionsUpdate,
+		Payload: jsonMust(t, UpdatePayload{}),
+	}
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, hello)))
+
+	// Give the handler time to subscribe.
+	time.Sleep(50 * time.Millisecond)
+
+	// Publish a fresh event AFTER hello. Only this one should arrive.
+	publishIdentity(t, b, "did:plc:post-hello", 2)
+
+	frame := readOneFrame(t, ctx, conn)
+	require.Contains(t, string(frame), "did:plc:post-hello")
+	require.NotContains(t, string(frame), "did:plc:pre-hello",
+		"pre-hello publish must be dropped, not queued")
+}
+
+// V1 PARITY: a filter delivered in the hello options_update must take
+// effect before any events flow. This is the load-bearing reason
+// requireHello exists — clients use it to install their filter before
+// the firehose opens, avoiding a window of unfiltered traffic.
+func TestHandler_RequireHello_FilterFromHelloApplies(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?requireHello=true"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	// Hello with a wantedDids filter that excludes "did:plc:other".
+	hello := SubscriberSourcedMessage{
+		Type: SubMessageTypeOptionsUpdate,
+		Payload: jsonMust(t, UpdatePayload{
+			WantedDIDs: []string{"did:plc:wanted"},
+		}),
+	}
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, hello)))
+
+	// Give the handler time to apply the filter and Subscribe.
+	time.Sleep(50 * time.Millisecond)
+
+	// Publish an event that the filter should drop, then one it should
+	// pass. The reader can only see the second one if the filter was
+	// installed before Subscribe — which is the contract.
+	publishIdentity(t, b, "did:plc:other", 1)
+	publishIdentity(t, b, "did:plc:wanted", 2)
+
+	frame := readOneFrame(t, ctx, conn)
+	require.Contains(t, string(frame), "did:plc:wanted")
+	require.NotContains(t, string(frame), "did:plc:other",
+		"hello-supplied filter must apply before events flow")
+}
+
+func TestHandler_RequireHello_InvalidUpdateDisconnects(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		frame     []byte
+		wantClose websocket.StatusCode
+	}{
+		{
+			name:      "malformed envelope JSON",
+			frame:     []byte(`{`),
+			wantClose: websocket.StatusInvalidFramePayloadData,
+		},
+		{
+			name:      "well-formed envelope with bad payload JSON",
+			frame:     []byte(`{"type":"options_update","payload":"not-json"}`),
+			wantClose: websocket.StatusInvalidFramePayloadData,
+		},
+		{
+			name: "well-formed payload with bad DID",
+			frame: jsonMust(t, SubscriberSourcedMessage{
+				Type: SubMessageTypeOptionsUpdate,
+				Payload: jsonMust(t, UpdatePayload{
+					WantedDIDs: []string{"not-a-did"},
+				}),
+			}),
+			wantClose: websocket.StatusPolicyViolation,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := newSteadyStateStore(t)
+			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			require.NoError(t, err)
+
+			h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?requireHello=true"
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+			require.NoError(t, err)
+			if resp != nil && resp.Body != nil {
+				defer func() { _ = resp.Body.Close() }()
+			}
+			defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+			require.NoError(t, conn.Write(ctx, websocket.MessageText, tc.frame))
+
+			// The server should close the connection. Read returns the
+			// close as an error; CloseStatus extracts the code.
+			_, _, rerr := conn.Read(ctx)
+			require.Error(t, rerr)
+			require.Equal(t, tc.wantClose, websocket.CloseStatus(rerr),
+				"close status mismatch (err=%v)", rerr)
+		})
+	}
+}
+
+func TestHandler_RequireHello_FalseHasNoEffect(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		// queryFragment is appended to "ws://..." with "?" already
+		// present iff non-empty. "" means no query string at all.
+		queryFragment string
+	}{
+		{"absent", ""},
+		{"false", "?requireHello=false"},
+		{"capitalized True", "?requireHello=True"},
+		{"garbage", "?requireHello=garbage"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := newSteadyStateStore(t)
+			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			require.NoError(t, err)
+
+			h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + tc.queryFragment
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+			require.NoError(t, err)
+			if resp != nil && resp.Body != nil {
+				defer func() { _ = resp.Body.Close() }()
+			}
+			defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+			// Wait for the handler to register the subscriber.
+			time.Sleep(50 * time.Millisecond)
+
+			// No hello sent. Publish and expect immediate delivery.
+			publishIdentity(t, b, "did:plc:no-hello-needed", 1)
+
+			frame := readOneFrame(t, ctx, conn)
+			require.Contains(t, string(frame), "did:plc:no-hello-needed")
+		})
+	}
+}
+
 // Small helper used by the options_update tests.
 func jsonMust[T any](t *testing.T, v T) []byte {
 	t.Helper()
@@ -796,4 +1022,98 @@ func TestTruncateCloseReason_RuneAligned(t *testing.T) {
 	// Boundary: input exactly at the cap is returned unchanged.
 	exact := strings.Repeat("a", 123)
 	require.Equal(t, exact, truncateCloseReason(exact))
+}
+
+func TestHandler_RequireHello_NoLeakOnClientDisconnect(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+
+	// Wrap the real handler so we can observe ServeHTTP returning. That
+	// signal is deterministic: serve() returning means its deferred
+	// conn.CloseNow ran, which unblocks the reader goroutine's conn.Read.
+	// We avoid runtime.NumGoroutine() because t.Parallel tests in the
+	// same binary spawn/retire goroutines independently and would race
+	// the global counter.
+	inner := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	served := make(chan struct{})
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(served)
+		inner.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?requireHello=true"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+
+	// Let the handler get into its hello wait. The reader goroutine
+	// is running; the writer-side serve() body is blocked on helloCh.
+	time.Sleep(50 * time.Millisecond)
+
+	// Client closes without sending hello. The handler's reader goroutine
+	// observes the read error, defer cancel()s the connection context,
+	// the wait select exits via <-ctx.Done(), and serve returns.
+	require.NoError(t, conn.Close(websocket.StatusNormalClosure, "go away"))
+
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after client disconnect during hello wait")
+	}
+}
+
+func TestHandler_RequireHello_MultipleUpdatesDoNotPanic(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?requireHello=true"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	hello := SubscriberSourcedMessage{
+		Type:    SubMessageTypeOptionsUpdate,
+		Payload: jsonMust(t, UpdatePayload{}),
+	}
+	helloBytes := jsonMust(t, hello)
+
+	// Send the first hello.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, helloBytes))
+	// Immediately send a second valid options_update.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, helloBytes))
+	// And a third, for good measure.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, helloBytes))
+
+	// Give the handler time to process all three and Subscribe.
+	time.Sleep(100 * time.Millisecond)
+
+	// Confirm normal flow works after the chatty start.
+	publishIdentity(t, b, "did:plc:still-flowing", 1)
+	frame := readOneFrame(t, ctx, conn)
+	require.Contains(t, string(frame), "did:plc:still-flowing")
 }

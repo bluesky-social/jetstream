@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -71,6 +72,8 @@ func serve(
 		return
 	}
 
+	requireHello := parseRequireHello(values)
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns:  []string{"*"},
 		CompressionMode: websocket.CompressionDisabled,
@@ -95,8 +98,16 @@ func serve(
 	var filterPtr atomic.Pointer[Filter]
 	filterPtr.Store(initialFilter)
 
-	subCh, doneCh, unsubscribe := broadcaster.Subscribe()
-	defer unsubscribe()
+	// helloCh is closed by the reader goroutine on the first valid
+	// options_update IFF requireHello is set. The signal is idempotent
+	// via sync.Once so a chatty client sending multiple updates doesn't
+	// panic on a closed channel. The pre-Subscribe wait below selects
+	// on this channel and ctx.Done().
+	helloCh := make(chan struct{})
+	var helloOnce sync.Once
+	signalHello := func() {
+		helloOnce.Do(func() { close(helloCh) })
+	}
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -150,12 +161,36 @@ func serve(
 				}
 				filterPtr.Store(newFilter)
 				m.incOptionsUpdates()
+				// Releases the requireHello wait below on the first
+				// successful update; sync.Once makes subsequent calls
+				// no-ops, including the requireHello=false case where
+				// nothing is waiting on helloCh.
+				signalHello()
 			default:
 				// V1 PARITY: unknown types log a warning and are ignored.
 				logger.Warn("unknown subscriber message type", "type", msg.Type)
 			}
 		}
 	}()
+
+	if requireHello {
+		// V1 PARITY: pause replay/live-tail until the first valid
+		// options_update. Matches v1 README §"Options Updates":
+		// "a client can connect with ?requireHello=true ... to pause
+		// replay/live-tail until the first Options Update message is
+		// sent by the client over the socket."
+		//
+		// Invalid updates during the wait disconnect the client via the
+		// reader goroutine's existing close paths, which cancel ctx.
+		select {
+		case <-helloCh:
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	subCh, doneCh, unsubscribe := broadcaster.Subscribe()
+	defer unsubscribe()
 
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()

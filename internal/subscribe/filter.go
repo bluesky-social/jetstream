@@ -207,6 +207,19 @@ func parseMaxMsgSizeQuery(s string) uint32 {
 	return uint32(n)
 }
 
+// parseRequireHello returns true iff the requireHello query parameter is
+// exactly the literal string "true". V1 PARITY: jetstream v1 uses
+//
+//	c.Request().URL.Query().Get("requireHello") == "true"
+//
+// so any other value — including "True", "1", or "yes" — is treated as
+// false. Existing v1 clients send "true" or omit the param; we must not
+// "be liberal in what we accept" or we change wire semantics for them.
+// TestParseRequireHello locks this down — touch with care.
+func parseRequireHello(values url.Values) bool {
+	return values.Get("requireHello") == "true"
+}
+
 // SubscriberSourcedMessage is the envelope for any client→server message
 // over the websocket. v1 README §"Subscriber Sourced messages".
 type SubscriberSourcedMessage struct {
