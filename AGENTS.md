@@ -21,8 +21,10 @@ just test-race                  # full suite under -race. ~30s, swarm-dominated.
 
 just test ./segment             # one package
 just test ./segment -run TestX  # one test (gotestsum forwards args after `--`)
-just run serve                  # go run ./cmd/jetstream serve
-just build                      # binary at ./bin/jetstream
+just simulate --accounts=100    # run the simulator with 100 mock accounts
+just run serve                  # go run ./cmd/jetstream serve against the simulator
+just run-prod serve             # go run ./cmd/jetstream serve against the real production firehose
+just build                      # build binaries to ./bin
 ```
 
 ## Observability
@@ -65,3 +67,7 @@ Internalize and always carry forward the following:
     - github.com/puzpuzpuz/xsync
 - Follow existing conventions closely. Avoid introducing new patterns, make sure code style, error handling, and logging is consistent.
 - Avoid doing overly verbose comments. Comments should provide context about decision making rather than explaining simple lines of code. We should ensure that all exported symbols and packages have high level overview docstring comments.
+
+## Simulator
+
+We have a local minimal simulator available to test against quickly. It implements the minimal API surface required by PLC, PDSes, and the Relay in order to run the local jetstream development environment.
