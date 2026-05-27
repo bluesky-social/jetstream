@@ -11,7 +11,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,7 +22,6 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/internal/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 )
@@ -358,18 +356,6 @@ func (s *Server) debugMux() http.Handler {
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 	return mux
-}
-
-// handleRoot returns a small JSON identity payload. It exists primarily to
-// give us something real to instrument while the substantive endpoints are
-// being designed.
-func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
-	resp := map[string]string{
-		"name":    "jetstream",
-		"version": version.Get().Version,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // serveOrIgnoreClosed runs srv.Serve and treats ErrServerClosed as nil so
