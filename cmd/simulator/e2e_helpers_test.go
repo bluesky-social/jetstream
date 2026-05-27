@@ -16,12 +16,28 @@ import (
 // buildJetstreamForTest compiles the jetstream binary into a temp
 // dir and returns the path. Build artifacts are scoped to the test's
 // TempDir, so cleanup is automatic.
+//
+// When the test binary itself was built with -race (i.e. `go test
+// -race` / `just test-race`), we propagate -race to the spawned
+// build. Go's build cache keys include the -race flag, so without
+// this the spawned build can't reuse any of the race-mode artifacts
+// the parent `go test` run already produced — it would recompile
+// every transitive dependency in non-race mode from a cold cache.
+// CI disables Go module/build caching by policy (see ci.yml item 11),
+// so that cold rebuild has been observed to exceed the build timeout
+// under CPU contention from parallel tests. Matching the build mode
+// lets the spawned build hit the warm cache instead.
 func buildJetstreamForTest(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "jetstream")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", bin, "./cmd/jetstream")
+	args := []string{"build", "-o", bin}
+	if raceEnabled {
+		args = append(args, "-race")
+	}
+	args = append(args, "./cmd/jetstream")
+	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = repoRoot(t)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "go build jetstream: %s", string(out))
