@@ -88,6 +88,11 @@ type Config struct {
 	// against a relay with millions of users; leave 0 in production.
 	// See backfill.Config.MaxRepos for the precise semantics.
 	MaxBackfillRepos int
+
+	// SkipMergeDiscovery, a debug-only flag that skips the discovery
+	// portion of the merge phase for fast feedback loops in local
+	// development while running against production.
+	SkipMergeDiscovery bool
 }
 
 func (c *Config) validate() error {

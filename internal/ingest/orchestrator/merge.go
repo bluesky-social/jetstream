@@ -100,8 +100,10 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			}
 		}
 
-		if err := runner.runDiscovery(ctx, o.cfg.RelayURL, o.cfg.HTTPClient); err != nil {
-			return err
+		if !o.cfg.SkipMergeDiscovery {
+			if err := runner.runDiscovery(ctx, o.cfg.RelayURL, o.cfg.HTTPClient); err != nil {
+				return err
+			}
 		}
 
 		if err := os.RemoveAll(filepath.Join(o.cfg.DataDir, "backfill")); err != nil {

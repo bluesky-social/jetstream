@@ -216,6 +216,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_MAX_BACKFILL_REPOS"),
 				Value:   0,
 			},
+			&cli.BoolFlag{
+				Name:    "skip-merge-discovery",
+				Usage:   "DEBUG ONLY: . Intended for fast local-dev iteration against the production relay's millions of users; safe to leave set in production but unnecessary there.",
+				Sources: cli.EnvVars("JETSTREAM_SKIP_MERGE_DISCOVERY"),
+				Value:   false,
+			},
 			&cli.DurationFlag{
 				Name:    "status-cache-ttl",
 				Usage:   "Lifetime of the cached /status snapshot before a new one is built. Lower values (e.g. 1s in local dev) make the dashboard feel live; the production default amortizes pebble scans across requests.",
@@ -371,14 +377,15 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		// Bare logger; orchestrator.New attaches component=orchestrator
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.
-		Logger:           processLogger,
-		Metrics:          orchestrator.NewMetrics(metrics.Registry),
-		IngestMetrics:    ingest.NewMetrics(metrics.Registry),
-		LiveMetrics:      live.NewMetrics(metrics.Registry),
-		BackfillMetrics:  backfill.NewMetrics(metrics.Registry),
-		SegmentMetrics:   segmentMetrics,
-		OnEvent:          broadcaster.Publish,
-		MaxBackfillRepos: cmd.Int("max-backfill-repos"),
+		Logger:             processLogger,
+		Metrics:            orchestrator.NewMetrics(metrics.Registry),
+		IngestMetrics:      ingest.NewMetrics(metrics.Registry),
+		LiveMetrics:        live.NewMetrics(metrics.Registry),
+		BackfillMetrics:    backfill.NewMetrics(metrics.Registry),
+		SegmentMetrics:     segmentMetrics,
+		OnEvent:            broadcaster.Publish,
+		MaxBackfillRepos:   cmd.Int("max-backfill-repos"),
+		SkipMergeDiscovery: cmd.Bool("skip-merge-discovery"),
 	})
 	if err != nil {
 		return fmt.Errorf("serve: build orchestrator: %w", err)
