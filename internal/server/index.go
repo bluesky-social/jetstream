@@ -25,7 +25,7 @@ var (
 // being designed.
 func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write([]byte(rootStr))
+	_, _ = w.Write([]byte(rootStr))
 }
 
 const asciiArt = `
