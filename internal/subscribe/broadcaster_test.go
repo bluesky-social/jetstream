@@ -145,46 +145,34 @@ func TestBroadcaster_SlowDropDoesNotAffectFastPeer(t *testing.T) {
 
 	_, slowDone, slowUnsub := b.Subscribe() // never read
 	defer slowUnsub()
-	fastCh, _, fastUnsub := b.Subscribe()
+	fastCh, fastDone, fastUnsub := b.Subscribe()
 	defer fastUnsub()
 
-	// Drain fastCh in the background so the publisher never blocks on it.
-	received := make(chan uint64, 200)
-	go func() {
-		for evt := range fastCh {
-			received <- evt.Seq
+	// Drain the fast peer synchronously between publishes. This makes the
+	// test deterministic: fastCh has depth 0 entering each Publish call,
+	// so its 4-slot buffer cannot overflow regardless of scheduling. The
+	// slow peer never reads, so its buffer fills and it is dropped on the
+	// first Publish that overflows it. Earlier versions of this test used
+	// a background reader plus a microsecond sleep to "yield"; that's a
+	// hope, not synchronization, and flaked under CPU contention.
+	const N = 100
+	for i := uint64(1); i <= N; i++ {
+		b.Publish(&segment.Event{Seq: i})
+		select {
+		case got := <-fastCh:
+			require.Equal(t, i, got.Seq, "fast peer event %d", i)
+		case <-fastDone:
+			t.Fatalf("fast peer dropped unexpectedly at i=%d", i)
+		case <-time.After(time.Second):
+			t.Fatalf("fast peer did not receive event %d", i)
 		}
-	}()
-
-	for i := 1; i <= 100; i++ {
-		b.Publish(&segment.Event{Seq: uint64(i)})
-		// Yield to the reader goroutine so the fast subscriber's tiny
-		// 4-slot buffer doesn't overflow alongside the deliberately
-		// unread slow peer's. Go's scheduler is cooperative for
-		// CPU-bound goroutines and runtime.Gosched alone has been
-		// observed insufficient here; a microsecond sleep parks us
-		// long enough for the reader to drain.
-		time.Sleep(time.Microsecond)
 	}
 
-	// Slow subscriber must be dropped.
+	// Slow peer must have been dropped well before now (its 4-slot buffer
+	// fills on the 4th Publish; the 5th drops it).
 	select {
 	case <-slowDone:
 	case <-time.After(time.Second):
 		t.Fatal("slow subscriber not dropped")
-	}
-
-	// Fast peer must receive events. With slow peer dropped early, the
-	// fast peer should have plenty of buffer space, so most/all events
-	// should arrive. We check for at least 50 as a representative sample.
-	deadline := time.After(2 * time.Second)
-	got := make(map[uint64]struct{})
-	for len(got) < 50 {
-		select {
-		case s := <-received:
-			got[s] = struct{}{}
-		case <-deadline:
-			t.Fatalf("fast peer only received %d events", len(got))
-		}
 	}
 }
