@@ -193,6 +193,11 @@ type stubServer struct {
 	firstListReposCursor   string
 	firstListReposCursorMu sync.Mutex
 	firstListReposCursorOK bool
+
+	// listReposPageSize, when non-zero, makes listRepos return results
+	// in pages of this size. Cursor is the first DID of the next page,
+	// or "" when drained.
+	listReposPageSize int
 }
 
 func newStubServer(t *testing.T, fixtures map[atmos.DID]repoFixture) *stubServer {
@@ -230,11 +235,38 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 			dids = append(dids, did)
 		}
 		slices.Sort(dids)
+
 		page := listPage{}
-		for _, d := range dids {
-			page.Repos = append(page.Repos, listEntry{
-				DID: string(d), Head: "bafytest", Rev: "rev1", Active: true,
-			})
+		if s.listReposPageSize > 0 {
+			// Paginated mode: cursor is the first DID of this page.
+			cursor := r.URL.Query().Get("cursor")
+			startIdx := 0
+			if cursor != "" {
+				// Find where this cursor starts in the sorted DID list.
+				for i, d := range dids {
+					if string(d) == cursor {
+						startIdx = i
+						break
+					}
+				}
+			}
+			endIdx := min(startIdx+s.listReposPageSize, len(dids))
+			for _, d := range dids[startIdx:endIdx] {
+				page.Repos = append(page.Repos, listEntry{
+					DID: string(d), Head: "bafytest", Rev: "rev1", Active: true,
+				})
+			}
+			// Set cursor to the first DID of the next page, or "" if drained.
+			if endIdx < len(dids) {
+				page.Cursor = string(dids[endIdx])
+			}
+		} else {
+			// Non-paginated mode: return all DIDs in one page.
+			for _, d := range dids {
+				page.Repos = append(page.Repos, listEntry{
+					DID: string(d), Head: "bafytest", Rev: "rev1", Active: true,
+				})
+			}
 		}
 		_ = json.NewEncoder(w).Encode(page)
 
@@ -548,4 +580,49 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	require.True(t, found, "segment must contain at least one block")
 	require.GreaterOrEqual(t, maxSeq, uint64(1),
 		"two repos × 1 record each = 2 events; max seq must be at least 1")
+}
+
+// TestRun_PersistsBootstrapLastListReposCursor confirms the bootstrap-
+// last cursor is written on every non-empty page. The merge phase needs
+// the last non-empty cursor to resume listRepos for new-DID discovery.
+func TestRun_PersistsBootstrapLastListReposCursor(t *testing.T) {
+	t.Parallel()
+
+	// Build three DIDs that will be returned across two listRepos pages.
+	dids := []atmos.DID{"did:plc:aaa", "did:plc:bbb", "did:plc:ccc"}
+	fixtures := make(map[atmos.DID]repoFixture, len(dids))
+	for _, d := range dids {
+		fixtures[d] = buildRepoFixture(t, d)
+	}
+
+	// Create a stub server that paginates: page 1 returns did:plc:aaa
+	// and did:plc:bbb with NextCursor=did:plc:ccc; page 2 returns did:plc:ccc
+	// with NextCursor="" (the drain sentinel).
+	srv := newPaginatingStubServer(t, fixtures, 2)
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	require.NoError(t, runWithStub(t, t.Context(), srv, db))
+
+	// After drain, relay/list_repos_cursor must be empty.
+	got, err := LoadListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "", got, "post-drain cursor must be empty")
+
+	// Bootstrap-last cursor must be the last NON-EMPTY cursor seen,
+	// so the merge phase can resume listRepos for new-DID discovery.
+	last, err := LoadBootstrapLastListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "did:plc:ccc", last, "bootstrap-last cursor must be the last non-empty cursor (did:plc:ccc)")
+}
+
+// newPaginatingStubServer builds a stubServer that returns repos
+// across multiple pages of pageSize DIDs each.
+func newPaginatingStubServer(t *testing.T, fixtures map[atmos.DID]repoFixture, pageSize int) *stubServer {
+	t.Helper()
+	s := newStubServer(t, fixtures)
+	s.listReposPageSize = pageSize
+	return s
 }

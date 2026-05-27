@@ -24,7 +24,8 @@
 			"program": "${workspaceFolder}/cmd/jetstream",
 			"cwd": "${workspaceFolder}",
 			"args": [
-				"serve"
+				"serve",
+				"--max-backfill-repos=40"
 			]
 		}
 	]

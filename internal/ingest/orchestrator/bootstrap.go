@@ -49,11 +49,8 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		// Backfill writer (shared with the backfill engine).
 		bw, err := ingest.Open(ingest.Config{
-			SegmentsDir: segmentsDir,
-			Store:       o.cfg.Store,
-			// Pass cfg.Logger bare; ingest.Open sets its own
-			// component=ingest/writer attribute. Stacking ours on top
-			// would emit duplicate `component` JSON keys.
+			SegmentsDir:    segmentsDir,
+			Store:          o.cfg.Store,
 			Logger:         o.cfg.Logger,
 			Metrics:        o.cfg.IngestMetrics,
 			SegmentMetrics: o.cfg.SegmentMetrics,
@@ -64,12 +61,11 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		// Bootstrap-time live consumer.
 		bootstrapLive, err := live.Open(live.Config{
-			SegmentsDir: liveSegmentsDir,
-			Store:       o.cfg.Store,
-			SeqKey:      live.BootstrapSeqKey,
-			CursorKey:   live.CursorKey,
-			RelayURL:    o.cfg.RelayURL,
-			// Bare cfg.Logger; live.Open sets its own component.
+			SegmentsDir:    liveSegmentsDir,
+			Store:          o.cfg.Store,
+			SeqKey:         live.BootstrapSeqKey,
+			CursorKey:      live.CursorKey,
+			RelayURL:       o.cfg.RelayURL,
 			Logger:         o.cfg.Logger,
 			Metrics:        o.cfg.LiveMetrics,
 			Verifier:       o.cfg.Verifier,
@@ -115,6 +111,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
+
 			// Backfill drained cleanly. Trigger the cutover by writing
 			// phase=merging FIRST (commit point #1), THEN cancelling the
 			// live consumer. The order matters: the phase write is the
@@ -124,6 +121,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			if err := o.writeMergingPhase(); err != nil {
 				return err
 			}
+
 			// Cancel the bootstrap-live consumer's context. This signals
 			// state 2. The live consumer's Run goroutine returns shortly,
 			// and its return value is the second errgroup goroutine's
@@ -135,6 +133,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		g.Go(func() error {
 			err := bootstrapLive.Run(liveCtx)
+
 			// If the only thing that happened is the orchestrator's own
 			// cancelLive() call (after backfill drained successfully),
 			// liveCtx is cancelled but ctx (the outer process ctx) is
@@ -209,6 +208,7 @@ func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.
 		if err := bootstrapLive.Close(); err != nil {
 			return fmt.Errorf("orchestrator: close bootstrap-live consumer: %w", err)
 		}
+
 		sealW, err := ingest.Open(ingest.Config{
 			SegmentsDir: liveSegmentsDir,
 			Store:       o.cfg.Store,
@@ -232,8 +232,8 @@ func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.
 		if err := sealW.SealActiveAndClose(); err != nil {
 			return fmt.Errorf("orchestrator: seal bootstrap-live segment: %w", err)
 		}
-		o.cfg.Metrics.observeState("seal_bootstrap", time.Since(start).Seconds())
 
+		o.cfg.Metrics.observeState("seal_bootstrap", time.Since(start).Seconds())
 		return nil
 	})
 }

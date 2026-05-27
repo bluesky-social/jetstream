@@ -2,13 +2,21 @@ package orchestrator
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
+	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/identity"
@@ -29,6 +37,7 @@ import (
 type fakeRelay struct {
 	t          *testing.T
 	repos      []listReposEntry
+	pages      map[string]listReposPage // optional; cursor → page
 	srv        *httptest.Server
 	Subscribed chan struct{}
 	subOnce    sync.Once
@@ -67,6 +76,11 @@ func (f *fakeRelay) handle(w http.ResponseWriter, r *http.Request) {
 		f.subOnce.Do(func() { close(f.Subscribed) })
 		<-r.Context().Done()
 	case strings.HasSuffix(r.URL.Path, "/com.atproto.sync.listRepos"):
+		cursor := r.URL.Query().Get("cursor")
+		if page, ok := f.pages[cursor]; ok {
+			_ = json.NewEncoder(w).Encode(page)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(listReposPage{Repos: f.repos})
 	default:
 		// Surface unexpected paths in test output so a future
@@ -122,4 +136,88 @@ func newTestVerifier(t *testing.T, relayURL string) *atmossync.Verifier {
 // reach the network.
 func testIdentityDirectory() *identity.Directory {
 	return identity.NewInMemoryDirectory()
+}
+
+func newOrchestratorTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+func mustEncodeStatus(t *testing.T, rs *backfill.RepoStatus) []byte {
+	t.Helper()
+	b, err := backfill.EncodeRepoStatus(rs)
+	require.NoError(t, err)
+	return b
+}
+
+// mergeFixture builds a data dir with backfill/live_segments/ populated
+// from the supplied event slices (one slice per source segment) and
+// repo/<did> rows from the supplied per-DID backfill revs. Returns the
+// data dir, the open store (cleanup wired via t.Cleanup), and the
+// orchestrator Config wired to a fakeRelay.
+type mergeFixture struct {
+	dataDir string
+	store   *store.Store
+	cfg     Config
+	relay   *fakeRelay
+}
+
+// newMergeFixture builds the data tree. sources is a slice of slices —
+// one outer entry per source segment. Each segment is sealed before
+// returning so the merge sees fully-sealed source files. repoRevs is
+// the pre-merge per-DID Backfill.Rev (also pre-populates the top-level
+// Rev to that same value, mirroring what the real OnComplete callback
+// does). Both arguments may be nil/empty.
+func newMergeFixture(t *testing.T, sources [][]segment.Event, repoRevs map[string]string) *mergeFixture {
+	t.Helper()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	for did, rev := range repoRevs {
+		rs := &backfill.RepoStatus{
+			Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete, Rev: rev},
+			Rev:      rev,
+		}
+		require.NoError(t, st.Set(backfill.RepoKey(did), mustEncodeStatus(t, rs), store.SyncWrites))
+	}
+
+	liveDir := filepath.Join(dataDir, "backfill", "live_segments")
+	require.NoError(t, os.MkdirAll(liveDir, 0o755))
+	for _, evs := range sources {
+		w, err := ingest.Open(ingest.Config{
+			SegmentsDir: liveDir,
+			Store:       st,
+			SeqKey:      live.BootstrapSeqKey,
+			Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		require.NoError(t, err)
+		for i := range evs {
+			require.NoError(t, w.Append(t.Context(), &evs[i]))
+		}
+		require.NoError(t, w.SealActiveAndClose())
+	}
+
+	relay := newFakeRelay(t, nil)
+	cfg := Config{
+		DataDir:    dataDir,
+		Store:      st,
+		RelayURL:   relay.URL(),
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Directory:  testIdentityDirectory(),
+		Verifier:   newTestVerifier(t, relay.URL()),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return &mergeFixture{dataDir: dataDir, store: st, cfg: cfg, relay: relay}
+}
+
+// seedBootstrapLastCursor pre-populates bootstrap/last_listrepos_cursor.
+// Used by tests that exercise the post-merge discovery step.
+func (f *mergeFixture) seedBootstrapLastCursor(t *testing.T, cursor string) {
+	t.Helper()
+	require.NoError(t, backfill.MaybeSaveBootstrapLastListReposCursor(f.store, cursor))
 }

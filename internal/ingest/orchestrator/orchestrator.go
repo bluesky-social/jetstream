@@ -63,6 +63,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			if err := o.runBootstrap(ctx); err != nil {
 				return err
 			}
+
 			// runBootstrap returned cleanly: phase=merging is durably
 			// written and the bootstrap-time subsystems are torn down.
 			// Merge has NOT run and PhaseSteadyState has NOT been written;
@@ -76,17 +77,24 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			// the bootstrap-fallthrough case is a harmless idempotent
 			// re-set.
 			o.cfg.Metrics.setPhase(PhaseGaugeMerging)
-			// Re-run merge (stub no-op for now; future implementation
-			// must be idempotent).
+
+			// Re-run merge. Idempotent under partial completion: the
+			// restart-after-cleanup guard, per-source cursor, and
+			// idempotent discovery-row writes ensure a crash at any
+			// point in runMerge leaves the next start in a recoverable
+			// state. Spec §5.3.
 			if err := o.runMerge(ctx); err != nil {
 				return fmt.Errorf("orchestrator: merge: %w", err)
 			}
+
 			if err := o.writeSteadyStatePhase(); err != nil {
 				return err
 			}
+
 			fallthrough
 		case lifecycle.PhaseSteadyState:
 			return o.runSteadyState(ctx)
+
 		default:
 			return fmt.Errorf("orchestrator: unrecognized phase %q", phase)
 		}

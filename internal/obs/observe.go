@@ -52,11 +52,11 @@ func Span(ctx context.Context, fn func(context.Context) error, opts ...trace.Spa
 	return err
 }
 
-// Span1 is Span for functions that return one value plus an error.
+// Span2 is Span for functions that return one value plus an error.
 // The value is returned unmodified alongside fn's error.
 //
 // Same caller-depth and hot-path rules as Span.
-func Span1[T any](ctx context.Context, fn func(context.Context) (T, error), opts ...trace.SpanStartOption) (T, error) {
+func Span2[T any](ctx context.Context, fn func(context.Context) (T, error), opts ...trace.SpanStartOption) (T, error) {
 	ctx, span := startCallerSpan(ctx, opts)
 	v, err := fn(ctx)
 	finishSpan(span, err)

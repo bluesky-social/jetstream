@@ -89,7 +89,7 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
@@ -121,7 +121,7 @@ func TestHandler_RendersBackfillingState(t *testing.T) {
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
@@ -139,7 +139,7 @@ func TestHandler_EscapesXSS(t *testing.T) {
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
 	h.ServeHTTP(rr, req)
 
 	body := rr.Body.String()
@@ -157,7 +157,7 @@ func TestHandler_MethodNotAllowed(t *testing.T) {
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/status", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/status", nil)
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusMethodNotAllowed, rr.Code)
@@ -172,7 +172,7 @@ func TestHandler_503OnError(t *testing.T) {
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusServiceUnavailable, rr.Code)
@@ -187,7 +187,7 @@ func TestHandler_HEAD(t *testing.T) {
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodHead, "/status", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodHead, "/status", nil)
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)

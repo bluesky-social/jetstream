@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ import (
 //
 // Asserts:
 //   - Phase progresses bootstrap → merging → steady_state.
-//   - data/backfill/live_segments/ contains at least one sealed file.
+//   - data/backfill/ is cleaned up by merge phase.
 //   - data/segments/ contains at least one active file (the
 //     steady-state writer rolled forward from backfill's writer).
 //   - Run returns ctx.Err() on cancel.
@@ -60,13 +61,9 @@ func TestRun_EndToEnd_BootstrapToSteadyState(t *testing.T) {
 		return err == nil && got == lifecycle.PhaseSteadyState
 	}, 10*time.Second, 50*time.Millisecond, "phase did not reach steady_state")
 
-	// data/backfill/live_segments should have at least one sealed file.
-	liveSegs, err := readSegFiles(filepath.Join(dataDir, "backfill", "live_segments"))
-	require.NoError(t, err)
-	require.NotEmpty(t, liveSegs, "expected at least one live_segments file")
-	for _, p := range liveSegs {
-		require.True(t, isSealed(t, p), "%s should be sealed", p)
-	}
+	// data/backfill should be cleaned up by merge phase.
+	_, err = os.Stat(filepath.Join(dataDir, "backfill"))
+	require.True(t, os.IsNotExist(err), "backfill dir should be removed")
 
 	// data/segments should have at least the active file the
 	// steady-state writer opened (whether or not events have been

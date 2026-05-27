@@ -642,3 +642,41 @@ func TestSealActiveAndClose_FreshDir(t *testing.T) {
 	require.True(t, ins.Sealed)
 	require.Zero(t, ins.Header.EventCount, "sealed empty segment carries no events")
 }
+
+func TestSegmentFiles_Empty(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	got, err := SegmentFiles(dir)
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+func TestSegmentFiles_SortedAscending(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// Create out-of-order to confirm the helper sorts.
+	for _, idx := range []uint64{2, 0, 5, 1} {
+		path := filepath.Join(dir, SegmentFilename(idx))
+		require.NoError(t, os.WriteFile(path, []byte("placeholder"), 0o644))
+	}
+
+	got, err := SegmentFiles(dir)
+	require.NoError(t, err)
+	require.Len(t, got, 4)
+	require.Equal(t, []uint64{0, 1, 2, 5}, []uint64{got[0].Idx, got[1].Idx, got[2].Idx, got[3].Idx})
+	require.Equal(t, filepath.Join(dir, SegmentFilename(0)), got[0].Path)
+	require.Equal(t, filepath.Join(dir, SegmentFilename(5)), got[3].Path)
+}
+
+func TestSegmentFiles_IgnoresNonSegmentFiles(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, SegmentFilename(3)), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "README.md"), []byte("x"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "subdir"), 0o755))
+
+	got, err := SegmentFiles(dir)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(3), got[0].Idx)
+}

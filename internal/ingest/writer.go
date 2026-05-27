@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
@@ -247,6 +248,25 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	return nil
 }
 
+// Flush forces any pending block to fsync. Goroutine-safe. Used by
+// the merge phase to order destination-segment durability before
+// its cursor commit (DESIGN.md §3.1.1 / merge spec §5.2). Steady-
+// state callers do not need to call this — the per-block-fill path
+// inside Append handles ordinary flush + rotation.
+//
+// A no-op when nothing is buffered.
+func (w *Writer) Flush(ctx context.Context) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
+	if w.active == nil {
+		return nil
+	}
+	return w.flushAndRotateLocked(ctx)
+}
+
 // flushAndRotateLocked is the post-Append durability commit. The
 // caller MUST hold w.mu.
 //
@@ -344,29 +364,53 @@ func (w *Writer) ActiveIndex() uint64 {
 	return w.activeIdx
 }
 
-// scanSegmentsDir lists cfg.SegmentsDir and returns the highest seg_*
-// index seen and whether any matching files exist. Files that don't
-// match the seg_<10 base36>.jss pattern are silently skipped — the
-// directory may legitimately contain other operator-placed files.
-func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
+// SegmentFile is one entry in a SegmentFiles result.
+type SegmentFile struct {
+	Idx  uint64
+	Path string
+}
+
+// SegmentFiles returns every seg_*.jss file under dir, sorted by
+// numeric index ascending. Non-segment files and subdirectories are
+// silently skipped — the directory may legitimately contain other
+// operator-placed files.
+//
+// Used by every consumer that needs the full segment manifest in
+// creation order: the merge phase draining live_segments/, the
+// future lookaside compactor, and inspect tooling.
+func SegmentFiles(dir string) ([]SegmentFile, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return 0, false, fmt.Errorf("ingest: readdir %s: %w", dir, err)
+		return nil, fmt.Errorf("ingest: readdir %s: %w", dir, err)
 	}
+	out := make([]SegmentFile, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		i, ok := ParseSegmentIndex(e.Name())
+		idx, ok := ParseSegmentIndex(e.Name())
 		if !ok {
 			continue
 		}
-		if !has || i > idx {
-			idx = i
-			has = true
-		}
+		out = append(out, SegmentFile{Idx: idx, Path: filepath.Join(dir, e.Name())})
 	}
-	return idx, has, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Idx < out[j].Idx })
+	return out, nil
+}
+
+// scanSegmentsDir lists cfg.SegmentsDir and returns the highest seg_*
+// index seen and whether any matching files exist. Thin wrapper over
+// SegmentFiles preserved for the writer-open path.
+func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
+	files, err := SegmentFiles(dir)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(files) == 0 {
+		return 0, false, nil
+	}
+	last := files[len(files)-1]
+	return last.Idx, true, nil
 }
 
 // loadNextSeq reads the persisted seq/next counter for key. A missing

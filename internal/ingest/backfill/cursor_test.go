@@ -75,3 +75,44 @@ func TestSaveListReposCursor_EmptyValue(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "", got)
 }
+
+func TestBootstrapLastListReposCursor_RoundTrip(t *testing.T) {
+	t.Parallel()
+	db := newCursorTestStore(t)
+
+	got, err := LoadBootstrapLastListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "", got)
+
+	require.NoError(t, MaybeSaveBootstrapLastListReposCursor(db, "page-2-cursor"))
+
+	got, err = LoadBootstrapLastListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "page-2-cursor", got)
+}
+
+func TestBootstrapLastListReposCursor_IgnoresEmpty(t *testing.T) {
+	t.Parallel()
+	db := newCursorTestStore(t)
+
+	require.NoError(t, MaybeSaveBootstrapLastListReposCursor(db, "page-1-cursor"))
+	// The relay's final page returns NextCursor="". We must NOT
+	// overwrite our last-known-non-empty cursor with that.
+	require.NoError(t, MaybeSaveBootstrapLastListReposCursor(db, ""))
+
+	got, err := LoadBootstrapLastListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "page-1-cursor", got)
+}
+
+func TestBootstrapLastListReposCursor_Delete(t *testing.T) {
+	t.Parallel()
+	db := newCursorTestStore(t)
+	require.NoError(t, MaybeSaveBootstrapLastListReposCursor(db, "x"))
+
+	require.NoError(t, DeleteBootstrapLastListReposCursor(db))
+
+	got, err := LoadBootstrapLastListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "", got)
+}

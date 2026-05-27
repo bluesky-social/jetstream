@@ -70,3 +70,48 @@ func TestPrefixUpperBound(t *testing.T) {
 		require.Equal(t, c.want, string(got), "input %q", c.in)
 	}
 }
+
+func TestVersionedUint64LE_RoundTrip(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+
+	require.NoError(t, s.SetVersionedUint64LE("merge/test", 0x42, 12345))
+
+	got, ok, err := s.GetVersionedUint64LE("merge/test", 0x42)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(12345), got)
+}
+
+func TestVersionedUint64LE_AbsentKey(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+
+	got, ok, err := s.GetVersionedUint64LE("merge/missing", 0x42)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, uint64(0), got)
+}
+
+func TestVersionedUint64LE_VersionMismatch(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+
+	require.NoError(t, s.SetVersionedUint64LE("merge/test", 0x01, 7))
+
+	_, _, err := s.GetVersionedUint64LE("merge/test", 0x02)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown version")
+}
+
+func TestVersionedUint64LE_WrongLength(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+
+	// Stash a too-short value directly.
+	require.NoError(t, s.Set([]byte("merge/test"), []byte{0x01, 0x00, 0x00}, store.SyncWrites))
+
+	_, _, err := s.GetVersionedUint64LE("merge/test", 0x01)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "wrong length")
+}

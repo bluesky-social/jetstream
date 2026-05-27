@@ -69,3 +69,57 @@ func SaveListReposCursor(db *store.Store, cursor string) error {
 	}
 	return nil
 }
+
+// bootstrapLastListReposCursorKey is the pebble key carrying the
+// last *non-empty* listRepos cursor saved during the bootstrap
+// phase. The merge phase reads this to resume listRepos against
+// the relay and discover DIDs born during the bootstrap window
+// (DESIGN.md §4.7 of the merge spec).
+//
+// We need a separate key from listReposCursorKey because the
+// existing cursor is allowed (correctly) to drain to "" when
+// listRepos completes — that's how the resume path knows to start
+// from the beginning on the next Run. The merge phase needs the
+// last meaningful cursor, not the post-drain empty value.
+const bootstrapLastListReposCursorKey = "bootstrap/last_listrepos_cursor"
+
+// LoadBootstrapLastListReposCursor returns the saved bootstrap-phase
+// last-non-empty listRepos cursor, or "" if absent (debug short-
+// circuit runs that never paged past page 1, or a fresh data dir).
+func LoadBootstrapLastListReposCursor(db *store.Store) (string, error) {
+	val, closer, err := db.Get([]byte(bootstrapLastListReposCursorKey))
+	if errors.Is(err, store.ErrNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("backfill: load bootstrap_last_listrepos_cursor: %w", err)
+	}
+	defer func() { _ = closer.Close() }()
+	return string(val), nil
+}
+
+// MaybeSaveBootstrapLastListReposCursor writes cursor under
+// bootstrapLastListReposCursorKey via pebble.Sync iff cursor != "".
+// The empty-cursor short-circuit is the entire point: atmos's
+// OnPageComplete fires on every page including the post-drain
+// terminator, and we must not overwrite the last meaningful cursor
+// with the relay's "I'm done" empty value.
+func MaybeSaveBootstrapLastListReposCursor(db *store.Store, cursor string) error {
+	if cursor == "" {
+		return nil
+	}
+	if err := db.Set([]byte(bootstrapLastListReposCursorKey), []byte(cursor), store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: save bootstrap_last_listrepos_cursor: %w", err)
+	}
+	return nil
+}
+
+// DeleteBootstrapLastListReposCursor removes the key. Called by the
+// merge phase's terminal cleanup once discovery has succeeded so
+// the keyspace is clean once we reach steady state.
+func DeleteBootstrapLastListReposCursor(db *store.Store) error {
+	if err := db.Delete([]byte(bootstrapLastListReposCursorKey), store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: delete bootstrap_last_listrepos_cursor: %w", err)
+	}
+	return nil
+}

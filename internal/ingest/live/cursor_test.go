@@ -96,7 +96,7 @@ func TestLoadUpstreamCursor_RejectsHighBitSet(t *testing.T) {
 
 	// Valid v1 prefix + maximally-corrupt uint64. Reading the payload
 	// as int64 would silently produce -1.
-	corrupt := []byte{cursorV1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	corrupt := []byte{0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 	require.NoError(t, st.Set([]byte("relay/cursor"), corrupt, store.SyncWrites))
 
 	_, err := LoadUpstreamCursor(st, "relay/cursor")
@@ -118,7 +118,7 @@ func TestSaveUpstreamCursor_WritesV1Format(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = closer.Close() }()
 
-	want := []byte{cursorV1, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01}
+	want := []byte{0x01, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01}
 	require.Equal(t, want, val)
 }
 

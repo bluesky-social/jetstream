@@ -81,3 +81,26 @@ func decodeRepoStatus(b []byte) (*RepoStatus, error) {
 	}
 	return &s, nil
 }
+
+// DecodeRepoStatus is the exported decoder used by cross-package
+// readers (the orchestrator's merge phase) that need to read the
+// JSON shape stored at repo/<did>. Internal callers continue to
+// use decodeRepoStatus directly.
+func DecodeRepoStatus(b []byte) (*RepoStatus, error) {
+	return decodeRepoStatus(b)
+}
+
+// EncodeRepoStatus is the exported encoder used by cross-package
+// writers (the orchestrator's merge phase committing per-DID Rev
+// updates) that need to produce the JSON shape stored at
+// repo/<did>. Internal callers continue to use encodeRepoStatus
+// directly.
+func EncodeRepoStatus(s *RepoStatus) ([]byte, error) {
+	return encodeRepoStatus(s)
+}
+
+// RepoKey returns the pebble key for a DID's RepoStatus row. Mirror
+// of the unexported repoKey; exported for cross-package writers.
+func RepoKey(did string) []byte {
+	return []byte(repoKeyPrefix + did)
+}

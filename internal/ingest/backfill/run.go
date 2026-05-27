@@ -126,7 +126,14 @@ func Run(ctx context.Context, cfg Config) error {
 			HTTPClient:  gt.Some(cfg.HTTPClient),
 			StartCursor: gt.Some(startCursor),
 			OnPageComplete: gt.Some(func(cursor string) error {
-				return SaveListReposCursor(cfg.Store, cursor)
+				if err := SaveListReposCursor(cfg.Store, cursor); err != nil {
+					return err
+				}
+				// Persist the last non-empty cursor under a sibling
+				// key so the merge phase can resume listRepos to
+				// discover DIDs born during bootstrap. The
+				// MaybeSave helper short-circuits on cursor=="".
+				return MaybeSaveBootstrapLastListReposCursor(cfg.Store, cursor)
 			}),
 			OnError: gt.Some(func(did atmos.DID, err error) {
 				logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)

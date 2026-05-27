@@ -102,7 +102,7 @@ func TestSpan_TracerScopeFromForeignPackage(t *testing.T) {
 }
 
 func spanReturnsValue(ctx context.Context) (int, error) {
-	return obs.Span1(ctx, func(_ context.Context) (int, error) {
+	return obs.Span2(ctx, func(_ context.Context) (int, error) {
 		return 42, nil
 	})
 }
@@ -121,7 +121,7 @@ func TestSpan1_ReturnsValueAndSetsOk(t *testing.T) {
 }
 
 func spanReturnsValueErr(ctx context.Context) (string, error) {
-	return obs.Span1(ctx, func(_ context.Context) (string, error) {
+	return obs.Span2(ctx, func(_ context.Context) (string, error) {
 		return "partial", errors.New("oops")
 	})
 }
