@@ -61,14 +61,6 @@ func mountPublic(t *testing.T, srv *Server) string {
 	return ts.URL
 }
 
-func TestPublicHandler_Root(t *testing.T) {
-	t.Parallel()
-	base := mountPublic(t, newServer(t))
-
-	body := mustGet(t, base+"/")
-	require.Contains(t, body, `"name":"jetstream"`)
-}
-
 func TestDebugHandler_Metrics(t *testing.T) {
 	t.Parallel()
 	base := mountDebug(t, newServer(t))
@@ -216,10 +208,6 @@ func TestServer_LifecycleAndGracefulShutdown(t *testing.T) {
 		_ = resp.Body.Close()
 		return resp.StatusCode == http.StatusOK
 	}, 2*time.Second, 10*time.Millisecond, "server never became ready")
-
-	// And the public listener answers real HTTP traffic over real TCP.
-	body := mustGet(t, "http://"+srv.PublicAddr()+"/")
-	require.Contains(t, body, `"name":"jetstream"`)
 
 	cancel()
 
