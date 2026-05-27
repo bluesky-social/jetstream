@@ -1,8 +1,10 @@
 package subscribe
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -151,4 +154,646 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	require.NoError(t, json.Unmarshal(frame, &got))
 	require.Equal(t, "identity", got["kind"])
 	require.Equal(t, "did:plc:i", got["did"])
+}
+
+// readOneFrame reads one text frame with a 1s deadline. Centralizes the
+// pattern so tests stay terse.
+func readOneFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) []byte {
+	t.Helper()
+	rctx, rcancel := context.WithTimeout(ctx, 1*time.Second)
+	defer rcancel()
+	_, frame, err := conn.Read(rctx)
+	require.NoError(t, err)
+	return frame
+}
+
+// publishIdentity publishes a minimal identity event the encoder can render.
+func publishIdentity(t *testing.T, b *Broadcaster, did string, indexedAt int64) {
+	t.Helper()
+	id := &comatproto.SyncSubscribeRepos_Identity{
+		DID: did, Seq: indexedAt, Time: "2026-05-27T00:00:00Z",
+	}
+	payload, err := id.MarshalCBOR()
+	require.NoError(t, err)
+	b.Publish(&segment.Event{
+		IndexedAt: indexedAt, Kind: segment.KindIdentity,
+		DID: did, Payload: payload,
+	})
+}
+
+// publishCommit publishes a minimal create commit. The Payload is a
+// DAG-CBOR-encoded empty map (0xa0), which the encoder will turn into "{}".
+func publishCommit(t *testing.T, b *Broadcaster, did, collection string, indexedAt int64) {
+	t.Helper()
+	b.Publish(&segment.Event{
+		IndexedAt:  indexedAt,
+		Kind:       segment.KindCreate,
+		DID:        did,
+		Collection: collection,
+		Rkey:       "abcd1234",
+		Rev:        "3lXrev",
+		Payload:    []byte{0xa0}, // CBOR empty map
+	})
+}
+
+// publishOversizeCommit publishes a commit with a payload large enough
+// that the encoded JSON envelope will exceed any modest maxMessageSizeBytes.
+func publishOversizeCommit(t *testing.T, b *Broadcaster, did, collection string, indexedAt int64) {
+	t.Helper()
+	// CBOR map of 1 entry: key "x" → byte string of 4096 bytes.
+	// 0xa1 = map(1); 0x61 = text(1); 0x78 ... = bytes header.
+	big := bytes.NewBuffer(nil)
+	big.WriteByte(0xa1) // map(1)
+	big.WriteByte(0x61) // text(1)
+	big.WriteByte('x')  // "x"
+	big.WriteByte(0x59) // bytes, 2-byte length follows
+	big.WriteByte(0x10) // 0x1000 = 4096
+	big.WriteByte(0x00)
+	big.Write(make([]byte, 0x1000)) // 4096 zero bytes
+	b.Publish(&segment.Event{
+		IndexedAt:  indexedAt,
+		Kind:       segment.KindCreate,
+		DID:        did,
+		Collection: collection,
+		Rkey:       "abcd1234",
+		Rev:        "3lXrev",
+		Payload:    big.Bytes(),
+	})
+}
+
+func TestHandler_Filter_RejectsInvalidQuery(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// Illegal prefix (must be at NSID boundary).
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"?wantedCollections=app.bsky.fo*", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	require.Contains(t, string(body), "invalid collection")
+}
+
+// TestHandler_Filter_RejectsTooManyQueryParams verifies the handler
+// returns HTTP 400 when the unique wantedDids count exceeds
+// MaxWantedDIDs. Uses unique DIDs so the post-dedupe cap fires —
+// duplicates would dedupe back below the cap (V1 PARITY).
+func TestHandler_Filter_RejectsTooManyQueryParams(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	var sb strings.Builder
+	for i := 0; i <= MaxWantedDIDs; i++ {
+		if i > 0 {
+			sb.WriteByte('&')
+		}
+		fmt.Fprintf(&sb, "wantedDids=did:web:host%d.example.com", i)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"?"+sb.String(), nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	require.Contains(t, string(body), "subscribe: invalid options",
+		"the response should be wrapped in our ErrInvalidOptions string")
+}
+
+func TestHandler_Filter_WantedCollections_DeliversMatching(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?wantedCollections=app.bsky.feed.post"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Build a record-bearing commit. Encoder needs DAG-CBOR Payload + a CID;
+	// the simplest valid CBOR is an empty map: 0xa0 = empty map.
+	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.like", 1)
+	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.post", 2)
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "commit", got["kind"])
+	commit, ok := got["commit"].(map[string]any)
+	require.True(t, ok, "commit field should be a map")
+	require.Equal(t, "app.bsky.feed.post", commit["collection"])
+}
+
+// V1 PARITY end-to-end check: a top-level vendor prefix
+// "app.bsky.*" (only 2 segments before the wildcard) must be accepted
+// as a filter and match commits in any sub-collection. This is the
+// regression case the v1 code accepts but our previous strict
+// NSID-validating prefix branch rejected.
+func TestHandler_Filter_WantedCollections_TopLevelPrefix(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?wantedCollections=app.bsky.*"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err, "two-segment prefix must be accepted (v1 parity)")
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	publishCommit(t, b, "did:plc:abc", "com.example.foo", 1)       // outside prefix
+	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.post", 2)    // inside prefix
+	publishCommit(t, b, "did:plc:abc", "app.bsky.graph.follow", 3) // inside prefix
+
+	for i := 0; i < 2; i++ {
+		frame := readOneFrame(t, ctx, conn)
+		var got map[string]any
+		require.NoError(t, json.Unmarshal(frame, &got))
+		commit, ok := got["commit"].(map[string]any)
+		require.True(t, ok)
+		col, _ := commit["collection"].(string)
+		require.True(t, strings.HasPrefix(col, "app.bsky."),
+			"unexpected collection %q delivered through app.bsky.* filter", col)
+	}
+}
+
+func TestHandler_Filter_WantedCollections_PrefixMatch(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?wantedCollections=app.bsky.graph.*"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.post", 1)
+	publishCommit(t, b, "did:plc:abc", "app.bsky.graph.follow", 2)
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	commit, ok := got["commit"].(map[string]any)
+	require.True(t, ok, "commit field should be a map")
+	require.Equal(t, "app.bsky.graph.follow", commit["collection"])
+}
+
+func TestHandler_Filter_WantedDIDs_DeliversMatching(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?wantedDids=did:plc:want"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	publishCommit(t, b, "did:plc:other", "app.bsky.feed.post", 1)
+	publishCommit(t, b, "did:plc:want", "app.bsky.feed.post", 2)
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "did:plc:want", got["did"])
+}
+
+func TestHandler_Filter_IdentityBypassesCollectionFilter(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?wantedCollections=app.bsky.feed.post"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	publishIdentity(t, b, "did:plc:any", 1)
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "identity", got["kind"])
+}
+
+func TestHandler_Filter_IdentityRespectsDIDFilter(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?wantedDids=did:plc:want"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	publishIdentity(t, b, "did:plc:other", 1)
+	publishIdentity(t, b, "did:plc:want", 2)
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "did:plc:want", got["did"])
+}
+
+func TestHandler_Filter_MaxMessageSize_DropsOversize(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// 200 bytes is enough for a small commit envelope but not for a giant one.
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?maxMessageSizeBytes=200"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	// Identity events are tiny; one should fit. Use them as the
+	// "delivered" half of this test rather than constructing oversize
+	// commits (which require valid CBOR + CID).
+	publishOversizeCommit(t, b, "did:plc:big", "app.bsky.feed.post", 1)
+	publishIdentity(t, b, "did:plc:small", 2)
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	// We should see the identity (small) but never the oversize commit.
+	require.Equal(t, "identity", got["kind"])
+}
+
+// V1 PARITY regression guard — empty maxMessageSizeBytes coerces to "no cap".
+func TestHandler_Filter_MaxMessageSize_EmptyMeansNoCap(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?maxMessageSizeBytes="
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err, "empty maxMessageSizeBytes must NOT reject the connection")
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+}
+
+// V1 PARITY regression guard — negative maxMessageSizeBytes coerces to "no cap".
+func TestHandler_Filter_MaxMessageSize_NegativeMeansNoCap(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?maxMessageSizeBytes=-1"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err, "negative maxMessageSizeBytes must NOT reject the connection")
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+}
+
+func TestHandler_OptionsUpdate_ChangesFilter(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	// Narrow to likes only.
+	update := SubscriberSourcedMessage{
+		Type: SubMessageTypeOptionsUpdate,
+		Payload: jsonMust(t, UpdatePayload{
+			WantedCollections: []string{"app.bsky.feed.like"},
+		}),
+	}
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, update)))
+
+	// Give the reader goroutine a moment to apply the update.
+	time.Sleep(50 * time.Millisecond)
+
+	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.post", 1)
+	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.like", 2)
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	commit, ok := got["commit"].(map[string]any)
+	require.True(t, ok, "commit field should be a map")
+	require.Equal(t, "app.bsky.feed.like", commit["collection"])
+}
+
+func TestHandler_OptionsUpdate_InvalidPayloadDisconnects(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusInternalError, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	// Send malformed JSON envelope.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte("not json")))
+
+	// The next read should observe a close.
+	rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
+	defer rcancel()
+	_, _, err = conn.Read(rctx)
+	require.Error(t, err, "expected close after malformed envelope")
+}
+
+func TestHandler_OptionsUpdate_BadNSIDDisconnects(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusInternalError, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	update := SubscriberSourcedMessage{
+		Type: SubMessageTypeOptionsUpdate,
+		Payload: jsonMust(t, UpdatePayload{
+			WantedCollections: []string{"app.bsky.fo*"}, // illegal prefix
+		}),
+	}
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, update)))
+
+	rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
+	defer rcancel()
+	_, _, err = conn.Read(rctx)
+	require.Error(t, err, "expected close after bad NSID in options_update")
+}
+
+func TestHandler_OptionsUpdate_OversizePayload(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	// The handler raises the server-side read limit to exactly
+	// MaxSubscriberMessageBytes; one byte beyond it should be the
+	// websocket layer's read-limit close (StatusMessageTooBig), which
+	// the application path observes as a Read error and counts via
+	// the optionsUpdateErrorReasonOversize metric label.
+	defer func() { _ = conn.Close(websocket.StatusInternalError, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	// Send a payload just over MaxSubscriberMessageBytes.
+	big := make([]byte, MaxSubscriberMessageBytes+1)
+	for i := range big {
+		big[i] = ' '
+	}
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, big))
+
+	rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
+	defer rcancel()
+	_, _, err = conn.Read(rctx)
+	require.Error(t, err, "expected close after oversize subscriber message")
+}
+
+func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	time.Sleep(50 * time.Millisecond)
+
+	// V1 PARITY: unknown message types are logged and ignored, not fatal.
+	unknown := SubscriberSourcedMessage{
+		Type:    "unknown_type",
+		Payload: json.RawMessage(`null`),
+	}
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, unknown)))
+
+	// Subsequent events must still flow.
+	time.Sleep(50 * time.Millisecond)
+	publishIdentity(t, b, "did:plc:still-alive", 1)
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "identity", got["kind"])
+}
+
+// Small helper used by the options_update tests.
+func jsonMust[T any](t *testing.T, v T) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return b
+}
+
+// truncateCloseReason must always emit valid UTF-8 (RFC 6455 §5.5.1
+// requires the close-frame reason to be valid UTF-8, and
+// coder/websocket rejects close frames whose reason is not). The
+// echoed-back-input close path can mid-cut a multi-byte rune unless
+// the cut snaps to a rune boundary.
+func TestTruncateCloseReason_RuneAligned(t *testing.T) {
+	t.Parallel()
+
+	// Build an input where a naive byte-cut at 120 lands inside a
+	// 3-byte rune. Each "λ" is 2 bytes; "你" is 3 bytes. Pad with
+	// ASCII so the truncate point falls inside a multi-byte rune.
+	pad := strings.Repeat("a", 119)
+	in := pad + "你你你你你你"
+	out := truncateCloseReason(in)
+	require.LessOrEqual(t, len(out), 123, "must fit close-frame cap")
+	require.True(t, utf8.ValidString(out), "truncated reason must be valid UTF-8: %q", out)
+	require.True(t, strings.HasSuffix(out, "..."), "expected truncation suffix")
+
+	// Short input — no truncation, no suffix.
+	short := "hello"
+	require.Equal(t, short, truncateCloseReason(short))
+
+	// Boundary: input exactly at the cap is returned unchanged.
+	exact := strings.Repeat("a", 123)
+	require.Equal(t, exact, truncateCloseReason(exact))
 }

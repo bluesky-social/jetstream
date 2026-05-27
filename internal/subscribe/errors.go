@@ -9,3 +9,9 @@ import "errors"
 //
 //nolint:unused
 var errSkipEvent = errors.New("subscribe: skip event")
+
+// ErrInvalidOptions wraps validation failures from ParseQuery and
+// ParseUpdatePayload. Callers (the handler, plus tests outside this
+// package) errors.Is against it to distinguish bad-input failures from
+// other errors.
+var ErrInvalidOptions = errors.New("subscribe: invalid options")

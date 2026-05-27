@@ -23,6 +23,13 @@ func TestNewMetrics_RegistersAllSeries(t *testing.T) {
 	m.incEventsSkippedSync()
 	m.incEncodeErrors()
 	m.observeQueueDepth(42)
+	m.incEventsFiltered()
+	m.incEventsOversize()
+	m.incOptionsUpdates()
+	m.incOptionsUpdateError(optionsUpdateErrorReasonOversize)
+	m.incOptionsUpdateError(optionsUpdateErrorReasonBadEnvelopeJSON)
+	m.incOptionsUpdateError(optionsUpdateErrorReasonBadPayloadJSON)
+	m.incOptionsUpdateError(optionsUpdateErrorReasonInvalidOptions)
 }
 
 func TestMetrics_NilReceiverIsNoop(t *testing.T) {
@@ -39,4 +46,8 @@ func TestMetrics_NilReceiverIsNoop(t *testing.T) {
 	m.incEventsSkippedSync()
 	m.incEncodeErrors()
 	m.observeQueueDepth(7)
+	m.incEventsFiltered()
+	m.incEventsOversize()
+	m.incOptionsUpdates()
+	m.incOptionsUpdateError(optionsUpdateErrorReasonOversize)
 }

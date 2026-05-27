@@ -1,7 +1,8 @@
 // Package subscribe owns the live websocket fan-out behind the public
-// /subscribe endpoint.
+// /subscribe endpoint, plus the v1-compatible filtering and
+// subscriber-sourced-message protocol that clients depend on.
 //
-// The package has three concerns, each in its own file:
+// The package has four concerns, each in its own file:
 //
 //   - broadcaster.go: a single-publisher / many-subscriber pub/sub with
 //     bounded per-subscriber channels. Slow subscribers are dropped, never
@@ -10,11 +11,58 @@
 //   - encoder.go: a pure function family that turns a segment.Event into
 //     the Jetstream v1-compatible JSON wire format.
 //
-//   - handler.go: an http.Handler that upgrades to a websocket, registers
-//     with the broadcaster, and pumps encoded events to the client until
-//     either side hangs up.
+//   - filter.go: the per-connection Filter — wantedCollections,
+//     wantedDids, maxMessageSizeBytes — plus parsers for the query-string
+//     and options_update wire formats.
 //
-// The first cut deliberately omits filtering, cursor replay,
-// SubscriberOptionsUpdatePayload, and compression. See
-// docs/superpowers/specs/2026-05-25-subscribe-design.md §10.
+//   - handler.go: an http.Handler that upgrades to a websocket, parses
+//     the initial filter, registers with the broadcaster, and pumps
+//     filtered+encoded events to the client. The reader goroutine
+//     accepts SubscriberSourcedMessage frames and applies options_update
+//     by swapping a per-connection atomic.Pointer[Filter].
+//
+// V1 wire compatibility is the explicit design point. Where v2's house
+// style ("crash loud, no silent fallbacks" — CLAUDE.md) would diverge
+// from the v1 README's stated contract, this package deliberately
+// matches v1. The places we do that are:
+//
+//   - maxMessageSizeBytes silently coerces empty/malformed/negative
+//     values to 0 ("no cap"). v1 README: "Zero means no limit, negative
+//     values are treated as zero." Locked down by
+//     TestParseMaxMsgSize_V1Compat.
+//
+//   - Identity and Account events bypass wantedCollections — they are
+//     always delivered, regardless of the subscriber's collection
+//     filter. v1 README: "Regardless of desired collections, all
+//     subscribers receive Account and Identity events." Locked down by
+//     TestWants_IdentityBypassesCollectionFilter.
+//
+//   - #sync events are deliberately not emitted. v1 didn't emit them
+//     either; the v2 archive path is authoritative for #sync.
+//     Implemented in encoder.go via errSkipEvent.
+//
+//   - Unknown SubscriberSourcedMessage.Type values are logged and
+//     ignored, not fatal. v1 has the same policy. Locked down by
+//     TestHandler_OptionsUpdate_UnknownTypeIgnored.
+//
+//   - wantedCollections accepts any "<prefix>.*" pattern with no
+//     validation of the head — v1's docs claim the head must pass
+//     NSID validation, but v1's actual code does not enforce it,
+//     and patterns like "app.bsky.*" appear in v1 client examples.
+//     Locked down by TestParseQuery_PrefixCollection_TwoSegment.
+//
+//   - Filter caps fire post-dedupe (parseWantedDIDs and
+//     parseWantedCollections build the unique set first, then
+//     compare to MaxWantedDIDs / MaxWantedCollections). v1 does
+//     the same on DIDs; we extend the same forgiveness to
+//     collections for symmetry.
+//
+//   - A commit with an empty collection field bypasses the
+//     wantedCollections filter — matches v1's WantsCollection.
+//
+// Out of scope for this v1-compat surface: cursor replay, zstd
+// compression, requireHello. We accept those query params
+// (silently ignored for cursor; absent for requireHello) so that v1
+// clients that send them aren't rejected. Future v2-native endpoints
+// will live alongside this package or in a sibling.
 package subscribe
