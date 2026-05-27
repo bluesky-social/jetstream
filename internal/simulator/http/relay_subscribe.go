@@ -29,7 +29,8 @@ const subscribeReplayLimit = 1024
 //     ctx is cancelled.
 func newRelaySubscribeReposHandler(w *world.World) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
 		conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,
 		})
@@ -47,6 +48,22 @@ func newRelaySubscribeReposHandler(w *world.World) http.Handler {
 			}
 			cursor = n
 		}
+
+		// Reader goroutine: drains client->server frames so the handler
+		// notices when the client hangs up (mirrors internal/subscribe).
+		// Without this, a client's close frame can't be acknowledged and
+		// the close handshake stalls until the library timeout (~5s),
+		// keeping the subscriber attached the whole time. We don't act
+		// on any client frames; subscribeRepos has no client->server
+		// payload in the protocol.
+		go func() {
+			defer cancel()
+			for {
+				if _, _, rerr := conn.Reader(ctx); rerr != nil {
+					return
+				}
+			}
+		}()
 
 		// Subscribe BEFORE replay — see step 2 in the package comment.
 		sub := w.SubscribeFanout()
