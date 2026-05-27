@@ -54,9 +54,11 @@ simulator-reset:
 test-long *ARGS="./...":
     gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 {{ARGS}}
 
-# Runs the tests in -short mode.
+# Runs the tests in -short mode. Hides the skipped-test summary because
+# heavy tests (e.g. the simulator E2E) are deliberately skipped here and
+# the listing is just noise.
 test *ARGS="./...":
-    just test-long -short {{ARGS}}
+    gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 -short {{ARGS}}
 
 # Runs the tests with the race detector enabled
 test-race *ARGS="./...":

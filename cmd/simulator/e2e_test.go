@@ -25,6 +25,9 @@ import (
 //
 // Heavy test (subprocess + backfill drain): skipped under -short.
 func TestEndToEnd_JetstreamConsumesSimulator(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heavy test: spawns jetstream subprocess and waits for backfill")
+	}
 	t.Parallel()
 
 	// Build the simulator world directly. Spawning cmd/simulator as

@@ -45,7 +45,7 @@ Internalize and always carry forward the following:
     - Fuzz tests and property based tests are valuable for many things, notably handling untrusted user input, or finding edge cases you may not have thought of that violate your invariants
     - Swarm testing to generate some meaningful randomness, not just white noise randomness
     - Smoke tests against real, live, production data
-    - We make our tests execute very quickly so we can maintain fast feedback loops
+    - We make our tests execute very quickly so we can maintain fast feedback loops. If there are any packages that take more than a second to run all tests, question it and attempt to improve so they run in under a second.
 - We use minimal logging to stdout/stderr, but we do extensive metrics with prometheus and distributed tracing with OTEL
     - Observability is critical to the success of this project, so we instrument with metrics and traces liberally
 - The local development environment must be very simple to use
