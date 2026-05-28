@@ -261,12 +261,20 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 			if i == 0 {
 				info.MinSeq = ev.Seq
 				info.MaxSeq = ev.Seq
+				info.MinIndexedAt = ev.IndexedAt
+				info.MaxIndexedAt = ev.IndexedAt
 			}
 			if ev.Seq < info.MinSeq {
 				info.MinSeq = ev.Seq
 			}
 			if ev.Seq > info.MaxSeq {
 				info.MaxSeq = ev.Seq
+			}
+			if ev.IndexedAt < info.MinIndexedAt {
+				info.MinIndexedAt = ev.IndexedAt
+			}
+			if ev.IndexedAt > info.MaxIndexedAt {
+				info.MaxIndexedAt = ev.IndexedAt
 			}
 
 			if !res.sawAny {

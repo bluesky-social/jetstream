@@ -162,7 +162,7 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 	}
 
 	bw.printf("\nblocks (%d total):\n", len(ins.Blocks))
-	bw.printf("  idx       offset  comp_size  uncomp_size  events     min_seq     max_seq  cols\n")
+	bw.printf("  idx       offset  comp_size  uncomp_size  events     min_seq     max_seq                  min_indexed_at                  max_indexed_at  cols\n")
 
 	emitRow := func(i int) {
 		b := ins.Blocks[i]
@@ -170,9 +170,11 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 		if i < len(ins.BlockCollections) {
 			cols = len(ins.BlockCollections[i])
 		}
-		bw.printf("  %3d  0x%010x  %9d  %11d  %6d  %10d  %10d  %4d\n",
+		bw.printf("  %3d  0x%010x  %9d  %11d  %6d  %10d  %10d  %30s  %30s  %4d\n",
 			i, b.Offset, b.CompressedSize, b.UncompressedSize,
-			b.EventCount, b.MinSeq, b.MaxSeq, cols)
+			b.EventCount, b.MinSeq, b.MaxSeq,
+			formatMicros(b.MinIndexedAt), formatMicros(b.MaxIndexedAt),
+			cols)
 		if blocksMode == "full" && i < len(ins.BlockCollections) && len(ins.BlockCollections[i]) > 0 {
 			names := make([]string, 0, len(ins.BlockCollections[i]))
 			for _, id := range ins.BlockCollections[i] {

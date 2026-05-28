@@ -260,3 +260,24 @@ func TestInspectSegmentCommand_RejectsMissingArg(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "expected exactly one path argument")
 }
+
+// TestRenderInspection_PerBlockIndexedAtColumns asserts the per-block
+// table includes min_indexed_at and max_indexed_at columns and emits
+// formatted timestamps for them.
+func TestRenderInspection_PerBlockIndexedAtColumns(t *testing.T) {
+	t.Parallel()
+
+	path := makeSealedFixture(t)
+	ins, err := segment.Inspect(path)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, renderInspection(&buf, ins, "table", 100))
+
+	out := buf.String()
+	require.Contains(t, out, "min_indexed_at")
+	require.Contains(t, out, "max_indexed_at")
+	// makeSealedFixture seeds IndexedAt with 1_700_000_000_000_000 + seq,
+	// which renders as a 2023-11 timestamp. Spot-check the year prefix.
+	require.Contains(t, out, "2023-11-")
+}

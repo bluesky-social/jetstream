@@ -65,6 +65,16 @@ func TestInspect_SealedRoundtrip(t *testing.T) {
 		ins.Collections)
 	require.Len(t, ins.BlockCollections, len(ins.Blocks))
 
+	// Per-block indexed_at bounds round-trip through seal.
+	for i, b := range ins.Blocks {
+		require.LessOrEqual(t, b.MinIndexedAt, b.MaxIndexedAt,
+			"block %d has inverted indexed_at bounds", i)
+		require.GreaterOrEqual(t, b.MinIndexedAt, int64(1_000_000),
+			"block %d min_indexed_at below fixture floor", i)
+		require.LessOrEqual(t, b.MaxIndexedAt, int64(1_000_004),
+			"block %d max_indexed_at above fixture ceiling", i)
+	}
+
 	require.EqualValues(t, sealRes.EventCount, ins.TotalEvents)
 	require.NotZero(t, ins.BlockIndexBytes)
 	require.NotZero(t, ins.SegmentBloomBytes)
@@ -169,6 +179,15 @@ func TestInspect_ActiveFileWithBlocks(t *testing.T) {
 		[]string{"app.bsky.feed.post", "app.bsky.feed.like"},
 		ins.Collections)
 	require.Len(t, ins.BlockCollections, 2)
+
+	for i, b := range ins.Blocks {
+		require.LessOrEqual(t, b.MinIndexedAt, b.MaxIndexedAt,
+			"active block %d has inverted indexed_at bounds", i)
+		require.GreaterOrEqual(t, b.MinIndexedAt, int64(2_000_000),
+			"active block %d min below fixture floor", i)
+		require.LessOrEqual(t, b.MaxIndexedAt, int64(2_000_003),
+			"active block %d max above fixture ceiling", i)
+	}
 }
 
 func TestInspect_ActiveFileEmpty(t *testing.T) {

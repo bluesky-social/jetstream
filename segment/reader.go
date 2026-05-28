@@ -30,8 +30,8 @@ type ReaderConfig struct {
 // has ~64k blocks; an order of magnitude beyond that is extravagant.
 // 1<<20 lets us absorb future block-size knob changes without
 // rebuilding the cap, while still bounding the worst-case allocation
-// a hostile/corrupt header can drive: at 36 bytes per block index
-// entry, that's 36 MB rather than 4 GB.
+// a hostile/corrupt header can drive: at blockIndexEntrySize bytes
+// per entry, that's ~52 MB rather than 4 GB.
 const maxBlockCountLimit = 1 << 20
 
 // maxCollectionCountLimit caps the unique-collections-per-segment
@@ -406,6 +406,11 @@ func validateBlockOffsets(blocks []BlockInfo, footerOffset uint64) error {
 			return fmt.Errorf(
 				"%w: block %d has max_seq %d < min_seq %d",
 				ErrInvalidBlockIndex, i, b.MaxSeq, b.MinSeq)
+		}
+		if b.MaxIndexedAt < b.MinIndexedAt {
+			return fmt.Errorf(
+				"%w: block %d has max_indexed_at %d < min_indexed_at %d",
+				ErrInvalidBlockIndex, i, b.MaxIndexedAt, b.MinIndexedAt)
 		}
 		prevEnd = end
 	}

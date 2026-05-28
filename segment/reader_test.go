@@ -388,8 +388,8 @@ func TestReaderOpenRejectsOverlappingBlockIndex(t *testing.T) {
 	require.NoError(t, err)
 
 	// Patch the SECOND block-index entry's offset to point inside the
-	// first block. blockIndexEntrySize=36, the offset field is at
-	// the entry's offset 0..8.
+	// first block. The offset field is at entry-relative bytes 0..8;
+	// we step over the first entry by adding blockIndexEntrySize.
 	var bad [8]byte
 	binary.LittleEndian.PutUint64(bad[:], uint64(ReservedHeaderBytes))
 	secondOffsetField := int64(hdr.BlockIndexOffset) + int64(blockIndexEntrySize)
@@ -445,4 +445,42 @@ func TestReaderConcurrentDecodeBlock(t *testing.T) {
 	for err := range errs {
 		t.Fatal(err)
 	}
+}
+
+// TestReaderOpenRejectsInvertedIndexedAtBounds asserts the
+// validateBlockOffsets pass refuses a file whose block-index entry
+// has max_indexed_at < min_indexed_at. Mirrors the existing seq
+// invariant test pattern.
+func TestReaderOpenRejectsInvertedIndexedAtBounds(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := sealedSegmentForReader(t, dir, []Event{
+		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, IndexedAt: 200, Kind: KindCreate, DID: "did:plc:b"},
+	}, 2)
+
+	// Patch the FIRST block-index entry's max_indexed_at to a value
+	// less than its min_indexed_at. The two indexed_at fields live at
+	// entry-relative offsets [36:44] and [44:52].
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+
+	headerBytes := make([]byte, ReservedHeaderBytes)
+	_, err = f.ReadAt(headerBytes, 0)
+	require.NoError(t, err)
+	hdr, err := decodeHeader(headerBytes)
+	require.NoError(t, err)
+
+	// First entry's min is currently 100, max is 200. Patch max to 50.
+	maxField := int64(hdr.BlockIndexOffset) + 44
+	var bad [8]byte
+	binary.LittleEndian.PutUint64(bad[:], uint64(50))
+	_, err = f.WriteAt(bad[:], maxField)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+
+	_, err = Open(ReaderConfig{Path: path, SkipChecksum: true})
+	require.True(t, errors.Is(err, ErrInvalidBlockIndex))
 }

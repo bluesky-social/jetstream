@@ -197,13 +197,15 @@ Jetstream Sealed Segment File (.jss):
 │ Block N                                                  │
 ├──────────────────────────────────────────────────────────┤
 │ Variable-Len Footer (appended at seal time)              │
-│   Block Index [N entries, each 36 bytes]:                │
+│   Block Index [N entries, each 52 bytes]:                │
 │     offset:            uint64  (byte offset in file)     │
 │     compressed_size:   uint32                            │
 │     uncompressed_size: uint32                            │
 │     event_count:       uint32                            │
 │     min_seq:           uint64                            │
 │     max_seq:           uint64                            │
+│     min_indexed_at:    int64   (unix micros)             │
+│     max_indexed_at:    int64   (unix micros)             │
 │   DID Bloom Filter                                       │
 │     Serialized gloom.Filter (MarshalBinary)              │
 │     Covers all unique DIDs in this segment               │

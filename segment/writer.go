@@ -89,6 +89,18 @@ type Writer struct {
 	// frame and produce duplicate rows on disk. The caller must
 	// Close the writer and start over.
 	stickyErr error
+
+	// flushedBlocks carries one BlockInfo per block already written
+	// and fsynced. Appended in flushLocked after the Write succeeds.
+	// Cleared on Seal (the writer is consumed). Rebuilt at New()
+	// time when resuming an existing active segment.
+	flushedBlocks []BlockInfo
+
+	// nextBlockOffset is the file offset at which the *next* flush
+	// will write its 8-byte length prefix. Seeded from the file size
+	// at New() time (after any torn-tail truncate); updated after
+	// each successful flush by adding 8 + len(zstd frame).
+	nextBlockOffset uint64
 }
 
 // New opens or creates the active segment at cfg.Path. See package
@@ -141,9 +153,25 @@ func New(cfg Config) (*Writer, error) {
 		}
 	}
 
-	success = true
 	w := &Writer{cfg: cfg, file: f}
 	w.pending.preallocate(cfg.MaxEventsPerBlock)
+
+	endInfo, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("segment: stat after open: %w", err)
+	}
+	w.nextBlockOffset = uint64(endInfo.Size())
+	if endInfo.Size() > int64(ReservedHeaderBytes) {
+		walk, walkErr := walkActiveFrames(f, endInfo.Size())
+		if walkErr != nil {
+			return nil, walkErr
+		}
+		// walk.infos already carries every field we care about
+		// because the seal walk populates the indexed_at bounds.
+		w.flushedBlocks = walk.infos
+	}
+
+	success = true
 	return w, nil
 }
 
@@ -300,6 +328,20 @@ type pendingBlock struct {
 	rkeys       []byte
 	revs        []byte
 	payloads    []byte
+
+	// pendingBounds is the running min/max of seq and indexed_at
+	// across the events currently buffered. Reset on flushLocked
+	// after the BlockInfo for this block is finalized.
+	pendingBounds blockBounds
+	sawAny        bool
+}
+
+// blockBounds is the running per-block summary tracked incrementally
+// by Append so flushLocked can finalize a BlockInfo without
+// re-walking the events.
+type blockBounds struct {
+	minSeq, maxSeq             uint64
+	minIndexedAt, maxIndexedAt int64
 }
 
 // count returns the number of events currently buffered. All column
@@ -347,6 +389,8 @@ func (p *pendingBlock) reset() {
 	p.rkeys = p.rkeys[:0]
 	p.revs = p.revs[:0]
 	p.payloads = p.payloads[:0]
+	p.pendingBounds = blockBounds{}
+	p.sawAny = false
 }
 
 // Close flushes any pending block and closes the file. Idempotent.
@@ -460,9 +504,24 @@ func (w *Writer) flushLocked() error {
 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 		return w.stickyErr
 	}
-	// Write succeeded: the bytes are owned by the file. Drop the
-	// pending buffer so a Sync failure cannot re-encode the same
-	// rows on a retry.
+	// Write succeeded: the bytes are owned by the file. Snapshot the
+	// BlockInfo before resetting the pending buffer; reset() zeroes
+	// pendingBounds.
+	info := BlockInfo{
+		Offset:           w.nextBlockOffset,
+		CompressedSize:   uint32(len(w.wireScratch) - 8),
+		UncompressedSize: uint32(len(w.bodyScratch)),
+		EventCount:       uint32(w.pending.count()),
+		MinSeq:           w.pending.pendingBounds.minSeq,
+		MaxSeq:           w.pending.pendingBounds.maxSeq,
+		MinIndexedAt:     w.pending.pendingBounds.minIndexedAt,
+		MaxIndexedAt:     w.pending.pendingBounds.maxIndexedAt,
+	}
+	w.flushedBlocks = append(w.flushedBlocks, info)
+	w.nextBlockOffset += uint64(len(w.wireScratch))
+
+	// Drop the pending buffer so a Sync failure cannot re-encode the
+	// same rows on a retry.
 	w.pending.reset()
 
 	if err := syncFile(w.file); err != nil {
@@ -507,6 +566,27 @@ func (w *Writer) Append(ev Event) (full bool, err error) {
 	p.revs = append(p.revs, ev.Rev...)
 	p.payloads = append(p.payloads, ev.Payload...)
 
+	if !p.sawAny {
+		p.pendingBounds.minSeq = ev.Seq
+		p.pendingBounds.maxSeq = ev.Seq
+		p.pendingBounds.minIndexedAt = ev.IndexedAt
+		p.pendingBounds.maxIndexedAt = ev.IndexedAt
+		p.sawAny = true
+	} else {
+		if ev.Seq < p.pendingBounds.minSeq {
+			p.pendingBounds.minSeq = ev.Seq
+		}
+		if ev.Seq > p.pendingBounds.maxSeq {
+			p.pendingBounds.maxSeq = ev.Seq
+		}
+		if ev.IndexedAt < p.pendingBounds.minIndexedAt {
+			p.pendingBounds.minIndexedAt = ev.IndexedAt
+		}
+		if ev.IndexedAt > p.pendingBounds.maxIndexedAt {
+			p.pendingBounds.maxIndexedAt = ev.IndexedAt
+		}
+	}
+
 	return p.count() >= w.cfg.MaxEventsPerBlock, nil
 }
 
@@ -515,3 +595,27 @@ func (w *Writer) Pending() int { return w.pending.count() }
 
 // Cap returns Config.MaxEventsPerBlock.
 func (w *Writer) Cap() int { return w.cfg.MaxEventsPerBlock }
+
+// Blocks returns a snapshot of the blocks already flushed to disk.
+// The pending in-memory block is deliberately excluded — its bytes
+// are not yet on disk, so its Offset would be a lie. Callers that
+// need bounds for in-flight events can wait for the next Flush.
+//
+// On a writer that has been Sealed (or has not yet flushed any
+// block), Blocks returns nil. The caller can range over a nil
+// slice safely; it never needs an explicit nil check.
+//
+// Like every Writer method, Blocks is not safe for concurrent use
+// with Append / Flush / Seal / Close. The caller already serializes
+// access to the writer.
+func (w *Writer) Blocks() []BlockInfo {
+	if w.closed {
+		return nil
+	}
+	if len(w.flushedBlocks) == 0 {
+		return nil
+	}
+	out := make([]BlockInfo, len(w.flushedBlocks))
+	copy(out, w.flushedBlocks)
+	return out
+}

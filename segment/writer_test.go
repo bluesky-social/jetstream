@@ -554,3 +554,177 @@ func TestNewTruncatesTornLengthPrefix(t *testing.T) {
 	walked := walkFramedBlocks(t, contents[ReservedHeaderBytes:])
 	require.Len(t, walked, 1)
 }
+
+// TestWriterBlocks_EmptyWhenNoFlush — a brand-new writer has no
+// flushed blocks to report.
+func TestWriterBlocks_EmptyWhenNoFlush(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 4})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.Empty(t, w.Blocks())
+}
+
+// TestWriterBlocks_PendingNotIncluded — events buffered but not yet
+// flushed must NOT show up in Blocks(). The pending block has no
+// on-disk offset, so reporting it would be a lie.
+func TestWriterBlocks_PendingNotIncluded(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 4})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	_, err = w.Append(Event{
+		Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a",
+	})
+	require.NoError(t, err)
+	require.Empty(t, w.Blocks(), "Pending events must not appear in Blocks()")
+
+	require.NoError(t, w.Flush())
+	require.Len(t, w.Blocks(), 1, "After Flush, the block becomes visible")
+}
+
+// TestWriterBlocks_AppendsOnFlush — two flushes produce two blocks
+// with correct offsets, sizes, event counts, seq bounds, and
+// indexed_at bounds.
+func TestWriterBlocks_AppendsOnFlush(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	// Block 0: seq 1..2, indexed_at 100..250.
+	for _, ev := range []Event{
+		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, IndexedAt: 250, Kind: KindCreate, DID: "did:plc:b"},
+	} {
+		_, err := w.Append(ev)
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Flush())
+
+	// Block 1: seq 3..4, indexed_at 50..1000 (out-of-order to prove
+	// min/max really track min and max, not first and last).
+	for _, ev := range []Event{
+		{Seq: 3, IndexedAt: 1000, Kind: KindCreate, DID: "did:plc:c"},
+		{Seq: 4, IndexedAt: 50, Kind: KindUpdate, DID: "did:plc:d"},
+	} {
+		_, err := w.Append(ev)
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Flush())
+
+	got := w.Blocks()
+	require.Len(t, got, 2)
+
+	require.EqualValues(t, ReservedHeaderBytes, got[0].Offset)
+	require.EqualValues(t, 2, got[0].EventCount)
+	require.EqualValues(t, 1, got[0].MinSeq)
+	require.EqualValues(t, 2, got[0].MaxSeq)
+	require.EqualValues(t, 100, got[0].MinIndexedAt)
+	require.EqualValues(t, 250, got[0].MaxIndexedAt)
+	require.NotZero(t, got[0].CompressedSize)
+	require.NotZero(t, got[0].UncompressedSize)
+
+	// Block 1's offset is block 0's offset + 8 + comp size.
+	expectedOffset := uint64(ReservedHeaderBytes) + 8 + uint64(got[0].CompressedSize)
+	require.Equal(t, expectedOffset, got[1].Offset)
+	require.EqualValues(t, 2, got[1].EventCount)
+	require.EqualValues(t, 3, got[1].MinSeq)
+	require.EqualValues(t, 4, got[1].MaxSeq)
+	require.EqualValues(t, 50, got[1].MinIndexedAt)
+	require.EqualValues(t, 1000, got[1].MaxIndexedAt)
+}
+
+// TestWriterBlocks_ReturnsCopy — mutating the returned slice must
+// not affect a subsequent Blocks() call.
+func TestWriterBlocks_ReturnsCopy(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	_, err = w.Append(Event{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "d"})
+	require.NoError(t, err)
+	require.NoError(t, w.Flush())
+
+	first := w.Blocks()
+	require.Len(t, first, 1)
+	first[0].MinSeq = 0xDEADBEEF // mutation must not propagate
+
+	second := w.Blocks()
+	require.EqualValues(t, 1, second[0].MinSeq)
+}
+
+// TestWriterBlocks_RebuiltOnResume — write a block, close (without
+// sealing), reopen via New() on the same path, assert Blocks()
+// reflects what's already on disk.
+func TestWriterBlocks_RebuiltOnResume(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w1, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	for _, ev := range []Event{
+		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, IndexedAt: 200, Kind: KindCreate, DID: "did:plc:b"},
+	} {
+		_, err := w1.Append(ev)
+		require.NoError(t, err)
+	}
+	require.NoError(t, w1.Flush())
+	require.NoError(t, w1.Close())
+
+	w2, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w2.Close() })
+
+	got := w2.Blocks()
+	require.Len(t, got, 1)
+	require.EqualValues(t, ReservedHeaderBytes, got[0].Offset)
+	require.EqualValues(t, 2, got[0].EventCount)
+	require.EqualValues(t, 1, got[0].MinSeq)
+	require.EqualValues(t, 2, got[0].MaxSeq)
+	require.EqualValues(t, 100, got[0].MinIndexedAt)
+	require.EqualValues(t, 200, got[0].MaxIndexedAt)
+}
+
+// TestWriterBlocks_NilAfterSeal — Seal closes the writer; Blocks()
+// returns nil. Mirrors Reader.Blocks() always returning a slice and
+// avoids forcing callers into a nil-check just because the writer
+// hit end-of-life.
+func TestWriterBlocks_NilAfterSeal(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	_, err = w.Append(Event{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "d"})
+	require.NoError(t, err)
+
+	_, err = w.Seal()
+	require.NoError(t, err)
+
+	require.Nil(t, w.Blocks())
+}

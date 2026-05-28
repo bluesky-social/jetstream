@@ -212,6 +212,50 @@ func TestSealReaderRoundtripProperty(t *testing.T) {
 	}
 }
 
+// TestSealPopulatesPerBlockIndexedAtBounds asserts the seal walk
+// records min/max indexed_at on every block in the on-disk block
+// index, mirroring how it already records min/max seq.
+func TestSealPopulatesPerBlockIndexedAtBounds(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+
+	// Two flushes -> two blocks.
+	// Block 0: indexed_at in [100, 250]
+	// Block 1: indexed_at in [400, 1000]
+	events := []Event{
+		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
+		{Seq: 2, IndexedAt: 250, Kind: KindCreate, DID: "did:plc:b", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
+		{Seq: 3, IndexedAt: 400, Kind: KindCreate, DID: "did:plc:c", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
+		{Seq: 4, IndexedAt: 1000, Kind: KindCreate, DID: "did:plc:d", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
+	}
+	for _, ev := range events {
+		full, err := w.Append(ev)
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	_, err = w.Seal()
+	require.NoError(t, err)
+
+	r, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+
+	blocks := r.Blocks()
+	require.Len(t, blocks, 2)
+
+	require.EqualValues(t, 100, blocks[0].MinIndexedAt)
+	require.EqualValues(t, 250, blocks[0].MaxIndexedAt)
+	require.EqualValues(t, 400, blocks[1].MinIndexedAt)
+	require.EqualValues(t, 1000, blocks[1].MaxIndexedAt)
+}
+
 // TestSealGolden pins the byte-exact output of a deterministic seal.
 // Any accidental layout change breaks this test loudly. Regenerate
 // the fixture with: go test -run TestSealGolden -update ./segment

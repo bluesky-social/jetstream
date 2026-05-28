@@ -11,10 +11,19 @@ import (
 
 // TestRecoveryFromCrashAfterFooterFsyncBeforeHeaderPwrite simulates a
 // crash where the footer is durable but the header is still zero-
-// filled. The first 8 bytes of the footer are the block index's
-// first entry (a uint64 file offset interpreted as a length prefix
-// by lastGoodOffset); that interpreted "length" overruns the file,
-// so lastGoodOffset truncates the trailing bytes back off.
+// filled. New() rebuilds its in-memory flushed-block index by walking
+// every frame in the file, which forces decompression. The first 8
+// bytes of the orphaned footer (a block-index file offset) parse as
+// a plausible-but-bogus frame length, but the bytes that follow are
+// not a valid zstd frame, so decompression fails loudly. CLAUDE.md
+// prefers crashing over silent data corruption: the alternative is
+// to silently truncate, which would discard real data on any subtle
+// corruption with the same shape.
+//
+// In practice, this state isn't reachable via the normal seal code
+// path: Seal explicitly truncates the footer back off when the
+// header pwrite fails (see truncateFooterTail). This test fabricates
+// the state by hand to pin the behavior under deliberate corruption.
 func TestRecoveryFromCrashAfterFooterFsyncBeforeHeaderPwrite(t *testing.T) {
 	t.Parallel()
 
@@ -43,19 +52,12 @@ func TestRecoveryFromCrashAfterFooterFsyncBeforeHeaderPwrite(t *testing.T) {
 	require.NoError(t, f.Sync())
 	require.NoError(t, f.Close())
 
-	preInfo, err := os.Stat(path)
-	require.NoError(t, err)
-	preSize := preInfo.Size()
-
-	// Reopen — torn footer must be truncated.
-	w2, err := New(Config{Path: path})
-	require.NoError(t, err)
-	require.NoError(t, w2.Close())
-
-	postInfo, err := os.Stat(path)
-	require.NoError(t, err)
-	require.Less(t, postInfo.Size(), preSize,
-		"reopen must shrink the file by truncating the orphaned footer")
+	// Reopen must surface the corruption rather than silently
+	// truncating bytes whose meaning we can't verify.
+	_, err = New(Config{Path: path})
+	require.Error(t, err,
+		"reopen of an orphaned-footer file must fail loudly, "+
+			"not silently truncate")
 }
 
 // TestRecoveryFromPartialFooterWrite simulates a crash where some

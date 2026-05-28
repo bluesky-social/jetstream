@@ -20,6 +20,8 @@ func TestEncodeBlockIndexRoundtrip(t *testing.T) {
 			EventCount:       16,
 			MinSeq:           1,
 			MaxSeq:           16,
+			MinIndexedAt:     100,
+			MaxIndexedAt:     1600,
 		},
 		{
 			Offset:           ReservedHeaderBytes + 1024 + 8,
@@ -28,6 +30,8 @@ func TestEncodeBlockIndexRoundtrip(t *testing.T) {
 			EventCount:       32,
 			MinSeq:           17,
 			MaxSeq:           48,
+			MinIndexedAt:     1601,
+			MaxIndexedAt:     4800,
 		},
 	}
 
@@ -42,7 +46,7 @@ func TestEncodeBlockIndexRoundtrip(t *testing.T) {
 func TestEncodeBlockIndexEntryFieldOffsets(t *testing.T) {
 	t.Parallel()
 
-	// Pin field offsets within a single 36-byte entry. Same rationale
+	// Pin field offsets within a single 52-byte entry. Same rationale
 	// as the header field-offset test: silent reorder = silent file
 	// incompatibility.
 	info := BlockInfo{
@@ -52,6 +56,8 @@ func TestEncodeBlockIndexEntryFieldOffsets(t *testing.T) {
 		EventCount:       0x31323334,
 		MinSeq:           0x4142434445464748,
 		MaxSeq:           0x5152535455565758,
+		MinIndexedAt:     0x6162636465666768,
+		MaxIndexedAt:     0x7172737475767778,
 	}
 	buf := encodeBlockIndex([]BlockInfo{info})
 	require.Len(t, buf, blockIndexEntrySize)
@@ -68,6 +74,10 @@ func TestEncodeBlockIndexEntryFieldOffsets(t *testing.T) {
 		binary.LittleEndian.Uint64(buf[20:28]))
 	require.Equal(t, uint64(0x5152535455565758),
 		binary.LittleEndian.Uint64(buf[28:36]))
+	require.Equal(t, uint64(0x6162636465666768),
+		binary.LittleEndian.Uint64(buf[36:44]))
+	require.Equal(t, uint64(0x7172737475767778),
+		binary.LittleEndian.Uint64(buf[44:52]))
 }
 
 func TestDecodeBlockIndexRejectsLengthMismatch(t *testing.T) {
@@ -102,6 +112,8 @@ func TestEncodeBlockIndexProperty(t *testing.T) {
 				EventCount:       r.Uint32(),
 				MinSeq:           r.Uint64(),
 				MaxSeq:           r.Uint64(),
+				MinIndexedAt:     int64(r.Uint64()),
+				MaxIndexedAt:     int64(r.Uint64()),
 			}
 		}
 		buf := encodeBlockIndex(infos)
@@ -109,4 +121,25 @@ func TestEncodeBlockIndexProperty(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, infos, got)
 	}
+}
+
+// TestDecodeBlockIndexRejectsOldStride asserts a buffer sized at the
+// pre-change 36-byte stride no longer parses cleanly. Belt-and-
+// suspenders against an accidental partial migration that leaves an
+// older stride somewhere in the codebase.
+func TestDecodeBlockIndexRejectsOldStride(t *testing.T) {
+	t.Parallel()
+
+	const oldStride = 36
+	buf := make([]byte, 2*oldStride) // 2 entries at the OLD stride
+	_, err := decodeBlockIndex(buf, 2)
+	require.True(t, errors.Is(err, ErrInvalidBlockIndex))
+}
+
+// TestBlockIndexEntrySize pins the wire-format entry size loud-and-
+// proud so the diff-reviewer's eye lands on it if anyone ever bumps
+// the constant by accident.
+func TestBlockIndexEntrySize(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, 52, blockIndexEntrySize)
 }
