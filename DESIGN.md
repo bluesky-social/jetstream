@@ -1,0 +1,733 @@
+# 1. Executive Summary
+
+Jetstream v2 is full network archive and live streaming service for atproto. It is an open-source product that allows us and other atproto builders to quickly and easily gather all data on the network in order to build novel products, perform network analysis, etc.
+
+It ingests every record from all known repos on a relay, then cuts over to the live firehose. It stores data in a custom, highly optimized columnar file format. Users then connect to the server jetstream v2 to seamlessly stream through backfilled data as well as live.
+
+Jetstream v2 is the next evolution of Jetstream v1, with expanded capabilities and better aligned with the atproto ethos. It provides the same user-friendly JSON interface that allows for data filtering in a backwards-compatible manner, but also enables fast and easy full network backfill. It also stores the raw CBOR so each record and account is interrogatable if desired.
+
+It is self-hostable and cheap to run. We will also provide it as a free service, transparently replacing our existing Jetstream v1 instances (i.e. same URLs, same websocket payload).
+
+From here on out, I call Jetstream v2 simply "jetstream", and the old jetstream implementation will be called "jetstream v1".
+
+### 1.1 Goals and Non-Goals
+
+Jetstream v2 is designed with the following use-cases in mind:
+
+1. Archive the whole network locally to disk in a highly compressed format
+2. Use that local cache to backfill all data (or a subset) and cut over to live seamlessly
+    1. This enables building AppViews quickly and in a robust manner
+3. Transparently replace Jetstream v1 while providing the ability for independent parties to interrogate the validity of its data
+4. Provide a CDN-friendly downloadable archive for all known accounts and events
+5. Maintain a database of witness timestamps on records
+6. Dead-simple and cheap for us and others to operate on a single server or in a HA setup
+    1. The machine doesn't need much CPU, but it would benefit from a fair bit of ram for initial backfill, and a reasonably large disk (a few TB)
+    2. If you create a replica from another live jetstream instance, it actually shouldn't need much RAM either
+
+We also have the following non-goals, which are explicitly not included in this design:
+
+1. Exactly once delivery
+    1. We do at-least-once delivery and require clients to be idempotent (they already should be if they're subscribing to the existing firehose!)
+2. Cryptographic proof storage
+    1. Since we lay out records in order per-DID, we actually should be able to reconstruct the MST on the fly for a user
+3. Query engine with arbitrary queries or point lookups
+    1. This is a replay cache, not a general purpose database. We only support large range scans
+4. Distributed consensus
+    1. We instead support bootstrapping from a live instance to create a read-replica that could be promoted in disaster recovery scenarios
+    2. Doing distributed consensus is quite challenging, and I want to ship a robust system quickly
+    3. This isn’t a one-way door; we can add raft on segment blocks eventually. But I want to avoid ballooning the complexity of the original design so we can ship on reasonably short timelines
+
+### 1.2 Why Build This Now?
+
+First, our [users](https://bsky.app/profile/rude1.blacksky.team/post/3mjhlpd6idk2c) [are](https://bsky.app/profile/willdot.net/post/3mk6stoay4s2s) [asking](https://bsky.app/profile/danabra.mov/post/3mizg3nvooc2o) [for](https://bsky.app/profile/makeworld.space/post/3mk7hlc26g22c) [this](https://bsky.app/profile/timburga.com/post/3mizkj7omss2g). 2026 is the Atmosyear! Jetstream increases atproto adoption by providing an easy, robust, and cheap way to build AppViews and do network analysis.
+
+Second, the current production Bluesky data plane has several real limitations, all of which we will fix:
+
+1. It's poorly tested and very challenging to run locally in a dev environment, leading to slow iteration times, bugs in production, and high operational toil
+2. Scylla as a replay tool is error prone, risks production stability, and requires writing a lot of code
+3. It only stores the lexicons for which we planned ahead, so we're missing interesting lexicons from our database (i.e. `standard.site`)
+
+Finally, Jetstream v1 is a user-friendly tool and is cheap to run, but drops all ability to interrogate its data. We want the same excellent user experience of a JSON websocket that's filterable, but we also want a mechanism by which third parties can examine it for validity and completeness.
+
+## 2. Architecture Overview
+
+Jetstream is a single static executable that runs on a single server. We support replication for an primary/read-replica HA setup. We do this for simplicity and so we can ship in a reasonable amount of time.
+
+It completes full network backfill, transitions to the live tail seamlessly. Then, its clients to subscribe to the full network or certain data slices (similar to Jetstream v1).
+
+It tracks each event via its own `sequence number`, a monotonic 64-bit integer assigned at ingestion time (this sequence number is also known as the `cursor`). Clients resume from where they left off by passing their last-seen cursor back, and we deliver events with seq > cursor (the same as how other atproto sync flows work). The client can use this to either backfill data starting from the beginning of time, some arbitrary point, or just start streaming the current live tip.
+
+Same as the normal firehose, cursors are instance-local. Each jetstream instance assigns its own seq values independently, so on failover to a replica, clients should rewind their cursor by a small margin and rely on at-least-once delivery to cover the overlap.
+
+We enforce some invariants that are required for building correctly on atproto:
+
+1. No data loss, even in the face of crashes, network weather, etc.
+    - We ensure the cursor of the firehose to which we're subscribed that's durably written to disk always matches or is older than the events that have been written
+    - Note: it's okay to have the same event written to disk multiple times because we don't enforce exactly once delivery
+2. Events for a single DID are always replayed in the same order in which they were originally ingested
+    - This naturally implies ordering by DID as well, which is often required for building AppViews correctly
+3. At least once delivery
+    - We explicitly don't enforce exactly once delivery
+    - All clients must be idempotent to repeated calls (all existing jetstream v1 clients should be doing this already anyways!)
+
+Jetstream goes through a bootstrap phase where it seeds a user list from a relay's `com.atproto.sync.listRepos` endpoint, saving all DIDs to a file. During the iteration through the `listRepos` call, it also downloads DID docs to find the user's PDS, calling `com.atproto.sync.getRepo` to backfill the repo to disk. We lay out each event's data on disk in a custom file format called `segment files` as described in Section 3. Once a repo has been downloaded and saved to disk, we mark it as complete in our per-DID tracking file.
+
+During bootstrap, the process does not accept user requests and instead returns a 503 so clients cannot get in to inconsistent states.
+
+During that initial backfill, we also immediately start consuming from the live firehose and storing it to the side of all the backfilled files. This ensures that once the backfill is complete, we can compact those live files to the normal segment stores, and the transition to live will be quick and easy. The initial backfill may take many hours (the fastest we've seen is about 16 hours).
+
+Once the backfill phase is complete, it continues to subscribe to the live tail of the upstream firehose. As it receives events, it stores them in a WAL, and once the WAL reaches a large enough size, it's sealed in to a segment block as described in Section 3.
+
+## 2.1 Client Overview
+
+It's at this transition point that Jetstream starts to field user requests. It handles two request modes:
+
+- HTTPS file downloads of the large segment files
+- Live websocket tail in the same JSON format as Jetstream v1 for live events
+
+We provide a seamless user experience similar to the following example Go code.
+
+```go
+func main() {
+    client := jetstream.Subscribe(
+        "jetstream.us-west.bsky.network",
+        jetstream.WithCollections([]string{"app.bsky.feed.post"}), // optional
+        jetstream.WithDIDs([]string{"did:plc:4uz2445cjiw7w4nobfgnu35f"}), // optional
+        jetstream.WithBatchSize(64), // optional
+    })
+
+    for events, err := client.Events(ctx) {
+        if err != nil {
+            continue // handle error
+        }
+        
+        if err := db.WriteBatch(events); err != nil {
+	          continue // handle error
+	      }
+
+				// Or, handle events individually
+        // for event := range events {
+            // handle each event
+        // }
+
+        lastCursor := events.LastCursor()
+        if err := db.SaveCursor(lastCursor); err != nil {
+            continue // handle error
+        }
+    }
+
+    if err := client.Close(); err != nil {
+        // handle err
+    }
+}
+```
+
+Under the hood, the client library and server come up with a plan that details which segment files to download, and when to transition to the live websocket. It begins downloading data from either source, but presents events to the user in a single format so they don't even need to be aware of whether or not they're completing a backfill or tailing live. This means that we need to have relatively "thick" client libraries (TypeScript and Go to start) that understand the semantics of Jetstream.
+
+For instance, if a user requests all `standard.site` documents since two weeks ago according to some cursor value, the client library asks the server for the HTTP segments since that time period. It downloads them with some amount of bounded concurrency, and emits them in the `client.Events(ctx)` for loop iterator.
+
+Just like the firehose, the way the data is laid out on disk naturally ensures events within a single DID are delivered in order (though multiple DIDs may be interleaved together).
+
+Once the server notices the client library has reached the end of the available HTTPS files to download in parallel, the server tells the client to pick up the websocket endpoint with a given cursor value to ensure zero events are missed. Jetstream is capable of replaying some number of recent events via the websocket endpoint so that way there is a buffer period where the backfill to live cut over can happen without the potential for data loss (say, a 72 hour replay window, configurable by the server operator).
+
+The client must also be aware of the deletion/update lookaside file and respect that appropriately (more on this later).
+
+## 3. Data Layout
+
+### 3.1 Segment Files
+
+### 3.1.1 Overview
+
+`Segment files` store events in a format optimized for fast range scans and high compression ratios. No other access patterns are prioritized (i.e. we don't support point lookups). This is not a general purpose database; it's highly specific to being a full network cache that's optimized for fast replay on as small a disk as possible.
+
+Events in segment files are sorted by the order they were ingested by Jetstream. That means we also naturally sort events in order per-DID (though there is no global ordering).
+
+Each segment file is either `active` or `sealed`. There is only one active segment file at a time, and it's the one that is currently open and being appended to. We use a single on-disk format for both states. The difference between active and sealed is:
+
+1. An active segment reserves the first 4 bytes for the magic number, then 252 bytes as zeroes for the fixed header. It contains zero or more fully-flushed blocks appended to the end of the file.
+2. A sealed segment has the 256-byte fixed header populated, its blocks unchanged from active state, and a variable-length footer appended at the end
+
+We detect state at read time by checking the checksum bytes at offset 4: zeroes means active (don't trust the header). A non-zero checksum means sealed.
+
+Each block contains some number of events (4096 by default, but operator-configurable). Each event has some metadata fields and its full raw CBOR, all stored in a columnar format as described in Section 3.2. Storing CBOR is important so Jetstream is interrogatable and can be audited/spot checked for correctness (i.e. comparable to a `getRecord` call on the user's PDS for consistency checks). A block is flushed to disk whenever it reaches 4096 events or 30 seconds have elapsed since the block started filling, whichever comes first. Once a block is ready, we zstd compress it and append it to the active segment file, prefixed with an 8-byte uint64 length. The length prefix makes crash recovery and sequential scans straightforward without needing a zstd-aware frame walker.
+
+As we subscribe to the upstream firehose, we assign each event a sequence number, store them in an in-memory buffer, and forward it to downstream subscribers. Once we've accumulated a full block in-memory, we write it to the active segment file on disk and fsync, then update our latest seen cursor in the metadata db (see section 3.5). The persisted cursor is always less than or equal to the the latest durable event in the segment file.
+
+On crash/restart, we seek to the active segment back to the last complete block (walking the 8-byte length prefixes from offset 256 forward), resume the upstream firehose from the persisted cursor, and rely on at-least-once semantics to cover the overlap. Worst-case, re-fetched and re-delivered traffic is one block. All downstream subscribers must be idempotent to duplicate event delivery (they already should be!). Note that sequence numbers will never go backwards or be duplicated; they only go forward (even on crash and restart).
+
+After a segment file accumulates enough blocks (~256MB of compressed data), we seal it by writing the variable-length footer at the end of the file, seeking to offset 0 and overwriting the reserved 256 bytes with the finalized fixed header, fsync, and rotate to a new active file. The process continues until the heat death of the universe.
+
+Deletions and updates do not modify segment files synchronously. Every delete and update is appended to a single global lookaside file, keyed by its AT URI (Section 3.3). Readers (both the server-side scanner and remote clients) merge the lookaside on top of segment events at delivery time.
+
+Every so often (once a day by default, operator-configurable), we compact the lookaside file into the sealed segments. Compaction uses the in-memory segment-level DID bloom to narrow to candidate segments, then the per-block DID blooms to narrow to candidate blocks within each, then an exact column scan to find the rows to rewrite or drop.
+
+The net of this is that segment files are immutable for most of the day and only rewrite during the daily compaction pass. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy replication to read-replicas that seed from a given jetstream instance.
+
+### 3.1.2 File Format
+
+The binary format of the segment file is as follows:
+
+```
+Jetstream Sealed Segment File (.jss):
+┌──────────────────────────────────────────────────────────┐
+│ Fixed-Len Header (256 bytes, finalized at seal time)     │
+│   magic:                   [4]byte = "jss0"              │
+│   checksum:                uint64  (xxhash3)             │
+│   version:                 uint16                        │
+│   block_count:             uint32                        │
+│   event_count:             uint32                        │
+│   unique_did_count:        uint32                        │
+│   min_seq:                 uint64                        │
+│   max_seq:                 uint64                        │
+│   min_indexed_at:          int64   (unix micros)         │
+│   max_indexed_at:          int64   (unix micros)         │
+│   footer_offset:           uint64                        │
+│   did_bloom_offset:        uint64                        │
+│   block_did_bloom_offset:  uint64                        │
+│   collection_index_offset: uint64                        │
+│   block_index_offset:      uint64                        │
+│   _reserved:               [158]byte  (future expansion) │
+├──────────────────────────────────────────────────────────┤
+│ Block 0                                                  │
+│   block_len:     uint64 (LE, compressed byte length)     │
+│   block_data:    [block_len]byte (ZSTD frame, checksum)  │
+│ Block 1                                                  │
+│ Block 2                                                  │
+│ ...                                                      │
+│ Block N                                                  │
+├──────────────────────────────────────────────────────────┤
+│ Variable-Len Footer (appended at seal time)              │
+│   Block Index [N entries, each 36 bytes]:                │
+│     offset:            uint64  (byte offset in file)     │
+│     compressed_size:   uint32                            │
+│     uncompressed_size: uint32                            │
+│     event_count:       uint32                            │
+│     min_seq:           uint64                            │
+│     max_seq:           uint64                            │
+│   DID Bloom Filter                                       │
+│     Serialized gloom.Filter (MarshalBinary)              │
+│     Covers all unique DIDs in this segment               │
+│     Sized for 0.1% false positive rate                   │
+│   Per-Block DID Bloom Filters                            │
+│     One fixed-size gloom.Filter per block, packed        │
+│     contiguously and indexed by multiplication           │
+│   Collection Block Index (zstd compressed body)          │
+│     String table + per-block collection bitmasks         │
+└──────────────────────────────────────────────────────────┘
+```
+
+An active segment has the same layout minus the footer, with the fixed header left as 256 zero bytes until seal.
+
+The xxhash3 is the hash of all fields after the hash (`version` through the end of the collection block index). The magic number and checksum itself are not included in the checksum.
+
+### 3.1.3 DID Filtering
+
+The variable-length footer has two structures that work together to enable fast scans of "give me all events for user X":
+
+1. Segment-level DID bloom filter ("might user X be in this segment file?")
+2. Per-block DID bloom filters ("which blocks in this segment might contain events for user X?")
+
+We use [gloom](https://github.com/jcalabro/gloom) for both, which has a stable binary format. We serialize the segment-level bloom to disk upon segment seal, and also keep all segment's blooms in Jetstream server's memory since it's small.
+
+The per-block blooms are kept on disk (one bloom per block, all sized for the configured max events per block so we can index them by multiplication with no offset table), and we keep an LRU cache of the hot set in server memory (operator-configurable, defaulting to the most recently accessed 1024 segments).
+
+The lookup flow for "give me all events for DID X in this segment" is:
+
+1. Check the segment-level bloom filter (in memory)
+    - On negative filter result, skip the whole segment, never touching disk at all
+2. On hit, load the per-block blooms for this segment (cache hit, else `pread` from disk into cache)
+3. Check each per-block bloom for DID X to produce a candidate block list
+4. Decompress only those candidate blocks, scan the `did` column within each for matching events
+
+```
+Per-Block DID Bloom Filters:
+┌─────────────────────────────────────────────────────┐
+│ Header (8 bytes, uncompressed)                      │
+│   block_count:      uint32                          │
+│   bloom_size_bytes: uint32  (every bloom same size) │
+├─────────────────────────────────────────────────────┤
+│ Blooms (block_count × bloom_size_bytes)             │
+│   Block 0 bloom: [bloom_size_bytes]byte             │
+│   Block 1 bloom: [bloom_size_bytes]byte             │
+│   ...                                               │
+│   Block N bloom: [bloom_size_bytes]byte             │
+└─────────────────────────────────────────────────────┘
+```
+
+### 3.1.4 Collection Block Index
+
+We store a compact per-block summary of which collections are present in the segment file.
+
+The index consists of a string table of unique collection NSIDs (assigned uint32 IDs by table position), followed by a bitmask per block where bit N is set if collection ID N appears in that block. The whole index is stored as a single ZSTD frame with content checksums enabled.
+
+The collection block index is quite small per-file and kept in server memory to attempt to minimize the number of times we need to touch the disk for queries by collection.
+
+```
+Collection Block Index:
+┌──────────────────────────────────────────────────────────┐
+│ Header (16 bytes, uncompressed)                          │
+│   collection_count:  uint32 (unique collections)         │
+│   block_count:       uint32                              │
+│   bitmask_len:       uint32 (ceil(collection_count / 8)) │
+│   uncompressed_size: uint32                              │
+├──────────────────────────────────────────────────────────┤
+│ Body (zstd compressed)                                   │
+│   String Table [collection_count entries]                │
+│     Per entry:                                           │
+│       len:   uint8                                       │
+│       nsid:  [len]byte                                   │
+│   Block Bitmasks [block_count × bitmask_len bytes]       │
+│     Bitmask for block 0: [bitmask_len]byte               │
+│     Bitmask for block 1: [bitmask_len]byte               │
+│     ...                                                  │
+│     Bit N set = collection ID N present in this block    │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 3.2 Segment Blocks File Format
+
+Each block contains 4096 events (configurable by the server operator). Events within a block are stored in a columnar layout. All columns are concatenated and compressed as a single ztsd frame with content checksums enabled so that bit flips or partial writes are detected on decompression.
+
+Note that this default size of 4096 was chosen somewhat arbitrarily and we should run experiments on real-world data to measure compression ratios of larger blocks, and try to square that against scans filtering by did or collection needing to examine too much data. More experimentation is required to pick a good default size. Similarly, is 256mb a good size for the overall file?
+
+Each block is composed of the following data:
+
+```
+Compressed block (single ZSTD frame):
+┌──────────────────────────────────────────────────────────┐
+│ Column Metadata (4 bytes)                                │
+│   event_count:  uint32                                   │
+├──────────────────────────────────────────────────────────┤
+│ Fixed-size columns (contiguous arrays):                  │
+│   seq[]              event_count × uint64 (LE)           │
+│   indexed_at[]       event_count × int64  (LE)           │
+│   kind[]             event_count × uint8                 │
+│   collection_len[]   event_count × uint8                 │
+│   did_len[]          event_count × uint16                │
+│   rkey_len[]         event_count × uint8                 │
+│   rev_len[]          event_count × uint8                 │
+│   event_len[]        event_count × uint32 (LE)           │
+├──────────────────────────────────────────────────────────┤
+│ Variable-length columns (concatenated):                  │
+│   collections[]      sum(collection_len) bytes           │
+│   dids[]             sum(did_len) bytes                  │
+│   rkeys[]            sum(rkey_len) bytes                 │
+│   revs[]             sum(rev_len) bytes                  │
+│   payloads[]         sum(event_len) bytes of CBOR        │
+└──────────────────────────────────────────────────────────┘
+```
+
+The `event_count` field is required because record deletions may mean we have fewer than the configured max number of events per block.
+
+The `kind` column is a `uint8` discriminator that identifies which firehose event type each row represents:
+
+```
+kind values:
+  1 = Create     (#commit op: record created)
+  2 = Update     (#commit op: record updated)
+  3 = Delete     (#commit op: record deleted)
+  4 = Identity   (#identity event)
+  5 = Account    (#account event)
+  6 = Sync       (#sync event)
+```
+
+### 3.3 Update/Delete Lookaside File
+
+In addition to the segment files, we maintain a single global lookaside file (`lookaside.upd`) that stores all updates, deletions, and account suppressions. The lookaside is an append-only binary file. Each entry is keyed by its AT URI triple `(did, collection, rkey)` for commit events, or by `did` alone for account suppressions.
+
+Clients (both server-side scan and HTTP clients downloading segments) must load the lookaside file alongside the segments they're scanning and apply it during event delivery. Entries are applied in file order; later entries for the same record identity supersede earlier ones.
+
+The lookaside file is small relative to the archive (updates and deletes are a small fraction of all network traffic, and we compact every so often). Clients download the whole file once and keep it resident for the duration of a scan.
+
+If a deletion or update targets an event that is still in the in-memory pending block (not yet flushed to disk), we mutate the pending block in place and never write a lookaside entry for it.
+
+The file format is a stream of length-prefixed entries with no file-level header. Entries are read sequentially.
+
+```
+Lookaside File (.upd) stream of entries:
+
+Entry: Record Delete (type=1)
+┌──────────────────────────────────────────────────┐
+│ entry_len:       uint32 (LE); total entry bytes  │
+│                    excluding this field          │
+│ type:            uint8  = 1                      │
+│ did_len:         uint16                          │
+│ collection_len:  uint8                           │
+│ rkey_len:        uint8                           │
+│ did:             [did_len]byte                   │
+│ collection:      [collection_len]byte            │
+│ rkey:            [rkey_len]byte                  │
+└──────────────────────────────────────────────────┘
+
+Entry: Record Update (type=2)
+┌──────────────────────────────────────────────────┐
+│ entry_len:       uint32 (LE)                     │
+│ type:            uint8  = 2                      │
+│ did_len:         uint16                          │
+│ collection_len:  uint8                           │
+│ rkey_len:        uint8                           │
+│ new_rev_len:     uint8                           │
+│ new_record_len:  uint32 (LE)                     │
+│ new_indexed_at:  int64  (LE, unix micros)        │
+│ did:             [did_len]byte                   │
+│ collection:      [collection_len]byte            │
+│ rkey:            [rkey_len]byte                  │
+│ new_rev:         [new_rev_len]byte               │
+│ new_record:      [new_record_len]byte (CBOR)     │
+└──────────────────────────────────────────────────┘
+
+Entry: Account Suppression (type=3)
+┌──────────────────────────────────────────────────┐
+│ entry_len:       uint32 (LE)                     │
+│ type:            uint8  = 3                      │
+│ did_len:         uint16                          │
+│ did:             [did_len]byte                   │
+└──────────────────────────────────────────────────┘
+```
+
+During a scan, the reader loads the lookaside into memory and builds a set of suppressed DIDs and records.
+
+For each record during decode:
+
+1. If the record's DID is in the suppression set and the row is a commit event (Create/Update/Delete), suppress the row
+2. Else if `(did, collection, rkey)` maps to a delete, suppress the row
+3. Else if `(did, collection, rkey)` maps to an update, emit the row with the replacement rev and payload
+4. Else emit the row as-is
+
+### 3.3.1 Compaction
+
+Once a day by default (operator-configurable), the server compacts the lookaside into the segments it targets. The goal is to avoid unbounded growth of the lookaside and to let clients doing large historical scans skip most of the merge work.
+
+Compaction is a read-mostly, write-sparingly operation. The pass is structured to do the minimum amount of segment I/O:
+
+1. Rename `lookaside.upd` to `lookaside.upd.compacting` and create a fresh empty `lookaside.upd` for new entries arriving during the pass. New entries that supersede ones we're compacting will be picked up on the next daily run.
+2. Bucket the `.compacting` entries by DID.
+3. For each segment, ask its in-memory segment-level DID bloom whether any bucketed DID might appear. Most segments answer no and we skip them entirely.
+4. For each candidate segment, load its per-block DID blooms (already cached for hot segments) and narrow to the candidate block set.
+5. Decompress only the candidate blocks. Walk the `did`, `collection`, and `rkey` columns to find exact `(did, collection, rkey)` matches. For deletes, drop the row. For updates, replace the row's `rev`, `indexed_at`, and `payload` with the entry's replacement values.
+6. Re-encode the changed blocks, rebuild the segment's footer, rewrite the fixed header (new checksum, possibly updated `event_count` and `min_seq`/`max_seq` if an edge row was deleted), and fsync. Segments with no matches are not touched.
+7. Delete `lookaside.upd.compacting` once every affected segment has been durably rewritten.
+
+Updates are more expensive than deletes because the replacement payload may be larger than the original, shifting bytes within the block. We still only rewrite the blocks that contain matches; shifting is local to a single block.
+
+The segment-level DID bloom does nearly all the filtering work here. Deletes and updates on atproto cluster heavily per-user (an account gets suspended and its records are tombstoned, a spam ring gets cleaned up), so a compaction pass typically touches a small fraction of segments even when the lookaside has many entries.
+
+### 3.4 File Organization
+
+Events within segment files are laid out on disk by DID so we can naturally maintain the invariant of "all events from a user must be replayed in the same order in which the events were indexed".
+
+The data directory file layout is the following:
+
+```
+data/
+  meta.pebble/             <- unified metadata store (see Section 3.5)
+  lookaside.upd            <- single global update/deletion lookaside (see Section 3.3)
+  backfill_complete.log    <- append-only log of completed repo backfills (see Section 3.5)
+  segments/
+    seg_0000000000.jss     <- fixed header + compressed blocks (+ footer once sealed)
+  backfill/
+    live_segments/         <- segment files for the live tail consumer during the backfill phase
+      seg_0000000000.jss
+```
+
+Segments are named with a counter as a 10-digit zero-padded base-36 string. Segment files and seq ranges sort lexicographically in creation order. This means that all events in segment file 0 have indexed at timestamps before all events in segment file 1.
+
+### 3.5 Metadata Store
+
+All structured metadata that isn't derivable by cheaply rescanning segment files lives in a single [pebble](https://github.com/cockroachdb/pebble) database at `data/meta.pebble/`. We picked pebble because it's pure Go, handles tens of millions of keys comfortably, and gives us atomic multi-key batch writes for free, which matters for the durability ordering described below.
+
+Keys are namespaced by prefix:
+
+```
+relay/cursor            -> uint64 upstream firehose seq we've durably persisted
+repo/<did>              -> JSON<RepoStatus> per-DID backfill and steady-state bookkeeping
+account/<did>           -> JSON<AccountStatus> hosting status, only present when non-active
+sync/<did>              -> JSON<SyncState> present while a resync is in progress
+replica/upstream_cursor -> uint64 (replica-only) last seq consumed from the upstream leader
+```
+
+`RepoStatus` carries both initial-backfill state and steady-state bookkeeping with the following fields:
+
+```go
+type Status string
+
+const (
+    StatusNotStarted Status = "not_started"
+    StatusComplete   Status = "complete"
+    StatusFailed     Status = "failed"
+)
+
+type RepoStatus struct {
+    Backfill    RepoBackfillStatus `json:"backfill"`
+    PDS         string             `json:"pds,omitempty"`
+    // latest rev, updated on every commit
+    Rev         string             `json:"rev,omitempty"`
+    UpdatedAt  time.Time           `json:"updated_at,omitempty"`
+    RecordCount int64              `json:"record_count,omitempty"`
+    TotalBytes  int64              `json:"total_bytes,omitempty"`
+}
+
+type RepoBackfillStatus struct {
+    Status      Status    `json:"status"`
+    // rev at end of initial download
+    Rev         string    `json:"rev,omitempty"`
+    Attempts    int       `json:"attempts,omitempty"`
+    LastError   string    `json:"last_error,omitempty"`
+    StartedAt   time.Time `json:"started_at,omitempty"`
+    CompletedAt time.Time `json:"completed_at,omitempty"`
+}
+```
+
+The per-block durability ordering is: append and fsync the block into the active segment first, then commit a single pebble batch with `sync=true` that advances `relay/cursor` and updates `repo/<did>.Rev` and other fields for every DID present in the block. Only after both steps complete do we treat the block as durable. Because the pebble batch always follows the segment fsync, a crash between the two leaves `relay/cursor` pointing at or before the last durable event, so if we do crash, we'll just replay some relatively small number of events.
+
+`backfill_complete.log` is a separate append-only file with a custom format that sits next to pebble. Each entry records that a specific DID's initial backfill finished successfully, along with the backfill rev. It exists because that particular signal is the one piece of leader-only state that a freshly-promoted replica cannot re-derive locally without re-running the entire backfill (the presence of live-tail events for a DID alone does not prove we ever successfully downloaded that repo's full history). Treating completion as a first-class log that replicates alongside segments is cheap (one entry per DID per lifetime) and avoids the silent-data-loss failure mode where a partially-backfilled DID gets treated as complete on failover. Replication of this file is described in Section 6. The log is a simple stream of length-prefixed entries:
+
+```
+backfill_complete.log stream of entries:
+┌──────────────────────────────────────────────────┐
+│ entry_len:        uint32 (LE)                    │
+│ did_len:          uint16                         │
+│ backfill_rev_len: uint8                          │
+│ completed_at:     int64 (LE, unix micros)        │
+│ did:              [did_len]byte                  │
+│ backfill_rev:     [backfill_rev_len]byte         │
+└──────────────────────────────────────────────────┘
+```
+
+Everything else is deliberately kept out of the metadata store. The segment manifest is just a directory scan plus each file's self-describing 256-byte header, so we don't duplicate it. DID-to-PDS caches and handle resolutions come back from the PLC directory when we need them. Per-DID hosting status flows in as `#account` events; we keep the current value in pebble so we can answer quickly, but it's always reconstructible by replaying segments.
+
+## 4. Ingestion Pipeline
+
+This section describes how events get from the PDSes and relay into our segment files.
+
+### 4.1 Bootstrap Phase
+
+On first startup, we kick off two things in parallel:
+
+1. The live firehose consumer
+    1. Connects to `com.atproto.sync.subscribeRepos` on the relay
+    2. We start the live tail first to ensure we don't miss any events
+    3. Events are written in segment files to the temporary `./data/backfill/live_segments` folder
+    4. We treat these as temporary events and will compact them in to the long-term `segments` folder in the merge phase
+2. The backfill engine
+    1. Downloads all results from `com.atproto.sync.listRepos` on the relay, writing each DID to `repo/<did>` in the metadata store with `StatusNotStarted`
+    2. Downloads each repo via `com.atproto.sync.getRepo` and writes the events directly to the active segment file
+    3. On successful completion, sets `repo/<did>.Status = StatusComplete`, records the `BackfillRev`, and appends an entry to `backfill_complete.log`. The log append is what replicas will consume to learn that the backfill finished; see Section 6.
+
+This phase takes a while. At time of writing with current rate limits on the mushroom PDSes on the new relay, it takes ~16 hours.
+
+Once we complete the backfill phase, we seal the active segment so when we resume the live consumer during the steady state phase, it starts with a fresh file.
+
+### 4.2 Merge Phase
+
+Once the backfill of all repos is complete, we need to merge the segment files accumulated by the live firehose consumer in to the `./data/segments/` folder for permanent storage.
+
+The bootstrap-live consumer has been continuously persisting the upstream firehose cursor to `relay/cursor` on every block flush, so by the time we enter the merge phase the cursor already reflects the latest durable bootstrap-live event. We stop the live consumer before merge runs; when we transition to the steady-state phase, the new live consumer reads `relay/cursor` and resumes from that watermark. At-least-once delivery covers the at-most-one-block overlap. The merge phase itself is a relatively small amount of data and should only take a few minutes.
+
+We take the events from the sealed and active segment files in `./data/backfill/live_segments/` and replay those events in to the main `./data/segments/` directory. We do that simply by opening a new segment file in `./data/segments` with the next contiguous file name, and writing events from `./data/backfill/live_segments` to the new file(s). We seal and roll over to the next segment file once the active one reaches its size limit.
+
+We ensure that we don't store any events out of order by checking the DID's `BackfillRev` from `repo/<did>` in the metadata store against the revs of the events we're compacting. We drop the events whose rev is less than or equal to `BackfillRev`. This also should ensure we don’t store duplicate events (though because of at-least-once semantics, this is not a strict requirement).
+
+After the last surviving event has been durably written:
+
+- We seal the active segment file in `./data/segments/`
+- We `os.RemoveAll` the entire `./data/backfill/` directory
+    - This tree is temporary and only valid during the initial backfill phase; nothing outside the merge code should ever read from it again
+- Only after these steps do we durably write `phase=steady_state`
+    - Each step is durable on its own (segment seal fsyncs, RemoveAll is observable on next directory scan, pebble delete is Sync=true), so a crash at any point during merge is recoverable on restart
+
+Additionally, since the merge phase takes so3 time, at the end, we also scan the relay with `listRepos` to find accounts that were newly created during the merge phase. We treat these repos the same as repos that failed to download during the initial backfill, and we will do a full `getRepo` call on them during the steady-state phase.
+
+### 4.3 Steady State Phase
+
+The steady-state phase simply consumes from the upstream firehose and writes events to the active segment file in the `./data/segments` directory as normal. Every so often, it compacts the lookaside file in to the sealed segments as described in Section 3.3.1.
+
+Every block seal commits a single pebble batch that advances `relay/cursor` and refreshes `repo/<did>.LatestRev` for every DID in the block. We always fsync the segment block first and then commit the pebble batch with `sync=true`, so the persisted cursor can never get ahead of the durable event data. A crash between the two steps is handled by the active-segment recovery path described in Section 3.1, and the upstream resumes from whatever cursor pebble last saw.
+
+If there were any accounts that failed to download during the initial backfill phase (i.e. `repo/<did>.Status == StatusFailed`), we periodically retry downloading them with exponential backoff in the background until they succeed, at which point we append to `backfill_complete.log` exactly as during the bootstrap phase. This is best-effort to minimize missing data in Jetstream in the long term. When we do successfully download a repo that previously failed, we treat it similar to a whole-repo `#sync` event: mark all previous events for that DID as deleted, and recreate from the downloaded CAR file.
+
+### 4.4 Identity, Account, and Sync Events
+
+As noted in Section 3, all event types are stored in the segment files, not just commits.
+
+Internally, Jetstream doesn't care about handles, identity updates, or hosting status, but consumers of the application certainly do. `#identity`, `#account`, and `#sync` events are stored in-line with `#commit` events in the same segment blocks and passed along to clients as they come over the firehose.
+
+Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we write a type=3 suppression entry (see Section 3.3) the lookaside file to hide the user's pre-divergence records and re-download their repo from scratch from the PDS, updating events past the DID specified in the sync event.
+
+## 5. Client Protocol and Libraries
+
+We ship client libraries in TypeScript and Go. They are relatively "thick" in the sense that clients require substantial amounts of logic in order to use the system. All the code is public and well-documented, so community members can maintain client libraries in other languages.
+
+For the live-tail use-case, clients are simple: it's compatible with the existing Jetstream v1 WebSocket JSON payload and query parameters. Existing Jetstream v1 consumers will continue to work as-is (i.e. no client wrapper library is even needed for those simple use-cases).
+
+It gets more complicated when the caller requests data that is older than the current active segment. The client asks the server something like "I want all likes since 2024", and the server begins sending over the sealed segment files in order, the lookaside file and its updates, and then seamlessly cuts over to the live websocket payload. That cutover is transparent to callers, who use a Go `iter.Seq2` or a TypeScript async iterable to provide an excellent devex.
+
+Most callers will want to use the client wrapper (even for the trivial use case) so they don't need to repeatedly implement the same websocket logic, and may seamlessly handle the case where they want to perform backfill some day.
+
+### 5.1 Simple JSON Payload (default)
+
+The default websocket stream delivers events in the same JSON shape as Jetstream v1 today. It's small, easy to consume from any language, and carries a decoded form of each record so callers don't need a CBOR decoder. This is what the vast majority of end-user clients will use.
+
+An example commit event looks like:
+
+```json
+{
+  "did": "did:plc:eygmaihciaxprqvxpfvl6flk",
+  "time_us": 1725911162329308,
+  "cursor": "XYZ",
+  "kind": "commit",
+  "commit": {
+    "rev": "3l3qo2vutsw2b",
+    "operation": "create",
+    "collection": "app.bsky.feed.like",
+    "rkey": "3l3qo2vuowo2b",
+    "cid": "bafyreidwaivazkwu67xztlmuobx35hs2lnfh3kolmgfmucldvhd3sgzcqi",
+    "record": {
+      "$type": "app.bsky.feed.like",
+      "createdAt": "2024-09-09T19:46:02.102Z",
+      "subject": {
+        "cid": "bafyreidc6sydkkbchcyg62v77wbhzvb2mvytlmsychqgwf2xojjtirmzj4",
+        "uri": "at://did:plc:wa7b35aakoll7hugkrjtf3xf/app.bsky.feed.post/3l3pte3p2e325"
+      }
+    }
+  }
+}
+```
+
+The `time_us` field is the jetstream v2 instance's own indexed at timestamp for the event in microseconds since the unix epoch, and `cursor` is what clients pass back to resume the stream. Note that for backwards compatibility with jetstream v1, we do support passing `cursor` as a unix timestamp integer as well (int vs. string in the JSON object is what determines v1 vs v2 mode). For clients using the legacy cursor system, we only support looking back at the most recent 36 hours worth of data (the current jetstream v1 behavior).
+
+### 5.2 Extended JSON Payload
+
+Subscribers that need everything Jetstream knows about an event can opt in by appending `?extended=true` to the websocket URL. The extended form is a strict superset of the simple form: all the same fields are present, plus:
+
+- `seq`: Jetstream's own monotonic 64-bit cursor assigned to this event at ingestion time.
+- `upstream_relay_cursor`: the upstream relay firehose cursor this event came from. Useful to any subscriber that wants to eventually promote itself into a primary and pick up from the relay with minimal overlap.
+- `commit.record_cbor`: the raw DAG-CBOR payload of the record, base64-encoded. Only populated for `kind: "commit"`. This is the byte-exact form written to the segment file, suitable for verifying against a PDS or reconstructing the MST.
+
+A replica is just an extended-mode subscriber with the additional behavior of writing what it receives into its own segments. See Section 6.
+
+On extended connections, the stream also interleaves control events that don't flow on simple connections. These use new `kind` values:
+
+```
+kind values (extended-only):
+  segment_sealed      upstream sealed a segment file
+  segment_compacted   upstream rewrote a previously-sealed segment (lookaside compaction
+                      or timestamp import)
+  backfill_complete   a DID's initial backfill finished successfully
+  heartbeat           keepalive; carries cursor values for liveness detection
+```
+
+Each control event carries a small payload: `segment_sealed` and `segment_compacted` carry `{name, sha256, min_seq, max_seq}`; `backfill_complete` carries `{did, backfill_rev, completed_at_us}`; `heartbeat` carries `{seq, upstream_relay_cursor}`.
+
+Extended-mode subscriptions are not authenticated, but they're more expensive to produce (base64-encoded CBOR, heavier per-event payload) so we many more strictly rate limit them compared to the simple firehose on the Bluesky-hosted instance.
+
+## 6. Replication
+
+NOTE (jrc): this section is still pretty early-days and I want to review it myself a fair bit more before getting seriously in-depth review from others. This will come much later in the implementation, so I'm not overly fixated on getting it perfect yet.
+
+We support a simple asynchronous replication protocol for active-passive high availability setups. This allows for the leader instance to handle writes and a relatively small read workload, and there can be some large number of read replicas (or read-replica chains) that can distribute read traffic across many sites.
+
+The guiding principle is that as much as possible, we only replicate source data, not metadata stores. Everything pebble holds on the leader is either derivable from the event stream the replica already consumes (per-DID `LatestRev`, `AccountStatus`), reconstructible on promotion by calling `com.atproto.sync.listRepos` on the relay (the DID list itself), or deliberately leader-only and not needed by a passive replica (retry attempt counters, `LastError` strings, in-flight sync state). The one exception is the signal that a DID's initial backfill finished successfully, which a replica cannot derive from the live event stream alone. That's what `backfill_complete.log` is for.
+
+### 6.1 The Replication Protocol
+
+Replication has two moving parts: bulk transfer of sealed segment files over plain HTTP downloads (the same CDN-friendly downloads that end-user clients use), and a persistent websocket between the replica and its upstream that carries live events and the control signals replicas depend on. That websocket is just an extended-mode subscription to the same streaming endpoint end-user clients use, as described in Section 5.2. There is no separate replication protocol.
+
+Everything a replica needs to stay caught up is already carried on an extended-mode connection: the raw DAG-CBOR of each record (so the replica can write bit-exact payloads into its own segments), the jetstream-local `seq` (so the replica can persist its own upstream cursor), the upstream relay cursor (so a promoted replica can pick up the relay firehose with minimal overlap), and the `segment_sealed`, `segment_compacted`, and `backfill_complete` control events. Because end-user clients with `?extended=true` receive the same frames, replicas aren't a privileged special case at the protocol layer; they're just the most aggressive consumer.
+
+Idempotency matters for the bootstrap-to-live handoff. Duplicate events are deduplicated by `(did, seq)` at the block boundary; duplicate segment-seal or segment-compacted events redownload the same file and produce the same on-disk state; duplicate `backfill_complete` entries are harmless because the log is read as a set. This lets the bootstrap-time bulk transfers overlap with live control events at the boundary without a strict handoff.
+
+### 6.2 Bootstrapping a Replica
+
+To bootstrap a new read replica, start the server with the `--upstream=jetstream.us-east.bsky.network` flag. The replica goes through the following steps:
+
+1. Open an extended-mode websocket to the upstream with no cursor, and start buffering frames in memory. Doing this first ensures no live events or control signals are lost during the bulk-transfer phase.
+2. Download every sealed segment file the upstream currently lists, verifying each one's sha256 checksum against the value in its fixed header.
+3. Download the current `backfill_complete.log` from the upstream over HTTPS and apply each entry to the replica's `repo/<did>` records in pebble.
+4. Begin processing buffered websocket frames: write events into the active segment, handle `segment_sealed` and `segment_compacted` by downloading and swapping the named file, and apply `backfill_complete` entries to the local log and pebble records.
+
+The replica writes events into its own active segment exactly as a primary would, and seals independently when its active segment fills. Replica sealed segments are not expected to be bitwise-identical to the upstream's, since block boundaries depend on local timing. They're logically equivalent, and each file's self-contained sha256 checksum is what we verify against.
+
+### 6.3 Promoting a Replica to Leader
+
+To promote a replica to leader, remove the `--upstream` flag and point it at a relay firehose instead. The promoted leader uses the last `upstream_relay_cursor` it observed on the extended stream as its starting point and rewinds slightly to lean on at-least-once delivery across the overlap. It then calls `com.atproto.sync.listRepos` to get the authoritative DID list, diffs it against `repo/<did>` in pebble to find DIDs that are either unknown or missing from `backfill_complete.log`, and queues them for initial backfill or retry. DIDs present in the log are treated as fully backfilled and not re-downloaded. This means a promoted leader has a warmup window measured in minutes (dominated by `listRepos` pagination) before retry work resumes, which we consider acceptable given our non-goal of sub-minute failover.
+
+We accept a few cosmetic regressions on failover: `Attempts` counters reset to zero, `LastError` strings are lost (operators can consult logs for debugging history), and any accounts that are legitimately empty at the relay may be redundantly re-fetched once. None of these affect correctness.
+
+Timestamp imports (Section 8) flow to replicas entirely through `segment_compacted` events on the extended stream and do not need a parallel channel.
+
+## 7. Rate Limits
+
+For production readiness, we ensure that we have reasonable rate limits for requests that make it to the system. We'll put in place per-IP limits on the CDN as well as the origin to ensure that HTTP segment file downloads are limited as well as the number of subscribers and events to the live tail.
+
+These will be configurable over time as we scale.
+
+This is of course an implementation detail of the Bluesky-hosted instance. Others can do what they please.
+
+## 8. Timestamp Import
+
+There is a requirement for building real-world AppViews with any new firehose indexer: they must retain the previous indexed at timestamps as the system that came before it.
+
+Concretely, we can't rebuild the production Bluesky AppView unless we also carry over its indexed at timestamps because the created at timestamp (if present) is spoofable by the client. This can lead to a poor app experience and trust and safety concerns where users edit their timestamps to be misleading.
+
+If we don't import the existing indexed at timestamps at all, it would look like any post made before 2026 was indeed created in 2026. That's obviously not acceptable.
+
+To work around this, we are creating an optional bulk indexed at timestamp API where a jetstream operator can upload a large CSV of AT URIs and their preferred `rendered at` timestamp. The jetstream instance ensures that it stores both the indexed at timestamp (when did jetstream itself see the record) as well as the optional rendered at timestamp (when did the Bluesky AppView originally see the record). The subscribers of jetstream receive both timestamp values and can choose which one they'd prefer to use (usually the rendered at timestamp).
+
+Only the operator of jetstream may alter timestamps. This is an authenticated feature.
+
+Rather than maintaining a separate timestamp table that has to be kept in sync alongside segments and replicated on its own channel, we apply timestamp imports directly into segment files as part of the upload operation. The flow is: the operator POSTs a large CSV; the server buckets the URIs by DID; the segment-level DID bloom narrows to candidate segments; the per-block DID blooms narrow to candidate blocks; and each candidate block is decompressed, its `rendered_at` column is patched for the matching rows, and the block is re-encoded. This is the same filtering and rewrite machinery used for lookaside compaction (Section 3.3.1), so there's nothing new to build at the storage layer.
+
+We require uploads to be keyed by AT URI rather than by CID. URIs contain the DID, which lets us use the existing segment-level DID bloom to do almost all the filtering work. CID-keyed imports would force either a full scan of every segment or a second per-segment bloom over CIDs; both are expensive enough that it's not worth paying for unless we see a concrete need. Operators that only have CIDs can resolve them upstream before uploading.
+
+Once the compaction pass has rewritten all affected segments and resealed them with new checksums, the segment-compaction notification path from Section 6 fires for each touched file, and replicas re-download and swap them in exactly as they would for any other compaction. No additional replication mechanism is required for timestamps.
+
+## 9. FAQ
+
+1. **Why store data by indexed timestamp rather than collection?**
+
+> I did a v0 of this system storing data by collection, and it has some nice properties. If you only want to download `app.bsky.feed.post`, it's simple and efficient to do so. However, when creating real-world AppViews, the requirement to replay events in order for a single DID would require a k-way sort if we ordered by collection. That's a deal breaker. Ordering by indexed at timestamp has the property that events within a single DID are ordered in the order in which they were created (though there is no global ordering).
+> 
+1. **What is the latency between a record being read from the live firehose and it being sent to client consumers during steady-state?**
+
+> Close to real-time. It's essential for AppView product experience that we deliver records with very low latency (tens of milliseconds).
+> 
+1. **This is the next evolution of Jetstream v1? What happens to existing Jetstream v1? How does Tap play in to this?**
+
+> This system uses the same JSON+websocket API as Jetstream v1, so we will swap out the underlying Jetstream v1 processes for instances of jetstream (ensuring that cursors only go forward). Clients will not be impacted.
+> 
+
+> Tap is solving a bit of a different problem than Jetstream. Tap helps manage cursors via webhooks and ACKs, whereas jetstream really is just about archiving and forwarding the whole network. Tap will eventually be upgraded to support jetstream as an upstream data source (in addition to the current full-fat firehose mode).
+> 
+1. **What about permissioned data?**
+
+> This remains to be seen as the permissioned data sync mechanism is designed and implemented. If there is a use-case for jetstream and permissioned data, we will strongly consider adding support for it.
+> 
+1. **What about off-protocol data such as the data currently stored in bsync (mutes, bookmarks, etc.)?**
+
+> Off-protocol data is not a concern of this project. There is no support for it.
+> 
+1. **Why not build a more robust HA mechanism that's hands-off like kafka?**
+
+> This system is already fairly complex. Adding a distributed consensus protocol like raft to do multi-master HA is more complexity than we feel we can handle given the team and time constraints.
+> 
+
+> I'm a big fan of active/active systems over active/passive, but we need to make tradeoffs so we can ship quickly and without bugs.
+> 
+
+## 10. References and Further Reading
+
+1. https://atproto.com/specs/sync
+2. https://atproto.com/specs/event-stream
+3. https://atproto.com/specs/repository
+4. https://atproto.com/specs/account
+5. https://github.com/bluesky-social/jetstream
+6. https://github.com/bluesky-social/indigo/tree/main/cmd/relay
+7. https://github.com/bluesky-social/indigo/tree/main/cmd/tap
+8. https://github.com/jcalabro/gloom
+
+NOTE (jrc): we should treat the existing jetstream HTTP API surface as legacy, and is only there for backwards compatability. We will instead be building on XRPC. We’ll maintain the old surface, but also duplicate the existing API to XRPC, and all net-new stuff will be XRPC.
+
+NOTE (jrc): clarify rendered at vs. indexed at. it should not leak through to the user at all
+
+NOTE (jrc): call the “lookaside” file the “op log”
