@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,7 +75,7 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 	if ins.Sealed {
 		bw.printf("state: sealed\n")
 	} else {
-		bw.printf("state: active (unsealed; frame walk)\n")
+		bw.printf("state: active (unsealed; block walk)\n")
 	}
 	bw.printf("magic: jss0\n")
 	if ins.Sealed {
@@ -99,7 +100,7 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 		bw.printf("  event_count:       %d\n", ins.Header.EventCount)
 		bw.printf("  unique_did_count:  %d\n", ins.Header.UniqueDIDCount)
 	} else {
-		bw.printf("  block_count:       %d (discovered via frame walk)\n", len(ins.Blocks))
+		bw.printf("  block_count:       %d (discovered via block walk)\n", len(ins.Blocks))
 		bw.printf("  event_count:       %d (from walk)\n", ins.TotalEvents)
 		bw.printf("  unique_did_count:  %d (from walk; not durable until seal)\n", ins.UniqueDIDCount)
 	}
@@ -127,22 +128,41 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 	if len(ins.Collections) == 0 {
 		bw.printf("  (none)\n")
 	} else {
-		counts := make([]int, len(ins.Collections))
+		blockCounts := make([]int, len(ins.Collections))
 		for _, ids := range ins.BlockCollections {
 			for _, id := range ids {
-				if int(id) < len(counts) {
-					counts[id]++
+				if int(id) < len(blockCounts) {
+					blockCounts[id]++
 				}
 			}
 		}
+		// Inspection guarantees CollectionEventCounts is parallel-indexed
+		// with Collections (segment.Inspect populates both from the same
+		// source). A length mismatch would indicate a bug upstream;
+		// surface it rather than silently zero-fill so the operator can
+		// see something is wrong with the file.
+		eventCounts := ins.CollectionEventCounts
+		if len(eventCounts) != len(ins.Collections) {
+			return fmt.Errorf(
+				"inspect-segment: CollectionEventCounts len %d != Collections len %d",
+				len(eventCounts), len(ins.Collections))
+		}
 		nsidWidth := 0
-		for _, n := range ins.Collections {
+		eventsWidth := len("events")
+		blocksWidth := len("blocks")
+		for i, n := range ins.Collections {
 			if len(n) > nsidWidth {
 				nsidWidth = len(n)
 			}
+			if w := len(strconv.FormatUint(uint64(eventCounts[i]), 10)); w > eventsWidth {
+				eventsWidth = w
+			}
+			if w := len(strconv.Itoa(blockCounts[i])); w > blocksWidth {
+				blocksWidth = w
+			}
 		}
-		// Sort by descending block-occurrence count so the operator's eye
-		// lands on the noisy collections first. The original index in
+		// Sort by descending event count so the operator's eye lands on
+		// the noisiest collections first. The original index in
 		// ins.Collections is preserved as the printed [id] so cross-refs
 		// to per-block "collections:" lists in --blocks=full still match.
 		order := make([]int, len(ins.Collections))
@@ -150,10 +170,13 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 			order[i] = i
 		}
 		sort.SliceStable(order, func(a, b int) bool {
-			return counts[order[a]] > counts[order[b]]
+			return eventCounts[order[a]] > eventCounts[order[b]]
 		})
 		for _, i := range order {
-			bw.printf("  [%3d] %-*s  blocks: %d\n", i, nsidWidth, ins.Collections[i], counts[i])
+			bw.printf("  [%3d] %-*s  events: %*d  blocks: %*d\n",
+				i, nsidWidth, ins.Collections[i],
+				eventsWidth, eventCounts[i],
+				blocksWidth, blockCounts[i])
 		}
 	}
 

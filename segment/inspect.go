@@ -31,16 +31,20 @@ type Inspection struct {
 
 	// Collections is the segment's NSID string table. For sealed
 	// files this comes from the on-disk collection index. For active
-	// files it's the table accumulated during the frame walk in
+	// files it's the table accumulated during the block walk in
 	// first-seen order (and is therefore stable as long as the writer
 	// hasn't appended more events since the inspect started).
 	Collections []string
 	// BlockCollections[i] is the sorted collection IDs in block i.
 	BlockCollections [][]uint32
+	// CollectionEventCounts[i] is the total event count for Collections[i]
+	// across the whole segment. Events with empty Collection are not
+	// counted, so sum(CollectionEventCounts) <= TotalEvents.
+	CollectionEventCounts []uint32
 
 	// Aggregates derived during inspection. For sealed files these
 	// match the corresponding Header fields; for active files they
-	// come from the frame walk.
+	// come from the block walk.
 	TotalEvents    uint64
 	UniqueDIDCount uint32
 	MinSeq, MaxSeq uint64
@@ -137,6 +141,7 @@ func inspectSealed(path string, fileSize int64, headerBytes []byte) (*Inspection
 		}
 		perBlockCollections[i] = ids
 	}
+	collectionEventCounts := r.CollectionEventCounts()
 
 	checksumValid, err := verifySealedChecksum(path, fileSize, headerBytes, header)
 	if err != nil {
@@ -154,25 +159,26 @@ func inspectSealed(path string, fileSize int64, headerBytes []byte) (*Inspection
 	}
 
 	return &Inspection{
-		Path:                 path,
-		FileSize:             fileSize,
-		Sealed:               true,
-		Header:               header,
-		Blocks:               blocks,
-		Collections:          collections,
-		BlockCollections:     perBlockCollections,
-		TotalEvents:          uint64(header.EventCount),
-		UniqueDIDCount:       header.UniqueDIDCount,
-		MinSeq:               header.MinSeq,
-		MaxSeq:               header.MaxSeq,
-		MinIndexedAt:         header.MinIndexedAt,
-		MaxIndexedAt:         header.MaxIndexedAt,
-		BlockIndexBytes:      blockIndexBytes,
-		SegmentBloomBytes:    segmentBloomBytes,
-		BlockBloomsBytes:     blockBloomsBytes,
-		CollectionIndexBytes: collectionIndexBytes,
-		PerBlockBloomBytes:   perBlockBloomBytes,
-		ChecksumValid:        checksumValid,
+		Path:                  path,
+		FileSize:              fileSize,
+		Sealed:                true,
+		Header:                header,
+		Blocks:                blocks,
+		Collections:           collections,
+		BlockCollections:      perBlockCollections,
+		CollectionEventCounts: collectionEventCounts,
+		TotalEvents:           uint64(header.EventCount),
+		UniqueDIDCount:        header.UniqueDIDCount,
+		MinSeq:                header.MinSeq,
+		MaxSeq:                header.MaxSeq,
+		MinIndexedAt:          header.MinIndexedAt,
+		MaxIndexedAt:          header.MaxIndexedAt,
+		BlockIndexBytes:       blockIndexBytes,
+		SegmentBloomBytes:     segmentBloomBytes,
+		BlockBloomsBytes:      blockBloomsBytes,
+		CollectionIndexBytes:  collectionIndexBytes,
+		PerBlockBloomBytes:    perBlockBloomBytes,
+		ChecksumValid:         checksumValid,
 	}, nil
 }
 
@@ -209,18 +215,19 @@ func verifySealedChecksum(path string, fileSize int64, headerBytes []byte, heade
 func inspectActive(path string, f *os.File, fileSize int64) (*Inspection, error) {
 	walk, walkErr := walkActiveFrames(f, fileSize)
 	ins := &Inspection{
-		Path:             path,
-		FileSize:         fileSize,
-		Sealed:           false,
-		Blocks:           walk.infos,
-		Collections:      walk.collectionStringTable,
-		BlockCollections: walk.perBlockCollections,
-		TotalEvents:      uint64(walk.totalEventCount),
-		UniqueDIDCount:   uint32(len(walk.uniqueDIDs)),
-		MinSeq:           walk.minSeq,
-		MaxSeq:           walk.maxSeq,
-		MinIndexedAt:     walk.minIndexedAt,
-		MaxIndexedAt:     walk.maxIndexedAt,
+		Path:                  path,
+		FileSize:              fileSize,
+		Sealed:                false,
+		Blocks:                walk.infos,
+		Collections:           walk.collectionStringTable,
+		BlockCollections:      walk.perBlockCollections,
+		CollectionEventCounts: walk.collectionEventCounts,
+		TotalEvents:           uint64(walk.totalEventCount),
+		UniqueDIDCount:        uint32(len(walk.uniqueDIDs)),
+		MinSeq:                walk.minSeq,
+		MaxSeq:                walk.maxSeq,
+		MinIndexedAt:          walk.minIndexedAt,
+		MaxIndexedAt:          walk.maxIndexedAt,
 	}
 	if walkErr != nil {
 		ins.PartialError = walkErr

@@ -171,19 +171,19 @@ func TestRenderInspection_BlockTruncation(t *testing.T) {
 	require.Contains(t, out, "rows omitted")
 }
 
-func TestRenderInspection_CollectionsSortedByBlockCountDesc(t *testing.T) {
+func TestRenderInspection_CollectionsSortedByEventCountDesc(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "multi.jss")
-	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: 1})
+	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: 4})
 	require.NoError(t, err)
 
-	// Each Append+Flush produces one block. Collection occurrences (in
-	// blocks) end up: rare=1, common=3, mid=2. Insertion order is
-	// rare, common, mid — so a sort that ignored counts would print them
-	// in that order. We expect descending: common, mid, rare.
-	collections := []string{"rare", "common", "common", "common", "mid", "mid"}
+	// Per-collection event counts: rare=1, common=4, mid=2.
+	// Insertion order is rare, common, mid — a sort that ignored
+	// counts would print them in that order. We expect descending by
+	// event count: common, mid, rare.
+	collections := []string{"rare", "common", "common", "common", "common", "mid", "mid"}
 	for i, c := range collections {
 		full, err := w.Append(segment.Event{
 			Seq:        uint64(i + 1),
@@ -194,9 +194,11 @@ func TestRenderInspection_CollectionsSortedByBlockCountDesc(t *testing.T) {
 			Rev:        "v",
 		})
 		require.NoError(t, err)
-		require.True(t, full)
-		require.NoError(t, w.Flush())
+		if full {
+			require.NoError(t, w.Flush())
+		}
 	}
+	require.NoError(t, w.Flush())
 	_, err = w.Seal()
 	require.NoError(t, err)
 
@@ -213,6 +215,61 @@ func TestRenderInspection_CollectionsSortedByBlockCountDesc(t *testing.T) {
 	require.Greater(t, commonIdx, 0)
 	require.Greater(t, midIdx, commonIdx, "mid should follow common")
 	require.Greater(t, rareIdx, midIdx, "rare should follow mid")
+
+	// Also assert the events: column is rendered. Numeric width is
+	// computed dynamically from the largest count in the segment, so
+	// match exact rendered cells (max here = 4 → width 6 from the
+	// "events" header label).
+	require.Contains(t, out, "events:")
+	require.Contains(t, out, "common  events:      4")
+	require.Contains(t, out, "mid     events:      2")
+	require.Contains(t, out, "rare    events:      1")
+}
+
+// TestRenderInspection_CollectionsAlignsWideCounts pins that the
+// rendered events column widens to fit the largest count rather than
+// silently overflowing a fixed-width specifier.
+func TestRenderInspection_CollectionsAlignsWideCounts(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wide.jss")
+	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: 64})
+	require.NoError(t, err)
+
+	// 20000 events all in one collection — exceeds the old "%4d" cell.
+	const total = 20000
+	for i := range total {
+		full, err := w.Append(segment.Event{
+			Seq:        uint64(i + 1),
+			Kind:       segment.KindCreate,
+			DID:        "d",
+			Collection: "app.bsky.feed.post",
+			Rkey:       "r",
+			Rev:        "v",
+		})
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	require.NoError(t, w.Flush())
+	_, err = w.Seal()
+	require.NoError(t, err)
+
+	ins, err := segment.Inspect(path)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, renderInspection(&buf, ins, "summary", 0))
+	out := buf.String()
+
+	// The 5-digit count should appear right-aligned (min width 6 from
+	// the "events" header) with no truncation or stray padding mid-
+	// number. Pre-fix, "%4d" would have printed "events: 20000" with
+	// the 5-digit number overflowing the cell — which would still
+	// substring-match, so we instead pin the exact column cell.
+	require.Contains(t, out, "events:  20000  blocks:")
 }
 
 func TestInspectSegmentCommand_EndToEndAgainstRealFile(t *testing.T) {

@@ -265,6 +265,20 @@ func (r *Reader) Collections() []string {
 	return out
 }
 
+// CollectionEventCounts returns the per-collection event counts,
+// indexed the same way as Collections(). For collection id i,
+// CollectionEventCounts()[i] is the total number of events with
+// Collection == Collections()[i] across the whole segment. Events
+// with an empty Collection (e.g. Identity, Account) are not counted,
+// so sum(CollectionEventCounts()) <= Header().EventCount.
+//
+// The returned slice is a fresh copy; mutation is harmless.
+func (r *Reader) CollectionEventCounts() []uint32 {
+	out := make([]uint32, len(r.parsedCollections.eventCounts))
+	copy(out, r.parsedCollections.eventCounts)
+	return out
+}
+
 // BlockCollections returns the NSID ids present in the given block,
 // sorted ascending.
 func (r *Reader) BlockCollections(idx int) ([]uint32, error) {

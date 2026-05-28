@@ -65,6 +65,16 @@ func TestInspect_SealedRoundtrip(t *testing.T) {
 		ins.Collections)
 	require.Len(t, ins.BlockCollections, len(ins.Blocks))
 
+	require.Len(t, ins.CollectionEventCounts, len(ins.Collections))
+	byName := map[string]uint32{}
+	for i, n := range ins.Collections {
+		byName[n] = ins.CollectionEventCounts[i]
+	}
+	// Fixture: 2 posts, 2 likes, 1 follow.
+	require.Equal(t, uint32(2), byName["app.bsky.feed.post"])
+	require.Equal(t, uint32(2), byName["app.bsky.feed.like"])
+	require.Equal(t, uint32(1), byName["app.bsky.graph.follow"])
+
 	// Per-block indexed_at bounds round-trip through seal.
 	for i, b := range ins.Blocks {
 		require.LessOrEqual(t, b.MinIndexedAt, b.MaxIndexedAt,
@@ -179,6 +189,15 @@ func TestInspect_ActiveFileWithBlocks(t *testing.T) {
 		[]string{"app.bsky.feed.post", "app.bsky.feed.like"},
 		ins.Collections)
 	require.Len(t, ins.BlockCollections, 2)
+
+	require.Len(t, ins.CollectionEventCounts, len(ins.Collections))
+	byName := map[string]uint32{}
+	for i, n := range ins.Collections {
+		byName[n] = ins.CollectionEventCounts[i]
+	}
+	// Fixture: 2 posts, 2 likes.
+	require.Equal(t, uint32(2), byName["app.bsky.feed.post"])
+	require.Equal(t, uint32(2), byName["app.bsky.feed.like"])
 
 	for i, b := range ins.Blocks {
 		require.LessOrEqual(t, b.MinIndexedAt, b.MaxIndexedAt,

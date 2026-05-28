@@ -484,3 +484,60 @@ func TestReaderOpenRejectsInvertedIndexedAtBounds(t *testing.T) {
 	_, err = Open(ReaderConfig{Path: path, SkipChecksum: true})
 	require.True(t, errors.Is(err, ErrInvalidBlockIndex))
 }
+
+func TestReader_CollectionEventCounts(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 4})
+	require.NoError(t, err)
+
+	// 3 posts, 2 likes, 1 follow → 6 events with non-empty Collection.
+	// Plus one Identity event with empty Collection that must NOT count.
+	events := []Event{
+		{Seq: 1, IndexedAt: 1_000_000, Kind: KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "1", Rev: "r"},
+		{Seq: 2, IndexedAt: 1_000_001, Kind: KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "2", Rev: "r"},
+		{Seq: 3, IndexedAt: 1_000_002, Kind: KindCreate, DID: "did:plc:c", Collection: "app.bsky.feed.post", Rkey: "3", Rev: "r"},
+		{Seq: 4, IndexedAt: 1_000_003, Kind: KindCreate, DID: "did:plc:d", Collection: "app.bsky.feed.like", Rkey: "4", Rev: "r"},
+		{Seq: 5, IndexedAt: 1_000_004, Kind: KindCreate, DID: "did:plc:e", Collection: "app.bsky.feed.like", Rkey: "5", Rev: "r"},
+		{Seq: 6, IndexedAt: 1_000_005, Kind: KindCreate, DID: "did:plc:f", Collection: "app.bsky.graph.follow", Rkey: "6", Rev: "r"},
+		{Seq: 7, IndexedAt: 1_000_006, Kind: KindIdentity, DID: "did:plc:a"},
+	}
+	for _, ev := range events {
+		full, err := w.Append(ev)
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	require.NoError(t, w.Flush())
+	res, err := w.Seal()
+	require.NoError(t, err)
+	require.EqualValues(t, 7, res.EventCount)
+
+	r, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+
+	collections := r.Collections()
+	counts := r.CollectionEventCounts()
+	require.Len(t, counts, len(collections))
+
+	byName := map[string]uint32{}
+	for i, n := range collections {
+		byName[n] = counts[i]
+	}
+	require.Equal(t, uint32(3), byName["app.bsky.feed.post"])
+	require.Equal(t, uint32(2), byName["app.bsky.feed.like"])
+	require.Equal(t, uint32(1), byName["app.bsky.graph.follow"])
+
+	var sum uint32
+	for _, c := range counts {
+		sum += c
+	}
+	require.EqualValues(t, 6, sum,
+		"sum of per-collection counts excludes Identity event with empty Collection")
+	require.Less(t, sum, res.EventCount,
+		"sum should be strictly less than EventCount because Identity events have no Collection")
+}

@@ -9,14 +9,20 @@ import (
 // collectionIndex is the parsed form of the collection block index
 // (DESIGN.md §3.1.4, spec §5.5). stringTable is the unique NSIDs in
 // first-seen order; the index of each NSID in stringTable is its
-// "collection ID". blockBitmasks[i] is the sorted, deduplicated set
-// of collection IDs present in block i.
+// "collection ID". eventCounts[i] is the total number of events with
+// collection-id i across the whole segment (parallel-indexed with
+// stringTable). blockBitmasks[i] is the sorted, deduplicated set of
+// collection IDs present in block i.
 //
-// On disk the bitmasks are stored as packed-byte bit arrays of size
-// ceil(len(stringTable) / 8); we decode them into []uint32 of IDs
-// here so callers don't have to do bit math.
+// On disk the per-collection rows are interleaved as
+// (len:uint8, count:uint32 LE, nsid:[len]byte); we keep them as two
+// parallel slices in memory because every consumer reads them by
+// collection-id index. The bitmasks are stored as packed-byte bit
+// arrays of size ceil(len(stringTable) / 8); we decode them into
+// []uint32 of IDs here so callers don't have to do bit math.
 type collectionIndex struct {
 	stringTable   []string
+	eventCounts   []uint32
 	blockBitmasks [][]uint32
 }
 
@@ -38,14 +44,26 @@ func encodeCollectionIndex(idx collectionIndex) ([]byte, error) {
 	}
 	bitmaskLen := (collectionCount + 7) / 8
 
-	// Build the uncompressed body: string table + per-block bitmasks.
+	// Build the uncompressed body: collection table (interleaved
+	// len/count/nsid) + per-block bitmasks. The two parallel slices on
+	// the in-memory struct are emitted in lockstep so a length mismatch
+	// can't be expressed on the wire.
+	if len(idx.eventCounts) != len(idx.stringTable) {
+		return nil, fmt.Errorf(
+			"%w: eventCounts len %d != stringTable len %d",
+			ErrInvalidFooter, len(idx.eventCounts), len(idx.stringTable))
+	}
 	var body []byte
+	var countBuf [4]byte
+	le := binary.LittleEndian
 	for i, nsid := range idx.stringTable {
 		if len(nsid) > math.MaxUint8 {
 			return nil, fmt.Errorf("%w: NSID %d exceeds %d bytes",
 				ErrFieldTooLong, i, math.MaxUint8)
 		}
 		body = append(body, uint8(len(nsid)))
+		le.PutUint32(countBuf[:], idx.eventCounts[i])
+		body = append(body, countBuf[:]...)
 		body = append(body, nsid...)
 	}
 	for blockIdx, ids := range idx.blockBitmasks {
@@ -64,7 +82,6 @@ func encodeCollectionIndex(idx collectionIndex) ([]byte, error) {
 	bodyZstd := blockEncoder.EncodeAll(body, nil)
 
 	header := make([]byte, collectionIndexHeaderSize)
-	le := binary.LittleEndian
 	le.PutUint32(header[0:4], uint32(collectionCount))
 	le.PutUint32(header[4:8], uint32(blockCount))
 	le.PutUint32(header[8:12], uint32(bitmaskLen))
@@ -124,6 +141,7 @@ func decodeCollectionIndex(buf []byte) (collectionIndex, error) {
 
 	off := 0
 	stringTable := make([]string, collectionCount)
+	eventCounts := make([]uint32, collectionCount)
 	for i := range stringTable {
 		if off+1 > len(body) {
 			return collectionIndex{}, fmt.Errorf(
@@ -131,6 +149,12 @@ func decodeCollectionIndex(buf []byte) (collectionIndex, error) {
 		}
 		strLen := int(body[off])
 		off++
+		if off+4 > len(body) {
+			return collectionIndex{}, fmt.Errorf(
+				"%w: truncated event count at i=%d", ErrInvalidFooter, i)
+		}
+		eventCounts[i] = le.Uint32(body[off : off+4])
+		off += 4
 		if off+strLen > len(body) {
 			return collectionIndex{}, fmt.Errorf(
 				"%w: truncated NSID body at i=%d", ErrInvalidFooter, i)
@@ -174,6 +198,7 @@ func decodeCollectionIndex(buf []byte) (collectionIndex, error) {
 
 	return collectionIndex{
 		stringTable:   stringTable,
+		eventCounts:   eventCounts,
 		blockBitmasks: bitmasks,
 	}, nil
 }

@@ -207,6 +207,7 @@ type blockWalkResult struct {
 
 	// Global collection string table in first-seen order.
 	collectionStringTable []string
+	collectionEventCounts []uint32 // parallel-indexed with collectionStringTable
 	collectionIDByName    map[string]uint32
 
 	// Did we see any events at all? minSeq/minIndexedAt are only
@@ -325,8 +326,10 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 					col := string([]byte(ev.Collection))
 					id = uint32(len(res.collectionStringTable))
 					res.collectionStringTable = append(res.collectionStringTable, col)
+					res.collectionEventCounts = append(res.collectionEventCounts, 0)
 					res.collectionIDByName[col] = id
 				}
+				res.collectionEventCounts[id]++
 				blockCollections[id] = struct{}{}
 			}
 		}
@@ -382,6 +385,7 @@ func buildFooter(walk blockWalkResult, maxEventsPerBlock int, footerOffset int64
 	// 4. Collection block index.
 	colIdx := collectionIndex{
 		stringTable:   walk.collectionStringTable,
+		eventCounts:   walk.collectionEventCounts,
 		blockBitmasks: walk.perBlockCollections,
 	}
 	collectionIndexBytes, err := encodeCollectionIndex(colIdx)

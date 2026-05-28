@@ -260,7 +260,7 @@ Per-Block DID Bloom Filters:
 
 We store a compact per-block summary of which collections are present in the segment file.
 
-The index consists of a string table of unique collection NSIDs (assigned uint32 IDs by table position), followed by a bitmask per block where bit N is set if collection ID N appears in that block. The whole index is stored as a single ZSTD frame with content checksums enabled.
+The index consists of a string table of unique collection NSIDs (assigned uint32 IDs by table position) as well as collection counts, followed by a bitmask per block where bit N is set if collection ID N appears in that block. The whole index is stored as a single ZSTD frame with content checksums enabled.
 
 The collection block index is quite small per-file and kept in server memory to attempt to minimize the number of times we need to touch the disk for queries by collection.
 
@@ -274,9 +274,10 @@ Collection Block Index:
 │   uncompressed_size: uint32                              │
 ├──────────────────────────────────────────────────────────┤
 │ Body (zstd compressed)                                   │
-│   String Table [collection_count entries]                │
+│   Collection Table [collection_count entries]            │
 │     Per entry:                                           │
 │       len:   uint8                                       │
+│       count: uint32                                      │
 │       nsid:  [len]byte                                   │
 │   Block Bitmasks [block_count × bitmask_len bytes]       │
 │     Bitmask for block 0: [bitmask_len]byte               │

@@ -43,6 +43,7 @@ func FuzzReadBlockIndex(f *testing.F) {
 func FuzzReadCollectionIndex(f *testing.F) {
 	good, err := encodeCollectionIndex(collectionIndex{
 		stringTable:   []string{"app.bsky.feed.post"},
+		eventCounts:   []uint32{1},
 		blockBitmasks: [][]uint32{{0}},
 	})
 	if err != nil {
