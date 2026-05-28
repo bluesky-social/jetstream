@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/urfave/cli/v3"
@@ -226,30 +225,4 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 	}
 
 	return bw.err
-}
-
-// formatMicros formats a unix-microsecond timestamp as RFC3339 with
-// six-digit fractional seconds in UTC. Zero -> the literal "0" so the
-// renderer doesn't print a misleading 1970 timestamp on a fresh file.
-func formatMicros(us int64) string {
-	if us == 0 {
-		return "0"
-	}
-	t := time.UnixMicro(us).UTC()
-	return t.Format("2006-01-02T15:04:05.000000Z")
-}
-
-// errWriter accumulates a write error so the renderer can be a sequence
-// of bw.printf calls without an `if err != nil` after every one. The
-// first error is sticky; subsequent writes are dropped.
-type errWriter struct {
-	w   io.Writer
-	err error
-}
-
-func (e *errWriter) printf(format string, args ...any) {
-	if e.err != nil {
-		return
-	}
-	_, e.err = fmt.Fprintf(e.w, format, args...)
 }

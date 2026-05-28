@@ -5,19 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
-	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -96,113 +92,6 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 		PercentComplete: pct,
 		ListReposCursor: cursor,
 	}, nil
-}
-
-func collectSegmentTree(dir string) (SegmentTreeStats, error) {
-	stats := SegmentTreeStats{Dir: dir}
-
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return stats, nil
-		}
-		return stats, fmt.Errorf("status: readdir %s: %w", dir, err)
-	}
-
-	type segFile struct {
-		idx  uint64
-		path string
-		info os.FileInfo
-	}
-	var files []segFile
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		idx, ok := ingest.ParseSegmentIndex(e.Name())
-		if !ok {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			return stats, fmt.Errorf("status: stat %s: %w", e.Name(), err)
-		}
-		files = append(files, segFile{idx: idx, path: filepath.Join(dir, e.Name()), info: fi})
-	}
-	if len(files) == 0 {
-		return stats, nil
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].idx < files[j].idx })
-
-	stats.OldestMTime = files[0].info.ModTime()
-	stats.NewestMTime = files[0].info.ModTime()
-
-	for i, f := range files {
-		stats.CompressedBytes += f.info.Size()
-		mt := f.info.ModTime()
-		if mt.Before(stats.OldestMTime) {
-			stats.OldestMTime = mt
-		}
-		if mt.After(stats.NewestMTime) {
-			stats.NewestMTime = mt
-		}
-
-		qs, err := segment.QuickStats(f.path)
-		if err != nil {
-			// Latest file may be torn during rotation; tolerate it. Note:
-			// we already added f.info.Size() to CompressedBytes above, so
-			// CompressedBytes can briefly include bytes that have no matching
-			// UncompressedBytes contribution. Acceptable for a 30s-cached
-			// status page; the next refresh after the rotation completes
-			// will reconcile.
-			if i == len(files)-1 {
-				continue
-			}
-			return stats, fmt.Errorf("status: quickstats %s: %w", f.path, err)
-		}
-		stats.UncompressedBytes += qs.UncompressedBytes
-
-		if qs.Sealed {
-			stats.SealedCount++
-		} else {
-			stats.ActiveCount++
-		}
-	}
-
-	// Latest-segment summary (cheap full Inspect on one file).
-	latest := files[len(files)-1]
-	if summary, err := buildSegmentSummary(latest.path, latest.idx, latest.info.Size()); err == nil {
-		stats.LatestSegment = summary
-	}
-
-	return stats, nil
-}
-
-func buildSegmentSummary(path string, idx uint64, size int64) (*SegmentSummary, error) {
-	ins, err := segment.Inspect(path)
-	if err != nil {
-		return nil, err
-	}
-	return &SegmentSummary{
-		Index:           idx,
-		Sealed:          ins.Sealed,
-		EventCount:      ins.TotalEvents,
-		UniqueDIDCount:  ins.UniqueDIDCount,
-		BlockCount:      uint32(len(ins.Blocks)),
-		CollectionCount: len(ins.Collections),
-		MinSeq:          ins.MinSeq,
-		MaxSeq:          ins.MaxSeq,
-		MinIndexedAt:    microsToTime(ins.MinIndexedAt),
-		MaxIndexedAt:    microsToTime(ins.MaxIndexedAt),
-		SizeBytes:       size,
-	}, nil
-}
-
-func microsToTime(us int64) time.Time {
-	if us == 0 {
-		return time.Time{}
-	}
-	return time.UnixMicro(us).UTC()
 }
 
 func collectPebble(s *store.Store, dataDir string) (PebbleStats, error) {
@@ -291,14 +180,16 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		return nil, err
 	}
 
-	segs, err := collectSegmentTree(filepath.Join(opts.DataDir, "segments"))
+	roots := []string{
+		filepath.Join(opts.DataDir, "segments"),
+		filepath.Join(opts.DataDir, "backfill", "live_segments"),
+	}
+	agg, err := InspectAll(roots, InspectAllOptions{})
 	if err != nil {
 		return nil, err
 	}
-
-	livesegs, err := collectSegmentTree(filepath.Join(opts.DataDir, "backfill", "live_segments"))
-	if err != nil {
-		return nil, err
+	if len(agg.Trees) != 2 {
+		return nil, fmt.Errorf("status: InspectAll returned %d trees, expected 2 (segments + backfill/live_segments) — the /status template assumes this shape", len(agg.Trees))
 	}
 
 	pdb, err := collectPebble(opts.Store, opts.DataDir)
@@ -307,13 +198,12 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 	}
 
 	return &Snapshot{
-		GeneratedAt: now,
-		Process:     collectProcess(now, startedAt),
-		Phase:       phase,
-		Backfill:    bf,
-		Live:        liveStats,
-		Segments:    segs,
-		LiveSegs:    livesegs,
-		Pebble:      pdb,
+		GeneratedAt:      now,
+		Process:          collectProcess(now, startedAt),
+		Phase:            phase,
+		Backfill:         bf,
+		Live:             liveStats,
+		SegmentAggregate: agg,
+		Pebble:           pdb,
 	}, nil
 }

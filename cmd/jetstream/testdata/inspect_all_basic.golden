@@ -1,0 +1,39 @@
+inspect-all
+data-dir: /data
+generated: 2026-05-28T12:34:56.000000Z
+
+network totals:
+  segments:               4 (3 sealed, 1 active)
+  blocks:                 12
+  events:                 1,234
+  collections:            3 distinct NSIDs
+  seq range:              [10, 1243]
+  indexed_at range:       2026-05-27T00:00:00.000000Z → 2026-05-28T00:00:00.000000Z
+  payload (uncompressed): 6.00 MiB
+  payload (compressed):   2.00 MiB
+  disk usage:             3.00 MiB
+  compression ratio:      3.00x
+
+trees:
+  [0] /data/segments
+        files:        3 sealed + 1 active
+        events:       1,234
+        blocks:       12
+        seq range:    [10, 1243]
+        indexed_at:   2026-05-27T00:00:00.000000Z → 2026-05-28T00:00:00.000000Z
+        oldest mtime: 2026-05-27T00:01:00.000000Z
+        newest mtime: 2026-05-28T00:01:00.000000Z
+        compressed:   2.00 MiB
+        uncompressed: 6.00 MiB
+        disk:         3.00 MiB
+        latest:       idx=4 active events=300 blocks=3 size=768.00 KiB
+  [1] /data/backfill/live_segments
+        (empty)
+
+collections (3 distinct NSIDs):
+  [  0] app.bsky.feed.post     events:          900  segments:     4  blocks:            9
+  [  1] app.bsky.feed.like     events:          300  segments:     2  blocks:            2
+  [  2] app.bsky.graph.follow  events:           34  segments:     1  blocks:            1
+
+warnings (1):
+  /data/segments/seg_0000000002.jss: corrupt segment: bad magic "XXXX"

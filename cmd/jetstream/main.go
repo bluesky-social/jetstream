@@ -129,6 +129,7 @@ func newApp() *cli.Command {
 			serveCommand(),
 			versionCommand(),
 			inspectSegmentCommand(),
+			inspectAllCommand(),
 		},
 	}
 }

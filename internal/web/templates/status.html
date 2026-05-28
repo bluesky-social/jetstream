@@ -151,11 +151,51 @@
   </section>
 
   <section>
+    <h2>Network</h2>
+    {{with .SegmentAggregate}}
+    <dl>
+      <dt>Segments</dt>
+      <dd>{{.Network.Segments}} ({{.Network.SealedSegments}} sealed{{if gt .Network.ActiveSegments 0}} + {{.Network.ActiveSegments}} active{{end}})</dd>
+      <dt>Blocks</dt>
+      <dd>{{humanInt .Network.Blocks}}</dd>
+      <dt>Events</dt>
+      <dd>{{humanInt .Network.Events}}</dd>
+      <dt>Collections</dt>
+      <dd>{{.Network.Collections}} distinct NSIDs</dd>
+      {{if gt .Network.Events 0}}
+      <dt>Seq range</dt>
+      <dd>[{{humanInt .Network.MinSeq}}, {{humanInt .Network.MaxSeq}}]</dd>
+      {{if not .Network.MinIndexedAt.IsZero}}
+      <dt>Indexed range</dt>
+      <dd>{{.Network.MinIndexedAt.Format "2006-01-02 15:04:05"}} … {{.Network.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>
+      {{end}}
+      {{end}}
+      <dt>Compressed</dt>
+      <dd>{{humanBytes .Network.CompressedBytes}}</dd>
+      <dt>Uncompressed</dt>
+      <dd>{{humanBytes .Network.UncompressedBytes}}</dd>
+      <dt>Disk usage</dt>
+      <dd>{{humanBytes .Network.DiskBytes}}</dd>
+    </dl>
+    {{end}}
+  </section>
+
+  <section>
     <h2>Segments</h2>
-    <div class="grid2">
-      {{template "tree" dict "Stats" .Segments "Now" .Now "Title" "segments/"}}
-      {{template "tree" dict "Stats" .LiveSegs "Now" .Now "Title" "backfill/live_segments/"}}
+    {{with .SegmentAggregate}}
+    {{if .Warnings}}
+    <div class="warnings" style="margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; border-left: 3px solid var(--accent); background: var(--bar-bg);">
+      <strong>{{len .Warnings}} warning(s):</strong>
+      <ul style="margin: 0.25rem 0 0 1rem; padding: 0;">
+        {{range .Warnings}}<li><code>{{.}}</code></li>{{end}}
+      </ul>
     </div>
+    {{end}}
+    <div class="grid2">
+      {{template "tree" dict "Stats" (index .Trees 0) "Now" $.Now "Title" "segments/"}}
+      {{template "tree" dict "Stats" (index .Trees 1) "Now" $.Now "Title" "backfill/live_segments/"}}
+    </div>
+    {{end}}
   </section>
 
   <section>
@@ -169,6 +209,36 @@
       {{end}}
     </dl>
   </section>
+
+  <section>
+    <h2>Collections</h2>
+    {{with .SegmentAggregate}}
+    {{if .Collections}}
+    <table style="border-collapse: collapse; width: 100%;">
+      <thead>
+        <tr style="text-align: left; border-bottom: 1px solid var(--border);">
+          <th style="padding: 0.25rem 0.5rem;">NSID</th>
+          <th style="padding: 0.25rem 0.5rem; text-align: right;">Events</th>
+          <th style="padding: 0.25rem 0.5rem; text-align: right;">Segments</th>
+          <th style="padding: 0.25rem 0.5rem; text-align: right;">Blocks</th>
+        </tr>
+      </thead>
+      <tbody>
+      {{range .Collections}}
+        <tr>
+          <td style="padding: 0.25rem 0.5rem;"><code>{{.NSID}}</code></td>
+          <td style="padding: 0.25rem 0.5rem; text-align: right; font-variant-numeric: tabular-nums;">{{humanInt .EventCount}}</td>
+          <td style="padding: 0.25rem 0.5rem; text-align: right; font-variant-numeric: tabular-nums;">{{.SegmentCount}}</td>
+          <td style="padding: 0.25rem 0.5rem; text-align: right; font-variant-numeric: tabular-nums;">{{humanInt .BlockCount}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <p class="sub">No segments yet.</p>
+    {{end}}
+    {{end}}
+  </section>
 </main>
 </body>
 </html>
@@ -176,21 +246,30 @@
 {{define "tree"}}
 <div>
   <h3 style="margin-top: 0; font-size: 0.95rem; color: var(--muted); font-weight: 500;">{{.Title}}</h3>
+  {{with .Stats}}
   <dl>
     <dt>Files</dt>
-    <dd>{{.Stats.SealedCount}} sealed{{if gt .Stats.ActiveCount 0}} + {{.Stats.ActiveCount}} active{{end}}</dd>
+    <dd>{{.SealedCount}} sealed{{if gt .ActiveCount 0}} + {{.ActiveCount}} active{{end}}</dd>
+    {{if gt .EventCount 0}}
+    <dt>Events</dt>
+    <dd>{{humanInt .EventCount}}</dd>
+    <dt>Blocks</dt>
+    <dd>{{humanInt .BlockCount}}</dd>
+    <dt>Seq range</dt>
+    <dd>[{{humanInt .MinSeq}}, {{humanInt .MaxSeq}}]</dd>
+    {{end}}
     <dt>Compressed</dt>
-    <dd>{{humanBytes .Stats.CompressedBytes}}</dd>
+    <dd>{{humanBytes .CompressedBytes}}</dd>
     <dt>Uncompressed</dt>
-    <dd>{{humanBytes .Stats.UncompressedBytes}}</dd>
-    {{if not .Stats.OldestMTime.IsZero}}
+    <dd>{{humanBytes .UncompressedBytes}}</dd>
+    {{if not .OldestMTime.IsZero}}
     <dt>Oldest</dt>
-    <dd>{{relativeTime .Stats.OldestMTime .Now}}</dd>
+    <dd>{{relativeTime .OldestMTime $.Now}}</dd>
     <dt>Newest</dt>
-    <dd>{{relativeTime .Stats.NewestMTime .Now}}</dd>
+    <dd>{{relativeTime .NewestMTime $.Now}}</dd>
     {{end}}
   </dl>
-  {{with .Stats.LatestSegment}}
+  {{with .LatestSegment}}
   <div class="latest">
     <h3>Latest segment ({{if .Sealed}}sealed{{else}}active{{end}})</h3>
     <dl>
@@ -214,6 +293,7 @@
       <dd>{{humanBytes .SizeBytes}}</dd>
     </dl>
   </div>
+  {{end}}
   {{end}}
 </div>
 {{end}}

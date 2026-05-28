@@ -43,10 +43,12 @@ func TestCollect_FreshDataDir(t *testing.T) {
 	require.True(t, snap.Phase.PhaseEnteredAt.IsZero())
 	require.Equal(t, status.BackfillStats{}, snap.Backfill)
 	require.Equal(t, status.LiveStats{}, snap.Live)
-	require.Equal(t, 0, snap.Segments.SealedCount+snap.Segments.ActiveCount)
-	require.Equal(t, 0, snap.LiveSegs.SealedCount+snap.LiveSegs.ActiveCount)
-	require.Equal(t, filepath.Join(dataDir, "segments"), snap.Segments.Dir)
-	require.Equal(t, filepath.Join(dataDir, "backfill", "live_segments"), snap.LiveSegs.Dir)
+	require.NotNil(t, snap.SegmentAggregate)
+	require.Len(t, snap.SegmentAggregate.Trees, 2)
+	require.Equal(t, filepath.Join(dataDir, "segments"), snap.SegmentAggregate.Trees[0].Dir)
+	require.Equal(t, filepath.Join(dataDir, "backfill", "live_segments"), snap.SegmentAggregate.Trees[1].Dir)
+	require.Equal(t, 0, snap.SegmentAggregate.Trees[0].SealedCount+snap.SegmentAggregate.Trees[0].ActiveCount)
+	require.Equal(t, 0, snap.SegmentAggregate.Trees[1].SealedCount+snap.SegmentAggregate.Trees[1].ActiveCount)
 }
 
 func TestCollect_CacheReusesPointer(t *testing.T) {
