@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,6 +64,19 @@ func serve(
 	values, qerr := url.ParseQuery(r.URL.RawQuery)
 	if qerr != nil {
 		http.Error(w, fmt.Sprintf("%s: %s", ErrInvalidOptions.Error(), qerr.Error()), http.StatusBadRequest)
+		return
+	}
+
+	// Reject the v1 zstd-with-custom-dictionary opt-in explicitly. v1
+	// signaled this two ways (jetstream/pkg/server/server.go:82):
+	// ?compress=true OR a Socket-Encoding header containing "zstd".
+	// v2 does not ship a custom dictionary or any per-frame compression
+	// on /subscribe, so a v1 client that flipped either switch would
+	// otherwise upgrade successfully and then silently fail to decode
+	// our plain-JSON frames. 400 here makes the contract loud at the
+	// HTTP layer instead of mysterious on the wire.
+	if values.Get("compress") == "true" || strings.Contains(r.Header.Get("Socket-Encoding"), "zstd") {
+		http.Error(w, "compression not supported: jetstream v2 does not implement the v1 zstd-with-custom-dictionary scheme; remove ?compress=true and the Socket-Encoding header", http.StatusBadRequest)
 		return
 	}
 

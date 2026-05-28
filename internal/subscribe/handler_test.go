@@ -274,6 +274,85 @@ func TestHandler_Filter_RejectsTooManyQueryParams(t *testing.T) {
 		"the response should be wrapped in our ErrInvalidOptions string")
 }
 
+// TestHandler_RejectsCompressQueryParam verifies we 400 a v1 client that
+// asks for zstd-with-custom-dict compression. Jetstream v1 supported a
+// custom zstd dictionary via ?compress=true; v2 does not. Without an
+// explicit reject, the websocket would upgrade and the client would
+// silently get uncompressed JSON it can't decode (or, worse, would feed
+// to a zstd reader and corrupt). 400 makes the contract loud.
+func TestHandler_RejectsCompressQueryParam(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"?compress=true", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	require.Contains(t, string(body), "compression not supported",
+		"the response body should explain that v2 does not support zstd compression")
+}
+
+// TestHandler_RejectsZstdSocketEncoding verifies that the v1 alternate
+// signal — a Socket-Encoding header containing "zstd" (server.go:82
+// in jetstream v1) — is also rejected. Same rationale as
+// TestHandler_RejectsCompressQueryParam: a v1 client porting over via
+// the header path would otherwise be silently surprised on the wire.
+func TestHandler_RejectsZstdSocketEncoding(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	req.Header.Set("Socket-Encoding", "zstd")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	require.Contains(t, string(body), "compression not supported",
+		"the response body should explain that v2 does not support zstd compression")
+}
+
+// TestHandler_AllowsCompressFalse verifies the compress=false (the v1
+// default) is accepted — we only reject affirmative requests for zstd.
+func TestHandler_AllowsCompressFalse(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?compress=false"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+}
+
 func TestHandler_Filter_WantedCollections_DeliversMatching(t *testing.T) {
 	t.Parallel()
 
