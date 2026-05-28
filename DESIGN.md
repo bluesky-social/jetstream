@@ -577,7 +577,7 @@ An example commit event looks like:
 {
   "did": "did:plc:eygmaihciaxprqvxpfvl6flk",
   "time_us": 1725911162329308,
-  "cursor": "XYZ",
+  "cursor": 12345,
   "kind": "commit",
   "commit": {
     "rev": "3l3qo2vutsw2b",
