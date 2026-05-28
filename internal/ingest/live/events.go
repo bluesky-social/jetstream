@@ -22,6 +22,14 @@ import (
 // ConvertEvent translates one atmos streaming.Event into zero or
 // more segment.Events. See the per-kind mapping in the spec
 // (§4.3 of the design doc).
+//
+// When a #commit's CAR diff omits the record block for one or more
+// create/update ops, ConvertEvent returns ErrDroppedMissingBlocks
+// alongside the surviving events; use errors.AsType to retrieve
+// per-op detail. The error is informational (the surviving events
+// in the slice are still archivable); callers should fall through
+// rather than discard the result. See the consumer's processBatch
+// for the canonical handling.
 func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
 	switch {
 	case evt.Commit != nil:
@@ -85,15 +93,15 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, 
 		// Resync ops carry the live record bytes for create/update;
 		// deletes are not part of a resync result (atmos's resync
 		// worker only emits records present in the post-resync repo).
-		// Surface a missing payload rather than archive a Create with
-		// nil bytes — AGENTS.md: crashing > silent corruption.
+		// A nil block here would mean atmos's resync worker emitted
+		// an op without payload bytes, which it shouldn't — but we
+		// drop rather than crash to keep the property uniform with
+		// convertCommit: a misbehaving upstream should not be able
+		// to take the firehose down.
 		if kind != segment.KindDelete {
 			block := op.BlockData()
 			if block == nil {
-				return nil, fmt.Errorf(
-					"livestream: did=%s collection=%s rkey=%s: %s op references CID missing from CAR diff",
-					op.Repo, op.Collection, op.RKey, op.Action,
-				)
+				continue
 			}
 			segEv.Payload = append([]byte(nil), block...)
 		}
@@ -101,9 +109,9 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, 
 	}
 
 	if len(out) == 0 {
-		// Iterator yielded nothing — this is a true unknown event
-		// kind (no Commit/Sync/Identity/Account/Info, no verified
-		// ops). Refuse to advance the cursor past it.
+		// Iterator yielded nothing at all — this is a true unknown
+		// event kind (no Commit/Sync/Identity/Account/Info, no
+		// verified ops). Refuse to advance the cursor past it.
 		return nil, ErrUnknownEventKind
 	}
 	return out, nil
@@ -112,6 +120,7 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, 
 func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
 	commit := evt.Commit
 	ops := make([]segment.Event, 0, len(commit.Ops))
+	var dropped []DroppedOp
 
 	for op, err := range evt.Operations() {
 		if err != nil {
@@ -134,21 +143,34 @@ func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error
 		// Deletes have no record bytes; everything else carries the
 		// raw CBOR record block exactly as atmos extracted it from
 		// the commit's CAR. atmos returns BlockData()==nil silently
-		// when the op's CID is missing from the CAR diff (truncated
-		// CAR, hash mismatch, or relay bug). We refuse rather than
-		// archive a Create/Update with no payload — AGENTS.md:
-		// crashing > silent corruption.
+		// when the op's CID is missing from the CAR diff — partial
+		// CARs are spec-permitted (a record block may be omitted
+		// e.g. when the new CID equals the old CID after a no-op
+		// update, or when a non-canonical PDS just doesn't include
+		// it). We drop the op rather than archive a Create/Update
+		// with nil payload (which would be data-corruption-shaped),
+		// and rather than abort the whole commit (which would let a
+		// single misbehaving PDS DoS the firehose consumer). The
+		// drop is surfaced to the caller via ErrDroppedMissingBlocks
+		// alongside the well-formed events.
 		if kind != segment.KindDelete {
 			block := op.BlockData()
 			if block == nil {
-				return nil, fmt.Errorf(
-					"livestream: did=%s collection=%s rkey=%s: %s op references CID missing from CAR diff",
-					commit.Repo, op.Collection, op.RKey, op.Action,
-				)
+				dropped = append(dropped, DroppedOp{
+					DID:        commit.Repo,
+					Collection: string(op.Collection),
+					RKey:       string(op.RKey),
+					Action:     string(op.Action),
+					CID:        op.CID.String(),
+				})
+				continue
 			}
 			segEv.Payload = append([]byte(nil), block...)
 		}
 		ops = append(ops, segEv)
+	}
+	if len(dropped) > 0 {
+		return ops, &DroppedMissingBlocksError{Dropped: dropped}
 	}
 	return ops, nil
 }

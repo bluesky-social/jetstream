@@ -261,6 +261,7 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			c.cfg.Metrics.incEventsReceived()
 
 			segEvts, err := ConvertEvent(evt, indexedAt)
+			dme, isDropped := errors.AsType[*DroppedMissingBlocksError](err)
 			switch {
 			case errors.Is(err, ErrUnknownEventKind):
 				// Forward-compat hole: a future relay variant we don't
@@ -281,6 +282,26 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					"seq", evt.Seq,
 				)
 				continue
+			case isDropped:
+				// Partial-CAR commit from a non-canonical PDS: one or
+				// more create/update ops referenced CIDs whose blocks
+				// were absent from the CAR diff. Bump the metric, log
+				// the offending DID, and fall through to archive the
+				// surviving ops (segEvts is non-nil and contains the
+				// well-formed events). A misbehaving upstream must NOT
+				// take the firehose down — a single such commit took
+				// down a multi-hour bootstrap backfill before this
+				// arm was added.
+				c.cfg.Metrics.addDroppedOpsMissingBlock(len(dme.Dropped))
+				// One log line per affected event keeps volume
+				// bounded under a misbehaving PDS spamming the
+				// firehose; per-op detail is on dme.Dropped for a
+				// future flag that wants it.
+				c.logger.WarnContext(ctx, "dropped ops with missing record blocks",
+					"seq", evt.Seq,
+					"count", len(dme.Dropped),
+					"did", dme.Dropped[0].DID,
+				)
 			case err != nil:
 				c.cfg.Metrics.incDecodeErrors()
 				// Bad shape from upstream is a data-integrity issue;

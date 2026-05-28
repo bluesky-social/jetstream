@@ -32,6 +32,8 @@ import (
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -155,6 +157,67 @@ func TestProcessBatch_UnknownEventDoesNotAdvanceCursor(t *testing.T) {
 	}))
 	require.Equal(t, int64(100), c.LastUpstreamSeq(),
 		"unknown trailing event must not advance the cursor past it")
+}
+
+// TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer pins the
+// system-level guarantee that motivated this fix: a #commit whose
+// CAR diff omits the record block for one of its create/update ops
+// (a partial CAR from a non-canonical PDS, e.g.
+// did:web:atpub.social.clipsymphony.com observed in production)
+// must NOT propagate an error out of processBatch. Pre-fix, this
+// returned a non-nil error, Consumer.Run returned it, the
+// orchestrator's errgroup tore down the entire process, and a
+// single misbehaving PDS could DoS the bootstrap backfill of the
+// whole network.
+//
+// This test drives processBatch directly so we can pin the
+// "no propagation, surviving ops still archived" property without
+// spinning up a fake firehose.
+func TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+
+	// Real metrics registry so we can assert the dropped-ops counter
+	// was bumped — both that the typed-error arm fired AND that the
+	// AsType extraction inside that arm reached len(dme.Dropped).
+	metrics := NewMetrics(prometheus.NewRegistry())
+
+	c, err := Open(Config{
+		SegmentsDir: dir,
+		Store:       st,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		Metrics:     metrics,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Build a #commit with one valid create plus one orphan create
+	// whose CID parses but isn't in the CAR.
+	did := "did:plc:partialcar"
+	evt, _ := buildCommit(t, did, "rev-mixed",
+		struct{ Coll, Rkey string }{"app.bsky.feed.post", "good"},
+	)
+	orphanCID := cbor.ComputeCID(cbor.CodecDagCBOR, []byte("not-in-the-car"))
+	evt.Commit.Ops = append(evt.Commit.Ops, comatproto.SyncSubscribeRepos_RepoOp{
+		Action: "create",
+		Path:   "app.bsky.feed.post/orphan",
+		CID:    gt.Some(lextypes.LexCIDLink{Link: orphanCID.String()}),
+	})
+	evt.Seq = 42
+
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{evt}),
+		"missing-block op must not propagate an error out of processBatch")
+	require.Equal(t, int64(42), c.LastUpstreamSeq(),
+		"the upstream cursor must advance past a partial-CAR commit; "+
+			"otherwise restart hits the same commit and re-crashes")
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DroppedOpsMissingBlock), 0,
+		"the consumer must extract per-op detail from the typed error and bump the counter")
 }
 
 func encodeAccountFrame(t *testing.T, did string, seq int64) []byte {

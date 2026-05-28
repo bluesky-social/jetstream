@@ -11,12 +11,13 @@ const (
 // consumer. A nil *Metrics is a valid zero-value: every method is a
 // no-op, so tests can skip metric registration entirely.
 type Metrics struct {
-	EventsReceived  prometheus.Counter
-	EventsConverted prometheus.Counter
-	Reconnects      prometheus.Counter
-	DecodeErrors    prometheus.Counter
-	UnknownEvents   prometheus.Counter
-	UpstreamCursor  prometheus.Gauge
+	EventsReceived         prometheus.Counter
+	EventsConverted        prometheus.Counter
+	Reconnects             prometheus.Counter
+	DecodeErrors           prometheus.Counter
+	UnknownEvents          prometheus.Counter
+	DroppedOpsMissingBlock prometheus.Counter
+	UpstreamCursor         prometheus.Gauge
 }
 
 // NewMetrics registers the livestream counters/gauges against reg.
@@ -50,6 +51,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help: "Number of upstream events whose kind ConvertEvent did not recognize. " +
 				"These do NOT advance the upstream cursor so a future build can replay them.",
 		}),
+		DroppedOpsMissingBlock: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "dropped_ops_missing_block_total",
+			Help: "Number of create/update ops dropped because the upstream commit's " +
+				"CAR diff omitted the referenced record block. The rest of the commit " +
+				"is still archived; a non-zero rate signals upstream PDSes shipping " +
+				"incomplete CARs (partial CARs are spec-permitted but unarchivable).",
+		}),
 		UpstreamCursor: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "upstream_cursor",
@@ -58,7 +67,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.EventsReceived, m.EventsConverted, m.Reconnects,
-		m.DecodeErrors, m.UnknownEvents, m.UpstreamCursor,
+		m.DecodeErrors, m.UnknownEvents, m.DroppedOpsMissingBlock,
+		m.UpstreamCursor,
 	)
 	return m
 }
@@ -90,6 +100,12 @@ func (m *Metrics) incDecodeErrors() {
 func (m *Metrics) incUnknownEvents() {
 	if m != nil {
 		m.UnknownEvents.Inc()
+	}
+}
+
+func (m *Metrics) addDroppedOpsMissingBlock(n int) {
+	if m != nil && n > 0 {
+		m.DroppedOpsMissingBlock.Add(float64(n))
 	}
 }
 

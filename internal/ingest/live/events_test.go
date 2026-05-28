@@ -2,12 +2,14 @@ package live
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/api/lextypes"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/mst"
 	atmosrepo "github.com/jcalabro/atmos/repo"
@@ -253,47 +255,67 @@ func TestConvertEvent_CommitDelete_PayloadNil(t *testing.T) {
 	require.Nil(t, got[0].Payload)
 }
 
-// TestConvertEvent_CommitMissingCAR_Errors pins data-integrity
-// behavior for the case where a Create/Update op references a CID
-// that isn't in the commit's CAR block index. atmos surfaces this
-// silently as Operation.BlockData()==nil; convertCommit must refuse
-// rather than write a Create with nil payload (AGENTS.md:
-// crashing > silent corruption).
-func TestConvertEvent_CommitMissingCAR_Errors(t *testing.T) {
+// TestConvertEvent_CommitMissingCAR_DropsBadOpKeepsRest pins the
+// data-tolerance behavior for partial CARs from non-canonical PDSes:
+// a create/update op referencing a CID that isn't in the commit's
+// CAR block index gets dropped (we will not archive a Create with
+// nil payload), but other ops in the same commit are still emitted.
+// The drop is surfaced via *DroppedMissingBlocksError (carrying
+// per-op detail) alongside the surviving events, so the consumer
+// can bump a metric, log, and continue. Pre-fix: the whole commit
+// errored, the consumer's processBatch returned the error, the
+// orchestrator's errgroup tore the process down — a single
+// misbehaving PDS DoSed the entire backfill.
+func TestConvertEvent_CommitMissingCAR_DropsBadOpKeepsRest(t *testing.T) {
 	t.Parallel()
 
 	did := "did:plc:missingcar"
 
-	key, err := crypto.GenerateP256()
-	require.NoError(t, err)
-	mstore := mst.NewMemBlockStore()
-	r := &atmosrepo.Repo{
-		DID:   atmosDIDFromString(t, did),
-		Clock: atmos.NewTIDClock(0),
-		Store: mstore,
-		Tree:  mst.NewTree(mstore),
+	// Build a commit whose first and third ops have valid CIDs (their
+	// blocks are in the CAR), but the middle op references a CID that
+	// is NOT in the CAR. Mirrors a partial CAR from a misbehaving PDS.
+	evt, payloads := buildCommit(t, did, "rev-mixed",
+		struct{ Coll, Rkey string }{"app.bsky.feed.post", "good0"},
+		struct{ Coll, Rkey string }{"app.bsky.feed.like", "good1"},
+	)
+	// Splice an orphan op in between the two valid creates. The CID
+	// is computed over data the CAR does not carry, so it parses
+	// cleanly (no syntax error) but no block will be found at lookup
+	// time — the exact shape of the partial-CAR PDS bug we hit in
+	// production with did:web:atpub.social.clipsymphony.com.
+	orphanCID := cbor.ComputeCID(cbor.CodecDagCBOR, []byte("not-in-the-car"))
+	orphanOp := comatproto.SyncSubscribeRepos_RepoOp{
+		Action: "create",
+		Path:   "app.bsky.feed.post/orphan",
+		CID:    gt.Some(lextypes.LexCIDLink{Link: orphanCID.String()}),
 	}
-	// Empty repo CAR — no record blocks at all.
-	var carBuf bytes.Buffer
-	require.NoError(t, r.ExportCAR(&carBuf, key))
-
-	// Op references a CID that is NOT in the CAR.
-	commit := &comatproto.SyncSubscribeRepos_Commit{
-		Repo: did,
-		Rev:  "rev-missing",
-		Ops: []comatproto.SyncSubscribeRepos_RepoOp{{
-			Action: "create",
-			Path:   "app.bsky.feed.post/rec0",
-			CID: gt.Some(lextypes.LexCIDLink{
-				Link: "bafyreiabsentcidthatisnotinthecarfile00000000000000000",
-			}),
-		}},
-		Blocks: carBuf.Bytes(),
+	evt.Commit.Ops = []comatproto.SyncSubscribeRepos_RepoOp{
+		evt.Commit.Ops[0], orphanOp, evt.Commit.Ops[1],
 	}
 
-	_, err = ConvertEvent(streaming.Event{Seq: 1, Commit: commit}, testIndexedAt)
-	require.Error(t, err, "create op with missing CAR block must surface as an error")
-	require.Contains(t, err.Error(), "did:plc:missingcar")
+	got, err := ConvertEvent(evt, testIndexedAt)
+
+	// The typed error must be reachable via errors.AsType, carrying
+	// per-op detail.
+	dme, ok := errors.AsType[*DroppedMissingBlocksError](err)
+	require.True(t, ok,
+		"partial CAR must surface *DroppedMissingBlocksError, not abort the commit; got=%v", err)
+	require.Len(t, dme.Dropped, 1, "exactly one op should be reported as dropped")
+	require.Equal(t, did, dme.Dropped[0].DID)
+	require.Equal(t, "app.bsky.feed.post", dme.Dropped[0].Collection)
+	require.Equal(t, "orphan", dme.Dropped[0].RKey)
+	require.Equal(t, "create", dme.Dropped[0].Action)
+	require.Equal(t, orphanCID.String(), dme.Dropped[0].CID)
+
+	// Critically, the surviving ops MUST still be returned alongside
+	// the error — the call site decides to fall through and archive
+	// them. This is the property that distinguishes the new design
+	// from "any non-nil error means drop the result."
+	require.Len(t, got, 2, "the two well-formed ops must still be emitted")
+	require.Equal(t, "good0", got[0].Rkey)
+	require.Equal(t, payloads[0], got[0].Payload)
+	require.Equal(t, "good1", got[1].Rkey)
+	require.Equal(t, payloads[1], got[1].Payload)
 }
 
 // TestConvertEvent_CommitResync pins the post-Sync-1.1 mapping:

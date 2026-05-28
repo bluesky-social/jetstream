@@ -11,6 +11,7 @@ import (
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/api/lextypes"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/mst"
 	atmosrepo "github.com/jcalabro/atmos/repo"
@@ -32,15 +33,17 @@ func swarmIterations(t *testing.T) int {
 
 // swarmCase is one synthesized input plus the expected outcome.
 //
-// Exactly one of expectErr / expectAnyErr / expectN must be the
-// "operative" expectation — the test asserts on whichever is set.
+// Exactly one of expectErr / expectAnyErr / expectDroppedMissingBlocks /
+// (default success) must be the "operative" expectation — the test
+// asserts on whichever is set.
 type swarmCase struct {
-	desc         string // why this case exists, useful in failure messages
-	evt          streaming.Event
-	expectErr    error          // non-nil → errors.Is(got, expectErr) must hold
-	expectAnyErr bool           // if true, any non-nil error is acceptable
-	expectN      int            // success path: exact number of segment.Events
-	expectK      []segment.Kind // success path: kinds in order
+	desc                       string // why this case exists, useful in failure messages
+	evt                        streaming.Event
+	expectErr                  error          // non-nil → errors.Is(got, expectErr) must hold; got events MUST be nil
+	expectAnyErr               bool           // if true, any non-nil error is acceptable; got events MUST be nil
+	expectDroppedMissingBlocks bool           // partial-success: errors.AsType[*DroppedMissingBlocksError] must succeed; got events MAY be empty or non-empty
+	expectN                    int            // exact number of segment.Events expected (used by both success and partial paths)
+	expectK                    []segment.Kind // kinds in order (success and partial paths)
 }
 
 // TestConvertEvent_Swarm exercises the actual semantic contract of
@@ -98,6 +101,26 @@ func TestConvertEvent_Swarm(t *testing.T) {
 			require.Error(t, gotErr,
 				"iter %d (%s): expected any non-nil error", i, c.desc)
 			require.Nil(t, got, "iter %d (%s): error path must not yield events", i, c.desc)
+			expectedErrSeen++
+
+		case c.expectDroppedMissingBlocks:
+			// Partial success: an error is returned alongside a
+			// possibly-non-empty events slice (the surviving ops).
+			// *DroppedMissingBlocksError is the canonical example.
+			_, ok := errors.AsType[*DroppedMissingBlocksError](gotErr)
+			require.True(t, ok,
+				"iter %d (%s): expected *DroppedMissingBlocksError, got %v",
+				i, c.desc, gotErr)
+			require.Len(t, got, c.expectN,
+				"iter %d (%s): wrong surviving-event count", i, c.desc)
+			for j, want := range c.expectK {
+				require.Equal(t, want, got[j].Kind,
+					"iter %d (%s): kind[%d]", i, c.desc, j)
+			}
+			for j, ev := range got {
+				assertSegmentInvariants(t, i, c.desc, j, ev, indexedAt)
+				successByKind[ev.Kind]++
+			}
 			expectedErrSeen++
 
 		default:
@@ -417,6 +440,13 @@ func commitWithMissingCAR(t *testing.T, r *rand.Rand) swarmCase {
 	var carBuf bytes.Buffer
 	require.NoError(t, repo.ExportCAR(&carBuf, key))
 
+	// Real, parseable CID over data the CAR does not carry. Mirrors
+	// the partial-CAR shape we see from non-canonical PDSes
+	// (did:web:atpub.social.clipsymphony.com observed in production).
+	// The op is dropped silently and the commit yields zero events;
+	// no error reaches the caller, so the consumer keeps running.
+	orphanCID := cbor.ComputeCID(cbor.CodecDagCBOR, []byte("not-in-the-car"))
+
 	return swarmCase{
 		desc: "commit referencing CID missing from CAR",
 		evt: streaming.Event{
@@ -427,14 +457,16 @@ func commitWithMissingCAR(t *testing.T, r *rand.Rand) swarmCase {
 				Ops: []comatproto.SyncSubscribeRepos_RepoOp{{
 					Action: "create",
 					Path:   "app.bsky.feed.post/orphan",
-					CID: gt.Some(lextypes.LexCIDLink{
-						Link: "bafyreiabsentcidthatisnotinthecarfile00000000000000000",
-					}),
+					CID:    gt.Some(lextypes.LexCIDLink{Link: orphanCID.String()}),
 				}},
 				Blocks: carBuf.Bytes(),
 			},
 		},
-		expectAnyErr: true,
+		// All (one) ops dropped → *DroppedMissingBlocksError alongside
+		// an empty surviving-events slice. The caller (consumer)
+		// archives nothing for this commit but does not abort.
+		expectDroppedMissingBlocks: true,
+		expectN:                    0,
 	}
 }
 
