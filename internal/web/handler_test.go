@@ -71,6 +71,12 @@ func newFixtureSnap() *status.Snapshot {
 				"repo/": 100, "sync/chain/": 50, "sync/host/": 50, "relay/": 1,
 			},
 		},
+		CursorLookback: status.CursorLookbackStats{
+			ConfiguredLookback:   36 * time.Hour,
+			ManifestSegmentCount: 15,
+			OldestRetainedSeq:    5000,
+			OldestRetainedAt:     time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
+		},
 	}
 }
 
@@ -111,6 +117,10 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "[100, 1,233]") // Seq range
 	require.Contains(t, body, "2026-05-24")
 	require.Contains(t, body, "Indexed range")
+	require.Contains(t, body, "Cursor lookback")
+	require.Contains(t, body, "1d 12h") // 36h formatted by humanDuration
+	require.Contains(t, body, "15")     // ManifestSegmentCount
+	require.Contains(t, body, "5,000")  // OldestRetainedSeq formatted
 }
 
 func TestHandler_RendersBackfillingState(t *testing.T) {

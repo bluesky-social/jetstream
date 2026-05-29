@@ -50,15 +50,13 @@ func TestBroadcaster_Swarm(t *testing.T) {
 
 	// N churners spin: subscribe, read a few events, unsubscribe.
 	var wg sync.WaitGroup
-	for c := 0; c < numChurners; c++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for c := range numChurners {
+		wg.Go(func() {
 			rng := rand.New(rand.NewPCG(uint64(c), 1))
 			for i := 0; i < iters; i++ {
 				ch, done, unsub := b.Subscribe()
 				toRead := rng.IntN(8)
-				for j := 0; j < toRead; j++ {
+				for range toRead {
 					select {
 					case <-ch:
 					case <-done:
@@ -67,7 +65,7 @@ func TestBroadcaster_Swarm(t *testing.T) {
 				}
 				unsub()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(stop)

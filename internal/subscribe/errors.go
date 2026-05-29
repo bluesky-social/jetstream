@@ -15,3 +15,9 @@ var errSkipEvent = errors.New("subscribe: skip event")
 // package) errors.Is against it to distinguish bad-input failures from
 // other errors.
 var ErrInvalidOptions = errors.New("subscribe: invalid options")
+
+// ErrLookbackTooSlow signals that a cursor-replay subscriber's outbox
+// could not keep up with disk replay over MaxLookbackIterations
+// successive ring overflows. The handler emits a JSON error frame
+// and closes the connection.
+var ErrLookbackTooSlow = errors.New("subscribe: lookback too slow")

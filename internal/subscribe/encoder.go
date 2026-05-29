@@ -59,6 +59,7 @@ func encodeCommit(evt *segment.Event) ([]byte, error) {
 	env := &streaming.JetstreamEvent{
 		DID:    evt.DID,
 		TimeUS: evt.IndexedAt,
+		Cursor: evt.Seq,
 		Kind:   streaming.JetstreamKindCommit,
 		Commit: commit,
 	}
@@ -86,6 +87,7 @@ func encodeIdentity(evt *segment.Event) ([]byte, error) {
 	env := &streaming.JetstreamEvent{
 		DID:      evt.DID,
 		TimeUS:   evt.IndexedAt,
+		Cursor:   evt.Seq,
 		Kind:     streaming.JetstreamKindIdentity,
 		Identity: &id,
 	}
@@ -100,6 +102,7 @@ func encodeAccount(evt *segment.Event) ([]byte, error) {
 	env := &streaming.JetstreamEvent{
 		DID:     evt.DID,
 		TimeUS:  evt.IndexedAt,
+		Cursor:  evt.Seq,
 		Kind:    streaming.JetstreamKindAccount,
 		Account: &acct,
 	}

@@ -93,6 +93,19 @@ type Config struct {
 	// portion of the merge phase for fast feedback loops in local
 	// development while running against production.
 	SkipMergeDiscovery bool
+
+	// IngestOnAfterSeal is forwarded to the steady-state live
+	// consumer's OnAfterSeal hook, which forwards to the inner
+	// ingest.Writer. Used by cmd/jetstream to wire the manifest's
+	// OnSegmentSealed callback. Optional.
+	IngestOnAfterSeal func(idx uint64, path string) error
+
+	// OnSteadyStateWriter, if non-nil, fires once the steady-state
+	// live consumer's ingest.Writer is constructed and registered.
+	// Used by cmd/jetstream to publish the writer pointer for the
+	// cursor-replay handler. Called exactly once per orchestrator
+	// run; nil-safe.
+	OnSteadyStateWriter func(*ingest.Writer)
 }
 
 func (c *Config) validate() error {

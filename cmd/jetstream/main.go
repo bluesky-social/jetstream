@@ -59,6 +59,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -68,6 +70,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/orchestrator"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/status"
@@ -218,7 +221,7 @@ func serveCommand() *cli.Command {
 			},
 			&cli.BoolFlag{
 				Name:    "skip-merge-discovery",
-				Usage:   "DEBUG ONLY: . Intended for fast local-dev iteration against the production relay's millions of users; safe to leave set in production but unnecessary there.",
+				Usage:   "DEBUG ONLY: skip the end-of-merge listRepos rescan that discovers accounts created during the merge phase. Intended for fast local-dev iteration against the production relay's millions of users; safe to leave set in production but unnecessary there.",
 				Sources: cli.EnvVars("JETSTREAM_SKIP_MERGE_DISCOVERY"),
 				Value:   false,
 			},
@@ -227,6 +230,24 @@ func serveCommand() *cli.Command {
 				Usage:   "Lifetime of the cached /status snapshot before a new one is built. Lower values (e.g. 1s in local dev) make the dashboard feel live; the production default amortizes pebble scans across requests.",
 				Sources: cli.EnvVars("JETSTREAM_STATUS_CACHE_TTL"),
 				Value:   30 * time.Second,
+			},
+			&cli.DurationFlag{
+				Name:    "cursor-lookback",
+				Usage:   "Maximum age for ?cursor= replay. Cursors older than this are clamped to the floor. 0 disables cursor lookback (cursor query parameter resolves to live tip).",
+				Sources: cli.EnvVars("JETSTREAM_CURSOR_LOOKBACK"),
+				Value:   36 * time.Hour,
+			},
+			&cli.IntFlag{
+				Name:    "cursor-ring-size",
+				Usage:   "Per-subscriber bounded ring buffer (events) used during the lookback-to-live handoff.",
+				Sources: cli.EnvVars("JETSTREAM_CURSOR_RING_SIZE"),
+				Value:   16384,
+			},
+			&cli.IntFlag{
+				Name:    "cursor-block-index-cache-size",
+				Usage:   "Number of segments whose block indices stay resident in the manifest LRU.",
+				Sources: cli.EnvVars("JETSTREAM_CURSOR_BLOCK_INDEX_CACHE_SIZE"),
+				Value:   32,
 			},
 		},
 		Action: runServe,
@@ -267,10 +288,16 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	segmentMetrics := segment.NewMetrics(metrics.Registry)
 	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
 	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
+	manifestMetrics := manifest.NewMetrics(metrics.Registry)
 
 	dataDir := cmd.String("data-dir")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return fmt.Errorf("serve: create data dir %s: %w", dataDir, err)
+	}
+
+	segmentsDir := filepath.Join(dataDir, "segments")
+	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
+		return fmt.Errorf("serve: create segments dir %s: %w", segmentsDir, err)
 	}
 
 	metaStore, err := store.Open(dataDir, storeMetrics)
@@ -283,10 +310,28 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
+	mft, err := manifest.Open(manifest.Options{
+		SegmentsDir:         segmentsDir,
+		BlockIndexCacheSize: cmd.Int("cursor-block-index-cache-size"),
+		Logger:              processLogger,
+		Metrics:             manifestMetrics,
+	})
+	if err != nil {
+		return fmt.Errorf("serve: open manifest: %w", err)
+	}
+
+	// writerPtr is published by the orchestrator once the steady-state
+	// live consumer opens its ingest.Writer; the cursor handler reads it
+	// atomically. Before steady-state the lifecycle.IsSteadyState gate
+	// returns 503, so the nil-pointer window is harmless.
+	var writerPtr atomic.Pointer[ingest.Writer]
+
 	statusCollector, err := status.New(status.Options{
-		Store:   metaStore,
-		DataDir: dataDir,
-		TTL:     cmd.Duration("status-cache-ttl"),
+		Store:          metaStore,
+		DataDir:        dataDir,
+		TTL:            cmd.Duration("status-cache-ttl"),
+		Manifest:       mft,
+		CursorLookback: cmd.Duration("cursor-lookback"),
 	})
 	if err != nil {
 		return fmt.Errorf("serve: build status collector: %w", err)
@@ -386,6 +431,10 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		OnEvent:            broadcaster.Publish,
 		MaxBackfillRepos:   cmd.Int("max-backfill-repos"),
 		SkipMergeDiscovery: cmd.Bool("skip-merge-discovery"),
+		IngestOnAfterSeal:  mft.OnSegmentSealed,
+		OnSteadyStateWriter: func(w *ingest.Writer) {
+			writerPtr.Store(w)
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("serve: build orchestrator: %w", err)
@@ -398,12 +447,20 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		StatusHandler:   statusHandler,
 	}, processLogger, metrics)
 
-	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(
-		broadcaster,
-		metaStore,
-		processLogger,
-		subscribeMetrics,
-	))
+	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
+	// before steady-state, lifecycle.IsSteadyState gates with 503 so
+	// nil-pointer reads are harmless.
+	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(subscribe.HandlerDeps{
+		Broadcaster:    broadcaster,
+		Store:          metaStore,
+		Manifest:       mft,
+		WriterRef:      &writerPtr,
+		Logger:         processLogger,
+		Metrics:        subscribeMetrics,
+		Lookback:       cmd.Duration("cursor-lookback"),
+		LookbackRingSz: cmd.Int("cursor-ring-size"),
+		MaxIters:       subscribe.DefaultMaxLookbackIterations,
+	}))
 
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()

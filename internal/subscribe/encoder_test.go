@@ -257,3 +257,82 @@ func TestEncode_UnknownKindReturnsError(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, errSkipEvent)
 }
+
+func TestEncode_CursorFieldOnCommit(t *testing.T) {
+	t.Parallel()
+	// Empty CBOR map (0xa0) is sufficient — the encoder will decode
+	// and re-encode it as JSON; the test only asserts the envelope's
+	// cursor field, not the record contents.
+	evt := &segment.Event{
+		Seq:        12345,
+		IndexedAt:  1_700_000_000_000_000,
+		Kind:       segment.KindCreate,
+		DID:        "did:plc:test",
+		Collection: "app.bsky.feed.post",
+		Rkey:       "abc",
+		Rev:        "rev1",
+		Payload:    []byte{0xa0},
+	}
+	body, err := Encode(evt)
+	require.NoError(t, err)
+	require.Contains(t, string(body), `"cursor":12345`)
+}
+
+func TestEncode_CursorFieldOnIdentity(t *testing.T) {
+	t.Parallel()
+	ident := &comatproto.SyncSubscribeRepos_Identity{
+		DID: "did:plc:test",
+		Seq: 99,
+	}
+	payload, err := ident.MarshalCBOR()
+	require.NoError(t, err)
+	evt := &segment.Event{
+		Seq:       12345,
+		IndexedAt: 1_700_000_000_000_000,
+		Kind:      segment.KindIdentity,
+		DID:       "did:plc:test",
+		Payload:   payload,
+	}
+	body, err := Encode(evt)
+	require.NoError(t, err)
+	require.Contains(t, string(body), `"cursor":12345`)
+}
+
+func TestEncode_CursorFieldOnAccount(t *testing.T) {
+	t.Parallel()
+	acct := &comatproto.SyncSubscribeRepos_Account{
+		DID:    "did:plc:test",
+		Active: true,
+		Seq:    77,
+	}
+	payload, err := acct.MarshalCBOR()
+	require.NoError(t, err)
+	evt := &segment.Event{
+		Seq:       12345,
+		IndexedAt: 1_700_000_000_000_000,
+		Kind:      segment.KindAccount,
+		DID:       "did:plc:test",
+		Payload:   payload,
+	}
+	body, err := Encode(evt)
+	require.NoError(t, err)
+	require.Contains(t, string(body), `"cursor":12345`)
+}
+
+func TestEncode_CursorOmittedWhenZero(t *testing.T) {
+	t.Parallel()
+	evt := &segment.Event{
+		Seq:        0,
+		IndexedAt:  1_700_000_000_000_000,
+		Kind:       segment.KindCreate,
+		DID:        "did:plc:test",
+		Collection: "app.bsky.feed.post",
+		Rkey:       "abc",
+		Rev:        "rev1",
+		Payload:    []byte{0xa0},
+	}
+	body, err := Encode(evt)
+	require.NoError(t, err)
+	require.NotContains(t, string(body), `"cursor":0`,
+		"omitempty in atmos.JetstreamEvent must keep cursor:0 off the wire")
+}

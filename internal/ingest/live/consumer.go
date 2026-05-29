@@ -89,6 +89,7 @@ func Open(cfg Config) (*Consumer, error) {
 		// upstream cursor) live in cfg.Metrics.
 		Metrics:        nil,
 		OnAfterFlush:   c.onAfterFlush,
+		OnAfterSeal:    cfg.OnAfterSeal,
 		SegmentMetrics: cfg.SegmentMetrics,
 	})
 	if err != nil {
@@ -340,4 +341,12 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 		return nil
 	})
+}
+
+// Writer returns the live consumer's ingest writer. May be nil before
+// Open completes; after Open returns successfully, this is stable
+// until Close. Used by callers (cmd/jetstream) that need a writer
+// reference for cursor-replay handler wiring.
+func (c *Consumer) Writer() *ingest.Writer {
+	return c.writer
 }

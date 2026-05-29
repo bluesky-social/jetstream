@@ -10,14 +10,15 @@ import (
 // single moment. Treated as immutable after construction; consumers
 // share a *Snapshot pointer without locks.
 type Snapshot struct {
-	GeneratedAt time.Time
-	Process     ProcessInfo
-	Phase       PhaseInfo
-	Backfill    BackfillStats
-	Live        LiveStats
-	Segments    SegmentTreeStats
-	LiveSegs    SegmentTreeStats
-	Pebble      PebbleStats
+	GeneratedAt    time.Time
+	Process        ProcessInfo
+	Phase          PhaseInfo
+	Backfill       BackfillStats
+	Live           LiveStats
+	Segments       SegmentTreeStats
+	LiveSegs       SegmentTreeStats
+	Pebble         PebbleStats
+	CursorLookback CursorLookbackStats
 }
 
 // ProcessInfo carries the per-process build + uptime context.
@@ -91,4 +92,27 @@ type SegmentSummary struct {
 type PebbleStats struct {
 	DiskBytes      int64
 	KeyspaceCounts map[string]uint64
+}
+
+// CursorLookbackStats summarizes the cursor-replay observability
+// surface: configured lookback duration, sealed-segment count, and
+// the oldest seq that's still within the lookback window. Empty
+// (zero values) when the manifest is unavailable or cursor lookback
+// is disabled.
+type CursorLookbackStats struct {
+	// ConfiguredLookback is the operator-set --cursor-lookback duration.
+	// Zero means cursor replay is disabled.
+	ConfiguredLookback time.Duration
+
+	// ManifestSegmentCount is the number of sealed segments tracked
+	// in the in-memory manifest.
+	ManifestSegmentCount int
+
+	// OldestRetainedSeq is the smallest seq still within the lookback
+	// window. Computed from manifest.LookbackFloor.
+	OldestRetainedSeq uint64
+
+	// OldestRetainedAt is the corresponding timestamp. Zero when no
+	// sealed segments exist.
+	OldestRetainedAt time.Time
 }

@@ -306,7 +306,7 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		return nil, err
 	}
 
-	return &Snapshot{
+	snap := &Snapshot{
 		GeneratedAt: now,
 		Process:     collectProcess(now, startedAt),
 		Phase:       phase,
@@ -315,5 +315,24 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		Segments:    segs,
 		LiveSegs:    livesegs,
 		Pebble:      pdb,
-	}, nil
+	}
+
+	if opts.Manifest != nil {
+		snap.CursorLookback.ConfiguredLookback = opts.CursorLookback
+		snap.CursorLookback.ManifestSegmentCount = opts.Manifest.SegmentCount()
+		if opts.CursorLookback > 0 {
+			seq, ts := opts.Manifest.LookbackFloor(opts.CursorLookback)
+			snap.CursorLookback.OldestRetainedSeq = seq
+			if ts != 0 {
+				snap.CursorLookback.OldestRetainedAt = time.UnixMicro(ts)
+			}
+		}
+	} else {
+		// No manifest wired in — leave CursorLookback at its zero value.
+		// ConfiguredLookback may still be set so the operator sees the
+		// flag value even before steady-state.
+		snap.CursorLookback.ConfiguredLookback = opts.CursorLookback
+	}
+
+	return snap, nil
 }

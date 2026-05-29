@@ -11,6 +11,14 @@ var (
 	// file is smaller than the 256-byte reserved header region.
 	ErrCorruptSegment = errors.New("segment: file is corrupt")
 
+	// ErrActiveSegment is returned by Open when the file at the given
+	// path has its fixed-header checksum field still zero — i.e. the
+	// segment is active (not yet sealed). Callers that intentionally
+	// scan a directory of mixed sealed and active segments (manifest
+	// startup) can errors.Is against this to skip the active files
+	// without conflating them with genuine corruption.
+	ErrActiveSegment = errors.New("segment: active (unsealed)")
+
 	// ErrSegmentSealed will be returned by New when the file carries
 	// a sealed checksum trailer. The seal/unseal mechanism lands in a
 	// later slice; the sentinel is reserved here so callers can already

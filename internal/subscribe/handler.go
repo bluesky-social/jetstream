@@ -14,8 +14,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/coder/websocket"
 )
 
@@ -29,52 +32,71 @@ const (
 	frameWriteTimeout = 5 * time.Second
 )
 
-// NewHandler returns the http.Handler for GET /subscribe. The same
-// handler instance is shared across all requests; every connection
-// gets its own subscription via b.Subscribe.
-func NewHandler(b *Broadcaster, st *store.Store, logger *slog.Logger, m *Metrics) http.Handler {
-	logger = logger.With(slog.String("component", "subscribe/handler"))
+// HandlerDeps bundles the dependencies of the /subscribe handler.
+// Required fields are validated in NewHandler with a panic — this is
+// wired exactly once at process startup, so a panic at construction
+// time is the right granularity.
+type HandlerDeps struct {
+	Broadcaster *Broadcaster
+	Store       *store.Store
+	Manifest    *manifest.Manifest // optional; required for cursor replay
+	Writer      *ingest.Writer     // optional; required for cursor replay
+	// WriterRef, when non-nil, supersedes Writer. Resolved at request
+	// time; supports cmd/jetstream's deferred-writer-publication
+	// pattern where the orchestrator publishes the writer pointer
+	// after steady-state begins.
+	WriterRef *atomic.Pointer[ingest.Writer]
+	Logger    *slog.Logger
+	Metrics   *Metrics
+
+	// Lookback is the cursor-replay clamp duration. Zero disables
+	// cursor replay entirely (cursors are silently dropped to live).
+	Lookback time.Duration
+
+	// LookbackRingSz is the per-subscriber ring size for the lookback
+	// handoff. Zero defaults to DefaultLookbackRingSize.
+	LookbackRingSz int
+
+	// MaxIters bounds the ring-overflow restart loop. Zero defaults
+	// to DefaultMaxLookbackIterations.
+	MaxIters int
+}
+
+func (d HandlerDeps) writer() *ingest.Writer {
+	if d.WriterRef != nil {
+		return d.WriterRef.Load()
+	}
+	return d.Writer
+}
+
+func NewHandler(deps HandlerDeps) http.Handler {
+	if deps.Logger == nil {
+		panic("subscribe: HandlerDeps.Logger is required")
+	}
+	if deps.Broadcaster == nil {
+		panic("subscribe: HandlerDeps.Broadcaster is required")
+	}
+	if deps.Store == nil {
+		panic("subscribe: HandlerDeps.Store is required")
+	}
+	logger := deps.Logger.With(slog.String("component", "subscribe/handler"))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serve(w, r, b, st, logger, m)
+		serve(w, r, deps, logger)
 	})
 }
 
-func serve(
-	w http.ResponseWriter,
-	r *http.Request,
-	broadcaster *Broadcaster,
-	store *store.Store,
-	logger *slog.Logger,
-	m *Metrics,
-) {
-	if !lifecycle.IsSteadyState(store) {
+func serve(w http.ResponseWriter, r *http.Request, deps HandlerDeps, logger *slog.Logger) {
+	if !lifecycle.IsSteadyState(deps.Store) {
 		http.Error(w, "service not ready: bootstrap in progress", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Parse subscriber filter BEFORE upgrading. v1 contract: a bad
-	// query yields HTTP 400 with a useful body, not a websocket close.
-	//
-	// We call url.ParseQuery directly rather than r.URL.Query() because
-	// r.URL.Query() silently discards percent-decode errors, returning
-	// a partial values map. A client that sends a malformed query
-	// (e.g. "wantedCollections=app%XX") deserves an explicit 400, not
-	// a connection that silently drops every collection because the
-	// filter parsed empty.
 	values, qerr := url.ParseQuery(r.URL.RawQuery)
 	if qerr != nil {
 		http.Error(w, fmt.Sprintf("%s: %s", ErrInvalidOptions.Error(), qerr.Error()), http.StatusBadRequest)
 		return
 	}
 
-	// Reject the v1 zstd-with-custom-dictionary opt-in explicitly. v1
-	// signaled this two ways (jetstream/pkg/server/server.go:82):
-	// ?compress=true OR a Socket-Encoding header containing "zstd".
-	// v2 does not ship a custom dictionary or any per-frame compression
-	// on /subscribe, so a v1 client that flipped either switch would
-	// otherwise upgrade successfully and then silently fail to decode
-	// our plain-JSON frames. 400 here makes the contract loud at the
-	// HTTP layer instead of mysterious on the wire.
 	if values.Get("compress") == "true" || strings.Contains(r.Header.Get("Socket-Encoding"), "zstd") {
 		http.Error(w, "compression not supported: jetstream v2 does not implement the v1 zstd-with-custom-dictionary scheme; remove ?compress=true and the Socket-Encoding header", http.StatusBadRequest)
 		return
@@ -88,114 +110,86 @@ func serve(
 
 	requireHello := parseRequireHello(values)
 
+	// Resolve cursor BEFORE upgrade so a bad cursor returns HTTP 400.
+	rawCursor := values.Get("cursor")
+	var cursorPlan CursorPlan
+	switch {
+	case deps.Lookback <= 0:
+		// Cursor lookback is disabled by configuration. Ignore the
+		// parameter and serve live tip; this is a documented operator
+		// choice, not a silent gap.
+		cursorPlan = CursorPlan{Mode: ModeLive}
+	case deps.Manifest == nil || deps.writer() == nil:
+		// Cursor lookback is enabled, but the replay dependencies aren't
+		// available yet. The only window this happens in is steady-state
+		// warmup: the phase marker is durable (we passed IsSteadyState
+		// above) but the live consumer hasn't published its writer
+		// pointer yet. Silently serving live tip here would hand a
+		// resuming client the live tip while it believes it resumed at
+		// its cursor — a silent gap of every event between the cursor
+		// and the tip. Refuse with a retryable 503 instead so the
+		// client reconnects once warmup completes. A request with no
+		// cursor has nothing to resume, so it's safe to serve live.
+		if rawCursor != "" {
+			deps.Metrics.incCursorRequests("unavailable")
+			http.Error(w, "service not ready: cursor replay warming up", http.StatusServiceUnavailable)
+			return
+		}
+		cursorPlan = CursorPlan{Mode: ModeLive}
+	default:
+		resolveStart := time.Now()
+		plan, err := ResolveCursor(rawCursor, CursorEnv{
+			Manifest: deps.Manifest,
+			NextSeq:  deps.writer().NextSeq(),
+			Lookback: deps.Lookback,
+		})
+		deps.Metrics.observeCursorResolveSeconds(time.Since(resolveStart).Seconds())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cursorPlan = plan
+	}
+
+	// Classify the cursor mode for metrics.
+	mode := "live"
+	switch cursorPlan.Mode {
+	case ModeReplaySeq:
+		mode = "seq"
+	case ModeReplayTimeUS:
+		mode = "time_us"
+	}
+	if cursorPlan.Clamped {
+		mode = "clamped"
+	}
+	if deps.Lookback == 0 && rawCursor != "" {
+		mode = "disabled"
+	}
+	deps.Metrics.incCursorRequests(mode)
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns:  []string{"*"},
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {
-		// Accept already wrote the error response.
 		return
 	}
 	defer func() { _ = conn.CloseNow() }()
-
-	// Raise coder/websocket's default 32 KiB read limit to match the
-	// 10MB v1 cap exactly. coder/websocket closes with StatusMessageTooBig
-	// when the limit is exceeded, which is the same close code the
-	// application path below would have used — so a single source of
-	// truth at the websocket layer is fine. We no longer need a
-	// redundant len(payload) check in the read loop.
 	conn.SetReadLimit(int64(MaxSubscriberMessageBytes))
 
-	// Per-connection filter pointer. Updates from options_update (Task 9)
-	// will Store a fresh *Filter; the writer loop Loads on each event.
-	// Treated as immutable once published — atomic pointer not RWMutex.
 	var filterPtr atomic.Pointer[Filter]
 	filterPtr.Store(initialFilter)
 
-	// helloCh is closed by the reader goroutine on the first valid
-	// options_update IFF requireHello is set. The signal is idempotent
-	// via sync.Once so a chatty client sending multiple updates doesn't
-	// panic on a closed channel. The pre-Subscribe wait below selects
-	// on this channel and ctx.Done().
 	helloCh := make(chan struct{})
 	var helloOnce sync.Once
-	signalHello := func() {
-		helloOnce.Do(func() { close(helloCh) })
-	}
+	signalHello := func() { helloOnce.Do(func() { close(helloCh) }) }
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	// Reader goroutine: parses SubscriberSourcedMessage frames. On any
-	// validation failure we send a websocket close with the reason and
-	// cancel the connection context, which tears down the writer loop.
-	go func() {
-		defer cancel()
-		for {
-			msgType, payload, rerr := conn.Read(ctx)
-			if rerr != nil {
-				// SetReadLimit(MaxSubscriberMessageBytes) above causes
-				// coder/websocket to close with StatusMessageTooBig on
-				// oversize. Surface that through the existing metric
-				// label so operators see the same counter regardless of
-				// where the cap is enforced.
-				if websocket.CloseStatus(rerr) == websocket.StatusMessageTooBig {
-					m.incOptionsUpdateError(optionsUpdateErrorReasonOversize)
-				}
-				return
-			}
-			if msgType != websocket.MessageText {
-				// V1 ignores binary frames silently; match that.
-				continue
-			}
-			var msg SubscriberSourcedMessage
-			if err := json.Unmarshal(payload, &msg); err != nil {
-				m.incOptionsUpdateError(optionsUpdateErrorReasonBadEnvelopeJSON)
-				_ = conn.Close(websocket.StatusInvalidFramePayloadData,
-					"bad SubscriberSourcedMessage envelope")
-				return
-			}
-			switch msg.Type {
-			case SubMessageTypeOptionsUpdate:
-				var update UpdatePayload
-				if err := json.Unmarshal(msg.Payload, &update); err != nil {
-					m.incOptionsUpdateError(optionsUpdateErrorReasonBadPayloadJSON)
-					_ = conn.Close(websocket.StatusInvalidFramePayloadData,
-						"bad options_update payload")
-					return
-				}
-				newFilter, err := ParseUpdatePayload(update)
-				if err != nil {
-					m.incOptionsUpdateError(optionsUpdateErrorReasonInvalidOptions)
-					// Truncate the reason to fit the websocket close-frame
-					// 123-byte cap (RFC 6455 §5.5.1).
-					reason := truncateCloseReason(err.Error())
-					_ = conn.Close(websocket.StatusPolicyViolation, reason)
-					return
-				}
-				filterPtr.Store(newFilter)
-				m.incOptionsUpdates()
-				// Releases the requireHello wait below on the first
-				// successful update; sync.Once makes subsequent calls
-				// no-ops, including the requireHello=false case where
-				// nothing is waiting on helloCh.
-				signalHello()
-			default:
-				// V1 PARITY: unknown types log a warning and are ignored.
-				logger.Warn("unknown subscriber message type", "type", msg.Type)
-			}
-		}
-	}()
+	go runReader(ctx, cancel, conn, deps, &filterPtr, signalHello, logger)
 
 	if requireHello {
-		// V1 PARITY: pause replay/live-tail until the first valid
-		// options_update. Matches v1 README §"Options Updates":
-		// "a client can connect with ?requireHello=true ... to pause
-		// replay/live-tail until the first Options Update message is
-		// sent by the client over the socket."
-		//
-		// Invalid updates during the wait disconnect the client via the
-		// reader goroutine's existing close paths, which cancel ctx.
 		select {
 		case <-helloCh:
 		case <-ctx.Done():
@@ -203,14 +197,73 @@ func serve(
 		}
 	}
 
-	subCh, doneCh, unsubscribe := broadcaster.Subscribe()
+	if cursorPlan.Mode == ModeLive {
+		runLiveLoop(ctx, conn, deps, &filterPtr, logger)
+		return
+	}
+
+	runReplayLoop(ctx, conn, deps, &filterPtr, cursorPlan, logger)
+}
+
+func runReader(
+	ctx context.Context, cancel context.CancelFunc,
+	conn *websocket.Conn,
+	deps HandlerDeps,
+	filterPtr *atomic.Pointer[Filter],
+	signalHello func(),
+	logger *slog.Logger,
+) {
+	defer cancel()
+	for {
+		msgType, payload, rerr := conn.Read(ctx)
+		if rerr != nil {
+			if websocket.CloseStatus(rerr) == websocket.StatusMessageTooBig {
+				deps.Metrics.incOptionsUpdateError(optionsUpdateErrorReasonOversize)
+			}
+			return
+		}
+		if msgType != websocket.MessageText {
+			continue
+		}
+		var msg SubscriberSourcedMessage
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			deps.Metrics.incOptionsUpdateError(optionsUpdateErrorReasonBadEnvelopeJSON)
+			_ = conn.Close(websocket.StatusInvalidFramePayloadData, "bad SubscriberSourcedMessage envelope")
+			return
+		}
+		switch msg.Type {
+		case SubMessageTypeOptionsUpdate:
+			var update UpdatePayload
+			if err := json.Unmarshal(msg.Payload, &update); err != nil {
+				deps.Metrics.incOptionsUpdateError(optionsUpdateErrorReasonBadPayloadJSON)
+				_ = conn.Close(websocket.StatusInvalidFramePayloadData, "bad options_update payload")
+				return
+			}
+			newFilter, err := ParseUpdatePayload(update)
+			if err != nil {
+				deps.Metrics.incOptionsUpdateError(optionsUpdateErrorReasonInvalidOptions)
+				_ = conn.Close(websocket.StatusPolicyViolation, truncateCloseReason(err.Error()))
+				return
+			}
+			filterPtr.Store(newFilter)
+			deps.Metrics.incOptionsUpdates()
+			signalHello()
+		default:
+			logger.Warn("unknown subscriber message type", "type", msg.Type)
+		}
+	}
+}
+
+func runLiveLoop(
+	ctx context.Context, conn *websocket.Conn,
+	deps HandlerDeps, filterPtr *atomic.Pointer[Filter],
+	logger *slog.Logger,
+) {
+	subCh, doneCh, unsubscribe := deps.Broadcaster.Subscribe()
 	defer unsubscribe()
 
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
-
-	logger.Info("subscriber connected", "remote_addr", r.RemoteAddr)
-	defer logger.Info("subscriber disconnected", "remote_addr", r.RemoteAddr)
 
 	for {
 		select {
@@ -226,38 +279,89 @@ func serve(
 				return
 			}
 		case evt := <-subCh:
-			f := filterPtr.Load()
-			if !f.Wants(evt) {
-				m.incEventsFiltered()
-				continue
-			}
-			body, eerr := Encode(evt)
-			if errors.Is(eerr, errSkipEvent) {
-				m.incEventsSkippedSync()
-				continue
-			}
-			if eerr != nil {
-				m.incEncodeErrors()
-				logger.Warn("encode error",
-					"err", eerr,
-					"kind", int(evt.Kind),
-					"did", evt.DID,
-				)
-				continue
-			}
-			if max := f.MaxMessageSizeBytes(); max > 0 && uint32(len(body)) > max {
-				m.incEventsOversize()
-				continue
-			}
-			writeCtx, wcancel := context.WithTimeout(ctx, frameWriteTimeout)
-			werr := conn.Write(writeCtx, websocket.MessageText, body)
-			wcancel()
-			if werr != nil {
+			if !deliverEvent(ctx, conn, deps, filterPtr.Load(), evt, logger) {
 				return
 			}
-			m.incEventsSent()
 		}
 	}
+}
+
+func runReplayLoop(
+	ctx context.Context, conn *websocket.Conn,
+	deps HandlerDeps, filterPtr *atomic.Pointer[Filter],
+	plan CursorPlan, logger *slog.Logger,
+) {
+	deps.Metrics.incLookbackSubscribers()
+	defer deps.Metrics.decLookbackSubscribers()
+
+	r := NewReplayer(ReplayerInput{
+		Broadcaster: deps.Broadcaster,
+		Manifest:    deps.Manifest,
+		Writer:      deps.writer(),
+		StartSeq:    plan.StartSeq,
+		RingSize:    deps.LookbackRingSz,
+		MaxIters:    deps.MaxIters,
+		Metrics:     deps.Metrics,
+	})
+	err := r.Run(ctx, func(ev *segment.Event) error {
+		if !deliverEvent(ctx, conn, deps, filterPtr.Load(), ev, logger) {
+			return context.Canceled
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		// ErrLookbackTooSlow is the iteration-cap exhaustion case;
+		// any other non-context error is an unexpected replay failure
+		// (disk I/O, segment decode, etc.). Distinguish them on the
+		// wire so clients can react appropriately.
+		errCode := "replay_error"
+		if errors.Is(err, ErrLookbackTooSlow) {
+			errCode = "lookback_too_slow"
+		}
+		body, _ := json.Marshal(struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}{Error: errCode, Message: err.Error()})
+		writeCtx, wcancel := context.WithTimeout(ctx, frameWriteTimeout)
+		_ = conn.Write(writeCtx, websocket.MessageText, body)
+		wcancel()
+	}
+}
+
+// deliverEvent is the per-event filter+encode+write step shared by
+// the live and replay paths. Returns false if the connection should
+// terminate (write error). Skipped or oversize events are reported
+// via metrics; the connection stays alive.
+func deliverEvent(
+	ctx context.Context, conn *websocket.Conn,
+	deps HandlerDeps, f *Filter, evt *segment.Event, logger *slog.Logger,
+) bool {
+	if !f.Wants(evt) {
+		deps.Metrics.incEventsFiltered()
+		return true
+	}
+	body, eerr := Encode(evt)
+	if errors.Is(eerr, errSkipEvent) {
+		deps.Metrics.incEventsSkippedSync()
+		return true
+	}
+	if eerr != nil {
+		deps.Metrics.incEncodeErrors()
+		logger.Warn("encode error", "err", eerr, "kind", int(evt.Kind), "did", evt.DID)
+		return true
+	}
+	if max := f.MaxMessageSizeBytes(); max > 0 && uint32(len(body)) > max {
+		deps.Metrics.incEventsOversize()
+		return true
+	}
+	writeCtx, wcancel := context.WithTimeout(ctx, frameWriteTimeout)
+	werr := conn.Write(writeCtx, websocket.MessageText, body)
+	wcancel()
+	if werr != nil {
+		return false
+	}
+	deps.Metrics.incEventsSent()
+	return true
 }
 
 // truncateCloseReason fits a reason string into the 123-byte limit

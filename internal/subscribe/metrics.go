@@ -26,6 +26,16 @@ type Metrics struct {
 	EventsOversize      prometheus.Counter
 	OptionsUpdates      prometheus.Counter
 	OptionsUpdateErrors *prometheus.CounterVec
+
+	// Added in 2026-05-28 v1-cursor port:
+	CursorRequests       *prometheus.CounterVec
+	CursorResolveSeconds prometheus.Histogram
+	LookbackSubscribers  prometheus.Gauge
+	LookbackIterations   prometheus.Counter
+	RingOverflows        prometheus.Counter
+	LookbackSeconds      prometheus.Histogram
+	LookbackEvents       prometheus.Counter
+	LookbackTerminated   *prometheus.CounterVec
 }
 
 // NewMetrics registers the subscribe series against reg. Calls
@@ -98,6 +108,48 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			},
 			[]string{"reason"},
 		),
+		CursorRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "cursor_requests_total",
+			Help: "Number of /subscribe connections by cursor resolution mode. Mode is one of: live, seq, time_us, clamped, disabled, unavailable.",
+		}, []string{"mode"}),
+		CursorResolveSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "cursor_resolve_seconds",
+			Help:    "Wall-clock duration of ResolveCursor (parse + manifest lookup + optional block scan).",
+			Buckets: prometheus.ExponentialBuckets(0.0001, 4, 8),
+		}),
+		LookbackSubscribers: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "lookback_subscribers",
+			Help: "Current number of subscribers in lookback (cursor-replay) mode.",
+		}),
+		LookbackIterations: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "lookback_iterations_total",
+			Help: "Total ring-overflow restart iterations across all lookback subscribers.",
+		}),
+		RingOverflows: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "ring_overflows_total",
+			Help: "Number of times a lookback subscriber's bounded ring filled.",
+		}),
+		LookbackSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "lookback_seconds",
+			Help:    "End-to-end wall-clock duration of one Replayer.Run.",
+			Buckets: prometheus.ExponentialBuckets(0.001, 4, 10),
+		}),
+		LookbackEvents: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "lookback_events_total",
+			Help: "Total events emitted by lookback replay (across the disk walk and ring drain).",
+		}),
+		LookbackTerminated: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "lookback_terminated_total",
+			Help: "Lookback subscribers terminated for reasons other than clean disconnect.",
+		}, []string{"reason"}),
 	}
 	reg.MustRegister(
 		m.Subscribers, m.CleanDisconnects, m.SlowDrops,
@@ -105,6 +157,9 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.EncodeErrors, m.QueueDepth,
 		m.EventsFiltered, m.EventsOversize,
 		m.OptionsUpdates, m.OptionsUpdateErrors,
+		m.CursorRequests, m.CursorResolveSeconds, m.LookbackSubscribers,
+		m.LookbackIterations, m.RingOverflows, m.LookbackSeconds,
+		m.LookbackEvents, m.LookbackTerminated,
 	)
 	return m
 }
@@ -183,5 +238,59 @@ const (
 func (m *Metrics) incOptionsUpdateError(reason string) {
 	if m != nil {
 		m.OptionsUpdateErrors.WithLabelValues(reason).Inc()
+	}
+}
+
+func (m *Metrics) incCursorRequests(mode string) {
+	if m != nil {
+		m.CursorRequests.WithLabelValues(mode).Inc()
+	}
+}
+
+func (m *Metrics) observeCursorResolveSeconds(d float64) {
+	if m != nil {
+		m.CursorResolveSeconds.Observe(d)
+	}
+}
+
+func (m *Metrics) incLookbackSubscribers() {
+	if m != nil {
+		m.LookbackSubscribers.Inc()
+	}
+}
+
+func (m *Metrics) decLookbackSubscribers() {
+	if m != nil {
+		m.LookbackSubscribers.Dec()
+	}
+}
+
+func (m *Metrics) incLookbackIterations() {
+	if m != nil {
+		m.LookbackIterations.Inc()
+	}
+}
+
+func (m *Metrics) incRingOverflows() {
+	if m != nil {
+		m.RingOverflows.Inc()
+	}
+}
+
+func (m *Metrics) observeLookbackSeconds(d float64) {
+	if m != nil {
+		m.LookbackSeconds.Observe(d)
+	}
+}
+
+func (m *Metrics) incLookbackEvents() {
+	if m != nil {
+		m.LookbackEvents.Inc()
+	}
+}
+
+func (m *Metrics) incLookbackTerminated(reason string) {
+	if m != nil {
+		m.LookbackTerminated.WithLabelValues(reason).Inc()
 	}
 }

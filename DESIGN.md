@@ -597,7 +597,11 @@ An example commit event looks like:
 }
 ```
 
-The `time_us` field is the jetstream v2 instance's own indexed at timestamp for the event in microseconds since the unix epoch, and `cursor` is what clients pass back to resume the stream. Note that for backwards compatibility with jetstream v1, we do support passing `cursor` as a unix timestamp integer as well (int vs. string in the JSON object is what determines v1 vs v2 mode). For clients using the legacy cursor system, we only support looking back at the most recent 36 hours worth of data (the current jetstream v1 behavior).
+The `time_us` field is the jetstream v2 instance's own indexed at timestamp for the event in microseconds since the unix epoch. The `cursor` field is jetstream v2's monotonic per-event sequence number (a JSON number); clients that want to resume from a saved point pass `?cursor=N` on reconnect.
+
+For backwards compatibility with jetstream v1, the server also accepts a v1-style unix-microsecond timestamp on the same `?cursor=` query parameter. The two namespaces are distinguished by magnitude: a value strictly less than 1×10^15 is interpreted as a v2 sequence number; a value greater than or equal to 1×10^15 is interpreted as a v1 unix-microsecond timestamp. The split is provably non-overlapping under our 36h lookback ceiling (any legitimate v1 timestamp within 36h of "now" is well above 10^15, and v2 seq won't approach 10^15 for centuries).
+
+Cursor lookback is bounded to the most recent 36 hours by default (matching jetstream v1), tunable via `--cursor-lookback`. Cursors older than the floor are clamped silently. Cursors in the future drop into live-tip mode (no replay).
 
 ### 5.2 Extended JSON Payload
 

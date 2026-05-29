@@ -122,7 +122,7 @@ func TestBroadcaster_SlowSubscriber_Dropped(t *testing.T) {
 	defer unsub()
 
 	// Publish more than the buffer can hold without ever reading.
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		b.Publish(&segment.Event{Seq: uint64(i)})
 	}
 
@@ -175,4 +175,121 @@ func TestBroadcaster_SlowDropDoesNotAffectFastPeer(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("slow subscriber not dropped")
 	}
+}
+
+func TestBroadcaster_PublishToLookbackPushesToRing(t *testing.T) {
+	t.Parallel()
+	b, err := New(Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	subID, ring := b.SubscribeForLookback(8)
+	defer b.Unsubscribe(subID)
+
+	for i := uint64(1); i <= 4; i++ {
+		b.Publish(&segment.Event{Seq: i, DID: "did:plc:a"})
+	}
+
+	require.Equal(t, 4, ring.Len())
+}
+
+func TestBroadcaster_PublishOverflowMarksRing(t *testing.T) {
+	t.Parallel()
+	b, err := New(Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	subID, ring := b.SubscribeForLookback(2)
+	defer b.Unsubscribe(subID)
+
+	for i := uint64(1); i <= 3; i++ {
+		b.Publish(&segment.Event{Seq: i})
+	}
+	require.Equal(t, 2, ring.Len())
+	require.True(t, b.SubscriberOverflowed(subID),
+		"third Publish should have set the phase overflow flag")
+}
+
+func TestBroadcaster_ClearPhaseSwitchesToLive(t *testing.T) {
+	t.Parallel()
+	b, err := New(Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	subID, ring := b.SubscribeForLookback(8)
+	defer b.Unsubscribe(subID)
+
+	b.Publish(&segment.Event{Seq: 1})
+	require.Equal(t, 1, ring.Len())
+
+	ch, drained := b.SwitchToLive(subID)
+	require.Len(t, drained, 1, "the seq=1 event buffered before switch is returned by drain")
+	require.Equal(t, uint64(1), drained[0].Seq)
+	b.Publish(&segment.Event{Seq: 2})
+	select {
+	case ev := <-ch:
+		require.Equal(t, uint64(2), ev.Seq)
+	default:
+		t.Fatal("expected live event on channel")
+	}
+	require.Equal(t, 0, ring.Len(), "ring is sealed and emptied by SwitchToLive")
+}
+
+// TestBroadcaster_SwitchToLiveRoutesRacingEventToLive reproduces the
+// handoff race: an event whose Publish observed the (pre-clear) phase
+// pointer but lost the lock race to SealAndDrain must reroute to the
+// live channel rather than vanish into a ring nobody drains.
+func TestBroadcaster_SwitchToLiveRoutesRacingEventToLive(t *testing.T) {
+	t.Parallel()
+	b, err := New(Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	subID, _ := b.SubscribeForLookback(8)
+	defer b.Unsubscribe(subID)
+
+	// Seal+drain happens here (nothing buffered).
+	ch, drained := b.SwitchToLive(subID)
+	require.Empty(t, drained)
+	require.NotNil(t, ch)
+
+	// A Publish that conceptually loaded the stale phase pointer: the
+	// ring is now sealed, so the broadcaster must reroute to live.
+	b.Publish(&segment.Event{Seq: 42})
+	select {
+	case ev := <-ch:
+		require.Equal(t, uint64(42), ev.Seq,
+			"event arriving after seal must be delivered on the live channel")
+	case <-time.After(time.Second):
+		t.Fatal("event stranded: not delivered on the live channel after seal")
+	}
+}
+
+func TestBroadcaster_ResetSubscriberOverflow(t *testing.T) {
+	t.Parallel()
+	b, err := New(Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	subID, _ := b.SubscribeForLookback(2)
+	defer b.Unsubscribe(subID)
+
+	for i := uint64(1); i <= 3; i++ {
+		b.Publish(&segment.Event{Seq: i})
+	}
+	require.True(t, b.SubscriberOverflowed(subID))
+
+	freshRing := b.ResetSubscriberOverflow(subID, 4)
+	require.NotNil(t, freshRing)
+	require.Equal(t, 4, freshRing.Cap())
+	require.Equal(t, 0, freshRing.Len(), "fresh ring starts empty")
+	require.False(t, b.SubscriberOverflowed(subID), "overflow flag clears on reset")
+
+	b.Publish(&segment.Event{Seq: 100})
+	require.Equal(t, 1, freshRing.Len())
 }

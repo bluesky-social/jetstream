@@ -593,6 +593,62 @@ func (w *Writer) Append(ev Event) (full bool, err error) {
 // Pending returns the number of events buffered but not yet flushed.
 func (w *Writer) Pending() int { return w.pending.count() }
 
+// SnapshotPending returns a copy of every event currently buffered in
+// the active block (not yet flushed to disk). Used by the lookback
+// replay engine in internal/subscribe to bridge from on-disk events
+// to live events without forcing a flush (which would create user-driven
+// fsync pressure on every cursor connection).
+//
+// Each returned Event has its variable-length fields (DID, Collection,
+// Rkey, Rev, Payload) copied out of the writer's column buffers so
+// the snapshot is safe to retain across subsequent Append calls — a
+// later Append may grow and reslice the underlying buffer, leaving
+// any aliased pointers dangling.
+//
+// Like every Writer method, SnapshotPending is not safe for concurrent
+// use with Append/Flush/Seal/Close. The caller already serializes
+// access (in production via internal/ingest.Writer.mu).
+func (w *Writer) SnapshotPending() []Event {
+	n := w.pending.count()
+	if n == 0 {
+		return nil
+	}
+	out := make([]Event, n)
+	p := &w.pending
+
+	// Walk the variable-length blob columns alongside the per-event
+	// length columns so we can slice each event's bytes out by running
+	// offset rather than re-summing lengths from 0..i for every event.
+	var collOff, didOff, rkeyOff, revOff int
+	var payloadOff uint64
+	for i := range n {
+		collN := int(p.collLen[i])
+		didN := int(p.didLen[i])
+		rkeyN := int(p.rkeyLen[i])
+		revN := int(p.revLen[i])
+		payloadN := uint64(p.eventLen[i])
+
+		out[i] = Event{
+			Seq:        p.seq[i],
+			IndexedAt:  p.indexedAt[i],
+			RenderedAt: p.renderedAt[i],
+			Kind:       Kind(p.kind[i]),
+			DID:        string(p.dids[didOff : didOff+didN]),
+			Collection: string(p.collections[collOff : collOff+collN]),
+			Rkey:       string(p.rkeys[rkeyOff : rkeyOff+rkeyN]),
+			Rev:        string(p.revs[revOff : revOff+revN]),
+			Payload:    append([]byte(nil), p.payloads[payloadOff:payloadOff+payloadN]...),
+		}
+
+		collOff += collN
+		didOff += didN
+		rkeyOff += rkeyN
+		revOff += revN
+		payloadOff += payloadN
+	}
+	return out
+}
+
 // Cap returns Config.MaxEventsPerBlock.
 func (w *Writer) Cap() int { return w.cfg.MaxEventsPerBlock }
 

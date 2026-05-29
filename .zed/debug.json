@@ -1,0 +1,15 @@
+[
+  {
+    "label": "Debug (prod)",
+    "adapter": "Delve",
+    "request": "launch",
+    "mode": "debug",
+    "program": "./cmd/jetstream",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "JETSTREAM_DATA_DIR": "./data-prod",
+      "JETSTREAM_SKIP_MERGE_DISCOVERY": "true",
+    },
+    "args": ["serve", "--max-backfill-repos=20"],
+  },
+]

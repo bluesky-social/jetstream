@@ -42,7 +42,11 @@ func TestHandler_RejectsWhenNotSteadyState(t *testing.T) {
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
 
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -63,7 +67,11 @@ func TestHandler_HappyPath_DeliversIdentityEvent(t *testing.T) {
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
 
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -112,7 +120,11 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
 
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -227,7 +239,11 @@ func TestHandler_Filter_RejectsInvalidQuery(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -252,7 +268,11 @@ func TestHandler_Filter_RejectsTooManyQueryParams(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -286,7 +306,11 @@ func TestHandler_RejectsCompressQueryParam(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -312,7 +336,11 @@ func TestHandler_RejectsZstdSocketEncoding(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -336,7 +364,11 @@ func TestHandler_AllowsCompressFalse(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -359,7 +391,11 @@ func TestHandler_Filter_WantedCollections_DeliversMatching(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -402,7 +438,11 @@ func TestHandler_Filter_WantedCollections_TopLevelPrefix(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -423,7 +463,7 @@ func TestHandler_Filter_WantedCollections_TopLevelPrefix(t *testing.T) {
 	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.post", 2)    // inside prefix
 	publishCommit(t, b, "did:plc:abc", "app.bsky.graph.follow", 3) // inside prefix
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		frame := readOneFrame(t, ctx, conn)
 		var got map[string]any
 		require.NoError(t, json.Unmarshal(frame, &got))
@@ -441,7 +481,11 @@ func TestHandler_Filter_WantedCollections_PrefixMatch(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -475,7 +519,11 @@ func TestHandler_Filter_WantedDIDs_DeliversMatching(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -507,7 +555,11 @@ func TestHandler_Filter_IdentityBypassesCollectionFilter(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -538,7 +590,11 @@ func TestHandler_Filter_IdentityRespectsDIDFilter(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -570,7 +626,11 @@ func TestHandler_Filter_MaxMessageSize_DropsOversize(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -607,7 +667,11 @@ func TestHandler_Filter_MaxMessageSize_EmptyMeansNoCap(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -630,7 +694,11 @@ func TestHandler_Filter_MaxMessageSize_NegativeMeansNoCap(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -652,7 +720,11 @@ func TestHandler_OptionsUpdate_ChangesFilter(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -698,7 +770,11 @@ func TestHandler_OptionsUpdate_InvalidPayloadDisconnects(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -731,7 +807,11 @@ func TestHandler_OptionsUpdate_BadNSIDDisconnects(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -768,7 +848,11 @@ func TestHandler_OptionsUpdate_OversizePayload(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -809,7 +893,11 @@ func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -849,7 +937,11 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
 
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -909,7 +1001,11 @@ func TestHandler_RequireHello_FilterFromHelloApplies(t *testing.T) {
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
 
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -980,7 +1076,6 @@ func TestHandler_RequireHello_InvalidUpdateDisconnects(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -988,7 +1083,11 @@ func TestHandler_RequireHello_InvalidUpdateDisconnects(t *testing.T) {
 			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 			require.NoError(t, err)
 
-			h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			h := NewHandler(HandlerDeps{
+				Broadcaster: b,
+				Store:       st,
+				Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
 			srv := httptest.NewServer(h)
 			defer srv.Close()
 
@@ -1032,7 +1131,6 @@ func TestHandler_RequireHello_FalseHasNoEffect(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -1040,7 +1138,11 @@ func TestHandler_RequireHello_FalseHasNoEffect(t *testing.T) {
 			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 			require.NoError(t, err)
 
-			h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			h := NewHandler(HandlerDeps{
+				Broadcaster: b,
+				Store:       st,
+				Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
 			srv := httptest.NewServer(h)
 			defer srv.Close()
 
@@ -1116,7 +1218,11 @@ func TestHandler_RequireHello_NoLeakOnClientDisconnect(t *testing.T) {
 	// We avoid runtime.NumGoroutine() because t.Parallel tests in the
 	// same binary spawn/retire goroutines independently and would race
 	// the global counter.
-	inner := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	inner := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	served := make(chan struct{})
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(served)
@@ -1159,7 +1265,11 @@ func TestHandler_RequireHello_MultipleUpdatesDoNotPanic(t *testing.T) {
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
 
-	h := NewHandler(b, st, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 

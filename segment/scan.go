@@ -81,3 +81,47 @@ func ScanMaxSeq(path string) (maxSeq uint64, found bool, err error) {
 	}
 	return maxSeq, found, nil
 }
+
+// WalkActive opens path as an active (unsealed) segment file and
+// decodes every flushed block in order, calling fn with the events
+// in each block. Used by the lookback replay engine to read the
+// unsealed tail without forcing a flush.
+//
+// Differs from Reader.Open + DecodeBlock in that it does not require
+// the fixed header to be finalized; it walks the 8-byte length
+// prefixes directly from offset ReservedHeaderBytes forward via the
+// existing walkActiveFrames helper.
+//
+// Halts on the first error returned from fn. Returns os.PathError
+// (so os.IsNotExist works) if path does not exist.
+func WalkActive(path string, fn func([]Event) error) error {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return err // pass through os.PathError; caller may errors.Is
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("segment: stat %s: %w", path, err)
+	}
+	walk, err := walkActiveFrames(f, info.Size())
+	if err != nil {
+		return fmt.Errorf("segment: walk active frames: %w", err)
+	}
+
+	for i, b := range walk.infos {
+		frame := make([]byte, b.CompressedSize)
+		if _, err := f.ReadAt(frame, int64(b.Offset)+8); err != nil {
+			return fmt.Errorf("segment: read active block %d: %w", i, err)
+		}
+		events, _, err := decodeBlockCompressedSized(frame)
+		if err != nil {
+			return fmt.Errorf("segment: decode active block %d: %w", i, err)
+		}
+		if err := fn(events); err != nil {
+			return err
+		}
+	}
+	return nil
+}

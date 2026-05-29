@@ -3,6 +3,7 @@ package subscribe
 import (
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bluesky-social/jetstream-v2/segment"
 )
@@ -20,6 +21,14 @@ type Broadcaster struct {
 	nextID      uint64
 }
 
+// subscriberPhase, when non-nil, signals "this subscriber is in
+// lookback mode": Publish writes events into ring rather than into
+// events. Set to nil to switch back to live mode.
+type subscriberPhase struct {
+	ring     *RingBuf
+	overflow atomic.Bool
+}
+
 // subscriber is one connected websocket client's slot in the broadcaster.
 // events is buffered so a stalled receiver can't backpressure Publish;
 // done is closed exactly once when this subscriber is retired (slow-drop
@@ -31,6 +40,7 @@ type subscriber struct {
 	events chan *segment.Event
 	done   chan struct{}
 	once   sync.Once
+	phase  atomic.Pointer[subscriberPhase] // nil = live mode
 }
 
 // New validates cfg and returns a Broadcaster ready to Publish.
@@ -98,6 +108,23 @@ func (b *Broadcaster) Publish(evt *segment.Event) {
 		// it past Publish's return without aliasing the OnEvent caller's
 		// stack frame. Payload is shared (read-only at this layer).
 		e := *evt
+		if ph := s.phase.Load(); ph != nil {
+			ok, sealed := ph.ring.Push(&e)
+			if ok {
+				continue
+			}
+			if !sealed {
+				// Genuine overflow: the replay goroutine is too slow.
+				ph.overflow.Store(true)
+				continue
+			}
+			// Ring sealed at the live handoff: the replay goroutine has
+			// stopped reading it. Fall through to the live channel so the
+			// event is delivered rather than stranded. The replay loop has
+			// already cleared the phase pointer for subsequent Publishes;
+			// this branch only covers the single in-flight event that
+			// observed the phase pointer before the clear.
+		}
 		select {
 		case s.events <- &e:
 			b.metrics.observeQueueDepth(len(s.events))
@@ -144,4 +171,103 @@ func (b *Broadcaster) dropByID(id uint64, reason dropReason) {
 			b.metrics.incCleanDisconnects()
 		}
 	})
+}
+
+// SubscribeForLookback registers a new subscriber in lookback mode
+// from the start. The returned ring receives every Publish until
+// SwitchToLive is called. The returned id is the broadcaster's
+// internal subscriber id (used to clear the phase or unsubscribe).
+//
+// ringSize must be > 0; it sets the per-subscriber bounded buffer
+// capacity for the lookback window. On overflow, the broadcaster
+// sets the phase's overflow flag, which the replay engine observes
+// and uses to trigger replay restart.
+func (b *Broadcaster) SubscribeForLookback(ringSize int) (uint64, *RingBuf) {
+	b.mu.Lock()
+	id := b.nextID
+	b.nextID++
+	s := &subscriber{
+		id:     id,
+		events: make(chan *segment.Event, b.cfg.SubscriberBufferSize),
+		done:   make(chan struct{}),
+	}
+	ph := &subscriberPhase{ring: NewRingBuf(ringSize)}
+	s.phase.Store(ph)
+	b.subscribers[id] = s
+	b.mu.Unlock()
+
+	b.metrics.incSubscribers()
+	return id, ph.ring
+}
+
+// SwitchToLive completes the lookback→live handoff for subID. It
+// clears the phase pointer (so steady-state Publishes skip the ring
+// lock), then atomically seals and drains the ring. It returns the
+// live events channel plus the events that were still buffered in the
+// ring at seal time, in FIFO (seq) order. Returns (nil, nil) if subID
+// is not a known subscriber.
+//
+// The seal-and-drain is the crux of the no-loss guarantee: a Publish
+// that loaded the (pre-clear) phase pointer and is about to Push
+// either lands in the ring before SealAndDrain takes the lock (so it
+// is in the returned slice) or observes the sealed flag and reroutes
+// to the live channel. There is no window in which an event is pushed
+// into a ring nobody drains. The caller MUST emit the returned drained
+// events before pumping the live channel to preserve seq order.
+func (b *Broadcaster) SwitchToLive(subID uint64) (<-chan *segment.Event, []*segment.Event) {
+	b.mu.RLock()
+	s, ok := b.subscribers[subID]
+	b.mu.RUnlock()
+	if !ok {
+		return nil, nil
+	}
+	ph := s.phase.Load()
+	s.phase.Store(nil)
+	if ph == nil {
+		return s.events, nil
+	}
+	drained := ph.ring.SealAndDrain()
+	return s.events, drained
+}
+
+// SubscriberOverflowed reports whether the subscriber's lookback ring
+// has dropped at least one event due to the writer outpacing the
+// replay engine. The replay engine polls this between blocks.
+// Returns false for live-mode subscribers (no phase) and unknown ids.
+func (b *Broadcaster) SubscriberOverflowed(subID uint64) bool {
+	b.mu.RLock()
+	s, ok := b.subscribers[subID]
+	b.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	ph := s.phase.Load()
+	if ph == nil {
+		return false
+	}
+	return ph.overflow.Load()
+}
+
+// ResetSubscriberOverflow clears the overflow flag and replaces the
+// ring with a fresh one. Called by the replay engine after dropping
+// a saturated ring and restarting replay at an updated cursor.
+// Returns nil if subID is not a known subscriber.
+func (b *Broadcaster) ResetSubscriberOverflow(subID uint64, ringSize int) *RingBuf {
+	b.mu.RLock()
+	s, ok := b.subscribers[subID]
+	b.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	ph := &subscriberPhase{ring: NewRingBuf(ringSize)}
+	s.phase.Store(ph)
+	return ph.ring
+}
+
+// Unsubscribe drops the subscriber identified by subID, mirroring the
+// closure returned by Subscribe. Needed because SubscribeForLookback's
+// return shape is different (uses id+ring rather than the standard
+// channel+done+closure tuple).
+func (b *Broadcaster) Unsubscribe(subID uint64) {
+	b.dropByID(subID, dropReasonClient)
 }

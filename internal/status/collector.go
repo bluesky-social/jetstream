@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"golang.org/x/sync/singleflight"
 )
@@ -24,6 +25,15 @@ type Options struct {
 	// Now overrides the wall clock; tests pin it for determinism.
 	// Default time.Now.
 	Now func() time.Time
+
+	// Manifest is the in-memory segment manifest. Optional; when nil,
+	// the snapshot's CursorLookback section will report zero values.
+	Manifest *manifest.Manifest
+
+	// CursorLookback is the operator-configured --cursor-lookback
+	// duration. Zero means cursor replay is disabled; the snapshot
+	// reports zero values for the cursor-lookback panel.
+	CursorLookback time.Duration
 }
 
 const (

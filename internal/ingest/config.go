@@ -53,6 +53,24 @@ type Config struct {
 	// every Append in the active worker pool).
 	OnAfterFlush func(ctx context.Context) error
 
+	// OnAfterSeal, if non-nil, runs after a successful segment seal
+	// inside rotateLocked: segment.Writer.Seal has fsynced the footer
+	// and finalized the fixed header before this hook fires. The hook
+	// receives the just-sealed segment's numeric index and on-disk
+	// path. Errors propagate up through Append and abort the rotation;
+	// the segment file is sealed and closed by Seal before this hook
+	// runs, so a hook failure leaves the writer with no usable active
+	// segment — subsequent Appends will fail. Callers that want to
+	// recover should Close the writer and reopen.
+	//
+	// Used by internal/manifest to publish the newly-sealed segment
+	// into its in-memory bounds slice without polling the directory.
+	//
+	// Hooks must not call back into the Writer (that would deadlock
+	// on the writer mutex) or perform unbounded I/O (that would stall
+	// every Append in the active worker pool).
+	OnAfterSeal func(idx uint64, path string) error
+
 	// Logger is required (no sensible default for an ingestion
 	// component whose failure modes need visibility).
 	Logger *slog.Logger

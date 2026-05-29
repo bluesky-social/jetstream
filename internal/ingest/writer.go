@@ -322,8 +322,16 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 // parent.
 func (w *Writer) rotateLocked(ctx context.Context) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
+		sealedIdx := w.activeIdx
+		sealedPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(sealedIdx))
 		if _, err := w.active.Seal(); err != nil {
-			return fmt.Errorf("ingest: seal segment %d: %w", w.activeIdx, err)
+			return fmt.Errorf("ingest: seal segment %d: %w", sealedIdx, err)
+		}
+
+		if w.cfg.OnAfterSeal != nil {
+			if err := w.cfg.OnAfterSeal(sealedIdx, sealedPath); err != nil {
+				return fmt.Errorf("ingest: on_after_seal: %w", err)
+			}
 		}
 
 		w.activeIdx++
@@ -357,11 +365,35 @@ func (w *Writer) NextSeq() uint64 {
 	return w.nextSeq
 }
 
+// SnapshotPending returns a copy of every event currently buffered in
+// the active segment's pending block (not yet flushed to disk). The
+// snapshot is taken under w.mu so it is consistent with concurrent
+// Append calls; the returned events have their variable-length fields
+// copied out of the writer's column buffers and are safe to retain.
+//
+// Used by the lookback replay engine in internal/subscribe to bridge
+// disk events to live events at a cursor handoff without forcing a
+// flush.
+func (w *Writer) SnapshotPending() []segment.Event {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.active == nil {
+		return nil
+	}
+	return w.active.SnapshotPending()
+}
+
 // ActiveIndex returns the numeric index of the current active segment.
 func (w *Writer) ActiveIndex() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.activeIdx
+}
+
+// SegmentsDir returns the configured segments directory. The cfg is
+// read-only after Open, so no mutex is needed.
+func (w *Writer) SegmentsDir() string {
+	return w.cfg.SegmentsDir
 }
 
 // SegmentFile is one entry in a SegmentFiles result.

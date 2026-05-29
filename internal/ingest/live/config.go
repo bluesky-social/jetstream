@@ -100,6 +100,11 @@ type Config struct {
 	// longer-lived consumer.
 	OnEvent func(*segment.Event)
 
+	// OnAfterSeal is forwarded to the inner ingest.Writer's
+	// Config.OnAfterSeal. See internal/ingest.Config.OnAfterSeal for
+	// the full contract. Optional.
+	OnAfterSeal func(idx uint64, path string) error
+
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time
 }
