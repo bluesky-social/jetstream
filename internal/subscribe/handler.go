@@ -196,6 +196,32 @@ func serve(w http.ResponseWriter, r *http.Request, deps HandlerDeps, logger *slo
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
+	// Enroll this connection in the broadcaster's graceful-shutdown
+	// registry. On shutdown the broadcaster invokes closeConn (below),
+	// which sends a clean StatusGoingAway close frame and unwinds the
+	// serve loops. If RegisterConn reports the broadcaster is already
+	// draining, we missed the closer snapshot — send our own goodbye and
+	// bail rather than serve a connection nobody will ever close.
+	closeConn := func() {
+		// Send the close frame FIRST, before cancelling. Cancelling the
+		// read context trips coder/websocket's AfterFunc, which force-
+		// closes the socket (rwc.Close) with no close frame — exactly the
+		// abrupt teardown we're trying to avoid. conn.Close writes the
+		// goodbye over the independent write path; the blocked reader
+		// unwinds on the peer's echo (or on Close's own 5s+5s internal
+		// timeout for a silent peer). Only then do we cancel, to
+		// guarantee the serve loops exit even if they were mid-select.
+		// The whole call is bounded by the caller's Shutdown deadline.
+		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
+		cancel()
+	}
+	connID, ok := deps.Broadcaster.RegisterConn(closeConn)
+	if !ok {
+		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
+		return
+	}
+	defer deps.Broadcaster.DeregisterConn(connID)
+
 	go runReader(ctx, cancel, conn, deps, &filterPtr, signalHello, logger)
 
 	if requireHello {

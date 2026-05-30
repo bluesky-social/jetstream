@@ -1,6 +1,7 @@
 package subscribe
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,17 @@ type Broadcaster struct {
 	mu          sync.RWMutex
 	subscribers map[uint64]*subscriber
 	nextID      uint64
+
+	// connMu guards the graceful-close registry below. It is distinct
+	// from mu: the subscriber map (mu) tracks event-fanout slots, which
+	// not every connection holds for its whole lifetime (a replay-only
+	// loop registers a subscriber lazily). The conn registry tracks the
+	// websocket connections themselves so Shutdown can send each a clean
+	// close frame regardless of which fanout phase it's in.
+	connMu   sync.Mutex
+	conns    map[uint64]func()
+	nextConn uint64
+	draining bool
 }
 
 // subscriberPhase, when non-nil, signals "this subscriber is in
@@ -55,7 +67,100 @@ func New(cfg Config) (*Broadcaster, error) {
 		logger:      cfg.Logger.With(slog.String("component", "subscribe/broadcaster")),
 		metrics:     cfg.Metrics,
 		subscribers: make(map[uint64]*subscriber),
+		conns:       make(map[uint64]func()),
 	}, nil
+}
+
+// RegisterConn enrolls a websocket connection's graceful-close function
+// in the shutdown registry and returns an opaque id plus ok=true. The
+// close func must send a clean close frame and unblock the handler (for
+// coder/websocket this is conn.Close(StatusGoingAway, ...)); Shutdown
+// invokes it concurrently with all other registered conns.
+//
+// ok=false means the broadcaster is already draining: the caller must
+// not proceed to serve and should close its own connection immediately.
+// This closes the race where a connection accepted after Shutdown
+// snapshotted its closers would otherwise never be told to leave.
+//
+// Pair every ok=true RegisterConn with a DeregisterConn (via the
+// returned id) when the connection ends normally, so a long-lived
+// process doesn't accumulate dead closers.
+func (b *Broadcaster) RegisterConn(closeFn func()) (uint64, bool) {
+	b.connMu.Lock()
+	defer b.connMu.Unlock()
+	if b.draining {
+		return 0, false
+	}
+	id := b.nextConn
+	b.nextConn++
+	b.conns[id] = closeFn
+	return id, true
+}
+
+// DeregisterConn removes a previously registered connection. Safe to
+// call with an unknown id (e.g. after Shutdown already drained it).
+func (b *Broadcaster) DeregisterConn(id uint64) {
+	b.connMu.Lock()
+	delete(b.conns, id)
+	b.connMu.Unlock()
+}
+
+// Shutdown gracefully closes every registered connection, fanning the
+// per-connection close calls out concurrently and waiting until they
+// all finish or ctx expires. The first call flips the registry into
+// draining mode so no new connection is admitted mid-drain; subsequent
+// calls are no-ops that return nil.
+//
+// Returns ctx.Err() if the deadline elapses before every connection
+// finishes its close handshake — the bound the caller (cmd/jetstream)
+// places on how long a clean shutdown may take. Connections still
+// closing when the deadline hits are abandoned to the process exit /
+// the server's own listener teardown.
+func (b *Broadcaster) Shutdown(ctx context.Context) error {
+	b.connMu.Lock()
+	if b.draining {
+		b.connMu.Unlock()
+		return nil
+	}
+	b.draining = true
+	closers := make([]func(), 0, len(b.conns))
+	for id, fn := range b.conns {
+		closers = append(closers, fn)
+		delete(b.conns, id)
+	}
+	b.connMu.Unlock()
+
+	if len(closers) == 0 {
+		return nil
+	}
+
+	b.logger.Info("gracefully closing subscribers", "count", len(closers))
+
+	// Each close func runs in its own goroutine so one wedged peer can't
+	// serialize the others behind it; the whole fan-out is bounded by ctx.
+	var wg sync.WaitGroup
+	wg.Add(len(closers))
+	for _, fn := range closers {
+		go func() {
+			defer wg.Done()
+			fn()
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// Deadline hit: return without waiting for the stragglers. Their
+		// goroutines keep running until their own close calls return,
+		// then exit harmlessly; the process is exiting regardless.
+		return ctx.Err()
+	}
 }
 
 // Subscribe registers a new subscriber. Returns:

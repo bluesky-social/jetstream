@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -233,7 +234,18 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 	c.client.Store(client)
 	defer func() {
-		if cerr := client.Close(); cerr != nil {
+		// On a clean ctx-cancel shutdown atmos's Events iterator has
+		// already torn the socket down (consumeLoop calls conn.CloseNow
+		// when its read loop exits), so this client.Close races that and
+		// finds the connection already closed, returning a wrapped
+		// net.ErrClosed. That's the expected steady-state shutdown path,
+		// not a fault — suppress it. We still call Close because on the
+		// error-return path (a fatal write/pebble failure surfaced from
+		// processBatch) the iterator has NOT cancelled, so Close is what
+		// releases the live socket; any non-already-closed error there is
+		// genuine and worth a warning.
+		cerr := client.Close()
+		if cerr != nil && !errors.Is(cerr, net.ErrClosed) {
 			c.logger.WarnContext(ctx, "client close", "err", cerr)
 		}
 	}()

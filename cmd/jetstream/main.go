@@ -195,6 +195,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_SHUTDOWN_TIMEOUT"),
 				Value:   30 * time.Second,
 			},
+			&cli.DurationFlag{
+				Name:    "client-drain-timeout",
+				Usage:   "Maximum time allowed for in-progress websocket subscribers to receive a clean close frame and disconnect before the process exits",
+				Sources: cli.EnvVars("JETSTREAM_CLIENT_DRAIN_TIMEOUT"),
+				Value:   10 * time.Second,
+			},
 			&cli.StringFlag{
 				Name:    "relay-url",
 				Usage:   "Base URL of the upstream relay",
@@ -473,6 +479,26 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 
 	g.Go(func() error {
 		return orch.Run(gctx)
+	})
+
+	// Graceful client drain. Live websocket subscribers are hijacked
+	// connections, so http.Server.Shutdown neither tracks nor closes
+	// them — without this they'd be severed abruptly (no close frame) on
+	// process exit. On shutdown we send each subscriber a StatusGoingAway
+	// close frame and wait up to client-drain-timeout for them to leave
+	// cleanly. We keep this in the errgroup so g.Wait() blocks on the
+	// drain: the process must not exit out from under a half-sent close
+	// handshake. The drain context is rooted at Background (not gctx,
+	// which is already cancelled by the time we drain) and bounded by the
+	// flag, so a wedged client can't delay exit past the budget.
+	g.Go(func() error {
+		<-gctx.Done()
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), cmd.Duration("client-drain-timeout"))
+		defer drainCancel()
+		if err := broadcaster.Shutdown(drainCtx); err != nil {
+			logger.Warn("client drain did not complete within budget; severing remaining subscribers", "err", err)
+		}
+		return nil
 	})
 
 	// Verifier async-error drain. Verification failures are
