@@ -385,6 +385,96 @@ func TestHandler_AllowsCompressFalse(t *testing.T) {
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 }
 
+// TestHandler_NegotiatesCompression_WhenClientOffers verifies the
+// handler negotiates RFC 7692 permessage-deflate when a client offers
+// it. The handshake response must echo the extension; we assert on the
+// Sec-WebSocket-Extensions header because compression is otherwise
+// transparent on the read path. Note this is independent of the v1
+// zstd-with-custom-dictionary scheme rejected via ?compress=true.
+func TestHandler_NegotiatesCompression_WhenClientOffers(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		CompressionMode: websocket.CompressionContextTakeover,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	if resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	require.Contains(t, resp.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate",
+		"the handshake response must echo permessage-deflate when the client offers it")
+
+	// Compression is transparent on the wire: a compressed frame must
+	// still decode to the same JSON the uncompressed path produces.
+	time.Sleep(50 * time.Millisecond)
+	publishIdentity(t, b, "did:plc:compressed", 1)
+	frame := readOneFrame(t, ctx, conn)
+	require.Contains(t, string(frame), "did:plc:compressed")
+}
+
+// TestHandler_NoCompression_WhenClientDoesNotOffer verifies graceful
+// fallback: a client that does not advertise permessage-deflate gets an
+// uncompressed connection, and the handshake response carries no
+// extension. This is the path Safari and bare non-browser clients take.
+func TestHandler_NoCompression_WhenClientDoesNotOffer(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	h := NewHandler(HandlerDeps{
+		Broadcaster: b,
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// CompressionDisabled (the Dial default) means the client sends no
+	// Sec-WebSocket-Extensions offer.
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	if resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	require.Empty(t, resp.Header.Get("Sec-WebSocket-Extensions"),
+		"no compression extension should be negotiated when the client does not offer one")
+
+	time.Sleep(50 * time.Millisecond)
+	publishIdentity(t, b, "did:plc:plain", 1)
+	frame := readOneFrame(t, ctx, conn)
+	require.Contains(t, string(frame), "did:plc:plain")
+}
+
 func TestHandler_Filter_WantedCollections_DeliversMatching(t *testing.T) {
 	t.Parallel()
 

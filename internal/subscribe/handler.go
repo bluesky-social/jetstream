@@ -167,9 +167,18 @@ func serve(w http.ResponseWriter, r *http.Request, deps HandlerDeps, logger *slo
 	}
 	deps.Metrics.incCursorRequests(mode)
 
+	// Negotiate RFC 7692 permessage-deflate when the client offers it.
+	// coder/websocket reads the client's Sec-WebSocket-Extensions during
+	// Accept and only enables compression if the peer advertises support,
+	// falling back to uncompressed otherwise — so non-offering clients
+	// (Safari, bare consumers) are unaffected. ContextTakeover reuses a
+	// 32 KB sliding window across messages for the best ratio on this
+	// repetitive JSON firehose; its ~1.2 MB flate.Writer per connection is
+	// affordable at our connection scale. This is orthogonal to the v1
+	// zstd-with-custom-dictionary scheme rejected above.
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns:  []string{"*"},
-		CompressionMode: websocket.CompressionDisabled,
+		CompressionMode: websocket.CompressionContextTakeover,
 	})
 	if err != nil {
 		return
