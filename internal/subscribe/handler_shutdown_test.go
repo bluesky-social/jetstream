@@ -55,17 +55,36 @@ func TestHandler_GracefulShutdownSendsGoingAway(t *testing.T) {
 	// Let the handler register its connection in the shutdown registry.
 	time.Sleep(100 * time.Millisecond)
 
+	// Model a real subscriber: always blocked in Read consuming the
+	// firehose. This matters for timing — the server's closeConn does a
+	// graceful conn.Close, which sends the StatusGoingAway frame and then
+	// waits for the peer to echo it. A client that only starts reading
+	// AFTER Shutdown returns is a silent peer, so the server's Close
+	// blocks on its internal ~5s handshake timeout, making this test take
+	// ~5s for no reason. With the read already in flight the echo is
+	// immediate and shutdown completes in milliseconds.
+	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readCancel()
+	readErrCh := make(chan error, 1)
+	go func() {
+		_, _, rerr := conn.Read(readCtx)
+		readErrCh <- rerr
+	}()
+
 	// Drain. The handler should send each live subscriber a close frame.
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
 	require.NoError(t, b.Shutdown(shutCtx))
 
-	// The client's next read must surface the server's close frame with
-	// StatusGoingAway — not block until our deadline, and not an abrupt
+	// The in-flight read must surface the server's close frame with
+	// StatusGoingAway — not block until its deadline, and not an abrupt
 	// abnormal closure.
-	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer readCancel()
-	_, _, readErr := conn.Read(readCtx)
+	var readErr error
+	select {
+	case readErr = <-readErrCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client read did not return after shutdown")
+	}
 	require.Error(t, readErr)
 	require.Equal(t, websocket.StatusGoingAway, websocket.CloseStatus(readErr),
 		"client must receive a clean StatusGoingAway close frame on shutdown")
