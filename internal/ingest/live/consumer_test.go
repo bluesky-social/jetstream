@@ -435,7 +435,16 @@ func TestConsumer_Run_ResumesFromPersistedCursor(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(t.Context())
 	go func() { _ = c1.Run(ctx1) }()
 
-	require.Eventually(t, func() bool { return c1.LastUpstreamSeq() >= 11 }, 3*time.Second, 10*time.Millisecond)
+	// Gate on the safe-to-persist watermark — the exact value Close
+	// will write to relay/cursor — not on LastUpstreamSeq(). Under
+	// atmos's default Parallelism>1, a higher seq for one DID can finish
+	// verification (bumping LastUpstreamSeq) while a lower seq is still
+	// in-flight on another worker, pinning the watermark (min(inflight)-1)
+	// below 11. Gating on LastUpstreamSeq here let us cancel while the
+	// watermark was still at 9, so Close persisted 9 and the assertion
+	// below flaked. cursorValue() is exactly what Close persists, and it
+	// only advances monotonically, so once it reaches 11 the assertion holds.
+	require.Eventually(t, func() bool { return c1.cursorValue() >= 11 }, 3*time.Second, 10*time.Millisecond)
 	cancel1()
 	require.NoError(t, c1.Close())
 
