@@ -42,6 +42,10 @@ run-prod *ARGS:
     JETSTREAM_DATA_DIR=./data-prod \
     go run ./cmd/jetstream {{ARGS}}
 
+# Run the websocket load-test client against a running jetstream server.
+run-client *ARGS:
+    go run ./cmd/client {{ARGS}}
+
 # Run the local simulator (PLC + PDS + relay + firehose).
 simulator *ARGS:
     go run ./cmd/simulator {{ARGS}}
