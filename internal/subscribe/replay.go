@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
+	"sync/atomic"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/manifest"
@@ -27,6 +27,10 @@ type WalkInput struct {
 	// segment's flushed blocks and SnapshotPending() events to extend
 	// past the sealed-segment region. Required.
 	Writer *ingest.Writer
+
+	// BlockCache, when non-nil, serves sealed-block decodes through the shared
+	// cache instead of decoding directly. Optional; nil preserves direct decode.
+	BlockCache *blockCache
 }
 
 // WalkFromCursor invokes emit for every durable event with
@@ -39,10 +43,9 @@ type WalkInput struct {
 // Halts when emit returns a non-nil error and surfaces the error
 // (errors.Is is honored).
 //
-// Pure-function design: WalkFromCursor never touches the broadcaster
-// or per-subscriber ring. The replay state machine in a subsequent
-// task composes WalkFromCursor with ring management and overflow
-// handling.
+// Pure-function design: WalkFromCursor holds no subscriber state. The
+// bounded cold reader (NewColdReader) composes it with a batch limit and
+// the shared block cache to serve Tail's cold-path reads.
 func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Event) error) error {
 	current := input.StartSeq
 
@@ -56,7 +59,7 @@ func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Eve
 			if !ok {
 				break
 			}
-			next, err := walkSealedSegment(input.Manifest, bounds, current, emit)
+			next, err := walkSealedSegment(input.Manifest, bounds, current, input.BlockCache, emit)
 			if err != nil {
 				return err
 			}
@@ -98,7 +101,17 @@ func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Eve
 	return nil
 }
 
-func walkSealedSegment(m *manifest.Manifest, bounds manifest.SegmentBounds, current uint64, emit func(*segment.Event) error) (uint64, error) {
+func decodeSealedBlock(cache *blockCache, segIdx uint64, blockIdx int, r *segment.Reader) ([]segment.Event, error) {
+	if cache == nil {
+		return r.DecodeBlock(blockIdx)
+	}
+	return cache.getOrDecode(
+		blockKey{segIdx: segIdx, blockIdx: uint64(blockIdx)},
+		func() ([]segment.Event, error) { return r.DecodeBlock(blockIdx) },
+	)
+}
+
+func walkSealedSegment(m *manifest.Manifest, bounds manifest.SegmentBounds, current uint64, cache *blockCache, emit func(*segment.Event) error) (uint64, error) {
 	blocks, err := m.BlockIndex(bounds.Idx)
 	if err != nil {
 		return current, fmt.Errorf("block index for seg %d: %w", bounds.Idx, err)
@@ -114,7 +127,7 @@ func walkSealedSegment(m *manifest.Manifest, bounds manifest.SegmentBounds, curr
 		if block.MaxSeq < current {
 			continue
 		}
-		events, err := r.DecodeBlock(i)
+		events, err := decodeSealedBlock(cache, bounds.Idx, i, r)
 		if err != nil {
 			return current, fmt.Errorf("decode seg %d block %d: %w", bounds.Idx, i, err)
 		}
@@ -132,159 +145,58 @@ func walkSealedSegment(m *manifest.Manifest, bounds manifest.SegmentBounds, curr
 	return current, nil
 }
 
-// ReplayerInput configures a single per-subscriber replay run.
-type ReplayerInput struct {
-	Broadcaster *Broadcaster
-	Manifest    *manifest.Manifest
-	Writer      *ingest.Writer
+// DefaultBlockCacheBytes bounds the shared decoded-block cache for the cold
+// (disk replay) path. Smaller than the hot ring: the cold path is the
+// less-common case. Operator-tunable via --subscribe-block-cache-bytes.
+const DefaultBlockCacheBytes = 64 << 20
 
-	// StartSeq is the resolved cursor (post-clamp). The replayer
-	// emits events with Seq >= StartSeq.
-	StartSeq uint64
-
-	// RingSize is the per-subscriber bounded ring capacity used during
-	// lookback. On overflow the ring is dropped and replay restarts
-	// from an updated cursor.
-	RingSize int
-
-	// MaxIters bounds the overflow-restart loop. Exceeding it returns
-	// ErrLookbackTooSlow.
-	MaxIters int
-
-	// Metrics is optional. nil means no metric increments.
-	Metrics *Metrics
+// ColdReaderConfig wires the cold (disk) read path. The writer is held by
+// reference (atomic.Pointer) because cmd/jetstream publishes it after
+// steady-state begins; before then a cold read returns errColdUnavailable.
+type ColdReaderConfig struct {
+	Manifest        *manifest.Manifest
+	WriterRef       *atomic.Pointer[ingest.Writer]
+	BlockCacheBytes int // 0 -> DefaultBlockCacheBytes
 }
 
-// Replayer composes WalkFromCursor with broadcaster lookback
-// subscription, ring overflow handling, drain, and switchover to
-// live. The handler's writer loop consumes events from the emit
-// callback in seq order; switchover is transparent.
-type Replayer struct {
-	in ReplayerInput
-}
+// errBatchFull is the sentinel the bounded collector returns to stop the
+// walk once max entries are gathered. Never escapes NewColdReader's closure.
+var errBatchFull = errors.New("subscribe: cold batch full")
 
-// NewReplayer constructs a Replayer for one subscriber. Zero/negative
-// RingSize and MaxIters fall back to package defaults.
-func NewReplayer(in ReplayerInput) *Replayer {
-	if in.RingSize <= 0 {
-		in.RingSize = DefaultLookbackRingSize
+// NewColdReader returns a coldReader that serves a bounded batch from disk
+// via WalkFromCursor, routing sealed-block decodes through a shared, byte-
+// bounded block cache owned by this closure. It stops after max events and
+// reports the next cursor so the subscriber loop resumes contiguously.
+func NewColdReader(cfg ColdReaderConfig) coldReader {
+	bytes := cfg.BlockCacheBytes
+	if bytes <= 0 {
+		bytes = DefaultBlockCacheBytes
 	}
-	if in.MaxIters <= 0 {
-		in.MaxIters = DefaultMaxLookbackIterations
-	}
-	return &Replayer{in: in}
-}
-
-// Run drives the state machine to completion (or error). emit is
-// called once per event in seq order; the caller is expected to
-// forward the event to the websocket. Run blocks until live-mode
-// has fully taken over and the subscriber is detached, the context
-// is cancelled, or an error occurs.
-func (r *Replayer) Run(ctx context.Context, emit func(*segment.Event) error) error {
-	start := time.Now()
-	defer func() {
-		r.in.Metrics.observeLookbackSeconds(time.Since(start).Seconds())
-	}()
-
-	// 1. Subscribe in lookback mode FIRST so no live events are missed.
-	//    The ring is drained via SwitchToLive at the handoff, so we don't
-	//    retain the handle here.
-	subID, _ := r.in.Broadcaster.SubscribeForLookback(r.in.RingSize)
-	defer r.in.Broadcaster.Unsubscribe(subID)
-
-	currentCursor := r.in.StartSeq
-	var lastEmittedSeq uint64
-	var hasEmitted bool
-
-	for iter := 0; iter < r.in.MaxIters; iter++ {
-		// 2. Run the disk walker. Intercept emit to forward to the
-		//    caller while checking ring overflow between events.
-		walkErr := WalkFromCursor(ctx, WalkInput{
-			StartSeq: currentCursor,
-			Manifest: r.in.Manifest,
-			Writer:   r.in.Writer,
+	cache := newBlockCache(bytes)
+	return func(ctx context.Context, cursor uint64, max int) ([]*Entry, uint64, error) {
+		w := cfg.WriterRef.Load()
+		if w == nil {
+			return nil, cursor, errColdUnavailable
+		}
+		batch := make([]*Entry, 0, max)
+		next := cursor
+		err := WalkFromCursor(ctx, WalkInput{
+			StartSeq:   cursor,
+			Manifest:   cfg.Manifest,
+			Writer:     w,
+			BlockCache: cache,
 		}, func(ev *segment.Event) error {
-			if r.in.Broadcaster.SubscriberOverflowed(subID) {
-				return errOverflow
+			cp := *ev
+			batch = append(batch, newEntry(&cp))
+			next = ev.Seq + 1
+			if len(batch) >= max {
+				return errBatchFull
 			}
-			if err := emit(ev); err != nil {
-				return err
-			}
-			lastEmittedSeq = ev.Seq
-			hasEmitted = true
-			r.in.Metrics.incLookbackEvents()
 			return nil
 		})
-
-		if errors.Is(walkErr, errOverflow) {
-			// Drop the saturated ring; replay restarts from the next
-			// untouched seq.
-			r.in.Metrics.incRingOverflows()
-			r.in.Metrics.incLookbackIterations()
-			// Install a fresh ring + clear overflow on the subscriber's
-			// phase. We don't retain the handle: SwitchToLive drains via
-			// the live phase pointer at the eventual handoff.
-			r.in.Broadcaster.ResetSubscriberOverflow(subID, r.in.RingSize)
-			if hasEmitted {
-				currentCursor = lastEmittedSeq + 1
-			}
-			continue
+		if err != nil && !errors.Is(err, errBatchFull) {
+			return nil, cursor, err
 		}
-		if walkErr != nil {
-			return walkErr
-		}
-
-		// 3. Disk replay completed. Atomically clear the phase, seal the
-		//    ring, and drain it. SealAndDrain (inside SwitchToLive) closes
-		//    the window where a live event could be pushed into a ring the
-		//    replay goroutine has stopped reading: any racing Publish
-		//    either lands in the returned slice or reroutes to liveCh.
-		liveCh, drained := r.in.Broadcaster.SwitchToLive(subID)
-		if liveCh == nil {
-			// Subscriber was unsubscribed under our feet; treat as a
-			// clean disconnect.
-			return nil
-		}
-		for _, ev := range drained {
-			if hasEmitted && ev.Seq <= lastEmittedSeq {
-				continue
-			}
-			if err := emit(ev); err != nil {
-				return err
-			}
-			lastEmittedSeq = ev.Seq
-			hasEmitted = true
-			r.in.Metrics.incLookbackEvents()
-		}
-
-		// 5. Pump live events until ctx is cancelled.
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case ev, ok := <-liveCh:
-				if !ok {
-					return nil
-				}
-				if hasEmitted && ev.Seq <= lastEmittedSeq {
-					// Defensive: filter any boundary-time duplicate.
-					continue
-				}
-				if err := emit(ev); err != nil {
-					return err
-				}
-				lastEmittedSeq = ev.Seq
-				hasEmitted = true
-				r.in.Metrics.incLookbackEvents()
-			}
-		}
+		return batch, next, nil
 	}
-
-	// We hit MaxIters without making it through replay.
-	r.in.Metrics.incLookbackTerminated("too_slow")
-	return ErrLookbackTooSlow
 }
-
-// errOverflow is the sentinel WalkFromCursor's emit callback returns
-// to abort the walk on ring overflow. It never escapes Replayer.Run.
-var errOverflow = errors.New("subscribe: lookback ring overflow")

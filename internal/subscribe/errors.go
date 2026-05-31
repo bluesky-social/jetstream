@@ -4,10 +4,8 @@ import "errors"
 
 // errSkipEvent signals that the encoder intentionally produced no
 // frame for this event (e.g. #sync events, which Jetstream v1 never
-// emitted on the wire). The handler's writer loop treats this as
-// "advance the channel; keep the connection alive."
-//
-//nolint:unused
+// emitted on the wire). The subscriber pull loop treats this as
+// "advance the cursor; keep the connection alive."
 var errSkipEvent = errors.New("subscribe: skip event")
 
 // ErrInvalidOptions wraps validation failures from ParseQuery and
@@ -15,9 +13,3 @@ var errSkipEvent = errors.New("subscribe: skip event")
 // package) errors.Is against it to distinguish bad-input failures from
 // other errors.
 var ErrInvalidOptions = errors.New("subscribe: invalid options")
-
-// ErrLookbackTooSlow signals that a cursor-replay subscriber's outbox
-// could not keep up with disk replay over MaxLookbackIterations
-// successive ring overflows. The handler emits a JSON error frame
-// and closes the connection.
-var ErrLookbackTooSlow = errors.New("subscribe: lookback too slow")

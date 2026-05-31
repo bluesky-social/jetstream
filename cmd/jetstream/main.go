@@ -244,10 +244,34 @@ func serveCommand() *cli.Command {
 				Value:   36 * time.Hour,
 			},
 			&cli.IntFlag{
-				Name:    "cursor-ring-size",
-				Usage:   "Per-subscriber bounded ring buffer (events) used during the lookback-to-live handoff.",
-				Sources: cli.EnvVars("JETSTREAM_CURSOR_RING_SIZE"),
-				Value:   16384,
+				Name:    "subscribe-hot-tail-bytes",
+				Usage:   "Byte budget of the in-memory hot-tail ring that fans live events to /subscribe clients.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_HOT_TAIL_BYTES"),
+				Value:   256 << 20,
+			},
+			&cli.IntFlag{
+				Name:    "subscribe-block-cache-bytes",
+				Usage:   "Decoded-byte budget of the shared cold-path block cache (sealed + flushed blocks).",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_BLOCK_CACHE_BYTES"),
+				Value:   64 << 20,
+			},
+			&cli.IntFlag{
+				Name:    "subscribe-read-batch",
+				Usage:   "Max events returned per ReadFrom call to a /subscribe client.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_READ_BATCH"),
+				Value:   1024,
+			},
+			&cli.DurationFlag{
+				Name:    "subscribe-slow-window",
+				Usage:   "Sustained window over which an adversarially-slow /subscribe client is judged before being dropped.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_SLOW_WINDOW"),
+				Value:   60 * time.Second,
+			},
+			&cli.FloatFlag{
+				Name:    "subscribe-slow-min-rate",
+				Usage:   "Events/sec floor below which a far-behind /subscribe client is considered adversarially slow.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_SLOW_MIN_RATE"),
+				Value:   5,
 			},
 			&cli.IntFlag{
 				Name:    "cursor-block-index-cache-size",
@@ -385,12 +409,26 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	stateStore := syncstate.New(metaStore)
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
-	broadcaster, err := subscribe.New(subscribe.Config{
-		Logger:  processLogger,
-		Metrics: subscribeMetrics,
+	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
+		Manifest:        mft,
+		WriterRef:       &writerPtr,
+		BlockCacheBytes: cmd.Int("subscribe-block-cache-bytes"),
+	})
+	tail, err := subscribe.New(subscribe.Config{
+		Logger:       processLogger,
+		Metrics:      subscribeMetrics,
+		HotTailBytes: cmd.Int("subscribe-hot-tail-bytes"),
+		ReadBatch:    cmd.Int("subscribe-read-batch"),
+		SlowWindow:   cmd.Duration("subscribe-slow-window"),
+		SlowMinRate:  cmd.Float("subscribe-slow-min-rate"),
+	}, coldRd, func() uint64 {
+		if w := writerPtr.Load(); w != nil {
+			return w.NextSeq()
+		}
+		return 0
 	})
 	if err != nil {
-		return fmt.Errorf("serve: build subscribe broadcaster: %w", err)
+		return fmt.Errorf("serve: build subscribe tail: %w", err)
 	}
 
 	verifierLogger := processLogger.With(slog.String("component", "verifier"))
@@ -434,7 +472,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		LiveMetrics:        live.NewMetrics(metrics.Registry),
 		BackfillMetrics:    backfill.NewMetrics(metrics.Registry),
 		SegmentMetrics:     segmentMetrics,
-		OnEvent:            broadcaster.Publish,
+		OnEvent:            tail.Append,
 		MaxBackfillRepos:   cmd.Int("max-backfill-repos"),
 		SkipMergeDiscovery: cmd.Bool("skip-merge-discovery"),
 		IngestOnAfterSeal:  mft.OnSegmentSealed,
@@ -456,16 +494,14 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
 	// before steady-state, lifecycle.IsSteadyState gates with 503 so
 	// nil-pointer reads are harmless.
-	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(subscribe.HandlerDeps{
-		Broadcaster:    broadcaster,
-		Store:          metaStore,
-		Manifest:       mft,
-		WriterRef:      &writerPtr,
-		Logger:         processLogger,
-		Metrics:        subscribeMetrics,
-		Lookback:       cmd.Duration("cursor-lookback"),
-		LookbackRingSz: cmd.Int("cursor-ring-size"),
-		MaxIters:       subscribe.DefaultMaxLookbackIterations,
+	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(subscribe.Subscription{
+		Tail:      tail,
+		Store:     metaStore,
+		Manifest:  mft,
+		WriterRef: &writerPtr,
+		Logger:    processLogger,
+		Metrics:   subscribeMetrics,
+		Lookback:  cmd.Duration("cursor-lookback"),
 	}))
 
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
@@ -495,7 +531,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		<-gctx.Done()
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), cmd.Duration("client-drain-timeout"))
 		defer drainCancel()
-		if err := broadcaster.Shutdown(drainCtx); err != nil {
+		if err := tail.Shutdown(drainCtx); err != nil {
 			logger.Warn("client drain did not complete within budget; severing remaining subscribers", "err", err)
 		}
 		return nil

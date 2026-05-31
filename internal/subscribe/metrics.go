@@ -14,12 +14,9 @@ const (
 type Metrics struct {
 	Subscribers       prometheus.Gauge
 	CleanDisconnects  prometheus.Counter
-	SlowDrops         prometheus.Counter
-	EventsPublished   prometheus.Counter
 	EventsSent        prometheus.Counter
 	EventsSkippedSync prometheus.Counter
 	EncodeErrors      prometheus.Counter
-	QueueDepth        prometheus.Histogram
 
 	// Added in 2026-05-27 v1-filtering port:
 	EventsFiltered      prometheus.Counter
@@ -30,12 +27,13 @@ type Metrics struct {
 	// Added in 2026-05-28 v1-cursor port:
 	CursorRequests       *prometheus.CounterVec
 	CursorResolveSeconds prometheus.Histogram
-	LookbackSubscribers  prometheus.Gauge
-	LookbackIterations   prometheus.Counter
-	RingOverflows        prometheus.Counter
-	LookbackSeconds      prometheus.Histogram
-	LookbackEvents       prometheus.Counter
-	LookbackTerminated   *prometheus.CounterVec
+
+	// Pull-fanout series (2026-05-31):
+	EventsAppended   prometheus.Counter
+	HotReads         prometheus.Counter
+	ColdReads        prometheus.Counter
+	AdversarialDrops prometheus.Counter
+	HotRingBytes     prometheus.Gauge
 }
 
 // NewMetrics registers the subscribe series against reg. Calls
@@ -53,16 +51,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "clean_disconnects_total",
 			Help: "Number of /subscribe connections closed by the client or normal shutdown.",
 		}),
-		SlowDrops: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "slow_drops_total",
-			Help: "Number of /subscribe connections dropped because the per-subscriber buffer overflowed.",
-		}),
-		EventsPublished: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "events_published_total",
-			Help: "Number of segment.Events the broadcaster has fanned out to its subscribers.",
-		}),
 		EventsSent: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "events_sent_total",
@@ -78,12 +66,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "encode_errors_total",
 			Help: "Number of segment.Events the encoder failed to render to JSON.",
-		}),
-		QueueDepth: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name:    "subscriber_queue_depth",
-			Help:    "Distribution of per-subscriber channel depth observed at Publish time.",
-			Buckets: prometheus.ExponentialBuckets(1, 4, 9), // 1..65536
 		}),
 		EventsFiltered: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -119,47 +101,40 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Wall-clock duration of ResolveCursor (parse + manifest lookup + optional block scan).",
 			Buckets: prometheus.ExponentialBuckets(0.0001, 4, 8),
 		}),
-		LookbackSubscribers: prometheus.NewGauge(prometheus.GaugeOpts{
+		EventsAppended: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "lookback_subscribers",
-			Help: "Current number of subscribers in lookback (cursor-replay) mode.",
+			Name: "events_appended_total",
+			Help: "Number of segment.Events ingest has appended into the hot-tail ring.",
 		}),
-		LookbackIterations: prometheus.NewCounter(prometheus.CounterOpts{
+		HotReads: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "lookback_iterations_total",
-			Help: "Total ring-overflow restart iterations across all lookback subscribers.",
+			Name: "hot_reads_total",
+			Help: "Number of ReadFrom calls served from the in-memory hot ring.",
 		}),
-		RingOverflows: prometheus.NewCounter(prometheus.CounterOpts{
+		ColdReads: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "ring_overflows_total",
-			Help: "Number of times a lookback subscriber's bounded ring filled.",
+			Name: "cold_reads_total",
+			Help: "Number of ReadFrom calls that fell through to the cold (disk) reader.",
 		}),
-		LookbackSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+		AdversarialDrops: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name:    "lookback_seconds",
-			Help:    "End-to-end wall-clock duration of one Replayer.Run.",
-			Buckets: prometheus.ExponentialBuckets(0.001, 4, 10),
+			Name: "adversarial_drops_total",
+			Help: "Number of /subscribe connections dropped by the adversarially-slow detector.",
 		}),
-		LookbackEvents: prometheus.NewCounter(prometheus.CounterOpts{
+		HotRingBytes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "lookback_events_total",
-			Help: "Total events emitted by lookback replay (across the disk walk and ring drain).",
+			Name: "hot_ring_bytes",
+			Help: "Current resident byte size of the in-memory hot-tail ring.",
 		}),
-		LookbackTerminated: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "lookback_terminated_total",
-			Help: "Lookback subscribers terminated for reasons other than clean disconnect.",
-		}, []string{"reason"}),
 	}
 	reg.MustRegister(
-		m.Subscribers, m.CleanDisconnects, m.SlowDrops,
-		m.EventsPublished, m.EventsSent, m.EventsSkippedSync,
-		m.EncodeErrors, m.QueueDepth,
+		m.Subscribers, m.CleanDisconnects,
+		m.EventsSent, m.EventsSkippedSync, m.EncodeErrors,
 		m.EventsFiltered, m.EventsOversize,
 		m.OptionsUpdates, m.OptionsUpdateErrors,
-		m.CursorRequests, m.CursorResolveSeconds, m.LookbackSubscribers,
-		m.LookbackIterations, m.RingOverflows, m.LookbackSeconds,
-		m.LookbackEvents, m.LookbackTerminated,
+		m.CursorRequests, m.CursorResolveSeconds,
+		m.EventsAppended, m.HotReads, m.ColdReads,
+		m.AdversarialDrops, m.HotRingBytes,
 	)
 	return m
 }
@@ -179,16 +154,6 @@ func (m *Metrics) incCleanDisconnects() {
 		m.CleanDisconnects.Inc()
 	}
 }
-func (m *Metrics) incSlowDrops() {
-	if m != nil {
-		m.SlowDrops.Inc()
-	}
-}
-func (m *Metrics) incEventsPublished() {
-	if m != nil {
-		m.EventsPublished.Inc()
-	}
-}
 func (m *Metrics) incEventsSent() {
 	if m != nil {
 		m.EventsSent.Inc()
@@ -202,11 +167,6 @@ func (m *Metrics) incEventsSkippedSync() {
 func (m *Metrics) incEncodeErrors() {
 	if m != nil {
 		m.EncodeErrors.Inc()
-	}
-}
-func (m *Metrics) observeQueueDepth(n int) {
-	if m != nil {
-		m.QueueDepth.Observe(float64(n))
 	}
 }
 func (m *Metrics) incEventsFiltered() {
@@ -253,44 +213,33 @@ func (m *Metrics) observeCursorResolveSeconds(d float64) {
 	}
 }
 
-func (m *Metrics) incLookbackSubscribers() {
-	if m != nil {
-		m.LookbackSubscribers.Inc()
+func (m *Metrics) incEventsAppended() {
+	if m == nil {
+		return
 	}
+	m.EventsAppended.Inc()
 }
-
-func (m *Metrics) decLookbackSubscribers() {
-	if m != nil {
-		m.LookbackSubscribers.Dec()
+func (m *Metrics) incHotReads() {
+	if m == nil {
+		return
 	}
+	m.HotReads.Inc()
 }
-
-func (m *Metrics) incLookbackIterations() {
-	if m != nil {
-		m.LookbackIterations.Inc()
+func (m *Metrics) incColdReads() {
+	if m == nil {
+		return
 	}
+	m.ColdReads.Inc()
 }
-
-func (m *Metrics) incRingOverflows() {
-	if m != nil {
-		m.RingOverflows.Inc()
+func (m *Metrics) incAdversarialDrops() {
+	if m == nil {
+		return
 	}
+	m.AdversarialDrops.Inc()
 }
-
-func (m *Metrics) observeLookbackSeconds(d float64) {
-	if m != nil {
-		m.LookbackSeconds.Observe(d)
+func (m *Metrics) setHotRingBytes(n int) {
+	if m == nil {
+		return
 	}
-}
-
-func (m *Metrics) incLookbackEvents() {
-	if m != nil {
-		m.LookbackEvents.Inc()
-	}
-}
-
-func (m *Metrics) incLookbackTerminated(reason string) {
-	if m != nil {
-		m.LookbackTerminated.WithLabelValues(reason).Inc()
-	}
+	m.HotRingBytes.Set(float64(n))
 }

@@ -33,14 +33,14 @@ func TestHandler_GracefulShutdownSendsGoingAway(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	makeSteadyState(t, st)
 
-	b, err := subscribe.New(subscribe.Config{Logger: discardLogger()})
+	b, err := subscribe.New(subscribe.Config{Logger: discardLogger()}, nil, nil)
 	require.NoError(t, err)
 
-	srv := httptest.NewServer(subscribe.NewHandler(subscribe.HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      discardLogger(),
-		Metrics:     subscribe.NewMetrics(prometheus.NewRegistry()),
+	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{
+		Tail:    b,
+		Store:   st,
+		Logger:  discardLogger(),
+		Metrics: subscribe.NewMetrics(prometheus.NewRegistry()),
 	}))
 	defer srv.Close()
 
@@ -102,14 +102,14 @@ func TestHandler_RejectsConnectionsDuringDrain(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	makeSteadyState(t, st)
 
-	b, err := subscribe.New(subscribe.Config{Logger: discardLogger()})
+	b, err := subscribe.New(subscribe.Config{Logger: discardLogger()}, nil, nil)
 	require.NoError(t, err)
 
-	srv := httptest.NewServer(subscribe.NewHandler(subscribe.HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      discardLogger(),
-		Metrics:     subscribe.NewMetrics(prometheus.NewRegistry()),
+	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{
+		Tail:    b,
+		Store:   st,
+		Logger:  discardLogger(),
+		Metrics: subscribe.NewMetrics(prometheus.NewRegistry()),
 	}))
 	defer srv.Close()
 

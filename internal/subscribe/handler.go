@@ -18,7 +18,6 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/coder/websocket"
 )
 
@@ -32,15 +31,15 @@ const (
 	frameWriteTimeout = 5 * time.Second
 )
 
-// HandlerDeps bundles the dependencies of the /subscribe handler.
+// Subscription bundles the dependencies of the /subscribe handler.
 // Required fields are validated in NewHandler with a panic — this is
 // wired exactly once at process startup, so a panic at construction
 // time is the right granularity.
-type HandlerDeps struct {
-	Broadcaster *Broadcaster
-	Store       *store.Store
-	Manifest    *manifest.Manifest // optional; required for cursor replay
-	Writer      *ingest.Writer     // optional; required for cursor replay
+type Subscription struct {
+	Tail     *Tail
+	Store    *store.Store
+	Manifest *manifest.Manifest // optional; required for cursor replay
+	Writer   *ingest.Writer     // optional; required for cursor replay
 	// WriterRef, when non-nil, supersedes Writer. Resolved at request
 	// time; supports cmd/jetstream's deferred-writer-publication
 	// pattern where the orchestrator publishes the writer pointer
@@ -52,29 +51,21 @@ type HandlerDeps struct {
 	// Lookback is the cursor-replay clamp duration. Zero disables
 	// cursor replay entirely (cursors are silently dropped to live).
 	Lookback time.Duration
-
-	// LookbackRingSz is the per-subscriber ring size for the lookback
-	// handoff. Zero defaults to DefaultLookbackRingSize.
-	LookbackRingSz int
-
-	// MaxIters bounds the ring-overflow restart loop. Zero defaults
-	// to DefaultMaxLookbackIterations.
-	MaxIters int
 }
 
-func (d HandlerDeps) writer() *ingest.Writer {
+func (d Subscription) writer() *ingest.Writer {
 	if d.WriterRef != nil {
 		return d.WriterRef.Load()
 	}
 	return d.Writer
 }
 
-func NewHandler(deps HandlerDeps) http.Handler {
+func NewHandler(deps Subscription) http.Handler {
 	if deps.Logger == nil {
 		panic("subscribe: HandlerDeps.Logger is required")
 	}
-	if deps.Broadcaster == nil {
-		panic("subscribe: HandlerDeps.Broadcaster is required")
+	if deps.Tail == nil {
+		panic("subscribe: HandlerDeps.Tail is required")
 	}
 	if deps.Store == nil {
 		panic("subscribe: HandlerDeps.Store is required")
@@ -85,7 +76,7 @@ func NewHandler(deps HandlerDeps) http.Handler {
 	})
 }
 
-func serve(w http.ResponseWriter, r *http.Request, deps HandlerDeps, logger *slog.Logger) {
+func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *slog.Logger) {
 	if !lifecycle.IsSteadyState(deps.Store) {
 		http.Error(w, "service not ready: bootstrap in progress", http.StatusServiceUnavailable)
 		return
@@ -112,30 +103,41 @@ func serve(w http.ResponseWriter, r *http.Request, deps HandlerDeps, logger *slo
 
 	// Resolve cursor BEFORE upgrade so a bad cursor returns HTTP 400.
 	rawCursor := values.Get("cursor")
+
 	var cursorPlan CursorPlan
 	switch {
 	case deps.Lookback <= 0:
-		// Cursor lookback is disabled by configuration. Ignore the
-		// parameter and serve live tip; this is a documented operator
+		// Cursor lookback is disabled by configuration. The service runs
+		// pure-live: seqs start at 0 and the live tip comes from the ring,
+		// so there's no warmup window and no writer to wait on. Ignore the
+		// cursor parameter and serve live tip; a documented operator
 		// choice, not a silent gap.
 		cursorPlan = CursorPlan{Mode: ModeLive}
 	case deps.Manifest == nil || deps.writer() == nil:
-		// Cursor lookback is enabled, but the replay dependencies aren't
-		// available yet. The only window this happens in is steady-state
-		// warmup: the phase marker is durable (we passed IsSteadyState
-		// above) but the live consumer hasn't published its writer
-		// pointer yet. Silently serving live tip here would hand a
-		// resuming client the live tip while it believes it resumed at
-		// its cursor — a silent gap of every event between the cursor
-		// and the tip. Refuse with a retryable 503 instead so the
-		// client reconnects once warmup completes. A request with no
-		// cursor has nothing to resume, so it's safe to serve live.
+		// Cursor lookback is enabled but the replay dependencies aren't
+		// available. The dominant case is the steady-state warmup window:
+		// the phase marker is durable (we passed IsSteadyState above) but
+		// the live consumer hasn't published its writer pointer yet, so
+		// the Tail's live tip is not yet meaningful — Tip() reports 0.
+		// Serving ANY subscriber now is wrong:
+		//
+		//   - A cursor client would be handed the live tip while believing
+		//     it resumed at its cursor — a silent gap of every event
+		//     between the cursor and the tip.
+		//   - A live (no-cursor) client would anchor at the bogus tip 0;
+		//     once real events arrive at a high seq, that client sits below
+		//     the hot ring's base and dives the ENTIRE archive cold — the
+		//     replay storm this fan-out path exists to avoid.
+		//
+		// Refuse both with a retryable 503 until the writer is published;
+		// the client reconnects in seconds. Earlier this exempted no-cursor
+		// requests as "safe to serve live" — that was the source of the
+		// full-archive replay, since the live tip is unknowable here.
 		if rawCursor != "" {
 			deps.Metrics.incCursorRequests("unavailable")
-			http.Error(w, "service not ready: cursor replay warming up", http.StatusServiceUnavailable)
-			return
 		}
-		cursorPlan = CursorPlan{Mode: ModeLive}
+		http.Error(w, "service not ready: cursor replay warming up", http.StatusServiceUnavailable)
+		return
 	default:
 		resolveStart := time.Now()
 		plan, err := ResolveCursor(rawCursor, CursorEnv{
@@ -196,10 +198,10 @@ func serve(w http.ResponseWriter, r *http.Request, deps HandlerDeps, logger *slo
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	// Enroll this connection in the broadcaster's graceful-shutdown
-	// registry. On shutdown the broadcaster invokes closeConn (below),
+	// Enroll this connection in the Tail's graceful-shutdown
+	// registry. On shutdown the Tail invokes closeConn (below),
 	// which sends a clean StatusGoingAway close frame and unwinds the
-	// serve loops. If RegisterConn reports the broadcaster is already
+	// serve loops. If RegisterConn reports the Tail is already
 	// draining, we missed the closer snapshot — send our own goodbye and
 	// bail rather than serve a connection nobody will ever close.
 	closeConn := func() {
@@ -215,12 +217,13 @@ func serve(w http.ResponseWriter, r *http.Request, deps HandlerDeps, logger *slo
 		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
 		cancel()
 	}
-	connID, ok := deps.Broadcaster.RegisterConn(closeConn)
+
+	connID, ok := deps.Tail.RegisterConn(closeConn)
 	if !ok {
 		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
 		return
 	}
-	defer deps.Broadcaster.DeregisterConn(connID)
+	defer deps.Tail.DeregisterConn(connID)
 
 	go runReader(ctx, cancel, conn, deps, &filterPtr, signalHello, logger)
 
@@ -232,18 +235,18 @@ func serve(w http.ResponseWriter, r *http.Request, deps HandlerDeps, logger *slo
 		}
 	}
 
+	startSeq := cursorPlan.StartSeq
 	if cursorPlan.Mode == ModeLive {
-		runLiveLoop(ctx, conn, deps, &filterPtr, logger)
-		return
+		startSeq = deps.Tail.Tip()
 	}
 
-	runReplayLoop(ctx, conn, deps, &filterPtr, cursorPlan, logger)
+	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, logger)
 }
 
 func runReader(
 	ctx context.Context, cancel context.CancelFunc,
 	conn *websocket.Conn,
-	deps HandlerDeps,
+	deps Subscription,
 	filterPtr *atomic.Pointer[Filter],
 	signalHello func(),
 	logger *slog.Logger,
@@ -289,13 +292,25 @@ func runReader(
 	}
 }
 
-func runLiveLoop(
-	ctx context.Context, conn *websocket.Conn,
-	deps HandlerDeps, filterPtr *atomic.Pointer[Filter],
+// runSubscriberLoop is the single pull loop for every subscriber, live or
+// cursor. It reads batches from the Tail starting at startSeq, delivers each
+// event (filter -> memoized encode -> write), and drops the client only when
+// the adversarial-rate detector fires. ReadFrom blocks at the tip, so an idle
+// stream costs nothing; a ping ticker keeps idle connections alive.
+func runSubscriberLoop(
+	ctx context.Context,
+	conn *websocket.Conn,
+	deps Subscription,
+	filterPtr *atomic.Pointer[Filter],
+	startSeq uint64,
 	logger *slog.Logger,
 ) {
-	subCh, doneCh, unsubscribe := deps.Broadcaster.Subscribe()
-	defer unsubscribe()
+	deps.Metrics.incSubscribers()
+	defer deps.Metrics.decSubscribers()
+
+	slowDetector := newSlowDetector(deps.Tail.SlowConfig())
+	batchMax := deps.Tail.ReadBatch()
+	cursor := startSeq
 
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
@@ -303,8 +318,7 @@ func runLiveLoop(
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case <-doneCh:
+			deps.Metrics.incCleanDisconnects()
 			return
 		case <-pingTicker.C:
 			pingCtx, pcancel := context.WithTimeout(ctx, frameWriteTimeout)
@@ -313,90 +327,89 @@ func runLiveLoop(
 			if perr != nil {
 				return
 			}
-		case evt := <-subCh:
-			if !deliverEvent(ctx, conn, deps, filterPtr.Load(), evt, logger) {
+		default:
+		}
+
+		// Bound the read so the loop wakes periodically to send keepalive
+		// pings even when the stream is idle (ReadFrom blocks at the tip).
+		readCtx, rcancel := context.WithTimeout(ctx, pingInterval)
+		batch, next, err := deps.Tail.ReadFrom(readCtx, cursor, batchMax)
+		rcancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				deps.Metrics.incCleanDisconnects()
+				return // connection closing
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				continue // idle at tip: loop to send a keepalive ping
+			}
+			if errors.Is(err, errColdUnavailable) {
 				return
 			}
+			logger.Warn("read error", "err", err)
+			return
+		}
+
+		// Forward-progress invariant: a non-error ReadFrom must advance the
+		// cursor. Blocking at the live tip surfaces as DeadlineExceeded
+		// (handled above); a hot hit or cold batch always advances past what
+		// it returned. A non-advancing non-error return (e.g. an empty cold
+		// batch with next == cursor) would spin this loop hot, so treat it as
+		// a contract violation and disconnect.
+		if next <= cursor {
+			logger.Error("tail ReadFrom returned non-advancing cursor",
+				"cursor", cursor, "next", next, "batch", len(batch))
+			return
+		}
+
+		for _, e := range batch {
+			f := filterPtr.Load()
+			if !f.Wants(e.Event) {
+				deps.Metrics.incEventsFiltered()
+				continue
+			}
+
+			body, eerr := e.Encoded()
+			if errors.Is(eerr, errSkipEvent) {
+				deps.Metrics.incEventsSkippedSync()
+				continue
+			}
+			if eerr != nil {
+				deps.Metrics.incEncodeErrors()
+				logger.Warn("encode error", "err", eerr, "kind", int(e.Event.Kind), "did", e.Event.DID)
+				continue
+			}
+
+			if max := f.MaxMessageSizeBytes(); max > 0 && uint32(len(body)) > max {
+				deps.Metrics.incEventsOversize()
+				continue
+			}
+
+			writeCtx, wcancel := context.WithTimeout(ctx, frameWriteTimeout)
+			werr := conn.Write(writeCtx, websocket.MessageText, body)
+			wcancel()
+			if werr != nil {
+				return
+			}
+
+			deps.Metrics.incEventsSent()
+		}
+
+		cursor = next
+
+		// The detector keys on cursor (log-scan progress), not frames
+		// delivered: a selective-filter client that scans fast but emits
+		// little is keeping up and must not be dropped.
+		lag := uint64(0)
+		if tip := deps.Tail.Tip(); tip > cursor {
+			lag = tip - cursor
+		}
+		if slowDetector.observe(cursor, lag) {
+			deps.Metrics.incAdversarialDrops()
+			logger.Warn("dropped adversarially slow subscriber", "cursor", cursor, "lag", lag)
+			return
 		}
 	}
-}
-
-func runReplayLoop(
-	ctx context.Context, conn *websocket.Conn,
-	deps HandlerDeps, filterPtr *atomic.Pointer[Filter],
-	plan CursorPlan, logger *slog.Logger,
-) {
-	deps.Metrics.incLookbackSubscribers()
-	defer deps.Metrics.decLookbackSubscribers()
-
-	r := NewReplayer(ReplayerInput{
-		Broadcaster: deps.Broadcaster,
-		Manifest:    deps.Manifest,
-		Writer:      deps.writer(),
-		StartSeq:    plan.StartSeq,
-		RingSize:    deps.LookbackRingSz,
-		MaxIters:    deps.MaxIters,
-		Metrics:     deps.Metrics,
-	})
-	err := r.Run(ctx, func(ev *segment.Event) error {
-		if !deliverEvent(ctx, conn, deps, filterPtr.Load(), ev, logger) {
-			return context.Canceled
-		}
-		return nil
-	})
-	if err != nil && !errors.Is(err, context.Canceled) {
-		// ErrLookbackTooSlow is the iteration-cap exhaustion case;
-		// any other non-context error is an unexpected replay failure
-		// (disk I/O, segment decode, etc.). Distinguish them on the
-		// wire so clients can react appropriately.
-		errCode := "replay_error"
-		if errors.Is(err, ErrLookbackTooSlow) {
-			errCode = "lookback_too_slow"
-		}
-		body, _ := json.Marshal(struct {
-			Error   string `json:"error"`
-			Message string `json:"message"`
-		}{Error: errCode, Message: err.Error()})
-		writeCtx, wcancel := context.WithTimeout(ctx, frameWriteTimeout)
-		_ = conn.Write(writeCtx, websocket.MessageText, body)
-		wcancel()
-	}
-}
-
-// deliverEvent is the per-event filter+encode+write step shared by
-// the live and replay paths. Returns false if the connection should
-// terminate (write error). Skipped or oversize events are reported
-// via metrics; the connection stays alive.
-func deliverEvent(
-	ctx context.Context, conn *websocket.Conn,
-	deps HandlerDeps, f *Filter, evt *segment.Event, logger *slog.Logger,
-) bool {
-	if !f.Wants(evt) {
-		deps.Metrics.incEventsFiltered()
-		return true
-	}
-	body, eerr := Encode(evt)
-	if errors.Is(eerr, errSkipEvent) {
-		deps.Metrics.incEventsSkippedSync()
-		return true
-	}
-	if eerr != nil {
-		deps.Metrics.incEncodeErrors()
-		logger.Warn("encode error", "err", eerr, "kind", int(evt.Kind), "did", evt.DID)
-		return true
-	}
-	if max := f.MaxMessageSizeBytes(); max > 0 && uint32(len(body)) > max {
-		deps.Metrics.incEventsOversize()
-		return true
-	}
-	writeCtx, wcancel := context.WithTimeout(ctx, frameWriteTimeout)
-	werr := conn.Write(writeCtx, websocket.MessageText, body)
-	wcancel()
-	if werr != nil {
-		return false
-	}
-	deps.Metrics.incEventsSent()
-	return true
 }
 
 // truncateCloseReason fits a reason string into the 123-byte limit

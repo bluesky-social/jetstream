@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/subscribe"
@@ -39,21 +41,26 @@ func TestHandler_ReplaysFromCursor(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
 	makeSteadyState(t, st)
 
+	var writerPtr atomic.Pointer[ingest.Writer]
+	writerPtr.Store(w)
+	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{
+		Manifest:        m,
+		WriterRef:       &writerPtr,
+		BlockCacheBytes: 1 << 20,
+	})
 	b, err := subscribe.New(subscribe.Config{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	}, cold, func() uint64 { return w.NextSeq() })
 	require.NoError(t, err)
 
-	srv := httptest.NewServer(subscribe.NewHandler(subscribe.HandlerDeps{
-		Broadcaster:    b,
-		Store:          st,
-		Manifest:       m,
-		Writer:         w,
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Metrics:        subscribe.NewMetrics(prometheus.NewRegistry()),
-		Lookback:       36 * time.Hour,
-		LookbackRingSz: 1024,
-		MaxIters:       16,
+	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{
+		Tail:     b,
+		Store:    st,
+		Manifest: m,
+		Writer:   w,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:  subscribe.NewMetrics(prometheus.NewRegistry()),
+		Lookback: 36 * time.Hour,
 	}))
 	defer srv.Close()
 
@@ -90,14 +97,14 @@ func TestHandler_CursorDuringWarmupReturns503(t *testing.T) {
 
 	b, err := subscribe.New(subscribe.Config{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	}, nil, nil)
 	require.NoError(t, err)
 	m := mustOpenManifest(t, t.TempDir())
 
 	// Note: no Writer and no WriterRef — simulates the warmup window
 	// where the steady-state consumer hasn't published its writer yet.
-	srv := httptest.NewServer(subscribe.NewHandler(subscribe.HandlerDeps{
-		Broadcaster: b, Store: st, Manifest: m,
+	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{
+		Tail: b, Store: st, Manifest: m,
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:  subscribe.NewMetrics(prometheus.NewRegistry()),
 		Lookback: 36 * time.Hour,
@@ -112,6 +119,18 @@ func TestHandler_CursorDuringWarmupReturns503(t *testing.T) {
 	t.Cleanup(func() { _ = resp.Body.Close() })
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
 		"cursor request during warmup must be retryable, not silently served live")
+
+	// A NO-cursor (live) request must ALSO be refused during warmup. The
+	// Tail's live tip is 0 until the writer publishes; anchoring a live
+	// client there makes it dive the whole archive cold once real events
+	// arrive at a high seq. Regression guard for that full-replay bug.
+	liveReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/", nil)
+	require.NoError(t, err)
+	liveResp, err := http.DefaultClient.Do(liveReq)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = liveResp.Body.Close() })
+	require.Equal(t, http.StatusServiceUnavailable, liveResp.StatusCode,
+		"live request during warmup must be refused: the live tip is not yet known")
 }
 
 func TestHandler_RejectsInvalidCursor(t *testing.T) {
@@ -123,12 +142,12 @@ func TestHandler_RejectsInvalidCursor(t *testing.T) {
 
 	b, err := subscribe.New(subscribe.Config{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	}, nil, nil)
 	require.NoError(t, err)
 	m := mustOpenManifest(t, t.TempDir())
 
-	srv := httptest.NewServer(subscribe.NewHandler(subscribe.HandlerDeps{
-		Broadcaster: b, Store: st, Manifest: m, Writer: w,
+	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{
+		Tail: b, Store: st, Manifest: m, Writer: w,
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:  subscribe.NewMetrics(prometheus.NewRegistry()),
 		Lookback: 36 * time.Hour,

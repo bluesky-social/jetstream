@@ -44,7 +44,6 @@ func mustWriteSealedSegment(tb testing.TB, path string, f sealedFixture) {
 	}
 	_, err = w.Seal()
 	require.NoError(tb, err)
-	_ = filepath.Base
 }
 
 func mustOpenManifest(tb testing.TB, dir string) *manifest.Manifest {

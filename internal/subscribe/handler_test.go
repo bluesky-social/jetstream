@@ -39,13 +39,13 @@ func TestHandler_RejectsWhenNotSteadyState(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseBootstrap, time.Now().UTC()))
 
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
 
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -64,13 +64,13 @@ func TestHandler_HappyPath_DeliversIdentityEvent(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
 
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -97,7 +97,8 @@ func TestHandler_HappyPath_DeliversIdentityEvent(t *testing.T) {
 	}
 	payload, err := id.MarshalCBOR()
 	require.NoError(t, err)
-	b.Publish(&segment.Event{
+	var seq uint64
+	appendSeq(b, &seq, &segment.Event{
 		IndexedAt: 1779719010267528,
 		Kind:      segment.KindIdentity,
 		DID:       "did:plc:test",
@@ -117,13 +118,13 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
 
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -145,14 +146,15 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	// Publish a sync event (which the encoder skips) followed by an
 	// identity (which the encoder emits). Only the identity should
 	// arrive on the wire.
-	b.Publish(&segment.Event{Kind: segment.KindSync, DID: "did:plc:s"})
+	var seq uint64
+	appendSeq(b, &seq, &segment.Event{Kind: segment.KindSync, DID: "did:plc:s"})
 
 	id := &comatproto.SyncSubscribeRepos_Identity{
 		DID: "did:plc:i", Seq: 1, Time: "2026-05-25T00:00:00Z",
 	}
 	payload, err := id.MarshalCBOR()
 	require.NoError(t, err)
-	b.Publish(&segment.Event{
+	appendSeq(b, &seq, &segment.Event{
 		IndexedAt: 2, Kind: segment.KindIdentity,
 		DID: "did:plc:i", Payload: payload,
 	})
@@ -179,15 +181,23 @@ func readOneFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) []byt
 	return frame
 }
 
+// appendSeq assigns the next dense seq and appends, mirroring how ingest
+// drives the Tail in production (Append after durable seq assignment).
+func appendSeq(tl *Tail, seqCtr *uint64, ev *segment.Event) {
+	ev.Seq = *seqCtr
+	*seqCtr++
+	tl.Append(ev)
+}
+
 // publishIdentity publishes a minimal identity event the encoder can render.
-func publishIdentity(t *testing.T, b *Broadcaster, did string, indexedAt int64) {
+func publishIdentity(t *testing.T, tl *Tail, seqCtr *uint64, did string, indexedAt int64) {
 	t.Helper()
 	id := &comatproto.SyncSubscribeRepos_Identity{
 		DID: did, Seq: indexedAt, Time: "2026-05-27T00:00:00Z",
 	}
 	payload, err := id.MarshalCBOR()
 	require.NoError(t, err)
-	b.Publish(&segment.Event{
+	appendSeq(tl, seqCtr, &segment.Event{
 		IndexedAt: indexedAt, Kind: segment.KindIdentity,
 		DID: did, Payload: payload,
 	})
@@ -195,9 +205,9 @@ func publishIdentity(t *testing.T, b *Broadcaster, did string, indexedAt int64) 
 
 // publishCommit publishes a minimal create commit. The Payload is a
 // DAG-CBOR-encoded empty map (0xa0), which the encoder will turn into "{}".
-func publishCommit(t *testing.T, b *Broadcaster, did, collection string, indexedAt int64) {
+func publishCommit(t *testing.T, tl *Tail, seqCtr *uint64, did, collection string, indexedAt int64) {
 	t.Helper()
-	b.Publish(&segment.Event{
+	appendSeq(tl, seqCtr, &segment.Event{
 		IndexedAt:  indexedAt,
 		Kind:       segment.KindCreate,
 		DID:        did,
@@ -210,7 +220,7 @@ func publishCommit(t *testing.T, b *Broadcaster, did, collection string, indexed
 
 // publishOversizeCommit publishes a commit with a payload large enough
 // that the encoded JSON envelope will exceed any modest maxMessageSizeBytes.
-func publishOversizeCommit(t *testing.T, b *Broadcaster, did, collection string, indexedAt int64) {
+func publishOversizeCommit(t *testing.T, tl *Tail, seqCtr *uint64, did, collection string, indexedAt int64) {
 	t.Helper()
 	// CBOR map of 1 entry: key "x" → byte string of 4096 bytes.
 	// 0xa1 = map(1); 0x61 = text(1); 0x78 ... = bytes header.
@@ -222,7 +232,7 @@ func publishOversizeCommit(t *testing.T, b *Broadcaster, did, collection string,
 	big.WriteByte(0x10) // 0x1000 = 4096
 	big.WriteByte(0x00)
 	big.Write(make([]byte, 0x1000)) // 4096 zero bytes
-	b.Publish(&segment.Event{
+	appendSeq(tl, seqCtr, &segment.Event{
 		IndexedAt:  indexedAt,
 		Kind:       segment.KindCreate,
 		DID:        did,
@@ -237,12 +247,12 @@ func TestHandler_Filter_RejectsInvalidQuery(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -266,12 +276,12 @@ func TestHandler_Filter_RejectsTooManyQueryParams(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -304,12 +314,12 @@ func TestHandler_RejectsCompressQueryParam(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -334,12 +344,12 @@ func TestHandler_RejectsZstdSocketEncoding(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -362,12 +372,12 @@ func TestHandler_AllowsCompressFalse(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -395,12 +405,12 @@ func TestHandler_NegotiatesCompression_WhenClientOffers(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -426,7 +436,8 @@ func TestHandler_NegotiatesCompression_WhenClientOffers(t *testing.T) {
 	// Compression is transparent on the wire: a compressed frame must
 	// still decode to the same JSON the uncompressed path produces.
 	time.Sleep(50 * time.Millisecond)
-	publishIdentity(t, b, "did:plc:compressed", 1)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:compressed", 1)
 	frame := readOneFrame(t, ctx, conn)
 	require.Contains(t, string(frame), "did:plc:compressed")
 }
@@ -439,12 +450,12 @@ func TestHandler_NoCompression_WhenClientDoesNotOffer(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -470,7 +481,8 @@ func TestHandler_NoCompression_WhenClientDoesNotOffer(t *testing.T) {
 		"no compression extension should be negotiated when the client does not offer one")
 
 	time.Sleep(50 * time.Millisecond)
-	publishIdentity(t, b, "did:plc:plain", 1)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:plain", 1)
 	frame := readOneFrame(t, ctx, conn)
 	require.Contains(t, string(frame), "did:plc:plain")
 }
@@ -479,12 +491,12 @@ func TestHandler_Filter_WantedCollections_DeliversMatching(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -505,8 +517,9 @@ func TestHandler_Filter_WantedCollections_DeliversMatching(t *testing.T) {
 
 	// Build a record-bearing commit. Encoder needs DAG-CBOR Payload + a CID;
 	// the simplest valid CBOR is an empty map: 0xa0 = empty map.
-	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.like", 1)
-	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.post", 2)
+	var seq uint64
+	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.like", 1)
+	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.post", 2)
 
 	frame := readOneFrame(t, ctx, conn)
 	var got map[string]any
@@ -526,12 +539,12 @@ func TestHandler_Filter_WantedCollections_TopLevelPrefix(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -549,9 +562,10 @@ func TestHandler_Filter_WantedCollections_TopLevelPrefix(t *testing.T) {
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 	time.Sleep(50 * time.Millisecond)
 
-	publishCommit(t, b, "did:plc:abc", "com.example.foo", 1)       // outside prefix
-	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.post", 2)    // inside prefix
-	publishCommit(t, b, "did:plc:abc", "app.bsky.graph.follow", 3) // inside prefix
+	var seq uint64
+	publishCommit(t, b, &seq, "did:plc:abc", "com.example.foo", 1)       // outside prefix
+	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.post", 2)    // inside prefix
+	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.graph.follow", 3) // inside prefix
 
 	for range 2 {
 		frame := readOneFrame(t, ctx, conn)
@@ -569,12 +583,12 @@ func TestHandler_Filter_WantedCollections_PrefixMatch(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -592,8 +606,9 @@ func TestHandler_Filter_WantedCollections_PrefixMatch(t *testing.T) {
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 	time.Sleep(50 * time.Millisecond)
 
-	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.post", 1)
-	publishCommit(t, b, "did:plc:abc", "app.bsky.graph.follow", 2)
+	var seq uint64
+	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.post", 1)
+	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.graph.follow", 2)
 
 	frame := readOneFrame(t, ctx, conn)
 	var got map[string]any
@@ -607,12 +622,12 @@ func TestHandler_Filter_WantedDIDs_DeliversMatching(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -630,8 +645,9 @@ func TestHandler_Filter_WantedDIDs_DeliversMatching(t *testing.T) {
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 	time.Sleep(50 * time.Millisecond)
 
-	publishCommit(t, b, "did:plc:other", "app.bsky.feed.post", 1)
-	publishCommit(t, b, "did:plc:want", "app.bsky.feed.post", 2)
+	var seq uint64
+	publishCommit(t, b, &seq, "did:plc:other", "app.bsky.feed.post", 1)
+	publishCommit(t, b, &seq, "did:plc:want", "app.bsky.feed.post", 2)
 
 	frame := readOneFrame(t, ctx, conn)
 	var got map[string]any
@@ -643,12 +659,12 @@ func TestHandler_Filter_IdentityBypassesCollectionFilter(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -666,7 +682,8 @@ func TestHandler_Filter_IdentityBypassesCollectionFilter(t *testing.T) {
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 	time.Sleep(50 * time.Millisecond)
 
-	publishIdentity(t, b, "did:plc:any", 1)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:any", 1)
 
 	frame := readOneFrame(t, ctx, conn)
 	var got map[string]any
@@ -678,12 +695,12 @@ func TestHandler_Filter_IdentityRespectsDIDFilter(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -701,8 +718,9 @@ func TestHandler_Filter_IdentityRespectsDIDFilter(t *testing.T) {
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 	time.Sleep(50 * time.Millisecond)
 
-	publishIdentity(t, b, "did:plc:other", 1)
-	publishIdentity(t, b, "did:plc:want", 2)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:other", 1)
+	publishIdentity(t, b, &seq, "did:plc:want", 2)
 
 	frame := readOneFrame(t, ctx, conn)
 	var got map[string]any
@@ -714,12 +732,12 @@ func TestHandler_Filter_MaxMessageSize_DropsOversize(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -740,8 +758,9 @@ func TestHandler_Filter_MaxMessageSize_DropsOversize(t *testing.T) {
 	// Identity events are tiny; one should fit. Use them as the
 	// "delivered" half of this test rather than constructing oversize
 	// commits (which require valid CBOR + CID).
-	publishOversizeCommit(t, b, "did:plc:big", "app.bsky.feed.post", 1)
-	publishIdentity(t, b, "did:plc:small", 2)
+	var seq uint64
+	publishOversizeCommit(t, b, &seq, "did:plc:big", "app.bsky.feed.post", 1)
+	publishIdentity(t, b, &seq, "did:plc:small", 2)
 
 	frame := readOneFrame(t, ctx, conn)
 	var got map[string]any
@@ -755,12 +774,12 @@ func TestHandler_Filter_MaxMessageSize_EmptyMeansNoCap(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -782,12 +801,12 @@ func TestHandler_Filter_MaxMessageSize_NegativeMeansNoCap(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -808,12 +827,12 @@ func TestHandler_OptionsUpdate_ChangesFilter(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -843,8 +862,9 @@ func TestHandler_OptionsUpdate_ChangesFilter(t *testing.T) {
 	// Give the reader goroutine a moment to apply the update.
 	time.Sleep(50 * time.Millisecond)
 
-	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.post", 1)
-	publishCommit(t, b, "did:plc:abc", "app.bsky.feed.like", 2)
+	var seq uint64
+	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.post", 1)
+	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.like", 2)
 
 	frame := readOneFrame(t, ctx, conn)
 	var got map[string]any
@@ -858,12 +878,12 @@ func TestHandler_OptionsUpdate_InvalidPayloadDisconnects(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -895,12 +915,12 @@ func TestHandler_OptionsUpdate_BadNSIDDisconnects(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -936,12 +956,12 @@ func TestHandler_OptionsUpdate_OversizePayload(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -981,12 +1001,12 @@ func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -1013,7 +1033,8 @@ func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
 
 	// Subsequent events must still flow.
 	time.Sleep(50 * time.Millisecond)
-	publishIdentity(t, b, "did:plc:still-alive", 1)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:still-alive", 1)
 	frame := readOneFrame(t, ctx, conn)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(frame, &got))
@@ -1024,13 +1045,13 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
 
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -1051,10 +1072,12 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	// time to subscribe (it shouldn't subscribe until hello).
 	time.Sleep(50 * time.Millisecond)
 
-	// Publish a matching event. Because Subscribe() hasn't been called
-	// yet, the broadcaster has no per-connection channel to queue this
-	// into — the event must be dropped silently.
-	publishIdentity(t, b, "did:plc:pre-hello", 1)
+	// Append a matching event. The subscriber loop hasn't started yet (it
+	// waits for hello), so it will begin reading at the live tip — which is
+	// already past this event. A pre-hello event is therefore never
+	// delivered: live subscribers do not replay history.
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:pre-hello", 1)
 
 	// Wait long enough to ensure that IF the event were going to be
 	// delivered, it would have been (but it won't be, because we
@@ -1072,12 +1095,12 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Publish a fresh event AFTER hello. Only this one should arrive.
-	publishIdentity(t, b, "did:plc:post-hello", 2)
+	publishIdentity(t, b, &seq, "did:plc:post-hello", 2)
 
 	frame := readOneFrame(t, ctx, conn)
 	require.Contains(t, string(frame), "did:plc:post-hello")
 	require.NotContains(t, string(frame), "did:plc:pre-hello",
-		"pre-hello publish must be dropped, not queued")
+		"pre-hello append precedes the live-tip start and must not be delivered")
 }
 
 // V1 PARITY: a filter delivered in the hello options_update must take
@@ -1088,13 +1111,13 @@ func TestHandler_RequireHello_FilterFromHelloApplies(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
 
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -1126,8 +1149,9 @@ func TestHandler_RequireHello_FilterFromHelloApplies(t *testing.T) {
 	// Publish an event that the filter should drop, then one it should
 	// pass. The reader can only see the second one if the filter was
 	// installed before Subscribe — which is the contract.
-	publishIdentity(t, b, "did:plc:other", 1)
-	publishIdentity(t, b, "did:plc:wanted", 2)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:other", 1)
+	publishIdentity(t, b, &seq, "did:plc:wanted", 2)
 
 	frame := readOneFrame(t, ctx, conn)
 	require.Contains(t, string(frame), "did:plc:wanted")
@@ -1170,13 +1194,13 @@ func TestHandler_RequireHello_InvalidUpdateDisconnects(t *testing.T) {
 			t.Parallel()
 
 			st := newSteadyStateStore(t)
-			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 			require.NoError(t, err)
 
-			h := NewHandler(HandlerDeps{
-				Broadcaster: b,
-				Store:       st,
-				Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+			h := NewHandler(Subscription{
+				Tail:   b,
+				Store:  st,
+				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 			})
 			srv := httptest.NewServer(h)
 			defer srv.Close()
@@ -1225,13 +1249,13 @@ func TestHandler_RequireHello_FalseHasNoEffect(t *testing.T) {
 			t.Parallel()
 
 			st := newSteadyStateStore(t)
-			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 			require.NoError(t, err)
 
-			h := NewHandler(HandlerDeps{
-				Broadcaster: b,
-				Store:       st,
-				Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+			h := NewHandler(Subscription{
+				Tail:   b,
+				Store:  st,
+				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 			})
 			srv := httptest.NewServer(h)
 			defer srv.Close()
@@ -1252,7 +1276,8 @@ func TestHandler_RequireHello_FalseHasNoEffect(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 
 			// No hello sent. Publish and expect immediate delivery.
-			publishIdentity(t, b, "did:plc:no-hello-needed", 1)
+			var seq uint64
+			publishIdentity(t, b, &seq, "did:plc:no-hello-needed", 1)
 
 			frame := readOneFrame(t, ctx, conn)
 			require.Contains(t, string(frame), "did:plc:no-hello-needed")
@@ -1299,7 +1324,7 @@ func TestHandler_RequireHello_NoLeakOnClientDisconnect(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
 
 	// Wrap the real handler so we can observe ServeHTTP returning. That
@@ -1308,10 +1333,10 @@ func TestHandler_RequireHello_NoLeakOnClientDisconnect(t *testing.T) {
 	// We avoid runtime.NumGoroutine() because t.Parallel tests in the
 	// same binary spawn/retire goroutines independently and would race
 	// the global counter.
-	inner := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	inner := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	served := make(chan struct{})
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1352,13 +1377,13 @@ func TestHandler_RequireHello_MultipleUpdatesDoNotPanic(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
 
-	h := NewHandler(HandlerDeps{
-		Broadcaster: b,
-		Store:       st,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -1392,7 +1417,8 @@ func TestHandler_RequireHello_MultipleUpdatesDoNotPanic(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Confirm normal flow works after the chatty start.
-	publishIdentity(t, b, "did:plc:still-flowing", 1)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:still-flowing", 1)
 	frame := readOneFrame(t, ctx, conn)
 	require.Contains(t, string(frame), "did:plc:still-flowing")
 }
