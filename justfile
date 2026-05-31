@@ -33,7 +33,7 @@ run *ARGS:
 
 # Run jetstream with the race detector enabled.
 run-race *ARGS:
-    just run -race {{ARGS}}
+    go run -race ./cmd/jetstream {{ARGS}}
 
 # Run jetstream against real production services.
 run-prod *ARGS:
@@ -41,6 +41,13 @@ run-prod *ARGS:
     JETSTREAM_PLC_URL=https://plc.directory \
     JETSTREAM_DATA_DIR=./data-prod \
     go run ./cmd/jetstream {{ARGS}}
+
+# Run jetstream against real production services with the race detector enabled.
+run-prod-race *ARGS:
+    JETSTREAM_RELAY_URL=https://bsky.network \
+    JETSTREAM_PLC_URL=https://plc.directory \
+    JETSTREAM_DATA_DIR=./data-prod \
+    go run -race ./cmd/jetstream {{ARGS}}
 
 # Run the websocket load-test client against a running jetstream server.
 run-client *ARGS:
