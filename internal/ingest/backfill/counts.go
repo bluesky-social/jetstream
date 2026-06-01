@@ -1,6 +1,8 @@
 package backfill
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -9,10 +11,45 @@ import (
 
 // Counts is the per-status row count produced by CountStatuses.
 type Counts struct {
-	Total      uint64
-	Discovered uint64
-	Complete   uint64
-	Failed     uint64
+	Total      uint64 `json:"total"`
+	Discovered uint64 `json:"discovered"`
+	Complete   uint64 `json:"complete"`
+	Failed     uint64 `json:"failed"`
+}
+
+const countsKey = "backfill/counts"
+
+// LoadCounts reads a precomputed aggregate count. Missing counts are
+// expected for data dirs that have not been repaired or migrated to
+// include this optional operator-facing summary.
+func LoadCounts(s *store.Store) (Counts, bool, error) {
+	val, closer, err := s.Get([]byte(countsKey))
+	if errors.Is(err, store.ErrNotFound) {
+		return Counts{}, false, nil
+	}
+	if err != nil {
+		return Counts{}, false, fmt.Errorf("backfill: load counts: %w", err)
+	}
+	defer func() { _ = closer.Close() }()
+
+	var c Counts
+	if err := json.Unmarshal(val, &c); err != nil {
+		return Counts{}, false, fmt.Errorf("backfill: decode counts: %w", err)
+	}
+	return c, true, nil
+}
+
+// SaveCounts writes aggregate counts. It is exported for repair/migration
+// tools and tests; hot write paths deliberately do not maintain it.
+func SaveCounts(s *store.Store, c Counts) error {
+	enc, err := json.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("backfill: encode counts: %w", err)
+	}
+	if err := s.Set([]byte(countsKey), enc, store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: write counts: %w", err)
+	}
+	return nil
 }
 
 // CountStatuses range-scans the repo/ keyspace and tallies rows by

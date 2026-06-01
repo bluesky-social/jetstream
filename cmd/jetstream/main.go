@@ -275,7 +275,7 @@ func serveCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:    "cursor-block-index-cache-size",
-				Usage:   "Number of segments whose block indices stay resident in the manifest LRU.",
+				Usage:   "Deprecated compatibility no-op: sealed segment metadata is always resident in the manifest.",
 				Sources: cli.EnvVars("JETSTREAM_CURSOR_BLOCK_INDEX_CACHE_SIZE"),
 				Value:   32,
 			},

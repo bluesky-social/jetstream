@@ -264,8 +264,8 @@ func TestBlockIndex_LoadsAndCaches(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, blocks1, blocks2)
 
-	require.Equal(t, float64(1), readCounter(t, reg, "jetstream_manifest_block_index_cache_misses_total"))
-	require.Equal(t, float64(1), readCounter(t, reg, "jetstream_manifest_block_index_cache_hits_total"))
+	require.Equal(t, float64(0), readCounter(t, reg, "jetstream_manifest_block_index_cache_misses_total"))
+	require.Equal(t, float64(2), readCounter(t, reg, "jetstream_manifest_block_index_cache_hits_total"))
 }
 
 func TestBlockIndex_UnknownSegment(t *testing.T) {
@@ -275,7 +275,7 @@ func TestBlockIndex_UnknownSegment(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestBlockIndex_LRUEvictsLeastRecent(t *testing.T) {
+func TestBlockIndex_AllSegmentsStayResident(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	for i := range 5 {
@@ -303,13 +303,13 @@ func TestBlockIndex_LRUEvictsLeastRecent(t *testing.T) {
 		_, err := m.BlockIndex(idx)
 		require.NoError(t, err)
 	}
-	require.Equal(t, float64(3), readCounter(t, reg, "jetstream_manifest_block_index_cache_misses_total"))
-	require.Equal(t, float64(0), readCounter(t, reg, "jetstream_manifest_block_index_cache_hits_total"))
+	require.Equal(t, float64(3), readCounter(t, reg, "jetstream_manifest_block_index_cache_hits_total"))
 
 	_, err = m.BlockIndex(0)
 	require.NoError(t, err)
-	require.Equal(t, float64(4), readCounter(t, reg, "jetstream_manifest_block_index_cache_misses_total"),
-		"segment 0 was evicted; re-access must miss")
+	require.Equal(t, float64(0), readCounter(t, reg, "jetstream_manifest_block_index_cache_misses_total"))
+	require.Equal(t, float64(4), readCounter(t, reg, "jetstream_manifest_block_index_cache_hits_total"),
+		"segment 0 should remain resident even when BlockIndexCacheSize is small")
 }
 
 func readCounter(t *testing.T, reg *prometheus.Registry, name string) float64 {

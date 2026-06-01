@@ -3,6 +3,9 @@ package status_test
 import (
 	"context"
 	"encoding/binary"
+	"io"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -11,8 +14,10 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/status"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
@@ -248,6 +253,42 @@ func TestCollect_PebbleKeyspaces(t *testing.T) {
 	require.False(t, hasIdentity, "sync/identity/ must not be exposed")
 }
 
+func TestCollect_WithManifestSkipsRepoScan(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	segmentsDir := filepath.Join(dataDir, "segments")
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	require.NoError(t, makeSealedStatusSegment(filepath.Join(segmentsDir, "seg_0000000000.jss")))
+
+	mft, err := manifest.Open(manifest.Options{
+		SegmentsDir: segmentsDir,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, st.Set([]byte("repo/did:plc:corrupt"), []byte("not json"), store.SyncWrites))
+	require.NoError(t, backfill.SaveCounts(st, backfill.Counts{
+		Total: 10, Discovered: 3, Complete: 6, Failed: 1,
+	}))
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir, Manifest: mft})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, uint64(10), snap.Backfill.TotalDIDs)
+	require.Equal(t, uint64(6), snap.Backfill.Complete)
+	require.Equal(t, 1, snap.Segments.SealedCount)
+	require.Equal(t, uint64(2), snap.Segments.LatestSegment.EventCount)
+	require.Greater(t, snap.Segments.CompressedBytes, int64(0))
+	_, hasRepoCount := snap.Pebble.KeyspaceCounts["repo/"]
+	require.False(t, hasRepoCount, "manifest-backed status must not count Pebble keyspaces")
+}
+
 func TestCollect_CursorLookback_NoManifest(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
@@ -270,6 +311,30 @@ func TestCollect_CursorLookback_NoManifest(t *testing.T) {
 	require.Equal(t, 0, snap.CursorLookback.ManifestSegmentCount)
 	require.Equal(t, uint64(0), snap.CursorLookback.OldestRetainedSeq)
 	require.True(t, snap.CursorLookback.OldestRetainedAt.IsZero())
+}
+
+func makeSealedStatusSegment(path string) error {
+	w, err := segment.New(segment.Config{
+		Path:              path,
+		MaxEventsPerBlock: 2,
+	})
+	if err != nil {
+		return err
+	}
+	for i := range 2 {
+		if _, err := w.Append(segment.Event{
+			Seq:        uint64(i + 1),
+			Kind:       segment.KindCreate,
+			DID:        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+			IndexedAt:  1_700_000_000_000_000 + int64(i),
+			Collection: "app.bsky.feed.post",
+			Payload:    []byte("hello"),
+		}); err != nil {
+			return err
+		}
+	}
+	_, err = w.Seal()
+	return err
 }
 
 func TestCollect_CursorLookback_Disabled(t *testing.T) {

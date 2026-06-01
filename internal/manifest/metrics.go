@@ -11,8 +11,9 @@ const (
 // *Metrics is a valid zero-value: every reference is guarded by a nil
 // check at the call site, so tests can skip metric registration.
 //
-// Subsequent tasks add cache hit/miss counters and a load-seconds
-// histogram for the block-index LRU.
+// Block index cache metric names predate the all-resident manifest:
+// a "hit" now means the requested segment metadata was resident, and
+// a "miss" means the segment idx was unknown.
 type Metrics struct {
 	SegmentsLoaded             prometheus.Gauge
 	BlockIndexCacheHitsTotal   prometheus.Counter
@@ -33,17 +34,17 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		BlockIndexCacheHitsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "block_index_cache_hits_total",
-			Help: "Number of BlockIndex calls served from the LRU cache.",
+			Help: "Number of BlockIndex calls served from resident manifest metadata.",
 		}),
 		BlockIndexCacheMissesTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "block_index_cache_misses_total",
-			Help: "Number of BlockIndex calls that opened a segment.Reader to load.",
+			Help: "Number of BlockIndex calls for unknown segment indexes.",
 		}),
 		BlockIndexLoadSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name:    "block_index_load_seconds",
-			Help:    "Wall-clock duration to load one segment's block index from disk on a cache miss.",
+			Help:    "Wall-clock duration to load one sealed segment's resident metadata.",
 			Buckets: prometheus.ExponentialBuckets(0.0001, 4, 8),
 		}),
 	}

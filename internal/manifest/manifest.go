@@ -1,15 +1,20 @@
 package manifest
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/jcalabro/gloom"
+	"github.com/jcalabro/gt"
 )
 
 // SegmentBounds is the projection of segment.Header that the manifest
@@ -25,16 +30,60 @@ type SegmentBounds struct {
 	MaxIndexedAt int64
 }
 
+// SegmentMetadata is the immutable metadata manifest keeps resident for
+// every sealed segment. It intentionally excludes decoded event payloads
+// and the open file descriptor; callers that need block bodies still open
+// a segment.Reader for the short duration of the read.
+type SegmentMetadata struct {
+	SegmentBounds
+
+	FileSize int64
+	ModTime  time.Time
+	Header   segment.Header
+
+	Blocks                []segment.BlockInfo
+	SegmentBloom          *gloom.Filter
+	BlockBlooms           []*gloom.Filter
+	Collections           []string
+	CollectionEventCounts []uint32
+	BlockCollections      [][]uint32
+}
+
+// SegmentTreeStats is the manifest-owned aggregate view used by operator
+// surfaces such as /status. It is deliberately small and cheap to copy.
+type SegmentTreeStats struct {
+	Dir               string
+	SealedCount       int
+	CompressedBytes   int64
+	UncompressedBytes int64
+	OldestMTime       time.Time
+	NewestMTime       time.Time
+	LatestSegment     *SegmentSummary
+}
+
+// SegmentSummary is the latest-segment projection used by status surfaces.
+type SegmentSummary struct {
+	Index           uint64
+	EventCount      uint64
+	UniqueDIDCount  uint32
+	BlockCount      uint32
+	CollectionCount int
+	MinSeq          uint64
+	MaxSeq          uint64
+	MinIndexedAt    int64
+	MaxIndexedAt    int64
+	SizeBytes       int64
+}
+
 // Options configures Open. SegmentsDir is required; the rest have
 // safe zero-value defaults.
 type Options struct {
 	// SegmentsDir is the directory holding seg_*.jss files. Required.
 	SegmentsDir string
 
-	// BlockIndexCacheSize is the LRU capacity for per-segment block
-	// indices. 0 disables caching (every BlockIndex call hits disk).
-	// Used only by the BlockIndex method (added in a later task);
-	// harmless before then.
+	// BlockIndexCacheSize is retained for flag compatibility. Block
+	// indices are now always loaded into the manifest at startup and on
+	// segment seal.
 	BlockIndexCacheSize int
 
 	// Logger is required.
@@ -45,17 +94,12 @@ type Options struct {
 }
 
 // Manifest is the in-memory authoritative view of every sealed segment
-// in SegmentsDir, plus a lazy block-index LRU.
+// in SegmentsDir.
 type Manifest struct {
 	opts Options
 
-	mu     sync.RWMutex
-	bounds []SegmentBounds // sorted by Idx ascending
-
-	// Block-index LRU lives on the struct so the field is type-stable
-	// across tasks even though it stays unused until the LRU task.
-	blockIdxLRUMu sync.Mutex
-	blockIdxLRU   *blockIndexLRU // nil until the LRU task wires it up
+	mu       sync.RWMutex
+	segments []SegmentMetadata // sorted by Idx ascending
 }
 
 // Open scans dir, parses every sealed seg_*.jss file's fixed header,
@@ -77,46 +121,80 @@ func Open(opts Options) (*Manifest, error) {
 	}
 
 	m := &Manifest{
-		opts:   opts,
-		bounds: make([]SegmentBounds, 0, len(files)),
+		opts:     opts,
+		segments: make([]SegmentMetadata, 0, len(files)),
 	}
 
-	for _, f := range files {
-		bounds, ok, err := readSealedBounds(f.Idx, f.Path)
-		if err != nil {
-			return nil, fmt.Errorf("manifest: read segment %s: %w", f.Path, err)
-		}
-		if !ok {
-			continue
-		}
-		m.bounds = append(m.bounds, bounds)
+	loadConcurrency := manifestLoadConcurrency()
+	loaded, err := loadSealedMetadata(files, loadConcurrency, opts.Metrics)
+	if err != nil {
+		return nil, err
 	}
+	m.segments = loaded
 
 	// Defensive: ingest.SegmentFiles already sorts ascending by Idx, but
 	// guard the invariant the rest of this package depends on.
-	sort.Slice(m.bounds, func(i, j int) bool {
-		return m.bounds[i].Idx < m.bounds[j].Idx
+	sort.Slice(m.segments, func(i, j int) bool {
+		return m.segments[i].Idx < m.segments[j].Idx
 	})
 
-	if opts.BlockIndexCacheSize > 0 {
-		m.blockIdxLRU = newBlockIndexLRU(opts.BlockIndexCacheSize)
-	}
-
 	if opts.Metrics != nil {
-		opts.Metrics.SegmentsLoaded.Set(float64(len(m.bounds)))
+		opts.Metrics.SegmentsLoaded.Set(float64(len(m.segments)))
 	}
 	logger.Info("opened",
 		"segments_dir", opts.SegmentsDir,
-		"sealed_segments", len(m.bounds),
+		"sealed_segments", len(m.segments),
+		"load_concurrency", loadConcurrency,
 	)
 	return m, nil
+}
+
+func manifestLoadConcurrency() int {
+	n := runtime.GOMAXPROCS(0)
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+type metadataLoadResult struct {
+	meta   SegmentMetadata
+	sealed bool
+}
+
+func loadSealedMetadata(files []ingest.SegmentFile, concurrency int, metrics *Metrics) ([]SegmentMetadata, error) {
+	results, err := gt.ConcurrentN(context.Background(), files, concurrency, func(f ingest.SegmentFile) (metadataLoadResult, error) {
+		start := time.Now()
+		meta, ok, err := readSealedMetadata(f.Idx, f.Path)
+		if err != nil {
+			return metadataLoadResult{}, fmt.Errorf("manifest: read segment %s: %w", f.Path, err)
+		}
+		if !ok {
+			return metadataLoadResult{}, nil
+		}
+		if metrics != nil {
+			metrics.BlockIndexLoadSeconds.Observe(time.Since(start).Seconds())
+		}
+		return metadataLoadResult{meta: meta, sealed: true}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]SegmentMetadata, 0, len(files))
+	for _, result := range results {
+		if result.sealed {
+			out = append(out, result.meta)
+		}
+	}
+	return out, nil
 }
 
 // SegmentCount returns the number of sealed segments tracked.
 func (m *Manifest) SegmentCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return len(m.bounds)
+	return len(m.segments)
 }
 
 // AllBounds returns a fresh copy of the bounds slice. Useful for tests
@@ -124,33 +202,105 @@ func (m *Manifest) SegmentCount() int {
 func (m *Manifest) AllBounds() []SegmentBounds {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	out := make([]SegmentBounds, len(m.bounds))
-	copy(out, m.bounds)
+	out := make([]SegmentBounds, len(m.segments))
+	for i := range m.segments {
+		out[i] = m.segments[i].SegmentBounds
+	}
 	return out
 }
 
-// readSealedBounds opens path with the segment Reader. The bool is
+// SegmentStats returns the in-memory aggregate view of all sealed segments.
+func (m *Manifest) SegmentStats() SegmentTreeStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	stats := SegmentTreeStats{Dir: m.opts.SegmentsDir, SealedCount: len(m.segments)}
+	if len(m.segments) == 0 {
+		return stats
+	}
+	stats.OldestMTime = m.segments[0].ModTime
+	stats.NewestMTime = m.segments[0].ModTime
+	for i := range m.segments {
+		meta := &m.segments[i]
+		stats.CompressedBytes += meta.FileSize
+		for _, b := range meta.Blocks {
+			stats.UncompressedBytes += int64(b.UncompressedSize)
+		}
+		if meta.ModTime.Before(stats.OldestMTime) {
+			stats.OldestMTime = meta.ModTime
+		}
+		if meta.ModTime.After(stats.NewestMTime) {
+			stats.NewestMTime = meta.ModTime
+		}
+	}
+
+	latest := &m.segments[len(m.segments)-1]
+	stats.LatestSegment = &SegmentSummary{
+		Index:           latest.Idx,
+		EventCount:      uint64(latest.Header.EventCount),
+		UniqueDIDCount:  latest.Header.UniqueDIDCount,
+		BlockCount:      uint32(len(latest.Blocks)),
+		CollectionCount: len(latest.Collections),
+		MinSeq:          latest.Header.MinSeq,
+		MaxSeq:          latest.Header.MaxSeq,
+		MinIndexedAt:    latest.Header.MinIndexedAt,
+		MaxIndexedAt:    latest.Header.MaxIndexedAt,
+		SizeBytes:       latest.FileSize,
+	}
+	return stats
+}
+
+// readSealedMetadata opens path with the segment Reader. The bool is
 // false (with nil error) iff the file is an active (unsealed) segment.
-func readSealedBounds(idx uint64, path string) (SegmentBounds, bool, error) {
+func readSealedMetadata(idx uint64, path string) (SegmentMetadata, bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return SegmentMetadata{}, false, fmt.Errorf("stat: %w", err)
+	}
 	// SkipChecksum=true at startup keeps cost bounded; operators who
 	// want full integrity checks run the inspect-segment command.
 	r, err := segment.Open(segment.ReaderConfig{Path: path, SkipChecksum: true})
 	if err != nil {
 		if isActiveSegmentSentinel(err) {
-			return SegmentBounds{}, false, nil
+			return SegmentMetadata{}, false, nil
 		}
-		return SegmentBounds{}, false, err
+		return SegmentMetadata{}, false, err
 	}
 	defer func() { _ = r.Close() }()
 
 	h := r.Header()
-	return SegmentBounds{
-		Idx:          idx,
-		Path:         path,
-		MinSeq:       h.MinSeq,
-		MaxSeq:       h.MaxSeq,
-		MinIndexedAt: h.MinIndexedAt,
-		MaxIndexedAt: h.MaxIndexedAt,
+	blocks := r.Blocks()
+	blockCollections := make([][]uint32, len(blocks))
+	for i := range blocks {
+		ids, err := r.BlockCollections(i)
+		if err != nil {
+			return SegmentMetadata{}, false, err
+		}
+		blockCollections[i] = ids
+	}
+	blockBlooms, err := r.LoadAllBlockBlooms()
+	if err != nil {
+		return SegmentMetadata{}, false, err
+	}
+
+	return SegmentMetadata{
+		SegmentBounds: SegmentBounds{
+			Idx:          idx,
+			Path:         path,
+			MinSeq:       h.MinSeq,
+			MaxSeq:       h.MaxSeq,
+			MinIndexedAt: h.MinIndexedAt,
+			MaxIndexedAt: h.MaxIndexedAt,
+		},
+		FileSize:              info.Size(),
+		ModTime:               info.ModTime(),
+		Header:                h,
+		Blocks:                blocks,
+		SegmentBloom:          r.SegmentBloom(),
+		BlockBlooms:           blockBlooms,
+		Collections:           r.Collections(),
+		CollectionEventCounts: r.CollectionEventCounts(),
+		BlockCollections:      blockCollections,
 	}, true, nil
 }
 
@@ -173,22 +323,22 @@ func isActiveSegmentSentinel(err error) bool {
 func (m *Manifest) SegmentForSeq(seq uint64) (SegmentBounds, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if len(m.bounds) == 0 {
+	if len(m.segments) == 0 {
 		return SegmentBounds{}, false
 	}
-	i := sort.Search(len(m.bounds), func(i int) bool {
-		return m.bounds[i].MaxSeq >= seq
+	i := sort.Search(len(m.segments), func(i int) bool {
+		return m.segments[i].MaxSeq >= seq
 	})
-	if i == len(m.bounds) {
+	if i == len(m.segments) {
 		return SegmentBounds{}, false
 	}
-	if seq < m.bounds[i].MinSeq {
+	if seq < m.segments[i].MinSeq {
 		// Pathological: gap between segments. Should not happen in
 		// practice (seq is contiguous across rotations) but we don't
 		// silently lie about coverage.
 		return SegmentBounds{}, false
 	}
-	return m.bounds[i], true
+	return m.segments[i].SegmentBounds, true
 }
 
 // SegmentForTimeUS returns the smallest sealed segment whose
@@ -204,16 +354,16 @@ func (m *Manifest) SegmentForSeq(seq uint64) (SegmentBounds, bool) {
 func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if len(m.bounds) == 0 {
+	if len(m.segments) == 0 {
 		return SegmentBounds{}, false
 	}
-	i := sort.Search(len(m.bounds), func(i int) bool {
-		return m.bounds[i].MaxIndexedAt >= timeUS
+	i := sort.Search(len(m.segments), func(i int) bool {
+		return m.segments[i].MaxIndexedAt >= timeUS
 	})
-	if i == len(m.bounds) {
+	if i == len(m.segments) {
 		return SegmentBounds{}, false
 	}
-	return m.bounds[i], true
+	return m.segments[i].SegmentBounds, true
 }
 
 // LookbackFloor returns the (seq, time_us) of the oldest event still
@@ -232,31 +382,29 @@ func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
 func (m *Manifest) LookbackFloor(lookback time.Duration) (uint64, int64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if len(m.bounds) == 0 {
+	if len(m.segments) == 0 {
 		return 0, 0
 	}
 	floorTimeUS := time.Now().UnixMicro() - lookback.Microseconds()
-	i := sort.Search(len(m.bounds), func(i int) bool {
-		return m.bounds[i].MaxIndexedAt >= floorTimeUS
+	i := sort.Search(len(m.segments), func(i int) bool {
+		return m.segments[i].MaxIndexedAt >= floorTimeUS
 	})
-	if i == len(m.bounds) {
+	if i == len(m.segments) {
 		// All segments are older than the floor; clamp to the freshest
 		// segment's MinSeq (lookback is shorter than retention skew).
-		last := m.bounds[len(m.bounds)-1]
+		last := m.segments[len(m.segments)-1]
 		return last.MinSeq, last.MinIndexedAt
 	}
-	return m.bounds[i].MinSeq, m.bounds[i].MinIndexedAt
+	return m.segments[i].MinSeq, m.segments[i].MinIndexedAt
 }
 
 // OnSegmentSealed publishes a freshly-sealed segment into the manifest.
 // Wired through internal/ingest.Writer.Config.OnAfterSeal. Re-publishing
 // an existing idx replaces the entry in place (idempotent for repeated
 // callbacks; the on-disk state is authoritative).
-//
-// Reads the segment's fixed header to extract bounds — one pread on
-// the metadata region, not a full file scan.
 func (m *Manifest) OnSegmentSealed(idx uint64, path string) error {
-	bounds, ok, err := readSealedBounds(idx, path)
+	start := time.Now()
+	meta, ok, err := readSealedMetadata(idx, path)
 	if err != nil {
 		return fmt.Errorf("manifest: on_segment_sealed: %w", err)
 	}
@@ -267,151 +415,89 @@ func (m *Manifest) OnSegmentSealed(idx uint64, path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	i := sort.Search(len(m.bounds), func(i int) bool {
-		return m.bounds[i].Idx >= idx
+	i := sort.Search(len(m.segments), func(i int) bool {
+		return m.segments[i].Idx >= idx
 	})
 	switch {
-	case i < len(m.bounds) && m.bounds[i].Idx == idx:
-		m.bounds[i] = bounds
-	case i == len(m.bounds):
-		m.bounds = append(m.bounds, bounds)
+	case i < len(m.segments) && m.segments[i].Idx == idx:
+		m.segments[i] = meta
+	case i == len(m.segments):
+		m.segments = append(m.segments, meta)
 	default:
-		m.bounds = append(m.bounds, SegmentBounds{})
-		copy(m.bounds[i+1:], m.bounds[i:])
-		m.bounds[i] = bounds
+		m.segments = append(m.segments, SegmentMetadata{})
+		copy(m.segments[i+1:], m.segments[i:])
+		m.segments[i] = meta
 	}
 
 	if m.opts.Metrics != nil {
-		m.opts.Metrics.SegmentsLoaded.Set(float64(len(m.bounds)))
+		m.opts.Metrics.SegmentsLoaded.Set(float64(len(m.segments)))
+		m.opts.Metrics.BlockIndexLoadSeconds.Observe(time.Since(start).Seconds())
 	}
 	return nil
 }
 
-// blockIndexLRU is a small bounded LRU of segment.BlockInfo slices,
-// keyed by segment idx. Capacity is set at construction; on overflow,
-// the least-recently-used entry is evicted.
-//
-// We hand-roll rather than pulling in golang-lru: the surface area
-// is tiny (Get/Put), our hot path needs no extra allocations beyond
-// the underlying slice itself, and an external dep would be the only
-// non-stdlib import in this package.
-type blockIndexLRU struct {
-	cap   int
-	order []uint64 // most-recent at the back
-	data  map[uint64][]segment.BlockInfo
-}
-
-func newBlockIndexLRU(capacity int) *blockIndexLRU {
-	return &blockIndexLRU{
-		cap:   capacity,
-		order: make([]uint64, 0, capacity),
-		data:  make(map[uint64][]segment.BlockInfo, capacity),
-	}
-}
-
-func (l *blockIndexLRU) Get(idx uint64) ([]segment.BlockInfo, bool) {
-	v, ok := l.data[idx]
-	if !ok {
-		return nil, false
-	}
-	l.touch(idx)
-	return v, true
-}
-
-func (l *blockIndexLRU) Put(idx uint64, blocks []segment.BlockInfo) {
-	if _, ok := l.data[idx]; ok {
-		l.data[idx] = blocks
-		l.touch(idx)
-		return
-	}
-	if len(l.order) >= l.cap {
-		evicted := l.order[0]
-		l.order = l.order[1:]
-		delete(l.data, evicted)
-	}
-	l.order = append(l.order, idx)
-	l.data[idx] = blocks
-}
-
-// touch moves idx to the back of the order slice (most recent).
-// Caller must guarantee idx is in l.data.
-func (l *blockIndexLRU) touch(idx uint64) {
-	for i, v := range l.order {
-		if v == idx {
-			l.order = append(l.order[:i], l.order[i+1:]...)
-			l.order = append(l.order, idx)
-			return
-		}
-	}
-}
-
-// BlockIndex returns the cached []BlockInfo for segment idx, loading
-// it via segment.Open on cache miss. Returns an error if idx is not
-// a known segment, or if the segment file fails to open.
+// BlockIndex returns the resident []BlockInfo for segment idx.
 //
 // The returned slice is shared across callers; treat it as read-only.
 func (m *Manifest) BlockIndex(idx uint64) ([]segment.BlockInfo, error) {
 	m.mu.RLock()
-	var path string
-	var found bool
-	for _, b := range m.bounds {
-		if b.Idx == idx {
-			path = b.Path
-			found = true
-			break
+	defer m.mu.RUnlock()
+	for i := range m.segments {
+		if m.segments[i].Idx == idx {
+			if m.opts.Metrics != nil {
+				m.opts.Metrics.BlockIndexCacheHitsTotal.Inc()
+			}
+			return m.segments[i].Blocks, nil
 		}
 	}
-	m.mu.RUnlock()
-	if !found {
-		return nil, fmt.Errorf("manifest: unknown segment idx %d", idx)
-	}
-
-	m.blockIdxLRUMu.Lock()
-	defer m.blockIdxLRUMu.Unlock()
-
-	if m.blockIdxLRU == nil {
-		// Cache disabled (BlockIndexCacheSize <= 0). Load from disk
-		// and return without storing.
-		blocks, err := loadBlockIndex(path)
-		if err != nil {
-			return nil, err
-		}
-		if m.opts.Metrics != nil {
-			m.opts.Metrics.BlockIndexCacheMissesTotal.Inc()
-		}
-		return blocks, nil
-	}
-
-	if cached, ok := m.blockIdxLRU.Get(idx); ok {
-		if m.opts.Metrics != nil {
-			m.opts.Metrics.BlockIndexCacheHitsTotal.Inc()
-		}
-		return cached, nil
-	}
-
 	if m.opts.Metrics != nil {
 		m.opts.Metrics.BlockIndexCacheMissesTotal.Inc()
 	}
-	start := time.Now()
-	blocks, err := loadBlockIndex(path)
-	if err != nil {
-		return nil, err
-	}
-	if m.opts.Metrics != nil {
-		m.opts.Metrics.BlockIndexLoadSeconds.Observe(time.Since(start).Seconds())
-	}
-	m.blockIdxLRU.Put(idx, blocks)
-	return blocks, nil
+	return nil, fmt.Errorf("manifest: unknown segment idx %d", idx)
 }
 
-// loadBlockIndex opens path with segment.Open and returns its block
-// index. SkipChecksum=true keeps the per-load cost bounded; the
-// startup pass already validated structural integrity.
-func loadBlockIndex(path string) ([]segment.BlockInfo, error) {
-	r, err := segment.Open(segment.ReaderConfig{Path: path, SkipChecksum: true})
-	if err != nil {
-		return nil, fmt.Errorf("manifest: open %s: %w", path, err)
+// SegmentBloom returns the resident segment-level DID bloom for segment idx.
+func (m *Manifest) SegmentBloom(idx uint64) (*gloom.Filter, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for i := range m.segments {
+		if m.segments[i].Idx == idx {
+			return m.segments[i].SegmentBloom, nil
+		}
 	}
-	defer func() { _ = r.Close() }()
-	return r.Blocks(), nil
+	return nil, fmt.Errorf("manifest: unknown segment idx %d", idx)
+}
+
+// BlockBloom returns the resident per-block DID bloom for segment idx/block idx.
+// The returned filter is shared across callers; treat it as read-only.
+func (m *Manifest) BlockBloom(segIdx uint64, blockIdx int) (*gloom.Filter, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for i := range m.segments {
+		if m.segments[i].Idx != segIdx {
+			continue
+		}
+		if blockIdx < 0 || blockIdx >= len(m.segments[i].BlockBlooms) {
+			return nil, fmt.Errorf("manifest: segment %d block %d out of range", segIdx, blockIdx)
+		}
+		return m.segments[i].BlockBlooms[blockIdx], nil
+	}
+	return nil, fmt.Errorf("manifest: unknown segment idx %d", segIdx)
+}
+
+// BlockCollections returns the resident per-block collection ids for segment idx/block idx.
+// The returned slice is shared across callers; treat it as read-only.
+func (m *Manifest) BlockCollections(segIdx uint64, blockIdx int) ([]uint32, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for i := range m.segments {
+		if m.segments[i].Idx != segIdx {
+			continue
+		}
+		if blockIdx < 0 || blockIdx >= len(m.segments[i].BlockCollections) {
+			return nil, fmt.Errorf("manifest: segment %d block %d out of range", segIdx, blockIdx)
+		}
+		return m.segments[i].BlockCollections[blockIdx], nil
+	}
+	return nil, fmt.Errorf("manifest: unknown segment idx %d", segIdx)
 }

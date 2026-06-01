@@ -15,6 +15,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
 	"github.com/bluesky-social/jetstream-v2/segment"
@@ -96,6 +97,59 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 		PercentComplete: pct,
 		ListReposCursor: cursor,
 	}, nil
+}
+
+func collectBackfillFast(s *store.Store) (BackfillStats, error) {
+	cursor, err := backfill.LoadListReposCursor(s)
+	if err != nil {
+		return BackfillStats{}, err
+	}
+	// Exact counts require scanning every repo/<did> row. On production
+	// instances /status uses only the optional precomputed aggregate so
+	// cache refreshes stay cheap; missing aggregates render as zeros.
+	counts, ok, err := backfill.LoadCounts(s)
+	if err != nil {
+		return BackfillStats{}, err
+	}
+	pct := 0.0
+	if ok && counts.Total > 0 {
+		pct = float64(counts.Complete) / float64(counts.Total) * 100
+	}
+	return BackfillStats{
+		TotalDIDs:       counts.Total,
+		Discovered:      counts.Discovered,
+		Complete:        counts.Complete,
+		Failed:          counts.Failed,
+		PercentComplete: pct,
+		ListReposCursor: cursor,
+	}, nil
+}
+
+func collectManifestSegmentTree(ms manifest.SegmentTreeStats) SegmentTreeStats {
+	stats := SegmentTreeStats{
+		Dir:               ms.Dir,
+		SealedCount:       ms.SealedCount,
+		CompressedBytes:   ms.CompressedBytes,
+		UncompressedBytes: ms.UncompressedBytes,
+		OldestMTime:       ms.OldestMTime,
+		NewestMTime:       ms.NewestMTime,
+	}
+	if ms.LatestSegment != nil {
+		stats.LatestSegment = &SegmentSummary{
+			Index:           ms.LatestSegment.Index,
+			Sealed:          true,
+			EventCount:      ms.LatestSegment.EventCount,
+			UniqueDIDCount:  ms.LatestSegment.UniqueDIDCount,
+			BlockCount:      ms.LatestSegment.BlockCount,
+			CollectionCount: ms.LatestSegment.CollectionCount,
+			MinSeq:          ms.LatestSegment.MinSeq,
+			MaxSeq:          ms.LatestSegment.MaxSeq,
+			MinIndexedAt:    microsToTime(ms.LatestSegment.MinIndexedAt),
+			MaxIndexedAt:    microsToTime(ms.LatestSegment.MaxIndexedAt),
+			SizeBytes:       ms.LatestSegment.SizeBytes,
+		}
+	}
+	return stats
 }
 
 func collectSegmentTree(dir string) (SegmentTreeStats, error) {
@@ -241,6 +295,10 @@ func collectPebble(s *store.Store, dataDir string) (PebbleStats, error) {
 	return stats, nil
 }
 
+func collectPebbleFast() PebbleStats {
+	return PebbleStats{KeyspaceCounts: make(map[string]uint64, len(keyspacePrefixes))}
+}
+
 func countKeysWithPrefix(s *store.Store, prefix string) (uint64, error) {
 	lower := []byte(prefix)
 	upper := store.PrefixUpperBound(lower)
@@ -286,24 +344,37 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		return nil, err
 	}
 
-	bf, err := collectBackfill(opts.Store)
-	if err != nil {
-		return nil, err
-	}
-
-	segs, err := collectSegmentTree(filepath.Join(opts.DataDir, "segments"))
-	if err != nil {
-		return nil, err
-	}
-
-	livesegs, err := collectSegmentTree(filepath.Join(opts.DataDir, "backfill", "live_segments"))
-	if err != nil {
-		return nil, err
-	}
-
-	pdb, err := collectPebble(opts.Store, opts.DataDir)
-	if err != nil {
-		return nil, err
+	var (
+		bf       BackfillStats
+		segs     SegmentTreeStats
+		livesegs SegmentTreeStats
+		pdb      PebbleStats
+	)
+	if opts.Manifest != nil {
+		bf, err = collectBackfillFast(opts.Store)
+		if err != nil {
+			return nil, err
+		}
+		segs = collectManifestSegmentTree(opts.Manifest.SegmentStats())
+		livesegs = SegmentTreeStats{Dir: filepath.Join(opts.DataDir, "backfill", "live_segments")}
+		pdb = collectPebbleFast()
+	} else {
+		bf, err = collectBackfill(opts.Store)
+		if err != nil {
+			return nil, err
+		}
+		segs, err = collectSegmentTree(filepath.Join(opts.DataDir, "segments"))
+		if err != nil {
+			return nil, err
+		}
+		livesegs, err = collectSegmentTree(filepath.Join(opts.DataDir, "backfill", "live_segments"))
+		if err != nil {
+			return nil, err
+		}
+		pdb, err = collectPebble(opts.Store, opts.DataDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	snap := &Snapshot{
