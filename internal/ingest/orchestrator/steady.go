@@ -50,6 +50,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			Verifier:       o.cfg.Verifier,
 			SegmentMetrics: o.cfg.SegmentMetrics,
 			OnEvent:        o.cfg.OnEvent,
+			OnAfterSeal:    o.cfg.IngestOnAfterSeal,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)
@@ -59,6 +60,10 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 				o.logger.ErrorContext(ctx, "close steady-state live consumer", "err", cerr)
 			}
 		}()
+
+		if o.cfg.OnSteadyStateWriter != nil {
+			o.cfg.OnSteadyStateWriter(c.Writer())
+		}
 
 		o.logger.InfoContext(ctx, "steady-state consumer running")
 

@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -727,4 +728,108 @@ func TestWriterBlocks_NilAfterSeal(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Nil(t, w.Blocks())
+}
+
+func TestWriter_SnapshotPending_Empty(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	w, err := New(Config{
+		Path:              filepath.Join(dir, "seg.jss"),
+		MaxEventsPerBlock: 4096,
+	})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	got := w.SnapshotPending()
+	require.Empty(t, got)
+}
+
+func TestWriter_SnapshotPending_ReturnsAllPending(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	w, err := New(Config{
+		Path:              filepath.Join(dir, "seg.jss"),
+		MaxEventsPerBlock: 4096,
+	})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	events := []Event{
+		{Seq: 1, IndexedAt: 1000, RenderedAt: 9001, Kind: KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "abc", Rev: "rev1", Payload: []byte{0xa1, 0x61, 0x78, 0x01}},
+		{Seq: 2, IndexedAt: 2000, RenderedAt: 9002, Kind: KindUpdate, DID: "did:plc:b", Collection: "app.bsky.feed.like", Rkey: "def", Rev: "rev2", Payload: []byte{0xa1, 0x61, 0x79, 0x02}},
+	}
+	for _, ev := range events {
+		full, err := w.Append(ev)
+		require.NoError(t, err)
+		require.False(t, full)
+	}
+
+	got := w.SnapshotPending()
+	require.Len(t, got, 2)
+	for i, ev := range events {
+		require.Equal(t, ev.Seq, got[i].Seq)
+		require.Equal(t, ev.IndexedAt, got[i].IndexedAt)
+		require.Equal(t, ev.RenderedAt, got[i].RenderedAt)
+		require.Equal(t, ev.Kind, got[i].Kind)
+		require.Equal(t, ev.DID, got[i].DID)
+		require.Equal(t, ev.Collection, got[i].Collection)
+		require.Equal(t, ev.Rkey, got[i].Rkey)
+		require.Equal(t, ev.Rev, got[i].Rev)
+		require.Equal(t, ev.Payload, got[i].Payload)
+	}
+}
+
+func TestWriter_SnapshotPending_AfterFlushIsEmpty(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	w, err := New(Config{
+		Path:              filepath.Join(dir, "seg.jss"),
+		MaxEventsPerBlock: 4096,
+	})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	_, err = w.Append(Event{Seq: 1, IndexedAt: 1, Kind: KindCreate, DID: "did:plc:a", Payload: []byte{0xa0}})
+	require.NoError(t, err)
+
+	require.NoError(t, w.Flush())
+	require.Empty(t, w.SnapshotPending())
+}
+
+func TestWriter_SnapshotPending_PayloadIsSafeAgainstFurtherAppend(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	w, err := New(Config{
+		Path: filepath.Join(dir, "seg.jss"),
+		// Small block cap forces the writer's payloads buffer to its
+		// initial low capacity (16 * 512 = 8KB), so the 14 × 1KB appends
+		// below DO trigger multiple growth events. Without this, a default
+		// MaxEventsPerBlock=4096 preallocates ~2MB and the appends fit
+		// without ever resizing — making the safety check a false positive.
+		MaxEventsPerBlock: 16,
+	})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	original := []byte{0xa1, 0x61, 0x78, 0xff}
+	_, err = w.Append(Event{Seq: 1, IndexedAt: 1, Kind: KindCreate, DID: "did:plc:a", Payload: original})
+	require.NoError(t, err)
+
+	got := w.SnapshotPending()
+	require.Len(t, got, 1)
+	snapshotPayload := got[0].Payload
+
+	// 14 more 1KB-payload appends after the snapshot. With initial
+	// payload capacity of 8KB (16 events × 512 bytes), this forces the
+	// payloads buffer to grow at least once. Stay under MaxEventsPerBlock
+	// (16 with our seq=1 baseline) so we don't trigger a flush mid-test.
+	for i := 2; i <= 15; i++ {
+		_, err := w.Append(Event{
+			Seq: uint64(i), IndexedAt: int64(i), Kind: KindCreate,
+			DID: "did:plc:a", Payload: bytes.Repeat([]byte{0xff}, 1024),
+		})
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, original, snapshotPayload, "snapshot must not be aliased into the writer's growing buffer")
 }

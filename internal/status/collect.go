@@ -197,7 +197,7 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		return nil, err
 	}
 
-	return &Snapshot{
+	snap := &Snapshot{
 		GeneratedAt:      now,
 		Process:          collectProcess(now, startedAt),
 		Phase:            phase,
@@ -205,5 +205,17 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		Live:             liveStats,
 		SegmentAggregate: agg,
 		Pebble:           pdb,
-	}, nil
+	}
+
+	snap.CursorLookback.ConfiguredLookback = opts.CursorLookback
+	if opts.Manifest != nil && opts.CursorLookback > 0 {
+		snap.CursorLookback.ManifestSegmentCount = opts.Manifest.SegmentCount()
+		seq, ts := opts.Manifest.LookbackFloor(opts.CursorLookback)
+		snap.CursorLookback.OldestRetainedSeq = seq
+		if ts != 0 {
+			snap.CursorLookback.OldestRetainedAt = time.UnixMicro(ts)
+		}
+	}
+
+	return snap, nil
 }

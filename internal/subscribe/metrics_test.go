@@ -17,12 +17,9 @@ func TestNewMetrics_RegistersAllSeries(t *testing.T) {
 	m.incSubscribers()
 	m.decSubscribers()
 	m.incCleanDisconnects()
-	m.incSlowDrops()
-	m.incEventsPublished()
 	m.incEventsSent()
 	m.incEventsSkippedSync()
 	m.incEncodeErrors()
-	m.observeQueueDepth(42)
 	m.incEventsFiltered()
 	m.incEventsOversize()
 	m.incOptionsUpdates()
@@ -30,6 +27,15 @@ func TestNewMetrics_RegistersAllSeries(t *testing.T) {
 	m.incOptionsUpdateError(optionsUpdateErrorReasonBadEnvelopeJSON)
 	m.incOptionsUpdateError(optionsUpdateErrorReasonBadPayloadJSON)
 	m.incOptionsUpdateError(optionsUpdateErrorReasonInvalidOptions)
+
+	m.incCursorRequests("live")
+	m.observeCursorResolveSeconds(0.001)
+
+	m.incEventsAppended()
+	m.incHotReads()
+	m.incColdReads()
+	m.incAdversarialDrops()
+	m.setHotRingBytes(4096)
 }
 
 func TestMetrics_NilReceiverIsNoop(t *testing.T) {
@@ -40,14 +46,33 @@ func TestMetrics_NilReceiverIsNoop(t *testing.T) {
 	m.incSubscribers()
 	m.decSubscribers()
 	m.incCleanDisconnects()
-	m.incSlowDrops()
-	m.incEventsPublished()
 	m.incEventsSent()
 	m.incEventsSkippedSync()
 	m.incEncodeErrors()
-	m.observeQueueDepth(7)
 	m.incEventsFiltered()
 	m.incEventsOversize()
 	m.incOptionsUpdates()
 	m.incOptionsUpdateError(optionsUpdateErrorReasonOversize)
+
+	m.incCursorRequests("live")
+	m.observeCursorResolveSeconds(0.001)
+
+	m.incEventsAppended()
+	m.incHotReads()
+	m.incColdReads()
+	m.incAdversarialDrops()
+	m.setHotRingBytes(7)
+}
+
+func TestMetrics_PullSeriesRegistered(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := NewMetrics(reg)
+	require.NotNil(t, m.CursorRequests)
+	require.NotNil(t, m.CursorResolveSeconds)
+	require.NotNil(t, m.EventsAppended)
+	require.NotNil(t, m.HotReads)
+	require.NotNil(t, m.ColdReads)
+	require.NotNil(t, m.AdversarialDrops)
+	require.NotNil(t, m.HotRingBytes)
 }

@@ -267,6 +267,18 @@ func TestConsumer_Run_HappyPath(t *testing.T) {
 	st := newTestStore(t)
 	dir := filepath.Join(t.TempDir(), "live_segments")
 
+	// Count durable appends via OnEvent so we can gate on ALL upstream
+	// events landing — not just the highest seq. Under atmos's default
+	// Parallelism>1, events are delivered in verification-completion
+	// order, so the highest seq can finish (bumping LastUpstreamSeq)
+	// while a lower seq on another DID is still in-flight. On ctx-cancel
+	// atmos flushes only the current batch and returns WITHOUT draining
+	// in-flight work, so gating on LastUpstreamSeq let us cancel before
+	// a trailing event was appended, dropping it from the segment and
+	// flaking the readback below. Gating on the delivered count instead
+	// guarantees every event is durable before we cancel.
+	var delivered atomic.Int64
+
 	c, err := Open(Config{
 		SegmentsDir:       dir,
 		Store:             st,
@@ -276,6 +288,7 @@ func TestConsumer_Run_HappyPath(t *testing.T) {
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Verifier:          newTestVerifier(t),
 		MaxEventsPerBlock: 2, // force a block flush after every 2 events
+		OnEvent:           func(*segment.Event) { delivered.Add(1) },
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
@@ -286,15 +299,15 @@ func TestConsumer_Run_HappyPath(t *testing.T) {
 	runErr := make(chan error, 1)
 	go func() { runErr <- c.Run(ctx) }()
 
-	// Wait for processBatch to have witnessed the last upstream
-	// seq. Under atmos's default Parallelism>1 the per-event
-	// lastUpstream is in completion order rather than seq order,
-	// but the max-tracking in processBatch still ends up at the
-	// highest seq once the firehose has been fully drained.
+	// Gate on every upstream event being durably appended. This both
+	// fixes the cross-DID interleave race described above AND ensures
+	// the cursor watermark has settled before we read it: once all
+	// events are delivered, atmos's inflight set is empty so the
+	// cursor reflects its final value.
 	lastSeq := upstream[len(upstream)-1].seq
 	require.Eventually(t, func() bool {
-		return c.LastUpstreamSeq() >= lastSeq
-	}, 3*time.Second, 10*time.Millisecond, "consumer never reached last upstream seq")
+		return delivered.Load() >= int64(len(upstream))
+	}, 3*time.Second, 10*time.Millisecond, "consumer never delivered all upstream events")
 
 	cancel()
 	select {
@@ -306,11 +319,24 @@ func TestConsumer_Run_HappyPath(t *testing.T) {
 	}
 	require.NoError(t, c.Close())
 
-	// Cursor at shutdown should reflect the last seq buffered.
+	// The persisted cursor must be a valid safe-replay watermark, NOT
+	// necessarily the highest seq. atmos derives the cursor as
+	// min(in-flight)-1, falling back to the highest seq in the
+	// just-flushed batch once nothing is in-flight (streaming/client.go).
+	// Under Parallelism>1 with BatchSize=1, the final cursor lands on
+	// the seq of whichever event finished verifying LAST, which may be
+	// any of our seqs — e.g. completion order 1,3,4,2 settles at 2.
+	// Asserting == lastSeq here is what made this test flaky. The real
+	// invariant: the cursor is positive, never exceeds the highest seq
+	// we sent (which would mean skipping un-archived data on replay),
+	// and matches what cursorValue() reports in-memory.
 	finalCursor, err := LoadUpstreamCursor(st, "relay/cursor")
 	require.NoError(t, err)
-	require.Equal(t, lastSeq, finalCursor,
-		"final cursor must equal the last upstream seq we processed")
+	require.Positive(t, finalCursor, "a cursor must be persisted once events flow")
+	require.LessOrEqual(t, finalCursor, lastSeq,
+		"the safe watermark must never advance past the highest seq we archived")
+	require.Equal(t, c.cursorValue(), finalCursor,
+		"the persisted cursor must equal the in-memory watermark Close flushed")
 
 	// Decode every event from the on-disk segment files. Under
 	// atmos's default Parallelism>1 cross-DID seq order is NOT
@@ -435,7 +461,16 @@ func TestConsumer_Run_ResumesFromPersistedCursor(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(t.Context())
 	go func() { _ = c1.Run(ctx1) }()
 
-	require.Eventually(t, func() bool { return c1.LastUpstreamSeq() >= 11 }, 3*time.Second, 10*time.Millisecond)
+	// Gate on the safe-to-persist watermark — the exact value Close
+	// will write to relay/cursor — not on LastUpstreamSeq(). Under
+	// atmos's default Parallelism>1, a higher seq for one DID can finish
+	// verification (bumping LastUpstreamSeq) while a lower seq is still
+	// in-flight on another worker, pinning the watermark (min(inflight)-1)
+	// below 11. Gating on LastUpstreamSeq here let us cancel while the
+	// watermark was still at 9, so Close persisted 9 and the assertion
+	// below flaked. cursorValue() is exactly what Close persists, and it
+	// only advances monotonically, so once it reaches 11 the assertion holds.
+	require.Eventually(t, func() bool { return c1.cursorValue() >= 11 }, 3*time.Second, 10*time.Millisecond)
 	cancel1()
 	require.NoError(t, c1.Close())
 

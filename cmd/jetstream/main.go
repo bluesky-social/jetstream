@@ -59,6 +59,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -68,6 +70,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/orchestrator"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/status"
@@ -193,6 +196,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_SHUTDOWN_TIMEOUT"),
 				Value:   30 * time.Second,
 			},
+			&cli.DurationFlag{
+				Name:    "client-drain-timeout",
+				Usage:   "Maximum time allowed for in-progress websocket subscribers to receive a clean close frame and disconnect before the process exits",
+				Sources: cli.EnvVars("JETSTREAM_CLIENT_DRAIN_TIMEOUT"),
+				Value:   10 * time.Second,
+			},
 			&cli.StringFlag{
 				Name:    "relay-url",
 				Usage:   "Base URL of the upstream relay",
@@ -219,7 +228,7 @@ func serveCommand() *cli.Command {
 			},
 			&cli.BoolFlag{
 				Name:    "skip-merge-discovery",
-				Usage:   "DEBUG ONLY: . Intended for fast local-dev iteration against the production relay's millions of users; safe to leave set in production but unnecessary there.",
+				Usage:   "DEBUG ONLY: skip the end-of-merge listRepos rescan that discovers accounts created during the merge phase. Intended for fast local-dev iteration against the production relay's millions of users; safe to leave set in production but unnecessary there.",
 				Sources: cli.EnvVars("JETSTREAM_SKIP_MERGE_DISCOVERY"),
 				Value:   false,
 			},
@@ -228,6 +237,48 @@ func serveCommand() *cli.Command {
 				Usage:   "Lifetime of the cached /status snapshot before a new one is built. Lower values (e.g. 1s in local dev) make the dashboard feel live; the production default amortizes pebble scans across requests.",
 				Sources: cli.EnvVars("JETSTREAM_STATUS_CACHE_TTL"),
 				Value:   30 * time.Second,
+			},
+			&cli.DurationFlag{
+				Name:    "cursor-lookback",
+				Usage:   "Maximum age for ?cursor= replay. Cursors older than this are clamped to the floor. 0 disables cursor lookback (cursor query parameter resolves to live tip).",
+				Sources: cli.EnvVars("JETSTREAM_CURSOR_LOOKBACK"),
+				Value:   36 * time.Hour,
+			},
+			&cli.IntFlag{
+				Name:    "subscribe-hot-tail-bytes",
+				Usage:   "Byte budget of the in-memory hot-tail ring that fans live events to /subscribe clients.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_HOT_TAIL_BYTES"),
+				Value:   256 << 20,
+			},
+			&cli.IntFlag{
+				Name:    "subscribe-block-cache-bytes",
+				Usage:   "Decoded-byte budget of the shared cold-path block cache (sealed + flushed blocks).",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_BLOCK_CACHE_BYTES"),
+				Value:   64 << 20,
+			},
+			&cli.IntFlag{
+				Name:    "subscribe-read-batch",
+				Usage:   "Max events returned per ReadFrom call to a /subscribe client.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_READ_BATCH"),
+				Value:   1024,
+			},
+			&cli.DurationFlag{
+				Name:    "subscribe-slow-window",
+				Usage:   "Sustained window over which an adversarially-slow /subscribe client is judged before being dropped.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_SLOW_WINDOW"),
+				Value:   60 * time.Second,
+			},
+			&cli.FloatFlag{
+				Name:    "subscribe-slow-min-rate",
+				Usage:   "Events/sec floor below which a far-behind /subscribe client is considered adversarially slow.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_SLOW_MIN_RATE"),
+				Value:   5,
+			},
+			&cli.IntFlag{
+				Name:    "cursor-block-index-cache-size",
+				Usage:   "Number of segments whose block indices stay resident in the manifest LRU.",
+				Sources: cli.EnvVars("JETSTREAM_CURSOR_BLOCK_INDEX_CACHE_SIZE"),
+				Value:   32,
 			},
 		},
 		Action: runServe,
@@ -268,10 +319,16 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	segmentMetrics := segment.NewMetrics(metrics.Registry)
 	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
 	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
+	manifestMetrics := manifest.NewMetrics(metrics.Registry)
 
 	dataDir := cmd.String("data-dir")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return fmt.Errorf("serve: create data dir %s: %w", dataDir, err)
+	}
+
+	segmentsDir := filepath.Join(dataDir, "segments")
+	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
+		return fmt.Errorf("serve: create segments dir %s: %w", segmentsDir, err)
 	}
 
 	metaStore, err := store.Open(dataDir, storeMetrics)
@@ -284,10 +341,28 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
+	mft, err := manifest.Open(manifest.Options{
+		SegmentsDir:         segmentsDir,
+		BlockIndexCacheSize: cmd.Int("cursor-block-index-cache-size"),
+		Logger:              processLogger,
+		Metrics:             manifestMetrics,
+	})
+	if err != nil {
+		return fmt.Errorf("serve: open manifest: %w", err)
+	}
+
+	// writerPtr is published by the orchestrator once the steady-state
+	// live consumer opens its ingest.Writer; the cursor handler reads it
+	// atomically. Before steady-state the lifecycle.IsSteadyState gate
+	// returns 503, so the nil-pointer window is harmless.
+	var writerPtr atomic.Pointer[ingest.Writer]
+
 	statusCollector, err := status.New(status.Options{
-		Store:   metaStore,
-		DataDir: dataDir,
-		TTL:     cmd.Duration("status-cache-ttl"),
+		Store:          metaStore,
+		DataDir:        dataDir,
+		TTL:            cmd.Duration("status-cache-ttl"),
+		Manifest:       mft,
+		CursorLookback: cmd.Duration("cursor-lookback"),
 	})
 	if err != nil {
 		return fmt.Errorf("serve: build status collector: %w", err)
@@ -335,12 +410,26 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	stateStore := syncstate.New(metaStore)
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
-	broadcaster, err := subscribe.New(subscribe.Config{
-		Logger:  processLogger,
-		Metrics: subscribeMetrics,
+	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
+		Manifest:        mft,
+		WriterRef:       &writerPtr,
+		BlockCacheBytes: cmd.Int("subscribe-block-cache-bytes"),
+	})
+	tail, err := subscribe.New(subscribe.Config{
+		Logger:       processLogger,
+		Metrics:      subscribeMetrics,
+		HotTailBytes: cmd.Int("subscribe-hot-tail-bytes"),
+		ReadBatch:    cmd.Int("subscribe-read-batch"),
+		SlowWindow:   cmd.Duration("subscribe-slow-window"),
+		SlowMinRate:  cmd.Float("subscribe-slow-min-rate"),
+	}, coldRd, func() uint64 {
+		if w := writerPtr.Load(); w != nil {
+			return w.NextSeq()
+		}
+		return 0
 	})
 	if err != nil {
-		return fmt.Errorf("serve: build subscribe broadcaster: %w", err)
+		return fmt.Errorf("serve: build subscribe tail: %w", err)
 	}
 
 	verifierLogger := processLogger.With(slog.String("component", "verifier"))
@@ -384,9 +473,13 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		LiveMetrics:        live.NewMetrics(metrics.Registry),
 		BackfillMetrics:    backfill.NewMetrics(metrics.Registry),
 		SegmentMetrics:     segmentMetrics,
-		OnEvent:            broadcaster.Publish,
+		OnEvent:            tail.Append,
 		MaxBackfillRepos:   cmd.Int("max-backfill-repos"),
 		SkipMergeDiscovery: cmd.Bool("skip-merge-discovery"),
+		IngestOnAfterSeal:  mft.OnSegmentSealed,
+		OnSteadyStateWriter: func(w *ingest.Writer) {
+			writerPtr.Store(w)
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("serve: build orchestrator: %w", err)
@@ -399,12 +492,18 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		StatusHandler:   statusHandler,
 	}, processLogger, metrics)
 
-	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(
-		broadcaster,
-		metaStore,
-		processLogger,
-		subscribeMetrics,
-	))
+	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
+	// before steady-state, lifecycle.IsSteadyState gates with 503 so
+	// nil-pointer reads are harmless.
+	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(subscribe.Subscription{
+		Tail:      tail,
+		Store:     metaStore,
+		Manifest:  mft,
+		WriterRef: &writerPtr,
+		Logger:    processLogger,
+		Metrics:   subscribeMetrics,
+		Lookback:  cmd.Duration("cursor-lookback"),
+	}))
 
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -417,6 +516,26 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 
 	g.Go(func() error {
 		return orch.Run(gctx)
+	})
+
+	// Graceful client drain. Live websocket subscribers are hijacked
+	// connections, so http.Server.Shutdown neither tracks nor closes
+	// them — without this they'd be severed abruptly (no close frame) on
+	// process exit. On shutdown we send each subscriber a StatusGoingAway
+	// close frame and wait up to client-drain-timeout for them to leave
+	// cleanly. We keep this in the errgroup so g.Wait() blocks on the
+	// drain: the process must not exit out from under a half-sent close
+	// handshake. The drain context is rooted at Background (not gctx,
+	// which is already cancelled by the time we drain) and bounded by the
+	// flag, so a wedged client can't delay exit past the budget.
+	g.Go(func() error {
+		<-gctx.Done()
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), cmd.Duration("client-drain-timeout"))
+		defer drainCancel()
+		if err := tail.Shutdown(drainCtx); err != nil {
+			logger.Warn("client drain did not complete within budget; severing remaining subscribers", "err", err)
+		}
+		return nil
 	})
 
 	// Verifier async-error drain. Verification failures are

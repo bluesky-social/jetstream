@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,7 @@ import (
 // single-producer loop.
 type Consumer struct {
 	cfg Config
+
 	// logger is cfg.Logger pre-attributed with
 	// component=livestream/consumer for the consumer's own log
 	// lines. cfg.Logger itself is left bare so child constructors
@@ -79,9 +81,11 @@ func Open(cfg Config) (*Consumer, error) {
 		SeqKey:            cfg.SeqKey,
 		MaxSegmentBytes:   cfg.MaxSegmentBytes,
 		MaxEventsPerBlock: cfg.MaxEventsPerBlock,
+
 		// Bare cfg.Logger; ingest.Open sets its own
 		// component=ingest/writer attribute.
 		Logger: cfg.Logger,
+
 		// Metrics intentionally nil: per-writer ingest metrics for
 		// the live writer are not registered to avoid colliding with
 		// the backfill writer's series. The livestream-level Metrics
@@ -89,6 +93,7 @@ func Open(cfg Config) (*Consumer, error) {
 		// upstream cursor) live in cfg.Metrics.
 		Metrics:        nil,
 		OnAfterFlush:   c.onAfterFlush,
+		OnAfterSeal:    cfg.OnAfterSeal,
 		SegmentMetrics: cfg.SegmentMetrics,
 	})
 	if err != nil {
@@ -206,8 +211,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 	)
 
 	opts := streaming.Options{
-		URL:    wsURL,
-		Cursor: gt.Some(startCursor),
+		URL:       wsURL,
+		Cursor:    gt.Some(startCursor),
+		BatchSize: gt.Some(1),
 		// Verifier is supplied by the caller via livestream.Config; the
 		// streaming layer would otherwise auto-attach an in-memory verifier
 		// that doesn't survive restart. cmd/jetstream constructs ours with
@@ -228,7 +234,18 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 	c.client.Store(client)
 	defer func() {
-		if cerr := client.Close(); cerr != nil {
+		// On a clean ctx-cancel shutdown atmos's Events iterator has
+		// already torn the socket down (consumeLoop calls conn.CloseNow
+		// when its read loop exits), so this client.Close races that and
+		// finds the connection already closed, returning a wrapped
+		// net.ErrClosed. That's the expected steady-state shutdown path,
+		// not a fault — suppress it. We still call Close because on the
+		// error-return path (a fatal write/pebble failure surfaced from
+		// processBatch) the iterator has NOT cancelled, so Close is what
+		// releases the live socket; any non-already-closed error there is
+		// genuine and worth a warning.
+		cerr := client.Close()
+		if cerr != nil && !errors.Is(cerr, net.ErrClosed) {
 			c.logger.WarnContext(ctx, "client close", "err", cerr)
 		}
 	}()
@@ -340,4 +357,12 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 		return nil
 	})
+}
+
+// Writer returns the live consumer's ingest writer. May be nil before
+// Open completes; after Open returns successfully, this is stable
+// until Close. Used by callers (cmd/jetstream) that need a writer
+// reference for cursor-replay handler wiring.
+func (c *Consumer) Writer() *ingest.Writer {
+	return c.writer
 }

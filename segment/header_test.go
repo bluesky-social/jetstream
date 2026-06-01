@@ -125,7 +125,22 @@ func TestDecodeHeaderRejectsZeroChecksum(t *testing.T) {
 	copy(buf, segmentMagic)
 	binary.LittleEndian.PutUint16(buf[12:14], 1) // version
 	_, err := decodeHeader(buf)
-	require.True(t, errors.Is(err, ErrCorruptSegment))
+	require.True(t, errors.Is(err, ErrActiveSegment))
+}
+
+func TestDecodeHeader_ActiveSegmentSentinel(t *testing.T) {
+	t.Parallel()
+
+	// 256 bytes: magic + zero checksum + zero-padded rest.
+	buf := make([]byte, ReservedHeaderBytes)
+	copy(buf[0:4], []byte("jss0"))
+	// Bytes 4..11 (checksum) deliberately left zero.
+
+	_, err := decodeHeader(buf)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrActiveSegment)
+	require.NotErrorIs(t, err, ErrCorruptSegment,
+		"active-segment marker must be distinct from real corruption")
 }
 
 func TestDecodeHeaderRejectsBadVersion(t *testing.T) {

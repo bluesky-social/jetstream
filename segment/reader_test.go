@@ -138,7 +138,7 @@ func TestReaderOpenRejectsActiveFile(t *testing.T) {
 	require.NoError(t, w.Close())
 
 	_, err = Open(ReaderConfig{Path: path})
-	require.True(t, errors.Is(err, ErrCorruptSegment))
+	require.True(t, errors.Is(err, ErrActiveSegment))
 }
 
 func TestReaderOpenRejectsMissingPath(t *testing.T) {

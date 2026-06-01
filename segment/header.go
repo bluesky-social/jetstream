@@ -80,8 +80,7 @@ func decodeHeader(buf []byte) (Header, error) {
 	le := binary.LittleEndian
 	checksum := le.Uint64(buf[4:12])
 	if checksum == 0 {
-		return Header{}, fmt.Errorf("%w: checksum is zero (active file?)",
-			ErrCorruptSegment)
+		return Header{}, fmt.Errorf("%w: checksum field at offset 4 is zero", ErrActiveSegment)
 	}
 	version := le.Uint16(buf[12:14])
 	if version != currentHeaderVersion {

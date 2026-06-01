@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -679,4 +680,114 @@ func TestSegmentFiles_IgnoresNonSegmentFiles(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, uint64(3), got[0].Idx)
+}
+
+func TestWriter_OnAfterSeal_FiresOnRotation(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+
+	type sealedEvent struct {
+		idx  uint64
+		path string
+	}
+	var got []sealedEvent
+	var gotMu sync.Mutex
+
+	w, err := Open(Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		MaxSegmentBytes:   1, // rotate on every flush
+		MaxEventsPerBlock: 1,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+		OnAfterSeal: func(idx uint64, path string) error {
+			gotMu.Lock()
+			defer gotMu.Unlock()
+			got = append(got, sealedEvent{idx: idx, path: path})
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	// MaxEventsPerBlock=1 + MaxSegmentBytes=1 means each Append fills
+	// the block, flushes, rotates, and seals. Three appends → three
+	// seals at idx 0, 1, 2.
+	for i := 1; i <= 3; i++ {
+		ev := segment.Event{
+			IndexedAt: int64(i), Kind: segment.KindCreate,
+			DID: "did:plc:a", Payload: []byte{0xa0},
+		}
+		require.NoError(t, w.Append(t.Context(), &ev))
+	}
+
+	gotMu.Lock()
+	defer gotMu.Unlock()
+	require.GreaterOrEqual(t, len(got), 2, "expected at least two seal callbacks across three rotations")
+	for i, ev := range got {
+		require.Equal(t, uint64(i), ev.idx, "callback %d: idx mismatch", i)
+		require.Contains(t, ev.path, fmt.Sprintf("seg_%010d.jss", i),
+			"callback %d: path should reference its sealed file", i)
+	}
+}
+
+func TestWriter_OnAfterSeal_ErrorPropagates(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+
+	wantErr := errors.New("boom")
+	w, err := Open(Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		MaxSegmentBytes:   1,
+		MaxEventsPerBlock: 1,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+		OnAfterSeal:       func(idx uint64, path string) error { return wantErr },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	// First append fills the block + triggers a rotation; the seal hook
+	// returns wantErr, which Append must surface.
+	ev := segment.Event{
+		IndexedAt: 1, Kind: segment.KindCreate,
+		DID: "did:plc:a", Payload: []byte{0xa0},
+	}
+	err = w.Append(t.Context(), &ev)
+	require.ErrorIs(t, err, wantErr)
+
+	// Subsequent Appends must also fail: the hook error left the writer
+	// with no usable active segment (Seal already closed the file).
+	// We don't pin the exact error class — what matters is that a
+	// caller can't accidentally write into limbo state.
+	ev2 := segment.Event{
+		IndexedAt: 2, Kind: segment.KindCreate,
+		DID: "did:plc:a", Payload: []byte{0xa0},
+	}
+	require.Error(t, w.Append(t.Context(), &ev2),
+		"writer must remain unusable after a failed OnAfterSeal")
+}
+
+func TestWriter_SnapshotPending_DelegatesToSegmentWriter(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{})
+
+	require.Empty(t, w.SnapshotPending())
+
+	require.NoError(t, w.Append(t.Context(), &segment.Event{
+		IndexedAt: 1, Kind: segment.KindCreate,
+		DID: "did:plc:a", Payload: []byte{0xa0},
+	}))
+	require.NoError(t, w.Append(t.Context(), &segment.Event{
+		IndexedAt: 2, Kind: segment.KindCreate,
+		DID: "did:plc:b", Payload: []byte{0xa0},
+	}))
+
+	got := w.SnapshotPending()
+	require.Len(t, got, 2)
+	require.Equal(t, "did:plc:a", got[0].DID)
+	require.Equal(t, "did:plc:b", got[1].DID)
 }

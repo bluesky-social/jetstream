@@ -403,7 +403,6 @@ func TestParseMaxMsgSize_V1Compat(t *testing.T) {
 			{"99999999999", 0}, // overflow → 0
 		}
 		for _, tc := range cases {
-			tc := tc
 			t.Run(tc.in, func(t *testing.T) {
 				t.Parallel()
 				got := parseMaxMsgSizeQuery(tc.in)
@@ -423,7 +422,6 @@ func TestParseMaxMsgSize_V1Compat(t *testing.T) {
 			{1_000_000, 1_000_000},
 		}
 		for _, tc := range cases {
-			tc := tc
 			t.Run("", func(t *testing.T) {
 				t.Parallel()
 				got := clampMaxMsgSize(tc.in)
@@ -450,7 +448,6 @@ func TestParseRequireHello(t *testing.T) {
 		{" true", false},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.in, func(t *testing.T) {
 			t.Parallel()
 			values := url.Values{}

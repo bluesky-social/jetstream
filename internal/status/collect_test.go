@@ -249,3 +249,50 @@ func TestCollect_PebbleKeyspaces(t *testing.T) {
 	_, hasIdentity := snap.Pebble.KeyspaceCounts["sync/identity/"]
 	require.False(t, hasIdentity, "sync/identity/ must not be exposed")
 }
+
+func TestCollect_CursorLookback_NoManifest(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	c, err := status.New(status.Options{
+		Store:          st,
+		DataDir:        dataDir,
+		CursorLookback: 24 * time.Hour,
+		Manifest:       nil, // No manifest wired in
+	})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	// Should still report the configured lookback, but other fields are zero.
+	require.Equal(t, 24*time.Hour, snap.CursorLookback.ConfiguredLookback)
+	require.Equal(t, 0, snap.CursorLookback.ManifestSegmentCount)
+	require.Equal(t, uint64(0), snap.CursorLookback.OldestRetainedSeq)
+	require.True(t, snap.CursorLookback.OldestRetainedAt.IsZero())
+}
+
+func TestCollect_CursorLookback_Disabled(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	c, err := status.New(status.Options{
+		Store:          st,
+		DataDir:        dataDir,
+		CursorLookback: 0, // Disabled
+	})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	// All fields should be zero when disabled.
+	require.Equal(t, time.Duration(0), snap.CursorLookback.ConfiguredLookback)
+	require.Equal(t, 0, snap.CursorLookback.ManifestSegmentCount)
+	require.Equal(t, uint64(0), snap.CursorLookback.OldestRetainedSeq)
+	require.True(t, snap.CursorLookback.OldestRetainedAt.IsZero())
+}

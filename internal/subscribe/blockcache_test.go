@@ -1,0 +1,85 @@
+package subscribe
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/stretchr/testify/require"
+)
+
+func decodedFixture(seqs ...uint64) []segment.Event {
+	out := make([]segment.Event, len(seqs))
+	for i, s := range seqs {
+		out[i] = segment.Event{Seq: s, Kind: segment.KindCreate, DID: "did:plc:b", Payload: []byte{0xa0}}
+	}
+	return out
+}
+
+func TestBlockCache_GetOrDecode_RunsDecodeOnce(t *testing.T) {
+	t.Parallel()
+	c := newBlockCache(1 << 20)
+	var calls atomic.Int64
+	decode := func() ([]segment.Event, error) {
+		calls.Add(1)
+		return decodedFixture(1, 2, 3), nil
+	}
+
+	const N = 20
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			evs, err := c.getOrDecode(blockKey{segIdx: 0, blockIdx: 0}, decode)
+			require.NoError(t, err)
+			require.Len(t, evs, 3)
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, int64(1), calls.Load(), "decode runs once across concurrent hits")
+}
+
+func TestBlockCache_EvictsByByteBudget(t *testing.T) {
+	t.Parallel()
+	c := newBlockCache(200)
+	mk := func(seg uint64) func() ([]segment.Event, error) {
+		return func() ([]segment.Event, error) { return decodedFixture(seg*10, seg*10+1, seg*10+2), nil }
+	}
+	for seg := uint64(0); seg < 10; seg++ {
+		_, err := c.getOrDecode(blockKey{segIdx: seg, blockIdx: 0}, mk(seg))
+		require.NoError(t, err)
+	}
+	require.LessOrEqual(t, c.bytes(), 200, "cache must respect byte budget")
+
+	// The earliest key was evicted: a re-get re-decodes.
+	var redecoded atomic.Bool
+	_, err := c.getOrDecode(blockKey{segIdx: 0, blockIdx: 0}, func() ([]segment.Event, error) {
+		redecoded.Store(true)
+		return decodedFixture(0, 1, 2), nil
+	})
+	require.NoError(t, err)
+	require.True(t, redecoded.Load(), "evicted block must re-decode on next access")
+}
+
+func TestBlockCache_DecodeErrorNotCached(t *testing.T) {
+	t.Parallel()
+	c := newBlockCache(1 << 20)
+	_, err := c.getOrDecode(blockKey{segIdx: 1, blockIdx: 0}, func() ([]segment.Event, error) {
+		return nil, assertErr
+	})
+	require.ErrorIs(t, err, assertErr)
+	// A decode error must not poison the slot.
+	evs, err := c.getOrDecode(blockKey{segIdx: 1, blockIdx: 0}, func() ([]segment.Event, error) {
+		return decodedFixture(5), nil
+	})
+	require.NoError(t, err)
+	require.Len(t, evs, 1)
+}
+
+var assertErr = errorString("decode failed")
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }

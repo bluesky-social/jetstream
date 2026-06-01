@@ -199,6 +199,31 @@
   </section>
 
   <section>
+    <h2>Cursor lookback</h2>
+    <dl>
+      <dt>Configured lookback</dt>
+      <dd>
+        {{if eq .CursorLookback.ConfiguredLookback 0}}
+          <em>disabled</em>
+        {{else}}
+          {{humanDuration .CursorLookback.ConfiguredLookback}}
+        {{end}}
+      </dd>
+      <dt>Sealed segments tracked</dt>
+      <dd>{{humanInt64Cast .CursorLookback.ManifestSegmentCount}}</dd>
+      <dt>Oldest retained seq</dt>
+      <dd>
+        {{if .CursorLookback.OldestRetainedAt.IsZero}}
+          <em>n/a</em>
+        {{else}}
+          {{humanInt64Cast .CursorLookback.OldestRetainedSeq}}
+          <small>({{relativeTime .CursorLookback.OldestRetainedAt .Now}})</small>
+        {{end}}
+      </dd>
+    </dl>
+  </section>
+
+  <section>
     <h2>Metadata store</h2>
     <dl>
       <dt>On disk</dt>
