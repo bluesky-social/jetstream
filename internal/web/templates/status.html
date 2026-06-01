@@ -13,7 +13,6 @@
     --border: #e0e0e0;
     --accent: #2860c8;
     --bar-bg: #eee;
-    --bar-fill: #2860c8;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -24,7 +23,6 @@
       --border: #333;
       --accent: #6aa3ff;
       --bar-bg: #333;
-      --bar-fill: #6aa3ff;
     }
   }
   body {
@@ -55,14 +53,6 @@
   @media (max-width: 700px) {
     .grid2 { grid-template-columns: 1fr; }
   }
-  .bar {
-    background: var(--bar-bg);
-    border-radius: 4px;
-    height: 12px;
-    overflow: hidden;
-    margin: 0.25rem 0 0.5rem 0;
-  }
-  .bar > div { background: var(--bar-fill); height: 100%; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
   .cursor {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -130,32 +120,26 @@
     {{if eq .Backfill.TotalDIDs 0}}
       <p class="sub">Backfill has not started.</p>
     {{else if .Backfill.ListReposCursor}}
-      <div class="bar"><div style="width: {{percentString .Backfill.PercentComplete}}"></div></div>
       <dl>
         <dt>State</dt>
         <dd>enumerating repos</dd>
-        <dt>Progress so far</dt>
-        <dd>{{printf "%.2f%%" .Backfill.PercentComplete}}
-            ({{humanInt .Backfill.Complete}} / {{humanInt .Backfill.TotalDIDs}} DIDs)</dd>
-        <dt>Discovered so far</dt>
-        <dd>{{humanInt .Backfill.TotalDIDs}}</dd>
-        <dt>Pending</dt>
-        <dd>{{humanInt .Backfill.Discovered}}</dd>
-        <dt>Failed</dt>
-        <dd>{{humanInt .Backfill.Failed}}</dd>
+        <dt>Discovered</dt>
+        <dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
+        <dt>Downloaded</dt>
+        <dd>{{humanInt .Backfill.Complete}} repos</dd>
+        <dt>Errored</dt>
+        <dd>{{humanInt .Backfill.Failed}} repos</dd>
         <dt>listRepos cursor</dt>
         <dd class="cursor">{{.Backfill.ListReposCursor}}</dd>
       </dl>
     {{else}}
-      <div class="bar"><div style="width: {{percentString .Backfill.PercentComplete}}"></div></div>
       <dl>
-        <dt>Progress</dt>
-        <dd>{{printf "%.2f%%" .Backfill.PercentComplete}}
-            ({{humanInt .Backfill.Complete}} / {{humanInt .Backfill.TotalDIDs}} DIDs)</dd>
         <dt>Discovered</dt>
-        <dd>{{humanInt .Backfill.Discovered}}</dd>
-        <dt>Failed</dt>
-        <dd>{{humanInt .Backfill.Failed}}</dd>
+        <dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
+        <dt>Downloaded</dt>
+        <dd>{{humanInt .Backfill.Complete}} repos</dd>
+        <dt>Errored</dt>
+        <dd>{{humanInt .Backfill.Failed}} repos</dd>
       </dl>
     {{end}}
   </section>

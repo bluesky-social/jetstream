@@ -131,10 +131,16 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "steady_state")
 	require.Contains(t, body, "Backfill")
 	require.Contains(t, body, "enumerating repos")
-	require.Contains(t, body, "Progress so far")
-	require.Contains(t, body, "80.00%")
-	require.Contains(t, body, "Discovered so far")
-	require.Contains(t, body, "100")
+	require.NotContains(t, body, `class="bar"`)
+	require.NotContains(t, body, "Progress so far")
+	require.NotContains(t, body, "Progress")
+	require.NotContains(t, body, "80.00%")
+	require.Contains(t, body, "Discovered")
+	require.Contains(t, body, "100 repos")
+	require.Contains(t, body, "Downloaded")
+	require.Contains(t, body, "80 repos")
+	require.Contains(t, body, "Errored")
+	require.Contains(t, body, "10 repos")
 	require.Contains(t, body, "Latest segment")
 	require.Contains(t, body, "1,234")        // EventCount via humanInt
 	require.Contains(t, body, "567")          // UniqueDIDCount via humanInt64Cast
@@ -162,8 +168,15 @@ func TestHandler_RendersBackfillingState(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	body := rr.Body.String()
-	require.Contains(t, body, "80.00%")
-	require.Contains(t, body, "Progress")
+	require.NotContains(t, body, `class="bar"`)
+	require.NotContains(t, body, "80.00%")
+	require.NotContains(t, body, "Progress")
+	require.Contains(t, body, "Discovered")
+	require.Contains(t, body, "100 repos")
+	require.Contains(t, body, "Downloaded")
+	require.Contains(t, body, "80 repos")
+	require.Contains(t, body, "Errored")
+	require.Contains(t, body, "10 repos")
 	require.NotContains(t, body, "enumerating repos")
 }
 

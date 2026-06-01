@@ -8,7 +8,6 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/status"
@@ -71,9 +70,8 @@ func New(opts Options) (*Handler, error) {
 				return fmt.Sprint(n)
 			}
 		},
-		"relativeTime":  relativeTime,
-		"percentString": func(p float64) string { return strconv.FormatFloat(p, 'f', 2, 64) + "%" },
-		"dict":          dictFunc,
+		"relativeTime": relativeTime,
+		"dict":         dictFunc,
 	}
 
 	tpl, err := template.New("status.html").Funcs(funcs).ParseFS(templateFS, "templates/status.html")
