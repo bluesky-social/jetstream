@@ -374,15 +374,36 @@ func (r *Reader) BlockBloom(idx int) (*gloom.Filter, error) {
 	return f, nil
 }
 
-// LoadAllBlockBlooms calls BlockBloom for every block in order.
-// Equivalent to a hand-written loop; provided for callers that want
-// a single call.
+// LoadAllBlockBlooms reads and unmarshals every per-block DID bloom in order.
+// The on-disk bloom body is contiguous, so this performs one pread instead of
+// one pread per block.
 func (r *Reader) LoadAllBlockBlooms() ([]*gloom.Filter, error) {
 	out := make([]*gloom.Filter, len(r.blocks))
+	if len(out) == 0 {
+		return out, nil
+	}
+	if r.perBlockBloomSize == 0 {
+		return nil, fmt.Errorf("%w: no per-block blooms in this segment",
+			ErrBlockOutOfRange)
+	}
+
+	bodyLen := uint64(len(out)) * uint64(r.perBlockBloomSize)
+	if bodyLen > uint64(int(^uint(0)>>1)) {
+		return nil, fmt.Errorf("%w: per-block bloom body too large: %d bytes",
+			ErrInvalidFooter, bodyLen)
+	}
+	buf := make([]byte, int(bodyLen))
+	off := int64(r.header.BlockDIDBloomOffset) + int64(blockBloomsRegionHeaderSize)
+	if _, err := r.file.ReadAt(buf, off); err != nil {
+		return nil, fmt.Errorf("segment: read block blooms: %w", err)
+	}
+
+	size := int(r.perBlockBloomSize)
 	for i := range out {
-		f, err := r.BlockBloom(i)
+		start := i * size
+		f, err := gloom.UnmarshalBinary(buf[start : start+size])
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("segment: unmarshal block %d bloom: %w", i, err)
 		}
 		out[i] = f
 	}
