@@ -119,13 +119,12 @@ func Run(ctx context.Context, cfg Config) error {
 		var limitTripped atomic.Bool
 
 		engine := atmosbackfill.NewEngine(atmosbackfill.Options{
-			SyncClient:       sc,
-			Store:            st,
-			Handler:          handler,
-			Directory:        gt.Some(cfg.Directory),
-			HTTPClient:       gt.Some(cfg.HTTPClient),
-			StartCursor:      gt.Some(startCursor),
-			ShuffleBatchSize: gt.Some(100_000),
+			SyncClient:  sc,
+			Store:       st,
+			Handler:     handler,
+			Directory:   gt.Some(cfg.Directory),
+			HTTPClient:  gt.Some(cfg.HTTPClient),
+			StartCursor: gt.Some(startCursor),
 			OnPageComplete: gt.Some(func(cursor string) error {
 				if err := SaveListReposCursor(cfg.Store, cursor); err != nil {
 					return err
