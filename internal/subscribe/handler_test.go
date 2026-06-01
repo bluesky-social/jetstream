@@ -3,6 +3,7 @@ package subscribe
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -168,6 +169,135 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	require.NoError(t, json.Unmarshal(frame, &got))
 	require.Equal(t, "identity", got["kind"])
 	require.Equal(t, "did:plc:i", got["did"])
+}
+
+func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
+	require.NoError(t, err)
+
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?extended=true"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	var seq uint64
+	payload := []byte{0xa0}
+	appendSeq(b, &seq, &segment.Event{
+		IndexedAt:           1779719010267528,
+		UpstreamRelayCursor: 111,
+		Kind:                segment.KindCreate,
+		DID:                 "did:plc:extended",
+		Collection:          "app.bsky.feed.post",
+		Rkey:                "abcd1234",
+		Rev:                 "3lXrev",
+		Payload:             payload,
+	})
+
+	commitFrame := readOneFrame(t, ctx, conn)
+	var commit map[string]any
+	require.NoError(t, json.Unmarshal(commitFrame, &commit))
+	require.Equal(t, "commit", commit["kind"])
+	require.Equal(t, float64(0), commit["cursor"])
+	require.Equal(t, float64(0), commit["seq"])
+	require.Equal(t, float64(111), commit["upstream_relay_cursor"])
+	commitPayload, ok := commit["commit"].(map[string]any)
+	require.True(t, ok, "commit payload not a map")
+	require.Equal(t, base64.StdEncoding.EncodeToString(payload), commitPayload["record_cbor"])
+
+	syncEvt := &comatproto.SyncSubscribeRepos_Sync{
+		DID: "did:plc:extended", Rev: "rev-sync", Seq: 222, Time: "2026-05-25T00:00:00Z",
+		Blocks: []byte{0x01},
+	}
+	syncPayload, err := syncEvt.MarshalCBOR()
+	require.NoError(t, err)
+	appendSeq(b, &seq, &segment.Event{
+		IndexedAt:           1779719010267529,
+		UpstreamRelayCursor: 222,
+		Kind:                segment.KindSync,
+		DID:                 "did:plc:extended",
+		Rev:                 "rev-sync",
+		Payload:             syncPayload,
+	})
+
+	syncFrame := readOneFrame(t, ctx, conn)
+	var syncGot map[string]any
+	require.NoError(t, json.Unmarshal(syncFrame, &syncGot))
+	require.Equal(t, "sync", syncGot["kind"])
+	require.Equal(t, float64(1), syncGot["cursor"])
+	require.Equal(t, float64(222), syncGot["upstream_relay_cursor"])
+	require.Contains(t, syncGot, "sync")
+}
+
+func TestHandler_DefaultModeDoesNotEmitExtendedFields(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
+	require.NoError(t, err)
+
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	var seq uint64
+	appendSeq(b, &seq, &segment.Event{
+		IndexedAt:           1779719010267528,
+		UpstreamRelayCursor: 111,
+		Kind:                segment.KindCreate,
+		DID:                 "did:plc:simple",
+		Collection:          "app.bsky.feed.post",
+		Rkey:                "abcd1234",
+		Rev:                 "3lXrev",
+		Payload:             []byte{0xa0},
+	})
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "commit", got["kind"])
+	require.NotContains(t, got, "seq")
+	require.NotContains(t, got, "upstream_relay_cursor")
+	commit, ok := got["commit"].(map[string]any)
+	require.True(t, ok, "commit not a map")
+	require.NotContains(t, commit, "record_cbor")
 }
 
 // readOneFrame reads one text frame with a 1s deadline. Centralizes the

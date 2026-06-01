@@ -17,8 +17,15 @@ type Entry struct {
 	body []byte
 	err  error
 
+	extendedOnce sync.Once
+	extendedBody []byte
+	extendedErr  error
+
 	// encodeFn defaults to Encode; overridable in tests.
 	encodeFn func(*segment.Event) ([]byte, error)
+
+	// encodeExtendedFn defaults to EncodeExtended; overridable in tests.
+	encodeExtendedFn func(*segment.Event) ([]byte, error)
 }
 
 // newEntry wraps ev. The event's Payload is treated as read-only (it may
@@ -40,6 +47,18 @@ func (e *Entry) Encoded() ([]byte, error) {
 		e.body, e.err = fn(e.Event)
 	})
 	return e.body, e.err
+}
+
+// EncodedExtended returns the memoized extended wire encoding for this entry.
+func (e *Entry) EncodedExtended() ([]byte, error) {
+	e.extendedOnce.Do(func() {
+		fn := e.encodeExtendedFn
+		if fn == nil {
+			fn = EncodeExtended
+		}
+		e.extendedBody, e.extendedErr = fn(e.Event)
+	})
+	return e.extendedBody, e.extendedErr
 }
 
 // approxBytes estimates the entry's memory footprint for the hot ring's

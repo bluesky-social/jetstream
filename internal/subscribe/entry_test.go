@@ -54,3 +54,31 @@ func TestEntry_MemoizesSkipSentinel(t *testing.T) {
 	require.ErrorIs(t, err2, errSkipEvent)
 	require.Nil(t, body2)
 }
+
+func TestEntry_MemoizesSimpleAndExtendedIndependently(t *testing.T) {
+	t.Parallel()
+	var simpleCalls atomic.Int64
+	var extendedCalls atomic.Int64
+	e := newEntry(&segment.Event{Seq: 1, Kind: segment.KindDelete, DID: "did:plc:s"})
+	e.encodeFn = func(*segment.Event) ([]byte, error) {
+		simpleCalls.Add(1)
+		return []byte(`{"mode":"simple"}`), nil
+	}
+	e.encodeExtendedFn = func(*segment.Event) ([]byte, error) {
+		extendedCalls.Add(1)
+		return []byte(`{"mode":"extended"}`), nil
+	}
+
+	for range 3 {
+		body, err := e.Encoded()
+		require.NoError(t, err)
+		require.Equal(t, []byte(`{"mode":"simple"}`), body)
+
+		body, err = e.EncodedExtended()
+		require.NoError(t, err)
+		require.Equal(t, []byte(`{"mode":"extended"}`), body)
+	}
+
+	require.Equal(t, int64(1), simpleCalls.Load())
+	require.Equal(t, int64(1), extendedCalls.Load())
+}

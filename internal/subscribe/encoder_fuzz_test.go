@@ -59,3 +59,45 @@ func FuzzEncode(f *testing.F) {
 		}
 	})
 }
+
+// FuzzEncodeExtended mirrors FuzzEncode for the extended protocol path:
+// arbitrary event fields must never panic and successful encodes must be JSON.
+func FuzzEncodeExtended(f *testing.F) {
+	seeds := []struct {
+		kind                       uint8
+		did, collection, rkey, rev string
+		payload                    []byte
+	}{
+		{uint8(segment.KindCreate), "did:plc:a", "app.bsky.feed.like", "rk1", "rev1", []byte{0xa0}},
+		{uint8(segment.KindDelete), "did:plc:a", "app.bsky.feed.like", "rk1", "rev1", nil},
+		{uint8(segment.KindIdentity), "did:plc:a", "", "", "", []byte{0xa0}},
+		{uint8(segment.KindSync), "did:plc:a", "", "", "", nil},
+		{99, "did:plc:a", "", "", "", nil},
+	}
+	for _, s := range seeds {
+		f.Add(s.kind, s.did, s.collection, s.rkey, s.rev, s.payload)
+	}
+
+	f.Fuzz(func(t *testing.T, kind uint8, did, collection, rkey, rev string, payload []byte) {
+		evt := &segment.Event{
+			Kind:                segment.Kind(kind),
+			DID:                 did,
+			Collection:          collection,
+			Rkey:                rkey,
+			Rev:                 rev,
+			Payload:             payload,
+			IndexedAt:           1,
+			UpstreamRelayCursor: 2,
+		}
+
+		out, err := EncodeExtended(evt)
+		if err != nil {
+			return
+		}
+
+		var v any
+		if err := json.Unmarshal(out, &v); err != nil {
+			t.Fatalf("EncodeExtended produced invalid JSON: %v\nbytes: %s", err, out)
+		}
+	})
+}

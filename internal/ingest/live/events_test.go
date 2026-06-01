@@ -109,6 +109,7 @@ func TestConvertEvent_CommitCreate(t *testing.T) {
 		require.Equal(t, "3l3qo2vutsw2b", ev.Rev)
 		require.Equal(t, testIndexedAt, ev.IndexedAt)
 		require.Equal(t, uint64(0), ev.Seq, "Seq is allocated downstream by ingest.Writer")
+		require.Equal(t, int64(42), ev.UpstreamRelayCursor)
 		require.Equal(t, want.payload, ev.Payload)
 	}
 }
@@ -130,6 +131,7 @@ func TestConvertEvent_Identity(t *testing.T) {
 	require.Equal(t, segment.KindIdentity, got[0].Kind)
 	require.Equal(t, "did:plc:bbb", got[0].DID)
 	require.Equal(t, testIndexedAt, got[0].IndexedAt)
+	require.Equal(t, int64(99), got[0].UpstreamRelayCursor)
 
 	// Round-trip the payload to confirm faithful serialization.
 	var roundTrip comatproto.SyncSubscribeRepos_Identity
@@ -158,6 +160,7 @@ func TestConvertEvent_Account(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Equal(t, segment.KindAccount, got[0].Kind)
 	require.Equal(t, "did:plc:ccc", got[0].DID)
+	require.Equal(t, int64(100), got[0].UpstreamRelayCursor)
 
 	var roundTrip comatproto.SyncSubscribeRepos_Account
 	require.NoError(t, roundTrip.UnmarshalCBOR(got[0].Payload))
@@ -185,6 +188,7 @@ func TestConvertEvent_Sync(t *testing.T) {
 	require.Equal(t, segment.KindSync, got[0].Kind)
 	require.Equal(t, "did:plc:ddd", got[0].DID)
 	require.Equal(t, "rev-xyz", got[0].Rev)
+	require.Equal(t, int64(101), got[0].UpstreamRelayCursor)
 
 	var roundTrip comatproto.SyncSubscribeRepos_Sync
 	require.NoError(t, roundTrip.UnmarshalCBOR(got[0].Payload))
@@ -252,6 +256,7 @@ func TestConvertEvent_CommitDelete_PayloadNil(t *testing.T) {
 	require.Equal(t, segment.KindDelete, got[0].Kind)
 	require.Equal(t, "app.bsky.feed.post", got[0].Collection)
 	require.Equal(t, "rec0", got[0].Rkey)
+	require.Equal(t, int64(5), got[0].UpstreamRelayCursor)
 	require.Nil(t, got[0].Payload)
 }
 

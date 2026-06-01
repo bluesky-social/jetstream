@@ -100,6 +100,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	}
 
 	requireHello := parseRequireHello(values)
+	extended := values.Get("extended") == "true"
 
 	// Resolve cursor BEFORE upgrade so a bad cursor returns HTTP 400.
 	rawCursor := values.Get("cursor")
@@ -247,7 +248,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		startSeq = deps.Tail.Tip()
 	}
 
-	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, logger)
+	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, extended, logger)
 }
 
 func runReader(
@@ -310,6 +311,7 @@ func runSubscriberLoop(
 	deps Subscription,
 	filterPtr *atomic.Pointer[Filter],
 	startSeq uint64,
+	extended bool,
 	logger *slog.Logger,
 ) {
 	deps.Metrics.incSubscribers()
@@ -376,7 +378,13 @@ func runSubscriberLoop(
 				continue
 			}
 
-			body, eerr := e.Encoded()
+			var body []byte
+			var eerr error
+			if extended {
+				body, eerr = e.EncodedExtended()
+			} else {
+				body, eerr = e.Encoded()
+			}
 			if errors.Is(eerr, errSkipEvent) {
 				deps.Metrics.incEventsSkippedSync()
 				continue

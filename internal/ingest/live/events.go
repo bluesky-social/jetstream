@@ -83,12 +83,13 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, 
 		}
 
 		segEv := segment.Event{
-			IndexedAt:  indexedAt,
-			Kind:       kind,
-			DID:        string(op.Repo),
-			Collection: string(op.Collection),
-			Rkey:       string(op.RKey),
-			Rev:        string(op.Rev),
+			IndexedAt:           indexedAt,
+			UpstreamRelayCursor: evt.Seq,
+			Kind:                kind,
+			DID:                 string(op.Repo),
+			Collection:          string(op.Collection),
+			Rkey:                string(op.RKey),
+			Rev:                 string(op.Rev),
 		}
 		// Resync ops carry the live record bytes for create/update;
 		// deletes are not part of a resync result (atmos's resync
@@ -133,12 +134,13 @@ func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error
 		}
 
 		segEv := segment.Event{
-			IndexedAt:  indexedAt,
-			Kind:       kind,
-			DID:        commit.Repo,
-			Collection: string(op.Collection),
-			Rkey:       string(op.RKey),
-			Rev:        commit.Rev,
+			IndexedAt:           indexedAt,
+			UpstreamRelayCursor: evt.Seq,
+			Kind:                kind,
+			DID:                 commit.Repo,
+			Collection:          string(op.Collection),
+			Rkey:                string(op.RKey),
+			Rev:                 commit.Rev,
 		}
 		// Deletes have no record bytes; everything else carries the
 		// raw CBOR record block exactly as atmos extracted it from
@@ -203,10 +205,11 @@ func convertIdentity(evt streaming.Event, indexedAt int64) ([]segment.Event, err
 		return nil, fmt.Errorf("livestream: marshal identity: %w", err)
 	}
 	return []segment.Event{{
-		IndexedAt: indexedAt,
-		Kind:      segment.KindIdentity,
-		DID:       evt.Identity.DID,
-		Payload:   payload,
+		IndexedAt:           indexedAt,
+		UpstreamRelayCursor: evt.Seq,
+		Kind:                segment.KindIdentity,
+		DID:                 evt.Identity.DID,
+		Payload:             payload,
 	}}, nil
 }
 
@@ -216,10 +219,11 @@ func convertAccount(evt streaming.Event, indexedAt int64) ([]segment.Event, erro
 		return nil, fmt.Errorf("livestream: marshal account: %w", err)
 	}
 	return []segment.Event{{
-		IndexedAt: indexedAt,
-		Kind:      segment.KindAccount,
-		DID:       evt.Account.DID,
-		Payload:   payload,
+		IndexedAt:           indexedAt,
+		UpstreamRelayCursor: evt.Seq,
+		Kind:                segment.KindAccount,
+		DID:                 evt.Account.DID,
+		Payload:             payload,
 	}}, nil
 }
 
@@ -229,10 +233,11 @@ func convertSync(evt streaming.Event, indexedAt int64) ([]segment.Event, error) 
 		return nil, fmt.Errorf("livestream: marshal sync: %w", err)
 	}
 	return []segment.Event{{
-		IndexedAt: indexedAt,
-		Kind:      segment.KindSync,
-		DID:       evt.Sync.DID,
-		Rev:       evt.Sync.Rev,
-		Payload:   payload,
+		IndexedAt:           indexedAt,
+		UpstreamRelayCursor: evt.Seq,
+		Kind:                segment.KindSync,
+		DID:                 evt.Sync.DID,
+		Rev:                 evt.Sync.Rev,
+		Payload:             payload,
 	}}, nil
 }

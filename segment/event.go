@@ -35,7 +35,11 @@ type Event struct {
 	Seq        uint64
 	IndexedAt  int64
 	RenderedAt int64
-	Kind       Kind
+	// UpstreamRelayCursor is the relay subscribeRepos cursor that produced
+	// this event. It is carried in memory for extended websocket clients;
+	// the current segment block format does not persist it.
+	UpstreamRelayCursor int64
+	Kind                Kind
 
 	DID        string
 	Collection string
