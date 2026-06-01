@@ -19,7 +19,7 @@ just install-tools  # run once after cloning
 To run against the real production network in a setup that doesn't require a whole-network backfill:
 
 ```sh
-just run-prod serve --max-backfill-repos=50
+just run-prod serve --max-backfill-repos=20
 ```
 
 This repo also ships with an extremely minimal atproto simulator (PLC, PDS, and the Relay). To run the local environment against it, use two terminals like:
