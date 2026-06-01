@@ -34,7 +34,6 @@ func TestCollect_FreshDataDir(t *testing.T) {
 	c, err := status.New(status.Options{
 		Store:   st,
 		DataDir: dataDir,
-		TTL:     30 * time.Second,
 		Now:     func() time.Time { return time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC) },
 	})
 	require.NoError(t, err)
@@ -54,30 +53,7 @@ func TestCollect_FreshDataDir(t *testing.T) {
 	require.Equal(t, filepath.Join(dataDir, "backfill", "live_segments"), snap.LiveSegs.Dir)
 }
 
-func TestCollect_CacheReusesPointer(t *testing.T) {
-	t.Parallel()
-	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
-
-	now := time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC)
-	c, err := status.New(status.Options{
-		Store:   st,
-		DataDir: dataDir,
-		TTL:     30 * time.Second,
-		Now:     func() time.Time { return now },
-	})
-	require.NoError(t, err)
-
-	a, err := c.Snapshot(context.Background())
-	require.NoError(t, err)
-	b, err := c.Snapshot(context.Background())
-	require.NoError(t, err)
-	require.Same(t, a, b, "cached snapshot pointer should be reused")
-}
-
-func TestCollect_CacheExpiresAfterTTL(t *testing.T) {
+func TestCollect_BuildsFreshSnapshotEachCall(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
 	st, err := store.Open(dataDir, nil)
@@ -86,64 +62,25 @@ func TestCollect_CacheExpiresAfterTTL(t *testing.T) {
 
 	var mu sync.Mutex
 	now := time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC)
-	clockFn := func() time.Time {
-		mu.Lock()
-		defer mu.Unlock()
-		return now
-	}
-
 	c, err := status.New(status.Options{
 		Store:   st,
 		DataDir: dataDir,
-		TTL:     30 * time.Second,
-		Now:     clockFn,
+		Now: func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			out := now
+			now = now.Add(time.Second)
+			return out
+		},
 	})
 	require.NoError(t, err)
 
 	a, err := c.Snapshot(context.Background())
 	require.NoError(t, err)
-
-	// Advance the clock past TTL; the next call should build fresh.
-	mu.Lock()
-	now = now.Add(31 * time.Second)
-	mu.Unlock()
-
 	b, err := c.Snapshot(context.Background())
 	require.NoError(t, err)
-	require.NotSame(t, a, b, "snapshot pointer should change after TTL")
-}
-
-func TestCollect_ConcurrentCallsCollapse(t *testing.T) {
-	t.Parallel()
-	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
-
-	c, err := status.New(status.Options{
-		Store:   st,
-		DataDir: dataDir,
-		TTL:     30 * time.Second,
-	})
-	require.NoError(t, err)
-
-	const N = 64
-	var wg sync.WaitGroup
-	results := make([]*status.Snapshot, N)
-	wg.Add(N)
-	for i := range N {
-		go func() {
-			defer wg.Done()
-			snap, err := c.Snapshot(context.Background())
-			require.NoError(t, err)
-			results[i] = snap
-		}()
-	}
-	wg.Wait()
-
-	for i := 1; i < N; i++ {
-		require.Same(t, results[0], results[i])
-	}
+	require.NotSame(t, a, b, "snapshot pointer should change without a snapshot cache")
+	require.NotEqual(t, a.GeneratedAt, b.GeneratedAt)
 }
 
 func TestCollect_PhaseAndEnteredAt(t *testing.T) {

@@ -1,6 +1,7 @@
 package manifest_test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -81,6 +82,36 @@ func TestOpen_NonExistentDir(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "manifest: list segments",
 		"error must be wrapped with the manifest layer's prefix")
+}
+
+func TestOpenBackground_WaitReturnsLoadError(t *testing.T) {
+	t.Parallel()
+	m, err := manifest.OpenBackground(context.Background(), manifest.Options{
+		SegmentsDir: filepath.Join(t.TempDir(), "does-not-exist"),
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	err = m.Wait(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "manifest: list segments")
+}
+
+func TestOpenBackground_MethodsWaitForLoad(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
+		minSeq: 0, maxSeq: 99,
+		minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000,
+		eventCount: 100,
+	})
+
+	m, err := manifest.OpenBackground(context.Background(), manifest.Options{
+		SegmentsDir: dir,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, m.SegmentCount())
 }
 
 func TestOpen_CorruptSegmentAborts(t *testing.T) {

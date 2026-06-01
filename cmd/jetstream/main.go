@@ -232,12 +232,6 @@ func serveCommand() *cli.Command {
 				Value:   false,
 			},
 			&cli.DurationFlag{
-				Name:    "status-cache-ttl",
-				Usage:   "Lifetime of the cached /status snapshot before a new one is built. Lower values (e.g. 1s in local dev) make the dashboard feel live; the production default amortizes pebble scans across requests.",
-				Sources: cli.EnvVars("JETSTREAM_STATUS_CACHE_TTL"),
-				Value:   30 * time.Second,
-			},
-			&cli.DurationFlag{
 				Name:    "cursor-lookback",
 				Usage:   "Maximum age for ?cursor= replay. Cursors older than this are clamped to the floor. 0 disables cursor lookback (cursor query parameter resolves to live tip).",
 				Sources: cli.EnvVars("JETSTREAM_CURSOR_LOOKBACK"),
@@ -340,7 +334,10 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		}
 	}()
 
-	mft, err := manifest.Open(manifest.Options{
+	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	mft, err := manifest.OpenBackground(runCtx, manifest.Options{
 		SegmentsDir:         segmentsDir,
 		BlockIndexCacheSize: cmd.Int("cursor-block-index-cache-size"),
 		Logger:              processLogger,
@@ -359,7 +356,6 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	statusCollector, err := status.New(status.Options{
 		Store:          metaStore,
 		DataDir:        dataDir,
-		TTL:            cmd.Duration("status-cache-ttl"),
 		Manifest:       mft,
 		CursorLookback: cmd.Duration("cursor-lookback"),
 	})
@@ -504,10 +500,17 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		Lookback:  cmd.Duration("cursor-lookback"),
 	}))
 
-	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	g, gctx := errgroup.WithContext(runCtx)
+
+	g.Go(func() error {
+		if err := mft.Wait(gctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return fmt.Errorf("manifest load: %w", err)
+		}
+		return nil
+	})
 
 	g.Go(func() error {
 		return srv.Run(gctx)

@@ -106,7 +106,7 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 	}
 	// Exact counts require scanning every repo/<did> row. On production
 	// instances /status uses only the optional precomputed aggregate so
-	// cache refreshes stay cheap; missing aggregates render as zeros.
+	// snapshot builds stay cheap; missing aggregates render as zeros.
 	counts, ok, err := backfill.LoadCounts(s)
 	if err != nil {
 		return BackfillStats{}, err
@@ -206,9 +206,8 @@ func collectSegmentTree(dir string) (SegmentTreeStats, error) {
 			// Latest file may be torn during rotation; tolerate it. Note:
 			// we already added f.info.Size() to CompressedBytes above, so
 			// CompressedBytes can briefly include bytes that have no matching
-			// UncompressedBytes contribution. Acceptable for a 30s-cached
-			// status page; the next refresh after the rotation completes
-			// will reconcile.
+			// UncompressedBytes contribution. Acceptable for helpful status
+			// data; a later request after rotation completes will reconcile.
 			if i == len(files)-1 {
 				continue
 			}
@@ -351,6 +350,9 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		pdb      PebbleStats
 	)
 	if opts.Manifest != nil {
+		if err := opts.Manifest.Wait(ctx); err != nil {
+			return nil, err
+		}
 		bf, err = collectBackfillFast(opts.Store)
 		if err != nil {
 			return nil, err

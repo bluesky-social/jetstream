@@ -21,7 +21,6 @@ var templateFS embed.FS
 // concrete *status.Collector satisfies it; tests pass a fake.
 type Snapshotter interface {
 	Snapshot(ctx context.Context) (*status.Snapshot, error)
-	TTL() time.Duration
 }
 
 // Handler renders the public /status page. Construct via New.
@@ -118,7 +117,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(h.src.TTL().Seconds())))
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Status-Generated-At", snap.GeneratedAt.UTC().Format(time.RFC3339Nano))
 
 	if r.Method == http.MethodHead {

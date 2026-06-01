@@ -445,7 +445,7 @@ func TestServe_StatusEndpoint(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, "text/html; charset=utf-8", resp.Header.Get("Content-Type"))
-	require.Contains(t, resp.Header.Get("Cache-Control"), "max-age=")
+	require.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
 	require.NotEmpty(t, resp.Header.Get("X-Status-Generated-At"))
 
 	body, err := io.ReadAll(resp.Body)

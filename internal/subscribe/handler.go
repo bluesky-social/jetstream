@@ -139,6 +139,13 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		http.Error(w, "service not ready: cursor replay warming up", http.StatusServiceUnavailable)
 		return
 	default:
+		if err := deps.Manifest.Wait(r.Context()); err != nil {
+			if rawCursor != "" {
+				deps.Metrics.incCursorRequests("unavailable")
+			}
+			http.Error(w, fmt.Sprintf("service not ready: manifest warming up: %s", err.Error()), http.StatusServiceUnavailable)
+			return
+		}
 		resolveStart := time.Now()
 		plan, err := ResolveCursor(rawCursor, CursorEnv{
 			Manifest: deps.Manifest,

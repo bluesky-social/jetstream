@@ -51,6 +51,9 @@ func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Eve
 
 	// 1. Sealed segments.
 	if input.Manifest != nil {
+		if err := input.Manifest.Wait(ctx); err != nil {
+			return err
+		}
 		for {
 			if err := ctx.Err(); err != nil {
 				return err

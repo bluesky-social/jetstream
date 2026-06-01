@@ -18,13 +18,11 @@ import (
 type fakeSnapshotter struct {
 	snap *status.Snapshot
 	err  error
-	ttl  time.Duration
 }
 
 func (f *fakeSnapshotter) Snapshot(_ context.Context) (*status.Snapshot, error) {
 	return f.snap, f.err
 }
-func (f *fakeSnapshotter) TTL() time.Duration { return f.ttl }
 
 func newFixtureSnap() *status.Snapshot {
 	return &status.Snapshot{
@@ -89,7 +87,7 @@ func newFixtureSnapBackfilling() *status.Snapshot {
 func TestHandler_RendersOK(t *testing.T) {
 	t.Parallel()
 	h, err := web.New(web.Options{
-		Snapshotter: &fakeSnapshotter{snap: newFixtureSnap(), ttl: 30 * time.Second},
+		Snapshotter: &fakeSnapshotter{snap: newFixtureSnap()},
 		Now:         func() time.Time { return time.Date(2026, 5, 25, 12, 0, 5, 0, time.UTC) },
 	})
 	require.NoError(t, err)
@@ -100,7 +98,7 @@ func TestHandler_RendersOK(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.Equal(t, "text/html; charset=utf-8", rr.Header().Get("Content-Type"))
-	require.Equal(t, "public, max-age=30", rr.Header().Get("Cache-Control"))
+	require.Equal(t, "no-store", rr.Header().Get("Cache-Control"))
 	require.NotEmpty(t, rr.Header().Get("X-Status-Generated-At"))
 
 	body := rr.Body.String()
@@ -126,7 +124,7 @@ func TestHandler_RendersOK(t *testing.T) {
 func TestHandler_RendersBackfillingState(t *testing.T) {
 	t.Parallel()
 	h, err := web.New(web.Options{
-		Snapshotter: &fakeSnapshotter{snap: newFixtureSnapBackfilling(), ttl: 30 * time.Second},
+		Snapshotter: &fakeSnapshotter{snap: newFixtureSnapBackfilling()},
 	})
 	require.NoError(t, err)
 
@@ -144,7 +142,7 @@ func TestHandler_RendersBackfillingState(t *testing.T) {
 func TestHandler_EscapesXSS(t *testing.T) {
 	t.Parallel()
 	h, err := web.New(web.Options{
-		Snapshotter: &fakeSnapshotter{snap: newFixtureSnap(), ttl: 30 * time.Second},
+		Snapshotter: &fakeSnapshotter{snap: newFixtureSnap()},
 	})
 	require.NoError(t, err)
 
@@ -162,7 +160,7 @@ func TestHandler_EscapesXSS(t *testing.T) {
 func TestHandler_MethodNotAllowed(t *testing.T) {
 	t.Parallel()
 	h, err := web.New(web.Options{
-		Snapshotter: &fakeSnapshotter{snap: newFixtureSnap(), ttl: 30 * time.Second},
+		Snapshotter: &fakeSnapshotter{snap: newFixtureSnap()},
 	})
 	require.NoError(t, err)
 
@@ -177,7 +175,7 @@ func TestHandler_MethodNotAllowed(t *testing.T) {
 func TestHandler_503OnError(t *testing.T) {
 	t.Parallel()
 	h, err := web.New(web.Options{
-		Snapshotter: &fakeSnapshotter{err: errors.New("boom"), ttl: 30 * time.Second},
+		Snapshotter: &fakeSnapshotter{err: errors.New("boom")},
 	})
 	require.NoError(t, err)
 
@@ -192,7 +190,7 @@ func TestHandler_503OnError(t *testing.T) {
 func TestHandler_HEAD(t *testing.T) {
 	t.Parallel()
 	h, err := web.New(web.Options{
-		Snapshotter: &fakeSnapshotter{snap: newFixtureSnap(), ttl: 30 * time.Second},
+		Snapshotter: &fakeSnapshotter{snap: newFixtureSnap()},
 	})
 	require.NoError(t, err)
 

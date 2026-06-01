@@ -100,6 +100,8 @@ type Manifest struct {
 
 	mu       sync.RWMutex
 	segments []SegmentMetadata // sorted by Idx ascending
+	loadErr  error
+	ready    chan struct{}
 }
 
 // Open scans dir, parses every sealed seg_*.jss file's fixed header,
@@ -107,29 +109,62 @@ type Manifest struct {
 // a zero checksum at offset 4..11) are silently skipped; corrupt files
 // produce a wrapped error and abort startup.
 func Open(opts Options) (*Manifest, error) {
+	m, err := newManifest(opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.load(context.Background()); err != nil {
+		m.finishLoad(err)
+		return nil, err
+	}
+	m.finishLoad(nil)
+	return m, nil
+}
+
+// OpenBackground returns a Manifest immediately and starts loading
+// sealed-segment metadata in a background goroutine. Callers that need
+// manifest data must call Wait(ctx) or use Manifest methods, which
+// block until the initial load completes.
+func OpenBackground(ctx context.Context, opts Options) (*Manifest, error) {
+	m, err := newManifest(opts)
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		m.finishLoad(m.load(ctx))
+	}()
+	return m, nil
+}
+
+func newManifest(opts Options) (*Manifest, error) {
 	if opts.SegmentsDir == "" {
 		return nil, fmt.Errorf("manifest: SegmentsDir is required")
 	}
 	if opts.Logger == nil {
 		return nil, fmt.Errorf("manifest: Logger is required")
 	}
-	logger := opts.Logger.With(slog.String("component", "manifest"))
-
-	files, err := ingest.SegmentFiles(opts.SegmentsDir)
-	if err != nil {
-		return nil, fmt.Errorf("manifest: list segments: %w", err)
-	}
-
-	m := &Manifest{
+	return &Manifest{
 		opts:     opts,
-		segments: make([]SegmentMetadata, 0, len(files)),
+		segments: nil,
+		ready:    make(chan struct{}),
+	}, nil
+}
+
+func (m *Manifest) load(ctx context.Context) error {
+	logger := m.opts.Logger.With(slog.String("component", "manifest"))
+
+	files, err := ingest.SegmentFiles(m.opts.SegmentsDir)
+	if err != nil {
+		return fmt.Errorf("manifest: list segments: %w", err)
 	}
 
 	loadConcurrency := manifestLoadConcurrency()
-	loaded, err := loadSealedMetadata(files, loadConcurrency, opts.Metrics)
+	loaded, err := loadSealedMetadata(ctx, files, loadConcurrency, m.opts.Metrics)
 	if err != nil {
-		return nil, err
+		return err
 	}
+
+	m.mu.Lock()
 	m.segments = loaded
 
 	// Defensive: ingest.SegmentFiles already sorts ascending by Idx, but
@@ -137,16 +172,45 @@ func Open(opts Options) (*Manifest, error) {
 	sort.Slice(m.segments, func(i, j int) bool {
 		return m.segments[i].Idx < m.segments[j].Idx
 	})
+	segmentCount := len(m.segments)
+	m.mu.Unlock()
 
-	if opts.Metrics != nil {
-		opts.Metrics.SegmentsLoaded.Set(float64(len(m.segments)))
+	if m.opts.Metrics != nil {
+		m.opts.Metrics.SegmentsLoaded.Set(float64(segmentCount))
 	}
 	logger.Info("opened",
-		"segments_dir", opts.SegmentsDir,
-		"sealed_segments", len(m.segments),
+		"segments_dir", m.opts.SegmentsDir,
+		"sealed_segments", segmentCount,
 		"load_concurrency", loadConcurrency,
 	)
-	return m, nil
+	return nil
+}
+
+func (m *Manifest) finishLoad(err error) {
+	m.mu.Lock()
+	m.loadErr = err
+	m.mu.Unlock()
+	close(m.ready)
+}
+
+// Wait blocks until the initial manifest load finishes. It returns the
+// load error, if any, or ctx.Err() if the caller stops waiting first.
+func (m *Manifest) Wait(ctx context.Context) error {
+	select {
+	case <-m.ready:
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		return m.loadErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manifest) waitReady() error {
+	<-m.ready
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.loadErr
 }
 
 func manifestLoadConcurrency() int {
@@ -162,8 +226,8 @@ type metadataLoadResult struct {
 	sealed bool
 }
 
-func loadSealedMetadata(files []ingest.SegmentFile, concurrency int, metrics *Metrics) ([]SegmentMetadata, error) {
-	results, err := gt.ConcurrentN(context.Background(), files, concurrency, func(f ingest.SegmentFile) (metadataLoadResult, error) {
+func loadSealedMetadata(ctx context.Context, files []ingest.SegmentFile, concurrency int, metrics *Metrics) ([]SegmentMetadata, error) {
+	results, err := gt.ConcurrentN(ctx, files, concurrency, func(f ingest.SegmentFile) (metadataLoadResult, error) {
 		start := time.Now()
 		meta, ok, err := readSealedMetadata(f.Idx, f.Path)
 		if err != nil {
@@ -192,6 +256,9 @@ func loadSealedMetadata(files []ingest.SegmentFile, concurrency int, metrics *Me
 
 // SegmentCount returns the number of sealed segments tracked.
 func (m *Manifest) SegmentCount() int {
+	if err := m.waitReady(); err != nil {
+		return 0
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.segments)
@@ -200,6 +267,9 @@ func (m *Manifest) SegmentCount() int {
 // AllBounds returns a fresh copy of the bounds slice. Useful for tests
 // and operator surface (status page).
 func (m *Manifest) AllBounds() []SegmentBounds {
+	if err := m.waitReady(); err != nil {
+		return nil
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]SegmentBounds, len(m.segments))
@@ -211,6 +281,9 @@ func (m *Manifest) AllBounds() []SegmentBounds {
 
 // SegmentStats returns the in-memory aggregate view of all sealed segments.
 func (m *Manifest) SegmentStats() SegmentTreeStats {
+	if err := m.waitReady(); err != nil {
+		return SegmentTreeStats{Dir: m.opts.SegmentsDir}
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -321,6 +394,9 @@ func isActiveSegmentSentinel(err error) bool {
 // the first segment whose MaxSeq >= seq is the candidate. If that
 // segment's MinSeq is also <= seq, it's a hit.
 func (m *Manifest) SegmentForSeq(seq uint64) (SegmentBounds, bool) {
+	if err := m.waitReady(); err != nil {
+		return SegmentBounds{}, false
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if len(m.segments) == 0 {
@@ -352,6 +428,9 @@ func (m *Manifest) SegmentForSeq(seq uint64) (SegmentBounds, bool) {
 // smallest segment whose MaxIndexedAt covers the request, which
 // gives the earliest possible event with indexed_at >= timeUS.
 func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
+	if err := m.waitReady(); err != nil {
+		return SegmentBounds{}, false
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if len(m.segments) == 0 {
@@ -380,6 +459,9 @@ func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
 // resolver treats that as "no on-disk floor; replay the active
 // segment from the beginning."
 func (m *Manifest) LookbackFloor(lookback time.Duration) (uint64, int64) {
+	if err := m.waitReady(); err != nil {
+		return 0, 0
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if len(m.segments) == 0 {
@@ -403,6 +485,9 @@ func (m *Manifest) LookbackFloor(lookback time.Duration) (uint64, int64) {
 // an existing idx replaces the entry in place (idempotent for repeated
 // callbacks; the on-disk state is authoritative).
 func (m *Manifest) OnSegmentSealed(idx uint64, path string) error {
+	if err := m.waitReady(); err != nil {
+		return err
+	}
 	start := time.Now()
 	meta, ok, err := readSealedMetadata(idx, path)
 	if err != nil {
@@ -440,6 +525,9 @@ func (m *Manifest) OnSegmentSealed(idx uint64, path string) error {
 //
 // The returned slice is shared across callers; treat it as read-only.
 func (m *Manifest) BlockIndex(idx uint64) ([]segment.BlockInfo, error) {
+	if err := m.waitReady(); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for i := range m.segments {
@@ -458,6 +546,9 @@ func (m *Manifest) BlockIndex(idx uint64) ([]segment.BlockInfo, error) {
 
 // SegmentBloom returns the resident segment-level DID bloom for segment idx.
 func (m *Manifest) SegmentBloom(idx uint64) (*gloom.Filter, error) {
+	if err := m.waitReady(); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for i := range m.segments {
@@ -471,6 +562,9 @@ func (m *Manifest) SegmentBloom(idx uint64) (*gloom.Filter, error) {
 // BlockBloom returns the resident per-block DID bloom for segment idx/block idx.
 // The returned filter is shared across callers; treat it as read-only.
 func (m *Manifest) BlockBloom(segIdx uint64, blockIdx int) (*gloom.Filter, error) {
+	if err := m.waitReady(); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for i := range m.segments {
@@ -488,6 +582,9 @@ func (m *Manifest) BlockBloom(segIdx uint64, blockIdx int) (*gloom.Filter, error
 // BlockCollections returns the resident per-block collection ids for segment idx/block idx.
 // The returned slice is shared across callers; treat it as read-only.
 func (m *Manifest) BlockCollections(segIdx uint64, blockIdx int) ([]uint32, error) {
+	if err := m.waitReady(); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for i := range m.segments {
