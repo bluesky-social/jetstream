@@ -5,20 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
-	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -125,17 +121,25 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 	}, nil
 }
 
-func collectManifestSegmentTree(ms manifest.SegmentTreeStats) SegmentTreeStats {
-	stats := SegmentTreeStats{
+func collectManifestSegmentAggregate(ms manifest.SegmentTreeStats, liveDir string) *SegmentAggregate {
+	tree := TreeAggregate{
 		Dir:               ms.Dir,
 		SealedCount:       ms.SealedCount,
+		ActiveCount:       ms.ActiveCount,
 		CompressedBytes:   ms.CompressedBytes,
 		UncompressedBytes: ms.UncompressedBytes,
+		DiskBytes:         ms.DiskBytes,
+		EventCount:        ms.EventCount,
+		BlockCount:        ms.BlockCount,
 		OldestMTime:       ms.OldestMTime,
 		NewestMTime:       ms.NewestMTime,
+		MinSeq:            ms.MinSeq,
+		MaxSeq:            ms.MaxSeq,
+		MinIndexedAt:      microsToTime(ms.MinIndexedAt),
+		MaxIndexedAt:      microsToTime(ms.MaxIndexedAt),
 	}
 	if ms.LatestSegment != nil {
-		stats.LatestSegment = &SegmentSummary{
+		tree.LatestSegment = &SegmentSummary{
 			Index:           ms.LatestSegment.Index,
 			Sealed:          true,
 			EventCount:      ms.LatestSegment.EventCount,
@@ -149,113 +153,26 @@ func collectManifestSegmentTree(ms manifest.SegmentTreeStats) SegmentTreeStats {
 			SizeBytes:       ms.LatestSegment.SizeBytes,
 		}
 	}
-	return stats
-}
 
-func collectSegmentTree(dir string) (SegmentTreeStats, error) {
-	stats := SegmentTreeStats{Dir: dir}
-
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return stats, nil
-		}
-		return stats, fmt.Errorf("status: readdir %s: %w", dir, err)
+	collections := make([]CollectionAggregate, 0, len(ms.Collections))
+	for _, c := range ms.Collections {
+		collections = append(collections, CollectionAggregate{
+			NSID:         c.NSID,
+			EventCount:   c.EventCount,
+			SegmentCount: c.SegmentCount,
+			BlockCount:   c.BlockCount,
+		})
 	}
 
-	type segFile struct {
-		idx  uint64
-		path string
-		info os.FileInfo
+	agg := &SegmentAggregate{
+		Trees: []TreeAggregate{
+			tree,
+			{Dir: liveDir},
+		},
+		Collections: collections,
 	}
-	var files []segFile
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		idx, ok := ingest.ParseSegmentIndex(e.Name())
-		if !ok {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			return stats, fmt.Errorf("status: stat %s: %w", e.Name(), err)
-		}
-		files = append(files, segFile{idx: idx, path: filepath.Join(dir, e.Name()), info: fi})
-	}
-	if len(files) == 0 {
-		return stats, nil
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].idx < files[j].idx })
-
-	stats.OldestMTime = files[0].info.ModTime()
-	stats.NewestMTime = files[0].info.ModTime()
-
-	for i, f := range files {
-		stats.CompressedBytes += f.info.Size()
-		mt := f.info.ModTime()
-		if mt.Before(stats.OldestMTime) {
-			stats.OldestMTime = mt
-		}
-		if mt.After(stats.NewestMTime) {
-			stats.NewestMTime = mt
-		}
-
-		qs, err := segment.QuickStats(f.path)
-		if err != nil {
-			// Latest file may be torn during rotation; tolerate it. Note:
-			// we already added f.info.Size() to CompressedBytes above, so
-			// CompressedBytes can briefly include bytes that have no matching
-			// UncompressedBytes contribution. Acceptable for helpful status
-			// data; a later request after rotation completes will reconcile.
-			if i == len(files)-1 {
-				continue
-			}
-			return stats, fmt.Errorf("status: quickstats %s: %w", f.path, err)
-		}
-		stats.UncompressedBytes += qs.UncompressedBytes
-
-		if qs.Sealed {
-			stats.SealedCount++
-		} else {
-			stats.ActiveCount++
-		}
-	}
-
-	// Latest-segment summary (cheap full Inspect on one file).
-	latest := files[len(files)-1]
-	if summary, err := buildSegmentSummary(latest.path, latest.idx, latest.info.Size()); err == nil {
-		stats.LatestSegment = summary
-	}
-
-	return stats, nil
-}
-
-func buildSegmentSummary(path string, idx uint64, size int64) (*SegmentSummary, error) {
-	ins, err := segment.Inspect(path)
-	if err != nil {
-		return nil, err
-	}
-	return &SegmentSummary{
-		Index:           idx,
-		Sealed:          ins.Sealed,
-		EventCount:      ins.TotalEvents,
-		UniqueDIDCount:  ins.UniqueDIDCount,
-		BlockCount:      uint32(len(ins.Blocks)),
-		CollectionCount: len(ins.Collections),
-		MinSeq:          ins.MinSeq,
-		MaxSeq:          ins.MaxSeq,
-		MinIndexedAt:    microsToTime(ins.MinIndexedAt),
-		MaxIndexedAt:    microsToTime(ins.MaxIndexedAt),
-		SizeBytes:       size,
-	}, nil
-}
-
-func microsToTime(us int64) time.Time {
-	if us == 0 {
-		return time.Time{}
-	}
-	return time.UnixMicro(us).UTC()
+	agg.Network = computeNetworkTotals(agg.Trees, len(agg.Collections))
+	return agg
 }
 
 func collectPebble(s *store.Store, dataDir string) (PebbleStats, error) {
@@ -344,11 +261,15 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 	}
 
 	var (
-		bf       BackfillStats
-		segs     SegmentTreeStats
-		livesegs SegmentTreeStats
-		pdb      PebbleStats
+		bf  BackfillStats
+		agg *SegmentAggregate
+		pdb PebbleStats
 	)
+
+	roots := []string{
+		filepath.Join(opts.DataDir, "segments"),
+		filepath.Join(opts.DataDir, "backfill", "live_segments"),
+	}
 	if opts.Manifest != nil {
 		if err := opts.Manifest.Wait(ctx); err != nil {
 			return nil, err
@@ -357,19 +278,14 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		if err != nil {
 			return nil, err
 		}
-		segs = collectManifestSegmentTree(opts.Manifest.SegmentStats())
-		livesegs = SegmentTreeStats{Dir: filepath.Join(opts.DataDir, "backfill", "live_segments")}
+		agg = collectManifestSegmentAggregate(opts.Manifest.SegmentStats(), roots[1])
 		pdb = collectPebbleFast()
 	} else {
 		bf, err = collectBackfill(opts.Store)
 		if err != nil {
 			return nil, err
 		}
-		segs, err = collectSegmentTree(filepath.Join(opts.DataDir, "segments"))
-		if err != nil {
-			return nil, err
-		}
-		livesegs, err = collectSegmentTree(filepath.Join(opts.DataDir, "backfill", "live_segments"))
+		agg, err = InspectAll(roots, InspectAllOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -378,33 +294,28 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 			return nil, err
 		}
 	}
-
-	snap := &Snapshot{
-		GeneratedAt: now,
-		Process:     collectProcess(now, startedAt),
-		Phase:       phase,
-		Backfill:    bf,
-		Live:        liveStats,
-		Segments:    segs,
-		LiveSegs:    livesegs,
-		Pebble:      pdb,
+	if len(agg.Trees) != 2 {
+		return nil, fmt.Errorf("status: segment aggregate has %d trees, expected 2 (segments + backfill/live_segments); the /status template assumes this shape", len(agg.Trees))
 	}
 
-	if opts.Manifest != nil {
-		snap.CursorLookback.ConfiguredLookback = opts.CursorLookback
+	snap := &Snapshot{
+		GeneratedAt:      now,
+		Process:          collectProcess(now, startedAt),
+		Phase:            phase,
+		Backfill:         bf,
+		Live:             liveStats,
+		SegmentAggregate: agg,
+		Pebble:           pdb,
+	}
+
+	snap.CursorLookback.ConfiguredLookback = opts.CursorLookback
+	if opts.Manifest != nil && opts.CursorLookback > 0 {
 		snap.CursorLookback.ManifestSegmentCount = opts.Manifest.SegmentCount()
-		if opts.CursorLookback > 0 {
-			seq, ts := opts.Manifest.LookbackFloor(opts.CursorLookback)
-			snap.CursorLookback.OldestRetainedSeq = seq
-			if ts != 0 {
-				snap.CursorLookback.OldestRetainedAt = time.UnixMicro(ts)
-			}
+		seq, ts := opts.Manifest.LookbackFloor(opts.CursorLookback)
+		snap.CursorLookback.OldestRetainedSeq = seq
+		if ts != 0 {
+			snap.CursorLookback.OldestRetainedAt = time.UnixMicro(ts)
 		}
-	} else {
-		// No manifest wired in — leave CursorLookback at its zero value.
-		// ConfiguredLookback may still be set so the operator sees the
-		// flag value even before steady-state.
-		snap.CursorLookback.ConfiguredLookback = opts.CursorLookback
 	}
 
 	return snap, nil

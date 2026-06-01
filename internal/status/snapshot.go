@@ -10,15 +10,14 @@ import (
 // single moment. Treated as immutable after construction; consumers
 // share a *Snapshot pointer without locks.
 type Snapshot struct {
-	GeneratedAt    time.Time
-	Process        ProcessInfo
-	Phase          PhaseInfo
-	Backfill       BackfillStats
-	Live           LiveStats
-	Segments       SegmentTreeStats
-	LiveSegs       SegmentTreeStats
-	Pebble         PebbleStats
-	CursorLookback CursorLookbackStats
+	GeneratedAt      time.Time
+	Process          ProcessInfo
+	Phase            PhaseInfo
+	Backfill         BackfillStats
+	Live             LiveStats
+	SegmentAggregate *SegmentAggregate
+	Pebble           PebbleStats
+	CursorLookback   CursorLookbackStats
 }
 
 // ProcessInfo carries the per-process build + uptime context.
@@ -54,20 +53,6 @@ type LiveStats struct {
 	UpstreamCursor int64
 	NextSeq        uint64
 	BootstrapSeq   uint64
-}
-
-// SegmentTreeStats summarizes a single segment tree (segments/ or
-// backfill/live_segments/). LatestSegment is nil if the directory is
-// empty or the latest file couldn't be inspected.
-type SegmentTreeStats struct {
-	Dir               string
-	SealedCount       int
-	ActiveCount       int
-	CompressedBytes   int64
-	UncompressedBytes int64
-	OldestMTime       time.Time
-	NewestMTime       time.Time
-	LatestSegment     *SegmentSummary
 }
 
 // SegmentSummary mirrors segment.Inspection's user-facing fields,

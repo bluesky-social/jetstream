@@ -54,11 +54,20 @@ type SegmentMetadata struct {
 type SegmentTreeStats struct {
 	Dir               string
 	SealedCount       int
+	ActiveCount       int
 	CompressedBytes   int64
 	UncompressedBytes int64
+	DiskBytes         int64
+	EventCount        uint64
+	BlockCount        uint64
 	OldestMTime       time.Time
 	NewestMTime       time.Time
+	MinSeq            uint64
+	MaxSeq            uint64
+	MinIndexedAt      int64
+	MaxIndexedAt      int64
 	LatestSegment     *SegmentSummary
+	Collections       []CollectionStats
 }
 
 // SegmentSummary is the latest-segment projection used by status surfaces.
@@ -73,6 +82,14 @@ type SegmentSummary struct {
 	MinIndexedAt    int64
 	MaxIndexedAt    int64
 	SizeBytes       int64
+}
+
+// CollectionStats is the manifest-owned aggregate view for one NSID.
+type CollectionStats struct {
+	NSID         string
+	EventCount   uint64
+	SegmentCount int
+	BlockCount   uint64
 }
 
 // Options configures Open. SegmentsDir is required; the rest have
@@ -293,17 +310,56 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 	}
 	stats.OldestMTime = m.segments[0].ModTime
 	stats.NewestMTime = m.segments[0].ModTime
+	collections := make(map[string]*CollectionStats)
 	for i := range m.segments {
 		meta := &m.segments[i]
-		stats.CompressedBytes += meta.FileSize
+		stats.DiskBytes += meta.FileSize
+		stats.EventCount += uint64(meta.Header.EventCount)
+		stats.BlockCount += uint64(len(meta.Blocks))
 		for _, b := range meta.Blocks {
+			stats.CompressedBytes += int64(b.CompressedSize)
 			stats.UncompressedBytes += int64(b.UncompressedSize)
+		}
+		if meta.Header.EventCount > 0 {
+			if stats.MinSeq == 0 || meta.Header.MinSeq < stats.MinSeq {
+				stats.MinSeq = meta.Header.MinSeq
+			}
+			if meta.Header.MaxSeq > stats.MaxSeq {
+				stats.MaxSeq = meta.Header.MaxSeq
+			}
+			if stats.MinIndexedAt == 0 || meta.Header.MinIndexedAt < stats.MinIndexedAt {
+				stats.MinIndexedAt = meta.Header.MinIndexedAt
+			}
+			if meta.Header.MaxIndexedAt > stats.MaxIndexedAt {
+				stats.MaxIndexedAt = meta.Header.MaxIndexedAt
+			}
 		}
 		if meta.ModTime.Before(stats.OldestMTime) {
 			stats.OldestMTime = meta.ModTime
 		}
 		if meta.ModTime.After(stats.NewestMTime) {
 			stats.NewestMTime = meta.ModTime
+		}
+
+		blockCountsByID := make(map[uint32]uint64, len(meta.Collections))
+		for _, ids := range meta.BlockCollections {
+			for _, id := range ids {
+				blockCountsByID[id]++
+			}
+		}
+		for i, nsid := range meta.Collections {
+			agg, ok := collections[nsid]
+			if !ok {
+				agg = &CollectionStats{NSID: nsid}
+				collections[nsid] = agg
+			}
+			var events uint32
+			if i < len(meta.CollectionEventCounts) {
+				events = meta.CollectionEventCounts[i]
+			}
+			agg.EventCount += uint64(events)
+			agg.SegmentCount++
+			agg.BlockCount += blockCountsByID[uint32(i)]
 		}
 	}
 
@@ -320,6 +376,16 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 		MaxIndexedAt:    latest.Header.MaxIndexedAt,
 		SizeBytes:       latest.FileSize,
 	}
+	stats.Collections = make([]CollectionStats, 0, len(collections))
+	for _, c := range collections {
+		stats.Collections = append(stats.Collections, *c)
+	}
+	sort.Slice(stats.Collections, func(i, j int) bool {
+		if stats.Collections[i].EventCount != stats.Collections[j].EventCount {
+			return stats.Collections[i].EventCount > stats.Collections[j].EventCount
+		}
+		return stats.Collections[i].NSID < stats.Collections[j].NSID
+	})
 	return stats
 }
 
