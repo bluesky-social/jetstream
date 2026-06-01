@@ -107,13 +107,15 @@
     {{if eq .Backfill.TotalDIDs 0}}
       <p class="sub">Backfill has not started.</p>
     {{else if .Backfill.ListReposCursor}}
+      <div class="bar"><div style="width: {{percentString .Backfill.PercentComplete}}"></div></div>
       <dl>
         <dt>State</dt>
         <dd>enumerating repos</dd>
+        <dt>Progress so far</dt>
+        <dd>{{printf "%.2f%%" .Backfill.PercentComplete}}
+            ({{humanInt .Backfill.Complete}} / {{humanInt .Backfill.TotalDIDs}} DIDs)</dd>
         <dt>Discovered so far</dt>
         <dd>{{humanInt .Backfill.TotalDIDs}}</dd>
-        <dt>Backfilled</dt>
-        <dd>{{humanInt .Backfill.Complete}}</dd>
         <dt>Pending</dt>
         <dd>{{humanInt .Backfill.Discovered}}</dd>
         <dt>Failed</dt>

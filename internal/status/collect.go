@@ -101,8 +101,8 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 		return BackfillStats{}, err
 	}
 	// Exact counts require scanning every repo/<did> row. On production
-	// instances /status uses only the optional precomputed aggregate so
-	// snapshot builds stay cheap; missing aggregates render as zeros.
+	// instances /status uses the maintained aggregate so snapshot
+	// builds stay cheap; missing aggregates render as zeros.
 	counts, ok, err := backfill.LoadCounts(s)
 	if err != nil {
 		return BackfillStats{}, err

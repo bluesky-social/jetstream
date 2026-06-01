@@ -130,6 +130,8 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "steady_state")
 	require.Contains(t, body, "Backfill")
 	require.Contains(t, body, "enumerating repos")
+	require.Contains(t, body, "Progress so far")
+	require.Contains(t, body, "80.00%")
 	require.Contains(t, body, "Discovered so far")
 	require.Contains(t, body, "100")
 	require.Contains(t, body, "Latest segment")

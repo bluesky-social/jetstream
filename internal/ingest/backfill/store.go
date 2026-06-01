@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -28,8 +29,9 @@ import (
 // Store implements atmosbackfill.Store against the shared pebble
 // metadata store. Construct via NewStore.
 type Store struct {
-	db      *store.Store
-	metrics *Metrics
+	db       *store.Store
+	metrics  *Metrics
+	countsMu sync.Mutex
 }
 
 // Compile-time guarantee that Store satisfies the atmos contract.
@@ -86,6 +88,73 @@ func (s *Store) putRepoStatus(did atmos.DID, rs *RepoStatus) error {
 	return nil
 }
 
+func (s *Store) putRepoStatusAndCounts(did atmos.DID, rs *RepoStatus, hadRow bool, old Status) error {
+	enc, err := encodeRepoStatus(rs)
+	if err != nil {
+		return err
+	}
+
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+
+	counts, ok, err := LoadCounts(s.db)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		counts, err = CountStatuses(s.db)
+		if err != nil {
+			return err
+		}
+	}
+	applyCountTransition(&counts, hadRow, old, rs.Backfill.Status)
+	countsEnc, err := encodeCounts(counts)
+	if err != nil {
+		return err
+	}
+
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.Set(repoKey(did), enc, nil); err != nil {
+		return fmt.Errorf("backfill: stage repo/%s: %w", did, err)
+	}
+	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
+		return fmt.Errorf("backfill: stage counts: %w", err)
+	}
+	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: write repo/%s and counts: %w", did, err)
+	}
+	return nil
+}
+
+func applyCountTransition(c *Counts, hadRow bool, old, next Status) {
+	if !hadRow {
+		c.Total++
+	}
+	if hadRow && old == next {
+		return
+	}
+	if p := countBucket(c, old); p != nil && *p > 0 {
+		*p--
+	}
+	if p := countBucket(c, next); p != nil {
+		*p++
+	}
+}
+
+func countBucket(c *Counts, st Status) *uint64 {
+	switch st {
+	case StatusNotStarted:
+		return &c.Discovered
+	case StatusComplete:
+		return &c.Complete
+	case StatusFailed:
+		return &c.Failed
+	default:
+		return nil
+	}
+}
+
 // readRepoStatus is the RMW helper for OnUpdate/OnComplete/OnFail.
 // It returns (nil, nil) when the row doesn't exist so callers can
 // decide whether absence is an error in their context.
@@ -112,7 +181,7 @@ func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) er
 		},
 		Active: entry.Active,
 	}
-	if err := s.putRepoStatus(entry.DID, rs); err != nil {
+	if err := s.putRepoStatusAndCounts(entry.DID, rs, false, ""); err != nil {
 		return err
 	}
 	s.metrics.incDiscovered()
@@ -154,6 +223,8 @@ func (s *Store) OnComplete(_ context.Context, did atmos.DID, commit *repo.Commit
 	if err != nil {
 		return err
 	}
+	hadRow := rs != nil
+	old := Status("")
 	if rs == nil {
 		// Defensive: the engine only fires OnComplete after a Lookup
 		// returned Discovered/Failed, so the row exists. If somehow
@@ -161,6 +232,8 @@ func (s *Store) OnComplete(_ context.Context, did atmos.DID, commit *repo.Commit
 		// download already happened and we don't want to lose the
 		// progress signal.
 		rs = &RepoStatus{}
+	} else {
+		old = rs.Backfill.Status
 	}
 	now := timeNow()
 	rs.Backfill.Status = StatusComplete
@@ -169,7 +242,7 @@ func (s *Store) OnComplete(_ context.Context, did atmos.DID, commit *repo.Commit
 	rs.Backfill.LastError = ""
 	rs.Rev = commit.Rev
 	rs.UpdatedAt = now
-	if err := s.putRepoStatus(did, rs); err != nil {
+	if err := s.putRepoStatusAndCounts(did, rs, hadRow, old); err != nil {
 		return err
 	}
 	s.metrics.incCompleted()
@@ -191,13 +264,17 @@ func (s *Store) OnFail(_ context.Context, did atmos.DID, failErr error, attempts
 		s.metrics.incOnFailErrors()
 		return err
 	}
+	hadRow := rs != nil
+	old := Status("")
 	if rs == nil {
 		rs = &RepoStatus{}
+	} else {
+		old = rs.Backfill.Status
 	}
 	rs.Backfill.Status = StatusFailed
 	rs.Backfill.LastError = failErr.Error()
 	rs.Backfill.Attempts = attempts
-	if err := s.putRepoStatus(did, rs); err != nil {
+	if err := s.putRepoStatusAndCounts(did, rs, hadRow, old); err != nil {
 		s.metrics.incOnFailErrors()
 		return err
 	}

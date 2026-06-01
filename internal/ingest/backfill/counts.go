@@ -32,19 +32,35 @@ func LoadCounts(s *store.Store) (Counts, bool, error) {
 	}
 	defer func() { _ = closer.Close() }()
 
-	var c Counts
-	if err := json.Unmarshal(val, &c); err != nil {
-		return Counts{}, false, fmt.Errorf("backfill: decode counts: %w", err)
+	c, err := decodeCounts(val)
+	if err != nil {
+		return Counts{}, false, err
 	}
 	return c, true, nil
 }
 
-// SaveCounts writes aggregate counts. It is exported for repair/migration
-// tools and tests; hot write paths deliberately do not maintain it.
-func SaveCounts(s *store.Store, c Counts) error {
+func decodeCounts(val []byte) (Counts, error) {
+	var c Counts
+	if err := json.Unmarshal(val, &c); err != nil {
+		return Counts{}, fmt.Errorf("backfill: decode counts: %w", err)
+	}
+	return c, nil
+}
+
+func encodeCounts(c Counts) ([]byte, error) {
 	enc, err := json.Marshal(c)
 	if err != nil {
-		return fmt.Errorf("backfill: encode counts: %w", err)
+		return nil, fmt.Errorf("backfill: encode counts: %w", err)
+	}
+	return enc, nil
+}
+
+// SaveCounts writes aggregate counts. It is exported for repair/migration
+// tools and tests; normal backfill state transitions maintain it via Store.
+func SaveCounts(s *store.Store, c Counts) error {
+	enc, err := encodeCounts(c)
+	if err != nil {
+		return err
 	}
 	if err := s.Set([]byte(countsKey), enc, store.SyncWrites); err != nil {
 		return fmt.Errorf("backfill: write counts: %w", err)

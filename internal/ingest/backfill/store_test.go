@@ -317,3 +317,58 @@ func TestStore_OnComplete_ClearsLastError(t *testing.T) {
 	require.Equal(t, "", rs.Backfill.LastError, "OnComplete must clear LastError")
 	require.Equal(t, StatusComplete, rs.Backfill.Status)
 }
+
+func TestStore_MaintainsCounts(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	done := atmos.DID("did:plc:done")
+	recovered := atmos.DID("did:plc:recovered")
+	failed := atmos.DID("did:plc:failed")
+
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: done, Active: true}))
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: recovered, Active: true}))
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: failed, Active: true}))
+
+	counts, ok, err := LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, Counts{Total: 3, Discovered: 3}, counts)
+
+	require.NoError(t, s.OnComplete(ctx, done, &repo.Commit{DID: string(done), Rev: "rev-done"}))
+	require.NoError(t, s.OnFail(ctx, recovered, errors.New("temporary"), 1))
+	require.NoError(t, s.OnFail(ctx, failed, errors.New("permanent"), 1))
+
+	counts, ok, err = LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, Counts{Total: 3, Complete: 1, Failed: 2}, counts)
+
+	require.NoError(t, s.OnComplete(ctx, recovered, &repo.Commit{DID: string(recovered), Rev: "rev-recovered"}))
+
+	counts, ok, err = LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, Counts{Total: 3, Complete: 2, Failed: 1}, counts)
+}
+
+func TestStore_SeedsMissingCountsFromRows(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	existing := atmos.DID("did:plc:existing")
+	require.NoError(t, s.putRepoStatus(existing, &RepoStatus{
+		Backfill: RepoBackfillStatus{Status: StatusComplete},
+		Active:   true,
+	}))
+
+	next := atmos.DID("did:plc:next")
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: next, Active: true}))
+
+	counts, ok, err := LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, Counts{Total: 2, Discovered: 1, Complete: 1}, counts)
+}
