@@ -231,6 +231,58 @@ func TestCollect_WithManifestSkipsRepoScan(t *testing.T) {
 	require.False(t, hasRepoCount, "manifest-backed status must not count Pebble keyspaces")
 }
 
+func TestCollect_WithManifestIncludesWritableTails(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	segmentsDir := filepath.Join(dataDir, "segments")
+	liveDir := filepath.Join(dataDir, "backfill", "live_segments")
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	require.NoError(t, os.MkdirAll(liveDir, 0o755))
+	require.NoError(t, makeSealedStatusSegment(filepath.Join(segmentsDir, "seg_0000000000.jss")))
+
+	mft, err := manifest.Open(manifest.Options{
+		SegmentsDir: segmentsDir,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	writeActiveSegment(t, segmentsDir, 1, []segment.Event{
+		{Seq: 3, IndexedAt: 1_700_000_000_000_003, Kind: segment.KindCreate, DID: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", Collection: "app.bsky.feed.like", Rkey: "r", Rev: "v", Payload: []byte("p")},
+	})
+	writeActiveSegment(t, liveDir, 0, []segment.Event{
+		{Seq: 4, IndexedAt: 1_700_000_000_000_004, Kind: segment.KindCreate, DID: "did:plc:cccccccccccccccccccccccc", Collection: "app.bsky.graph.follow", Rkey: "r", Rev: "v", Payload: []byte("p")},
+	})
+
+	require.NoError(t, backfill.SaveCounts(st, backfill.Counts{Total: 10, Discovered: 10, Complete: 8}))
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir, Manifest: mft})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, snap.SegmentAggregate.Trees, 2)
+	require.Equal(t, 1, snap.SegmentAggregate.Trees[0].SealedCount)
+	require.Equal(t, 1, snap.SegmentAggregate.Trees[0].ActiveCount)
+	require.Equal(t, uint64(3), snap.SegmentAggregate.Trees[0].EventCount)
+	require.NotNil(t, snap.SegmentAggregate.Trees[0].LatestSegment)
+	require.False(t, snap.SegmentAggregate.Trees[0].LatestSegment.Sealed)
+	require.Equal(t, uint64(1), snap.SegmentAggregate.Trees[0].LatestSegment.Index)
+
+	require.Equal(t, 0, snap.SegmentAggregate.Trees[1].SealedCount)
+	require.Equal(t, 1, snap.SegmentAggregate.Trees[1].ActiveCount)
+	require.Equal(t, uint64(1), snap.SegmentAggregate.Trees[1].EventCount)
+
+	require.Equal(t, 3, snap.SegmentAggregate.Network.Segments)
+	require.Equal(t, 1, snap.SegmentAggregate.Network.SealedSegments)
+	require.Equal(t, 2, snap.SegmentAggregate.Network.ActiveSegments)
+	require.Equal(t, uint64(4), snap.SegmentAggregate.Network.Events)
+	require.Equal(t, 3, snap.SegmentAggregate.Network.Collections)
+}
+
 func TestCollect_CursorLookback_NoManifest(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()

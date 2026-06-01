@@ -54,6 +54,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			Logger:         o.cfg.Logger,
 			Metrics:        o.cfg.IngestMetrics,
 			SegmentMetrics: o.cfg.SegmentMetrics,
+			OnAfterSeal:    o.cfg.IngestOnAfterSeal,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open backfill ingest writer: %w", err)

@@ -75,6 +75,29 @@
     border-top: 1px solid var(--border);
   }
   .latest h3 { margin: 0 0 0.5rem 0; font-size: 0.95rem; color: var(--muted); font-weight: 500; }
+  .collections-table {
+    border-collapse: collapse;
+    table-layout: fixed;
+    width: 100%;
+  }
+  .collections-table th,
+  .collections-table td {
+    padding: 0.25rem 0.5rem;
+    vertical-align: top;
+  }
+  .collections-table thead tr { border-bottom: 1px solid var(--border); }
+  .collections-table th { text-align: left; }
+  .collections-table .count-col { width: 7.25rem; }
+  .collections-table .nsid code {
+    display: block;
+    overflow-wrap: anywhere;
+    word-break: normal;
+  }
+  .collections-table .num {
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+  }
 </style>
 </head>
 <body>
@@ -240,22 +263,28 @@
     <h2>Collections</h2>
     {{with .SegmentAggregate}}
     {{if .Collections}}
-    <table style="border-collapse: collapse; width: 100%;">
+    <table class="collections-table">
+      <colgroup>
+        <col>
+        <col class="count-col">
+        <col class="count-col">
+        <col class="count-col">
+      </colgroup>
       <thead>
-        <tr style="text-align: left; border-bottom: 1px solid var(--border);">
-          <th style="padding: 0.25rem 0.5rem;">NSID</th>
-          <th style="padding: 0.25rem 0.5rem; text-align: right;">Events</th>
-          <th style="padding: 0.25rem 0.5rem; text-align: right;">Segments</th>
-          <th style="padding: 0.25rem 0.5rem; text-align: right;">Blocks</th>
+        <tr>
+          <th>NSID</th>
+          <th class="num">Events</th>
+          <th class="num">Segments</th>
+          <th class="num">Blocks</th>
         </tr>
       </thead>
       <tbody>
       {{range .Collections}}
         <tr>
-          <td style="padding: 0.25rem 0.5rem;"><code>{{.NSID}}</code></td>
-          <td style="padding: 0.25rem 0.5rem; text-align: right; font-variant-numeric: tabular-nums;">{{humanInt .EventCount}}</td>
-          <td style="padding: 0.25rem 0.5rem; text-align: right; font-variant-numeric: tabular-nums;">{{.SegmentCount}}</td>
-          <td style="padding: 0.25rem 0.5rem; text-align: right; font-variant-numeric: tabular-nums;">{{humanInt .BlockCount}}</td>
+          <td class="nsid"><code>{{.NSID}}</code></td>
+          <td class="num">{{humanInt .EventCount}}</td>
+          <td class="num">{{.SegmentCount}}</td>
+          <td class="num">{{humanInt .BlockCount}}</td>
         </tr>
       {{end}}
       </tbody>

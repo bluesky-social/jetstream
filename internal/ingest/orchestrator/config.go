@@ -94,9 +94,8 @@ type Config struct {
 	// development while running against production.
 	SkipMergeDiscovery bool
 
-	// IngestOnAfterSeal is forwarded to the steady-state live
-	// consumer's OnAfterSeal hook, which forwards to the inner
-	// ingest.Writer. Used by cmd/jetstream to wire the manifest's
+	// IngestOnAfterSeal is forwarded to every writer that appends to
+	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's
 	// OnSegmentSealed callback. Optional.
 	IngestOnAfterSeal func(idx uint64, path string) error
 

@@ -5,16 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"runtime"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -121,7 +124,7 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 	}, nil
 }
 
-func collectManifestSegmentAggregate(ms manifest.SegmentTreeStats, liveDir string) *SegmentAggregate {
+func treeFromManifest(ms manifest.SegmentTreeStats) TreeAggregate {
 	tree := TreeAggregate{
 		Dir:               ms.Dir,
 		SealedCount:       ms.SealedCount,
@@ -153,7 +156,10 @@ func collectManifestSegmentAggregate(ms manifest.SegmentTreeStats, liveDir strin
 			SizeBytes:       ms.LatestSegment.SizeBytes,
 		}
 	}
+	return tree
+}
 
+func collectionsFromManifest(ms manifest.SegmentTreeStats) map[string]*CollectionAggregate {
 	collections := make([]CollectionAggregate, 0, len(ms.Collections))
 	for _, c := range ms.Collections {
 		collections = append(collections, CollectionAggregate{
@@ -163,16 +169,124 @@ func collectManifestSegmentAggregate(ms manifest.SegmentTreeStats, liveDir strin
 			BlockCount:   c.BlockCount,
 		})
 	}
+	out := make(map[string]*CollectionAggregate, len(collections))
+	for i := range collections {
+		c := collections[i]
+		out[c.NSID] = &c
+	}
+	return out
+}
+
+func collectManifestSegmentAggregate(ms manifest.SegmentTreeStats, roots []string) (*SegmentAggregate, error) {
+	tree := treeFromManifest(ms)
+	collections := collectionsFromManifest(ms)
+
+	activeTail, tailWarnings, err := scanActiveTail(roots[0], collections)
+	if err != nil {
+		return nil, err
+	}
+	mergeTree(&tree, activeTail)
+
+	liveTree, liveWarnings, err := scanTree(roots[1], InspectAllOptions{}, collections)
+	if err != nil {
+		return nil, err
+	}
 
 	agg := &SegmentAggregate{
 		Trees: []TreeAggregate{
 			tree,
-			{Dir: liveDir},
+			liveTree,
 		},
-		Collections: collections,
+		Warnings: append(tailWarnings, liveWarnings...),
 	}
+	agg.Collections = materializeCollections(collections)
 	agg.Network = computeNetworkTotals(agg.Trees, len(agg.Collections))
-	return agg
+	return agg, nil
+}
+
+func scanActiveTail(root string, collections map[string]*CollectionAggregate) (TreeAggregate, []string, error) {
+	tree := TreeAggregate{Dir: root}
+	files, err := ingest.SegmentFiles(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return tree, nil, nil
+		}
+		return TreeAggregate{}, nil, err
+	}
+	if len(files) == 0 {
+		return tree, nil, nil
+	}
+
+	tail := files[len(files)-1]
+	info, err := os.Stat(tail.Path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return tree, nil, nil
+		}
+		return TreeAggregate{}, nil, fmt.Errorf("status: stat %s: %w", tail.Path, err)
+	}
+	ins, inspectErr := segment.Inspect(tail.Path)
+	if inspectErr != nil {
+		// Same tolerance as InspectAll: the tail can be mid-rotation.
+		return tree, nil, nil //nolint:nilerr
+	}
+	if ins.Sealed {
+		return tree, nil, nil
+	}
+
+	tree.OldestMTime = info.ModTime()
+	tree.NewestMTime = info.ModTime()
+	tree.ActiveCount = 1
+	tree.DiskBytes = ins.FileSize
+	tree.LatestSegment = &SegmentSummary{
+		Index:           tail.Idx,
+		Sealed:          false,
+		EventCount:      ins.TotalEvents,
+		UniqueDIDCount:  ins.UniqueDIDCount,
+		BlockCount:      uint32(len(ins.Blocks)),
+		CollectionCount: len(ins.Collections),
+		MinSeq:          ins.MinSeq,
+		MaxSeq:          ins.MaxSeq,
+		MinIndexedAt:    microsToTime(ins.MinIndexedAt),
+		MaxIndexedAt:    microsToTime(ins.MaxIndexedAt),
+		SizeBytes:       ins.FileSize,
+	}
+	foldInspection(&tree, ins, collections)
+	return tree, nil, nil
+}
+
+func mergeTree(dst *TreeAggregate, src TreeAggregate) {
+	dst.SealedCount += src.SealedCount
+	dst.ActiveCount += src.ActiveCount
+	dst.CompressedBytes += src.CompressedBytes
+	dst.UncompressedBytes += src.UncompressedBytes
+	dst.DiskBytes += src.DiskBytes
+	dst.EventCount += src.EventCount
+	dst.BlockCount += src.BlockCount
+
+	if !src.OldestMTime.IsZero() && (dst.OldestMTime.IsZero() || src.OldestMTime.Before(dst.OldestMTime)) {
+		dst.OldestMTime = src.OldestMTime
+	}
+	if src.NewestMTime.After(dst.NewestMTime) {
+		dst.NewestMTime = src.NewestMTime
+	}
+	if src.EventCount > 0 {
+		if dst.MinSeq == 0 || src.MinSeq < dst.MinSeq {
+			dst.MinSeq = src.MinSeq
+		}
+		if src.MaxSeq > dst.MaxSeq {
+			dst.MaxSeq = src.MaxSeq
+		}
+		if !src.MinIndexedAt.IsZero() && (dst.MinIndexedAt.IsZero() || src.MinIndexedAt.Before(dst.MinIndexedAt)) {
+			dst.MinIndexedAt = src.MinIndexedAt
+		}
+		if src.MaxIndexedAt.After(dst.MaxIndexedAt) {
+			dst.MaxIndexedAt = src.MaxIndexedAt
+		}
+	}
+	if src.LatestSegment != nil && (dst.LatestSegment == nil || src.LatestSegment.Index >= dst.LatestSegment.Index) {
+		dst.LatestSegment = src.LatestSegment
+	}
 }
 
 func collectPebble(s *store.Store, dataDir string) (PebbleStats, error) {
@@ -278,7 +392,10 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		if err != nil {
 			return nil, err
 		}
-		agg = collectManifestSegmentAggregate(opts.Manifest.SegmentStats(), roots[1])
+		agg, err = collectManifestSegmentAggregate(opts.Manifest.SegmentStats(), roots)
+		if err != nil {
+			return nil, err
+		}
 		pdb = collectPebbleFast()
 	} else {
 		bf, err = collectBackfill(opts.Store)

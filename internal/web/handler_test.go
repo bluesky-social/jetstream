@@ -73,6 +73,7 @@ func newFixtureSnap() *status.Snapshot {
 				{NSID: "app.bsky.feed.post", EventCount: 9000, SegmentCount: 5, BlockCount: 30},
 				{NSID: "app.bsky.feed.like", EventCount: 3000, SegmentCount: 4, BlockCount: 10},
 				{NSID: "app.bsky.graph.follow", EventCount: 345, SegmentCount: 2, BlockCount: 2},
+				{NSID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaahhh", EventCount: 1, SegmentCount: 1, BlockCount: 1},
 			},
 			Network: status.NetworkTotals{
 				Segments:          6,
@@ -144,6 +145,8 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "1d 12h") // 36h formatted by humanDuration
 	require.Contains(t, body, "15")     // ManifestSegmentCount
 	require.Contains(t, body, "5,000")  // OldestRetainedSeq formatted
+	require.Contains(t, body, `class="collections-table"`)
+	require.Contains(t, body, "overflow-wrap: anywhere")
 }
 
 func TestHandler_RendersBackfillingState(t *testing.T) {
