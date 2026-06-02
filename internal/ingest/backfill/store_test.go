@@ -216,6 +216,33 @@ func TestStore_OnComplete_WritesComplete(t *testing.T) {
 	require.False(t, rs.UpdatedAt.IsZero())
 }
 
+func TestStore_OnCompleteRunsHookAfterDurableRow(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t).db
+	s := NewStore(db, nil)
+
+	ctx := context.Background()
+	did := atmos.DID("did:plc:hooked")
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+
+	var hookSawComplete bool
+	s.afterComplete = func(ctx context.Context, got atmos.DID) error {
+		require.Equal(t, did, got)
+		val, closer, err := db.Get(RepoKey(string(got)))
+		require.NoError(t, err)
+		defer func() { _ = closer.Close() }()
+
+		rs, err := DecodeRepoStatus(val)
+		require.NoError(t, err)
+		hookSawComplete = rs.Backfill.Status == StatusComplete && rs.Backfill.Rev == "rev-hooked"
+		return nil
+	}
+
+	require.NoError(t, s.OnComplete(ctx, did, &repo.Commit{DID: string(did), Rev: "rev-hooked"}))
+	require.True(t, hookSawComplete, "completion hook must run after the Complete row is durable and readable")
+}
+
 // TestStore_OnComplete_PreservesExtraFields locks in the RMW
 // guarantee: a future PR may add fields like RecordCount; OnComplete
 // must not clobber them. We simulate this by writing a row with a

@@ -100,14 +100,15 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		g.Go(func() error {
 			err := backfill.Run(gctx, backfill.Config{
-				Store:      o.cfg.Store,
-				HTTPClient: o.cfg.HTTPClient,
-				Directory:  o.cfg.Directory,
-				Writer:     bw,
-				RelayURL:   o.cfg.RelayURL,
-				Logger:     o.cfg.Logger,
-				Metrics:    o.cfg.BackfillMetrics,
-				MaxRepos:   o.cfg.MaxBackfillRepos,
+				Store:             o.cfg.Store,
+				HTTPClient:        o.cfg.HTTPClient,
+				Directory:         o.cfg.Directory,
+				Writer:            bw,
+				RelayURL:          o.cfg.RelayURL,
+				Logger:            o.cfg.Logger,
+				Metrics:           o.cfg.BackfillMetrics,
+				MaxRepos:          o.cfg.MaxBackfillRepos,
+				AfterRepoComplete: o.cfg.AfterRepoComplete,
 			})
 			if err != nil {
 				return err

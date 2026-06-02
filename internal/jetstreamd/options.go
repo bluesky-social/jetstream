@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/jcalabro/atmos"
 )
 
 // PhaseBarrier is a test hook that can pause execution after a major
@@ -42,5 +43,6 @@ type Options struct {
 	CursorBlockIndexCacheSize int
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
+	AfterRepoComplete         func(context.Context, atmos.DID) error
 	OnSteadyStateEvent        func(*segment.Event)
 }

@@ -1,6 +1,7 @@
 set shell := ["bash", "-cu"]
 set dotenv-load
 
+# Runs the linter and tests
 default: lint test
 
 # Ensures that all tools required for local development are installed
@@ -76,7 +77,7 @@ test-race *ARGS="./...":
     just test-long -race {{ARGS}}
 
 # Runs the heavier simulator oracle mode.
-oracle-stress:
+oracle:
     JETSTREAM_ORACLE_MODE=stress gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 ./internal/oracle -run TestOracle_DefaultLifecycle
 
 # Sweeps oracle stress mode across deterministic seeds. Intended for nightly CI;

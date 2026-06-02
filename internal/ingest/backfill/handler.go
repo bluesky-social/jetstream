@@ -27,10 +27,11 @@ import (
 // two HandleRepo calls overlap for the same DID; ingest.Writer is
 // safe across DIDs.
 type SegmentHandler struct {
-	writer  *ingest.Writer
-	logger  *slog.Logger
-	now     func() time.Time
-	metrics *Metrics
+	writer        *ingest.Writer
+	logger        *slog.Logger
+	now           func() time.Time
+	metrics       *Metrics
+	onWriterError func(error)
 }
 
 // Compile-time assertion.
@@ -64,8 +65,9 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 		defer func() { h.metrics.observeHandleRepo(start, retErr) }()
 
 		indexedAt := h.now().UnixMicro()
+		appended := false
 
-		return r.Tree.Walk(func(key string, cid cbor.CID) error {
+		if err := r.Tree.Walk(func(key string, cid cbor.CID) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -88,11 +90,30 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 				Payload:    payload,
 			}
 			if err := h.writer.Append(ctx, &ev); err != nil {
-				return fmt.Errorf("backfill: did=%s append %s/%s: %w", did, collection, rkey, err)
+				err = fmt.Errorf("backfill: did=%s append %s/%s: %w", did, collection, rkey, err)
+				h.abortOnWriterError(err)
+				return err
 			}
+			appended = true
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
+		if appended {
+			if err := h.writer.Flush(ctx); err != nil {
+				err = fmt.Errorf("backfill: did=%s flush before complete: %w", did, err)
+				h.abortOnWriterError(err)
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+func (h *SegmentHandler) abortOnWriterError(err error) {
+	if h.onWriterError != nil {
+		h.onWriterError(err)
+	}
 }
 
 // splitMSTKey splits "collection/rkey" into its parts. The MST

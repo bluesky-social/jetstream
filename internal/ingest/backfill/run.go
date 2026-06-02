@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
@@ -50,6 +51,10 @@ type Config struct {
 	// Metrics is optional; nil means we still run, just without
 	// /metrics counters incrementing.
 	Metrics *Metrics
+
+	// AfterRepoComplete is a test-only restart hook invoked after a
+	// repo completion row is durably written. Leave nil in production.
+	AfterRepoComplete func(context.Context, atmos.DID) error
 
 	// MaxRepos, when > 0, is a debug-only ceiling on the number of
 	// repos this Run will fully download before stopping early and
@@ -93,8 +98,29 @@ func Run(ctx context.Context, cfg Config) error {
 			Directory: gt.Some(cfg.Directory),
 		})
 
+		runCtx, cancelRun := context.WithCancel(ctx)
+		defer cancelRun()
+
+		var fatalMu sync.Mutex
+		var fatalErr error
+		recordFatal := func(err error) {
+			fatalMu.Lock()
+			if fatalErr == nil {
+				fatalErr = err
+			}
+			fatalMu.Unlock()
+			cancelRun()
+		}
+		loadFatal := func() error {
+			fatalMu.Lock()
+			defer fatalMu.Unlock()
+			return fatalErr
+		}
+
 		st := NewStore(cfg.Store, cfg.Metrics)
+		st.afterComplete = cfg.AfterRepoComplete
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
+		handler.onWriterError = recordFatal
 		logger := cfg.Logger.With(slog.String("component", "backfill/run"))
 
 		startCursor, err := LoadListReposCursor(cfg.Store)
@@ -105,17 +131,11 @@ func Run(ctx context.Context, cfg Config) error {
 			logger.InfoContext(ctx, "resuming from saved cursor", "cursor", startCursor)
 		}
 
-		// runCtx is what we hand to the atmos engine. When MaxRepos is
-		// set we wrap ctx with a cancel we trip from OnProgress so the
-		// engine drains in the same "producer cancelled" path it uses
-		// for any other ctx cancellation. limitTripped distinguishes
-		// "we cancelled because the debug ceiling was reached" (return
-		// nil) from "the outer ctx was cancelled" (propagate).
-		runCtx, cancelRun := ctx, func() {}
-		if cfg.MaxRepos > 0 {
-			runCtx, cancelRun = context.WithCancel(ctx)
-		}
-		defer cancelRun()
+		// runCtx is what we hand to the atmos engine. We cancel it for
+		// local writer failures and for MaxRepos so workers stop before
+		// atmos can record a per-DID failure for infrastructure state.
+		// limitTripped distinguishes "debug ceiling reached" (return nil)
+		// from "outer ctx cancelled" (propagate).
 		var limitTripped atomic.Bool
 
 		engine := atmosbackfill.NewEngine(atmosbackfill.Options{
@@ -154,6 +174,10 @@ func Run(ctx context.Context, cfg Config) error {
 
 		logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL, "max_repos", cfg.MaxRepos)
 		if err := engine.Run(runCtx); err != nil {
+			if fatal := loadFatal(); fatal != nil {
+				logger.ErrorContext(ctx, "engine aborted after local writer error", "err", fatal)
+				return fmt.Errorf("backfill: %w", fatal)
+			}
 			// Internal limit-driven cancel: the outer ctx is still healthy,
 			// only our derived runCtx was cancelled. Treat as a clean drain
 			// so the orchestrator advances to merge.
@@ -163,6 +187,10 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			logger.ErrorContext(ctx, "engine returned error", "err", err)
 			return fmt.Errorf("backfill: %w", err)
+		}
+		if fatal := loadFatal(); fatal != nil {
+			logger.ErrorContext(ctx, "engine aborted after local writer error", "err", fatal)
+			return fmt.Errorf("backfill: %w", fatal)
 		}
 
 		logger.InfoContext(ctx, "engine drained")

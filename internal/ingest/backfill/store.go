@@ -29,9 +29,10 @@ import (
 // Store implements atmosbackfill.Store against the shared pebble
 // metadata store. Construct via NewStore.
 type Store struct {
-	db       *store.Store
-	metrics  *Metrics
-	countsMu sync.Mutex
+	db            *store.Store
+	metrics       *Metrics
+	afterComplete func(context.Context, atmos.DID) error
+	countsMu      sync.Mutex
 }
 
 // Compile-time guarantee that Store satisfies the atmos contract.
@@ -218,7 +219,7 @@ func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) erro
 // (RecordCount, TotalBytes) added between OnDiscover and OnComplete
 // survives. atmos's no-concurrent-callback guarantee per-DID makes
 // the RMW race-free.
-func (s *Store) OnComplete(_ context.Context, did atmos.DID, commit *repo.Commit) error {
+func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Commit) error {
 	rs, err := s.readRepoStatus(did)
 	if err != nil {
 		return err
@@ -244,6 +245,11 @@ func (s *Store) OnComplete(_ context.Context, did atmos.DID, commit *repo.Commit
 	rs.UpdatedAt = now
 	if err := s.putRepoStatusAndCounts(did, rs, hadRow, old); err != nil {
 		return err
+	}
+	if s.afterComplete != nil {
+		if err := s.afterComplete(ctx, did); err != nil {
+			return err
+		}
 	}
 	s.metrics.incCompleted()
 	return nil

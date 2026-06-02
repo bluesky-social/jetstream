@@ -43,6 +43,17 @@ just fuzz 30s ./segment         # fuzz every Fuzz* target for 30s each
 just modernize                  # apply gopls modernize rewrites
 ```
 
+Oracle tests live in `internal/oracle` and compare Jetstream's durable output against a simulator model. Run them after changes to ingest, segment persistence, lifecycle/orchestrator phases, cursor handling, or restart recovery:
+
+```sh
+just test ./internal/oracle                                      # fast short-mode oracle checks
+just test-long ./internal/oracle -run TestOracle_Restart -v      # non-short restart/recovery oracle
+just oracle                                                      # heavier stress oracle mode
+just oracle-sweep                                                # deterministic multi-seed stress sweep
+```
+
+The default `just` target intentionally runs short tests, so it does not execute non-short restart or stress oracle coverage. Use `just test-long` or the dedicated oracle recipes when the change could affect crash/restart correctness or end-to-end event fidelity.
+
 Configuration is env-var driven (`JETSTREAM_*`). Defaults for local dev land in the committed `.env`; `just run-prod` overrides inline. Do not put secrets in `.env`.
 
 ## Observability
@@ -61,6 +72,7 @@ Use the package-level metrics/tracer rather than rolling your own. `obs.Tracer("
     - Fuzz and property-based tests for untrusted input and edge cases that violate invariants.
     - Swarm tests for meaningful randomness (not white-noise flakes).
     - Smoke tests against real production occasionally.
+    - Oracle tests that run a seeded simulator that validate data correctness at various parts of the server lifecycle
     - Tests must be fast. If a package's full test suite takes >1s, question it and try to bring it under a second.
 - **Observability over logging.** Minimal stdout/stderr. Instrument with Prometheus metrics and OTEL traces liberally.
 - **Local dev simplicity.** The justfile is the UX. CI mirrors it as closely as possible.

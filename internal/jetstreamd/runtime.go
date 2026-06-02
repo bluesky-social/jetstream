@@ -272,6 +272,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		IngestOnAfterSeal:     mft.OnSegmentSealed,
 		BarrierAfterBootstrap: phaseBarrier(opts.BarrierAfterBootstrap),
 		BarrierAfterMerge:     phaseBarrier(opts.BarrierAfterMerge),
+		AfterRepoComplete:     opts.AfterRepoComplete,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			writerPtr.Store(w)
 		},

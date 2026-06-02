@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -580,6 +581,62 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	require.True(t, found, "segment must contain at least one block")
 	require.GreaterOrEqual(t, maxSeq, uint64(1),
 		"two repos × 1 record each = 2 events; max seq must be at least 1")
+}
+
+func TestRun_WriterFlushErrorAbortsWithoutMarkingRepoFailed(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:flush-fails")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+
+	dataDir := t.TempDir()
+	db, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	errFlush := errors.New("flush failed")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(dataDir, "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4096,
+		MaxSegmentBytes:   1 << 30,
+		OnAfterFlush: func(context.Context) error {
+			return errFlush
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
+	for did, f := range fixtures {
+		docs[did] = &identity.DIDDocument{
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		}
+	}
+
+	err = Run(t.Context(), Config{
+		Store:      db,
+		Directory:  &identity.Directory{Resolver: &stubResolver{docs: docs}},
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Writer:     w,
+		RelayURL:   srv.srv.URL,
+		Logger:     logger,
+	})
+	require.ErrorIs(t, err, errFlush)
+
+	got, err := NewStore(db, nil).Lookup(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateDiscovered, got.State,
+		"local writer durability errors must abort the run, not become a per-DID failure")
 }
 
 // TestRun_PersistsBootstrapLastListReposCursor confirms the bootstrap-

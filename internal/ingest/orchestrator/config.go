@@ -11,6 +11,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
@@ -120,6 +121,10 @@ type Config struct {
 	// PhaseSteadyState and before the steady-state live consumer starts.
 	// Intended for deterministic validation harnesses; production leaves it nil.
 	BarrierAfterMerge PhaseBarrier
+
+	// AfterRepoComplete is forwarded to the backfill store after a repo
+	// completion row is durable; test-only restart hook; production leaves nil.
+	AfterRepoComplete func(context.Context, atmos.DID) error
 }
 
 func (c *Config) validate() error {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/mst"
@@ -54,6 +55,16 @@ func buildSingleRecordRepo(t *testing.T, did atmos.DID, collection, rkey string,
 	return r, commit
 }
 
+func collectActiveEvents(t *testing.T, path string) []segment.Event {
+	t.Helper()
+	var events []segment.Event
+	require.NoError(t, segment.WalkActive(path, func(block []segment.Event) error {
+		events = append(events, block...)
+		return nil
+	}))
+	return events
+}
+
 // TestSegmentHandler_EmitsOneEventPerRecord pins the contract: a
 // repo with K records lands K Create rows in the segment with the
 // expected (DID, Collection, Rkey, Rev) coordinates.
@@ -73,6 +84,36 @@ func TestSegmentHandler_EmitsOneEventPerRecord(t *testing.T) {
 
 	require.Equal(t, uint64(1), w.NextSeq(),
 		"one record yields exactly one event")
+}
+
+func TestSegmentHandler_HandleRepoFlushesBeforeReturning(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	segmentsDir := filepath.Join(dir, "segments")
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       segmentsDir,
+		Store:             st,
+		MaxEventsPerBlock: 4096,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	did := atmos.DID("did:plc:flush-before-complete")
+	r, commit := buildSingleRecordRepo(t,
+		did, "app.bsky.feed.post", "rkey1",
+		map[string]any{"text": "flush before complete"})
+	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	require.NoError(t, h.HandleRepo(t.Context(), did, r, commit))
+
+	events := collectActiveEvents(t, filepath.Join(segmentsDir, ingest.SegmentFilename(0)))
+	require.Len(t, events, 1, "HandleRepo must flush appended rows before returning to the engine")
 }
 
 // TestSegmentHandler_NilWriterPanics pins the constructor's

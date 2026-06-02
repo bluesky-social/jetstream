@@ -2,9 +2,12 @@ package jetstreamd
 
 import (
 	"bytes"
+	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jcalabro/atmos"
 	"github.com/stretchr/testify/require"
 )
 
@@ -15,6 +18,20 @@ func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
 	opts.SegmentCacheMaxAge = -time.Second
 	_, err := Build(t.Context(), opts)
 	require.ErrorContains(t, err, "SegmentCacheMaxAge must be >= 0")
+}
+
+func TestOptionsExposeAfterRepoCompleteHook(t *testing.T) {
+	t.Parallel()
+
+	var called atomic.Bool
+	opts := testOptions(t)
+	opts.AfterRepoComplete = func(context.Context, atmos.DID) error {
+		called.Store(true)
+		return nil
+	}
+
+	require.NotNil(t, opts.AfterRepoComplete)
+	require.False(t, called.Load())
 }
 
 func testOptions(t *testing.T) Options {
