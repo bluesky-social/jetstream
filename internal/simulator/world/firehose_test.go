@@ -55,3 +55,19 @@ func TestPersistAndRange(t *testing.T) {
 	require.Len(t, frames, 1)
 	require.Equal(t, byte(5), frames[0][0])
 }
+
+func TestPersistFirehoseFramePersistsSeqInSameCommitPoint(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.DataDir = filepath.Join(t.TempDir(), "simulator")
+	w, err := New(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	require.NoError(t, w.persistFirehoseFrame(7, []byte("frame-7")))
+
+	seq, err := w.loadSeq()
+	require.NoError(t, err)
+	require.Equal(t, int64(7), seq)
+}

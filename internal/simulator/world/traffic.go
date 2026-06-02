@@ -172,9 +172,6 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 	if err := w.persistFirehoseFrame(seq, frame); err != nil {
 		return nil, err
 	}
-	if err := w.saveSeq(seq); err != nil {
-		return nil, err
-	}
 	w.fanout.Publish(frame)
 	return frame, nil
 }

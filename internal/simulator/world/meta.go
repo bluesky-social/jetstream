@@ -79,9 +79,9 @@ func (w *World) loadSeq() (int64, error) {
 	return int64(binary.BigEndian.Uint64(val)), nil
 }
 
-// saveSeq writes sim/meta/seq with pebble.NoSync — the seq is updated
-// in the same batch as the firehose-event row, so durability comes
-// from that batch.
+// saveSeq writes sim/meta/seq with pebble.NoSync. Live firehose
+// generation uses persistFirehoseFrame so seq and frame share one
+// commit point; saveSeq exists for tests and direct metadata setup.
 func (w *World) saveSeq(seq int64) error {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(seq))

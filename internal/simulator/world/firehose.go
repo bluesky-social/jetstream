@@ -118,6 +118,11 @@ func (w *World) persistFirehoseFrame(seq int64, frame []byte) error {
 	if err := b.Set(keyFirehose(seq), frame, nil); err != nil {
 		return fmt.Errorf("world: stage firehose row: %w", err)
 	}
+	var seqBuf [8]byte
+	binary.BigEndian.PutUint64(seqBuf[:], uint64(seq))
+	if err := b.Set(keyMetaSeq, seqBuf[:], nil); err != nil {
+		return fmt.Errorf("world: stage firehose seq: %w", err)
+	}
 
 	// Trim. The oldest seq we want to retain is seq - history + 1.
 	if w.cfg.FirehoseHistory > 0 && seq > int64(w.cfg.FirehoseHistory) {

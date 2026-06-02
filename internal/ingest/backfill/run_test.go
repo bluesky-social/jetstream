@@ -639,6 +639,57 @@ func TestRun_WriterFlushErrorAbortsWithoutMarkingRepoFailed(t *testing.T) {
 		"local writer durability errors must abort the run, not become a per-DID failure")
 }
 
+func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:after-complete-fails")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+
+	dataDir := t.TempDir()
+	db, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(dataDir, "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4096,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
+	for did, f := range fixtures {
+		docs[did] = &identity.DIDDocument{
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		}
+	}
+
+	errHook := errors.New("after complete hook failed")
+	err = Run(t.Context(), Config{
+		Store:      db,
+		Directory:  &identity.Directory{Resolver: &stubResolver{docs: docs}},
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Writer:     w,
+		RelayURL:   srv.srv.URL,
+		Logger:     logger,
+		AfterRepoComplete: func(context.Context, atmos.DID) error {
+			return errHook
+		},
+	})
+	require.ErrorIs(t, err, errHook)
+}
+
 // TestRun_PersistsBootstrapLastListReposCursor confirms the bootstrap-
 // last cursor is written on every non-empty page. The merge phase needs
 // the last non-empty cursor to resume listRepos for new-DID discovery.

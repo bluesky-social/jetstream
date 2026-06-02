@@ -29,10 +29,11 @@ import (
 // Store implements atmosbackfill.Store against the shared pebble
 // metadata store. Construct via NewStore.
 type Store struct {
-	db            *store.Store
-	metrics       *Metrics
-	afterComplete func(context.Context, atmos.DID) error
-	countsMu      sync.Mutex
+	db                 *store.Store
+	metrics            *Metrics
+	afterComplete      func(context.Context, atmos.DID) error
+	afterCompleteError func(error)
+	countsMu           sync.Mutex
 }
 
 // Compile-time guarantee that Store satisfies the atmos contract.
@@ -248,6 +249,10 @@ func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Comm
 	}
 	if s.afterComplete != nil {
 		if err := s.afterComplete(ctx, did); err != nil {
+			err = fmt.Errorf("backfill: after complete hook %s: %w", did, err)
+			if s.afterCompleteError != nil {
+				s.afterCompleteError(err)
+			}
 			return err
 		}
 	}

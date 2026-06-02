@@ -119,6 +119,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 		st := NewStore(cfg.Store, cfg.Metrics)
 		st.afterComplete = cfg.AfterRepoComplete
+		st.afterCompleteError = recordFatal
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 		handler.onWriterError = recordFatal
 		logger := cfg.Logger.With(slog.String("component", "backfill/run"))

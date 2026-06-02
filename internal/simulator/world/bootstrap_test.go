@@ -1,11 +1,13 @@
 package world
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"path/filepath"
 	"testing"
 
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/stretchr/testify/require"
 )
 
@@ -109,6 +111,38 @@ func TestBootstrap_DeterministicAcrossRuns(t *testing.T) {
 	require.Equal(t, a1.DID, a2.DID)
 }
 
+func TestBootstrap_ResumeAfterCompletedAccountMatchesUninterruptedBootstrap(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.Accounts = 4
+	cfg.InitialRecords = 8
+	cfg.Seed = 17
+	cfg.DataDir = filepath.Join(t.TempDir(), "full")
+
+	full, err := New(context.Background(), cfg)
+	require.NoError(t, err)
+	_, err = full.EnsureSeed()
+	require.NoError(t, err)
+	require.NoError(t, full.Bootstrap(context.Background(), slog.Default()))
+	defer func() { _ = full.Close() }()
+
+	resumeCfg := cfg
+	resumeCfg.DataDir = filepath.Join(t.TempDir(), "resume")
+	resumed, err := New(context.Background(), resumeCfg)
+	require.NoError(t, err)
+	_, err = resumed.EnsureSeed()
+	require.NoError(t, err)
+	defer func() { _ = resumed.Close() }()
+
+	bootstrapOnlyAccount(t, resumed, cfg, 0)
+	require.NoError(t, resumed.Bootstrap(context.Background(), slog.Default()))
+
+	for idx := range cfg.Accounts {
+		requireRecordMapsEqual(t, accountRecords(t, full, idx), accountRecords(t, resumed, idx), idx)
+	}
+}
+
 func TestBootstrap_ZeroInitialRecordsStillMaterializesRepo(t *testing.T) {
 	t.Parallel()
 
@@ -162,4 +196,67 @@ func TestInitialRecordCounts_AreZeroInflatedHeavyTail(t *testing.T) {
 	require.Greater(t, zeros, 0, "default oracle needs empty repos")
 	require.Greater(t, handful, 0, "default oracle needs small repos")
 	require.Greater(t, tail, 0, "default oracle needs large-ish repos")
+}
+
+func bootstrapOnlyAccount(t *testing.T, w *World, cfg Config, idx int) {
+	t.Helper()
+
+	accounts := make([]account, cfg.Accounts)
+	for i := range cfg.Accounts {
+		a, err := deriveAccount(cfg.Seed, i)
+		require.NoError(t, err)
+		accounts[i] = a
+	}
+
+	b := w.db.NewBatch()
+	require.NoError(t, w.saveAccount(b, accounts[idx]))
+	require.NoError(t, b.Commit(nil))
+	require.NoError(t, b.Close())
+
+	counts := initialRecordCounts(cfg)
+	r := bootstrapRecordRand(cfg.Seed, idx)
+	rp, err := newEmptyRepo(accounts[idx])
+	require.NoError(t, err)
+	for range counts[idx] {
+		coll := chooseCreateCollection(r)
+		target := accounts[r.IntN(len(accounts))].DID
+		rkey := newRkey(r)
+		rec := generateRecord(r, coll, string(target))
+		require.NoError(t, rp.Create(coll, rkey, rec))
+	}
+	_, err = w.commitAndPersist(accounts[idx], rp)
+	require.NoError(t, err)
+}
+
+func accountRecords(t *testing.T, w *World, idx int) map[string][]byte {
+	t.Helper()
+
+	a, err := w.loadAccount(idx)
+	require.NoError(t, err)
+	rp, err := w.loadRepo(a)
+	require.NoError(t, err)
+
+	out := make(map[string][]byte)
+	require.NoError(t, rp.Tree.Walk(func(key string, cid cbor.CID) error {
+		payload, err := rp.Store.GetBlock(cid)
+		if err != nil {
+			return err
+		}
+		out[key] = append([]byte(nil), payload...)
+		return nil
+	}))
+	return out
+}
+
+func requireRecordMapsEqual(t *testing.T, want, got map[string][]byte, accountIdx int) {
+	t.Helper()
+
+	require.Len(t, got, len(want), "account %d record count diverged", accountIdx)
+	for key, wantPayload := range want {
+		gotPayload, ok := got[key]
+		require.True(t, ok, "account %d missing key %s", accountIdx, key)
+		require.True(t, bytes.Equal(wantPayload, gotPayload),
+			"account %d payload diverged for key %s: want_len=%d got_len=%d",
+			accountIdx, key, len(wantPayload), len(gotPayload))
+	}
 }

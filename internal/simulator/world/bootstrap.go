@@ -17,10 +17,6 @@ import (
 // content-dependent on whether a previous run had bootstrapped fully.
 func (w *World) Bootstrap(ctx context.Context, logger *slog.Logger) error {
 	logger = logger.With(slog.String("component", "simulator/bootstrap"))
-	// Stream 0xb007 ("boot") namespaces the bootstrap RNG away from
-	// the live-traffic stream so the two never share state.
-	r := rand.New(rand.NewPCG(w.cfg.Seed, 0xb007))
-
 	// Pre-derive every account so account picks for like/follow/repost
 	// targets can come from the full roster.
 	accounts := make([]account, w.cfg.Accounts)
@@ -70,6 +66,7 @@ func (w *World) Bootstrap(ctx context.Context, logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		r := bootstrapRecordRand(w.cfg.Seed, i)
 		for range counts[i] {
 			coll := chooseCreateCollection(r)
 			target := accounts[r.IntN(len(accounts))].DID
@@ -89,4 +86,11 @@ func (w *World) Bootstrap(ctx context.Context, logger *slog.Logger) error {
 	}
 	logger.InfoContext(ctx, "bootstrap complete", "accounts", len(accounts))
 	return nil
+}
+
+func bootstrapRecordRand(seed uint64, accountIdx int) *rand.Rand {
+	// Per-account streams keep bootstrap resume deterministic. A
+	// completed account may be skipped on restart, and that must not
+	// change the random content generated for later accounts.
+	return rand.New(rand.NewPCG(seed^0xb007, uint64(accountIdx)^0x1a17))
 }
