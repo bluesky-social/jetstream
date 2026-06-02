@@ -267,6 +267,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		BackfillMetrics:       backfill.NewMetrics(metrics.Registry),
 		SegmentMetrics:        segmentMetrics,
 		OnEvent:               onSteadyStateEvent,
+		OnBootstrapLiveEvent:  opts.OnBootstrapLiveEvent,
 		MaxBackfillRepos:      opts.MaxBackfillRepos,
 		SkipMergeDiscovery:    opts.SkipMergeDiscovery,
 		IngestOnAfterSeal:     mft.OnSegmentSealed,

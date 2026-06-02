@@ -88,6 +88,12 @@ type Config struct {
 	// events go to backfill/live_segments and are not user-visible.
 	OnEvent func(*segment.Event)
 
+	// OnBootstrapLiveEvent, if non-nil, is forwarded to the bootstrap-time
+	// live.Consumer after durable append. This is a validation hook for
+	// oracle/restart tests that need deterministic cutover acknowledgements;
+	// production leaves it nil so bootstrap events are not user-visible.
+	OnBootstrapLiveEvent func(*segment.Event)
+
 	// MaxBackfillRepos, when > 0, caps the bootstrap-phase backfill
 	// engine at this many fully-downloaded repos and then advances to
 	// the merge phase. Debug-only knob for fast local-dev iteration

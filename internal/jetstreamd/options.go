@@ -44,5 +44,6 @@ type Options struct {
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
 	AfterRepoComplete         func(context.Context, atmos.DID) error
+	OnBootstrapLiveEvent      func(*segment.Event)
 	OnSteadyStateEvent        func(*segment.Event)
 }

@@ -71,6 +71,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			Metrics:        o.cfg.LiveMetrics,
 			Verifier:       o.cfg.Verifier,
 			SegmentMetrics: o.cfg.SegmentMetrics,
+			OnEvent:        o.cfg.OnBootstrapLiveEvent,
 		})
 		if err != nil {
 			if cerr := bw.Close(); cerr != nil {

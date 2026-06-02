@@ -2,6 +2,7 @@ package oracle
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
 	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/jcalabro/atmos"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,8 +55,19 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	dataDir := t.TempDir()
 	afterBootstrap := newPhaseGate()
 	afterMerge := newPhaseGate()
+	bootstrapAck := newSeqAck()
 	steadyAck := newSeqAck()
 	ctx, cancel := context.WithCancel(t.Context())
+	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, func(ctx context.Context) (int64, error) {
+		_, err := w.GenerateOneForTest(ctx)
+		if err != nil {
+			return 0, err
+		}
+		return w.CurrentSeq(), nil
+	})
+	bootstrapTraffic.afterBatch = func(ctx context.Context, targetSeq int64) error {
+		return bootstrapAck.WaitContiguousFrom(ctx, 1, targetSeq, oracleWaitTimeout(cfg))
+	}
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
 		PublicAddr:                "127.0.0.1:0",
@@ -78,7 +91,9 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		CursorBlockIndexCacheSize: 32,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
+		OnBootstrapLiveEvent:      bootstrapAck.Observe,
 		OnSteadyStateEvent:        steadyAck.Observe,
+		AfterRepoComplete:         bootstrapTraffic.AfterRepoComplete,
 	})
 	require.NoError(t, err)
 
@@ -101,7 +116,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	}()
 
 	waitForBarrier(t, cfg, "after-bootstrap", afterBootstrap, run)
-	assertOracleMatches(t, dataDir, w, cfg, "after-bootstrap")
+	assertBootstrapOracleMatches(t, dataDir, w, cfg)
 	afterBootstrap.Release()
 
 	waitForBarrier(t, cfg, "after-merge", afterMerge, run)
@@ -137,6 +152,20 @@ func assertOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Confi
 	require.NoErrorf(t, Compare(want, got), "%s mode=%s seed=%d: compare oracle model", phase, cfg.Mode, cfg.Seed)
 
 	t.Logf("%s: oracle matched %d observed events in mode=%s seed=%d", phase, len(events), cfg.Mode, cfg.Seed)
+}
+
+func assertBootstrapOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Config) {
+	t.Helper()
+
+	want, err := GroundTruthFromWorld(w)
+	require.NoErrorf(t, err, "after-bootstrap mode=%s seed=%d: build ground truth", cfg.Mode, cfg.Seed)
+	events, err := ObserveBootstrapSegments(dataDir)
+	require.NoErrorf(t, err, "after-bootstrap mode=%s seed=%d: observe bootstrap segments", cfg.Mode, cfg.Seed)
+	got, err := Reconstruct(events)
+	require.NoErrorf(t, err, "after-bootstrap mode=%s seed=%d: reconstruct observed events", cfg.Mode, cfg.Seed)
+	require.NoErrorf(t, Compare(want, got), "after-bootstrap mode=%s seed=%d: compare oracle model", cfg.Mode, cfg.Seed)
+
+	t.Logf("after-bootstrap: oracle matched %d observed events in mode=%s seed=%d", len(events), cfg.Mode, cfg.Seed)
 }
 
 type phaseGate struct {
@@ -175,7 +204,7 @@ type runtimeRun struct {
 func waitForBarrier(t *testing.T, cfg Config, name string, gate *phaseGate, run *runtimeRun) {
 	t.Helper()
 
-	timer := time.NewTimer(60 * time.Second)
+	timer := time.NewTimer(oracleWaitTimeout(cfg))
 	defer timer.Stop()
 	select {
 	case <-gate.entered:
@@ -185,6 +214,17 @@ func waitForBarrier(t *testing.T, cfg Config, name string, gate *phaseGate, run 
 	case <-timer.C:
 		t.Fatalf("%s barrier not reached before timeout: mode=%s seed=%d", name, cfg.Mode, cfg.Seed)
 	}
+}
+
+func oracleWaitTimeout(cfg Config) time.Duration {
+	timeout := 60 * time.Second
+	if cfg.LiveEventsBootstrap > 0 {
+		scaled := time.Duration(cfg.LiveEventsBootstrap/100) * time.Second
+		if scaled > timeout {
+			timeout = scaled
+		}
+	}
+	return timeout
 }
 
 func generateN(t *testing.T, w *world.World, n int) {
@@ -245,6 +285,30 @@ func (a *seqAck) Wait(t *testing.T, cfg Config, target int64, run *runtimeRun, t
 	case <-timer.C:
 		t.Fatalf("timeout waiting for contiguous steady-state upstream seq %d: mode=%s seed=%d seen=%d highest_contiguous=%d",
 			target, cfg.Mode, cfg.Seed, a.seenCount(), a.highestContiguous())
+	}
+}
+
+func (a *seqAck) WaitContiguousFrom(ctx context.Context, start, target int64, timeout time.Duration) error {
+	if target < start {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		if a.highestContiguousFrom(start) >= target {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("timeout waiting for contiguous upstream seq %d from %d: seen=%d highest_contiguous=%d",
+				target, start, a.seenCount(), a.highestContiguousFrom(start))
+		case <-tick.C:
+		}
 	}
 }
 
@@ -313,6 +377,18 @@ func (a *seqAck) highestContiguous() int64 {
 	}
 }
 
+func (a *seqAck) highestContiguousFrom(start int64) int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	h := start - 1
+	for {
+		if _, ok := a.seen[h+1]; !ok {
+			return h
+		}
+		h++
+	}
+}
+
 func waitForRuntimeExit(t *testing.T, cfg Config, run *runtimeRun) {
 	t.Helper()
 
@@ -332,4 +408,53 @@ func (w testWriter) Write(p []byte) (int, error) {
 	w.t.Helper()
 	w.t.Logf("%s", p)
 	return len(p), nil
+}
+
+type bootstrapTrafficGenerator struct {
+	mu         sync.Mutex
+	accounts   int
+	target     int
+	completed  int
+	generated  int
+	generate   func(context.Context) (int64, error)
+	afterBatch func(context.Context, int64) error
+}
+
+func newBootstrapTrafficGenerator(accounts, target int, generate func(context.Context) (int64, error)) *bootstrapTrafficGenerator {
+	return &bootstrapTrafficGenerator{
+		accounts: accounts,
+		target:   target,
+		generate: generate,
+	}
+}
+
+func (g *bootstrapTrafficGenerator) AfterRepoComplete(ctx context.Context, _ atmos.DID) error {
+	if g == nil || g.target <= 0 {
+		return nil
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	g.completed++
+	remainingEvents := g.target - g.generated
+	if remainingEvents <= 0 {
+		return nil
+	}
+
+	remainingAccounts := max(1, g.accounts-g.completed+1)
+	n := (remainingEvents + remainingAccounts - 1) / remainingAccounts
+	var lastSeq int64
+	for range n {
+		seq, err := g.generate(ctx)
+		if err != nil {
+			return err
+		}
+		lastSeq = seq
+		g.generated++
+	}
+	if g.afterBatch != nil && lastSeq > 0 {
+		return g.afterBatch(ctx, lastSeq)
+	}
+	return nil
 }

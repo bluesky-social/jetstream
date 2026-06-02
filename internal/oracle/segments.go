@@ -3,6 +3,7 @@ package oracle
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 
@@ -11,7 +12,37 @@ import (
 )
 
 func ObserveSegments(dataDir string) ([]ObservedEvent, error) {
-	files, err := ingest.SegmentFiles(filepath.Join(dataDir, "segments"))
+	return observeSegmentDir(filepath.Join(dataDir, "segments"))
+}
+
+func ObserveBootstrapSegments(dataDir string) ([]ObservedEvent, error) {
+	primary, err := observeSegmentDir(filepath.Join(dataDir, "segments"))
+	if err != nil {
+		return nil, err
+	}
+	if err := CheckInvariants(primary); err != nil {
+		return nil, fmt.Errorf("primary segments: %w", err)
+	}
+
+	live, err := observeSegmentDir(filepath.Join(dataDir, "backfill", "live_segments"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return EventsSortedBySeq(primary), nil
+		}
+		return nil, err
+	}
+
+	if err := CheckInvariants(live); err != nil {
+		return nil, fmt.Errorf("bootstrap live segments: %w", err)
+	}
+
+	out := EventsSortedBySeq(primary)
+	out = append(out, EventsSortedBySeq(live)...)
+	return out, nil
+}
+
+func observeSegmentDir(dir string) ([]ObservedEvent, error) {
+	files, err := ingest.SegmentFiles(dir)
 	if err != nil {
 		return nil, err
 	}
