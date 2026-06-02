@@ -14,29 +14,33 @@ var ErrDataDirReserved = errors.New("world: --data-dir cannot be ./data; use ./d
 
 // Config drives *World construction.
 type Config struct {
-	DataDir         string
-	Reset           bool
-	Seed            uint64
-	Accounts        int
-	InitialRecords  int
-	CommitsPerSec   float64
-	RateMultiplier  float64
-	FirehoseHistory int
-	RepoCacheSize   int
+	DataDir           string
+	Reset             bool
+	Seed              uint64
+	Accounts          int
+	InitialRecords    int
+	InitialRecordsMin int
+	InitialRecordsMax int
+	CommitsPerSec     float64
+	RateMultiplier    float64
+	FirehoseHistory   int
+	RepoCacheSize     int
 }
 
 // DefaultConfig returns simulator defaults matching the design doc.
 func DefaultConfig() Config {
 	return Config{
-		DataDir:         "./data/simulator",
-		Reset:           false,
-		Seed:            42,
-		Accounts:        10000,
-		InitialRecords:  5,
-		CommitsPerSec:   10,
-		RateMultiplier:  1.0,
-		FirehoseHistory: 10000,
-		RepoCacheSize:   512,
+		DataDir:           "./data/simulator",
+		Reset:             false,
+		Seed:              42,
+		Accounts:          10000,
+		InitialRecords:    0,
+		InitialRecordsMin: 0,
+		InitialRecordsMax: 1000,
+		CommitsPerSec:     10,
+		RateMultiplier:    1.0,
+		FirehoseHistory:   10000,
+		RepoCacheSize:     512,
 	}
 }
 
@@ -71,6 +75,15 @@ func (c Config) validate() error {
 	}
 	if c.InitialRecords < 0 {
 		return fmt.Errorf("world: InitialRecords must be >= 0 (got %d)", c.InitialRecords)
+	}
+	if c.InitialRecordsMin < 0 {
+		return fmt.Errorf("world: InitialRecordsMin must be >= 0 (got %d)", c.InitialRecordsMin)
+	}
+	if c.InitialRecordsMax < 0 {
+		return fmt.Errorf("world: InitialRecordsMax must be >= 0 (got %d)", c.InitialRecordsMax)
+	}
+	if c.InitialRecordsMax < c.InitialRecordsMin {
+		return fmt.Errorf("world: InitialRecordsMax must be >= InitialRecordsMin (got %d < %d)", c.InitialRecordsMax, c.InitialRecordsMin)
 	}
 	if c.FirehoseHistory < 0 {
 		return fmt.Errorf("world: FirehoseHistory must be >= 0 (got %d)", c.FirehoseHistory)

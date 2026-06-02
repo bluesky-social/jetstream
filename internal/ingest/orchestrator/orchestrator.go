@@ -68,6 +68,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			// written and the bootstrap-time subsystems are torn down.
 			// Merge has NOT run and PhaseSteadyState has NOT been written;
 			// fall through to do both.
+			if o.cfg.BarrierAfterBootstrap != nil {
+				if err := o.cfg.BarrierAfterBootstrap(ctx); err != nil {
+					return fmt.Errorf("orchestrator: after-bootstrap barrier: %w", err)
+				}
+			}
+
 			fallthrough
 		case lifecycle.PhaseMerging:
 			// Either we just got here from bootstrap (fallthrough — in
@@ -89,6 +95,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 			if err := o.writeSteadyStatePhase(); err != nil {
 				return err
+			}
+
+			if o.cfg.BarrierAfterMerge != nil {
+				if err := o.cfg.BarrierAfterMerge(ctx); err != nil {
+					return fmt.Errorf("orchestrator: after-merge barrier: %w", err)
+				}
 			}
 
 			fallthrough

@@ -54,41 +54,15 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	identcache "github.com/bluesky-social/jetstream-v2/internal/identity"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/orchestrator"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/manifest"
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/internal/server"
-	"github.com/bluesky-social/jetstream-v2/internal/status"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/internal/subscribe"
+	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
-	"github.com/bluesky-social/jetstream-v2/internal/web"
-	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
-	"github.com/bluesky-social/jetstream-v2/segment"
-	"github.com/jcalabro/atmos"
-	"github.com/jcalabro/atmos/identity"
-	atmossync "github.com/jcalabro/atmos/sync"
-	"github.com/jcalabro/atmos/xrpc"
-	"github.com/jcalabro/gt"
-	"github.com/jcalabro/jttp"
 	"github.com/urfave/cli/v3"
-	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -287,323 +261,43 @@ func serveCommand() *cli.Command {
 	}
 }
 
+func serveOptionsFromCommand(cmd *cli.Command) jetstreamd.Options {
+	return jetstreamd.Options{
+		PublicAddr:                cmd.String("addr"),
+		DebugAddr:                 cmd.String("debug-addr"),
+		DataDir:                   cmd.String("data-dir"),
+		RelayURL:                  cmd.String("relay-url"),
+		PLCURL:                    cmd.String("plc-url"),
+		OTelServiceName:           cmd.String("otel-service-name"),
+		LogLevel:                  cmd.String("log-level"),
+		LogFormat:                 cmd.String("log-format"),
+		LogOutput:                 os.Stderr,
+		ShutdownTimeout:           cmd.Duration("shutdown-timeout"),
+		ClientDrainTimeout:        cmd.Duration("client-drain-timeout"),
+		MaxBackfillRepos:          cmd.Int("max-backfill-repos"),
+		SkipMergeDiscovery:        cmd.Bool("skip-merge-discovery"),
+		CursorLookback:            cmd.Duration("cursor-lookback"),
+		SegmentCacheMaxAge:        cmd.Duration("segment-cache-max-age"),
+		SubscribeHotTailBytes:     cmd.Int("subscribe-hot-tail-bytes"),
+		SubscribeBlockCacheBytes:  cmd.Int("subscribe-block-cache-bytes"),
+		SubscribeReadBatch:        cmd.Int("subscribe-read-batch"),
+		SubscribeSlowWindow:       cmd.Duration("subscribe-slow-window"),
+		SubscribeSlowMinRate:      cmd.Float("subscribe-slow-min-rate"),
+		CursorBlockIndexCacheSize: cmd.Int("cursor-block-index-cache-size"),
+	}
+}
+
 func runServe(ctx context.Context, cmd *cli.Command) error {
-	processLogger, err := obs.BuildLoggerFromStrings(os.Stderr, cmd.String("log-level"), cmd.String("log-format"))
-	if err != nil {
-		return err
-	}
-	// processLogger is the bare per-process logger; downstream
-	// subsystems (orchestrator, server, verifier callback) receive it
-	// AS-IS so each can set its own `component` without slog stacking
-	// duplicate keys (slog.With appends rather than replacing).
-	//
-	// logger is a component=main wrapper for cmd/jetstream's own log
-	// lines.
-	logger := processLogger.With(slog.String("component", "main"))
-	slog.SetDefault(logger)
-
-	info := version.Get()
-	logger.Info("startup",
-		"version", info.Version,
-		"commit", info.Commit,
-		"built", info.Date,
-	)
-
-	tracerShutdown, err := obs.SetupTracing(ctx, obs.TracingConfig{
-		ServiceName: cmd.String("otel-service-name"),
-	})
-	if err != nil {
-		return fmt.Errorf("setup tracing: %w", err)
-	}
-
-	metrics := obs.NewMetrics()
-	storeMetrics := store.NewMetrics(metrics.Registry)
-	segmentMetrics := segment.NewMetrics(metrics.Registry)
-	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
-	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
-	manifestMetrics := manifest.NewMetrics(metrics.Registry)
-
-	dataDir := cmd.String("data-dir")
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return fmt.Errorf("serve: create data dir %s: %w", dataDir, err)
-	}
-	segmentCacheMaxAge := cmd.Duration("segment-cache-max-age")
-	if segmentCacheMaxAge < 0 {
-		return fmt.Errorf("serve: --segment-cache-max-age must be >= 0, got %s", segmentCacheMaxAge)
-	}
-
-	segmentsDir := filepath.Join(dataDir, "segments")
-	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
-		return fmt.Errorf("serve: create segments dir %s: %w", segmentsDir, err)
-	}
-
-	metaStore, err := store.Open(dataDir, storeMetrics)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if cerr := metaStore.Close(); cerr != nil {
-			logger.Error("close metadata store", "err", cerr)
-		}
-	}()
-
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	mft, err := manifest.OpenBackground(runCtx, manifest.Options{
-		SegmentsDir:         segmentsDir,
-		BlockIndexCacheSize: cmd.Int("cursor-block-index-cache-size"),
-		Logger:              processLogger,
-		Metrics:             manifestMetrics,
-	})
+	rt, err := jetstreamd.Build(runCtx, serveOptionsFromCommand(cmd))
 	if err != nil {
-		return fmt.Errorf("serve: open manifest: %w", err)
+		return err
 	}
-
-	// writerPtr is published by the orchestrator once the steady-state
-	// live consumer opens its ingest.Writer; the cursor handler reads it
-	// atomically. Before steady-state the lifecycle.IsSteadyState gate
-	// returns 503, so the nil-pointer window is harmless.
-	var writerPtr atomic.Pointer[ingest.Writer]
-
-	statusCollector, err := status.New(status.Options{
-		Store:          metaStore,
-		DataDir:        dataDir,
-		Manifest:       mft,
-		CursorLookback: cmd.Duration("cursor-lookback"),
-	})
-	if err != nil {
-		return fmt.Errorf("serve: build status collector: %w", err)
-	}
-
-	statusHandler, err := web.New(web.Options{
-		Snapshotter: statusCollector,
-		Logger:      processLogger,
-	})
-	if err != nil {
-		return fmt.Errorf("serve: build status handler: %w", err)
-	}
-
-	// Verifier setup (shared across phases). The verifier itself is
-	// owned by the orchestrator's per-phase live consumers, but we
-	// construct it here because its async-error drain is a sibling
-	// goroutine in the top-level errgroup — it's a process-wide
-	// observability concern.
-	relayHTTPURL, err := live.DeriveRelayHTTPURL(cmd.String("relay-url"))
-	if err != nil {
-		return fmt.Errorf("serve: derive relay HTTP URL: %w", err)
-	}
-
-	xrpcClient := &xrpc.Client{
-		Host:       relayHTTPURL,
-		HTTPClient: gt.Some(jttp.New(xrpc.BulkDownloadOpts()...)),
-	}
-
-	resolver := &identity.DefaultResolver{}
-	if u := cmd.String("plc-url"); u != "" {
-		resolver.PLCURL = gt.Some(u)
-		// atmos's default resolver client enables jttp.WithStrictSSRFProtection,
-		// which refuses loopback even on the initial request. When the
-		// operator points us at a local PLC (e.g. the dev simulator at
-		// http://localhost:7777), use a non-strict client so the dial
-		// succeeds.
-		resolver.HTTPClient = gt.Some(jttp.New(xrpc.ATProtoOpts(10 * time.Second)...))
-	}
-	directory := &identity.Directory{
-		Resolver:               resolver,
-		Cache:                  identcache.New(metaStore, identcache.DefaultTTL),
-		SkipHandleVerification: true,
-	}
-
-	stateStore := syncstate.New(metaStore)
-	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
-
-	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        mft,
-		WriterRef:       &writerPtr,
-		BlockCacheBytes: cmd.Int("subscribe-block-cache-bytes"),
-	})
-	tail, err := subscribe.New(subscribe.Config{
-		Logger:       processLogger,
-		Metrics:      subscribeMetrics,
-		HotTailBytes: cmd.Int("subscribe-hot-tail-bytes"),
-		ReadBatch:    cmd.Int("subscribe-read-batch"),
-		SlowWindow:   cmd.Duration("subscribe-slow-window"),
-		SlowMinRate:  cmd.Float("subscribe-slow-min-rate"),
-	}, coldRd, func() uint64 {
-		if w := writerPtr.Load(); w != nil {
-			return w.NextSeq()
-		}
-		return 0
-	})
-	if err != nil {
-		return fmt.Errorf("serve: build subscribe tail: %w", err)
-	}
-
-	verifierLogger := processLogger.With(slog.String("component", "verifier"))
-	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
-		Directory:  directory,
-		StateStore: stateStore,
-		SyncClient: gt.Some(syncClient),
-		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
-			verifierMetrics.IncFailure(obs.Classify(vErr))
-			verifierLogger.Warn("verification failure",
-				"did", did,
-				"err", vErr,
-			)
-		}),
-	})
-	if err != nil {
-		return fmt.Errorf("serve: build verifier: %w", err)
-	}
-	defer func() {
-		if cerr := verifier.Close(); cerr != nil {
-			logger.Error("verifier close", "err", cerr)
-		}
-	}()
-
-	// The orchestrator owns all ingestion-lifecycle subsystems
-	// (backfill engine, bootstrap-time live consumer, steady-state
-	// live consumer). cmd/jetstream is no longer phase-aware.
-	orch, err := orchestrator.New(orchestrator.Config{
-		DataDir:    dataDir,
-		Store:      metaStore,
-		RelayURL:   cmd.String("relay-url"),
-		HTTPClient: xrpcClient.HTTPClient.Val(),
-		Directory:  directory,
-		Verifier:   verifier,
-		// Bare logger; orchestrator.New attaches component=orchestrator
-		// itself, and its children (live, ingest, backfill) attach
-		// their own component on top of the bare parent.
-		Logger:             processLogger,
-		Metrics:            orchestrator.NewMetrics(metrics.Registry),
-		IngestMetrics:      ingest.NewMetrics(metrics.Registry),
-		LiveMetrics:        live.NewMetrics(metrics.Registry),
-		BackfillMetrics:    backfill.NewMetrics(metrics.Registry),
-		SegmentMetrics:     segmentMetrics,
-		OnEvent:            tail.Append,
-		MaxBackfillRepos:   cmd.Int("max-backfill-repos"),
-		SkipMergeDiscovery: cmd.Bool("skip-merge-discovery"),
-		IngestOnAfterSeal:  mft.OnSegmentSealed,
-		OnSteadyStateWriter: func(w *ingest.Writer) {
-			writerPtr.Store(w)
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("serve: build orchestrator: %w", err)
-	}
-
-	srv := server.New(server.Config{
-		PublicAddr:      cmd.String("addr"),
-		DebugAddr:       cmd.String("debug-addr"),
-		ShutdownTimeout: cmd.Duration("shutdown-timeout"),
-		StatusHandler:   statusHandler,
-	}, processLogger, metrics)
-
-	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
-	// before steady-state, lifecycle.IsSteadyState gates with 503 so
-	// nil-pointer reads are harmless.
-	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(subscribe.Subscription{
-		Tail:      tail,
-		Store:     metaStore,
-		Manifest:  mft,
-		WriterRef: &writerPtr,
-		Logger:    processLogger,
-		Metrics:   subscribeMetrics,
-		Lookback:  cmd.Duration("cursor-lookback"),
-	}))
-
-	// XRPC surface: whole-file segment download + listing. The atmos
-	// xrpcserver routes /xrpc/{nsid}; mounting at the "/xrpc/" subtree
-	// lets it own every jetstream NSID. Backed by the in-memory manifest,
-	// which only tracks sealed (immutable) segments.
-	xrpcSrv := xrpcapi.NewWithReadyAndCache(mft, processLogger, func(ctx context.Context) error {
-		if !lifecycle.IsSteadyState(metaStore) {
-			return errors.New("bootstrap in progress")
-		}
-		if err := mft.Wait(ctx); err != nil {
-			return fmt.Errorf("manifest warming up: %w", err)
-		}
-		return nil
-	}, segmentCacheMaxAge)
-	srv.RegisterPublicRoute("/xrpc/", xrpcSrv.Handler())
-
-	g, gctx := errgroup.WithContext(runCtx)
-
-	g.Go(func() error {
-		if err := mft.Wait(gctx); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return fmt.Errorf("manifest load: %w", err)
-		}
-		return nil
-	})
-
-	g.Go(func() error {
-		return srv.Run(gctx)
-	})
-
-	g.Go(func() error {
-		return orch.Run(gctx)
-	})
-
-	// Graceful client drain. Live websocket subscribers are hijacked
-	// connections, so http.Server.Shutdown neither tracks nor closes
-	// them — without this they'd be severed abruptly (no close frame) on
-	// process exit. On shutdown we send each subscriber a StatusGoingAway
-	// close frame and wait up to client-drain-timeout for them to leave
-	// cleanly. We keep this in the errgroup so g.Wait() blocks on the
-	// drain: the process must not exit out from under a half-sent close
-	// handshake. The drain context is rooted at Background (not gctx,
-	// which is already cancelled by the time we drain) and bounded by the
-	// flag, so a wedged client can't delay exit past the budget.
-	g.Go(func() error {
-		<-gctx.Done()
-		drainCtx, drainCancel := context.WithTimeout(context.Background(), cmd.Duration("client-drain-timeout"))
-		defer drainCancel()
-		if err := tail.Shutdown(drainCtx); err != nil {
-			logger.Warn("client drain did not complete within budget; severing remaining subscribers", "err", err)
-		}
-		return nil
-	})
-
-	// Verifier async-error drain. Verification failures are
-	// diagnostic, not fatal — they typically reflect adversarial or
-	// malformed PDS input, which is invalid user data, not a
-	// jetstream bug. We warn-log and the OnVerificationFailure hook
-	// fires for operator visibility, but never crash.
-	g.Go(func() error {
-		for {
-			select {
-			case <-gctx.Done():
-				return nil
-			case err, ok := <-verifier.AsyncErrors():
-				if !ok {
-					return nil
-				}
-				verifierLogger.Warn("async error", "err", err)
-			}
-		}
-	})
-
-	// A signal-driven shutdown surfaces as context.Canceled from the
-	// errgroup: the orchestrator's steady-state consumer and the HTTP
-	// server both return ctx.Err() on graceful shutdown. We don't want
-	// the user to see "context canceled" when they hit Ctrl-C.
-	runErr := g.Wait()
-	if errors.Is(runErr, context.Canceled) && runCtx.Err() != nil {
-		runErr = nil
-	}
-
-	// Shut tracing down with a fresh, bounded context so we can still flush
-	// pending spans even though runCtx has been cancelled.
+	runErr := rt.Run(runCtx)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cmd.Duration("shutdown-timeout"))
 	defer cancel()
-
-	if err := tracerShutdown(shutdownCtx); err != nil {
-		logger.Error("tracer shutdown failed", "err", err)
-	}
-
+	_ = rt.Close(shutdownCtx)
 	return runErr
 }

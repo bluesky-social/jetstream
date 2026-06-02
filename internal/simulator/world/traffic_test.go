@@ -18,10 +18,15 @@ import (
 
 func newTestWorld(t *testing.T) *World {
 	t.Helper()
+	return newRuntimeWorld(t, 25, 1)
+}
+
+func newRuntimeWorld(t *testing.T, accounts, initialRecords int) *World {
+	t.Helper()
 	cfg := DefaultConfig()
 	cfg.DataDir = filepath.Join(t.TempDir(), "simulator")
-	cfg.Accounts = 25
-	cfg.InitialRecords = 1
+	cfg.Accounts = accounts
+	cfg.InitialRecords = initialRecords
 	w, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -55,6 +60,8 @@ func TestGenerateOne_ProducesValidCommit(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, cm.Repo, string(rp.DID))
 	require.Equal(t, cm.Rev, commit.Rev)
+	acct := accountForRepo(t, w, cm.Repo)
+	require.NoError(t, commit.VerifySignature(acct.priv.PublicKey()))
 
 	// At least one op references its CID; verify it exists in the CAR.
 	require.True(t, cm.Ops[0].CID.HasVal())
@@ -65,6 +72,19 @@ func TestGenerateOne_ProducesValidCommit(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func accountForRepo(t *testing.T, w *World, did string) account {
+	t.Helper()
+	for i := range w.cfg.Accounts {
+		acct, err := w.loadAccount(i)
+		require.NoError(t, err)
+		if string(acct.DID) == did {
+			return acct
+		}
+	}
+	t.Fatalf("no simulator account for repo %s", did)
+	return account{}
+}
+
 func TestGenerateOne_AdvancesSeq(t *testing.T) {
 	t.Parallel()
 	w := newTestWorld(t)
@@ -73,6 +93,83 @@ func TestGenerateOne_AdvancesSeq(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, i, w.CurrentSeq())
 	}
+}
+
+func TestGenerateOne_RevsStrictlyIncreaseForHotAccount(t *testing.T) {
+	t.Parallel()
+
+	w := newRuntimeWorld(t, 1, 1)
+	var prev string
+	for range 100 {
+		_, err := w.GenerateOneForTest(t.Context())
+		require.NoError(t, err)
+		state, err := w.loadState(0)
+		require.NoError(t, err)
+		if prev != "" {
+			require.Greater(t, state.Rev, prev)
+		}
+		prev = state.Rev
+	}
+}
+
+func TestGenerateOne_RevsAdvancePastBootstrapForEveryAccount(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.DataDir = filepath.Join(t.TempDir(), "simulator")
+	cfg.Accounts = 25
+	cfg.InitialRecords = 0
+	cfg.InitialRecordsMin = 0
+	cfg.InitialRecordsMax = 1000
+	cfg.Seed = 42
+
+	w, err := New(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	_, err = w.EnsureSeed()
+	require.NoError(t, err)
+	require.NoError(t, w.Bootstrap(context.Background(), slog.Default()))
+	require.NoError(t, w.AttachRuntime(rand.New(rand.NewPCG(42^0xfeedf00d, 42^0xc0ffee)), fanout.New(4096)))
+
+	lastRevByRepo := make(map[string]string, cfg.Accounts)
+	for i := range cfg.Accounts {
+		a, err := w.loadAccount(i)
+		require.NoError(t, err)
+		state, err := w.loadState(i)
+		require.NoError(t, err)
+		lastRevByRepo[string(a.DID)] = state.Rev
+	}
+
+	for i := range 500 {
+		frame, err := w.generateOne(context.Background())
+		require.NoError(t, err, "iter=%d", i)
+
+		body, ok := bytes.CutPrefix(frame, frameHeaderCommit)
+		require.True(t, ok, "iter=%d: expected #commit header", i)
+		var cm comatproto.SyncSubscribeRepos_Commit
+		require.NoError(t, cm.UnmarshalCBOR(body))
+
+		require.Greater(t, cm.Rev, lastRevByRepo[cm.Repo], "iter=%d repo=%s", i, cm.Repo)
+		lastRevByRepo[cm.Repo] = cm.Rev
+	}
+}
+
+func TestGenerateOne_DeterministicFramesAcrossRuns(t *testing.T) {
+	t.Parallel()
+
+	run := func(t *testing.T) [][]byte {
+		t.Helper()
+		w := newRuntimeWorld(t, 5, 2)
+		var frames [][]byte
+		for range 50 {
+			frame, err := w.GenerateOneForTest(t.Context())
+			require.NoError(t, err)
+			frames = append(frames, frame)
+		}
+		return frames
+	}
+
+	require.Equal(t, run(t), run(t))
 }
 
 func TestRunTraffic_StopsOnContext(t *testing.T) {

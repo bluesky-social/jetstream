@@ -28,13 +28,8 @@ func newPDSGetRepoHandler(w *world.World) http.Handler {
 			http.NotFound(rw, r)
 			return
 		}
-		rp, key, err := w.LoadRepo(acct.Index)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
 		rw.Header().Set("Content-Type", "application/vnd.ipld.car")
-		if err := rp.ExportCAR(rw, key); err != nil {
+		if err := w.ExportRepoCAR(acct.Index, rw); err != nil {
 			// Headers may already be flushed; the response body is
 			// committed at this point. Nothing useful we can do
 			// except let the client see a truncated CAR. A future

@@ -1,0 +1,115 @@
+# Nightly simulator oracle seed sweep.
+#
+# This workflow is intentionally separate from push CI. It is expensive enough
+# to be a bug-hunting job, not a per-commit gate. GitHub's built-in Actions
+# notifications handle failure emails for users who have Actions email
+# notifications enabled.
+
+name: oracle-nightly
+
+on:
+  schedule:
+    # 08:17 UTC keeps this away from the top-of-hour GitHub Actions rush.
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Number of deterministic seeds to sweep"
+        required: false
+        default: "100"
+      accounts:
+        description: "Simulator accounts per seed"
+        required: false
+        default: "250"
+      max_initial_records:
+        description: "Maximum initial records per account"
+        required: false
+        default: "10000"
+      live_events_bootstrap:
+        description: "Live events generated during bootstrap/merge coverage"
+        required: false
+        default: "25000"
+      live_events_steady:
+        description: "Live events generated during steady-state coverage"
+        required: false
+        default: "25000"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  ORACLE_SWEEP_SEEDS: ${{ github.event.inputs.seeds || '100' }}
+  ORACLE_SWEEP_ACCOUNTS: ${{ github.event.inputs.accounts || '250' }}
+  ORACLE_SWEEP_MAX_INITIAL_RECORDS: ${{ github.event.inputs.max_initial_records || '10000' }}
+  ORACLE_SWEEP_LIVE_EVENTS_BOOTSTRAP: ${{ github.event.inputs.live_events_bootstrap || '25000' }}
+  ORACLE_SWEEP_LIVE_EVENTS_STEADY: ${{ github.event.inputs.live_events_steady || '25000' }}
+
+jobs:
+  oracle-sweep:
+    name: oracle seed sweep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            dl.google.com:443
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install tooling
+        run: just install-tools
+
+      - name: Oracle seed sweep
+        run: |
+          just oracle-sweep \
+            "$ORACLE_SWEEP_SEEDS" \
+            "$ORACLE_SWEEP_ACCOUNTS" \
+            "$ORACLE_SWEEP_MAX_INITIAL_RECORDS" \
+            "$ORACLE_SWEEP_LIVE_EVENTS_BOOTSTRAP" \
+            "$ORACLE_SWEEP_LIVE_EVENTS_STEADY"
+
+      - name: Failure summary
+        if: failure()
+        run: |
+          {
+            echo "## Nightly oracle failed"
+            echo
+            echo 'The failing seed and exact local repro command are printed in the `Oracle seed sweep` step logs.'
+            echo
+            echo "Configured workload:"
+            echo
+            echo "- seeds: ${ORACLE_SWEEP_SEEDS}"
+            echo "- accounts: ${ORACLE_SWEEP_ACCOUNTS}"
+            echo "- max initial records: ${ORACLE_SWEEP_MAX_INITIAL_RECORDS}"
+            echo "- bootstrap live events: ${ORACLE_SWEEP_LIVE_EVENTS_BOOTSTRAP}"
+            echo "- steady-state live events: ${ORACLE_SWEEP_LIVE_EVENTS_STEADY}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,10 @@ import (
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
+
+// PhaseBarrier is a nil-able hook that can pause between orchestrator
+// lifecycle phases.
+type PhaseBarrier func(context.Context) error
 
 // Config controls Orchestrator behavior. cmd/jetstream constructs
 // exactly one of these per process and hands it to New.
@@ -105,6 +110,16 @@ type Config struct {
 	// cursor-replay handler. Called exactly once per orchestrator
 	// run; nil-safe.
 	OnSteadyStateWriter func(*ingest.Writer)
+
+	// BarrierAfterBootstrap, if non-nil, runs after bootstrap has durably
+	// written PhaseMerging and before merge begins. Intended for deterministic
+	// validation harnesses; production leaves it nil.
+	BarrierAfterBootstrap PhaseBarrier
+
+	// BarrierAfterMerge, if non-nil, runs after merge has durably written
+	// PhaseSteadyState and before the steady-state live consumer starts.
+	// Intended for deterministic validation harnesses; production leaves it nil.
+	BarrierAfterMerge PhaseBarrier
 }
 
 func (c *Config) validate() error {

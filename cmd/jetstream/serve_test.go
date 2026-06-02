@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/coder/websocket"
@@ -27,7 +28,162 @@ import (
 	atmosrepo "github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
+	"github.com/urfave/cli/v3"
 )
+
+// nolint:paralleltest
+func TestServeOptionsFromCLI_Defaults(t *testing.T) {
+	// Intentionally NOT parallel: this asserts the CLI's built-in
+	// defaults, which urfave/cli silently overrides from the $JETSTREAM_*
+	// (and $OTEL_*) env sources declared on each flag. A developer or CI
+	// shell that exports any of those (e.g. JETSTREAM_DATA_DIR) would
+	// otherwise break this test. We clear the process environment for the
+	// duration so "default" means default. Non-parallel tests run to
+	// completion before any t.Parallel test resumes, so mutating global
+	// env here is safe.
+	withClearedEnv(t)
+
+	app := newApp()
+	var opts jetstreamd.Options
+	for _, cmd := range app.Commands {
+		if cmd.Name != "serve" {
+			continue
+		}
+		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
+			opts = serveOptionsFromCommand(cmd)
+			return nil
+		}
+		break
+	}
+
+	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
+	require.Equal(t, ":8080", opts.PublicAddr)
+	require.Equal(t, ":6060", opts.DebugAddr)
+	require.Equal(t, "./data", opts.DataDir)
+	require.Equal(t, "https://bsky.network", opts.RelayURL)
+	require.Equal(t, "", opts.PLCURL)
+	require.Equal(t, "jetstream", opts.OTelServiceName)
+	require.Equal(t, "info", opts.LogLevel)
+	require.Equal(t, "json", opts.LogFormat)
+	require.Same(t, os.Stderr, opts.LogOutput)
+	require.Equal(t, 30*time.Second, opts.ShutdownTimeout)
+	require.Equal(t, 10*time.Second, opts.ClientDrainTimeout)
+	require.Equal(t, 0, opts.MaxBackfillRepos)
+	require.False(t, opts.SkipMergeDiscovery)
+	require.Equal(t, 36*time.Hour, opts.CursorLookback)
+	require.Equal(t, 0*time.Second, opts.SegmentCacheMaxAge)
+	require.Equal(t, 256<<20, opts.SubscribeHotTailBytes)
+	require.Equal(t, 64<<20, opts.SubscribeBlockCacheBytes)
+	require.Equal(t, 1024, opts.SubscribeReadBatch)
+	require.Equal(t, 60*time.Second, opts.SubscribeSlowWindow)
+	require.Equal(t, float64(5), opts.SubscribeSlowMinRate)
+	require.Equal(t, 32, opts.CursorBlockIndexCacheSize)
+	require.Nil(t, opts.BarrierAfterBootstrap)
+	require.Nil(t, opts.BarrierAfterMerge)
+	require.Nil(t, opts.OnSteadyStateEvent)
+}
+
+// withClearedEnv unsets every environment variable the serve flags bind
+// to, restoring the prior values via t.Cleanup. urfave/cli treats those
+// vars as flag sources, so a default-value assertion is only meaningful
+// in an environment where none of them are set. The caller must NOT be
+// parallel: this mutates global process state.
+func withClearedEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"JETSTREAM_ADDR",
+		"JETSTREAM_DEBUG_ADDR",
+		"JETSTREAM_DATA_DIR",
+		"JETSTREAM_RELAY_URL",
+		"JETSTREAM_PLC_URL",
+		"OTEL_SERVICE_NAME",
+		"JETSTREAM_LOG_LEVEL",
+		"JETSTREAM_LOG_FORMAT",
+		"JETSTREAM_SHUTDOWN_TIMEOUT",
+		"JETSTREAM_CLIENT_DRAIN_TIMEOUT",
+		"JETSTREAM_MAX_BACKFILL_REPOS",
+		"JETSTREAM_SKIP_MERGE_DISCOVERY",
+		"JETSTREAM_CURSOR_LOOKBACK",
+		"JETSTREAM_SEGMENT_CACHE_MAX_AGE",
+		"JETSTREAM_SUBSCRIBE_HOT_TAIL_BYTES",
+		"JETSTREAM_SUBSCRIBE_BLOCK_CACHE_BYTES",
+		"JETSTREAM_SUBSCRIBE_READ_BATCH",
+		"JETSTREAM_SUBSCRIBE_SLOW_WINDOW",
+		"JETSTREAM_SUBSCRIBE_SLOW_MIN_RATE",
+		"JETSTREAM_CURSOR_BLOCK_INDEX_CACHE_SIZE",
+	} {
+		if prev, ok := os.LookupEnv(key); ok {
+			require.NoError(t, os.Unsetenv(key))
+			t.Cleanup(func() { _ = os.Setenv(key, prev) })
+		}
+	}
+}
+
+func TestServeOptionsFromCLI_Overrides(t *testing.T) {
+	t.Parallel()
+
+	app := newApp()
+	var opts jetstreamd.Options
+	for _, cmd := range app.Commands {
+		if cmd.Name != "serve" {
+			continue
+		}
+		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
+			opts = serveOptionsFromCommand(cmd)
+			return nil
+		}
+		break
+	}
+
+	require.NoError(t, app.Run(t.Context(), []string{
+		"jetstream",
+		"--log-level=debug",
+		"--log-format=text",
+		"serve",
+		"--addr=127.0.0.1:18080",
+		"--debug-addr=127.0.0.1:16060",
+		"--data-dir=/tmp/jetstream-override-data",
+		"--relay-url=https://relay.example.com",
+		"--plc-url=https://plc.example.com",
+		"--otel-service-name=jetstream-test",
+		"--shutdown-timeout=45s",
+		"--client-drain-timeout=11s",
+		"--max-backfill-repos=17",
+		"--skip-merge-discovery",
+		"--cursor-lookback=7h",
+		"--segment-cache-max-age=13s",
+		"--subscribe-hot-tail-bytes=123456",
+		"--subscribe-block-cache-bytes=654321",
+		"--subscribe-read-batch=77",
+		"--subscribe-slow-window=22s",
+		"--subscribe-slow-min-rate=9.5",
+		"--cursor-block-index-cache-size=99",
+	}))
+	require.Equal(t, "127.0.0.1:18080", opts.PublicAddr)
+	require.Equal(t, "127.0.0.1:16060", opts.DebugAddr)
+	require.Equal(t, "/tmp/jetstream-override-data", opts.DataDir)
+	require.Equal(t, "https://relay.example.com", opts.RelayURL)
+	require.Equal(t, "https://plc.example.com", opts.PLCURL)
+	require.Equal(t, "jetstream-test", opts.OTelServiceName)
+	require.Equal(t, "debug", opts.LogLevel)
+	require.Equal(t, "text", opts.LogFormat)
+	require.Same(t, os.Stderr, opts.LogOutput)
+	require.Equal(t, 45*time.Second, opts.ShutdownTimeout)
+	require.Equal(t, 11*time.Second, opts.ClientDrainTimeout)
+	require.Equal(t, 17, opts.MaxBackfillRepos)
+	require.True(t, opts.SkipMergeDiscovery)
+	require.Equal(t, 7*time.Hour, opts.CursorLookback)
+	require.Equal(t, 13*time.Second, opts.SegmentCacheMaxAge)
+	require.Equal(t, 123456, opts.SubscribeHotTailBytes)
+	require.Equal(t, 654321, opts.SubscribeBlockCacheBytes)
+	require.Equal(t, 77, opts.SubscribeReadBatch)
+	require.Equal(t, 22*time.Second, opts.SubscribeSlowWindow)
+	require.Equal(t, 9.5, opts.SubscribeSlowMinRate)
+	require.Equal(t, 99, opts.CursorBlockIndexCacheSize)
+	require.Nil(t, opts.BarrierAfterBootstrap)
+	require.Nil(t, opts.BarrierAfterMerge)
+	require.Nil(t, opts.OnSteadyStateEvent)
+}
 
 // TestServe_BootstrapsAndShutsDownCleanly is the wiring smoke test:
 // a real `jetstream serve` invocation against a stubbed relay that

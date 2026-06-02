@@ -7,7 +7,7 @@ import (
 	"math/rand/v2"
 )
 
-// Bootstrap generates and persists Accounts × InitialRecords records.
+// Bootstrap generates and persists per-account initial records.
 // Idempotent: state rows already at the target shape are not
 // rewritten, so re-running on a partially-populated db is safe.
 //
@@ -31,6 +31,7 @@ func (w *World) Bootstrap(ctx context.Context, logger *slog.Logger) error {
 		}
 		accounts[i] = a
 	}
+	counts := initialRecordCounts(w.cfg)
 
 	const logEvery = 1000
 	for i, a := range accounts {
@@ -38,12 +39,21 @@ func (w *World) Bootstrap(ctx context.Context, logger *slog.Logger) error {
 			return ctx.Err()
 		}
 
-		// Skip if already populated to the target record count.
+		// Skip accounts already bootstrapped to a durable commit. We key
+		// on a defined commit rather than RecordCount because record-key
+		// TID collisions (newRkey draws random TIDs, and repo.Create
+		// upserts on an equal MST key) can leave the persisted count below
+		// the sampled target. Keying on RecordCount would then wrongly
+		// treat a finished account as incomplete and re-bootstrap it from
+		// an empty repo, advancing its rev/commit and breaking the
+		// documented idempotency contract. commitAndPersist runs only
+		// after the full create loop, so a defined commit means this
+		// account completed.
 		state, err := w.loadState(i)
 		if err != nil {
 			return err
 		}
-		if state.RecordCount >= w.cfg.InitialRecords {
+		if state.CommitCID.Defined() {
 			continue
 		}
 
@@ -60,7 +70,7 @@ func (w *World) Bootstrap(ctx context.Context, logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
-		for range w.cfg.InitialRecords {
+		for range counts[i] {
 			coll := chooseCreateCollection(r)
 			target := accounts[r.IntN(len(accounts))].DID
 			rkey := newRkey(r)

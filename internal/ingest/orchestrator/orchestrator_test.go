@@ -81,3 +81,58 @@ func TestRun_EndToEnd_BootstrapToSteadyState(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 }
+
+func TestRun_BarrierAfterBootstrapBlocksBeforeMerge(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	relay := newFakeRelay(t, nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	o, err := New(Config{
+		DataDir:    dataDir,
+		Store:      st,
+		RelayURL:   relay.URL(),
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Directory:  testIdentityDirectory(),
+		Verifier:   newTestVerifier(t, relay.URL()),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		BarrierAfterBootstrap: func(ctx context.Context) error {
+			close(entered)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() { done <- o.Run(ctx) }()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("barrier not reached")
+	}
+	phase, err := lifecycle.ReadPhase(st)
+	require.NoError(t, err)
+	require.Equal(t, lifecycle.PhaseMerging, phase)
+
+	close(release)
+	require.Eventually(t, func() bool {
+		phase, err := lifecycle.ReadPhase(st)
+		return err == nil && phase == lifecycle.PhaseSteadyState
+	}, 5*time.Second, 20*time.Millisecond)
+	cancel()
+	<-done
+}

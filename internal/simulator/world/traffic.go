@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/jcalabro/atmos"
@@ -126,21 +127,25 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 	}
 	carBlocks := make([]car.Block, 0, len(store.writes)+len(store.reads)+1)
 	carBlocks = append(carBlocks, car.Block{CID: newState.CommitCID, Data: commitData})
-	for cid, data := range store.writes {
+	for _, cid := range sortedCIDs(store.writes) {
 		if cid == newState.CommitCID {
 			continue
 		}
-		carBlocks = append(carBlocks, car.Block{CID: cid, Data: data})
+		carBlocks = append(carBlocks, car.Block{CID: cid, Data: store.writes[cid]})
 	}
-	for cid, data := range store.reads {
+	for _, cid := range sortedCIDs(store.reads) {
 		if _, written := store.writes[cid]; written {
 			continue
 		}
-		carBlocks = append(carBlocks, car.Block{CID: cid, Data: data})
+		carBlocks = append(carBlocks, car.Block{CID: cid, Data: store.reads[cid]})
 	}
 	var carBuf carBytesWriter
 	if err := car.WriteAll(&carBuf, []cbor.CID{newState.CommitCID}, carBlocks); err != nil {
 		return nil, fmt.Errorf("simulator: write CAR diff: %w", err)
+	}
+	revTID, err := atmos.ParseTID(newState.Rev)
+	if err != nil {
+		return nil, fmt.Errorf("simulator: parse generated rev: %w", err)
 	}
 
 	// Allocate the seq and assemble the envelope.
@@ -149,7 +154,7 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 		Repo:   string(author.DID),
 		Rev:    newState.Rev,
 		Seq:    seq,
-		Time:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		Time:   revTID.Time().UTC().Format("2006-01-02T15:04:05.000Z"),
 		Commit: lextypes.LexCIDLink{Link: newState.CommitCID.String()},
 		Blocks: carBuf.bytes(),
 		Ops:    wireOps,
@@ -186,7 +191,10 @@ func (w *World) applyOp(rp *repo.Repo, authorIdx int, action string, touched map
 	case "create":
 		coll := chooseCreateCollection(w.rng)
 		rkey := newRkey(w.rng)
-		target := w.pickAnotherAccount(authorIdx).DID
+		target, err := w.pickTargetAccount(authorIdx)
+		if err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, err
+		}
 		rec := generateRecord(w.rng, coll, string(target))
 		if err := rp.Create(coll, rkey, rec); err != nil {
 			return comatproto.SyncSubscribeRepos_RepoOp{}, fmt.Errorf("simulator: create %s/%s: %w", coll, rkey, err)
@@ -207,7 +215,11 @@ func (w *World) applyOp(rp *repo.Repo, authorIdx int, action string, touched map
 			return w.applyOp(rp, authorIdx, "create", touched)
 		}
 		prevCID, _, _ := rp.Get(coll, rkey)
-		rec := generateRecord(w.rng, coll, string(w.pickAnotherAccount(authorIdx).DID))
+		target, err := w.pickTargetAccount(authorIdx)
+		if err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, err
+		}
+		rec := generateRecord(w.rng, coll, string(target))
 		if err := rp.Update(coll, rkey, rec); err != nil {
 			return comatproto.SyncSubscribeRepos_RepoOp{}, fmt.Errorf("simulator: update %s/%s: %w", coll, rkey, err)
 		}
@@ -239,16 +251,34 @@ func (w *World) applyOp(rp *repo.Repo, authorIdx int, action string, touched map
 	}
 }
 
-func (w *World) pickAnotherAccount(notIdx int) account {
+// pickTargetAccount returns a target DID for a like/follow/repost,
+// uniformly chosen from accounts other than the author when more than
+// one exists. Rejection-sampling away the author's own index is
+// deterministic — it depends only on the RNG sequence. A load error,
+// by contrast, is fatal rather than retried: retrying would (a) spin
+// forever if a load consistently failed, masking real db corruption as
+// a hang instead of crashing loudly, and (b) make the number of RNG
+// draws depend on which accounts happen to load, desyncing the
+// deterministic draw stream. Accounts are derived deterministically and
+// persisted during bootstrap, so a load failure is a genuine fault.
+func (w *World) pickTargetAccount(authorIdx int) (atmos.DID, error) {
+	if w.cfg.Accounts <= 1 {
+		a, err := w.loadAccount(authorIdx)
+		if err != nil {
+			return "", fmt.Errorf("simulator: load only target account %d: %w", authorIdx, err)
+		}
+		return a.DID, nil
+	}
 	for {
 		idx := w.rng.IntN(w.cfg.Accounts)
-		if idx == notIdx {
+		if idx == authorIdx {
 			continue
 		}
 		a, err := w.loadAccount(idx)
-		if err == nil {
-			return a
+		if err != nil {
+			return "", fmt.Errorf("simulator: load target account %d: %w", idx, err)
 		}
+		return a.DID, nil
 	}
 }
 
@@ -318,6 +348,17 @@ func (s *diffStore) PutBlock(cid cbor.CID, data []byte) error {
 	}
 	s.writes[cid] = append([]byte(nil), data...)
 	return s.base.PutBlock(cid, data)
+}
+
+func sortedCIDs(blocks map[cbor.CID][]byte) []cbor.CID {
+	cids := make([]cbor.CID, 0, len(blocks))
+	for cid := range blocks {
+		cids = append(cids, cid)
+	}
+	sort.Slice(cids, func(i, j int) bool {
+		return cids[i].String() < cids[j].String()
+	})
+	return cids
 }
 
 // carBytesWriter is a tiny io.Writer over a growable byte slice, so

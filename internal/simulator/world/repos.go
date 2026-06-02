@@ -1,6 +1,9 @@
 package world
 
 import (
+	"crypto"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -9,6 +12,7 @@ import (
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/mst"
 	"github.com/jcalabro/atmos/repo"
+	"gitlab.com/yawning/secp256k1-voi/secec"
 )
 
 // repoState mirrors what we persist per-account: the previous commit
@@ -96,7 +100,15 @@ func (w *World) loadRepo(a account) (*repo.Repo, error) {
 // pebble batch. Returns the post-commit state. New record blocks must
 // already be in rp.Store before this is called.
 func (w *World) commitAndPersist(a account, rp *repo.Repo) (repoState, error) {
-	commit, err := rp.Commit(a.priv)
+	// Write everything as one batch.
+	b := w.db.NewBatch()
+	defer func() { _ = b.Close() }()
+
+	rev, err := w.nextRev(b)
+	if err != nil {
+		return repoState{}, err
+	}
+	commit, err := commitWithRev(a, rp, rev)
 	if err != nil {
 		return repoState{}, fmt.Errorf("world: commit account %d: %w", a.Index, err)
 	}
@@ -125,10 +137,6 @@ func (w *World) commitAndPersist(a account, rp *repo.Repo) (repoState, error) {
 		CommitCID:   commitCID,
 		RecordCount: count,
 	}
-
-	// Write everything as one batch.
-	b := w.db.NewBatch()
-	defer func() { _ = b.Close() }()
 
 	// New blocks: every block the *pebbleStore captured during this
 	// session, plus the commit block.
@@ -182,6 +190,96 @@ func (w *World) commitAndPersist(a account, rp *repo.Repo) (repoState, error) {
 		return repoState{}, fmt.Errorf("world: commit batch: %w", err)
 	}
 	return state, nil
+}
+
+func commitWithRev(a account, rp *repo.Repo, rev string) (*repo.Commit, error) {
+	rootCID, err := rp.Tree.WriteBlocks(rp.Store)
+	if err != nil {
+		return nil, fmt.Errorf("repo: writing MST blocks: %w", err)
+	}
+
+	commit := &repo.Commit{
+		DID:     string(rp.DID),
+		Version: 3,
+		Data:    rootCID,
+		Rev:     rev,
+	}
+	if err := signCommitDeterministic(a, commit); err != nil {
+		return nil, err
+	}
+
+	commitData, err := commit.EncodeCBOR()
+	if err != nil {
+		return nil, fmt.Errorf("repo: encoding commit: %w", err)
+	}
+	commitCID := cbor.ComputeCID(cbor.CodecDagCBOR, commitData)
+	if err := rp.Store.PutBlock(commitCID, commitData); err != nil {
+		return nil, fmt.Errorf("repo: storing commit: %w", err)
+	}
+	return commit, nil
+}
+
+// deterministicK256Options intentionally mirrors atmos/crypto's strict K256
+// signing options. The simulator needs byte-stable commits under a fixed seed,
+// while atmos's public PrivateKey API uses crypto/rand for production signing.
+var deterministicK256Options = &secec.ECDSAOptions{
+	Hash:            crypto.SHA256,
+	Encoding:        secec.EncodingCompact,
+	RejectMalleable: true,
+}
+
+func signCommitDeterministic(a account, commit *repo.Commit) error {
+	unsigned, err := commit.UnsignedBytes()
+	if err != nil {
+		return fmt.Errorf("repo: encoding unsigned commit: %w", err)
+	}
+
+	// Simulator commits need reproducible bytes under a fixed seed; this
+	// deliberately uses deterministic nonce material for simulator-only keys.
+	key, err := secec.NewPrivateKey(a.priv.Bytes())
+	if err != nil {
+		return fmt.Errorf("repo: load deterministic signing key: %w", err)
+	}
+	digest := sha256.Sum256(unsigned)
+	sig, err := key.Sign(newDeterministicReader(a.priv.Bytes(), unsigned), digest[:], deterministicK256Options)
+	if err != nil {
+		return fmt.Errorf("repo: deterministic signing commit: %w", err)
+	}
+	commit.Sig = sig
+	return nil
+}
+
+type deterministicReader struct {
+	seed    [32]byte
+	counter uint64
+	buf     []byte
+}
+
+func newDeterministicReader(key, msg []byte) *deterministicReader {
+	h := sha256.New()
+	_, _ = h.Write([]byte("jetstream-v2 simulator deterministic k256 nonce"))
+	_, _ = h.Write(key)
+	_, _ = h.Write(msg)
+	var seed [32]byte
+	copy(seed[:], h.Sum(nil))
+	return &deterministicReader{seed: seed}
+}
+
+func (r *deterministicReader) Read(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		if len(r.buf) == 0 {
+			var counter [8]byte
+			binary.BigEndian.PutUint64(counter[:], r.counter)
+			block := sha256.Sum256(append(r.seed[:], counter[:]...))
+			r.counter++
+			r.buf = block[:]
+		}
+		copied := copy(p, r.buf)
+		p = p[copied:]
+		r.buf = r.buf[copied:]
+	}
+	return n, nil
 }
 
 // loadState reads sim/account/<idx>/state. Missing rows return a zero

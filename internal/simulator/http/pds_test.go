@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
@@ -39,4 +40,36 @@ func TestPDS_GetRepoRoundTrips(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, a.DID, rp.DID)
 	require.NotEmpty(t, commit.Sig)
+}
+
+func TestPDS_GetRepoServesPersistedHead(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 5, 2)
+	srv := httptest.NewServer(simhttp.NewHandler(w, "http://example.test"))
+	defer srv.Close()
+
+	a, err := w.LoadAccount(0)
+	require.NoError(t, err)
+	page, _, err := w.ListReposPage(0, 1)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	require.Equal(t, a.DID, page[0].DID)
+
+	xc := &xrpc.Client{
+		Host:       srv.URL,
+		HTTPClient: gt.Some(jttp.New()),
+	}
+	sc := sync.NewClient(sync.Options{Client: xc})
+
+	body, err := sc.GetRepoStream(context.Background(), a.DID, "")
+	require.NoError(t, err)
+	defer func() { _ = body.Close() }()
+
+	_, commit, err := loadFromCAR(body)
+	require.NoError(t, err)
+	commitData, err := commit.EncodeCBOR()
+	require.NoError(t, err)
+
+	require.Equal(t, page[0].Rev, commit.Rev)
+	require.Equal(t, page[0].Head, cbor.ComputeCID(cbor.CodecDagCBOR, commitData).String())
 }
