@@ -54,14 +54,14 @@ type Config struct {
 	OnAfterFlush func(ctx context.Context) error
 
 	// OnAfterSeal, if non-nil, runs after a successful segment seal
-	// inside rotateLocked: segment.Writer.Seal has fsynced the footer
-	// and finalized the fixed header before this hook fires. The hook
-	// receives the just-sealed segment's numeric index and on-disk
-	// path. Errors propagate up through Append and abort the rotation;
+	// during rotation or SealActiveAndClose: segment.Writer.Seal has
+	// fsynced the footer and finalized the fixed header before this
+	// hook fires. The hook receives the just-sealed segment's numeric
+	// index and on-disk path. Errors propagate up through the caller;
 	// the segment file is sealed and closed by Seal before this hook
 	// runs, so a hook failure leaves the writer with no usable active
-	// segment — subsequent Appends will fail. Callers that want to
-	// recover should Close the writer and reopen.
+	// segment. Callers that want to recover should Close the writer
+	// and reopen.
 	//
 	// Used by internal/manifest to publish the newly-sealed segment
 	// into its in-memory bounds slice without polling the directory.

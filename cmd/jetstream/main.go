@@ -70,6 +70,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/orchestrator"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
@@ -78,6 +79,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/subscribe"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
 	"github.com/bluesky-social/jetstream-v2/internal/web"
+	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
@@ -238,6 +240,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_CURSOR_LOOKBACK"),
 				Value:   36 * time.Hour,
 			},
+			&cli.DurationFlag{
+				Name:    "segment-cache-max-age",
+				Usage:   "Cache-Control max-age for XRPC segment downloads. 0 requires caches to revalidate every request.",
+				Sources: cli.EnvVars("JETSTREAM_SEGMENT_CACHE_MAX_AGE"),
+				Value:   0,
+			},
 			&cli.IntFlag{
 				Name:    "subscribe-hot-tail-bytes",
 				Usage:   "Byte budget of the in-memory hot-tail ring that fans live events to /subscribe clients.",
@@ -318,6 +326,10 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	dataDir := cmd.String("data-dir")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return fmt.Errorf("serve: create data dir %s: %w", dataDir, err)
+	}
+	segmentCacheMaxAge := cmd.Duration("segment-cache-max-age")
+	if segmentCacheMaxAge < 0 {
+		return fmt.Errorf("serve: --segment-cache-max-age must be >= 0, got %s", segmentCacheMaxAge)
 	}
 
 	segmentsDir := filepath.Join(dataDir, "segments")
@@ -500,6 +512,21 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		Metrics:   subscribeMetrics,
 		Lookback:  cmd.Duration("cursor-lookback"),
 	}))
+
+	// XRPC surface: whole-file segment download + listing. The atmos
+	// xrpcserver routes /xrpc/{nsid}; mounting at the "/xrpc/" subtree
+	// lets it own every jetstream NSID. Backed by the in-memory manifest,
+	// which only tracks sealed (immutable) segments.
+	xrpcSrv := xrpcapi.NewWithReadyAndCache(mft, processLogger, func(ctx context.Context) error {
+		if !lifecycle.IsSteadyState(metaStore) {
+			return errors.New("bootstrap in progress")
+		}
+		if err := mft.Wait(ctx); err != nil {
+			return fmt.Errorf("manifest warming up: %w", err)
+		}
+		return nil
+	}, segmentCacheMaxAge)
+	srv.RegisterPublicRoute("/xrpc/", xrpcSrv.Handler())
 
 	g, gctx := errgroup.WithContext(runCtx)
 

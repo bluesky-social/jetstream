@@ -76,6 +76,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			Logger:         o.cfg.Logger,
 			Metrics:        o.cfg.IngestMetrics,
 			SegmentMetrics: o.cfg.SegmentMetrics,
+			OnAfterSeal:    o.cfg.IngestOnAfterSeal,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)

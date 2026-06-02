@@ -39,5 +39,8 @@ func ParseSegmentIndex(name string) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
+	if SegmentFilename(idx) != name {
+		return 0, false
+	}
 	return idx, true
 }

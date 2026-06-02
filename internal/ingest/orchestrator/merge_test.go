@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -79,6 +82,37 @@ func TestMerge_DropsCoveredCommits_KeepsOthers(t *testing.T) {
 	for _, e := range got {
 		require.Greater(t, e.IndexedAt, maxSrc, "survivor IndexedAt must be re-stamped to merge time")
 	}
+}
+
+func TestMerge_PublishesTerminalSealToManifest(t *testing.T) {
+	t.Parallel()
+	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
+	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
+
+	segmentsDir := filepath.Join(fix.dataDir, "segments")
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	mft, err := manifest.Open(manifest.Options{
+		SegmentsDir: segmentsDir,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, mft.SegmentCount(), "manifest starts before merge seals any destination segment")
+
+	fix.cfg.IngestOnAfterSeal = mft.OnSegmentSealed
+	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	o, err := New(fix.cfg)
+	require.NoError(t, err)
+	require.NoError(t, o.runMerge(t.Context()))
+
+	require.Equal(t, 1, mft.SegmentCount(), "merge terminal seal must publish without process restart")
+	entries, nextIdx, more := mft.ListFrom(0, 10)
+	require.False(t, more)
+	require.Zero(t, nextIdx)
+	require.Len(t, entries, 1)
+	require.Equal(t, uint64(0), entries[0].Idx)
+	require.Equal(t, uint32(1), entries[0].EventCount)
+	require.Equal(t, uint64(0), entries[0].MinSeq)
+	require.Equal(t, uint64(0), entries[0].MaxSeq)
 }
 
 func TestMerge_RefreshesRepoRev_PreservesBackfillRev(t *testing.T) {

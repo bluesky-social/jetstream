@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -96,6 +97,22 @@ func (r *statusRecorder) Push(target string, opts *http.PushOptions) error {
 		return p.Push(target, opts)
 	}
 	return http.ErrNotSupported
+}
+
+// ReadFrom forwards to the underlying writer's io.ReaderFrom when present.
+// http.ServeContent relies on this to trigger sendfile(2) zero-copy
+// transfer when streaming an *os.File; without it large segment downloads
+// fall back to userspace 32 KiB copies. When the underlying writer does
+// not implement io.ReaderFrom, copy through the standard path so behavior
+// is still correct (just not zero-copy).
+func (r *statusRecorder) ReadFrom(src io.Reader) (int64, error) {
+	if !r.wroteHeader {
+		r.wroteHeader = true
+	}
+	if rf, ok := r.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+	return io.Copy(r.ResponseWriter, src)
 }
 
 var errHijackUnsupported = errors.New("underlying ResponseWriter does not implement http.Hijacker")

@@ -44,6 +44,7 @@ func TestParseSegmentIndex_Rejects(t *testing.T) {
 		"seg_00000000000.jss", // too long (11 digits)
 		"seg_0000000000.txt",
 		"shard_0000000000.jss",
+		"seg_000000000Z.jss",
 		"seg_!@#$%^&*().jss",
 	}
 	for _, s := range bad {

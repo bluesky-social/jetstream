@@ -179,3 +179,44 @@ func TestStatusRecorder_HijackUnsupported(t *testing.T) {
 		t.Fatal("Hijack call never returned")
 	}
 }
+
+// readerFromRecorder is a minimal ResponseWriter that also implements
+// io.ReaderFrom, standing in for the real *net/http response which uses
+// ReadFrom to trigger sendfile(2).
+type readerFromRecorder struct {
+	http.ResponseWriter
+	readFromCalled bool
+}
+
+func (r *readerFromRecorder) ReadFrom(src io.Reader) (int64, error) {
+	r.readFromCalled = true
+	return io.Copy(r.ResponseWriter, src)
+}
+
+// TestStatusRecorder_PreservesReaderFrom is the regression test for
+// sendfile(2) performance. http.ServeContent triggers zero-copy transfer
+// when the ResponseWriter implements io.ReaderFrom; a statusRecorder that
+// doesn't expose it forces slow userspace copies for large file downloads.
+func TestStatusRecorder_PreservesReaderFrom(t *testing.T) {
+	t.Parallel()
+
+	m := obs.NewMetrics()
+	inner := &readerFromRecorder{ResponseWriter: httptest.NewRecorder()}
+	readFromCalled := false
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		rf, ok := w.(io.ReaderFrom)
+		require.True(t, ok, "statusRecorder should implement io.ReaderFrom")
+
+		n, err := rf.ReadFrom(strings.NewReader("hello"))
+		require.NoError(t, err)
+		require.EqualValues(t, 5, n)
+		readFromCalled = inner.readFromCalled
+	})
+
+	req, err := http.NewRequest(http.MethodGet, "/", nil) //nolint:noctx // synthesized request
+	require.NoError(t, err)
+	m.InstrumentHandler("readfrom", handler).ServeHTTP(inner, req)
+
+	require.True(t, readFromCalled, "ReadFrom must delegate to the inner writer (sendfile path)")
+}

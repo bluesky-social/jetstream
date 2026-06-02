@@ -644,6 +644,96 @@ func TestSealActiveAndClose_FreshDir(t *testing.T) {
 	require.Zero(t, ins.Header.EventCount, "sealed empty segment carries no events")
 }
 
+func TestSealActiveAndClose_OnAfterSealFiresOnce(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+
+	var calls int
+	var gotIdx uint64
+	var gotPath string
+	w, err := Open(Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		MaxEventsPerBlock: 2,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+		OnAfterSeal: func(idx uint64, path string) error {
+			calls++
+			gotIdx = idx
+			gotPath = path
+
+			ins, err := segment.Inspect(path)
+			require.NoError(t, err)
+			require.True(t, ins.Sealed, "callback must observe a sealed segment")
+			require.Equal(t, uint64(1), ins.TotalEvents)
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	ev := segment.Event{
+		IndexedAt: 1, Kind: segment.KindCreate,
+		DID: "did:plc:a", Payload: []byte{0xa0},
+	}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.NoError(t, w.SealActiveAndClose())
+	require.NoError(t, w.SealActiveAndClose(), "second terminal seal is an idempotent no-op")
+
+	require.Equal(t, 1, calls)
+	require.Equal(t, uint64(0), gotIdx)
+	require.Equal(t, filepath.Join(segDir, SegmentFilename(0)), gotPath)
+}
+
+func TestSealActiveAndClose_OnAfterSealErrorPropagatesAfterDurableSeal(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+
+	wantErr := errors.New("publish failed")
+	var calls int
+	w, err := Open(Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		MaxEventsPerBlock: 2,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+		OnAfterSeal: func(uint64, string) error {
+			calls++
+			return wantErr
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	for i := range 3 {
+		ev := segment.Event{
+			IndexedAt: int64(i + 1),
+			Kind:      segment.KindCreate,
+			DID:       "did:plc:a",
+		}
+		require.NoError(t, w.Append(t.Context(), &ev))
+	}
+
+	err = w.SealActiveAndClose()
+	require.ErrorIs(t, err, wantErr)
+	require.Equal(t, 1, calls)
+
+	path := filepath.Join(segDir, SegmentFilename(0))
+	ins, inspectErr := segment.Inspect(path)
+	require.NoError(t, inspectErr)
+	require.True(t, ins.Sealed, "hook failure happens after the segment is sealed")
+	require.Equal(t, uint64(3), ins.TotalEvents)
+
+	persisted, closer, getErr := st.Get([]byte(seqNextKey))
+	require.NoError(t, getErr)
+	defer func() { _ = closer.Close() }()
+	require.Equal(t, uint64(3), binary.LittleEndian.Uint64(persisted),
+		"hook failure happens after seq/next is persisted")
+	require.ErrorIs(t, w.Append(t.Context(), &segment.Event{IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:a"}), ErrClosed)
+}
+
 func TestSegmentFiles_Empty(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

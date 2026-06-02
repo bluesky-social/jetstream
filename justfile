@@ -91,3 +91,7 @@ fuzz DURATION="10s" *ARGS="./...":
             go test "$pkg" -run='^$' -fuzz="^${t}$" -fuzztime={{DURATION}}
         done
     done
+
+# Generate Go XRPC types from the lexicons in ./lexicons
+lexgen:
+    go run github.com/jcalabro/atmos/cmd/lexgen -lexdir lexicons -config lexgen.json

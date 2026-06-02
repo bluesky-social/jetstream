@@ -9,12 +9,11 @@
 			"program": "${workspaceFolder}/cmd/jetstream",
 			"cwd": "${workspaceFolder}",
 			"args": [
-				"serve"
-			],
-			"env": {
-				"JETSTREAM_RELAY_URL": "http://localhost:7777",
-				"JETSTREAM_PLC_URL": "http://localhost:7777"
-			}
+				"serve",
+				"--relay-url=http://localhost:7777",
+				"--plc-url=http://localhost:7777",
+				"data-dir=${workspaceFolder}/data-sim",
+			]
 		},
 		{
 			"name": "Debug Jetstream (prod)",
@@ -25,7 +24,8 @@
 			"cwd": "${workspaceFolder}",
 			"args": [
 				"serve",
-				"--max-backfill-repos=40"
+				"--max-backfill-repos=20",
+				"--data-dir=${workspaceFolder}/data-prod",
 			]
 		}
 	]

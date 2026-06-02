@@ -1,0 +1,13 @@
+{
+  "packages": [
+    {
+      "prefix": "network.bsky.jetstream",
+      "package": "jetstream",
+      "outDir": "api/jetstream",
+      "import": "github.com/bluesky-social/jetstream-v2/api/jetstream"
+    }
+  ],
+  "sharedTypesDir": "api/lextypes",
+  "sharedTypesPkg": "lextypes",
+  "sharedTypesImport": "github.com/bluesky-social/jetstream-v2/api/lextypes"
+}

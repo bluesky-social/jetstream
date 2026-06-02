@@ -92,6 +92,29 @@ type CollectionStats struct {
 	BlockCount   uint64
 }
 
+// SegmentListEntry is the lightweight per-segment row returned by ListFrom.
+// It deliberately excludes blooms, block indexes, and the file path.
+type SegmentListEntry struct {
+	Idx          uint64
+	SizeBytes    int64
+	Checksum     uint64
+	EventCount   uint32
+	MinSeq       uint64
+	MaxSeq       uint64
+	MinIndexedAt int64
+	MaxIndexedAt int64
+}
+
+// SegmentFileRef is what a download handler needs to serve one sealed
+// segment: the on-disk path plus the immutable metadata used for ETag,
+// Last-Modified, and Content-Length.
+type SegmentFileRef struct {
+	Path      string
+	Checksum  uint64
+	ModTime   time.Time
+	SizeBytes int64
+}
+
 // Options configures Open. SegmentsDir is required; the rest have
 // safe zero-value defaults.
 type Options struct {
@@ -294,6 +317,72 @@ func (m *Manifest) AllBounds() []SegmentBounds {
 		out[i] = m.segments[i].SegmentBounds
 	}
 	return out
+}
+
+// SegmentByIdx resolves a single sealed segment for download. ok is false
+// when no sealed segment with that index is resident in the manifest
+// (covers both never-existed and not-yet-sealed).
+func (m *Manifest) SegmentByIdx(idx uint64) (SegmentFileRef, bool) {
+	if err := m.waitReady(); err != nil {
+		return SegmentFileRef{}, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	i := sort.Search(len(m.segments), func(i int) bool {
+		return m.segments[i].Idx >= idx
+	})
+	if i >= len(m.segments) || m.segments[i].Idx != idx {
+		return SegmentFileRef{}, false
+	}
+	meta := &m.segments[i]
+	return SegmentFileRef{
+		Path:      meta.Path,
+		Checksum:  meta.Header.Checksum,
+		ModTime:   meta.ModTime,
+		SizeBytes: meta.FileSize,
+	}, true
+}
+
+// ListFrom returns up to limit sealed-segment entries with Idx >= startIdx
+// in ascending index order. more reports whether further entries remain
+// beyond the returned page; when more is true, nextIdx is the index to pass
+// as the next startIdx. When more is false, nextIdx is zero and undefined.
+func (m *Manifest) ListFrom(startIdx uint64, limit int) (entries []SegmentListEntry, nextIdx uint64, more bool) {
+	if limit <= 0 {
+		return nil, 0, false
+	}
+	if err := m.waitReady(); err != nil {
+		return nil, 0, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	start := sort.Search(len(m.segments), func(i int) bool {
+		return m.segments[i].Idx >= startIdx
+	})
+
+	end := min(start+limit, len(m.segments))
+
+	entries = make([]SegmentListEntry, 0, end-start)
+	for i := start; i < end; i++ {
+		meta := &m.segments[i]
+		entries = append(entries, SegmentListEntry{
+			Idx:          meta.Idx,
+			SizeBytes:    meta.FileSize,
+			Checksum:     meta.Header.Checksum,
+			EventCount:   meta.Header.EventCount,
+			MinSeq:       meta.Header.MinSeq,
+			MaxSeq:       meta.Header.MaxSeq,
+			MinIndexedAt: meta.Header.MinIndexedAt,
+			MaxIndexedAt: meta.Header.MaxIndexedAt,
+		})
+	}
+
+	if end < len(m.segments) {
+		return entries, m.segments[end].Idx, true
+	}
+	return entries, 0, false
 }
 
 // SegmentStats returns the in-memory aggregate view of all sealed segments.

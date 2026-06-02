@@ -174,8 +174,8 @@ func (w *Writer) Close() error {
 
 // SealActiveAndClose flushes any pending block, seals the active
 // segment file (writes the variable-length footer and finalizes the
-// 256-byte fixed header), persists nextSeq, and closes the writer.
-// Idempotent.
+// 256-byte fixed header), persists nextSeq, publishes OnAfterSeal,
+// and closes the writer. Idempotent.
 //
 // Used by the orchestrator at cutover time to finalize the
 // bootstrap-phase live_segments writer's trailing active file so the
@@ -210,6 +210,11 @@ func (w *Writer) SealActiveAndClose() error {
 		return fmt.Errorf("ingest: seal active segment: %w", err)
 	}
 	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+		return err
+	}
+	sealedIdx := w.activeIdx
+	sealedPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(sealedIdx))
+	if err := w.onAfterSealLocked(sealedIdx, sealedPath); err != nil {
 		return err
 	}
 	return nil
@@ -328,10 +333,8 @@ func (w *Writer) rotateLocked(ctx context.Context) error {
 			return fmt.Errorf("ingest: seal segment %d: %w", sealedIdx, err)
 		}
 
-		if w.cfg.OnAfterSeal != nil {
-			if err := w.cfg.OnAfterSeal(sealedIdx, sealedPath); err != nil {
-				return fmt.Errorf("ingest: on_after_seal: %w", err)
-			}
+		if err := w.onAfterSealLocked(sealedIdx, sealedPath); err != nil {
+			return err
 		}
 
 		w.activeIdx++
@@ -354,6 +357,18 @@ func (w *Writer) rotateLocked(ctx context.Context) error {
 		w.cfg.Logger.InfoContext(ctx, "rotated segment", "new_index", w.activeIdx)
 		return nil
 	})
+}
+
+// onAfterSealLocked publishes a newly sealed segment. The caller MUST
+// hold w.mu; hooks must not call back into Writer.
+func (w *Writer) onAfterSealLocked(idx uint64, path string) error {
+	if w.cfg.OnAfterSeal == nil {
+		return nil
+	}
+	if err := w.cfg.OnAfterSeal(idx, path); err != nil {
+		return fmt.Errorf("ingest: on_after_seal: %w", err)
+	}
+	return nil
 }
 
 // NextSeq returns the next seq value the writer will allocate.
