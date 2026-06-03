@@ -51,7 +51,7 @@ env:
 jobs:
   oracle-sweep:
     name: oracle seed sweep
-    runs-on: ubuntu-24.04
+    runs-on: arc
     timeout-minutes: 360
     permissions:
       contents: read

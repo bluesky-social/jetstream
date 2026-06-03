@@ -165,7 +165,7 @@ jobs:
 
   test:
     name: test (race)
-    runs-on: ubuntu-24.04
+    runs-on: arc
     timeout-minutes: 10
     permissions:
       contents: read
