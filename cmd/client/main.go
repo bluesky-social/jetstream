@@ -139,8 +139,7 @@ func newApp() *cli.Command {
 				defer cancel()
 			}
 
-			run(runCtx, cfg)
-			return nil
+			return run(runCtx, cfg)
 		},
 	}
 }
@@ -273,9 +272,11 @@ func (s *counters) lastError() string {
 	return s.lastErr
 }
 
-func run(ctx context.Context, cfg config) {
+func run(ctx context.Context, cfg config) error {
 	stats := &counters{}
 	start := time.Now()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	_, _ = fmt.Fprintf(cfg.out, "target=%d url=%s report_interval=%s ramp_duration=%s compression=%t\n",
 		cfg.concurrency, cfg.url, cfg.reportInterval, cfg.rampDuration, cfg.compression)
@@ -283,10 +284,11 @@ func run(ctx context.Context, cfg config) {
 	reportDone := make(chan struct{})
 	go func() {
 		defer close(reportDone)
-		report(ctx, cfg, stats, start)
+		report(runCtx, cfg, stats, start)
 	}()
 
 	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
 	launchDelay := time.Duration(0)
 	if cfg.concurrency > 1 && cfg.rampDuration > 0 {
 		launchDelay = cfg.rampDuration / time.Duration(cfg.concurrency-1)
@@ -294,7 +296,7 @@ func run(ctx context.Context, cfg config) {
 
 	for i := 0; i < cfg.concurrency; i++ {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			goto wait
 		default:
 		}
@@ -302,11 +304,17 @@ func run(ctx context.Context, cfg config) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			consume(ctx, cfg, stats, id)
+			if err := consume(runCtx, cfg, stats, id); err != nil {
+				select {
+				case errCh <- err:
+					cancel()
+				default:
+				}
+			}
 		}(i)
 		if launchDelay > 0 && i < cfg.concurrency-1 {
 			select {
-			case <-ctx.Done():
+			case <-runCtx.Done():
 				goto wait
 			case <-time.After(launchDelay):
 			}
@@ -314,21 +322,27 @@ func run(ctx context.Context, cfg config) {
 	}
 
 wait:
-	<-ctx.Done()
+	<-runCtx.Done()
 	wg.Wait()
 	<-reportDone
 	printReport(cfg.out, "final", time.Since(start), cfg.concurrency, stats, reportSnapshot{}, time.Since(start))
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
 }
 
-func consume(ctx context.Context, cfg config, stats *counters, id int) {
+func consume(ctx context.Context, cfg config, stats *counters, id int) error {
 	firstAttempt := true
 	for {
 		if err := ctx.Err(); err != nil {
-			return
+			return nil
 		}
 		if !firstAttempt {
 			if !sleepReconnect(ctx, cfg.reconnectDelay, id) {
-				return
+				return nil
 			}
 			stats.reconnects.Add(1)
 		}
@@ -340,15 +354,16 @@ func consume(ctx context.Context, cfg config, stats *counters, id int) {
 		closeResponse(resp)
 		if err != nil {
 			if ctx.Err() != nil {
-				return
+				return nil
 			}
 			stats.dialErrors.Add(1)
 			if resp != nil {
 				stats.setLastError("dial: http %d: %v", resp.StatusCode, err)
+				return fmt.Errorf("subscriber %d dial: http %d: %w", id, resp.StatusCode, err)
 			} else {
 				stats.setLastError("dial: %v", err)
+				return fmt.Errorf("subscriber %d dial: %w", id, err)
 			}
-			continue
 		}
 
 		stats.dials.Add(1)
@@ -361,7 +376,7 @@ func consume(ctx context.Context, cfg config, stats *counters, id int) {
 				stats.setLastError("hello: %v", err)
 				stats.connected.Add(-1)
 				_ = conn.Close(websocket.StatusNormalClosure, "hello failed")
-				continue
+				return fmt.Errorf("subscriber %d hello: %w", id, err)
 			}
 		}
 

@@ -1,6 +1,17 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+)
 
 func TestSubscribeURLDefaults(t *testing.T) {
 	t.Parallel()
@@ -55,5 +66,42 @@ func TestSubscribeURLRejectsUnsupportedScheme(t *testing.T) {
 
 	if _, err := subscribeURL(config{rawURL: "ftp://example.com"}); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestRunExitsWhenDialFails(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	var out bytes.Buffer
+	start := time.Now()
+	err := run(ctx, config{
+		url:             "ws://example.test/subscribe",
+		concurrency:     1,
+		reportInterval:  time.Hour,
+		dialTimeout:     100 * time.Millisecond,
+		reconnectDelay:  time.Hour,
+		readLimit:       10_000_000,
+		out:             &out,
+		dial: func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+			return nil, &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader("not ready")),
+			}, errors.New("rejected")
+		},
+	})
+	if err == nil {
+		t.Fatal("expected dial failure")
+	}
+	if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
+		t.Fatalf("run returned too slowly after dial failure: %s", elapsed)
+	}
+	if !strings.Contains(err.Error(), "http 503") {
+		t.Fatalf("error %q does not include HTTP status", err)
+	}
+	if !strings.Contains(out.String(), "final ") {
+		t.Fatalf("expected final report, got:\n%s", out.String())
 	}
 }
