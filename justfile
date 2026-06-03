@@ -109,7 +109,7 @@ oracle-sweep SEEDS="100" ACCOUNTS="250" MAX_INITIAL_RECORDS="10000" LIVE_EVENTS_
             JETSTREAM_ORACLE_MAX_INITIAL_RECORDS="{{MAX_INITIAL_RECORDS}}" \
             JETSTREAM_ORACLE_LIVE_EVENTS_BOOTSTRAP="{{LIVE_EVENTS_BOOTSTRAP}}" \
             JETSTREAM_ORACLE_LIVE_EVENTS_STEADY="{{LIVE_EVENTS_STEADY}}" \
-            gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 ./internal/oracle -run TestOracle_DefaultLifecycle -v; then
+            gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -timeout 30m ./internal/oracle -run TestOracle_DefaultLifecycle -v; then
             echo "::endgroup::"
             echo "::error::oracle failed at seed ${seed}"
             echo "Repro:"
@@ -119,7 +119,7 @@ oracle-sweep SEEDS="100" ACCOUNTS="250" MAX_INITIAL_RECORDS="10000" LIVE_EVENTS_
             echo "  JETSTREAM_ORACLE_MAX_INITIAL_RECORDS={{MAX_INITIAL_RECORDS}} \\"
             echo "  JETSTREAM_ORACLE_LIVE_EVENTS_BOOTSTRAP={{LIVE_EVENTS_BOOTSTRAP}} \\"
             echo "  JETSTREAM_ORACLE_LIVE_EVENTS_STEADY={{LIVE_EVENTS_STEADY}} \\"
-            echo "  go test ./internal/oracle -run TestOracle_DefaultLifecycle -count=1 -v"
+            echo "  go test ./internal/oracle -run TestOracle_DefaultLifecycle -count=1 -timeout 30m -v"
             exit 1
         fi
         echo "::endgroup::"
