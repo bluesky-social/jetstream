@@ -18,9 +18,23 @@ lint:
 modernize *ARGS="./...":
     modernize -fix -test {{ARGS}}
 
-# Build the jetstream binary into ./bin/jetstream.
+# Build the jetstream binary into ./bin/jetstream, stamping build info
+# (version/commit/date) into internal/version via -ldflags, mirroring the
+# Dockerfile. VERSION comes from `git describe`; a dirty tree gets a -dirty
+# suffix on the commit.
 build:
-    go build -trimpath -o bin/jetstream ./cmd/jetstream
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pkg="github.com/bluesky-social/jetstream-v2/internal/version"
+    version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+    commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    if ! git diff --quiet HEAD 2>/dev/null; then
+        commit="${commit}-dirty"
+    fi
+    date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    go build -trimpath \
+        -ldflags "-X ${pkg}.Version=${version} -X ${pkg}.Commit=${commit} -X ${pkg}.Date=${date}" \
+        -o bin/jetstream ./cmd/jetstream
 
 # Remove build artifacts and local data.
 clean:
