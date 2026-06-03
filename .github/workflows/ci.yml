@@ -104,7 +104,7 @@ env:
 jobs:
   lint:
     name: lint
-    runs-on: ubuntu-24.04
+    runs-on: arc
     timeout-minutes: 10
     permissions:
       contents: read
