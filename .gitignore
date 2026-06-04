@@ -35,4 +35,5 @@ go.work.sum
 
 # Files not for distribution
 /docs
+.superpowers/
 /data*
