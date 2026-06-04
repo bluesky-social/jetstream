@@ -123,6 +123,18 @@
   .filter { width: min(28rem, 100%); margin-bottom: 0.75rem; }
   .error-text { color: var(--warn); overflow-wrap: anywhere; }
   .samples { margin: 0.25rem 0 0 0; padding-left: 1rem; color: var(--muted); font-size: 0.86rem; }
+  .sample-did code { overflow-wrap: anywhere; }
+  .account-link {
+    margin-left: 0.35rem;
+    padding: 0.08rem 0.3rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .sample-meta { color: var(--muted); }
+  .sample-error { overflow-wrap: anywhere; }
   @media (max-width: 520px) {
     body { padding: 1rem 0.5rem; }
     section { padding: 0.85rem; }
@@ -322,11 +334,14 @@ document.addEventListener("input", function (event) {
         <td class="num">{{humanInt .Failed}}</td>
         <td>{{relativeTime .LastAttemptedAt $.Now}}</td>
         <td class="wide">
-          {{if .LatestErrorClass}}<code>{{.LatestErrorClass}}</code> {{end}}{{.LatestError}}
           {{if .RecentErrors}}
           <ul class="samples">
             {{range .RecentErrors}}
-            <li><code>{{.DID}}</code> {{relativeTime .AttemptedAt $.Now}} {{if .Class}}<code>{{.Class}}</code>{{end}} {{.Error}}</li>
+            <li>
+              <span class="sample-did"><code>{{.DID}}</code></span><a class="account-link" href="/status?tab=accounts&amp;did={{.DID}}&amp;handle=" target="_blank" rel="noopener">view</a>
+              <span class="sample-meta">{{relativeTime .AttemptedAt $.Now}} {{if .Class}}<code>{{.Class}}</code>{{end}}</span>
+              <span class="sample-error">{{.Error}}</span>
+            </li>
             {{end}}
           </ul>
           {{end}}

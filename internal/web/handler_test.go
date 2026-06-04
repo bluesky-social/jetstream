@@ -254,7 +254,7 @@ func TestHandler_RendersHostsTab(t *testing.T) {
 		RecentErrors: []status.HostErrorRow{{
 			DID:   "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
 			Class: "http_5xx",
-			Error: "boom",
+			Error: `<script>alert("x")</script>`,
 		}},
 	}}}
 	src := &fakeSnapshotter{snap: s}
@@ -273,6 +273,10 @@ func TestHandler_RendersHostsTab(t *testing.T) {
 	body := rr.Body.String()
 	require.Contains(t, body, "Hosts")
 	require.Contains(t, body, "host-filter")
+	require.Contains(t, body, "sample-did")
+	require.Contains(t, body, "account-link")
+	require.Contains(t, body, `href="/status?tab=accounts&amp;did=did%3aplc%3aaaaaaaaaaaaaaaaaaaaaaaaa&amp;handle="`)
+	require.Contains(t, body, `target="_blank"`)
 	require.Contains(t, body, "pds.example.com")
 	require.Contains(t, body, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
 	require.NotContains(t, body, `<script>alert("x")</script>`)
