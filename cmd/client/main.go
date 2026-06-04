@@ -161,7 +161,16 @@ type config struct {
 	requireHello      bool
 	readLimit         int64
 	out               io.Writer
+
+	// dial establishes a websocket connection. It defaults to websocket.Dial
+	// in run when nil; tests inject a stub to exercise dial error handling
+	// without a live server.
+	dial dialFunc
 }
+
+// dialFunc matches the signature of websocket.Dial so the dialer can be
+// swapped out in tests.
+type dialFunc func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error)
 
 func (c config) validate() error {
 	if c.concurrency <= 0 {
@@ -273,6 +282,9 @@ func (s *counters) lastError() string {
 }
 
 func run(ctx context.Context, cfg config) error {
+	if cfg.dial == nil {
+		cfg.dial = websocket.Dial
+	}
 	stats := &counters{}
 	start := time.Now()
 	runCtx, cancel := context.WithCancel(ctx)
@@ -338,7 +350,7 @@ func consume(ctx context.Context, cfg config, stats *counters, id int) error {
 	firstAttempt := true
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil
+			return nil //nolint:nilerr // context cancellation is a clean shutdown, not an error
 		}
 		if !firstAttempt {
 			if !sleepReconnect(ctx, cfg.reconnectDelay, id) {
@@ -349,12 +361,12 @@ func consume(ctx context.Context, cfg config, stats *counters, id int) error {
 		firstAttempt = false
 
 		dialCtx, cancel := context.WithTimeout(ctx, cfg.dialTimeout)
-		conn, resp, err := websocket.Dial(dialCtx, cfg.url, dialOptions(cfg))
+		conn, resp, err := cfg.dial(dialCtx, cfg.url, dialOptions(cfg))
 		cancel()
 		closeResponse(resp)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return nil //nolint:nilerr // dial failed because the run context was cancelled; clean shutdown
 			}
 			stats.dialErrors.Add(1)
 			if resp != nil {

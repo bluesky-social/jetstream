@@ -78,13 +78,13 @@ func TestRunExitsWhenDialFails(t *testing.T) {
 	var out bytes.Buffer
 	start := time.Now()
 	err := run(ctx, config{
-		url:             "ws://example.test/subscribe",
-		concurrency:     1,
-		reportInterval:  time.Hour,
-		dialTimeout:     100 * time.Millisecond,
-		reconnectDelay:  time.Hour,
-		readLimit:       10_000_000,
-		out:             &out,
+		url:            "ws://example.test/subscribe",
+		concurrency:    1,
+		reportInterval: time.Hour,
+		dialTimeout:    100 * time.Millisecond,
+		reconnectDelay: time.Hour,
+		readLimit:      10_000_000,
+		out:            &out,
 		dial: func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
 			return nil, &http.Response{
 				StatusCode: http.StatusServiceUnavailable,
