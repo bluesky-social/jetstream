@@ -217,7 +217,14 @@ func waitForBarrier(t *testing.T, cfg Config, name string, gate *phaseGate, run 
 }
 
 func oracleWaitTimeout(cfg Config) time.Duration {
-	timeout := 60 * time.Second
+	// The after-bootstrap barrier waits for the initial-record backfill
+	// (accounts × MaxInitialRecords), which dominates bootstrap cost and is far
+	// heavier than the live-event scaling below accounts for. A 60s floor was
+	// too tight for stress mode on slower CI runners (the arc runner timed out
+	// at exactly 60s). 5m gives ample headroom while staying well under the
+	// per-seed `-timeout 30m` cap; a genuine hang is still caught promptly by
+	// the run.exited select in waitForBarrier.
+	timeout := 5 * time.Minute
 	if cfg.LiveEventsBootstrap > 0 {
 		scaled := time.Duration(cfg.LiveEventsBootstrap/100) * time.Second
 		if scaled > timeout {
