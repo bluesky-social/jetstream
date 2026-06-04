@@ -321,9 +321,17 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				)
 			case err != nil:
 				c.cfg.Metrics.incDecodeErrors()
-				// Bad shape from upstream is a data-integrity issue;
-				// we surface it rather than silently dropping events.
-				return fmt.Errorf("livestream: convert: %w", err)
+				// Bad shape from upstream is invalid external input,
+				// not local corruption. Count, log, and advance past
+				// this recognized-but-malformed event so one bad repo
+				// cannot wedge the firehose consumer forever. Internal
+				// append/flush/pebble failures still return below.
+				c.logger.WarnContext(ctx, "malformed upstream event",
+					"seq", evt.Seq,
+					"err", err,
+				)
+				c.noteUpstreamSeq(evt.Seq)
+				continue
 			}
 
 			for i := range segEvts {
@@ -345,18 +353,23 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			// blindly. lastUpstream is informational; the
 			// cursor we persist comes from cursorValue() which
 			// prefers atmos's watermark.
-			if evt.Seq > 0 {
-				for {
-					prev := c.lastUpstream.Load()
-					if evt.Seq <= prev || c.lastUpstream.CompareAndSwap(prev, evt.Seq) {
-						break
-					}
-				}
-			}
+			c.noteUpstreamSeq(evt.Seq)
 		}
 
 		return nil
 	})
+}
+
+func (c *Consumer) noteUpstreamSeq(seq int64) {
+	if seq <= 0 {
+		return
+	}
+	for {
+		prev := c.lastUpstream.Load()
+		if seq <= prev || c.lastUpstream.CompareAndSwap(prev, seq) {
+			return
+		}
+	}
 }
 
 // Writer returns the live consumer's ingest writer. May be nil before

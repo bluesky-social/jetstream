@@ -399,3 +399,195 @@ func TestStore_SeedsMissingCountsFromRows(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, Counts{Total: 2, Discovered: 1, Complete: 1}, counts)
 }
+
+func TestStore_HostAggregates_FailThenComplete(t *testing.T) {
+	t.Parallel()
+	st, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, bs.recordIdentityResolution(ctx, did, IdentityResolution{
+		Handle: "alice.test",
+		PDS:    "https://pds.example.com",
+		Host:   "pds.example.com",
+	}))
+
+	require.NoError(t, bs.OnFail(ctx, did, errors.New("xrpc: HTTP 503: unavailable"), 3))
+	hs, ok, err := loadHostStatus(st, "pds.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), hs.Total)
+	require.Equal(t, uint64(1), hs.Active)
+	require.Equal(t, uint64(0), hs.NotStarted)
+	require.Equal(t, uint64(0), hs.Complete)
+	require.Equal(t, uint64(1), hs.Failed)
+	require.Equal(t, ErrorClassHTTP5xx, hs.LatestErrorClass)
+	require.Len(t, hs.RecentErrors, 1)
+
+	require.NoError(t, bs.OnComplete(ctx, did, &repo.Commit{Rev: "rev1"}))
+	hs, ok, err = loadHostStatus(st, "pds.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), hs.Total)
+	require.Equal(t, uint64(1), hs.Active)
+	require.Equal(t, uint64(0), hs.Failed)
+	require.Equal(t, uint64(1), hs.Complete)
+}
+
+func TestStore_HostAggregates_ActiveFlip(t *testing.T) {
+	t.Parallel()
+	st, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, bs.recordIdentityResolution(ctx, did, IdentityResolution{
+		PDS:  "https://pds.example.com",
+		Host: "pds.example.com",
+	}))
+
+	require.NoError(t, bs.OnUpdate(ctx, atmossync.ListReposEntry{DID: did, Active: false}))
+	hs, ok, err := loadHostStatus(st, "pds.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), hs.Total)
+	require.Equal(t, uint64(0), hs.Active)
+}
+
+func TestStore_HandleIndex_DeclaredHandleChange(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:handlechange")
+
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, s.recordIdentityResolution(ctx, did, IdentityResolution{
+		Handle: "alice.test",
+		PDS:    "https://pds.example.com",
+		Host:   "pds.example.com",
+	}))
+
+	got, ok, err := lookupDIDByHandle(s.db, "ALICE.TEST")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, did, got)
+
+	require.NoError(t, s.recordIdentityResolution(ctx, did, IdentityResolution{
+		Handle: "bob.test",
+		PDS:    "https://pds.example.com",
+		Host:   "pds.example.com",
+	}))
+
+	_, ok, err = lookupDIDByHandle(s.db, "alice.test")
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	got, ok, err = lookupDIDByHandle(s.db, "bob.test")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, did, got)
+}
+
+func TestStore_HandleIndex_HandleChangePreservesLaterOwner(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	didA := atmos.DID("did:plc:handlechangea")
+	didB := atmos.DID("did:plc:handlechangeb")
+
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: didA, Active: true}))
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: didB, Active: true}))
+
+	require.NoError(t, s.recordIdentityResolution(ctx, didA, IdentityResolution{
+		Handle: "alice.test",
+		PDS:    "https://pds-a.example.com",
+		Host:   "pds-a.example.com",
+	}))
+	require.NoError(t, s.recordIdentityResolution(ctx, didB, IdentityResolution{
+		Handle: "alice.test",
+		PDS:    "https://pds-b.example.com",
+		Host:   "pds-b.example.com",
+	}))
+	require.NoError(t, s.recordIdentityResolution(ctx, didA, IdentityResolution{
+		Handle: "bob.test",
+		PDS:    "https://pds-a.example.com",
+		Host:   "pds-a.example.com",
+	}))
+
+	got, ok, err := lookupDIDByHandle(s.db, "alice.test")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, didB, got)
+
+	got, ok, err = lookupDIDByHandle(s.db, "bob.test")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, didA, got)
+}
+
+func TestStore_HostMove_AdjustsOldAndNewAggregates(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:hostmove")
+
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, s.recordIdentityResolution(ctx, did, IdentityResolution{
+		PDS:  "https://pds-a.example.com",
+		Host: "pds-a.example.com",
+	}))
+	require.NoError(t, s.recordIdentityResolution(ctx, did, IdentityResolution{
+		PDS:  "https://pds-b.example.com",
+		Host: "pds-b.example.com",
+	}))
+
+	oldHost, ok, err := loadHostStatus(s.db, "pds-a.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(0), oldHost.Total)
+	require.Equal(t, uint64(0), oldHost.Active)
+	require.Equal(t, uint64(0), oldHost.NotStarted)
+
+	newHost, ok, err := loadHostStatus(s.db, "pds-b.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), newHost.Total)
+	require.Equal(t, uint64(1), newHost.Active)
+	require.Equal(t, uint64(1), newHost.NotStarted)
+}
+
+func TestStore_HostAggregates_LatestFiveFailureSamples(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:samplefailures")
+
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, s.recordIdentityResolution(ctx, did, IdentityResolution{
+		PDS:  "https://pds.example.com",
+		Host: "pds.example.com",
+	}))
+
+	for i := 0; i < 7; i++ {
+		require.NoError(t, s.OnFail(ctx, did, errors.New("xrpc: HTTP 503: unavailable sample "+string(rune('0'+i))), i+1))
+	}
+
+	hs, ok, err := loadHostStatus(s.db, "pds.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), hs.Total)
+	require.Equal(t, uint64(1), hs.Failed)
+	require.Equal(t, uint64(7), hs.ErrorClassCounts[ErrorClassHTTP5xx])
+	require.Equal(t, ErrorClassHTTP5xx, hs.LatestErrorClass)
+	require.Contains(t, hs.LatestError, "sample 6")
+	require.Len(t, hs.RecentErrors, 5)
+	require.Contains(t, hs.RecentErrors[0].Error, "sample 6")
+	require.Contains(t, hs.RecentErrors[4].Error, "sample 2")
+}

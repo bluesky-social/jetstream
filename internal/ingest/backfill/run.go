@@ -93,11 +93,6 @@ func Run(ctx context.Context, cfg Config) error {
 			Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
 		}
 
-		sc := atmossync.NewClient(atmossync.Options{
-			Client:    xc,
-			Directory: gt.Some(cfg.Directory),
-		})
-
 		runCtx, cancelRun := context.WithCancel(ctx)
 		defer cancelRun()
 
@@ -120,6 +115,13 @@ func Run(ctx context.Context, cfg Config) error {
 		st := NewStore(cfg.Store, cfg.Metrics)
 		st.afterComplete = cfg.AfterRepoComplete
 		st.afterCompleteError = recordFatal
+		directory := directoryWithRecordingResolver(cfg.Directory, st, recordFatal)
+
+		sc := atmossync.NewClient(atmossync.Options{
+			Client:    xc,
+			Directory: gt.Some(directory),
+		})
+
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 		handler.onWriterError = recordFatal
 		logger := cfg.Logger.With(slog.String("component", "backfill/run"))
@@ -143,7 +145,7 @@ func Run(ctx context.Context, cfg Config) error {
 			SyncClient:  sc,
 			Store:       st,
 			Handler:     handler,
-			Directory:   gt.Some(cfg.Directory),
+			Directory:   gt.Some(directory),
 			HTTPClient:  gt.Some(cfg.HTTPClient),
 			StartCursor: gt.Some(startCursor),
 			OnPageComplete: gt.Some(func(cursor string) error {
@@ -158,6 +160,9 @@ func Run(ctx context.Context, cfg Config) error {
 			}),
 			OnError: gt.Some(func(did atmos.DID, err error) {
 				logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
+				if errors.Is(err, errIdentityDiagnosticsPersistence) {
+					recordFatal(err)
+				}
 			}),
 			OnProgress: gt.Some(func(stats atmosbackfill.Stats) {
 				cfg.Metrics.setProgressCompleted(stats.Completed)

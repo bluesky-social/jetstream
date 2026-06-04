@@ -220,6 +220,40 @@ func TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer(t *testing.T) {
 		"the consumer must extract per-op detail from the typed error and bump the counter")
 }
 
+func TestProcessBatch_MalformedCommitDoesNotShutDownConsumer(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	metrics := NewMetrics(prometheus.NewRegistry())
+
+	c, err := Open(Config{
+		SegmentsDir: dir,
+		Store:       st,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		Metrics:     metrics,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	evt, _ := buildCommit(t, "did:plc:badcommit", "rev-bad",
+		struct{ Coll, Rkey string }{"app.bsky.feed.post", "rec0"},
+	)
+	evt.Seq = 43
+	evt.Commit.Ops[0].Action = "not-a-real-action"
+
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{evt}),
+		"malformed upstream commit data must not propagate an error out of processBatch")
+	require.Equal(t, int64(43), c.LastUpstreamSeq(),
+		"malformed-but-recognized external data should advance past the bad upstream cursor")
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DecodeErrors), 0,
+		"the skipped malformed event must be visible in decode_errors_total")
+}
+
 func encodeAccountFrame(t *testing.T, did string, seq int64) []byte {
 	t.Helper()
 	acc := &comatproto.SyncSubscribeRepos_Account{

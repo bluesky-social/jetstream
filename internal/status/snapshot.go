@@ -11,6 +11,7 @@ import (
 // share a *Snapshot pointer without locks.
 type Snapshot struct {
 	GeneratedAt      time.Time
+	Request          Request
 	Process          ProcessInfo
 	Phase            PhaseInfo
 	Backfill         BackfillStats
@@ -18,6 +19,15 @@ type Snapshot struct {
 	SegmentAggregate *SegmentAggregate
 	Pebble           PebbleStats
 	CursorLookback   CursorLookbackStats
+	Hosts            HostDiagnostics
+	Account          AccountLookup
+}
+
+// Request selects the status-page view and optional account lookup.
+type Request struct {
+	Tab    string
+	DID    string
+	Handle string
 }
 
 // ProcessInfo carries the per-process build + uptime context.
@@ -46,6 +56,59 @@ type BackfillStats struct {
 	Failed          uint64
 	PercentComplete float64
 	ListReposCursor string
+}
+
+// HostDiagnostics is the host/PDS aggregate table.
+type HostDiagnostics struct {
+	Rows       []HostRow
+	TopFailing []HostRow
+}
+
+// HostRow is the rendering view for one PDS host bucket.
+type HostRow struct {
+	Host             string
+	Total            uint64
+	Active           uint64
+	NotStarted       uint64
+	Complete         uint64
+	Failed           uint64
+	LastAttemptedAt  time.Time
+	LatestError      string
+	LatestErrorClass string
+	ErrorClassCounts map[string]uint64
+	RecentErrors     []HostErrorRow
+}
+
+// HostErrorRow is one bounded recent error sample for a host bucket.
+type HostErrorRow struct {
+	DID         string
+	AttemptedAt time.Time
+	Class       string
+	Error       string
+}
+
+// AccountLookup is the account diagnostics panel for one DID or local
+// declared-handle query.
+type AccountLookup struct {
+	Query           string
+	QueryKind       string
+	Found           bool
+	Error           string
+	DID             string
+	Handle          string
+	PDS             string
+	Host            string
+	Active          bool
+	Backfill        string
+	Attempts        int
+	LastError       string
+	BackfillRev     string
+	LatestRev       string
+	UpdatedAt       time.Time
+	LastAttemptedAt time.Time
+	RecordCount     int64
+	TotalBytes      int64
+	HostContext     *HostRow
 }
 
 // LiveStats summarizes the upstream cursor and seq counters.

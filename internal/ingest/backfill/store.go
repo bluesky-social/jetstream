@@ -90,7 +90,13 @@ func (s *Store) putRepoStatus(did atmos.DID, rs *RepoStatus) error {
 	return nil
 }
 
-func (s *Store) putRepoStatusAndCounts(did atmos.DID, rs *RepoStatus, hadRow bool, old Status) error {
+func (s *Store) putRepoStatusAndCounts(
+	did atmos.DID,
+	rs *RepoStatus,
+	hadRow bool,
+	old Status,
+	updateHost func(*HostStatus),
+) error {
 	enc, err := encodeRepoStatus(rs)
 	if err != nil {
 		return err
@@ -122,6 +128,19 @@ func (s *Store) putRepoStatusAndCounts(did atmos.DID, rs *RepoStatus, hadRow boo
 	}
 	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
 		return fmt.Errorf("backfill: stage counts: %w", err)
+	}
+	if rs.Host != "" {
+		hs, _, err := loadHostStatus(s.db, rs.Host)
+		if err != nil {
+			return err
+		}
+		applyHostStatusTransition(hs, hadRow, rs.Active, old, rs.Backfill.Status)
+		if updateHost != nil {
+			updateHost(hs)
+		}
+		if err := stageHostStatus(batch, hs); err != nil {
+			return err
+		}
 	}
 	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
 		return fmt.Errorf("backfill: write repo/%s and counts: %w", did, err)
@@ -157,6 +176,35 @@ func countBucket(c *Counts, st Status) *uint64 {
 	}
 }
 
+func applyHostStatusTransition(h *HostStatus, hadRow bool, active bool, old, next Status) {
+	if !hadRow {
+		h.Total++
+		if active {
+			h.Active++
+		}
+		incrementStatus(h, next)
+		return
+	}
+	if old == next {
+		return
+	}
+	decrementStatus(h, old)
+	incrementStatus(h, next)
+}
+
+func applyHostActiveTransition(h *HostStatus, oldActive, nextActive bool) {
+	if oldActive == nextActive {
+		return
+	}
+	if nextActive {
+		h.Active++
+		return
+	}
+	if h.Active > 0 {
+		h.Active--
+	}
+}
+
 // readRepoStatus is the RMW helper for OnUpdate/OnComplete/OnFail.
 // It returns (nil, nil) when the row doesn't exist so callers can
 // decide whether absence is an error in their context.
@@ -172,6 +220,161 @@ func (s *Store) readRepoStatus(did atmos.DID) (*RepoStatus, error) {
 	return decodeRepoStatus(val)
 }
 
+func (s *Store) putRepoStatusAndHostActive(did atmos.DID, rs *RepoStatus, oldActive bool) error {
+	enc, err := encodeRepoStatus(rs)
+	if err != nil {
+		return err
+	}
+
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.Set(repoKey(did), enc, nil); err != nil {
+		return fmt.Errorf("backfill: stage repo/%s: %w", did, err)
+	}
+	if rs.Host != "" && oldActive != rs.Active {
+		hs, _, err := loadHostStatus(s.db, rs.Host)
+		if err != nil {
+			return err
+		}
+		applyHostActiveTransition(hs, oldActive, rs.Active)
+		if err := stageHostStatus(batch, hs); err != nil {
+			return err
+		}
+	}
+	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: write repo/%s and host active: %w", did, err)
+	}
+	return nil
+}
+
+func (s *Store) recordIdentityResolution(_ context.Context, did atmos.DID, resolution IdentityResolution) error {
+	normalizedHost, _, err := normalizeHostStatusKey(resolution.Host)
+	if err != nil {
+		return fmt.Errorf("backfill: record identity resolution %s: %w", did, err)
+	}
+
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+
+	rs, err := s.readRepoStatus(did)
+	if err != nil {
+		return err
+	}
+	hadRow := rs != nil
+	if rs == nil {
+		rs = &RepoStatus{
+			Backfill: RepoBackfillStatus{Status: StatusNotStarted},
+		}
+	}
+	oldStatus := rs.Backfill.Status
+	oldHost := rs.Host
+	if oldHost != "" {
+		oldHost, _, err = normalizeHostStatusKey(oldHost)
+		if err != nil {
+			return fmt.Errorf("backfill: record identity resolution %s: existing host %q: %w", did, rs.Host, err)
+		}
+	}
+	oldActive := rs.Active
+	oldHandle := rs.Handle
+
+	rs.Handle = resolution.Handle
+	rs.PDS = resolution.PDS
+	rs.Host = normalizedHost
+
+	enc, err := encodeRepoStatus(rs)
+	if err != nil {
+		return err
+	}
+
+	var countsEnc []byte
+	if !hadRow {
+		counts, ok, err := LoadCounts(s.db)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			counts, err = CountStatuses(s.db)
+			if err != nil {
+				return err
+			}
+		}
+		applyCountTransition(&counts, false, "", rs.Backfill.Status)
+		countsEnc, err = encodeCounts(counts)
+		if err != nil {
+			return err
+		}
+	}
+
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.Set(repoKey(did), enc, nil); err != nil {
+		return fmt.Errorf("backfill: stage repo/%s: %w", did, err)
+	}
+	if len(countsEnc) > 0 {
+		if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
+			return fmt.Errorf("backfill: stage counts: %w", err)
+		}
+	}
+	if handleIndexChanged(oldHandle, resolution.Handle) {
+		if err := stageHandleIndexDeleteIfMatches(s.db, batch, oldHandle, did); err != nil {
+			return err
+		}
+	}
+	if err := stageHandleIndexSet(batch, resolution.Handle, did); err != nil {
+		return err
+	}
+	if oldHost != normalizedHost {
+		if oldHost != "" {
+			oldHS, _, err := loadHostStatus(s.db, oldHost)
+			if err != nil {
+				return err
+			}
+			if oldHS.Total > 0 {
+				oldHS.Total--
+			}
+			if oldActive && oldHS.Active > 0 {
+				oldHS.Active--
+			}
+			decrementStatus(oldHS, oldStatus)
+			if err := stageHostStatus(batch, oldHS); err != nil {
+				return err
+			}
+		}
+
+		newHS, _, err := loadHostStatus(s.db, normalizedHost)
+		if err != nil {
+			return err
+		}
+		newHS.Total++
+		if rs.Active {
+			newHS.Active++
+		}
+		incrementStatus(newHS, rs.Backfill.Status)
+		if err := stageHostStatus(batch, newHS); err != nil {
+			return err
+		}
+	}
+	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: write identity resolution %s: %w", did, err)
+	}
+	return nil
+}
+
+func handleIndexChanged(a, b string) bool {
+	ak, aok := normalizeHandleIndexKey(a)
+	bk, bok := normalizeHandleIndexKey(b)
+	if aok != bok {
+		return true
+	}
+	if !aok {
+		return false
+	}
+	return string(ak) != string(bk)
+}
+
 // OnDiscover writes a fresh RepoStatus at status=not_started for a
 // DID the engine has never seen. atmos guarantees this fires at most
 // once per DID per Lookup-StateUnknown path.
@@ -183,7 +386,7 @@ func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) er
 		},
 		Active: entry.Active,
 	}
-	if err := s.putRepoStatusAndCounts(entry.DID, rs, false, ""); err != nil {
+	if err := s.putRepoStatusAndCounts(entry.DID, rs, false, "", nil); err != nil {
 		return err
 	}
 	s.metrics.incDiscovered()
@@ -202,8 +405,9 @@ func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) erro
 	if rs == nil {
 		return fmt.Errorf("backfill: on_update %s: missing row (atmos invariant violation)", entry.DID)
 	}
+	oldActive := rs.Active
 	rs.Active = entry.Active
-	if err := s.putRepoStatus(entry.DID, rs); err != nil {
+	if err := s.putRepoStatusAndHostActive(entry.DID, rs, oldActive); err != nil {
 		return err
 	}
 	s.metrics.incActiveFlips()
@@ -244,7 +448,10 @@ func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Comm
 	rs.Backfill.LastError = ""
 	rs.Rev = commit.Rev
 	rs.UpdatedAt = now
-	if err := s.putRepoStatusAndCounts(did, rs, hadRow, old); err != nil {
+	rs.LastAttemptedAt = now
+	if err := s.putRepoStatusAndCounts(did, rs, hadRow, old, func(hs *HostStatus) {
+		hs.LastAttemptedAt = now
+	}); err != nil {
 		return err
 	}
 	if s.afterComplete != nil {
@@ -269,7 +476,16 @@ func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Comm
 // preserved. This is defensive — within this PR the engine never
 // retries a StateComplete DID — but it keeps a hypothetical future
 // "complete then later failed" trail intact.
-func (s *Store) OnFail(_ context.Context, did atmos.DID, failErr error, attempts int) error {
+func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attempts int) error {
+	if errors.Is(failErr, errIdentityDiagnosticsPersistence) {
+		s.metrics.incOnFailErrors()
+		return failErr
+	}
+	if err := ctx.Err(); err != nil {
+		s.metrics.incOnFailErrors()
+		return err
+	}
+
 	rs, err := s.readRepoStatus(did)
 	if err != nil {
 		s.metrics.incOnFailErrors()
@@ -282,10 +498,26 @@ func (s *Store) OnFail(_ context.Context, did atmos.DID, failErr error, attempts
 	} else {
 		old = rs.Backfill.Status
 	}
+	now := timeNow()
+	errMsg := ""
+	if failErr != nil {
+		errMsg = failErr.Error()
+	}
+	errMsg = truncateErrorString(errMsg)
+	errClass := classifyBackfillError(failErr)
 	rs.Backfill.Status = StatusFailed
-	rs.Backfill.LastError = failErr.Error()
+	rs.Backfill.LastError = errMsg
 	rs.Backfill.Attempts = attempts
-	if err := s.putRepoStatusAndCounts(did, rs, hadRow, old); err != nil {
+	rs.LastAttemptedAt = now
+	if err := s.putRepoStatusAndCounts(did, rs, hadRow, old, func(hs *HostStatus) {
+		hs.LastAttemptedAt = now
+		hs.addErrorSample(HostErrorSample{
+			DID:         did,
+			AttemptedAt: now,
+			Class:       errClass,
+			Error:       errMsg,
+		})
+	}); err != nil {
 		s.metrics.incOnFailErrors()
 		return err
 	}

@@ -118,10 +118,16 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 // backfill_test.go. We need it because the production resolver talks
 // to plc.directory; the test environment has no PLC.
 type stubResolver struct {
-	docs map[atmos.DID]*identity.DIDDocument
+	docs         map[atmos.DID]*identity.DIDDocument
+	onResolveDID func(context.Context, atmos.DID) error
 }
 
-func (r *stubResolver) ResolveDID(_ context.Context, did atmos.DID) (*identity.DIDDocument, error) {
+func (r *stubResolver) ResolveDID(ctx context.Context, did atmos.DID) (*identity.DIDDocument, error) {
+	if r.onResolveDID != nil {
+		if err := r.onResolveDID(ctx, did); err != nil {
+			return nil, err
+		}
+	}
 	doc, ok := r.docs[did]
 	if !ok {
 		return nil, identity.ErrDIDNotFound
@@ -299,10 +305,22 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 // the integration entry point for our run_test.go.
 func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.Store) error {
 	t.Helper()
+	return runWithStubResolver(t, ctx, srv, db, nil)
+}
+
+func runWithStubResolver(
+	t *testing.T,
+	ctx context.Context,
+	srv *stubServer,
+	db *store.Store,
+	onResolveDID func(context.Context, atmos.DID) error,
+) error {
+	t.Helper()
 	docs := make(map[atmos.DID]*identity.DIDDocument, len(srv.fixtures))
 	for did, f := range srv.fixtures {
 		docs[did] = &identity.DIDDocument{
-			ID: string(did),
+			ID:          string(did),
+			AlsoKnownAs: []string{"at://" + did.Identifier() + ".test"},
 			VerificationMethod: []identity.VerificationMethod{
 				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
 			},
@@ -311,7 +329,7 @@ func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.S
 			},
 		}
 	}
-	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
+	dir := &identity.Directory{Resolver: &stubResolver{docs: docs, onResolveDID: onResolveDID}}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	segDir := filepath.Join(t.TempDir(), "segments")
@@ -336,6 +354,35 @@ func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.S
 	return Run(ctx, cfg)
 }
 
+func TestRun_IdentityDiagnosticsPersistenceFailureAbortsRun(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:diagfail")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	host, ok := normalizeHostBucket(srv.srv.URL)
+	require.True(t, ok)
+	hostStatusKey, err := hostKey(host)
+	require.NoError(t, err)
+	require.NoError(t, db.Set(hostStatusKey, []byte("not json"), store.SyncWrites))
+
+	err = runWithStub(t, t.Context(), srv, db)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "identity diagnostics")
+
+	rs, err := NewStore(db, nil).readRepoStatus(did)
+	require.NoError(t, err)
+	require.NotNil(t, rs)
+	require.Equal(t, StatusNotStarted, rs.Backfill.Status)
+	require.Empty(t, rs.Backfill.LastError)
+	require.Empty(t, rs.Host)
+}
+
 // TestRun_HappyPath_DownloadsAllRepos is the wiring smoke test: three
 // DIDs in listRepos, each with a real signed CAR served by the stub
 // PDS. After Run, every DID lands at StatusComplete in pebble.
@@ -356,11 +403,25 @@ func TestRun_HappyPath_DownloadsAllRepos(t *testing.T) {
 	require.NoError(t, runWithStub(t, t.Context(), srv, db))
 
 	bf := NewStore(db, nil)
+	wantHost, ok := normalizeHostBucket(srv.srv.URL)
+	require.True(t, ok)
 	for _, did := range dids {
 		got, err := bf.Lookup(context.Background(), did)
 		require.NoError(t, err)
 		require.Equal(t, atmosbackfill.StateComplete, got.State, "%s should be Complete", did)
+
+		rs, err := bf.readRepoStatus(did)
+		require.NoError(t, err)
+		require.NotNil(t, rs)
+		require.Equal(t, srv.srv.URL, rs.PDS)
+		require.Equal(t, wantHost, rs.Host)
 	}
+
+	hs, ok, err := loadHostStatus(db, wantHost)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(len(dids)), hs.Total)
+	require.Equal(t, uint64(len(dids)), hs.Complete)
 }
 
 // TestRun_Resume_NoOpAfterCompletion exercises restart-after-

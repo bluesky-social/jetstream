@@ -140,6 +140,146 @@ func TestCollect_BackfillCounts(t *testing.T) {
 	require.InDelta(t, 37.5, snap.Backfill.PercentComplete, 0.001)
 }
 
+func TestCollect_HostDiagnosticsFromAggregates(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	hs := &backfill.HostStatus{
+		Host:             "pds.example.com",
+		Total:            10,
+		Active:           9,
+		NotStarted:       1,
+		Complete:         7,
+		Failed:           2,
+		LastAttemptedAt:  now,
+		LatestError:      "xrpc: HTTP 503",
+		LatestErrorClass: backfill.ErrorClassHTTP5xx,
+		ErrorClassCounts: map[backfill.ErrorClass]uint64{backfill.ErrorClassHTTP5xx: 2},
+		RecentErrors: []backfill.HostErrorSample{
+			{DID: atmos.DID("did:plc:alice"), AttemptedAt: now, Class: backfill.ErrorClassHTTP5xx, Error: "xrpc: HTTP 503"},
+		},
+	}
+	enc, err := backfill.EncodeHostStatus(hs)
+	require.NoError(t, err)
+	require.NoError(t, st.Set([]byte("host/pds.example.com"), enc, store.SyncWrites))
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "hosts"})
+	require.NoError(t, err)
+	require.Equal(t, "hosts", snap.Request.Tab)
+	require.Len(t, snap.Hosts.Rows, 1)
+	require.Equal(t, "pds.example.com", snap.Hosts.Rows[0].Host)
+	require.Equal(t, uint64(10), snap.Hosts.Rows[0].Total)
+	require.Equal(t, uint64(2), snap.Hosts.Rows[0].Failed)
+	require.Equal(t, "http_5xx", snap.Hosts.Rows[0].LatestErrorClass)
+	require.Equal(t, uint64(2), snap.Hosts.Rows[0].ErrorClassCounts["http_5xx"])
+	require.Len(t, snap.Hosts.Rows[0].RecentErrors, 1)
+	require.Equal(t, "did:plc:alice", snap.Hosts.Rows[0].RecentErrors[0].DID)
+	require.Len(t, snap.Hosts.TopFailing, 1)
+	require.Equal(t, "pds.example.com", snap.Hosts.TopFailing[0].Host)
+}
+
+func TestCollect_HostDiagnosticsTopFailingIsBounded(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	for i := range 12 {
+		host := "pds" + string(rune('a'+i)) + ".example.com"
+		enc, err := backfill.EncodeHostStatus(&backfill.HostStatus{
+			Host: host, Total: 20, Failed: uint64(12 - i),
+		})
+		require.NoError(t, err)
+		require.NoError(t, st.Set([]byte("host/"+host), enc, store.SyncWrites))
+	}
+	healthy, err := backfill.EncodeHostStatus(&backfill.HostStatus{
+		Host: "healthy.example.com", Total: 100, Complete: 100,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Set([]byte("host/healthy.example.com"), healthy, store.SyncWrites))
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "summary"})
+	require.NoError(t, err)
+
+	require.Len(t, snap.Hosts.Rows, 13)
+	require.Len(t, snap.Hosts.TopFailing, 10)
+	require.Equal(t, uint64(12), snap.Hosts.TopFailing[0].Failed)
+	require.Equal(t, uint64(3), snap.Hosts.TopFailing[9].Failed)
+	for _, row := range snap.Hosts.TopFailing {
+		require.Positive(t, row.Failed)
+		require.NotEqual(t, "healthy.example.com", row.Host)
+	}
+}
+
+func TestCollect_AccountLookupByHandle(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	did := atmos.DID("did:plc:alice")
+	attemptedAt := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	rs := &backfill.RepoStatus{
+		Backfill: backfill.RepoBackfillStatus{
+			Status:    backfill.StatusFailed,
+			Attempts:  3,
+			LastError: "boom",
+			Rev:       "backfill-rev",
+		},
+		Handle:          "alice.test",
+		Host:            "pds.example.com",
+		PDS:             "https://pds.example.com",
+		Rev:             "latest-rev",
+		LastAttemptedAt: attemptedAt,
+		Active:          true,
+		RecordCount:     42,
+		TotalBytes:      1024,
+	}
+	enc, err := backfill.EncodeRepoStatus(rs)
+	require.NoError(t, err)
+	require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
+	require.NoError(t, st.Set([]byte("handle/alice.test"), []byte(did), store.SyncWrites))
+
+	hostEnc, err := backfill.EncodeHostStatus(&backfill.HostStatus{
+		Host: "pds.example.com", Total: 5, Active: 4, Complete: 3, Failed: 2,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Set([]byte("host/pds.example.com"), hostEnc, store.SyncWrites))
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "accounts", Handle: "Alice.Test"})
+	require.NoError(t, err)
+	require.Equal(t, "accounts", snap.Request.Tab)
+	require.True(t, snap.Account.Found)
+	require.Equal(t, string(did), snap.Account.DID)
+	require.Equal(t, "alice.test", snap.Account.Query)
+	require.Equal(t, "handle", snap.Account.QueryKind)
+	require.Equal(t, "alice.test", snap.Account.Handle)
+	require.Equal(t, "pds.example.com", snap.Account.Host)
+	require.Equal(t, "https://pds.example.com", snap.Account.PDS)
+	require.True(t, snap.Account.Active)
+	require.Equal(t, "failed", snap.Account.Backfill)
+	require.Equal(t, 3, snap.Account.Attempts)
+	require.Equal(t, "boom", snap.Account.LastError)
+	require.Equal(t, "backfill-rev", snap.Account.BackfillRev)
+	require.Equal(t, "latest-rev", snap.Account.LatestRev)
+	require.Equal(t, int64(42), snap.Account.RecordCount)
+	require.Equal(t, int64(1024), snap.Account.TotalBytes)
+	require.NotNil(t, snap.Account.HostContext)
+	require.Equal(t, uint64(2), snap.Account.HostContext.Failed)
+}
+
 func TestCollect_LiveCursors(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
@@ -229,6 +369,55 @@ func TestCollect_WithManifestSkipsRepoScan(t *testing.T) {
 	require.Greater(t, snap.SegmentAggregate.Trees[0].CompressedBytes, int64(0))
 	_, hasRepoCount := snap.Pebble.KeyspaceCounts["repo/"]
 	require.False(t, hasRepoCount, "manifest-backed status must not count Pebble keyspaces")
+}
+
+func TestCollect_DefaultSnapshotDoesNotScanHostAggregates(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	require.NoError(t, st.Set([]byte("host/corrupt.example.com"), []byte("not json"), store.SyncWrites))
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, snap.Hosts.Rows)
+
+	_, err = c.SnapshotForRequest(t.Context(), status.Request{Tab: "hosts"})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "decode HostStatus")
+}
+
+func TestCollect_SnapshotForRequestSingleflightKeyDoesNotCollide(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	didA := atmos.DID("did:plc:a")
+	didAB := atmos.DID("did:plc:a:b")
+	for _, did := range []atmos.DID{didA, didAB} {
+		enc, err := backfill.EncodeRepoStatus(&backfill.RepoStatus{
+			Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete},
+			Handle:   string(did),
+		})
+		require.NoError(t, err)
+		require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
+	}
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	first, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "accounts", DID: string(didA), Handle: "b:c"})
+	require.NoError(t, err)
+	second, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "accounts", DID: string(didAB), Handle: "c"})
+	require.NoError(t, err)
+
+	require.Equal(t, string(didA), first.Account.DID)
+	require.Equal(t, string(didAB), second.Account.DID)
 }
 
 func TestCollect_WithManifestIncludesWritableTails(t *testing.T) {

@@ -13,6 +13,7 @@
     --border: #e0e0e0;
     --accent: #2860c8;
     --bar-bg: #eee;
+    --warn: #b33a3a;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -23,6 +24,7 @@
       --border: #333;
       --accent: #6aa3ff;
       --bar-bg: #333;
+      --warn: #ff8a8a;
     }
   }
   body {
@@ -31,9 +33,10 @@
     color: var(--fg); background: var(--bg);
     line-height: 1.5;
   }
-  main { max-width: 1000px; margin: 0 auto; }
+  main { max-width: 1180px; margin: 0 auto; }
   h1 { margin: 0 0 0.25rem 0; font-size: 1.75rem; }
   h2 { margin: 0 0 0.75rem 0; font-size: 1.1rem; color: var(--accent); }
+  h3 { margin: 0 0 0.5rem 0; font-size: 0.95rem; color: var(--muted); font-weight: 500; }
   .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
   section {
     background: var(--card);
@@ -44,16 +47,26 @@
   }
   dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0; }
   dt { color: var(--muted); }
-  dd { margin: 0; font-variant-numeric: tabular-nums; }
-  .grid2 {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 1rem;
+  dd { margin: 0; font-variant-numeric: tabular-nums; min-width: 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; overflow-wrap: anywhere; }
+  .tabs {
+    display: flex; gap: 0.25rem; flex-wrap: wrap;
+    border-bottom: 1px solid var(--border);
+    margin: 0 0 1rem 0;
   }
-  @media (max-width: 700px) {
-    .grid2 { grid-template-columns: 1fr; }
+  .tab {
+    color: var(--fg); text-decoration: none;
+    padding: 0.45rem 0.75rem;
+    border: 1px solid transparent;
+    border-bottom: 0;
+    border-radius: 6px 6px 0 0;
   }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+  .tab.active { color: var(--accent); border-color: var(--border); background: var(--card); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+  @media (max-width: 800px) {
+    .grid2, .grid3 { grid-template-columns: 1fr; }
+  }
   .cursor {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.85em;
@@ -64,29 +77,56 @@
     margin-top: 0.75rem; padding-top: 0.75rem;
     border-top: 1px solid var(--border);
   }
-  .latest h3 { margin: 0 0 0.5rem 0; font-size: 0.95rem; color: var(--muted); font-weight: 500; }
-  .collections-table {
+  .warnings {
+    margin-bottom: 0.75rem; padding: 0.5rem 0.75rem;
+    border-left: 3px solid var(--accent); background: var(--bar-bg);
+  }
+  .status-table {
     border-collapse: collapse;
     table-layout: fixed;
     width: 100%;
   }
-  .collections-table th,
-  .collections-table td {
-    padding: 0.25rem 0.5rem;
+  .table-wrap { overflow-x: auto; max-width: 100%; }
+  .table-wrap .status-table { min-width: 760px; }
+  .status-table th,
+  .status-table td {
+    padding: 0.3rem 0.5rem;
     vertical-align: top;
   }
-  .collections-table thead tr { border-bottom: 1px solid var(--border); }
-  .collections-table th { text-align: left; }
-  .collections-table .count-col { width: 7.25rem; }
-  .collections-table .nsid code {
-    display: block;
-    overflow-wrap: anywhere;
-    word-break: normal;
-  }
-  .collections-table .num {
+  .status-table thead tr { border-bottom: 1px solid var(--border); }
+  .status-table tbody tr + tr { border-top: 1px solid var(--border); }
+  .status-table th { text-align: left; color: var(--muted); font-weight: 600; }
+  .status-table .num {
     font-variant-numeric: tabular-nums;
     text-align: right;
     white-space: nowrap;
+  }
+  .count-col { width: 7.25rem; }
+  .host-col { width: 18rem; }
+  .time-col { width: 8rem; }
+  .status-table .wide { overflow-wrap: anywhere; word-break: normal; }
+  .toolbar {
+    display: flex; flex-wrap: wrap; gap: 0.5rem;
+    margin-bottom: 1rem;
+  }
+  input, button {
+    box-sizing: border-box;
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.4rem 0.55rem;
+  }
+  button { cursor: pointer; background: var(--card); }
+  .lookup-input { min-width: 0; flex: 1 1 18rem; }
+  .filter { width: min(28rem, 100%); margin-bottom: 0.75rem; }
+  .error-text { color: var(--warn); overflow-wrap: anywhere; }
+  .samples { margin: 0.25rem 0 0 0; padding-left: 1rem; color: var(--muted); font-size: 0.86rem; }
+  @media (max-width: 520px) {
+    body { padding: 1rem 0.5rem; }
+    section { padding: 0.85rem; }
+    .lookup-input, .toolbar button { flex-basis: 100%; width: 100%; }
   }
 </style>
 </head>
@@ -99,237 +139,325 @@
     &middot; uptime {{humanDuration .Process.Uptime}}
   </div>
 
-  <section>
-    <h2>Phase</h2>
-    <dl>
-      <dt>State</dt>
-      <dd>{{if .Phase.Phase}}<code>{{.Phase.Phase}}</code>{{else}}starting{{end}}</dd>
-      <dt>Entered</dt>
-      <dd>
-        {{if .Phase.PhaseEnteredAt.IsZero}}
-          since process start
-        {{else}}
-          {{relativeTime .Phase.PhaseEnteredAt .Now}}
-        {{end}}
-      </dd>
-    </dl>
-  </section>
+  <nav class="tabs" aria-label="status sections">
+    <a class="tab {{if eq .Request.Tab "summary"}}active{{end}}" href="/status?tab=summary">Summary</a>
+    <a class="tab {{if eq .Request.Tab "hosts"}}active{{end}}" href="/status?tab=hosts">Hosts</a>
+    <a class="tab {{if eq .Request.Tab "accounts"}}active{{end}}" href="/status?tab=accounts">Accounts</a>
+    <a class="tab {{if eq .Request.Tab "collections"}}active{{end}}" href="/status?tab=collections">Collections</a>
+  </nav>
 
-  <section>
-    <h2>Backfill</h2>
-    {{if eq .Backfill.TotalDIDs 0}}
-      <p class="sub">Backfill has not started.</p>
-    {{else if .Backfill.ListReposCursor}}
+  {{if eq .Request.Tab "summary"}}
+    {{template "summary" .}}
+  {{else if eq .Request.Tab "hosts"}}
+    {{template "hosts" .}}
+  {{else if eq .Request.Tab "accounts"}}
+    {{template "accounts" .}}
+  {{else if eq .Request.Tab "collections"}}
+    {{template "collections" .}}
+  {{end}}
+</main>
+<script>
+document.addEventListener("input", function (event) {
+  if (event.target.id !== "host-filter") return;
+  var q = event.target.value.toLowerCase();
+  document.querySelectorAll("#hosts-table tbody tr").forEach(function (row) {
+    row.hidden = row.textContent.toLowerCase().indexOf(q) === -1;
+  });
+});
+</script>
+</body>
+</html>
+
+{{define "summary"}}
+  <div class="grid2">
+    <section>
+      <h2>Phase</h2>
       <dl>
         <dt>State</dt>
-        <dd>enumerating repos</dd>
-        <dt>Discovered</dt>
-        <dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
-        <dt>Downloaded</dt>
-        <dd>{{humanInt .Backfill.Complete}} repos</dd>
-        <dt>Errored</dt>
-        <dd>{{humanInt .Backfill.Failed}} repos</dd>
-        <dt>listRepos cursor</dt>
-        <dd class="cursor">{{.Backfill.ListReposCursor}}</dd>
+        <dd>{{if .Phase.Phase}}<code>{{.Phase.Phase}}</code>{{else}}starting{{end}}</dd>
+        <dt>Entered</dt>
+        <dd>{{if .Phase.PhaseEnteredAt.IsZero}}since process start{{else}}{{relativeTime .Phase.PhaseEnteredAt .Now}}{{end}}</dd>
       </dl>
-    {{else}}
-      <dl>
-        <dt>Discovered</dt>
-        <dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
-        <dt>Downloaded</dt>
-        <dd>{{humanInt .Backfill.Complete}} repos</dd>
-        <dt>Errored</dt>
-        <dd>{{humanInt .Backfill.Failed}} repos</dd>
-      </dl>
-    {{end}}
-  </section>
+    </section>
 
-  <section>
-    <h2>Live ingest</h2>
-    <dl>
-      <dt>Upstream cursor</dt>
-      <dd>{{if eq .Live.UpstreamCursor 0}}not yet started{{else}}{{humanInt64 .Live.UpstreamCursor}}{{end}}</dd>
-      <dt>Sequence allocated</dt>
-      <dd>{{humanInt .Live.NextSeq}} events</dd>
-      {{if gt .Live.BootstrapSeq 0}}
-      <dt>Bootstrap-time live seq</dt>
-      <dd>{{humanInt .Live.BootstrapSeq}}</dd>
+    <section>
+      <h2>Backfill</h2>
+      {{if eq .Backfill.TotalDIDs 0}}
+        <p class="sub">Backfill has not started.</p>
+      {{else if .Backfill.ListReposCursor}}
+        <dl>
+          <dt>State</dt><dd>enumerating repos</dd>
+          <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
+          <dt>Downloaded</dt><dd>{{humanInt .Backfill.Complete}} repos</dd>
+          <dt>Errored</dt><dd>{{humanInt .Backfill.Failed}} repos</dd>
+          <dt>listRepos cursor</dt><dd class="cursor">{{.Backfill.ListReposCursor}}</dd>
+        </dl>
+      {{else}}
+        <dl>
+          <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
+          <dt>Downloaded</dt><dd>{{humanInt .Backfill.Complete}} repos</dd>
+          <dt>Errored</dt><dd>{{humanInt .Backfill.Failed}} repos</dd>
+        </dl>
       {{end}}
-    </dl>
-  </section>
+    </section>
+  </div>
+
+  <div class="grid2">
+    <section>
+      <h2>Live ingest</h2>
+      <dl>
+        <dt>Upstream cursor</dt><dd>{{if eq .Live.UpstreamCursor 0}}not yet started{{else}}{{humanInt64 .Live.UpstreamCursor}}{{end}}</dd>
+        <dt>Sequence allocated</dt><dd>{{humanInt .Live.NextSeq}} events</dd>
+        {{if gt .Live.BootstrapSeq 0}}<dt>Bootstrap-time live seq</dt><dd>{{humanInt .Live.BootstrapSeq}}</dd>{{end}}
+      </dl>
+    </section>
+
+    <section>
+      <h2>Metadata store</h2>
+      <dl>
+        <dt>On disk</dt><dd>{{humanBytes .Pebble.DiskBytes}}</dd>
+        {{range $prefix, $count := .Pebble.KeyspaceCounts}}
+        <dt><code>{{$prefix}}</code></dt><dd>{{humanInt $count}}</dd>
+        {{end}}
+      </dl>
+    </section>
+  </div>
 
   <section>
     <h2>Network</h2>
     {{with .SegmentAggregate}}
     <dl>
-      <dt>Segments</dt>
-      <dd>{{.Network.Segments}} ({{.Network.SealedSegments}} sealed{{if gt .Network.ActiveSegments 0}} + {{.Network.ActiveSegments}} active{{end}})</dd>
-      <dt>Blocks</dt>
-      <dd>{{humanInt .Network.Blocks}}</dd>
-      <dt>Events</dt>
-      <dd>{{humanInt .Network.Events}}</dd>
-      <dt>Collections</dt>
-      <dd>{{.Network.Collections}} distinct NSIDs</dd>
+      <dt>Segments</dt><dd>{{.Network.Segments}} ({{.Network.SealedSegments}} sealed{{if gt .Network.ActiveSegments 0}} + {{.Network.ActiveSegments}} active{{end}})</dd>
+      <dt>Blocks</dt><dd>{{humanInt .Network.Blocks}}</dd>
+      <dt>Events</dt><dd>{{humanInt .Network.Events}}</dd>
+      <dt>Collections</dt><dd>{{.Network.Collections}} distinct NSIDs</dd>
       {{if gt .Network.Events 0}}
-      <dt>Seq range</dt>
-      <dd>[{{humanInt .Network.MinSeq}}, {{humanInt .Network.MaxSeq}}]</dd>
-      {{if not .Network.MinIndexedAt.IsZero}}
-      <dt>Indexed range</dt>
-      <dd>{{.Network.MinIndexedAt.Format "2006-01-02 15:04:05"}} … {{.Network.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>
+      <dt>Seq range</dt><dd>[{{humanInt .Network.MinSeq}}, {{humanInt .Network.MaxSeq}}]</dd>
+      {{if not .Network.MinIndexedAt.IsZero}}<dt>Indexed range</dt><dd>{{.Network.MinIndexedAt.Format "2006-01-02 15:04:05"}} ... {{.Network.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>{{end}}
       {{end}}
-      {{end}}
-      <dt>Compressed</dt>
-      <dd>{{humanBytes .Network.CompressedBytes}}</dd>
-      <dt>Uncompressed</dt>
-      <dd>{{humanBytes .Network.UncompressedBytes}}</dd>
-      <dt>Disk usage</dt>
-      <dd>{{humanBytes .Network.DiskBytes}}</dd>
+      <dt>Compressed</dt><dd>{{humanBytes .Network.CompressedBytes}}</dd>
+      <dt>Uncompressed</dt><dd>{{humanBytes .Network.UncompressedBytes}}</dd>
+      <dt>Disk usage</dt><dd>{{humanBytes .Network.DiskBytes}}</dd>
     </dl>
     {{end}}
   </section>
+
+  {{if .Hosts.TopFailing}}
+  <section>
+    <h2>Top failing hosts</h2>
+    <div class="table-wrap">
+    <table class="status-table">
+      <colgroup><col class="host-col"><col class="count-col"><col class="count-col"><col></colgroup>
+      <thead><tr><th>Host</th><th class="num">Repos</th><th class="num">Failed</th><th>Error</th></tr></thead>
+      <tbody>
+      {{range .Hosts.TopFailing}}
+        <tr>
+          <td><code>{{.Host}}</code></td>
+          <td class="num">{{humanInt .Total}}</td>
+          <td class="num">{{humanInt .Failed}}</td>
+          <td class="wide">{{if .LatestErrorClass}}<code>{{.LatestErrorClass}}</code> {{end}}{{.LatestError}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    </div>
+  </section>
+  {{end}}
 
   <section>
     <h2>Segments</h2>
     {{with .SegmentAggregate}}
     {{if .Warnings}}
-    <div class="warnings" style="margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; border-left: 3px solid var(--accent); background: var(--bar-bg);">
+    <div class="warnings">
       <strong>{{len .Warnings}} warning(s):</strong>
       <ul style="margin: 0.25rem 0 0 1rem; padding: 0;">
         {{range .Warnings}}<li><code>{{.}}</code></li>{{end}}
       </ul>
     </div>
     {{end}}
-    <div class="grid2">
-      {{template "tree" dict "Stats" (index .Trees 0) "Now" $.Now "Title" "segments/"}}
-      {{template "tree" dict "Stats" (index .Trees 1) "Now" $.Now "Title" "backfill/live_segments/"}}
-    </div>
+    {{if ge (len .Trees) 2}}
+      <div class="grid2">
+        {{template "tree" dict "Stats" (index .Trees 0) "Now" $.Now "Title" "segments/"}}
+        {{template "tree" dict "Stats" (index .Trees 1) "Now" $.Now "Title" "backfill/live_segments/"}}
+      </div>
+    {{else}}
+      <p class="sub">Segment aggregates are not available.</p>
+    {{end}}
     {{end}}
   </section>
 
   <section>
     <h2>Cursor lookback</h2>
     <dl>
-      <dt>Configured lookback</dt>
-      <dd>
-        {{if eq .CursorLookback.ConfiguredLookback 0}}
-          <em>disabled</em>
-        {{else}}
-          {{humanDuration .CursorLookback.ConfiguredLookback}}
-        {{end}}
-      </dd>
-      <dt>Sealed segments tracked</dt>
-      <dd>{{humanInt64Cast .CursorLookback.ManifestSegmentCount}}</dd>
+      <dt>Configured lookback</dt><dd>{{if eq .CursorLookback.ConfiguredLookback 0}}<em>disabled</em>{{else}}{{humanDuration .CursorLookback.ConfiguredLookback}}{{end}}</dd>
+      <dt>Sealed segments tracked</dt><dd>{{humanInt64Cast .CursorLookback.ManifestSegmentCount}}</dd>
       <dt>Oldest retained seq</dt>
-      <dd>
-        {{if .CursorLookback.OldestRetainedAt.IsZero}}
-          <em>n/a</em>
-        {{else}}
-          {{humanInt64Cast .CursorLookback.OldestRetainedSeq}}
-          <small>({{relativeTime .CursorLookback.OldestRetainedAt .Now}})</small>
-        {{end}}
-      </dd>
+      <dd>{{if .CursorLookback.OldestRetainedAt.IsZero}}<em>n/a</em>{{else}}{{humanInt64Cast .CursorLookback.OldestRetainedSeq}} <small>({{relativeTime .CursorLookback.OldestRetainedAt .Now}})</small>{{end}}</dd>
     </dl>
   </section>
+{{end}}
 
-  <section>
-    <h2>Metadata store</h2>
+{{define "hosts"}}
+<section>
+  <h2>Hosts</h2>
+  <input id="host-filter" class="filter" placeholder="filter host, class, DID, or error">
+  {{if .Hosts.Rows}}
+  <div class="table-wrap">
+  <table class="status-table" id="hosts-table">
+    <colgroup>
+      <col class="host-col"><col class="count-col"><col class="count-col"><col class="count-col"><col class="count-col"><col class="time-col"><col>
+    </colgroup>
+    <thead>
+      <tr>
+        <th>Host</th><th class="num">Repos</th><th class="num">Active</th><th class="num">Complete</th><th class="num">Failed</th><th>Last attempt</th><th>Error</th>
+      </tr>
+    </thead>
+    <tbody>
+    {{range .Hosts.Rows}}
+      <tr>
+        <td><code>{{.Host}}</code></td>
+        <td class="num">{{humanInt .Total}}</td>
+        <td class="num">{{humanInt .Active}}</td>
+        <td class="num">{{humanInt .Complete}}</td>
+        <td class="num">{{humanInt .Failed}}</td>
+        <td>{{relativeTime .LastAttemptedAt $.Now}}</td>
+        <td class="wide">
+          {{if .LatestErrorClass}}<code>{{.LatestErrorClass}}</code> {{end}}{{.LatestError}}
+          {{if .RecentErrors}}
+          <ul class="samples">
+            {{range .RecentErrors}}
+            <li><code>{{.DID}}</code> {{relativeTime .AttemptedAt $.Now}} {{if .Class}}<code>{{.Class}}</code>{{end}} {{.Error}}</li>
+            {{end}}
+          </ul>
+          {{end}}
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div>
+  {{else}}
+  <p class="sub">No host aggregates have been recorded yet.</p>
+  {{end}}
+</section>
+{{end}}
+
+{{define "accounts"}}
+<section>
+  <h2>Accounts</h2>
+  <form method="get" action="/status" class="toolbar">
+    <input type="hidden" name="tab" value="accounts">
+    <input name="did" class="lookup-input" placeholder="did:plc:..." value="{{.Request.DID}}">
+    <input name="handle" class="lookup-input" placeholder="declared handle" value="{{.Request.Handle}}">
+    <button type="submit">Lookup</button>
+  </form>
+
+  {{if .Account.Found}}
+  <div class="grid2">
+    <div>
+      <dl>
+        <dt>DID</dt><dd><code>{{.Account.DID}}</code></dd>
+        <dt>declared handle</dt><dd>{{if .Account.Handle}}<code>{{.Account.Handle}}</code>{{else}}unknown{{end}}</dd>
+        <dt>PDS endpoint</dt><dd>{{if .Account.PDS}}<code>{{.Account.PDS}}</code>{{else}}unknown{{end}}</dd>
+        <dt>PDS host</dt><dd>{{if .Account.Host}}<code>{{.Account.Host}}</code>{{else}}unknown{{end}}</dd>
+        <dt>Active</dt><dd>{{.Account.Active}}</dd>
+      </dl>
+    </div>
+    <div>
+      <dl>
+        <dt>Backfill</dt><dd><code>{{.Account.Backfill}}</code></dd>
+        <dt>Attempts</dt><dd>{{.Account.Attempts}}</dd>
+        <dt>Last attempted</dt><dd>{{relativeTime .Account.LastAttemptedAt .Now}}</dd>
+        <dt>Backfill rev</dt><dd>{{if .Account.BackfillRev}}<code>{{.Account.BackfillRev}}</code>{{else}}unknown{{end}}</dd>
+        <dt>Latest rev</dt><dd>{{if .Account.LatestRev}}<code>{{.Account.LatestRev}}</code>{{else}}unknown{{end}}</dd>
+        {{if gt .Account.RecordCount 0}}<dt>Records</dt><dd>{{humanInt64Cast .Account.RecordCount}}</dd>{{end}}
+        {{if gt .Account.TotalBytes 0}}<dt>Repo bytes</dt><dd>{{humanBytes .Account.TotalBytes}}</dd>{{end}}
+      </dl>
+    </div>
+  </div>
+  {{if .Account.LastError}}
+  <div class="latest"><h3>Last error</h3><div class="error-text">{{.Account.LastError}}</div></div>
+  {{end}}
+  {{with .Account.HostContext}}
+  <div class="latest">
+    <h3>Host context</h3>
     <dl>
-      <dt>On disk</dt>
-      <dd>{{humanBytes .Pebble.DiskBytes}}</dd>
-      {{range $prefix, $count := .Pebble.KeyspaceCounts}}
-      <dt><code>{{$prefix}}</code></dt>
-      <dd>{{humanInt $count}}</dd>
-      {{end}}
+      <dt>Host repos</dt><dd>{{humanInt .Total}}</dd>
+      <dt>Host active</dt><dd>{{humanInt .Active}}</dd>
+      <dt>Host complete</dt><dd>{{humanInt .Complete}}</dd>
+      <dt>Host failed</dt><dd>{{humanInt .Failed}}</dd>
+      {{if .LatestError}}<dt>Host latest error</dt><dd class="error-text">{{.LatestError}}</dd>{{end}}
     </dl>
-  </section>
+  </div>
+  {{end}}
+  {{else if .Account.Error}}
+  <p class="error-text">{{.Account.Error}}</p>
+  {{else if .Account.Query}}
+  <p class="sub">No local account metadata found for <code>{{.Account.Query}}</code>.</p>
+  {{else}}
+  <p class="sub">Lookup reads local DID and declared-handle metadata only.</p>
+  {{end}}
+</section>
+{{end}}
 
-  <section>
-    <h2>Collections</h2>
-    {{with .SegmentAggregate}}
-    {{if .Collections}}
-    <table class="collections-table">
-      <colgroup>
-        <col>
-        <col class="count-col">
-        <col class="count-col">
-        <col class="count-col">
-      </colgroup>
-      <thead>
-        <tr>
-          <th>NSID</th>
-          <th class="num">Events</th>
-          <th class="num">Segments</th>
-          <th class="num">Blocks</th>
-        </tr>
-      </thead>
-      <tbody>
-      {{range .Collections}}
-        <tr>
-          <td class="nsid"><code>{{.NSID}}</code></td>
-          <td class="num">{{humanInt .EventCount}}</td>
-          <td class="num">{{.SegmentCount}}</td>
-          <td class="num">{{humanInt .BlockCount}}</td>
-        </tr>
-      {{end}}
-      </tbody>
-    </table>
-    {{else}}
-    <p class="sub">No segments yet.</p>
+{{define "collections"}}
+<section>
+  <h2>Collections</h2>
+  {{with .SegmentAggregate}}
+  {{if .Collections}}
+  <div class="table-wrap">
+  <table class="status-table">
+    <colgroup><col><col class="count-col"><col class="count-col"><col class="count-col"></colgroup>
+    <thead><tr><th>NSID</th><th class="num">Events</th><th class="num">Segments</th><th class="num">Blocks</th></tr></thead>
+    <tbody>
+    {{range .Collections}}
+      <tr>
+        <td class="wide"><code>{{.NSID}}</code></td>
+        <td class="num">{{humanInt .EventCount}}</td>
+        <td class="num">{{.SegmentCount}}</td>
+        <td class="num">{{humanInt .BlockCount}}</td>
+      </tr>
     {{end}}
-    {{end}}
-  </section>
-</main>
-</body>
-</html>
+    </tbody>
+  </table>
+  </div>
+  {{else}}
+  <p class="sub">No segments yet.</p>
+  {{end}}
+  {{end}}
+</section>
+{{end}}
 
 {{define "tree"}}
 <div>
-  <h3 style="margin-top: 0; font-size: 0.95rem; color: var(--muted); font-weight: 500;">{{.Title}}</h3>
+  <h3>{{.Title}}</h3>
   {{with .Stats}}
   <dl>
-    <dt>Files</dt>
-    <dd>{{.SealedCount}} sealed{{if gt .ActiveCount 0}} + {{.ActiveCount}} active{{end}}</dd>
+    <dt>Files</dt><dd>{{.SealedCount}} sealed{{if gt .ActiveCount 0}} + {{.ActiveCount}} active{{end}}</dd>
     {{if gt .EventCount 0}}
-    <dt>Events</dt>
-    <dd>{{humanInt .EventCount}}</dd>
-    <dt>Blocks</dt>
-    <dd>{{humanInt .BlockCount}}</dd>
-    <dt>Seq range</dt>
-    <dd>[{{humanInt .MinSeq}}, {{humanInt .MaxSeq}}]</dd>
+    <dt>Events</dt><dd>{{humanInt .EventCount}}</dd>
+    <dt>Blocks</dt><dd>{{humanInt .BlockCount}}</dd>
+    <dt>Seq range</dt><dd>[{{humanInt .MinSeq}}, {{humanInt .MaxSeq}}]</dd>
     {{end}}
-    <dt>Compressed</dt>
-    <dd>{{humanBytes .CompressedBytes}}</dd>
-    <dt>Uncompressed</dt>
-    <dd>{{humanBytes .UncompressedBytes}}</dd>
+    <dt>Compressed</dt><dd>{{humanBytes .CompressedBytes}}</dd>
+    <dt>Uncompressed</dt><dd>{{humanBytes .UncompressedBytes}}</dd>
     {{if not .OldestMTime.IsZero}}
-    <dt>Oldest</dt>
-    <dd>{{relativeTime .OldestMTime $.Now}}</dd>
-    <dt>Newest</dt>
-    <dd>{{relativeTime .NewestMTime $.Now}}</dd>
+    <dt>Oldest</dt><dd>{{relativeTime .OldestMTime $.Now}}</dd>
+    <dt>Newest</dt><dd>{{relativeTime .NewestMTime $.Now}}</dd>
     {{end}}
   </dl>
   {{with .LatestSegment}}
   <div class="latest">
     <h3>Latest segment ({{if .Sealed}}sealed{{else}}active{{end}})</h3>
     <dl>
-      <dt>Index</dt>
-      <dd>{{.Index}}</dd>
-      <dt>Events</dt>
-      <dd>{{humanInt .EventCount}}</dd>
-      <dt>Unique DIDs</dt>
-      <dd>{{humanInt64Cast .UniqueDIDCount}}</dd>
-      <dt>Blocks</dt>
-      <dd>{{humanInt64Cast .BlockCount}}</dd>
-      <dt>Collections</dt>
-      <dd>{{.CollectionCount}}</dd>
-      <dt>Seq range</dt>
-      <dd>[{{humanInt .MinSeq}}, {{humanInt .MaxSeq}}]</dd>
-      {{if not .MinIndexedAt.IsZero}}
-      <dt>Indexed range</dt>
-      <dd>{{.MinIndexedAt.Format "2006-01-02 15:04:05"}}<br>… {{.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>
-      {{end}}
-      <dt>Size</dt>
-      <dd>{{humanBytes .SizeBytes}}</dd>
+      <dt>Index</dt><dd>{{.Index}}</dd>
+      <dt>Events</dt><dd>{{humanInt .EventCount}}</dd>
+      <dt>Unique DIDs</dt><dd>{{humanInt64Cast .UniqueDIDCount}}</dd>
+      <dt>Blocks</dt><dd>{{humanInt64Cast .BlockCount}}</dd>
+      <dt>Collections</dt><dd>{{.CollectionCount}}</dd>
+      <dt>Seq range</dt><dd>[{{humanInt .MinSeq}}, {{humanInt .MaxSeq}}]</dd>
+      {{if not .MinIndexedAt.IsZero}}<dt>Indexed range</dt><dd>{{.MinIndexedAt.Format "2006-01-02 15:04:05"}}<br>... {{.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>{{end}}
+      <dt>Size</dt><dd>{{humanBytes .SizeBytes}}</dd>
     </dl>
   </div>
   {{end}}

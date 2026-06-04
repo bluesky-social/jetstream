@@ -3,6 +3,7 @@ package status
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/manifest"
@@ -58,7 +59,7 @@ func New(opts Options) (*Collector, error) {
 // Snapshot builds a fresh snapshot. Concurrent callers share a single
 // in-flight build via singleflight.
 func (c *Collector) Snapshot(ctx context.Context) (*Snapshot, error) {
-	v, err, _ := c.sf.Do("status", func() (any, error) {
+	v, err, _ := c.sf.Do("status:summary", func() (any, error) {
 		return build(ctx, c.opts, c.startedAt)
 	})
 	if err != nil {
@@ -69,4 +70,29 @@ func (c *Collector) Snapshot(ctx context.Context) (*Snapshot, error) {
 		return nil, fmt.Errorf("status: singleflight returned unexpected type %T", v)
 	}
 	return snap, nil
+}
+
+// SnapshotForRequest builds a snapshot with request-scoped diagnostics.
+func (c *Collector) SnapshotForRequest(ctx context.Context, req Request) (*Snapshot, error) {
+	req = normalizeRequest(req)
+	key := requestSingleflightKey(req)
+	v, err, _ := c.sf.Do(key, func() (any, error) {
+		return buildForRequest(ctx, c.opts, c.startedAt, req)
+	})
+	if err != nil {
+		return nil, err
+	}
+	snap, ok := v.(*Snapshot)
+	if !ok {
+		return nil, fmt.Errorf("status: singleflight returned unexpected type %T", v)
+	}
+	return snap, nil
+}
+
+func requestSingleflightKey(req Request) string {
+	return "status:" + lengthPrefixed(req.Tab) + lengthPrefixed(req.DID) + lengthPrefixed(req.Handle)
+}
+
+func lengthPrefixed(s string) string {
+	return strconv.Itoa(len(s)) + ":" + s
 }

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
@@ -19,6 +21,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/version"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/cockroachdb/pebble"
+	"github.com/jcalabro/atmos"
 )
 
 // keyspacePrefixes lists the pebble prefixes the status page exposes
@@ -30,6 +33,8 @@ var keyspacePrefixes = []string{
 	"sync/host/",
 	"relay/",
 }
+
+const topFailingHostLimit = 10
 
 func collectProcess(now time.Time, startedAt time.Time) ProcessInfo {
 	info := version.Get()
@@ -122,6 +127,169 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 		PercentComplete: pct,
 		ListReposCursor: cursor,
 	}, nil
+}
+
+func normalizeRequest(req Request) Request {
+	req.Tab = strings.ToLower(strings.TrimSpace(req.Tab))
+	switch req.Tab {
+	case "", "summary":
+		req.Tab = "summary"
+	case "hosts", "accounts", "collections":
+	default:
+		req.Tab = "summary"
+	}
+	req.DID = strings.TrimSpace(req.DID)
+	req.Handle = strings.TrimSpace(req.Handle)
+	if req.Tab != "accounts" {
+		req.DID = ""
+		req.Handle = ""
+		return req
+	}
+	if req.DID != "" {
+		req.Handle = ""
+	}
+	return req
+}
+
+func collectHosts(s *store.Store) (HostDiagnostics, error) {
+	statuses, err := backfill.ListHostStatuses(s)
+	if err != nil {
+		return HostDiagnostics{}, err
+	}
+	rows := make([]HostRow, 0, len(statuses))
+	for i := range statuses {
+		rows = append(rows, hostRowFromBackfill(&statuses[i]))
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Failed != rows[j].Failed {
+			return rows[i].Failed > rows[j].Failed
+		}
+		if rows[i].Total != rows[j].Total {
+			return rows[i].Total > rows[j].Total
+		}
+		return rows[i].Host < rows[j].Host
+	})
+	top := make([]HostRow, 0, min(topFailingHostLimit, len(rows)))
+	for _, row := range rows {
+		if row.Failed == 0 {
+			continue
+		}
+		top = append(top, row)
+		if len(top) == topFailingHostLimit {
+			break
+		}
+	}
+	return HostDiagnostics{Rows: rows, TopFailing: top}, nil
+}
+
+func hostRowFromBackfill(hs *backfill.HostStatus) HostRow {
+	row := HostRow{
+		Host:             hs.Host,
+		Total:            hs.Total,
+		Active:           hs.Active,
+		NotStarted:       hs.NotStarted,
+		Complete:         hs.Complete,
+		Failed:           hs.Failed,
+		LastAttemptedAt:  hs.LastAttemptedAt,
+		LatestError:      hs.LatestError,
+		LatestErrorClass: string(hs.LatestErrorClass),
+	}
+	if len(hs.ErrorClassCounts) > 0 {
+		row.ErrorClassCounts = make(map[string]uint64, len(hs.ErrorClassCounts))
+		for class, count := range hs.ErrorClassCounts {
+			row.ErrorClassCounts[string(class)] = count
+		}
+	}
+	if len(hs.RecentErrors) > 0 {
+		row.RecentErrors = make([]HostErrorRow, 0, len(hs.RecentErrors))
+		for _, sample := range hs.RecentErrors {
+			row.RecentErrors = append(row.RecentErrors, HostErrorRow{
+				DID:         string(sample.DID),
+				AttemptedAt: sample.AttemptedAt,
+				Class:       string(sample.Class),
+				Error:       sample.Error,
+			})
+		}
+	}
+	return row
+}
+
+func collectAccount(s *store.Store, req Request) AccountLookup {
+	acct := AccountLookup{}
+	var did atmos.DID
+	var ok bool
+	var err error
+
+	switch {
+	case req.DID != "":
+		acct.QueryKind = "did"
+		acct.Query = req.DID
+		did, err = atmos.ParseDID(req.DID)
+		if err != nil {
+			acct.Error = fmt.Sprintf("invalid DID: %v", err)
+			return acct
+		}
+	case req.Handle != "":
+		handle := strings.TrimPrefix(req.Handle, "@")
+		acct.QueryKind = "handle"
+		acct.Query = handle
+		parsed, err := atmos.ParseHandle(handle)
+		if err != nil {
+			acct.Error = fmt.Sprintf("invalid handle: %v", err)
+			return acct
+		}
+		handle = string(parsed.Normalize())
+		acct.Query = handle
+		did, ok, err = backfill.LookupDIDByHandle(s, handle)
+		if err != nil {
+			acct.Error = err.Error()
+			return acct
+		}
+		if !ok {
+			return acct
+		}
+	default:
+		return acct
+	}
+
+	rs, found, err := backfill.LoadRepoStatus(s, did)
+	if err != nil {
+		acct.Error = err.Error()
+		return acct
+	}
+	if !found {
+		acct.DID = string(did)
+		return acct
+	}
+
+	acct.Found = true
+	acct.DID = string(did)
+	acct.Handle = rs.Handle
+	acct.PDS = rs.PDS
+	acct.Host = rs.Host
+	acct.Active = rs.Active
+	acct.Backfill = string(rs.Backfill.Status)
+	acct.Attempts = rs.Backfill.Attempts
+	acct.LastError = rs.Backfill.LastError
+	acct.BackfillRev = rs.Backfill.Rev
+	acct.LatestRev = rs.Rev
+	acct.UpdatedAt = rs.UpdatedAt
+	acct.LastAttemptedAt = rs.LastAttemptedAt
+	acct.RecordCount = rs.RecordCount
+	acct.TotalBytes = rs.TotalBytes
+
+	if rs.Host != "" {
+		hs, ok, err := backfill.LoadHostStatus(s, rs.Host)
+		if err != nil {
+			acct.Error = err.Error()
+			return acct
+		}
+		if ok {
+			row := hostRowFromBackfill(hs)
+			acct.HostContext = &row
+		}
+	}
+	return acct
 }
 
 func treeFromManifest(ms manifest.SegmentTreeStats) TreeAggregate {
@@ -433,6 +601,28 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		if ts != 0 {
 			snap.CursorLookback.OldestRetainedAt = time.UnixMicro(ts)
 		}
+	}
+
+	return snap, nil
+}
+
+func buildForRequest(ctx context.Context, opts Options, startedAt time.Time, req Request) (*Snapshot, error) {
+	req = normalizeRequest(req)
+	snap, err := build(ctx, opts, startedAt)
+	if err != nil {
+		return nil, err
+	}
+	snap.Request = req
+
+	switch req.Tab {
+	case "summary", "hosts":
+		hosts, err := collectHosts(opts.Store)
+		if err != nil {
+			return nil, err
+		}
+		snap.Hosts = hosts
+	case "accounts":
+		snap.Account = collectAccount(opts.Store, req)
 	}
 
 	return snap, nil

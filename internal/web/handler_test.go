@@ -16,17 +16,20 @@ import (
 )
 
 type fakeSnapshotter struct {
-	snap *status.Snapshot
-	err  error
+	snap    *status.Snapshot
+	err     error
+	lastReq status.Request
 }
 
-func (f *fakeSnapshotter) Snapshot(_ context.Context) (*status.Snapshot, error) {
+func (f *fakeSnapshotter) SnapshotForRequest(_ context.Context, req status.Request) (*status.Snapshot, error) {
+	f.lastReq = req
 	return f.snap, f.err
 }
 
 func newFixtureSnap() *status.Snapshot {
 	return &status.Snapshot{
 		GeneratedAt: time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+		Request:     status.Request{Tab: "summary"},
 		Process: status.ProcessInfo{
 			Version: "v1.2.3", Commit: "abcdef0", BuiltAt: "2026-05-20",
 			StartedAt: time.Date(2026, 5, 25, 11, 0, 0, 0, time.UTC),
@@ -93,6 +96,26 @@ func newFixtureSnap() *status.Snapshot {
 				"repo/": 100, "sync/chain/": 50, "sync/host/": 50, "relay/": 1,
 			},
 		},
+		Hosts: status.HostDiagnostics{
+			Rows: []status.HostRow{{
+				Host:             "pds.example.com",
+				Total:            10,
+				Active:           9,
+				Complete:         7,
+				Failed:           2,
+				LatestError:      "xrpc: HTTP 503",
+				LatestErrorClass: "http_5xx",
+			}},
+			TopFailing: []status.HostRow{{
+				Host:             "pds.example.com",
+				Total:            10,
+				Active:           9,
+				Complete:         7,
+				Failed:           2,
+				LatestError:      "xrpc: HTTP 503",
+				LatestErrorClass: "http_5xx",
+			}},
+		},
 		CursorLookback: status.CursorLookbackStats{
 			ConfiguredLookback:   36 * time.Hour,
 			ManifestSegmentCount: 15,
@@ -110,8 +133,9 @@ func newFixtureSnapBackfilling() *status.Snapshot {
 
 func TestHandler_RendersOK(t *testing.T) {
 	t.Parallel()
+	src := &fakeSnapshotter{snap: newFixtureSnap()}
 	h, err := web.New(web.Options{
-		Snapshotter: &fakeSnapshotter{snap: newFixtureSnap()},
+		Snapshotter: src,
 		Now:         func() time.Time { return time.Date(2026, 5, 25, 12, 0, 5, 0, time.UTC) },
 	})
 	require.NoError(t, err)
@@ -121,6 +145,7 @@ func TestHandler_RendersOK(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, status.Request{}, src.lastReq)
 	require.Equal(t, "text/html; charset=utf-8", rr.Header().Get("Content-Type"))
 	require.Equal(t, "no-store", rr.Header().Get("Cache-Control"))
 	require.NotEmpty(t, rr.Header().Get("X-Status-Generated-At"))
@@ -151,8 +176,9 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "1d 12h") // 36h formatted by humanDuration
 	require.Contains(t, body, "15")     // ManifestSegmentCount
 	require.Contains(t, body, "5,000")  // OldestRetainedSeq formatted
-	require.Contains(t, body, `class="collections-table"`)
 	require.Contains(t, body, "overflow-wrap: anywhere")
+	require.Contains(t, body, "Top failing hosts")
+	require.NotContains(t, body, `<h2>Collections</h2>`)
 }
 
 func TestHandler_RendersBackfillingState(t *testing.T) {
@@ -180,6 +206,21 @@ func TestHandler_RendersBackfillingState(t *testing.T) {
 	require.NotContains(t, body, "enumerating repos")
 }
 
+func TestHandler_RendersSummaryWithMissingSegmentTrees(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.SegmentAggregate.Trees = nil
+	h, err := web.New(web.Options{Snapshotter: &fakeSnapshotter{snap: s}})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Contains(t, rr.Body.String(), "Segment aggregates are not available")
+}
+
 func TestHandler_EscapesXSS(t *testing.T) {
 	t.Parallel()
 	h, err := web.New(web.Options{
@@ -196,6 +237,101 @@ func TestHandler_EscapesXSS(t *testing.T) {
 	require.True(t,
 		strings.Contains(body, "&lt;script&gt;") || strings.Contains(body, "&#x3C;script&#x3E;") || strings.Contains(body, "&#34;"),
 		"expected the cursor's HTML to be escaped, body=%s", body)
+}
+
+func TestHandler_RendersHostsTab(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "hosts"}
+	s.Hosts = status.HostDiagnostics{Rows: []status.HostRow{{
+		Host:             "pds.example.com",
+		Total:            10,
+		Active:           9,
+		Complete:         7,
+		Failed:           2,
+		LatestError:      `<script>alert("x")</script>`,
+		LatestErrorClass: "http_5xx",
+		RecentErrors: []status.HostErrorRow{{
+			DID:   "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+			Class: "http_5xx",
+			Error: "boom",
+		}},
+	}}}
+	src := &fakeSnapshotter{snap: s}
+	h, err := web.New(web.Options{
+		Snapshotter: src,
+		Now:         func() time.Time { return time.Date(2026, 5, 25, 12, 0, 5, 0, time.UTC) },
+	})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=hosts", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, status.Request{Tab: "hosts"}, src.lastReq)
+	body := rr.Body.String()
+	require.Contains(t, body, "Hosts")
+	require.Contains(t, body, "host-filter")
+	require.Contains(t, body, "pds.example.com")
+	require.Contains(t, body, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+	require.NotContains(t, body, `<script>alert("x")</script>`)
+	require.Contains(t, body, "&lt;script&gt;")
+}
+
+func TestHandler_RendersAccountsTabWithHandleQuery(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "accounts", Handle: "alice.test"}
+	s.Account = status.AccountLookup{
+		Query:     "alice.test",
+		QueryKind: "handle",
+		Found:     true,
+		DID:       "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Handle:    "alice.test",
+		Host:      "pds.example.com",
+		PDS:       "https://pds.example.com",
+		Backfill:  "failed",
+		Attempts:  3,
+		LastError: "boom",
+		HostContext: &status.HostRow{
+			Host: "pds.example.com", Total: 10, Active: 9, Complete: 7, Failed: 2,
+		},
+	}
+	src := &fakeSnapshotter{snap: s}
+	h, err := web.New(web.Options{Snapshotter: src})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&handle=alice.test", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, status.Request{Tab: "accounts", Handle: "alice.test"}, src.lastReq)
+	body := rr.Body.String()
+	require.Contains(t, body, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+	require.Contains(t, body, "declared handle")
+	require.Contains(t, body, "pds.example.com")
+	require.Contains(t, body, "Host context")
+	require.Contains(t, body, "boom")
+}
+
+func TestHandler_RendersCollectionsTab(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "collections"}
+	h, err := web.New(web.Options{Snapshotter: &fakeSnapshotter{snap: s}})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=collections", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	body := rr.Body.String()
+	require.Contains(t, body, "<h2>Collections</h2>")
+	require.Contains(t, body, "app.bsky.feed.post")
+	require.NotContains(t, body, "<h2>Phase</h2>")
 }
 
 func TestHandler_MethodNotAllowed(t *testing.T) {

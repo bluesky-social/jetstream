@@ -19,7 +19,7 @@ var templateFS embed.FS
 // Snapshotter is what the handler needs from a status collector. The
 // concrete *status.Collector satisfies it; tests pass a fake.
 type Snapshotter interface {
-	Snapshot(ctx context.Context) (*status.Snapshot, error)
+	SnapshotForRequest(ctx context.Context, req status.Request) (*status.Snapshot, error)
 }
 
 // Handler renders the public /status page. Construct via New.
@@ -106,7 +106,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap, err := h.src.Snapshot(r.Context())
+	reqStatus := status.Request{
+		Tab:    r.URL.Query().Get("tab"),
+		DID:    r.URL.Query().Get("did"),
+		Handle: r.URL.Query().Get("handle"),
+	}
+	snap, err := h.src.SnapshotForRequest(r.Context(), reqStatus)
 	if err != nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusServiceUnavailable)
