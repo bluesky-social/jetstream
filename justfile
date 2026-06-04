@@ -94,31 +94,31 @@ test-race *ARGS="./...":
 oracle:
     JETSTREAM_ORACLE_MODE=stress gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 ./internal/oracle -run TestOracle_DefaultLifecycle
 
-# Sweeps oracle stress mode across deterministic seeds. Intended for nightly CI;
-# override args locally to shrink or expand the run.
-oracle-sweep SEEDS="100" ACCOUNTS="250" MAX_INITIAL_RECORDS="10000" LIVE_EVENTS_BOOTSTRAP="25000" LIVE_EVENTS_STEADY="25000":
+# Sweeps oracle stress mode across randomly-chosen seeds. Intended for nightly
+# CI. The per-seed workload is governed entirely by JETSTREAM_ORACLE_MODE=stress
+# (see internal/oracle/config.go) so there is a single source of truth: do not
+# reintroduce account/record/event overrides here. Pass a smaller SEEDS to
+# shrink a local run.
+oracle-sweep SEEDS="100":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    for seed in $(seq 1 "{{SEEDS}}"); do
-        echo "::group::oracle seed ${seed}"
-        echo "oracle seed ${seed}/{{SEEDS}}"
+    for i in $(seq 1 "{{SEEDS}}"); do
+        # Draw a fresh random uint64 seed each iteration so successive nightly
+        # runs explore different points in the state space instead of replaying
+        # a fixed 1..N. /dev/urandom is portable across the Linux CI runner and
+        # macOS dev machines; the failing seed is printed below for exact repro.
+        seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+        echo "::group::oracle ${i}/{{SEEDS}} seed=${seed}"
+        echo "oracle run ${i}/{{SEEDS}} seed=${seed}"
         if ! JETSTREAM_ORACLE_MODE=stress \
             JETSTREAM_ORACLE_SEED="${seed}" \
-            JETSTREAM_ORACLE_ACCOUNTS="{{ACCOUNTS}}" \
-            JETSTREAM_ORACLE_MAX_INITIAL_RECORDS="{{MAX_INITIAL_RECORDS}}" \
-            JETSTREAM_ORACLE_LIVE_EVENTS_BOOTSTRAP="{{LIVE_EVENTS_BOOTSTRAP}}" \
-            JETSTREAM_ORACLE_LIVE_EVENTS_STEADY="{{LIVE_EVENTS_STEADY}}" \
             gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -timeout 30m ./internal/oracle -run TestOracle_DefaultLifecycle -v; then
             echo "::endgroup::"
             echo "::error::oracle failed at seed ${seed}"
             echo "Repro:"
             echo "  JETSTREAM_ORACLE_MODE=stress \\"
             echo "  JETSTREAM_ORACLE_SEED=${seed} \\"
-            echo "  JETSTREAM_ORACLE_ACCOUNTS={{ACCOUNTS}} \\"
-            echo "  JETSTREAM_ORACLE_MAX_INITIAL_RECORDS={{MAX_INITIAL_RECORDS}} \\"
-            echo "  JETSTREAM_ORACLE_LIVE_EVENTS_BOOTSTRAP={{LIVE_EVENTS_BOOTSTRAP}} \\"
-            echo "  JETSTREAM_ORACLE_LIVE_EVENTS_STEADY={{LIVE_EVENTS_STEADY}} \\"
             echo "  go test ./internal/oracle -run TestOracle_DefaultLifecycle -count=1 -timeout 30m -v"
             exit 1
         fi

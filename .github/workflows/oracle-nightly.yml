@@ -14,25 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       seeds:
-        description: "Number of deterministic seeds to sweep"
+        description: "Number of randomly-chosen seeds to sweep"
         required: false
         default: "100"
-      accounts:
-        description: "Simulator accounts per seed"
-        required: false
-        default: "250"
-      max_initial_records:
-        description: "Maximum initial records per account"
-        required: false
-        default: "10000"
-      live_events_bootstrap:
-        description: "Live events generated during bootstrap/merge coverage"
-        required: false
-        default: "25000"
-      live_events_steady:
-        description: "Live events generated during steady-state coverage"
-        required: false
-        default: "25000"
 
 permissions: {}
 
@@ -42,11 +26,10 @@ concurrency:
 
 env:
   GOTOOLCHAIN: local
+  # The per-seed workload is fixed by JETSTREAM_ORACLE_MODE=stress inside the
+  # oracle-sweep recipe (see internal/oracle/config.go). Only the seed count is
+  # tunable here; do not reintroduce account/record/event overrides.
   ORACLE_SWEEP_SEEDS: ${{ github.event.inputs.seeds || '100' }}
-  ORACLE_SWEEP_ACCOUNTS: ${{ github.event.inputs.accounts || '250' }}
-  ORACLE_SWEEP_MAX_INITIAL_RECORDS: ${{ github.event.inputs.max_initial_records || '10000' }}
-  ORACLE_SWEEP_LIVE_EVENTS_BOOTSTRAP: ${{ github.event.inputs.live_events_bootstrap || '25000' }}
-  ORACLE_SWEEP_LIVE_EVENTS_STEADY: ${{ github.event.inputs.live_events_steady || '25000' }}
 
 jobs:
   oracle-sweep:
@@ -89,13 +72,7 @@ jobs:
         run: just install-tools
 
       - name: Oracle seed sweep
-        run: |
-          just oracle-sweep \
-            "$ORACLE_SWEEP_SEEDS" \
-            "$ORACLE_SWEEP_ACCOUNTS" \
-            "$ORACLE_SWEEP_MAX_INITIAL_RECORDS" \
-            "$ORACLE_SWEEP_LIVE_EVENTS_BOOTSTRAP" \
-            "$ORACLE_SWEEP_LIVE_EVENTS_STEADY"
+        run: just oracle-sweep "$ORACLE_SWEEP_SEEDS"
 
       - name: Failure summary
         if: failure()
@@ -105,11 +82,7 @@ jobs:
             echo
             echo 'The failing seed and exact local repro command are printed in the `Oracle seed sweep` step logs.'
             echo
-            echo "Configured workload:"
+            echo "Workload: JETSTREAM_ORACLE_MODE=stress (see internal/oracle/config.go)"
             echo
-            echo "- seeds: ${ORACLE_SWEEP_SEEDS}"
-            echo "- accounts: ${ORACLE_SWEEP_ACCOUNTS}"
-            echo "- max initial records: ${ORACLE_SWEEP_MAX_INITIAL_RECORDS}"
-            echo "- bootstrap live events: ${ORACLE_SWEEP_LIVE_EVENTS_BOOTSTRAP}"
-            echo "- steady-state live events: ${ORACLE_SWEEP_LIVE_EVENTS_STEADY}"
+            echo "- seeds swept: ${ORACLE_SWEEP_SEEDS}"
           } >> "$GITHUB_STEP_SUMMARY"
