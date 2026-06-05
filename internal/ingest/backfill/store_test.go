@@ -11,6 +11,7 @@ import (
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/atmos/xrpc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -316,6 +317,54 @@ func TestStore_OnFail_AfterPriorComplete(t *testing.T) {
 	require.Equal(t, StatusFailed, rs.Backfill.Status)
 	require.Equal(t, "rev-good", rs.Backfill.Rev)
 	require.False(t, rs.Backfill.CompletedAt.IsZero(), "prior CompletedAt preserved")
+}
+
+func TestStore_OnFail_RepoNotFoundCompletesWithoutError(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:deleted")
+
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{
+		DID: did, Active: true,
+	}))
+	require.NoError(t, s.recordIdentityResolution(ctx, did, IdentityResolution{
+		PDS:  "https://pds.example.com",
+		Host: "pds.example.com",
+	}))
+
+	failErr := &xrpc.Error{
+		StatusCode: 400,
+		Name:       "RepoNotFound",
+		Message:    "Could not find repo for DID: did:plc:deleted",
+	}
+	require.NoError(t, s.OnFail(ctx, did, failErr, 1))
+
+	got, err := s.Lookup(ctx, did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateComplete, got.State)
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusComplete, rs.Backfill.Status)
+	require.Empty(t, rs.Backfill.LastError)
+	require.Equal(t, 0, rs.Backfill.Attempts)
+	require.False(t, rs.Backfill.CompletedAt.IsZero())
+
+	counts, ok, err := LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, Counts{Total: 1, Complete: 1}, counts)
+
+	hs, ok, err := loadHostStatus(s.db, "pds.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), hs.Total)
+	require.Equal(t, uint64(1), hs.Complete)
+	require.Equal(t, uint64(0), hs.Failed)
+	require.Empty(t, hs.LatestError)
+	require.Empty(t, hs.ErrorClassCounts)
+	require.Empty(t, hs.RecentErrors)
 }
 
 // TestStore_OnComplete_ClearsLastError is the symmetric partner to

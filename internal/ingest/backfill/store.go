@@ -499,6 +499,17 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attemp
 		old = rs.Backfill.Status
 	}
 	now := timeNow()
+	if isRepoNotFoundError(failErr) {
+		rs.Backfill.Status = StatusComplete
+		rs.Backfill.LastError = ""
+		rs.Backfill.Attempts = 0
+		rs.Backfill.CompletedAt = now
+		rs.LastAttemptedAt = now
+		return s.putRepoStatusAndCounts(did, rs, hadRow, old, func(hs *HostStatus) {
+			hs.LastAttemptedAt = now
+		})
+	}
+
 	errMsg := ""
 	if failErr != nil {
 		errMsg = failErr.Error()

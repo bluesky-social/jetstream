@@ -159,6 +159,9 @@ func Run(ctx context.Context, cfg Config) error {
 				return MaybeSaveBootstrapLastListReposCursor(cfg.Store, cursor)
 			}),
 			OnError: gt.Some(func(did atmos.DID, err error) {
+				if !shouldLogBackfillError(err) {
+					return
+				}
 				logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
 				if errors.Is(err, errIdentityDiagnosticsPersistence) {
 					recordFatal(err)

@@ -3,11 +3,13 @@ package backfill
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/xrpc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,6 +51,23 @@ func TestClassifyBackfillError(t *testing.T) {
 	require.Equal(t, ErrorClassLocalWrite, classifyBackfillError(errors.New("flush before complete: disk full")))
 	require.Equal(t, ErrorClassUnknown, classifyBackfillError(errors.New("other")))
 	require.Equal(t, ErrorClassUnknown, classifyBackfillError(errors.New("not actually HTTP 5")))
+}
+
+func TestIsRepoNotFoundError(t *testing.T) {
+	t.Parallel()
+
+	repoNotFound := &xrpc.Error{
+		StatusCode: 400,
+		Name:       "RepoNotFound",
+		Message:    "Could not find repo for DID: did:plc:missing",
+	}
+	require.True(t, isRepoNotFoundError(repoNotFound))
+	require.True(t, isRepoNotFoundError(fmt.Errorf("wrapped: %w", repoNotFound)))
+	require.False(t, shouldLogBackfillError(repoNotFound))
+
+	require.False(t, isRepoNotFoundError(&xrpc.Error{StatusCode: 400, Name: "InvalidRequest"}))
+	require.False(t, isRepoNotFoundError(errors.New("xrpc 400 RepoNotFound: text only")))
+	require.True(t, shouldLogBackfillError(&xrpc.Error{StatusCode: 400, Name: "InvalidRequest"}))
 }
 
 func TestHostStatus_AddErrorSampleKeepsLatestFive(t *testing.T) {

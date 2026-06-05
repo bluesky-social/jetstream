@@ -13,6 +13,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/xrpc"
 )
 
 const (
@@ -249,6 +250,15 @@ func classifyBackfillError(err error) ErrorClass {
 	default:
 		return ErrorClassUnknown
 	}
+}
+
+func isRepoNotFoundError(err error) bool {
+	var xerr *xrpc.Error
+	return errors.As(err, &xerr) && xerr.Name == "RepoNotFound"
+}
+
+func shouldLogBackfillError(err error) bool {
+	return !isRepoNotFoundError(err)
 }
 
 func truncateErrorString(s string) string {
