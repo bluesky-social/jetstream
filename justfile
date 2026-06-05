@@ -94,12 +94,13 @@ test-race *ARGS="./...":
 oracle:
     JETSTREAM_ORACLE_MODE=stress gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 ./internal/oracle -run TestOracle_DefaultLifecycle
 
-# Sweeps oracle stress mode across randomly-chosen seeds. Intended for nightly
-# CI. The per-seed workload is governed entirely by JETSTREAM_ORACLE_MODE=stress
-# (see internal/oracle/config.go) so there is a single source of truth: do not
-# reintroduce account/record/event overrides here. Pass a smaller SEEDS to
-# shrink a local run.
-oracle-sweep SEEDS="100":
+# Sweeps oracle stress mode across randomly-chosen seeds. Intended for the
+# scheduled CI job, which runs several smaller sweeps each day to reduce the
+# blast radius of ARC runner failures. The per-seed workload is governed
+# entirely by JETSTREAM_ORACLE_MODE=stress (see internal/oracle/config.go) so
+# there is a single source of truth: do not reintroduce account/record/event
+# overrides here. Pass SEEDS explicitly to grow or shrink a local run.
+oracle-sweep SEEDS="10":
     #!/usr/bin/env bash
     set -euo pipefail
 

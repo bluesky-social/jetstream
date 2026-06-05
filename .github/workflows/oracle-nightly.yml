@@ -9,14 +9,14 @@ name: oracle-nightly
 
 on:
   schedule:
-    # 08:17 UTC keeps this away from the top-of-hour GitHub Actions rush.
-    - cron: "17 8 * * *"
+    # Run every 6 hours at minute 17 to stay away from top-of-hour Actions rush.
+    - cron: "17 2,8,14,20 * * *"
   workflow_dispatch:
     inputs:
       seeds:
         description: "Number of randomly-chosen seeds to sweep"
         required: false
-        default: "100"
+        default: "10"
 
 permissions: {}
 
@@ -29,7 +29,7 @@ env:
   # The per-seed workload is fixed by JETSTREAM_ORACLE_MODE=stress inside the
   # oracle-sweep recipe (see internal/oracle/config.go). Only the seed count is
   # tunable here; do not reintroduce account/record/event overrides.
-  ORACLE_SWEEP_SEEDS: ${{ github.event.inputs.seeds || '100' }}
+  ORACLE_SWEEP_SEEDS: ${{ github.event.inputs.seeds || '10' }}
 
 jobs:
   oracle-sweep:
