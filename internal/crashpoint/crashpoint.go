@@ -32,6 +32,12 @@ const (
 	// bootstrap artifacts idempotently.
 	AfterMergeDstSealBeforeDiscovery Point = "after-merge-dst-seal-before-discovery"
 
+	// AfterMergeDiscoveryBeforeCleanup fires after post-merge discovery has
+	// durably written any newly observed DID rows but before the temporary
+	// backfill tree and merge cursor keys are removed. Recovery must replay
+	// discovery idempotently and still complete cleanup.
+	AfterMergeDiscoveryBeforeCleanup Point = "after-merge-discovery-before-cleanup"
+
 	// AfterBootstrapLiveCloseBeforeSeal fires after bootstrap-live Close flushes
 	// data and cursor state but before its active segment is sealed for merge.
 	// Recovery must not assume the source tree is already fully sealed.
@@ -51,6 +57,7 @@ var AllPoints = []Point{
 	AfterRepoComplete,
 	AfterMergeDstFlushBeforeSourceCommit,
 	AfterMergeDstSealBeforeDiscovery,
+	AfterMergeDiscoveryBeforeCleanup,
 	AfterBootstrapLiveCloseBeforeSeal,
 	AfterSteadyPhaseBeforeSteadyRun,
 }

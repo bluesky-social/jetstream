@@ -330,6 +330,63 @@ func TestMerge_CrashAfterSealBeforeDiscovery_RestartCleansUp(t *testing.T) {
 	require.Equal(t, "", bcur)
 }
 
+func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
+	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
+	fix.seedBootstrapLastCursor(t, "page2")
+	fix.relay.pages = map[string]listReposPage{
+		"page2": {
+			Cursor: "",
+			Repos: []listReposEntry{
+				{DID: "did:plc:new", Active: true},
+			},
+		},
+	}
+
+	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	sentinel := errors.New("kill point: discovery-before-cleanup")
+	fix.cfg.CrashInjector = pointErrorInjector{
+		point: crashpoint.AfterMergeDiscoveryBeforeCleanup,
+		err:   sentinel,
+	}
+
+	o, err := New(fix.cfg)
+	require.NoError(t, err)
+	require.ErrorIs(t, o.runMerge(t.Context()), sentinel)
+
+	val, closer, err := fix.store.Get(backfill.RepoKey("did:plc:new"))
+	require.NoError(t, err, "discovered DID row must be durable before cleanup")
+	rs, err := backfill.DecodeRepoStatus(val)
+	require.NoError(t, err)
+	_ = closer.Close()
+	require.Equal(t, backfill.StatusFailed, rs.Backfill.Status)
+	require.True(t, rs.Active)
+
+	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill", "live_segments"))
+	require.NoError(t, err, "backfill tree should still exist when cleanup has not run")
+
+	fix.cfg.CrashInjector = nil
+	o2, err := New(fix.cfg)
+	require.NoError(t, err)
+	require.NoError(t, o2.runMerge(t.Context()))
+
+	val, closer, err = fix.store.Get(backfill.RepoKey("did:plc:new"))
+	require.NoError(t, err, "discovered DID row must survive idempotent discovery replay")
+	rs, err = backfill.DecodeRepoStatus(val)
+	require.NoError(t, err)
+	_ = closer.Close()
+	require.Equal(t, backfill.StatusFailed, rs.Backfill.Status)
+	require.True(t, rs.Active)
+
+	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill"))
+	require.True(t, os.IsNotExist(err), "backfill dir should be removed after restart")
+	bcur, err := backfill.LoadBootstrapLastListReposCursor(fix.store)
+	require.NoError(t, err)
+	require.Equal(t, "", bcur)
+}
+
 // TestMerge_SealsActiveSourceSegmentBeforeDrain exercises
 // sealActiveMergeSource directly. It reproduces the on-disk state a
 // crash at AfterBootstrapLiveCloseBeforeSeal leaves behind: the

@@ -103,6 +103,9 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 				return err
 			}
 		}
+		if err := o.simulateCrash(ctx, crashpoint.AfterMergeDiscoveryBeforeCleanup); err != nil {
+			return err
+		}
 
 		if err := os.RemoveAll(filepath.Join(o.cfg.DataDir, "backfill")); err != nil {
 			return fmt.Errorf("orchestrator: merge: remove backfill dir: %w", err)
