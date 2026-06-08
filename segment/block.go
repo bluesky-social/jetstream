@@ -8,9 +8,14 @@ import (
 	"unsafe"
 )
 
-// validate checks that ev's fields fit the on-disk column widths and
-// that Kind is in range. It performs no I/O and never panics.
-func validate(ev Event) error {
+// ValidateEvent checks that ev's fields fit the on-disk column widths
+// and that Kind is in range. It performs no I/O and never panics.
+//
+// External-ingest callers use this before Append so malformed
+// upstream data can be counted and skipped without touching the
+// durable writer. Append still validates internally because segment
+// is the final invariant boundary for on-disk data.
+func ValidateEvent(ev Event) error {
 	if ev.Kind < KindCreate || ev.Kind > KindSync {
 		return fmt.Errorf("%w: %d", ErrInvalidKind, ev.Kind)
 	}
@@ -30,6 +35,10 @@ func validate(ev Event) error {
 		return fmt.Errorf("%w: payload is %d bytes (max %d)", ErrFieldTooLong, len(ev.Payload), math.MaxUint32)
 	}
 	return nil
+}
+
+func validate(ev Event) error {
+	return ValidateEvent(ev)
 }
 
 // columns is the small interface encodeBlockColumns reads through.

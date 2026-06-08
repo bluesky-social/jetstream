@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/mst"
 	atmosrepo "github.com/jcalabro/atmos/repo"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -114,6 +117,28 @@ func TestSegmentHandler_HandleRepoFlushesBeforeReturning(t *testing.T) {
 
 	events := collectActiveEvents(t, filepath.Join(segmentsDir, ingest.SegmentFilename(0)))
 	require.Len(t, events, 1, "HandleRepo must flush appended rows before returning to the engine")
+}
+
+func TestSegmentHandler_DropsRecordThatExceedsSegmentColumnWidth(t *testing.T) {
+	t.Parallel()
+
+	w := newTestIngest(t)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics)
+
+	var writerErr error
+	h.onWriterError = func(err error) { writerErr = err }
+
+	longRkey := strings.Repeat("x", 256)
+	r, commit := buildSingleRecordRepo(t,
+		"did:plc:widefield", "app.bsky.feed.post", longRkey,
+		map[string]any{"text": "this rkey cannot fit in the segment column"})
+
+	require.NoError(t, h.HandleRepo(t.Context(), "did:plc:widefield", r, commit))
+	require.NoError(t, writerErr, "invalid upstream record data must not abort the local writer")
+	require.Equal(t, uint64(0), w.NextSeq(), "skipped records must not allocate seqs")
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DroppedRecords), 0,
+		"the skipped record must be visible in dropped_records_total")
 }
 
 // TestSegmentHandler_NilWriterPanics pins the constructor's

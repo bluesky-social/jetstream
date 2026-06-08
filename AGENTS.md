@@ -90,3 +90,6 @@ Use the package-level metrics/tracer rather than rolling your own. `obs.Tracer("
 - **Follow existing conventions.** Don't introduce new patterns when the codebase already has one for code style, error handling, or logging.
 - **Comments explain why, not what.** Exported symbols and packages get a high-level docstring; otherwise comment only when the reasoning isn't obvious from the code.
 - **Never crash, and never corrupt data.** The process is a mission-critical, long-lived server daemon. Add observability in the case of incorrect/adversarial user input, but don't crash.
+    - Treat all upstream relay/firehose/backfill data as user input. Invalid external records must not abort, stop, exit, or crash the server.
+    - If upstream record data cannot be represented safely in Jetstream's internal format (for example a field exceeds a segment column width), drop that record or event, increment a warning/error metric, and log bounded diagnostic fields. Do not silently truncate or coerce it.
+    - Preserve crash-loud behavior for invalid internal state, persistence corruption, fsync/store failures, and other conditions where continuing could corrupt Jetstream-owned data.

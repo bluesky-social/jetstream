@@ -17,6 +17,7 @@ type Metrics struct {
 	DecodeErrors           prometheus.Counter
 	UnknownEvents          prometheus.Counter
 	DroppedOpsMissingBlock prometheus.Counter
+	DroppedEvents          prometheus.Counter
 	UpstreamCursor         prometheus.Gauge
 }
 
@@ -59,6 +60,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 				"is still archived; a non-zero rate signals upstream PDSes shipping " +
 				"incomplete CARs (partial CARs are spec-permitted but unarchivable).",
 		}),
+		DroppedEvents: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "dropped_events_total",
+			Help: "Number of upstream events skipped because their fields cannot be represented in the segment format.",
+		}),
 		UpstreamCursor: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "upstream_cursor",
@@ -68,7 +74,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	reg.MustRegister(
 		m.EventsReceived, m.EventsConverted, m.Reconnects,
 		m.DecodeErrors, m.UnknownEvents, m.DroppedOpsMissingBlock,
-		m.UpstreamCursor,
+		m.DroppedEvents, m.UpstreamCursor,
 	)
 	return m
 }
@@ -106,6 +112,12 @@ func (m *Metrics) incUnknownEvents() {
 func (m *Metrics) addDroppedOpsMissingBlock(n int) {
 	if m != nil && n > 0 {
 		m.DroppedOpsMissingBlock.Add(float64(n))
+	}
+}
+
+func (m *Metrics) incDroppedEvents() {
+	if m != nil {
+		m.DroppedEvents.Inc()
 	}
 }
 

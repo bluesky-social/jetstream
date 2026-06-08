@@ -17,6 +17,7 @@ import (
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/jcalabro/gt"
 )
@@ -335,6 +336,23 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			}
 
 			for i := range segEvts {
+				if err := segment.ValidateEvent(segEvts[i]); err != nil {
+					if errors.Is(err, segment.ErrFieldTooLong) {
+						c.cfg.Metrics.incDroppedEvents()
+						c.logger.WarnContext(ctx, "dropped unarchivable upstream event",
+							"seq", evt.Seq,
+							"kind", segEvts[i].Kind,
+							"did_len", len(segEvts[i].DID),
+							"collection_len", len(segEvts[i].Collection),
+							"rkey_len", len(segEvts[i].Rkey),
+							"rev_len", len(segEvts[i].Rev),
+							"payload_len", len(segEvts[i].Payload),
+							"err", err,
+						)
+						continue
+					}
+					return fmt.Errorf("livestream: invalid segment event: %w", err)
+				}
 				if err := c.writer.Append(ctx, &segEvts[i]); err != nil {
 					return fmt.Errorf("livestream: append: %w", err)
 				}

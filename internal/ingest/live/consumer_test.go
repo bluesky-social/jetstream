@@ -254,6 +254,40 @@ func TestProcessBatch_MalformedCommitDoesNotShutDownConsumer(t *testing.T) {
 		"the skipped malformed event must be visible in decode_errors_total")
 }
 
+func TestProcessBatch_OverwideRecordKeyDoesNotShutDownConsumer(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	metrics := NewMetrics(prometheus.NewRegistry())
+
+	c, err := Open(Config{
+		SegmentsDir: dir,
+		Store:       st,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		Metrics:     metrics,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	evt, _ := buildCommit(t, "did:plc:widerkey", "rev-wide",
+		struct{ Coll, Rkey string }{"app.bsky.feed.post", strings.Repeat("x", 256)},
+	)
+	evt.Seq = 44
+
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{evt}),
+		"overwide upstream record fields must not propagate an append error out of processBatch")
+	require.Equal(t, int64(44), c.LastUpstreamSeq(),
+		"the upstream cursor must advance past recognized-but-unarchivable external data")
+	require.Equal(t, uint64(0), c.Writer().NextSeq(), "unarchivable records must not be written")
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DroppedEvents), 0,
+		"the skipped event must be visible in dropped_events_total")
+}
+
 func encodeAccountFrame(t *testing.T, did string, seq int64) []byte {
 	t.Helper()
 	acc := &comatproto.SyncSubscribeRepos_Account{

@@ -6,6 +6,7 @@ package backfill
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -88,6 +89,22 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 				Rkey:       rkey,
 				Rev:        commit.Rev,
 				Payload:    payload,
+			}
+			if err := segment.ValidateEvent(ev); err != nil {
+				if errors.Is(err, segment.ErrFieldTooLong) {
+					h.metrics.incDroppedRecords()
+					h.logger.WarnContext(ctx, "dropped unarchivable upstream record",
+						"did", string(did),
+						"did_len", len(string(did)),
+						"collection_len", len(collection),
+						"rkey_len", len(rkey),
+						"rev_len", len(commit.Rev),
+						"payload_len", len(payload),
+						"err", err,
+					)
+					return nil
+				}
+				return fmt.Errorf("backfill: did=%s invalid segment event %s/%s: %w", did, collection, rkey, err)
 			}
 			if err := h.writer.Append(ctx, &ev); err != nil {
 				err = fmt.Errorf("backfill: did=%s append %s/%s: %w", did, collection, rkey, err)
