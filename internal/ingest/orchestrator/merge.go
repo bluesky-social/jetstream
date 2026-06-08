@@ -11,22 +11,13 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream-v2/segment"
 )
-
-// killAfterSealBeforeDiscovery, when non-nil, is invoked between
-// dst.SealActiveAndClose and runner.runDiscovery. Test-only;
-// production paths leave it nil.
-//
-// Used to reproduce the spec §5.3 "after SealActiveAndClose" crash
-// window: the destination is fully sealed but discovery, RemoveAll,
-// and the cursor deletes have not yet run. On restart, the source-
-// loop is empty (cursor at len), seal is idempotent, discovery
-// re-runs, and cleanup completes.
-var killAfterSealBeforeDiscovery func() error
 
 // runMerge is the cutover state machine's State 5: drain
 // data/backfill/live_segments/ into data/segments/. Per the spec:
@@ -68,6 +59,14 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		} else if err != nil {
 			return fmt.Errorf("orchestrator: merge: stat live_segments: %w", err)
 		}
+		// Seal guard: a crash at crashpoint.AfterBootstrapLiveCloseBeforeSeal
+		// (finishBootstrap closed the bootstrap-live consumer but died before
+		// re-opening it to seal) leaves the source tree with an unsealed
+		// trailing segment. The drain loop's segment.Open would reject it
+		// with ErrActiveSegment, so seal it here before draining.
+		if err := o.sealActiveMergeSource(ctx, liveSegmentsDir); err != nil {
+			return err
+		}
 
 		dst, err := ingest.Open(ingest.Config{
 			SegmentsDir:    segmentsDir,
@@ -82,7 +81,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)
 		}
 
-		runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.Logger, o.cfg.Metrics)
+		runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
 
 		if err := runner.run(ctx); err != nil {
 			if cerr := dst.Close(); cerr != nil {
@@ -95,10 +94,8 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return fmt.Errorf("orchestrator: merge: seal dst: %w", err)
 		}
 
-		if killAfterSealBeforeDiscovery != nil {
-			if err := killAfterSealBeforeDiscovery(); err != nil {
-				return err
-			}
+		if err := o.simulateCrash(ctx, crashpoint.AfterMergeDstSealBeforeDiscovery); err != nil {
+			return err
 		}
 
 		if !o.cfg.SkipMergeDiscovery {
@@ -118,4 +115,49 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+// sealActiveMergeSource ensures the trailing source segment is sealed
+// before the drain loop reads it. Normally finishBootstrap seals it at
+// cutover, but a crash at crashpoint.AfterBootstrapLiveCloseBeforeSeal
+// can leave it active. Only the latest segment can be unsealed: the
+// bootstrap-live writer holds exactly one active segment and rotation
+// seals the old file before opening the next, so checking
+// files[len-1] is sufficient. Idempotent — a no-op when the trailing
+// segment is already sealed.
+func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDir string) error {
+	files, err := ingest.SegmentFiles(liveSegmentsDir)
+	if err != nil {
+		return fmt.Errorf("orchestrator: merge: list source segments before seal guard: %w", err)
+	}
+	if len(files) == 0 {
+		return nil
+	}
+
+	latest := files[len(files)-1]
+	rd, err := segment.Open(segment.ReaderConfig{Path: latest.Path})
+	if err == nil {
+		return rd.Close()
+	}
+	if !errors.Is(err, segment.ErrActiveSegment) {
+		return fmt.Errorf("orchestrator: merge: inspect source segment %s: %w", latest.Path, err)
+	}
+
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:     liveSegmentsDir,
+		Store:           o.cfg.Store,
+		SeqKey:          live.BootstrapSeqKey,
+		Logger:          o.cfg.Logger,
+		Metrics:         nil,
+		SegmentMetrics:  o.cfg.SegmentMetrics,
+		MaxSegmentBytes: 0,
+	})
+	if err != nil {
+		return fmt.Errorf("orchestrator: merge: reopen active source for seal: %w", err)
+	}
+	if err := w.SealActiveAndClose(); err != nil {
+		return fmt.Errorf("orchestrator: merge: seal active source: %w", err)
+	}
+	o.logger.InfoContext(ctx, "sealed active bootstrap-live source before merge", "segment", latest.Idx)
+	return nil
 }

@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -33,6 +34,7 @@ type Store struct {
 	metrics            *Metrics
 	afterComplete      func(context.Context, atmos.DID) error
 	afterCompleteError func(error)
+	crashInjector      crashpoint.Injector
 	countsMu           sync.Mutex
 }
 
@@ -454,6 +456,9 @@ func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Comm
 	}); err != nil {
 		return err
 	}
+	if err := s.simulateCrash(ctx, crashpoint.AfterRepoComplete); err != nil {
+		return err
+	}
 	if s.afterComplete != nil {
 		if err := s.afterComplete(ctx, did); err != nil {
 			err = fmt.Errorf("backfill: after complete hook %s: %w", did, err)
@@ -465,6 +470,13 @@ func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Comm
 	}
 	s.metrics.incCompleted()
 	return nil
+}
+
+func (s *Store) simulateCrash(ctx context.Context, point crashpoint.Point) error {
+	if s.crashInjector == nil {
+		return nil
+	}
+	return s.crashInjector.SimulateCrash(ctx, point)
 }
 
 // OnFail records a failed repo download. atmos passes the total

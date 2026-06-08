@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
@@ -131,6 +132,10 @@ type Config struct {
 	// AfterRepoComplete is forwarded to the backfill store after a repo
 	// completion row is durable; test-only restart hook; production leaves nil.
 	AfterRepoComplete func(context.Context, atmos.DID) error
+
+	// CrashInjector is a test-only deterministic crash simulator. Production
+	// leaves it nil, making every simulateCrash checkpoint a no-op.
+	CrashInjector crashpoint.Injector
 }
 
 func (c *Config) validate() error {

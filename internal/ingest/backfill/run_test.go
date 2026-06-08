@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
@@ -111,6 +112,19 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 			require.ErrorContains(t, err, tc.errPart)
 		})
 	}
+}
+
+func TestConfig_CrashInjectorField(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{CrashInjector: stubCrashInjector{}}
+	require.NotNil(t, cfg.CrashInjector)
+}
+
+type stubCrashInjector struct{}
+
+func (stubCrashInjector) SimulateCrash(context.Context, crashpoint.Point) error {
+	return nil
 }
 
 // stubResolver is a fixed-document Resolver. It maps DID -> document

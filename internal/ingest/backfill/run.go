@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -55,6 +56,10 @@ type Config struct {
 	// AfterRepoComplete is a test-only restart hook invoked after a
 	// repo completion row is durably written. Leave nil in production.
 	AfterRepoComplete func(context.Context, atmos.DID) error
+
+	// CrashInjector is a test-only deterministic crash simulator. Leave nil in
+	// production.
+	CrashInjector crashpoint.Injector
 
 	// MaxRepos, when > 0, is a debug-only ceiling on the number of
 	// repos this Run will fully download before stopping early and
@@ -115,6 +120,7 @@ func Run(ctx context.Context, cfg Config) error {
 		st := NewStore(cfg.Store, cfg.Metrics)
 		st.afterComplete = cfg.AfterRepoComplete
 		st.afterCompleteError = recordFatal
+		st.crashInjector = cfg.CrashInjector
 		directory := directoryWithRecordingResolver(cfg.Directory, st, recordFatal)
 
 		sc := atmossync.NewClient(atmossync.Options{

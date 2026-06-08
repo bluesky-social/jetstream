@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
@@ -71,6 +72,31 @@ func TestRun_ResumeFromMerging_AdvancesToSteadyState(t *testing.T) {
 	}
 
 	// data/backfill removed by the merge phase.
+	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill"))
+	require.True(t, os.IsNotExist(err))
+}
+
+func TestRun_CrashAfterSteadyPhaseBeforeSteadyRunLeavesSteadyPhase(t *testing.T) {
+	t.Parallel()
+
+	fix := newMergeFixture(t, [][]segment.Event{{
+		{Kind: segment.KindIdentity, DID: "did:plc:steady-crash", IndexedAt: 1000},
+	}}, nil)
+	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+
+	sentinel := errors.New("kill point: steady phase before steady run")
+	fix.cfg.CrashInjector = pointErrorInjector{
+		point: crashpoint.AfterSteadyPhaseBeforeSteadyRun,
+		err:   sentinel,
+	}
+
+	o, err := New(fix.cfg)
+	require.NoError(t, err)
+	require.ErrorIs(t, o.Run(t.Context()), sentinel)
+
+	got, err := lifecycle.ReadPhase(fix.store)
+	require.NoError(t, err)
+	require.Equal(t, lifecycle.PhaseSteadyState, got)
 	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill"))
 	require.True(t, os.IsNotExist(err))
 }

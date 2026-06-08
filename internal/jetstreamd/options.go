@@ -7,6 +7,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 )
@@ -44,6 +45,7 @@ type Options struct {
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
 	AfterRepoComplete         func(context.Context, atmos.DID) error
+	CrashInjector             crashpoint.Injector
 	OnBootstrapLiveEvent      func(*segment.Event)
 	OnSteadyStateEvent        func(*segment.Event)
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/jcalabro/atmos"
 	"github.com/stretchr/testify/require"
 )
@@ -32,6 +33,21 @@ func TestOptionsExposeAfterRepoCompleteHook(t *testing.T) {
 
 	require.NotNil(t, opts.AfterRepoComplete)
 	require.False(t, called.Load())
+}
+
+func TestOptionsExposeCrashInjector(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions(t)
+	opts.CrashInjector = stubCrashInjector{}
+
+	require.NotNil(t, opts.CrashInjector)
+}
+
+type stubCrashInjector struct{}
+
+func (stubCrashInjector) SimulateCrash(context.Context, crashpoint.Point) error {
+	return nil
 }
 
 func testOptions(t *testing.T) Options {

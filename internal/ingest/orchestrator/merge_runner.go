@@ -9,41 +9,37 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
 )
 
-// killAfterFlushBeforeCommit, when non-nil, is invoked between
-// processSourceSegment returning successfully and commitSourceComplete
-// being called. Test-only; production paths leave it nil.
-//
-// Used to reproduce the spec §5.3 "after dst.Flush, before commit
-// SourceComplete" crash window: the destination block is durable on
-// disk but the cursor + per-DID Rev refresh have not been committed
-// to pebble. On restart, the merge re-runs the same source segment,
-// producing logical duplicates with new seq numbers.
-var killAfterFlushBeforeCommit func() error
-
 type mergeRunner struct {
-	dst       *ingest.Writer
-	store     *store.Store
-	sourceDir string
-	logger    *slog.Logger
-	metrics   *Metrics
-	now       func() time.Time // overridable for tests
-	cache     *repoStatusLookup
+	dst           *ingest.Writer
+	store         *store.Store
+	sourceDir     string
+	logger        *slog.Logger
+	metrics       *Metrics
+	crashInjector crashpoint.Injector
+	now           func() time.Time // overridable for tests
+	cache         *repoStatusLookup
 }
 
-func newMergeRunner(dst *ingest.Writer, st *store.Store, sourceDir string, logger *slog.Logger, m *Metrics) *mergeRunner {
+// newMergeRunner builds a drain runner. injector is the test-only crash
+// simulator (crashpoint.Injector); production callers thread
+// o.cfg.CrashInjector, which is nil in production, making every
+// simulateCrash checkpoint a no-op. Pass nil to disable injection.
+func newMergeRunner(dst *ingest.Writer, st *store.Store, sourceDir string, logger *slog.Logger, m *Metrics, injector crashpoint.Injector) *mergeRunner {
 	r := &mergeRunner{
-		dst:       dst,
-		store:     st,
-		sourceDir: sourceDir,
-		logger:    logger.With(slog.String("component", "orchestrator/merge")),
-		metrics:   m,
-		now:       func() time.Time { return time.Now().UTC() },
+		dst:           dst,
+		store:         st,
+		sourceDir:     sourceDir,
+		logger:        logger.With(slog.String("component", "orchestrator/merge")),
+		metrics:       m,
+		crashInjector: injector,
+		now:           func() time.Time { return time.Now().UTC() },
 	}
 	r.cache = newRepoStatusLookup(st, m.incMergeDIDLookups)
 	return r
@@ -87,10 +83,8 @@ func (r *mergeRunner) run(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if killAfterFlushBeforeCommit != nil {
-				if err := killAfterFlushBeforeCommit(); err != nil {
-					return err
-				}
+			if err := r.simulateCrash(ctx, crashpoint.AfterMergeDstFlushBeforeSourceCommit); err != nil {
+				return err
 			}
 			if err := commitSourceComplete(r.store, r.cache, sf.Idx+1, perDID, r.now()); err != nil {
 				return err
@@ -100,6 +94,13 @@ func (r *mergeRunner) run(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+func (r *mergeRunner) simulateCrash(ctx context.Context, point crashpoint.Point) error {
+	if r.crashInjector == nil {
+		return nil
+	}
+	return r.crashInjector.SimulateCrash(ctx, point)
 }
 
 // processSourceSegment opens one source seg, iterates its blocks,

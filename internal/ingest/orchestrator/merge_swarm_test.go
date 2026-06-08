@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -23,10 +24,6 @@ const (
 // preserves the spec's invariants under variation in: event count,
 // per-DID rev sequences, BackfillRev cutoffs, source-segment splits,
 // and kill-point injections.
-//
-// Cannot use t.Parallel() at the outer level because individual
-// iterations may use kill-point hooks (which mutate package-level
-// state). Inner subtests run serially within an iteration.
 //
 //nolint:paralleltest
 func TestMerge_Swarm(t *testing.T) {
@@ -153,11 +150,20 @@ func runSwarmIteration(t *testing.T, rng *rand.Rand) {
 	// 30% chance of a kill-point injection on the flush-before-commit path.
 	// On crash, restart and run merge to completion.
 	if rng.IntN(10) < 3 {
-		killAfterFlushBeforeCommit = func() error { return errors.New("swarm kill") }
+		fix.cfg.CrashInjector = pointErrorInjector{
+			point: crashpoint.AfterMergeDstFlushBeforeSourceCommit,
+			err:   errors.New("swarm kill"),
+		}
 		o, err := New(fix.cfg)
 		require.NoError(t, err)
-		_ = o.runMerge(t.Context()) // expected error; recover below
-		killAfterFlushBeforeCommit = nil
+		// Assert the checkpoint actually fired. Without this, a scenario
+		// that drains zero source segments (e.g. every event filtered) —
+		// or a regression that deletes the simulateCrash call entirely —
+		// would silently skip the crash and make the recovery assertions
+		// below vacuous while still passing.
+		require.ErrorContains(t, o.runMerge(t.Context()), "swarm kill",
+			"crash must fire at AfterMergeDstFlushBeforeSourceCommit")
+		fix.cfg.CrashInjector = nil
 	}
 
 	o, err := New(fix.cfg)

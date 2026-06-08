@@ -13,7 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/segment"
@@ -33,6 +36,27 @@ func ev(did, rev string, kind segment.Kind, indexedAtMicros int64) segment.Event
 		Rev:        rev,
 		Payload:    []byte("payload-" + rev),
 	}
+}
+
+// pointErrorInjector simulates a crash at a single checkpoint by
+// RETURNING an error there. The error unwinds the call stack, so all
+// deferred cleanup (dst.Close, writer Close, etc.) still runs — this is
+// a "recoverable error" model, NOT a faithful process death. It is
+// sufficient for the checkpoints used here because each fires AFTER the
+// durable fsync it names, so the on-disk/in-store state at the crash
+// boundary is identical whether the process unwinds gracefully or is
+// SIGKILLed. The oracle restart harness (oracleCrashInjector) provides
+// the faithful SIGKILL model where cleanup-on-crash behavior matters.
+type pointErrorInjector struct {
+	point crashpoint.Point
+	err   error
+}
+
+func (i pointErrorInjector) SimulateCrash(_ context.Context, point crashpoint.Point) error {
+	if point == i.point {
+		return i.err
+	}
+	return nil
 }
 
 // readDestEvents returns every event currently present in
@@ -217,10 +241,8 @@ func TestMerge_TopLevelRunAdvancesPhase(t *testing.T) {
 	require.GreaterOrEqual(t, sealedCount, 1, "at least one sealed segment should exist from merge")
 }
 
-//nolint:paralleltest // Cannot use t.Parallel() because we mutate package-level killAfterFlushBeforeCommit
 func TestMerge_CrashAfterFlushBeforeCommit_ProducesDuplicates(t *testing.T) {
-	// Cannot use t.Parallel() because we mutate the package-level
-	// killAfterFlushBeforeCommit hook.
+	t.Parallel()
 
 	srcEvs := []segment.Event{
 		ev("did:plc:a", "3l6", segment.KindCreate, 1000),
@@ -230,8 +252,10 @@ func TestMerge_CrashAfterFlushBeforeCommit_ProducesDuplicates(t *testing.T) {
 
 	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	sentinel := errors.New("kill point: flush-before-commit")
-	killAfterFlushBeforeCommit = func() error { return sentinel }
-	t.Cleanup(func() { killAfterFlushBeforeCommit = nil })
+	fix.cfg.CrashInjector = pointErrorInjector{
+		point: crashpoint.AfterMergeDstFlushBeforeSourceCommit,
+		err:   sentinel,
+	}
 
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
@@ -243,7 +267,7 @@ func TestMerge_CrashAfterFlushBeforeCommit_ProducesDuplicates(t *testing.T) {
 	require.Equal(t, uint64(0), cur)
 
 	// Restart: clear the hook and re-run.
-	killAfterFlushBeforeCommit = nil
+	fix.cfg.CrashInjector = nil
 	o2, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o2.runMerge(t.Context()))
@@ -266,18 +290,18 @@ func TestMerge_CrashAfterFlushBeforeCommit_ProducesDuplicates(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // Cannot use t.Parallel() because we mutate package-level killAfterSealBeforeDiscovery
 func TestMerge_CrashAfterSealBeforeDiscovery_RestartCleansUp(t *testing.T) {
-	// Cannot use t.Parallel() because we mutate the package-level
-	// killAfterSealBeforeDiscovery hook.
+	t.Parallel()
 
 	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
 	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	sentinel := errors.New("kill point: seal-before-removeall")
-	killAfterSealBeforeDiscovery = func() error { return sentinel }
-	t.Cleanup(func() { killAfterSealBeforeDiscovery = nil })
+	fix.cfg.CrashInjector = pointErrorInjector{
+		point: crashpoint.AfterMergeDstSealBeforeDiscovery,
+		err:   sentinel,
+	}
 
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
@@ -288,7 +312,7 @@ func TestMerge_CrashAfterSealBeforeDiscovery_RestartCleansUp(t *testing.T) {
 	require.NoError(t, err)
 
 	// Restart: clear the hook and re-run.
-	killAfterSealBeforeDiscovery = nil
+	fix.cfg.CrashInjector = nil
 	o2, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o2.runMerge(t.Context()))
@@ -304,6 +328,69 @@ func TestMerge_CrashAfterSealBeforeDiscovery_RestartCleansUp(t *testing.T) {
 	bcur, err := backfill.LoadBootstrapLastListReposCursor(fix.store)
 	require.NoError(t, err)
 	require.Equal(t, "", bcur)
+}
+
+// TestMerge_SealsActiveSourceSegmentBeforeDrain exercises
+// sealActiveMergeSource directly. It reproduces the on-disk state a
+// crash at AfterBootstrapLiveCloseBeforeSeal leaves behind: the
+// bootstrap-live source tree has a trailing ACTIVE (unsealed) segment
+// because the process died after Close() flushed data but before the
+// seal-via-reopen ran.
+//
+// Without sealActiveMergeSource, the merge runner's
+// processSourceSegment would call segment.Open on the active file and
+// get ErrActiveSegment, crash-looping merge forever. This test pins
+// that the seal guard makes the source readable and the survivor is
+// drained exactly once.
+func TestMerge_SealsActiveSourceSegmentBeforeDrain(t *testing.T) {
+	t.Parallel()
+
+	// No sealed sources from the fixture; we build the unsealed one by hand.
+	fix := newMergeFixture(t, nil, map[string]string{"did:plc:active": "3l5"})
+	liveDir := filepath.Join(fix.dataDir, "backfill", "live_segments")
+
+	// Write one surviving event (rev > cutoff) and Close() WITHOUT
+	// sealing — mirroring bootstrapLive.Close() in the crash window.
+	srcW, err := ingest.Open(ingest.Config{
+		SegmentsDir: liveDir,
+		Store:       fix.store,
+		SeqKey:      live.BootstrapSeqKey,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	survivor := ev("did:plc:active", "3l9", segment.KindCreate, 1000)
+	require.NoError(t, srcW.Append(t.Context(), &survivor))
+	require.NoError(t, srcW.Close()) // Close, not SealActiveAndClose.
+
+	// Precondition: the trailing source segment is genuinely unsealed,
+	// otherwise this test would pass for the wrong reason.
+	srcFiles, err := readSegFiles(liveDir)
+	require.NoError(t, err)
+	require.Len(t, srcFiles, 1)
+	require.False(t, isSealed(t, srcFiles[0]),
+		"precondition: trailing source segment must be active/unsealed")
+
+	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+
+	o, err := New(fix.cfg)
+	require.NoError(t, err)
+	require.NoError(t, o.runMerge(t.Context()),
+		"merge must seal the active source segment and drain it")
+
+	// The survivor reached the destination exactly once.
+	got := readDestEvents(t, fix.dataDir)
+	survivors := map[string]int{}
+	for _, e := range got {
+		survivors[e.Rev]++
+	}
+	require.Equal(t, 1, survivors["3l9"], "survivor must be drained exactly once")
+
+	// Full merge completed: backfill tree removed, cursors clean.
+	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill"))
+	require.True(t, os.IsNotExist(err), "backfill dir should be removed after a clean merge")
+	cur, err := loadMergeCursor(fix.store)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), cur)
 }
 
 func TestMerge_DiscoversNewDIDsViaListReposResume(t *testing.T) {

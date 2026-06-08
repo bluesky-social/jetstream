@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 )
@@ -96,6 +97,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			if err := o.writeSteadyStatePhase(); err != nil {
 				return err
 			}
+			if err := o.simulateCrash(ctx, crashpoint.AfterSteadyPhaseBeforeSteadyRun); err != nil {
+				return err
+			}
 
 			if o.cfg.BarrierAfterMerge != nil {
 				if err := o.cfg.BarrierAfterMerge(ctx); err != nil {
@@ -111,4 +115,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			return fmt.Errorf("orchestrator: unrecognized phase %q", phase)
 		}
 	})
+}
+
+func (o *Orchestrator) simulateCrash(ctx context.Context, point crashpoint.Point) error {
+	if o.cfg.CrashInjector == nil {
+		return nil
+	}
+	return o.cfg.CrashInjector.SimulateCrash(ctx, point)
 }

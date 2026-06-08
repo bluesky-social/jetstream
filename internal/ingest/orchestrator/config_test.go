@@ -1,11 +1,13 @@
 package orchestrator
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
 	"testing"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/identity"
@@ -64,4 +66,19 @@ func TestConfig_OnEventField(t *testing.T) {
 		OnEvent: func(*segment.Event) {},
 	}
 	require.NotNil(t, cfg.OnEvent)
+}
+
+func TestConfig_CrashInjectorField(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		CrashInjector: stubCrashInjector{},
+	}
+	require.NotNil(t, cfg.CrashInjector)
+}
+
+type stubCrashInjector struct{}
+
+func (stubCrashInjector) SimulateCrash(context.Context, crashpoint.Point) error {
+	return nil
 }

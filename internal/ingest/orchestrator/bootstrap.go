@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
@@ -110,6 +111,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 				Metrics:           o.cfg.BackfillMetrics,
 				MaxRepos:          o.cfg.MaxBackfillRepos,
 				AfterRepoComplete: o.cfg.AfterRepoComplete,
+				CrashInjector:     o.cfg.CrashInjector,
 			})
 			if err != nil {
 				return err
@@ -210,6 +212,9 @@ func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.
 		start := time.Now()
 		if err := bootstrapLive.Close(); err != nil {
 			return fmt.Errorf("orchestrator: close bootstrap-live consumer: %w", err)
+		}
+		if err := o.simulateCrash(ctx, crashpoint.AfterBootstrapLiveCloseBeforeSeal); err != nil {
+			return err
 		}
 
 		sealW, err := ingest.Open(ingest.Config{

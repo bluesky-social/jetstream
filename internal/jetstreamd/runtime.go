@@ -274,6 +274,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		BarrierAfterBootstrap: phaseBarrier(opts.BarrierAfterBootstrap),
 		BarrierAfterMerge:     phaseBarrier(opts.BarrierAfterMerge),
 		AfterRepoComplete:     opts.AfterRepoComplete,
+		CrashInjector:         opts.CrashInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			writerPtr.Store(w)
 		},
