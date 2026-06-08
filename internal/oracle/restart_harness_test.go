@@ -11,74 +11,108 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
 	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
 	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
-	"github.com/jcalabro/atmos"
 	"github.com/stretchr/testify/require"
 )
 
 const (
-	envRestartChild     = "JETSTREAM_ORACLE_RESTART_CHILD"
-	envRestartDataDir   = "JETSTREAM_ORACLE_RESTART_DATA_DIR"
-	envRestartRelayURL  = "JETSTREAM_ORACLE_RESTART_RELAY_URL"
-	envRestartMarker    = "JETSTREAM_ORACLE_RESTART_MARKER"
-	envRestartMergeDone = "JETSTREAM_ORACLE_RESTART_MERGE_DONE"
-	envRestartUseHook   = "JETSTREAM_ORACLE_RESTART_USE_HOOK"
+	envRestartChild      = "JETSTREAM_ORACLE_RESTART_CHILD"
+	envRestartDataDir    = "JETSTREAM_ORACLE_RESTART_DATA_DIR"
+	envRestartRelayURL   = "JETSTREAM_ORACLE_RESTART_RELAY_URL"
+	envRestartMarker     = "JETSTREAM_ORACLE_RESTART_MARKER"
+	envRestartMergeDone  = "JETSTREAM_ORACLE_RESTART_MERGE_DONE"
+	envRestartCrashPoint = "JETSTREAM_ORACLE_RESTART_CRASH_POINT"
 )
 
 // nolint:paralleltest
-func TestOracle_RestartAfterRepoCompleteDoesNotLoseRecords(t *testing.T) {
+func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping restart oracle under -short")
 	}
 
-	cfg := Config{
-		Mode:                "restart",
-		Seed:                101,
-		Accounts:            4,
-		MinInitialRecords:   1,
-		MaxInitialRecords:   4,
-		LiveEventsBootstrap: 4,
-		LiveEventsSteady:    4,
+	cases := []struct {
+		name          string
+		point         crashpoint.Point
+		preLiveEvents int
+	}{
+		{
+			name:  "after-repo-complete",
+			point: crashpoint.AfterRepoComplete,
+		},
+		{
+			name:          "after-merge-dst-flush-before-source-commit",
+			point:         crashpoint.AfterMergeDstFlushBeforeSourceCommit,
+			preLiveEvents: 4,
+		},
+		{
+			name:          "after-merge-dst-seal-before-discovery",
+			point:         crashpoint.AfterMergeDstSealBeforeDiscovery,
+			preLiveEvents: 4,
+		},
+		{
+			name:          "after-bootstrap-live-close-before-seal",
+			point:         crashpoint.AfterBootstrapLiveCloseBeforeSeal,
+			preLiveEvents: 4,
+		},
 	}
 
-	w := newRestartWorld(t, cfg)
-	defer func() { require.NoError(t, w.Close()) }()
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				Mode:                "restart",
+				Seed:                uint64(101 + i),
+				Accounts:            4,
+				MinInitialRecords:   1,
+				MaxInitialRecords:   4,
+				LiveEventsBootstrap: 4,
+				LiveEventsSteady:    4,
+			}
 
-	srv := newRestartServer(t, w)
-	defer srv.Close()
+			w := newRestartWorld(t, cfg)
+			defer func() { require.NoError(t, w.Close()) }()
+			if tc.preLiveEvents > 0 {
+				generateN(t, w, tc.preLiveEvents)
+			}
 
-	dataDir := t.TempDir()
-	markersDir := t.TempDir()
-	markerPath := filepath.Join(markersDir, "after-repo-complete")
-	mergeDonePath := filepath.Join(markersDir, "after-merge")
+			srv := newRestartServer(t, w)
+			defer srv.Close()
 
-	first := runRestartChild(t, restartChildArgs{
-		dataDir:         dataDir,
-		relayURL:        srv.URL,
-		markerPath:      markerPath,
-		useHook:         true,
-		killAfterMarker: true,
-		timeout:         30 * time.Second,
-	})
-	require.True(t, wasSIGKILL(first.err), "first child should be killed at the restart point: err=%v\n%s", first.err, first.output)
+			dataDir := t.TempDir()
+			markersDir := t.TempDir()
+			markerPath := filepath.Join(markersDir, tc.point.String())
+			mergeDonePath := filepath.Join(markersDir, "after-merge")
 
-	second := runRestartChild(t, restartChildArgs{
-		dataDir:       dataDir,
-		relayURL:      srv.URL,
-		mergeDonePath: mergeDonePath,
-		timeout:       30 * time.Second,
-	})
-	require.NoError(t, second.err, "restart child should exit cleanly\n%s", second.output)
-	require.FileExists(t, mergeDonePath, "restart child must reach after-merge barrier before exiting")
+			first := runRestartChild(t, restartChildArgs{
+				dataDir:         dataDir,
+				relayURL:        srv.URL,
+				markerPath:      markerPath,
+				crashPoint:      tc.point,
+				killAfterMarker: true,
+				timeout:         30 * time.Second,
+			})
+			require.True(t, wasSIGKILL(first.err), "first child should be killed at %s: err=%v\n%s", tc.point, first.err, first.output)
 
-	assertOracleMatches(t, dataDir, w, cfg, "restart-after-repo-complete")
+			second := runRestartChild(t, restartChildArgs{
+				dataDir:       dataDir,
+				relayURL:      srv.URL,
+				mergeDonePath: mergeDonePath,
+				timeout:       30 * time.Second,
+			})
+			require.NoError(t, second.err, "restart child should exit cleanly\n%s", second.output)
+			require.FileExists(t, mergeDonePath, "restart child must reach after-merge barrier before exiting")
+
+			assertOracleMatches(t, dataDir, w, cfg, tc.name)
+		})
+	}
 }
 
 // nolint:paralleltest
@@ -96,17 +130,7 @@ func TestOracleRestartChild(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	var afterComplete func(context.Context, atmos.DID) error
-	if os.Getenv(envRestartUseHook) == "1" {
-		require.NotEmpty(t, markerPath, "%s is required when hook is enabled", envRestartMarker)
-		afterComplete = func(ctx context.Context, did atmos.DID) error {
-			if err := os.WriteFile(markerPath, []byte(did), 0o644); err != nil {
-				return err
-			}
-			<-ctx.Done()
-			return ctx.Err()
-		}
-	}
+	crashInjector := newOracleCrashInjectorFromEnv(t, markerPath)
 	var afterMerge jetstreamd.PhaseBarrier
 	if mergeDonePath := os.Getenv(envRestartMergeDone); mergeDonePath != "" {
 		afterMerge = func(context.Context) error {
@@ -139,7 +163,7 @@ func TestOracleRestartChild(t *testing.T) {
 		SubscribeSlowMinRate:      1,
 		CursorBlockIndexCacheSize: 32,
 		BarrierAfterMerge:         afterMerge,
-		AfterRepoComplete:         afterComplete,
+		CrashInjector:             crashInjector,
 	})
 	require.NoError(t, err)
 
@@ -150,6 +174,52 @@ func TestOracleRestartChild(t *testing.T) {
 	require.True(t,
 		runErr == nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded),
 		"runtime error: %v", runErr)
+}
+
+func newOracleCrashInjectorFromEnv(t *testing.T, markerPath string) crashpoint.Injector {
+	t.Helper()
+
+	rawPoint := os.Getenv(envRestartCrashPoint)
+	if rawPoint == "" {
+		return nil
+	}
+	require.NotEmpty(t, markerPath, "%s is required when %s is set", envRestartMarker, envRestartCrashPoint)
+
+	point, err := crashpoint.Parse(rawPoint)
+	require.NoError(t, err)
+
+	return &oracleCrashInjector{
+		target:     point,
+		markerPath: markerPath,
+	}
+}
+
+// oracleCrashInjector fires on the FIRST time the target crashpoint is
+// reached: it writes the marker file (the parent polls for it, then
+// SIGKILLs this child) and blocks until the process is killed. The
+// sync.Once makes the marker write exactly-once even though backfill
+// invokes SimulateCrash from multiple per-DID worker goroutines
+// concurrently.
+type oracleCrashInjector struct {
+	target     crashpoint.Point
+	markerPath string
+	once       sync.Once
+	writeErr   error
+}
+
+func (i *oracleCrashInjector) SimulateCrash(ctx context.Context, point crashpoint.Point) error {
+	if point != i.target {
+		return nil
+	}
+
+	i.once.Do(func() {
+		i.writeErr = os.WriteFile(i.markerPath, []byte(point.String()), 0o644)
+	})
+	if i.writeErr != nil {
+		return i.writeErr
+	}
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func newRestartWorld(t *testing.T, cfg Config) *world.World {
@@ -194,7 +264,7 @@ type restartChildArgs struct {
 	relayURL        string
 	markerPath      string
 	mergeDonePath   string
-	useHook         bool
+	crashPoint      crashpoint.Point
 	killAfterMarker bool
 	timeout         time.Duration
 }
@@ -221,7 +291,7 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 		envRestartRelayURL+"="+args.relayURL,
 		envRestartMarker+"="+args.markerPath,
 		envRestartMergeDone+"="+args.mergeDonePath,
-		envRestartUseHook+"="+boolEnv(args.useHook),
+		envRestartCrashPoint+"="+args.crashPoint.String(),
 	)
 	require.NoError(t, cmd.Start())
 
@@ -312,11 +382,4 @@ func wasSIGKILL(err error) bool {
 	}
 	status, ok := exitErr.Sys().(syscall.WaitStatus)
 	return ok && status.Signaled() && status.Signal() == syscall.SIGKILL
-}
-
-func boolEnv(v bool) string {
-	if v {
-		return "1"
-	}
-	return "0"
 }
