@@ -143,7 +143,9 @@ func TestPDS_GetRepoFaultHandlerServesTruncatedCARThenCAR(t *testing.T) {
 	defer srv.Close()
 
 	url := srv.URL + "/xrpc/com.atproto.sync.getRepo?did=" + string(a.DID)
-	resp, err := http.DefaultClient.Get(url)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -152,7 +154,9 @@ func TestPDS_GetRepoFaultHandlerServesTruncatedCARThenCAR(t *testing.T) {
 	require.Error(t, err, "first response must be an incomplete CAR")
 	require.Equal(t, 1, faults.GetRepoCARTruncationsFired(string(a.DID)))
 
-	resp, err = http.DefaultClient.Get(url)
+	req, err = http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err = http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
