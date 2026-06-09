@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"net/http"
 
 	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
@@ -39,6 +40,17 @@ func newPDSGetRepoHandler(w *world.World, faults *FaultPlan) http.Handler {
 			return
 		}
 		rw.Header().Set("Content-Type", "application/vnd.ipld.car")
+		if faults.maybeGetRepoCARTruncation(string(did)) {
+			var buf bytes.Buffer
+			if err := w.ExportRepoCAR(acct.Index, &buf); err != nil {
+				return
+			}
+			body := buf.Bytes()
+			if len(body) > 0 {
+				_, _ = rw.Write(body[:max(1, len(body)/2)])
+			}
+			return
+		}
 		if err := w.ExportRepoCAR(acct.Index, rw); err != nil {
 			// Headers may already be flushed; the response body is
 			// committed at this point. Nothing useful we can do

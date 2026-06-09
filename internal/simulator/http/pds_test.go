@@ -1,7 +1,9 @@
 package http_test
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -119,4 +121,47 @@ func TestPDS_GetRepoFaultHandlerServesTransient503ThenCAR(t *testing.T) {
 	require.Equal(t, a.DID, rp.DID)
 	require.NotEmpty(t, commit.Sig)
 	require.Equal(t, 1, faults.GetRepoHTTPFailuresFired(string(a.DID)))
+}
+
+// TestPDS_GetRepoFaultHandlerServesTruncatedCARThenCAR pins the simulator
+// handler's mid-body fault injection: the first matching request returns
+// a 200 response whose CAR body is incomplete, and the next request serves
+// the real CAR. The first request deliberately goes through raw HTTP instead
+// of sync.GetRepoStream so the assertion is at the response-body boundary.
+func TestPDS_GetRepoFaultHandlerServesTruncatedCARThenCAR(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 5, 2)
+	a, err := w.LoadAccount(0)
+	require.NoError(t, err)
+
+	faults := simhttp.NewFaultPlan()
+	faults.AddGetRepoCARTruncations(string(a.DID), 1)
+
+	srv := httptest.NewServer(simhttp.NewHandlerWithOptions(w, "http://example.test", simhttp.HandlerOptions{
+		Faults: faults,
+	}))
+	defer srv.Close()
+
+	url := srv.URL + "/xrpc/com.atproto.sync.getRepo?did=" + string(a.DID)
+	resp, err := http.DefaultClient.Get(url)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/vnd.ipld.car", resp.Header.Get("Content-Type"))
+	_, _, err = loadFromCAR(resp.Body)
+	require.Error(t, err, "first response must be an incomplete CAR")
+	require.Equal(t, 1, faults.GetRepoCARTruncationsFired(string(a.DID)))
+
+	resp, err = http.DefaultClient.Get(url)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	rp, commit, err := loadFromCAR(bytes.NewReader(body))
+	require.NoError(t, err)
+	require.Equal(t, a.DID, rp.DID)
+	require.NotEmpty(t, commit.Sig)
+	require.Equal(t, 1, faults.GetRepoCARTruncationsFired(string(a.DID)))
 }

@@ -165,10 +165,10 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 // In swarm mode it first requires the plan to be NON-empty: a zero-fault
 // plan would make the "all faults fired" check below pass vacuously,
 // silently hiding a config or planner regression that disabled
-// injection. It then requires every scheduled getRepo HTTP fault to have
-// fired, which holds because backfill touches every DID at least once
-// (per-DID download) and atmos's retry loop consumes each transient 503;
-// the after-bootstrap barrier only releases after backfill has fully
+// injection. It then requires every scheduled getRepo HTTP fault and CAR
+// truncation to have fired, which holds because backfill touches every DID at
+// least once (per-DID download) and atmos's retry loop consumes each transient
+// failure; the after-bootstrap barrier only releases after backfill has fully
 // drained, so no scheduled fault is still pending when this runs.
 func assertFaultPlanFired(t *testing.T, cfg Config, plan *SwarmFaultPlan) {
 	t.Helper()
@@ -176,8 +176,11 @@ func assertFaultPlanFired(t *testing.T, cfg Config, plan *SwarmFaultPlan) {
 	if cfg.FaultMode == FaultModeSwarm {
 		require.NotEmpty(t, plan.GetRepoHTTPFailures,
 			"swarm mode must schedule at least one getRepo HTTP fault; empty plan means injection is disabled")
+		require.NotEmpty(t, plan.GetRepoCARTruncations,
+			"swarm mode must schedule at least one getRepo CAR truncation; empty plan means injection is disabled")
 	}
 	require.Empty(t, plan.UnfiredGetRepoHTTPFailures(), "configured getRepo HTTP faults must fire")
+	require.Empty(t, plan.UnfiredGetRepoCARTruncations(), "configured getRepo CAR truncation faults must fire")
 }
 
 func assertSubscribeReposFaultPlanFired(t *testing.T, cfg Config, plan *SwarmFaultPlan) {

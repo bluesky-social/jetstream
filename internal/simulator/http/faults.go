@@ -16,12 +16,18 @@ type FaultPlan struct {
 }
 
 type getRepoFaults struct {
-	mu    sync.Mutex
-	byDID map[string]httpFaultState
+	mu            sync.Mutex
+	httpByDID     map[string]httpFaultState
+	truncateByDID map[string]countFaultState
 }
 
 type httpFaultState struct {
 	status    int
+	remaining int
+	fired     int
+}
+
+type countFaultState struct {
 	remaining int
 	fired     int
 }
@@ -37,7 +43,10 @@ type subscribeReposFaults struct {
 // NewFaultPlan constructs an empty fault plan.
 func NewFaultPlan() *FaultPlan {
 	return &FaultPlan{
-		getRepo:        &getRepoFaults{byDID: make(map[string]httpFaultState)},
+		getRepo: &getRepoFaults{
+			httpByDID:     make(map[string]httpFaultState),
+			truncateByDID: make(map[string]countFaultState),
+		},
 		subscribeRepos: &subscribeReposFaults{},
 	}
 }
@@ -50,10 +59,10 @@ func (p *FaultPlan) AddGetRepoHTTPFailures(did string, status, count int) {
 	}
 	p.getRepo.mu.Lock()
 	defer p.getRepo.mu.Unlock()
-	st := p.getRepo.byDID[did]
+	st := p.getRepo.httpByDID[did]
 	st.status = status
 	st.remaining += count
-	p.getRepo.byDID[did] = st
+	p.getRepo.httpByDID[did] = st
 }
 
 // GetRepoHTTPFailuresFired reports how many scheduled getRepo HTTP
@@ -64,7 +73,32 @@ func (p *FaultPlan) GetRepoHTTPFailuresFired(did string) int {
 	}
 	p.getRepo.mu.Lock()
 	defer p.getRepo.mu.Unlock()
-	return p.getRepo.byDID[did].fired
+	return p.getRepo.httpByDID[did].fired
+}
+
+// AddGetRepoCARTruncations schedules count successful-status getRepo
+// responses for did whose CAR body is cut short before getRepo returns to
+// normal simulator behavior.
+func (p *FaultPlan) AddGetRepoCARTruncations(did string, count int) {
+	if p == nil || p.getRepo == nil || did == "" || count <= 0 {
+		return
+	}
+	p.getRepo.mu.Lock()
+	defer p.getRepo.mu.Unlock()
+	st := p.getRepo.truncateByDID[did]
+	st.remaining += count
+	p.getRepo.truncateByDID[did] = st
+}
+
+// GetRepoCARTruncationsFired reports how many scheduled getRepo CAR
+// truncations have fired for did.
+func (p *FaultPlan) GetRepoCARTruncationsFired(did string) int {
+	if p == nil || p.getRepo == nil {
+		return 0
+	}
+	p.getRepo.mu.Lock()
+	defer p.getRepo.mu.Unlock()
+	return p.getRepo.truncateByDID[did].fired
 }
 
 // SetSubscribeReposDisconnectSchedule installs per-connection frame
@@ -110,14 +144,30 @@ func (p *FaultPlan) maybeGetRepoHTTPFault(did string) (int, bool) {
 	}
 	p.getRepo.mu.Lock()
 	defer p.getRepo.mu.Unlock()
-	st, ok := p.getRepo.byDID[did]
+	st, ok := p.getRepo.httpByDID[did]
 	if !ok || st.remaining <= 0 {
 		return 0, false
 	}
 	st.remaining--
 	st.fired++
-	p.getRepo.byDID[did] = st
+	p.getRepo.httpByDID[did] = st
 	return st.status, true
+}
+
+func (p *FaultPlan) maybeGetRepoCARTruncation(did string) bool {
+	if p == nil || p.getRepo == nil {
+		return false
+	}
+	p.getRepo.mu.Lock()
+	defer p.getRepo.mu.Unlock()
+	st, ok := p.getRepo.truncateByDID[did]
+	if !ok || st.remaining <= 0 {
+		return false
+	}
+	st.remaining--
+	st.fired++
+	p.getRepo.truncateByDID[did] = st
+	return true
 }
 
 func (p *FaultPlan) onSubscribeConnect() (int, bool) {

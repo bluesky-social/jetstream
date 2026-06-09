@@ -34,28 +34,30 @@ const (
 const _ = uint(subscribeDisconnectMaxScheduleK - subscribeDisconnectScheduleK)
 
 // SwarmFaultPlan is the oracle's deterministic fault schedule plus the
-// simulator plan used to enforce it. GetRepoHTTPFailures is the oracle's
-// authoritative record of what was scheduled (DID -> failure count);
-// SimulatorFaults is the live plan the HTTP handler consults and that
-// counts how many of those failures actually fired.
+// simulator plan used to enforce it. GetRepoHTTPFailures and
+// GetRepoCARTruncations are the oracle's authoritative records of what was
+// scheduled (DID -> failure count); SimulatorFaults is the live plan the HTTP
+// handler consults and that counts how many of those failures actually fired.
 type SwarmFaultPlan struct {
 	SimulatorFaults                    *simhttp.FaultPlan
 	GetRepoHTTPFailures                map[string]int
+	GetRepoCARTruncations              map[string]int
 	SubscribeReposDisconnectThresholds []int
 }
 
 // BuildSwarmFaultPlan builds the deterministic fault schedule for an
-// oracle run. FaultModeNone returns an empty plan (no DIDs scheduled,
-// TotalGetRepoHTTPFailures() == 0). FaultModeSwarm schedules a small,
-// bounded set of transient getRepo 503s: two on a hot DID and one on a
-// distinct secondary DID. The budget is deliberately well inside atmos's
-// default retry count so every faulted repo still completes, leaving the
-// durable model identical to the simulator world. An unknown mode is an
-// error.
+// oracle run. FaultModeNone returns an empty plan (no DIDs scheduled).
+// FaultModeSwarm schedules a small, bounded set of transient getRepo failures:
+// two 503s plus one truncated CAR body on a hot DID, and one 503 on a distinct
+// secondary DID when the world has more than one account. The budget is
+// deliberately inside atmos's default retry count so every faulted repo still
+// completes, leaving the durable model identical to the simulator world. An
+// unknown mode is an error.
 func BuildSwarmFaultPlan(w *world.World, cfg Config) (*SwarmFaultPlan, error) {
 	plan := &SwarmFaultPlan{
-		SimulatorFaults:     simhttp.NewFaultPlan(),
-		GetRepoHTTPFailures: map[string]int{},
+		SimulatorFaults:       simhttp.NewFaultPlan(),
+		GetRepoHTTPFailures:   map[string]int{},
+		GetRepoCARTruncations: map[string]int{},
 	}
 	if cfg.FaultMode == FaultModeNone {
 		return plan, nil
@@ -81,6 +83,7 @@ func BuildSwarmFaultPlan(w *world.World, cfg Config) (*SwarmFaultPlan, error) {
 	rng := rand.New(rand.NewPCG(cfg.Seed^oracleFaultSeedSalt, cfg.Seed+oracleFaultSeedSalt))
 	hot := dids[skewedIndex(rng, len(dids))]
 	plan.addGetRepoHTTPFailures(hot, 2)
+	plan.addGetRepoCARTruncations(hot, 1)
 
 	if len(dids) > 1 {
 		secondary := hot
@@ -134,12 +137,28 @@ func (p *SwarmFaultPlan) addGetRepoHTTPFailures(did string, count int) {
 	p.SimulatorFaults.AddGetRepoHTTPFailures(did, http.StatusServiceUnavailable, count)
 }
 
+func (p *SwarmFaultPlan) addGetRepoCARTruncations(did string, count int) {
+	p.GetRepoCARTruncations[did] += count
+	p.SimulatorFaults.AddGetRepoCARTruncations(did, count)
+}
+
 func (p *SwarmFaultPlan) TotalGetRepoHTTPFailures() int {
 	if p == nil {
 		return 0
 	}
 	var total int
 	for _, count := range p.GetRepoHTTPFailures {
+		total += count
+	}
+	return total
+}
+
+func (p *SwarmFaultPlan) TotalGetRepoCARTruncations() int {
+	if p == nil {
+		return 0
+	}
+	var total int
+	for _, count := range p.GetRepoCARTruncations {
 		total += count
 	}
 	return total
@@ -162,6 +181,23 @@ func (p *SwarmFaultPlan) UnfiredGetRepoHTTPFailures() map[string]int {
 	}
 	for did, want := range p.GetRepoHTTPFailures {
 		got := p.SimulatorFaults.GetRepoHTTPFailuresFired(did)
+		if got != want {
+			out[did] = want - got
+		}
+	}
+	return out
+}
+
+// UnfiredGetRepoCARTruncations returns, per DID, how many scheduled getRepo
+// CAR truncation faults have NOT yet fired (want - got). See
+// UnfiredGetRepoHTTPFailures for the assertion semantics.
+func (p *SwarmFaultPlan) UnfiredGetRepoCARTruncations() map[string]int {
+	out := map[string]int{}
+	if p == nil {
+		return out
+	}
+	for did, want := range p.GetRepoCARTruncations {
+		got := p.SimulatorFaults.GetRepoCARTruncationsFired(did)
 		if got != want {
 			out[did] = want - got
 		}

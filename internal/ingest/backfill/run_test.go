@@ -218,6 +218,11 @@ type stubServer struct {
 	transientFailGetRepo     map[atmos.DID]int
 	transientFailGetRepoCode int
 
+	// transientTruncateGetRepo maps a DID to the number of successful-status
+	// getRepo responses that should return an incomplete CAR before the
+	// real CAR is served. Guarded by transientMu.
+	transientTruncateGetRepo map[atmos.DID]int
+
 	// firstListReposCursor records the cursor query param the relay
 	// saw on its first listRepos request. Lets tests verify that a
 	// pre-seeded resume cursor is passed through correctly.
@@ -326,6 +331,16 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/vnd.ipld.car")
+		s.transientMu.Lock()
+		if remaining := s.transientTruncateGetRepo[did]; remaining > 0 {
+			s.transientTruncateGetRepo[did] = remaining - 1
+			s.transientMu.Unlock()
+			if len(f.car) > 0 {
+				_, _ = w.Write(f.car[:max(1, len(f.car)/2)])
+			}
+			return
+		}
+		s.transientMu.Unlock()
 		_, _ = w.Write(f.car)
 
 	default:
@@ -452,6 +467,66 @@ func TestRun_TransientGetRepoFailureThenRecovers(t *testing.T) {
 	srv.transientMu.Lock()
 	defer srv.transientMu.Unlock()
 	require.Equal(t, 0, srv.transientFailGetRepo[did], "all scheduled transient failures must have fired")
+}
+
+// TestRun_TruncatedGetRepoCARThenRecovers exercises the real engine retry
+// path for a successful HTTP response whose body fails while parsing as CAR.
+// The first getRepo returns a 200 with only half the CAR body; the retry must
+// fetch the full CAR and complete the DID without persisting a failed state.
+func TestRun_TruncatedGetRepoCARThenRecovers(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:truncated")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+	srv.transientTruncateGetRepo = map[atmos.DID]int{did: 1}
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	docs := map[atmos.DID]*identity.DIDDocument{
+		did: {
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: fixtures[did].multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		},
+	}
+	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, Run(t.Context(), Config{
+		Store:          db,
+		Directory:      dir,
+		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
+		Writer:         w,
+		RelayURL:       srv.srv.URL,
+		Logger:         logger,
+		RetryBaseDelay: time.Millisecond,
+		RetryMaxDelay:  10 * time.Millisecond,
+	}))
+
+	got, err := NewStore(db, nil).Lookup(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateComplete, got.State, "truncated CAR must be retried to completion")
+
+	srv.transientMu.Lock()
+	defer srv.transientMu.Unlock()
+	require.Equal(t, 0, srv.transientTruncateGetRepo[did], "all scheduled truncated CAR faults must have fired")
 }
 
 func TestRun_IdentityDiagnosticsPersistenceFailureAbortsRun(t *testing.T) {

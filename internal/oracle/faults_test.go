@@ -41,6 +41,7 @@ func TestBuildSwarmFaultPlanIsDeterministicAndBounded(t *testing.T) {
 
 	// Determinism: same seed + same world => identical schedule.
 	require.Equal(t, first.GetRepoHTTPFailures, second.GetRepoHTTPFailures)
+	require.Equal(t, first.GetRepoCARTruncations, second.GetRepoCARTruncations)
 
 	// Exact swarm contract for a multi-DID world: precisely two distinct
 	// DIDs, one "hot" with 2 failures and one secondary with 1. Asserting
@@ -49,6 +50,8 @@ func TestBuildSwarmFaultPlanIsDeterministicAndBounded(t *testing.T) {
 	// onto a single DID would fail here.
 	require.Len(t, first.GetRepoHTTPFailures, 2, "swarm faults exactly two distinct DIDs")
 	require.Equal(t, 3, first.TotalGetRepoHTTPFailures(), "2 (hot) + 1 (secondary)")
+	require.Len(t, first.GetRepoCARTruncations, 1, "swarm faults one DID with a truncated CAR")
+	require.Equal(t, 1, first.TotalGetRepoCARTruncations())
 
 	counts := make([]int, 0, 2)
 	for _, c := range first.GetRepoHTTPFailures {
@@ -172,6 +175,8 @@ func TestBuildSwarmFaultPlanSingleDIDWorld(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, plan.GetRepoHTTPFailures, 1, "single-DID world faults only the hot DID")
 	require.Equal(t, 2, plan.TotalGetRepoHTTPFailures())
+	require.Len(t, plan.GetRepoCARTruncations, 1, "single-DID world truncates only the hot DID")
+	require.Equal(t, 1, plan.TotalGetRepoCARTruncations())
 }
 
 func TestBuildSwarmFaultPlanNoopsWhenFaultModeNone(t *testing.T) {
@@ -188,6 +193,8 @@ func TestBuildSwarmFaultPlanNoopsWhenFaultModeNone(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, plan.GetRepoHTTPFailures)
 	require.Zero(t, plan.TotalGetRepoHTTPFailures())
+	require.Empty(t, plan.GetRepoCARTruncations)
+	require.Zero(t, plan.TotalGetRepoCARTruncations())
 }
 
 func newFaultPlanWorld(t *testing.T, accounts int) *world.World {
