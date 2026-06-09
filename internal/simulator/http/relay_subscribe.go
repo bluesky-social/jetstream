@@ -27,7 +27,7 @@ const subscribeReplayLimit = 1024
 //     OutdatedCursor frame first.
 //  4. Pump live events until the connection closes or the request
 //     ctx is cancelled.
-func newRelaySubscribeReposHandler(w *world.World) http.Handler {
+func newRelaySubscribeReposHandler(w *world.World, faults *FaultPlan) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -38,6 +38,14 @@ func newRelaySubscribeReposHandler(w *world.World) http.Handler {
 			return
 		}
 		defer func() { _ = conn.CloseNow() }()
+
+		framesBeforeClose, faultArmed := faults.onSubscribeConnect()
+		writer := subscribeFaultWriter{
+			conn:              conn,
+			faults:            faults,
+			framesBeforeClose: framesBeforeClose,
+			faultArmed:        faultArmed,
+		}
 
 		var cursor int64
 		if c := r.URL.Query().Get("cursor"); c != "" {
@@ -80,12 +88,12 @@ func newRelaySubscribeReposHandler(w *world.World) http.Handler {
 		// fresh seq will then resume normally.
 		if cursor > 0 && len(frames) == 0 && w.CurrentSeq() > cursor {
 			info := world.EncodeOutdatedCursorInfo()
-			if writeErr := conn.Write(ctx, websocket.MessageBinary, info); writeErr != nil {
+			if writeErr := writer.Write(ctx, info); writeErr != nil {
 				return
 			}
 		}
 		for _, f := range frames {
-			if err := conn.Write(ctx, websocket.MessageBinary, f); err != nil {
+			if err := writer.Write(ctx, f); err != nil {
 				return
 			}
 		}
@@ -99,7 +107,7 @@ func newRelaySubscribeReposHandler(w *world.World) http.Handler {
 				if !ok {
 					return
 				}
-				if err := conn.Write(ctx, websocket.MessageBinary, f); err != nil {
+				if err := writer.Write(ctx, f); err != nil {
 					if errors.Is(err, context.Canceled) {
 						return
 					}
@@ -109,4 +117,25 @@ func newRelaySubscribeReposHandler(w *world.World) http.Handler {
 			}
 		}
 	})
+}
+
+type subscribeFaultWriter struct {
+	conn              *websocket.Conn
+	faults            *FaultPlan
+	framesBeforeClose int
+	framesWritten     int
+	faultArmed        bool
+}
+
+func (w *subscribeFaultWriter) Write(ctx context.Context, frame []byte) error {
+	if err := w.conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+		return err
+	}
+	w.framesWritten++
+	if !w.faultArmed || w.framesWritten < w.framesBeforeClose {
+		return nil
+	}
+	w.faultArmed = false
+	w.faults.noteSubscribeDisconnect()
+	return w.conn.Close(websocket.StatusTryAgainLater, "simulated subscribeRepos disconnect")
 }

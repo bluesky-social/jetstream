@@ -13,6 +13,12 @@ const (
 	envOracleMaxInitialRecords   = "JETSTREAM_ORACLE_MAX_INITIAL_RECORDS"
 	envOracleLiveEventsBootstrap = "JETSTREAM_ORACLE_LIVE_EVENTS_BOOTSTRAP"
 	envOracleLiveEventsSteady    = "JETSTREAM_ORACLE_LIVE_EVENTS_STEADY"
+	envOracleFaultMode           = "JETSTREAM_ORACLE_FAULT_MODE"
+)
+
+const (
+	FaultModeNone  = "none"
+	FaultModeSwarm = "swarm"
 )
 
 type Config struct {
@@ -23,6 +29,7 @@ type Config struct {
 	MaxInitialRecords   int
 	LiveEventsBootstrap int
 	LiveEventsSteady    int
+	FaultMode           string
 }
 
 // ConfigFromEnv returns oracle harness configuration and panics on invalid
@@ -75,6 +82,19 @@ func parseConfigFromLookupEnv(lookupenv func(string) (string, bool)) (Config, er
 	}
 	cfg.Mode = mode
 
+	faultMode, ok := lookupenv(envOracleFaultMode)
+	if !ok {
+		faultMode = cfg.FaultMode
+	} else if faultMode == "" {
+		return Config{}, fmt.Errorf("%s must not be empty", envOracleFaultMode)
+	}
+	switch faultMode {
+	case FaultModeNone, FaultModeSwarm:
+	default:
+		return Config{}, fmt.Errorf("%s: unknown oracle fault mode %q", envOracleFaultMode, faultMode)
+	}
+	cfg.FaultMode = faultMode
+
 	if err := parseUint64Env(lookupenv, envOracleSeed, &cfg.Seed); err != nil {
 		return Config{}, err
 	}
@@ -125,6 +145,13 @@ func defaultConfig() Config {
 		MaxInitialRecords:   1000,
 		LiveEventsBootstrap: 200,
 		LiveEventsSteady:    200,
+		// Swarm fault injection is on by default so the nightly oracle
+		// sweep exercises the transient-getRepo recovery path on every
+		// run. Set JETSTREAM_ORACLE_FAULT_MODE=none to opt out (e.g. to
+		// isolate a non-fault regression). The fault budget is bounded
+		// and transient, so the durable model still matches the
+		// simulator world; see internal/oracle/faults.go.
+		FaultMode: FaultModeSwarm,
 	}
 }
 

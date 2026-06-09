@@ -90,7 +90,10 @@ test *ARGS="./...":
 test-race *ARGS="./...":
     just test-long -race {{ARGS}}
 
-# Runs the heavier simulator oracle mode.
+# Runs the heavier simulator oracle mode. Deterministic transient getRepo and
+# steady-state subscribeRepos disconnect fault injection is ON by default
+# (JETSTREAM_ORACLE_FAULT_MODE=swarm, see internal/oracle/config.go); set
+# JETSTREAM_ORACLE_FAULT_MODE=none to opt out.
 oracle:
     JETSTREAM_ORACLE_MODE=stress gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 ./internal/oracle -run TestOracle_DefaultLifecycle
 
@@ -100,6 +103,11 @@ oracle:
 # entirely by JETSTREAM_ORACLE_MODE=stress (see internal/oracle/config.go) so
 # there is a single source of truth: do not reintroduce account/record/event
 # overrides here. Pass SEEDS explicitly to grow or shrink a local run.
+#
+# Deterministic transient getRepo and steady-state subscribeRepos disconnect
+# fault injection is on by default (JETSTREAM_ORACLE_FAULT_MODE=swarm); the
+# sweep relies on it to exercise backfill retry/recovery and live reconnect/
+# resume recovery on every seed.
 oracle-sweep SEEDS="10":
     #!/usr/bin/env bash
     set -euo pipefail

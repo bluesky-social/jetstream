@@ -7,6 +7,7 @@ import (
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/jcalabro/atmos/streaming"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
 
@@ -107,6 +108,12 @@ type Config struct {
 
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time
+
+	// ReconnectBackoff overrides atmos's subscribeRepos reconnect backoff.
+	// Nil preserves atmos defaults. This is intended for deterministic
+	// integration harnesses that inject disconnects without paying
+	// production-scale sleeps.
+	ReconnectBackoff *streaming.BackoffPolicy
 }
 
 func (c *Config) validate() error {

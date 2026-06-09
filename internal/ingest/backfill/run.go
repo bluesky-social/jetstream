@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
@@ -75,6 +76,20 @@ type Config struct {
 	// limit trips, so subsequent runs without the flag re-walk from
 	// the same point.
 	MaxRepos int
+
+	// MaxRetries, RetryBaseDelay, and RetryMaxDelay tune the engine's
+	// per-DID retry/backoff loop for transient getRepo failures. A zero
+	// value means "use atmos's default" (5 retries, 1s base, 30s cap),
+	// so production leaves all three at their zero value. The oracle
+	// fault-injection harness sets RetryBaseDelay to a sub-millisecond
+	// value so injected transient 503s recover without paying atmos's
+	// 1s production backoff per fault. MaxRetries is intentionally NOT
+	// lowered there: the fault budget per DID stays well inside the
+	// default retry count, and shrinking it would risk turning a
+	// transient fault into a spurious permanent failure.
+	MaxRetries     int
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
 }
 
 // Run drives the atmos backfill engine to completion. It blocks until
@@ -147,7 +162,7 @@ func Run(ctx context.Context, cfg Config) error {
 		// from "outer ctx cancelled" (propagate).
 		var limitTripped atomic.Bool
 
-		engine := atmosbackfill.NewEngine(atmosbackfill.Options{
+		engineOpts := atmosbackfill.Options{
 			SyncClient:  sc,
 			Store:       st,
 			Handler:     handler,
@@ -177,7 +192,7 @@ func Run(ctx context.Context, cfg Config) error {
 				cfg.Metrics.setProgressCompleted(stats.Completed)
 				if cfg.MaxRepos > 0 && stats.Completed >= int64(cfg.MaxRepos) {
 					if limitTripped.CompareAndSwap(false, true) {
-						logger.WarnContext(ctx, "DEBUG: max-backfill-repos limit reached; stopping backfill early",
+						logger.WarnContext(ctx, "max-backfill-repos limit reached; stopping backfill early",
 							"limit", cfg.MaxRepos,
 							"completed", stats.Completed,
 						)
@@ -185,7 +200,22 @@ func Run(ctx context.Context, cfg Config) error {
 					}
 				}
 			}),
-		})
+		}
+
+		// Only override atmos's retry defaults when explicitly configured;
+		// a zero value leaves the engine on its production defaults (5
+		// retries, 1s base, 30s cap). The oracle harness sets a tiny
+		// RetryBaseDelay so injected transient faults recover quickly.
+		if cfg.MaxRetries > 0 {
+			engineOpts.MaxRetries = gt.Some(cfg.MaxRetries)
+		}
+		if cfg.RetryBaseDelay > 0 {
+			engineOpts.RetryBaseDelay = gt.Some(cfg.RetryBaseDelay)
+		}
+		if cfg.RetryMaxDelay > 0 {
+			engineOpts.RetryMaxDelay = gt.Some(cfg.RetryMaxDelay)
+		}
+		engine := atmosbackfill.NewEngine(engineOpts)
 
 		logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL, "max_repos", cfg.MaxRepos)
 		if err := engine.Run(runCtx); err != nil {

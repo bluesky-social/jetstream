@@ -10,6 +10,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/streaming"
 )
 
 // PhaseBarrier is a test hook that can pause execution after a major
@@ -33,6 +34,17 @@ type Options struct {
 
 	MaxBackfillRepos   int
 	SkipMergeDiscovery bool
+
+	// BackfillRetryBaseDelay, when > 0, overrides the bootstrap backfill
+	// engine's initial retry backoff (atmos default 1s). Used by the
+	// oracle fault-injection harness to keep injected transient getRepo
+	// faults fast; production leaves it 0.
+	BackfillRetryBaseDelay time.Duration
+
+	// LiveReconnectBackoff, when non-nil, overrides atmos's subscribeRepos
+	// reconnect backoff for internal integration harnesses. Production
+	// leaves it nil.
+	LiveReconnectBackoff *streaming.BackoffPolicy
 
 	CursorLookback            time.Duration
 	SegmentCacheMaxAge        time.Duration

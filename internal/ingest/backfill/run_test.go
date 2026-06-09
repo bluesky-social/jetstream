@@ -208,6 +208,16 @@ type stubServer struct {
 	failGetRepo     map[atmos.DID]bool
 	failGetRepoCode int
 
+	// transientFailGetRepo maps a DID to the number of getRepo calls
+	// that should still fail with transientFailGetRepoCode before the
+	// real CAR is served. Each matching call decrements the counter, so
+	// after the budget is exhausted the DID downloads normally. Guarded
+	// by transientMu because the engine drives getRepo from many worker
+	// goroutines concurrently.
+	transientMu              sync.Mutex
+	transientFailGetRepo     map[atmos.DID]int
+	transientFailGetRepoCode int
+
 	// firstListReposCursor records the cursor query param the relay
 	// saw on its first listRepos request. Lets tests verify that a
 	// pre-seeded resume cursor is passed through correctly.
@@ -300,6 +310,15 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "TransientError"})
 			return
 		}
+		s.transientMu.Lock()
+		if remaining := s.transientFailGetRepo[did]; remaining > 0 {
+			s.transientFailGetRepo[did] = remaining - 1
+			s.transientMu.Unlock()
+			w.WriteHeader(s.transientFailGetRepoCode)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "TransientError"})
+			return
+		}
+		s.transientMu.Unlock()
 		f, ok := s.fixtures[did]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -366,6 +385,73 @@ func runWithStubResolver(
 		Logger:     logger,
 	}
 	return Run(ctx, cfg)
+}
+
+// TestRun_TransientGetRepoFailureThenRecovers exercises the real
+// engine retry path end-to-end: the stub PDS returns one retryable 503
+// for a DID before serving its CAR, and Run must still drive that DID
+// to StateComplete. Unlike the simulator-handler unit test (which calls
+// GetRepoStream directly with retries disabled), this proves jetstream's
+// configured retry/backoff loop recovers from a transient upstream
+// failure. RetryBaseDelay is pinned tiny so the test does not pay
+// atmos's 1s production backoff.
+func TestRun_TransientGetRepoFailureThenRecovers(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:transient")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+	srv.transientFailGetRepo = map[atmos.DID]int{did: 2}
+	srv.transientFailGetRepoCode = http.StatusServiceUnavailable
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	docs := map[atmos.DID]*identity.DIDDocument{
+		did: {
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: fixtures[did].multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		},
+	}
+	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, Run(t.Context(), Config{
+		Store:          db,
+		Directory:      dir,
+		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
+		Writer:         w,
+		RelayURL:       srv.srv.URL,
+		Logger:         logger,
+		RetryBaseDelay: time.Millisecond,
+		RetryMaxDelay:  10 * time.Millisecond,
+	}))
+
+	// The DID must have completed despite the two transient 503s, and
+	// the budget must be fully consumed (the engine actually retried).
+	got, err := NewStore(db, nil).Lookup(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateComplete, got.State, "transient 503s must be retried to completion")
+
+	srv.transientMu.Lock()
+	defer srv.transientMu.Unlock()
+	require.Equal(t, 0, srv.transientFailGetRepo[did], "all scheduled transient failures must have fired")
 }
 
 func TestRun_IdentityDiagnosticsPersistenceFailureAbortsRun(t *testing.T) {

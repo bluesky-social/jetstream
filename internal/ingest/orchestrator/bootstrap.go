@@ -63,16 +63,17 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		// Bootstrap-time live consumer.
 		bootstrapLive, err := live.Open(live.Config{
-			SegmentsDir:    liveSegmentsDir,
-			Store:          o.cfg.Store,
-			SeqKey:         live.BootstrapSeqKey,
-			CursorKey:      live.CursorKey,
-			RelayURL:       o.cfg.RelayURL,
-			Logger:         o.cfg.Logger,
-			Metrics:        o.cfg.LiveMetrics,
-			Verifier:       o.cfg.Verifier,
-			SegmentMetrics: o.cfg.SegmentMetrics,
-			OnEvent:        o.cfg.OnBootstrapLiveEvent,
+			SegmentsDir:      liveSegmentsDir,
+			Store:            o.cfg.Store,
+			SeqKey:           live.BootstrapSeqKey,
+			CursorKey:        live.CursorKey,
+			RelayURL:         o.cfg.RelayURL,
+			Logger:           o.cfg.Logger,
+			Metrics:          o.cfg.LiveMetrics,
+			Verifier:         o.cfg.Verifier,
+			SegmentMetrics:   o.cfg.SegmentMetrics,
+			OnEvent:          o.cfg.OnBootstrapLiveEvent,
+			ReconnectBackoff: o.cfg.LiveReconnectBackoff,
 		})
 		if err != nil {
 			if cerr := bw.Close(); cerr != nil {
@@ -110,6 +111,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 				Logger:            o.cfg.Logger,
 				Metrics:           o.cfg.BackfillMetrics,
 				MaxRepos:          o.cfg.MaxBackfillRepos,
+				RetryBaseDelay:    o.cfg.BackfillRetryBaseDelay,
 				AfterRepoComplete: o.cfg.AfterRepoComplete,
 				CrashInjector:     o.cfg.CrashInjector,
 			})

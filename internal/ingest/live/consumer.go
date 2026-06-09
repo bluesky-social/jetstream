@@ -228,6 +228,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 			)
 		}),
 	}
+	if c.cfg.ReconnectBackoff != nil {
+		opts.Backoff = gt.Some(*c.cfg.ReconnectBackoff)
+	}
 
 	client, err := streaming.NewClient(opts)
 	if err != nil {

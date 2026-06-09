@@ -14,6 +14,7 @@ func TestConfigDefaultMode(t *testing.T) {
 	require.Equal(t, 25, cfg.Accounts)
 	require.Equal(t, 0, cfg.MinInitialRecords)
 	require.Equal(t, 1000, cfg.MaxInitialRecords)
+	require.Equal(t, FaultModeSwarm, cfg.FaultMode)
 	require.Greater(t, cfg.LiveEventsBootstrap, 0)
 	require.Greater(t, cfg.LiveEventsSteady, 0)
 }
@@ -26,12 +27,15 @@ func TestConfigEnvOverrides(t *testing.T) {
 		"JETSTREAM_ORACLE_SEED":                "99",
 		"JETSTREAM_ORACLE_ACCOUNTS":            "7",
 		"JETSTREAM_ORACLE_MAX_INITIAL_RECORDS": "13",
+		"JETSTREAM_ORACLE_FAULT_MODE":          "none",
 	}
 	cfg := ConfigFromEnv(func(k string) string { return env[k] })
 	require.Equal(t, "fast", cfg.Mode)
 	require.Equal(t, uint64(99), cfg.Seed)
 	require.Equal(t, 7, cfg.Accounts)
 	require.Equal(t, 13, cfg.MaxInitialRecords)
+	// Swarm is the default; verify the env var can still opt back out.
+	require.Equal(t, FaultModeNone, cfg.FaultMode)
 }
 
 func TestConfigModePresets(t *testing.T) {
@@ -70,6 +74,11 @@ func TestConfigRejectsInvalidEnv(t *testing.T) {
 			name:    "unknown mode",
 			env:     map[string]string{"JETSTREAM_ORACLE_MODE": "tiny"},
 			wantErr: "unknown oracle mode",
+		},
+		{
+			name:    "unknown fault mode",
+			env:     map[string]string{"JETSTREAM_ORACLE_FAULT_MODE": "tiny"},
+			wantErr: "unknown oracle fault mode",
 		},
 		{
 			name:    "invalid seed",
@@ -138,6 +147,11 @@ func TestConfigRejectsExplicitEmptyEnv(t *testing.T) {
 			name:    "empty mode",
 			env:     map[string]string{"JETSTREAM_ORACLE_MODE": ""},
 			wantErr: "JETSTREAM_ORACLE_MODE must not be empty",
+		},
+		{
+			name:    "empty fault mode",
+			env:     map[string]string{"JETSTREAM_ORACLE_FAULT_MODE": ""},
+			wantErr: "JETSTREAM_ORACLE_FAULT_MODE must not be empty",
 		},
 		{
 			name:    "empty numeric override",

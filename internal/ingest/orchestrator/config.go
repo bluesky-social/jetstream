@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
@@ -14,6 +15,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
+	"github.com/jcalabro/atmos/streaming"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
 
@@ -106,6 +108,18 @@ type Config struct {
 	// portion of the merge phase for fast feedback loops in local
 	// development while running against production.
 	SkipMergeDiscovery bool
+
+	// BackfillRetryBaseDelay, when > 0, overrides the bootstrap backfill
+	// engine's initial retry backoff (atmos default 1s). The oracle
+	// fault-injection harness sets this to a sub-millisecond value so
+	// injected transient getRepo 503s recover without paying the
+	// production backoff per fault. Production leaves it 0.
+	BackfillRetryBaseDelay time.Duration
+
+	// LiveReconnectBackoff, when non-nil, overrides atmos's subscribeRepos
+	// reconnect backoff for both bootstrap-time and steady-state live
+	// consumers. Production leaves it nil.
+	LiveReconnectBackoff *streaming.BackoffPolicy
 
 	// IngestOnAfterSeal is forwarded to every writer that appends to
 	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's

@@ -1,11 +1,11 @@
-# Nightly simulator oracle seed sweep.
+# Scheduled simulator oracle seed sweep.
 #
 # This workflow is intentionally separate from push CI. It is expensive enough
 # to be a bug-hunting job, not a per-commit gate. GitHub's built-in Actions
 # notifications handle failure emails for users who have Actions email
 # notifications enabled.
 
-name: oracle-nightly
+name: oracle-scheduled
 
 on:
   schedule:
@@ -78,7 +78,7 @@ jobs:
         if: failure()
         run: |
           {
-            echo "## Nightly oracle failed"
+            echo "## Scheduled oracle test failed"
             echo
             echo 'The failing seed and exact local repro command are printed in the `Oracle seed sweep` step logs.'
             echo

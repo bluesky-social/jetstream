@@ -49,6 +49,8 @@ just test                     # everything, -short mode
 just test ./internal/foo/...  # one package
 just test-race                # full suite with -race
 just test-long                # full suite without -short
+
+just oracle                   # heavier simulator oracle (stress mode)
 ```
 
 ## Inspecting segment files

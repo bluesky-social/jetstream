@@ -45,12 +45,13 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			CursorKey:   live.CursorKey,
 			RelayURL:    o.cfg.RelayURL,
 			// Bare cfg.Logger; live.Open sets its own component.
-			Logger:         o.cfg.Logger,
-			Metrics:        o.cfg.LiveMetrics,
-			Verifier:       o.cfg.Verifier,
-			SegmentMetrics: o.cfg.SegmentMetrics,
-			OnEvent:        o.cfg.OnEvent,
-			OnAfterSeal:    o.cfg.IngestOnAfterSeal,
+			Logger:           o.cfg.Logger,
+			Metrics:          o.cfg.LiveMetrics,
+			Verifier:         o.cfg.Verifier,
+			SegmentMetrics:   o.cfg.SegmentMetrics,
+			OnEvent:          o.cfg.OnEvent,
+			OnAfterSeal:      o.cfg.IngestOnAfterSeal,
+			ReconnectBackoff: o.cfg.LiveReconnectBackoff,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)

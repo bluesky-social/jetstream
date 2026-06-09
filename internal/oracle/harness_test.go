@@ -17,6 +17,8 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/streaming"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,9 +50,14 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		fanout.New(4096),
 	))
 
+	faultPlan, err := BuildSwarmFaultPlan(w, cfg)
+	require.NoError(t, err)
+
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
-	srv.Config.Handler = simhttp.NewHandler(w, srv.URL)
+	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, srv.URL, simhttp.HandlerOptions{
+		Faults: faultPlan.SimulatorFaults,
+	})
 
 	dataDir := t.TempDir()
 	afterBootstrap := newPhaseGate()
@@ -68,19 +75,31 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	bootstrapTraffic.afterBatch = func(ctx context.Context, targetSeq int64) error {
 		return bootstrapAck.WaitContiguousFrom(ctx, 1, targetSeq, oracleWaitTimeout(cfg))
 	}
+	liveReconnectBackoff := &streaming.BackoffPolicy{
+		InitialDelay: gt.Some(time.Millisecond),
+		MaxDelay:     gt.Some(time.Millisecond),
+		Multiplier:   gt.Some(1.0),
+		Jitter:       gt.Some(false),
+	}
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
-		PublicAddr:                "127.0.0.1:0",
-		DebugAddr:                 "127.0.0.1:0",
-		DataDir:                   dataDir,
-		RelayURL:                  srv.URL,
-		PLCURL:                    srv.URL,
-		OTelServiceName:           "jetstream-oracle",
-		LogLevel:                  "warn",
-		LogFormat:                 "text",
-		LogOutput:                 testWriter{t: t},
-		ShutdownTimeout:           5 * time.Second,
-		ClientDrainTimeout:        time.Second,
+		PublicAddr:         "127.0.0.1:0",
+		DebugAddr:          "127.0.0.1:0",
+		DataDir:            dataDir,
+		RelayURL:           srv.URL,
+		PLCURL:             srv.URL,
+		OTelServiceName:    "jetstream-oracle",
+		LogLevel:           "warn",
+		LogFormat:          "text",
+		LogOutput:          testWriter{t: t},
+		ShutdownTimeout:    5 * time.Second,
+		ClientDrainTimeout: time.Second,
+		// Keep injected transient getRepo 503s fast: a sub-millisecond
+		// retry backoff means each fault adds microseconds, not atmos's
+		// 1s production base delay, so the swarm sweep stays inside its
+		// per-seed timeout budget even at stress scale.
+		BackfillRetryBaseDelay:    time.Millisecond,
+		LiveReconnectBackoff:      liveReconnectBackoff,
 		CursorLookback:            36 * time.Hour,
 		SegmentCacheMaxAge:        0,
 		SubscribeHotTailBytes:     16 << 20,
@@ -116,11 +135,13 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	}()
 
 	waitForBarrier(t, cfg, "after-bootstrap", afterBootstrap, run)
+	assertFaultPlanFired(t, cfg, faultPlan)
 	assertBootstrapOracleMatches(t, dataDir, w, cfg)
 	afterBootstrap.Release()
 
 	waitForBarrier(t, cfg, "after-merge", afterMerge, run)
 	assertOracleMatches(t, dataDir, w, cfg, "after-merge")
+	faultPlan.ArmSubscribeReposDisconnects()
 	afterMerge.Release()
 
 	generateN(t, w, cfg.LiveEventsSteady)
@@ -136,7 +157,41 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	cancel()
 	waitForRuntimeExit(t, cfg, run)
 	runDone = true
+	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
+}
+
+// assertFaultPlanFired verifies the fault injection actually happened.
+// In swarm mode it first requires the plan to be NON-empty: a zero-fault
+// plan would make the "all faults fired" check below pass vacuously,
+// silently hiding a config or planner regression that disabled
+// injection. It then requires every scheduled getRepo HTTP fault to have
+// fired, which holds because backfill touches every DID at least once
+// (per-DID download) and atmos's retry loop consumes each transient 503;
+// the after-bootstrap barrier only releases after backfill has fully
+// drained, so no scheduled fault is still pending when this runs.
+func assertFaultPlanFired(t *testing.T, cfg Config, plan *SwarmFaultPlan) {
+	t.Helper()
+
+	if cfg.FaultMode == FaultModeSwarm {
+		require.NotEmpty(t, plan.GetRepoHTTPFailures,
+			"swarm mode must schedule at least one getRepo HTTP fault; empty plan means injection is disabled")
+	}
+	require.Empty(t, plan.UnfiredGetRepoHTTPFailures(), "configured getRepo HTTP faults must fire")
+}
+
+func assertSubscribeReposFaultPlanFired(t *testing.T, cfg Config, plan *SwarmFaultPlan) {
+	t.Helper()
+
+	if cfg.FaultMode != FaultModeSwarm {
+		return
+	}
+	require.NotEmpty(t, plan.SubscribeReposDisconnectThresholds,
+		"swarm mode must schedule subscribeRepos disconnect thresholds")
+	require.GreaterOrEqual(t, plan.SimulatorFaults.SubscribeReposDisconnects(), 1,
+		"configured subscribeRepos disconnect fault must fire")
+	require.GreaterOrEqual(t, plan.SimulatorFaults.SubscribeReposConnections(), 2,
+		"subscribeRepos disconnect must be followed by a reconnect")
 }
 
 func assertOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Config, phase string) {

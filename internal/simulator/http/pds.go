@@ -11,12 +11,22 @@ import (
 // bytes straight to the response. Ignores `since` in v1 — always
 // returns the full repo (which is valid behavior; consumers can
 // request diffs but aren't required to).
-func newPDSGetRepoHandler(w *world.World) http.Handler {
+func newPDSGetRepoHandler(w *world.World, faults *FaultPlan) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		didStr := r.URL.Query().Get("did")
 		did, err := atmos.ParseDID(didStr)
 		if err != nil {
 			http.Error(rw, "bad did", http.StatusBadRequest)
+			return
+		}
+		// Inject a scheduled fault before touching the real repo. This is
+		// a clean early exit: nothing has been written to rw yet, so
+		// http.Error sets a proper status code and body — unlike the
+		// mid-stream CAR truncation below, which can only happen after
+		// headers are committed. Each call consumes one unit of this
+		// DID's fault budget; once exhausted, getRepo serves normally.
+		if status, ok := faults.maybeGetRepoHTTPFault(string(did)); ok {
+			http.Error(rw, "simulated getRepo fault", status)
 			return
 		}
 		acct, ok, err := w.FindAccountByDID(did)
