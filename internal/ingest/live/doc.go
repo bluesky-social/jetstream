@@ -20,9 +20,9 @@
 // (with a pebble-backed StateStore + identity cache) and shares
 // with any future steady-state consumer.
 //
-// #sync frames are archived as segment.KindSync. ActionResync ops
-// produced by the verifier's resync worker after a chain break
-// archive as segment.KindCreate carrying the live record bytes
-// (see events.go); downstream consumers can dedupe on
+// #sync frames and async verifier resync events are archived as a
+// segment.KindSync tombstone row first. Any ActionResync ops yielded by
+// Event.Operations archive after it as segment.KindCreate rows carrying the
+// live record bytes (see events.go); downstream consumers can dedupe on
 // (DID, Collection, Rkey, Rev).
 package live

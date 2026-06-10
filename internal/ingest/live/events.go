@@ -32,6 +32,8 @@ import (
 // for the canonical handling.
 func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
 	switch {
+	case evt.Resync != streaming.ResyncNone && evt.Sync == nil:
+		return nil, fmt.Errorf("livestream: resync event missing sync envelope: %w", ErrUnknownEventKind)
 	case evt.Commit != nil:
 		return convertCommit(evt, indexedAt)
 	case evt.Identity != nil:
@@ -48,20 +50,16 @@ func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error)
 	default:
 		// No public envelope is set. Two cases:
 		//
-		//   1. atmos's verifier resync worker emits a synthetic
-		//      streaming.Event with only its (unexported) verifiedOps
-		//      populated, after re-fetching a repo via getRepo to
-		//      recover from a verification failure (chain break,
-		//      duplicate-op-path, inversion failure). Operations()
-		//      yields the resync ops directly with per-op DID + Rev;
-		//      we map each to KindCreate, matching the
-		//      streaming.ActionResync handling used when ops arrive
-		//      inside a #commit envelope.
+		//   1. Older local atmos checkouts emitted async resync
+		//      replacement ops without a public envelope. The current
+		//      local atmos API emits ResyncAsync with Sync populated,
+		//      but keeping this fallback makes the converter tolerant
+		//      during branch bisects and local replace churn.
 		//
 		//   2. A future relay variant we don't know how to decode.
 		//      Operations() yields nothing in that case, so we fall
-		//      through to ErrUnknownEventKind and the consumer
-		//      refuses to advance its cursor past this seq.
+		//      through to ErrUnknownEventKind and the consumer refuses
+		//      to advance its cursor past this seq.
 		return convertVerifiedOps(evt, indexedAt)
 	}
 }

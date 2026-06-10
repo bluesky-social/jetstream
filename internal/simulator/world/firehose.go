@@ -15,6 +15,7 @@ import (
 // these as two concatenated CBOR values (header map + body).
 var (
 	frameHeaderCommit   = mustEncodeFrameHeader("#commit")
+	frameHeaderSync     = mustEncodeFrameHeader("#sync")
 	frameHeaderIdentity = mustEncodeFrameHeader("#identity")
 	frameHeaderAccount  = mustEncodeFrameHeader("#account")
 	frameHeaderInfo     = mustEncodeFrameHeader("#info")
@@ -50,6 +51,17 @@ func encodeCommitFrame(c *comatproto.SyncSubscribeRepos_Commit) ([]byte, error) 
 	}
 	out := make([]byte, 0, len(frameHeaderCommit)+len(body))
 	out = append(out, frameHeaderCommit...)
+	out = append(out, body...)
+	return out, nil
+}
+
+func encodeSyncFrame(e *comatproto.SyncSubscribeRepos_Sync) ([]byte, error) {
+	body, err := e.MarshalCBOR()
+	if err != nil {
+		return nil, fmt.Errorf("world: encode sync frame body: %w", err)
+	}
+	out := make([]byte, 0, len(frameHeaderSync)+len(body))
+	out = append(out, frameHeaderSync...)
 	out = append(out, body...)
 	return out, nil
 }

@@ -64,6 +64,20 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return w.generateOneForAccount(ctx, authorIdx)
+}
+
+func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byte, error) {
+	if authorIdx < 0 || authorIdx >= w.cfg.Accounts {
+		return nil, fmt.Errorf("simulator: author index %d out of range", authorIdx)
+	}
+	deleted, err := w.isAccountDeleted(authorIdx)
+	if err != nil {
+		return nil, err
+	}
+	if deleted {
+		return nil, fmt.Errorf("simulator: author account %d is deleted", authorIdx)
+	}
 	author, err := w.loadAccount(authorIdx)
 	if err != nil {
 		return nil, err
@@ -174,6 +188,139 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 
+	if err := w.persistFirehoseFrame(seq, frame); err != nil {
+		return nil, err
+	}
+	w.fanout.Publish(frame)
+	return frame, nil
+}
+
+// GenerateSyncForTest emits a real subscribeRepos #sync frame for the current
+// head of account idx. It does not mutate the repo; it packages the current
+// commit block in the #sync CAR body, persists the frame to firehose history,
+// and publishes it to live subscribers.
+func (w *World) GenerateSyncForTest(ctx context.Context, idx int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return w.emitSyncForAccount(ctx, idx)
+}
+
+// GenerateSilentMutationThenSyncForTest mutates account idx, intentionally
+// skips publishing the corresponding #commit frame, then emits a #sync for the
+// new repo head. Oracle tests use this to force a true local/upstream
+// divergence: Jetstream must recover the authoritative state via getRepo.
+func (w *World) GenerateSilentMutationThenSyncForTest(ctx context.Context, idx int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := w.silentCreateForAccount(idx); err != nil {
+		return nil, err
+	}
+	return w.emitSyncForAccount(ctx, idx)
+}
+
+// GenerateSilentMutationThenCommitForTest mutates account idx, skips that
+// commit frame, then emits the next commit for the same DID. The emitted
+// commit's prevData points at a state Jetstream never saw, forcing the verifier
+// chain-break path and its async resync repair.
+func (w *World) GenerateSilentMutationThenCommitForTest(ctx context.Context, idx int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := w.silentCreateForAccount(idx); err != nil {
+		return nil, err
+	}
+	return w.generateOneForAccount(ctx, idx)
+}
+
+func (w *World) silentCreateForAccount(idx int) error {
+	if idx < 0 || idx >= w.cfg.Accounts {
+		return fmt.Errorf("simulator: silent account index %d out of range", idx)
+	}
+	deleted, err := w.isAccountDeleted(idx)
+	if err != nil {
+		return err
+	}
+	if deleted {
+		return fmt.Errorf("simulator: silent account %d is deleted", idx)
+	}
+	author, err := w.loadAccount(idx)
+	if err != nil {
+		return err
+	}
+	rp, err := w.loadRepo(author)
+	if err != nil {
+		return err
+	}
+	coll := chooseCreateCollection(w.rng)
+	rkey := newRkey(w.rng)
+	target, err := w.pickTargetAccount(idx)
+	if err != nil {
+		return err
+	}
+	if err := rp.Create(coll, rkey, generateRecord(w.rng, coll, string(target))); err != nil {
+		return fmt.Errorf("simulator: silent create %s/%s: %w", coll, rkey, err)
+	}
+	if _, err := w.commitAndPersist(author, rp); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *World) emitSyncForAccount(ctx context.Context, idx int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if idx < 0 || idx >= w.cfg.Accounts {
+		return nil, fmt.Errorf("simulator: sync account index %d out of range", idx)
+	}
+	deleted, err := w.isAccountDeleted(idx)
+	if err != nil {
+		return nil, err
+	}
+	if deleted {
+		return nil, fmt.Errorf("simulator: sync account %d is deleted", idx)
+	}
+	author, err := w.loadAccount(idx)
+	if err != nil {
+		return nil, err
+	}
+	state, err := w.loadState(idx)
+	if err != nil {
+		return nil, err
+	}
+	if !state.CommitCID.Defined() {
+		return nil, fmt.Errorf("simulator: sync account %d has no commit", idx)
+	}
+	commitData, err := (&pebbleStore{db: w.db, idx: idx}).GetBlock(state.CommitCID)
+	if err != nil {
+		return nil, fmt.Errorf("simulator: load sync commit block: %w", err)
+	}
+	var carBuf carBytesWriter
+	if err := car.WriteAll(&carBuf, []cbor.CID{state.CommitCID}, []car.Block{{
+		CID:  state.CommitCID,
+		Data: commitData,
+	}}); err != nil {
+		return nil, fmt.Errorf("simulator: write sync CAR: %w", err)
+	}
+	revTID, err := atmos.ParseTID(state.Rev)
+	if err != nil {
+		return nil, fmt.Errorf("simulator: parse sync rev: %w", err)
+	}
+
+	seq := w.seq.Add(1)
+	envelope := &comatproto.SyncSubscribeRepos_Sync{
+		DID:    string(author.DID),
+		Rev:    state.Rev,
+		Seq:    seq,
+		Time:   revTID.Time().UTC().Format("2006-01-02T15:04:05.000Z"),
+		Blocks: carBuf.bytes(),
+	}
+	frame, err := encodeSyncFrame(envelope)
+	if err != nil {
+		return nil, err
+	}
 	if err := w.persistFirehoseFrame(seq, frame); err != nil {
 		return nil, err
 	}

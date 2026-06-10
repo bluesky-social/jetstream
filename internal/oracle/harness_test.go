@@ -64,6 +64,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	afterMerge := newPhaseGate()
 	bootstrapAck := newSeqAck()
 	steadyAck := newSeqAck()
+	asyncResyncAck := newSyncTombstoneAck()
 	compaction := newCompactionPassRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
 	emittedBootstrapAccountDelete := false
@@ -123,8 +124,11 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		BarrierAfterMerge:         afterMerge.Barrier,
 		OnCompactionPass:          compaction.Observe,
 		OnBootstrapLiveEvent:      bootstrapAck.Observe,
-		OnSteadyStateEvent:        steadyAck.Observe,
-		AfterRepoComplete:         bootstrapTraffic.AfterRepoComplete,
+		OnSteadyStateEvent: func(ev *segment.Event) {
+			steadyAck.Observe(ev)
+			asyncResyncAck.Observe(ev)
+		},
+		AfterRepoComplete: bootstrapTraffic.AfterRepoComplete,
 	})
 	require.NoError(t, err)
 
@@ -158,8 +162,19 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	afterMerge.Release()
 
 	generateN(t, w, cfg.LiveEventsSteady)
+	syncIdx := pickActiveOracleAccount(t, w, cfg)
+	_, err = w.GenerateSilentMutationThenSyncForTest(t.Context(), syncIdx)
+	require.NoError(t, err)
 	targetSeq := w.CurrentSeq()
 	steadyAck.Wait(t, cfg, targetSeq, run, 30*time.Second)
+
+	asyncIdx := pickActiveOracleAccount(t, w, cfg)
+	_, err = w.GenerateSilentMutationThenCommitForTest(t.Context(), asyncIdx)
+	require.NoError(t, err)
+	asyncEntry, _, err := w.ListReposPage(asyncIdx, 1)
+	require.NoError(t, err)
+	require.Len(t, asyncEntry, 1)
+	asyncResyncAck.Wait(t, cfg, string(asyncEntry[0].DID), asyncEntry[0].Rev, run, 30*time.Second)
 
 	// steadyAck.Wait above guarantees every steady-state cursor up to
 	// targetSeq has been durably appended (OnEvent fires post-Append), so
@@ -349,6 +364,19 @@ func generateN(t *testing.T, w *world.World, n int) {
 	}
 }
 
+func pickActiveOracleAccount(t *testing.T, w *world.World, cfg Config) int {
+	t.Helper()
+	for idx := range cfg.Accounts {
+		deleted, err := w.IsAccountDeleted(idx)
+		require.NoError(t, err)
+		if !deleted {
+			return idx
+		}
+	}
+	t.Fatal("oracle requires at least one active account for sync divergence")
+	return 0
+}
+
 // seqAck tracks a gap-free watermark over the steady-state cursors
 // surfaced by OnEvent (which fires only after a durable Append). The
 // harness waits until every cursor up to the target seq has been durably
@@ -362,11 +390,73 @@ type seqAck struct {
 	once   sync.Once
 }
 
+type syncTombstoneAck struct {
+	mu      sync.Mutex
+	seen    map[string]struct{}
+	target  string
+	done    chan struct{}
+	waiting bool
+	once    sync.Once
+}
+
 func newSeqAck() *seqAck {
 	return &seqAck{
 		seen: make(map[int64]struct{}),
 		done: make(chan struct{}),
 	}
+}
+
+func newSyncTombstoneAck() *syncTombstoneAck {
+	return &syncTombstoneAck{
+		seen: make(map[string]struct{}),
+		done: make(chan struct{}),
+	}
+}
+
+func (a *syncTombstoneAck) Observe(ev *segment.Event) {
+	if ev == nil || ev.Kind != segment.KindSync || ev.DID == "" || ev.Rev == "" {
+		return
+	}
+	a.mu.Lock()
+	a.seen[syncTombstoneKey(ev.DID, ev.Rev)] = struct{}{}
+	a.maybeDoneLocked()
+	a.mu.Unlock()
+}
+
+func (a *syncTombstoneAck) Wait(t *testing.T, cfg Config, did, rev string, run *runtimeRun, timeout time.Duration) {
+	t.Helper()
+
+	a.mu.Lock()
+	a.target = syncTombstoneKey(did, rev)
+	a.waiting = true
+	a.maybeDoneLocked()
+	a.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-a.done:
+		return
+	case <-run.exited:
+		t.Fatalf("steady-state ingestion stopped before observing async resync tombstone did=%s rev=%s: mode=%s seed=%d err=%v",
+			did, rev, cfg.Mode, cfg.Seed, run.err)
+	case <-timer.C:
+		t.Fatalf("timeout waiting for async resync tombstone did=%s rev=%s: mode=%s seed=%d",
+			did, rev, cfg.Mode, cfg.Seed)
+	}
+}
+
+func (a *syncTombstoneAck) maybeDoneLocked() {
+	if !a.waiting || a.target == "" {
+		return
+	}
+	if _, ok := a.seen[a.target]; ok {
+		a.once.Do(func() { close(a.done) })
+	}
+}
+
+func syncTombstoneKey(did, rev string) string {
+	return did + "\x00" + rev
 }
 
 func (a *seqAck) Observe(ev *segment.Event) {
