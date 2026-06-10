@@ -424,7 +424,7 @@ type SegmentFile struct {
 //
 // Used by every consumer that needs the full segment manifest in
 // creation order: the merge phase draining live_segments/, the
-// future lookaside compactor, and inspect tooling.
+// delete/update compactor, and inspect tooling.
 func SegmentFiles(dir string) ([]SegmentFile, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

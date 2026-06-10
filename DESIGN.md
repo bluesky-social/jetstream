@@ -159,9 +159,9 @@ After a segment file accumulates enough blocks (~256MB of compressed data), we s
 
 Deletions and updates do not modify segment files synchronously. Every delete and update is treated as a tombstoned, keyed by its AT URI (Section 3.3). Readers (both the server-side scanner and remote clients) logically overlay the tomstones on top of segment events at delivery time.
 
-Every so often, we compact updates/deletions file into the sealed segments. Compaction uses the in-memory segment-level DID bloom to narrow to candidate segments, then the per-block DID blooms to narrow to candidate blocks within each, then an exact column scan to find the rows to rewrite or drop. See Section 3.3 for more details.
+Every so often, we compact updates/deletions into the sealed segments. Compaction snapshots tombstones above `compaction/seq`, rewrites sealed segments atomically, and refreshes serving metadata for changed files. See Section 3.3 for more details.
 
-The net of this is that segment files are immutable for most of the day and only rewrite during the daily compaction pass. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy replication to read-replicas that seed from a given jetstream instance.
+The net of this is that segment files are immutable between compaction passes and only rewrite on the merge-tail pass or the steady-state compaction cadence. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy replication to read-replicas that seed from a given jetstream instance.
 
 ### 3.1.2 File Format
 
@@ -388,7 +388,7 @@ Keys are namespaced by prefix:
 
 ```
 relay/cursor            -> uint64 upstream firehose seq we've durably persisted
-compaction/seq          -> the highest-watermark sequence number of the most recent compaction
+compaction/seq          -> the highest-watermark sequence number of the most recent compaction; owned by the compactor
 repo/<did>              -> JSON<RepoStatus> per-DID backfill and steady-state bookkeeping
 account/<did>           -> JSON<AccountStatus> hosting status, only present when non-active
 sync/<did>              -> JSON<SyncState> present while a resync is in progress
@@ -477,7 +477,7 @@ We take the events from the sealed and active segment files in `./data/backfill/
 
 We ensure that we don't store any events out of order by checking the DID's `BackfillRev` from `repo/<did>` in the metadata store against the revs of the events we're compacting. We drop the events whose rev is less than or equal to `BackfillRev`. This also should ensure we don’t store duplicate events (though because of at-least-once semantics, this is not a strict requirement).
 
-We also must complete a tombstone compaction to account for record updates and deletions as well as account deletions (see Section 3.3).
+After sealing the destination segment, we run the merge-tail tombstone compaction described in Section 3.3 so the archive is delete/update-compliant before `phase=steady_state` is written.
 
 After the last surviving event has been durably written:
 
@@ -487,7 +487,7 @@ After the last surviving event has been durably written:
 - Only after these steps do we durably write `phase=steady_state`
     - Each step is durable on its own (segment seal fsyncs, RemoveAll is observable on next directory scan, pebble delete is Sync=true), so a crash at any point during merge is recoverable on restart
 
-Additionally, since the merge phase takes so3 time, at the end, we also scan the relay with `listRepos` to find accounts that were newly created during the merge phase. We treat these repos the same as repos that failed to download during the initial backfill, and we will do a full `getRepo` call on them during the steady-state phase.
+Additionally, since the merge phase takes some time, at the end, we also scan the relay with `listRepos` to find accounts that were newly created during the merge phase. We treat these repos the same as repos that failed to download during the initial backfill, and we will do a full `getRepo` call on them during the steady-state phase.
 
 ### 4.3 Steady State Phase
 
@@ -503,7 +503,7 @@ As noted in Section 3, all event types are stored in the segment files, not just
 
 Internally, Jetstream doesn't care about handles, identity updates, or hosting status, but consumers of the application certainly do. `#identity`, `#account`, and `#sync` events are stored in-line with `#commit` events in the same segment blocks and passed along to clients as they come over the firehose.
 
-Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we write one or more a tombstones (see Section 3.3) the lookaside file to hide the user's pre-divergence records and re-download their repo from scratch from the PDS, updating events past the DID specified in the sync event.
+Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we store the `KindSync` row followed by the authoritative replacement records returned by the verifier. The `KindSync` row is a DID tombstone for compaction (see Section 3.3), so older pre-divergence record rows are physically removed once the relevant sealed segment is compacted.
 
 ## 5. Client Protocol and Libraries
 
