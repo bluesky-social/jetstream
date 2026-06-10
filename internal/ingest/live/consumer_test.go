@@ -166,9 +166,9 @@ func TestMaybeTriggerCompactionReportsCoalescedTriggers(t *testing.T) {
 	trigger := make(chan struct{}, 1)
 	var skipped atomic.Int32
 	c := &Consumer{cfg: Config{
-		Tombstones:                  tombstoneSetWithOneEntry(t),
-		TombstoneCap:                1,
-		CompactionTrigger:           trigger,
+		Tombstones:                   tombstoneSetWithOneEntry(t),
+		TombstoneCap:                 1,
+		CompactionTrigger:            trigger,
 		OnCompactionTriggerCoalesced: func() { skipped.Add(1) },
 	}}
 

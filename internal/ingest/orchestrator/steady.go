@@ -60,10 +60,10 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			OnCompactionTriggerCoalesced: func() {
 				o.cfg.Metrics.incCompactionSkippedTick()
 			},
-			SegmentMetrics:    o.cfg.SegmentMetrics,
-			OnEvent:           o.cfg.OnEvent,
-			OnAfterSeal:       o.cfg.IngestOnAfterSeal,
-			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
+			SegmentMetrics:   o.cfg.SegmentMetrics,
+			OnEvent:          o.cfg.OnEvent,
+			OnAfterSeal:      o.cfg.IngestOnAfterSeal,
+			ReconnectBackoff: o.cfg.LiveReconnectBackoff,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)

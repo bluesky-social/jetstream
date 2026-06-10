@@ -293,10 +293,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 				opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
 			}
 		},
-		BarrierAfterBootstrap:  phaseBarrier(opts.BarrierAfterBootstrap),
-		BarrierAfterMerge:      phaseBarrier(opts.BarrierAfterMerge),
-		AfterRepoComplete:      opts.AfterRepoComplete,
-		CrashInjector:          opts.CrashInjector,
+		BarrierAfterBootstrap: phaseBarrier(opts.BarrierAfterBootstrap),
+		BarrierAfterMerge:     phaseBarrier(opts.BarrierAfterMerge),
+		AfterRepoComplete:     opts.AfterRepoComplete,
+		CrashInjector:         opts.CrashInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			writerPtr.Store(w)
 		},
