@@ -39,7 +39,7 @@ We also have the following non-goals, which are explicitly not included in this 
 
 ### 1.2 Why Build This Now?
 
-First, our [users](https://bsky.app/profile/rude1.blacksky.team/post/3mjhlpd6idk2c) [are](https://bsky.app/profile/willdot.net/post/3mk6stoay4s2s) [asking](https://bsky.app/profile/danabra.mov/post/3mizg3nvooc2o) [for](https://bsky.app/profile/makeworld.space/post/3mk7hlc26g22c) [this](https://bsky.app/profile/timburga.com/post/3mizkj7omss2g). 2026 is the Atmosyear! Jetstream increases atproto adoption by providing an easy, robust, and cheap way to build AppViews and do network analysis.
+First, our users are asking for this. 2026 is the Atmosyear! Jetstream increases atproto adoption by providing an easy, robust, and cheap way to build AppViews and do network analysis.
 
 Second, the current production Bluesky data plane has several real limitations, all of which we will fix:
 
@@ -130,7 +130,7 @@ Just like the firehose, the way the data is laid out on disk naturally ensures e
 
 Once the server notices the client library has reached the end of the available HTTPS files to download in parallel, the server tells the client to pick up the websocket endpoint with a given cursor value to ensure zero events are missed. Jetstream is capable of replaying some number of recent events via the websocket endpoint so that way there is a buffer period where the backfill to live cut over can happen without the potential for data loss (say, a 72 hour replay window, configurable by the server operator).
 
-The client must also be aware of the deletion/update lookaside file and respect that appropriately (more on this later).
+The client must also be aware of deletion/update tombstones and respect that appropriately (more on this later).
 
 ## 3. Data Layout
 
@@ -157,9 +157,9 @@ On crash/restart, we seek to the active segment back to the last complete block 
 
 After a segment file accumulates enough blocks (~256MB of compressed data), we seal it by writing the variable-length footer at the end of the file, seeking to offset 0 and overwriting the reserved 256 bytes with the finalized fixed header, fsync, and rotate to a new active file. The process continues until the heat death of the universe.
 
-Deletions and updates do not modify segment files synchronously. Every delete and update is appended to a single global lookaside file, keyed by its AT URI (Section 3.3). Readers (both the server-side scanner and remote clients) merge the lookaside on top of segment events at delivery time.
+Deletions and updates do not modify segment files synchronously. Every delete and update is treated as a tombstoned, keyed by its AT URI (Section 3.3). Readers (both the server-side scanner and remote clients) logically overlay the tomstones on top of segment events at delivery time.
 
-Every so often (once a day by default, operator-configurable), we compact the lookaside file into the sealed segments. Compaction uses the in-memory segment-level DID bloom to narrow to candidate segments, then the per-block DID blooms to narrow to candidate blocks within each, then an exact column scan to find the rows to rewrite or drop.
+Every so often, we compact updates/deletions file into the sealed segments. Compaction uses the in-memory segment-level DID bloom to narrow to candidate segments, then the per-block DID blooms to narrow to candidate blocks within each, then an exact column scan to find the rows to rewrite or drop. See Section 3.3 for more details.
 
 The net of this is that segment files are immutable for most of the day and only rewrite during the daily compaction pass. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy replication to read-replicas that seed from a given jetstream instance.
 
@@ -205,7 +205,7 @@ Jetstream Sealed Segment File (.jss):
 │     min_seq:           uint64                            │
 │     max_seq:           uint64                            │
 │     min_indexed_at:    int64   (unix micros)             │
-│     max_indexed_at:    int64   (unix micros)             │
+│     max_indexed_at:    int64   (unix micros)             |
 │   DID Bloom Filter                                       │
 │     Serialized gloom.Filter (MarshalBinary)              │
 │     Covers all unique DIDs in this segment               │
@@ -229,7 +229,7 @@ The variable-length footer has two structures that work together to enable fast 
 1. Segment-level DID bloom filter ("might user X be in this segment file?")
 2. Per-block DID bloom filters ("which blocks in this segment might contain events for user X?")
 
-We use [gloom](https://github.com/jcalabro/gloom) for both, which has a stable binary format. We serialize the segment-level bloom to disk upon segment seal, and also keep all segment's blooms in Jetstream server's memory since it's small.
+We use gloom for both, which has a stable binary format. We serialize the segment-level bloom to disk upon segment seal, and also keep all segment's blooms in Jetstream server's memory since it's small.
 
 The per-block blooms are kept on disk (one bloom per block, all sized for the configured max events per block so we can index them by multiplication with no offset table), and we keep an LRU cache of the hot set in server memory (operator-configurable, defaulting to the most recently accessed 1024 segments).
 
@@ -334,86 +334,31 @@ kind values:
   6 = Sync       (#sync event)
 ```
 
-### 3.3 Update/Delete Lookaside File
+### 3.3 Record Updates/Deletions, Account Deletions, and Compaction
 
-In addition to the segment files, we maintain a single global lookaside file (`lookaside.upd`) that stores all updates, deletions, and account suppressions. The lookaside is an append-only binary file. Each entry is keyed by its AT URI triple `(did, collection, rkey)` for commit events, or by `did` alone for account suppressions.
+Jetstream supports record updates, record deletion, and account deletion. When an account is deleted, all its records will also be deleted. We will only store data on the latest version of a record; we will not store full record history until that is also kept on-protocol (perhaps some day?). We treat an update similar to a delete, blowing away the original record and replacing it with the newly updated version.
 
-Clients (both server-side scan and HTTP clients downloading segments) must load the lookaside file alongside the segments they're scanning and apply it during event delivery. Entries are applied in file order; later entries for the same record identity supersede earlier ones.
+As updates and deletions come over the firehose, and we store them in the active segment file as normal. However, we do eventually need to alter the original source data in older, sealed segment files to ensure we’re not storing data that the user requested be deleted. The process of cleaning up the older data is known as compaction.
 
-The lookaside file is small relative to the archive (updates and deletes are a small fraction of all network traffic, and we compact every so often). Clients download the whole file once and keep it resident for the duration of a scan.
+We have a compaction thread that runs every so often (once every 4 hours by default) that reads recent updates and deletions from sealed and active segment files, alters the older segment files containing the original records, then re-seals them with new header and footer data to match. We don’t immediately update sealed segment files because doing so would be computationally expensive, and it would kill our ability to serve sealed segment files over the CDN.
 
-If a deletion or update targets an event that is still in the in-memory pending block (not yet flushed to disk), we mutate the pending block in place and never write a lookaside entry for it.
+In the pebble kv store, we keep track of the sequence number of the most recent compaction checkpoint spot. Then the next time we compact, we find all records since the previous compaction sequence number, and the process repeats.
 
-The file format is a stream of length-prefixed entries with no file-level header. Entries are read sequentially.
+We also store the updates and deletions since the most recent compaction in-memory in the server to act as tombstones, and re-populate that cache on process restart to ensure we have the working set of deletes and updates resident.
 
-```
-Lookaside File (.upd) stream of entries:
+When the client calls the jetstream server to assemble a query plan, it must first download the recent update/deletion tombstones, then start streaming the live firehose, then it may begin backfilling data. We use those update/delete tombstones as a marker to indicate that any records seen for a URI or account during the backfill of segment files should be hidden to the caller as part of the event loop. The in-memory cache is small relative to the 
 
-Entry: Record Delete (type=1)
-┌──────────────────────────────────────────────────┐
-│ entry_len:       uint32 (LE); total entry bytes  │
-│                    excluding this field          │
-│ type:            uint8  = 1                      │
-│ did_len:         uint16                          │
-│ collection_len:  uint8                           │
-│ rkey_len:        uint8                           │
-│ did:             [did_len]byte                   │
-│ collection:      [collection_len]byte            │
-│ rkey:            [rkey_len]byte                  │
-└──────────────────────────────────────────────────┘
+Putting it all together, the query plan and client code looks something like the following:
 
-Entry: Record Update (type=2)
-┌──────────────────────────────────────────────────┐
-│ entry_len:       uint32 (LE)                     │
-│ type:            uint8  = 2                      │
-│ did_len:         uint16                          │
-│ collection_len:  uint8                           │
-│ rkey_len:        uint8                           │
-│ new_rev_len:     uint8                           │
-│ new_record_len:  uint32 (LE)                     │
-│ new_indexed_at:  int64  (LE, unix micros)        │
-│ did:             [did_len]byte                   │
-│ collection:      [collection_len]byte            │
-│ rkey:            [rkey_len]byte                  │
-│ new_rev:         [new_rev_len]byte               │
-│ new_record:      [new_record_len]byte (CBOR)     │
-└──────────────────────────────────────────────────┘
-
-Entry: Account Suppression (type=3)
-┌──────────────────────────────────────────────────┐
-│ entry_len:       uint32 (LE)                     │
-│ type:            uint8  = 3                      │
-│ did_len:         uint16                          │
-│ did:             [did_len]byte                   │
-└──────────────────────────────────────────────────┘
-```
-
-During a scan, the reader loads the lookaside into memory and builds a set of suppressed DIDs and records.
-
-For each record during decode:
-
-1. If the record's DID is in the suppression set and the row is a commit event (Create/Update/Delete), suppress the row
-2. Else if `(did, collection, rkey)` maps to a delete, suppress the row
-3. Else if `(did, collection, rkey)` maps to an update, emit the row with the replacement rev and payload
-4. Else emit the row as-is
-
-### 3.3.1 Compaction
-
-Once a day by default (operator-configurable), the server compacts the lookaside into the segments it targets. The goal is to avoid unbounded growth of the lookaside and to let clients doing large historical scans skip most of the merge work.
-
-Compaction is a read-mostly, write-sparingly operation. The pass is structured to do the minimum amount of segment I/O:
-
-1. Rename `lookaside.upd` to `lookaside.upd.compacting` and create a fresh empty `lookaside.upd` for new entries arriving during the pass. New entries that supersede ones we're compacting will be picked up on the next daily run.
-2. Bucket the `.compacting` entries by DID.
-3. For each segment, ask its in-memory segment-level DID bloom whether any bucketed DID might appear. Most segments answer no and we skip them entirely.
-4. For each candidate segment, load its per-block DID blooms (already cached for hot segments) and narrow to the candidate block set.
-5. Decompress only the candidate blocks. Walk the `did`, `collection`, and `rkey` columns to find exact `(did, collection, rkey)` matches. For deletes, drop the row. For updates, replace the row's `rev`, `indexed_at`, and `payload` with the entry's replacement values.
-6. Re-encode the changed blocks, rebuild the segment's footer, rewrite the fixed header (new checksum, possibly updated `event_count` and `min_seq`/`max_seq` if an edge row was deleted), and fsync. Segments with no matches are not touched.
-7. Delete `lookaside.upd.compacting` once every affected segment has been durably rewritten.
-
-Updates are more expensive than deletes because the replacement payload may be larger than the original, shifting bytes within the block. We still only rewrite the blocks that contain matches; shifting is local to a single block.
-
-The segment-level DID bloom does nearly all the filtering work here. Deletes and updates on atproto cluster heavily per-user (an account gets suspended and its records are tombstoned, a spam ring gets cleaned up), so a compaction pass typically touches a small fraction of segments even when the lookaside has many entries.
+1. The client connects to the jetstream live tail and starts receiving the most recent records
+    1. If a re-creation event for a record or account comes over the firehose, the tombstone is cleared until a corresponding delete for that record or account arrives over the firehose again. This avoids the “permanent tombstone” problem. We need to be able to support repeated creation and deletion of a single record or account
+2. The client negotiates a plan of which segment file blocks it must download to satisfy a particular query (i.e. “give me all `standard.site` documents”)
+3. The client downloads the list of recent deletions and updates
+4. The client begins download the segment file blocks and decompresses them in an attempt to emit records that match the user’s query
+5. If the record's DID is in the suppression set of deleted accounts, suppress the row
+6. If the URI of the record from the segment file maps to a known deletion tombstone, suppress the row
+7. If the URI of the record from the segment file maps to a known update, emit the record with the replacement rev and payload
+8. Emit the row as-is (no updates or deletes have been applied to this record)
 
 ### 3.4 File Organization
 
@@ -424,7 +369,6 @@ The data directory file layout is the following:
 ```
 data/
   meta.pebble/             <- unified metadata store (see Section 3.5)
-  lookaside.upd            <- single global update/deletion lookaside (see Section 3.3)
   backfill_complete.log    <- append-only log of completed repo backfills (see Section 3.5)
   segments/
     seg_0000000000.jss     <- fixed header + compressed blocks (+ footer once sealed)
@@ -437,19 +381,20 @@ Segments are named with a counter as a 10-digit zero-padded base-36 string. Segm
 
 ### 3.5 Metadata Store
 
-All structured metadata that isn't derivable by cheaply rescanning segment files lives in a single [pebble](https://github.com/cockroachdb/pebble) database at `data/meta.pebble/`. We picked pebble because it's pure Go, handles tens of millions of keys comfortably, and gives us atomic multi-key batch writes for free, which matters for the durability ordering described below.
+All structured metadata that isn't derivable by cheaply rescanning segment files lives in a single pebble database at `data/meta.pebble/`. We picked pebble because it's pure Go, handles tens of millions of keys comfortably, and gives us atomic multi-key batch writes for free, which matters for the durability ordering described below.
 
 Keys are namespaced by prefix:
 
 ```
 relay/cursor            -> uint64 upstream firehose seq we've durably persisted
+compaction/seq          -> the highest-watermark sequence number of the most recent compaction
 repo/<did>              -> JSON<RepoStatus> per-DID backfill and steady-state bookkeeping
 account/<did>           -> JSON<AccountStatus> hosting status, only present when non-active
 sync/<did>              -> JSON<SyncState> present while a resync is in progress
 replica/upstream_cursor -> uint64 (replica-only) last seq consumed from the upstream leader
 ```
 
-`RepoStatus` carries both initial-backfill state and steady-state bookkeeping with the following fields:
+`RepoStatus` carries both initial backfill state and steady-state bookkeeping with the following fields:
 
 ```go
 type Status string
@@ -531,6 +476,8 @@ We take the events from the sealed and active segment files in `./data/backfill/
 
 We ensure that we don't store any events out of order by checking the DID's `BackfillRev` from `repo/<did>` in the metadata store against the revs of the events we're compacting. We drop the events whose rev is less than or equal to `BackfillRev`. This also should ensure we don’t store duplicate events (though because of at-least-once semantics, this is not a strict requirement).
 
+We also must complete a tombstone compaction to account for record updates and deletions as well as account deletions (see Section 3.3).
+
 After the last surviving event has been durably written:
 
 - We seal the active segment file in `./data/segments/`
@@ -543,7 +490,7 @@ Additionally, since the merge phase takes so3 time, at the end, we also scan the
 
 ### 4.3 Steady State Phase
 
-The steady-state phase simply consumes from the upstream firehose and writes events to the active segment file in the `./data/segments` directory as normal. Every so often, it compacts the lookaside file in to the sealed segments as described in Section 3.3.1.
+The steady-state phase simply consumes from the upstream firehose and writes events to the active segment file in the `./data/segments` directory as normal. Every so often, it compacts updates and deltions in to the sealed segments as described in Section 3.3.
 
 Every block seal commits a single pebble batch that advances `relay/cursor` and refreshes `repo/<did>.LatestRev` for every DID in the block. We always fsync the segment block first and then commit the pebble batch with `sync=true`, so the persisted cursor can never get ahead of the durable event data. A crash between the two steps is handled by the active-segment recovery path described in Section 3.1, and the upstream resumes from whatever cursor pebble last saw.
 
@@ -555,7 +502,7 @@ As noted in Section 3, all event types are stored in the segment files, not just
 
 Internally, Jetstream doesn't care about handles, identity updates, or hosting status, but consumers of the application certainly do. `#identity`, `#account`, and `#sync` events are stored in-line with `#commit` events in the same segment blocks and passed along to clients as they come over the firehose.
 
-Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we write a type=3 suppression entry (see Section 3.3) the lookaside file to hide the user's pre-divergence records and re-download their repo from scratch from the PDS, updating events past the DID specified in the sync event.
+Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we write one or more a tombstones (see Section 3.3) the lookaside file to hide the user's pre-divergence records and re-download their repo from scratch from the PDS, updating events past the DID specified in the sync event.
 
 ## 5. Client Protocol and Libraries
 
@@ -563,7 +510,7 @@ We ship client libraries in TypeScript and Go. They are relatively "thick" in th
 
 For the live-tail use-case, clients are simple: it's compatible with the existing Jetstream v1 WebSocket JSON payload and query parameters. Existing Jetstream v1 consumers will continue to work as-is (i.e. no client wrapper library is even needed for those simple use-cases).
 
-It gets more complicated when the caller requests data that is older than the current active segment. The client asks the server something like "I want all likes since 2024", and the server begins sending over the sealed segment files in order, the lookaside file and its updates, and then seamlessly cuts over to the live websocket payload. That cutover is transparent to callers, who use a Go `iter.Seq2` or a TypeScript async iterable to provide an excellent devex.
+It gets more complicated when the caller requests data that is older than the current active segment. The client asks the server something like "I want all likes since 2024", and the server begins sending over the sealed segment files in order, the update/deletion tombstones, and then seamlessly cuts over to the live websocket payload. That cutover is transparent to callers, who use a Go `iter.Seq2` or a TypeScript async iterable to provide an excellent devex.
 
 Most callers will want to use the client wrapper (even for the trivial use case) so they don't need to repeatedly implement the same websocket logic, and may seamlessly handle the case where they want to perform backfill some day.
 
@@ -610,6 +557,8 @@ Subscribers that need everything Jetstream knows about an event can opt in by ap
 - `seq`: Jetstream's own monotonic 64-bit cursor assigned to this event at ingestion time.
 - `upstream_relay_cursor`: the upstream relay firehose cursor this event came from. Useful to any subscriber that wants to eventually promote itself into a primary and pick up from the relay with minimal overlap.
 - `commit.record_cbor`: the raw DAG-CBOR payload of the record, base64-encoded. Only populated for `kind: "commit"`. This is the byte-exact form written to the segment file, suitable for verifying against a PDS or reconstructing the MST.
+- TODO: `#sync` events (Fig suggestion)
+- TODO: `prevRev`  on all events (Fig suggestion)
 
 A replica is just an extended-mode subscriber with the additional behavior of writing what it receives into its own segments. See Section 6.
 
@@ -618,7 +567,7 @@ On extended connections, the stream also interleaves control events that don't f
 ```
 kind values (extended-only):
   segment_sealed      upstream sealed a segment file
-  segment_compacted   upstream rewrote a previously-sealed segment (lookaside compaction
+  segment_compacted   upstream rewrote a previously-sealed segment (tombstone compaction
                       or timestamp import)
   backfill_complete   a DID's initial backfill finished successfully
   heartbeat           keepalive; carries cursor values for liveness detection
@@ -683,7 +632,7 @@ To work around this, we are creating an optional bulk indexed at timestamp API w
 
 Only the operator of jetstream may alter timestamps. This is an authenticated feature.
 
-Rather than maintaining a separate timestamp table that has to be kept in sync alongside segments and replicated on its own channel, we apply timestamp imports directly into segment files as part of the upload operation. The flow is: the operator POSTs a large CSV; the server buckets the URIs by DID; the segment-level DID bloom narrows to candidate segments; the per-block DID blooms narrow to candidate blocks; and each candidate block is decompressed, its `rendered_at` column is patched for the matching rows, and the block is re-encoded. This is the same filtering and rewrite machinery used for lookaside compaction (Section 3.3.1), so there's nothing new to build at the storage layer.
+Rather than maintaining a separate timestamp table that has to be kept in sync alongside segments and replicated on its own channel, we apply timestamp imports directly into segment files as part of the upload operation. The flow is: the operator POSTs a large CSV; the server buckets the URIs by DID; the segment-level DID bloom narrows to candidate segments; the per-block DID blooms narrow to candidate blocks; and each candidate block is decompressed, its `rendered_at` column is patched for the matching rows, and the block is re-encoded.
 
 We require uploads to be keyed by AT URI rather than by CID. URIs contain the DID, which lets us use the existing segment-level DID bloom to do almost all the filtering work. CID-keyed imports would force either a full scan of every segment or a second per-segment bloom over CIDs; both are expensive enough that it's not worth paying for unless we see a concrete need. Operators that only have CIDs can resolve them upstream before uploading.
 
@@ -736,5 +685,3 @@ Once the compaction pass has rewritten all affected segments and resealed them w
 NOTE (jrc): we should treat the existing jetstream HTTP API surface as legacy, and is only there for backwards compatability. We will instead be building on XRPC. We’ll maintain the old surface, but also duplicate the existing API to XRPC, and all net-new stuff will be XRPC.
 
 NOTE (jrc): clarify rendered at vs. indexed at. it should not leak through to the user at all
-
-NOTE (jrc): call the “lookaside” file the “op log”
