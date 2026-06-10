@@ -6,12 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"sync"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"golang.org/x/sync/errgroup"
 )
 
 type compactionMode uint8
@@ -24,6 +29,12 @@ const (
 type sealedCompactionSegment struct {
 	ingest.SegmentFile
 	header segment.Header
+}
+
+type compactionRewriteResult struct {
+	file            sealedCompactionSegment
+	result          segment.RewriteResult
+	droppedByReason map[string]uint64
 }
 
 func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionMode) error {
@@ -124,6 +135,10 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 					return err
 				}
 			}
+			if err := o.simulateCrash(ctx, crashpoint.AfterCompactionRewriteBeforeWatermark); err != nil {
+				retErr = err
+				return err
+			}
 
 			if err := saveCompactionWatermark(o.cfg.Store, chunkEnd); err != nil {
 				retErr = err
@@ -135,6 +150,10 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			if o.cfg.Tombstones != nil {
 				o.cfg.Tombstones.Evict(chunkEnd)
 				o.cfg.Metrics.setCompactionTombstoneSet(o.cfg.Tombstones.Len())
+			}
+			if err := o.simulateCrash(ctx, crashpoint.AfterCompactionChunkWatermark); err != nil {
+				retErr = err
+				return err
 			}
 			current = chunkEnd
 		}
@@ -187,35 +206,77 @@ func (o *Orchestrator) collectCompactionTombstones(ctx context.Context, sealed [
 }
 
 func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealedCompactionSegment, snap tombstone.Snapshot, chunkEnd uint64, mode compactionMode) error {
+	candidateDIDs := compactionCandidateDIDs(snap)
+	workers := o.cfg.CompactionRewriteWorkers
+	if workers <= 0 {
+		workers = defaultCompactionRewriteWorkers()
+	}
+	workers = min(workers, len(sealed))
+	if workers <= 0 {
+		return nil
+	}
+
+	jobs := make(chan sealedCompactionSegment)
+	var (
+		mu      sync.Mutex
+		results []compactionRewriteResult
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	for range workers {
+		g.Go(func() error {
+			for f := range jobs {
+				if err := gctx.Err(); err != nil {
+					return err
+				}
+				o.cfg.Metrics.incCompactionSegmentsExamined()
+				droppedByReason := map[string]uint64{}
+				res, err := segment.Rewrite(f.Path, func(ev *segment.Event) segment.RowDecision {
+					if ev.Seq > chunkEnd {
+						return segment.RowKeep
+					}
+					if drop, reason := snap.ShouldDrop(ev); drop {
+						droppedByReason[reason]++
+						return segment.RowDrop
+					}
+					return segment.RowKeep
+				}, segment.RewriteOptions{CrashInjector: o.cfg.CrashInjector, CandidateDIDs: candidateDIDs})
+				if err != nil {
+					return fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err)
+				}
+				mu.Lock()
+				results = append(results, compactionRewriteResult{file: f, result: res, droppedByReason: droppedByReason})
+				mu.Unlock()
+			}
+			return nil
+		})
+	}
 	for _, f := range sealed {
-		if err := ctx.Err(); err != nil {
-			return err
+		select {
+		case jobs <- f:
+		case <-gctx.Done():
+			close(jobs)
+			return g.Wait()
 		}
-		o.cfg.Metrics.incCompactionSegmentsExamined()
-		droppedByReason := map[string]uint64{}
-		res, err := segment.Rewrite(f.Path, func(ev *segment.Event) segment.RowDecision {
-			if ev.Seq > chunkEnd {
-				return segment.RowKeep
-			}
-			if drop, reason := snap.ShouldDrop(ev); drop {
-				droppedByReason[reason]++
-				return segment.RowDrop
-			}
-			return segment.RowKeep
-		}, segment.RewriteOptions{})
-		if err != nil {
-			return fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err)
-		}
-		if res.Rewritten {
+	}
+	close(jobs)
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].file.Idx < results[j].file.Idx
+	})
+
+	for _, r := range results {
+		if r.result.Rewritten {
 			o.cfg.Metrics.incCompactionSegmentsRewritten()
-			for reason, n := range droppedByReason {
+			for reason, n := range r.droppedByReason {
 				o.cfg.Metrics.addCompactionRowsDropped(reason, n)
 			}
-			if info, err := os.Stat(f.Path); err == nil {
+			if info, err := os.Stat(r.file.Path); err == nil {
 				o.cfg.Metrics.addCompactionBytesRewritten(info.Size())
 			}
 			if mode == compactionSteady && o.cfg.OnSegmentCompacted != nil {
-				if err := o.cfg.OnSegmentCompacted(f.Idx, f.Path); err != nil {
+				if err := o.cfg.OnSegmentCompacted(r.file.Idx, r.file.Path); err != nil {
 					return fmt.Errorf("orchestrator: compaction: refresh manifest: %w", err)
 				}
 				o.cfg.Metrics.incCompactionManifestReconciled()
@@ -225,6 +286,37 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
 		}
 	}
 	return nil
+}
+
+func compactionCandidateDIDs(snap tombstone.Snapshot) []string {
+	seen := make(map[string]struct{}, len(snap.Records)+len(snap.DIDs))
+	dids := make([]string, 0, len(snap.Records)+len(snap.DIDs))
+	for key := range snap.Records {
+		if key.DID == "" {
+			continue
+		}
+		if _, ok := seen[key.DID]; ok {
+			continue
+		}
+		seen[key.DID] = struct{}{}
+		dids = append(dids, key.DID)
+	}
+	for did := range snap.DIDs {
+		if did == "" {
+			continue
+		}
+		if _, ok := seen[did]; ok {
+			continue
+		}
+		seen[did] = struct{}{}
+		dids = append(dids, did)
+	}
+	sort.Strings(dids)
+	return dids
+}
+
+func defaultCompactionRewriteWorkers() int {
+	return min(runtime.NumCPU(), 8)
 }
 
 func (o *Orchestrator) runSteadyCompactor(ctx context.Context) error {

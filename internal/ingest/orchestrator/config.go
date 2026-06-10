@@ -162,6 +162,10 @@ type Config struct {
 	// chunking lands with the live tombstone set integration.
 	CompactionTombstoneCap int
 
+	// CompactionRewriteWorkers bounds per-segment rewrite parallelism during a
+	// compaction chunk. Zero selects the default min(runtime.NumCPU(), 8).
+	CompactionRewriteWorkers int
+
 	// OnCompactionPass, if non-nil, fires after each enabled compaction pass
 	// attempt, including no-op and failed passes. Test/oracle hook only;
 	// production leaves it nil.

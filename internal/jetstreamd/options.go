@@ -62,6 +62,7 @@ type Options struct {
 	CursorBlockIndexCacheSize int
 	CompactionInterval        time.Duration
 	CompactionTombstoneCap    int
+	CompactionRewriteWorkers  int
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
 	OnCompactionPass          func(CompactionPassResult)

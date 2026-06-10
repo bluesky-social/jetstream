@@ -1,10 +1,13 @@
 package segment
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/stretchr/testify/require"
 )
 
@@ -67,4 +70,77 @@ func TestRewriteZeroDropLeavesFileUntouched(t *testing.T) {
 	after, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, before, after)
+}
+
+func TestRewriteCandidateDIDsSkipDisjointSegment(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := sealedSegmentForReader(t, dir, []Event{{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a"}}, 2)
+	res, err := Rewrite(path, func(*Event) RowDecision {
+		t.Fatal("decider must not run when candidate DIDs miss the segment bloom")
+		return RowKeep
+	}, RewriteOptions{CandidateDIDs: []string{"did:plc:not-present"}})
+	require.NoError(t, err)
+	require.False(t, res.Rewritten)
+}
+
+func TestRewriteCrashSeams(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name              string
+		point             crashpoint.Point
+		wantRewrittenFile bool
+	}{
+		{name: "temp written", point: crashpoint.AfterSegmentRewriteTempWritten, wantRewrittenFile: false},
+		{name: "temp synced", point: crashpoint.AfterSegmentRewriteTempSynced, wantRewrittenFile: false},
+		{name: "renamed", point: crashpoint.AfterSegmentRewriteRenamed, wantRewrittenFile: true},
+		{name: "dir synced", point: crashpoint.AfterSegmentRewriteDirSynced, wantRewrittenFile: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := sealedSegmentForReader(t, t.TempDir(), []Event{
+				{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a"},
+				{Seq: 2, IndexedAt: 20, Kind: KindDelete, DID: "did:plc:a"},
+			}, 2)
+
+			crashErr := errors.New("simulated segment rewrite crash")
+			_, err := Rewrite(path, func(ev *Event) RowDecision {
+				if ev.Kind == KindCreate {
+					return RowDrop
+				}
+				return RowKeep
+			}, RewriteOptions{CrashInjector: rewritePointInjector{point: tc.point, err: crashErr}})
+			require.ErrorIs(t, err, crashErr)
+
+			r, err := Open(ReaderConfig{Path: path})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = r.Close() })
+			require.EqualValues(t, 1, r.Header().BlockCount)
+			if tc.wantRewrittenFile {
+				require.EqualValues(t, 1, r.Header().EventCount)
+				block, err := r.DecodeBlock(0)
+				require.NoError(t, err)
+				require.Len(t, block, 1)
+				require.Equal(t, KindDelete, block[0].Kind)
+			} else {
+				require.EqualValues(t, 2, r.Header().EventCount)
+				block, err := r.DecodeBlock(0)
+				require.NoError(t, err)
+				require.Len(t, block, 2)
+			}
+		})
+	}
+}
+
+type rewritePointInjector struct {
+	point crashpoint.Point
+	err   error
+}
+
+func (i rewritePointInjector) SimulateCrash(_ context.Context, point crashpoint.Point) error {
+	if point == i.point {
+		return i.err
+	}
+	return nil
 }

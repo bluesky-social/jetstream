@@ -1,11 +1,14 @@
 package segment
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"os"
+
+	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 )
 
 type RowDecision uint8
@@ -15,7 +18,10 @@ const (
 	RowDrop
 )
 
-type RewriteOptions struct{}
+type RewriteOptions struct {
+	CrashInjector crashpoint.Injector
+	CandidateDIDs []string
+}
 
 type RewriteResult struct {
 	Rewritten     bool
@@ -42,6 +48,9 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	src := r.file
 	header := r.Header()
 	blocks := r.Blocks()
+	if len(opts.CandidateDIDs) > 0 && !segmentBloomMayContainAny(r, opts.CandidateDIDs) {
+		return RewriteResult{Header: header}, nil
+	}
 	var perBlockParams *bloomParams
 	if len(blocks) > 0 {
 		firstBloom, err := r.BlockBloom(0)
@@ -186,8 +195,14 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if _, err := f.WriteAt(headerBytes, 0); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite write header: %w", err)
 	}
+	if err := simulateRewriteCrash(opts, crashpoint.AfterSegmentRewriteTempWritten); err != nil {
+		return RewriteResult{}, err
+	}
 	if err := syncFile(f); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite fsync tmp: %w", err)
+	}
+	if err := simulateRewriteCrash(opts, crashpoint.AfterSegmentRewriteTempSynced); err != nil {
+		return RewriteResult{}, err
 	}
 	if err := f.Close(); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite close tmp: %w", err)
@@ -195,7 +210,13 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if err := os.Rename(tmp, path); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite rename: %w", err)
 	}
+	if err := simulateRewriteCrash(opts, crashpoint.AfterSegmentRewriteRenamed); err != nil {
+		return RewriteResult{}, err
+	}
 	if err := syncParentDir(path); err != nil {
+		return RewriteResult{}, err
+	}
+	if err := simulateRewriteCrash(opts, crashpoint.AfterSegmentRewriteDirSynced); err != nil {
 		return RewriteResult{}, err
 	}
 	success = true
@@ -207,6 +228,26 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 		NewChecksum:   checksum,
 		Header:        newHeader,
 	}, nil
+}
+
+func segmentBloomMayContainAny(r *Reader, dids []string) bool {
+	bloom := r.SegmentBloom()
+	if bloom == nil {
+		return true
+	}
+	for _, did := range dids {
+		if did != "" && bloom.TestString(did) {
+			return true
+		}
+	}
+	return false
+}
+
+func simulateRewriteCrash(opts RewriteOptions, point crashpoint.Point) error {
+	if opts.CrashInjector == nil {
+		return nil
+	}
+	return opts.CrashInjector.SimulateCrash(context.Background(), point)
 }
 
 func readSealedFrame(f io.ReaderAt, b BlockInfo) ([]byte, error) {

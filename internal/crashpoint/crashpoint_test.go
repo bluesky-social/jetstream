@@ -42,7 +42,7 @@ func TestAllPointsRoundTripAndAreKnown(t *testing.T) {
 
 	// Pin the count so adding a constant without updating AllPoints
 	// (and this test) is a conscious, reviewed change.
-	require.Len(t, AllPoints, 6)
+	require.Len(t, AllPoints, 12)
 
 	seen := make(map[Point]struct{}, len(AllPoints))
 	for _, p := range AllPoints {

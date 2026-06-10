@@ -138,6 +138,10 @@ oracle-sweep SEEDS="10":
 bench *ARGS="./...":
     go test -bench=. -benchmem -count=1 -run='^$' {{ARGS}}
 
+# Runs synthetic delete-compaction benchmarks.
+bench-compaction *ARGS="":
+    go test -bench='Compaction' -benchmem -count=1 -run='^$' ./internal/ingest/orchestrator {{ARGS}}
+
 # Runs fuzz tests for the given duration (default 10s per target)
 fuzz DURATION="10s" *ARGS="./...":
     #!/usr/bin/env bash

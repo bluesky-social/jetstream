@@ -80,6 +80,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 60*time.Second, opts.SubscribeSlowWindow)
 	require.Equal(t, float64(5), opts.SubscribeSlowMinRate)
 	require.Equal(t, 32, opts.CursorBlockIndexCacheSize)
+	require.Equal(t, 0, opts.CompactionRewriteWorkers)
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
@@ -114,6 +115,9 @@ func withClearedEnv(t *testing.T) {
 		"JETSTREAM_SUBSCRIBE_SLOW_WINDOW",
 		"JETSTREAM_SUBSCRIBE_SLOW_MIN_RATE",
 		"JETSTREAM_CURSOR_BLOCK_INDEX_CACHE_SIZE",
+		"JETSTREAM_COMPACTION_INTERVAL",
+		"JETSTREAM_COMPACTION_TOMBSTONE_CAP",
+		"JETSTREAM_COMPACTION_REWRITE_WORKERS",
 	} {
 		if prev, ok := os.LookupEnv(key); ok {
 			require.NoError(t, os.Unsetenv(key))
@@ -162,6 +166,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--subscribe-slow-window=22s",
 		"--subscribe-slow-min-rate=9.5",
 		"--cursor-block-index-cache-size=99",
+		"--compaction-rewrite-workers=3",
 	}))
 	require.Equal(t, "127.0.0.1:18080", opts.PublicAddr)
 	require.Equal(t, "127.0.0.1:16060", opts.DebugAddr)
@@ -185,6 +190,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 22*time.Second, opts.SubscribeSlowWindow)
 	require.Equal(t, 9.5, opts.SubscribeSlowMinRate)
 	require.Equal(t, 99, opts.CursorBlockIndexCacheSize)
+	require.Equal(t, 3, opts.CompactionRewriteWorkers)
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)

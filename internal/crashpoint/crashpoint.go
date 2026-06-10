@@ -47,6 +47,33 @@ const (
 	// but before the steady-state live consumer starts. Recovery must dispatch
 	// directly to steady-state without rerunning bootstrap or merge.
 	AfterSteadyPhaseBeforeSteadyRun Point = "after-steady-phase-before-steady-run"
+
+	// AfterCompactionRewriteBeforeWatermark fires after a compaction chunk has
+	// rewritten all candidate segments but before compaction/seq advances.
+	// Recovery must rerun the chunk idempotently and then advance the watermark.
+	AfterCompactionRewriteBeforeWatermark Point = "after-compaction-rewrite-before-watermark"
+
+	// AfterCompactionChunkWatermark fires after a compaction chunk's
+	// compaction/seq watermark has been durably advanced. Recovery must resume
+	// at the next chunk without reintroducing already-applied tombstones.
+	AfterCompactionChunkWatermark Point = "after-compaction-chunk-watermark"
+
+	// AfterSegmentRewriteTempWritten fires after a segment rewrite has written
+	// all bytes to the temporary replacement file but before fsyncing it.
+	AfterSegmentRewriteTempWritten Point = "after-segment-rewrite-temp-written"
+
+	// AfterSegmentRewriteTempSynced fires after a segment rewrite has fsynced
+	// the temporary replacement file but before renaming it over the original.
+	AfterSegmentRewriteTempSynced Point = "after-segment-rewrite-temp-synced"
+
+	// AfterSegmentRewriteRenamed fires after a segment rewrite has renamed the
+	// replacement file over the original but before fsyncing the parent dir.
+	AfterSegmentRewriteRenamed Point = "after-segment-rewrite-renamed"
+
+	// AfterSegmentRewriteDirSynced fires after a segment rewrite has fsynced
+	// the parent dir. The replacement is durable; callers must still tolerate
+	// receiving an error at this checkpoint.
+	AfterSegmentRewriteDirSynced Point = "after-segment-rewrite-dir-synced"
 )
 
 // AllPoints is the single source of truth for the set of declared
@@ -60,6 +87,12 @@ var AllPoints = []Point{
 	AfterMergeDiscoveryBeforeCleanup,
 	AfterBootstrapLiveCloseBeforeSeal,
 	AfterSteadyPhaseBeforeSteadyRun,
+	AfterCompactionRewriteBeforeWatermark,
+	AfterCompactionChunkWatermark,
+	AfterSegmentRewriteTempWritten,
+	AfterSegmentRewriteTempSynced,
+	AfterSegmentRewriteRenamed,
+	AfterSegmentRewriteDirSynced,
 }
 
 var knownPoints = func() map[Point]struct{} {

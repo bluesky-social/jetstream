@@ -277,6 +277,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_COMPACTION_TOMBSTONE_CAP"),
 				Value:   32_000_000,
 			},
+			&cli.IntFlag{
+				Name:    "compaction-rewrite-workers",
+				Usage:   "Maximum sealed segments rewritten concurrently during compaction. 0 uses min(NumCPU, 8).",
+				Sources: cli.EnvVars("JETSTREAM_COMPACTION_REWRITE_WORKERS"),
+				Value:   0,
+			},
 		},
 		Action: runServe,
 	}
@@ -317,6 +323,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		CursorBlockIndexCacheSize: cmd.Int("cursor-block-index-cache-size"),
 		CompactionInterval:        cmd.Duration("compaction-interval"),
 		CompactionTombstoneCap:    cmd.Int("compaction-tombstone-cap"),
+		CompactionRewriteWorkers:  cmd.Int("compaction-rewrite-workers"),
 	}, nil
 }
 

@@ -69,6 +69,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.CompactionTombstoneCap < 0 {
 		return nil, fmt.Errorf("serve: --compaction-tombstone-cap must be >= 0 (CompactionTombstoneCap must be >= 0), got %d", opts.CompactionTombstoneCap)
 	}
+	if opts.CompactionRewriteWorkers < 0 {
+		return nil, fmt.Errorf("serve: --compaction-rewrite-workers must be >= 0 (CompactionRewriteWorkers must be >= 0), got %d", opts.CompactionRewriteWorkers)
+	}
 
 	processLogger, err := obs.BuildLoggerFromStrings(opts.LogOutput, opts.LogLevel, opts.LogFormat)
 	if err != nil {
@@ -271,23 +274,24 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		// Bare logger; orchestrator.New attaches component=orchestrator
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.
-		Logger:                 processLogger,
-		Metrics:                orchestrator.NewMetrics(metrics.Registry),
-		IngestMetrics:          ingest.NewMetrics(metrics.Registry),
-		LiveMetrics:            live.NewMetrics(metrics.Registry),
-		BackfillMetrics:        backfill.NewMetrics(metrics.Registry),
-		SegmentMetrics:         segmentMetrics,
-		OnEvent:                onSteadyStateEvent,
-		OnBootstrapLiveEvent:   opts.OnBootstrapLiveEvent,
-		MaxBackfillRepos:       opts.MaxBackfillRepos,
-		BackfillRepos:          opts.BackfillRepos,
-		SkipMergeDiscovery:     opts.SkipMergeDiscovery,
-		BackfillRetryBaseDelay: opts.BackfillRetryBaseDelay,
-		LiveReconnectBackoff:   opts.LiveReconnectBackoff,
-		IngestOnAfterSeal:      mft.OnSegmentSealed,
-		OnSegmentCompacted:     mft.OnSegmentSealed,
-		CompactionInterval:     opts.CompactionInterval,
-		CompactionTombstoneCap: opts.CompactionTombstoneCap,
+		Logger:                   processLogger,
+		Metrics:                  orchestrator.NewMetrics(metrics.Registry),
+		IngestMetrics:            ingest.NewMetrics(metrics.Registry),
+		LiveMetrics:              live.NewMetrics(metrics.Registry),
+		BackfillMetrics:          backfill.NewMetrics(metrics.Registry),
+		SegmentMetrics:           segmentMetrics,
+		OnEvent:                  onSteadyStateEvent,
+		OnBootstrapLiveEvent:     opts.OnBootstrapLiveEvent,
+		MaxBackfillRepos:         opts.MaxBackfillRepos,
+		BackfillRepos:            opts.BackfillRepos,
+		SkipMergeDiscovery:       opts.SkipMergeDiscovery,
+		BackfillRetryBaseDelay:   opts.BackfillRetryBaseDelay,
+		LiveReconnectBackoff:     opts.LiveReconnectBackoff,
+		IngestOnAfterSeal:        mft.OnSegmentSealed,
+		OnSegmentCompacted:       mft.OnSegmentSealed,
+		CompactionInterval:       opts.CompactionInterval,
+		CompactionTombstoneCap:   opts.CompactionTombstoneCap,
+		CompactionRewriteWorkers: opts.CompactionRewriteWorkers,
 		OnCompactionPass: func(result orchestrator.CompactionPassResult) {
 			if opts.OnCompactionPass != nil {
 				opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})

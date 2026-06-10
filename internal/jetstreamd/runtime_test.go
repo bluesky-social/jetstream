@@ -21,6 +21,15 @@ func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
 	require.ErrorContains(t, err, "SegmentCacheMaxAge must be >= 0")
 }
 
+func TestOptionsValidateRejectsNegativeCompactionRewriteWorkers(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions(t)
+	opts.CompactionRewriteWorkers = -1
+	_, err := Build(t.Context(), opts)
+	require.ErrorContains(t, err, "CompactionRewriteWorkers must be >= 0")
+}
+
 func TestOptionsExposeAfterRepoCompleteHook(t *testing.T) {
 	t.Parallel()
 
