@@ -37,6 +37,21 @@ func TestReconstructPurgesDeletedAccount(t *testing.T) {
 	require.Empty(t, got.Accounts["did:plc:a"].Records)
 }
 
+func TestReconstructPurgesSyncedRepo(t *testing.T) {
+	t.Parallel()
+
+	events := []ObservedEvent{
+		{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "old", Payload: []byte("old")},
+		{Seq: 2, Kind: segment.KindSync, DID: "did:plc:a", Rev: "r2"},
+		{Seq: 3, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "new", Rev: "r2", Payload: []byte("new")},
+	}
+
+	got, err := Reconstruct(events)
+	require.NoError(t, err)
+	require.NotContains(t, got.Accounts["did:plc:a"].Records, RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "old"})
+	require.Equal(t, RecordValue{Rev: "r2", Payload: []byte("new")}, got.Accounts["did:plc:a"].Records[RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "new"}])
+}
+
 func TestReconstructRetainsNonDeletedAccountStatuses(t *testing.T) {
 	t.Parallel()
 

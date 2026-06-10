@@ -15,6 +15,10 @@ func Reconstruct(events []ObservedEvent) (*Model, error) {
 			}
 			continue
 		}
+		if ev.Kind == segment.KindSync {
+			model.Accounts[ev.DID] = RepoSnapshot{Records: make(map[RecordKey]RecordValue)}
+			continue
+		}
 		if !isCommitKind(ev.Kind) {
 			continue
 		}
