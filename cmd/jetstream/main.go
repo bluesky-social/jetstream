@@ -57,11 +57,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/jcalabro/atmos"
 	"github.com/urfave/cli/v3"
 )
 
@@ -109,6 +111,7 @@ func newApp() *cli.Command {
 			versionCommand(),
 			inspectSegmentCommand(),
 			inspectAllCommand(),
+			verifyRepoCommand(),
 		},
 	}
 }
@@ -202,6 +205,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_MAX_BACKFILL_REPOS"),
 				Value:   0,
 			},
+			&cli.StringFlag{
+				Name:    "backfill-repos",
+				Usage:   "DEBUG ONLY: comma-separated DID list to backfill instead of walking listRepos. Empty = normal production behavior.",
+				Sources: cli.EnvVars("JETSTREAM_BACKFILL_REPOS"),
+				Value:   "",
+			},
 			&cli.BoolFlag{
 				Name:    "skip-merge-discovery",
 				Usage:   "DEBUG ONLY: skip the end-of-merge listRepos rescan that discovers accounts created during the merge phase. Intended for fast local-dev iteration against the production relay's millions of users; safe to leave set in production but unnecessary there.",
@@ -261,7 +270,16 @@ func serveCommand() *cli.Command {
 	}
 }
 
-func serveOptionsFromCommand(cmd *cli.Command) jetstreamd.Options {
+func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
+	backfillRepos, err := parseBackfillRepos(cmd.String("backfill-repos"))
+	if err != nil {
+		return jetstreamd.Options{}, err
+	}
+	maxBackfillRepos := cmd.Int("max-backfill-repos")
+	if len(backfillRepos) > 0 && maxBackfillRepos > 0 {
+		return jetstreamd.Options{}, fmt.Errorf("serve: --backfill-repos cannot be combined with --max-backfill-repos")
+	}
+
 	return jetstreamd.Options{
 		PublicAddr:                cmd.String("addr"),
 		DebugAddr:                 cmd.String("debug-addr"),
@@ -274,7 +292,8 @@ func serveOptionsFromCommand(cmd *cli.Command) jetstreamd.Options {
 		LogOutput:                 os.Stderr,
 		ShutdownTimeout:           cmd.Duration("shutdown-timeout"),
 		ClientDrainTimeout:        cmd.Duration("client-drain-timeout"),
-		MaxBackfillRepos:          cmd.Int("max-backfill-repos"),
+		MaxBackfillRepos:          maxBackfillRepos,
+		BackfillRepos:             backfillRepos,
 		SkipMergeDiscovery:        cmd.Bool("skip-merge-discovery"),
 		CursorLookback:            cmd.Duration("cursor-lookback"),
 		SegmentCacheMaxAge:        cmd.Duration("segment-cache-max-age"),
@@ -284,14 +303,43 @@ func serveOptionsFromCommand(cmd *cli.Command) jetstreamd.Options {
 		SubscribeSlowWindow:       cmd.Duration("subscribe-slow-window"),
 		SubscribeSlowMinRate:      cmd.Float("subscribe-slow-min-rate"),
 		CursorBlockIndexCacheSize: cmd.Int("cursor-block-index-cache-size"),
+	}, nil
+}
+
+func parseBackfillRepos(raw string) ([]atmos.DID, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
 	}
+	parts := strings.Split(raw, ",")
+	out := make([]atmos.DID, 0, len(parts))
+	seen := make(map[atmos.DID]struct{}, len(parts))
+	for i, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			return nil, fmt.Errorf("serve: --backfill-repos contains empty entry at position %d", i+1)
+		}
+		did, err := atmos.ParseDID(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("serve: --backfill-repos entry %d: %w", i+1, err)
+		}
+		if _, ok := seen[did]; ok {
+			return nil, fmt.Errorf("serve: --backfill-repos duplicate DID %s", did)
+		}
+		seen[did] = struct{}{}
+		out = append(out, did)
+	}
+	return out, nil
 }
 
 func runServe(ctx context.Context, cmd *cli.Command) error {
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	rt, err := jetstreamd.Build(runCtx, serveOptionsFromCommand(cmd))
+	opts, err := serveOptionsFromCommand(cmd)
+	if err != nil {
+		return err
+	}
+	rt, err := jetstreamd.Build(runCtx, opts)
 	if err != nil {
 		return err
 	}

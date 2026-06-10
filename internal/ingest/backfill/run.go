@@ -77,6 +77,13 @@ type Config struct {
 	// the same point.
 	MaxRepos int
 
+	// BackfillRepos, when non-empty, is a debug-only explicit DID list
+	// to download during bootstrap instead of walking listRepos. This is
+	// intended for targeted production smoke tests against a known repo.
+	// The normal Store, Handler, retry, verification, and completion
+	// paths are still used; only discovery is replaced.
+	BackfillRepos []atmos.DID
+
 	// MaxRetries, RetryBaseDelay, and RetryMaxDelay tune the engine's
 	// per-DID retry/backoff loop for transient getRepo failures. A zero
 	// value means "use atmos's default" (5 retries, 1s base, 30s cap),
@@ -146,6 +153,50 @@ func Run(ctx context.Context, cfg Config) error {
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 		handler.onWriterError = recordFatal
 		logger := cfg.Logger.With(slog.String("component", "backfill/run"))
+
+		if len(cfg.BackfillRepos) > 0 {
+			if err := DeleteBootstrapLastListReposCursor(cfg.Store); err != nil {
+				return fmt.Errorf("backfill: selected repo mode: %w", err)
+			}
+			logger.InfoContext(ctx, "starting selected repo backfill",
+				"relay", cfg.RelayURL,
+				"repos", len(cfg.BackfillRepos),
+			)
+			err := runSelectedRepos(runCtx, selectedReposConfig{
+				Repos:          cfg.BackfillRepos,
+				Store:          st,
+				Handler:        handler,
+				SyncClient:     sc,
+				Directory:      directory,
+				HTTPClient:     cfg.HTTPClient,
+				Metrics:        cfg.Metrics,
+				MaxRetries:     cfg.MaxRetries,
+				RetryBaseDelay: cfg.RetryBaseDelay,
+				RetryMaxDelay:  cfg.RetryMaxDelay,
+				OnError: func(did atmos.DID, err error) {
+					if !shouldLogBackfillError(err) {
+						return
+					}
+					logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
+					if errors.Is(err, errIdentityDiagnosticsPersistence) {
+						recordFatal(err)
+					}
+				},
+			})
+			if err != nil {
+				if fatal := loadFatal(); fatal != nil {
+					logger.ErrorContext(ctx, "selected repo backfill aborted after local writer error", "err", fatal)
+					return fmt.Errorf("backfill: %w", fatal)
+				}
+				logger.ErrorContext(ctx, "selected repo backfill returned error", "err", err)
+				return fmt.Errorf("backfill: %w", err)
+			}
+			if fatal := loadFatal(); fatal != nil {
+				logger.ErrorContext(ctx, "selected repo backfill aborted after local writer error", "err", fatal)
+				return fmt.Errorf("backfill: %w", fatal)
+			}
+			return nil
+		}
 
 		startCursor, err := LoadListReposCursor(cfg.Store)
 		if err != nil {

@@ -50,8 +50,9 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 			continue
 		}
 		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
-			opts = serveOptionsFromCommand(cmd)
-			return nil
+			var err error
+			opts, err = serveOptionsFromCommand(cmd)
+			return err
 		}
 		break
 	}
@@ -69,6 +70,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 30*time.Second, opts.ShutdownTimeout)
 	require.Equal(t, 10*time.Second, opts.ClientDrainTimeout)
 	require.Equal(t, 0, opts.MaxBackfillRepos)
+	require.Empty(t, opts.BackfillRepos)
 	require.False(t, opts.SkipMergeDiscovery)
 	require.Equal(t, 36*time.Hour, opts.CursorLookback)
 	require.Equal(t, 0*time.Second, opts.SegmentCacheMaxAge)
@@ -102,6 +104,7 @@ func withClearedEnv(t *testing.T) {
 		"JETSTREAM_SHUTDOWN_TIMEOUT",
 		"JETSTREAM_CLIENT_DRAIN_TIMEOUT",
 		"JETSTREAM_MAX_BACKFILL_REPOS",
+		"JETSTREAM_BACKFILL_REPOS",
 		"JETSTREAM_SKIP_MERGE_DISCOVERY",
 		"JETSTREAM_CURSOR_LOOKBACK",
 		"JETSTREAM_SEGMENT_CACHE_MAX_AGE",
@@ -129,8 +132,9 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 			continue
 		}
 		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
-			opts = serveOptionsFromCommand(cmd)
-			return nil
+			var err error
+			opts, err = serveOptionsFromCommand(cmd)
+			return err
 		}
 		break
 	}
@@ -148,7 +152,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--otel-service-name=jetstream-test",
 		"--shutdown-timeout=45s",
 		"--client-drain-timeout=11s",
-		"--max-backfill-repos=17",
+		"--backfill-repos=did:plc:aaa, did:plc:bbb",
 		"--skip-merge-discovery",
 		"--cursor-lookback=7h",
 		"--segment-cache-max-age=13s",
@@ -170,7 +174,8 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Same(t, os.Stderr, opts.LogOutput)
 	require.Equal(t, 45*time.Second, opts.ShutdownTimeout)
 	require.Equal(t, 11*time.Second, opts.ClientDrainTimeout)
-	require.Equal(t, 17, opts.MaxBackfillRepos)
+	require.Equal(t, 0, opts.MaxBackfillRepos)
+	require.Equal(t, []atmos.DID{"did:plc:aaa", "did:plc:bbb"}, opts.BackfillRepos)
 	require.True(t, opts.SkipMergeDiscovery)
 	require.Equal(t, 7*time.Hour, opts.CursorLookback)
 	require.Equal(t, 13*time.Second, opts.SegmentCacheMaxAge)
@@ -183,6 +188,54 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
+}
+
+func TestServeOptionsFromCLI_RejectsBackfillReposWithMaxBackfillRepos(t *testing.T) {
+	t.Parallel()
+
+	err := newApp().Run(t.Context(), []string{
+		"jetstream", "serve",
+		"--max-backfill-repos=1",
+		"--backfill-repos=did:plc:aaa",
+	})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "--backfill-repos cannot be combined with --max-backfill-repos")
+}
+
+func TestServeOptionsFromCLI_MaxBackfillReposOverride(t *testing.T) {
+	t.Parallel()
+
+	app := newApp()
+	var opts jetstreamd.Options
+	for _, cmd := range app.Commands {
+		if cmd.Name != "serve" {
+			continue
+		}
+		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			opts, err = serveOptionsFromCommand(cmd)
+			return err
+		}
+		break
+	}
+
+	require.NoError(t, app.Run(t.Context(), []string{
+		"jetstream", "serve",
+		"--max-backfill-repos=17",
+	}))
+	require.Equal(t, 17, opts.MaxBackfillRepos)
+	require.Empty(t, opts.BackfillRepos)
+}
+
+func TestServeOptionsFromCLI_RejectsDuplicateBackfillRepos(t *testing.T) {
+	t.Parallel()
+
+	err := newApp().Run(t.Context(), []string{
+		"jetstream", "serve",
+		"--backfill-repos=did:plc:aaa,did:plc:aaa",
+	})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "duplicate DID")
 }
 
 // TestServe_BootstrapsAndShutsDownCleanly is the wiring smoke test:

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream-v2/internal/repoexport"
 	"github.com/bluesky-social/jetstream-v2/internal/status"
 	"github.com/bluesky-social/jetstream-v2/internal/web"
 	"github.com/stretchr/testify/require"
@@ -24,6 +25,19 @@ type fakeSnapshotter struct {
 func (f *fakeSnapshotter) SnapshotForRequest(_ context.Context, req status.Request) (*status.Snapshot, error) {
 	f.lastReq = req
 	return f.snap, f.err
+}
+
+type fakeRepoActions struct {
+	verifyReport repoexport.VerifyReport
+	verifyErr    error
+	verifyCalls  int
+	verifyDID    string
+}
+
+func (f *fakeRepoActions) VerifyRepo(_ context.Context, did string) (repoexport.VerifyReport, error) {
+	f.verifyCalls++
+	f.verifyDID = did
+	return f.verifyReport, f.verifyErr
 }
 
 func newFixtureSnap() *status.Snapshot {
@@ -318,6 +332,115 @@ func TestHandler_RendersAccountsTabWithHandleQuery(t *testing.T) {
 	require.Contains(t, body, "pds.example.com")
 	require.Contains(t, body, "Host context")
 	require.Contains(t, body, "boom")
+}
+
+func TestHandler_AutoVerifiesFoundAccount(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "accounts", DID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}
+	s.Account = status.AccountLookup{
+		Query:    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Found:    true,
+		DID:      "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Backfill: "complete",
+	}
+	actions := &fakeRepoActions{
+		verifyReport: repoexport.VerifyReport{
+			DID:               "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+			Match:             true,
+			AuthoritativeRev:  "3abc",
+			AuthoritativeRoot: "bafy-authoritative",
+			LocalLatestRev:    "3abc",
+			LocalRoot:         "bafy-authoritative",
+			LocalRecordCount:  42,
+		},
+	}
+	h, err := web.New(web.Options{Snapshotter: &fakeSnapshotter{snap: s}, RepoActions: actions})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&did=did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	body := rr.Body.String()
+	require.NotContains(t, body, `name="repo_action" value="verify"`)
+	require.NotContains(t, body, ">Verify<")
+	require.NotContains(t, body, "Export CAR")
+	require.NotContains(t, body, "/status/repo/export")
+	require.Equal(t, 1, actions.verifyCalls)
+	require.Equal(t, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", actions.verifyDID)
+	require.Contains(t, body, "Repo verification")
+	require.Contains(t, body, "match")
+	require.Contains(t, body, "authoritative rev")
+	require.Contains(t, body, "3abc")
+	require.Contains(t, body, "local records")
+	require.Contains(t, body, "42")
+}
+
+func TestHandler_RateLimitsAutomaticRepoVerificationBySourceIP(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "accounts", DID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}
+	s.Account = status.AccountLookup{
+		Query:    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Found:    true,
+		DID:      "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Backfill: "complete",
+	}
+	actions := &fakeRepoActions{}
+	h, err := web.New(web.Options{
+		Snapshotter: &fakeSnapshotter{snap: s},
+		RepoActions: actions,
+		RepoActionRateLimit: web.RateLimit{
+			Limit:  1,
+			Window: time.Hour,
+		},
+	})
+	require.NoError(t, err)
+
+	first := httptest.NewRecorder()
+	req1 := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&did=did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	req1.RemoteAddr = "203.0.113.10:5555"
+	h.ServeHTTP(first, req1)
+	require.Equal(t, http.StatusOK, first.Code)
+	require.Equal(t, 1, actions.verifyCalls)
+
+	verify := httptest.NewRecorder()
+	req2 := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&did=did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", nil)
+	req2.RemoteAddr = "203.0.113.10:5556"
+	h.ServeHTTP(verify, req2)
+	require.Equal(t, http.StatusOK, verify.Code)
+	require.Contains(t, verify.Body.String(), "repo action rate limit exceeded")
+	require.Equal(t, 1, actions.verifyCalls)
+
+	otherIP := httptest.NewRecorder()
+	req3 := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&did=did:plc:cccccccccccccccccccccccc", nil)
+	req3.RemoteAddr = "203.0.113.11:5555"
+	h.ServeHTTP(otherIP, req3)
+	require.Equal(t, http.StatusOK, otherIP.Code)
+	require.Equal(t, 2, actions.verifyCalls)
+}
+
+func TestHandler_DoesNotVerifyMissingAccount(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "accounts", DID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}
+	s.Account = status.AccountLookup{
+		Query: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Found: false,
+	}
+	actions := &fakeRepoActions{}
+	h, err := web.New(web.Options{Snapshotter: &fakeSnapshotter{snap: s}, RepoActions: actions})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&did=did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Zero(t, actions.verifyCalls)
+	require.NotContains(t, rr.Body.String(), "Repo verification")
 }
 
 func TestHandler_RendersCollectionsTab(t *testing.T) {

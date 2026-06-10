@@ -111,6 +111,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 				Logger:            o.cfg.Logger,
 				Metrics:           o.cfg.BackfillMetrics,
 				MaxRepos:          o.cfg.MaxBackfillRepos,
+				BackfillRepos:     o.cfg.BackfillRepos,
 				RetryBaseDelay:    o.cfg.BackfillRetryBaseDelay,
 				AfterRepoComplete: o.cfg.AfterRepoComplete,
 				CrashInjector:     o.cfg.CrashInjector,

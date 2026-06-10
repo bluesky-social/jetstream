@@ -353,15 +353,27 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 // the integration entry point for our run_test.go.
 func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.Store) error {
 	t.Helper()
-	return runWithStubResolver(t, ctx, srv, db, nil)
+	return runWithStubResolverAndRepos(t, ctx, srv, db, nil, nil)
 }
 
-func runWithStubResolver(
+func runWithStubRepos(
+	t *testing.T,
+	ctx context.Context,
+	srv *stubServer,
+	db *store.Store,
+	repos []atmos.DID,
+) error {
+	t.Helper()
+	return runWithStubResolverAndRepos(t, ctx, srv, db, nil, repos)
+}
+
+func runWithStubResolverAndRepos(
 	t *testing.T,
 	ctx context.Context,
 	srv *stubServer,
 	db *store.Store,
 	onResolveDID func(context.Context, atmos.DID) error,
+	repos []atmos.DID,
 ) error {
 	t.Helper()
 	docs := make(map[atmos.DID]*identity.DIDDocument, len(srv.fixtures))
@@ -392,12 +404,13 @@ func runWithStubResolver(
 	t.Cleanup(func() { _ = w.Close() })
 
 	cfg := Config{
-		Store:      db,
-		Directory:  dir,
-		HTTPClient: &http.Client{Timeout: 5 * time.Second},
-		Writer:     w,
-		RelayURL:   srv.srv.URL,
-		Logger:     logger,
+		Store:         db,
+		Directory:     dir,
+		HTTPClient:    &http.Client{Timeout: 5 * time.Second},
+		Writer:        w,
+		RelayURL:      srv.srv.URL,
+		Logger:        logger,
+		BackfillRepos: repos,
 	}
 	return Run(ctx, cfg)
 }
@@ -597,6 +610,100 @@ func TestRun_HappyPath_DownloadsAllRepos(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, uint64(len(dids)), hs.Total)
 	require.Equal(t, uint64(len(dids)), hs.Complete)
+}
+
+func TestRun_BackfillReposDownloadsSelectedDIDsWithoutListRepos(t *testing.T) {
+	t.Parallel()
+
+	selected := atmos.DID("did:plc:selected")
+	other := atmos.DID("did:plc:other")
+	fixtures := map[atmos.DID]repoFixture{
+		selected: buildRepoFixture(t, selected),
+		other:    buildRepoFixture(t, other),
+	}
+	srv := newStubServer(t, fixtures)
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, MaybeSaveBootstrapLastListReposCursor(db, "stale-cursor"))
+
+	require.NoError(t, runWithStubRepos(t, t.Context(), srv, db, []atmos.DID{selected}))
+
+	require.Equal(t, int64(0), srv.listReposHit.Load(), "selected backfill must not scan listRepos")
+	require.Equal(t, int64(1), srv.getRepoHit.Load(), "selected backfill should download only requested repos")
+
+	bf := NewStore(db, nil)
+	got, err := bf.Lookup(t.Context(), selected)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateComplete, got.State)
+
+	got, err = bf.Lookup(t.Context(), other)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateUnknown, got.State)
+
+	cursor, err := LoadBootstrapLastListReposCursor(db)
+	require.NoError(t, err)
+	require.Empty(t, cursor, "selected backfill must clear stale merge discovery state")
+}
+
+func TestRun_BackfillReposRetriesTransientGetRepoFailure(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:selectedtransient")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+	srv.transientFailGetRepo = map[atmos.DID]int{did: 2}
+	srv.transientFailGetRepoCode = http.StatusServiceUnavailable
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	docs := map[atmos.DID]*identity.DIDDocument{
+		did: {
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: fixtures[did].multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		},
+	}
+	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, Run(t.Context(), Config{
+		Store:          db,
+		Directory:      dir,
+		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
+		Writer:         w,
+		RelayURL:       srv.srv.URL,
+		Logger:         logger,
+		BackfillRepos:  []atmos.DID{did},
+		RetryBaseDelay: time.Millisecond,
+		RetryMaxDelay:  10 * time.Millisecond,
+	}))
+
+	got, err := NewStore(db, nil).Lookup(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateComplete, got.State)
+	require.Equal(t, int64(0), srv.listReposHit.Load())
+
+	srv.transientMu.Lock()
+	defer srv.transientMu.Unlock()
+	require.Equal(t, 0, srv.transientFailGetRepo[did], "all scheduled transient failures must have fired")
 }
 
 // TestRun_Resume_NoOpAfterCompletion exercises restart-after-

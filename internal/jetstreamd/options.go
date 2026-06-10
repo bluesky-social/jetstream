@@ -33,6 +33,7 @@ type Options struct {
 	ClientDrainTimeout time.Duration
 
 	MaxBackfillRepos   int
+	BackfillRepos      []atmos.DID
 	SkipMergeDiscovery bool
 
 	// BackfillRetryBaseDelay, when > 0, overrides the bootstrap backfill

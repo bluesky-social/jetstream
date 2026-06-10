@@ -104,6 +104,11 @@ type Config struct {
 	// See backfill.Config.MaxRepos for the precise semantics.
 	MaxBackfillRepos int
 
+	// BackfillRepos, when non-empty, replaces bootstrap listRepos
+	// discovery with this explicit DID list. Debug-only knob for
+	// targeted production smoke tests; leave empty in production.
+	BackfillRepos []atmos.DID
+
 	// SkipMergeDiscovery, a debug-only flag that skips the discovery
 	// portion of the merge phase for fast feedback loops in local
 	// development while running against production.

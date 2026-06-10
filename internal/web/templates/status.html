@@ -393,6 +393,23 @@ document.addEventListener("input", function (event) {
   {{if .Account.LastError}}
   <div class="latest"><h3>Last error</h3><div class="error-text">{{.Account.LastError}}</div></div>
   {{end}}
+  {{with .RepoVerification}}
+  <div class="latest">
+    <h3>Repo verification</h3>
+    <dl>
+      <dt>Result</dt><dd>{{if .Match}}match{{else}}mismatch{{end}}</dd>
+      <dt>authoritative rev</dt><dd>{{if .AuthoritativeRev}}<code>{{.AuthoritativeRev}}</code>{{else}}unknown{{end}}</dd>
+      <dt>authoritative root</dt><dd>{{if .AuthoritativeRoot}}<code>{{.AuthoritativeRoot}}</code>{{else}}unknown{{end}}</dd>
+      <dt>local rev</dt><dd>{{if .LocalLatestRev}}<code>{{.LocalLatestRev}}</code>{{else}}unknown{{end}}</dd>
+      <dt>local root</dt><dd>{{if .LocalRoot}}<code>{{.LocalRoot}}</code>{{else}}unknown{{end}}</dd>
+      <dt>local records</dt><dd>{{humanInt64Cast .LocalRecordCount}}</dd>
+      {{if .Message}}<dt>Message</dt><dd class="error-text">{{.Message}}</dd>{{end}}
+    </dl>
+  </div>
+  {{end}}
+  {{if .RepoVerificationError}}
+  <div class="latest"><h3>Repo verification</h3><div class="error-text">{{.RepoVerificationError}}</div></div>
+  {{end}}
   {{with .Account.HostContext}}
   <div class="latest">
     <h3>Host context</h3>

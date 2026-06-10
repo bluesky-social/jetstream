@@ -160,6 +160,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	statusHandler, err := web.New(web.Options{
 		Snapshotter: statusCollector,
+		RepoActions: web.NewRepoActions(opts.DataDir, opts.RelayURL),
 		Logger:      processLogger,
 	})
 	if err != nil {
@@ -269,6 +270,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		OnEvent:                onSteadyStateEvent,
 		OnBootstrapLiveEvent:   opts.OnBootstrapLiveEvent,
 		MaxBackfillRepos:       opts.MaxBackfillRepos,
+		BackfillRepos:          opts.BackfillRepos,
 		SkipMergeDiscovery:     opts.SkipMergeDiscovery,
 		BackfillRetryBaseDelay: opts.BackfillRetryBaseDelay,
 		LiveReconnectBackoff:   opts.LiveReconnectBackoff,
