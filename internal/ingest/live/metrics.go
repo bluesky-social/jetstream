@@ -18,6 +18,7 @@ type Metrics struct {
 	UnknownEvents          prometheus.Counter
 	DroppedOpsMissingBlock prometheus.Counter
 	DroppedEvents          prometheus.Counter
+	StaleResyncsDropped    prometheus.Counter
 	UpstreamCursor         prometheus.Gauge
 }
 
@@ -65,6 +66,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "dropped_events_total",
 			Help: "Number of upstream events skipped because their fields cannot be represented in the segment format.",
 		}),
+		StaleResyncsDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "stale_resyncs_dropped_total",
+			Help: "Number of async resync events dropped because the verifier chain rev had " +
+				"already advanced past the resync's rev (delivery-order guard; the affected " +
+				"DID's tombstone coverage waits for its next divergence).",
+		}),
 		UpstreamCursor: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "upstream_cursor",
@@ -74,7 +82,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	reg.MustRegister(
 		m.EventsReceived, m.EventsConverted, m.Reconnects,
 		m.DecodeErrors, m.UnknownEvents, m.DroppedOpsMissingBlock,
-		m.DroppedEvents, m.UpstreamCursor,
+		m.DroppedEvents, m.StaleResyncsDropped, m.UpstreamCursor,
 	)
 	return m
 }
@@ -118,6 +126,12 @@ func (m *Metrics) addDroppedOpsMissingBlock(n int) {
 func (m *Metrics) incDroppedEvents() {
 	if m != nil {
 		m.DroppedEvents.Inc()
+	}
+}
+
+func (m *Metrics) incStaleResyncsDropped() {
+	if m != nil {
+		m.StaleResyncsDropped.Inc()
 	}
 }
 

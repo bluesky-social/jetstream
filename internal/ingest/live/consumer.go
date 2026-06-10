@@ -19,6 +19,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/jcalabro/gt"
 )
@@ -77,12 +78,27 @@ func Open(cfg Config) (*Consumer, error) {
 		logger: cfg.Logger.With(slog.String("component", "livestream/consumer")),
 	}
 
+	// Tombstone observation runs as the writer's OnAppend hook —
+	// under the writer mutex, after seq assignment, before the block
+	// can flush or the segment seal — NOT after Append returns. The
+	// steady-state compactor discovers sealed segments by directory
+	// scan from its own goroutine; observing post-Append would open a
+	// window where a freshly sealed header's MaxSeq covers a
+	// tombstone the set does not yet contain, and the pass would
+	// durably advance the watermark past it, evicting it unapplied.
+	var onAppend func(ev *segment.Event) error
+	if cfg.Tombstones != nil {
+		ts := cfg.Tombstones
+		onAppend = func(ev *segment.Event) error { return ts.Observe(ev) }
+	}
+
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       cfg.SegmentsDir,
 		Store:             cfg.Store,
 		SeqKey:            cfg.SeqKey,
 		MaxSegmentBytes:   cfg.MaxSegmentBytes,
 		MaxEventsPerBlock: cfg.MaxEventsPerBlock,
+		OnAppend:          onAppend,
 
 		// Bare cfg.Logger; ingest.Open sets its own
 		// component=ingest/writer attribute.
@@ -131,8 +147,79 @@ func (c *Consumer) Close() error {
 			return fmt.Errorf("livestream: close: save cursor: %w", err)
 		}
 		c.cfg.Metrics.setUpstreamCursor(cur)
+	} else if c.cfg.SyncStateStore != nil {
+		// No cursor to persist (shutdown before the first yielded
+		// event), but promoted verifier state can still exist — its
+		// rows were appended and writer.Close fsynced them above.
+		// Flush it so it isn't silently dropped.
+		if err := c.cfg.SyncStateStore.Flush(); err != nil {
+			return fmt.Errorf("livestream: close: flush sync state: %w", err)
+		}
 	}
 	return nil
+}
+
+// promoteSyncState marks the verifier chain/hosting state staged for
+// one upstream event as durable-eligible, after every row of that
+// event's group has been appended to the writer. Until promotion, the
+// state stays pending in memory and is never flushed to pebble — so a
+// crash mid-group leaves durable chain state at the previous rev, the
+// event is redelivered (or the next commit chain-breaks and triggers a
+// fresh resync), and a durable KindSync tombstone can never sit above
+// a partially-archived replacement set (compaction spec §2.2).
+func (c *Consumer) promoteSyncState(segEvts []segment.Event) {
+	if c.cfg.SyncStateStore == nil || len(segEvts) == 0 {
+		return
+	}
+	did := atmos.DID(segEvts[0].DID)
+	var maxRev string
+	for i := range segEvts {
+		if segEvts[i].Rev > maxRev {
+			maxRev = segEvts[i].Rev
+		}
+		if segEvts[i].Kind == segment.KindAccount {
+			c.cfg.SyncStateStore.PromoteHosting(atmos.DID(segEvts[i].DID), segEvts[i].UpstreamRelayCursor)
+		}
+	}
+	if maxRev != "" {
+		c.cfg.SyncStateStore.PromoteChain(did, maxRev)
+	}
+}
+
+// dropStaleOrderedAsyncResync guards against atmos's async-resync
+// delivery race: the synthetic resync event travels on a separate
+// channel from the ordered result stream, so a post-resync #commit for
+// the same DID can be yielded — and archived — BEFORE the resync's
+// KindSync row. Archiving the KindSync row then would give the DID
+// tombstone a seq ABOVE the newer commit's rows and compaction would
+// permanently erase them. When the persisted/staged chain rev is
+// already past the resync's rev, the resync is stale-ordered (or
+// pipelined verification has simply run ahead — indistinguishable);
+// drop the whole event. Cost of a false positive is bounded staleness
+// (this resync's tombstone coverage waits for the next divergence);
+// cost of archiving a stale-ordered one is permanent data destruction.
+// The root fix is ordered delivery in atmos (compaction spec §12).
+func (c *Consumer) dropStaleOrderedAsyncResync(ctx context.Context, evt streaming.Event, segEvts []segment.Event) (bool, error) {
+	if evt.Resync != streaming.ResyncAsync || c.cfg.SyncStateStore == nil {
+		return false, nil
+	}
+	if len(segEvts) == 0 || segEvts[0].Kind != segment.KindSync {
+		return false, nil
+	}
+	state, err := c.cfg.SyncStateStore.LoadChain(ctx, atmos.DID(segEvts[0].DID))
+	if err != nil {
+		return false, fmt.Errorf("livestream: async resync ordering guard: %w", err)
+	}
+	if state == nil || state.Rev <= segEvts[0].Rev {
+		return false, nil
+	}
+	c.cfg.Metrics.incStaleResyncsDropped()
+	c.logger.WarnContext(ctx, "dropped stale-ordered async resync",
+		"did", segEvts[0].DID,
+		"resync_rev", segEvts[0].Rev,
+		"chain_rev", state.Rev,
+	)
+	return true, nil
 }
 
 // cursorValue returns the safe-to-persist upstream cursor: atmos's
@@ -362,6 +449,12 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				continue
 			}
 
+			if stale, err := c.dropStaleOrderedAsyncResync(ctx, evt, segEvts); err != nil {
+				return err
+			} else if stale {
+				continue
+			}
+
 			for i := range segEvts {
 				if err := segment.ValidateEvent(segEvts[i]); err != nil {
 					if errors.Is(err, segment.ErrFieldTooLong) {
@@ -380,15 +473,12 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					}
 					return fmt.Errorf("livestream: invalid segment event: %w", err)
 				}
+				// Append runs the tombstone Observe hook internally
+				// (ingest.Config.OnAppend) before any flush/seal.
 				if err := c.writer.Append(ctx, &segEvts[i]); err != nil {
 					return fmt.Errorf("livestream: append: %w", err)
 				}
-				if c.cfg.Tombstones != nil {
-					if err := c.cfg.Tombstones.Observe(&segEvts[i]); err != nil {
-						return fmt.Errorf("livestream: update tombstone set: %w", err)
-					}
-					c.maybeTriggerCompaction()
-				}
+				c.maybeTriggerCompaction()
 				c.cfg.Metrics.incEventsConverted()
 
 				// Forward to downstream subscribers AFTER durable append.
@@ -397,6 +487,8 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					c.cfg.OnEvent(&segEvts[i])
 				}
 			}
+
+			c.promoteSyncState(segEvts)
 
 			// Track the highest seq we've witnessed. Under
 			// Parallelism>1 the seqs in this batch are in
