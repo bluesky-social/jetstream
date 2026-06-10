@@ -29,8 +29,12 @@ just run-prod serve --backfill-repos=did:plc:4uz2445cjiw7w4nobfgnu35f
 This repo also ships with an extremely minimal atproto simulator (PLC, PDS, and the Relay). To run the local environment against it, use two terminals like:
 
 ```sh
-just simulator  # terminal 1: starts the simulator on :7777 with 10,000 mock accounts
-just run serve  # terminal 2: jetstream points at the simulator
+# terminal 1: starts the simulator on :7777 with 10,000 mock accounts
+# (this takes a minute to start up)
+just simulator serve
+
+# terminal 2: jetstream points at the simulator
+just run serve
 ```
 
 Simulator and prod data are always isolated, so you can swap between them without worry (they each get a unique data directory).
