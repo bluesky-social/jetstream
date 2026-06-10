@@ -16,10 +16,14 @@ just install-tools  # run once after cloning
 
 ## Running Locally
 
-To run against the real production network in a setup that doesn't require a whole-network backfill:
+For development purposes, to run against the real production network in a setup that doesn't require a whole-network backfill:
 
 ```sh
+# backfill 20 random repos, then cut over to the live tail
 just run-prod serve --max-backfill-repos=20
+
+# backfill a small number of chosen DIDs (csv), then cut over to the live tail
+just run-prod serve --backfill-repos=did:plc:4uz2445cjiw7w4nobfgnu35f
 ```
 
 This repo also ships with an extremely minimal atproto simulator (PLC, PDS, and the Relay). To run the local environment against it, use two terminals like:
@@ -56,7 +60,15 @@ just oracle                   # heavier simulator oracle (stress mode)
 ## Inspecting segment files
 
 ```sh
+# inspect all segment files
+just run inspect-all
+
+# inspect a single file
 just run inspect-segment ./data-prod/segments/seg_0000000000.jss
 ```
 
 Dumps the header, footer, per-block stats, and collection event counts for a sealed segment.
+
+## Web Dashboard
+
+The jetstream server also offers a web dashboard with some basic read-only features. Run the server, then open `http://localhost:8080/status` in your browser.
