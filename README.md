@@ -71,4 +71,6 @@ Dumps the header, footer, per-block stats, and collection event counts for a sea
 
 ## Web Dashboard
 
-The jetstream server also offers a web dashboard with some basic read-only features. Run the server, then open `http://localhost:8080/status` in your browser.
+The jetstream server also offers a web dashboard with some basic read-only features.
+
+Start the server locally in your desired configuration, then open `http://localhost:8080/status` in your browser.
