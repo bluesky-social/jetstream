@@ -1,10 +1,12 @@
 package segment
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
@@ -143,4 +145,146 @@ func (i rewritePointInjector) SimulateCrash(_ context.Context, point crashpoint.
 		return i.err
 	}
 	return nil
+}
+
+func TestRewriteAllDropProducesValidSealedSegment(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	events := []Event{
+		{Seq: 5, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 6, IndexedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
+		{Seq: 7, IndexedAt: 30, Kind: KindUpdate, DID: "did:plc:b", Collection: "c", Rkey: "r3"},
+	}
+	for _, ev := range events {
+		full, err := w.Append(ev)
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	_, err = w.Seal()
+	require.NoError(t, err)
+
+	res, err := Rewrite(path, func(*Event) RowDecision { return RowDrop }, RewriteOptions{})
+	require.NoError(t, err)
+	require.True(t, res.Rewritten)
+	require.EqualValues(t, 3, res.RowsDropped)
+
+	// The all-dropped file stays a valid, reopenable sealed segment
+	// with its historical seq envelope intact (spec §6).
+	r, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	require.EqualValues(t, 0, r.Header().EventCount)
+	require.EqualValues(t, 0, r.Header().UniqueDIDCount)
+	require.EqualValues(t, 5, r.Header().MinSeq)
+	require.EqualValues(t, 7, r.Header().MaxSeq)
+	require.EqualValues(t, 2, r.Header().BlockCount)
+	for i := range int(r.Header().BlockCount) {
+		evs, err := r.DecodeBlock(i)
+		require.NoError(t, err)
+		require.Empty(t, evs)
+	}
+
+	// Idempotency: a second rewrite has nothing to drop and must not touch the file.
+	res2, err := Rewrite(path, func(*Event) RowDecision { return RowDrop }, RewriteOptions{})
+	require.NoError(t, err)
+	require.False(t, res2.Rewritten)
+}
+
+func TestRewritePreservesSeqEnvelopeWhenEdgeRowsDrop(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := sealedSegmentForReader(t, dir, []Event{
+		{Seq: 10, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 11, IndexedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
+	}, 4)
+
+	res, err := Rewrite(path, func(ev *Event) RowDecision {
+		if ev.Seq == 11 {
+			return RowDrop
+		}
+		return RowKeep
+	}, RewriteOptions{})
+	require.NoError(t, err)
+	require.True(t, res.Rewritten)
+
+	r, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	require.EqualValues(t, 10, r.Header().MinSeq)
+	require.EqualValues(t, 11, r.Header().MaxSeq, "historical envelope must survive edge-row drops")
+	require.EqualValues(t, 11, r.Blocks()[0].MaxSeq)
+	require.EqualValues(t, 1, r.Header().EventCount, "counts describe contents and must be true")
+}
+
+func TestRewriteZeroDropKeepsInodeAndMtime(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := sealedSegmentForReader(t, dir, []Event{{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a"}}, 2)
+	before, err := os.Stat(path)
+	require.NoError(t, err)
+
+	res, err := Rewrite(path, func(*Event) RowDecision { return RowKeep }, RewriteOptions{})
+	require.NoError(t, err)
+	require.False(t, res.Rewritten)
+
+	after, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, before.ModTime(), after.ModTime(), "zero-drop rewrite must not touch the file")
+	beforeSys, ok := before.Sys().(*syscall.Stat_t)
+	require.True(t, ok)
+	afterSys, ok := after.Sys().(*syscall.Stat_t)
+	require.True(t, ok)
+	require.Equal(t, beforeSys.Ino, afterSys.Ino, "zero-drop rewrite must not replace the inode")
+}
+
+// FuzzRewrite feeds arbitrary bytes to Rewrite: it must error (never
+// panic) on corrupt input and leave the source file untouched.
+func FuzzRewrite(f *testing.F) {
+	dir := f.TempDir()
+	seedPath := sealedSegmentForReader(f, dir, []Event{
+		{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 2, IndexedAt: 20, Kind: KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+	}, 2)
+	seed, err := os.ReadFile(seedPath)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Add(seed[:len(seed)/2])
+	f.Add([]byte{})
+	corrupted := append([]byte(nil), seed...)
+	corrupted[300] ^= 0xff
+	f.Add(corrupted)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		path := filepath.Join(t.TempDir(), "seg.jss")
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res, err := Rewrite(path, func(*Event) RowDecision { return RowDrop }, RewriteOptions{})
+		after, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("source file unreadable after rewrite attempt: %v", readErr)
+		}
+		if err != nil {
+			if !bytes.Equal(data, after) {
+				t.Fatalf("failed rewrite mutated the source file")
+			}
+			return
+		}
+		if res.Rewritten {
+			// A successful rewrite of fuzz input must still produce a
+			// file the reader accepts.
+			r, openErr := Open(ReaderConfig{Path: path})
+			if openErr != nil {
+				t.Fatalf("rewritten file does not reopen: %v", openErr)
+			}
+			_ = r.Close()
+		}
+	})
 }

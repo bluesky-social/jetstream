@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func sealedSegmentForReader(t *testing.T, dir string, events []Event, maxPerBlock int) string {
+func sealedSegmentForReader(t testing.TB, dir string, events []Event, maxPerBlock int) string {
 	t.Helper()
 	path := filepath.Join(dir, "seg.jss")
 	w, err := New(Config{Path: path, MaxEventsPerBlock: maxPerBlock})

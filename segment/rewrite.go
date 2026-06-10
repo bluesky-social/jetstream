@@ -110,15 +110,10 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 				outFrame = encodeEmptyBlockCompressed()
 				outUncompressedSize = len(encodeEmptyBlock())
 			} else {
-				outFrame, err = encodeBlockCompressed(kept)
+				outFrame, outUncompressedSize, err = encodeBlockCompressedSized(kept)
 				if err != nil {
 					return RewriteResult{}, fmt.Errorf("segment: rewrite encode block %d: %w", i, err)
 				}
-				body, err := encodeBlock(kept)
-				if err != nil {
-					return RewriteResult{}, fmt.Errorf("segment: rewrite size block %d: %w", i, err)
-				}
-				outUncompressedSize = len(body)
 			}
 		}
 
