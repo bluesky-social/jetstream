@@ -150,8 +150,22 @@ type Config struct {
 
 	// OnSegmentCompacted refreshes serving metadata after a sealed segment is
 	// rewritten by compaction. cmd/jetstream wires this to the manifest refresh
-	// path. Optional before steady state; required for live serving freshness.
+	// path (which verifies the rewritten file's checksum as an integrity gate).
+	// Optional before steady state; required for live serving freshness.
 	OnSegmentCompacted func(idx uint64, path string) error
+
+	// SegmentManifestChecksums returns the manifest's resident header
+	// checksums keyed by segment index, as one snapshot. The compactor's
+	// reconcile step compares these against on-disk headers and re-fires
+	// OnSegmentCompacted only on mismatch, keeping no-op passes cheap.
+	// Optional; nil makes reconcile refresh every sealed segment.
+	SegmentManifestChecksums func() map[uint64]uint64
+
+	// CompactionBloomNarrowMaxDIDs bounds the candidate-DID set handed to the
+	// segment-level bloom prefilter; larger tombstone sets skip narrowing
+	// (probing would cost more than it saves — spec §5). Zero selects the
+	// default of 100k.
+	CompactionBloomNarrowMaxDIDs int
 
 	// CompactionInterval controls steady-state periodic delete/update
 	// compaction. Zero disables compaction scheduling and the merge-tail pass.

@@ -43,6 +43,15 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			return err
 		}
 
+		// With compaction disabled nothing ever evicts the live set, so
+		// feeding it would leak memory without bound; leave it detached.
+		tombstones := o.cfg.Tombstones
+		tombstoneCap := o.cfg.CompactionTombstoneCap
+		if o.cfg.CompactionInterval == 0 {
+			tombstones = nil
+			tombstoneCap = 0
+		}
+
 		c, err := live.Open(live.Config{
 			SegmentsDir: segmentsDir,
 			Store:       o.cfg.Store,
@@ -54,8 +63,8 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			Metrics:           o.cfg.LiveMetrics,
 			Verifier:          o.cfg.Verifier,
 			SyncStateStore:    o.cfg.SyncStateStore,
-			Tombstones:        o.cfg.Tombstones,
-			TombstoneCap:      o.cfg.CompactionTombstoneCap,
+			Tombstones:        tombstones,
+			TombstoneCap:      tombstoneCap,
 			CompactionTrigger: o.compactionTrigger,
 			OnCompactionTriggerCoalesced: func() {
 				o.cfg.Metrics.incCompactionSkippedTick()

@@ -1,12 +1,14 @@
 package orchestrator
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,7 +63,7 @@ func TestCompactionCandidateDIDs(t *testing.T) {
 		},
 	})
 
-	require.Equal(t, []string{"did:plc:a", "did:plc:b", "did:plc:c"}, got)
+	require.ElementsMatch(t, []string{"did:plc:a", "did:plc:b", "did:plc:c"}, got)
 }
 
 func TestRunDeleteCompaction_RewriteBeforeWatermarkCrashIsIdempotent(t *testing.T) {
@@ -390,4 +392,170 @@ func readCompactionSegment(t *testing.T, path string) []segment.Event {
 		out = append(out, events...)
 	}
 	return out
+}
+
+// TestReconcileCompactionManifestRefreshesOnlyMismatches pins the spec
+// §5 step-2 reconcile primitive: entries whose resident checksum
+// matches the on-disk header are skipped; mismatched and missing
+// entries re-fire the refresh path.
+func TestReconcileCompactionManifestRefreshesOnlyMismatches(t *testing.T) {
+	t.Parallel()
+
+	var refreshed []uint64
+	o := &Orchestrator{cfg: Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnSegmentCompacted: func(idx uint64, path string) error {
+			refreshed = append(refreshed, idx)
+			return nil
+		},
+		SegmentManifestChecksums: func() map[uint64]uint64 {
+			return map[uint64]uint64{
+				0: 0xAAAA, // matches -> skipped
+				1: 0xDEAD, // stale -> refreshed
+				// 2 missing -> refreshed
+			}
+		},
+	}}
+	o.logger = o.cfg.Logger
+
+	sealed := []sealedCompactionSegment{
+		{SegmentFile: ingest.SegmentFile{Idx: 0, Path: "seg0"}, header: segment.Header{Checksum: 0xAAAA}},
+		{SegmentFile: ingest.SegmentFile{Idx: 1, Path: "seg1"}, header: segment.Header{Checksum: 0xBBBB}},
+		{SegmentFile: ingest.SegmentFile{Idx: 2, Path: "seg2"}, header: segment.Header{Checksum: 0xCCCC}},
+	}
+	require.NoError(t, o.reconcileCompactionManifest(sealed))
+	require.Equal(t, []uint64{1, 2}, refreshed)
+
+	// Without a checksum source, reconcile must refresh everything
+	// (conservative fallback).
+	refreshed = nil
+	o.cfg.SegmentManifestChecksums = nil
+	require.NoError(t, o.reconcileCompactionManifest(sealed))
+	require.Equal(t, []uint64{0, 1, 2}, refreshed)
+}
+
+// TestRunSteadyCompactor_PassErrorDoesNotExit pins the spec §5 failure
+// policy: a failing pass is logged and retried on the next trigger;
+// it must never propagate into the errgroup and take the daemon down.
+func TestRunSteadyCompactor_PassErrorDoesNotExit(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	// Make every pass fail: "segments" is a file, so the pass's
+	// directory listing errors.
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "segments"), []byte("not a dir"), 0o644))
+	st, err := store.Open(filepath.Join(dataDir, "meta"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var passes []CompactionPassResult
+	var mu sync.Mutex
+	o := &Orchestrator{
+		cfg: Config{
+			DataDir:            dataDir,
+			Store:              st,
+			Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+			CompactionInterval: 5 * time.Millisecond,
+			OnCompactionPass: func(result CompactionPassResult) {
+				mu.Lock()
+				passes = append(passes, result)
+				mu.Unlock()
+			},
+		},
+		compactionTrigger: make(chan struct{}, 1),
+	}
+	o.logger = o.cfg.Logger
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	err = o.runSteadyCompactor(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded,
+		"the compactor must outlive failing passes and exit only on ctx")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(passes), 2, "failing passes must keep retrying on the interval")
+	for _, p := range passes {
+		require.Error(t, p.Err)
+	}
+}
+
+// TestRebuildLiveTombstones_BoundedByWatermark pins the spec §3.4
+// restart rebuild: the rebuilt set equals the fold over
+// (compaction/seq, tip] — segments entirely at or below the watermark
+// contribute nothing — and the result matches an incrementally
+// Observe()-built set over the same window.
+func TestRebuildLiveTombstones_BoundedByWatermark(t *testing.T) {
+	t.Parallel()
+
+	segA := []segment.Event{
+		{Seq: 1, IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "1", Payload: []byte("x")},
+		{Seq: 2, IndexedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "2"},
+	}
+	segB := []segment.Event{
+		{Seq: 3, IndexedAt: 30, Kind: segment.KindDelete, DID: "did:plc:b", Collection: "c", Rkey: "r", Rev: "3"},
+		{Seq: 4, IndexedAt: 40, Kind: segment.KindSync, DID: "did:plc:c", Rev: "4", Payload: []byte{0xa0}},
+	}
+
+	dataDir := t.TempDir()
+	segmentsDir := filepath.Join(dataDir, "segments")
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	writeCompactionSegment(t, segmentsDir, 0, segA)
+	writeCompactionSegment(t, segmentsDir, 1, segB)
+
+	// Watermark covers all of segment A.
+	require.NoError(t, saveCompactionWatermark(st, 2))
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	set := tombstone.New()
+	o := &Orchestrator{cfg: Config{
+		DataDir:            dataDir,
+		Store:              st,
+		Logger:             logger,
+		Tombstones:         set,
+		CompactionInterval: time.Hour,
+	}, logger: logger}
+	require.NoError(t, o.rebuildLiveTombstones(t.Context()))
+
+	want := tombstone.New()
+	for i := range segB {
+		require.NoError(t, want.Observe(&segB[i]))
+	}
+	maxSeq := ^uint64(0)
+	require.Equal(t, want.SnapshotRange(0, maxSeq).Records, set.SnapshotRange(0, maxSeq).Records)
+	require.Equal(t, want.SnapshotRange(0, maxSeq).DIDs, set.SnapshotRange(0, maxSeq).DIDs)
+	require.NotContains(t, set.SnapshotRange(0, maxSeq).Records,
+		tombstone.RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "r"},
+		"tombstones at or below the watermark are already applied and must not rebuild")
+}
+
+// TestRebuildLiveTombstones_DisabledWhenCompactionOff: with
+// --compaction-interval=0 nothing ever evicts the set, so the rebuild
+// must not populate it (unbounded growth otherwise).
+func TestRebuildLiveTombstones_DisabledWhenCompactionOff(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	segmentsDir := filepath.Join(dataDir, "segments")
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	writeCompactionSegment(t, segmentsDir, 0, []segment.Event{
+		{Seq: 1, IndexedAt: 10, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "1"},
+	})
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	set := tombstone.New()
+	o := &Orchestrator{cfg: Config{
+		DataDir:            dataDir,
+		Store:              st,
+		Logger:             logger,
+		Tombstones:         set,
+		CompactionInterval: 0,
+	}, logger: logger}
+	require.NoError(t, o.rebuildLiveTombstones(t.Context()))
+	require.Zero(t, set.Len())
 }

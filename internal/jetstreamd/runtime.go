@@ -288,7 +288,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		BackfillRetryBaseDelay:   opts.BackfillRetryBaseDelay,
 		LiveReconnectBackoff:     opts.LiveReconnectBackoff,
 		IngestOnAfterSeal:        mft.OnSegmentSealed,
-		OnSegmentCompacted:       mft.OnSegmentSealed,
+		OnSegmentCompacted:       mft.OnSegmentCompacted,
+		SegmentManifestChecksums: mft.SegmentChecksums,
 		CompactionInterval:       opts.CompactionInterval,
 		CompactionTombstoneCap:   opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers: opts.CompactionRewriteWorkers,
@@ -446,6 +447,13 @@ func (r *Runtime) Close(ctx context.Context) error {
 		}
 		r.verifier = nil
 	}
+	// Note: promoted sync state is NOT flushed here. The consumer's own
+	// Close flushes it after its writer has durably fsynced every
+	// appended row; flushing from Runtime.Close would commit promoted
+	// state even when the consumer's writer.Close failed, letting
+	// verifier state run ahead of the archive. Pending (unpromoted)
+	// entries are deliberately dropped — their events' rows were never
+	// archived and redelivery re-verifies them.
 	if r.metaStore != nil {
 		if err := r.metaStore.Close(); err != nil {
 			r.logger.Error("close metadata store", "err", err)

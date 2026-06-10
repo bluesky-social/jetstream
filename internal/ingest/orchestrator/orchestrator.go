@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
@@ -57,6 +58,13 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			if err := lifecycle.WritePhase(o.cfg.Store, phase, time.Now().UTC()); err != nil {
 				return fmt.Errorf("orchestrator: write initial phase: %w", err)
 			}
+		}
+
+		// A crash mid-rewrite can leave a segment-sized *.jss.tmp
+		// behind; reclaim it at boot even when compaction is disabled
+		// (each pass also cleans at start).
+		if err := removeStaleCompactionTemps(filepath.Join(o.cfg.DataDir, "segments")); err != nil {
+			return err
 		}
 
 		o.logger.InfoContext(ctx, "starting", "phase", phase)

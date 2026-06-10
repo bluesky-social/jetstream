@@ -103,16 +103,12 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		if err := o.runDeleteCompaction(ctx, compactionMergeTail); err != nil {
 			return fmt.Errorf("orchestrator: merge-tail compaction: %w", err)
 		}
-		if o.cfg.OnSegmentCompacted != nil {
-			refreshFiles, err := listCompactionRefreshSegments(segmentsDir)
-			if err != nil {
-				return err
-			}
-			for _, sf := range refreshFiles {
-				if err := o.cfg.OnSegmentCompacted(sf.Idx, sf.Path); err != nil {
-					return fmt.Errorf("orchestrator: merge-tail compaction manifest refresh: %w", err)
-				}
-			}
+		// One-shot manifest reconcile (spec §7): the merge-tail pass is
+		// manifest-oblivious, so before serving ungates every manifest
+		// entry must match its on-disk header. Reconcile failure aborts
+		// the transition — internal-state correctness, crash-loud.
+		if err := o.reconcileCompactionManifestFromDisk(segmentsDir); err != nil {
+			return fmt.Errorf("orchestrator: merge-tail compaction manifest reconcile: %w", err)
 		}
 
 		if err := o.simulateCrash(ctx, crashpoint.AfterMergeDstSealBeforeDiscovery); err != nil {

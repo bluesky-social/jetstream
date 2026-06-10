@@ -300,10 +300,10 @@ func (m *Metrics) addCompactionTombstones(kind string, n int) {
 	}
 }
 
-func (m *Metrics) setCompactionTombstoneSet(entries int) {
+func (m *Metrics) setCompactionTombstoneSet(entries int, bytes int64) {
 	if m != nil {
 		m.CompactionTombstoneEntries.Set(float64(entries))
-		m.CompactionTombstoneBytes.Set(float64(entries * 135))
+		m.CompactionTombstoneBytes.Set(float64(bytes))
 	}
 }
 
