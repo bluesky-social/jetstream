@@ -881,3 +881,65 @@ func TestWriter_SnapshotPending_DelegatesToSegmentWriter(t *testing.T) {
 	require.Equal(t, "did:plc:a", got[0].DID)
 	require.Equal(t, "did:plc:b", got[1].DID)
 }
+
+// TestAppend_OnAppendFiresBeforeSealVisibility pins the ordering the
+// compaction tombstone set depends on: by the time a seal is visible
+// (OnAfterSeal fires, sealed header on disk), OnAppend has already run
+// for every event in the segment — including the one whose Append
+// triggered the rotation. Without this, a concurrent compaction pass
+// could compute a watermark covering an unobserved tombstone and
+// permanently skip it.
+func TestAppend_OnAppendFiresBeforeSealVisibility(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+
+	var observed []uint64
+	var observedAtSeal []uint64
+	w, err := Open(Config{
+		SegmentsDir:       segDir,
+		Store:             newTestStore(t),
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+		MaxEventsPerBlock: 2,
+		MaxSegmentBytes:   1, // first flush rotates
+		OnAppend: func(ev *segment.Event) error {
+			observed = append(observed, ev.Seq)
+			return nil
+		},
+		OnAfterSeal: func(idx uint64, path string) error {
+			observedAtSeal = append([]uint64(nil), observed...)
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	for range 2 {
+		ev := segment.Event{Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r"}
+		require.NoError(t, w.Append(t.Context(), &ev))
+	}
+
+	require.Equal(t, uint64(1), w.ActiveIndex(), "the second append must have sealed segment 0")
+	require.Equal(t, []uint64{0, 1}, observed)
+	require.Equal(t, []uint64{0, 1}, observedAtSeal,
+		"every event of the sealed segment must be observed before the seal is visible")
+}
+
+func TestAppend_OnAppendErrorFailsAppend(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	hookErr := errors.New("observe failed")
+	w, err := Open(Config{
+		SegmentsDir: segDir,
+		Store:       newTestStore(t),
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:     NewMetrics(prometheus.NewRegistry()),
+		OnAppend:    func(*segment.Event) error { return hookErr },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
+	err = w.Append(t.Context(), &ev)
+	require.ErrorIs(t, err, hookErr)
+}

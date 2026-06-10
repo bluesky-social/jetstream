@@ -245,6 +245,12 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	w.cfg.Metrics.incEventsAppended()
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
 
+	if w.cfg.OnAppend != nil {
+		if err := w.cfg.OnAppend(ev); err != nil {
+			return fmt.Errorf("ingest: on_append: %w", err)
+		}
+	}
+
 	if full {
 		if err := w.flushAndRotateLocked(ctx); err != nil {
 			return err
