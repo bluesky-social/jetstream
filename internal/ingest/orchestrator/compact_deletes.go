@@ -25,19 +25,25 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 	if o.cfg.CompactionInterval == 0 {
 		return nil
 	}
+	start := time.Now()
+	var retErr error
+	defer func() { o.cfg.Metrics.observeCompactionPass(start, retErr) }()
 	return obs.Span(ctx, func(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 		if err := removeStaleCompactionTemps(segmentsDir); err != nil {
+			retErr = err
 			return err
 		}
 
 		watermark, _, err := loadCompactionWatermark(o.cfg.Store)
 		if err != nil {
+			retErr = err
 			return err
 		}
 		files, err := ingest.SegmentFiles(segmentsDir)
 		if err != nil {
-			return fmt.Errorf("orchestrator: compaction: list segments: %w", err)
+			retErr = fmt.Errorf("orchestrator: compaction: list segments: %w", err)
+			return retErr
 		}
 
 		type sealedSegment struct {
@@ -52,7 +58,8 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 				if errors.Is(err, segment.ErrActiveSegment) {
 					continue
 				}
-				return fmt.Errorf("orchestrator: compaction: open %s: %w", f.Path, err)
+				retErr = fmt.Errorf("orchestrator: compaction: open %s: %w", f.Path, err)
+				return retErr
 			}
 			h := r.Header()
 			_ = r.Close()
@@ -64,8 +71,10 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 		if mode == compactionSteady && o.cfg.OnSegmentCompacted != nil {
 			for _, f := range sealed {
 				if err := o.cfg.OnSegmentCompacted(f.Idx, f.Path); err != nil {
-					return fmt.Errorf("orchestrator: compaction: reconcile manifest: %w", err)
+					retErr = fmt.Errorf("orchestrator: compaction: reconcile manifest: %w", err)
+					return retErr
 				}
+				o.cfg.Metrics.incCompactionManifestReconciled()
 			}
 		}
 		if targetWatermark <= watermark {
@@ -78,6 +87,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 				continue
 			}
 			if err := ctx.Err(); err != nil {
+				retErr = err
 				return err
 			}
 			r, err := segment.Open(segment.ReaderConfig{Path: f.Path, SkipChecksum: true})
@@ -88,48 +98,73 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 				events, err := r.DecodeBlock(i)
 				if err != nil {
 					_ = r.Close()
-					return fmt.Errorf("orchestrator: compaction: decode source %s block %d: %w", f.Path, i, err)
+					retErr = fmt.Errorf("orchestrator: compaction: decode source %s block %d: %w", f.Path, i, err)
+					return retErr
 				}
 				part, err := tombstone.Fold(events, watermark)
 				if err != nil {
 					_ = r.Close()
+					retErr = err
 					return err
 				}
 				snap.Merge(part)
 			}
 			_ = r.Close()
 		}
+		o.cfg.Metrics.addCompactionTombstones("record", len(snap.Records))
+		o.cfg.Metrics.addCompactionTombstones("did", len(snap.DIDs))
 
 		if !snap.Empty() {
 			for _, f := range sealed {
 				if err := ctx.Err(); err != nil {
+					retErr = err
 					return err
 				}
+				o.cfg.Metrics.incCompactionSegmentsExamined()
+				droppedByReason := map[string]uint64{}
 				res, err := segment.Rewrite(f.Path, func(ev *segment.Event) segment.RowDecision {
 					if ev.Seq > targetWatermark {
 						return segment.RowKeep
 					}
-					if drop, _ := snap.ShouldDrop(ev); drop {
+					if drop, reason := snap.ShouldDrop(ev); drop {
+						droppedByReason[reason]++
 						return segment.RowDrop
 					}
 					return segment.RowKeep
 				}, segment.RewriteOptions{})
 				if err != nil {
-					return fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err)
+					retErr = fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err)
+					return retErr
 				}
-				if res.Rewritten && mode == compactionSteady && o.cfg.OnSegmentCompacted != nil {
-					if err := o.cfg.OnSegmentCompacted(f.Idx, f.Path); err != nil {
-						return fmt.Errorf("orchestrator: compaction: refresh manifest: %w", err)
+				if res.Rewritten {
+					o.cfg.Metrics.incCompactionSegmentsRewritten()
+					for reason, n := range droppedByReason {
+						o.cfg.Metrics.addCompactionRowsDropped(reason, n)
 					}
+					if info, err := os.Stat(f.Path); err == nil {
+						o.cfg.Metrics.addCompactionBytesRewritten(info.Size())
+					}
+					if mode == compactionSteady && o.cfg.OnSegmentCompacted != nil {
+						if err := o.cfg.OnSegmentCompacted(f.Idx, f.Path); err != nil {
+							retErr = fmt.Errorf("orchestrator: compaction: refresh manifest: %w", err)
+							return retErr
+						}
+						o.cfg.Metrics.incCompactionManifestReconciled()
+					}
+				} else {
+					o.cfg.Metrics.incCompactionSegmentsClean()
 				}
 			}
 		}
 
 		if err := saveCompactionWatermark(o.cfg.Store, targetWatermark); err != nil {
+			retErr = err
 			return err
 		}
+		o.cfg.Metrics.setCompactionWatermark(targetWatermark)
 		if o.cfg.Tombstones != nil {
 			o.cfg.Tombstones.Evict(targetWatermark)
+			o.cfg.Metrics.setCompactionTombstoneSet(o.cfg.Tombstones.Len())
 		}
 		o.logger.InfoContext(ctx, "delete compaction pass complete",
 			"watermark", targetWatermark,
@@ -156,6 +191,7 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context) error {
 			if err := o.runDeleteCompaction(ctx, compactionSteady); err != nil {
 				return err
 			}
+			o.cfg.Metrics.incCompactionEarlyPass()
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -223,6 +259,7 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 		}
 	}
 	o.cfg.Tombstones.Replace(snap)
+	o.cfg.Metrics.setCompactionTombstoneSet(o.cfg.Tombstones.Len())
 	o.logger.InfoContext(ctx, "rebuilt live tombstone set",
 		"record_tombstones", len(snap.Records),
 		"did_tombstones", len(snap.DIDs),
