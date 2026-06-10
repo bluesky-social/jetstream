@@ -269,7 +269,7 @@ type metadataLoadResult struct {
 func loadSealedMetadata(ctx context.Context, files []ingest.SegmentFile, concurrency int, metrics *Metrics) ([]SegmentMetadata, error) {
 	results, err := gt.ConcurrentN(ctx, files, concurrency, func(f ingest.SegmentFile) (metadataLoadResult, error) {
 		start := time.Now()
-		meta, ok, err := readSealedMetadata(f.Idx, f.Path)
+		meta, ok, err := readSealedMetadata(f.Idx, f.Path, false)
 		if err != nil {
 			return metadataLoadResult{}, fmt.Errorf("manifest: read segment %s: %w", f.Path, err)
 		}
@@ -480,14 +480,15 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 
 // readSealedMetadata opens path with the segment Reader. The bool is
 // false (with nil error) iff the file is an active (unsealed) segment.
-func readSealedMetadata(idx uint64, path string) (SegmentMetadata, bool, error) {
+func readSealedMetadata(idx uint64, path string, verifyChecksum bool) (SegmentMetadata, bool, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return SegmentMetadata{}, false, fmt.Errorf("stat: %w", err)
 	}
-	// SkipChecksum=true at startup keeps cost bounded; operators who
-	// want full integrity checks run the inspect-segment command.
-	r, err := segment.Open(segment.ReaderConfig{Path: path, SkipChecksum: true})
+	// SkipChecksum=true on the startup/seal paths keeps cost bounded;
+	// the compacted-refresh path verifies (OnSegmentCompacted) and
+	// operators who want full integrity checks run inspect-segment.
+	r, err := segment.Open(segment.ReaderConfig{Path: path, SkipChecksum: !verifyChecksum})
 	if err != nil {
 		if isActiveSegmentSentinel(err) {
 			return SegmentMetadata{}, false, nil
@@ -640,16 +641,46 @@ func (m *Manifest) LookbackFloor(lookback time.Duration) (uint64, int64) {
 // an existing idx replaces the entry in place (idempotent for repeated
 // callbacks; the on-disk state is authoritative).
 func (m *Manifest) OnSegmentSealed(idx uint64, path string) error {
+	return m.refreshSegment(idx, path, false)
+}
+
+// OnSegmentCompacted re-publishes a sealed segment after a compaction
+// rewrite. Unlike OnSegmentSealed it verifies the file's header/footer
+// checksum (cheap — the xxh3 covers header+footer bytes, not block
+// data) as an integrity gate on the just-rewritten file before its
+// metadata reaches serving paths.
+func (m *Manifest) OnSegmentCompacted(idx uint64, path string) error {
+	return m.refreshSegment(idx, path, true)
+}
+
+// SegmentChecksums returns the resident header checksum of every
+// sealed segment keyed by index, as one snapshot. Used by the
+// compactor's manifest reconcile to detect stale entries without
+// re-reading full segment metadata.
+func (m *Manifest) SegmentChecksums() map[uint64]uint64 {
+	if err := m.waitReady(); err != nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[uint64]uint64, len(m.segments))
+	for i := range m.segments {
+		out[m.segments[i].Idx] = m.segments[i].Header.Checksum
+	}
+	return out
+}
+
+func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) error {
 	if err := m.waitReady(); err != nil {
 		return err
 	}
 	start := time.Now()
-	meta, ok, err := readSealedMetadata(idx, path)
+	meta, ok, err := readSealedMetadata(idx, path, verifyChecksum)
 	if err != nil {
-		return fmt.Errorf("manifest: on_segment_sealed: %w", err)
+		return fmt.Errorf("manifest: refresh segment: %w", err)
 	}
 	if !ok {
-		return fmt.Errorf("manifest: on_segment_sealed: %s appears active (zero checksum)", path)
+		return fmt.Errorf("manifest: refresh segment: %s appears active (zero checksum)", path)
 	}
 
 	m.mu.Lock()
