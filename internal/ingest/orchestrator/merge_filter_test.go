@@ -97,8 +97,20 @@ func TestShouldKeep(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "sync → keep regardless",
+			name: "sync with empty rev → keep",
 			ev:   segment.Event{Kind: segment.KindSync},
+			st:   &backfill.RepoStatus{Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete, Rev: "3l5"}},
+			want: true,
+		},
+		{
+			name: "sync with ev.Rev <= BackfillRev → drop",
+			ev:   segment.Event{Kind: segment.KindSync, Rev: "3l5"},
+			st:   &backfill.RepoStatus{Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete, Rev: "3l5"}},
+			want: false,
+		},
+		{
+			name: "sync with ev.Rev > BackfillRev → keep",
+			ev:   segment.Event{Kind: segment.KindSync, Rev: "3l6"},
 			st:   &backfill.RepoStatus{Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete, Rev: "3l5"}},
 			want: true,
 		},

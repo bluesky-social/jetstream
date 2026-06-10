@@ -2,6 +2,7 @@ package xrpcapi
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -54,10 +55,28 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 		return xrpcserver.InternalError("failed to open segment")
 	}
 	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		h.logger.Error("getSegment: stat sealed file failed",
+			slog.String("name", name), slog.String("path", ref.Path),
+			slog.Any("err", err))
+		return xrpcserver.InternalError("failed to stat segment")
+	}
+	var header [256]byte
+	if _, err := f.ReadAt(header[:], 0); err != nil {
+		h.logger.Error("getSegment: read sealed header failed",
+			slog.String("name", name), slog.String("path", ref.Path),
+			slog.Any("err", err))
+		return xrpcserver.InternalError("failed to read segment header")
+	}
+	checksum := binary.LittleEndian.Uint64(header[4:12])
+	if checksum == 0 {
+		return xrpcserver.InternalError("segment is not sealed")
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// A strong ETag is the value wrapped in double quotes per RFC 9110.
-	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(ref.Checksum)))
+	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(checksum)))
 	w.Header().Set("Cache-Control", cacheControlHeader(h.cacheMaxAge))
 
 	// ServeContent handles Range, Accept-Ranges, Content-Length,
@@ -65,7 +84,7 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 	// statusRecorder.ReadFrom delegation. Per the xrpcserver.Handler contract
 	// we MUST return nil after this point: the response may already be
 	// partially written, so an error envelope is no longer possible.
-	http.ServeContent(w, r.HTTPReq, name, ref.ModTime, f)
+	http.ServeContent(w, r.HTTPReq, name, info.ModTime(), f)
 	return nil
 }
 

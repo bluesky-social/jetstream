@@ -248,6 +248,9 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 			return res, fmt.Errorf("segment: decode block at %d: %w",
 				off, err)
 		}
+		if len(events) == 0 {
+			break
+		}
 
 		info := BlockInfo{
 			Offset:           uint64(off),

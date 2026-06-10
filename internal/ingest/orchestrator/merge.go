@@ -80,6 +80,12 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)
 		}
+		if err := initCompactionWatermarkFloor(o.cfg.Store, dst.NextSeq()); err != nil {
+			if cerr := dst.Close(); cerr != nil {
+				o.logger.WarnContext(ctx, "dst writer close after compaction watermark init failure", "err", cerr)
+			}
+			return err
+		}
 
 		runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
 
@@ -92,6 +98,21 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 
 		if err := dst.SealActiveAndClose(); err != nil {
 			return fmt.Errorf("orchestrator: merge: seal dst: %w", err)
+		}
+
+		if err := o.runDeleteCompaction(ctx, compactionMergeTail); err != nil {
+			return fmt.Errorf("orchestrator: merge-tail compaction: %w", err)
+		}
+		if o.cfg.OnSegmentCompacted != nil {
+			refreshFiles, err := listCompactionRefreshSegments(segmentsDir)
+			if err != nil {
+				return err
+			}
+			for _, sf := range refreshFiles {
+				if err := o.cfg.OnSegmentCompacted(sf.Idx, sf.Path); err != nil {
+					return fmt.Errorf("orchestrator: merge-tail compaction manifest refresh: %w", err)
+				}
+			}
 		}
 
 		if err := o.simulateCrash(ctx, crashpoint.AfterMergeDstSealBeforeDiscovery); err != nil {

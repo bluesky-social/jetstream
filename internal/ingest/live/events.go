@@ -232,12 +232,44 @@ func convertSync(evt streaming.Event, indexedAt int64) ([]segment.Event, error) 
 	if err != nil {
 		return nil, fmt.Errorf("livestream: marshal sync: %w", err)
 	}
-	return []segment.Event{{
+	out := []segment.Event{{
 		IndexedAt:           indexedAt,
 		UpstreamRelayCursor: evt.Seq,
 		Kind:                segment.KindSync,
 		DID:                 evt.Sync.DID,
 		Rev:                 evt.Sync.Rev,
 		Payload:             payload,
-	}}, nil
+	}}
+
+	// When the verifier performs a synchronous resync for this #sync
+	// event, Operations yields the authoritative post-resync record set
+	// without extra I/O. The KindSync row must remain first so its seq is
+	// below every replacement record assigned by ingest.Writer.
+	for op, err := range evt.Operations() {
+		if err != nil {
+			return nil, fmt.Errorf("livestream: decode sync resync ops for did=%s: %w", evt.Sync.DID, err)
+		}
+		kind, err := actionKind(op.Action)
+		if err != nil {
+			return nil, fmt.Errorf("livestream: did=%s: %w", op.Repo, err)
+		}
+		segEv := segment.Event{
+			IndexedAt:           indexedAt,
+			UpstreamRelayCursor: evt.Seq,
+			Kind:                kind,
+			DID:                 string(op.Repo),
+			Collection:          string(op.Collection),
+			Rkey:                string(op.RKey),
+			Rev:                 string(op.Rev),
+		}
+		if kind != segment.KindDelete {
+			block := op.BlockData()
+			if block == nil {
+				continue
+			}
+			segEv.Payload = append([]byte(nil), block...)
+		}
+		out = append(out, segEv)
+	}
+	return out, nil
 }

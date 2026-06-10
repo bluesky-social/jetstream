@@ -265,6 +265,18 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_CURSOR_BLOCK_INDEX_CACHE_SIZE"),
 				Value:   32,
 			},
+			&cli.DurationFlag{
+				Name:    "compaction-interval",
+				Usage:   "Interval between steady-state delete/update compaction passes. 0 disables compaction, including the merge-tail pass.",
+				Sources: cli.EnvVars("JETSTREAM_COMPACTION_INTERVAL"),
+				Value:   4 * time.Hour,
+			},
+			&cli.IntFlag{
+				Name:    "compaction-tombstone-cap",
+				Usage:   "Maximum tombstone entries retained before an early compaction pass is triggered.",
+				Sources: cli.EnvVars("JETSTREAM_COMPACTION_TOMBSTONE_CAP"),
+				Value:   32_000_000,
+			},
 		},
 		Action: runServe,
 	}
@@ -303,6 +315,8 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		SubscribeSlowWindow:       cmd.Duration("subscribe-slow-window"),
 		SubscribeSlowMinRate:      cmd.Float("subscribe-slow-min-rate"),
 		CursorBlockIndexCacheSize: cmd.Int("cursor-block-index-cache-size"),
+		CompactionInterval:        cmd.Duration("compaction-interval"),
+		CompactionTombstoneCap:    cmd.Int("compaction-tombstone-cap"),
 	}, nil
 }
 

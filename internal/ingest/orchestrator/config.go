@@ -11,7 +11,9 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
@@ -52,6 +54,16 @@ type Config struct {
 	// Verifier is the Sync 1.1 verifier used by both bootstrap-time
 	// and steady-state live consumers.
 	Verifier *atmossync.Verifier
+
+	// SyncStateStore is the verifier state store when it supports staged
+	// durability. It is forwarded to live consumers so verifier state commits
+	// atomically with the relay cursor after block fsync.
+	SyncStateStore *syncstate.PebbleStateStore
+
+	// Tombstones is the steady-state live tombstone set. Bootstrap leaves
+	// live.Config.Tombstones nil because live_segments are re-sequenced at
+	// merge.
+	Tombstones *tombstone.Set
 
 	// Logger is required.
 	Logger *slog.Logger
@@ -130,6 +142,20 @@ type Config struct {
 	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's
 	// OnSegmentSealed callback. Optional.
 	IngestOnAfterSeal func(idx uint64, path string) error
+
+	// OnSegmentCompacted refreshes serving metadata after a sealed segment is
+	// rewritten by compaction. cmd/jetstream wires this to the manifest refresh
+	// path. Optional before steady state; required for live serving freshness.
+	OnSegmentCompacted func(idx uint64, path string) error
+
+	// CompactionInterval controls steady-state periodic delete/update
+	// compaction. Zero disables compaction scheduling and the merge-tail pass.
+	CompactionInterval time.Duration
+
+	// CompactionTombstoneCap is the operator cap for tombstone entries. The
+	// first implementation exposes the knob and uses it for trigger accounting;
+	// chunking lands with the live tombstone set integration.
+	CompactionTombstoneCap int
 
 	// OnSteadyStateWriter, if non-nil, fires once the steady-state
 	// live consumer's ingest.Writer is constructed and registered.

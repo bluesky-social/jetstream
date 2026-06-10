@@ -52,6 +52,10 @@ func encodeBlockCompressed(events []Event) ([]byte, error) {
 	return blockEncoder.EncodeAll(body, nil), nil
 }
 
+func encodeEmptyBlockCompressed() []byte {
+	return blockEncoder.EncodeAll(encodeEmptyBlock(), nil)
+}
+
 // decodeBlockCompressed is the inverse: decompress, then decodeBlock.
 //
 // We pass a fresh `nil` dst to DecodeAll so body is a private

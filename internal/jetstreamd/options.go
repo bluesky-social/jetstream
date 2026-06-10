@@ -55,6 +55,8 @@ type Options struct {
 	SubscribeSlowWindow       time.Duration
 	SubscribeSlowMinRate      float64
 	CursorBlockIndexCacheSize int
+	CompactionInterval        time.Duration
+	CompactionTombstoneCap    int
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
 	AfterRepoComplete         func(context.Context, atmos.DID) error

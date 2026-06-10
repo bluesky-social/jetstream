@@ -10,6 +10,7 @@ import (
 // blockKey identifies one immutable decoded block.
 type blockKey struct {
 	segIdx   uint64
+	checksum uint64
 	blockIdx uint64
 }
 

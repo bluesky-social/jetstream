@@ -71,6 +71,9 @@ func ScanMaxSeq(path string) (maxSeq uint64, found bool, err error) {
 		if err != nil {
 			return 0, false, fmt.Errorf("segment: scan decode block at %d: %w", off, err)
 		}
+		if len(events) == 0 {
+			return maxSeq, found, nil
+		}
 		for _, ev := range events {
 			if !found || ev.Seq > maxSeq {
 				maxSeq = ev.Seq
@@ -118,6 +121,9 @@ func WalkActive(path string, fn func([]Event) error) error {
 		events, _, err := decodeBlockCompressedSized(frame)
 		if err != nil {
 			return fmt.Errorf("segment: decode active block %d: %w", i, err)
+		}
+		if len(events) == 0 {
+			return nil
 		}
 		if err := fn(events); err != nil {
 			return err

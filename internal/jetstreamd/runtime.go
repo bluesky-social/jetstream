@@ -24,6 +24,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/status"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/subscribe"
+	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
 	"github.com/bluesky-social/jetstream-v2/internal/web"
 	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
@@ -61,6 +62,12 @@ type Runtime struct {
 func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.SegmentCacheMaxAge < 0 {
 		return nil, fmt.Errorf("serve: --segment-cache-max-age must be >= 0 (SegmentCacheMaxAge must be >= 0), got %s", opts.SegmentCacheMaxAge)
+	}
+	if opts.CompactionInterval < 0 {
+		return nil, fmt.Errorf("serve: --compaction-interval must be >= 0 (CompactionInterval must be >= 0), got %s", opts.CompactionInterval)
+	}
+	if opts.CompactionTombstoneCap < 0 {
+		return nil, fmt.Errorf("serve: --compaction-tombstone-cap must be >= 0 (CompactionTombstoneCap must be >= 0), got %d", opts.CompactionTombstoneCap)
 	}
 
 	processLogger, err := obs.BuildLoggerFromStrings(opts.LogOutput, opts.LogLevel, opts.LogFormat)
@@ -199,6 +206,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 
 	stateStore := syncstate.New(metaStore)
+	tombstones := tombstone.New()
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
@@ -252,12 +260,14 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		}
 	}
 	orch, err := orchestrator.New(orchestrator.Config{
-		DataDir:    opts.DataDir,
-		Store:      metaStore,
-		RelayURL:   opts.RelayURL,
-		HTTPClient: xrpcClient.HTTPClient.Val(),
-		Directory:  directory,
-		Verifier:   verifier,
+		DataDir:        opts.DataDir,
+		Store:          metaStore,
+		RelayURL:       opts.RelayURL,
+		HTTPClient:     xrpcClient.HTTPClient.Val(),
+		Directory:      directory,
+		Verifier:       verifier,
+		SyncStateStore: stateStore,
+		Tombstones:     tombstones,
 		// Bare logger; orchestrator.New attaches component=orchestrator
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.
@@ -275,6 +285,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		BackfillRetryBaseDelay: opts.BackfillRetryBaseDelay,
 		LiveReconnectBackoff:   opts.LiveReconnectBackoff,
 		IngestOnAfterSeal:      mft.OnSegmentSealed,
+		OnSegmentCompacted:     mft.OnSegmentSealed,
+		CompactionInterval:     opts.CompactionInterval,
+		CompactionTombstoneCap: opts.CompactionTombstoneCap,
 		BarrierAfterBootstrap:  phaseBarrier(opts.BarrierAfterBootstrap),
 		BarrierAfterMerge:      phaseBarrier(opts.BarrierAfterMerge),
 		AfterRepoComplete:      opts.AfterRepoComplete,

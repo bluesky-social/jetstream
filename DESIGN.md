@@ -340,21 +340,22 @@ Jetstream supports record updates, record deletion, and account deletion. When a
 
 As updates and deletions come over the firehose, and we store them in the active segment file as normal. However, we do eventually need to alter the original source data in older, sealed segment files to ensure we’re not storing data that the user requested be deleted. The process of cleaning up the older data is known as compaction.
 
-We have a compaction thread that runs every so often (once every 4 hours by default) that reads recent updates and deletions from sealed and active segment files, alters the older segment files containing the original records, then re-seals them with new header and footer data to match. We don’t immediately update sealed segment files because doing so would be computationally expensive, and it would kill our ability to serve sealed segment files over the CDN.
+Compaction runs once at the tail of the merge phase, after the destination segments are sealed and before the server enters `phase=steady_state`. This makes the first served archive view delete/update compliant. In steady state, compaction runs every `--compaction-interval` (`JETSTREAM_COMPACTION_INTERVAL`, default `4h`; `0` disables compaction) and can also run early when the in-memory tombstone set reaches `--compaction-tombstone-cap` (`JETSTREAM_COMPACTION_TOMBSTONE_CAP`, default `32000000`).
 
-In the pebble kv store, we keep track of the sequence number of the most recent compaction checkpoint spot. Then the next time we compact, we find all records since the previous compaction sequence number, and the process repeats.
+In the pebble kv store, we keep track of `compaction/seq`, the highest sequence number covered by physical compaction. Each pass gathers tombstones above the prior watermark, rewrites affected sealed segment files with a temporary-file + fsync + rename sequence, then advances the watermark only after every rewrite has completed.
 
-We also store the updates and deletions since the most recent compaction in-memory in the server to act as tombstones, and re-populate that cache on process restart to ensure we have the working set of deletes and updates resident.
+Tombstones are retained as event rows forever. Record tombstones come from `KindDelete` and `KindUpdate`; DID tombstones come from account deletes (`active=false`, `status=deleted`) and `KindSync`. Compaction physically removes only superseded `KindCreate` and `KindUpdate` rows older than the tombstone seq. Delete, account, identity, and sync rows are retained so mid-stream clients and future audit tooling can observe the event history.
 
-When the client calls the jetstream server to assemble a query plan, it must first download the recent update/deletion tombstones, then start streaming the live firehose, then it may begin backfilling data. We use those update/delete tombstones as a marker to indicate that any records seen for a URI or account during the backfill of segment files should be hidden to the caller as part of the event loop. The in-memory cache is small relative to the 
+Segment rewrites preserve block topology and historical seq/indexed-at envelopes. A block whose rows are all dropped remains present as an `event_count=0` block, so manifest block indexes, cursor translation, and cold replay can continue to use stable block numbers across generations. Rewritten files get new checksums; HTTP downloads derive validators from the file descriptor they serve, and the subscribe block cache keys decoded blocks by segment checksum.
+
+We also store tombstones since the most recent compaction in memory in the server. Today this powers steady-state compaction and early cap-triggered passes. A future read-time overlay will expose this same structure to backfill clients so they can suppress rows newer than the physical compaction watermark.
 
 Putting it all together, the query plan and client code looks something like the following:
 
 1. The client connects to the jetstream live tail and starts receiving the most recent records
-    1. If a re-creation event for a record or account comes over the firehose, the tombstone is cleared until a corresponding delete for that record or account arrives over the firehose again. This avoids the “permanent tombstone” problem. We need to be able to support repeated creation and deletion of a single record or account
 2. The client negotiates a plan of which segment file blocks it must download to satisfy a particular query (i.e. “give me all `standard.site` documents”)
-3. The client downloads the list of recent deletions and updates
-4. The client begins download the segment file blocks and decompresses them in an attempt to emit records that match the user’s query
+3. Future read-overlay work: the client downloads the list of recent deletions and updates above `compaction/seq`
+4. The client begins downloading the segment file blocks and decompresses them in an attempt to emit records that match the user’s query
 5. If the record's DID is in the suppression set of deleted accounts, suppress the row
 6. If the URI of the record from the segment file maps to a known deletion tombstone, suppress the row
 7. If the URI of the record from the segment file maps to a known update, emit the record with the replacement rev and payload

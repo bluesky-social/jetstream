@@ -146,7 +146,7 @@ func TestEncodeBlockUncompressedHandcrafted(t *testing.T) {
 	require.Equal(t, want.Bytes(), got)
 }
 
-func TestEncodeBlockEmptyReturnsError(t *testing.T) {
+func TestEncodeBlockEmptyReturnsErrorAndDecodeAcceptsExplicitEmpty(t *testing.T) {
 	t.Parallel()
 
 	// Zero events is not a meaningful block; the writer's Flush is
@@ -154,6 +154,10 @@ func TestEncodeBlockEmptyReturnsError(t *testing.T) {
 	// caller can never accidentally write a zero-event block.
 	_, err := encodeBlock(nil)
 	require.Error(t, err)
+
+	got, err := decodeBlock(encodeEmptyBlock())
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
 
 func TestDecodeBlockRoundtripHandcrafted(t *testing.T) {

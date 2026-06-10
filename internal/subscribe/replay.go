@@ -109,7 +109,7 @@ func decodeSealedBlock(cache *blockCache, segIdx uint64, blockIdx int, r *segmen
 		return r.DecodeBlock(blockIdx)
 	}
 	return cache.getOrDecode(
-		blockKey{segIdx: segIdx, blockIdx: uint64(blockIdx)},
+		blockKey{segIdx: segIdx, checksum: r.Header().Checksum, blockIdx: uint64(blockIdx)},
 		func() ([]segment.Event, error) { return r.DecodeBlock(blockIdx) },
 	)
 }

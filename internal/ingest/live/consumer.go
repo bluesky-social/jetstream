@@ -17,6 +17,7 @@ import (
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/jcalabro/gt"
@@ -126,7 +127,7 @@ func (c *Consumer) Close() error {
 	// path). Persist the final cursor explicitly.
 	cur := c.cursorValue()
 	if cur > 0 {
-		if err := SaveUpstreamCursor(c.cfg.Store, c.cfg.CursorKey, cur); err != nil {
+		if err := c.saveCursorAndSyncState(cur); err != nil {
 			return fmt.Errorf("livestream: close: save cursor: %w", err)
 		}
 		c.cfg.Metrics.setUpstreamCursor(cur)
@@ -172,10 +173,33 @@ func (c *Consumer) onAfterFlush(ctx context.Context) error {
 		// nothing to persist.
 		return nil
 	}
-	if err := SaveUpstreamCursor(c.cfg.Store, c.cfg.CursorKey, cur); err != nil {
+	if err := c.saveCursorAndSyncState(cur); err != nil {
 		return err
 	}
 	c.cfg.Metrics.setUpstreamCursor(cur)
+	return nil
+}
+
+func (c *Consumer) saveCursorAndSyncState(cur int64) error {
+	if cur < 0 {
+		return fmt.Errorf("livestream: refuse to save negative cursor %d to %s", cur, c.cfg.CursorKey)
+	}
+	b := c.cfg.Store.NewBatch()
+	defer func() { _ = b.Close() }()
+	if err := b.Set([]byte(c.cfg.CursorKey), store.EncodeVersionedUint64LE(cursorV1, uint64(cur)), nil); err != nil {
+		return fmt.Errorf("livestream: stage %s: %w", c.cfg.CursorKey, err)
+	}
+	if c.cfg.SyncStateStore != nil {
+		if err := c.cfg.SyncStateStore.StageFlush(b); err != nil {
+			return err
+		}
+	}
+	if err := c.cfg.Store.Commit(b, store.SyncWrites); err != nil {
+		return fmt.Errorf("livestream: save %s: %w", c.cfg.CursorKey, err)
+	}
+	if c.cfg.SyncStateStore != nil {
+		c.cfg.SyncStateStore.CommitStaged()
+	}
 	return nil
 }
 
@@ -359,6 +383,12 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				if err := c.writer.Append(ctx, &segEvts[i]); err != nil {
 					return fmt.Errorf("livestream: append: %w", err)
 				}
+				if c.cfg.Tombstones != nil {
+					if err := c.cfg.Tombstones.Observe(&segEvts[i]); err != nil {
+						return fmt.Errorf("livestream: update tombstone set: %w", err)
+					}
+					c.maybeTriggerCompaction()
+				}
 				c.cfg.Metrics.incEventsConverted()
 
 				// Forward to downstream subscribers AFTER durable append.
@@ -379,6 +409,19 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 		return nil
 	})
+}
+
+func (c *Consumer) maybeTriggerCompaction() {
+	if c.cfg.TombstoneCap <= 0 || c.cfg.CompactionTrigger == nil || c.cfg.Tombstones == nil {
+		return
+	}
+	if c.cfg.Tombstones.Len() < c.cfg.TombstoneCap {
+		return
+	}
+	select {
+	case c.cfg.CompactionTrigger <- struct{}{}:
+	default:
+	}
 }
 
 func (c *Consumer) noteUpstreamSeq(seq int64) {

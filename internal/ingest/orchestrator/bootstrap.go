@@ -71,6 +71,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			Logger:           o.cfg.Logger,
 			Metrics:          o.cfg.LiveMetrics,
 			Verifier:         o.cfg.Verifier,
+			SyncStateStore:   o.cfg.SyncStateStore,
 			SegmentMetrics:   o.cfg.SegmentMetrics,
 			OnEvent:          o.cfg.OnBootstrapLiveEvent,
 			ReconnectBackoff: o.cfg.LiveReconnectBackoff,

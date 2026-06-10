@@ -22,6 +22,8 @@ type Orchestrator struct {
 	// without slog stacking duplicate keys (slog appends; it does not
 	// replace).
 	logger *slog.Logger
+
+	compactionTrigger chan struct{}
 }
 
 // New validates cfg and returns an Orchestrator ready to Run.
@@ -30,8 +32,9 @@ func New(cfg Config) (*Orchestrator, error) {
 		return nil, err
 	}
 	return &Orchestrator{
-		cfg:    cfg,
-		logger: cfg.Logger.With(slog.String("component", "orchestrator")),
+		cfg:               cfg,
+		logger:            cfg.Logger.With(slog.String("component", "orchestrator")),
+		compactionTrigger: make(chan struct{}, 1),
 	}, nil
 }
 

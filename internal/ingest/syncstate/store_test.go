@@ -36,7 +36,8 @@ func TestStateStore_LoadChain_AbsentReturnsNil(t *testing.T) {
 
 func TestStateStore_ChainRoundTrip(t *testing.T) {
 	t.Parallel()
-	s := New(newTestStore(t))
+	raw := newTestStore(t)
+	s := New(raw)
 	did := parseDID(t, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
 	want := atmossync.ChainState{Rev: "3l3qo2vutsw2b", Data: fixedCID(t)}
 
@@ -46,11 +47,23 @@ func TestStateStore_ChainRoundTrip(t *testing.T) {
 	require.NotNil(t, got)
 	require.Equal(t, want.Rev, got.Rev)
 	require.True(t, want.Data.Equal(got.Data))
+
+	fresh := New(raw)
+	absent, err := fresh.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Nil(t, absent, "staged chain state must not be durable before Flush")
+
+	require.NoError(t, s.Flush())
+	durable, err := fresh.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.NotNil(t, durable)
+	require.Equal(t, want.Rev, durable.Rev)
 }
 
 func TestStateStore_HostingRoundTrip(t *testing.T) {
 	t.Parallel()
-	s := New(newTestStore(t))
+	raw := newTestStore(t)
+	s := New(raw)
 	did := parseDID(t, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
 	want := atmossync.HostingState{
 		Active: false,
@@ -64,6 +77,17 @@ func TestStateStore_HostingRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	require.Equal(t, want, *got)
+
+	fresh := New(raw)
+	absent, err := fresh.LoadHosting(t.Context(), did)
+	require.NoError(t, err)
+	require.Nil(t, absent, "staged hosting state must not be durable before Flush")
+
+	require.NoError(t, s.Flush())
+	durable, err := fresh.LoadHosting(t.Context(), did)
+	require.NoError(t, err)
+	require.NotNil(t, durable)
+	require.Equal(t, want, *durable)
 }
 
 func TestStateStore_DistinctKeyspaces(t *testing.T) {
