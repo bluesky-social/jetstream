@@ -358,6 +358,10 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 // concatenated, plus the partially-populated Header (Checksum left
 // zero; the caller fills it in after computing xxh3).
 func buildFooter(walk blockWalkResult, maxEventsPerBlock int, footerOffset int64) ([]byte, Header, error) {
+	return buildFooterWithBloomParams(walk, maxEventsPerBlock, footerOffset, nil)
+}
+
+func buildFooterWithBloomParams(walk blockWalkResult, maxEventsPerBlock int, footerOffset int64, perBlockParams *bloomParams) ([]byte, Header, error) {
 	// 1. Block index.
 	blockIndexBytes := encodeBlockIndex(walk.infos)
 
@@ -374,7 +378,12 @@ func buildFooter(walk blockWalkResult, maxEventsPerBlock int, footerOffset int64
 	// 3. Per-block DID blooms.
 	perBlockFilters := make([]*gloom.Filter, len(walk.perBlockDIDs))
 	for i, dids := range walk.perBlockDIDs {
-		f := gloom.New(uint64(maxEventsPerBlock), perBlockBloomFPRate)
+		var f *gloom.Filter
+		if perBlockParams != nil {
+			f = gloom.NewWithParams(perBlockParams.numBlocks, perBlockParams.k)
+		} else {
+			f = gloom.New(uint64(maxEventsPerBlock), perBlockBloomFPRate)
+		}
 		for did := range dids {
 			f.AddString(did)
 		}

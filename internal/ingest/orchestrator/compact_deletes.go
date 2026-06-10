@@ -172,6 +172,65 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context) error {
 	}
 }
 
+func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
+	if o.cfg.Tombstones == nil {
+		return nil
+	}
+	segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
+	watermark, _, err := loadCompactionWatermark(o.cfg.Store)
+	if err != nil {
+		return err
+	}
+	files, err := ingest.SegmentFiles(segmentsDir)
+	if err != nil {
+		return fmt.Errorf("orchestrator: compaction: rebuild tombstones list: %w", err)
+	}
+	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]uint64)}
+	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, SkipChecksum: true})
+		if err == nil {
+			for i := range int(r.Header().BlockCount) {
+				events, err := r.DecodeBlock(i)
+				if err != nil {
+					_ = r.Close()
+					return fmt.Errorf("orchestrator: compaction: rebuild decode %s block %d: %w", f.Path, i, err)
+				}
+				part, err := tombstone.Fold(events, watermark)
+				if err != nil {
+					_ = r.Close()
+					return err
+				}
+				snap.Merge(part)
+			}
+			_ = r.Close()
+			continue
+		}
+		if !errors.Is(err, segment.ErrActiveSegment) {
+			return fmt.Errorf("orchestrator: compaction: rebuild open %s: %w", f.Path, err)
+		}
+		if err := segment.WalkActive(f.Path, func(events []segment.Event) error {
+			part, err := tombstone.Fold(events, watermark)
+			if err != nil {
+				return err
+			}
+			snap.Merge(part)
+			return nil
+		}); err != nil {
+			return fmt.Errorf("orchestrator: compaction: rebuild walk active %s: %w", f.Path, err)
+		}
+	}
+	o.cfg.Tombstones.Replace(snap)
+	o.logger.InfoContext(ctx, "rebuilt live tombstone set",
+		"record_tombstones", len(snap.Records),
+		"did_tombstones", len(snap.DIDs),
+		"watermark", watermark,
+	)
+	return nil
+}
+
 func removeStaleCompactionTemps(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

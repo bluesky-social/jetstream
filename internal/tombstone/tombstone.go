@@ -73,6 +73,19 @@ func (s *Set) Evict(maxSeq uint64) {
 	}
 }
 
+func (s *Set) Replace(snapshot Snapshot) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records = make(map[RecordKey]uint64, len(snapshot.Records))
+	for k, seq := range snapshot.Records {
+		s.records[k] = seq
+	}
+	s.dids = make(map[string]uint64, len(snapshot.DIDs))
+	for did, seq := range snapshot.DIDs {
+		s.dids[did] = seq
+	}
+}
+
 func (s *Set) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

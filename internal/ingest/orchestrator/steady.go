@@ -39,6 +39,9 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 		o.cfg.Metrics.setPhase(PhaseGaugeSteadyState)
 
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
+		if err := o.rebuildLiveTombstones(ctx); err != nil {
+			return err
+		}
 
 		c, err := live.Open(live.Config{
 			SegmentsDir: segmentsDir,

@@ -42,6 +42,22 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	src := r.file
 	header := r.Header()
 	blocks := r.Blocks()
+	var perBlockParams *bloomParams
+	if len(blocks) > 0 {
+		firstBloom, err := r.BlockBloom(0)
+		if err != nil {
+			return RewriteResult{}, err
+		}
+		encodedBloom, err := firstBloom.MarshalBinary()
+		if err != nil {
+			return RewriteResult{}, fmt.Errorf("segment: rewrite marshal source bloom params: %w", err)
+		}
+		params, err := parseBloomParams(encodedBloom)
+		if err != nil {
+			return RewriteResult{}, err
+		}
+		perBlockParams = &params
+	}
 
 	type outBlock struct {
 		frame []byte
@@ -150,7 +166,7 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	}
 
 	footerOffset := int64(nextOffset)
-	footerBytes, newHeader, err := buildFooter(walk, DefaultMaxEventsPerBlock, footerOffset)
+	footerBytes, newHeader, err := buildFooterWithBloomParams(walk, DefaultMaxEventsPerBlock, footerOffset, perBlockParams)
 	if err != nil {
 		return RewriteResult{}, err
 	}
