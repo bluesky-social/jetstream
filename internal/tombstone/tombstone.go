@@ -93,9 +93,13 @@ func (s *Set) Len() int {
 }
 
 func Fold(events []segment.Event, watermark uint64) (Snapshot, error) {
+	return FoldRange(events, watermark, ^uint64(0))
+}
+
+func FoldRange(events []segment.Event, lowExclusive, highInclusive uint64) (Snapshot, error) {
 	out := Snapshot{Records: make(map[RecordKey]uint64), DIDs: make(map[string]uint64)}
 	for i := range events {
-		if events[i].Seq <= watermark {
+		if events[i].Seq <= lowExclusive || events[i].Seq > highInclusive {
 			continue
 		}
 		if err := observeLocked(out.Records, out.DIDs, &events[i]); err != nil {

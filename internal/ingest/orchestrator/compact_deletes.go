@@ -21,6 +21,11 @@ const (
 	compactionSteady
 )
 
+type sealedCompactionSegment struct {
+	ingest.SegmentFile
+	header segment.Header
+}
+
 func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionMode) error {
 	if o.cfg.CompactionInterval == 0 {
 		return nil
@@ -46,11 +51,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			return retErr
 		}
 
-		type sealedSegment struct {
-			ingest.SegmentFile
-			header segment.Header
-		}
-		sealed := make([]sealedSegment, 0, len(files))
+		sealed := make([]sealedCompactionSegment, 0, len(files))
 		var targetWatermark uint64
 		for _, f := range files {
 			r, err := segment.Open(segment.ReaderConfig{Path: f.Path, SkipChecksum: true})
@@ -63,7 +64,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			}
 			h := r.Header()
 			_ = r.Close()
-			sealed = append(sealed, sealedSegment{SegmentFile: f, header: h})
+			sealed = append(sealed, sealedCompactionSegment{SegmentFile: f, header: h})
 			if h.EventCount > 0 && h.MaxSeq > targetWatermark {
 				targetWatermark = h.MaxSeq
 			}
@@ -81,99 +82,124 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			return nil
 		}
 
-		snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]uint64)}
-		for _, f := range sealed {
-			if f.header.MaxSeq <= watermark || f.header.MinSeq > targetWatermark {
-				continue
-			}
-			if err := ctx.Err(); err != nil {
+		current := watermark
+		for current < targetWatermark {
+			snap, chunkEnd, err := o.collectCompactionTombstones(ctx, sealed, current, targetWatermark)
+			if err != nil {
 				retErr = err
 				return err
 			}
-			r, err := segment.Open(segment.ReaderConfig{Path: f.Path, SkipChecksum: true})
-			if err != nil {
-				return fmt.Errorf("orchestrator: compaction: open source %s: %w", f.Path, err)
+			if chunkEnd <= current {
+				chunkEnd = targetWatermark
 			}
-			for i := range int(r.Header().BlockCount) {
-				events, err := r.DecodeBlock(i)
-				if err != nil {
-					_ = r.Close()
-					retErr = fmt.Errorf("orchestrator: compaction: decode source %s block %d: %w", f.Path, i, err)
-					return retErr
-				}
-				part, err := tombstone.Fold(events, watermark)
-				if err != nil {
-					_ = r.Close()
+			o.cfg.Metrics.addCompactionTombstones("record", len(snap.Records))
+			o.cfg.Metrics.addCompactionTombstones("did", len(snap.DIDs))
+
+			if !snap.Empty() {
+				if err := o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode); err != nil {
 					retErr = err
 					return err
 				}
-				snap.Merge(part)
 			}
-			_ = r.Close()
-		}
-		o.cfg.Metrics.addCompactionTombstones("record", len(snap.Records))
-		o.cfg.Metrics.addCompactionTombstones("did", len(snap.DIDs))
 
-		if !snap.Empty() {
-			for _, f := range sealed {
-				if err := ctx.Err(); err != nil {
-					retErr = err
-					return err
-				}
-				o.cfg.Metrics.incCompactionSegmentsExamined()
-				droppedByReason := map[string]uint64{}
-				res, err := segment.Rewrite(f.Path, func(ev *segment.Event) segment.RowDecision {
-					if ev.Seq > targetWatermark {
-						return segment.RowKeep
-					}
-					if drop, reason := snap.ShouldDrop(ev); drop {
-						droppedByReason[reason]++
-						return segment.RowDrop
-					}
-					return segment.RowKeep
-				}, segment.RewriteOptions{})
-				if err != nil {
-					retErr = fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err)
-					return retErr
-				}
-				if res.Rewritten {
-					o.cfg.Metrics.incCompactionSegmentsRewritten()
-					for reason, n := range droppedByReason {
-						o.cfg.Metrics.addCompactionRowsDropped(reason, n)
-					}
-					if info, err := os.Stat(f.Path); err == nil {
-						o.cfg.Metrics.addCompactionBytesRewritten(info.Size())
-					}
-					if mode == compactionSteady && o.cfg.OnSegmentCompacted != nil {
-						if err := o.cfg.OnSegmentCompacted(f.Idx, f.Path); err != nil {
-							retErr = fmt.Errorf("orchestrator: compaction: refresh manifest: %w", err)
-							return retErr
-						}
-						o.cfg.Metrics.incCompactionManifestReconciled()
-					}
-				} else {
-					o.cfg.Metrics.incCompactionSegmentsClean()
-				}
+			if err := saveCompactionWatermark(o.cfg.Store, chunkEnd); err != nil {
+				retErr = err
+				return err
 			}
-		}
-
-		if err := saveCompactionWatermark(o.cfg.Store, targetWatermark); err != nil {
-			retErr = err
-			return err
-		}
-		o.cfg.Metrics.setCompactionWatermark(targetWatermark)
-		if o.cfg.Tombstones != nil {
-			o.cfg.Tombstones.Evict(targetWatermark)
-			o.cfg.Metrics.setCompactionTombstoneSet(o.cfg.Tombstones.Len())
+			o.cfg.Metrics.setCompactionWatermark(chunkEnd)
+			if o.cfg.Tombstones != nil {
+				o.cfg.Tombstones.Evict(chunkEnd)
+				o.cfg.Metrics.setCompactionTombstoneSet(o.cfg.Tombstones.Len())
+			}
+			current = chunkEnd
 		}
 		o.logger.InfoContext(ctx, "delete compaction pass complete",
 			"watermark", targetWatermark,
-			"record_tombstones", len(snap.Records),
-			"did_tombstones", len(snap.DIDs),
 			"mode", mode,
 		)
 		return nil
 	})
+}
+
+func (o *Orchestrator) collectCompactionTombstones(ctx context.Context, sealed []sealedCompactionSegment, watermark, targetWatermark uint64) (tombstone.Snapshot, uint64, error) {
+	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]uint64)}
+	chunkEnd := targetWatermark
+	capEntries := o.cfg.CompactionTombstoneCap
+	for _, f := range sealed {
+		if f.header.MaxSeq <= watermark || f.header.MinSeq > targetWatermark {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return tombstone.Snapshot{}, 0, err
+		}
+		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, SkipChecksum: true})
+		if err != nil {
+			return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: open source %s: %w", f.Path, err)
+		}
+		for i := range int(r.Header().BlockCount) {
+			events, err := r.DecodeBlock(i)
+			if err != nil {
+				_ = r.Close()
+				return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: decode source %s block %d: %w", f.Path, i, err)
+			}
+			part, err := tombstone.FoldRange(events, watermark, targetWatermark)
+			if err != nil {
+				_ = r.Close()
+				return tombstone.Snapshot{}, 0, err
+			}
+			snap.Merge(part)
+		}
+		_ = r.Close()
+		if capEntries > 0 && len(snap.Records)+len(snap.DIDs) >= capEntries {
+			chunkEnd = f.header.MaxSeq
+			if chunkEnd > targetWatermark {
+				chunkEnd = targetWatermark
+			}
+			break
+		}
+	}
+	return snap, chunkEnd, nil
+}
+
+func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealedCompactionSegment, snap tombstone.Snapshot, chunkEnd uint64, mode compactionMode) error {
+	for _, f := range sealed {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		o.cfg.Metrics.incCompactionSegmentsExamined()
+		droppedByReason := map[string]uint64{}
+		res, err := segment.Rewrite(f.Path, func(ev *segment.Event) segment.RowDecision {
+			if ev.Seq > chunkEnd {
+				return segment.RowKeep
+			}
+			if drop, reason := snap.ShouldDrop(ev); drop {
+				droppedByReason[reason]++
+				return segment.RowDrop
+			}
+			return segment.RowKeep
+		}, segment.RewriteOptions{})
+		if err != nil {
+			return fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err)
+		}
+		if res.Rewritten {
+			o.cfg.Metrics.incCompactionSegmentsRewritten()
+			for reason, n := range droppedByReason {
+				o.cfg.Metrics.addCompactionRowsDropped(reason, n)
+			}
+			if info, err := os.Stat(f.Path); err == nil {
+				o.cfg.Metrics.addCompactionBytesRewritten(info.Size())
+			}
+			if mode == compactionSteady && o.cfg.OnSegmentCompacted != nil {
+				if err := o.cfg.OnSegmentCompacted(f.Idx, f.Path); err != nil {
+					return fmt.Errorf("orchestrator: compaction: refresh manifest: %w", err)
+				}
+				o.cfg.Metrics.incCompactionManifestReconciled()
+			}
+		} else {
+			o.cfg.Metrics.incCompactionSegmentsClean()
+		}
+	}
+	return nil
 }
 
 func (o *Orchestrator) runSteadyCompactor(ctx context.Context) error {
