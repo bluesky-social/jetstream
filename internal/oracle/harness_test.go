@@ -64,8 +64,18 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	afterMerge := newPhaseGate()
 	bootstrapAck := newSeqAck()
 	steadyAck := newSeqAck()
+	compaction := newCompactionPassRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
+	emittedBootstrapAccountDelete := false
 	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, func(ctx context.Context) (int64, error) {
+		if !emittedBootstrapAccountDelete {
+			emittedBootstrapAccountDelete = true
+			_, err := w.GenerateAccountDeleteForTest(ctx, 0)
+			if err != nil {
+				return 0, err
+			}
+			return w.CurrentSeq(), nil
+		}
 		_, err := w.GenerateOneForTest(ctx)
 		if err != nil {
 			return 0, err
@@ -108,8 +118,10 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		SubscribeSlowWindow:       time.Second,
 		SubscribeSlowMinRate:      1,
 		CursorBlockIndexCacheSize: 32,
+		CompactionInterval:        time.Hour,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
+		OnCompactionPass:          compaction.Observe,
 		OnBootstrapLiveEvent:      bootstrapAck.Observe,
 		OnSteadyStateEvent:        steadyAck.Observe,
 		AfterRepoComplete:         bootstrapTraffic.AfterRepoComplete,
@@ -141,6 +153,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 
 	waitForBarrier(t, cfg, "after-merge", afterMerge, run)
 	assertOracleMatches(t, dataDir, w, cfg, "after-merge")
+	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "after-merge")
 	faultPlan.ArmSubscribeReposDisconnects()
 	afterMerge.Release()
 
@@ -159,6 +172,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	runDone = true
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
+	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "steady-state-shutdown-flush")
 }
 
 // assertFaultPlanFired verifies the fault injection actually happened.
@@ -212,6 +226,15 @@ func assertOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Confi
 	t.Logf("%s: oracle matched %d observed events in mode=%s seed=%d", phase, len(events), cfg.Mode, cfg.Seed)
 }
 
+func assertCompacted(t *testing.T, dataDir string, watermark uint64, cfg Config, phase string) {
+	t.Helper()
+
+	events, err := ObserveSegments(dataDir)
+	require.NoErrorf(t, err, "%s mode=%s seed=%d: observe segments for compaction", phase, cfg.Mode, cfg.Seed)
+	require.NoErrorf(t, CheckCompacted(EventsSortedBySeq(events), watermark),
+		"%s mode=%s seed=%d: check compacted watermark=%d", phase, cfg.Mode, cfg.Seed, watermark)
+}
+
 func assertBootstrapOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Config) {
 	t.Helper()
 
@@ -257,6 +280,31 @@ func (g *phaseGate) Release() {
 type runtimeRun struct {
 	exited chan struct{}
 	err    error
+}
+
+type compactionPassRecorder struct {
+	mu      sync.Mutex
+	results []jetstreamd.CompactionPassResult
+}
+
+func newCompactionPassRecorder() *compactionPassRecorder {
+	return &compactionPassRecorder{}
+}
+
+func (r *compactionPassRecorder) Observe(result jetstreamd.CompactionPassResult) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.results = append(r.results, result)
+}
+
+func (r *compactionPassRecorder) Last(t *testing.T) jetstreamd.CompactionPassResult {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	require.NotEmpty(t, r.results, "expected at least one compaction pass")
+	last := r.results[len(r.results)-1]
+	require.NoError(t, last.Err, "latest compaction pass failed")
+	return last
 }
 
 func waitForBarrier(t *testing.T, cfg Config, name string, gate *phaseGate, run *runtimeRun) {

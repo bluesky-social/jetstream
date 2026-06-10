@@ -25,6 +25,11 @@ import (
 // lifecycle phases.
 type PhaseBarrier func(context.Context) error
 
+type CompactionPassResult struct {
+	Watermark uint64
+	Err       error
+}
+
 // Config controls Orchestrator behavior. cmd/jetstream constructs
 // exactly one of these per process and hands it to New.
 //
@@ -156,6 +161,11 @@ type Config struct {
 	// first implementation exposes the knob and uses it for trigger accounting;
 	// chunking lands with the live tombstone set integration.
 	CompactionTombstoneCap int
+
+	// OnCompactionPass, if non-nil, fires after each enabled compaction pass
+	// attempt, including no-op and failed passes. Test/oracle hook only;
+	// production leaves it nil.
+	OnCompactionPass func(CompactionPassResult)
 
 	// OnSteadyStateWriter, if non-nil, fires once the steady-state
 	// live consumer's ingest.Writer is constructed and registered.

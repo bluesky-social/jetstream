@@ -1,14 +1,18 @@
 package world
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/crypto"
+	"github.com/jcalabro/gt"
 )
 
 // account is the in-memory shape of a single simulated user's
@@ -107,4 +111,55 @@ func (w *World) loadAccount(idx int) (account, error) {
 		PrivKeyBytes: append([]byte(nil), keyVal...),
 		priv:         priv,
 	}, nil
+}
+
+func (w *World) isAccountDeleted(idx int) (bool, error) {
+	val, closer, err := w.db.Get(keyAccountDeleted(idx))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("world: load account %d deleted status: %w", idx, err)
+	}
+	defer func() { _ = closer.Close() }()
+	return len(val) == 1 && val[0] == 1, nil
+}
+
+func (w *World) generateAccountDelete(ctx context.Context, idx int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	a, err := w.loadAccount(idx)
+	if err != nil {
+		return nil, err
+	}
+
+	seq := w.seq.Add(1)
+	envelope := &comatproto.SyncSubscribeRepos_Account{
+		DID:    string(a.DID),
+		Active: false,
+		Status: gt.Some("deleted"),
+		Seq:    seq,
+		Time:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+	}
+	frame, err := encodeAccountFrame(envelope)
+	if err != nil {
+		return nil, err
+	}
+
+	b := w.db.NewBatch()
+	defer func() { _ = b.Close() }()
+	if err := b.Set(keyAccountDeleted(idx), []byte{1}, nil); err != nil {
+		return nil, fmt.Errorf("world: stage account deleted: %w", err)
+	}
+	if err := stageFirehoseFrame(b, seq, frame, w.cfg.FirehoseHistory); err != nil {
+		return nil, err
+	}
+	if err := b.Commit(pebble.NoSync); err != nil {
+		return nil, fmt.Errorf("world: commit account delete: %w", err)
+	}
+	if w.fanout != nil {
+		w.fanout.Publish(frame)
+	}
+	return frame, nil
 }

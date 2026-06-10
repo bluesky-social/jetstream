@@ -15,6 +15,13 @@ func GroundTruthFromWorld(w *world.World) (*Model, error) {
 		if err != nil {
 			return nil, err
 		}
+		deleted, err := w.IsAccountDeleted(idx)
+		if err != nil {
+			return nil, err
+		}
+		if deleted {
+			continue
+		}
 		rp, _, err := w.LoadRepo(idx)
 		if err != nil {
 			return nil, err

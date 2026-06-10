@@ -145,11 +145,15 @@ func (w *World) ListReposPage(start, limit int) (entries []ListReposEntry, nextS
 		if err != nil {
 			return nil, 0, err
 		}
+		deleted, err := w.isAccountDeleted(i)
+		if err != nil {
+			return nil, 0, err
+		}
 		out = append(out, ListReposEntry{
 			DID:    a.DID,
 			Rev:    state.Rev,
 			Head:   state.CommitCID.String(),
-			Active: true,
+			Active: !deleted,
 		})
 	}
 	return out, end, nil
@@ -168,4 +172,12 @@ func EncodeOutdatedCursorInfo() []byte {
 // individual events synchronously.
 func (w *World) GenerateOneForTest(ctx context.Context) ([]byte, error) {
 	return w.generateOne(ctx)
+}
+
+func (w *World) GenerateAccountDeleteForTest(ctx context.Context, idx int) ([]byte, error) {
+	return w.generateAccountDelete(ctx, idx)
+}
+
+func (w *World) IsAccountDeleted(idx int) (bool, error) {
+	return w.isAccountDeleted(idx)
 }

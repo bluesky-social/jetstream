@@ -32,7 +32,13 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 	}
 	start := time.Now()
 	var retErr error
-	defer func() { o.cfg.Metrics.observeCompactionPass(start, retErr) }()
+	var finalWatermark uint64
+	defer func() {
+		o.cfg.Metrics.observeCompactionPass(start, retErr)
+		if o.cfg.OnCompactionPass != nil {
+			o.cfg.OnCompactionPass(CompactionPassResult{Watermark: finalWatermark, Err: retErr})
+		}
+	}()
 	return obs.Span(ctx, func(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 		if err := removeStaleCompactionTemps(segmentsDir); err != nil {
@@ -45,6 +51,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			retErr = err
 			return err
 		}
+		finalWatermark = watermark
 		files, err := ingest.SegmentFiles(segmentsDir)
 		if err != nil {
 			retErr = fmt.Errorf("orchestrator: compaction: list segments: %w", err)
@@ -115,6 +122,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 				return err
 			}
 			o.cfg.Metrics.setCompactionWatermark(chunkEnd)
+			finalWatermark = chunkEnd
 			o.cfg.Metrics.setCompactionWatermarkLag(compactionWatermarkLagSeconds(sealed, chunkEnd))
 			if o.cfg.Tombstones != nil {
 				o.cfg.Tombstones.Evict(chunkEnd)

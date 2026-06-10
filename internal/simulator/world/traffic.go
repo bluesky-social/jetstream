@@ -2,6 +2,7 @@ package world
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -57,8 +58,12 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 
-	// Choose author.
-	authorIdx := zipfian(w.rng, 1.07, w.cfg.Accounts)
+	// Choose an active author. Deleted accounts keep their historical repo
+	// state for backfill/compaction tests, but must not emit new commits.
+	authorIdx, err := w.pickActiveAuthor()
+	if err != nil {
+		return nil, err
+	}
 	author, err := w.loadAccount(authorIdx)
 	if err != nil {
 		return nil, err
@@ -260,15 +265,29 @@ func (w *World) applyOp(rp *repo.Repo, authorIdx int, action string, touched map
 // persisted during bootstrap, so a load failure is a genuine fault.
 func (w *World) pickTargetAccount(authorIdx int) (atmos.DID, error) {
 	if w.cfg.Accounts <= 1 {
+		deleted, err := w.isAccountDeleted(authorIdx)
+		if err != nil {
+			return "", err
+		}
+		if deleted {
+			return "", errors.New("simulator: no active target accounts")
+		}
 		a, err := w.loadAccount(authorIdx)
 		if err != nil {
 			return "", fmt.Errorf("simulator: load only target account %d: %w", authorIdx, err)
 		}
 		return a.DID, nil
 	}
-	for {
+	for attempts := 0; attempts < max(1, w.cfg.Accounts*4); attempts++ {
 		idx := w.rng.IntN(w.cfg.Accounts)
 		if idx == authorIdx {
+			continue
+		}
+		deleted, err := w.isAccountDeleted(idx)
+		if err != nil {
+			return "", err
+		}
+		if deleted {
 			continue
 		}
 		a, err := w.loadAccount(idx)
@@ -277,6 +296,47 @@ func (w *World) pickTargetAccount(authorIdx int) (atmos.DID, error) {
 		}
 		return a.DID, nil
 	}
+	for idx := range w.cfg.Accounts {
+		if idx == authorIdx {
+			continue
+		}
+		deleted, err := w.isAccountDeleted(idx)
+		if err != nil {
+			return "", err
+		}
+		if deleted {
+			continue
+		}
+		a, err := w.loadAccount(idx)
+		if err != nil {
+			return "", fmt.Errorf("simulator: load target account %d: %w", idx, err)
+		}
+		return a.DID, nil
+	}
+	return "", errors.New("simulator: no active target accounts")
+}
+
+func (w *World) pickActiveAuthor() (int, error) {
+	for attempts := 0; attempts < max(1, w.cfg.Accounts*4); attempts++ {
+		idx := zipfian(w.rng, 1.07, w.cfg.Accounts)
+		deleted, err := w.isAccountDeleted(idx)
+		if err != nil {
+			return 0, err
+		}
+		if !deleted {
+			return idx, nil
+		}
+	}
+	for idx := range w.cfg.Accounts {
+		deleted, err := w.isAccountDeleted(idx)
+		if err != nil {
+			return 0, err
+		}
+		if !deleted {
+			return idx, nil
+		}
+	}
+	return 0, errors.New("simulator: no active author accounts")
 }
 
 // pickUntouchedRecord chooses one (collection, rkey) at random from

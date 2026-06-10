@@ -17,6 +17,11 @@ import (
 // lifecycle phase before the daemon advances to the next phase.
 type PhaseBarrier func(context.Context) error
 
+type CompactionPassResult struct {
+	Watermark uint64
+	Err       error
+}
+
 // Options is the typed runtime configuration for one jetstream daemon
 // instance, after CLI and environment inputs have been resolved.
 type Options struct {
@@ -59,6 +64,7 @@ type Options struct {
 	CompactionTombstoneCap    int
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
+	OnCompactionPass          func(CompactionPassResult)
 	AfterRepoComplete         func(context.Context, atmos.DID) error
 	CrashInjector             crashpoint.Injector
 	OnBootstrapLiveEvent      func(*segment.Event)

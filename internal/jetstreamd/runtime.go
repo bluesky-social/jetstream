@@ -288,6 +288,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		OnSegmentCompacted:     mft.OnSegmentSealed,
 		CompactionInterval:     opts.CompactionInterval,
 		CompactionTombstoneCap: opts.CompactionTombstoneCap,
+		OnCompactionPass: func(result orchestrator.CompactionPassResult) {
+			if opts.OnCompactionPass != nil {
+				opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
+			}
+		},
 		BarrierAfterBootstrap:  phaseBarrier(opts.BarrierAfterBootstrap),
 		BarrierAfterMerge:      phaseBarrier(opts.BarrierAfterMerge),
 		AfterRepoComplete:      opts.AfterRepoComplete,

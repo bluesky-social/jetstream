@@ -24,6 +24,33 @@ func TestReconstructAppliesCreateUpdateDelete(t *testing.T) {
 	require.Empty(t, got.Accounts["did:plc:a"].Records)
 }
 
+func TestReconstructPurgesDeletedAccount(t *testing.T) {
+	t.Parallel()
+
+	events := []ObservedEvent{
+		{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Payload: []byte("old")},
+		{Seq: 2, Kind: segment.KindAccount, DID: "did:plc:a", Payload: oracleAccountPayload(t, false, "deleted")},
+	}
+
+	got, err := Reconstruct(events)
+	require.NoError(t, err)
+	require.Empty(t, got.Accounts["did:plc:a"].Records)
+}
+
+func TestReconstructRetainsNonDeletedAccountStatuses(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []string{"takendown", "suspended", "deactivated", "desynchronized", "throttled", "future"} {
+		events := []ObservedEvent{
+			{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Payload: []byte("old")},
+			{Seq: 2, Kind: segment.KindAccount, DID: "did:plc:a", Payload: oracleAccountPayload(t, false, status)},
+		}
+		got, err := Reconstruct(events)
+		require.NoError(t, err)
+		require.NotEmpty(t, got.Accounts["did:plc:a"].Records, status)
+	}
+}
+
 func TestCheckInvariantsRejectsSeqRegression(t *testing.T) {
 	t.Parallel()
 
