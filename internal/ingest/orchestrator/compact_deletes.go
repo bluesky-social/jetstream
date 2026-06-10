@@ -93,10 +93,18 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 
 		current := watermark
 		for current < targetWatermark {
-			snap, chunkEnd, err := o.collectCompactionTombstones(ctx, sealed, current, targetWatermark)
-			if err != nil {
-				retErr = err
-				return err
+			var snap tombstone.Snapshot
+			var chunkEnd uint64
+			if mode == compactionSteady && o.cfg.Tombstones != nil {
+				snap = o.cfg.Tombstones.SnapshotRange(current, targetWatermark)
+				chunkEnd = targetWatermark
+			} else {
+				var err error
+				snap, chunkEnd, err = o.collectCompactionTombstones(ctx, sealed, current, targetWatermark)
+				if err != nil {
+					retErr = err
+					return err
+				}
 			}
 			if chunkEnd <= current {
 				chunkEnd = targetWatermark

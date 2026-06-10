@@ -66,6 +66,22 @@ func TestSnapshotShouldDropDIDChainsWithSpecificReason(t *testing.T) {
 	}
 }
 
+func TestSnapshotRangeFiltersLowAndHighBounds(t *testing.T) {
+	t.Parallel()
+
+	set := New()
+	require.NoError(t, set.Observe(&segment.Event{Seq: 3, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "old"}))
+	require.NoError(t, set.Observe(&segment.Event{Seq: 5, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "in"}))
+	require.NoError(t, set.Observe(&segment.Event{Seq: 7, Kind: segment.KindSync, DID: "did:plc:a"}))
+	require.NoError(t, set.Observe(&segment.Event{Seq: 9, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "future"}))
+
+	snap := set.SnapshotRange(3, 7)
+	require.NotContains(t, snap.Records, RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "old"})
+	require.Contains(t, snap.Records, RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "in"})
+	require.NotContains(t, snap.Records, RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "future"})
+	require.Equal(t, DIDTombstone{Seq: 7, Reason: "sync"}, snap.DIDs["did:plc:a"])
+}
+
 func accountPayload(t *testing.T, active bool, status string) []byte {
 	t.Helper()
 	acc := &comatproto.SyncSubscribeRepos_Account{DID: "did:plc:a", Active: active, Status: gt.Some(status)}

@@ -44,6 +44,10 @@ func (s *Set) Observe(ev *segment.Event) error {
 }
 
 func (s *Set) Snapshot(maxSeq uint64) Snapshot {
+	return s.SnapshotRange(0, maxSeq)
+}
+
+func (s *Set) SnapshotRange(lowExclusive, highInclusive uint64) Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := Snapshot{
@@ -51,12 +55,12 @@ func (s *Set) Snapshot(maxSeq uint64) Snapshot {
 		DIDs:    make(map[string]DIDTombstone, len(s.dids)),
 	}
 	for k, seq := range s.records {
-		if seq <= maxSeq {
+		if seq > lowExclusive && seq <= highInclusive {
 			out.Records[k] = seq
 		}
 	}
 	for did, ts := range s.dids {
-		if ts.Seq <= maxSeq {
+		if ts.Seq > lowExclusive && ts.Seq <= highInclusive {
 			out.DIDs[did] = ts
 		}
 	}
