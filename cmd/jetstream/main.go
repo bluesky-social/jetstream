@@ -224,8 +224,10 @@ func serveCommand() *cli.Command {
 				Value:   36 * time.Hour,
 			},
 			&cli.DurationFlag{
-				Name:    "segment-cache-max-age",
-				Usage:   "Cache-Control max-age for XRPC segment downloads. 0 requires caches to revalidate every request.",
+				Name: "segment-cache-max-age",
+				Usage: "Cache-Control max-age for XRPC segment downloads. 0 requires caches to revalidate every request. " +
+					"End-to-end deletion-compliance latency is the compaction watermark lag plus this value, so keep it " +
+					"well under --compaction-interval (or wire a CDN purge into the post-rewrite hook).",
 				Sources: cli.EnvVars("JETSTREAM_SEGMENT_CACHE_MAX_AGE"),
 				Value:   0,
 			},

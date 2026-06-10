@@ -231,7 +231,7 @@ The variable-length footer has two structures that work together to enable fast 
 
 We use gloom for both, which has a stable binary format. We serialize the segment-level bloom to disk upon segment seal, and also keep all segment's blooms in Jetstream server's memory since it's small.
 
-The per-block blooms are kept on disk (one bloom per block, all sized for the configured max events per block so we can index them by multiplication with no offset table), and we keep an LRU cache of the hot set in server memory (operator-configurable, defaulting to the most recently accessed 1024 segments).
+The per-block blooms are kept on disk (one bloom per block, all sized for the configured max events per block so we can index them by multiplication with no offset table). Today the manifest holds every segment's per-block blooms resident in memory; if that footprint becomes a problem, a future change may swap them for an LRU cache of the hot set.
 
 The lookup flow for "give me all events for DID X in this segment" is:
 
@@ -356,10 +356,12 @@ Putting it all together, the query plan and client code looks something like the
 2. The client negotiates a plan of which segment file blocks it must download to satisfy a particular query (i.e. “give me all `standard.site` documents”)
 3. Future read-overlay work: the client downloads the list of recent deletions and updates above `compaction/seq`
 4. The client begins downloading the segment file blocks and decompresses them in an attempt to emit records that match the user’s query
-5. If the record's DID is in the suppression set of deleted accounts, suppress the row
-6. If the URI of the record from the segment file maps to a known deletion tombstone, suppress the row
-7. If the URI of the record from the segment file maps to a known update, emit the record with the replacement rev and payload
+5. Future read-overlay work: if the record's DID is in the suppression set of deleted accounts, suppress the row
+6. Future read-overlay work: if the URI of the record from the segment file maps to a known deletion tombstone, suppress the row
+7. Future read-overlay work: if the URI of the record from the segment file maps to a known update, emit the record with the replacement rev and payload
 8. Emit the row as-is (no updates or deletes have been applied to this record)
+
+Steps 3 and 5–7 are the client-side tombstone overlay covering the window above `compaction/seq`; until that ships, rows in that window may include data superseded after the last compaction pass (bounded by the compaction interval plus segment cache max-age).
 
 ### 3.4 File Organization
 
