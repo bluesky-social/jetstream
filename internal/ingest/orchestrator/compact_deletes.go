@@ -79,8 +79,10 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			}
 		}
 		if targetWatermark <= watermark {
+			o.cfg.Metrics.setCompactionWatermarkLag(0)
 			return nil
 		}
+		o.cfg.Metrics.setCompactionWatermarkLag(compactionWatermarkLagSeconds(sealed, watermark))
 
 		current := watermark
 		for current < targetWatermark {
@@ -93,7 +95,13 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 				chunkEnd = targetWatermark
 			}
 			o.cfg.Metrics.addCompactionTombstones("record", len(snap.Records))
-			o.cfg.Metrics.addCompactionTombstones("did", len(snap.DIDs))
+			didsByReason := map[string]int{}
+			for _, ts := range snap.DIDs {
+				didsByReason[ts.Reason]++
+			}
+			for reason, n := range didsByReason {
+				o.cfg.Metrics.addCompactionTombstones(reason, n)
+			}
 
 			if !snap.Empty() {
 				if err := o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode); err != nil {
@@ -107,6 +115,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 				return err
 			}
 			o.cfg.Metrics.setCompactionWatermark(chunkEnd)
+			o.cfg.Metrics.setCompactionWatermarkLag(compactionWatermarkLagSeconds(sealed, chunkEnd))
 			if o.cfg.Tombstones != nil {
 				o.cfg.Tombstones.Evict(chunkEnd)
 				o.cfg.Metrics.setCompactionTombstoneSet(o.cfg.Tombstones.Len())
@@ -122,7 +131,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 }
 
 func (o *Orchestrator) collectCompactionTombstones(ctx context.Context, sealed []sealedCompactionSegment, watermark, targetWatermark uint64) (tombstone.Snapshot, uint64, error) {
-	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]uint64)}
+	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]tombstone.DIDTombstone)}
 	chunkEnd := targetWatermark
 	capEntries := o.cfg.CompactionTombstoneCap
 	for _, f := range sealed {
@@ -247,7 +256,7 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("orchestrator: compaction: rebuild tombstones list: %w", err)
 	}
-	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]uint64)}
+	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]tombstone.DIDTombstone)}
 	for _, f := range files {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -292,6 +301,26 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 		"watermark", watermark,
 	)
 	return nil
+}
+
+func compactionWatermarkLagSeconds(sealed []sealedCompactionSegment, watermark uint64) float64 {
+	var tipIndexedAt int64
+	var watermarkIndexedAt int64
+	for _, f := range sealed {
+		if f.header.EventCount == 0 {
+			continue
+		}
+		if f.header.MaxIndexedAt > tipIndexedAt {
+			tipIndexedAt = f.header.MaxIndexedAt
+		}
+		if f.header.MaxSeq <= watermark && f.header.MaxIndexedAt > watermarkIndexedAt {
+			watermarkIndexedAt = f.header.MaxIndexedAt
+		}
+	}
+	if tipIndexedAt <= watermarkIndexedAt {
+		return 0
+	}
+	return float64(tipIndexedAt-watermarkIndexedAt) / 1_000_000
 }
 
 func removeStaleCompactionTemps(dir string) error {

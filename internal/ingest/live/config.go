@@ -95,6 +95,10 @@ type Config struct {
 	// is crossed. The receiver should use a size-1 channel to coalesce bursts.
 	CompactionTrigger chan<- struct{}
 
+	// OnCompactionTriggerCoalesced is called when CompactionTrigger is already
+	// full and an additional cap-triggered compaction signal is coalesced.
+	OnCompactionTriggerCoalesced func()
+
 	// MaxSegmentBytes / MaxEventsPerBlock forward to ingest.Config.
 	// Zero means use ingest defaults.
 	MaxSegmentBytes   int64

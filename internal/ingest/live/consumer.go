@@ -421,6 +421,9 @@ func (c *Consumer) maybeTriggerCompaction() {
 	select {
 	case c.cfg.CompactionTrigger <- struct{}{}:
 	default:
+		if c.cfg.OnCompactionTriggerCoalesced != nil {
+			c.cfg.OnCompactionTriggerCoalesced()
+		}
 	}
 }
 

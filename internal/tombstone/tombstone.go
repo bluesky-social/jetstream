@@ -14,21 +14,26 @@ type RecordKey struct {
 	Rkey       string
 }
 
+type DIDTombstone struct {
+	Seq    uint64
+	Reason string
+}
+
 type Snapshot struct {
 	Records map[RecordKey]uint64
-	DIDs    map[string]uint64
+	DIDs    map[string]DIDTombstone
 }
 
 type Set struct {
 	mu      sync.RWMutex
 	records map[RecordKey]uint64
-	dids    map[string]uint64
+	dids    map[string]DIDTombstone
 }
 
 func New() *Set {
 	return &Set{
 		records: make(map[RecordKey]uint64),
-		dids:    make(map[string]uint64),
+		dids:    make(map[string]DIDTombstone),
 	}
 }
 
@@ -43,16 +48,16 @@ func (s *Set) Snapshot(maxSeq uint64) Snapshot {
 	defer s.mu.RUnlock()
 	out := Snapshot{
 		Records: make(map[RecordKey]uint64, len(s.records)),
-		DIDs:    make(map[string]uint64, len(s.dids)),
+		DIDs:    make(map[string]DIDTombstone, len(s.dids)),
 	}
 	for k, seq := range s.records {
 		if seq <= maxSeq {
 			out.Records[k] = seq
 		}
 	}
-	for did, seq := range s.dids {
-		if seq <= maxSeq {
-			out.DIDs[did] = seq
+	for did, ts := range s.dids {
+		if ts.Seq <= maxSeq {
+			out.DIDs[did] = ts
 		}
 	}
 	return out
@@ -66,8 +71,8 @@ func (s *Set) Evict(maxSeq uint64) {
 			delete(s.records, k)
 		}
 	}
-	for did, seq := range s.dids {
-		if seq <= maxSeq {
+	for did, ts := range s.dids {
+		if ts.Seq <= maxSeq {
 			delete(s.dids, did)
 		}
 	}
@@ -80,9 +85,9 @@ func (s *Set) Replace(snapshot Snapshot) {
 	for k, seq := range snapshot.Records {
 		s.records[k] = seq
 	}
-	s.dids = make(map[string]uint64, len(snapshot.DIDs))
-	for did, seq := range snapshot.DIDs {
-		s.dids[did] = seq
+	s.dids = make(map[string]DIDTombstone, len(snapshot.DIDs))
+	for did, ts := range snapshot.DIDs {
+		s.dids[did] = ts
 	}
 }
 
@@ -97,7 +102,7 @@ func Fold(events []segment.Event, watermark uint64) (Snapshot, error) {
 }
 
 func FoldRange(events []segment.Event, lowExclusive, highInclusive uint64) (Snapshot, error) {
-	out := Snapshot{Records: make(map[RecordKey]uint64), DIDs: make(map[string]uint64)}
+	out := Snapshot{Records: make(map[RecordKey]uint64), DIDs: make(map[string]DIDTombstone)}
 	for i := range events {
 		if events[i].Seq <= lowExclusive || events[i].Seq > highInclusive {
 			continue
@@ -117,8 +122,8 @@ func (s Snapshot) ShouldDrop(ev *segment.Event) (bool, string) {
 	if ev.Kind != segment.KindCreate && ev.Kind != segment.KindUpdate {
 		return false, ""
 	}
-	if seq, ok := s.DIDs[ev.DID]; ok && seq > ev.Seq {
-		return true, "did"
+	if ts, ok := s.DIDs[ev.DID]; ok && ts.Seq > ev.Seq {
+		return true, ts.Reason
 	}
 	key := RecordKey{DID: ev.DID, Collection: ev.Collection, Rkey: ev.Rkey}
 	if seq, ok := s.Records[key]; ok && seq > ev.Seq {
@@ -133,14 +138,14 @@ func (s Snapshot) Merge(other Snapshot) {
 			s.Records[k] = seq
 		}
 	}
-	for did, seq := range other.DIDs {
-		if seq > s.DIDs[did] {
-			s.DIDs[did] = seq
+	for did, ts := range other.DIDs {
+		if ts.Seq > s.DIDs[did].Seq {
+			s.DIDs[did] = ts
 		}
 	}
 }
 
-func observeLocked(records map[RecordKey]uint64, dids map[string]uint64, ev *segment.Event) error {
+func observeLocked(records map[RecordKey]uint64, dids map[string]DIDTombstone, ev *segment.Event) error {
 	switch ev.Kind {
 	case segment.KindDelete, segment.KindUpdate:
 		key := RecordKey{DID: ev.DID, Collection: ev.Collection, Rkey: ev.Rkey}
@@ -148,16 +153,16 @@ func observeLocked(records map[RecordKey]uint64, dids map[string]uint64, ev *seg
 			records[key] = ev.Seq
 		}
 	case segment.KindSync:
-		if ev.Seq > dids[ev.DID] {
-			dids[ev.DID] = ev.Seq
+		if ev.Seq > dids[ev.DID].Seq {
+			dids[ev.DID] = DIDTombstone{Seq: ev.Seq, Reason: "sync"}
 		}
 	case segment.KindAccount:
 		deleted, err := accountDeleted(ev.Payload)
 		if err != nil {
 			return fmt.Errorf("tombstone: decode account did=%s seq=%d: %w", ev.DID, ev.Seq, err)
 		}
-		if deleted && ev.Seq > dids[ev.DID] {
-			dids[ev.DID] = ev.Seq
+		if deleted && ev.Seq > dids[ev.DID].Seq {
+			dids[ev.DID] = DIDTombstone{Seq: ev.Seq, Reason: "account"}
 		}
 	}
 	return nil

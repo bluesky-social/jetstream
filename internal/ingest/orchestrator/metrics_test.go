@@ -48,3 +48,20 @@ func TestMetrics_RegistersMergeCounters(t *testing.T) {
 		require.True(t, ok, "missing metric %s", want)
 	}
 }
+
+func TestMetrics_RegistersCompactionWatermarkLag(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := NewMetrics(reg)
+
+	m.setCompactionWatermarkLag(12.5)
+
+	gathered, err := reg.Gather()
+	require.NoError(t, err)
+	names := make(map[string]struct{}, len(gathered))
+	for _, mf := range gathered {
+		names[mf.GetName()] = struct{}{}
+	}
+	_, ok := names["jetstream_compaction_watermark_lag_seconds"]
+	require.True(t, ok, "missing compaction watermark lag metric")
+}

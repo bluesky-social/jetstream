@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos"
@@ -157,6 +158,34 @@ func TestProcessBatch_UnknownEventDoesNotAdvanceCursor(t *testing.T) {
 	}))
 	require.Equal(t, int64(100), c.LastUpstreamSeq(),
 		"unknown trailing event must not advance the cursor past it")
+}
+
+func TestMaybeTriggerCompactionReportsCoalescedTriggers(t *testing.T) {
+	t.Parallel()
+
+	trigger := make(chan struct{}, 1)
+	var skipped atomic.Int32
+	c := &Consumer{cfg: Config{
+		Tombstones:                  tombstoneSetWithOneEntry(t),
+		TombstoneCap:                1,
+		CompactionTrigger:           trigger,
+		OnCompactionTriggerCoalesced: func() { skipped.Add(1) },
+	}}
+
+	c.maybeTriggerCompaction()
+	require.Len(t, trigger, 1)
+	require.EqualValues(t, 0, skipped.Load())
+
+	c.maybeTriggerCompaction()
+	require.Len(t, trigger, 1)
+	require.EqualValues(t, 1, skipped.Load())
+}
+
+func tombstoneSetWithOneEntry(t *testing.T) *tombstone.Set {
+	t.Helper()
+	set := tombstone.New()
+	require.NoError(t, set.Observe(&segment.Event{Seq: 1, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r"}))
+	return set
 }
 
 // TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer pins the

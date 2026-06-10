@@ -58,6 +58,7 @@ type Metrics struct {
 	CompactionRowsDropped       *prometheus.CounterVec
 	CompactionBytesRewritten    prometheus.Counter
 	CompactionWatermarkSeq      prometheus.Gauge
+	CompactionWatermarkLag      prometheus.Gauge
 }
 
 // NewMetrics registers the orchestrator counters/gauges against reg.
@@ -181,6 +182,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Name: "watermark_seq",
 		Help: "Current compaction/seq watermark.",
 	})
+	m.CompactionWatermarkLag = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
+		Name: "watermark_lag_seconds",
+		Help: "Header-granular indexed_at lag between the sealed segment tip and the compaction watermark.",
+	})
 	reg.MustRegister(
 		m.Phase,
 		m.PhaseTransitions,
@@ -205,6 +211,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.CompactionRowsDropped,
 		m.CompactionBytesRewritten,
 		m.CompactionWatermarkSeq,
+		m.CompactionWatermarkLag,
 	)
 	return m
 }
@@ -339,5 +346,11 @@ func (m *Metrics) addCompactionBytesRewritten(n int64) {
 func (m *Metrics) setCompactionWatermark(seq uint64) {
 	if m != nil {
 		m.CompactionWatermarkSeq.Set(float64(seq))
+	}
+}
+
+func (m *Metrics) setCompactionWatermarkLag(seconds float64) {
+	if m != nil {
+		m.CompactionWatermarkLag.Set(seconds)
 	}
 }

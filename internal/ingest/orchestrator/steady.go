@@ -57,6 +57,9 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			Tombstones:        o.cfg.Tombstones,
 			TombstoneCap:      o.cfg.CompactionTombstoneCap,
 			CompactionTrigger: o.compactionTrigger,
+			OnCompactionTriggerCoalesced: func() {
+				o.cfg.Metrics.incCompactionSkippedTick()
+			},
 			SegmentMetrics:    o.cfg.SegmentMetrics,
 			OnEvent:           o.cfg.OnEvent,
 			OnAfterSeal:       o.cfg.IngestOnAfterSeal,

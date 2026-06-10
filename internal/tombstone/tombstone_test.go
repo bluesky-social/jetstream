@@ -13,7 +13,7 @@ func TestSnapshotShouldDropRecordChains(t *testing.T) {
 	t.Parallel()
 	snap := Snapshot{
 		Records: map[RecordKey]uint64{{DID: "did:plc:a", Collection: "c", Rkey: "r"}: 10},
-		DIDs:    map[string]uint64{},
+		DIDs:    map[string]DIDTombstone{},
 	}
 	drop, reason := snap.ShouldDrop(&segment.Event{Seq: 9, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r"})
 	require.True(t, drop)
@@ -37,7 +37,33 @@ func TestObserveAccountDeletedOnlyPurgesLiteralDeleted(t *testing.T) {
 
 	set := New()
 	require.NoError(t, set.Observe(&segment.Event{Seq: 5, Kind: segment.KindAccount, DID: "did:plc:a", Payload: accountPayload(t, false, "deleted")}))
-	require.Equal(t, uint64(5), set.Snapshot(10).DIDs["did:plc:a"])
+	require.Equal(t, DIDTombstone{Seq: 5, Reason: "account"}, set.Snapshot(10).DIDs["did:plc:a"])
+}
+
+func TestSnapshotShouldDropDIDChainsWithSpecificReason(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		tombstone DIDTombstone
+		reason    string
+	}{
+		{name: "account delete", tombstone: DIDTombstone{Seq: 10, Reason: "account"}, reason: "account"},
+		{name: "sync replacement", tombstone: DIDTombstone{Seq: 10, Reason: "sync"}, reason: "sync"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			snap := Snapshot{
+				Records: map[RecordKey]uint64{},
+				DIDs:    map[string]DIDTombstone{"did:plc:a": tc.tombstone},
+			}
+			drop, reason := snap.ShouldDrop(&segment.Event{Seq: 9, Kind: segment.KindUpdate, DID: "did:plc:a"})
+			require.True(t, drop)
+			require.Equal(t, tc.reason, reason)
+
+			drop, _ = snap.ShouldDrop(&segment.Event{Seq: 10, Kind: segment.KindCreate, DID: "did:plc:a"})
+			require.False(t, drop, "tombstone marker seq itself must be retained")
+		})
+	}
 }
 
 func accountPayload(t *testing.T, active bool, status string) []byte {
