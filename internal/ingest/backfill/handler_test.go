@@ -13,9 +13,11 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/mst"
 	atmosrepo "github.com/jcalabro/atmos/repo"
+	"github.com/jcalabro/atmos/xrpc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -139,6 +141,28 @@ func TestSegmentHandler_DropsRecordThatExceedsSegmentColumnWidth(t *testing.T) {
 	require.Equal(t, uint64(0), w.NextSeq(), "skipped records must not allocate seqs")
 	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DroppedRecords), 0,
 		"the skipped record must be visible in dropped_records_total")
+}
+
+func TestSegmentHandler_MissingDownloadedRecordBlockIsTransient(t *testing.T) {
+	t.Parallel()
+
+	w := newTestIngest(t)
+	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	store := mst.NewMemBlockStore()
+	tree := mst.NewTree(store)
+	missingCID := cbor.ComputeCID(cbor.CodecDagCBOR, []byte("missing-record-block"))
+	require.NoError(t, tree.Insert("app.bsky.feed.post/rkey1", missingCID))
+	r := &atmosrepo.Repo{
+		DID:   "did:plc:truncatedcar",
+		Store: store,
+		Tree:  tree,
+	}
+	commit := &atmosrepo.Commit{Rev: "rev1"}
+
+	err := h.HandleRepo(t.Context(), "did:plc:truncatedcar", r, commit)
+	require.Error(t, err)
+	require.True(t, xrpc.IsTransient(err), "missing downloaded CAR blocks must be retried by atmos backfill")
 }
 
 // TestSegmentHandler_NilWriterPanics pins the constructor's

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"time"
@@ -78,7 +79,7 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 			}
 			payload, err := r.Store.GetBlock(cid)
 			if err != nil {
-				return fmt.Errorf("backfill: did=%s get block %s/%s: %w", did, collection, rkey, err)
+				return fmt.Errorf("backfill: did=%s get block %s/%s: %w: %w", did, collection, rkey, io.ErrUnexpectedEOF, err)
 			}
 
 			ev := segment.Event{
