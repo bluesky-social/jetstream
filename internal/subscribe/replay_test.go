@@ -131,3 +131,87 @@ func encodeUint64LE(v uint64) []byte {
 	}
 	return b
 }
+
+// TestWalkFromCursor_CompactedTrailingGapTerminates pins the
+// compaction interaction: a rewritten segment keeps its historical
+// seq envelope while its trailing rows may be gone, so the walk must
+// advance past the envelope instead of re-querying the same segment
+// forever.
+func TestWalkFromCursor_CompactedTrailingGapTerminates(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	segDir := filepath.Join(dir, "segments")
+	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
+		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+	})
+	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000001.jss"), sealedFixture{
+		minSeq: 10, maxSeq: 19, minIndexedAt: 10_000, maxIndexedAt: 19_999, eventCount: 10,
+	})
+
+	// Compact away seg0's trailing rows (8 and 9). The envelope
+	// (MaxSeq=9) is preserved by design.
+	res, err := segment.Rewrite(filepath.Join(segDir, "seg_0000000000.jss"), func(ev *segment.Event) segment.RowDecision {
+		if ev.Seq >= 8 {
+			return segment.RowDrop
+		}
+		return segment.RowKeep
+	}, segment.RewriteOptions{})
+	require.NoError(t, err)
+	require.True(t, res.Rewritten)
+
+	m := mustOpenManifest(t, segDir)
+	st, w := openWriterAtTip(t, dir, 20)
+	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+
+	// Walk across the gap.
+	var got []uint64
+	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
+		StartSeq: 0, Manifest: m, Writer: w,
+	}, func(ev *segment.Event) error {
+		got = append(got, ev.Seq)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}, got)
+
+	// Cursor landing inside the trailing gap.
+	got = got[:0]
+	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
+		StartSeq: 9, Manifest: m, Writer: w,
+	}, func(ev *segment.Event) error {
+		got = append(got, ev.Seq)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{10, 11, 12, 13, 14, 15, 16, 17, 18, 19}, got)
+}
+
+func TestWalkFromCursor_FullyEmptiedSegmentTerminates(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	segDir := filepath.Join(dir, "segments")
+	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
+		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+	})
+	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000001.jss"), sealedFixture{
+		minSeq: 10, maxSeq: 19, minIndexedAt: 10_000, maxIndexedAt: 19_999, eventCount: 10,
+	})
+	res, err := segment.Rewrite(filepath.Join(segDir, "seg_0000000000.jss"),
+		func(*segment.Event) segment.RowDecision { return segment.RowDrop }, segment.RewriteOptions{})
+	require.NoError(t, err)
+	require.True(t, res.Rewritten)
+
+	m := mustOpenManifest(t, segDir)
+	st, w := openWriterAtTip(t, dir, 20)
+	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+
+	var got []uint64
+	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
+		StartSeq: 0, Manifest: m, Writer: w,
+	}, func(ev *segment.Event) error {
+		got = append(got, ev.Seq)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{10, 11, 12, 13, 14, 15, 16, 17, 18, 19}, got)
+}

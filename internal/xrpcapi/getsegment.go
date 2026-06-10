@@ -2,7 +2,6 @@ package xrpcapi
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
 )
@@ -62,21 +62,23 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 			slog.Any("err", err))
 		return xrpcserver.InternalError("failed to stat segment")
 	}
-	var header [256]byte
-	if _, err := f.ReadAt(header[:], 0); err != nil {
+	// Download validators come from the fd we actually serve, never the
+	// manifest: during a compaction rename→refresh window the manifest
+	// ETag is stale, and an If-Range match against it would let a
+	// resuming client splice two file generations together.
+	// ReadSealedHeader validates magic/version, so a corrupt or
+	// foreign file errors instead of serving a confident strong ETag.
+	hdr, err := segment.ReadSealedHeader(f)
+	if err != nil {
 		h.logger.Error("getSegment: read sealed header failed",
 			slog.String("name", name), slog.String("path", ref.Path),
 			slog.Any("err", err))
 		return xrpcserver.InternalError("failed to read segment header")
 	}
-	checksum := binary.LittleEndian.Uint64(header[4:12])
-	if checksum == 0 {
-		return xrpcserver.InternalError("segment is not sealed")
-	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// A strong ETag is the value wrapped in double quotes per RFC 9110.
-	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(checksum)))
+	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(hdr.Checksum)))
 	w.Header().Set("Cache-Control", cacheControlHeader(h.cacheMaxAge))
 
 	// ServeContent handles Range, Accept-Ranges, Content-Length,
