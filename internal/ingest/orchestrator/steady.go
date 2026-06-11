@@ -61,18 +61,16 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			// Bare cfg.Logger; live.Open sets its own component.
 			Logger:            o.cfg.Logger,
 			Metrics:           o.cfg.LiveMetrics,
+			WriterMetrics:     o.cfg.IngestMetrics,
 			Verifier:          o.cfg.Verifier,
 			SyncStateStore:    o.cfg.SyncStateStore,
 			Tombstones:        tombstones,
 			TombstoneCap:      tombstoneCap,
 			CompactionTrigger: o.compactionTrigger,
-			OnCompactionTriggerCoalesced: func() {
-				o.cfg.Metrics.incCompactionSkippedTick()
-			},
-			SegmentMetrics:   o.cfg.SegmentMetrics,
-			OnEvent:          o.cfg.OnEvent,
-			OnAfterSeal:      o.cfg.IngestOnAfterSeal,
-			ReconnectBackoff: o.cfg.LiveReconnectBackoff,
+			SegmentMetrics:    o.cfg.SegmentMetrics,
+			OnEvent:           o.cfg.OnEvent,
+			OnAfterSeal:       o.cfg.IngestOnAfterSeal,
+			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)

@@ -12,7 +12,6 @@ const (
 // no-op, so tests can skip metric registration entirely.
 type Metrics struct {
 	EventsReceived         prometheus.Counter
-	EventsConverted        prometheus.Counter
 	Reconnects             prometheus.Counter
 	DecodeErrors           prometheus.Counter
 	UnknownEvents          prometheus.Counter
@@ -31,11 +30,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "events_received_total",
 			Help: "Number of upstream firehose events the consumer decoded successfully.",
-		}),
-		EventsConverted: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "events_converted_total",
-			Help: "Number of segment.Events emitted by the converter (one per record op for commits, one per non-commit event).",
 		}),
 		Reconnects: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -80,7 +74,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 	}
 	reg.MustRegister(
-		m.EventsReceived, m.EventsConverted, m.Reconnects,
+		m.EventsReceived, m.Reconnects,
 		m.DecodeErrors, m.UnknownEvents, m.DroppedOpsMissingBlock,
 		m.DroppedEvents, m.StaleResyncsDropped, m.UpstreamCursor,
 	)
@@ -90,12 +84,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 func (m *Metrics) incEventsReceived() {
 	if m != nil {
 		m.EventsReceived.Inc()
-	}
-}
-
-func (m *Metrics) incEventsConverted() {
-	if m != nil {
-		m.EventsConverted.Inc()
 	}
 }
 

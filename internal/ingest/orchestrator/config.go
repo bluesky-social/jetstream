@@ -77,13 +77,11 @@ type Config struct {
 	// nil means no /metrics counters incrementing.
 	Metrics *Metrics
 
-	// IngestMetrics is consumed by the bootstrap-phase backfill
-	// writer only. The steady-state live consumer's internal
-	// *ingest.Writer hardcodes Metrics: nil (see
-	// internal/ingest/live/consumer.go) to avoid prometheus
-	// duplicate-series registration with the backfill writer's
-	// series, so this field does not flow into the steady-state
-	// path. Optional.
+	// IngestMetrics is the canonical durable-archive writer metric
+	// handle. It is used by the bootstrap backfill writer, merge
+	// destination writer, and steady-state live writer. Bootstrap's
+	// temporary live_segments writer deliberately leaves it nil because
+	// that tree has a throwaway seq space. Optional.
 	IngestMetrics *ingest.Metrics
 
 	// LiveMetrics is shared between the bootstrap-time and

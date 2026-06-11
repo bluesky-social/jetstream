@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
@@ -65,6 +66,12 @@ type Config struct {
 
 	// Metrics is optional; nil means no /metrics counters incrementing.
 	Metrics *Metrics
+
+	// WriterMetrics flows through to the consumer's internal ingest.Writer.
+	// Steady-state callers pass the canonical ingest metrics for the durable
+	// archive; bootstrap-time live_segments callers leave it nil because that
+	// writer has a throwaway seq space.
+	WriterMetrics *ingest.Metrics
 
 	// Verifier runs Sync 1.1 verification on every #commit and #sync
 	// before the consumer's Operations() iterator yields ops to the

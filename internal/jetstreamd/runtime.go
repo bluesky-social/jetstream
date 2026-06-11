@@ -276,7 +276,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.
 		Logger:                   processLogger,
-		Metrics:                  orchestrator.NewMetrics(metrics.Registry),
+		Metrics:                  orchestrator.NewMetrics(metrics.Registry, tombstones),
 		IngestMetrics:            ingest.NewMetrics(metrics.Registry),
 		LiveMetrics:              live.NewMetrics(metrics.Registry),
 		BackfillMetrics:          backfill.NewMetrics(metrics.Registry),

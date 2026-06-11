@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -46,11 +47,10 @@ type Metrics struct {
 
 	CompactionPasses            *prometheus.CounterVec
 	CompactionPassDuration      prometheus.Histogram
-	CompactionSkippedTicks      prometheus.Counter
 	CompactionEarlyPasses       prometheus.Counter
 	CompactionTombstones        *prometheus.CounterVec
-	CompactionTombstoneEntries  prometheus.Gauge
-	CompactionTombstoneBytes    prometheus.Gauge
+	CompactionTombstoneEntries  prometheus.Collector
+	CompactionTombstoneBytes    prometheus.Collector
 	CompactionSegmentsExamined  prometheus.Counter
 	CompactionSegmentsRewritten prometheus.Counter
 	CompactionSegmentsClean     prometheus.Counter
@@ -62,7 +62,12 @@ type Metrics struct {
 }
 
 // NewMetrics registers the orchestrator counters/gauges against reg.
-func NewMetrics(reg prometheus.Registerer) *Metrics {
+func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metrics {
+	var ts *tombstone.Set
+	if len(tombstones) > 0 {
+		ts = tombstones[0]
+	}
+
 	m := &Metrics{
 		Phase: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -122,11 +127,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Help:    "Wall-clock seconds spent in delete/update compaction passes.",
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 16),
 	})
-	m.CompactionSkippedTicks = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
-		Name: "passes_skipped_ticks_total",
-		Help: "Compaction ticks or early triggers coalesced while another trigger was pending.",
-	})
 	m.CompactionEarlyPasses = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
 		Name: "passes_early_total",
@@ -137,15 +137,25 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Name: "tombstones_collected_total",
 		Help: "Tombstones collected by compaction kind.",
 	}, []string{"kind"})
-	m.CompactionTombstoneEntries = prometheus.NewGauge(prometheus.GaugeOpts{
+	m.CompactionTombstoneEntries = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
 		Name: "tombstone_set_entries",
 		Help: "Current number of entries in the live in-memory tombstone set.",
+	}, func() float64 {
+		if ts == nil {
+			return 0
+		}
+		return float64(ts.Len())
 	})
-	m.CompactionTombstoneBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+	m.CompactionTombstoneBytes = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
 		Name: "tombstone_set_bytes",
 		Help: "Estimated bytes held by the live in-memory tombstone set.",
+	}, func() float64 {
+		if ts == nil {
+			return 0
+		}
+		return float64(ts.ApproxBytes())
 	})
 	m.CompactionSegmentsExamined = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
@@ -199,7 +209,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.MergeDIDsDiscoveredPostBootstrap,
 		m.CompactionPasses,
 		m.CompactionPassDuration,
-		m.CompactionSkippedTicks,
 		m.CompactionEarlyPasses,
 		m.CompactionTombstones,
 		m.CompactionTombstoneEntries,
@@ -282,12 +291,6 @@ func (m *Metrics) observeCompactionPass(start time.Time, err error) {
 	m.CompactionPassDuration.Observe(time.Since(start).Seconds())
 }
 
-func (m *Metrics) incCompactionSkippedTick() {
-	if m != nil {
-		m.CompactionSkippedTicks.Inc()
-	}
-}
-
 func (m *Metrics) incCompactionEarlyPass() {
 	if m != nil {
 		m.CompactionEarlyPasses.Inc()
@@ -297,13 +300,6 @@ func (m *Metrics) incCompactionEarlyPass() {
 func (m *Metrics) addCompactionTombstones(kind string, n int) {
 	if m != nil && n > 0 {
 		m.CompactionTombstones.WithLabelValues(kind).Add(float64(n))
-	}
-}
-
-func (m *Metrics) setCompactionTombstoneSet(entries int, bytes int64) {
-	if m != nil {
-		m.CompactionTombstoneEntries.Set(float64(entries))
-		m.CompactionTombstoneBytes.Set(float64(bytes))
 	}
 }
 

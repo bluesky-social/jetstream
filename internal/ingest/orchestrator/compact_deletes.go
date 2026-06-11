@@ -144,7 +144,6 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			o.cfg.Metrics.setCompactionWatermarkLag(compactionWatermarkLagSeconds(sealed, chunkEnd))
 			if o.cfg.Tombstones != nil {
 				o.cfg.Tombstones.Evict(chunkEnd)
-				o.cfg.Metrics.setCompactionTombstoneSet(o.cfg.Tombstones.Len(), o.cfg.Tombstones.ApproxBytes())
 			}
 			if err := o.simulateCrash(ctx, crashpoint.AfterCompactionChunkWatermark); err != nil {
 				return err
@@ -429,7 +428,6 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context) error {
 			return ctx.Err()
 		case <-o.compactionTrigger:
 			if !lastPass.IsZero() && time.Since(lastPass) < minCompactionTriggerSpacing {
-				o.cfg.Metrics.incCompactionSkippedTick()
 				continue
 			}
 
@@ -518,7 +516,6 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 	}
 
 	o.cfg.Tombstones.Replace(snap)
-	o.cfg.Metrics.setCompactionTombstoneSet(o.cfg.Tombstones.Len(), o.cfg.Tombstones.ApproxBytes())
 	o.logger.InfoContext(ctx, "rebuilt live tombstone set",
 		"record_tombstones", len(snap.Records),
 		"did_tombstones", len(snap.DIDs),

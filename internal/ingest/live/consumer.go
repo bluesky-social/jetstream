@@ -104,12 +104,9 @@ func Open(cfg Config) (*Consumer, error) {
 		// component=ingest/writer attribute.
 		Logger: cfg.Logger,
 
-		// Metrics intentionally nil: per-writer ingest metrics for
-		// the live writer are not registered to avoid colliding with
-		// the backfill writer's series. The livestream-level Metrics
-		// (events received / converted, decode errors, reconnects,
-		// upstream cursor) live in cfg.Metrics.
-		Metrics:        nil,
+		// WriterMetrics is nil for bootstrap live_segments and shared
+		// with the canonical ingest metrics in steady-state.
+		Metrics:        cfg.WriterMetrics,
 		OnAfterFlush:   c.onAfterFlush,
 		OnAfterSeal:    cfg.OnAfterSeal,
 		SegmentMetrics: cfg.SegmentMetrics,
@@ -479,7 +476,6 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					return fmt.Errorf("livestream: append: %w", err)
 				}
 				c.maybeTriggerCompaction()
-				c.cfg.Metrics.incEventsConverted()
 
 				// Forward to downstream subscribers AFTER durable append.
 				// segEvts[i].Seq has been populated by Append.
