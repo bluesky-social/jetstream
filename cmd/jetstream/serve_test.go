@@ -72,6 +72,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 0, opts.MaxBackfillRepos)
 	require.Empty(t, opts.BackfillRepos)
 	require.False(t, opts.SkipMergeDiscovery)
+	require.False(t, opts.DisableRepoActionRateLimits)
 	require.Equal(t, 36*time.Hour, opts.CursorLookback)
 	require.Equal(t, 0*time.Second, opts.SegmentCacheMaxAge)
 	require.Equal(t, 256<<20, opts.SubscribeHotTailBytes)
@@ -107,6 +108,7 @@ func withClearedEnv(t *testing.T) {
 		"JETSTREAM_MAX_BACKFILL_REPOS",
 		"JETSTREAM_BACKFILL_REPOS",
 		"JETSTREAM_SKIP_MERGE_DISCOVERY",
+		"JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS",
 		"JETSTREAM_CURSOR_LOOKBACK",
 		"JETSTREAM_SEGMENT_CACHE_MAX_AGE",
 		"JETSTREAM_SUBSCRIBE_HOT_TAIL_BYTES",
@@ -158,6 +160,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--client-drain-timeout=11s",
 		"--backfill-repos=did:plc:aaa, did:plc:bbb",
 		"--skip-merge-discovery",
+		"--disable-repo-action-rate-limits",
 		"--cursor-lookback=7h",
 		"--segment-cache-max-age=13s",
 		"--subscribe-hot-tail-bytes=123456",
@@ -182,6 +185,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 0, opts.MaxBackfillRepos)
 	require.Equal(t, []atmos.DID{"did:plc:aaa", "did:plc:bbb"}, opts.BackfillRepos)
 	require.True(t, opts.SkipMergeDiscovery)
+	require.True(t, opts.DisableRepoActionRateLimits)
 	require.Equal(t, 7*time.Hour, opts.CursorLookback)
 	require.Equal(t, 13*time.Second, opts.SegmentCacheMaxAge)
 	require.Equal(t, 123456, opts.SubscribeHotTailBytes)
@@ -194,6 +198,29 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
+}
+
+func TestServeOptionsFromCLI_DisableRepoActionRateLimitsEnv(t *testing.T) {
+	withClearedEnv(t)
+
+	app := newApp()
+	var opts jetstreamd.Options
+	for _, cmd := range app.Commands {
+		if cmd.Name != "serve" {
+			continue
+		}
+		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			opts, err = serveOptionsFromCommand(cmd)
+			return err
+		}
+		break
+	}
+
+	t.Setenv("JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS", "true")
+
+	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
+	require.True(t, opts.DisableRepoActionRateLimits)
 }
 
 func TestServeOptionsFromCLI_RejectsBackfillReposWithMaxBackfillRepos(t *testing.T) {

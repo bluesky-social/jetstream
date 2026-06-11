@@ -8,11 +8,14 @@
 			"mode": "auto",
 			"program": "${workspaceFolder}/cmd/jetstream",
 			"cwd": "${workspaceFolder}",
+			"env": {
+				"JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS": "true"
+			},
 			"args": [
 				"serve",
 				"--relay-url=http://localhost:7777",
 				"--plc-url=http://localhost:7777",
-				"data-dir=${workspaceFolder}/data-sim",
+				"--data-dir=${workspaceFolder}/data-sim",
 			]
 		},
 		{
@@ -22,6 +25,9 @@
 			"mode": "auto",
 			"program": "${workspaceFolder}/cmd/jetstream",
 			"cwd": "${workspaceFolder}",
+			"env": {
+				"JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS": "true"
+			},
 			"args": [
 				"serve",
 				"--max-backfill-repos=20",

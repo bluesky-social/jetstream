@@ -422,6 +422,44 @@ func TestHandler_RateLimitsAutomaticRepoVerificationBySourceIP(t *testing.T) {
 	require.Equal(t, 2, actions.verifyCalls)
 }
 
+func TestHandler_CanDisableRepoActionRateLimit(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "accounts", DID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}
+	s.Account = status.AccountLookup{
+		Query:    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Found:    true,
+		DID:      "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Backfill: "complete",
+	}
+	actions := &fakeRepoActions{}
+	h, err := web.New(web.Options{
+		Snapshotter: &fakeSnapshotter{snap: s},
+		RepoActions: actions,
+		RepoActionRateLimit: web.RateLimit{
+			Limit:  1,
+			Window: time.Hour,
+		},
+		DisableRepoActionRateLimit: true,
+	})
+	require.NoError(t, err)
+
+	first := httptest.NewRecorder()
+	req1 := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&did=did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	req1.RemoteAddr = "203.0.113.10:5555"
+	h.ServeHTTP(first, req1)
+	require.Equal(t, http.StatusOK, first.Code)
+	require.Equal(t, 1, actions.verifyCalls)
+
+	second := httptest.NewRecorder()
+	req2 := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&did=did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", nil)
+	req2.RemoteAddr = "203.0.113.10:5556"
+	h.ServeHTTP(second, req2)
+	require.Equal(t, http.StatusOK, second.Code)
+	require.NotContains(t, second.Body.String(), "repo action rate limit exceeded")
+	require.Equal(t, 2, actions.verifyCalls)
+}
+
 func TestHandler_DoesNotVerifyMissingAccount(t *testing.T) {
 	t.Parallel()
 	s := newFixtureSnap()

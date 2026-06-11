@@ -41,6 +41,10 @@ type Options struct {
 	BackfillRepos      []atmos.DID
 	SkipMergeDiscovery bool
 
+	// DisableRepoActionRateLimits disables the per-source-IP limiter for
+	// expensive operator-triggered repo actions on the status UI.
+	DisableRepoActionRateLimits bool
+
 	// BackfillRetryBaseDelay, when > 0, overrides the bootstrap backfill
 	// engine's initial retry backoff (atmos default 1s). Used by the
 	// oracle fault-injection harness to keep injected transient getRepo

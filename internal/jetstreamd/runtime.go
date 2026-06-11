@@ -169,9 +169,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 
 	statusHandler, err := web.New(web.Options{
-		Snapshotter: statusCollector,
-		RepoActions: web.NewRepoActions(opts.DataDir, opts.RelayURL),
-		Logger:      processLogger,
+		Snapshotter:                statusCollector,
+		RepoActions:                web.NewRepoActions(opts.DataDir, opts.RelayURL),
+		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
+		Logger:                     processLogger,
 	})
 	if err != nil {
 		return fail(fmt.Errorf("serve: build status handler: %w", err))
