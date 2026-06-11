@@ -54,8 +54,10 @@ type compactionRewriteResult struct {
 
 func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionMode) (retErr error) {
 	if o.cfg.CompactionInterval == 0 {
+		// Compaction is disabled
 		return nil
 	}
+
 	start := time.Now()
 	var finalWatermark uint64
 	defer func() {
@@ -64,6 +66,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			o.cfg.OnCompactionPass(CompactionPassResult{Watermark: finalWatermark, Err: retErr})
 		}
 	}()
+
 	return obs.Span(ctx, func(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 		if err := removeStaleCompactionTemps(segmentsDir); err != nil {
@@ -403,20 +406,23 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	var lastPass time.Time
+
 	// Spec §5 failure policy: a failed pass aborts without advancing
 	// the watermark and the next pass retries; watermark_lag_seconds
 	// is the operator's paging signal. A pass error must never tear
 	// down the daemon (it would cancel the live consumer and turn a
 	// transient IO error into an ingestion outage / crash loop).
+	var lastPass time.Time
 	runPass := func() {
 		if err := o.runDeleteCompaction(ctx, compactionSteady); err != nil && ctx.Err() == nil {
 			o.logger.ErrorContext(ctx, "steady compaction pass failed; will retry", "err", err)
 		}
 		lastPass = time.Now()
 	}
+
 	timer := time.NewTimer(o.cfg.CompactionInterval)
 	defer timer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -426,7 +432,9 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context) error {
 				o.cfg.Metrics.incCompactionSkippedTick()
 				continue
 			}
+
 			runPass()
+
 			o.cfg.Metrics.incCompactionEarlyPass()
 			if !timer.Stop() {
 				select {
@@ -446,15 +454,18 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 	if o.cfg.Tombstones == nil || o.cfg.CompactionInterval == 0 {
 		return nil
 	}
+
 	segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 	watermark, _, err := loadCompactionWatermark(o.cfg.Store)
 	if err != nil {
 		return err
 	}
+
 	files, err := ingest.SegmentFiles(segmentsDir)
 	if err != nil {
 		return fmt.Errorf("orchestrator: compaction: rebuild tombstones list: %w", err)
 	}
+
 	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]tombstone.DIDTombstone)}
 	for _, f := range files {
 		if err := ctx.Err(); err != nil {
@@ -505,6 +516,7 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 			return fmt.Errorf("orchestrator: compaction: rebuild walk active %s: %w", f.Path, err)
 		}
 	}
+
 	o.cfg.Tombstones.Replace(snap)
 	o.cfg.Metrics.setCompactionTombstoneSet(o.cfg.Tombstones.Len(), o.cfg.Tombstones.ApproxBytes())
 	o.logger.InfoContext(ctx, "rebuilt live tombstone set",
@@ -512,6 +524,7 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 		"did_tombstones", len(snap.DIDs),
 		"watermark", watermark,
 	)
+
 	return nil
 }
 
@@ -533,6 +546,7 @@ func compactionWatermarkLagSeconds(sealed []sealedCompactionSegment, watermark u
 			watermarkIndexedAt = f.header.MaxIndexedAt
 		}
 	}
+
 	if watermarkIndexedAt == 0 {
 		// Nothing compacted yet: without this floor the gauge would
 		// report tip-since-epoch (a false ~50-year spike on the
@@ -540,9 +554,11 @@ func compactionWatermarkLagSeconds(sealed []sealedCompactionSegment, watermark u
 		// uncompacted data.
 		watermarkIndexedAt = oldestIndexedAt
 	}
+
 	if tipIndexedAt <= watermarkIndexedAt {
 		return 0
 	}
+
 	return float64(tipIndexedAt-watermarkIndexedAt) / 1_000_000
 }
 
@@ -558,6 +574,7 @@ func removeStaleCompactionTemps(dir string) error {
 		}
 		return fmt.Errorf("orchestrator: compaction: readdir tmp cleanup: %w", err)
 	}
+
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jss.tmp") {
 			continue
@@ -566,5 +583,6 @@ func removeStaleCompactionTemps(dir string) error {
 			return fmt.Errorf("orchestrator: compaction: remove tmp %s: %w", e.Name(), err)
 		}
 	}
+
 	return nil
 }

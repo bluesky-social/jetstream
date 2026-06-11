@@ -90,7 +90,11 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 		o.logger.InfoContext(ctx, "steady-state consumer running")
 
 		g, gctx := errgroup.WithContext(ctx)
+
+		// Run the main loop
 		g.Go(func() error { return c.Run(gctx) })
+
+		// Run the compactor loop
 		g.Go(func() error {
 			err := o.runSteadyCompactor(gctx)
 			if errors.Is(err, context.Canceled) {
@@ -98,6 +102,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			}
 			return err
 		})
+
 		return g.Wait()
 	})
 }
