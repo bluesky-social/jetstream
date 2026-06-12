@@ -1,0 +1,27 @@
+mutant: m002_watermark_floor_off_by_one
+target: internal/ingest/orchestrator/compaction_watermark.go
+failure-mode: |
+  On first startup, the compaction watermark floor is initialized to
+  nextSeq instead of nextSeq-1. The watermark claims a seq that was never
+  compacted is below the compaction line. Classic inclusive/exclusive
+  boundary mistake when initializing a cursor from a "next" value.
+expected-detection: |
+  assertCompacted should fail: CheckCompacted re-derives which rows must
+  be gone at-or-below the watermark, and a row at the boundary seq can
+  survive uncompacted. Likely seed-dependent — only fires when the
+  boundary seq carries a superseding event. If it survives the default
+  seed, run the seed sweep before recording it as an escape.
+expected-tier: stress
+tiers: default,stress
+
+diff --git a/internal/ingest/orchestrator/compaction_watermark.go b/internal/ingest/orchestrator/compaction_watermark.go
+index 7403134..b98a633 100644
+--- a/internal/ingest/orchestrator/compaction_watermark.go
++++ b/internal/ingest/orchestrator/compaction_watermark.go
+@@ -37,5 +37,5 @@ func initCompactionWatermarkFloor(s *store.Store, nextSeq uint64) error {
+ 	if nextSeq == 0 {
+ 		return saveCompactionWatermark(s, 0)
+ 	}
+-	return saveCompactionWatermark(s, nextSeq-1)
++	return saveCompactionWatermark(s, nextSeq)
+ }
