@@ -49,7 +49,11 @@ type Options struct {
 	// RepoActionRateLimit bounds expensive explicit repo actions by source IP.
 	// A zero value uses the production default when RepoActions is configured.
 	RepoActionRateLimit RateLimit
-	Now                 func() time.Time
+	// DisableRepoActionRateLimit bypasses RepoActionRateLimit. It is intended
+	// for trusted local/operator deployments where repeated verification is
+	// more valuable than protecting the endpoint from accidental load.
+	DisableRepoActionRateLimit bool
+	Now                        func() time.Time
 	// Logger is used to surface post-headers template execution
 	// failures (the only place we can't return an HTTP error). nil
 	// defaults to slog.Default().
@@ -71,17 +75,17 @@ func New(opts Options) (*Handler, error) {
 	if opts.RepoActionRateLimit.Window < 0 || opts.RepoActionRateLimit.Limit < 0 {
 		return nil, errors.New("web: repo action rate limit must be non-negative")
 	}
-	if opts.RepoActions != nil && opts.RepoActionRateLimit.Limit == 0 && opts.RepoActionRateLimit.Window == 0 {
+	if opts.RepoActions != nil && !opts.DisableRepoActionRateLimit && opts.RepoActionRateLimit.Limit == 0 && opts.RepoActionRateLimit.Window == 0 {
 		opts.RepoActionRateLimit = defaultRepoActionRateLimit
 	}
-	if opts.RepoActions != nil && opts.RepoActionRateLimit.Limit == 0 && opts.RepoActionRateLimit.Window > 0 {
+	if opts.RepoActions != nil && !opts.DisableRepoActionRateLimit && opts.RepoActionRateLimit.Limit == 0 && opts.RepoActionRateLimit.Window > 0 {
 		return nil, errors.New("web: repo action rate limit must include a positive limit")
 	}
-	if opts.RepoActions != nil && opts.RepoActionRateLimit.Limit > 0 && opts.RepoActionRateLimit.Window <= 0 {
+	if opts.RepoActions != nil && !opts.DisableRepoActionRateLimit && opts.RepoActionRateLimit.Limit > 0 && opts.RepoActionRateLimit.Window <= 0 {
 		return nil, errors.New("web: repo action rate limit window is required")
 	}
 	var limiter *repoActionLimiter
-	if opts.RepoActions != nil && opts.RepoActionRateLimit.Limit > 0 {
+	if opts.RepoActions != nil && !opts.DisableRepoActionRateLimit && opts.RepoActionRateLimit.Limit > 0 {
 		limiter = newRepoActionLimiter(opts.RepoActionRateLimit, opts.Now)
 	}
 

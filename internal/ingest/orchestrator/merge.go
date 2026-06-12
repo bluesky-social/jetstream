@@ -80,6 +80,12 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)
 		}
+		if err := initCompactionWatermarkFloor(o.cfg.Store, dst.NextSeq()); err != nil {
+			if cerr := dst.Close(); cerr != nil {
+				o.logger.WarnContext(ctx, "dst writer close after compaction watermark init failure", "err", cerr)
+			}
+			return err
+		}
 
 		runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
 
@@ -92,6 +98,17 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 
 		if err := dst.SealActiveAndClose(); err != nil {
 			return fmt.Errorf("orchestrator: merge: seal dst: %w", err)
+		}
+
+		if err := o.runDeleteCompaction(ctx, compactionMergeTail); err != nil {
+			return fmt.Errorf("orchestrator: merge-tail compaction: %w", err)
+		}
+		// One-shot manifest reconcile (spec §7): the merge-tail pass is
+		// manifest-oblivious, so before serving ungates every manifest
+		// entry must match its on-disk header. Reconcile failure aborts
+		// the transition — internal-state correctness, crash-loud.
+		if err := o.reconcileCompactionManifestFromDisk(segmentsDir); err != nil {
+			return fmt.Errorf("orchestrator: merge-tail compaction manifest reconcile: %w", err)
 		}
 
 		if err := o.simulateCrash(ctx, crashpoint.AfterMergeDstSealBeforeDiscovery); err != nil {

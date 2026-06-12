@@ -11,7 +11,9 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
@@ -22,6 +24,11 @@ import (
 // PhaseBarrier is a nil-able hook that can pause between orchestrator
 // lifecycle phases.
 type PhaseBarrier func(context.Context) error
+
+type CompactionPassResult struct {
+	Watermark uint64
+	Err       error
+}
 
 // Config controls Orchestrator behavior. cmd/jetstream constructs
 // exactly one of these per process and hands it to New.
@@ -53,6 +60,16 @@ type Config struct {
 	// and steady-state live consumers.
 	Verifier *atmossync.Verifier
 
+	// SyncStateStore is the verifier state store when it supports staged
+	// durability. It is forwarded to live consumers so verifier state commits
+	// atomically with the relay cursor after block fsync.
+	SyncStateStore *syncstate.PebbleStateStore
+
+	// Tombstones is the steady-state live tombstone set. Bootstrap leaves
+	// live.Config.Tombstones nil because live_segments are re-sequenced at
+	// merge.
+	Tombstones *tombstone.Set
+
 	// Logger is required.
 	Logger *slog.Logger
 
@@ -60,13 +77,11 @@ type Config struct {
 	// nil means no /metrics counters incrementing.
 	Metrics *Metrics
 
-	// IngestMetrics is consumed by the bootstrap-phase backfill
-	// writer only. The steady-state live consumer's internal
-	// *ingest.Writer hardcodes Metrics: nil (see
-	// internal/ingest/live/consumer.go) to avoid prometheus
-	// duplicate-series registration with the backfill writer's
-	// series, so this field does not flow into the steady-state
-	// path. Optional.
+	// IngestMetrics is the canonical durable-archive writer metric
+	// handle. It is used by the bootstrap backfill writer, merge
+	// destination writer, and steady-state live writer. Bootstrap's
+	// temporary live_segments writer deliberately leaves it nil because
+	// that tree has a throwaway seq space. Optional.
 	IngestMetrics *ingest.Metrics
 
 	// LiveMetrics is shared between the bootstrap-time and
@@ -130,6 +145,43 @@ type Config struct {
 	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's
 	// OnSegmentSealed callback. Optional.
 	IngestOnAfterSeal func(idx uint64, path string) error
+
+	// OnSegmentCompacted refreshes serving metadata after a sealed segment is
+	// rewritten by compaction. cmd/jetstream wires this to the manifest refresh
+	// path (which verifies the rewritten file's checksum as an integrity gate).
+	// Optional before steady state; required for live serving freshness.
+	OnSegmentCompacted func(idx uint64, path string) error
+
+	// SegmentManifestChecksums returns the manifest's resident header
+	// checksums keyed by segment index, as one snapshot. The compactor's
+	// reconcile step compares these against on-disk headers and re-fires
+	// OnSegmentCompacted only on mismatch, keeping no-op passes cheap.
+	// Optional; nil makes reconcile refresh every sealed segment.
+	SegmentManifestChecksums func() map[uint64]uint64
+
+	// CompactionBloomNarrowMaxDIDs bounds the candidate-DID set handed to the
+	// segment-level bloom prefilter; larger tombstone sets skip narrowing
+	// (probing would cost more than it saves — spec §5). Zero selects the
+	// default of 100k.
+	CompactionBloomNarrowMaxDIDs int
+
+	// CompactionInterval controls steady-state periodic delete/update
+	// compaction. Zero disables compaction scheduling and the merge-tail pass.
+	CompactionInterval time.Duration
+
+	// CompactionTombstoneCap is the operator cap for tombstone entries. The
+	// first implementation exposes the knob and uses it for trigger accounting;
+	// chunking lands with the live tombstone set integration.
+	CompactionTombstoneCap int
+
+	// CompactionRewriteWorkers bounds per-segment rewrite parallelism during a
+	// compaction chunk. Zero selects the default min(runtime.NumCPU(), 8).
+	CompactionRewriteWorkers int
+
+	// OnCompactionPass, if non-nil, fires after each enabled compaction pass
+	// attempt, including no-op and failed passes. Test/oracle hook only;
+	// production leaves it nil.
+	OnCompactionPass func(CompactionPassResult)
 
 	// OnSteadyStateWriter, if non-nil, fires once the steady-state
 	// live consumer's ingest.Writer is constructed and registered.

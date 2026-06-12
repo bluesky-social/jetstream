@@ -142,7 +142,7 @@ func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.Segmen
 					return nil, fmt.Errorf("orchestrator: merge: append: %w", err)
 				}
 				r.metrics.incMergeEventsKept()
-				if isCommitKind(ev.Kind) && ev.Rev != "" {
+				if isBackfillRevFilteredKind(ev.Kind) && ev.Rev != "" {
 					perDID[ev.DID] = ev.Rev
 				}
 			}

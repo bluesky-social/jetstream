@@ -93,6 +93,21 @@ func encodeBlockBloomsRegion(filters []*gloom.Filter) ([]byte, uint32, error) {
 	return append(header, body...), sizeBytes, nil
 }
 
+type bloomParams struct {
+	numBlocks uint64
+	k         uint32
+}
+
+func parseBloomParams(buf []byte) (bloomParams, error) {
+	if len(buf) < 13 {
+		return bloomParams{}, fmt.Errorf("%w: bloom params data too short", ErrInvalidFooter)
+	}
+	return bloomParams{
+		k:         binary.LittleEndian.Uint32(buf[1:5]),
+		numBlocks: binary.LittleEndian.Uint64(buf[5:13]),
+	}, nil
+}
+
 // decodeBlockBloomsRegionHeader reads the 8-byte region header and
 // returns (block_count, bloom_size_bytes). The full region body
 // follows on disk and is read by the caller via pread on demand.

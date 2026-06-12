@@ -2,7 +2,7 @@
 	"version": "0.2.0",
 	"configurations": [
 		{
-			"name": "Debug Jetstream (simulator)",
+			"name": "Debug (simulator)",
 			"type": "go",
 			"request": "launch",
 			"mode": "auto",
@@ -10,13 +10,15 @@
 			"cwd": "${workspaceFolder}",
 			"args": [
 				"serve",
+				"--log-level=debug",
 				"--relay-url=http://localhost:7777",
 				"--plc-url=http://localhost:7777",
-				"data-dir=${workspaceFolder}/data-sim",
+				"--data-dir=${workspaceFolder}/data-sim",
+				"--disable-repo-action-rate-limits",
 			]
 		},
 		{
-			"name": "Debug Jetstream (prod)",
+			"name": "Debug (prod)",
 			"type": "go",
 			"request": "launch",
 			"mode": "auto",
@@ -24,8 +26,30 @@
 			"cwd": "${workspaceFolder}",
 			"args": [
 				"serve",
+				"--log-level=debug",
 				"--max-backfill-repos=20",
 				"--data-dir=${workspaceFolder}/data-prod",
+				"--disable-repo-action-rate-limits",
+			]
+		},
+		{
+			"name": "Debug jcalabro (prod)",
+			"type": "go",
+			"request": "launch",
+			"mode": "auto",
+			"program": "${workspaceFolder}/cmd/jetstream",
+			"cwd": "${workspaceFolder}",
+			"args": [
+				"serve",
+				"--log-level=debug",
+				"--relay-url=https://bsky.network",
+				"--plc-url=https://plc.directory",
+				"--data-dir=${workspaceFolder}/data-prod",
+				"--backfill-repos=did:plc:4uz2445cjiw7w4nobfgnu35f",
+				"--compaction-interval=10s",
+				"--compaction-tombstone-cap=100",
+				"--compaction-rewrite-workers=1",
+				"--disable-repo-action-rate-limits",
 			]
 		}
 	]

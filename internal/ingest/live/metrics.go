@@ -12,12 +12,12 @@ const (
 // no-op, so tests can skip metric registration entirely.
 type Metrics struct {
 	EventsReceived         prometheus.Counter
-	EventsConverted        prometheus.Counter
 	Reconnects             prometheus.Counter
 	DecodeErrors           prometheus.Counter
 	UnknownEvents          prometheus.Counter
 	DroppedOpsMissingBlock prometheus.Counter
 	DroppedEvents          prometheus.Counter
+	StaleResyncsDropped    prometheus.Counter
 	UpstreamCursor         prometheus.Gauge
 }
 
@@ -30,11 +30,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "events_received_total",
 			Help: "Number of upstream firehose events the consumer decoded successfully.",
-		}),
-		EventsConverted: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "events_converted_total",
-			Help: "Number of segment.Events emitted by the converter (one per record op for commits, one per non-commit event).",
 		}),
 		Reconnects: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -65,6 +60,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "dropped_events_total",
 			Help: "Number of upstream events skipped because their fields cannot be represented in the segment format.",
 		}),
+		StaleResyncsDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "stale_resyncs_dropped_total",
+			Help: "Number of async resync events dropped because the verifier chain rev had " +
+				"already advanced past the resync's rev (delivery-order guard; the affected " +
+				"DID's tombstone coverage waits for its next divergence).",
+		}),
 		UpstreamCursor: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "upstream_cursor",
@@ -72,9 +74,9 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 	}
 	reg.MustRegister(
-		m.EventsReceived, m.EventsConverted, m.Reconnects,
+		m.EventsReceived, m.Reconnects,
 		m.DecodeErrors, m.UnknownEvents, m.DroppedOpsMissingBlock,
-		m.DroppedEvents, m.UpstreamCursor,
+		m.DroppedEvents, m.StaleResyncsDropped, m.UpstreamCursor,
 	)
 	return m
 }
@@ -82,12 +84,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 func (m *Metrics) incEventsReceived() {
 	if m != nil {
 		m.EventsReceived.Inc()
-	}
-}
-
-func (m *Metrics) incEventsConverted() {
-	if m != nil {
-		m.EventsConverted.Inc()
 	}
 }
 
@@ -118,6 +114,12 @@ func (m *Metrics) addDroppedOpsMissingBlock(n int) {
 func (m *Metrics) incDroppedEvents() {
 	if m != nil {
 		m.DroppedEvents.Inc()
+	}
+}
+
+func (m *Metrics) incStaleResyncsDropped() {
+	if m != nil {
+		m.StaleResyncsDropped.Inc()
 	}
 }
 

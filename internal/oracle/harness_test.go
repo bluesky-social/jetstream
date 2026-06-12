@@ -64,8 +64,19 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	afterMerge := newPhaseGate()
 	bootstrapAck := newSeqAck()
 	steadyAck := newSeqAck()
+	asyncResyncAck := newSyncTombstoneAck()
+	compaction := newCompactionPassRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
+	emittedBootstrapAccountDelete := false
 	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, func(ctx context.Context) (int64, error) {
+		if !emittedBootstrapAccountDelete {
+			emittedBootstrapAccountDelete = true
+			_, err := w.GenerateAccountDeleteForTest(ctx, 0)
+			if err != nil {
+				return 0, err
+			}
+			return w.CurrentSeq(), nil
+		}
 		_, err := w.GenerateOneForTest(ctx)
 		if err != nil {
 			return 0, err
@@ -108,11 +119,16 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		SubscribeSlowWindow:       time.Second,
 		SubscribeSlowMinRate:      1,
 		CursorBlockIndexCacheSize: 32,
+		CompactionInterval:        time.Hour,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
+		OnCompactionPass:          compaction.Observe,
 		OnBootstrapLiveEvent:      bootstrapAck.Observe,
-		OnSteadyStateEvent:        steadyAck.Observe,
-		AfterRepoComplete:         bootstrapTraffic.AfterRepoComplete,
+		OnSteadyStateEvent: func(ev *segment.Event) {
+			steadyAck.Observe(ev)
+			asyncResyncAck.Observe(ev)
+		},
+		AfterRepoComplete: bootstrapTraffic.AfterRepoComplete,
 	})
 	require.NoError(t, err)
 
@@ -141,12 +157,24 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 
 	waitForBarrier(t, cfg, "after-merge", afterMerge, run)
 	assertOracleMatches(t, dataDir, w, cfg, "after-merge")
+	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "after-merge")
 	faultPlan.ArmSubscribeReposDisconnects()
 	afterMerge.Release()
 
 	generateN(t, w, cfg.LiveEventsSteady)
+	syncIdx := pickActiveOracleAccount(t, w, cfg)
+	_, err = w.GenerateSilentMutationThenSyncForTest(t.Context(), syncIdx)
+	require.NoError(t, err)
 	targetSeq := w.CurrentSeq()
 	steadyAck.Wait(t, cfg, targetSeq, run, 30*time.Second)
+
+	asyncIdx := pickActiveOracleAccount(t, w, cfg)
+	_, err = w.GenerateSilentMutationThenCommitForTest(t.Context(), asyncIdx)
+	require.NoError(t, err)
+	asyncEntry, _, err := w.ListReposPage(asyncIdx, 1)
+	require.NoError(t, err)
+	require.Len(t, asyncEntry, 1)
+	asyncResyncAck.Wait(t, cfg, string(asyncEntry[0].DID), asyncEntry[0].Rev, run, 30*time.Second)
 
 	// steadyAck.Wait above guarantees every steady-state cursor up to
 	// targetSeq has been durably appended (OnEvent fires post-Append), so
@@ -159,6 +187,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	runDone = true
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
+	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "steady-state-shutdown-flush")
 }
 
 // assertFaultPlanFired verifies the fault injection actually happened.
@@ -212,6 +241,15 @@ func assertOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Confi
 	t.Logf("%s: oracle matched %d observed events in mode=%s seed=%d", phase, len(events), cfg.Mode, cfg.Seed)
 }
 
+func assertCompacted(t *testing.T, dataDir string, watermark uint64, cfg Config, phase string) {
+	t.Helper()
+
+	events, err := ObserveSegments(dataDir)
+	require.NoErrorf(t, err, "%s mode=%s seed=%d: observe segments for compaction", phase, cfg.Mode, cfg.Seed)
+	require.NoErrorf(t, CheckCompacted(EventsSortedBySeq(events), watermark),
+		"%s mode=%s seed=%d: check compacted watermark=%d", phase, cfg.Mode, cfg.Seed, watermark)
+}
+
 func assertBootstrapOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Config) {
 	t.Helper()
 
@@ -259,6 +297,31 @@ type runtimeRun struct {
 	err    error
 }
 
+type compactionPassRecorder struct {
+	mu      sync.Mutex
+	results []jetstreamd.CompactionPassResult
+}
+
+func newCompactionPassRecorder() *compactionPassRecorder {
+	return &compactionPassRecorder{}
+}
+
+func (r *compactionPassRecorder) Observe(result jetstreamd.CompactionPassResult) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.results = append(r.results, result)
+}
+
+func (r *compactionPassRecorder) Last(t *testing.T) jetstreamd.CompactionPassResult {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	require.NotEmpty(t, r.results, "expected at least one compaction pass")
+	last := r.results[len(r.results)-1]
+	require.NoError(t, last.Err, "latest compaction pass failed")
+	return last
+}
+
 func waitForBarrier(t *testing.T, cfg Config, name string, gate *phaseGate, run *runtimeRun) {
 	t.Helper()
 
@@ -301,6 +364,19 @@ func generateN(t *testing.T, w *world.World, n int) {
 	}
 }
 
+func pickActiveOracleAccount(t *testing.T, w *world.World, cfg Config) int {
+	t.Helper()
+	for idx := range cfg.Accounts {
+		deleted, err := w.IsAccountDeleted(idx)
+		require.NoError(t, err)
+		if !deleted {
+			return idx
+		}
+	}
+	t.Fatal("oracle requires at least one active account for sync divergence")
+	return 0
+}
+
 // seqAck tracks a gap-free watermark over the steady-state cursors
 // surfaced by OnEvent (which fires only after a durable Append). The
 // harness waits until every cursor up to the target seq has been durably
@@ -314,11 +390,73 @@ type seqAck struct {
 	once   sync.Once
 }
 
+type syncTombstoneAck struct {
+	mu      sync.Mutex
+	seen    map[string]struct{}
+	target  string
+	done    chan struct{}
+	waiting bool
+	once    sync.Once
+}
+
 func newSeqAck() *seqAck {
 	return &seqAck{
 		seen: make(map[int64]struct{}),
 		done: make(chan struct{}),
 	}
+}
+
+func newSyncTombstoneAck() *syncTombstoneAck {
+	return &syncTombstoneAck{
+		seen: make(map[string]struct{}),
+		done: make(chan struct{}),
+	}
+}
+
+func (a *syncTombstoneAck) Observe(ev *segment.Event) {
+	if ev == nil || ev.Kind != segment.KindSync || ev.DID == "" || ev.Rev == "" {
+		return
+	}
+	a.mu.Lock()
+	a.seen[syncTombstoneKey(ev.DID, ev.Rev)] = struct{}{}
+	a.maybeDoneLocked()
+	a.mu.Unlock()
+}
+
+func (a *syncTombstoneAck) Wait(t *testing.T, cfg Config, did, rev string, run *runtimeRun, timeout time.Duration) {
+	t.Helper()
+
+	a.mu.Lock()
+	a.target = syncTombstoneKey(did, rev)
+	a.waiting = true
+	a.maybeDoneLocked()
+	a.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-a.done:
+		return
+	case <-run.exited:
+		t.Fatalf("steady-state ingestion stopped before observing async resync tombstone did=%s rev=%s: mode=%s seed=%d err=%v",
+			did, rev, cfg.Mode, cfg.Seed, run.err)
+	case <-timer.C:
+		t.Fatalf("timeout waiting for async resync tombstone did=%s rev=%s: mode=%s seed=%d",
+			did, rev, cfg.Mode, cfg.Seed)
+	}
+}
+
+func (a *syncTombstoneAck) maybeDoneLocked() {
+	if !a.waiting || a.target == "" {
+		return
+	}
+	if _, ok := a.seen[a.target]; ok {
+		a.once.Do(func() { close(a.done) })
+	}
+}
+
+func syncTombstoneKey(did, rev string) string {
+	return did + "\x00" + rev
 }
 
 func (a *seqAck) Observe(ev *segment.Event) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 
 	"github.com/zeebo/xxh3"
 )
@@ -104,6 +105,20 @@ func decodeHeader(buf []byte) (Header, error) {
 		Checksum:              checksum,
 	}
 	return h, nil
+}
+
+// ReadSealedHeader reads and parses the 256-byte fixed header from r
+// (an open segment file), with full magic/version validation. Returns
+// an ErrActiveSegment-wrapped error when the checksum field is zero
+// (active file) and an ErrCorruptSegment-wrapped error on bad magic.
+// Cheap (one pread); used by serving paths that derive download
+// validators from the file descriptor they actually opened.
+func ReadSealedHeader(r io.ReaderAt) (Header, error) {
+	buf := make([]byte, ReservedHeaderBytes)
+	if _, err := r.ReadAt(buf, 0); err != nil {
+		return Header{}, fmt.Errorf("segment: read header: %w", err)
+	}
+	return decodeHeader(buf)
 }
 
 // xxh3HeaderFooter computes xxh3 over headerBytes[12:] followed by

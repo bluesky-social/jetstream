@@ -24,6 +24,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/status"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/internal/subscribe"
+	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
 	"github.com/bluesky-social/jetstream-v2/internal/web"
 	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
@@ -61,6 +62,15 @@ type Runtime struct {
 func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.SegmentCacheMaxAge < 0 {
 		return nil, fmt.Errorf("serve: --segment-cache-max-age must be >= 0 (SegmentCacheMaxAge must be >= 0), got %s", opts.SegmentCacheMaxAge)
+	}
+	if opts.CompactionInterval < 0 {
+		return nil, fmt.Errorf("serve: --compaction-interval must be >= 0 (CompactionInterval must be >= 0), got %s", opts.CompactionInterval)
+	}
+	if opts.CompactionTombstoneCap < 0 {
+		return nil, fmt.Errorf("serve: --compaction-tombstone-cap must be >= 0 (CompactionTombstoneCap must be >= 0), got %d", opts.CompactionTombstoneCap)
+	}
+	if opts.CompactionRewriteWorkers < 0 {
+		return nil, fmt.Errorf("serve: --compaction-rewrite-workers must be >= 0 (CompactionRewriteWorkers must be >= 0), got %d", opts.CompactionRewriteWorkers)
 	}
 
 	processLogger, err := obs.BuildLoggerFromStrings(opts.LogOutput, opts.LogLevel, opts.LogFormat)
@@ -159,9 +169,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 
 	statusHandler, err := web.New(web.Options{
-		Snapshotter: statusCollector,
-		RepoActions: web.NewRepoActions(opts.DataDir, opts.RelayURL),
-		Logger:      processLogger,
+		Snapshotter:                statusCollector,
+		RepoActions:                web.NewRepoActions(opts.DataDir, opts.RelayURL),
+		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
+		Logger:                     processLogger,
 	})
 	if err != nil {
 		return fail(fmt.Errorf("serve: build status handler: %w", err))
@@ -199,6 +210,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 
 	stateStore := syncstate.New(metaStore)
+	tombstones := tombstone.New()
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
@@ -252,33 +264,45 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		}
 	}
 	orch, err := orchestrator.New(orchestrator.Config{
-		DataDir:    opts.DataDir,
-		Store:      metaStore,
-		RelayURL:   opts.RelayURL,
-		HTTPClient: xrpcClient.HTTPClient.Val(),
-		Directory:  directory,
-		Verifier:   verifier,
+		DataDir:        opts.DataDir,
+		Store:          metaStore,
+		RelayURL:       opts.RelayURL,
+		HTTPClient:     xrpcClient.HTTPClient.Val(),
+		Directory:      directory,
+		Verifier:       verifier,
+		SyncStateStore: stateStore,
+		Tombstones:     tombstones,
 		// Bare logger; orchestrator.New attaches component=orchestrator
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.
-		Logger:                 processLogger,
-		Metrics:                orchestrator.NewMetrics(metrics.Registry),
-		IngestMetrics:          ingest.NewMetrics(metrics.Registry),
-		LiveMetrics:            live.NewMetrics(metrics.Registry),
-		BackfillMetrics:        backfill.NewMetrics(metrics.Registry),
-		SegmentMetrics:         segmentMetrics,
-		OnEvent:                onSteadyStateEvent,
-		OnBootstrapLiveEvent:   opts.OnBootstrapLiveEvent,
-		MaxBackfillRepos:       opts.MaxBackfillRepos,
-		BackfillRepos:          opts.BackfillRepos,
-		SkipMergeDiscovery:     opts.SkipMergeDiscovery,
-		BackfillRetryBaseDelay: opts.BackfillRetryBaseDelay,
-		LiveReconnectBackoff:   opts.LiveReconnectBackoff,
-		IngestOnAfterSeal:      mft.OnSegmentSealed,
-		BarrierAfterBootstrap:  phaseBarrier(opts.BarrierAfterBootstrap),
-		BarrierAfterMerge:      phaseBarrier(opts.BarrierAfterMerge),
-		AfterRepoComplete:      opts.AfterRepoComplete,
-		CrashInjector:          opts.CrashInjector,
+		Logger:                   processLogger,
+		Metrics:                  orchestrator.NewMetrics(metrics.Registry, tombstones),
+		IngestMetrics:            ingest.NewMetrics(metrics.Registry),
+		LiveMetrics:              live.NewMetrics(metrics.Registry),
+		BackfillMetrics:          backfill.NewMetrics(metrics.Registry),
+		SegmentMetrics:           segmentMetrics,
+		OnEvent:                  onSteadyStateEvent,
+		OnBootstrapLiveEvent:     opts.OnBootstrapLiveEvent,
+		MaxBackfillRepos:         opts.MaxBackfillRepos,
+		BackfillRepos:            opts.BackfillRepos,
+		SkipMergeDiscovery:       opts.SkipMergeDiscovery,
+		BackfillRetryBaseDelay:   opts.BackfillRetryBaseDelay,
+		LiveReconnectBackoff:     opts.LiveReconnectBackoff,
+		IngestOnAfterSeal:        mft.OnSegmentSealed,
+		OnSegmentCompacted:       mft.OnSegmentCompacted,
+		SegmentManifestChecksums: mft.SegmentChecksums,
+		CompactionInterval:       opts.CompactionInterval,
+		CompactionTombstoneCap:   opts.CompactionTombstoneCap,
+		CompactionRewriteWorkers: opts.CompactionRewriteWorkers,
+		OnCompactionPass: func(result orchestrator.CompactionPassResult) {
+			if opts.OnCompactionPass != nil {
+				opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
+			}
+		},
+		BarrierAfterBootstrap: phaseBarrier(opts.BarrierAfterBootstrap),
+		BarrierAfterMerge:     phaseBarrier(opts.BarrierAfterMerge),
+		AfterRepoComplete:     opts.AfterRepoComplete,
+		CrashInjector:         opts.CrashInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			writerPtr.Store(w)
 		},
@@ -424,6 +448,13 @@ func (r *Runtime) Close(ctx context.Context) error {
 		}
 		r.verifier = nil
 	}
+	// Note: promoted sync state is NOT flushed here. The consumer's own
+	// Close flushes it after its writer has durably fsynced every
+	// appended row; flushing from Runtime.Close would commit promoted
+	// state even when the consumer's writer.Close failed, letting
+	// verifier state run ahead of the archive. Pending (unpromoted)
+	// entries are deliberately dropped — their events' rows were never
+	// archived and redelivery re-verifies them.
 	if r.metaStore != nil {
 		if err := r.metaStore.Close(); err != nil {
 			r.logger.Error("close metadata store", "err", err)

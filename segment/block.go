@@ -234,14 +234,19 @@ func (e eventColumns) TotalPayloadsLen() int {
 }
 
 // encodeBlock writes the uncompressed columnar body for the given
-// events. Callers must pass at least one event. Events must be
-// validated before this call.
+// events. Callers must pass at least one event; the compaction rewrite
+// path uses encodeEmptyBlock for the explicit zero-event-block format.
+// Events must be validated before this call.
 func encodeBlock(events []Event) ([]byte, error) {
 	if len(events) == 0 {
 		return nil, fmt.Errorf("segment: encodeBlock called with zero events")
 	}
 
 	return encodeBlockColumns(eventColumns(events)), nil
+}
+
+func encodeEmptyBlock() []byte {
+	return []byte{0, 0, 0, 0}
 }
 
 // errTruncatedBlock is the sentinel for any malformed uncompressed
@@ -298,9 +303,10 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	nEvents := int(nEvents64)
 
 	if nEvents == 0 {
-		// encodeBlock refuses empty input; a zero-event block on the
-		// wire is corruption.
-		return nil, errTruncatedBlock
+		if off != len(buf) {
+			return nil, errTruncatedBlock
+		}
+		return []Event{}, nil
 	}
 
 	events := make([]Event, nEvents)

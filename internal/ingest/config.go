@@ -53,6 +53,19 @@ type Config struct {
 	// every Append in the active worker pool).
 	OnAfterFlush func(ctx context.Context) error
 
+	// OnAppend, if non-nil, runs synchronously inside Append after
+	// the event's Seq is assigned and BEFORE the block can flush or
+	// the segment can seal, under the writer mutex. This ordering is
+	// load-bearing for the compaction tombstone set: any seq visible
+	// in a sealed on-disk header has already passed through OnAppend,
+	// so a concurrently-running compaction pass that discovers the
+	// sealed file can never compute a watermark covering an event the
+	// hook has not yet observed. An error fails the Append.
+	//
+	// Hooks must not call back into the Writer (deadlock on w.mu) and
+	// must be cheap — they run on the hot ingest path for every event.
+	OnAppend func(ev *segment.Event) error
+
 	// OnAfterSeal, if non-nil, runs after a successful segment seal
 	// during rotation or SealActiveAndClose: segment.Writer.Seal has
 	// fsynced the footer and finalized the fixed header before this

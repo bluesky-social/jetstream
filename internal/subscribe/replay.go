@@ -66,6 +66,16 @@ func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Eve
 			if err != nil {
 				return err
 			}
+			if next <= bounds.MaxSeq {
+				// The segment was fully scanned and emitted nothing at
+				// or above next. Compaction preserves a segment's
+				// historical seq envelope while dropping rows, so the
+				// trailing seqs up to bounds.MaxSeq may simply no
+				// longer exist; without this bump SegmentForSeq would
+				// return the same segment forever and the walk would
+				// spin.
+				next = bounds.MaxSeq + 1
+			}
 			current = next
 		}
 	}
@@ -109,11 +119,18 @@ func decodeSealedBlock(cache *blockCache, segIdx uint64, blockIdx int, r *segmen
 		return r.DecodeBlock(blockIdx)
 	}
 	return cache.getOrDecode(
-		blockKey{segIdx: segIdx, blockIdx: uint64(blockIdx)},
+		blockKey{segIdx: segIdx, checksum: r.Header().Checksum, blockIdx: uint64(blockIdx)},
 		func() ([]segment.Event, error) { return r.DecodeBlock(blockIdx) },
 	)
 }
 
+// walkSealedSegment mixes the MANIFEST's block index (iteration order,
+// seq-bound skip decisions) with offsets from the freshly-opened file.
+// That mixing is safe across compaction rewrites ONLY because Rewrite
+// preserves block topology and historical seq envelopes (block numbers
+// stable, manifest bounds valid supersets). Block repacking — merging
+// thinned blocks — must migrate this call site (or generation-check
+// the manifest entry) first.
 func walkSealedSegment(m *manifest.Manifest, bounds manifest.SegmentBounds, current uint64, cache *blockCache, emit func(*segment.Event) error) (uint64, error) {
 	blocks, err := m.BlockIndex(bounds.Idx)
 	if err != nil {

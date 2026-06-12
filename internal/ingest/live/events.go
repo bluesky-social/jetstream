@@ -32,6 +32,8 @@ import (
 // for the canonical handling.
 func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
 	switch {
+	case evt.Resync != streaming.ResyncNone && evt.Sync == nil:
+		return nil, fmt.Errorf("livestream: resync event missing sync envelope: %w", ErrUnknownEventKind)
 	case evt.Commit != nil:
 		return convertCommit(evt, indexedAt)
 	case evt.Identity != nil:
@@ -48,20 +50,16 @@ func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error)
 	default:
 		// No public envelope is set. Two cases:
 		//
-		//   1. atmos's verifier resync worker emits a synthetic
-		//      streaming.Event with only its (unexported) verifiedOps
-		//      populated, after re-fetching a repo via getRepo to
-		//      recover from a verification failure (chain break,
-		//      duplicate-op-path, inversion failure). Operations()
-		//      yields the resync ops directly with per-op DID + Rev;
-		//      we map each to KindCreate, matching the
-		//      streaming.ActionResync handling used when ops arrive
-		//      inside a #commit envelope.
+		//   1. Older local atmos checkouts emitted async resync
+		//      replacement ops without a public envelope. The current
+		//      local atmos API emits ResyncAsync with Sync populated,
+		//      but keeping this fallback makes the converter tolerant
+		//      during branch bisects and local replace churn.
 		//
 		//   2. A future relay variant we don't know how to decode.
 		//      Operations() yields nothing in that case, so we fall
-		//      through to ErrUnknownEventKind and the consumer
-		//      refuses to advance its cursor past this seq.
+		//      through to ErrUnknownEventKind and the consumer refuses
+		//      to advance its cursor past this seq.
 		return convertVerifiedOps(evt, indexedAt)
 	}
 }
@@ -72,6 +70,7 @@ func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error)
 // the iterator yielding ops.
 func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
 	var out []segment.Event
+	var dropped []DroppedOp
 	for op, err := range evt.Operations() {
 		if err != nil {
 			return nil, fmt.Errorf("livestream: decode resync ops: %w", err)
@@ -98,10 +97,21 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, 
 		// an op without payload bytes, which it shouldn't — but we
 		// drop rather than crash to keep the property uniform with
 		// convertCommit: a misbehaving upstream should not be able
-		// to take the firehose down.
+		// to take the firehose down. The drop is surfaced via
+		// DroppedMissingBlocksError so it is never silent: when the
+		// event also carries a KindSync DID tombstone, a record
+		// skipped here is permanently absent from the post-compaction
+		// archive, and the operator needs the signal.
 		if kind != segment.KindDelete {
 			block := op.BlockData()
 			if block == nil {
+				dropped = append(dropped, DroppedOp{
+					DID:        string(op.Repo),
+					Collection: string(op.Collection),
+					RKey:       string(op.RKey),
+					Action:     string(op.Action),
+					CID:        op.CID.String(),
+				})
 				continue
 			}
 			segEv.Payload = append([]byte(nil), block...)
@@ -109,6 +119,9 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, 
 		out = append(out, segEv)
 	}
 
+	if len(dropped) > 0 {
+		return out, &DroppedMissingBlocksError{Dropped: dropped}
+	}
 	if len(out) == 0 {
 		// Iterator yielded nothing at all — this is a true unknown
 		// event kind (no Commit/Sync/Identity/Account/Info, no
@@ -232,12 +245,63 @@ func convertSync(evt streaming.Event, indexedAt int64) ([]segment.Event, error) 
 	if err != nil {
 		return nil, fmt.Errorf("livestream: marshal sync: %w", err)
 	}
-	return []segment.Event{{
+	out := []segment.Event{{
 		IndexedAt:           indexedAt,
 		UpstreamRelayCursor: evt.Seq,
 		Kind:                segment.KindSync,
 		DID:                 evt.Sync.DID,
 		Rev:                 evt.Sync.Rev,
 		Payload:             payload,
-	}}, nil
+	}}
+
+	// When the verifier performs a synchronous resync for this #sync
+	// event, Operations yields the authoritative post-resync record set
+	// without extra I/O. (atmos's resync is all-or-nothing — a missing
+	// record block fails the whole resync — and live.Config requires a
+	// verifier, so Operations never falls back to lazy network I/O
+	// here.) The KindSync row must remain first so its seq is below
+	// every replacement record assigned by ingest.Writer.
+	var dropped []DroppedOp
+	for op, err := range evt.Operations() {
+		if err != nil {
+			return nil, fmt.Errorf("livestream: decode sync resync ops for did=%s: %w", evt.Sync.DID, err)
+		}
+		kind, err := actionKind(op.Action)
+		if err != nil {
+			return nil, fmt.Errorf("livestream: did=%s: %w", op.Repo, err)
+		}
+		segEv := segment.Event{
+			IndexedAt:           indexedAt,
+			UpstreamRelayCursor: evt.Seq,
+			Kind:                kind,
+			DID:                 string(op.Repo),
+			Collection:          string(op.Collection),
+			Rkey:                string(op.RKey),
+			Rev:                 string(op.Rev),
+		}
+		if kind != segment.KindDelete {
+			block := op.BlockData()
+			if block == nil {
+				// Should be unreachable for resync ops (see above),
+				// but the KindSync row is a DID tombstone: silently
+				// skipping a replacement record here would make
+				// compaction permanently erase it from the archive.
+				// Surface the drop so the consumer counts and logs it.
+				dropped = append(dropped, DroppedOp{
+					DID:        string(op.Repo),
+					Collection: string(op.Collection),
+					RKey:       string(op.RKey),
+					Action:     string(op.Action),
+					CID:        op.CID.String(),
+				})
+				continue
+			}
+			segEv.Payload = append([]byte(nil), block...)
+		}
+		out = append(out, segEv)
+	}
+	if len(dropped) > 0 {
+		return out, &DroppedMissingBlocksError{Dropped: dropped}
+	}
+	return out, nil
 }

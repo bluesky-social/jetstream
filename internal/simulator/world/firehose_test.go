@@ -30,6 +30,29 @@ func TestEncodeCommitFrame_DecodableHeader(t *testing.T) {
 	require.True(t, bytes.HasPrefix(frame, []byte{0xa2}), "expected map(2) header")
 }
 
+func TestEncodeSyncFrame_DecodableHeader(t *testing.T) {
+	t.Parallel()
+	sync := &comatproto.SyncSubscribeRepos_Sync{
+		DID:    "did:plc:abcdefghijklmnopqrstuvwx",
+		Rev:    "3kabc123def4g",
+		Seq:    1,
+		Time:   "2024-01-01T00:00:00Z",
+		Blocks: []byte{0x01, 0x02},
+	}
+	frame, err := encodeSyncFrame(sync)
+	require.NoError(t, err)
+
+	require.True(t, bytes.HasPrefix(frame, []byte{0xa2}), "expected map(2) header")
+	body, ok := bytes.CutPrefix(frame, frameHeaderSync)
+	require.True(t, ok, "expected #sync header")
+	var roundTrip comatproto.SyncSubscribeRepos_Sync
+	require.NoError(t, roundTrip.UnmarshalCBOR(body))
+	require.Equal(t, sync.DID, roundTrip.DID)
+	require.Equal(t, sync.Rev, roundTrip.Rev)
+	require.Equal(t, sync.Seq, roundTrip.Seq)
+	require.Equal(t, sync.Blocks, roundTrip.Blocks)
+}
+
 func TestPersistAndRange(t *testing.T) {
 	t.Parallel()
 	cfg := DefaultConfig()

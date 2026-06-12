@@ -17,6 +17,11 @@ import (
 // lifecycle phase before the daemon advances to the next phase.
 type PhaseBarrier func(context.Context) error
 
+type CompactionPassResult struct {
+	Watermark uint64
+	Err       error
+}
+
 // Options is the typed runtime configuration for one jetstream daemon
 // instance, after CLI and environment inputs have been resolved.
 type Options struct {
@@ -35,6 +40,10 @@ type Options struct {
 	MaxBackfillRepos   int
 	BackfillRepos      []atmos.DID
 	SkipMergeDiscovery bool
+
+	// DisableRepoActionRateLimits disables the per-source-IP limiter for
+	// expensive operator-triggered repo actions on the status UI.
+	DisableRepoActionRateLimits bool
 
 	// BackfillRetryBaseDelay, when > 0, overrides the bootstrap backfill
 	// engine's initial retry backoff (atmos default 1s). Used by the
@@ -55,8 +64,12 @@ type Options struct {
 	SubscribeSlowWindow       time.Duration
 	SubscribeSlowMinRate      float64
 	CursorBlockIndexCacheSize int
+	CompactionInterval        time.Duration
+	CompactionTombstoneCap    int
+	CompactionRewriteWorkers  int
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
+	OnCompactionPass          func(CompactionPassResult)
 	AfterRepoComplete         func(context.Context, atmos.DID) error
 	CrashInjector             crashpoint.Injector
 	OnBootstrapLiveEvent      func(*segment.Event)

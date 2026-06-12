@@ -15,6 +15,7 @@ import (
 // these as two concatenated CBOR values (header map + body).
 var (
 	frameHeaderCommit   = mustEncodeFrameHeader("#commit")
+	frameHeaderSync     = mustEncodeFrameHeader("#sync")
 	frameHeaderIdentity = mustEncodeFrameHeader("#identity")
 	frameHeaderAccount  = mustEncodeFrameHeader("#account")
 	frameHeaderInfo     = mustEncodeFrameHeader("#info")
@@ -50,6 +51,17 @@ func encodeCommitFrame(c *comatproto.SyncSubscribeRepos_Commit) ([]byte, error) 
 	}
 	out := make([]byte, 0, len(frameHeaderCommit)+len(body))
 	out = append(out, frameHeaderCommit...)
+	out = append(out, body...)
+	return out, nil
+}
+
+func encodeSyncFrame(e *comatproto.SyncSubscribeRepos_Sync) ([]byte, error) {
+	body, err := e.MarshalCBOR()
+	if err != nil {
+		return nil, fmt.Errorf("world: encode sync frame body: %w", err)
+	}
+	out := make([]byte, 0, len(frameHeaderSync)+len(body))
+	out = append(out, frameHeaderSync...)
 	out = append(out, body...)
 	return out, nil
 }
@@ -115,6 +127,17 @@ func (w *World) persistFirehoseFrame(seq int64, frame []byte) error {
 	b := w.db.NewBatch()
 	defer func() { _ = b.Close() }()
 
+	if err := stageFirehoseFrame(b, seq, frame, w.cfg.FirehoseHistory); err != nil {
+		return err
+	}
+
+	if err := b.Commit(pebble.NoSync); err != nil {
+		return fmt.Errorf("world: commit firehose: %w", err)
+	}
+	return nil
+}
+
+func stageFirehoseFrame(b *pebble.Batch, seq int64, frame []byte, history int) error {
 	if err := b.Set(keyFirehose(seq), frame, nil); err != nil {
 		return fmt.Errorf("world: stage firehose row: %w", err)
 	}
@@ -124,17 +147,11 @@ func (w *World) persistFirehoseFrame(seq int64, frame []byte) error {
 		return fmt.Errorf("world: stage firehose seq: %w", err)
 	}
 
-	// Trim. The oldest seq we want to retain is seq - history + 1.
-	if w.cfg.FirehoseHistory > 0 && seq > int64(w.cfg.FirehoseHistory) {
-		oldest := seq - int64(w.cfg.FirehoseHistory) + 1
-		// DeleteRange [firehose/0, firehose/oldest).
+	if history > 0 && seq > int64(history) {
+		oldest := seq - int64(history) + 1
 		if err := b.DeleteRange(keyFirehose(0), keyFirehose(oldest), nil); err != nil {
 			return fmt.Errorf("world: trim firehose: %w", err)
 		}
-	}
-
-	if err := b.Commit(pebble.NoSync); err != nil {
-		return fmt.Errorf("world: commit firehose: %w", err)
 	}
 	return nil
 }

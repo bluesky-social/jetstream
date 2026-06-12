@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
 )
@@ -54,10 +55,30 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 		return xrpcserver.InternalError("failed to open segment")
 	}
 	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		h.logger.Error("getSegment: stat sealed file failed",
+			slog.String("name", name), slog.String("path", ref.Path),
+			slog.Any("err", err))
+		return xrpcserver.InternalError("failed to stat segment")
+	}
+	// Download validators come from the fd we actually serve, never the
+	// manifest: during a compaction rename→refresh window the manifest
+	// ETag is stale, and an If-Range match against it would let a
+	// resuming client splice two file generations together.
+	// ReadSealedHeader validates magic/version, so a corrupt or
+	// foreign file errors instead of serving a confident strong ETag.
+	hdr, err := segment.ReadSealedHeader(f)
+	if err != nil {
+		h.logger.Error("getSegment: read sealed header failed",
+			slog.String("name", name), slog.String("path", ref.Path),
+			slog.Any("err", err))
+		return xrpcserver.InternalError("failed to read segment header")
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// A strong ETag is the value wrapped in double quotes per RFC 9110.
-	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(ref.Checksum)))
+	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(hdr.Checksum)))
 	w.Header().Set("Cache-Control", cacheControlHeader(h.cacheMaxAge))
 
 	// ServeContent handles Range, Accept-Ranges, Content-Length,
@@ -65,7 +86,7 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 	// statusRecorder.ReadFrom delegation. Per the xrpcserver.Handler contract
 	// we MUST return nil after this point: the response may already be
 	// partially written, so an error envelope is no longer possible.
-	http.ServeContent(w, r.HTTPReq, name, ref.ModTime, f)
+	http.ServeContent(w, r.HTTPReq, name, info.ModTime(), f)
 	return nil
 }
 

@@ -5,6 +5,20 @@ import "github.com/bluesky-social/jetstream-v2/segment"
 func Reconstruct(events []ObservedEvent) (*Model, error) {
 	model := &Model{Accounts: make(map[string]RepoSnapshot)}
 	for _, ev := range events {
+		if ev.Kind == segment.KindAccount {
+			deleted, err := oracleAccountDeleted(ev.Payload)
+			if err != nil {
+				return nil, err
+			}
+			if deleted {
+				model.Accounts[ev.DID] = RepoSnapshot{Records: make(map[RecordKey]RecordValue)}
+			}
+			continue
+		}
+		if ev.Kind == segment.KindSync {
+			model.Accounts[ev.DID] = RepoSnapshot{Records: make(map[RecordKey]RecordValue)}
+			continue
+		}
 		if !isCommitKind(ev.Kind) {
 			continue
 		}

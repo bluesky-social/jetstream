@@ -197,6 +197,41 @@ func TestConvertEvent_Sync(t *testing.T) {
 	require.Equal(t, sync.Blocks, roundTrip.Blocks)
 }
 
+func TestConvertEvent_AsyncResyncEmptyRepoEmitsSyncTombstone(t *testing.T) {
+	t.Parallel()
+
+	sync := &comatproto.SyncSubscribeRepos_Sync{
+		DID: "did:plc:emptyasyncresync",
+		Rev: "3async",
+	}
+	evt := streaming.Event{
+		Sync:   sync,
+		Resync: streaming.ResyncAsync,
+	}
+
+	got, err := ConvertEvent(evt, testIndexedAt)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, segment.KindSync, got[0].Kind)
+	require.Equal(t, "did:plc:emptyasyncresync", got[0].DID)
+	require.Equal(t, "3async", got[0].Rev)
+	require.Equal(t, int64(0), got[0].UpstreamRelayCursor, "async resync events are synthetic and have no relay seq")
+
+	var roundTrip comatproto.SyncSubscribeRepos_Sync
+	require.NoError(t, roundTrip.UnmarshalCBOR(got[0].Payload))
+	require.Equal(t, sync.DID, roundTrip.DID)
+	require.Equal(t, sync.Rev, roundTrip.Rev)
+}
+
+func TestConvertEvent_ResyncWithoutSyncEnvelopeErrors(t *testing.T) {
+	t.Parallel()
+
+	got, err := ConvertEvent(streaming.Event{Resync: streaming.ResyncAsync}, testIndexedAt)
+	require.ErrorIs(t, err, ErrUnknownEventKind)
+	require.Contains(t, err.Error(), "resync event missing sync envelope")
+	require.Nil(t, got)
+}
+
 func TestConvertEvent_InfoEmits_Nothing(t *testing.T) {
 	t.Parallel()
 	evt := streaming.Event{Info: &comatproto.SyncSubscribeRepos_Info{}}

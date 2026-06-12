@@ -27,9 +27,14 @@ func isCommitKind(k segment.Kind) bool {
 	}
 }
 
-// shouldKeep returns true unless the event is a commit kind whose
-// data is already covered by the backfill writer's authoritative
-// per-DID write.
+func isBackfillRevFilteredKind(k segment.Kind) bool {
+	return isCommitKind(k) || k == segment.KindSync
+}
+
+// shouldKeep returns true unless the event is a commit-shaped row
+// whose data is already covered by the backfill writer's authoritative
+// per-DID write. Rev-stamped KindSync rows are included because their
+// resync replacement records are superseded by the same backfill rev.
 //
 // Cross-component dependency: this predicate's correctness leans on
 // internal/ingest/backfill/handler.go stamping commit.Rev (the head
@@ -38,7 +43,7 @@ func isCommitKind(k segment.Kind) bool {
 // this predicate's BackfillRev comparison stops being a coherent
 // watermark for the whole repo and would need to be reworked.
 func shouldKeep(ev *segment.Event, st *backfill.RepoStatus) bool {
-	if !isCommitKind(ev.Kind) {
+	if !isBackfillRevFilteredKind(ev.Kind) {
 		return true
 	}
 	if st == nil {

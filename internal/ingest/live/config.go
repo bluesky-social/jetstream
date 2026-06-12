@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/streaming"
 	atmossync "github.com/jcalabro/atmos/sync"
@@ -64,6 +67,12 @@ type Config struct {
 	// Metrics is optional; nil means no /metrics counters incrementing.
 	Metrics *Metrics
 
+	// WriterMetrics flows through to the consumer's internal ingest.Writer.
+	// Steady-state callers pass the canonical ingest metrics for the durable
+	// archive; bootstrap-time live_segments callers leave it nil because that
+	// writer has a throwaway seq space.
+	WriterMetrics *ingest.Metrics
+
 	// Verifier runs Sync 1.1 verification on every #commit and #sync
 	// before the consumer's Operations() iterator yields ops to the
 	// converter. Required.
@@ -73,6 +82,29 @@ type Config struct {
 	// pool is a process-wide resource and is reusable across a
 	// future steady-state consumer).
 	Verifier *atmossync.Verifier
+
+	// SyncStateStore is the verifier state store when it supports staged
+	// durability. If set, Consumer commits its staged chain/hosting writes in
+	// the same pebble batch as the relay cursor after a segment block fsyncs.
+	SyncStateStore *syncstate.PebbleStateStore
+
+	// Tombstones, when set, is updated after each event is durably appended
+	// and assigned a seq. Steady-state passes use it as their live in-memory
+	// tombstone source; bootstrap leaves it nil because live_segments are
+	// re-sequenced during merge.
+	Tombstones *tombstone.Set
+
+	// TombstoneCap triggers an early compaction signal when Tombstones reaches
+	// or exceeds the cap. Zero disables cap-triggered signaling.
+	TombstoneCap int
+
+	// CompactionTrigger receives a non-blocking signal when the tombstone cap
+	// is crossed. The receiver should use a size-1 channel to coalesce bursts.
+	CompactionTrigger chan<- struct{}
+
+	// OnCompactionTriggerCoalesced is called when CompactionTrigger is already
+	// full and an additional cap-triggered compaction signal is coalesced.
+	OnCompactionTriggerCoalesced func()
 
 	// MaxSegmentBytes / MaxEventsPerBlock forward to ingest.Config.
 	// Zero means use ingest defaults.

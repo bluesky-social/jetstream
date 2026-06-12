@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos"
@@ -157,6 +159,60 @@ func TestProcessBatch_UnknownEventDoesNotAdvanceCursor(t *testing.T) {
 	}))
 	require.Equal(t, int64(100), c.LastUpstreamSeq(),
 		"unknown trailing event must not advance the cursor past it")
+}
+
+func TestMaybeTriggerCompactionReportsCoalescedTriggers(t *testing.T) {
+	t.Parallel()
+
+	trigger := make(chan struct{}, 1)
+	var skipped atomic.Int32
+	c := &Consumer{cfg: Config{
+		Tombstones:                   tombstoneSetWithOneEntry(t),
+		TombstoneCap:                 1,
+		CompactionTrigger:            trigger,
+		OnCompactionTriggerCoalesced: func() { skipped.Add(1) },
+	}}
+
+	c.maybeTriggerCompaction()
+	require.Len(t, trigger, 1)
+	require.EqualValues(t, 0, skipped.Load())
+
+	c.maybeTriggerCompaction()
+	require.Len(t, trigger, 1)
+	require.EqualValues(t, 1, skipped.Load())
+}
+
+func tombstoneSetWithOneEntry(t *testing.T) *tombstone.Set {
+	t.Helper()
+	set := tombstone.New()
+	require.NoError(t, set.Observe(&segment.Event{Seq: 1, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r"}))
+	return set
+}
+
+func TestOpen_ForwardsWriterMetricsToOwnedIngestWriter(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	writerMetrics := ingest.NewMetrics(reg)
+	c, err := Open(Config{
+		SegmentsDir:    filepath.Join(t.TempDir(), "segments"),
+		Store:          newTestStore(t),
+		SeqKey:         SteadySeqKey,
+		CursorKey:      CursorKey,
+		RelayURL:       "https://example.invalid",
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:       newTestVerifier(t),
+		WriterMetrics:  writerMetrics,
+		SegmentMetrics: segment.NewMetrics(prometheus.NewRegistry()),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "x.y", Rkey: "r", Rev: "1", Payload: []byte{0x01}}
+	require.NoError(t, c.Writer().Append(t.Context(), &ev))
+
+	require.InDelta(t, 1.0, testutil.ToFloat64(writerMetrics.EventsAppended), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(writerMetrics.NextSeq), 0)
 }
 
 // TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer pins the

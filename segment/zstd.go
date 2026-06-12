@@ -44,12 +44,24 @@ func init() {
 // encodeBlockCompressed encodes events with encodeBlock, then wraps
 // the result in a single zstd frame with content checksums enabled.
 func encodeBlockCompressed(events []Event) ([]byte, error) {
+	frame, _, err := encodeBlockCompressedSized(events)
+	return frame, err
+}
+
+// encodeBlockCompressedSized is encodeBlockCompressed returning the
+// uncompressed body length alongside the frame, so callers that need
+// both (the rewrite path's block-index entries) encode exactly once.
+func encodeBlockCompressedSized(events []Event) ([]byte, int, error) {
 	body, err := encodeBlock(events)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return blockEncoder.EncodeAll(body, nil), nil
+	return blockEncoder.EncodeAll(body, nil), len(body), nil
+}
+
+func encodeEmptyBlockCompressed() []byte {
+	return blockEncoder.EncodeAll(encodeEmptyBlock(), nil)
 }
 
 // decodeBlockCompressed is the inverse: decompress, then decodeBlock.

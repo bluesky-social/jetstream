@@ -2,11 +2,13 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"golang.org/x/sync/errgroup"
 )
 
 // runSteadyState opens a live.Consumer pointed at <DataDir>/segments
@@ -37,6 +39,18 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 		o.cfg.Metrics.setPhase(PhaseGaugeSteadyState)
 
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
+		if err := o.rebuildLiveTombstones(ctx); err != nil {
+			return err
+		}
+
+		// With compaction disabled nothing ever evicts the live set, so
+		// feeding it would leak memory without bound; leave it detached.
+		tombstones := o.cfg.Tombstones
+		tombstoneCap := o.cfg.CompactionTombstoneCap
+		if o.cfg.CompactionInterval == 0 {
+			tombstones = nil
+			tombstoneCap = 0
+		}
 
 		c, err := live.Open(live.Config{
 			SegmentsDir: segmentsDir,
@@ -45,13 +59,18 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			CursorKey:   live.CursorKey,
 			RelayURL:    o.cfg.RelayURL,
 			// Bare cfg.Logger; live.Open sets its own component.
-			Logger:           o.cfg.Logger,
-			Metrics:          o.cfg.LiveMetrics,
-			Verifier:         o.cfg.Verifier,
-			SegmentMetrics:   o.cfg.SegmentMetrics,
-			OnEvent:          o.cfg.OnEvent,
-			OnAfterSeal:      o.cfg.IngestOnAfterSeal,
-			ReconnectBackoff: o.cfg.LiveReconnectBackoff,
+			Logger:            o.cfg.Logger,
+			Metrics:           o.cfg.LiveMetrics,
+			WriterMetrics:     o.cfg.IngestMetrics,
+			Verifier:          o.cfg.Verifier,
+			SyncStateStore:    o.cfg.SyncStateStore,
+			Tombstones:        tombstones,
+			TombstoneCap:      tombstoneCap,
+			CompactionTrigger: o.compactionTrigger,
+			SegmentMetrics:    o.cfg.SegmentMetrics,
+			OnEvent:           o.cfg.OnEvent,
+			OnAfterSeal:       o.cfg.IngestOnAfterSeal,
+			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)
@@ -68,6 +87,20 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 
 		o.logger.InfoContext(ctx, "steady-state consumer running")
 
-		return c.Run(ctx)
+		g, gctx := errgroup.WithContext(ctx)
+
+		// Run the main loop
+		g.Go(func() error { return c.Run(gctx) })
+
+		// Run the compactor loop
+		g.Go(func() error {
+			err := o.runSteadyCompactor(gctx)
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		})
+
+		return g.Wait()
 	})
 }

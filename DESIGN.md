@@ -159,9 +159,9 @@ After a segment file accumulates enough blocks (~256MB of compressed data), we s
 
 Deletions and updates do not modify segment files synchronously. Every delete and update is treated as a tombstoned, keyed by its AT URI (Section 3.3). Readers (both the server-side scanner and remote clients) logically overlay the tomstones on top of segment events at delivery time.
 
-Every so often, we compact updates/deletions file into the sealed segments. Compaction uses the in-memory segment-level DID bloom to narrow to candidate segments, then the per-block DID blooms to narrow to candidate blocks within each, then an exact column scan to find the rows to rewrite or drop. See Section 3.3 for more details.
+Every so often, we compact updates/deletions into the sealed segments. Compaction snapshots tombstones above `compaction/seq`, rewrites sealed segments atomically, and refreshes serving metadata for changed files. See Section 3.3 for more details.
 
-The net of this is that segment files are immutable for most of the day and only rewrite during the daily compaction pass. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy replication to read-replicas that seed from a given jetstream instance.
+The net of this is that segment files are immutable between compaction passes and only rewrite on the merge-tail pass or the steady-state compaction cadence. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy replication to read-replicas that seed from a given jetstream instance.
 
 ### 3.1.2 File Format
 
@@ -231,7 +231,7 @@ The variable-length footer has two structures that work together to enable fast 
 
 We use gloom for both, which has a stable binary format. We serialize the segment-level bloom to disk upon segment seal, and also keep all segment's blooms in Jetstream server's memory since it's small.
 
-The per-block blooms are kept on disk (one bloom per block, all sized for the configured max events per block so we can index them by multiplication with no offset table), and we keep an LRU cache of the hot set in server memory (operator-configurable, defaulting to the most recently accessed 1024 segments).
+The per-block blooms are kept on disk (one bloom per block, all sized for the configured max events per block so we can index them by multiplication with no offset table). Today the manifest holds every segment's per-block blooms resident in memory; if that footprint becomes a problem, a future change may swap them for an LRU cache of the hot set.
 
 The lookup flow for "give me all events for DID X in this segment" is:
 
@@ -340,25 +340,28 @@ Jetstream supports record updates, record deletion, and account deletion. When a
 
 As updates and deletions come over the firehose, and we store them in the active segment file as normal. However, we do eventually need to alter the original source data in older, sealed segment files to ensure we’re not storing data that the user requested be deleted. The process of cleaning up the older data is known as compaction.
 
-We have a compaction thread that runs every so often (once every 4 hours by default) that reads recent updates and deletions from sealed and active segment files, alters the older segment files containing the original records, then re-seals them with new header and footer data to match. We don’t immediately update sealed segment files because doing so would be computationally expensive, and it would kill our ability to serve sealed segment files over the CDN.
+Compaction runs once at the tail of the merge phase, after the destination segments are sealed and before the server enters `phase=steady_state`. This makes the first served archive view delete/update compliant. In steady state, compaction runs every `--compaction-interval` (`JETSTREAM_COMPACTION_INTERVAL`, default `4h`; `0` disables compaction) and can also run early when the in-memory tombstone set reaches `--compaction-tombstone-cap` (`JETSTREAM_COMPACTION_TOMBSTONE_CAP`, default `32000000`).
 
-In the pebble kv store, we keep track of the sequence number of the most recent compaction checkpoint spot. Then the next time we compact, we find all records since the previous compaction sequence number, and the process repeats.
+In the pebble kv store, we keep track of `compaction/seq`, the highest sequence number covered by physical compaction. Each pass gathers tombstones above the prior watermark, rewrites affected sealed segment files with a temporary-file + fsync + rename sequence, then advances the watermark only after every rewrite has completed.
 
-We also store the updates and deletions since the most recent compaction in-memory in the server to act as tombstones, and re-populate that cache on process restart to ensure we have the working set of deletes and updates resident.
+Tombstones are retained as event rows forever. Record tombstones come from `KindDelete` and `KindUpdate`; DID tombstones come from account deletes (`active=false`, `status=deleted`) and `KindSync`. Compaction physically removes only superseded `KindCreate` and `KindUpdate` rows older than the tombstone seq. Delete, account, identity, and sync rows are retained so mid-stream clients and future audit tooling can observe the event history.
 
-When the client calls the jetstream server to assemble a query plan, it must first download the recent update/deletion tombstones, then start streaming the live firehose, then it may begin backfilling data. We use those update/delete tombstones as a marker to indicate that any records seen for a URI or account during the backfill of segment files should be hidden to the caller as part of the event loop. The in-memory cache is small relative to the 
+Segment rewrites preserve block topology and historical seq/indexed-at envelopes. A block whose rows are all dropped remains present as an `event_count=0` block, so manifest block indexes, cursor translation, and cold replay can continue to use stable block numbers across generations. Rewritten files get new checksums; HTTP downloads derive validators from the file descriptor they serve, and the subscribe block cache keys decoded blocks by segment checksum.
+
+We also store tombstones since the most recent compaction in memory in the server. Today this powers steady-state compaction and early cap-triggered passes. A future read-time overlay will expose this same structure to backfill clients so they can suppress rows newer than the physical compaction watermark.
 
 Putting it all together, the query plan and client code looks something like the following:
 
 1. The client connects to the jetstream live tail and starts receiving the most recent records
-    1. If a re-creation event for a record or account comes over the firehose, the tombstone is cleared until a corresponding delete for that record or account arrives over the firehose again. This avoids the “permanent tombstone” problem. We need to be able to support repeated creation and deletion of a single record or account
 2. The client negotiates a plan of which segment file blocks it must download to satisfy a particular query (i.e. “give me all `standard.site` documents”)
-3. The client downloads the list of recent deletions and updates
-4. The client begins download the segment file blocks and decompresses them in an attempt to emit records that match the user’s query
-5. If the record's DID is in the suppression set of deleted accounts, suppress the row
-6. If the URI of the record from the segment file maps to a known deletion tombstone, suppress the row
-7. If the URI of the record from the segment file maps to a known update, emit the record with the replacement rev and payload
+3. Future read-overlay work: the client downloads the list of recent deletions and updates above `compaction/seq`
+4. The client begins downloading the segment file blocks and decompresses them in an attempt to emit records that match the user’s query
+5. Future read-overlay work: if the record's DID is in the suppression set of deleted accounts, suppress the row
+6. Future read-overlay work: if the URI of the record from the segment file maps to a known deletion tombstone, suppress the row
+7. Future read-overlay work: if the URI of the record from the segment file maps to a known update, emit the record with the replacement rev and payload
 8. Emit the row as-is (no updates or deletes have been applied to this record)
+
+Steps 3 and 5–7 are the client-side tombstone overlay covering the window above `compaction/seq`; until that ships, rows in that window may include data superseded after the last compaction pass (bounded by the compaction interval plus segment cache max-age).
 
 ### 3.4 File Organization
 
@@ -387,7 +390,7 @@ Keys are namespaced by prefix:
 
 ```
 relay/cursor            -> uint64 upstream firehose seq we've durably persisted
-compaction/seq          -> the highest-watermark sequence number of the most recent compaction
+compaction/seq          -> the highest-watermark sequence number of the most recent compaction; owned by the compactor
 repo/<did>              -> JSON<RepoStatus> per-DID backfill and steady-state bookkeeping
 account/<did>           -> JSON<AccountStatus> hosting status, only present when non-active
 sync/<did>              -> JSON<SyncState> present while a resync is in progress
@@ -476,7 +479,7 @@ We take the events from the sealed and active segment files in `./data/backfill/
 
 We ensure that we don't store any events out of order by checking the DID's `BackfillRev` from `repo/<did>` in the metadata store against the revs of the events we're compacting. We drop the events whose rev is less than or equal to `BackfillRev`. This also should ensure we don’t store duplicate events (though because of at-least-once semantics, this is not a strict requirement).
 
-We also must complete a tombstone compaction to account for record updates and deletions as well as account deletions (see Section 3.3).
+After sealing the destination segment, we run the merge-tail tombstone compaction described in Section 3.3 so the archive is delete/update-compliant before `phase=steady_state` is written.
 
 After the last surviving event has been durably written:
 
@@ -486,7 +489,7 @@ After the last surviving event has been durably written:
 - Only after these steps do we durably write `phase=steady_state`
     - Each step is durable on its own (segment seal fsyncs, RemoveAll is observable on next directory scan, pebble delete is Sync=true), so a crash at any point during merge is recoverable on restart
 
-Additionally, since the merge phase takes so3 time, at the end, we also scan the relay with `listRepos` to find accounts that were newly created during the merge phase. We treat these repos the same as repos that failed to download during the initial backfill, and we will do a full `getRepo` call on them during the steady-state phase.
+Additionally, since the merge phase takes some time, at the end, we also scan the relay with `listRepos` to find accounts that were newly created during the merge phase. We treat these repos the same as repos that failed to download during the initial backfill, and we will do a full `getRepo` call on them during the steady-state phase.
 
 ### 4.3 Steady State Phase
 
@@ -502,7 +505,7 @@ As noted in Section 3, all event types are stored in the segment files, not just
 
 Internally, Jetstream doesn't care about handles, identity updates, or hosting status, but consumers of the application certainly do. `#identity`, `#account`, and `#sync` events are stored in-line with `#commit` events in the same segment blocks and passed along to clients as they come over the firehose.
 
-Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we write one or more a tombstones (see Section 3.3) the lookaside file to hide the user's pre-divergence records and re-download their repo from scratch from the PDS, updating events past the DID specified in the sync event.
+Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we store the `KindSync` row followed by the authoritative replacement records returned by the verifier. The `KindSync` row is a DID tombstone for compaction (see Section 3.3), so older pre-divergence record rows are physically removed once the relevant sealed segment is compacted.
 
 ## 5. Client Protocol and Libraries
 

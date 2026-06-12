@@ -3,8 +3,10 @@ package oracle
 import (
 	"context"
 	"log/slog"
+	"math/rand/v2"
 	"testing"
 
+	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
 	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/cbor"
@@ -56,6 +58,30 @@ func TestGroundTruthFromWorldIncludesEmptyRepos(t *testing.T) {
 		require.NotNil(t, repo.Records)
 		require.Empty(t, repo.Records)
 	}
+}
+
+func TestGroundTruthFromWorldOmitsDeletedAccounts(t *testing.T) {
+	t.Parallel()
+
+	cfg := world.DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Accounts = 2
+	cfg.InitialRecords = 1
+	w, err := world.New(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	require.NoError(t, w.Bootstrap(context.Background(), slog.Default()))
+	require.NoError(t, w.AttachRuntime(rand.New(rand.NewPCG(1, 2)), fanout.New(16)))
+	deleted, err := w.LoadAccount(0)
+	require.NoError(t, err)
+	require.NoError(t, err)
+	_, err = w.GenerateAccountDeleteForTest(context.Background(), 0)
+	require.NoError(t, err)
+
+	model, err := GroundTruthFromWorld(w)
+	require.NoError(t, err)
+	require.NotContains(t, model.Accounts, string(deleted.DID))
+	require.Len(t, model.Accounts, 1)
 }
 
 func TestSnapshotRepoCopiesPayloadBytes(t *testing.T) {

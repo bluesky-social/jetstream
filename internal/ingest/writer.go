@@ -245,6 +245,12 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	w.cfg.Metrics.incEventsAppended()
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
 
+	if w.cfg.OnAppend != nil {
+		if err := w.cfg.OnAppend(ev); err != nil {
+			return fmt.Errorf("ingest: on_append: %w", err)
+		}
+	}
+
 	if full {
 		if err := w.flushAndRotateLocked(ctx); err != nil {
 			return err
@@ -424,7 +430,7 @@ type SegmentFile struct {
 //
 // Used by every consumer that needs the full segment manifest in
 // creation order: the merge phase draining live_segments/, the
-// future lookaside compactor, and inspect tooling.
+// delete/update compactor, and inspect tooling.
 func SegmentFiles(dir string) ([]SegmentFile, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

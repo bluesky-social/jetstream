@@ -72,6 +72,90 @@ func TestGenerateOne_ProducesValidCommit(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestGenerateSyncForTest_ProducesValidSyncFrame(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t)
+
+	frame, err := w.GenerateSyncForTest(context.Background(), 0)
+	require.NoError(t, err)
+
+	body, ok := bytes.CutPrefix(frame, frameHeaderSync)
+	require.True(t, ok, "expected #sync header")
+	var syncEvt comatproto.SyncSubscribeRepos_Sync
+	require.NoError(t, syncEvt.UnmarshalCBOR(body))
+	require.Equal(t, int64(1), syncEvt.Seq)
+	require.NotEmpty(t, syncEvt.DID)
+	require.NotEmpty(t, syncEvt.Rev)
+	require.NotEmpty(t, syncEvt.Blocks)
+
+	_, commit, err := repo.LoadFromCAR(bytes.NewReader(syncEvt.Blocks))
+	require.NoError(t, err)
+	require.Equal(t, syncEvt.DID, commit.DID)
+	require.Equal(t, syncEvt.Rev, commit.Rev)
+	acct := accountForRepo(t, w, syncEvt.DID)
+	require.NoError(t, commit.VerifySignature(acct.priv.PublicKey()))
+
+	frames, err := w.FirehoseRange(0, 10)
+	require.NoError(t, err)
+	require.Len(t, frames, 1)
+	require.Equal(t, frame, frames[0])
+}
+
+func TestGenerateSilentMutationThenSyncForTest_EmitsOnlySyncFrame(t *testing.T) {
+	t.Parallel()
+	w := newRuntimeWorld(t, 1, 1)
+
+	before, err := w.loadState(0)
+	require.NoError(t, err)
+
+	frame, err := w.GenerateSilentMutationThenSyncForTest(context.Background(), 0)
+	require.NoError(t, err)
+
+	after, err := w.loadState(0)
+	require.NoError(t, err)
+	require.Greater(t, after.Rev, before.Rev)
+	require.Greater(t, after.RecordCount, before.RecordCount)
+
+	body, ok := bytes.CutPrefix(frame, frameHeaderSync)
+	require.True(t, ok, "expected #sync header")
+	var syncEvt comatproto.SyncSubscribeRepos_Sync
+	require.NoError(t, syncEvt.UnmarshalCBOR(body))
+	require.Equal(t, after.Rev, syncEvt.Rev)
+
+	frames, err := w.FirehoseRange(0, 10)
+	require.NoError(t, err)
+	require.Len(t, frames, 1, "silent mutation must not emit the skipped commit")
+	require.Equal(t, frame, frames[0])
+}
+
+func TestGenerateSilentMutationThenCommitForTest_EmitsOnlyTriggerCommit(t *testing.T) {
+	t.Parallel()
+	w := newRuntimeWorld(t, 1, 1)
+
+	before, err := w.loadState(0)
+	require.NoError(t, err)
+
+	frame, err := w.GenerateSilentMutationThenCommitForTest(context.Background(), 0)
+	require.NoError(t, err)
+
+	after, err := w.loadState(0)
+	require.NoError(t, err)
+	require.Greater(t, after.Rev, before.Rev)
+	require.Greater(t, after.RecordCount, before.RecordCount)
+
+	body, ok := bytes.CutPrefix(frame, frameHeaderCommit)
+	require.True(t, ok, "expected #commit header")
+	var commitEvt comatproto.SyncSubscribeRepos_Commit
+	require.NoError(t, commitEvt.UnmarshalCBOR(body))
+	require.Equal(t, after.Rev, commitEvt.Rev)
+	require.True(t, commitEvt.PrevData.HasVal(), "trigger commit must point at the skipped state")
+
+	frames, err := w.FirehoseRange(0, 10)
+	require.NoError(t, err)
+	require.Len(t, frames, 1, "silent mutation must not emit the skipped commit")
+	require.Equal(t, frame, frames[0])
+}
+
 func accountForRepo(t *testing.T, w *World, did string) account {
 	t.Helper()
 	for i := range w.cfg.Accounts {

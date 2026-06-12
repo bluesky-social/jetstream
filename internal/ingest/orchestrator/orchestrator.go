@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
@@ -22,6 +23,8 @@ type Orchestrator struct {
 	// without slog stacking duplicate keys (slog appends; it does not
 	// replace).
 	logger *slog.Logger
+
+	compactionTrigger chan struct{}
 }
 
 // New validates cfg and returns an Orchestrator ready to Run.
@@ -30,8 +33,9 @@ func New(cfg Config) (*Orchestrator, error) {
 		return nil, err
 	}
 	return &Orchestrator{
-		cfg:    cfg,
-		logger: cfg.Logger.With(slog.String("component", "orchestrator")),
+		cfg:               cfg,
+		logger:            cfg.Logger.With(slog.String("component", "orchestrator")),
+		compactionTrigger: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -54,6 +58,13 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			if err := lifecycle.WritePhase(o.cfg.Store, phase, time.Now().UTC()); err != nil {
 				return fmt.Errorf("orchestrator: write initial phase: %w", err)
 			}
+		}
+
+		// A crash mid-rewrite can leave a segment-sized *.jss.tmp
+		// behind; reclaim it at boot even when compaction is disabled
+		// (each pass also cleans at start).
+		if err := removeStaleCompactionTemps(filepath.Join(o.cfg.DataDir, "segments")); err != nil {
+			return err
 		}
 
 		o.logger.InfoContext(ctx, "starting", "phase", phase)

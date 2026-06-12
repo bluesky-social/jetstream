@@ -30,6 +30,11 @@ func keyAccountDID(idx int) []byte {
 	return fmt.Appendf(nil, "sim/account/%010d/did", idx)
 }
 
+// keyAccountDeleted builds "sim/account/<idx>/deleted". Absence means active.
+func keyAccountDeleted(idx int) []byte {
+	return fmt.Appendf(nil, "sim/account/%010d/deleted", idx)
+}
+
 // keyAccountBlock builds "sim/account/<idx>/blocks/<cidBytes>". The
 // CID bytes are appended raw — we never iterate by CID, only point-
 // look up.

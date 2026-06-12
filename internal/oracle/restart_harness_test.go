@@ -162,6 +162,7 @@ func TestOracleRestartChild(t *testing.T) {
 		SubscribeSlowWindow:       time.Second,
 		SubscribeSlowMinRate:      1,
 		CursorBlockIndexCacheSize: 32,
+		CompactionInterval:        time.Hour,
 		BarrierAfterMerge:         afterMerge,
 		CrashInjector:             crashInjector,
 	})
