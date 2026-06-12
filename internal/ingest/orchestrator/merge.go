@@ -100,7 +100,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return fmt.Errorf("orchestrator: merge: seal dst: %w", err)
 		}
 
-		if err := o.runDeleteCompaction(ctx, compactionMergeTail); err != nil {
+		if err := o.runDeleteCompaction(ctx, compactionMergeTail, nil); err != nil {
 			return fmt.Errorf("orchestrator: merge-tail compaction: %w", err)
 		}
 		// One-shot manifest reconcile (spec §7): the merge-tail pass is

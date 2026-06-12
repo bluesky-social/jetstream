@@ -35,10 +35,11 @@ const (
 const defaultCompactionBloomNarrowMaxDIDs = 100_000
 
 // minCompactionTriggerSpacing bounds how often cap-triggered early
-// passes can run back-to-back. When every tombstone in the set sits
-// above the sealed boundary a pass evicts nothing, the consumer
-// re-fires the trigger on the next event, and without this floor the
-// compactor would spin full passes until the active segment seals.
+// passes can run back-to-back. Steady passes force-rotate the active
+// segment first, so a pass normally evicts everything at or below the
+// fresh seal — but defense-in-depth: if eviction ever falls short
+// (e.g. a failed pass), the consumer re-fires the trigger on the next
+// event and this floor keeps the compactor from spinning full passes.
 const minCompactionTriggerSpacing = 30 * time.Second
 
 type sealedCompactionSegment struct {
@@ -52,7 +53,12 @@ type compactionRewriteResult struct {
 	droppedByReason map[string]uint64
 }
 
-func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionMode) (retErr error) {
+// runDeleteCompaction executes one compaction pass. liveWriter is the
+// steady-state consumer's writer, force-rotated at the top of every
+// steady pass so rows deleted while their segment was still active are
+// compacted by this pass instead of waiting for a size-based rotation;
+// merge-tail passes hand nil (that tree is sealed before the pass).
+func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionMode, liveWriter *ingest.Writer) (retErr error) {
 	if o.cfg.CompactionInterval == 0 {
 		// Compaction is disabled
 		return nil
@@ -71,6 +77,22 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 		if err := removeStaleCompactionTemps(segmentsDir); err != nil {
 			return err
+		}
+
+		// Seal the active segment first so this pass covers rows deleted
+		// while their segment was still active. Ordering is what makes
+		// this race-free: tombstone Observe runs as the writer's OnAppend
+		// hook under the writer mutex (see live.Open), so by the time
+		// ForceRotate returns, every event in the just-sealed file has
+		// its tombstone in the live set; events appended afterwards land
+		// in the new active segment with seqs above the sealed header's
+		// MaxSeq, i.e. above this pass's target watermark, and their
+		// tombstones survive eviction (Evict is bounded by chunkEnd).
+		// A no-op when the active segment is empty.
+		if liveWriter != nil {
+			if err := liveWriter.ForceRotate(ctx); err != nil {
+				return fmt.Errorf("orchestrator: compaction: force rotate active segment: %w", err)
+			}
 		}
 
 		watermark, _, err := loadCompactionWatermark(o.cfg.Store)
@@ -163,7 +185,9 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 // watermark: the max seq across sealed segments with events. Active
 // segments are skipped; the watermark never advances past them (spec
 // §4 — their tombstones stay in the live set, which evicts only ≤ the
-// committed watermark, and re-apply after seal).
+// committed watermark, and re-apply after seal). Steady passes
+// force-rotate the live writer before this sweep, so the only active
+// segment left holds events appended after the pass began.
 func (o *Orchestrator) listSealedCompactionSegments(segmentsDir string) ([]sealedCompactionSegment, uint64, error) {
 	files, err := ingest.SegmentFiles(segmentsDir)
 	if err != nil {
@@ -400,7 +424,7 @@ func defaultCompactionRewriteWorkers() int {
 	return min(runtime.NumCPU(), 8)
 }
 
-func (o *Orchestrator) runSteadyCompactor(ctx context.Context) error {
+func (o *Orchestrator) runSteadyCompactor(ctx context.Context, liveWriter *ingest.Writer) error {
 	if o.cfg.CompactionInterval == 0 {
 		<-ctx.Done()
 		return ctx.Err()
@@ -413,7 +437,7 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context) error {
 	// transient IO error into an ingestion outage / crash loop).
 	var lastPass time.Time
 	runPass := func() {
-		if err := o.runDeleteCompaction(ctx, compactionSteady); err != nil && ctx.Err() == nil {
+		if err := o.runDeleteCompaction(ctx, compactionSteady, liveWriter); err != nil && ctx.Err() == nil {
 			o.logger.ErrorContext(ctx, "steady compaction pass failed; will retry", "err", err)
 		}
 		lastPass = time.Now()

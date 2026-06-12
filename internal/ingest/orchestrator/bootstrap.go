@@ -211,7 +211,7 @@ func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.
 		// If the bootstrap consumer's underlying writer happened to seal
 		// its active file during normal rotation just before we got here,
 		// ingest.Open rolls forward to a fresh empty seg_<N+1>.jss and
-		// SealActiveAndClose seals that empty file. The future compactor
+		// SealActiveAndClose seals that empty file. The compactor
 		// reads zero events from such a file and ignores it.
 		start := time.Now()
 		if err := bootstrapLive.Close(); err != nil {

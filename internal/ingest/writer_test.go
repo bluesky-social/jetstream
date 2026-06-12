@@ -734,6 +734,171 @@ func TestSealActiveAndClose_OnAfterSealErrorPropagatesAfterDurableSeal(t *testin
 	require.ErrorIs(t, w.Append(t.Context(), &segment.Event{IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:a"}), ErrClosed)
 }
 
+// TestForceRotate_SealsAndOpensNext pins the compaction-time forced
+// rotation: pending events are flushed and sealed into the current
+// segment, a fresh active segment is opened at idx+1, and appends
+// continue with monotonic seqs.
+func TestForceRotate_SealsAndOpensNext(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{MaxEventsPerBlock: 64})
+
+	for i := range 3 {
+		ev := segment.Event{IndexedAt: int64(i + 1), Kind: segment.KindCreate, DID: "did:plc:a"}
+		require.NoError(t, w.Append(t.Context(), &ev))
+	}
+
+	require.NoError(t, w.ForceRotate(t.Context()))
+
+	require.Equal(t, uint64(1), w.ActiveIndex())
+	ins, err := segment.Inspect(filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0)))
+	require.NoError(t, err)
+	require.True(t, ins.Sealed)
+	require.Equal(t, uint64(3), ins.TotalEvents)
+
+	// seq/next was persisted before the seal (same ordering as the
+	// size-based rotation path).
+	persisted, closer, err := w.cfg.Store.Get([]byte(seqNextKey))
+	require.NoError(t, err)
+	defer func() { _ = closer.Close() }()
+	require.Equal(t, uint64(3), binary.LittleEndian.Uint64(persisted))
+
+	// The writer remains usable on the next segment.
+	ev := segment.Event{IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:b"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.Equal(t, uint64(3), ev.Seq)
+}
+
+// TestForceRotate_EmptyActiveIsNoOp: rotating an empty active segment
+// would generate churn (empty sealed files, manifest publishes) with
+// zero compliance benefit — e.g. every compaction interval while the
+// upstream relay is down. It must do nothing.
+func TestForceRotate_EmptyActiveIsNoOp(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{})
+
+	require.NoError(t, w.ForceRotate(t.Context()))
+	require.Equal(t, uint64(0), w.ActiveIndex())
+
+	info, err := os.Stat(filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0)))
+	require.NoError(t, err)
+	require.Equal(t, int64(segment.ReservedHeaderBytes), info.Size(),
+		"empty active segment must be left untouched")
+}
+
+// TestForceRotate_FlushedButUnsealedRotates: events already flushed to
+// disk (no pending block) must still rotate — emptiness is about the
+// segment having zero events, not zero buffered events.
+func TestForceRotate_FlushedButUnsealedRotates(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{MaxEventsPerBlock: 64})
+
+	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.NoError(t, w.Flush(t.Context()))
+
+	require.NoError(t, w.ForceRotate(t.Context()))
+	require.Equal(t, uint64(1), w.ActiveIndex())
+}
+
+// TestForceRotate_RejectsClosed pins the closed-writer behavior.
+func TestForceRotate_RejectsClosed(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{})
+	require.NoError(t, w.Close())
+	require.ErrorIs(t, w.ForceRotate(t.Context()), ErrClosed)
+}
+
+// TestForceRotate_FiresOnAfterSeal: the manifest publish hook must see
+// a forced rotation exactly like a size-based one.
+func TestForceRotate_FiresOnAfterSeal(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+
+	var calls int
+	var gotIdx uint64
+	w, err := Open(Config{
+		SegmentsDir:       segDir,
+		Store:             newTestStore(t),
+		MaxEventsPerBlock: 64,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+		OnAfterSeal: func(idx uint64, path string) error {
+			calls++
+			gotIdx = idx
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.NoError(t, w.ForceRotate(t.Context()))
+	require.Equal(t, 1, calls)
+	require.Equal(t, uint64(0), gotIdx)
+}
+
+// TestForceRotate_ConcurrentWithAppends: forced rotation must compose
+// with concurrent appenders — no lost events, no duplicate seqs, and
+// every event lands in exactly one segment.
+func TestForceRotate_ConcurrentWithAppends(t *testing.T) {
+	t.Parallel()
+	const goroutines = 8
+	const perGoroutine = 64
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			for range perGoroutine {
+				ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
+				require.NoError(t, w.Append(t.Context(), &ev))
+			}
+		}()
+	}
+	for range 4 {
+		require.NoError(t, w.ForceRotate(t.Context()))
+	}
+	wg.Wait()
+	require.NoError(t, w.Close())
+
+	require.Equal(t, uint64(goroutines*perGoroutine), w.NextSeq())
+
+	// Count events across all segments (sealed + trailing active).
+	files, err := SegmentFiles(w.cfg.SegmentsDir)
+	require.NoError(t, err)
+	seen := make(map[uint64]bool)
+	note := func(events []segment.Event) {
+		for i := range events {
+			require.False(t, seen[events[i].Seq], "duplicate seq %d", events[i].Seq)
+			seen[events[i].Seq] = true
+		}
+	}
+	for _, f := range files {
+		r, err := segment.Open(segment.ReaderConfig{Path: f.Path})
+		if err == nil {
+			for i := range int(r.Header().BlockCount) {
+				events, err := r.DecodeBlock(i)
+				require.NoError(t, err)
+				note(events)
+			}
+			require.NoError(t, r.Close())
+			continue
+		}
+		require.ErrorIs(t, err, segment.ErrActiveSegment)
+		require.NoError(t, segment.WalkActive(f.Path, func(events []segment.Event) error {
+			note(events)
+			return nil
+		}))
+	}
+	require.Len(t, seen, goroutines*perGoroutine)
+}
+
 func TestSegmentFiles_Empty(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

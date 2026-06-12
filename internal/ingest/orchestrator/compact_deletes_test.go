@@ -40,10 +40,85 @@ func TestRunDeleteCompactionCallsPassHook(t *testing.T) {
 		},
 	}}
 
-	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionSteady))
+	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionSteady, nil))
 	require.Len(t, got, 1)
 	require.Equal(t, uint64(0), got[0].Watermark)
 	require.NoError(t, got[0].Err)
+}
+
+// TestRunDeleteCompaction_SealsActiveSegmentBeforeSteadyPass pins the
+// deletion-compliance contract for data in the active segment: a steady
+// pass force-seals the live writer's active segment first, so rows
+// deleted while the segment was still active are physically removed by
+// the same pass instead of waiting (potentially unbounded time) for a
+// size-based rotation.
+func TestRunDeleteCompaction_SealsActiveSegmentBeforeSteadyPass(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	segmentsDir := filepath.Join(dataDir, "segments")
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Mirror production wiring: tombstone Observe runs as the writer's
+	// OnAppend hook, under the writer mutex, before any flush/seal.
+	ts := tombstone.New()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       segmentsDir,
+		Store:             st,
+		Logger:            logger,
+		MaxEventsPerBlock: 64,
+		OnAppend:          func(ev *segment.Event) error { return ts.Observe(ev) },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	create := segment.Event{IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")}
+	del := segment.Event{IndexedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"}
+	require.NoError(t, w.Append(t.Context(), &create))
+	require.NoError(t, w.Append(t.Context(), &del))
+	// Deliberately no flush: both rows sit in the active segment's
+	// pending block. The pass must make them durable, sealed, and
+	// compacted on its own.
+
+	o := &Orchestrator{cfg: Config{
+		DataDir:            dataDir,
+		Store:              st,
+		Logger:             logger,
+		Tombstones:         ts,
+		CompactionInterval: time.Hour,
+	}, logger: logger}
+	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionSteady, w))
+
+	// The formerly-active segment is sealed and the deleted create row
+	// is physically gone.
+	seg0 := filepath.Join(segmentsDir, ingest.SegmentFilename(0))
+	events := readCompactionSegment(t, seg0)
+	require.Len(t, events, 1, "create row must be physically removed")
+	require.Equal(t, segment.KindDelete, events[0].Kind)
+
+	watermark, _, err := loadCompactionWatermark(st)
+	require.NoError(t, err)
+	require.Equal(t, del.Seq, watermark)
+	require.Zero(t, ts.Len(), "applied tombstones must be evicted")
+
+	// The writer survives the forced rotation: subsequent appends land
+	// in the next segment with monotonic seqs.
+	next := segment.Event{IndexedAt: 30, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("new")}
+	require.NoError(t, w.Append(t.Context(), &next))
+	require.Equal(t, del.Seq+1, next.Seq)
+	require.Equal(t, uint64(1), w.ActiveIndex())
+
+	// Second pass: segment 1 holds one event, so it force-rotates.
+	// Third pass: segment 2 is empty, so the rotation is a no-op (no
+	// empty-segment churn while e.g. the upstream relay is down).
+	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionSteady, w))
+	require.Equal(t, uint64(2), w.ActiveIndex(), "non-empty active must rotate")
+	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionSteady, w))
+	require.Equal(t, uint64(2), w.ActiveIndex(), "empty active must not rotate")
 }
 
 func TestCompactionCandidateDIDs(t *testing.T) {
@@ -94,7 +169,7 @@ func TestRunDeleteCompaction_RewriteBeforeWatermarkCrashIsIdempotent(t *testing.
 		},
 	}, logger: logger}
 
-	err = o.runDeleteCompaction(t.Context(), compactionMergeTail)
+	err = o.runDeleteCompaction(t.Context(), compactionMergeTail, nil)
 	require.ErrorIs(t, err, crashErr)
 	watermark, _, err := loadCompactionWatermark(st)
 	require.NoError(t, err)
@@ -105,7 +180,7 @@ func TestRunDeleteCompaction_RewriteBeforeWatermarkCrashIsIdempotent(t *testing.
 	require.Equal(t, segment.KindDelete, events[0].Kind)
 
 	o.cfg.CrashInjector = nil
-	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionMergeTail))
+	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionMergeTail, nil))
 	watermark, _, err = loadCompactionWatermark(st)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), watermark)
@@ -151,7 +226,7 @@ func TestRunDeleteCompaction_ManifestRefreshFailureReconcilesOnRetry(t *testing.
 		},
 	}, logger: logger}
 
-	err = o.runDeleteCompaction(t.Context(), compactionSteady)
+	err = o.runDeleteCompaction(t.Context(), compactionSteady, nil)
 	require.ErrorIs(t, err, refreshErr)
 	require.Equal(t, 2, calls, "first call reconciles at pass start; second call is the failed post-rewrite refresh")
 	watermark, _, err := loadCompactionWatermark(st)
@@ -162,7 +237,7 @@ func TestRunDeleteCompaction_ManifestRefreshFailureReconcilesOnRetry(t *testing.
 	require.Equal(t, segment.KindDelete, events[0].Kind)
 	require.Equal(t, 1, ts.Len(), "failed pass must not evict tombstones")
 
-	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionSteady))
+	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionSteady, nil))
 	require.Equal(t, 3, calls, "retry must reconcile the rewritten segment even though it is already clean")
 	watermark, _, err = loadCompactionWatermark(st)
 	require.NoError(t, err)
@@ -200,7 +275,7 @@ func TestRunDeleteCompaction_ChunkWatermarkCrashResumesAtNextChunk(t *testing.T)
 		CrashInjector:          pointErrorInjector{point: crashpoint.AfterCompactionChunkWatermark, err: crashErr},
 	}, logger: logger}
 
-	err = o.runDeleteCompaction(t.Context(), compactionMergeTail)
+	err = o.runDeleteCompaction(t.Context(), compactionMergeTail, nil)
 	require.ErrorIs(t, err, crashErr)
 	watermark, _, err := loadCompactionWatermark(st)
 	require.NoError(t, err)
@@ -209,7 +284,7 @@ func TestRunDeleteCompaction_ChunkWatermarkCrashResumesAtNextChunk(t *testing.T)
 	require.Len(t, readCompactionSegment(t, path1), 2)
 
 	o.cfg.CrashInjector = nil
-	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionMergeTail))
+	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionMergeTail, nil))
 	watermark, _, err = loadCompactionWatermark(st)
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), watermark)
@@ -235,7 +310,7 @@ func TestRunDeleteCompaction_SteadyLiveSetMatchesScanFold(t *testing.T) {
 		Logger:             scanLogger,
 		CompactionInterval: time.Hour,
 	}, logger: scanLogger}
-	require.NoError(t, scan.runDeleteCompaction(t.Context(), compactionMergeTail))
+	require.NoError(t, scan.runDeleteCompaction(t.Context(), compactionMergeTail, nil))
 
 	steadyDir, steadyStore, steadyPath := newCompactionDataDir(t, events)
 	liveSet := tombstone.New()
@@ -250,7 +325,7 @@ func TestRunDeleteCompaction_SteadyLiveSetMatchesScanFold(t *testing.T) {
 		Tombstones:         liveSet,
 		CompactionInterval: time.Hour,
 	}, logger: steadyLogger}
-	require.NoError(t, steady.runDeleteCompaction(t.Context(), compactionSteady))
+	require.NoError(t, steady.runDeleteCompaction(t.Context(), compactionSteady, nil))
 
 	scanWatermark, _, err := loadCompactionWatermark(scanStore)
 	require.NoError(t, err)
@@ -317,7 +392,7 @@ func BenchmarkDeleteCompactionSyntheticArchive(b *testing.B) {
 		}, logger: logger}
 
 		b.StartTimer()
-		if err := o.runDeleteCompaction(b.Context(), compactionMergeTail); err != nil {
+		if err := o.runDeleteCompaction(b.Context(), compactionMergeTail, nil); err != nil {
 			b.Fatal(err)
 		}
 		b.StopTimer()
@@ -468,7 +543,7 @@ func TestRunSteadyCompactor_PassErrorDoesNotExit(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	err = o.runSteadyCompactor(ctx)
+	err = o.runSteadyCompactor(ctx, nil)
 	require.ErrorIs(t, err, context.DeadlineExceeded,
 		"the compactor must outlive failing passes and exit only on ctx")
 

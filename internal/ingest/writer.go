@@ -296,19 +296,8 @@ func (w *Writer) Flush(ctx context.Context) error {
 // spans would balloon to ~1B/day at full network scale.
 func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
-		if err := w.active.Flush(); err != nil {
-			return fmt.Errorf("ingest: flush block: %w", err)
-		}
-		w.cfg.Metrics.incBlocksFlushed()
-
-		if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+		if err := w.flushBlockLocked(ctx); err != nil {
 			return err
-		}
-
-		if w.cfg.OnAfterFlush != nil {
-			if err := w.cfg.OnAfterFlush(ctx); err != nil {
-				return fmt.Errorf("ingest: on_after_flush: %w", err)
-			}
 		}
 
 		path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))
@@ -325,6 +314,49 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 
 		return w.rotateLocked(ctx)
 	})
+}
+
+// flushBlockLocked is the shared flush-side of the durability commit:
+// fsync the pending block, pebble.Sync seq/next, fire OnAfterFlush.
+// The caller MUST hold w.mu.
+func (w *Writer) flushBlockLocked(ctx context.Context) error {
+	if err := w.active.Flush(); err != nil {
+		return fmt.Errorf("ingest: flush block: %w", err)
+	}
+	w.cfg.Metrics.incBlocksFlushed()
+
+	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+		return err
+	}
+
+	if w.cfg.OnAfterFlush != nil {
+		if err := w.cfg.OnAfterFlush(ctx); err != nil {
+			return fmt.Errorf("ingest: on_after_flush: %w", err)
+		}
+	}
+	return nil
+}
+
+// ForceRotate flushes any pending block and rotates the active segment
+// regardless of its size, so the just-sealed file becomes visible to
+// the delete compactor's sealed-segment sweep. A no-op when the active
+// segment holds zero events — rotating an empty file would churn out
+// empty sealed segments (e.g. every compaction interval while the
+// upstream relay is down) for no compliance benefit. Goroutine-safe;
+// concurrent Appends serialize against the rotation on w.mu.
+func (w *Writer) ForceRotate(ctx context.Context) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
+	if w.active.Pending() == 0 && len(w.active.Blocks()) == 0 {
+		return nil
+	}
+	if err := w.flushBlockLocked(ctx); err != nil {
+		return err
+	}
+	return w.rotateLocked(ctx)
 }
 
 // rotateLocked seals the active segment and opens the next one. The

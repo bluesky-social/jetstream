@@ -94,7 +94,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 
 		// Run the compactor loop
 		g.Go(func() error {
-			err := o.runSteadyCompactor(gctx)
+			err := o.runSteadyCompactor(gctx, c.Writer())
 			if errors.Is(err, context.Canceled) {
 				return nil
 			}
