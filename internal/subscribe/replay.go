@@ -119,7 +119,7 @@ func decodeSealedBlock(cache *blockCache, segIdx uint64, blockIdx int, r *segmen
 		return r.DecodeBlock(blockIdx)
 	}
 	return cache.getOrDecode(
-		blockKey{segIdx: segIdx, checksum: r.Header().Checksum, blockIdx: uint64(blockIdx)},
+		cache.keyForBlock(segIdx, r.Header().Checksum, blockIdx),
 		func() ([]segment.Event, error) { return r.DecodeBlock(blockIdx) },
 	)
 }
@@ -180,43 +180,69 @@ type ColdReaderConfig struct {
 }
 
 // errBatchFull is the sentinel the bounded collector returns to stop the
-// walk once max entries are gathered. Never escapes NewColdReader's closure.
+// walk once max entries are gathered. Never escapes ColdReader.Read.
 var errBatchFull = errors.New("subscribe: cold batch full")
 
-// NewColdReader returns a coldReader that serves a bounded batch from disk
+// ColdReader serves bounded cold-path reads from disk and owns the decoded
+// block cache shared by those reads.
+type ColdReader struct {
+	manifest  *manifest.Manifest
+	writerRef *atomic.Pointer[ingest.Writer]
+	cache     *blockCache
+}
+
+// NewColdReader returns a ColdReader that serves bounded batches from disk
 // via WalkFromCursor, routing sealed-block decodes through a shared, byte-
-// bounded block cache owned by this closure. It stops after max events and
-// reports the next cursor so the subscriber loop resumes contiguously.
-func NewColdReader(cfg ColdReaderConfig) coldReader {
+// bounded block cache. Read stops after max events and reports the next cursor
+// so the subscriber loop resumes contiguously.
+func NewColdReader(cfg ColdReaderConfig) *ColdReader {
 	bytes := cfg.BlockCacheBytes
 	if bytes <= 0 {
 		bytes = DefaultBlockCacheBytes
 	}
-	cache := newBlockCache(bytes)
-	return func(ctx context.Context, cursor uint64, max int) ([]*Entry, uint64, error) {
-		w := cfg.WriterRef.Load()
-		if w == nil {
-			return nil, cursor, errColdUnavailable
-		}
-		batch := make([]*Entry, 0, max)
-		next := cursor
-		err := WalkFromCursor(ctx, WalkInput{
-			StartSeq:   cursor,
-			Manifest:   cfg.Manifest,
-			Writer:     w,
-			BlockCache: cache,
-		}, func(ev *segment.Event) error {
-			cp := *ev
-			batch = append(batch, newEntry(&cp))
-			next = ev.Seq + 1
-			if len(batch) >= max {
-				return errBatchFull
-			}
-			return nil
-		})
-		if err != nil && !errors.Is(err, errBatchFull) {
-			return nil, cursor, err
-		}
-		return batch, next, nil
+	return &ColdReader{
+		manifest:  cfg.Manifest,
+		writerRef: cfg.WriterRef,
+		cache:     newBlockCache(bytes),
 	}
+}
+
+// InvalidateSegment purges decoded blocks for segIdx from the cold read cache.
+func (r *ColdReader) InvalidateSegment(idx uint64) {
+	if r == nil || r.cache == nil {
+		return
+	}
+	r.cache.invalidateSegment(idx)
+}
+
+// Read serves a bounded batch from disk, stopping after max entries and
+// returning the next cursor so the subscriber loop resumes contiguously.
+func (r *ColdReader) Read(ctx context.Context, cursor uint64, max int) ([]*Entry, uint64, error) {
+	if r == nil || r.writerRef == nil {
+		return nil, cursor, errColdUnavailable
+	}
+	w := r.writerRef.Load()
+	if w == nil {
+		return nil, cursor, errColdUnavailable
+	}
+	batch := make([]*Entry, 0, max)
+	next := cursor
+	err := WalkFromCursor(ctx, WalkInput{
+		StartSeq:   cursor,
+		Manifest:   r.manifest,
+		Writer:     w,
+		BlockCache: r.cache,
+	}, func(ev *segment.Event) error {
+		cp := *ev
+		batch = append(batch, newEntry(&cp))
+		next = ev.Seq + 1
+		if len(batch) >= max {
+			return errBatchFull
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errBatchFull) {
+		return nil, cursor, err
+	}
+	return batch, next, nil
 }

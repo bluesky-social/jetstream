@@ -225,7 +225,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		ReadBatch:    opts.SubscribeReadBatch,
 		SlowWindow:   opts.SubscribeSlowWindow,
 		SlowMinRate:  opts.SubscribeSlowMinRate,
-	}, coldRd, func() uint64 {
+	}, coldRd.Read, func() uint64 {
 		if w := writerPtr.Load(); w != nil {
 			return w.NextSeq()
 		}
@@ -263,6 +263,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			opts.OnSteadyStateEvent(ev)
 		}
 	}
+	onSegmentCompacted := func(idx uint64, path string) error {
+		if err := mft.OnSegmentCompacted(idx, path); err != nil {
+			return err
+		}
+		coldRd.InvalidateSegment(idx)
+		return nil
+	}
 	orch, err := orchestrator.New(orchestrator.Config{
 		DataDir:        opts.DataDir,
 		Store:          metaStore,
@@ -289,7 +296,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		BackfillRetryBaseDelay:   opts.BackfillRetryBaseDelay,
 		LiveReconnectBackoff:     opts.LiveReconnectBackoff,
 		IngestOnAfterSeal:        mft.OnSegmentSealed,
-		OnSegmentCompacted:       mft.OnSegmentCompacted,
+		OnSegmentCompacted:       onSegmentCompacted,
 		SegmentManifestChecksums: mft.SegmentChecksums,
 		CompactionInterval:       opts.CompactionInterval,
 		CompactionTombstoneCap:   opts.CompactionTombstoneCap,
@@ -349,6 +356,14 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.server = srv
 
 	return rt, nil
+}
+
+// PublicAddr returns the bound public listener address, or "" before Run binds.
+func (r *Runtime) PublicAddr() string {
+	if r == nil || r.server == nil {
+		return ""
+	}
+	return r.server.PublicAddr()
 }
 
 // Run starts the constructed service graph and blocks until shutdown or a

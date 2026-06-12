@@ -12,6 +12,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRuntimePublicAddrBeforeRunIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil runtime", func(t *testing.T) {
+		t.Parallel()
+		var rt *Runtime
+		require.Empty(t, rt.PublicAddr())
+	})
+
+	t.Run("zero value", func(t *testing.T) {
+		t.Parallel()
+		rt := &Runtime{}
+		require.Empty(t, rt.PublicAddr())
+	})
+
+	t.Run("built before run", func(t *testing.T) {
+		t.Parallel()
+		rt, err := Build(t.Context(), testOptions(t))
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, rt.Close(context.Background()))
+		})
+
+		require.Empty(t, rt.PublicAddr())
+	})
+}
+
 func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
 	t.Parallel()
 

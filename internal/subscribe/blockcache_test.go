@@ -63,6 +63,72 @@ func TestBlockCache_EvictsByByteBudget(t *testing.T) {
 	require.True(t, redecoded.Load(), "evicted block must re-decode on next access")
 }
 
+func TestBlockCache_InvalidateSegmentForcesRedecode(t *testing.T) {
+	t.Parallel()
+	c := newBlockCache(1 << 20)
+	key := c.keyForBlock(7, 11, 0)
+
+	var calls atomic.Int64
+	evs, err := c.getOrDecode(key, func() ([]segment.Event, error) {
+		calls.Add(1)
+		return decodedFixture(1), nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), evs[0].Seq)
+
+	c.invalidateSegment(7)
+
+	key = c.keyForBlock(7, 11, 0)
+	evs, err = c.getOrDecode(key, func() ([]segment.Event, error) {
+		calls.Add(1)
+		return decodedFixture(2), nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), evs[0].Seq)
+	require.Equal(t, int64(2), calls.Load(), "invalidated segment must re-decode")
+}
+
+func TestBlockCache_InvalidateSegmentPreventsInflightInsert(t *testing.T) {
+	t.Parallel()
+	c := newBlockCache(1 << 20)
+	key := c.keyForBlock(9, 22, 0)
+	oldKey := key
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		_, err := c.getOrDecode(key, func() ([]segment.Event, error) {
+			close(started)
+			<-release
+			return decodedFixture(1), nil
+		})
+		require.NoError(t, err)
+	}()
+
+	<-started
+	c.invalidateSegment(9)
+	close(release)
+	<-done
+
+	c.mu.Lock()
+	_, staleInserted := c.items[oldKey]
+	c.mu.Unlock()
+	require.False(t, staleInserted, "old in-flight decode must not populate the resident cache")
+
+	key = c.keyForBlock(9, 22, 0)
+	var fresh atomic.Bool
+	evs, err := c.getOrDecode(key, func() ([]segment.Event, error) {
+		fresh.Store(true)
+		return decodedFixture(2), nil
+	})
+	require.NoError(t, err)
+	require.True(t, fresh.Load(), "old in-flight decode must not populate the new generation")
+	require.Equal(t, uint64(2), evs[0].Seq)
+}
+
 func TestBlockCache_DecodeErrorNotCached(t *testing.T) {
 	t.Parallel()
 	c := newBlockCache(1 << 20)

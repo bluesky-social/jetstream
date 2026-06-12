@@ -29,7 +29,7 @@ func TestColdReadBatch_BoundedAndResumes(t *testing.T) {
 	})
 
 	// First batch of 10 starting at seq 5.
-	batch, next, err := rd(context.Background(), 5, 10)
+	batch, next, err := rd.Read(context.Background(), 5, 10)
 	require.NoError(t, err)
 	require.Len(t, batch, 10)
 	require.Equal(t, uint64(5), batch[0].Event.Seq)
@@ -37,7 +37,7 @@ func TestColdReadBatch_BoundedAndResumes(t *testing.T) {
 	require.Equal(t, uint64(15), next)
 
 	// Resume from next; verify contiguity.
-	batch2, _, err := rd(context.Background(), next, 10)
+	batch2, _, err := rd.Read(context.Background(), next, 10)
 	require.NoError(t, err)
 	require.Equal(t, uint64(15), batch2[0].Event.Seq)
 }
@@ -58,7 +58,7 @@ func TestColdReadBatch_ExhaustsBeforeMax(t *testing.T) {
 	rd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
 		Manifest: m, WriterRef: &writerPtr, BlockCacheBytes: 1 << 20,
 	})
-	batch, next, err := rd(context.Background(), 8, 100) // only 8,9 remain
+	batch, next, err := rd.Read(context.Background(), 8, 100) // only 8,9 remain
 	require.NoError(t, err)
 	require.Len(t, batch, 2)
 	require.Equal(t, uint64(10), next, "next is one past the last available seq")

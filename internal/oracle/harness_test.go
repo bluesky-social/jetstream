@@ -120,6 +120,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		SubscribeSlowMinRate:      1,
 		CursorBlockIndexCacheSize: 32,
 		CompactionInterval:        time.Hour,
+		CompactionTombstoneCap:    1,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
 		OnCompactionPass:          compaction.Observe,
@@ -157,9 +158,14 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 
 	waitForBarrier(t, cfg, "after-merge", afterMerge, run)
 	assertOracleMatches(t, dataDir, w, cfg, "after-merge")
-	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "after-merge")
+	afterMergeCompaction := compaction.Last(t)
+	assertCompacted(t, dataDir, afterMergeCompaction.Watermark, cfg, "after-merge")
 	faultPlan.ArmSubscribeReposDisconnects()
 	afterMerge.Release()
+
+	publicURL := waitForRuntimePublicURL(t, cfg, rt, run)
+	_ = collectSubscribeReplay(t, cfg, run, publicURL, 0, afterMergeCompaction.Watermark)
+	passesBeforeSteady := compaction.Count()
 
 	generateN(t, w, cfg.LiveEventsSteady)
 	syncIdx := pickActiveOracleAccount(t, w, cfg)
@@ -175,6 +181,14 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, asyncEntry, 1)
 	asyncResyncAck.Wait(t, cfg, string(asyncEntry[0].DID), asyncEntry[0].Rev, run, 30*time.Second)
+	steadyCompaction := compaction.WaitAfter(t, cfg, run, passesBeforeSteady, 30*time.Second)
+	require.Greaterf(t, steadyCompaction.Watermark, afterMergeCompaction.Watermark,
+		"steady compaction watermark did not advance: mode=%s seed=%d after_merge_watermark=%d steady_watermark=%d",
+		cfg.Mode, cfg.Seed, afterMergeCompaction.Watermark, steadyCompaction.Watermark)
+	served := collectSubscribeReplay(t, cfg, run, publicURL, 0, steadyCompaction.Watermark)
+	require.NoErrorf(t, CheckCompacted(served, steadyCompaction.Watermark),
+		"served subscribe replay compacted check failed: mode=%s seed=%d watermark=%d",
+		cfg.Mode, cfg.Seed, steadyCompaction.Watermark)
 
 	// steadyAck.Wait above guarantees every steady-state cursor up to
 	// targetSeq has been durably appended (OnEvent fires post-Append), so
@@ -312,6 +326,12 @@ func (r *compactionPassRecorder) Observe(result jetstreamd.CompactionPassResult)
 	r.results = append(r.results, result)
 }
 
+func (r *compactionPassRecorder) Count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.results)
+}
+
 func (r *compactionPassRecorder) Last(t *testing.T) jetstreamd.CompactionPassResult {
 	t.Helper()
 	r.mu.Lock()
@@ -320,6 +340,41 @@ func (r *compactionPassRecorder) Last(t *testing.T) jetstreamd.CompactionPassRes
 	last := r.results[len(r.results)-1]
 	require.NoError(t, last.Err, "latest compaction pass failed")
 	return last
+}
+
+func (r *compactionPassRecorder) WaitAfter(t *testing.T, cfg Config, run *runtimeRun, after int, timeout time.Duration) jetstreamd.CompactionPassResult {
+	t.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		r.mu.Lock()
+		if len(r.results) > after {
+			last := r.results[len(r.results)-1]
+			if last.Err != nil {
+				r.mu.Unlock()
+				t.Fatalf("compaction pass after %d failed: mode=%s seed=%d err=%v",
+					after, cfg.Mode, cfg.Seed, last.Err)
+			}
+			r.mu.Unlock()
+			return last
+		}
+		seen := len(r.results)
+		r.mu.Unlock()
+
+		select {
+		case <-run.exited:
+			t.Fatalf("runtime exited while waiting for compaction pass after %d: mode=%s seed=%d seen=%d err=%v",
+				after, cfg.Mode, cfg.Seed, seen, run.err)
+		case <-timer.C:
+			t.Fatalf("timeout waiting for compaction pass after %d: mode=%s seed=%d seen=%d",
+				after, cfg.Mode, cfg.Seed, seen)
+		case <-tick.C:
+		}
+	}
 }
 
 func waitForBarrier(t *testing.T, cfg Config, name string, gate *phaseGate, run *runtimeRun) {

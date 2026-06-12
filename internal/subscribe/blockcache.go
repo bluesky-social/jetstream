@@ -9,9 +9,10 @@ import (
 
 // blockKey identifies one immutable decoded block.
 type blockKey struct {
-	segIdx   uint64
-	checksum uint64
-	blockIdx uint64
+	segIdx     uint64
+	checksum   uint64
+	blockIdx   uint64
+	generation uint64
 }
 
 // blockCache is a byte-bounded LRU of decoded blocks shared by all cold-path
@@ -23,6 +24,8 @@ type blockCache struct {
 	curBytes int
 	ll       *list.List // front = most recently used
 	items    map[blockKey]*list.Element
+
+	generationBySegment map[uint64]uint64
 
 	// Single-flight: in-flight decodes keyed by blockKey. Each inflight holds
 	// the decode result or error, populated by the first goroutine to hit the
@@ -53,6 +56,36 @@ func newBlockCache(maxBytes int) *blockCache {
 		ll:       list.New(),
 		items:    make(map[blockKey]*list.Element),
 		inFlight: make(map[blockKey]*inflight),
+
+		generationBySegment: make(map[uint64]uint64),
+	}
+}
+
+func (c *blockCache) keyForBlock(segIdx, checksum uint64, blockIdx int) blockKey {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return blockKey{
+		segIdx:     segIdx,
+		checksum:   checksum,
+		blockIdx:   uint64(blockIdx),
+		generation: c.generationBySegment[segIdx],
+	}
+}
+
+func (c *blockCache) invalidateSegment(segIdx uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.generationBySegment[segIdx]++
+	for el := c.ll.Front(); el != nil; {
+		next := el.Next()
+		item := itemOf(el)
+		if item.key.segIdx == segIdx {
+			c.ll.Remove(el)
+			delete(c.items, item.key)
+			c.curBytes -= item.bytes
+		}
+		el = next
 	}
 }
 
@@ -99,6 +132,10 @@ func (c *blockCache) getOrDecode(key blockKey, decode func() ([]segment.Event, e
 	if err != nil {
 		// Decode error is not cached; remove inflight so next call retries.
 		return nil, err
+	}
+
+	if c.generationBySegment[key.segIdx] != key.generation {
+		return evs, nil
 	}
 
 	// Cache the result if not already present (a concurrent decode could have

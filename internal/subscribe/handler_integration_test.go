@@ -50,7 +50,7 @@ func TestHandler_ReplaysFromCursor(t *testing.T) {
 	})
 	b, err := subscribe.New(subscribe.Config{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}, cold, func() uint64 { return w.NextSeq() })
+	}, cold.Read, func() uint64 { return w.NextSeq() })
 	require.NoError(t, err)
 
 	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{

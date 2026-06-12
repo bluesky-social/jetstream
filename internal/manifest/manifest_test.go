@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/manifest"
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
@@ -256,6 +257,42 @@ func TestOnSegmentSealed_ReplacesExistingIdx(t *testing.T) {
 
 	require.NoError(t, m.OnSegmentSealed(0, path))
 	require.Equal(t, 1, m.SegmentCount())
+}
+
+func TestOnSegmentCompacted_ReplacesResidentMetadata(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg_0000000000.jss")
+	mustWriteSealedSegment(t, path, sealedFixture{
+		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+	})
+	m := mustOpenManifest(t, dir)
+	before, _, _ := m.ListFrom(0, 1)
+	require.Len(t, before, 1)
+	require.EqualValues(t, 10, before[0].EventCount)
+
+	_, err := segment.Rewrite(path, func(ev *segment.Event) segment.RowDecision {
+		if ev.Seq < 5 {
+			return segment.RowDrop
+		}
+		return segment.RowKeep
+	}, segment.RewriteOptions{})
+	require.NoError(t, err)
+
+	require.NoError(t, m.OnSegmentCompacted(0, path))
+
+	after, _, _ := m.ListFrom(0, 1)
+	require.Len(t, after, 1)
+	require.EqualValues(t, 5, after[0].EventCount)
+	require.NotEqual(t, before[0].Checksum, after[0].Checksum)
+
+	blocks, err := m.BlockIndex(0)
+	require.NoError(t, err)
+	var events uint32
+	for _, b := range blocks {
+		events += b.EventCount
+	}
+	require.EqualValues(t, 5, events)
 }
 
 func mustOpenManifest(t *testing.T, dir string) *manifest.Manifest {
