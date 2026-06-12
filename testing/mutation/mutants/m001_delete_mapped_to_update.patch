@@ -1,0 +1,28 @@
+mutant: m001_delete_mapped_to_update
+target: internal/ingest/live/events.go
+failure-mode: |
+  The live-ingest action->kind switch maps ActionDelete to KindUpdate.
+  Models a copy-paste error in a switch mapping — the adjacent arms all
+  return similar-looking constants and review eyes glaze over. Deletes are
+  archived as updates, so a replaying consumer never removes the record.
+expected-detection: |
+  Compare should fail with "oracle: extra <did> <collection>/<rkey>":
+  ground truth (simulator MST) no longer contains the deleted record, but
+  the reconstructed model retains it as an update. Default mode generates
+  ~10% deletes across 400 live events, so tier 1 should see many.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index c9d264e..76858fc 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -197,7 +197,7 @@ func actionKind(a streaming.Action) (segment.Kind, error) {
+ 	case streaming.ActionUpdate:
+ 		return segment.KindUpdate, nil
+ 	case streaming.ActionDelete:
+-		return segment.KindDelete, nil
++		return segment.KindUpdate, nil
+ 	case streaming.ActionResync:
+ 		// After Sync 1.1, atmos's verifier resync worker yields each
+ 		// record currently in the repo as ActionResync with the live
