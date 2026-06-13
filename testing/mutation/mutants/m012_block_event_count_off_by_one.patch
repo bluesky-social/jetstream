@@ -1,0 +1,25 @@
+mutant: m012_block_event_count_off_by_one
+target: segment/block.go
+failure-mode: |
+  The per-block event count is encoded as n-1, so decode reads one fewer
+  event and leaves trailing bytes, failing block validation. Models an
+  off-by-one in a count field.
+expected-detection: |
+  DecodeBlock should error (truncated/trailing bytes), so ObserveSegments
+  fails and the harness reports it. Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/segment/block.go b/segment/block.go
+index c14f864..9337465 100644
+--- a/segment/block.go
++++ b/segment/block.go
+@@ -97,7 +97,7 @@ func encodeBlockInto(dst []byte, c columns) []byte {
+ 	}
+ 
+ 	le := binary.LittleEndian
+-	dst = le.AppendUint32(dst, uint32(n))
++	dst = le.AppendUint32(dst, uint32(n-1))
+ 
+ 	// Fixed-size columns, in spec order.
+ 	for i := range n {

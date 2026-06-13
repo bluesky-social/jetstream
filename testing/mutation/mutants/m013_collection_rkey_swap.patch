@@ -1,0 +1,26 @@
+mutant: m013_collection_rkey_swap
+target: internal/ingest/live/events.go
+failure-mode: |
+  In the verified-commit-op conversion, Collection and Rkey are sourced from
+  the swapped fields, so every archived record gets a corrupt (collection,
+  rkey) coordinate. Models a copy-paste swap between two adjacent struct
+  fields.
+expected-detection: |
+  Compare keys on (DID, Collection, Rkey); swapped coordinates produce
+  missing/extra records vs ground truth. Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index c9d264e..f86314d 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -86,7 +86,7 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event,
+ 			UpstreamRelayCursor: evt.Seq,
+ 			Kind:                kind,
+ 			DID:                 string(op.Repo),
+-			Collection:          string(op.Collection),
++			Collection:          string(op.RKey),
+ 			Rkey:                string(op.RKey),
+ 			Rev:                 string(op.Rev),
+ 		}

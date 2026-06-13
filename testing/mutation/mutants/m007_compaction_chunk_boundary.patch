@@ -1,0 +1,27 @@
+mutant: m007_compaction_chunk_boundary
+target: internal/ingest/orchestrator/compact_deletes.go
+failure-mode: |
+  The chunk-boundary keep predicate weakens from > to >=, so the row at
+  exactly chunkEnd is unconditionally kept and never evaluated for deletion
+  in this or (since the watermark advances to chunkEnd) any later pass.
+  Models an inclusive/exclusive boundary slip.
+expected-detection: |
+  assertCompacted (CheckCompacted) should fail when the boundary seq is a
+  superseded create/update that should have been compacted away. Likely
+  seed/scale dependent.
+expected-tier: stress
+tiers: default,stress
+
+diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
+index af22a9a..d80c2ac 100644
+--- a/internal/ingest/orchestrator/compact_deletes.go
++++ b/internal/ingest/orchestrator/compact_deletes.go
+@@ -329,7 +329,7 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
+ 				o.cfg.Metrics.incCompactionSegmentsExamined()
+ 				droppedByReason := map[string]uint64{}
+ 				res, err := segment.Rewrite(f.Path, func(ev *segment.Event) segment.RowDecision {
+-					if ev.Seq > chunkEnd {
++					if ev.Seq >= chunkEnd {
+ 						return segment.RowKeep
+ 					}
+ 					if drop, reason := snap.ShouldDrop(ev); drop {

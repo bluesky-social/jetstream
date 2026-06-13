@@ -1,0 +1,26 @@
+mutant: m009_checksum_range_off_by_one
+target: segment/header.go
+failure-mode: |
+  The header/footer checksum is computed over headerBytes[13:] instead of
+  [12:], excluding one byte from the digest. Sealed files then fail checksum
+  verification on reopen despite being byte-intact. Models an off-by-one in
+  a checksum byte range.
+expected-detection: |
+  Reader.Open should reject the segment on checksum mismatch, so
+  ObserveSegments errors and the harness fails. Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/segment/header.go b/segment/header.go
+index b3e6cee..5f5ece0 100644
+--- a/segment/header.go
++++ b/segment/header.go
+@@ -132,7 +132,7 @@ func ReadSealedHeader(r io.ReaderAt) (Header, error) {
+ // finalized header.
+ func xxh3HeaderFooter(headerBytes, footerBytes []byte) uint64 {
+ 	h := xxh3.New()
+-	_, _ = h.Write(headerBytes[12:])
++	_, _ = h.Write(headerBytes[13:])
+ 	_, _ = h.Write(footerBytes)
+ 	return h.Sum64()
+ }

@@ -1,0 +1,27 @@
+mutant: m003_merge_cursor_no_advance
+target: internal/ingest/orchestrator/merge_runner.go
+failure-mode: |
+  The merge source cursor commits sf.Idx instead of sf.Idx+1, so a merge
+  restart re-processes the just-completed source segment and re-appends its
+  events to the destination. Models an off-by-one when deciding whether a
+  cursor records "last done" vs "next to do".
+expected-detection: |
+  On restart the duplicated events should trip CheckInvariants (duplicate
+  seq) or Compare (extra/duplicate record). Restart-only: needs a crash
+  between source completion and the next run, so add the restart tier.
+expected-tier: stress
+tiers: default,stress,restart
+
+diff --git a/internal/ingest/orchestrator/merge_runner.go b/internal/ingest/orchestrator/merge_runner.go
+index 6118c4c..54f4981 100644
+--- a/internal/ingest/orchestrator/merge_runner.go
++++ b/internal/ingest/orchestrator/merge_runner.go
+@@ -86,7 +86,7 @@ func (r *mergeRunner) run(ctx context.Context) error {
+ 			if err := r.simulateCrash(ctx, crashpoint.AfterMergeDstFlushBeforeSourceCommit); err != nil {
+ 				return err
+ 			}
+-			if err := commitSourceComplete(r.store, r.cache, sf.Idx+1, perDID, r.now()); err != nil {
++			if err := commitSourceComplete(r.store, r.cache, sf.Idx, perDID, r.now()); err != nil {
+ 				return err
+ 			}
+ 			r.metrics.incMergeSegmentsConsumed()

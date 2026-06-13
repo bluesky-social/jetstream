@@ -1,0 +1,25 @@
+mutant: m008_header_offset_byteslice
+target: segment/header.go
+failure-mode: |
+  BlockIndexOffset is encoded into buf[89:97] instead of buf[90:98], shifting
+  the field one byte and corrupting the adjacent header field. Models an
+  off-by-one in a hand-maintained fixed-offset header layout.
+expected-detection: |
+  Reopening/decoding a sealed segment should fail (bad offset / checksum), so
+  ObserveSegments errors out and the harness fails. Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/segment/header.go b/segment/header.go
+index b3e6cee..6a775f5 100644
+--- a/segment/header.go
++++ b/segment/header.go
+@@ -56,7 +56,7 @@ func encodeHeader(h Header) []byte {
+ 	le.PutUint64(buf[66:74], h.DIDBloomOffset)
+ 	le.PutUint64(buf[74:82], h.BlockDIDBloomOffset)
+ 	le.PutUint64(buf[82:90], h.CollectionIndexOffset)
+-	le.PutUint64(buf[90:98], h.BlockIndexOffset)
++	le.PutUint64(buf[89:97], h.BlockIndexOffset)
+ 	// buf[98:256] is left zero — reserved for future expansion.
+ 	return buf
+ }

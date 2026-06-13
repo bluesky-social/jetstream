@@ -1,0 +1,26 @@
+mutant: m004_rev_filter_inverted
+target: internal/ingest/orchestrator/merge_filter.go
+failure-mode: |
+  The merge dedup predicate is inverted (ev.Rev < instead of >), so events
+  already covered by backfill pass the filter and bootstrap-live events that
+  should advance are dropped. Models a flipped comparison in a dedup guard.
+expected-detection: |
+  Compare should fail: either a backfill-covered record reappears (extra /
+  wrong payload) or a newer record is missing. Should fire in default mode
+  wherever bootstrap-live and backfill overlap.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/orchestrator/merge_filter.go b/internal/ingest/orchestrator/merge_filter.go
+index 2553697..1fa97e5 100644
+--- a/internal/ingest/orchestrator/merge_filter.go
++++ b/internal/ingest/orchestrator/merge_filter.go
+@@ -56,7 +56,7 @@ func shouldKeep(ev *segment.Event, st *backfill.RepoStatus) bool {
+ 		return true
+ 	}
+ 	// TIDs are designed to sort lexicographically (atproto rev spec).
+-	return ev.Rev > st.Backfill.Rev
++	return ev.Rev < st.Backfill.Rev
+ }
+ 
+ // repoStatusLookup memoizes per-DID repo/<did> reads for a single

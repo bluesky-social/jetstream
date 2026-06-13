@@ -1,0 +1,25 @@
+mutant: m014_rev_dropped
+target: internal/ingest/live/events.go
+failure-mode: |
+  The commit-op Rev field is dropped (set to ""), so archived events carry no
+  rev. Models forgetting to copy a field during struct construction.
+expected-detection: |
+  CheckInvariants tracks per-DID rev monotonicity and Compare checks rev when
+  both sides have it; an empty rev should surface as a rev regression or
+  mismatch. Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index c9d264e..460ed0c 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -88,7 +88,7 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event,
+ 			DID:                 string(op.Repo),
+ 			Collection:          string(op.Collection),
+ 			Rkey:                string(op.RKey),
+-			Rev:                 string(op.Rev),
++			Rev:                 "",
+ 		}
+ 		// Resync ops carry the live record bytes for create/update;
+ 		// deletes are not part of a resync result (atmos's resync

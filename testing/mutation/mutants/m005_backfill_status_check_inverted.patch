@@ -1,0 +1,25 @@
+mutant: m005_backfill_status_check_inverted
+target: internal/ingest/orchestrator/merge_filter.go
+failure-mode: |
+  The "skip rev-filtering unless backfill is complete" guard is inverted
+  (== instead of !=), so completed-backfill repos bypass rev filtering and
+  incomplete ones get filtered. Models a flipped status check.
+expected-detection: |
+  Compare should fail with duplicated/extra records from completed-backfill
+  DIDs that should have been rev-filtered. Default mode should surface it.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/orchestrator/merge_filter.go b/internal/ingest/orchestrator/merge_filter.go
+index 2553697..ba0d6ae 100644
+--- a/internal/ingest/orchestrator/merge_filter.go
++++ b/internal/ingest/orchestrator/merge_filter.go
+@@ -49,7 +49,7 @@ func shouldKeep(ev *segment.Event, st *backfill.RepoStatus) bool {
+ 	if st == nil {
+ 		return true
+ 	}
+-	if st.Backfill.Status != backfill.StatusComplete {
++	if st.Backfill.Status == backfill.StatusComplete {
+ 		return true
+ 	}
+ 	if st.Backfill.Rev == "" || ev.Rev == "" {

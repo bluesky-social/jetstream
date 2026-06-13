@@ -1,0 +1,26 @@
+mutant: m016_bloom_size_off_by_one
+target: segment/bloom.go
+failure-mode: |
+  The per-bloom stride in the block-blooms region header is encoded as
+  sizeBytes-1, so readers index blooms with the wrong stride and alias into
+  neighbouring filter bytes. Models an off-by-one in an index stride.
+expected-detection: |
+  PREDICTED SURVIVAL: the oracle reads events directly from blocks and never
+  queries the bloom filters, so corrupt blooms do not affect reconstruction.
+  Documents a known bloom/read-path blind spot.
+expected-tier: none
+tiers: default,stress
+
+diff --git a/segment/bloom.go b/segment/bloom.go
+index d97c361..e04a9c7 100644
+--- a/segment/bloom.go
++++ b/segment/bloom.go
+@@ -88,7 +88,7 @@ func encodeBlockBloomsRegion(filters []*gloom.Filter) ([]byte, uint32, error) {
+ 
+ 	le := binary.LittleEndian
+ 	le.PutUint32(header[0:4], uint32(len(filters)))
+-	le.PutUint32(header[4:8], sizeBytes)
++	le.PutUint32(header[4:8], sizeBytes-1)
+ 
+ 	return append(header, body...), sizeBytes, nil
+ }
