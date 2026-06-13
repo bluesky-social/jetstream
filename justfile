@@ -134,6 +134,14 @@ oracle-sweep SEEDS="10":
         echo "::endgroup::"
     done
 
+# Runs the oracle mutation campaign: applies each curated mutant patch in
+# testing/mutation/mutants one at a time and verifies the oracle kills it.
+# Pass a mutant id to run one (e.g. `just mutation-campaign m007`), or
+# `m007 --seeds 5` for a stress-mode seed sweep of a survivor. Scorecard
+# lives in testing/mutation/RESULTS.md.
+mutation-campaign *ARGS="":
+    testing/mutation/run.sh {{ARGS}}
+
 # Runs performance benchmarks.
 bench *ARGS="./...":
     go test -bench=. -benchmem -count=1 -run='^$' {{ARGS}}
