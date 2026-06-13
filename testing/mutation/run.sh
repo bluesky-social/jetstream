@@ -15,13 +15,22 @@ ONLY=""
 SEEDS=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --seeds) SEEDS="$2"; shift 2 ;;
+        --seeds)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --seeds requires a value" >&2
+                exit 1
+            fi
+            SEEDS="$2"; shift 2 ;;
         *) ONLY="$1"; shift ;;
     esac
 done
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
     echo "error: uncommitted changes to tracked files; commit or stash first" >&2
+    exit 1
+fi
+if ! [[ "$SEEDS" =~ ^[0-9]+$ ]]; then
+    echo "error: --seeds must be a non-negative integer" >&2
     exit 1
 fi
 if [[ "$SEEDS" -gt 0 && -z "$ONLY" ]]; then
@@ -31,15 +40,35 @@ fi
 
 LOG_ROOT="$(mktemp -d -t mutation-campaign-XXXXXX)"
 
-# Safety net: any exit path (including Ctrl-C) reverts an applied mutant.
+# CURRENT_PATCH names the mutant currently applied to the working tree, or ""
+# when the tree is clean. Every git-apply is paired with revert_current so this
+# invariant holds at every loop boundary; the EXIT trap is the backstop.
 CURRENT_PATCH=""
-cleanup() {
-    if [[ -n "$CURRENT_PATCH" ]]; then
-        git apply -R "$CURRENT_PATCH" 2>/dev/null || true
-        CURRENT_PATCH=""
+
+# revert_current undoes the applied mutant and clears CURRENT_PATCH. A failed
+# reverse means the tree is dirty and we cannot trust any further result, so we
+# crash loud rather than silently continuing on corrupted state (project
+# directive: fail loud over corrupt). Callers run this OUTSIDE `if !` guards so
+# `set -e`/the explicit exit aborts the campaign.
+revert_current() {
+    if [[ -z "$CURRENT_PATCH" ]]; then
+        return 0
     fi
+    if ! git apply -R "$CURRENT_PATCH"; then
+        echo "FATAL: failed to revert $CURRENT_PATCH; working tree is DIRTY — aborting" >&2
+        CURRENT_PATCH=""
+        exit 2
+    fi
+    CURRENT_PATCH=""
 }
-trap cleanup EXIT INT TERM
+
+# EXIT is the single cleanup backstop: it fires after normal exit and after the
+# signal traps below re-exit, so trapping cleanup on INT/TERM too would just
+# double-invoke it. The signal traps set a conventional non-zero status so a
+# Ctrl-C'd campaign does not masquerade as success.
+trap revert_current EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 declare -a ROWS=()
 
@@ -64,13 +93,16 @@ for patch in "$MUTANTS_DIR"/*.patch; do
     if ! go build ./... >"$LOG_ROOT/$id.build.log" 2>&1; then
         echo "    BUILD-BROKEN (mutant does not compile — refresh needed)"
         ROWS+=("| $id | BUILD-BROKEN | mutant does not compile — refresh needed |")
-        git apply -R "$patch"
-        CURRENT_PATCH=""
+        revert_current
         continue
     fi
 
     result=""
     if [[ "$SEEDS" -gt 0 ]]; then
+        # A non-zero test exit counts as a kill. The preceding `go build` rules
+        # out compile errors, but an infra failure (timeout, OOM) is still
+        # indistinguishable from a real oracle assertion here; inspect the
+        # per-seed logs before trusting a low kill count.
         kills=0
         for i in $(seq 1 "$SEEDS"); do
             seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
@@ -116,8 +148,7 @@ for patch in "$MUTANTS_DIR"/*.patch; do
         fi
     fi
 
-    git apply -R "$patch"
-    CURRENT_PATCH=""
+    revert_current
     ROWS+=("$result")
 done
 
