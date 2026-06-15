@@ -48,7 +48,7 @@ func TestCacheBuildsOnFirstAccess(t *testing.T) {
 	require.Equal(t, uint64(110), blob.MaxSeq)
 	require.NotEmpty(t, blob.ETag)
 
-	w, m, snap, err := decodeForTest(blob.Bytes)
+	w, m, snap, err := Decode(blob.Bytes)
 	require.NoError(t, err)
 	require.Equal(t, uint64(100), w)
 	require.Equal(t, uint64(110), m)
@@ -94,7 +94,7 @@ func TestCacheConcurrentServeAndRebuild(t *testing.T) {
 					return
 				default:
 					b := c.Current()
-					_, _, _, err := decodeForTest(b.Bytes)
+					_, _, _, err := Decode(b.Bytes)
 					require.NoError(t, err)
 				}
 			}

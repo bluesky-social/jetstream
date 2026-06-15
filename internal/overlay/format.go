@@ -222,10 +222,11 @@ func appendUvarint(b []byte, v uint64) []byte {
 // blob. The decoder never panics on hostile input.
 var errMalformed = errors.New("overlay: malformed blob")
 
-// decodeForTest inverts Encode. It is the reference decoder used by
-// tests and the oracle; it bounds all lengths against the buffer and
-// never panics on malformed input.
-func decodeForTest(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
+// Decode parses a jsto v1 overlay blob back into its watermark, maxSeq,
+// and tombstone snapshot. It bounds every length against the buffer and
+// returns an error (never panics) on malformed input. This is the
+// reference decoder the future client library mirrors (issue #10).
+func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 	if len(blob) < frameHdrSize {
 		return 0, 0, tombstone.Snapshot{}, fmt.Errorf("%w: short header", errMalformed)
 	}

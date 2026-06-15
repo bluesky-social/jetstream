@@ -27,7 +27,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	const W, M = uint64(100), uint64(150)
 	blob := Encode(sampleSnapshot(), W, M)
 
-	gotW, gotM, gotSnap, err := decodeForTest(blob)
+	gotW, gotM, gotSnap, err := Decode(blob)
 	require.NoError(t, err)
 	require.Equal(t, W, gotW)
 	require.Equal(t, M, gotM)
@@ -69,7 +69,7 @@ func TestEncodeEmpty(t *testing.T) {
 		Records: map[tombstone.RecordKey]uint64{},
 		DIDs:    map[string]tombstone.DIDTombstone{},
 	}, 200, 200)
-	w, m, snap, err := decodeForTest(blob)
+	w, m, snap, err := Decode(blob)
 	require.NoError(t, err)
 	require.Equal(t, uint64(200), w)
 	require.Equal(t, uint64(200), m)
@@ -81,7 +81,7 @@ func TestEncodeRoundTripProperty(t *testing.T) {
 	f := func(seed uint32) bool {
 		snap, w, m := randomSnapshot(seed)
 		blob := Encode(snap, w, m)
-		gw, gm, gs, err := decodeForTest(blob)
+		gw, gm, gs, err := Decode(blob)
 		if err != nil || gw != w || gm != m {
 			return false
 		}
@@ -157,6 +157,6 @@ func FuzzDecodeForTest(f *testing.F) {
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, blob []byte) {
 		// Must never panic; any structurally invalid blob returns an error.
-		_, _, _, _ = decodeForTest(blob)
+		_, _, _, _ = Decode(blob)
 	})
 }
