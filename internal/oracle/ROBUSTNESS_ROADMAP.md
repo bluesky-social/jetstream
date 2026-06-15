@@ -1,7 +1,8 @@
 # Oracle Robustness Roadmap
 
 Date: 2026-06-15
-Status: draft for review
+Status: Milestone A complete on branch `testing-revamp`; Milestones B-E
+remain planned.
 
 ## Purpose
 
@@ -22,6 +23,24 @@ The near-term goal is higher confidence:
 This document folds together the current oracle code review,
 `internal/oracle/DETERMINISM_DESIGN.md`, `ORACLE_TODO.md`, and
 `testing/mutation/RESULTS.md`.
+
+## Current Implementation Status
+
+Milestone A, "Stronger Existing Oracle", is complete on `testing-revamp`:
+
+- Workstream 1 closed known assertion gaps and updated mutation dispositions
+  via issues #9 and commits `1967891` / `e143db7`.
+- Workstream 2 added canonical JSONL oracle traces via issue #12 and commit
+  `2062913`.
+- Workstream 3 added normalized event-log equivalence for bootstrap/live
+  oracle events, plus a sync-loss mutant, via issues #13-#17 and commits
+  `cec8c3c` through `8fe6e20`.
+- The remaining Milestone A deterministic-input item moved simulator
+  `#account` event timestamps onto the persisted logical clock via issue #18
+  and commit `19063c1`.
+
+The rest of this roadmap remains the forward plan. Milestone B should start
+with product-path replay observation, not more storage-only assertions.
 
 ## Design Principles
 
@@ -71,19 +90,20 @@ The existing oracle is already valuable:
 
 This roadmap preserves those strengths and builds around them.
 
-## Current Weaknesses
+## Remaining Weaknesses After Milestone A
 
-The current oracle is weaker than it should be in these areas:
+The oracle is still weaker than it should be in these areas:
 
-- It mostly checks final materialized repo state. Intermediate event loss can
-  be hidden when a later event converges the final state.
 - The product replay path is not a primary oracle observation.
-- The mutation campaign found concrete escapes:
-  empty commit revs, block offset bookkeeping, compaction boundary handling,
-  merge-cursor crash seams, store-fault paths, and footer/bloom read indexes.
-- The harness has useful hooks, but no single typed trace tying simulator
-  inputs, faults, runtime transitions, append/flush/seal/cursor events,
-  compaction, replay, shutdown, and restart together.
+- The mutation campaign still has concrete future targets: merge-cursor crash
+  seams, store-fault paths, and footer/bloom read indexes.
+- Event-log equivalence now covers the default lifecycle's bootstrap/live
+  oracle events, but product replay and XRPC egress still need to be compared
+  against the same normalized stream.
+- The trace recorder now captures core run metadata, phase/fault facts,
+  lifecycle events, compaction, replay observations, shutdown, and restart
+  markers, but it is not yet a complete typed trace for every writer
+  flush/seal/rotate/cursor transition.
 - The simulator is intentionally polite: bounded-success faults, limited data
   diversity, little malformed input, no identity path coverage, no hard
   failure-contract modes.
@@ -115,6 +135,9 @@ components beside the current harness, then migrate `TestOracle_DefaultLifecycle
 to use them.
 
 ## Workstream 1: Close Known Assertion Gaps
+
+Status: complete on `testing-revamp` via issue #9 and commits `1967891` /
+`e143db7`.
 
 ### Rationale
 
@@ -163,6 +186,9 @@ Fix the known mutation escapes that require no new runtime infrastructure:
 - Run `just test ./internal/oracle`.
 
 ## Workstream 2: Add Canonical Oracle Traces
+
+Status: complete for Milestone A via issue #12 and commit `2062913`. Future
+milestones may add more trace categories as new observers and fault tiers land.
 
 ### Rationale
 
@@ -218,6 +244,9 @@ Introduce an `oracle.Trace` recorder with canonical event records:
   catches it.
 
 ## Workstream 3: Event-Log Equivalence
+
+Status: complete for the first lifecycle scope via issues #13-#17 and commits
+`cec8c3c` through `8fe6e20`.
 
 ### Rationale
 
@@ -348,6 +377,10 @@ to filesystem observation and expected event log.
   sees the rewritten version.
 
 ## Workstream 6: Deterministic-Enough Inputs
+
+Status: partially complete. Milestone A fixed simulator `#account` event time
+via issue #18 and commit `19063c1`; the rest of this workstream remains
+future work.
 
 ### Rationale
 
@@ -680,10 +713,12 @@ Prototype narrow uses of:
 
 ### Milestone A: Stronger Existing Oracle
 
-1. Close mutation assertion gaps.
-2. Add canonical trace recorder.
-3. Make simulator account event times deterministic.
-4. Add event-log equivalence for live/steady events.
+Status: complete on `testing-revamp`.
+
+1. Close mutation assertion gaps. Complete.
+2. Add canonical trace recorder. Complete.
+3. Make simulator account event times deterministic. Complete.
+4. Add event-log equivalence for live/steady events. Complete.
 
 This is the first milestone because it improves detection and diagnostics
 without changing the transport or runtime architecture.
