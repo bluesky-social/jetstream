@@ -167,22 +167,18 @@ Fix the known mutation escapes that require no new runtime infrastructure:
   The invariant checker is already the canonical physical-stream gate.
 - Add a small sealed-segment structural checker used by `ObserveSegments`.
   It should verify block offsets are monotonic, in range, and consistent with
-  block ranges where available. `m010_nextblockoffset_reset` is stale for
-  sealed output because `Writer.Seal` rebuilds footer metadata by walking
-  physical frames; preserve that analysis in `testing/mutation/RESULTS.md`.
-- Do not add chunk-boundary assertions for `m007_compaction_chunk_boundary`
-  unless production chunk construction changes. Under the current compactor,
-  snapshots are bounded to `<= chunkEnd`, so a row at exactly `chunkEnd` cannot
-  be droppable by that same chunk snapshot.
+  block ranges where available.
+- Preserve retired-mutant analysis in `testing/mutation/RESULTS.md`. Mutants
+  `m007_compaction_chunk_boundary` and `m010_nextblockoffset_reset` were
+  removed from the active catalog after reclassification, because they model
+  stale/dead corrupt shapes under the current implementation.
 - Keep diagnostics specific: include seq, file, block index, DID, collection,
   rkey, and phase where possible.
 
 ### Verification
 
 - Unit tests under `internal/oracle`.
-- Re-run the relevant mutation mutants:
-  `m018`, `m010`, and `m007`, with stale/invalid survivors documented in
-  `testing/mutation/RESULTS.md`.
+- Re-run the active Milestone A mutation mutants: `m018` and `m019`.
 - Run `just test ./internal/oracle`.
 
 ## Workstream 2: Add Canonical Oracle Traces

@@ -45,7 +45,7 @@ testing/mutation/
 Plus:
 
 - a `mutation-campaign` recipe in the justfile (`just mutation-campaign` for
-  all mutants, `just mutation-campaign m007` for one),
+  all mutants, `just mutation-campaign m019` for one),
 - one paragraph in AGENTS.md (Testing section) describing the campaign so
   future sessions/staff know it exists, when to run it, and that
   `testing/mutation/mutants/*.patch` are deliberate bugs — never to be
@@ -61,7 +61,7 @@ One self-contained `.patch` file per mutant. `git apply` ignores text before
 the `diff --git` header, so metadata lives in the same file:
 
 ```
-mutant: m007_watermark_floor_off_by_one
+mutant: mNNN_watermark_floor_off_by_one
 target: internal/ingest/orchestrator/compaction_watermark.go
 failure-mode: |
   On first startup, the compaction watermark floor is initialized to

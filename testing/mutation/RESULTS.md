@@ -5,6 +5,17 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
+## Retired mutants
+
+The active catalog no longer carries mutants that have been reclassified as
+stale/dead under the current implementation. Their historical scorecard rows
+remain below so the reasoning is not lost.
+
+| mutant | retired | reason |
+|---|---|---|
+| m007_compaction_chunk_boundary | 2026-06-15 | Invalid/dead under current compaction chunk construction; the modeled corrupt shape cannot be produced by current chunk snapshots. |
+| m010_nextblockoffset_reset | 2026-06-15 | Stale/dead for sealed oracle observations; `Writer.Seal` rebuilds footer block metadata from physical frames. |
+
 ## Targeted follow-up 2026-06-15 — event-log equivalence
 
 - commit under test: branch `testing-revamp` after
@@ -22,6 +33,7 @@ method and `testing/mutation/run.sh` for the driver.
 - commit under test: branch `testing-revamp` after
   `oracle: reclassify stale mutation expectations`
 - driver: targeted `just mutation-campaign m018`, `m010`, and `m007`
+  before retiring stale/dead mutants `m010` and `m007` from the active catalog
 - scope: Phase 1 of the oracle robustness roadmap
 
 | mutant | result | disposition |
@@ -92,8 +104,12 @@ so they were not swept. This is a deliberate scope limit, not full coverage.
   actionable operational result: it argues the nightly `oracle-sweep` seed
   count is load-bearing, not decorative — a single-seed CI run would have a
   ~20% chance of missing this real bug.
-- **m007**: SURVIVED all 5 seeds → true escape.
-- **m010**: SURVIVED all 5 seeds → true escape.
+- **m007**: SURVIVED all 5 seeds → originally treated as a true escape; later
+  reclassified as invalid/dead under current compaction chunk construction and
+  retired from the active catalog.
+- **m010**: SURVIVED all 5 seeds → originally treated as a true escape; later
+  reclassified as stale/dead for sealed oracle observations and retired from
+  the active catalog.
 
 ### Escapes — analysis and disposition
 
@@ -117,20 +133,26 @@ Disposition: **accepted blind spot** — only an independent checksum oracle
 (or a committed golden segment with a known-good checksum) would catch it.
 Cross-referenced in ORACLE_TODO.md.
 
-**m010 — block read by index, not by recorded offset (real gap).**
+**m010 — block read by index, not by recorded offset (historical, retired).**
 `DecodeBlock` (reader.go:301) seeks via the block-index entry's offset, and
 the oracle decodes blocks 0..N by index. The `nextBlockOffset` bookkeeping the
 mutant corrupts feeds a path the oracle's read does not depend on in this
 config. A real consumer using offset-based seeks could diverge. Disposition:
 **fix the oracle** candidate — add a read mode that follows recorded offsets,
-or assert offset monotonicity in ObserveSegments. Filed to ORACLE_TODO.md.
+or assert offset monotonicity in ObserveSegments. Later Milestone A review
+found this mutant stale/dead for sealed oracle observations because
+`Writer.Seal` rebuilds footer metadata by walking physical frames; the active
+patch was retired on 2026-06-15.
 
-**m007 — compaction boundary row never re-evaluated (real gap).**
+**m007 — compaction boundary row never re-evaluated (historical, retired).**
 The `>` → `>=` weakening keeps the row at exactly chunkEnd, and because the
 watermark advances to chunkEnd it is never revisited. assertCompacted did not
 catch it across 6 seeds. Disposition: **fix the oracle** — CheckCompacted
 should assert that the boundary seq itself is evaluated, not just rows
-strictly below it. Filed to ORACLE_TODO.md.
+strictly below it. Later Milestone A review found this mutant invalid/dead
+under current compaction chunk construction because the modeled corrupt shape
+cannot be produced by current chunk snapshots; the active patch was retired on
+2026-06-15.
 
 **m003 — merge-cursor off-by-one not exercised by restart tier (real gap).**
 The restart oracle only covers 4 enumerated crashpoints; a merge-cursor
@@ -174,9 +196,8 @@ which exercises the read indexes a client uses.
 
 The campaign measured the oracle rather than re-confirming it. It caught
 every hot-path data-shape bug we threw at it (m001, m004, m008, m011, m012,
-m017) and several at scale (m005), but it surfaced **four genuine oracle gaps
-worth fixing** (m018 rev-blindness, m010 offset-vs-index, m007 compaction
-boundary, m003 merge-cursor restart seam), **three structural blind spots**
+m017) and several at scale (m005), but it surfaced **two active oracle gaps
+worth fixing** (m018 rev-blindness and m003 merge-cursor restart seam), **three structural blind spots**
 already named in ORACLE_TODO.md (m006 store-fault, m009 closed-loop checksum,
 m015/m016 read-path indexes), and one operational signal — **m002's flaky
 detection justifies the multi-seed nightly sweep**. The over-fitting worry was

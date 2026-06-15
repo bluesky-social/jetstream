@@ -108,7 +108,8 @@ If a phase reveals separable follow-up work, create a new issue and link it from
 - Modify: `internal/oracle/compacted.go`
 - Modify: `internal/oracle/compacted_test.go`
 - Reference: `testing/mutation/RESULTS.md`
-- Reference mutants: `m018`, `m010`, `m007`
+- Reference mutants: `m018`; historical retired mutants `m010` and `m007`
+  remain documented in `testing/mutation/RESULTS.md`.
 
 ### Task 1.1: Reject Empty Rev On Commit-Kind Events
 
@@ -267,11 +268,12 @@ Run:
 ```bash
 just test ./internal/oracle
 just mutation-campaign m018
-just mutation-campaign m010
-just mutation-campaign m007
+just mutation-campaign m019
 ```
 
-Expected: oracle tests PASS; targeted mutants are KILLED or explicitly reclassified in `testing/mutation/RESULTS.md` with evidence.
+Expected: oracle tests PASS; active targeted mutants are KILLED. Historical
+mutants `m010` and `m007` have been retired from the active catalog after
+explicit reclassification in `testing/mutation/RESULTS.md`.
 
 - [ ] **Commit**
 
@@ -816,12 +818,11 @@ Run:
 
 ```bash
 just test ./internal/oracle
-just mutation-campaign m018 m010 m007
+just mutation-campaign m018
+just mutation-campaign m019
 ```
 
-If the mutation driver does not accept multiple IDs, run each targeted mutant separately.
-
-Expected: all oracle tests pass; targeted mutants are killed or have documented dispositions.
+Expected: all oracle tests pass and active targeted mutants are killed.
 
 ### Gate B: After Phases 5-6
 
