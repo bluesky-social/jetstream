@@ -125,10 +125,20 @@ oracle-sweep SEEDS="10":
             gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -timeout 30m ./internal/oracle -run TestOracle_DefaultLifecycle -v; then
             echo "::endgroup::"
             echo "::error::oracle failed at seed ${seed}"
-            echo "Repro:"
+            echo "Repro (NOTE: the seed fixes the INPUTS only — the world,"
+            echo "the runtime RNG, and the fault schedule. The oracle runs the"
+            echo "real jetstreamd runtime concurrently against real time and"
+            echo "real sockets, so goroutine scheduling, fault-vs-retry timing,"
+            echo "and socket ordering are NOT seeded. A single run may pass on a"
+            echo "faster or less-contended machine; the failure is interleaving-"
+            echo "dependent. To surface it, force the schedule rather than"
+            echo "trusting a single replay:"
             echo "  JETSTREAM_ORACLE_MODE=stress \\"
             echo "  JETSTREAM_ORACLE_SEED=${seed} \\"
-            echo "  go test ./internal/oracle -run TestOracle_DefaultLifecycle -count=1 -timeout 30m -v"
+            echo "  GOMAXPROCS=2 go test ./internal/oracle -run TestOracle_DefaultLifecycle \\"
+            echo "    -count=200 -failfast -timeout 30m -v"
+            echo "(add -race to catch a data race directly; raise -count or lower"
+            echo "GOMAXPROCS to bias the scheduler toward the CI interleaving.)"
             exit 1
         fi
         echo "::endgroup::"
