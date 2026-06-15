@@ -140,7 +140,17 @@ func replayFile(ctx context.Context, path, watermark string, state *replayState)
 		}
 	}()
 
-	for i := range reader.Blocks() {
+	// Prune by DID before decoding. A full-network segment holds events
+	// for every DID on the network; without this, reconstructing one
+	// account would zstd-decompress and decode the entire archive and
+	// then discard nearly every event in replayEvent's DID filter. The
+	// bloom-backed selection has no false negatives, so every block that
+	// actually holds state.did is still decoded.
+	selected, err := reader.BlocksContainingDID(state.did)
+	if err != nil {
+		return fmt.Errorf("repoexport: select blocks in %s: %w", path, err)
+	}
+	for _, i := range selected {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

@@ -410,6 +410,55 @@ func (r *Reader) LoadAllBlockBlooms() ([]*gloom.Filter, error) {
 	return out, nil
 }
 
+// BlocksContainingDID returns the ascending indices of blocks that may
+// contain an event for did, using the segment's DID bloom filters to
+// prune. It is the read-path counterpart to the pushdown rewrite.go
+// already uses during compaction.
+//
+// The contract is one-sided, exactly as bloom filters allow: there are
+// never false negatives, so every block that actually holds did is
+// included; there may be false positives, so a returned block is not
+// guaranteed to hold did (the caller filters per-event after decode).
+// This lets reconstruction decode only the few blocks an account
+// touches instead of zstd-decompressing the entire archive.
+//
+// Fast paths, in order:
+//   - segment-level bloom miss -> no block holds did; returns nil with
+//     zero block-bloom preads.
+//   - if any bloom is nil/unavailable (corrupt or foreign file), the
+//     block is conservatively included so we never silently drop
+//     records; the cost is a wasted decode, never a wrong result.
+func (r *Reader) BlocksContainingDID(did string) ([]int, error) {
+	if len(r.blocks) == 0 {
+		return nil, nil
+	}
+	// Segment-level short-circuit: if the whole-segment bloom says the
+	// DID is absent, no block can contain it. This is what collapses a
+	// full-network scan to near-nothing for a single account.
+	if r.segmentBloom != nil && !r.segmentBloom.TestString(did) {
+		return nil, nil
+	}
+
+	blooms, err := r.LoadAllBlockBlooms()
+	if err != nil {
+		// Without per-block blooms we cannot prune safely; fall back to
+		// every block rather than risk a false negative.
+		all := make([]int, len(r.blocks))
+		for i := range all {
+			all[i] = i
+		}
+		return all, nil
+	}
+
+	out := make([]int, 0, len(blooms))
+	for i, bloom := range blooms {
+		if bloom == nil || bloom.TestString(did) {
+			out = append(out, i)
+		}
+	}
+	return out, nil
+}
+
 // validateBlockOffsets verifies every block's [offset, offset+8+size]
 // range fits before the footer, that ranges are strictly ascending and
 // non-overlapping (since that's how Seal writes them), and that

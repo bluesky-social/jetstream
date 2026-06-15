@@ -3,6 +3,7 @@ package segment
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -263,6 +264,85 @@ func TestReaderLoadAllBlockBlooms(t *testing.T) {
 			blooms[i].TestString("did:plc:a"),
 			single.TestString("did:plc:a"))
 	}
+}
+
+func TestReaderBlocksContainingDID(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// Two blocks of two events each. alice and bob land in block 0;
+	// carol and dave in block 1.
+	events := []Event{
+		{Seq: 1, Kind: KindCreate, DID: "did:plc:alice"},
+		{Seq: 2, Kind: KindCreate, DID: "did:plc:bob"},
+		{Seq: 3, Kind: KindCreate, DID: "did:plc:carol"},
+		{Seq: 4, Kind: KindCreate, DID: "did:plc:dave"},
+	}
+	path := sealedSegmentForReader(t, dir, events, 2)
+
+	r, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+
+	// No false negatives: a DID present only in block 0 must yield a
+	// selection that includes block 0. (Bloom false positives may add
+	// other blocks, so assert containment, not equality.)
+	got, err := r.BlocksContainingDID("did:plc:alice")
+	require.NoError(t, err)
+	require.Contains(t, got, 0)
+
+	got, err = r.BlocksContainingDID("did:plc:dave")
+	require.NoError(t, err)
+	require.Contains(t, got, 1)
+
+	// A DID absent from the whole segment must short-circuit on the
+	// segment-level bloom and select no blocks at all -- this is the
+	// property that turns a full-archive scan into a near-no-op.
+	got, err = r.BlocksContainingDID("did:plc:not-present-anywhere")
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// Returned indices are ascending and in range.
+	all, err := r.BlocksContainingDID("did:plc:alice")
+	require.NoError(t, err)
+	for i := 1; i < len(all); i++ {
+		require.Less(t, all[i-1], all[i])
+	}
+}
+
+// TestReaderBlocksContainingDIDPrunesMostBlocks is the regression guard
+// for the reconstruction speedup: in a segment where a DID appears in
+// exactly one of many blocks, selection must return far fewer blocks
+// than exist. If a future change reverts to "decode every block", this
+// fails here rather than only as production latency. The 0.1% per-block
+// bloom FP rate makes spurious extra selections vanishingly unlikely
+// for the handful of decoy DIDs used here.
+func TestReaderBlocksContainingDIDPrunesMostBlocks(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// 20 blocks of one event each; only block 7 holds the target DID.
+	const target = "did:plc:needle"
+	events := make([]Event, 0, 20)
+	for i := range 20 {
+		did := fmt.Sprintf("did:plc:decoy-%02d", i)
+		if i == 7 {
+			did = target
+		}
+		events = append(events, Event{Seq: uint64(i + 1), Kind: KindCreate, DID: did})
+	}
+	path := sealedSegmentForReader(t, dir, events, 1)
+
+	r, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+
+	require.Len(t, r.Blocks(), 20)
+
+	got, err := r.BlocksContainingDID(target)
+	require.NoError(t, err)
+	require.Contains(t, got, 7)  // no false negative
+	require.Less(t, len(got), 5) // and almost everything pruned
 }
 
 // TestReaderOpenEmptySegment exercises the corner case where Seal
