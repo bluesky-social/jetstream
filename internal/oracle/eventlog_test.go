@@ -134,6 +134,31 @@ func TestCompareEventLogsRejectsOrderMismatch(t *testing.T) {
 	require.ErrorContains(t, err, "got seq=2")
 }
 
+func TestCompareEventLogMultisetAllowsInterDIDReordering(t *testing.T) {
+	t.Parallel()
+
+	first := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1", Rev: "rev1"}
+	second := ObservedEvent{Seq: 2, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "c", Rkey: "r2", Rev: "rev1"}
+
+	require.NoError(t, CompareEventLogMultiset(
+		NormalizeEventLog([]ObservedEvent{first, second}),
+		NormalizeEventLog([]ObservedEvent{second, first}),
+	))
+}
+
+func TestCompareEventLogMultisetRejectsMissingDuplicate(t *testing.T) {
+	t.Parallel()
+
+	row := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev1"}
+
+	err := CompareEventLogMultiset(
+		NormalizeEventLog([]ObservedEvent{row, row}),
+		NormalizeEventLog([]ObservedEvent{row}),
+	)
+	require.ErrorContains(t, err, "missing expected event")
+	require.ErrorContains(t, err, "seq=1")
+}
+
 func TestCompareEventLogsCompactedAllowsSupersededCreateBelowWatermark(t *testing.T) {
 	t.Parallel()
 
@@ -222,4 +247,45 @@ func TestCompareEventLogsCompactedRejectsUnjustifiedMissingCreate(t *testing.T) 
 	)
 	require.ErrorContains(t, err, "missing expected event")
 	require.ErrorContains(t, err, "seq=1")
+}
+
+func TestEventLogRecorderNormalizesByUpstreamCursor(t *testing.T) {
+	t.Parallel()
+
+	rec := newEventLogRecorder()
+	rec.Observe(&segment.Event{
+		Seq:                 100,
+		UpstreamRelayCursor: 7,
+		Kind:                segment.KindCreate,
+		DID:                 "did:plc:a",
+		Collection:          "c",
+		Rkey:                "r",
+		Rev:                 "rev1",
+		Payload:             []byte("payload"),
+	})
+	rec.Observe(&segment.Event{
+		Seq:                 101,
+		UpstreamRelayCursor: 8,
+		Kind:                segment.KindDelete,
+		DID:                 "did:plc:a",
+		Collection:          "c",
+		Rkey:                "r",
+		Rev:                 "rev2",
+	})
+
+	rows := rec.RowsByUpstreamCursor(0, 7)
+	require.Len(t, rows, 1)
+	require.Equal(t, uint64(7), rows[0].Seq)
+	require.Equal(t, "create", rows[0].Kind)
+	require.Equal(t, "did:plc:a", rows[0].DID)
+	require.NotEmpty(t, rows[0].PayloadSHA256_64)
+}
+
+func TestEventLogRecorderIgnoresSyntheticEventsWithoutUpstreamCursor(t *testing.T) {
+	t.Parallel()
+
+	rec := newEventLogRecorder()
+	rec.Observe(&segment.Event{Seq: 1, UpstreamRelayCursor: 0, Kind: segment.KindSync, DID: "did:plc:a"})
+
+	require.Empty(t, rec.RowsByUpstreamCursor(0, 10))
 }

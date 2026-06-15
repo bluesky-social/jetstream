@@ -44,7 +44,7 @@ func TestExpectedEventLogFromFirehoseNormalizesAccountAndSyncFrames(t *testing.T
 
 	rows, err := ExpectedEventLogFromFirehose(w, 0, 10)
 	require.NoError(t, err)
-	require.Len(t, rows, 2)
+	require.GreaterOrEqual(t, len(rows), 3)
 
 	require.Equal(t, uint64(1), rows[0].Seq)
 	require.Equal(t, "account", rows[0].Kind)
@@ -59,6 +59,13 @@ func TestExpectedEventLogFromFirehoseNormalizesAccountAndSyncFrames(t *testing.T
 	require.NotEmpty(t, rows[1].Rev)
 	require.NotZero(t, rows[1].PayloadLen)
 	require.NotEmpty(t, rows[1].PayloadSHA256_64)
+	require.Equal(t, uint64(2), rows[2].Seq)
+	require.Equal(t, "create", rows[2].Kind)
+	require.Equal(t, rows[1].DID, rows[2].DID)
+	require.NotEmpty(t, rows[2].Collection)
+	require.NotEmpty(t, rows[2].Rkey)
+	require.Equal(t, rows[1].Rev, rows[2].Rev)
+	require.NotZero(t, rows[2].PayloadLen)
 }
 
 func TestExpectedEventLogFromFirehoseHonorsCursorAndLimit(t *testing.T) {
@@ -72,8 +79,10 @@ func TestExpectedEventLogFromFirehoseHonorsCursorAndLimit(t *testing.T) {
 
 	rows, err := ExpectedEventLogFromFirehose(w, 1, 1)
 	require.NoError(t, err)
-	require.Len(t, rows, 1)
-	require.Equal(t, uint64(2), rows[0].Seq)
+	require.NotEmpty(t, rows)
+	for _, row := range rows {
+		require.Equal(t, uint64(2), row.Seq)
+	}
 	require.Equal(t, "sync", rows[0].Kind)
 }
 

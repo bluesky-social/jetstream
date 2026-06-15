@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
+	"sync"
 
 	"github.com/bluesky-social/jetstream-v2/segment"
 )
@@ -18,6 +20,48 @@ type EventLogRow struct {
 	PayloadLen       int    `json:"payload_len,omitempty"`
 	PayloadSHA256_64 string `json:"payload_sha256_64,omitempty"`
 	AccountDeleted   bool   `json:"account_deleted,omitempty"`
+}
+
+type eventLogRecorder struct {
+	mu     sync.Mutex
+	events []segment.Event
+}
+
+func newEventLogRecorder() *eventLogRecorder {
+	return &eventLogRecorder{}
+}
+
+func (r *eventLogRecorder) Observe(ev *segment.Event) {
+	if r == nil || ev == nil {
+		return
+	}
+	r.mu.Lock()
+	r.events = append(r.events, cloneSegmentEvent(*ev))
+	r.mu.Unlock()
+}
+
+func (r *eventLogRecorder) RowsByUpstreamCursor(after, through int64) []EventLogRow {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	events := append([]segment.Event(nil), r.events...)
+	r.mu.Unlock()
+
+	var observed []ObservedEvent
+	for _, ev := range events {
+		if ev.UpstreamRelayCursor <= after || ev.UpstreamRelayCursor > through {
+			continue
+		}
+		ev.Seq = uint64(ev.UpstreamRelayCursor)
+		observed = append(observed, observedEventFromSegment(ev))
+	}
+	return NormalizeEventLog(observed)
+}
+
+func cloneSegmentEvent(ev segment.Event) segment.Event {
+	ev.Payload = append([]byte(nil), ev.Payload...)
+	return ev
 }
 
 func NormalizeEventLog(events []ObservedEvent) []EventLogRow {
@@ -73,6 +117,12 @@ func CompareEventLogs(want, got []EventLogRow) error {
 	return nil
 }
 
+func CompareEventLogMultiset(want, got []EventLogRow) error {
+	wantSorted := eventLogRowsSorted(want)
+	gotSorted := eventLogRowsSorted(got)
+	return CompareEventLogs(wantSorted, gotSorted)
+}
+
 func CompareEventLogsCompacted(want, got []EventLogRow, watermark uint64) error {
 	return CompareEventLogs(filterCompactedExpectedRows(want, watermark), got)
 }
@@ -125,6 +175,62 @@ func eventLogContains(rows []EventLogRow, target EventLogRow) bool {
 		}
 	}
 	return false
+}
+
+func eventLogRowsSorted(rows []EventLogRow) []EventLogRow {
+	out := append([]EventLogRow(nil), rows...)
+	slices.SortFunc(out, compareEventLogRows)
+	return out
+}
+
+func compareEventLogRows(a, b EventLogRow) int {
+	if a.Seq != b.Seq {
+		return compareOrdered(a.Seq, b.Seq)
+	}
+	if a.Kind != b.Kind {
+		return compareOrdered(a.Kind, b.Kind)
+	}
+	if a.DID != b.DID {
+		return compareOrdered(a.DID, b.DID)
+	}
+	if a.Collection != b.Collection {
+		return compareOrdered(a.Collection, b.Collection)
+	}
+	if a.Rkey != b.Rkey {
+		return compareOrdered(a.Rkey, b.Rkey)
+	}
+	if a.Rev != b.Rev {
+		return compareOrdered(a.Rev, b.Rev)
+	}
+	if a.PayloadLen != b.PayloadLen {
+		return compareOrdered(a.PayloadLen, b.PayloadLen)
+	}
+	if a.PayloadSHA256_64 != b.PayloadSHA256_64 {
+		return compareOrdered(a.PayloadSHA256_64, b.PayloadSHA256_64)
+	}
+	return compareBool(a.AccountDeleted, b.AccountDeleted)
+}
+
+func compareOrdered[T ~int | ~uint64 | ~string](a, b T) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareBool(a, b bool) int {
+	switch {
+	case !a && b:
+		return -1
+	case a && !b:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func eventLogMismatchFields(want, got EventLogRow) string {

@@ -97,6 +97,8 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	steadyAck := newSeqAck()
 	asyncResyncAck := newSyncTombstoneAck()
 	compaction := newCompactionPassRecorder()
+	bootstrapEventLog := newEventLogRecorder()
+	steadyEventLog := newEventLogRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
 	emittedBootstrapAccountDelete := false
 	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, func(ctx context.Context) (int64, error) {
@@ -163,11 +165,13 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		},
 		OnBootstrapLiveEvent: func(ev *segment.Event) {
 			bootstrapAck.Observe(ev)
+			bootstrapEventLog.Observe(ev)
 			recordTraceOrError(t, trace, "bootstrap_live_event", traceSegmentEvent(ev))
 		},
 		OnSteadyStateEvent: func(ev *segment.Event) {
 			steadyAck.Observe(ev)
 			asyncResyncAck.Observe(ev)
+			steadyEventLog.Observe(ev)
 			recordTraceOrError(t, trace, "steady_state_event", traceSegmentEvent(ev))
 		},
 		AfterRepoComplete: func(ctx context.Context, did atmos.DID) error {
@@ -212,6 +216,8 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "barrier_reached"})
 	recordGetRepoFaults(t, trace, "after-bootstrap", faultPlan)
 	assertFaultPlanFired(t, cfg, faultPlan)
+	bootstrapTargetSeq := w.CurrentSeq()
+	assertFirehoseEventLogMatches(t, trace, w, bootstrapEventLog, 0, bootstrapTargetSeq, "after-bootstrap")
 	assertBootstrapOracleMatches(t, dataDir, w, cfg)
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "release"})
 	afterBootstrap.Release()
@@ -232,6 +238,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	_ = collectSubscribeReplay(t, cfg, run, trace, publicURL, 0, afterMergeCompaction.Watermark)
 	passesBeforeSteady := compaction.Count()
 
+	steadyStartSeq := w.CurrentSeq()
 	generateN(t, w, cfg.LiveEventsSteady)
 	syncIdx := pickActiveOracleAccount(t, w, cfg)
 	_, err = w.GenerateSilentMutationThenSyncForTest(t.Context(), syncIdx)
@@ -239,6 +246,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	targetSeq := w.CurrentSeq()
 	recordTraceOrError(t, trace, "steady_target", map[string]any{"target_seq": targetSeq})
 	steadyAck.Wait(t, cfg, targetSeq, run, 30*time.Second)
+	assertFirehoseEventLogMatches(t, trace, w, steadyEventLog, steadyStartSeq, targetSeq, "steady-state")
 
 	asyncIdx := pickActiveOracleAccount(t, w, cfg)
 	_, err = w.GenerateSilentMutationThenCommitForTest(t.Context(), asyncIdx)
@@ -284,6 +292,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"compaction_pass",
 		"backfill_repo_complete",
 		"faults_fired",
+		"event_log_compare",
 		"bootstrap_live_event",
 		"steady_state_event",
 		"subscribe_replay_start",
@@ -366,6 +375,35 @@ func recordSubscribeReposFaults(t *testing.T, trace *Trace, phase string, plan *
 		"subscribe_repos_connections":                connections,
 		"subscribe_repos_disconnects":                disconnects,
 	})
+}
+
+func assertFirehoseEventLogMatches(
+	t *testing.T,
+	trace *Trace,
+	w *world.World,
+	observed *eventLogRecorder,
+	cursor int64,
+	target int64,
+	phase string,
+) {
+	t.Helper()
+
+	limit := int(target - cursor)
+	require.Positivef(t, limit, "%s expected positive firehose comparison range cursor=%d target=%d", phase, cursor, target)
+	want, err := ExpectedEventLogFromFirehose(w, cursor, limit)
+	require.NoErrorf(t, err, "%s: build expected event log cursor=%d target=%d", phase, cursor, target)
+	got := observed.RowsByUpstreamCursor(cursor, target)
+	err = CompareEventLogMultiset(want, got)
+	recordTraceOrError(t, trace, "event_log_compare", map[string]any{
+		"phase":          phase,
+		"cursor":         cursor,
+		"target_seq":     target,
+		"expected_count": len(want),
+		"observed_count": len(got),
+		"err":            traceErr(err),
+	})
+	require.NoErrorf(t, err, "%s: compare firehose event log cursor=%d target=%d expected=%d observed=%d",
+		phase, cursor, target, len(want), len(got))
 }
 
 func totalGetRepoHTTPFailuresFired(plan *SwarmFaultPlan) int {

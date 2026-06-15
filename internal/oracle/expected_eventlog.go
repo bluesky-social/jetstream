@@ -2,6 +2,7 @@ package oracle
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
 	"github.com/bluesky-social/jetstream-v2/segment"
@@ -18,7 +19,7 @@ func ExpectedEventLogFromFirehose(w *world.World, cursor int64, limit int) ([]Ev
 
 	var out []EventLogRow
 	for _, frame := range frames {
-		rows, err := expectedEventLogRowsFromFrame(frame)
+		rows, err := expectedEventLogRowsFromFrame(w, frame)
 		if err != nil {
 			return nil, err
 		}
@@ -27,13 +28,13 @@ func ExpectedEventLogFromFirehose(w *world.World, cursor int64, limit int) ([]Ev
 	return out, nil
 }
 
-func expectedEventLogRowsFromFrame(frame []byte) ([]EventLogRow, error) {
+func expectedEventLogRowsFromFrame(w *world.World, frame []byte) ([]EventLogRow, error) {
 	evt, err := decodeOracleFirehoseFrame(frame)
 	if err != nil {
 		return nil, err
 	}
 
-	segEvents, err := expectedSegmentEventsFromFirehoseEvent(evt)
+	segEvents, err := expectedSegmentEventsFromFirehoseEvent(w, evt)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +44,7 @@ func expectedEventLogRowsFromFrame(frame []byte) ([]EventLogRow, error) {
 	return NormalizeEventLog(observedEventsFromSegments(segEvents)), nil
 }
 
-func expectedSegmentEventsFromFirehoseEvent(evt streaming.Event) ([]segment.Event, error) {
+func expectedSegmentEventsFromFirehoseEvent(w *world.World, evt streaming.Event) ([]segment.Event, error) {
 	switch {
 	case evt.Commit != nil:
 		out := make([]segment.Event, 0, len(evt.Commit.Ops))
@@ -79,7 +80,12 @@ func expectedSegmentEventsFromFirehoseEvent(evt streaming.Event) ([]segment.Even
 		if err != nil {
 			return nil, fmt.Errorf("oracle: marshal expected sync seq=%d did=%s: %w", evt.Sync.Seq, evt.Sync.DID, err)
 		}
-		return []segment.Event{{Kind: segment.KindSync, DID: evt.Sync.DID, Rev: evt.Sync.Rev, Payload: payload}}, nil
+		out := []segment.Event{{Kind: segment.KindSync, DID: evt.Sync.DID, Rev: evt.Sync.Rev, Payload: payload}}
+		replacements, err := expectedSyncReplacementRows(w, evt.Sync.DID, evt.Sync.Rev)
+		if err != nil {
+			return nil, err
+		}
+		return append(out, replacements...), nil
 	case evt.Identity != nil:
 		payload, err := evt.Identity.MarshalCBOR()
 		if err != nil {
@@ -97,6 +103,50 @@ func expectedSegmentEventsFromFirehoseEvent(evt streaming.Event) ([]segment.Even
 	default:
 		return nil, fmt.Errorf("oracle: unknown expected firehose event")
 	}
+}
+
+func expectedSyncReplacementRows(w *world.World, did, rev string) ([]segment.Event, error) {
+	for idx := range w.AccountCount() {
+		acct, err := w.LoadAccount(idx)
+		if err != nil {
+			return nil, err
+		}
+		if string(acct.DID) != did {
+			continue
+		}
+		rp, _, err := w.LoadRepo(idx)
+		if err != nil {
+			return nil, err
+		}
+		snap, err := snapshotRepo(did, rp)
+		if err != nil {
+			return nil, err
+		}
+		keys := make([]RecordKey, 0, len(snap.Records))
+		for key := range snap.Records {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].Collection != keys[j].Collection {
+				return keys[i].Collection < keys[j].Collection
+			}
+			return keys[i].Rkey < keys[j].Rkey
+		})
+		out := make([]segment.Event, 0, len(keys))
+		for _, key := range keys {
+			value := snap.Records[key]
+			out = append(out, segment.Event{
+				Kind:       segment.KindCreate,
+				DID:        did,
+				Collection: key.Collection,
+				Rkey:       key.Rkey,
+				Rev:        rev,
+				Payload:    append([]byte(nil), value.Payload...),
+			})
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("oracle: sync frame did %s not found in simulator world", did)
 }
 
 func expectedActionKind(action streaming.Action) (segment.Kind, error) {
