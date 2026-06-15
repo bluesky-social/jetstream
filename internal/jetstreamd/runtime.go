@@ -270,6 +270,12 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		coldRd.InvalidateSegment(idx)
 		return nil
 	}
+	var onCompactionPass func(orchestrator.CompactionPassResult)
+	if opts.OnCompactionPass != nil {
+		onCompactionPass = func(result orchestrator.CompactionPassResult) {
+			opts.OnCompactionPass(compactionPassResultFromOrchestrator(result))
+		}
+	}
 	orch, err := orchestrator.New(orchestrator.Config{
 		DataDir:        opts.DataDir,
 		Store:          metaStore,
@@ -301,15 +307,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CompactionInterval:       opts.CompactionInterval,
 		CompactionTombstoneCap:   opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers: opts.CompactionRewriteWorkers,
-		OnCompactionPass: func(result orchestrator.CompactionPassResult) {
-			if opts.OnCompactionPass != nil {
-				opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
-			}
-		},
-		BarrierAfterBootstrap: phaseBarrier(opts.BarrierAfterBootstrap),
-		BarrierAfterMerge:     phaseBarrier(opts.BarrierAfterMerge),
-		AfterRepoComplete:     opts.AfterRepoComplete,
-		CrashInjector:         opts.CrashInjector,
+		OnCompactionPass:         onCompactionPass,
+		BarrierAfterBootstrap:    phaseBarrier(opts.BarrierAfterBootstrap),
+		BarrierAfterMerge:        phaseBarrier(opts.BarrierAfterMerge),
+		AfterRepoComplete:        opts.AfterRepoComplete,
+		CrashInjector:            opts.CrashInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			writerPtr.Store(w)
 		},
@@ -506,6 +508,40 @@ func (r *Runtime) cancelManifestLoad() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+func compactionPassResultFromOrchestrator(result orchestrator.CompactionPassResult) CompactionPassResult {
+	out := CompactionPassResult{
+		Watermark: result.Watermark,
+		Chunks:    make([]CompactionChunkResult, 0, len(result.Chunks)),
+		Err:       result.Err,
+	}
+	for _, chunk := range result.Chunks {
+		dst := CompactionChunkResult{
+			StartWatermark:   chunk.StartWatermark,
+			TargetWatermark:  chunk.TargetWatermark,
+			ChunkEnd:         chunk.ChunkEnd,
+			RecordTombstones: make([]CompactionRecordTombstone, 0, len(chunk.RecordTombstones)),
+			DIDTombstones:    make([]CompactionDIDTombstone, 0, len(chunk.DIDTombstones)),
+		}
+		for _, ts := range chunk.RecordTombstones {
+			dst.RecordTombstones = append(dst.RecordTombstones, CompactionRecordTombstone{
+				DID:        ts.DID,
+				Collection: ts.Collection,
+				Rkey:       ts.Rkey,
+				Seq:        ts.Seq,
+			})
+		}
+		for _, ts := range chunk.DIDTombstones {
+			dst.DIDTombstones = append(dst.DIDTombstones, CompactionDIDTombstone{
+				DID:    ts.DID,
+				Seq:    ts.Seq,
+				Reason: ts.Reason,
+			})
+		}
+		out.Chunks = append(out.Chunks, dst)
+	}
+	return out
 }
 
 func phaseBarrier(barrier PhaseBarrier) orchestrator.PhaseBarrier {

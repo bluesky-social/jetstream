@@ -27,7 +27,29 @@ type PhaseBarrier func(context.Context) error
 
 type CompactionPassResult struct {
 	Watermark uint64
+	Chunks    []CompactionChunkResult
 	Err       error
+}
+
+type CompactionChunkResult struct {
+	StartWatermark   uint64
+	TargetWatermark  uint64
+	ChunkEnd         uint64
+	RecordTombstones []CompactionRecordTombstone
+	DIDTombstones    []CompactionDIDTombstone
+}
+
+type CompactionRecordTombstone struct {
+	DID        string
+	Collection string
+	Rkey       string
+	Seq        uint64
+}
+
+type CompactionDIDTombstone struct {
+	DID    string
+	Seq    uint64
+	Reason string
 }
 
 // Config controls Orchestrator behavior. cmd/jetstream constructs
