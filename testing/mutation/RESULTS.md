@@ -5,6 +5,23 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
+## Targeted follow-up 2026-06-15
+
+- commit under test: branch `testing-revamp` after
+  `oracle: reclassify stale mutation expectations`
+- driver: targeted `just mutation-campaign m018`, `m010`, and `m007`
+- scope: Phase 1 of the oracle robustness roadmap
+
+| mutant | result | disposition |
+|---|---|---|
+| m018_commit_rev_dropped | KILLED@default | Fixed by rejecting empty `Rev` on commit-kind observed events. |
+| m010_nextblockoffset_reset | SURVIVED | Reclassified stale/dead for sealed oracle observations. `Writer.Seal` rebuilds footer block metadata by walking physical frames, so the mutated `Writer.nextBlockOffset` only corrupts active `Writer.Blocks()` metadata; existing segment tests already cover that active API. |
+| m007_compaction_chunk_boundary | SURVIVED | Reclassified invalid/dead under current compaction chunk construction. A row at `seq == chunkEnd` can only be dropped if the same chunk snapshot contains a tombstone with `seq > chunkEnd`; merge and steady chunk snapshots are both bounded to `<= chunkEnd`, and later chunks still rewrite older rows. |
+
+The original campaign remains below as historical data. These follow-up
+results correct two stale mutant interpretations rather than counting them as
+oracle assertion work.
+
 ## Campaign 2026-06-15
 
 - commit: `75d9251` (branch `mutation-campaign`)

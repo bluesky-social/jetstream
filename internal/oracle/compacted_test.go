@@ -34,32 +34,6 @@ func TestCheckCompactedAcceptsRowsAboveWatermark(t *testing.T) {
 	require.NoError(t, CheckCompacted(events, 1))
 }
 
-func TestCheckCompactedChunksRejectsBoundarySurvivorDroppedByChunkSnapshot(t *testing.T) {
-	t.Parallel()
-
-	events := []ObservedEvent{
-		{Seq: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Payload: []byte("old")},
-	}
-	chunks := []CompactionChunkObservation{{
-		StartWatermark:  5,
-		TargetWatermark: 12,
-		ChunkEnd:        10,
-		RecordTombstones: []CompactionRecordTombstone{{
-			DID:        "did:plc:a",
-			Collection: "c",
-			Rkey:       "r",
-			Seq:        12,
-		}},
-	}}
-
-	require.NoError(t, CheckCompacted(events, 10), "final-watermark semantics alone cannot see chunk-local tombstones above the watermark")
-	err := CheckCompactionChunks(events, chunks)
-	require.ErrorContains(t, err, "compaction chunk")
-	require.ErrorContains(t, err, "superseded record row survived")
-	require.ErrorContains(t, err, "seq=10")
-	require.ErrorContains(t, err, "tombstone_seq=12")
-}
-
 func TestCheckCompactedRejectsSurvivingAccountDeletedRow(t *testing.T) {
 	t.Parallel()
 

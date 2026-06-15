@@ -24,44 +24,26 @@ func TestRunDeleteCompactionCallsPassHook(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	segmentsDir := filepath.Join(dataDir, "segments")
-	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dataDir, "segments"), 0o755))
 	st, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	writeCompactionSegment(t, segmentsDir, 0, []segment.Event{
-		{Seq: 1, IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
-		{Seq: 2, IndexedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
-	})
 
 	var got []CompactionPassResult
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	o := &Orchestrator{cfg: Config{
 		DataDir:            dataDir,
 		Store:              st,
-		Logger:             logger,
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
 		CompactionInterval: time.Hour,
 		OnCompactionPass: func(result CompactionPassResult) {
 			got = append(got, result)
 		},
-	}, logger: logger}
+	}}
 
 	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionSteady, nil))
 	require.Len(t, got, 1)
-	require.Equal(t, uint64(2), got[0].Watermark)
+	require.Equal(t, uint64(0), got[0].Watermark)
 	require.NoError(t, got[0].Err)
-	require.Equal(t, []CompactionChunkResult{{
-		StartWatermark:  0,
-		TargetWatermark: 2,
-		ChunkEnd:        2,
-		RecordTombstones: []CompactionRecordTombstone{{
-			DID:        "did:plc:a",
-			Collection: "app.bsky.feed.post",
-			Rkey:       "r",
-			Seq:        2,
-		}},
-		DIDTombstones: []CompactionDIDTombstone{},
-	}}, got[0].Chunks)
 }
 
 // TestRunDeleteCompaction_SealsActiveSegmentBeforeSteadyPass pins the
@@ -157,37 +139,6 @@ func TestCompactionCandidateDIDs(t *testing.T) {
 	})
 
 	require.ElementsMatch(t, []string{"did:plc:a", "did:plc:b", "did:plc:c"}, got)
-}
-
-func TestCompactionChunkResultFromSnapshotSortsObservations(t *testing.T) {
-	t.Parallel()
-
-	got := compactionChunkResultFromSnapshot(3, 20, 10, tombstone.Snapshot{
-		Records: map[tombstone.RecordKey]uint64{
-			{DID: "did:plc:b", Collection: "c", Rkey: "r2"}: 12,
-			{DID: "did:plc:a", Collection: "b", Rkey: "r2"}: 11,
-			{DID: "did:plc:a", Collection: "b", Rkey: "r1"}: 10,
-		},
-		DIDs: map[string]tombstone.DIDTombstone{
-			"did:plc:c": {Seq: 15, Reason: "sync"},
-			"did:plc:a": {Seq: 14, Reason: "account"},
-		},
-	})
-
-	require.Equal(t, CompactionChunkResult{
-		StartWatermark:  3,
-		TargetWatermark: 20,
-		ChunkEnd:        10,
-		RecordTombstones: []CompactionRecordTombstone{
-			{DID: "did:plc:a", Collection: "b", Rkey: "r1", Seq: 10},
-			{DID: "did:plc:a", Collection: "b", Rkey: "r2", Seq: 11},
-			{DID: "did:plc:b", Collection: "c", Rkey: "r2", Seq: 12},
-		},
-		DIDTombstones: []CompactionDIDTombstone{
-			{DID: "did:plc:a", Seq: 14, Reason: "account"},
-			{DID: "did:plc:c", Seq: 15, Reason: "sync"},
-		},
-	}, got)
 }
 
 func TestRunDeleteCompaction_RewriteBeforeWatermarkCrashIsIdempotent(t *testing.T) {

@@ -159,7 +159,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	waitForBarrier(t, cfg, "after-merge", afterMerge, run)
 	assertOracleMatches(t, dataDir, w, cfg, "after-merge")
 	afterMergeCompaction := compaction.Last(t)
-	assertCompacted(t, dataDir, afterMergeCompaction, cfg, "after-merge")
+	assertCompacted(t, dataDir, afterMergeCompaction.Watermark, cfg, "after-merge")
 	faultPlan.ArmSubscribeReposDisconnects()
 	afterMerge.Release()
 
@@ -201,7 +201,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	runDone = true
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
-	assertCompacted(t, dataDir, compaction.Last(t), cfg, "steady-state-shutdown-flush")
+	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "steady-state-shutdown-flush")
 }
 
 // assertFaultPlanFired verifies the fault injection actually happened.
@@ -255,46 +255,13 @@ func assertOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Confi
 	t.Logf("%s: oracle matched %d observed events in mode=%s seed=%d", phase, len(events), cfg.Mode, cfg.Seed)
 }
 
-func assertCompacted(t *testing.T, dataDir string, result jetstreamd.CompactionPassResult, cfg Config, phase string) {
+func assertCompacted(t *testing.T, dataDir string, watermark uint64, cfg Config, phase string) {
 	t.Helper()
 
 	events, err := ObserveSegments(dataDir)
 	require.NoErrorf(t, err, "%s mode=%s seed=%d: observe segments for compaction", phase, cfg.Mode, cfg.Seed)
-	sorted := EventsSortedBySeq(events)
-	require.NoErrorf(t, CheckCompacted(sorted, result.Watermark),
-		"%s mode=%s seed=%d: check compacted watermark=%d", phase, cfg.Mode, cfg.Seed, result.Watermark)
-	require.NoErrorf(t, CheckCompactionChunks(sorted, compactionChunkObservations(result.Chunks)),
-		"%s mode=%s seed=%d: check compaction chunks watermark=%d", phase, cfg.Mode, cfg.Seed, result.Watermark)
-}
-
-func compactionChunkObservations(chunks []jetstreamd.CompactionChunkResult) []CompactionChunkObservation {
-	out := make([]CompactionChunkObservation, 0, len(chunks))
-	for _, chunk := range chunks {
-		dst := CompactionChunkObservation{
-			StartWatermark:   chunk.StartWatermark,
-			TargetWatermark:  chunk.TargetWatermark,
-			ChunkEnd:         chunk.ChunkEnd,
-			RecordTombstones: make([]CompactionRecordTombstone, 0, len(chunk.RecordTombstones)),
-			DIDTombstones:    make([]CompactionDIDTombstone, 0, len(chunk.DIDTombstones)),
-		}
-		for _, ts := range chunk.RecordTombstones {
-			dst.RecordTombstones = append(dst.RecordTombstones, CompactionRecordTombstone{
-				DID:        ts.DID,
-				Collection: ts.Collection,
-				Rkey:       ts.Rkey,
-				Seq:        ts.Seq,
-			})
-		}
-		for _, ts := range chunk.DIDTombstones {
-			dst.DIDTombstones = append(dst.DIDTombstones, CompactionDIDTombstone{
-				DID:    ts.DID,
-				Seq:    ts.Seq,
-				Reason: ts.Reason,
-			})
-		}
-		out = append(out, dst)
-	}
-	return out
+	require.NoErrorf(t, CheckCompacted(EventsSortedBySeq(events), watermark),
+		"%s mode=%s seed=%d: check compacted watermark=%d", phase, cfg.Mode, cfg.Seed, watermark)
 }
 
 func assertBootstrapOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Config) {

@@ -66,11 +66,10 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 
 	start := time.Now()
 	var finalWatermark uint64
-	var chunks []CompactionChunkResult
 	defer func() {
 		o.cfg.Metrics.observeCompactionPass(start, retErr)
 		if o.cfg.OnCompactionPass != nil {
-			o.cfg.OnCompactionPass(CompactionPassResult{Watermark: finalWatermark, Chunks: chunks, Err: retErr})
+			o.cfg.OnCompactionPass(CompactionPassResult{Watermark: finalWatermark, Err: retErr})
 		}
 	}()
 
@@ -161,9 +160,6 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 
 			if err := saveCompactionWatermark(o.cfg.Store, chunkEnd); err != nil {
 				return err
-			}
-			if o.cfg.OnCompactionPass != nil {
-				chunks = append(chunks, compactionChunkResultFromSnapshot(current, targetWatermark, chunkEnd, snap))
 			}
 			o.cfg.Metrics.setCompactionWatermark(chunkEnd)
 			finalWatermark = chunkEnd
@@ -422,55 +418,6 @@ func compactionCandidateDIDs(snap tombstone.Snapshot) []string {
 		dids = append(dids, did)
 	}
 	return dids
-}
-
-func compactionChunkResultFromSnapshot(startWatermark, targetWatermark, chunkEnd uint64, snap tombstone.Snapshot) CompactionChunkResult {
-	out := CompactionChunkResult{
-		StartWatermark:   startWatermark,
-		TargetWatermark:  targetWatermark,
-		ChunkEnd:         chunkEnd,
-		RecordTombstones: make([]CompactionRecordTombstone, 0, len(snap.Records)),
-		DIDTombstones:    make([]CompactionDIDTombstone, 0, len(snap.DIDs)),
-	}
-	for key, seq := range snap.Records {
-		out.RecordTombstones = append(out.RecordTombstones, CompactionRecordTombstone{
-			DID:        key.DID,
-			Collection: key.Collection,
-			Rkey:       key.Rkey,
-			Seq:        seq,
-		})
-	}
-	sort.Slice(out.RecordTombstones, func(i, j int) bool {
-		a, b := out.RecordTombstones[i], out.RecordTombstones[j]
-		if a.DID != b.DID {
-			return a.DID < b.DID
-		}
-		if a.Collection != b.Collection {
-			return a.Collection < b.Collection
-		}
-		if a.Rkey != b.Rkey {
-			return a.Rkey < b.Rkey
-		}
-		return a.Seq < b.Seq
-	})
-	for did, ts := range snap.DIDs {
-		out.DIDTombstones = append(out.DIDTombstones, CompactionDIDTombstone{
-			DID:    did,
-			Seq:    ts.Seq,
-			Reason: ts.Reason,
-		})
-	}
-	sort.Slice(out.DIDTombstones, func(i, j int) bool {
-		a, b := out.DIDTombstones[i], out.DIDTombstones[j]
-		if a.DID != b.DID {
-			return a.DID < b.DID
-		}
-		if a.Reason != b.Reason {
-			return a.Reason < b.Reason
-		}
-		return a.Seq < b.Seq
-	})
-	return out
 }
 
 func defaultCompactionRewriteWorkers() int {

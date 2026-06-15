@@ -132,10 +132,11 @@ These are not determinism problems. They are missing assertions.
 Fix the known mutation escapes that require no new runtime infrastructure:
 
 - Reject empty `Rev` on create/update/delete events.
-- Check recorded segment block offsets, not only block decode-by-index.
-- Strengthen compaction boundary assertions so rows at exactly the boundary are
-  evaluated.
-- Add tests proving each checker rejects the corresponding corrupt shape.
+- Check sealed segment block metadata invariants before trusting decoded
+  contents.
+- Reclassify stale/invalid mutants when code inspection proves the predicted
+  corrupt shape cannot affect the oracle path.
+- Add tests proving each real checker rejects the corresponding corrupt shape.
 
 ### Lightweight Implementation Guidance
 
@@ -143,9 +144,13 @@ Fix the known mutation escapes that require no new runtime infrastructure:
   The invariant checker is already the canonical physical-stream gate.
 - Add a small sealed-segment structural checker used by `ObserveSegments`.
   It should verify block offsets are monotonic, in range, and consistent with
-  block sizes where available.
-- Add a focused `CheckCompacted` test case where the superseding event lands at
-  exactly the committed watermark/chunk boundary.
+  block ranges where available. `m010_nextblockoffset_reset` is stale for
+  sealed output because `Writer.Seal` rebuilds footer metadata by walking
+  physical frames; preserve that analysis in `testing/mutation/RESULTS.md`.
+- Do not add chunk-boundary assertions for `m007_compaction_chunk_boundary`
+  unless production chunk construction changes. Under the current compactor,
+  snapshots are bounded to `<= chunkEnd`, so a row at exactly `chunkEnd` cannot
+  be droppable by that same chunk snapshot.
 - Keep diagnostics specific: include seq, file, block index, DID, collection,
   rkey, and phase where possible.
 
@@ -153,7 +158,8 @@ Fix the known mutation escapes that require no new runtime infrastructure:
 
 - Unit tests under `internal/oracle`.
 - Re-run the relevant mutation mutants:
-  `m018`, `m010`, and `m007`.
+  `m018`, `m010`, and `m007`, with stale/invalid survivors documented in
+  `testing/mutation/RESULTS.md`.
 - Run `just test ./internal/oracle`.
 
 ## Workstream 2: Add Canonical Oracle Traces
