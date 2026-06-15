@@ -112,9 +112,23 @@
 // is then accepted but resolves to the live tip rather than 400-ing, so
 // v1 clients that always send a cursor still connect.
 //
-// RFC 7692 permessage-deflate compression is negotiated when the client
-// offers it (handler.go). The v1 zstd-with-custom-dictionary scheme
-// (?compress=true / Socket-Encoding: zstd) is NOT supported and is
-// rejected with a 400 so a v1 client fails loudly rather than receiving
-// uncompressed frames it can't decode.
+// Two compression schemes are offered, and a client may use at most one:
+//
+//   - RFC 7692 permessage-deflate (PREFERRED) is negotiated transparently
+//     when the client offers it via Sec-WebSocket-Extensions (handler.go).
+//     This is the recommended path: no out-of-band dictionary, standard
+//     browser support, transparent on the read path.
+//
+//   - The v1 custom-zstd-dictionary scheme (?compress=true or
+//     Socket-Encoding: zstd) is supported only for backwards compatibility
+//     with v1 clients and is NOT preferred. Opted-in connections receive
+//     binary websocket frames, each a zstd frame compressed with the v1
+//     custom dictionary (dict ID 1612007021, embedded in compress.go). A
+//     client decodes with zstd.NewReader(nil, WithDecoderDicts(dict)).
+//
+// Offering BOTH at once (zstd opt-in plus a permessage-deflate extension
+// offer) is rejected with a 400: the two would double-compress, so the
+// client must pick one. zstd clients have permessage-deflate disabled on
+// the connection; the maxMessageSizeBytes cap is enforced on the
+// uncompressed JSON length for all clients.
 package subscribe

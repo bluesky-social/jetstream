@@ -21,6 +21,14 @@ type Entry struct {
 	extendedBody []byte
 	extendedErr  error
 
+	compressedOnce sync.Once
+	compressedBody []byte
+	compressedErr  error
+
+	compressedExtendedOnce sync.Once
+	compressedExtendedBody []byte
+	compressedExtendedErr  error
+
 	// encodeFn defaults to Encode; overridable in tests.
 	encodeFn func(*segment.Event) ([]byte, error)
 
@@ -61,10 +69,44 @@ func (e *Entry) EncodedExtended() ([]byte, error) {
 	return e.extendedBody, e.extendedErr
 }
 
+// Compressed returns the memoized v1-shape JSON encoding compressed as a
+// single zstd frame with the custom dictionary. It derives from Encoded
+// (so the JSON encode is never duplicated) and runs the compression at
+// most once per Entry, shared across every caught-up zstd subscriber. The
+// error contract matches Encoded: errSkipEvent (advance, don't send) or an
+// encode error (skip + log) is returned unchanged.
+func (e *Entry) Compressed() ([]byte, error) {
+	e.compressedOnce.Do(func() {
+		body, err := e.Encoded()
+		if err != nil {
+			e.compressedErr = err
+			return
+		}
+		e.compressedBody = compressFrame(body)
+	})
+	return e.compressedBody, e.compressedErr
+}
+
+// CompressedExtended is Compressed for the extended (v2) wire shape.
+func (e *Entry) CompressedExtended() ([]byte, error) {
+	e.compressedExtendedOnce.Do(func() {
+		body, err := e.EncodedExtended()
+		if err != nil {
+			e.compressedExtendedErr = err
+			return
+		}
+		e.compressedExtendedBody = compressFrame(body)
+	})
+	return e.compressedExtendedBody, e.compressedExtendedErr
+}
+
 // approxBytes estimates the entry's memory footprint for the hot ring's
 // byte budget: the payload plus the small fixed-size string fields. The
-// memoized encoding is intentionally excluded — it is bounded by the same
-// ring and counting it would double-count the shared bytes.
+// memoized encodings are intentionally excluded — they are bounded by the
+// same ring (evicted FIFO with the entry) and counting them would
+// double-count the shared bytes. An entry may memoize up to four payloads
+// (simple/extended JSON × plain/zstd) when a mix of subscriber types is
+// connected; the off-budget overhang stays O(ring length).
 func (e *Entry) approxBytes() int {
 	ev := e.Event
 	return len(ev.Payload) + len(ev.DID) + len(ev.Collection) +
