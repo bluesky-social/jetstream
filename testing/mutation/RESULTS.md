@@ -153,3 +153,54 @@ m015/m016 read-path indexes), and one operational signal — **m002's flaky
 detection justifies the multi-seed nightly sweep**. The over-fitting worry was
 warranted in specific, now-documented places; it was not warranted as a
 blanket claim about the oracle.
+
+## Campaign 2026-06-15 (getTombstones overlay)
+
+- commit: `bb135af` (branch `feat/gettombstones-overlay`)
+- default seed: the driver's default tier seed; the one survivor was swept
+  with 3 random seeds (see below)
+- catalog: 4 new mutants — overlay encoder 3 (m019–m021), tombstone 1 (m022)
+- target test: `TestOracle_DefaultLifecycle`, which now runs
+  `assertOverlayReconstruction` (segments(<=W) + overlay((W,M]) +
+  live((M,inf)) reconstruction must equal ground truth) alongside the
+  existing compacted/oracle checks
+- driver: `just mutation-campaign mNNN`; all four are `tiers: default`
+
+### Scorecard
+
+| mutant | subsystem | expected | actual | note |
+|---|---|---|---|---|
+| m019_overlay_drop_record_tombstones | overlay | default | KILLED@default | record-tombstone group count forced to 0 → deleted record in (W,M] emitted; `emitted a record that ground truth deleted` |
+| m020_overlay_drop_did_tombstones | overlay | default | SURVIVED(3 seeds) | dead path in this scenario — overlay carries **zero** DID tombstones (W=1672 M=1686 overlay.DIDs=0); sync/account-delete land at/below W and are compacted away |
+| m021_overlay_record_seq_base_zero | overlay | default | KILLED@default | record seq delta encoded against base 0 not W; decoder re-adds W, inflating tombstone seqs above live records → `failed to emit a live record` |
+| m022_shoulddrop_did_seq_inverted | tombstone | default | KILLED@default | `>`→`<` in ShouldDrop DID branch; caught by the compacted oracle and/or reconstruction |
+
+Summary: **3 killed, 1 survived.** The three kills confirm the new
+reconstruction assertion has real detection power on the overlay's
+record-tombstone section (m019 drop, m021 seq-base) and on the shared
+ShouldDrop suppression logic (m022). The single survival (m020) is a
+documented dead-path artifact, not a weakness in the test.
+
+### Escapes — analysis and disposition
+
+**m020 — overlay DID-tombstone section is empty in this scenario (dead path;
+not seed-sensitive).** The reconstruction's combined suppression set is
+`overlay((W,M]) ∪ live((M,inf))`. For dropping the overlay's DID-tombstone
+section to matter, a sync or account-delete tombstone must fall *inside* the
+overlay window (W,M]. It does not: instrumenting `assertOverlayReconstruction`
+showed `W=1672 M=1686 overlay.DIDs=0 overlay.Records=6` — the overlay window
+is a thin 14-seq band carrying only six record tombstones and **no** DID
+tombstones. The lifecycle scenario generates the sync divergence (and the
+bootstrap account delete) earlier; those DID tombstones have seq ≤ W by the
+time the steady compaction watermark advances, so compaction evicts them
+before the served overlay is built, and any later kill would be in the live
+tail (> M), recovered by the `live((M,inf))` fold regardless of the overlay.
+The mutant therefore edits a section the served blob never populates in this
+config. Swept across 3 random seeds: SURVIVED on all 3 — structural, not a
+flaky escape. Disposition: **accepted dead-path artifact for the default
+lifecycle.** Closing it requires a scenario that lands a DID tombstone strictly
+inside (W,M] — i.e. an account-delete/sync whose seq is above the steady
+compaction watermark but at or below the captured overlay max-seq. That is a
+narrow timing window the current harness does not deliberately stage. Filed as
+follow-up #21: extend the overlay scenario (or add a dedicated overlay-window
+fixture) to exercise an in-window DID tombstone so m020 becomes killable.
