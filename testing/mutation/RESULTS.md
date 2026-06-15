@@ -5,6 +5,18 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
+## Targeted follow-up 2026-06-15 — event-log equivalence
+
+- commit under test: branch `testing-revamp` after
+  `oracle: assert lifecycle event-log equivalence`
+- driver: targeted manual equivalent of `just mutation-campaign m019`
+  (`git apply --check`, apply, `go build ./...`, default oracle tier, reverse)
+- scope: Workstream 3 event-log equivalence
+
+| mutant | result | disposition |
+|---|---|---|
+| m019_sync_tombstone_dropped | KILLED@default | New event-log equivalence assertion caught a missing `KindSync` row even though replacement rows can allow final state to converge. Diagnostic: `oracle: missing expected event ... kind=sync`. |
+
 ## Targeted follow-up 2026-06-15
 
 - commit under test: branch `testing-revamp` after

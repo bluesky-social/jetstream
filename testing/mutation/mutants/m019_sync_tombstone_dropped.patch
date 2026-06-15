@@ -1,0 +1,36 @@
+mutant: m019_sync_tombstone_dropped
+target: internal/ingest/live/events.go
+failure-mode: |
+  In convertSync, the KindSync tombstone row is dropped while verifier
+  replacement rows are still emitted. Models a stream-fidelity bug where
+  clients miss the authoritative sync boundary even though replacement records
+  can make final repo state converge.
+expected-detection: |
+  Workstream 3 event-log equivalence compares simulator firehose #sync rows to
+  post-append lifecycle hook observations keyed by UpstreamRelayCursor. The
+  missing KindSync row should produce a "missing expected event" diagnostic in
+  the default lifecycle oracle before final-state comparison can hide it.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index c9d264e..4ed61f9 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -247,14 +247,8 @@ func convertSync(evt streaming.Event, indexedAt int64) ([]segment.Event, error)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("livestream: marshal sync: %w", err)
+ 	}
+-	out := []segment.Event{{
+-		IndexedAt:           indexedAt,
+-		UpstreamRelayCursor: evt.Seq,
+-		Kind:                segment.KindSync,
+-		DID:                 evt.Sync.DID,
+-		Rev:                 evt.Sync.Rev,
+-		Payload:             payload,
+-	}}
++	out := []segment.Event{}
++	_ = payload
+ 
+ 	// When the verifier performs a synchronous resync for this #sync
+ 	// event, Operations yields the authoritative post-resync record set
