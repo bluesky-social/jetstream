@@ -88,8 +88,17 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		return
 	}
 
-	if values.Get("compress") == "true" || strings.Contains(r.Header.Get("Socket-Encoding"), "zstd") {
-		http.Error(w, "compression not supported: jetstream v2 does not implement the v1 zstd-with-custom-dictionary scheme; remove ?compress=true and the Socket-Encoding header", http.StatusBadRequest)
+	// v1 custom-zstd-dictionary opt-in. NOT PREFERRED — kept only for
+	// backwards compatibility with v1 clients. New consumers should use
+	// RFC 7692 permessage-deflate (negotiated automatically below). A
+	// client must pick ONE scheme: opting into custom zstd while ALSO
+	// offering permessage-deflate would double-compress (zstd output is
+	// already entropy-coded), so we reject that combination loudly rather
+	// than silently disabling one.
+	wantZstd := values.Get("compress") == "true" ||
+		strings.Contains(r.Header.Get("Socket-Encoding"), "zstd")
+	if wantZstd && strings.Contains(r.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate") {
+		http.Error(w, "choose one compression scheme: custom zstd (compress=true / Socket-Encoding: zstd) or RFC 7692 permessage-deflate, not both", http.StatusBadRequest)
 		return
 	}
 
@@ -186,9 +195,17 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	// repetitive JSON firehose; its ~1.2 MB flate.Writer per connection is
 	// affordable at our connection scale. This is orthogonal to the v1
 	// zstd-with-custom-dictionary scheme rejected above.
+	// zstd clients do their own framing; permessage-deflate must NOT also
+	// run (the mutual-exclusion 400 above guarantees they didn't offer it,
+	// but disable explicitly so an Accept default can't re-enable it).
+	// Non-zstd clients keep the default: deflate negotiated when offered.
+	compressionMode := websocket.CompressionContextTakeover
+	if wantZstd {
+		compressionMode = websocket.CompressionDisabled
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns:  []string{"*"},
-		CompressionMode: websocket.CompressionContextTakeover,
+		CompressionMode: compressionMode,
 	})
 	if err != nil {
 		return
@@ -248,7 +265,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		startSeq = deps.Tail.Tip()
 	}
 
-	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, extended, logger)
+	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, extended, wantZstd, logger)
 }
 
 func runReader(
@@ -312,6 +329,7 @@ func runSubscriberLoop(
 	filterPtr *atomic.Pointer[Filter],
 	startSeq uint64,
 	extended bool,
+	compress bool,
 	logger *slog.Logger,
 ) {
 	deps.Metrics.incSubscribers()
@@ -378,6 +396,11 @@ func runSubscriberLoop(
 				continue
 			}
 
+			// Size cap is enforced on the UNCOMPRESSED JSON length even for
+			// zstd clients: the cap bounds the logical record size a client
+			// will accept, and comparing against unpredictable compressed
+			// size (v1's behavior) would let a large record slip a small cap.
+			// A deliberate, documented divergence from v1.
 			var body []byte
 			var eerr error
 			if extended {
@@ -400,8 +423,30 @@ func runSubscriberLoop(
 				continue
 			}
 
+			// Pick the wire payload + frame type by the connection's fixed
+			// compression preference. The compressed accessors derive from
+			// the same memoized JSON above, so the size cap (checked on the
+			// uncompressed body) and the skip/encode-error branches already
+			// hold; the only remaining failure is the compress step itself.
+			msgType := websocket.MessageText
+			payload := body
+			if compress {
+				var cerr error
+				if extended {
+					payload, cerr = e.CompressedExtended()
+				} else {
+					payload, cerr = e.Compressed()
+				}
+				if cerr != nil {
+					deps.Metrics.incEncodeErrors()
+					logger.Warn("compress error", "err", cerr, "kind", int(e.Event.Kind), "did", e.Event.DID)
+					continue
+				}
+				msgType = websocket.MessageBinary
+			}
+
 			writeCtx, wcancel := context.WithTimeout(ctx, frameWriteTimeout)
-			werr := conn.Write(writeCtx, websocket.MessageText, body)
+			werr := conn.Write(writeCtx, msgType, payload)
 			wcancel()
 			if werr != nil {
 				return
