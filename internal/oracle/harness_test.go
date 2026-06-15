@@ -452,7 +452,7 @@ func traceSegmentEvent(ev *segment.Event) map[string]any {
 		"indexed_at":            ev.IndexedAt,
 		"rendered_at":           ev.RenderedAt,
 		"upstream_relay_cursor": ev.UpstreamRelayCursor,
-		"kind":                  traceSegmentKind(ev.Kind),
+		"kind":                  eventLogKind(ev.Kind),
 		"kind_code":             uint8(ev.Kind),
 		"did":                   ev.DID,
 		"collection":            ev.Collection,
@@ -469,7 +469,7 @@ func traceObservedEvent(ev ObservedEvent) map[string]any {
 	out := map[string]any{
 		"seq":        ev.Seq,
 		"indexed_at": ev.IndexedAt,
-		"kind":       traceSegmentKind(ev.Kind),
+		"kind":       eventLogKind(ev.Kind),
 		"kind_code":  uint8(ev.Kind),
 		"did":        ev.DID,
 		"collection": ev.Collection,
@@ -480,25 +480,6 @@ func traceObservedEvent(ev ObservedEvent) map[string]any {
 		out["payload"] = tracePayload(ev.Payload)
 	}
 	return out
-}
-
-func traceSegmentKind(kind segment.Kind) string {
-	switch kind {
-	case segment.KindCreate:
-		return "create"
-	case segment.KindUpdate:
-		return "update"
-	case segment.KindDelete:
-		return "delete"
-	case segment.KindIdentity:
-		return "identity"
-	case segment.KindAccount:
-		return "account"
-	case segment.KindSync:
-		return "sync"
-	default:
-		return fmt.Sprintf("unknown-%d", kind)
-	}
 }
 
 func traceErr(err error) any {
