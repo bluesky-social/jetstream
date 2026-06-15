@@ -34,14 +34,26 @@ func toSegmentEvent(ev ObservedEvent) segment.Event {
 //   - overlay covers (W, M]
 //   - live tail covers (M, inf)
 //
-// A client emits a create/update row unless a tombstone with strictly
-// greater seq supersedes it. We reconstruct that decision from the three
-// sources and compare against groundTruthLive.
+// A client emits, per record key, the highest-seq create/update row that
+// is surfaced AND not suppressed by a higher-seq tombstone.
+//
+// Precondition: events is the post-compaction physical segment stream
+// (plus the live tail / active segment). Create/update rows superseded by
+// a tombstone at or below W have already been physically removed by
+// compaction, so they are absent here. The client therefore never sees
+// those rows nor their (evicted) tombstones — consistent. Every
+// create/update row still present is surfaced to the client.
+//
+// The client holds ALL its tombstones simultaneously: the overlay covers
+// (W, M] and the live tail covers (M, inf). A record created in (W, M]
+// can be deleted by a tombstone in (M, inf) and vice versa, so the
+// combined set — not a per-seq-range subset — must be applied to every
+// surfaced row.
 func CheckOverlayReconstruction(events []ObservedEvent, w, m uint64, overlaySnap tombstone.Snapshot) error {
 	ground := groundTruthLive(events)
 
-	// Live tombstones cover (M, inf): this is what the client receives on
-	// the /subscribe tail when it resumes from cursor=M.
+	// Live tombstones cover (M, inf): what the client receives on the
+	// /subscribe tail when it resumes from cursor=M.
 	segEvents := make([]segment.Event, 0, len(events))
 	for _, ev := range events {
 		segEvents = append(segEvents, toSegmentEvent(ev))
@@ -51,6 +63,15 @@ func CheckOverlayReconstruction(events []ObservedEvent, w, m uint64, overlaySnap
 		return err
 	}
 
+	// combined = overlay((W,M]) ∪ live((M,inf)), taking the max seq per
+	// key. This is the full suppression set a client holds at once.
+	combined := tombstone.Snapshot{
+		Records: make(map[tombstone.RecordKey]uint64),
+		DIDs:    make(map[string]tombstone.DIDTombstone),
+	}
+	combined.Merge(overlaySnap)
+	combined.Merge(liveTomb)
+
 	emitted := make(map[tombstone.RecordKey]uint64)
 	for i := range events {
 		ev := &events[i]
@@ -59,21 +80,8 @@ func CheckOverlayReconstruction(events []ObservedEvent, w, m uint64, overlaySnap
 		}
 		key := tombstone.RecordKey{DID: ev.DID, Collection: ev.Collection, Rkey: ev.Rkey}
 		se := toSegmentEvent(*ev)
-		switch {
-		case ev.Seq <= w:
-			// Rows <= W survive in segments only if they are the
-			// ground-truth-latest (compaction removed superseded ones).
-			if gseq, ok := ground[key]; ok && gseq == ev.Seq {
-				emitted[key] = maxU64(emitted[key], ev.Seq)
-			}
-		case ev.Seq <= m:
-			if drop, _ := overlaySnap.ShouldDrop(&se); !drop {
-				emitted[key] = maxU64(emitted[key], ev.Seq)
-			}
-		default: // ev.Seq > m
-			if drop, _ := liveTomb.ShouldDrop(&se); !drop {
-				emitted[key] = maxU64(emitted[key], ev.Seq)
-			}
+		if drop, _ := combined.ShouldDrop(&se); !drop {
+			emitted[key] = maxU64(emitted[key], ev.Seq)
 		}
 	}
 

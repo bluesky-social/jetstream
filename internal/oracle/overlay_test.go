@@ -31,12 +31,20 @@ func TestOverlayReconstruction_SuppressesDeletedRecord(t *testing.T) {
 
 func TestOverlayReconstruction_NoPermanentTombstone(t *testing.T) {
 	t.Parallel()
+	// Account deleted at seq 100, then the DID posts a new record at 200.
+	// W=50 keeps every row inside the overlay window (W, M], so nothing
+	// here is a <=W row superseded by a <=W tombstone (which compaction
+	// would have physically removed). The DID tombstone is exercised
+	// directly: the pre-deletion "old" record is suppressed, but the
+	// post-deletion "new" record (seq 200 > the account-delete's 100)
+	// survives — the tombstone is a half-open seq window, not a permanent
+	// mask on the DID.
 	events := []ObservedEvent{
 		{Seq: 60, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "old"},
 		{Seq: 100, Kind: segment.KindAccount, DID: "did:plc:a", Payload: oracleAccountPayload(t, false, "deleted")},
 		{Seq: 200, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "new"},
 	}
-	require.NoError(t, CheckOverlayReconstruction(events, 150, 250, overlayFor(t, events, 150, 250)),
+	require.NoError(t, CheckOverlayReconstruction(events, 50, 250, overlayFor(t, events, 50, 250)),
 		"reactivated account's newer record must be emitted")
 }
 

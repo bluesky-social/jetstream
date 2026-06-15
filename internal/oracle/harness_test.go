@@ -190,6 +190,13 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"served subscribe replay compacted check failed: mode=%s seed=%d watermark=%d",
 		cfg.Mode, cfg.Seed, steadyCompaction.Watermark)
 
+	// Capture the served compaction overlay while the server is still up.
+	// No live events are generated after this point, so the in-memory
+	// tombstone set cannot trigger another compaction pass before
+	// shutdown: the blob's W is stable across the fetch->flush window, so
+	// the post-shutdown segment scan is consistent with it.
+	overlayW, overlayM, overlaySnap := fetchOverlay(t, cfg, run, publicURL)
+
 	// steadyAck.Wait above guarantees every steady-state cursor up to
 	// targetSeq has been durably appended (OnEvent fires post-Append), so
 	// no event is still in flight when we cancel. The steady-state writer
@@ -202,6 +209,12 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
 	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "steady-state-shutdown-flush")
+
+	// End-to-end overlay coverage: the segments(<=W) + overlay((W,M]) +
+	// live((M,inf)) reconstruction must equal the ground-truth live set.
+	// Uses the blob captured above (server up) against the now-flushed
+	// durable segments.
+	assertOverlayReconstruction(t, dataDir, cfg, overlayW, overlayM, overlaySnap)
 }
 
 // assertFaultPlanFired verifies the fault injection actually happened.
