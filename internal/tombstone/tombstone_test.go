@@ -188,7 +188,7 @@ func TestApproxBytesTracksInsertEvictReplace(t *testing.T) {
 // incrementally by per-event Observe.
 func TestRebuildEqualsIncremental(t *testing.T) {
 	t.Parallel()
-	for seed := int64(0); seed < 25; seed++ {
+	for seed := range int64(25) {
 		rng := rand.New(rand.NewSource(seed))
 		n := 50 + rng.Intn(200)
 		events := make([]segment.Event, 0, n)

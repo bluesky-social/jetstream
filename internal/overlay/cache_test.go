@@ -84,10 +84,8 @@ func TestCacheConcurrentServeAndRebuild(t *testing.T) {
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -98,9 +96,9 @@ func TestCacheConcurrentServeAndRebuild(t *testing.T) {
 					require.NoError(t, err)
 				}
 			}
-		}()
+		})
 	}
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		ev := segEvt(t, uint64(i+1), "did:plc:a", "c", "r"+string(rune('a'+i%26)))
 		require.NoError(t, set.Observe(&ev))
 		src.gen.Add(1)

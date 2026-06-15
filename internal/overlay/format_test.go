@@ -107,10 +107,10 @@ func randomSnapshot(seed uint32) (tombstone.Snapshot, uint64, uint64) {
 	nDID := int(next()%5) + 1
 	rkeys := []string{"", "rk", string([]byte{0x00, 0xff, 0x80}), "aaaaaaaaaaaaaaaaaaaa"}
 	colls := []string{"app.bsky.feed.post", "app.bsky.feed.like", "x"}
-	for i := 0; i < nDID; i++ {
+	for i := range nDID {
 		did := "did:plc:" + string(rune('a'+i))
 		nRec := int(next() % 4)
-		for j := 0; j < nRec; j++ {
+		for range nRec {
 			seq := w + 1 + next()%500
 			if seq > maxSeq {
 				maxSeq = seq

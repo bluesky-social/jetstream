@@ -18,7 +18,7 @@ func realisticSnapshot(n int, w uint64) (tombstone.Snapshot, uint64) {
 	r := uint64(0x9e3779b97f4a7c15)
 	next := func() uint64 { r ^= r >> 12; r ^= r << 25; r ^= r >> 27; return r * 2685821657736338717 }
 	nDID := n/20 + 1
-	for i := 0; i < n; i++ {
+	for range n {
 		didN := next() % uint64(nDID)
 		if next()%3 == 0 { // skew: a third land on the 16 hottest DIDs
 			didN %= 16
@@ -74,7 +74,7 @@ func BenchmarkEncodeColumnarVsFlat(b *testing.B) {
 		snap, m := realisticSnapshot(n, 1_000_000)
 		b.Run(fmt.Sprintf("columnar/%d", n), func(b *testing.B) {
 			var sz int
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				sz = len(Encode(snap, 1_000_000, m))
 			}
 			b.ReportMetric(float64(sz), "wire_bytes")
@@ -82,7 +82,7 @@ func BenchmarkEncodeColumnarVsFlat(b *testing.B) {
 		})
 		b.Run(fmt.Sprintf("flat/%d", n), func(b *testing.B) {
 			var sz int
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				sz = len(encodeFlat(snap, 1_000_000, m))
 			}
 			b.ReportMetric(float64(sz), "wire_bytes")

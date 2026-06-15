@@ -266,7 +266,7 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 	if err != nil {
 		return 0, 0, tombstone.Snapshot{}, err
 	}
-	for g := uint64(0); g < groupCount; g++ {
+	for range groupCount {
 		didIdx, err := c.uvarint()
 		if err != nil {
 			return 0, 0, tombstone.Snapshot{}, err
@@ -279,7 +279,7 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 			return 0, 0, tombstone.Snapshot{}, err
 		}
 		prev := w
-		for e := uint64(0); e < entryCount; e++ {
+		for range entryCount {
 			collIdx, err := c.uvarint()
 			if err != nil {
 				return 0, 0, tombstone.Snapshot{}, err
@@ -306,7 +306,7 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 		return 0, 0, tombstone.Snapshot{}, err
 	}
 	prev := w
-	for i := uint64(0); i < didTombCount; i++ {
+	for range didTombCount {
 		didIdx, err := c.uvarint()
 		if err != nil {
 			return 0, 0, tombstone.Snapshot{}, err
@@ -379,7 +379,7 @@ func (c *cursor) stringTable() ([]string, error) {
 		return nil, err
 	}
 	out := make([]string, 0, count)
-	for i := uint64(0); i < count; i++ {
+	for range count {
 		b, err := c.lenBytes()
 		if err != nil {
 			return nil, err
