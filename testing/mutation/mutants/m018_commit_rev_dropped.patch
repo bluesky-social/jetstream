@@ -1,0 +1,27 @@
+mutant: m018_commit_rev_dropped
+target: internal/ingest/live/events.go
+failure-mode: |
+  In convertCommit (the MAIN live #commit path), the Rev field is dropped
+  (set to ""). Models forgetting to copy a field on the hot path. Companion
+  to m014, which mutated the resync fallback that simulator traffic never
+  takes.
+expected-detection: |
+  CheckInvariants tracks per-DID rev monotonicity and Compare checks rev when
+  both sides populate it; an empty rev should surface as a regression or
+  mismatch. Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index c9d264e..ec2aa95 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -153,7 +153,7 @@ func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error
+ 			DID:                 commit.Repo,
+ 			Collection:          string(op.Collection),
+ 			Rkey:                string(op.RKey),
+-			Rev:                 commit.Rev,
++			Rev:                 "",
+ 		}
+ 		// Deletes have no record bytes; everything else carries the
+ 		// raw CBOR record block exactly as atmos extracted it from

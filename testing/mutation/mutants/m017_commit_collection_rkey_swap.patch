@@ -1,0 +1,27 @@
+mutant: m017_commit_collection_rkey_swap
+target: internal/ingest/live/events.go
+failure-mode: |
+  In convertCommit (the MAIN live #commit path that all normal firehose
+  traffic takes), Collection is sourced from op.RKey, swapping two adjacent
+  struct fields. Models a copy-paste swap on the hot path. Companion to m013,
+  which mutated the convertVerifiedOps resync fallback that simulator traffic
+  never exercises; this one hits the path the simulator actually uses.
+expected-detection: |
+  Compare keys on (DID, Collection, Rkey); swapped coordinates yield
+  missing/extra records vs ground truth. Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index c9d264e..cb04038 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -151,7 +151,7 @@ func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error
+ 			UpstreamRelayCursor: evt.Seq,
+ 			Kind:                kind,
+ 			DID:                 commit.Repo,
+-			Collection:          string(op.Collection),
++			Collection:          string(op.RKey),
+ 			Rkey:                string(op.RKey),
+ 			Rev:                 commit.Rev,
+ 		}
