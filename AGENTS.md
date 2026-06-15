@@ -66,6 +66,45 @@ Use the package-level metrics/tracer rather than rolling your own. `obs.Tracer("
 
 `.github/workflows/ci.yml` is heavily security-hardened. Two jobs: `lint` and `test (race)`. They run on every push to any branch.
 
+## Task tracking
+
+We track work as **GitHub issues in this repo** (`gh issue ...`). This is an open-source project, so issues are the public, durable worklog — they live alongside the code, not in a private tracker. The goal is a granular, persistent history: someone reading the issues months later should be able to reconstruct what was done and why.
+
+**One issue per discrete unit of work.** A unit is something a single focused change resolves — a bug, a small feature, a refactor of one component, a doc update. If a task naturally splits into independently-committable pieces, file an issue per piece rather than one broad issue. Prefer too granular over too coarse.
+
+**File the issue before starting the work**, so the issue number is available to reference in the branch and commits. Skip issue-filing only for trivial, in-the-moment fixes (typos, formatting) that ship in an unrelated commit.
+
+**Title** — imperative and subsystem-scoped, mirroring our commit style: `ingest: dedupe overlapping live/backfill events`, `segment: validate footer CRC on open`. Lead with the affected area from the repo layout (`ingest`, `segment`, `subscribe`, `store`, …).
+
+**Body** — keep it tight but self-contained:
+- *Context* — what's wrong or missing, and why it matters (link `DESIGN.md` sections or code with `path:line` when relevant).
+- *Definition of done* — the observable outcome that closes the issue (behaviour, test, metric).
+- *Notes* — open questions, alternatives considered, or follow-ups to split out later (kaizen: record out-of-scope problems as their own issues rather than scope-creeping this one).
+
+**Labels** — use the existing defaults; don't invent a taxonomy without discussion. `bug` (incorrect behaviour), `enhancement` (new capability), `documentation` (docs/comments), `question`, `help wanted`, `good first issue`. Apply at most one type label plus any meta labels that fit.
+
+**Status & linking** — the worklog lives in the issue:
+- Post a comment when meaningfully starting or when state changes (blocked, approach changed, finding). These comments are the persistent log — favour a short comment over silence.
+- Close issues *through commits/PRs*, never by hand: put `Closes #N` (or `Fixes #N`) in the commit body or PR description so the link is permanent and the issue auto-closes on merge to the default branch.
+- Reference related issues with `#N` to build the graph; split discovered follow-up work into new issues and link them.
+
+**Recipes:**
+
+```sh
+gh issue create -t "segment: validate footer CRC on open" -b "$(cat <<'EOF'
+## Context
+...
+
+## Definition of done
+...
+EOF
+)" -l bug
+gh issue list --state open                  # current worklog
+gh issue comment <N> -b "Starting: approach is ..."
+gh issue view <N> --comments                # full history of one unit
+# closing happens via "Closes #<N>" in the commit/PR, not `gh issue close`
+```
+
 ## Practices
 
 - **Testing.** Be liberal with the right kind of test for the job:
