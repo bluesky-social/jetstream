@@ -10,7 +10,7 @@
 
 ## Execution Status
 
-Milestone A is complete on branch `testing-revamp`.
+Milestone A is complete on `main` via PR #22.
 
 | Plan area | Issues | Commits | Status |
 |---|---|---|---|
