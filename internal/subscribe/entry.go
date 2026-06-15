@@ -102,8 +102,11 @@ func (e *Entry) CompressedExtended() ([]byte, error) {
 
 // approxBytes estimates the entry's memory footprint for the hot ring's
 // byte budget: the payload plus the small fixed-size string fields. The
-// memoized encoding is intentionally excluded — it is bounded by the same
-// ring and counting it would double-count the shared bytes.
+// memoized encodings are intentionally excluded — they are bounded by the
+// same ring (evicted FIFO with the entry) and counting them would
+// double-count the shared bytes. An entry may memoize up to four payloads
+// (simple/extended JSON × plain/zstd) when a mix of subscriber types is
+// connected; the off-budget overhang stays O(ring length).
 func (e *Entry) approxBytes() int {
 	ev := e.Event
 	return len(ev.Payload) + len(ev.DID) + len(ev.Collection) +
