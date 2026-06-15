@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 )
@@ -129,4 +130,52 @@ func TestEntry_CompressedPropagatesSkipSentinel(t *testing.T) {
 	body, err := e.Compressed()
 	require.ErrorIs(t, err, errSkipEvent)
 	require.Nil(t, body)
+}
+
+// TestEntry_CompressedExtended_SyncEmitsDecodableFrame pins the divergence
+// between the v1 and extended wire shapes for KindSync events: the v1 path
+// returns errSkipEvent (no frame emitted) while the extended path emits a
+// real frame. This catches any future mis-wiring of CompressedExtended to
+// the v1 source.
+func TestEntry_CompressedExtended_SyncEmitsDecodableFrame(t *testing.T) {
+	t.Parallel()
+
+	sync := &comatproto.SyncSubscribeRepos_Sync{
+		DID:    "did:plc:testsync",
+		Rev:    "rev-sync-test",
+		Seq:    555,
+		Time:   "2026-05-25T00:00:00Z",
+		Blocks: []byte{0x01, 0x02},
+	}
+	payload, err := sync.MarshalCBOR()
+	require.NoError(t, err)
+
+	e := newEntry(&segment.Event{
+		Seq:                 77,
+		IndexedAt:           1_700_000_000_000_000,
+		UpstreamRelayCursor: 555,
+		Kind:                segment.KindSync,
+		DID:                 "did:plc:testsync",
+		Rev:                 "rev-sync-test",
+		Payload:             payload,
+	})
+
+	// v1 path must skip #sync events.
+	compressedBody, compressedErr := e.Compressed()
+	require.ErrorIs(t, compressedErr, errSkipEvent, "v1 Compressed must return errSkipEvent for KindSync")
+	require.Nil(t, compressedBody)
+
+	// Extended path must emit a decodable frame.
+	extBody, extErr := e.CompressedExtended()
+	require.NoError(t, extErr, "CompressedExtended must not return an error for KindSync")
+	require.NotNil(t, extBody, "CompressedExtended must return a non-nil frame for KindSync")
+
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionary))
+	require.NoError(t, err)
+	defer dec.Close()
+	decoded, err := dec.DecodeAll(extBody, nil)
+	require.NoError(t, err)
+
+	require.Contains(t, string(decoded), `"kind":"sync"`, "decoded frame must contain kind:sync")
+	require.Contains(t, string(decoded), "did:plc:testsync", "decoded frame must contain the DID")
 }
