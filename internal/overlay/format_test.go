@@ -40,6 +40,28 @@ func TestEncodeDeterministic(t *testing.T) {
 	require.Equal(t, a, b, "same snapshot must produce byte-identical blobs")
 }
 
+func TestEncodePanicsOnUnknownReason(t *testing.T) {
+	t.Parallel()
+	require.Panics(t, func() {
+		Encode(tombstone.Snapshot{
+			Records: map[tombstone.RecordKey]uint64{},
+			DIDs:    map[string]tombstone.DIDTombstone{"did:plc:a": {Seq: 110, Reason: "bogus"}},
+		}, 100, 110)
+	})
+}
+
+func TestEncodePanicsOnSeqBelowWatermark(t *testing.T) {
+	t.Parallel()
+	require.Panics(t, func() {
+		Encode(tombstone.Snapshot{
+			Records: map[tombstone.RecordKey]uint64{
+				{DID: "did:plc:a", Collection: "c", Rkey: "r"}: 50, // <= W
+			},
+			DIDs: map[string]tombstone.DIDTombstone{},
+		}, 100, 100)
+	})
+}
+
 func TestEncodeEmpty(t *testing.T) {
 	t.Parallel()
 	blob := Encode(tombstone.Snapshot{

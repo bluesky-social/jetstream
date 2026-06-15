@@ -47,10 +47,19 @@ func init() {
 }
 
 func reasonCode(s string) uint8 {
-	if s == "sync" {
+	switch s {
+	case "account":
+		return reasonAcct
+	case "sync":
 		return reasonSync
+	default:
+		// The reason originates from Jetstream's own tombstone set
+		// (tombstone.observeLocked sets only "account"/"sync"). An
+		// unexpected value is invalid internal state, not external
+		// input: crash loud rather than silently mislabel it on the
+		// wire (AGENTS.md crash-over-corruption directive).
+		panic(fmt.Sprintf("overlay: unexpected tombstone reason %q", s))
 	}
-	return reasonAcct // tombstone.observeLocked only ever sets "account" or "sync"
 }
 
 func reasonString(c uint8) (string, error) {
@@ -68,6 +77,10 @@ func reasonString(c uint8) (string, error) {
 // carrying W and M, then a single zstd frame holding dictionary tables
 // and columnar, delta-varint tombstone sections. Pure and deterministic:
 // the same snapshot always yields identical bytes.
+//
+// Precondition: every tombstone seq in snap must be strictly greater
+// than w (as guaranteed by tombstone.SnapshotRange(w, ...)); a
+// violation panics.
 func Encode(snap tombstone.Snapshot, w, m uint64) []byte {
 	body := encodeBody(snap, w)
 	frame := overlayEncoder.EncodeAll(body, nil)
@@ -86,6 +99,21 @@ func Encode(snap tombstone.Snapshot, w, m uint64) []byte {
 // encodeBody builds the uncompressed columnar body. seqBase is W (the
 // first seq delta in every group/section is seq-W).
 func encodeBody(snap tombstone.Snapshot, seqBase uint64) []byte {
+	// Every seq must be strictly above seqBase (W): snapshots come from
+	// tombstone.SnapshotRange(W, ...), which excludes seq <= W. A
+	// violation is an internal bug (mismatched W), and the delta
+	// encoding would silently underflow — crash loud instead.
+	for k, seq := range snap.Records {
+		if seq <= seqBase {
+			panic(fmt.Sprintf("overlay: record seq %d <= watermark %d for %s/%s/%s", seq, seqBase, k.DID, k.Collection, k.Rkey))
+		}
+	}
+	for did, ts := range snap.DIDs {
+		if ts.Seq <= seqBase {
+			panic(fmt.Sprintf("overlay: did-tombstone seq %d <= watermark %d for %s", ts.Seq, seqBase, did))
+		}
+	}
+
 	type recEntry struct {
 		coll string
 		rkey string
