@@ -84,6 +84,18 @@ func TestSnapshotRangeFiltersLowAndHighBounds(t *testing.T) {
 	require.Equal(t, DIDTombstone{Seq: 7, Reason: "sync"}, snap.DIDs["did:plc:a"])
 }
 
+func TestSetDirtyChangesOnMutation(t *testing.T) {
+	t.Parallel()
+	s := New()
+	d0 := s.Dirty()
+	ev := segment.Event{Seq: 1, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r"}
+	require.NoError(t, s.Observe(&ev))
+	require.NotEqual(t, d0, s.Dirty())
+	d1 := s.Dirty()
+	s.Evict(1)
+	require.NotEqual(t, d1, s.Dirty())
+}
+
 func accountPayload(t *testing.T, active bool, status string) []byte {
 	t.Helper()
 	acc := &comatproto.SyncSubscribeRepos_Account{DID: "did:plc:a", Active: active, Status: gt.Some(status)}

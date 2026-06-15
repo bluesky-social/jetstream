@@ -20,6 +20,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream-v2/internal/overlay"
 	"github.com/bluesky-social/jetstream-v2/internal/server"
 	"github.com/bluesky-social/jetstream-v2/internal/status"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
@@ -38,6 +39,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// overlayRebuildInterval bounds how stale the served overlay blob can
+// be relative to the live tail (spec §5.5). The blob's reported maxSeq
+// is always honest; staleness only adds a few seconds of live replay on
+// the consumer side.
+const overlayRebuildInterval = 2 * time.Second
+
 // Runtime is one fully constructed jetstream daemon instance.
 type Runtime struct {
 	opts Options
@@ -50,6 +57,7 @@ type Runtime struct {
 	metaStore      *store.Store
 	manifest       *manifest.Manifest
 	tail           *subscribe.Tail
+	overlayCache   *overlay.Cache
 	verifier       *atmossync.Verifier
 	orchestrator   *orchestrator.Orchestrator
 	server         *server.Server
@@ -211,6 +219,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	stateStore := syncstate.New(metaStore)
 	tombstones := tombstone.New()
+	overlayMetrics := overlay.NewMetrics(metrics.Registry)
+	overlayCache := overlay.NewCache(overlaySource{set: tombstones, store: metaStore}, overlayMetrics)
+	rt.overlayCache = overlayCache
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
@@ -302,6 +313,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CompactionTombstoneCap:   opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers: opts.CompactionRewriteWorkers,
 		OnCompactionPass: func(result orchestrator.CompactionPassResult) {
+			// The compaction pass just evicted tombstones <= the new
+			// watermark; rebuild the overlay so served W/M reflect it.
+			overlayCache.Rebuild()
 			if opts.OnCompactionPass != nil {
 				opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
 			}
@@ -343,7 +357,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// xrpcserver routes /xrpc/{nsid}; mounting at the "/xrpc/" subtree
 	// lets it own every jetstream NSID. Backed by the in-memory manifest,
 	// which only tracks sealed (immutable) segments.
-	xrpcSrv := xrpcapi.NewWithReadyAndCache(mft, processLogger, func(ctx context.Context) error {
+	xrpcSrv := xrpcapi.NewWithReadyAndCacheAndOverlay(mft, processLogger, func(ctx context.Context) error {
 		if !lifecycle.IsSteadyState(metaStore) {
 			return errors.New("bootstrap in progress")
 		}
@@ -351,7 +365,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			return fmt.Errorf("manifest warming up: %w", err)
 		}
 		return nil
-	}, opts.SegmentCacheMaxAge)
+	}, opts.SegmentCacheMaxAge, overlayCache)
 	srv.RegisterPublicRoute("/xrpc/", xrpcSrv.Handler())
 	rt.server = srv
 
@@ -393,6 +407,14 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 	g.Go(func() error {
 		return r.orchestrator.Run(gctx)
+	})
+
+	g.Go(func() error {
+		err := r.overlayCache.RunTicker(gctx, overlayRebuildInterval)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
 	})
 
 	// Graceful client drain. Live websocket subscribers are hijacked
