@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,21 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		t.Skip("skipping stress oracle under -short")
 	}
 
+	trace, tracePath, closeTrace := newOracleTrace(t, "oracle-trace.jsonl")
+	defer closeTrace()
+	recordTraceOrError(t, trace, "run_start", map[string]any{
+		"mode":                  cfg.Mode,
+		"seed":                  cfg.Seed,
+		"go_version":            runtime.Version(),
+		"gomaxprocs":            runtime.GOMAXPROCS(0),
+		"accounts":              cfg.Accounts,
+		"min_initial_records":   cfg.MinInitialRecords,
+		"max_initial_records":   cfg.MaxInitialRecords,
+		"live_events_bootstrap": cfg.LiveEventsBootstrap,
+		"live_events_steady":    cfg.LiveEventsSteady,
+		"fault_mode":            cfg.FaultMode,
+	})
+
 	simCfg := world.DefaultConfig()
 	simCfg.DataDir = t.TempDir()
 	simCfg.Seed = cfg.Seed
@@ -38,6 +54,14 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	simCfg.InitialRecordsMin = cfg.MinInitialRecords
 	simCfg.InitialRecordsMax = cfg.MaxInitialRecords
 	simCfg.FirehoseHistory = max(10_000, cfg.LiveEventsBootstrap+cfg.LiveEventsSteady+1024)
+	recordTraceOrError(t, trace, "simulator_config", map[string]any{
+		"seed":                simCfg.Seed,
+		"accounts":            simCfg.Accounts,
+		"initial_records":     simCfg.InitialRecords,
+		"initial_records_min": simCfg.InitialRecordsMin,
+		"initial_records_max": simCfg.InitialRecordsMax,
+		"firehose_history":    simCfg.FirehoseHistory,
+	})
 
 	w, err := world.New(t.Context(), simCfg)
 	require.NoError(t, err)
@@ -52,6 +76,13 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 
 	faultPlan, err := BuildSwarmFaultPlan(w, cfg)
 	require.NoError(t, err)
+	recordTraceOrError(t, trace, "fault_plan", map[string]any{
+		"scheduled_get_repo_http_failures":           faultPlan.TotalGetRepoHTTPFailures(),
+		"scheduled_get_repo_http_failure_dids":       len(faultPlan.GetRepoHTTPFailures),
+		"scheduled_get_repo_car_truncations":         faultPlan.TotalGetRepoCARTruncations(),
+		"scheduled_get_repo_car_truncation_dids":     len(faultPlan.GetRepoCARTruncations),
+		"subscribe_repos_disconnect_threshold_count": len(faultPlan.SubscribeReposDisconnectThresholds),
+	})
 
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
@@ -123,13 +154,34 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		CompactionTombstoneCap:    1,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
-		OnCompactionPass:          compaction.Observe,
-		OnBootstrapLiveEvent:      bootstrapAck.Observe,
+		OnCompactionPass: func(result jetstreamd.CompactionPassResult) {
+			compaction.Observe(result)
+			recordTraceOrError(t, trace, "compaction_pass", map[string]any{
+				"watermark": result.Watermark,
+				"err":       traceErr(result.Err),
+			})
+		},
+		OnBootstrapLiveEvent: func(ev *segment.Event) {
+			bootstrapAck.Observe(ev)
+			recordTraceOrError(t, trace, "bootstrap_live_event", traceSegmentEvent(ev))
+		},
 		OnSteadyStateEvent: func(ev *segment.Event) {
 			steadyAck.Observe(ev)
 			asyncResyncAck.Observe(ev)
+			recordTraceOrError(t, trace, "steady_state_event", traceSegmentEvent(ev))
 		},
-		AfterRepoComplete: bootstrapTraffic.AfterRepoComplete,
+		AfterRepoComplete: func(ctx context.Context, did atmos.DID) error {
+			err := bootstrapTraffic.AfterRepoComplete(ctx, did)
+			completed, generated := bootstrapTraffic.Snapshot()
+			recordTraceOrError(t, trace, "backfill_repo_complete", map[string]any{
+				"did":       string(did),
+				"completed": completed,
+				"generated": generated,
+				"target":    cfg.LiveEventsBootstrap,
+				"err":       traceErr(err),
+			})
+			return err
+		},
 	})
 	require.NoError(t, err)
 
@@ -144,6 +196,10 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		cancel()
 		if !runDone {
 			waitForRuntimeExit(t, cfg, run)
+			recordTraceOrError(t, trace, "runtime_exit", map[string]any{
+				"phase": "cleanup",
+				"err":   traceErr(run.err),
+			})
 			runDone = true
 		}
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -151,20 +207,29 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		require.NoError(t, rt.Close(closeCtx))
 	}()
 
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "wait_begin"})
 	waitForBarrier(t, cfg, "after-bootstrap", afterBootstrap, run)
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "barrier_reached"})
+	recordGetRepoFaults(t, trace, "after-bootstrap", faultPlan)
 	assertFaultPlanFired(t, cfg, faultPlan)
 	assertBootstrapOracleMatches(t, dataDir, w, cfg)
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "release"})
 	afterBootstrap.Release()
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "after_release"})
 
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-merge", "marker": "wait_begin"})
 	waitForBarrier(t, cfg, "after-merge", afterMerge, run)
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-merge", "marker": "barrier_reached"})
 	assertOracleMatches(t, dataDir, w, cfg, "after-merge")
 	afterMergeCompaction := compaction.Last(t)
 	assertCompacted(t, dataDir, afterMergeCompaction.Watermark, cfg, "after-merge")
 	faultPlan.ArmSubscribeReposDisconnects()
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-merge", "marker": "release"})
 	afterMerge.Release()
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-merge", "marker": "after_release"})
 
 	publicURL := waitForRuntimePublicURL(t, cfg, rt, run)
-	_ = collectSubscribeReplay(t, cfg, run, publicURL, 0, afterMergeCompaction.Watermark)
+	_ = collectSubscribeReplay(t, cfg, run, trace, publicURL, 0, afterMergeCompaction.Watermark)
 	passesBeforeSteady := compaction.Count()
 
 	generateN(t, w, cfg.LiveEventsSteady)
@@ -172,6 +237,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	_, err = w.GenerateSilentMutationThenSyncForTest(t.Context(), syncIdx)
 	require.NoError(t, err)
 	targetSeq := w.CurrentSeq()
+	recordTraceOrError(t, trace, "steady_target", map[string]any{"target_seq": targetSeq})
 	steadyAck.Wait(t, cfg, targetSeq, run, 30*time.Second)
 
 	asyncIdx := pickActiveOracleAccount(t, w, cfg)
@@ -185,7 +251,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	require.Greaterf(t, steadyCompaction.Watermark, afterMergeCompaction.Watermark,
 		"steady compaction watermark did not advance: mode=%s seed=%d after_merge_watermark=%d steady_watermark=%d",
 		cfg.Mode, cfg.Seed, afterMergeCompaction.Watermark, steadyCompaction.Watermark)
-	served := collectSubscribeReplay(t, cfg, run, publicURL, 0, steadyCompaction.Watermark)
+	served := collectSubscribeReplay(t, cfg, run, trace, publicURL, 0, steadyCompaction.Watermark)
 	require.NoErrorf(t, CheckCompacted(served, steadyCompaction.Watermark),
 		"served subscribe replay compacted check failed: mode=%s seed=%d watermark=%d",
 		cfg.Mode, cfg.Seed, steadyCompaction.Watermark)
@@ -196,12 +262,37 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	// buffers pending events until a block fills or shutdown closes the
 	// consumer; this assertion verifies that graceful shutdown durably
 	// flushes the generated live events.
+	recordTraceOrError(t, trace, "shutdown_start", map[string]any{"phase": "steady-state-shutdown-flush"})
 	cancel()
 	waitForRuntimeExit(t, cfg, run)
+	recordTraceOrError(t, trace, "runtime_exit", map[string]any{
+		"phase": "steady-state-shutdown-flush",
+		"err":   traceErr(run.err),
+	})
 	runDone = true
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "final-assertions", "marker": "begin"})
+	recordSubscribeReposFaults(t, trace, "steady-state-shutdown-flush", faultPlan)
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
 	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "steady-state-shutdown-flush")
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "final-assertions", "marker": "done"})
+	assertTraceContainsKinds(t, tracePath,
+		"run_start",
+		"simulator_config",
+		"fault_plan",
+		"phase",
+		"compaction_pass",
+		"backfill_repo_complete",
+		"faults_fired",
+		"bootstrap_live_event",
+		"steady_state_event",
+		"subscribe_replay_start",
+		"subscribe_replay_event",
+		"subscribe_replay_done",
+		"steady_target",
+		"shutdown_start",
+		"runtime_exit",
+	)
 }
 
 // assertFaultPlanFired verifies the fault injection actually happened.
@@ -240,6 +331,73 @@ func assertSubscribeReposFaultPlanFired(t *testing.T, cfg Config, plan *SwarmFau
 		"subscribeRepos disconnect must be followed by a reconnect")
 }
 
+func recordGetRepoFaults(t *testing.T, trace *Trace, phase string, plan *SwarmFaultPlan) {
+	t.Helper()
+
+	unfiredHTTP := plan.UnfiredGetRepoHTTPFailures()
+	unfiredCAR := plan.UnfiredGetRepoCARTruncations()
+	recordTraceOrError(t, trace, "faults_fired", map[string]any{
+		"phase":                                phase,
+		"scheduled_get_repo_http_failures":     plan.TotalGetRepoHTTPFailures(),
+		"fired_get_repo_http_failures":         totalGetRepoHTTPFailuresFired(plan),
+		"unfired_get_repo_http_failure_dids":   len(unfiredHTTP),
+		"unfired_get_repo_http_failures":       totalIntMap(unfiredHTTP),
+		"scheduled_get_repo_car_truncations":   plan.TotalGetRepoCARTruncations(),
+		"fired_get_repo_car_truncations":       totalGetRepoCARTruncationsFired(plan),
+		"unfired_get_repo_car_truncation_dids": len(unfiredCAR),
+		"unfired_get_repo_car_truncations":     totalIntMap(unfiredCAR),
+	})
+}
+
+func recordSubscribeReposFaults(t *testing.T, trace *Trace, phase string, plan *SwarmFaultPlan) {
+	t.Helper()
+
+	var thresholdCount, connections, disconnects int
+	if plan != nil {
+		thresholdCount = len(plan.SubscribeReposDisconnectThresholds)
+	}
+	if plan != nil && plan.SimulatorFaults != nil {
+		connections = plan.SimulatorFaults.SubscribeReposConnections()
+		disconnects = plan.SimulatorFaults.SubscribeReposDisconnects()
+	}
+	recordTraceOrError(t, trace, "faults_fired", map[string]any{
+		"phase": phase,
+		"subscribe_repos_disconnect_threshold_count": thresholdCount,
+		"subscribe_repos_connections":                connections,
+		"subscribe_repos_disconnects":                disconnects,
+	})
+}
+
+func totalGetRepoHTTPFailuresFired(plan *SwarmFaultPlan) int {
+	if plan == nil || plan.SimulatorFaults == nil {
+		return 0
+	}
+	var total int
+	for did := range plan.GetRepoHTTPFailures {
+		total += plan.SimulatorFaults.GetRepoHTTPFailuresFired(did)
+	}
+	return total
+}
+
+func totalGetRepoCARTruncationsFired(plan *SwarmFaultPlan) int {
+	if plan == nil || plan.SimulatorFaults == nil {
+		return 0
+	}
+	var total int
+	for did := range plan.GetRepoCARTruncations {
+		total += plan.SimulatorFaults.GetRepoCARTruncationsFired(did)
+	}
+	return total
+}
+
+func totalIntMap(values map[string]int) int {
+	var total int
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
 func assertOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Config, phase string) {
 	t.Helper()
 
@@ -276,6 +434,78 @@ func assertBootstrapOracleMatches(t *testing.T, dataDir string, w *world.World, 
 	require.NoErrorf(t, Compare(want, got), "after-bootstrap mode=%s seed=%d: compare oracle model", cfg.Mode, cfg.Seed)
 
 	t.Logf("after-bootstrap: oracle matched %d observed events in mode=%s seed=%d", len(events), cfg.Mode, cfg.Seed)
+}
+
+func recordTraceOrError(t *testing.T, trace *Trace, kind string, data map[string]any) {
+	t.Helper()
+	if err := recordTrace(trace, kind, data); err != nil {
+		t.Errorf("record oracle trace %q: %v", kind, err)
+	}
+}
+
+func traceSegmentEvent(ev *segment.Event) map[string]any {
+	if ev == nil {
+		return map[string]any{"nil": true}
+	}
+	out := map[string]any{
+		"seq":                   ev.Seq,
+		"indexed_at":            ev.IndexedAt,
+		"rendered_at":           ev.RenderedAt,
+		"upstream_relay_cursor": ev.UpstreamRelayCursor,
+		"kind":                  traceSegmentKind(ev.Kind),
+		"kind_code":             uint8(ev.Kind),
+		"did":                   ev.DID,
+		"collection":            ev.Collection,
+		"rkey":                  ev.Rkey,
+		"rev":                   ev.Rev,
+	}
+	if ev.Payload != nil {
+		out["payload"] = tracePayload(ev.Payload)
+	}
+	return out
+}
+
+func traceObservedEvent(ev ObservedEvent) map[string]any {
+	out := map[string]any{
+		"seq":        ev.Seq,
+		"indexed_at": ev.IndexedAt,
+		"kind":       traceSegmentKind(ev.Kind),
+		"kind_code":  uint8(ev.Kind),
+		"did":        ev.DID,
+		"collection": ev.Collection,
+		"rkey":       ev.Rkey,
+		"rev":        ev.Rev,
+	}
+	if ev.Payload != nil {
+		out["payload"] = tracePayload(ev.Payload)
+	}
+	return out
+}
+
+func traceSegmentKind(kind segment.Kind) string {
+	switch kind {
+	case segment.KindCreate:
+		return "create"
+	case segment.KindUpdate:
+		return "update"
+	case segment.KindDelete:
+		return "delete"
+	case segment.KindIdentity:
+		return "identity"
+	case segment.KindAccount:
+		return "account"
+	case segment.KindSync:
+		return "sync"
+	default:
+		return fmt.Sprintf("unknown-%d", kind)
+	}
+}
+
+func traceErr(err error) any {
+	if err == nil {
+		return nil
+	}
+	return err.Error()
 }
 
 type phaseGate struct {
@@ -715,4 +945,14 @@ func (g *bootstrapTrafficGenerator) AfterRepoComplete(ctx context.Context, _ atm
 		return g.afterBatch(ctx, lastSeq)
 	}
 	return nil
+}
+
+func (g *bootstrapTrafficGenerator) Snapshot() (completed, generated int) {
+	if g == nil {
+		return 0, 0
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.completed, g.generated
 }
