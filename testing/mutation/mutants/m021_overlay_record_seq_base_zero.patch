@@ -1,0 +1,27 @@
+mutant: m021_overlay_record_seq_base_zero
+target: internal/overlay/format.go
+failure-mode: |
+  encodeBody encodes record-tombstone seq deltas against base 0 instead
+  of the watermark W. The decoder adds W back, inflating every
+  record-tombstone seq by W. Inflated tombstone seqs suppress records
+  they should not, corrupting the client's view.
+expected-detection: |
+  assertOverlayReconstruction: inflated tombstone seqs (decoded as
+  W+seq) exceed legitimate record seqs and wrongly suppress live
+  records -> 'failed to emit a live record'. Default tier.
+expected-tier: default
+tiers: default
+
+diff --git a/internal/overlay/format.go b/internal/overlay/format.go
+index 10bfdf0..bd6a160 100644
+--- a/internal/overlay/format.go
++++ b/internal/overlay/format.go
+@@ -167,7 +167,7 @@ func encodeBody(snap tombstone.Snapshot, seqBase uint64) []byte {
+ 		})
+ 		buf = appendUvarint(buf, uint64(didID[did]))
+ 		buf = appendUvarint(buf, uint64(len(entries)))
+-		prev := seqBase
++		prev := uint64(0)
+ 		for _, e := range entries {
+ 			buf = appendUvarint(buf, uint64(collID[e.coll]))
+ 			buf = appendUvarint(buf, uint64(len(e.rkey)))

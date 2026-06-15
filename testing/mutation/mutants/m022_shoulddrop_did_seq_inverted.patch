@@ -1,0 +1,26 @@
+mutant: m022_shoulddrop_did_seq_inverted
+target: internal/tombstone/tombstone.go
+failure-mode: |
+  ShouldDrop inverts the DID-tombstone seq comparison (> becomes <), so
+  account-delete/sync tombstones suppress the wrong rows: superseded
+  records survive and live records get dropped.
+expected-detection: |
+  CheckCompacted ('superseded account/sync row survived') and/or
+  assertOverlayReconstruction in TestOracle_DefaultLifecycle. Default
+  tier.
+expected-tier: default
+tiers: default
+
+diff --git a/internal/tombstone/tombstone.go b/internal/tombstone/tombstone.go
+index 8e04306..7776583 100644
+--- a/internal/tombstone/tombstone.go
++++ b/internal/tombstone/tombstone.go
+@@ -173,7 +173,7 @@ func (s Snapshot) ShouldDrop(ev *segment.Event) (bool, string) {
+ 	if ev.Kind != segment.KindCreate && ev.Kind != segment.KindUpdate {
+ 		return false, ""
+ 	}
+-	if ts, ok := s.DIDs[ev.DID]; ok && ts.Seq > ev.Seq {
++	if ts, ok := s.DIDs[ev.DID]; ok && ts.Seq < ev.Seq {
+ 		return true, ts.Reason
+ 	}
+ 	key := RecordKey{DID: ev.DID, Collection: ev.Collection, Rkey: ev.Rkey}

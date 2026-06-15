@@ -1,0 +1,30 @@
+mutant: m019_overlay_drop_record_tombstones
+target: internal/overlay/format.go
+failure-mode: |
+  encodeBody omits all record tombstones from the served overlay blob
+  (group count forced to 0). Models an encoder bug that silently drops
+  the record-deletion/update section. A client overlaying this blob
+  would fail to suppress records deleted in the (W,M] window.
+expected-detection: |
+  assertOverlayReconstruction in TestOracle_DefaultLifecycle: the
+  decoded overlay lacks record tombstones, so a deleted record in
+  (W,M] is emitted -> 'emitted a record that ground truth deleted'.
+  Default tier.
+expected-tier: default
+tiers: default
+
+diff --git a/internal/overlay/format.go b/internal/overlay/format.go
+index 10bfdf0..7150995 100644
+--- a/internal/overlay/format.go
++++ b/internal/overlay/format.go
+@@ -153,8 +153,8 @@ func encodeBody(snap tombstone.Snapshot, seqBase uint64) []byte {
+ 	}
+ 	sort.Slice(groupDIDs, func(i, j int) bool { return didID[groupDIDs[i]] < didID[groupDIDs[j]] })
+
+-	buf = appendUvarint(buf, uint64(len(groupDIDs)))
+-	for _, did := range groupDIDs {
++	buf = appendUvarint(buf, 0)
++	for _, did := range groupDIDs[:0] {
+ 		entries := byDID[did]
+ 		sort.Slice(entries, func(i, j int) bool {
+ 			if entries[i].seq != entries[j].seq {
