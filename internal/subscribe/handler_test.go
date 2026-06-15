@@ -313,7 +313,7 @@ func readOneFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) []byt
 }
 
 // readOneZstdFrame reads one websocket frame and asserts it is a BINARY
-// frame, then decodes it with the v1 custom dictionary — exactly what a
+// frame, then decodes it with a dictionary-seeded reader — exactly what a
 // v1 client does. Returns the decoded JSON bytes.
 func readOneZstdFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) []byte {
 	t.Helper()
@@ -327,7 +327,7 @@ func readOneZstdFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) [
 	require.NoError(t, err)
 	defer dec.Close()
 	got, err := dec.DecodeAll(frame, nil)
-	require.NoError(t, err, "frame must decode with the v1 custom dictionary")
+	require.NoError(t, err, "frame must decode with a dictionary-seeded reader")
 	return got
 }
 
