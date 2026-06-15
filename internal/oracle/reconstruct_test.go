@@ -76,6 +76,30 @@ func TestCheckInvariantsRejectsSeqRegression(t *testing.T) {
 	require.ErrorContains(t, err, "seq")
 }
 
+func TestCheckInvariantsRejectsEmptyRevOnCommitKind(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		kind segment.Kind
+	}{
+		{name: "create", kind: segment.KindCreate},
+		{name: "update", kind: segment.KindUpdate},
+		{name: "delete", kind: segment.KindDelete},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CheckInvariants([]ObservedEvent{{
+				Seq:        1,
+				Kind:       tt.kind,
+				DID:        "did:plc:a",
+				Collection: "app.bsky.feed.post",
+				Rkey:       "r1",
+			}})
+			require.ErrorContains(t, err, "empty rev")
+		})
+	}
+}
+
 func TestObserveSegmentsPreservesPhysicalOrderForInvariants(t *testing.T) {
 	t.Parallel()
 

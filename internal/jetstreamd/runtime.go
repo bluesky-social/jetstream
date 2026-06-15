@@ -270,6 +270,12 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		coldRd.InvalidateSegment(idx)
 		return nil
 	}
+	var onCompactionPass func(orchestrator.CompactionPassResult)
+	if opts.OnCompactionPass != nil {
+		onCompactionPass = func(result orchestrator.CompactionPassResult) {
+			opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
+		}
+	}
 	orch, err := orchestrator.New(orchestrator.Config{
 		DataDir:        opts.DataDir,
 		Store:          metaStore,
@@ -301,15 +307,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CompactionInterval:       opts.CompactionInterval,
 		CompactionTombstoneCap:   opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers: opts.CompactionRewriteWorkers,
-		OnCompactionPass: func(result orchestrator.CompactionPassResult) {
-			if opts.OnCompactionPass != nil {
-				opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
-			}
-		},
-		BarrierAfterBootstrap: phaseBarrier(opts.BarrierAfterBootstrap),
-		BarrierAfterMerge:     phaseBarrier(opts.BarrierAfterMerge),
-		AfterRepoComplete:     opts.AfterRepoComplete,
-		CrashInjector:         opts.CrashInjector,
+		OnCompactionPass:         onCompactionPass,
+		BarrierAfterBootstrap:    phaseBarrier(opts.BarrierAfterBootstrap),
+		BarrierAfterMerge:        phaseBarrier(opts.BarrierAfterMerge),
+		AfterRepoComplete:        opts.AfterRepoComplete,
+		CrashInjector:            opts.CrashInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			writerPtr.Store(w)
 		},

@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
@@ -135,20 +134,24 @@ func (w *World) generateAccountDelete(ctx context.Context, idx int) ([]byte, err
 	}
 
 	seq := w.seq.Add(1)
+	b := w.db.NewBatch()
+	defer func() { _ = b.Close() }()
+	eventMicros, err := w.nextLogicalClockMicros(b)
+	if err != nil {
+		return nil, err
+	}
 	envelope := &comatproto.SyncSubscribeRepos_Account{
 		DID:    string(a.DID),
 		Active: false,
 		Status: gt.Some("deleted"),
 		Seq:    seq,
-		Time:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		Time:   formatLogicalClockTime(eventMicros),
 	}
 	frame, err := encodeAccountFrame(envelope)
 	if err != nil {
 		return nil, err
 	}
 
-	b := w.db.NewBatch()
-	defer func() { _ = b.Close() }()
 	if err := b.Set(keyAccountDeleted(idx), []byte{1}, nil); err != nil {
 		return nil, fmt.Errorf("world: stage account deleted: %w", err)
 	}

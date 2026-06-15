@@ -75,14 +75,29 @@ func waitForRuntimePublicURL(t *testing.T, cfg Config, rt *jetstreamd.Runtime, r
 	}
 }
 
-func collectSubscribeReplay(t *testing.T, cfg Config, run *runtimeRun, baseURL string, cursor, targetSeq uint64) []ObservedEvent {
+func collectSubscribeReplay(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, baseURL string, cursor, targetSeq uint64) (out []ObservedEvent) {
 	t.Helper()
 
 	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/subscribe?extended=true&cursor=" + strconv.FormatUint(cursor, 10)
+	recordTraceOrError(t, trace, "subscribe_replay_start", map[string]any{
+		"cursor":     cursor,
+		"target_seq": targetSeq,
+	})
+	defer func() {
+		var lastSeq uint64
+		if len(out) > 0 {
+			lastSeq = out[len(out)-1].Seq
+		}
+		recordTraceOrError(t, trace, "subscribe_replay_done", map[string]any{
+			"cursor":      cursor,
+			"target_seq":  targetSeq,
+			"event_count": len(out),
+			"last_seq":    lastSeq,
+		})
+	}()
 	conn := dialSubscribeReplay(t, cfg, run, wsURL)
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "oracle replay complete") }()
 
-	var out []ObservedEvent
 	for {
 		readTimeout := oracleWaitTimeout(cfg)
 		if readTimeout > 10*time.Second {
@@ -115,6 +130,9 @@ func collectSubscribeReplay(t *testing.T, cfg Config, run *runtimeRun, baseURL s
 			"decode subscribe replay frame target_seq=%d mode=%s seed=%d body=%s", targetSeq, cfg.Mode, cfg.Seed, body)
 		ev := observedEventFromSubscribeReplay(t, msg)
 		out = append(out, ev)
+		data := traceObservedEvent(ev)
+		data["frame_kind"] = msg.Kind
+		recordTraceOrError(t, trace, "subscribe_replay_event", data)
 		if targetSeq == 0 || ev.Seq >= targetSeq {
 			return out
 		}
