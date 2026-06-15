@@ -348,20 +348,64 @@ Tombstones are retained as event rows forever. Record tombstones come from `Kind
 
 Segment rewrites preserve block topology and historical seq/indexed-at envelopes. A block whose rows are all dropped remains present as an `event_count=0` block, so manifest block indexes, cursor translation, and cold replay can continue to use stable block numbers across generations. Rewritten files get new checksums; HTTP downloads derive validators from the file descriptor they serve, and the subscribe block cache keys decoded blocks by segment checksum.
 
-We also store tombstones since the most recent compaction in memory in the server. Today this powers steady-state compaction and early cap-triggered passes. A future read-time overlay will expose this same structure to backfill clients so they can suppress rows newer than the physical compaction watermark.
+We also store tombstones since the most recent compaction in memory in the server. This powers steady-state compaction and early cap-triggered passes, and it backs the read-time overlay endpoint described next, which exposes the same structure to backfill clients so they can suppress rows newer than the physical compaction watermark.
+
+#### Compaction overlay endpoint (`network.bsky.jetstream.getTombstones`)
+
+The server exposes the in-memory tombstone set as an XRPC query, `network.bsky.jetstream.getTombstones`, an `application/octet-stream` query like `getSegment`. It serves a precomputed, immutable, zstd-compressed binary blob covering the seq range `(W, M]`, where `W` is the compaction watermark (`compaction/seq`) and `M` is the highest seq folded into the blob. The blob is rebuilt on each compaction pass and on a short coalescing interval, then shared verbatim by all readers (no per-request encode). This endpoint is not CDN-cacheable in practice — deletes/updates arrive continuously, so the blob changes every second or so — but it still emits a strong ETag for opportunistic revalidation.
+
+The blob unifies the three compaction data types into one seq-bounded suppression set: record deletions and record updates key `(did, collection, rkey) → seq`; account deletions (`active=false, status=deleted`) and `#sync` divergences key `did → (seq, reason)`. A client suppresses any `Create`/`Update` row whose `seq` is strictly less than the matching tombstone's `seq`. Because the mask is a half-open seq window (`seq < tombstone.seq`), there is **no permanent-tombstone problem**: a DID deleted at seq 100 and reactivated/posting at seq 200 is not masked (200 ≥ 100). Updates carry no payload in the overlay — the replacement `#commit` row is delivered by its own segment/live row; the overlay only suppresses the stale create.
+
+The wire format is self-describing. All multi-byte integers are little-endian; "varint" is LEB128 unsigned. `W` and `M` live in the uncompressed framing so a query plan can read the coverage envelope without decompressing the body (they are also echoed in the `Jetstream-Overlay-Watermark` / `Jetstream-Overlay-Max-Seq` response headers):
+
+```
+getTombstones overlay blob (.jsto framing):
+┌──────────────────────────────────────────────────────────┐
+│ Uncompressed framing (32 bytes)                          │
+│   magic:      [4]byte = "jsto"                           │
+│   version:    uint16 = 1                                 │
+│   flags:      uint16 (reserved, 0)                       │
+│   watermark:  uint64  (W = compaction/seq at build time) │
+│   max_seq:    uint64  (M = highest seq folded in)        │
+│   body_len:   uint64  (compressed byte length)           │
+├──────────────────────────────────────────────────────────┤
+│ Body (single ZSTD frame), decompresses to:               │
+│   DID string table:    count varint, (len varint, bytes)*│
+│     -> didID = table index                               │
+│   Collection NSID table: count varint, (len varint,bytes)*│
+│     -> collID = table index                              │
+│   Record tombstones, grouped by didID ascending:         │
+│     group_count varint                                   │
+│     per group: didID varint, entry_count varint,         │
+│       entries sorted by seq (seq delta-varint within the │
+│       group, first delta = seq - W):                     │
+│         collID varint, rkey_len varint, rkey [len]byte,  │
+│         seq_delta varint                                 │
+│   DID tombstones, ascending by didID:                    │
+│     did_tomb_count varint                                │
+│     per entry: didID varint, seq_delta varint (first vs  │
+│       W, then vs prev), reason uint8 (1=account, 2=sync) │
+└──────────────────────────────────────────────────────────┘
+```
+
+The columnar layout with DID/NSID dictionaries and delta-varint seqs is measurably smaller than flat rows after zstd (~20% fewer wire bytes at 1M tombstones), because an explicit dictionary dedups DIDs globally where zstd's bounded match window cannot. An empty overlay (nothing in `(W, M]`) is valid and common: zero-count tables and a tiny body, not an error.
+
+**A stale blob is stale-but-coherent, not incorrect.** Each build is an atomic snapshot, so the blob always reports the exact `W` and `M` it covers — it can never claim an `M` it does not cover. The query plan resumes the client's `/subscribe` tail from the blob's actual `M`, so whatever a slightly-stale overlay omits above `M` is delivered on the live tail instead. Staleness only costs a few seconds of extra live replay, never correctness.
+
+The **client decoder/overlay applier and the query-plan negotiation** (which segments to download, per-segment cache directives, and setting the `/subscribe` cursor to `M`) are future work; only the server endpoint ships now. The query plan is what closes the stale-cached-segment window noted at the end of this section: it must guarantee the client never reads a segment generation older than the overlay's `W`, by marking still-rewritable segments must-revalidate.
 
 Putting it all together, the query plan and client code looks something like the following:
 
 1. The client connects to the jetstream live tail and starts receiving the most recent records
 2. The client negotiates a plan of which segment file blocks it must download to satisfy a particular query (i.e. “give me all `standard.site` documents”)
-3. Future read-overlay work: the client downloads the list of recent deletions and updates above `compaction/seq`
+3. The client downloads the overlay blob of recent deletions and updates above `compaction/seq` from `network.bsky.jetstream.getTombstones` (server endpoint shipped; see above)
 4. The client begins downloading the segment file blocks and decompresses them in an attempt to emit records that match the user’s query
-5. Future read-overlay work: if the record's DID is in the suppression set of deleted accounts, suppress the row
-6. Future read-overlay work: if the URI of the record from the segment file maps to a known deletion tombstone, suppress the row
-7. Future read-overlay work: if the URI of the record from the segment file maps to a known update, emit the record with the replacement rev and payload
+5. Future client work: if the record's DID is in the overlay's DID-tombstone suppression set (deleted account or sync divergence) at a higher seq, suppress the row
+6. Future client work: if the record's URI maps to an overlay record tombstone (delete/update) at a higher seq, suppress the row
+7. The replacement for an updated record is delivered as its own `#commit` row (suppress-old + deliver-new), so the overlay carries no payloads
 8. Emit the row as-is (no updates or deletes have been applied to this record)
 
-Steps 3 and 5–7 are the client-side tombstone overlay covering the window above `compaction/seq`; until that ships, rows in that window may include data superseded after the last compaction pass (bounded by the compaction interval plus segment cache max-age).
+Step 3's server endpoint ships now; the client-side application in steps 5–6 is future work. The overlay covers the window above `compaction/seq`; until the client consumer ships, rows in that window may include data superseded after the last compaction pass (bounded by the compaction interval plus segment cache max-age).
 
 ### 3.4 File Organization
 
