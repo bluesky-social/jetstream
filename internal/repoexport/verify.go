@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
@@ -23,6 +24,11 @@ type VerifyConfig struct {
 	DataDir  string
 	DID      string
 	RelayURL string
+
+	// PendingEvents are the live writer's not-yet-flushed events, folded
+	// into the local reconstruction so a record created moments ago is
+	// reflected before the next compaction flush. See Config.PendingEvents.
+	PendingEvents []segment.Event
 }
 
 // VerifyReport describes the outcome of comparing a local reconstruction
@@ -68,8 +74,9 @@ func Verify(ctx context.Context, cfg VerifyConfig) (VerifyReport, error) {
 	}
 
 	snap, err := Reconstruct(ctx, Config{
-		DataDir: cfg.DataDir,
-		DID:     cfg.DID,
+		DataDir:       cfg.DataDir,
+		DID:           cfg.DID,
+		PendingEvents: cfg.PendingEvents,
 	})
 	if err != nil {
 		if errors.Is(err, ErrNoLocalRepo) {

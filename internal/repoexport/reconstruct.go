@@ -25,6 +25,16 @@ var ErrNoLocalRepo = errors.New("repoexport: no local commit events for DID")
 type Config struct {
 	DataDir string
 	DID     string
+
+	// PendingEvents are events buffered in the live writer's in-memory
+	// pending block that have not yet been flushed to a segment file on
+	// disk. They are replayed after all on-disk segments so a record
+	// created moments ago (e.g. a like) is reflected in the snapshot
+	// immediately, rather than only after the next compaction-driven
+	// flush rotates the active segment. Optional; nil for offline
+	// reconstruction with no live writer. The slice is the caller's
+	// already-copied SnapshotPending() result and is not mutated.
+	PendingEvents []segment.Event
 }
 
 // Snapshot is the reconstructed repo state for one DID.
@@ -59,6 +69,14 @@ func Reconstruct(ctx context.Context, cfg Config) (Snapshot, error) {
 	}
 	primaryWatermark := state.latestRev
 	if err := replayDir(ctx, filepath.Join(cfg.DataDir, "backfill", "live_segments"), primaryWatermark, &state); err != nil {
+		return Snapshot{}, err
+	}
+
+	// Pending events live in the live writer's active segment, after every
+	// block already flushed to disk, so they carry the newest revs and need
+	// no watermark filter. replayEvents applies the same DID/kind filtering
+	// as the on-disk path.
+	if err := replayEvents(ctx, cfg.PendingEvents, "", &state); err != nil {
 		return Snapshot{}, err
 	}
 

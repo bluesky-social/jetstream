@@ -235,6 +235,70 @@ func TestReconstruct_ActiveSegmentUsesWalkActive(t *testing.T) {
 	require.Equal(t, wantCount, got.RecordCount)
 }
 
+func TestReconstruct_IncludesPendingWriterEvents(t *testing.T) {
+	t.Parallel()
+
+	dataDir, st := newTestDataDir(t)
+	// On disk: one record already flushed to a sealed segment.
+	disk := []segment.Event{
+		createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1")),
+	}
+	writeSegmentTree(t, st, filepath.Join(dataDir, "segments"), disk)
+
+	// In the live writer's in-memory pending block but NOT yet flushed to
+	// disk: e.g. a like the user just created. Reconstruct must see it so
+	// the status page's MST verification matches immediately instead of
+	// waiting for the next compaction-driven flush.
+	pending := []segment.Event{
+		createEvent(testDID, "app.bsky.feed.like", "r2", "rev2", payload("2")),
+	}
+
+	wantRoot, wantCount := expectedRoot(t, append(append([]segment.Event(nil), disk...), pending...))
+	got, err := Reconstruct(context.Background(), Config{
+		DataDir:       dataDir,
+		DID:           testDID,
+		PendingEvents: pending,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "rev2", got.LatestRev)
+	require.Equal(t, wantRoot, got.Root)
+	require.Equal(t, wantCount, got.RecordCount)
+}
+
+func TestReconstruct_PendingEventsFilterByDIDAndKind(t *testing.T) {
+	t.Parallel()
+
+	dataDir, st := newTestDataDir(t)
+	disk := []segment.Event{
+		createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1")),
+	}
+	writeSegmentTree(t, st, filepath.Join(dataDir, "segments"), disk)
+
+	// SnapshotPending returns every pending event in the active block,
+	// across all DIDs and kinds. Reconstruct must apply the same filtering
+	// it applies to on-disk events: only this DID's commit events count.
+	pending := []segment.Event{
+		createEvent("did:plc:other", "app.bsky.feed.post", "x1", "rev9", payload("3")),
+		{Kind: segment.KindIdentity, DID: testDID, Rev: "identity-rev"},
+		updateEvent(testDID, "app.bsky.feed.post", "r1", "rev2", payload("2")),
+	}
+
+	wantEvents := []segment.Event{
+		disk[0],
+		updateEvent(testDID, "app.bsky.feed.post", "r1", "rev2", payload("2")),
+	}
+	wantRoot, wantCount := expectedRoot(t, wantEvents)
+	got, err := Reconstruct(context.Background(), Config{
+		DataDir:       dataDir,
+		DID:           testDID,
+		PendingEvents: pending,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "rev2", got.LatestRev)
+	require.Equal(t, wantRoot, got.Root)
+	require.Equal(t, wantCount, got.RecordCount)
+}
+
 func TestReconstruct_ValidatesConfig(t *testing.T) {
 	t.Parallel()
 

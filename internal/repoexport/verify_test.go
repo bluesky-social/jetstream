@@ -48,6 +48,38 @@ func TestVerify_MatchingRoots(t *testing.T) {
 	}, report)
 }
 
+func TestVerify_PendingEventsMatchAuthoritativeRoot(t *testing.T) {
+	t.Parallel()
+
+	// The authoritative repo already reflects both records.
+	authoritativeEvents := []segment.Event{
+		createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1")),
+		createEvent(testDID, "app.bsky.feed.like", "r2", "rev2", payload("2")),
+	}
+	carBytes, authoritativeRoot := authoritativeCAR(t, testDID, testAuthoritativeRev, authoritativeEvents)
+	relay := newGetRepoServer(t, testDID, carBytes)
+
+	// Locally, only the first record made it to disk; the second (the
+	// just-created like) is still in the live writer's pending block.
+	// Without folding pending events in, Verify reports a root mismatch
+	// even though the local state is actually current.
+	dataDir, st := newTestDataDir(t)
+	writeSegmentTree(t, st, filepath.Join(dataDir, "segments"), authoritativeEvents[:1])
+	pending := authoritativeEvents[1:]
+
+	report, err := Verify(t.Context(), VerifyConfig{
+		DataDir:       dataDir,
+		DID:           testDID,
+		RelayURL:      relay.URL,
+		PendingEvents: pending,
+	})
+	require.NoError(t, err)
+	require.True(t, report.Match, "expected pending like to close the gap; message=%q", report.Message)
+	require.Equal(t, authoritativeRoot.String(), report.LocalRoot)
+	require.Equal(t, "rev2", report.LocalLatestRev)
+	require.Equal(t, 2, report.LocalRecordCount)
+}
+
 func TestVerify_MismatchingRootsReturnsReport(t *testing.T) {
 	t.Parallel()
 
