@@ -17,6 +17,7 @@ type EventLogRow struct {
 	Rev              string `json:"rev,omitempty"`
 	PayloadLen       int    `json:"payload_len,omitempty"`
 	PayloadSHA256_64 string `json:"payload_sha256_64,omitempty"`
+	AccountDeleted   bool   `json:"account_deleted,omitempty"`
 }
 
 func NormalizeEventLog(events []ObservedEvent) []EventLogRow {
@@ -34,6 +35,9 @@ func NormalizeEventLog(events []ObservedEvent) []EventLogRow {
 			sum := sha256.Sum256(ev.Payload)
 			row.PayloadLen = len(ev.Payload)
 			row.PayloadSHA256_64 = hex.EncodeToString(sum[:8])
+		}
+		if ev.Kind == segment.KindAccount {
+			row.AccountDeleted, _ = oracleAccountDeleted(ev.Payload)
 		}
 		out = append(out, row)
 	}
@@ -69,6 +73,51 @@ func CompareEventLogs(want, got []EventLogRow) error {
 	return nil
 }
 
+func CompareEventLogsCompacted(want, got []EventLogRow, watermark uint64) error {
+	return CompareEventLogs(filterCompactedExpectedRows(want, watermark), got)
+}
+
+func filterCompactedExpectedRows(rows []EventLogRow, watermark uint64) []EventLogRow {
+	recordTombstones := make(map[RecordKey]uint64)
+	didTombstones := make(map[string]uint64)
+
+	for _, row := range rows {
+		if row.Seq > watermark {
+			continue
+		}
+		switch row.Kind {
+		case "delete", "update":
+			key := RecordKey{DID: row.DID, Collection: row.Collection, Rkey: row.Rkey}
+			if row.Seq > recordTombstones[key] {
+				recordTombstones[key] = row.Seq
+			}
+		case "sync":
+			if row.Seq > didTombstones[row.DID] {
+				didTombstones[row.DID] = row.Seq
+			}
+		case "account":
+			if !row.AccountDeleted {
+				continue
+			}
+			if row.Seq > didTombstones[row.DID] {
+				didTombstones[row.DID] = row.Seq
+			}
+		}
+	}
+
+	out := make([]EventLogRow, 0, len(rows))
+	for _, row := range rows {
+		if row.Seq <= watermark && (row.Kind == "create" || row.Kind == "update") {
+			key := RecordKey{DID: row.DID, Collection: row.Collection, Rkey: row.Rkey}
+			if recordTombstones[key] > row.Seq || didTombstones[row.DID] > row.Seq {
+				continue
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
 func eventLogContains(rows []EventLogRow, target EventLogRow) bool {
 	for _, row := range rows {
 		if row == target {
@@ -98,6 +147,9 @@ func eventLogMismatchFields(want, got EventLogRow) string {
 	if want.PayloadLen != got.PayloadLen || want.PayloadSHA256_64 != got.PayloadSHA256_64 {
 		out += " payload"
 	}
+	if want.AccountDeleted != got.AccountDeleted {
+		out += " account_deleted"
+	}
 	if out == "" {
 		return ""
 	}
@@ -105,8 +157,8 @@ func eventLogMismatchFields(want, got EventLogRow) string {
 }
 
 func (r EventLogRow) describe() string {
-	return fmt.Sprintf("seq=%d kind=%s did=%s key=%s/%s rev=%s payload_len=%d payload_sha256_64=%s",
-		r.Seq, r.Kind, r.DID, r.Collection, r.Rkey, r.Rev, r.PayloadLen, r.PayloadSHA256_64)
+	return fmt.Sprintf("seq=%d kind=%s did=%s key=%s/%s rev=%s payload_len=%d payload_sha256_64=%s account_deleted=%t",
+		r.Seq, r.Kind, r.DID, r.Collection, r.Rkey, r.Rev, r.PayloadLen, r.PayloadSHA256_64, r.AccountDeleted)
 }
 
 func eventLogKind(kind segment.Kind) string {

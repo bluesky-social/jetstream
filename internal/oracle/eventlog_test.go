@@ -133,3 +133,93 @@ func TestCompareEventLogsRejectsOrderMismatch(t *testing.T) {
 	require.ErrorContains(t, err, "want seq=1")
 	require.ErrorContains(t, err, "got seq=2")
 }
+
+func TestCompareEventLogsCompactedAllowsSupersededCreateBelowWatermark(t *testing.T) {
+	t.Parallel()
+
+	old := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev1", Payload: []byte("old")}
+	update := ObservedEvent{Seq: 2, Kind: segment.KindUpdate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev2", Payload: []byte("new")}
+
+	require.Error(t, CompareEventLogs(NormalizeEventLog([]ObservedEvent{old, update}), NormalizeEventLog([]ObservedEvent{update})),
+		"strict comparison must still reject missing rows")
+	require.NoError(t, CompareEventLogsCompacted(
+		NormalizeEventLog([]ObservedEvent{old, update}),
+		NormalizeEventLog([]ObservedEvent{update}),
+		2,
+	))
+}
+
+func TestCompareEventLogsCompactedAllowsRowsSupersededByDIDTombstoneBelowWatermark(t *testing.T) {
+	t.Parallel()
+
+	old := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev1", Payload: []byte("old")}
+	sync := ObservedEvent{Seq: 2, Kind: segment.KindSync, DID: "did:plc:a", Rev: "rev2"}
+	other := ObservedEvent{Seq: 3, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "c", Rkey: "r", Rev: "rev1", Payload: []byte("other")}
+	account := ObservedEvent{Seq: 4, Kind: segment.KindAccount, DID: "did:plc:b", Payload: oracleAccountPayload(t, false, "deleted")}
+
+	require.NoError(t, CompareEventLogsCompacted(
+		NormalizeEventLog([]ObservedEvent{old, sync, other, account}),
+		NormalizeEventLog([]ObservedEvent{sync, account}),
+		4,
+	))
+}
+
+func TestCompareEventLogsCompactedRejectsMissingRowAboveWatermark(t *testing.T) {
+	t.Parallel()
+
+	old := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev1", Payload: []byte("old")}
+	update := ObservedEvent{Seq: 2, Kind: segment.KindUpdate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev2", Payload: []byte("new")}
+
+	err := CompareEventLogsCompacted(
+		NormalizeEventLog([]ObservedEvent{old, update}),
+		NormalizeEventLog([]ObservedEvent{update}),
+		1,
+	)
+	require.ErrorContains(t, err, "missing expected event")
+	require.ErrorContains(t, err, "seq=1")
+}
+
+func TestCompareEventLogsCompactedRejectsMissingTombstone(t *testing.T) {
+	t.Parallel()
+
+	old := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev1", Payload: []byte("old")}
+	deleted := ObservedEvent{Seq: 2, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev2"}
+
+	err := CompareEventLogsCompacted(
+		NormalizeEventLog([]ObservedEvent{old, deleted}),
+		NormalizeEventLog([]ObservedEvent{}),
+		2,
+	)
+	require.ErrorContains(t, err, "missing expected event")
+	require.ErrorContains(t, err, "seq=2")
+	require.ErrorContains(t, err, "kind=delete")
+}
+
+func TestCompareEventLogsCompactedRejectsMissingRowBeforeNonDeletedAccountEvent(t *testing.T) {
+	t.Parallel()
+
+	old := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev1", Payload: []byte("old")}
+	account := ObservedEvent{Seq: 2, Kind: segment.KindAccount, DID: "did:plc:a", Payload: oracleAccountPayload(t, false, "suspended")}
+
+	err := CompareEventLogsCompacted(
+		NormalizeEventLog([]ObservedEvent{old, account}),
+		NormalizeEventLog([]ObservedEvent{account}),
+		2,
+	)
+	require.ErrorContains(t, err, "missing expected event")
+	require.ErrorContains(t, err, "seq=1")
+}
+
+func TestCompareEventLogsCompactedRejectsUnjustifiedMissingCreate(t *testing.T) {
+	t.Parallel()
+
+	old := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev1", Payload: []byte("old")}
+
+	err := CompareEventLogsCompacted(
+		NormalizeEventLog([]ObservedEvent{old}),
+		nil,
+		1,
+	)
+	require.ErrorContains(t, err, "missing expected event")
+	require.ErrorContains(t, err, "seq=1")
+}
