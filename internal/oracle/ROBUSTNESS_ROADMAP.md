@@ -1,8 +1,8 @@
 # Oracle Robustness Roadmap
 
 Date: 2026-06-15
-Status: Milestone A complete on branch `testing-revamp`; Milestones B-E
-remain planned.
+Status: Milestone A merged to `main` via PR #22; Milestones B-E remain
+planned.
 
 ## Purpose
 
@@ -26,7 +26,7 @@ This document folds together the current oracle code review,
 
 ## Current Implementation Status
 
-Milestone A, "Stronger Existing Oracle", is complete on `testing-revamp`:
+Milestone A, "Stronger Existing Oracle", is complete on `main` via PR #22:
 
 - Workstream 1 closed known assertion gaps and updated mutation dispositions
   via issues #9 and commits `1967891` / `e143db7`.
@@ -136,7 +136,7 @@ to use them.
 
 ## Workstream 1: Close Known Assertion Gaps
 
-Status: complete on `testing-revamp` via issue #9 and commits `1967891` /
+Status: complete on `main` via issue #9, PR #22, and commits `1967891` /
 `e143db7`.
 
 ### Rationale
@@ -709,7 +709,7 @@ Prototype narrow uses of:
 
 ### Milestone A: Stronger Existing Oracle
 
-Status: complete on `testing-revamp`.
+Status: complete on `main` via PR #22.
 
 1. Close mutation assertion gaps. Complete.
 2. Add canonical trace recorder. Complete.
