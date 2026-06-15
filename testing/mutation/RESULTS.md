@@ -16,6 +16,34 @@ remain below so the reasoning is not lost.
 | m007_compaction_chunk_boundary | 2026-06-15 | Invalid/dead under current compaction chunk construction; the modeled corrupt shape cannot be produced by current chunk snapshots. |
 | m010_nextblockoffset_reset | 2026-06-15 | Stale/dead for sealed oracle observations; `Writer.Seal` rebuilds footer block metadata from physical frames. |
 
+## Active catalog check 2026-06-15 — retired mutants removed
+
+- commit under test: `767792e`
+- driver: `just mutation-campaign`
+- catalog: 17 active mutants; retired mutants `m007` and `m010` are absent
+- purpose: verify the active catalog still runs after removing stale/dead
+  legacy patches
+
+| mutant | result | note |
+|---|---|---|
+| m001_delete_mapped_to_update | KILLED@default | default oracle killed the mutant |
+| m002_watermark_floor_off_by_one | SURVIVED | known seed-dependent/future-roadmap gap |
+| m003_merge_cursor_no_advance | SURVIVED | known restart-depth gap |
+| m004_rev_filter_inverted | KILLED@default | missing expected event diagnostic |
+| m005_backfill_status_check_inverted | KILLED@stress | rev-regression diagnostic |
+| m006_merge_commit_error_swallowed | SURVIVED | known store-fault gap |
+| m008_header_offset_byteslice | KILLED@default | default oracle killed the mutant |
+| m009_checksum_range_off_by_one | SURVIVED | known closed-loop checksum blind spot |
+| m011_wire_frame_length | KILLED@default | active segment walk failed |
+| m012_block_event_count_off_by_one | KILLED@default | default oracle killed the mutant |
+| m013_collection_rkey_swap | SURVIVED | known dead path in this simulator config; companion `m017` covers hot path |
+| m014_rev_dropped | SURVIVED | known dead path in this simulator config; companion `m018` covers hot path |
+| m015_collection_count_double | SURVIVED | known read-path index blind spot |
+| m016_bloom_size_off_by_one | KILLED@default | default oracle killed the mutant |
+| m017_commit_collection_rkey_swap | KILLED@default | event-log mismatch diagnostic |
+| m018_commit_rev_dropped | KILLED@default | event-log mismatch diagnostic |
+| m019_sync_tombstone_dropped | KILLED@default | event-log equivalence caught missing sync row |
+
 ## Targeted follow-up 2026-06-15 — event-log equivalence
 
 - commit under test: branch `testing-revamp` after
