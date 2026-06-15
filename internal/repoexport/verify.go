@@ -25,6 +25,10 @@ type VerifyConfig struct {
 	DID      string
 	RelayURL string
 
+	// Selector prunes which segments/blocks reconstruction decodes via the
+	// in-memory manifest blooms. Required; see Config.Selector.
+	Selector Selector
+
 	// PendingEvents are the live writer's not-yet-flushed events, folded
 	// into the local reconstruction so a record created moments ago is
 	// reflected before the next compaction flush. See Config.PendingEvents.
@@ -76,6 +80,7 @@ func Verify(ctx context.Context, cfg VerifyConfig) (VerifyReport, error) {
 	snap, err := Reconstruct(ctx, Config{
 		DataDir:       cfg.DataDir,
 		DID:           cfg.DID,
+		Selector:      cfg.Selector,
 		PendingEvents: cfg.PendingEvents,
 	})
 	if err != nil {

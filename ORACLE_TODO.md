@@ -201,10 +201,12 @@ mode, or only under stress with the right seed?
 - [ ] **Break the atmos loop with real data.** Capture a few minutes of real
       production firehose (plus a handful of real `getRepo` CARs from diverse
       PDS implementations) as a committed corpus; replay it through ingest in
-      CI and assert invariants + golden output. Also schedule `verify-repo`
-      against production as a periodic smoke job — the tool already exists
-      (`cmd/jetstream/repo_verify.go`). This is the only defense against
-      "atmos agrees with itself but not the network."
+      CI and assert invariants + golden output. Also schedule a periodic
+      repo-verification smoke job against production by polling the
+      `/status` repo-verification endpoint (the standalone `verify-repo`
+      CLI was removed in favor of the HTTP path, which reuses the live
+      manifest cache). This is the only defense against "atmos agrees with
+      itself but not the network."
 - [ ] **Random-time kill loop** as a nightly companion to the enumerated
       crashpoint tests: SIGKILL at a random moment in a seeded run, restart,
       oracle-check, repeat.

@@ -730,6 +730,90 @@ func (m *Manifest) BlockIndex(idx uint64) ([]segment.BlockInfo, error) {
 	return nil, fmt.Errorf("manifest: unknown segment idx %d", idx)
 }
 
+// SegmentBlockSelection identifies, for one sealed segment, the blocks
+// that may contain a given DID. Blocks holds ascending block indices
+// into the segment's on-disk block array; Path locates the file.
+type SegmentBlockSelection struct {
+	Idx    uint64
+	Path   string
+	Blocks []int
+}
+
+// SelectBlocksForDID returns, for every sealed segment that may contain
+// did, the blocks within it that may hold the DID -- computed entirely
+// from the resident segment and per-block DID blooms, without opening a
+// single segment file. This is the in-memory cache that lets repo
+// reconstruction open only the few segments an account actually touches
+// instead of every sealed segment on disk.
+//
+// The selection inherits SelectBlocksForDID's one-sided contract: no
+// false negatives (every block that holds did is included), possible
+// false positives (a returned block may not hold did; the caller
+// filters per-event after decode). Segments whose segment-level bloom
+// misses are omitted entirely. Results are ascending by segment Idx;
+// the returned slices are fresh and safe for the caller to retain.
+func (m *Manifest) SelectBlocksForDID(did string) ([]SegmentBlockSelection, error) {
+	if err := m.waitReady(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var out []SegmentBlockSelection
+	for i := range m.segments {
+		seg := &m.segments[i]
+		blocks := segment.SelectBlocksForDID(seg.SegmentBloom, seg.BlockBlooms, did)
+		if len(blocks) == 0 {
+			continue
+		}
+		out = append(out, SegmentBlockSelection{
+			Idx:    seg.Idx,
+			Path:   seg.Path,
+			Blocks: blocks,
+		})
+	}
+	return out, nil
+}
+
+// ActiveSegmentPaths returns the paths of seg_*.jss files in SegmentsDir
+// that are NOT resident in the manifest -- i.e. the active (unsealed)
+// segment, plus any segment sealed so recently that OnSegmentSealed has
+// not yet refreshed the manifest. The manifest only gains a segment's
+// blooms at seal time, so its flushed-but-unsealed blocks are invisible
+// to SelectBlocksForDID; callers that need a complete view (repo
+// reconstruction) must scan these files directly.
+//
+// Returning a just-sealed file here is safe and deliberate: the caller
+// replays it through a path that handles both active and sealed files,
+// so a seal racing this call causes idempotent double-coverage, never a
+// missed block. Ascending by path; empty when every on-disk segment is
+// resident.
+func (m *Manifest) ActiveSegmentPaths() ([]string, error) {
+	if err := m.waitReady(); err != nil {
+		return nil, err
+	}
+	files, err := ingest.SegmentFiles(m.opts.SegmentsDir)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: list active segments: %w", err)
+	}
+
+	m.mu.RLock()
+	resident := make(map[uint64]struct{}, len(m.segments))
+	for i := range m.segments {
+		resident[m.segments[i].Idx] = struct{}{}
+	}
+	m.mu.RUnlock()
+
+	var out []string
+	for _, f := range files {
+		if _, ok := resident[f.Idx]; ok {
+			continue
+		}
+		out = append(out, f.Path)
+	}
+	return out, nil
+}
+
 // SegmentBloom returns the resident segment-level DID bloom for segment idx.
 func (m *Manifest) SegmentBloom(idx uint64) (*gloom.Filter, error) {
 	if err := m.waitReady(); err != nil {

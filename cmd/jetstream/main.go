@@ -111,7 +111,6 @@ func newApp() *cli.Command {
 			versionCommand(),
 			inspectSegmentCommand(),
 			inspectAllCommand(),
-			verifyRepoCommand(),
 		},
 	}
 }

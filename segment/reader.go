@@ -411,30 +411,19 @@ func (r *Reader) LoadAllBlockBlooms() ([]*gloom.Filter, error) {
 }
 
 // BlocksContainingDID returns the ascending indices of blocks that may
-// contain an event for did, using the segment's DID bloom filters to
-// prune. It is the read-path counterpart to the pushdown rewrite.go
-// already uses during compaction.
+// contain an event for did, reading the segment's per-block DID blooms
+// from disk and applying SelectBlocksForDID. It is the file-backed
+// counterpart to the manifest's in-memory selection; both share the
+// same SelectBlocksForDID decision so they can never diverge.
 //
-// The contract is one-sided, exactly as bloom filters allow: there are
-// never false negatives, so every block that actually holds did is
-// included; there may be false positives, so a returned block is not
-// guaranteed to hold did (the caller filters per-event after decode).
-// This lets reconstruction decode only the few blocks an account
-// touches instead of zstd-decompressing the entire archive.
-//
-// Fast paths, in order:
-//   - segment-level bloom miss -> no block holds did; returns nil with
-//     zero block-bloom preads.
-//   - if any bloom is nil/unavailable (corrupt or foreign file), the
-//     block is conservatively included so we never silently drop
-//     records; the cost is a wasted decode, never a wrong result.
+// See SelectBlocksForDID for the one-sided (no-false-negative) contract.
 func (r *Reader) BlocksContainingDID(did string) ([]int, error) {
 	if len(r.blocks) == 0 {
 		return nil, nil
 	}
-	// Segment-level short-circuit: if the whole-segment bloom says the
-	// DID is absent, no block can contain it. This is what collapses a
-	// full-network scan to near-nothing for a single account.
+	// Segment-level short-circuit before paying for the per-block bloom
+	// pread: if the whole-segment bloom says the DID is absent, no block
+	// can contain it.
 	if r.segmentBloom != nil && !r.segmentBloom.TestString(did) {
 		return nil, nil
 	}
@@ -450,13 +439,9 @@ func (r *Reader) BlocksContainingDID(did string) ([]int, error) {
 		return all, nil
 	}
 
-	out := make([]int, 0, len(blooms))
-	for i, bloom := range blooms {
-		if bloom == nil || bloom.TestString(did) {
-			out = append(out, i)
-		}
-	}
-	return out, nil
+	// segBloom is nil here so SelectBlocksForDID does not re-test the
+	// segment bloom (already checked above); pass nil to skip it.
+	return SelectBlocksForDID(nil, blooms, did), nil
 }
 
 // validateBlockOffsets verifies every block's [offset, offset+8+size]

@@ -51,3 +51,23 @@ func mustWriteSealedSegment(t *testing.T, path string, f sealedFixture) {
 
 	_ = filepath.Base // anchor the import; helpers may grow later
 }
+
+// mustWriteSealedSegmentWithEvents writes one sealed segment containing
+// exactly the given events, flushing after every maxPerBlock events so
+// callers control the block boundaries (and thus which per-block bloom
+// each DID lands in).
+func mustWriteSealedSegmentWithEvents(t *testing.T, path string, maxPerBlock int, events []segment.Event) {
+	t.Helper()
+	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: maxPerBlock})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+	for _, ev := range events {
+		full, err := w.Append(ev)
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	_, err = w.Seal()
+	require.NoError(t, err)
+}

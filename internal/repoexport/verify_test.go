@@ -35,6 +35,7 @@ func TestVerify_MatchingRoots(t *testing.T) {
 		DataDir:  dataDir,
 		DID:      testDID,
 		RelayURL: relay.URL,
+		Selector: openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, VerifyReport{
@@ -71,6 +72,7 @@ func TestVerify_PendingEventsMatchAuthoritativeRoot(t *testing.T) {
 		DataDir:       dataDir,
 		DID:           testDID,
 		RelayURL:      relay.URL,
+		Selector:      openSelector(t, dataDir),
 		PendingEvents: pending,
 	})
 	require.NoError(t, err)
@@ -101,6 +103,7 @@ func TestVerify_MismatchingRootsReturnsReport(t *testing.T) {
 		DataDir:  dataDir,
 		DID:      testDID,
 		RelayURL: relay.URL,
+		Selector: openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, VerifyReport{
@@ -124,10 +127,12 @@ func TestVerify_MissingLocalRepoReturnsMismatchReport(t *testing.T) {
 	carBytes, authoritativeRoot := authoritativeCAR(t, testDID, testAuthoritativeRev, events)
 	relay := newGetRepoServer(t, testDID, carBytes)
 
+	emptyDir := t.TempDir()
 	report, err := Verify(t.Context(), VerifyConfig{
-		DataDir:  t.TempDir(),
+		DataDir:  emptyDir,
 		DID:      testDID,
 		RelayURL: relay.URL,
+		Selector: openSelector(t, emptyDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, testDID, report.DID)

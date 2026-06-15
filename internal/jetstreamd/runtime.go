@@ -170,7 +170,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	statusHandler, err := web.New(web.Options{
 		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(opts.DataDir, opts.RelayURL, pendingEventsForDID(&writerPtr)),
+		RepoActions:                web.NewRepoActions(opts.DataDir, opts.RelayURL, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
 		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
 		Logger:                     processLogger,
 	})

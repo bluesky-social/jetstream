@@ -10,6 +10,9 @@ import (
 type repoExportActions struct {
 	dataDir  string
 	relayURL string
+	// selector prunes which segments/blocks reconstruction decodes, backed
+	// by the in-memory manifest. Required for verification to run.
+	selector repoexport.Selector
 	// pendingEvents returns the live writer's not-yet-flushed events for a
 	// DID, folded into reconstruction so a record created moments ago is
 	// reflected in verification before the next compaction flush. nil when
@@ -18,13 +21,16 @@ type repoExportActions struct {
 }
 
 // NewRepoActions builds the production repo action implementation used by the
-// status handler. pendingEvents may be nil; when set it supplies the live
-// writer's in-memory pending events so verification does not spuriously report
-// a root mismatch for a just-written record.
-func NewRepoActions(dataDir, relayURL string, pendingEvents func(did string) []segment.Event) RepoActions {
+// status handler. selector supplies the manifest-backed bloom pruning so
+// verification opens only the segments an account touches. pendingEvents may
+// be nil; when set it supplies the live writer's in-memory pending events so
+// verification does not spuriously report a root mismatch for a just-written
+// record.
+func NewRepoActions(dataDir, relayURL string, selector repoexport.Selector, pendingEvents func(did string) []segment.Event) RepoActions {
 	return repoExportActions{
 		dataDir:       dataDir,
 		relayURL:      relayURL,
+		selector:      selector,
 		pendingEvents: pendingEvents,
 	}
 }
@@ -42,6 +48,7 @@ func (a repoExportActions) VerifyRepo(ctx context.Context, did string) (repoexpo
 		DataDir:       a.dataDir,
 		DID:           did,
 		RelayURL:      a.relayURL,
+		Selector:      a.selector,
 		PendingEvents: a.gatherPending(did),
 	})
 }
