@@ -30,35 +30,47 @@ type ReadyFunc func(context.Context) error
 
 // Server builds the XRPC handler tree for the jetstream lexicons.
 type Server struct {
-	src    SegmentSource
-	logger *slog.Logger
-	xrpc   *xrpcserver.Server
+	src     SegmentSource
+	logger  *slog.Logger
+	xrpc    *xrpcserver.Server
+	overlay OverlaySource
 }
 
 // New constructs the XRPC server and registers all jetstream NSIDs.
 func New(src SegmentSource, logger *slog.Logger) *Server {
-	return NewWithReady(src, logger, nil)
+	return NewWithReadyAndCacheAndOverlay(src, logger, nil, 0, nil)
 }
 
 // NewWithReady constructs the XRPC server and registers all jetstream NSIDs,
 // guarding each request with ready when ready is non-nil.
 func NewWithReady(src SegmentSource, logger *slog.Logger, ready ReadyFunc) *Server {
-	return NewWithReadyAndCache(src, logger, ready, 0)
+	return NewWithReadyAndCacheAndOverlay(src, logger, ready, 0, nil)
 }
 
 // NewWithReadyAndCache constructs the XRPC server with a readiness gate and
 // a getSegment Cache-Control max-age. cacheMaxAge <= 0 disables caching.
 func NewWithReadyAndCache(src SegmentSource, logger *slog.Logger, ready ReadyFunc, cacheMaxAge time.Duration) *Server {
+	return NewWithReadyAndCacheAndOverlay(src, logger, ready, cacheMaxAge, nil)
+}
+
+// NewWithReadyAndCacheAndOverlay constructs the XRPC server with a readiness
+// gate, a getSegment Cache-Control max-age, and an optional overlay source.
+// When ov is non-nil, the getTombstones NSID is registered behind the same
+// readiness gate; when nil, getTombstones is not exposed.
+func NewWithReadyAndCacheAndOverlay(src SegmentSource, logger *slog.Logger, ready ReadyFunc, cacheMaxAge time.Duration, ov OverlaySource) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{src: src, logger: logger, xrpc: &xrpcserver.Server{}}
+	s := &Server{src: src, logger: logger, xrpc: &xrpcserver.Server{}, overlay: ov}
 	s.xrpc.HandleQuery("network.bsky.jetstream.getSegment", withReady(ready, &getSegmentHandler{
 		src:         src,
 		logger:      logger,
 		cacheMaxAge: cacheMaxAge,
 	}))
 	s.xrpc.HandleQuery("network.bsky.jetstream.listSegments", withReady(ready, newListSegmentsHandler(src)))
+	if ov != nil {
+		s.xrpc.HandleQuery("network.bsky.jetstream.getTombstones", withReady(ready, newGetTombstonesHandler(ov)))
+	}
 	return s
 }
 

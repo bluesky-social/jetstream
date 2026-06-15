@@ -136,4 +136,6 @@ func (c *Cache) RunTicker(ctx context.Context, interval time.Duration) error {
 	}
 }
 
-func (c *Cache) observeServe(n int) { c.metrics.observeServe(n) }
+// ObserveServe records that n bytes of the overlay blob were written to a
+// client. Called by the getTombstones handler after a successful write.
+func (c *Cache) ObserveServe(n int) { c.metrics.observeServe(n) }
