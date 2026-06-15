@@ -20,6 +20,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 )
 
@@ -311,6 +312,25 @@ func readOneFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) []byt
 	return frame
 }
 
+// readOneZstdFrame reads one websocket frame and asserts it is a BINARY
+// frame, then decodes it with the v1 custom dictionary — exactly what a
+// v1 client does. Returns the decoded JSON bytes.
+func readOneZstdFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) []byte {
+	t.Helper()
+	rctx, rcancel := context.WithTimeout(ctx, 1*time.Second)
+	defer rcancel()
+	mt, frame, err := conn.Read(rctx)
+	require.NoError(t, err)
+	require.Equal(t, websocket.MessageBinary, mt, "zstd clients must receive binary frames")
+
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionary))
+	require.NoError(t, err)
+	defer dec.Close()
+	got, err := dec.DecodeAll(frame, nil)
+	require.NoError(t, err, "frame must decode with the v1 custom dictionary")
+	return got
+}
+
 // appendSeq assigns the next dense seq and appends, mirroring how ingest
 // drives the Tail in production (Append after durable seq assignment).
 func appendSeq(tl *Tail, seqCtr *uint64, ev *segment.Event) {
@@ -434,13 +454,10 @@ func TestHandler_Filter_RejectsTooManyQueryParams(t *testing.T) {
 		"the response should be wrapped in our ErrInvalidOptions string")
 }
 
-// TestHandler_RejectsCompressQueryParam verifies we 400 a v1 client that
-// asks for zstd-with-custom-dict compression. Jetstream v1 supported a
-// custom zstd dictionary via ?compress=true; v2 does not. Without an
-// explicit reject, the websocket would upgrade and the client would
-// silently get uncompressed JSON it can't decode (or, worse, would feed
-// to a zstd reader and corrupt). 400 makes the contract loud.
-func TestHandler_RejectsCompressQueryParam(t *testing.T) {
+// TestHandler_ZstdQueryParam_DeliversDictCompressedFrames verifies the v1
+// custom-zstd opt-in via ?compress=true: frames arrive BINARY and decode,
+// with the v1 dictionary, to the same JSON the uncompressed path emits.
+func TestHandler_ZstdQueryParam_DeliversDictCompressedFrames(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
@@ -454,23 +471,35 @@ func TestHandler_RejectsCompressQueryParam(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"?compress=true", nil)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?compress=true"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// CompressionDisabled: the client must NOT offer permessage-deflate,
+	// or the handler rejects the both-at-once combination.
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		CompressionMode: websocket.CompressionDisabled,
+	})
 	require.NoError(t, err)
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	body, _ := io.ReadAll(resp.Body)
-	require.Contains(t, string(body), "compression not supported",
-		"the response body should explain that v2 does not support zstd compression")
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	time.Sleep(50 * time.Millisecond)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:zstdquery", 1)
+
+	got := readOneZstdFrame(t, ctx, conn)
+	require.Contains(t, string(got), "did:plc:zstdquery")
+	require.Contains(t, string(got), `"kind":"identity"`)
 }
 
-// TestHandler_RejectsZstdSocketEncoding verifies that the v1 alternate
-// signal — a Socket-Encoding header containing "zstd" (server.go:82
-// in jetstream v1) — is also rejected. Same rationale as
-// TestHandler_RejectsCompressQueryParam: a v1 client porting over via
-// the header path would otherwise be silently surprised on the wire.
-func TestHandler_RejectsZstdSocketEncoding(t *testing.T) {
+// TestHandler_ZstdSocketEncodingHeader_DeliversDictCompressedFrames
+// verifies the alternate v1 opt-in signal: Socket-Encoding: zstd. Same
+// contract as the query-param path.
+func TestHandler_ZstdSocketEncodingHeader_DeliversDictCompressedFrames(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
@@ -484,16 +513,61 @@ func TestHandler_RejectsZstdSocketEncoding(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		CompressionMode: websocket.CompressionDisabled,
+		HTTPHeader:      http.Header{"Socket-Encoding": []string{"zstd"}},
+	})
 	require.NoError(t, err)
-	req.Header.Set("Socket-Encoding", "zstd")
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	time.Sleep(50 * time.Millisecond)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:zstdheader", 1)
+
+	got := readOneZstdFrame(t, ctx, conn)
+	require.Contains(t, string(got), "did:plc:zstdheader")
+}
+
+// TestHandler_RejectsZstdAndDeflateTogether verifies the mutual-exclusion
+// rule: a client opting into custom zstd (?compress=true) while ALSO
+// offering RFC 7692 permessage-deflate is rejected with a 400, rather than
+// silently double-compressing or dropping one scheme.
+func TestHandler_RejectsZstdAndDeflateTogether(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
+	require.NoError(t, err)
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// Plain HTTP GET (not a ws Dial) so we can set the exact extension
+	// offer header and read the 400 body. The handler's mutual-exclusion
+	// check runs before the upgrade, so a 400 is returned regardless.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"?compress=true", nil)
+	require.NoError(t, err)
+	req.Header.Set("Sec-WebSocket-Extensions", "permessage-deflate; client_max_window_bits")
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
+
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
-	require.Contains(t, string(body), "compression not supported",
-		"the response body should explain that v2 does not support zstd compression")
+	require.Contains(t, string(body), "choose one compression scheme",
+		"the 400 body should explain zstd and permessage-deflate are mutually exclusive")
 }
 
 // TestHandler_AllowsCompressFalse verifies the compress=false (the v1
