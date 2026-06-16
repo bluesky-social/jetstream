@@ -22,11 +22,6 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
-const (
-	subscribeVersionV1 = "v1"
-	subscribeVersionV2 = "v2"
-)
-
 func main() {
 	if err := newApp().Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, "jetstream-client:", err)
@@ -41,14 +36,8 @@ func newApp() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  "url",
-				Usage: "Websocket URL, HTTP(S) URL, or host[:port] for the selected jetstream subscribe endpoint",
+				Usage: "Websocket URL, HTTP(S) URL, or host[:port] for the jetstream /subscribe endpoint",
 				Value: "ws://localhost:8080/subscribe",
-			},
-			&cli.StringFlag{
-				Name:    "subscribe-version",
-				Usage:   "Subscribe endpoint version (v1|v2); v1 hides resync replacement rows",
-				Sources: cli.EnvVars("JETSTREAM_CLIENT_SUBSCRIBE_VERSION"),
-				Value:   subscribeVersionV1,
 			},
 			&cli.IntFlag{
 				Name:    "concurrency",
@@ -114,7 +103,6 @@ func newApp() *cli.Command {
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			cfg := config{
 				rawURL:            cmd.String("url"),
-				subscribeVersion:  cmd.String("subscribe-version"),
 				concurrency:       cmd.Int("concurrency"),
 				reportInterval:    cmd.Duration("report-interval"),
 				rampDuration:      cmd.Duration("ramp-duration"),
@@ -160,7 +148,6 @@ func newApp() *cli.Command {
 type config struct {
 	rawURL            string
 	url               string
-	subscribeVersion  string
 	concurrency       int
 	reportInterval    time.Duration
 	rampDuration      time.Duration
@@ -187,12 +174,6 @@ type config struct {
 type dialFunc func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error)
 
 func (c config) validate() error {
-	if strings.TrimSpace(c.subscribeVersion) == "" {
-		return fmt.Errorf("subscribe-version must not be empty")
-	}
-	if _, err := normalizeSubscribeVersion(c.subscribeVersion); err != nil {
-		return err
-	}
 	if c.concurrency <= 0 {
 		return fmt.Errorf("concurrency must be > 0")
 	}
@@ -221,11 +202,6 @@ func (c config) validate() error {
 }
 
 func subscribeURL(c config) (string, error) {
-	subscribeVersion, err := normalizeSubscribeVersion(c.subscribeVersion)
-	if err != nil {
-		return "", err
-	}
-
 	raw := strings.TrimSpace(c.rawURL)
 	if raw == "" {
 		return "", fmt.Errorf("url is required")
@@ -250,8 +226,8 @@ func subscribeURL(c config) (string, error) {
 	if u.Host == "" {
 		return "", fmt.Errorf("url host is required")
 	}
-	if isStandardSubscribePath(u.Path) {
-		u.Path = subscribePath(subscribeVersion)
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/subscribe"
 	}
 
 	q := u.Query()
@@ -276,35 +252,6 @@ func subscribeURL(c config) (string, error) {
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
-}
-
-func normalizeSubscribeVersion(version string) (string, error) {
-	version = strings.ToLower(strings.TrimSpace(version))
-	if version == "" {
-		return subscribeVersionV1, nil
-	}
-	switch version {
-	case subscribeVersionV1, subscribeVersionV2:
-		return version, nil
-	default:
-		return "", fmt.Errorf("subscribe-version must be %q or %q", subscribeVersionV1, subscribeVersionV2)
-	}
-}
-
-func isStandardSubscribePath(path string) bool {
-	switch path {
-	case "", "/", "/subscribe", "/subscribe-v2":
-		return true
-	default:
-		return false
-	}
-}
-
-func subscribePath(version string) string {
-	if version == subscribeVersionV2 {
-		return "/subscribe-v2"
-	}
-	return "/subscribe"
 }
 
 type counters struct {
