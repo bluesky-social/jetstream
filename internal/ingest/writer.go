@@ -228,6 +228,31 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	return w.appendLocked(ctx, ev)
+}
+
+// AppendBatch writes a bounded caller-provided event batch while holding the
+// writer lock once. On success, mutates each event's Seq in place to the
+// allocated value. On an error before an event is appended, that event and all
+// later events are left untouched. If a flush or hook fails after appending an
+// event, the error semantics match Append.
+func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for i := range events {
+		if err := w.appendLocked(ctx, &events[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) error {
 	if w.closed {
 		w.cfg.Metrics.incAppendErrors()
 		return ErrClosed
