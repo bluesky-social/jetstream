@@ -119,6 +119,17 @@ type Config struct {
 	// See backfill.Config.MaxRepos for the precise semantics.
 	MaxBackfillRepos int
 
+	// BackfillWorkers controls concurrent repo downloads during normal
+	// whole-network bootstrap backfill. Zero leaves the backfill package on
+	// its default; cmd/jetstream normally resolves zero to its production
+	// default before constructing the orchestrator.
+	BackfillWorkers int
+
+	// BackfillBatchSize controls how many listRepos entries are accumulated
+	// before atmos shuffles and dispatches a bootstrap backfill batch. Zero
+	// leaves the backfill package on its default.
+	BackfillBatchSize int
+
 	// BackfillRepos, when non-empty, replaces bootstrap listRepos
 	// discovery with this explicit DID list. Debug-only knob for
 	// targeted production smoke tests; leave empty in production.
@@ -218,6 +229,12 @@ func (c *Config) validate() error {
 	}
 	if c.RelayURL == "" {
 		return fmt.Errorf("%w: RelayURL is required", ErrInvalidConfig)
+	}
+	if c.BackfillWorkers < 0 {
+		return fmt.Errorf("%w: BackfillWorkers must be >= 0", ErrInvalidConfig)
+	}
+	if c.BackfillBatchSize < 0 {
+		return fmt.Errorf("%w: BackfillBatchSize must be >= 0", ErrInvalidConfig)
 	}
 	if c.HTTPClient == nil {
 		return fmt.Errorf("%w: HTTPClient is required", ErrInvalidConfig)

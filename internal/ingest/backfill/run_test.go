@@ -223,6 +223,13 @@ type stubServer struct {
 	// real CAR is served. Guarded by transientMu.
 	transientTruncateGetRepo map[atmos.DID]int
 
+	getRepoDelay     time.Duration
+	getRepoActive    atomic.Int64
+	getRepoMaxActive atomic.Int64
+
+	eventsMu sync.Mutex
+	events   []string
+
 	// firstListReposCursor records the cursor query param the relay
 	// saw on its first listRepos request. Lets tests verify that a
 	// pre-seeded resume cursor is passed through correctly.
@@ -259,6 +266,7 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/xrpc/com.atproto.sync.listRepos":
 		s.listReposHit.Add(1)
+		s.recordEvent("listRepos")
 		s.firstListReposCursorMu.Lock()
 		if !s.firstListReposCursorOK {
 			s.firstListReposCursor = r.URL.Query().Get("cursor")
@@ -308,6 +316,18 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 
 	case "/xrpc/com.atproto.sync.getRepo":
 		s.getRepoHit.Add(1)
+		s.recordEvent("getRepo")
+		active := s.getRepoActive.Add(1)
+		for {
+			prev := s.getRepoMaxActive.Load()
+			if active <= prev || s.getRepoMaxActive.CompareAndSwap(prev, active) {
+				break
+			}
+		}
+		defer s.getRepoActive.Add(-1)
+		if s.getRepoDelay > 0 {
+			time.Sleep(s.getRepoDelay)
+		}
 		didStr := r.URL.Query().Get("did")
 		did := atmos.DID(didStr)
 		if s.failGetRepo[did] {
@@ -346,6 +366,28 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+func (s *stubServer) recordEvent(event string) {
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+	s.events = append(s.events, event)
+}
+
+func (s *stubServer) eventIndex(event string, n int) int {
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+	seen := 0
+	for i, got := range s.events {
+		if got != event {
+			continue
+		}
+		seen++
+		if seen == n {
+			return i
+		}
+	}
+	return -1
 }
 
 // runWithStub drives runWithDirectory with a Directory whose Resolver
@@ -610,6 +652,115 @@ func TestRun_HappyPath_DownloadsAllRepos(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, uint64(len(dids)), hs.Total)
 	require.Equal(t, uint64(len(dids)), hs.Complete)
+}
+
+func TestRun_PassesBackfillBatchSizeToAtmos(t *testing.T) {
+	t.Parallel()
+
+	dids := []atmos.DID{"did:plc:aaa", "did:plc:bbb", "did:plc:ccc", "did:plc:ddd"}
+	fixtures := make(map[atmos.DID]repoFixture, len(dids))
+	for _, d := range dids {
+		fixtures[d] = buildRepoFixture(t, d)
+	}
+	srv := newPaginatingStubServer(t, fixtures, 2)
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
+	for did, f := range fixtures {
+		docs[did] = &identity.DIDDocument{
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		}
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, Run(t.Context(), Config{
+		Store:             db,
+		Directory:         &identity.Directory{Resolver: &stubResolver{docs: docs}},
+		HTTPClient:        &http.Client{Timeout: 5 * time.Second},
+		Writer:            w,
+		RelayURL:          srv.srv.URL,
+		Logger:            logger,
+		BackfillBatchSize: 2,
+	}))
+
+	firstGetRepo := srv.eventIndex("getRepo", 1)
+	secondListRepos := srv.eventIndex("listRepos", 2)
+	require.NotEqual(t, -1, firstGetRepo)
+	require.NotEqual(t, -1, secondListRepos)
+	require.Less(t, firstGetRepo, secondListRepos,
+		"BackfillBatchSize=2 should dispatch the first page before requesting the second listRepos page")
+}
+
+func TestRun_PassesBackfillWorkersToAtmos(t *testing.T) {
+	t.Parallel()
+
+	dids := []atmos.DID{"did:plc:aaa", "did:plc:bbb", "did:plc:ccc", "did:plc:ddd"}
+	fixtures := make(map[atmos.DID]repoFixture, len(dids))
+	for _, d := range dids {
+		fixtures[d] = buildRepoFixture(t, d)
+	}
+	srv := newStubServer(t, fixtures)
+	srv.getRepoDelay = 25 * time.Millisecond
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
+	for did, f := range fixtures {
+		docs[did] = &identity.DIDDocument{
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		}
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, Run(t.Context(), Config{
+		Store:           db,
+		Directory:       &identity.Directory{Resolver: &stubResolver{docs: docs}},
+		HTTPClient:      &http.Client{Timeout: 5 * time.Second},
+		Writer:          w,
+		RelayURL:        srv.srv.URL,
+		Logger:          logger,
+		BackfillWorkers: 1,
+	}))
+
+	require.Equal(t, int64(1), srv.getRepoMaxActive.Load(),
+		"BackfillWorkers=1 should serialize getRepo downloads")
 }
 
 func TestRun_BackfillReposDownloadsSelectedDIDsWithoutListRepos(t *testing.T) {

@@ -77,6 +77,12 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.CompactionTombstoneCap < 0 {
 		return nil, fmt.Errorf("serve: --compaction-tombstone-cap must be >= 0 (CompactionTombstoneCap must be >= 0), got %d", opts.CompactionTombstoneCap)
 	}
+	if opts.BackfillWorkers < 0 {
+		return nil, fmt.Errorf("serve: --backfill-workers must be >= 0 (BackfillWorkers must be >= 0), got %d", opts.BackfillWorkers)
+	}
+	if opts.BackfillBatchSize < 0 {
+		return nil, fmt.Errorf("serve: --backfill-batch-size must be >= 0 (BackfillBatchSize must be >= 0), got %d", opts.BackfillBatchSize)
+	}
 	if opts.CompactionRewriteWorkers < 0 {
 		return nil, fmt.Errorf("serve: --compaction-rewrite-workers must be >= 0 (CompactionRewriteWorkers must be >= 0), got %d", opts.CompactionRewriteWorkers)
 	}
@@ -310,6 +316,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		OnEvent:                  onSteadyStateEvent,
 		OnBootstrapLiveEvent:     opts.OnBootstrapLiveEvent,
 		MaxBackfillRepos:         opts.MaxBackfillRepos,
+		BackfillWorkers:          opts.effectiveBackfillWorkers(),
+		BackfillBatchSize:        opts.effectiveBackfillBatchSize(),
 		BackfillRepos:            opts.BackfillRepos,
 		SkipMergeDiscovery:       opts.SkipMergeDiscovery,
 		BackfillRetryBaseDelay:   opts.BackfillRetryBaseDelay,

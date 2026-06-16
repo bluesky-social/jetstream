@@ -13,6 +13,11 @@ import (
 	"github.com/jcalabro/atmos/streaming"
 )
 
+const (
+	DefaultBackfillWorkers   = 200
+	DefaultBackfillBatchSize = 100_000
+)
+
 // PhaseBarrier is a test hook that can pause execution after a major
 // lifecycle phase before the daemon advances to the next phase.
 type PhaseBarrier func(context.Context) error
@@ -38,6 +43,8 @@ type Options struct {
 	ClientDrainTimeout time.Duration
 
 	MaxBackfillRepos   int
+	BackfillWorkers    int
+	BackfillBatchSize  int
 	BackfillRepos      []atmos.DID
 	SkipMergeDiscovery bool
 
@@ -74,4 +81,18 @@ type Options struct {
 	CrashInjector             crashpoint.Injector
 	OnBootstrapLiveEvent      func(*segment.Event)
 	OnSteadyStateEvent        func(*segment.Event)
+}
+
+func (o Options) effectiveBackfillWorkers() int {
+	if o.BackfillWorkers > 0 {
+		return o.BackfillWorkers
+	}
+	return DefaultBackfillWorkers
+}
+
+func (o Options) effectiveBackfillBatchSize() int {
+	if o.BackfillBatchSize > 0 {
+		return o.BackfillBatchSize
+	}
+	return DefaultBackfillBatchSize
 }

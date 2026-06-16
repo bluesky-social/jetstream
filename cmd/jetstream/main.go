@@ -204,6 +204,18 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_MAX_BACKFILL_REPOS"),
 				Value:   0,
 			},
+			&cli.IntFlag{
+				Name:    "backfill-workers",
+				Usage:   "Concurrent repo download workers for whole-network bootstrap backfill. 0 uses the production default.",
+				Sources: cli.EnvVars("JETSTREAM_BACKFILL_WORKERS"),
+				Value:   jetstreamd.DefaultBackfillWorkers,
+			},
+			&cli.IntFlag{
+				Name:    "backfill-batch-size",
+				Usage:   "Number of listRepos entries accumulated before shuffling and dispatching a bootstrap backfill batch. 0 uses the production default.",
+				Sources: cli.EnvVars("JETSTREAM_BACKFILL_BATCH_SIZE"),
+				Value:   jetstreamd.DefaultBackfillBatchSize,
+			},
 			&cli.StringFlag{
 				Name:    "backfill-repos",
 				Usage:   "DEBUG ONLY: comma-separated DID list to backfill instead of walking listRepos. Empty = normal production behavior.",
@@ -318,6 +330,8 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		ShutdownTimeout:             cmd.Duration("shutdown-timeout"),
 		ClientDrainTimeout:          cmd.Duration("client-drain-timeout"),
 		MaxBackfillRepos:            maxBackfillRepos,
+		BackfillWorkers:             cmd.Int("backfill-workers"),
+		BackfillBatchSize:           cmd.Int("backfill-batch-size"),
 		BackfillRepos:               backfillRepos,
 		SkipMergeDiscovery:          cmd.Bool("skip-merge-discovery"),
 		DisableRepoActionRateLimits: cmd.Bool("disable-repo-action-rate-limits"),

@@ -77,6 +77,14 @@ type Config struct {
 	// the same point.
 	MaxRepos int
 
+	// BackfillWorkers, when > 0, overrides atmos's repo download worker count.
+	// Zero leaves atmos on its default.
+	BackfillWorkers int
+
+	// BackfillBatchSize, when > 0, overrides atmos's listRepos-entry batch size.
+	// Zero leaves atmos on its default.
+	BackfillBatchSize int
+
 	// BackfillRepos, when non-empty, is a debug-only explicit DID list
 	// to download during bootstrap instead of walking listRepos. This is
 	// intended for targeted production smoke tests against a known repo.
@@ -260,6 +268,12 @@ func Run(ctx context.Context, cfg Config) error {
 		if cfg.MaxRetries > 0 {
 			engineOpts.MaxRetries = gt.Some(cfg.MaxRetries)
 		}
+		if cfg.BackfillWorkers > 0 {
+			engineOpts.Workers = gt.Some(cfg.BackfillWorkers)
+		}
+		if cfg.BackfillBatchSize > 0 {
+			engineOpts.BatchSize = gt.Some(cfg.BackfillBatchSize)
+		}
 		if cfg.RetryBaseDelay > 0 {
 			engineOpts.RetryBaseDelay = gt.Some(cfg.RetryBaseDelay)
 		}
@@ -268,7 +282,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		engine := atmosbackfill.NewEngine(engineOpts)
 
-		logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL, "max_repos", cfg.MaxRepos)
+		logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL, "max_repos", cfg.MaxRepos, "workers", cfg.BackfillWorkers, "batch_size", cfg.BackfillBatchSize)
 		if err := engine.Run(runCtx); err != nil {
 			if fatal := loadFatal(); fatal != nil {
 				logger.ErrorContext(ctx, "engine aborted after local writer error", "err", fatal)
@@ -309,6 +323,12 @@ func (cfg Config) validate() error {
 	}
 	if cfg.RelayURL == "" {
 		return fmt.Errorf("backfill: Config.RelayURL is required")
+	}
+	if cfg.BackfillWorkers < 0 {
+		return fmt.Errorf("backfill: Config.BackfillWorkers must be >= 0")
+	}
+	if cfg.BackfillBatchSize < 0 {
+		return fmt.Errorf("backfill: Config.BackfillBatchSize must be >= 0")
 	}
 	if cfg.Logger == nil {
 		return fmt.Errorf("backfill: Config.Logger is required")

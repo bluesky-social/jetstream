@@ -70,6 +70,8 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 30*time.Second, opts.ShutdownTimeout)
 	require.Equal(t, 10*time.Second, opts.ClientDrainTimeout)
 	require.Equal(t, 0, opts.MaxBackfillRepos)
+	require.Equal(t, 200, opts.BackfillWorkers)
+	require.Equal(t, 100_000, opts.BackfillBatchSize)
 	require.Empty(t, opts.BackfillRepos)
 	require.False(t, opts.SkipMergeDiscovery)
 	require.False(t, opts.DisableRepoActionRateLimits)
@@ -106,6 +108,8 @@ func withClearedEnv(t *testing.T) {
 		"JETSTREAM_SHUTDOWN_TIMEOUT",
 		"JETSTREAM_CLIENT_DRAIN_TIMEOUT",
 		"JETSTREAM_MAX_BACKFILL_REPOS",
+		"JETSTREAM_BACKFILL_WORKERS",
+		"JETSTREAM_BACKFILL_BATCH_SIZE",
 		"JETSTREAM_BACKFILL_REPOS",
 		"JETSTREAM_SKIP_MERGE_DISCOVERY",
 		"JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS",
@@ -158,6 +162,8 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--otel-service-name=jetstream-test",
 		"--shutdown-timeout=45s",
 		"--client-drain-timeout=11s",
+		"--backfill-workers=17",
+		"--backfill-batch-size=12345",
 		"--backfill-repos=did:plc:aaa, did:plc:bbb",
 		"--skip-merge-discovery",
 		"--disable-repo-action-rate-limits",
@@ -183,6 +189,8 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 45*time.Second, opts.ShutdownTimeout)
 	require.Equal(t, 11*time.Second, opts.ClientDrainTimeout)
 	require.Equal(t, 0, opts.MaxBackfillRepos)
+	require.Equal(t, 17, opts.BackfillWorkers)
+	require.Equal(t, 12345, opts.BackfillBatchSize)
 	require.Equal(t, []atmos.DID{"did:plc:aaa", "did:plc:bbb"}, opts.BackfillRepos)
 	require.True(t, opts.SkipMergeDiscovery)
 	require.True(t, opts.DisableRepoActionRateLimits)
@@ -198,6 +206,31 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
+}
+
+func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
+	withClearedEnv(t)
+
+	app := newApp()
+	var opts jetstreamd.Options
+	for _, cmd := range app.Commands {
+		if cmd.Name != "serve" {
+			continue
+		}
+		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			opts, err = serveOptionsFromCommand(cmd)
+			return err
+		}
+		break
+	}
+
+	t.Setenv("JETSTREAM_BACKFILL_WORKERS", "33")
+	t.Setenv("JETSTREAM_BACKFILL_BATCH_SIZE", "76543")
+
+	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
+	require.Equal(t, 33, opts.BackfillWorkers)
+	require.Equal(t, 76543, opts.BackfillBatchSize)
 }
 
 func TestServeOptionsFromCLI_DisableRepoActionRateLimitsEnv(t *testing.T) {
