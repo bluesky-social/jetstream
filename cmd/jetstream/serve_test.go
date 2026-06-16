@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -648,14 +647,6 @@ func TestServe_StatusEndpoint(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
-	// Pre-bind a free port for the public listener so the test knows
-	// where to hit /status without parsing logs.
-	lc := net.ListenConfig{}
-	publicLn, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	publicAddr := publicLn.Addr().String()
-	require.NoError(t, publicLn.Close())
-
 	// Minimal relay stub — listRepos returns an empty page so backfill
 	// drains immediately, and subscribeRepos blocks until cancellation.
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -676,24 +667,42 @@ func TestServe_StatusEndpoint(t *testing.T) {
 	}))
 	t.Cleanup(relay.Close)
 
+	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
+		PublicAddr:                "127.0.0.1:0",
+		DebugAddr:                 "127.0.0.1:0",
+		DataDir:                   dataDir,
+		RelayURL:                  relay.URL,
+		OTelServiceName:           "jetstream-test",
+		LogLevel:                  "warn",
+		LogFormat:                 "text",
+		LogOutput:                 io.Discard,
+		ShutdownTimeout:           5 * time.Second,
+		ClientDrainTimeout:        10 * time.Second,
+		CursorLookback:            36 * time.Hour,
+		SubscribeHotTailBytes:     1 << 20,
+		SubscribeBlockCacheBytes:  1 << 20,
+		SubscribeReadBatch:        128,
+		SubscribeSlowWindow:       time.Second,
+		SubscribeSlowMinRate:      5,
+		CursorBlockIndexCacheSize: 32,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cancel()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		require.NoError(t, rt.Close(closeCtx))
+	})
+
 	done := make(chan error, 1)
 	go func() {
-		done <- newApp().Run(ctx, []string{
-			"jetstream",
-			"--log-format=text",
-			"--log-level=warn",
-			"serve",
-			"--addr=" + publicAddr,
-			"--debug-addr=127.0.0.1:0",
-			"--shutdown-timeout=5s",
-			"--relay-url=" + relay.URL,
-			"--data-dir=" + dataDir,
-		})
+		done <- rt.Run(ctx)
 	}()
 
 	// Poll /status until it answers 200 or we time out. The endpoint
 	// is mounted before listenerless work starts, so a couple hundred
 	// ms is plenty even on a slow CI box.
+	publicAddr := waitRuntimePublicAddr(t, rt, done)
 	url := "http://" + publicAddr + "/status"
 	deadline := time.Now().Add(5 * time.Second)
 	var resp *http.Response
