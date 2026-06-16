@@ -149,17 +149,17 @@ checks. m017 proves the hot path is otherwise exercised (the collection/rkey
 swap on the same struct was caught instantly), so this is a true gap, not a
 dead path. Disposition: **fix the oracle** — have CheckInvariants reject an
 empty rev on a commit-kind event (a create/update/delete must carry a rev),
-which costs nothing and closes the hole. Filed to ORACLE_TODO.md.
+which costs nothing and closes the hole. This gap was closed in Milestone A.
 
 **m009 — symmetric checksum (oracle structurally cannot catch; accepted).**
 `xxh3HeaderFooter` is used both to write the seal checksum (seal.go:123) and
 to verify it on read (reader.go:193). A mutation to its byte range changes
 both sides identically, so they always agree. This is a miniature of the
-"atmos closed loop" blind spot from ORACLE_TODO.md §3: the oracle cannot
+"atmos closed loop" blind spot described in `docs/oracle/DESIGN.md`: the oracle cannot
 detect a bug that lives in a function shared by the writer and reader.
 Disposition: **accepted blind spot** — only an independent checksum oracle
 (or a committed golden segment with a known-good checksum) would catch it.
-Cross-referenced in ORACLE_TODO.md.
+Cross-referenced in the oracle design document.
 
 **m010 — block read by index, not by recorded offset (historical, retired).**
 `DecodeBlock` (reader.go:301) seeks via the block-index entry's offset, and
@@ -188,12 +188,13 @@ double-process needs a crash precisely between source completion and the next
 run, which the current harness does not stage for this seam. Disposition:
 **fix the oracle** — extend the restart harness to crash at the
 source-complete seam, OR (better) the random-time kill loop from
-ORACLE_TODO.md Tier 2 would cover this class without enumeration. Filed.
+the crash/restart tier in `docs/oracle/DESIGN.md` would cover this class
+without enumeration.
 
 **m006 — swallowed commit error needs store-fault injection (predicted).**
 Predicted to survive: under normal runs `commitSourceComplete` never fails,
-so the inverted check is dormant. Confirms ORACLE_TODO.md Tier 3
-"adversarial-fault mode": the oracle has no way to make a store write fail.
+so the inverted check is dormant. Confirms the store-fault tier requirement in
+`docs/oracle/DESIGN.md`: the oracle has no way to make a store write fail.
 Disposition: **accepted, pending** the store-fault oracle tier.
 
 **m015 / m016 — footer/bloom read-path indexes (confirmed blind spots).**
@@ -201,8 +202,8 @@ Predicted survival, confirmed. The oracle decodes every block sequentially
 and never consults the footer collection-count index or the per-block bloom
 filters, so corruption there is invisible. These mutants exist to *document*
 the gap with evidence. Disposition: **accepted blind spots** — would be
-closed by the replay-path / XRPC-egress oracle in ORACLE_TODO.md Tier 1,
-which exercises the read indexes a client uses.
+closed by the product replay and XRPC egress tiers in
+`docs/oracle/DESIGN.md`, which exercise the read indexes a client uses.
 
 ### Prediction misses (corrections to our model of the oracle)
 
@@ -226,8 +227,8 @@ The campaign measured the oracle rather than re-confirming it. It caught
 every hot-path data-shape bug we threw at it (m001, m004, m008, m011, m012,
 m017) and several at scale (m005), but it surfaced **two active oracle gaps
 worth fixing** (m018 rev-blindness and m003 merge-cursor restart seam), **three structural blind spots**
-already named in ORACLE_TODO.md (m006 store-fault, m009 closed-loop checksum,
-m015/m016 read-path indexes), and one operational signal — **m002's flaky
+now named in `docs/oracle/DESIGN.md` (m006 store-fault, m009 closed-loop
+checksum, m015/m016 read-path indexes), and one operational signal — **m002's flaky
 detection justifies the multi-seed nightly sweep**. The over-fitting worry was
 warranted in specific, now-documented places; it was not warranted as a
 blanket claim about the oracle.

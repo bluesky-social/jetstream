@@ -52,6 +52,12 @@ just oracle                                                      # heavier stres
 just oracle-sweep                                                # deterministic multi-seed stress sweep
 ```
 
+`docs/oracle/DESIGN.md` is the source of truth for the oracle/simulator testing
+architecture: why the oracle exists, what it can and cannot prove, its current
+tiers, mutation-campaign discipline, and how future testing work should extend
+it. Read it before changing `internal/oracle`, `internal/simulator`, or the
+mutation campaign.
+
 The default `just` target intentionally runs short tests, so it does not execute non-short restart or stress oracle coverage. Use `just test-long` or the dedicated oracle recipes when the change could affect crash/restart correctness or end-to-end event fidelity.
 
 The oracle's bug-detection power is measured by a mutation campaign. `testing/mutation/mutants/*.patch` are curated single-edit bugs ("mutants"), each documented with the production failure mode it models and a prediction of which oracle tier should catch it. `just mutation-campaign` applies them one at a time and verifies the oracle kills them; the scorecard lives in `testing/mutation/RESULTS.md`. Never apply these patches outside the driver, and never "fix" production code to match a mutant — they are deliberate bugs. Re-run the campaign after major changes to ingest, segment, or orchestrator logic; a STALE result means the underlying code moved and the mutant needs re-review and refresh.
