@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -70,6 +69,8 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 30*time.Second, opts.ShutdownTimeout)
 	require.Equal(t, 10*time.Second, opts.ClientDrainTimeout)
 	require.Equal(t, 0, opts.MaxBackfillRepos)
+	require.Equal(t, 200, opts.BackfillWorkers)
+	require.Equal(t, 100_000, opts.BackfillBatchSize)
 	require.Empty(t, opts.BackfillRepos)
 	require.False(t, opts.SkipMergeDiscovery)
 	require.False(t, opts.DisableRepoActionRateLimits)
@@ -106,6 +107,8 @@ func withClearedEnv(t *testing.T) {
 		"JETSTREAM_SHUTDOWN_TIMEOUT",
 		"JETSTREAM_CLIENT_DRAIN_TIMEOUT",
 		"JETSTREAM_MAX_BACKFILL_REPOS",
+		"JETSTREAM_BACKFILL_WORKERS",
+		"JETSTREAM_BACKFILL_BATCH_SIZE",
 		"JETSTREAM_BACKFILL_REPOS",
 		"JETSTREAM_SKIP_MERGE_DISCOVERY",
 		"JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS",
@@ -158,6 +161,8 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--otel-service-name=jetstream-test",
 		"--shutdown-timeout=45s",
 		"--client-drain-timeout=11s",
+		"--backfill-workers=17",
+		"--backfill-batch-size=12345",
 		"--backfill-repos=did:plc:aaa, did:plc:bbb",
 		"--skip-merge-discovery",
 		"--disable-repo-action-rate-limits",
@@ -183,6 +188,8 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 45*time.Second, opts.ShutdownTimeout)
 	require.Equal(t, 11*time.Second, opts.ClientDrainTimeout)
 	require.Equal(t, 0, opts.MaxBackfillRepos)
+	require.Equal(t, 17, opts.BackfillWorkers)
+	require.Equal(t, 12345, opts.BackfillBatchSize)
 	require.Equal(t, []atmos.DID{"did:plc:aaa", "did:plc:bbb"}, opts.BackfillRepos)
 	require.True(t, opts.SkipMergeDiscovery)
 	require.True(t, opts.DisableRepoActionRateLimits)
@@ -198,6 +205,31 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
+}
+
+func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
+	withClearedEnv(t)
+
+	app := newApp()
+	var opts jetstreamd.Options
+	for _, cmd := range app.Commands {
+		if cmd.Name != "serve" {
+			continue
+		}
+		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			opts, err = serveOptionsFromCommand(cmd)
+			return err
+		}
+		break
+	}
+
+	t.Setenv("JETSTREAM_BACKFILL_WORKERS", "33")
+	t.Setenv("JETSTREAM_BACKFILL_BATCH_SIZE", "76543")
+
+	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
+	require.Equal(t, 33, opts.BackfillWorkers)
+	require.Equal(t, 76543, opts.BackfillBatchSize)
 }
 
 func TestServeOptionsFromCLI_DisableRepoActionRateLimitsEnv(t *testing.T) {
@@ -615,14 +647,6 @@ func TestServe_StatusEndpoint(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
-	// Pre-bind a free port for the public listener so the test knows
-	// where to hit /status without parsing logs.
-	lc := net.ListenConfig{}
-	publicLn, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	publicAddr := publicLn.Addr().String()
-	require.NoError(t, publicLn.Close())
-
 	// Minimal relay stub — listRepos returns an empty page so backfill
 	// drains immediately, and subscribeRepos blocks until cancellation.
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -643,24 +667,42 @@ func TestServe_StatusEndpoint(t *testing.T) {
 	}))
 	t.Cleanup(relay.Close)
 
+	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
+		PublicAddr:                "127.0.0.1:0",
+		DebugAddr:                 "127.0.0.1:0",
+		DataDir:                   dataDir,
+		RelayURL:                  relay.URL,
+		OTelServiceName:           "jetstream-test",
+		LogLevel:                  "warn",
+		LogFormat:                 "text",
+		LogOutput:                 io.Discard,
+		ShutdownTimeout:           5 * time.Second,
+		ClientDrainTimeout:        10 * time.Second,
+		CursorLookback:            36 * time.Hour,
+		SubscribeHotTailBytes:     1 << 20,
+		SubscribeBlockCacheBytes:  1 << 20,
+		SubscribeReadBatch:        128,
+		SubscribeSlowWindow:       time.Second,
+		SubscribeSlowMinRate:      5,
+		CursorBlockIndexCacheSize: 32,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cancel()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		require.NoError(t, rt.Close(closeCtx))
+	})
+
 	done := make(chan error, 1)
 	go func() {
-		done <- newApp().Run(ctx, []string{
-			"jetstream",
-			"--log-format=text",
-			"--log-level=warn",
-			"serve",
-			"--addr=" + publicAddr,
-			"--debug-addr=127.0.0.1:0",
-			"--shutdown-timeout=5s",
-			"--relay-url=" + relay.URL,
-			"--data-dir=" + dataDir,
-		})
+		done <- rt.Run(ctx)
 	}()
 
 	// Poll /status until it answers 200 or we time out. The endpoint
 	// is mounted before listenerless work starts, so a couple hundred
 	// ms is plenty even on a slow CI box.
+	publicAddr := waitRuntimePublicAddr(t, rt, done)
 	url := "http://" + publicAddr + "/status"
 	deadline := time.Now().Add(5 * time.Second)
 	var resp *http.Response

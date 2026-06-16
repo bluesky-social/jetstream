@@ -27,7 +27,8 @@ func TestRunBootstrap_DrainsAndAdvancesPhase(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseBootstrap, time.Now().UTC()))
+	bootstrapStartedAt := time.Now().UTC().Add(-2 * time.Hour)
+	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseBootstrap, bootstrapStartedAt))
 
 	relay := newFakeRelay(t, nil) // empty repo list => backfill drains immediately
 	verifier := newTestVerifier(t, relay.URL())
@@ -52,6 +53,12 @@ func TestRunBootstrap_DrainsAndAdvancesPhase(t *testing.T) {
 	got, err := lifecycle.ReadPhase(st)
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseMerging, got)
+
+	timing, err := lifecycle.ReadBackfillTiming(st)
+	require.NoError(t, err)
+	require.True(t, timing.StartedAt.Equal(bootstrapStartedAt), "got %s, want %s", timing.StartedAt, bootstrapStartedAt)
+	require.False(t, timing.CompletedAt.IsZero())
+	require.Greater(t, timing.Duration(), time.Duration(0))
 
 	// The bootstrap-live segment file must exist and be sealed
 	// (non-zero checksum at offset 4).

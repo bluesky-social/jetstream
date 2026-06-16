@@ -89,6 +89,10 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 	if err != nil {
 		return BackfillStats{}, err
 	}
+	timing, err := lifecycle.ReadBackfillTiming(s)
+	if err != nil {
+		return BackfillStats{}, err
+	}
 	pct := 0.0
 	if counts.Total > 0 {
 		pct = float64(counts.Complete) / float64(counts.Total) * 100
@@ -100,11 +104,18 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 		Failed:          counts.Failed,
 		PercentComplete: pct,
 		ListReposCursor: cursor,
+		StartedAt:       timing.StartedAt,
+		CompletedAt:     timing.CompletedAt,
+		Duration:        timing.Duration(),
 	}, nil
 }
 
 func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 	cursor, err := backfill.LoadListReposCursor(s)
+	if err != nil {
+		return BackfillStats{}, err
+	}
+	timing, err := lifecycle.ReadBackfillTiming(s)
 	if err != nil {
 		return BackfillStats{}, err
 	}
@@ -126,6 +137,9 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 		Failed:          counts.Failed,
 		PercentComplete: pct,
 		ListReposCursor: cursor,
+		StartedAt:       timing.StartedAt,
+		CompletedAt:     timing.CompletedAt,
+		Duration:        timing.Duration(),
 	}, nil
 }
 

@@ -48,6 +48,24 @@ func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
 	require.ErrorContains(t, err, "SegmentCacheMaxAge must be >= 0")
 }
 
+func TestOptionsValidateRejectsNegativeBackfillWorkers(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions(t)
+	opts.BackfillWorkers = -1
+	_, err := Build(t.Context(), opts)
+	require.ErrorContains(t, err, "BackfillWorkers must be >= 0")
+}
+
+func TestOptionsValidateRejectsNegativeBackfillBatchSize(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions(t)
+	opts.BackfillBatchSize = -1
+	_, err := Build(t.Context(), opts)
+	require.ErrorContains(t, err, "BackfillBatchSize must be >= 0")
+}
+
 func TestOptionsValidateRejectsNegativeCompactionRewriteWorkers(t *testing.T) {
 	t.Parallel()
 

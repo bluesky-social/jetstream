@@ -57,6 +57,9 @@ func newFixtureSnap() *status.Snapshot {
 			TotalDIDs: 100, Discovered: 10, Complete: 80, Failed: 10,
 			PercentComplete: 80.0,
 			ListReposCursor: "<script>alert('xss')</script>",
+			StartedAt:       time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC),
+			CompletedAt:     time.Date(2026, 5, 23, 7, 5, 0, 0, time.UTC),
+			Duration:        3*24*time.Hour + 7*time.Hour + 5*time.Minute,
 		},
 		Live: status.LiveStats{UpstreamCursor: 1234567, NextSeq: 999, BootstrapSeq: 0},
 		SegmentAggregate: &status.SegmentAggregate{
@@ -180,6 +183,8 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "80 repos")
 	require.Contains(t, body, "Errored")
 	require.Contains(t, body, "10 repos")
+	require.Contains(t, body, "Duration")
+	require.Contains(t, body, "3d 7h")
 	require.Contains(t, body, "Latest segment")
 	require.Contains(t, body, "1,234")        // EventCount via humanInt
 	require.Contains(t, body, "567")          // UniqueDIDCount via humanInt64Cast
@@ -193,6 +198,26 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "overflow-wrap: anywhere")
 	require.Contains(t, body, "Top failing hosts")
 	require.NotContains(t, body, `<h2>Collections</h2>`)
+}
+
+func TestHandler_RendersUnknownBackfillDurationForOldSteadyStateData(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Backfill.StartedAt = time.Time{}
+	s.Backfill.CompletedAt = time.Time{}
+	s.Backfill.Duration = 0
+
+	h, err := web.New(web.Options{Snapshotter: &fakeSnapshotter{snap: s}})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	body := rr.Body.String()
+	require.Contains(t, body, "Duration")
+	require.Contains(t, body, "unknown")
 }
 
 func TestHandler_RendersBackfillingState(t *testing.T) {

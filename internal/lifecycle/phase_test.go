@@ -68,6 +68,31 @@ func TestPhaseEnteredAt_RoundTrip(t *testing.T) {
 	require.True(t, got.Equal(want), "got %s, want %s", got, want)
 }
 
+func TestBackfillTiming_RoundTrip(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+
+	startedAt := time.Date(2026, 5, 25, 1, 2, 3, 0, time.UTC)
+	completedAt := startedAt.Add(3*24*time.Hour + 7*time.Hour + 5*time.Minute)
+	require.NoError(t, WriteBackfillTiming(st, startedAt, completedAt))
+
+	got, err := ReadBackfillTiming(st)
+	require.NoError(t, err)
+	require.True(t, got.StartedAt.Equal(startedAt), "got %s, want %s", got.StartedAt, startedAt)
+	require.True(t, got.CompletedAt.Equal(completedAt), "got %s, want %s", got.CompletedAt, completedAt)
+	require.Equal(t, completedAt.Sub(startedAt), got.Duration())
+}
+
+func TestReadBackfillTiming_Empty(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	got, err := ReadBackfillTiming(st)
+	require.NoError(t, err)
+	require.True(t, got.StartedAt.IsZero())
+	require.True(t, got.CompletedAt.IsZero())
+	require.Equal(t, time.Duration(0), got.Duration())
+}
+
 func TestReadPhaseEnteredAt_Empty(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)

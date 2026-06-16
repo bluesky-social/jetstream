@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/coder/websocket"
@@ -34,13 +35,6 @@ func TestServe_GracefulShutdownClosesSubscriber(t *testing.T) {
 		require.NoError(t, s.Close())
 	}
 
-	// Pre-bind a free port so the test knows where /subscribe lives.
-	lc := net.ListenConfig{}
-	publicLn, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	publicAddr := publicLn.Addr().String()
-	require.NoError(t, publicLn.Close())
-
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/com.atproto.sync.subscribeRepos") {
 			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
@@ -61,21 +55,39 @@ func TestServe_GracefulShutdownClosesSubscriber(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
+	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
+		PublicAddr:                "127.0.0.1:0",
+		DebugAddr:                 "127.0.0.1:0",
+		DataDir:                   dataDir,
+		RelayURL:                  relay.URL,
+		OTelServiceName:           "jetstream-test",
+		LogLevel:                  "warn",
+		LogFormat:                 "text",
+		LogOutput:                 io.Discard,
+		ShutdownTimeout:           5 * time.Second,
+		ClientDrainTimeout:        10 * time.Second,
+		CursorLookback:            36 * time.Hour,
+		SubscribeHotTailBytes:     1 << 20,
+		SubscribeBlockCacheBytes:  1 << 20,
+		SubscribeReadBatch:        128,
+		SubscribeSlowWindow:       time.Second,
+		SubscribeSlowMinRate:      5,
+		CursorBlockIndexCacheSize: 32,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cancel()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		require.NoError(t, rt.Close(closeCtx))
+	})
+
 	done := make(chan error, 1)
 	go func() {
-		done <- newApp().Run(ctx, []string{
-			"jetstream",
-			"--log-format=text",
-			"--log-level=warn",
-			"serve",
-			"--addr=" + publicAddr,
-			"--debug-addr=127.0.0.1:0",
-			"--shutdown-timeout=5s",
-			"--client-drain-timeout=10s",
-			"--relay-url=" + relay.URL,
-			"--data-dir=" + dataDir,
-		})
+		done <- rt.Run(ctx)
 	}()
+
+	publicAddr := waitRuntimePublicAddr(t, rt, done)
 
 	// Dial /subscribe until the handler is live (steady-state gate open).
 	wsURL := "ws://" + publicAddr + "/subscribe"
@@ -138,4 +150,22 @@ func TestServe_GracefulShutdownClosesSubscriber(t *testing.T) {
 
 	require.Less(t, time.Since(shutdownStart), 11*time.Second,
 		"shutdown should complete promptly once the client has departed")
+}
+
+func waitRuntimePublicAddr(t *testing.T, rt *jetstreamd.Runtime, done <-chan error) string {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if addr := rt.PublicAddr(); addr != "" {
+			return addr
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("serve exited before binding public listener: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatal("serve never bound public listener")
+	return ""
 }
