@@ -434,12 +434,18 @@ Keys are namespaced by prefix:
 
 ```
 relay/cursor            -> uint64 upstream firehose seq we've durably persisted
+phase                   -> string current lifecycle phase: bootstrap, merging, or steady_state
+phase/entered_at        -> RFC3339Nano timestamp when the current lifecycle phase was entered
+backfill/timing/started_at   -> RFC3339Nano timestamp when initial bootstrap backfill started
+backfill/timing/completed_at -> RFC3339Nano timestamp when initial bootstrap backfill drained
 compaction/seq          -> the highest-watermark sequence number of the most recent compaction; owned by the compactor
 repo/<did>              -> JSON<RepoStatus> per-DID backfill and steady-state bookkeeping
 account/<did>           -> JSON<AccountStatus> hosting status, only present when non-active
 sync/<did>              -> JSON<SyncState> present while a resync is in progress
 replica/upstream_cursor -> uint64 (replica-only) last seq consumed from the upstream leader
 ```
+
+The `backfill/timing/*` keys are operator diagnostics, not control-plane state. When the bootstrap backfill engine drains, the orchestrator commits `phase=merging`, `phase/entered_at`, `backfill/timing/started_at`, and `backfill/timing/completed_at` in one synced pebble batch. That makes the status page's completed-backfill duration durable without creating a recovery dependency on it. Older data directories that predate these keys can still enter steady state; they simply render the completed backfill duration as unknown.
 
 `RepoStatus` carries both initial backfill state and steady-state bookkeeping with the following fields:
 

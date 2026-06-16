@@ -108,6 +108,28 @@ func TestCollect_PhaseAndEnteredAt(t *testing.T) {
 	require.True(t, snap.Phase.PhaseEnteredAt.Equal(enteredAt))
 }
 
+func TestCollect_BackfillTiming(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	startedAt := time.Date(2026, 5, 1, 1, 0, 0, 0, time.UTC)
+	completedAt := startedAt.Add(3*24*time.Hour + 7*time.Hour)
+	require.NoError(t, lifecycle.WriteBackfillTiming(st, startedAt, completedAt))
+	require.NoError(t, backfill.SaveCounts(st, backfill.Counts{Total: 10, Discovered: 10, Complete: 10}))
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	require.True(t, snap.Backfill.StartedAt.Equal(startedAt))
+	require.True(t, snap.Backfill.CompletedAt.Equal(completedAt))
+	require.Equal(t, completedAt.Sub(startedAt), snap.Backfill.Duration)
+}
+
 func TestCollect_BackfillCounts(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()

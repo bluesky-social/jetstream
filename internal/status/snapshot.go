@@ -56,6 +56,9 @@ type BackfillStats struct {
 	Failed          uint64
 	PercentComplete float64
 	ListReposCursor string
+	StartedAt       time.Time
+	CompletedAt     time.Time
+	Duration        time.Duration
 }
 
 // HostDiagnostics is the host/PDS aggregate table.

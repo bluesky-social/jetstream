@@ -202,6 +202,7 @@ document.addEventListener("input", function (event) {
           <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
           <dt>Downloaded</dt><dd>{{humanInt .Backfill.Complete}} repos</dd>
           <dt>Errored</dt><dd>{{humanInt .Backfill.Failed}} repos</dd>
+          {{template "backfillDuration" .}}
           <dt>listRepos cursor</dt><dd class="cursor">{{.Backfill.ListReposCursor}}</dd>
         </dl>
       {{else}}
@@ -209,6 +210,7 @@ document.addEventListener("input", function (event) {
           <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
           <dt>Downloaded</dt><dd>{{humanInt .Backfill.Complete}} repos</dd>
           <dt>Errored</dt><dd>{{humanInt .Backfill.Failed}} repos</dd>
+          {{template "backfillDuration" .}}
         </dl>
       {{end}}
     </section>
@@ -307,6 +309,16 @@ document.addEventListener("input", function (event) {
       <dd>{{if .CursorLookback.OldestRetainedAt.IsZero}}<em>n/a</em>{{else}}{{humanInt64Cast .CursorLookback.OldestRetainedSeq}} <small>({{relativeTime .CursorLookback.OldestRetainedAt .Now}})</small>{{end}}</dd>
     </dl>
   </section>
+{{end}}
+
+{{define "backfillDuration"}}
+  {{if .Backfill.CompletedAt.IsZero}}
+    {{if eq .Phase.Phase "steady_state"}}
+      <dt>Duration</dt><dd>unknown</dd>
+    {{end}}
+  {{else}}
+    <dt>Duration</dt><dd>{{humanDuration .Backfill.Duration}}</dd>
+  {{end}}
 {{end}}
 
 {{define "hosts"}}
