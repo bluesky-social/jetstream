@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/overlay"
 	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
@@ -53,6 +54,30 @@ func fetchOverlay(t *testing.T, cfg Config, run *runtimeRun, baseURL string) (ui
 		"overlay max-seq header must equal decoded M")
 
 	return w, m, snap
+}
+
+func fetchOverlayWithDIDTombstone(t *testing.T, cfg Config, run *runtimeRun, baseURL, did string, seq uint64) (uint64, uint64, tombstone.Snapshot) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	var lastW, lastM uint64
+	var lastSnap tombstone.Snapshot
+	for {
+		w, m, snap := fetchOverlay(t, cfg, run, baseURL)
+		lastW, lastM, lastSnap = w, m, snap
+		if ts, ok := snap.DIDs[did]; ok && ts.Seq == seq && m >= seq {
+			return w, m, snap
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("overlay did not include late DID tombstone before timeout: mode=%s seed=%d did=%s seq=%d lastW=%d lastM=%d did_tombstones=%d",
+				cfg.Mode, cfg.Seed, did, seq, lastW, lastM, len(lastSnap.DIDs))
+		}
+		select {
+		case <-run.exited:
+			t.Fatalf("runtime exited while waiting for late DID tombstone overlay: mode=%s seed=%d err=%v", cfg.Mode, cfg.Seed, run.err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // assertOverlayReconstruction reads the durable segment stream and asserts

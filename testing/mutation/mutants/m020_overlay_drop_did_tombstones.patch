@@ -15,15 +15,9 @@ diff --git a/internal/overlay/format.go b/internal/overlay/format.go
 index 10bfdf0..664fb28 100644
 --- a/internal/overlay/format.go
 +++ b/internal/overlay/format.go
-@@ -183,9 +183,9 @@ func encodeBody(snap tombstone.Snapshot, seqBase uint64) []byte {
- 	}
- 	sort.Slice(didTombDIDs, func(i, j int) bool { return didID[didTombDIDs[i]] < didID[didTombDIDs[j]] })
-
+@@ -197,1 +197,1 @@ func encodeBody(snap tombstone.Snapshot, seqBase uint64) []byte {
 -	buf = appendUvarint(buf, uint64(len(didTombDIDs)))
 +	buf = appendUvarint(buf, 0)
- 	prev := seqBase
+@@ -199,1 +199,1 @@ func encodeBody(snap tombstone.Snapshot, seqBase uint64) []byte {
 -	for _, did := range didTombDIDs {
 +	for _, did := range didTombDIDs[:0] {
- 		ts := snap.DIDs[did]
- 		buf = appendUvarint(buf, uint64(didID[did]))
- 		buf = appendUvarint(buf, ts.Seq-prev)

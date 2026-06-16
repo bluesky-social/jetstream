@@ -1,4 +1,4 @@
-mutant: m019_overlay_drop_record_tombstones
+mutant: m023_overlay_drop_record_tombstones
 target: internal/overlay/format.go
 failure-mode: |
   encodeBody omits all record tombstones from the served overlay blob
