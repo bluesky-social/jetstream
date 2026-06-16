@@ -8,7 +8,7 @@ require (
 	github.com/jcalabro/atmos v0.1.9
 	github.com/jcalabro/gloom v0.0.3
 	github.com/jcalabro/gt v0.0.13
-	github.com/jcalabro/jttp v0.0.5
+	github.com/jcalabro/jttp v0.0.6
 	github.com/klauspost/compress v1.18.6
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
