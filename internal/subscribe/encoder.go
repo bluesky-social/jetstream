@@ -21,7 +21,7 @@ import (
 // Pure: no I/O, no goroutines. Safe to fuzz against arbitrary input.
 func Encode(evt *segment.Event) ([]byte, error) {
 	switch evt.Kind {
-	case segment.KindCreate, segment.KindUpdate, segment.KindDelete:
+	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
 		return encodeCommit(evt)
 	case segment.KindIdentity:
 		return encodeIdentity(evt)
@@ -41,7 +41,7 @@ func Encode(evt *segment.Event) ([]byte, error) {
 // events, and additionally emits archived #sync events.
 func EncodeExtended(evt *segment.Event) ([]byte, error) {
 	switch evt.Kind {
-	case segment.KindCreate, segment.KindUpdate, segment.KindDelete:
+	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
 		return encodeExtendedCommit(evt)
 	case segment.KindIdentity:
 		return encodeExtendedIdentity(evt)
@@ -148,7 +148,7 @@ func encodeExtendedCommit(evt *segment.Event) ([]byte, error) {
 
 func commitOpString(k segment.Kind) string {
 	switch k {
-	case segment.KindCreate:
+	case segment.KindCreate, segment.KindCreateResync:
 		return streaming.JetstreamOpCreate
 	case segment.KindUpdate:
 		return streaming.JetstreamOpUpdate

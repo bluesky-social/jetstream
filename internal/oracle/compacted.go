@@ -45,7 +45,7 @@ func CheckCompacted(events []ObservedEvent, watermark uint64) error {
 	}
 
 	for _, ev := range events {
-		if ev.Seq > watermark || (ev.Kind != segment.KindCreate && ev.Kind != segment.KindUpdate) {
+		if ev.Seq > watermark || !ev.Kind.IsMaterialization() {
 			continue
 		}
 		if ts := didTombstones[ev.DID]; ts.seq > ev.Seq {

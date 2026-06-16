@@ -34,7 +34,7 @@ func Reconstruct(events []ObservedEvent) (*Model, error) {
 
 		key := RecordKey{DID: ev.DID, Collection: ev.Collection, Rkey: ev.Rkey}
 		switch ev.Kind {
-		case segment.KindCreate, segment.KindUpdate:
+		case segment.KindCreate, segment.KindUpdate, segment.KindCreateResync:
 			snap.Records[key] = RecordValue{
 				Rev:     ev.Rev,
 				Payload: append([]byte(nil), ev.Payload...),
@@ -47,5 +47,5 @@ func Reconstruct(events []ObservedEvent) (*Model, error) {
 }
 
 func isCommitKind(kind segment.Kind) bool {
-	return kind == segment.KindCreate || kind == segment.KindUpdate || kind == segment.KindDelete
+	return kind.IsCommit()
 }

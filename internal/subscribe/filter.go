@@ -284,7 +284,7 @@ func clampMaxMsgSize(n int) uint32 {
 //   - wantedDIDs applies to all event kinds. If non-empty and evt.DID
 //     is not in the set, drop.
 //   - wantedCollections applies ONLY to commit events
-//     (KindCreate / KindUpdate / KindDelete). Identity and Account
+//     (KindCreate / KindUpdate / KindDelete / KindCreateResync). Identity and Account
 //     events bypass the collection filter — v1 README:
 //     "Regardless of desired collections, all subscribers receive
 //     Account and Identity events." Sync events are filtered upstream
@@ -327,5 +327,5 @@ func (f *Filter) Wants(evt *segment.Event) bool {
 }
 
 func isCommitKind(k segment.Kind) bool {
-	return k == segment.KindCreate || k == segment.KindUpdate || k == segment.KindDelete
+	return k.IsCommit()
 }

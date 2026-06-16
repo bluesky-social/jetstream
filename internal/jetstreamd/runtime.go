@@ -353,6 +353,16 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Metrics:   subscribeMetrics,
 		Lookback:  opts.CursorLookback,
 	}))
+	srv.RegisterPublicRoute("GET /subscribe-v2", subscribe.NewHandler(subscribe.Subscription{
+		Tail:                      tail,
+		Store:                     metaStore,
+		Manifest:                  mft,
+		WriterRef:                 &writerPtr,
+		Logger:                    processLogger,
+		Metrics:                   subscribeMetrics,
+		Lookback:                  opts.CursorLookback,
+		EmitResyncReplacementRows: true,
+	}))
 
 	// XRPC surface: whole-file segment download + listing. The atmos
 	// xrpcserver routes /xrpc/{nsid}; mounting at the "/xrpc/" subtree

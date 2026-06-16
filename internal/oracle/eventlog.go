@@ -278,6 +278,8 @@ func eventLogKind(kind segment.Kind) string {
 	switch kind {
 	case segment.KindCreate:
 		return "create"
+	case segment.KindCreateResync:
+		return "create_resync"
 	case segment.KindUpdate:
 		return "update"
 	case segment.KindDelete:

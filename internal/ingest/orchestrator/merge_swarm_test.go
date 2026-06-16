@@ -70,7 +70,7 @@ func generateScenario(rng *rand.Rand) scenario {
 		revCounters[did] += 1 + rng.IntN(5)
 		rev := "rev-" + paddedHex(revCounters[did])
 		var kind segment.Kind
-		switch rng.IntN(6) {
+		switch rng.IntN(7) {
 		case 0:
 			kind = segment.KindCreate
 		case 1:
@@ -78,8 +78,10 @@ func generateScenario(rng *rand.Rand) scenario {
 		case 2:
 			kind = segment.KindDelete
 		case 3:
-			kind = segment.KindIdentity
+			kind = segment.KindCreateResync
 		case 4:
+			kind = segment.KindIdentity
+		case 5:
 			kind = segment.KindAccount
 		default:
 			kind = segment.KindSync

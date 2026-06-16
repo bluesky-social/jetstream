@@ -24,17 +24,19 @@ func newCappedDecoder(maxBytes uint64) (*zstd.Decoder, error) {
 func TestValidateAcceptsHappyPath(t *testing.T) {
 	t.Parallel()
 
-	require.NoError(t, ValidateEvent(Event{
-		Seq:        42,
-		IndexedAt:  1_700_000_000_000_000,
-		RenderedAt: 0,
-		Kind:       KindCreate,
-		DID:        "did:plc:abcdefghijklmnopqrstuvwx",
-		Collection: "app.bsky.feed.post",
-		Rkey:       "3l3qo2vuowo2b",
-		Rev:        "3l3qo2vutsw2b",
-		Payload:    []byte("any DAG-CBOR bytes"),
-	}))
+	for _, kind := range []Kind{KindCreate, KindCreateResync} {
+		require.NoError(t, ValidateEvent(Event{
+			Seq:        42,
+			IndexedAt:  1_700_000_000_000_000,
+			RenderedAt: 0,
+			Kind:       kind,
+			DID:        "did:plc:abcdefghijklmnopqrstuvwx",
+			Collection: "app.bsky.feed.post",
+			Rkey:       "3l3qo2vuowo2b",
+			Rev:        "3l3qo2vutsw2b",
+			Payload:    []byte("any DAG-CBOR bytes"),
+		}))
+	}
 }
 
 func TestValidateRejectsInvalidKind(t *testing.T) {
@@ -46,9 +48,9 @@ func TestValidateRejectsInvalidKind(t *testing.T) {
 		require.ErrorIs(t, err, ErrInvalidKind)
 	})
 
-	t.Run("seven", func(t *testing.T) {
+	t.Run("eight", func(t *testing.T) {
 		t.Parallel()
-		err := ValidateEvent(Event{Kind: 7})
+		err := ValidateEvent(Event{Kind: 8})
 		require.ErrorIs(t, err, ErrInvalidKind)
 	})
 }
@@ -236,7 +238,7 @@ func TestDecodeBlockRejectsTrailingBytes(t *testing.T) {
 // guard in the decoder (block.go:243-ish) rejects kinds that the
 // validator catches on the encode side. A round-trip cannot
 // produce one, but a hostile or corrupt buffer can; the decoder
-// must not happily emit Kind(0) or Kind(7).
+// must not happily emit Kind(0) or Kind(8).
 func TestDecodeBlockRejectsOutOfRangeKind(t *testing.T) {
 	t.Parallel()
 
@@ -255,7 +257,7 @@ func TestDecodeBlockRejectsOutOfRangeKind(t *testing.T) {
 	_, err = decodeBlock(corrupted)
 	require.ErrorIs(t, err, errTruncatedBlock)
 
-	corrupted[kindOffset] = 7
+	corrupted[kindOffset] = 8
 	_, err = decodeBlock(corrupted)
 	require.ErrorIs(t, err, errTruncatedBlock)
 }
@@ -351,7 +353,7 @@ func genEvent(r *rand.Rand) Event {
 		Seq:        r.Uint64(),
 		IndexedAt:  int64(r.Uint64()),
 		RenderedAt: int64(r.Uint64()),
-		Kind:       Kind(1 + r.Intn(6)),
+		Kind:       Kind(1 + r.Intn(7)),
 		DID:        randString(r, didLen),
 		Collection: randString(r, collLen),
 		Rkey:       randString(r, rkeyLen),

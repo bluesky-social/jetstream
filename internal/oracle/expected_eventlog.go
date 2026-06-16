@@ -140,7 +140,7 @@ func expectedSyncReplacementRows(w *world.World, did, rev string) ([]segment.Eve
 		for _, key := range keys {
 			value := snap.Records[key]
 			out = append(out, segment.Event{
-				Kind:       segment.KindCreate,
+				Kind:       segment.KindCreateResync,
 				DID:        did,
 				Collection: key.Collection,
 				Rkey:       key.Rkey,
@@ -161,6 +161,8 @@ func expectedActionKind(action streaming.Action) (segment.Kind, error) {
 		return segment.KindUpdate, nil
 	case streaming.ActionDelete:
 		return segment.KindDelete, nil
+	case streaming.ActionResync:
+		return segment.KindCreateResync, nil
 	default:
 		return 0, fmt.Errorf("oracle: unknown expected firehose action %q", action)
 	}

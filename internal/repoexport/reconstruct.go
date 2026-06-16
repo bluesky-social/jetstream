@@ -317,7 +317,7 @@ func replayEvent(ev segment.Event, watermark string, state *replayState) error {
 	}
 
 	switch ev.Kind {
-	case segment.KindCreate, segment.KindUpdate:
+	case segment.KindCreate, segment.KindUpdate, segment.KindCreateResync:
 		if watermark != "" && ev.Rev <= watermark {
 			return nil
 		}

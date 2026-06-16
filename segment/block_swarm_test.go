@@ -104,7 +104,7 @@ func generateSwarmBlock(r *rand.Rand, f swarmFlags) []Event {
 	}
 
 	// Kind axis.
-	pickKind := func() Kind { return Kind(1 + r.Intn(6)) }
+	pickKind := func() Kind { return Kind(1 + r.Intn(7)) }
 	if f[axisSameKind] {
 		k := pickKind()
 		pickKind = func() Kind { return k }

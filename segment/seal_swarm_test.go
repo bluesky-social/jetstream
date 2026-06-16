@@ -101,7 +101,7 @@ func TestSealSwarm(t *testing.T) {
 			}
 			ev := Event{
 				Seq: uint64(i + 1), IndexedAt: int64(i),
-				Kind: Kind(1 + r.IntN(6)),
+				Kind: Kind(1 + r.IntN(7)),
 				DID:  did, Collection: coll, Rkey: "k", Rev: "rev",
 				Payload: payload,
 			}
