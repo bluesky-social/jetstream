@@ -36,6 +36,8 @@ type SegmentHandler struct {
 	onWriterError func(error)
 }
 
+const segmentHandlerAppendBatchSize = 1024
+
 // Compile-time assertion.
 var _ atmosbackfill.Handler = (*SegmentHandler)(nil)
 
@@ -68,6 +70,21 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 
 		indexedAt := h.now().UnixMicro()
 		appended := false
+		batch := make([]segment.Event, 0, segmentHandlerAppendBatchSize)
+
+		flushBatch := func() error {
+			if len(batch) == 0 {
+				return nil
+			}
+			if err := h.writer.AppendBatch(ctx, batch); err != nil {
+				err = fmt.Errorf("backfill: did=%s append batch: %w", did, err)
+				h.abortOnWriterError(err)
+				return err
+			}
+			appended = true
+			batch = batch[:0]
+			return nil
+		}
 
 		if err := r.Tree.Walk(func(key string, cid cbor.CID) error {
 			if err := ctx.Err(); err != nil {
@@ -107,14 +124,15 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 				}
 				return fmt.Errorf("backfill: did=%s invalid segment event %s/%s: %w", did, collection, rkey, err)
 			}
-			if err := h.writer.Append(ctx, &ev); err != nil {
-				err = fmt.Errorf("backfill: did=%s append %s/%s: %w", did, collection, rkey, err)
-				h.abortOnWriterError(err)
-				return err
+			batch = append(batch, ev)
+			if len(batch) >= segmentHandlerAppendBatchSize {
+				return flushBatch()
 			}
-			appended = true
 			return nil
 		}); err != nil {
+			return err
+		}
+		if err := flushBatch(); err != nil {
 			return err
 		}
 		if appended {

@@ -130,6 +130,10 @@ type Config struct {
 	// leaves the backfill package on its default.
 	BackfillBatchSize int
 
+	// BackfillAsyncFlushWorkers enables async segment flush compression for
+	// the bootstrap backfill writer only. Zero keeps synchronous flushing.
+	BackfillAsyncFlushWorkers int
+
 	// BackfillRepos, when non-empty, replaces bootstrap listRepos
 	// discovery with this explicit DID list. Debug-only knob for
 	// targeted production smoke tests; leave empty in production.
@@ -235,6 +239,9 @@ func (c *Config) validate() error {
 	}
 	if c.BackfillBatchSize < 0 {
 		return fmt.Errorf("%w: BackfillBatchSize must be >= 0", ErrInvalidConfig)
+	}
+	if c.BackfillAsyncFlushWorkers < 0 {
+		return fmt.Errorf("%w: BackfillAsyncFlushWorkers must be >= 0", ErrInvalidConfig)
 	}
 	if c.HTTPClient == nil {
 		return fmt.Errorf("%w: HTTPClient is required", ErrInvalidConfig)

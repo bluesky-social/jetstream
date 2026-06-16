@@ -34,6 +34,11 @@ type Writer struct {
 	activeIdx   uint64
 	nextSeq     uint64
 	closed      bool
+
+	async            *asyncFlushPipeline
+	asyncPrepared    int
+	asyncJobs        sync.WaitGroup
+	nextAsyncFlushID uint64
 }
 
 // Open scans cfg.SegmentsDir, resumes or creates the active segment,
@@ -134,6 +139,10 @@ func Open(cfg Config) (*Writer, error) {
 	w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
 
+	if cfg.AsyncFlushWorkers > 0 {
+		w.async = newAsyncFlushPipeline(w, cfg.AsyncFlushWorkers)
+	}
+
 	w.cfg.Logger.Info("opened",
 		"segments_dir", cfg.SegmentsDir,
 		"active_index", w.activeIdx,
@@ -154,6 +163,10 @@ func Open(cfg Config) (*Writer, error) {
 // ScanMaxSeq reconciliation will recover the correct nextSeq on
 // next start.
 func (w *Writer) Close() error {
+	if w.async != nil {
+		return w.closeAsync()
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -184,6 +197,10 @@ func (w *Writer) Close() error {
 // instead — sealing during normal operation is a rotation-time
 // concern handled inside flushAndRotateLocked.
 func (w *Writer) SealActiveAndClose() error {
+	if w.async != nil {
+		return w.sealActiveAndCloseAsync()
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -225,12 +242,60 @@ func (w *Writer) SealActiveAndClose() error {
 // is left untouched so callers can safely retry without observing
 // a phantom allocation. Goroutine-safe.
 func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
+	if w.async != nil {
+		w.mu.Lock()
+		job, err := w.appendLocked(ctx, ev)
+		w.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		return w.waitAsyncFlushes([]*asyncFlushJob{job})
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	_, err := w.appendLocked(ctx, ev)
+	return err
+}
+
+// AppendBatch writes a bounded caller-provided event batch while holding the
+// writer lock once. On success, mutates each event's Seq in place to the
+// allocated value. On an error before an event is appended, that event and all
+// later events are left untouched. If a flush or hook fails after appending an
+// event, the error semantics match Append.
+func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	w.mu.Lock()
+	var jobs []*asyncFlushJob
+	var appendErr error
+
+	for i := range events {
+		job, err := w.appendLocked(ctx, &events[i])
+		if job != nil {
+			jobs = append(jobs, job)
+		}
+		if err != nil {
+			appendErr = err
+			break
+		}
+	}
+	w.mu.Unlock()
+
+	flushErr := w.waitAsyncFlushes(jobs)
+	if appendErr != nil {
+		return appendErr
+	}
+	return flushErr
+}
+
+func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlushJob, error) {
 	if w.closed {
 		w.cfg.Metrics.incAppendErrors()
-		return ErrClosed
+		return nil, ErrClosed
 	}
 
 	candidate := *ev
@@ -238,7 +303,7 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	full, err := w.active.Append(candidate)
 	if err != nil {
 		w.cfg.Metrics.incAppendErrors()
-		return fmt.Errorf("ingest: append: %w", err)
+		return nil, fmt.Errorf("ingest: append: %w", err)
 	}
 	ev.Seq = candidate.Seq
 	w.nextSeq++
@@ -247,16 +312,23 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 
 	if w.cfg.OnAppend != nil {
 		if err := w.cfg.OnAppend(ev); err != nil {
-			return fmt.Errorf("ingest: on_append: %w", err)
+			return nil, fmt.Errorf("ingest: on_append: %w", err)
 		}
 	}
 
 	if full {
+		if w.async != nil {
+			job, err := w.prepareAsyncFlushLocked()
+			if err != nil {
+				return nil, err
+			}
+			return job, nil
+		}
 		if err := w.flushAndRotateLocked(ctx); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // Flush forces any pending block to fsync. Goroutine-safe. Used by
@@ -267,6 +339,24 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 //
 // A no-op when nothing is buffered.
 func (w *Writer) Flush(ctx context.Context) error {
+	if w.async != nil {
+		w.mu.Lock()
+		if w.closed {
+			w.mu.Unlock()
+			return ErrClosed
+		}
+		if w.active == nil {
+			w.mu.Unlock()
+			return nil
+		}
+		job, err := w.prepareAsyncFlushLocked()
+		w.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		return w.waitAsyncFlushes([]*asyncFlushJob{job})
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -345,6 +435,10 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
 // upstream relay is down) for no compliance benefit. Goroutine-safe;
 // concurrent Appends serialize against the rotation on w.mu.
 func (w *Writer) ForceRotate(ctx context.Context) error {
+	if w.async != nil {
+		return fmt.Errorf("ingest: force rotate is not supported with async flush")
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {

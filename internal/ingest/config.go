@@ -35,6 +35,13 @@ type Config struct {
 	// segment.DefaultMaxEventsPerBlock when zero.
 	MaxEventsPerBlock int
 
+	// AsyncFlushWorkers enables a backfill-oriented pipeline that detaches
+	// full segment blocks under the writer mutex, compresses them outside the
+	// mutex, then commits them in order before AppendBatch returns. This must
+	// not be used with OnAfterFlush until that hook is made block-specific;
+	// the live consumer currently uses it to persist a mutable cursor.
+	AsyncFlushWorkers int
+
 	// SeqKey is the pebble key holding the writer's seq counter.
 	// Default "seq/next" preserves backfill-writer behavior. The
 	// live_segments consumer overrides this with
@@ -113,6 +120,14 @@ func (c *Config) validate() error {
 	if c.MaxEventsPerBlock < 0 {
 		return fmt.Errorf("%w: MaxEventsPerBlock must be >= 0 (got %d)",
 			ErrInvalidConfig, c.MaxEventsPerBlock)
+	}
+	if c.AsyncFlushWorkers < 0 {
+		return fmt.Errorf("%w: AsyncFlushWorkers must be >= 0 (got %d)",
+			ErrInvalidConfig, c.AsyncFlushWorkers)
+	}
+	if c.AsyncFlushWorkers > 0 && c.OnAfterFlush != nil {
+		return fmt.Errorf("%w: AsyncFlushWorkers cannot be used with OnAfterFlush",
+			ErrInvalidConfig)
 	}
 	return nil
 }

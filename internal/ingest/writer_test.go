@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -48,6 +49,12 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	}
 	if overrides.MaxEventsPerBlock != 0 {
 		cfg.MaxEventsPerBlock = overrides.MaxEventsPerBlock
+	}
+	if overrides.AsyncFlushWorkers != 0 {
+		cfg.AsyncFlushWorkers = overrides.AsyncFlushWorkers
+	}
+	if overrides.Metrics != nil {
+		cfg.Metrics = overrides.Metrics
 	}
 
 	w, err := Open(cfg)
@@ -1107,4 +1114,252 @@ func TestAppend_OnAppendErrorFailsAppend(t *testing.T) {
 	ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
 	err = w.Append(t.Context(), &ev)
 	require.ErrorIs(t, err, hookErr)
+}
+
+func TestAppendBatch_AllocatesMonotonicSeq(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{MaxEventsPerBlock: 64})
+
+	events := make([]segment.Event, 10)
+	for i := range events {
+		events[i] = segment.Event{
+			IndexedAt: int64(i + 1),
+			Kind:      segment.KindCreate,
+			DID:       "did:plc:a",
+		}
+	}
+
+	require.NoError(t, w.AppendBatch(t.Context(), events))
+
+	for i := range events {
+		require.Equal(t, uint64(i), events[i].Seq, "event %d", i)
+	}
+	require.Equal(t, uint64(len(events)), w.NextSeq())
+}
+
+func TestAppendBatch_AsyncFlushPersistsBlocksAndSeqBeforeReturn(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 2,
+		AsyncFlushWorkers: 2,
+	})
+
+	events := []segment.Event{
+		{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"},
+		{IndexedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b"},
+		{IndexedAt: 3, Kind: segment.KindCreate, DID: "did:plc:c"},
+		{IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:d"},
+	}
+	require.NoError(t, w.AppendBatch(t.Context(), events))
+
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), persisted)
+
+	require.NoError(t, w.Close())
+	path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))
+	var blocks [][]segment.Event
+	require.NoError(t, segment.WalkActive(path, func(events []segment.Event) error {
+		blocks = append(blocks, append([]segment.Event(nil), events...))
+		return nil
+	}))
+	require.Len(t, blocks, 2)
+	require.Equal(t, uint64(0), blocks[0][0].Seq)
+	require.Equal(t, uint64(1), blocks[0][1].Seq)
+	require.Equal(t, uint64(2), blocks[1][0].Seq)
+	require.Equal(t, uint64(3), blocks[1][1].Seq)
+}
+
+func TestAppendBatch_AsyncFlushDefersRotationWhilePendingRowsExist(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 2,
+		MaxSegmentBytes:   1,
+		AsyncFlushWorkers: 2,
+	})
+
+	events := []segment.Event{
+		{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a", Payload: []byte("one")},
+		{IndexedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b", Payload: []byte("two")},
+		{IndexedAt: 3, Kind: segment.KindCreate, DID: "did:plc:c", Payload: []byte("three")},
+	}
+	require.NoError(t, w.AppendBatch(t.Context(), events))
+
+	require.Equal(t, uint64(0), w.ActiveIndex(),
+		"async rotation must not seal while a later partial block is pending")
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), persisted,
+		"only the full async block is durable before the explicit flush")
+
+	require.NoError(t, w.Flush(t.Context()))
+	require.Equal(t, uint64(1), w.ActiveIndex(),
+		"flush drains the partial block and lets the oversized segment rotate")
+	persisted, err = loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), persisted)
+
+	r, err := segment.Open(segment.ReaderConfig{Path: filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	require.Len(t, r.Blocks(), 2)
+}
+
+func TestAppendBatch_AsyncFlushConcurrentBatchesRemainContiguous(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 3,
+		AsyncFlushWorkers: 4,
+	})
+
+	const goroutines = 8
+	const perBatch = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := range goroutines {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			events := make([]segment.Event, perBatch)
+			for i := range events {
+				events[i] = segment.Event{
+					IndexedAt: int64(g*perBatch + i + 1),
+					Kind:      segment.KindCreate,
+					DID:       fmt.Sprintf("did:plc:test%02d%02d", g, i),
+					Payload:   []byte{byte(g), byte(i)},
+				}
+			}
+			errs <- w.AppendBatch(t.Context(), events)
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+
+	path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))
+	var seqs []uint64
+	require.NoError(t, segment.WalkActive(path, func(events []segment.Event) error {
+		for _, ev := range events {
+			seqs = append(seqs, ev.Seq)
+		}
+		return nil
+	}))
+	require.Len(t, seqs, goroutines*perBatch)
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	for i, seq := range seqs {
+		require.Equal(t, uint64(i), seq)
+	}
+}
+
+func TestWriter_AsyncCloseFlushesPendingBlockAndPersistsNextSeq(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 8,
+		AsyncFlushWorkers: 4,
+	})
+
+	events := []segment.Event{
+		{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"},
+		{IndexedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b"},
+		{IndexedAt: 3, Kind: segment.KindCreate, DID: "did:plc:c"},
+	}
+	require.NoError(t, w.AppendBatch(t.Context(), events))
+	require.NoError(t, w.Close())
+
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), persisted)
+
+	path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))
+	var got []segment.Event
+	require.NoError(t, segment.WalkActive(path, func(events []segment.Event) error {
+		got = append(got, events...)
+		return nil
+	}))
+	require.Len(t, got, 3)
+	for i := range got {
+		require.Equal(t, uint64(i), got[i].Seq)
+	}
+}
+
+func TestWriter_AsyncSealActiveAndCloseSealsPendingBlock(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 8,
+		AsyncFlushWorkers: 4,
+	})
+
+	events := []segment.Event{
+		{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"},
+		{IndexedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b"},
+	}
+	require.NoError(t, w.AppendBatch(t.Context(), events))
+	require.NoError(t, w.SealActiveAndClose())
+
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), persisted)
+
+	path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))
+	r, err := segment.Open(segment.ReaderConfig{Path: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	require.Len(t, r.Blocks(), 1)
+	require.EqualValues(t, 2, r.Blocks()[0].EventCount)
+}
+
+func TestAppendBatch_LeavesSeqUntouchedOnClosedWriter(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{})
+	require.NoError(t, w.Close())
+
+	events := []segment.Event{
+		{Seq: 0xA, Kind: segment.KindCreate, DID: "did:plc:a"},
+		{Seq: 0xB, Kind: segment.KindCreate, DID: "did:plc:b"},
+	}
+
+	err := w.AppendBatch(t.Context(), events)
+	require.ErrorIs(t, err, ErrClosed)
+	require.Equal(t, uint64(0xA), events[0].Seq)
+	require.Equal(t, uint64(0xB), events[1].Seq)
+}
+
+func TestAppendBatch_OnAppendFiresBeforeSealVisibility(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+
+	var observed []uint64
+	var observedAtSeal []uint64
+	w, err := Open(Config{
+		SegmentsDir:       segDir,
+		Store:             newTestStore(t),
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+		MaxEventsPerBlock: 2,
+		MaxSegmentBytes:   1,
+		OnAppend: func(ev *segment.Event) error {
+			observed = append(observed, ev.Seq)
+			return nil
+		},
+		OnAfterSeal: func(idx uint64, path string) error {
+			observedAtSeal = append([]uint64(nil), observed...)
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	events := []segment.Event{
+		{Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r"},
+		{Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "s"},
+	}
+	require.NoError(t, w.AppendBatch(t.Context(), events))
+
+	require.Equal(t, uint64(1), w.ActiveIndex(), "batch append must seal segment 0")
+	require.Equal(t, []uint64{0, 1}, observed)
+	require.Equal(t, []uint64{0, 1}, observedAtSeal,
+		"every event of the sealed segment must be observed before the seal is visible")
 }

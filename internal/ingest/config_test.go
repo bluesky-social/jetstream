@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -60,4 +61,35 @@ func TestConfigValidate_RejectsNegativeBytes(t *testing.T) {
 	}
 	err := cfg.validate()
 	require.True(t, errors.Is(err, ErrInvalidConfig), "want ErrInvalidConfig, got %v", err)
+}
+
+func TestConfigValidate_RejectsNegativeAsyncFlushWorkers(t *testing.T) {
+	t.Parallel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{
+		SegmentsDir:       "/tmp/x",
+		Store:             &store.Store{},
+		Logger:            logger,
+		AsyncFlushWorkers: -1,
+	}
+
+	err := cfg.validate()
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorContains(t, err, "AsyncFlushWorkers")
+}
+
+func TestConfigValidate_RejectsAsyncFlushWithOnAfterFlush(t *testing.T) {
+	t.Parallel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{
+		SegmentsDir:       "/tmp/x",
+		Store:             &store.Store{},
+		Logger:            logger,
+		AsyncFlushWorkers: 1,
+		OnAfterFlush:      func(_ context.Context) error { return nil },
+	}
+
+	err := cfg.validate()
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorContains(t, err, "OnAfterFlush")
 }

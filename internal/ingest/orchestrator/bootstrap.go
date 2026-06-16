@@ -50,12 +50,13 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		// Backfill writer (shared with the backfill engine).
 		bw, err := ingest.Open(ingest.Config{
-			SegmentsDir:    segmentsDir,
-			Store:          o.cfg.Store,
-			Logger:         o.cfg.Logger,
-			Metrics:        o.cfg.IngestMetrics,
-			SegmentMetrics: o.cfg.SegmentMetrics,
-			OnAfterSeal:    o.cfg.IngestOnAfterSeal,
+			SegmentsDir:       segmentsDir,
+			Store:             o.cfg.Store,
+			Logger:            o.cfg.Logger,
+			Metrics:           o.cfg.IngestMetrics,
+			SegmentMetrics:    o.cfg.SegmentMetrics,
+			AsyncFlushWorkers: o.cfg.BackfillAsyncFlushWorkers,
+			OnAfterSeal:       o.cfg.IngestOnAfterSeal,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open backfill ingest writer: %w", err)

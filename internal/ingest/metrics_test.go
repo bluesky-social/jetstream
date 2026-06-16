@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,6 +31,8 @@ func TestNewMetrics_RegistersCounters(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.AppendErrors), 0)
 	require.InDelta(t, 123.0, testutil.ToFloat64(m.ActiveSegBytes), 0)
 	require.InDelta(t, 456.0, testutil.ToFloat64(m.NextSeq), 0)
+	requireNoDebugMetricFields(t, m)
+	requireNoDebugMetrics(t, reg)
 }
 
 // TestNewMetrics_NilSafe pins that every inc/set helper tolerates a
@@ -46,4 +49,21 @@ func TestNewMetrics_NilSafe(t *testing.T) {
 		m.setActiveSegBytes(1)
 		m.setNextSeq(1)
 	})
+}
+
+func requireNoDebugMetrics(t *testing.T, reg *prometheus.Registry) {
+	t.Helper()
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		require.NotContains(t, mf.GetName(), "_debug_")
+	}
+}
+
+func requireNoDebugMetricFields(t *testing.T, m *Metrics) {
+	t.Helper()
+	typ := reflect.TypeOf(*m)
+	for i := range typ.NumField() {
+		require.NotContains(t, typ.Field(i).Name, "Debug")
+	}
 }

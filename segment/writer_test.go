@@ -313,6 +313,180 @@ func TestFlushMultipleBlocks(t *testing.T) {
 	require.True(t, eventsEqual(allEvents[2], walked[1][0]))
 }
 
+func TestPrepareAndCommitPreparedFlushAllowsAppendWhileBlockIsCompressed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+
+	allEvents := []Event{
+		{Seq: 1, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, Kind: KindCreate, DID: "did:plc:b"},
+		{Seq: 3, Kind: KindCreate, DID: "did:plc:c"},
+		{Seq: 4, Kind: KindCreate, DID: "did:plc:d"},
+	}
+	for _, ev := range allEvents[:2] {
+		full, err := w.Append(ev)
+		require.NoError(t, err)
+		if ev.Seq == 2 {
+			require.True(t, full)
+		}
+	}
+
+	first, err := w.PrepareFlush()
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.Equal(t, 0, w.Pending(), "PrepareFlush must swap in an empty pending block")
+
+	for _, ev := range allEvents[2:] {
+		_, err := w.Append(ev)
+		require.NoError(t, err)
+	}
+	second, err := w.PrepareFlush()
+	require.NoError(t, err)
+	require.NotNil(t, second)
+
+	firstFrame := CompressPreparedBlock(first)
+	secondFrame := CompressPreparedBlock(second)
+	require.NoError(t, w.CommitPreparedFlush(first, firstFrame))
+	require.NoError(t, w.CommitPreparedFlush(second, secondFrame))
+	require.NoError(t, w.Close())
+
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	walked := walkFramedBlocks(t, contents[ReservedHeaderBytes:])
+	require.Len(t, walked, 2)
+	require.Len(t, walked[0], 2)
+	require.Len(t, walked[1], 2)
+	for i, ev := range allEvents {
+		require.True(t, eventsEqual(ev, walked[i/2][i%2]))
+	}
+}
+
+func TestCommitPreparedFlushRejectsOutOfOrderPreparedBlocks(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:a"})
+	require.NoError(t, err)
+	first, err := w.PrepareFlush()
+	require.NoError(t, err)
+	require.NotNil(t, first)
+
+	_, err = w.Append(Event{Seq: 2, Kind: KindCreate, DID: "did:plc:b"})
+	require.NoError(t, err)
+	second, err := w.PrepareFlush()
+	require.NoError(t, err)
+	require.NotNil(t, second)
+
+	err = w.CommitPreparedFlush(second, CompressPreparedBlock(second))
+	require.ErrorContains(t, err, "prepared block order")
+	require.NoError(t, w.CommitPreparedFlush(first, CompressPreparedBlock(first)))
+	require.NoError(t, w.CommitPreparedFlush(second, CompressPreparedBlock(second)))
+}
+
+func TestCommitPreparedFlushRejectsPreparedBlockFromDifferentWriter(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "a.jss")
+	pathB := filepath.Join(dir, "b.jss")
+
+	wA, err := New(Config{Path: pathA, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+	defer func() { _ = wA.Close() }()
+	wB, err := New(Config{Path: pathB, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+	defer func() { _ = wB.Close() }()
+
+	_, err = wA.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:a"})
+	require.NoError(t, err)
+	prepared, err := wA.PrepareFlush()
+	require.NoError(t, err)
+	require.NotNil(t, prepared)
+
+	err = wB.CommitPreparedFlush(prepared, CompressPreparedBlock(prepared))
+	require.ErrorContains(t, err, "different writer")
+}
+
+func TestCommitPreparedFlushRejectsAlreadyCommittedBlock(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:a"})
+	require.NoError(t, err)
+	prepared, err := w.PrepareFlush()
+	require.NoError(t, err)
+	require.NotNil(t, prepared)
+
+	frame := CompressPreparedBlock(prepared)
+	require.NoError(t, w.CommitPreparedFlush(prepared, frame))
+	err = w.CommitPreparedFlush(prepared, frame)
+	require.ErrorContains(t, err, "already committed")
+}
+
+func TestCloseRejectsUncommittedPreparedBlock(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:a"})
+	require.NoError(t, err)
+	prepared, err := w.PrepareFlush()
+	require.NoError(t, err)
+	require.NotNil(t, prepared)
+
+	err = w.Close()
+	require.ErrorContains(t, err, "uncommitted prepared block")
+
+	require.NoError(t, w.CommitPreparedFlush(prepared, CompressPreparedBlock(prepared)))
+	require.NoError(t, w.Close())
+}
+
+func TestSealRejectsUncommittedPreparedBlock(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:a"})
+	require.NoError(t, err)
+	prepared, err := w.PrepareFlush()
+	require.NoError(t, err)
+	require.NotNil(t, prepared)
+
+	_, err = w.Seal()
+	require.ErrorContains(t, err, "uncommitted prepared block")
+
+	require.NoError(t, w.CommitPreparedFlush(prepared, CompressPreparedBlock(prepared)))
+	_, err = w.Seal()
+	require.NoError(t, err)
+}
+
 func TestFlushAfterCloseReturnsErrClosed(t *testing.T) {
 	t.Parallel()
 

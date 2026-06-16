@@ -216,6 +216,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_BACKFILL_BATCH_SIZE"),
 				Value:   jetstreamd.DefaultBackfillBatchSize,
 			},
+			&cli.IntFlag{
+				Name:    "backfill-async-flush-workers",
+				Usage:   "Async compression workers for bootstrap backfill segment flushes. 0 disables async flushing.",
+				Sources: cli.EnvVars("JETSTREAM_BACKFILL_ASYNC_FLUSH_WORKERS"),
+				Value:   jetstreamd.DefaultBackfillAsyncFlushWorkers,
+			},
 			&cli.StringFlag{
 				Name:    "backfill-repos",
 				Usage:   "DEBUG ONLY: comma-separated DID list to backfill instead of walking listRepos. Empty = normal production behavior.",
@@ -332,6 +338,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		MaxBackfillRepos:            maxBackfillRepos,
 		BackfillWorkers:             cmd.Int("backfill-workers"),
 		BackfillBatchSize:           cmd.Int("backfill-batch-size"),
+		BackfillAsyncFlushWorkers:   cmd.Int("backfill-async-flush-workers"),
 		BackfillRepos:               backfillRepos,
 		SkipMergeDiscovery:          cmd.Bool("skip-merge-discovery"),
 		DisableRepoActionRateLimits: cmd.Bool("disable-repo-action-rate-limits"),
