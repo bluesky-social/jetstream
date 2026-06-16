@@ -33,10 +33,7 @@ func TestTail_BurstDoesNotDropSlowButLiveReaders(t *testing.T) {
 		if cursor >= n {
 			return nil, cursor, nil
 		}
-		end := cursor + uint64(max)
-		if end > n {
-			end = n
-		}
+		end := min(cursor+uint64(max), n)
 		out := make([]*Entry, 0, end-cursor)
 		for s := cursor; s < end; s++ {
 			out = append(out, newEntry(logged[s]))
@@ -57,7 +54,7 @@ func TestTail_BurstDoesNotDropSlowButLiveReaders(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	for r := 0; r < readers; r++ {
+	for r := range readers {
 		wg.Add(1)
 		go func(r int) {
 			defer wg.Done()
@@ -75,7 +72,7 @@ func TestTail_BurstDoesNotDropSlowButLiveReaders(t *testing.T) {
 
 	// Producer: append everything, recording into the cold log FIRST so a cold
 	// miss can always be served. The byte budget must hold throughout.
-	for s := 0; s < total; s++ {
+	for s := range total {
 		ev := &segment.Event{
 			Seq: uint64(s), Kind: segment.KindCreate, DID: "did:plc:burst",
 			Payload: make([]byte, 64),
@@ -88,7 +85,7 @@ func TestTail_BurstDoesNotDropSlowButLiveReaders(t *testing.T) {
 	}
 
 	wg.Wait()
-	for r := 0; r < readers; r++ {
+	for r := range readers {
 		require.Equal(t, total, received[r], "reader %d must receive every event, zero drops", r)
 	}
 }

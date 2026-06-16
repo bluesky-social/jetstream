@@ -99,10 +99,7 @@ func collectSubscribeReplay(t *testing.T, cfg Config, run *runtimeRun, trace *Tr
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "oracle replay complete") }()
 
 	for {
-		readTimeout := oracleWaitTimeout(cfg)
-		if readTimeout > 10*time.Second {
-			readTimeout = 10 * time.Second
-		}
+		readTimeout := min(oracleWaitTimeout(cfg), 10*time.Second)
 		readCtx, cancel := context.WithTimeout(context.Background(), readTimeout)
 		go func() {
 			select {

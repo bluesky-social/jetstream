@@ -11,7 +11,7 @@ import (
 // seedN writes n sealed segments with indices 0..n-1 into dir.
 func seedN(t *testing.T, dir string, n int) {
 	t.Helper()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		base := uint64(i)*100 + 1
 		mustWriteSealedSegment(t, filepath.Join(dir, ingest.SegmentFilename(uint64(i))), sealedFixture{
 			minSeq:       base,

@@ -76,16 +76,14 @@ func TestTraceRecordIndexesAreConcurrentSafe(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for worker := range goroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range perWorker {
 				errs <- trace.Record("event", map[string]any{
 					"worker": worker,
 					"i":      i,
 				})
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

@@ -29,7 +29,7 @@ func TestBlockCache_GetOrDecode_RunsDecodeOnce(t *testing.T) {
 	const N = 20
 	var wg sync.WaitGroup
 	wg.Add(N)
-	for i := 0; i < N; i++ {
+	for range N {
 		go func() {
 			defer wg.Done()
 			evs, err := c.getOrDecode(blockKey{segIdx: 0, blockIdx: 0}, decode)
@@ -47,7 +47,7 @@ func TestBlockCache_EvictsByByteBudget(t *testing.T) {
 	mk := func(seg uint64) func() ([]segment.Event, error) {
 		return func() ([]segment.Event, error) { return decodedFixture(seg*10, seg*10+1, seg*10+2), nil }
 	}
-	for seg := uint64(0); seg < 10; seg++ {
+	for seg := range uint64(10) {
 		_, err := c.getOrDecode(blockKey{segIdx: seg, blockIdx: 0}, mk(seg))
 		require.NoError(t, err)
 	}

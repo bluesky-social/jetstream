@@ -624,7 +624,7 @@ func TestStore_HostAggregates_LatestFiveFailureSamples(t *testing.T) {
 		Host: "pds.example.com",
 	}))
 
-	for i := 0; i < 7; i++ {
+	for i := range 7 {
 		require.NoError(t, s.OnFail(ctx, did, errors.New("xrpc: HTTP 503: unavailable sample "+string(rune('0'+i))), i+1))
 	}
 

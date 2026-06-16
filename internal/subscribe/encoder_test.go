@@ -411,7 +411,6 @@ func TestEncodeExtended_IdentityAndAccountCarryCursors(t *testing.T) {
 		{"identity", segment.KindIdentity, identPayload, "identity"},
 		{"account", segment.KindAccount, acctPayload, "account"},
 	} {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			body, err := EncodeExtended(&segment.Event{

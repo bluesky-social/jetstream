@@ -342,7 +342,7 @@ func BenchmarkDeleteCompactionSyntheticArchive(b *testing.B) {
 	)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		b.StopTimer()
 		dataDir := b.TempDir()
 		segmentsDir := filepath.Join(dataDir, "segments")

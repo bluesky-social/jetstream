@@ -208,7 +208,7 @@ func TestTail_ReadFrom_EvictedCursorStillGoesCold(t *testing.T) {
 		return []*Entry{newEntry(&segment.Event{Seq: cursor})}, cursor + 1, nil
 	}
 	tl := newTestTail(t, 200, cold) // tiny ring forces eviction
-	for seq := uint64(0); seq < 50; seq++ {
+	for seq := range uint64(50) {
 		tl.Append(&segment.Event{Seq: seq, Kind: segment.KindCreate, DID: "did:plc:x", Payload: []byte{0xa0}})
 	}
 	// seq 0 was evicted (below ring base): must serve cold.
@@ -236,14 +236,11 @@ func TestTail_ReadFrom_ConcurrentEvictionNoRace(t *testing.T) {
 	tl := newTestTail(t, 4096, cold)
 
 	const total = 50_000
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	var wg sync.WaitGroup
-	for r := 0; r < 6; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 6 {
+		wg.Go(func() {
 			cursor := uint64(0)
 			for cursor < total {
 				batch, next, err := tl.ReadFrom(ctx, cursor, 64)
@@ -256,10 +253,10 @@ func TestTail_ReadFrom_ConcurrentEvictionNoRace(t *testing.T) {
 				}
 				cursor = next
 			}
-		}()
+		})
 	}
 
-	for s := uint64(0); s < total; s++ {
+	for s := range uint64(total) {
 		tl.Append(&segment.Event{Seq: s, Kind: segment.KindCreate, DID: "did:plc:c", Payload: make([]byte, 32)})
 	}
 	wg.Wait()

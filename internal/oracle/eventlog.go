@@ -169,12 +169,7 @@ func filterCompactedExpectedRows(rows []EventLogRow, watermark uint64) []EventLo
 }
 
 func eventLogContains(rows []EventLogRow, target EventLogRow) bool {
-	for _, row := range rows {
-		if row == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(rows, target)
 }
 
 func eventLogRowsSorted(rows []EventLogRow) []EventLogRow {

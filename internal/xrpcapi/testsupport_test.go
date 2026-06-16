@@ -41,7 +41,7 @@ func writeSealedSegment(t *testing.T, dir string, idx uint64, seqStart uint64) s
 	path := filepath.Join(dir, ingest.SegmentFilename(idx))
 	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: 4096})
 	require.NoError(t, err)
-	for i := uint64(0); i < 4; i++ {
+	for i := range uint64(4) {
 		_, err = w.Append(segment.Event{
 			Seq:        seqStart + i,
 			IndexedAt:  int64(1_730_000_000_000_000 + (seqStart+i)*1_000),
@@ -64,7 +64,7 @@ func writeSealedSegment(t *testing.T, dir string, idx uint64, seqStart uint64) s
 func newTestServer(t *testing.T, n int) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		writeSealedSegment(t, dir, uint64(i), uint64(i*4+1))
 	}
 	m, err := manifest.Open(manifest.Options{SegmentsDir: dir, Logger: slog.Default()})

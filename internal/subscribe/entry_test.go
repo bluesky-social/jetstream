@@ -28,7 +28,7 @@ func TestEntry_EncodedMemoizesOnce(t *testing.T) {
 	var wg sync.WaitGroup
 	results := make([][]byte, N)
 	wg.Add(N)
-	for i := 0; i < N; i++ {
+	for i := range N {
 		go func(i int) {
 			defer wg.Done()
 			body, err := e.Encoded()
@@ -39,7 +39,7 @@ func TestEntry_EncodedMemoizesOnce(t *testing.T) {
 	wg.Wait()
 
 	require.Equal(t, int64(1), calls.Load(), "encode must run exactly once")
-	for i := 0; i < N; i++ {
+	for i := range N {
 		require.Equal(t, []byte(`{"ok":true}`), results[i])
 	}
 }
@@ -98,7 +98,7 @@ func TestEntry_CompressedMemoizesOnceAndDecodes(t *testing.T) {
 	var wg sync.WaitGroup
 	results := make([][]byte, N)
 	wg.Add(N)
-	for i := 0; i < N; i++ {
+	for i := range N {
 		go func(i int) {
 			defer wg.Done()
 			body, err := e.Compressed()
@@ -109,7 +109,7 @@ func TestEntry_CompressedMemoizesOnceAndDecodes(t *testing.T) {
 	wg.Wait()
 
 	require.Equal(t, int64(1), calls.Load(), "underlying JSON encode must run exactly once")
-	for i := 0; i < N; i++ {
+	for i := range N {
 		require.Equal(t, results[0], results[i], "all callers see the same memoized frame")
 	}
 

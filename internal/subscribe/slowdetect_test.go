@@ -17,7 +17,7 @@ func TestSlowDetector_DropsStalledFarBehindClient(t *testing.T) {
 	// Far behind (lag 1e6) and scanning ~1 seq/sec for 90s: adversarial.
 	pos := uint64(0)
 	dropped := false
-	for sec := 0; sec < 90; sec++ {
+	for range 90 {
 		now = now.Add(time.Second)
 		pos++ // 1 seq/sec
 		tip := uint64(1_000_000)
@@ -38,7 +38,7 @@ func TestSlowDetector_KeepsSlowButProgressingClient(t *testing.T) {
 	})
 	// Far behind but scanning at 100 seq/sec (above floor): never dropped.
 	pos := uint64(0)
-	for sec := 0; sec < 120; sec++ {
+	for range 120 {
 		now = now.Add(time.Second)
 		pos += 100
 		require.False(t, d.observe(pos, 1_000_000), "progressing client must not be dropped")
@@ -53,7 +53,7 @@ func TestSlowDetector_KeepsIdleCaughtUpClient(t *testing.T) {
 		now: func() time.Time { return now },
 	})
 	// Caught up (lag 0), cursor static because the stream is idle.
-	for sec := 0; sec < 300; sec++ {
+	for range 300 {
 		now = now.Add(time.Second)
 		require.False(t, d.observe(0, 0), "idle caught-up client must not be dropped")
 	}
@@ -68,7 +68,7 @@ func TestSlowDetector_RecoveryResetsWindow(t *testing.T) {
 	})
 	pos := uint64(0)
 	// 30s slow + far behind (not yet a full window).
-	for sec := 0; sec < 30; sec++ {
+	for range 30 {
 		now = now.Add(time.Second)
 		pos++
 		require.False(t, d.observe(pos, 1_000_000))
@@ -78,7 +78,7 @@ func TestSlowDetector_RecoveryResetsWindow(t *testing.T) {
 	pos += 1_000_000
 	require.False(t, d.observe(pos, 100))
 	// Another 30s slow: still under a full window from the reset.
-	for sec := 0; sec < 30; sec++ {
+	for range 30 {
 		now = now.Add(time.Second)
 		pos++
 		require.False(t, d.observe(pos, 1_000_000))
