@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/format"
 	"github.com/coder/websocket"
 	"github.com/urfave/cli/v3"
 )
@@ -544,9 +545,9 @@ func printReport(
 		stats.started.Load(),
 		formatCount(events),
 		eps,
-		formatBytes(bytes),
-		formatBytes(uint64(bps)),
-		formatBytes(avgBytes),
+		format.Bytes(int64(bytes)),
+		format.Bytes(int64(bps)),
+		format.Bytes(int64(avgBytes)),
 		formatCount(stats.dials.Load()),
 		formatCount(stats.dialErrors.Load()),
 		formatCount(stats.reconnects.Load()),
@@ -583,19 +584,4 @@ func formatCount[T ~int64 | ~uint64](n T) string {
 		b.WriteString(s[i : i+3])
 	}
 	return b.String()
-}
-
-func formatBytes(n uint64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := uint64(unit), 0
-	for n/div >= unit && exp < 4 {
-		div *= unit
-		exp++
-	}
-	value := float64(n) / float64(div)
-	suffixes := []string{"KiB", "MiB", "GiB", "TiB", "PiB"}
-	return fmt.Sprintf("%.1f %s", value, suffixes[exp])
 }

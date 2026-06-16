@@ -16,11 +16,15 @@ const (
 	envOracleFaultMode           = "JETSTREAM_ORACLE_FAULT_MODE"
 )
 
+// FaultModeNone and FaultModeSwarm are the supported values for Config.FaultMode:
+// no injected faults, or the bounded transient-getRepo fault swarm.
 const (
 	FaultModeNone  = "none"
 	FaultModeSwarm = "swarm"
 )
 
+// Config holds the tunable parameters of an oracle harness run: the mode,
+// RNG seed, account and record counts, live-event budgets, and fault mode.
 type Config struct {
 	Mode                string
 	Seed                uint64
@@ -49,6 +53,9 @@ func ParseConfigFromLookupEnv(lookupenv func(string) (string, bool)) (Config, er
 	return parseConfigFromLookupEnv(lookupenv)
 }
 
+// ParseConfigFromEnv parses oracle configuration from a getenv-style lookup,
+// treating empty values as absent. Use ParseConfigFromLookupEnv to distinguish
+// unset variables from explicitly-empty ones.
 func ParseConfigFromEnv(getenv func(string) string) (Config, error) {
 	return parseConfigFromLookupEnv(func(key string) (string, bool) {
 		value := getenv(key)

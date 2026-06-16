@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/format"
 	"github.com/bluesky-social/jetstream-v2/internal/repoexport"
 	"github.com/bluesky-social/jetstream-v2/internal/status"
 	"github.com/jcalabro/atmos"
@@ -90,18 +91,18 @@ func New(opts Options) (*Handler, error) {
 	}
 
 	funcs := template.FuncMap{
-		"humanBytes":    humanBytes,
+		"humanBytes":    format.Bytes,
 		"humanDuration": humanDuration,
-		"humanInt":      humanInt,
-		"humanInt64":    func(n int64) string { return humanInt(uint64(n)) },
+		"humanInt":      format.Int,
+		"humanInt64":    func(n int64) string { return format.Int(uint64(n)) },
 		"humanInt64Cast": func(n any) string {
 			switch v := n.(type) {
 			case uint32:
-				return humanInt(uint64(v))
+				return format.Int(uint64(v))
 			case uint64:
-				return humanInt(v)
+				return format.Int(v)
 			case int:
-				return humanInt(uint64(v))
+				return format.Int(uint64(v))
 			default:
 				return fmt.Sprint(n)
 			}
@@ -125,8 +126,11 @@ func New(opts Options) (*Handler, error) {
 	}, nil
 }
 
-// dictFunc lets the template build map[string]any inline so we can
-// pass multiple values to a sub-template.
+// dictFunc exists because Go templates can only pass a single pipeline
+// value into a sub-template ({{template "x" .Foo}}). When a sub-template
+// needs several named values, the caller builds them into a map inline
+// ({{template "x" dict "a" .A "b" .B}}) and the sub-template reads them
+// back by key. Keys must be strings and arguments must come in pairs.
 func dictFunc(kv ...any) (map[string]any, error) {
 	if len(kv)%2 != 0 {
 		return nil, errors.New("dict: odd number of args")

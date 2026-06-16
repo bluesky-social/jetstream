@@ -707,6 +707,19 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 	return nil
 }
 
+// lookupSegment returns a pointer to the resident segment metadata whose
+// Idx matches idx, or the standard "unknown segment idx" error. Callers
+// must hold m.mu (at least RLock); the returned pointer aliases the
+// resident slice and is only valid while the lock is held.
+func (m *Manifest) lookupSegment(idx uint64) (*SegmentMetadata, error) {
+	for i := range m.segments {
+		if m.segments[i].Idx == idx {
+			return &m.segments[i], nil
+		}
+	}
+	return nil, fmt.Errorf("manifest: unknown segment idx %d", idx)
+}
+
 // BlockIndex returns the resident []BlockInfo for segment idx.
 //
 // The returned slice is shared across callers; treat it as read-only.
@@ -716,18 +729,17 @@ func (m *Manifest) BlockIndex(idx uint64) ([]segment.BlockInfo, error) {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for i := range m.segments {
-		if m.segments[i].Idx == idx {
-			if m.opts.Metrics != nil {
-				m.opts.Metrics.BlockIndexCacheHitsTotal.Inc()
-			}
-			return m.segments[i].Blocks, nil
+	seg, err := m.lookupSegment(idx)
+	if err != nil {
+		if m.opts.Metrics != nil {
+			m.opts.Metrics.BlockIndexCacheMissesTotal.Inc()
 		}
+		return nil, err
 	}
 	if m.opts.Metrics != nil {
-		m.opts.Metrics.BlockIndexCacheMissesTotal.Inc()
+		m.opts.Metrics.BlockIndexCacheHitsTotal.Inc()
 	}
-	return nil, fmt.Errorf("manifest: unknown segment idx %d", idx)
+	return seg.Blocks, nil
 }
 
 // SegmentBlockSelection identifies, for one sealed segment, the blocks
@@ -821,12 +833,11 @@ func (m *Manifest) SegmentBloom(idx uint64) (*gloom.Filter, error) {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for i := range m.segments {
-		if m.segments[i].Idx == idx {
-			return m.segments[i].SegmentBloom, nil
-		}
+	seg, err := m.lookupSegment(idx)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("manifest: unknown segment idx %d", idx)
+	return seg.SegmentBloom, nil
 }
 
 // BlockBloom returns the resident per-block DID bloom for segment idx/block idx.
@@ -837,16 +848,14 @@ func (m *Manifest) BlockBloom(segIdx uint64, blockIdx int) (*gloom.Filter, error
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for i := range m.segments {
-		if m.segments[i].Idx != segIdx {
-			continue
-		}
-		if blockIdx < 0 || blockIdx >= len(m.segments[i].BlockBlooms) {
-			return nil, fmt.Errorf("manifest: segment %d block %d out of range", segIdx, blockIdx)
-		}
-		return m.segments[i].BlockBlooms[blockIdx], nil
+	seg, err := m.lookupSegment(segIdx)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("manifest: unknown segment idx %d", segIdx)
+	if blockIdx < 0 || blockIdx >= len(seg.BlockBlooms) {
+		return nil, fmt.Errorf("manifest: segment %d block %d out of range", segIdx, blockIdx)
+	}
+	return seg.BlockBlooms[blockIdx], nil
 }
 
 // BlockCollections returns the resident per-block collection ids for segment idx/block idx.
@@ -857,14 +866,12 @@ func (m *Manifest) BlockCollections(segIdx uint64, blockIdx int) ([]uint32, erro
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for i := range m.segments {
-		if m.segments[i].Idx != segIdx {
-			continue
-		}
-		if blockIdx < 0 || blockIdx >= len(m.segments[i].BlockCollections) {
-			return nil, fmt.Errorf("manifest: segment %d block %d out of range", segIdx, blockIdx)
-		}
-		return m.segments[i].BlockCollections[blockIdx], nil
+	seg, err := m.lookupSegment(segIdx)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("manifest: unknown segment idx %d", segIdx)
+	if blockIdx < 0 || blockIdx >= len(seg.BlockCollections) {
+		return nil, fmt.Errorf("manifest: segment %d block %d out of range", segIdx, blockIdx)
+	}
+	return seg.BlockCollections[blockIdx], nil
 }

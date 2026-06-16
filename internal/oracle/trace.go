@@ -9,12 +9,16 @@ import (
 	"sync"
 )
 
+// Trace is a thread-safe sink that writes ordered, JSON-lines trace records to
+// an io.Writer for debugging oracle runs.
 type Trace struct {
 	mu   sync.Mutex
 	next uint64
 	w    io.Writer
 }
 
+// TraceRecord is a single line emitted by a Trace: a monotonically increasing
+// index, an event kind, and optional structured data.
 type TraceRecord struct {
 	Index uint64         `json:"index"`
 	Kind  string         `json:"kind"`
@@ -22,10 +26,13 @@ type TraceRecord struct {
 	Data  map[string]any `json:"data,omitempty"`
 }
 
+// NewTrace returns a Trace that writes records to w.
 func NewTrace(w io.Writer) *Trace {
 	return &Trace{w: w}
 }
 
+// Record appends one JSON-lines trace record. It is a no-op on a nil Trace and
+// errors if the Trace has no writer or the underlying write is short.
 func (t *Trace) Record(kind string, data map[string]any) error {
 	if t == nil {
 		return nil

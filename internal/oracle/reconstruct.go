@@ -2,6 +2,9 @@ package oracle
 
 import "github.com/bluesky-social/jetstream-v2/segment"
 
+// Reconstruct folds an ordered event stream into a final-state Model by
+// applying create/update/delete ops and resetting an account's records on
+// account-delete and sync events.
 func Reconstruct(events []ObservedEvent) (*Model, error) {
 	model := &Model{Accounts: make(map[string]RepoSnapshot)}
 	for _, ev := range events {

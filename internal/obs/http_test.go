@@ -62,12 +62,12 @@ func getCtx(t *testing.T, url string) *http.Response {
 	return resp
 }
 
-// TestInstrumentHandler_RecordsStatusCode is the regression test for
+// TestMiddleware_RecordsStatusCode is the regression test for
 // statusRecorder.WriteHeader: any non-200 response must propagate into
 // the `code` histogram label. Without this, a silent regression that
 // always labels code="200" would slip past the existing integration
 // test (which only checks that a histogram bucket line exists).
-func TestInstrumentHandler_RecordsStatusCode(t *testing.T) {
+func TestMiddleware_RecordsStatusCode(t *testing.T) {
 	t.Parallel()
 
 	m := obs.NewMetrics()
@@ -75,7 +75,7 @@ func TestInstrumentHandler_RecordsStatusCode(t *testing.T) {
 		w.WriteHeader(http.StatusTeapot)
 	})
 
-	ts := httptest.NewServer(m.InstrumentHandler("teapot", handler))
+	ts := httptest.NewServer(m.Middleware("teapot", handler))
 	t.Cleanup(ts.Close)
 
 	resp := getCtx(t, ts.URL)
@@ -85,10 +85,10 @@ func TestInstrumentHandler_RecordsStatusCode(t *testing.T) {
 	requireHistogramHasObservation(t, m, "teapot", http.MethodGet, "418")
 }
 
-// TestInstrumentHandler_DefaultStatusIs200 covers the path where a
+// TestMiddleware_DefaultStatusIs200 covers the path where a
 // handler writes a body without an explicit WriteHeader call: the
 // recorder's default status (200) must be the one observed.
-func TestInstrumentHandler_DefaultStatusIs200(t *testing.T) {
+func TestMiddleware_DefaultStatusIs200(t *testing.T) {
 	t.Parallel()
 
 	m := obs.NewMetrics()
@@ -96,7 +96,7 @@ func TestInstrumentHandler_DefaultStatusIs200(t *testing.T) {
 		_, _ = w.Write([]byte("hello"))
 	})
 
-	ts := httptest.NewServer(m.InstrumentHandler("hello", handler))
+	ts := httptest.NewServer(m.Middleware("hello", handler))
 	t.Cleanup(ts.Close)
 
 	resp := getCtx(t, ts.URL)
@@ -105,12 +105,12 @@ func TestInstrumentHandler_DefaultStatusIs200(t *testing.T) {
 	requireHistogramHasObservation(t, m, "hello", http.MethodGet, "200")
 }
 
-// TestInstrumentHandler_PreservesHijacker is the regression test for
+// TestMiddleware_PreservesHijacker is the regression test for
 // the websocket-upgrade footgun. A statusRecorder that doesn't expose
 // http.Hijacker breaks every websocket handler in surprising ways at
 // production-traffic time. We assert by checking that the handler
 // can type-assert the wrapped writer to http.Hijacker and use it.
-func TestInstrumentHandler_PreservesHijacker(t *testing.T) {
+func TestMiddleware_PreservesHijacker(t *testing.T) {
 	t.Parallel()
 
 	m := obs.NewMetrics()
@@ -130,7 +130,7 @@ func TestInstrumentHandler_PreservesHijacker(t *testing.T) {
 		_ = conn.Close()
 	})
 
-	ts := httptest.NewServer(m.InstrumentHandler("hijack", handler))
+	ts := httptest.NewServer(m.Middleware("hijack", handler))
 	t.Cleanup(ts.Close)
 
 	dialCtx, dialCancel := context.WithTimeout(t.Context(), 2*time.Second)
@@ -170,7 +170,7 @@ func TestStatusRecorder_HijackUnsupported(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req, err := http.NewRequest(http.MethodGet, "/", nil) //nolint:noctx // synthesized request
 	require.NoError(t, err)
-	m.InstrumentHandler("hijack-fail", handler).ServeHTTP(rec, req)
+	m.Middleware("hijack-fail", handler).ServeHTTP(rec, req)
 
 	select {
 	case err := <-captured:
@@ -216,7 +216,7 @@ func TestStatusRecorder_PreservesReaderFrom(t *testing.T) {
 
 	req, err := http.NewRequest(http.MethodGet, "/", nil) //nolint:noctx // synthesized request
 	require.NoError(t, err)
-	m.InstrumentHandler("readfrom", handler).ServeHTTP(inner, req)
+	m.Middleware("readfrom", handler).ServeHTTP(inner, req)
 
 	require.True(t, readFromCalled, "ReadFrom must delegate to the inner writer (sendfile path)")
 }

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/bluesky-social/jetstream-v2/internal/format"
 	"github.com/bluesky-social/jetstream-v2/internal/status"
 	"github.com/urfave/cli/v3"
 )
@@ -88,17 +89,17 @@ func renderNetwork(bw *errWriter, n status.NetworkTotals) {
 	bw.printf("\nnetwork totals:\n")
 	bw.printf("  segments:               %d (%d sealed, %d active)\n",
 		n.Segments, n.SealedSegments, n.ActiveSegments)
-	bw.printf("  blocks:                 %s\n", humanInt(n.Blocks))
-	bw.printf("  events:                 %s\n", humanInt(n.Events))
+	bw.printf("  blocks:                 %s\n", format.Int(n.Blocks))
+	bw.printf("  events:                 %s\n", format.Int(n.Events))
 	bw.printf("  collections:            %d distinct NSIDs\n", n.Collections)
 	if n.Events > 0 {
 		bw.printf("  seq range:              [%d, %d]\n", n.MinSeq, n.MaxSeq)
 		bw.printf("  indexed_at range:       %s → %s\n",
 			formatTime(n.MinIndexedAt), formatTime(n.MaxIndexedAt))
 	}
-	bw.printf("  payload (uncompressed): %s\n", formatBytes(n.UncompressedBytes))
-	bw.printf("  payload (compressed):   %s\n", formatBytes(n.CompressedBytes))
-	bw.printf("  disk usage:             %s\n", formatBytes(n.DiskBytes))
+	bw.printf("  payload (uncompressed): %s\n", format.Bytes(n.UncompressedBytes))
+	bw.printf("  payload (compressed):   %s\n", format.Bytes(n.CompressedBytes))
+	bw.printf("  disk usage:             %s\n", format.Bytes(n.DiskBytes))
 	if n.CompressedBytes > 0 {
 		ratio := float64(n.UncompressedBytes) / float64(n.CompressedBytes)
 		bw.printf("  compression ratio:      %.2fx\n", ratio)
@@ -118,8 +119,8 @@ func renderTrees(bw *errWriter, trees []status.TreeAggregate) {
 			continue
 		}
 		bw.printf("        files:        %d sealed + %d active\n", t.SealedCount, t.ActiveCount)
-		bw.printf("        events:       %s\n", humanInt(t.EventCount))
-		bw.printf("        blocks:       %s\n", humanInt(t.BlockCount))
+		bw.printf("        events:       %s\n", format.Int(t.EventCount))
+		bw.printf("        blocks:       %s\n", format.Int(t.BlockCount))
 		if t.EventCount > 0 {
 			bw.printf("        seq range:    [%d, %d]\n", t.MinSeq, t.MaxSeq)
 			bw.printf("        indexed_at:   %s → %s\n",
@@ -129,16 +130,16 @@ func renderTrees(bw *errWriter, trees []status.TreeAggregate) {
 			bw.printf("        oldest mtime: %s\n", formatTime(t.OldestMTime))
 			bw.printf("        newest mtime: %s\n", formatTime(t.NewestMTime))
 		}
-		bw.printf("        compressed:   %s\n", formatBytes(t.CompressedBytes))
-		bw.printf("        uncompressed: %s\n", formatBytes(t.UncompressedBytes))
-		bw.printf("        disk:         %s\n", formatBytes(t.DiskBytes))
+		bw.printf("        compressed:   %s\n", format.Bytes(t.CompressedBytes))
+		bw.printf("        uncompressed: %s\n", format.Bytes(t.UncompressedBytes))
+		bw.printf("        disk:         %s\n", format.Bytes(t.DiskBytes))
 		if ls := t.LatestSegment; ls != nil {
 			state := "active"
 			if ls.Sealed {
 				state = "sealed"
 			}
 			bw.printf("        latest:       idx=%d %s events=%s blocks=%d size=%s\n",
-				ls.Index, state, humanInt(ls.EventCount), ls.BlockCount, formatBytes(ls.SizeBytes))
+				ls.Index, state, format.Int(ls.EventCount), ls.BlockCount, format.Bytes(ls.SizeBytes))
 		}
 	}
 }
@@ -162,7 +163,7 @@ func renderCollections(bw *errWriter, cols []status.CollectionAggregate, truncat
 
 	emit := func(idx int, c status.CollectionAggregate) {
 		bw.printf("  [%3d] %-*s  events: %12s  segments: %5d  blocks: %12s\n",
-			idx, nsidW, c.NSID, humanInt(c.EventCount), c.SegmentCount, humanInt(c.BlockCount))
+			idx, nsidW, c.NSID, format.Int(c.EventCount), c.SegmentCount, format.Int(c.BlockCount))
 	}
 
 	n := len(cols)

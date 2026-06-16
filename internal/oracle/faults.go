@@ -96,6 +96,9 @@ func BuildSwarmFaultPlan(w *world.World, cfg Config) (*SwarmFaultPlan, error) {
 	return plan, nil
 }
 
+// ArmSubscribeReposDisconnects installs the plan's subscribeRepos disconnect
+// thresholds into the live simulator fault plan. It is a no-op if the plan or
+// its simulator faults are nil.
 func (p *SwarmFaultPlan) ArmSubscribeReposDisconnects() {
 	if p == nil || p.SimulatorFaults == nil {
 		return
@@ -142,6 +145,8 @@ func (p *SwarmFaultPlan) addGetRepoCARTruncations(did string, count int) {
 	p.SimulatorFaults.AddGetRepoCARTruncations(did, count)
 }
 
+// TotalGetRepoHTTPFailures returns the total number of scheduled getRepo HTTP
+// failures across all DIDs. It returns 0 for a nil plan.
 func (p *SwarmFaultPlan) TotalGetRepoHTTPFailures() int {
 	if p == nil {
 		return 0
@@ -153,6 +158,8 @@ func (p *SwarmFaultPlan) TotalGetRepoHTTPFailures() int {
 	return total
 }
 
+// TotalGetRepoCARTruncations returns the total number of scheduled getRepo CAR
+// truncation faults across all DIDs. It returns 0 for a nil plan.
 func (p *SwarmFaultPlan) TotalGetRepoCARTruncations() int {
 	if p == nil {
 		return 0

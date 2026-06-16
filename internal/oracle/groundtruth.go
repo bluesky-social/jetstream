@@ -8,6 +8,9 @@ import (
 	"github.com/jcalabro/atmos/repo"
 )
 
+// GroundTruthFromWorld builds the authoritative final-state Model directly from
+// the simulator world's repos, skipping deleted accounts, for comparison
+// against the reconstructed model.
 func GroundTruthFromWorld(w *world.World) (*Model, error) {
 	out := &Model{Accounts: make(map[string]RepoSnapshot, w.AccountCount())}
 	for idx := range w.AccountCount() {

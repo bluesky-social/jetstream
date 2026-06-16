@@ -159,7 +159,7 @@ func TestServer_MetricsCaptureNon200StatusCodes(t *testing.T) {
 	// 404 from a stdlib NotFound goes through statusRecorder.Write
 	// without WriteHeader being called; the recorder's default of 200
 	// would mask the real code. Today we don't wrap the 404 path
-	// (only registered routes carry InstrumentHandler), so this
+	// (only registered routes carry Middleware), so this
 	// assertion is forward-looking for when the project adds a
 	// catch-all instrumented handler. For now, just confirm the
 	// metric for the registered route doesn't get spuriously created.

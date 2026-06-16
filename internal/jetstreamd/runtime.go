@@ -510,11 +510,6 @@ func (r *Runtime) Close(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Options returns the resolved options used to build this runtime.
-func (r *Runtime) Options() Options {
-	return r.opts
-}
-
 func (r *Runtime) closeWithLogging(ctx context.Context) {
 	if err := r.Close(ctx); err != nil {
 		r.logger.Error("runtime cleanup failed", "err", err)

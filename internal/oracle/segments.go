@@ -11,10 +11,15 @@ import (
 	"github.com/bluesky-social/jetstream-v2/segment"
 )
 
+// ObserveSegments reads every event from the primary segment directory under
+// dataDir in physical order.
 func ObserveSegments(dataDir string) ([]ObservedEvent, error) {
 	return observeSegmentDir(filepath.Join(dataDir, "segments"))
 }
 
+// ObserveBootstrapSegments reads the primary segments followed by the bootstrap
+// live segments, checking invariants on each source before returning them
+// sorted by seq. A missing live-segments directory yields just the primary events.
 func ObserveBootstrapSegments(dataDir string) ([]ObservedEvent, error) {
 	primary, err := observeSegmentDir(filepath.Join(dataDir, "segments"))
 	if err != nil {

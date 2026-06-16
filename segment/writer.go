@@ -413,13 +413,11 @@ func (w *Writer) Close() error {
 // pendingBlock satisfies the columns interface (defined in block.go)
 // so flushLocked can encode without materializing []Event.
 //
-// The variable-length blob accessors are AppendXxx — they copy
-// the writer's contiguous buffer wholesale. The previous design
-// exposed per-event Collection(i)/DID(i)/etc. accessors that walked
-// the length column from 0..i to compute each row's offset, which
-// made a single encode O(n²) in the lengths-summing cost. The new
-// columns contract sidesteps that by appending the entire variable
-// region as one operation per column.
+// The variable-length blob accessors are AppendXxx — they copy the
+// writer's contiguous buffer wholesale. Per-event Collection(i)/DID(i)/
+// etc. accessors would have to walk the length column 0..i to compute
+// each row's offset, making a single encode O(n²); appending the entire
+// variable region per column keeps it O(n).
 
 func (p *pendingBlock) Len() int               { return p.count() }
 func (p *pendingBlock) Seq(i int) uint64       { return p.seq[i] }
@@ -546,7 +544,7 @@ func (w *Writer) Append(ev Event) (full bool, err error) {
 	if w.pending.count() >= w.cfg.MaxEventsPerBlock {
 		return false, ErrBufferFull
 	}
-	if err := validate(ev); err != nil {
+	if err := ValidateEvent(ev); err != nil {
 		return false, err
 	}
 

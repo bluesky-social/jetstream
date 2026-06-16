@@ -13,12 +13,12 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
-// InstrumentHandler wraps h with prometheus and OTEL HTTP instrumentation.
+// Middleware wraps h with prometheus and OTEL HTTP instrumentation.
 // `name` is the logical handler label used as the `handler` metric label and
 // the otelhttp span name; it should be a short identifier like "root" or
 // "segments_download", not the raw path (which would explode label
 // cardinality).
-func (m *Metrics) InstrumentHandler(name string, h http.Handler) http.Handler {
+func (m *Metrics) Middleware(name string, h http.Handler) http.Handler {
 	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
@@ -29,13 +29,6 @@ func (m *Metrics) InstrumentHandler(name string, h http.Handler) http.Handler {
 	})
 
 	return otelhttp.NewHandler(wrapped, name)
-}
-
-// Middleware is the canonical name AGENTS.md uses for the
-// instrumentation wrapper above. Kept as a thin alias so callers
-// can write the documented form.
-func (m *Metrics) Middleware(name string, h http.Handler) http.Handler {
-	return m.InstrumentHandler(name, h)
 }
 
 // statusRecorder captures the status code so we can label metrics
