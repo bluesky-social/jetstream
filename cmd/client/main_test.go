@@ -25,6 +25,36 @@ func TestSubscribeURLDefaults(t *testing.T) {
 	}
 }
 
+func TestSubscribeURLUsesV2Endpoint(t *testing.T) {
+	t.Parallel()
+
+	got, err := subscribeURL(config{
+		rawURL:           "localhost:8080",
+		subscribeVersion: "v2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "ws://localhost:8080/subscribe-v2"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestSubscribeURLSelectedVersionOverridesStandardEndpoint(t *testing.T) {
+	t.Parallel()
+
+	got, err := subscribeURL(config{
+		rawURL:           "ws://example.com/subscribe",
+		subscribeVersion: "v2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "ws://example.com/subscribe-v2"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestSubscribeURLConvertsHTTPAndAddsQuery(t *testing.T) {
 	t.Parallel()
 
@@ -61,11 +91,66 @@ func TestSubscribeURLPreservesPathAndExistingQuery(t *testing.T) {
 	}
 }
 
+func TestSubscribeURLPreservesCustomPathWhenSelectingVersion(t *testing.T) {
+	t.Parallel()
+
+	got, err := subscribeURL(config{
+		rawURL:           "ws://example.com/custom",
+		subscribeVersion: "v2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "ws://example.com/custom"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestSubscribeURLRejectsUnsupportedScheme(t *testing.T) {
 	t.Parallel()
 
 	if _, err := subscribeURL(config{rawURL: "ftp://example.com"}); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestValidateRejectsUnknownSubscribeVersion(t *testing.T) {
+	t.Parallel()
+
+	err := config{
+		concurrency:      1,
+		reportInterval:   time.Second,
+		rampDuration:     0,
+		dialTimeout:      time.Second,
+		reconnectDelay:   time.Second,
+		readLimit:        1,
+		subscribeVersion: "v3",
+	}.validate()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "subscribe-version") {
+		t.Fatalf("error %q does not mention subscribe-version", err)
+	}
+}
+
+func TestValidateRejectsEmptySubscribeVersion(t *testing.T) {
+	t.Parallel()
+
+	err := config{
+		concurrency:      1,
+		reportInterval:   time.Second,
+		rampDuration:     0,
+		dialTimeout:      time.Second,
+		reconnectDelay:   time.Second,
+		readLimit:        1,
+		subscribeVersion: " ",
+	}.validate()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "subscribe-version") {
+		t.Fatalf("error %q does not mention subscribe-version", err)
 	}
 }
 
