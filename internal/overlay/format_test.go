@@ -171,6 +171,67 @@ func TestDecodeRejectsSeqAboveMaxSeq(t *testing.T) {
 	require.ErrorIs(t, err, errMalformed)
 }
 
+func TestDecodeRejectsSeqAtWatermark(t *testing.T) {
+	t.Parallel()
+
+	t.Run("record tombstone", func(t *testing.T) {
+		t.Parallel()
+		body := appendStringTableForTest(nil, "did:plc:a")
+		body = appendStringTableForTest(body, "app.bsky.feed.post")
+		body = appendUvarint(body, 1) // record group count
+		body = appendUvarint(body, 0) // didID
+		body = appendUvarint(body, 1) // entry count
+		body = appendUvarint(body, 0) // collID
+		body = appendUvarint(body, 1) // rkey len
+		body = append(body, 'r')
+		body = appendUvarint(body, 0) // seq delta: seq == W, invalid
+		body = appendUvarint(body, 0) // DID tombstone count
+
+		_, _, _, err := Decode(frameForTest(100, 100, body))
+		require.ErrorIs(t, err, errMalformed)
+	})
+
+	t.Run("did tombstone", func(t *testing.T) {
+		t.Parallel()
+		body := appendStringTableForTest(nil, "did:plc:a")
+		body = appendStringTableForTest(body) // no collections
+		body = appendUvarint(body, 0)         // record group count
+		body = appendUvarint(body, 1)         // DID tombstone count
+		body = appendUvarint(body, 0)         // didID
+		body = appendUvarint(body, 0)         // seq delta: seq == W, invalid
+		body = append(body, reasonAcct)
+
+		_, _, _, err := Decode(frameForTest(100, 100, body))
+		require.ErrorIs(t, err, errMalformed)
+	})
+}
+
+func TestDecodeRejectsNonzeroFlags(t *testing.T) {
+	t.Parallel()
+
+	blob := Encode(tombstone.Snapshot{
+		Records: map[tombstone.RecordKey]uint64{},
+		DIDs:    map[string]tombstone.DIDTombstone{},
+	}, 100, 100)
+	binary.LittleEndian.PutUint16(blob[6:8], 1)
+
+	_, _, _, err := Decode(blob)
+	require.ErrorIs(t, err, errMalformed)
+}
+
+func TestDecodeRejectsMaxSeqBelowWatermark(t *testing.T) {
+	t.Parallel()
+
+	blob := Encode(tombstone.Snapshot{
+		Records: map[tombstone.RecordKey]uint64{},
+		DIDs:    map[string]tombstone.DIDTombstone{},
+	}, 100, 100)
+	binary.LittleEndian.PutUint64(blob[16:24], 99)
+
+	_, _, _, err := Decode(blob)
+	require.ErrorIs(t, err, errMalformed)
+}
+
 func FuzzDecodeForTest(f *testing.F) {
 	f.Add(Encode(sampleSnapshot(), 100, 150))
 	f.Add([]byte("jsto"))
@@ -179,4 +240,25 @@ func FuzzDecodeForTest(f *testing.F) {
 		// Must never panic; any structurally invalid blob returns an error.
 		_, _, _, _ = Decode(blob)
 	})
+}
+
+func appendStringTableForTest(buf []byte, items ...string) []byte {
+	buf = appendUvarint(buf, uint64(len(items)))
+	for _, item := range items {
+		buf = appendUvarint(buf, uint64(len(item)))
+		buf = append(buf, item...)
+	}
+	return buf
+}
+
+func frameForTest(w, m uint64, body []byte) []byte {
+	frame := overlayEncoder.EncodeAll(body, nil)
+	out := make([]byte, frameHdrSize+len(frame))
+	copy(out[0:4], magic)
+	binary.LittleEndian.PutUint16(out[4:6], formatVer)
+	binary.LittleEndian.PutUint64(out[8:16], w)
+	binary.LittleEndian.PutUint64(out[16:24], m)
+	binary.LittleEndian.PutUint64(out[24:32], uint64(len(frame)))
+	copy(out[frameHdrSize:], frame)
+	return out
 }

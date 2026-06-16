@@ -247,8 +247,14 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 	if ver := binary.LittleEndian.Uint16(blob[4:6]); ver != formatVer {
 		return 0, 0, tombstone.Snapshot{}, fmt.Errorf("%w: unsupported version %d", errMalformed, ver)
 	}
+	if flags := binary.LittleEndian.Uint16(blob[6:8]); flags != 0 {
+		return 0, 0, tombstone.Snapshot{}, fmt.Errorf("%w: unsupported flags 0x%x", errMalformed, flags)
+	}
 	w = binary.LittleEndian.Uint64(blob[8:16])
 	m = binary.LittleEndian.Uint64(blob[16:24])
+	if m < w {
+		return 0, 0, tombstone.Snapshot{}, fmt.Errorf("%w: maxSeq %d below watermark %d", errMalformed, m, w)
+	}
 	bodyLen := binary.LittleEndian.Uint64(blob[24:32])
 	if uint64(len(blob)-frameHdrSize) != bodyLen {
 		return 0, 0, tombstone.Snapshot{}, fmt.Errorf("%w: body length mismatch", errMalformed)
@@ -306,7 +312,7 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 			if err != nil {
 				return 0, 0, tombstone.Snapshot{}, err
 			}
-			seq, err := addSeqDelta(prev, delta, m)
+			seq, err := addSeqDelta(prev, delta, w, m)
 			if err != nil {
 				return 0, 0, tombstone.Snapshot{}, err
 			}
@@ -340,7 +346,7 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 		if err != nil {
 			return 0, 0, tombstone.Snapshot{}, err
 		}
-		seq, err := addSeqDelta(prev, delta, m)
+		seq, err := addSeqDelta(prev, delta, w, m)
 		if err != nil {
 			return 0, 0, tombstone.Snapshot{}, err
 		}
@@ -362,10 +368,13 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 // adversarial. We reject rather than store a wrapped/garbage seq, which
 // would otherwise become a silently-wrong suppression entry in the
 // client overlay (this is the reference decoder; see issue #10).
-func addSeqDelta(prev, delta, m uint64) (uint64, error) {
+func addSeqDelta(prev, delta, w, m uint64) (uint64, error) {
 	seq := prev + delta
 	if seq < prev {
 		return 0, fmt.Errorf("%w: seq delta overflow", errMalformed)
+	}
+	if seq <= w {
+		return 0, fmt.Errorf("%w: seq %d not above watermark %d", errMalformed, seq, w)
 	}
 	if seq > m {
 		return 0, fmt.Errorf("%w: seq %d exceeds maxSeq %d", errMalformed, seq, m)
