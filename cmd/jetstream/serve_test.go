@@ -69,7 +69,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 30*time.Second, opts.ShutdownTimeout)
 	require.Equal(t, 10*time.Second, opts.ClientDrainTimeout)
 	require.Equal(t, 0, opts.MaxBackfillRepos)
-	require.Equal(t, 200, opts.BackfillWorkers)
+	require.Equal(t, 100, opts.BackfillWorkers)
 	require.Equal(t, 100_000, opts.BackfillBatchSize)
 	require.Empty(t, opts.BackfillRepos)
 	require.False(t, opts.SkipMergeDiscovery)

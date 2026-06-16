@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	DefaultBackfillWorkers   = 200
+	DefaultBackfillWorkers   = 100
 	DefaultBackfillBatchSize = 100_000
 )
 
