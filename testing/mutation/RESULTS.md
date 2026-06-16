@@ -232,3 +232,35 @@ checksum, m015/m016 read-path indexes), and one operational signal — **m002's 
 detection justifies the multi-seed nightly sweep**. The over-fitting worry was
 warranted in specific, now-documented places; it was not warranted as a
 blanket claim about the oracle.
+
+## Campaign 2026-06-15 (getTombstones overlay)
+
+- commit: `bb135af` (branch `feat/gettombstones-overlay`)
+- default seed: the driver's default tier seed
+- catalog: 4 new mutants — overlay encoder 3 (m020, m021, m023), tombstone 1 (m022)
+- target test: `TestOracle_DefaultLifecycle`, which now runs
+  `assertOverlayReconstruction` (segments(<=W) + overlay((W,M]) +
+  live((M,inf)) reconstruction must equal ground truth) alongside the
+  existing compacted/oracle checks
+- driver: `just mutation-campaign mNNN`; all four are `tiers: default`
+- review refresh: renamed `m019_overlay_drop_record_tombstones` to
+  `m023_overlay_drop_record_tombstones` to avoid the main-branch `m019`
+  duplicate, and refreshed `m020_overlay_drop_did_tombstones` after the
+  DID-tombstone delta-order hardening so the patch applies again. The oracle
+  lifecycle now stages a late account-delete tombstone inside `(W, M]`, closing
+  the prior m020 dead path. Targeted manual driver equivalent confirmed both
+  `m020` and `m023` are `KILLED@default`.
+
+### Scorecard
+
+| mutant | subsystem | expected | actual | note |
+|---|---|---|---|---|
+| m020_overlay_drop_did_tombstones | overlay | default | KILLED@default | late account-delete tombstone forced into `(W,M]`; dropping DID tombstones makes the overlay poll fail with `did_tombstones=0` while `M` covers the tombstone seq |
+| m021_overlay_record_seq_base_zero | overlay | default | KILLED@default | record seq delta encoded against base 0 not W; decoder re-adds W, inflating tombstone seqs above live records → `failed to emit a live record` |
+| m022_shoulddrop_did_seq_inverted | tombstone | default | KILLED@default | `>`→`<` in ShouldDrop DID branch; caught by the compacted oracle and/or reconstruction |
+| m023_overlay_drop_record_tombstones | overlay | default | KILLED@default | record-tombstone group count forced to 0 → deleted record in (W,M] emitted; `emitted a record that ground truth deleted` |
+
+Summary: **4 killed, 0 survived.** The kills confirm the reconstruction
+assertion has detection power on both overlay sections (m020 DID tombstones,
+m023 record tombstones), on seq-delta base correctness (m021), and on the
+shared ShouldDrop suppression logic (m022).

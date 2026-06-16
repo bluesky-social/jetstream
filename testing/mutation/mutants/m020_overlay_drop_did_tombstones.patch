@@ -1,0 +1,23 @@
+mutant: m020_overlay_drop_did_tombstones
+target: internal/overlay/format.go
+failure-mode: |
+  encodeBody omits all DID (account-delete / sync) tombstones from the
+  served overlay (count forced to 0). A client would fail to suppress
+  every record of a deleted/resynced account in the (W,M] window.
+expected-detection: |
+  assertOverlayReconstruction: a deleted account's records (or pre-sync
+  records) in (W,M] are emitted -> reconstruction mismatch. Default
+  tier.
+expected-tier: default
+tiers: default
+
+diff --git a/internal/overlay/format.go b/internal/overlay/format.go
+index 10bfdf0..664fb28 100644
+--- a/internal/overlay/format.go
++++ b/internal/overlay/format.go
+@@ -197,1 +197,1 @@ func encodeBody(snap tombstone.Snapshot, seqBase uint64) []byte {
+-	buf = appendUvarint(buf, uint64(len(didTombDIDs)))
++	buf = appendUvarint(buf, 0)
+@@ -199,1 +199,1 @@ func encodeBody(snap tombstone.Snapshot, seqBase uint64) []byte {
+-	for _, did := range didTombDIDs {
++	for _, did := range didTombDIDs[:0] {

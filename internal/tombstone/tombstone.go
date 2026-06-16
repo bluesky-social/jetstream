@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
@@ -41,7 +42,13 @@ type Set struct {
 	records map[RecordKey]uint64
 	dids    map[string]DIDTombstone
 	bytes   int64
+	dirty   atomic.Uint64
 }
+
+// Dirty returns a monotonically increasing value that changes on every
+// mutation (Observe, Evict, Replace). The overlay cache uses it to skip
+// rebuilds when the set is unchanged.
+func (s *Set) Dirty() uint64 { return s.dirty.Load() }
 
 func New() *Set {
 	return &Set{
@@ -55,6 +62,7 @@ func (s *Set) Observe(ev *segment.Event) error {
 	defer s.mu.Unlock()
 	added, err := observeLocked(s.records, s.dids, ev)
 	s.bytes += added
+	s.dirty.Add(1)
 	return err
 }
 
@@ -97,6 +105,7 @@ func (s *Set) Evict(maxSeq uint64) {
 			s.bytes -= didEntryBytes(did)
 		}
 	}
+	s.dirty.Add(1)
 }
 
 func (s *Set) Replace(snapshot Snapshot) {
@@ -113,6 +122,7 @@ func (s *Set) Replace(snapshot Snapshot) {
 		s.dids[did] = ts
 		s.bytes += didEntryBytes(did)
 	}
+	s.dirty.Add(1)
 }
 
 func (s *Set) Len() int {

@@ -54,7 +54,7 @@ revert_current() {
     if [[ -z "$CURRENT_PATCH" ]]; then
         return 0
     fi
-    if ! git apply -R "$CURRENT_PATCH"; then
+    if ! git apply --unidiff-zero -R "$CURRENT_PATCH"; then
         echo "FATAL: failed to revert $CURRENT_PATCH; working tree is DIRTY — aborting" >&2
         CURRENT_PATCH=""
         exit 2
@@ -82,12 +82,12 @@ for patch in "$MUTANTS_DIR"/*.patch; do
     tiers="${tiers:-default,stress}"
     echo "=== $id (tiers: $tiers) ==="
 
-    if ! git apply --check "$patch" 2>"$LOG_ROOT/$id.apply.log"; then
+    if ! git apply --unidiff-zero --check "$patch" 2>"$LOG_ROOT/$id.apply.log"; then
         echo "    STALE (patch no longer applies — refresh needed)"
         ROWS+=("| $id | STALE | patch no longer applies — refresh needed |")
         continue
     fi
-    git apply "$patch"
+    git apply --unidiff-zero "$patch"
     CURRENT_PATCH="$patch"
 
     if ! go build ./... >"$LOG_ROOT/$id.build.log" 2>&1; then

@@ -1,0 +1,13 @@
+{
+  "lexicon": 1,
+  "id": "network.bsky.jetstream.getTombstones",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Download the current compaction overlay: the set of record deletions, record updates, and account/sync DID tombstones above the server's compaction watermark, as a compact zstd-compressed binary blob. A client overlays these on segment-file rows during backfill replay to suppress superseded records. The body is self-describing (see DESIGN.md section 3.3): a fixed 'jsto' framing carrying the watermark and maxSeq, followed by a single zstd frame. This endpoint is not CDN-cacheable in practice because the overlay changes continuously; it emits a strong ETag only for opportunistic revalidation.",
+      "output": {
+        "encoding": "application/octet-stream"
+      }
+    }
+  }
+}

@@ -95,6 +95,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	afterMerge := newPhaseGate()
 	bootstrapAck := newSeqAck()
 	steadyAck := newSeqAck()
+	lateOverlayDIDAck := newAccountTombstoneAck()
 	asyncResyncAck := newSyncTombstoneAck()
 	compaction := newCompactionPassRecorder()
 	bootstrapEventLog := newEventLogRecorder()
@@ -170,6 +171,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		},
 		OnSteadyStateEvent: func(ev *segment.Event) {
 			steadyAck.Observe(ev)
+			lateOverlayDIDAck.Observe(ev)
 			asyncResyncAck.Observe(ev)
 			steadyEventLog.Observe(ev)
 			recordTraceOrError(t, trace, "steady_state_event", traceSegmentEvent(ev))
@@ -264,6 +266,37 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"served subscribe replay compacted check failed: mode=%s seed=%d watermark=%d",
 		cfg.Mode, cfg.Seed, steadyCompaction.Watermark)
 
+	// Exercise the overlay's DID-tombstone section inside the live overlay
+	// window. The earlier bootstrap account-delete and sync tombstones are
+	// usually at or below W by this point, so a mutation that drops DID
+	// tombstones from the served blob was previously a dead path. This late
+	// account delete lands strictly above the current watermark, and the
+	// compaction trigger is rate-limited after the pass above, so the
+	// tombstone remains in the overlay rather than being immediately evicted.
+	lateDIDIdx := pickActiveOracleAccount(t, w, cfg)
+	lateAcct, err := w.LoadAccount(lateDIDIdx)
+	require.NoError(t, err)
+	_, err = w.GenerateAccountDeleteForTest(t.Context(), lateDIDIdx)
+	require.NoError(t, err)
+	lateDIDUpstreamSeq := w.CurrentSeq()
+	recordTraceOrError(t, trace, "late_overlay_did_tombstone", map[string]any{
+		"did":          string(lateAcct.DID),
+		"upstream_seq": lateDIDUpstreamSeq,
+	})
+	lateDIDTombstoneSeq := lateOverlayDIDAck.Wait(t, cfg, string(lateAcct.DID), lateDIDUpstreamSeq, run, 30*time.Second)
+	recordTraceOrError(t, trace, "late_overlay_did_tombstone_observed", map[string]any{
+		"did":          string(lateAcct.DID),
+		"upstream_seq": lateDIDUpstreamSeq,
+		"seq":          lateDIDTombstoneSeq,
+	})
+
+	// Capture the served compaction overlay while the server is still up.
+	// No live events are generated after this point, so the in-memory
+	// tombstone set cannot trigger another compaction pass before
+	// shutdown: the blob's W is stable across the fetch->flush window, so
+	// the post-shutdown segment scan is consistent with it.
+	overlayW, overlayM, overlaySnap := fetchOverlayWithDIDTombstone(t, cfg, run, publicURL, string(lateAcct.DID), lateDIDTombstoneSeq)
+
 	// steadyAck.Wait above guarantees every steady-state cursor up to
 	// targetSeq has been durably appended (OnEvent fires post-Append), so
 	// no event is still in flight when we cancel. The steady-state writer
@@ -283,6 +316,12 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
 	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "steady-state-shutdown-flush")
+	// End-to-end overlay coverage: the segments(<=W) + overlay((W,M]) +
+	// live((M,inf)) reconstruction must equal the ground-truth live set.
+	// Uses the blob captured above (server up) against the now-flushed
+	// durable segments.
+	assertOverlayReconstruction(t, dataDir, cfg, overlayW, overlayM, overlaySnap)
+
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "final-assertions", "marker": "done"})
 	assertTraceContainsKinds(t, tracePath,
 		"run_start",
@@ -703,6 +742,15 @@ type syncTombstoneAck struct {
 	once    sync.Once
 }
 
+type accountTombstoneAck struct {
+	mu      sync.Mutex
+	seen    map[string]uint64
+	target  string
+	done    chan struct{}
+	waiting bool
+	once    sync.Once
+}
+
 func newSeqAck() *seqAck {
 	return &seqAck{
 		seen: make(map[int64]struct{}),
@@ -715,6 +763,67 @@ func newSyncTombstoneAck() *syncTombstoneAck {
 		seen: make(map[string]struct{}),
 		done: make(chan struct{}),
 	}
+}
+
+func newAccountTombstoneAck() *accountTombstoneAck {
+	return &accountTombstoneAck{
+		seen: make(map[string]uint64),
+		done: make(chan struct{}),
+	}
+}
+
+func (a *accountTombstoneAck) Observe(ev *segment.Event) {
+	if ev == nil || ev.Kind != segment.KindAccount || ev.DID == "" {
+		return
+	}
+	deleted, err := oracleAccountDeleted(ev.Payload)
+	if err != nil || !deleted {
+		return
+	}
+	a.mu.Lock()
+	a.seen[accountTombstoneKey(ev.DID, ev.UpstreamRelayCursor)] = ev.Seq
+	a.maybeDoneLocked()
+	a.mu.Unlock()
+}
+
+func (a *accountTombstoneAck) Wait(t *testing.T, cfg Config, did string, upstreamSeq int64, run *runtimeRun, timeout time.Duration) uint64 {
+	t.Helper()
+
+	a.mu.Lock()
+	a.target = accountTombstoneKey(did, upstreamSeq)
+	a.waiting = true
+	a.maybeDoneLocked()
+	a.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-a.done:
+		a.mu.Lock()
+		seq := a.seen[a.target]
+		a.mu.Unlock()
+		return seq
+	case <-run.exited:
+		t.Fatalf("steady-state ingestion stopped before observing late account tombstone did=%s upstream_seq=%d: mode=%s seed=%d err=%v",
+			did, upstreamSeq, cfg.Mode, cfg.Seed, run.err)
+	case <-timer.C:
+		t.Fatalf("timeout waiting for late account tombstone did=%s upstream_seq=%d: mode=%s seed=%d",
+			did, upstreamSeq, cfg.Mode, cfg.Seed)
+	}
+	return 0
+}
+
+func (a *accountTombstoneAck) maybeDoneLocked() {
+	if !a.waiting || a.target == "" {
+		return
+	}
+	if _, ok := a.seen[a.target]; ok {
+		a.once.Do(func() { close(a.done) })
+	}
+}
+
+func accountTombstoneKey(did string, seq int64) string {
+	return fmt.Sprintf("%s\x00%d", did, seq)
 }
 
 func (a *syncTombstoneAck) Observe(ev *segment.Event) {
