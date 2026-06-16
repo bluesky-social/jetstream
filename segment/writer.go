@@ -101,6 +101,30 @@ type Writer struct {
 	// at New() time (after any torn-tail truncate); updated after
 	// each successful flush by adding 8 + len(zstd frame).
 	nextBlockOffset uint64
+
+	nextPreparedBlockID  uint64
+	nextPreparedCommitID uint64
+	preparedOutstanding  uint64
+}
+
+// PreparedBlock is an encoded-but-not-yet-durable segment block.
+// Callers may compress Body outside the Writer critical section, then
+// call CommitPreparedFlush in original block order. A PreparedBlock
+// is single-use and must not be modified after PrepareFlush returns.
+type PreparedBlock struct {
+	Body      []byte
+	info      BlockInfo
+	owner     *Writer
+	id        uint64
+	committed bool
+}
+
+// MaxSeq returns the highest seq in this prepared block.
+func (p *PreparedBlock) MaxSeq() uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.info.MaxSeq
 }
 
 // New opens or creates the active segment at cfg.Path. See package
@@ -398,6 +422,12 @@ func (w *Writer) Close() error {
 	if w.closed {
 		return nil
 	}
+	if w.stickyErr != nil {
+		return w.stickyErr
+	}
+	if w.preparedOutstanding > 0 {
+		return fmt.Errorf("segment: close with %d uncommitted prepared block(s)", w.preparedOutstanding)
+	}
 	w.closed = true
 	// Flush is a no-op while pending is empty; the unconditional call
 	// keeps the implementation honest about durability when Close is
@@ -526,6 +556,105 @@ func (w *Writer) flushLocked() error {
 		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
 		return w.stickyErr
 	}
+	return nil
+}
+
+func (w *Writer) prepareFlushLocked(dst []byte) (*PreparedBlock, error) {
+	if w.stickyErr != nil {
+		return nil, w.stickyErr
+	}
+	if w.pending.count() == 0 {
+		return nil, nil
+	}
+
+	body := encodeBlockInto(dst, &w.pending)
+	info := BlockInfo{
+		UncompressedSize: uint32(len(body)),
+		EventCount:       uint32(w.pending.count()),
+		MinSeq:           w.pending.pendingBounds.minSeq,
+		MaxSeq:           w.pending.pendingBounds.maxSeq,
+		MinIndexedAt:     w.pending.pendingBounds.minIndexedAt,
+		MaxIndexedAt:     w.pending.pendingBounds.maxIndexedAt,
+	}
+	w.pending.reset()
+	prepared := &PreparedBlock{
+		Body:  body,
+		info:  info,
+		owner: w,
+		id:    w.nextPreparedBlockID,
+	}
+	w.nextPreparedBlockID++
+	w.preparedOutstanding++
+	return prepared, nil
+}
+
+// PrepareFlush detaches the current pending block for out-of-band
+// compression. It is a no-op when no events are pending.
+//
+// The caller must later call CommitPreparedFlush for every non-nil
+// PreparedBlock, in the same order PrepareFlush returned them, before
+// closing or sealing the writer. Dropping a prepared block would drop
+// memory-only rows whose metadata has not yet become durable.
+func (w *Writer) PrepareFlush() (*PreparedBlock, error) {
+	return w.prepareFlushLocked(nil)
+}
+
+// CompressPreparedBlock zstd-compresses a prepared block body. The returned
+// frame does not include the segment file's 8-byte length prefix.
+func CompressPreparedBlock(prepared *PreparedBlock) []byte {
+	if prepared == nil {
+		return nil
+	}
+	return blockEncoder.EncodeAll(prepared.Body, nil)
+}
+
+// CommitPreparedFlush writes a previously prepared and compressed block frame
+// to the active segment, fsyncs it, and updates the writer's flushed block
+// index. Prepared blocks must be committed in their original prepare order.
+func (w *Writer) CommitPreparedFlush(prepared *PreparedBlock, frame []byte) error {
+	if prepared == nil {
+		return nil
+	}
+	wire := make([]byte, 8, 8+len(frame))
+	wire = append(wire, frame...)
+	return w.commitPreparedFlushLocked(prepared, wire)
+}
+
+func (w *Writer) commitPreparedFlushLocked(prepared *PreparedBlock, wire []byte) error {
+	if w.stickyErr != nil {
+		return w.stickyErr
+	}
+	if prepared == nil {
+		return nil
+	}
+	if prepared.owner != w {
+		return fmt.Errorf("segment: prepared block belongs to a different writer")
+	}
+	if prepared.committed {
+		return fmt.Errorf("segment: prepared block already committed")
+	}
+	if prepared.id != w.nextPreparedCommitID {
+		return fmt.Errorf("segment: prepared block order violation: got %d, want %d",
+			prepared.id, w.nextPreparedCommitID)
+	}
+	binary.LittleEndian.PutUint64(wire[:8], uint64(len(wire)-8))
+	if _, err := w.file.Write(wire); err != nil {
+		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
+		return w.stickyErr
+	}
+	info := prepared.info
+	info.Offset = w.nextBlockOffset
+	info.CompressedSize = uint32(len(wire) - 8)
+	w.flushedBlocks = append(w.flushedBlocks, info)
+	w.nextBlockOffset += uint64(len(wire))
+
+	if err := syncFile(w.file); err != nil {
+		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
+		return w.stickyErr
+	}
+	prepared.committed = true
+	w.nextPreparedCommitID++
+	w.preparedOutstanding--
 	return nil
 }
 

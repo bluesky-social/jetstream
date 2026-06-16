@@ -83,6 +83,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.BackfillBatchSize < 0 {
 		return nil, fmt.Errorf("serve: --backfill-batch-size must be >= 0 (BackfillBatchSize must be >= 0), got %d", opts.BackfillBatchSize)
 	}
+	if opts.BackfillAsyncFlushWorkers < 0 {
+		return nil, fmt.Errorf("serve: --backfill-async-flush-workers must be >= 0 (BackfillAsyncFlushWorkers must be >= 0), got %d", opts.BackfillAsyncFlushWorkers)
+	}
 	if opts.CompactionRewriteWorkers < 0 {
 		return nil, fmt.Errorf("serve: --compaction-rewrite-workers must be >= 0 (CompactionRewriteWorkers must be >= 0), got %d", opts.CompactionRewriteWorkers)
 	}
@@ -202,6 +205,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: derive relay HTTP URL: %w", err))
 	}
 
+	backfillMetrics := backfill.NewMetrics(metrics.Registry)
 	xrpcClient := &xrpc.Client{
 		Host:       relayHTTPURL,
 		HTTPClient: gt.Some(jttp.New(xrpc.BulkDownloadOpts()...)),
@@ -307,32 +311,33 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		// Bare logger; orchestrator.New attaches component=orchestrator
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.
-		Logger:                   processLogger,
-		Metrics:                  orchestrator.NewMetrics(metrics.Registry, tombstones),
-		IngestMetrics:            ingest.NewMetrics(metrics.Registry),
-		LiveMetrics:              live.NewMetrics(metrics.Registry),
-		BackfillMetrics:          backfill.NewMetrics(metrics.Registry),
-		SegmentMetrics:           segmentMetrics,
-		OnEvent:                  onSteadyStateEvent,
-		OnBootstrapLiveEvent:     opts.OnBootstrapLiveEvent,
-		MaxBackfillRepos:         opts.MaxBackfillRepos,
-		BackfillWorkers:          opts.effectiveBackfillWorkers(),
-		BackfillBatchSize:        opts.effectiveBackfillBatchSize(),
-		BackfillRepos:            opts.BackfillRepos,
-		SkipMergeDiscovery:       opts.SkipMergeDiscovery,
-		BackfillRetryBaseDelay:   opts.BackfillRetryBaseDelay,
-		LiveReconnectBackoff:     opts.LiveReconnectBackoff,
-		IngestOnAfterSeal:        mft.OnSegmentSealed,
-		OnSegmentCompacted:       onSegmentCompacted,
-		SegmentManifestChecksums: mft.SegmentChecksums,
-		CompactionInterval:       opts.CompactionInterval,
-		CompactionTombstoneCap:   opts.CompactionTombstoneCap,
-		CompactionRewriteWorkers: opts.CompactionRewriteWorkers,
-		OnCompactionPass:         onCompactionPass,
-		BarrierAfterBootstrap:    phaseBarrier(opts.BarrierAfterBootstrap),
-		BarrierAfterMerge:        phaseBarrier(opts.BarrierAfterMerge),
-		AfterRepoComplete:        opts.AfterRepoComplete,
-		CrashInjector:            opts.CrashInjector,
+		Logger:                    processLogger,
+		Metrics:                   orchestrator.NewMetrics(metrics.Registry, tombstones),
+		IngestMetrics:             ingest.NewMetrics(metrics.Registry),
+		LiveMetrics:               live.NewMetrics(metrics.Registry),
+		BackfillMetrics:           backfillMetrics,
+		SegmentMetrics:            segmentMetrics,
+		OnEvent:                   onSteadyStateEvent,
+		OnBootstrapLiveEvent:      opts.OnBootstrapLiveEvent,
+		MaxBackfillRepos:          opts.MaxBackfillRepos,
+		BackfillWorkers:           opts.effectiveBackfillWorkers(),
+		BackfillBatchSize:         opts.effectiveBackfillBatchSize(),
+		BackfillAsyncFlushWorkers: opts.BackfillAsyncFlushWorkers,
+		BackfillRepos:             opts.BackfillRepos,
+		SkipMergeDiscovery:        opts.SkipMergeDiscovery,
+		BackfillRetryBaseDelay:    opts.BackfillRetryBaseDelay,
+		LiveReconnectBackoff:      opts.LiveReconnectBackoff,
+		IngestOnAfterSeal:         mft.OnSegmentSealed,
+		OnSegmentCompacted:        onSegmentCompacted,
+		SegmentManifestChecksums:  mft.SegmentChecksums,
+		CompactionInterval:        opts.CompactionInterval,
+		CompactionTombstoneCap:    opts.CompactionTombstoneCap,
+		CompactionRewriteWorkers:  opts.CompactionRewriteWorkers,
+		OnCompactionPass:          onCompactionPass,
+		BarrierAfterBootstrap:     phaseBarrier(opts.BarrierAfterBootstrap),
+		BarrierAfterMerge:         phaseBarrier(opts.BarrierAfterMerge),
+		AfterRepoComplete:         opts.AfterRepoComplete,
+		CrashInjector:             opts.CrashInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			writerPtr.Store(w)
 		},

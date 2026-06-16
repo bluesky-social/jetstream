@@ -66,6 +66,15 @@ func TestOptionsValidateRejectsNegativeBackfillBatchSize(t *testing.T) {
 	require.ErrorContains(t, err, "BackfillBatchSize must be >= 0")
 }
 
+func TestOptionsValidateRejectsNegativeBackfillAsyncFlushWorkers(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions(t)
+	opts.BackfillAsyncFlushWorkers = -1
+	_, err := Build(t.Context(), opts)
+	require.ErrorContains(t, err, "BackfillAsyncFlushWorkers must be >= 0")
+}
+
 func TestOptionsValidateRejectsNegativeCompactionRewriteWorkers(t *testing.T) {
 	t.Parallel()
 

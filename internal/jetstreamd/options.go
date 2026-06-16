@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	DefaultBackfillWorkers   = 100
-	DefaultBackfillBatchSize = 100_000
+	DefaultBackfillWorkers           = 100
+	DefaultBackfillBatchSize         = 100_000
+	DefaultBackfillAsyncFlushWorkers = 4
 )
 
 // PhaseBarrier is a test hook that can pause execution after a major
@@ -42,11 +43,12 @@ type Options struct {
 	ShutdownTimeout    time.Duration
 	ClientDrainTimeout time.Duration
 
-	MaxBackfillRepos   int
-	BackfillWorkers    int
-	BackfillBatchSize  int
-	BackfillRepos      []atmos.DID
-	SkipMergeDiscovery bool
+	MaxBackfillRepos          int
+	BackfillWorkers           int
+	BackfillBatchSize         int
+	BackfillAsyncFlushWorkers int
+	BackfillRepos             []atmos.DID
+	SkipMergeDiscovery        bool
 
 	// DisableRepoActionRateLimits disables the per-source-IP limiter for
 	// expensive operator-triggered repo actions on the status UI.

@@ -60,6 +60,9 @@ func (w *Writer) Seal() (SealResult, error) {
 	if w.stickyErr != nil {
 		return SealResult{}, w.stickyErr
 	}
+	if w.preparedOutstanding > 0 {
+		return SealResult{}, fmt.Errorf("segment: seal with %d uncommitted prepared block(s)", w.preparedOutstanding)
+	}
 	// Capture start *after* the closed/stickyErr early-returns so the
 	// histogram measures real seal work, not no-op rejections. Per
 	// metrics.go: failed seals are not recorded — operators chase

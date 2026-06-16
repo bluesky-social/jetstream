@@ -71,6 +71,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 0, opts.MaxBackfillRepos)
 	require.Equal(t, 100, opts.BackfillWorkers)
 	require.Equal(t, 100_000, opts.BackfillBatchSize)
+	require.Equal(t, 4, opts.BackfillAsyncFlushWorkers)
 	require.Empty(t, opts.BackfillRepos)
 	require.False(t, opts.SkipMergeDiscovery)
 	require.False(t, opts.DisableRepoActionRateLimits)
@@ -109,6 +110,7 @@ func withClearedEnv(t *testing.T) {
 		"JETSTREAM_MAX_BACKFILL_REPOS",
 		"JETSTREAM_BACKFILL_WORKERS",
 		"JETSTREAM_BACKFILL_BATCH_SIZE",
+		"JETSTREAM_BACKFILL_ASYNC_FLUSH_WORKERS",
 		"JETSTREAM_BACKFILL_REPOS",
 		"JETSTREAM_SKIP_MERGE_DISCOVERY",
 		"JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS",
@@ -163,6 +165,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--client-drain-timeout=11s",
 		"--backfill-workers=17",
 		"--backfill-batch-size=12345",
+		"--backfill-async-flush-workers=4",
 		"--backfill-repos=did:plc:aaa, did:plc:bbb",
 		"--skip-merge-discovery",
 		"--disable-repo-action-rate-limits",
@@ -190,6 +193,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 0, opts.MaxBackfillRepos)
 	require.Equal(t, 17, opts.BackfillWorkers)
 	require.Equal(t, 12345, opts.BackfillBatchSize)
+	require.Equal(t, 4, opts.BackfillAsyncFlushWorkers)
 	require.Equal(t, []atmos.DID{"did:plc:aaa", "did:plc:bbb"}, opts.BackfillRepos)
 	require.True(t, opts.SkipMergeDiscovery)
 	require.True(t, opts.DisableRepoActionRateLimits)
@@ -226,10 +230,12 @@ func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
 
 	t.Setenv("JETSTREAM_BACKFILL_WORKERS", "33")
 	t.Setenv("JETSTREAM_BACKFILL_BATCH_SIZE", "76543")
+	t.Setenv("JETSTREAM_BACKFILL_ASYNC_FLUSH_WORKERS", "5")
 
 	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
 	require.Equal(t, 33, opts.BackfillWorkers)
 	require.Equal(t, 76543, opts.BackfillBatchSize)
+	require.Equal(t, 5, opts.BackfillAsyncFlushWorkers)
 }
 
 func TestServeOptionsFromCLI_DisableRepoActionRateLimitsEnv(t *testing.T) {
