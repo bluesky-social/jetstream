@@ -177,11 +177,22 @@ func encodeBody(snap tombstone.Snapshot, seqBase uint64) []byte {
 		}
 	}
 
+	// Sort DID tombstones by seq (didID as a deterministic tiebreak) so
+	// the running seq delta is monotonic and never underflows. The
+	// decoder carries an explicit didID per entry and assumes no DID
+	// ordering, so seq order is free to choose here. Each entry's seq
+	// delta is encoded against the previous entry's seq (first vs W).
 	didTombDIDs := make([]string, 0, len(snap.DIDs))
 	for did := range snap.DIDs {
 		didTombDIDs = append(didTombDIDs, did)
 	}
-	sort.Slice(didTombDIDs, func(i, j int) bool { return didID[didTombDIDs[i]] < didID[didTombDIDs[j]] })
+	sort.Slice(didTombDIDs, func(i, j int) bool {
+		si, sj := snap.DIDs[didTombDIDs[i]].Seq, snap.DIDs[didTombDIDs[j]].Seq
+		if si != sj {
+			return si < sj
+		}
+		return didID[didTombDIDs[i]] < didID[didTombDIDs[j]]
+	})
 
 	buf = appendUvarint(buf, uint64(len(didTombDIDs)))
 	prev := seqBase
@@ -295,7 +306,10 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 			if err != nil {
 				return 0, 0, tombstone.Snapshot{}, err
 			}
-			seq := prev + delta
+			seq, err := addSeqDelta(prev, delta, m)
+			if err != nil {
+				return 0, 0, tombstone.Snapshot{}, err
+			}
 			prev = seq
 			snap.Records[tombstone.RecordKey{DID: dids[didIdx], Collection: colls[collIdx], Rkey: string(rkey)}] = seq
 		}
@@ -326,7 +340,10 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 		if err != nil {
 			return 0, 0, tombstone.Snapshot{}, err
 		}
-		seq := prev + delta
+		seq, err := addSeqDelta(prev, delta, m)
+		if err != nil {
+			return 0, 0, tombstone.Snapshot{}, err
+		}
 		prev = seq
 		snap.DIDs[dids[didIdx]] = tombstone.DIDTombstone{Seq: seq, Reason: reason}
 	}
@@ -335,6 +352,25 @@ func Decode(blob []byte) (w, m uint64, snap tombstone.Snapshot, err error) {
 		return 0, 0, tombstone.Snapshot{}, fmt.Errorf("%w: trailing bytes", errMalformed)
 	}
 	return w, m, snap, nil
+}
+
+// addSeqDelta reconstructs a tombstone seq from a running base and an
+// encoded delta, rejecting hostile input. A well-formed blob always
+// satisfies W < seq <= M (the encoder sources seqs from
+// SnapshotRange(W, M] and delta-encodes against W), so any overflow of
+// prev+delta or any result outside (W, M] means the blob is corrupt or
+// adversarial. We reject rather than store a wrapped/garbage seq, which
+// would otherwise become a silently-wrong suppression entry in the
+// client overlay (this is the reference decoder; see issue #10).
+func addSeqDelta(prev, delta, m uint64) (uint64, error) {
+	seq := prev + delta
+	if seq < prev {
+		return 0, fmt.Errorf("%w: seq delta overflow", errMalformed)
+	}
+	if seq > m {
+		return 0, fmt.Errorf("%w: seq %d exceeds maxSeq %d", errMalformed, seq, m)
+	}
+	return seq, nil
 }
 
 type cursor struct {

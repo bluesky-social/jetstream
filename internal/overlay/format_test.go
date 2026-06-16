@@ -1,6 +1,7 @@
 package overlay
 
 import (
+	"encoding/binary"
 	"testing"
 	"testing/quick"
 
@@ -149,6 +150,25 @@ func snapshotsEqual(a, b tombstone.Snapshot) bool {
 		}
 	}
 	return true
+}
+
+func TestDecodeRejectsSeqAboveMaxSeq(t *testing.T) {
+	t.Parallel()
+	// A blob whose framed maxSeq is below a tombstone's actual seq is
+	// corrupt/adversarial: the decoder must reject it rather than store a
+	// seq the coverage envelope claims not to cover.
+	snap := tombstone.Snapshot{
+		Records: map[tombstone.RecordKey]uint64{
+			{DID: "did:plc:a", Collection: "c", Rkey: "r"}: 150,
+		},
+		DIDs: map[string]tombstone.DIDTombstone{},
+	}
+	// Encode honestly with M=150, then rewrite the framed maxSeq to 140
+	// (< the record's seq 150) so the decoded delta lands above M.
+	blob := Encode(snap, 100, 150)
+	binary.LittleEndian.PutUint64(blob[16:24], 140)
+	_, _, _, err := Decode(blob)
+	require.ErrorIs(t, err, errMalformed)
 }
 
 func FuzzDecodeForTest(f *testing.F) {
