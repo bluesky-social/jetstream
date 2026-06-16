@@ -75,7 +75,7 @@ func CheckOverlayReconstruction(events []ObservedEvent, w, m uint64, overlaySnap
 	emitted := make(map[tombstone.RecordKey]uint64)
 	for i := range events {
 		ev := &events[i]
-		if ev.Kind != segment.KindCreate && ev.Kind != segment.KindUpdate {
+		if !ev.Kind.IsMaterialization() {
 			continue
 		}
 		key := tombstone.RecordKey{DID: ev.DID, Collection: ev.Collection, Rkey: ev.Rkey}
@@ -115,7 +115,7 @@ func groundTruthLive(events []ObservedEvent) map[tombstone.RecordKey]uint64 {
 	for i := range events {
 		ev := &events[i]
 		switch ev.Kind {
-		case segment.KindCreate, segment.KindUpdate:
+		case segment.KindCreate, segment.KindUpdate, segment.KindCreateResync:
 			key := tombstone.RecordKey{DID: ev.DID, Collection: ev.Collection, Rkey: ev.Rkey}
 			r := latest[key]
 			if r == nil {

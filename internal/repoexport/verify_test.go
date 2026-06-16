@@ -209,7 +209,7 @@ func authoritativeCAR(t *testing.T, did, rev string, events []segment.Event) ([]
 	for _, ev := range events {
 		key := ev.Collection + "/" + ev.Rkey
 		switch ev.Kind {
-		case segment.KindCreate, segment.KindUpdate:
+		case segment.KindCreate, segment.KindUpdate, segment.KindCreateResync:
 			cid := cbor.ComputeCID(cbor.CodecDagCBOR, ev.Payload)
 			require.NoError(t, blocks.PutBlock(cid, append([]byte(nil), ev.Payload...)))
 			require.NoError(t, tree.Insert(key, cid))

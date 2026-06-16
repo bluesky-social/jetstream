@@ -60,7 +60,7 @@ func TestExpectedEventLogFromFirehoseNormalizesAccountAndSyncFrames(t *testing.T
 	require.NotZero(t, rows[1].PayloadLen)
 	require.NotEmpty(t, rows[1].PayloadSHA256_64)
 	require.Equal(t, uint64(2), rows[2].Seq)
-	require.Equal(t, "create", rows[2].Kind)
+	require.Equal(t, "create_resync", rows[2].Kind)
 	require.Equal(t, rows[1].DID, rows[2].DID)
 	require.NotEmpty(t, rows[2].Collection)
 	require.NotEmpty(t, rows[2].Rkey)

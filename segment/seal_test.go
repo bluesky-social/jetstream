@@ -166,7 +166,7 @@ func TestSealReaderRoundtripProperty(t *testing.T) {
 			ev := Event{
 				Seq:        uint64(i + 1),
 				IndexedAt:  int64(it*1000 + i),
-				Kind:       Kind(1 + r.IntN(6)),
+				Kind:       Kind(1 + r.IntN(7)),
 				DID:        "did:plc:" + string(rune('a'+r.IntN(26))),
 				Collection: "app.bsky.feed." + string(rune('a'+r.IntN(5))),
 				Rkey:       "k" + string(rune('a'+r.IntN(26))),

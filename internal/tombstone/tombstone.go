@@ -170,7 +170,7 @@ func (s Snapshot) Empty() bool {
 }
 
 func (s Snapshot) ShouldDrop(ev *segment.Event) (bool, string) {
-	if ev.Kind != segment.KindCreate && ev.Kind != segment.KindUpdate {
+	if !ev.Kind.IsMaterialization() {
 		return false, ""
 	}
 	if ts, ok := s.DIDs[ev.DID]; ok && ts.Seq > ev.Seq {

@@ -172,6 +172,105 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	require.Equal(t, "did:plc:i", got["did"])
 }
 
+func TestHandler_DefaultModeDoesNotEmitResyncReplacementRows(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
+	require.NoError(t, err)
+
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	var seq uint64
+	appendSeq(b, &seq, &segment.Event{
+		IndexedAt:  1,
+		Kind:       segment.KindCreateResync,
+		DID:        "did:plc:resync",
+		Collection: "app.bsky.feed.post",
+		Rkey:       "resync",
+		Rev:        "3lresync",
+		Payload:    []byte{0xa0},
+	})
+	publishIdentity(t, b, &seq, "did:plc:afterresync", 2)
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "identity", got["kind"])
+	require.Equal(t, "did:plc:afterresync", got["did"])
+}
+
+func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
+	require.NoError(t, err)
+
+	h := NewHandler(Subscription{
+		Tail:                      b,
+		Store:                     st,
+		Logger:                    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		EmitResyncReplacementRows: true,
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	var seq uint64
+	appendSeq(b, &seq, &segment.Event{
+		IndexedAt:  1,
+		Kind:       segment.KindCreateResync,
+		DID:        "did:plc:resync",
+		Collection: "app.bsky.feed.post",
+		Rkey:       "resync",
+		Rev:        "3lresync",
+		Payload:    []byte{0xa0},
+	})
+
+	frame := readOneFrame(t, ctx, conn)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "commit", got["kind"])
+	require.Equal(t, "did:plc:resync", got["did"])
+	commit, ok := got["commit"].(map[string]any)
+	require.True(t, ok, "commit payload should be present")
+	require.Equal(t, "create", commit["operation"])
+}
+
 func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
 	t.Parallel()
 

@@ -51,6 +51,11 @@ type Subscription struct {
 	// Lookback is the cursor-replay clamp duration. Zero disables
 	// cursor replay entirely (cursors are silently dropped to live).
 	Lookback time.Duration
+
+	// EmitResyncReplacementRows enables the v2 presentation policy used by
+	// /subscribe-v2. The default false preserves Jetstream v1 behavior by
+	// advancing over Sync 1.1 resync replacement rows without emitting them.
+	EmitResyncReplacementRows bool
 }
 
 func (d Subscription) writer() *ingest.Writer {
@@ -396,6 +401,10 @@ func runSubscriberLoop(
 
 		for _, e := range batch {
 			f := filterPtr.Load()
+			if e.Event.Kind.IsResyncReplacement() && !deps.EmitResyncReplacementRows {
+				deps.Metrics.incEventsSkippedResync()
+				continue
+			}
 			if !f.Wants(e.Event) {
 				deps.Metrics.incEventsFiltered()
 				continue

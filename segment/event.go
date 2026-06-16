@@ -5,13 +5,45 @@ package segment
 type Kind uint8
 
 const (
-	KindCreate   Kind = 1
-	KindUpdate   Kind = 2
-	KindDelete   Kind = 3
-	KindIdentity Kind = 4
-	KindAccount  Kind = 5
-	KindSync     Kind = 6
+	KindCreate       Kind = 1
+	KindUpdate       Kind = 2
+	KindDelete       Kind = 3
+	KindIdentity     Kind = 4
+	KindAccount      Kind = 5
+	KindSync         Kind = 6
+	KindCreateResync Kind = 7
 )
+
+// Valid reports whether k is one of the persisted event kinds.
+func (k Kind) Valid() bool {
+	return k >= KindCreate && k <= KindCreateResync
+}
+
+// IsCommit reports whether k is rendered as a commit-shaped Jetstream event.
+func (k Kind) IsCommit() bool {
+	switch k {
+	case KindCreate, KindUpdate, KindDelete, KindCreateResync:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsMaterialization reports whether k carries record bytes that materialize
+// the current value for a repo path.
+func (k Kind) IsMaterialization() bool {
+	switch k {
+	case KindCreate, KindUpdate, KindCreateResync:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsResyncReplacement reports whether k is a Sync 1.1 resync replacement row.
+func (k Kind) IsResyncReplacement() bool {
+	return k == KindCreateResync
+}
 
 // Event is one row inside a segment block.
 //

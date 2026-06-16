@@ -201,12 +201,11 @@ func actionKind(a streaming.Action) (segment.Kind, error) {
 	case streaming.ActionResync:
 		// After Sync 1.1, atmos's verifier resync worker yields each
 		// record currently in the repo as ActionResync with the live
-		// record bytes. Mapping to KindCreate is the brainstorming-
-		// locked decision: the segment is an event log, not a state
-		// table, so emitting a duplicate Create over a record we've
-		// already archived is acceptable. Downstream consumers can
-		// dedupe on (DID, Collection, Rkey, Rev).
-		return segment.KindCreate, nil
+		// record bytes. Persist a distinct create-shaped kind so the
+		// v1 /subscribe presentation can hide these replacement rows
+		// while /subscribe-v2 and archive readers still see the full
+		// Sync 1.1 state-repair stream.
+		return segment.KindCreateResync, nil
 	default:
 		return 0, fmt.Errorf("livestream: unknown commit action %q", a)
 	}

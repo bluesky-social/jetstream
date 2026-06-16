@@ -361,8 +361,9 @@ func TestConvertEvent_CommitMissingCAR_DropsBadOpKeepsRest(t *testing.T) {
 // TestConvertEvent_CommitResync pins the post-Sync-1.1 mapping:
 // atmos's verifier triggers an async resync after a chain break,
 // and the resulting ops arrive with Action=ActionResync. They
-// carry the live record bytes; we map them to KindCreate so the
-// archive records the post-resync state.
+// carry the live record bytes; we map them to KindCreateResync so
+// /subscribe can hide the replacement row while /subscribe-v2 and
+// archive readers can still observe the post-resync state.
 func TestConvertEvent_CommitResync(t *testing.T) {
 	t.Parallel()
 
@@ -378,7 +379,7 @@ func TestConvertEvent_CommitResync(t *testing.T) {
 	got, err := ConvertEvent(evt, testIndexedAt)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
-	require.Equal(t, segment.KindCreate, got[0].Kind, "ActionResync must map to KindCreate")
+	require.Equal(t, segment.KindCreateResync, got[0].Kind, "ActionResync must map to KindCreateResync")
 	require.Equal(t, did, got[0].DID)
 	require.Equal(t, "app.bsky.feed.post", got[0].Collection)
 	require.Equal(t, "rec0", got[0].Rkey)

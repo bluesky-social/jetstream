@@ -16,7 +16,7 @@ import (
 // durable writer. Append still validates internally because segment
 // is the final invariant boundary for on-disk data.
 func ValidateEvent(ev Event) error {
-	if ev.Kind < KindCreate || ev.Kind > KindSync {
+	if !ev.Kind.Valid() {
 		return fmt.Errorf("%w: %d", ErrInvalidKind, ev.Kind)
 	}
 	if len(ev.DID) > math.MaxUint16 {
@@ -352,7 +352,7 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	}
 	for i := range nEvents {
 		k := Kind(chunk[i])
-		if k < KindCreate || k > KindSync {
+		if !k.Valid() {
 			return nil, errTruncatedBlock
 		}
 		events[i].Kind = k

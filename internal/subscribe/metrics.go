@@ -12,11 +12,12 @@ const (
 // skip metric registration entirely. Mirrors the convention in
 // internal/ingest/live/metrics.go.
 type Metrics struct {
-	Subscribers       prometheus.Gauge
-	CleanDisconnects  prometheus.Counter
-	EventsSent        prometheus.Counter
-	EventsSkippedSync prometheus.Counter
-	EncodeErrors      prometheus.Counter
+	Subscribers         prometheus.Gauge
+	CleanDisconnects    prometheus.Counter
+	EventsSent          prometheus.Counter
+	EventsSkippedSync   prometheus.Counter
+	EventsSkippedResync prometheus.Counter
+	EncodeErrors        prometheus.Counter
 
 	// Added in 2026-05-27 v1-filtering port:
 	EventsFiltered      prometheus.Counter
@@ -59,8 +60,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		EventsSkippedSync: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name:        "events_skipped_total",
-			Help:        "Events deliberately not emitted on the v1-compat wire format (e.g. #sync).",
+			Help:        "Events deliberately not emitted on the v1-compat wire format.",
 			ConstLabels: prometheus.Labels{"reason": "sync"},
+		}),
+		EventsSkippedResync: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:        "events_skipped_total",
+			Help:        "Events deliberately not emitted on the v1-compat wire format.",
+			ConstLabels: prometheus.Labels{"reason": "resync_replacement"},
 		}),
 		EncodeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -129,7 +136,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.Subscribers, m.CleanDisconnects,
-		m.EventsSent, m.EventsSkippedSync, m.EncodeErrors,
+		m.EventsSent, m.EventsSkippedSync, m.EventsSkippedResync, m.EncodeErrors,
 		m.EventsFiltered, m.EventsOversize,
 		m.OptionsUpdates, m.OptionsUpdateErrors,
 		m.CursorRequests, m.CursorResolveSeconds,
@@ -162,6 +169,11 @@ func (m *Metrics) incEventsSent() {
 func (m *Metrics) incEventsSkippedSync() {
 	if m != nil {
 		m.EventsSkippedSync.Inc()
+	}
+}
+func (m *Metrics) incEventsSkippedResync() {
+	if m != nil {
+		m.EventsSkippedResync.Inc()
 	}
 }
 func (m *Metrics) incEncodeErrors() {

@@ -174,7 +174,7 @@ func assertSegmentInvariants(t *testing.T, iter int, desc string, j int, ev segm
 	require.LessOrEqual(t, len(ev.Rev), math.MaxUint8,
 		"iter %d (%s) ev[%d]: Rev exceeds uint8 column", iter, desc, j)
 	switch ev.Kind {
-	case segment.KindCreate, segment.KindUpdate:
+	case segment.KindCreate, segment.KindUpdate, segment.KindCreateResync:
 		require.NotNil(t, ev.Payload,
 			"iter %d (%s) ev[%d]: Create/Update must carry payload bytes", iter, desc, j)
 	case segment.KindDelete:
@@ -289,9 +289,9 @@ func wellFormedCommit(t *testing.T, r *rand.Rand) swarmCase {
 // wellFormedResync builds a #commit whose ops are all ActionResync
 // (the wire form of streaming.ActionResync). Atmos's verifier resync
 // worker emits these after a chain break, with the live record bytes
-// in the CAR. ConvertEvent maps ActionResync → KindCreate so the
-// archive records the post-resync state (a duplicate Create is
-// acceptable; the segment is an event log, not a state table).
+// in the CAR. ConvertEvent maps ActionResync → KindCreateResync so
+// /subscribe can hide the replacement row while archive readers still
+// see the post-resync state.
 func wellFormedResync(t *testing.T, r *rand.Rand) swarmCase {
 	t.Helper()
 	did := randomDID(r)
@@ -315,7 +315,7 @@ func wellFormedResync(t *testing.T, r *rand.Rand) swarmCase {
 
 	kinds := make([]segment.Kind, nOps)
 	for i := range kinds {
-		kinds[i] = segment.KindCreate
+		kinds[i] = segment.KindCreateResync
 	}
 	return swarmCase{
 		desc:    "well-formed resync",

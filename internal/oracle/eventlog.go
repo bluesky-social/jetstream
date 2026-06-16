@@ -169,7 +169,7 @@ func filterCompactedExpectedRows(rows []EventLogRow, watermark uint64) []EventLo
 
 	out := make([]EventLogRow, 0, len(rows))
 	for _, row := range rows {
-		if row.Seq <= watermark && (row.Kind == "create" || row.Kind == "update") {
+		if row.Seq <= watermark && (row.Kind == "create" || row.Kind == "update" || row.Kind == "create_resync") {
 			key := RecordKey{DID: row.DID, Collection: row.Collection, Rkey: row.Rkey}
 			if recordTombstones[key] > row.Seq || didTombstones[row.DID] > row.Seq {
 				continue
@@ -278,6 +278,8 @@ func eventLogKind(kind segment.Kind) string {
 	switch kind {
 	case segment.KindCreate:
 		return "create"
+	case segment.KindCreateResync:
+		return "create_resync"
 	case segment.KindUpdate:
 		return "update"
 	case segment.KindDelete:

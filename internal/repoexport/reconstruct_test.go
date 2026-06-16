@@ -490,7 +490,7 @@ func expectedRoot(t *testing.T, events []segment.Event) (cbor.CID, int) {
 	for _, ev := range events {
 		key := ev.Collection + "/" + ev.Rkey
 		switch ev.Kind {
-		case segment.KindCreate, segment.KindUpdate:
+		case segment.KindCreate, segment.KindUpdate, segment.KindCreateResync:
 			cid := cbor.ComputeCID(cbor.CodecDagCBOR, ev.Payload)
 			require.NoError(t, store.PutBlock(cid, ev.Payload))
 			require.NoError(t, tree.Insert(key, cid))

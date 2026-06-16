@@ -19,12 +19,7 @@ import (
 // that maps to the repo MST and can therefore be filtered against
 // repo/<did>.Backfill.Rev.
 func isCommitKind(k segment.Kind) bool {
-	switch k {
-	case segment.KindCreate, segment.KindUpdate, segment.KindDelete:
-		return true
-	default:
-		return false
-	}
+	return k.IsCommit()
 }
 
 func isBackfillRevFilteredKind(k segment.Kind) bool {

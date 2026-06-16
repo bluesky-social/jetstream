@@ -196,7 +196,7 @@ func TestRebuildEqualsIncremental(t *testing.T) {
 		for i := range n {
 			seq := uint64(i + 1)
 			did := dids[rng.Intn(len(dids))]
-			switch rng.Intn(6) {
+			switch rng.Intn(7) {
 			case 0:
 				events = append(events, segment.Event{Seq: seq, Kind: segment.KindCreate, DID: did, Collection: "c", Rkey: fmt.Sprintf("r%d", rng.Intn(10))})
 			case 1:
@@ -204,14 +204,16 @@ func TestRebuildEqualsIncremental(t *testing.T) {
 			case 2:
 				events = append(events, segment.Event{Seq: seq, Kind: segment.KindDelete, DID: did, Collection: "c", Rkey: fmt.Sprintf("r%d", rng.Intn(10))})
 			case 3:
-				events = append(events, segment.Event{Seq: seq, Kind: segment.KindSync, DID: did})
+				events = append(events, segment.Event{Seq: seq, Kind: segment.KindCreateResync, DID: did, Collection: "c", Rkey: fmt.Sprintf("r%d", rng.Intn(10))})
 			case 4:
+				events = append(events, segment.Event{Seq: seq, Kind: segment.KindSync, DID: did})
+			case 5:
 				status := []string{"deleted", "takendown", "suspended"}[rng.Intn(3)]
 				acc := &comatproto.SyncSubscribeRepos_Account{DID: did, Active: false, Status: gt.Some(status)}
 				payload, err := acc.MarshalCBOR()
 				require.NoError(t, err)
 				events = append(events, segment.Event{Seq: seq, Kind: segment.KindAccount, DID: did, Payload: payload})
-			case 5:
+			case 6:
 				events = append(events, segment.Event{Seq: seq, Kind: segment.KindIdentity, DID: did})
 			}
 		}

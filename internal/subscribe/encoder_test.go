@@ -252,6 +252,28 @@ func TestEncode_SyncReturnsSkipSentinel(t *testing.T) {
 	require.ErrorIs(t, err, errSkipEvent)
 }
 
+func TestEncode_CreateResyncUsesCreateWireOperation(t *testing.T) {
+	t.Parallel()
+
+	body, err := Encode(&segment.Event{
+		Seq:        123,
+		IndexedAt:  1_700_000_000_000_000,
+		Kind:       segment.KindCreateResync,
+		DID:        "did:plc:x",
+		Collection: "app.bsky.feed.post",
+		Rkey:       "r1",
+		Rev:        "rev1",
+		Payload:    []byte{0xa0},
+	})
+	require.NoError(t, err)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(body, &got))
+	commit, ok := got["commit"].(map[string]any)
+	require.True(t, ok, "commit payload should be present")
+	require.Equal(t, "create", commit["operation"])
+}
+
 func TestEncode_UnknownKindReturnsError(t *testing.T) {
 	t.Parallel()
 	_, err := Encode(&segment.Event{Kind: segment.Kind(99)})
