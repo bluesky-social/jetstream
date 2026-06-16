@@ -180,7 +180,7 @@ func TestCompareEventLogsCompactedAllowsSupersededCreateResyncBelowWatermark(t *
 	// Production compaction drops superseded create_resync rows the same as
 	// plain creates (tombstone.ShouldDrop -> Kind.IsMaterialization), so the
 	// expected-side filter must drop them too or the oracle reports a spurious
-	// "extra observed event" once a resync replacement row is compacted away.
+	// "missing expected event" once a resync replacement row is compacted away.
 	resync := ObservedEvent{Seq: 1, Kind: segment.KindCreateResync, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev1", Payload: []byte("old")}
 	deleted := ObservedEvent{Seq: 2, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "rev2"}
 
