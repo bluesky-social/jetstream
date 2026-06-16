@@ -2,6 +2,9 @@ package oracle
 
 import "fmt"
 
+// CheckInvariants validates structural guarantees of an observed event stream:
+// seqs are unique and strictly increasing, commit events carry a rev, and per-DID
+// revs never regress.
 func CheckInvariants(events []ObservedEvent) error {
 	seenSeqs := make(map[uint64]struct{}, len(events))
 	lastRevByDID := make(map[string]ObservedEvent)

@@ -9,16 +9,15 @@ import (
 	"github.com/jcalabro/gt"
 )
 
-// frameHeaderCommit, frameHeaderIdentity, frameHeaderAccount, frameHeaderInfo
+// frameHeaderCommit, frameHeaderSync, frameHeaderAccount, frameHeaderInfo
 // are the precomputed CBOR encodings of the {"op":1,"t":"#..."} headers
 // that prefix every wire frame. atmos's streaming.decodeFrame reads
 // these as two concatenated CBOR values (header map + body).
 var (
-	frameHeaderCommit   = mustEncodeFrameHeader("#commit")
-	frameHeaderSync     = mustEncodeFrameHeader("#sync")
-	frameHeaderIdentity = mustEncodeFrameHeader("#identity")
-	frameHeaderAccount  = mustEncodeFrameHeader("#account")
-	frameHeaderInfo     = mustEncodeFrameHeader("#info")
+	frameHeaderCommit  = mustEncodeFrameHeader("#commit")
+	frameHeaderSync    = mustEncodeFrameHeader("#sync")
+	frameHeaderAccount = mustEncodeFrameHeader("#account")
+	frameHeaderInfo    = mustEncodeFrameHeader("#info")
 )
 
 func mustEncodeFrameHeader(typ string) []byte {
@@ -66,19 +65,7 @@ func encodeSyncFrame(e *comatproto.SyncSubscribeRepos_Sync) ([]byte, error) {
 	return out, nil
 }
 
-// encodeIdentityFrame and encodeAccountFrame mirror encodeCommitFrame
-// for #identity and #account.
-func encodeIdentityFrame(e *comatproto.SyncSubscribeRepos_Identity) ([]byte, error) {
-	body, err := e.MarshalCBOR()
-	if err != nil {
-		return nil, fmt.Errorf("world: encode identity frame body: %w", err)
-	}
-	out := make([]byte, 0, len(frameHeaderIdentity)+len(body))
-	out = append(out, frameHeaderIdentity...)
-	out = append(out, body...)
-	return out, nil
-}
-
+// encodeAccountFrame mirrors encodeCommitFrame for #account.
 func encodeAccountFrame(e *comatproto.SyncSubscribeRepos_Account) ([]byte, error) {
 	body, err := e.MarshalCBOR()
 	if err != nil {
@@ -189,9 +176,3 @@ func keyFirehoseUpper() []byte {
 	binary.BigEndian.PutUint64(buf[:], (1<<63)-1)
 	return append(out, buf[:]...)
 }
-
-// Scaffolding: these encode functions are unused until later tasks.
-var (
-	_ = encodeIdentityFrame
-	_ = encodeAccountFrame
-)

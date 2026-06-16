@@ -280,12 +280,12 @@ func (s *Server) DebugAddr() string {
 }
 
 // publicMux builds the user-facing routes. Each route is wrapped with the
-// prom + OTEL middleware via Metrics.InstrumentHandler.
+// prom + OTEL middleware via Metrics.Middleware.
 func (s *Server) publicMux() http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("GET /{$}", s.metrics.InstrumentHandler("root", http.HandlerFunc(s.handleRoot)))
+	mux.Handle("GET /{$}", s.metrics.Middleware("root", http.HandlerFunc(s.handleRoot)))
 	if s.statusHandler != nil {
-		instrumented := s.metrics.InstrumentHandler("status", s.statusHandler)
+		instrumented := s.metrics.Middleware("status", s.statusHandler)
 		mux.Handle("GET /status", instrumented)
 		mux.Handle("HEAD /status", instrumented)
 	}
@@ -293,7 +293,7 @@ func (s *Server) publicMux() http.Handler {
 		// Wrap each registered route in the same prom + OTEL middleware
 		// as the built-in / route, with a metric label derived from the
 		// pattern (last path segment).
-		mux.Handle(r.pattern, s.metrics.InstrumentHandler(routeLabel(r.pattern), r.handler))
+		mux.Handle(r.pattern, s.metrics.Middleware(routeLabel(r.pattern), r.handler))
 	}
 	return mux
 }

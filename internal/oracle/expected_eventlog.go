@@ -11,6 +11,10 @@ import (
 	"github.com/jcalabro/atmos/streaming"
 )
 
+// ExpectedEventLogFromFirehose derives the event log Jetstream should produce by
+// decoding the simulator world's firehose frames after cursor (up to limit) and
+// expanding them into normalized rows, including the per-record rows a sync frame
+// implies.
 func ExpectedEventLogFromFirehose(w *world.World, cursor int64, limit int) ([]EventLogRow, error) {
 	frames, err := w.FirehoseRange(cursor, limit)
 	if err != nil {

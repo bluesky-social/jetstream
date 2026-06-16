@@ -24,7 +24,7 @@ func newCappedDecoder(maxBytes uint64) (*zstd.Decoder, error) {
 func TestValidateAcceptsHappyPath(t *testing.T) {
 	t.Parallel()
 
-	require.NoError(t, validate(Event{
+	require.NoError(t, ValidateEvent(Event{
 		Seq:        42,
 		IndexedAt:  1_700_000_000_000_000,
 		RenderedAt: 0,
@@ -42,13 +42,13 @@ func TestValidateRejectsInvalidKind(t *testing.T) {
 
 	t.Run("zero", func(t *testing.T) {
 		t.Parallel()
-		err := validate(Event{Kind: 0})
+		err := ValidateEvent(Event{Kind: 0})
 		require.ErrorIs(t, err, ErrInvalidKind)
 	})
 
 	t.Run("seven", func(t *testing.T) {
 		t.Parallel()
-		err := validate(Event{Kind: 7})
+		err := ValidateEvent(Event{Kind: 7})
 		require.ErrorIs(t, err, ErrInvalidKind)
 	})
 }
@@ -83,7 +83,7 @@ func TestValidateRejectsOversizedFields(t *testing.T) {
 			t.Parallel()
 			ev := Event{Kind: KindCreate}
 			tc.mut(&ev)
-			err := validate(ev)
+			err := ValidateEvent(ev)
 			require.True(t, errors.Is(err, ErrFieldTooLong),
 				"expected ErrFieldTooLong, got %v", err)
 		})

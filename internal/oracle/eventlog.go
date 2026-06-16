@@ -10,6 +10,9 @@ import (
 	"github.com/bluesky-social/jetstream-v2/segment"
 )
 
+// EventLogRow is a normalized, JSON-serializable representation of one durable
+// event, with payloads reduced to a length and SHA-256 prefix so logs can be
+// compared without carrying raw bytes.
 type EventLogRow struct {
 	Seq              uint64 `json:"seq"`
 	Kind             string `json:"kind"`
@@ -64,6 +67,8 @@ func cloneSegmentEvent(ev segment.Event) segment.Event {
 	return ev
 }
 
+// NormalizeEventLog converts observed events into EventLogRows, hashing
+// payloads and decoding the account-deleted flag for account events.
 func NormalizeEventLog(events []ObservedEvent) []EventLogRow {
 	out := make([]EventLogRow, 0, len(events))
 	for _, ev := range events {
@@ -88,6 +93,8 @@ func NormalizeEventLog(events []ObservedEvent) []EventLogRow {
 	return out
 }
 
+// CompareEventLogs reports the first positional mismatch between two event
+// logs, distinguishing missing, extra, reordered, and field-level differences.
 func CompareEventLogs(want, got []EventLogRow) error {
 	for i := 0; i < len(want) && i < len(got); i++ {
 		if want[i] == got[i] {
@@ -117,12 +124,17 @@ func CompareEventLogs(want, got []EventLogRow) error {
 	return nil
 }
 
+// CompareEventLogMultiset compares two event logs ignoring order by sorting
+// both sides into a canonical order before a positional comparison.
 func CompareEventLogMultiset(want, got []EventLogRow) error {
 	wantSorted := eventLogRowsSorted(want)
 	gotSorted := eventLogRowsSorted(got)
 	return CompareEventLogs(wantSorted, gotSorted)
 }
 
+// CompareEventLogsCompacted compares against got after dropping the expected
+// rows that compaction would have removed at or below watermark, so the
+// expected log matches a compacted segment stream.
 func CompareEventLogsCompacted(want, got []EventLogRow, watermark uint64) error {
 	return CompareEventLogs(filterCompactedExpectedRows(want, watermark), got)
 }

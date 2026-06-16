@@ -37,10 +37,6 @@ func ValidateEvent(ev Event) error {
 	return nil
 }
 
-func validate(ev Event) error {
-	return ValidateEvent(ev)
-}
-
 // columns is the small interface encodeBlockColumns reads through.
 // It exists so the writer's pendingBlock (parallel slices) and the
 // test/golden/fuzz path's []Event share one byte-layout

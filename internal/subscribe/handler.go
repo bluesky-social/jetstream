@@ -322,6 +322,11 @@ func runReader(
 // event (filter -> memoized encode -> write), and drops the client only when
 // the adversarial-rate detector fires. ReadFrom blocks at the tip, so an idle
 // stream costs nothing; a ping ticker keeps idle connections alive.
+//
+// Each subscriber drives its own pull loop and advances its cursor at its own
+// pace, so backpressure is implicit: a slow client simply pulls slower. There
+// is no central broadcaster fanning out writes and no per-subscriber buffer to
+// bound or overflow.
 func runSubscriberLoop(
 	ctx context.Context,
 	conn *websocket.Conn,
