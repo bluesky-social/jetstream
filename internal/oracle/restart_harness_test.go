@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -76,12 +77,37 @@ func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 				LiveEventsBootstrap: 4,
 				LiveEventsSteady:    4,
 			}
+			trace, _, closeTrace := newOracleTrace(t, "restart-"+tc.name+".jsonl")
+			defer closeTrace()
+			recordTraceOrError(t, trace, "run_start", map[string]any{
+				"mode":                  cfg.Mode,
+				"seed":                  cfg.Seed,
+				"go_version":            runtime.Version(),
+				"gomaxprocs":            runtime.GOMAXPROCS(0),
+				"accounts":              cfg.Accounts,
+				"min_initial_records":   cfg.MinInitialRecords,
+				"max_initial_records":   cfg.MaxInitialRecords,
+				"live_events_bootstrap": cfg.LiveEventsBootstrap,
+				"live_events_steady":    cfg.LiveEventsSteady,
+				"case":                  tc.name,
+				"crash_point":           tc.point.String(),
+				"pre_live_events":       tc.preLiveEvents,
+			})
 
 			w := newRestartWorld(t, cfg)
 			defer func() { require.NoError(t, w.Close()) }()
 			if tc.preLiveEvents > 0 {
 				generateN(t, w, tc.preLiveEvents)
 			}
+			recordTraceOrError(t, trace, "simulator_config", map[string]any{
+				"seed":                cfg.Seed,
+				"accounts":            cfg.Accounts,
+				"initial_records_min": cfg.MinInitialRecords,
+				"initial_records_max": cfg.MaxInitialRecords,
+				"firehose_history":    max(10_000, cfg.LiveEventsBootstrap+cfg.LiveEventsSteady+1024),
+				"pre_live_events":     tc.preLiveEvents,
+				"current_seq":         w.CurrentSeq(),
+			})
 
 			srv := newRestartServer(t, w)
 			defer srv.Close()
@@ -98,7 +124,10 @@ func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 				crashPoint:      tc.point,
 				killAfterMarker: true,
 				timeout:         30 * time.Second,
+				trace:           trace,
+				runLabel:        "first-" + tc.name,
 			})
+			recordTraceOrError(t, trace, "restart_child_result", traceRestartChildResult("first", first))
 			require.True(t, wasSIGKILL(first.err), "first child should be killed at %s: err=%v\n%s", tc.point, first.err, first.output)
 
 			second := runRestartChild(t, restartChildArgs{
@@ -106,11 +135,16 @@ func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 				relayURL:      srv.URL,
 				mergeDonePath: mergeDonePath,
 				timeout:       30 * time.Second,
+				trace:         trace,
+				runLabel:      "second-" + tc.name,
 			})
+			recordTraceOrError(t, trace, "restart_child_result", traceRestartChildResult("second", second))
 			require.NoError(t, second.err, "restart child should exit cleanly\n%s", second.output)
 			require.FileExists(t, mergeDonePath, "restart child must reach after-merge barrier before exiting")
 
+			recordTraceOrError(t, trace, "phase", map[string]any{"phase": "restart-final-assertions", "marker": "begin"})
 			assertOracleMatches(t, dataDir, w, cfg, tc.name)
+			recordTraceOrError(t, trace, "phase", map[string]any{"phase": "restart-final-assertions", "marker": "done"})
 		})
 	}
 }
@@ -268,20 +302,29 @@ type restartChildArgs struct {
 	crashPoint      crashpoint.Point
 	killAfterMarker bool
 	timeout         time.Duration
+	trace           *Trace
+	runLabel        string
 }
 
 type restartChildResult struct {
-	output string
-	err    error
+	output  string
+	err     error
+	logPath string
 }
 
 func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 	t.Helper()
 
-	logPath := filepath.Join(t.TempDir(), "restart-child.log")
-	logFile, err := os.Create(logPath)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, logFile.Close()) }()
+	logPath, logFile, closeLog := newOracleArtifactFile(t, args.runLabel+"-restart-child.log")
+	defer closeLog()
+	recordTraceOrError(t, args.trace, "restart_child_start", map[string]any{
+		"label":             args.runLabel,
+		"log_path":          logPath,
+		"crash_point":       args.crashPoint.String(),
+		"kill_after_marker": args.killAfterMarker,
+		"marker_path":       args.markerPath,
+		"merge_done_path":   args.mergeDonePath,
+	})
 
 	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestOracleRestartChild$", "-test.v")
 	cmd.Stdout = logFile
@@ -295,6 +338,10 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 		envRestartCrashPoint+"="+args.crashPoint.String(),
 	)
 	require.NoError(t, cmd.Start())
+	recordTraceOrError(t, args.trace, "restart_child_process", map[string]any{
+		"label": args.runLabel,
+		"pid":   cmd.Process.Pid,
+	})
 
 	waitDone := make(chan error, 1)
 	reaped := false
@@ -313,8 +360,23 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 	}()
 
 	if args.killAfterMarker {
-		require.NoError(t, waitForMarker(args.markerPath, waitDone, args.timeout, logPath))
-		require.NoError(t, cmd.Process.Signal(syscall.SIGKILL))
+		recordTraceOrError(t, args.trace, "restart_marker_wait_start", map[string]any{
+			"label":       args.runLabel,
+			"marker_path": args.markerPath,
+		})
+		markerErr := waitForMarker(args.markerPath, waitDone, args.timeout, logPath)
+		recordTraceOrError(t, args.trace, "restart_marker_wait_done", map[string]any{
+			"label": args.runLabel,
+			"err":   traceErr(markerErr),
+		})
+		require.NoError(t, markerErr)
+		signalErr := cmd.Process.Signal(syscall.SIGKILL)
+		recordTraceOrError(t, args.trace, "restart_child_signal", map[string]any{
+			"label":  args.runLabel,
+			"signal": syscall.SIGKILL.String(),
+			"err":    traceErr(signalErr),
+		})
+		require.NoError(t, signalErr)
 	}
 
 	var waitErr error
@@ -333,7 +395,19 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 
 	output, readErr := os.ReadFile(logPath)
 	require.NoError(t, readErr)
-	return restartChildResult{output: string(output), err: waitErr}
+	result := restartChildResult{output: string(output), err: waitErr, logPath: logPath}
+	recordTraceOrError(t, args.trace, "restart_child_exit", traceRestartChildResult(args.runLabel, result))
+	return result
+}
+
+func traceRestartChildResult(label string, result restartChildResult) map[string]any {
+	return map[string]any{
+		"label":        label,
+		"log_path":     result.logPath,
+		"output_bytes": len(result.output),
+		"err":          traceErr(result.err),
+		"was_sigkill":  wasSIGKILL(result.err),
+	}
 }
 
 func waitForMarker(markerPath string, waitDone <-chan error, timeout time.Duration, logPath string) error {

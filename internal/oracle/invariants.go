@@ -18,6 +18,10 @@ func CheckInvariants(events []ObservedEvent) error {
 		}
 		lastSeq = ev.Seq
 
+		if ev.Rev == "" && isCommitKind(ev.Kind) {
+			return fmt.Errorf("oracle: empty rev for commit event at event %d: seq=%d kind=%d did=%s collection=%s rkey=%s",
+				i, ev.Seq, ev.Kind, ev.DID, ev.Collection, ev.Rkey)
+		}
 		if ev.Rev == "" {
 			continue
 		}

@@ -5,6 +5,75 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
+## Retired mutants
+
+The active catalog no longer carries mutants that have been reclassified as
+stale/dead under the current implementation. Their historical scorecard rows
+remain below so the reasoning is not lost.
+
+| mutant | retired | reason |
+|---|---|---|
+| m007_compaction_chunk_boundary | 2026-06-15 | Invalid/dead under current compaction chunk construction; the modeled corrupt shape cannot be produced by current chunk snapshots. |
+| m010_nextblockoffset_reset | 2026-06-15 | Stale/dead for sealed oracle observations; `Writer.Seal` rebuilds footer block metadata from physical frames. |
+
+## Active catalog check 2026-06-15 — retired mutants removed
+
+- commit under test: `767792e`
+- driver: `just mutation-campaign`
+- catalog: 17 active mutants; retired mutants `m007` and `m010` are absent
+- purpose: verify the active catalog still runs after removing stale/dead
+  legacy patches
+
+| mutant | result | note |
+|---|---|---|
+| m001_delete_mapped_to_update | KILLED@default | default oracle killed the mutant |
+| m002_watermark_floor_off_by_one | SURVIVED | known seed-dependent/future-roadmap gap |
+| m003_merge_cursor_no_advance | SURVIVED | known restart-depth gap |
+| m004_rev_filter_inverted | KILLED@default | missing expected event diagnostic |
+| m005_backfill_status_check_inverted | KILLED@stress | rev-regression diagnostic |
+| m006_merge_commit_error_swallowed | SURVIVED | known store-fault gap |
+| m008_header_offset_byteslice | KILLED@default | default oracle killed the mutant |
+| m009_checksum_range_off_by_one | SURVIVED | known closed-loop checksum blind spot |
+| m011_wire_frame_length | KILLED@default | active segment walk failed |
+| m012_block_event_count_off_by_one | KILLED@default | default oracle killed the mutant |
+| m013_collection_rkey_swap | SURVIVED | known dead path in this simulator config; companion `m017` covers hot path |
+| m014_rev_dropped | SURVIVED | known dead path in this simulator config; companion `m018` covers hot path |
+| m015_collection_count_double | SURVIVED | known read-path index blind spot |
+| m016_bloom_size_off_by_one | KILLED@default | default oracle killed the mutant |
+| m017_commit_collection_rkey_swap | KILLED@default | event-log mismatch diagnostic |
+| m018_commit_rev_dropped | KILLED@default | event-log mismatch diagnostic |
+| m019_sync_tombstone_dropped | KILLED@default | event-log equivalence caught missing sync row |
+
+## Targeted follow-up 2026-06-15 — event-log equivalence
+
+- commit under test: branch `testing-revamp` after
+  `oracle: assert lifecycle event-log equivalence`
+- driver: targeted manual equivalent of `just mutation-campaign m019`
+  (`git apply --check`, apply, `go build ./...`, default oracle tier, reverse)
+- scope: Workstream 3 event-log equivalence
+
+| mutant | result | disposition |
+|---|---|---|
+| m019_sync_tombstone_dropped | KILLED@default | New event-log equivalence assertion caught a missing `KindSync` row even though replacement rows can allow final state to converge. Diagnostic: `oracle: missing expected event ... kind=sync`. |
+
+## Targeted follow-up 2026-06-15
+
+- commit under test: branch `testing-revamp` after
+  `oracle: reclassify stale mutation expectations`
+- driver: targeted `just mutation-campaign m018`, `m010`, and `m007`
+  before retiring stale/dead mutants `m010` and `m007` from the active catalog
+- scope: Phase 1 of the oracle robustness roadmap
+
+| mutant | result | disposition |
+|---|---|---|
+| m018_commit_rev_dropped | KILLED@default | Fixed by rejecting empty `Rev` on commit-kind observed events. |
+| m010_nextblockoffset_reset | SURVIVED | Reclassified stale/dead for sealed oracle observations. `Writer.Seal` rebuilds footer block metadata by walking physical frames, so the mutated `Writer.nextBlockOffset` only corrupts active `Writer.Blocks()` metadata; existing segment tests already cover that active API. |
+| m007_compaction_chunk_boundary | SURVIVED | Reclassified invalid/dead under current compaction chunk construction. A row at `seq == chunkEnd` can only be dropped if the same chunk snapshot contains a tombstone with `seq > chunkEnd`; merge and steady chunk snapshots are both bounded to `<= chunkEnd`, and later chunks still rewrite older rows. |
+
+The original campaign remains below as historical data. These follow-up
+results correct two stale mutant interpretations rather than counting them as
+oracle assertion work.
+
 ## Campaign 2026-06-15
 
 - commit: `75d9251` (branch `mutation-campaign`)
@@ -63,8 +132,12 @@ so they were not swept. This is a deliberate scope limit, not full coverage.
   actionable operational result: it argues the nightly `oracle-sweep` seed
   count is load-bearing, not decorative — a single-seed CI run would have a
   ~20% chance of missing this real bug.
-- **m007**: SURVIVED all 5 seeds → true escape.
-- **m010**: SURVIVED all 5 seeds → true escape.
+- **m007**: SURVIVED all 5 seeds → originally treated as a true escape; later
+  reclassified as invalid/dead under current compaction chunk construction and
+  retired from the active catalog.
+- **m010**: SURVIVED all 5 seeds → originally treated as a true escape; later
+  reclassified as stale/dead for sealed oracle observations and retired from
+  the active catalog.
 
 ### Escapes — analysis and disposition
 
@@ -76,32 +149,38 @@ checks. m017 proves the hot path is otherwise exercised (the collection/rkey
 swap on the same struct was caught instantly), so this is a true gap, not a
 dead path. Disposition: **fix the oracle** — have CheckInvariants reject an
 empty rev on a commit-kind event (a create/update/delete must carry a rev),
-which costs nothing and closes the hole. Filed to ORACLE_TODO.md.
+which costs nothing and closes the hole. This gap was closed in Milestone A.
 
 **m009 — symmetric checksum (oracle structurally cannot catch; accepted).**
 `xxh3HeaderFooter` is used both to write the seal checksum (seal.go:123) and
 to verify it on read (reader.go:193). A mutation to its byte range changes
 both sides identically, so they always agree. This is a miniature of the
-"atmos closed loop" blind spot from ORACLE_TODO.md §3: the oracle cannot
+"atmos closed loop" blind spot described in `docs/oracle/DESIGN.md`: the oracle cannot
 detect a bug that lives in a function shared by the writer and reader.
 Disposition: **accepted blind spot** — only an independent checksum oracle
 (or a committed golden segment with a known-good checksum) would catch it.
-Cross-referenced in ORACLE_TODO.md.
+Cross-referenced in the oracle design document.
 
-**m010 — block read by index, not by recorded offset (real gap).**
+**m010 — block read by index, not by recorded offset (historical, retired).**
 `DecodeBlock` (reader.go:301) seeks via the block-index entry's offset, and
 the oracle decodes blocks 0..N by index. The `nextBlockOffset` bookkeeping the
 mutant corrupts feeds a path the oracle's read does not depend on in this
 config. A real consumer using offset-based seeks could diverge. Disposition:
 **fix the oracle** candidate — add a read mode that follows recorded offsets,
-or assert offset monotonicity in ObserveSegments. Filed to ORACLE_TODO.md.
+or assert offset monotonicity in ObserveSegments. Later Milestone A review
+found this mutant stale/dead for sealed oracle observations because
+`Writer.Seal` rebuilds footer metadata by walking physical frames; the active
+patch was retired on 2026-06-15.
 
-**m007 — compaction boundary row never re-evaluated (real gap).**
+**m007 — compaction boundary row never re-evaluated (historical, retired).**
 The `>` → `>=` weakening keeps the row at exactly chunkEnd, and because the
 watermark advances to chunkEnd it is never revisited. assertCompacted did not
 catch it across 6 seeds. Disposition: **fix the oracle** — CheckCompacted
 should assert that the boundary seq itself is evaluated, not just rows
-strictly below it. Filed to ORACLE_TODO.md.
+strictly below it. Later Milestone A review found this mutant invalid/dead
+under current compaction chunk construction because the modeled corrupt shape
+cannot be produced by current chunk snapshots; the active patch was retired on
+2026-06-15.
 
 **m003 — merge-cursor off-by-one not exercised by restart tier (real gap).**
 The restart oracle only covers 4 enumerated crashpoints; a merge-cursor
@@ -109,12 +188,13 @@ double-process needs a crash precisely between source completion and the next
 run, which the current harness does not stage for this seam. Disposition:
 **fix the oracle** — extend the restart harness to crash at the
 source-complete seam, OR (better) the random-time kill loop from
-ORACLE_TODO.md Tier 2 would cover this class without enumeration. Filed.
+the crash/restart tier in `docs/oracle/DESIGN.md` would cover this class
+without enumeration.
 
 **m006 — swallowed commit error needs store-fault injection (predicted).**
 Predicted to survive: under normal runs `commitSourceComplete` never fails,
-so the inverted check is dormant. Confirms ORACLE_TODO.md Tier 3
-"adversarial-fault mode": the oracle has no way to make a store write fail.
+so the inverted check is dormant. Confirms the store-fault tier requirement in
+`docs/oracle/DESIGN.md`: the oracle has no way to make a store write fail.
 Disposition: **accepted, pending** the store-fault oracle tier.
 
 **m015 / m016 — footer/bloom read-path indexes (confirmed blind spots).**
@@ -122,8 +202,8 @@ Predicted survival, confirmed. The oracle decodes every block sequentially
 and never consults the footer collection-count index or the per-block bloom
 filters, so corruption there is invisible. These mutants exist to *document*
 the gap with evidence. Disposition: **accepted blind spots** — would be
-closed by the replay-path / XRPC-egress oracle in ORACLE_TODO.md Tier 1,
-which exercises the read indexes a client uses.
+closed by the product replay and XRPC egress tiers in
+`docs/oracle/DESIGN.md`, which exercise the read indexes a client uses.
 
 ### Prediction misses (corrections to our model of the oracle)
 
@@ -145,11 +225,10 @@ which exercises the read indexes a client uses.
 
 The campaign measured the oracle rather than re-confirming it. It caught
 every hot-path data-shape bug we threw at it (m001, m004, m008, m011, m012,
-m017) and several at scale (m005), but it surfaced **four genuine oracle gaps
-worth fixing** (m018 rev-blindness, m010 offset-vs-index, m007 compaction
-boundary, m003 merge-cursor restart seam), **three structural blind spots**
-already named in ORACLE_TODO.md (m006 store-fault, m009 closed-loop checksum,
-m015/m016 read-path indexes), and one operational signal — **m002's flaky
+m017) and several at scale (m005), but it surfaced **two active oracle gaps
+worth fixing** (m018 rev-blindness and m003 merge-cursor restart seam), **three structural blind spots**
+now named in `docs/oracle/DESIGN.md` (m006 store-fault, m009 closed-loop
+checksum, m015/m016 read-path indexes), and one operational signal — **m002's flaky
 detection justifies the multi-seed nightly sweep**. The over-fitting worry was
 warranted in specific, now-documented places; it was not warranted as a
 blanket claim about the oracle.

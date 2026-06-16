@@ -410,6 +410,40 @@ func (r *Reader) LoadAllBlockBlooms() ([]*gloom.Filter, error) {
 	return out, nil
 }
 
+// BlocksContainingDID returns the ascending indices of blocks that may
+// contain an event for did, reading the segment's per-block DID blooms
+// from disk and applying SelectBlocksForDID. It is the file-backed
+// counterpart to the manifest's in-memory selection; both share the
+// same SelectBlocksForDID decision so they can never diverge.
+//
+// See SelectBlocksForDID for the one-sided (no-false-negative) contract.
+func (r *Reader) BlocksContainingDID(did string) ([]int, error) {
+	if len(r.blocks) == 0 {
+		return nil, nil
+	}
+	// Segment-level short-circuit before paying for the per-block bloom
+	// pread: if the whole-segment bloom says the DID is absent, no block
+	// can contain it.
+	if r.segmentBloom != nil && !r.segmentBloom.TestString(did) {
+		return nil, nil
+	}
+
+	blooms, err := r.LoadAllBlockBlooms()
+	if err != nil {
+		// Without per-block blooms we cannot prune safely; fall back to
+		// every block rather than risk a false negative.
+		all := make([]int, len(r.blocks))
+		for i := range all {
+			all[i] = i
+		}
+		return all, nil
+	}
+
+	// segBloom is nil here so SelectBlocksForDID does not re-test the
+	// segment bloom (already checked above); pass nil to skip it.
+	return SelectBlocksForDID(nil, blooms, did), nil
+}
+
 // validateBlockOffsets verifies every block's [offset, offset+8+size]
 // range fits before the footer, that ranges are strictly ascending and
 // non-overlapping (since that's how Seal writes them), and that

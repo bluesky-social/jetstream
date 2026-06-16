@@ -97,6 +97,11 @@ func observeSealedSegment(path string) ([]ObservedEvent, error) {
 	defer func() { _ = rd.Close() }()
 
 	header := rd.Header()
+	blocks := rd.Blocks()
+	if err := checkSegmentStructure(path, header, blocks); err != nil {
+		return nil, err
+	}
+
 	var out []ObservedEvent
 	for i := range int(header.BlockCount) {
 		block, err := rd.DecodeBlock(i)
@@ -108,6 +113,49 @@ func observeSealedSegment(path string) ([]ObservedEvent, error) {
 		}
 	}
 	return out, nil
+}
+
+func checkSegmentStructure(path string, header segment.Header, blocks []segment.BlockInfo) error {
+	if len(blocks) != int(header.BlockCount) {
+		return fmt.Errorf("oracle: sealed segment %s block count mismatch: header=%d index=%d",
+			path, header.BlockCount, len(blocks))
+	}
+
+	for i := 1; i < len(blocks); i++ {
+		prev := blocks[i-1]
+		cur := blocks[i]
+		if cur.Offset <= prev.Offset {
+			return fmt.Errorf("oracle: sealed segment %s block %d non-increasing block offset: prev=%d current=%d",
+				path, i, prev.Offset, cur.Offset)
+		}
+	}
+
+	var prevMaxSeq uint64
+	havePrevSeq := false
+	for i, block := range blocks {
+		if block.EventCount == 0 {
+			continue
+		}
+		if block.MinSeq > block.MaxSeq {
+			return fmt.Errorf("oracle: sealed segment %s block %d invalid seq range: min_seq=%d max_seq=%d",
+				path, i, block.MinSeq, block.MaxSeq)
+		}
+		if havePrevSeq && block.MinSeq <= prevMaxSeq {
+			return fmt.Errorf("oracle: sealed segment %s block %d block seq overlap: prev_max_seq=%d min_seq=%d",
+				path, i, prevMaxSeq, block.MinSeq)
+		}
+		prevMaxSeq = block.MaxSeq
+		havePrevSeq = true
+	}
+
+	for i, block := range blocks {
+		if block.Offset < segment.ReservedHeaderBytes {
+			return fmt.Errorf("oracle: sealed segment %s block %d offset before segment header: offset=%d header_bytes=%d",
+				path, i, block.Offset, segment.ReservedHeaderBytes)
+		}
+	}
+
+	return nil
 }
 
 func observeActiveSegment(path string) ([]ObservedEvent, error) {

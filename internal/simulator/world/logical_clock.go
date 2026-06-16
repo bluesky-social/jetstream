@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
@@ -15,9 +16,17 @@ const logicalClockStepMicros int64 = 1
 const logicalClockID uint = 0
 
 func (w *World) nextRev(b *pebble.Batch) (string, error) {
-	cur, err := w.loadLogicalClock()
+	next, err := w.nextLogicalClockMicros(b)
 	if err != nil {
 		return "", err
+	}
+	return string(atmos.NewTID(next, logicalClockID)), nil
+}
+
+func (w *World) nextLogicalClockMicros(b *pebble.Batch) (int64, error) {
+	cur, err := w.loadLogicalClock()
+	if err != nil {
+		return 0, err
 	}
 	if cur == 0 {
 		cur = logicalClockBaseMicros
@@ -27,9 +36,13 @@ func (w *World) nextRev(b *pebble.Batch) (string, error) {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(next))
 	if err := b.Set([]byte(logicalClockKey), buf[:], nil); err != nil {
-		return "", fmt.Errorf("world: stage logical clock: %w", err)
+		return 0, fmt.Errorf("world: stage logical clock: %w", err)
 	}
-	return string(atmos.NewTID(next, logicalClockID)), nil
+	return next, nil
+}
+
+func formatLogicalClockTime(micros int64) string {
+	return time.UnixMicro(micros).UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
 func (w *World) loadLogicalClock() (int64, error) {

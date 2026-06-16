@@ -178,7 +178,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	statusHandler, err := web.New(web.Options{
 		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(opts.DataDir, opts.RelayURL, pendingEventsForDID(&writerPtr)),
+		RepoActions:                web.NewRepoActions(opts.DataDir, opts.RelayURL, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
 		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
 		Logger:                     processLogger,
 	})
@@ -281,6 +281,14 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		coldRd.InvalidateSegment(idx)
 		return nil
 	}
+	onCompactionPass := func(result orchestrator.CompactionPassResult) {
+		// The compaction pass just evicted tombstones <= the new
+		// watermark; rebuild the overlay so served W/M reflect it.
+		overlayCache.Rebuild()
+		if opts.OnCompactionPass != nil {
+			opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
+		}
+	}
 	orch, err := orchestrator.New(orchestrator.Config{
 		DataDir:        opts.DataDir,
 		Store:          metaStore,
@@ -312,18 +320,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CompactionInterval:       opts.CompactionInterval,
 		CompactionTombstoneCap:   opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers: opts.CompactionRewriteWorkers,
-		OnCompactionPass: func(result orchestrator.CompactionPassResult) {
-			// The compaction pass just evicted tombstones <= the new
-			// watermark; rebuild the overlay so served W/M reflect it.
-			overlayCache.Rebuild()
-			if opts.OnCompactionPass != nil {
-				opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
-			}
-		},
-		BarrierAfterBootstrap: phaseBarrier(opts.BarrierAfterBootstrap),
-		BarrierAfterMerge:     phaseBarrier(opts.BarrierAfterMerge),
-		AfterRepoComplete:     opts.AfterRepoComplete,
-		CrashInjector:         opts.CrashInjector,
+		OnCompactionPass:         onCompactionPass,
+		BarrierAfterBootstrap:    phaseBarrier(opts.BarrierAfterBootstrap),
+		BarrierAfterMerge:        phaseBarrier(opts.BarrierAfterMerge),
+		AfterRepoComplete:        opts.AfterRepoComplete,
+		CrashInjector:            opts.CrashInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			writerPtr.Store(w)
 		},

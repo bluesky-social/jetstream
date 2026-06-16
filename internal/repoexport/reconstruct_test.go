@@ -4,10 +4,12 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream-v2/internal/manifest"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos/cbor"
@@ -16,6 +18,117 @@ import (
 )
 
 const testDID = "did:plc:repoexport"
+
+// manifestSelector adapts a real *manifest.Manifest to repoexport.Selector,
+// mirroring the production adapter in jetstreamd. Tests use a real manifest
+// (not a hand-rolled fake) so reconstruction is exercised end-to-end:
+// real resident blooms -> real segment decode -> real MST root.
+type manifestSelector struct{ m *manifest.Manifest }
+
+func (s manifestSelector) SelectBlocksForDID(did string) ([]BlockSelection, error) {
+	sel, err := s.m.SelectBlocksForDID(did)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]BlockSelection, len(sel))
+	for i := range sel {
+		out[i] = BlockSelection{Path: sel[i].Path, Blocks: sel[i].Blocks}
+	}
+	return out, nil
+}
+
+func (s manifestSelector) ActiveSegmentPaths() ([]string, error) {
+	return s.m.ActiveSegmentPaths()
+}
+
+// openSelector opens a manifest over dataDir/segments and returns it adapted
+// to repoexport.Selector. The manifest is the single in-memory cache the
+// production /status path uses; reconstruction never re-scans segments/.
+func openSelector(t *testing.T, dataDir string) Selector {
+	t.Helper()
+	segmentsDir := filepath.Join(dataDir, "segments")
+	// Production MkdirAll's the segments dir before opening the manifest
+	// (jetstreamd runtime); mirror that so an account with no on-disk
+	// segments still yields a usable (empty) selector.
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	m, err := manifest.Open(manifest.Options{
+		SegmentsDir: segmentsDir,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	return manifestSelector{m: m}
+}
+
+// TestReconstruct_CoversSealedActiveAndPending is the central correctness
+// test for the manifest-backed path. A DID's records are spread across all
+// three regions that exist at steady state:
+//   - r1: in a SEALED segment (resident in the manifest, selected by bloom)
+//   - r2: in the ACTIVE segment's flushed-but-unsealed block (NOT in the
+//     manifest and NOT in SnapshotPending -- the gap a manifest-only
+//     implementation would silently drop)
+//   - r3: in the live writer's in-memory pending block (PendingEvents)
+//
+// All three must appear in the reconstructed root, or /status would report
+// a spurious mismatch.
+func TestReconstruct_CoversSealedActiveAndPending(t *testing.T) {
+	t.Parallel()
+
+	dataDir, st := newTestDataDir(t)
+	segmentsDir := filepath.Join(dataDir, "segments")
+
+	r1 := createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1"))
+	r2 := createEvent(testDID, "app.bsky.feed.like", "r2", "rev2", payload("2"))
+	r3 := createEvent(testDID, "app.bsky.feed.post", "r3", "rev3", payload("3"))
+
+	// Seal r1 into segment 0, then leave r2 in segment 1 as a flushed but
+	// unsealed (active) block.
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       segmentsDir,
+		Store:             st,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	ev1 := r1
+	require.NoError(t, w.Append(t.Context(), &ev1))
+	require.NoError(t, w.SealActiveAndClose())
+
+	w2, err := ingest.Open(ingest.Config{
+		SegmentsDir:       segmentsDir,
+		Store:             st,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	ev2 := r2
+	require.NoError(t, w2.Append(t.Context(), &ev2))
+	require.NoError(t, w2.Flush(t.Context())) // flush block to active seg, do NOT seal
+	require.NoError(t, w2.Close())
+
+	wantRoot, wantCount := expectedRoot(t, []segment.Event{r1, r2, r3})
+	got, err := Reconstruct(context.Background(), Config{
+		DataDir:       dataDir,
+		DID:           testDID,
+		Selector:      openSelector(t, dataDir),
+		PendingEvents: []segment.Event{r3},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "rev3", got.LatestRev)
+	require.Equal(t, wantRoot, got.Root)
+	require.Equal(t, wantCount, got.RecordCount)
+}
+
+func TestReconstruct_RequiresSelector(t *testing.T) {
+	t.Parallel()
+
+	_, err := Reconstruct(context.Background(), Config{
+		DataDir: t.TempDir(),
+		DID:     testDID,
+	})
+	require.ErrorContains(t, err, "Selector is required")
+}
 
 func TestReconstruct_CreateOnlyBuildsExpectedRoot(t *testing.T) {
 	t.Parallel()
@@ -32,8 +145,9 @@ func TestReconstruct_CreateOnlyBuildsExpectedRoot(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, append(archive, live...))
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir: dataDir,
-		DID:     testDID,
+		DataDir:  dataDir,
+		DID:      testDID,
+		Selector: openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, testDID, got.DID)
@@ -62,8 +176,9 @@ func TestReconstruct_LiveSegmentsSkipEventsAtOrBeforePrimaryWatermark(t *testing
 	}
 	wantRoot, wantCount := expectedRoot(t, wantEvents)
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir: dataDir,
-		DID:     testDID,
+		DataDir:  dataDir,
+		DID:      testDID,
+		Selector: openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, "3l6", got.LatestRev)
@@ -94,8 +209,9 @@ func TestReconstruct_UpdateReplacesRecordCID(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, events)
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir: dataDir,
-		DID:     testDID,
+		DataDir:  dataDir,
+		DID:      testDID,
+		Selector: openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, "rev2", got.LatestRev)
@@ -127,8 +243,9 @@ func TestReconstruct_BlocksExcludeStaleRecordPayloads(t *testing.T) {
 	writeSegmentTree(t, st, filepath.Join(dataDir, "segments"), events)
 
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir: dataDir,
-		DID:     testDID,
+		DataDir:  dataDir,
+		DID:      testDID,
+		Selector: openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 
@@ -159,8 +276,9 @@ func TestReconstruct_DeleteRemovesRecord(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, events)
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir: dataDir,
-		DID:     testDID,
+		DataDir:  dataDir,
+		DID:      testDID,
+		Selector: openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, "rev3", got.LatestRev)
@@ -185,8 +303,9 @@ func TestReconstruct_IgnoresOtherDIDsAndNonCommitEvents(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, []segment.Event{matching})
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir: dataDir,
-		DID:     testDID,
+		DataDir:  dataDir,
+		DID:      testDID,
+		Selector: openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, "rev1", got.LatestRev)
@@ -203,14 +322,17 @@ func TestReconstruct_MissingDIDReturnsErrNoLocalRepo(t *testing.T) {
 	})
 
 	_, err := Reconstruct(context.Background(), Config{
-		DataDir: dataDir,
-		DID:     testDID,
+		DataDir:  dataDir,
+		DID:      testDID,
+		Selector: openSelector(t, dataDir),
 	})
 	require.ErrorIs(t, err, ErrNoLocalRepo)
 
+	emptyDir := t.TempDir()
 	_, err = Reconstruct(context.Background(), Config{
-		DataDir: t.TempDir(),
-		DID:     testDID,
+		DataDir:  emptyDir,
+		DID:      testDID,
+		Selector: openSelector(t, emptyDir),
 	})
 	require.ErrorIs(t, err, ErrNoLocalRepo)
 }
@@ -226,8 +348,9 @@ func TestReconstruct_ActiveSegmentUsesWalkActive(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, events)
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir: dataDir,
-		DID:     testDID,
+		DataDir:  dataDir,
+		DID:      testDID,
+		Selector: openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, "rev1", got.LatestRev)
@@ -257,6 +380,7 @@ func TestReconstruct_IncludesPendingWriterEvents(t *testing.T) {
 	got, err := Reconstruct(context.Background(), Config{
 		DataDir:       dataDir,
 		DID:           testDID,
+		Selector:      openSelector(t, dataDir),
 		PendingEvents: pending,
 	})
 	require.NoError(t, err)
@@ -291,6 +415,7 @@ func TestReconstruct_PendingEventsFilterByDIDAndKind(t *testing.T) {
 	got, err := Reconstruct(context.Background(), Config{
 		DataDir:       dataDir,
 		DID:           testDID,
+		Selector:      openSelector(t, dataDir),
 		PendingEvents: pending,
 	})
 	require.NoError(t, err)
@@ -307,6 +432,9 @@ func TestReconstruct_ValidatesConfig(t *testing.T) {
 
 	_, err = Reconstruct(context.Background(), Config{DataDir: t.TempDir()})
 	require.ErrorContains(t, err, "DID is required")
+
+	_, err = Reconstruct(context.Background(), Config{DataDir: t.TempDir(), DID: testDID})
+	require.ErrorContains(t, err, "Selector is required")
 }
 
 func newTestDataDir(t *testing.T) (string, *store.Store) {

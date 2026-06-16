@@ -21,19 +21,58 @@ import (
 // events exist for the requested DID.
 var ErrNoLocalRepo = errors.New("repoexport: no local commit events for DID")
 
+// BlockSelection identifies, for one sealed segment, the blocks that may
+// contain the requested DID. Path locates the file; Blocks holds ascending
+// block indices into the segment's on-disk block array.
+type BlockSelection struct {
+	Path   string
+	Blocks []int
+}
+
+// Selector is the bloom-pruning front door reconstruction uses instead of
+// scanning every segment file. The production implementation is backed by
+// the in-memory manifest, which already holds every sealed segment's DID
+// blooms resident -- so pruning happens entirely in memory and only the
+// segments an account actually touches are opened.
+//
+// Keeping this an interface (rather than depending on *manifest.Manifest
+// directly) keeps repoexport decoupled from the manifest package and makes
+// the selection trivially fakeable in tests.
+type Selector interface {
+	// SelectBlocksForDID returns, for every sealed segment that may hold
+	// did, the candidate blocks within it. One-sided contract: no false
+	// negatives, possible false positives. Ascending by segment index.
+	SelectBlocksForDID(did string) ([]BlockSelection, error)
+
+	// ActiveSegmentPaths returns the seg_*.jss files not yet resident in
+	// the manifest -- the active (unsealed) segment plus any just-sealed
+	// file the manifest has not absorbed. Their flushed blocks are
+	// invisible to SelectBlocksForDID, so reconstruction scans them
+	// directly. Callers MUST query this BEFORE SelectBlocksForDID so a
+	// segment sealing mid-call is double-covered, never missed.
+	ActiveSegmentPaths() ([]string, error)
+}
+
 // Config controls local repo reconstruction.
 type Config struct {
 	DataDir string
 	DID     string
+
+	// Selector prunes which sealed segments/blocks to decode via the
+	// in-memory manifest blooms, and reports the active (unsealed)
+	// segment files that need a direct scan. Required: reconstruction is
+	// only invoked from the live /status path, which always has a
+	// manifest.
+	Selector Selector
 
 	// PendingEvents are events buffered in the live writer's in-memory
 	// pending block that have not yet been flushed to a segment file on
 	// disk. They are replayed after all on-disk segments so a record
 	// created moments ago (e.g. a like) is reflected in the snapshot
 	// immediately, rather than only after the next compaction-driven
-	// flush rotates the active segment. Optional; nil for offline
-	// reconstruction with no live writer. The slice is the caller's
-	// already-copied SnapshotPending() result and is not mutated.
+	// flush rotates the active segment. Optional; nil when no live writer
+	// is available. The slice is the caller's already-copied
+	// SnapshotPending() result and is not mutated.
 	PendingEvents []segment.Event
 }
 
@@ -46,14 +85,27 @@ type Snapshot struct {
 	Blocks      *mst.MemBlockStore
 }
 
-// Reconstruct replays local segment files and returns the current repo
-// snapshot for cfg.DID.
+// Reconstruct rebuilds cfg.DID's current repo snapshot from local storage.
+//
+// It replays, in seq/index-ascending order so the last-writer-wins rev
+// tracking matches a full scan:
+//  1. sealed segments, pruned to candidate blocks via cfg.Selector's
+//     in-memory manifest blooms (only the few segments the DID touches are
+//     opened and decoded);
+//  2. the active (unsealed) segment files, scanned directly because their
+//     flushed blocks are not yet resident in the manifest;
+//  3. backfill/live_segments, scanned directly (bootstrap-only; absent at
+//     steady state);
+//  4. the live writer's in-memory pending block (cfg.PendingEvents).
 func Reconstruct(ctx context.Context, cfg Config) (Snapshot, error) {
 	if cfg.DataDir == "" {
 		return Snapshot{}, errors.New("repoexport: DataDir is required")
 	}
 	if cfg.DID == "" {
 		return Snapshot{}, errors.New("repoexport: DID is required")
+	}
+	if cfg.Selector == nil {
+		return Snapshot{}, errors.New("repoexport: Selector is required")
 	}
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
@@ -64,18 +116,46 @@ func Reconstruct(ctx context.Context, cfg Config) (Snapshot, error) {
 		records: make(map[string][]byte),
 	}
 
-	if err := replayDir(ctx, filepath.Join(cfg.DataDir, "segments"), "", &state); err != nil {
-		return Snapshot{}, err
+	// Snapshot the active (unsealed) paths BEFORE asking the selector for
+	// sealed blocks. If a segment seals in the gap between the two calls it
+	// is then both reported active here AND resident in the selection --
+	// idempotent double-coverage. The reverse order could miss it in both,
+	// dropping records (the spurious-mismatch bug class).
+	activePaths, err := cfg.Selector.ActiveSegmentPaths()
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("repoexport: list active segments: %w", err)
 	}
+
+	selections, err := cfg.Selector.SelectBlocksForDID(cfg.DID)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("repoexport: select blocks: %w", err)
+	}
+	for _, sel := range selections {
+		if err := replaySelectedBlocks(ctx, sel, &state); err != nil {
+			return Snapshot{}, err
+		}
+	}
+
+	// Active segment files carry the newest sealed-tree revs; scan them
+	// after the sealed selection so ascending order is preserved.
+	for _, path := range activePaths {
+		if err := ctx.Err(); err != nil {
+			return Snapshot{}, err
+		}
+		if err := replayFile(ctx, path, "", &state); err != nil {
+			return Snapshot{}, err
+		}
+	}
+
 	primaryWatermark := state.latestRev
 	if err := replayDir(ctx, filepath.Join(cfg.DataDir, "backfill", "live_segments"), primaryWatermark, &state); err != nil {
 		return Snapshot{}, err
 	}
 
-	// Pending events live in the live writer's active segment, after every
-	// block already flushed to disk, so they carry the newest revs and need
-	// no watermark filter. replayEvents applies the same DID/kind filtering
-	// as the on-disk path.
+	// Pending events live in the live writer's active in-memory block,
+	// after every block already flushed to disk, so they carry the newest
+	// revs and need no watermark filter. replayEvents applies the same
+	// DID/kind filtering as the on-disk path.
 	if err := replayEvents(ctx, cfg.PendingEvents, "", &state); err != nil {
 		return Snapshot{}, err
 	}
@@ -96,6 +176,46 @@ func Reconstruct(ctx context.Context, cfg Config) (Snapshot, error) {
 		RecordCount: len(state.records),
 		Blocks:      blocks,
 	}, nil
+}
+
+// replaySelectedBlocks decodes only the selector-chosen blocks of one
+// sealed segment. The segment may have been compacted (and thus rewritten)
+// since the manifest snapshot, but compaction preserves block count and is
+// purely subtractive, so a stored block index never points past the file
+// and never yields a false negative for the DID.
+func replaySelectedBlocks(ctx context.Context, sel BlockSelection, state *replayState) error {
+	if len(sel.Blocks) == 0 {
+		return nil
+	}
+	reader, err := segment.Open(segment.ReaderConfig{Path: sel.Path})
+	if err != nil {
+		// A segment selected from the manifest can race a seal/compaction
+		// rename. ErrActiveSegment means it is mid-rotation; the active-path
+		// scan covers it, so skip rather than fail the whole reconstruction.
+		if errors.Is(err, segment.ErrActiveSegment) {
+			return nil
+		}
+		return fmt.Errorf("repoexport: open segment %s: %w", sel.Path, err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	blockCount := len(reader.Blocks())
+	for _, i := range sel.Blocks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if i < 0 || i >= blockCount {
+			continue
+		}
+		events, err := reader.DecodeBlock(i)
+		if err != nil {
+			return fmt.Errorf("repoexport: decode block %d in %s: %w", i, sel.Path, err)
+		}
+		if err := replayEvents(ctx, events, "", state); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type replayState struct {
@@ -140,7 +260,17 @@ func replayFile(ctx context.Context, path, watermark string, state *replayState)
 		}
 	}()
 
-	for i := range reader.Blocks() {
+	// Prune by DID before decoding. A full-network segment holds events
+	// for every DID on the network; without this, reconstructing one
+	// account would zstd-decompress and decode the entire archive and
+	// then discard nearly every event in replayEvent's DID filter. The
+	// bloom-backed selection has no false negatives, so every block that
+	// actually holds state.did is still decoded.
+	selected, err := reader.BlocksContainingDID(state.did)
+	if err != nil {
+		return fmt.Errorf("repoexport: select blocks in %s: %w", path, err)
+	}
+	for _, i := range selected {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

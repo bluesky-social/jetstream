@@ -4,8 +4,8 @@
 #
 # Usage:
 #   testing/mutation/run.sh                 # run every mutant
-#   testing/mutation/run.sh m007            # run one mutant (filename prefix match)
-#   testing/mutation/run.sh m007 --seeds 5  # stress sweep over 5 random seeds
+#   testing/mutation/run.sh m019            # run one mutant (filename prefix match)
+#   testing/mutation/run.sh m002 --seeds 5  # stress sweep over 5 random seeds
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
