@@ -553,6 +553,64 @@ func TestFlush_InvokesOnAfterFlushHook(t *testing.T) {
 	require.Equal(t, int32(2), calls.Load())
 }
 
+// TestAppendBatch_DurableCommitNotAbortedByCanceledContext pins the contract
+// that a post-fsync durability commit must run to completion even when the
+// caller's context is cancelled. The sync flush path threads the engine's
+// (cancellable) run context all the way into the per-block durable commit; when
+// the backfill MaxRepos limit trips and cancels that context, a concurrent
+// worker that happens to fill a block must NOT have its already-fsynced block's
+// metadata commit turned into a spurious "on_durable_batch: context canceled"
+// error (which the handler escalates to a fatal run abort). This matches the
+// async flush path, which commits durable batches under context.Background().
+func TestAppendBatch_DurableCommitNotAbortedByCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var hookCtxErr error
+	var hookCalls int
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 1, // every append fills a block -> durable commit
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, _ uint64, _ bool) (func(), func(error), error) {
+			hookCalls++
+			// Mirror the completion batcher's leading guard: a cancelled
+			// context here would abort the post-fsync durable commit.
+			if err := ctx.Err(); err != nil {
+				hookCtxErr = err
+				return nil, nil, err
+			}
+			return nil, nil, b.Set([]byte("durable/ok"), []byte("yes"), nil)
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the run was cancelled (e.g. MaxRepos tripped) before this flush
+
+	err = w.AppendBatch(ctx, []segment.Event{
+		{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "1"},
+	})
+	require.NoError(t, err, "a post-fsync durable commit must not be aborted by a cancelled context")
+	require.NoError(t, hookCtxErr, "OnDurableBatch must not observe a cancelled context")
+	require.Equal(t, 1, hookCalls)
+
+	got, closer, err := st.Get([]byte("durable/ok"))
+	require.NoError(t, err)
+	require.Equal(t, "yes", string(got))
+	require.NoError(t, closer.Close())
+
+	persisted, err := loadNextSeq(st, w.cfg.SeqKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), persisted)
+}
+
 func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 	t.Parallel()
 

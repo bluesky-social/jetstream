@@ -711,6 +711,17 @@ func stageNextSeq(b *pebble.Batch, key string, v uint64) error {
 }
 
 func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force bool) error {
+	// The block this commit describes is already fsynced by the time we get
+	// here (flushBlockLocked / commitAsyncFlush / the drain paths all flush
+	// first). The durable metadata commit must therefore run to completion
+	// regardless of caller cancellation: aborting now would leave seq/next and
+	// any OnDurableBatch metadata (e.g. queued repo completions) behind durable
+	// segment data, and would surface a benign run-cancel (backfill MaxRepos,
+	// graceful shutdown) as a spurious fatal "on_durable_batch: context
+	// canceled". WithoutCancel keeps trace/span lineage while detaching
+	// cancellation, matching the async path's context.Background() intent.
+	ctx = context.WithoutCancel(ctx)
+
 	b := w.cfg.Store.NewBatch()
 	defer func() { _ = b.Close() }()
 
