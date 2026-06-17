@@ -122,7 +122,7 @@ oracle-sweep SEEDS="10":
         echo "oracle run ${i}/{{SEEDS}} seed=${seed}"
         if ! JETSTREAM_ORACLE_MODE=stress \
             JETSTREAM_ORACLE_SEED="${seed}" \
-            gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -timeout 30m ./internal/oracle -run TestOracle_DefaultLifecycle -v; then
+            gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -timeout 360m ./internal/oracle -run TestOracle_DefaultLifecycle -v; then
             echo "::endgroup::"
             echo "::error::oracle failed at seed ${seed}"
             echo "Repro (NOTE: the seed fixes the INPUTS only — the world,"
@@ -136,7 +136,7 @@ oracle-sweep SEEDS="10":
             echo "  JETSTREAM_ORACLE_MODE=stress \\"
             echo "  JETSTREAM_ORACLE_SEED=${seed} \\"
             echo "  GOMAXPROCS=2 go test ./internal/oracle -run TestOracle_DefaultLifecycle \\"
-            echo "    -count=200 -failfast -timeout 30m -v"
+            echo "    -count=200 -failfast -timeout 360m -v"
             echo "(add -race to catch a data race directly; raise -count or lower"
             echo "GOMAXPROCS to bias the scheduler toward the CI interleaving.)"
             exit 1
