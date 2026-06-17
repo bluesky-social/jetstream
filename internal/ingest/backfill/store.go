@@ -73,6 +73,13 @@ func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEnt
 		st = atmosbackfill.StateComplete
 	case StatusFailed:
 		st = atmosbackfill.StateFailed
+	case StatusUnavailable:
+		// Terminal, non-retryable: atmos has no dedicated state for
+		// "exists but unfetchable", so we project to StateComplete,
+		// which is the only Lookup result that makes the engine skip
+		// re-dispatch (engine.reconcile). The distinct lifecycle is
+		// preserved on disk via Backfill.Status for diagnostics.
+		st = atmosbackfill.StateComplete
 	default:
 		return atmosbackfill.StoreEntry{}, fmt.Errorf("backfill: lookup %s: unknown status %q", did, rs.Backfill.Status)
 	}
@@ -173,6 +180,8 @@ func countBucket(c *Counts, st Status) *uint64 {
 		return &c.Complete
 	case StatusFailed:
 		return &c.Failed
+	case StatusUnavailable:
+		return &c.Unavailable
 	default:
 		return nil
 	}
@@ -516,6 +525,22 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attemp
 		rs.Backfill.LastError = ""
 		rs.Backfill.Attempts = 0
 		rs.Backfill.CompletedAt = now
+		rs.LastAttemptedAt = now
+		return s.putRepoStatusAndCounts(did, rs, hadRow, old, func(hs *HostStatus) {
+			hs.LastAttemptedAt = now
+		})
+	}
+	if isRepoUnavailableError(failErr) {
+		// The account exists but its repo is deactivated/suspended/
+		// taken down. This is a terminal upstream state, not a download
+		// failure: record it as unavailable so the engine stops
+		// retrying (Lookup -> StateComplete) and dashboards don't count
+		// it as a failed host. Clear LastError/Attempts so a row that
+		// previously failed for another reason doesn't carry a stale
+		// diagnostic into its terminal state.
+		rs.Backfill.Status = StatusUnavailable
+		rs.Backfill.LastError = ""
+		rs.Backfill.Attempts = 0
 		rs.LastAttemptedAt = now
 		return s.putRepoStatusAndCounts(did, rs, hadRow, old, func(hs *HostStatus) {
 			hs.LastAttemptedAt = now

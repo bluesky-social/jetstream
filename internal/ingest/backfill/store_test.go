@@ -51,6 +51,7 @@ func TestStore_Lookup_StatusMapping(t *testing.T) {
 		{"not_started -> Discovered", StatusNotStarted, atmosbackfill.StateDiscovered},
 		{"complete -> Complete", StatusComplete, atmosbackfill.StateComplete},
 		{"failed -> Failed", StatusFailed, atmosbackfill.StateFailed},
+		{"unavailable -> Complete", StatusUnavailable, atmosbackfill.StateComplete},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -365,6 +366,62 @@ func TestStore_OnFail_RepoNotFoundCompletesWithoutError(t *testing.T) {
 	require.Empty(t, hs.LatestError)
 	require.Empty(t, hs.ErrorClassCounts)
 	require.Empty(t, hs.RecentErrors)
+}
+
+func TestStore_OnFail_RepoUnavailableIsTerminalNotFailed(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"RepoDeactivated", "RepoSuspended", "RepoTakendown"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s := newTestStore(t)
+			ctx := context.Background()
+			did := atmos.DID("did:plc:gone")
+
+			require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{
+				DID: did, Active: true,
+			}))
+			require.NoError(t, s.recordIdentityResolution(ctx, did, IdentityResolution{
+				PDS:  "https://pds.example.com",
+				Host: "pds.example.com",
+			}))
+
+			failErr := &xrpc.Error{
+				StatusCode: 400,
+				Name:       name,
+				Message:    "Repo has been " + name + ": did:plc:gone",
+			}
+			require.NoError(t, s.OnFail(ctx, did, failErr, 1))
+
+			// atmos must skip re-dispatch: unavailable projects to StateComplete.
+			got, err := s.Lookup(ctx, did)
+			require.NoError(t, err)
+			require.Equal(t, atmosbackfill.StateComplete, got.State)
+
+			rs, err := s.readRepoStatus(did)
+			require.NoError(t, err)
+			require.Equal(t, StatusUnavailable, rs.Backfill.Status)
+			require.Empty(t, rs.Backfill.LastError)
+			require.Equal(t, 0, rs.Backfill.Attempts)
+
+			// Counts: tracked under Unavailable, never Failed or Complete.
+			counts, ok, err := LoadCounts(s.db)
+			require.NoError(t, err)
+			require.True(t, ok)
+			require.Equal(t, Counts{Total: 1, Unavailable: 1}, counts)
+
+			// Host buckets: not a failed host, no error sample pollution.
+			hs, ok, err := loadHostStatus(s.db, "pds.example.com")
+			require.NoError(t, err)
+			require.True(t, ok)
+			require.Equal(t, uint64(1), hs.Total)
+			require.Equal(t, uint64(1), hs.Unavailable)
+			require.Equal(t, uint64(0), hs.Failed)
+			require.Equal(t, uint64(0), hs.Complete)
+			require.Empty(t, hs.LatestError)
+			require.Empty(t, hs.ErrorClassCounts)
+			require.Empty(t, hs.RecentErrors)
+		})
+	}
 }
 
 // TestStore_OnComplete_ClearsLastError is the symmetric partner to

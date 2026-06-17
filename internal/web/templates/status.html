@@ -202,6 +202,7 @@ document.addEventListener("input", function (event) {
           <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
           <dt>Downloaded</dt><dd>{{humanInt .Backfill.Complete}} repos</dd>
           <dt>Errored</dt><dd>{{humanInt .Backfill.Failed}} repos</dd>
+          <dt>Unavailable</dt><dd>{{humanInt .Backfill.Unavailable}} repos</dd>
           {{template "backfillDuration" .}}
           <dt>listRepos cursor</dt><dd class="cursor">{{.Backfill.ListReposCursor}}</dd>
         </dl>
@@ -210,6 +211,7 @@ document.addEventListener("input", function (event) {
           <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
           <dt>Downloaded</dt><dd>{{humanInt .Backfill.Complete}} repos</dd>
           <dt>Errored</dt><dd>{{humanInt .Backfill.Failed}} repos</dd>
+          <dt>Unavailable</dt><dd>{{humanInt .Backfill.Unavailable}} repos</dd>
           {{template "backfillDuration" .}}
         </dl>
       {{end}}
@@ -329,11 +331,11 @@ document.addEventListener("input", function (event) {
   <div class="table-wrap">
   <table class="status-table" id="hosts-table">
     <colgroup>
-      <col class="host-col"><col class="count-col"><col class="count-col"><col class="count-col"><col class="count-col"><col class="time-col"><col>
+      <col class="host-col"><col class="count-col"><col class="count-col"><col class="count-col"><col class="count-col"><col class="count-col"><col class="time-col"><col>
     </colgroup>
     <thead>
       <tr>
-        <th>Host</th><th class="num">Repos</th><th class="num">Active</th><th class="num">Complete</th><th class="num">Failed</th><th>Last attempt</th><th>Error</th>
+        <th>Host</th><th class="num">Repos</th><th class="num">Active</th><th class="num">Complete</th><th class="num">Failed</th><th class="num">Unavailable</th><th>Last attempt</th><th>Error</th>
       </tr>
     </thead>
     <tbody>
@@ -344,6 +346,7 @@ document.addEventListener("input", function (event) {
         <td class="num">{{humanInt .Active}}</td>
         <td class="num">{{humanInt .Complete}}</td>
         <td class="num">{{humanInt .Failed}}</td>
+        <td class="num">{{humanInt .Unavailable}}</td>
         <td>{{relativeTime .LastAttemptedAt $.Now}}</td>
         <td class="wide">
           {{if .RecentErrors}}

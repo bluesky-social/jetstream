@@ -11,10 +11,11 @@ import (
 
 // Counts is the per-status row count produced by CountStatuses.
 type Counts struct {
-	Total      uint64 `json:"total"`
-	Discovered uint64 `json:"discovered"`
-	Complete   uint64 `json:"complete"`
-	Failed     uint64 `json:"failed"`
+	Total       uint64 `json:"total"`
+	Discovered  uint64 `json:"discovered"`
+	Complete    uint64 `json:"complete"`
+	Failed      uint64 `json:"failed"`
+	Unavailable uint64 `json:"unavailable"`
 }
 
 const countsKey = "backfill/counts"
@@ -69,7 +70,7 @@ func SaveCounts(s *store.Store, c Counts) error {
 }
 
 // CountStatuses range-scans the repo/ keyspace and tallies rows by
-// Backfill.Status. Total is the sum of the three buckets plus any
+// Backfill.Status. Total is the sum of the status buckets plus any
 // rows whose status doesn't decode to a recognized value (those are
 // counted under Total but not under any bucket; surfacing the
 // mismatch via Total != sum is intentional).
@@ -111,6 +112,8 @@ func CountStatuses(s *store.Store) (Counts, error) {
 			c.Complete++
 		case StatusFailed:
 			c.Failed++
+		case StatusUnavailable:
+			c.Unavailable++
 		}
 	}
 	if err := it.Error(); err != nil {

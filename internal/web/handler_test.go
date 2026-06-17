@@ -54,7 +54,7 @@ func newFixtureSnap() *status.Snapshot {
 			PhaseEnteredAt: time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
 		},
 		Backfill: status.BackfillStats{
-			TotalDIDs: 100, Discovered: 10, Complete: 80, Failed: 10,
+			TotalDIDs: 100, Discovered: 10, Complete: 80, Failed: 10, Unavailable: 5,
 			PercentComplete: 80.0,
 			ListReposCursor: "<script>alert('xss')</script>",
 			StartedAt:       time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC),
@@ -183,6 +183,8 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "80 repos")
 	require.Contains(t, body, "Errored")
 	require.Contains(t, body, "10 repos")
+	require.Contains(t, body, "Unavailable")
+	require.Contains(t, body, "5 repos")
 	require.Contains(t, body, "Duration")
 	require.Contains(t, body, "3d 7h")
 	require.Contains(t, body, "Latest segment")
@@ -242,6 +244,7 @@ func TestHandler_RendersBackfillingState(t *testing.T) {
 	require.Contains(t, body, "80 repos")
 	require.Contains(t, body, "Errored")
 	require.Contains(t, body, "10 repos")
+	require.Contains(t, body, "Unavailable")
 	require.NotContains(t, body, "enumerating repos")
 }
 

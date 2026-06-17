@@ -230,8 +230,30 @@ func isRepoNotFoundError(err error) bool {
 	return errors.As(err, &xerr) && xerr.Name == "RepoNotFound"
 }
 
+// isRepoUnavailableError reports whether err is a terminal "the account
+// exists but its repo can't be fetched" signal from getRepo. These are
+// the non-RepoNotFound members of the com.atproto.sync.getRepo error
+// set: the account was deactivated, suspended, or taken down. They are
+// not download failures — the upstream deliberately has no repo to
+// serve — so they must not be retried or counted as failed hosts.
+//
+// RepoNotFound is intentionally excluded; it keeps its own dedicated
+// StatusComplete handling in OnFail.
+func isRepoUnavailableError(err error) bool {
+	var xerr *xrpc.Error
+	if !errors.As(err, &xerr) {
+		return false
+	}
+	switch xerr.Name {
+	case "RepoDeactivated", "RepoSuspended", "RepoTakendown":
+		return true
+	default:
+		return false
+	}
+}
+
 func shouldLogBackfillError(err error) bool {
-	return !isRepoNotFoundError(err)
+	return !isRepoNotFoundError(err) && !isRepoUnavailableError(err)
 }
 
 func truncateErrorString(s string) string {
@@ -275,6 +297,8 @@ func hostStatusBucket(h *HostStatus, st Status) *uint64 {
 		return &h.Complete
 	case StatusFailed:
 		return &h.Failed
+	case StatusUnavailable:
+		return &h.Unavailable
 	default:
 		return nil
 	}

@@ -28,6 +28,14 @@ const (
 	StatusNotStarted Status = "not_started"
 	StatusComplete   Status = "complete"
 	StatusFailed     Status = "failed"
+	// StatusUnavailable is a terminal, non-failure state: the account
+	// exists but its repo cannot be fetched (deactivated, suspended, or
+	// taken down per com.atproto.sync.getRepo). Unlike StatusFailed it
+	// is never retried — Lookup projects it to atmos StateComplete so
+	// the engine skips re-dispatch — and it is tracked separately from
+	// StatusComplete so dashboards don't conflate "downloaded" with
+	// "nothing to download".
+	StatusUnavailable Status = "unavailable"
 )
 
 // RepoBackfillStatus tracks initial-backfill state per DESIGN.md §3.5.
@@ -102,6 +110,7 @@ type HostStatus struct {
 	NotStarted       uint64                `json:"not_started"`
 	Complete         uint64                `json:"complete"`
 	Failed           uint64                `json:"failed"`
+	Unavailable      uint64                `json:"unavailable"`
 	LastAttemptedAt  time.Time             `json:"last_attempted_at,omitzero"`
 	LatestError      string                `json:"latest_error,omitempty"`
 	LatestErrorClass ErrorClass            `json:"latest_error_class,omitempty"`

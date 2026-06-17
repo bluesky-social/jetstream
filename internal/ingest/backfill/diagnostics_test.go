@@ -70,6 +70,26 @@ func TestIsRepoNotFoundError(t *testing.T) {
 	require.True(t, shouldLogBackfillError(&xrpc.Error{StatusCode: 400, Name: "InvalidRequest"}))
 }
 
+func TestIsRepoUnavailableError(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"RepoDeactivated", "RepoSuspended", "RepoTakendown"} {
+		xerr := &xrpc.Error{StatusCode: 400, Name: name, Message: "Repo has been " + name}
+		require.Truef(t, isRepoUnavailableError(xerr), "%s should be unavailable", name)
+		require.Truef(t, isRepoUnavailableError(fmt.Errorf("wrapped: %w", xerr)), "%s wrapped should be unavailable", name)
+		require.Falsef(t, shouldLogBackfillError(xerr), "%s should not be logged as a failure", name)
+	}
+
+	// RepoNotFound keeps its own dedicated handling and is not folded
+	// into the unavailable bucket.
+	require.False(t, isRepoUnavailableError(&xrpc.Error{StatusCode: 400, Name: "RepoNotFound"}))
+	// Genuine failures and string-only errors are not unavailable.
+	require.False(t, isRepoUnavailableError(&xrpc.Error{StatusCode: 400, Name: "InvalidRequest"}))
+	require.False(t, isRepoUnavailableError(errors.New("xrpc 400 RepoDeactivated: text only")))
+	require.False(t, isRepoUnavailableError(nil))
+	require.True(t, shouldLogBackfillError(&xrpc.Error{StatusCode: 400, Name: "InvalidRequest"}))
+}
+
 func TestHostStatus_AddErrorSampleKeepsLatestFive(t *testing.T) {
 	t.Parallel()
 
