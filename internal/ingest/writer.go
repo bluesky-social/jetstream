@@ -186,7 +186,7 @@ func (w *Writer) Close() error {
 	if err := w.active.Close(); err != nil {
 		return fmt.Errorf("ingest: close active segment: %w", err)
 	}
-	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
 	}
 	return nil
@@ -233,7 +233,7 @@ func (w *Writer) SealActiveAndClose() error {
 		}
 		return fmt.Errorf("ingest: seal active segment: %w", err)
 	}
-	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
 	}
 	sealedIdx := w.activeIdx
@@ -444,6 +444,20 @@ func (w *Writer) DrainDurability(ctx context.Context) error {
 		return w.drainAsync(ctx)
 	}
 	return w.drainSync(ctx)
+}
+
+// SetDurableBatchHook installs or replaces the metadata hook invoked when the
+// writer commits durable block metadata. Backfill Run owns this hook for the
+// backfill writer and intentionally replaces any prior hook. Callers should
+// wire this before starting producers.
+func (w *Writer) SetDurableBatchHook(h DurableBatchHook) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.cfg.OnDurableBatch = h
+}
+
+func (w *Writer) commitTerminalDurableBatchLocked() error {
+	return w.commitDurableBatchLocked(context.Background(), w.nextSeq, true)
 }
 
 // flushAndRotateLocked is the post-Append durability commit. The

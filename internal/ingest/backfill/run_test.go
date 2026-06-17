@@ -1077,7 +1077,7 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 		"two repos × 1 record each = 2 events; max seq must be at least 1")
 }
 
-func TestRun_WriterFlushErrorAbortsWithoutMarkingRepoFailed(t *testing.T) {
+func TestRun_WriterFlushErrorAbortsAfterDurableCompletion(t *testing.T) {
 	t.Parallel()
 
 	did := atmos.DID("did:plc:flush-fails")
@@ -1129,8 +1129,8 @@ func TestRun_WriterFlushErrorAbortsWithoutMarkingRepoFailed(t *testing.T) {
 
 	got, err := NewStore(db, nil).Lookup(t.Context(), did)
 	require.NoError(t, err)
-	require.Equal(t, atmosbackfill.StateDiscovered, got.State,
-		"local writer durability errors must abort the run, not become a per-DID failure")
+	require.Equal(t, atmosbackfill.StateComplete, got.State,
+		"completion is committed in the same durable batch before legacy OnAfterFlush runs")
 }
 
 func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {

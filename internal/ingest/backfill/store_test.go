@@ -12,6 +12,8 @@ import (
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -196,6 +198,8 @@ func TestStore_OnUpdate_MissingRow(t *testing.T) {
 func TestStore_OnComplete_WritesComplete(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	s.metrics = metrics
 	did := atmos.DID("did:plc:done")
 
 	require.NoError(t, s.OnDiscover(context.Background(), atmossync.ListReposEntry{
@@ -215,6 +219,76 @@ func TestStore_OnComplete_WritesComplete(t *testing.T) {
 	require.Equal(t, "rev-final", rs.Rev)
 	require.False(t, rs.Backfill.CompletedAt.IsZero())
 	require.False(t, rs.UpdatedAt.IsZero())
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.Completed), 0)
+}
+
+func TestStore_OnCompleteQueuesWhenBatcherConfigured(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	metrics := NewMetrics(prometheus.NewRegistry())
+	s := NewStore(st, metrics)
+	cb := NewCompletionBatcher(s, metrics)
+	s.SetCompletionBatcher(cb)
+
+	ctx := t.Context()
+	did := atmos.DID("did:plc:queued-complete")
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+
+	var hookRan bool
+	s.afterComplete = func(ctx context.Context, got atmos.DID) error {
+		require.Equal(t, did, got)
+		requireLookupState(t, s, got, atmosbackfill.StateComplete)
+		hookRan = true
+		return nil
+	}
+
+	cb.RecordWatermark(did, 41, true)
+	require.NoError(t, s.OnComplete(ctx, did, &repo.Commit{DID: string(did), Rev: "rev-queued"}))
+	requireLookupState(t, s, did, atmosbackfill.StateDiscovered)
+	require.False(t, hookRan, "afterComplete must wait for durable completion commit")
+	require.InDelta(t, 0.0, testutil.ToFloat64(metrics.Completed), 0)
+	require.Len(t, cb.queued, 1)
+
+	b := st.NewBatch()
+	afterCommit, afterDone, err := cb.StageDurable(ctx, b, 42, false)
+	require.NoError(t, err)
+	require.NotNil(t, afterCommit)
+	require.NotNil(t, afterDone)
+
+	commitErr := st.Commit(b, store.SyncWrites)
+	if commitErr != nil {
+		afterDone(commitErr)
+		require.NoError(t, commitErr)
+	}
+	afterCommit()
+	afterDone(nil)
+	require.NoError(t, b.Close())
+
+	requireLookupState(t, s, did, atmosbackfill.StateComplete)
+	require.True(t, hookRan)
+	require.Empty(t, cb.queued)
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.Completed), 0)
+}
+
+func TestStore_OnCompleteWithBatcherRequiresWatermark(t *testing.T) {
+	t.Parallel()
+
+	s := newTestStore(t)
+	cb := NewCompletionBatcher(s, nil)
+	s.SetCompletionBatcher(cb)
+
+	ctx := t.Context()
+	did := atmos.DID("did:plc:queued-missing-watermark")
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+
+	err := s.OnComplete(ctx, did, &repo.Commit{DID: string(did), Rev: "rev-missing"})
+	require.ErrorContains(t, err, "missing watermark")
+	requireLookupState(t, s, did, atmosbackfill.StateDiscovered)
+	require.Empty(t, cb.queued)
 }
 
 func TestStore_OnCompleteRunsHookAfterDurableRow(t *testing.T) {

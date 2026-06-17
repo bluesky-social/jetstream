@@ -37,6 +37,7 @@ type Store struct {
 	afterCompleteError func(error)
 	crashInjector      crashpoint.Injector
 	countsMu           sync.Mutex
+	completions        *completionBatcher
 }
 
 // Compile-time guarantee that Store satisfies the atmos contract.
@@ -46,6 +47,13 @@ var _ atmosbackfill.Store = (*Store)(nil)
 // metrics may be nil; callbacks are no-ops in that case.
 func NewStore(db *store.Store, metrics *Metrics) *Store {
 	return &Store{db: db, metrics: metrics}
+}
+
+// SetCompletionBatcher defers OnComplete writes into writer durable metadata
+// batches. It is intended for construction-time wiring before the backfill
+// engine starts.
+func (s *Store) SetCompletionBatcher(b *completionBatcher) {
+	s.completions = b
 }
 
 // Lookup reads repo/<did> and projects the on-disk RepoStatus into
@@ -329,7 +337,28 @@ func (s *Store) stageCompleteBatch(ctx context.Context, batch *pebble.Batch, com
 			return fail(err)
 		}
 	}
-	return unlock, nil
+	return func(commitErr error) {
+		unlock(commitErr)
+		if commitErr != nil {
+			return
+		}
+		for _, c := range completions {
+			if err := s.simulateCrash(ctx, crashpoint.AfterRepoComplete); err != nil {
+				if s.afterCompleteError != nil {
+					s.afterCompleteError(fmt.Errorf("backfill: after repo complete crashpoint %s: %w", c.did, err))
+				}
+				continue
+			}
+			if s.afterComplete != nil {
+				if err := s.afterComplete(ctx, c.did); err != nil {
+					err = fmt.Errorf("backfill: after complete hook %s: %w", c.did, err)
+					if s.afterCompleteError != nil {
+						s.afterCompleteError(err)
+					}
+				}
+			}
+		}
+	}, nil
 }
 
 func applyCountTransition(c *Counts, hadRow bool, old, next Status) {
@@ -610,6 +639,10 @@ func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) erro
 // survives. The read, aggregate transition, and durable write must
 // stay serialized with deferred completion staging via countsMu.
 func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Commit) error {
+	if s.completions != nil {
+		return s.completions.QueueComplete(ctx, did, commit)
+	}
+
 	now := timeNow()
 	if err := s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
 		rs.Backfill.Status = StatusComplete

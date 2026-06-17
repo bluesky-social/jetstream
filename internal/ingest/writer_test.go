@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
@@ -567,7 +568,9 @@ func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 		MaxEventsPerBlock: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
-			require.False(t, force)
+			if force {
+				return nil, nil, nil
+			}
 			hookSeq = nextSeq
 			return nil, nil, b.Set([]byte("hook/ran"), []byte("yes"), nil)
 		},
@@ -971,6 +974,183 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 	}))
 	require.Len(t, gotEvents, 1)
 	require.Equal(t, uint64(0), gotEvents[0].Seq)
+}
+
+func TestDurableBatchClose_RunsAfterPendingEvents(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	type durableCall struct {
+		nextSeq uint64
+		force   bool
+	}
+	calls := make(chan durableCall, 1)
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 64,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+			calls <- durableCall{nextSeq: nextSeq, force: force}
+			return nil, nil, b.Set([]byte("metadata/close"), []byte("ok"), nil)
+		},
+	})
+	require.NoError(t, err)
+
+	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:close"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.NoError(t, w.Close())
+
+	require.Equal(t, durableCall{nextSeq: 1, force: true}, requireDurableCall(t, calls))
+	got, closer, err := st.Get([]byte("metadata/close"))
+	require.NoError(t, err)
+	require.Equal(t, "ok", string(got))
+	require.NoError(t, closer.Close())
+	persisted, err := loadNextSeq(st, seqNextKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), persisted)
+}
+
+func TestSealActiveAndClose_RunsDurableBatchHookAfterPendingEvents(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	type durableCall struct {
+		nextSeq uint64
+		force   bool
+	}
+	calls := make(chan durableCall, 1)
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 64,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+			calls <- durableCall{nextSeq: nextSeq, force: force}
+			return nil, nil, b.Set([]byte("metadata/seal-close"), []byte("ok"), nil)
+		},
+	})
+	require.NoError(t, err)
+
+	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:seal-close"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.NoError(t, w.SealActiveAndClose())
+
+	require.Equal(t, durableCall{nextSeq: 1, force: true}, requireDurableCall(t, calls))
+	got, closer, err := st.Get([]byte("metadata/seal-close"))
+	require.NoError(t, err)
+	require.Equal(t, "ok", string(got))
+	require.NoError(t, closer.Close())
+	ins, err := segment.Inspect(filepath.Join(dir, "segments", SegmentFilename(0)))
+	require.NoError(t, err)
+	require.True(t, ins.Sealed)
+	require.Equal(t, uint64(1), ins.TotalEvents)
+}
+
+func TestWriter_DurableBatchAsyncCloseRunsAfterPendingEvents(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	type durableCall struct {
+		nextSeq uint64
+		force   bool
+	}
+	calls := make(chan durableCall, 2)
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 64,
+		AsyncFlushWorkers: 2,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+			calls <- durableCall{nextSeq: nextSeq, force: force}
+			key := fmt.Sprintf("metadata/async-close/%t", force)
+			return nil, nil, b.Set([]byte(key), []byte("ok"), nil)
+		},
+	})
+	require.NoError(t, err)
+
+	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:async-close"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.NoError(t, w.Close())
+
+	gotCalls := []durableCall{requireDurableCall(t, calls), requireDurableCall(t, calls)}
+	require.ElementsMatch(t, []durableCall{
+		{nextSeq: 1, force: false},
+		{nextSeq: 1, force: true},
+	}, gotCalls)
+	for _, key := range []string{"metadata/async-close/false", "metadata/async-close/true"} {
+		got, closer, err := st.Get([]byte(key))
+		require.NoError(t, err)
+		require.Equal(t, "ok", string(got))
+		require.NoError(t, closer.Close())
+	}
+}
+
+func TestWriter_AsyncSealActiveAndCloseRunsDurableBatchHookAfterPendingEvents(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	type durableCall struct {
+		nextSeq uint64
+		force   bool
+	}
+	calls := make(chan durableCall, 2)
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 64,
+		AsyncFlushWorkers: 2,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+			calls <- durableCall{nextSeq: nextSeq, force: force}
+			key := fmt.Sprintf("metadata/async-seal-close/%t", force)
+			return nil, nil, b.Set([]byte(key), []byte("ok"), nil)
+		},
+	})
+	require.NoError(t, err)
+
+	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:async-seal-close"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.NoError(t, w.SealActiveAndClose())
+
+	gotCalls := []durableCall{requireDurableCall(t, calls), requireDurableCall(t, calls)}
+	require.ElementsMatch(t, []durableCall{
+		{nextSeq: 1, force: false},
+		{nextSeq: 1, force: true},
+	}, gotCalls)
+	ins, err := segment.Inspect(filepath.Join(dir, "segments", SegmentFilename(0)))
+	require.NoError(t, err)
+	require.True(t, ins.Sealed)
+}
+
+func requireDurableCall[T any](t *testing.T, calls <-chan T) T {
+	t.Helper()
+
+	select {
+	case got := <-calls:
+		return got
+	case <-time.After(time.Second):
+		require.Fail(t, "durable hook did not run")
+		var zero T
+		return zero
+	}
 }
 
 // TestForceRotate_FlushedButUnsealedRotates: events already flushed to

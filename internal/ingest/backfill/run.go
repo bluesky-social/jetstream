@@ -146,11 +146,25 @@ func Run(ctx context.Context, cfg Config) error {
 			defer fatalMu.Unlock()
 			return fatalErr
 		}
+		drainDurability := func() error {
+			if err := cfg.Writer.DrainDurability(ctx); err != nil {
+				return fmt.Errorf("backfill: drain durable completions: %w", err)
+			}
+			if fatal := loadFatal(); fatal != nil {
+				logger := cfg.Logger.With(slog.String("component", "backfill/run"))
+				logger.ErrorContext(ctx, "backfill aborted during durable completion drain", "err", fatal)
+				return fmt.Errorf("backfill: %w", fatal)
+			}
+			return nil
+		}
 
 		st := NewStore(cfg.Store, cfg.Metrics)
 		st.afterComplete = cfg.AfterRepoComplete
 		st.afterCompleteError = recordFatal
 		st.crashInjector = cfg.CrashInjector
+		completions := NewCompletionBatcher(st, cfg.Metrics)
+		st.SetCompletionBatcher(completions)
+		cfg.Writer.SetDurableBatchHook(completions.StageDurable)
 		directory := directoryWithRecordingResolver(cfg.Directory, st, recordFatal)
 
 		sc := atmossync.NewClient(atmossync.Options{
@@ -160,6 +174,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 		handler.onWriterError = recordFatal
+		handler.SetCompletionBatcher(completions)
 		logger := cfg.Logger.With(slog.String("component", "backfill/run"))
 
 		if len(cfg.BackfillRepos) > 0 {
@@ -203,7 +218,7 @@ func Run(ctx context.Context, cfg Config) error {
 				logger.ErrorContext(ctx, "selected repo backfill aborted after local writer error", "err", fatal)
 				return fmt.Errorf("backfill: %w", fatal)
 			}
-			return nil
+			return drainDurability()
 		}
 
 		startCursor, err := LoadListReposCursor(cfg.Store)
@@ -293,7 +308,7 @@ func Run(ctx context.Context, cfg Config) error {
 			// so the orchestrator advances to merge.
 			if limitTripped.Load() && errors.Is(err, context.Canceled) && ctx.Err() == nil {
 				logger.InfoContext(ctx, "engine drained early via max-backfill-repos")
-				return nil
+				return drainDurability()
 			}
 			logger.ErrorContext(ctx, "engine returned error", "err", err)
 			return fmt.Errorf("backfill: %w", err)
@@ -304,7 +319,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		logger.InfoContext(ctx, "engine drained")
-		return nil
+		return drainDurability()
 	})
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
 	"github.com/jcalabro/atmos"
+	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/mst"
@@ -91,34 +92,131 @@ func TestSegmentHandler_EmitsOneEventPerRecord(t *testing.T) {
 		"one record yields exactly one event")
 }
 
-func TestSegmentHandler_HandleRepoFlushesBeforeReturning(t *testing.T) {
+func TestSegmentHandler_HandleRepoQueuesCompletionWithoutFlush(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	st, err := store.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
+	bs := NewStore(st, nil)
 
 	segmentsDir := filepath.Join(dir, "segments")
+	cb := NewCompletionBatcher(bs, nil)
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       segmentsDir,
 		Store:             st,
 		MaxEventsPerBlock: 4096,
+		OnDurableBatch:    cb.StageDurable,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	did := atmos.DID("did:plc:flush-before-complete")
+	did := atmos.DID("did:plc:no-flush-before-complete")
+	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
+	bs.SetCompletionBatcher(cb)
+
 	r, commit := buildSingleRecordRepo(t,
 		did, "app.bsky.feed.post", "rkey1",
-		map[string]any{"text": "flush before complete"})
+		map[string]any{"text": "completion is tied to durable block metadata"})
 	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h.SetCompletionBatcher(cb)
 
 	require.NoError(t, h.HandleRepo(t.Context(), did, r, commit))
 
 	events := collectActiveEvents(t, filepath.Join(segmentsDir, ingest.SegmentFilename(0)))
-	require.Len(t, events, 1, "HandleRepo must flush appended rows before returning to the engine")
+	require.Empty(t, events, "HandleRepo must not force a per-repo segment flush")
+	require.Equal(t, completionWatermark{lastSeq: 0, appended: true}, cb.watermarks[did])
+
+	require.NoError(t, bs.OnComplete(t.Context(), did, commit))
+	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
+	require.Len(t, cb.queued, 1)
+
+	require.NoError(t, w.DrainDurability(t.Context()))
+	requireLookupState(t, bs, did, atmosbackfill.StateComplete)
+	require.Empty(t, cb.queued)
+}
+
+func TestSegmentHandler_HandleEmptyRepoRecordsEmptyWatermark(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	bs := NewStore(st, nil)
+	cb := NewCompletionBatcher(bs, nil)
+
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 4096,
+		OnDurableBatch:    cb.StageDurable,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	did := atmos.DID("did:plc:empty-repo")
+	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
+	bs.SetCompletionBatcher(cb)
+
+	blockStore := mst.NewMemBlockStore()
+	r := &atmosrepo.Repo{
+		DID:   did,
+		Store: blockStore,
+		Tree:  mst.NewTree(blockStore),
+	}
+	commit := &atmosrepo.Commit{DID: string(did), Rev: "rev-empty"}
+	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h.SetCompletionBatcher(cb)
+
+	require.NoError(t, h.HandleRepo(t.Context(), did, r, commit))
+	require.Equal(t, completionWatermark{lastSeq: 0, appended: false}, cb.watermarks[did])
+
+	require.NoError(t, bs.OnComplete(t.Context(), did, commit))
+	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
+	require.NoError(t, w.DrainDurability(t.Context()))
+	requireLookupState(t, bs, did, atmosbackfill.StateComplete)
+}
+
+func TestSegmentHandler_QueuedCompletionBecomesDurableOnWriterClose(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	bs := NewStore(st, nil)
+	cb := NewCompletionBatcher(bs, nil)
+
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 4096,
+		OnDurableBatch:    cb.StageDurable,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	did := atmos.DID("did:plc:complete-on-close")
+	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
+	bs.SetCompletionBatcher(cb)
+
+	r, commit := buildSingleRecordRepo(t,
+		did, "app.bsky.feed.post", "rkey1",
+		map[string]any{"text": "completion should be durable on close"})
+	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h.SetCompletionBatcher(cb)
+
+	require.NoError(t, h.HandleRepo(t.Context(), did, r, commit))
+	require.NoError(t, bs.OnComplete(t.Context(), did, commit))
+	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
+
+	require.NoError(t, w.Close())
+	requireLookupState(t, bs, did, atmosbackfill.StateComplete)
+	require.Empty(t, cb.queued)
 }
 
 func TestSegmentHandler_DropsRecordThatExceedsSegmentColumnWidth(t *testing.T) {

@@ -211,14 +211,13 @@ func (w *Writer) closeAsync() error {
 		return flushErr
 	}
 	closeErr := w.active.Close()
-	saveErr := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq)
 	if flushErr != nil {
 		return flushErr
 	}
 	if closeErr != nil {
 		return fmt.Errorf("ingest: close active segment: %w", closeErr)
 	}
-	return saveErr
+	return w.commitTerminalDurableBatchLocked()
 }
 
 func (w *Writer) sealActiveAndCloseAsync() error {
@@ -248,7 +247,7 @@ func (w *Writer) sealActiveAndCloseAsync() error {
 		}
 		return fmt.Errorf("ingest: seal active segment: %w", err)
 	}
-	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
 	}
 	sealedIdx := w.activeIdx
