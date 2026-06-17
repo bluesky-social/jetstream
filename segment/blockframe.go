@@ -22,9 +22,24 @@ func ReadBlockFrame(r io.ReaderAt, hdr Header, idx int) ([]byte, error) {
 		return nil, fmt.Errorf("%w: idx %d, block_count %d",
 			ErrBlockOutOfRange, idx, hdr.BlockCount)
 	}
+	if hdr.FooterOffset < uint64(ReservedHeaderBytes) {
+		return nil, fmt.Errorf("%w: footer_offset %d < reserved header",
+			ErrInvalidFooter, hdr.FooterOffset)
+	}
+	if hdr.BlockIndexOffset != hdr.FooterOffset {
+		return nil, fmt.Errorf("%w: block_index_offset %d != footer_offset %d",
+			ErrInvalidFooter, hdr.BlockIndexOffset, hdr.FooterOffset)
+	}
+
+	const maxInt64 = uint64(1<<63 - 1)
+	entryDelta := uint64(idx) * blockIndexEntrySize
+	if hdr.BlockIndexOffset > maxInt64 || entryDelta > maxInt64-hdr.BlockIndexOffset {
+		return nil, fmt.Errorf("%w: block %d index entry offset overflows int64",
+			ErrInvalidFooter, idx)
+	}
 
 	entry := make([]byte, blockIndexEntrySize)
-	entryOff := int64(hdr.BlockIndexOffset) + int64(idx)*blockIndexEntrySize
+	entryOff := int64(hdr.BlockIndexOffset + entryDelta)
 	if _, err := r.ReadAt(entry, entryOff); err != nil {
 		return nil, fmt.Errorf("segment: read block %d index entry: %w", idx, err)
 	}
@@ -37,6 +52,10 @@ func ReadBlockFrame(r io.ReaderAt, hdr Header, idx int) ([]byte, error) {
 	if uint64(compressedSize) > hdr.FooterOffset {
 		return nil, fmt.Errorf("%w: block %d compressed_size %d > footer_offset %d",
 			ErrInvalidBlockIndex, idx, compressedSize, hdr.FooterOffset)
+	}
+	if offset > hdr.FooterOffset-8 || uint64(compressedSize) > hdr.FooterOffset-offset-8 {
+		return nil, fmt.Errorf("%w: block %d range overflows or exceeds footer",
+			ErrInvalidBlockIndex, idx)
 	}
 	end := offset + 8 + uint64(compressedSize)
 	if offset < uint64(ReservedHeaderBytes) || end > hdr.FooterOffset {

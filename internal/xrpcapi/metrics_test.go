@@ -8,11 +8,15 @@ import (
 )
 
 func TestMetrics_NilSafe(t *testing.T) {
+	t.Parallel()
+
 	var m *Metrics
 	require.NotPanics(t, func() { m.observeServe(resultOK, 123, 0.001) })
 }
 
 func TestMetrics_ObserveServe(t *testing.T) {
+	t.Parallel()
+
 	reg := prometheus.NewRegistry()
 	m := NewMetrics(reg)
 	m.observeServe(resultOK, 100, 0.002)

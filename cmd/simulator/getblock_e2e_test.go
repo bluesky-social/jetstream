@@ -23,6 +23,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func getForTest(t *testing.T, ctx context.Context, url string) (*http.Response, error) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	require.NoError(t, err)
+	return http.DefaultClient.Do(req)
+}
+
 // TestEndToEnd_GetBlockMatchesOracle is the headline correctness test for the
 // getBlock endpoint. It boots the simulator, spawns jetstream as a subprocess
 // pointed at it, lets ingest drain to steady-state and seal at least one
@@ -151,7 +158,9 @@ func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 		} `json:"segments"`
 	}
 	require.Eventually(t, func() bool {
-		resp, err := http.Get(listURL)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		resp, err := getForTest(t, ctx, listURL)
 		if err != nil {
 			return false
 		}
@@ -200,7 +209,7 @@ func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 			url := fmt.Sprintf("http://%s/xrpc/network.bsky.jetstream.getBlock?segment=%s&blockIndex=%d",
 				jetAddr, seg.Name, idx)
 
-			resp, err := http.Get(url)
+			resp, err := getForTest(t, t.Context(), url)
 			require.NoErrorf(t, err, "%s block %d GET", seg.Name, idx)
 			require.Equalf(t, http.StatusOK, resp.StatusCode, "%s block %d status", seg.Name, idx)
 
@@ -224,7 +233,7 @@ func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 				etag, "%s block %d etag", seg.Name, idx)
 
 			// (4) second request with If-None-Match -> 304.
-			req, err := http.NewRequest(http.MethodGet, url, nil)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
 			require.NoError(t, err)
 			req.Header.Set("If-None-Match", etag)
 			resp2, err := http.DefaultClient.Do(req)
@@ -235,7 +244,7 @@ func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 		}
 
 		// Negative: blockIndex == blockCount -> 404 BlockNotFound.
-		nf, err := http.Get(fmt.Sprintf(
+		nf, err := getForTest(t, t.Context(), fmt.Sprintf(
 			"http://%s/xrpc/network.bsky.jetstream.getBlock?segment=%s&blockIndex=%d",
 			jetAddr, seg.Name, blockCount))
 		require.NoError(t, err)
@@ -250,7 +259,7 @@ func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 	// Negative: a well-formed but absent segment name -> 404 SegmentNotFound.
 	// seg_9999999999.jss parses as a valid segment index (so it passes the
 	// ParseSegmentIndex bad-request gate) but no such segment exists.
-	unknown, err := http.Get("http://" + jetAddr +
+	unknown, err := getForTest(t, t.Context(), "http://"+jetAddr+
 		"/xrpc/network.bsky.jetstream.getBlock?segment=seg_9999999999.jss&blockIndex=0")
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, unknown.StatusCode)

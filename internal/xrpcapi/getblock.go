@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -36,7 +37,7 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 	start := time.Now()
 	var span trace.Span
 	if h.tracer != nil {
-		ctx, span = h.tracer.Start(ctx, "getBlock")
+		_, span = h.tracer.Start(ctx, "getBlock")
 		defer span.End()
 	}
 	result := resultError
@@ -46,6 +47,8 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 	fail := func(res string, err error) error {
 		result = res
 		if span != nil {
+			span.SetAttributes(attribute.String("result", res))
+			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 		}
 		return err
@@ -115,16 +118,66 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(hdr.Checksum)+":"+fmt.Sprint(blockIdx)))
 	w.Header().Set("Cache-Control", cacheControlHeader(h.cacheMaxAge))
 
-	result = resultOK
-	served = len(frame)
 	if span != nil {
-		span.SetAttributes(attribute.Int("block.compressed_size", served))
-		span.SetStatus(codes.Ok, "")
+		span.SetAttributes(attribute.Int("block.compressed_size", len(frame)))
 	}
 
 	// ServeContent handles If-None-Match->304, Range, and Content-Length. After
 	// this point the response may be partially written, so per the Handler
 	// contract we return nil.
-	http.ServeContent(w, r.HTTPReq, name, ref.ModTime, bytes.NewReader(frame))
+	rec := &blockResponseRecorder{ResponseWriter: w}
+	http.ServeContent(rec, r.HTTPReq, name, ref.ModTime, bytes.NewReader(frame))
+	result = resultOK
+	if rec.status >= http.StatusBadRequest {
+		result = resultError
+	}
+	if rec.status == http.StatusOK {
+		served = rec.bytes
+	}
+	if span != nil {
+		span.SetAttributes(attribute.String("result", result))
+		if result == resultOK {
+			span.SetStatus(codes.Ok, "")
+		} else {
+			span.SetStatus(codes.Error, fmt.Sprintf("http status %d", rec.status))
+		}
+	}
 	return nil
+}
+
+type blockResponseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *blockResponseRecorder) WriteHeader(code int) {
+	if r.status != 0 {
+		return
+	}
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *blockResponseRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += n
+	return n, err
+}
+
+func (r *blockResponseRecorder) ReadFrom(src io.Reader) (int64, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	if rf, ok := r.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(src)
+		r.bytes += int(n)
+		return n, err
+	}
+	n, err := io.Copy(r.ResponseWriter, src)
+	r.bytes += int(n)
+	return n, err
 }
