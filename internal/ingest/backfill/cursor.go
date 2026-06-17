@@ -10,24 +10,13 @@
 //
 // # Persistence semantics
 //
-// SaveListReposCursor uses pebble.Sync, same as the per-DID write
-// path. atmos calls our save callback after every listRepos page
-// boundary, so the cost is one fsync per ~1000 DIDs (the protocol's
-// page cap). Cheap relative to repo download.
-//
-// # Known durability hole
-//
-// atmos fires OnPageComplete after a page's eligible jobs are
-// queued onto the worker channel — workers may still be downloading.
-// On a process kill mid-page-flush, those workers' DIDs stay at
-// StateDiscovered. The next Run starts at the saved cursor (page
-// N+1) and never re-walks page N, so those DIDs are stuck until a
-// future cursor-less Run rediscovers them.
-//
-// This is acceptable for now: a future "rewalk" subcommand can
-// clear the cursor to force a full re-enumeration. In practice the
-// hole only bites if every subsequent Run also dies in the same
-// way, which would have bigger problems than orphaned DIDs.
+// Run checkpoints this cursor from atmos's OnBatchComplete callback. atmos
+// fires that callback after the batch has been fully reconciled and
+// every eligible repo in the batch has reached a terminal state for
+// this run. Before checkpointing, Run drains writer durability so
+// queued repo completions and their segment data are durably visible.
+// The checkpoint uses pebble.Sync, so a successful callback means the
+// cursor advance is durable too.
 package backfill
 
 import (
@@ -60,12 +49,35 @@ func LoadListReposCursor(db *store.Store) (string, error) {
 	return out, nil
 }
 
-// SaveListReposCursor durably persists the cursor for resume. Used as
-// the body of atmos's OnPageComplete callback; the synchronous fsync
-// guarantees a crash after the page completes can't lose the advance.
+// SaveListReposCursor durably persists the cursor for resume. Run
+// calls it from atmos's OnBatchComplete callback only after the writer
+// durability drain succeeds, so the cursor cannot outrun queued repo
+// completions from the completed batch.
 func SaveListReposCursor(db *store.Store, cursor string) error {
 	if err := db.Set([]byte(listReposCursorKey), []byte(cursor), store.SyncWrites); err != nil {
 		return fmt.Errorf("backfill: save list_repos_cursor: %w", err)
+	}
+	return nil
+}
+
+// SaveListReposCheckpoint atomically persists the relay resume cursor
+// and, when non-empty, the bootstrap-last cursor. These two keys are
+// one logical checkpoint during Run: the relay cursor must not advance
+// independently of the bootstrap cursor the merge phase will use.
+func SaveListReposCheckpoint(db *store.Store, relayCursor, bootstrapCursor string) error {
+	batch := db.NewBatch()
+	defer func() { _ = batch.Close() }()
+
+	if err := batch.Set([]byte(listReposCursorKey), []byte(relayCursor), nil); err != nil {
+		return fmt.Errorf("backfill: stage list_repos_cursor: %w", err)
+	}
+	if bootstrapCursor != "" {
+		if err := batch.Set([]byte(bootstrapLastListReposCursorKey), []byte(bootstrapCursor), nil); err != nil {
+			return fmt.Errorf("backfill: stage bootstrap_last_listrepos_cursor: %w", err)
+		}
+	}
+	if err := db.Commit(batch, store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: save list_repos checkpoint: %w", err)
 	}
 	return nil
 }
@@ -100,10 +112,9 @@ func LoadBootstrapLastListReposCursor(db *store.Store) (string, error) {
 
 // MaybeSaveBootstrapLastListReposCursor writes cursor under
 // bootstrapLastListReposCursorKey via pebble.Sync iff cursor != "".
-// The empty-cursor short-circuit is the entire point: atmos's
-// OnPageComplete fires on every page including the post-drain
-// terminator, and we must not overwrite the last meaningful cursor
-// with the relay's "I'm done" empty value.
+// The empty-cursor short-circuit is the entire point: atmos's final
+// OnBatchComplete fires with the relay's "I'm done" empty value, and
+// we must not overwrite the last meaningful cursor with it.
 func MaybeSaveBootstrapLastListReposCursor(db *store.Store, cursor string) error {
 	if cursor == "" {
 		return nil

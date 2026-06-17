@@ -241,6 +241,10 @@ type stubServer struct {
 	// in pages of this size. Cursor is the first DID of the next page,
 	// or "" when drained.
 	listReposPageSize int
+
+	// emptyListReposCursor, when non-empty, makes listRepos return an empty
+	// terminal page for that cursor. This models resuming after the final DID.
+	emptyListReposCursor string
 }
 
 func newStubServer(t *testing.T, fixtures map[atmos.DID]repoFixture) *stubServer {
@@ -267,12 +271,17 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 	case "/xrpc/com.atproto.sync.listRepos":
 		s.listReposHit.Add(1)
 		s.recordEvent("listRepos")
+		cursor := r.URL.Query().Get("cursor")
 		s.firstListReposCursorMu.Lock()
 		if !s.firstListReposCursorOK {
-			s.firstListReposCursor = r.URL.Query().Get("cursor")
+			s.firstListReposCursor = cursor
 			s.firstListReposCursorOK = true
 		}
 		s.firstListReposCursorMu.Unlock()
+		if s.emptyListReposCursor != "" && cursor == s.emptyListReposCursor {
+			_ = json.NewEncoder(w).Encode(listPage{})
+			return
+		}
 		// Stable order so tests that count fail-vs-not are deterministic.
 		dids := make([]atmos.DID, 0, len(s.fixtures))
 		for did := range s.fixtures {
@@ -283,7 +292,6 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 		page := listPage{}
 		if s.listReposPageSize > 0 {
 			// Paginated mode: cursor is the first DID of this page.
-			cursor := r.URL.Query().Get("cursor")
 			startIdx := 0
 			if cursor != "" {
 				// Find where this cursor starts in the sorted DID list.
@@ -884,7 +892,7 @@ func TestRun_Resume_NoOpAfterCompletion(t *testing.T) {
 // TestRun_PersistsCursorAfterDrain confirms the post-drain cursor
 // (empty string) is durably saved to pebble. Following the existing
 // HappyPath: after Run returns, the cursor key exists in pebble with
-// value "" — atmos fires OnPageComplete("") after the terminator
+// value "" — atmos fires OnBatchComplete("") after the terminator
 // page. Without this assertion, the cursor optimization could
 // silently no-op.
 func TestRun_PersistsCursorAfterDrain(t *testing.T) {
@@ -1014,6 +1022,28 @@ func TestRun_PassesSavedCursorToRelay(t *testing.T) {
 		"first listRepos request must use the pre-seeded cursor as startCursor")
 }
 
+func TestRun_ClearsSavedCursorWhenResumeDrainsNoRepos(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:aaa")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+	srv.emptyListReposCursor = "after-last-did"
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	require.NoError(t, SaveListReposCursor(db, "after-last-did"))
+
+	require.NoError(t, runWithStub(t, t.Context(), srv, db))
+
+	got, err := LoadListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "", got, "full clean drain must clear stale non-empty resume cursor")
+	require.Equal(t, int64(0), srv.getRepoHit.Load(), "empty resumed listRepos must not download repos")
+}
+
 // TestRun_WritesSegmentFile confirms that backfilling a non-empty
 // fixture leaves a real seg_*.jss on disk with at least one event.
 func TestRun_WritesSegmentFile(t *testing.T) {
@@ -1136,9 +1166,12 @@ func TestRun_WriterFlushErrorAbortsAfterDurableCompletion(t *testing.T) {
 func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {
 	t.Parallel()
 
-	did := atmos.DID("did:plc:after-complete-fails")
-	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
-	srv := newStubServer(t, fixtures)
+	dids := []atmos.DID{"did:plc:after-complete-fails", "did:plc:after-complete-next"}
+	fixtures := make(map[atmos.DID]repoFixture, len(dids))
+	for _, did := range dids {
+		fixtures[did] = buildRepoFixture(t, did)
+	}
+	srv := newPaginatingStubServer(t, fixtures, 1)
 
 	dataDir := t.TempDir()
 	db, err := store.Open(dataDir, nil)
@@ -1182,6 +1215,25 @@ func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {
 		},
 	})
 	require.ErrorIs(t, err, errHook)
+
+	got, err := NewStore(db, nil).Lookup(t.Context(), dids[0])
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateComplete, got.State,
+		"completion row is durable before the hook failure is surfaced")
+
+	_, closer, err := db.Get([]byte(listReposCursorKey))
+	if closer != nil {
+		require.NoError(t, closer.Close())
+	}
+	require.ErrorIs(t, err, store.ErrNotFound,
+		"listRepos cursor must not advance past a failed durable completion hook")
+
+	_, closer, err = db.Get([]byte(bootstrapLastListReposCursorKey))
+	if closer != nil {
+		require.NoError(t, closer.Close())
+	}
+	require.ErrorIs(t, err, store.ErrNotFound,
+		"bootstrap-last cursor must not advance past a failed durable completion hook")
 }
 
 // TestRun_PersistsBootstrapLastListReposCursor confirms the bootstrap-
