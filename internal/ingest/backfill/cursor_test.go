@@ -59,7 +59,7 @@ func TestSaveListReposCursor_Overwrites(t *testing.T) {
 }
 
 // TestSaveListReposCursor_EmptyValue covers the post-drain state:
-// atmos fires OnPageComplete("") after the final page. We must
+// atmos fires OnBatchComplete("") after the final batch. We must
 // accept the empty string as a valid value, not treat it as a
 // missing-row error. Load afterwards returns "" — the same as
 // fresh-startup, which is the right semantic (next Run starts from
@@ -115,4 +115,54 @@ func TestBootstrapLastListReposCursor_Delete(t *testing.T) {
 	got, err := LoadBootstrapLastListReposCursor(db)
 	require.NoError(t, err)
 	require.Equal(t, "", got)
+}
+
+func TestSaveListReposCheckpoint_WritesBothKeys(t *testing.T) {
+	t.Parallel()
+	db := newCursorTestStore(t)
+
+	require.NoError(t, SaveListReposCheckpoint(db, "relay-page-2", "bootstrap-page-2"))
+
+	relay, err := LoadListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "relay-page-2", relay)
+
+	bootstrap, err := LoadBootstrapLastListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "bootstrap-page-2", bootstrap)
+}
+
+func TestSaveListReposCheckpoint_IgnoresEmptyBootstrapCursor(t *testing.T) {
+	t.Parallel()
+	db := newCursorTestStore(t)
+
+	require.NoError(t, MaybeSaveBootstrapLastListReposCursor(db, "existing-bootstrap"))
+
+	require.NoError(t, SaveListReposCheckpoint(db, "relay-page-3", ""))
+
+	relay, err := LoadListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "relay-page-3", relay)
+
+	bootstrap, err := LoadBootstrapLastListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "existing-bootstrap", bootstrap)
+}
+
+func TestSaveListReposCheckpoint_SavesEmptyRelayCursor(t *testing.T) {
+	t.Parallel()
+	db := newCursorTestStore(t)
+
+	require.NoError(t, SaveListReposCursor(db, "stale-relay"))
+	require.NoError(t, MaybeSaveBootstrapLastListReposCursor(db, "existing-bootstrap"))
+
+	require.NoError(t, SaveListReposCheckpoint(db, "", ""))
+
+	relay, err := LoadListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "", relay)
+
+	bootstrap, err := LoadBootstrapLastListReposCursor(db)
+	require.NoError(t, err)
+	require.Equal(t, "existing-bootstrap", bootstrap)
 }

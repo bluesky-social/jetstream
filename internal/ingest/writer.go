@@ -14,6 +14,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/cockroachdb/pebble"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -28,12 +29,17 @@ const seqNextKey = "seq/next"
 type Writer struct {
 	cfg Config
 
-	mu          sync.Mutex
-	active      *segment.Writer
-	activeBytes int64
-	activeIdx   uint64
-	nextSeq     uint64
-	closed      bool
+	// drainMu is an admission barrier for appends and explicit flushes. Acquire
+	// it before mu, and hold it through async job submission so DrainDurability
+	// can safely wait for all already-admitted jobs without racing future Add.
+	drainMu        sync.Mutex
+	mu             sync.Mutex
+	active         *segment.Writer
+	activeBytes    int64
+	activeIdx      uint64
+	nextSeq        uint64
+	durableNextSeq uint64
+	closed         bool
 
 	async            *asyncFlushPipeline
 	asyncPrepared    int
@@ -135,6 +141,7 @@ func Open(cfg Config) (*Writer, error) {
 		}
 	}
 	w.nextSeq = reconciled
+	w.durableNextSeq = reconciled
 
 	w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
@@ -179,7 +186,7 @@ func (w *Writer) Close() error {
 	if err := w.active.Close(); err != nil {
 		return fmt.Errorf("ingest: close active segment: %w", err)
 	}
-	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
 	}
 	return nil
@@ -226,7 +233,7 @@ func (w *Writer) SealActiveAndClose() error {
 		}
 		return fmt.Errorf("ingest: seal active segment: %w", err)
 	}
-	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
 	}
 	sealedIdx := w.activeIdx
@@ -243,15 +250,22 @@ func (w *Writer) SealActiveAndClose() error {
 // a phantom allocation. Goroutine-safe.
 func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	if w.async != nil {
+		w.drainMu.Lock()
 		w.mu.Lock()
 		job, err := w.appendLocked(ctx, ev)
 		w.mu.Unlock()
+		if err == nil {
+			w.submitAsyncFlushes([]*asyncFlushJob{job})
+		}
+		w.drainMu.Unlock()
 		if err != nil {
 			return err
 		}
-		return w.waitAsyncFlushes([]*asyncFlushJob{job})
+		return w.waitSubmittedAsyncFlushes([]*asyncFlushJob{job})
 	}
 
+	w.drainMu.Lock()
+	defer w.drainMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -269,6 +283,7 @@ func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error 
 		return nil
 	}
 
+	w.drainMu.Lock()
 	w.mu.Lock()
 	var jobs []*asyncFlushJob
 	var appendErr error
@@ -284,8 +299,10 @@ func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error 
 		}
 	}
 	w.mu.Unlock()
+	w.submitAsyncFlushes(jobs)
+	w.drainMu.Unlock()
 
-	flushErr := w.waitAsyncFlushes(jobs)
+	flushErr := w.waitSubmittedAsyncFlushes(jobs)
 	if appendErr != nil {
 		return appendErr
 	}
@@ -340,23 +357,36 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 // A no-op when nothing is buffered.
 func (w *Writer) Flush(ctx context.Context) error {
 	if w.async != nil {
-		w.mu.Lock()
-		if w.closed {
-			w.mu.Unlock()
-			return ErrClosed
+		w.drainMu.Lock()
+		job, err := w.prepareAsyncFlushForFlush()
+		if err == nil {
+			w.submitAsyncFlushes([]*asyncFlushJob{job})
 		}
-		if w.active == nil {
-			w.mu.Unlock()
-			return nil
-		}
-		job, err := w.prepareAsyncFlushLocked()
-		w.mu.Unlock()
+		w.drainMu.Unlock()
 		if err != nil {
 			return err
 		}
-		return w.waitAsyncFlushes([]*asyncFlushJob{job})
+		return w.waitSubmittedAsyncFlushes([]*asyncFlushJob{job})
 	}
 
+	w.drainMu.Lock()
+	defer w.drainMu.Unlock()
+	return w.flushSync(ctx)
+}
+
+func (w *Writer) prepareAsyncFlushForFlush() (*asyncFlushJob, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil, ErrClosed
+	}
+	if w.active == nil {
+		return nil, nil
+	}
+	return w.prepareAsyncFlushLocked()
+}
+
+func (w *Writer) flushSync(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -366,6 +396,68 @@ func (w *Writer) Flush(ctx context.Context) error {
 		return nil
 	}
 	return w.flushAndRotateLocked(ctx)
+}
+
+func (w *Writer) drainAsync(ctx context.Context) error {
+	job, err := w.prepareAsyncFlushForFlush()
+	if err != nil {
+		return err
+	}
+	w.submitAsyncFlushes([]*asyncFlushJob{job})
+	if err := w.waitSubmittedAsyncFlushes([]*asyncFlushJob{job}); err != nil {
+		return err
+	}
+	w.asyncJobs.Wait()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
+	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true)
+}
+
+func (w *Writer) drainSync(ctx context.Context) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
+	if w.active == nil {
+		return nil
+	}
+	if w.active.Pending() > 0 {
+		if err := w.flushAndRotateLocked(ctx); err != nil {
+			return err
+		}
+	}
+	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true)
+}
+
+// DrainDurability forces pending event-backed metadata to its block durability
+// point and commits metadata-only durable hooks even when no events are pending.
+func (w *Writer) DrainDurability(ctx context.Context) error {
+	w.drainMu.Lock()
+	defer w.drainMu.Unlock()
+
+	if w.async != nil {
+		return w.drainAsync(ctx)
+	}
+	return w.drainSync(ctx)
+}
+
+// SetDurableBatchHook installs or replaces the metadata hook invoked when the
+// writer commits durable block metadata. Backfill Run owns this hook for the
+// backfill writer and intentionally replaces any prior hook. Callers should
+// wire this before starting producers.
+func (w *Writer) SetDurableBatchHook(h DurableBatchHook) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.cfg.OnDurableBatch = h
+}
+
+func (w *Writer) commitTerminalDurableBatchLocked() error {
+	return w.commitDurableBatchLocked(context.Background(), w.nextSeq, true)
 }
 
 // flushAndRotateLocked is the post-Append durability commit. The
@@ -415,7 +507,7 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
 	}
 	w.cfg.Metrics.incBlocksFlushed()
 
-	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false); err != nil {
 		return err
 	}
 
@@ -605,6 +697,61 @@ func saveNextSeq(st *store.Store, key string, v uint64) error {
 	binary.LittleEndian.PutUint64(buf[:], v)
 	if err := st.Set([]byte(key), buf[:], store.SyncWrites); err != nil {
 		return fmt.Errorf("ingest: save %s: %w", key, err)
+	}
+	return nil
+}
+
+func stageNextSeq(b *pebble.Batch, key string, v uint64) error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], v)
+	if err := b.Set([]byte(key), buf[:], nil); err != nil {
+		return fmt.Errorf("ingest: stage %s: %w", key, err)
+	}
+	return nil
+}
+
+func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force bool) error {
+	// The block this commit describes is already fsynced by the time we get
+	// here (flushBlockLocked / commitAsyncFlush / the drain paths all flush
+	// first). The durable metadata commit must therefore run to completion
+	// regardless of caller cancellation: aborting now would leave seq/next and
+	// any OnDurableBatch metadata (e.g. queued repo completions) behind durable
+	// segment data, and would surface a benign run-cancel (backfill MaxRepos,
+	// graceful shutdown) as a spurious fatal "on_durable_batch: context
+	// canceled". WithoutCancel keeps trace/span lineage while detaching
+	// cancellation, matching the async path's context.Background() intent.
+	ctx = context.WithoutCancel(ctx)
+
+	b := w.cfg.Store.NewBatch()
+	defer func() { _ = b.Close() }()
+
+	if err := stageNextSeq(b, w.cfg.SeqKey, nextSeq); err != nil {
+		return err
+	}
+	var afterCommit func()
+	var afterDone func(error)
+	var commitErr error
+	if w.cfg.OnDurableBatch != nil {
+		cb, done, err := w.cfg.OnDurableBatch(ctx, b, nextSeq, force)
+		if err != nil {
+			return fmt.Errorf("ingest: on_durable_batch: %w", err)
+		}
+		afterCommit = cb
+		afterDone = done
+	}
+	defer func() {
+		if afterDone != nil {
+			afterDone(commitErr)
+		}
+	}()
+
+	commitErr = w.cfg.Store.Commit(b, store.SyncWrites)
+	if commitErr != nil {
+		return fmt.Errorf("ingest: commit durable batch: %w", commitErr)
+	}
+	w.durableNextSeq = nextSeq
+	if afterCommit != nil {
+		afterCommit()
 	}
 	return nil
 }

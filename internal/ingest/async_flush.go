@@ -120,14 +120,17 @@ func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
 	return job, nil
 }
 
-func (w *Writer) waitAsyncFlushes(jobs []*asyncFlushJob) error {
-	var firstErr error
+func (w *Writer) submitAsyncFlushes(jobs []*asyncFlushJob) {
 	for _, job := range jobs {
 		if job == nil {
 			continue
 		}
 		w.async.jobs <- job
 	}
+}
+
+func (w *Writer) waitSubmittedAsyncFlushes(jobs []*asyncFlushJob) error {
+	var firstErr error
 	for _, job := range jobs {
 		if job == nil {
 			continue
@@ -158,7 +161,7 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 		}
 		w.cfg.Metrics.incBlocksFlushed()
 
-		if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, job.nextSeq); err != nil {
+		if err := w.commitDurableBatchLocked(ctx, job.nextSeq, false); err != nil {
 			return err
 		}
 
@@ -180,19 +183,25 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 }
 
 func (w *Writer) closeAsync() error {
+	w.drainMu.Lock()
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
+		w.drainMu.Unlock()
 		return nil
 	}
 	job, err := w.prepareAsyncFlushLocked()
 	w.closed = true
 	w.mu.Unlock()
+	if err == nil {
+		w.submitAsyncFlushes([]*asyncFlushJob{job})
+	}
+	w.drainMu.Unlock()
 	if err != nil {
 		return err
 	}
 
-	flushErr := w.waitAsyncFlushes([]*asyncFlushJob{job})
+	flushErr := w.waitSubmittedAsyncFlushes([]*asyncFlushJob{job})
 	w.asyncJobs.Wait()
 	w.async.close()
 
@@ -202,14 +211,13 @@ func (w *Writer) closeAsync() error {
 		return flushErr
 	}
 	closeErr := w.active.Close()
-	saveErr := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq)
 	if flushErr != nil {
 		return flushErr
 	}
 	if closeErr != nil {
 		return fmt.Errorf("ingest: close active segment: %w", closeErr)
 	}
-	return saveErr
+	return w.commitTerminalDurableBatchLocked()
 }
 
 func (w *Writer) sealActiveAndCloseAsync() error {
@@ -239,7 +247,7 @@ func (w *Writer) sealActiveAndCloseAsync() error {
 		}
 		return fmt.Errorf("ingest: seal active segment: %w", err)
 	}
-	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
 	}
 	sealedIdx := w.activeIdx

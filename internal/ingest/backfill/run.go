@@ -71,10 +71,10 @@ type Config struct {
 	// counter and do not count.
 	//
 	// Intended for fast local-dev iteration against the production
-	// relay (millions of users); leave 0 in production. The persisted
-	// listRepos cursor will not advance past the page on which the
-	// limit trips, so subsequent runs without the flag re-walk from
-	// the same point.
+	// relay (millions of users); leave 0 in production. Cursor
+	// advancement remains batch/checkpoint-bound and may advance for a
+	// fully completed durable batch, but MaxRepos does not force
+	// terminal empty-cursor advancement.
 	MaxRepos int
 
 	// BackfillWorkers, when > 0, overrides atmos's repo download worker count.
@@ -146,11 +146,63 @@ func Run(ctx context.Context, cfg Config) error {
 			defer fatalMu.Unlock()
 			return fatalErr
 		}
+		drainDurability := func() error {
+			cfg.Metrics.incForcedCheckpointFlushes()
+			if err := cfg.Writer.DrainDurability(ctx); err != nil {
+				return fmt.Errorf("backfill: drain durable completions: %w", err)
+			}
+			if fatal := loadFatal(); fatal != nil {
+				logger := cfg.Logger.With(slog.String("component", "backfill/run"))
+				logger.ErrorContext(ctx, "backfill aborted during durable completion drain", "err", fatal)
+				return fmt.Errorf("backfill: %w", fatal)
+			}
+			return nil
+		}
+		var lastNonEmptyListReposCursor string
+		var batchCursorSaved bool
+		rememberPageCursor := func(cursor string) error {
+			if cursor != "" {
+				lastNonEmptyListReposCursor = cursor
+			}
+			return nil
+		}
+		saveBatchCursor := func(cursor string) error {
+			if err := drainDurability(); err != nil {
+				return err
+			}
+			// Persist the last non-empty cursor under a sibling key so the
+			// merge phase can resume listRepos to discover DIDs born during
+			// bootstrap. OnBatchComplete's final cursor can be empty even
+			// when its completed batch covered earlier non-empty pages, so
+			// OnPageComplete only records the latest candidate in memory;
+			// this callback is still the only durable persistence point.
+			bootstrapCursor := cursor
+			if bootstrapCursor == "" {
+				bootstrapCursor = lastNonEmptyListReposCursor
+			}
+			if err := SaveListReposCheckpoint(cfg.Store, cursor, bootstrapCursor); err != nil {
+				return err
+			}
+			batchCursorSaved = true
+			return nil
+		}
+		finishCleanEngineDrain := func() error {
+			if err := drainDurability(); err != nil {
+				return err
+			}
+			if batchCursorSaved {
+				return nil
+			}
+			return SaveListReposCheckpoint(cfg.Store, "", "")
+		}
 
 		st := NewStore(cfg.Store, cfg.Metrics)
 		st.afterComplete = cfg.AfterRepoComplete
 		st.afterCompleteError = recordFatal
 		st.crashInjector = cfg.CrashInjector
+		completions := NewCompletionBatcher(st, cfg.Metrics)
+		st.SetCompletionBatcher(completions)
+		cfg.Writer.SetDurableBatchHook(completions.StageDurable)
 		directory := directoryWithRecordingResolver(cfg.Directory, st, recordFatal)
 
 		sc := atmossync.NewClient(atmossync.Options{
@@ -160,6 +212,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 		handler.onWriterError = recordFatal
+		handler.SetCompletionBatcher(completions)
 		logger := cfg.Logger.With(slog.String("component", "backfill/run"))
 
 		if len(cfg.BackfillRepos) > 0 {
@@ -203,7 +256,7 @@ func Run(ctx context.Context, cfg Config) error {
 				logger.ErrorContext(ctx, "selected repo backfill aborted after local writer error", "err", fatal)
 				return fmt.Errorf("backfill: %w", fatal)
 			}
-			return nil
+			return drainDurability()
 		}
 
 		startCursor, err := LoadListReposCursor(cfg.Store)
@@ -222,22 +275,14 @@ func Run(ctx context.Context, cfg Config) error {
 		var limitTripped atomic.Bool
 
 		engineOpts := atmosbackfill.Options{
-			SyncClient:  sc,
-			Store:       st,
-			Handler:     handler,
-			Directory:   gt.Some(directory),
-			HTTPClient:  gt.Some(cfg.HTTPClient),
-			StartCursor: gt.Some(startCursor),
-			OnPageComplete: gt.Some(func(cursor string) error {
-				if err := SaveListReposCursor(cfg.Store, cursor); err != nil {
-					return err
-				}
-				// Persist the last non-empty cursor under a sibling
-				// key so the merge phase can resume listRepos to
-				// discover DIDs born during bootstrap. The
-				// MaybeSave helper short-circuits on cursor=="".
-				return MaybeSaveBootstrapLastListReposCursor(cfg.Store, cursor)
-			}),
+			SyncClient:      sc,
+			Store:           st,
+			Handler:         handler,
+			Directory:       gt.Some(directory),
+			HTTPClient:      gt.Some(cfg.HTTPClient),
+			StartCursor:     gt.Some(startCursor),
+			OnBatchComplete: gt.Some(saveBatchCursor),
+			OnPageComplete:  gt.Some(rememberPageCursor),
 			OnError: gt.Some(func(did atmos.DID, err error) {
 				if !shouldLogBackfillError(err) {
 					return
@@ -293,7 +338,7 @@ func Run(ctx context.Context, cfg Config) error {
 			// so the orchestrator advances to merge.
 			if limitTripped.Load() && errors.Is(err, context.Canceled) && ctx.Err() == nil {
 				logger.InfoContext(ctx, "engine drained early via max-backfill-repos")
-				return nil
+				return drainDurability()
 			}
 			logger.ErrorContext(ctx, "engine returned error", "err", err)
 			return fmt.Errorf("backfill: %w", err)
@@ -304,7 +349,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		logger.InfoContext(ctx, "engine drained")
-		return nil
+		return finishCleanEngineDrain()
 	})
 }
 

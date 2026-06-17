@@ -6,10 +6,10 @@
 // OnFail) write with pebble.Sync to satisfy atmos's durability
 // contract: the engine treats a successful return as durable.
 //
-// atmos guarantees no two callbacks are in flight for the same DID
-// simultaneously, so OnUpdate/OnComplete/OnFail use a non-transactional
-// read-modify-write to preserve fields a future PR may have added to
-// RepoStatus (e.g. RecordCount).
+// Whole-row read-modify-write paths preserve fields a future PR may
+// add to RepoStatus (e.g. RecordCount). They serialize through countsMu
+// with aggregate writes and deferred completion staging so a stale
+// callback cannot overwrite a just-committed completion row.
 package backfill
 
 import (
@@ -21,6 +21,7 @@ import (
 
 	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/repo"
@@ -36,6 +37,7 @@ type Store struct {
 	afterCompleteError func(error)
 	crashInjector      crashpoint.Injector
 	countsMu           sync.Mutex
+	completions        *completionBatcher
 }
 
 // Compile-time guarantee that Store satisfies the atmos contract.
@@ -45,6 +47,13 @@ var _ atmosbackfill.Store = (*Store)(nil)
 // metrics may be nil; callbacks are no-ops in that case.
 func NewStore(db *store.Store, metrics *Metrics) *Store {
 	return &Store{db: db, metrics: metrics}
+}
+
+// SetCompletionBatcher defers OnComplete writes into writer durable metadata
+// batches. It is intended for construction-time wiring before the backfill
+// engine starts.
+func (s *Store) SetCompletionBatcher(b *completionBatcher) {
+	s.completions = b
 }
 
 // Lookup reads repo/<did> and projects the on-disk RepoStatus into
@@ -150,6 +159,208 @@ func (s *Store) putRepoStatusAndCounts(
 	return nil
 }
 
+func (s *Store) updateRepoStatusAndCounts(
+	did atmos.DID,
+	mutate func(*RepoStatus, bool, Status) (func(*HostStatus), error),
+) error {
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+
+	rs, err := s.readRepoStatus(did)
+	if err != nil {
+		return err
+	}
+	hadRow := rs != nil
+	old := Status("")
+	if rs == nil {
+		rs = &RepoStatus{}
+	} else {
+		old = rs.Backfill.Status
+	}
+	updateHost, err := mutate(rs, hadRow, old)
+	if err != nil {
+		return err
+	}
+
+	counts, ok, err := LoadCounts(s.db)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		counts, err = CountStatuses(s.db)
+		if err != nil {
+			return err
+		}
+	}
+	applyCountTransition(&counts, hadRow, old, rs.Backfill.Status)
+	countsEnc, err := encodeCounts(counts)
+	if err != nil {
+		return err
+	}
+	enc, err := encodeRepoStatus(rs)
+	if err != nil {
+		return err
+	}
+
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.Set(repoKey(did), enc, nil); err != nil {
+		return fmt.Errorf("backfill: stage repo/%s: %w", did, err)
+	}
+	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
+		return fmt.Errorf("backfill: stage counts: %w", err)
+	}
+	if rs.Host != "" {
+		hs, _, err := loadHostStatus(s.db, rs.Host)
+		if err != nil {
+			return err
+		}
+		applyHostStatusTransition(hs, hadRow, rs.Active, old, rs.Backfill.Status)
+		if updateHost != nil {
+			updateHost(hs)
+		}
+		if err := stageHostStatus(batch, hs); err != nil {
+			return err
+		}
+	}
+	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: write repo/%s and counts: %w", did, err)
+	}
+	return nil
+}
+
+func (s *Store) stageCompleteBatch(ctx context.Context, batch *pebble.Batch, completions []queuedCompletion) (func(error), error) {
+	s.countsMu.Lock()
+	locked := true
+	unlock := func(error) {
+		if locked {
+			locked = false
+			s.countsMu.Unlock()
+		}
+	}
+	fail := func(err error) (func(error), error) {
+		unlock(err)
+		return nil, err
+	}
+
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	if len(completions) == 0 {
+		unlock(nil)
+		return nil, nil
+	}
+
+	counts, ok, err := LoadCounts(s.db)
+	if err != nil {
+		return fail(err)
+	}
+	if !ok {
+		counts, err = CountStatuses(s.db)
+		if err != nil {
+			return fail(err)
+		}
+	}
+
+	type stagedRepoStatus struct {
+		status *RepoStatus
+		hadRow bool
+	}
+	repoCache := make(map[atmos.DID]stagedRepoStatus)
+	hostCache := make(map[string]*HostStatus)
+	for _, c := range completions {
+		if err := ctx.Err(); err != nil {
+			return fail(err)
+		}
+		if c.commit == nil {
+			return fail(fmt.Errorf("backfill: stage complete %s: nil commit", c.did))
+		}
+
+		cached, ok := repoCache[c.did]
+		rs := cached.status
+		hadRow := cached.hadRow
+		if !ok {
+			var err error
+			rs, err = s.readRepoStatus(c.did)
+			if err != nil {
+				return fail(err)
+			}
+			hadRow = rs != nil
+			if rs == nil {
+				rs = &RepoStatus{}
+			}
+		}
+		old := rs.Backfill.Status
+		if !hadRow {
+			old = Status("")
+		}
+		rs.Backfill.Status = StatusComplete
+		rs.Backfill.Rev = c.commit.Rev
+		rs.Backfill.CompletedAt = c.completed
+		rs.Backfill.LastError = ""
+		rs.Rev = c.commit.Rev
+		rs.UpdatedAt = c.completed
+		rs.LastAttemptedAt = c.completed
+		applyCountTransition(&counts, hadRow, old, StatusComplete)
+
+		enc, err := encodeRepoStatus(rs)
+		if err != nil {
+			return fail(err)
+		}
+		if err := batch.Set(repoKey(c.did), enc, nil); err != nil {
+			return fail(fmt.Errorf("backfill: stage repo/%s: %w", c.did, err))
+		}
+		repoCache[c.did] = stagedRepoStatus{status: rs, hadRow: true}
+		if rs.Host != "" {
+			hs := hostCache[rs.Host]
+			if hs == nil {
+				var err error
+				hs, _, err = loadHostStatus(s.db, rs.Host)
+				if err != nil {
+					return fail(err)
+				}
+				hostCache[rs.Host] = hs
+			}
+			applyHostStatusTransition(hs, hadRow, rs.Active, old, StatusComplete)
+			hs.LastAttemptedAt = c.completed
+		}
+	}
+	countsEnc, err := encodeCounts(counts)
+	if err != nil {
+		return fail(err)
+	}
+	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
+		return fail(fmt.Errorf("backfill: stage counts: %w", err))
+	}
+	for _, hs := range hostCache {
+		if err := stageHostStatus(batch, hs); err != nil {
+			return fail(err)
+		}
+	}
+	return func(commitErr error) {
+		unlock(commitErr)
+		if commitErr != nil {
+			return
+		}
+		for _, c := range completions {
+			if err := s.simulateCrash(ctx, crashpoint.AfterRepoComplete); err != nil {
+				if s.afterCompleteError != nil {
+					s.afterCompleteError(fmt.Errorf("backfill: after repo complete crashpoint %s: %w", c.did, err))
+				}
+				continue
+			}
+			if s.afterComplete != nil {
+				if err := s.afterComplete(ctx, c.did); err != nil {
+					err = fmt.Errorf("backfill: after complete hook %s: %w", c.did, err)
+					if s.afterCompleteError != nil {
+						s.afterCompleteError(err)
+					}
+				}
+			}
+		}
+	}, nil
+}
+
 func applyCountTransition(c *Counts, hadRow bool, old, next Status) {
 	if !hadRow {
 		c.Total++
@@ -222,14 +433,24 @@ func (s *Store) readRepoStatus(did atmos.DID) (*RepoStatus, error) {
 	return decodeRepoStatus(val)
 }
 
-func (s *Store) putRepoStatusAndHostActive(did atmos.DID, rs *RepoStatus, oldActive bool) error {
+func (s *Store) updateRepoActive(did atmos.DID, active bool) error {
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+
+	rs, err := s.readRepoStatus(did)
+	if err != nil {
+		return err
+	}
+	if rs == nil {
+		return fmt.Errorf("backfill: on_update %s: missing row (atmos invariant violation)", did)
+	}
+	oldActive := rs.Active
+	rs.Active = active
+
 	enc, err := encodeRepoStatus(rs)
 	if err != nil {
 		return err
 	}
-
-	s.countsMu.Lock()
-	defer s.countsMu.Unlock()
 
 	batch := s.db.NewBatch()
 	defer func() { _ = batch.Close() }()
@@ -400,16 +621,7 @@ func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) er
 // listRepos.Active value differs from what the Store last saw, and
 // it never changes the Status as a side effect.
 func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) error {
-	rs, err := s.readRepoStatus(entry.DID)
-	if err != nil {
-		return err
-	}
-	if rs == nil {
-		return fmt.Errorf("backfill: on_update %s: missing row (atmos invariant violation)", entry.DID)
-	}
-	oldActive := rs.Active
-	rs.Active = entry.Active
-	if err := s.putRepoStatusAndHostActive(entry.DID, rs, oldActive); err != nil {
+	if err := s.updateRepoActive(entry.DID, entry.Active); err != nil {
 		return err
 	}
 	s.metrics.incActiveFlips()
@@ -424,35 +636,25 @@ func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) erro
 //
 // We RMW rather than write fresh so a future field on RepoStatus
 // (RecordCount, TotalBytes) added between OnDiscover and OnComplete
-// survives. atmos's no-concurrent-callback guarantee per-DID makes
-// the RMW race-free.
+// survives. The read, aggregate transition, and durable write must
+// stay serialized with deferred completion staging via countsMu.
 func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Commit) error {
-	rs, err := s.readRepoStatus(did)
-	if err != nil {
-		return err
+	if s.completions != nil {
+		return s.completions.QueueComplete(ctx, did, commit)
 	}
-	hadRow := rs != nil
-	old := Status("")
-	if rs == nil {
-		// Defensive: the engine only fires OnComplete after a Lookup
-		// returned Discovered/Failed, so the row exists. If somehow
-		// it doesn't, recreate it rather than failing the run — the
-		// download already happened and we don't want to lose the
-		// progress signal.
-		rs = &RepoStatus{}
-	} else {
-		old = rs.Backfill.Status
-	}
+
 	now := timeNow()
-	rs.Backfill.Status = StatusComplete
-	rs.Backfill.Rev = commit.Rev
-	rs.Backfill.CompletedAt = now
-	rs.Backfill.LastError = ""
-	rs.Rev = commit.Rev
-	rs.UpdatedAt = now
-	rs.LastAttemptedAt = now
-	if err := s.putRepoStatusAndCounts(did, rs, hadRow, old, func(hs *HostStatus) {
-		hs.LastAttemptedAt = now
+	if err := s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
+		rs.Backfill.Status = StatusComplete
+		rs.Backfill.Rev = commit.Rev
+		rs.Backfill.CompletedAt = now
+		rs.Backfill.LastError = ""
+		rs.Rev = commit.Rev
+		rs.UpdatedAt = now
+		rs.LastAttemptedAt = now
+		return func(hs *HostStatus) {
+			hs.LastAttemptedAt = now
+		}, nil
 	}); err != nil {
 		return err
 	}
@@ -498,27 +700,17 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attemp
 		return err
 	}
 
-	rs, err := s.readRepoStatus(did)
-	if err != nil {
-		s.metrics.incOnFailErrors()
-		return err
-	}
-	hadRow := rs != nil
-	old := Status("")
-	if rs == nil {
-		rs = &RepoStatus{}
-	} else {
-		old = rs.Backfill.Status
-	}
 	now := timeNow()
 	if isRepoNotFoundError(failErr) {
-		rs.Backfill.Status = StatusComplete
-		rs.Backfill.LastError = ""
-		rs.Backfill.Attempts = 0
-		rs.Backfill.CompletedAt = now
-		rs.LastAttemptedAt = now
-		return s.putRepoStatusAndCounts(did, rs, hadRow, old, func(hs *HostStatus) {
-			hs.LastAttemptedAt = now
+		return s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
+			rs.Backfill.Status = StatusComplete
+			rs.Backfill.LastError = ""
+			rs.Backfill.Attempts = 0
+			rs.Backfill.CompletedAt = now
+			rs.LastAttemptedAt = now
+			return func(hs *HostStatus) {
+				hs.LastAttemptedAt = now
+			}, nil
 		})
 	}
 
@@ -528,18 +720,20 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attemp
 	}
 	errMsg = truncateErrorString(errMsg)
 	errClass := classifyBackfillError(failErr)
-	rs.Backfill.Status = StatusFailed
-	rs.Backfill.LastError = errMsg
-	rs.Backfill.Attempts = attempts
-	rs.LastAttemptedAt = now
-	if err := s.putRepoStatusAndCounts(did, rs, hadRow, old, func(hs *HostStatus) {
-		hs.LastAttemptedAt = now
-		hs.addErrorSample(HostErrorSample{
-			DID:         did,
-			AttemptedAt: now,
-			Class:       errClass,
-			Error:       errMsg,
-		})
+	if err := s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
+		rs.Backfill.Status = StatusFailed
+		rs.Backfill.LastError = errMsg
+		rs.Backfill.Attempts = attempts
+		rs.LastAttemptedAt = now
+		return func(hs *HostStatus) {
+			hs.LastAttemptedAt = now
+			hs.addErrorSample(HostErrorSample{
+				DID:         did,
+				AttemptedAt: now,
+				Class:       errClass,
+				Error:       errMsg,
+			})
+		}, nil
 	}); err != nil {
 		s.metrics.incOnFailErrors()
 		return err

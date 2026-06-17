@@ -34,6 +34,7 @@ type SegmentHandler struct {
 	now           func() time.Time
 	metrics       *Metrics
 	onWriterError func(error)
+	completions   *completionBatcher
 }
 
 const segmentHandlerAppendBatchSize = 1024
@@ -58,6 +59,12 @@ func NewSegmentHandler(writer *ingest.Writer, logger *slog.Logger, m *Metrics) *
 	}
 }
 
+// SetCompletionBatcher queues repo completion watermarks for durable batch
+// metadata. It is intended for construction-time wiring before HandleRepo runs.
+func (h *SegmentHandler) SetCompletionBatcher(b *completionBatcher) {
+	h.completions = b
+}
+
 // HandleRepo emits one segment event per record in r.Tree. The
 // IndexedAt timestamp is the same for every event in this repo: it
 // is the wall-clock instant at which jetstream observed this repo.
@@ -70,6 +77,7 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 
 		indexedAt := h.now().UnixMicro()
 		appended := false
+		lastSeq := uint64(0)
 		batch := make([]segment.Event, 0, segmentHandlerAppendBatchSize)
 
 		flushBatch := func() error {
@@ -81,6 +89,7 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 				h.abortOnWriterError(err)
 				return err
 			}
+			lastSeq = batch[len(batch)-1].Seq
 			appended = true
 			batch = batch[:0]
 			return nil
@@ -135,12 +144,8 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 		if err := flushBatch(); err != nil {
 			return err
 		}
-		if appended {
-			if err := h.writer.Flush(ctx); err != nil {
-				err = fmt.Errorf("backfill: did=%s flush before complete: %w", did, err)
-				h.abortOnWriterError(err)
-				return err
-			}
+		if h.completions != nil {
+			h.completions.RecordWatermark(did, lastSeq, appended)
 		}
 		return nil
 	})
