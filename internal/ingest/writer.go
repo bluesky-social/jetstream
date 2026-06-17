@@ -704,15 +704,25 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 		return err
 	}
 	var afterCommit func()
+	var afterDone func(error)
+	var commitErr error
 	if w.cfg.OnDurableBatch != nil {
-		cb, err := w.cfg.OnDurableBatch(ctx, b, nextSeq, force)
+		cb, done, err := w.cfg.OnDurableBatch(ctx, b, nextSeq, force)
 		if err != nil {
 			return fmt.Errorf("ingest: on_durable_batch: %w", err)
 		}
 		afterCommit = cb
+		afterDone = done
 	}
-	if err := w.cfg.Store.Commit(b, store.SyncWrites); err != nil {
-		return fmt.Errorf("ingest: commit durable batch: %w", err)
+	defer func() {
+		if afterDone != nil {
+			afterDone(commitErr)
+		}
+	}()
+
+	commitErr = w.cfg.Store.Commit(b, store.SyncWrites)
+	if commitErr != nil {
+		return fmt.Errorf("ingest: commit durable batch: %w", commitErr)
 	}
 	w.durableNextSeq = nextSeq
 	if afterCommit != nil {

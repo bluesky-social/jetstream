@@ -566,10 +566,10 @@ func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 		Store:             st,
 		MaxEventsPerBlock: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
 			require.False(t, force)
 			hookSeq = nextSeq
-			return nil, b.Set([]byte("hook/ran"), []byte("yes"), nil)
+			return nil, nil, b.Set([]byte("hook/ran"), []byte("yes"), nil)
 		},
 	})
 	require.NoError(t, err)
@@ -840,14 +840,15 @@ func TestDrainDurability_CommitsHookWithoutPendingEvents(t *testing.T) {
 
 	var gotForce bool
 	var gotNextSeq uint64
+	afterDone := make(chan error, 1)
 	w, err := Open(Config{
 		SegmentsDir: filepath.Join(dir, "segments"),
 		Store:       st,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
 			gotForce = force
 			gotNextSeq = nextSeq
-			return nil, b.Set([]byte("metadata/only"), []byte("ok"), nil)
+			return nil, func(err error) { afterDone <- err }, b.Set([]byte("metadata/only"), []byte("ok"), nil)
 		},
 	})
 	require.NoError(t, err)
@@ -856,6 +857,12 @@ func TestDrainDurability_CommitsHookWithoutPendingEvents(t *testing.T) {
 	require.NoError(t, w.DrainDurability(t.Context()))
 	require.True(t, gotForce)
 	require.Equal(t, uint64(0), gotNextSeq)
+	select {
+	case err := <-afterDone:
+		require.NoError(t, err)
+	default:
+		require.Fail(t, "afterDone did not run")
+	}
 
 	got, closer, err := st.Get([]byte("metadata/only"))
 	require.NoError(t, err)
@@ -881,9 +888,9 @@ func TestDrainDurability_AsyncCommitsHookWithoutPendingEvents(t *testing.T) {
 		Store:             st,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
-			return nil, b.Set([]byte("metadata/async-only"), []byte("ok"), nil)
+			return nil, nil, b.Set([]byte("metadata/async-only"), []byte("ok"), nil)
 		},
 	})
 	require.NoError(t, err)
@@ -925,10 +932,10 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 		MaxEventsPerBlock: 64,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			key := fmt.Sprintf("metadata/async-pending/%t", force)
-			return nil, b.Set([]byte(key), []byte("ok"), nil)
+			return nil, nil, b.Set([]byte(key), []byte("ok"), nil)
 		},
 	})
 	require.NoError(t, err)
@@ -1359,15 +1366,15 @@ func TestAppendBatch_AsyncFlushRunsDurableBatchHook(t *testing.T) {
 		MaxEventsPerBlock: 2,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
 			if force {
-				return nil, fmt.Errorf("force = true")
+				return nil, nil, fmt.Errorf("force = true")
 			}
 			if nextSeq != 2 {
-				return nil, fmt.Errorf("nextSeq = %d, want 2", nextSeq)
+				return nil, nil, fmt.Errorf("nextSeq = %d, want 2", nextSeq)
 			}
 			if err := b.Set([]byte("async/hook"), []byte("ok"), nil); err != nil {
-				return nil, fmt.Errorf("stage async/hook: %w", err)
+				return nil, nil, fmt.Errorf("stage async/hook: %w", err)
 			}
 			return func() {
 				got, closer, err := st.Get([]byte("async/hook"))
@@ -1385,7 +1392,7 @@ func TestAppendBatch_AsyncFlushRunsDurableBatchHook(t *testing.T) {
 					return
 				}
 				afterCommit <- nil
-			}, nil
+			}, nil, nil
 		},
 	})
 	require.NoError(t, err)

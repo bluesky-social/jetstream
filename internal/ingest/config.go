@@ -13,7 +13,7 @@ import (
 // DurableBatchHook stages block-specific metadata into the same synced Pebble
 // batch that persists the writer's next sequence after a segment block is
 // durable.
-type DurableBatchHook func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool) (afterCommit func(), err error)
+type DurableBatchHook func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool) (afterCommit func(), afterDone func(error), err error)
 
 // defaultMaxSegmentBytes is the rotation threshold. DESIGN.md §3.1.1
 // names ~256MB as the target sealed-segment size. Operator-tunable
@@ -69,12 +69,15 @@ type Config struct {
 	// OnDurableBatch, if non-nil, stages extra metadata into the same synced
 	// Pebble batch that persists SeqKey after a segment block has been fsynced.
 	// The hook may return an afterCommit callback, which runs only after the
-	// batch commit succeeds. Unlike OnAfterFlush, this hook is supported with
-	// AsyncFlushWorkers because it is tied to a specific durable block.
+	// batch commit succeeds, and an afterDone callback, which runs after the
+	// batch commit attempt on both success and failure. Unlike OnAfterFlush,
+	// this hook is supported with AsyncFlushWorkers because it is tied to a
+	// specific durable block.
 	//
-	// The hook and afterCommit callback run under the writer mutex. Hooks must
-	// not call back into the Writer (that would deadlock) or perform unbounded
-	// I/O (that would stall every Append in the active worker pool).
+	// The hook, afterCommit callback, and afterDone callback run under the
+	// writer mutex. Hooks must not call back into the Writer (that would
+	// deadlock) or perform unbounded I/O (that would stall every Append in the
+	// active worker pool).
 	OnDurableBatch DurableBatchHook
 
 	// OnAppend, if non-nil, runs synchronously inside Append after

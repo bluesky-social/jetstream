@@ -510,6 +510,50 @@ func TestStore_HostAggregates_ActiveFlip(t *testing.T) {
 	require.Equal(t, uint64(0), hs.Active)
 }
 
+func TestStore_StaleActiveFlipCannotRegressCompletedStatus(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:staleactiveflip")
+	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+
+	cb := NewCompletionBatcher(bs, nil)
+	cb.RecordWatermark(did, 41, true)
+	require.NoError(t, cb.QueueComplete(ctx, did, &repo.Commit{DID: string(did), Rev: "rev-complete"}))
+
+	b := st.NewBatch()
+	afterCommit, afterDone, err := cb.StageDurable(ctx, b, 42, false)
+	require.NoError(t, err)
+	require.NotNil(t, afterCommit)
+	require.NotNil(t, afterDone)
+	commitErr := st.Commit(b, store.SyncWrites)
+	if commitErr != nil {
+		afterDone(commitErr)
+		require.NoError(t, commitErr)
+	}
+	afterCommit()
+	afterDone(nil)
+	require.NoError(t, b.Close())
+
+	require.NoError(t, bs.updateRepoActive(did, false))
+
+	rs, err := bs.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusComplete, rs.Backfill.Status)
+	require.Equal(t, "rev-complete", rs.Backfill.Rev)
+	require.False(t, rs.Active)
+
+	counts, ok, err := LoadCounts(st)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, Counts{Total: 1, Complete: 1}, counts)
+}
+
 func TestStore_HandleIndex_DeclaredHandleChange(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
