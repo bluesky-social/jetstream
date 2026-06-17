@@ -17,8 +17,8 @@ func buildMultiBlockSegment(t *testing.T, perBlock, blockCount int) string {
 	w, err := New(Config{Path: path, MaxEventsPerBlock: perBlock})
 	require.NoError(t, err)
 	var seq uint64
-	for b := 0; b < blockCount; b++ {
-		for i := 0; i < perBlock; i++ {
+	for b := range blockCount {
+		for range perBlock {
 			seq++
 			_, err = w.Append(Event{
 				Seq:        seq,
