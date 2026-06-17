@@ -147,6 +147,7 @@ func Run(ctx context.Context, cfg Config) error {
 			return fatalErr
 		}
 		drainDurability := func() error {
+			cfg.Metrics.incForcedCheckpointFlushes()
 			if err := cfg.Writer.DrainDurability(ctx); err != nil {
 				return fmt.Errorf("backfill: drain durable completions: %w", err)
 			}

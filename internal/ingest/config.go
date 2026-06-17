@@ -78,6 +78,14 @@ type Config struct {
 	// writer mutex. Hooks must not call back into the Writer (that would
 	// deadlock) or perform unbounded I/O (that would stall every Append in the
 	// active worker pool).
+	//
+	// force is true only on the drain/terminal commit paths (DrainDurability,
+	// Close, SealActiveAndClose) and means "commit the seq/next checkpoint even
+	// though no new block was just flushed." It does NOT license the hook to
+	// stage metadata whose backing events are not yet durable: a hook that ties
+	// metadata to event durability (e.g. backfill repo completion) must still
+	// gate every staged row on nextSeq, never on force, or it would mark data
+	// durable ahead of its segment fsync (violating DESIGN.md §3.1.1 ordering).
 	OnDurableBatch DurableBatchHook
 
 	// OnAppend, if non-nil, runs synchronously inside Append after

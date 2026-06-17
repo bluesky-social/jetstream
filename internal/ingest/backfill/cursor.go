@@ -49,10 +49,11 @@ func LoadListReposCursor(db *store.Store) (string, error) {
 	return out, nil
 }
 
-// SaveListReposCursor durably persists the cursor for resume. Run
-// calls it from atmos's OnBatchComplete callback only after the writer
-// durability drain succeeds, so the cursor cannot outrun queued repo
-// completions from the completed batch.
+// SaveListReposCursor durably persists the cursor for resume via
+// pebble.Sync. This is now a test/seed helper only: Run's production
+// checkpoint path uses SaveListReposCheckpoint, which writes the relay
+// and bootstrap cursors atomically after the writer durability drain.
+// Tests that only need to seed a starting cursor still call this.
 func SaveListReposCursor(db *store.Store, cursor string) error {
 	if err := db.Set([]byte(listReposCursorKey), []byte(cursor), store.SyncWrites); err != nil {
 		return fmt.Errorf("backfill: save list_repos_cursor: %w", err)
@@ -86,7 +87,8 @@ func SaveListReposCheckpoint(db *store.Store, relayCursor, bootstrapCursor strin
 // last *non-empty* listRepos cursor saved during the bootstrap
 // phase. The merge phase reads this to resume listRepos against
 // the relay and discover DIDs born during the bootstrap window
-// (DESIGN.md §4.7 of the merge spec).
+// (merge-phase spec §4.7,
+// docs/superpowers/specs/2026-05-27-merge-phase-design.md).
 //
 // We need a separate key from listReposCursorKey because the
 // existing cursor is allowed (correctly) to drain to "" when

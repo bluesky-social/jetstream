@@ -94,6 +94,21 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batc
 	for _, completion := range b.queued {
 		if !completion.watermark.appended || completion.watermark.lastSeq < nextSeq {
 			staged = append(staged, completion)
+			continue
+		}
+		// force=true is the drain/terminal commit: the writer has already
+		// flushed every pending block and waited for in-flight async jobs,
+		// so nextSeq must cover every appended event. An event-backed
+		// completion excluded here means its final event is not durable at
+		// a forced checkpoint — which would let saveBatchCursor advance the
+		// listRepos cursor past a non-durable completion (silent data loss).
+		// Crash rather than corrupt (AGENTS.md / DESIGN.md §3.1.1 ordering).
+		if force {
+			b.mu.Unlock()
+			b.metrics.incCompletionStageErrors()
+			return nil, nil, fmt.Errorf(
+				"backfill: forced durable batch at seq %d excludes appended completion %s with lastSeq %d (events not durable)",
+				nextSeq, completion.did, completion.watermark.lastSeq)
 		}
 	}
 	b.mu.Unlock()
@@ -116,35 +131,38 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batc
 			b.mu.Unlock()
 
 			b.metrics.observeCompletionDurableBatch(len(staged))
-			for range staged {
+			now := timeNow()
+			for _, c := range staged {
+				b.metrics.observeCompletionQueueWait(now.Sub(c.completed))
 				b.metrics.incCompleted()
 			}
 		})
 	}, afterDone, nil
 }
 
+// removeQueuedCompletions drops from queued exactly the entries that were
+// staged, leaving any entry re-queued for the same DID after staging (a newer
+// commit/watermark) in place. Both slices are DID-unique because QueueComplete
+// dedupes by DID in place, so a single map keyed by DID gives an O(len(queued))
+// filter; the full-identity queuedCompletionEqual check preserves the
+// replaced-after-stage invariant (a re-queued entry differs in commit pointer,
+// completed time, or watermark and therefore survives).
 func removeQueuedCompletions(queued, staged []queuedCompletion) []queuedCompletion {
 	if len(staged) == 0 {
 		return queued
 	}
+	stagedByDID := make(map[atmos.DID]queuedCompletion, len(staged))
+	for _, completion := range staged {
+		stagedByDID[completion.did] = completion
+	}
 	out := queued[:0]
 	for _, completion := range queued {
-		if removeFirstQueuedCompletion(&staged, completion) {
+		if candidate, ok := stagedByDID[completion.did]; ok && queuedCompletionEqual(candidate, completion) {
 			continue
 		}
 		out = append(out, completion)
 	}
 	return out
-}
-
-func removeFirstQueuedCompletion(staged *[]queuedCompletion, completion queuedCompletion) bool {
-	for i, candidate := range *staged {
-		if queuedCompletionEqual(candidate, completion) {
-			*staged = append((*staged)[:i], (*staged)[i+1:]...)
-			return true
-		}
-	}
-	return false
 }
 
 func queuedCompletionEqual(a, b queuedCompletion) bool {

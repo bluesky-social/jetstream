@@ -28,6 +28,8 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	m.setCompletionQueueDepth(3)
 	m.observeCompletionDurableBatch(2)
 	m.incCompletionStageErrors()
+	m.observeCompletionQueueWait(time.Millisecond)
+	m.incForcedCheckpointFlushes()
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.Discovered), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.Completed), 0)
@@ -42,6 +44,8 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.CompletionDurableBatches), 0)
 	require.InDelta(t, 2.0, testutil.ToFloat64(m.CompletionDurableRepos), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.CompletionStageErrors), 0)
+	require.Equal(t, 1, testutil.CollectAndCount(m.CompletionQueueWait))
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.ForcedCheckpointFlushes), 0)
 	requireNoDebugMetricFields(t, m)
 	requireNoDebugMetrics(t, reg)
 }
@@ -63,6 +67,8 @@ func TestNewMetrics_NilSafe(t *testing.T) {
 		m.setCompletionQueueDepth(1)
 		m.observeCompletionDurableBatch(1)
 		m.incCompletionStageErrors()
+		m.observeCompletionQueueWait(time.Millisecond)
+		m.incForcedCheckpointFlushes()
 	})
 }
 

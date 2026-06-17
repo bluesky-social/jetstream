@@ -27,6 +27,8 @@ type Metrics struct {
 	CompletionDurableBatches prometheus.Counter
 	CompletionDurableRepos   prometheus.Counter
 	CompletionStageErrors    prometheus.Counter
+	CompletionQueueWait      prometheus.Histogram
+	ForcedCheckpointFlushes  prometheus.Counter
 }
 
 // NewMetrics registers the backfill counters against reg. Pass the
@@ -105,12 +107,24 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "completion_stage_errors_total",
 			Help: "Number of errors staging queued repo completions into a writer durable metadata batch.",
 		}),
+		CompletionQueueWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "completion_queue_wait_seconds",
+			Help:    "Time a repo completion waited in the in-memory queue between being queued and becoming durable. A rising tail surfaces a durability backlog that completion_queue_depth alone cannot distinguish from steady draining.",
+			Buckets: obs.LatencyBucketsSlow,
+		}),
+		ForcedCheckpointFlushes: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "forced_checkpoint_flushes_total",
+			Help: "Number of forced writer durability drains at a batch/checkpoint barrier (DrainDurability), as opposed to completions that drained naturally on a block boundary.",
+		}),
 	}
 	reg.MustRegister(
 		m.Discovered, m.Completed, m.Failed, m.ActiveFlips, m.OnFailErrors,
 		m.HandleRepoDuration, m.ProgressCompleted, m.DroppedRecords,
 		m.CompletionQueued, m.CompletionQueueDepth, m.CompletionDurableBatches,
 		m.CompletionDurableRepos, m.CompletionStageErrors,
+		m.CompletionQueueWait, m.ForcedCheckpointFlushes,
 	)
 	return m
 }
@@ -193,5 +207,20 @@ func (m *Metrics) observeCompletionDurableBatch(repos int) {
 func (m *Metrics) incCompletionStageErrors() {
 	if m != nil {
 		m.CompletionStageErrors.Inc()
+	}
+}
+
+// observeCompletionQueueWait records how long a completion sat in the queue
+// before becoming durable. since is the duration from QueueComplete's captured
+// timestamp to the durable commit; negative values (clock skew) are dropped.
+func (m *Metrics) observeCompletionQueueWait(since time.Duration) {
+	if m != nil && since >= 0 {
+		m.CompletionQueueWait.Observe(since.Seconds())
+	}
+}
+
+func (m *Metrics) incForcedCheckpointFlushes() {
+	if m != nil {
+		m.ForcedCheckpointFlushes.Inc()
 	}
 }
