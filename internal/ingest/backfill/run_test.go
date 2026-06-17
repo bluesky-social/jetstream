@@ -1163,6 +1163,80 @@ func TestRun_WriterFlushErrorAbortsAfterDurableCompletion(t *testing.T) {
 		"completion is committed in the same durable batch before legacy OnAfterFlush runs")
 }
 
+func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:queued-complete-restart")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+
+	dataDir := t.TempDir()
+	db, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
+	for did, f := range fixtures {
+		docs[did] = &identity.DIDDocument{
+			ID: string(did),
+			VerificationMethod: []identity.VerificationMethod{
+				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
+			},
+			Service: []identity.Service{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
+			},
+		}
+	}
+	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	errFlush := errors.New("flush failed after completion commit")
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(dataDir, "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4096,
+		MaxSegmentBytes:   1 << 30,
+		OnAfterFlush: func(context.Context) error {
+			return errFlush
+		},
+	})
+	require.NoError(t, err)
+
+	err = Run(t.Context(), Config{
+		Store:      db,
+		Directory:  dir,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Writer:     w,
+		RelayURL:   srv.srv.URL,
+		Logger:     logger,
+	})
+	require.ErrorIs(t, err, errFlush)
+	require.NoError(t, w.Close())
+	firstGetRepo := srv.getRepoHit.Load()
+	require.Equal(t, int64(1), firstGetRepo)
+
+	w, err = ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(dataDir, "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4096,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, Run(t.Context(), Config{
+		Store:      db,
+		Directory:  dir,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Writer:     w,
+		RelayURL:   srv.srv.URL,
+		Logger:     logger,
+	}))
+	require.Equal(t, firstGetRepo, srv.getRepoHit.Load(), "durable queued completion must prevent restart redownload")
+}
+
 func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {
 	t.Parallel()
 
