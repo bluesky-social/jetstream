@@ -14,6 +14,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
@@ -67,6 +68,10 @@ func TestServe_GracefulShutdownClosesSubscriber(t *testing.T) {
 		ShutdownTimeout:           5 * time.Second,
 		ClientDrainTimeout:        10 * time.Second,
 		CursorLookback:            36 * time.Hour,
+		PlanMaxDIDs:               xrpcapi.DefaultPlanMaxDIDs,
+		PlanMaxCollections:        xrpcapi.DefaultPlanMaxCollections,
+		PlanMaxEntries:            xrpcapi.DefaultPlanMaxEntries,
+		PlanWholeSegmentThreshold: xrpcapi.DefaultPlanWholeSegmentThreshold,
 		SubscribeHotTailBytes:     1 << 20,
 		SubscribeBlockCacheBytes:  1 << 20,
 		SubscribeReadBatch:        128,

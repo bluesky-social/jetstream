@@ -67,6 +67,10 @@ type Options struct {
 
 	CursorLookback            time.Duration
 	SegmentCacheMaxAge        time.Duration
+	PlanMaxDIDs               int
+	PlanMaxCollections        int
+	PlanMaxEntries            int
+	PlanWholeSegmentThreshold float64
 	SubscribeHotTailBytes     int
 	SubscribeBlockCacheBytes  int
 	SubscribeReadBatch        int

@@ -89,6 +89,18 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.CompactionRewriteWorkers < 0 {
 		return nil, fmt.Errorf("serve: --compaction-rewrite-workers must be >= 0 (CompactionRewriteWorkers must be >= 0), got %d", opts.CompactionRewriteWorkers)
 	}
+	if opts.PlanMaxDIDs < 0 {
+		return nil, fmt.Errorf("serve: --plan-max-dids must be >= 0 (PlanMaxDIDs must be >= 0), got %d", opts.PlanMaxDIDs)
+	}
+	if opts.PlanMaxCollections < 0 {
+		return nil, fmt.Errorf("serve: --plan-max-collections must be >= 0 (PlanMaxCollections must be >= 0), got %d", opts.PlanMaxCollections)
+	}
+	if opts.PlanMaxEntries <= 0 {
+		return nil, fmt.Errorf("serve: --plan-max-entries must be positive (PlanMaxEntries must be positive), got %d", opts.PlanMaxEntries)
+	}
+	if opts.PlanWholeSegmentThreshold <= 0 || opts.PlanWholeSegmentThreshold > 1 {
+		return nil, fmt.Errorf("serve: --plan-whole-segment-threshold must be > 0 and <= 1 (PlanWholeSegmentThreshold must be > 0 and <= 1), got %g", opts.PlanWholeSegmentThreshold)
+	}
 
 	processLogger, err := obs.BuildLoggerFromStrings(opts.LogOutput, opts.LogLevel, opts.LogFormat)
 	if err != nil {
@@ -396,8 +408,14 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		},
 		CacheMaxAge: opts.SegmentCacheMaxAge,
 		Overlay:     overlayCache,
-		Metrics:     xrpcMetrics,
-		Tracer:      obs.Tracer("xrpcapi"),
+		Plan: xrpcapi.PlanConfig{
+			MaxDIDs:               opts.PlanMaxDIDs,
+			MaxCollections:        opts.PlanMaxCollections,
+			MaxEntries:            opts.PlanMaxEntries,
+			WholeSegmentThreshold: opts.PlanWholeSegmentThreshold,
+		},
+		Metrics: xrpcMetrics,
+		Tracer:  obs.Tracer("xrpcapi"),
 	})
 	srv.RegisterPublicRoute("/xrpc/", xrpcSrv.Handler())
 	rt.server = srv

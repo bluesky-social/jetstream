@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
+	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
 	"github.com/jcalabro/atmos"
 	"github.com/stretchr/testify/require"
 )
@@ -84,6 +85,57 @@ func TestOptionsValidateRejectsNegativeCompactionRewriteWorkers(t *testing.T) {
 	require.ErrorContains(t, err, "CompactionRewriteWorkers must be >= 0")
 }
 
+func TestOptionsValidateRejectsInvalidPlanLimits(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		edit func(*Options)
+		want string
+	}{
+		{
+			name: "negative DIDs",
+			edit: func(opts *Options) { opts.PlanMaxDIDs = -1 },
+			want: "PlanMaxDIDs must be >= 0",
+		},
+		{
+			name: "negative collections",
+			edit: func(opts *Options) { opts.PlanMaxCollections = -1 },
+			want: "PlanMaxCollections must be >= 0",
+		},
+		{
+			name: "zero entries",
+			edit: func(opts *Options) { opts.PlanMaxEntries = 0 },
+			want: "PlanMaxEntries must be positive",
+		},
+		{
+			name: "negative entries",
+			edit: func(opts *Options) { opts.PlanMaxEntries = -1 },
+			want: "PlanMaxEntries must be positive",
+		},
+		{
+			name: "zero threshold",
+			edit: func(opts *Options) { opts.PlanWholeSegmentThreshold = 0 },
+			want: "PlanWholeSegmentThreshold must be > 0 and <= 1",
+		},
+		{
+			name: "high threshold",
+			edit: func(opts *Options) { opts.PlanWholeSegmentThreshold = 1.1 },
+			want: "PlanWholeSegmentThreshold must be > 0 and <= 1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			opts := testOptions(t)
+			tt.edit(&opts)
+			_, err := Build(t.Context(), opts)
+			require.ErrorContains(t, err, tt.want)
+		})
+	}
+}
+
 func TestOptionsExposeAfterRepoCompleteHook(t *testing.T) {
 	t.Parallel()
 
@@ -127,6 +179,10 @@ func testOptions(t *testing.T) Options {
 		ShutdownTimeout:           5 * time.Second,
 		ClientDrainTimeout:        time.Second,
 		CursorLookback:            36 * time.Hour,
+		PlanMaxDIDs:               xrpcapi.DefaultPlanMaxDIDs,
+		PlanMaxCollections:        xrpcapi.DefaultPlanMaxCollections,
+		PlanMaxEntries:            xrpcapi.DefaultPlanMaxEntries,
+		PlanWholeSegmentThreshold: xrpcapi.DefaultPlanWholeSegmentThreshold,
 		SubscribeHotTailBytes:     1 << 20,
 		SubscribeBlockCacheBytes:  1 << 20,
 		SubscribeReadBatch:        128,

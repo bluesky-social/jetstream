@@ -1,6 +1,8 @@
 package xrpcapi
 
 import (
+	"bytes"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -29,6 +31,18 @@ func doGetWith(t *testing.T, url string, customize func(*http.Request)) *http.Re
 	if customize != nil {
 		customize(req)
 	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+func doPostJSON(t *testing.T, url string, body any) *http.Response {
+	t.Helper()
+	b, err := json.Marshal(body)
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, bytes.NewReader(b))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	return resp
