@@ -69,7 +69,38 @@ func newTestServer(t *testing.T, n int) (*Server, string) {
 	}
 	m, err := manifest.Open(manifest.Options{SegmentsDir: dir, Logger: slog.Default()})
 	require.NoError(t, err)
-	return New(m, slog.Default()), dir
+	return New(Config{Src: m, Logger: slog.Default()}), dir
+}
+
+// writeSealedSegmentBlocks writes a sealed segment at index idx with blockCount
+// blocks of perBlock events each (seq starting at seqStart) and returns its path.
+func writeSealedSegmentBlocks(t *testing.T, dir string, idx, seqStart uint64, perBlock, blockCount int) string {
+	t.Helper()
+	path := filepath.Join(dir, ingest.SegmentFilename(idx))
+	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: perBlock})
+	require.NoError(t, err)
+	seq := seqStart
+	for b := 0; b < blockCount; b++ {
+		for i := 0; i < perBlock; i++ {
+			_, err = w.Append(segment.Event{
+				Seq: seq, IndexedAt: int64(1_730_000_000_000_000 + seq*1_000),
+				Kind: segment.KindCreate, DID: "did:plc:test",
+				Collection: "app.bsky.feed.post", Rkey: "rkey", Rev: "rev",
+				Payload: []byte{0xa0},
+			})
+			require.NoError(t, err)
+			seq++
+		}
+		// Roll the just-filled pending buffer into a sealed block. The final
+		// block is flushed by Seal, so only flush between blocks here;
+		// flushing after the last block would emit a spurious empty block.
+		if b < blockCount-1 {
+			require.NoError(t, w.Flush())
+		}
+	}
+	_, err = w.Seal()
+	require.NoError(t, err)
+	return path
 }
 
 // rawFile reads a segment file's bytes for byte-identical comparison.

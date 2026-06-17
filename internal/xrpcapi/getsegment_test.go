@@ -45,7 +45,7 @@ func TestGetSegment_WholeFile(t *testing.T) {
 func TestGetSegment_CacheMaxAge(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestServer(t, 1)
-	cached := NewWithReadyAndCache(s.src, s.logger, nil, time.Hour)
+	cached := New(Config{Src: s.src, Logger: s.logger, CacheMaxAge: time.Hour})
 	ts := httptest.NewServer(cached.Handler())
 	defer ts.Close()
 

@@ -26,7 +26,7 @@ func newOverlayTestServer(t *testing.T, snap tombstone.Snapshot, w, m uint64) *S
 		ETag:      `"abc123"`,
 		Watermark: w, MaxSeq: m,
 	}
-	return NewWithReadyAndCacheAndOverlay(s.src, s.logger, nil, 0, &fakeOverlay{blob: blob})
+	return New(Config{Src: s.src, Logger: s.logger, Overlay: &fakeOverlay{blob: blob}})
 }
 
 func tombURL(base string) string {
@@ -80,9 +80,9 @@ func TestGetTombstones_ReadinessGate(t *testing.T) {
 	s, _ := newTestServer(t, 1)
 	blob := &overlay.Blob{Bytes: overlay.Encode(tombstone.Snapshot{
 		Records: map[tombstone.RecordKey]uint64{}, DIDs: map[string]tombstone.DIDTombstone{}}, 0, 0), ETag: `"x"`}
-	gated := NewWithReadyAndCacheAndOverlay(s.src, s.logger, func(_ context.Context) error {
+	gated := New(Config{Src: s.src, Logger: s.logger, Ready: func(_ context.Context) error {
 		return errors.New("bootstrap in progress")
-	}, 0, &fakeOverlay{blob: blob})
+	}, Overlay: &fakeOverlay{blob: blob}})
 	ts := httptest.NewServer(gated.Handler())
 	defer ts.Close()
 

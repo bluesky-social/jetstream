@@ -381,15 +381,24 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// xrpcserver routes /xrpc/{nsid}; mounting at the "/xrpc/" subtree
 	// lets it own every jetstream NSID. Backed by the in-memory manifest,
 	// which only tracks sealed (immutable) segments.
-	xrpcSrv := xrpcapi.NewWithReadyAndCacheAndOverlay(mft, processLogger, func(ctx context.Context) error {
-		if !lifecycle.IsSteadyState(metaStore) {
-			return errors.New("bootstrap in progress")
-		}
-		if err := mft.Wait(ctx); err != nil {
-			return fmt.Errorf("manifest warming up: %w", err)
-		}
-		return nil
-	}, opts.SegmentCacheMaxAge, overlayCache)
+	xrpcMetrics := xrpcapi.NewMetrics(metrics.Registry)
+	xrpcSrv := xrpcapi.New(xrpcapi.Config{
+		Src:    mft,
+		Logger: processLogger,
+		Ready: func(ctx context.Context) error {
+			if !lifecycle.IsSteadyState(metaStore) {
+				return errors.New("bootstrap in progress")
+			}
+			if err := mft.Wait(ctx); err != nil {
+				return fmt.Errorf("manifest warming up: %w", err)
+			}
+			return nil
+		},
+		CacheMaxAge: opts.SegmentCacheMaxAge,
+		Overlay:     overlayCache,
+		Metrics:     xrpcMetrics,
+		Tracer:      obs.Tracer("xrpcapi"),
+	})
 	srv.RegisterPublicRoute("/xrpc/", xrpcSrv.Handler())
 	rt.server = srv
 
