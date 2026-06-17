@@ -87,7 +87,7 @@ We track work as **GitHub issues in this repo** (`gh issue ...`). This is an ope
 - *Definition of done* — the observable outcome that closes the issue (behaviour, test, metric).
 - *Notes* — open questions, alternatives considered, or follow-ups to split out later (kaizen: record out-of-scope problems as their own issues rather than scope-creeping this one).
 
-**Labels** — use the existing defaults; don't invent a taxonomy without discussion. `bug` (incorrect behaviour), `enhancement` (new capability), `documentation` (docs/comments), `question`, `help wanted`, `good first issue`. Apply at most one type label plus any meta labels that fit.
+**Labels** — use the existing labels; don't invent a taxonomy without discussion.
 
 **Status & linking** — the worklog lives in the issue:
 - Post a comment when meaningfully starting or when state changes (blocked, approach changed, finding). These comments are the persistent log — favour a short comment over silence.
