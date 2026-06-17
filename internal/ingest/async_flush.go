@@ -158,7 +158,7 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 		}
 		w.cfg.Metrics.incBlocksFlushed()
 
-		if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, job.nextSeq); err != nil {
+		if err := w.commitDurableBatchLocked(ctx, job.nextSeq, false); err != nil {
 			return err
 		}
 

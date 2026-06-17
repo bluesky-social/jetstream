@@ -552,6 +552,44 @@ func TestFlush_InvokesOnAfterFlushHook(t *testing.T) {
 	require.Equal(t, int32(2), calls.Load())
 }
 
+func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var hookSeq uint64
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 2,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+			require.False(t, force)
+			hookSeq = nextSeq
+			return nil, b.Set([]byte("hook/ran"), []byte("yes"), nil)
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, w.AppendBatch(t.Context(), []segment.Event{
+		{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1", Rev: "1"},
+		{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2", Rev: "1"},
+	}))
+
+	require.Equal(t, uint64(2), hookSeq)
+	got, closer, err := st.Get([]byte("hook/ran"))
+	require.NoError(t, err)
+	require.Equal(t, "yes", string(got))
+	require.NoError(t, closer.Close())
+	persisted, err := loadNextSeq(st, w.cfg.SeqKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), persisted)
+}
+
 // TestFlush_OnAfterFlushErrorPropagates verifies that an error from
 // the hook surfaces back through Append so the errgroup can tear
 // the process down. AGENTS.md: crashing > silent corruption.
@@ -1168,6 +1206,65 @@ func TestAppendBatch_AsyncFlushPersistsBlocksAndSeqBeforeReturn(t *testing.T) {
 	require.Equal(t, uint64(1), blocks[0][1].Seq)
 	require.Equal(t, uint64(2), blocks[1][0].Seq)
 	require.Equal(t, uint64(3), blocks[1][1].Seq)
+}
+
+func TestAppendBatch_AsyncFlushRunsDurableBatchHook(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	afterCommit := make(chan error, 1)
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 2,
+		AsyncFlushWorkers: 2,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+			if force {
+				return nil, fmt.Errorf("force = true")
+			}
+			if nextSeq != 2 {
+				return nil, fmt.Errorf("nextSeq = %d, want 2", nextSeq)
+			}
+			if err := b.Set([]byte("async/hook"), []byte("ok"), nil); err != nil {
+				return nil, fmt.Errorf("stage async/hook: %w", err)
+			}
+			return func() {
+				got, closer, err := st.Get([]byte("async/hook"))
+				if err != nil {
+					afterCommit <- err
+					return
+				}
+				if string(got) != "ok" {
+					afterCommit <- fmt.Errorf("async/hook = %q, want ok", got)
+					_ = closer.Close()
+					return
+				}
+				if err := closer.Close(); err != nil {
+					afterCommit <- err
+					return
+				}
+				afterCommit <- nil
+			}, nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, w.AppendBatch(t.Context(), []segment.Event{
+		{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1", Rev: "1"},
+		{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2", Rev: "1"},
+	}))
+	select {
+	case err := <-afterCommit:
+		require.NoError(t, err)
+	default:
+		require.Fail(t, "afterCommit did not run")
+	}
 }
 
 func TestAppendBatch_AsyncFlushDefersRotationWhilePendingRowsExist(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/obs"
 	"github.com/bluesky-social/jetstream-v2/internal/store"
 	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/cockroachdb/pebble"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -415,7 +416,7 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
 	}
 	w.cfg.Metrics.incBlocksFlushed()
 
-	if err := saveNextSeq(w.cfg.Store, w.cfg.SeqKey, w.nextSeq); err != nil {
+	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false); err != nil {
 		return err
 	}
 
@@ -605,6 +606,39 @@ func saveNextSeq(st *store.Store, key string, v uint64) error {
 	binary.LittleEndian.PutUint64(buf[:], v)
 	if err := st.Set([]byte(key), buf[:], store.SyncWrites); err != nil {
 		return fmt.Errorf("ingest: save %s: %w", key, err)
+	}
+	return nil
+}
+
+func stageNextSeq(b *pebble.Batch, key string, v uint64) error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], v)
+	if err := b.Set([]byte(key), buf[:], nil); err != nil {
+		return fmt.Errorf("ingest: stage %s: %w", key, err)
+	}
+	return nil
+}
+
+func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force bool) error {
+	b := w.cfg.Store.NewBatch()
+	defer func() { _ = b.Close() }()
+
+	if err := stageNextSeq(b, w.cfg.SeqKey, nextSeq); err != nil {
+		return err
+	}
+	var afterCommit func()
+	if w.cfg.OnDurableBatch != nil {
+		cb, err := w.cfg.OnDurableBatch(ctx, b, nextSeq, force)
+		if err != nil {
+			return fmt.Errorf("ingest: on_durable_batch: %w", err)
+		}
+		afterCommit = cb
+	}
+	if err := w.cfg.Store.Commit(b, store.SyncWrites); err != nil {
+		return fmt.Errorf("ingest: commit durable batch: %w", err)
+	}
+	if afterCommit != nil {
+		afterCommit()
 	}
 	return nil
 }
