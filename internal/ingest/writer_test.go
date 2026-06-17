@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1248,7 +1248,7 @@ func TestAppendBatch_AsyncFlushConcurrentBatchesRemainContiguous(t *testing.T) {
 		return nil
 	}))
 	require.Len(t, seqs, goroutines*perBatch)
-	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	slices.Sort(seqs)
 	for i, seq := range seqs {
 		require.Equal(t, uint64(i), seq)
 	}

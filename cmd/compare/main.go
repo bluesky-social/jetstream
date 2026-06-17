@@ -277,7 +277,7 @@ func (c *comparator) observe(phase samplePhase, obs observation) {
 		}
 	}
 
-	if phase == phaseWarmup && !(hadV1 && hadV2) && presence.v1 != nil && presence.v2 != nil {
+	if phase == phaseWarmup && (!hadV1 || !hadV2) && presence.v1 != nil && presence.v2 != nil {
 		c.warmupOverlap++
 	}
 }
@@ -420,18 +420,26 @@ func runCompare(ctx context.Context, cfg compareConfig) error {
 	go readStream(ctx, sourceV2, cfg.v2URL, cfg.dialTimeout, cfg.readLimit, events, errs)
 
 	comp := newComparator(cfg.minOverlap)
-	fmt.Fprintf(cfg.out, "connecting v1=%s v2=%s\n", cfg.v1URL, cfg.v2URL)
-	fmt.Fprintf(cfg.out, "warming up until %d shared keyed commit events overlap\n", cfg.minOverlap)
+	if err := writef(cfg.out, "connecting v1=%s v2=%s\n", cfg.v1URL, cfg.v2URL); err != nil {
+		return err
+	}
+	if err := writef(cfg.out, "warming up until %d shared keyed commit events overlap\n", cfg.minOverlap); err != nil {
+		return err
+	}
 
 	if err := runWarmup(ctx, cfg, comp, events, errs); err != nil {
 		return err
 	}
-	fmt.Fprintf(cfg.out, "warmup overlap reached: %d shared keys; sampling for %s\n", comp.warmupOverlap, cfg.duration)
+	if err := writef(cfg.out, "warmup overlap reached: %d shared keys; sampling for %s\n", comp.warmupOverlap, cfg.duration); err != nil {
+		return err
+	}
 
 	if err := runTimedPhase(ctx, cfg, comp, phaseSample, cfg.duration, events, errs); err != nil {
 		return err
 	}
-	fmt.Fprintf(cfg.out, "sample complete: draining for %s\n", cfg.grace)
+	if err := writef(cfg.out, "sample complete: draining for %s\n", cfg.grace); err != nil {
+		return err
+	}
 
 	if cfg.grace > 0 {
 		if err := runTimedPhase(ctx, cfg, comp, phaseDrain, cfg.grace, events, errs); err != nil {
@@ -440,7 +448,9 @@ func runCompare(ctx context.Context, cfg compareConfig) error {
 	}
 
 	result := comp.compare(cfg.maxExamples, cfg.minSample)
-	printReport(cfg.out, comp, result, cfg)
+	if err := printReport(cfg.out, comp, result, cfg); err != nil {
+		return err
+	}
 	if result.failed() {
 		return fmt.Errorf("streams differed")
 	}
@@ -516,11 +526,14 @@ func readStream(
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	conn, resp, err := websocket.Dial(dialCtx, wsURL, nil)
 	cancel()
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
 	if err != nil {
 		sendErr(ctx, errs, fmt.Errorf("%s dial %s: %w%s", src, wsURL, err, responseSuffix(resp)))
 		return
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "")
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "") }()
 	conn.SetReadLimit(readLimit)
 
 	for {
@@ -645,47 +658,82 @@ func compareKeys(a, b eventKey) int {
 	}
 }
 
-func printReport(out io.Writer, comp *comparator, result comparisonResult, cfg compareConfig) {
-	fmt.Fprintf(out, "\ncomparison sample: duration=%s grace=%s\n", cfg.duration, cfg.grace)
-	fmt.Fprintf(out, "warmup_overlap=%d tracked_keys=%d\n", comp.warmupOverlap, comp.trackedEvents())
-	fmt.Fprintf(out, "sample: keys=%d v1_seen=%d v2_seen=%d min_sample=%d\n",
-		result.sampleKeys, result.sampleSeenV1, result.sampleSeenV2, cfg.minSample)
-	fmt.Fprintf(out, "common=%d missing_from_v1=%d missing_from_v2=%d payload_mismatches=%d\n",
-		result.common, result.onlyV2Count, result.onlyV1Count, result.mismatchCount)
-	fmt.Fprintf(out, "duplicates: v1=%d v2=%d\n", result.duplicatesV1, result.duplicatesV2)
-	fmt.Fprintf(out, "lag: v1_first=%d v2_first=%d equal=%d avg_abs=%s max_abs=%s\n",
-		result.lag.v1First, result.lag.v2First, result.lag.equal, result.lag.avgAbs(), result.lag.maxAbs)
+func writef(out io.Writer, format string, args ...any) error {
+	_, err := fmt.Fprintf(out, format, args...)
+	return err
+}
+
+func writeln(out io.Writer, args ...any) error {
+	_, err := fmt.Fprintln(out, args...)
+	return err
+}
+
+func printReport(out io.Writer, comp *comparator, result comparisonResult, cfg compareConfig) error {
+	if err := writef(out, "\ncomparison sample: duration=%s grace=%s\n", cfg.duration, cfg.grace); err != nil {
+		return err
+	}
+	if err := writef(out, "warmup_overlap=%d tracked_keys=%d\n", comp.warmupOverlap, comp.trackedEvents()); err != nil {
+		return err
+	}
+	if err := writef(out, "sample: keys=%d v1_seen=%d v2_seen=%d min_sample=%d\n",
+		result.sampleKeys, result.sampleSeenV1, result.sampleSeenV2, cfg.minSample); err != nil {
+		return err
+	}
+	if err := writef(out, "common=%d missing_from_v1=%d missing_from_v2=%d payload_mismatches=%d\n",
+		result.common, result.onlyV2Count, result.onlyV1Count, result.mismatchCount); err != nil {
+		return err
+	}
+	if err := writef(out, "duplicates: v1=%d v2=%d\n", result.duplicatesV1, result.duplicatesV2); err != nil {
+		return err
+	}
+	if err := writef(out, "lag: v1_first=%d v2_first=%d equal=%d avg_abs=%s max_abs=%s\n",
+		result.lag.v1First, result.lag.v2First, result.lag.equal, result.lag.avgAbs(), result.lag.maxAbs); err != nil {
+		return err
+	}
 	if result.insufficientSample {
-		fmt.Fprintf(out, "insufficient sample: got %d keys, need %d\n", result.sampleKeys, cfg.minSample)
+		if err := writef(out, "insufficient sample: got %d keys, need %d\n", result.sampleKeys, cfg.minSample); err != nil {
+			return err
+		}
 	}
 
-	printMissingExamples(out, "present only on v1", result.onlyV1)
-	printMissingExamples(out, "present only on v2", result.onlyV2)
+	if err := printMissingExamples(out, "present only on v1", result.onlyV1); err != nil {
+		return err
+	}
+	if err := printMissingExamples(out, "present only on v2", result.onlyV2); err != nil {
+		return err
+	}
 	for _, mismatch := range result.mismatches {
-		fmt.Fprintf(out, "mismatch %s first_diff=%d\n", mismatch.key, firstDiff(mismatch.v1Normalized, mismatch.v2Normalized))
-		fmt.Fprintf(out, "  v1 normalized: %s\n", snippet(mismatch.v1Normalized, 320))
-		fmt.Fprintf(out, "  v2 normalized: %s\n", snippet(mismatch.v2Normalized, 320))
+		if err := writef(out, "mismatch %s first_diff=%d\n", mismatch.key, firstDiff(mismatch.v1Normalized, mismatch.v2Normalized)); err != nil {
+			return err
+		}
+		if err := writef(out, "  v1 normalized: %s\n", snippet(mismatch.v1Normalized, 320)); err != nil {
+			return err
+		}
+		if err := writef(out, "  v2 normalized: %s\n", snippet(mismatch.v2Normalized, 320)); err != nil {
+			return err
+		}
 	}
 
 	if result.failed() {
-		fmt.Fprintln(out, "result: FAIL")
-	} else {
-		fmt.Fprintln(out, "result: PASS")
+		return writeln(out, "result: FAIL")
 	}
+	return writeln(out, "result: PASS")
 }
 
-func printMissingExamples(out io.Writer, label string, events []missingEvent) {
+func printMissingExamples(out io.Writer, label string, events []missingEvent) error {
 	for _, event := range events {
-		fmt.Fprintf(out, "%s: %s\n", label, event.key)
-		fmt.Fprintf(out, "  payload: %s\n", snippet(event.normalized, 320))
+		if err := writef(out, "%s: %s\n", label, event.key); err != nil {
+			return err
+		}
+		if err := writef(out, "  payload: %s\n", snippet(event.normalized, 320)); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func firstDiff(a []byte, b []byte) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
+	n := min(len(b), len(a))
 	for i := 0; i < n; i++ {
 		if a[i] != b[i] {
 			return i

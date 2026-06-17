@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 )
+
+var errTestWrite = errors.New("write failed")
 
 func TestDecodeEventKeyDistinguishesOpsInSameCommit(t *testing.T) {
 	t.Parallel()
@@ -115,6 +118,21 @@ func TestInsufficientSampleFails(t *testing.T) {
 	if !result.failed() {
 		t.Fatal("insufficient sample should fail")
 	}
+}
+
+func TestPrintReportReturnsWriteError(t *testing.T) {
+	t.Parallel()
+
+	err := printReport(failingWriter{}, newComparator(1), comparisonResult{}, compareConfig{})
+	if !errors.Is(err, errTestWrite) {
+		t.Fatalf("printReport error = %v, want %v", err, errTestWrite)
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errTestWrite
 }
 
 func mustDecodeObservation(t *testing.T, src source, raw []byte) observation {
