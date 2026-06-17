@@ -21,6 +21,7 @@ import (
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/atmos/xrpc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -149,17 +150,25 @@ func TestCollect_BackfillCounts(t *testing.T) {
 		require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
 		require.NoError(t, bs.OnComplete(ctx, did, &repo.Commit{Rev: "abcdef"}))
 	}
+	for i := range 2 {
+		did := atmos.DID("did:plc:gone" + string(rune('a'+i)))
+		require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+		require.NoError(t, bs.OnFail(ctx, did, &xrpc.Error{
+			StatusCode: 400, Name: "RepoDeactivated", Message: "Repo has been deactivated",
+		}, 1))
+	}
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
 	require.NoError(t, err)
 	snap, err := c.Snapshot(ctx)
 	require.NoError(t, err)
 
-	require.Equal(t, uint64(8), snap.Backfill.TotalDIDs)
+	require.Equal(t, uint64(10), snap.Backfill.TotalDIDs)
 	require.Equal(t, uint64(5), snap.Backfill.Discovered)
 	require.Equal(t, uint64(3), snap.Backfill.Complete)
 	require.Equal(t, uint64(0), snap.Backfill.Failed)
-	require.InDelta(t, 37.5, snap.Backfill.PercentComplete, 0.001)
+	require.Equal(t, uint64(2), snap.Backfill.Unavailable)
+	require.InDelta(t, 30.0, snap.Backfill.PercentComplete, 0.001)
 }
 
 func TestCollect_HostDiagnosticsFromAggregates(t *testing.T) {
@@ -177,6 +186,7 @@ func TestCollect_HostDiagnosticsFromAggregates(t *testing.T) {
 		NotStarted:       1,
 		Complete:         7,
 		Failed:           2,
+		Unavailable:      1,
 		LastAttemptedAt:  now,
 		LatestError:      "xrpc: HTTP 503",
 		LatestErrorClass: backfill.ErrorClassHTTP5xx,
@@ -198,6 +208,7 @@ func TestCollect_HostDiagnosticsFromAggregates(t *testing.T) {
 	require.Equal(t, "pds.example.com", snap.Hosts.Rows[0].Host)
 	require.Equal(t, uint64(10), snap.Hosts.Rows[0].Total)
 	require.Equal(t, uint64(2), snap.Hosts.Rows[0].Failed)
+	require.Equal(t, uint64(1), snap.Hosts.Rows[0].Unavailable)
 	require.Equal(t, "http_5xx", snap.Hosts.Rows[0].LatestErrorClass)
 	require.Equal(t, uint64(2), snap.Hosts.Rows[0].ErrorClassCounts["http_5xx"])
 	require.Len(t, snap.Hosts.Rows[0].RecentErrors, 1)

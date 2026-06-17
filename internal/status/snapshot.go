@@ -54,6 +54,7 @@ type BackfillStats struct {
 	Discovered      uint64
 	Complete        uint64
 	Failed          uint64
+	Unavailable     uint64
 	PercentComplete float64
 	ListReposCursor string
 	StartedAt       time.Time
@@ -75,6 +76,7 @@ type HostRow struct {
 	NotStarted       uint64
 	Complete         uint64
 	Failed           uint64
+	Unavailable      uint64
 	LastAttemptedAt  time.Time
 	LatestError      string
 	LatestErrorClass string
