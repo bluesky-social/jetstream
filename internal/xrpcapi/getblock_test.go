@@ -88,7 +88,7 @@ func TestGetBlock_BytesMatchOnDisk(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint32(3), hdr.BlockCount)
 
-	for idx := 0; idx < 3; idx++ {
+	for idx := range 3 {
 		resp := doGet(t, blockURL(ts.URL, segName, idx))
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		require.Equal(t, "application/octet-stream", resp.Header.Get("Content-Type"))

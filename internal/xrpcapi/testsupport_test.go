@@ -80,8 +80,8 @@ func writeSealedSegmentBlocks(t *testing.T, dir string, idx, seqStart uint64, pe
 	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: perBlock})
 	require.NoError(t, err)
 	seq := seqStart
-	for b := 0; b < blockCount; b++ {
-		for i := 0; i < perBlock; i++ {
+	for b := range blockCount {
+		for range perBlock {
 			_, err = w.Append(segment.Event{
 				Seq: seq, IndexedAt: int64(1_730_000_000_000_000 + seq*1_000),
 				Kind: segment.KindCreate, DID: "did:plc:test",
