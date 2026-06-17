@@ -730,12 +730,14 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attemp
 		// it as a failed host. Clear LastError/Attempts so a row that
 		// previously failed for another reason doesn't carry a stale
 		// diagnostic into its terminal state.
-		rs.Backfill.Status = StatusUnavailable
-		rs.Backfill.LastError = ""
-		rs.Backfill.Attempts = 0
-		rs.LastAttemptedAt = now
-		return s.putRepoStatusAndCounts(did, rs, hadRow, old, func(hs *HostStatus) {
-			hs.LastAttemptedAt = now
+		return s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
+			rs.Backfill.Status = StatusUnavailable
+			rs.Backfill.LastError = ""
+			rs.Backfill.Attempts = 0
+			rs.LastAttemptedAt = now
+			return func(hs *HostStatus) {
+				hs.LastAttemptedAt = now
+			}, nil
 		})
 	}
 
