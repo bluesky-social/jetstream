@@ -94,7 +94,7 @@ type Config struct {
 
 	// MaxRetries, RetryBaseDelay, and RetryMaxDelay tune the engine's
 	// per-DID retry/backoff loop for transient getRepo failures. A zero
-	// value means "use atmos's default" (5 retries, 1s base, 30s cap),
+	// value means "use atmos's default" (3 retries, 1s base, 30s cap),
 	// so production leaves all three at their zero value. The oracle
 	// fault-injection harness sets RetryBaseDelay to a sub-millisecond
 	// value so injected transient 503s recover without paying atmos's
