@@ -830,6 +830,142 @@ func TestForceRotate_EmptyActiveIsNoOp(t *testing.T) {
 		"empty active segment must be left untouched")
 }
 
+func TestDrainDurability_CommitsHookWithoutPendingEvents(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var gotForce bool
+	var gotNextSeq uint64
+	w, err := Open(Config{
+		SegmentsDir: filepath.Join(dir, "segments"),
+		Store:       st,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+			gotForce = force
+			gotNextSeq = nextSeq
+			return nil, b.Set([]byte("metadata/only"), []byte("ok"), nil)
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, w.DrainDurability(t.Context()))
+	require.True(t, gotForce)
+	require.Equal(t, uint64(0), gotNextSeq)
+
+	got, closer, err := st.Get([]byte("metadata/only"))
+	require.NoError(t, err)
+	require.Equal(t, "ok", string(got))
+	require.NoError(t, closer.Close())
+}
+
+func TestDrainDurability_AsyncCommitsHookWithoutPendingEvents(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	type durableCall struct {
+		nextSeq uint64
+		force   bool
+	}
+	calls := make(chan durableCall, 4)
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		AsyncFlushWorkers: 2,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+			calls <- durableCall{nextSeq: nextSeq, force: force}
+			return nil, b.Set([]byte("metadata/async-only"), []byte("ok"), nil)
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, w.DrainDurability(t.Context()))
+
+	select {
+	case got := <-calls:
+		require.True(t, got.force)
+		require.Equal(t, uint64(0), got.nextSeq)
+	default:
+		require.Fail(t, "durable hook did not run")
+	}
+	require.Empty(t, calls)
+
+	got, closer, err := st.Get([]byte("metadata/async-only"))
+	require.NoError(t, err)
+	require.Equal(t, "ok", string(got))
+	require.NoError(t, closer.Close())
+}
+
+func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	type durableCall struct {
+		nextSeq uint64
+		force   bool
+	}
+	calls := make(chan durableCall, 4)
+	w, err := Open(Config{
+		SegmentsDir:       filepath.Join(dir, "segments"),
+		Store:             st,
+		MaxEventsPerBlock: 64,
+		AsyncFlushWorkers: 2,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), error) {
+			calls <- durableCall{nextSeq: nextSeq, force: force}
+			key := fmt.Sprintf("metadata/async-pending/%t", force)
+			return nil, b.Set([]byte(key), []byte("ok"), nil)
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+
+	require.NoError(t, w.DrainDurability(t.Context()))
+
+	gotCalls := []durableCall{<-calls, <-calls}
+	require.ElementsMatch(t, []durableCall{
+		{nextSeq: 1, force: false},
+		{nextSeq: 1, force: true},
+	}, gotCalls)
+	require.Empty(t, calls)
+
+	for _, key := range []string{"metadata/async-pending/false", "metadata/async-pending/true"} {
+		got, closer, err := st.Get([]byte(key))
+		require.NoError(t, err)
+		require.Equal(t, "ok", string(got))
+		require.NoError(t, closer.Close())
+	}
+	persisted, err := loadNextSeq(st, seqNextKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), persisted)
+
+	path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))
+	var gotEvents []segment.Event
+	require.NoError(t, segment.WalkActive(path, func(events []segment.Event) error {
+		gotEvents = append(gotEvents, events...)
+		return nil
+	}))
+	require.Len(t, gotEvents, 1)
+	require.Equal(t, uint64(0), gotEvents[0].Seq)
+}
+
 // TestForceRotate_FlushedButUnsealedRotates: events already flushed to
 // disk (no pending block) must still rotate — emptiness is about the
 // segment having zero events, not zero buffered events.

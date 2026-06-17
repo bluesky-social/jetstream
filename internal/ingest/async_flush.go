@@ -120,14 +120,17 @@ func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
 	return job, nil
 }
 
-func (w *Writer) waitAsyncFlushes(jobs []*asyncFlushJob) error {
-	var firstErr error
+func (w *Writer) submitAsyncFlushes(jobs []*asyncFlushJob) {
 	for _, job := range jobs {
 		if job == nil {
 			continue
 		}
 		w.async.jobs <- job
 	}
+}
+
+func (w *Writer) waitSubmittedAsyncFlushes(jobs []*asyncFlushJob) error {
+	var firstErr error
 	for _, job := range jobs {
 		if job == nil {
 			continue
@@ -180,19 +183,25 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 }
 
 func (w *Writer) closeAsync() error {
+	w.drainMu.Lock()
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
+		w.drainMu.Unlock()
 		return nil
 	}
 	job, err := w.prepareAsyncFlushLocked()
 	w.closed = true
 	w.mu.Unlock()
+	if err == nil {
+		w.submitAsyncFlushes([]*asyncFlushJob{job})
+	}
+	w.drainMu.Unlock()
 	if err != nil {
 		return err
 	}
 
-	flushErr := w.waitAsyncFlushes([]*asyncFlushJob{job})
+	flushErr := w.waitSubmittedAsyncFlushes([]*asyncFlushJob{job})
 	w.asyncJobs.Wait()
 	w.async.close()
 
