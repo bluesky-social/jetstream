@@ -3,6 +3,7 @@ package xrpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 
@@ -38,27 +39,35 @@ func (c PlanConfig) withDefaults() PlanConfig {
 	return c
 }
 
+// validate reports whether the operator-supplied plan limits are sane. These
+// invariants are the server's responsibility, so failures here map to an
+// InternalError, never a client-facing InvalidRequest.
 func (c PlanConfig) validate() error {
 	if c.MaxDIDs < 0 {
-		return xrpcserver.InvalidRequest("plan max DIDs must be >= 0")
+		return fmt.Errorf("plan max DIDs must be >= 0, got %d", c.MaxDIDs)
 	}
 	if c.MaxCollections < 0 {
-		return xrpcserver.InvalidRequest("plan max collections must be >= 0")
+		return fmt.Errorf("plan max collections must be >= 0, got %d", c.MaxCollections)
 	}
 	if c.MaxEntries <= 0 {
-		return xrpcserver.InvalidRequest("plan max entries must be positive")
+		return fmt.Errorf("plan max entries must be positive, got %d", c.MaxEntries)
 	}
 	if c.WholeSegmentThreshold <= 0 || c.WholeSegmentThreshold > 1 {
-		return xrpcserver.InvalidRequest("plan whole segment threshold must be > 0 and <= 1")
+		return fmt.Errorf("plan whole segment threshold must be > 0 and <= 1, got %g", c.WholeSegmentThreshold)
 	}
 	return nil
 }
 
 func newPlanBackfillHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handler {
 	cfg = cfg.withDefaults()
+	// Validate once at construction rather than per request. runtime.Build
+	// already validates these limits at startup, so a non-nil cfgErr only
+	// arises from direct construction with a bad config; it is a server fault,
+	// surfaced as InternalError below.
+	cfgErr := cfg.validate()
 	return xrpcserver.Procedure(func(ctx context.Context, _ xrpcserver.Params, input *jetstream.JetstreamPlanBackfill_Input) (*jetstream.JetstreamPlanBackfill_Output, error) {
-		if err := cfg.validate(); err != nil {
-			return nil, err
+		if cfgErr != nil {
+			return nil, xrpcserver.InternalError("planBackfill is misconfigured")
 		}
 		req, err := planRequestFromInput(input, cfg)
 		if err != nil {
@@ -74,6 +83,11 @@ func newPlanBackfillHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handle
 				}
 			}
 			if errors.Is(err, manifest.ErrInvalidPlanRequest) {
+				// Defense in depth: planRequestFromInput already rejects the
+				// window/threshold conditions the planner guards, so this is
+				// unreachable on the normal path. The generic message is fine
+				// because the specific cause was already reported upstream when
+				// reachable.
 				return nil, xrpcserver.InvalidRequest("invalid plan request")
 			}
 			return nil, xrpcserver.InternalError("failed to plan backfill")
@@ -127,6 +141,12 @@ func planRequestFromInput(input *jetstream.JetstreamPlanBackfill_Input, cfg Plan
 	return req, nil
 }
 
+// validatePlanDIDs returns the distinct, syntactically-valid DIDs from raw.
+// The limit is on the DISTINCT count. Deduplication happens before parsing
+// (ParseDID returns its input verbatim, so the distinct set is identical
+// either way), and the loop stops once the limit is reached. This bounds parse
+// work and map growth to maxDIDs even when an adversary submits a body full of
+// duplicate DIDs.
 func validatePlanDIDs(raw []string, maxDIDs int) ([]string, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -134,26 +154,26 @@ func validatePlanDIDs(raw []string, maxDIDs int) ([]string, error) {
 	if maxDIDs == 0 {
 		return nil, xrpcserver.InvalidRequest("DID filters are disabled")
 	}
-	seen := make(map[string]struct{}, len(raw))
-	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, min(len(raw), maxDIDs))
+	out := make([]string, 0, min(len(raw), maxDIDs))
 	for _, value := range raw {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		if len(out) == maxDIDs {
+			return nil, xrpcserver.InvalidRequest("too many DIDs")
+		}
+		seen[value] = struct{}{}
 		did, err := atmos.ParseDID(value)
 		if err != nil {
 			return nil, xrpcserver.InvalidRequest("invalid DID: " + value)
 		}
-		s := string(did)
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	if len(out) > maxDIDs {
-		return nil, xrpcserver.InvalidRequest("too many DIDs")
+		out = append(out, string(did))
 	}
 	return out, nil
 }
 
+// validatePlanCollections mirrors validatePlanDIDs for collection NSIDs.
 func validatePlanCollections(raw []string, maxCollections int) ([]string, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -161,22 +181,21 @@ func validatePlanCollections(raw []string, maxCollections int) ([]string, error)
 	if maxCollections == 0 {
 		return nil, xrpcserver.InvalidRequest("collection filters are disabled")
 	}
-	seen := make(map[string]struct{}, len(raw))
-	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, min(len(raw), maxCollections))
+	out := make([]string, 0, min(len(raw), maxCollections))
 	for _, value := range raw {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		if len(out) == maxCollections {
+			return nil, xrpcserver.InvalidRequest("too many collections")
+		}
+		seen[value] = struct{}{}
 		nsid, err := atmos.ParseNSID(value)
 		if err != nil {
 			return nil, xrpcserver.InvalidRequest("invalid collection: " + value)
 		}
-		s := string(nsid)
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	if len(out) > maxCollections {
-		return nil, xrpcserver.InvalidRequest("too many collections")
+		out = append(out, string(nsid))
 	}
 	return out, nil
 }
@@ -220,6 +239,10 @@ func planOutput(plan manifest.PlanBackfillResult) (*jetstream.JetstreamPlanBackf
 		if seg.Mode == manifest.PlanModeBlocks {
 			row.Blocks = make([]jetstream.JetstreamPlanBackfill_BlockRange, 0, len(seg.Blocks))
 			for _, block := range seg.Blocks {
+				// First/Last are small non-negative block indices (bounded by a
+				// segment's block_count), so the int->int64 widening is always
+				// lossless and needs no overflow guard, unlike the uint64 seq
+				// fields routed through int64FromUint64.
 				row.Blocks = append(row.Blocks, jetstream.JetstreamPlanBackfill_BlockRange{
 					First: int64(block.First),
 					Last:  int64(block.Last),

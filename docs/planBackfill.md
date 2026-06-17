@@ -45,10 +45,14 @@ upper bound is the sealed archive tip. If both bounds are present and
 
 Output fields:
 
-- `plannedThroughSeq`: highest sealed seq covered by the plan, capped by
-  `beforeSeq` when present. Clients that want a complete backfill+live flow can
-  separately subscribe from this cursor, but the planner itself does not manage
-  that flow.
+- `plannedThroughSeq`: the sealed-archive coverage horizon for this request —
+  the highest sealed seq the planner authoritatively accounted for, capped by
+  `beforeSeq` when present. It is the sealed tip (capped), independent of how
+  many segments the filters actually matched: a filter that matches nothing in
+  a non-empty archive still reports the tip, because the planner has confirmed
+  there is no matching sealed data at or below it. An empty archive reports `0`.
+  This is the cursor clients hand to `/subscribe` for the live tail; the planner
+  itself does not manage that flow.
 - `segments`: array of planned sealed segment work in ascending segment index.
 - `stats`: small diagnostic counts useful to clients and operators.
 
@@ -56,8 +60,13 @@ Each segment entry has:
 
 - `name`: segment filename accepted by `getSegment` and `getBlock`.
 - `index`: segment index.
-- `checksum`: resident segment checksum as hex. This is advisory metadata and
-  equals the segment ETag when the file generation has not changed.
+- `checksum`: resident segment checksum as a 16-char hex string (unquoted).
+  This is advisory metadata. It equals the value *inside* the strong ETag that
+  `getSegment` returns for the same file (an RFC 9110 strong validator is
+  double-quoted, e.g. `"a1b2c3d4e5f60718"`), so compare against the ETag with
+  its surrounding quotes stripped. Note `getBlock` uses a different ETag form
+  (`<checksum>:<blockIndex>`). The match holds while the file generation is
+  unchanged; compaction rewrites a segment with a new checksum.
 - `minSeq`, `maxSeq`: segment seq envelope.
 - `mode`: either `segment` or `blocks`.
 - `blocks`: only present for `mode=blocks`, as inclusive `{first,last}` ranges.
@@ -90,6 +99,14 @@ Validation:
   disabled by configuration. Empty filters still mean match-all.
 - `plan-max-entries` must be positive. Returning an unbounded response is not
   acceptable on the public surface.
+
+The `plan-max-dids` / `plan-max-collections` limits apply to the number of
+*distinct* values after de-duplication, not the raw array length: a request
+that repeats the same DID is collapsed before the limit is checked. The handler
+de-duplicates before parsing and stops once the distinct limit is reached, so a
+body padded with duplicate entries cannot amplify per-request work beyond the
+configured maximum. Raw array length is still bounded by the XRPC request body
+size limit.
 
 ## Planner Algorithm
 

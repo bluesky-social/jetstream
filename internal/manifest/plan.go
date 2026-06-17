@@ -69,16 +69,35 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
 	if req.HasAfterSeq && req.HasBeforeSeq && req.BeforeSeq <= req.AfterSeq {
 		return PlanBackfillResult{}, ErrInvalidPlanRequest
 	}
+	// MaxEntries <= 0 is a malformed limit, not an oversized plan. Returning
+	// ErrPlanTooLarge here would mislabel a misconfigured caller; reserve that
+	// sentinel for an actually-exceeded valid limit below.
 	if req.MaxEntries <= 0 {
-		return PlanBackfillResult{}, ErrPlanTooLarge
+		return PlanBackfillResult{}, ErrInvalidPlanRequest
 	}
 	if req.WholeSegmentThreshold <= 0 || req.WholeSegmentThreshold > 1 {
 		return PlanBackfillResult{}, ErrInvalidPlanRequest
 	}
 
+	// The requested collection set is request-invariant; resolve it to a lookup
+	// set once rather than rebuilding it for every matched segment.
+	var wantCollections map[string]struct{}
+	if len(req.Collections) > 0 {
+		wantCollections = make(map[string]struct{}, len(req.Collections))
+		for _, collection := range req.Collections {
+			wantCollections[collection] = struct{}{}
+		}
+	}
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	// PlannedThroughSeq is the sealed-archive coverage horizon: the highest
+	// sealed seq the planner authoritatively accounted for (the sealed tip,
+	// capped by beforeSeq), independent of how many segments the filters
+	// matched. A filter that matches nothing in a non-empty archive still
+	// reports the tip, because the planner has confirmed there is no matching
+	// sealed data at or below it. Clients use this as the /subscribe cursor.
 	var result PlanBackfillResult
 	if len(m.segments) > 0 {
 		tip := m.segments[len(m.segments)-1].MaxSeq
@@ -95,7 +114,7 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
 			continue
 		}
 
-		selected := selectPlanBlocks(seg, req)
+		selected := selectPlanBlocks(seg, req, wantCollections)
 		if len(selected) == 0 {
 			continue
 		}
@@ -110,6 +129,12 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
 			MaxSeq:   seg.Header.MaxSeq,
 		}
 
+		// Density is selected blocks over the segment's *total* block count,
+		// not over the in-window/candidate subset. This intentionally biases a
+		// narrow seq window (or a heavily-compacted segment with many empty
+		// blocks) toward mode=blocks, so clients fetch only the few blocks they
+		// need instead of a whole segment. Both modes are correct under the
+		// one-sided contract; this only trades transport precision.
 		density := float64(len(selected)) / float64(max(len(seg.Blocks), 1))
 		if density >= req.WholeSegmentThreshold {
 			planned.Mode = PlanModeSegment
@@ -154,7 +179,7 @@ func blockOverlapsSeq(block segment.BlockInfo, req PlanBackfillRequest) bool {
 	return true
 }
 
-func selectPlanBlocks(seg *SegmentMetadata, req PlanBackfillRequest) []int {
+func selectPlanBlocks(seg *SegmentMetadata, req PlanBackfillRequest, wantCollections map[string]struct{}) []int {
 	collectionMatchAll := len(req.Collections) == 0
 	didMatchAll := len(req.DIDs) == 0
 
@@ -164,7 +189,7 @@ func selectPlanBlocks(seg *SegmentMetadata, req PlanBackfillRequest) []int {
 
 	var collectionIDs map[uint32]struct{}
 	if !collectionMatchAll {
-		collectionIDs = collectionIDsForSegment(seg, req.Collections)
+		collectionIDs = collectionIDsForSegment(seg, wantCollections)
 		if len(collectionIDs) == 0 {
 			return nil
 		}
@@ -214,12 +239,8 @@ func blockBloomMayContainAny(seg *SegmentMetadata, blockIdx int, dids []string) 
 	return false
 }
 
-func collectionIDsForSegment(seg *SegmentMetadata, collections []string) map[uint32]struct{} {
-	want := make(map[string]struct{}, len(collections))
-	for _, collection := range collections {
-		want[collection] = struct{}{}
-	}
-	out := make(map[uint32]struct{}, min(len(collections), len(seg.Collections)))
+func collectionIDsForSegment(seg *SegmentMetadata, want map[string]struct{}) map[uint32]struct{} {
+	out := make(map[uint32]struct{}, min(len(want), len(seg.Collections)))
 	for id, collection := range seg.Collections {
 		if _, ok := want[collection]; ok && id <= math.MaxUint32 {
 			out[uint32(id)] = struct{}{}

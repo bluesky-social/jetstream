@@ -1,7 +1,6 @@
 package manifest_test
 
 import (
-	"errors"
 	"path/filepath"
 	"testing"
 
@@ -234,5 +233,5 @@ func TestPlanBackfill_InvalidRequest(t *testing.T) {
 	req = planReq()
 	req.MaxEntries = 0
 	_, err = m.PlanBackfill(req)
-	require.True(t, errors.Is(err, manifest.ErrPlanTooLarge))
+	require.ErrorIs(t, err, manifest.ErrInvalidPlanRequest)
 }

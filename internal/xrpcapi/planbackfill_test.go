@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -137,6 +138,47 @@ func TestPlanBackfill_ReturnsBlockPlan(t *testing.T) {
 	require.EqualValues(t, 1, out.Stats.Entries)
 }
 
+func TestPlanBackfill_WholeSegmentWireShape(t *testing.T) {
+	t.Parallel()
+
+	// A DID present in 3 of 4 blocks at the default 0.75 threshold yields a
+	// whole-segment entry. WholeSegmentThreshold:0 exercises the withDefaults()
+	// path that fills in the 0.75 default.
+	cfg := PlanConfig{MaxDIDs: 10, MaxCollections: 10, MaxEntries: 100, WholeSegmentThreshold: 0}
+	ts := newPlanTestServer(t, cfg,
+		planEvent(1, "did:plc:target", "app.bsky.feed.post"),
+		planEvent(2, "did:plc:target", "app.bsky.feed.post"),
+		planEvent(3, "did:plc:target", "app.bsky.feed.post"),
+		planEvent(4, "did:plc:other", "app.bsky.feed.post"),
+	)
+
+	resp := doPostJSON(t, ts.URL+planURLPath, map[string]any{"dids": []string{"did:plc:target"}})
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	// Decode into the typed shape and assert mode=segment with no block ranges.
+	var out planResp
+	require.NoError(t, json.Unmarshal(body, &out))
+	require.Len(t, out.Segments, 1)
+	require.Equal(t, "segment", out.Segments[0].Mode)
+	require.Empty(t, out.Segments[0].Blocks, "whole-segment entries carry no block ranges")
+	require.EqualValues(t, 1, out.Stats.Entries)
+
+	// And assert the raw wire payload omits the blocks key entirely (the
+	// generated binding tags it omitempty), so clients never see a stray empty
+	// array for a whole-segment plan.
+	var raw struct {
+		Segments []map[string]json.RawMessage `json:"segments"`
+	}
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.Len(t, raw.Segments, 1)
+	_, hasBlocks := raw.Segments[0]["blocks"]
+	require.False(t, hasBlocks, "mode=segment must omit the blocks field on the wire, got: %s", body)
+}
+
 func TestPlanBackfill_IsPOSTProcedure(t *testing.T) {
 	t.Parallel()
 
@@ -220,11 +262,6 @@ func TestPlanBackfill_InvalidRequests(t *testing.T) {
 			cfg:  defaultPlanTestConfig(),
 			body: map[string]any{"afterSeq": 10, "beforeSeq": 10},
 		},
-		{
-			name: "invalid config",
-			cfg:  PlanConfig{MaxDIDs: 10, MaxCollections: 10, MaxEntries: -1, WholeSegmentThreshold: 1},
-			body: map[string]any{},
-		},
 	}
 
 	for _, tt := range tests {
@@ -237,6 +274,19 @@ func TestPlanBackfill_InvalidRequests(t *testing.T) {
 			require.Equal(t, "InvalidRequest", readXRPCError(t, resp))
 		})
 	}
+}
+
+func TestPlanBackfill_MisconfiguredServerReturnsInternalError(t *testing.T) {
+	t.Parallel()
+
+	// A bad operator config is a server fault, not the client's: it must
+	// surface as a 500 InternalError, never a 400 InvalidRequest that would
+	// blame the caller.
+	ts := newPlanTestServer(t, PlanConfig{MaxDIDs: 10, MaxCollections: 10, MaxEntries: -1, WholeSegmentThreshold: 1})
+	resp := doPostJSON(t, ts.URL+planURLPath, map[string]any{})
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	require.Equal(t, "InternalServerError", readXRPCError(t, resp))
 }
 
 func TestPlanBackfill_InvalidJSON(t *testing.T) {

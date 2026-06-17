@@ -41,6 +41,7 @@
           "properties": {
             "plannedThroughSeq": {
               "type": "integer",
+              "minimum": 0,
               "description": "Highest sealed seq covered by this plan, capped by beforeSeq when provided."
             },
             "segments": {
@@ -60,10 +61,10 @@
       "required": ["name", "index", "checksum", "minSeq", "maxSeq", "mode"],
       "properties": {
         "name": { "type": "string", "description": "Segment filename accepted by getSegment and getBlock." },
-        "index": { "type": "integer", "description": "Zero-based segment index." },
-        "checksum": { "type": "string", "description": "Segment-format xxh3 metadata checksum as 16-char hex." },
-        "minSeq": { "type": "integer" },
-        "maxSeq": { "type": "integer" },
+        "index": { "type": "integer", "minimum": 0, "description": "Zero-based segment index." },
+        "checksum": { "type": "string", "minLength": 16, "maxLength": 16, "description": "Segment-format xxh3 metadata checksum as 16-char hex." },
+        "minSeq": { "type": "integer", "minimum": 0 },
+        "maxSeq": { "type": "integer", "minimum": 0 },
         "mode": {
           "type": "string",
           "knownValues": ["segment", "blocks"],
@@ -88,11 +89,12 @@
       "type": "object",
       "required": ["segmentsExamined", "segmentsMatched", "blocksMatched", "entries"],
       "properties": {
-        "segmentsExamined": { "type": "integer" },
-        "segmentsMatched": { "type": "integer" },
-        "blocksMatched": { "type": "integer" },
+        "segmentsExamined": { "type": "integer", "minimum": 0 },
+        "segmentsMatched": { "type": "integer", "minimum": 0 },
+        "blocksMatched": { "type": "integer", "minimum": 0 },
         "entries": {
           "type": "integer",
+          "minimum": 0,
           "description": "Number of response work entries counted against the server plan limit."
         }
       }
