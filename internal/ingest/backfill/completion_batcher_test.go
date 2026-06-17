@@ -10,6 +10,8 @@ import (
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -310,6 +312,51 @@ func TestCompletionBatcherAfterCommitRemovesOnlyStagedCompletions(t *testing.T) 
 	afterDone(nil)
 	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
+}
+
+func TestCompletionBatcherRecordsQueueAndDurableBatchMetrics(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	metrics := NewMetrics(prometheus.NewRegistry())
+	bs := NewStore(st, metrics)
+	ready := atmos.DID("did:plc:completebatch-metrics-ready")
+	pending := atmos.DID("did:plc:completebatch-metrics-pending")
+	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(ready)))
+	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(pending)))
+
+	cb := NewCompletionBatcher(bs, metrics)
+	cb.RecordWatermark(ready, 41, true)
+	require.NoError(t, cb.QueueComplete(t.Context(), ready, &repo.Commit{DID: string(ready), Rev: "rev-ready"}))
+	cb.RecordWatermark(pending, 50, true)
+	require.NoError(t, cb.QueueComplete(t.Context(), pending, &repo.Commit{DID: string(pending), Rev: "rev-pending"}))
+	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.CompletionQueued), 0)
+	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.CompletionQueueDepth), 0)
+
+	b := st.NewBatch()
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
+	require.NoError(t, err)
+	require.NotNil(t, afterCommit)
+	require.NotNil(t, afterDone)
+
+	commitErr := st.Commit(b, store.SyncWrites)
+	if commitErr != nil {
+		afterDone(commitErr)
+		require.NoError(t, commitErr)
+	}
+	afterCommit()
+	afterDone(nil)
+	require.NoError(t, b.Close())
+
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.CompletionDurableBatches), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.CompletionDurableRepos), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.CompletionQueueDepth), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.Completed), 0)
+	require.InDelta(t, 0.0, testutil.ToFloat64(metrics.CompletionStageErrors), 0)
 }
 
 func TestCompletionBatcherCommitFailureKeepsStagedCompletionQueued(t *testing.T) {

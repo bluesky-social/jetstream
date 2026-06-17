@@ -73,10 +73,14 @@ func (b *completionBatcher) QueueComplete(ctx context.Context, did atmos.DID, co
 	for i := range b.queued {
 		if b.queued[i].did == did {
 			b.queued[i] = completion
+			b.metrics.incCompletionQueued()
+			b.metrics.setCompletionQueueDepth(len(b.queued))
 			return nil
 		}
 	}
 	b.queued = append(b.queued, completion)
+	b.metrics.incCompletionQueued()
+	b.metrics.setCompletionQueueDepth(len(b.queued))
 	return nil
 }
 
@@ -99,6 +103,7 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batc
 	}
 	afterDone, err := b.store.stageCompleteBatch(ctx, batch, staged)
 	if err != nil {
+		b.metrics.incCompletionStageErrors()
 		return nil, nil, err
 	}
 
@@ -107,8 +112,10 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batc
 		once.Do(func() {
 			b.mu.Lock()
 			b.queued = removeQueuedCompletions(b.queued, staged)
+			b.metrics.setCompletionQueueDepth(len(b.queued))
 			b.mu.Unlock()
 
+			b.metrics.observeCompletionDurableBatch(len(staged))
 			for range staged {
 				b.metrics.incCompleted()
 			}

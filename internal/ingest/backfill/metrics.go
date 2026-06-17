@@ -14,14 +14,19 @@ const metricsSubsystem = "backfill"
 // A nil *Metrics is a valid zero-value: every method is a no-op,
 // which lets tests skip metric registration entirely.
 type Metrics struct {
-	Discovered         prometheus.Counter
-	Completed          prometheus.Counter
-	Failed             prometheus.Counter
-	ActiveFlips        prometheus.Counter
-	OnFailErrors       prometheus.Counter
-	HandleRepoDuration prometheus.Histogram
-	ProgressCompleted  prometheus.Gauge
-	DroppedRecords     prometheus.Counter
+	Discovered               prometheus.Counter
+	Completed                prometheus.Counter
+	Failed                   prometheus.Counter
+	ActiveFlips              prometheus.Counter
+	OnFailErrors             prometheus.Counter
+	HandleRepoDuration       prometheus.Histogram
+	ProgressCompleted        prometheus.Gauge
+	DroppedRecords           prometheus.Counter
+	CompletionQueued         prometheus.Counter
+	CompletionQueueDepth     prometheus.Gauge
+	CompletionDurableBatches prometheus.Counter
+	CompletionDurableRepos   prometheus.Counter
+	CompletionStageErrors    prometheus.Counter
 }
 
 // NewMetrics registers the backfill counters against reg. Pass the
@@ -75,10 +80,37 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "dropped_records_total",
 			Help: "Number of upstream repo records skipped because their fields cannot be represented in the segment format.",
 		}),
+		CompletionQueued: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "completion_queued_total",
+			Help: "Number of repo completions queued for async durable metadata commit.",
+		}),
+		CompletionQueueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "completion_queue_depth",
+			Help: "Current number of repo completions waiting for a writer durable metadata batch.",
+		}),
+		CompletionDurableBatches: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "completion_durable_batches_total",
+			Help: "Number of writer durable metadata batches that committed at least one queued repo completion.",
+		}),
+		CompletionDurableRepos: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "completion_durable_repos_total",
+			Help: "Number of queued repo completions committed by writer durable metadata batches.",
+		}),
+		CompletionStageErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "completion_stage_errors_total",
+			Help: "Number of errors staging queued repo completions into a writer durable metadata batch.",
+		}),
 	}
 	reg.MustRegister(
 		m.Discovered, m.Completed, m.Failed, m.ActiveFlips, m.OnFailErrors,
 		m.HandleRepoDuration, m.ProgressCompleted, m.DroppedRecords,
+		m.CompletionQueued, m.CompletionQueueDepth, m.CompletionDurableBatches,
+		m.CompletionDurableRepos, m.CompletionStageErrors,
 	)
 	return m
 }
@@ -136,5 +168,30 @@ func (m *Metrics) setProgressCompleted(v int64) {
 func (m *Metrics) incDroppedRecords() {
 	if m != nil {
 		m.DroppedRecords.Inc()
+	}
+}
+
+func (m *Metrics) incCompletionQueued() {
+	if m != nil {
+		m.CompletionQueued.Inc()
+	}
+}
+
+func (m *Metrics) setCompletionQueueDepth(v int) {
+	if m != nil {
+		m.CompletionQueueDepth.Set(float64(v))
+	}
+}
+
+func (m *Metrics) observeCompletionDurableBatch(repos int) {
+	if m != nil && repos > 0 {
+		m.CompletionDurableBatches.Inc()
+		m.CompletionDurableRepos.Add(float64(repos))
+	}
+}
+
+func (m *Metrics) incCompletionStageErrors() {
+	if m != nil {
+		m.CompletionStageErrors.Inc()
 	}
 }
