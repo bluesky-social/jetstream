@@ -34,9 +34,4 @@ go.work.sum
 # .vscode/
 
 # Files not for distribution
-/docs/*
-!/docs/oracle/
-!/docs/oracle/**
-!/docs/planBackfill.md
-.superpowers/
 /data*
