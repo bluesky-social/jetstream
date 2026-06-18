@@ -34,80 +34,82 @@ const (
 // Kind.
 type Event struct {
 	// DID is the repository (account) this event belongs to.
-	DID string
+	DID string `json:"did"`
 
 	// Seq is Jetstream's monotonic per-event sequence number (the cursor).
 	// Persist the last seen Seq (via Batch.LastCursor) to resume later.
-	Seq uint64
+	Seq uint64 `json:"cursor"`
 
 	// TimeUS is Jetstream's own indexed-at timestamp, microseconds since the
 	// Unix epoch. This is the server's ingest time, not the record's
 	// client-supplied createdAt.
-	TimeUS int64
+	TimeUS int64 `json:"time_us"`
 
 	// Kind selects which of the payload pointers below is populated.
-	Kind Kind
+	Kind Kind `json:"kind"`
 
-	Commit   *Commit
-	Identity *Identity
-	Account  *Account
-	Sync     *Sync
+	Commit   *Commit   `json:"commit,omitempty"`
+	Identity *Identity `json:"identity,omitempty"`
+	Account  *Account  `json:"account,omitempty"`
+	Sync     *Sync     `json:"sync,omitempty"`
 }
 
-// Commit describes a single record mutation.
+// Commit describes a single record mutation. The JSON tags mirror the
+// Jetstream wire shape so json.Marshal(Event) yields the familiar payload.
 type Commit struct {
 	// Operation is create, update, or delete.
-	Operation Operation
+	Operation Operation `json:"operation"`
 
 	// Collection is the record's NSID, e.g. "app.bsky.feed.post".
-	Collection string
+	Collection string `json:"collection"`
 
 	// Rkey is the record key within the collection.
-	Rkey string
+	Rkey string `json:"rkey"`
 
 	// Rev is the repo revision that produced this commit.
-	Rev string
+	Rev string `json:"rev"`
 
 	// CID is the content identifier of the record. Empty for deletes.
-	CID string
+	CID string `json:"cid,omitempty"`
 
 	// Record is the decoded record as a generic atproto object. nil for
 	// deletes. Callers that want typed records can decode RecordCBOR with
 	// their own lexicon codegen.
-	Record map[string]any
+	Record map[string]any `json:"record,omitempty"`
 
 	// RecordCBOR is the raw, byte-exact DAG-CBOR encoding of the record,
 	// suitable for verifying against a PDS or reconstructing the MST. nil for
-	// deletes. It is populated on both the backfill and live paths.
-	RecordCBOR []byte
+	// deletes. It is populated on both the backfill and live paths. Marshals
+	// to base64 (matching the extended wire's record_cbor).
+	RecordCBOR []byte `json:"record_cbor,omitempty"`
 }
 
 // Identity is a #identity event: a change to an account's handle or DID
 // document.
 type Identity struct {
-	DID    string
-	Handle string // empty if not present in the event
-	Seq    int64  // upstream relay sequence number carried by the event
-	Time   string // RFC3339 timestamp from the upstream event
+	DID    string `json:"did"`
+	Handle string `json:"handle,omitempty"` // empty if not present in the event
+	Seq    int64  `json:"seq"`              // upstream relay sequence number carried by the event
+	Time   string `json:"time"`             // RFC3339 timestamp from the upstream event
 }
 
 // Account is a #account event: a change to an account's hosting status.
 type Account struct {
-	DID    string
-	Active bool
+	DID    string `json:"did"`
+	Active bool   `json:"active"`
 	// Status is the inactive reason (e.g. "deleted", "suspended",
 	// "takendown") when Active is false; empty when Active is true.
-	Status string
-	Seq    int64
-	Time   string
+	Status string `json:"status,omitempty"`
+	Seq    int64  `json:"seq"`
+	Time   string `json:"time"`
 }
 
 // Sync is a #sync event: the upstream signaled a repo divergence requiring a
 // resync. The authoritative replacement records follow as their own commit
 // events.
 type Sync struct {
-	DID  string
-	Rev  string
-	Seq  int64
-	Time string
+	DID  string `json:"did"`
+	Rev  string `json:"rev"`
+	Seq  int64  `json:"seq"`
+	Time string `json:"time"`
 }
