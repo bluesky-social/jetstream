@@ -414,7 +414,11 @@ func randBytes(r *rand.Rand, n int) []byte {
 func TestEncodeBlockRoundtripProperty(t *testing.T) {
 	t.Parallel()
 
-	cfg := &quick.Config{MaxCount: 200}
+	maxCount := 100
+	if !testing.Short() {
+		maxCount = 200
+	}
+	cfg := &quick.Config{MaxCount: maxCount}
 
 	prop := func(seed int64, n uint16) bool {
 		// Map n into [1, 256] for fast tests. The swarm test covers

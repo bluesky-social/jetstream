@@ -33,6 +33,15 @@ func newSteadyStateStore(t *testing.T) *store.Store {
 	return st
 }
 
+func waitForTailBlocked(t *testing.T, b *Tail) {
+	t.Helper()
+	select {
+	case <-b.blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not park at live tip")
+	}
+}
+
 func TestHandler_RejectsWhenNotSteadyState(t *testing.T) {
 	t.Parallel()
 
@@ -90,7 +99,7 @@ func TestHandler_HappyPath_DeliversIdentityEvent(t *testing.T) {
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
 	// Give the handler time to register the subscriber.
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	id := &comatproto.SyncSubscribeRepos_Identity{
 		DID:  "did:plc:test",
@@ -143,7 +152,7 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	// Publish a sync event (which the encoder skips) followed by an
 	// identity (which the encoder emits). Only the identity should
@@ -199,7 +208,7 @@ func TestHandler_DefaultModeDoesNotEmitResyncReplacementRows(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	var seq uint64
 	appendSeq(b, &seq, &segment.Event{
@@ -248,7 +257,7 @@ func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	var seq uint64
 	appendSeq(b, &seq, &segment.Event{
@@ -298,7 +307,7 @@ func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	var seq uint64
 	payload := []byte{0xa0}
@@ -375,7 +384,7 @@ func TestHandler_DefaultModeDoesNotEmitExtendedFields(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	var seq uint64
 	appendSeq(b, &seq, &segment.Event{
@@ -586,7 +595,7 @@ func TestHandler_ZstdQueryParam_DeliversDictCompressedFrames(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 	var seq uint64
 	publishIdentity(t, b, &seq, "did:plc:zstdquery", 1)
 
@@ -627,7 +636,7 @@ func TestHandler_ZstdSocketEncodingHeader_DeliversDictCompressedFrames(t *testin
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 	var seq uint64
 	publishIdentity(t, b, &seq, "did:plc:zstdheader", 1)
 
@@ -738,7 +747,7 @@ func TestHandler_NegotiatesCompression_WhenClientOffers(t *testing.T) {
 
 	// Compression is transparent on the wire: a compressed frame must
 	// still decode to the same JSON the uncompressed path produces.
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 	var seq uint64
 	publishIdentity(t, b, &seq, "did:plc:compressed", 1)
 	frame := readOneFrame(t, ctx, conn)
@@ -783,7 +792,7 @@ func TestHandler_NoCompression_WhenClientDoesNotOffer(t *testing.T) {
 	require.Empty(t, resp.Header.Get("Sec-WebSocket-Extensions"),
 		"no compression extension should be negotiated when the client does not offer one")
 
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 	var seq uint64
 	publishIdentity(t, b, &seq, "did:plc:plain", 1)
 	frame := readOneFrame(t, ctx, conn)
@@ -816,7 +825,7 @@ func TestHandler_Filter_WantedCollections_DeliversMatching(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	// Build a record-bearing commit. Encoder needs DAG-CBOR Payload + a CID;
 	// the simplest valid CBOR is an empty map: 0xa0 = empty map.
@@ -863,7 +872,7 @@ func TestHandler_Filter_WantedCollections_TopLevelPrefix(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	var seq uint64
 	publishCommit(t, b, &seq, "did:plc:abc", "com.example.foo", 1)       // outside prefix
@@ -907,7 +916,7 @@ func TestHandler_Filter_WantedCollections_PrefixMatch(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	var seq uint64
 	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.post", 1)
@@ -946,7 +955,7 @@ func TestHandler_Filter_WantedDIDs_DeliversMatching(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	var seq uint64
 	publishCommit(t, b, &seq, "did:plc:other", "app.bsky.feed.post", 1)
@@ -983,7 +992,7 @@ func TestHandler_Filter_IdentityBypassesCollectionFilter(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	var seq uint64
 	publishIdentity(t, b, &seq, "did:plc:any", 1)
@@ -1019,7 +1028,7 @@ func TestHandler_Filter_IdentityRespectsDIDFilter(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	var seq uint64
 	publishIdentity(t, b, &seq, "did:plc:other", 1)
@@ -1056,7 +1065,7 @@ func TestHandler_Filter_MaxMessageSize_DropsOversize(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	// Identity events are tiny; one should fit. Use them as the
 	// "delivered" half of this test rather than constructing oversize
@@ -1151,7 +1160,7 @@ func TestHandler_OptionsUpdate_ChangesFilter(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	// Narrow to likes only.
 	update := SubscriberSourcedMessage{
@@ -1163,7 +1172,7 @@ func TestHandler_OptionsUpdate_ChangesFilter(t *testing.T) {
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, update)))
 
 	// Give the reader goroutine a moment to apply the update.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 
 	var seq uint64
 	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.post", 1)
@@ -1202,7 +1211,7 @@ func TestHandler_OptionsUpdate_InvalidPayloadDisconnects(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusInternalError, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	// Send malformed JSON envelope.
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte("not json")))
@@ -1239,7 +1248,7 @@ func TestHandler_OptionsUpdate_BadNSIDDisconnects(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusInternalError, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	update := SubscriberSourcedMessage{
 		Type: SubMessageTypeOptionsUpdate,
@@ -1285,7 +1294,7 @@ func TestHandler_OptionsUpdate_OversizePayload(t *testing.T) {
 	// the application path observes as a Read error and counts via
 	// the optionsUpdateErrorReasonOversize metric label.
 	defer func() { _ = conn.Close(websocket.StatusInternalError, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	// Send a payload just over MaxSubscriberMessageBytes.
 	big := make([]byte, MaxSubscriberMessageBytes+1)
@@ -1325,7 +1334,7 @@ func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	// V1 PARITY: unknown message types are logged and ignored, not fatal.
 	unknown := SubscriberSourcedMessage{
@@ -1335,7 +1344,7 @@ func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, unknown)))
 
 	// Subsequent events must still flow.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	var seq uint64
 	publishIdentity(t, b, &seq, "did:plc:still-alive", 1)
 	frame := readOneFrame(t, ctx, conn)
@@ -1373,7 +1382,7 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 
 	// Give the handler time to start the reader goroutine but NOT
 	// time to subscribe (it shouldn't subscribe until hello).
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 
 	// Append a matching event. The subscriber loop hasn't started yet (it
 	// waits for hello), so it will begin reading at the live tip — which is
@@ -1385,7 +1394,7 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	// Wait long enough to ensure that IF the event were going to be
 	// delivered, it would have been (but it won't be, because we
 	// haven't sent hello yet).
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 
 	// Send the hello.
 	hello := SubscriberSourcedMessage{
@@ -1395,7 +1404,7 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, hello)))
 
 	// Give the handler time to subscribe.
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	// Publish a fresh event AFTER hello. Only this one should arrive.
 	publishIdentity(t, b, &seq, "did:plc:post-hello", 2)
@@ -1447,7 +1456,7 @@ func TestHandler_RequireHello_FilterFromHelloApplies(t *testing.T) {
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, hello)))
 
 	// Give the handler time to apply the filter and Subscribe.
-	time.Sleep(50 * time.Millisecond)
+	waitForTailBlocked(t, b)
 
 	// Publish an event that the filter should drop, then one it should
 	// pass. The reader can only see the second one if the filter was
@@ -1576,7 +1585,7 @@ func TestHandler_RequireHello_FalseHasNoEffect(t *testing.T) {
 			defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
 			// Wait for the handler to register the subscriber.
-			time.Sleep(50 * time.Millisecond)
+			waitForTailBlocked(t, b)
 
 			// No hello sent. Publish and expect immediate delivery.
 			var seq uint64
@@ -1662,7 +1671,7 @@ func TestHandler_RequireHello_NoLeakOnClientDisconnect(t *testing.T) {
 
 	// Let the handler get into its hello wait. The reader goroutine
 	// is running; the writer-side serve() body is blocked on helloCh.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 
 	// Client closes without sending hello. The handler's reader goroutine
 	// observes the read error, defer cancel()s the connection context,
@@ -1716,8 +1725,8 @@ func TestHandler_RequireHello_MultipleUpdatesDoNotPanic(t *testing.T) {
 	// And a third, for good measure.
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, helloBytes))
 
-	// Give the handler time to process all three and Subscribe.
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the handler to process the hellos and subscribe.
+	waitForTailBlocked(t, b)
 
 	// Confirm normal flow works after the chatty start.
 	var seq uint64

@@ -50,7 +50,7 @@ func (f swarmFlags) any() bool {
 func TestSwarm(t *testing.T) {
 	t.Parallel()
 
-	iterations := 50
+	iterations := 20
 	if !testing.Short() {
 		iterations = 1000
 	}

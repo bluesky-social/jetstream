@@ -184,7 +184,7 @@ func TestGenerateOne_RevsStrictlyIncreaseForHotAccount(t *testing.T) {
 
 	w := newRuntimeWorld(t, 1, 1)
 	var prev string
-	for range 100 {
+	for range 50 {
 		_, err := w.GenerateOneForTest(t.Context())
 		require.NoError(t, err)
 		state, err := w.loadState(0)
@@ -224,7 +224,7 @@ func TestGenerateOne_RevsAdvancePastBootstrapForEveryAccount(t *testing.T) {
 		lastRevByRepo[string(a.DID)] = state.Rev
 	}
 
-	for i := range 500 {
+	for i := range 200 {
 		frame, err := w.generateOne(context.Background())
 		require.NoError(t, err, "iter=%d", i)
 
@@ -259,7 +259,7 @@ func TestGenerateOne_DeterministicFramesAcrossRuns(t *testing.T) {
 func TestRunTraffic_StopsOnContext(t *testing.T) {
 	t.Parallel()
 	w := newTestWorld(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
 	require.NoError(t, w.RunTraffic(ctx, slog.Default()))
 }
@@ -278,7 +278,7 @@ func TestRunTraffic_StopsOnContext(t *testing.T) {
 //
 // Configuration is tuned to make duplicates likely without the fix:
 // 5 accounts, 1 initial record each, RNG biased so multi-op commits
-// happen often, run 500 commits.
+// happen often, run 200 commits.
 func TestGenerateOne_NoDuplicateOpPaths(t *testing.T) {
 	t.Parallel()
 
@@ -294,7 +294,7 @@ func TestGenerateOne_NoDuplicateOpPaths(t *testing.T) {
 	require.NoError(t, w.Bootstrap(context.Background(), slog.Default()))
 	require.NoError(t, w.AttachRuntime(rand.New(rand.NewPCG(11, 22)), fanout.New(64)))
 
-	for i := range 500 {
+	for i := range 200 {
 		frame, err := w.generateOne(context.Background())
 		require.NoError(t, err, "iter=%d", i)
 

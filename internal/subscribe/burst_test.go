@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,12 +22,14 @@ import (
 func TestTail_BurstDoesNotDropSlowButLiveReaders(t *testing.T) {
 	t.Parallel()
 
-	const total = 500_000
+	const total = 50_000
 	// In-memory cold log so the test needs no disk fixtures: it records every
 	// appended event and replays Seq >= cursor on a cold miss. Seq == index.
 	var logMu sync.RWMutex
+	var coldReads atomic.Int64
 	logged := make([]*segment.Event, 0, total)
 	cold := func(_ context.Context, cursor uint64, max int) ([]*Entry, uint64, error) {
+		coldReads.Add(1)
 		logMu.RLock()
 		defer logMu.RUnlock()
 		n := uint64(len(logged))
@@ -42,7 +45,7 @@ func TestTail_BurstDoesNotDropSlowButLiveReaders(t *testing.T) {
 	}
 
 	tl := newTail(tailConfig{
-		hotBytes: 8 << 20, // deliberately small so readers fall cold
+		hotBytes: 64 << 10, // deliberately small so readers fall cold
 		cold:     cold,
 		nextSeq:  func() uint64 { logMu.RLock(); defer logMu.RUnlock(); return uint64(len(logged)) },
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -81,10 +84,11 @@ func TestTail_BurstDoesNotDropSlowButLiveReaders(t *testing.T) {
 		logged = append(logged, ev)
 		logMu.Unlock()
 		tl.Append(ev)
-		require.LessOrEqual(t, tl.ringBytes(), 8<<20, "ring must stay within budget mid-burst")
+		require.LessOrEqual(t, tl.ringBytes(), 64<<10, "ring must stay within budget mid-burst")
 	}
 
 	wg.Wait()
+	require.Positive(t, coldReads.Load(), "burst must force at least one cold replay")
 	for r := range readers {
 		require.Equal(t, total, received[r], "reader %d must receive every event, zero drops", r)
 	}

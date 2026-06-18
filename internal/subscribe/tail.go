@@ -41,6 +41,7 @@ type Tail struct {
 	mu      sync.Mutex
 	ring    *hotRing
 	notify  chan struct{} // closed + replaced on each Append to wake tip waiters
+	blocked chan uint64   // nonblocking test/diagnostic signal when a reader parks at the tip
 	cold    coldReader
 	nextSeq func() uint64
 	logger  *slog.Logger
@@ -98,6 +99,7 @@ func newTail(cfg tailConfig) *Tail {
 	return &Tail{
 		ring:    newHotRing(cfg.hotBytes),
 		notify:  make(chan struct{}),
+		blocked: make(chan uint64, 1024),
 		cold:    cfg.cold,
 		nextSeq: cfg.nextSeq,
 		logger:  cfg.logger,
@@ -201,6 +203,10 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 			return t.cold(ctx, cursor, max)
 		}
 
+		select {
+		case t.blocked <- cursor:
+		default:
+		}
 		select {
 		case <-ctx.Done():
 			return nil, cursor, ctx.Err()
