@@ -21,7 +21,7 @@ func subscribeCommand() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  "host",
-				Usage: "Jetstream host (bare host, host:port, or http(s):// URL)",
+				Usage: "Jetstream host (bare host, host:port, or http(s):// URL); bare hosts default to https except loopback, which defaults to http",
 				Value: "localhost:8080",
 			},
 			&cli.StringSliceFlag{

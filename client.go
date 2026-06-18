@@ -6,6 +6,7 @@ import (
 	"io"
 	"iter"
 	"log/slog"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -160,14 +161,29 @@ type engine interface {
 }
 
 // normalizeHost turns a bare host, host:port, or URL into a normalized
-// "scheme://host[:port]" base URL with no path, defaulting to https.
+// "scheme://host[:port]" base URL with no path.
+//
+// When no scheme is given, it defaults to https — except for loopback hosts
+// (localhost, 127.0.0.0/8, ::1), which default to http since a local dev
+// server almost never terminates TLS. An explicit scheme is always honored.
 func normalizeHost(host string) (string, error) {
 	raw := strings.TrimSpace(host)
 	if raw == "" {
 		return "", fmt.Errorf("jetstream: host is required")
 	}
-	if !strings.Contains(raw, "://") {
-		raw = "https://" + raw
+	schemeless := !strings.Contains(raw, "://")
+	if schemeless {
+		// Parse with a placeholder scheme so url.Parse populates Host/Hostname,
+		// then pick the real default from whether the host is loopback.
+		probe, err := url.Parse("https://" + raw)
+		if err != nil {
+			return "", fmt.Errorf("jetstream: parse host: %w", err)
+		}
+		scheme := "https"
+		if isLoopbackHost(probe.Hostname()) {
+			scheme = "http"
+		}
+		raw = scheme + "://" + raw
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -186,6 +202,23 @@ func normalizeHost(host string) (string, error) {
 		return "", fmt.Errorf("jetstream: host is required")
 	}
 	return u.Scheme + "://" + u.Host, nil
+}
+
+// isLoopbackHost reports whether host (a hostname with no port) refers to the
+// local machine: the literal "localhost" (or any *.localhost name, per RFC
+// 6761) or a loopback IP literal (127.0.0.0/8, ::1).
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	h := strings.ToLower(host)
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // validateConfig rejects internally inconsistent option combinations.

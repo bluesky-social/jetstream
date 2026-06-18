@@ -32,9 +32,11 @@ build:
         commit="${commit}-dirty"
     fi
     date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    go build -trimpath \
-        -ldflags "-X ${pkg}.Version=${version} -X ${pkg}.Commit=${commit} -X ${pkg}.Date=${date}" \
-        -o bin/jetstream ./cmd/jetstream
+    ldflags="-X ${pkg}.Version=${version} -X ${pkg}.Commit=${commit} -X ${pkg}.Date=${date}"
+    for cmd in ./cmd/*/; do
+        name="$(basename "${cmd}")"
+        go build -trimpath -ldflags "${ldflags}" -o "bin/${name}" "${cmd}"
+    done
 
 # Remove build artifacts and local data.
 clean:

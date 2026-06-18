@@ -24,8 +24,14 @@ func TestNormalizeHost(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{name: "bare host", in: "jetstream.us-west.bsky.network", want: "https://jetstream.us-west.bsky.network"},
-		{name: "host:port", in: "localhost:8080", want: "https://localhost:8080"},
+		{name: "bare host defaults https", in: "jetstream.us-west.bsky.network", want: "https://jetstream.us-west.bsky.network"},
+		{name: "bare localhost defaults http", in: "localhost:8080", want: "http://localhost:8080"},
+		{name: "bare localhost no port", in: "localhost", want: "http://localhost"},
+		{name: "bare 127.0.0.1 defaults http", in: "127.0.0.1:8080", want: "http://127.0.0.1:8080"},
+		{name: "bare ipv6 loopback defaults http", in: "[::1]:8080", want: "http://[::1]:8080"},
+		{name: "sub.localhost defaults http", in: "foo.localhost:8080", want: "http://foo.localhost:8080"},
+		{name: "explicit https localhost honored", in: "https://localhost:8080", want: "https://localhost:8080"},
+		{name: "non-loopback ip defaults https", in: "10.0.0.5:8080", want: "https://10.0.0.5:8080"},
 		{name: "http url", in: "http://localhost:8080", want: "http://localhost:8080"},
 		{name: "https url", in: "https://host", want: "https://host"},
 		{name: "ws to http", in: "ws://localhost:8080", want: "http://localhost:8080"},
