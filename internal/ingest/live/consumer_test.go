@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
@@ -203,7 +204,7 @@ func TestOpen_ForwardsWriterMetricsToOwnedIngestWriter(t *testing.T) {
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Verifier:       newTestVerifier(t),
 		WriterMetrics:  writerMetrics,
-		SegmentMetrics: segment.NewMetrics(prometheus.NewRegistry()),
+		SegmentMetrics: obs.NewSegmentMetrics(prometheus.NewRegistry()),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })

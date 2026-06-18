@@ -128,7 +128,7 @@ type Config struct {
 
 	// SegmentMetrics is forwarded to every segment.New call this writer
 	// makes (initial open, post-rotation new active). Optional.
-	SegmentMetrics *segment.Metrics
+	SegmentMetrics segment.SealObserver
 }
 
 func (c *Config) validate() error {

@@ -9,7 +9,6 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/stretchr/testify/require"
 )
 
@@ -91,13 +90,13 @@ func TestRewriteCrashSeams(t *testing.T) {
 
 	for _, tc := range []struct {
 		name              string
-		point             crashpoint.Point
+		point             string
 		wantRewrittenFile bool
 	}{
-		{name: "temp written", point: crashpoint.AfterSegmentRewriteTempWritten, wantRewrittenFile: false},
-		{name: "temp synced", point: crashpoint.AfterSegmentRewriteTempSynced, wantRewrittenFile: false},
-		{name: "renamed", point: crashpoint.AfterSegmentRewriteRenamed, wantRewrittenFile: true},
-		{name: "dir synced", point: crashpoint.AfterSegmentRewriteDirSynced, wantRewrittenFile: true},
+		{name: "temp written", point: CrashPointRewriteTempWritten, wantRewrittenFile: false},
+		{name: "temp synced", point: CrashPointRewriteTempSynced, wantRewrittenFile: false},
+		{name: "renamed", point: CrashPointRewriteRenamed, wantRewrittenFile: true},
+		{name: "dir synced", point: CrashPointRewriteDirSynced, wantRewrittenFile: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -136,11 +135,11 @@ func TestRewriteCrashSeams(t *testing.T) {
 }
 
 type rewritePointInjector struct {
-	point crashpoint.Point
+	point string
 	err   error
 }
 
-func (i rewritePointInjector) SimulateCrash(_ context.Context, point crashpoint.Point) error {
+func (i rewritePointInjector) SimulateCrash(_ context.Context, point string) error {
 	if point == i.point {
 		return i.err
 	}

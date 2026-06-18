@@ -83,6 +83,38 @@ func TestReadBlockFrame_MatchesOnDiskAndDecodes(t *testing.T) {
 	}
 }
 
+func TestDecodeBlockFrame_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	path := buildMultiBlockSegment(t, 4, 2)
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+	hdr, err := ReadSealedHeader(f)
+	require.NoError(t, err)
+
+	r, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	defer func() { _ = r.Close() }()
+
+	for idx := 0; idx < int(hdr.BlockCount); idx++ {
+		frame, err := ReadBlockFrame(f, hdr, idx)
+		require.NoError(t, err)
+
+		got, err := DecodeBlockFrame(frame)
+		require.NoError(t, err)
+		want, err := r.DecodeBlock(idx)
+		require.NoError(t, err)
+		require.Equal(t, want, got, "block %d events via DecodeBlockFrame", idx)
+	}
+}
+
+func TestDecodeBlockFrame_RejectsGarbage(t *testing.T) {
+	t.Parallel()
+	_, err := DecodeBlockFrame([]byte("not a zstd frame"))
+	require.Error(t, err)
+}
+
 func TestReadBlockFrame_OutOfRange(t *testing.T) {
 	t.Parallel()
 

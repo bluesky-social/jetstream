@@ -151,7 +151,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	metrics := obs.NewMetrics()
 	storeMetrics := store.NewMetrics(metrics.Registry)
-	segmentMetrics := segment.NewMetrics(metrics.Registry)
+	segmentMetrics := obs.NewSegmentMetrics(metrics.Registry)
 	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
 	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
 	manifestMetrics := manifest.NewMetrics(metrics.Registry)
@@ -244,7 +244,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	stateStore := syncstate.New(metaStore)
 	tombstones := tombstone.New()
-	overlayMetrics := overlay.NewMetrics(metrics.Registry)
+	overlayMetrics := obs.NewOverlayMetrics(metrics.Registry)
 	overlayCache := overlay.NewCache(overlaySource{set: tombstones, store: metaStore}, overlayMetrics)
 	rt.overlayCache = overlayCache
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})

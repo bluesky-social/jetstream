@@ -337,7 +337,7 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
 						return segment.RowDrop
 					}
 					return segment.RowKeep
-				}, segment.RewriteOptions{CrashInjector: o.cfg.CrashInjector, CandidateDIDs: candidateDIDs})
+				}, segment.RewriteOptions{CrashInjector: crashpoint.ForSegment(o.cfg.CrashInjector), CandidateDIDs: candidateDIDs})
 				if err != nil {
 					return fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err)
 				}

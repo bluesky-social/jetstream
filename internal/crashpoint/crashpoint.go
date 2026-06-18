@@ -6,6 +6,8 @@ package crashpoint
 import (
 	"context"
 	"fmt"
+
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // Point identifies a deterministic crash simulation checkpoint.
@@ -58,22 +60,28 @@ const (
 	// at the next chunk without reintroducing already-applied tombstones.
 	AfterCompactionChunkWatermark Point = "after-compaction-chunk-watermark"
 
+	// The four segment-rewrite seams are owned by package segment (their
+	// firing site), so the constants below are derived from segment's
+	// strings rather than re-declared. This is a compile-time link: if a
+	// segment crash-point string changes, these follow automatically and the
+	// oracle's enumeration cannot reference a stale value.
+
 	// AfterSegmentRewriteTempWritten fires after a segment rewrite has written
 	// all bytes to the temporary replacement file but before fsyncing it.
-	AfterSegmentRewriteTempWritten Point = "after-segment-rewrite-temp-written"
+	AfterSegmentRewriteTempWritten Point = Point(segment.CrashPointRewriteTempWritten)
 
 	// AfterSegmentRewriteTempSynced fires after a segment rewrite has fsynced
 	// the temporary replacement file but before renaming it over the original.
-	AfterSegmentRewriteTempSynced Point = "after-segment-rewrite-temp-synced"
+	AfterSegmentRewriteTempSynced Point = Point(segment.CrashPointRewriteTempSynced)
 
 	// AfterSegmentRewriteRenamed fires after a segment rewrite has renamed the
 	// replacement file over the original but before fsyncing the parent dir.
-	AfterSegmentRewriteRenamed Point = "after-segment-rewrite-renamed"
+	AfterSegmentRewriteRenamed Point = Point(segment.CrashPointRewriteRenamed)
 
 	// AfterSegmentRewriteDirSynced fires after a segment rewrite has fsynced
 	// the parent dir. The replacement is durable; callers must still tolerate
 	// receiving an error at this checkpoint.
-	AfterSegmentRewriteDirSynced Point = "after-segment-rewrite-dir-synced"
+	AfterSegmentRewriteDirSynced Point = Point(segment.CrashPointRewriteDirSynced)
 )
 
 // AllPoints is the single source of truth for the set of declared
@@ -102,6 +110,24 @@ var knownPoints = func() map[Point]struct{} {
 	}
 	return m
 }()
+
+// ForSegment adapts an Injector to segment.CrashInjector, whose seam is
+// string-typed (package segment owns the rewrite crash points and must not
+// import crashpoint). Returns nil when inj is nil so production — which wires
+// no injector — passes a nil segment.CrashInjector and every rewrite seam
+// stays a no-op.
+func ForSegment(inj Injector) segment.CrashInjector {
+	if inj == nil {
+		return nil
+	}
+	return segmentInjector{inj: inj}
+}
+
+type segmentInjector struct{ inj Injector }
+
+func (s segmentInjector) SimulateCrash(ctx context.Context, point string) error {
+	return s.inj.SimulateCrash(ctx, Point(point))
+}
 
 // String returns the stable environment/test name for p.
 func (p Point) String() string {
