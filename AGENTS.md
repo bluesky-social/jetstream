@@ -5,8 +5,11 @@
 Jetstream v2 is a full-network archive and live-streaming service for atproto. Backfill is served as HTTPS segment-file downloads; live tail is the same JSON websocket protocol as Jetstream v1.
 
 - `README.md` covers running the app, tests, and the simulator.
-- `DESIGN.md` is the source of truth for the system. Read it before any non-trivial change, especially anything touching the on-disk segment format.
+- `docs/*` is for documentation that is intended to be read by humans and agents alike
+- `docs/README.md` is the source of truth for the system. Read it before any non-trivial change, especially anything touching the on-disk segment format.
 - This file is the team's coding conventions. It overrides anything inferred from existing code.
+- `specs/*` is documentation intended to be read only by agents
+- `specs/notes/*` are specs and plans documentation that catalogs our train of thought while working on tasks as we go
 
 ## Repo layout
 
