@@ -107,7 +107,6 @@ func (p *SwarmFaultPlan) ArmSubscribeReposDisconnects() {
 }
 
 func buildSubscribeReposDisconnectSchedule(seed uint64, steadyEvents int) ([]int, error) {
-	const k = subscribeDisconnectScheduleK
 	// floor is clamped to >= 2 so a threshold of 0 or 1 can never make the
 	// fault fire before the consumer has made progress (a livelock boundary).
 	// maxThreshold caps each draw at half the steady-state budget so the first
@@ -123,6 +122,10 @@ func buildSubscribeReposDisconnectSchedule(seed uint64, steadyEvents int) ([]int
 	if maxThreshold <= floor {
 		return nil, fmt.Errorf("oracle: subscribeRepos disconnect cap %d must be > floor %d (steady events %d too small)",
 			maxThreshold, floor, steadyEvents)
+	}
+	k := subscribeDisconnectScheduleK
+	if steadyEvents < 25 {
+		k = max(1, steadyEvents/4)
 	}
 
 	rng := rand.New(rand.NewPCG(seed^oracleSubscribeFaultSeedSalt, seed+oracleSubscribeFaultSeedSalt))

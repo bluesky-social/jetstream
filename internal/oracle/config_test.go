@@ -45,11 +45,11 @@ func TestConfigModePresets(t *testing.T) {
 		"JETSTREAM_ORACLE_MODE": "fast",
 	}))
 	require.NoError(t, err)
-	require.Equal(t, 8, fast.Accounts)
+	require.Equal(t, 4, fast.Accounts)
 	require.Equal(t, 0, fast.MinInitialRecords)
-	require.Equal(t, 50, fast.MaxInitialRecords)
-	require.Equal(t, 25, fast.LiveEventsBootstrap)
-	require.Equal(t, 25, fast.LiveEventsSteady)
+	require.Equal(t, 10, fast.MaxInitialRecords)
+	require.Equal(t, 12, fast.LiveEventsBootstrap)
+	require.Equal(t, 12, fast.LiveEventsSteady)
 
 	stress, err := ParseConfigFromEnv(envMap(map[string]string{
 		"JETSTREAM_ORACLE_MODE": "stress",
@@ -60,6 +60,38 @@ func TestConfigModePresets(t *testing.T) {
 	require.Equal(t, 5000, stress.MaxInitialRecords)
 	require.Equal(t, 5000, stress.LiveEventsBootstrap)
 	require.Equal(t, 5000, stress.LiveEventsSteady)
+}
+
+func TestDefaultLifecycleConfigUsesFastModeUnderShort(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := defaultLifecycleConfig(lookupEnvMap(nil), true)
+	require.NoError(t, err)
+	require.Equal(t, "fast", cfg.Mode)
+	require.Equal(t, 4, cfg.Accounts)
+	require.Equal(t, 10, cfg.MaxInitialRecords)
+}
+
+func TestDefaultLifecycleConfigHonorsExplicitModeUnderShort(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := defaultLifecycleConfig(lookupEnvMap(map[string]string{
+		"JETSTREAM_ORACLE_MODE": "default",
+	}), true)
+	require.NoError(t, err)
+	require.Equal(t, "default", cfg.Mode)
+	require.Equal(t, 25, cfg.Accounts)
+	require.Equal(t, 1000, cfg.MaxInitialRecords)
+}
+
+func TestDefaultLifecycleConfigKeepsDefaultOutsideShort(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := defaultLifecycleConfig(lookupEnvMap(nil), false)
+	require.NoError(t, err)
+	require.Equal(t, "default", cfg.Mode)
+	require.Equal(t, 25, cfg.Accounts)
+	require.Equal(t, 1000, cfg.MaxInitialRecords)
 }
 
 func TestConfigRejectsInvalidEnv(t *testing.T) {

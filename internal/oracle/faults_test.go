@@ -144,14 +144,18 @@ func TestBuildSubscribeReposDisconnectScheduleRejectsDegenerateSteadyCounts(t *t
 func TestBuildSubscribeReposDisconnectScheduleAcceptsSupportedModes(t *testing.T) {
 	t.Parallel()
 
-	// steady=6 is the first accepted value (maxThreshold=3 > floor=2); 25 and
-	// 5000 cover the fast and stress presets.
-	for _, steady := range []int{6, 25, 5000} {
+	// steady=6 is the first accepted value (maxThreshold=3 > floor=2); 12
+	// covers the fast preset, while 25 and 5000 cover the full schedule.
+	for _, steady := range []int{6, 12, 25, 5000} {
 		t.Run(fmt.Sprintf("steady_%d", steady), func(t *testing.T) {
 			t.Parallel()
 			got, err := buildSubscribeReposDisconnectSchedule(123, steady)
 			require.NoError(t, err)
-			require.Len(t, got, 8)
+			wantLen := subscribeDisconnectScheduleK
+			if steady < 25 {
+				wantLen = max(1, steady/4)
+			}
+			require.Len(t, got, wantLen)
 		})
 	}
 }

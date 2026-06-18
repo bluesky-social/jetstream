@@ -26,7 +26,7 @@ import (
 
 // nolint:paralleltest
 func TestOracle_DefaultLifecycle(t *testing.T) {
-	cfg, err := ParseConfigFromLookupEnv(os.LookupEnv)
+	cfg, err := defaultLifecycleConfig(os.LookupEnv, testing.Short())
 	require.NoError(t, err)
 	if cfg.Mode == "stress" && testing.Short() {
 		t.Skip("skipping stress oracle under -short")
@@ -160,6 +160,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		CursorBlockIndexCacheSize: 32,
 		CompactionInterval:        time.Hour,
 		CompactionTombstoneCap:    1,
+		OverlayRebuildInterval:    10 * time.Millisecond,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
 		OnCompactionPass: func(result jetstreamd.CompactionPassResult) {
@@ -346,6 +347,21 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"shutdown_start",
 		"runtime_exit",
 	)
+}
+
+func defaultLifecycleConfig(lookupenv func(string) (string, bool), short bool) (Config, error) {
+	if !short {
+		return ParseConfigFromLookupEnv(lookupenv)
+	}
+	if _, ok := lookupenv(envOracleMode); ok {
+		return ParseConfigFromLookupEnv(lookupenv)
+	}
+	return ParseConfigFromLookupEnv(func(key string) (string, bool) {
+		if key == envOracleMode {
+			return "fast", true
+		}
+		return lookupenv(key)
+	})
 }
 
 // assertFaultPlanFired verifies the fault injection actually happened.

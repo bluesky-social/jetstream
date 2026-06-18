@@ -80,6 +80,7 @@ type Options struct {
 	CompactionInterval        time.Duration
 	CompactionTombstoneCap    int
 	CompactionRewriteWorkers  int
+	OverlayRebuildInterval    time.Duration
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
 	OnCompactionPass          func(CompactionPassResult)

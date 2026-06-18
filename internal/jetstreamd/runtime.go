@@ -74,6 +74,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.CompactionInterval < 0 {
 		return nil, fmt.Errorf("serve: --compaction-interval must be >= 0 (CompactionInterval must be >= 0), got %s", opts.CompactionInterval)
 	}
+	if opts.OverlayRebuildInterval < 0 {
+		return nil, fmt.Errorf("serve: overlay rebuild interval must be >= 0 (OverlayRebuildInterval must be >= 0), got %s", opts.OverlayRebuildInterval)
+	}
 	if opts.CompactionTombstoneCap < 0 {
 		return nil, fmt.Errorf("serve: --compaction-tombstone-cap must be >= 0 (CompactionTombstoneCap must be >= 0), got %d", opts.CompactionTombstoneCap)
 	}
@@ -435,6 +438,10 @@ func (r *Runtime) PublicAddr() string {
 // fatal subsystem error.
 func (r *Runtime) Run(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
+	overlayInterval := r.opts.OverlayRebuildInterval
+	if overlayInterval == 0 {
+		overlayInterval = overlayRebuildInterval
+	}
 
 	g.Go(func() error {
 		<-gctx.Done()
@@ -461,7 +468,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	})
 
 	g.Go(func() error {
-		err := r.overlayCache.RunTicker(gctx, overlayRebuildInterval)
+		err := r.overlayCache.RunTicker(gctx, overlayInterval)
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}

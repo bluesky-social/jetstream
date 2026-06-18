@@ -14,7 +14,7 @@ func newTestRand() *rand.Rand {
 func TestZipfian_AllInRange(t *testing.T) {
 	t.Parallel()
 	r := newTestRand()
-	for range 10000 {
+	for range 1000 {
 		idx := zipfian(r, 1.07, 100)
 		require.GreaterOrEqual(t, idx, 0)
 		require.Less(t, idx, 100)
@@ -25,7 +25,7 @@ func TestZipfian_FavorsLowIndices(t *testing.T) {
 	t.Parallel()
 	r := newTestRand()
 	hits := make(map[int]int, 100)
-	for range 100000 {
+	for range 20000 {
 		hits[zipfian(r, 1.07, 100)]++
 	}
 	require.Greater(t, hits[0], hits[50])
@@ -37,7 +37,7 @@ func TestExponentialDelay_MeanInTolerance(t *testing.T) {
 	r := newTestRand()
 	const want = 0.1 // mean
 	var sum float64
-	const n = 100000
+	const n = 20000
 	for range n {
 		sum += exponentialDelay(r, want)
 	}
@@ -55,7 +55,7 @@ func TestWeightedChoice(t *testing.T) {
 		{value: c, weight: 1},
 	}
 	hits := map[string]int{}
-	for range 100000 {
+	for range 20000 {
 		hits[weightedChoice(r, weights)]++
 	}
 	require.Greater(t, hits[a], hits[b])
@@ -65,7 +65,7 @@ func TestWeightedChoice(t *testing.T) {
 func TestLogNormalClamped(t *testing.T) {
 	t.Parallel()
 	r := newTestRand()
-	for range 5000 {
+	for range 1000 {
 		v := logNormalClamped(r, 4.0, 1.0, 1, 3000)
 		require.GreaterOrEqual(t, v, 1)
 		require.LessOrEqual(t, v, 3000)

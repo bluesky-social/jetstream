@@ -53,7 +53,7 @@ func TestHandler_GracefulShutdownSendsGoingAway(t *testing.T) {
 	defer func() { _ = conn.CloseNow() }()
 
 	// Let the handler register its connection in the shutdown registry.
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 
 	// Model a real subscriber: always blocked in Read consuming the
 	// firehose. This matters for timing — the server's closeConn does a
