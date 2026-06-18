@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,6 +29,10 @@ type archiveServer struct {
 	segments  map[string][]byte // name -> whole sealed file bytes
 	blockReqs atomic.Int64
 	segReqs   atomic.Int64
+	// segGate, when non-nil, is awaited at the start of every getSegment before
+	// the response is served. Cutover tests use it to deterministically order a
+	// live-buffer append ahead of the backfill completing.
+	segGate <-chan struct{}
 }
 
 func newArchiveServer(t *testing.T) *archiveServer {
@@ -37,6 +42,16 @@ func newArchiveServer(t *testing.T) *archiveServer {
 	as.mux = mux
 	mux.HandleFunc("/xrpc/network.bsky.jetstream.getSegment", func(w http.ResponseWriter, r *http.Request) {
 		as.segReqs.Add(1)
+		as.mu.Lock()
+		gate := as.segGate
+		as.mu.Unlock()
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		name := r.URL.Query().Get("name")
 		as.mu.Lock()
 		raw, ok := as.segments[name]
@@ -282,6 +297,62 @@ func TestDownloadEmitStopCancelsDownloads(t *testing.T) {
 	require.Equal(t, 1, emitted, "emit must be called exactly once before stopping")
 	require.Less(t, int(as.segReqs.Load()), n,
 		"early stop must cancel pending downloads, not fetch the whole plan")
+}
+
+// TestDownloadBlocksMaxUint32NoWraparound guards against the unsigned
+// wraparound non-termination: a block range ending at math.MaxUint32 (which the
+// planner's `> MaxUint32` validation permits) must be visited exactly once. A
+// uint32 loop counter would wrap from MaxUint32 back to 0 after the final
+// increment and call getBlock forever. The server serves a valid frame for any
+// blockIndex and fails the test if getBlock is called more than once, so a
+// wrapped second call is caught immediately rather than hanging.
+func TestDownloadBlocksMaxUint32NoWraparound(t *testing.T) {
+	t.Parallel()
+
+	// Build a real one-block segment and capture its block-0 frame so the test
+	// server can serve a decodable frame for the MaxUint32 index.
+	src := newArchiveServer(t)
+	src.addSegment(t, "seg_src.jss", []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+	})
+	src.mu.Lock()
+	raw := src.segments["seg_src.jss"]
+	src.mu.Unlock()
+	hdr, err := segment.ReadSealedHeader(bytes.NewReader(raw))
+	require.NoError(t, err)
+	frame, err := segment.ReadBlockFrame(bytes.NewReader(raw), hdr, 0)
+	require.NoError(t, err)
+
+	var calls atomic.Int64
+	var firstIdx atomic.Value // string: the blockIndex of the first call
+	mux := http.NewServeMux()
+	mux.HandleFunc("/xrpc/network.bsky.jetstream.getBlock", func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		idx := r.URL.Query().Get("blockIndex")
+		if n == 1 {
+			firstIdx.Store(idx)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(frame)
+			return
+		}
+		// A second call means the uint32 loop counter wrapped from MaxUint32 to
+		// 0. Error out so the buggy loop terminates (instead of looping 2^32
+		// times) and the test observes calls > 1 rather than hanging.
+		writeXRPCError(w, http.StatusInternalServerError, "UnexpectedSecondCall")
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	d := NewDownloader(&xrpc.Client{Host: srv.URL}, 1, nil)
+	entries := []PlanEntry{{
+		SegmentName: "seg_max.jss", Index: 0, Mode: ModeBlocks,
+		Blocks: []BlockRange{{First: math.MaxUint32, Last: math.MaxUint32}},
+	}}
+
+	got := collectOrdered(t, d, entries)
+	require.Equal(t, []uint64{1}, seqs(got))
+	require.Equal(t, int64(1), calls.Load(), "exactly one getBlock call for a single-index range at MaxUint32; >1 means the counter wrapped")
+	require.Equal(t, strconv.FormatUint(math.MaxUint32, 10), firstIdx.Load(), "the single call must be for the MaxUint32 index")
 }
 
 func seqs(events []Event) []uint64 {

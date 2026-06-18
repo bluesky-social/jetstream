@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -127,6 +128,42 @@ func TestPlanInputMapping(t *testing.T) {
 	require.ElementsMatch(t, []any{"app.bsky.feed.post", "app.bsky.feed.*"}, in["collections"])
 	require.EqualValues(t, 42, in["afterSeq"])
 	require.EqualValues(t, 1000, in["beforeSeq"])
+}
+
+// TestPlanRejectsCursorOverflow guards the int64 boundary: WithAfterSeq /
+// WithBeforeSeq accept arbitrary uint64 from the public API, but the lexicon
+// fields are int64. A value > MaxInt64 would wrap negative and silently make
+// the server plan from the wrong range. Plan must reject it before any request
+// rather than corrupt the query.
+func TestPlanRejectsCursorOverflow(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		req  PlanRequest
+	}{
+		{name: "afterSeq overflow", req: PlanRequest{AfterSeq: math.MaxInt64 + 1}},
+		{name: "afterSeq max uint64", req: PlanRequest{AfterSeq: math.MaxUint64}},
+		{name: "beforeSeq overflow", req: PlanRequest{HasBeforeSeq: true, BeforeSeq: math.MaxInt64 + 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Server fails the test if it is ever called: the guard must trip
+			// before the request leaves the client.
+			ps := newPlanServer(t, http.StatusOK, `{"plannedThroughSeq":0,"segments":[],"stats":{}}`)
+			before := len(ps.lastBody)
+			_, err := ps.planner().Plan(context.Background(), tc.req)
+			require.Error(t, err)
+			require.Equal(t, before, len(ps.lastBody), "no request should be sent for an out-of-range cursor")
+		})
+	}
+
+	// A value exactly at MaxInt64 is the largest legal cursor and must pass.
+	t.Run("afterSeq at int64 max is allowed", func(t *testing.T) {
+		t.Parallel()
+		ps := newPlanServer(t, http.StatusOK, `{"plannedThroughSeq":0,"segments":[],"stats":{}}`)
+		_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: math.MaxInt64})
+		require.NoError(t, err)
+	})
 }
 
 func TestPlanInputOmitsEmptyFilters(t *testing.T) {

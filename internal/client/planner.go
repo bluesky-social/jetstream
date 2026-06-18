@@ -124,6 +124,15 @@ func NewPlanner(xc *xrpc.Client) *Planner {
 // into an ordered Plan. It returns ErrPlanTooLarge (wrapped) when the server
 // rejects the query as too large.
 func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
+	// The planBackfill lexicon fields are int64; reject a uint64 cursor that
+	// would wrap negative rather than silently plan from the wrong range
+	// (symmetric with the negative-seq guards on the response side below).
+	if req.AfterSeq > math.MaxInt64 {
+		return nil, fmt.Errorf("jetstream: afterSeq %d exceeds int64 max", req.AfterSeq)
+	}
+	if req.HasBeforeSeq && req.BeforeSeq > math.MaxInt64 {
+		return nil, fmt.Errorf("jetstream: beforeSeq %d exceeds int64 max", req.BeforeSeq)
+	}
 	in := planInput(req)
 	out, err := jetstream.JetstreamPlanBackfill(ctx, p.xc, in)
 	if err != nil {

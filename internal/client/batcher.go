@@ -12,26 +12,31 @@ import "sync"
 // timer goroutine. The mutex also serializes the downstream emit so the
 // iterator's yield is never called concurrently.
 type batcher struct {
-	mu     sync.Mutex
-	size   int
-	buf    []Event
-	emit   func(batch []Event) bool
-	stop   bool   // set once emit returned false; further adds are no-ops
-	onStop func() // fired exactly once when the batcher first stops
-	onced  bool   // guards onStop
+	mu      sync.Mutex
+	size    int
+	buf     []Event
+	emit    func(batch []Event) bool
+	emitErr func(error) bool // serialized recoverable-error emission
+	stop    bool             // set once emit returned false; further adds are no-ops
+	onStop  func()           // fired exactly once when the batcher first stops
+	onced   bool             // guards onStop
 }
 
-func newBatcher(size int, emit func(batch []Event) bool) *batcher {
+func newBatcher(size int, emit func(batch []Event) bool, emitErr func(error) bool) *batcher {
 	if size < 1 {
 		size = 1
 	}
-	return &batcher{size: size, emit: emit, buf: make([]Event, 0, size)}
+	return &batcher{size: size, emit: emit, emitErr: emitErr, buf: make([]Event, 0, size)}
 }
 
 // setOnStop registers a callback fired exactly once when the consumer first
 // asks to stop (emit returns false). The engine uses it to cancel the live
 // tail so a quiet steady-state stream still unwinds promptly: the periodic
 // flusher's yield returns false even when no live event is arriving.
+//
+// Register it BEFORE any goroutine (e.g. the flusher) can drive a stopping
+// emit: fireStopLocked latches onced=true the first time the batcher stops, so
+// a stop that races ahead of setOnStop would leave onStop permanently unfired.
 func (b *batcher) setOnStop(fn func()) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -61,6 +66,32 @@ func (b *batcher) add(ev Event) bool {
 	b.buf = append(b.buf, ev)
 	if len(b.buf) >= b.size {
 		return b.flushLocked()
+	}
+	return true
+}
+
+// emitError emits a recoverable error downstream, serialized against batch
+// emission by b.mu so the consumer's yield is never called concurrently (the
+// live goroutine reports errors while the flusher goroutine emits batches). Any
+// buffered events are flushed first so an error never jumps ahead of events
+// already accepted. Returns false if the consumer asked to stop, after which
+// the batcher is inert (mirroring a batch-emit stop, including onStop).
+func (b *batcher) emitError(err error) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stop {
+		return false
+	}
+	if !b.flushLocked() {
+		return false
+	}
+	if b.emitErr == nil {
+		return true
+	}
+	if !b.emitErr(err) {
+		b.stop = true
+		b.fireStopLocked()
+		return false
 	}
 	return true
 }

@@ -177,7 +177,11 @@ func (d *Downloader) downloadWholeSegment(ctx context.Context, entry PlanEntry) 
 func (d *Downloader) downloadBlocks(ctx context.Context, entry PlanEntry) ([]Event, error) {
 	var events []Event
 	for _, br := range entry.Blocks {
-		for idx := br.First; idx <= br.Last; idx++ {
+		// idx is widened to uint64 so a range ending at the uint32 max
+		// (math.MaxUint32 passes the planner's `> MaxUint32` validation) does
+		// not wrap back to 0 on the final increment and loop forever. The body
+		// only runs for idx <= br.Last <= MaxUint32, so int64/int narrowing is safe.
+		for idx := uint64(br.First); idx <= uint64(br.Last); idx++ {
 			frame, err := jetstream.JetstreamGetBlock(ctx, d.xc, int64(idx), entry.SegmentName)
 			if err != nil {
 				return nil, fmt.Errorf("jetstream: getBlock %d of %q: %w", idx, entry.SegmentName, err)

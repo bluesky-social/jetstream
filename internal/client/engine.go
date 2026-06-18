@@ -113,15 +113,19 @@ func (e *Engine) Run(ctx context.Context, emitBatch func([]Event) bool, emitErr 
 // runLiveOnly is the pure live-tail path (no backfill options): tail from the
 // caller's saved cursor (or the current tip) with no archive negotiation.
 func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
-	b := newBatcher(e.cfg.BatchSize, emitBatch)
+	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 	liveCtx, stopLive := context.WithCancel(ctx)
 	defer stopLive()
-	stopFlusher := e.startFlusher(liveCtx, b)
-	defer stopFlusher()
+	// Register onStop BEFORE starting the flusher: the flusher's first yield can
+	// observe a consumer stop, and if it does so before onStop is set, the
+	// batcher latches onced=true with a nil onStop and stopLive would never fire
+	// (a quiet tail would then block until ctx cancel).
+	b.setOnStop(stopLive)
 	// Cancel the live consumer when emission stops, so a quiet tail unwinds via
 	// the flusher's stop-propagating yield rather than blocking until ctx
 	// cancel (see runBackfillThenLive for the same rationale).
-	b.setOnStop(stopLive)
+	stopFlusher := e.startFlusher(liveCtx, b)
+	defer stopFlusher()
 	consumer := newLiveConsumer(liveConfig{
 		host:       e.cfg.Host,
 		cursor:     e.cfg.LiveCursor,
@@ -129,9 +133,13 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 		logger:     e.logger,
 		backoffMin: e.cfg.LiveBackoffMin,
 	})
+	// Route both events and errors through the batcher so the downstream yield
+	// is serialized against the flusher goroutine, and an error the consumer
+	// rejects stops batching (and fires onStop -> stopLive) instead of being
+	// emitted concurrently and then ignored.
 	_ = consumer.Run(liveCtx, func(ev *Event, _ []byte, err error) bool {
 		if err != nil {
-			return emitErr(err)
+			return b.emitError(err)
 		}
 		return b.add(*ev)
 	})
@@ -190,16 +198,19 @@ func (e *Engine) startFlusher(ctx context.Context, b *batcher) func() {
 // active (unsealed) segment, seq in (plannedThroughSeq, M], are not
 // downloadable from the archive and are delivered by the live tail instead.
 func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
-	// 1. Overlay seed.
+	// 1. Overlay seed. A seed failure is terminal: without the tombstone base
+	// the suppressor cannot honor the deletion guarantee, so abort fatally
+	// rather than emit unsuppressed historical rows.
 	if _, _, err := e.suppressor.SeedFromOverlay(ctx, e.cfg.XRPC); err != nil {
-		emitErr(err)
+		emitErr(fatal(err))
 		return
 	}
 
-	// 2. Plan.
+	// 2. Plan. A plan failure is terminal: there is no archive transport plan to
+	// execute.
 	plan, err := e.planner.Plan(ctx, e.cfg.Request)
 	if err != nil {
-		emitErr(err)
+		emitErr(fatal(err))
 		return
 	}
 
@@ -226,14 +237,16 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		_ = consumer.Run(liveCtx, sink.onLive)
 	})
 
-	b := newBatcher(e.cfg.BatchSize, emitBatch)
+	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 
 	// 4. Download + emit the backfill in plan order. Rows are filtered +
-	// suppressed before decode by the downloader's selector.
+	// suppressed before decode by the downloader's selector. Errors flow
+	// through the batcher (b.emitError) so they stay serialized with batch
+	// emission once the flusher goroutine starts in phase 5.
 	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
 	derr := dl.Download(ctx, plan.Entries, func(res EntryResult) bool {
 		if res.Err != nil {
-			return emitErr(res.Err)
+			return b.emitError(res.Err)
 		}
 		for _, ev := range res.Events {
 			if !b.add(ev) {
@@ -258,20 +271,37 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 
 	// 5. Flip the sink: from here, buffered then live frames flow through the
 	// same batcher. Drain everything strictly above the sealed tip (the
-	// backfill already emitted <= plannedThroughSeq). Start the max-latency
-	// flusher now so steady-state low-volume tail batches deliver promptly.
-	stopFlusher := e.startFlusher(ctx, b)
-	defer stopFlusher()
+	// backfill already emitted <= plannedThroughSeq).
+	//
 	// When emission stops (the consumer broke the iterator), cancel the live
 	// context so the live consumer exits and liveWG.Wait below returns. The
 	// stop is observed two ways: an arriving live event whose b.add returns
 	// false, and — crucially for a quiet tail — the periodic flusher's yield
 	// returning false, which fires the batcher's onStop. Without the latter, a
 	// steady-state stream with no new events never unwinds until ctx cancel.
+	//
+	// onStop MUST be registered before the flusher starts: otherwise the
+	// flusher's first yield could latch the batcher's once-guard with a nil
+	// onStop, and stopLive would never fire.
 	b.setOnStop(stopLive)
+	// Start the max-latency flusher so steady-state low-volume tail batches
+	// deliver promptly.
+	stopFlusher := e.startFlusher(ctx, b)
+	defer stopFlusher()
 	emitLive := func(ev Event) bool { return b.add(ev) }
-	if err := sink.flipAndDrain(ctx, plan.PlannedThroughSeq, emitLive, emitErr); err != nil {
-		emitErr(err)
+	if err := sink.flipAndDrain(ctx, plan.PlannedThroughSeq, emitLive, b.emitError); err != nil {
+		// A cutover replay/append failure breaks the at-least-once handoff
+		// guarantee: surface it as fatal so the consumer aborts rather than
+		// continues against a truncated stream.
+		b.emitError(fatal(err))
+		// flipAndDrain failed before installing the forward path, so the
+		// batcher's onStop can never fire and a quiet live tail would never
+		// observe a stop. Cancel the live consumer explicitly so liveWG.Wait
+		// below returns instead of blocking until parent-ctx cancel (mirrors the
+		// ctx-cancel and b.stopped early-return branches above).
+		stopLive()
+		liveWG.Wait()
+		return
 	}
 
 	// 6. Steady state: the live consumer now forwards directly through the

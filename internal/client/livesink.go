@@ -28,6 +28,11 @@ type liveSink struct {
 	mu         sync.Mutex
 	forwarding bool
 	forward    func(Event) bool // set at flip; called under mu while forwarding
+	// fatalErr records a buffering-phase failure (e.g. a buffer append error)
+	// that stopped the live consumer. It is surfaced by flipAndDrain so the
+	// engine aborts the cutover rather than replaying a truncated buffer and
+	// silently dropping the live frames that never got persisted.
+	fatalErr error
 }
 
 func newLiveSink(buf Buffer, suppressor *Suppressor, matcher *Matcher) *liveSink {
@@ -65,8 +70,12 @@ func (s *liveSink) onLive(ev *Event, raw []byte, err error) bool {
 	// the raw bytes (re-decoded on replay) avoids a lossy re-marshal of the
 	// decoded event.
 	if aErr := s.buf.Append([]LiveFrame{{Seq: ev.Seq, Data: append([]byte(nil), raw...)}}); aErr != nil {
-		// A buffer append failure is fatal to the cutover guarantee; stop the
-		// live consumer so the engine surfaces it.
+		// A buffer append failure is fatal to the cutover guarantee: the buffer
+		// is now missing this frame (and the consumer is about to exit, so it
+		// will miss every later frame too). Record it and stop the live
+		// consumer; flipAndDrain surfaces fatalErr instead of replaying a
+		// truncated buffer.
+		s.fatalErr = fmt.Errorf("jetstream: append live buffer seq=%d: %w", ev.Seq, aErr)
 		return false
 	}
 	return true
@@ -80,6 +89,16 @@ func (s *liveSink) onLive(ev *Event, raw []byte, err error) bool {
 func (s *liveSink) flipAndDrain(ctx context.Context, throughSeq uint64, emit func(Event) bool, emitErr func(error) bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// A buffering-phase append failure means the buffer is incomplete; aborting
+	// here is mandatory — replaying it would silently drop the un-persisted live
+	// frames. Install a stop-forwarder so any late live event unwinds the
+	// consumer rather than re-entering the buffering branch.
+	if s.fatalErr != nil {
+		s.forwarding = true
+		s.forward = func(Event) bool { return false }
+		return s.fatalErr
+	}
 
 	var lastDrained uint64
 	for fr, err := range s.buf.Replay(ctx, throughSeq) {

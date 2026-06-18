@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -369,6 +370,253 @@ func TestEngineLiveOnlyBreakOnQuietTail(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("engine did not unwind after consumer stop on a quiet tail")
 	}
+}
+
+// failOnNthAppendBuffer wraps memBuffer and fails the Nth Append call, modeling
+// a durable-buffer write failure during the cutover. The frame whose append
+// fails (and every later frame) is therefore NOT persisted.
+type failOnNthAppendBuffer struct {
+	memBuffer
+	failAt  int // 1-based append index to fail
+	appends atomic.Int64
+}
+
+func (b *failOnNthAppendBuffer) Append(frames []LiveFrame) error {
+	if int(b.appends.Add(1)) == b.failAt {
+		return fmt.Errorf("simulated buffer append failure")
+	}
+	return b.memBuffer.Append(frames)
+}
+
+// TestEngineCutoverAppendFailureSurfaces is the B3 regression guard: a live
+// buffer Append failure during the buffering phase must be surfaced as an
+// error, not silently swallowed. Before the fix, onLive returned false, the
+// live consumer exited cleanly (errEmitStop -> nil), and flipAndDrain replayed
+// a truncated buffer — silently dropping every un-persisted live frame and
+// exiting "successfully". That is the silent-data-loss class we forbid.
+func TestEngineCutoverAppendFailureSurfaces(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	// Small sealed archive (seqs 1..2), plannedThroughSeq = 2.
+	h.as.addSegment(t, "seg_0000000000.jss", []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+	})
+	h.planned = 2
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 2}}
+	h.overlayM = 2
+
+	// Live frames above the sealed tip that the cutover must not lose.
+	for i := uint64(3); i <= 5; i++ {
+		h.liveSteps = append(h.liveSteps, readStep{
+			data: liveCommitFrame(t, i, "did:plc:a", "create", "app.bsky.feed.post", "r"+itoaU(i), true),
+		})
+	}
+	h.installHandlers()
+
+	// Gate getSegment until at least one live frame has been appended, so the
+	// failing append happens during the buffering phase (before flipAndDrain).
+	gate := make(chan struct{})
+	h.as.mu.Lock()
+	h.as.segGate = gate
+	h.as.mu.Unlock()
+
+	buf := &failOnNthAppendBuffer{failAt: 1}
+	cfg := h.cfg()
+	cfg.Buffer = buf
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var (
+		mu      sync.Mutex
+		gotErr  error
+		opened  = make(chan struct{})
+		onceOpn sync.Once
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func([]Event) bool { return true },
+			func(err error) bool {
+				mu.Lock()
+				if gotErr == nil {
+					gotErr = err
+				}
+				mu.Unlock()
+				return true
+			},
+		)
+	}()
+
+	// Release the backfill once the first append has been attempted (and failed).
+	go func() {
+		for {
+			if buf.appends.Load() >= 1 {
+				onceOpn.Do(func() { close(opened) })
+				return
+			}
+			select {
+			case <-finished:
+				onceOpn.Do(func() { close(opened) })
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+	select {
+	case <-opened:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no live append attempted within 5s")
+	}
+	close(gate)
+
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("engine did not return within 5s after cutover append failure")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Error(t, gotErr, "a cutover buffer append failure must surface as an error, not be silently swallowed")
+	require.Contains(t, gotErr.Error(), "append live buffer")
+}
+
+// replayErrBuffer appends normally but always fails Replay, modeling a durable
+// buffer that cannot be read back at cutover time.
+type replayErrBuffer struct {
+	memBuffer
+}
+
+func (b *replayErrBuffer) Replay(context.Context, uint64) func(yield func(LiveFrame, error) bool) {
+	return func(yield func(LiveFrame, error) bool) {
+		yield(LiveFrame{}, fmt.Errorf("simulated replay failure"))
+	}
+}
+
+// TestEngineCutoverReplayErrorUnwinds is the B2 regression guard: when
+// flipAndDrain returns a replay error, the engine must cancel the live consumer
+// and return, rather than fall into liveWG.Wait() and block until the parent
+// ctx is cancelled. The tail is quiet after the buffered frames, so the only
+// thing that can unwind the live goroutine is an explicit stopLive — exactly
+// what the buggy fall-through omitted. The test does NOT cancel ctx; the engine
+// must self-unwind.
+func TestEngineCutoverReplayErrorUnwinds(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	h.as.addSegment(t, "seg_0000000000.jss", []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+	})
+	h.planned = 2
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 2}}
+	h.overlayM = 2
+
+	// One live frame above the tip so the buffering phase has something to
+	// append; after it the scripted conn EOFs and the tail goes quiet.
+	h.liveSteps = append(h.liveSteps, readStep{
+		data: liveCommitFrame(t, 3, "did:plc:a", "create", "app.bsky.feed.post", "r3", true),
+	})
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.Buffer = &replayErrBuffer{}
+
+	var sawErr atomic.Bool
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		// Background ctx: NOT cancelled by the test. The engine must unwind on
+		// its own via the replay-error branch's stopLive.
+		eng.Run(context.Background(),
+			func([]Event) bool { return true },
+			func(err error) bool {
+				if err != nil {
+					sawErr.Store(true)
+				}
+				return true
+			},
+		)
+	}()
+
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine did not unwind after a cutover replay error (deadlock on liveWG.Wait)")
+	}
+	require.True(t, sawErr.Load(), "the replay error must be surfaced before unwinding")
+}
+
+// TestEngineLiveOnlyErrorRejectStopsBatching is the B4 regression guard: in the
+// live-only path, when the consumer rejects an emitted error (emitErr returns
+// false), batching must stop and no batch may be delivered afterward. Before
+// the fix, the error was emitted directly (bypassing the batcher), so a buffered
+// event could still be flushed to emitBatch after the consumer had already
+// stopped — violating the "yield never called after stop" contract.
+func TestEngineLiveOnlyErrorRejectStopsBatching(t *testing.T) {
+	t.Parallel()
+
+	// First a normal event (buffered, since BatchSize is large), then an error
+	// frame. The consumer rejects the error; the final flush must NOT deliver
+	// the buffered event after the rejection.
+	conn := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "app.bsky.feed.post", "r1", true)},
+		{data: []byte(`{"seq":2,"kind":"commit","commit":{"operation":"create","collection":"c","rkey":"r2"}}`)}, // malformed: missing record_cbor -> error frame
+	}}
+	dial, _ := scriptedDialer(conn)
+	cfg := Config{
+		Host:           "https://h",
+		Backfill:       false,
+		BatchSize:      64, // large: events stay buffered until flush/stop
+		MaxBatchDelay:  time.Hour,
+		LiveBackoffMin: time.Millisecond,
+		Dial:           dial,
+	}
+
+	var (
+		mu          sync.Mutex
+		batchAfter  bool
+		errRejected bool
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(context.Background(),
+			func([]Event) bool {
+				mu.Lock()
+				defer mu.Unlock()
+				if errRejected {
+					batchAfter = true // a batch emitted AFTER the error was rejected
+				}
+				return true
+			},
+			func(error) bool {
+				mu.Lock()
+				errRejected = true
+				mu.Unlock()
+				return false // reject: stop the stream on the first error
+			},
+		)
+	}()
+
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine did not unwind after the consumer rejected an error")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	require.True(t, errRejected, "the error must have been surfaced to the consumer")
+	require.False(t, batchAfter, "no batch may be emitted after the consumer rejected an error")
 }
 
 func uniqueSeqs(events []Event) []uint64 {

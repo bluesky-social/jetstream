@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -13,9 +14,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/overlay"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/cbor"
 )
+
+// emptyOverlayBlob is a valid getTombstones response carrying no tombstones
+// (watermark=0, maxSeq=0), so the engine's suppressor seed succeeds and the
+// failure under test is isolated to planBackfill.
+func emptyOverlayBlob() []byte {
+	return overlay.Encode(tombstone.Snapshot{
+		Records: map[tombstone.RecordKey]uint64{},
+		DIDs:    map[string]tombstone.DIDTombstone{},
+	}, 0, 0)
+}
 
 // syncBuffer is a concurrency-safe bytes.Buffer for capturing CLI output while
 // a goroutine polls it.
@@ -70,6 +83,91 @@ func commitFrame(t *testing.T, seq uint64, did, coll, rkey string) string {
 	return `{"did":"` + did + `","time_us":1,"cursor":` + s + `,"seq":` + s +
 		`,"kind":"commit","commit":{"rev":"r","operation":"create","collection":"` + coll +
 		`","rkey":"` + rkey + `","cid":"bafytest","record_cbor":"` + base64.StdEncoding.EncodeToString(rec) + `"}}`
+}
+
+// TestSubscribeFatalBackfillReturnsError is the E1/E2 regression guard: a
+// doomed backfill (here, the server rejects planBackfill) must make the CLI
+// return a non-zero error in BOTH --print and throughput modes, rather than log
+// (or silently drop) the error and exit 0 — which would mask a failed backfill
+// from any orchestrator checking the exit status.
+func TestSubscribeFatalBackfillReturnsError(t *testing.T) {
+	t.Parallel()
+
+	// Server: getTombstones succeeds (empty overlay) but planBackfill fails, so
+	// the engine aborts the backfill fatally before any event is delivered.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/network.bsky.jetstream.getTombstones":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			// A minimal valid empty overlay blob: watermark=0, maxSeq=0, no rows.
+			// The real decoder tolerates an empty body as an empty snapshot.
+			_, _ = w.Write(emptyOverlayBlob())
+		case "/xrpc/network.bsky.jetstream.planBackfill":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"InternalError","message":"boom"}`)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	for _, mode := range []string{"print", "throughput"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			app := newApp()
+			app.Writer = &syncBuffer{}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			args := []string{"jetstream-client", "--host", srv.URL, "--after-seq", "0"}
+			if mode == "print" {
+				args = append(args, "--print")
+			} else {
+				// throughput mode is the default (no --print).
+				args = append(args, "--report-interval", "100ms")
+			}
+			err := app.Run(ctx, args)
+			if err == nil {
+				t.Fatalf("%s mode: a fatal backfill failure must return a non-zero error, got nil", mode)
+			}
+			if !strings.Contains(err.Error(), "aborted") {
+				t.Fatalf("%s mode: expected an 'aborted' stream error, got: %v", mode, err)
+			}
+		})
+	}
+}
+
+// TestSubscribeRejectsNegativeCursors guards C2: a negative seq cursor must be
+// rejected with an error, not silently dropped (which would turn a requested
+// bounded backfill into an unbounded one with no signal).
+func TestSubscribeRejectsNegativeCursors(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		flag string
+		val  string
+	}{
+		{name: "before-seq negative", flag: "--before-seq", val: "-5"},
+		{name: "live-cursor negative", flag: "--live-cursor", val: "-1"},
+		{name: "after-seq below sentinel", flag: "--after-seq", val: "-2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := newApp()
+			app.Writer = &syncBuffer{}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			// localhost:1 never connects; the validation must trip before any I/O.
+			err := app.Run(ctx, []string{"jetstream-client", "--host", "localhost:1", tc.flag, tc.val})
+			if err == nil {
+				t.Fatalf("%s %s: expected a validation error, got nil", tc.flag, tc.val)
+			}
+			if !strings.Contains(err.Error(), tc.flag) {
+				t.Fatalf("%s %s: error should name the flag, got: %v", tc.flag, tc.val, err)
+			}
+		})
+	}
 }
 
 // TestSubscribePrintsEvents runs the real subscribe command (live-only) against

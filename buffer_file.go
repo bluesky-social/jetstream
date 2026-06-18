@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -23,6 +24,11 @@ const (
 	fileBufferFlushFrames   = 5000
 	fileBufferFlushInterval = 5 * time.Second
 )
+
+// errBufferClosed is returned by Append/Replay/Truncate after Close, so misuse
+// (reusing a closed buffer) surfaces as a deterministic error rather than a
+// nil-pointer panic on the nil writer/file.
+var errBufferClosed = fmt.Errorf("jetstream: live buffer is closed")
 
 // fileLiveBuffer is a durable, append-only LiveBuffer backed by a single file.
 //
@@ -68,6 +74,9 @@ func (b *fileLiveBuffer) Append(frames []LiveFrame) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.f == nil || b.w == nil {
+		return errBufferClosed
+	}
 	for _, fr := range frames {
 		if err := b.writeLine(fr); err != nil {
 			return err
@@ -117,6 +126,11 @@ func (b *fileLiveBuffer) flushLocked() error {
 func (b *fileLiveBuffer) Replay(ctx context.Context, from uint64) iter.Seq2[LiveFrame, error] {
 	return func(yield func(LiveFrame, error) bool) {
 		b.mu.Lock()
+		if b.f == nil || b.w == nil {
+			b.mu.Unlock()
+			yield(LiveFrame{}, errBufferClosed)
+			return
+		}
 		err := b.flushLocked()
 		b.mu.Unlock()
 		if err != nil {
@@ -203,6 +217,9 @@ func parseLine(line []byte) (LiveFrame, bool) {
 func (b *fileLiveBuffer) Truncate(throughSeq uint64) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.f == nil || b.w == nil {
+		return errBufferClosed
+	}
 	if err := b.flushLocked(); err != nil {
 		return err
 	}
@@ -211,7 +228,12 @@ func (b *fileLiveBuffer) Truncate(throughSeq uint64) error {
 	if err != nil {
 		return fmt.Errorf("jetstream: open live buffer for truncate: %w", err)
 	}
-	defer func() { _ = src.Close() }()
+	srcClosed := false
+	defer func() {
+		if !srcClosed {
+			_ = src.Close()
+		}
+	}()
 
 	tmp := b.path + ".tmp"
 	out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -259,6 +281,14 @@ func (b *fileLiveBuffer) Truncate(throughSeq uint64) error {
 		return fmt.Errorf("jetstream: close live buffer temp: %w", err)
 	}
 
+	// Close the read handle on the original before the swap: src has been fully
+	// read into the temp by now, and an open handle on the destination makes the
+	// rename fail on platforms (e.g. Windows) that reject replacing an open file.
+	if err := src.Close(); err != nil {
+		return fmt.Errorf("jetstream: close live buffer source during truncate: %w", err)
+	}
+	srcClosed = true
+
 	// Swap the temp in and reopen the live writer at the new tail.
 	if err := b.w.Flush(); err != nil {
 		return fmt.Errorf("jetstream: flush before swap: %w", err)
@@ -267,11 +297,33 @@ func (b *fileLiveBuffer) Truncate(throughSeq uint64) error {
 		return fmt.Errorf("jetstream: close live buffer before swap: %w", err)
 	}
 	if err := os.Rename(tmp, b.path); err != nil {
+		// The swap failed but the original file is untouched at b.path. Reopen it
+		// (discarding the temp) so the buffer stays usable rather than stranding
+		// b.f/b.w on a closed descriptor and permanently breaking the buffer.
+		_ = os.Remove(tmp)
+		if rErr := b.reopenAppend(); rErr != nil {
+			return errors.Join(
+				fmt.Errorf("jetstream: rename live buffer temp: %w", err),
+				fmt.Errorf("jetstream: reopen live buffer after failed rename: %w", rErr),
+			)
+		}
 		return fmt.Errorf("jetstream: rename live buffer temp: %w", err)
 	}
+	if err := b.reopenAppend(); err != nil {
+		return fmt.Errorf("jetstream: reopen live buffer after truncate: %w", err)
+	}
+	return nil
+}
+
+// reopenAppend reopens b.path for append and resets the buffered writer and
+// flush bookkeeping. Caller holds b.mu. On error b.f/b.w are left nil so a
+// subsequent call observes the closed state rather than a stale descriptor.
+func (b *fileLiveBuffer) reopenAppend() error {
 	nf, err := os.OpenFile(b.path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
-		return fmt.Errorf("jetstream: reopen live buffer after truncate: %w", err)
+		b.f = nil
+		b.w = nil
+		return err
 	}
 	b.f = nf
 	b.w = bufio.NewWriter(nf)

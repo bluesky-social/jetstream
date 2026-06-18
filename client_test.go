@@ -309,6 +309,65 @@ func TestSubscribeLiveTailEndToEnd(t *testing.T) {
 	require.EqualValues(t, 2, got[1].Seq)
 }
 
+// TestCloseStopsRunningEventsWithoutCtxCancel is the A2 regression guard: the
+// documented contract is that Close is "the natural way to stop a live tail"
+// concurrently with a running Events. Before the fix, realEngine.close() only
+// closed the buffer and cancelled nothing, so a live tail kept its goroutine
+// and network reads alive until the Events ctx was cancelled. Here the ctx is
+// deliberately a plain Background (never cancelled by the test): Close alone
+// must unwind the iteration.
+func TestCloseStopsRunningEventsWithoutCtxCancel(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close(websocket.StatusNormalClosure, "done") }()
+		// One frame, then go quiet: the tail stays open with no further events,
+		// so only Close (cancelling the run ctx) can unwind the consumer.
+		_ = conn.Write(r.Context(), websocket.MessageText,
+			[]byte(liveCommitFrameJSON(1, "did:plc:a", "app.bsky.feed.post", "r1")))
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := Subscribe(srv.URL)
+	require.NoError(t, err)
+
+	first := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var once sync.Once
+		// Background ctx: NOT cancelled anywhere in this test. The iteration must
+		// end because Close cancels the run, per the documented contract.
+		for batch, err := range c.Events(context.Background()) {
+			if err != nil {
+				continue
+			}
+			if len(batch.Events()) > 0 {
+				once.Do(func() { close(first) })
+			}
+		}
+	}()
+
+	select {
+	case <-first:
+	case <-time.After(5 * time.Second):
+		t.Fatal("never received the first event")
+	}
+
+	require.NoError(t, c.Close())
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not stop a running Events (no ctx cancel) within 5s")
+	}
+}
+
 // liveCommitFrameJSON builds an extended commit frame with a minimal CBOR
 // record, base64-encoded, matching the /subscribe-v2 extended wire shape.
 func liveCommitFrameJSON(seq uint64, did, coll, rkey string) string {

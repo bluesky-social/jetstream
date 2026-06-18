@@ -10,7 +10,16 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	iclient "github.com/bluesky-social/jetstream/internal/client"
 )
+
+// ErrFatal marks a terminal error yielded by Events: the stream has aborted and
+// will deliver no further events (e.g. the backfill plan was rejected or a
+// cutover guarantee could not be met). Test for it with errors.Is(err,
+// ErrFatal). Errors that are NOT ErrFatal are recoverable — a single bad
+// segment or a transient live-tail read — and iteration continues past them.
+var ErrFatal = iclient.ErrFatal
 
 // Client is a Jetstream v2 consumer. Construct one with Subscribe. A Client
 // drives at most one Events iteration at a time; create separate Clients for
@@ -97,8 +106,12 @@ func Subscribe(host string, opts ...Option) (*Client, error) {
 //	}
 //
 // A non-nil err is yielded for recoverable problems; iteration continues so
-// the caller may log and move on. When ctx is done or the stream ends, the
-// iterator returns. Events must not be called concurrently on the same Client.
+// the caller may log and move on. A terminal failure is yielded as an error
+// satisfying errors.Is(err, ErrFatal), after which the stream aborts and the
+// iterator returns no further events — callers should stop and surface a
+// failure rather than treat it as recoverable. When ctx is done or the stream
+// ends, the iterator returns. Events must not be called concurrently on the
+// same Client.
 func (c *Client) Events(ctx context.Context) iter.Seq2[*Batch, error] {
 	return func(yield func(*Batch, error) bool) {
 		if c == nil || c.engine == nil {

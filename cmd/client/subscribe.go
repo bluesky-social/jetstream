@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -95,8 +96,23 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 	if d := cmd.StringSlice("did"); len(d) > 0 {
 		opts = append(opts, jetstream.WithDIDs(d))
 	}
-	if after := cmd.Int("after-seq"); after >= 0 {
-		opts = append(opts, jetstream.WithAfterSeq(uint64(after)))
+	// Reject negative cursors explicitly rather than silently dropping them:
+	// --after-seq uses -1 as its documented "unset" sentinel, so only < -1 is
+	// invalid; --before-seq and --live-cursor default to 0, so any negative is
+	// invalid. Silently ignoring a negative --before-seq would turn a requested
+	// bounded backfill into an unbounded one with no signal.
+	if before := cmd.Int("before-seq"); before < 0 {
+		return fmt.Errorf("--before-seq must be >= 0, got %d", before)
+	}
+	if lc := cmd.Int("live-cursor"); lc < 0 {
+		return fmt.Errorf("--live-cursor must be >= 0, got %d", lc)
+	}
+	if a := cmd.Int("after-seq"); a < -1 {
+		return fmt.Errorf("--after-seq must be >= -1 (-1 = unset), got %d", a)
+	}
+
+	if a := cmd.Int("after-seq"); a >= 0 {
+		opts = append(opts, jetstream.WithAfterSeq(uint64(a)))
 	}
 	if before := cmd.Int("before-seq"); before > 0 {
 		opts = append(opts, jetstream.WithBeforeSeq(uint64(before)))
@@ -139,6 +155,9 @@ func printEvents(ctx context.Context, out io.Writer, client *jetstream.Client) e
 	enc := json.NewEncoder(out)
 	for batch, err := range client.Events(ctx) {
 		if err != nil {
+			if errors.Is(err, jetstream.ErrFatal) {
+				return fmt.Errorf("event stream aborted: %w", err)
+			}
 			fmt.Fprintln(os.Stderr, "event error:", err)
 			continue
 		}
@@ -193,6 +212,11 @@ func reportThroughput(ctx context.Context, out io.Writer, client *jetstream.Clie
 				return nil
 			}
 			if item.err != nil {
+				if errors.Is(item.err, jetstream.ErrFatal) {
+					report("final")
+					return fmt.Errorf("event stream aborted: %w", item.err)
+				}
+				fmt.Fprintln(os.Stderr, "event error:", item.err)
 				continue
 			}
 			events += uint64(len(item.batch.Events()))

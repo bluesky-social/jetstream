@@ -2,6 +2,7 @@ package jetstream
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	iclient "github.com/bluesky-social/jetstream/internal/client"
@@ -60,9 +61,34 @@ type realEngine struct {
 	eng    *iclient.Engine
 	buf    LiveBuffer
 	ownBuf bool // close the buffer on engine close only if we created it
+
+	// mu guards runCancel and closed so a concurrent Close (the documented way
+	// to stop a live tail) can cancel an in-flight run without a data race.
+	mu        sync.Mutex
+	runCancel context.CancelFunc // cancels the active run's ctx; nil when idle
+	closed    bool               // Close was called; a later run starts cancelled
 }
 
 func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
+	// Derive a cancelable ctx so Close can unwind a running tail. If Close
+	// already happened, start cancelled so the run returns promptly.
+	runCtx, cancel := context.WithCancel(ctx)
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		cancel()
+		return
+	}
+	e.runCancel = cancel
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.runCancel = nil
+		e.mu.Unlock()
+		cancel()
+	}()
+
+	ctx = runCtx
 	stopped := false
 	e.eng.Run(ctx,
 		func(batch []iclient.Event) bool {
@@ -90,6 +116,19 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 }
 
 func (e *realEngine) close() error {
+	// Cancel any in-flight run first so a live tail actually stops (the
+	// documented "natural way to stop a live tail"). We do NOT wait for the run
+	// to finish: a consumer may call Close from inside its own Events loop, and
+	// blocking here would deadlock. The buffer's own methods are close-safe
+	// (they return errBufferClosed rather than panicking), so a run still
+	// unwinding when we close the buffer below cannot corrupt or crash.
+	e.mu.Lock()
+	e.closed = true
+	cancel := e.runCancel
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if e.ownBuf {
 		return e.buf.Close()
 	}
