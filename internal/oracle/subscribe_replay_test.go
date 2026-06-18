@@ -118,9 +118,31 @@ func collectSubscribeReplay(t *testing.T, cfg Config, run *runtimeRun, trace *Tr
 					targetSeq, cfg.Mode, cfg.Seed, run.err)
 			default:
 			}
+			// The server closed the replay socket mid-stream while the
+			// runtime is still up. This is the SAME fragile observation
+			// point as the CheckCompacted failure (a long from-cursor-0
+			// cold replay of sealed history over the live-tail transport
+			// under heavy concurrent compaction/reconnect load), surfacing
+			// as a torn frame instead of a contract violation. Record where
+			// the replay died so the trace classifies it rather than
+			// leaving an opaque read error. See #77.
+			var lastSeq uint64
+			if len(out) > 0 {
+				lastSeq = out[len(out)-1].Seq
+			}
+			recordTraceOrError(t, trace, "subscribe_replay_read_error", map[string]any{
+				"cursor":      cursor,
+				"target_seq":  targetSeq,
+				"event_count": len(out),
+				"last_seq":    lastSeq,
+				"err":         err.Error(),
+			})
+			t.Fatalf("subscribe replay socket closed mid-stream at seq=%d of target_seq=%d (got %d events) "+
+				"while runtime is up: mode=%s seed=%d err=%v -- this is the live-tail transport serving "+
+				"sealed history (see #77), not a clean read",
+				lastSeq, targetSeq, len(out), cfg.Mode, cfg.Seed, err)
 		}
-		require.NoErrorf(t, err, "read subscribe replay target_seq=%d mode=%s seed=%d", targetSeq, cfg.Mode, cfg.Seed)
-		require.Equal(t, websocket.MessageText, typ, "subscribe replay must emit text frames")
+		require.Equalf(t, websocket.MessageText, typ, "subscribe replay must emit text frames mode=%s seed=%d", cfg.Mode, cfg.Seed)
 
 		var msg subscribeReplayEvent
 		require.NoErrorf(t, json.Unmarshal(body, &msg),
