@@ -42,6 +42,10 @@ func subscribeCommand() *cli.Command {
 				Usage: "Backfill upper bound (inclusive); 0 means unset",
 				Value: 0,
 			},
+			&cli.BoolFlag{
+				Name:  "backfill-only",
+				Usage: "Dump the matched sealed archive and exit; do not start the live tail. Requires --after-seq and/or --before-seq.",
+			},
 			&cli.IntFlag{
 				Name:  "live-cursor",
 				Usage: "Resume a pure live tail from this cursor (ignored when backfilling)",
@@ -119,6 +123,18 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 	}
 	if lc := cmd.Int("live-cursor"); lc > 0 {
 		opts = append(opts, jetstream.WithLiveCursor(uint64(lc)))
+	}
+
+	// --backfill-only is a one-time archive dump: it requires a backfill bound
+	// (--after-seq enables backfill even at 0; --before-seq enables it when > 0).
+	// Reject the no-bound case here with a clear CLI message rather than letting
+	// the library's validation surface a less actionable error.
+	if cmd.Bool("backfill-only") {
+		hasBound := cmd.Int("after-seq") >= 0 || cmd.Int("before-seq") > 0
+		if !hasBound {
+			return fmt.Errorf("--backfill-only requires --after-seq and/or --before-seq")
+		}
+		opts = append(opts, jetstream.WithBackfillOnly())
 	}
 
 	if path := cmd.String("live-buffer-file"); path != "" {

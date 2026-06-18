@@ -22,7 +22,7 @@ func main() {
 func newApp() *cli.Command {
 	cmd := subscribeCommand()
 	cmd.Name = "jetstream-client"
-	cmd.Usage = "Drive the jetstream Go client (live tail or backfill+cutover)"
+	cmd.Usage = "Drive the jetstream Go client (live tail, backfill+cutover, or one-time --backfill-only dump)"
 	cmd.Commands = []*cli.Command{loadtestCommand()}
 	return cmd
 }

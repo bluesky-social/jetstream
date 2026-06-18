@@ -226,5 +226,8 @@ func validateConfig(c *config) error {
 	if c.hasAfterSeq && c.hasBeforeSeq && c.beforeSeq <= c.afterSeq {
 		return fmt.Errorf("jetstream: beforeSeq (%d) must be greater than afterSeq (%d)", c.beforeSeq, c.afterSeq)
 	}
+	if c.backfillOnly && !c.backfillRequested() {
+		return fmt.Errorf("jetstream: WithBackfillOnly requires a backfill bound (WithAfterSeq and/or WithBeforeSeq)")
+	}
 	return nil
 }

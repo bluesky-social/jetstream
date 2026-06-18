@@ -17,6 +17,7 @@ type config struct {
 	afterSeq      uint64
 	hasBeforeSeq  bool
 	beforeSeq     uint64
+	backfillOnly  bool
 	hasLiveCursor bool
 	liveCursor    uint64
 	batchSize     int
@@ -82,6 +83,18 @@ func WithBeforeSeq(seq uint64) Option {
 		c.hasBeforeSeq = true
 		c.beforeSeq = seq
 	}
+}
+
+// WithBackfillOnly turns the client into a one-time archive dump: it downloads
+// and delivers the matched sealed range (bounded by WithAfterSeq/WithBeforeSeq)
+// and then ends the stream, without ever starting the live tail or cutover.
+//
+// It requires a backfill bound (WithAfterSeq and/or WithBeforeSeq); without one
+// there is no archive to dump and Subscribe returns an error. Records in the
+// active, unsealed segment (above the sealed tip) are only reachable via the
+// live tail and are therefore not delivered by a dump.
+func WithBackfillOnly() Option {
+	return func(c *config) { c.backfillOnly = true }
 }
 
 // WithLiveCursor resumes a pure live tail from a previously saved cursor

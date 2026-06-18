@@ -14,9 +14,16 @@ import (
 // newEngine builds the real orchestration engine in internal/client and adapts
 // it to the root Client's engine interface.
 func newEngine(host string, cfg config) (engine, error) {
+	// A backfill-only dump never starts the live tail, so it needs no cutover
+	// buffer. Skip allocating the default in-memory buffer in that case; a
+	// caller-supplied buffer is still honored (and closed) if one was set.
 	buf := cfg.liveBuffer
-	if buf == nil {
+	if buf == nil && !cfg.backfillOnly {
 		buf = NewMemLiveBuffer()
+	}
+	var bufAdapter iclient.Buffer
+	if buf != nil {
+		bufAdapter = bufferAdapter{buf}
 	}
 
 	ec := iclient.Config{
@@ -29,16 +36,20 @@ func newEngine(host string, cfg config) (engine, error) {
 			BeforeSeq:    cfg.beforeSeq,
 		},
 		Backfill:      cfg.backfillRequested(),
+		BackfillOnly:  cfg.backfillOnly,
 		HasLiveCursor: cfg.hasLiveCursor,
 		LiveCursor:    cfg.liveCursor,
 		BatchSize:     cfg.batchSize,
 		Concurrency:   cfg.downloadConc,
-		Buffer:        bufferAdapter{buf},
+		Buffer:        bufAdapter,
 		XRPC:          newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second)),
 		BulkXRPC:      newXRPCClient(host, cfg, xrpc.BulkDownloadOpts()),
 		Logger:        cfg.logger,
 	}
-	return &realEngine{eng: iclient.NewEngine(ec), buf: buf, ownBuf: cfg.liveBuffer == nil}, nil
+	// ownBuf gates whether close() calls buf.Close(); only true when we created
+	// the buffer ourselves. When buf is nil (backfill-only, no caller buffer)
+	// it must stay false so close() never dereferences a nil buffer.
+	return &realEngine{eng: iclient.NewEngine(ec), buf: buf, ownBuf: buf != nil && cfg.liveBuffer == nil}, nil
 }
 
 // newXRPCClient builds an xrpc.Client for host. When the caller supplied an

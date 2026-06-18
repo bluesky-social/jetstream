@@ -118,6 +118,17 @@ func TestSubscribeValidation(t *testing.T) {
 	c, err := Subscribe("host", WithAfterSeq(10), WithBeforeSeq(100))
 	require.NoError(t, err)
 	require.NoError(t, c.Close())
+
+	// WithBackfillOnly requires a backfill bound: without one there is no
+	// archive to dump.
+	_, err = Subscribe("host", WithBackfillOnly())
+	require.ErrorContains(t, err, "WithBackfillOnly requires a backfill bound")
+
+	// With a bound it is accepted, and Close must not panic despite the engine
+	// having no live buffer allocated in dump mode.
+	c, err = Subscribe("host", WithAfterSeq(0), WithBackfillOnly())
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
 }
 
 // TestSubscribeNilOption asserts a nil Option yields a constructor error

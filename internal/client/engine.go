@@ -40,9 +40,13 @@ const defaultMaxBatchDelay = 20 * time.Millisecond
 
 // Config is the resolved engine configuration the root package passes in.
 type Config struct {
-	Host          string // normalized base URL
-	Request       PlanRequest
-	Backfill      bool // run the historical backfill path before live
+	Host     string // normalized base URL
+	Request  PlanRequest
+	Backfill bool // run the historical backfill path before live
+	// BackfillOnly downloads and emits the sealed archive, then returns without
+	// starting the live tail or cutover. A one-time dump of the matched range.
+	// Only meaningful when Backfill is true.
+	BackfillOnly  bool
 	HasLiveCursor bool
 	LiveCursor    uint64 // pure-live resume cursor when !Backfill
 	BatchSize     int
@@ -104,6 +108,10 @@ func NewEngine(cfg Config) *Engine {
 // emitErr (returns false to stop). Run blocks until the stream ends.
 func (e *Engine) Run(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
 	if e.cfg.Backfill {
+		if e.cfg.BackfillOnly {
+			e.runBackfillOnly(ctx, emitBatch, emitErr)
+			return
+		}
 		e.runBackfillThenLive(ctx, emitBatch, emitErr)
 		return
 	}
@@ -181,6 +189,57 @@ func (e *Engine) startFlusher(ctx context.Context, b *batcher) func() {
 	return func() {
 		once.Do(func() { close(stop) })
 		<-done
+	}
+}
+
+// runBackfillOnly executes a one-time dump of the sealed archive: seed the
+// suppressor from the overlay, plan, then download + emit the matched range and
+// return. It is a strict subset of runBackfillThenLive with the live tail,
+// cutover, and steady-state phases removed — no websocket is ever dialed.
+//
+// Records in the active (unsealed) segment, seq in (plannedThroughSeq, M], are
+// only reachable via the live tail and are therefore NOT delivered by a dump.
+// That is the defining trade-off of BackfillOnly: a clean point-in-time slice
+// of the sealed archive, not the full up-to-the-instant stream.
+func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
+	// 1. Overlay seed. Terminal on failure: without the tombstone base the
+	// suppressor cannot honor the deletion guarantee, so abort rather than emit
+	// unsuppressed historical rows.
+	if _, _, err := e.suppressor.SeedFromOverlay(ctx, e.cfg.XRPC); err != nil {
+		emitErr(fatal(err))
+		return
+	}
+
+	// 2. Plan. Terminal on failure: there is no archive transport plan to run.
+	plan, err := e.planner.Plan(ctx, e.cfg.Request)
+	if err != nil {
+		emitErr(fatal(err))
+		return
+	}
+
+	// 3. Download + emit in plan order. Rows are filtered + suppressed before
+	// decode by the downloader's selector. No live buffer is consulted, so the
+	// suppressor only carries the overlay-seeded tombstones (no live deletes can
+	// arrive during a dump).
+	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
+	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
+	_ = dl.Download(ctx, plan.Entries, func(res EntryResult) bool {
+		if res.Err != nil {
+			return b.emitError(res.Err)
+		}
+		for _, ev := range res.Events {
+			if !b.add(ev) {
+				return false
+			}
+		}
+		return true
+	})
+
+	// 4. Flush the partial tail. Download returns on ctx cancel or consumer stop;
+	// in both cases a final flush of any buffered events is correct (flushLocked
+	// is a no-op once the batcher has stopped).
+	if !b.stopped() {
+		b.flush()
 	}
 }
 

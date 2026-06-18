@@ -220,6 +220,72 @@ func TestEngineActiveSegmentGap(t *testing.T) {
 	require.Equal(t, want, got, "no record gap across sealed->active->live; gap (10,15] must be live-delivered")
 }
 
+// TestEngineBackfillOnly covers the one-time-dump path: with BackfillOnly the
+// engine seeds the overlay, plans, downloads + emits the sealed archive, and
+// returns WITHOUT ever dialing the live websocket. The run self-terminates when
+// the download completes (the test never cancels ctx), and the live dial count
+// stays zero — the property that distinguishes a dump from backfill+cutover.
+func TestEngineBackfillOnly(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	var sealed []segment.Event
+	for i := uint64(1); i <= 6; i++ {
+		sealed = append(sealed, makeCreate(t, i, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(i)))
+	}
+	h.as.addSegment(t, "seg_0000000000.jss", sealed)
+	h.planned = 6
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 6}}
+	h.overlayM = 6
+	// Script a live frame too: if the engine wrongly started the live tail it
+	// would dial and deliver seq 7, which the assertions below would catch.
+	h.liveSteps = append(h.liveSteps, readStep{
+		data: liveCommitFrame(t, 7, "did:plc:a", "create", "app.bsky.feed.post", "r7", true),
+	})
+	h.installHandlers()
+
+	conn := &scriptedConn{steps: h.liveSteps}
+	dial, dials := scriptedDialer(conn)
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	cfg.Dial = dial
+
+	// Background ctx: NOT cancelled by the test. A backfill-only run must end on
+	// its own when the download finishes, not block on a live tail.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func(batch []Event) bool {
+				mu.Lock()
+				events = append(events, batch...)
+				mu.Unlock()
+				return true
+			},
+			func(error) bool { return true },
+		)
+	}()
+
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("backfill-only engine did not return on its own (blocked on live tail?)")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, uniqueSeqs(events), "all sealed seqs emitted, no live seq 7")
+	require.Equal(t, 0, *dials, "backfill-only must never dial the live websocket")
+}
+
 // TestEngineBackfillThenLiveOrdering asserts backfill rows precede live rows
 // and the whole stream is in seq order with the overlap deduped.
 func TestEngineBackfillThenLiveOrdering(t *testing.T) {
