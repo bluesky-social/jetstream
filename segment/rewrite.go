@@ -7,8 +7,6 @@ import (
 	"io"
 	"math"
 	"os"
-
-	"github.com/bluesky-social/jetstream/internal/crashpoint"
 )
 
 type RowDecision uint8
@@ -19,7 +17,7 @@ const (
 )
 
 type RewriteOptions struct {
-	CrashInjector crashpoint.Injector
+	CrashInjector CrashInjector
 	CandidateDIDs []string
 }
 
@@ -190,13 +188,13 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if _, err := f.WriteAt(headerBytes, 0); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite write header: %w", err)
 	}
-	if err := simulateRewriteCrash(opts, crashpoint.AfterSegmentRewriteTempWritten); err != nil {
+	if err := simulateRewriteCrash(opts, CrashPointRewriteTempWritten); err != nil {
 		return RewriteResult{}, err
 	}
 	if err := syncFile(f); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite fsync tmp: %w", err)
 	}
-	if err := simulateRewriteCrash(opts, crashpoint.AfterSegmentRewriteTempSynced); err != nil {
+	if err := simulateRewriteCrash(opts, CrashPointRewriteTempSynced); err != nil {
 		return RewriteResult{}, err
 	}
 	if err := f.Close(); err != nil {
@@ -205,13 +203,13 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if err := os.Rename(tmp, path); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite rename: %w", err)
 	}
-	if err := simulateRewriteCrash(opts, crashpoint.AfterSegmentRewriteRenamed); err != nil {
+	if err := simulateRewriteCrash(opts, CrashPointRewriteRenamed); err != nil {
 		return RewriteResult{}, err
 	}
 	if err := syncParentDir(path); err != nil {
 		return RewriteResult{}, err
 	}
-	if err := simulateRewriteCrash(opts, crashpoint.AfterSegmentRewriteDirSynced); err != nil {
+	if err := simulateRewriteCrash(opts, CrashPointRewriteDirSynced); err != nil {
 		return RewriteResult{}, err
 	}
 	success = true
@@ -238,7 +236,7 @@ func segmentBloomMayContainAny(r *Reader, dids []string) bool {
 	return false
 }
 
-func simulateRewriteCrash(opts RewriteOptions, point crashpoint.Point) error {
+func simulateRewriteCrash(opts RewriteOptions, point string) error {
 	if opts.CrashInjector == nil {
 		return nil
 	}
