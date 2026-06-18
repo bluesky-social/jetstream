@@ -128,13 +128,19 @@ func collectClientBackfill(t *testing.T, cfg Config, run *runtimeRun, trace *Tra
 // negotiation + overlay suppression + cutover) rather than a /subscribe
 // whole-archive replay. The watermark is in jetstream seq space, so the drain
 // stops deterministically and the asserted window is snapshot-consistent.
-func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, baseURL string, watermark uint64, phase string) {
+func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, dataDir string, compaction *compactionPassRecorder, baseURL string, watermark uint64, phase string) {
 	t.Helper()
 
 	events := collectClientBackfill(t, cfg, run, trace, baseURL, watermark)
-	require.NoErrorf(t, CheckCompacted(events, watermark),
-		"%s mode=%s seed=%d: client backfill compacted check failed watermark=%d",
-		phase, cfg.Mode, cfg.Seed, watermark)
+	if clientErr := CheckCompacted(events, watermark); clientErr != nil {
+		// Bisect the failure into a durable-defect vs. serving/client-artifact
+		// verdict (#94) before failing, so a client-path bug isn't mistaken for
+		// a storage defect (or vice versa). bisectServedCompactedFailure is
+		// surface-agnostic: it re-runs CheckCompacted against the on-disk
+		// segments at the same watermark to classify the failure.
+		bisectServedCompactedFailure(t, trace, dataDir, cfg, compaction, watermark, clientErr)
+		return
+	}
 
 	t.Logf("%s: client backfill compacted-check passed over %d observed events (watermark=%d) in mode=%s seed=%d",
 		phase, len(events), watermark, cfg.Mode, cfg.Seed)
