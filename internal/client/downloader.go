@@ -11,21 +11,34 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// RowSelector decides whether a decoded segment row should be kept (emitted)
+// or skipped. The downloader consults it before the expensive CBOR decode so
+// filtered-out and suppressed rows are never materialized. A nil RowSelector
+// keeps every row.
+//
+// Keep is called concurrently across entries and must be safe for concurrent
+// use. The bool is keep; the string is a drop reason for diagnostics.
+type RowSelector interface {
+	Keep(ev *segment.Event) (bool, string)
+}
+
 // Downloader fetches sealed-archive plan entries over XRPC and decodes them
 // into events. It downloads with bounded concurrency but emits entries in
 // strict plan order, preserving the archive's per-DID ordering invariant.
 type Downloader struct {
 	xc          *xrpc.Client
 	concurrency int
+	selector    RowSelector
 }
 
 // NewDownloader returns a Downloader using xc for getSegment/getBlock calls.
 // concurrency bounds in-flight downloads; values < 1 are clamped to 1.
-func NewDownloader(xc *xrpc.Client, concurrency int) *Downloader {
+// selector (may be nil) filters/suppresses rows before decode.
+func NewDownloader(xc *xrpc.Client, concurrency int, selector RowSelector) *Downloader {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	return &Downloader{xc: xc, concurrency: concurrency}
+	return &Downloader{xc: xc, concurrency: concurrency, selector: selector}
 }
 
 // EntryResult is the decoded output of one plan entry, tagged with its plan
@@ -140,7 +153,7 @@ func (d *Downloader) downloadWholeSegment(ctx context.Context, entry PlanEntry) 
 		if err != nil {
 			return nil, fmt.Errorf("jetstream: read block %d of %q: %w", idx, entry.SegmentName, err)
 		}
-		blockEvents, err := decodeFrame(frame, entry.SegmentName, idx)
+		blockEvents, err := d.decodeFrame(frame, entry.SegmentName, idx)
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +170,7 @@ func (d *Downloader) downloadBlocks(ctx context.Context, entry PlanEntry) ([]Eve
 			if err != nil {
 				return nil, fmt.Errorf("jetstream: getBlock %d of %q: %w", idx, entry.SegmentName, err)
 			}
-			blockEvents, err := decodeFrame(frame, entry.SegmentName, int(idx))
+			blockEvents, err := d.decodeFrame(frame, entry.SegmentName, int(idx))
 			if err != nil {
 				return nil, err
 			}
@@ -167,14 +180,21 @@ func (d *Downloader) downloadBlocks(ctx context.Context, entry PlanEntry) ([]Eve
 	return events, nil
 }
 
-// decodeFrame decompresses one block frame and converts its rows to events.
-func decodeFrame(frame []byte, segName string, blockIdx int) ([]Event, error) {
+// decodeFrame decompresses one block frame, applies the row selector before
+// decode (so filtered/suppressed rows are never materialized), and converts
+// the survivors to events.
+func (d *Downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]Event, error) {
 	rows, err := segment.DecodeBlockFrame(frame)
 	if err != nil {
 		return nil, fmt.Errorf("jetstream: decode block %d of %q: %w", blockIdx, segName, err)
 	}
 	out := make([]Event, 0, len(rows))
 	for i := range rows {
+		if d.selector != nil {
+			if keep, _ := d.selector.Keep(&rows[i]); !keep {
+				continue
+			}
+		}
 		ev, err := decodeSegmentEvent(&rows[i])
 		if err != nil {
 			return nil, err

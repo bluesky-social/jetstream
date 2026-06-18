@@ -110,7 +110,11 @@ func (as *archiveServer) addSegment(t *testing.T, name string, events []segment.
 }
 
 func (as *archiveServer) downloader(concurrency int) *Downloader {
-	return NewDownloader(&xrpc.Client{Host: as.srv.URL}, concurrency)
+	return NewDownloader(&xrpc.Client{Host: as.srv.URL}, concurrency, nil)
+}
+
+func (as *archiveServer) downloaderWith(concurrency int, sel RowSelector) *Downloader {
+	return NewDownloader(&xrpc.Client{Host: as.srv.URL}, concurrency, sel)
 }
 
 // makeCreate builds a create-commit segment row carrying a minimal CBOR record.
