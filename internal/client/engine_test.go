@@ -279,6 +279,60 @@ func TestEngineLiveDeleteSuppressesBackfillCreate(t *testing.T) {
 	require.True(t, hasRkey(events, "r2"), "unsuppressed r2 must be emitted")
 }
 
+// TestEngineLiveOnly covers the no-backfill path: Subscribe with no seq bound
+// tails live directly, with the max-latency flusher delivering low-volume
+// batches promptly.
+func TestEngineLiveOnly(t *testing.T) {
+	t.Parallel()
+	conn := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "app.bsky.feed.post", "r1", true)},
+		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "app.bsky.feed.post", "r2", true)},
+	}}
+	dial, _ := scriptedDialer(conn)
+	cfg := Config{
+		Host:           "https://h",
+		Backfill:       false,
+		BatchSize:      64, // larger than the stream: only the flusher delivers
+		MaxBatchDelay:  time.Millisecond,
+		LiveBackoffMin: time.Millisecond,
+		Dial:           dial,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func(batch []Event) bool {
+				mu.Lock()
+				events = append(events, batch...)
+				done := len(events) >= 2
+				mu.Unlock()
+				if done {
+					cancel()
+					return false
+				}
+				return true
+			},
+			func(error) bool { return true },
+		)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("live-only engine did not deliver within 5s")
+	}
+	require.Equal(t, []uint64{1, 2}, uniqueSeqs(events))
+}
+
 func uniqueSeqs(events []Event) []uint64 {
 	seen := map[uint64]bool{}
 	var out []uint64
