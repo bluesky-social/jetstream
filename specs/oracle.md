@@ -237,11 +237,36 @@ intermediate events that final-state comparison can hide.
 Compaction-aware comparison may allow a missing row only when a committed
 watermark and later tombstone/update make that absence legal.
 
-### Product Replay Tier
+### Client-Driven Historical Tier
 
-This tier treats `/subscribe` replay as a first-class observation surface. It
-must cover replay from cursor zero, mid-stream cursors, boundary cursors around
-blocks and segments, compaction watermarks, and selected filters.
+This tier drives the real Go client (`github.com/bluesky-social/jetstream`)
+through the full archive-negotiation path — `getTombstones` → `planBackfill` →
+`getSegment`/`getBlock` → overlay suppression → cutover to `/subscribe-v2` —
+and asserts the documented compaction contract on what the client replayed.
+This is the historical product-path surface: it validates what real clients
+replay through the public APIs, carrying the `(W, M]` snapshot envelope that a
+bespoke whole-archive `/subscribe?cursor=0` replay lacks.
+
+The client is an **observation surface only**. Expected state (the compaction
+watermark, the suppression contract) is derived independently from simulator
+world state and the firehose history; the oracle never compares the client
+against itself. Because the client and Jetstream share `atmos` (and now the
+client shares the segment/overlay decoders with the server), the direct segment
+and event-log tiers remain the independent storage check that distinguishes a
+server bug from a client bug — the client tier runs alongside them, not instead.
+
+The client emits jetstream's own seq, so the drain stops at a jetstream-seq
+watermark (e.g. the steady compaction watermark), not the simulator's upstream
+relay cursor — the two spaces do not map.
+
+### Live-Tail Replay Tier
+
+This tier treats `/subscribe` replay as a first-class observation surface for
+its real role — the recent live tail. It covers mid-stream cursors, boundary
+cursors around blocks and segments, compaction watermarks, and selected
+filters. It does **not** replay the whole archive from cursor zero; historical
+reads go through the client-driven tier above (the archive transport real
+clients use), per issue #77.
 
 The replay tier validates hot tail / cold reader handoff, cursor semantics,
 JSON encoding, extended events, pending writer snapshots, manifest refresh,
