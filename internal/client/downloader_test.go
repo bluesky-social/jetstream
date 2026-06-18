@@ -251,6 +251,37 @@ func TestDownloadContextCancel(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
+// TestDownloadEmitStopCancelsDownloads asserts the documented early-stop
+// contract: when emit returns false, Download must stop fetching the remaining
+// entries (cancel in-flight/pending downloads) rather than draining the whole
+// plan. We seed many entries, stop after the first emit, and assert that far
+// fewer than all segments were fetched.
+func TestDownloadEmitStopCancelsDownloads(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	const n = 50
+	var entries []PlanEntry
+	for s := range n {
+		as.addSegment(t, segName(s), []segment.Event{
+			makeCreate(t, uint64(s*10+1), "did:plc:a", "app.bsky.feed.post", "r1"),
+		})
+		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+	}
+
+	// concurrency=1 makes the bound tight: with early cancel, the producer must
+	// stop launching after the consumer bails, so the server sees far fewer
+	// than n getSegment calls.
+	var emitted int
+	err := as.downloader(1).Download(context.Background(), entries, func(EntryResult) bool {
+		emitted++
+		return false // stop immediately after the first entry
+	})
+	require.NoError(t, err, "an emit-driven early stop is a clean stop, not an error")
+	require.Equal(t, 1, emitted, "emit must be called exactly once before stopping")
+	require.Less(t, int(as.segReqs.Load()), n,
+		"early stop must cancel pending downloads, not fetch the whole plan")
+}
+
 func seqs(events []Event) []uint64 {
 	out := make([]uint64, len(events))
 	for i := range events {

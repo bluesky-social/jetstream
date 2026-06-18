@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/jcalabro/atmos/xrpc"
@@ -185,6 +186,15 @@ func planEntryFromSegment(seg *jetstream.JetstreamPlanBackfill_Segment) (PlanEnt
 	if seg.Index < 0 || seg.MinSeq < 0 || seg.MaxSeq < 0 {
 		return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q has negative index/seq", seg.Name)
 	}
+	if seg.MaxSeq < seg.MinSeq {
+		return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q has inverted seq range [%d,%d]", seg.Name, seg.MinSeq, seg.MaxSeq)
+	}
+	// Index is narrowed to uint32 below; reject values that would wrap silently
+	// rather than key a download under the wrong index. MinSeq/MaxSeq widen to
+	// uint64 and cannot overflow after the negative check above.
+	if seg.Index > math.MaxUint32 {
+		return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q index %d exceeds uint32 max", seg.Name, seg.Index)
+	}
 	entry := PlanEntry{
 		SegmentName: seg.Name,
 		Index:       uint32(seg.Index),
@@ -201,6 +211,9 @@ func planEntryFromSegment(seg *jetstream.JetstreamPlanBackfill_Segment) (PlanEnt
 		for _, br := range seg.Blocks {
 			if br.First < 0 || br.Last < 0 || br.Last < br.First {
 				return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q has invalid block range [%d,%d]", seg.Name, br.First, br.Last)
+			}
+			if br.Last > math.MaxUint32 {
+				return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q block range [%d,%d] exceeds uint32 max", seg.Name, br.First, br.Last)
 			}
 			entry.Blocks = append(entry.Blocks, BlockRange{First: uint32(br.First), Last: uint32(br.Last)})
 		}

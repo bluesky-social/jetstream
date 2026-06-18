@@ -82,9 +82,16 @@ func decodeCommit(ev *segment.Event) (*Commit, error) {
 // decodeRecordMap decodes DAG-CBOR record bytes into a generic JSON-shaped
 // object: the same shape callers see in the "record" field on /subscribe.
 func decodeRecordMap(payload []byte) (map[string]any, error) {
-	val, err := cbor.NewDecoder(bytes.NewReader(payload)).ReadValue()
+	r := bytes.NewReader(payload)
+	val, err := cbor.NewDecoder(r).ReadValue()
 	if err != nil {
 		return nil, fmt.Errorf("cbor decode: %w", err)
+	}
+	// A record payload must be exactly one CBOR item. Trailing bytes mean the
+	// frame is corrupt: the map we decoded would not match RecordCBOR/CID
+	// (which retain the full payload), so reject rather than silently diverge.
+	if r.Len() != 0 {
+		return nil, fmt.Errorf("cbor decode: %d trailing bytes after record", r.Len())
 	}
 	jsonBytes, err := cbor.ToJSON(val)
 	if err != nil {
@@ -93,6 +100,12 @@ func decodeRecordMap(payload []byte) (map[string]any, error) {
 	var m map[string]any
 	if err := json.Unmarshal(jsonBytes, &m); err != nil {
 		return nil, fmt.Errorf("json unmarshal record: %w", err)
+	}
+	// JSON null unmarshals into a map as a nil map with no error. A commit
+	// record must be an object; reject null/non-object so a malformed payload
+	// cannot surface as a non-delete commit with a nil Record.
+	if m == nil {
+		return nil, fmt.Errorf("json unmarshal record: record is not an object")
 	}
 	return m, nil
 }

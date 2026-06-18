@@ -54,10 +54,11 @@ type EntryResult struct {
 // Download fetches and decodes every entry in plan order, invoking emit once
 // per entry in ascending plan order regardless of completion order. Downloads
 // run concurrently up to the configured bound; emission is serialized and
-// ordered. If emit returns false, Download stops early. Download returns the
-// first context error encountered; per-entry download/decode failures are
-// reported through EntryResult.Err, not returned, so one bad entry does not
-// abort the whole backfill.
+// ordered. If emit returns false, Download stops early: it cancels in-flight
+// and pending downloads and returns without fetching the remaining entries.
+// Download returns the first context error encountered; per-entry
+// download/decode failures are reported through EntryResult.Err, not returned,
+// so one bad entry does not abort the whole backfill.
 func (d *Downloader) Download(ctx context.Context, entries []PlanEntry, emit func(EntryResult) bool) error {
 	if len(entries) == 0 {
 		return nil
@@ -71,7 +72,13 @@ func (d *Downloader) Download(ctx context.Context, entries []PlanEntry, emit fun
 		ready[i] = make(chan struct{})
 	}
 
-	g, gctx := errgroup.WithContext(ctx)
+	// Derive a cancelable context so the emitter can stop in-flight and pending
+	// downloads when the consumer asks to stop early (emit returns false). We
+	// keep the caller's ctx separate for the final error check: an emit-driven
+	// cancel is a clean early stop (Download returns nil), not an error.
+	dlCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	g, gctx := errgroup.WithContext(dlCtx)
 	g.SetLimit(d.concurrency)
 
 	// Consumer: emit slots in order as they become ready. Runs concurrently
@@ -88,6 +95,11 @@ func (d *Downloader) Download(ctx context.Context, entries []PlanEntry, emit fun
 		for i := range entries {
 			<-ready[i]
 			if !emit(results[i]) {
+				// Consumer asked to stop. Cancel pending/in-flight downloads
+				// so Download returns promptly instead of fetching the rest of
+				// the archive. The producer loop observes gctx.Err() and fills
+				// the remaining slots; nothing else reads them after we return.
+				cancel()
 				return
 			}
 		}

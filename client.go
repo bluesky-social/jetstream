@@ -101,6 +101,10 @@ func Subscribe(host string, opts ...Option) (*Client, error) {
 // iterator returns. Events must not be called concurrently on the same Client.
 func (c *Client) Events(ctx context.Context) iter.Seq2[*Batch, error] {
 	return func(yield func(*Batch, error) bool) {
+		if c == nil || c.engine == nil {
+			yield(nil, errClientNotInitialized)
+			return
+		}
 		if c.closed.Load() {
 			yield(nil, fmt.Errorf("jetstream: client is closed"))
 			return
@@ -114,12 +118,21 @@ func (c *Client) Events(ctx context.Context) iter.Seq2[*Batch, error] {
 // than once; the underlying engine is closed exactly once and every call
 // returns that same result. Calling Events after Close yields an error.
 func (c *Client) Close() error {
+	if c == nil || c.engine == nil {
+		return errClientNotInitialized
+	}
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
 		c.closeErr = c.engine.close()
 	})
 	return c.closeErr
 }
+
+// errClientNotInitialized is returned (rather than panicking) when a method is
+// called on a zero-value or nil Client. Subscribe is the only constructor; a
+// Client built any other way has a nil engine. Failing deterministically keeps
+// API misuse from surfacing as a nil-pointer panic during cleanup or iteration.
+var errClientNotInitialized = fmt.Errorf("jetstream: client not initialized (use Subscribe)")
 
 // engine is the internal seam between the public Client and the orchestration
 // implementation (planning, download, suppression, cutover, live tail). The

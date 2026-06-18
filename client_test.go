@@ -144,6 +144,45 @@ func TestClosedClientEventsErrors(t *testing.T) {
 	require.Error(t, gotErr, "Events on a closed client must yield an error")
 }
 
+// TestZeroValueClientFailsClosed asserts that calling methods on a Client that
+// bypassed the Subscribe constructor (zero value or nil pointer) returns a
+// deterministic error instead of a nil-pointer panic. Client is exported, so
+// misuse is reachable; failing closed is friendlier than crashing in cleanup.
+func TestZeroValueClientFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	t.Run("zero-value Close", func(t *testing.T) {
+		t.Parallel()
+		var c Client
+		require.ErrorIs(t, c.Close(), errClientNotInitialized)
+	})
+	t.Run("nil-pointer Close", func(t *testing.T) {
+		t.Parallel()
+		var c *Client
+		require.ErrorIs(t, c.Close(), errClientNotInitialized)
+	})
+	t.Run("zero-value Events", func(t *testing.T) {
+		t.Parallel()
+		var c Client
+		var gotErr error
+		for _, err := range c.Events(context.Background()) {
+			gotErr = err
+			break
+		}
+		require.ErrorIs(t, gotErr, errClientNotInitialized)
+	})
+	t.Run("nil-pointer Events", func(t *testing.T) {
+		t.Parallel()
+		var c *Client
+		var gotErr error
+		for _, err := range c.Events(context.Background()) {
+			gotErr = err
+			break
+		}
+		require.ErrorIs(t, gotErr, errClientNotInitialized)
+	})
+}
+
 // countingEngine records how many times close() is invoked, so tests can
 // assert Close drives the engine exactly once even under concurrency.
 type countingEngine struct {

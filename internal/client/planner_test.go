@@ -171,6 +171,9 @@ func TestPlanRejectsMalformedSegments(t *testing.T) {
 		{name: "unknown mode", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"bogus"}],"stats":{}}`},
 		{name: "blocks mode no ranges", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"blocks"}],"stats":{}}`},
 		{name: "inverted block range", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"blocks","blocks":[{"first":5,"last":2}]}],"stats":{}}`},
+		{name: "inverted seq range", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":500,"maxSeq":200,"mode":"segment"}],"stats":{}}`},
+		{name: "index exceeds uint32", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":4294967296,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"segment"}],"stats":{}}`},
+		{name: "block last exceeds uint32", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"blocks","blocks":[{"first":0,"last":4294967296}]}],"stats":{}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
