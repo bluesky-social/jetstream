@@ -41,9 +41,23 @@ type Config struct {
 	BatchSize     int
 	Concurrency   int
 	Buffer        Buffer
-	XRPC          *xrpc.Client
-	Dial          dialFunc // optional; nil uses the production websocket dialer
-	Logger        *slog.Logger
+	// XRPC drives the short XRPC negotiation calls (getTombstones,
+	// planBackfill). BulkXRPC drives the large getSegment/getBlock downloads;
+	// it gets bulk-transfer HTTP tuning (no short wall-clock timeout). When
+	// BulkXRPC is nil the engine reuses XRPC. See design note §5.1.
+	XRPC     *xrpc.Client
+	BulkXRPC *xrpc.Client
+	Dial     dialFunc // optional; nil uses the production websocket dialer
+	Logger   *slog.Logger
+}
+
+// bulkClient returns the client for segment/block downloads, falling back to
+// the negotiation client.
+func (c Config) bulkClient() *xrpc.Client {
+	if c.BulkXRPC != nil {
+		return c.BulkXRPC
+	}
+	return c.XRPC
 }
 
 // Engine orchestrates the whole stream: overlay seed, backfill plan +
@@ -157,7 +171,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 
 	// 4. Download + emit the backfill in plan order. Rows are filtered +
 	// suppressed before decode by the downloader's selector.
-	dl := NewDownloader(e.cfg.XRPC, e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
+	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
 	derr := dl.Download(ctx, plan.Entries, func(res EntryResult) bool {
 		if res.Err != nil {
 			return emitErr(res.Err)

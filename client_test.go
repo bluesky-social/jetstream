@@ -2,10 +2,17 @@ package jetstream
 
 import (
 	"context"
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/coder/websocket"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/stretchr/testify/require"
 )
 
@@ -248,19 +255,67 @@ func TestCloseRacesEvents(t *testing.T) {
 	require.EqualValues(t, 1, eng.closes.Load())
 }
 
-// TestPlaceholderEngineReports asserts the skeleton wiring reaches the engine
-// and surfaces its (currently not-implemented) status without panicking. This
-// test is updated when the real engine lands.
-func TestPlaceholderEngineReports(t *testing.T) {
+// TestSubscribeLiveTailEndToEnd exercises the full public API against a real
+// /subscribe-v2 websocket server: Subscribe (live-only) -> Events -> decoded
+// Event, including record decode and cursor extraction.
+func TestSubscribeLiveTailEndToEnd(t *testing.T) {
 	t.Parallel()
-	c, err := Subscribe("host")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/subscribe-v2", r.URL.Path)
+		require.Equal(t, "true", r.URL.Query().Get("extended"))
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close(websocket.StatusNormalClosure, "done") }()
+		for _, frame := range []string{
+			liveCommitFrameJSON(1, "did:plc:a", "app.bsky.feed.post", "r1"),
+			liveCommitFrameJSON(2, "did:plc:a", "app.bsky.feed.post", "r2"),
+		} {
+			if err := conn.Write(r.Context(), websocket.MessageText, []byte(frame)); err != nil {
+				return
+			}
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := Subscribe(srv.URL)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 
-	var gotErr error
-	for _, err := range c.Events(context.Background()) {
-		gotErr = err
-		break
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var got []Event
+	for batch, err := range c.Events(ctx) {
+		if err != nil {
+			continue
+		}
+		got = append(got, batch.Events()...)
+		if len(got) >= 2 {
+			cancel()
+			break
+		}
 	}
-	require.ErrorContains(t, gotErr, "not yet implemented")
+
+	require.Len(t, got, 2)
+	require.Equal(t, KindCommit, got[0].Kind)
+	require.EqualValues(t, 1, got[0].Seq)
+	require.Equal(t, "app.bsky.feed.post", got[0].Commit.Collection)
+	require.Equal(t, "r1", got[0].Commit.Rkey)
+	require.NotNil(t, got[0].Commit.Record)
+	require.EqualValues(t, 2, got[1].Seq)
+}
+
+// liveCommitFrameJSON builds an extended commit frame with a minimal CBOR
+// record, base64-encoded, matching the /subscribe-v2 extended wire shape.
+func liveCommitFrameJSON(seq uint64, did, coll, rkey string) string {
+	rec, _ := cbor.Marshal(map[string]any{"$type": coll, "text": "hi " + rkey})
+	b64 := base64.StdEncoding.EncodeToString(rec)
+	return `{"did":"` + did + `","time_us":1,"cursor":` + strconv.FormatUint(seq, 10) +
+		`,"seq":` + strconv.FormatUint(seq, 10) +
+		`,"kind":"commit","commit":{"rev":"r","operation":"create","collection":"` + coll +
+		`","rkey":"` + rkey + `","cid":"bafytest","record_cbor":"` + b64 + `"}}`
 }
