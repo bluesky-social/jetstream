@@ -459,7 +459,28 @@ func assertFirehoseEventLogMatches(
 	require.Positivef(t, limit, "%s expected positive firehose comparison range cursor=%d target=%d", phase, cursor, target)
 	want, err := ExpectedEventLogFromFirehose(w, cursor, limit)
 	require.NoErrorf(t, err, "%s: build expected event log cursor=%d target=%d", phase, cursor, target)
-	got := observed.RowsByUpstreamCursor(cursor, target)
+
+	// The seqAck the caller waited on keys on the SET of upstream cursors, so it
+	// fires as soon as the target cursor first appears. But a #sync divergence
+	// fans one upstream cursor out into a KindSync tombstone plus N
+	// KindCreateResync replacement rows that all share that cursor (see
+	// internal/ingest/live/events.go convertSync), and the recorder is fed
+	// asynchronously by the live callback. A one-shot snapshot can therefore
+	// race ahead of the trailing replacement rows. Poll until the observed count
+	// reaches the deterministic expected count (the world is quiescent across
+	// this comparison window), then run the authoritative multiset compare.
+	// This preserves failure power: a genuinely dropped row never reaches the
+	// count and times out below; a duplicate or wrong row overshoots the count
+	// or fails the compare.
+	var got []EventLogRow
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		got = observed.RowsByUpstreamCursor(cursor, target)
+		if len(got) >= len(want) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	err = CompareEventLogMultiset(want, got)
 	recordTraceOrError(t, trace, "event_log_compare", map[string]any{
 		"phase":          phase,
