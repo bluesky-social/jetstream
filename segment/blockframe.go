@@ -69,3 +69,20 @@ func ReadBlockFrame(r io.ReaderAt, hdr Header, idx int) ([]byte, error) {
 	}
 	return frame, nil
 }
+
+// DecodeBlockFrame decompresses and decodes a single raw block frame into its
+// events. frame is exactly the zstd frame returned by ReadBlockFrame or by the
+// getBlock XRPC endpoint (no 8-byte length prefix). This is the standard block
+// decoder remote clients use on the bytes named by a backfill plan.
+//
+// The decoder bounds decompressed size to guard against zstd bombs and
+// validates every column length, so a corrupt or hostile frame yields an error
+// rather than a panic or oversized allocation.
+//
+// Buffer-aliasing contract: the returned events alias an internal decompressed
+// buffer for their string and payload columns. The buffer is private to this
+// call (not shared across frames), but callers that retain fields beyond the
+// events' lifetime should clone them.
+func DecodeBlockFrame(frame []byte) ([]Event, error) {
+	return decodeBlockCompressed(frame)
+}
