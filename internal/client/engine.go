@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/jcalabro/atmos/xrpc"
 )
@@ -31,6 +32,12 @@ type Buffer interface {
 // few extra live frames re-tailed, never a gap.
 const liveRewindMargin = 256
 
+// defaultMaxBatchDelay bounds how long a partially-filled batch waits before
+// being flushed, so a low-volume live tail still delivers promptly rather than
+// holding events until BatchSize accumulates. Backfill fills batches by count
+// almost immediately, so this only governs the steady-state tail.
+const defaultMaxBatchDelay = 20 * time.Millisecond
+
 // Config is the resolved engine configuration the root package passes in.
 type Config struct {
 	Host          string // normalized base URL
@@ -39,6 +46,9 @@ type Config struct {
 	HasLiveCursor bool
 	LiveCursor    uint64 // pure-live resume cursor when !Backfill
 	BatchSize     int
+	// MaxBatchDelay bounds how long a partial batch waits before flushing in
+	// the steady-state live tail. Zero uses defaultMaxBatchDelay.
+	MaxBatchDelay time.Duration
 	Concurrency   int
 	Buffer        Buffer
 	// XRPC drives the short XRPC negotiation calls (getTombstones,
@@ -48,7 +58,10 @@ type Config struct {
 	XRPC     *xrpc.Client
 	BulkXRPC *xrpc.Client
 	Dial     dialFunc // optional; nil uses the production websocket dialer
-	Logger   *slog.Logger
+	// LiveBackoffMin overrides the live-tail reconnect backoff floor. Zero uses
+	// the package default; tests set a tiny value to avoid real-time waits.
+	LiveBackoffMin time.Duration
+	Logger         *slog.Logger
 }
 
 // bulkClient returns the client for segment/block downloads, falling back to
@@ -101,11 +114,14 @@ func (e *Engine) Run(ctx context.Context, emitBatch func([]Event) bool, emitErr 
 // caller's saved cursor (or the current tip) with no archive negotiation.
 func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
 	b := newBatcher(e.cfg.BatchSize, emitBatch)
+	stopFlusher := e.startFlusher(ctx, b)
+	defer stopFlusher()
 	consumer := newLiveConsumer(liveConfig{
-		host:   e.cfg.Host,
-		cursor: e.cfg.LiveCursor,
-		dial:   e.cfg.Dial,
-		logger: e.logger,
+		host:       e.cfg.Host,
+		cursor:     e.cfg.LiveCursor,
+		dial:       e.cfg.Dial,
+		logger:     e.logger,
+		backoffMin: e.cfg.LiveBackoffMin,
 	})
 	_ = consumer.Run(ctx, func(ev *Event, _ []byte, err error) bool {
 		if err != nil {
@@ -113,8 +129,44 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 		}
 		return b.add(*ev)
 	})
+	stopFlusher()
 	if !b.stopped() {
 		b.flush()
+	}
+}
+
+// startFlusher runs a background ticker that flushes the batcher's partial tail
+// at most every MaxBatchDelay, so a low-volume live tail delivers promptly. It
+// returns a stop function (idempotent) that halts the ticker and waits for it
+// to exit.
+func (e *Engine) startFlusher(ctx context.Context, b *batcher) func() {
+	delay := e.cfg.MaxBatchDelay
+	if delay <= 0 {
+		delay = defaultMaxBatchDelay
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	stop := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(delay)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-t.C:
+				if !b.flush() {
+					return // consumer stopped
+				}
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() { close(stop) })
+		<-done
 	}
 }
 
@@ -157,10 +209,11 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	liveCtx, stopLive := context.WithCancel(ctx)
 	defer stopLive()
 	consumer := newLiveConsumer(liveConfig{
-		host:   e.cfg.Host,
-		cursor: liveStart,
-		dial:   e.cfg.Dial,
-		logger: e.logger,
+		host:       e.cfg.Host,
+		cursor:     liveStart,
+		dial:       e.cfg.Dial,
+		logger:     e.logger,
+		backoffMin: e.cfg.LiveBackoffMin,
 	})
 	var liveWG sync.WaitGroup
 	liveWG.Go(func() {
@@ -199,7 +252,10 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 
 	// 5. Flip the sink: from here, buffered then live frames flow through the
 	// same batcher. Drain everything strictly above the sealed tip (the
-	// backfill already emitted <= plannedThroughSeq).
+	// backfill already emitted <= plannedThroughSeq). Start the max-latency
+	// flusher now so steady-state low-volume tail batches deliver promptly.
+	stopFlusher := e.startFlusher(ctx, b)
+	defer stopFlusher()
 	emitLive := func(ev Event) bool { return b.add(ev) }
 	if err := sink.flipAndDrain(ctx, plan.PlannedThroughSeq, emitLive, emitErr); err != nil {
 		emitErr(err)
@@ -208,6 +264,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	// 6. Steady state: the live consumer now forwards directly through the
 	// sink to the batcher. Block until the live tail ends (ctx cancel).
 	liveWG.Wait()
+	stopFlusher()
 	if !b.stopped() {
 		b.flush()
 	}

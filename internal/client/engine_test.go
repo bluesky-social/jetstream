@@ -108,42 +108,72 @@ func (h *engineHarness) cfg() Config {
 		Buffer:      &memBuffer{},
 		XRPC:        &xrpc.Client{Host: h.as.srv.URL},
 		Dial:        dial,
+		// Tiny reconnect backoff: the scripted transport EOFs after its frames,
+		// and the engine reconnect-loops until the test cancels. A short floor
+		// keeps the test fast without real-time waits.
+		LiveBackoffMin: time.Millisecond,
 	}
 }
 
-// run executes the engine until the short-lived context expires (the live
-// consumer reconnect-loops on script EOF), returning all emitted events.
-func (h *engineHarness) run(t *testing.T, cfg Config) []Event {
+// runUntilDone drives the engine until done(seenSeqs) is true, then cancels and
+// returns all emitted events. A 5s safety net fails the test rather than
+// hanging.
+func (h *engineHarness) runUntilDone(t *testing.T, cfg Config, what string, done func(seen map[uint64]bool) bool) []Event {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var (
 		mu     sync.Mutex
 		events []Event
+		seen   = map[uint64]bool{}
 	)
 	eng := NewEngine(cfg)
-	done := make(chan struct{})
+	finished := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(finished)
 		eng.Run(ctx,
 			func(batch []Event) bool {
 				mu.Lock()
 				events = append(events, batch...)
+				for _, ev := range batch {
+					seen[ev.Seq] = true
+				}
+				reached := done(seen)
 				mu.Unlock()
+				if reached {
+					cancel()
+					return false
+				}
 				return true
 			},
 			func(error) bool { return true },
 		)
 	}()
 	select {
-	case <-done:
+	case <-finished:
 	case <-time.After(5 * time.Second):
-		t.Fatal("engine did not finish within 5s")
+		cancel()
+		<-finished
+		t.Fatalf("engine did not reach %s within 5s", what)
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	return append([]Event(nil), events...)
+}
+
+// runUntil drives the engine until it has emitted wantSeqs distinct seqs.
+func (h *engineHarness) runUntil(t *testing.T, cfg Config, wantSeqs int) []Event {
+	t.Helper()
+	return h.runUntilDone(t, cfg, fmt.Sprintf("%d distinct seqs", wantSeqs),
+		func(seen map[uint64]bool) bool { return len(seen) >= wantSeqs })
+}
+
+// runUntilSeq drives the engine until the given seq has been emitted.
+func (h *engineHarness) runUntilSeq(t *testing.T, cfg Config, seq uint64) []Event {
+	t.Helper()
+	return h.runUntilDone(t, cfg, fmt.Sprintf("seq %d", seq),
+		func(seen map[uint64]bool) bool { return seen[seq] })
 }
 
 // TestEngineActiveSegmentGap is the headline correctness guard (#87): records
@@ -177,7 +207,7 @@ func TestEngineActiveSegmentGap(t *testing.T) {
 	}
 	h.installHandlers()
 
-	events := h.run(t, h.cfg())
+	events := h.runUntil(t, h.cfg(), 18)
 
 	// Every seq 1..18 must appear, with NONE of the active-segment gap (11..15)
 	// dropped. Dedup means each seq appears exactly once.
@@ -211,7 +241,7 @@ func TestEngineBackfillThenLiveOrdering(t *testing.T) {
 	}
 	h.installHandlers()
 
-	events := h.run(t, h.cfg())
+	events := h.runUntil(t, h.cfg(), 6)
 	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, uniqueSeqs(events))
 }
 
@@ -237,7 +267,9 @@ func TestEngineLiveDeleteSuppressesBackfillCreate(t *testing.T) {
 	h.overlayM = 50
 	h.installHandlers()
 
-	events := h.run(t, h.cfg())
+	// r2 is at seq 3; once it arrives the backfill has emitted everything it
+	// will (r1 is suppressed), so wait for seq 3 then assert r1 never appeared.
+	events := h.runUntilSeq(t, h.cfg(), 3)
 	for _, ev := range events {
 		if ev.Kind == KindCommit && ev.Commit.Rkey == "r1" && ev.Commit.Operation == OpCreate {
 			t.Fatalf("suppressed create of r1 (deleted at seq 50) was emitted at seq %d", ev.Seq)

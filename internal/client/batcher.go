@@ -1,9 +1,18 @@
 package client
 
-// batcher groups events into batches by count, with an explicit flush for the
-// partial tail (e.g. when the live tail goes idle or the stream ends). It does
-// no locking: the engine calls it from a single emission goroutine at a time.
+import "sync"
+
+// batcher groups events into batches by count, with a max-latency flush so a
+// low-volume live tail does not hold events indefinitely (the design's
+// tens-of-milliseconds delivery goal) and a final flush for the partial tail
+// when the stream ends.
+//
+// It is safe for concurrent use: add is called from the backfill goroutine and
+// (after cutover) the live goroutine, while a periodic flusher may fire from a
+// timer goroutine. The mutex also serializes the downstream emit so the
+// iterator's yield is never called concurrently.
 type batcher struct {
+	mu   sync.Mutex
 	size int
 	buf  []Event
 	emit func(batch []Event) bool
@@ -21,12 +30,14 @@ func newBatcher(size int, emit func(batch []Event) bool) *batcher {
 // the consumer asked to stop (emit returned false), after which the batcher is
 // inert.
 func (b *batcher) add(ev Event) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.stop {
 		return false
 	}
 	b.buf = append(b.buf, ev)
 	if len(b.buf) >= b.size {
-		return b.flush()
+		return b.flushLocked()
 	}
 	return true
 }
@@ -34,6 +45,12 @@ func (b *batcher) add(ev Event) bool {
 // flush emits any buffered events as one batch. A no-op when empty. Returns
 // false if the consumer asked to stop.
 func (b *batcher) flush() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.flushLocked()
+}
+
+func (b *batcher) flushLocked() bool {
 	if b.stop {
 		return false
 	}
@@ -50,4 +67,8 @@ func (b *batcher) flush() bool {
 }
 
 // stopped reports whether the consumer asked to stop.
-func (b *batcher) stopped() bool { return b.stop }
+func (b *batcher) stopped() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.stop
+}

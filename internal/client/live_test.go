@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
@@ -70,6 +71,10 @@ func scriptedDialer(conns ...*scriptedConn) (dialFunc, *int) {
 // cancels. Returns the emitted events (errors are recorded separately).
 func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error) {
 	t.Helper()
+	// Tiny reconnect backoff so overlap/reconnect tests don't wait real time.
+	if cfg.backoffMin == 0 {
+		cfg.backoffMin = time.Millisecond
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

@@ -42,6 +42,24 @@ type liveConfig struct {
 	readLimit int64
 	dial      dialFunc
 	logger    *slog.Logger
+	// backoffMin/backoffMax override the reconnect backoff bounds. Zero uses
+	// the package defaults. Tests set tiny values to avoid real-time waits.
+	backoffMin time.Duration
+	backoffMax time.Duration
+}
+
+func (c liveConfig) minBackoff() time.Duration {
+	if c.backoffMin > 0 {
+		return c.backoffMin
+	}
+	return liveBackoffMin
+}
+
+func (c liveConfig) maxBackoff() time.Duration {
+	if c.backoffMax > 0 {
+		return c.backoffMax
+	}
+	return liveBackoffMax
 }
 
 // liveConsumer tails /subscribe-v2 in extended mode, decoding frames into
@@ -73,7 +91,8 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 // emit as a non-nil error with a nil event so the caller can observe churn);
 // a context cancellation is a clean stop and returns nil.
 func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error) bool) error {
-	backoff := liveBackoffMin
+	minB, maxB := c.cfg.minBackoff(), c.cfg.maxBackoff()
+	backoff := minB
 	for {
 		if ctx.Err() != nil {
 			return nil //nolint:nilerr // context cancellation is a clean shutdown, not an error
@@ -90,7 +109,7 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error)
 		// backoff so a long-lived connection that finally drops reconnects
 		// promptly rather than at the accumulated max.
 		if c.lastSeq > seqBefore {
-			backoff = liveBackoffMin
+			backoff = minB
 		}
 		// Report the disconnect and back off before reconnecting.
 		if err != nil && !emit(nil, nil, fmt.Errorf("jetstream: live tail reconnecting: %w", err)) {
@@ -99,7 +118,7 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error)
 		if !sleep(ctx, backoff) {
 			return nil
 		}
-		backoff = nextBackoff(backoff)
+		backoff = nextBackoff(backoff, maxB)
 	}
 }
 
@@ -184,10 +203,10 @@ func dialWebsocket(ctx context.Context, rawURL string) (wsConn, error) {
 	return conn, nil
 }
 
-func nextBackoff(d time.Duration) time.Duration {
+func nextBackoff(d, maxB time.Duration) time.Duration {
 	d *= 2
-	if d > liveBackoffMax {
-		return liveBackoffMax
+	if d > maxB {
+		return maxB
 	}
 	return d
 }

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,7 +38,12 @@ func newPlanServer(t *testing.T, status int, respBody string) *planServer {
 }
 
 func (ps *planServer) planner() *Planner {
-	return NewPlanner(&xrpc.Client{Host: ps.srv.URL})
+	// Disable retry backoff so the error-path tests don't wait real seconds on
+	// 5xx responses; one attempt is enough to assert mapping behavior.
+	return NewPlanner(&xrpc.Client{
+		Host:  ps.srv.URL,
+		Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+	})
 }
 
 func (ps *planServer) decodeInput(t *testing.T) map[string]any {
