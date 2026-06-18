@@ -66,9 +66,19 @@ staleness (all matching is under the manifest `RLock` against current state),
 and the cap counts patterns, not expansions.
 
 **Equivalence claim (the core correctness property):** for any archive and any
-prefix `P`, planning with `{prefixes: [P]}` selects exactly the same segments
-and blocks as planning with `{collections: <every NSID in the archive under P>}`.
-This is what the equivalence property test (below) proves.
+prefix `P` that matches **at least one** archived NSID, planning with
+`{prefixes: [P]}` selects exactly the same segments and blocks as planning with
+`{collections: <every NSID in the archive under P>}`. This is what the
+equivalence property test (below) proves.
+
+**Match-nothing boundary (important):** when `P` matches *no* archived NSID, the
+two are deliberately *not* interchangeable, and that asymmetry is the point. A
+non-empty `CollectionPrefixes` means "constrain to these prefixes," so a prefix
+matching nothing yields an empty plan. But the enumerated-exact form expands to
+`Collections == []`, which means *match-all*. So "empty list == match all"
+applies only to a genuinely-absent filter, never to a wildcard that happened to
+match nothing. The equivalence test asserts the equality only for non-empty
+expansions and asserts match-nothing directly for empty ones.
 
 ### Wire shape: no new field
 

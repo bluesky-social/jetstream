@@ -998,7 +998,7 @@ type JetstreamPlanBackfill_Input struct {
 	LexiconTypeID string           `json:"$type,omitempty"`
 	AfterSeq      gt.Option[int64] `json:"afterSeq,omitzero"`     // Lower exclusive sequence bound. Rows with seq <= afterSeq are outside the requested window.
 	BeforeSeq     gt.Option[int64] `json:"beforeSeq,omitzero"`    // Upper inclusive sequence bound. Rows with seq > beforeSeq are outside the requested window.
-	Collections   []string         `json:"collections,omitempty"` // Exact collection NSIDs to match. Missing or empty means all collections.
+	Collections   []string         `json:"collections,omitempty"` // Collection filters to match. Each entry is either an exact NSID (e.g. app.bsky.feed.post) or a na...
 	Dids          []string         `json:"dids,omitempty"`        // Exact DIDs to match. Missing or empty means all DIDs.
 
 	// extra preserves unknown fields for same-format round-trips.

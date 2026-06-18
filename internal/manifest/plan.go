@@ -3,6 +3,7 @@ package manifest
 import (
 	"errors"
 	"math"
+	"strings"
 
 	"github.com/bluesky-social/jetstream-v2/segment"
 )
@@ -22,6 +23,12 @@ const (
 type PlanBackfillRequest struct {
 	DIDs        []string
 	Collections []string
+	// CollectionPrefixes are namespace prefixes from wildcard filters
+	// (e.g. "app.bsky.feed." from "app.bsky.feed.*"). Each entry ends in
+	// ".". A segment collection matches if its NSID is in Collections OR
+	// has any of these as a prefix. Like Collections, an empty set here
+	// imposes no collection constraint; the two are combined as a union.
+	CollectionPrefixes []string
 
 	AfterSeq     uint64
 	HasAfterSeq  bool
@@ -180,7 +187,7 @@ func blockOverlapsSeq(block segment.BlockInfo, req PlanBackfillRequest) bool {
 }
 
 func selectPlanBlocks(seg *SegmentMetadata, req PlanBackfillRequest, wantCollections map[string]struct{}) []int {
-	collectionMatchAll := len(req.Collections) == 0
+	collectionMatchAll := len(req.Collections) == 0 && len(req.CollectionPrefixes) == 0
 	didMatchAll := len(req.DIDs) == 0
 
 	if !didMatchAll && !segmentBloomMayContainAny(seg, req.DIDs) {
@@ -189,7 +196,7 @@ func selectPlanBlocks(seg *SegmentMetadata, req PlanBackfillRequest, wantCollect
 
 	var collectionIDs map[uint32]struct{}
 	if !collectionMatchAll {
-		collectionIDs = collectionIDsForSegment(seg, wantCollections)
+		collectionIDs = collectionIDsForSegment(seg, wantCollections, req.CollectionPrefixes)
 		if len(collectionIDs) == 0 {
 			return nil
 		}
@@ -239,11 +246,33 @@ func blockBloomMayContainAny(seg *SegmentMetadata, blockIdx int, dids []string) 
 	return false
 }
 
-func collectionIDsForSegment(seg *SegmentMetadata, want map[string]struct{}) map[uint32]struct{} {
-	out := make(map[uint32]struct{}, min(len(want), len(seg.Collections)))
+// collectionIDsForSegment returns the segment-local collection indices whose
+// NSID is exact-matched by want OR is covered by one of prefixes. Prefixes only
+// widen the matched set, preserving the planner's one-sided contract (no false
+// negatives). Matching prefixes against this segment's own resident collection
+// table is equivalent to expanding each prefix against the global collection
+// union and exact-matching, because a segment can only contain collections that
+// exist in that union — but it needs no global cache and stays current under
+// the manifest read lock.
+func collectionIDsForSegment(seg *SegmentMetadata, want map[string]struct{}, prefixes []string) map[uint32]struct{} {
+	out := make(map[uint32]struct{}, min(len(want)+len(prefixes), len(seg.Collections)))
 	for id, collection := range seg.Collections {
-		if _, ok := want[collection]; ok && id <= math.MaxUint32 {
+		// BlockCollections references collections by uint32 index, so an index
+		// past MaxUint32 can never appear in a block and matching it would be
+		// dead weight. Skipping it cannot cause a false negative (no block
+		// could reference it), preserving the one-sided contract.
+		if id > math.MaxUint32 {
+			continue
+		}
+		if _, ok := want[collection]; ok {
 			out[uint32(id)] = struct{}{}
+			continue
+		}
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(collection, prefix) {
+				out[uint32(id)] = struct{}{}
+				break
+			}
 		}
 	}
 	return out
