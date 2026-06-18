@@ -8,16 +8,26 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Client is a Jetstream v2 consumer. Construct one with Subscribe. A Client
 // drives at most one Events iteration at a time; create separate Clients for
-// concurrent streams. Close releases its resources.
+// concurrent streams. Close releases its resources and is safe to call
+// concurrently with a running Events (the natural way to stop a live tail) and
+// to call more than once.
 type Client struct {
 	cfg    config
 	host   string // normalized base URL, e.g. "https://host"
 	engine engine
-	closed bool
+
+	// closed reports whether Close has been called. atomic so a concurrent
+	// Close can interrupt a running Events without a data race; closeOnce
+	// makes Close idempotent and engine.close() run exactly once.
+	closed    atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Batch is a group of events delivered together by the Events iterator. It
@@ -53,7 +63,10 @@ func (b *Batch) LastCursor() uint64 {
 // sealed archive and then cuts over to live.
 func Subscribe(host string, opts ...Option) (*Client, error) {
 	cfg := defaultConfig()
-	for _, opt := range opts {
+	for i, opt := range opts {
+		if opt == nil {
+			return nil, fmt.Errorf("jetstream: option %d is nil", i)
+		}
 		opt(&cfg)
 	}
 	if cfg.logger == nil {
@@ -88,7 +101,7 @@ func Subscribe(host string, opts ...Option) (*Client, error) {
 // iterator returns. Events must not be called concurrently on the same Client.
 func (c *Client) Events(ctx context.Context) iter.Seq2[*Batch, error] {
 	return func(yield func(*Batch, error) bool) {
-		if c.closed {
+		if c.closed.Load() {
 			yield(nil, fmt.Errorf("jetstream: client is closed"))
 			return
 		}
@@ -97,13 +110,15 @@ func (c *Client) Events(ctx context.Context) iter.Seq2[*Batch, error] {
 }
 
 // Close releases the Client's resources. It is safe to call after Events
-// returns. Calling Events after Close yields an error.
+// returns, concurrently with a running Events (to stop a live tail), and more
+// than once; the underlying engine is closed exactly once and every call
+// returns that same result. Calling Events after Close yields an error.
 func (c *Client) Close() error {
-	if c.closed {
-		return nil
-	}
-	c.closed = true
-	return c.engine.close()
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		c.closeErr = c.engine.close()
+	})
+	return c.closeErr
 }
 
 // engine is the internal seam between the public Client and the orchestration

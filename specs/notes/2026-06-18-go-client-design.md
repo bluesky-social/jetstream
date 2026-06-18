@@ -219,6 +219,26 @@ of these pull OTEL, Prometheus, pebble, or any ingest/server package. Because
 `internal/client` can freely import other `internal/*` packages, overlay and
 tombstone decode are reused directly — nothing is promoted to public.
 
+### 5.1 HTTP client tuning (two clients, decided)
+
+The two HTTP workloads want opposite jttp tuning, so the engine builds **two**
+clients (not one), matching the existing codebase pattern:
+
+- **XRPC negotiation** (`getTombstones`/`planBackfill`): short fan-out calls →
+  `jttp.New(xrpc.ATProtoOpts(timeout)...)` (short overall `WithTimeout`, 5s
+  dial/TLS, 15s response-header).
+- **Bulk segment/block download** (`getSegment`/`getBlock`): large streaming
+  transfers → `jttp.New(xrpc.BulkDownloadOpts()...)` (no short wall-clock
+  timeout — TTFB/idle/min-transfer-rate guards plus a 30m backstop; a blanket
+  30s timeout would prematurely kill a multi-hundred-MiB segment).
+
+`WithHTTPClient` is a caller **override** that replaces *both* with the single
+client supplied; `cfg.httpClient == nil` is the "use the per-workload defaults"
+sentinel. `defaultConfig()` must NOT install a default client — doing so would
+collapse the two-client tuning into one. (Resolves the roast finding that the
+documented default was never installed; the doc now describes the engine-built
+per-workload clients.)
+
 ## 6. Dependency + API-surface audit (enabler refactors)
 
 ### 6.1 `segment` decode core must shed `internal/*`

@@ -22,8 +22,13 @@ type config struct {
 	batchSize     int
 	downloadConc  int
 	liveBuffer    LiveBuffer
-	httpClient    *http.Client
-	logger        *slog.Logger
+	// httpClient is a caller override. nil is the sentinel for "unset":
+	// the engine then builds its own per-workload jttp clients
+	// (xrpc.ATProtoOpts for XRPC, xrpc.BulkDownloadOpts for bulk
+	// downloads). Do not install a default here — that would collapse the
+	// two-client tuning into one shared client. See WithHTTPClient.
+	httpClient *http.Client
+	logger     *slog.Logger
 }
 
 // Defaults applied when an option is not supplied.
@@ -122,8 +127,13 @@ func WithLiveBuffer(b LiveBuffer) Option {
 	}
 }
 
-// WithHTTPClient sets the HTTP client used for XRPC and segment downloads.
-// The default is a client with sensible atproto timeouts.
+// WithHTTPClient overrides the HTTP client used for both XRPC negotiation
+// and bulk segment/block downloads. It is an override: when unset, the
+// client builds its own jttp clients tuned per workload — xrpc.ATProtoOpts
+// for the short XRPC calls (getTombstones/planBackfill) and
+// xrpc.BulkDownloadOpts for the streaming segment/block downloads, whose
+// large transfers a short wall-clock timeout would prematurely kill.
+// Supplying a client here replaces both with the single client given.
 func WithHTTPClient(h *http.Client) Option {
 	return func(c *config) {
 		if h != nil {

@@ -2,6 +2,8 @@ package jetstream
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -105,6 +107,18 @@ func TestSubscribeValidation(t *testing.T) {
 	require.NoError(t, c.Close())
 }
 
+// TestSubscribeNilOption asserts a nil Option yields a constructor error
+// rather than panicking on a nil func call — public API robustness.
+func TestSubscribeNilOption(t *testing.T) {
+	t.Parallel()
+
+	_, err := Subscribe("host", nil)
+	require.ErrorContains(t, err, "option 0 is nil")
+
+	_, err = Subscribe("host", WithBatchSize(8), nil)
+	require.ErrorContains(t, err, "option 1 is nil")
+}
+
 func TestBatchLastCursor(t *testing.T) {
 	t.Parallel()
 	var empty Batch
@@ -128,6 +142,71 @@ func TestClosedClientEventsErrors(t *testing.T) {
 		break
 	}
 	require.Error(t, gotErr, "Events on a closed client must yield an error")
+}
+
+// countingEngine records how many times close() is invoked, so tests can
+// assert Close drives the engine exactly once even under concurrency.
+type countingEngine struct {
+	closes  atomic.Int64
+	runErr  error
+	started atomic.Bool
+}
+
+func (e *countingEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
+	e.started.Store(true)
+	<-ctx.Done()
+	yield(nil, e.runErr)
+}
+
+func (e *countingEngine) close() error {
+	e.closes.Add(1)
+	return nil
+}
+
+// TestCloseConcurrentClosesEngineOnce asserts Close is idempotent and
+// race-free under concurrent callers: the engine is closed exactly once and
+// every caller observes nil. Run under -race to catch unsynchronized access
+// to the close state.
+func TestCloseConcurrentClosesEngineOnce(t *testing.T) {
+	t.Parallel()
+	eng := &countingEngine{}
+	c := &Client{engine: eng}
+
+	const n = 16
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			require.NoError(t, c.Close())
+		}()
+	}
+	wg.Wait()
+
+	require.EqualValues(t, 1, eng.closes.Load(), "engine.close must run exactly once")
+}
+
+// TestCloseRacesEvents asserts Close can stop a running Events from another
+// goroutine without a data race on the close state — the natural shutdown
+// pattern for a live tail. Meaningful under -race.
+func TestCloseRacesEvents(t *testing.T) {
+	t.Parallel()
+	eng := &countingEngine{}
+	c := &Client{engine: eng}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range c.Events(ctx) {
+		}
+	}()
+
+	require.NoError(t, c.Close())
+	cancel()
+	<-done
+	require.EqualValues(t, 1, eng.closes.Load())
 }
 
 // TestPlaceholderEngineReports asserts the skeleton wiring reaches the engine
