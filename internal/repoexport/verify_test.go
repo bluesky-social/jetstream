@@ -8,7 +8,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/car"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/mst"

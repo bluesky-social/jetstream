@@ -12,11 +12,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
+	"github.com/bluesky-social/jetstream/segment"
 	"golang.org/x/sync/errgroup"
 )
 

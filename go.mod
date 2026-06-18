@@ -1,4 +1,4 @@
-module github.com/bluesky-social/jetstream-v2
+module github.com/bluesky-social/jetstream
 
 go 1.26
 

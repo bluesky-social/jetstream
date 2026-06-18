@@ -15,10 +15,10 @@ import (
 	"math/rand/v2"
 	"net/http/httptest"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )

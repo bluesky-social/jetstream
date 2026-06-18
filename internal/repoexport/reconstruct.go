@@ -11,8 +11,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/mst"
 )

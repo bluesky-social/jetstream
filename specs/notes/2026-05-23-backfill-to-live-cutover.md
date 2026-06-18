@@ -295,7 +295,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
@@ -421,10 +421,10 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
@@ -649,7 +649,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 )
 
 // writeMergingPhase is commit point #1. After this call returns nil,
@@ -742,7 +742,7 @@ import (
 	"log/slog"
 	"path/filepath"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
 )
 
 // runSteadyState opens a live.Consumer pointed at <DataDir>/segments
@@ -806,7 +806,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 )
 
 // Orchestrator owns the ingestion-lifecycle state machine. Construct
@@ -936,9 +936,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -1270,8 +1270,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1439,8 +1439,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1580,8 +1580,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1844,7 +1844,7 @@ Replace that entire block with:
 Add to the import block:
 
 ```go
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/orchestrator"
+	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
 ```
 
 The existing `internal/ingest`, `internal/ingest/backfill`, and `internal/ingest/live` imports stay because we still pass their `*Metrics` types and use `live.DeriveRelayHTTPURL`.

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus"
 )

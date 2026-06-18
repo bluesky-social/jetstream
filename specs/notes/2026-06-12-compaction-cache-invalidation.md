@@ -594,7 +594,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/gt"

@@ -61,9 +61,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
-	"github.com/bluesky-social/jetstream-v2/internal/version"
-	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
+	"github.com/bluesky-social/jetstream/internal/jetstreamd"
+	"github.com/bluesky-social/jetstream/internal/version"
+	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/jcalabro/atmos"
 	"github.com/urfave/cli/v3"
 )

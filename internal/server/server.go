@@ -21,7 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 )

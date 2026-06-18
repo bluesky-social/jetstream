@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/manifest"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"golang.org/x/sync/singleflight"
 )
 

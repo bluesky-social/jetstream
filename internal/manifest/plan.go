@@ -5,7 +5,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 var (

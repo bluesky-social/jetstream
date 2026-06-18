@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/xrpc"

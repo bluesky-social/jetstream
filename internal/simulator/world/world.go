@@ -8,7 +8,7 @@ import (
 	"os"
 	"sync/atomic"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 	"github.com/cockroachdb/pebble"
 )
 

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/streaming"

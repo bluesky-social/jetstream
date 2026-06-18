@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/bluesky-social/jetstream-v2/internal/overlay"
+	"github.com/bluesky-social/jetstream/internal/overlay"
 	"github.com/jcalabro/atmos/xrpcserver"
 )
 

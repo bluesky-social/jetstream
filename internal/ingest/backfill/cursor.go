@@ -23,7 +23,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 )
 
 // listReposCursorKey is the pebble key for the persisted listRepos

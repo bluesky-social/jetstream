@@ -127,7 +127,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -441,7 +441,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -576,8 +576,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
@@ -671,7 +671,7 @@ package backfill
 import (
 	"fmt"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -787,7 +787,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 
@@ -979,7 +979,7 @@ package status
 import (
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 )
 
 // Snapshot is the rendering-agnostic view of jetstream's state at a
@@ -1109,8 +1109,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/status"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/status"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1179,13 +1179,13 @@ import (
 	"sort"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/internal/version"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/version"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -1537,7 +1537,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -1812,7 +1812,7 @@ func TestCollect_PhaseAndEnteredAt(t *testing.T) {
 }
 ```
 
-Add `"github.com/bluesky-social/jetstream-v2/internal/lifecycle"` to test imports.
+Add `"github.com/bluesky-social/jetstream/internal/lifecycle"` to test imports.
 
 - [ ] **Step 7.2: Add test for backfill counts**
 
@@ -1853,7 +1853,7 @@ func TestCollect_BackfillCounts(t *testing.T) {
 ```
 
 Add to test imports:
-- `"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"`
+- `"github.com/bluesky-social/jetstream/internal/ingest/backfill"`
 - `"github.com/jcalabro/atmos"`
 - `"github.com/jcalabro/atmos/repo"`
 - `sync "github.com/jcalabro/atmos/sync"` (aliased to avoid collision with stdlib `sync`)
@@ -1891,7 +1891,7 @@ func TestCollect_LiveCursors(t *testing.T) {
 }
 ```
 
-Add `"encoding/binary"` and `"github.com/bluesky-social/jetstream-v2/internal/ingest/live"` to test imports.
+Add `"encoding/binary"` and `"github.com/bluesky-social/jetstream/internal/ingest/live"` to test imports.
 
 - [ ] **Step 7.4: Add test for pebble keyspace counts**
 
@@ -2391,7 +2391,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/status"
+	"github.com/bluesky-social/jetstream/internal/status"
 )
 
 //go:embed templates/status.html
@@ -2529,9 +2529,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/status"
-	"github.com/bluesky-social/jetstream-v2/internal/web"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/status"
+	"github.com/bluesky-social/jetstream/internal/web"
 	"github.com/stretchr/testify/require"
 )
 
@@ -2847,8 +2847,8 @@ srv := server.New(server.Config{
 Add imports:
 
 ```go
-"github.com/bluesky-social/jetstream-v2/internal/status"
-"github.com/bluesky-social/jetstream-v2/internal/web"
+"github.com/bluesky-social/jetstream/internal/status"
+"github.com/bluesky-social/jetstream/internal/web"
 ```
 
 - [ ] **Step 11.2: Build to confirm wiring compiles**

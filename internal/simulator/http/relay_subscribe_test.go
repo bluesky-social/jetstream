@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/stretchr/testify/require"

@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"

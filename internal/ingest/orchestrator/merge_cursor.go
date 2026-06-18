@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/store"
 )
 
 const (

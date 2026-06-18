@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // FuzzEncode asserts that Encode either produces valid JSON or returns

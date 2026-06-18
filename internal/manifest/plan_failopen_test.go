@@ -3,7 +3,7 @@ package manifest
 import (
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/gloom"
 	"github.com/stretchr/testify/require"
 )

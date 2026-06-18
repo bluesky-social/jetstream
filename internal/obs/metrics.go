@@ -1,7 +1,7 @@
 package obs
 
 import (
-	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )

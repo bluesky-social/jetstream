@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/format"
-	"github.com/bluesky-social/jetstream-v2/internal/repoexport"
-	"github.com/bluesky-social/jetstream-v2/internal/status"
+	"github.com/bluesky-social/jetstream/internal/format"
+	"github.com/bluesky-social/jetstream/internal/repoexport"
+	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/jcalabro/atmos"
 )
 

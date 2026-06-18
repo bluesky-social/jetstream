@@ -237,7 +237,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 )
 
 const (
@@ -865,8 +865,8 @@ package orchestrator
 import (
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 
@@ -992,9 +992,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // isCommitKind reports whether k is one of the three commit-shaped
@@ -1219,8 +1219,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1296,8 +1296,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/store"
 )
 
 const (
@@ -1397,11 +1397,11 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 type mergeRunner struct {
@@ -1575,9 +1575,9 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
@@ -1700,10 +1700,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/obs"
 )
 
 func (o *Orchestrator) runMerge(ctx context.Context) error {
@@ -1880,10 +1880,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 
@@ -2217,9 +2217,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 
@@ -2419,7 +2419,7 @@ func runSwarmIteration(t *testing.T, rng *rand.Rand) {
 }
 ```
 
-Add `"github.com/bluesky-social/jetstream-v2/internal/store"` for the `store.ErrNotFound` reference.
+Add `"github.com/bluesky-social/jetstream/internal/store"` for the `store.ErrNotFound` reference.
 
 - [ ] **Step 2: Verify**
 

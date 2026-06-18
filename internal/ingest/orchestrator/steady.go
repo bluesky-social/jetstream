@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/obs"
 	"golang.org/x/sync/errgroup"
 )
 

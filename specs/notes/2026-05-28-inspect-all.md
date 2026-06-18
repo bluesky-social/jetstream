@@ -186,7 +186,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/urfave/cli/v3"
 )
 ```
@@ -253,7 +253,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/status"
+	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/stretchr/testify/require"
 )
 
@@ -321,7 +321,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 )
 
 // SegmentAggregate is the rendering-agnostic, database-wide view of
@@ -598,9 +598,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/status"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/status"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 
@@ -689,9 +689,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/status"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/status"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 ```
@@ -705,7 +705,7 @@ Expected: FAIL — counters are zero, `agg.Trees[0].EventCount == 0` etc., becau
 
 Replace the entire `scanTree` function in `internal/status/inspect_all.go` and add a new `inspectFile` helper. The new file body (just the modified parts):
 
-Add `"github.com/bluesky-social/jetstream-v2/segment"` to the import block.
+Add `"github.com/bluesky-social/jetstream/segment"` to the import block.
 
 Replace the existing `scanTree` and the trailing `_ = collections` block. The new `scanTree`:
 
@@ -1169,7 +1169,7 @@ package status
 import (
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 )
 
 // Snapshot is the rendering-agnostic view of jetstream's state at a
@@ -1594,7 +1594,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/status"
+	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/urfave/cli/v3"
 )
 
@@ -1872,7 +1872,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/status"
+	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/stretchr/testify/require"
 )
 

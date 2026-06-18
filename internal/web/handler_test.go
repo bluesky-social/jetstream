@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/repoexport"
-	"github.com/bluesky-social/jetstream-v2/internal/status"
-	"github.com/bluesky-social/jetstream-v2/internal/web"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/repoexport"
+	"github.com/bluesky-social/jetstream/internal/status"
+	"github.com/bluesky-social/jetstream/internal/web"
 	"github.com/stretchr/testify/require"
 )
 

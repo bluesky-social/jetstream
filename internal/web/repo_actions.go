@@ -3,8 +3,8 @@ package web
 import (
 	"context"
 
-	"github.com/bluesky-social/jetstream-v2/internal/repoexport"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/repoexport"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 type repoExportActions struct {

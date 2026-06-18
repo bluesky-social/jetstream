@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	observe_innertest "github.com/bluesky-social/jetstream-v2/internal/obs/observe_innertest"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	observe_innertest "github.com/bluesky-social/jetstream/internal/obs/observe_innertest"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"

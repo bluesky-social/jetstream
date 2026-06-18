@@ -6,8 +6,8 @@ import (
 	"math/rand/v2"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/mst"

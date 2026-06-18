@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 )
 
 type listReposOutput struct {

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"net/http"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/jcalabro/atmos"
 )
 

@@ -11,9 +11,9 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"

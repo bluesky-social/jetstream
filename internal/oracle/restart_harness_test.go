@@ -17,12 +17,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
-	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
-	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/jetstreamd"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/stretchr/testify/require"
 )
 

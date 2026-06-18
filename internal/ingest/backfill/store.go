@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"

@@ -10,9 +10,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/api/jetstream"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
 	"go.opentelemetry.io/otel/attribute"

@@ -18,8 +18,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // SegmentAggregate is the rendering-agnostic, database-wide view of

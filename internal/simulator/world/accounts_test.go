@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/cbor"

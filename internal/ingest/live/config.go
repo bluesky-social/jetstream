@@ -5,11 +5,11 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/streaming"
 	atmossync "github.com/jcalabro/atmos/sync"
 )

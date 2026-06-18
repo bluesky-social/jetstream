@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 )
 
 const (

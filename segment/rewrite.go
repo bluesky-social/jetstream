@@ -8,7 +8,7 @@ import (
 	"math"
 	"os"
 
-	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
 )
 
 type RowDecision uint8

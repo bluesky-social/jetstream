@@ -25,7 +25,7 @@ modernize *ARGS="./...":
 build:
     #!/usr/bin/env bash
     set -euo pipefail
-    pkg="github.com/bluesky-social/jetstream-v2/internal/version"
+    pkg="github.com/bluesky-social/jetstream/internal/version"
     version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
     commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     if ! git diff --quiet HEAD 2>/dev/null; then

@@ -3,7 +3,7 @@ package subscribe
 import (
 	"sync"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // Entry is one event held in the hot ring: the decoded event plus a

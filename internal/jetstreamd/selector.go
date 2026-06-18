@@ -1,8 +1,8 @@
 package jetstreamd
 
 import (
-	"github.com/bluesky-social/jetstream-v2/internal/manifest"
-	"github.com/bluesky-social/jetstream-v2/internal/repoexport"
+	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/repoexport"
 )
 
 // manifestSelector adapts the in-memory *manifest.Manifest to the

@@ -11,12 +11,12 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/live"
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // runMerge is the cutover state machine's State 5: drain

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 )
 
 // NewHandler builds the simulator's HTTP handler. publicURL is the

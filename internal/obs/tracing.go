@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/jcalabro/gt"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -97,7 +97,7 @@ func Tracer(name string) trace.Tracer {
 
 // repoPathPrefix is stripped from gt.CallerInfo.Package so tracer scopes
 // read as "ingest/live" rather than the full import path.
-const repoPathPrefix = "github.com/bluesky-social/jetstream-v2/"
+const repoPathPrefix = "github.com/bluesky-social/jetstream/"
 
 // fallbackTracerName is used when frame inspection produces an
 // unusable label. It is intentionally short so it shows up clearly in

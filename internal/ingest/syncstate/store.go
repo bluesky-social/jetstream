@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmossync "github.com/jcalabro/atmos/sync"

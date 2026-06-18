@@ -7,8 +7,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 )

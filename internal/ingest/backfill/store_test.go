@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"

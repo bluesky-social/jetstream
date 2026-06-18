@@ -3,8 +3,8 @@ package jetstreamd
 import (
 	"sync/atomic"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // pendingEventsForDID returns a function the status handler uses to fetch the

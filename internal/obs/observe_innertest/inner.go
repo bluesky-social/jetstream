@@ -6,7 +6,7 @@ package observe_innertest
 import (
 	"context"
 
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/obs"
 )
 
 // Inner runs obs.Span and returns its result. The surrounding test

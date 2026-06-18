@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"sync/atomic"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/manifest"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // WalkInput is the parameter bundle for WalkFromCursor.

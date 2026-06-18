@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // FuzzParseQuery feeds arbitrary input to ParseQuery and asserts that

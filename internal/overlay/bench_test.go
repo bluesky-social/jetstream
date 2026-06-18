@@ -6,7 +6,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 )
 
 // realisticSnapshot builds n record tombstones with a Zipfian-ish DID skew

@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/segment"
 	"go.opentelemetry.io/otel/trace"
 )
 

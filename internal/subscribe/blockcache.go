@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"sync"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // blockKey identifies one immutable decoded block.

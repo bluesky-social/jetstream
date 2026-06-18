@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 )
 
 // writeMergingPhase is commit point #1. After this call returns nil,

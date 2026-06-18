@@ -5,7 +5,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"

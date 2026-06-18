@@ -6,8 +6,8 @@ import (
 	"math/rand/v2"
 	"net/http"
 
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 )
 
 // oracleFaultSeedSalt derives the fault planner's RNG seed from cfg.Seed

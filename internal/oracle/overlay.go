@@ -3,8 +3,8 @@ package oracle
 import (
 	"fmt"
 
-	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // toSegmentEvent adapts an ObservedEvent to the segment.Event shape the

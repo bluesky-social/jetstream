@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/crypto"

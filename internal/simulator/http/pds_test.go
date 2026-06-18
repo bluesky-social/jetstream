@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"

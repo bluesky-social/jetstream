@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"

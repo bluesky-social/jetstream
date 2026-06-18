@@ -370,7 +370,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -486,7 +486,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -1168,7 +1168,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
@@ -1321,7 +1321,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1899,8 +1899,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/backfill"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/mst"

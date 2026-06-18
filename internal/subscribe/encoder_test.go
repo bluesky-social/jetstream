@@ -11,7 +11,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/stretchr/testify/require"

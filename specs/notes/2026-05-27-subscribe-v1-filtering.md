@@ -596,7 +596,7 @@ func ev(kind segment.Kind, did, collection string) *segment.Event {
 }
 ```
 
-Add `"github.com/bluesky-social/jetstream-v2/segment"` to the test file's import block. Then append:
+Add `"github.com/bluesky-social/jetstream/segment"` to the test file's import block. Then append:
 
 ```go
 func TestWants_NilFilterMatchesAll(t *testing.T) {
@@ -762,7 +762,7 @@ func isCommitKind(k segment.Kind) bool {
 }
 ```
 
-Add `"github.com/bluesky-social/jetstream-v2/segment"` to `filter.go`'s import block.
+Add `"github.com/bluesky-social/jetstream/segment"` to `filter.go`'s import block.
 
 - [ ] **Step 4.4: Run tests and confirm they pass**
 
@@ -941,7 +941,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // FuzzParseQuery feeds arbitrary input to ParseQuery and asserts that
@@ -1484,7 +1484,7 @@ func TestHandler_Filter_MaxMessageSize_NegativeMeansNoCap(t *testing.T) {
 }
 ```
 
-Add to `handler_test.go`'s import block as needed: `"github.com/bluesky-social/jetstream-v2/segment"`. Several imports (`net/http`, `strings`) may already be there.
+Add to `handler_test.go`'s import block as needed: `"github.com/bluesky-social/jetstream/segment"`. Several imports (`net/http`, `strings`) may already be there.
 
 - [ ] **Step 8.2: Add the test helpers (publish helpers + readOneFrame)**
 
@@ -1557,7 +1557,7 @@ func publishOversizeCommit(t *testing.T, b *Broadcaster, did, collection string,
 }
 ```
 
-Add imports at the top of `handler_test.go` if missing: `"bytes"`, `"github.com/bluesky-social/jetstream-v2/segment"`.
+Add imports at the top of `handler_test.go` if missing: `"bytes"`, `"github.com/bluesky-social/jetstream/segment"`.
 
 - [ ] **Step 8.3: Run the tests and confirm they fail**
 

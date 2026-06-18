@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/jetstreamd"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/gt"

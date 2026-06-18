@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/format"
+	"github.com/bluesky-social/jetstream/internal/format"
 	"github.com/coder/websocket"
 	"github.com/urfave/cli/v3"
 )

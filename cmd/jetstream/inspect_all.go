@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/format"
-	"github.com/bluesky-social/jetstream-v2/internal/status"
+	"github.com/bluesky-social/jetstream/internal/format"
+	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/urfave/cli/v3"
 )
 

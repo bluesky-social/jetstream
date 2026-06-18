@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/cbor"

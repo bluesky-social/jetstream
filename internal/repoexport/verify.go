@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"

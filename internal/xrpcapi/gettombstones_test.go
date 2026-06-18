@@ -8,8 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/overlay"
-	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
+	"github.com/bluesky-social/jetstream/internal/overlay"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/stretchr/testify/require"
 )
 

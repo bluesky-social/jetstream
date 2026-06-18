@@ -7,7 +7,7 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // EventLogRow is a normalized, JSON-serializable representation of one durable

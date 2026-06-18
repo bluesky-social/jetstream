@@ -2432,7 +2432,7 @@ import (
 	"math/rand/v2"
 	"sync/atomic"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 )
 
 type World struct {
@@ -2483,7 +2483,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/repo"
@@ -2926,8 +2926,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
@@ -2991,8 +2991,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/stretchr/testify/require"
 )
 
@@ -3061,7 +3061,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 )
 
 // NewHandler builds the simulator's HTTP handler. publicURL is the
@@ -3099,7 +3099,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/jcalabro/atmos"
 )
 
@@ -3313,7 +3313,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
@@ -3379,7 +3379,7 @@ package http
 import (
 	"net/http"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/jcalabro/atmos"
 )
 
@@ -3509,7 +3509,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/sync"
@@ -3618,7 +3618,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 )
 
 type listReposOutput struct {
@@ -3721,7 +3721,7 @@ import (
 	"testing"
 	"time"
 
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/stretchr/testify/require"
@@ -3829,7 +3829,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/coder/websocket"
 )
 
@@ -3910,7 +3910,7 @@ In `internal/simulator/world/account_view.go`, append:
 ```go
 import (
 	// existing
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 )
 
 // SubscribeFanout adds a new subscriber to the live broadcast.
@@ -3970,10 +3970,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
 )
@@ -4376,9 +4376,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
-	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
-	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
+	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 	"log/slog"

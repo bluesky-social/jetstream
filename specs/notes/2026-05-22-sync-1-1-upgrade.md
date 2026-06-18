@@ -392,7 +392,7 @@ import (
     "context"
     "testing"
 
-    "github.com/bluesky-social/jetstream-v2/internal/store"
+    "github.com/bluesky-social/jetstream/internal/store"
     "github.com/jcalabro/atmos"
     atmossync "github.com/jcalabro/atmos/sync"
     "github.com/stretchr/testify/require"
@@ -550,7 +550,7 @@ import (
     "errors"
     "fmt"
 
-    "github.com/bluesky-social/jetstream-v2/internal/store"
+    "github.com/bluesky-social/jetstream/internal/store"
     "github.com/cockroachdb/pebble"
     "github.com/jcalabro/atmos"
     atmossync "github.com/jcalabro/atmos/sync"
@@ -813,7 +813,7 @@ import (
     "testing"
     "time"
 
-    "github.com/bluesky-social/jetstream-v2/internal/store"
+    "github.com/bluesky-social/jetstream/internal/store"
     "github.com/jcalabro/atmos"
     "github.com/jcalabro/atmos/identity"
     "github.com/stretchr/testify/require"
@@ -963,7 +963,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/bluesky-social/jetstream-v2/internal/store"
+    "github.com/bluesky-social/jetstream/internal/store"
     "github.com/cockroachdb/pebble"
     "github.com/jcalabro/atmos/identity"
 )
@@ -1481,8 +1481,8 @@ Expected: PASS.
 In `cmd/jetstream/main.go`, add imports:
 
 ```go
-"github.com/bluesky-social/jetstream-v2/internal/identitycache"
-"github.com/bluesky-social/jetstream-v2/internal/syncstate"
+"github.com/bluesky-social/jetstream/internal/identitycache"
+"github.com/bluesky-social/jetstream/internal/syncstate"
 "github.com/jcalabro/atmos/identity"
 atmossync "github.com/jcalabro/atmos/sync"
 "github.com/jcalabro/atmos/xrpc"

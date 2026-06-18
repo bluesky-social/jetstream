@@ -3,7 +3,7 @@ package oracle
 import (
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 

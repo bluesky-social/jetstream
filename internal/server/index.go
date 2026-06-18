@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/bluesky-social/jetstream/internal/version"
 )
 
 const (

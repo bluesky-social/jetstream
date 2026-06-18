@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"

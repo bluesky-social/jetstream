@@ -1,6 +1,6 @@
 package oracle
 
-import "github.com/bluesky-social/jetstream-v2/segment"
+import "github.com/bluesky-social/jetstream/segment"
 
 // RecordKey identifies a single repo record by its DID, collection, and rkey.
 type RecordKey struct {

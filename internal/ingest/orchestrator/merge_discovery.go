@@ -10,9 +10,9 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/store"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"

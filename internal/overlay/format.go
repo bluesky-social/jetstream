@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/klauspost/compress/zstd"
 )
 

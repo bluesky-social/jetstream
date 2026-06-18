@@ -270,8 +270,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/coder/websocket"
 )
 ```

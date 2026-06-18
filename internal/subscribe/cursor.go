@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/manifest"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // CursorSeqMaxThreshold splits the v2 seq cursor namespace from the

@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/stretchr/testify/require"
 )
 

@@ -3,9 +3,9 @@ package live
 import (
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 	atmoscbor "github.com/jcalabro/atmos/cbor"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"

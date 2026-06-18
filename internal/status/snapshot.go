@@ -3,7 +3,7 @@ package status
 import (
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 )
 
 // Snapshot is the rendering-agnostic view of jetstream's state at a

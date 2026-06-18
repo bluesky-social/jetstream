@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/api/comatproto"

@@ -90,7 +90,7 @@ package lifecycle
 import (
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -179,7 +179,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -856,7 +856,7 @@ package livestream
 import (
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -941,7 +941,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -1179,7 +1179,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/api/lextypes"
@@ -1318,7 +1318,7 @@ package livestream
 import (
 	"fmt"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/streaming"
 )
 
@@ -1627,7 +1627,7 @@ import (
 	"math/rand/v2"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/jcalabro/gt"
@@ -1783,7 +1783,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1851,7 +1851,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 )
 
 // Config controls Consumer behavior.
@@ -2036,7 +2036,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 )
 
 // Consumer drives the upstream firehose into a directory of
@@ -2187,7 +2187,7 @@ import (
 	// ... existing ...
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/gt"
@@ -2713,7 +2713,7 @@ func TestServe_WritesBootstrapPhaseOnFreshDir(t *testing.T) {
 }
 ```
 
-You will need to add imports: `"github.com/bluesky-social/jetstream-v2/internal/lifecycle"`.
+You will need to add imports: `"github.com/bluesky-social/jetstream/internal/lifecycle"`.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -2725,8 +2725,8 @@ Expected: FAIL — no phase logic in `runServe`.
 Modify `cmd/jetstream/main.go`. Add imports:
 
 ```go
-"github.com/bluesky-social/jetstream-v2/internal/lifecycle"
-"github.com/bluesky-social/jetstream-v2/internal/livestream"
+"github.com/bluesky-social/jetstream/internal/lifecycle"
+"github.com/bluesky-social/jetstream/internal/livestream"
 ```
 
 In `runServe`, after `metaStore, err := store.Open(dataDir)` and the deferred close, but before the `ingestWriter` open:

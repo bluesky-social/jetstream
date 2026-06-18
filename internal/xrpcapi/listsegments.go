@@ -4,8 +4,8 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/bluesky-social/jetstream-v2/api/jetstream"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
+	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/jcalabro/atmos/xrpcserver"
 	"github.com/jcalabro/gt"
 )

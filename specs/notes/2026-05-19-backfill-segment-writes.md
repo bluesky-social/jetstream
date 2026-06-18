@@ -879,7 +879,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -955,8 +955,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // defaultMaxSegmentBytes is the rotation threshold. DESIGN.md §3.1.1
@@ -1069,7 +1069,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/require"
 )
@@ -1154,8 +1154,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -1415,7 +1415,7 @@ EOF
 Append to `internal/ingest/writer_test.go`:
 
 ```go
-import "github.com/bluesky-social/jetstream-v2/segment"  // add to existing import block
+import "github.com/bluesky-social/jetstream/segment"  // add to existing import block
 
 // TestAppend_AllocatesMonotonicSeq pins the seq-allocation contract:
 // N appends produce ev.Seq values in [0, N) in call order.
@@ -2250,7 +2250,7 @@ EOF
 In `internal/ingest/writer.go`, add the import:
 
 ```go
-import "github.com/bluesky-social/jetstream-v2/internal/obs"
+import "github.com/bluesky-social/jetstream/internal/obs"
 ```
 
 Wrap the body of `flushAndRotateLocked` with a span. Replace the function:
@@ -2369,8 +2369,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/cbor"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -2483,9 +2483,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/mst"
@@ -2699,7 +2699,7 @@ func newPebbleStore(t *testing.T) *store.Store {
 }
 ```
 
-Add `"path/filepath"` and `"github.com/bluesky-social/jetstream-v2/internal/ingest"` to imports. Drop the unused `_ = storeFixture` if Go complains.
+Add `"path/filepath"` and `"github.com/bluesky-social/jetstream/internal/ingest"` to imports. Drop the unused `_ = storeFixture` if Go complains.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -2748,7 +2748,7 @@ func (cfg Config) validate() error {
 }
 ```
 
-Add `"github.com/bluesky-social/jetstream-v2/internal/ingest"` to imports.
+Add `"github.com/bluesky-social/jetstream/internal/ingest"` to imports.
 
 Replace the `LogHandler` construction in `runWithDirectory`:
 
@@ -2892,7 +2892,7 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 }
 ```
 
-Add `"github.com/bluesky-social/jetstream-v2/segment"` to imports.
+Add `"github.com/bluesky-social/jetstream/segment"` to imports.
 
 - [ ] **Step 3: Run the tests**
 
@@ -2969,7 +2969,7 @@ g.Go(func() error {
 })
 ```
 
-Add `"path/filepath"` and `"github.com/bluesky-social/jetstream-v2/internal/ingest"` to imports.
+Add `"path/filepath"` and `"github.com/bluesky-social/jetstream/internal/ingest"` to imports.
 
 - [ ] **Step 2: Build and run the smoke test**
 
@@ -3079,8 +3079,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/segment"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 

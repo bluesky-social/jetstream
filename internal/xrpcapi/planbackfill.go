@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/bluesky-social/jetstream-v2/api/jetstream"
-	"github.com/bluesky-social/jetstream-v2/internal/ingest"
-	"github.com/bluesky-social/jetstream-v2/internal/manifest"
+	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"

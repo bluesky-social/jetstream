@@ -1,8 +1,8 @@
 package jetstreamd
 
 import (
-	"github.com/bluesky-social/jetstream-v2/internal/store"
-	"github.com/bluesky-social/jetstream-v2/internal/tombstone"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 )
 
 // overlaySource adapts the live tombstone set + metadata store to the
