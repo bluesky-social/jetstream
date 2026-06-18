@@ -272,6 +272,20 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"served subscribe replay compacted check failed: mode=%s seed=%d watermark=%d",
 		cfg.Mode, cfg.Seed, steadyCompaction.Watermark)
 
+	// Client-driven historical observation (#77): drive the REAL public client
+	// through the full archive path (plan -> segment/block download -> overlay
+	// suppression -> live cutover) and assert its reconstruction equals the
+	// independently-derived ground truth. This runs ALONGSIDE the direct
+	// segment observers above (which stay as the storage tier that
+	// distinguishes a server bug from a client bug).
+	//
+	// Drain to the world's CURRENT seq, not the earlier steadyTarget: the
+	// async silent-mutation-then-commit above advanced the world past
+	// steadyTarget and was already ack'd durable, so ground truth reflects
+	// those rows and the client must observe them too. The world is quiescent
+	// here (no generation until the late account delete below).
+	assertClientBackfillCompacted(t, cfg, run, trace, publicURL, steadyCompaction.Watermark, "steady-state-client-backfill")
+
 	// Exercise the overlay's DID-tombstone section inside the live overlay
 	// window. The earlier bootstrap account-delete and sync tombstones are
 	// usually at or below W by this point, so a mutation that drops DID
