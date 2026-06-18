@@ -118,6 +118,72 @@ func TestPlanBackfill_CollectionFilterUsesResidentCollectionIndex(t *testing.T) 
 	require.Equal(t, 2, got.Stats.Entries)
 }
 
+func TestPlanBackfill_CollectionPrefixMatchesNamespace(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, otherDID, postNSID), // app.bsky.feed.post
+		planEvent(2, otherDID, "app.bsky.graph.follow"),
+		planEvent(3, otherDID, likeNSID), // app.bsky.feed.like
+		planEvent(4, otherDID, "app.bsky.graph.block"),
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.CollectionPrefixes = []string{"app.bsky.feed."}
+
+	got, err := m.PlanBackfill(req)
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	require.Equal(t, manifest.PlanModeBlocks, got.Segments[0].Mode)
+	// Only the two app.bsky.feed.* blocks (0-indexed 0 and 2) match.
+	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 0}, {First: 2, Last: 2}}, got.Segments[0].Blocks)
+	require.Equal(t, 2, got.Stats.BlocksMatched)
+}
+
+func TestPlanBackfill_CollectionPrefixAndExactUnion(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, otherDID, postNSID),                // matched by exact
+		planEvent(2, otherDID, "app.bsky.graph.follow"), // matched by prefix
+		planEvent(3, otherDID, "com.example.thing"),     // matched by neither
+		planEvent(4, otherDID, "app.bsky.graph.block"),  // matched by prefix
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.Collections = []string{postNSID}
+	req.CollectionPrefixes = []string{"app.bsky.graph."}
+
+	got, err := m.PlanBackfill(req)
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 1}, {First: 3, Last: 3}}, got.Segments[0].Blocks)
+	require.Equal(t, 3, got.Stats.BlocksMatched)
+}
+
+func TestPlanBackfill_CollectionPrefixMatchesNothing(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, otherDID, postNSID),
+		planEvent(2, otherDID, likeNSID),
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.CollectionPrefixes = []string{"com.example."}
+
+	got, err := m.PlanBackfill(req)
+	require.NoError(t, err)
+	// Coverage horizon still reported even though nothing matched.
+	require.EqualValues(t, 2, got.PlannedThroughSeq)
+	require.Empty(t, got.Segments)
+	require.Equal(t, 1, got.Stats.SegmentsExamined)
+	require.Zero(t, got.Stats.SegmentsMatched)
+}
+
 func TestPlanBackfill_DIDAndCollectionFiltersIntersect(t *testing.T) {
 	t.Parallel()
 

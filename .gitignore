@@ -34,4 +34,5 @@ go.work.sum
 # .vscode/
 
 # Files not for distribution
+/.superpowers
 /data*

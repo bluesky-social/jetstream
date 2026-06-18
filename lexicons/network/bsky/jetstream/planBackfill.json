@@ -17,8 +17,8 @@
             },
             "collections": {
               "type": "array",
-              "description": "Exact collection NSIDs to match. Missing or empty means all collections.",
-              "items": { "type": "string", "format": "nsid" }
+              "description": "Collection filters to match. Each entry is either an exact NSID (e.g. app.bsky.feed.post) or a namespace wildcard ending in '.*' (e.g. app.bsky.feed.*), which matches every collection under that namespace prefix. Missing or empty means all collections. A wildcard that matches no archived collection yields an empty plan (it is not treated as match-all).",
+              "items": { "type": "string" }
             },
             "afterSeq": {
               "type": "integer",

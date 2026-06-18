@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 
 	"github.com/bluesky-social/jetstream-v2/api/jetstream"
 	"github.com/bluesky-social/jetstream-v2/internal/ingest"
@@ -108,7 +109,7 @@ func planRequestFromInput(input *jetstream.JetstreamPlanBackfill_Input, cfg Plan
 	if err != nil {
 		return manifest.PlanBackfillRequest{}, err
 	}
-	collections, err := validatePlanCollections(input.Collections, cfg.MaxCollections)
+	collections, collectionPrefixes, err := validatePlanCollections(input.Collections, cfg.MaxCollections)
 	if err != nil {
 		return manifest.PlanBackfillRequest{}, err
 	}
@@ -116,6 +117,7 @@ func planRequestFromInput(input *jetstream.JetstreamPlanBackfill_Input, cfg Plan
 	req := manifest.PlanBackfillRequest{
 		DIDs:                  dids,
 		Collections:           collections,
+		CollectionPrefixes:    collectionPrefixes,
 		MaxEntries:            cfg.MaxEntries,
 		WholeSegmentThreshold: cfg.WholeSegmentThreshold,
 	}
@@ -173,31 +175,82 @@ func validatePlanDIDs(raw []string, maxDIDs int) ([]string, error) {
 	return out, nil
 }
 
-// validatePlanCollections mirrors validatePlanDIDs for collection NSIDs.
-func validatePlanCollections(raw []string, maxCollections int) ([]string, error) {
+// wildcardSuffix is the only glob shape planBackfill accepts: a trailing ".*"
+// on a namespace prefix (e.g. "app.bsky.feed.*"). This mirrors the one shape
+// /subscribe allows.
+const wildcardSuffix = ".*"
+
+// classifyCollectionPattern decides whether raw is an exact NSID or a namespace
+// wildcard, returning exactly one of (exact, prefix). A wildcard "<head>.*" is
+// accepted iff head is a valid NSID authority, which we check by appending a
+// synthetic, known-valid name label and reusing atmos.ParseNSID as the single
+// source of truth for NSID grammar. atmos requires the name segment to start
+// with a letter and be alphanumeric, so "wildcard" is always a valid probe
+// label and is never stored. The returned prefix is "<head>." (e.g.
+// "app.bsky.feed."), matched elsewhere with strings.HasPrefix.
+//
+// Validation here is intentionally stricter than /subscribe (which is
+// deliberately v1-lax and skips head validation): planBackfill is a new
+// endpoint with no v1 wire contract.
+func classifyCollectionPattern(raw string) (exact string, prefix string, err error) {
+	if head, ok := strings.CutSuffix(raw, wildcardSuffix); ok {
+		if _, perr := atmos.ParseNSID(head + ".wildcard"); perr != nil {
+			return "", "", xrpcserver.InvalidRequest("invalid collection wildcard: " + raw)
+		}
+		return "", head + ".", nil
+	}
+	nsid, perr := atmos.ParseNSID(raw)
+	if perr != nil {
+		return "", "", xrpcserver.InvalidRequest("invalid collection: " + raw)
+	}
+	return string(nsid), "", nil
+}
+
+// validatePlanCollections splits raw collection filters into distinct exact
+// NSIDs and distinct namespace prefixes (from wildcards). The cap counts
+// distinct PATTERNS (exact + prefix), not expanded collections, so one wildcard
+// counts as one regardless of how many collections it covers — matching
+// /subscribe's cap semantics. Both returned slices are nil when raw is empty,
+// which the planner treats as match-all; a non-empty prefix set that matches no
+// archived collection correctly yields an empty plan (see design doc,
+// "match-nothing boundary").
+func validatePlanCollections(raw []string, maxCollections int) (exact []string, prefixes []string, err error) {
 	if len(raw) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if maxCollections == 0 {
-		return nil, xrpcserver.InvalidRequest("collection filters are disabled")
+		return nil, nil, xrpcserver.InvalidRequest("collection filters are disabled")
 	}
+	// Dedup on the raw string BEFORE classifying. classifyCollectionPattern is
+	// deterministic, so identical raw values classify identically; deduping
+	// first bounds parse work (each value runs up to two atmos.ParseNSID scans)
+	// and map growth to maxCollections distinct patterns even when a hostile
+	// caller submits a body full of duplicates. This mirrors validatePlanDIDs
+	// above; the collections array has no maxLength on the wire, so this bound
+	// is the only thing standing between a duplicate-stuffed body and O(N) parse
+	// work. The cap counts distinct PATTERNS (exact + prefix), not expanded
+	// collections, so one wildcard counts as one regardless of coverage —
+	// matching /subscribe's cap semantics.
 	seen := make(map[string]struct{}, min(len(raw), maxCollections))
-	out := make([]string, 0, min(len(raw), maxCollections))
 	for _, value := range raw {
-		if _, ok := seen[value]; ok {
+		if _, dup := seen[value]; dup {
 			continue
 		}
-		if len(out) == maxCollections {
-			return nil, xrpcserver.InvalidRequest("too many collections")
+		if len(exact)+len(prefixes) == maxCollections {
+			return nil, nil, xrpcserver.InvalidRequest("too many collections")
+		}
+		ex, pre, cerr := classifyCollectionPattern(value)
+		if cerr != nil {
+			return nil, nil, cerr
 		}
 		seen[value] = struct{}{}
-		nsid, err := atmos.ParseNSID(value)
-		if err != nil {
-			return nil, xrpcserver.InvalidRequest("invalid collection: " + value)
+		if ex != "" {
+			exact = append(exact, ex)
+		} else {
+			prefixes = append(prefixes, pre)
 		}
-		out = append(out, string(nsid))
 	}
-	return out, nil
+	return exact, prefixes, nil
 }
 
 func planOutput(plan manifest.PlanBackfillResult) (*jetstream.JetstreamPlanBackfill_Output, error) {
