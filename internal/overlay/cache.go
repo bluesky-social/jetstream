@@ -39,14 +39,15 @@ type Blob struct {
 // Cache holds the latest published *Blob and rebuilds it from Source.
 type Cache struct {
 	src     Source
-	metrics *Metrics
+	metrics CacheObserver
 
 	mu  sync.RWMutex
 	cur *Blob
 }
 
 // NewCache builds an initial blob immediately so Current never returns nil.
-func NewCache(src Source, m *Metrics) *Cache {
+// m may be nil to disable metrics.
+func NewCache(src Source, m CacheObserver) *Cache {
 	c := &Cache{src: src, metrics: m}
 	c.cur = c.build()
 	return c
@@ -115,7 +116,9 @@ func (c *Cache) build() *Blob {
 		NumDIDs:    len(snap.DIDs),
 		dirtyAt:    dirty,
 	}
-	c.metrics.observeBuild(time.Since(start), len(bytes), blob.NumRecords, blob.NumDIDs)
+	if c.metrics != nil {
+		c.metrics.ObserveBuild(time.Since(start), len(bytes), blob.NumRecords, blob.NumDIDs)
+	}
 	return blob
 }
 
@@ -138,4 +141,8 @@ func (c *Cache) RunTicker(ctx context.Context, interval time.Duration) error {
 
 // ObserveServe records that n bytes of the overlay blob were written to a
 // client. Called by the getTombstones handler after a successful write.
-func (c *Cache) ObserveServe(n int) { c.metrics.observeServe(n) }
+func (c *Cache) ObserveServe(n int) {
+	if c.metrics != nil {
+		c.metrics.ObserveServe(n)
+	}
+}

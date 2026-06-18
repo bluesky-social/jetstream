@@ -244,7 +244,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	stateStore := syncstate.New(metaStore)
 	tombstones := tombstone.New()
-	overlayMetrics := overlay.NewMetrics(metrics.Registry)
+	overlayMetrics := obs.NewOverlayMetrics(metrics.Registry)
 	overlayCache := overlay.NewCache(overlaySource{set: tombstones, store: metaStore}, overlayMetrics)
 	rt.overlayCache = overlayCache
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
