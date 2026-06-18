@@ -40,8 +40,8 @@ type Config struct {
 	MaxEventsPerBlock int
 
 	// Metrics is optional; nil disables segment-package metrics
-	// (e.g. seal duration). The zero-value Metrics is a no-op.
-	Metrics *Metrics
+	// (e.g. seal duration).
+	Metrics SealObserver
 }
 
 func (c Config) validate() error {

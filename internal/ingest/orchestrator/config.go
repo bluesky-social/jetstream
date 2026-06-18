@@ -98,7 +98,7 @@ type Config struct {
 	// Optional. The same instance flows through to live.Config and
 	// ingest.Config so all segment.Writer instances under the
 	// orchestrator share the seal_duration histogram series.
-	SegmentMetrics *segment.Metrics
+	SegmentMetrics segment.SealObserver
 
 	// OnEvent, if non-nil, is forwarded to the steady-state live.Consumer
 	// so live events can be fanned out to /subscribe websocket clients.

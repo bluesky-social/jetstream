@@ -76,7 +76,9 @@ func (w *Writer) Seal() (SealResult, error) {
 	if err != nil {
 		return SealResult{}, err
 	}
-	w.cfg.Metrics.ObserveSeal(start, nil)
+	if w.cfg.Metrics != nil {
+		w.cfg.Metrics.ObserveSeal(start, nil)
+	}
 	// Mark the writer closed: Seal is terminal. The underlying file
 	// has already been Close()d by sealAfterFlush.
 	w.closed = true

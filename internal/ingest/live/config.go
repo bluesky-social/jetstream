@@ -113,7 +113,7 @@ type Config struct {
 
 	// SegmentMetrics flows through the consumer's internal *ingest.Writer
 	// to every segment.New it makes. Optional.
-	SegmentMetrics *segment.Metrics
+	SegmentMetrics segment.SealObserver
 
 	// OnEvent is called once per segment.Event after it has been
 	// durably appended to the writer. The event passed in carries

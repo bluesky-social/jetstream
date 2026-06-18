@@ -151,7 +151,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	metrics := obs.NewMetrics()
 	storeMetrics := store.NewMetrics(metrics.Registry)
-	segmentMetrics := segment.NewMetrics(metrics.Registry)
+	segmentMetrics := obs.NewSegmentMetrics(metrics.Registry)
 	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
 	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
 	manifestMetrics := manifest.NewMetrics(metrics.Registry)

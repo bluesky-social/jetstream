@@ -1,39 +1,19 @@
 package segment
 
-import (
-	"time"
+import "time"
 
-	"github.com/bluesky-social/jetstream/internal/obs"
-	"github.com/prometheus/client_golang/prometheus"
-)
-
-// Metrics owns prometheus state for the segment package. nil is a
-// valid zero-value: every method is a no-op.
-type Metrics struct {
-	SealDuration prometheus.Histogram
-}
-
-// NewMetrics registers segment metrics against reg.
-func NewMetrics(reg prometheus.Registerer) *Metrics {
-	m := &Metrics{
-		SealDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Namespace: "jetstream",
-			Subsystem: "segment",
-			Name:      "seal_duration_seconds",
-			Help:      "End-to-end duration of segment.Writer.Seal: flush + footer + header pwrite + fsyncs.",
-			Buckets:   obs.LatencyBucketsSlow,
-		}),
-	}
-	reg.MustRegister(m.SealDuration)
-	return m
-}
-
-// ObserveSeal records a successful seal duration. Failed seals are
-// not recorded — operators chase failures through error logs and
-// trace status, not the success-time histogram.
-func (m *Metrics) ObserveSeal(start time.Time, err error) {
-	if m == nil || err != nil {
-		return
-	}
-	m.SealDuration.Observe(time.Since(start).Seconds())
+// SealObserver receives a timing sample each time Writer.Seal completes
+// successfully. It is the segment package's only metrics seam: the concrete
+// Prometheus implementation lives outside this package (internal/obs) so the
+// decode/seal core carries no metrics, OTEL, or Prometheus dependency and
+// stays cheap for the public client to import.
+//
+// A nil SealObserver is valid and disables observation; Writer guards the
+// call. Implementations should also tolerate a nil receiver, matching the
+// codebase nil-safe-metrics convention.
+type SealObserver interface {
+	// ObserveSeal records a successful seal that started at start. Callers
+	// pass the seal error; implementations must ignore non-nil err (failed
+	// seals are chased through logs and trace status, not this histogram).
+	ObserveSeal(start time.Time, err error)
 }
