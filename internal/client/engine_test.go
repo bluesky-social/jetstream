@@ -333,6 +333,44 @@ func TestEngineLiveOnly(t *testing.T) {
 	require.Equal(t, []uint64{1, 2}, uniqueSeqs(events))
 }
 
+// TestEngineLiveOnlyBreakOnQuietTail is a regression guard: a consumer that
+// breaks the iterator after one event, on a tail that then goes quiet (no more
+// frames), must let Run return promptly. The stop is propagated by the batch
+// flusher's yield, not by a subsequent live event (there are none). Without
+// the onStop->cancel wiring the engine blocked until ctx cancel.
+func TestEngineLiveOnlyBreakOnQuietTail(t *testing.T) {
+	t.Parallel()
+	// One frame, then the scripted conn EOFs and reconnect-loops forever (a
+	// quiet tail). The consumer takes the first event and stops.
+	conn := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "app.bsky.feed.post", "r1", true)},
+	}}
+	dial, _ := scriptedDialer(conn)
+	cfg := Config{
+		Host:           "https://h",
+		Backfill:       false,
+		BatchSize:      1,
+		MaxBatchDelay:  time.Millisecond,
+		LiveBackoffMin: time.Millisecond,
+		Dial:           dial,
+	}
+
+	eng := NewEngine(cfg)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		eng.Run(context.Background(), // NOT cancelled by the test: the engine must self-unwind
+			func([]Event) bool { return false }, // stop after the first batch
+			func(error) bool { return true },
+		)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine did not unwind after consumer stop on a quiet tail")
+	}
+}
+
 func uniqueSeqs(events []Event) []uint64 {
 	seen := map[uint64]bool{}
 	var out []uint64

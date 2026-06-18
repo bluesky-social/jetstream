@@ -243,7 +243,6 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-merge", "marker": "after_release"})
 
 	publicURL := waitForRuntimePublicURL(t, cfg, rt, run)
-	_ = collectSubscribeReplay(t, cfg, run, trace, publicURL, 0, afterMergeCompaction.Watermark)
 	passesBeforeSteady := compaction.Count()
 
 	steadyStartSeq := w.CurrentSeq()
@@ -267,11 +266,6 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	require.Greaterf(t, steadyCompaction.Watermark, afterMergeCompaction.Watermark,
 		"steady compaction watermark did not advance: mode=%s seed=%d after_merge_watermark=%d steady_watermark=%d",
 		cfg.Mode, cfg.Seed, afterMergeCompaction.Watermark, steadyCompaction.Watermark)
-	served := collectSubscribeReplay(t, cfg, run, trace, publicURL, 0, steadyCompaction.Watermark)
-	require.NoErrorf(t, CheckCompacted(served, steadyCompaction.Watermark),
-		"served subscribe replay compacted check failed: mode=%s seed=%d watermark=%d",
-		cfg.Mode, cfg.Seed, steadyCompaction.Watermark)
-
 	// Client-driven historical observation (#77): drive the REAL public client
 	// through the full archive path (plan -> segment/block download -> overlay
 	// suppression -> live cutover) and assert its reconstruction equals the
@@ -354,9 +348,8 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"event_log_compare",
 		"bootstrap_live_event",
 		"steady_state_event",
-		"subscribe_replay_start",
-		"subscribe_replay_event",
-		"subscribe_replay_done",
+		"client_backfill_start",
+		"client_backfill_done",
 		"steady_target",
 		"shutdown_start",
 		"runtime_exit",
@@ -570,23 +563,6 @@ func traceSegmentEvent(ev *segment.Event) map[string]any {
 		"collection":            ev.Collection,
 		"rkey":                  ev.Rkey,
 		"rev":                   ev.Rev,
-	}
-	if ev.Payload != nil {
-		out["payload"] = tracePayload(ev.Payload)
-	}
-	return out
-}
-
-func traceObservedEvent(ev ObservedEvent) map[string]any {
-	out := map[string]any{
-		"seq":        ev.Seq,
-		"indexed_at": ev.IndexedAt,
-		"kind":       eventLogKind(ev.Kind),
-		"kind_code":  uint8(ev.Kind),
-		"did":        ev.DID,
-		"collection": ev.Collection,
-		"rkey":       ev.Rkey,
-		"rev":        ev.Rev,
 	}
 	if ev.Payload != nil {
 		out["payload"] = tracePayload(ev.Payload)

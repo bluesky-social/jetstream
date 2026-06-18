@@ -114,8 +114,14 @@ func (e *Engine) Run(ctx context.Context, emitBatch func([]Event) bool, emitErr 
 // caller's saved cursor (or the current tip) with no archive negotiation.
 func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
 	b := newBatcher(e.cfg.BatchSize, emitBatch)
-	stopFlusher := e.startFlusher(ctx, b)
+	liveCtx, stopLive := context.WithCancel(ctx)
+	defer stopLive()
+	stopFlusher := e.startFlusher(liveCtx, b)
 	defer stopFlusher()
+	// Cancel the live consumer when emission stops, so a quiet tail unwinds via
+	// the flusher's stop-propagating yield rather than blocking until ctx
+	// cancel (see runBackfillThenLive for the same rationale).
+	b.setOnStop(stopLive)
 	consumer := newLiveConsumer(liveConfig{
 		host:       e.cfg.Host,
 		cursor:     e.cfg.LiveCursor,
@@ -123,7 +129,7 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 		logger:     e.logger,
 		backoffMin: e.cfg.LiveBackoffMin,
 	})
-	_ = consumer.Run(ctx, func(ev *Event, _ []byte, err error) bool {
+	_ = consumer.Run(liveCtx, func(ev *Event, _ []byte, err error) bool {
 		if err != nil {
 			return emitErr(err)
 		}
@@ -256,13 +262,21 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	// flusher now so steady-state low-volume tail batches deliver promptly.
 	stopFlusher := e.startFlusher(ctx, b)
 	defer stopFlusher()
+	// When emission stops (the consumer broke the iterator), cancel the live
+	// context so the live consumer exits and liveWG.Wait below returns. The
+	// stop is observed two ways: an arriving live event whose b.add returns
+	// false, and — crucially for a quiet tail — the periodic flusher's yield
+	// returning false, which fires the batcher's onStop. Without the latter, a
+	// steady-state stream with no new events never unwinds until ctx cancel.
+	b.setOnStop(stopLive)
 	emitLive := func(ev Event) bool { return b.add(ev) }
 	if err := sink.flipAndDrain(ctx, plan.PlannedThroughSeq, emitLive, emitErr); err != nil {
 		emitErr(err)
 	}
 
 	// 6. Steady state: the live consumer now forwards directly through the
-	// sink to the batcher. Block until the live tail ends (ctx cancel).
+	// sink to the batcher. Block until the live tail ends (ctx cancel or the
+	// consumer-driven stopLive above).
 	liveWG.Wait()
 	stopFlusher()
 	if !b.stopped() {

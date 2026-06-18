@@ -3,13 +3,41 @@ package oracle
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream"
+	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
+
+// waitForRuntimePublicURL blocks until the runtime's public listener is bound
+// and returns its base URL, or fails on timeout / early runtime exit.
+func waitForRuntimePublicURL(t *testing.T, cfg Config, rt *jetstreamd.Runtime, run *runtimeRun) string {
+	t.Helper()
+
+	timer := time.NewTimer(oracleWaitTimeout(cfg))
+	defer timer.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		if addr := rt.PublicAddr(); addr != "" {
+			return "http://" + addr
+		}
+
+		select {
+		case <-run.exited:
+			t.Fatalf("runtime exited before public listener was available: mode=%s seed=%d err=%v",
+				cfg.Mode, cfg.Seed, run.err)
+		case <-timer.C:
+			t.Fatalf("timeout waiting for public listener: mode=%s seed=%d", cfg.Mode, cfg.Seed)
+		case <-tick.C:
+		}
+	}
+}
 
 // collectClientBackfill drives the REAL public jetstream client through the
 // full archive-negotiation path (getTombstones -> planBackfill ->
