@@ -22,6 +22,7 @@ import (
 	"github.com/bluesky-social/jetstream-v2/internal/simulator/fanout"
 	simhttp "github.com/bluesky-social/jetstream-v2/internal/simulator/http"
 	"github.com/bluesky-social/jetstream-v2/internal/simulator/world"
+	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -190,6 +191,10 @@ func TestOracleRestartChild(t *testing.T) {
 		ClientDrainTimeout:        time.Second,
 		CursorLookback:            36 * time.Hour,
 		SegmentCacheMaxAge:        0,
+		PlanMaxDIDs:               xrpcapi.DefaultPlanMaxDIDs,
+		PlanMaxCollections:        xrpcapi.DefaultPlanMaxCollections,
+		PlanMaxEntries:            xrpcapi.DefaultPlanMaxEntries,
+		PlanWholeSegmentThreshold: xrpcapi.DefaultPlanWholeSegmentThreshold,
 		SubscribeHotTailBytes:     16 << 20,
 		SubscribeBlockCacheBytes:  16 << 20,
 		SubscribeReadBatch:        1024,

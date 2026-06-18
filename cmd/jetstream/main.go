@@ -63,6 +63,7 @@ import (
 
 	"github.com/bluesky-social/jetstream-v2/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream-v2/internal/version"
+	"github.com/bluesky-social/jetstream-v2/internal/xrpcapi"
 	"github.com/jcalabro/atmos"
 	"github.com/urfave/cli/v3"
 )
@@ -255,6 +256,30 @@ func serveCommand() *cli.Command {
 				Value:   0,
 			},
 			&cli.IntFlag{
+				Name:    "plan-max-dids",
+				Usage:   "Maximum distinct DIDs accepted by planBackfill. 0 disables non-empty DID filters.",
+				Sources: cli.EnvVars("JETSTREAM_PLAN_MAX_DIDS"),
+				Value:   xrpcapi.DefaultPlanMaxDIDs,
+			},
+			&cli.IntFlag{
+				Name:    "plan-max-collections",
+				Usage:   "Maximum distinct collections accepted by planBackfill. 0 disables non-empty collection filters.",
+				Sources: cli.EnvVars("JETSTREAM_PLAN_MAX_COLLECTIONS"),
+				Value:   xrpcapi.DefaultPlanMaxCollections,
+			},
+			&cli.IntFlag{
+				Name:    "plan-max-entries",
+				Usage:   "Maximum response work entries planBackfill may return before failing with PlanTooLarge.",
+				Sources: cli.EnvVars("JETSTREAM_PLAN_MAX_ENTRIES"),
+				Value:   xrpcapi.DefaultPlanMaxEntries,
+			},
+			&cli.FloatFlag{
+				Name:    "plan-whole-segment-threshold",
+				Usage:   "Selected-block density at or above which planBackfill returns a whole segment instead of block ranges.",
+				Sources: cli.EnvVars("JETSTREAM_PLAN_WHOLE_SEGMENT_THRESHOLD"),
+				Value:   xrpcapi.DefaultPlanWholeSegmentThreshold,
+			},
+			&cli.IntFlag{
 				Name:    "subscribe-hot-tail-bytes",
 				Usage:   "Byte budget of the in-memory hot-tail ring that fans live events to /subscribe clients.",
 				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_HOT_TAIL_BYTES"),
@@ -344,6 +369,10 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		DisableRepoActionRateLimits: cmd.Bool("disable-repo-action-rate-limits"),
 		CursorLookback:              cmd.Duration("cursor-lookback"),
 		SegmentCacheMaxAge:          cmd.Duration("segment-cache-max-age"),
+		PlanMaxDIDs:                 cmd.Int("plan-max-dids"),
+		PlanMaxCollections:          cmd.Int("plan-max-collections"),
+		PlanMaxEntries:              cmd.Int("plan-max-entries"),
+		PlanWholeSegmentThreshold:   cmd.Float("plan-whole-segment-threshold"),
 		SubscribeHotTailBytes:       cmd.Int("subscribe-hot-tail-bytes"),
 		SubscribeBlockCacheBytes:    cmd.Int("subscribe-block-cache-bytes"),
 		SubscribeReadBatch:          cmd.Int("subscribe-read-batch"),

@@ -205,7 +205,7 @@ Jetstream Sealed Segment File (.jss):
 │     min_seq:           uint64                            │
 │     max_seq:           uint64                            │
 │     min_indexed_at:    int64   (unix micros)             │
-│     max_indexed_at:    int64   (unix micros)             |
+│     max_indexed_at:    int64   (unix micros)             │
 │   DID Bloom Filter                                       │
 │     Serialized gloom.Filter (MarshalBinary)              │
 │     Covers all unique DIDs in this segment               │
@@ -289,7 +289,7 @@ Collection Block Index:
 
 ### 3.2 Segment Blocks File Format
 
-Each block contains 4096 events (configurable by the server operator). Events within a block are stored in a columnar layout. All columns are concatenated and compressed as a single ztsd frame with content checksums enabled so that bit flips or partial writes are detected on decompression.
+Each block contains 4096 events (configurable by the server operator). Events within a block are stored in a columnar layout. All columns are concatenated and compressed as a single zstd frame with content checksums enabled so that bit flips or partial writes are detected on decompression.
 
 Note that this default size of 4096 was chosen somewhat arbitrarily and we should run experiments on real-world data to measure compression ratios of larger blocks, and try to square that against scans filtering by did or collection needing to examine too much data. More experimentation is required to pick a good default size. Similarly, is 256mb a good size for the overall file?
 
@@ -304,6 +304,7 @@ Compressed block (single ZSTD frame):
 │ Fixed-size columns (contiguous arrays):                  │
 │   seq[]              event_count × uint64 (LE)           │
 │   indexed_at[]       event_count × int64  (LE)           │
+│   rendered_at[]      event_count × int64  (LE)           │
 │   kind[]             event_count × uint8                 │
 │   collection_len[]   event_count × uint8                 │
 │   did_len[]          event_count × uint16                │
@@ -390,22 +391,30 @@ getTombstones overlay blob (.jsto framing):
 
 The columnar layout with DID/NSID dictionaries and delta-varint seqs is measurably smaller than flat rows after zstd (~20% fewer wire bytes at 1M tombstones), because an explicit dictionary dedups DIDs globally where zstd's bounded match window cannot. An empty overlay (nothing in `(W, M]`) is valid and common: zero-count tables and a tiny body, not an error.
 
-**A stale blob is stale-but-coherent, not incorrect.** Each build is an atomic snapshot, so the blob always reports the exact `W` and `M` it covers — it can never claim an `M` it does not cover. The query plan resumes the client's `/subscribe` tail from the blob's actual `M`, so whatever a slightly-stale overlay omits above `M` is delivered on the live tail instead. Staleness only costs a few seconds of extra live replay, never correctness.
+**A stale blob is stale-but-coherent, not incorrect.** Each build is an atomic snapshot, so the blob always reports the exact `W` and `M` it covers — it can never claim an `M` it does not cover. A correct client starts its live `/subscribe` tail from the blob's actual `M`, so whatever a slightly-stale overlay omits above `M` is delivered on the live tail instead. Staleness only costs a few seconds of extra live replay, never correctness.
 
-The **client decoder/overlay applier and the query-plan negotiation** (which segments to download, per-segment cache directives, and setting the `/subscribe` cursor to `M`) are future work; only the server endpoint ships now. The query plan is what closes the stale-cached-segment window noted at the end of this section: it must guarantee the client never reads a segment generation older than the overlay's `W`, by marking still-rewritable segments must-revalidate.
+#### Historical backfill planner endpoint (`network.bsky.jetstream.planBackfill`)
+
+The server exposes sealed-archive transport planning as an XRPC procedure, `network.bsky.jetstream.planBackfill`. It accepts exact DID filters, exact collection filters, and an optional seq window with `(afterSeq, beforeSeq]` semantics. Missing or empty DID/collection filters mean match all. The v1 planner deliberately does not include overlay negotiation, live-tail cutover, active-segment planning, pagination, or wildcard collection matching.
+
+The planner runs over manifest-resident sealed-segment metadata: segment seq bounds, block seq bounds, segment DID blooms, per-block DID blooms, and per-block collection summaries. It never opens segment files on the normal path. It returns an ordered list of whole segments or inclusive block ranges that may contain matching rows, plus `plannedThroughSeq`, the sealed archive tip covered by the plan capped by `beforeSeq` when present.
+
+The planner has a one-sided correctness contract: no false negatives, possible false positives. DID bloom filters may include blocks that do not contain the requested DID, and block-level collection summaries are still only transport hints. Clients must decode rows, apply exact DID/collection filtering, apply overlay tombstones, and de-duplicate/idempotently process events.
+
+Servers bound planner cost with configurable limits: maximum distinct DIDs, maximum distinct collections, maximum response/work entries, and a whole-segment density threshold. If a plan would exceed the entry limit, the server returns `PlanTooLarge`; it must not silently truncate.
 
 Putting it all together, the query plan and client code looks something like the following:
 
-1. The client connects to the jetstream live tail and starts receiving the most recent records
-2. The client negotiates a plan of which segment file blocks it must download to satisfy a particular query (i.e. “give me all `standard.site` documents”)
-3. The client downloads the overlay blob of recent deletions and updates above `compaction/seq` from `network.bsky.jetstream.getTombstones` (server endpoint shipped; see above)
-4. The client begins downloading the segment file blocks and decompresses them in an attempt to emit records that match the user’s query
-5. Future client work: if the record's DID is in the overlay's DID-tombstone suppression set (deleted account or sync divergence) at a higher seq, suppress the row
-6. Future client work: if the record's URI maps to an overlay record tombstone (delete/update) at a higher seq, suppress the row
+1. The client downloads the overlay blob of recent deletions and updates above `compaction/seq` from `network.bsky.jetstream.getTombstones`
+2. The client starts `/subscribe` from the overlay blob's actual `M` and buffers or processes live rows idempotently
+3. The client calls `network.bsky.jetstream.planBackfill` to learn which sealed segment files or block ranges may satisfy its historical query (i.e. “give me all `standard.site` documents”)
+4. The client downloads the planned segment files/blocks and decompresses them in an attempt to emit records that match the user’s query
+5. If the record's DID is in the overlay's DID-tombstone suppression set (deleted account or sync divergence) at a higher seq, suppress the row
+6. If the record's URI maps to an overlay record tombstone (delete/update) at a higher seq, suppress the row
 7. The replacement for an updated record is delivered as its own `#commit` row (suppress-old + deliver-new), so the overlay carries no payloads
 8. Emit the row as-is (no updates or deletes have been applied to this record)
 
-Step 3's server endpoint ships now; the client-side application in steps 5–6 is future work. The overlay covers the window above `compaction/seq`; until the client consumer ships, rows in that window may include data superseded after the last compaction pass (bounded by the compaction interval plus segment cache max-age).
+The server endpoints for the overlay and historical backfill planning are intentionally separate. The client owns the orchestration among overlay download, live subscription, historical block/segment downloads, exact filtering, and overlay application.
 
 ### 3.4 File Organization
 

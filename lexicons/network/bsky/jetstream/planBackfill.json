@@ -1,0 +1,103 @@
+{
+  "lexicon": 1,
+  "id": "network.bsky.jetstream.planBackfill",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Plan sealed-archive downloads for a historical backfill. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested exact DID and collection filters. This is a transport planner only: clients must still decode rows, apply exact filtering, fetch tombstones if needed, and coordinate live-tail subscription independently.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "dids": {
+              "type": "array",
+              "description": "Exact DIDs to match. Missing or empty means all DIDs.",
+              "items": { "type": "string", "format": "did" }
+            },
+            "collections": {
+              "type": "array",
+              "description": "Exact collection NSIDs to match. Missing or empty means all collections.",
+              "items": { "type": "string", "format": "nsid" }
+            },
+            "afterSeq": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Lower exclusive sequence bound. Rows with seq <= afterSeq are outside the requested window."
+            },
+            "beforeSeq": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Upper inclusive sequence bound. Rows with seq > beforeSeq are outside the requested window."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["plannedThroughSeq", "segments", "stats"],
+          "properties": {
+            "plannedThroughSeq": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Highest sealed seq covered by this plan, capped by beforeSeq when provided."
+            },
+            "segments": {
+              "type": "array",
+              "items": { "type": "ref", "ref": "#segment" }
+            },
+            "stats": { "type": "ref", "ref": "#stats" }
+          }
+        }
+      },
+      "errors": [
+        { "name": "PlanTooLarge", "description": "The plan would exceed the server's configured response/work entry limit." }
+      ]
+    },
+    "segment": {
+      "type": "object",
+      "required": ["name", "index", "checksum", "minSeq", "maxSeq", "mode"],
+      "properties": {
+        "name": { "type": "string", "description": "Segment filename accepted by getSegment and getBlock." },
+        "index": { "type": "integer", "minimum": 0, "description": "Zero-based segment index." },
+        "checksum": { "type": "string", "minLength": 16, "maxLength": 16, "description": "Segment-format xxh3 metadata checksum as 16-char hex." },
+        "minSeq": { "type": "integer", "minimum": 0 },
+        "maxSeq": { "type": "integer", "minimum": 0 },
+        "mode": {
+          "type": "string",
+          "knownValues": ["segment", "blocks"],
+          "description": "segment means download the whole segment with getSegment; blocks means download the listed block ranges with getBlock."
+        },
+        "blocks": {
+          "type": "array",
+          "description": "Inclusive block ranges. Present only when mode is blocks.",
+          "items": { "type": "ref", "ref": "#blockRange" }
+        }
+      }
+    },
+    "blockRange": {
+      "type": "object",
+      "required": ["first", "last"],
+      "properties": {
+        "first": { "type": "integer", "minimum": 0, "description": "First block index in this inclusive range." },
+        "last": { "type": "integer", "minimum": 0, "description": "Last block index in this inclusive range." }
+      }
+    },
+    "stats": {
+      "type": "object",
+      "required": ["segmentsExamined", "segmentsMatched", "blocksMatched", "entries"],
+      "properties": {
+        "segmentsExamined": { "type": "integer", "minimum": 0 },
+        "segmentsMatched": { "type": "integer", "minimum": 0 },
+        "blocksMatched": { "type": "integer", "minimum": 0 },
+        "entries": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of response work entries counted against the server plan limit."
+        }
+      }
+    }
+  }
+}
