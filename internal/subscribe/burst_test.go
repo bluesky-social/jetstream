@@ -57,6 +57,32 @@ func TestTail_BurstDoesNotDropSlowButLiveReaders(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// appendEvent records ev into the cold log FIRST (so a cold miss can always
+	// be served) then into the hot ring. The byte budget must hold throughout.
+	appendEvent := func(s int) {
+		ev := &segment.Event{
+			Seq: uint64(s), Kind: segment.KindCreate, DID: "did:plc:burst",
+			Payload: make([]byte, 64),
+		}
+		logMu.Lock()
+		logged = append(logged, ev)
+		logMu.Unlock()
+		tl.Append(ev)
+		require.LessOrEqual(t, tl.ringBytes(), 64<<10, "ring must stay within budget mid-burst")
+	}
+
+	// Pre-burst: append far more than the ~319-entry ring can hold (64KiB /
+	// ~205B per entry) BEFORE launching any reader. This forces eviction so the
+	// ring base is well above seq 0, which deterministically makes each reader's
+	// first read (at cursor 0) a cold miss. Without this head start the 8 fast
+	// readers (256/batch) outrun the single 1-at-a-time producer, reach the tip,
+	// and block hot forever — so a cold replay would only ever occur by chance
+	// scheduling, making the coldReads assertion flaky.
+	const preburst = 2000
+	for s := range preburst {
+		appendEvent(s)
+	}
+
 	for r := range readers {
 		wg.Add(1)
 		go func(r int) {
@@ -73,18 +99,10 @@ func TestTail_BurstDoesNotDropSlowButLiveReaders(t *testing.T) {
 		}(r)
 	}
 
-	// Producer: append everything, recording into the cold log FIRST so a cold
-	// miss can always be served. The byte budget must hold throughout.
-	for s := range total {
-		ev := &segment.Event{
-			Seq: uint64(s), Kind: segment.KindCreate, DID: "did:plc:burst",
-			Payload: make([]byte, 64),
-		}
-		logMu.Lock()
-		logged = append(logged, ev)
-		logMu.Unlock()
-		tl.Append(ev)
-		require.LessOrEqual(t, tl.ringBytes(), 64<<10, "ring must stay within budget mid-burst")
+	// Producer continues the burst concurrently with the now-running readers,
+	// which consume via cold replay until they catch up into the resident ring.
+	for s := preburst; s < total; s++ {
+		appendEvent(s)
 	}
 
 	wg.Wait()
