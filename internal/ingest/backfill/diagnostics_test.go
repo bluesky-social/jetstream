@@ -65,6 +65,25 @@ func TestIsRepoNotFoundError(t *testing.T) {
 	require.True(t, isRepoNotFoundError(fmt.Errorf("wrapped: %w", repoNotFound)))
 	require.False(t, shouldLogBackfillError(repoNotFound))
 
+	// Production bsky.network hosts report a missing repo with a generic
+	// "NotFound" name and a "Repo not found" message rather than the
+	// canonical RepoNotFound lexicon error. This must be treated as a
+	// missing repo too, otherwise these get retried and counted as
+	// failed hosts.
+	genericNotFound := &xrpc.Error{
+		StatusCode: 400,
+		Name:       "NotFound",
+		Message:    "Repo not found",
+	}
+	require.True(t, isRepoNotFoundError(genericNotFound))
+	require.True(t, isRepoNotFoundError(fmt.Errorf("wrapped: %w", genericNotFound)))
+	require.False(t, shouldLogBackfillError(genericNotFound))
+
+	// A generic NotFound for something other than a repo (a missing
+	// record or blob) must not be mistaken for a missing repo.
+	require.False(t, isRepoNotFoundError(&xrpc.Error{StatusCode: 400, Name: "NotFound", Message: "Could not find record"}))
+	require.False(t, isRepoNotFoundError(&xrpc.Error{StatusCode: 400, Name: "NotFound"}))
+
 	require.False(t, isRepoNotFoundError(&xrpc.Error{StatusCode: 400, Name: "InvalidRequest"}))
 	require.False(t, isRepoNotFoundError(errors.New("xrpc 400 RepoNotFound: text only")))
 	require.True(t, shouldLogBackfillError(&xrpc.Error{StatusCode: 400, Name: "InvalidRequest"}))

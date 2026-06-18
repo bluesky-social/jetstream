@@ -30,6 +30,13 @@ const (
 var (
 	http429ErrorRE = regexp.MustCompile(`(?i)\bhttp\s+429\b`)
 	http5xxErrorRE = regexp.MustCompile(`(?i)\bhttp\s+5[0-9][0-9]\b`)
+
+	// repoNotFoundMessageRE matches the "repo not found" message used by
+	// upstreams that report a generic "NotFound" error name instead of
+	// the canonical RepoNotFound lexicon error. The message is the only
+	// thing distinguishing it from other generic NotFound responses
+	// (e.g. a missing record or blob), so we gate on it.
+	repoNotFoundMessageRE = regexp.MustCompile(`(?i)\brepo not found\b`)
 )
 
 func normalizeHandleIndexKey(handle string) ([]byte, bool) {
@@ -225,9 +232,24 @@ func classifyBackfillError(err error) ErrorClass {
 	}
 }
 
+// isRepoNotFoundError reports whether err is the terminal "this repo
+// does not exist" signal from com.atproto.sync.getRepo. The canonical
+// lexicon error name is RepoNotFound, but production bsky.network hosts
+// report it as a generic "NotFound" name with a "Repo not found"
+// message instead. Both mean the same thing — there is nothing to
+// download and never will be — so we must not retry or count either as
+// a failed host. The generic "NotFound" name is gated on the message so
+// an unrelated NotFound (a missing record or blob) can't be mistaken
+// for a missing repo.
 func isRepoNotFoundError(err error) bool {
 	var xerr *xrpc.Error
-	return errors.As(err, &xerr) && xerr.Name == "RepoNotFound"
+	if !errors.As(err, &xerr) {
+		return false
+	}
+	if xerr.Name == "RepoNotFound" {
+		return true
+	}
+	return xerr.Name == "NotFound" && repoNotFoundMessageRE.MatchString(xerr.Message)
 }
 
 // isRepoUnavailableError reports whether err is a terminal "the account
