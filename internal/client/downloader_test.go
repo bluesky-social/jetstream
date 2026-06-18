@@ -23,6 +23,7 @@ import (
 // closely enough to exercise the downloader's decode path end to end.
 type archiveServer struct {
 	srv       *httptest.Server
+	mux       *http.ServeMux
 	mu        sync.Mutex
 	segments  map[string][]byte // name -> whole sealed file bytes
 	blockReqs atomic.Int64
@@ -33,6 +34,7 @@ func newArchiveServer(t *testing.T) *archiveServer {
 	t.Helper()
 	as := &archiveServer{segments: map[string][]byte{}}
 	mux := http.NewServeMux()
+	as.mux = mux
 	mux.HandleFunc("/xrpc/network.bsky.jetstream.getSegment", func(w http.ResponseWriter, r *http.Request) {
 		as.segReqs.Add(1)
 		name := r.URL.Query().Get("name")

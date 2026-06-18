@@ -72,7 +72,7 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 // Recoverable read/dial failures trigger a reconnect with backoff (reported to
 // emit as a non-nil error with a nil event so the caller can observe churn);
 // a context cancellation is a clean stop and returns nil.
-func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) error {
+func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error) bool) error {
 	backoff := liveBackoffMin
 	for {
 		if ctx.Err() != nil {
@@ -93,7 +93,7 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) e
 			backoff = liveBackoffMin
 		}
 		// Report the disconnect and back off before reconnecting.
-		if err != nil && !emit(nil, fmt.Errorf("jetstream: live tail reconnecting: %w", err)) {
+		if err != nil && !emit(nil, nil, fmt.Errorf("jetstream: live tail reconnecting: %w", err)) {
 			return nil
 		}
 		if !sleep(ctx, backoff) {
@@ -108,7 +108,7 @@ var errEmitStop = errors.New("jetstream: live emit stop")
 
 // session runs one connection: dial, read-decode-emit until an error or stop.
 // A successful read resets the caller's backoff via the return path (nil err).
-func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) bool) error {
+func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, error) bool) error {
 	conn, err := c.cfg.dial(ctx, c.subscribeURL())
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -131,7 +131,7 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 		if derr != nil {
 			// A malformed data frame is upstream input; surface it but keep the
 			// connection (one bad frame must not drop the tail).
-			if !emit(nil, derr) {
+			if !emit(nil, nil, derr) {
 				return errEmitStop
 			}
 			continue
@@ -143,7 +143,9 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 		}
 		c.lastSeq = ev.Seq
 		evCopy := ev
-		if !emit(&evCopy, nil) {
+		// Pass the raw frame too so the cutover buffer can persist verbatim
+		// bytes (re-decoded on replay) rather than re-marshal the decoded event.
+		if !emit(&evCopy, data, nil) {
 			return errEmitStop
 		}
 	}

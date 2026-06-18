@@ -82,7 +82,7 @@ func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = c.Run(ctx, func(ev *Event, err error) bool {
+		_ = c.Run(ctx, func(ev *Event, _ []byte, err error) bool {
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -182,7 +182,7 @@ func TestLiveConsumerContextCancelCleanStop(t *testing.T) {
 	var got int
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.Run(ctx, func(ev *Event, err error) bool {
+		errCh <- c.Run(ctx, func(ev *Event, _ []byte, err error) bool {
 			if err == nil && ev != nil {
 				got++
 				cancel()
