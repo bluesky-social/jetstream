@@ -30,6 +30,11 @@ env:
   # oracle-sweep recipe (see internal/oracle/config.go). Only the seed count is
   # tunable here; do not reintroduce account/record/event overrides.
   ORACLE_SWEEP_SEEDS: ${{ github.event.inputs.seeds || '10' }}
+  # Per-seed diagnostic artifacts (JSONL trace + captured test output carrying
+  # the goroutine dump) are written here by the oracle-sweep recipe and uploaded
+  # on failure. Without this the trace lands in an ephemeral temp dir and every
+  # scheduled failure is diagnostically blind.
+  ORACLE_ARTIFACT_DIR: ${{ github.workspace }}/oracle-artifacts
 
 jobs:
   oracle-sweep:
@@ -53,6 +58,8 @@ jobs:
             sum.golang.org:443
             storage.googleapis.com:443
             dl.google.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -73,6 +80,18 @@ jobs:
 
       - name: Oracle seed sweep
         run: just oracle-sweep "$ORACLE_SWEEP_SEEDS"
+
+      - name: Upload diagnostic artifacts
+        # The JSONL trace is the design's substitute for bit-reproducible
+        # scheduling; capturing it (plus the goroutine-dump-bearing test output)
+        # only matters when a seed fails, so this runs on failure only.
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: oracle-failure-traces
+          path: ${{ env.ORACLE_ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Failure summary
         if: failure()

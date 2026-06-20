@@ -114,19 +114,43 @@ oracle-sweep SEEDS="10":
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Root for per-seed diagnostic artifacts (the JSONL trace and the captured
+    # test output that carries the goroutine dump on a hang). CI sets
+    # ORACLE_ARTIFACT_DIR to a path it uploads on failure; locally it defaults
+    # to a repo-relative dir. The trace is the design's substitute for
+    # bit-reproducible scheduling, so it must outlive the test process.
+    artifact_root="${ORACLE_ARTIFACT_DIR:-oracle-artifacts}"
+    mkdir -p "${artifact_root}"
+
     for i in $(seq 1 "{{SEEDS}}"); do
         # Draw a fresh random uint64 seed each iteration so successive nightly
         # runs explore different points in the state space instead of replaying
         # a fixed 1..N. /dev/urandom is portable across the Linux CI runner and
         # macOS dev machines; the failing seed is printed below for exact repro.
         seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+        seed_dir="${artifact_root}/seed-${i}-${seed}"
+        mkdir -p "${seed_dir}"
         echo "::group::oracle ${i}/{{SEEDS}} seed=${seed}"
-        echo "oracle run ${i}/{{SEEDS}} seed=${seed}"
-        if ! JETSTREAM_ORACLE_MODE=stress \
+        echo "oracle run ${i}/{{SEEDS}} seed=${seed} artifacts=${seed_dir}"
+        # GOTRACEBACK=all makes the runtime print every goroutine's stack when
+        # the test -timeout fires, so a hang is diagnosable instead of a bare
+        # job kill. The per-seed -timeout (30m, matching the mutation campaign)
+        # is deliberately far below the job budget (timeout-minutes: 360) so the
+        # dump prints and the artifact upload runs before the job is killed; a
+        # healthy stress seed completes in minutes. JETSTREAM_ORACLE_TRACE_DIR
+        # redirects the harness trace from an ephemeral t.ArtifactDir() into the
+        # uploaded per-seed dir. --jsonfile records the raw test2json stream
+        # (the timeout traceback arrives as package output events), so the dump
+        # is captured regardless of how gotestsum renders its console output;
+        # tee additionally mirrors the console stream for human-readable triage.
+        if ! GOTRACEBACK=all \
+            JETSTREAM_ORACLE_MODE=stress \
             JETSTREAM_ORACLE_SEED="${seed}" \
-            gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -timeout 360m ./internal/oracle -run TestOracle_DefaultLifecycle -v; then
+            JETSTREAM_ORACLE_TRACE_DIR="${seed_dir}" \
+            gotestsum --format-hide-empty-pkg --format-icons hivis --jsonfile "${seed_dir}/gotestsum.jsonl" -- -count=1 -timeout 30m ./internal/oracle -run TestOracle_DefaultLifecycle -v \
+            2>&1 | tee "${seed_dir}/test-output.log"; then
             echo "::endgroup::"
-            echo "::error::oracle failed at seed ${seed}"
+            echo "::error::oracle failed at seed ${seed} (artifacts: ${seed_dir})"
             echo "Repro (NOTE: the seed fixes the INPUTS only — the world,"
             echo "the runtime RNG, and the fault schedule. The oracle runs the"
             echo "real jetstreamd runtime concurrently against real time and"

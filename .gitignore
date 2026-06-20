@@ -36,3 +36,7 @@ go.work.sum
 # Files not for distribution
 /.superpowers
 /data*
+
+# Local oracle-sweep diagnostic artifacts (trace + captured test output).
+# In CI these are written under a workspace path and uploaded on failure.
+/oracle-artifacts
