@@ -148,7 +148,7 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                 # assertion, so there is no 'oracle:' line; surface that as the
                 # reason instead of a bare "see log".
                 if [[ -z "$note" ]] && grep -q 'panic: test timed out' "$LOG_ROOT/$id.$tier.log"; then
-                    note="hang: test timed out (liveness broken — no barrier release)"
+                    note="hang: test timed out, no oracle assertion (likely liveness break — e.g. barrier never releases; inspect log for the blocked goroutine)"
                 fi
                 result="| $id | KILLED@$tier | ${note:-see log} |"
                 echo "    KILLED@$tier"

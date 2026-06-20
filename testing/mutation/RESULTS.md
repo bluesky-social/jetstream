@@ -336,7 +336,7 @@ every event — the regime in which the unique case becomes reachable.
 
 | mutant | result | note |
 |---|---|---|
-| m001_delete_mapped_to_update | KILLED@default | now kills via test-timeout hang (delete->update stalls the bootstrap seq-ack contiguity wait → after-bootstrap barrier never releases). Was a fast assertion kill at baseline; failure mode changed to a hang. |
+| m001_delete_mapped_to_update | KILLED@default | kills via test-timeout hang (delete->update stalls the bootstrap seq-ack contiguity wait → after-bootstrap barrier never releases). Baseline also recorded this as a barrier-timeout kill (not a fast assertion); this campaign only makes the bound explicit at 5m instead of relying on Go's silent 10m default — the failure mode is unchanged. |
 | m002_watermark_floor_off_by_one | SURVIVED@seed42 / KILLED@stress(4/5 seeds) | seed-dependent, unchanged from baseline. The fixed campaign seed (42) is one of the ~1/5 that survives; a 5-seed sweep reproduced 4/5 kills. NOT a regression. |
 | m003_merge_cursor_no_advance | SURVIVED | unchanged — restart tier does not stage the merge-cursor crash seam (real gap, tracked). |
 | m004_rev_filter_inverted | KILLED@default | `oracle: missing … app.bsky.actor.profile/…` |
