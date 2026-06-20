@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 )
 
 // LiveFrame is one buffered live event: its seq and the raw JSON frame bytes.
@@ -133,9 +134,16 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	// cancel (see runBackfillThenLive for the same rationale).
 	stopFlusher := e.startFlusher(liveCtx, b)
 	defer stopFlusher()
+	// LiveCursor is a pure-live resume point with 0 meaning "from the current
+	// tip" (the documented WithLiveCursor contract): map 0 -> None so the
+	// consumer omits the cursor, and a non-zero cursor -> Some(seq) to resume.
+	var liveCursor gt.Option[uint64]
+	if e.cfg.LiveCursor > 0 {
+		liveCursor = gt.Some(e.cfg.LiveCursor)
+	}
 	consumer := newLiveConsumer(liveConfig{
 		host:       e.cfg.Host,
-		cursor:     e.cfg.LiveCursor,
+		cursor:     liveCursor,
 		dial:       e.cfg.Dial,
 		logger:     e.logger,
 		backoffMin: e.cfg.LiveBackoffMin,
@@ -284,16 +292,16 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	liveCtx, stopLive := context.WithCancel(ctx)
 	defer stopLive()
 	consumer := newLiveConsumer(liveConfig{
-		host:   e.cfg.Host,
-		cursor: liveStart,
-		// The cutover always means "replay from liveStart", including liveStart=0
-		// (sealed tip below the rewind margin). Force the cursor onto the wire so
-		// a 0 start replays from the beginning rather than anchoring at the live
-		// tip and dropping the (plannedThroughSeq, tip] band. See #112.
-		explicitCursor: true,
-		dial:           e.cfg.Dial,
-		logger:         e.logger,
-		backoffMin:     e.cfg.LiveBackoffMin,
+		host: e.cfg.Host,
+		// The cutover always means "replay from liveStart", so it is always a
+		// present cursor — including Some(0) when the sealed tip is below the
+		// rewind margin. Some(0) sends cursor=0 (replay from the start) rather
+		// than the None "live from tip" sentinel, so the (plannedThroughSeq, tip]
+		// band is not dropped. See #112.
+		cursor:     gt.Some(liveStart),
+		dial:       e.cfg.Dial,
+		logger:     e.logger,
+		backoffMin: e.cfg.LiveBackoffMin,
 	})
 	var liveWG sync.WaitGroup
 	liveWG.Go(func() {

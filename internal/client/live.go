@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/jcalabro/gt"
 )
 
 const (
@@ -38,19 +39,21 @@ type dialFunc func(ctx context.Context, url string) (wsConn, error)
 // liveConfig configures a liveConsumer.
 type liveConfig struct {
 	host string // normalized base URL, e.g. "https://host"
-	// cursor is the initial resume point. The server replays inclusively (it
-	// delivers seq >= cursor; see internal/subscribe/replay.go); the consumer's
-	// own seq dedup turns that into the effective "> last delivered" on resume.
-	cursor uint64
-	// explicitCursor forces the cursor onto the wire even when it is 0. A bare
-	// cursor=0 (omitted param) is the "live from the current tip" sentinel; the
-	// backfill->live cutover sets this so a rewind start of 0 (sealed tip below
-	// the rewind margin) REPLAYS from seq 0 instead of anchoring at the tip and
-	// dropping the (plannedThroughSeq, tip] band. See #112.
-	explicitCursor bool
-	readLimit      int64
-	dial           dialFunc
-	logger         *slog.Logger
+	// cursor is the initial resume point, as an explicit optional so the seq
+	// space's 0 sentinel is never overloaded:
+	//
+	//   - None      -> "live from the current tip"; the cursor param is omitted.
+	//   - Some(seq) -> replay/resume from seq; the param is always sent, including
+	//     Some(0) (the #112 cutover from a sealed tip below the rewind margin,
+	//     which must replay from the start rather than anchor at the tip).
+	//
+	// The server replays inclusively (it delivers seq >= cursor; see
+	// internal/subscribe/replay.go); the consumer's own seq dedup turns that into
+	// the effective "> last delivered" on resume.
+	cursor    gt.Option[uint64]
+	readLimit int64
+	dial      dialFunc
+	logger    *slog.Logger
 	// backoffMin/backoffMax override the reconnect backoff bounds. Zero uses
 	// the package defaults. Tests set tiny values to avoid real-time waits.
 	backoffMin time.Duration
@@ -77,15 +80,14 @@ func (c liveConfig) maxBackoff() time.Duration {
 // stream: the engine consumes its output during cutover (buffered) and in
 // steady state (direct).
 type liveConsumer struct {
-	cfg     liveConfig
-	lastSeq uint64 // highest seq delivered; the reconnect resume cursor
-	// haveLastSeq distinguishes "lastSeq holds a real delivered/resume seq" from
-	// "lastSeq is the zero default". The seq space is 0-based (a fresh archive
-	// assigns the first event seq 0), so lastSeq==0 is ambiguous: it can mean
-	// "nothing delivered yet" OR "seq 0 has been delivered/already-held". Without
-	// this flag the dedup (ev.Seq <= lastSeq) would unconditionally swallow the
-	// first-ever event (seq 0). Mirrors the afterSeq>0 gate from #111.
-	haveLastSeq bool
+	cfg liveConfig
+	// lastSeq is the highest seq delivered, used both as the dedup floor and the
+	// reconnect resume cursor. It is an optional because the seq space is 0-based
+	// (a fresh archive assigns the first event seq 0): None means "nothing
+	// delivered yet" and Some(0) means "seq 0 has been delivered". Collapsing the
+	// two onto a bare 0 would make the dedup (ev.Seq <= lastSeq) swallow the
+	// first-ever event and make a reconnect re-anchor at the tip.
+	lastSeq gt.Option[uint64]
 }
 
 func newLiveConsumer(cfg liveConfig) *liveConsumer {
@@ -98,12 +100,14 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 	if cfg.logger == nil {
 		cfg.logger = slog.New(slog.NewTextHandler(discardWriter{}, nil))
 	}
-	// A non-zero resume cursor means the caller already holds events up to it, so
-	// seed lastSeq as an established resume point to dedup the at-least-once
-	// re-delivery of cursor itself. A zero cursor (live-from-tip, or the #112
-	// explicit replay-from-0 cutover) is NOT an established point: seq 0 has not
-	// been delivered, so it must pass the dedup.
-	return &liveConsumer{cfg: cfg, lastSeq: cfg.cursor, haveLastSeq: cfg.cursor > 0}
+	// Seed lastSeq from the initial cursor: a Some(seq) resume point means the
+	// caller already holds events up to seq, so it doubles as the dedup floor
+	// that drops the at-least-once re-delivery of seq itself. A None (live from
+	// tip) leaves lastSeq None so the first event delivered — even seq 0 — passes
+	// the dedup. The #112 Some(0) cutover seeds Some(0), which correctly dedups a
+	// re-delivered seq 0 only after it has first been delivered (lastSeq advances
+	// past it on delivery), not before.
+	return &liveConsumer{cfg: cfg, lastSeq: cfg.cursor}
 }
 
 // Run tails the live stream until ctx is cancelled, invoking emit for each
@@ -128,8 +132,10 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error)
 		}
 		// A session that made progress (delivered new events) is healthy; reset
 		// backoff so a long-lived connection that finally drops reconnects
-		// promptly rather than at the accumulated max.
-		if c.lastSeq > seqBefore {
+		// promptly rather than at the accumulated max. lastSeq advances
+		// monotonically (None -> Some, then strictly increasing), so any change
+		// means the session delivered at least one new event.
+		if c.lastSeq != seqBefore {
 			backoff = minB
 		}
 		// Report the disconnect and back off before reconnecting.
@@ -177,14 +183,14 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, er
 			continue
 		}
 		// Deduplicate the at-least-once reconnect overlap: skip anything at or
-		// below the highest seq already delivered. The haveLastSeq guard keeps
-		// this from swallowing the first-ever event (seq 0) on a from-tip /
-		// replay-from-0 start, where lastSeq==0 means "nothing delivered yet".
-		if c.haveLastSeq && ev.Seq <= c.lastSeq {
+		// below the highest seq already delivered. While lastSeq is None nothing
+		// has been delivered yet, so the first event always passes — this is what
+		// lets a from-tip / replay-from-0 start deliver the first-ever event
+		// (seq 0) instead of swallowing it against a bare zero floor.
+		if c.lastSeq.HasVal() && ev.Seq <= c.lastSeq.Val() {
 			continue
 		}
-		c.lastSeq = ev.Seq
-		c.haveLastSeq = true
+		c.lastSeq = gt.Some(ev.Seq)
 		evCopy := ev
 		// Pass the raw frame too so the cutover buffer can persist verbatim
 		// bytes (re-decoded on replay) rather than re-marshal the decoded event.
@@ -205,18 +211,17 @@ func (c *liveConsumer) subscribeURL() string {
 	u.Path = "/subscribe-v2"
 	q := url.Values{}
 	q.Set("extended", "true")
-	// Resume from lastSeq (the highest seq delivered), not the immutable initial
-	// cursor: subscribeURL is rebuilt on every reconnect, and anchoring each new
-	// session at cfg.cursor would, on a live-from-tip stream, re-anchor at the
-	// reconnect-time tip and silently drop events produced while disconnected.
-	// Gate on haveLastSeq, not lastSeq>0: once seq 0 has been delivered we hold
-	// an established resume point (lastSeq==0) and MUST send cursor=0 so the
-	// reconnect resumes from 0 instead of re-anchoring at the tip. explicitCursor
-	// forces a replay-from-0 cutover (#112) onto the wire before any event has
-	// been delivered. A bare from-tip start (no event yet, no explicitCursor)
-	// stays omitted = "live from tip".
-	if c.haveLastSeq || c.cfg.explicitCursor {
-		q.Set("cursor", strconv.FormatUint(c.lastSeq, 10))
+	// Resume from lastSeq (the highest seq delivered, or the seeded initial
+	// cursor), NOT the immutable cfg.cursor: subscribeURL is rebuilt on every
+	// reconnect, so anchoring each new session at the initial cursor would, on a
+	// live-from-tip stream, re-anchor at the reconnect-time tip and silently drop
+	// events produced while disconnected. The optional carries presence directly:
+	// Some(seq) sends cursor=seq (a resume point, a #112 replay-from-0 cutover, or
+	// any delivered event including seq 0), while None omits the param = "live
+	// from tip". Once any event is delivered lastSeq is Some, so a from-tip
+	// reconnect resumes from the last seq rather than re-anchoring.
+	if c.lastSeq.HasVal() {
+		q.Set("cursor", strconv.FormatUint(c.lastSeq.Val(), 10))
 	}
 	u.RawQuery = q.Encode()
 	return u.String()

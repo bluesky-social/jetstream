@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -220,7 +221,7 @@ func TestLiveConsumerSkipsControlAndMalformed(t *testing.T) {
 
 func TestLiveConsumerSubscribeURL(t *testing.T) {
 	t.Parallel()
-	c := newLiveConsumer(liveConfig{host: "https://jetstream.example", cursor: 123})
+	c := newLiveConsumer(liveConfig{host: "https://jetstream.example", cursor: gt.Some[uint64](123)})
 	u := c.subscribeURL()
 	require.True(t, strings.HasPrefix(u, "wss://jetstream.example/subscribe-v2?"), "got %s", u)
 	require.Contains(t, u, "extended=true")
@@ -230,24 +231,24 @@ func TestLiveConsumerSubscribeURL(t *testing.T) {
 	u2 := c2.subscribeURL()
 	require.True(t, strings.HasPrefix(u2, "ws://localhost:8080/subscribe-v2?"), "got %s", u2)
 	require.Contains(t, u2, "extended=true")
-	require.NotContains(t, u2, "cursor=", "no cursor when zero")
+	require.NotContains(t, u2, "cursor=", "no cursor when none (live from tip)")
 }
 
-// TestLiveConsumerSubscribeURLExplicitCursorZero guards #112: a backfill->live
-// cutover whose rewind start lands at seq 0 (sealed tip below the rewind
-// margin) must REPLAY from seq 0, not live-tail from the tip. A bare cursor=0
-// is the "live from tip" sentinel, so the cutover sets explicitCursor to force
-// cursor=0 onto the wire, which the server resolves as a seq replay from the
-// start. Without this, the entire (plannedThroughSeq, tip] band is dropped.
-func TestLiveConsumerSubscribeURLExplicitCursorZero(t *testing.T) {
+// TestLiveConsumerSubscribeURLCursorZero guards #112: a backfill->live cutover
+// whose rewind start lands at seq 0 (sealed tip below the rewind margin) must
+// REPLAY from seq 0, not live-tail from the tip. A present cursor of Some(0)
+// sends cursor=0 onto the wire (which the server resolves as a seq replay from
+// the start), while a None cursor stays the "live from tip" sentinel. Without
+// the Some(0) distinction the entire (plannedThroughSeq, tip] band is dropped.
+func TestLiveConsumerSubscribeURLCursorZero(t *testing.T) {
 	t.Parallel()
-	c := newLiveConsumer(liveConfig{host: "https://h", explicitCursor: true})
+	c := newLiveConsumer(liveConfig{host: "https://h", cursor: gt.Some[uint64](0)})
 	u := c.subscribeURL()
-	require.Contains(t, u, "cursor=0", "explicit cursor must send cursor=0 for a replay from the start; got %s", u)
+	require.Contains(t, u, "cursor=0", "Some(0) must send cursor=0 for a replay from the start; got %s", u)
 
-	// Pure-live (no explicit cursor) keeps the "0 = tip" sentinel.
+	// None cursor keeps the "live from tip" sentinel.
 	c2 := newLiveConsumer(liveConfig{host: "https://h"})
-	require.NotContains(t, c2.subscribeURL(), "cursor=", "pure-live cursor 0 must remain tip")
+	require.NotContains(t, c2.subscribeURL(), "cursor=", "None cursor must remain live-from-tip")
 }
 
 // capturingDialer wraps scriptedDialer to record the URL requested on each
