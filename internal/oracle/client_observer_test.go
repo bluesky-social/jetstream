@@ -7,6 +7,7 @@ import (
 
 	"github.com/bluesky-social/jetstream"
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/gt"
@@ -39,6 +40,16 @@ func waitForRuntimePublicURL(t *testing.T, cfg Config, rt *jetstreamd.Runtime, r
 	}
 }
 
+// clientBackfillResult is the outcome of draining the real client through the
+// full archive + live path: the complete ordered event stream it emitted, the
+// number of recoverable download/live errors it surfaced, and the highest
+// jetstream seq seen.
+type clientBackfillResult struct {
+	events       []ObservedEvent
+	downloadErrs int
+	maxSeq       uint64
+}
+
 // collectClientBackfill drives the REAL public jetstream client through the
 // full archive-negotiation path (getTombstones -> planBackfill ->
 // getSegment/getBlock -> overlay suppression -> cutover to /subscribe-v2),
@@ -46,15 +57,22 @@ func waitForRuntimePublicURL(t *testing.T, cfg Config, rt *jetstreamd.Runtime, r
 // OBSERVATION SURFACE ONLY — expected state is still derived independently
 // from simulator world + firehose history, never from the client itself.
 //
-// It drains the client through the full archive path until
-// it has observed every event with jetstream seq <= targetSeq, or the deadline
-// fires. targetSeq is in jetstream's own seq space (e.g. a sealed compaction
-// watermark), the same space the client emits, so the stop is a deterministic
-// seq threshold. The live tail never ends on its own; reaching targetSeq is
-// the stop condition. Events strictly above targetSeq are dropped so the
-// returned slice is a clean (-inf, targetSeq] window for downstream checks
-// even though the live tail may race ahead.
-func collectClientBackfill(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, baseURL string, targetSeq uint64) []ObservedEvent {
+// It drains the client's full emitted stream — archive AND live tail — until
+// the reconstructed final state converges to the independently-derived ground
+// truth (converged returns true on a clean Compare), or the deadline fires.
+// Draining PAST the compaction watermark to convergence is deliberate: the
+// client emits a SUPPRESSED stream (a create/update kept on disk at watermark
+// W can still be dropped by the client when a tombstone above W supersedes it),
+// so its (-inf, W] window is a subset of the on-disk rows and a per-seq
+// completeness check over that window is unsound. Final state, by contrast, is
+// key-based and seq-space-agnostic: it is comparable exactly when the client
+// has caught up to the quiescent world, which is what convergence detects.
+//
+// The live tail never ends on its own; convergence (or the deadline) is the
+// stop condition. Recoverable client errors are COUNTED (not silently
+// swallowed) so the caller can assert them against the run's fault budget; a
+// client-path error is never expected on a no-fault run.
+func collectClientBackfill(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, baseURL string, targetSeq uint64, converged func(events []ObservedEvent) bool) clientBackfillResult {
 	t.Helper()
 
 	recordTraceOrError(t, trace, "client_backfill_start", map[string]any{"target_seq": targetSeq})
@@ -78,29 +96,34 @@ func collectClientBackfill(t *testing.T, cfg Config, run *runtimeRun, trace *Tra
 		}
 	}()
 
-	var (
-		out     []ObservedEvent
-		maxSeq  uint64
-		batches int
-	)
+	res := clientBackfillResult{}
+	var batches int
 	for batch, err := range client.Events(ctx) {
 		if err != nil {
-			// Recoverable client errors (e.g. a live reconnect) are expected as
-			// the tail churns; keep draining until the target is reached.
+			// Recoverable client errors (e.g. a live reconnect) surface here.
+			// Count them rather than swallowing: a silent `continue` let a run
+			// where every getSegment/getBlock errored satisfy a coarse
+			// high-water guard with an incomplete window (issue #102). The
+			// caller asserts this count against the fault budget.
+			res.downloadErrs++
+			recordTraceOrError(t, trace, "client_backfill_error", map[string]any{
+				"err":     err.Error(),
+				"max_seq": res.maxSeq,
+			})
 			continue
 		}
 		batches++
 		for _, ev := range batch.Events() {
-			if ev.Seq > maxSeq {
-				maxSeq = ev.Seq
+			if ev.Seq > res.maxSeq {
+				res.maxSeq = ev.Seq
 			}
-			// Keep only the (-inf, targetSeq] window; the live tail may deliver
-			// higher seqs but they are outside the asserted envelope.
-			if ev.Seq <= targetSeq {
-				out = append(out, observedEventFromClient(t, ev))
-			}
+			res.events = append(res.events, observedEventFromClient(t, ev))
 		}
-		if maxSeq >= targetSeq {
+		// Converge only once the client has at least reached the sealed
+		// watermark; before that the archive is still streaming and a transient
+		// empty-diff match is impossible anyway. converged runs a full Compare,
+		// so gate it on maxSeq to avoid paying that cost on every early batch.
+		if res.maxSeq >= targetSeq && converged(res.events) {
 			break
 		}
 		if ctx.Err() != nil {
@@ -109,30 +132,83 @@ func collectClientBackfill(t *testing.T, cfg Config, run *runtimeRun, trace *Tra
 	}
 
 	recordTraceOrError(t, trace, "client_backfill_done", map[string]any{
-		"target_seq":  targetSeq,
-		"event_count": len(out),
-		"batches":     batches,
-		"max_seq":     maxSeq,
+		"target_seq":    targetSeq,
+		"event_count":   len(res.events),
+		"batches":       batches,
+		"download_errs": res.downloadErrs,
+		"max_seq":       res.maxSeq,
 	})
-	require.GreaterOrEqualf(t, maxSeq, targetSeq,
+	require.GreaterOrEqualf(t, res.maxSeq, targetSeq,
 		"client backfill did not reach target seq before deadline: mode=%s seed=%d target=%d max=%d",
-		cfg.Mode, cfg.Seed, targetSeq, maxSeq)
-	return out
+		cfg.Mode, cfg.Seed, targetSeq, res.maxSeq)
+	return res
+}
+
+// clientEventsAtOrBelow returns the subset of the client's emitted stream with
+// jetstream seq <= watermark, sorted by seq. This is the (-inf, watermark]
+// window the compaction contract (CheckCompacted) is asserted over.
+func clientEventsAtOrBelow(events []ObservedEvent, watermark uint64) []ObservedEvent {
+	out := make([]ObservedEvent, 0, len(events))
+	for _, ev := range events {
+		if ev.Seq <= watermark {
+			out = append(out, ev)
+		}
+	}
+	return EventsSortedBySeq(out)
 }
 
 // assertClientBackfillCompacted drives the real client through the full
-// archive path up to the compaction watermark and asserts the documented
-// compaction contract on what it replayed: no create/update row superseded by
-// a tombstone at or below the watermark survives. This is the product-path
-// contract #77 requires, observed through the real client (the archive
-// negotiation + overlay suppression + cutover) rather than a /subscribe
-// whole-archive replay. The watermark is in jetstream seq space, so the drain
-// stops deterministically and the asserted window is snapshot-consistent.
-func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, dataDir string, compaction *compactionPassRecorder, baseURL string, watermark uint64, phase string) {
+// archive + live path and asserts the product contract on what it replayed,
+// through three independent checks (issue #102):
+//
+//  1. FINAL STATE: Reconstruct the client's complete emitted stream and
+//     Compare it to GroundTruthFromWorld — the authoritative final state
+//     derived independently from the simulator MST. This is the load-bearing
+//     correctness check: it is key-based (DID/collection/rkey/payload) and so
+//     seq-space-agnostic, and it catches a client that drops records, skips
+//     DIDs/collections, serves a stale payload, or emits an extra row. The
+//     drain runs to CONVERGENCE on this Compare (see collectClientBackfill):
+//     the world is quiescent at this point in the lifecycle, so a correct
+//     client converges and a defective one never does (fails at the deadline
+//     with the precise Compare mismatch).
+//
+//  2. COMPACTION CONTRACT: CheckCompacted over the client's (-inf, watermark]
+//     window — no create/update row superseded by a tombstone at or below the
+//     watermark survives. On failure, #94's disk-vs-serving bisection
+//     classifies it as a durable defect vs. a serving/client artifact.
+//
+//  3. ERROR BUDGET: the client must not silently lose the archive behind
+//     recoverable download/live errors. On a no-fault run zero are tolerated;
+//     the swarm faults target the upstream relay->jetstream path, not the
+//     client->jetstream path, so the client should see none even under swarm.
+func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, dataDir string, w *world.World, compaction *compactionPassRecorder, baseURL string, watermark uint64, phase string) {
 	t.Helper()
 
-	events := collectClientBackfill(t, cfg, run, trace, baseURL, watermark)
-	if clientErr := CheckCompacted(events, watermark); clientErr != nil {
+	ground, err := GroundTruthFromWorld(w)
+	require.NoErrorf(t, err, "%s mode=%s seed=%d: build ground truth for client backfill", phase, cfg.Mode, cfg.Seed)
+
+	converged := func(events []ObservedEvent) bool {
+		got, rerr := Reconstruct(EventsSortedBySeq(events))
+		if rerr != nil {
+			return false
+		}
+		return Compare(ground, got) == nil
+	}
+
+	res := collectClientBackfill(t, cfg, run, trace, baseURL, watermark, converged)
+
+	// 1. Final-state comparison. If the drain converged this passes; if it
+	// timed out (a genuinely dropped/stale/extra record) this surfaces the
+	// precise mismatch instead of a bare high-water timeout.
+	got, err := Reconstruct(EventsSortedBySeq(res.events))
+	require.NoErrorf(t, err, "%s mode=%s seed=%d: reconstruct client stream", phase, cfg.Mode, cfg.Seed)
+	require.NoErrorf(t, Compare(ground, got),
+		"%s mode=%s seed=%d: client stream final state does not match simulator ground truth (events=%d max_seq=%d)",
+		phase, cfg.Mode, cfg.Seed, len(res.events), res.maxSeq)
+
+	// 2. Compaction contract over the (-inf, watermark] window.
+	window := clientEventsAtOrBelow(res.events, watermark)
+	if clientErr := CheckCompacted(window, watermark); clientErr != nil {
 		// Bisect the failure into a durable-defect vs. serving/client-artifact
 		// verdict (#94) before failing, so a client-path bug isn't mistaken for
 		// a storage defect (or vice versa). bisectServedCompactedFailure is
@@ -142,8 +218,15 @@ func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, tr
 		return
 	}
 
-	t.Logf("%s: client backfill compacted-check passed over %d observed events (watermark=%d) in mode=%s seed=%d",
-		phase, len(events), watermark, cfg.Mode, cfg.Seed)
+	// 3. Error budget. A recoverable error means the client retried/reconnected;
+	// the upstream-only swarm faults never touch the client transport, so on
+	// any run mode the client tail should complete clean.
+	require.Zerof(t, res.downloadErrs,
+		"%s mode=%s seed=%d: client surfaced %d recoverable download/live errors; the archive may be incomplete behind them",
+		phase, cfg.Mode, cfg.Seed, res.downloadErrs)
+
+	t.Logf("%s: client backfill matched ground truth over %d emitted events (window=%d watermark=%d) in mode=%s seed=%d",
+		phase, len(res.events), len(window), watermark, cfg.Mode, cfg.Seed)
 }
 
 // observedEventFromClient adapts a decoded public jetstream.Event into the

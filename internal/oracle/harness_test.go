@@ -286,7 +286,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	// server bug from a client bug). On a CheckCompacted failure we still run
 	// #94's disk-vs-serving bisection to classify durable-defect vs.
 	// serving/client artifact.
-	assertClientBackfillCompacted(t, cfg, run, trace, dataDir, compaction, publicURL, steadyCompaction.Watermark, "steady-state-client-backfill")
+	assertClientBackfillCompacted(t, cfg, run, trace, dataDir, w, compaction, publicURL, steadyCompaction.Watermark, "steady-state-client-backfill")
 
 	// Exercise the overlay's DID-tombstone section inside the live overlay
 	// window. The earlier bootstrap account-delete and sync tombstones are
