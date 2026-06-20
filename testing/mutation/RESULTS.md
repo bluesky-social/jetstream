@@ -405,3 +405,54 @@ snapshot is bounded so the boundary row at `seq == chunkEnd` is never
 superseded by a tombstone with `seq > chunkEnd`, making `>` vs `>=`
 behaviorally equivalent. m007 stays retired (dead/equivalent), not a true
 escape.
+
+## Campaign 2026-06-20 (m003 re-disposition — benign, not a gap)
+
+- scope: re-characterize **m003** only, via the restart tier, after #103
+  investigation; no full re-run.
+- context: prior sections (2026-06-12, 2026-06-15, 2026-06-20 b937b6e) all
+  recorded m003 as a SURVIVED **real gap** — "restart tier does not stage the
+  merge-cursor crash seam." That disposition is **wrong on both counts** and is
+  corrected here (history above is left intact per the no-back-edit convention).
+
+### m003 is benign / equivalent in the current scenario — NOT a real gap
+
+Two empirical corrections, both verified by direct on-disk observation:
+
+1. **The seam IS staged.** The restart tier's
+   `after-merge-dst-flush-before-source-commit` case already crashes at
+   `crashpoint.AfterMergeDstFlushBeforeSourceCommit` — exactly the point m003's
+   patch (`commitSourceComplete(..., sf.Idx, ...)` instead of `sf.Idx+1`)
+   double-processes. The earlier "seam not exercised" claim was incorrect.
+
+2. **m003 produces no observable effect.** Applied the patch and dumped the
+   on-disk event multiset for the merge crashpoint case vs. baseline: **identical**
+   — 11 events, zero duplicates, zero losses. The two runs differ only in
+   seq-assignment *order*, and two clean baseline runs differ in that same order
+   too (per-DID backfill concurrency nondeterminism), so the ordering is not a
+   mutation effect.
+
+Mechanism (file-probed `shouldKeep`, not inferred): in this scenario the merge
+keeps **zero** `live_segments` rows — the 16 rev-filterable events evaluated in
+the merge case are **all DROP, zero KEEP** (the pre-backfill `preLiveEvents` are
+rev-subsumed by the backfill snapshot, same family as the m005 finding above).
+With zero rows kept, m003 re-processing the source segment on restart also keeps
+zero rows, so nothing is double-appended. In a scenario where the merge *does*
+keep rows, m003 would re-append them with **fresh seqs** (the dst `ingest.Writer`
+re-stamps `ev.Seq = nextSeq`, `writer.go`), yielding a benign at-least-once
+**duplicate** — which is explicitly contract-permitted (`docs/README.md`:
+sequence numbers are never duplicated, and all subscribers must be idempotent to
+duplicate event delivery). It is not a data-loss bug either way.
+
+Disposition: **benign / equivalent in the current scenario — accepted, not a
+gap.** The mutant author's prediction (restart should trip `CheckInvariants`
+duplicate-seq or `Compare` extra-record) was based on a seq-preserving re-append;
+the dst re-stamps, so neither fires, and an at-least-once duplicate is correct
+behavior. The earlier "fix the oracle / extend the restart harness" disposition
+is withdrawn.
+
+Note: the restart tier's broader weakness — it lands **only surviving creates**
+on disk (`disk_total == final_records`, no durable tombstones/updates), so it
+cannot exercise the §180-182 lost-intermediate class at all — is real but
+orthogonal to m003. It is tracked as a scenario expansion in #113 (which closed
+the original #103). m003 is not the mutant that demonstrates that gap.
