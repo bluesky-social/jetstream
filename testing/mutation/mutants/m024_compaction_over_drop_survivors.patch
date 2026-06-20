@@ -1,0 +1,33 @@
+mutant: m024_compaction_over_drop_survivors
+target: internal/ingest/orchestrator/compact_deletes.go
+failure-mode: |
+  The compaction rewrite keep-guard returns RowDrop instead of RowKeep for
+  rows that ShouldDrop did NOT mark, so every surviving materialization row at
+  or below the chunk watermark is physically deleted: a blanket compaction
+  over-drop / data-loss bug.
+expected-detection: |
+  Killed at the after-merge assertOracleMatches -> Compare (final-state)
+  in TestOracle_DefaultLifecycle: dropping ALL survivors also removes rows
+  that are still live in the simulator world, so final-state comparison
+  diverges ("missing <did> <coll>/<rkey>"). Default tier.
+
+  NOTE on the #100 over-drop check: this blanket mutant is caught by
+  final-state Compare BEFORE the metamorphic compactionOverDropRecorder.Assert
+  runs, so it does not by itself exercise that check's UNIQUE power (catching
+  an over-drop that final-state convergence hides). That unique case requires
+  a survivor dropped at/below W but independently superseded ABOVE W. In
+  steady mode it is structurally unreachable from a single edit: each pass
+  force-rotates the active segment first, so W covers every event and the live
+  tombstone set holds nothing above W. The check's unique power is proven by
+  the unit test TestCompareEventLogsCompactedMultisetToleratesReorderingBut
+  CatchesOverDrop; an end-to-end convergence-hiding mutant belongs with the
+  crash-mid-pass restart tier (#103), where W need not cover everything.
+expected-tier: default
+tiers: default
+
+diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
+--- a/internal/ingest/orchestrator/compact_deletes.go
++++ b/internal/ingest/orchestrator/compact_deletes.go
+@@ -347 +347 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
+-					return segment.RowKeep
++					return segment.RowDrop

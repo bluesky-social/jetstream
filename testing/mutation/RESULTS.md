@@ -264,3 +264,48 @@ Summary: **4 killed, 0 survived.** The kills confirm the reconstruction
 assertion has detection power on both overlay sections (m020 DID tombstones,
 m023 record tombstones), on seq-delta base correctness (m021), and on the
 shared ShouldDrop suppression logic (m022).
+
+## Targeted follow-up 2026-06-20 — compaction over-drop check (#100)
+
+- commit: `fed7c1b` (branch `oracle-improvements`)
+- new mutant: `m024_compaction_over_drop_survivors` (1 new; catalog now 22
+  active, m001–m024 with m007/m010 retired)
+- target test: `TestOracle_DefaultLifecycle`, which now runs a metamorphic
+  compaction over-drop check (`compactionOverDropRecorder.Assert`): a
+  pre-rewrite sealed-segment snapshot (via the new `OnBeforeCompactionPass`
+  hook) is compared against the post-rewrite snapshot at the same watermark,
+  asserting every row the documented compaction filter says survives is still
+  present. Closes the §4.2 over-drop / data-loss blind spot.
+- driver: `just mutation-campaign m024`
+
+### Scorecard
+
+| mutant | subsystem | expected | actual | note |
+|---|---|---|---|---|
+| m024_compaction_over_drop_survivors | compaction | default | KILLED@default | rewrite keep-guard `RowKeep`→`RowDrop`; blanket over-drop of survivors, caught at after-merge final-state `Compare` |
+
+Summary: **1 killed, 0 survived.**
+
+Honest scope note (verified empirically + structurally, not assumed): m024 is a
+*blanket* over-drop, so it also deletes permanently-live rows and is killed by
+final-state `Compare` at the after-merge barrier — **before** the new
+metamorphic over-drop check runs. m024 therefore proves the over-drop class is
+caught, but does **not** demonstrate the new check's UNIQUE power: catching an
+over-drop that final-state convergence hides (a survivor dropped at/below W but
+independently superseded above W).
+
+Five candidate single-edit over-drop mutations (widening the steady tombstone
+`SnapshotRange` low/high bounds, the merge-path `FoldRange` bound, and the
+`ev.Seq > chunkEnd` keep-guard) were tested and **all survived the default
+scenario** — they are equivalent/dead mutants in steady mode: each compaction
+pass force-rotates the active segment first, so the target watermark W covers
+every event in existence and the live tombstone set never holds a tombstone
+above W. A single production bug thus cannot produce a convergence-hiding
+over-drop in steady mode; it is structurally unreachable.
+
+The new check's unique power is proven by the unit test
+`TestCompareEventLogsCompactedMultisetToleratesReorderingButCatchesOverDrop`
+(a survivor dropped but deleted above W: final-state converges, the check
+fails). An end-to-end convergence-hiding mutant is deferred to the crash-mid-
+pass restart tier (#103), where a pass can be interrupted with W not covering
+every event — the regime in which the unique case becomes reachable.
