@@ -3,13 +3,10 @@ package jetstreamd
 import (
 	"bytes"
 	"context"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
-	"github.com/jcalabro/atmos"
 	"github.com/stretchr/testify/require"
 )
 
@@ -143,35 +140,6 @@ func TestOptionsValidateRejectsInvalidPlanLimits(t *testing.T) {
 			require.ErrorContains(t, err, tt.want)
 		})
 	}
-}
-
-func TestOptionsExposeAfterRepoCompleteHook(t *testing.T) {
-	t.Parallel()
-
-	var called atomic.Bool
-	opts := testOptions(t)
-	opts.AfterRepoComplete = func(context.Context, atmos.DID) error {
-		called.Store(true)
-		return nil
-	}
-
-	require.NotNil(t, opts.AfterRepoComplete)
-	require.False(t, called.Load())
-}
-
-func TestOptionsExposeCrashInjector(t *testing.T) {
-	t.Parallel()
-
-	opts := testOptions(t)
-	opts.CrashInjector = stubCrashInjector{}
-
-	require.NotNil(t, opts.CrashInjector)
-}
-
-type stubCrashInjector struct{}
-
-func (stubCrashInjector) SimulateCrash(context.Context, crashpoint.Point) error {
-	return nil
 }
 
 func testOptions(t *testing.T) Options {

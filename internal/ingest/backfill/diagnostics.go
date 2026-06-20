@@ -352,7 +352,9 @@ func encodeHostStatus(s *HostStatus) ([]byte, error) {
 	return b, nil
 }
 
-// EncodeHostStatus marshals a HostStatus for repair tooling and tests.
+// EncodeHostStatus marshals a HostStatus. It is a test-only seed helper,
+// NOT production or repair tooling: tests use it to encode a HostStatus row
+// they write directly into the store.
 func EncodeHostStatus(s *HostStatus) ([]byte, error) {
 	return encodeHostStatus(s)
 }

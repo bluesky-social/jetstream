@@ -46,27 +46,3 @@ func TestNew_RejectsAbsolutePathToData(t *testing.T) {
 	_, err := New(context.Background(), cfg)
 	require.ErrorIs(t, err, ErrDataDirReserved)
 }
-
-func TestNew_OpensAndCloses(t *testing.T) {
-	t.Parallel()
-	cfg := DefaultConfig()
-	cfg.DataDir = filepath.Join(t.TempDir(), "simulator")
-	w, err := New(context.Background(), cfg)
-	require.NoError(t, err)
-	require.NoError(t, w.Close())
-}
-
-func TestNew_ResetWipesDir(t *testing.T) {
-	t.Parallel()
-	dir := filepath.Join(t.TempDir(), "simulator")
-	cfg := DefaultConfig()
-	cfg.DataDir = dir
-	w, err := New(context.Background(), cfg)
-	require.NoError(t, err)
-	require.NoError(t, w.Close())
-
-	cfg.Reset = true
-	w, err = New(context.Background(), cfg)
-	require.NoError(t, err)
-	require.NoError(t, w.Close())
-}

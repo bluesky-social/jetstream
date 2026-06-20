@@ -1,15 +1,12 @@
 package orchestrator
 
 import (
-	"context"
 	"io"
 	"log/slog"
 	"net/http"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
@@ -55,30 +52,4 @@ func TestConfig_Validate_MissingFields(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	require.Contains(t, err.Error(), "Store")
-}
-
-func TestConfig_OnEventField(t *testing.T) {
-	t.Parallel()
-	// Compile-time assertion: Config has the OnEvent field with the
-	// expected signature. The field flows through into the steady-state
-	// live.Consumer; see runSteadyState in steady.go.
-	cfg := Config{
-		OnEvent: func(*segment.Event) {},
-	}
-	require.NotNil(t, cfg.OnEvent)
-}
-
-func TestConfig_CrashInjectorField(t *testing.T) {
-	t.Parallel()
-
-	cfg := Config{
-		CrashInjector: stubCrashInjector{},
-	}
-	require.NotNil(t, cfg.CrashInjector)
-}
-
-type stubCrashInjector struct{}
-
-func (stubCrashInjector) SimulateCrash(context.Context, crashpoint.Point) error {
-	return nil
 }

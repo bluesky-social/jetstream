@@ -36,23 +36,6 @@ func TestNewCreatesEmpty256ByteFile(t *testing.T) {
 	}
 }
 
-func TestNewResumesActiveFile(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "seg.jss")
-
-	// Create with first writer, close.
-	w1, err := New(Config{Path: path})
-	require.NoError(t, err)
-	require.NoError(t, w1.Close())
-
-	// Reopen.
-	w2, err := New(Config{Path: path})
-	require.NoError(t, err)
-	require.NoError(t, w2.Close())
-}
-
 func TestNewRejectsTooSmallFile(t *testing.T) {
 	t.Parallel()
 

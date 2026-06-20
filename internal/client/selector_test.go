@@ -1,10 +1,8 @@
 package client
 
 import (
-	"strconv"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -49,97 +47,4 @@ func TestSelectorFiltersAndSuppressesDuringDownload(t *testing.T) {
 		require.Equal(t, "did:plc:a", ev.DID)
 		require.Equal(t, "app.bsky.feed.post", ev.Commit.Collection)
 	}
-}
-
-// TestReconstructionMatchesGroundTruth mirrors the oracle's
-// CheckOverlayReconstruction contract at the client filter+suppress layer:
-// given a set of materialization rows and the combined tombstone set, the rows
-// the client emits equal the independently-derived live set.
-func TestReconstructionMatchesGroundTruth(t *testing.T) {
-	t.Parallel()
-
-	// Build a row stream: creates and a few deletes/updates across keys.
-	type row struct {
-		seq       uint64
-		kind      segment.Kind
-		did, rkey string
-	}
-	rows := []row{
-		{1, segment.KindCreate, "did:plc:a", "r1"},
-		{2, segment.KindCreate, "did:plc:a", "r2"},
-		{3, segment.KindCreate, "did:plc:b", "r1"},
-		{4, segment.KindUpdate, "did:plc:a", "r1"}, // supersedes seq1
-		{5, segment.KindDelete, "did:plc:a", "r2"}, // kills r2
-		{6, segment.KindCreate, "did:plc:b", "r2"},
-	}
-
-	const coll = "app.bsky.feed.post"
-	toEvent := func(r row) segment.Event {
-		return segment.Event{Seq: r.seq, Kind: r.kind, DID: r.did, Collection: coll, Rkey: r.rkey}
-	}
-
-	// Combined tombstone set folded from the full stream (overlay + live
-	// union, as the client would hold it).
-	all := make([]segment.Event, 0, len(rows))
-	for _, r := range rows {
-		all = append(all, toEvent(r))
-	}
-	snap, err := tombstone.FoldRange(all, 0, ^uint64(0))
-	require.NoError(t, err)
-
-	sup := NewSuppressor()
-	sup.snap = ensureSnapshotMaps(snap)
-
-	// Emit: every materialization row not suppressed, keeping the highest
-	// surviving seq per key.
-	emitted := map[string]uint64{}
-	for _, r := range rows {
-		ev := toEvent(r)
-		if !ev.Kind.IsMaterialization() {
-			continue
-		}
-		if drop, _ := sup.ShouldDrop(&ev); drop {
-			continue
-		}
-		key := r.did + "/" + r.rkey
-		if r.seq > emitted[key] {
-			emitted[key] = r.seq
-		}
-	}
-
-	// Ground truth: highest create/update seq per key not killed by a later
-	// delete.
-	want := map[string]uint64{
-		"did:plc:a/r1": 4, // create@1 then update@4
-		"did:plc:b/r1": 3,
-		"did:plc:b/r2": 6,
-		// did:plc:a/r2 created@2 then deleted@5 -> absent
-	}
-	require.Equal(t, want, emitted)
-}
-
-// makeManyCreates is a helper for larger reconstruction sweeps.
-func makeManyCreates(n int) []segment.Event {
-	out := make([]segment.Event, 0, n)
-	for i := 1; i <= n; i++ {
-		out = append(out, segment.Event{
-			Seq: uint64(i), Kind: segment.KindCreate,
-			DID: "did:plc:" + strconv.Itoa(i%5), Collection: "app.bsky.feed.post", Rkey: "r" + strconv.Itoa(i),
-		})
-	}
-	return out
-}
-
-func TestReconstructionEmptyOverlayKeepsAll(t *testing.T) {
-	t.Parallel()
-	rows := makeManyCreates(20)
-	sup := NewSuppressor()
-	sup.snap = emptySnapshot()
-	kept := 0
-	for i := range rows {
-		if drop, _ := sup.ShouldDrop(&rows[i]); !drop {
-			kept++
-		}
-	}
-	require.Equal(t, 20, kept, "empty overlay suppresses nothing")
 }

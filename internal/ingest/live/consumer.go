@@ -236,8 +236,7 @@ func (c *Consumer) cursorValue() int64 {
 // value, NOT the persisted relay/cursor — the persisted cursor
 // lags by at most one in-flight block.
 //
-// Used by tests and the future merge orchestrator that needs to
-// know where to resume the steady-state consumer from.
+// Used only by tests to assert how far the consumer has progressed.
 func (c *Consumer) LastUpstreamSeq() int64 {
 	return c.lastUpstream.Load()
 }

@@ -52,8 +52,10 @@ func LoadUpstreamCursor(s *store.Store, key string) (int64, error) {
 }
 
 // SaveUpstreamCursor durably persists v under key with pebble.Sync.
-// Used inside ingest.Writer's OnAfterFlush so the cursor advance
-// is ordered after the per-block fsync.
+// This is a test-only seed helper used to write a cursor into pebble
+// directly; production persists the cursor via the Consumer's own
+// saveCursorAndSyncState path (which batches the cursor with sync
+// state under a single Commit).
 //
 // Rejects negative values so the on-disk invariant "stored cursor >= 0"
 // holds by construction at every write site, and LoadUpstreamCursor

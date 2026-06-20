@@ -96,7 +96,11 @@ func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEnt
 	return atmosbackfill.StoreEntry{State: st, Active: rs.Active}, nil
 }
 
-// putRepoStatus writes the value durably. Used by all write paths.
+// putRepoStatus writes the value durably. It is a test-only setter that
+// writes the repo/<did> row in isolation, skipping the counts and host
+// aggregate maintenance that production write paths perform; production
+// code goes through putRepoStatusAndCounts (and the RMW helpers built on
+// it) instead.
 func (s *Store) putRepoStatus(did atmos.DID, rs *RepoStatus) error {
 	enc, err := encodeRepoStatus(rs)
 	if err != nil {

@@ -50,10 +50,11 @@ func LoadListReposCursor(db *store.Store) (string, error) {
 }
 
 // SaveListReposCursor durably persists the cursor for resume via
-// pebble.Sync. This is now a test/seed helper only: Run's production
-// checkpoint path uses SaveListReposCheckpoint, which writes the relay
-// and bootstrap cursors atomically after the writer durability drain.
-// Tests that only need to seed a starting cursor still call this.
+// pebble.Sync. It is a test-only seed helper, NOT production or repair
+// tooling: Run's production checkpoint path uses SaveListReposCheckpoint,
+// which writes the relay and bootstrap cursors atomically after the
+// writer durability drain. Tests that only need to seed a starting
+// cursor call this.
 func SaveListReposCursor(db *store.Store, cursor string) error {
 	if err := db.Set([]byte(listReposCursorKey), []byte(cursor), store.SyncWrites); err != nil {
 		return fmt.Errorf("backfill: save list_repos_cursor: %w", err)
@@ -117,6 +118,10 @@ func LoadBootstrapLastListReposCursor(db *store.Store) (string, error) {
 // The empty-cursor short-circuit is the entire point: atmos's final
 // OnBatchComplete fires with the relay's "I'm done" empty value, and
 // we must not overwrite the last meaningful cursor with it.
+//
+// This is a test-only seed helper, NOT production or repair tooling:
+// Run's production path persists this cursor via SaveListReposCheckpoint.
+// Tests call this to seed a starting bootstrap-last cursor.
 func MaybeSaveBootstrapLastListReposCursor(db *store.Store, cursor string) error {
 	if cursor == "" {
 		return nil

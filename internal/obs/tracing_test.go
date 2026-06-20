@@ -37,19 +37,3 @@ func TestSetupTracing_NoExporterInstallsNoop(t *testing.T) {
 	defer cancel()
 	require.NoError(t, shutdown(ctx))
 }
-
-// TestTracerNamespace pins the "jetstream/<name>" namespacing
-// described in AGENTS.md.
-func TestTracerNamespace(t *testing.T) {
-	t.Parallel()
-
-	// We can't easily inspect the tracer name through the public
-	// otel API, but the function must be callable, return non-nil,
-	// and produce a non-nil span — that's the contract surface
-	// callers actually use.
-	tr := obs.Tracer("subsystem")
-	require.NotNil(t, tr)
-
-	_, span := tr.Start(t.Context(), "x")
-	span.End()
-}

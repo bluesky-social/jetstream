@@ -46,10 +46,9 @@ type Config struct {
 	// BackfillOnly downloads and emits the sealed archive, then returns without
 	// starting the live tail or cutover. A one-time dump of the matched range.
 	// Only meaningful when Backfill is true.
-	BackfillOnly  bool
-	HasLiveCursor bool
-	LiveCursor    uint64 // pure-live resume cursor when !Backfill
-	BatchSize     int
+	BackfillOnly bool
+	LiveCursor   uint64 // pure-live resume cursor when !Backfill
+	BatchSize    int
 	// MaxBatchDelay bounds how long a partial batch waits before flushing in
 	// the steady-state live tail. Zero uses defaultMaxBatchDelay.
 	MaxBatchDelay time.Duration

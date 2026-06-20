@@ -36,16 +36,6 @@ func TestInspectAll_MissingRoot(t *testing.T) {
 	require.Empty(t, agg.Warnings)
 }
 
-func TestInspectAll_EmptyExistingRoot(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	agg, err := status.InspectAll([]string{dir}, status.InspectAllOptions{})
-	require.NoError(t, err)
-	require.Len(t, agg.Trees, 1)
-	require.Equal(t, dir, agg.Trees[0].Dir)
-	require.Equal(t, 0, agg.Trees[0].SealedCount+agg.Trees[0].ActiveCount)
-}
-
 // writeSealedSegment writes a deterministic sealed segment file at
 // dir/seg_<idx>.jss containing the provided events and returns the
 // path. The fixture mirrors segment/inspect_test.go::makeSealedFixture

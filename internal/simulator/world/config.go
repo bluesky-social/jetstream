@@ -24,7 +24,6 @@ type Config struct {
 	CommitsPerSec     float64
 	RateMultiplier    float64
 	FirehoseHistory   int
-	RepoCacheSize     int
 }
 
 // DefaultConfig returns simulator defaults matching the design doc.
@@ -40,7 +39,6 @@ func DefaultConfig() Config {
 		CommitsPerSec:     10,
 		RateMultiplier:    1.0,
 		FirehoseHistory:   10000,
-		RepoCacheSize:     512,
 	}
 }
 
@@ -87,9 +85,6 @@ func (c Config) validate() error {
 	}
 	if c.FirehoseHistory < 0 {
 		return fmt.Errorf("world: FirehoseHistory must be >= 0 (got %d)", c.FirehoseHistory)
-	}
-	if c.RepoCacheSize <= 0 {
-		return fmt.Errorf("world: RepoCacheSize must be > 0 (got %d)", c.RepoCacheSize)
 	}
 	return nil
 }

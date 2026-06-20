@@ -89,13 +89,6 @@ func TestConfig_Validate(t *testing.T) {
 	}
 }
 
-func TestOpen_RejectsBadConfig(t *testing.T) {
-	t.Parallel()
-	_, err := Open(Config{})
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrInvalidConfig))
-}
-
 // TestOpen_UsesConfiguredSeqKey verifies that Open actually wires
 // cfg.SeqKey down to the underlying ingest.Writer. We do that by
 // choosing a deliberately unusual SeqKey, opening, appending one

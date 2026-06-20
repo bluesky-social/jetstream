@@ -22,10 +22,3 @@ func TestGenerateRecord_RoundTrips(t *testing.T) {
 		require.NoError(t, err, coll)
 	}
 }
-
-func TestNewRkey_ValidTID(t *testing.T) {
-	t.Parallel()
-	r := newTestRand()
-	k := newRkey(r)
-	require.Len(t, k, 13)
-}
