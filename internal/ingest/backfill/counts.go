@@ -56,8 +56,10 @@ func encodeCounts(c Counts) ([]byte, error) {
 	return enc, nil
 }
 
-// SaveCounts writes aggregate counts. It is exported for repair/migration
-// tools and tests; normal backfill state transitions maintain it via Store.
+// SaveCounts writes aggregate counts. It is a test-only seed helper, NOT
+// production or repair tooling: normal backfill state transitions maintain
+// the counts row via Store's write paths. Tests call this to seed a counts
+// row directly.
 func SaveCounts(s *store.Store, c Counts) error {
 	enc, err := encodeCounts(c)
 	if err != nil {

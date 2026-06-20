@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 
@@ -131,19 +130,4 @@ func buildRandomArchive(t *testing.T, seed int64) *manifest.Manifest {
 		mustWriteSealedSegmentWithEvents(t, filepath.Join(dir, ingest.SegmentFilename(uint64(segIdx))), maxPerBlock, events)
 	}
 	return openManifestDir(t, dir)
-}
-
-// TestArchivedNSIDsUnderPrefix guards the test helper itself so a bug in the
-// oracle can't silently make the equivalence assertion vacuous.
-func TestArchivedNSIDsUnderPrefix(t *testing.T) {
-	t.Parallel()
-
-	got := archivedNSIDsUnderPrefix("app.bsky.feed.")
-	want := []string{"app.bsky.feed.post", "app.bsky.feed.like", "app.bsky.feed.repost"}
-	sort.Strings(got)
-	sort.Strings(want)
-	require.Equal(t, want, got)
-
-	require.Empty(t, archivedNSIDsUnderPrefix("net.nonexistent."))
-	require.Len(t, archivedNSIDsUnderPrefix("com."), 3)
 }

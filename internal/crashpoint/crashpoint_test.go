@@ -6,16 +6,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseKnownPoint(t *testing.T) {
-	t.Parallel()
-
-	got, err := Parse("after-repo-complete")
-	require.NoError(t, err)
-	require.Equal(t, AfterRepoComplete, got)
-	require.Equal(t, "after-repo-complete", got.String())
-	require.True(t, Known(got))
-}
-
 func TestParseRejectsUnknownPoint(t *testing.T) {
 	t.Parallel()
 

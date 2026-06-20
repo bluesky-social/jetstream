@@ -1,7 +1,6 @@
 package manifest_test
 
 import (
-	"path/filepath"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/segment"
@@ -48,8 +47,6 @@ func mustWriteSealedSegment(t *testing.T, path string, f sealedFixture) {
 	}
 	_, err = w.Seal()
 	require.NoError(t, err)
-
-	_ = filepath.Base // anchor the import; helpers may grow later
 }
 
 // mustWriteSealedSegmentWithEvents writes one sealed segment containing

@@ -170,9 +170,6 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, er
 	}
 }
 
-// LastSeq returns the highest seq delivered so far (the live resume cursor).
-func (c *liveConsumer) LastSeq() uint64 { return c.lastSeq }
-
 func (c *liveConsumer) subscribeURL() string {
 	u, _ := url.Parse(c.cfg.host) // host is pre-normalized by the caller
 	switch u.Scheme {

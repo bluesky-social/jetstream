@@ -22,7 +22,6 @@ type Trace struct {
 type TraceRecord struct {
 	Index uint64         `json:"index"`
 	Kind  string         `json:"kind"`
-	At    string         `json:"at,omitempty"`
 	Data  map[string]any `json:"data,omitempty"`
 }
 

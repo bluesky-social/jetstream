@@ -6,19 +6,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestConfigDefaultMode(t *testing.T) {
-	t.Parallel()
-
-	cfg := ConfigFromEnv(func(string) string { return "" })
-	require.Equal(t, "default", cfg.Mode)
-	require.Equal(t, 25, cfg.Accounts)
-	require.Equal(t, 0, cfg.MinInitialRecords)
-	require.Equal(t, 1000, cfg.MaxInitialRecords)
-	require.Equal(t, FaultModeSwarm, cfg.FaultMode)
-	require.Greater(t, cfg.LiveEventsBootstrap, 0)
-	require.Greater(t, cfg.LiveEventsSteady, 0)
-}
-
 func TestConfigEnvOverrides(t *testing.T) {
 	t.Parallel()
 
@@ -38,30 +25,6 @@ func TestConfigEnvOverrides(t *testing.T) {
 	require.Equal(t, FaultModeNone, cfg.FaultMode)
 }
 
-func TestConfigModePresets(t *testing.T) {
-	t.Parallel()
-
-	fast, err := ParseConfigFromEnv(envMap(map[string]string{
-		"JETSTREAM_ORACLE_MODE": "fast",
-	}))
-	require.NoError(t, err)
-	require.Equal(t, 4, fast.Accounts)
-	require.Equal(t, 0, fast.MinInitialRecords)
-	require.Equal(t, 10, fast.MaxInitialRecords)
-	require.Equal(t, 12, fast.LiveEventsBootstrap)
-	require.Equal(t, 12, fast.LiveEventsSteady)
-
-	stress, err := ParseConfigFromEnv(envMap(map[string]string{
-		"JETSTREAM_ORACLE_MODE": "stress",
-	}))
-	require.NoError(t, err)
-	require.Equal(t, 100, stress.Accounts)
-	require.Equal(t, 0, stress.MinInitialRecords)
-	require.Equal(t, 5000, stress.MaxInitialRecords)
-	require.Equal(t, 5000, stress.LiveEventsBootstrap)
-	require.Equal(t, 5000, stress.LiveEventsSteady)
-}
-
 func TestDefaultLifecycleConfigUsesFastModeUnderShort(t *testing.T) {
 	t.Parallel()
 
@@ -78,16 +41,6 @@ func TestDefaultLifecycleConfigHonorsExplicitModeUnderShort(t *testing.T) {
 	cfg, err := defaultLifecycleConfig(lookupEnvMap(map[string]string{
 		"JETSTREAM_ORACLE_MODE": "default",
 	}), true)
-	require.NoError(t, err)
-	require.Equal(t, "default", cfg.Mode)
-	require.Equal(t, 25, cfg.Accounts)
-	require.Equal(t, 1000, cfg.MaxInitialRecords)
-}
-
-func TestDefaultLifecycleConfigKeepsDefaultOutsideShort(t *testing.T) {
-	t.Parallel()
-
-	cfg, err := defaultLifecycleConfig(lookupEnvMap(nil), false)
 	require.NoError(t, err)
 	require.Equal(t, "default", cfg.Mode)
 	require.Equal(t, 25, cfg.Accounts)

@@ -24,8 +24,6 @@ const (
 // nil *Metrics is a valid zero-value: every observe* method is a
 // no-op, so tests can skip metric registration.
 type Metrics struct {
-	OpDuration *prometheus.HistogramVec
-
 	// Pre-computed observers. We pay the WithLabelValues cost once at
 	// registration time so per-call observe doesn't allocate.
 	getOk       prometheus.Observer
@@ -52,7 +50,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	reg.MustRegister(hist)
 
 	return &Metrics{
-		OpDuration:  hist,
 		getOk:       hist.WithLabelValues("get", statusOK),
 		getNotFound: hist.WithLabelValues("get", statusNotFound),
 		getError:    hist.WithLabelValues("get", statusError),

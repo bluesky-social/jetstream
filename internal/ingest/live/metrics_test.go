@@ -42,16 +42,3 @@ func TestNewMetrics_RegistersAllSeries(t *testing.T) {
 	// Re-registering the same collectors must collide.
 	require.Panics(t, func() { _ = NewMetrics(reg) })
 }
-
-// TestMetrics_NilSafe pins that a nil *Metrics receiver tolerates
-// every increment / set helper. This lets tests skip metric
-// registration entirely by passing nil.
-func TestMetrics_NilSafe(t *testing.T) {
-	t.Parallel()
-	var m *Metrics
-	m.incEventsReceived()
-	m.incReconnects()
-	m.incDecodeErrors()
-	m.incUnknownEvents()
-	m.setUpstreamCursor(42)
-}

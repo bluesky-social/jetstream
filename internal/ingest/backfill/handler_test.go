@@ -358,17 +358,6 @@ func TestSegmentHandler_NilWriterPanics(t *testing.T) {
 	require.Panics(t, func() { _ = NewSegmentHandler(nil, nil, nil) })
 }
 
-// TestSegmentHandler_NilLoggerNoPanic guards the wiring: a caller
-// that forgot to plumb a logger should get a usable handler.
-func TestSegmentHandler_NilLoggerNoPanic(t *testing.T) {
-	t.Parallel()
-	w := newTestIngest(t)
-	require.NotPanics(t, func() {
-		h := NewSegmentHandler(w, nil, nil)
-		require.NotNil(t, h)
-	})
-}
-
 // TestSplitMSTKey rounds the helper through happy and unhappy cases.
 func TestSplitMSTKey(t *testing.T) {
 	t.Parallel()

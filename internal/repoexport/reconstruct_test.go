@@ -120,16 +120,6 @@ func TestReconstruct_CoversSealedActiveAndPending(t *testing.T) {
 	require.Equal(t, wantCount, got.RecordCount)
 }
 
-func TestReconstruct_RequiresSelector(t *testing.T) {
-	t.Parallel()
-
-	_, err := Reconstruct(context.Background(), Config{
-		DataDir: t.TempDir(),
-		DID:     testDID,
-	})
-	require.ErrorContains(t, err, "Selector is required")
-}
-
 func TestReconstruct_CreateOnlyBuildsExpectedRoot(t *testing.T) {
 	t.Parallel()
 

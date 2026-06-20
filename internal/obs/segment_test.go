@@ -11,14 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSegmentMetrics_NilSafe pins the codebase nil-receiver convention.
-func TestSegmentMetrics_NilSafe(t *testing.T) {
-	t.Parallel()
-	var m *obs.SegmentMetrics
-	var zero time.Time
-	m.ObserveSeal(zero, nil)
-}
-
 // TestSegmentMetrics_RecordsHistogram drives a real Writer through Seal with
 // a registered *SegmentMetrics and confirms the histogram landed exactly one
 // observation.

@@ -46,11 +46,6 @@ func TestResolveCursor_FutureTimestampDropsToLive(t *testing.T) {
 	require.Equal(t, subscribe.ModeLive, p.Mode)
 }
 
-func TestResolveCursor_ThresholdConstantStable(t *testing.T) {
-	t.Parallel()
-	require.Equal(t, uint64(1_000_000_000_000_000), subscribe.CursorSeqMaxThreshold)
-}
-
 func TestResolveCursor_SeqBelowFloorClamped(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

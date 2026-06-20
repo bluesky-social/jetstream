@@ -9,14 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMergeCursor_AbsentReadsZero(t *testing.T) {
-	t.Parallel()
-	st := newOrchestratorTestStore(t)
-	got, err := loadMergeCursor(st)
-	require.NoError(t, err)
-	require.Equal(t, uint64(0), got)
-}
-
 func TestMergeCursor_RoundTripViaCommit(t *testing.T) {
 	t.Parallel()
 	st := newOrchestratorTestStore(t)

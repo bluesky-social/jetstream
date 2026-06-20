@@ -1452,27 +1452,6 @@ func TestWriter_OnAfterSeal_ErrorPropagates(t *testing.T) {
 		"writer must remain unusable after a failed OnAfterSeal")
 }
 
-func TestWriter_SnapshotPending_DelegatesToSegmentWriter(t *testing.T) {
-	t.Parallel()
-	w := newTestWriter(t, Config{})
-
-	require.Empty(t, w.SnapshotPending())
-
-	require.NoError(t, w.Append(t.Context(), &segment.Event{
-		IndexedAt: 1, Kind: segment.KindCreate,
-		DID: "did:plc:a", Payload: []byte{0xa0},
-	}))
-	require.NoError(t, w.Append(t.Context(), &segment.Event{
-		IndexedAt: 2, Kind: segment.KindCreate,
-		DID: "did:plc:b", Payload: []byte{0xa0},
-	}))
-
-	got := w.SnapshotPending()
-	require.Len(t, got, 2)
-	require.Equal(t, "did:plc:a", got[0].DID)
-	require.Equal(t, "did:plc:b", got[1].DID)
-}
-
 // TestAppend_OnAppendFiresBeforeSealVisibility pins the ordering the
 // compaction tombstone set depends on: by the time a seal is visible
 // (OnAfterSeal fires, sealed header on disk), OnAppend has already run

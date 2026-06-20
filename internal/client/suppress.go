@@ -27,11 +27,6 @@ import (
 type Suppressor struct {
 	mu   sync.RWMutex
 	snap tombstone.Snapshot
-
-	// watermark (W) and maxSeq (M) from the overlay the suppressor was seeded
-	// with. M is the live-tail cutover floor for tombstone coverage.
-	watermark uint64
-	maxSeq    uint64
 }
 
 // NewSuppressor returns an empty Suppressor (no rows suppressed). Seed it with
@@ -45,16 +40,6 @@ func emptySnapshot() tombstone.Snapshot {
 		Records: make(map[tombstone.RecordKey]uint64),
 		DIDs:    make(map[string]tombstone.DIDTombstone),
 	}
-}
-
-// OverlayCoverage reports the (W, M] window the seeded overlay covers. M is
-// the highest seq folded into the tombstone set (including the active,
-// unsealed segment), which the engine uses to reason about the live-tail
-// tombstone handoff. Valid only after SeedFromOverlay.
-func (s *Suppressor) OverlayCoverage() (w, m uint64) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.watermark, s.maxSeq
 }
 
 // SeedFromOverlay fetches the current getTombstones blob, decodes it, and
@@ -72,8 +57,6 @@ func (s *Suppressor) SeedFromOverlay(ctx context.Context, xc *xrpc.Client) (w, m
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.snap = ensureSnapshotMaps(snap)
-	s.watermark = w
-	s.maxSeq = m
 	return w, m, nil
 }
 

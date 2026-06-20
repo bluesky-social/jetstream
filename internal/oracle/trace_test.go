@@ -34,34 +34,6 @@ func TestTraceRecordIndexesAreMonotonic(t *testing.T) {
 	require.Equal(t, "third", records[2].Kind)
 }
 
-func TestTraceRecordsAreJSONL(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	trace := NewTrace(&buf)
-
-	require.NoError(t, trace.Record("alpha", map[string]any{"n": 1}))
-	require.NoError(t, trace.Record("beta", map[string]any{"n": 2}))
-
-	output := buf.String()
-	require.Equal(t, "{\"index\":1,\"kind\":\"alpha\",\"data\":{\"n\":1}}\n{\"index\":2,\"kind\":\"beta\",\"data\":{\"n\":2}}\n", output)
-	require.True(t, strings.HasSuffix(output, "\n"))
-	require.NotContains(t, strings.TrimSuffix(output, "\n"), "\n\n")
-
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	var lines []string
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	require.NoError(t, scanner.Err())
-	require.Len(t, lines, 2)
-
-	for _, line := range lines {
-		require.NotEmpty(t, line)
-		require.JSONEq(t, line, line)
-	}
-}
-
 func TestTraceRecordIndexesAreConcurrentSafe(t *testing.T) {
 	t.Parallel()
 

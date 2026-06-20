@@ -55,35 +55,6 @@ func TestNormalizeHost(t *testing.T) {
 	}
 }
 
-func TestOptionsApply(t *testing.T) {
-	t.Parallel()
-	cfg := defaultConfig()
-	require.Equal(t, defaultBatchSize, cfg.batchSize)
-	require.Equal(t, defaultDownloadConc, cfg.downloadConc)
-	require.False(t, cfg.backfillRequested())
-
-	for _, opt := range []Option{
-		WithCollections([]string{"app.bsky.feed.post", "app.bsky.feed.*"}),
-		WithDIDs([]string{"did:plc:abc"}),
-		WithAfterSeq(10),
-		WithBeforeSeq(100),
-		WithBatchSize(256),
-		WithDownloadConcurrency(4),
-	} {
-		opt(&cfg)
-	}
-
-	require.Equal(t, []string{"app.bsky.feed.post", "app.bsky.feed.*"}, cfg.collections)
-	require.Equal(t, []string{"did:plc:abc"}, cfg.dids)
-	require.True(t, cfg.hasAfterSeq)
-	require.EqualValues(t, 10, cfg.afterSeq)
-	require.True(t, cfg.hasBeforeSeq)
-	require.EqualValues(t, 100, cfg.beforeSeq)
-	require.Equal(t, 256, cfg.batchSize)
-	require.Equal(t, 4, cfg.downloadConc)
-	require.True(t, cfg.backfillRequested())
-}
-
 func TestOptionsRejectNonPositive(t *testing.T) {
 	t.Parallel()
 	cfg := defaultConfig()

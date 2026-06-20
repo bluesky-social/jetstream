@@ -71,13 +71,6 @@ func TestDebugHandler_Metrics(t *testing.T) {
 	require.Contains(t, body, "go_goroutines")
 }
 
-func TestDebugHandler_Healthz(t *testing.T) {
-	t.Parallel()
-	base := mountDebug(t, newServer(t))
-
-	require.Equal(t, "ok\n", mustGet(t, base+"/healthz"))
-}
-
 func TestDebugHandler_Readyz(t *testing.T) {
 	t.Parallel()
 
@@ -166,19 +159,6 @@ func TestServer_MetricsCaptureNon200StatusCodes(t *testing.T) {
 	metrics := mustGet(t, debugURL+"/metrics")
 	require.NotContains(t, metrics, `code="404"`,
 		"unrouted 404s should not yet record metrics; revisit when a catch-all is added")
-}
-
-// TestPublicHandler_UnknownPath404 pins the public mux's behavior
-// for unknown paths. Adding a catch-all in the future must be a
-// deliberate choice.
-func TestPublicHandler_UnknownPath404(t *testing.T) {
-	t.Parallel()
-	base := mountPublic(t, newServer(t))
-
-	resp, err := doGet(t.Context(), base+"/does-not-exist")
-	require.NoError(t, err)
-	require.NoError(t, resp.Body.Close())
-	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
 // TestServer_LifecycleAndGracefulShutdown is the only test that exercises

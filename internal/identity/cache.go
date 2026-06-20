@@ -25,7 +25,7 @@ const DefaultTTL = 24 * time.Hour
 //
 // Expiry is stored as a uint64 unix-nano timestamp, decoded as int64
 // for time.Unix arithmetic. This silently wraps around year 2262;
-// in practice ttl is bounded (DefaultTTL = 6h) so the wrap is
+// in practice ttl is bounded (DefaultTTL = 24h) so the wrap is
 // unreachable, but a hypothetical "pre-set far-future entry" caller
 // would need to either bound the input or switch to a wider format.
 const expiryHeaderLen = 8

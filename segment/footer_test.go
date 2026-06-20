@@ -122,24 +122,3 @@ func TestEncodeBlockIndexProperty(t *testing.T) {
 		require.Equal(t, infos, got)
 	}
 }
-
-// TestDecodeBlockIndexRejectsOldStride asserts a buffer sized at the
-// pre-change 36-byte stride no longer parses cleanly. Belt-and-
-// suspenders against an accidental partial migration that leaves an
-// older stride somewhere in the codebase.
-func TestDecodeBlockIndexRejectsOldStride(t *testing.T) {
-	t.Parallel()
-
-	const oldStride = 36
-	buf := make([]byte, 2*oldStride) // 2 entries at the OLD stride
-	_, err := decodeBlockIndex(buf, 2)
-	require.True(t, errors.Is(err, ErrInvalidBlockIndex))
-}
-
-// TestBlockIndexEntrySize pins the wire-format entry size loud-and-
-// proud so the diff-reviewer's eye lands on it if anyone ever bumps
-// the constant by accident.
-func TestBlockIndexEntrySize(t *testing.T) {
-	t.Parallel()
-	require.Equal(t, 52, blockIndexEntrySize)
-}

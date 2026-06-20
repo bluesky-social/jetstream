@@ -128,9 +128,3 @@ func TestCache_UndecodableJSONTreatedAsMiss(t *testing.T) {
 	require.False(t, ok, "undecodable JSON must surface as a cache miss")
 	require.Nil(t, got)
 }
-
-// TestCache_ImplementsInterface is a compile-time check.
-func TestCache_ImplementsInterface(t *testing.T) {
-	t.Parallel()
-	var _ identity.Cache = (*PebbleCache)(nil)
-}

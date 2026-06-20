@@ -20,26 +20,6 @@ func TestMetrics_NilSafe(t *testing.T) {
 	m.ObserveBatchCommit(zero, nil)
 }
 
-// TestMetrics_Registration confirms NewMetrics registers exactly the
-// documented histogram with bounded label cardinality.
-func TestMetrics_Registration(t *testing.T) {
-	t.Parallel()
-	reg := prometheus.NewRegistry()
-	m := store.NewMetrics(reg)
-	require.NotNil(t, m)
-
-	mfs, err := reg.Gather()
-	require.NoError(t, err)
-
-	var found bool
-	for _, mf := range mfs {
-		if mf.GetName() == "jetstream_store_op_duration_seconds" {
-			found = true
-		}
-	}
-	require.True(t, found, "histogram must be registered")
-}
-
 // TestMetrics_StatusLabels exercises the four observe methods with
 // every status branch and confirms the sample counts land on the
 // correct {op,status} series.

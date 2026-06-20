@@ -68,7 +68,6 @@ func serveCommand() *cli.Command {
 			&cli.FloatFlag{Name: "commits-per-sec", Usage: "Mean live event rate", Sources: cli.EnvVars("JETSTREAM_SIM_COMMITS_PER_SEC"), Value: 10},
 			&cli.FloatFlag{Name: "traffic-rate-multiplier", Usage: "Scales commits-per-sec without touching distribution shape", Sources: cli.EnvVars("JETSTREAM_SIM_TRAFFIC_RATE_MULTIPLIER"), Value: 1},
 			&cli.IntFlag{Name: "firehose-history", Usage: "Ring-buffered events for cursor replay", Sources: cli.EnvVars("JETSTREAM_SIM_FIREHOSE_HISTORY"), Value: 10000},
-			&cli.IntFlag{Name: "repo-cache", Usage: "LRU size for in-memory repo reconstruction", Sources: cli.EnvVars("JETSTREAM_SIM_REPO_CACHE"), Value: 512},
 			&cli.StringFlag{Name: "public-url", Usage: "Externally-reachable base URL (advertised in DID docs); empty derives from --addr", Sources: cli.EnvVars("JETSTREAM_SIM_PUBLIC_URL"), Value: ""},
 			&cli.DurationFlag{Name: "shutdown-timeout", Usage: "Maximum graceful-shutdown time", Value: 30 * time.Second},
 		},
@@ -93,7 +92,6 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		CommitsPerSec:   cmd.Float("commits-per-sec"),
 		RateMultiplier:  cmd.Float("traffic-rate-multiplier"),
 		FirehoseHistory: cmd.Int("firehose-history"),
-		RepoCacheSize:   cmd.Int("repo-cache"),
 	}
 
 	w, err := world.New(ctx, cfg)

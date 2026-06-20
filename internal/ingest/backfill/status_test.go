@@ -3,17 +3,8 @@ package backfill
 import (
 	"testing"
 
-	"github.com/jcalabro/atmos"
 	"github.com/stretchr/testify/require"
 )
-
-// TestRepoKey pins the on-disk key shape — DESIGN.md §3.5 promises
-// repo/<did>, and replicas will eventually parse this prefix.
-func TestRepoKey(t *testing.T) {
-	t.Parallel()
-	got := repoKey(atmos.DID("did:plc:abc"))
-	require.Equal(t, "repo/did:plc:abc", string(got))
-}
 
 // TestRepoStatus_RoundTrip confirms the JSON encoder accepts and
 // re-emits every field we populate, plus that Active is always

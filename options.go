@@ -11,18 +11,17 @@ type Option func(*config)
 // config is the resolved, validated client configuration. It is private:
 // callers build it exclusively through Option values.
 type config struct {
-	collections   []string
-	dids          []string
-	hasAfterSeq   bool
-	afterSeq      uint64
-	hasBeforeSeq  bool
-	beforeSeq     uint64
-	backfillOnly  bool
-	hasLiveCursor bool
-	liveCursor    uint64
-	batchSize     int
-	downloadConc  int
-	liveBuffer    LiveBuffer
+	collections  []string
+	dids         []string
+	hasAfterSeq  bool
+	afterSeq     uint64
+	hasBeforeSeq bool
+	beforeSeq    uint64
+	backfillOnly bool
+	liveCursor   uint64
+	batchSize    int
+	downloadConc int
+	liveBuffer   LiveBuffer
 	// httpClient is a caller override. nil is the sentinel for "unset":
 	// the engine then builds its own per-workload jttp clients
 	// (xrpc.ATProtoOpts for XRPC, xrpc.BulkDownloadOpts for bulk
@@ -103,7 +102,6 @@ func WithBackfillOnly() Option {
 // backfill path computes its own live cutover cursor.
 func WithLiveCursor(seq uint64) Option {
 	return func(c *config) {
-		c.hasLiveCursor = true
 		c.liveCursor = seq
 	}
 }

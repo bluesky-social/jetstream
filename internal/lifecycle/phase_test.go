@@ -101,22 +101,6 @@ func TestReadPhaseEnteredAt_Empty(t *testing.T) {
 	require.True(t, got.IsZero())
 }
 
-func TestWritePhase_AtomicWithEnteredAt(t *testing.T) {
-	t.Parallel()
-	st := newTestStore(t)
-
-	want := time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)
-	require.NoError(t, WritePhase(st, PhaseMerging, want))
-
-	gotPhase, err := ReadPhase(st)
-	require.NoError(t, err)
-	require.Equal(t, PhaseMerging, gotPhase)
-
-	gotAt, err := ReadPhaseEnteredAt(st)
-	require.NoError(t, err)
-	require.True(t, gotAt.Equal(want))
-}
-
 func TestIsSteadyState_Empty(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)

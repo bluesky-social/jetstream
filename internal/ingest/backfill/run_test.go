@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
@@ -114,34 +113,15 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-func TestConfig_CrashInjectorField(t *testing.T) {
-	t.Parallel()
-
-	cfg := Config{CrashInjector: stubCrashInjector{}}
-	require.NotNil(t, cfg.CrashInjector)
-}
-
-type stubCrashInjector struct{}
-
-func (stubCrashInjector) SimulateCrash(context.Context, crashpoint.Point) error {
-	return nil
-}
-
 // stubResolver is a fixed-document Resolver. It maps DID -> document
 // and never hits the network, mirroring atmos's own test pattern in
 // backfill_test.go. We need it because the production resolver talks
 // to plc.directory; the test environment has no PLC.
 type stubResolver struct {
-	docs         map[atmos.DID]*identity.DIDDocument
-	onResolveDID func(context.Context, atmos.DID) error
+	docs map[atmos.DID]*identity.DIDDocument
 }
 
-func (r *stubResolver) ResolveDID(ctx context.Context, did atmos.DID) (*identity.DIDDocument, error) {
-	if r.onResolveDID != nil {
-		if err := r.onResolveDID(ctx, did); err != nil {
-			return nil, err
-		}
-	}
+func (r *stubResolver) ResolveDID(_ context.Context, did atmos.DID) (*identity.DIDDocument, error) {
 	doc, ok := r.docs[did]
 	if !ok {
 		return nil, identity.ErrDIDNotFound
@@ -403,7 +383,7 @@ func (s *stubServer) eventIndex(event string, n int) int {
 // the integration entry point for our run_test.go.
 func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.Store) error {
 	t.Helper()
-	return runWithStubResolverAndRepos(t, ctx, srv, db, nil, nil)
+	return runWithStubResolverAndRepos(t, ctx, srv, db, nil)
 }
 
 func runWithStubRepos(
@@ -414,7 +394,7 @@ func runWithStubRepos(
 	repos []atmos.DID,
 ) error {
 	t.Helper()
-	return runWithStubResolverAndRepos(t, ctx, srv, db, nil, repos)
+	return runWithStubResolverAndRepos(t, ctx, srv, db, repos)
 }
 
 func runWithStubResolverAndRepos(
@@ -422,7 +402,6 @@ func runWithStubResolverAndRepos(
 	ctx context.Context,
 	srv *stubServer,
 	db *store.Store,
-	onResolveDID func(context.Context, atmos.DID) error,
 	repos []atmos.DID,
 ) error {
 	t.Helper()
@@ -439,7 +418,7 @@ func runWithStubResolverAndRepos(
 			},
 		}
 	}
-	dir := &identity.Directory{Resolver: &stubResolver{docs: docs, onResolveDID: onResolveDID}}
+	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	segDir := filepath.Join(t.TempDir(), "segments")

@@ -161,10 +161,8 @@ func TestDirectoryWithRecordingResolver_DoesNotMutateOriginalDirectory(t *testin
 }
 
 type fakeResolver struct {
-	doc              *identity.DIDDocument
-	err              error
-	resolveHandleDID atmos.DID
-	resolveHandleErr error
+	doc *identity.DIDDocument
+	err error
 }
 
 var _ identity.Resolver = (*fakeResolver)(nil)
@@ -177,10 +175,7 @@ func (r *fakeResolver) ResolveDID(_ context.Context, _ atmos.DID) (*identity.DID
 }
 
 func (r *fakeResolver) ResolveHandle(_ context.Context, _ atmos.Handle) (atmos.DID, error) {
-	if r.resolveHandleErr != nil {
-		return "", r.resolveHandleErr
-	}
-	return r.resolveHandleDID, nil
+	return "", identity.ErrHandleNotFound
 }
 
 type fakeIdentityCache struct{}

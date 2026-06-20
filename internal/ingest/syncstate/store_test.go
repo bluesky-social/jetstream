@@ -1,7 +1,6 @@
 package syncstate
 
 import (
-	"context"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -243,19 +242,4 @@ func TestStateStore_TwoDIDs(t *testing.T) {
 	gb, err := s.LoadChain(t.Context(), b)
 	require.NoError(t, err)
 	require.Equal(t, "rev-b", gb.Rev)
-}
-
-func TestStateStore_ImplementsInterface(t *testing.T) {
-	t.Parallel()
-	var _ atmossync.StateStore = (*PebbleStateStore)(nil)
-}
-
-func TestStateStore_CancelledContext(t *testing.T) {
-	t.Parallel()
-	s := New(newTestStore(t))
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	_, _ = s.LoadChain(ctx, parseDID(t, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"))
 }

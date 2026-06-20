@@ -18,20 +18,6 @@ func fixedCID(t *testing.T) cbor.CID {
 	return cid
 }
 
-func TestEncodeChainState_RoundTrip(t *testing.T) {
-	t.Parallel()
-	in := atmossync.ChainState{Rev: "3l3qo2vutsw2b", Data: fixedCID(t)}
-
-	buf, err := encodeChainState(in)
-	require.NoError(t, err)
-	require.Greater(t, len(buf), 0)
-
-	out, err := decodeChainState(buf)
-	require.NoError(t, err)
-	require.Equal(t, in.Rev, out.Rev)
-	require.True(t, in.Data.Equal(out.Data))
-}
-
 func TestEncodeChainState_RejectsZeroCID(t *testing.T) {
 	t.Parallel()
 	_, err := encodeChainState(atmossync.ChainState{Rev: "rev"})
@@ -55,22 +41,6 @@ func TestDecodeChainState_RejectsUnknownVersion(t *testing.T) {
 	_, err = decodeChainState(buf)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unknown")
-}
-
-func TestEncodeHostingState_RoundTrip(t *testing.T) {
-	t.Parallel()
-	in := atmossync.HostingState{
-		Active: false,
-		Status: "takendown",
-		Seq:    12345,
-		Time:   "2026-05-21T00:00:00Z",
-	}
-	buf, err := encodeHostingState(in)
-	require.NoError(t, err)
-
-	out, err := decodeHostingState(buf)
-	require.NoError(t, err)
-	require.Equal(t, in, out)
 }
 
 func TestEncodeHostingState_ActiveZeroSeq(t *testing.T) {

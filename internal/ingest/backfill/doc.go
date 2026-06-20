@@ -8,6 +8,6 @@
 // and downloads any DID not already at StatusComplete. Restart-resume
 // falls out of that model — completed rows are skipped on Lookup.
 //
-// This package does not write segment files. Handler.HandleRepo is
-// a no-op that logs and counts; the segment writer wires in later.
+// SegmentHandler.HandleRepo walks the downloaded repo's MST and emits one
+// segment.KindCreate event per record into the shared segment writer.
 package backfill
