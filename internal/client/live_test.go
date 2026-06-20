@@ -144,7 +144,7 @@ func TestLiveConsumerDeliversSeqZero(t *testing.T) {
 	}}
 	dial, _ := scriptedDialer(conn)
 
-	// cursor=0, no explicitCursor: pure live-from-tip start.
+	// None cursor: pure live-from-tip start.
 	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial}, 2)
 	require.Equal(t, []uint64{0, 1}, seqs(events), "seq 0 must not be swallowed by the zero-initialized dedup cursor")
 }
@@ -270,7 +270,7 @@ func capturingDialer(urls *[]string, mu *sync.Mutex, conns ...*scriptedConn) dia
 // the disconnect window. The reconnect must request cursor=<highest delivered>.
 func TestLiveConsumerReconnectResumesFromLastSeq(t *testing.T) {
 	t.Parallel()
-	// Live-from-tip start (cursor=0): first session delivers 1,2,3 then errors.
+	// Live-from-tip start (None cursor): first session delivers 1,2,3 then errors.
 	first := &scriptedConn{steps: []readStep{
 		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)},
 		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "c", "r2", true)},
