@@ -37,8 +37,11 @@ type dialFunc func(ctx context.Context, url string) (wsConn, error)
 
 // liveConfig configures a liveConsumer.
 type liveConfig struct {
-	host   string // normalized base URL, e.g. "https://host"
-	cursor uint64 // resume point; the server delivers seq > cursor
+	host string // normalized base URL, e.g. "https://host"
+	// cursor is the initial resume point. The server replays inclusively (it
+	// delivers seq >= cursor; see internal/subscribe/replay.go); the consumer's
+	// own seq dedup turns that into the effective "> last delivered" on resume.
+	cursor uint64
 	// explicitCursor forces the cursor onto the wire even when it is 0. A bare
 	// cursor=0 (omitted param) is the "live from the current tip" sentinel; the
 	// backfill->live cutover sets this so a rewind start of 0 (sealed tip below
@@ -76,6 +79,13 @@ func (c liveConfig) maxBackoff() time.Duration {
 type liveConsumer struct {
 	cfg     liveConfig
 	lastSeq uint64 // highest seq delivered; the reconnect resume cursor
+	// haveLastSeq distinguishes "lastSeq holds a real delivered/resume seq" from
+	// "lastSeq is the zero default". The seq space is 0-based (a fresh archive
+	// assigns the first event seq 0), so lastSeq==0 is ambiguous: it can mean
+	// "nothing delivered yet" OR "seq 0 has been delivered/already-held". Without
+	// this flag the dedup (ev.Seq <= lastSeq) would unconditionally swallow the
+	// first-ever event (seq 0). Mirrors the afterSeq>0 gate from #111.
+	haveLastSeq bool
 }
 
 func newLiveConsumer(cfg liveConfig) *liveConsumer {
@@ -88,7 +98,12 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 	if cfg.logger == nil {
 		cfg.logger = slog.New(slog.NewTextHandler(discardWriter{}, nil))
 	}
-	return &liveConsumer{cfg: cfg, lastSeq: cfg.cursor}
+	// A non-zero resume cursor means the caller already holds events up to it, so
+	// seed lastSeq as an established resume point to dedup the at-least-once
+	// re-delivery of cursor itself. A zero cursor (live-from-tip, or the #112
+	// explicit replay-from-0 cutover) is NOT an established point: seq 0 has not
+	// been delivered, so it must pass the dedup.
+	return &liveConsumer{cfg: cfg, lastSeq: cfg.cursor, haveLastSeq: cfg.cursor > 0}
 }
 
 // Run tails the live stream until ctx is cancelled, invoking emit for each
@@ -162,11 +177,14 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, er
 			continue
 		}
 		// Deduplicate the at-least-once reconnect overlap: skip anything at or
-		// below the highest seq already delivered.
-		if ev.Seq <= c.lastSeq {
+		// below the highest seq already delivered. The haveLastSeq guard keeps
+		// this from swallowing the first-ever event (seq 0) on a from-tip /
+		// replay-from-0 start, where lastSeq==0 means "nothing delivered yet".
+		if c.haveLastSeq && ev.Seq <= c.lastSeq {
 			continue
 		}
 		c.lastSeq = ev.Seq
+		c.haveLastSeq = true
 		evCopy := ev
 		// Pass the raw frame too so the cutover buffer can persist verbatim
 		// bytes (re-decoded on replay) rather than re-marshal the decoded event.
@@ -187,11 +205,18 @@ func (c *liveConsumer) subscribeURL() string {
 	u.Path = "/subscribe-v2"
 	q := url.Values{}
 	q.Set("extended", "true")
-	// Send the cursor when it is non-zero, or when the caller explicitly wants a
-	// replay from seq 0 (cutover from a sub-margin sealed tip). A zero cursor
-	// without explicitCursor stays omitted = "live from tip". See #112.
-	if c.cfg.cursor > 0 || c.cfg.explicitCursor {
-		q.Set("cursor", strconv.FormatUint(c.cfg.cursor, 10))
+	// Resume from lastSeq (the highest seq delivered), not the immutable initial
+	// cursor: subscribeURL is rebuilt on every reconnect, and anchoring each new
+	// session at cfg.cursor would, on a live-from-tip stream, re-anchor at the
+	// reconnect-time tip and silently drop events produced while disconnected.
+	// Gate on haveLastSeq, not lastSeq>0: once seq 0 has been delivered we hold
+	// an established resume point (lastSeq==0) and MUST send cursor=0 so the
+	// reconnect resumes from 0 instead of re-anchoring at the tip. explicitCursor
+	// forces a replay-from-0 cutover (#112) onto the wire before any event has
+	// been delivered. A bare from-tip start (no event yet, no explicitCursor)
+	// stays omitted = "live from tip".
+	if c.haveLastSeq || c.cfg.explicitCursor {
+		q.Set("cursor", strconv.FormatUint(c.lastSeq, 10))
 	}
 	u.RawQuery = q.Encode()
 	return u.String()

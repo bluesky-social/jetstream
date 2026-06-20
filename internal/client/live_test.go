@@ -102,7 +102,18 @@ func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error
 			return true
 		})
 	}()
-	<-done
+	// Safety timeout: if the consumer never reaches wantEvents (e.g. a regression
+	// silently drops an event), cancel and return what we have so the caller's
+	// assertion fails legibly instead of the goroutine blocking until go test's
+	// package-level panic.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-done
+	}
+	mu.Lock()
+	defer mu.Unlock()
 	return events, errs
 }
 
@@ -117,6 +128,53 @@ func TestLiveConsumerDeliversInOrder(t *testing.T) {
 
 	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial}, 3)
 	require.Equal(t, []uint64{1, 2, 3}, seqs(events))
+}
+
+// TestLiveConsumerDeliversSeqZero guards against the 0-based-seq-space drop
+// (the live analog of #111): the seq space starts at 0, so a from-tip stream
+// against a fresh archive can legitimately deliver seq 0 as its first event.
+// The dedup must not treat the zero-initialized lastSeq as "already delivered
+// seq 0" and swallow it.
+func TestLiveConsumerDeliversSeqZero(t *testing.T) {
+	t.Parallel()
+	conn := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 0, "did:plc:a", "create", "c", "r0", true)},
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)},
+	}}
+	dial, _ := scriptedDialer(conn)
+
+	// cursor=0, no explicitCursor: pure live-from-tip start.
+	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial}, 2)
+	require.Equal(t, []uint64{0, 1}, seqs(events), "seq 0 must not be swallowed by the zero-initialized dedup cursor")
+}
+
+// TestLiveConsumerReconnectResumesFromSeqZero pins the interaction between the
+// seq-0 fix and the reconnect-resume fix: after delivering seq 0 on a from-tip
+// stream, a reconnect must resume from cursor=0 (an established resume point),
+// NOT re-anchor at the tip by omitting the cursor.
+func TestLiveConsumerReconnectResumesFromSeqZero(t *testing.T) {
+	t.Parallel()
+	first := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 0, "did:plc:a", "create", "c", "r0", true)},
+		{err: errors.New("connection reset")},
+	}}
+	second := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)},
+	}}
+	var (
+		mu   sync.Mutex
+		urls []string
+	)
+	dial := capturingDialer(&urls, &mu, first, second)
+
+	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial}, 2)
+	require.Equal(t, []uint64{0, 1}, seqs(events))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(urls), 2, "must have reconnected")
+	require.NotContains(t, urls[0], "cursor=", "initial from-tip dial omits cursor; got %s", urls[0])
+	require.Contains(t, urls[1], "cursor=0", "reconnect after delivering seq 0 must resume from cursor=0, not re-anchor at tip; got %s", urls[1])
 }
 
 func TestLiveConsumerDedupsReconnectOverlap(t *testing.T) {
@@ -190,6 +248,55 @@ func TestLiveConsumerSubscribeURLExplicitCursorZero(t *testing.T) {
 	// Pure-live (no explicit cursor) keeps the "0 = tip" sentinel.
 	c2 := newLiveConsumer(liveConfig{host: "https://h"})
 	require.NotContains(t, c2.subscribeURL(), "cursor=", "pure-live cursor 0 must remain tip")
+}
+
+// capturingDialer wraps scriptedDialer to record the URL requested on each
+// dial, so a test can assert that reconnects advance the resume cursor.
+func capturingDialer(urls *[]string, mu *sync.Mutex, conns ...*scriptedConn) dialFunc {
+	inner, _ := scriptedDialer(conns...)
+	return func(ctx context.Context, u string) (wsConn, error) {
+		mu.Lock()
+		*urls = append(*urls, u)
+		mu.Unlock()
+		return inner(ctx, u)
+	}
+}
+
+// TestLiveConsumerReconnectResumesFromLastSeq guards against a regression where
+// reconnects rebuilt the subscribe URL from the immutable initial cursor rather
+// than from lastSeq. On a live-from-tip stream (cursor=0) that would re-anchor
+// each reconnect at the new tip and silently drop the events produced during
+// the disconnect window. The reconnect must request cursor=<highest delivered>.
+func TestLiveConsumerReconnectResumesFromLastSeq(t *testing.T) {
+	t.Parallel()
+	// Live-from-tip start (cursor=0): first session delivers 1,2,3 then errors.
+	first := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)},
+		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "c", "r2", true)},
+		{data: liveCommitFrame(t, 3, "did:plc:a", "create", "c", "r3", true)},
+		{err: errors.New("connection reset")},
+	}}
+	second := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 4, "did:plc:a", "create", "c", "r4", true)},
+	}}
+
+	var (
+		mu   sync.Mutex
+		urls []string
+	)
+	dial := capturingDialer(&urls, &mu, first, second)
+
+	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial}, 4)
+	require.Equal(t, []uint64{1, 2, 3, 4}, seqs(events))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(urls), 2, "must have reconnected")
+	// First dial is live-from-tip: no cursor.
+	require.NotContains(t, urls[0], "cursor=", "initial live-from-tip dial must omit cursor; got %s", urls[0])
+	// The reconnect must resume from the highest seq delivered (3), not re-anchor
+	// at the tip (which would omit the cursor and drop events during downtime).
+	require.Contains(t, urls[1], "cursor=3", "reconnect must resume from lastSeq; got %s", urls[1])
 }
 
 func TestLiveConsumerContextCancelCleanStop(t *testing.T) {
