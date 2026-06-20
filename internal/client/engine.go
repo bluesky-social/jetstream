@@ -284,11 +284,16 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	liveCtx, stopLive := context.WithCancel(ctx)
 	defer stopLive()
 	consumer := newLiveConsumer(liveConfig{
-		host:       e.cfg.Host,
-		cursor:     liveStart,
-		dial:       e.cfg.Dial,
-		logger:     e.logger,
-		backoffMin: e.cfg.LiveBackoffMin,
+		host:   e.cfg.Host,
+		cursor: liveStart,
+		// The cutover always means "replay from liveStart", including liveStart=0
+		// (sealed tip below the rewind margin). Force the cursor onto the wire so
+		// a 0 start replays from the beginning rather than anchoring at the live
+		// tip and dropping the (plannedThroughSeq, tip] band. See #112.
+		explicitCursor: true,
+		dial:           e.cfg.Dial,
+		logger:         e.logger,
+		backoffMin:     e.cfg.LiveBackoffMin,
 	})
 	var liveWG sync.WaitGroup
 	liveWG.Go(func() {

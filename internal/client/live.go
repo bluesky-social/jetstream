@@ -37,11 +37,17 @@ type dialFunc func(ctx context.Context, url string) (wsConn, error)
 
 // liveConfig configures a liveConsumer.
 type liveConfig struct {
-	host      string // normalized base URL, e.g. "https://host"
-	cursor    uint64 // resume point; the server delivers seq > cursor
-	readLimit int64
-	dial      dialFunc
-	logger    *slog.Logger
+	host   string // normalized base URL, e.g. "https://host"
+	cursor uint64 // resume point; the server delivers seq > cursor
+	// explicitCursor forces the cursor onto the wire even when it is 0. A bare
+	// cursor=0 (omitted param) is the "live from the current tip" sentinel; the
+	// backfill->live cutover sets this so a rewind start of 0 (sealed tip below
+	// the rewind margin) REPLAYS from seq 0 instead of anchoring at the tip and
+	// dropping the (plannedThroughSeq, tip] band. See #112.
+	explicitCursor bool
+	readLimit      int64
+	dial           dialFunc
+	logger         *slog.Logger
 	// backoffMin/backoffMax override the reconnect backoff bounds. Zero uses
 	// the package defaults. Tests set tiny values to avoid real-time waits.
 	backoffMin time.Duration
@@ -181,7 +187,10 @@ func (c *liveConsumer) subscribeURL() string {
 	u.Path = "/subscribe-v2"
 	q := url.Values{}
 	q.Set("extended", "true")
-	if c.cfg.cursor > 0 {
+	// Send the cursor when it is non-zero, or when the caller explicitly wants a
+	// replay from seq 0 (cutover from a sub-margin sealed tip). A zero cursor
+	// without explicitCursor stays omitted = "live from tip". See #112.
+	if c.cfg.cursor > 0 || c.cfg.explicitCursor {
 		q.Set("cursor", strconv.FormatUint(c.cfg.cursor, 10))
 	}
 	u.RawQuery = q.Encode()

@@ -175,6 +175,23 @@ func TestLiveConsumerSubscribeURL(t *testing.T) {
 	require.NotContains(t, u2, "cursor=", "no cursor when zero")
 }
 
+// TestLiveConsumerSubscribeURLExplicitCursorZero guards #112: a backfill->live
+// cutover whose rewind start lands at seq 0 (sealed tip below the rewind
+// margin) must REPLAY from seq 0, not live-tail from the tip. A bare cursor=0
+// is the "live from tip" sentinel, so the cutover sets explicitCursor to force
+// cursor=0 onto the wire, which the server resolves as a seq replay from the
+// start. Without this, the entire (plannedThroughSeq, tip] band is dropped.
+func TestLiveConsumerSubscribeURLExplicitCursorZero(t *testing.T) {
+	t.Parallel()
+	c := newLiveConsumer(liveConfig{host: "https://h", explicitCursor: true})
+	u := c.subscribeURL()
+	require.Contains(t, u, "cursor=0", "explicit cursor must send cursor=0 for a replay from the start; got %s", u)
+
+	// Pure-live (no explicit cursor) keeps the "0 = tip" sentinel.
+	c2 := newLiveConsumer(liveConfig{host: "https://h"})
+	require.NotContains(t, c2.subscribeURL(), "cursor=", "pure-live cursor 0 must remain tip")
+}
+
 func TestLiveConsumerContextCancelCleanStop(t *testing.T) {
 	t.Parallel()
 	conn := &scriptedConn{steps: []readStep{
