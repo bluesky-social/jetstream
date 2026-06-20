@@ -132,6 +132,32 @@ func CompareEventLogMultiset(want, got []EventLogRow) error {
 	return CompareEventLogs(wantSorted, gotSorted)
 }
 
+// CompareEventLogCoverage asserts at-least-once coverage: every row in want
+// appears at least once in got, ignoring order. Extra rows in got (including
+// duplicates) are tolerated — this honors jetstream's at-least-once delivery
+// contract (docs/README.md:156), under which the durable stream may legitimately
+// re-deliver an event (e.g. a merge re-run across a crash boundary re-stamps and
+// re-appends rows). It is sensitive to LOSS (a missing expected row) and blind to
+// duplication; spurious-duplication classes are covered elsewhere (final-state
+// Compare, CheckInvariants' unique-seq guard). Coverage matches on the full row
+// key (kind+did+collection+rkey+rev+payload-hash, but NOT seq), so it is
+// seq-space-agnostic: callers should zero the Seq field on both sides (the on-disk
+// jetstream-seq is not comparable to a model-derived expectation). Returns an error
+// naming the first uncovered expected row.
+func CompareEventLogCoverage(want, got []EventLogRow) error {
+	present := make(map[EventLogRow]struct{}, len(got))
+	for _, row := range got {
+		present[row] = struct{}{}
+	}
+	for _, row := range want {
+		if _, ok := present[row]; ok {
+			continue
+		}
+		return fmt.Errorf("oracle: event-log coverage gap: expected durable row not found on disk: %s", row.describe())
+	}
+	return nil
+}
+
 // CompareEventLogsCompacted compares against got after dropping the expected
 // rows that compaction would have removed at or below watermark, so the
 // expected log matches a compacted segment stream.

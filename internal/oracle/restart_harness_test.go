@@ -71,7 +71,7 @@ func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := Config{
 				Mode:                "restart",
-				Seed:                uint64(101 + i),
+				Seed:                restartSeed(i),
 				Accounts:            4,
 				MinInitialRecords:   1,
 				MaxInitialRecords:   4,
@@ -110,7 +110,7 @@ func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 				"current_seq":         w.CurrentSeq(),
 			})
 
-			srv := newRestartServer(t, w)
+			srv := newRestartServer(t, w, nil)
 			defer srv.Close()
 
 			dataDir := t.TempDir()
@@ -148,6 +148,92 @@ func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 			recordTraceOrError(t, trace, "phase", map[string]any{"phase": "restart-final-assertions", "marker": "done"})
 		})
 	}
+}
+
+// restartSeed returns the seed for restart case i. It honors
+// JETSTREAM_ORACLE_SEED (so the nightly sweep can vary it), defaulting to
+// the historical 101+i for push CI so that remains fixed and
+// reproducible. When the env seed is set, cases are offset from it so
+// they don't all collide on one seed.
+func restartSeed(i int) uint64 {
+	if v, ok := os.LookupEnv(envOracleSeed); ok && v != "" {
+		var base uint64
+		if err := parseUint64Env(func(string) (string, bool) { return v, true }, envOracleSeed, &base); err == nil {
+			return base + uint64(i)
+		}
+	}
+	return uint64(101 + i)
+}
+
+// TestOracle_RestartChainDurableIntermediates_Baseline is the Group 0
+// no-crash baseline (plan §7 step 0e): it proves the getRepo-served timing
+// signal lands a seed-derived create/update/delete chain durably on disk
+// THROUGH the merge, and that the three post-restart assertions
+// (coverage, compaction contract, no-permanent-tombstone) pass when
+// nothing is lost. It runs the child to a clean exit at the after-merge
+// barrier — NO crash — so any assertion failure is a real mechanism
+// defect, not crash-recovery noise. Every later per-shape crash test
+// depends on this baseline holding.
+//
+// nolint:paralleltest
+func TestOracle_RestartChainDurableIntermediates_Baseline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping restart oracle under -short")
+	}
+
+	cfg := Config{
+		Mode:                "restart",
+		Seed:                restartSeed(0),
+		Accounts:            4,
+		MinInitialRecords:   1,
+		MaxInitialRecords:   4,
+		LiveEventsBootstrap: 4,
+		LiveEventsSteady:    4,
+	}
+	trace, _, closeTrace := newOracleTrace(t, "restart-chain-baseline.jsonl")
+	defer closeTrace()
+
+	spec := deriveChainSpec(cfg.Seed, cfg.Accounts)
+	recordTraceOrError(t, trace, "run_start", map[string]any{
+		"mode":          cfg.Mode,
+		"seed":          cfg.Seed,
+		"go_version":    runtime.Version(),
+		"gomaxprocs":    runtime.GOMAXPROCS(0),
+		"accounts":      cfg.Accounts,
+		"case":          "chain-baseline",
+		"chain_did_idx": spec.chainAccountIdx(),
+		"chain_records": len(spec.records),
+	})
+
+	w := newRestartWorld(t, cfg)
+	defer func() { require.NoError(t, w.Close()) }()
+
+	coord := newChainCoordinator(t, w, spec)
+	srv := newRestartServer(t, w, coord.onGetRepoServed)
+	defer srv.Close()
+
+	dataDir := t.TempDir()
+	markersDir := t.TempDir()
+	mergeDonePath := filepath.Join(markersDir, "after-merge")
+
+	child := runRestartChild(t, restartChildArgs{
+		dataDir:       dataDir,
+		relayURL:      srv.URL,
+		mergeDonePath: mergeDonePath,
+		timeout:       30 * time.Second,
+		trace:         trace,
+		runLabel:      "baseline",
+	})
+	recordTraceOrError(t, trace, "restart_child_result", traceRestartChildResult("baseline", child))
+	require.NoError(t, child.err, "baseline child should exit cleanly\n%s", child.output)
+	require.FileExists(t, mergeDonePath, "baseline child must reach after-merge barrier before exiting")
+
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "chain-baseline-assertions", "marker": "begin"})
+	// Existing final-state check still holds.
+	assertOracleMatches(t, dataDir, w, cfg, "chain-baseline")
+	// New: the chain landed durably and all three new assertions pass.
+	assertChainDurable(t, dataDir, coord, "chain-baseline")
+	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "chain-baseline-assertions", "marker": "done"})
 }
 
 // nolint:paralleltest
@@ -286,7 +372,7 @@ func newRestartWorld(t *testing.T, cfg Config) *world.World {
 	return w
 }
 
-func newRestartServer(t *testing.T, w *world.World) *httptest.Server {
+func newRestartServer(t *testing.T, w *world.World, onGetRepoServed func(did string)) *httptest.Server {
 	t.Helper()
 
 	ln, err := new(net.ListenConfig).Listen(t.Context(), "tcp4", "127.0.0.1:0")
@@ -294,7 +380,9 @@ func newRestartServer(t *testing.T, w *world.World) *httptest.Server {
 
 	srv := httptest.NewUnstartedServer(nil)
 	srv.Listener = ln
-	srv.Config.Handler = simhttp.NewHandler(w, "http://"+ln.Addr().String())
+	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, "http://"+ln.Addr().String(), simhttp.HandlerOptions{
+		OnGetRepoServed: onGetRepoServed,
+	})
 	srv.Start()
 	return srv
 }
