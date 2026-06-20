@@ -252,6 +252,30 @@ func TestCompareEventLogsCompactedRejectsMissingRowBeforeNonDeletedAccountEvent(
 	require.ErrorContains(t, err, "seq=1")
 }
 
+func TestCompareEventLogsCompactedMultisetToleratesReorderingButCatchesOverDrop(t *testing.T) {
+	t.Parallel()
+
+	// Two records that both survive at the watermark (no superseding
+	// tombstone), plus one superseded create that compaction legitimately
+	// drops. pre is the pre-compaction stream; post is what a correct pass
+	// leaves behind, in a different block order.
+	createA := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "ra", Rev: "rev1", Payload: []byte("a")}
+	superseded := ObservedEvent{Seq: 2, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "rb", Rev: "rev1", Payload: []byte("b-old")}
+	updateB := ObservedEvent{Seq: 3, Kind: segment.KindUpdate, DID: "did:plc:a", Collection: "c", Rkey: "rb", Rev: "rev2", Payload: []byte("b-new")}
+
+	pre := NormalizeEventLog([]ObservedEvent{createA, superseded, updateB})
+	// Correct post: superseded create (seq 2) dropped; survivors reordered.
+	goodPost := NormalizeEventLog([]ObservedEvent{updateB, createA})
+	require.NoError(t, CompareEventLogsCompactedMultiset(pre, goodPost, 3),
+		"reordered survivors with the superseded row dropped must pass")
+
+	// Over-drop: the pass also wrongly dropped surviving createA (seq 1).
+	overDropped := NormalizeEventLog([]ObservedEvent{updateB})
+	err := CompareEventLogsCompactedMultiset(pre, overDropped, 3)
+	require.Error(t, err, "an over-dropped surviving row must be caught")
+	require.ErrorContains(t, err, "ra")
+}
+
 func TestCompareEventLogsCompactedRejectsUnjustifiedMissingCreate(t *testing.T) {
 	t.Parallel()
 

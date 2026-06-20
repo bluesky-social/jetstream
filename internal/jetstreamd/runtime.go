@@ -349,6 +349,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CompactionTombstoneCap:    opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers:  opts.CompactionRewriteWorkers,
 		OnCompactionPass:          onCompactionPass,
+		OnBeforeCompactionPass:    opts.OnBeforeCompactionPass,
 		BarrierAfterBootstrap:     phaseBarrier(opts.BarrierAfterBootstrap),
 		BarrierAfterMerge:         phaseBarrier(opts.BarrierAfterMerge),
 		AfterRepoComplete:         opts.AfterRepoComplete,

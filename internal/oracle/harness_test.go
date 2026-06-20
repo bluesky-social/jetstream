@@ -2,6 +2,7 @@ package oracle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -99,6 +100,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	lateOverlayDIDAck := newAccountTombstoneAck()
 	asyncResyncAck := newSyncTombstoneAck()
 	compaction := newCompactionPassRecorder()
+	overDrop := newCompactionOverDropRecorder(dataDir)
 	bootstrapEventLog := newEventLogRecorder()
 	steadyEventLog := newEventLogRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -163,7 +165,14 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		OverlayRebuildInterval:    10 * time.Millisecond,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
+		OnBeforeCompactionPass: func(targetWatermark uint64) {
+			overDrop.ObserveBefore(targetWatermark)
+		},
 		OnCompactionPass: func(result jetstreamd.CompactionPassResult) {
+			// Pair the post-rewrite snapshot with the pre-rewrite one before
+			// recording the pass, so the over-drop check sees a consistent
+			// before/after for this pass.
+			overDrop.ObserveAfter(result)
 			compaction.Observe(result)
 			recordTraceOrError(t, trace, "compaction_pass", map[string]any{
 				"watermark": result.Watermark,
@@ -334,6 +343,11 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	// Uses the blob captured above (server up) against the now-flushed
 	// durable segments.
 	assertOverlayReconstruction(t, dataDir, cfg, overlayW, overlayM, overlaySnap)
+	// Compaction over-drop / data-loss check (#100): every compaction pass
+	// must have preserved each row the documented filter says survives at its
+	// watermark. The runtime has exited, so all passes are captured and none
+	// can race this assertion.
+	overDrop.Assert(t, cfg, trace, "steady-state-shutdown-flush")
 
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "final-assertions", "marker": "done"})
 	assertTraceContainsKinds(t, tracePath,
@@ -352,6 +366,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"steady_target",
 		"shutdown_start",
 		"runtime_exit",
+		"compaction_over_drop_check",
 	)
 }
 
@@ -733,6 +748,141 @@ func (r *compactionPassRecorder) WaitAfter(t *testing.T, cfg Config, run *runtim
 		case <-tick.C:
 		}
 	}
+}
+
+// compactionOverDropPass holds the pre- and post-compaction sealed segment
+// streams for a single compaction pass that did real work, captured so the
+// harness can metamorphically prove the pass did not over-drop a surviving row
+// (issue #100 / oracle.md compaction invariant). Compaction is strictly
+// subtractive, so every row present before the pass that the documented
+// compaction filter says must SURVIVE at the watermark must still be present
+// after the pass; a missing survivor is a data-loss defect that final-state
+// convergence and the pre-compaction event-log tier cannot see.
+type compactionOverDropPass struct {
+	watermark uint64
+	pre       []EventLogRow
+	post      []EventLogRow
+}
+
+// compactionOverDropRecorder pairs the pre-rewrite and post-rewrite sealed
+// segment snapshots captured by the OnBeforeCompactionPass / OnCompactionPass
+// hooks. Both hooks fire serially on the compactor goroutine, so a single
+// pending slot pairs them 1:1; the hooks only read files and store rows, while
+// the verdict (a pure comparison plus require) runs on the test goroutine.
+type compactionOverDropRecorder struct {
+	dataDir string
+
+	mu          sync.Mutex
+	havePending bool
+	pendingW    uint64
+	pendingPre  []EventLogRow
+	scanErr     error
+	passes      []compactionOverDropPass
+}
+
+func newCompactionOverDropRecorder(dataDir string) *compactionOverDropRecorder {
+	return &compactionOverDropRecorder{dataDir: dataDir}
+}
+
+// ObserveBefore captures the pre-compaction sealed stream (rows with
+// seq <= targetWatermark). It fires after the active segment is force-rotated
+// and sealed but before any rewrite, so the snapshot is the complete stream the
+// pass is about to subtract from. Sealed-only and seq-bounded, so it does not
+// race the concurrent live writer appending rows above the watermark.
+func (r *compactionOverDropRecorder) ObserveBefore(targetWatermark uint64) {
+	rows, err := r.scanSealed(targetWatermark)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err != nil {
+		r.scanErr = errors.Join(r.scanErr, fmt.Errorf("pre-compaction scan watermark=%d: %w", targetWatermark, err))
+		return
+	}
+	r.havePending = true
+	r.pendingW = targetWatermark
+	r.pendingPre = rows
+}
+
+// ObserveAfter pairs the post-compaction sealed stream with the pending
+// pre-snapshot. It is a no-op when no pre-snapshot is pending (a no-op pass
+// never fired ObserveBefore) or when the pass failed (a partially-advanced
+// watermark would make the metamorphic relation ambiguous; the harness fails
+// such a pass through the compaction-pass recorder instead).
+func (r *compactionOverDropRecorder) ObserveAfter(result jetstreamd.CompactionPassResult) {
+	r.mu.Lock()
+	pending := r.havePending
+	pendingW := r.pendingW
+	pre := r.pendingPre
+	r.havePending = false
+	r.pendingPre = nil
+	r.mu.Unlock()
+
+	if !pending || result.Err != nil {
+		return
+	}
+
+	post, err := r.scanSealed(pendingW)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err != nil {
+		r.scanErr = errors.Join(r.scanErr, fmt.Errorf("post-compaction scan watermark=%d: %w", pendingW, err))
+		return
+	}
+	r.passes = append(r.passes, compactionOverDropPass{watermark: pendingW, pre: pre, post: post})
+}
+
+func (r *compactionOverDropRecorder) scanSealed(watermark uint64) ([]EventLogRow, error) {
+	events, err := ObserveSealedSegments(r.dataDir)
+	if err != nil {
+		return nil, err
+	}
+	bounded := make([]ObservedEvent, 0, len(events))
+	for _, ev := range events {
+		if ev.Seq <= watermark {
+			bounded = append(bounded, ev)
+		}
+	}
+	return NormalizeEventLog(EventsSortedBySeq(bounded)), nil
+}
+
+// Assert proves no compaction pass over-dropped (or under-dropped) a row.
+// For each captured pass it checks that the post-compaction stream equals the
+// pre-compaction stream after applying the documented compaction filter at the
+// watermark, as a multiset (block/segment order need not match). Anti-vacuity:
+// at least one pass must have been observed and verified a non-empty surviving
+// set, so a run where the hooks never fired or every window was empty fails
+// loudly rather than passing silently.
+func (r *compactionOverDropRecorder) Assert(t *testing.T, cfg Config, trace *Trace, phase string) {
+	t.Helper()
+
+	r.mu.Lock()
+	require.NoErrorf(t, r.scanErr, "%s mode=%s seed=%d: compaction over-drop snapshot scan", phase, cfg.Mode, cfg.Seed)
+	passes := r.passes
+	r.mu.Unlock()
+
+	var survivorsChecked int
+	for _, p := range passes {
+		survivors := filterCompactedExpectedRows(p.pre, p.watermark)
+		survivorsChecked += len(survivors)
+		dropped := len(p.pre) - len(survivors)
+		err := CompareEventLogsCompactedMultiset(p.pre, p.post, p.watermark)
+		recordTraceOrError(t, trace, "compaction_over_drop_check", map[string]any{
+			"phase":          phase,
+			"watermark":      p.watermark,
+			"pre_count":      len(p.pre),
+			"post_count":     len(p.post),
+			"survivor_count": len(survivors),
+			"dropped_count":  dropped,
+			"err":            traceErr(err),
+		})
+		require.NoErrorf(t, err,
+			"%s mode=%s seed=%d: compaction over-drop at watermark=%d (pre=%d post=%d survivors=%d dropped=%d)",
+			phase, cfg.Mode, cfg.Seed, p.watermark, len(p.pre), len(p.post), len(survivors), dropped)
+	}
+
+	require.NotEmptyf(t, passes,
+		"%s mode=%s seed=%d: no compaction pass observed for over-drop check (anti-vacuity)", phase, cfg.Mode, cfg.Seed)
+	require.Positivef(t, survivorsChecked,
+		"%s mode=%s seed=%d: compaction over-drop check verified no surviving rows (anti-vacuity)", phase, cfg.Mode, cfg.Seed)
 }
 
 func waitForBarrier(t *testing.T, cfg Config, name string, gate *phaseGate, run *runtimeRun) {

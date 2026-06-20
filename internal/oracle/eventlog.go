@@ -139,6 +139,15 @@ func CompareEventLogsCompacted(want, got []EventLogRow, watermark uint64) error 
 	return CompareEventLogs(filterCompactedExpectedRows(want, watermark), got)
 }
 
+// CompareEventLogsCompactedMultiset is CompareEventLogsCompacted ignoring order:
+// it drops the expected rows compaction would have removed at or below
+// watermark, then compares want and got as multisets. Use this when want and
+// got are two physical scans of the same stream (e.g. pre- and post-compaction
+// disk snapshots) whose block/segment ordering need not match.
+func CompareEventLogsCompactedMultiset(want, got []EventLogRow, watermark uint64) error {
+	return CompareEventLogMultiset(filterCompactedExpectedRows(want, watermark), got)
+}
+
 func filterCompactedExpectedRows(rows []EventLogRow, watermark uint64) []EventLogRow {
 	recordTombstones := make(map[RecordKey]uint64)
 	didTombstones := make(map[string]uint64)
