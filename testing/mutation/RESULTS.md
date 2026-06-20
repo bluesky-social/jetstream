@@ -5,6 +5,13 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
+**Current catalog (keep this line current): 22 active mutants on disk
+(m001–m024; m007 and m010 retired). Latest full campaign: 2026-06-20 at
+`b937b6e` — 14 killed, 8 survived (see the dated section at the end of this
+file for the authoritative current scorecard). Counts inside older dated
+sections describe the catalog *as of that date* and are intentionally not
+back-edited.**
+
 ## Retired mutants
 
 The active catalog no longer carries mutants that have been reclassified as
@@ -309,3 +316,92 @@ The new check's unique power is proven by the unit test
 fails). An end-to-end convergence-hiding mutant is deferred to the crash-mid-
 pass restart tier (#103), where a pass can be interrupted with W not covering
 every event — the regime in which the unique case becomes reachable.
+
+## Campaign 2026-06-20 — full catalog at HEAD (#101)
+
+- commit under test: `b937b6e` (branch `oracle-improvements`)
+- driver: `testing/mutation/run.sh` (full catalog), plus `--seeds 5` sweeps for
+  the two seed-sensitive movers (m002, m005)
+- catalog: 22 active mutants (m001–m024; m007/m010 retired)
+- context: first full campaign since 2026-06-15 (baseline `bb135af`); 139
+  commits intervened, including the client tier (#77), the bisect work, the
+  event-log rework, and this branch's #99/#100 changes. Run to re-establish a
+  trustworthy scorecard and to validate the refreshed m022 patch and the new
+  m024 mutant.
+- harness fix landed alongside: the default tier now passes `-timeout 5m`, so a
+  mutant that breaks liveness (m001) is killed fast instead of hanging on Go's
+  silent 10m default.
+
+### Scorecard
+
+| mutant | result | note |
+|---|---|---|
+| m001_delete_mapped_to_update | KILLED@default | now kills via test-timeout hang (delete->update stalls the bootstrap seq-ack contiguity wait → after-bootstrap barrier never releases). Was a fast assertion kill at baseline; failure mode changed to a hang. |
+| m002_watermark_floor_off_by_one | SURVIVED@seed42 / KILLED@stress(4/5 seeds) | seed-dependent, unchanged from baseline. The fixed campaign seed (42) is one of the ~1/5 that survives; a 5-seed sweep reproduced 4/5 kills. NOT a regression. |
+| m003_merge_cursor_no_advance | SURVIVED | unchanged — restart tier does not stage the merge-cursor crash seam (real gap, tracked). |
+| m004_rev_filter_inverted | KILLED@default | `oracle: missing … app.bsky.actor.profile/…` |
+| m005_backfill_status_check_inverted | SURVIVED (6 seeds: 42 + 5 random) | **REGRESSION from baseline KILLED@stress.** Root-caused (see below): the merge rev-filter runs over 7129 completed-repo events but every live event carries rev > backfillRev, so the inverted guard never changes the output — equivalent in this scenario. Filed as a coverage gap. |
+| m006_merge_commit_error_swallowed | SURVIVED | unchanged — predicted, needs store-fault injection (#30). |
+| m008_header_offset_byteslice | KILLED@default | corrupt header offset → segment open fails. |
+| m009_checksum_range_off_by_one | SURVIVED | unchanged — symmetric checksum closed loop (#32 corpus/golden-segment gap). |
+| m011_wire_frame_length | KILLED@default | `walk active segment …: segment: walk active frames` torn-tail on reopen. |
+| m012_block_event_count_off_by_one | KILLED@default | block decode truncated/trailing bytes. |
+| m013_collection_rkey_swap | SURVIVED | unchanged — dead path in this config; companion m017 covers the hot path. |
+| m014_rev_dropped | SURVIVED | unchanged — dead path in this config; companion m018 covers the hot path. |
+| m015_collection_count_double | SURVIVED | unchanged — footer collection index unread by oracle (known blind spot). |
+| m016_bloom_size_off_by_one | KILLED@default | (was SURVIVED at baseline) bloom-size corruption now caught at default. Improvement. |
+| m017_commit_collection_rkey_swap | KILLED@default | `oracle: event mismatch … key=app.bsky.feed.like/…` hot path exercised. |
+| m018_commit_rev_dropped | KILLED@default | **IMPROVEMENT from baseline SURVIVED** — the event-log tier now compares rev (`oracle: event mismatch … rev=`), closing the documented rev-never-compared escape. |
+| m019_sync_tombstone_dropped | KILLED@default | event-log equivalence catches the missing `kind=sync` row. |
+| m020_overlay_drop_did_tombstones | KILLED@default | overlay reconstruction. |
+| m021_overlay_record_seq_base_zero | KILLED@default | overlay reconstruction. |
+| m022_shoulddrop_did_seq_inverted | KILLED@default | **patch refreshed this campaign** (context → `IsMaterialization()`); now applies and kills again. |
+| m023_overlay_drop_record_tombstones | KILLED@default | overlay reconstruction. |
+| m024_compaction_over_drop_survivors | KILLED@default | **new** (#100); blanket compaction over-drop caught by final-state `Compare`. |
+
+Summary: **14 killed, 8 survived.** Movement vs. the 2026-06-15 baseline:
+- **m018 SURVIVED → KILLED** (improvement: rev now compared by the event-log tier).
+- **m016 SURVIVED → KILLED** (improvement at default).
+- **m005 KILLED → SURVIVED** (regression; root-caused below, coverage gap filed).
+- **m002** apparent change is fixed-seed variance, not a regression (4/5 sweep confirms).
+- m022 refreshed; m024 added (both KILLED).
+- All other mutants unchanged from baseline disposition.
+
+### m005 regression — root cause (diagnosed, verified)
+
+The mutated guard inverts "skip rev-filtering unless backfill is complete"
+(`merge_filter.go` `shouldKeep`, `!= StatusComplete` → `== StatusComplete`), so
+completed-backfill repos bypass rev filtering. The kill required a
+completed-repo live event with `rev <= backfillRev` to survive into the merged
+tree and trip the `rev regression` invariant (`invariants.go:32`).
+
+File-based instrumentation of `shouldKeep` on a stress run (seed 42) showed the
+merge processes **7129** completed-repo rev-filterable events, but **every one**
+has `ev.Rev > st.Backfill.Rev` (live events arrive strictly newer than the
+backfill head). **Zero** events hit the `rev <= backfillRev` case, so the
+inverted guard and the correct guard produce identical output — m005 is an
+equivalent mutant in the current scenario.
+
+(Methodology note: an initial `fmt.Fprintf(os.Stderr, …)` probe reported "0
+calls" and was wrong — the oracle harness's `go test` stderr buffering swallows
+sub-goroutine writes. A `panic()` probe proved `shouldKeep` *is* called; the
+file-based probe then gave the real distribution. Recorded so the next
+investigator does not repeat the stderr mistake.)
+
+This is a real loss of detection power caused by simulator/scenario drift (the
+merge live-overlap traffic no longer generates an in-flight event below the
+backfill rev for an already-completed repo), not a deleted assertion. Tracked
+as a follow-up coverage gap: the merge rev-filter tier needs traffic that
+stages a completed-repo event at/below the backfill snapshot rev.
+
+### m007 retirement re-confirmed (#101)
+
+The report's §5 flagged m007's retirement rationale as possibly fragile under
+the merge-mode tombstone cap. Reconstructed the historical m007 patch
+(`ev.Seq > chunkEnd` → `>=` in `applyCompactionChunk`) and ran it at HEAD: it
+**SURVIVED** both default(-short) and stress(seed 42), consistent with the
+retirement. Reasoning confirmed: with `CompactionTombstoneCap:1` the chunk
+snapshot is bounded so the boundary row at `seq == chunkEnd` is never
+superseded by a tombstone with `seq > chunkEnd`, making `>` vs `>=`
+behaviorally equivalent. m007 stays retired (dead/equivalent), not a true
+escape.
