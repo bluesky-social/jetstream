@@ -123,7 +123,14 @@ for patch in "$MUTANTS_DIR"/*.patch; do
         for tier in ${tiers//,/ }; do
             case "$tier" in
                 default)
-                    cmd=(go test ./internal/oracle -run 'TestOracle_DefaultLifecycle$' -count=1 -short) ;;
+                    # -timeout 5m bounds a mutant that breaks LIVENESS rather
+                    # than tripping an assertion: e.g. a delete->update mutation
+                    # stalls the bootstrap seq-ack contiguity wait so the
+                    # after-bootstrap barrier never releases. A healthy -short
+                    # run finishes in ~1s, so the timeout only fires on a hung
+                    # mutant, where it is the kill signal (non-zero exit) instead
+                    # of Go's silent 10m default.
+                    cmd=(go test ./internal/oracle -run 'TestOracle_DefaultLifecycle$' -count=1 -short -timeout 5m) ;;
                 stress)
                     cmd=(env JETSTREAM_ORACLE_MODE=stress go test ./internal/oracle
                          -run 'TestOracle_DefaultLifecycle$' -count=1 -timeout 30m) ;;
@@ -137,6 +144,12 @@ for patch in "$MUTANTS_DIR"/*.patch; do
             echo "    tier=$tier ..."
             if ! "${cmd[@]}" >"$LOG_ROOT/$id.$tier.log" 2>&1; then
                 note="$(grep -m1 -o 'oracle: [^"]*' "$LOG_ROOT/$id.$tier.log" | head -c 140 || true)"
+                # A liveness-breaking mutant kills via test timeout, not an
+                # assertion, so there is no 'oracle:' line; surface that as the
+                # reason instead of a bare "see log".
+                if [[ -z "$note" ]] && grep -q 'panic: test timed out' "$LOG_ROOT/$id.$tier.log"; then
+                    note="hang: test timed out (liveness broken — no barrier release)"
+                fi
                 result="| $id | KILLED@$tier | ${note:-see log} |"
                 echo "    KILLED@$tier"
                 break
