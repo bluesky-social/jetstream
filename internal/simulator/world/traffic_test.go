@@ -274,7 +274,6 @@ func TestConcurrentGeneratedEventsAreSerialized(t *testing.T) {
 	errs := make(chan error, workers)
 
 	for i := range workers {
-		i := i
 		go func() {
 			<-start
 			if i%2 == 0 {

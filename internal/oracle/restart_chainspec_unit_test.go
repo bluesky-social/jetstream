@@ -45,7 +45,7 @@ func TestDeriveChainSpec_VariesAcrossSeeds(t *testing.T) {
 // well-formed op sequence.
 func TestDeriveChainSpec_AllPinnedShapesPresent(t *testing.T) {
 	t.Parallel()
-	for seed := uint64(0); seed < 25; seed++ {
+	for seed := range uint64(25) {
 		spec := deriveChainSpec(seed, 4)
 		got := map[chainShape]recordChain{}
 		for _, rc := range spec.records {
