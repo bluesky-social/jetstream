@@ -234,7 +234,7 @@ func loadCampaign(path string) (Campaign, error) {
 	if err != nil {
 		return Campaign{}, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return ParseCampaign(f)
 }
 

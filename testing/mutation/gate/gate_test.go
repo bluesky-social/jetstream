@@ -16,6 +16,7 @@ func campaign(commit string, pairs map[string]string) Campaign {
 }
 
 func TestEvaluate_CleanCampaignPasses(t *testing.T) {
+	t.Parallel()
 	base := campaign("abc", map[string]string{
 		"m001": "KILLED",
 		"m002": "SURVIVED",
@@ -31,6 +32,7 @@ func TestEvaluate_CleanCampaignPasses(t *testing.T) {
 }
 
 func TestEvaluate_KilledToSurvivedIsRegression(t *testing.T) {
+	t.Parallel()
 	base := campaign("abc", map[string]string{"m001": "KILLED"})
 	result := campaign("def", map[string]string{"m001": "SURVIVED"})
 	v := Evaluate(base, result)
@@ -46,6 +48,7 @@ func TestEvaluate_KilledToSurvivedIsRegression(t *testing.T) {
 // IMPROVEMENT, not a failure. It must NOT produce a gate-failing violation, but
 // it should surface so the baseline gets refreshed.
 func TestEvaluate_SurvivedToKilledIsImprovementNotFailure(t *testing.T) {
+	t.Parallel()
 	base := campaign("abc", map[string]string{"m001": "SURVIVED"})
 	result := campaign("def", map[string]string{"m001": "KILLED"})
 	v := Evaluate(base, result)
@@ -60,6 +63,7 @@ func TestEvaluate_SurvivedToKilledIsImprovementNotFailure(t *testing.T) {
 }
 
 func TestEvaluate_StaleAndBuildBrokenFail(t *testing.T) {
+	t.Parallel()
 	base := campaign("abc", map[string]string{"m001": "KILLED", "m002": "KILLED"})
 	result := campaign("def", map[string]string{"m001": "STALE", "m002": "BUILD-BROKEN"})
 	v := Evaluate(base, result)
@@ -75,6 +79,7 @@ func TestEvaluate_StaleAndBuildBrokenFail(t *testing.T) {
 // catalog shrank without the baseline being refreshed — the gate must catch it
 // rather than silently passing on reduced coverage.
 func TestEvaluate_MutantMissingFromResultFails(t *testing.T) {
+	t.Parallel()
 	base := campaign("abc", map[string]string{"m001": "KILLED", "m002": "KILLED"})
 	result := campaign("def", map[string]string{"m001": "KILLED"})
 	v := Evaluate(base, result)
@@ -88,6 +93,7 @@ func TestEvaluate_MutantMissingFromResultFails(t *testing.T) {
 // expected disposition. It fails the gate so a new mutant cannot be added
 // without recording its baseline.
 func TestEvaluate_NewMutantNotInBaselineFails(t *testing.T) {
+	t.Parallel()
 	base := campaign("abc", map[string]string{"m001": "KILLED"})
 	result := campaign("def", map[string]string{"m001": "KILLED", "m099": "KILLED"})
 	v := Evaluate(base, result)
@@ -97,6 +103,7 @@ func TestEvaluate_NewMutantNotInBaselineFails(t *testing.T) {
 }
 
 func TestEvaluate_UnknownDispositionFails(t *testing.T) {
+	t.Parallel()
 	base := campaign("abc", map[string]string{"m001": "KILLED"})
 	result := campaign("def", map[string]string{"m001": "WHAT"})
 	v := Evaluate(base, result)
@@ -108,6 +115,7 @@ func TestEvaluate_UnknownDispositionFails(t *testing.T) {
 // The whole point of the gate is a non-zero exit on any failing violation; a
 // pure improvement or empty set must report success.
 func TestHasFailures(t *testing.T) {
+	t.Parallel()
 	if hasFailures([]Violation{{Kind: KindImprovement, ID: "m001"}}) {
 		t.Fatal("an improvement-only set must not be a failure")
 	}
@@ -120,6 +128,7 @@ func TestHasFailures(t *testing.T) {
 }
 
 func TestParseCampaign(t *testing.T) {
+	t.Parallel()
 	const doc = `{
   "commit": "deadbeef",
   "mutants": [
@@ -145,6 +154,7 @@ func TestParseCampaign(t *testing.T) {
 // typo — and a genuine KILLED->SURVIVED regression would pass the gate, the
 // exact loss of detection power the gate exists to catch.
 func TestParseCampaign_RejectsUnknownDisposition(t *testing.T) {
+	t.Parallel()
 	const doc = `{
   "commit": "deadbeef",
   "mutants": [
@@ -165,6 +175,7 @@ func TestParseCampaign_RejectsUnknownDisposition(t *testing.T) {
 // than silently accepted — an enforcement artifact has to fail closed on
 // corruption.
 func TestParseCampaign_RejectsTrailingData(t *testing.T) {
+	t.Parallel()
 	const doc = `{
   "commit": "deadbeef",
   "mutants": [{"id": "m001", "disposition": "KILLED"}]
@@ -180,6 +191,7 @@ func TestParseCampaign_RejectsTrailingData(t *testing.T) {
 
 // A second concatenated JSON document is the same hazard as trailing junk.
 func TestParseCampaign_RejectsSecondDocument(t *testing.T) {
+	t.Parallel()
 	const doc = `{"commit": "a", "mutants": [{"id": "m001", "disposition": "KILLED"}]}
 {"commit": "b", "mutants": []}`
 	_, err := ParseCampaign(strings.NewReader(doc))
