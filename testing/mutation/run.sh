@@ -100,6 +100,20 @@ revert_current() {
     CURRENT_PATCH=""
 }
 
+# log_is_build_failure reports whether a `go test` log failed because the TEST
+# package did not compile, rather than because an oracle assertion fired. The
+# preceding `go build ./...` gate only compiles non-test code, so a mutant that
+# edits a symbol used by _test.go files compiles for the build but breaks `go
+# test`'s package build. Without this, that compile error is recorded as a
+# KILLED — a false "the oracle detected the bug" when the oracle never ran. We
+# match `go test`'s own compile-failure framing (`[build failed]` / the `FAIL
+# pkg [build failed]` line / the leading `# pkg` diagnostic header) rather than
+# substrings like "undefined:" that could legitimately appear inside an oracle
+# assertion message.
+log_is_build_failure() {
+    grep -qE '\[build failed\]|^# [^ ]' "$1"
+}
+
 # EXIT is the single cleanup backstop: it fires after normal exit and after the
 # signal traps below re-exit, so trapping cleanup on INT/TERM too would just
 # double-invoke it. The signal traps set a conventional non-zero status so a
@@ -174,17 +188,27 @@ for patch in "$MUTANTS_DIR"/*.patch; do
         # indistinguishable from a real oracle assertion here; inspect the
         # per-seed logs before trusting a low kill count.
         kills=0
+        build_broken=0
         for i in $(seq 1 "$SEEDS"); do
             seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
             echo "    seed sweep $i/$SEEDS seed=$seed"
             if ! env JETSTREAM_ORACLE_MODE=stress JETSTREAM_ORACLE_SEED="$seed" \
                 go test "${RACE_FLAG[@]}" ./internal/oracle -run 'TestOracle_DefaultLifecycle$' \
                 -count=1 -timeout "$stress_timeout" >"$LOG_ROOT/$id.seed$i.log" 2>&1; then
+                # A test-package compile error fails every seed identically and is
+                # NOT a kill (the oracle never ran); reclassify and stop sweeping.
+                if log_is_build_failure "$LOG_ROOT/$id.seed$i.log"; then
+                    build_broken=1
+                    echo "        BUILD-BROKEN (test package does not compile)"
+                    break
+                fi
                 kills=$((kills + 1))
                 echo "        KILLED seed=$seed"
             fi
         done
-        if [[ "$kills" -gt 0 ]]; then
+        if [[ "$build_broken" -eq 1 ]]; then
+            disposition="BUILD-BROKEN"; result="BUILD-BROKEN"; note="test package failed to compile — refresh needed"
+        elif [[ "$kills" -gt 0 ]]; then
             disposition="KILLED"; result="KILLED@stress($kills/$SEEDS seeds)"; note="flaky detection — see logs"
         else
             disposition="SURVIVED"; result="SURVIVED($SEEDS seeds)"; note="true escape candidate"
@@ -213,6 +237,16 @@ for patch in "$MUTANTS_DIR"/*.patch; do
             esac
             echo "    tier=$tier ..."
             if ! "${cmd[@]}" >"$LOG_ROOT/$id.$tier.log" 2>&1; then
+                # A test-package compile error is NOT a kill: the oracle never
+                # ran. `go build ./...` above only compiles non-test code, so a
+                # mutant touching a _test.go-only symbol slips through to here.
+                # Reclassify as BUILD-BROKEN (refresh needed), not KILLED.
+                if log_is_build_failure "$LOG_ROOT/$id.$tier.log"; then
+                    disposition="BUILD-BROKEN"; result="BUILD-BROKEN"
+                    note="test package failed to compile — refresh needed"
+                    echo "    BUILD-BROKEN (test package does not compile)"
+                    break
+                fi
                 note="$(grep -m1 -o 'oracle: [^"]*' "$LOG_ROOT/$id.$tier.log" | head -c 140 || true)"
                 # A liveness-breaking mutant kills via test timeout, not an
                 # assertion, so there is no 'oracle:' line; surface that as the
@@ -248,8 +282,11 @@ echo
 echo "logs: $LOG_ROOT"
 
 if [[ -n "$JSON_OUT" ]]; then
-    # commit is recorded so the gate can confirm the result describes the tree
-    # it is gating. A partial run (a single --json with a mutant filter) is still
+    # commit is recorded for provenance/triage only — it identifies the tree the
+    # campaign ran against in logs and refresh PRs. The gate does NOT validate it
+    # (Evaluate diffs dispositions, not commits); the CI flow runs the campaign
+    # fresh at HEAD and gates the just-produced result, so the tree is HEAD by
+    # construction. A partial run (a single --json with a mutant filter) is still
     # emitted; the gate decides whether partial coverage is acceptable.
     commit="$(git rev-parse HEAD)"
     {

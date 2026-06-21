@@ -213,6 +213,13 @@ func ParseCampaign(r io.Reader) (Campaign, error) {
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return Campaign{}, fmt.Errorf("decode campaign json: trailing data after the campaign document")
 	}
+	// An empty catalog is a fail-closed condition: a baseline with no mutants
+	// silently disables ALL detection (every Evaluate loop iterates empty maps
+	// and finds zero violations), and an empty fresh result means the campaign
+	// produced nothing. Reject both at the boundary rather than passing green.
+	if len(c.Mutants) == 0 {
+		return Campaign{}, fmt.Errorf("campaign contains no mutants")
+	}
 	seen := map[string]struct{}{}
 	for _, m := range c.Mutants {
 		if m.ID == "" {

@@ -170,6 +170,21 @@ func TestParseCampaign_RejectsUnknownDisposition(t *testing.T) {
 	}
 }
 
+// An empty catalog must fail closed: a baseline with no mutants silently
+// disables ALL detection (Evaluate finds zero violations against empty maps),
+// and an empty fresh result means the campaign produced nothing.
+func TestParseCampaign_RejectsEmptyCatalog(t *testing.T) {
+	t.Parallel()
+	const doc = `{"commit": "deadbeef", "mutants": []}`
+	_, err := ParseCampaign(strings.NewReader(doc))
+	if err == nil {
+		t.Fatal("expected a parse error for an empty mutant catalog, got nil")
+	}
+	if !strings.Contains(err.Error(), "no mutants") {
+		t.Fatalf("expected a no-mutants error, got: %v", err)
+	}
+}
+
 // json.Decoder.Decode reads one value and leaves trailing bytes unread, so a
 // valid campaign followed by junk or a second document must be rejected rather
 // than silently accepted — an enforcement artifact has to fail closed on
