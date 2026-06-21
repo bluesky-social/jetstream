@@ -6,6 +6,12 @@
 #   testing/mutation/run.sh                 # run every mutant
 #   testing/mutation/run.sh m019            # run one mutant (filename prefix match)
 #   testing/mutation/run.sh m002 --seeds 5  # stress sweep over 5 random seeds
+#   testing/mutation/run.sh --json out.json # also emit a machine-readable result
+#
+# The optional --json file is the contract consumed by the #108 campaign gate
+# (testing/mutation/gate): a stable {commit, mutants:[{id, disposition, result,
+# note}]} document the gate diffs against the committed baseline. The markdown
+# table on stdout stays the human-facing view; the JSON is the enforced one.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -13,6 +19,7 @@ MUTANTS_DIR="testing/mutation/mutants"
 
 ONLY=""
 SEEDS=0
+JSON_OUT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --seeds)
@@ -21,6 +28,12 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             SEEDS="$2"; shift 2 ;;
+        --json)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --json requires a path" >&2
+                exit 1
+            fi
+            JSON_OUT="$2"; shift 2 ;;
         *) ONLY="$1"; shift ;;
     esac
 done
@@ -70,7 +83,35 @@ trap revert_current EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# json_escape emits a JSON-safe rendering of its argument (sans surrounding
+# quotes). Notes originate from grepped 'oracle: ...' lines, so backslashes and
+# double-quotes are the realistic hazards; tabs/newlines are flattened to spaces
+# so each value stays on one logical line. This keeps the JSON contract free of
+# a jq dependency on the runner.
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\t'/ }
+    s=${s//$'\n'/ }
+    printf '%s' "$s"
+}
+
 declare -a ROWS=()
+declare -a JSON_ROWS=()
+
+# record_result appends one row to both the markdown table and the JSON
+# accumulator from a single normalized (id, disposition, result, note) tuple, so
+# the human and machine views can never disagree. disposition is the gate's
+# coarse verdict (KILLED|SURVIVED|STALE|BUILD-BROKEN); result carries the
+# tier/seed detail for humans.
+record_result() {
+    local id=$1 disposition=$2 result=$3 note=$4
+    ROWS+=("| $id | $result | $note |")
+    JSON_ROWS+=("$(printf '{"id":"%s","disposition":"%s","result":"%s","note":"%s"}' \
+        "$(json_escape "$id")" "$(json_escape "$disposition")" \
+        "$(json_escape "$result")" "$(json_escape "$note")")")
+}
 
 for patch in "$MUTANTS_DIR"/*.patch; do
     id="$(basename "$patch" .patch)"
@@ -84,7 +125,7 @@ for patch in "$MUTANTS_DIR"/*.patch; do
 
     if ! git apply --unidiff-zero --check "$patch" 2>"$LOG_ROOT/$id.apply.log"; then
         echo "    STALE (patch no longer applies — refresh needed)"
-        ROWS+=("| $id | STALE | patch no longer applies — refresh needed |")
+        record_result "$id" "STALE" "STALE" "patch no longer applies — refresh needed"
         continue
     fi
     git apply --unidiff-zero "$patch"
@@ -92,12 +133,14 @@ for patch in "$MUTANTS_DIR"/*.patch; do
 
     if ! go build ./... >"$LOG_ROOT/$id.build.log" 2>&1; then
         echo "    BUILD-BROKEN (mutant does not compile — refresh needed)"
-        ROWS+=("| $id | BUILD-BROKEN | mutant does not compile — refresh needed |")
+        record_result "$id" "BUILD-BROKEN" "BUILD-BROKEN" "mutant does not compile — refresh needed"
         revert_current
         continue
     fi
 
+    disposition=""
     result=""
+    note=""
     if [[ "$SEEDS" -gt 0 ]]; then
         # A non-zero test exit counts as a kill. The preceding `go build` rules
         # out compile errors, but an infra failure (timeout, OOM) is still
@@ -115,9 +158,9 @@ for patch in "$MUTANTS_DIR"/*.patch; do
             fi
         done
         if [[ "$kills" -gt 0 ]]; then
-            result="| $id | KILLED@stress($kills/$SEEDS seeds) | flaky detection — see logs |"
+            disposition="KILLED"; result="KILLED@stress($kills/$SEEDS seeds)"; note="flaky detection — see logs"
         else
-            result="| $id | SURVIVED($SEEDS seeds) | true escape candidate |"
+            disposition="SURVIVED"; result="SURVIVED($SEEDS seeds)"; note="true escape candidate"
         fi
     else
         for tier in ${tiers//,/ }; do
@@ -150,19 +193,19 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                 if [[ -z "$note" ]] && grep -q 'panic: test timed out' "$LOG_ROOT/$id.$tier.log"; then
                     note="hang: test timed out, no oracle assertion (likely liveness break — e.g. barrier never releases; inspect log for the blocked goroutine)"
                 fi
-                result="| $id | KILLED@$tier | ${note:-see log} |"
+                disposition="KILLED"; result="KILLED@$tier"; note="${note:-see log}"
                 echo "    KILLED@$tier"
                 break
             fi
         done
         if [[ -z "$result" ]]; then
-            result="| $id | SURVIVED | escape — analyze and disposition |"
+            disposition="SURVIVED"; result="SURVIVED"; note="escape — analyze and disposition"
             echo "    SURVIVED"
         fi
     fi
 
     revert_current
-    ROWS+=("$result")
+    record_result "$id" "$disposition" "$result" "$note"
 done
 
 if [[ ${#ROWS[@]} -eq 0 ]]; then
@@ -176,3 +219,23 @@ echo "|---|---|---|"
 printf '%s\n' "${ROWS[@]}"
 echo
 echo "logs: $LOG_ROOT"
+
+if [[ -n "$JSON_OUT" ]]; then
+    # commit is recorded so the gate can confirm the result describes the tree
+    # it is gating. A partial run (a single --json with a mutant filter) is still
+    # emitted; the gate decides whether partial coverage is acceptable.
+    commit="$(git rev-parse HEAD)"
+    {
+        printf '{\n'
+        printf '  "commit": "%s",\n' "$(json_escape "$commit")"
+        printf '  "mutants": [\n'
+        for i in "${!JSON_ROWS[@]}"; do
+            sep=","
+            if [[ "$i" -eq $((${#JSON_ROWS[@]} - 1)) ]]; then sep=""; fi
+            printf '    %s%s\n' "${JSON_ROWS[$i]}" "$sep"
+        done
+        printf '  ]\n'
+        printf '}\n'
+    } >"$JSON_OUT"
+    echo "json: $JSON_OUT"
+fi
