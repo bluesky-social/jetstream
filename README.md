@@ -4,6 +4,8 @@
 
 Full-network archive and streaming service for atproto.
 
+The original jetstream codebase is available [here](https://github.com/bluesky-social/jetstream-legacy).
+
 **NOTE:** This project is not yet deployed to production, and there will be backwards-incompatible changes to the on-disk format in the next few days. Do not run this yourself and expect it to remain stable until we tag a 1.0 release (coming soon!).
 
 ## Getting started
