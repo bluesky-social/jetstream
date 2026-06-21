@@ -23,24 +23,64 @@ const (
 	// SAME rkey: the no-permanent-tombstone fixture. The recreate above
 	// the tombstone must reconstruct as visible.
 	shapeLiveDeleteRecreate chainShape = "live-delete-recreate"
+	// shapeBfCreateUpdate is R_bf create(@backfill)→update(live): the
+	// record exists at backfill (its create lands as a KindCreate at the
+	// repo head rev) and is then superseded by a live update at a HIGHER
+	// rev. Exercises the merge rev-filter survival boundary — the live
+	// update must survive (rev > BackfillRev) and supersede the
+	// backfilled create at compaction.
+	shapeBfCreateUpdate chainShape = "bf-create-update"
 )
 
-// pinnedShapes is the always-present set for Group 0's no-crash
-// baseline. Per-shape issues (A,B,C,D,F,…) extend this set as they land.
-var pinnedShapes = []chainShape{shapeLiveCUD, shapeLiveDeleteRecreate}
+// chainOrigin records whether a chain record existed at backfill (R_bf)
+// or is born entirely in the live window (R_live). It governs which of a
+// record's ops are generated pre-spawn (the backfill seed) vs. in the
+// getRepo-served hook (the durable intermediates).
+type chainOrigin string
+
+const (
+	originLive     chainOrigin = "live"
+	originBackfill chainOrigin = "backfill"
+)
+
+// pinnedShapes is the always-present set: every shape is generated on
+// every seed so no post-restart assertion is ever vacuous. Per-shape
+// issues (A,B,C,D,F,…) extend this set as they land.
+var pinnedShapes = []chainShape{shapeLiveCUD, shapeLiveDeleteRecreate, shapeBfCreateUpdate}
 
 // recordChain is one record's full op sequence on a single
 // (accountIdx, collection, rkey). origin records whether the record
-// existed at backfill (R_bf) or is born live (R_live); Group 0 ships
-// R_live only.
+// existed at backfill (R_bf) or is born live (R_live).
 type recordChain struct {
 	shape      chainShape
+	origin     chainOrigin
 	accountIdx int
 	collection string
 	rkey       string
 	// ops is the ordered action sequence (create/update/delete). For
-	// shapeLiveDeleteRecreate the final create reuses rkey.
+	// shapeLiveDeleteRecreate the final create reuses rkey. For an R_bf
+	// record, ops[0] is the backfill seed (generated pre-spawn) and the
+	// rest are durable live intermediates.
 	ops []string
+}
+
+// backfillOps are the ops generated BEFORE the child spawns, so they are
+// captured by the getRepo snapshot at the repo head rev. For R_bf that is
+// the seed create; for R_live there are none.
+func (rc recordChain) backfillOps() []string {
+	if rc.origin == originBackfill && len(rc.ops) > 0 {
+		return rc.ops[:1]
+	}
+	return nil
+}
+
+// liveOps are the durable intermediates generated AFTER getRepo is served
+// (rev > BackfillRev). These are the rows event-log coverage tracks.
+func (rc recordChain) liveOps() []string {
+	if rc.origin == originBackfill && len(rc.ops) > 0 {
+		return rc.ops[1:]
+	}
+	return rc.ops
 }
 
 // chainSpec is the full seed-derived plan of durable intermediates to
@@ -80,16 +120,23 @@ func deriveChainSpec(seed uint64, accounts int) chainSpec {
 		coll := chainCollections[rng.IntN(len(chainCollections))]
 		rkey := deriveChainRkey(rng)
 		var ops []string
+		origin := originLive
 		switch shape {
 		case shapeLiveCUD:
 			ops = []string{"create", "update", "delete"}
 		case shapeLiveDeleteRecreate:
 			ops = []string{"create", "delete", "create"}
+		case shapeBfCreateUpdate:
+			// Seed create lands at backfill; the live update is the
+			// durable intermediate that must survive the rev-filter.
+			origin = originBackfill
+			ops = []string{"create", "update"}
 		default:
 			panic(fmt.Sprintf("oracle: unhandled pinned chain shape %q", shape))
 		}
 		spec.records = append(spec.records, recordChain{
 			shape:      shape,
+			origin:     origin,
 			accountIdx: chainAccountIdx,
 			collection: coll,
 			rkey:       rkey,

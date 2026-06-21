@@ -21,12 +21,24 @@ import (
 // The expected side is model-derived (the ops the coordinator issued), so
 // it is independent of the system under test; seqs come from the disk rows
 // only as a join coordinate for the watermark filter.
-func assertChainDurable(t *testing.T, dataDir string, coord *chainCoordinator, phase string) {
+// chainCoverageView is the computed coverage comparison for a recovered
+// run: the model-derived expected durable rows (filtered at W) and the
+// observed on-disk rows, both seq-zeroed for key-based comparison. It is
+// shared by the positive assertion (assertChainDurable) and the per-shape
+// red-first power tests, so both compare against the identical sets.
+type chainCoverageView struct {
+	want      []EventLogRow
+	got       []EventLogRow
+	events    []ObservedEvent
+	watermark uint64
+}
+
+func chainCoverage(t *testing.T, dataDir string, coord *chainCoordinator) chainCoverageView {
 	t.Helper()
 
 	ops := coord.recordedOps()
 	events, err := ObserveSegments(dataDir)
-	require.NoErrorf(t, err, "%s: observe segments", phase)
+	require.NoError(t, err, "observe segments")
 	events = EventsSortedBySeq(events)
 	diskRows := NormalizeEventLog(events)
 	watermark := readCompactionWatermark(t, dataDir)
@@ -36,8 +48,8 @@ func assertChainDurable(t *testing.T, dataDir string, coord *chainCoordinator, p
 
 	// Join model rows to on-disk seqs by key so the watermark-based
 	// compaction filter can run. A model row with no on-disk match keeps
-	// seq 0 (treated as <= W); if it was genuinely lost it surfaces below
-	// as a coverage gap, which is the intended failure.
+	// seq 0 (treated as <= W); if it was genuinely lost it surfaces as a
+	// coverage gap, which is the intended failure.
 	seqByKey := firstSeqByRowKey(diskRows)
 	wantSeqed := make([]EventLogRow, len(wantPre))
 	for i, r := range wantPre {
@@ -45,20 +57,31 @@ func assertChainDurable(t *testing.T, dataDir string, coord *chainCoordinator, p
 		wantSeqed[i] = r
 	}
 
-	// Drop the creates/updates compaction legitimately removed at W, then
-	// assert at-least-once coverage of what must remain.
-	want := zeroRowSeqs(filterCompactedExpectedRows(wantSeqed, watermark))
-	got := zeroRowSeqs(diskRows)
-	require.NoErrorf(t, CompareEventLogCoverage(want, got),
-		"%s: at-least-once event-log coverage (W=%d)", phase, watermark)
+	return chainCoverageView{
+		want:      zeroRowSeqs(filterCompactedExpectedRows(wantSeqed, watermark)),
+		got:       zeroRowSeqs(diskRows),
+		events:    events,
+		watermark: watermark,
+	}
+}
+
+func assertChainDurable(t *testing.T, dataDir string, coord *chainCoordinator, phase string) {
+	t.Helper()
+
+	cov := chainCoverage(t, dataDir, coord)
+
+	// At-least-once coverage: every expected durable row that survives
+	// compaction is present on disk at least once.
+	require.NoErrorf(t, CompareEventLogCoverage(cov.want, cov.got),
+		"%s: at-least-once event-log coverage (W=%d)", phase, cov.watermark)
 
 	// Compaction contract over the recovered segments.
-	require.NoErrorf(t, CheckCompacted(events, watermark),
-		"%s: compaction contract (W=%d)", phase, watermark)
+	require.NoErrorf(t, CheckCompacted(cov.events, cov.watermark),
+		"%s: compaction contract (W=%d)", phase, cov.watermark)
 
 	// No-permanent-tombstone: every delete→recreate record reconstructs as
 	// present at head.
-	assertRecreatedRecordsVisible(t, events, coord.spec, coord.hostDID, phase)
+	assertRecreatedRecordsVisible(t, cov.events, coord.spec, coord.hostDID, phase)
 }
 
 // assertRecreatedRecordsVisible reconstructs the durable stream and checks

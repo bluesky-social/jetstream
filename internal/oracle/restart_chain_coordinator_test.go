@@ -36,11 +36,29 @@ func newChainCoordinator(t *testing.T, w *world.World, spec chainSpec) *chainCoo
 	t.Helper()
 	acct, err := w.LoadAccount(spec.chainAccountIdx())
 	require.NoError(t, err)
-	return &chainCoordinator{
+	c := &chainCoordinator{
 		t:       t,
 		w:       w,
 		spec:    spec,
 		hostDID: string(acct.DID),
+	}
+	c.seedBackfillRecords()
+	return c
+}
+
+// seedBackfillRecords generates the R_bf seed creates BEFORE the child
+// spawns, so they are captured by the child's getRepo snapshot at the
+// repo head rev (becoming KindCreate backfill rows). The matching live
+// op(s) are generated later in onGetRepoServed at a higher rev. Must be
+// called before the restart child starts.
+func (c *chainCoordinator) seedBackfillRecords() {
+	c.t.Helper()
+	ctx := context.Background()
+	for _, rc := range c.spec.records {
+		for _, action := range rc.backfillOps() {
+			_, _, err := c.w.GenerateRecordOpForTest(ctx, rc.accountIdx, action, rc.collection, rc.rkey)
+			require.NoErrorf(c.t, err, "seed backfill %s %s %s/%s", rc.shape, action, rc.collection, rc.rkey)
+		}
 	}
 }
 
@@ -59,13 +77,15 @@ func (c *chainCoordinator) onGetRepoServed(did string) {
 	})
 }
 
-// generate issues every record chain's ops in order on the host DID. Each
-// op is a real #commit on the live firehose at a fresh (higher) rev.
+// generate issues every record chain's LIVE ops in order on the host DID
+// (the R_bf seed creates were already generated pre-spawn). Each op is a
+// real #commit on the live firehose at a fresh rev > the backfill head
+// rev, so it survives the merge as a durable intermediate.
 func (c *chainCoordinator) generate() ([]world.GeneratedChainOp, error) {
 	ctx := context.Background()
 	var out []world.GeneratedChainOp
 	for _, rc := range c.spec.records {
-		for _, action := range rc.ops {
+		for _, action := range rc.liveOps() {
 			_, op, err := c.w.GenerateRecordOpForTest(ctx, rc.accountIdx, action, rc.collection, rc.rkey)
 			if err != nil {
 				return out, fmt.Errorf("chain %s %s %s/%s: %w", rc.shape, action, rc.collection, rc.rkey, err)

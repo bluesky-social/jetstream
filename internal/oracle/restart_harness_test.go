@@ -175,23 +175,40 @@ func restartSeed(i int) uint64 {
 // defect, not crash-recovery noise. Every later per-shape crash test
 // depends on this baseline holding.
 //
+// recoveredChainRun is the result of driving the chain through one
+// no-crash restart child to a clean after-merge exit.
+type recoveredChainRun struct {
+	cfg     Config
+	spec    chainSpec
+	w       *world.World
+	coord   *chainCoordinator
+	dataDir string
+}
+
+// runChainToMergeNoCrash builds a restart world, installs the chain
+// coordinator, runs ONE child to a clean exit at the after-merge barrier
+// (no crash), and returns the recovered run for assertions. The caller
+// owns nothing to clean up beyond what t.Cleanup/defers here handle. label
+// names the trace + child log.
+//
 // nolint:paralleltest
-func TestOracle_RestartChainDurableIntermediates_Baseline(t *testing.T) {
+func runChainToMergeNoCrash(t *testing.T, label string, seedIdx int) recoveredChainRun {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping restart oracle under -short")
 	}
 
 	cfg := Config{
 		Mode:                "restart",
-		Seed:                restartSeed(0),
+		Seed:                restartSeed(seedIdx),
 		Accounts:            4,
 		MinInitialRecords:   1,
 		MaxInitialRecords:   4,
 		LiveEventsBootstrap: 4,
 		LiveEventsSteady:    4,
 	}
-	trace, _, closeTrace := newOracleTrace(t, "restart-chain-baseline.jsonl")
-	defer closeTrace()
+	trace, _, closeTrace := newOracleTrace(t, "restart-chain-"+label+".jsonl")
+	t.Cleanup(closeTrace)
 
 	spec := deriveChainSpec(cfg.Seed, cfg.Accounts)
 	recordTraceOrError(t, trace, "run_start", map[string]any{
@@ -200,21 +217,20 @@ func TestOracle_RestartChainDurableIntermediates_Baseline(t *testing.T) {
 		"go_version":    runtime.Version(),
 		"gomaxprocs":    runtime.GOMAXPROCS(0),
 		"accounts":      cfg.Accounts,
-		"case":          "chain-baseline",
+		"case":          label,
 		"chain_did_idx": spec.chainAccountIdx(),
 		"chain_records": len(spec.records),
 	})
 
 	w := newRestartWorld(t, cfg)
-	defer func() { require.NoError(t, w.Close()) }()
+	t.Cleanup(func() { require.NoError(t, w.Close()) })
 
 	coord := newChainCoordinator(t, w, spec)
 	srv := newRestartServer(t, w, coord.onGetRepoServed)
-	defer srv.Close()
+	t.Cleanup(srv.Close)
 
 	dataDir := t.TempDir()
-	markersDir := t.TempDir()
-	mergeDonePath := filepath.Join(markersDir, "after-merge")
+	mergeDonePath := filepath.Join(t.TempDir(), "after-merge")
 
 	child := runRestartChild(t, restartChildArgs{
 		dataDir:       dataDir,
@@ -222,18 +238,23 @@ func TestOracle_RestartChainDurableIntermediates_Baseline(t *testing.T) {
 		mergeDonePath: mergeDonePath,
 		timeout:       30 * time.Second,
 		trace:         trace,
-		runLabel:      "baseline",
+		runLabel:      label,
 	})
-	recordTraceOrError(t, trace, "restart_child_result", traceRestartChildResult("baseline", child))
-	require.NoError(t, child.err, "baseline child should exit cleanly\n%s", child.output)
-	require.FileExists(t, mergeDonePath, "baseline child must reach after-merge barrier before exiting")
+	recordTraceOrError(t, trace, "restart_child_result", traceRestartChildResult(label, child))
+	require.NoErrorf(t, child.err, "%s child should exit cleanly\n%s", label, child.output)
+	require.FileExistsf(t, mergeDonePath, "%s child must reach after-merge barrier before exiting", label)
 
-	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "chain-baseline-assertions", "marker": "begin"})
+	return recoveredChainRun{cfg: cfg, spec: spec, w: w, coord: coord, dataDir: dataDir}
+}
+
+// nolint:paralleltest
+func TestOracle_RestartChainDurableIntermediates_Baseline(t *testing.T) {
+	run := runChainToMergeNoCrash(t, "baseline", 0)
+
 	// Existing final-state check still holds.
-	assertOracleMatches(t, dataDir, w, cfg, "chain-baseline")
-	// New: the chain landed durably and all three new assertions pass.
-	assertChainDurable(t, dataDir, coord, "chain-baseline")
-	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "chain-baseline-assertions", "marker": "done"})
+	assertOracleMatches(t, run.dataDir, run.w, run.cfg, "chain-baseline")
+	// The chain landed durably and all three new assertions pass.
+	assertChainDurable(t, run.dataDir, run.coord, "chain-baseline")
 }
 
 // nolint:paralleltest
