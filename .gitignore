@@ -39,4 +39,6 @@ go.work.sum
 
 # Local oracle-sweep diagnostic artifacts (trace + captured test output).
 # In CI these are written under a workspace path and uploaded on failure.
-/oracle-artifacts
+# Unanchored: the restart child subprocess runs with CWD=internal/oracle, so
+# the default ORACLE_ARTIFACT_DIR can also resolve there.
+oracle-artifacts/

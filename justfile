@@ -168,6 +168,34 @@ oracle-sweep SEEDS="10":
             exit 1
         fi
         echo "::endgroup::"
+
+        # Restart/crash tier: same per-seed budget. This tier SIGKILLs a real
+        # child subprocess at enumerated crashpoints and asserts recovery does
+        # not lose records; the chain shapes (#113) additionally land durable
+        # create/update/delete intermediates + sync/account tombstones through
+        # the merge, so a nightly random seed here exercises the lost-
+        # intermediate / no-permanent-tombstone / over-drop surface that
+        # DefaultLifecycle does not. It reads JETSTREAM_ORACLE_SEED (default
+        # 101+i) so the sweep varies the chain specifics per run. Cheap vs.
+        # stress DefaultLifecycle (each crash case SIGKILLs in ~0.1s), so it
+        # runs at full per-seed frequency. Not -short (that skips the tier).
+        echo "::group::oracle-restart ${i}/{{SEEDS}} seed=${seed}"
+        echo "oracle-restart run ${i}/{{SEEDS}} seed=${seed} artifacts=${seed_dir}"
+        if ! GOTRACEBACK=all \
+            JETSTREAM_ORACLE_SEED="${seed}" \
+            JETSTREAM_ORACLE_TRACE_DIR="${seed_dir}" \
+            gotestsum --format-hide-empty-pkg --format-icons hivis --jsonfile "${seed_dir}/gotestsum-restart.jsonl" -- -count=1 -timeout 30m ./internal/oracle -run 'TestOracle_Restart' -v \
+            2>&1 | tee "${seed_dir}/test-output-restart.log"; then
+            echo "::endgroup::"
+            echo "::error::oracle restart tier failed at seed ${seed} (artifacts: ${seed_dir})"
+            echo "Repro (seed fixes the world + chain shape; crash TIMING is real"
+            echo "wall-clock scheduling, not seeded — force the schedule):"
+            echo "  JETSTREAM_ORACLE_SEED=${seed} \\"
+            echo "  GOMAXPROCS=2 go test ./internal/oracle -run 'TestOracle_Restart' \\"
+            echo "    -count=50 -failfast -timeout 60m -v"
+            exit 1
+        fi
+        echo "::endgroup::"
     done
 
 # Runs the oracle mutation campaign: applies each curated mutant patch in
