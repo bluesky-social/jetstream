@@ -65,6 +65,36 @@ func TestOptionsRejectNonPositive(t *testing.T) {
 	require.Equal(t, defaultDownloadConc, cfg.downloadConc, "non-positive concurrency must be ignored")
 }
 
+func TestWithMaxDownloadAttempts(t *testing.T) {
+	t.Parallel()
+
+	// Non-positive is ignored: the config stays unset and newXRPCClient
+	// leaves xrpc on its default retry policy (Retry unset).
+	cfg := defaultConfig()
+	WithMaxDownloadAttempts(0)(&cfg)
+	WithMaxDownloadAttempts(-3)(&cfg)
+	require.Zero(t, cfg.maxDownloadAttempts, "non-positive attempt cap must be ignored")
+	c := newXRPCClient("http://h", cfg, nil)
+	require.False(t, c.Retry.HasVal(), "unset attempt cap must leave the default retry policy")
+
+	// A positive cap sets the xrpc retry policy's MaxAttempts, on both the
+	// default-transport and custom-HTTP-client paths (retry is orthogonal to
+	// transport).
+	cfg = defaultConfig()
+	WithMaxDownloadAttempts(2)(&cfg)
+	require.Equal(t, 2, cfg.maxDownloadAttempts)
+
+	c = newXRPCClient("http://h", cfg, nil)
+	require.True(t, c.Retry.HasVal(), "attempt cap must set the retry policy")
+	require.Equal(t, 2, c.Retry.Val().MaxAttempts.Val())
+
+	cfg.httpClient = &http.Client{}
+	c = newXRPCClient("http://h", cfg, nil)
+	require.True(t, c.Retry.HasVal(), "attempt cap must apply even with a custom HTTP client")
+	require.Equal(t, 2, c.Retry.Val().MaxAttempts.Val())
+	require.True(t, c.HTTPClient.HasVal(), "custom HTTP client must still be installed")
+}
+
 func TestOptionsCopySlices(t *testing.T) {
 	t.Parallel()
 	cfg := defaultConfig()

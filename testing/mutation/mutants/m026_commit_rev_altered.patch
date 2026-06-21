@@ -1,0 +1,29 @@
+mutant: m026_commit_rev_altered
+target: internal/ingest/live/events.go
+failure-mode: |
+  In convertVerifiedOps (the MAIN live #commit path), the archived Rev is
+  ALTERED rather than dropped (commit.Rev + "x"). Models a corruption /
+  mis-copy that produces a wrong-but-non-empty rev. Unlike m014/m018 (which
+  empty the rev and trip CheckInvariants' monotonicity), a wrong non-empty
+  rev still increases monotonically, so the per-DID rev-regression invariant
+  does NOT fire — only an exact rev-field comparison catches it.
+expected-detection: |
+  Killed by the EVENT-LOG tier: assertFirehoseEventLogMatches compares
+  normalized rows including the rev field, so the altered rev surfaces as
+  "event mismatch at index N ... fields: rev". Default tier.
+
+  This mutant is the #104 proof that rev correctness is owned by the
+  event-log tier, not the final-state tier. The final-state Compare
+  deliberately does NOT compare rev (ground truth cannot populate a correct
+  per-record rev, and a #sync resync collapses records to the sync rev), so
+  this mutant is INVISIBLE to Compare — verified: it is caught only by the
+  event-log comparison, with equal payload and a converged final state.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -156 +156 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event,
+-			Rev:                 commit.Rev,
++			Rev:                 commit.Rev + "x",

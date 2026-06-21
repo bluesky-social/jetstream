@@ -71,7 +71,7 @@ func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := Config{
 				Mode:                "restart",
-				Seed:                uint64(101 + i),
+				Seed:                restartSeed(i),
 				Accounts:            4,
 				MinInitialRecords:   1,
 				MaxInitialRecords:   4,
@@ -110,7 +110,7 @@ func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 				"current_seq":         w.CurrentSeq(),
 			})
 
-			srv := newRestartServer(t, w)
+			srv := newRestartServer(t, w, nil)
 			defer srv.Close()
 
 			dataDir := t.TempDir()
@@ -148,6 +148,113 @@ func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
 			recordTraceOrError(t, trace, "phase", map[string]any{"phase": "restart-final-assertions", "marker": "done"})
 		})
 	}
+}
+
+// restartSeed returns the seed for restart case i. It honors
+// JETSTREAM_ORACLE_SEED (so the nightly sweep can vary it), defaulting to
+// the historical 101+i for push CI so that remains fixed and
+// reproducible. When the env seed is set, cases are offset from it so
+// they don't all collide on one seed.
+func restartSeed(i int) uint64 {
+	if v, ok := os.LookupEnv(envOracleSeed); ok && v != "" {
+		var base uint64
+		if err := parseUint64Env(func(string) (string, bool) { return v, true }, envOracleSeed, &base); err == nil {
+			return base + uint64(i)
+		}
+	}
+	return uint64(101 + i)
+}
+
+// TestOracle_RestartChainDurableIntermediates_Baseline is the Group 0
+// no-crash baseline (plan §7 step 0e): it proves the getRepo-served timing
+// signal lands a seed-derived create/update/delete chain durably on disk
+// THROUGH the merge, and that the three post-restart assertions
+// (coverage, compaction contract, no-permanent-tombstone) pass when
+// nothing is lost. It runs the child to a clean exit at the after-merge
+// barrier — NO crash — so any assertion failure is a real mechanism
+// defect, not crash-recovery noise. Every later per-shape crash test
+// depends on this baseline holding.
+//
+// recoveredChainRun is the result of driving the chain through one
+// no-crash restart child to a clean after-merge exit.
+type recoveredChainRun struct {
+	cfg     Config
+	spec    chainSpec
+	w       *world.World
+	coord   *chainCoordinator
+	dataDir string
+}
+
+// runChainToMergeNoCrash builds a restart world, installs the chain
+// coordinator, runs ONE child to a clean exit at the after-merge barrier
+// (no crash), and returns the recovered run for assertions. The caller
+// owns nothing to clean up beyond what t.Cleanup/defers here handle. label
+// names the trace + child log.
+//
+// nolint:paralleltest
+func runChainToMergeNoCrash(t *testing.T, label string, seedIdx int) recoveredChainRun {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping restart oracle under -short")
+	}
+
+	cfg := Config{
+		Mode:                "restart",
+		Seed:                restartSeed(seedIdx),
+		Accounts:            4,
+		MinInitialRecords:   1,
+		MaxInitialRecords:   4,
+		LiveEventsBootstrap: 4,
+		LiveEventsSteady:    4,
+	}
+	trace, _, closeTrace := newOracleTrace(t, "restart-chain-"+label+".jsonl")
+	t.Cleanup(closeTrace)
+
+	spec := deriveChainSpec(cfg.Seed, cfg.Accounts)
+	recordTraceOrError(t, trace, "run_start", map[string]any{
+		"mode":          cfg.Mode,
+		"seed":          cfg.Seed,
+		"go_version":    runtime.Version(),
+		"gomaxprocs":    runtime.GOMAXPROCS(0),
+		"accounts":      cfg.Accounts,
+		"case":          label,
+		"chain_did_idx": spec.chainAccountIdx(),
+		"chain_records": len(spec.records),
+	})
+
+	w := newRestartWorld(t, cfg)
+	t.Cleanup(func() { require.NoError(t, w.Close()) })
+
+	coord := newChainCoordinator(t, w, spec)
+	srv := newRestartServer(t, w, coord.onGetRepoServed)
+	t.Cleanup(srv.Close)
+
+	dataDir := t.TempDir()
+	mergeDonePath := filepath.Join(t.TempDir(), "after-merge")
+
+	child := runRestartChild(t, restartChildArgs{
+		dataDir:       dataDir,
+		relayURL:      srv.URL,
+		mergeDonePath: mergeDonePath,
+		timeout:       30 * time.Second,
+		trace:         trace,
+		runLabel:      label,
+	})
+	recordTraceOrError(t, trace, "restart_child_result", traceRestartChildResult(label, child))
+	require.NoErrorf(t, child.err, "%s child should exit cleanly\n%s", label, child.output)
+	require.FileExistsf(t, mergeDonePath, "%s child must reach after-merge barrier before exiting", label)
+
+	return recoveredChainRun{cfg: cfg, spec: spec, w: w, coord: coord, dataDir: dataDir}
+}
+
+// nolint:paralleltest
+func TestOracle_RestartChainDurableIntermediates_Baseline(t *testing.T) {
+	run := runChainToMergeNoCrash(t, "baseline", 0)
+
+	// Existing final-state check still holds.
+	assertOracleMatches(t, run.dataDir, run.w, run.cfg, "chain-baseline")
+	// The chain landed durably and all three new assertions pass.
+	assertChainDurable(t, run.dataDir, run.coord, "chain-baseline")
 }
 
 // nolint:paralleltest
@@ -286,7 +393,7 @@ func newRestartWorld(t *testing.T, cfg Config) *world.World {
 	return w
 }
 
-func newRestartServer(t *testing.T, w *world.World) *httptest.Server {
+func newRestartServer(t *testing.T, w *world.World, onGetRepoServed func(did string)) *httptest.Server {
 	t.Helper()
 
 	ln, err := new(net.ListenConfig).Listen(t.Context(), "tcp4", "127.0.0.1:0")
@@ -294,7 +401,9 @@ func newRestartServer(t *testing.T, w *world.World) *httptest.Server {
 
 	srv := httptest.NewUnstartedServer(nil)
 	srv.Listener = ln
-	srv.Config.Handler = simhttp.NewHandler(w, "http://"+ln.Addr().String())
+	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, "http://"+ln.Addr().String(), simhttp.HandlerOptions{
+		OnGetRepoServed: onGetRepoServed,
+	})
 	srv.Start()
 	return srv
 }

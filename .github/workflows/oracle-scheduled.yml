@@ -17,6 +17,10 @@ on:
         description: "Number of randomly-chosen seeds to sweep"
         required: false
         default: "10"
+      race_seeds:
+        description: "Number of seeds for the -race lane (race is ~5-15x slower)"
+        required: false
+        default: "3"
 
 permissions: {}
 
@@ -30,6 +34,16 @@ env:
   # oracle-sweep recipe (see internal/oracle/config.go). Only the seed count is
   # tunable here; do not reintroduce account/record/event overrides.
   ORACLE_SWEEP_SEEDS: ${{ github.event.inputs.seeds || '10' }}
+  # The -race lane (#107) is far slower per seed (~5.5 min for one stress
+  # DefaultLifecycle + restart seed under the detector, vs. minutes without), so
+  # it sweeps a handful of seeds within the same 360m job budget rather than the
+  # full nightly count. The non-race lane stays at ORACLE_SWEEP_SEEDS.
+  ORACLE_RACE_SWEEP_SEEDS: ${{ github.event.inputs.race_seeds || '3' }}
+  # Per-seed diagnostic artifacts (JSONL trace + captured test output carrying
+  # the goroutine dump) are written here by the oracle-sweep recipe and uploaded
+  # on failure. Without this the trace lands in an ephemeral temp dir and every
+  # scheduled failure is diagnostically blind.
+  ORACLE_ARTIFACT_DIR: ${{ github.workspace }}/oracle-artifacts
 
 jobs:
   oracle-sweep:
@@ -53,6 +67,8 @@ jobs:
             sum.golang.org:443
             storage.googleapis.com:443
             dl.google.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -74,6 +90,18 @@ jobs:
       - name: Oracle seed sweep
         run: just oracle-sweep "$ORACLE_SWEEP_SEEDS"
 
+      - name: Upload diagnostic artifacts
+        # The JSONL trace is the design's substitute for bit-reproducible
+        # scheduling; capturing it (plus the goroutine-dump-bearing test output)
+        # only matters when a seed fails, so this runs on failure only.
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: oracle-failure-traces
+          path: ${{ env.ORACLE_ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Failure summary
         if: failure()
         run: |
@@ -85,4 +113,82 @@ jobs:
             echo "Workload: JETSTREAM_ORACLE_MODE=stress (see internal/oracle/config.go)"
             echo
             echo "- seeds swept: ${ORACLE_SWEEP_SEEDS}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The #107 race lane: the same stress/swarm + restart sweep under the data-race
+  # detector, at a low seed count. The repo's only other race coverage is
+  # ci.yml's `test (race)` job, which runs DEFAULT mode (25 accounts/1000
+  # records) and never the stress/swarm or restart interleavings where observed
+  # sweep failures actually reproduce. This closes that gap. It is a separate job
+  # (not extra seeds on the sweep above) so a race-detector data-race report is
+  # attributable on its own and the slower per-seed budget doesn't dilute the
+  # non-race seed count.
+  oracle-sweep-race:
+    name: oracle seed sweep (race)
+    runs-on: arc
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            dl.google.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install tooling
+        run: just install-tools
+
+      - name: Oracle seed sweep (race detector)
+        # A non-empty RACE arg turns on -race and widens the per-seed timeout to
+        # 90m inside the recipe; the restart tier re-execs the same test binary
+        # as its killed child, so the detector instruments both processes.
+        run: just oracle-sweep "$ORACLE_RACE_SWEEP_SEEDS" race
+
+      - name: Upload diagnostic artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: oracle-race-failure-traces
+          path: ${{ env.ORACLE_ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Failure summary
+        if: failure()
+        run: |
+          {
+            echo "## Scheduled oracle race lane failed"
+            echo
+            echo 'A failure here is either a data race (the detector prints a `DATA RACE` report in the step logs) or an oracle assertion under -race.'
+            echo
+            echo "Workload: JETSTREAM_ORACLE_MODE=stress under -race (see internal/oracle/config.go)"
+            echo
+            echo "- seeds swept: ${ORACLE_RACE_SWEEP_SEEDS}"
+            echo "- the failing seed and exact local repro command are printed in the sweep step logs (add -race to the printed command)."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -6,9 +6,11 @@ failure-mode: |
   to m014, which mutated the resync fallback that simulator traffic never
   takes.
 expected-detection: |
-  CheckInvariants tracks per-DID rev monotonicity and Compare checks rev when
-  both sides populate it; an empty rev should surface as a regression or
-  mismatch. Default tier.
+  CheckInvariants tracks per-DID rev monotonicity, so an empty rev surfaces
+  as a rev regression. (Note: the final-state Compare no longer checks rev —
+  see #104; exact rev correctness is owned by the event-log tier. An empty
+  rev is caught by the monotonicity invariant here; a wrong NON-empty rev is
+  caught by the event-log tier — see m026.) Default tier.
 expected-tier: default
 tiers: default,stress
 

@@ -6,9 +6,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	stdsync "sync"
+	"sync/atomic"
 	"testing"
 
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
+	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
@@ -42,6 +45,70 @@ func TestPDS_GetRepoRoundTrips(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, a.DID, rp.DID)
 	require.NotEmpty(t, commit.Sig)
+}
+
+// TestPDS_GetRepoServedHookFiresOncePerServe pins the OnGetRepoServed
+// timing signal: it fires exactly once per successful getRepo, carrying
+// the served DID, AFTER the CAR body is written. It must NOT fire on the
+// not-found path (no snapshot served).
+func TestPDS_GetRepoServedHookFiresOncePerServe(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 5, 2)
+	a0, err := w.LoadAccount(0)
+	require.NoError(t, err)
+	a1, err := w.LoadAccount(1)
+	require.NoError(t, err)
+
+	var served []string
+	var mu stdsync.Mutex
+	srv := httptest.NewServer(simhttp.NewHandlerWithOptions(w, "http://example.test", simhttp.HandlerOptions{
+		OnGetRepoServed: func(did string) {
+			mu.Lock()
+			served = append(served, did)
+			mu.Unlock()
+		},
+	}))
+	defer srv.Close()
+
+	xc := &xrpc.Client{Host: srv.URL, HTTPClient: gt.Some(jttp.New())}
+	sc := sync.NewClient(sync.Options{Client: xc})
+
+	for _, did := range []atmos.DID{a0.DID, a1.DID, a0.DID} {
+		body, err := sc.GetRepoStream(context.Background(), did, "")
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, body)
+		require.NoError(t, err)
+		require.NoError(t, body.Close())
+	}
+
+	mu.Lock()
+	got := append([]string(nil), served...)
+	mu.Unlock()
+	require.Equal(t, []string{string(a0.DID), string(a1.DID), string(a0.DID)}, got,
+		"hook fires once per successful getRepo, in order, carrying the served DID")
+}
+
+// TestPDS_GetRepoServedHookDoesNotFireWhenNotFound pins that the timing
+// signal is tied to a real snapshot: an unknown DID 404s and the hook
+// must stay silent.
+func TestPDS_GetRepoServedHookDoesNotFireWhenNotFound(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 2, 1)
+
+	var fired atomic.Int64
+	srv := httptest.NewServer(simhttp.NewHandlerWithOptions(w, "http://example.test", simhttp.HandlerOptions{
+		OnGetRepoServed: func(string) { fired.Add(1) },
+	}))
+	defer srv.Close()
+
+	url := srv.URL + "/xrpc/com.atproto.sync.getRepo?did=" + "did:plc:doesnotexist0000000000000"
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	require.Equal(t, int64(0), fired.Load(), "hook must not fire when no snapshot is served")
 }
 
 // TestPDS_GetRepoFaultHandlerServesTransient503ThenCAR pins the

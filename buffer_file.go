@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/jcalabro/gt"
 )
 
 const (
@@ -123,7 +125,7 @@ func (b *fileLiveBuffer) flushLocked() error {
 	return nil
 }
 
-func (b *fileLiveBuffer) Replay(ctx context.Context, from uint64) iter.Seq2[LiveFrame, error] {
+func (b *fileLiveBuffer) Replay(ctx context.Context, after gt.Option[uint64]) iter.Seq2[LiveFrame, error] {
 	return func(yield func(LiveFrame, error) bool) {
 		b.mu.Lock()
 		if b.f == nil || b.w == nil {
@@ -154,7 +156,8 @@ func (b *fileLiveBuffer) Replay(ctx context.Context, from uint64) iter.Seq2[Live
 			if !ok {
 				return false // corrupt line: stop at the recovery boundary
 			}
-			if fr.Seq <= from {
+			// None replays everything (incl. seq 0); Some(n) skips Seq <= n.
+			if after.HasVal() && fr.Seq <= after.Val() {
 				return true
 			}
 			return yield(fr, nil)

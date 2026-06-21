@@ -285,6 +285,48 @@ This tier kills real child processes and reopens real persistent state. It
 must not be replaced with in-memory storage. Enumerated crashpoints are useful
 for known seams; random-time kill loops explore timing gaps that nobody named.
 
+Beyond "no records lost across a crash," this tier lands **durable
+intermediate events** through the merge so it can exercise the lost-intermediate
+and no-permanent-tombstone contracts the storage tier's final-state check is
+blind to (per §180-182). Because a production PDS's `getRepo` serves only the
+current head (creates, never updates/deletes), the only way a durable
+update/delete/tombstone reaches disk is via the live firehose at a rev above the
+backfill head. The harness reproduces that exactly: a `OnGetRepoServed` timing
+signal tells the simulator (running in the parent process) that a DID's backfill
+head is pinned, after which it generates a seed-derived chain on the live
+firehose that survives the merge rev-filter. The chains are pinned shapes with
+seed-varied specifics (account/collection/rkey/payload), so every run exercises
+the same seams while the nightly sweep explores the state space:
+
+- R_bf create→update and create→delete (a backfilled create superseded by a
+  live mutation — the rev-filter survival boundary, and the §180-182 lost-create
+  shape);
+- R_live create→update→delete (a record born entirely in the live window);
+- R_live delete→recreate on a reused rkey (record-level no-permanent-tombstone:
+  the recreate above the tombstone must reconstruct visible);
+- account-delete→reactivate→post (DID-level no-permanent-tombstone);
+- #sync divergence (a silent mutation + #sync forces a verifier getRepo resync
+  whose KindSync tombstone + KindCreateResync rows must survive the merge and
+  rebuild the full repo — landed on an early-served DID so the async resync
+  completes before cutover);
+- control guards (a live create-only record and a pure-backfill untouched DID)
+  so a fixture that lands nothing fails loud rather than passing vacuously.
+
+Three post-restart checks run over the recovered segments: final-state
+`Compare` (existing); at-least-once event-log **coverage** (every model-derived
+durable row is present at least once, tolerant of the contract-permitted
+re-merge duplicate, sensitive to loss); and the compaction contract +
+overlay/visibility reconstruction. The expected side is model-derived from the
+chain the test issued (oracle independence), using on-disk seqs only to position
+the watermark-compaction filter.
+
+The convergence-hiding compaction over-drop (#100) is NOT reachable here: the
+merge-tail compaction snapshot always spans the whole sealed stream, so every
+drop decision is complete. That check's end-to-end proof lives in the
+steady-state tier (mutation `m025`), where a delete arriving after the pass's
+force-rotate sits above the watermark and a survivor can be wrongly dropped
+while final state still converges.
+
 ### Store-Fault Tier
 
 This tier injects deterministic local persistence failures at high-risk store

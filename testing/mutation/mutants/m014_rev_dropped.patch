@@ -4,9 +4,13 @@ failure-mode: |
   The commit-op Rev field is dropped (set to ""), so archived events carry no
   rev. Models forgetting to copy a field during struct construction.
 expected-detection: |
-  CheckInvariants tracks per-DID rev monotonicity and Compare checks rev when
-  both sides have it; an empty rev should surface as a rev regression or
-  mismatch. Default tier.
+  CheckInvariants tracks per-DID rev monotonicity, so an empty rev should
+  surface as a rev regression. (Note: the final-state Compare no longer
+  checks rev — see #104; rev correctness is owned by the event-log tier,
+  and a wrong NON-empty rev is caught there — see m026. An EMPTY rev is
+  caught by the monotonicity invariant.) Known dead path in this simulator
+  config — see m018 (the hot-path companion); simulator traffic never takes
+  the resync fallback this mutates.
 expected-tier: default
 tiers: default,stress
 

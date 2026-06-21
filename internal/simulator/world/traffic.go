@@ -27,7 +27,7 @@ func (w *World) RunTraffic(ctx context.Context, logger *slog.Logger) error {
 	logger.InfoContext(ctx, "starting", "mean_delay_sec", mean)
 
 	for {
-		delay := exponentialDelay(w.rng, mean)
+		delay := w.nextTrafficDelay(mean)
 		t := time.NewTimer(time.Duration(delay * float64(time.Second)))
 		select {
 		case <-ctx.Done():
@@ -42,6 +42,12 @@ func (w *World) RunTraffic(ctx context.Context, logger *slog.Logger) error {
 	}
 }
 
+func (w *World) nextTrafficDelay(mean float64) float64 {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+	return exponentialDelay(w.rng, mean)
+}
+
 // actionMix is the design-doc weighted action distribution.
 var actionMix = []weighted[string]{
 	{value: "create", weight: 75},
@@ -54,6 +60,12 @@ var actionMix = []weighted[string]{
 // build a CAR diff with only the new blocks, and broadcast the frame.
 // Returns the wire frame so tests can inspect it.
 func (w *World) generateOne(ctx context.Context) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+	return w.generateOneLocked(ctx)
+}
+
+func (w *World) generateOneLocked(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -68,6 +80,12 @@ func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 }
 
 func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byte, error) {
+	// Honor cancellation before doing work, consistent with every sibling
+	// generate helper (generateOneLocked, the targeted/sync/silent paths). The
+	// check consumes no RNG, so it does not perturb the deterministic draw stream.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if authorIdx < 0 || authorIdx >= w.cfg.Accounts {
 		return nil, fmt.Errorf("simulator: author index %d out of range", authorIdx)
 	}
@@ -127,11 +145,27 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 		touched[op.Path] = struct{}{}
 	}
 
+	frame, _, err := w.commitAndBroadcast(author, rp, store, prevState, wireOps)
+	return frame, err
+}
+
+// commitAndBroadcast is the shared tail of the live commit pump: persist
+// the post-op state, package a CAR diff over exactly the blocks this
+// commit touched, allocate a seq, encode + persist + publish the #commit
+// frame. Callers must have applied their ops to rp (a *repo.Repo whose
+// Store is the supplied diffStore) and assembled the matching wireOps.
+//
+// Returns the wire frame and the post-commit state. The returned state is
+// the authoritative source for the rev/CID this frame carries — callers
+// MUST use it rather than re-reading via loadState, which would race a
+// concurrent commit on the same account and report a rev that disagrees
+// with the broadcast frame.
+func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffStore, prevState repoState, wireOps []comatproto.SyncSubscribeRepos_RepoOp) ([]byte, repoState, error) {
 	// Persist the new state. commitAndPersist signs + flushes blocks
 	// + updates the MST index in one batch.
 	newState, err := w.commitAndPersist(author, rp)
 	if err != nil {
-		return nil, err
+		return nil, repoState{}, err
 	}
 
 	// Build a CAR diff containing every block our diffStore touched:
@@ -142,7 +176,7 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 	// neighbor requires that neighbor be present in the diff.
 	commitData, err := store.GetBlock(newState.CommitCID)
 	if err != nil {
-		return nil, err
+		return nil, repoState{}, err
 	}
 	carBlocks := make([]car.Block, 0, len(store.writes)+len(store.reads)+1)
 	carBlocks = append(carBlocks, car.Block{CID: newState.CommitCID, Data: commitData})
@@ -160,11 +194,11 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 	}
 	var carBuf carBytesWriter
 	if err := car.WriteAll(&carBuf, []cbor.CID{newState.CommitCID}, carBlocks); err != nil {
-		return nil, fmt.Errorf("simulator: write CAR diff: %w", err)
+		return nil, repoState{}, fmt.Errorf("simulator: write CAR diff: %w", err)
 	}
 	revTID, err := atmos.ParseTID(newState.Rev)
 	if err != nil {
-		return nil, fmt.Errorf("simulator: parse generated rev: %w", err)
+		return nil, repoState{}, fmt.Errorf("simulator: parse generated rev: %w", err)
 	}
 
 	// Allocate the seq and assemble the envelope.
@@ -185,14 +219,175 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 
 	frame, err := encodeCommitFrame(envelope)
 	if err != nil {
-		return nil, err
+		return nil, repoState{}, err
 	}
 
 	if err := w.persistFirehoseFrame(seq, frame); err != nil {
-		return nil, err
+		return nil, repoState{}, err
 	}
 	w.fanout.Publish(frame)
-	return frame, nil
+	return frame, newState, nil
+}
+
+// GeneratedChainOp describes one op injected via GenerateRecordOpForTest,
+// carrying enough detail for a test to derive the durable event-log row
+// it should produce: the action, its (collection, rkey), the rev the
+// commit assigned, and the record's CBOR block (nil for delete). Payload
+// equals the record block jetstream records on disk for create/update.
+type GeneratedChainOp struct {
+	Action     string
+	Collection string
+	Rkey       string
+	Rev        string
+	Payload    []byte
+}
+
+// GenerateRecordOpForTest applies a single create/update/delete on
+// account idx against the caller-specified (collection, rkey), commits,
+// and broadcasts the resulting #commit frame on the live firehose. It is
+// the targeted analogue of GenerateOneForTest: where ordinary traffic
+// picks random paths, this lets a test drive an exact chain on a known
+// key — in particular a delete followed by a recreate reusing the SAME
+// rkey, which random traffic (fresh TID rkeys) never produces. Record
+// payloads are still drawn from the world RNG, so payload bytes vary by
+// seed. Returns the wire frame and the op descriptor (assigned rev +
+// record block).
+func (w *World) GenerateRecordOpForTest(ctx context.Context, idx int, action, coll, rkey string) ([]byte, GeneratedChainOp, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, GeneratedChainOp{}, err
+	}
+	if idx < 0 || idx >= w.cfg.Accounts {
+		return nil, GeneratedChainOp{}, fmt.Errorf("simulator: chain account index %d out of range", idx)
+	}
+	deleted, err := w.isAccountDeleted(idx)
+	if err != nil {
+		return nil, GeneratedChainOp{}, err
+	}
+	if deleted {
+		return nil, GeneratedChainOp{}, fmt.Errorf("simulator: chain account %d is deleted", idx)
+	}
+	author, err := w.loadAccount(idx)
+	if err != nil {
+		return nil, GeneratedChainOp{}, err
+	}
+	prevState, err := w.loadState(idx)
+	if err != nil {
+		return nil, GeneratedChainOp{}, err
+	}
+
+	store := &diffStore{base: &pebbleStore{db: w.db, idx: idx}}
+	tree := mst.NewTree(store)
+	if prevState.DataCID.Defined() {
+		tree = mst.LoadTree(store, prevState.DataCID)
+	}
+	rp := &repo.Repo{
+		DID:   author.DID,
+		Clock: atmos.NewTIDClock(0),
+		Store: store,
+		Tree:  tree,
+	}
+
+	op, payload, err := w.applyTargetedOp(rp, idx, action, coll, rkey)
+	if err != nil {
+		return nil, GeneratedChainOp{}, err
+	}
+
+	// commitAndBroadcast returns the authoritative post-commit state. We use
+	// its rev directly rather than re-reading via loadState: the helper is
+	// documented for use while live firehose traffic runs, and a concurrent
+	// commit on this account between the broadcast and a re-read would make
+	// the descriptor's rev disagree with the rev carried in the frame we just
+	// published — silently corrupting any oracle row derived from it.
+	frame, newState, err := w.commitAndBroadcast(author, rp, store, prevState, []comatproto.SyncSubscribeRepos_RepoOp{op})
+	if err != nil {
+		return nil, GeneratedChainOp{}, err
+	}
+	return frame, GeneratedChainOp{
+		Action:     action,
+		Collection: coll,
+		Rkey:       rkey,
+		Rev:        newState.Rev,
+		Payload:    payload,
+	}, nil
+}
+
+// applyTargetedOp performs one op on rp against the exact (coll, rkey)
+// and returns the wire RepoOp plus the record's CBOR block (nil for
+// delete). Unlike applyOp it never falls back to a different action or
+// path: a create on an existing key, or an update/delete on a missing
+// key, surfaces as a loud error rather than silently mutating something
+// else — the test's chain expectations depend on the exact op landing.
+func (w *World) applyTargetedOp(rp *repo.Repo, authorIdx int, action, coll, rkey string) (comatproto.SyncSubscribeRepos_RepoOp, []byte, error) {
+	switch action {
+	case "create":
+		// repo.Create is an upsert (Tree.Insert), so guard the
+		// create-on-existing case explicitly: a chain that expects a
+		// fresh create must not silently overwrite a live record.
+		if _, _, err := rp.Get(coll, rkey); err == nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, fmt.Errorf("simulator: targeted create on existing %s/%s", coll, rkey)
+		}
+		target, err := w.pickTargetAccount(authorIdx)
+		if err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, err
+		}
+		rec := generateRecord(w.rng, coll, string(target))
+		if err := rp.Create(coll, rkey, rec); err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, fmt.Errorf("simulator: targeted create %s/%s: %w", coll, rkey, err)
+		}
+		cid, block, err := rp.Get(coll, rkey)
+		if err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, fmt.Errorf("simulator: lookup targeted create %s/%s: %w", coll, rkey, err)
+		}
+		return comatproto.SyncSubscribeRepos_RepoOp{
+			Action: "create",
+			Path:   coll + "/" + rkey,
+			CID:    gt.Some(lextypes.LexCIDLink{Link: cid.String()}),
+		}, append([]byte(nil), block...), nil
+
+	case "update":
+		prevCID, _, err := rp.Get(coll, rkey)
+		if err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, fmt.Errorf("simulator: targeted update missing %s/%s: %w", coll, rkey, err)
+		}
+		target, err := w.pickTargetAccount(authorIdx)
+		if err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, err
+		}
+		rec := generateRecord(w.rng, coll, string(target))
+		if err := rp.Update(coll, rkey, rec); err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, fmt.Errorf("simulator: targeted update %s/%s: %w", coll, rkey, err)
+		}
+		cid, block, err := rp.Get(coll, rkey)
+		if err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, fmt.Errorf("simulator: lookup targeted update %s/%s: %w", coll, rkey, err)
+		}
+		return comatproto.SyncSubscribeRepos_RepoOp{
+			Action: "update",
+			Path:   coll + "/" + rkey,
+			CID:    gt.Some(lextypes.LexCIDLink{Link: cid.String()}),
+			Prev:   gt.Some(lextypes.LexCIDLink{Link: prevCID.String()}),
+		}, append([]byte(nil), block...), nil
+
+	case "delete":
+		prevCID, _, err := rp.Get(coll, rkey)
+		if err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, fmt.Errorf("simulator: targeted delete missing %s/%s: %w", coll, rkey, err)
+		}
+		if err := rp.Delete(coll, rkey); err != nil {
+			return comatproto.SyncSubscribeRepos_RepoOp{}, nil, fmt.Errorf("simulator: targeted delete %s/%s: %w", coll, rkey, err)
+		}
+		return comatproto.SyncSubscribeRepos_RepoOp{
+			Action: "delete",
+			Path:   coll + "/" + rkey,
+			Prev:   gt.Some(lextypes.LexCIDLink{Link: prevCID.String()}),
+		}, nil, nil
+
+	default:
+		return comatproto.SyncSubscribeRepos_RepoOp{}, nil, fmt.Errorf("simulator: unknown targeted action %q", action)
+	}
 }
 
 // GenerateSyncForTest emits a real subscribeRepos #sync frame for the current
@@ -200,6 +395,9 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 // commit block in the #sync CAR body, persists the frame to firehose history,
 // and publishes it to live subscribers.
 func (w *World) GenerateSyncForTest(ctx context.Context, idx int) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -211,6 +409,9 @@ func (w *World) GenerateSyncForTest(ctx context.Context, idx int) ([]byte, error
 // new repo head. Oracle tests use this to force a true local/upstream
 // divergence: Jetstream must recover the authoritative state via getRepo.
 func (w *World) GenerateSilentMutationThenSyncForTest(ctx context.Context, idx int) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -225,6 +426,9 @@ func (w *World) GenerateSilentMutationThenSyncForTest(ctx context.Context, idx i
 // commit's prevData points at a state Jetstream never saw, forcing the verifier
 // chain-break path and its async resync repair.
 func (w *World) GenerateSilentMutationThenCommitForTest(ctx context.Context, idx int) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

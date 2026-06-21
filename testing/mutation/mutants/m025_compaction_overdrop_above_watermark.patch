@@ -1,0 +1,45 @@
+mutant: m025_compaction_overdrop_above_watermark
+target: internal/ingest/orchestrator/compact_deletes.go
+failure-mode: |
+  The steady-state compaction pass collects its tombstone snapshot with an
+  UNBOUNDED high seq (SnapshotRange(current, ^uint64(0))) instead of bounding
+  it at the pass's targetWatermark. A delete that arrived AFTER the active
+  segment was force-rotated (seq > targetWatermark, living in the new active
+  segment) therefore leaks into the snapshot and suppresses its own create —
+  a create at/below the watermark that the pass should have KEPT (its only
+  superseding tombstone is above the watermark, so the create is still a
+  legitimate survivor of this pass). A convergence-hiding compaction over-drop:
+  one or more survivors per pass can be wrongly removed (the observed failing
+  pass reported dropped=1).
+expected-detection: |
+  Killed by the metamorphic compactionOverDropRecorder.Assert at
+  steady-state-shutdown-flush in TestOracle_DefaultLifecycle (full lifecycle,
+  not -short), with "compaction over-drop at watermark=W (... dropped=1)".
+
+  This mutant proves the UNIQUE power of the #100 over-drop check that the
+  blanket m024 mutant does NOT exercise: the dropped create's record is
+  independently deleted ABOVE the watermark, so the record is absent in final
+  state either way and final-state Compare stays GREEN. Only the pre/post
+  metamorphic recorder — which holds the pass to "every survivor the
+  documented filter says must remain at W is still present after the pass" —
+  catches it. (Contrast m024, caught by final-state because it also drops rows
+  that are still live.)
+
+  Reachability correction: this convergence-hiding case IS reachable in steady
+  mode, contrary to the earlier m024 note. Force-rotating the active segment
+  before a pass does NOT make W cover every event — a delete that arrives in
+  the new active segment after the rotate has seq > targetWatermark and remains
+  in the live tombstone set above W. The straddle (create <= W, delete > W) is
+  the normal steady-state shape; the bug is letting an above-W tombstone act on
+  an at/below-W survivor. Verified empirically (2026-06-20): killed at full
+  default (~1s) and stress (~20s); SURVIVES -short (too little steady traffic
+  to materialize a straddle + pass), so this mutant's home is the stress tier.
+expected-tier: stress
+tiers: stress
+
+diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
+--- a/internal/ingest/orchestrator/compact_deletes.go
++++ b/internal/ingest/orchestrator/compact_deletes.go
+@@ -136 +136 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
+-				snap = o.cfg.Tombstones.SnapshotRange(current, targetWatermark)
++				snap = o.cfg.Tombstones.SnapshotRange(current, ^uint64(0))

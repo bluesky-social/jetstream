@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,10 +27,25 @@ func itoa(n uint64) string {
 	return string(b)
 }
 
+// drain replays frames with Seq strictly greater than from (the exclusive
+// lower bound). Use drainAll for the None "from the beginning, including seq 0"
+// case.
 func drain(t *testing.T, b LiveBuffer, from uint64) []LiveFrame {
 	t.Helper()
+	return drainAfter(t, b, gt.Some(from))
+}
+
+// drainAll replays every buffered frame, including the first-ever event at
+// seq 0 (the None lower bound).
+func drainAll(t *testing.T, b LiveBuffer) []LiveFrame {
+	t.Helper()
+	return drainAfter(t, b, gt.None[uint64]())
+}
+
+func drainAfter(t *testing.T, b LiveBuffer, after gt.Option[uint64]) []LiveFrame {
+	t.Helper()
 	var out []LiveFrame
-	for fr, err := range b.Replay(context.Background(), from) {
+	for fr, err := range b.Replay(context.Background(), after) {
 		require.NoError(t, err)
 		out = append(out, fr)
 	}
@@ -70,6 +86,16 @@ func bufferContract(t *testing.T, mk func(t *testing.T) LiveBuffer) {
 	t.Run("empty replay", func(t *testing.T) {
 		b := mk(t)
 		require.Empty(t, drain(t, b, 0))
+	})
+
+	// The None lower bound replays the first-ever event at seq 0; Some(0) skips
+	// it. This is the 0-based seq-space distinction the empty-archive cutover
+	// relies on (an exclusive Some(0) would swallow the first event).
+	t.Run("none replays seq 0, some(0) skips it", func(t *testing.T) {
+		b := mk(t)
+		require.NoError(t, b.Append([]LiveFrame{frame(0, "z"), frame(1, "a")}))
+		require.Equal(t, []uint64{0, 1}, frameSeqs(drainAll(t, b)), "None must include seq 0")
+		require.Equal(t, []uint64{1}, frameSeqs(drain(t, b, 0)), "Some(0) must skip seq 0")
 	})
 }
 
@@ -195,7 +221,7 @@ func TestFileLiveBufferUseAfterCloseReturnsError(t *testing.T) {
 		b := mk(t)
 		require.NotPanics(t, func() {
 			var gotErr error
-			for _, err := range b.Replay(context.Background(), 0) {
+			for _, err := range b.Replay(context.Background(), gt.Some[uint64](0)) {
 				if err != nil {
 					gotErr = err
 				}

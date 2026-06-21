@@ -55,7 +55,7 @@ just oracle                                                      # heavier stres
 just oracle-sweep                                                # deterministic multi-seed stress sweep
 ```
 
-`docs/oracle/DESIGN.md` is the source of truth for the oracle/simulator testing
+`specs/oracle.md` is the source of truth for the oracle/simulator testing
 architecture: why the oracle exists, what it can and cannot prove, its current
 tiers, mutation-campaign discipline, and how future testing work should extend
 it. Read it before changing `internal/oracle`, `internal/simulator`, or the
@@ -86,7 +86,7 @@ We track work as **GitHub issues in this repo** (`gh issue ...`). This is an ope
 **Title** — imperative and subsystem-scoped, mirroring our commit style: `ingest: dedupe overlapping live/backfill events`, `segment: validate footer CRC on open`. Lead with the affected area from the repo layout (`ingest`, `segment`, `subscribe`, `store`, …).
 
 **Body** — keep it tight but self-contained:
-- *Context* — what's wrong or missing, and why it matters (link `DESIGN.md` sections or code with `path:line` when relevant).
+- *Context* — what's wrong or missing, and why it matters (link `docs/README.md` sections or code with `path:line` when relevant).
 - *Definition of done* — the observable outcome that closes the issue (behaviour, test, metric).
 - *Notes* — open questions, alternatives considered, or follow-ups to split out later (kaizen: record out-of-scope problems as their own issues rather than scope-creeping this one).
 

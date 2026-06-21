@@ -3,6 +3,8 @@ package jetstream
 import (
 	"context"
 	"iter"
+
+	"github.com/jcalabro/gt"
 )
 
 // LiveFrame is one buffered live-tail event: its Jetstream sequence number and
@@ -31,9 +33,12 @@ type LiveBuffer interface {
 	// durability/fsync cadence.
 	Append(frames []LiveFrame) error
 
-	// Replay yields buffered frames with Seq strictly greater than from, in
-	// ascending seq order. Iteration stops on the first yielded error.
-	Replay(ctx context.Context, from uint64) iter.Seq2[LiveFrame, error]
+	// Replay yields buffered frames after the given exclusive lower bound, in
+	// ascending seq order. The bound is an optional so the 0-based seq space's 0
+	// is never overloaded: None replays from the very beginning (including the
+	// first-ever event at seq 0), while Some(n) yields only frames with Seq > n.
+	// Iteration stops on the first yielded error.
+	Replay(ctx context.Context, after gt.Option[uint64]) iter.Seq2[LiveFrame, error]
 
 	// Truncate drops buffered frames with Seq <= throughSeq once they have
 	// been replayed and emitted, reclaiming space.

@@ -3,6 +3,7 @@ package manifest
 import (
 	"errors"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/bluesky-social/jetstream/segment"
@@ -222,12 +223,7 @@ func segmentBloomMayContainAny(seg *SegmentMetadata, dids []string) bool {
 	if seg.SegmentBloom == nil {
 		return true
 	}
-	for _, did := range dids {
-		if seg.SegmentBloom.TestString(did) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(dids, seg.SegmentBloom.TestString)
 }
 
 func blockBloomMayContainAny(seg *SegmentMetadata, blockIdx int, dids []string) bool {
@@ -238,12 +234,7 @@ func blockBloomMayContainAny(seg *SegmentMetadata, blockIdx int, dids []string) 
 	if bloom == nil {
 		return true
 	}
-	for _, did := range dids {
-		if bloom.TestString(did) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(dids, bloom.TestString)
 }
 
 // collectionIDsForSegment returns the segment-local collection indices whose

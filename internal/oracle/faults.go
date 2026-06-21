@@ -8,6 +8,7 @@ import (
 
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
+	"github.com/jcalabro/atmos/backfill"
 )
 
 // oracleFaultSeedSalt derives the fault planner's RNG seed from cfg.Seed
@@ -172,6 +173,51 @@ func (p *SwarmFaultPlan) TotalGetRepoCARTruncations() int {
 		total += count
 	}
 	return total
+}
+
+// CheckWithinRetryBudget verifies that the swarm plan leaves every faulted
+// DID at least one clean getRepo attempt: the retry-consuming faults
+// scheduled for a DID (HTTP failures + CAR truncations, each of which burns
+// one attempt) must be strictly fewer than the backfill engine's total
+// attempts (backfill.DefaultMaxRetries + 1 = retries + the initial attempt).
+//
+// This guards a zero-margin invariant the swarm relies on but nothing else
+// pins: the hot DID schedules 2 HTTP failures + 1 CAR truncation = 3 faults
+// against 4 available attempts, leaving exactly one clean attempt. If atmos
+// ever lowers DefaultMaxRetries, or the planner ever schedules more faults
+// per DID, a faulted repo would exhaust its budget and the run would
+// degrade into a confusing backfill timeout instead of a clear, attributable
+// failure — and the durable model would diverge from the simulator world
+// because that repo never completes. Keyed off the imported
+// backfill.DefaultMaxRetries (not a hard-coded literal) so an atmos budget
+// change is caught here at plan construction rather than as a mysterious
+// hang. Returns nil for a nil plan (no faults scheduled).
+func (p *SwarmFaultPlan) CheckWithinRetryBudget() error {
+	if p == nil {
+		return nil
+	}
+	const totalAttempts = backfill.DefaultMaxRetries + 1
+	for did, http := range p.GetRepoHTTPFailures {
+		consumed := http + p.GetRepoCARTruncations[did]
+		if consumed >= totalAttempts {
+			return fmt.Errorf(
+				"oracle: swarm fault plan exceeds the backfill retry budget for DID %s: %d retry-consuming faults vs %d total attempts (backfill.DefaultMaxRetries=%d + initial); no clean attempt remains",
+				did, consumed, totalAttempts, backfill.DefaultMaxRetries)
+		}
+	}
+	// A DID may have a CAR truncation without an HTTP failure entry; cover
+	// those too rather than only iterating the HTTP map.
+	for did, trunc := range p.GetRepoCARTruncations {
+		if _, seen := p.GetRepoHTTPFailures[did]; seen {
+			continue // already checked the combined total above
+		}
+		if trunc >= totalAttempts {
+			return fmt.Errorf(
+				"oracle: swarm fault plan exceeds the backfill retry budget for DID %s: %d retry-consuming faults vs %d total attempts (backfill.DefaultMaxRetries=%d + initial); no clean attempt remains",
+				did, trunc, totalAttempts, backfill.DefaultMaxRetries)
+		}
+	}
+	return nil
 }
 
 // UnfiredGetRepoHTTPFailures returns, per DID, how many scheduled getRepo

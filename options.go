@@ -29,6 +29,10 @@ type config struct {
 	// two-client tuning into one shared client. See WithHTTPClient.
 	httpClient *http.Client
 	logger     *slog.Logger
+	// maxDownloadAttempts, when > 0, caps the total number of attempts
+	// (initial + retries) the XRPC clients make per request. 0 (unset)
+	// leaves xrpc on its default retry policy. See WithMaxDownloadAttempts.
+	maxDownloadAttempts int
 }
 
 // Defaults applied when an option is not supplied.
@@ -149,6 +153,24 @@ func WithHTTPClient(h *http.Client) Option {
 	return func(c *config) {
 		if h != nil {
 			c.httpClient = h
+		}
+	}
+}
+
+// WithMaxDownloadAttempts caps the total number of attempts (the initial
+// request plus retries) each XRPC/download request makes before failing.
+// n <= 0 is ignored (leaves the default retry policy). n == 1 disables
+// retries entirely.
+//
+// The default policy retries transient failures, which is right for
+// production resilience but undesirable for tests and tools that must fail
+// fast against a deliberately-broken or unavailable backend rather than
+// wait out a long backoff schedule. Bounding attempts turns a permanent
+// download failure into a prompt error instead of a slow retry loop.
+func WithMaxDownloadAttempts(n int) Option {
+	return func(c *config) {
+		if n > 0 {
+			c.maxDownloadAttempts = n
 		}
 	}
 }

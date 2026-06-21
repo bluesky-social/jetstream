@@ -110,9 +110,32 @@ oracle:
 # fault injection is on by default (JETSTREAM_ORACLE_FAULT_MODE=swarm); the
 # sweep relies on it to exercise backfill retry/recovery and live reconnect/
 # resume recovery on every seed.
-oracle-sweep SEEDS="10":
+oracle-sweep SEEDS="10" RACE="":
     #!/usr/bin/env bash
     set -euo pipefail
+
+    # Root for per-seed diagnostic artifacts (the JSONL trace and the captured
+    # test output that carries the goroutine dump on a hang). CI sets
+    # ORACLE_ARTIFACT_DIR to a path it uploads on failure; locally it defaults
+    # to a repo-relative dir. The trace is the design's substitute for
+    # bit-reproducible scheduling, so it must outlive the test process.
+    artifact_root="${ORACLE_ARTIFACT_DIR:-oracle-artifacts}"
+    mkdir -p "${artifact_root}"
+
+    # RACE="" (default): no race detector, 30m per-seed timeout. Any non-empty
+    # RACE arg enables `-race` and raises the timeout to 90m, because the race
+    # detector slows execution ~5-15x and inflates memory; the #107 race lane
+    # runs FEW seeds within this larger budget rather than the full nightly
+    # count. The restart tier re-execs the SAME test binary as its child
+    # (os.Args[0]), so -race instruments both the parent harness and the killed
+    # child — the data-race coverage is real on both tiers, not just the parent.
+    race_flag=()
+    per_seed_timeout="30m"
+    if [[ -n "{{RACE}}" ]]; then
+        race_flag=(-race)
+        per_seed_timeout="90m"
+        echo "oracle-sweep: race detector ENABLED (per-seed timeout ${per_seed_timeout})"
+    fi
 
     for i in $(seq 1 "{{SEEDS}}"); do
         # Draw a fresh random uint64 seed each iteration so successive nightly
@@ -120,13 +143,29 @@ oracle-sweep SEEDS="10":
         # a fixed 1..N. /dev/urandom is portable across the Linux CI runner and
         # macOS dev machines; the failing seed is printed below for exact repro.
         seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+        seed_dir="${artifact_root}/seed-${i}-${seed}"
+        mkdir -p "${seed_dir}"
         echo "::group::oracle ${i}/{{SEEDS}} seed=${seed}"
-        echo "oracle run ${i}/{{SEEDS}} seed=${seed}"
-        if ! JETSTREAM_ORACLE_MODE=stress \
+        echo "oracle run ${i}/{{SEEDS}} seed=${seed} artifacts=${seed_dir}"
+        # GOTRACEBACK=all makes the runtime print every goroutine's stack when
+        # the test -timeout fires, so a hang is diagnosable instead of a bare
+        # job kill. The per-seed -timeout (30m, matching the mutation campaign)
+        # is deliberately far below the job budget (timeout-minutes: 360) so the
+        # dump prints and the artifact upload runs before the job is killed; a
+        # healthy stress seed completes in minutes. JETSTREAM_ORACLE_TRACE_DIR
+        # redirects the harness trace from an ephemeral t.ArtifactDir() into the
+        # uploaded per-seed dir. --jsonfile records the raw test2json stream
+        # (the timeout traceback arrives as package output events), so the dump
+        # is captured regardless of how gotestsum renders its console output;
+        # tee additionally mirrors the console stream for human-readable triage.
+        if ! GOTRACEBACK=all \
+            JETSTREAM_ORACLE_MODE=stress \
             JETSTREAM_ORACLE_SEED="${seed}" \
-            gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -timeout 360m ./internal/oracle -run TestOracle_DefaultLifecycle -v; then
+            JETSTREAM_ORACLE_TRACE_DIR="${seed_dir}" \
+            gotestsum --format-hide-empty-pkg --format-icons hivis --jsonfile "${seed_dir}/gotestsum.jsonl" -- -count=1 -timeout "${per_seed_timeout}" "${race_flag[@]}" ./internal/oracle -run TestOracle_DefaultLifecycle -v \
+            2>&1 | tee "${seed_dir}/test-output.log"; then
             echo "::endgroup::"
-            echo "::error::oracle failed at seed ${seed}"
+            echo "::error::oracle failed at seed ${seed} (artifacts: ${seed_dir})"
             echo "Repro (NOTE: the seed fixes the INPUTS only — the world,"
             echo "the runtime RNG, and the fault schedule. The oracle runs the"
             echo "real jetstreamd runtime concurrently against real time and"
@@ -144,6 +183,34 @@ oracle-sweep SEEDS="10":
             exit 1
         fi
         echo "::endgroup::"
+
+        # Restart/crash tier: same per-seed budget. This tier SIGKILLs a real
+        # child subprocess at enumerated crashpoints and asserts recovery does
+        # not lose records; the chain shapes (#113) additionally land durable
+        # create/update/delete intermediates + sync/account tombstones through
+        # the merge, so a nightly random seed here exercises the lost-
+        # intermediate / no-permanent-tombstone / over-drop surface that
+        # DefaultLifecycle does not. It reads JETSTREAM_ORACLE_SEED (default
+        # 101+i) so the sweep varies the chain specifics per run. Cheap vs.
+        # stress DefaultLifecycle (each crash case SIGKILLs in ~0.1s), so it
+        # runs at full per-seed frequency. Not -short (that skips the tier).
+        echo "::group::oracle-restart ${i}/{{SEEDS}} seed=${seed}"
+        echo "oracle-restart run ${i}/{{SEEDS}} seed=${seed} artifacts=${seed_dir}"
+        if ! GOTRACEBACK=all \
+            JETSTREAM_ORACLE_SEED="${seed}" \
+            JETSTREAM_ORACLE_TRACE_DIR="${seed_dir}" \
+            gotestsum --format-hide-empty-pkg --format-icons hivis --jsonfile "${seed_dir}/gotestsum-restart.jsonl" -- -count=1 -timeout "${per_seed_timeout}" "${race_flag[@]}" ./internal/oracle -run 'TestOracle_Restart' -v \
+            2>&1 | tee "${seed_dir}/test-output-restart.log"; then
+            echo "::endgroup::"
+            echo "::error::oracle restart tier failed at seed ${seed} (artifacts: ${seed_dir})"
+            echo "Repro (seed fixes the world + chain shape; crash TIMING is real"
+            echo "wall-clock scheduling, not seeded — force the schedule):"
+            echo "  JETSTREAM_ORACLE_SEED=${seed} \\"
+            echo "  GOMAXPROCS=2 go test ./internal/oracle -run 'TestOracle_Restart' \\"
+            echo "    -count=50 -failfast -timeout 60m -v"
+            exit 1
+        fi
+        echo "::endgroup::"
     done
 
 # Runs the oracle mutation campaign: applies each curated mutant patch in
@@ -153,6 +220,31 @@ oracle-sweep SEEDS="10":
 # lives in testing/mutation/RESULTS.md.
 mutation-campaign *ARGS="":
     testing/mutation/run.sh {{ARGS}}
+
+# Runs the full mutation campaign and enforces the committed baseline (#108).
+# Emits a machine-readable result and fails if any mutant regressed
+# (KILLED->SURVIVED), went STALE/BUILD-BROKEN, or drifted from
+# testing/mutation/baseline.json. This is the scheduled CI gate; a
+# SURVIVED->KILLED improvement is reported but does not fail (refresh the
+# baseline to bank it). CI sets MUTATION_RESULT_JSON to a path it uploads as an
+# artifact; locally it defaults to a repo-relative file.
+mutation-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    result_json="${MUTATION_RESULT_JSON:-mutation-result.json}"
+    mkdir -p "$(dirname "${result_json}")"
+    testing/mutation/run.sh --json "${result_json}"
+    echo "::group::mutation gate vs baseline"
+    go run ./testing/mutation/gate -baseline testing/mutation/baseline.json -result "${result_json}"
+    echo "::endgroup::"
+
+# Regenerates testing/mutation/baseline.json from a fresh full campaign at HEAD.
+# Run this (and review the diff) after intentionally adding/retiring a mutant or
+# banking a SURVIVED->KILLED improvement, so the #108 gate has a current
+# source of truth. Requires a clean tree.
+mutation-baseline:
+    testing/mutation/run.sh --json testing/mutation/baseline.json
+    @echo "baseline written to testing/mutation/baseline.json — review the diff and commit"
 
 # Runs performance benchmarks.
 bench *ARGS="./...":

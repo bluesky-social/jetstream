@@ -57,6 +57,11 @@ func newEngine(host string, cfg config) (engine, error) {
 // negotiation, bulk-transfer tuning for downloads — design note §5.1).
 func newXRPCClient(host string, cfg config, opts []jttp.Option) *xrpc.Client {
 	c := &xrpc.Client{Host: host}
+	// Retry policy is orthogonal to transport: apply the caller's attempt
+	// cap whether or not they also supplied a custom HTTP client.
+	if cfg.maxDownloadAttempts > 0 {
+		c.Retry = gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(cfg.maxDownloadAttempts)})
+	}
 	if cfg.httpClient != nil {
 		c.HTTPClient = gt.Some(cfg.httpClient)
 		return c
@@ -158,9 +163,9 @@ func (a bufferAdapter) Append(frames []iclient.LiveFrame) error {
 	return a.b.Append(pub)
 }
 
-func (a bufferAdapter) Replay(ctx context.Context, from uint64) func(yield func(iclient.LiveFrame, error) bool) {
+func (a bufferAdapter) Replay(ctx context.Context, after gt.Option[uint64]) func(yield func(iclient.LiveFrame, error) bool) {
 	return func(yield func(iclient.LiveFrame, error) bool) {
-		for f, err := range a.b.Replay(ctx, from) {
+		for f, err := range a.b.Replay(ctx, after) {
 			if !yield(iclient.LiveFrame{Seq: f.Seq, Data: f.Data}, err) {
 				return
 			}

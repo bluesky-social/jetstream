@@ -14,14 +14,24 @@ import (
 // ObserveSegments reads every event from the primary segment directory under
 // dataDir in physical order.
 func ObserveSegments(dataDir string) ([]ObservedEvent, error) {
-	return observeSegmentDir(filepath.Join(dataDir, "segments"))
+	return observeSegmentDir(filepath.Join(dataDir, "segments"), false)
+}
+
+// ObserveSealedSegments reads every event from the primary segment directory
+// under dataDir, skipping the active (still-being-appended) segment. Use this
+// for snapshots taken while ingestion is live (e.g. a mid-run compaction hook):
+// reading the active segment would race concurrent appends, and the active
+// segment only holds rows above the latest sealed watermark, which such callers
+// filter out anyway.
+func ObserveSealedSegments(dataDir string) ([]ObservedEvent, error) {
+	return observeSegmentDir(filepath.Join(dataDir, "segments"), true)
 }
 
 // ObserveBootstrapSegments reads the primary segments followed by the bootstrap
 // live segments, checking invariants on each source before returning them
 // sorted by seq. A missing live-segments directory yields just the primary events.
 func ObserveBootstrapSegments(dataDir string) ([]ObservedEvent, error) {
-	primary, err := observeSegmentDir(filepath.Join(dataDir, "segments"))
+	primary, err := observeSegmentDir(filepath.Join(dataDir, "segments"), false)
 	if err != nil {
 		return nil, err
 	}
@@ -29,7 +39,7 @@ func ObserveBootstrapSegments(dataDir string) ([]ObservedEvent, error) {
 		return nil, fmt.Errorf("primary segments: %w", err)
 	}
 
-	live, err := observeSegmentDir(filepath.Join(dataDir, "backfill", "live_segments"))
+	live, err := observeSegmentDir(filepath.Join(dataDir, "backfill", "live_segments"), false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return EventsSortedBySeq(primary), nil
@@ -46,7 +56,7 @@ func ObserveBootstrapSegments(dataDir string) ([]ObservedEvent, error) {
 	return out, nil
 }
 
-func observeSegmentDir(dir string) ([]ObservedEvent, error) {
+func observeSegmentDir(dir string, sealedOnly bool) ([]ObservedEvent, error) {
 	files, err := ingest.SegmentFiles(dir)
 	if err != nil {
 		return nil, err
@@ -61,6 +71,9 @@ func observeSegmentDir(dir string) ([]ObservedEvent, error) {
 		}
 		if !errors.Is(err, segment.ErrActiveSegment) {
 			return nil, err
+		}
+		if sealedOnly {
+			continue
 		}
 
 		events, err = observeActiveSegment(file.Path)

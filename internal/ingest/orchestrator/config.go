@@ -198,6 +198,19 @@ type Config struct {
 	// production leaves it nil.
 	OnCompactionPass func(CompactionPassResult)
 
+	// OnBeforeCompactionPass, if non-nil, fires once per pass that will advance
+	// the committed watermark (target watermark strictly above the committed
+	// one — note a watermark-advancing pass over a tombstone-free window does no
+	// physical rewrite, and the hook still fires, which is what the over-drop
+	// oracle wants: it proves a zero-drop pass dropped nothing), after the
+	// active segment is force-rotated and sealed but before any rewrite, with
+	// the target watermark the pass will compact up to. The
+	// oracle uses it to snapshot the pre-compaction on-disk stream so it can
+	// metamorphically prove the pass did not over-drop a surviving row.
+	// Fires synchronously on the compactor goroutine, so the callback must
+	// not block long. Test/oracle hook only; production leaves it nil.
+	OnBeforeCompactionPass func(targetWatermark uint64)
+
 	// OnSteadyStateWriter, if non-nil, fires once the steady-state
 	// live consumer's ingest.Writer is constructed and registered.
 	// Used by cmd/jetstream to publish the writer pointer for the

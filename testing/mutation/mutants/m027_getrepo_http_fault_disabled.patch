@@ -1,0 +1,27 @@
+mutant: m027_getrepo_http_fault_disabled
+target: internal/simulator/http/faults.go
+failure-mode: |
+  The simulator's getRepo HTTP fault injection is silently disabled by a
+  flipped comparator: the "no budget remaining" guard `st.remaining <= 0`
+  becomes `st.remaining >= 0`, which is ALWAYS true (remaining starts
+  positive and never goes negative), so maybeGetRepoHTTPFault always returns
+  (0, false) and a scheduled 503 never fires (st.fired never increments).
+  Models a regression that breaks the fault-injection subsystem itself — the
+  anti-vacuity machinery every swarm-mode run relies on to prove its recovery
+  paths were actually exercised.
+expected-detection: |
+  Killed by assertFaultPlanFired in TestOracle_DefaultLifecycle (swarm mode):
+  the scheduled hot/secondary-DID getRepo 503s never fire, so
+  UnfiredGetRepoHTTPFailures() is non-empty and the
+  "configured getRepo HTTP faults must fire" assertion fails. This is the
+  #105 proof that the fault-injection subsystem's own kill power is asserted
+  by a mutant, not only by code reading. Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/simulator/http/faults.go b/internal/simulator/http/faults.go
+--- a/internal/simulator/http/faults.go
++++ b/internal/simulator/http/faults.go
+@@ -148 +148 @@ func (p *FaultPlan) maybeGetRepoHTTPFault(did string) (int, bool) {
+-	if !ok || st.remaining <= 0 {
++	if !ok || st.remaining >= 0 {

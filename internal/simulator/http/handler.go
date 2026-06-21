@@ -24,6 +24,18 @@ type HandlerOptions struct {
 	// zero value) means no fault injection; the oracle fault-injection
 	// harness is the primary caller that sets it.
 	Faults *FaultPlan
+
+	// OnGetRepoServed, when non-nil, fires after getRepo has fully
+	// served a DID's current-head CAR. It is a TIMING SIGNAL ("the
+	// snapshot for this DID is taken; its head rev is pinned"), never a
+	// data channel — getRepo carries creates only (current head), so a
+	// caller that wants to land a durable update/delete uses this hook
+	// to learn when it is safe to generate that mutation on the live
+	// firehose at a rev above the now-pinned backfill head. The restart
+	// oracle tier is the primary caller; nil means no-op. It does NOT
+	// fire on the fault/truncation paths, which do not serve a clean
+	// snapshot.
+	OnGetRepoServed func(did string)
 }
 
 // NewHandlerWithOptions builds the simulator's HTTP handler, optionally
@@ -33,7 +45,7 @@ type HandlerOptions struct {
 // should call NewHandler, which passes an empty HandlerOptions.
 func NewHandlerWithOptions(w *world.World, publicURL string, opts HandlerOptions) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("GET /xrpc/com.atproto.sync.getRepo", newPDSGetRepoHandler(w, opts.Faults))
+	mux.Handle("GET /xrpc/com.atproto.sync.getRepo", newPDSGetRepoHandler(w, opts.Faults, opts.OnGetRepoServed))
 	mux.Handle("GET /xrpc/com.atproto.sync.listRepos", newRelayListReposHandler(w))
 	mux.Handle("GET /xrpc/com.atproto.sync.subscribeRepos", newRelaySubscribeReposHandler(w, opts.Faults))
 

@@ -61,6 +61,50 @@ func TestBuildSwarmFaultPlanIsDeterministicAndBounded(t *testing.T) {
 	require.Equal(t, []int{1, 2}, counts, "one hot DID (2 failures) and one secondary DID (1 failure)")
 }
 
+// TestSwarmFaultPlanWithinRetryBudget pins the #109 invariant: the swarm
+// plan leaves every faulted DID at least one clean getRepo attempt, keyed
+// off the real backfill retry budget. The hot DID's 3 faults (2 HTTP + 1
+// CAR) sit one below the 4-attempt ceiling; the guard must accept that and
+// reject a plan that reaches/exceeds the ceiling.
+func TestSwarmFaultPlanWithinRetryBudget(t *testing.T) {
+	t.Parallel()
+
+	w := newFaultPlanWorld(t, 12)
+	cfg := Config{
+		Mode:                "fast",
+		Seed:                123,
+		Accounts:            12,
+		MinInitialRecords:   1,
+		MaxInitialRecords:   4,
+		LiveEventsBootstrap: 4,
+		LiveEventsSteady:    25,
+		FaultMode:           FaultModeSwarm,
+	}
+	plan, err := BuildSwarmFaultPlan(w, cfg)
+	require.NoError(t, err)
+
+	// The real plan is within budget (hot DID = 3 faults < 4 attempts).
+	require.NoError(t, plan.CheckWithinRetryBudget())
+
+	// A nil plan and the no-fault plan are trivially within budget.
+	require.NoError(t, (*SwarmFaultPlan)(nil).CheckWithinRetryBudget())
+
+	// Pushing a DID's combined faults to the attempt ceiling must trip the
+	// guard. Find the hot DID (2 HTTP failures) and add CAR truncations
+	// until consumed == DefaultMaxRetries+1.
+	var hot string
+	for did, n := range plan.GetRepoHTTPFailures {
+		if n == 2 {
+			hot = did
+		}
+	}
+	require.NotEmpty(t, hot, "expected a hot DID with 2 HTTP failures")
+	// hot already has 2 HTTP + 1 CAR = 3; one more CAR truncation -> 4 == ceiling.
+	plan.GetRepoCARTruncations[hot]++
+	require.Error(t, plan.CheckWithinRetryBudget(),
+		"a plan that consumes all 4 attempts for a DID must be rejected")
+}
+
 // TestSkewedIndexBiasesTowardLowIndices pins skewedIndex's low-index bias so a
 // regression that replaced it with uniform selection (e.g. plain rng.IntN(n))
 // fails loudly. The min-of-three-draws scheme pulls the mean well below the

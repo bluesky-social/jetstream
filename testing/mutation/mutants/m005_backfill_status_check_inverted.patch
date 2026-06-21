@@ -5,10 +5,21 @@ failure-mode: |
   (== instead of !=), so completed-backfill repos bypass rev filtering and
   incomplete ones get filtered. Models a flipped status check.
 expected-detection: |
-  Compare should fail with duplicated/extra records from completed-backfill
-  DIDs that should have been rev-filtered. Default mode should surface it.
-expected-tier: default
-tiers: default,stress
+  Killed by the RESTART tier
+  (TestOracle_RestartCrashPointsDoNotLoseRecords): its preLiveEvents are
+  generated BEFORE the child backfills, so they are rev-subsumed by the
+  getRepo snapshot (ev.Rev <= backfillRev). With the inverted guard,
+  completed-backfill repos bypass rev-filtering, so those rev-subsumed events
+  survive into the merged tree and trip the per-DID rev-regression invariant
+  (CheckInvariants): "rev regression for DID ...". The lifecycle tiers
+  (default/stress) do NOT kill it — every completed-repo live event there
+  arrives strictly newer than the backfill head, so the rev<=backfillRev
+  branch is never reached and the inverted vs. correct guard are equivalent
+  (diagnosed in the #110 / 2026-06-20 RESULTS.md section). The restart tier is
+  the home that exercises the rev-filter branch; #110 adds an anti-vacuity
+  assertion there pinning that the branch fires.
+expected-tier: restart
+tiers: restart
 
 diff --git a/internal/ingest/orchestrator/merge_filter.go b/internal/ingest/orchestrator/merge_filter.go
 index 2553697..ba0d6ae 100644

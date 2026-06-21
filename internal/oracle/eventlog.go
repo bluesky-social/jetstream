@@ -1,6 +1,7 @@
 package oracle
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -27,11 +28,21 @@ type EventLogRow struct {
 
 type eventLogRecorder struct {
 	mu     sync.Mutex
+	cond   *sync.Cond
 	events []segment.Event
+
+	// beforeWait, if non-nil, is invoked while holding r.mu immediately
+	// before cond.Wait parks the goroutine. Test-only hook that makes the
+	// wakeup-path regression guard deterministic (an observer cannot acquire
+	// r.mu to Broadcast until cond.Wait releases the lock, so signaling here
+	// proves the waiter is about to park). Always nil in production.
+	beforeWait func()
 }
 
 func newEventLogRecorder() *eventLogRecorder {
-	return &eventLogRecorder{}
+	r := &eventLogRecorder{}
+	r.cond = sync.NewCond(&r.mu)
+	return r
 }
 
 func (r *eventLogRecorder) Observe(ev *segment.Event) {
@@ -40,7 +51,63 @@ func (r *eventLogRecorder) Observe(ev *segment.Event) {
 	}
 	r.mu.Lock()
 	r.events = append(r.events, cloneSegmentEvent(*ev))
+	r.cond.Broadcast()
 	r.mu.Unlock()
+}
+
+// rowCountInRange returns how many normalized rows fall in the
+// (after, through] upstream-cursor window. Caller must hold r.mu.
+func (r *eventLogRecorder) rowCountInRangeLocked(after, through int64) int {
+	var observed []ObservedEvent
+	for _, ev := range r.events {
+		if ev.UpstreamRelayCursor <= after || ev.UpstreamRelayCursor > through {
+			continue
+		}
+		ev.Seq = uint64(ev.UpstreamRelayCursor)
+		observed = append(observed, observedEventFromSegment(ev))
+	}
+	return len(NormalizeEventLog(observed))
+}
+
+// waitForRowCount blocks until at least want normalized rows are present
+// in the (after, through] window, or the deadline-guarded context is
+// cancelled. It is a signal-driven deadlock guard, NOT a correctness wait:
+// a genuinely dropped row never reaches the count and the caller's long
+// guard fires as a clear TIMEOUT (reported as such), rather than a 5ms
+// poll racing a 30s wall-clock deadline and surfacing a confusing
+// multiset mismatch. Returns true if the count was reached, false on
+// ctx.Done (timeout). The caller still runs the authoritative multiset
+// compare afterward, so an OVER-count or wrong row is caught there.
+func (r *eventLogRecorder) waitForRowCount(ctx context.Context, after, through int64, want int) bool {
+	if r == nil {
+		return want <= 0
+	}
+	// A goroutine wakes the cond wait when ctx is cancelled so the guard
+	// cannot block past the deadline even if no further Observe arrives.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			r.mu.Lock()
+			r.cond.Broadcast()
+			r.mu.Unlock()
+		case <-stop:
+		}
+	}()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for r.rowCountInRangeLocked(after, through) < want {
+		if ctx.Err() != nil {
+			return false
+		}
+		if r.beforeWait != nil {
+			r.beforeWait()
+		}
+		r.cond.Wait()
+	}
+	return true
 }
 
 func (r *eventLogRecorder) RowsByUpstreamCursor(after, through int64) []EventLogRow {
@@ -132,11 +199,46 @@ func CompareEventLogMultiset(want, got []EventLogRow) error {
 	return CompareEventLogs(wantSorted, gotSorted)
 }
 
+// CompareEventLogCoverage asserts at-least-once coverage: every row in want
+// appears at least once in got, ignoring order. Extra rows in got (including
+// duplicates) are tolerated — this honors jetstream's at-least-once delivery
+// contract (docs/README.md:156), under which the durable stream may legitimately
+// re-deliver an event (e.g. a merge re-run across a crash boundary re-stamps and
+// re-appends rows). It is sensitive to LOSS (a missing expected row) and blind to
+// duplication; spurious-duplication classes are covered elsewhere (final-state
+// Compare, CheckInvariants' unique-seq guard). Coverage matches on the full row
+// key (kind+did+collection+rkey+rev+payload-hash, but NOT seq), so it is
+// seq-space-agnostic: callers should zero the Seq field on both sides (the on-disk
+// jetstream-seq is not comparable to a model-derived expectation). Returns an error
+// naming the first uncovered expected row.
+func CompareEventLogCoverage(want, got []EventLogRow) error {
+	present := make(map[EventLogRow]struct{}, len(got))
+	for _, row := range got {
+		present[row] = struct{}{}
+	}
+	for _, row := range want {
+		if _, ok := present[row]; ok {
+			continue
+		}
+		return fmt.Errorf("oracle: event-log coverage gap: expected durable row not found on disk: %s", row.describe())
+	}
+	return nil
+}
+
 // CompareEventLogsCompacted compares against got after dropping the expected
 // rows that compaction would have removed at or below watermark, so the
 // expected log matches a compacted segment stream.
 func CompareEventLogsCompacted(want, got []EventLogRow, watermark uint64) error {
 	return CompareEventLogs(filterCompactedExpectedRows(want, watermark), got)
+}
+
+// CompareEventLogsCompactedMultiset is CompareEventLogsCompacted ignoring order:
+// it drops the expected rows compaction would have removed at or below
+// watermark, then compares want and got as multisets. Use this when want and
+// got are two physical scans of the same stream (e.g. pre- and post-compaction
+// disk snapshots) whose block/segment ordering need not match.
+func CompareEventLogsCompactedMultiset(want, got []EventLogRow, watermark uint64) error {
+	return CompareEventLogMultiset(filterCompactedExpectedRows(want, watermark), got)
 }
 
 func filterCompactedExpectedRows(rows []EventLogRow, watermark uint64) []EventLogRow {

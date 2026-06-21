@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 )
 
 // LiveFrame is one buffered live event: its seq and the raw JSON frame bytes.
@@ -21,7 +22,9 @@ type LiveFrame struct {
 // supplies an adapter over the user-facing jetstream.LiveBuffer.
 type Buffer interface {
 	Append(frames []LiveFrame) error
-	Replay(ctx context.Context, from uint64) func(yield func(LiveFrame, error) bool)
+	// Replay yields buffered frames after the given exclusive lower bound. None
+	// replays from the beginning (including seq 0); Some(n) yields only Seq > n.
+	Replay(ctx context.Context, after gt.Option[uint64]) func(yield func(LiveFrame, error) bool)
 	Truncate(throughSeq uint64) error
 	Close() error
 }
@@ -133,9 +136,20 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	// cancel (see runBackfillThenLive for the same rationale).
 	stopFlusher := e.startFlusher(liveCtx, b)
 	defer stopFlusher()
+	// LiveCursor is a pure-live resume point with 0 meaning "from the current
+	// tip" (the documented WithLiveCursor contract): map 0 -> None so the
+	// consumer omits the cursor, and a non-zero cursor -> Some(seq) to resume.
+	var liveCursor gt.Option[uint64]
+	if e.cfg.LiveCursor > 0 {
+		liveCursor = gt.Some(e.cfg.LiveCursor)
+	}
 	consumer := newLiveConsumer(liveConfig{
-		host:       e.cfg.Host,
-		cursor:     e.cfg.LiveCursor,
+		host:   e.cfg.Host,
+		cursor: liveCursor,
+		// Pure-live resume: a saved LiveCursor means the caller already holds
+		// events through it, so it is also the dedup floor. A None (live from
+		// tip) leaves the floor None so the first event delivered passes.
+		dedupFloor: liveCursor,
 		dial:       e.cfg.Dial,
 		logger:     e.logger,
 		backoffMin: e.cfg.LiveBackoffMin,
@@ -280,12 +294,33 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	} else {
 		liveStart = 0
 	}
+	// An empty plan (no sealed segments matched, and the sealed tip is 0) means
+	// the backfill covered NOTHING: the live tail owns the entire stream from the
+	// start, including the first-ever event at seq 0. plannedThroughSeq==0 alone
+	// is ambiguous (it is also a single sealed event at seq 0), so we key off the
+	// plan having no entries AND a zero horizon — the unambiguous "nothing sealed"
+	// signal. In that case the dedup floor must be None (nothing delivered yet) so
+	// live seq 0 passes; otherwise the cutover already emitted through the sealed
+	// tip and Some(liveStart) is the correct floor.
+	backfillCoveredNothing := len(plan.Entries) == 0 && plan.PlannedThroughSeq == 0
+	dedupFloor := gt.Some(liveStart)
+	if backfillCoveredNothing {
+		dedupFloor = gt.None[uint64]()
+	}
 	sink := newLiveSink(e.cfg.Buffer, e.suppressor, e.matcher)
 	liveCtx, stopLive := context.WithCancel(ctx)
 	defer stopLive()
 	consumer := newLiveConsumer(liveConfig{
-		host:       e.cfg.Host,
-		cursor:     liveStart,
+		host: e.cfg.Host,
+		// The cutover always means "replay from liveStart", so the WIRE cursor is
+		// always present — including Some(0) when the sealed tip is below the
+		// rewind margin or the archive is empty. Some(0) sends cursor=0 (replay
+		// from the start) rather than the None "live from tip" sentinel, so the
+		// (plannedThroughSeq, tip] band is not dropped. See #112. The dedup floor
+		// is decoupled (see dedupFloor above): it is None for an empty archive so
+		// the first-ever live event at seq 0 is delivered, not swallowed.
+		cursor:     gt.Some(liveStart),
+		dedupFloor: dedupFloor,
 		dial:       e.cfg.Dial,
 		logger:     e.logger,
 		backoffMin: e.cfg.LiveBackoffMin,
@@ -329,7 +364,9 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 
 	// 5. Flip the sink: from here, buffered then live frames flow through the
 	// same batcher. Drain everything strictly above the sealed tip (the
-	// backfill already emitted <= plannedThroughSeq).
+	// backfill already emitted <= plannedThroughSeq); when the backfill covered
+	// nothing (empty archive) drain from the beginning so the buffered seq 0 is
+	// not skipped by the strict-> replay bound.
 	//
 	// When emission stops (the consumer broke the iterator), cancel the live
 	// context so the live consumer exits and liveWG.Wait below returns. The
@@ -347,7 +384,11 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	stopFlusher := e.startFlusher(ctx, b)
 	defer stopFlusher()
 	emitLive := func(ev Event) bool { return b.add(ev) }
-	if err := sink.flipAndDrain(ctx, plan.PlannedThroughSeq, emitLive, b.emitError); err != nil {
+	coveredThrough := gt.Some(plan.PlannedThroughSeq)
+	if backfillCoveredNothing {
+		coveredThrough = gt.None[uint64]()
+	}
+	if err := sink.flipAndDrain(ctx, coveredThrough, emitLive, b.emitError); err != nil {
 		// A cutover replay/append failure breaks the at-least-once handoff
 		// guarantee: surface it as fatal so the consumer aborts rather than
 		// continues against a truncated stream.

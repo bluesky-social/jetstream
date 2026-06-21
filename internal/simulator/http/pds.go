@@ -12,7 +12,7 @@ import (
 // bytes straight to the response. Ignores `since` in v1 — always
 // returns the full repo (which is valid behavior; consumers can
 // request diffs but aren't required to).
-func newPDSGetRepoHandler(w *world.World, faults *FaultPlan) http.Handler {
+func newPDSGetRepoHandler(w *world.World, faults *FaultPlan, onServed func(did string)) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		didStr := r.URL.Query().Get("did")
 		did, err := atmos.ParseDID(didStr)
@@ -57,6 +57,13 @@ func newPDSGetRepoHandler(w *world.World, faults *FaultPlan) http.Handler {
 			// except let the client see a truncated CAR. A future
 			// metric would surface the rate of these.
 			return
+		}
+		// The snapshot for this DID is now fully served; its head rev is
+		// pinned. Fire the timing signal AFTER the body is written so a
+		// caller can safely generate a post-backfill mutation (see
+		// HandlerOptions.OnGetRepoServed).
+		if onServed != nil {
+			onServed(string(did))
 		}
 	})
 }

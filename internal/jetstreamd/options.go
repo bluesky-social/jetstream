@@ -84,6 +84,7 @@ type Options struct {
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
 	OnCompactionPass          func(CompactionPassResult)
+	OnBeforeCompactionPass    func(targetWatermark uint64)
 	AfterRepoComplete         func(context.Context, atmos.DID) error
 	CrashInjector             crashpoint.Injector
 	OnBootstrapLiveEvent      func(*segment.Event)

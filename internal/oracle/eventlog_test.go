@@ -1,8 +1,11 @@
 package oracle
 
 import (
+	"context"
 	"encoding/json"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -252,6 +255,30 @@ func TestCompareEventLogsCompactedRejectsMissingRowBeforeNonDeletedAccountEvent(
 	require.ErrorContains(t, err, "seq=1")
 }
 
+func TestCompareEventLogsCompactedMultisetToleratesReorderingButCatchesOverDrop(t *testing.T) {
+	t.Parallel()
+
+	// Two records that both survive at the watermark (no superseding
+	// tombstone), plus one superseded create that compaction legitimately
+	// drops. pre is the pre-compaction stream; post is what a correct pass
+	// leaves behind, in a different block order.
+	createA := ObservedEvent{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "ra", Rev: "rev1", Payload: []byte("a")}
+	superseded := ObservedEvent{Seq: 2, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "rb", Rev: "rev1", Payload: []byte("b-old")}
+	updateB := ObservedEvent{Seq: 3, Kind: segment.KindUpdate, DID: "did:plc:a", Collection: "c", Rkey: "rb", Rev: "rev2", Payload: []byte("b-new")}
+
+	pre := NormalizeEventLog([]ObservedEvent{createA, superseded, updateB})
+	// Correct post: superseded create (seq 2) dropped; survivors reordered.
+	goodPost := NormalizeEventLog([]ObservedEvent{updateB, createA})
+	require.NoError(t, CompareEventLogsCompactedMultiset(pre, goodPost, 3),
+		"reordered survivors with the superseded row dropped must pass")
+
+	// Over-drop: the pass also wrongly dropped surviving createA (seq 1).
+	overDropped := NormalizeEventLog([]ObservedEvent{updateB})
+	err := CompareEventLogsCompactedMultiset(pre, overDropped, 3)
+	require.Error(t, err, "an over-dropped surviving row must be caught")
+	require.ErrorContains(t, err, "ra")
+}
+
 func TestCompareEventLogsCompactedRejectsUnjustifiedMissingCreate(t *testing.T) {
 	t.Parallel()
 
@@ -305,4 +332,90 @@ func TestEventLogRecorderIgnoresSyntheticEventsWithoutUpstreamCursor(t *testing.
 	rec.Observe(&segment.Event{Seq: 1, UpstreamRelayCursor: 0, Kind: segment.KindSync, DID: "did:plc:a"})
 
 	require.Empty(t, rec.RowsByUpstreamCursor(0, 10))
+}
+
+// observeCursor records one create row at the given upstream cursor, the shape
+// waitForRowCount counts in its (after, through] window.
+func observeCursor(rec *eventLogRecorder, cursor int64, rkey string) {
+	rec.Observe(&segment.Event{
+		Seq:                 uint64(cursor),
+		UpstreamRelayCursor: cursor,
+		Kind:                segment.KindCreate,
+		DID:                 "did:plc:a",
+		Collection:          "c",
+		Rkey:                rkey,
+		Rev:                 "rev",
+		Payload:             []byte("p"),
+	})
+}
+
+// TestWaitForRowCount is the direct regression guard for the cond-var deadlock
+// guard (otherwise exercised only through the 5-minute live harness). It pins:
+// the count-reached path returns true; an unreachable count returns false on
+// the deadline WITHOUT hanging; and the nil-recorder fast path. Run under
+// `go test -race` it also catches a missed Broadcast or a leaked watcher
+// goroutine in the cond logic. Run after Observe-from-another-goroutine so the
+// wait actually parks and is woken by the broadcast, not by an already-met
+// predicate.
+func TestWaitForRowCount(t *testing.T) {
+	t.Parallel()
+
+	t.Run("reaches count via a concurrent observe", func(t *testing.T) {
+		t.Parallel()
+		rec := newEventLogRecorder()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// Deterministically park the waiter FIRST, then publish, so the rows
+		// arrive via a Broadcast wakeup rather than an already-met predicate.
+		// If the observe ran before the wait, the for-loop guard would return
+		// true without ever calling cond.Wait — the test would pass even with
+		// a broken Broadcast, defeating its purpose. The beforeWait hook fires
+		// while holding r.mu immediately before cond.Wait, and the observer
+		// cannot acquire r.mu to append+Broadcast until cond.Wait releases it,
+		// so closing parked here proves the waiter is genuinely about to park.
+		// A fixed time.Sleep would only narrow the race, not eliminate it.
+		parked := make(chan struct{})
+		var once sync.Once
+		rec.beforeWait = func() { once.Do(func() { close(parked) }) }
+		done := make(chan bool, 1)
+		go func() { done <- rec.waitForRowCount(ctx, 0, 10, 2) }()
+		<-parked
+		observeCursor(rec, 1, "r1")
+		observeCursor(rec, 2, "r2")
+		// Bound the wakeup well inside the 5s deadlock-guard deadline: a
+		// missing Observe Broadcast must surface as a hard failure here, not
+		// as a slow pass woken by the ctx-deadline guard at the 5s mark.
+		select {
+		case got := <-done:
+			require.True(t, got,
+				"waitForRowCount must return true once the window holds the wanted rows")
+		case <-time.After(2 * time.Second):
+			t.Fatal("waitForRowCount was not woken by Observe's Broadcast within 2s")
+		}
+	})
+
+	t.Run("unreachable count returns false on deadline without hanging", func(t *testing.T) {
+		t.Parallel()
+		rec := newEventLogRecorder()
+		observeCursor(rec, 1, "r1") // only one row; we ask for two
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		done := make(chan bool, 1)
+		go func() { done <- rec.waitForRowCount(ctx, 0, 10, 2) }()
+		select {
+		case got := <-done:
+			require.False(t, got, "an unreachable count must return false when the ctx deadline fires")
+		case <-time.After(5 * time.Second):
+			t.Fatal("waitForRowCount did not return after its ctx deadline (missed wakeup / hang)")
+		}
+	})
+
+	t.Run("nil recorder", func(t *testing.T) {
+		t.Parallel()
+		var rec *eventLogRecorder
+		require.True(t, rec.waitForRowCount(context.Background(), 0, 10, 0),
+			"nil recorder with want<=0 is trivially satisfied")
+		require.False(t, rec.waitForRowCount(context.Background(), 0, 10, 1),
+			"nil recorder can never reach a positive want")
+	})
 }

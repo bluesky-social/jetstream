@@ -1,0 +1,30 @@
+{
+  "commit": "007abab5b56d2b32e01a04d71667e8077fd6fce1",
+  "mutants": [
+    {"id":"m001_delete_mapped_to_update","disposition":"KILLED","result":"KILLED@default","note":"hang: test timed out, no oracle assertion (likely liveness break — e.g. barrier never releases; inspect log for the blocked goroutine)"},
+    {"id":"m002_watermark_floor_off_by_one","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m003_merge_cursor_no_advance","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m004_rev_filter_inverted","disposition":"KILLED","result":"KILLED@default","note":"oracle: missing did:plc:iv2erqbe5k4ltaawmik4tfeo app.bsky.actor.profile/22auixj3zqj3g rev="},
+    {"id":"m005_backfill_status_check_inverted","disposition":"KILLED","result":"KILLED@restart","note":"oracle: rev regression for DID did:plc:xe6kimero4ysp4mpzse6npbs at event 13: seq=19 app.bsky.feed.post/22avhp53lzac4 rev="},
+    {"id":"m006_merge_commit_error_swallowed","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m008_header_offset_byteslice","disposition":"KILLED","result":"KILLED@default","note":"see log"},
+    {"id":"m009_checksum_range_off_by_one","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m011_wire_frame_length","disposition":"KILLED","result":"KILLED@default","note":"oracle: walk active segment /tmp/TestOracle_DefaultLifecycle1233169754/003/segments/seg_0000000000.jss: segment: walk active frames: segment"},
+    {"id":"m012_block_event_count_off_by_one","disposition":"KILLED","result":"KILLED@default","note":"see log"},
+    {"id":"m013_collection_rkey_swap","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m014_rev_dropped","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m015_collection_count_double","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m016_bloom_size_off_by_one","disposition":"KILLED","result":"KILLED@default","note":"see log"},
+    {"id":"m017_commit_collection_rkey_swap","disposition":"KILLED","result":"KILLED@default","note":"oracle: event mismatch at index 1: want seq=2 kind=create did=did:plc:osv2tmz2rla3ku63phjjgzdh key=app.bsky.feed.like/22bbxbcjghpur rev=3ke6"},
+    {"id":"m018_commit_rev_dropped","disposition":"KILLED","result":"KILLED@default","note":"oracle: event mismatch at index 1: want seq=2 kind=create did=did:plc:osv2tmz2rla3ku63phjjgzdh key=app.bsky.feed.like/22bbxbcjghpur rev=3ke6"},
+    {"id":"m019_sync_tombstone_dropped","disposition":"KILLED","result":"KILLED@default","note":"hang: test timed out, no oracle assertion (likely liveness break — e.g. barrier never releases; inspect log for the blocked goroutine)"},
+    {"id":"m020_overlay_drop_did_tombstones","disposition":"KILLED","result":"KILLED@default","note":"see log"},
+    {"id":"m021_overlay_record_seq_base_zero","disposition":"KILLED","result":"KILLED@default","note":"see log"},
+    {"id":"m022_shoulddrop_did_seq_inverted","disposition":"KILLED","result":"KILLED@default","note":"hang: test timed out, no oracle assertion (likely liveness break — e.g. barrier never releases; inspect log for the blocked goroutine)"},
+    {"id":"m023_overlay_drop_record_tombstones","disposition":"KILLED","result":"KILLED@default","note":"see log"},
+    {"id":"m024_compaction_over_drop_survivors","disposition":"KILLED","result":"KILLED@default","note":"oracle: missing did:plc:iv2erqbe5k4ltaawmik4tfeo app.bsky.actor.profile/22auixj3zqj3g rev="},
+    {"id":"m025_compaction_overdrop_above_watermark","disposition":"KILLED","result":"KILLED@stress","note":"oracle: missing expected event at index 27528: seq=29284 kind=create did=did:plc:iv2erqbe5k4ltaawmik4tfeo key=app.bsky.feed.repost/22bab3wsv"},
+    {"id":"m026_commit_rev_altered","disposition":"KILLED","result":"KILLED@default","note":"oracle: event mismatch at index 1: want seq=2 kind=create did=did:plc:osv2tmz2rla3ku63phjjgzdh key=app.bsky.feed.like/22bbxbcjghpur rev=3ke6"},
+    {"id":"m027_getrepo_http_fault_disabled","disposition":"KILLED","result":"KILLED@default","note":"see log"}
+  ]
+}
