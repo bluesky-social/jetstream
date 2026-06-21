@@ -1,5 +1,5 @@
 {
-  "commit": "df3fc4b47bab11f65c16d95b22d027ddc209a899",
+  "commit": "007abab5b56d2b32e01a04d71667e8077fd6fce1",
   "mutants": [
     {"id":"m001_delete_mapped_to_update","disposition":"KILLED","result":"KILLED@default","note":"hang: test timed out, no oracle assertion (likely liveness break — e.g. barrier never releases; inspect log for the blocked goroutine)"},
     {"id":"m002_watermark_floor_off_by_one","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
