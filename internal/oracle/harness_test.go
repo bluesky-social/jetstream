@@ -166,6 +166,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
 		OnBeforeCompactionPass: func(targetWatermark uint64) {
+			compaction.ObserveStart()
 			overDrop.ObserveBefore(targetWatermark)
 		},
 		OnCompactionPass: func(result jetstreamd.CompactionPassResult) {
@@ -480,21 +481,22 @@ func assertFirehoseEventLogMatches(
 	// KindCreateResync replacement rows that all share that cursor (see
 	// internal/ingest/live/events.go convertSync), and the recorder is fed
 	// asynchronously by the live callback. A one-shot snapshot can therefore
-	// race ahead of the trailing replacement rows. Poll until the observed count
-	// reaches the deterministic expected count (the world is quiescent across
-	// this comparison window), then run the authoritative multiset compare.
-	// This preserves failure power: a genuinely dropped row never reaches the
-	// count and times out below; a duplicate or wrong row overshoots the count
-	// or fails the compare.
-	var got []EventLogRow
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		got = observed.RowsByUpstreamCursor(cursor, target)
-		if len(got) >= len(want) || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	// race ahead of the trailing replacement rows. Wait (signal-driven, not a
+	// wall-clock poll) until the observed count reaches the deterministic
+	// expected count (the world is quiescent across this comparison window),
+	// then run the authoritative multiset compare. The wait is a deadlock
+	// GUARD with a long deadline: a genuinely dropped row never reaches the
+	// count and surfaces as a clear TIMEOUT (not a confusing multiset
+	// mismatch from a short poll deadline racing a slow runner); a duplicate
+	// or wrong row reaches/overshoots the count and is caught by the compare.
+	// #27/#106 conversion.
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancelWait()
+	reached := observed.waitForRowCount(waitCtx, cursor, target, len(want))
+	got := observed.RowsByUpstreamCursor(cursor, target)
+	require.Truef(t, reached,
+		"%s: timed out waiting for firehose event log cursor=%d target=%d expected=%d observed=%d (a dropped row never reaches the expected count)",
+		phase, cursor, target, len(want), len(got))
 	err = CompareEventLogMultiset(want, got)
 	recordTraceOrError(t, trace, "event_log_compare", map[string]any{
 		"phase":          phase,
@@ -556,11 +558,17 @@ func bisectServedCompactedFailure(
 ) {
 	t.Helper()
 
-	passesBefore := compaction.Count()
+	// Bracket the scan on BOTH the completed-pass and started-pass counts.
+	// A pass that straddles the scan (begins before, ends after) moves
+	// neither completed endpoint during the bracket, but DOES move the
+	// started count, so taking the max of the two deltas detects an
+	// in-flight rewrite that a completed-only bracket would miss (#106).
+	completedBefore := compaction.Count()
+	startedBefore := compaction.StartedCount()
 	disk, err := ObserveSegments(dataDir)
 	require.NoErrorf(t, err, "bisect: observe on-disk segments mode=%s seed=%d watermark=%d", cfg.Mode, cfg.Seed, watermark)
 	disk = EventsSortedBySeq(disk)
-	passesDuringScan := compaction.Count() - passesBefore
+	passesDuringScan := max(compaction.Count()-completedBefore, compaction.StartedCount()-startedBefore)
 
 	v := ClassifyCompactedFailure(servedErr, disk, watermark, passesDuringScan)
 	recordTraceOrError(t, trace, "compacted_bisection", map[string]any{
@@ -687,6 +695,15 @@ type runtimeRun struct {
 type compactionPassRecorder struct {
 	mu      sync.Mutex
 	results []jetstreamd.CompactionPassResult
+	// started counts passes that have BEGUN real rewrite work (fired via
+	// OnBeforeCompactionPass), as opposed to results which counts COMPLETED
+	// passes (OnCompactionPass, in a defer at pass end). The bisect bracket
+	// needs started to detect a pass that STRADDLES the on-disk scan (begins
+	// before the scan, ends after it): such a pass increments neither
+	// Count() endpoint during the bracket, so a completed-only counter reads
+	// passesDuringScan==0 and mislabels a possibly-torn clean read as
+	// SERVING_DEFECT instead of INCONCLUSIVE (#106).
+	started int
 }
 
 func newCompactionPassRecorder() *compactionPassRecorder {
@@ -699,10 +716,28 @@ func (r *compactionPassRecorder) Observe(result jetstreamd.CompactionPassResult)
 	r.results = append(r.results, result)
 }
 
+// ObserveStart records that a compaction pass has begun real rewrite work.
+// Wired to OnBeforeCompactionPass.
+func (r *compactionPassRecorder) ObserveStart() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.started++
+}
+
 func (r *compactionPassRecorder) Count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.results)
+}
+
+// StartedCount returns the number of passes that have begun real rewrite
+// work. Paired with Count() it brackets a straddling pass: if either the
+// started or completed count moves across the scan, a rewrite was in
+// flight during it.
+func (r *compactionPassRecorder) StartedCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.started
 }
 
 func (r *compactionPassRecorder) Last(t *testing.T) jetstreamd.CompactionPassResult {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -103,4 +104,53 @@ func TestClassifyCompactedFailure_NilServedErr_Panics(t *testing.T) {
 	require.Panics(t, func() {
 		ClassifyCompactedFailure(nil, nil, 0, 0)
 	})
+}
+
+// bisectPassesDuringScan mirrors the harness's bisect bracket: a pass that
+// straddles the scan (starts before, ends after) must be detected via the
+// started counter even though the completed counter does not move during
+// the bracket (#106).
+func bisectPassesDuringScan(r *compactionPassRecorder, scan func()) int {
+	completedBefore := r.Count()
+	startedBefore := r.StartedCount()
+	scan()
+	return max(r.Count()-completedBefore, r.StartedCount()-startedBefore)
+}
+
+// A compaction pass that STRADDLES the on-disk scan (begins before the
+// scan, ends after it) increments neither completed-count endpoint during
+// the bracket. A completed-only bracket would read passesDuringScan==0 and
+// mislabel a possibly-torn clean read as SERVING_DEFECT; the started
+// counter must surface it so the verdict is INCONCLUSIVE (#106).
+func TestCompactionPassRecorder_StraddlingPass_DetectedAsInFlight(t *testing.T) {
+	t.Parallel()
+
+	r := newCompactionPassRecorder()
+
+	// Pass begins BEFORE the scan...
+	r.ObserveStart()
+	// ...the scan runs while the pass is in flight (no completion yet)...
+	passes := bisectPassesDuringScan(r, func() {
+		// during the scan the pass completes
+		r.Observe(jetstreamd.CompactionPassResult{Watermark: 10})
+	})
+	require.Positive(t, passes, "a pass in flight across the scan must be detected as raced")
+
+	// Sanity: the classifier turns a raced clean disk into INCONCLUSIVE.
+	v := ClassifyCompactedFailure(errors.New("served check failed"), nil, 10, passes)
+	require.Equal(t, VerdictInconclusive, v.Verdict)
+}
+
+// A pass that fully PRECEDED the scan (started and completed before it)
+// must NOT count as racing the scan, or every post-pass bisect would be
+// spuriously INCONCLUSIVE.
+func TestCompactionPassRecorder_PriorPass_NotInFlight(t *testing.T) {
+	t.Parallel()
+
+	r := newCompactionPassRecorder()
+	r.ObserveStart()
+	r.Observe(jetstreamd.CompactionPassResult{Watermark: 5})
+
+	passes := bisectPassesDuringScan(r, func() { /* quiescent scan */ })
+	require.Zero(t, passes, "a pass that completed before the scan must not count as racing it")
 }

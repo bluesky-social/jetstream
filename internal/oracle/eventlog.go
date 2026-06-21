@@ -1,6 +1,7 @@
 package oracle
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -27,11 +28,14 @@ type EventLogRow struct {
 
 type eventLogRecorder struct {
 	mu     sync.Mutex
+	cond   *sync.Cond
 	events []segment.Event
 }
 
 func newEventLogRecorder() *eventLogRecorder {
-	return &eventLogRecorder{}
+	r := &eventLogRecorder{}
+	r.cond = sync.NewCond(&r.mu)
+	return r
 }
 
 func (r *eventLogRecorder) Observe(ev *segment.Event) {
@@ -40,7 +44,60 @@ func (r *eventLogRecorder) Observe(ev *segment.Event) {
 	}
 	r.mu.Lock()
 	r.events = append(r.events, cloneSegmentEvent(*ev))
+	r.cond.Broadcast()
 	r.mu.Unlock()
+}
+
+// rowCountInRange returns how many normalized rows fall in the
+// (after, through] upstream-cursor window. Caller must hold r.mu.
+func (r *eventLogRecorder) rowCountInRangeLocked(after, through int64) int {
+	var observed []ObservedEvent
+	for _, ev := range r.events {
+		if ev.UpstreamRelayCursor <= after || ev.UpstreamRelayCursor > through {
+			continue
+		}
+		ev.Seq = uint64(ev.UpstreamRelayCursor)
+		observed = append(observed, observedEventFromSegment(ev))
+	}
+	return len(NormalizeEventLog(observed))
+}
+
+// waitForRowCount blocks until at least want normalized rows are present
+// in the (after, through] window, or the deadline-guarded context is
+// cancelled. It is a signal-driven deadlock guard, NOT a correctness wait:
+// a genuinely dropped row never reaches the count and the caller's long
+// guard fires as a clear TIMEOUT (reported as such), rather than a 5ms
+// poll racing a 30s wall-clock deadline and surfacing a confusing
+// multiset mismatch. Returns true if the count was reached, false on
+// ctx.Done (timeout). The caller still runs the authoritative multiset
+// compare afterward, so an OVER-count or wrong row is caught there.
+func (r *eventLogRecorder) waitForRowCount(ctx context.Context, after, through int64, want int) bool {
+	if r == nil {
+		return want <= 0
+	}
+	// A goroutine wakes the cond wait when ctx is cancelled so the guard
+	// cannot block past the deadline even if no further Observe arrives.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			r.mu.Lock()
+			r.cond.Broadcast()
+			r.mu.Unlock()
+		case <-stop:
+		}
+	}()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for r.rowCountInRangeLocked(after, through) < want {
+		if ctx.Err() != nil {
+			return false
+		}
+		r.cond.Wait()
+	}
+	return true
 }
 
 func (r *eventLogRecorder) RowsByUpstreamCursor(after, through int64) []EventLogRow {
