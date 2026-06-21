@@ -456,3 +456,43 @@ on disk (`disk_total == final_records`, no durable tombstones/updates), so it
 cannot exercise the §180-182 lost-intermediate class at all — is real but
 orthogonal to m003. It is tracked as a scenario expansion in #113 (which closed
 the original #103). m003 is not the mutant that demonstrates that gap.
+
+## Campaign 2026-06-20 (m025 — convergence-hiding compaction over-drop, KILLED@stress)
+
+Added `m025_compaction_overdrop_above_watermark` to give the #100 metamorphic
+`compactionOverDropRecorder` an end-to-end mutant that exercises its **unique**
+power: catching an over-drop that final-state convergence hides. The blanket
+m024 mutant does not do this — it drops rows that are still live, so final-state
+`Compare` kills it first.
+
+**Mutant:** the steady compaction pass takes its tombstone snapshot with an
+unbounded high seq (`SnapshotRange(current, ^uint64(0))`) instead of bounding at
+`targetWatermark`. A delete that arrived in the new active segment after the
+pass's force-rotate (seq > W) leaks into the snapshot and suppresses its own
+create — a create ≤ W whose only superseding tombstone is above W, i.e. a
+legitimate survivor of this pass. Exactly one survivor is dropped per pass.
+
+**Result:** KILLED@stress via `compactionOverDropRecorder.Assert` at
+steady-state-shutdown-flush: `compaction over-drop at watermark=W (... dropped=1)`,
+with the dropped row a `create` whose record is deleted above W. **Final-state
+`Compare` stays green** (the record is absent in the end either way), so this is
+caught *only* by the pre/post survivor check — the property #100 exists for.
+Verified killed at full default (~1s) and stress (~20s, the cataloged tier);
+**survives `-short`** (too little steady traffic to materialize a straddle +
+pass), so its home is the stress tier.
+
+**Reachability correction (supersedes the earlier m024 note):** the
+convergence-hiding case is **reachable in steady mode**, not (as previously
+claimed) structurally impossible there. Force-rotating the active segment before
+a pass does NOT make W cover every event: a delete arriving in the new active
+segment after the rotate has seq > W and stays in the live tombstone set above W,
+so the `(create ≤ W, delete > W)` straddle is the *normal* steady-state shape.
+It is the restart/merge-tail path that cannot host it — there the compaction
+tombstone snapshot always spans the whole sealed stream, so every drop decision
+is complete and no above-scope straddle exists. This was confirmed by direct
+on-disk probing of the crashed restart child (single merged segment, snapshot
+folds the full `(0, targetWatermark]` range). Consequently the #100 end-to-end
+over-drop proof lives in the **steady-state lifecycle tier** (m025), and the
+restart-tier B-crash variant contemplated by #113's plan was withdrawn as
+structurally infeasible. The exploratory restart-tier merge-segment plumbing
+added during that investigation was reverted to keep the harness lean.
