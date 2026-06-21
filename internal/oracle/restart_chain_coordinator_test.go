@@ -26,6 +26,7 @@ type chainCoordinator struct {
 	spec       chainSpec
 	hostDID    string
 	didReactID string // DID hosting shape F, "" if none
+	syncDivID  string // DID hosting shape G, "" if none
 
 	once sync.Once
 	mu   sync.Mutex
@@ -36,6 +37,11 @@ type chainCoordinator struct {
 	didReactOnce sync.Once
 	didReactErr  error
 	didReactDone bool
+
+	// shape G result, generated on the syncDiverge DID's getRepo.
+	syncDivOnce sync.Once
+	syncDivErr  error
+	syncDivDone bool
 }
 
 func newChainCoordinator(t *testing.T, w *world.World, spec chainSpec) *chainCoordinator {
@@ -52,6 +58,11 @@ func newChainCoordinator(t *testing.T, w *world.World, spec chainSpec) *chainCoo
 		dacct, err := w.LoadAccount(spec.didReact.accountIdx)
 		require.NoError(t, err)
 		c.didReactID = string(dacct.DID)
+	}
+	if spec.syncDiverge != nil {
+		gacct, err := w.LoadAccount(spec.syncDiverge.accountIdx)
+		require.NoError(t, err)
+		c.syncDivID = string(gacct.DID)
 	}
 	c.seedBackfillRecords()
 	return c
@@ -97,6 +108,30 @@ func (c *chainCoordinator) onGetRepoServed(did string) {
 			c.mu.Unlock()
 		})
 	}
+	if c.syncDivID != "" && did == c.syncDivID {
+		c.syncDivOnce.Do(func() {
+			err := c.generateSyncDivergence()
+			c.mu.Lock()
+			c.syncDivErr = err
+			c.syncDivDone = true
+			c.mu.Unlock()
+		})
+	}
+}
+
+// generateSyncDivergence drives shape G on its dedicated DID: a silent
+// repo mutation (a create whose #commit is suppressed) followed by a
+// #sync. Jetstream's verifier detects the chain break on the #sync and
+// repairs via an async getRepo resync, archiving a KindSync DID tombstone
+// plus KindCreateResync rows for the full current repo. The DID is served
+// early (spec allocates host+2) so the async resync lands before cutover.
+func (c *chainCoordinator) generateSyncDivergence() error {
+	ctx := context.Background()
+	g := c.spec.syncDiverge
+	if _, err := c.w.GenerateSilentMutationThenSyncForTest(ctx, g.accountIdx); err != nil {
+		return fmt.Errorf("shape G silent-mutation-then-sync: %w", err)
+	}
+	return nil
 }
 
 // generateDIDReactivation drives shape F on its dedicated DID: an
@@ -126,6 +161,16 @@ func (c *chainCoordinator) didReactResult() {
 	defer c.mu.Unlock()
 	require.NoError(c.t, c.didReactErr, "shape F generation failed")
 	require.True(c.t, c.didReactDone, "shape F never generated: getRepo for its DID was not observed")
+}
+
+// syncDivResult returns shape G's generation status, failing the test if
+// it never ran or errored.
+func (c *chainCoordinator) syncDivResult() {
+	c.t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	require.NoError(c.t, c.syncDivErr, "shape G generation failed")
+	require.True(c.t, c.syncDivDone, "shape G never generated: getRepo for its DID was not observed")
 }
 
 // generate issues every record chain's LIVE ops in order on the host DID

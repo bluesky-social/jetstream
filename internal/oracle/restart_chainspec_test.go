@@ -108,6 +108,24 @@ type didReactivation struct {
 	rkey       string // the post-reactivation record key
 }
 
+// syncDivergence is the shape G fixture: a silent repo mutation (a create
+// whose #commit is suppressed) followed by a #sync on a DEDICATED DID. It
+// forces jetstream's verifier to detect a chain break and repair via an
+// async getRepo resync, which archives a KindSync DID tombstone plus
+// KindCreateResync replacement rows for the repo's full current state. The
+// seam: across a restart, the resync rows must (a) survive the merge, (b)
+// reconstruct the full repo (including the silently-created record), and
+// (c) sit above the sync tombstone so the DID is visible again — the
+// sync-flavored DID-level no-permanent-tombstone contract.
+//
+// The DID must be backfilled EARLY: the async resync runs on a verifier
+// worker and must land its rows before cutover truncates the live window.
+// A late-served DID flakes (verified: resync rows truncated). This mirrors
+// the Group 0 Q2 early-DID + baseline-gated timing discipline.
+type syncDivergence struct {
+	accountIdx int
+}
+
 // chainSpec is the full seed-derived plan of durable intermediates to
 // inject after the chain DID's getRepo is served. It is a pure function
 // of the seed (deriveChainSpec): same seed → identical spec (so a CI
@@ -120,6 +138,10 @@ type chainSpec struct {
 	// record-chain host) so the record chains and the DID reset don't
 	// interfere. nil only if there are too few accounts.
 	didReact *didReactivation
+	// syncDiverge, when set, hosts shape G on a DEDICATED account distinct
+	// from the chain host and the shape-F DID. nil if there are too few
+	// accounts to allocate a third dedicated DID.
+	syncDiverge *syncDivergence
 }
 
 // chainCollections is the set of collections a chain record may use.
@@ -185,11 +207,22 @@ func deriveChainSpec(seed uint64, accounts int) chainSpec {
 	// distinct from the record-chain host so the DID reset doesn't wipe the
 	// record chains. Requires >= 2 accounts; the restart tier uses 4.
 	if accounts >= 2 {
-		didIdx := (chainAccountIdx + 1 + rng.IntN(accounts-1)) % accounts
+		didIdx := (chainAccountIdx + 1) % accounts
 		spec.didReact = &didReactivation{
 			accountIdx: didIdx,
 			collection: chainCollections[rng.IntN(len(chainCollections))],
 			rkey:       deriveChainRkey(rng),
+		}
+	}
+
+	// Shape G (#sync divergence) needs a third DEDICATED account, distinct
+	// from both the chain host and the shape-F DID, so the silent-mutation
+	// resync repair doesn't entangle the other fixtures. Requires >= 3
+	// accounts; the restart tier uses 4. (host, host+1, host+2 mod accounts
+	// are pairwise distinct when accounts >= 3.)
+	if accounts >= 3 {
+		spec.syncDiverge = &syncDivergence{
+			accountIdx: (chainAccountIdx + 2) % accounts,
 		}
 	}
 	return spec
