@@ -8,8 +8,9 @@ failure-mode: |
   segment) therefore leaks into the snapshot and suppresses its own create —
   a create at/below the watermark that the pass should have KEPT (its only
   superseding tombstone is above the watermark, so the create is still a
-  legitimate survivor of this pass). A surgical, convergence-hiding compaction
-  over-drop: exactly one survivor per pass is wrongly removed.
+  legitimate survivor of this pass). A convergence-hiding compaction over-drop:
+  one or more survivors per pass can be wrongly removed (the observed failing
+  pass reported dropped=1).
 expected-detection: |
   Killed by the metamorphic compactionOverDropRecorder.Assert at
   steady-state-shutdown-flush in TestOracle_DefaultLifecycle (full lifecycle,

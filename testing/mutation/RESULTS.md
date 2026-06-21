@@ -5,12 +5,14 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 22 active mutants on disk
-(m001–m024; m007 and m010 retired). Latest full campaign: 2026-06-20 at
-`b937b6e` — 14 killed, 8 survived (see the dated section at the end of this
-file for the authoritative current scorecard). Counts inside older dated
-sections describe the catalog *as of that date* and are intentionally not
-back-edited.**
+**Current catalog (keep this line current): 23 active mutants on disk
+(m001–m025; m007 and m010 retired). Latest full campaign: 2026-06-20 at
+`b937b6e` — 14 killed, 8 survived over m001–m024 (see the dated section at the
+end of this file for the authoritative current scorecard). m025 was a targeted
+addition after that campaign, `KILLED@stress`, bringing the current catalog
+disposition to 15 killed, 8 survived until the next full campaign supersedes it.
+Counts inside older dated sections describe the catalog *as of that date* and are
+intentionally not back-edited.**
 
 ## Retired mutants
 
@@ -470,7 +472,8 @@ unbounded high seq (`SnapshotRange(current, ^uint64(0))`) instead of bounding at
 `targetWatermark`. A delete that arrived in the new active segment after the
 pass's force-rotate (seq > W) leaks into the snapshot and suppresses its own
 create — a create ≤ W whose only superseding tombstone is above W, i.e. a
-legitimate survivor of this pass. Exactly one survivor is dropped per pass.
+legitimate survivor of this pass. One or more such survivors can be dropped per
+pass (the observed failing pass reported `dropped=1`).
 
 **Result:** KILLED@stress via `compactionOverDropRecorder.Assert` at
 steady-state-shutdown-flush: `compaction over-drop at watermark=W (... dropped=1)`,
