@@ -30,6 +30,14 @@ const (
 	// update must survive (rev > BackfillRev) and supersede the
 	// backfilled create at compaction.
 	shapeBfCreateUpdate chainShape = "bf-create-update"
+	// shapeBfCreateDelete is R_bf create(@backfill)→delete(live): the
+	// backfilled create is tombstoned by a live delete (rev > BackfillRev).
+	// The tombstone survives the merge and supersedes the backfilled
+	// create at compaction; final state is absent. The convergence-hiding
+	// lost-CREATE power (§180-182) needs the create to survive uncompacted
+	// (straddle create≤W / delete>W) and is delivered by B-crash, not the
+	// no-crash path.
+	shapeBfCreateDelete chainShape = "bf-create-delete"
 )
 
 // chainOrigin records whether a chain record existed at backfill (R_bf)
@@ -46,7 +54,7 @@ const (
 // pinnedShapes is the always-present set: every shape is generated on
 // every seed so no post-restart assertion is ever vacuous. Per-shape
 // issues (A,B,C,D,F,…) extend this set as they land.
-var pinnedShapes = []chainShape{shapeLiveCUD, shapeLiveDeleteRecreate, shapeBfCreateUpdate}
+var pinnedShapes = []chainShape{shapeLiveCUD, shapeLiveDeleteRecreate, shapeBfCreateUpdate, shapeBfCreateDelete}
 
 // recordChain is one record's full op sequence on a single
 // (accountIdx, collection, rkey). origin records whether the record
@@ -131,6 +139,11 @@ func deriveChainSpec(seed uint64, accounts int) chainSpec {
 			// durable intermediate that must survive the rev-filter.
 			origin = originBackfill
 			ops = []string{"create", "update"}
+		case shapeBfCreateDelete:
+			// Seed create lands at backfill; the live delete tombstone is
+			// the durable intermediate. Final state absent.
+			origin = originBackfill
+			ops = []string{"create", "delete"}
 		default:
 			panic(fmt.Sprintf("oracle: unhandled pinned chain shape %q", shape))
 		}
