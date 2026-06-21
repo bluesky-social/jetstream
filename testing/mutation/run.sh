@@ -85,16 +85,18 @@ trap 'exit 143' TERM
 
 # json_escape emits a JSON-safe rendering of its argument (sans surrounding
 # quotes). Notes originate from grepped 'oracle: ...' lines, so backslashes and
-# double-quotes are the realistic hazards; tabs/newlines are flattened to spaces
-# so each value stays on one logical line. This keeps the JSON contract free of
-# a jq dependency on the runner.
+# double-quotes are the realistic hazards and are backslash-escaped. Every C0
+# control byte (U+0000–U+001F: tabs, newlines, carriage returns, and ANSI/
+# terminal bytes that can leak in from `go test` output) is then flattened to a
+# space: encoding/json in the #108 gate rejects ANY raw control byte inside a
+# string, so leaving even a lone \r in a note would make the whole result
+# document undecodable and silently break the gate. tr is coreutils, so this
+# keeps the JSON contract free of a jq dependency on the runner.
 json_escape() {
     local s=$1
     s=${s//\\/\\\\}
     s=${s//\"/\\\"}
-    s=${s//$'\t'/ }
-    s=${s//$'\n'/ }
-    printf '%s' "$s"
+    printf '%s' "$s" | LC_ALL=C tr '\000-\037' ' '
 }
 
 declare -a ROWS=()

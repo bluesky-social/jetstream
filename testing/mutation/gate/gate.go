@@ -189,9 +189,20 @@ func hasFailures(vs []Violation) bool {
 	return false
 }
 
-// ParseCampaign decodes a campaign/baseline JSON document and rejects a
-// duplicate mutant id (which would make indexByID silently drop a row and mask
-// a regression).
+// ParseCampaign decodes a campaign/baseline JSON document and rejects corrupt
+// input at the boundary (project directive: fail loud over corrupt). It rejects:
+//
+//   - a duplicate mutant id, which would make indexByID silently drop a row and
+//     mask a regression;
+//   - an empty mutant id;
+//   - an unrecognised disposition string. Both the baseline and the fresh result
+//     flow through here, so a baseline typo such as "KILED" can never reach the
+//     regression check (where == dispKilled would silently miss and a genuine
+//     KILLED->SURVIVED regression would pass the gate);
+//   - trailing bytes after the JSON document. json.Decoder.Decode reads exactly
+//     one value and leaves the rest of the stream unread, so without this check a
+//     valid campaign followed by junk or a second document parses clean — hiding
+//     corruption in an enforcement artifact instead of failing closed.
 func ParseCampaign(r io.Reader) (Campaign, error) {
 	var c Campaign
 	dec := json.NewDecoder(r)
@@ -199,10 +210,16 @@ func ParseCampaign(r io.Reader) (Campaign, error) {
 	if err := dec.Decode(&c); err != nil {
 		return Campaign{}, fmt.Errorf("decode campaign json: %w", err)
 	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return Campaign{}, fmt.Errorf("decode campaign json: trailing data after the campaign document")
+	}
 	seen := map[string]struct{}{}
 	for _, m := range c.Mutants {
 		if m.ID == "" {
 			return Campaign{}, fmt.Errorf("campaign contains a mutant with an empty id")
+		}
+		if !isKnownDisposition(m.Disposition) {
+			return Campaign{}, fmt.Errorf("campaign mutant %q has unrecognised disposition %q", m.ID, m.Disposition)
 		}
 		if _, dup := seen[m.ID]; dup {
 			return Campaign{}, fmt.Errorf("campaign contains duplicate mutant id %q", m.ID)

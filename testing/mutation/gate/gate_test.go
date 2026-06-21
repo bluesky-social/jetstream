@@ -139,6 +139,58 @@ func TestParseCampaign(t *testing.T) {
 	}
 }
 
+// A typo in a committed baseline disposition (e.g. "KILED" for "KILLED") must
+// be rejected at parse time. Otherwise it would slip past the regression check
+// in Evaluate — `b.Disposition == dispKilled` is a false equality against the
+// typo — and a genuine KILLED->SURVIVED regression would pass the gate, the
+// exact loss of detection power the gate exists to catch.
+func TestParseCampaign_RejectsUnknownDisposition(t *testing.T) {
+	const doc = `{
+  "commit": "deadbeef",
+  "mutants": [
+    {"id": "m001", "disposition": "KILED", "result": "KILLED@default", "note": "typo"}
+  ]
+}`
+	_, err := ParseCampaign(strings.NewReader(doc))
+	if err == nil {
+		t.Fatal("expected a parse error for an unrecognised disposition, got nil")
+	}
+	if !strings.Contains(err.Error(), "unrecognised disposition") {
+		t.Fatalf("expected an unrecognised-disposition error, got: %v", err)
+	}
+}
+
+// json.Decoder.Decode reads one value and leaves trailing bytes unread, so a
+// valid campaign followed by junk or a second document must be rejected rather
+// than silently accepted — an enforcement artifact has to fail closed on
+// corruption.
+func TestParseCampaign_RejectsTrailingData(t *testing.T) {
+	const doc = `{
+  "commit": "deadbeef",
+  "mutants": [{"id": "m001", "disposition": "KILLED"}]
+} trailing garbage`
+	_, err := ParseCampaign(strings.NewReader(doc))
+	if err == nil {
+		t.Fatal("expected a parse error for trailing data, got nil")
+	}
+	if !strings.Contains(err.Error(), "trailing data") {
+		t.Fatalf("expected a trailing-data error, got: %v", err)
+	}
+}
+
+// A second concatenated JSON document is the same hazard as trailing junk.
+func TestParseCampaign_RejectsSecondDocument(t *testing.T) {
+	const doc = `{"commit": "a", "mutants": [{"id": "m001", "disposition": "KILLED"}]}
+{"commit": "b", "mutants": []}`
+	_, err := ParseCampaign(strings.NewReader(doc))
+	if err == nil {
+		t.Fatal("expected a parse error for a second document, got nil")
+	}
+	if !strings.Contains(err.Error(), "trailing data") {
+		t.Fatalf("expected a trailing-data error, got: %v", err)
+	}
+}
+
 func hasKind(vs []Violation, k Kind) bool {
 	for _, v := range vs {
 		if v.Kind == k {
