@@ -7,6 +7,7 @@
 #   testing/mutation/run.sh m019            # run one mutant (filename prefix match)
 #   testing/mutation/run.sh m002 --seeds 5  # stress sweep over 5 random seeds
 #   testing/mutation/run.sh --json out.json # also emit a machine-readable result
+#   testing/mutation/run.sh --race          # run every tier under -race (#107)
 #
 # The optional --json file is the contract consumed by the #108 campaign gate
 # (testing/mutation/gate): a stable {commit, mutants:[{id, disposition, result,
@@ -20,6 +21,7 @@ MUTANTS_DIR="testing/mutation/mutants"
 ONLY=""
 SEEDS=0
 JSON_OUT=""
+RACE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --seeds)
@@ -34,9 +36,32 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             JSON_OUT="$2"; shift 2 ;;
+        --race)
+            RACE=1; shift ;;
         *) ONLY="$1"; shift ;;
     esac
 done
+
+# Under --race the data-race detector instruments every tier's `go test`, so a
+# race-only regression in the stress/restart interleavings (the #107 gap: the
+# only existing race coverage is ci.yml's default-mode lane) becomes a kill. The
+# detector slows execution ~5-15x, so each tier's timeout is widened to keep a
+# healthy run from racing its own bound and reading as a false liveness kill.
+# A genuine hang still kills via the (larger) timeout. The default-tier -short
+# run is ~1s clean, so even 10x under race stays well inside 15m; that timeout
+# only fires on a real hang. RACE_FLAG expands to nothing when disabled (safe
+# under set -u in bash >=4.4).
+RACE_FLAG=()
+default_timeout="5m"
+stress_timeout="30m"
+restart_timeout="10m"
+if [[ "$RACE" -eq 1 ]]; then
+    RACE_FLAG=(-race)
+    default_timeout="15m"
+    stress_timeout="90m"
+    restart_timeout="30m"
+    echo "mutation campaign: race detector ENABLED (timeouts default=$default_timeout stress=$stress_timeout restart=$restart_timeout)"
+fi
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
     echo "error: uncommitted changes to tracked files; commit or stash first" >&2
@@ -153,8 +178,8 @@ for patch in "$MUTANTS_DIR"/*.patch; do
             seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
             echo "    seed sweep $i/$SEEDS seed=$seed"
             if ! env JETSTREAM_ORACLE_MODE=stress JETSTREAM_ORACLE_SEED="$seed" \
-                go test ./internal/oracle -run 'TestOracle_DefaultLifecycle$' \
-                -count=1 -timeout 30m >"$LOG_ROOT/$id.seed$i.log" 2>&1; then
+                go test "${RACE_FLAG[@]}" ./internal/oracle -run 'TestOracle_DefaultLifecycle$' \
+                -count=1 -timeout "$stress_timeout" >"$LOG_ROOT/$id.seed$i.log" 2>&1; then
                 kills=$((kills + 1))
                 echo "        KILLED seed=$seed"
             fi
@@ -168,20 +193,20 @@ for patch in "$MUTANTS_DIR"/*.patch; do
         for tier in ${tiers//,/ }; do
             case "$tier" in
                 default)
-                    # -timeout 5m bounds a mutant that breaks LIVENESS rather
+                    # -timeout bounds a mutant that breaks LIVENESS rather
                     # than tripping an assertion: e.g. a delete->update mutation
                     # stalls the bootstrap seq-ack contiguity wait so the
                     # after-bootstrap barrier never releases. A healthy -short
                     # run finishes in ~1s, so the timeout only fires on a hung
                     # mutant, where it is the kill signal (non-zero exit) instead
-                    # of Go's silent 10m default.
-                    cmd=(go test ./internal/oracle -run 'TestOracle_DefaultLifecycle$' -count=1 -short -timeout 5m) ;;
+                    # of Go's silent 10m default. (Widened under --race.)
+                    cmd=(go test "${RACE_FLAG[@]}" ./internal/oracle -run 'TestOracle_DefaultLifecycle$' -count=1 -short -timeout "$default_timeout") ;;
                 stress)
-                    cmd=(env JETSTREAM_ORACLE_MODE=stress go test ./internal/oracle
-                         -run 'TestOracle_DefaultLifecycle$' -count=1 -timeout 30m) ;;
+                    cmd=(env JETSTREAM_ORACLE_MODE=stress go test "${RACE_FLAG[@]}" ./internal/oracle
+                         -run 'TestOracle_DefaultLifecycle$' -count=1 -timeout "$stress_timeout") ;;
                 restart)
-                    cmd=(go test ./internal/oracle -run 'TestOracle_RestartCrashPointsDoNotLoseRecords$'
-                         -count=1 -timeout 10m) ;;
+                    cmd=(go test "${RACE_FLAG[@]}" ./internal/oracle -run 'TestOracle_RestartCrashPointsDoNotLoseRecords$'
+                         -count=1 -timeout "$restart_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2
                     exit 1 ;;

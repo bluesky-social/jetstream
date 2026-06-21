@@ -110,7 +110,7 @@ oracle:
 # fault injection is on by default (JETSTREAM_ORACLE_FAULT_MODE=swarm); the
 # sweep relies on it to exercise backfill retry/recovery and live reconnect/
 # resume recovery on every seed.
-oracle-sweep SEEDS="10":
+oracle-sweep SEEDS="10" RACE="":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -121,6 +121,21 @@ oracle-sweep SEEDS="10":
     # bit-reproducible scheduling, so it must outlive the test process.
     artifact_root="${ORACLE_ARTIFACT_DIR:-oracle-artifacts}"
     mkdir -p "${artifact_root}"
+
+    # RACE="" (default): no race detector, 30m per-seed timeout. Any non-empty
+    # RACE arg enables `-race` and raises the timeout to 90m, because the race
+    # detector slows execution ~5-15x and inflates memory; the #107 race lane
+    # runs FEW seeds within this larger budget rather than the full nightly
+    # count. The restart tier re-execs the SAME test binary as its child
+    # (os.Args[0]), so -race instruments both the parent harness and the killed
+    # child — the data-race coverage is real on both tiers, not just the parent.
+    race_flag=()
+    per_seed_timeout="30m"
+    if [[ -n "{{RACE}}" ]]; then
+        race_flag=(-race)
+        per_seed_timeout="90m"
+        echo "oracle-sweep: race detector ENABLED (per-seed timeout ${per_seed_timeout})"
+    fi
 
     for i in $(seq 1 "{{SEEDS}}"); do
         # Draw a fresh random uint64 seed each iteration so successive nightly
@@ -147,7 +162,7 @@ oracle-sweep SEEDS="10":
             JETSTREAM_ORACLE_MODE=stress \
             JETSTREAM_ORACLE_SEED="${seed}" \
             JETSTREAM_ORACLE_TRACE_DIR="${seed_dir}" \
-            gotestsum --format-hide-empty-pkg --format-icons hivis --jsonfile "${seed_dir}/gotestsum.jsonl" -- -count=1 -timeout 30m ./internal/oracle -run TestOracle_DefaultLifecycle -v \
+            gotestsum --format-hide-empty-pkg --format-icons hivis --jsonfile "${seed_dir}/gotestsum.jsonl" -- -count=1 -timeout "${per_seed_timeout}" "${race_flag[@]}" ./internal/oracle -run TestOracle_DefaultLifecycle -v \
             2>&1 | tee "${seed_dir}/test-output.log"; then
             echo "::endgroup::"
             echo "::error::oracle failed at seed ${seed} (artifacts: ${seed_dir})"
@@ -184,7 +199,7 @@ oracle-sweep SEEDS="10":
         if ! GOTRACEBACK=all \
             JETSTREAM_ORACLE_SEED="${seed}" \
             JETSTREAM_ORACLE_TRACE_DIR="${seed_dir}" \
-            gotestsum --format-hide-empty-pkg --format-icons hivis --jsonfile "${seed_dir}/gotestsum-restart.jsonl" -- -count=1 -timeout 30m ./internal/oracle -run 'TestOracle_Restart' -v \
+            gotestsum --format-hide-empty-pkg --format-icons hivis --jsonfile "${seed_dir}/gotestsum-restart.jsonl" -- -count=1 -timeout "${per_seed_timeout}" "${race_flag[@]}" ./internal/oracle -run 'TestOracle_Restart' -v \
             2>&1 | tee "${seed_dir}/test-output-restart.log"; then
             echo "::endgroup::"
             echo "::error::oracle restart tier failed at seed ${seed} (artifacts: ${seed_dir})"
