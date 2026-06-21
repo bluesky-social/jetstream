@@ -1,0 +1,81 @@
+package oracle
+
+import (
+	"testing"
+
+	"github.com/bluesky-social/jetstream/segment"
+	"github.com/stretchr/testify/require"
+)
+
+// TestOracle_RestartChainShapeD_LiveDeleteRecreate covers shape D
+// (specs/notes/2026-06-20-restart-tier-intermediates-plan.md §6): a record
+// created, deleted, then RECREATED on the same rkey at a higher seq. The
+// seam it proves is record-level no-permanent-tombstone (docs/README.md:358):
+// the overlay mask is half-open (seq < tombstone.seq), so the recreate
+// ABOVE the tombstone is not masked and the record reconstructs as present.
+//
+// Red-first power test: with the recreate row removed, reconstruction must
+// show the record ABSENT — i.e. the recreate is the only thing making it
+// visible past the delete tombstone. This is the counterfactual of the
+// permanent-tombstone bug (a mask that incorrectly hid the recreate).
+//
+// nolint:paralleltest
+func TestOracle_RestartChainShapeD_LiveDeleteRecreate(t *testing.T) {
+	run := runChainToMergeNoCrash(t, "shape-d", 0)
+
+	assertOracleMatches(t, run.dataDir, run.w, run.cfg, "shape-d")
+	// assertChainDurable already checks the recreate reconstructs present.
+	assertChainDurable(t, run.dataDir, run.coord, "shape-d")
+
+	rc := recordChainForShape(t, run.spec, shapeLiveDeleteRecreate)
+	cov := chainCoverage(t, run.dataDir, run.coord)
+	key := RecordKey{DID: run.coord.hostDID, Collection: rc.collection, Rkey: rc.rkey}
+
+	// Positive: present with the recreate row on disk.
+	present, err := Reconstruct(cov.events)
+	require.NoError(t, err)
+	snap, ok := present.Accounts[run.coord.hostDID]
+	require.True(t, ok)
+	_, ok = snap.Records[key]
+	require.Truef(t, ok, "recreated record %s/%s must be visible", rc.collection, rc.rkey)
+
+	// Red: drop the recreate (the create row ABOVE the delete tombstone)
+	// and confirm the record then reconstructs ABSENT — proving the
+	// recreate is what defeats the tombstone, and that a mask incorrectly
+	// hiding it (a permanent tombstone) would be caught.
+	withoutRecreate := dropHighestCreateForKey(cov.events, run.coord.hostDID, rc.collection, rc.rkey)
+	masked, err := Reconstruct(withoutRecreate)
+	require.NoError(t, err)
+	if snap, ok := masked.Accounts[run.coord.hostDID]; ok {
+		_, stillThere := snap.Records[key]
+		require.Falsef(t, stillThere,
+			"counterfactual: without the recreate, %s/%s must be absent (delete tombstone wins)", rc.collection, rc.rkey)
+	}
+}
+
+// dropHighestCreateForKey removes the create/create_resync row with the
+// HIGHEST seq for (did, coll, rkey) — i.e. the recreate above any delete
+// tombstone — leaving everything else intact. Models a mask that
+// incorrectly hides the recreate.
+func dropHighestCreateForKey(events []ObservedEvent, did, coll, rkey string) []ObservedEvent {
+	bestIdx := -1
+	var bestSeq uint64
+	for i, e := range events {
+		if e.DID != did || e.Collection != coll || e.Rkey != rkey {
+			continue
+		}
+		if e.Kind != segment.KindCreate && e.Kind != segment.KindCreateResync {
+			continue
+		}
+		if bestIdx == -1 || e.Seq > bestSeq {
+			bestIdx, bestSeq = i, e.Seq
+		}
+	}
+	if bestIdx == -1 {
+		return events
+	}
+	out := make([]ObservedEvent, 0, len(events)-1)
+	out = append(out, events[:bestIdx]...)
+	out = append(out, events[bestIdx+1:]...)
+	return out
+}
