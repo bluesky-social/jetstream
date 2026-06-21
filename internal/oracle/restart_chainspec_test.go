@@ -96,6 +96,18 @@ func (rc recordChain) liveOps() []string {
 	return rc.ops
 }
 
+// didReactivation is the shape F fixture: an account-delete (a DID-level
+// tombstone) followed by reactivation and a fresh post, all in the live
+// window. It is DID-keyed, not record-keyed, so it lives outside the
+// recordChain list. The seam: the DID tombstone resets the repo, and a
+// record created after reactivation (a higher seq) is visible again — the
+// DID-level no-permanent-tombstone contract.
+type didReactivation struct {
+	accountIdx int
+	collection string
+	rkey       string // the post-reactivation record key
+}
+
 // chainSpec is the full seed-derived plan of durable intermediates to
 // inject after the chain DID's getRepo is served. It is a pure function
 // of the seed (deriveChainSpec): same seed → identical spec (so a CI
@@ -104,6 +116,10 @@ func (rc recordChain) liveOps() []string {
 type chainSpec struct {
 	seed    uint64
 	records []recordChain
+	// didReact, when set, hosts shape F on a DEDICATED account (not the
+	// record-chain host) so the record chains and the DID reset don't
+	// interfere. nil only if there are too few accounts.
+	didReact *didReactivation
 }
 
 // chainCollections is the set of collections a chain record may use.
@@ -163,6 +179,18 @@ func deriveChainSpec(seed uint64, accounts int) chainSpec {
 			rkey:       rkey,
 			ops:        ops,
 		})
+	}
+
+	// Shape F (DID-level no-permanent-tombstone) needs a DEDICATED account
+	// distinct from the record-chain host so the DID reset doesn't wipe the
+	// record chains. Requires >= 2 accounts; the restart tier uses 4.
+	if accounts >= 2 {
+		didIdx := (chainAccountIdx + 1 + rng.IntN(accounts-1)) % accounts
+		spec.didReact = &didReactivation{
+			accountIdx: didIdx,
+			collection: chainCollections[rng.IntN(len(chainCollections))],
+			rkey:       deriveChainRkey(rng),
+		}
 	}
 	return spec
 }

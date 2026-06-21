@@ -178,6 +178,13 @@ func (w *World) GenerateAccountDeleteForTest(ctx context.Context, idx int) ([]by
 	return w.generateAccountDelete(ctx, idx)
 }
 
+// GenerateAccountReactivateForTest clears a deleted account's flag and
+// emits an Active:true #account frame, re-enabling commits. Oracle tests
+// use it for the DID-level no-permanent-tombstone path.
+func (w *World) GenerateAccountReactivateForTest(ctx context.Context, idx int) ([]byte, error) {
+	return w.generateAccountReactivate(ctx, idx)
+}
+
 func (w *World) IsAccountDeleted(idx int) (bool, error) {
 	return w.isAccountDeleted(idx)
 }

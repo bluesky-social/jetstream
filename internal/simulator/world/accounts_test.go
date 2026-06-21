@@ -76,6 +76,66 @@ func TestGenerateAccountDeleteForTestMarksInactiveAndEmitsFrame(t *testing.T) {
 	require.Equal(t, frame, frames[0])
 }
 
+func TestGenerateAccountReactivateForTest_ClearsDeletedAndEmitsActiveFrame(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Accounts = 2
+	cfg.InitialRecords = 1
+	w, err := New(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	require.NoError(t, w.Bootstrap(context.Background(), slog.Default()))
+	require.NoError(t, w.AttachRuntime(rand.New(rand.NewPCG(1, 2)), fanout.New(16)))
+
+	_, err = w.GenerateAccountDeleteForTest(context.Background(), 0)
+	require.NoError(t, err)
+	deleted, err := w.IsAccountDeleted(0)
+	require.NoError(t, err)
+	require.True(t, deleted)
+
+	// Reactivating a non-deleted account is an error.
+	_, err = w.GenerateAccountReactivateForTest(context.Background(), 1)
+	require.Error(t, err, "reactivating a live account must fail")
+
+	frame, err := w.GenerateAccountReactivateForTest(context.Background(), 0)
+	require.NoError(t, err)
+	require.NotEmpty(t, frame)
+
+	deleted, err = w.IsAccountDeleted(0)
+	require.NoError(t, err)
+	require.False(t, deleted, "reactivate must clear the deleted flag")
+
+	acct := decodeAccountFrameForTest(t, frame)
+	require.True(t, acct.Active, "reactivate frame must be Active:true")
+	require.False(t, acct.Status.HasVal(), "reactivate frame carries no status")
+
+	// Reactivation resets the repo to empty (atproto semantics; matches
+	// jetstream's DID-tombstone reset). Account 0 had an initial record.
+	rp, _, err := w.LoadRepo(0)
+	require.NoError(t, err)
+	n := 0
+	require.NoError(t, rp.Tree.Walk(func(string, cbor.CID) error { n++; return nil }))
+	require.Zero(t, n, "reactivated repo must start empty")
+
+	// Commits are re-enabled: a fresh op on the reactivated account
+	// succeeds and is the only record at head.
+	_, op, err := w.GenerateRecordOpForTest(context.Background(), 0, "create", collPost, "3kreactivepost0")
+	require.NoError(t, err)
+	require.Equal(t, "create", op.Action)
+
+	rp, _, err = w.LoadRepo(0)
+	require.NoError(t, err)
+	n = 0
+	require.NoError(t, rp.Tree.Walk(func(string, cbor.CID) error { n++; return nil }))
+	require.Equal(t, 1, n, "only the post-reactivation record is live")
+
+	entries, _, err := w.ListReposPage(0, 10)
+	require.NoError(t, err)
+	require.True(t, entries[0].Active, "reactivated account must list as active")
+}
+
 func TestGenerateAccountDeleteForTestUsesDeterministicTime(t *testing.T) {
 	t.Parallel()
 

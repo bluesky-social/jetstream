@@ -21,15 +21,21 @@ import (
 // intermediates. Generation happens exactly once, on the FIRST getRepo
 // for the chain DID.
 type chainCoordinator struct {
-	t       *testing.T
-	w       *world.World
-	spec    chainSpec
-	hostDID string
+	t          *testing.T
+	w          *world.World
+	spec       chainSpec
+	hostDID    string
+	didReactID string // DID hosting shape F, "" if none
 
 	once sync.Once
 	mu   sync.Mutex
 	ops  []world.GeneratedChainOp // recorded in generation order
 	err  error
+
+	// shape F result, generated on the didReact DID's getRepo.
+	didReactOnce sync.Once
+	didReactErr  error
+	didReactDone bool
 }
 
 func newChainCoordinator(t *testing.T, w *world.World, spec chainSpec) *chainCoordinator {
@@ -41,6 +47,11 @@ func newChainCoordinator(t *testing.T, w *world.World, spec chainSpec) *chainCoo
 		w:       w,
 		spec:    spec,
 		hostDID: string(acct.DID),
+	}
+	if spec.didReact != nil {
+		dacct, err := w.LoadAccount(spec.didReact.accountIdx)
+		require.NoError(t, err)
+		c.didReactID = string(dacct.DID)
 	}
 	c.seedBackfillRecords()
 	return c
@@ -62,19 +73,59 @@ func (c *chainCoordinator) seedBackfillRecords() {
 	}
 }
 
-// onGetRepoServed is the simulator hook. It fires on every getRepo; we
-// generate the chain only the first time the chain DID is served.
+// onGetRepoServed is the simulator hook. It fires on every getRepo. The
+// record chains are generated on the chain host's first getRepo; shape F
+// is generated on the shape-F DID's first getRepo (each DID's head is
+// pinned only once ITS own snapshot is served, so each fixture keys off
+// its own DID).
 func (c *chainCoordinator) onGetRepoServed(did string) {
-	if did != c.hostDID {
-		return
+	if did == c.hostDID {
+		c.once.Do(func() {
+			ops, err := c.generate()
+			c.mu.Lock()
+			c.ops = ops
+			c.err = err
+			c.mu.Unlock()
+		})
 	}
-	c.once.Do(func() {
-		ops, err := c.generate()
-		c.mu.Lock()
-		c.ops = ops
-		c.err = err
-		c.mu.Unlock()
-	})
+	if c.didReactID != "" && did == c.didReactID {
+		c.didReactOnce.Do(func() {
+			err := c.generateDIDReactivation()
+			c.mu.Lock()
+			c.didReactErr = err
+			c.didReactDone = true
+			c.mu.Unlock()
+		})
+	}
+}
+
+// generateDIDReactivation drives shape F on its dedicated DID: an
+// account-delete (DID tombstone, above backfill), a reactivation, then a
+// fresh post. All ride the live firehose; account frames are not
+// rev-filtered by the merge, so the tombstone + reactivation land durably.
+func (c *chainCoordinator) generateDIDReactivation() error {
+	ctx := context.Background()
+	f := c.spec.didReact
+	if _, err := c.w.GenerateAccountDeleteForTest(ctx, f.accountIdx); err != nil {
+		return fmt.Errorf("shape F account delete: %w", err)
+	}
+	if _, err := c.w.GenerateAccountReactivateForTest(ctx, f.accountIdx); err != nil {
+		return fmt.Errorf("shape F reactivate: %w", err)
+	}
+	if _, _, err := c.w.GenerateRecordOpForTest(ctx, f.accountIdx, "create", f.collection, f.rkey); err != nil {
+		return fmt.Errorf("shape F post-reactivation create: %w", err)
+	}
+	return nil
+}
+
+// didReactResult returns shape F's generation status, failing the test if
+// it never ran or errored.
+func (c *chainCoordinator) didReactResult() {
+	c.t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	require.NoError(c.t, c.didReactErr, "shape F generation failed")
+	require.True(c.t, c.didReactDone, "shape F never generated: getRepo for its DID was not observed")
 }
 
 // generate issues every record chain's LIVE ops in order on the host DID
