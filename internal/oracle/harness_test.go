@@ -78,6 +78,13 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 
 	faultPlan, err := BuildSwarmFaultPlan(w, cfg)
 	require.NoError(t, err)
+	// Fail loud at plan construction if the swarm ever schedules more
+	// retry-consuming faults for a DID than the backfill engine's attempt
+	// budget allows (#109): a budget-exceeding plan would turn a faulted
+	// repo into a confusing backfill timeout instead of a clear failure,
+	// and silently diverge the durable model from the simulator world.
+	require.NoErrorf(t, faultPlan.CheckWithinRetryBudget(),
+		"swarm fault plan must stay within the backfill retry budget: mode=%s seed=%d", cfg.Mode, cfg.Seed)
 	recordTraceOrError(t, trace, "fault_plan", map[string]any{
 		"scheduled_get_repo_http_failures":           faultPlan.TotalGetRepoHTTPFailures(),
 		"scheduled_get_repo_http_failure_dids":       len(faultPlan.GetRepoHTTPFailures),
