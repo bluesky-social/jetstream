@@ -501,3 +501,35 @@ over-drop proof lives in the **steady-state lifecycle tier** (m025), and the
 restart-tier B-crash variant contemplated by #113's plan was withdrawn as
 structurally infeasible. The exploratory restart-tier merge-segment plumbing
 added during that investigation was reverted to keep the harness lean.
+
+## Campaign 2026-06-20 (m005 re-homed to the restart tier — #110)
+
+The 2026-06-20 full campaign found m005_backfill_status_check_inverted had
+gone from `KILLED@stress` (2026-06-15) to `SURVIVED` across 6 seeds — a real
+loss of detection power, diagnosed as an **equivalent mutant in the lifecycle
+scenario**: every completed-repo live event there arrives strictly newer than
+the backfill head (`ev.Rev > BackfillRev`), so the `rev <= BackfillRev` branch
+of `shouldKeep` is never reached and the inverted vs. correct guard produce
+identical output (file-probed: 7129 rev-filterable events, zero in the
+`<=` branch). The production `merge_filter.go` logic was unchanged; only the
+lifecycle simulator traffic had drifted away from the branch.
+
+**Resolution (#110): re-home m005 to the restart tier.** The crash tier
+(`TestOracle_RestartCrashPointsDoNotLoseRecords`) generates its `preLiveEvents`
+on the parent BEFORE the child backfills, so they are rev-subsumed by the
+getRepo snapshot (`ev.Rev <= BackfillRev`) — exactly the branch the lifecycle
+no longer reaches. Verified: with the inverted guard, those rev-subsumed events
+bypass rev-filtering, survive into the merged tree, and trip the per-DID
+rev-regression invariant (`CheckInvariants`): `rev regression for DID ... rev=
+"3ke6kg3wk2722" after ... rev="3ke6kg3wk2c22"`. m005 is **KILLED@restart**;
+the catalog `tiers:` is changed from `default,stress` to `restart`.
+
+**Anti-vacuity is the mutation campaign itself.** Rather than a bespoke
+in-run counter (the merge drop metric lives inside the restart child
+subprocess, disk presence can't distinguish a rev-filtered row from its
+backfill-reintroduced create, and reading the child's `BackfillRev` would
+couple the oracle to the system under test), the guard against the branch
+silently going dead again is the m005 catalog entry: if the rev-filter branch
+ever stops being exercised, m005 flips `KILLED -> SURVIVED`, which the
+scheduled campaign gating (#108) is designed to catch. This is recorded here
+and in the m005 patch `expected-detection` note so the contract is explicit.
