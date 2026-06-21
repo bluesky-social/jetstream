@@ -80,6 +80,12 @@ func (w *World) generateOneLocked(ctx context.Context) ([]byte, error) {
 }
 
 func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byte, error) {
+	// Honor cancellation before doing work, consistent with every sibling
+	// generate helper (generateOneLocked, the targeted/sync/silent paths). The
+	// check consumes no RNG, so it does not perturb the deterministic draw stream.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if authorIdx < 0 || authorIdx >= w.cfg.Accounts {
 		return nil, fmt.Errorf("simulator: author index %d out of range", authorIdx)
 	}

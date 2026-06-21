@@ -1,8 +1,10 @@
 package oracle
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -329,4 +331,69 @@ func TestEventLogRecorderIgnoresSyntheticEventsWithoutUpstreamCursor(t *testing.
 	rec.Observe(&segment.Event{Seq: 1, UpstreamRelayCursor: 0, Kind: segment.KindSync, DID: "did:plc:a"})
 
 	require.Empty(t, rec.RowsByUpstreamCursor(0, 10))
+}
+
+// observeCursor records one create row at the given upstream cursor, the shape
+// waitForRowCount counts in its (after, through] window.
+func observeCursor(rec *eventLogRecorder, cursor int64, rkey string) {
+	rec.Observe(&segment.Event{
+		Seq:                 uint64(cursor),
+		UpstreamRelayCursor: cursor,
+		Kind:                segment.KindCreate,
+		DID:                 "did:plc:a",
+		Collection:          "c",
+		Rkey:                rkey,
+		Rev:                 "rev",
+		Payload:             []byte("p"),
+	})
+}
+
+// TestWaitForRowCount is the direct regression guard for the cond-var deadlock
+// guard (otherwise exercised only through the 5-minute live harness). It pins:
+// the count-reached path returns true; an unreachable count returns false on
+// the deadline WITHOUT hanging; and the nil-recorder fast path. Run under
+// `go test -race` it also catches a missed Broadcast or a leaked watcher
+// goroutine in the cond logic. Run after Observe-from-another-goroutine so the
+// wait actually parks and is woken by the broadcast, not by an already-met
+// predicate.
+func TestWaitForRowCount(t *testing.T) {
+	t.Parallel()
+
+	t.Run("reaches count via a concurrent observe", func(t *testing.T) {
+		t.Parallel()
+		rec := newEventLogRecorder()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		go func() {
+			observeCursor(rec, 1, "r1")
+			observeCursor(rec, 2, "r2")
+		}()
+		require.True(t, rec.waitForRowCount(ctx, 0, 10, 2),
+			"waitForRowCount must return true once the window holds the wanted rows")
+	})
+
+	t.Run("unreachable count returns false on deadline without hanging", func(t *testing.T) {
+		t.Parallel()
+		rec := newEventLogRecorder()
+		observeCursor(rec, 1, "r1") // only one row; we ask for two
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		done := make(chan bool, 1)
+		go func() { done <- rec.waitForRowCount(ctx, 0, 10, 2) }()
+		select {
+		case got := <-done:
+			require.False(t, got, "an unreachable count must return false when the ctx deadline fires")
+		case <-time.After(5 * time.Second):
+			t.Fatal("waitForRowCount did not return after its ctx deadline (missed wakeup / hang)")
+		}
+	})
+
+	t.Run("nil recorder", func(t *testing.T) {
+		t.Parallel()
+		var rec *eventLogRecorder
+		require.True(t, rec.waitForRowCount(context.Background(), 0, 10, 0),
+			"nil recorder with want<=0 is trivially satisfied")
+		require.False(t, rec.waitForRowCount(context.Background(), 0, 10, 1),
+			"nil recorder can never reach a positive want")
+	})
 }
