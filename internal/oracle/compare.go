@@ -32,10 +32,22 @@ func Compare(want, got *Model) error {
 			if !ok {
 				return fmt.Errorf("oracle: missing %s %s/%s rev=%s", key.DID, key.Collection, key.Rkey, wantVal.Rev)
 			}
-			if wantVal.Rev != "" && gotVal.Rev != "" && wantVal.Rev != gotVal.Rev {
-				return fmt.Errorf("oracle: rev mismatch %s %s/%s: want %s got %s",
-					key.DID, key.Collection, key.Rkey, wantVal.Rev, gotVal.Rev)
-			}
+			// Rev is deliberately NOT compared here. Ground truth derived from
+			// world repo state cannot populate a correct per-record rev: the
+			// MST exposes record bytes keyed by path, not the commit rev that
+			// last wrote each record, and the world tracks only the repo head
+			// rev (see GroundTruthFromWorld / model.go RecordValue.Rev). Worse,
+			// a per-record rev would FALSE-POSITIVE on every #sync-resynced DID:
+			// reconstruct collapses all of a DID's records to the single sync
+			// rev (KindCreateResync), while the world retains each record's
+			// original creation rev — reconciling the two would require
+			// replaying the firehose into ground truth, which breaks oracle
+			// independence (ground truth must come from world state, never the
+			// event stream). Per-event rev correctness is therefore owned by
+			// the EVENT-LOG tier (NormalizeEventLog/CompareEventLog* compare the
+			// rev field), which now covers the restart phase too via the #113
+			// chain intermediates. RecordValue.Rev is retained only for
+			// diagnostics (payloadMismatchDetail) and the reconstruct fold.
 			if !bytes.Equal(wantVal.Payload, gotVal.Payload) {
 				return fmt.Errorf("oracle: payload mismatch %s %s/%s: %s",
 					key.DID, key.Collection, key.Rkey, payloadMismatchDetail(wantVal, gotVal))
