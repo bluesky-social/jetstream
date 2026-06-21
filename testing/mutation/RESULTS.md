@@ -533,3 +533,58 @@ silently going dead again is the m005 catalog entry: if the rev-filter branch
 ever stops being exercised, m005 flips `KILLED -> SURVIVED`, which the
 scheduled campaign gating (#108) is designed to catch. This is recorded here
 and in the m005 patch `expected-detection` note so the contract is explicit.
+
+## Uncovered-code mutants 2026-06-21 (#105)
+
+#105 asked for mutants in four previously-mutant-free areas: fault-injection,
+compaction over-drop, XRPC egress, and the client decode/plan/cutover path.
+Disposition after building + empirically probing each:
+
+- **Fault-injection — DONE (m027, KILLED@default).** `m027_getrepo_http_fault_disabled`
+  flips the simulator getRepo fault-budget guard so injection silently never
+  fires; `assertFaultPlanFired` kills it crisply and fast. This is the proof
+  the anti-vacuity machinery's own kill power is asserted by a mutant, not
+  just by code reading.
+
+- **Compaction over-drop — already DONE (m024/m025/m026).** The blanket
+  over-drop (m024), the convergence-hiding over-drop (m025), and the
+  wrong-rev event-log mutant (m026) cover this area; no new mutant needed.
+
+- **XRPC getsegment egress — verified killable, NOT committed (deliberate).**
+  Two egress mutants were tried by hand: serving the wrong segment
+  (`SegmentByIdx(idx+1)`) and inverting the found-guard so a valid segment
+  404s. Both ARE caught — crisply, by the client tier's final-state `Compare`
+  ("client stream final state does not match ground truth"), with the segment
+  served as valid-but-wrong content the client accepts. But the kill only
+  lands at the client tier's full convergence deadline (~300s), because the
+  client climbs to the target seq with wrong content and only the end-state
+  Compare notices. A 300s mutant is NOT added to the catalog: it would have to
+  run `stress`-tier (the 5m `default` tier would race it and read as a flaky
+  timeout) and would add ~5 minutes to every stress campaign run for one
+  mutant. The area is verified reachable/killable; the cost/benefit of a
+  permanent catalog entry is negative, so it is documented here instead.
+
+  A no-progress watchdog on the client tier was prototyped to make this fast,
+  but it cannot catch this mutant class: the broken segment serves
+  wrong-but-PRESENT content, so the client's max-seq reaches target and the
+  watchdog (which must disarm at target to avoid false-tripping legitimate
+  convergence-settling) never fires. Reverted.
+
+- **Client decode/plan/cutover — coverage gap found, deferred.** A mutant
+  making the client's tombstone suppressor never drop (`Suppressor.ShouldDrop`
+  -> always false) SURVIVED: a leaked superseded row was not caught. This is a
+  real client-tier coverage gap (the overlay-suppression window in the default
+  run has too few tombstones for the comparator to bite), overlapping #102's
+  note that the client tier was "near-vacuous". Closing it is scenario/
+  assertion work (force a tombstone into the client's overlay window and assert
+  the leak), not a one-line mutant; deferred as a follow-up, cross-linked #102.
+
+Net: #105's fault-injection and over-drop goals are met with committed crisp
+mutants; XRPC egress is verified-killable but intentionally uncommitted to
+keep the campaign fast; client-decode is a deferred coverage-gap follow-up.
+
+Side effect (product feature): the investigation surfaced that the public
+jetstream client could override transport (`WithHTTPClient`) but not retry, so
+a test/tool could not make a broken backend fail fast instead of riding a long
+retry/backoff. Added `WithMaxDownloadAttempts(n)` (bounds total attempts on
+both XRPC clients); unit-tested in client_test.go.
