@@ -60,6 +60,7 @@ jobs:
             storage.googleapis.com:443
             dl.google.com:443
             results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

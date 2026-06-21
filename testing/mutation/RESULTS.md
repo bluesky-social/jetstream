@@ -6,12 +6,15 @@ oracle's detection power is visible over time. See
 method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 25 active mutants on disk
-(m001–m027; m007 and m010 retired). Latest full campaign: 2026-06-21 at
-`df3fc4b` — 18 killed, 7 survived over m001–m027 (the authoritative current
-scorecard; see the dated section at the end of this file). This is the run that
-seeded `testing/mutation/baseline.json` and is now the enforced gate baseline
-(#108). Counts inside older dated sections describe the catalog *as of that
-date* and are intentionally not back-edited.**
+(m001–m027; m007 and m010 retired). Latest full campaign: 2026-06-21,
+recorded in `testing/mutation/baseline.json` (commit field `007abab`) —
+18 killed, 7 survived over m001–m027 (the authoritative current scorecard;
+see the dated section at the end of this file). This is the run that seeded
+`testing/mutation/baseline.json` and is now the enforced gate baseline (#108).
+The dated section below was written against commit `df3fc4b`, which a later
+rebase orphaned; `baseline.json`'s commit field is the machine source of truth.
+Counts inside older dated sections describe the catalog *as of that date* and
+are intentionally not back-edited.**
 
 ## The baseline gate (#108)
 
@@ -201,7 +204,7 @@ which costs nothing and closes the hole. This gap was closed in Milestone A.
 `xxh3HeaderFooter` is used both to write the seal checksum (seal.go:123) and
 to verify it on read (reader.go:193). A mutation to its byte range changes
 both sides identically, so they always agree. This is a miniature of the
-"atmos closed loop" blind spot described in `docs/oracle/DESIGN.md`: the oracle cannot
+"atmos closed loop" blind spot described in `specs/oracle.md`: the oracle cannot
 detect a bug that lives in a function shared by the writer and reader.
 Disposition: **accepted blind spot** — only an independent checksum oracle
 (or a committed golden segment with a known-good checksum) would catch it.
@@ -234,13 +237,13 @@ double-process needs a crash precisely between source completion and the next
 run, which the current harness does not stage for this seam. Disposition:
 **fix the oracle** — extend the restart harness to crash at the
 source-complete seam, OR (better) the random-time kill loop from
-the crash/restart tier in `docs/oracle/DESIGN.md` would cover this class
+the crash/restart tier in `specs/oracle.md` would cover this class
 without enumeration.
 
 **m006 — swallowed commit error needs store-fault injection (predicted).**
 Predicted to survive: under normal runs `commitSourceComplete` never fails,
 so the inverted check is dormant. Confirms the store-fault tier requirement in
-`docs/oracle/DESIGN.md`: the oracle has no way to make a store write fail.
+`specs/oracle.md`: the oracle has no way to make a store write fail.
 Disposition: **accepted, pending** the store-fault oracle tier.
 
 **m015 / m016 — footer/bloom read-path indexes (confirmed blind spots).**
@@ -249,7 +252,7 @@ and never consults the footer collection-count index or the per-block bloom
 filters, so corruption there is invisible. These mutants exist to *document*
 the gap with evidence. Disposition: **accepted blind spots** — would be
 closed by the product replay and XRPC egress tiers in
-`docs/oracle/DESIGN.md`, which exercise the read indexes a client uses.
+`specs/oracle.md`, which exercise the read indexes a client uses.
 
 ### Prediction misses (corrections to our model of the oracle)
 
@@ -273,7 +276,7 @@ The campaign measured the oracle rather than re-confirming it. It caught
 every hot-path data-shape bug we threw at it (m001, m004, m008, m011, m012,
 m017) and several at scale (m005), but it surfaced **two active oracle gaps
 worth fixing** (m018 rev-blindness and m003 merge-cursor restart seam), **three structural blind spots**
-now named in `docs/oracle/DESIGN.md` (m006 store-fault, m009 closed-loop
+now named in `specs/oracle.md` (m006 store-fault, m009 closed-loop
 checksum, m015/m016 read-path indexes), and one operational signal — **m002's flaky
 detection justifies the multi-seed nightly sweep**. The over-fitting worry was
 warranted in specific, now-documented places; it was not warranted as a
@@ -626,7 +629,10 @@ both XRPC clients); unit-tested in client_test.go.
 
 ## Campaign 2026-06-21 — full catalog at HEAD, baseline for the #108 gate
 
-- commit under test: `df3fc4b` (branch `oracle-improvements`)
+- commit under test: `df3fc4b` (branch `oracle-improvements`) — NOTE: a later
+  rebase (inserting the simulator race fix 523d4e1) orphaned this hash; the
+  identical logical run is recorded under `testing/mutation/baseline.json`'s
+  commit field (`007abab`), which is the machine source of truth.
 - driver: `testing/mutation/run.sh --json` (full catalog, fixed campaign seed)
 - catalog: 25 active mutants (m001–m027; m007/m010 retired)
 - purpose: establish the authoritative current scorecard and seed

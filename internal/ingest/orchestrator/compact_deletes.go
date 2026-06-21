@@ -123,7 +123,8 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 		// Fire the pre-rewrite hook now: the active segment is sealed (force-
 		// rotated above), targetWatermark is known, and no rewrite has run yet,
 		// so a snapshot here captures the full pre-compaction stream the pass
-		// is about to subtract from. Guarded to passes that do real work.
+		// is about to subtract from. Guarded to passes that advance the
+		// watermark (targetWatermark > watermark, checked above).
 		if o.cfg.OnBeforeCompactionPass != nil {
 			o.cfg.OnBeforeCompactionPass(targetWatermark)
 		}
