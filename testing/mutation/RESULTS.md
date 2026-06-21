@@ -6,17 +6,12 @@ oracle's detection power is visible over time. See
 method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 25 active mutants on disk
-(m001–m027; m007 and m010 retired). Latest full campaign: 2026-06-20 at
-`b937b6e` — 14 killed, 8 survived over m001–m024 (see the dated section at the
-end of this file for the authoritative current scorecard). m025 (`KILLED@stress`,
-convergence-hiding compaction over-drop), m026 (`KILLED@default`, wrong
-non-empty commit rev caught by the event-log tier — #104), and m027
-(`KILLED@default`, getRepo fault injection silently disabled — #105) were
-targeted additions after that campaign, bringing the current catalog
-disposition to 17 killed, 8 survived until the next full campaign supersedes
-it. Counts inside older dated sections describe the catalog *as of that date*
-and are
-intentionally not back-edited.**
+(m001–m027; m007 and m010 retired). Latest full campaign: 2026-06-21 at
+`df3fc4b` — 18 killed, 7 survived over m001–m027 (the authoritative current
+scorecard; see the dated section at the end of this file). This is the run that
+seeded `testing/mutation/baseline.json` and is now the enforced gate baseline
+(#108). Counts inside older dated sections describe the catalog *as of that
+date* and are intentionally not back-edited.**
 
 ## The baseline gate (#108)
 
@@ -628,3 +623,51 @@ jetstream client could override transport (`WithHTTPClient`) but not retry, so
 a test/tool could not make a broken backend fail fast instead of riding a long
 retry/backoff. Added `WithMaxDownloadAttempts(n)` (bounds total attempts on
 both XRPC clients); unit-tested in client_test.go.
+
+## Campaign 2026-06-21 — full catalog at HEAD, baseline for the #108 gate
+
+- commit under test: `df3fc4b` (branch `oracle-improvements`)
+- driver: `testing/mutation/run.sh --json` (full catalog, fixed campaign seed)
+- catalog: 25 active mutants (m001–m027; m007/m010 retired)
+- purpose: establish the authoritative current scorecard and seed
+  `testing/mutation/baseline.json`, the machine-readable source of truth the
+  scheduled `mutation-campaign` gate (#108) now enforces.
+
+### Scorecard
+
+| mutant | result | note |
+|---|---|---|
+| m001_delete_mapped_to_update | KILLED@default | liveness break — kills via the default-tier 5m timeout (bootstrap barrier never releases). |
+| m002_watermark_floor_off_by_one | SURVIVED | unchanged — fixed-seed variance; a 5-seed stress sweep kills ~4/5 (not a regression). |
+| m003_merge_cursor_no_advance | SURVIVED | unchanged — benign/equivalent in this scenario (see 2026-06-20 m003 re-disposition). |
+| m004_rev_filter_inverted | KILLED@default | `oracle: missing … app.bsky.actor.profile/…`. |
+| m005_backfill_status_check_inverted | KILLED@restart | **confirms the #110 re-home** — `oracle: rev regression for DID …`. The merge rev-filter branch is exercised by the restart tier's rev-subsumed preLiveEvents; the gate now enforces this so a future re-regression flips KILLED→SURVIVED and fails CI. |
+| m006_merge_commit_error_swallowed | SURVIVED | unchanged — needs store-fault injection (#30). |
+| m008_header_offset_byteslice | KILLED@default | corrupt header offset → segment open fails. |
+| m009_checksum_range_off_by_one | SURVIVED | unchanged — symmetric checksum closed loop (#32). |
+| m011_wire_frame_length | KILLED@default | torn-tail active-segment walk fails on reopen. |
+| m012_block_event_count_off_by_one | KILLED@default | block decode truncated/trailing bytes. |
+| m013_collection_rkey_swap | SURVIVED | unchanged — dead path in this config; companion m017 covers the hot path. |
+| m014_rev_dropped | SURVIVED | unchanged — dead path in this config; companion m018 covers the hot path. |
+| m015_collection_count_double | SURVIVED | unchanged — footer collection index unread by oracle. |
+| m016_bloom_size_off_by_one | KILLED@default | bloom-size corruption caught at default. |
+| m017_commit_collection_rkey_swap | KILLED@default | `oracle: event mismatch … key=app.bsky.feed.like/…`. |
+| m018_commit_rev_dropped | KILLED@default | `oracle: event mismatch … rev=` (event-log tier compares rev). |
+| m019_sync_tombstone_dropped | KILLED@default | event-log equivalence catches the missing `kind=sync` row. |
+| m020_overlay_drop_did_tombstones | KILLED@default | overlay reconstruction. |
+| m021_overlay_record_seq_base_zero | KILLED@default | overlay reconstruction. |
+| m022_shoulddrop_did_seq_inverted | KILLED@default | overlay reconstruction. |
+| m023_overlay_drop_record_tombstones | KILLED@default | overlay reconstruction. |
+| m024_compaction_over_drop_survivors | KILLED@default | blanket compaction over-drop caught by final-state `Compare` (#100). |
+| m025_compaction_overdrop_above_watermark | KILLED@stress | convergence-hiding over-drop caught by `compactionOverDropRecorder` (#100). |
+| m026_commit_rev_altered | KILLED@default | wrong non-empty commit rev caught by the event-log tier (#104). |
+| m027_getrepo_http_fault_disabled | KILLED@default | getRepo fault injection silently disabled; `assertFaultPlanFired` kills it. |
+
+Summary: **18 killed, 7 survived.** This supersedes the 2026-06-20 `b937b6e`
+count (14 killed / 8 survived over m001–m024): m005 is now KILLED@restart (the
+#110 re-home), and m025/m026/m027 were added after that run (all KILLED). The 7
+survivors are all documented known gaps (m002 seed-variance; m003
+benign/equivalent; m006 #30; m009 #32; m013/m014 dead-path covered by
+m017/m018; m015 footer-index blind spot) — no true escapes. This run seeds
+`baseline.json`; subsequent scheduled runs are diffed against it and a
+KILLED→SURVIVED flip fails the job.
