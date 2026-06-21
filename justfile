@@ -206,6 +206,31 @@ oracle-sweep SEEDS="10":
 mutation-campaign *ARGS="":
     testing/mutation/run.sh {{ARGS}}
 
+# Runs the full mutation campaign and enforces the committed baseline (#108).
+# Emits a machine-readable result and fails if any mutant regressed
+# (KILLED->SURVIVED), went STALE/BUILD-BROKEN, or drifted from
+# testing/mutation/baseline.json. This is the scheduled CI gate; a
+# SURVIVED->KILLED improvement is reported but does not fail (refresh the
+# baseline to bank it). CI sets MUTATION_RESULT_JSON to a path it uploads as an
+# artifact; locally it defaults to a repo-relative file.
+mutation-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    result_json="${MUTATION_RESULT_JSON:-mutation-result.json}"
+    mkdir -p "$(dirname "${result_json}")"
+    testing/mutation/run.sh --json "${result_json}"
+    echo "::group::mutation gate vs baseline"
+    go run ./testing/mutation/gate -baseline testing/mutation/baseline.json -result "${result_json}"
+    echo "::endgroup::"
+
+# Regenerates testing/mutation/baseline.json from a fresh full campaign at HEAD.
+# Run this (and review the diff) after intentionally adding/retiring a mutant or
+# banking a SURVIVED->KILLED improvement, so the #108 gate has a current
+# source of truth. Requires a clean tree.
+mutation-baseline:
+    testing/mutation/run.sh --json testing/mutation/baseline.json
+    @echo "baseline written to testing/mutation/baseline.json — review the diff and commit"
+
 # Runs performance benchmarks.
 bench *ARGS="./...":
     go test -bench=. -benchmem -count=1 -run='^$' {{ARGS}}

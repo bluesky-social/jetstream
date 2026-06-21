@@ -18,6 +18,44 @@ it. Counts inside older dated sections describe the catalog *as of that date*
 and are
 intentionally not back-edited.**
 
+## The baseline gate (#108)
+
+This prose scorecard is the human record; the **enforced** scorecard is
+`testing/mutation/baseline.json` — a machine-readable `{commit, mutants:[{id,
+disposition, ...}]}` document. The scheduled `mutation-campaign` workflow
+(`.github/workflows/mutation-campaign.yml`) runs the full campaign at HEAD,
+emits a result with `run.sh --json`, and diffs it against the baseline via
+`testing/mutation/gate`. The job **fails** on:
+
+- a **KILLED→SURVIVED regression** (the oracle lost detection power),
+- a **STALE** or **BUILD-BROKEN** patch (a mutant that no longer applies or
+  compiles), and
+- **catalog drift** — a baseline mutant missing from the run, or a new mutant
+  the baseline does not record (so a mutant can't be added or dropped without
+  recording its disposition), or an unrecognised disposition.
+
+A **SURVIVED→KILLED improvement** is reported but does **not** fail the job;
+bank it by refreshing the baseline. This is what converts the prose above from
+something that silently drifted (the bug #108 was filed for) into an enforced
+contract. It is also the anti-vacuity guard the #110 m005 re-home relies on: if
+the merge rev-filter branch ever goes dead again, m005 flips KILLED→SURVIVED and
+this gate catches it.
+
+**Refresh the baseline** (and review the diff before committing) whenever you
+intentionally add/retire a mutant or bank an improvement:
+
+```bash
+just mutation-baseline   # full campaign at HEAD -> testing/mutation/baseline.json
+# or run the gate locally without rewriting the baseline:
+just mutation-gate
+```
+
+The baseline's `disposition` field is the coarse verdict
+(`KILLED|SURVIVED|STALE|BUILD-BROKEN`); the per-mutant `result`/`note` carry the
+tier/seed detail the gate ignores. A seed-sensitive mutant (e.g. m002) is
+recorded by its full-campaign fixed-seed disposition; the gate does not re-run
+seed sweeps.
+
 ## Retired mutants
 
 The active catalog no longer carries mutants that have been reclassified as
