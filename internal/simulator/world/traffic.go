@@ -127,7 +127,8 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 		touched[op.Path] = struct{}{}
 	}
 
-	return w.commitAndBroadcast(author, rp, store, prevState, wireOps)
+	frame, _, err := w.commitAndBroadcast(author, rp, store, prevState, wireOps)
+	return frame, err
 }
 
 // commitAndBroadcast is the shared tail of the live commit pump: persist
@@ -135,12 +136,18 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 // commit touched, allocate a seq, encode + persist + publish the #commit
 // frame. Callers must have applied their ops to rp (a *repo.Repo whose
 // Store is the supplied diffStore) and assembled the matching wireOps.
-func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffStore, prevState repoState, wireOps []comatproto.SyncSubscribeRepos_RepoOp) ([]byte, error) {
+//
+// Returns the wire frame and the post-commit state. The returned state is
+// the authoritative source for the rev/CID this frame carries — callers
+// MUST use it rather than re-reading via loadState, which would race a
+// concurrent commit on the same account and report a rev that disagrees
+// with the broadcast frame.
+func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffStore, prevState repoState, wireOps []comatproto.SyncSubscribeRepos_RepoOp) ([]byte, repoState, error) {
 	// Persist the new state. commitAndPersist signs + flushes blocks
 	// + updates the MST index in one batch.
 	newState, err := w.commitAndPersist(author, rp)
 	if err != nil {
-		return nil, err
+		return nil, repoState{}, err
 	}
 
 	// Build a CAR diff containing every block our diffStore touched:
@@ -151,7 +158,7 @@ func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffSto
 	// neighbor requires that neighbor be present in the diff.
 	commitData, err := store.GetBlock(newState.CommitCID)
 	if err != nil {
-		return nil, err
+		return nil, repoState{}, err
 	}
 	carBlocks := make([]car.Block, 0, len(store.writes)+len(store.reads)+1)
 	carBlocks = append(carBlocks, car.Block{CID: newState.CommitCID, Data: commitData})
@@ -169,11 +176,11 @@ func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffSto
 	}
 	var carBuf carBytesWriter
 	if err := car.WriteAll(&carBuf, []cbor.CID{newState.CommitCID}, carBlocks); err != nil {
-		return nil, fmt.Errorf("simulator: write CAR diff: %w", err)
+		return nil, repoState{}, fmt.Errorf("simulator: write CAR diff: %w", err)
 	}
 	revTID, err := atmos.ParseTID(newState.Rev)
 	if err != nil {
-		return nil, fmt.Errorf("simulator: parse generated rev: %w", err)
+		return nil, repoState{}, fmt.Errorf("simulator: parse generated rev: %w", err)
 	}
 
 	// Allocate the seq and assemble the envelope.
@@ -194,14 +201,14 @@ func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffSto
 
 	frame, err := encodeCommitFrame(envelope)
 	if err != nil {
-		return nil, err
+		return nil, repoState{}, err
 	}
 
 	if err := w.persistFirehoseFrame(seq, frame); err != nil {
-		return nil, err
+		return nil, repoState{}, err
 	}
 	w.fanout.Publish(frame)
-	return frame, nil
+	return frame, newState, nil
 }
 
 // GeneratedChainOp describes one op injected via GenerateRecordOpForTest,
@@ -267,14 +274,13 @@ func (w *World) GenerateRecordOpForTest(ctx context.Context, idx int, action, co
 		return nil, GeneratedChainOp{}, err
 	}
 
-	frame, err := w.commitAndBroadcast(author, rp, store, prevState, []comatproto.SyncSubscribeRepos_RepoOp{op})
-	if err != nil {
-		return nil, GeneratedChainOp{}, err
-	}
-
-	// The rev is assigned during the commit; re-read it from the freshly
-	// persisted state so the descriptor's rev matches the on-disk row.
-	newState, err := w.loadState(idx)
+	// commitAndBroadcast returns the authoritative post-commit state. We use
+	// its rev directly rather than re-reading via loadState: the helper is
+	// documented for use while live firehose traffic runs, and a concurrent
+	// commit on this account between the broadcast and a re-read would make
+	// the descriptor's rev disagree with the rev carried in the frame we just
+	// published — silently corrupting any oracle row derived from it.
+	frame, newState, err := w.commitAndBroadcast(author, rp, store, prevState, []comatproto.SyncSubscribeRepos_RepoOp{op})
 	if err != nil {
 		return nil, GeneratedChainOp{}, err
 	}
