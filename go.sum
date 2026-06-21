@@ -50,8 +50,8 @@ github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 h1:HWRh5R2+9EifMyIHV7ZV+MIZqgz
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0/go.mod h1:JfhWUomR1baixubs02l85lZYYOm7LV6om4ceouMv45c=
 github.com/jcalabro/atmos v0.1.11 h1:ojep6uh66qnEtqkzN0FItGYes/UhqX/Uh0jfGmPnrCM=
 github.com/jcalabro/atmos v0.1.11/go.mod h1:gIBqYv/tyQUKdZrLaByq+J7b91UaPq54C+hi36Wuqls=
-github.com/jcalabro/gloom v0.0.3 h1:ItYdGtjqoUOFbjPlKSvaTPEiTjyNogAyQePRAMpYnnk=
-github.com/jcalabro/gloom v0.0.3/go.mod h1:6uAawINljQYLN3a2YsekJ8LDYT/SobmJyfeKrSjHVx0=
+github.com/jcalabro/gloom v0.1.0 h1:Z8VTAMrdRNXr11tt9c5pIpDDJxAHg3QIBrHFt5x2I2M=
+github.com/jcalabro/gloom v0.1.0/go.mod h1:6uAawINljQYLN3a2YsekJ8LDYT/SobmJyfeKrSjHVx0=
 github.com/jcalabro/gt v0.0.13 h1:eYqMquSBWU/QXxwrAzWlOkPXAaw04nJBCZYA61LdueI=
 github.com/jcalabro/gt v0.0.13/go.mod h1:iBnF7jE8LG8mW0zjXVYTuXoT+L9UfwP7RNgMrmuuOTs=
 github.com/jcalabro/jttp v0.0.6 h1:LT3SXo7Fw+E1eL+OZK4Gsm1Ravv7DG5dur9x1YfH6GM=
@@ -60,8 +60,8 @@ github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI
 github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
 github.com/klauspost/compress v1.18.6 h1:2jupLlAwFm95+YDR+NwD2MEfFO9d4z4Prjl1XXDjuao=
 github.com/klauspost/compress v1.18.6/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
-github.com/klauspost/cpuid/v2 v2.2.10 h1:tBs3QSyvjDyFTq3uoc/9xFpCuOsJQFNPiAhYdw2skhE=
-github.com/klauspost/cpuid/v2 v2.2.10/go.mod h1:hqwkgyIinND0mEev00jJYCxPNVRVXFQeu1XKlok6oO0=
+github.com/klauspost/cpuid/v2 v2.3.0 h1:S4CRMLnYUhGeDFDqkGriYKdfoFlDnMtqTiI/sFzhA9Y=
+github.com/klauspost/cpuid/v2 v2.3.0/go.mod h1:hqwkgyIinND0mEev00jJYCxPNVRVXFQeu1XKlok6oO0=
 github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
 github.com/kr/pretty v0.3.1/go.mod h1:hoEshYVHaxMs3cyo3Yncou5ZscifuDolrwPKZanG3xk=
 github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=

@@ -98,14 +98,11 @@ type bloomParams struct {
 	k         uint32
 }
 
-func parseBloomParams(buf []byte) (bloomParams, error) {
-	if len(buf) < 13 {
-		return bloomParams{}, fmt.Errorf("%w: bloom params data too short", ErrInvalidFooter)
-	}
+func bloomParamsFromFilter(f *gloom.Filter) bloomParams {
 	return bloomParams{
-		k:         binary.LittleEndian.Uint32(buf[1:5]),
-		numBlocks: binary.LittleEndian.Uint64(buf[5:13]),
-	}, nil
+		k:         f.K(),
+		numBlocks: f.NumBlocks(),
+	}
 }
 
 // decodeBlockBloomsRegionHeader reads the 8-byte region header and

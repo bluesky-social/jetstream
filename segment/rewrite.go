@@ -55,14 +55,7 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 		if err != nil {
 			return RewriteResult{}, err
 		}
-		encodedBloom, err := firstBloom.MarshalBinary()
-		if err != nil {
-			return RewriteResult{}, fmt.Errorf("segment: rewrite marshal source bloom params: %w", err)
-		}
-		params, err := parseBloomParams(encodedBloom)
-		if err != nil {
-			return RewriteResult{}, err
-		}
+		params := bloomParamsFromFilter(firstBloom)
 		perBlockParams = &params
 	}
 

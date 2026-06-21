@@ -73,6 +73,42 @@ func TestRewriteZeroDropLeavesFileUntouched(t *testing.T) {
 	require.Equal(t, before, after)
 }
 
+func TestRewritePreservesSourcePerBlockBloomParams(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := sealedSegmentForReader(t, dir, []Event{
+		{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, IndexedAt: 20, Kind: KindCreate, DID: "did:plc:b"},
+	}, 2)
+
+	before, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	sourceBloom, err := before.BlockBloom(0)
+	require.NoError(t, err)
+	sourceBlocks := sourceBloom.NumBlocks()
+	sourceK := sourceBloom.K()
+	require.NoError(t, before.Close())
+
+	res, err := Rewrite(path, func(ev *Event) RowDecision {
+		if ev.Seq == 2 {
+			return RowDrop
+		}
+		return RowKeep
+	}, RewriteOptions{})
+	require.NoError(t, err)
+	require.True(t, res.Rewritten)
+
+	after, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = after.Close() })
+	rewrittenBloom, err := after.BlockBloom(0)
+	require.NoError(t, err)
+	require.Equal(t, sourceBlocks, rewrittenBloom.NumBlocks())
+	require.Equal(t, sourceK, rewrittenBloom.K())
+	require.True(t, rewrittenBloom.TestString("did:plc:a"))
+}
+
 func TestRewriteCandidateDIDsSkipDisjointSegment(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

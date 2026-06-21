@@ -229,7 +229,7 @@ The variable-length footer has two structures that work together to enable fast 
 1. Segment-level DID bloom filter ("might user X be in this segment file?")
 2. Per-block DID bloom filters ("which blocks in this segment might contain events for user X?")
 
-We use gloom for both, which has a stable binary format. We serialize the segment-level bloom to disk upon segment seal, and also keep all segment's blooms in Jetstream server's memory since it's small.
+We use gloom for both and persist its current `MarshalBinary` representation directly. A backwards-incompatible gloom serialization change is therefore a Jetstream segment format change; readers are only expected to support the format produced by the pinned gloom version. We serialize the segment-level bloom to disk upon segment seal, and also keep all segment's blooms in Jetstream server's memory since it's small.
 
 The per-block blooms are kept on disk (one bloom per block, all sized for the configured max events per block so we can index them by multiplication with no offset table). Today the manifest holds every segment's per-block blooms resident in memory; if that footprint becomes a problem, a future change may swap them for an LRU cache of the hot set.
 
