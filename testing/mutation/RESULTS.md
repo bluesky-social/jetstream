@@ -5,13 +5,15 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 23 active mutants on disk
-(m001–m025; m007 and m010 retired). Latest full campaign: 2026-06-20 at
+**Current catalog (keep this line current): 24 active mutants on disk
+(m001–m026; m007 and m010 retired). Latest full campaign: 2026-06-20 at
 `b937b6e` — 14 killed, 8 survived over m001–m024 (see the dated section at the
-end of this file for the authoritative current scorecard). m025 was a targeted
-addition after that campaign, `KILLED@stress`, bringing the current catalog
-disposition to 15 killed, 8 survived until the next full campaign supersedes it.
-Counts inside older dated sections describe the catalog *as of that date* and are
+end of this file for the authoritative current scorecard). m025 (`KILLED@stress`,
+convergence-hiding compaction over-drop) and m026 (`KILLED@default`, wrong
+non-empty commit rev caught by the event-log tier — #104) were targeted
+additions after that campaign, bringing the current catalog disposition to 16
+killed, 8 survived until the next full campaign supersedes it. Counts inside
+older dated sections describe the catalog *as of that date* and are
 intentionally not back-edited.**
 
 ## Retired mutants
