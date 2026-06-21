@@ -3,6 +3,7 @@ package oracle
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -364,12 +365,33 @@ func TestWaitForRowCount(t *testing.T) {
 		rec := newEventLogRecorder()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		go func() {
-			observeCursor(rec, 1, "r1")
-			observeCursor(rec, 2, "r2")
-		}()
-		require.True(t, rec.waitForRowCount(ctx, 0, 10, 2),
-			"waitForRowCount must return true once the window holds the wanted rows")
+		// Deterministically park the waiter FIRST, then publish, so the rows
+		// arrive via a Broadcast wakeup rather than an already-met predicate.
+		// If the observe ran before the wait, the for-loop guard would return
+		// true without ever calling cond.Wait — the test would pass even with
+		// a broken Broadcast, defeating its purpose. The beforeWait hook fires
+		// while holding r.mu immediately before cond.Wait, and the observer
+		// cannot acquire r.mu to append+Broadcast until cond.Wait releases it,
+		// so closing parked here proves the waiter is genuinely about to park.
+		// A fixed time.Sleep would only narrow the race, not eliminate it.
+		parked := make(chan struct{})
+		var once sync.Once
+		rec.beforeWait = func() { once.Do(func() { close(parked) }) }
+		done := make(chan bool, 1)
+		go func() { done <- rec.waitForRowCount(ctx, 0, 10, 2) }()
+		<-parked
+		observeCursor(rec, 1, "r1")
+		observeCursor(rec, 2, "r2")
+		// Bound the wakeup well inside the 5s deadlock-guard deadline: a
+		// missing Observe Broadcast must surface as a hard failure here, not
+		// as a slow pass woken by the ctx-deadline guard at the 5s mark.
+		select {
+		case got := <-done:
+			require.True(t, got,
+				"waitForRowCount must return true once the window holds the wanted rows")
+		case <-time.After(2 * time.Second):
+			t.Fatal("waitForRowCount was not woken by Observe's Broadcast within 2s")
+		}
 	})
 
 	t.Run("unreachable count returns false on deadline without hanging", func(t *testing.T) {

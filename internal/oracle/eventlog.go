@@ -30,6 +30,13 @@ type eventLogRecorder struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
 	events []segment.Event
+
+	// beforeWait, if non-nil, is invoked while holding r.mu immediately
+	// before cond.Wait parks the goroutine. Test-only hook that makes the
+	// wakeup-path regression guard deterministic (an observer cannot acquire
+	// r.mu to Broadcast until cond.Wait releases the lock, so signaling here
+	// proves the waiter is about to park). Always nil in production.
+	beforeWait func()
 }
 
 func newEventLogRecorder() *eventLogRecorder {
@@ -94,6 +101,9 @@ func (r *eventLogRecorder) waitForRowCount(ctx context.Context, after, through i
 	for r.rowCountInRangeLocked(after, through) < want {
 		if ctx.Err() != nil {
 			return false
+		}
+		if r.beforeWait != nil {
+			r.beforeWait()
 		}
 		r.cond.Wait()
 	}
