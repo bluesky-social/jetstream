@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
@@ -14,15 +15,17 @@ import (
 
 // World is the simulator's runtime handle: pebble db + the in-memory
 // state that derives from it. Goroutine-safety: pebble itself is safe;
-// only the live-traffic goroutine writes after bootstrap. Sequence
-// allocation is via atomic.Int64.
+// mutationMu serializes post-bootstrap event generation, including the
+// shared RNG and logical-clock state. Sequence allocation is via
+// atomic.Int64.
 type World struct {
 	cfg Config
 	db  *pebble.DB
 
-	rng    *rand.Rand
-	fanout *fanout.Registry
-	seq    atomic.Int64
+	mutationMu sync.Mutex
+	rng        *rand.Rand
+	fanout     *fanout.Registry
+	seq        atomic.Int64
 }
 
 // New opens (creating if needed) the simulator pebble db at

@@ -27,7 +27,7 @@ func (w *World) RunTraffic(ctx context.Context, logger *slog.Logger) error {
 	logger.InfoContext(ctx, "starting", "mean_delay_sec", mean)
 
 	for {
-		delay := exponentialDelay(w.rng, mean)
+		delay := w.nextTrafficDelay(mean)
 		t := time.NewTimer(time.Duration(delay * float64(time.Second)))
 		select {
 		case <-ctx.Done():
@@ -42,6 +42,12 @@ func (w *World) RunTraffic(ctx context.Context, logger *slog.Logger) error {
 	}
 }
 
+func (w *World) nextTrafficDelay(mean float64) float64 {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+	return exponentialDelay(w.rng, mean)
+}
+
 // actionMix is the design-doc weighted action distribution.
 var actionMix = []weighted[string]{
 	{value: "create", weight: 75},
@@ -54,6 +60,12 @@ var actionMix = []weighted[string]{
 // build a CAR diff with only the new blocks, and broadcast the frame.
 // Returns the wire frame so tests can inspect it.
 func (w *World) generateOne(ctx context.Context) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+	return w.generateOneLocked(ctx)
+}
+
+func (w *World) generateOneLocked(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -235,6 +247,9 @@ type GeneratedChainOp struct {
 // seed. Returns the wire frame and the op descriptor (assigned rev +
 // record block).
 func (w *World) GenerateRecordOpForTest(ctx context.Context, idx int, action, coll, rkey string) ([]byte, GeneratedChainOp, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		return nil, GeneratedChainOp{}, err
 	}
@@ -374,6 +389,9 @@ func (w *World) applyTargetedOp(rp *repo.Repo, authorIdx int, action, coll, rkey
 // commit block in the #sync CAR body, persists the frame to firehose history,
 // and publishes it to live subscribers.
 func (w *World) GenerateSyncForTest(ctx context.Context, idx int) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -385,6 +403,9 @@ func (w *World) GenerateSyncForTest(ctx context.Context, idx int) ([]byte, error
 // new repo head. Oracle tests use this to force a true local/upstream
 // divergence: Jetstream must recover the authoritative state via getRepo.
 func (w *World) GenerateSilentMutationThenSyncForTest(ctx context.Context, idx int) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -399,6 +420,9 @@ func (w *World) GenerateSilentMutationThenSyncForTest(ctx context.Context, idx i
 // commit's prevData points at a state Jetstream never saw, forcing the verifier
 // chain-break path and its async resync repair.
 func (w *World) GenerateSilentMutationThenCommitForTest(ctx context.Context, idx int) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

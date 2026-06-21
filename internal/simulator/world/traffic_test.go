@@ -3,6 +3,7 @@ package world
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"path/filepath"
@@ -262,6 +263,45 @@ func TestRunTraffic_StopsOnContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
 	require.NoError(t, w.RunTraffic(ctx, slog.Default()))
+}
+
+func TestConcurrentGeneratedEventsAreSerialized(t *testing.T) {
+	t.Parallel()
+
+	w := newRuntimeWorld(t, 8, 0)
+	const workers = 16
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+
+	for i := range workers {
+		i := i
+		go func() {
+			<-start
+			if i%2 == 0 {
+				_, _, err := w.GenerateRecordOpForTest(
+					context.Background(),
+					i%w.cfg.Accounts,
+					"create",
+					collPost,
+					fmt.Sprintf("3kconcurrent%04d", i),
+				)
+				errs <- err
+				return
+			}
+			_, err := w.GenerateSilentMutationThenSyncForTest(context.Background(), i%w.cfg.Accounts)
+			errs <- err
+		}()
+	}
+
+	close(start)
+	for range workers {
+		require.NoError(t, <-errs)
+	}
+
+	require.Equal(t, int64(workers), w.CurrentSeq())
+	frames, err := w.FirehoseRange(0, workers+1)
+	require.NoError(t, err)
+	require.Len(t, frames, workers)
 }
 
 // TestGenerateOne_NoDuplicateOpPaths is a swarm-style regression
