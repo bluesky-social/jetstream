@@ -15,6 +15,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,13 +34,13 @@ func (b *memBuffer) Append(frames []LiveFrame) error {
 	return nil
 }
 
-func (b *memBuffer) Replay(ctx context.Context, from uint64) func(yield func(LiveFrame, error) bool) {
+func (b *memBuffer) Replay(ctx context.Context, after gt.Option[uint64]) func(yield func(LiveFrame, error) bool) {
 	return func(yield func(LiveFrame, error) bool) {
 		b.mu.Lock()
 		snap := append([]LiveFrame(nil), b.frames...)
 		b.mu.Unlock()
 		for _, f := range snap {
-			if f.Seq <= from {
+			if after.HasVal() && f.Seq <= after.Val() {
 				continue
 			}
 			if !yield(f, nil) {
@@ -218,6 +219,42 @@ func TestEngineActiveSegmentGap(t *testing.T) {
 		want = append(want, i)
 	}
 	require.Equal(t, want, got, "no record gap across sealed->active->live; gap (10,15] must be live-delivered")
+}
+
+// TestEngineEmptyArchiveCutoverDeliversSeqZero is a regression guard for the
+// empty-archive seq-0 drop (the cutover analog of #111/#112). A freshly
+// bootstrapped server has NO sealed segments: planBackfill returns an empty
+// plan with plannedThroughSeq=0, so the backfill downloads nothing and the
+// live tail covers the WHOLE stream from seq 0. The first-ever network event
+// is seq 0, and it must be delivered exactly once — not swallowed by a dedup
+// floor seeded as if the (empty) backfill had already covered through seq 0.
+func TestEngineEmptyArchiveCutoverDeliversSeqZero(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	// Empty sealed archive: no segments, no plan entries, plannedThroughSeq=0,
+	// tombstone horizon at 0. This is the freshly-bootstrapped state.
+	h.planned = 0
+	h.planEntry = nil
+	h.overlayW = 0
+	h.overlayM = 0
+
+	// The live tail carries the entire stream from the first-ever event (seq 0).
+	for i := uint64(0); i <= 3; i++ {
+		h.liveSteps = append(h.liveSteps, readStep{
+			data: liveCommitFrame(t, i, "did:plc:a", "create", "app.bsky.feed.post", "r"+itoaU(i), true),
+		})
+	}
+	h.installHandlers()
+
+	events := h.runUntilSeq(t, h.cfg(), 3)
+
+	// Assert on the RAW (non-deduped) seq list so the test fails on BOTH a
+	// dropped seq 0 (the bug) AND a double-delivered seq 0 (the buffer drain
+	// and the post-flip forward path overlapping): the empty-archive cutover
+	// must deliver every event exactly once, in order.
+	require.Equal(t, []uint64{0, 1, 2, 3}, seqs(events),
+		"empty-archive cutover must deliver the first-ever live event (seq 0) exactly once")
 }
 
 // TestEngineBackfillOnly covers the one-time-dump path: with BackfillOnly the
@@ -560,7 +597,7 @@ type replayErrBuffer struct {
 	memBuffer
 }
 
-func (b *replayErrBuffer) Replay(context.Context, uint64) func(yield func(LiveFrame, error) bool) {
+func (b *replayErrBuffer) Replay(context.Context, gt.Option[uint64]) func(yield func(LiveFrame, error) bool) {
 	return func(yield func(LiveFrame, error) bool) {
 		yield(LiveFrame{}, fmt.Errorf("simulated replay failure"))
 	}

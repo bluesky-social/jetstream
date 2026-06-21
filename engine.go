@@ -163,9 +163,9 @@ func (a bufferAdapter) Append(frames []iclient.LiveFrame) error {
 	return a.b.Append(pub)
 }
 
-func (a bufferAdapter) Replay(ctx context.Context, from uint64) func(yield func(iclient.LiveFrame, error) bool) {
+func (a bufferAdapter) Replay(ctx context.Context, after gt.Option[uint64]) func(yield func(iclient.LiveFrame, error) bool) {
 	return func(yield func(iclient.LiveFrame, error) bool) {
-		for f, err := range a.b.Replay(ctx, from) {
+		for f, err := range a.b.Replay(ctx, after) {
 			if !yield(iclient.LiveFrame{Seq: f.Seq, Data: f.Data}, err) {
 				return
 			}

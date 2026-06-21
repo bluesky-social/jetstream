@@ -5,6 +5,8 @@ import (
 	"iter"
 	"sort"
 	"sync"
+
+	"github.com/jcalabro/gt"
 )
 
 // memLiveBuffer is the default in-memory LiveBuffer: a simple seq-ordered
@@ -34,7 +36,7 @@ func (b *memLiveBuffer) Append(frames []LiveFrame) error {
 	return nil
 }
 
-func (b *memLiveBuffer) Replay(ctx context.Context, from uint64) iter.Seq2[LiveFrame, error] {
+func (b *memLiveBuffer) Replay(ctx context.Context, after gt.Option[uint64]) iter.Seq2[LiveFrame, error] {
 	return func(yield func(LiveFrame, error) bool) {
 		b.mu.Lock()
 		snapshot := make([]LiveFrame, len(b.frames))
@@ -43,7 +45,8 @@ func (b *memLiveBuffer) Replay(ctx context.Context, from uint64) iter.Seq2[LiveF
 
 		sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].Seq < snapshot[j].Seq })
 		for _, f := range snapshot {
-			if f.Seq <= from {
+			// None replays everything (incl. seq 0); Some(n) skips Seq <= n.
+			if after.HasVal() && f.Seq <= after.Val() {
 				continue
 			}
 			if ctx.Err() != nil {
