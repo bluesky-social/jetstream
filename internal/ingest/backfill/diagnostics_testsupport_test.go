@@ -7,11 +7,6 @@ import (
 	"github.com/jcalabro/atmos"
 )
 
-func hostKey(host string) ([]byte, error) {
-	_, key, err := normalizeHostStatusKey(host)
-	return key, err
-}
-
 func saveHandleIndex(db *store.Store, handle string, did atmos.DID) error {
 	key, ok := normalizeHandleIndexKey(handle)
 	if !ok {

@@ -22,7 +22,6 @@ import (
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/crypto"
-	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/mst"
 	atmosrepo "github.com/jcalabro/atmos/repo"
 	"github.com/stretchr/testify/require"
@@ -55,7 +54,6 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 	}
 
 	httpClient := &http.Client{Timeout: 5 * time.Second}
-	dir := &identity.Directory{Resolver: &stubResolver{}}
 
 	tests := []struct {
 		name    string
@@ -65,42 +63,35 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 		{
 			name: "missing Store",
 			build: func(t *testing.T) Config {
-				return Config{Writer: newWriter(t), HTTPClient: httpClient, Directory: dir, RelayURL: "x", Logger: logger}
+				return Config{Writer: newWriter(t), HTTPClient: httpClient, RelayURL: "x", Logger: logger}
 			},
 			errPart: "Config.Store",
 		},
 		{
 			name: "missing Writer",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, HTTPClient: httpClient, Directory: dir, RelayURL: "x", Logger: logger}
+				return Config{Store: &store.Store{}, HTTPClient: httpClient, RelayURL: "x", Logger: logger}
 			},
 			errPart: "Config.Writer",
 		},
 		{
 			name: "missing HTTPClient",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, Writer: newWriter(t), Directory: dir, RelayURL: "x", Logger: logger}
+				return Config{Store: &store.Store{}, Writer: newWriter(t), RelayURL: "x", Logger: logger}
 			},
 			errPart: "Config.HTTPClient",
 		},
 		{
-			name: "missing Directory",
-			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, RelayURL: "x", Logger: logger}
-			},
-			errPart: "Config.Directory",
-		},
-		{
 			name: "missing RelayURL",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, Directory: dir, Logger: logger}
+				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, Logger: logger}
 			},
 			errPart: "Config.RelayURL",
 		},
 		{
 			name: "missing Logger",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, Directory: dir, RelayURL: "x"}
+				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, RelayURL: "x"}
 			},
 			errPart: "Config.Logger",
 		},
@@ -113,38 +104,16 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-// stubResolver is a fixed-document Resolver. It maps DID -> document
-// and never hits the network, mirroring atmos's own test pattern in
-// backfill_test.go. We need it because the production resolver talks
-// to plc.directory; the test environment has no PLC.
-type stubResolver struct {
-	docs map[atmos.DID]*identity.DIDDocument
-}
-
-func (r *stubResolver) ResolveDID(_ context.Context, did atmos.DID) (*identity.DIDDocument, error) {
-	doc, ok := r.docs[did]
-	if !ok {
-		return nil, identity.ErrDIDNotFound
-	}
-	return doc, nil
-}
-
-func (r *stubResolver) ResolveHandle(_ context.Context, _ atmos.Handle) (atmos.DID, error) {
-	return "", identity.ErrHandleNotFound
-}
-
-// repoFixture is one DID + its CAR + its public-key multibase. We
-// build the CAR via atmos/repo so signature verification (which the
-// engine performs because we set Directory) actually succeeds.
+// repoFixture is one DID + its signed CAR. The backfill download path
+// neither resolves identity nor verifies signatures, so the CAR is all a
+// fixture needs.
 type repoFixture struct {
-	did       atmos.DID
-	car       []byte
-	multibase string
+	did atmos.DID
+	car []byte
 }
 
 // buildRepoFixture constructs a single-record repo for did, signs it
-// with a fresh P-256 key, and returns the CAR + the multibase that
-// will go in the DID document.
+// with a fresh P-256 key, and returns the CAR.
 func buildRepoFixture(t *testing.T, did atmos.DID) repoFixture {
 	t.Helper()
 
@@ -163,13 +132,9 @@ func buildRepoFixture(t *testing.T, did atmos.DID) repoFixture {
 	var buf bytes.Buffer
 	require.NoError(t, r.ExportCAR(&buf, key))
 
-	pub, ok := key.PublicKey().(*crypto.P256PublicKey)
-	require.True(t, ok)
-
 	return repoFixture{
-		did:       did,
-		car:       buf.Bytes(),
-		multibase: pub.DIDKey()[8:],
+		did: did,
+		car: buf.Bytes(),
 	}
 }
 
@@ -405,21 +370,6 @@ func runWithStubResolverAndRepos(
 	repos []atmos.DID,
 ) error {
 	t.Helper()
-	docs := make(map[atmos.DID]*identity.DIDDocument, len(srv.fixtures))
-	for did, f := range srv.fixtures {
-		docs[did] = &identity.DIDDocument{
-			ID:          string(did),
-			AlsoKnownAs: []string{"at://" + did.Identifier() + ".test"},
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		}
-	}
-	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	segDir := filepath.Join(t.TempDir(), "segments")
 	w, err := ingest.Open(ingest.Config{
@@ -434,7 +384,6 @@ func runWithStubResolverAndRepos(
 
 	cfg := Config{
 		Store:         db,
-		Directory:     dir,
 		HTTPClient:    &http.Client{Timeout: 5 * time.Second},
 		Writer:        w,
 		RelayURL:      srv.srv.URL,
@@ -465,19 +414,6 @@ func TestRun_TransientGetRepoFailureThenRecovers(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	docs := map[atmos.DID]*identity.DIDDocument{
-		did: {
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: fixtures[did].multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		},
-	}
-	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
@@ -491,7 +427,6 @@ func TestRun_TransientGetRepoFailureThenRecovers(t *testing.T) {
 
 	require.NoError(t, Run(t.Context(), Config{
 		Store:          db,
-		Directory:      dir,
 		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
 		Writer:         w,
 		RelayURL:       srv.srv.URL,
@@ -527,19 +462,6 @@ func TestRun_TruncatedGetRepoCARThenRecovers(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	docs := map[atmos.DID]*identity.DIDDocument{
-		did: {
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: fixtures[did].multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		},
-	}
-	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
@@ -553,7 +475,6 @@ func TestRun_TruncatedGetRepoCARThenRecovers(t *testing.T) {
 
 	require.NoError(t, Run(t.Context(), Config{
 		Store:          db,
-		Directory:      dir,
 		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
 		Writer:         w,
 		RelayURL:       srv.srv.URL,
@@ -569,35 +490,6 @@ func TestRun_TruncatedGetRepoCARThenRecovers(t *testing.T) {
 	srv.transientMu.Lock()
 	defer srv.transientMu.Unlock()
 	require.Equal(t, 0, srv.transientTruncateGetRepo[did], "all scheduled truncated CAR faults must have fired")
-}
-
-func TestRun_IdentityDiagnosticsPersistenceFailureAbortsRun(t *testing.T) {
-	t.Parallel()
-
-	did := atmos.DID("did:plc:diagfail")
-	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
-	srv := newStubServer(t, fixtures)
-
-	db, err := store.Open(t.TempDir(), nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-
-	host, ok := normalizeHostBucket(srv.srv.URL)
-	require.True(t, ok)
-	hostStatusKey, err := hostKey(host)
-	require.NoError(t, err)
-	require.NoError(t, db.Set(hostStatusKey, []byte("not json"), store.SyncWrites))
-
-	err = runWithStub(t, t.Context(), srv, db)
-	require.Error(t, err)
-	require.ErrorContains(t, err, "identity diagnostics")
-
-	rs, err := NewStore(db, nil).readRepoStatus(did)
-	require.NoError(t, err)
-	require.NotNil(t, rs)
-	require.Equal(t, StatusNotStarted, rs.Backfill.Status)
-	require.Empty(t, rs.Backfill.LastError)
-	require.Empty(t, rs.Host)
 }
 
 // TestRun_HappyPath_DownloadsAllRepos is the wiring smoke test: three
@@ -630,7 +522,9 @@ func TestRun_HappyPath_DownloadsAllRepos(t *testing.T) {
 		rs, err := bf.readRepoStatus(did)
 		require.NoError(t, err)
 		require.NotNil(t, rs)
-		require.Equal(t, srv.srv.URL, rs.PDS)
+		// Host is recorded from the (post-redirect) download host that
+		// atmos surfaces to OnComplete — no identity resolution. PDS is
+		// no longer populated on the backfill path.
 		require.Equal(t, wantHost, rs.Host)
 	}
 
@@ -655,19 +549,6 @@ func TestRun_PassesBackfillBatchSizeToAtmos(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
-	for did, f := range fixtures {
-		docs[did] = &identity.DIDDocument{
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		}
-	}
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
@@ -681,7 +562,6 @@ func TestRun_PassesBackfillBatchSizeToAtmos(t *testing.T) {
 
 	require.NoError(t, Run(t.Context(), Config{
 		Store:             db,
-		Directory:         &identity.Directory{Resolver: &stubResolver{docs: docs}},
 		HTTPClient:        &http.Client{Timeout: 5 * time.Second},
 		Writer:            w,
 		RelayURL:          srv.srv.URL,
@@ -712,19 +592,6 @@ func TestRun_PassesBackfillWorkersToAtmos(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
-	for did, f := range fixtures {
-		docs[did] = &identity.DIDDocument{
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		}
-	}
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
@@ -738,7 +605,6 @@ func TestRun_PassesBackfillWorkersToAtmos(t *testing.T) {
 
 	require.NoError(t, Run(t.Context(), Config{
 		Store:           db,
-		Directory:       &identity.Directory{Resolver: &stubResolver{docs: docs}},
 		HTTPClient:      &http.Client{Timeout: 5 * time.Second},
 		Writer:          w,
 		RelayURL:        srv.srv.URL,
@@ -798,19 +664,6 @@ func TestRun_BackfillReposRetriesTransientGetRepoFailure(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	docs := map[atmos.DID]*identity.DIDDocument{
-		did: {
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: fixtures[did].multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		},
-	}
-	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
@@ -824,7 +677,6 @@ func TestRun_BackfillReposRetriesTransientGetRepoFailure(t *testing.T) {
 
 	require.NoError(t, Run(t.Context(), Config{
 		Store:          db,
-		Directory:      dir,
 		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
 		Writer:         w,
 		RelayURL:       srv.srv.URL,
@@ -923,20 +775,6 @@ func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
-	for did, f := range fixtures {
-		docs[did] = &identity.DIDDocument{
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		}
-	}
-	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	segDir := filepath.Join(t.TempDir(), "segments")
 	w, err := ingest.Open(ingest.Config{
@@ -951,7 +789,6 @@ func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 
 	cfg := Config{
 		Store:      db,
-		Directory:  dir,
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 		Writer:     w,
 		RelayURL:   srv.srv.URL,
@@ -1051,23 +888,8 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
-	for did, f := range fixtures {
-		docs[did] = &identity.DIDDocument{
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		}
-	}
-	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
-
 	cfg := Config{
 		Store:      db,
-		Directory:  dir,
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 		Writer:     w,
 		RelayURL:   srv.srv.URL,
@@ -1113,22 +935,8 @@ func TestRun_WriterFlushErrorAbortsAfterDurableCompletion(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
-	for did, f := range fixtures {
-		docs[did] = &identity.DIDDocument{
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		}
-	}
-
 	err = Run(t.Context(), Config{
 		Store:      db,
-		Directory:  &identity.Directory{Resolver: &stubResolver{docs: docs}},
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 		Writer:     w,
 		RelayURL:   srv.srv.URL,
@@ -1154,19 +962,6 @@ func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
-	for did, f := range fixtures {
-		docs[did] = &identity.DIDDocument{
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		}
-	}
-	dir := &identity.Directory{Resolver: &stubResolver{docs: docs}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	errFlush := errors.New("flush failed after completion commit")
@@ -1184,7 +979,6 @@ func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
 
 	err = Run(t.Context(), Config{
 		Store:      db,
-		Directory:  dir,
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 		Writer:     w,
 		RelayURL:   srv.srv.URL,
@@ -1207,7 +1001,6 @@ func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
 
 	require.NoError(t, Run(t.Context(), Config{
 		Store:      db,
-		Directory:  dir,
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 		Writer:     w,
 		RelayURL:   srv.srv.URL,
@@ -1242,23 +1035,9 @@ func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	docs := make(map[atmos.DID]*identity.DIDDocument, len(fixtures))
-	for did, f := range fixtures {
-		docs[did] = &identity.DIDDocument{
-			ID: string(did),
-			VerificationMethod: []identity.VerificationMethod{
-				{ID: "#atproto", Type: "Multikey", Controller: string(did), PublicKeyMultibase: f.multibase},
-			},
-			Service: []identity.Service{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: srv.srv.URL},
-			},
-		}
-	}
-
 	errHook := errors.New("after complete hook failed")
 	err = Run(t.Context(), Config{
 		Store:      db,
-		Directory:  &identity.Directory{Resolver: &stubResolver{docs: docs}},
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 		Writer:     w,
 		RelayURL:   srv.srv.URL,

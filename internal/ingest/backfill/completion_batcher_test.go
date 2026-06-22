@@ -29,7 +29,7 @@ func TestCompletionBatcherStagesCompletionAtDurableSeq(t *testing.T) {
 
 	cb := NewCompletionBatcher(bs, nil)
 	cb.RecordWatermark(did, 41, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev1"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev1"}))
 
 	b := st.NewBatch()
 	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
@@ -68,7 +68,7 @@ func TestCompletionBatcherDoesNotStageCompletionAtEqualDurableSeq(t *testing.T) 
 
 	cb := NewCompletionBatcher(bs, nil)
 	cb.RecordWatermark(did, 42, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev-equal"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-equal"}))
 
 	b := st.NewBatch()
 	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
@@ -111,7 +111,7 @@ func TestCompletionBatcherQueueCompleteRequiresWatermark(t *testing.T) {
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
 
 	cb := NewCompletionBatcher(bs, nil)
-	err = cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev-missing"})
+	err = cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-missing"})
 	require.ErrorContains(t, err, "missing watermark")
 	require.Empty(t, cb.queued)
 }
@@ -130,7 +130,7 @@ func TestCompletionBatcherStagesExplicitEmptyRepoCompletion(t *testing.T) {
 
 	cb := NewCompletionBatcher(bs, nil)
 	cb.RecordWatermark(did, 0, false)
-	require.NoError(t, cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev-empty"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-empty"}))
 
 	b := st.NewBatch()
 	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 0, false)
@@ -173,9 +173,9 @@ func TestCompletionBatcherCommitsMultipleCompletionsInOneBatch(t *testing.T) {
 
 	cb := NewCompletionBatcher(bs, metrics)
 	cb.RecordWatermark(first, 40, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), first, &repo.Commit{DID: string(first), Rev: "rev-first"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), first, "", &repo.Commit{DID: string(first), Rev: "rev-first"}))
 	cb.RecordWatermark(second, 41, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), second, &repo.Commit{DID: string(second), Rev: "rev-second"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), second, "", &repo.Commit{DID: string(second), Rev: "rev-second"}))
 
 	// nextSeq=42 means events through seq 41 are durable, so both completions
 	// are eligible and must stage into the same batch.
@@ -233,7 +233,7 @@ func TestCompletionBatcherForcedStageRejectsNonDurableAppendedCompletion(t *test
 	cb := NewCompletionBatcher(bs, metrics)
 	// lastSeq=42 with nextSeq=42 means the final event is NOT yet durable.
 	cb.RecordWatermark(did, 42, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev-forced"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-forced"}))
 
 	b := st.NewBatch()
 	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, true)
@@ -273,9 +273,9 @@ func TestCompletionBatcherQueueCompleteReplacesDuplicateDID(t *testing.T) {
 
 	cb := NewCompletionBatcher(bs, nil)
 	cb.RecordWatermark(did, 41, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev-old"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-old"}))
 	cb.RecordWatermark(did, 42, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev-new"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-new"}))
 	require.Len(t, cb.queued, 1)
 	require.Equal(t, "rev-new", cb.queued[0].commit.Rev)
 	require.Equal(t, completionWatermark{lastSeq: 42, appended: true}, cb.queued[0].watermark)
@@ -318,7 +318,7 @@ func TestCompletionBatcherHoldsCountsLockUntilAfterDone(t *testing.T) {
 
 	cb := NewCompletionBatcher(bs, nil)
 	cb.RecordWatermark(ready, 41, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), ready, &repo.Commit{DID: string(ready), Rev: "rev-ready"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), ready, "", &repo.Commit{DID: string(ready), Rev: "rev-ready"}))
 
 	b := st.NewBatch()
 	defer func() { _ = b.Close() }()
@@ -373,9 +373,9 @@ func TestCompletionBatcherAfterCommitRemovesOnlyStagedCompletions(t *testing.T) 
 
 	cb := NewCompletionBatcher(bs, nil)
 	cb.RecordWatermark(ready, 41, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), ready, &repo.Commit{DID: string(ready), Rev: "rev-ready"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), ready, "", &repo.Commit{DID: string(ready), Rev: "rev-ready"}))
 	cb.RecordWatermark(pending, 50, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), pending, &repo.Commit{DID: string(pending), Rev: "rev-pending"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), pending, "", &repo.Commit{DID: string(pending), Rev: "rev-pending"}))
 
 	b := st.NewBatch()
 	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
@@ -439,9 +439,9 @@ func TestCompletionBatcherRecordsQueueAndDurableBatchMetrics(t *testing.T) {
 
 	cb := NewCompletionBatcher(bs, metrics)
 	cb.RecordWatermark(ready, 41, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), ready, &repo.Commit{DID: string(ready), Rev: "rev-ready"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), ready, "", &repo.Commit{DID: string(ready), Rev: "rev-ready"}))
 	cb.RecordWatermark(pending, 50, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), pending, &repo.Commit{DID: string(pending), Rev: "rev-pending"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), pending, "", &repo.Commit{DID: string(pending), Rev: "rev-pending"}))
 	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.CompletionQueued), 0)
 	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.CompletionQueueDepth), 0)
 
@@ -481,7 +481,7 @@ func TestCompletionBatcherCommitFailureKeepsStagedCompletionQueued(t *testing.T)
 
 	cb := NewCompletionBatcher(bs, nil)
 	cb.RecordWatermark(did, 41, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev-retry"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-retry"}))
 
 	b := st.NewBatch()
 	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
@@ -530,7 +530,7 @@ func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *te
 
 	cb := NewCompletionBatcher(bs, nil)
 	cb.RecordWatermark(did, 41, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev-old"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-old"}))
 
 	b := st.NewBatch()
 	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
@@ -539,7 +539,7 @@ func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *te
 	require.NotNil(t, afterDone)
 
 	cb.RecordWatermark(did, 42, true)
-	require.NoError(t, cb.QueueComplete(t.Context(), did, &repo.Commit{DID: string(did), Rev: "rev-new"}))
+	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-new"}))
 	require.Len(t, cb.queued, 1)
 	require.Equal(t, "rev-new", cb.queued[0].commit.Rev)
 

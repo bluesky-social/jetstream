@@ -7,16 +7,13 @@ import (
 	"fmt"
 	"math/bits"
 	"math/rand/v2"
-	"net/http"
 	"time"
 
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
-	"github.com/jcalabro/atmos/identity"
 	atmosrepo "github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
-	"github.com/jcalabro/gt"
 )
 
 type selectedReposConfig struct {
@@ -24,8 +21,6 @@ type selectedReposConfig struct {
 	Store      *Store
 	Handler    *SegmentHandler
 	SyncClient *atmossync.Client
-	Directory  *identity.Directory
-	HTTPClient *http.Client
 	Metrics    *Metrics
 	OnError    func(atmos.DID, error)
 
@@ -35,18 +30,17 @@ type selectedReposConfig struct {
 }
 
 const (
-	selectedDefaultMaxRetries     = 5
-	selectedDefaultRetryBaseDelay = time.Second
-	selectedDefaultRetryMaxDelay  = 30 * time.Second
+	selectedDefaultMaxRetries        = 3
+	selectedDefaultRetryRateLimitMax = atmosbackfill.DefaultRetryRateLimitMaxAttempts
+	selectedDefaultRetryBaseDelay    = time.Second
+	selectedDefaultRetryMaxDelay     = 30 * time.Second
+	selectedRetryRateLimitCeiling    = 330 * time.Second
 )
 
 var errSelectedOnCompleteRecorded = errors.New("selected repo backfill: OnComplete recording failed; handler already ran")
 
 func runSelectedRepos(ctx context.Context, cfg selectedReposConfig) error {
-	r := &selectedRunner{
-		cfg:        cfg,
-		pdsClients: make(map[string]*atmossync.Client),
-	}
+	r := &selectedRunner{cfg: cfg}
 	for _, did := range cfg.Repos {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -59,9 +53,8 @@ func runSelectedRepos(ctx context.Context, cfg selectedReposConfig) error {
 }
 
 type selectedRunner struct {
-	cfg        selectedReposConfig
-	pdsClients map[string]*atmossync.Client
-	completed  int64
+	cfg       selectedReposConfig
+	completed int64
 }
 
 func (r *selectedRunner) reconcileAndProcess(ctx context.Context, did atmos.DID) error {
@@ -88,6 +81,12 @@ func (r *selectedRunner) reconcileAndProcess(ctx context.Context, did atmos.DID)
 	return nil
 }
 
+// processRepo mirrors the atmos engine's two-budget retry loop (see
+// atmos backfill/engine.go): ordinary transient errors draw on
+// maxRetries with capped backoff, while a 429 is treated as
+// backpressure — it sleeps for the server-directed reset (clamped to
+// selectedRetryRateLimitCeiling) and draws on a separate, larger
+// rate-limit budget, never failing for "the reset exceeds the cap."
 func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 	maxRetries := selectedDefaultMaxRetries
 	if r.cfg.MaxRetries > 0 {
@@ -101,9 +100,15 @@ func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 	if r.cfg.RetryMaxDelay > 0 {
 		maxDelay = r.cfg.RetryMaxDelay
 	}
+	rlMaxAttempts := selectedDefaultRetryRateLimitMax
 
-	for attempt := range maxRetries + 1 {
-		err := r.tryRepo(ctx, did)
+	transientAttempt := 0
+	rlAttempt := 0
+	attempts := 0
+
+	for {
+		host, err := r.tryRepo(ctx, did)
+		attempts++
 		if err == nil {
 			return
 		}
@@ -114,22 +119,23 @@ func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 			return
 		}
 
-		if !xrpc.IsTransient(err) || attempt >= maxRetries {
-			r.recordFail(ctx, did, err, attempt+1)
-			return
-		}
-
-		delay := selectedBackoffDelay(baseDelay, maxDelay, attempt)
-		if ra := xrpc.RetryAfter(err); !ra.IsZero() {
-			wait := time.Until(ra)
-			if wait > maxDelay {
-				r.recordFail(ctx, did, fmt.Errorf("server requested %s delay exceeds RetryMaxDelay %s: %w", wait, maxDelay, err), attempt+1)
+		var delay time.Duration
+		if xrpc.IsRateLimited(err) {
+			if rlAttempt >= rlMaxAttempts {
+				r.recordFail(ctx, did, host, fmt.Errorf("backfill: still rate limited after %d attempts: %w", rlAttempt+1, err), attempts)
 				return
 			}
-			if wait > delay {
-				delay = wait
+			rlAttempt++
+			delay = selectedRateLimitDelay(err, baseDelay, rlAttempt)
+		} else {
+			if !xrpc.IsTransient(err) || transientAttempt >= maxRetries {
+				r.recordFail(ctx, did, host, err, attempts)
+				return
 			}
+			delay = selectedBackoffDelay(baseDelay, maxDelay, transientAttempt)
+			transientAttempt++
 		}
+
 		t := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -138,6 +144,24 @@ func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 		case <-t.C:
 		}
 	}
+}
+
+// selectedRateLimitDelay mirrors atmos's rateLimitDelay: honor the
+// server-directed reset (clamped), else exponential backoff on baseDelay.
+func selectedRateLimitDelay(err error, baseDelay time.Duration, rlAttempt int) time.Duration {
+	if ra := xrpc.RetryAfter(err); !ra.IsZero() {
+		if wait := time.Until(ra); wait > 0 {
+			if wait > selectedRetryRateLimitCeiling {
+				wait = selectedRetryRateLimitCeiling
+			}
+			return wait
+		}
+	}
+	delay := selectedBackoffDelay(baseDelay, selectedRetryRateLimitCeiling, rlAttempt-1)
+	if delay < baseDelay {
+		delay = baseDelay
+	}
+	return delay
 }
 
 func selectedBackoffDelay(base, maxDelay time.Duration, attempt int) time.Duration {
@@ -157,81 +181,43 @@ func selectedBackoffDelay(base, maxDelay time.Duration, attempt int) time.Durati
 	return delay
 }
 
-func (r *selectedRunner) tryRepo(ctx context.Context, did atmos.DID) error {
-	sc := r.syncClientForRepo(ctx, did)
-	body, err := sc.GetRepoStream(ctx, did, "")
+// tryRepo downloads via the relay SyncClient (302→PDS), parses, and
+// hands the repo to the handler. It returns the host the CAR came from
+// (post-redirect) so a failure can be attributed even though no identity
+// resolution happens on this path. Commit signatures are not verified
+// (this debug path mirrors the bootstrap engine's relay-trusted default).
+func (r *selectedRunner) tryRepo(ctx context.Context, did atmos.DID) (string, error) {
+	body, host, err := r.cfg.SyncClient.GetRepoStreamHost(ctx, did, "")
 	if err != nil {
-		return err
+		return host, err
 	}
 	defer func() { _ = body.Close() }()
 
 	rp, commit, err := atmosrepo.LoadFromCAR(bufio.NewReader(body))
 	if err != nil {
-		return err
-	}
-	if r.cfg.Directory != nil {
-		if err := sc.VerifyCommit(ctx, commit); err != nil {
-			return err
-		}
+		return host, err
 	}
 	if err := r.cfg.Handler.HandleRepo(ctx, did, rp, commit); err != nil {
-		return err
+		return host, err
 	}
-	if err := r.cfg.Store.OnComplete(ctx, did, commit); err != nil {
+	if err := r.cfg.Store.OnComplete(ctx, did, host, commit); err != nil {
 		if r.cfg.OnError != nil {
 			r.cfg.OnError(did, fmt.Errorf("backfill: store on_complete: %w", err))
 		}
-		return errSelectedOnCompleteRecorded
+		return host, errSelectedOnCompleteRecorded
 	}
 	r.completed++
 	r.cfg.Metrics.setProgressCompleted(r.completed)
-	return nil
+	return host, nil
 }
 
-func (r *selectedRunner) recordFail(ctx context.Context, did atmos.DID, err error, attempts int) {
+func (r *selectedRunner) recordFail(ctx context.Context, did atmos.DID, host string, err error, attempts int) {
 	if r.cfg.OnError != nil {
 		r.cfg.OnError(did, err)
 	}
-	if storeErr := r.cfg.Store.OnFail(ctx, did, err, attempts); storeErr != nil {
+	if storeErr := r.cfg.Store.OnFail(ctx, did, host, err, attempts); storeErr != nil {
 		if r.cfg.OnError != nil {
 			r.cfg.OnError(did, fmt.Errorf("backfill: store on_fail: %w", storeErr))
 		}
 	}
-}
-
-func (r *selectedRunner) syncClientForRepo(ctx context.Context, did atmos.DID) *atmossync.Client {
-	if r.cfg.Directory == nil {
-		return r.cfg.SyncClient
-	}
-
-	doc, err := r.cfg.Directory.Resolver.ResolveDID(ctx, did)
-	if err != nil {
-		return r.cfg.SyncClient
-	}
-
-	var pds string
-	for _, svc := range doc.Service {
-		if svc.Type == "AtprotoPersonalDataServer" {
-			pds = svc.ServiceEndpoint
-			break
-		}
-	}
-	if pds == "" {
-		return r.cfg.SyncClient
-	}
-
-	if sc, ok := r.pdsClients[pds]; ok {
-		return sc
-	}
-	xc := &xrpc.Client{
-		Host:       pds,
-		HTTPClient: gt.Some(r.cfg.HTTPClient),
-		Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
-	}
-	sc := atmossync.NewClient(atmossync.Options{
-		Client:    xc,
-		Directory: gt.Some(r.cfg.Directory),
-	})
-	r.pdsClients[pds] = sc
-	return sc
 }

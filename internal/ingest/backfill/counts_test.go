@@ -45,17 +45,17 @@ func TestCountStatuses_MixedStates(t *testing.T) {
 	for i := range 2 {
 		did := atmos.DID("did:plc:done" + string(rune('a'+i)))
 		require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
-		require.NoError(t, bs.OnComplete(ctx, did, &repo.Commit{Rev: "abcdef"}))
+		require.NoError(t, bs.OnComplete(ctx, did, "", &repo.Commit{Rev: "abcdef"}))
 	}
 	// One failed.
 	failDID := atmos.DID("did:plc:fail")
 	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: failDID, Active: true}))
-	require.NoError(t, bs.OnFail(ctx, failDID, errors.New("nope"), 1))
+	require.NoError(t, bs.OnFail(ctx, failDID, "", errors.New("nope"), 1))
 
 	// One unavailable (deactivated account).
 	goneDID := atmos.DID("did:plc:gone")
 	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: goneDID, Active: true}))
-	require.NoError(t, bs.OnFail(ctx, goneDID, &xrpc.Error{
+	require.NoError(t, bs.OnFail(ctx, goneDID, "", &xrpc.Error{
 		StatusCode: 400, Name: "RepoDeactivated", Message: "Repo has been deactivated",
 	}, 1))
 
@@ -84,14 +84,14 @@ func TestCountStatuses_FailedToUnavailableMigration(t *testing.T) {
 	did := atmos.DID("did:plc:legacy")
 	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
 	// Legacy state: a generic failure marked it StatusFailed.
-	require.NoError(t, bs.OnFail(ctx, did, errors.New("unknown xrpc 400 RepoDeactivated"), 3))
+	require.NoError(t, bs.OnFail(ctx, did, "", errors.New("unknown xrpc 400 RepoDeactivated"), 3))
 
 	got, err := backfill.CountStatuses(st)
 	require.NoError(t, err)
 	require.Equal(t, backfill.Counts{Total: 1, Failed: 1}, got)
 
 	// Re-run now correctly classifies it as unavailable.
-	require.NoError(t, bs.OnFail(ctx, did, &xrpc.Error{
+	require.NoError(t, bs.OnFail(ctx, did, "", &xrpc.Error{
 		StatusCode: 400, Name: "RepoDeactivated", Message: "Repo has been deactivated",
 	}, 1))
 

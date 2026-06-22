@@ -201,6 +201,33 @@ func normalizeHostBucket(raw string) (string, bool) {
 	return host + ":" + port, true
 }
 
+// hostBucketFromAuthority normalizes a bare "host" or "host:port"
+// authority — as surfaced by atmos on OnComplete/OnFail from the final
+// (post-redirect) request URL — into the same host-bucket key space
+// that normalizeHostBucket produces from a full URL. The default https
+// port is stripped so "pds.example.com:443" and "pds.example.com" share
+// a bucket; non-default ports are preserved. Returns ("", false) for an
+// empty authority (e.g. a dial failure that never reached a server).
+func hostBucketFromAuthority(authority string) (string, bool) {
+	authority = strings.ToLower(strings.TrimSpace(authority))
+	if authority == "" {
+		return "", false
+	}
+	host, port, err := net.SplitHostPort(authority)
+	if err != nil {
+		// No port present: use the authority as-is.
+		return authority, true
+	}
+	if host == "" {
+		return "", false
+	}
+	// Strip the default https port; backfill downloads are https.
+	if port == "" || port == "443" {
+		return host, true
+	}
+	return net.JoinHostPort(host, port), true
+}
+
 func classifyBackfillError(err error) ErrorClass {
 	if err == nil {
 		return ErrorClassUnknown
