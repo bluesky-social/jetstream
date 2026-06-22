@@ -104,7 +104,7 @@ env:
 jobs:
   lint:
     name: lint
-    runs-on: arc
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -165,7 +165,7 @@ jobs:
 
   test:
     name: test (race)
-    runs-on: arc
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read

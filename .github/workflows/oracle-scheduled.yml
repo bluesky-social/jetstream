@@ -48,7 +48,7 @@ env:
 jobs:
   oracle-sweep:
     name: oracle seed sweep
-    runs-on: arc
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: read
@@ -125,7 +125,7 @@ jobs:
   # non-race seed count.
   oracle-sweep-race:
     name: oracle seed sweep (race)
-    runs-on: arc
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: read

@@ -38,7 +38,7 @@ env:
 jobs:
   campaign:
     name: mutation campaign gate
-    runs-on: arc
+    runs-on: ubuntu-24.04
     # The full catalog includes stress-tier mutants (30m timeout each) plus the
     # restart tier; a comfortable ceiling that still bounds a wedged run.
     timeout-minutes: 360
