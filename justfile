@@ -80,7 +80,7 @@ simulator-reset:
 
 # Runs the full, long test suite
 test-long *ARGS="./...":
-    gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 {{ARGS}}
+    gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 {{ARGS}}
 
 # Runs the tests in -short mode. Hides the skipped-test summary because
 # heavy tests (e.g. the simulator E2E) are deliberately skipped here and
