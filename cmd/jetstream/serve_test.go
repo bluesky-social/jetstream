@@ -499,7 +499,7 @@ func preSeedComplete(dataDir string, dids []atmos.DID) error {
 		if err := bf.OnDiscover(context.Background(), atmossync.ListReposEntry{DID: did, Active: true}); err != nil {
 			return err
 		}
-		if err := bf.OnComplete(context.Background(), did, &atmosrepo.Commit{DID: string(did), Rev: "rev-pre"}); err != nil {
+		if err := bf.OnComplete(context.Background(), did, "", &atmosrepo.Commit{DID: string(did), Rev: "rev-pre"}); err != nil {
 			return err
 		}
 	}

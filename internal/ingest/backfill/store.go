@@ -156,7 +156,10 @@ func (s *Store) putRepoStatusAndCounts(
 		if err != nil {
 			return err
 		}
-		applyHostStatusTransition(hs, hadRow, rs.Active, old, rs.Backfill.Status)
+		// putRepoStatusAndCounts is the create path (OnDiscover): the
+		// caller passes a freshly built rs, so any host present is a
+		// first sighting for that bucket.
+		applyHostStatusTransition(hs, firstInHostBucket(hadRow, "", rs.Host), rs.Active, old, rs.Backfill.Status)
 		if updateHost != nil {
 			updateHost(hs)
 		}
@@ -183,10 +186,12 @@ func (s *Store) updateRepoStatusAndCounts(
 	}
 	hadRow := rs != nil
 	old := Status("")
+	oldHost := ""
 	if rs == nil {
 		rs = &RepoStatus{}
 	} else {
 		old = rs.Backfill.Status
+		oldHost = rs.Host
 	}
 	updateHost, err := mutate(rs, hadRow, old)
 	if err != nil {
@@ -226,7 +231,7 @@ func (s *Store) updateRepoStatusAndCounts(
 		if err != nil {
 			return err
 		}
-		applyHostStatusTransition(hs, hadRow, rs.Active, old, rs.Backfill.Status)
+		applyHostStatusTransition(hs, firstInHostBucket(hadRow, oldHost, rs.Host), rs.Active, old, rs.Backfill.Status)
 		if updateHost != nil {
 			updateHost(hs)
 		}
@@ -305,6 +310,7 @@ func (s *Store) stageCompleteBatch(ctx context.Context, batch *pebble.Batch, com
 		if !hadRow {
 			old = Status("")
 		}
+		oldHost := rs.Host
 		rs.Backfill.Status = StatusComplete
 		rs.Backfill.Rev = c.commit.Rev
 		rs.Backfill.CompletedAt = c.completed
@@ -312,6 +318,12 @@ func (s *Store) stageCompleteBatch(ctx context.Context, batch *pebble.Batch, com
 		rs.Rev = c.commit.Rev
 		rs.UpdatedAt = c.completed
 		rs.LastAttemptedAt = c.completed
+		// Record the host the CAR was downloaded from (post-redirect),
+		// replacing the identity-resolution side effect. Preserve any
+		// existing bucket when the transport surfaced no host.
+		if bucket, ok := hostBucketFromAuthority(c.host); ok {
+			rs.Host = bucket
+		}
 		applyCountTransition(&counts, hadRow, old, StatusComplete)
 
 		enc, err := encodeRepoStatus(rs)
@@ -332,7 +344,7 @@ func (s *Store) stageCompleteBatch(ctx context.Context, batch *pebble.Batch, com
 				}
 				hostCache[rs.Host] = hs
 			}
-			applyHostStatusTransition(hs, hadRow, rs.Active, old, StatusComplete)
+			applyHostStatusTransition(hs, firstInHostBucket(hadRow, oldHost, rs.Host), rs.Active, old, StatusComplete)
 			hs.LastAttemptedAt = c.completed
 		}
 	}
@@ -402,8 +414,21 @@ func countBucket(c *Counts, st Status) *uint64 {
 	}
 }
 
-func applyHostStatusTransition(h *HostStatus, hadRow bool, active bool, old, next Status) {
-	if !hadRow {
+// applyHostStatusTransition folds one repo's status change into its host
+// aggregate. firstInBucket is true when this DID is being counted under
+// this host for the first time — which, now that the backfill path learns
+// a DID's host only at its terminal OnComplete/OnFail (no identity
+// resolution at discovery), is the common case: the repo row already
+// exists but was never attributed to any host. On a first sighting we
+// add the DID to the bucket (Total++, Active++, increment its status);
+// otherwise it is a status move within the same bucket.
+//
+// A DID changing host buckets (old non-empty host != new host) is not
+// expected on the backfill path — host is assigned once at the terminal
+// transition and never rewritten — so the stale-bucket decrement is
+// intentionally not handled here.
+func applyHostStatusTransition(h *HostStatus, firstInBucket bool, active bool, old, next Status) {
+	if firstInBucket {
 		h.Total++
 		if active {
 			h.Active++
@@ -416,6 +441,14 @@ func applyHostStatusTransition(h *HostStatus, hadRow bool, active bool, old, nex
 	}
 	decrementStatus(h, old)
 	incrementStatus(h, next)
+}
+
+// firstInHostBucket reports whether a DID is being counted under bucket
+// for the first time, given whether its repo row already existed and the
+// host it was previously attributed to (empty if none). True when the row
+// is new, or when it had no host / a different host than bucket.
+func firstInHostBucket(hadRow bool, oldHostBucket, bucket string) bool {
+	return !hadRow || oldHostBucket != bucket
 }
 
 func applyHostActiveTransition(h *HostStatus, oldActive, nextActive bool) {
@@ -651,12 +684,13 @@ func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) erro
 // (RecordCount, TotalBytes) added between OnDiscover and OnComplete
 // survives. The read, aggregate transition, and durable write must
 // stay serialized with deferred completion staging via countsMu.
-func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Commit) error {
+func (s *Store) OnComplete(ctx context.Context, did atmos.DID, host string, commit *repo.Commit) error {
 	if s.completions != nil {
-		return s.completions.QueueComplete(ctx, did, commit)
+		return s.completions.QueueComplete(ctx, did, host, commit)
 	}
 
 	now := timeNow()
+	bucket, hasBucket := hostBucketFromAuthority(host)
 	if err := s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
 		rs.Backfill.Status = StatusComplete
 		rs.Backfill.Rev = commit.Rev
@@ -665,6 +699,13 @@ func (s *Store) OnComplete(ctx context.Context, did atmos.DID, commit *repo.Comm
 		rs.Rev = commit.Rev
 		rs.UpdatedAt = now
 		rs.LastAttemptedAt = now
+		// Record the host the CAR was downloaded from (post-redirect),
+		// replacing the identity-resolution side effect that used to
+		// populate this. Preserve any existing bucket if the transport
+		// did not surface a host.
+		if hasBucket {
+			rs.Host = bucket
+		}
 		return func(hs *HostStatus) {
 			hs.LastAttemptedAt = now
 		}, nil
@@ -703,17 +744,23 @@ func (s *Store) simulateCrash(ctx context.Context, point crashpoint.Point) error
 // preserved. This is defensive — within this PR the engine never
 // retries a StateComplete DID — but it keeps a hypothetical future
 // "complete then later failed" trail intact.
-func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attempts int) error {
-	if errors.Is(failErr, errIdentityDiagnosticsPersistence) {
-		s.metrics.incOnFailErrors()
-		return failErr
-	}
+func (s *Store) OnFail(ctx context.Context, did atmos.DID, host string, failErr error, attempts int) error {
 	if err := ctx.Err(); err != nil {
 		s.metrics.incOnFailErrors()
 		return err
 	}
 
 	now := timeNow()
+	// host is the server the failing request was sent to (post-redirect),
+	// or "" when no response was received (e.g. a dial failure). Record it
+	// so per-host attribution survives without identity resolution;
+	// preserve any existing bucket when host is empty.
+	bucket, hasBucket := hostBucketFromAuthority(host)
+	setHost := func(rs *RepoStatus) {
+		if hasBucket {
+			rs.Host = bucket
+		}
+	}
 	if isRepoNotFoundError(failErr) {
 		return s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
 			rs.Backfill.Status = StatusComplete
@@ -721,6 +768,7 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attemp
 			rs.Backfill.Attempts = 0
 			rs.Backfill.CompletedAt = now
 			rs.LastAttemptedAt = now
+			setHost(rs)
 			return func(hs *HostStatus) {
 				hs.LastAttemptedAt = now
 			}, nil
@@ -739,6 +787,7 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attemp
 			rs.Backfill.LastError = ""
 			rs.Backfill.Attempts = 0
 			rs.LastAttemptedAt = now
+			setHost(rs)
 			return func(hs *HostStatus) {
 				hs.LastAttemptedAt = now
 			}, nil
@@ -756,6 +805,7 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, failErr error, attemp
 		rs.Backfill.LastError = errMsg
 		rs.Backfill.Attempts = attempts
 		rs.LastAttemptedAt = now
+		setHost(rs)
 		return func(hs *HostStatus) {
 			hs.LastAttemptedAt = now
 			hs.addErrorSample(HostErrorSample{

@@ -150,7 +150,7 @@ func TestSegmentHandler_HandleRepoQueuesCompletionWithoutFlush(t *testing.T) {
 	require.Empty(t, events, "HandleRepo must not force a per-repo segment flush")
 	require.Equal(t, completionWatermark{lastSeq: 0, appended: true}, cb.watermarks[did])
 
-	require.NoError(t, bs.OnComplete(t.Context(), did, commit))
+	require.NoError(t, bs.OnComplete(t.Context(), did, "", commit))
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
 	require.Len(t, cb.queued, 1)
 
@@ -209,7 +209,7 @@ func TestSegmentHandler_MultiBlockRepoCompletesOnlyWithFinalBlock(t *testing.T) 
 		"watermark must record the repo's final event seq")
 	require.Equal(t, uint64(records), w.NextSeq())
 
-	require.NoError(t, bs.OnComplete(t.Context(), did, commit))
+	require.NoError(t, bs.OnComplete(t.Context(), did, "", commit))
 	// The completion must NOT be durable yet: its watermark lastSeq=4 is not
 	// below the durable seq/next=4 (final event's block not fsynced).
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
@@ -263,7 +263,7 @@ func TestSegmentHandler_HandleEmptyRepoRecordsEmptyWatermark(t *testing.T) {
 	require.NoError(t, h.HandleRepo(t.Context(), did, r, commit))
 	require.Equal(t, completionWatermark{lastSeq: 0, appended: false}, cb.watermarks[did])
 
-	require.NoError(t, bs.OnComplete(t.Context(), did, commit))
+	require.NoError(t, bs.OnComplete(t.Context(), did, "", commit))
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
 	require.NoError(t, w.DrainDurability(t.Context()))
 	requireLookupState(t, bs, did, atmosbackfill.StateComplete)
@@ -299,7 +299,7 @@ func TestSegmentHandler_QueuedCompletionBecomesDurableOnWriterClose(t *testing.T
 	h.SetCompletionBatcher(cb)
 
 	require.NoError(t, h.HandleRepo(t.Context(), did, r, commit))
-	require.NoError(t, bs.OnComplete(t.Context(), did, commit))
+	require.NoError(t, bs.OnComplete(t.Context(), did, "", commit))
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
 
 	require.NoError(t, w.Close())

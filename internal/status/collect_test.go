@@ -148,12 +148,12 @@ func TestCollect_BackfillCounts(t *testing.T) {
 	for i := range 3 {
 		did := atmos.DID("did:plc:done" + string(rune('a'+i)))
 		require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
-		require.NoError(t, bs.OnComplete(ctx, did, &repo.Commit{Rev: "abcdef"}))
+		require.NoError(t, bs.OnComplete(ctx, did, "", &repo.Commit{Rev: "abcdef"}))
 	}
 	for i := range 2 {
 		did := atmos.DID("did:plc:gone" + string(rune('a'+i)))
 		require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
-		require.NoError(t, bs.OnFail(ctx, did, &xrpc.Error{
+		require.NoError(t, bs.OnFail(ctx, did, "", &xrpc.Error{
 			StatusCode: 400, Name: "RepoDeactivated", Message: "Repo has been deactivated",
 		}, 1))
 	}

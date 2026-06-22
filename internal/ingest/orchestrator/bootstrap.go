@@ -107,7 +107,6 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			err := backfill.Run(gctx, backfill.Config{
 				Store:             o.cfg.Store,
 				HTTPClient:        o.cfg.HTTPClient,
-				Directory:         o.cfg.Directory,
 				Writer:            bw,
 				RelayURL:          o.cfg.RelayURL,
 				Logger:            o.cfg.Logger,

@@ -26,6 +26,7 @@ type completionWatermark struct {
 
 type queuedCompletion struct {
 	did       atmos.DID
+	host      string
 	commit    *repo.Commit
 	completed time.Time
 	watermark completionWatermark
@@ -46,7 +47,7 @@ func (b *completionBatcher) RecordWatermark(did atmos.DID, lastSeq uint64, appen
 	b.watermarks[did] = completionWatermark{lastSeq: lastSeq, appended: appended}
 }
 
-func (b *completionBatcher) QueueComplete(ctx context.Context, did atmos.DID, commit *repo.Commit) error {
+func (b *completionBatcher) QueueComplete(ctx context.Context, did atmos.DID, host string, commit *repo.Commit) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -66,6 +67,7 @@ func (b *completionBatcher) QueueComplete(ctx context.Context, did atmos.DID, co
 	delete(b.watermarks, did)
 	completion := queuedCompletion{
 		did:       did,
+		host:      host,
 		commit:    queuedCommit,
 		completed: timeNow(),
 		watermark: watermark,
@@ -167,6 +169,7 @@ func removeQueuedCompletions(queued, staged []queuedCompletion) []queuedCompleti
 
 func queuedCompletionEqual(a, b queuedCompletion) bool {
 	return a.did == b.did &&
+		a.host == b.host &&
 		a.commit == b.commit &&
 		a.completed.Equal(b.completed) &&
 		a.watermark == b.watermark

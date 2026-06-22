@@ -208,7 +208,7 @@ func TestStore_OnComplete_WritesComplete(t *testing.T) {
 	}))
 
 	commit := &repo.Commit{DID: string(did), Rev: "rev-final"}
-	require.NoError(t, s.OnComplete(context.Background(), did, commit))
+	require.NoError(t, s.OnComplete(context.Background(), did, "", commit))
 
 	got, err := s.Lookup(context.Background(), did)
 	require.NoError(t, err)
@@ -248,7 +248,7 @@ func TestStore_OnCompleteQueuesWhenBatcherConfigured(t *testing.T) {
 	}
 
 	cb.RecordWatermark(did, 41, true)
-	require.NoError(t, s.OnComplete(ctx, did, &repo.Commit{DID: string(did), Rev: "rev-queued"}))
+	require.NoError(t, s.OnComplete(ctx, did, "", &repo.Commit{DID: string(did), Rev: "rev-queued"}))
 	requireLookupState(t, s, did, atmosbackfill.StateDiscovered)
 	require.False(t, hookRan, "afterComplete must wait for durable completion commit")
 	require.InDelta(t, 0.0, testutil.ToFloat64(metrics.Completed), 0)
@@ -286,7 +286,7 @@ func TestStore_OnCompleteWithBatcherRequiresWatermark(t *testing.T) {
 	did := atmos.DID("did:plc:queued-missing-watermark")
 	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
 
-	err := s.OnComplete(ctx, did, &repo.Commit{DID: string(did), Rev: "rev-missing"})
+	err := s.OnComplete(ctx, did, "", &repo.Commit{DID: string(did), Rev: "rev-missing"})
 	require.ErrorContains(t, err, "missing watermark")
 	requireLookupState(t, s, did, atmosbackfill.StateDiscovered)
 	require.Empty(t, cb.queued)
@@ -315,7 +315,7 @@ func TestStore_OnCompleteRunsHookAfterDurableRow(t *testing.T) {
 		return nil
 	}
 
-	require.NoError(t, s.OnComplete(ctx, did, &repo.Commit{DID: string(did), Rev: "rev-hooked"}))
+	require.NoError(t, s.OnComplete(ctx, did, "", &repo.Commit{DID: string(did), Rev: "rev-hooked"}))
 	require.True(t, hookSawComplete, "completion hook must run after the Complete row is durable and readable")
 }
 
@@ -335,7 +335,7 @@ func TestStore_OnComplete_PreservesExtraFields(t *testing.T) {
 	}))
 
 	commit := &repo.Commit{DID: string(did), Rev: "rev-z"}
-	require.NoError(t, s.OnComplete(context.Background(), did, commit))
+	require.NoError(t, s.OnComplete(context.Background(), did, "", commit))
 
 	rs, err := s.readRepoStatus(did)
 	require.NoError(t, err)
@@ -357,7 +357,7 @@ func TestStore_OnFail_RecordsFailure(t *testing.T) {
 	}))
 
 	failErr := errors.New("upstream 500")
-	require.NoError(t, s.OnFail(context.Background(), did, failErr, 6))
+	require.NoError(t, s.OnFail(context.Background(), did, "", failErr, 6))
 
 	got, err := s.Lookup(context.Background(), did)
 	require.NoError(t, err)
@@ -383,9 +383,9 @@ func TestStore_OnFail_AfterPriorComplete(t *testing.T) {
 	require.NoError(t, s.OnDiscover(context.Background(), atmossync.ListReposEntry{
 		DID: did, Active: true,
 	}))
-	require.NoError(t, s.OnComplete(context.Background(), did, &repo.Commit{DID: string(did), Rev: "rev-good"}))
+	require.NoError(t, s.OnComplete(context.Background(), did, "", &repo.Commit{DID: string(did), Rev: "rev-good"}))
 
-	require.NoError(t, s.OnFail(context.Background(), did, errors.New("boom"), 3))
+	require.NoError(t, s.OnFail(context.Background(), did, "", errors.New("boom"), 3))
 
 	rs, err := s.readRepoStatus(did)
 	require.NoError(t, err)
@@ -413,7 +413,7 @@ func TestStore_OnFail_RepoNotFoundCompletesWithoutError(t *testing.T) {
 		Name:       "RepoNotFound",
 		Message:    "Could not find repo for DID: did:plc:deleted",
 	}
-	require.NoError(t, s.OnFail(ctx, did, failErr, 1))
+	require.NoError(t, s.OnFail(ctx, did, "", failErr, 1))
 
 	got, err := s.Lookup(ctx, did)
 	require.NoError(t, err)
@@ -464,7 +464,7 @@ func TestStore_OnFail_RepoUnavailableIsTerminalNotFailed(t *testing.T) {
 				Name:       name,
 				Message:    "Repo has been " + name + ": did:plc:gone",
 			}
-			require.NoError(t, s.OnFail(ctx, did, failErr, 1))
+			require.NoError(t, s.OnFail(ctx, did, "", failErr, 1))
 
 			// atmos must skip re-dispatch: unavailable projects to StateComplete.
 			got, err := s.Lookup(ctx, did)
@@ -511,13 +511,13 @@ func TestStore_OnComplete_ClearsLastError(t *testing.T) {
 	require.NoError(t, s.OnDiscover(context.Background(), atmossync.ListReposEntry{
 		DID: did, Active: true,
 	}))
-	require.NoError(t, s.OnFail(context.Background(), did, errors.New("transient"), 4))
+	require.NoError(t, s.OnFail(context.Background(), did, "", errors.New("transient"), 4))
 
 	rs, err := s.readRepoStatus(did)
 	require.NoError(t, err)
 	require.Equal(t, "transient", rs.Backfill.LastError, "precondition: failure left a LastError")
 
-	require.NoError(t, s.OnComplete(context.Background(), did, &repo.Commit{DID: string(did), Rev: "rev-recovered"}))
+	require.NoError(t, s.OnComplete(context.Background(), did, "", &repo.Commit{DID: string(did), Rev: "rev-recovered"}))
 
 	rs, err = s.readRepoStatus(did)
 	require.NoError(t, err)
@@ -543,16 +543,16 @@ func TestStore_MaintainsCounts(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, Counts{Total: 3, Discovered: 3}, counts)
 
-	require.NoError(t, s.OnComplete(ctx, done, &repo.Commit{DID: string(done), Rev: "rev-done"}))
-	require.NoError(t, s.OnFail(ctx, recovered, errors.New("temporary"), 1))
-	require.NoError(t, s.OnFail(ctx, failed, errors.New("permanent"), 1))
+	require.NoError(t, s.OnComplete(ctx, done, "", &repo.Commit{DID: string(done), Rev: "rev-done"}))
+	require.NoError(t, s.OnFail(ctx, recovered, "", errors.New("temporary"), 1))
+	require.NoError(t, s.OnFail(ctx, failed, "", errors.New("permanent"), 1))
 
 	counts, ok, err = LoadCounts(s.db)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, Counts{Total: 3, Complete: 1, Failed: 2}, counts)
 
-	require.NoError(t, s.OnComplete(ctx, recovered, &repo.Commit{DID: string(recovered), Rev: "rev-recovered"}))
+	require.NoError(t, s.OnComplete(ctx, recovered, "", &repo.Commit{DID: string(recovered), Rev: "rev-recovered"}))
 
 	counts, ok, err = LoadCounts(s.db)
 	require.NoError(t, err)
@@ -596,7 +596,7 @@ func TestStore_HostAggregates_FailThenComplete(t *testing.T) {
 		Host:   "pds.example.com",
 	}))
 
-	require.NoError(t, bs.OnFail(ctx, did, errors.New("xrpc: HTTP 503: unavailable"), 3))
+	require.NoError(t, bs.OnFail(ctx, did, "", errors.New("xrpc: HTTP 503: unavailable"), 3))
 	hs, ok, err := loadHostStatus(st, "pds.example.com")
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -608,7 +608,7 @@ func TestStore_HostAggregates_FailThenComplete(t *testing.T) {
 	require.Equal(t, ErrorClassHTTP5xx, hs.LatestErrorClass)
 	require.Len(t, hs.RecentErrors, 1)
 
-	require.NoError(t, bs.OnComplete(ctx, did, &repo.Commit{Rev: "rev1"}))
+	require.NoError(t, bs.OnComplete(ctx, did, "", &repo.Commit{Rev: "rev1"}))
 	hs, ok, err = loadHostStatus(st, "pds.example.com")
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -655,7 +655,7 @@ func TestStore_StaleActiveFlipCannotRegressCompletedStatus(t *testing.T) {
 
 	cb := NewCompletionBatcher(bs, nil)
 	cb.RecordWatermark(did, 41, true)
-	require.NoError(t, cb.QueueComplete(ctx, did, &repo.Commit{DID: string(did), Rev: "rev-complete"}))
+	require.NoError(t, cb.QueueComplete(ctx, did, "", &repo.Commit{DID: string(did), Rev: "rev-complete"}))
 
 	b := st.NewBatch()
 	afterCommit, afterDone, err := cb.StageDurable(ctx, b, 42, false)
@@ -800,7 +800,7 @@ func TestStore_HostAggregates_LatestFiveFailureSamples(t *testing.T) {
 	}))
 
 	for i := range 7 {
-		require.NoError(t, s.OnFail(ctx, did, errors.New("xrpc: HTTP 503: unavailable sample "+string(rune('0'+i))), i+1))
+		require.NoError(t, s.OnFail(ctx, did, "", errors.New("xrpc: HTTP 503: unavailable sample "+string(rune('0'+i))), i+1))
 	}
 
 	hs, ok, err := loadHostStatus(s.db, "pds.example.com")

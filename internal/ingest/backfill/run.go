@@ -21,7 +21,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
-	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
@@ -39,9 +38,6 @@ type Config struct {
 	// The HTTP client to use while fetching repos, talking to the relay, etc.
 	// Should be tuned for bulk repo downloads.
 	HTTPClient *http.Client
-
-	// The identity directory to use while doing backfill.
-	Directory *identity.Directory
 
 	// RelayURL is the upstream relay base URL (e.g. https://bsky.network).
 	RelayURL string
@@ -203,12 +199,13 @@ func Run(ctx context.Context, cfg Config) error {
 		completions := NewCompletionBatcher(st, cfg.Metrics)
 		st.SetCompletionBatcher(completions)
 		cfg.Writer.SetDurableBatchHook(completions.StageDurable)
-		directory := directoryWithRecordingResolver(cfg.Directory, st, recordFatal)
 
-		sc := atmossync.NewClient(atmossync.Options{
-			Client:    xc,
-			Directory: gt.Some(directory),
-		})
+		// Backfill downloads via the relay (SyncClient), which 302-redirects
+		// to each account's PDS; the engine does not resolve DID→PDS and does
+		// not verify commit signatures (VerifyCommits stays off). The host the
+		// CAR came from is surfaced to Store.OnComplete/OnFail for per-host
+		// attribution, so no identity resolution is needed on this path.
+		sc := atmossync.NewClient(atmossync.Options{Client: xc})
 
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 		handler.onWriterError = recordFatal
@@ -228,8 +225,6 @@ func Run(ctx context.Context, cfg Config) error {
 				Store:          st,
 				Handler:        handler,
 				SyncClient:     sc,
-				Directory:      directory,
-				HTTPClient:     cfg.HTTPClient,
 				Metrics:        cfg.Metrics,
 				MaxRetries:     cfg.MaxRetries,
 				RetryBaseDelay: cfg.RetryBaseDelay,
@@ -239,9 +234,6 @@ func Run(ctx context.Context, cfg Config) error {
 						return
 					}
 					logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
-					if errors.Is(err, errIdentityDiagnosticsPersistence) {
-						recordFatal(err)
-					}
 				},
 			})
 			if err != nil {
@@ -278,8 +270,6 @@ func Run(ctx context.Context, cfg Config) error {
 			SyncClient:      sc,
 			Store:           st,
 			Handler:         handler,
-			Directory:       gt.Some(directory),
-			HTTPClient:      gt.Some(cfg.HTTPClient),
 			StartCursor:     gt.Some(startCursor),
 			OnBatchComplete: gt.Some(saveBatchCursor),
 			OnPageComplete:  gt.Some(rememberPageCursor),
@@ -288,9 +278,6 @@ func Run(ctx context.Context, cfg Config) error {
 					return
 				}
 				logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
-				if errors.Is(err, errIdentityDiagnosticsPersistence) {
-					recordFatal(err)
-				}
 			}),
 			OnProgress: gt.Some(func(stats atmosbackfill.Stats) {
 				cfg.Metrics.setProgressCompleted(stats.Completed)
@@ -307,9 +294,10 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		// Only override atmos's retry defaults when explicitly configured;
-		// a zero value leaves the engine on its production defaults (5
-		// retries, 1s base, 30s cap). The oracle harness sets a tiny
-		// RetryBaseDelay so injected transient faults recover quickly.
+		// a zero value leaves the engine on its production defaults (3
+		// transient retries, 1s base, 30s cap, plus the separate 429
+		// rate-limit budget). The oracle harness sets a tiny RetryBaseDelay
+		// so injected transient faults recover quickly.
 		if cfg.MaxRetries > 0 {
 			engineOpts.MaxRetries = gt.Some(cfg.MaxRetries)
 		}
@@ -362,9 +350,6 @@ func (cfg Config) validate() error {
 	}
 	if cfg.HTTPClient == nil {
 		return fmt.Errorf("backfill: Config.HTTPClient is required")
-	}
-	if cfg.Directory == nil {
-		return fmt.Errorf("backfill: Config.Directory is required")
 	}
 	if cfg.RelayURL == "" {
 		return fmt.Errorf("backfill: Config.RelayURL is required")
