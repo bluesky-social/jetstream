@@ -20,8 +20,8 @@ are intentionally not back-edited.**
 
 This prose scorecard is the human record; the **enforced** scorecard is
 `testing/mutation/baseline.json` — a machine-readable `{commit, mutants:[{id,
-disposition, ...}]}` document. The scheduled `mutation-campaign` workflow
-(`.github/workflows/mutation-campaign.yml`) runs the full campaign at HEAD,
+disposition, ...}]}` document. The scheduled `mutation-campaign-scheduled` workflow
+(`.github/workflows/mutation-campaign-scheduled.yml`) runs the full campaign at HEAD,
 emits a result with `run.sh --json`, and diffs it against the baseline via
 `testing/mutation/gate`. The job **fails** on:
 
@@ -637,7 +637,7 @@ both XRPC clients); unit-tested in client_test.go.
 - catalog: 25 active mutants (m001–m027; m007/m010 retired)
 - purpose: establish the authoritative current scorecard and seed
   `testing/mutation/baseline.json`, the machine-readable source of truth the
-  scheduled `mutation-campaign` gate (#108) now enforces.
+  scheduled `mutation-campaign-scheduled` gate (#108) now enforces.
 
 ### Scorecard
 

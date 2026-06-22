@@ -13,13 +13,13 @@
 # opt-in, persist-credentials disabled, harden-runner egress allowlist,
 # GOTOOLCHAIN=local, no caching.
 
-name: mutation-campaign
+name: mutation-campaign-scheduled
 
 on:
   schedule:
-    # Weekly, Mondays 03:42 UTC — off the top-of-hour Actions rush and distinct
+    # Daily at 03:42 UTC — off the top-of-hour Actions rush and distinct
     # from oracle-scheduled.yml's 6-hourly cadence so they don't contend.
-    - cron: "42 3 * * 1"
+    - cron: "42 3 * * *"
   workflow_dispatch:
 
 permissions: {}
