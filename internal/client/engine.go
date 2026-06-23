@@ -150,9 +150,13 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 		// events through it, so it is also the dedup floor. A None (live from
 		// tip) leaves the floor None so the first event delivered passes.
 		dedupFloor: liveCursor,
-		dial:       e.cfg.Dial,
-		logger:     e.logger,
-		backoffMin: e.cfg.LiveBackoffMin,
+		// Forward the filters so the server prunes server-side; the inline
+		// wantsLive matcher above remains the correctness backstop.
+		collections: e.cfg.Request.Collections,
+		dids:        e.cfg.Request.DIDs,
+		dial:        e.cfg.Dial,
+		logger:      e.logger,
+		backoffMin:  e.cfg.LiveBackoffMin,
 	})
 	// Route both events and errors through the batcher so the downstream yield
 	// is serialized against the flusher goroutine, and an error the consumer
@@ -344,9 +348,13 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		// the first-ever live event at seq 0 is delivered, not swallowed.
 		cursor:     gt.Some(liveStart),
 		dedupFloor: dedupFloor,
-		dial:       e.cfg.Dial,
-		logger:     e.logger,
-		backoffMin: e.cfg.LiveBackoffMin,
+		// Forward the filters so the server prunes the live tail server-side;
+		// liveSink.wantLive (matcher + suppressor) remains the backstop.
+		collections: e.cfg.Request.Collections,
+		dids:        e.cfg.Request.DIDs,
+		dial:        e.cfg.Dial,
+		logger:      e.logger,
+		backoffMin:  e.cfg.LiveBackoffMin,
 	})
 	var liveWG sync.WaitGroup
 	liveWG.Go(func() {

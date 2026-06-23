@@ -53,6 +53,13 @@ type liveConfig struct {
 	// internal/subscribe/replay.go); the consumer's own seq dedup turns that into
 	// the effective "> last delivered" on resume.
 	cursor gt.Option[uint64]
+	// collections and dids are the caller's filters, forwarded on the wire as
+	// repeated wantedCollections/wantedDids query params so the server filters
+	// server-side (v1 ParseQuery) rather than streaming the full firehose for
+	// the client to discard. Empty means "no filter" (the param is omitted).
+	// The client-side matcher remains a correctness backstop.
+	collections []string
+	dids        []string
 	// dedupFloor is the initial value of lastSeq, the seq dedup floor. It is kept
 	// SEPARATE from cursor because the wire resume point and the dedup floor are
 	// not always the same value:
@@ -248,13 +255,34 @@ func (c *liveConsumer) subscribeURL() string {
 	if wireCursor.HasVal() {
 		q.Set("cursor", strconv.FormatUint(wireCursor.Val(), 10))
 	}
+	// Forward the caller's filters server-side. v1's ParseQuery reads each
+	// collection/DID as its own repeated param, so append (not Set) one entry
+	// per value. Empty slices add nothing, leaving an unfiltered tail's URL
+	// unchanged.
+	for _, c := range c.cfg.collections {
+		q.Add("wantedCollections", c)
+	}
+	for _, d := range c.cfg.dids {
+		q.Add("wantedDids", d)
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
 }
 
+// liveDialOptions builds the websocket DialOptions for the live tail. It
+// offers RFC 7692 permessage-deflate with context takeover: the server
+// auto-negotiates deflate when the client advertises it, which cuts bandwidth
+// substantially on this repetitive JSON firehose. A server that does not
+// negotiate it falls back to an uncompressed stream transparently.
+func liveDialOptions() *websocket.DialOptions {
+	return &websocket.DialOptions{
+		CompressionMode: websocket.CompressionContextTakeover,
+	}
+}
+
 // dialWebsocket is the production dialer.
 func dialWebsocket(ctx context.Context, rawURL string) (wsConn, error) {
-	conn, resp, err := websocket.Dial(ctx, rawURL, nil)
+	conn, resp, err := websocket.Dial(ctx, rawURL, liveDialOptions())
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
