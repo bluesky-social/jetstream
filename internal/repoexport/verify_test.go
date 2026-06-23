@@ -2,17 +2,18 @@ package repoexport
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"sort"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/car"
 	"github.com/jcalabro/atmos/cbor"
-	"github.com/jcalabro/atmos/mst"
-	"github.com/jcalabro/atmos/repo"
+	"github.com/jcalabro/atmos/identity"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,17 +26,17 @@ func TestVerify_MatchingRoots(t *testing.T) {
 		createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1")),
 		createEvent(testDID, "app.bsky.feed.post", "r2", "rev2", payload("2")),
 	}
-	carBytes, authoritativeRoot := authoritativeCAR(t, testDID, testAuthoritativeRev, events)
-	relay := newGetRepoServer(t, testDID, carBytes)
+	authoritativeRoot, _ := expectedRoot(t, events)
+	relay := newAuthoritativeCommitServer(t, testDID, testAuthoritativeRev, authoritativeRoot)
 
 	dataDir, st := newTestDataDir(t)
 	writeSegmentTree(t, st, filepath.Join(dataDir, "segments"), events)
 
 	report, err := Verify(t.Context(), VerifyConfig{
-		DataDir:  dataDir,
-		DID:      testDID,
-		RelayURL: relay.URL,
-		Selector: openSelector(t, dataDir),
+		DataDir:          dataDir,
+		DID:              testDID,
+		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		Selector:         openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, VerifyReport{
@@ -57,8 +58,8 @@ func TestVerify_PendingEventsMatchAuthoritativeRoot(t *testing.T) {
 		createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1")),
 		createEvent(testDID, "app.bsky.feed.like", "r2", "rev2", payload("2")),
 	}
-	carBytes, authoritativeRoot := authoritativeCAR(t, testDID, testAuthoritativeRev, authoritativeEvents)
-	relay := newGetRepoServer(t, testDID, carBytes)
+	authoritativeRoot, _ := expectedRoot(t, authoritativeEvents)
+	relay := newAuthoritativeCommitServer(t, testDID, testAuthoritativeRev, authoritativeRoot)
 
 	// Locally, only the first record made it to disk; the second (the
 	// just-created like) is still in the live writer's pending block.
@@ -69,11 +70,11 @@ func TestVerify_PendingEventsMatchAuthoritativeRoot(t *testing.T) {
 	pending := authoritativeEvents[1:]
 
 	report, err := Verify(t.Context(), VerifyConfig{
-		DataDir:       dataDir,
-		DID:           testDID,
-		RelayURL:      relay.URL,
-		Selector:      openSelector(t, dataDir),
-		PendingEvents: pending,
+		DataDir:          dataDir,
+		DID:              testDID,
+		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		Selector:         openSelector(t, dataDir),
+		PendingEvents:    pending,
 	})
 	require.NoError(t, err)
 	require.True(t, report.Match, "expected pending like to close the gap; message=%q", report.Message)
@@ -89,8 +90,8 @@ func TestVerify_MismatchingRootsReturnsReport(t *testing.T) {
 		createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1")),
 		createEvent(testDID, "app.bsky.feed.post", "r2", "rev2", payload("2")),
 	}
-	carBytes, authoritativeRoot := authoritativeCAR(t, testDID, testAuthoritativeRev, authoritativeEvents)
-	relay := newGetRepoServer(t, testDID, carBytes)
+	authoritativeRoot, _ := expectedRoot(t, authoritativeEvents)
+	relay := newAuthoritativeCommitServer(t, testDID, testAuthoritativeRev, authoritativeRoot)
 
 	localEvents := []segment.Event{
 		createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1")),
@@ -100,10 +101,10 @@ func TestVerify_MismatchingRootsReturnsReport(t *testing.T) {
 	writeSegmentTree(t, st, filepath.Join(dataDir, "segments"), localEvents)
 
 	report, err := Verify(t.Context(), VerifyConfig{
-		DataDir:  dataDir,
-		DID:      testDID,
-		RelayURL: relay.URL,
-		Selector: openSelector(t, dataDir),
+		DataDir:          dataDir,
+		DID:              testDID,
+		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		Selector:         openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, VerifyReport{
@@ -124,15 +125,15 @@ func TestVerify_MissingLocalRepoReturnsMismatchReport(t *testing.T) {
 	events := []segment.Event{
 		createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1")),
 	}
-	carBytes, authoritativeRoot := authoritativeCAR(t, testDID, testAuthoritativeRev, events)
-	relay := newGetRepoServer(t, testDID, carBytes)
+	authoritativeRoot, _ := expectedRoot(t, events)
+	relay := newAuthoritativeCommitServer(t, testDID, testAuthoritativeRev, authoritativeRoot)
 
 	emptyDir := t.TempDir()
 	report, err := Verify(t.Context(), VerifyConfig{
-		DataDir:  emptyDir,
-		DID:      testDID,
-		RelayURL: relay.URL,
-		Selector: openSelector(t, emptyDir),
+		DataDir:          emptyDir,
+		DID:              testDID,
+		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		Selector:         openSelector(t, emptyDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, testDID, report.DID)
@@ -145,48 +146,75 @@ func TestVerify_MissingLocalRepoReturnsMismatchReport(t *testing.T) {
 	require.Contains(t, report.Message, "no local commit events")
 }
 
-func TestVerify_MalformedAuthoritativeCARReturnsError(t *testing.T) {
+func TestVerify_MalformedLatestCommitCIDReturnsError(t *testing.T) {
 	t.Parallel()
 
-	relay := newGetRepoServer(t, testDID, []byte("not a car"))
+	relay := newMalformedLatestCommitServer(t, testDID)
 
 	_, err := Verify(t.Context(), VerifyConfig{
-		DataDir:  t.TempDir(),
-		DID:      testDID,
-		RelayURL: relay.URL,
+		DataDir:          t.TempDir(),
+		DID:              testDID,
+		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
 	})
 	require.Error(t, err)
 }
 
-func TestVerify_AuthoritativeDIDMismatchReturnsError(t *testing.T) {
+func TestVerify_MissingAuthoritativeCommitBlockReturnsError(t *testing.T) {
 	t.Parallel()
 
-	authoritativeDID := "did:plc:otherrepo"
-	events := []segment.Event{
-		createEvent(testDID, "app.bsky.feed.post", "r1", "rev1", payload("1")),
-	}
-	carBytes, _ := authoritativeCAR(t, authoritativeDID, testAuthoritativeRev, events)
-	relay := newGetRepoServer(t, testDID, carBytes)
+	root := cbor.ComputeCID(cbor.CodecDagCBOR, []byte("root"))
+	commitCID, _ := authoritativeCommitCAR(t, testDID, testAuthoritativeRev, root)
+	otherCID, otherCAR := authoritativeCommitCAR(t, testDID, testAuthoritativeRev, cbor.ComputeCID(cbor.CodecDagCBOR, []byte("other-root")))
+	require.False(t, otherCID.Equal(commitCID))
+
+	relay := newCommitBlockServer(t, testDID, testAuthoritativeRev, commitCID, otherCAR)
+	_, err := Verify(t.Context(), VerifyConfig{
+		DataDir:          t.TempDir(),
+		DID:              testDID,
+		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+	})
+	require.ErrorContains(t, err, "not found in getBlocks response")
+}
+
+func TestVerify_AuthoritativeCommitDIDMismatchReturnsError(t *testing.T) {
+	t.Parallel()
+
+	root := cbor.ComputeCID(cbor.CodecDagCBOR, []byte("root"))
+	commitCID, commitCAR := authoritativeCommitCAR(t, "did:plc:other", testAuthoritativeRev, root)
+	relay := newCommitBlockServer(t, testDID, testAuthoritativeRev, commitCID, commitCAR)
 
 	_, err := Verify(t.Context(), VerifyConfig{
-		DataDir:  t.TempDir(),
-		DID:      testDID,
-		RelayURL: relay.URL,
+		DataDir:          t.TempDir(),
+		DID:              testDID,
+		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
 	})
-	require.Error(t, err)
-	require.ErrorContains(t, err, testDID)
-	require.ErrorContains(t, err, authoritativeDID)
+	require.ErrorContains(t, err, "authoritative commit DID mismatch")
+}
+
+func TestVerify_AuthoritativeCommitRevMismatchReturnsError(t *testing.T) {
+	t.Parallel()
+
+	root := cbor.ComputeCID(cbor.CodecDagCBOR, []byte("root"))
+	commitCID, commitCAR := authoritativeCommitCAR(t, testDID, "2222222222223", root)
+	relay := newCommitBlockServer(t, testDID, testAuthoritativeRev, commitCID, commitCAR)
+
+	_, err := Verify(t.Context(), VerifyConfig{
+		DataDir:          t.TempDir(),
+		DID:              testDID,
+		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+	})
+	require.ErrorContains(t, err, "authoritative commit rev mismatch")
 }
 
 func TestVerify_HTTPFailureReturnsError(t *testing.T) {
 	t.Parallel()
 
-	relay := newGetRepoErrorServer(t, http.StatusInternalServerError)
+	relay := newGetLatestCommitErrorServer(t, http.StatusInternalServerError)
 
 	_, err := Verify(t.Context(), VerifyConfig{
-		DataDir:  t.TempDir(),
-		DID:      testDID,
-		RelayURL: relay.URL,
+		DataDir:          t.TempDir(),
+		DID:              testDID,
+		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
 	})
 	require.Error(t, err)
 }
@@ -201,54 +229,43 @@ func TestVerify_ValidatesConfig(t *testing.T) {
 	require.ErrorContains(t, err, "DID is required")
 }
 
-func authoritativeCAR(t *testing.T, did, rev string, events []segment.Event) ([]byte, cbor.CID) {
+func newAuthoritativeCommitServer(t *testing.T, did string, rev string, root cbor.CID) *httptest.Server {
 	t.Helper()
 
-	blocks := mst.NewMemBlockStore()
-	tree := mst.NewTree(blocks)
-	for _, ev := range events {
-		key := ev.Collection + "/" + ev.Rkey
-		switch ev.Kind {
-		case segment.KindCreate, segment.KindUpdate, segment.KindCreateResync:
-			cid := cbor.ComputeCID(cbor.CodecDagCBOR, ev.Payload)
-			require.NoError(t, blocks.PutBlock(cid, append([]byte(nil), ev.Payload...)))
-			require.NoError(t, tree.Insert(key, cid))
-		case segment.KindDelete:
-			require.NoError(t, tree.Remove(key))
-		}
-	}
-	root, err := tree.WriteBlocks(blocks)
-	require.NoError(t, err)
-
-	commit := &repo.Commit{
-		DID:     did,
-		Version: 3,
-		Data:    root,
-		Rev:     rev,
-		Sig:     []byte{1, 2, 3},
-	}
-	commitBytes, err := commit.EncodeCBOR()
-	require.NoError(t, err)
-	commitCID := cbor.ComputeCID(cbor.CodecDagCBOR, commitBytes)
-	require.NoError(t, blocks.PutBlock(commitCID, commitBytes))
-
-	carBlocks := make([]car.Block, 0)
-	for cid, data := range blocks.All() {
-		carBlocks = append(carBlocks, car.Block{
-			CID:  cid,
-			Data: append([]byte(nil), data...),
-		})
-	}
-	sort.Slice(carBlocks, func(i, j int) bool {
-		return carBlocks[i].CID.String() < carBlocks[j].CID.String()
-	})
-
-	var buf bytes.Buffer
-	require.NoError(t, car.WriteAll(&buf, []cbor.CID{commitCID}, carBlocks))
-	return buf.Bytes(), root
+	commitCID, commitCAR := authoritativeCommitCAR(t, did, rev, root)
+	return newCommitBlockServer(t, did, rev, commitCID, commitCAR)
 }
 
-func newGetRepoServer(t *testing.T, did string, carBytes []byte) *httptest.Server {
+type testIdentityResolver struct {
+	did    string
+	pdsURL string
+}
+
+func newTestIdentityResolver(did, pdsURL string) *testIdentityResolver {
+	return &testIdentityResolver{did: did, pdsURL: pdsURL}
+}
+
+func (r *testIdentityResolver) ResolveDID(_ context.Context, did atmos.DID) (*identity.DIDDocument, error) {
+	if string(did) != r.did {
+		return nil, identity.ErrDIDNotFound
+	}
+	return &identity.DIDDocument{
+		ID: r.did,
+		Service: []identity.Service{
+			{
+				ID:              r.did + "#atproto_pds",
+				Type:            "AtprotoPersonalDataServer",
+				ServiceEndpoint: r.pdsURL,
+			},
+		},
+	}, nil
+}
+
+func (r *testIdentityResolver) ResolveHandle(_ context.Context, _ atmos.Handle) (atmos.DID, error) {
+	return "", identity.ErrHandleNotFound
+}
+
+func newCommitBlockServer(t *testing.T, did string, rev string, commitCID cbor.CID, commitCAR []byte) *httptest.Server {
 	t.Helper()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
@@ -256,7 +273,98 @@ func newGetRepoServer(t *testing.T, did string, carBytes []byte) *httptest.Serve
 			http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if r.URL.Path != "/xrpc/com.atproto.sync.getRepo" {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.sync.getLatestCommit":
+			if got := r.URL.Query().Get("did"); got != did {
+				http.Error(rw, "unexpected did", http.StatusBadRequest)
+				return
+			}
+
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(map[string]string{
+				"rev": rev,
+				"cid": commitCID.String(),
+			})
+		case "/xrpc/com.atproto.sync.getBlocks":
+			if got := r.URL.Query().Get("did"); got != did {
+				http.Error(rw, "unexpected did", http.StatusBadRequest)
+				return
+			}
+			if got := r.URL.Query()["cids"]; len(got) != 1 || got[0] != commitCID.String() {
+				http.Error(rw, "unexpected cids", http.StatusBadRequest)
+				return
+			}
+
+			rw.Header().Set("Content-Type", "application/vnd.ipld.car")
+			_, _ = rw.Write(commitCAR)
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func authoritativeCommitCAR(t *testing.T, did string, rev string, root cbor.CID) (cbor.CID, []byte) {
+	t.Helper()
+
+	commitData := cbor.AppendMapHeader(nil, 6)
+	commitData = cbor.AppendText(commitData, "did")
+	commitData = cbor.AppendText(commitData, did)
+	commitData = cbor.AppendText(commitData, "rev")
+	commitData = cbor.AppendText(commitData, rev)
+	commitData = cbor.AppendText(commitData, "sig")
+	commitData = cbor.AppendBytes(commitData, []byte{1, 2, 3})
+	commitData = cbor.AppendText(commitData, "data")
+	commitData = cbor.AppendCIDLink(commitData, &root)
+	commitData = cbor.AppendText(commitData, "prev")
+	commitData = cbor.AppendNull(commitData)
+	commitData = cbor.AppendText(commitData, "version")
+	commitData = cbor.AppendUint(commitData, 3)
+
+	commitCID := cbor.ComputeCID(cbor.CodecDagCBOR, commitData)
+	var buf bytes.Buffer
+	writeCARAllowEmptyRoots(t, &buf, nil, []car.Block{{CID: commitCID, Data: commitData}})
+	return commitCID, buf.Bytes()
+}
+
+func writeCARAllowEmptyRoots(t *testing.T, buf *bytes.Buffer, roots []cbor.CID, blocks []car.Block) {
+	t.Helper()
+
+	header := cbor.AppendMapHeader(nil, 2)
+	header = cbor.AppendText(header, "roots")
+	header = cbor.AppendArrayHeader(header, uint64(len(roots)))
+	for i := range roots {
+		header = cbor.AppendCIDLink(header, &roots[i])
+	}
+	header = cbor.AppendText(header, "version")
+	header = cbor.AppendUint(header, 1)
+
+	_, err := buf.Write(cbor.AppendUvarint(nil, uint64(len(header))))
+	require.NoError(t, err)
+	_, err = buf.Write(header)
+	require.NoError(t, err)
+
+	for _, block := range blocks {
+		blockLen := uint64(cbor.CIDByteLen(&block.CID) + len(block.Data))
+		_, err = buf.Write(cbor.AppendUvarint(nil, blockLen))
+		require.NoError(t, err)
+		_, err = buf.Write(block.CID.AppendBytes(nil))
+		require.NoError(t, err)
+		_, err = buf.Write(block.Data)
+		require.NoError(t, err)
+	}
+}
+
+func newMalformedLatestCommitServer(t *testing.T, did string) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Path != "/xrpc/com.atproto.sync.getLatestCommit" {
 			http.NotFound(rw, r)
 			return
 		}
@@ -265,14 +373,17 @@ func newGetRepoServer(t *testing.T, did string, carBytes []byte) *httptest.Serve
 			return
 		}
 
-		rw.Header().Set("Content-Type", "application/vnd.ipld.car")
-		_, _ = rw.Write(carBytes)
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]string{
+			"rev": testAuthoritativeRev,
+			"cid": "not-a-cid",
+		})
 	}))
 	t.Cleanup(srv.Close)
 	return srv
 }
 
-func newGetRepoErrorServer(t *testing.T, status int) *httptest.Server {
+func newGetLatestCommitErrorServer(t *testing.T, status int) *httptest.Server {
 	t.Helper()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
