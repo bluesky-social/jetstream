@@ -8,15 +8,20 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 )
 
 const (
-	DefaultBackfillWorkers           = 100
-	DefaultBackfillBatchSize         = 100_000
-	DefaultBackfillAsyncFlushWorkers = 4
+	DefaultBackfillWorkers            = 100
+	DefaultBackfillBatchSize          = 100_000
+	DefaultBackfillAsyncFlushWorkers  = 4
+	DefaultFailedRepoRetryInterval    = backfill.DefaultFailedRepoRetryInterval
+	DefaultFailedRepoRetryWorkers     = backfill.DefaultFailedRepoRetryWorkers
+	DefaultFailedRepoRetryHostWorkers = backfill.DefaultFailedRepoRetryHostWorkers
+	DefaultFailedRepoRetryMaxDelay    = backfill.DefaultFailedRepoRetryMaxDelay
 )
 
 // PhaseBarrier is a test hook that can pause execution after a major
@@ -43,12 +48,16 @@ type Options struct {
 	ShutdownTimeout    time.Duration
 	ClientDrainTimeout time.Duration
 
-	MaxBackfillRepos          int
-	BackfillWorkers           int
-	BackfillBatchSize         int
-	BackfillAsyncFlushWorkers int
-	BackfillRepos             []atmos.DID
-	SkipMergeDiscovery        bool
+	MaxBackfillRepos           int
+	BackfillWorkers            int
+	BackfillBatchSize          int
+	BackfillAsyncFlushWorkers  int
+	BackfillRepos              []atmos.DID
+	SkipMergeDiscovery         bool
+	FailedRepoRetryInterval    time.Duration
+	FailedRepoRetryWorkers     int
+	FailedRepoRetryHostWorkers int
+	FailedRepoRetryMaxDelay    time.Duration
 
 	// DisableRepoActionRateLimits disables the per-source-IP limiter for
 	// expensive operator-triggered repo actions on the status UI.

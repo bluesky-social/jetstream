@@ -151,6 +151,14 @@ type Config struct {
 	// production backoff per fault. Production leaves it 0.
 	BackfillRetryBaseDelay time.Duration
 
+	// FailedRepoRetryInterval controls steady-state retry scans for repos that
+	// exhausted bootstrap retry and remain StatusFailed. Zero disables the
+	// background retry loop.
+	FailedRepoRetryInterval    time.Duration
+	FailedRepoRetryWorkers     int
+	FailedRepoRetryHostWorkers int
+	FailedRepoRetryMaxDelay    time.Duration
+
 	// LiveReconnectBackoff, when non-nil, overrides atmos's subscribeRepos
 	// reconnect backoff for both bootstrap-time and steady-state live
 	// consumers. Production leaves it nil.
@@ -255,6 +263,18 @@ func (c *Config) validate() error {
 	}
 	if c.BackfillAsyncFlushWorkers < 0 {
 		return fmt.Errorf("%w: BackfillAsyncFlushWorkers must be >= 0", ErrInvalidConfig)
+	}
+	if c.FailedRepoRetryInterval < 0 {
+		return fmt.Errorf("%w: FailedRepoRetryInterval must be >= 0", ErrInvalidConfig)
+	}
+	if c.FailedRepoRetryWorkers < 0 {
+		return fmt.Errorf("%w: FailedRepoRetryWorkers must be >= 0", ErrInvalidConfig)
+	}
+	if c.FailedRepoRetryHostWorkers < 0 {
+		return fmt.Errorf("%w: FailedRepoRetryHostWorkers must be >= 0", ErrInvalidConfig)
+	}
+	if c.FailedRepoRetryMaxDelay < 0 {
+		return fmt.Errorf("%w: FailedRepoRetryMaxDelay must be >= 0", ErrInvalidConfig)
 	}
 	if c.HTTPClient == nil {
 		return fmt.Errorf("%w: HTTPClient is required", ErrInvalidConfig)

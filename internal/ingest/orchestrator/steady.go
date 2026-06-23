@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"golang.org/x/sync/errgroup"
@@ -100,6 +101,27 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			}
 			return err
 		})
+
+		if o.cfg.FailedRepoRetryInterval > 0 {
+			g.Go(func() error {
+				err := backfill.RunFailedRepoRetry(gctx, backfill.RetryConfig{
+					Store:       o.cfg.Store,
+					Writer:      c.Writer(),
+					HTTPClient:  o.cfg.HTTPClient,
+					RelayURL:    o.cfg.RelayURL,
+					Logger:      o.cfg.Logger,
+					Metrics:     o.cfg.BackfillMetrics,
+					Interval:    o.cfg.FailedRepoRetryInterval,
+					Workers:     o.cfg.FailedRepoRetryWorkers,
+					HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
+					MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
+				})
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
+				return err
+			})
+		}
 
 		return g.Wait()
 	})
