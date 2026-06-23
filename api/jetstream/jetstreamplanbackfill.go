@@ -504,6 +504,9 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalCBORAt(data []byte, pos int) (in
 					if err != nil {
 						return 0, err
 					}
+					if err := cbor.CheckArrayLen(arrLen, data, newPos); err != nil {
+						return 0, err
+					}
 					pos = newPos
 					s.Segments = make([]JetstreamPlanBackfill_Segment, arrLen)
 					for idx := range arrLen {
@@ -887,6 +890,9 @@ func (s *JetstreamPlanBackfill_Input) UnmarshalCBORAt(data []byte, pos int) (int
 					if err != nil {
 						return 0, err
 					}
+					if err := cbor.CheckArrayLen(arrLen, data, newPos); err != nil {
+						return 0, err
+					}
 					pos = newPos
 					s.Dids = make([]string, arrLen)
 					for idx := range arrLen {
@@ -963,6 +969,9 @@ func (s *JetstreamPlanBackfill_Input) UnmarshalCBORAt(data []byte, pos int) (int
 				{
 					arrLen, newPos, err := cbor.ReadArrayHeader(data, pos)
 					if err != nil {
+						return 0, err
+					}
+					if err := cbor.CheckArrayLen(arrLen, data, newPos); err != nil {
 						return 0, err
 					}
 					pos = newPos
@@ -1184,6 +1193,9 @@ func (s *JetstreamPlanBackfill_Segment) UnmarshalCBORAt(data []byte, pos int) (i
 				{
 					arrLen, newPos, err := cbor.ReadArrayHeader(data, pos)
 					if err != nil {
+						return 0, err
+					}
+					if err := cbor.CheckArrayLen(arrLen, data, newPos); err != nil {
 						return 0, err
 					}
 					pos = newPos
