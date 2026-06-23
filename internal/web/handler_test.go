@@ -317,7 +317,7 @@ func TestHandler_RendersHostsTab(t *testing.T) {
 	require.Contains(t, body, "host-filter")
 	require.Contains(t, body, "sample-did")
 	require.Contains(t, body, "account-link")
-	require.Contains(t, body, `href="/status?tab=accounts&amp;did=did%3aplc%3aaaaaaaaaaaaaaaaaaaaaaaaa&amp;handle="`)
+	require.Contains(t, body, `href="/status?tab=accounts&amp;account=did%3aplc%3aaaaaaaaaaaaaaaaaaaaaaaaa"`)
 	require.Contains(t, body, `target="_blank"`)
 	require.Contains(t, body, "pds.example.com")
 	require.Contains(t, body, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
@@ -328,7 +328,7 @@ func TestHandler_RendersHostsTab(t *testing.T) {
 func TestHandler_RendersAccountsTabWithHandleQuery(t *testing.T) {
 	t.Parallel()
 	s := newFixtureSnap()
-	s.Request = status.Request{Tab: "accounts", Handle: "alice.test"}
+	s.Request = status.Request{Tab: "accounts", Account: "alice.test"}
 	s.Account = status.AccountLookup{
 		Query:     "alice.test",
 		QueryKind: "handle",
@@ -349,13 +349,17 @@ func TestHandler_RendersAccountsTabWithHandleQuery(t *testing.T) {
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&handle=alice.test", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&account=alice.test", nil)
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	require.Equal(t, status.Request{Tab: "accounts", Handle: "alice.test"}, src.lastReq)
+	require.Equal(t, status.Request{Tab: "accounts", Account: "alice.test"}, src.lastReq)
 	body := rr.Body.String()
 	require.Contains(t, body, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+	require.Contains(t, body, `name="account"`)
+	require.Contains(t, body, `placeholder="DID or handle"`)
+	require.NotContains(t, body, `name="did" class="lookup-input"`)
+	require.NotContains(t, body, `name="handle" class="lookup-input"`)
 	require.Contains(t, body, "declared handle")
 	require.Contains(t, body, "pds.example.com")
 	require.Contains(t, body, "Host context")
