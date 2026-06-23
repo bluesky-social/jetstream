@@ -610,7 +610,7 @@ Subscribers that need everything Jetstream knows about an event can opt in by ap
 - `seq`: Jetstream's own monotonic 64-bit cursor assigned to this event at ingestion time.
 - `upstream_relay_cursor`: the upstream relay firehose cursor this event came from. Useful to any subscriber that wants to eventually promote itself into a primary and pick up from the relay with minimal overlap.
 - `commit.record_cbor`: the raw DAG-CBOR payload of the record, base64-encoded. Only populated for `kind: "commit"`. This is the byte-exact form written to the segment file, suitable for verifying against a PDS or reconstructing the MST.
-- TODO: `#sync` events (Fig suggestion)
+- `sync`: the archived `#sync` event. `sync.blocks` is the raw CAR payload, base64-encoded. Only populated for `kind: "sync"`.
 - TODO: `prevRev`  on all events (Fig suggestion)
 
 A replica is just an extended-mode subscriber with the additional behavior of writing what it receives into its own segments. See Section 6.

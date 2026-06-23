@@ -95,7 +95,7 @@ type extendedEvent struct {
 	Commit              *extendedCommit                         `json:"commit,omitempty"`
 	Account             *comatproto.SyncSubscribeRepos_Account  `json:"account,omitempty"`
 	Identity            *comatproto.SyncSubscribeRepos_Identity `json:"identity,omitempty"`
-	Sync                *comatproto.SyncSubscribeRepos_Sync     `json:"sync,omitempty"`
+	Sync                *extendedSync                           `json:"sync,omitempty"`
 }
 
 type extendedCommit struct {
@@ -106,6 +106,17 @@ type extendedCommit struct {
 	Record     json.RawMessage `json:"record,omitempty"`
 	CID        string          `json:"cid,omitempty"`
 	RecordCBOR string          `json:"record_cbor,omitempty"`
+}
+
+// Keep Jetstream's extended wire shape independent from atmos's generated
+// atproto JSON encoding for bytes, which uses DAG-JSON {"$bytes": "..."}.
+type extendedSync struct {
+	LexiconTypeID string `json:"$type,omitempty"`
+	Blocks        []byte `json:"blocks"`
+	DID           string `json:"did"`
+	Rev           string `json:"rev"`
+	Seq           int64  `json:"seq"`
+	Time          string `json:"time"`
 }
 
 func extendedEnvelope(evt *segment.Event, kind string) extendedEvent {
@@ -185,7 +196,14 @@ func encodeExtendedSync(evt *segment.Event) ([]byte, error) {
 		return nil, fmt.Errorf("subscribe: decode sync: %w", err)
 	}
 	env := extendedEnvelope(evt, "sync")
-	env.Sync = &sync
+	env.Sync = &extendedSync{
+		LexiconTypeID: sync.LexiconTypeID,
+		Blocks:        sync.Blocks,
+		DID:           sync.DID,
+		Rev:           sync.Rev,
+		Seq:           sync.Seq,
+		Time:          sync.Time,
+	}
 	return json.Marshal(&env)
 }
 
