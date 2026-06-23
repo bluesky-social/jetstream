@@ -11,18 +11,20 @@ import (
 
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
+	atmosidentity "github.com/jcalabro/atmos/identity"
 	atmosrepo "github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 )
 
 type selectedReposConfig struct {
-	Repos      []atmos.DID
-	Store      *Store
-	Handler    *SegmentHandler
-	SyncClient *atmossync.Client
-	Metrics    *Metrics
-	OnError    func(atmos.DID, error)
+	Repos            []atmos.DID
+	Store            *Store
+	Handler          *SegmentHandler
+	SyncClient       *atmossync.Client
+	IdentityResolver atmosidentity.Resolver
+	Metrics          *Metrics
+	OnError          func(atmos.DID, error)
 
 	MaxRetries     int
 	RetryBaseDelay time.Duration
@@ -74,11 +76,52 @@ func (r *selectedRunner) reconcileAndProcess(ctx context.Context, did atmos.DID)
 		}
 	}
 
+	if err := r.recordIdentityMetadata(ctx, did); err != nil {
+		return err
+	}
 	if rec.State == atmosbackfill.StateComplete {
 		return nil
 	}
 	r.processRepo(ctx, did)
 	return nil
+}
+
+func (r *selectedRunner) recordIdentityMetadata(ctx context.Context, did atmos.DID) error {
+	doc, err := r.cfg.IdentityResolver.ResolveDID(ctx, did)
+	if err != nil {
+		r.reportIdentityMetadataError(did, fmt.Errorf("backfill: resolve selected repo identity: %w", err))
+		return nil
+	}
+	ident, err := atmosidentity.IdentityFromDocument(doc)
+	if err != nil {
+		r.reportIdentityMetadataError(did, fmt.Errorf("backfill: parse selected repo identity: %w", err))
+		return nil
+	}
+
+	pds := ident.PDSEndpoint()
+	host, ok := normalizeHostBucket(pds)
+	if !ok {
+		host = HostBucketInvalidPDS
+	}
+
+	handle := ""
+	if ident.Handle != "" && ident.Handle != atmos.HandleInvalid {
+		handle = string(ident.Handle)
+	}
+	if err := r.cfg.Store.recordIdentityResolution(ctx, did, IdentityResolution{
+		Handle: handle,
+		PDS:    pds,
+		Host:   host,
+	}); err != nil {
+		return fmt.Errorf("selected repo backfill: record identity metadata %s: %w", did, err)
+	}
+	return nil
+}
+
+func (r *selectedRunner) reportIdentityMetadataError(did atmos.DID, err error) {
+	if r.cfg.OnError != nil {
+		r.cfg.OnError(did, err)
+	}
 }
 
 // processRepo mirrors the atmos engine's two-budget retry loop (see

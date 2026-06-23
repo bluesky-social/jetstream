@@ -115,6 +115,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 				BackfillWorkers:   o.cfg.BackfillWorkers,
 				BackfillBatchSize: o.cfg.BackfillBatchSize,
 				BackfillRepos:     o.cfg.BackfillRepos,
+				IdentityResolver:  o.cfg.Directory.Resolver,
 				RetryBaseDelay:    o.cfg.BackfillRetryBaseDelay,
 				AfterRepoComplete: o.cfg.AfterRepoComplete,
 				CrashInjector:     o.cfg.CrashInjector,
