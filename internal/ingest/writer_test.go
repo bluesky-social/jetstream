@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1627,7 +1628,14 @@ func TestAppendBatch_AsyncFlushRunsDurableBatchHook(t *testing.T) {
 	}
 }
 
-func TestAppendBatch_AsyncFlushDefersRotationWhilePendingRowsExist(t *testing.T) {
+// TestAppendBatch_AsyncFlushRotatesWhenFullIncludingPendingRows pins the
+// corrected async rotation contract: once the active segment crosses
+// MaxSegmentBytes, AppendBatch rotates before returning, durably flushing
+// any trailing sub-block remainder into the sealed segment first. The
+// rotation is size-driven and does not wait for an explicit Flush or a
+// downstream DrainDurability checkpoint — that checkpoint-only behavior was
+// the bug that let segments grow without bound under sustained backfill.
+func TestAppendBatch_AsyncFlushRotatesWhenFullIncludingPendingRows(t *testing.T) {
 	t.Parallel()
 	w := newTestWriter(t, Config{
 		MaxEventsPerBlock: 2,
@@ -1642,24 +1650,21 @@ func TestAppendBatch_AsyncFlushDefersRotationWhilePendingRowsExist(t *testing.T)
 	}
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 
-	require.Equal(t, uint64(0), w.ActiveIndex(),
-		"async rotation must not seal while a later partial block is pending")
+	require.Equal(t, uint64(1), w.ActiveIndex(),
+		"oversized async segment must rotate at end of AppendBatch, flushing the trailing partial block")
 	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(2), persisted,
-		"only the full async block is durable before the explicit flush")
+	require.Equal(t, uint64(3), persisted,
+		"seq/next must cover every appended event (incl. the flushed remainder) before the seal")
 
-	require.NoError(t, w.Flush(t.Context()))
-	require.Equal(t, uint64(1), w.ActiveIndex(),
-		"flush drains the partial block and lets the oversized segment rotate")
-	persisted, err = loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
-	require.NoError(t, err)
-	require.Equal(t, uint64(3), persisted)
-
+	// The sealed segment must contain ALL three events: the full async
+	// block (2 events) plus the trailing remainder block (1 event).
 	r, err := segment.Open(segment.ReaderConfig{Path: filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Close() })
 	require.Len(t, r.Blocks(), 2)
+	require.Equal(t, uint64(3), uint64(r.Header().EventCount),
+		"no acknowledged event may be dropped across the rotation")
 }
 
 func TestAppendBatch_AsyncFlushConcurrentBatchesRemainContiguous(t *testing.T) {
@@ -1708,6 +1713,83 @@ func TestAppendBatch_AsyncFlushConcurrentBatchesRemainContiguous(t *testing.T) {
 	slices.Sort(seqs)
 	for i, seq := range seqs {
 		require.Equal(t, uint64(i), seq)
+	}
+}
+
+// TestAsyncFlush_ConcurrentProducersRotateWithoutSeqCorruption stresses the
+// rotation fix under the production shape: many concurrent AppendBatch
+// producers against a small byte threshold, so rotateIfFull fires frequently
+// and concurrently. Each producer calls rotateIfFull after releasing drainMu,
+// so this exercises (a) rotateIfFull serializing on drainMu, (b) the
+// under-lock activeBytes re-check making redundant rotations no-ops, and
+// (c) seq integrity when a producer drains a pipeline holding other
+// producers' in-flight blocks. Asserts: many rotations fired, all segments
+// bounded, and every seq present exactly once with no gaps or duplicates.
+func TestAsyncFlush_ConcurrentProducersRotateWithoutSeqCorruption(t *testing.T) {
+	t.Parallel()
+
+	const (
+		maxSegmentBytes = 32 * 1024
+		goroutines      = 16
+		batchesEach     = 12
+		perBatch        = 10 // not a multiple of MaxEventsPerBlock
+		payloadBytes    = 256
+	)
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 8,
+		MaxSegmentBytes:   maxSegmentBytes,
+		AsyncFlushWorkers: 4,
+	})
+
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := range goroutines {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			// Per-goroutine PRNG seed keeps payloads incompressible and the
+			// run deterministic without shared state.
+			rng := mathrand.New(mathrand.NewPCG(uint64(g)+1, 0xc0ffee))
+			for b := range batchesEach {
+				events := make([]segment.Event, perBatch)
+				for i := range events {
+					events[i] = segment.Event{
+						IndexedAt: int64(b*perBatch + i + 1),
+						Kind:      segment.KindCreate,
+						DID:       fmt.Sprintf("did:plc:g%02db%02di%02d", g, b, i),
+						Payload:   incompressiblePayload(rng, payloadBytes),
+					}
+				}
+				if err := w.AppendBatch(t.Context(), events); err != nil {
+					errs <- err
+					return
+				}
+			}
+			errs <- nil
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	require.Greater(t, testutil.ToFloat64(w.cfg.Metrics.SegmentsRotated), 2.0,
+		"concurrent oversized load must rotate repeatedly")
+
+	require.NoError(t, w.DrainDurability(t.Context()))
+	require.NoError(t, w.Close())
+
+	require.Less(t, largestSegmentBytes(t, w.cfg.SegmentsDir), int64(4*maxSegmentBytes),
+		"no segment may grow far past MaxSegmentBytes under concurrent load")
+
+	total := goroutines * batchesEach * perBatch
+	seqs := collectAllSeqs(t, w.cfg.SegmentsDir)
+	require.Len(t, seqs, total, "every concurrently-appended event survives rotation exactly once")
+	slices.Sort(seqs)
+	for i := range seqs {
+		require.Equal(t, uint64(i), seqs[i],
+			"seqs contiguous across concurrent rotations (no gaps, no duplicates)")
 	}
 }
 
@@ -1819,4 +1901,294 @@ func TestAppendBatch_OnAppendFiresBeforeSealVisibility(t *testing.T) {
 	require.Equal(t, []uint64{0, 1}, observed)
 	require.Equal(t, []uint64{0, 1}, observedAtSeal,
 		"every event of the sealed segment must be observed before the seal is visible")
+}
+
+// collectAllSeqs reads every event seq from every segment file under dir,
+// in segment-index then in-segment order. Sealed segments are read via the
+// Reader's block index; the (single) trailing active segment is walked with
+// WalkActive. This is the ground-truth view used to assert no seq is
+// duplicated or skipped across rotations.
+func collectAllSeqs(t *testing.T, dir string) []uint64 {
+	t.Helper()
+	files, err := SegmentFiles(dir)
+	require.NoError(t, err)
+
+	var seqs []uint64
+	for _, f := range files {
+		r, err := segment.Open(segment.ReaderConfig{Path: f.Path})
+		switch {
+		case err == nil:
+			for i := range r.Blocks() {
+				evs, derr := r.DecodeBlock(i)
+				require.NoError(t, derr)
+				for j := range evs {
+					seqs = append(seqs, evs[j].Seq)
+				}
+			}
+			require.NoError(t, r.Close())
+		case errors.Is(err, segment.ErrActiveSegment):
+			require.NoError(t, segment.WalkActive(f.Path, func(evs []segment.Event) error {
+				for j := range evs {
+					seqs = append(seqs, evs[j].Seq)
+				}
+				return nil
+			}))
+		default:
+			require.NoError(t, err, "open segment %s", f.Path)
+		}
+	}
+	return seqs
+}
+
+// incompressiblePayload returns n deterministic, high-entropy bytes drawn
+// from a fixed-seed PRNG, so block-level zstd cannot collapse them. This
+// makes the on-disk segment size (and therefore the byte-keyed rotation
+// threshold) the binding constraint in rotation tests. Determinism (fixed
+// seed) keeps the tests reproducible without Date.now/global rand.
+func incompressiblePayload(rng *mathrand.Rand, n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(rng.UintN(256))
+	}
+	return b
+}
+
+// largestSegmentBytes returns the size of the largest seg_*.jss file under
+// dir, minus the reserved header (matching the activeBytes accounting the
+// rotation threshold is compared against).
+func largestSegmentBytes(t *testing.T, dir string) int64 {
+	t.Helper()
+	files, err := SegmentFiles(dir)
+	require.NoError(t, err)
+	var maxBytes int64
+	for _, f := range files {
+		info, serr := os.Stat(f.Path)
+		require.NoError(t, serr)
+		if b := info.Size() - int64(segment.ReservedHeaderBytes); b > maxBytes {
+			maxBytes = b
+		}
+	}
+	return maxBytes
+}
+
+// TestAsyncFlush_RotatesUnderSustainedLoad is the headline regression test
+// for the segment-rotation starvation bug. Under sustained AppendBatch load
+// against an async writer, the old code only rotated when the flush pipeline
+// happened to be momentarily quiescent AT a commit (asyncPrepared<=1 &&
+// Pending()==0), so segments grew far past MaxSegmentBytes — unbounded under
+// steady load. This test drives many batches with MaxSegmentBytes set small
+// and AsyncFlushWorkers>1, and asserts that (a) many rotations actually fire
+// and (b) no sealed segment exceeds the threshold by more than a tight
+// bounded overshoot. It fails hard on the pre-fix code (≈1 rotation, one
+// giant segment).
+func TestAsyncFlush_RotatesUnderSustainedLoad(t *testing.T) {
+	t.Parallel()
+
+	const (
+		blockSize = 8
+		// Each event carries a ~1KiB payload; with block-level zstd on
+		// incompressible random-ish bytes the on-disk segment grows
+		// predictably so the byte threshold is the binding constraint.
+		payloadBytes    = 1024
+		maxSegmentBytes = 64 * 1024 // 64 KiB target
+		batches         = 40
+		// perBatch is a multiple of blockSize, but the active block is primed
+		// with one event below (see prime), so every AppendBatch leaves
+		// exactly one event Pending. A real pipeline is almost never
+		// perfectly quiescent, and real backfill repos have arbitrary record
+		// counts that never align to the block boundary — so Pending()>0
+		// holds at commit time. That is precisely the shape the pre-fix
+		// inline guard (`|| w.active.Pending() > 0`) refuses to rotate on, so
+		// the old code starves here and never rotates regardless of size.
+		perBatch = 4 * blockSize
+	)
+	reg := prometheus.NewRegistry()
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: blockSize,
+		MaxSegmentBytes:   maxSegmentBytes,
+		AsyncFlushWorkers: 4,
+		Metrics:           NewMetrics(reg),
+	})
+
+	rng := mathrand.New(mathrand.NewPCG(0x5eed, 0x1dea))
+	mkEvent := func(n int) segment.Event {
+		return segment.Event{
+			IndexedAt:  int64(n + 1),
+			Kind:       segment.KindCreate,
+			DID:        fmt.Sprintf("did:plc:user%06d", n),
+			Collection: "app.bsky.feed.post",
+			Rkey:       fmt.Sprintf("rk%06d", n),
+			Rev:        "3kabc",
+			Payload:    incompressiblePayload(rng, payloadBytes),
+		}
+	}
+
+	// Prime the active block so the pending remainder is never zero at a
+	// block boundary.
+	prime := mkEvent(0)
+	require.NoError(t, w.Append(t.Context(), &prime))
+	total := 1
+	for range batches {
+		events := make([]segment.Event, perBatch)
+		for i := range events {
+			events[i] = mkEvent(total)
+			total++
+		}
+		require.NoError(t, w.AppendBatch(t.Context(), events))
+	}
+
+	rotations := testutil.ToFloat64(w.cfg.Metrics.SegmentsRotated)
+	require.Greater(t, rotations, 3.0,
+		"sustained oversized load must trigger many rotations, not starve (got %v)", rotations)
+
+	// Every sealed segment must be bounded near the threshold. Overshoot is
+	// at most one in-flight append/batch worth of blocks; we allow a
+	// generous 4x threshold ceiling, which still fails catastrophically on
+	// the pre-fix code (which produced a single multi-batch segment).
+	largest := largestSegmentBytes(t, w.cfg.SegmentsDir)
+	require.Less(t, largest, int64(4*maxSegmentBytes),
+		"no segment may grow far past MaxSegmentBytes; largest=%d threshold=%d", largest, maxSegmentBytes)
+
+	// Correctness: drain and confirm every appended seq is present exactly
+	// once across all segments, contiguous from 0.
+	require.NoError(t, w.DrainDurability(t.Context()))
+	require.NoError(t, w.Close())
+
+	seqs := collectAllSeqs(t, w.cfg.SegmentsDir)
+	require.Len(t, seqs, total, "every appended event must survive rotation")
+	slices.Sort(seqs)
+	for i := range seqs {
+		require.Equal(t, uint64(i), seqs[i], "seqs must be contiguous with no gaps or duplicates")
+	}
+}
+
+// TestAsyncFlush_SeqIntegrityAcrossRotationAndReopen drives oversized async
+// load, rotating several times, then Close+Reopen (simulating a process
+// restart) and continues appending. It asserts there are no duplicate or
+// skipped seqs across the rotation seams and across the reopen boundary —
+// the crash-recovery contract the rotation fix must preserve (Open's
+// ScanMaxSeq reconciliation of seq/next).
+func TestAsyncFlush_SeqIntegrityAcrossRotationAndReopen(t *testing.T) {
+	t.Parallel()
+
+	const blockSize = 8
+
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+	mkWriter := func() *Writer {
+		w, err := Open(Config{
+			SegmentsDir:       segDir,
+			Store:             st,
+			Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Metrics:           NewMetrics(prometheus.NewRegistry()),
+			MaxEventsPerBlock: blockSize,
+			MaxSegmentBytes:   32 * 1024,
+			AsyncFlushWorkers: 3,
+		})
+		require.NoError(t, err)
+		return w
+	}
+
+	rng := mathrand.New(mathrand.NewPCG(0xabcd, 0x1234))
+	seq := 0
+	mkEvent := func() segment.Event {
+		ev := segment.Event{
+			IndexedAt: int64(seq + 1),
+			Kind:      segment.KindCreate,
+			DID:       fmt.Sprintf("did:plc:u%06d", seq),
+			Payload:   incompressiblePayload(rng, 512),
+		}
+		seq++
+		return ev
+	}
+	// prime appends one event, then drives block-aligned batches so the
+	// active block always has exactly one event Pending at commit time —
+	// the shape the pre-fix guard (`|| Pending() > 0`) starves on.
+	appendPrimedBatches := func(w *Writer, batches int) {
+		prime := mkEvent()
+		require.NoError(t, w.Append(t.Context(), &prime))
+		for range batches {
+			events := make([]segment.Event, 4*blockSize)
+			for i := range events {
+				events[i] = mkEvent()
+			}
+			require.NoError(t, w.AppendBatch(t.Context(), events))
+		}
+	}
+
+	w1 := mkWriter()
+	appendPrimedBatches(w1, 20)
+	n1 := seq
+	require.Greater(t, testutil.ToFloat64(w1.cfg.Metrics.SegmentsRotated), 1.0,
+		"first run must rotate at least twice")
+	// Close (not Seal): the trailing active segment stays unsealed, exactly
+	// like a graceful shutdown mid-segment.
+	require.NoError(t, w1.Close())
+
+	nextAfterClose := w1.NextSeq()
+	require.Equal(t, uint64(n1), nextAfterClose, "nextSeq covers every appended event")
+
+	// Reopen against the same dir + store: must resume without regressing or
+	// re-allocating any seq.
+	w2 := mkWriter()
+	require.Equal(t, uint64(n1), w2.NextSeq(),
+		"reopen must reconcile nextSeq to exactly the prior count (no gap, no rewind)")
+	appendPrimedBatches(w2, 20)
+	require.NoError(t, w2.DrainDurability(t.Context()))
+	require.NoError(t, w2.Close())
+
+	total := seq
+	seqs := collectAllSeqs(t, segDir)
+	require.Len(t, seqs, total,
+		"every event across both runs must be present exactly once (no dups, no losses)")
+	slices.Sort(seqs)
+	for i := range seqs {
+		require.Equal(t, uint64(i), seqs[i],
+			"contiguous seqs across rotation seams and the reopen boundary")
+	}
+}
+
+// TestAsyncFlush_RotationIsSizeDrivenNotPipelineDepth is the focused
+// regression test pinning the exact root cause. It crosses MaxSegmentBytes
+// with a single AppendBatch whose final block is a sub-MaxEventsPerBlock
+// remainder (so the active block is left Pending), against multiple async
+// workers. On the pre-fix code the rotation guard
+// (asyncPrepared>1 || Pending()>0) vetoes rotation in this exact shape and
+// the segment never seals. The fix rotates because the segment is full,
+// regardless of pipeline state.
+func TestAsyncFlush_RotationIsSizeDrivenNotPipelineDepth(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1, // any non-empty block crosses the threshold
+		AsyncFlushWorkers: 4,
+	})
+
+	// 10 events / block-size 4 => two full blocks (8 events) submitted as
+	// async jobs + a 2-event remainder left Pending in the active block.
+	events := make([]segment.Event, 10)
+	for i := range events {
+		events[i] = segment.Event{
+			IndexedAt: int64(i + 1),
+			Kind:      segment.KindCreate,
+			DID:       fmt.Sprintf("did:plc:x%02d", i),
+			Payload:   []byte("payload"),
+		}
+	}
+	require.NoError(t, w.AppendBatch(t.Context(), events))
+
+	require.Equal(t, uint64(1), w.ActiveIndex(),
+		"full segment must rotate even with a pending remainder and in-flight pipeline depth")
+	require.Equal(t, 1.0, testutil.ToFloat64(w.cfg.Metrics.SegmentsRotated))
+
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), persisted,
+		"seq/next must be committed for every event before the seal")
+
+	r, err := segment.Open(segment.ReaderConfig{Path: filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	require.Equal(t, uint64(10), uint64(r.Header().EventCount),
+		"the sealed segment must contain all 10 events incl. the flushed remainder")
 }

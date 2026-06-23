@@ -58,6 +58,12 @@ func runOneSwarm(t *testing.T, rng *rand.Rand) {
 		MaxEventsPerBlock: maxBlock,
 		MaxSegmentBytes:   maxSegmentBytes,
 	}
+	// Exercise the async-flush rotation path (rotateIfFull) in half the
+	// iterations. The reopen invariant below then fuzzes async rotation
+	// crash-safety across randomized block/segment sizes for free.
+	if rng.IntN(2) == 0 {
+		cfg.AsyncFlushWorkers = 1 + rng.IntN(4)
+	}
 
 	w, err := Open(cfg)
 	require.NoError(t, err)

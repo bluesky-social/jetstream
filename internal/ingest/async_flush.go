@@ -115,7 +115,6 @@ func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
 		done:     make(chan asyncFlushDone, 1),
 	}
 	w.nextAsyncFlushID++
-	w.asyncPrepared++
 	w.asyncJobs.Add(1)
 	return job, nil
 }
@@ -152,9 +151,6 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 		if w.active == nil {
 			return ErrClosed
 		}
-		if w.asyncPrepared > 0 {
-			defer func() { w.asyncPrepared-- }()
-		}
 
 		if err := w.active.CommitPreparedFlush(job.prepared, frame); err != nil {
 			return fmt.Errorf("ingest: async flush block: %w", err)
@@ -173,8 +169,77 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 		w.activeBytes = info.Size() - int64(segment.ReservedHeaderBytes)
 		w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
 
-		if w.activeBytes < w.cfg.MaxSegmentBytes || w.asyncPrepared > 1 || w.active.Pending() > 0 {
+		// Rotation deliberately does NOT happen here. A prepared block may
+		// still be in flight (preparedOutstanding > 0), which segment.Seal
+		// refuses, and the pipeline is rarely quiescent mid-commit. The
+		// post-append rotateIfFull path performs the rotation at a provably
+		// quiescent point instead. See rotateIfFull.
+		return nil
+	})
+}
+
+// rotateIfFull seals the active segment and opens the next one when the
+// active segment has grown to MaxSegmentBytes. It is the async writer's
+// size-driven rotation lever, called by Append / AppendBatch after their
+// flush jobs have been submitted.
+//
+// The check is keyed on accumulated bytes (the value commitAsyncFlush
+// freshly re-stats after every block), not on transient pipeline depth,
+// so segments rotate at ~MaxSegmentBytes regardless of backfill batch
+// shape. Overshoot is bounded to one append/batch worth of events past
+// the threshold.
+//
+// Crash-safety mirrors the sync flushAndRotateLocked path exactly. We
+// acquire drainMu (the admission barrier every Append/AppendBatch holds
+// while submitting jobs) and then asyncJobs.Wait(), which together
+// guarantee the flush pipeline has drained to depth zero:
+// segment.preparedOutstanding == 0, so Seal's precondition holds, and
+// w.nextSeq is the trailing pending block's max seq + 1 with no
+// higher-seq block in flight. We then flush the trailing pending block
+// (fsync) and commit seq/next BEFORE sealing, so a crash between any two
+// steps leaves seq/next lagging at most one block, which Open's
+// ScanMaxSeq reconciliation recovers.
+//
+// Async-only: the sync path rotates inline in flushAndRotateLocked. A
+// no-op (cheap, no drain) when the active segment is below threshold.
+func (w *Writer) rotateIfFull(ctx context.Context) error {
+	if w.async == nil {
+		return nil
+	}
+
+	w.mu.Lock()
+	full := w.active != nil && !w.closed && w.activeBytes >= w.cfg.MaxSegmentBytes
+	w.mu.Unlock()
+	if !full {
+		return nil
+	}
+
+	return obs.Span(ctx, func(ctx context.Context) error {
+		w.drainMu.Lock()
+		defer w.drainMu.Unlock()
+
+		// Drain the flush pipeline to quiescence so no prepared block is
+		// outstanding against the segment we are about to seal.
+		w.asyncJobs.Wait()
+
+		w.mu.Lock()
+		defer w.mu.Unlock()
+
+		// Re-check under the lock: a concurrent rotateIfFull (or the drain
+		// path) may have already rotated, or the writer may have closed.
+		if w.closed || w.active == nil || w.activeBytes < w.cfg.MaxSegmentBytes {
 			return nil
+		}
+
+		// Flush any trailing sub-block remainder durably first. flushBlockLocked
+		// fsyncs the block, then commits seq/next — the same fsync-before-seq
+		// ordering the sync rotation path uses (DESIGN.md §3.1.1). At full
+		// drain w.nextSeq equals this block's max seq + 1, so the committed
+		// seq never leads durable data.
+		if w.active.Pending() > 0 {
+			if err := w.flushBlockLocked(ctx); err != nil {
+				return err
+			}
 		}
 
 		trace.SpanFromContext(ctx).AddEvent("async_flush_rotate")
