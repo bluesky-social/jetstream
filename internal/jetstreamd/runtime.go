@@ -202,26 +202,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// returns 503, so the nil-pointer window is harmless.
 	var writerPtr atomic.Pointer[ingest.Writer]
 
-	statusCollector, err := status.New(status.Options{
-		Store:          metaStore,
-		DataDir:        opts.DataDir,
-		Manifest:       mft,
-		CursorLookback: opts.CursorLookback,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build status collector: %w", err))
-	}
-
-	statusHandler, err := web.New(web.Options{
-		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(opts.DataDir, opts.RelayURL, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
-		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
-		Logger:                     processLogger,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build status handler: %w", err))
-	}
-
 	// Verifier setup (shared across phases). The verifier itself is
 	// owned by the orchestrator's per-phase live consumers, but we
 	// construct it here because its async-error drain is a sibling
@@ -252,6 +232,27 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Resolver:               resolver,
 		Cache:                  identcache.New(metaStore, identcache.DefaultTTL),
 		SkipHandleVerification: true,
+	}
+
+	statusCollector, err := status.New(status.Options{
+		Store:            metaStore,
+		DataDir:          opts.DataDir,
+		Manifest:         mft,
+		CursorLookback:   opts.CursorLookback,
+		IdentityResolver: resolver,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build status collector: %w", err))
+	}
+
+	statusHandler, err := web.New(web.Options{
+		Snapshotter:                statusCollector,
+		RepoActions:                web.NewRepoActions(opts.DataDir, opts.RelayURL, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
+		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
+		Logger:                     processLogger,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build status handler: %w", err))
 	}
 
 	stateStore := syncstate.New(metaStore)

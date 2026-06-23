@@ -353,7 +353,7 @@ document.addEventListener("input", function (event) {
           <ul class="samples">
             {{range .RecentErrors}}
             <li>
-              <span class="sample-did"><code>{{.DID}}</code></span><a class="account-link" href="/status?tab=accounts&amp;did={{.DID}}&amp;handle=" target="_blank" rel="noopener">view</a>
+              <span class="sample-did"><code>{{.DID}}</code></span><a class="account-link" href="/status?tab=accounts&amp;account={{.DID}}" target="_blank" rel="noopener">view</a>
               <span class="sample-meta">{{relativeTime .AttemptedAt $.Now}} {{if .Class}}<code>{{.Class}}</code>{{end}}</span>
               <span class="sample-error">{{.Error}}</span>
             </li>
@@ -377,8 +377,7 @@ document.addEventListener("input", function (event) {
   <h2>Accounts</h2>
   <form method="get" action="/status" class="toolbar">
     <input type="hidden" name="tab" value="accounts">
-    <input name="did" class="lookup-input" placeholder="did:plc:..." value="{{.Request.DID}}">
-    <input name="handle" class="lookup-input" placeholder="declared handle" value="{{.Request.Handle}}">
+    <input name="account" class="lookup-input" placeholder="DID or handle" value="{{.Request.Account}}">
     <button type="submit">Lookup</button>
   </form>
 
@@ -442,7 +441,7 @@ document.addEventListener("input", function (event) {
   {{else if .Account.Query}}
   <p class="sub">No local account metadata found for <code>{{.Account.Query}}</code>.</p>
   {{else}}
-  <p class="sub">Lookup reads local DID and declared-handle metadata only.</p>
+  <p class="sub">Lookup accepts a DID or handle.</p>
   {{end}}
 </section>
 {{end}}

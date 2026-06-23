@@ -25,9 +25,10 @@ type Snapshot struct {
 
 // Request selects the status-page view and optional account lookup.
 type Request struct {
-	Tab    string
-	DID    string
-	Handle string
+	Tab     string
+	Account string
+	DID     string
+	Handle  string
 }
 
 // ProcessInfo carries the per-process build + uptime context.
@@ -92,8 +93,7 @@ type HostErrorRow struct {
 	Error       string
 }
 
-// AccountLookup is the account diagnostics panel for one DID or local
-// declared-handle query.
+// AccountLookup is the account diagnostics panel for one DID or handle query.
 type AccountLookup struct {
 	Query           string
 	QueryKind       string

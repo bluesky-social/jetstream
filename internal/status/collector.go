@@ -8,6 +8,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/jcalabro/atmos/identity"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -28,6 +29,10 @@ type Options struct {
 	// duration. Zero means cursor replay is disabled; the snapshot
 	// reports zero values for the cursor-lookback panel.
 	CursorLookback time.Duration
+
+	// IdentityResolver resolves one operator-supplied handle on the accounts
+	// tab. Optional; nil means handle lookup is limited to the local index.
+	IdentityResolver identity.Resolver
 }
 
 // Collector builds Snapshots on demand. Concurrent callers share one
@@ -90,7 +95,7 @@ func (c *Collector) SnapshotForRequest(ctx context.Context, req Request) (*Snaps
 }
 
 func requestSingleflightKey(req Request) string {
-	return "status:" + lengthPrefixed(req.Tab) + lengthPrefixed(req.DID) + lengthPrefixed(req.Handle)
+	return "status:" + lengthPrefixed(req.Tab) + lengthPrefixed(req.Account) + lengthPrefixed(req.DID) + lengthPrefixed(req.Handle)
 }
 
 func lengthPrefixed(s string) string {

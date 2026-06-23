@@ -3,6 +3,7 @@ package status_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -19,11 +20,32 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/stretchr/testify/require"
 )
+
+type fakeIdentityResolver struct {
+	handles map[atmos.Handle]atmos.DID
+	err     error
+}
+
+func (r *fakeIdentityResolver) ResolveDID(_ context.Context, _ atmos.DID) (*identity.DIDDocument, error) {
+	return nil, nil
+}
+
+func (r *fakeIdentityResolver) ResolveHandle(_ context.Context, handle atmos.Handle) (atmos.DID, error) {
+	if r.err != nil {
+		return "", r.err
+	}
+	did, ok := r.handles[handle]
+	if !ok {
+		return "", errors.New("handle not found")
+	}
+	return did, nil
+}
 
 func TestCollect_FreshDataDir(t *testing.T) {
 	t.Parallel()
@@ -311,6 +333,99 @@ func TestCollect_AccountLookupByHandle(t *testing.T) {
 	require.Equal(t, int64(1024), snap.Account.TotalBytes)
 	require.NotNil(t, snap.Account.HostContext)
 	require.Equal(t, uint64(2), snap.Account.HostContext.Failed)
+}
+
+func TestCollect_AccountLookupByHandleResolverFallback(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	did := atmos.DID("did:plc:resolved")
+	enc, err := backfill.EncodeRepoStatus(&backfill.RepoStatus{
+		Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete},
+		Host:     "pds.example.com",
+		Active:   true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
+
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		IdentityResolver: &fakeIdentityResolver{handles: map[atmos.Handle]atmos.DID{
+			atmos.Handle("calabro.io"): did,
+		}},
+	})
+	require.NoError(t, err)
+	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "accounts", Account: "Calabro.IO"})
+	require.NoError(t, err)
+
+	require.True(t, snap.Account.Found)
+	require.Equal(t, string(did), snap.Account.DID)
+	require.Equal(t, "calabro.io", snap.Account.Query)
+	require.Equal(t, "handle", snap.Account.QueryKind)
+	require.Equal(t, "complete", snap.Account.Backfill)
+}
+
+func TestCollect_AccountLookupByHandlePrefersResolverOverLocalIndex(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	staleDID := atmos.DID("did:plc:stale")
+	freshDID := atmos.DID("did:plc:fresh")
+	for _, did := range []atmos.DID{staleDID, freshDID} {
+		enc, err := backfill.EncodeRepoStatus(&backfill.RepoStatus{
+			Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete},
+			Active:   true,
+		})
+		require.NoError(t, err)
+		require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
+	}
+	require.NoError(t, st.Set([]byte("handle/alice.test"), []byte(staleDID), store.SyncWrites))
+
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		IdentityResolver: &fakeIdentityResolver{handles: map[atmos.Handle]atmos.DID{
+			atmos.Handle("alice.test"): freshDID,
+		}},
+	})
+	require.NoError(t, err)
+	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "accounts", Account: "alice.test"})
+	require.NoError(t, err)
+
+	require.True(t, snap.Account.Found)
+	require.Equal(t, string(freshDID), snap.Account.DID)
+}
+
+func TestCollect_AccountLookupResolvedHandleWithMissingLocalMetadata(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	did := atmos.DID("did:plc:missinglocal")
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		IdentityResolver: &fakeIdentityResolver{handles: map[atmos.Handle]atmos.DID{
+			atmos.Handle("missing.test"): did,
+		}},
+	})
+	require.NoError(t, err)
+	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "accounts", Account: "missing.test"})
+	require.NoError(t, err)
+
+	require.False(t, snap.Account.Found)
+	require.Equal(t, string(did), snap.Account.DID)
+	require.Equal(t, "missing.test", snap.Account.Query)
+	require.Equal(t, "handle", snap.Account.QueryKind)
 }
 
 func TestCollect_LiveCursors(t *testing.T) {

@@ -22,6 +22,7 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/identity"
 )
 
 // keyspacePrefixes lists the pebble prefixes the status page exposes
@@ -154,16 +155,25 @@ func normalizeRequest(req Request) Request {
 	default:
 		req.Tab = "summary"
 	}
+	req.Account = strings.TrimSpace(req.Account)
 	req.DID = strings.TrimSpace(req.DID)
 	req.Handle = strings.TrimSpace(req.Handle)
 	if req.Tab != "accounts" {
+		req.Account = ""
 		req.DID = ""
 		req.Handle = ""
 		return req
 	}
-	if req.DID != "" {
-		req.Handle = ""
+	if req.Account == "" {
+		switch {
+		case req.DID != "":
+			req.Account = req.DID
+		case req.Handle != "":
+			req.Account = req.Handle
+		}
 	}
+	req.DID = ""
+	req.Handle = ""
 	return req
 }
 
@@ -231,23 +241,27 @@ func hostRowFromBackfill(hs *backfill.HostStatus) HostRow {
 	return row
 }
 
-func collectAccount(s *store.Store, req Request) AccountLookup {
+func collectAccount(ctx context.Context, s *store.Store, resolver identity.Resolver, req Request) AccountLookup {
 	acct := AccountLookup{}
 	var did atmos.DID
 	var ok bool
 	var err error
 
-	switch {
-	case req.DID != "":
+	account := strings.TrimSpace(req.Account)
+	if account == "" {
+		return acct
+	}
+
+	if strings.HasPrefix(strings.ToLower(account), "did:") {
 		acct.QueryKind = "did"
-		acct.Query = req.DID
-		did, err = atmos.ParseDID(req.DID)
+		acct.Query = account
+		did, err = atmos.ParseDID(account)
 		if err != nil {
 			acct.Error = fmt.Sprintf("invalid DID: %v", err)
 			return acct
 		}
-	case req.Handle != "":
-		handle := strings.TrimPrefix(req.Handle, "@")
+	} else {
+		handle := strings.TrimPrefix(account, "@")
 		acct.QueryKind = "handle"
 		acct.Query = handle
 		parsed, err := atmos.ParseHandle(handle)
@@ -257,16 +271,22 @@ func collectAccount(s *store.Store, req Request) AccountLookup {
 		}
 		handle = string(parsed.Normalize())
 		acct.Query = handle
-		did, ok, err = backfill.LookupDIDByHandle(s, handle)
-		if err != nil {
-			acct.Error = err.Error()
-			return acct
+		if resolver != nil {
+			did, err = resolver.ResolveHandle(ctx, parsed.Normalize())
+			if err != nil {
+				acct.Error = fmt.Sprintf("resolve handle %q: %v", handle, err)
+				return acct
+			}
+		} else {
+			did, ok, err = backfill.LookupDIDByHandle(s, handle)
+			if err != nil {
+				acct.Error = err.Error()
+				return acct
+			}
+			if !ok {
+				return acct
+			}
 		}
-		if !ok {
-			return acct
-		}
-	default:
-		return acct
 	}
 
 	rs, found, err := backfill.LoadRepoStatus(s, did)
@@ -639,7 +659,7 @@ func buildForRequest(ctx context.Context, opts Options, startedAt time.Time, req
 		}
 		snap.Hosts = hosts
 	case "accounts":
-		snap.Account = collectAccount(opts.Store, req)
+		snap.Account = collectAccount(ctx, opts.Store, opts.IdentityResolver, req)
 	}
 
 	return snap, nil
