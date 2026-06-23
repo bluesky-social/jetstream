@@ -187,11 +187,13 @@ func (s *Store) updateRepoStatusAndCounts(
 	hadRow := rs != nil
 	old := Status("")
 	oldHost := ""
+	oldActive := false
 	if rs == nil {
 		rs = &RepoStatus{}
 	} else {
 		old = rs.Backfill.Status
 		oldHost = rs.Host
+		oldActive = rs.Active
 	}
 	updateHost, err := mutate(rs, hadRow, old)
 	if err != nil {
@@ -225,6 +227,29 @@ func (s *Store) updateRepoStatusAndCounts(
 	}
 	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
 		return fmt.Errorf("backfill: stage counts: %w", err)
+	}
+	// A steady-state retry can re-attribute a DID to a different host than
+	// its prior terminal transition recorded (the relay can 302 to a
+	// different PDS on a later attempt). When that happens we must decrement
+	// the stale bucket — otherwise the DID is counted under both hosts.
+	// Mirrors the host-move handling in recordIdentityResolution. (The
+	// bootstrap path never moves a host post-terminal, so this is a no-op
+	// there.)
+	if oldHost != "" && oldHost != rs.Host {
+		oldHS, _, err := loadHostStatus(s.db, oldHost)
+		if err != nil {
+			return err
+		}
+		if oldHS.Total > 0 {
+			oldHS.Total--
+		}
+		if oldActive && oldHS.Active > 0 {
+			oldHS.Active--
+		}
+		decrementStatus(oldHS, old)
+		if err := stageHostStatus(batch, oldHS); err != nil {
+			return err
+		}
 	}
 	if rs.Host != "" {
 		hs, _, err := loadHostStatus(s.db, rs.Host)

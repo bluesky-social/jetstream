@@ -32,6 +32,7 @@ public worklog matches the code we are actually building.
 - On successful retry:
   - Append a synthetic `KindSync` DID tombstone row for the repo, then append downloaded records as `KindCreateResync`.
   - Clear retry metadata, set `Backfill.Status = complete`, update `Backfill.Rev`, top-level `Rev`, timestamps, counts, and host diagnostics through the existing store transition machinery.
+  - Durability ordering is append → fsync segment block (`DrainDurability`) → commit the `complete` status batch, in that order. A crash before the status commit leaves the repo `failed`, so a later retry re-prepends a fresh `KindSync` tombstone that supersedes the orphaned replacement rows — the resync is idempotent across retries. A status commit never lands ahead of durable replacement data.
   - Let the steady-state writer's normal `OnAppend` tombstone hook and compaction path handle suppression of older rows.
 - Wire the retry runner into `runSteadyState` after the live consumer opens, using the same `data/segments` writer as live ingest. Add it to the steady-state errgroup as best-effort for remote failures: local infrastructure/write errors return and stop the daemon; remote repo failures are recorded and retried later.
 

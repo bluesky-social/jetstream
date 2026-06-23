@@ -353,6 +353,15 @@ func (r *retryRunner) nextAttemptAt(err error, retryCount int) time.Time {
 	now := r.cfg.now().UTC()
 	if xrpc.IsRateLimited(err) {
 		if ra := xrpc.RetryAfter(err); !ra.IsZero() && ra.After(now) {
+			// Clamp a server-directed reset to MaxDelay. parkHost suppresses
+			// every repo on this host until this instant, so a buggy or
+			// hostile upstream sending a far-future RateLimit-Reset must not
+			// be able to park a host past the configured ceiling. Mirrors the
+			// bootstrap path's clamp in selectedRateLimitDelay.
+			max := now.Add(r.cfg.MaxDelay)
+			if ra.After(max) {
+				return max
+			}
 			return ra.UTC()
 		}
 	}

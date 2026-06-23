@@ -582,6 +582,70 @@ func TestStore_OnComplete_ClearsRetryMetadata(t *testing.T) {
 	require.Empty(t, rs.Backfill.LastError)
 }
 
+// TestStore_RetryHostMove_AdjustsAggregates locks in the fix for the
+// per-host double-count: a repo that failed on host A and is then
+// re-attributed to host B by a later retry (the relay 302'd to a
+// different PDS) must decrement A's aggregates, not leave the DID
+// counted under both hosts.
+func TestStore_RetryHostMove_AdjustsAggregates(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:retryhostmove")
+	next := time.Date(2026, 6, 23, 16, 0, 0, 0, time.UTC)
+
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	// Initial failure attributes the DID to host A.
+	require.NoError(t, s.OnFail(ctx, did, "pds-a.example.com", errors.New("xrpc: HTTP 503: unavailable"), 1))
+
+	hsA, ok, err := loadHostStatus(s.db, "pds-a.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), hsA.Total)
+	require.Equal(t, uint64(1), hsA.Failed)
+
+	// A retry fails again, but the relay redirected to host B this time.
+	require.NoError(t, s.RecordRetryFailure(ctx, did, "pds-b.example.com", errors.New("xrpc: HTTP 503: still unavailable"), next))
+
+	// Host A must have been decremented; the DID is no longer counted there.
+	hsA, ok, err = loadHostStatus(s.db, "pds-a.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(0), hsA.Total, "stale host bucket must be decremented on host move")
+	require.Equal(t, uint64(0), hsA.Active)
+	require.Equal(t, uint64(0), hsA.Failed)
+
+	// Host B now owns the DID's failed aggregate.
+	hsB, ok, err := loadHostStatus(s.db, "pds-b.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), hsB.Total)
+	require.Equal(t, uint64(1), hsB.Active)
+	require.Equal(t, uint64(1), hsB.Failed)
+
+	// Now a successful retry on host C moves it complete.
+	require.NoError(t, s.OnComplete(ctx, did, "pds-c.example.com", &repo.Commit{DID: string(did), Rev: "rev-ok"}))
+
+	hsB, ok, err = loadHostStatus(s.db, "pds-b.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(0), hsB.Total, "host B decremented when retry succeeds on host C")
+	require.Equal(t, uint64(0), hsB.Failed)
+
+	hsC, ok, err := loadHostStatus(s.db, "pds-c.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), hsC.Total)
+	require.Equal(t, uint64(1), hsC.Complete)
+	require.Equal(t, uint64(0), hsC.Failed)
+
+	// Global counts stay correct: exactly one repo, now complete.
+	counts, ok, err := LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, Counts{Total: 1, Complete: 1}, counts)
+}
+
 func TestStore_MaintainsCounts(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)

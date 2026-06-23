@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/atmos/xrpc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -212,6 +213,35 @@ func TestRetryRunner_RateLimitParksHost(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, reset, rs.Backfill.NextAttemptAt)
 	require.Equal(t, 1, rs.Backfill.RetryCount, "a parked skip is not a failed attempt")
+}
+
+func TestRetryRunner_NextAttemptAtClampsRetryAfter(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	maxDelay := 7 * 24 * time.Hour
+	r := &retryRunner{cfg: RetryConfig{
+		Interval: 4 * time.Hour,
+		MaxDelay: maxDelay,
+		now:      func() time.Time { return now },
+	}}
+
+	// A hostile/buggy upstream reports a reset 1000 days out. parkHost
+	// would otherwise suppress the whole host until then; the schedule
+	// must be clamped to MaxDelay.
+	farReset := now.Add(1000 * 24 * time.Hour)
+	rlErr := &xrpc.Error{
+		StatusCode: http.StatusTooManyRequests,
+		Name:       "RateLimitExceeded",
+		RateLimit:  &xrpc.RateLimit{Reset: farReset},
+	}
+	got := r.nextAttemptAt(rlErr, 0)
+	require.Equal(t, now.Add(maxDelay).UTC(), got, "far-future Retry-After must clamp to MaxDelay")
+
+	// A near reset within MaxDelay is honored verbatim.
+	nearReset := now.Add(2 * time.Hour)
+	rlErr.RateLimit.Reset = nearReset
+	got = r.nextAttemptAt(rlErr, 0)
+	require.Equal(t, nearReset.UTC(), got, "Retry-After within MaxDelay is honored")
 }
 
 func mustURLHost(t *testing.T, raw string) string {
