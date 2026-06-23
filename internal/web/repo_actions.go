@@ -5,11 +5,12 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/repoexport"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/jcalabro/atmos/identity"
 )
 
 type repoExportActions struct {
-	dataDir  string
-	relayURL string
+	dataDir          string
+	identityResolver identity.Resolver
 	// selector prunes which segments/blocks reconstruction decodes, backed
 	// by the in-memory manifest. Required for verification to run.
 	selector repoexport.Selector
@@ -26,12 +27,12 @@ type repoExportActions struct {
 // be nil; when set it supplies the live writer's in-memory pending events so
 // verification does not spuriously report a root mismatch for a just-written
 // record.
-func NewRepoActions(dataDir, relayURL string, selector repoexport.Selector, pendingEvents func(did string) []segment.Event) RepoActions {
+func NewRepoActions(dataDir string, identityResolver identity.Resolver, selector repoexport.Selector, pendingEvents func(did string) []segment.Event) RepoActions {
 	return repoExportActions{
-		dataDir:       dataDir,
-		relayURL:      relayURL,
-		selector:      selector,
-		pendingEvents: pendingEvents,
+		dataDir:          dataDir,
+		identityResolver: identityResolver,
+		selector:         selector,
+		pendingEvents:    pendingEvents,
 	}
 }
 
@@ -45,10 +46,10 @@ func (a repoExportActions) gatherPending(did string) []segment.Event {
 
 func (a repoExportActions) VerifyRepo(ctx context.Context, did string) (repoexport.VerifyReport, error) {
 	return repoexport.Verify(ctx, repoexport.VerifyConfig{
-		DataDir:       a.dataDir,
-		DID:           did,
-		RelayURL:      a.relayURL,
-		Selector:      a.selector,
-		PendingEvents: a.gatherPending(did),
+		DataDir:          a.dataDir,
+		DID:              did,
+		IdentityResolver: a.identityResolver,
+		Selector:         a.selector,
+		PendingEvents:    a.gatherPending(did),
 	})
 }
