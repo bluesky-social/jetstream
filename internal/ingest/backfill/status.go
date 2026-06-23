@@ -40,12 +40,14 @@ const (
 
 // RepoBackfillStatus tracks initial-backfill state per DESIGN.md §3.5.
 type RepoBackfillStatus struct {
-	Status      Status    `json:"status"`
-	Rev         string    `json:"rev,omitempty"`
-	Attempts    int       `json:"attempts,omitempty"`
-	LastError   string    `json:"last_error,omitempty"`
-	StartedAt   time.Time `json:"started_at,omitzero"`
-	CompletedAt time.Time `json:"completed_at,omitzero"`
+	Status        Status    `json:"status"`
+	Rev           string    `json:"rev,omitempty"`
+	Attempts      int       `json:"attempts,omitempty"`
+	RetryCount    int       `json:"retry_count,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+	NextAttemptAt time.Time `json:"next_attempt_at,omitzero"`
+	StartedAt     time.Time `json:"started_at,omitzero"`
+	CompletedAt   time.Time `json:"completed_at,omitzero"`
 }
 
 // RepoStatus is the JSON value stored at repo/<did>. The shape matches

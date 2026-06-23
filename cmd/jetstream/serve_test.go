@@ -75,6 +75,10 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 4, opts.BackfillAsyncFlushWorkers)
 	require.Empty(t, opts.BackfillRepos)
 	require.False(t, opts.SkipMergeDiscovery)
+	require.Equal(t, backfill.DefaultFailedRepoRetryInterval, opts.FailedRepoRetryInterval)
+	require.Equal(t, backfill.DefaultFailedRepoRetryWorkers, opts.FailedRepoRetryWorkers)
+	require.Equal(t, backfill.DefaultFailedRepoRetryHostWorkers, opts.FailedRepoRetryHostWorkers)
+	require.Equal(t, backfill.DefaultFailedRepoRetryMaxDelay, opts.FailedRepoRetryMaxDelay)
 	require.False(t, opts.DisableRepoActionRateLimits)
 	require.Equal(t, 36*time.Hour, opts.CursorLookback)
 	require.Equal(t, 0*time.Second, opts.SegmentCacheMaxAge)
@@ -118,6 +122,10 @@ func withClearedEnv(t *testing.T) {
 		"JETSTREAM_BACKFILL_ASYNC_FLUSH_WORKERS",
 		"JETSTREAM_BACKFILL_REPOS",
 		"JETSTREAM_SKIP_MERGE_DISCOVERY",
+		"JETSTREAM_FAILED_REPO_RETRY_INTERVAL",
+		"JETSTREAM_FAILED_REPO_RETRY_WORKERS",
+		"JETSTREAM_FAILED_REPO_RETRY_HOST_WORKERS",
+		"JETSTREAM_FAILED_REPO_RETRY_MAX_DELAY",
 		"JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS",
 		"JETSTREAM_CURSOR_LOOKBACK",
 		"JETSTREAM_SEGMENT_CACHE_MAX_AGE",
@@ -177,6 +185,10 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--backfill-async-flush-workers=4",
 		"--backfill-repos=did:plc:aaa, did:plc:bbb",
 		"--skip-merge-discovery",
+		"--failed-repo-retry-interval=2h",
+		"--failed-repo-retry-workers=9",
+		"--failed-repo-retry-host-workers=3",
+		"--failed-repo-retry-max-delay=48h",
 		"--disable-repo-action-rate-limits",
 		"--cursor-lookback=7h",
 		"--segment-cache-max-age=13s",
@@ -209,6 +221,10 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 4, opts.BackfillAsyncFlushWorkers)
 	require.Equal(t, []atmos.DID{"did:plc:aaa", "did:plc:bbb"}, opts.BackfillRepos)
 	require.True(t, opts.SkipMergeDiscovery)
+	require.Equal(t, 2*time.Hour, opts.FailedRepoRetryInterval)
+	require.Equal(t, 9, opts.FailedRepoRetryWorkers)
+	require.Equal(t, 3, opts.FailedRepoRetryHostWorkers)
+	require.Equal(t, 48*time.Hour, opts.FailedRepoRetryMaxDelay)
 	require.True(t, opts.DisableRepoActionRateLimits)
 	require.Equal(t, 7*time.Hour, opts.CursorLookback)
 	require.Equal(t, 13*time.Second, opts.SegmentCacheMaxAge)
@@ -248,11 +264,19 @@ func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
 	t.Setenv("JETSTREAM_BACKFILL_WORKERS", "33")
 	t.Setenv("JETSTREAM_BACKFILL_BATCH_SIZE", "76543")
 	t.Setenv("JETSTREAM_BACKFILL_ASYNC_FLUSH_WORKERS", "5")
+	t.Setenv("JETSTREAM_FAILED_REPO_RETRY_INTERVAL", "3h")
+	t.Setenv("JETSTREAM_FAILED_REPO_RETRY_WORKERS", "11")
+	t.Setenv("JETSTREAM_FAILED_REPO_RETRY_HOST_WORKERS", "2")
+	t.Setenv("JETSTREAM_FAILED_REPO_RETRY_MAX_DELAY", "72h")
 
 	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
 	require.Equal(t, 33, opts.BackfillWorkers)
 	require.Equal(t, 76543, opts.BackfillBatchSize)
 	require.Equal(t, 5, opts.BackfillAsyncFlushWorkers)
+	require.Equal(t, 3*time.Hour, opts.FailedRepoRetryInterval)
+	require.Equal(t, 11, opts.FailedRepoRetryWorkers)
+	require.Equal(t, 2, opts.FailedRepoRetryHostWorkers)
+	require.Equal(t, 72*time.Hour, opts.FailedRepoRetryMaxDelay)
 }
 
 func TestServeOptionsFromCLI_DisableRepoActionRateLimitsEnv(t *testing.T) {

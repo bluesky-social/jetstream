@@ -425,7 +425,6 @@ The data directory file layout is the following:
 ```
 data/
   meta.pebble/             <- unified metadata store (see Section 3.5)
-  backfill_complete.log    <- append-only log of completed repo backfills (see Section 3.5)
   segments/
     seg_0000000000.jss     <- fixed header + compressed blocks (+ footer once sealed)
   backfill/
@@ -470,39 +469,31 @@ const (
 type RepoStatus struct {
     Backfill    RepoBackfillStatus `json:"backfill"`
     PDS         string             `json:"pds,omitempty"`
+    Host        string             `json:"host,omitempty"`
+    Handle      string             `json:"handle,omitempty"`
     // latest rev, updated on every commit
     Rev         string             `json:"rev,omitempty"`
     UpdatedAt  time.Time           `json:"updated_at,omitempty"`
+    LastAttemptedAt time.Time      `json:"last_attempted_at,omitempty"`
     RecordCount int64              `json:"record_count,omitempty"`
     TotalBytes  int64              `json:"total_bytes,omitempty"`
+    Active      bool               `json:"active"`
 }
 
 type RepoBackfillStatus struct {
-    Status      Status    `json:"status"`
+    Status        Status    `json:"status"`
     // rev at end of initial download
-    Rev         string    `json:"rev,omitempty"`
-    Attempts    int       `json:"attempts,omitempty"`
-    LastError   string    `json:"last_error,omitempty"`
-    StartedAt   time.Time `json:"started_at,omitempty"`
-    CompletedAt time.Time `json:"completed_at,omitempty"`
+    Rev           string    `json:"rev,omitempty"`
+    Attempts      int       `json:"attempts,omitempty"`
+    RetryCount    int       `json:"retry_count,omitempty"`
+    LastError     string    `json:"last_error,omitempty"`
+    NextAttemptAt time.Time `json:"next_attempt_at,omitempty"`
+    StartedAt     time.Time `json:"started_at,omitempty"`
+    CompletedAt   time.Time `json:"completed_at,omitempty"`
 }
 ```
 
 The per-block durability ordering is: append and fsync the block into the active segment first, then commit a single pebble batch with `sync=true` that advances `relay/cursor` and updates `repo/<did>.Rev` and other fields for every DID present in the block. Only after both steps complete do we treat the block as durable. Because the pebble batch always follows the segment fsync, a crash between the two leaves `relay/cursor` pointing at or before the last durable event, so if we do crash, we'll just replay some relatively small number of events.
-
-`backfill_complete.log` is a separate append-only file with a custom format that sits next to pebble. Each entry records that a specific DID's initial backfill finished successfully, along with the backfill rev. It exists because that particular signal is the one piece of leader-only state that a freshly-promoted replica cannot re-derive locally without re-running the entire backfill (the presence of live-tail events for a DID alone does not prove we ever successfully downloaded that repo's full history). Treating completion as a first-class log that replicates alongside segments is cheap (one entry per DID per lifetime) and avoids the silent-data-loss failure mode where a partially-backfilled DID gets treated as complete on failover. Replication of this file is described in Section 6. The log is a simple stream of length-prefixed entries:
-
-```
-backfill_complete.log stream of entries:
-┌──────────────────────────────────────────────────┐
-│ entry_len:        uint32 (LE)                    │
-│ did_len:          uint16                         │
-│ backfill_rev_len: uint8                          │
-│ completed_at:     int64 (LE, unix micros)        │
-│ did:              [did_len]byte                  │
-│ backfill_rev:     [backfill_rev_len]byte         │
-└──────────────────────────────────────────────────┘
-```
 
 Everything else is deliberately kept out of the metadata store. The segment manifest is just a directory scan plus each file's self-describing 256-byte header, so we don't duplicate it. DID-to-PDS caches and handle resolutions come back from the PLC directory when we need them. Per-DID hosting status flows in as `#account` events; we keep the current value in pebble so we can answer quickly, but it's always reconstructible by replaying segments.
 
@@ -522,7 +513,7 @@ On first startup, we kick off two things in parallel:
 2. The backfill engine
     1. Downloads all results from `com.atproto.sync.listRepos` on the relay, writing each DID to `repo/<did>` in the metadata store with `StatusNotStarted`
     2. Downloads each repo via `com.atproto.sync.getRepo` and writes the events directly to the active segment file
-    3. On successful completion, sets `repo/<did>.Status = StatusComplete`, records the `BackfillRev`, and appends an entry to `backfill_complete.log`. The log append is what replicas will consume to learn that the backfill finished; see Section 6.
+    3. On successful completion, sets `repo/<did>.Status = StatusComplete` and records the `BackfillRev` in Pebble.
 
 This phase takes a while. At time of writing with current rate limits on the mushroom PDSes on the new relay, it takes ~16 hours.
 
@@ -556,7 +547,7 @@ The steady-state phase simply consumes from the upstream firehose and writes eve
 
 Every block seal commits a single pebble batch that advances `relay/cursor` and refreshes `repo/<did>.LatestRev` for every DID in the block. We always fsync the segment block first and then commit the pebble batch with `sync=true`, so the persisted cursor can never get ahead of the durable event data. A crash between the two steps is handled by the active-segment recovery path described in Section 3.1, and the upstream resumes from whatever cursor pebble last saw.
 
-If there were any accounts that failed to download during the initial backfill phase (i.e. `repo/<did>.Status == StatusFailed`), we periodically retry downloading them with exponential backoff in the background until they succeed, at which point we append to `backfill_complete.log` exactly as during the bootstrap phase. This is best-effort to minimize missing data in Jetstream in the long term. When we do successfully download a repo that previously failed, we treat it similar to a whole-repo `#sync` event: mark all previous events for that DID as deleted, and recreate from the downloaded CAR file.
+If there were any accounts that failed to download during the initial backfill phase (i.e. `repo/<did>.Status == StatusFailed`), we periodically retry downloading them with exponential backoff in the background until they succeed. Retry eligibility and backoff are stored on `repo/<did>` via `RetryCount` and `NextAttemptAt` so process restarts do not create retry storms. When we do successfully download a repo that previously failed, we treat it similar to a whole-repo `#sync` event: mark all previous events for that DID as deleted, and recreate from the downloaded CAR file.
 
 ### 4.4 Identity, Account, and Sync Events
 
@@ -631,13 +622,12 @@ kind values (extended-only):
   segment_sealed      upstream sealed a segment file
   segment_compacted   upstream rewrote a previously-sealed segment (tombstone compaction
                       or timestamp import)
-  backfill_complete   a DID's initial backfill finished successfully
   heartbeat           keepalive; carries cursor values for liveness detection
 ```
 
-Each control event carries a small payload: `segment_sealed` and `segment_compacted` carry `{name, sha256, min_seq, max_seq}`; `backfill_complete` carries `{did, backfill_rev, completed_at_us}`; `heartbeat` carries `{seq, upstream_relay_cursor}`.
+Each control event carries a small payload: `segment_sealed` and `segment_compacted` carry `{name, sha256, min_seq, max_seq}`; `heartbeat` carries `{seq, upstream_relay_cursor}`.
 
-Extended-mode subscriptions are not authenticated, but they're more expensive to produce (base64-encoded CBOR, heavier per-event payload) so we many more strictly rate limit them compared to the simple firehose on the Bluesky-hosted instance.
+Extended-mode subscriptions are not authenticated, but they're more expensive to produce (base64-encoded CBOR, heavier per-event payload) so we may more strictly rate limit them compared to the simple firehose on the Bluesky-hosted instance.
 
 ## 6. Replication
 
@@ -645,15 +635,15 @@ NOTE (jrc): this section is still pretty early-days and I want to review it myse
 
 We support a simple asynchronous replication protocol for active-passive high availability setups. This allows for the leader instance to handle writes and a relatively small read workload, and there can be some large number of read replicas (or read-replica chains) that can distribute read traffic across many sites.
 
-The guiding principle is that as much as possible, we only replicate source data, not metadata stores. Everything pebble holds on the leader is either derivable from the event stream the replica already consumes (per-DID `LatestRev`, `AccountStatus`), reconstructible on promotion by calling `com.atproto.sync.listRepos` on the relay (the DID list itself), or deliberately leader-only and not needed by a passive replica (retry attempt counters, `LastError` strings, in-flight sync state). The one exception is the signal that a DID's initial backfill finished successfully, which a replica cannot derive from the live event stream alone. That's what `backfill_complete.log` is for.
+The guiding principle is that as much as possible, we only replicate source data, not metadata stores. Everything pebble holds on the leader is either derivable from the event stream the replica already consumes (per-DID `LatestRev`, `AccountStatus`), reconstructible on promotion by calling `com.atproto.sync.listRepos` on the relay (the DID list itself), or deliberately leader-only and not needed by a passive replica (retry attempt counters, `LastError` strings, in-flight sync state). A promoted replica rebuilds any missing per-DID backfill lifecycle rows from the authoritative DID list and its local archive state.
 
 ### 6.1 The Replication Protocol
 
 Replication has two moving parts: bulk transfer of sealed segment files over plain HTTP downloads (the same CDN-friendly downloads that end-user clients use), and a persistent websocket between the replica and its upstream that carries live events and the control signals replicas depend on. That websocket is just an extended-mode subscription to the same streaming endpoint end-user clients use, as described in Section 5.2. There is no separate replication protocol.
 
-Everything a replica needs to stay caught up is already carried on an extended-mode connection: the raw DAG-CBOR of each record (so the replica can write bit-exact payloads into its own segments), the jetstream-local `seq` (so the replica can persist its own upstream cursor), the upstream relay cursor (so a promoted replica can pick up the relay firehose with minimal overlap), and the `segment_sealed`, `segment_compacted`, and `backfill_complete` control events. Because end-user clients with `?extended=true` receive the same frames, replicas aren't a privileged special case at the protocol layer; they're just the most aggressive consumer.
+Everything a replica needs to stay caught up is already carried on an extended-mode connection: the raw DAG-CBOR of each record (so the replica can write bit-exact payloads into its own segments), the jetstream-local `seq` (so the replica can persist its own upstream cursor), the upstream relay cursor (so a promoted replica can pick up the relay firehose with minimal overlap), and the `segment_sealed` and `segment_compacted` control events. Because end-user clients with `?extended=true` receive the same frames, replicas aren't a privileged special case at the protocol layer; they're just the most aggressive consumer.
 
-Idempotency matters for the bootstrap-to-live handoff. Duplicate events are deduplicated by `(did, seq)` at the block boundary; duplicate segment-seal or segment-compacted events redownload the same file and produce the same on-disk state; duplicate `backfill_complete` entries are harmless because the log is read as a set. This lets the bootstrap-time bulk transfers overlap with live control events at the boundary without a strict handoff.
+Idempotency matters for the bootstrap-to-live handoff. Duplicate events are deduplicated by `(did, seq)` at the block boundary; duplicate segment-seal or segment-compacted events redownload the same file and produce the same on-disk state. This lets the bootstrap-time bulk transfers overlap with live control events at the boundary without a strict handoff.
 
 ### 6.2 Bootstrapping a Replica
 
@@ -661,14 +651,13 @@ To bootstrap a new read replica, start the server with the `--upstream=jetstream
 
 1. Open an extended-mode websocket to the upstream with no cursor, and start buffering frames in memory. Doing this first ensures no live events or control signals are lost during the bulk-transfer phase.
 2. Download every sealed segment file the upstream currently lists, verifying each one's sha256 checksum against the value in its fixed header.
-3. Download the current `backfill_complete.log` from the upstream over HTTPS and apply each entry to the replica's `repo/<did>` records in pebble.
-4. Begin processing buffered websocket frames: write events into the active segment, handle `segment_sealed` and `segment_compacted` by downloading and swapping the named file, and apply `backfill_complete` entries to the local log and pebble records.
+3. Begin processing buffered websocket frames: write events into the active segment and handle `segment_sealed` and `segment_compacted` by downloading and swapping the named file.
 
 The replica writes events into its own active segment exactly as a primary would, and seals independently when its active segment fills. Replica sealed segments are not expected to be bitwise-identical to the upstream's, since block boundaries depend on local timing. They're logically equivalent, and each file's self-contained sha256 checksum is what we verify against.
 
 ### 6.3 Promoting a Replica to Leader
 
-To promote a replica to leader, remove the `--upstream` flag and point it at a relay firehose instead. The promoted leader uses the last `upstream_relay_cursor` it observed on the extended stream as its starting point and rewinds slightly to lean on at-least-once delivery across the overlap. It then calls `com.atproto.sync.listRepos` to get the authoritative DID list, diffs it against `repo/<did>` in pebble to find DIDs that are either unknown or missing from `backfill_complete.log`, and queues them for initial backfill or retry. DIDs present in the log are treated as fully backfilled and not re-downloaded. This means a promoted leader has a warmup window measured in minutes (dominated by `listRepos` pagination) before retry work resumes, which we consider acceptable given our non-goal of sub-minute failover.
+To promote a replica to leader, remove the `--upstream` flag and point it at a relay firehose instead. The promoted leader uses the last `upstream_relay_cursor` it observed on the extended stream as its starting point and rewinds slightly to lean on at-least-once delivery across the overlap. It then calls `com.atproto.sync.listRepos` to get the authoritative DID list, diffs it against `repo/<did>` in pebble and the local archive state, and queues unknown or incomplete active DIDs for initial backfill or retry. This means a promoted leader has a warmup window measured in minutes (dominated by `listRepos` pagination) before retry work resumes, which we consider acceptable given our non-goal of sub-minute failover.
 
 We accept a few cosmetic regressions on failover: `Attempts` counters reset to zero, `LastError` strings are lost (operators can consult logs for debugging history), and any accounts that are legitimately empty at the relay may be redundantly re-fetched once. None of these affect correctness.
 

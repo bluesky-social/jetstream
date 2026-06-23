@@ -17,6 +17,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/api/comatproto"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/repo"
@@ -70,15 +71,40 @@ func (h *SegmentHandler) SetCompletionBatcher(b *completionBatcher) {
 // is the wall-clock instant at which jetstream observed this repo.
 // Per-record timestamps would imply a false ordering.
 func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit) error {
+	return h.handleRepo(ctx, did, r, commit, segment.KindCreate, false)
+}
+
+// HandleRepoResync emits a whole-repo replacement stream for a previously
+// failed repo retry: one KindSync DID tombstone followed by KindCreateResync
+// rows for the downloaded repo's current records. It validates every
+// replacement row before appending anything so a malformed CAR cannot leave a
+// durable tombstone without its replacement rows.
+func (h *SegmentHandler) HandleRepoResync(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit) error {
+	return h.handleRepo(ctx, did, r, commit, segment.KindCreateResync, true)
+}
+
+func (h *SegmentHandler) handleRepo(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit, materializedKind segment.Kind, prependSync bool) error {
 	return obs.Span(ctx, func(ctx context.Context) (retErr error) {
 		trace.SpanFromContext(ctx).SetAttributes(attribute.String("did", string(did)))
 		start := time.Now()
 		defer func() { h.metrics.observeHandleRepo(start, retErr) }()
 
-		indexedAt := h.now().UnixMicro()
+		now := h.now().UTC()
+		indexedAt := now.UnixMicro()
 		appended := false
 		lastSeq := uint64(0)
 		batch := make([]segment.Event, 0, segmentHandlerAppendBatchSize)
+
+		if prependSync {
+			ev, err := syncTombstoneEvent(did, commit, indexedAt, now)
+			if err != nil {
+				return err
+			}
+			batch = append(batch, ev)
+			if err := h.validateRepoMaterializations(ctx, did, r, commit, materializedKind, indexedAt); err != nil {
+				return err
+			}
+		}
 
 		flushBatch := func() error {
 			if len(batch) == 0 {
@@ -110,7 +136,7 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 
 			ev := segment.Event{
 				IndexedAt:  indexedAt,
-				Kind:       segment.KindCreate,
+				Kind:       materializedKind,
 				DID:        string(did),
 				Collection: collection,
 				Rkey:       rkey,
@@ -149,6 +175,57 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 		}
 		return nil
 	})
+}
+
+func (h *SegmentHandler) validateRepoMaterializations(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit, materializedKind segment.Kind, indexedAt int64) error {
+	return r.Tree.Walk(func(key string, cid cbor.CID) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		collection, rkey, err := splitMSTKey(key)
+		if err != nil {
+			return fmt.Errorf("backfill: did=%s: %w", did, err)
+		}
+		payload, err := r.Store.GetBlock(cid)
+		if err != nil {
+			return fmt.Errorf("backfill: did=%s get block %s/%s: %w: %w", did, collection, rkey, io.ErrUnexpectedEOF, err)
+		}
+		ev := segment.Event{
+			IndexedAt:  indexedAt,
+			Kind:       materializedKind,
+			DID:        string(did),
+			Collection: collection,
+			Rkey:       rkey,
+			Rev:        commit.Rev,
+			Payload:    payload,
+		}
+		if err := segment.ValidateEvent(ev); err != nil && !errors.Is(err, segment.ErrFieldTooLong) {
+			return fmt.Errorf("backfill: did=%s invalid segment event %s/%s: %w", did, collection, rkey, err)
+		}
+		return nil
+	})
+}
+
+func syncTombstoneEvent(did atmos.DID, commit *repo.Commit, indexedAt int64, now time.Time) (segment.Event, error) {
+	payload, err := (&comatproto.SyncSubscribeRepos_Sync{
+		DID:  string(did),
+		Rev:  commit.Rev,
+		Time: now.Format(time.RFC3339Nano),
+	}).MarshalCBOR()
+	if err != nil {
+		return segment.Event{}, fmt.Errorf("backfill: did=%s marshal synthetic sync: %w", did, err)
+	}
+	ev := segment.Event{
+		IndexedAt: indexedAt,
+		Kind:      segment.KindSync,
+		DID:       string(did),
+		Rev:       commit.Rev,
+		Payload:   payload,
+	}
+	if err := segment.ValidateEvent(ev); err != nil {
+		return segment.Event{}, fmt.Errorf("backfill: did=%s invalid synthetic sync: %w", did, err)
+	}
+	return ev, nil
 }
 
 func (h *SegmentHandler) abortOnWriterError(err error) {

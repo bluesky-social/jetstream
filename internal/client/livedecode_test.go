@@ -77,7 +77,7 @@ func TestDecodeLiveFrameAccountIdentitySync(t *testing.T) {
 
 func TestDecodeLiveFrameUnknownKindSkips(t *testing.T) {
 	t.Parallel()
-	for _, kind := range []string{"heartbeat", "segment_sealed", "segment_compacted", "backfill_complete", "future_thing"} {
+	for _, kind := range []string{"heartbeat", "segment_sealed", "segment_compacted", "future_thing"} {
 		_, err := decodeLiveFrame([]byte(`{"kind":"` + kind + `","seq":1}`))
 		require.ErrorIs(t, err, errSkipFrame, "kind %q must be skipped, not errored", kind)
 	}

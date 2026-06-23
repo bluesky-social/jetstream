@@ -29,6 +29,12 @@ type Metrics struct {
 	CompletionStageErrors    prometheus.Counter
 	CompletionQueueWait      prometheus.Histogram
 	ForcedCheckpointFlushes  prometheus.Counter
+	RetryPasses              prometheus.Counter
+	RetryCandidates          prometheus.Counter
+	RetryAttempts            prometheus.Counter
+	RetrySucceeded           prometheus.Counter
+	RetryFailed              prometheus.Counter
+	RetrySkippedHostParked   prometheus.Counter
 }
 
 // NewMetrics registers the backfill counters against reg. Pass the
@@ -118,6 +124,36 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "forced_checkpoint_flushes_total",
 			Help: "Number of forced writer durability drains at a batch/checkpoint barrier (DrainDurability), as opposed to completions that drained naturally on a block boundary.",
 		}),
+		RetryPasses: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "failed_repo_retry_passes_total",
+			Help: "Number of steady-state failed-repo retry scans started.",
+		}),
+		RetryCandidates: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "failed_repo_retry_candidates_total",
+			Help: "Number of failed repo rows found eligible for steady-state retry.",
+		}),
+		RetryAttempts: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "failed_repo_retry_attempts_total",
+			Help: "Number of getRepo retry attempts issued by the steady-state failed-repo retry loop.",
+		}),
+		RetrySucceeded: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "failed_repo_retry_succeeded_total",
+			Help: "Number of steady-state failed-repo retries that completed and marked the repo backfill complete.",
+		}),
+		RetryFailed: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "failed_repo_retry_failed_total",
+			Help: "Number of steady-state failed-repo retry attempts that failed remotely and were rescheduled.",
+		}),
+		RetrySkippedHostParked: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "failed_repo_retry_skipped_host_parked_total",
+			Help: "Number of eligible failed repo retries skipped because their host was parked by a rate-limit response.",
+		}),
 	}
 	reg.MustRegister(
 		m.Discovered, m.Completed, m.Failed, m.ActiveFlips, m.OnFailErrors,
@@ -125,6 +161,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.CompletionQueued, m.CompletionQueueDepth, m.CompletionDurableBatches,
 		m.CompletionDurableRepos, m.CompletionStageErrors,
 		m.CompletionQueueWait, m.ForcedCheckpointFlushes,
+		m.RetryPasses, m.RetryCandidates, m.RetryAttempts,
+		m.RetrySucceeded, m.RetryFailed, m.RetrySkippedHostParked,
 	)
 	return m
 }
@@ -222,5 +260,41 @@ func (m *Metrics) observeCompletionQueueWait(since time.Duration) {
 func (m *Metrics) incForcedCheckpointFlushes() {
 	if m != nil {
 		m.ForcedCheckpointFlushes.Inc()
+	}
+}
+
+func (m *Metrics) incRetryPasses() {
+	if m != nil {
+		m.RetryPasses.Inc()
+	}
+}
+
+func (m *Metrics) incRetryCandidates() {
+	if m != nil {
+		m.RetryCandidates.Inc()
+	}
+}
+
+func (m *Metrics) incRetryAttempts() {
+	if m != nil {
+		m.RetryAttempts.Inc()
+	}
+}
+
+func (m *Metrics) incRetrySucceeded() {
+	if m != nil {
+		m.RetrySucceeded.Inc()
+	}
+}
+
+func (m *Metrics) incRetryFailed() {
+	if m != nil {
+		m.RetryFailed.Inc()
+	}
+}
+
+func (m *Metrics) incRetrySkippedHostParked() {
+	if m != nil {
+		m.RetrySkippedHostParked.Inc()
 	}
 }
