@@ -42,7 +42,6 @@ type Writer struct {
 	closed         bool
 
 	async            *asyncFlushPipeline
-	asyncPrepared    int
 	asyncJobs        sync.WaitGroup
 	nextAsyncFlushID uint64
 }
@@ -261,7 +260,10 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 		if err != nil {
 			return err
 		}
-		return w.waitSubmittedAsyncFlushes([]*asyncFlushJob{job})
+		if err := w.waitSubmittedAsyncFlushes([]*asyncFlushJob{job}); err != nil {
+			return err
+		}
+		return w.rotateIfFull(ctx)
 	}
 
 	w.drainMu.Lock()
@@ -306,7 +308,10 @@ func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error 
 	if appendErr != nil {
 		return appendErr
 	}
-	return flushErr
+	if flushErr != nil {
+		return flushErr
+	}
+	return w.rotateIfFull(ctx)
 }
 
 func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlushJob, error) {
@@ -353,6 +358,12 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 // its cursor commit (DESIGN.md §3.1.1 / merge spec §5.2). Steady-
 // state callers do not need to call this — the per-block-fill path
 // inside Append handles ordinary flush + rotation.
+//
+// Flush deliberately does not rotate: size-based rotation is the
+// concern of Append/AppendBatch (sync: flushAndRotateLocked; async:
+// rotateIfFull). A segment pushed over MaxSegmentBytes by an explicit
+// Flush alone stays active until the next append, which then rotates
+// it — bounded overshoot, since appends dominate in every caller.
 //
 // A no-op when nothing is buffered.
 func (w *Writer) Flush(ctx context.Context) error {
