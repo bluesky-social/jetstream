@@ -437,6 +437,86 @@ func TestEngineLiveOnly(t *testing.T) {
 	require.Equal(t, []uint64{1, 2}, uniqueSeqs(events))
 }
 
+// TestEngineLiveOnlyAppliesCollectionFilter is a regression guard: in the
+// pure live-only path (no backfill bound) the client must apply the caller's
+// collection filter, exactly as the backfill+cutover path does. The server
+// streams ALL collections to /subscribe-v2 (the client does not forward
+// wantedCollections on the wire), so the engine itself must drop events whose
+// collection the caller did not ask for. Before the fix, runLiveOnly forwarded
+// every event straight to the batcher, so a --collection=app.bsky.feed.post
+// tail leaked likes, reposts, and unrelated lexicons.
+func TestEngineLiveOnlyAppliesCollectionFilter(t *testing.T) {
+	t.Parallel()
+	// Mixed live stream: only the two posts must survive the filter.
+	conn := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "app.bsky.feed.post", "r1", true)},
+		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "app.bsky.feed.like", "r2", true)},
+		{data: liveCommitFrame(t, 3, "did:plc:a", "create", "app.bsky.feed.repost", "r3", true)},
+		{data: liveCommitFrame(t, 4, "did:plc:a", "create", "place.stream.livestream", "r4", true)},
+		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
+	}}
+	dial, _ := scriptedDialer(conn)
+	cfg := Config{
+		Host:           "https://h",
+		Request:        PlanRequest{Collections: []string{"app.bsky.feed.post"}},
+		Backfill:       false,
+		BatchSize:      1,
+		MaxBatchDelay:  time.Millisecond,
+		LiveBackoffMin: time.Millisecond,
+		Dial:           dial,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func(batch []Event) bool {
+				mu.Lock()
+				events = append(events, batch...)
+				// Two posts (seq 1 and 5) are expected; stop once seq 5 lands.
+				done := false
+				for _, ev := range events {
+					if ev.Seq == 5 {
+						done = true
+					}
+				}
+				mu.Unlock()
+				if done {
+					cancel()
+					return false
+				}
+				return true
+			},
+			func(error) bool { return true },
+		)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("live-only filtered engine did not deliver within 5s")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, ev := range events {
+		require.Equal(t, KindCommit, ev.Kind)
+		require.Equal(t, "app.bsky.feed.post", ev.Commit.Collection,
+			"live-only path must drop non-matching collections; leaked seq=%d collection=%s",
+			ev.Seq, ev.Commit.Collection)
+	}
+	require.Equal(t, []uint64{1, 5}, uniqueSeqs(events),
+		"only the app.bsky.feed.post events (seq 1 and 5) must be delivered")
+}
+
 // TestEngineLiveOnlyBreakOnQuietTail is a regression guard: a consumer that
 // breaks the iterator after one event, on a tail that then goes quiet (no more
 // frames), must let Run return promptly. The stop is propagated by the batch

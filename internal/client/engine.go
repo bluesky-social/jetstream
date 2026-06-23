@@ -158,9 +158,19 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	// is serialized against the flusher goroutine, and an error the consumer
 	// rejects stops batching (and fires onStop -> stopLive) instead of being
 	// emitted concurrently and then ignored.
+	//
+	// Apply the caller's exact DID/collection filter here: the server streams
+	// ALL collections to /subscribe-v2 (the client does not forward
+	// wantedCollections on the wire), so the engine must drop non-matching
+	// events itself. The backfill+cutover path filters via liveSink.wantLive;
+	// the pure live-only path has no sink, so it filters inline. A nil/empty
+	// matcher matches everything, so an unfiltered tail is unaffected.
 	_ = consumer.Run(liveCtx, func(ev *Event, _ []byte, err error) bool {
 		if err != nil {
 			return b.emitError(err)
+		}
+		if !e.wantsLive(ev) {
+			return true
 		}
 		return b.add(*ev)
 	})
@@ -168,6 +178,19 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	if !b.stopped() {
 		b.flush()
 	}
+}
+
+// wantsLive reports whether a live-only event passes the caller's exact
+// DID/collection filter. The live-only path runs no backfill and seeds no
+// suppressor (there are no historical rows to suppress against), so unlike the
+// cutover's liveSink.wantLive it applies only the matcher. A nil matcher
+// matches everything.
+func (e *Engine) wantsLive(ev *Event) bool {
+	if e.matcher == nil {
+		return true
+	}
+	se := segmentViewOf(ev)
+	return e.matcher.Wants(&se)
 }
 
 // startFlusher runs a background ticker that flushes the batcher's partial tail
