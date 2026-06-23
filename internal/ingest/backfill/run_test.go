@@ -22,6 +22,7 @@ import (
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/crypto"
+	atmosidentity "github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/mst"
 	atmosrepo "github.com/jcalabro/atmos/repo"
 	"github.com/stretchr/testify/require"
@@ -95,6 +96,20 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 			},
 			errPart: "Config.Logger",
 		},
+		{
+			name: "missing IdentityResolver for selected repos",
+			build: func(t *testing.T) Config {
+				return Config{
+					Store:         &store.Store{},
+					Writer:        newWriter(t),
+					HTTPClient:    httpClient,
+					RelayURL:      "x",
+					Logger:        logger,
+					BackfillRepos: []atmos.DID{"did:plc:selected"},
+				}
+			},
+			errPart: "Config.IdentityResolver",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -110,6 +125,57 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 type repoFixture struct {
 	did atmos.DID
 	car []byte
+}
+
+type stubIdentityResolver struct {
+	docs map[atmos.DID]*atmosidentity.DIDDocument
+	err  error
+}
+
+func (r *stubIdentityResolver) ResolveDID(_ context.Context, did atmos.DID) (*atmosidentity.DIDDocument, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	doc, ok := r.docs[did]
+	if !ok {
+		return nil, errors.New("identity: DID not found")
+	}
+	return doc, nil
+}
+
+func (r *stubIdentityResolver) ResolveHandle(_ context.Context, _ atmos.Handle) (atmos.DID, error) {
+	return "", errors.New("stubIdentityResolver: ResolveHandle not implemented")
+}
+
+func didDocumentForTest(did atmos.DID, handle string, pds string) *atmosidentity.DIDDocument {
+	return &atmosidentity.DIDDocument{
+		ID:          string(did),
+		AlsoKnownAs: []string{"at://" + handle},
+		VerificationMethod: []atmosidentity.VerificationMethod{{
+			ID:                 string(did) + "#atproto",
+			Type:               "Multikey",
+			Controller:         string(did),
+			PublicKeyMultibase: "zQ3shQo7n7VdGV9XEvjyXEFy3sCvi5R8VC2sXkqMfV3oRUDoY",
+		}},
+		Service: []atmosidentity.Service{{
+			ID:              "#atproto_pds",
+			Type:            "AtprotoPersonalDataServer",
+			ServiceEndpoint: pds,
+		}},
+	}
+}
+
+func selectedResolverForFixtures(fixtures map[atmos.DID]repoFixture, pds string) *stubIdentityResolver {
+	dids := make([]atmos.DID, 0, len(fixtures))
+	for did := range fixtures {
+		dids = append(dids, did)
+	}
+	slices.Sort(dids)
+	docs := make(map[atmos.DID]*atmosidentity.DIDDocument, len(dids))
+	for i, did := range dids {
+		docs[did] = didDocumentForTest(did, "selected-"+string(rune('a'+i))+".test", pds)
+	}
+	return &stubIdentityResolver{docs: docs}
 }
 
 // buildRepoFixture constructs a single-record repo for did, signs it
@@ -348,7 +414,7 @@ func (s *stubServer) eventIndex(event string, n int) int {
 // the integration entry point for our run_test.go.
 func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.Store) error {
 	t.Helper()
-	return runWithStubResolverAndRepos(t, ctx, srv, db, nil)
+	return runWithStubResolverAndRepos(t, ctx, srv, db, nil, nil)
 }
 
 func runWithStubRepos(
@@ -359,7 +425,7 @@ func runWithStubRepos(
 	repos []atmos.DID,
 ) error {
 	t.Helper()
-	return runWithStubResolverAndRepos(t, ctx, srv, db, repos)
+	return runWithStubResolverAndRepos(t, ctx, srv, db, repos, selectedResolverForFixtures(srv.fixtures, srv.srv.URL))
 }
 
 func runWithStubResolverAndRepos(
@@ -368,6 +434,7 @@ func runWithStubResolverAndRepos(
 	srv *stubServer,
 	db *store.Store,
 	repos []atmos.DID,
+	resolver atmosidentity.Resolver,
 ) error {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -383,12 +450,13 @@ func runWithStubResolverAndRepos(
 	t.Cleanup(func() { _ = w.Close() })
 
 	cfg := Config{
-		Store:         db,
-		HTTPClient:    &http.Client{Timeout: 5 * time.Second},
-		Writer:        w,
-		RelayURL:      srv.srv.URL,
-		Logger:        logger,
-		BackfillRepos: repos,
+		Store:            db,
+		HTTPClient:       &http.Client{Timeout: 5 * time.Second},
+		Writer:           w,
+		RelayURL:         srv.srv.URL,
+		Logger:           logger,
+		BackfillRepos:    repos,
+		IdentityResolver: resolver,
 	}
 	return Run(ctx, cfg)
 }
@@ -651,6 +719,71 @@ func TestRun_BackfillReposDownloadsSelectedDIDsWithoutListRepos(t *testing.T) {
 	require.Empty(t, cursor, "selected backfill must clear stale merge discovery state")
 }
 
+func TestRun_BackfillReposIndexesDeclaredHandle(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:selectedhandle")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+	resolver := &stubIdentityResolver{docs: map[atmos.DID]*atmosidentity.DIDDocument{
+		did: didDocumentForTest(did, "Alice.Example.COM", "https://pds.example.com"),
+	}}
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	require.NoError(t, runWithStubResolverAndRepos(t, t.Context(), srv, db, []atmos.DID{did}, resolver))
+
+	got, ok, err := lookupDIDByHandle(db, "alice.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, did, got)
+
+	rs, ok, err := LoadRepoStatus(db, did)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "alice.example.com", rs.Handle)
+	require.Equal(t, "https://pds.example.com", rs.PDS)
+}
+
+func TestRun_BackfillReposRepairsCompletedDeclaredHandleMetadata(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:selectedrepair")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+	resolver := &stubIdentityResolver{docs: map[atmos.DID]*atmosidentity.DIDDocument{
+		did: didDocumentForTest(did, "repair.test", "https://repair-pds.example.com"),
+	}}
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	bf := NewStore(db, nil)
+	require.NoError(t, bf.putRepoStatus(did, &RepoStatus{
+		Backfill: RepoBackfillStatus{Status: StatusComplete, Rev: "rev-complete"},
+		Active:   true,
+		Host:     "old-pds.example.com",
+	}))
+
+	require.NoError(t, runWithStubResolverAndRepos(t, t.Context(), srv, db, []atmos.DID{did}, resolver))
+	require.Equal(t, int64(0), srv.getRepoHit.Load(), "complete selected DID must not be redownloaded while repairing metadata")
+
+	got, ok, err := lookupDIDByHandle(db, "repair.test")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, did, got)
+
+	rs, ok, err := LoadRepoStatus(db, did)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "repair.test", rs.Handle)
+	require.Equal(t, "https://repair-pds.example.com", rs.PDS)
+	require.Equal(t, "rev-complete", rs.Backfill.Rev)
+}
+
 func TestRun_BackfillReposRetriesTransientGetRepoFailure(t *testing.T) {
 	t.Parallel()
 
@@ -676,14 +809,15 @@ func TestRun_BackfillReposRetriesTransientGetRepoFailure(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close() })
 
 	require.NoError(t, Run(t.Context(), Config{
-		Store:          db,
-		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
-		Writer:         w,
-		RelayURL:       srv.srv.URL,
-		Logger:         logger,
-		BackfillRepos:  []atmos.DID{did},
-		RetryBaseDelay: time.Millisecond,
-		RetryMaxDelay:  10 * time.Millisecond,
+		Store:            db,
+		HTTPClient:       &http.Client{Timeout: 5 * time.Second},
+		Writer:           w,
+		RelayURL:         srv.srv.URL,
+		Logger:           logger,
+		BackfillRepos:    []atmos.DID{did},
+		IdentityResolver: selectedResolverForFixtures(fixtures, srv.srv.URL),
+		RetryBaseDelay:   time.Millisecond,
+		RetryMaxDelay:    10 * time.Millisecond,
 	}))
 
 	got, err := NewStore(db, nil).Lookup(t.Context(), did)

@@ -21,6 +21,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
+	atmosidentity "github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
@@ -87,6 +88,12 @@ type Config struct {
 	// The normal Store, Handler, retry, verification, and completion
 	// paths are still used; only discovery is replaced.
 	BackfillRepos []atmos.DID
+
+	// IdentityResolver resolves selected BackfillRepos DIDs so status
+	// diagnostics can persist declared handle and PDS metadata without
+	// walking listRepos. Required when BackfillRepos is non-empty; normal
+	// whole-network backfill does not use it.
+	IdentityResolver atmosidentity.Resolver
 
 	// MaxRetries, RetryBaseDelay, and RetryMaxDelay tune the engine's
 	// per-DID retry/backoff loop for transient getRepo failures. A zero
@@ -221,14 +228,15 @@ func Run(ctx context.Context, cfg Config) error {
 				"repos", len(cfg.BackfillRepos),
 			)
 			err := runSelectedRepos(runCtx, selectedReposConfig{
-				Repos:          cfg.BackfillRepos,
-				Store:          st,
-				Handler:        handler,
-				SyncClient:     sc,
-				Metrics:        cfg.Metrics,
-				MaxRetries:     cfg.MaxRetries,
-				RetryBaseDelay: cfg.RetryBaseDelay,
-				RetryMaxDelay:  cfg.RetryMaxDelay,
+				Repos:            cfg.BackfillRepos,
+				Store:            st,
+				Handler:          handler,
+				SyncClient:       sc,
+				IdentityResolver: cfg.IdentityResolver,
+				Metrics:          cfg.Metrics,
+				MaxRetries:       cfg.MaxRetries,
+				RetryBaseDelay:   cfg.RetryBaseDelay,
+				RetryMaxDelay:    cfg.RetryMaxDelay,
 				OnError: func(did atmos.DID, err error) {
 					if !shouldLogBackfillError(err) {
 						return
@@ -359,6 +367,9 @@ func (cfg Config) validate() error {
 	}
 	if cfg.BackfillBatchSize < 0 {
 		return fmt.Errorf("backfill: Config.BackfillBatchSize must be >= 0")
+	}
+	if len(cfg.BackfillRepos) > 0 && cfg.IdentityResolver == nil {
+		return fmt.Errorf("backfill: Config.IdentityResolver is required when Config.BackfillRepos is set")
 	}
 	if cfg.Logger == nil {
 		return fmt.Errorf("backfill: Config.Logger is required")
