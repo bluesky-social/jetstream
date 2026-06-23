@@ -45,8 +45,7 @@ func deleteMergeCursor(s *store.Store) error {
 //
 // Per the spec §4.6: only top-level Rev / UpdatedAt are mutated.
 // Backfill.* is preserved byte-for-byte — Backfill.Rev is the
-// immutable signal of where backfill stopped (used by replicas
-// reading backfill_complete.log).
+// immutable signal of where initial backfill stopped.
 //
 // now is parameterized for deterministic tests; production callers
 // should pass time.Now().UTC().
