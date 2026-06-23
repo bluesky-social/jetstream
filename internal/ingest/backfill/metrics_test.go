@@ -30,6 +30,12 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	m.incCompletionStageErrors()
 	m.observeCompletionQueueWait(time.Millisecond)
 	m.incForcedCheckpointFlushes()
+	m.incRetryPasses()
+	m.incRetryCandidates()
+	m.incRetryAttempts()
+	m.incRetrySucceeded()
+	m.incRetryFailed()
+	m.incRetrySkippedHostParked()
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.Discovered), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.Completed), 0)
@@ -46,6 +52,12 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.CompletionStageErrors), 0)
 	require.Equal(t, 1, testutil.CollectAndCount(m.CompletionQueueWait))
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.ForcedCheckpointFlushes), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetryPasses), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetryCandidates), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetryAttempts), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetrySucceeded), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetryFailed), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetrySkippedHostParked), 0)
 	requireNoDebugMetricFields(t, m)
 	requireNoDebugMetrics(t, reg)
 }
@@ -69,6 +81,12 @@ func TestNewMetrics_NilSafe(t *testing.T) {
 		m.incCompletionStageErrors()
 		m.observeCompletionQueueWait(time.Millisecond)
 		m.incForcedCheckpointFlushes()
+		m.incRetryPasses()
+		m.incRetryCandidates()
+		m.incRetryAttempts()
+		m.incRetrySucceeded()
+		m.incRetryFailed()
+		m.incRetrySkippedHostParked()
 	})
 }
 

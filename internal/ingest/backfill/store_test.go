@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
@@ -523,6 +524,62 @@ func TestStore_OnComplete_ClearsLastError(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "", rs.Backfill.LastError, "OnComplete must clear LastError")
 	require.Equal(t, StatusComplete, rs.Backfill.Status)
+}
+
+func TestStore_RecordRetryFailure_SchedulesNextAttempt(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:retryfailure")
+	next := time.Date(2026, 6, 23, 16, 0, 0, 0, time.UTC)
+
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, s.OnFail(ctx, did, "pds.example.com", errors.New("xrpc: HTTP 503: bootstrap unavailable"), 1))
+	require.NoError(t, s.RecordRetryFailure(ctx, did, "pds.example.com", errors.New("xrpc: HTTP 503: unavailable"), next))
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusFailed, rs.Backfill.Status)
+	require.Equal(t, "xrpc: HTTP 503: unavailable", rs.Backfill.LastError)
+	require.Equal(t, 2, rs.Backfill.Attempts)
+	require.Equal(t, 1, rs.Backfill.RetryCount)
+	require.Equal(t, next, rs.Backfill.NextAttemptAt)
+	require.Equal(t, "pds.example.com", rs.Host)
+
+	counts, ok, err := LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, Counts{Total: 1, Failed: 1}, counts)
+
+	hs, ok, err := loadHostStatus(s.db, "pds.example.com")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), hs.Total)
+	require.Equal(t, uint64(1), hs.Active)
+	require.Equal(t, uint64(1), hs.Failed)
+	require.Equal(t, uint64(2), hs.ErrorClassCounts[ErrorClassHTTP5xx])
+	require.Len(t, hs.RecentErrors, 2)
+}
+
+func TestStore_OnComplete_ClearsRetryMetadata(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:retryrecovered")
+	next := time.Date(2026, 6, 23, 16, 0, 0, 0, time.UTC)
+
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, s.OnFail(ctx, did, "pds.example.com", errors.New("xrpc: HTTP 503: bootstrap unavailable"), 1))
+	require.NoError(t, s.RecordRetryFailure(ctx, did, "pds.example.com", errors.New("xrpc: HTTP 503: unavailable"), next))
+	require.NoError(t, s.OnComplete(ctx, did, "pds.example.com", &repo.Commit{DID: string(did), Rev: "rev-recovered"}))
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusComplete, rs.Backfill.Status)
+	require.Equal(t, 0, rs.Backfill.Attempts)
+	require.Equal(t, 0, rs.Backfill.RetryCount)
+	require.True(t, rs.Backfill.NextAttemptAt.IsZero())
+	require.Empty(t, rs.Backfill.LastError)
 }
 
 func TestStore_MaintainsCounts(t *testing.T) {
