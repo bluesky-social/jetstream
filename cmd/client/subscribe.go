@@ -79,6 +79,22 @@ func subscribeCommand() *cli.Command {
 				Usage: "Optional total run duration; 0 runs until interrupted",
 				Value: 0,
 			},
+			&cli.StringFlag{
+				Name:  "debug-pprof-addr",
+				Usage: "If set (e.g. localhost:6061), serve net/http/pprof for memory investigation",
+			},
+			&cli.DurationFlag{
+				Name:  "debug-mem-interval",
+				Usage: "If >0, periodically log runtime MemStats + RSS to stderr",
+			},
+			&cli.StringFlag{
+				Name:  "debug-profile-dir",
+				Usage: "Directory for heap/goroutine profile dumps (default: temp dir)",
+			},
+			&cli.IntFlag{
+				Name:  "debug-rss-limit-mib",
+				Usage: "If >0, a watchdog dumps profiles and exits(0) when RSS exceeds this many MiB, preserving valid pprof data instead of OOM-killing",
+			},
 		},
 		Action: runSubscribe,
 	}
@@ -159,6 +175,14 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 		runCtx, cancel = context.WithTimeout(sigCtx, d)
 		defer cancel()
 	}
+
+	stopDebug := startDebug(runCtx, debugConfig{
+		pprofAddr:      cmd.String("debug-pprof-addr"),
+		sampleInterval: cmd.Duration("debug-mem-interval"),
+		profileDir:     cmd.String("debug-profile-dir"),
+		rssLimitMiB:    cmd.Int("debug-rss-limit-mib"),
+	})
+	defer stopDebug()
 
 	if cmd.Bool("print") {
 		return printEvents(runCtx, out, client)
