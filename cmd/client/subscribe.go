@@ -72,7 +72,7 @@ func subscribeCommand() *cli.Command {
 			&cli.DurationFlag{
 				Name:  "report-interval",
 				Usage: "How often to print throughput stats (when not --print)",
-				Value: 5 * time.Second,
+				Value: time.Second,
 			},
 			&cli.DurationFlag{
 				Name:  "duration",
