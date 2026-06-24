@@ -3,6 +3,7 @@ package jetstream
 import (
 	"log/slog"
 	"net/http"
+	"runtime"
 )
 
 // Option configures a Client. Options are applied in order by Subscribe.
@@ -37,14 +38,41 @@ type config struct {
 
 // Defaults applied when an option is not supplied.
 const (
-	defaultBatchSize    = 64
-	defaultDownloadConc = 8
+	defaultBatchSize = 64
+	// maxAutoDownloadConc caps the auto-sized download concurrency. Backfill
+	// throughput is decode-bound and, on the records we've measured, the decode
+	// pool stops scaling well before this many workers, so a higher cap buys no
+	// throughput while costing one in-flight ~segment-sized download buffer per
+	// worker (the compressed-file memory term) and one HTTP connection. 32 spans
+	// the measured scaling knee on big machines while staying modest on memory
+	// and connection count; operators who want more set WithDownloadConcurrency.
+	maxAutoDownloadConc = 32
+	// minAutoDownloadConc keeps small machines from dropping to a near-serial
+	// backfill: even a 2-core box should overlap a couple of downloads/decodes.
+	minAutoDownloadConc = 4
 )
+
+// defaultDownloadConc auto-sizes download/decode concurrency to the machine:
+// GOMAXPROCS (the cores actually available to this process, honoring cgroup
+// CPU limits), clamped to [minAutoDownloadConc, maxAutoDownloadConc]. This lets
+// a 256-core production host use far more of its cores out of the box than the
+// old fixed default of 8, while a laptop or a CPU-limited container stays
+// reasonable. WithDownloadConcurrency overrides it explicitly.
+func defaultDownloadConc() int {
+	n := runtime.GOMAXPROCS(0)
+	if n < minAutoDownloadConc {
+		return minAutoDownloadConc
+	}
+	if n > maxAutoDownloadConc {
+		return maxAutoDownloadConc
+	}
+	return n
+}
 
 func defaultConfig() config {
 	return config{
 		batchSize:    defaultBatchSize,
-		downloadConc: defaultDownloadConc,
+		downloadConc: defaultDownloadConc(),
 	}
 }
 
@@ -58,11 +86,21 @@ func (c *config) backfillRequested() bool {
 // either an exact NSID (e.g. "app.bsky.feed.post") or a namespace wildcard
 // ending in ".*" (e.g. "app.bsky.feed.*"). Empty or unset means all
 // collections.
+//
+// Setting a collection filter also suppresses Account and Identity events:
+// they carry no collection, so a collection-scoped subscriber does not receive
+// them. (Account deletions are still applied internally as tombstones, so
+// records for a deleted account are correctly suppressed — you just don't see
+// the Account event itself.) With no collection filter, Account and Identity
+// events are delivered, subject to WithDIDs. See issue #142.
 func WithCollections(collections []string) Option {
 	return func(c *config) { c.collections = append([]string(nil), collections...) }
 }
 
 // WithDIDs restricts delivery to the given DIDs. Empty or unset means all DIDs.
+// The DID filter applies to every event kind, including Account and Identity:
+// with a DID filter and no collection filter, you receive Account and Identity
+// events for the matching DIDs only.
 func WithDIDs(dids []string) Option {
 	return func(c *config) { c.dids = append([]string(nil), dids...) }
 }
@@ -120,8 +158,15 @@ func WithBatchSize(n int) Option {
 	}
 }
 
-// WithDownloadConcurrency bounds how many sealed segment/block downloads run
-// in parallel during backfill. Must be > 0; ignored otherwise. Default 8.
+// WithDownloadConcurrency bounds how many sealed segment/block downloads (and
+// their decode work) run in parallel during backfill. Must be > 0; ignored
+// otherwise.
+//
+// The default is auto-sized from the CPU count (GOMAXPROCS, clamped to
+// [4, 32]), so a many-core host uses more of its cores without configuration
+// while small/CPU-limited environments stay modest. Set this to override the
+// auto-sizing — e.g. a higher value on a very large box, or a lower value to
+// cap memory (each in-flight download holds roughly one segment-sized buffer).
 func WithDownloadConcurrency(n int) Option {
 	return func(c *config) {
 		if n > 0 {

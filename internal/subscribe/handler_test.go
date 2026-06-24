@@ -20,6 +20,7 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
+	"github.com/jcalabro/gt"
 	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 )
@@ -278,6 +279,72 @@ func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
 	commit, ok := got["commit"].(map[string]any)
 	require.True(t, ok, "commit payload should be present")
 	require.Equal(t, "create", commit["operation"])
+}
+
+// TestHandler_V2FilterIdentityByCollection guards the /subscribe-v2 policy
+// (#142): a subscriber with a collection filter does NOT receive #identity
+// events (they carry no collection), but DOES still receive #account events
+// (which carry the DID-deletion tombstone the v2 client needs). We publish an
+// identity (must be skipped) followed by an account (must arrive), then a
+// matching commit, to prove identity was filtered without stalling the stream.
+func TestHandler_V2FilterIdentityByCollection(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
+	require.NoError(t, err)
+
+	h := NewHandler(Subscription{
+		Tail:                       b,
+		Store:                      st,
+		Logger:                     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		EmitResyncReplacementRows:  true,
+		FilterIdentityByCollection: true,
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?wantedCollections=app.bsky.feed.post"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	waitForTailBlocked(t, b)
+
+	var seq uint64
+	// Identity must be filtered out under the collection filter.
+	publishIdentity(t, b, &seq, "did:plc:ident", 1)
+	// Account must still be delivered (DID-deletion tombstone bearer).
+	acct := &comatproto.SyncSubscribeRepos_Account{
+		DID: "did:plc:acct", Active: false, Status: gt.Some("deleted"), Seq: 2, Time: "2026-05-27T00:00:00Z",
+	}
+	acctPayload, err := acct.MarshalCBOR()
+	require.NoError(t, err)
+	appendSeq(b, &seq, &segment.Event{
+		IndexedAt: 2, Kind: segment.KindAccount, DID: "did:plc:acct", Payload: acctPayload,
+	})
+	// Matching commit, to bound the test.
+	publishCommit(t, b, &seq, "did:plc:acct", "app.bsky.feed.post", 3)
+
+	// First frame must be the account (identity was skipped).
+	acctFrame := readOneFrame(t, ctx, conn)
+	var gotAcct map[string]any
+	require.NoError(t, json.Unmarshal(acctFrame, &gotAcct))
+	require.Equal(t, "account", gotAcct["kind"], "account must pass the collection filter; identity must have been skipped")
+	require.Equal(t, "did:plc:acct", gotAcct["did"])
+
+	// Second frame must be the matching commit.
+	commitFrame := readOneFrame(t, ctx, conn)
+	var gotCommit map[string]any
+	require.NoError(t, json.Unmarshal(commitFrame, &gotCommit))
+	require.Equal(t, "commit", gotCommit["kind"])
 }
 
 func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {

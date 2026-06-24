@@ -58,8 +58,8 @@ func subscribeCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:  "download-concurrency",
-				Usage: "Bounded concurrency for sealed segment/block downloads",
-				Value: 8,
+				Usage: "Bounded concurrency for sealed segment/block downloads (0 = auto-size from CPU count)",
+				Value: 0,
 			},
 			&cli.StringFlag{
 				Name:  "live-buffer-file",
@@ -72,12 +72,33 @@ func subscribeCommand() *cli.Command {
 			&cli.DurationFlag{
 				Name:  "report-interval",
 				Usage: "How often to print throughput stats (when not --print)",
-				Value: 5 * time.Second,
+				Value: time.Second,
 			},
 			&cli.DurationFlag{
 				Name:  "duration",
 				Usage: "Optional total run duration; 0 runs until interrupted",
 				Value: 0,
+			},
+			&cli.IntFlag{
+				Name:  "gc-percent",
+				Usage: "GOGC target for the run (higher = less frequent GC, more RAM). Default tuned for backfill throughput; ignored if GOGC is set in the environment.",
+				Value: defaultGCPercent,
+			},
+			&cli.StringFlag{
+				Name:  "debug-pprof-addr",
+				Usage: "If set (e.g. localhost:6061), serve net/http/pprof for memory investigation",
+			},
+			&cli.DurationFlag{
+				Name:  "debug-mem-interval",
+				Usage: "If >0, periodically log runtime MemStats + RSS to stderr",
+			},
+			&cli.StringFlag{
+				Name:  "debug-profile-dir",
+				Usage: "Directory for heap/goroutine profile dumps (default: temp dir)",
+			},
+			&cli.IntFlag{
+				Name:  "debug-rss-limit-mib",
+				Usage: "If >0, a watchdog dumps profiles and exits(0) when RSS exceeds this many MiB, preserving valid pprof data instead of OOM-killing",
 			},
 		},
 		Action: runSubscribe,
@@ -90,9 +111,21 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 		out = os.Stdout
 	}
 
+	// Tune GC before the run. A backfill is allocation-heavy (one record map +
+	// CBOR clone per event) but its live set is small and bounded, so the default
+	// GOGC=100 collects far too often relative to available RAM — GC was ~⅓ of
+	// client CPU at high decode concurrency (#142). Raising the target trades RAM
+	// for throughput. Honors an explicit GOGC env var (we skip tuning then).
+	tuneGC(cmd.Int("gc-percent"))
+
 	opts := []jetstream.Option{
 		jetstream.WithBatchSize(cmd.Int("batch-size")),
-		jetstream.WithDownloadConcurrency(cmd.Int("download-concurrency")),
+	}
+	// --download-concurrency=0 (the default) means "let the library auto-size
+	// from the CPU count"; only forward an explicit positive override so the
+	// library default applies otherwise.
+	if dc := cmd.Int("download-concurrency"); dc > 0 {
+		opts = append(opts, jetstream.WithDownloadConcurrency(dc))
 	}
 	if c := cmd.StringSlice("collection"); len(c) > 0 {
 		opts = append(opts, jetstream.WithCollections(c))
@@ -160,6 +193,17 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 		defer cancel()
 	}
 
+	stopDebug, err := startDebug(runCtx, debugConfig{
+		pprofAddr:      cmd.String("debug-pprof-addr"),
+		sampleInterval: cmd.Duration("debug-mem-interval"),
+		profileDir:     cmd.String("debug-profile-dir"),
+		rssLimitMiB:    cmd.Int("debug-rss-limit-mib"),
+	})
+	if err != nil {
+		return err
+	}
+	defer stopDebug()
+
 	if cmd.Bool("print") {
 		return printEvents(runCtx, out, client)
 	}
@@ -205,9 +249,9 @@ func reportThroughput(ctx context.Context, out io.Writer, client *jetstream.Clie
 		if secs <= 0 {
 			secs = 1
 		}
-		eps := float64(events-lastEvents) / secs
-		_, _ = fmt.Fprintf(out, "%s elapsed=%s events=%s eps=%.0f last_cursor=%d\n",
-			label, now.Sub(start).Round(time.Second), formatCount(events), eps, lastCursor)
+		eps := uint64(float64(events-lastEvents)/secs + 0.5)
+		_, _ = fmt.Fprintf(out, "%s elapsed=%s events=%s events_per_second=%s last_cursor=%d\n",
+			label, now.Sub(start).Round(time.Second), formatCount(events), formatCount(eps), lastCursor)
 		lastAt = now
 		lastEvents = events
 	}

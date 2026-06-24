@@ -24,6 +24,26 @@ func liveCommitFrame(t *testing.T, seq uint64, did, op, coll, rkey string, withR
 	return []byte(frame)
 }
 
+// liveIdentityFrame builds an extended-wire #identity frame.
+func liveIdentityFrame(seq uint64, did, handle string) []byte {
+	s := strconv.FormatUint(seq, 10)
+	return []byte(`{"did":"` + did + `","time_us":1,"cursor":` + s + `,"seq":` + s +
+		`,"kind":"identity","identity":{"did":"` + did + `","handle":"` + handle + `","seq":` + s + `,"time":"t"}}`)
+}
+
+// liveAccountFrame builds an extended-wire #account frame. A deleted account
+// (active=false, status="deleted") doubles as a DID-level tombstone.
+func liveAccountFrame(seq uint64, did string, active bool, status string) []byte {
+	s := strconv.FormatUint(seq, 10)
+	act := "true"
+	if !active {
+		act = "false"
+	}
+	return []byte(`{"did":"` + did + `","time_us":1,"cursor":` + s + `,"seq":` + s +
+		`,"kind":"account","account":{"did":"` + did + `","active":` + act +
+		`,"status":"` + status + `","seq":` + s + `,"time":"t"}}`)
+}
+
 func TestDecodeLiveFrameCommit(t *testing.T) {
 	t.Parallel()
 	ev, err := decodeLiveFrame(liveCommitFrame(t, 42, "did:plc:a", "create", "app.bsky.feed.post", "r1", true))

@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	iclient "github.com/bluesky-social/jetstream/internal/client"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/stretchr/testify/require"
@@ -61,8 +63,31 @@ func TestOptionsRejectNonPositive(t *testing.T) {
 	WithBatchSize(0)(&cfg)
 	WithBatchSize(-5)(&cfg)
 	WithDownloadConcurrency(0)(&cfg)
+	WithDownloadConcurrency(-3)(&cfg)
 	require.Equal(t, defaultBatchSize, cfg.batchSize, "non-positive batch size must be ignored")
-	require.Equal(t, defaultDownloadConc, cfg.downloadConc, "non-positive concurrency must be ignored")
+	require.Equal(t, defaultDownloadConc(), cfg.downloadConc, "non-positive concurrency must be ignored (auto-sized default retained)")
+}
+
+// Not parallel: mutates the process-global GOMAXPROCS.
+//
+//nolint:paralleltest // mutates process-global GOMAXPROCS
+func TestDefaultDownloadConcClamps(t *testing.T) {
+	// The auto-sized default tracks GOMAXPROCS but is clamped to a safe band so a
+	// tiny box does not go near-serial and a 256-core box does not spawn 256
+	// in-flight downloads.
+	got := defaultDownloadConc()
+	require.GreaterOrEqual(t, got, minAutoDownloadConc, "must not drop below the floor on a small machine")
+	require.LessOrEqual(t, got, maxAutoDownloadConc, "must not exceed the cap on a many-core machine")
+
+	// Drive GOMAXPROCS to the extremes and confirm the clamp, restoring it after.
+	prev := runtime.GOMAXPROCS(0)
+	t.Cleanup(func() { runtime.GOMAXPROCS(prev) })
+
+	runtime.GOMAXPROCS(1)
+	require.Equal(t, minAutoDownloadConc, defaultDownloadConc(), "1 core clamps up to the floor")
+
+	runtime.GOMAXPROCS(maxAutoDownloadConc * 4)
+	require.Equal(t, maxAutoDownloadConc, defaultDownloadConc(), "many cores clamp down to the cap")
 }
 
 func TestWithMaxDownloadAttempts(t *testing.T) {
@@ -152,6 +177,68 @@ func TestBatchLastCursor(t *testing.T) {
 	b := Batch{events: []Event{{Seq: 3}, {Seq: 7}, {Seq: 5}}}
 	require.EqualValues(t, 7, b.LastCursor())
 	require.Len(t, b.Events(), 3)
+}
+
+// TestToPublicEventsSlab guards the public-side per-block Commit slab: converting
+// a batch of internal events must give each commit event a DISTINCT *Commit with
+// its own correct fields (a slab indexing bug would alias slots), with field
+// values identical to a per-event conversion, and with correct slot accounting
+// when non-commit kinds are interleaved (they take no slot).
+func TestToPublicEventsSlab(t *testing.T) {
+	t.Parallel()
+	in := []iclient.Event{
+		{DID: "did:plc:a", Seq: 1, Kind: iclient.KindCommit, Commit: &iclient.Commit{Operation: iclient.OpCreate, Collection: "c", Rkey: "r1", Rev: "v1", CID: "cid1"}},
+		{DID: "did:plc:a", Seq: 2, Kind: iclient.KindIdentity, Identity: &iclient.Identity{DID: "did:plc:a", Handle: "h", Seq: 2, Time: "t"}},
+		{DID: "did:plc:a", Seq: 3, Kind: iclient.KindCommit, Commit: &iclient.Commit{Operation: iclient.OpUpdate, Collection: "c", Rkey: "r3", Rev: "v3", CID: "cid3"}},
+		{DID: "did:plc:a", Seq: 4, Kind: iclient.KindAccount, Account: &iclient.Account{DID: "did:plc:a", Active: true, Seq: 4, Time: "t"}},
+		{DID: "did:plc:a", Seq: 5, Kind: iclient.KindCommit, Commit: &iclient.Commit{Operation: iclient.OpDelete, Collection: "c", Rkey: "r5", Rev: "v5"}},
+	}
+	out := toPublicEvents(in)
+	require.Len(t, out, len(in))
+
+	seen := map[*Commit]bool{}
+	for i := range out {
+		require.EqualValues(t, in[i].Seq, out[i].Seq)
+		switch in[i].Kind {
+		case iclient.KindCommit:
+			require.NotNil(t, out[i].Commit, "event %d should have a Commit", i)
+			require.False(t, seen[out[i].Commit], "event %d aliases an already-used *Commit slot", i)
+			seen[out[i].Commit] = true
+			require.Equal(t, in[i].Commit.Rkey, out[i].Commit.Rkey, "commit %d carries the wrong rkey (slab misaligned)", i)
+			require.Equal(t, in[i].Commit.CID, out[i].Commit.CID)
+			require.Equal(t, Operation(in[i].Commit.Operation), out[i].Commit.Operation)
+		case iclient.KindIdentity:
+			require.NotNil(t, out[i].Identity)
+			require.Nil(t, out[i].Commit)
+		case iclient.KindAccount:
+			require.NotNil(t, out[i].Account)
+			require.Nil(t, out[i].Commit)
+		}
+	}
+	require.Len(t, seen, 3, "exactly the three commit events get distinct slots")
+}
+
+// TestToPublicEventsSlabAllocations pins that converting a batch of N commits
+// allocates O(1) Commit-struct backing (the slab), not O(N) *Commit. Doubling N
+// must not add ~N allocations.
+//
+//nolint:paralleltest // AllocsPerRun cannot run under t.Parallel
+func TestToPublicEventsSlabAllocations(t *testing.T) {
+	mk := func(n int) []iclient.Event {
+		evs := make([]iclient.Event, n)
+		for i := range evs {
+			evs[i] = iclient.Event{Seq: uint64(i), Kind: iclient.KindCommit, Commit: &iclient.Commit{Collection: "c", Rkey: "r"}}
+		}
+		return evs
+	}
+	in100, in200 := mk(100), mk(200)
+	a100 := testing.AllocsPerRun(100, func() { _ = toPublicEvents(in100) })
+	a200 := testing.AllocsPerRun(100, func() { _ = toPublicEvents(in200) })
+	t.Logf("toPublicEvents: 100=%.0f allocs, 200=%.0f allocs (delta=%.0f)", a100, a200, a200-a100)
+	// Per-*Commit allocation would make this delta ~100; the slab keeps it ~0
+	// (the []Commit and []Event slabs are 2 allocations regardless of N).
+	require.Less(t, a200-a100, float64(5),
+		"doubling commit count must not add ~N allocations; the Commit slab keeps it constant")
 }
 
 func TestClosedClientEventsErrors(t *testing.T) {

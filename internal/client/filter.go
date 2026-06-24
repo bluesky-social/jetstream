@@ -11,13 +11,26 @@ import (
 // negatives, possible false positives via DID blooms and per-block collection
 // summaries), so the client MUST re-apply exact filtering after decode.
 //
-// Semantics mirror the live /subscribe filter (v1 parity) so a backfill and a
-// live tail with the same options deliver the same rows:
+// The presentation contract is the v2 Go-client contract (NOT v1 wire parity):
+// a subscriber that asked for specific collections wants only those record
+// types, so account and identity events — which carry no collection — are
+// dropped when a collection filter is set. With no collection filter they flow
+// (subject to the DID filter). Concretely:
 //
 //   - DID filter applies to all event kinds.
-//   - Collection filter applies only to commit events; identity, account, and
-//     sync events bypass it (they carry no collection).
-//   - A commit with an empty collection bypasses the collection filter.
+//   - With a collection filter set: only commit events whose collection matches
+//     are delivered; identity and account events are dropped (they carry no
+//     collection). A commit with an empty collection still bypasses the filter.
+//   - With no collection filter: identity and account events are delivered
+//     (subject to the DID filter), matching "give me the whole stream".
+//   - Sync events bypass the collection filter regardless: they are an internal
+//     resync signal, never surfaced as a user record.
+//
+// IMPORTANT: this filter governs what is DELIVERED to the consumer, not what
+// the engine observes internally. Account-deletion tombstones are folded into
+// the Suppressor BEFORE this matcher runs (liveSink.onLive observes the
+// tombstone, then calls wantLive), so dropping an account event here never
+// weakens the client's record-deletion guarantee.
 //
 // The seq window is the client's exact (afterSeq, beforeSeq] bound, applied on
 // top of the planner's coarse per-segment/block seq pruning.
@@ -77,9 +90,16 @@ func (m *Matcher) Wants(ev *segment.Event) bool {
 	if !m.hasCollectionFilter() {
 		return true
 	}
-	// Collection filter applies only to commit events; others pass through.
-	if !ev.Kind.IsCommit() {
+	// Sync is an internal resync signal, never gated by the collection filter.
+	if ev.Kind == segment.KindSync {
 		return true
+	}
+	// With a collection filter set, identity and account events (which carry no
+	// collection) are not what a collection-scoped subscriber asked for. Drop
+	// them from delivery. Tombstone folding for account-deletes already happened
+	// upstream (see the type doc), so this does not affect record suppression.
+	if !ev.Kind.IsCommit() {
+		return false
 	}
 	// A commit lacking a collection bypasses the filter (v1 parity).
 	if ev.Collection == "" {

@@ -400,14 +400,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Lookback:  opts.CursorLookback,
 	}))
 	srv.RegisterPublicRoute("GET /subscribe-v2", subscribe.NewHandler(subscribe.Subscription{
-		Tail:                      tail,
-		Store:                     metaStore,
-		Manifest:                  mft,
-		WriterRef:                 &writerPtr,
-		Logger:                    processLogger,
-		Metrics:                   subscribeMetrics,
-		Lookback:                  opts.CursorLookback,
-		EmitResyncReplacementRows: true,
+		Tail:                       tail,
+		Store:                      metaStore,
+		Manifest:                   mft,
+		WriterRef:                  &writerPtr,
+		Logger:                     processLogger,
+		Metrics:                    subscribeMetrics,
+		Lookback:                   opts.CursorLookback,
+		EmitResyncReplacementRows:  true,
+		FilterIdentityByCollection: true,
 	}))
 
 	// XRPC surface: whole-file segment download + listing. The atmos

@@ -102,19 +102,49 @@ func TestMatcherCollectionExactAndWildcard(t *testing.T) {
 	}
 }
 
-func TestMatcherCollectionFilterSkipsNonCommit(t *testing.T) {
+// TestMatcherCollectionFilterDropsIdentityAccount guards the v2 Go-client
+// presentation contract (#142): with a collection filter set, identity and
+// account events — which carry no collection — are NOT delivered, because a
+// collection-scoped subscriber did not ask for them. Sync still passes (it is
+// an internal resync signal, not gated by the collection filter). Account
+// tombstone folding happens upstream of this matcher, so dropping account here
+// does not weaken record suppression.
+func TestMatcherCollectionFilterDropsIdentityAccount(t *testing.T) {
 	t.Parallel()
 	m := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
 
-	// Identity/account/sync carry no collection and must bypass the filter.
-	for _, k := range []segment.Kind{segment.KindIdentity, segment.KindAccount, segment.KindSync} {
+	for _, k := range []segment.Kind{segment.KindIdentity, segment.KindAccount} {
 		ev := segment.Event{Seq: 1, Kind: k, DID: "did:plc:a"}
-		require.Truef(t, m.Wants(&ev), "kind %d must bypass collection filter", k)
+		require.Falsef(t, m.Wants(&ev), "kind %d must be dropped under a collection filter", k)
 	}
+
+	// Sync bypasses the collection filter regardless.
+	sync := segment.Event{Seq: 1, Kind: segment.KindSync, DID: "did:plc:a"}
+	require.True(t, m.Wants(&sync), "sync must bypass the collection filter")
 
 	// A commit with an empty collection bypasses the filter (v1 parity).
 	emptyColl := segment.Event{Seq: 2, Kind: segment.KindCreate, DID: "did:plc:a", Collection: ""}
 	require.True(t, m.Wants(&emptyColl))
+}
+
+// TestMatcherNoCollectionFilterDeliversIdentityAccount guards the other side of
+// the contract: with NO collection filter, identity and account events are
+// delivered (subject to any DID filter) — "give me the whole stream".
+func TestMatcherNoCollectionFilterDeliversIdentityAccount(t *testing.T) {
+	t.Parallel()
+	m := NewMatcher(PlanRequest{}) // no filters at all
+
+	for _, k := range []segment.Kind{segment.KindIdentity, segment.KindAccount, segment.KindSync} {
+		ev := segment.Event{Seq: 1, Kind: k, DID: "did:plc:a"}
+		require.Truef(t, m.Wants(&ev), "kind %d must be delivered with no collection filter", k)
+	}
+
+	// A DID-only filter still delivers identity/account for the matching DID.
+	md := NewMatcher(PlanRequest{DIDs: []string{"did:plc:keep"}})
+	keep := segment.Event{Seq: 1, Kind: segment.KindIdentity, DID: "did:plc:keep"}
+	require.True(t, md.Wants(&keep), "identity for a matching DID must be delivered")
+	drop := segment.Event{Seq: 2, Kind: segment.KindAccount, DID: "did:plc:other"}
+	require.False(t, md.Wants(&drop), "account for a non-matching DID must be dropped")
 }
 
 func TestMatcherWildcardBoundary(t *testing.T) {

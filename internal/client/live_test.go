@@ -3,11 +3,13 @@ package client
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
@@ -116,6 +118,40 @@ func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error
 	mu.Lock()
 	defer mu.Unlock()
 	return events, errs
+}
+
+// TestLiveSinkAccountDeleteSuppressesDespiteCollectionFilter is the headline
+// correctness guard for #142: under a collection filter, the live sink must
+// fold an account-delete tombstone into the suppressor BEFORE applying the
+// delivery filter. So even though the account event itself is dropped from
+// delivery (a collection-scoped subscriber does not want it), a later
+// historical create for that DID is still suppressed. Dropping account events
+// from the user-facing stream must NOT weaken the record-deletion guarantee.
+func TestLiveSinkAccountDeleteSuppressesDespiteCollectionFilter(t *testing.T) {
+	t.Parallel()
+
+	suppressor := NewSuppressor()
+	// Collection filter set: account/identity are not delivered.
+	matcher := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
+	sink := newLiveSink(&memBuffer{}, suppressor, matcher)
+
+	// A live account-delete for did:plc:a at seq 100 arrives during buffering.
+	acctDel, err := decodeLiveFrame(liveAccountFrame(100, "did:plc:a", false, "deleted"))
+	require.NoError(t, err)
+
+	// Buffering phase: onLive must fold the tombstone (it returns true to keep
+	// tailing) even though the account event will never be delivered.
+	keep := sink.onLive(&acctDel, liveAccountFrame(100, "did:plc:a", false, "deleted"), nil)
+	require.True(t, keep, "sink must keep tailing after an account-delete")
+
+	// The suppressor must now drop a historical create for that DID below seq 100.
+	staleCreate := segment.Event{Seq: 50, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r1"}
+	drop, reason := suppressor.ShouldDrop(&staleCreate)
+	require.True(t, drop, "create below the account-delete must be suppressed")
+	require.Equal(t, "account", reason)
+
+	// And the account event itself must NOT pass the delivery filter.
+	require.False(t, sink.wantLive(&acctDel), "account event must be dropped from delivery under a collection filter")
 }
 
 func TestLiveConsumerDeliversInOrder(t *testing.T) {
@@ -234,6 +270,35 @@ func TestLiveConsumerSubscribeURL(t *testing.T) {
 	require.NotContains(t, u2, "cursor=", "no cursor when none (live from tip)")
 }
 
+// TestLiveConsumerSubscribeURLForwardsFilters verifies the live tail forwards
+// the caller's collection/DID filters on the wire as wantedCollections/
+// wantedDids. The server filters server-side (v1 ParseQuery), so forwarding
+// them avoids pulling the full firehose over the socket and discarding most of
+// it client-side. Each value is sent as its own repeated query param (the v1
+// wire shape ParseQuery expects). The client-side matcher remains a backstop.
+func TestLiveConsumerSubscribeURLForwardsFilters(t *testing.T) {
+	t.Parallel()
+	c := newLiveConsumer(liveConfig{
+		host:        "https://h",
+		collections: []string{"app.bsky.feed.post", "app.bsky.feed.like"},
+		dids:        []string{"did:plc:a", "did:plc:b"},
+	})
+	u := c.subscribeURL()
+	parsed, err := url.Parse(u)
+	require.NoError(t, err)
+	q := parsed.Query()
+	require.Equal(t, []string{"app.bsky.feed.post", "app.bsky.feed.like"}, q["wantedCollections"],
+		"each collection must be a repeated wantedCollections param; got %s", u)
+	require.Equal(t, []string{"did:plc:a", "did:plc:b"}, q["wantedDids"],
+		"each DID must be a repeated wantedDids param; got %s", u)
+
+	// No filters -> no params (unfiltered tail unaffected).
+	c2 := newLiveConsumer(liveConfig{host: "https://h"})
+	u2 := c2.subscribeURL()
+	require.NotContains(t, u2, "wantedCollections", "no collection filter -> no param")
+	require.NotContains(t, u2, "wantedDids", "no DID filter -> no param")
+}
+
 // TestLiveConsumerSubscribeURLCursorZero guards #112: a backfill->live cutover
 // whose rewind start lands at seq 0 (sealed tip below the rewind margin) must
 // REPLAY from seq 0, not live-tail from the tip. A present cursor of Some(0)
@@ -249,6 +314,19 @@ func TestLiveConsumerSubscribeURLCursorZero(t *testing.T) {
 	// None cursor keeps the "live from tip" sentinel.
 	c2 := newLiveConsumer(liveConfig{host: "https://h"})
 	require.NotContains(t, c2.subscribeURL(), "cursor=", "None cursor must remain live-from-tip")
+}
+
+// TestLiveDialOptionsOffersCompression verifies the production dialer offers
+// RFC 7692 permessage-deflate. The server auto-negotiates deflate when the
+// client advertises it (subscribe handler), so offering it on dial cuts
+// bandwidth on the repetitive JSON firehose; a non-offering client gets an
+// uncompressed stream.
+func TestLiveDialOptionsOffersCompression(t *testing.T) {
+	t.Parallel()
+	opts := liveDialOptions()
+	require.NotNil(t, opts)
+	require.Equal(t, websocket.CompressionContextTakeover, opts.CompressionMode,
+		"live dial must offer permessage-deflate with context takeover")
 }
 
 // capturingDialer wraps scriptedDialer to record the URL requested on each

@@ -2,7 +2,7 @@ package client
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
 
 	"github.com/bluesky-social/jetstream/segment"
@@ -11,12 +11,27 @@ import (
 )
 
 // decodeSegmentEvent converts a decoded segment row into the engine's
-// region-agnostic Event. It decodes the raw CBOR payload into a generic
-// record map (for commits) and the typed identity/account/sync shapes.
+// region-agnostic Event, allocating a fresh *Commit for a commit row. It is the
+// single-event helper used by tests and one-off callers; the hot decode path
+// uses decodeSegmentEventInto with a per-block Commit slab to avoid one heap
+// allocation per commit.
 //
 // segment.Event payloads alias a shared decompressed block buffer, so any
 // bytes retained in the returned Event (notably RecordCBOR) are copied.
 func decodeSegmentEvent(ev *segment.Event) (Event, error) {
+	var commit Commit
+	return decodeSegmentEventInto(ev, &commit)
+}
+
+// decodeSegmentEventInto is decodeSegmentEvent but writes a commit row's data
+// into the caller-provided *commit instead of allocating one. The caller passes
+// a pointer into a per-block []Commit slab (see decodeFrame), so a whole block's
+// commits cost one slice allocation rather than one *Commit each. commit is only
+// written (and referenced by the returned Event) for commit-kind rows; for
+// identity/account/sync rows it is ignored and those shapes are allocated
+// individually (they are comparatively rare). The caller MUST ensure commit's
+// backing slab is not grown/reallocated while the returned Event is reachable.
+func decodeSegmentEventInto(ev *segment.Event, commit *Commit) (Event, error) {
 	out := Event{
 		DID:    ev.DID,
 		Seq:    ev.Seq,
@@ -24,8 +39,7 @@ func decodeSegmentEvent(ev *segment.Event) (Event, error) {
 	}
 	switch ev.Kind {
 	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
-		commit, err := decodeCommit(ev)
-		if err != nil {
+		if err := decodeCommitInto(ev, commit); err != nil {
 			return Event{}, err
 		}
 		out.Kind = KindCommit
@@ -57,57 +71,152 @@ func decodeSegmentEvent(ev *segment.Event) (Event, error) {
 	return out, nil
 }
 
+// decodeCommit decodes a commit row into a freshly-allocated *Commit. The hot
+// path uses decodeCommitInto with a slab slot; this allocating form is kept for
+// tests and single-event callers.
 func decodeCommit(ev *segment.Event) (*Commit, error) {
-	commit := &Commit{
+	commit := &Commit{}
+	if err := decodeCommitInto(ev, commit); err != nil {
+		return nil, err
+	}
+	return commit, nil
+}
+
+// decodeCommitInto fills *commit from a commit row. On error *commit may hold
+// partial data, but the caller discards the event (and the slab slot is never
+// read) on a decode failure, so the partial write is harmless.
+func decodeCommitInto(ev *segment.Event, commit *Commit) error {
+	*commit = Commit{
 		Operation:  commitOperation(ev.Kind),
 		Collection: ev.Collection,
 		Rkey:       ev.Rkey,
 		Rev:        ev.Rev,
 	}
 	if ev.Kind == segment.KindDelete {
-		return commit, nil
+		return nil
 	}
 
 	record, err := decodeRecordMap(ev.Payload)
 	if err != nil {
-		return nil, fmt.Errorf("jetstream: decode record (did=%s collection=%s rkey=%s seq=%d): %w",
+		return fmt.Errorf("jetstream: decode record (did=%s collection=%s rkey=%s seq=%d): %w",
 			ev.DID, ev.Collection, ev.Rkey, ev.Seq, err)
 	}
 	commit.Record = record
 	commit.CID = cbor.ComputeCID(cbor.CodecDagCBOR, ev.Payload).String()
 	commit.RecordCBOR = bytes.Clone(ev.Payload)
-	return commit, nil
+	return nil
 }
 
 // decodeRecordMap decodes DAG-CBOR record bytes into a generic JSON-shaped
 // object: the same shape callers see in the "record" field on /subscribe.
+//
+// It converts the CBOR data model directly into the JSON-shaped value, rather
+// than round-tripping through JSON text (cbor.ToJSON -> json.Unmarshal). The
+// round-trip dominated backfill decode CPU (see #142): marshalling the decoded
+// value to JSON bytes and reparsing them was ~half of per-record decode cost
+// for no benefit, since the CBOR decode already produced the structured value.
+// The output is deep-equal to the old path: numbers are float64 (matching
+// encoding/json's number handling), []byte becomes {"$bytes": base64-raw}, and
+// a CID link becomes {"$link": cid-string} — the ATProto JSON sentinels.
+//
+// We decode with cbor.UnmarshalNoCopy (slice-based, zero-copy) rather than a
+// streaming cbor.NewDecoder(bytes.NewReader(...)).ReadValue(): the payload is
+// already a []byte, so the slice decoder avoids io.Reader indirection and the
+// per-string readN allocation, and NoCopy further returns string/[]byte values
+// that ALIAS payload instead of copying them — roughly halving decode
+// allocations on these string-heavy records (#142). It also enforces the
+// single-item / no-trailing-bytes contract internally (a trailing byte means the
+// frame is corrupt and would not match the RecordCBOR/CID computed over the full
+// payload), so no separate guard is needed here.
+//
+// NoCopy aliasing safety: payload is ev.Payload, which itself aliases the
+// segment block's decompressed buffer and is contractually read-only (see
+// segment/event.go and the decodeBlock buffer-aliasing contract) — it is never
+// mutated after decode. The returned Record map's string values therefore point
+// into that block buffer, which stays alive exactly as long as the decoded Event
+// that carries the map (the Event already pins the buffer via its own aliased
+// DID/Collection/Rkey/Rev string columns). So the map never outlives its backing
+// bytes, satisfying the UnmarshalNoCopy contract. RecordCBOR is separately cloned
+// in decodeCommit, so callers retaining raw bytes are unaffected.
 func decodeRecordMap(payload []byte) (map[string]any, error) {
-	r := bytes.NewReader(payload)
-	val, err := cbor.NewDecoder(r).ReadValue()
+	val, err := cbor.UnmarshalNoCopy(payload)
 	if err != nil {
 		return nil, fmt.Errorf("cbor decode: %w", err)
 	}
-	// A record payload must be exactly one CBOR item. Trailing bytes mean the
-	// frame is corrupt: the map we decoded would not match RecordCBOR/CID
-	// (which retain the full payload), so reject rather than silently diverge.
-	if r.Len() != 0 {
-		return nil, fmt.Errorf("cbor decode: %d trailing bytes after record", r.Len())
+	// A valid atproto record is always a CBOR map, so require the top-level value
+	// to be one and fail closed otherwise: a malformed payload must not surface as
+	// a non-delete commit with a nil/garbage Record. For a map, the converted
+	// output is identical to the canonical cbor.ToJSON shape the server emits on
+	// /subscribe — that semantic equivalence (not bug-for-bug parity with the old
+	// client code) is the contract here.
+	//
+	// This is intentionally stricter than the prior JSON round-trip, which
+	// inconsistently accepted a top-level byte string or CID (cbor.ToJSON wraps
+	// them as the JSON objects {"$bytes":..}/{"$link":..}) while rejecting a
+	// top-level scalar/array/null. Neither is a valid record; rejecting all
+	// non-map top-level payloads is the deliberate, consistent fail-closed choice.
+	m, ok := val.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("cbor decode: record is not an object")
 	}
-	jsonBytes, err := cbor.ToJSON(val)
-	if err != nil {
-		return nil, fmt.Errorf("cbor to json: %w", err)
+	return jsonShapedMap(m), nil
+}
+
+// jsonShapedValue converts one decoded CBOR value into its ATProto JSON-shaped
+// form, recursively. The mapping mirrors cbor.ToJSON followed by encoding/json
+// round-tripping exactly:
+//   - int64 -> float64 (encoding/json represents all JSON numbers as float64
+//     when decoding into any; the old path went through JSON text, so a CBOR
+//     integer surfaced as a float64 — preserved for byte-for-byte compatibility).
+//   - []byte        -> {"$bytes": base64.RawStdEncoding}
+//   - cbor.CID      -> {"$link": cid.String()}
+//   - []any / map   -> converted element-wise, in place.
+//   - string/bool/float64/nil -> passed through unchanged (original box reused).
+//
+// It mutates maps and slices in place and reuses the decoder's existing any
+// boxes for unchanged scalars, so it allocates only where the value's JSON shape
+// actually differs from its CBOR form (integers, byte strings, CID links).
+func jsonShapedValue(v any) any {
+	switch val := v.(type) {
+	case int64:
+		// CBOR integers surface as JSON float64 (the canonical cbor.ToJSON +
+		// encoding/json contract). This is the one pass-through-shaped arm that
+		// MUST re-box: the stored kind genuinely changes (int64 box -> float64).
+		return float64(val)
+	case []byte:
+		return map[string]any{"$bytes": base64.RawStdEncoding.EncodeToString(val)}
+	case cbor.CID:
+		return map[string]any{"$link": val.String()}
+	case []any:
+		// Rewrite in place rather than allocating a second slice: the slice came
+		// from the decoder and is not retained elsewhere. Only elements that
+		// actually change kind re-box, via the recursion.
+		for i := range val {
+			val[i] = jsonShapedValue(val[i])
+		}
+		return val
+	case map[string]any:
+		return jsonShapedMap(val)
+	default:
+		// string, bool, float64, nil, and any other already-JSON-shaped scalar
+		// pass through UNCHANGED — and we return the ORIGINAL box v, not a
+		// re-asserted value. Writing `case string: return val` would unbox to a
+		// concrete string and then heap-allocate a FRESH any box on return
+		// (runtime.convTstring), once per scalar leaf — ~22% of decode allocations
+		// (#142). Returning v reuses the box the decoder already produced; output
+		// is byte-identical (same kind, same value).
+		return v
 	}
-	var m map[string]any
-	if err := json.Unmarshal(jsonBytes, &m); err != nil {
-		return nil, fmt.Errorf("json unmarshal record: %w", err)
+}
+
+// jsonShapedMap converts a CBOR map in place into its JSON-shaped form. The map
+// from ReadValue is freshly allocated and not retained elsewhere, so rewriting
+// its values avoids a second map allocation per object.
+func jsonShapedMap(m map[string]any) map[string]any {
+	for k, v := range m {
+		m[k] = jsonShapedValue(v)
 	}
-	// JSON null unmarshals into a map as a nil map with no error. A commit
-	// record must be an object; reject null/non-object so a malformed payload
-	// cannot surface as a non-delete commit with a nil Record.
-	if m == nil {
-		return nil, fmt.Errorf("json unmarshal record: record is not an object")
-	}
-	return m, nil
+	return m
 }
 
 func commitOperation(k segment.Kind) Operation {

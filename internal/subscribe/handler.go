@@ -56,6 +56,17 @@ type Subscription struct {
 	// /subscribe-v2. The default false preserves Jetstream v1 behavior by
 	// advancing over Sync 1.1 resync replacement rows without emitting them.
 	EmitResyncReplacementRows bool
+
+	// FilterIdentityByCollection enables the v2 presentation policy used by
+	// /subscribe-v2: a subscriber with a collection filter does not receive
+	// #identity events (which carry no collection). The default false
+	// preserves Jetstream v1 behavior, where identity events bypass the
+	// collection filter entirely (v1 README: "Regardless of desired
+	// collections, all subscribers receive Account and Identity events").
+	// #account events bypass the collection filter under BOTH policies because
+	// they carry the DID-deletion tombstone the v2 client needs to suppress
+	// stale records; see Filter.Wants.
+	FilterIdentityByCollection bool
 }
 
 func (d Subscription) writer() *ingest.Writer {
@@ -112,6 +123,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		http.Error(w, perr.Error(), http.StatusBadRequest)
 		return
 	}
+	initialFilter = initialFilter.withIdentityCollectionPolicy(deps.FilterIdentityByCollection)
 
 	requireHello := parseRequireHello(values)
 	extended := values.Get("extended") == "true"
@@ -313,6 +325,7 @@ func runReader(
 				_ = conn.Close(websocket.StatusPolicyViolation, truncateCloseReason(err.Error()))
 				return
 			}
+			newFilter = newFilter.withIdentityCollectionPolicy(deps.FilterIdentityByCollection)
 			filterPtr.Store(newFilter)
 			deps.Metrics.incOptionsUpdates()
 			signalHello()

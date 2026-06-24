@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/xrpc"
-	"golang.org/x/sync/errgroup"
 )
 
 // RowSelector decides whether a decoded segment row should be kept (emitted)
@@ -22,14 +22,43 @@ type RowSelector interface {
 	Keep(ev *segment.Event) (bool, string)
 }
 
-// Downloader fetches sealed-archive plan entries over XRPC and decodes them
-// into events. It downloads with bounded concurrency but emits entries in
-// strict plan order, preserving the archive's per-DID ordering invariant.
+// prefetchDepth is how many whole-segment files the prefetcher may fetch ahead
+// of the framer. It overlaps the next segment's network download with the
+// current segment's decode so the decode pool does not starve waiting on I/O.
+// Depth 2 (one in-flight download + one ready) fully pipelines fetch with decode
+// when a single segment's fetch is no slower than its decode; the cost is up to
+// prefetchDepth resident ~280 MB segment buffers. Bounding the compressed-file
+// footprint further (streaming the body) is tracked separately as #143.
+const prefetchDepth = 2
+
+// Downloader fetches sealed-archive plan entries over XRPC and decodes them into
+// events. Block decode runs in parallel across a worker pool while a single
+// reassembler emits results in strict plan order, so decode scales across cores
+// without violating the archive's per-DID ordering invariant.
 type Downloader struct {
 	xc          *xrpc.Client
 	concurrency int
 	selector    RowSelector
+	// transform, when non-nil, runs ON the decode-pool workers (in parallel)
+	// immediately after a block is decoded, turning that block's []Event into an
+	// opaque, ready-to-deliver payload that the reassembler forwards in seq order
+	// as EntryResult.Payload. It exists to move expensive per-event work (notably
+	// the internal→public event conversion + batch assembly, ~⅔ of the old serial
+	// reassembler's CPU) OFF the single ordered goroutine and onto the parallel
+	// pool, lifting the scaling ceiling (#142). The return type is `any` — not a
+	// concrete type — precisely so this internal package never names the root
+	// jetstream.Event/Batch types (root imports internal/client; the reverse would
+	// be an import cycle). The root package supplies the closure and type-asserts
+	// the payload back on the way out. When nil, the legacy []Event path is used
+	// unchanged (direct Download callers / unit tests). A nil return for a block
+	// means "nothing to emit" (empty/filtered), matching the len(events)>0 skip.
+	transform func(entryIdx int, evs []Event) any
 }
+
+// SetTransform installs the per-block worker-side transform (see Downloader.transform).
+// It is set separately from NewDownloader so the constructor signature stays
+// stable for the many direct callers/tests that do not need it.
+func (d *Downloader) SetTransform(fn func(entryIdx int, evs []Event) any) { d.transform = fn }
 
 // NewDownloader returns a Downloader using xc for getSegment/getBlock calls.
 // concurrency bounds in-flight downloads; values < 1 are clamped to 1.
@@ -41,181 +70,443 @@ func NewDownloader(xc *xrpc.Client, concurrency int, selector RowSelector) *Down
 	return &Downloader{xc: xc, concurrency: concurrency, selector: selector}
 }
 
-// EntryResult is the decoded output of one plan entry, tagged with its plan
-// position so the consumer can emit in order. Err is non-nil if the entry
-// could not be downloaded or decoded; Events is then nil.
+// EntryResult is one unit of decoded output, tagged with its plan position so
+// the consumer can emit in order. A single plan entry streams as MULTIPLE
+// EntryResults — one per decoded block — all carrying the same Index/Entry, so
+// the downloader never holds a whole segment's decoded events in memory at
+// once. Err is non-nil if a block could not be downloaded or decoded; Events is
+// then nil, and that entry stops streaming after the error (any earlier blocks
+// of the same entry were already emitted).
 type EntryResult struct {
 	Index  int // position in the plan's Entries slice
 	Entry  PlanEntry
 	Events []Event
 	Err    error
+	// Payload is the opaque output of the Downloader's transform (when one is
+	// set), already computed in parallel on the decode workers and forwarded here
+	// in seq order. nil when no transform is set (legacy []Event path) or for an
+	// error result. The caller that supplied the transform type-asserts it.
+	Payload any
 }
 
-// Download fetches and decodes every entry in plan order, invoking emit once
-// per entry in ascending plan order regardless of completion order. Downloads
-// run concurrently up to the configured bound; emission is serialized and
-// ordered. If emit returns false, Download stops early: it cancels in-flight
-// and pending downloads and returns without fetching the remaining entries.
-// Download returns the first context error encountered; per-entry
-// download/decode failures are reported through EntryResult.Err, not returned,
-// so one bad entry does not abort the whole backfill.
+// decodeJob is one raw block frame queued for the decode pool, tagged with the
+// dense global sequence the framer assigned (for in-order reassembly) and its
+// plan entry index (to build the EntryResult). err != nil is a fetch/read
+// failure the framer surfaces in order without decoding (frame is then nil).
+type decodeJob struct {
+	seq      uint64
+	entryIdx int
+	blockIdx int
+	frame    []byte
+	err      error
+}
+
+// decodeResult is a decoded block leaving the pool, keyed by the same global
+// seq for reassembly. emit is false for a wholly filtered/suppressed block (no
+// events, no error): the reassembler still consumes its seq to keep the space
+// dense but calls no emit. Exactly one of events/err is meaningful.
+type decodeResult struct {
+	seq      uint64
+	entryIdx int
+	events   []Event
+	err      error
+	emit     bool
+	payload  any // transform output (worker-computed); nil on the legacy path
+}
+
+// Download fetches and decodes every entry in plan order, invoking emit once per
+// decoded block in strict plan order (entry 0's blocks ascending, then entry
+// 1's, …) regardless of decode-completion order. It runs a three-stage pipeline:
+//
+//  1. a single PREFETCHER fetches whole-segment files a little ahead (bounded),
+//     overlapping the next segment's download with the current one's decode;
+//  2. a POOL of d.concurrency DECODE workers decompresses + CBOR-decodes block
+//     frames in parallel — the CPU-heavy work, fanned out across cores;
+//  3. a single REASSEMBLER emits decoded blocks in global-seq order, so output
+//     order is independent of which worker finished first.
+//
+// Parallel decode is the throughput lever (#142): a likes backfill is decode-
+// bound, and serial decode pinned it to ~1 core. d.concurrency now sizes the
+// decode pool — the parallelism knob.
+//
+// If emit returns false, Download stops early: it cancels in-flight and pending
+// work and returns nil (a clean stop, not an error). It returns the first
+// context error encountered; per-block download/decode failures are reported
+// through EntryResult.Err in order (not returned), so one bad block does not
+// abort the backfill — the good prefix of that entry's blocks is emitted, then
+// the error, then the entry stops and the next entry continues.
+//
+// Ordering invariant: the framer assigns a dense, monotonically increasing seq
+// while walking entries in plan order and blocks in ascending index, and the
+// reassembler emits strictly in that seq order; rows within a block keep their
+// stored order. Per the segment format this yields per-DID ingestion order
+// (docs/README.md §2 invariant #2, §3.1.1), the contract the client rests on.
+// Parallel decode only reorders completion, never emission.
+//
+// Memory bound: at most inFlightWindow(d.concurrency) block frames are live
+// between dispatch and emission (a global semaphore the reassembler drains in
+// order), so decoded events held at once are O(window × block-size), not
+// O(archive). Compressed whole-segment buffers are bounded to ~prefetchDepth
+// resident files (a separate, larger term tracked by #143), independent of plan
+// size. This is what keeps the full-archive backfill from the OOM in #142.
 func (d *Downloader) Download(ctx context.Context, entries []PlanEntry, emit func(EntryResult) bool) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	// Each slot is completed by a worker and consumed by the ordered emitter.
-	// ready[i] is closed when slot i is filled.
-	results := make([]EntryResult, len(entries))
-	ready := make([]chan struct{}, len(entries))
-	for i := range ready {
-		ready[i] = make(chan struct{})
-	}
-
-	// Derive a cancelable context so the emitter can stop in-flight and pending
-	// downloads when the consumer asks to stop early (emit returns false). We
-	// keep the caller's ctx separate for the final error check: an emit-driven
-	// cancel is a clean early stop (Download returns nil), not an error.
+	// One cancelable context drives the whole pipeline. An emit-driven early stop
+	// cancels it (clean stop, Download returns nil); a caller-ctx cancel is
+	// surfaced as the Download error via the final ctx.Err() check.
 	dlCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	g, gctx := errgroup.WithContext(dlCtx)
-	g.SetLimit(d.concurrency)
 
-	// Consumer: emit slots in order as they become ready. Runs concurrently
-	// with the producers so a slow early entry doesn't stall downloads of
-	// later entries (only their emission waits on order). Every ready[i] is
-	// guaranteed to be closed exactly once — by its worker, or by the
-	// producer's cancellation path for entries never launched — so the
-	// emitter waits on ready[i] directly. It must NOT also select on
-	// gctx.Done(): errgroup cancels gctx the instant Wait returns, which would
-	// race the emitter into dropping an already-ready final slot.
-	emitDone := make(chan struct{})
+	window := inFlightWindow(d.concurrency)
+	// jobs/results are bounded so neither stage races arbitrarily far ahead; the
+	// window semaphore is the real memory bound, these just smooth handoff.
+	jobs := make(chan decodeJob, d.concurrency)
+	results := make(chan decodeResult, d.concurrency)
+	sem := make(chan struct{}, window) // in-flight block tokens; freed at reassembly
+
+	// Stage 1+2 framing: the framer fetches (via the prefetcher) and slices block
+	// frames, assigning a dense global seq, and feeds the decode pool. It closes
+	// jobs when the plan is exhausted or the context is cancelled.
+	go d.runFramer(dlCtx, entries, jobs, sem)
+
+	// Stage 2: parallel decode pool. Each worker pulls jobs, decodes in parallel,
+	// and forwards results. After all workers exit, results is closed so the
+	// reassembler's range terminates.
+	var pool sync.WaitGroup
+	pool.Add(d.concurrency)
+	for range d.concurrency {
+		go func() {
+			defer pool.Done()
+			d.runDecodeWorker(dlCtx, entries, jobs, results, sem)
+		}()
+	}
 	go func() {
-		defer close(emitDone)
-		for i := range entries {
-			<-ready[i]
-			if !emit(results[i]) {
-				// Consumer asked to stop. Cancel pending/in-flight downloads
-				// so Download returns promptly instead of fetching the rest of
-				// the archive. The producer loop observes gctx.Err() and fills
-				// the remaining slots; nothing else reads them after we return.
-				cancel()
-				return
-			}
-		}
+		pool.Wait()
+		close(results)
 	}()
 
-	// Producers: launched from the calling goroutine (not a group member, so
-	// it never occupies a limiter slot — avoids a deadlock at low
-	// concurrency). g.Go blocks once `concurrency` downloads are in flight. A
-	// download/decode failure is recorded in the slot, not propagated as a
-	// group error; the group error is reserved for context cancellation.
-	for i := range entries {
-		if gctx.Err() != nil {
-			// Fill remaining slots so the emitter can drain and exit.
-			for j := i; j < len(entries); j++ {
-				results[j] = EntryResult{Index: j, Entry: entries[j], Err: gctx.Err()}
-				close(ready[j])
-			}
-			break
-		}
-		idx := i
-		entry := entries[i]
-		g.Go(func() error {
-			events, err := d.downloadEntry(gctx, entry)
-			results[idx] = EntryResult{Index: idx, Entry: entry, Events: events, Err: err}
-			close(ready[idx])
-			return nil
-		})
-	}
+	// Stage 3: in-order reassembly + emission, on this goroutine. Returns when
+	// results is closed (pipeline drained) — which is guaranteed: the framer
+	// always closes jobs, every worker drains jobs to close, and close(results)
+	// follows pool.Wait().
+	reassemble(entries, results, sem, emit, cancel)
 
-	_ = g.Wait()
-	<-emitDone
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	return nil
 }
 
-// downloadEntry fetches and decodes a single plan entry into ordered events.
-func (d *Downloader) downloadEntry(ctx context.Context, entry PlanEntry) ([]Event, error) {
-	switch entry.Mode {
-	case ModeWholeSegment:
-		return d.downloadWholeSegment(ctx, entry)
-	case ModeBlocks:
-		return d.downloadBlocks(ctx, entry)
-	default:
-		return nil, fmt.Errorf("jetstream: unknown download mode %v for segment %q", entry.Mode, entry.SegmentName)
+// inFlightWindow is the cap on block frames live between dispatch and emission.
+// It is the decoded-memory bound: ~window × one-block-decoded. Two per decode
+// worker lets each worker hold one block while one more waits, keeping the pool
+// fed without letting the reorder buffer (or decoded-events footprint) grow with
+// the archive. A small floor keeps a 1-worker pipeline from starving itself.
+func inFlightWindow(concurrency int) int {
+	return max(2*concurrency, 4)
+}
+
+// runFramer is stages 1+2: walk entries in plan order, fetch each (whole-segment
+// files prefetched a little ahead; block-mode ranges fetched inline), slice
+// block frames, and dispatch them to the decode pool with a dense ascending
+// global seq. It closes jobs on return. A per-entry fetch/read error is
+// dispatched as an in-order error job and that entry stops (the next continues).
+func (d *Downloader) runFramer(ctx context.Context, entries []PlanEntry, jobs chan<- decodeJob, sem chan struct{}) {
+	defer close(jobs)
+
+	prefetch := d.startPrefetch(ctx, entries)
+	var seq uint64
+
+	// dispatch hands one frame (or an in-order error) to the pool, first taking a
+	// window token so in-flight frames stay bounded. It unblocks on cancellation
+	// so the framer never wedges after an early stop. Returns false to stop.
+	dispatch := func(entryIdx, blockIdx int, frame []byte, ferr error) bool {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return false
+		}
+		select {
+		case jobs <- decodeJob{seq: seq, entryIdx: entryIdx, blockIdx: blockIdx, frame: frame, err: ferr}:
+			seq++
+			return true
+		case <-ctx.Done():
+			<-sem // release the token we took but could not enqueue
+			return false
+		}
+	}
+
+	for f := range prefetch {
+		if ctx.Err() != nil {
+			return
+		}
+		switch {
+		case f.err != nil:
+			// Fetch failed: surface one in-order error for this entry, skip it.
+			if !dispatch(f.idx, 0, nil, f.err) {
+				return
+			}
+		case f.entry.Mode == ModeWholeSegment:
+			if !d.frameWholeSegment(f.idx, f.entry, f.raw, dispatch) {
+				return
+			}
+		case f.entry.Mode == ModeBlocks:
+			if !d.frameBlocks(ctx, f.idx, f.entry, dispatch) {
+				return
+			}
+		default:
+			if !dispatch(f.idx, 0, nil, fmt.Errorf("jetstream: unknown download mode %v for segment %q", f.entry.Mode, f.entry.SegmentName)) {
+				return
+			}
+		}
 	}
 }
 
-func (d *Downloader) downloadWholeSegment(ctx context.Context, entry PlanEntry) ([]Event, error) {
-	raw, err := jetstream.JetstreamGetSegment(ctx, d.xc, entry.SegmentName)
-	if err != nil {
-		return nil, fmt.Errorf("jetstream: getSegment %q: %w", entry.SegmentName, err)
-	}
+// frameWholeSegment slices the prefetched sealed file into block frames and
+// dispatches them in ascending index. A header/read error is dispatched in order
+// and stops this entry. Returns false if the pipeline was cancelled.
+func (d *Downloader) frameWholeSegment(entryIdx int, entry PlanEntry, raw []byte, dispatch func(entryIdx, blockIdx int, frame []byte, ferr error) bool) bool {
 	r := bytes.NewReader(raw)
 	hdr, err := segment.ReadSealedHeader(r)
 	if err != nil {
-		return nil, fmt.Errorf("jetstream: parse segment header %q: %w", entry.SegmentName, err)
+		return dispatch(entryIdx, 0, nil, fmt.Errorf("jetstream: parse segment header %q: %w", entry.SegmentName, err))
 	}
-	var events []Event
 	for idx := 0; idx < int(hdr.BlockCount); idx++ {
 		frame, err := segment.ReadBlockFrame(r, hdr, idx)
 		if err != nil {
-			return nil, fmt.Errorf("jetstream: read block %d of %q: %w", idx, entry.SegmentName, err)
+			return dispatch(entryIdx, idx, nil, fmt.Errorf("jetstream: read block %d of %q: %w", idx, entry.SegmentName, err))
 		}
-		blockEvents, err := d.decodeFrame(frame, entry.SegmentName, idx)
-		if err != nil {
-			return nil, err
+		if !dispatch(entryIdx, idx, frame, nil) {
+			return false
 		}
-		events = append(events, blockEvents...)
 	}
-	return events, nil
+	return true
 }
 
-func (d *Downloader) downloadBlocks(ctx context.Context, entry PlanEntry) ([]Event, error) {
-	var events []Event
+// frameBlocks fetches the entry's listed block ranges via getBlock and dispatches
+// each frame in ascending block index. getBlock failure is dispatched in order
+// and stops this entry. Returns false if the pipeline was cancelled.
+func (d *Downloader) frameBlocks(ctx context.Context, entryIdx int, entry PlanEntry, dispatch func(entryIdx, blockIdx int, frame []byte, ferr error) bool) bool {
 	for _, br := range entry.Blocks {
 		// idx is widened to uint64 so a range ending at the uint32 max
-		// (math.MaxUint32 passes the planner's `> MaxUint32` validation) does
-		// not wrap back to 0 on the final increment and loop forever. The body
-		// only runs for idx <= br.Last <= MaxUint32, so int64/int narrowing is safe.
+		// (math.MaxUint32 passes the planner's `> MaxUint32` validation) does not
+		// wrap back to 0 on the final increment and loop forever. The body only
+		// runs for idx <= br.Last <= MaxUint32, so int64/int narrowing is safe.
 		for idx := uint64(br.First); idx <= uint64(br.Last); idx++ {
 			frame, err := jetstream.JetstreamGetBlock(ctx, d.xc, int64(idx), entry.SegmentName)
 			if err != nil {
-				return nil, fmt.Errorf("jetstream: getBlock %d of %q: %w", idx, entry.SegmentName, err)
+				return dispatch(entryIdx, int(idx), nil, fmt.Errorf("jetstream: getBlock %d of %q: %w", idx, entry.SegmentName, err))
 			}
-			blockEvents, err := d.decodeFrame(frame, entry.SegmentName, int(idx))
-			if err != nil {
-				return nil, err
+			if !dispatch(entryIdx, int(idx), frame, nil) {
+				return false
 			}
-			events = append(events, blockEvents...)
 		}
 	}
-	return events, nil
+	return true
+}
+
+// fetchedEntry is one whole-segment file fetched ahead of framing (raw nil for
+// non-whole-segment entries, which the framer fetches itself), or a fetch error.
+type fetchedEntry struct {
+	idx   int
+	entry PlanEntry
+	raw   []byte
+	err   error
+}
+
+// startPrefetch launches a single goroutine that fetches whole-segment files in
+// plan order, a little ahead of the framer, so the next segment's download
+// overlaps the current one's decode. The depth-bounded channel caps how far
+// ahead it runs (and thus how many ~280 MB buffers are resident). Block-mode
+// entries pass through without fetching (the framer getBlocks them inline — the
+// sparse path). It closes the channel on completion or cancellation.
+func (d *Downloader) startPrefetch(ctx context.Context, entries []PlanEntry) <-chan fetchedEntry {
+	out := make(chan fetchedEntry, prefetchDepth)
+	go func() {
+		defer close(out)
+		for i := range entries {
+			if ctx.Err() != nil {
+				return
+			}
+			f := fetchedEntry{idx: i, entry: entries[i]}
+			if entries[i].Mode == ModeWholeSegment {
+				f.raw, f.err = jetstream.JetstreamGetSegment(ctx, d.xc, entries[i].SegmentName)
+				if f.err != nil {
+					f.err = fmt.Errorf("jetstream: getSegment %q: %w", entries[i].SegmentName, f.err)
+				}
+			}
+			select {
+			case out <- f:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// runDecodeWorker is one decode-pool worker: pull jobs, decode in parallel,
+// forward results keyed by seq. A fetch/read error job (frame nil, err set) is
+// forwarded without decoding so the reassembler can surface it in order. On
+// cancellation the worker stops pulling; it does not need to free window tokens
+// because the framer has also stopped acquiring them (no one is waiting).
+func (d *Downloader) runDecodeWorker(ctx context.Context, entries []PlanEntry, jobs <-chan decodeJob, results chan<- decodeResult, sem chan struct{}) {
+	_ = sem // window tokens are freed by the reassembler, in seq order
+	for j := range jobs {
+		res := decodeResult{seq: j.seq, entryIdx: j.entryIdx}
+		switch {
+		case j.err != nil:
+			res.err = j.err
+			res.emit = true
+		default:
+			events, err := d.decodeFrame(j.frame, entries[j.entryIdx].SegmentName, j.blockIdx)
+			switch {
+			case err != nil:
+				res.err = err
+				res.emit = true
+			case d.transform != nil:
+				// Fast path: run the caller's per-block transform HERE, in parallel,
+				// so the expensive per-event work is off the serial reassembler.
+				// The transform is caller-supplied (root) code running on a pool
+				// goroutine; if it panics, a dead worker would leave pool.Wait ->
+				// close(results) hung and wedge the whole Download. Convert a panic
+				// into an in-order recoverable error instead (crash-visible to the
+				// consumer, pipeline still drains) — never a silent hang.
+				res.payload, res.err = d.runTransform(j.entryIdx, events)
+				res.emit = res.payload != nil || res.err != nil
+			default:
+				res.events = events
+				res.emit = len(events) > 0 // skip wholly filtered/suppressed blocks
+			}
+		}
+		select {
+		case results <- res:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// runTransform invokes d.transform on a decoded block, recovering a panic into a
+// returned error. The transform runs caller-supplied (root) code on a decode-pool
+// goroutine; a panic that killed the worker would hang pool.Wait → close(results)
+// and wedge Download forever. Converting it to an in-order recoverable error keeps
+// the pipeline draining and surfaces the failure to the consumer (crash-loud, not
+// a silent hang). payload is nil for an empty/filtered block (nothing to emit).
+func (d *Downloader) runTransform(entryIdx int, evs []Event) (payload any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			payload = nil
+			err = fmt.Errorf("jetstream: backfill transform panicked: %v", r)
+		}
+	}()
+	return d.transform(entryIdx, evs), nil
+}
+
+// reassemble is stage 3: read decoded blocks (arriving in any order), emit them
+// strictly in global-seq order, and free one in-flight window token per block so
+// the framer can dispatch more. It is the SOLE caller of emit, so emission is
+// serialized and ordered. When emit returns false it cancels the pipeline and
+// switches to drain mode: it keeps reading results until close (so decode workers
+// never block on a full results channel) but emits nothing further.
+func reassemble(entries []PlanEntry, results <-chan decodeResult, sem chan struct{}, emit func(EntryResult) bool, cancel context.CancelFunc) {
+	pending := make(map[uint64]decodeResult)
+	var next uint64
+	stopped := false
+	for r := range results {
+		if stopped {
+			continue // drain remaining results without emitting
+		}
+		pending[r.seq] = r
+		// Flush every contiguous result from next upward that has arrived.
+		for {
+			nr, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			next++
+			<-sem // free this block's in-flight token
+			if !nr.emit {
+				continue // wholly filtered/suppressed block: consume seq, emit nothing
+			}
+			res := EntryResult{Index: nr.entryIdx, Entry: entries[nr.entryIdx], Events: nr.events, Err: nr.err, Payload: nr.payload}
+			if !emit(res) {
+				stopped = true
+				cancel() // stop the framer + prefetch + decode workers
+				break
+			}
+		}
+	}
 }
 
 // decodeFrame decompresses one block frame, applies the row selector before
 // decode (so filtered/suppressed rows are never materialized), and converts
 // the survivors to events.
+//
+// Commit rows dominate the archive (e.g. app.bsky.feed.like), and each commit's
+// *Commit was one heap allocation. To cut that, the surviving commit rows of a
+// block draw their Commit structs from a single per-block []Commit slab and the
+// events reference &slab[i] — collapsing N allocations to one per block. The
+// slab is sized exactly to the kept-commit count and NEVER appended to, so the
+// &slab[i] pointers stay valid (a realloc would dangle them). It is a fresh
+// allocation per block, dropped to GC with the batch; it is never pooled/reused,
+// so a consumer still holding an earlier batch can never observe a mutation.
 func (d *Downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]Event, error) {
 	rows, err := segment.DecodeBlockFrame(frame)
 	if err != nil {
 		return nil, fmt.Errorf("jetstream: decode block %d of %q: %w", blockIdx, segName, err)
 	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	// One Commit slab + one Event slab for the whole block, instead of a separate
+	// *Commit heap allocation per commit row. Each surviving commit takes the next
+	// slab slot (&commits[ci]); the events reference those pointers. The slab is
+	// sized to len(rows) and NEVER appended to, so &commits[ci] never dangles (a
+	// realloc would). It is sized to the row count rather than the surviving-
+	// commit count to keep this a single pass that runs the selector exactly once;
+	// when a collection/DID filter drops rows, the unused tail slots are zeroed
+	// Commits that are never referenced and are dropped to GC with the block. The
+	// slab is a fresh per-block allocation, never pooled, so a consumer still
+	// holding an earlier batch can never observe a mutation.
+	commits := make([]Commit, len(rows))
 	out := make([]Event, 0, len(rows))
+	ci := 0
 	for i := range rows {
 		if d.selector != nil {
 			if keep, _ := d.selector.Keep(&rows[i]); !keep {
 				continue
 			}
 		}
-		ev, err := decodeSegmentEvent(&rows[i])
+		var commit *Commit
+		if isCommitKind(rows[i].Kind) {
+			commit = &commits[ci]
+			ci++
+		}
+		ev, err := decodeSegmentEventInto(&rows[i], commit)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, ev)
 	}
+	if len(out) == 0 {
+		return nil, nil
+	}
 	return out, nil
+}
+
+// isCommitKind reports whether a segment row kind decodes to a KindCommit event
+// (and therefore consumes a Commit slab slot in decodeFrame).
+func isCommitKind(k segment.Kind) bool {
+	switch k {
+	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
+		return true
+	default:
+		return false
+	}
 }
