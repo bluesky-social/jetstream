@@ -91,16 +91,27 @@ func decodeCommit(ev *segment.Event) (*Commit, error) {
 // encoding/json's number handling), []byte becomes {"$bytes": base64-raw}, and
 // a CID link becomes {"$link": cid-string} — the ATProto JSON sentinels.
 //
-// We decode with cbor.Unmarshal (slice-based) rather than a streaming
-// cbor.NewDecoder(bytes.NewReader(...)).ReadValue(): the payload is already a
-// []byte, and the slice decoder is ~1.9x faster with ~40% fewer allocations
-// (no io.Reader indirection, no per-string readN allocation, zero-copy text).
-// It also enforces the single-item / no-trailing-bytes contract internally
-// (a trailing byte means the frame is corrupt and would not match the
-// RecordCBOR/CID computed over the full payload), so no separate guard is
-// needed here.
+// We decode with cbor.UnmarshalNoCopy (slice-based, zero-copy) rather than a
+// streaming cbor.NewDecoder(bytes.NewReader(...)).ReadValue(): the payload is
+// already a []byte, so the slice decoder avoids io.Reader indirection and the
+// per-string readN allocation, and NoCopy further returns string/[]byte values
+// that ALIAS payload instead of copying them — roughly halving decode
+// allocations on these string-heavy records (#142). It also enforces the
+// single-item / no-trailing-bytes contract internally (a trailing byte means the
+// frame is corrupt and would not match the RecordCBOR/CID computed over the full
+// payload), so no separate guard is needed here.
+//
+// NoCopy aliasing safety: payload is ev.Payload, which itself aliases the
+// segment block's decompressed buffer and is contractually read-only (see
+// segment/event.go and the decodeBlock buffer-aliasing contract) — it is never
+// mutated after decode. The returned Record map's string values therefore point
+// into that block buffer, which stays alive exactly as long as the decoded Event
+// that carries the map (the Event already pins the buffer via its own aliased
+// DID/Collection/Rkey/Rev string columns). So the map never outlives its backing
+// bytes, satisfying the UnmarshalNoCopy contract. RecordCBOR is separately cloned
+// in decodeCommit, so callers retaining raw bytes are unaffected.
 func decodeRecordMap(payload []byte) (map[string]any, error) {
-	val, err := cbor.Unmarshal(payload)
+	val, err := cbor.UnmarshalNoCopy(payload)
 	if err != nil {
 		return nil, fmt.Errorf("cbor decode: %w", err)
 	}
