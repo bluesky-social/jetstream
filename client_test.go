@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -61,8 +62,31 @@ func TestOptionsRejectNonPositive(t *testing.T) {
 	WithBatchSize(0)(&cfg)
 	WithBatchSize(-5)(&cfg)
 	WithDownloadConcurrency(0)(&cfg)
+	WithDownloadConcurrency(-3)(&cfg)
 	require.Equal(t, defaultBatchSize, cfg.batchSize, "non-positive batch size must be ignored")
-	require.Equal(t, defaultDownloadConc, cfg.downloadConc, "non-positive concurrency must be ignored")
+	require.Equal(t, defaultDownloadConc(), cfg.downloadConc, "non-positive concurrency must be ignored (auto-sized default retained)")
+}
+
+// Not parallel: mutates the process-global GOMAXPROCS.
+//
+//nolint:paralleltest // mutates process-global GOMAXPROCS
+func TestDefaultDownloadConcClamps(t *testing.T) {
+	// The auto-sized default tracks GOMAXPROCS but is clamped to a safe band so a
+	// tiny box does not go near-serial and a 256-core box does not spawn 256
+	// in-flight downloads.
+	got := defaultDownloadConc()
+	require.GreaterOrEqual(t, got, minAutoDownloadConc, "must not drop below the floor on a small machine")
+	require.LessOrEqual(t, got, maxAutoDownloadConc, "must not exceed the cap on a many-core machine")
+
+	// Drive GOMAXPROCS to the extremes and confirm the clamp, restoring it after.
+	prev := runtime.GOMAXPROCS(0)
+	t.Cleanup(func() { runtime.GOMAXPROCS(prev) })
+
+	runtime.GOMAXPROCS(1)
+	require.Equal(t, minAutoDownloadConc, defaultDownloadConc(), "1 core clamps up to the floor")
+
+	runtime.GOMAXPROCS(maxAutoDownloadConc * 4)
+	require.Equal(t, maxAutoDownloadConc, defaultDownloadConc(), "many cores clamp down to the cap")
 }
 
 func TestWithMaxDownloadAttempts(t *testing.T) {

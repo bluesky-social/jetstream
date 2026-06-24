@@ -58,8 +58,8 @@ func subscribeCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:  "download-concurrency",
-				Usage: "Bounded concurrency for sealed segment/block downloads",
-				Value: 8,
+				Usage: "Bounded concurrency for sealed segment/block downloads (0 = auto-size from CPU count)",
+				Value: 0,
 			},
 			&cli.StringFlag{
 				Name:  "live-buffer-file",
@@ -120,7 +120,12 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 
 	opts := []jetstream.Option{
 		jetstream.WithBatchSize(cmd.Int("batch-size")),
-		jetstream.WithDownloadConcurrency(cmd.Int("download-concurrency")),
+	}
+	// --download-concurrency=0 (the default) means "let the library auto-size
+	// from the CPU count"; only forward an explicit positive override so the
+	// library default applies otherwise.
+	if dc := cmd.Int("download-concurrency"); dc > 0 {
+		opts = append(opts, jetstream.WithDownloadConcurrency(dc))
 	}
 	if c := cmd.StringSlice("collection"); len(c) > 0 {
 		opts = append(opts, jetstream.WithCollections(c))
