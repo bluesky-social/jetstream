@@ -242,26 +242,14 @@ document.addEventListener("input", function (event) {
     </section>
   </div>
 
-  <div class="grid2">
-    <section>
-      <h2>Live ingest</h2>
-      <dl>
-        <dt>Upstream cursor</dt><dd>{{if eq .Live.UpstreamCursor 0}}not yet started{{else}}{{humanInt64 .Live.UpstreamCursor}}{{end}}</dd>
-        <dt>Sequence allocated</dt><dd>{{humanInt .Live.NextSeq}} events</dd>
-        {{if gt .Live.BootstrapSeq 0}}<dt>Bootstrap-time live seq</dt><dd>{{humanInt .Live.BootstrapSeq}}</dd>{{end}}
-      </dl>
-    </section>
-
-    <section>
-      <h2>Metadata store</h2>
-      <dl>
-        <dt>On disk</dt><dd>{{humanBytes .Pebble.DiskBytes}}</dd>
-        {{range $prefix, $count := .Pebble.KeyspaceCounts}}
-        <dt><code>{{$prefix}}</code></dt><dd>{{humanInt $count}}</dd>
-        {{end}}
-      </dl>
-    </section>
-  </div>
+  <section>
+    <h2>Live ingest</h2>
+    <dl>
+      <dt>Upstream cursor</dt><dd>{{if eq .Live.UpstreamCursor 0}}not yet started{{else}}{{humanInt64 .Live.UpstreamCursor}}{{end}}</dd>
+      <dt>Sequence allocated</dt><dd>{{humanInt .Live.NextSeq}} events</dd>
+      {{if gt .Live.BootstrapSeq 0}}<dt>Bootstrap-time live seq</dt><dd>{{humanInt .Live.BootstrapSeq}}</dd>{{end}}
+    </dl>
+  </section>
 
   <section>
     <h2>Network</h2>

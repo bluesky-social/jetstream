@@ -191,6 +191,7 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "5 repos")
 	require.Contains(t, body, "Duration")
 	require.Contains(t, body, "3d 7h")
+	require.NotContains(t, body, "Metadata store")
 	require.NotContains(t, body, "Latest segment")
 	require.NotContains(t, body, "Cursor lookback")
 	require.Contains(t, body, "12,345")       // Network event count via humanInt
