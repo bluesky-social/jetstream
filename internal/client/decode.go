@@ -2,7 +2,7 @@ package client
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
 
 	"github.com/bluesky-social/jetstream/segment"
@@ -81,6 +81,15 @@ func decodeCommit(ev *segment.Event) (*Commit, error) {
 
 // decodeRecordMap decodes DAG-CBOR record bytes into a generic JSON-shaped
 // object: the same shape callers see in the "record" field on /subscribe.
+//
+// It converts the CBOR data model directly into the JSON-shaped value, rather
+// than round-tripping through JSON text (cbor.ToJSON -> json.Unmarshal). The
+// round-trip dominated backfill decode CPU (see #142): marshalling the decoded
+// value to JSON bytes and reparsing them was ~half of per-record decode cost
+// for no benefit, since ReadValue already produced the structured value. The
+// output is deep-equal to the old path: numbers are float64 (matching
+// encoding/json's number handling), []byte becomes {"$bytes": base64-raw}, and
+// a CID link becomes {"$link": cid-string} — the ATProto JSON sentinels.
 func decodeRecordMap(payload []byte) (map[string]any, error) {
 	r := bytes.NewReader(payload)
 	val, err := cbor.NewDecoder(r).ReadValue()
@@ -93,21 +102,75 @@ func decodeRecordMap(payload []byte) (map[string]any, error) {
 	if r.Len() != 0 {
 		return nil, fmt.Errorf("cbor decode: %d trailing bytes after record", r.Len())
 	}
-	jsonBytes, err := cbor.ToJSON(val)
-	if err != nil {
-		return nil, fmt.Errorf("cbor to json: %w", err)
+	// A valid atproto record is always a CBOR map, so require the top-level value
+	// to be one and fail closed otherwise: a malformed payload must not surface as
+	// a non-delete commit with a nil/garbage Record. For a map, the converted
+	// output is identical to the canonical cbor.ToJSON shape the server emits on
+	// /subscribe — that semantic equivalence (not bug-for-bug parity with the old
+	// client code) is the contract here.
+	//
+	// This is intentionally stricter than the prior JSON round-trip, which
+	// inconsistently accepted a top-level byte string or CID (cbor.ToJSON wraps
+	// them as the JSON objects {"$bytes":..}/{"$link":..}) while rejecting a
+	// top-level scalar/array/null. Neither is a valid record; rejecting all
+	// non-map top-level payloads is the deliberate, consistent fail-closed choice.
+	m, ok := val.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("cbor decode: record is not an object")
 	}
-	var m map[string]any
-	if err := json.Unmarshal(jsonBytes, &m); err != nil {
-		return nil, fmt.Errorf("json unmarshal record: %w", err)
+	return jsonShapedMap(m), nil
+}
+
+// jsonShapedValue converts one cbor.ReadValue result into its ATProto
+// JSON-shaped form, recursively. The mapping mirrors cbor.ToJSON followed by
+// encoding/json round-tripping exactly:
+//   - int64/float64 -> float64 (encoding/json represents all JSON numbers as
+//     float64 when decoding into any; the old path went through JSON text, so a
+//     CBOR integer surfaced as a float64 — preserved here to stay byte-for-byte
+//     compatible with existing consumers).
+//   - []byte        -> {"$bytes": base64.RawStdEncoding}
+//   - cbor.CID      -> {"$link": cid.String()}
+//   - []any / map   -> converted element-wise.
+//   - string/bool/nil -> unchanged.
+func jsonShapedValue(v any) any {
+	switch val := v.(type) {
+	case nil:
+		return nil
+	case bool:
+		return val
+	case string:
+		return val
+	case int64:
+		return float64(val)
+	case float64:
+		return val
+	case []byte:
+		return map[string]any{"$bytes": base64.RawStdEncoding.EncodeToString(val)}
+	case cbor.CID:
+		return map[string]any{"$link": val.String()}
+	case []any:
+		out := make([]any, len(val))
+		for i := range val {
+			out[i] = jsonShapedValue(val[i])
+		}
+		return out
+	case map[string]any:
+		return jsonShapedMap(val)
+	default:
+		// ReadValue only ever returns the cases above; a new kind would be a
+		// library change. Return as-is rather than dropping data silently.
+		return val
 	}
-	// JSON null unmarshals into a map as a nil map with no error. A commit
-	// record must be an object; reject null/non-object so a malformed payload
-	// cannot surface as a non-delete commit with a nil Record.
-	if m == nil {
-		return nil, fmt.Errorf("json unmarshal record: record is not an object")
+}
+
+// jsonShapedMap converts a CBOR map in place into its JSON-shaped form. The map
+// from ReadValue is freshly allocated and not retained elsewhere, so rewriting
+// its values avoids a second map allocation per object.
+func jsonShapedMap(m map[string]any) map[string]any {
+	for k, v := range m {
+		m[k] = jsonShapedValue(v)
 	}
-	return m, nil
+	return m
 }
 
 func commitOperation(k segment.Kind) Operation {
