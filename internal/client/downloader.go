@@ -39,7 +39,26 @@ type Downloader struct {
 	xc          *xrpc.Client
 	concurrency int
 	selector    RowSelector
+	// transform, when non-nil, runs ON the decode-pool workers (in parallel)
+	// immediately after a block is decoded, turning that block's []Event into an
+	// opaque, ready-to-deliver payload that the reassembler forwards in seq order
+	// as EntryResult.Payload. It exists to move expensive per-event work (notably
+	// the internal→public event conversion + batch assembly, ~⅔ of the old serial
+	// reassembler's CPU) OFF the single ordered goroutine and onto the parallel
+	// pool, lifting the scaling ceiling (#142). The return type is `any` — not a
+	// concrete type — precisely so this internal package never names the root
+	// jetstream.Event/Batch types (root imports internal/client; the reverse would
+	// be an import cycle). The root package supplies the closure and type-asserts
+	// the payload back on the way out. When nil, the legacy []Event path is used
+	// unchanged (direct Download callers / unit tests). A nil return for a block
+	// means "nothing to emit" (empty/filtered), matching the len(events)>0 skip.
+	transform func(entryIdx int, evs []Event) any
 }
+
+// SetTransform installs the per-block worker-side transform (see Downloader.transform).
+// It is set separately from NewDownloader so the constructor signature stays
+// stable for the many direct callers/tests that do not need it.
+func (d *Downloader) SetTransform(fn func(entryIdx int, evs []Event) any) { d.transform = fn }
 
 // NewDownloader returns a Downloader using xc for getSegment/getBlock calls.
 // concurrency bounds in-flight downloads; values < 1 are clamped to 1.
@@ -63,6 +82,11 @@ type EntryResult struct {
 	Entry  PlanEntry
 	Events []Event
 	Err    error
+	// Payload is the opaque output of the Downloader's transform (when one is
+	// set), already computed in parallel on the decode workers and forwarded here
+	// in seq order. nil when no transform is set (legacy []Event path) or for an
+	// error result. The caller that supplied the transform type-asserts it.
+	Payload any
 }
 
 // decodeJob is one raw block frame queued for the decode pool, tagged with the
@@ -87,6 +111,7 @@ type decodeResult struct {
 	events   []Event
 	err      error
 	emit     bool
+	payload  any // transform output (worker-computed); nil on the legacy path
 }
 
 // Download fetches and decodes every entry in plan order, invoking emit once per
@@ -338,10 +363,21 @@ func (d *Downloader) runDecodeWorker(ctx context.Context, entries []PlanEntry, j
 			res.emit = true
 		default:
 			events, err := d.decodeFrame(j.frame, entries[j.entryIdx].SegmentName, j.blockIdx)
-			if err != nil {
+			switch {
+			case err != nil:
 				res.err = err
 				res.emit = true
-			} else {
+			case d.transform != nil:
+				// Fast path: run the caller's per-block transform HERE, in parallel,
+				// so the expensive per-event work is off the serial reassembler.
+				// The transform is caller-supplied (root) code running on a pool
+				// goroutine; if it panics, a dead worker would leave pool.Wait ->
+				// close(results) hung and wedge the whole Download. Convert a panic
+				// into an in-order recoverable error instead (crash-visible to the
+				// consumer, pipeline still drains) — never a silent hang.
+				res.payload, res.err = d.runTransform(j.entryIdx, events)
+				res.emit = res.payload != nil || res.err != nil
+			default:
 				res.events = events
 				res.emit = len(events) > 0 // skip wholly filtered/suppressed blocks
 			}
@@ -352,6 +388,22 @@ func (d *Downloader) runDecodeWorker(ctx context.Context, entries []PlanEntry, j
 			return
 		}
 	}
+}
+
+// runTransform invokes d.transform on a decoded block, recovering a panic into a
+// returned error. The transform runs caller-supplied (root) code on a decode-pool
+// goroutine; a panic that killed the worker would hang pool.Wait → close(results)
+// and wedge Download forever. Converting it to an in-order recoverable error keeps
+// the pipeline draining and surfaces the failure to the consumer (crash-loud, not
+// a silent hang). payload is nil for an empty/filtered block (nothing to emit).
+func (d *Downloader) runTransform(entryIdx int, evs []Event) (payload any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			payload = nil
+			err = fmt.Errorf("jetstream: backfill transform panicked: %v", r)
+		}
+	}()
+	return d.transform(entryIdx, evs), nil
 }
 
 // reassemble is stage 3: read decoded blocks (arriving in any order), emit them
@@ -381,7 +433,7 @@ func reassemble(entries []PlanEntry, results <-chan decodeResult, sem chan struc
 			if !nr.emit {
 				continue // wholly filtered/suppressed block: consume seq, emit nothing
 			}
-			res := EntryResult{Index: nr.entryIdx, Entry: entries[nr.entryIdx], Events: nr.events, Err: nr.err}
+			res := EntryResult{Index: nr.entryIdx, Entry: entries[nr.entryIdx], Events: nr.events, Err: nr.err, Payload: nr.payload}
 			if !emit(res) {
 				stopped = true
 				cancel() // stop the framer + prefetch + decode workers

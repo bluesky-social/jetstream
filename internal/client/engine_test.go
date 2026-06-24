@@ -132,24 +132,42 @@ func (h *engineHarness) runUntilDone(t *testing.T, cfg Config, what string, done
 	)
 	eng := NewEngine(cfg)
 	finished := make(chan struct{})
+	emitBatch := func(batch []Event) bool {
+		mu.Lock()
+		events = append(events, batch...)
+		for _, ev := range batch {
+			seen[ev.Seq] = true
+		}
+		reached := done(seen)
+		mu.Unlock()
+		if reached {
+			cancel()
+			return false
+		}
+		return true
+	}
 	go func() {
 		defer close(finished)
-		eng.Run(ctx,
-			func(batch []Event) bool {
-				mu.Lock()
-				events = append(events, batch...)
-				for _, ev := range batch {
-					seen[ev.Seq] = true
-				}
-				reached := done(seen)
-				mu.Unlock()
-				if reached {
-					cancel()
-					return false
-				}
-				return true
-			},
+		// Drive the BACKFILL FAST PATH (RunWithBackfill) so the existing
+		// backfill/cutover/ordering/suppression tests exercise the same code path
+		// production uses: a per-block transform that boxes the block's []Event,
+		// and an Emit that unboxes and feeds the same emitBatch. The live path is
+		// unchanged. Without this the fast path would ship with only root-level
+		// coverage; routing the engine tests through it closes that gap.
+		eng.RunWithBackfill(ctx, emitBatch,
 			func(error) bool { return true },
+			BackfillSink{
+				Transform: func(_ int, evs []Event) any {
+					if len(evs) == 0 {
+						return nil
+					}
+					return append([]Event(nil), evs...)
+				},
+				Emit: func(res EntryResult) bool {
+					batch, _ := res.Payload.([]Event)
+					return emitBatch(batch)
+				},
+			},
 		)
 	}()
 	select {
@@ -347,6 +365,106 @@ func TestEngineBackfillThenLiveOrdering(t *testing.T) {
 
 	events := h.runUntil(t, h.cfg(), 6)
 	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, uniqueSeqs(events))
+}
+
+// TestEngineFastPathBlockAlignedBatches verifies the fast-path batch-shape
+// contract (#142): when the production-style transform chunks each decoded block
+// by BatchSize, batches are block-aligned — every batch is non-empty and
+// <= BatchSize, at most one undersized batch per block, and the per-batch
+// LastCursor (max seq) is monotonic non-decreasing across the backfill. This
+// mirrors what realEngine.run does, asserted at the batch boundary (the engine
+// harness flattens batches and would not catch a shape regression).
+func TestEngineFastPathBlockAlignedBatches(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	// 3 segments × 6 events (3 blocks of 2 each at the archive's MaxEventsPerBlock=2).
+	const nSeg = 3
+	for s := range nSeg {
+		var sealed []segment.Event
+		for i := range 6 {
+			seq := uint64(s*100 + i + 1)
+			sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+		}
+		h.as.addSegment(t, segName(s), sealed)
+		h.planEntry = append(h.planEntry, planSeg{name: segName(s), index: uint32(s), minSeq: uint64(s*100 + 1), maxSeq: uint64(s*100 + 6)})
+	}
+	h.planned = 0 // no live cutover needed for this shape test
+	h.installHandlers()
+
+	const batchSize = 4
+	cfg := h.cfg()
+	cfg.BatchSize = batchSize
+	cfg.BackfillOnly = true // pure backfill: just exercise the batch shaping
+
+	eng := NewEngine(cfg)
+	var batchSizes []int
+	var lastCursors []uint64
+	var lastCursor uint64
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Production-style transform: chunk each block's events by BatchSize into
+	// "batches", carried as [][]Event so the test sees batch boundaries.
+	eng.RunWithBackfill(ctx,
+		func([]Event) bool { return true }, // legacy emitBatch unused on the fast path
+		func(error) bool { return true },
+		BackfillSink{
+			Transform: func(_ int, evs []Event) any {
+				if len(evs) == 0 {
+					return nil
+				}
+				var batches [][]Event
+				for i := 0; i < len(evs); i += batchSize {
+					end := min(i+batchSize, len(evs))
+					batches = append(batches, append([]Event(nil), evs[i:end]...))
+				}
+				return batches
+			},
+			Emit: func(res EntryResult) bool {
+				batches, _ := res.Payload.([][]Event)
+				for _, b := range batches {
+					require.NotEmpty(t, b, "no empty batch may be emitted")
+					require.LessOrEqual(t, len(b), batchSize, "batch must not exceed BatchSize")
+					batchSizes = append(batchSizes, len(b))
+					var mx uint64
+					for _, ev := range b {
+						if ev.Seq > mx {
+							mx = ev.Seq
+						}
+					}
+					require.GreaterOrEqual(t, mx, lastCursor, "LastCursor must be monotonic non-decreasing")
+					lastCursor = mx
+					lastCursors = append(lastCursors, mx)
+				}
+				return true
+			},
+		},
+	)
+
+	// 18 events total. Each block is 2 events (< batchSize 4), so block-alignment
+	// yields one 2-event batch per block = 9 batches, all size 2.
+	require.Equal(t, nSeg*6, sumInts(batchSizes), "every event delivered exactly once")
+	for _, sz := range batchSizes {
+		require.LessOrEqual(t, sz, batchSize)
+	}
+	require.True(t, isNonDecreasing(lastCursors), "per-batch LastCursors must be monotonic: %v", lastCursors)
+}
+
+func sumInts(xs []int) int {
+	s := 0
+	for _, x := range xs {
+		s += x
+	}
+	return s
+}
+
+func isNonDecreasing(xs []uint64) bool {
+	for i := 1; i < len(xs); i++ {
+		if xs[i] < xs[i-1] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestEngineLiveDeleteSuppressesBackfillCreate verifies the eager combined-set

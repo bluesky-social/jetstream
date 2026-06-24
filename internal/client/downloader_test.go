@@ -193,6 +193,223 @@ func collectOrdered(t *testing.T, d *Downloader, entries []PlanEntry) []Event {
 	return all
 }
 
+// TestDownloadTransformOrdering pins the fast-path (worker-side transform)
+// ordering contract: when a transform is set, each block's payload is computed
+// in parallel on the decode workers, but the reassembler must still deliver
+// payloads in strict ascending seq order. The transform boxes the block's first
+// event Seq as a sentinel; we assert the delivered sentinels are strictly
+// increasing across a multi-block, multi-entry plan at high concurrency. This is
+// the only test exercising the worker-box → reassembler-forward path directly.
+func TestDownloadTransformOrdering(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	const nSeg = 30
+	const perSeg = 10 // 5 blocks/segment at MaxEventsPerBlock=2
+	var entries []PlanEntry
+	for s := range nSeg {
+		var events []segment.Event
+		for i := range perSeg {
+			seq := uint64(s*1000 + i + 1)
+			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
+		}
+		as.addSegment(t, segName(s), events)
+		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+	}
+
+	d := as.downloader(16)
+	// Transform boxes the block's first-event seq. Because the framer assigns
+	// dense ascending seq in plan order and blocks ascend within a segment, the
+	// per-block first-seqs are themselves strictly increasing in emit order.
+	d.SetTransform(func(_ int, evs []Event) any {
+		if len(evs) == 0 {
+			return nil
+		}
+		return evs[0].Seq
+	})
+
+	var last int64 = -1
+	var count int
+	err := d.Download(context.Background(), entries, func(res EntryResult) bool {
+		require.NoError(t, res.Err)
+		require.Nil(t, res.Events, "fast path carries Payload, not Events")
+		first, ok := res.Payload.(uint64)
+		require.True(t, ok, "payload must be the boxed first-seq")
+		require.Greater(t, int64(first), last, "payloads must arrive in strictly ascending seq order")
+		last = int64(first)
+		count++
+		return true
+	})
+	require.NoError(t, err)
+	require.Equal(t, nSeg*(perSeg/2), count, "one payload per non-empty block")
+}
+
+// TestDownloadTransformPanicNoHang guards FIX #1: a transform that panics on one
+// block must NOT wedge Download (a dead worker would hang pool.Wait→close(results)).
+// The panic must surface as an in-order recoverable EntryResult.Err, after the
+// good prefix, and Download must return. The test's own timeout converts a
+// regression (hang) into a failure rather than a stuck run.
+func TestDownloadTransformPanicNoHang(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	const nSeg = 8
+	var entries []PlanEntry
+	for s := range nSeg {
+		var events []segment.Event
+		for i := range 4 { // 2 blocks/segment
+			seq := uint64(s*1000 + i + 1)
+			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
+		}
+		as.addSegment(t, segName(s), events)
+		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+	}
+
+	d := as.downloader(8)
+	// Panic on the block whose first event seq is in the 3rd segment.
+	panicSeq := uint64(2*1000 + 1)
+	d.SetTransform(func(_ int, evs []Event) any {
+		if len(evs) > 0 && evs[0].Seq == panicSeq {
+			panic("boom in transform")
+		}
+		if len(evs) == 0 {
+			return nil
+		}
+		return evs[0].Seq
+	})
+
+	done := make(chan struct{})
+	var sawErr error
+	var goodBefore int
+	go func() {
+		defer close(done)
+		_ = d.Download(context.Background(), entries, func(res EntryResult) bool {
+			if res.Err != nil {
+				sawErr = res.Err
+				return false // stop after the surfaced panic-error
+			}
+			goodBefore++
+			return true
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Download hung after a transform panic (FIX #1 regression)")
+	}
+	require.Error(t, sawErr, "transform panic must surface as a recoverable EntryResult.Err")
+	require.Contains(t, sawErr.Error(), "panicked")
+	require.Positive(t, goodBefore, "blocks before the panicking one must be delivered first")
+}
+
+// TestDownloadTransformErrorRouting guards FIX #3: on the fast path a per-block
+// decode error must still surface in order as EntryResult.Err with a nil Payload
+// (so the caller routes it through the error path, never asserting the payload).
+// We corrupt one block's frame so its decode fails; the transform is never
+// reached for that block.
+func TestDownloadTransformErrorRouting(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	var events []segment.Event
+	for i := uint64(1); i <= 4; i++ { // 2 blocks of 2
+		events = append(events, makeCreate(t, i, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(i, 10)))
+	}
+	as.addSegment(t, segName(0), events)
+
+	as.mu.Lock()
+	raw := append([]byte(nil), as.segments[segName(0)]...)
+	as.mu.Unlock()
+	hdr, err := segment.ReadSealedHeader(bytes.NewReader(raw))
+	require.NoError(t, err)
+	require.Equal(t, uint32(2), hdr.BlockCount)
+	frame1, err := segment.ReadBlockFrame(bytes.NewReader(raw), hdr, 1)
+	require.NoError(t, err)
+	at := bytes.Index(raw, frame1)
+	require.GreaterOrEqual(t, at, 0)
+	for i := at; i < at+len(frame1); i++ {
+		raw[i] ^= 0xFF
+	}
+	as.mu.Lock()
+	as.segments[segName(0)] = raw
+	as.mu.Unlock()
+
+	d := as.downloader(1)
+	transformCalls := 0
+	d.SetTransform(func(_ int, evs []Event) any {
+		transformCalls++
+		if len(evs) == 0 {
+			return nil
+		}
+		return evs[0].Seq
+	})
+
+	var payloads []uint64
+	var sawErr error
+	err = d.Download(context.Background(), []PlanEntry{{SegmentName: segName(0), Index: 0, Mode: ModeWholeSegment}},
+		func(res EntryResult) bool {
+			if res.Err != nil {
+				sawErr = res.Err
+				require.Nil(t, res.Payload, "an error result must carry no payload")
+				return true
+			}
+			p, ok := res.Payload.(uint64)
+			require.True(t, ok, "non-error result must carry the boxed seq payload")
+			payloads = append(payloads, p)
+			return true
+		})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1}, payloads, "the good block prefix is delivered as payloads before the error")
+	require.Error(t, sawErr, "the corrupt block surfaces as an in-order error")
+	require.Equal(t, 1, transformCalls, "transform runs only for the good block, never the failed-decode one")
+}
+
+// TestDownloadTransformNoGoroutineLeak mirrors the leak test on the fast path:
+// repeated Downloads with a transform set (and an early stop) must not leak
+// goroutines.
+//
+//nolint:paralleltest // intentionally serial: measures process-wide goroutine count
+func TestDownloadTransformNoGoroutineLeak(t *testing.T) {
+	as := newArchiveServer(t)
+	const nSeg = 20
+	var entries []PlanEntry
+	for s := range nSeg {
+		var events []segment.Event
+		for i := range 6 {
+			seq := uint64(s*1000 + i + 1)
+			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
+		}
+		as.addSegment(t, segName(s), events)
+		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+	}
+	settle := func() int {
+		for range 40 {
+			time.Sleep(5 * time.Millisecond)
+			runtime.GC()
+		}
+		return runtime.NumGoroutine()
+	}
+	dl := as.noKeepAliveDownloader(8)
+	dl.SetTransform(func(_ int, evs []Event) any {
+		if len(evs) == 0 {
+			return nil
+		}
+		return len(evs)
+	})
+	_ = collectViaTransform(dl, entries, func(EntryResult) bool { return true })
+	_ = collectViaTransform(dl, entries, func(EntryResult) bool { return false })
+	before := settle()
+	const runs = 15
+	for range runs {
+		_ = collectViaTransform(dl, entries, func(EntryResult) bool { return true })
+		_ = collectViaTransform(dl, entries, func(EntryResult) bool { return false })
+	}
+	after := settle()
+	require.LessOrEqual(t, after, before+5,
+		"goroutines must not grow across %d fast-path Download runs; before=%d after=%d", 2*runs, before, after)
+}
+
+func collectViaTransform(d *Downloader, entries []PlanEntry, emit func(EntryResult) bool) error {
+	return d.Download(context.Background(), entries, emit)
+}
+
 // TestDownloadStreamsPerBlock pins the core memory-fix contract: a single
 // whole-segment entry is emitted as MULTIPLE EntryResults — one per decoded
 // block — rather than one giant slice. With MaxEventsPerBlock=2 a 6-event

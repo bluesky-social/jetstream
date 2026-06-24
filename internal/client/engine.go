@@ -105,16 +105,46 @@ func NewEngine(cfg Config) *Engine {
 	}
 }
 
+// BackfillSink is the optional fast path for the backfill download phase. When
+// its Transform is non-nil, the downloader runs Transform on the parallel decode
+// workers (turning each block's []Event into an opaque payload) and the engine
+// delivers that payload via Emit — moving the per-event conversion + batching off
+// the single serial reassembler goroutine, which is the backfill scaling ceiling
+// (#142). When Transform is nil the engine uses the legacy per-event batcher path
+// unchanged.
+//
+// Emit receives the whole EntryResult (not just the payload) so the engine can
+// route an error result through the error path before ever asserting the payload
+// type. The live-tail phase always uses the serial batcher regardless — only the
+// high-volume backfill phase takes the fast path.
+type BackfillSink struct {
+	// Transform converts one decoded block's events into a ready-to-deliver
+	// payload, on the decode workers. nil disables the fast path.
+	Transform func(entryIdx int, evs []Event) any
+	// Emit delivers one non-error block payload (EntryResult.Payload) in seq
+	// order; returns false to stop. Only called for non-error results.
+	Emit func(EntryResult) bool
+}
+
 // Run drives the stream until ctx is cancelled or the consumer stops. It emits
 // batches via emitBatch (returns false to stop) and recoverable errors via
 // emitErr (returns false to stop). Run blocks until the stream ends.
+//
+// Run uses the legacy per-event batcher for backfill. To take the parallel
+// backfill fast path, use RunWithBackfill with a non-nil BackfillSink.
 func (e *Engine) Run(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
+	e.RunWithBackfill(ctx, emitBatch, emitErr, BackfillSink{})
+}
+
+// RunWithBackfill is Run with an optional backfill fast path (see BackfillSink).
+// A zero BackfillSink (nil Transform) is exactly equivalent to Run.
+func (e *Engine) RunWithBackfill(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
 	if e.cfg.Backfill {
 		if e.cfg.BackfillOnly {
-			e.runBackfillOnly(ctx, emitBatch, emitErr)
+			e.runBackfillOnly(ctx, emitBatch, emitErr, bf)
 			return
 		}
-		e.runBackfillThenLive(ctx, emitBatch, emitErr)
+		e.runBackfillThenLive(ctx, emitBatch, emitErr, bf)
 		return
 	}
 	e.runLiveOnly(ctx, emitBatch, emitErr)
@@ -237,11 +267,68 @@ func (e *Engine) startFlusher(ctx context.Context, b *batcher) func() {
 // return. It is a strict subset of runBackfillThenLive with the live tail,
 // cutover, and steady-state phases removed — no websocket is ever dialed.
 //
+// backfillEmitFunc builds the Download emit callback shared by both backfill
+// paths, and installs the fast-path transform on dl when bf provides one.
+//
+// Error results ALWAYS route through the batcher's emitError (which flushes any
+// buffered events first, preserving error-after-data ordering) BEFORE the
+// fast-path Emit is consulted — so bf.Emit is only ever called for a non-error
+// result, and the payload it receives is always a real transform output. On the
+// legacy path (bf.Transform == nil) events flow through the per-event batcher
+// exactly as before.
+//
+// The returned stopped() reports whether the consumer asked to stop during the
+// backfill. On the legacy path that is just b.stopped(); on the fast path the
+// batcher never sees the backfill events, so a stop is observed only via Emit
+// returning false and recorded here (FIX: the live phase must check THIS, not
+// only b.stopped()).
+func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (emit func(EntryResult) bool, stopped func() bool) {
+	if bf.Transform == nil {
+		// Legacy path: per-event batching on the serial reassembler goroutine.
+		return func(res EntryResult) bool {
+			if res.Err != nil {
+				return b.emitError(res.Err)
+			}
+			for _, ev := range res.Events {
+				if !b.add(ev) {
+					return false
+				}
+			}
+			return true
+		}, b.stopped
+	}
+
+	// Fast path: workers run the transform in parallel; the reassembler hands us
+	// the ready payload, which we deliver via bf.Emit with no per-event work.
+	dl.SetTransform(bf.Transform)
+	var consumerStopped bool
+	return func(res EntryResult) bool {
+			if res.Err != nil {
+				// Route errors (incl. a transform panic surfaced as Err) through the
+				// batcher so they stay ordered after any prior events and reuse the
+				// fatal/recoverable plumbing. b holds no backfill events on this path,
+				// so emitError just flushes-nothing then emits the error in order.
+				if !b.emitError(res.Err) {
+					consumerStopped = true
+					return false
+				}
+				return true
+			}
+			if !bf.Emit(res) {
+				consumerStopped = true
+				return false
+			}
+			return true
+		}, func() bool {
+			return consumerStopped || b.stopped()
+		}
+}
+
 // Records in the active (unsealed) segment, seq in (plannedThroughSeq, M], are
 // only reachable via the live tail and are therefore NOT delivered by a dump.
 // That is the defining trade-off of BackfillOnly: a clean point-in-time slice
 // of the sealed archive, not the full up-to-the-instant stream.
-func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
+func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
 	// 1. Overlay seed. Terminal on failure: without the tombstone base the
 	// suppressor cannot honor the deletion guarantee, so abort rather than emit
 	// unsuppressed historical rows.
@@ -263,21 +350,13 @@ func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bo
 	// arrive during a dump).
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
-	_ = dl.Download(ctx, plan.Entries, func(res EntryResult) bool {
-		if res.Err != nil {
-			return b.emitError(res.Err)
-		}
-		for _, ev := range res.Events {
-			if !b.add(ev) {
-				return false
-			}
-		}
-		return true
-	})
+	emit, _ := e.backfillEmitFunc(b, bf, dl)
+	_ = dl.Download(ctx, plan.Entries, emit)
 
-	// 4. Flush the partial tail. Download returns on ctx cancel or consumer stop;
-	// in both cases a final flush of any buffered events is correct (flushLocked
-	// is a no-op once the batcher has stopped).
+	// 4. Flush the partial tail. On the fast path b carries no backfill events
+	// (they went straight through bf.Emit), so this is a no-op there; on the
+	// legacy path it flushes the final partial batch. flushLocked is a no-op once
+	// the batcher has stopped.
 	if !b.stopped() {
 		b.flush()
 	}
@@ -296,7 +375,7 @@ func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bo
 // The record-stream handoff is at plannedThroughSeq, NOT at M: records in the
 // active (unsealed) segment, seq in (plannedThroughSeq, M], are not
 // downloadable from the archive and are delivered by the live tail instead.
-func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
+func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
 	// 1. Overlay seed. A seed failure is terminal: without the tombstone base
 	// the suppressor cannot honor the deletion guarantee, so abort fatally
 	// rather than emit unsuppressed historical rows.
@@ -366,19 +445,15 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	// 4. Download + emit the backfill in plan order. Rows are filtered +
 	// suppressed before decode by the downloader's selector. Errors flow
 	// through the batcher (b.emitError) so they stay serialized with batch
-	// emission once the flusher goroutine starts in phase 5.
+	// emission once the flusher goroutine starts in phase 5. On the fast path
+	// (bf.Transform != nil) the per-event conversion+batching runs on the decode
+	// workers and batches are delivered via bf.Emit; b carries no backfill events.
+	// All backfill batches are delivered synchronously inside Download — which
+	// returns only after the reassembler drains — so the cutover in phase 5 still
+	// installs the live forward path strictly AFTER the last backfill batch.
 	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
-	derr := dl.Download(ctx, plan.Entries, func(res EntryResult) bool {
-		if res.Err != nil {
-			return b.emitError(res.Err)
-		}
-		for _, ev := range res.Events {
-			if !b.add(ev) {
-				return false
-			}
-		}
-		return true
-	})
+	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
+	derr := dl.Download(ctx, plan.Entries, emit)
 	if derr != nil { // ctx cancelled
 		stopLive()
 		liveWG.Wait()
@@ -387,7 +462,11 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		}
 		return
 	}
-	if b.stopped() {
+	// Use backfillStopped() (not just b.stopped()): on the fast path the consumer
+	// stop is observed via bf.Emit returning false, NOT through the batcher, so a
+	// bare b.stopped() would miss it and we would needlessly dial/forward the live
+	// tail after the consumer already quit.
+	if backfillStopped() {
 		stopLive()
 		liveWG.Wait()
 		return
