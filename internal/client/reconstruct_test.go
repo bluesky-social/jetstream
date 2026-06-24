@@ -48,7 +48,7 @@ func TestReconstructionSwarm(t *testing.T) {
 			require.NoError(t, err)
 			snap = ensureSnapshotMaps(snap)
 			sup := NewSuppressor()
-			sup.snap.Store(&snap)
+			sup.base.Store(&snap)
 
 			emitted := map[tombstone.RecordKey]uint64{}
 			for i := range events {

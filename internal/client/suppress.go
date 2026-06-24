@@ -24,22 +24,29 @@ import (
 // holds a row back waiting for a tombstone it has not yet seen. Deletes/updates
 // that arrive later on the live tail flow through as their own rows.
 //
-// Concurrency: ShouldDrop is on the hot path — every backfill row, decoded by
-// many parallel workers (#142). It must be cheap and contention-free. The
-// tombstone set is read-mostly: seeded once from the overlay, then occasionally
-// grown by live-tail tombstones, against millions of reads. So the snapshot is
-// kept immutable behind an atomic.Pointer: ShouldDrop does a lock-free atomic
-// load (no per-row mutex), and writers (SeedFromOverlay, Merge) build a fresh
-// snapshot under a small write mutex and atomically swap it in (copy-on-write).
-// A reader always observes one complete, internally-consistent snapshot — never
-// a torn or partially-merged map.
+// Concurrency + cost model. ShouldDrop is the hot path: every backfill row,
+// decoded by many parallel workers (#142), so it must be lock-free. The set is
+// also asymmetric — a large overlay base (often 100K+ tombstones) seeded ONCE,
+// plus a thin stream of live-tail tombstones folded in during the backfill. So
+// the set is split into two layers:
+//
+//   - base: the immutable overlay seed. Stored behind an atomic.Pointer and
+//     swapped only by SeedFromOverlay (once, before reads begin). Never copied
+//     per write — that is the whole point of separating it from live.
+//   - live: tombstones observed on the live tail, also behind an atomic.Pointer.
+//     Merge rebuilds only THIS (small) layer copy-on-write and swaps it in.
+//
+// ShouldDrop loads both pointers lock-free and returns drop if EITHER layer
+// suppresses the row. Splitting the layers keeps writes O(live) instead of
+// O(base): folding a live tombstone copies only the handful of live entries,
+// not the 100K-entry overlay. Published snapshots are never mutated in place,
+// so a lock-free reader always sees two complete, self-consistent maps.
 type Suppressor struct {
-	// snap is the current immutable tombstone snapshot. Readers load it
-	// atomically; writers replace it wholesale under writeMu. Never mutate the
-	// maps of a published snapshot in place — that would race lock-free readers.
-	snap atomic.Pointer[tombstone.Snapshot]
-	// writeMu serializes writers so two concurrent merges/seeds cannot lose an
-	// update by both copying the same base and racing their swaps.
+	base atomic.Pointer[tombstone.Snapshot] // immutable overlay seed; swapped once
+	live atomic.Pointer[tombstone.Snapshot] // live-tail tombstones; copy-on-write
+
+	// writeMu serializes live-layer writers so two concurrent merges cannot lose
+	// an update by both copying the same base and racing their swaps.
 	writeMu sync.Mutex
 }
 
@@ -47,8 +54,10 @@ type Suppressor struct {
 // SeedFromOverlay and grow it with Merge as live tombstones arrive.
 func NewSuppressor() *Suppressor {
 	s := &Suppressor{}
-	empty := emptySnapshot()
-	s.snap.Store(&empty)
+	base := emptySnapshot()
+	live := emptySnapshot()
+	s.base.Store(&base)
+	s.live.Store(&live)
 	return s
 }
 
@@ -60,12 +69,10 @@ func emptySnapshot() tombstone.Snapshot {
 }
 
 // SeedFromOverlay fetches the current getTombstones blob, decodes it, and
-// installs its tombstones as the suppressor's base set. Returns the decoded
-// (W, M) coverage envelope.
-//
-// The decoded snapshot is published as-is (the overlay decode produces a fresh,
-// privately-owned snapshot), replacing whatever was there. Seeding happens once
-// at startup before the backfill reads begin.
+// installs its tombstones as the suppressor's immutable base layer. Returns the
+// decoded (W, M) coverage envelope. Seeding happens once at startup before the
+// backfill reads begin; the decoded snapshot is published as-is and never
+// copied again.
 func (s *Suppressor) SeedFromOverlay(ctx context.Context, xc *xrpc.Client) (w, m uint64, err error) {
 	blob, err := jetstream.JetstreamGetTombstones(ctx, xc)
 	if err != nil {
@@ -76,28 +83,23 @@ func (s *Suppressor) SeedFromOverlay(ctx context.Context, xc *xrpc.Client) (w, m
 		return 0, 0, fmt.Errorf("jetstream: decode tombstone overlay: %w", err)
 	}
 	snap = ensureSnapshotMaps(snap)
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	s.snap.Store(&snap)
+	s.base.Store(&snap)
 	return w, m, nil
 }
 
 // Merge folds additional tombstones (e.g. derived from live-tail rows) into the
-// suppressor via copy-on-write: it builds a new snapshot from the current one
-// plus other, then atomically swaps it in, so concurrent lock-free readers are
-// unaffected and never see a partially-merged map. A no-op for an empty delta
-// (the common case for a non-tombstone live event), so the hot live path pays
-// nothing.
+// LIVE layer via copy-on-write: it copies only the current live layer (small —
+// the base is untouched), folds other into the copy, then atomically swaps it
+// in. Concurrent lock-free readers are unaffected and never see a partial map.
+// A no-op for an empty delta (the common case for a non-tombstone live event),
+// so the hot live path pays nothing.
 func (s *Suppressor) Merge(other tombstone.Snapshot) {
 	if other.Empty() {
 		return
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	// Copy the current snapshot, fold other into the copy, then publish. The
-	// published snapshot is never mutated again, so readers holding the old
-	// pointer keep reading a valid set until they reload.
-	cur := s.snap.Load()
+	cur := s.live.Load()
 	next := tombstone.Snapshot{
 		Records: make(map[tombstone.RecordKey]uint64, len(cur.Records)+len(other.Records)),
 		DIDs:    make(map[string]tombstone.DIDTombstone, len(cur.DIDs)+len(other.DIDs)),
@@ -109,7 +111,7 @@ func (s *Suppressor) Merge(other tombstone.Snapshot) {
 		next.DIDs[k] = v
 	}
 	next.Merge(other) // keeps the max seq per key
-	s.snap.Store(&next)
+	s.live.Store(&next)
 }
 
 // ObserveLive folds a single live event into the suppressor if it is a
@@ -127,13 +129,22 @@ func (s *Suppressor) ObserveLive(ev *segment.Event) error {
 }
 
 // ShouldDrop reports whether a materialization row must be suppressed because a
-// higher-seq tombstone supersedes it. Non-materialization rows are never
-// dropped. The second return is the suppression reason for diagnostics.
+// higher-seq tombstone supersedes it, in EITHER the base or live layer. Non-
+// materialization rows are never dropped. The second return is the suppression
+// reason for diagnostics.
 //
-// Hot path: a lock-free atomic load of the immutable snapshot, then a pure map
-// read. No mutex, so parallel decode workers do not contend here.
+// Hot path: two lock-free atomic loads + pure map reads, no mutex, so parallel
+// decode workers never contend. A row is dropped if either layer has a
+// superseding tombstone; the layers are disjoint in time (base = (W,M], live =
+// (M,inf)) so "either suppresses" is the correct union of the combined set.
 func (s *Suppressor) ShouldDrop(ev *segment.Event) (bool, string) {
-	return s.snap.Load().ShouldDrop(ev)
+	if !ev.Kind.IsMaterialization() {
+		return false, ""
+	}
+	if drop, reason := s.base.Load().ShouldDrop(ev); drop {
+		return drop, reason
+	}
+	return s.live.Load().ShouldDrop(ev)
 }
 
 func ensureSnapshotMaps(snap tombstone.Snapshot) tombstone.Snapshot {

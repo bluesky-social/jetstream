@@ -141,10 +141,10 @@ func TestSuppressorMalformedBlob(t *testing.T) {
 func TestSuppressorConcurrentReadWrite(t *testing.T) {
 	t.Parallel()
 	s := NewSuppressor()
-	// Base tombstone present from the start: a reader must ALWAYS see it,
-	// regardless of how many concurrent merges have happened.
+	// Base tombstone present from the start (immutable base layer): a reader must
+	// ALWAYS see it, regardless of how many concurrent live-layer merges happen.
 	base := recordTombstoneSnapshot("did:plc:base", "c", "r", 1000)
-	s.snap.Store(&base)
+	s.base.Store(&base)
 
 	const readers = 8
 	const writes = 200
