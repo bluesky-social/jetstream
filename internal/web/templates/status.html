@@ -107,6 +107,36 @@
   .host-col { width: 18rem; }
   .time-col { width: 8rem; }
   .status-table .wide { overflow-wrap: anywhere; word-break: normal; }
+  .host-errors-row td {
+    padding-top: 0;
+    color: var(--muted);
+  }
+  .host-errors {
+    margin: 0.1rem 0 0.45rem 0;
+    padding: 0.55rem 0.75rem;
+    border-left: 3px solid var(--border);
+    background: var(--bg);
+  }
+  .host-errors h3 {
+    margin-bottom: 0.35rem;
+  }
+  .host-error-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.35rem;
+  }
+  .host-error-item {
+    display: grid;
+    grid-template-columns: minmax(14rem, 28rem) max-content 1fr;
+    gap: 0.5rem;
+    align-items: baseline;
+  }
+  .host-error-repo {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
   .toolbar {
     display: flex; flex-wrap: wrap; gap: 0.5rem;
     margin-bottom: 1rem;
@@ -143,7 +173,6 @@
   .match-state { font-weight: 700; }
   .match-ok { color: var(--ok); }
   .match-fail { color: var(--warn); }
-  .samples { margin: 0.25rem 0 0 0; padding-left: 1rem; color: var(--muted); font-size: 0.86rem; }
   .sample-did code { overflow-wrap: anywhere; }
   .account-link {
     margin-left: 0.35rem;
@@ -160,6 +189,7 @@
     body { padding: 1rem 0.5rem; }
     section { padding: 0.85rem; }
     .lookup-input, .toolbar button { flex-basis: 100%; width: 100%; }
+    .host-error-item { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -196,8 +226,17 @@
 document.addEventListener("input", function (event) {
   if (event.target.id !== "host-filter") return;
   var q = event.target.value.toLowerCase();
-  document.querySelectorAll("#hosts-table tbody tr").forEach(function (row) {
-    row.hidden = row.textContent.toLowerCase().indexOf(q) === -1;
+  document.querySelectorAll("#hosts-table tbody tr.host-row").forEach(function (row) {
+    var detail = row.nextElementSibling;
+    var text = row.textContent;
+    if (detail && detail.classList.contains("host-errors-row")) {
+      text += " " + detail.textContent;
+    }
+    var hidden = text.toLowerCase().indexOf(q) === -1;
+    row.hidden = hidden;
+    if (detail && detail.classList.contains("host-errors-row")) {
+      detail.hidden = hidden;
+    }
   });
 });
 </script>
@@ -346,12 +385,12 @@ document.addEventListener("input", function (event) {
     </colgroup>
     <thead>
       <tr>
-        <th>Host</th><th class="num">Repos</th><th class="num">Active</th><th class="num">Complete</th><th class="num">Failed</th><th class="num">Unavailable</th><th>Last attempt</th><th>Error</th>
+        <th>Host</th><th class="num">Repos</th><th class="num">Active</th><th class="num">Complete</th><th class="num">Failed</th><th class="num">Unavailable</th><th>Last attempt</th><th>Latest error</th>
       </tr>
     </thead>
     <tbody>
     {{range .Hosts.Rows}}
-      <tr>
+      <tr class="host-row">
         <td><code>{{.Host}}</code></td>
         <td class="num">{{humanInt .Total}}</td>
         <td class="num">{{humanInt .Active}}</td>
@@ -360,19 +399,28 @@ document.addEventListener("input", function (event) {
         <td class="num">{{humanInt .Unavailable}}</td>
         <td>{{relativeTime .LastAttemptedAt $.Now}}</td>
         <td class="wide">
-          {{if .RecentErrors}}
-          <ul class="samples">
+          {{if .LatestErrorClass}}<code>{{.LatestErrorClass}}</code>{{end}}
+          {{if .LatestError}} {{.LatestError}}{{end}}
+        </td>
+      </tr>
+      {{if .RecentErrors}}
+      <tr class="host-errors-row">
+        <td colspan="8">
+          <div class="host-errors">
+            <h3>Recent failing repos</h3>
+            <ul class="host-error-list">
             {{range .RecentErrors}}
-            <li>
-              <span class="sample-did"><code>{{.DID}}</code></span><a class="account-link" href="/status?tab=accounts&amp;account={{.DID}}" target="_blank" rel="noopener">view</a>
+            <li class="host-error-item">
+              <span class="host-error-repo"><span class="sample-did"><code>{{.DID}}</code></span><a class="account-link" href="/status?tab=accounts&amp;account={{.DID}}" target="_blank" rel="noopener">view</a></span>
               <span class="sample-meta">{{relativeTime .AttemptedAt $.Now}} {{if .Class}}<code>{{.Class}}</code>{{end}}</span>
               <span class="sample-error">{{.Error}}</span>
             </li>
             {{end}}
-          </ul>
-          {{end}}
+            </ul>
+          </div>
         </td>
       </tr>
+      {{end}}
     {{end}}
     </tbody>
   </table>
