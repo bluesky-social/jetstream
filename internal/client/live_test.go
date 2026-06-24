@@ -133,10 +133,10 @@ func TestLiveSinkAccountDeleteSuppressesDespiteCollectionFilter(t *testing.T) {
 	suppressor := NewSuppressor()
 	// Collection filter set: account/identity are not delivered.
 	matcher := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
-	sink := newLiveSink(&memBuffer{}, suppressor, matcher)
+	sink := newLiveSink(&memBuffer{}, suppressor, matcher, recordDecodeMode{})
 
 	// A live account-delete for did:plc:a at seq 100 arrives during buffering.
-	acctDel, err := decodeLiveFrame(liveAccountFrame(100, "did:plc:a", false, "deleted"))
+	acctDel, err := decodeLiveFrame(liveAccountFrame(100, "did:plc:a", false, "deleted"), recordDecodeMode{})
 	require.NoError(t, err)
 
 	// Buffering phase: onLive must fold the tombstone (it returns true to keep

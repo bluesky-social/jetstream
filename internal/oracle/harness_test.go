@@ -296,6 +296,11 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	// serving/client artifact.
 	assertClientBackfillCompacted(t, cfg, run, trace, dataDir, w, compaction, publicURL, steadyCompaction.Watermark, "steady-state-client-backfill")
 
+	// #146: drive the REAL client through the typed fast path (worker-parallel
+	// decode into bsky.FeedLike) over the same sealed range and assert it decodes
+	// likes cleanly and surfaces exactly the same like set as the map path.
+	assertTypedLikeBackfill(t, cfg, run, publicURL, steadyCompaction.Watermark)
+
 	// Exercise the overlay's DID-tombstone section inside the live overlay
 	// window. The earlier bootstrap account-delete and sync tombstones are
 	// usually at or below W by this point, so a mutation that drops DID

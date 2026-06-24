@@ -46,7 +46,7 @@ func liveAccountFrame(seq uint64, did string, active bool, status string) []byte
 
 func TestDecodeLiveFrameCommit(t *testing.T) {
 	t.Parallel()
-	ev, err := decodeLiveFrame(liveCommitFrame(t, 42, "did:plc:a", "create", "app.bsky.feed.post", "r1", true))
+	ev, err := decodeLiveFrame(liveCommitFrame(t, 42, "did:plc:a", "create", "app.bsky.feed.post", "r1", true), recordDecodeMode{})
 	require.NoError(t, err)
 	require.Equal(t, KindCommit, ev.Kind)
 	require.EqualValues(t, 42, ev.Seq)
@@ -59,7 +59,7 @@ func TestDecodeLiveFrameCommit(t *testing.T) {
 
 func TestDecodeLiveFrameDelete(t *testing.T) {
 	t.Parallel()
-	ev, err := decodeLiveFrame(liveCommitFrame(t, 7, "did:plc:a", "delete", "app.bsky.feed.post", "r1", false))
+	ev, err := decodeLiveFrame(liveCommitFrame(t, 7, "did:plc:a", "delete", "app.bsky.feed.post", "r1", false), recordDecodeMode{})
 	require.NoError(t, err)
 	require.Equal(t, OpDelete, ev.Commit.Operation)
 	require.Nil(t, ev.Commit.Record)
@@ -69,27 +69,27 @@ func TestDecodeLiveFrameDelete(t *testing.T) {
 func TestDecodeLiveFrameCreateMissingCBOR(t *testing.T) {
 	t.Parallel()
 	// A create without record_cbor (i.e. not extended mode) must error.
-	_, err := decodeLiveFrame(liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r", false))
+	_, err := decodeLiveFrame(liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r", false), recordDecodeMode{})
 	require.ErrorContains(t, err, "record_cbor")
 }
 
 func TestDecodeLiveFrameAccountIdentitySync(t *testing.T) {
 	t.Parallel()
 	acct := []byte(`{"did":"did:plc:a","time_us":1,"seq":5,"kind":"account","account":{"did":"did:plc:a","active":false,"status":"deleted","seq":5,"time":"t"}}`)
-	ev, err := decodeLiveFrame(acct)
+	ev, err := decodeLiveFrame(acct, recordDecodeMode{})
 	require.NoError(t, err)
 	require.Equal(t, KindAccount, ev.Kind)
 	require.False(t, ev.Account.Active)
 	require.Equal(t, "deleted", ev.Account.Status)
 
 	id := []byte(`{"did":"did:plc:a","time_us":1,"seq":6,"kind":"identity","identity":{"did":"did:plc:a","handle":"alice.test","seq":6,"time":"t"}}`)
-	ev, err = decodeLiveFrame(id)
+	ev, err = decodeLiveFrame(id, recordDecodeMode{})
 	require.NoError(t, err)
 	require.Equal(t, KindIdentity, ev.Kind)
 	require.Equal(t, "alice.test", ev.Identity.Handle)
 
 	sync := []byte(`{"did":"did:plc:a","time_us":1,"seq":8,"kind":"sync","sync":{"did":"did:plc:a","rev":"rev1","seq":8,"time":"t"}}`)
-	ev, err = decodeLiveFrame(sync)
+	ev, err = decodeLiveFrame(sync, recordDecodeMode{})
 	require.NoError(t, err)
 	require.Equal(t, KindSync, ev.Kind)
 	require.Equal(t, "rev1", ev.Sync.Rev)
@@ -98,14 +98,14 @@ func TestDecodeLiveFrameAccountIdentitySync(t *testing.T) {
 func TestDecodeLiveFrameUnknownKindSkips(t *testing.T) {
 	t.Parallel()
 	for _, kind := range []string{"heartbeat", "segment_sealed", "segment_compacted", "future_thing"} {
-		_, err := decodeLiveFrame([]byte(`{"kind":"` + kind + `","seq":1}`))
+		_, err := decodeLiveFrame([]byte(`{"kind":"`+kind+`","seq":1}`), recordDecodeMode{})
 		require.ErrorIs(t, err, errSkipFrame, "kind %q must be skipped, not errored", kind)
 	}
 }
 
 func TestDecodeLiveFrameErrorFrame(t *testing.T) {
 	t.Parallel()
-	_, err := decodeLiveFrame([]byte(`{"error":"FutureCursor","message":"cursor in the future"}`))
+	_, err := decodeLiveFrame([]byte(`{"error":"FutureCursor","message":"cursor in the future"}`), recordDecodeMode{})
 	require.ErrorContains(t, err, "FutureCursor")
 	require.NotErrorIs(t, err, errSkipFrame)
 }
@@ -113,7 +113,7 @@ func TestDecodeLiveFrameErrorFrame(t *testing.T) {
 func TestDecodeLiveFrameSeqFallbackToCursor(t *testing.T) {
 	t.Parallel()
 	// A frame with only cursor (no seq) still yields a usable seq.
-	ev, err := decodeLiveFrame([]byte(`{"did":"did:plc:a","cursor":99,"kind":"account","account":{"did":"did:plc:a","active":true,"seq":99,"time":"t"}}`))
+	ev, err := decodeLiveFrame([]byte(`{"did":"did:plc:a","cursor":99,"kind":"account","account":{"did":"did:plc:a","active":true,"seq":99,"time":"t"}}`), recordDecodeMode{})
 	require.NoError(t, err)
 	require.EqualValues(t, 99, ev.Seq)
 }

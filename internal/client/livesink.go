@@ -26,6 +26,7 @@ type liveSink struct {
 	buf        Buffer
 	suppressor *Suppressor
 	matcher    *Matcher
+	mode       recordDecodeMode // raw vs. map record decode for drained buffered frames
 
 	mu         sync.Mutex
 	forwarding bool
@@ -37,8 +38,8 @@ type liveSink struct {
 	fatalErr error
 }
 
-func newLiveSink(buf Buffer, suppressor *Suppressor, matcher *Matcher) *liveSink {
-	return &liveSink{buf: buf, suppressor: suppressor, matcher: matcher}
+func newLiveSink(buf Buffer, suppressor *Suppressor, matcher *Matcher, mode recordDecodeMode) *liveSink {
+	return &liveSink{buf: buf, suppressor: suppressor, matcher: matcher, mode: mode}
 }
 
 // onLive is the live consumer's emit callback. raw is the verbatim JSON frame
@@ -118,7 +119,7 @@ func (s *liveSink) flipAndDrain(ctx context.Context, coveredThrough gt.Option[ui
 		if err != nil {
 			return err
 		}
-		ev, decErr := decodeLiveFrame(fr.Data)
+		ev, decErr := decodeLiveFrame(fr.Data, s.mode)
 		if decErr != nil {
 			emitErr(fmt.Errorf("jetstream: corrupt buffered live frame seq=%d: %w", fr.Seq, decErr))
 			continue

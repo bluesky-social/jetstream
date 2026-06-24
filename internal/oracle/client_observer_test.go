@@ -9,6 +9,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/jcalabro/atmos/api/bsky"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
@@ -227,6 +228,88 @@ func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, tr
 
 	t.Logf("%s: client backfill matched ground truth over %d emitted events (window=%d watermark=%d) in mode=%s seed=%d",
 		phase, len(res.events), len(window), watermark, cfg.Mode, cfg.Seed)
+}
+
+// assertTypedLikeBackfill drives the REAL public client through the typed fast
+// path (jetstream.TypedEvents[bsky.FeedLike] over WithRawRecords) against the
+// running server, decoding every app.bsky.feed.like create on the parallel
+// decode workers. It is the end-to-end guard for #146's worker-parallel typed
+// decode: it asserts the typed path reaches the watermark, decodes likes with
+// ZERO decode errors, that every decoded like carries the well-formed subject
+// strongref the simulator generated, and — the correctness crux — that the SET
+// of (DID,rkey) likes the typed path surfaces equals what the map path observes
+// from the same server. Run as a bounded backfill-only dump so it terminates.
+func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, baseURL string, beforeSeq uint64) {
+	t.Helper()
+
+	client, err := jetstream.Subscribe(baseURL,
+		jetstream.WithCollections([]string{"app.bsky.feed.like"}),
+		jetstream.WithAfterSeq(0),
+		jetstream.WithBeforeSeq(beforeSeq),
+		jetstream.WithBackfillOnly(),
+		jetstream.WithRawRecords(),
+	)
+	require.NoErrorf(t, err, "typed subscribe: mode=%s seed=%d", cfg.Mode, cfg.Seed)
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), oracleWaitTimeout(cfg))
+	defer cancel()
+	go func() {
+		select {
+		case <-run.exited:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	typedLikes := map[string]string{} // did/rkey -> subject URI (decoded via the typed path)
+	var decoded, decodeErrs, maxSeq uint64
+	for tb, err := range jetstream.TypedEvents[bsky.FeedLike](ctx, client, "app.bsky.feed.like") {
+		require.NoErrorf(t, err, "typed backfill stream: mode=%s seed=%d", cfg.Mode, cfg.Seed)
+		for _, te := range tb.Events() {
+			if te.Event.Seq > maxSeq {
+				maxSeq = te.Event.Seq
+			}
+			require.NoErrorf(t, te.DecodeErr, "typed like decode error seq=%d", te.Event.Seq)
+			if te.Record == nil {
+				// Only like creates decode; deletes (no record) pass through.
+				continue
+			}
+			decoded++
+			require.NotEmpty(t, te.Record.Subject.URI, "decoded like must carry its subject URI (worker-parallel typed decode)")
+			typedLikes[te.Event.DID+"/"+te.Event.Commit.Rkey] = te.Record.Subject.URI
+		}
+	}
+	require.Zerof(t, decodeErrs, "typed backfill had %d decode errors", decodeErrs)
+	require.Positivef(t, decoded, "typed backfill decoded no likes: mode=%s seed=%d", cfg.Mode, cfg.Seed)
+
+	// Cross-check against the MAP path over the same bounded range: the set of
+	// surviving like creates must match exactly, proving the worker-parallel
+	// typed decode neither drops, duplicates, nor mis-decodes vs. the default.
+	mapClient, err := jetstream.Subscribe(baseURL,
+		jetstream.WithCollections([]string{"app.bsky.feed.like"}),
+		jetstream.WithAfterSeq(0),
+		jetstream.WithBeforeSeq(beforeSeq),
+		jetstream.WithBackfillOnly(),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = mapClient.Close() })
+	mapLikes := map[string]string{}
+	for batch, err := range mapClient.Events(ctx) {
+		require.NoError(t, err)
+		for _, ev := range batch.Events() {
+			if ev.Kind != jetstream.KindCommit || ev.Commit == nil || ev.Commit.Operation == jetstream.OpDelete {
+				continue
+			}
+			subj, _ := ev.Commit.Record["subject"].(map[string]any)
+			uri, _ := subj["uri"].(string)
+			mapLikes[ev.DID+"/"+ev.Commit.Rkey] = uri
+		}
+	}
+	require.Equal(t, mapLikes, typedLikes,
+		"typed fast path must surface exactly the same like set (DID/rkey -> subject URI) as the map path; mode=%s seed=%d", cfg.Mode, cfg.Seed)
+	t.Logf("typed-like-backfill: decoded %d likes via worker-parallel typed path, matched map path exactly (max_seq=%d) mode=%s seed=%d",
+		decoded, maxSeq, cfg.Mode, cfg.Seed)
 }
 
 // observedEventFromClient adapts a decoded public jetstream.Event into the

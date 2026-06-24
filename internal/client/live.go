@@ -83,6 +83,9 @@ type liveConfig struct {
 	// the package defaults. Tests set tiny values to avoid real-time waits.
 	backoffMin time.Duration
 	backoffMax time.Duration
+	// mode selects raw vs. map record materialization for live commits. Zero
+	// value = the default map build.
+	mode recordDecodeMode
 }
 
 func (c liveConfig) minBackoff() time.Duration {
@@ -196,7 +199,7 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, er
 		if typ != websocket.MessageText {
 			continue // jetstream frames are text JSON; ignore stray binary
 		}
-		ev, derr := decodeLiveFrame(data)
+		ev, derr := decodeLiveFrame(data, c.cfg.mode)
 		if errors.Is(derr, errSkipFrame) {
 			continue
 		}

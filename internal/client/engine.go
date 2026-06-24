@@ -68,6 +68,33 @@ type Config struct {
 	// the package default; tests set a tiny value to avoid real-time waits.
 	LiveBackoffMin time.Duration
 	Logger         *slog.Logger
+	// RawRecords, when true, makes commit decode SKIP building the generic
+	// Record map[string]any (decodeRecordMap — the dominant decode allocation at
+	// scale). Commit.Record is left nil and Commit.RecordCBOR is populated so a
+	// caller can decode it into a typed struct itself. See the root WithRawRecords
+	// option and TypedEvents.
+	RawRecords bool
+	// RawRecordsCopied, alongside RawRecords, clones RecordCBOR (backfill path)
+	// instead of aliasing the internal buffer, so it is safe to retain past the
+	// batch. See WithRawRecordsCopied.
+	RawRecordsCopied bool
+	// RawRecordCIDs, when true alongside RawRecords, still computes Commit.CID
+	// (sha256+base32 of the payload) on the backfill path. Default false in raw
+	// mode: CID is real per-record work the typed fast path avoids by default.
+	RawRecordCIDs bool
+}
+
+// recordDecodeMode captures how commit records are materialized, derived from
+// Config. It is passed down the decode paths (backfill + live) so the gating is
+// one value rather than scattered bools.
+type recordDecodeMode struct {
+	raw      bool // skip decodeRecordMap; leave Record nil, set RecordCBOR
+	copyCBOR bool // in raw mode, clone RecordCBOR instead of aliasing the buffer
+	wantCIDs bool // in raw mode, still compute Commit.CID
+}
+
+func (c Config) recordMode() recordDecodeMode {
+	return recordDecodeMode{raw: c.RawRecords, copyCBOR: c.RawRecordsCopied, wantCIDs: c.RawRecordCIDs}
 }
 
 // bulkClient returns the client for segment/block downloads, falling back to
@@ -187,6 +214,7 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 		dial:        e.cfg.Dial,
 		logger:      e.logger,
 		backoffMin:  e.cfg.LiveBackoffMin,
+		mode:        e.cfg.recordMode(),
 	})
 	// Route both events and errors through the batcher so the downstream yield
 	// is serialized against the flusher goroutine, and an error the consumer
@@ -350,6 +378,7 @@ func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bo
 	// arrive during a dump).
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
+	dl.SetRecordMode(e.cfg.recordMode())
 	emit, _ := e.backfillEmitFunc(b, bf, dl)
 	_ = dl.Download(ctx, plan.Entries, emit)
 
@@ -413,7 +442,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	if backfillCoveredNothing {
 		dedupFloor = gt.None[uint64]()
 	}
-	sink := newLiveSink(e.cfg.Buffer, e.suppressor, e.matcher)
+	sink := newLiveSink(e.cfg.Buffer, e.suppressor, e.matcher, e.cfg.recordMode())
 	liveCtx, stopLive := context.WithCancel(ctx)
 	defer stopLive()
 	consumer := newLiveConsumer(liveConfig{
@@ -434,6 +463,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		dial:        e.cfg.Dial,
 		logger:      e.logger,
 		backoffMin:  e.cfg.LiveBackoffMin,
+		mode:        e.cfg.recordMode(),
 	})
 	var liveWG sync.WaitGroup
 	liveWG.Go(func() {
@@ -452,6 +482,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	// returns only after the reassembler drains — so the cutover in phase 5 still
 	// installs the live forward path strictly AFTER the last backfill batch.
 	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
+	dl.SetRecordMode(e.cfg.recordMode())
 	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
 	derr := dl.Download(ctx, plan.Entries, emit)
 	if derr != nil { // ctx cancelled
