@@ -32,7 +32,7 @@ func TestSelectorFiltersAndSuppressesDuringDownload(t *testing.T) {
 	// Suppress r4 (deleted at seq 50, above its create seq 4).
 	snap := recordTombstoneSnapshot("did:plc:a", "app.bsky.feed.post", "r4", 50)
 	sup := NewSuppressor()
-	sup.snap = snap // seed directly for the test
+	sup.snap.Store(&snap) // seed directly for the test (copy-on-write store)
 
 	sel := newRowSelector(matcher, sup)
 	d := as.downloaderWith(2, sel)

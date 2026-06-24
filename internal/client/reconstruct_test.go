@@ -46,8 +46,9 @@ func TestReconstructionSwarm(t *testing.T) {
 			// seeding from the overlay and tailing live).
 			snap, err := tombstone.FoldRange(events, 0, ^uint64(0))
 			require.NoError(t, err)
+			snap = ensureSnapshotMaps(snap)
 			sup := NewSuppressor()
-			sup.snap = ensureSnapshotMaps(snap)
+			sup.snap.Store(&snap)
 
 			emitted := map[tombstone.RecordKey]uint64{}
 			for i := range events {

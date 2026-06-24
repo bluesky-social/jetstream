@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/overlay"
@@ -128,4 +130,59 @@ func TestSuppressorMalformedBlob(t *testing.T) {
 	s := NewSuppressor()
 	_, _, err := s.SeedFromOverlay(context.Background(), xc)
 	require.Error(t, err)
+}
+
+// TestSuppressorConcurrentReadWrite is the contract test for the copy-on-write
+// snapshot (#142): ShouldDrop is lock-free on the hot path while Merge swaps in
+// new snapshots concurrently. Under -race this proves no torn read / data race
+// between the lock-free readers and the copy-on-write writer, and asserts that
+// a tombstone merged mid-flight becomes visible (no lost update) and that the
+// pre-existing base tombstone is never lost across swaps.
+func TestSuppressorConcurrentReadWrite(t *testing.T) {
+	t.Parallel()
+	s := NewSuppressor()
+	// Base tombstone present from the start: a reader must ALWAYS see it,
+	// regardless of how many concurrent merges have happened.
+	base := recordTombstoneSnapshot("did:plc:base", "c", "r", 1000)
+	s.snap.Store(&base)
+
+	const readers = 8
+	const writes = 200
+	var wg sync.WaitGroup
+
+	// Readers hammer ShouldDrop on both the base key and the keys being merged.
+	stop := make(chan struct{})
+	for range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			baseCreate := &segment.Event{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:base", Collection: "c", Rkey: "r"}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// The base tombstone (seq 1000) must always suppress this seq-1 create.
+				drop, _ := s.ShouldDrop(baseCreate)
+				require.True(t, drop, "base tombstone must remain visible across concurrent merges")
+			}
+		}()
+	}
+
+	// One writer merges a stream of distinct live tombstones (copy-on-write).
+	for i := range writes {
+		part := recordTombstoneSnapshot("did:plc:x", "c", "r"+strconv.Itoa(i), uint64(100+i))
+		s.Merge(part)
+	}
+	close(stop)
+	wg.Wait()
+
+	// Every merged tombstone must be present in the final snapshot (no lost
+	// update across the copy-on-write swaps).
+	for i := range writes {
+		create := &segment.Event{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:x", Collection: "c", Rkey: "r" + strconv.Itoa(i)}
+		drop, _ := s.ShouldDrop(create)
+		require.True(t, drop, "merged tombstone %d must be visible in the final snapshot", i)
+	}
 }
