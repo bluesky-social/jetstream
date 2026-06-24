@@ -232,9 +232,9 @@ func reportThroughput(ctx context.Context, out io.Writer, client *jetstream.Clie
 		if secs <= 0 {
 			secs = 1
 		}
-		eps := float64(events-lastEvents) / secs
-		_, _ = fmt.Fprintf(out, "%s elapsed=%s events=%s eps=%.0f last_cursor=%d\n",
-			label, now.Sub(start).Round(time.Second), formatCount(events), eps, lastCursor)
+		eps := uint64(float64(events-lastEvents)/secs + 0.5)
+		_, _ = fmt.Fprintf(out, "%s elapsed=%s events=%s events_per_second=%s last_cursor=%d\n",
+			label, now.Sub(start).Round(time.Second), formatCount(events), formatCount(eps), lastCursor)
 		lastAt = now
 		lastEvents = events
 	}

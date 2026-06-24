@@ -52,8 +52,10 @@ func startDebug(ctx context.Context, cfg debugConfig) (func(), error) {
 		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 		// Bind up front so a failure to listen is reported to the caller rather
-		// than swallowed inside the serve goroutine.
-		ln, err := net.Listen("tcp", cfg.pprofAddr)
+		// than swallowed inside the serve goroutine. ListenConfig.Listen ties the
+		// bind to ctx (the run context), so cancellation during startup is honored.
+		var lc net.ListenConfig
+		ln, err := lc.Listen(ctx, "tcp", cfg.pprofAddr)
 		if err != nil {
 			return nil, fmt.Errorf("debug: pprof listen on %q: %w", cfg.pprofAddr, err)
 		}
