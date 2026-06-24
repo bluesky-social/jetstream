@@ -9,10 +9,44 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	rpprof "runtime/pprof"
 	"sync/atomic"
 	"time"
 )
+
+// defaultGCPercent is the GOGC target the client applies for a run. A backfill
+// allocates heavily (a record map + a CBOR clone + a CID string per event) yet
+// keeps only a small, bounded live set (the in-flight decode window), so the Go
+// default of 100 — collect when the heap doubles over the live set — triggers a
+// GC roughly every ~110 ms, and GC was ~⅓ of client CPU at high decode
+// concurrency (#142). 400 (collect at ~5× the live set) cuts GC frequency ~3.6×
+// for ~+12% throughput at ~8 GiB peak RSS; higher values (800, off) buy only a
+// few more percent for 2–4× the RAM, so 400 is the measured knee of the curve.
+// It is just a default: --gc-percent overrides it, and an explicit GOGC env var
+// wins outright (see tuneGC).
+const defaultGCPercent = 400
+
+// tuneGC raises the GC target to pct for this process, unless the operator has
+// already pinned GOGC in the environment — in which case we leave their choice
+// untouched (the Go runtime already applied it at startup). pct <= 0 disables
+// tuning entirely, deferring to whatever the runtime defaulted to.
+//
+// This lives in the client COMMAND, never the library: SetGCPercent is a
+// process-global knob, and a library that mutated it on import would silently
+// reshape the GC behavior of any program that embeds the client. The standalone
+// backfill tool owns its process, so tuning here is appropriate.
+func tuneGC(pct int) {
+	if pct <= 0 {
+		return
+	}
+	if _, ok := os.LookupEnv("GOGC"); ok {
+		// The runtime honored GOGC at startup; respect the operator's explicit
+		// choice rather than overriding it from the flag default.
+		return
+	}
+	debug.SetGCPercent(pct)
+}
 
 // debugConfig configures the optional profiling/observability harness used to
 // investigate client memory growth during large backfills. Everything here is

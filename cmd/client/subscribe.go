@@ -79,6 +79,11 @@ func subscribeCommand() *cli.Command {
 				Usage: "Optional total run duration; 0 runs until interrupted",
 				Value: 0,
 			},
+			&cli.IntFlag{
+				Name:  "gc-percent",
+				Usage: "GOGC target for the run (higher = less frequent GC, more RAM). Default tuned for backfill throughput; ignored if GOGC is set in the environment.",
+				Value: defaultGCPercent,
+			},
 			&cli.StringFlag{
 				Name:  "debug-pprof-addr",
 				Usage: "If set (e.g. localhost:6061), serve net/http/pprof for memory investigation",
@@ -105,6 +110,13 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 	if out == nil {
 		out = os.Stdout
 	}
+
+	// Tune GC before the run. A backfill is allocation-heavy (one record map +
+	// CBOR clone per event) but its live set is small and bounded, so the default
+	// GOGC=100 collects far too often relative to available RAM — GC was ~⅓ of
+	// client CPU at high decode concurrency (#142). Raising the target trades RAM
+	// for throughput. Honors an explicit GOGC env var (we skip tuning then).
+	tuneGC(cmd.Int("gc-percent"))
 
 	opts := []jetstream.Option{
 		jetstream.WithBatchSize(cmd.Int("batch-size")),
