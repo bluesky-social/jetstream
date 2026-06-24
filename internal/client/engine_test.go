@@ -517,6 +517,150 @@ func TestEngineLiveOnlyAppliesCollectionFilter(t *testing.T) {
 		"only the app.bsky.feed.post events (seq 1 and 5) must be delivered")
 }
 
+// TestEngineLiveOnlyCollectionFilterDropsAccountIdentity is a regression guard
+// for #142: with a collection filter set, the live-only path must NOT surface
+// #account or #identity events to the consumer (they carry no collection, so a
+// collection-scoped subscriber did not ask for them). #sync is also not a user
+// record. Only matching commits flow through.
+func TestEngineLiveOnlyCollectionFilterDropsAccountIdentity(t *testing.T) {
+	t.Parallel()
+	conn := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "app.bsky.feed.post", "r1", true)},
+		{data: liveIdentityFrame(2, "did:plc:a", "alice.test")},
+		{data: liveAccountFrame(3, "did:plc:a", true, "")},
+		{data: liveCommitFrame(t, 4, "did:plc:a", "create", "app.bsky.feed.like", "r4", true)},
+		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
+	}}
+	dial, _ := scriptedDialer(conn)
+	cfg := Config{
+		Host:           "https://h",
+		Request:        PlanRequest{Collections: []string{"app.bsky.feed.post"}},
+		Backfill:       false,
+		BatchSize:      1,
+		MaxBatchDelay:  time.Millisecond,
+		LiveBackoffMin: time.Millisecond,
+		Dial:           dial,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func(batch []Event) bool {
+				mu.Lock()
+				events = append(events, batch...)
+				done := false
+				for _, ev := range events {
+					if ev.Seq == 5 {
+						done = true
+					}
+				}
+				mu.Unlock()
+				if done {
+					cancel()
+					return false
+				}
+				return true
+			},
+			func(error) bool { return true },
+		)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("filtered live-only engine did not deliver within 5s")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, ev := range events {
+		require.Equalf(t, KindCommit, ev.Kind,
+			"only commits may be delivered under a collection filter; leaked kind=%s seq=%d", ev.Kind, ev.Seq)
+		require.Equal(t, "app.bsky.feed.post", ev.Commit.Collection)
+	}
+	require.Equal(t, []uint64{1, 5}, uniqueSeqs(events),
+		"only the app.bsky.feed.post commits (seq 1 and 5) survive; account/identity are dropped")
+}
+
+// TestEngineLiveOnlyNoFilterDeliversAccountIdentity guards the other side of
+// #142: with no collection filter, account and identity events ARE delivered.
+func TestEngineLiveOnlyNoFilterDeliversAccountIdentity(t *testing.T) {
+	t.Parallel()
+	conn := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "app.bsky.feed.post", "r1", true)},
+		{data: liveIdentityFrame(2, "did:plc:a", "alice.test")},
+		{data: liveAccountFrame(3, "did:plc:a", true, "")},
+	}}
+	dial, _ := scriptedDialer(conn)
+	cfg := Config{
+		Host:           "https://h",
+		Request:        PlanRequest{}, // no filters
+		Backfill:       false,
+		BatchSize:      1,
+		MaxBatchDelay:  time.Millisecond,
+		LiveBackoffMin: time.Millisecond,
+		Dial:           dial,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		mu     sync.Mutex
+		kinds  []Kind
+		events []Event
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func(batch []Event) bool {
+				mu.Lock()
+				events = append(events, batch...)
+				for _, ev := range batch {
+					kinds = append(kinds, ev.Kind)
+				}
+				done := false
+				for _, ev := range events {
+					if ev.Seq == 3 {
+						done = true
+					}
+				}
+				mu.Unlock()
+				if done {
+					cancel()
+					return false
+				}
+				return true
+			},
+			func(error) bool { return true },
+		)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("unfiltered live-only engine did not deliver within 5s")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []uint64{1, 2, 3}, uniqueSeqs(events),
+		"all events flow when no collection filter is set")
+	require.Contains(t, kinds, KindIdentity, "identity must be delivered with no filter")
+	require.Contains(t, kinds, KindAccount, "account must be delivered with no filter")
+}
+
 // TestEngineLiveOnlyBreakOnQuietTail is a regression guard: a consumer that
 // breaks the iterator after one event, on a tail that then goes quiet (no more
 // frames), must let Run return promptly. The stop is propagated by the batch

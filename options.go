@@ -58,11 +58,21 @@ func (c *config) backfillRequested() bool {
 // either an exact NSID (e.g. "app.bsky.feed.post") or a namespace wildcard
 // ending in ".*" (e.g. "app.bsky.feed.*"). Empty or unset means all
 // collections.
+//
+// Setting a collection filter also suppresses Account and Identity events:
+// they carry no collection, so a collection-scoped subscriber does not receive
+// them. (Account deletions are still applied internally as tombstones, so
+// records for a deleted account are correctly suppressed — you just don't see
+// the Account event itself.) With no collection filter, Account and Identity
+// events are delivered, subject to WithDIDs. See issue #142.
 func WithCollections(collections []string) Option {
 	return func(c *config) { c.collections = append([]string(nil), collections...) }
 }
 
 // WithDIDs restricts delivery to the given DIDs. Empty or unset means all DIDs.
+// The DID filter applies to every event kind, including Account and Identity:
+// with a DID filter and no collection filter, you receive Account and Identity
+// events for the matching DIDs only.
 func WithDIDs(dids []string) Option {
 	return func(c *config) { c.dids = append([]string(nil), dids...) }
 }

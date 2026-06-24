@@ -555,6 +555,16 @@ As noted in Section 3, all event types are stored in the segment files, not just
 
 Internally, Jetstream doesn't care about handles, identity updates, or hosting status, but consumers of the application certainly do. `#identity`, `#account`, and `#sync` events are stored in-line with `#commit` events in the same segment blocks and passed along to clients as they come over the firehose.
 
+#### Identity/Account delivery and the collection filter
+
+The legacy `/subscribe` (v1) endpoint preserves the original Jetstream contract: regardless of `wantedCollections`, all subscribers receive `#account` and `#identity` events (they are still gated by `wantedDids`). This is intentional backwards compatibility and must not change.
+
+The `/subscribe-v2` endpoint and the Go client library use a more intuitive policy (see [#142](https://github.com/bluesky-social/jetstream/issues/142)). A subscriber that requests specific collections (e.g. `app.bsky.feed.post`) is asking for those record types; receiving unrelated `#account`/`#identity` events is surprising. So:
+
+- **No collection filter and no DID filter:** all `#account`/`#identity` events are delivered (the whole stream).
+- **DID filter only:** `#account`/`#identity` events are delivered for the matching DIDs only (the DID filter already applies to every kind).
+- **Collection filter set:** `#identity` events are not delivered. On the wire, `/subscribe-v2` still forwards `#account` events (and the Go client folds them) because an `#account` delete (`active=false, status=deleted`) is a DID-level tombstone the client needs to suppress that account's stale records; the Go client then hides the `#account` event from user-level code so a collection-scoped subscriber sees only matching commits. Record-deletion correctness is preserved because tombstone folding happens before the delivery filter.
+
 Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we store the `KindSync` row followed by the authoritative replacement records returned by the verifier. The `KindSync` row is a DID tombstone for compaction (see Section 3.3), so older pre-divergence record rows are physically removed once the relevant sealed segment is compacted.
 
 ## 5. Client Protocol and Libraries
