@@ -14,6 +14,7 @@
     --accent: #2860c8;
     --bar-bg: #eee;
     --warn: #b33a3a;
+    --ok: #207a3a;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -25,6 +26,7 @@
       --accent: #6aa3ff;
       --bar-bg: #333;
       --warn: #ff8a8a;
+      --ok: #58d27d;
     }
   }
   body {
@@ -109,6 +111,22 @@
     display: flex; flex-wrap: wrap; gap: 0.5rem;
     margin-bottom: 1rem;
   }
+  .view-toggle {
+    display: inline-flex;
+    gap: 0.25rem;
+    margin: 0 0 0.75rem 0;
+  }
+  .view-toggle a {
+    color: var(--fg);
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.25rem 0.5rem;
+  }
+  .view-toggle a.active {
+    color: var(--accent);
+    background: var(--bar-bg);
+  }
   input, button {
     box-sizing: border-box;
     font: inherit;
@@ -122,6 +140,9 @@
   .lookup-input { min-width: 0; flex: 1 1 18rem; }
   .filter { width: min(28rem, 100%); margin-bottom: 0.75rem; }
   .error-text { color: var(--warn); overflow-wrap: anywhere; }
+  .match-state { font-weight: 700; }
+  .match-ok { color: var(--ok); }
+  .match-fail { color: var(--warn); }
   .samples { margin: 0.25rem 0 0 0; padding-left: 1rem; color: var(--muted); font-size: 0.86rem; }
   .sample-did code { overflow-wrap: anywhere; }
   .account-link {
@@ -156,6 +177,7 @@
     <a class="tab {{if eq .Request.Tab "hosts"}}active{{end}}" href="/status?tab=hosts">Hosts</a>
     <a class="tab {{if eq .Request.Tab "accounts"}}active{{end}}" href="/status?tab=accounts">Accounts</a>
     <a class="tab {{if eq .Request.Tab "collections"}}active{{end}}" href="/status?tab=collections">Collections</a>
+    <a class="tab {{if eq .Request.Tab "segments"}}active{{end}}" href="/status?tab=segments">Segment Files</a>
   </nav>
 
   {{if eq .Request.Tab "summary"}}
@@ -166,6 +188,8 @@
     {{template "accounts" .}}
   {{else if eq .Request.Tab "collections"}}
     {{template "collections" .}}
+  {{else if eq .Request.Tab "segments"}}
+    {{template "segmentFiles" .}}
   {{end}}
 </main>
 <script>
@@ -243,6 +267,22 @@ document.addEventListener("input", function (event) {
     <h2>Network</h2>
     {{with .SegmentAggregate}}
     <dl>
+      <dt>Events</dt><dd>{{humanInt .Network.Events}}</dd>
+      <dt>Collections</dt><dd>{{.Network.Collections}} distinct NSIDs</dd>
+      {{if gt .Network.Events 0}}
+      <dt>Seq range</dt><dd>[{{humanInt .Network.MinSeq}}, {{humanInt .Network.MaxSeq}}]</dd>
+      {{if not .Network.MinIndexedAt.IsZero}}<dt>Indexed range</dt><dd>{{.Network.MinIndexedAt.Format "2006-01-02 15:04:05"}} ... {{.Network.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>{{end}}
+      {{end}}
+    </dl>
+    {{end}}
+  </section>
+{{end}}
+
+{{define "segmentFiles"}}
+  <section>
+    <h2>Network segment files</h2>
+    {{with .SegmentAggregate}}
+    <dl>
       <dt>Segments</dt><dd>{{.Network.Segments}} ({{.Network.SealedSegments}} sealed{{if gt .Network.ActiveSegments 0}} + {{.Network.ActiveSegments}} active{{end}})</dd>
       <dt>Blocks</dt><dd>{{humanInt .Network.Blocks}}</dd>
       <dt>Events</dt><dd>{{humanInt .Network.Events}}</dd>
@@ -257,28 +297,6 @@ document.addEventListener("input", function (event) {
     </dl>
     {{end}}
   </section>
-
-  {{if .Hosts.TopFailing}}
-  <section>
-    <h2>Top failing hosts</h2>
-    <div class="table-wrap">
-    <table class="status-table">
-      <colgroup><col class="host-col"><col class="count-col"><col class="count-col"><col></colgroup>
-      <thead><tr><th>Host</th><th class="num">Repos</th><th class="num">Failed</th><th>Error</th></tr></thead>
-      <tbody>
-      {{range .Hosts.TopFailing}}
-        <tr>
-          <td><code>{{.Host}}</code></td>
-          <td class="num">{{humanInt .Total}}</td>
-          <td class="num">{{humanInt .Failed}}</td>
-          <td class="wide">{{if .LatestErrorClass}}<code>{{.LatestErrorClass}}</code> {{end}}{{.LatestError}}</td>
-        </tr>
-      {{end}}
-      </tbody>
-    </table>
-    </div>
-  </section>
-  {{end}}
 
   <section>
     <h2>Segments</h2>
@@ -326,6 +344,10 @@ document.addEventListener("input", function (event) {
 {{define "hosts"}}
 <section>
   <h2>Hosts</h2>
+  <div class="view-toggle" aria-label="host sort">
+    <a class="{{if eq .Request.HostSort "largest"}}active{{end}}" href="/status?tab=hosts&amp;sort=largest">Largest hosts</a>
+    <a class="{{if eq .Request.HostSort "failing"}}active{{end}}" href="/status?tab=hosts&amp;sort=failing">Failing hosts</a>
+  </div>
   <input id="host-filter" class="filter" placeholder="filter host, class, DID, or error">
   {{if .Hosts.Rows}}
   <div class="table-wrap">
@@ -411,7 +433,7 @@ document.addEventListener("input", function (event) {
   <div class="latest">
     <h3>Repo verification</h3>
     <dl>
-      <dt>Result</dt><dd>{{if .Match}}match{{else}}mismatch{{end}}</dd>
+      <dt>Result</dt><dd>{{if .Match}}<span class="match-state match-ok">Match</span>{{else}}<span class="match-state match-fail">Match failure</span>{{end}}</dd>
       <dt>authoritative rev</dt><dd>{{if .AuthoritativeRev}}<code>{{.AuthoritativeRev}}</code>{{else}}unknown{{end}}</dd>
       <dt>authoritative root</dt><dd>{{if .AuthoritativeRoot}}<code>{{.AuthoritativeRoot}}</code>{{else}}unknown{{end}}</dd>
       <dt>local rev</dt><dd>{{if .LocalLatestRev}}<code>{{.LocalLatestRev}}</code>{{else}}unknown{{end}}</dd>
@@ -423,18 +445,6 @@ document.addEventListener("input", function (event) {
   {{end}}
   {{if .RepoVerificationError}}
   <div class="latest"><h3>Repo verification</h3><div class="error-text">{{.RepoVerificationError}}</div></div>
-  {{end}}
-  {{with .Account.HostContext}}
-  <div class="latest">
-    <h3>Host context</h3>
-    <dl>
-      <dt>Host repos</dt><dd>{{humanInt .Total}}</dd>
-      <dt>Host active</dt><dd>{{humanInt .Active}}</dd>
-      <dt>Host complete</dt><dd>{{humanInt .Complete}}</dd>
-      <dt>Host failed</dt><dd>{{humanInt .Failed}}</dd>
-      {{if .LatestError}}<dt>Host latest error</dt><dd class="error-text">{{.LatestError}}</dd>{{end}}
-    </dl>
-  </div>
   {{end}}
   {{else if .Account.Error}}
   <p class="error-text">{{.Account.Error}}</p>

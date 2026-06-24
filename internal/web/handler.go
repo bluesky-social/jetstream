@@ -163,10 +163,11 @@ func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqStatus := status.Request{
-		Tab:     r.URL.Query().Get("tab"),
-		Account: r.URL.Query().Get("account"),
-		DID:     r.URL.Query().Get("did"),
-		Handle:  r.URL.Query().Get("handle"),
+		Tab:      r.URL.Query().Get("tab"),
+		Account:  r.URL.Query().Get("account"),
+		DID:      r.URL.Query().Get("did"),
+		Handle:   r.URL.Query().Get("handle"),
+		HostSort: r.URL.Query().Get("sort"),
 	}
 
 	snap, err := h.src.SnapshotForRequest(r.Context(), reqStatus)

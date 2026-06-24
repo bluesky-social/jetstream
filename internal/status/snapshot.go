@@ -25,10 +25,11 @@ type Snapshot struct {
 
 // Request selects the status-page view and optional account lookup.
 type Request struct {
-	Tab     string
-	Account string
-	DID     string
-	Handle  string
+	Tab      string
+	Account  string
+	DID      string
+	Handle   string
+	HostSort string
 }
 
 // ProcessInfo carries the per-process build + uptime context.
@@ -113,7 +114,6 @@ type AccountLookup struct {
 	LastAttemptedAt time.Time
 	RecordCount     int64
 	TotalBytes      int64
-	HostContext     *HostRow
 }
 
 // LiveStats summarizes the upstream cursor and seq counters.

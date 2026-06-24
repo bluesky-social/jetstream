@@ -29,11 +29,19 @@ import (
 
 type fakeIdentityResolver struct {
 	handles map[atmos.Handle]atmos.DID
+	docs    map[atmos.DID]*identity.DIDDocument
 	err     error
 }
 
-func (r *fakeIdentityResolver) ResolveDID(_ context.Context, _ atmos.DID) (*identity.DIDDocument, error) {
-	return nil, nil
+func (r *fakeIdentityResolver) ResolveDID(_ context.Context, did atmos.DID) (*identity.DIDDocument, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	doc, ok := r.docs[did]
+	if !ok {
+		return nil, errors.New("did not found")
+	}
+	return doc, nil
 }
 
 func (r *fakeIdentityResolver) ResolveHandle(_ context.Context, handle atmos.Handle) (atmos.DID, error) {
@@ -262,17 +270,48 @@ func TestCollect_HostDiagnosticsTopFailingIsBounded(t *testing.T) {
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
 	require.NoError(t, err)
-	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "summary"})
+	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "hosts", HostSort: "failing"})
 	require.NoError(t, err)
 
+	require.Equal(t, "failing", snap.Request.HostSort)
 	require.Len(t, snap.Hosts.Rows, 13)
 	require.Len(t, snap.Hosts.TopFailing, 10)
+	require.Equal(t, uint64(12), snap.Hosts.Rows[0].Failed)
 	require.Equal(t, uint64(12), snap.Hosts.TopFailing[0].Failed)
 	require.Equal(t, uint64(3), snap.Hosts.TopFailing[9].Failed)
 	for _, row := range snap.Hosts.TopFailing {
 		require.Positive(t, row.Failed)
 		require.NotEqual(t, "healthy.example.com", row.Host)
 	}
+}
+
+func TestCollect_HostDiagnosticsDefaultsToLargestHosts(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	for _, hs := range []*backfill.HostStatus{
+		{Host: "small-failing.example.com", Total: 10, Failed: 9},
+		{Host: "large-healthy.example.com", Total: 100, Complete: 100},
+		{Host: "medium-failing.example.com", Total: 50, Failed: 8},
+	} {
+		enc, err := backfill.EncodeHostStatus(hs)
+		require.NoError(t, err)
+		require.NoError(t, st.Set([]byte("host/"+hs.Host), enc, store.SyncWrites))
+	}
+
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
+	require.NoError(t, err)
+	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "hosts"})
+	require.NoError(t, err)
+
+	require.Equal(t, "largest", snap.Request.HostSort)
+	require.Equal(t, "large-healthy.example.com", snap.Hosts.Rows[0].Host)
+	require.Equal(t, "medium-failing.example.com", snap.Hosts.Rows[1].Host)
+	require.Equal(t, "small-failing.example.com", snap.Hosts.Rows[2].Host)
+	require.Equal(t, "small-failing.example.com", snap.Hosts.TopFailing[0].Host)
 }
 
 func TestCollect_AccountLookupByHandle(t *testing.T) {
@@ -331,8 +370,6 @@ func TestCollect_AccountLookupByHandle(t *testing.T) {
 	require.Equal(t, "latest-rev", snap.Account.LatestRev)
 	require.Equal(t, int64(42), snap.Account.RecordCount)
 	require.Equal(t, int64(1024), snap.Account.TotalBytes)
-	require.NotNil(t, snap.Account.HostContext)
-	require.Equal(t, uint64(2), snap.Account.HostContext.Failed)
 }
 
 func TestCollect_AccountLookupByHandleResolverFallback(t *testing.T) {
@@ -366,7 +403,43 @@ func TestCollect_AccountLookupByHandleResolverFallback(t *testing.T) {
 	require.Equal(t, string(did), snap.Account.DID)
 	require.Equal(t, "calabro.io", snap.Account.Query)
 	require.Equal(t, "handle", snap.Account.QueryKind)
+	require.Equal(t, "calabro.io", snap.Account.Handle)
 	require.Equal(t, "complete", snap.Account.Backfill)
+}
+
+func TestCollect_AccountLookupDIDHydratesMissingHandleFromResolver(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	did := atmos.DID("did:plc:resolved")
+	enc, err := backfill.EncodeRepoStatus(&backfill.RepoStatus{
+		Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete},
+		Host:     "pds.example.com",
+		Active:   true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
+
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		IdentityResolver: &fakeIdentityResolver{docs: map[atmos.DID]*identity.DIDDocument{
+			did: {
+				ID:          string(did),
+				AlsoKnownAs: []string{"at://resolved.test"},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	snap, err := c.SnapshotForRequest(t.Context(), status.Request{Tab: "accounts", Account: string(did)})
+	require.NoError(t, err)
+
+	require.True(t, snap.Account.Found)
+	require.Equal(t, string(did), snap.Account.DID)
+	require.Equal(t, "resolved.test", snap.Account.Handle)
 }
 
 func TestCollect_AccountLookupByHandlePrefersResolverOverLocalIndex(t *testing.T) {
