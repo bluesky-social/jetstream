@@ -193,7 +193,9 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "3d 7h")
 	require.NotContains(t, body, "Metadata store")
 	require.NotContains(t, body, "Latest segment")
-	require.NotContains(t, body, "Cursor lookback")
+	require.Contains(t, body, "Cursor lookback")
+	require.Contains(t, body, "1d 12h")       // 36h formatted by humanDuration
+	require.Contains(t, body, "5,000")        // OldestRetainedSeq formatted
 	require.Contains(t, body, "12,345")       // Network event count via humanInt
 	require.Contains(t, body, "[100, 1,233]") // Seq range
 	require.Contains(t, body, "2026-05-24")
@@ -568,9 +570,7 @@ func TestHandler_RendersSegmentFilesTab(t *testing.T) {
 	require.Contains(t, body, "Latest segment")
 	require.Contains(t, body, "1,234") // Latest segment EventCount via humanInt
 	require.Contains(t, body, "567")   // UniqueDIDCount via humanInt64Cast
-	require.Contains(t, body, "Cursor lookback")
-	require.Contains(t, body, "1d 12h") // 36h formatted by humanDuration
-	require.Contains(t, body, "5,000")  // OldestRetainedSeq formatted
+	require.NotContains(t, body, "Cursor lookback")
 	require.NotContains(t, body, "<h2>Phase</h2>")
 }
 

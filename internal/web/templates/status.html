@@ -264,6 +264,16 @@ document.addEventListener("input", function (event) {
     </dl>
     {{end}}
   </section>
+
+  <section>
+    <h2>Cursor lookback</h2>
+    <dl>
+      <dt>Configured lookback</dt><dd>{{if eq .CursorLookback.ConfiguredLookback 0}}<em>disabled</em>{{else}}{{humanDuration .CursorLookback.ConfiguredLookback}}{{end}}</dd>
+      <dt>Sealed segments tracked</dt><dd>{{humanInt64Cast .CursorLookback.ManifestSegmentCount}}</dd>
+      <dt>Oldest retained seq</dt>
+      <dd>{{if .CursorLookback.OldestRetainedAt.IsZero}}<em>n/a</em>{{else}}{{humanInt64Cast .CursorLookback.OldestRetainedSeq}} <small>({{relativeTime .CursorLookback.OldestRetainedAt .Now}})</small>{{end}}</dd>
+    </dl>
+  </section>
 {{end}}
 
 {{define "segmentFiles"}}
@@ -308,15 +318,6 @@ document.addEventListener("input", function (event) {
     {{end}}
   </section>
 
-  <section>
-    <h2>Cursor lookback</h2>
-    <dl>
-      <dt>Configured lookback</dt><dd>{{if eq .CursorLookback.ConfiguredLookback 0}}<em>disabled</em>{{else}}{{humanDuration .CursorLookback.ConfiguredLookback}}{{end}}</dd>
-      <dt>Sealed segments tracked</dt><dd>{{humanInt64Cast .CursorLookback.ManifestSegmentCount}}</dd>
-      <dt>Oldest retained seq</dt>
-      <dd>{{if .CursorLookback.OldestRetainedAt.IsZero}}<em>n/a</em>{{else}}{{humanInt64Cast .CursorLookback.OldestRetainedSeq}} <small>({{relativeTime .CursorLookback.OldestRetainedAt .Now}})</small>{{end}}</dd>
-    </dl>
-  </section>
 {{end}}
 
 {{define "backfillDuration"}}
