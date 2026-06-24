@@ -8,14 +8,17 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -128,6 +131,18 @@ func (as *archiveServer) addSegment(t *testing.T, name string, events []segment.
 
 func (as *archiveServer) downloader(concurrency int) *Downloader {
 	return NewDownloader(&xrpc.Client{Host: as.srv.URL}, concurrency, nil)
+}
+
+// noKeepAliveDownloader builds a downloader whose HTTP transport disables
+// connection reuse. The goroutine-leak test counts goroutines, and net/http's
+// idle keep-alive connections (one reader goroutine each, pooled up to
+// MaxIdleConns) otherwise accumulate independently of the pipeline and swamp the
+// signal. Disabling keep-alives makes every connection tear down promptly so the
+// count reflects only pipeline goroutines.
+func (as *archiveServer) noKeepAliveDownloader(concurrency int) *Downloader {
+	hc := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	xc := &xrpc.Client{Host: as.srv.URL, HTTPClient: gt.Some(hc)}
+	return NewDownloader(xc, concurrency, nil)
 }
 
 func (as *archiveServer) downloaderWith(concurrency int, sel RowSelector) *Downloader {
@@ -334,6 +349,114 @@ func TestDownloadEarlyStopMidSegmentCancels(t *testing.T) {
 	require.Equal(t, 1, emitted, "emit must be called exactly once before stopping")
 	require.Less(t, int(as.segReqs.Load()), n,
 		"early stop must cancel pending downloads, not fetch the whole plan")
+}
+
+// TestDownloadParallelOrderingUnderShuffledCompletion is the core ordering guard
+// for the parallel-decode pipeline (#142 lever 2): decode runs across a worker
+// pool and completes out of order, but emission must still be strict ascending
+// plan order. Many multi-block segments at high concurrency exercise genuine
+// parallelism; the test asserts the flattened seq stream is exactly the sorted
+// plan order. Run with -race, this also pins the pipeline race-free.
+func TestDownloadParallelOrderingUnderShuffledCompletion(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	const nSeg = 40
+	const perSeg = 10 // 5 blocks/segment at MaxEventsPerBlock=2
+	var entries []PlanEntry
+	var want []uint64
+	for s := range nSeg {
+		var events []segment.Event
+		for i := range perSeg {
+			seq := uint64(s*1000 + i + 1)
+			want = append(want, seq)
+			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
+		}
+		as.addSegment(t, segName(s), events)
+		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+	}
+
+	// High concurrency: decode order is effectively shuffled across the pool.
+	got := collectOrdered(t, as.downloader(16), entries)
+	require.Equal(t, want, seqs(got), "parallel decode must not perturb plan/seq order")
+}
+
+// TestDownloadConcurrencyEquivalence asserts the emitted event stream is
+// identical regardless of decode-pool size — the parallelism knob changes
+// throughput, never output. Pinning equivalence across 1/4/16 workers catches
+// any ordering or dropped/duplicated-block bug that only manifests at a
+// particular degree of parallelism.
+func TestDownloadConcurrencyEquivalence(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	const nSeg = 12
+	var entries []PlanEntry
+	for s := range nSeg {
+		var events []segment.Event
+		for i := range 8 { // 4 blocks/segment
+			seq := uint64(s*1000 + i + 1)
+			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
+		}
+		as.addSegment(t, segName(s), events)
+		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+	}
+
+	base := seqs(collectOrdered(t, as.downloader(1), entries))
+	for _, c := range []int{4, 16, 32} {
+		got := seqs(collectOrdered(t, as.downloader(c), entries))
+		require.Equal(t, base, got, "output must be independent of decode concurrency=%d", c)
+	}
+}
+
+// TestDownloadNoGoroutineLeak asserts the pipeline (framer, prefetcher, decode
+// pool, reassembler) fully unwinds on both clean completion and early-stop —
+// no leaked goroutine after Download returns. A leak would mean a worker blocked
+// forever on a send with no reader, the exact failure mode the bounded channels
+// + cancellation paths exist to prevent.
+// Not parallel: goroutine counting needs a quiet baseline, so it must not run
+// concurrently with other tests spawning their own goroutines.
+//
+//nolint:paralleltest // intentionally serial: measures process-wide goroutine count
+func TestDownloadNoGoroutineLeak(t *testing.T) {
+	as := newArchiveServer(t)
+	const nSeg = 20
+	var entries []PlanEntry
+	for s := range nSeg {
+		var events []segment.Event
+		for i := range 6 {
+			seq := uint64(s*1000 + i + 1)
+			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
+		}
+		as.addSegment(t, segName(s), events)
+		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+	}
+
+	settle := func() int {
+		for range 40 {
+			time.Sleep(5 * time.Millisecond)
+			runtime.GC()
+		}
+		return runtime.NumGoroutine()
+	}
+
+	// Warm up first so any one-time/lazy goroutines exist before the baseline,
+	// then measure growth across many runs. Keep-alives are disabled so HTTP
+	// connection goroutines do not accumulate and the count reflects the pipeline.
+	dl := as.noKeepAliveDownloader(8)
+	_ = collectOrdered(t, dl, entries)
+	_ = dl.Download(context.Background(), entries, func(EntryResult) bool { return false })
+
+	before := settle()
+	const runs = 15
+	for range runs {
+		_ = collectOrdered(t, dl, entries)
+		_ = dl.Download(context.Background(), entries, func(EntryResult) bool { return false })
+	}
+	after := settle()
+	// The pipeline spawns ~concurrency+4 goroutines per Download; a per-run leak
+	// across 2*runs Downloads would add dozens. A leak-free pipeline returns to
+	// the baseline (small slack for runtime/GC bookkeeping churn).
+	require.LessOrEqual(t, after, before+5,
+		"goroutines must not grow across %d Download runs (leak); before=%d after=%d", 2*runs, before, after)
 }
 
 func TestDownloadWholeSegment(t *testing.T) {
