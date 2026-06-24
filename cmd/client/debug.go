@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -27,9 +28,14 @@ type debugConfig struct {
 // startDebug wires up the opt-in profiling harness and returns a stop function.
 // It is safe to call with a zero debugConfig (everything stays off). The
 // returned stop flushes a final MemStats sample and stops background pollers.
-func startDebug(ctx context.Context, cfg debugConfig) func() {
+//
+// When pprofAddr is set, the listener is bound synchronously so an explicit
+// operator request to expose pprof fails loudly (EADDRINUSE, bad address,
+// permission denied) instead of silently never starting — a debugging control
+// that quietly does nothing is worse than no control at all.
+func startDebug(ctx context.Context, cfg debugConfig) (func(), error) {
 	if cfg.pprofAddr == "" && cfg.sampleInterval == 0 && cfg.rssLimitMiB == 0 {
-		return func() {}
+		return func() {}, nil
 	}
 
 	dir := cfg.profileDir
@@ -45,10 +51,16 @@ func startDebug(ctx context.Context, cfg debugConfig) func() {
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-		srv := &http.Server{Addr: cfg.pprofAddr, Handler: mux}
+		// Bind up front so a failure to listen is reported to the caller rather
+		// than swallowed inside the serve goroutine.
+		ln, err := net.Listen("tcp", cfg.pprofAddr)
+		if err != nil {
+			return nil, fmt.Errorf("debug: pprof listen on %q: %w", cfg.pprofAddr, err)
+		}
+		srv := &http.Server{Handler: mux}
 		go func() {
-			fmt.Fprintf(os.Stderr, "debug: pprof listening on http://%s/debug/pprof/\n", cfg.pprofAddr)
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "debug: pprof listening on http://%s/debug/pprof/\n", ln.Addr())
+			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 				fmt.Fprintln(os.Stderr, "debug: pprof server:", err)
 			}
 		}()
@@ -129,7 +141,7 @@ func startDebug(ctx context.Context, cfg debugConfig) func() {
 			sample("final")
 		}
 		dumpProfiles("final")
-	}
+	}, nil
 }
 
 // rssBytes returns the process resident set size in bytes, read from

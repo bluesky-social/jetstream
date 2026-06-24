@@ -176,12 +176,15 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 		defer cancel()
 	}
 
-	stopDebug := startDebug(runCtx, debugConfig{
+	stopDebug, err := startDebug(runCtx, debugConfig{
 		pprofAddr:      cmd.String("debug-pprof-addr"),
 		sampleInterval: cmd.Duration("debug-mem-interval"),
 		profileDir:     cmd.String("debug-profile-dir"),
 		rssLimitMiB:    cmd.Int("debug-rss-limit-mib"),
 	})
+	if err != nil {
+		return err
+	}
 	defer stopDebug()
 
 	if cmd.Bool("print") {
