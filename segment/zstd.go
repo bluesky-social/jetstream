@@ -2,6 +2,7 @@ package segment
 
 import (
 	"fmt"
+	"runtime"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -33,8 +34,17 @@ func init() {
 		panic(fmt.Sprintf("segment: zstd encoder init failed: %v", err))
 	}
 
+	// WithDecoderConcurrency raises the pool of block decoders DecodeAll draws
+	// from. klauspost defaults this to min(GOMAXPROCS, 4): a hard cap of 4 that
+	// silently serializes concurrent DecodeAll callers beyond 4, throttling the
+	// client's parallel backfill decode to ~4 cores regardless of its configured
+	// concurrency. Sizing the pool to GOMAXPROCS lets the parallel-decode
+	// pipeline actually scale; each pooled blockDec is cheap and idle ones cost
+	// nothing, and the server's seal/scan callers only benefit from the extra
+	// capacity. (DecodeAll is already safe for concurrent use across goroutines.)
 	blockDecoder, err = zstd.NewReader(nil,
 		zstd.WithDecoderMaxMemory(maxDecodedBlockBytes),
+		zstd.WithDecoderConcurrency(runtime.GOMAXPROCS(0)),
 	)
 	if err != nil {
 		panic(fmt.Sprintf("segment: zstd decoder init failed: %v", err))
