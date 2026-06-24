@@ -35,15 +35,18 @@ func newEngine(host string, cfg config) (engine, error) {
 			HasBeforeSeq: cfg.hasBeforeSeq,
 			BeforeSeq:    cfg.beforeSeq,
 		},
-		Backfill:     cfg.backfillRequested(),
-		BackfillOnly: cfg.backfillOnly,
-		LiveCursor:   cfg.liveCursor,
-		BatchSize:    cfg.batchSize,
-		Concurrency:  cfg.downloadConc,
-		Buffer:       bufAdapter,
-		XRPC:         newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second)),
-		BulkXRPC:     newXRPCClient(host, cfg, xrpc.BulkDownloadOpts()),
-		Logger:       cfg.logger,
+		Backfill:         cfg.backfillRequested(),
+		BackfillOnly:     cfg.backfillOnly,
+		LiveCursor:       cfg.liveCursor,
+		BatchSize:        cfg.batchSize,
+		Concurrency:      cfg.downloadConc,
+		Buffer:           bufAdapter,
+		XRPC:             newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second)),
+		BulkXRPC:         newXRPCClient(host, cfg, xrpc.BulkDownloadOpts()),
+		Logger:           cfg.logger,
+		RawRecords:       cfg.rawRecords,
+		RawRecordsCopied: cfg.rawRecordsCopied,
+		RawRecordCIDs:    cfg.rawRecordCIDs,
 	}
 	// ownBuf gates whether close() calls buf.Close(); only true when we created
 	// the buffer ourselves. When buf is nil (backfill-only, no caller buffer)
@@ -88,9 +91,12 @@ type realEngine struct {
 	closed    bool               // Close was called; a later run starts cancelled
 }
 
-func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
-	// Derive a cancelable ctx so Close can unwind a running tail. If Close
-	// already happened, start cancelled so the run returns promptly.
+// driveRun runs the engine with the caller's emit/error closures and backfill
+// sink, wrapping it in the Close cancellation handshake: it derives a cancelable
+// ctx, publishes the cancel so a concurrent Close can unwind the run, and clears
+// it on return. Both the default (*Batch) run and the generic typed run share
+// this; the only difference between them is the closures + sink they build.
+func (e *realEngine) driveRun(ctx context.Context, emitBatch func([]iclient.Event) bool, emitErr func(error) bool, bf iclient.BackfillSink) {
 	runCtx, cancel := context.WithCancel(ctx)
 	e.mu.Lock()
 	if e.closed {
@@ -106,8 +112,10 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 		e.mu.Unlock()
 		cancel()
 	}()
+	e.eng.RunWithBackfill(runCtx, emitBatch, emitErr, bf)
+}
 
-	ctx = runCtx
+func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	stopped := false
 
 	// Backfill fast path: convert + batch each decoded block ON the parallel
@@ -163,7 +171,7 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 		},
 	}
 
-	e.eng.RunWithBackfill(ctx,
+	e.driveRun(ctx,
 		func(batch []iclient.Event) bool {
 			if stopped {
 				return false

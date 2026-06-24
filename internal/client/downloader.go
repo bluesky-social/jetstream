@@ -53,12 +53,21 @@ type Downloader struct {
 	// unchanged (direct Download callers / unit tests). A nil return for a block
 	// means "nothing to emit" (empty/filtered), matching the len(events)>0 skip.
 	transform func(entryIdx int, evs []Event) any
+	// mode controls how commit records are materialized (raw vs. map[string]any).
+	// Zero value = the default map-building path, so existing callers/tests are
+	// unaffected. Set via SetRecordMode.
+	mode recordDecodeMode
 }
 
 // SetTransform installs the per-block worker-side transform (see Downloader.transform).
 // It is set separately from NewDownloader so the constructor signature stays
 // stable for the many direct callers/tests that do not need it.
 func (d *Downloader) SetTransform(fn func(entryIdx int, evs []Event) any) { d.transform = fn }
+
+// SetRecordMode selects raw vs. map record decode (see recordDecodeMode). The
+// zero value (default map build) applies when unset, keeping existing callers
+// unchanged.
+func (d *Downloader) SetRecordMode(m recordDecodeMode) { d.mode = m }
 
 // NewDownloader returns a Downloader using xc for getSegment/getBlock calls.
 // concurrency bounds in-flight downloads; values < 1 are clamped to 1.
@@ -488,7 +497,7 @@ func (d *Downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]
 			commit = &commits[ci]
 			ci++
 		}
-		ev, err := decodeSegmentEventInto(&rows[i], commit)
+		ev, err := decodeSegmentEventInto(&rows[i], commit, d.mode)
 		if err != nil {
 			return nil, err
 		}

@@ -69,6 +69,10 @@ func subscribeCommand() *cli.Command {
 				Name:  "print",
 				Usage: "Print each event as JSON instead of throughput stats",
 			},
+			&cli.BoolFlag{
+				Name:  "typed-likes-client",
+				Usage: "Decode records via the typed fast path (skips the generic map). Requires exactly --collection=app.bsky.feed.like; reports typed-decode throughput.",
+			},
 			&cli.DurationFlag{
 				Name:  "report-interval",
 				Usage: "How often to print throughput stats (when not --print)",
@@ -178,6 +182,19 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 		opts = append(opts, jetstream.WithLiveBuffer(buf))
 	}
 
+	// --typed-likes-client decodes records straight into bsky.FeedLike via the
+	// raw-record fast path (no generic map). It only makes sense for a single
+	// known record type, so require exactly --collection=app.bsky.feed.like, and
+	// enable WithRawRecords so the engine skips the map build on the workers.
+	typedLikes := cmd.Bool("typed-likes-client")
+	if typedLikes {
+		cols := cmd.StringSlice("collection")
+		if len(cols) != 1 || cols[0] != "app.bsky.feed.like" {
+			return fmt.Errorf("--typed-likes-client requires exactly --collection=app.bsky.feed.like")
+		}
+		opts = append(opts, jetstream.WithRawRecords())
+	}
+
 	client, err := jetstream.Subscribe(cmd.String("host"), opts...)
 	if err != nil {
 		return err
@@ -204,6 +221,9 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 	}
 	defer stopDebug()
 
+	if typedLikes {
+		return reportTypedLikeThroughput(runCtx, out, client, cmd.Duration("report-interval"))
+	}
 	if cmd.Bool("print") {
 		return printEvents(runCtx, out, client)
 	}

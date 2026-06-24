@@ -34,6 +34,13 @@ type config struct {
 	// (initial + retries) the XRPC clients make per request. 0 (unset)
 	// leaves xrpc on its default retry policy. See WithMaxDownloadAttempts.
 	maxDownloadAttempts int
+	// rawRecords skips building Commit.Record map[string]any (see WithRawRecords);
+	// rawRecordsCopied additionally clones RecordCBOR so it is safe to retain
+	// (see WithRawRecordsCopied); rawRecordCIDs keeps computing Commit.CID in raw
+	// mode (see WithRawRecordCIDs).
+	rawRecords       bool
+	rawRecordsCopied bool
+	rawRecordCIDs    bool
 }
 
 // Defaults applied when an option is not supplied.
@@ -228,4 +235,50 @@ func WithLogger(l *slog.Logger) Option {
 			c.logger = l
 		}
 	}
+}
+
+// WithRawRecords makes commit decoding SKIP building the generic
+// Commit.Record map[string]any. Instead, Commit.Record is left nil and
+// Commit.RecordCBOR is populated with the record's raw DAG-CBOR bytes, which the
+// caller decodes itself — typically into a typed struct via the generic
+// TypedEvents helper. Building the generic map dominates decode CPU and
+// allocations at scale (#142), so skipping it is the main lever for high-volume
+// backfills of a single record type (e.g. app.bsky.feed.like).
+//
+// Deletes (no record), identity/account/sync events, and the default Commit
+// fields (Operation/Collection/Rkey/Rev) are unaffected. Commit.CID is left
+// empty in raw mode unless WithRawRecordCIDs is also set (computing it is real
+// per-record work this fast path avoids by default).
+//
+// Aliasing/lifetime contract: in raw mode Commit.RecordCBOR aliases the
+// client's internal decompressed buffer on the backfill path (zero-copy), valid
+// only for the lifetime of the Batch that delivered it — the same contract the
+// default Record already carries. Anything decoded from it that retains slices
+// or strings (typed structs whose string fields alias the input) is likewise
+// valid only for the batch; copy it to retain longer. Use WithRawRecordsCopied
+// for a safe (cloned) variant that still skips the map build.
+func WithRawRecords() Option {
+	return func(c *config) { c.rawRecords = true }
+}
+
+// WithRawRecordsCopied is like WithRawRecords but Commit.RecordCBOR is a private
+// copy of the record bytes (not an alias of the internal buffer), so it — and
+// anything decoded from it — is safe to retain past the delivering Batch. It
+// still skips the generic map build; the only cost over WithRawRecords is one
+// allocation + copy of the raw bytes per commit. Use this when the consumer
+// keeps records around; use WithRawRecords for maximum throughput when records
+// are processed within the iteration.
+func WithRawRecordsCopied() Option {
+	return func(c *config) {
+		c.rawRecords = true
+		c.rawRecordsCopied = true
+	}
+}
+
+// WithRawRecordCIDs keeps computing Commit.CID (the record's content identifier,
+// a sha256 + base32 of the payload) when raw-record mode is enabled. Without it,
+// raw mode leaves Commit.CID empty to avoid the per-record hashing cost. No
+// effect unless WithRawRecords or WithRawRecordsCopied is also set.
+func WithRawRecordCIDs() Option {
+	return func(c *config) { c.rawRecordCIDs = true }
 }

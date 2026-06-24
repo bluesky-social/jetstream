@@ -20,7 +20,7 @@ import (
 // bytes retained in the returned Event (notably RecordCBOR) are copied.
 func decodeSegmentEvent(ev *segment.Event) (Event, error) {
 	var commit Commit
-	return decodeSegmentEventInto(ev, &commit)
+	return decodeSegmentEventInto(ev, &commit, recordDecodeMode{})
 }
 
 // decodeSegmentEventInto is decodeSegmentEvent but writes a commit row's data
@@ -31,7 +31,8 @@ func decodeSegmentEvent(ev *segment.Event) (Event, error) {
 // identity/account/sync rows it is ignored and those shapes are allocated
 // individually (they are comparatively rare). The caller MUST ensure commit's
 // backing slab is not grown/reallocated while the returned Event is reachable.
-func decodeSegmentEventInto(ev *segment.Event, commit *Commit) (Event, error) {
+// mode is forwarded to decodeCommitInto (raw vs. map record materialization).
+func decodeSegmentEventInto(ev *segment.Event, commit *Commit, mode recordDecodeMode) (Event, error) {
 	out := Event{
 		DID:    ev.DID,
 		Seq:    ev.Seq,
@@ -39,7 +40,7 @@ func decodeSegmentEventInto(ev *segment.Event, commit *Commit) (Event, error) {
 	}
 	switch ev.Kind {
 	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
-		if err := decodeCommitInto(ev, commit); err != nil {
+		if err := decodeCommitInto(ev, commit, mode); err != nil {
 			return Event{}, err
 		}
 		out.Kind = KindCommit
@@ -76,7 +77,7 @@ func decodeSegmentEventInto(ev *segment.Event, commit *Commit) (Event, error) {
 // tests and single-event callers.
 func decodeCommit(ev *segment.Event) (*Commit, error) {
 	commit := &Commit{}
-	if err := decodeCommitInto(ev, commit); err != nil {
+	if err := decodeCommitInto(ev, commit, recordDecodeMode{}); err != nil {
 		return nil, err
 	}
 	return commit, nil
@@ -85,7 +86,17 @@ func decodeCommit(ev *segment.Event) (*Commit, error) {
 // decodeCommitInto fills *commit from a commit row. On error *commit may hold
 // partial data, but the caller discards the event (and the slab slot is never
 // read) on a decode failure, so the partial write is harmless.
-func decodeCommitInto(ev *segment.Event, commit *Commit) error {
+//
+// mode selects record materialization. In the default (map) mode it builds the
+// generic Record map[string]any, computes the CID, and clones RecordCBOR so the
+// caller may retain it. In raw mode it SKIPS the map build entirely (the
+// dominant decode allocation): Record stays nil, RecordCBOR aliases ev.Payload
+// zero-copy, and the CID is computed only if mode.wantCIDs. The raw aliasing is
+// safe because ev.Payload aliases the decompressed block buffer, which outlives
+// the batch (the segment events already alias it for DID/Collection/Rkey/Rev);
+// the contract — valid for the batch lifetime, copy to retain — is the same one
+// the default Record (built via UnmarshalNoCopy) already carries.
+func decodeCommitInto(ev *segment.Event, commit *Commit, mode recordDecodeMode) error {
 	*commit = Commit{
 		Operation:  commitOperation(ev.Kind),
 		Collection: ev.Collection,
@@ -93,6 +104,18 @@ func decodeCommitInto(ev *segment.Event, commit *Commit) error {
 		Rev:        ev.Rev,
 	}
 	if ev.Kind == segment.KindDelete {
+		return nil
+	}
+
+	if mode.raw {
+		if mode.wantCIDs {
+			commit.CID = cbor.ComputeCID(cbor.CodecDagCBOR, ev.Payload).String()
+		}
+		if mode.copyCBOR {
+			commit.RecordCBOR = bytes.Clone(ev.Payload) // safe to retain (WithRawRecordsCopied)
+		} else {
+			commit.RecordCBOR = ev.Payload // zero-copy alias; see doc + WithRawRecords contract
+		}
 		return nil
 	}
 

@@ -28,7 +28,7 @@ func FuzzDecodeLiveFrame(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic. The return values are all acceptable; we only assert
 		// the absence of a crash and basic invariants on success.
-		ev, err := decodeLiveFrame(data)
+		ev, err := decodeLiveFrame(data, recordDecodeMode{})
 		if err != nil {
 			return
 		}

@@ -64,8 +64,10 @@ type liveSync struct {
 
 // decodeLiveFrame parses one extended JSON frame into an engine Event. It
 // returns errSkipFrame for control frames and unknown kinds, and a wrapped
-// error for malformed data frames or server error frames.
-func decodeLiveFrame(data []byte) (Event, error) {
+// error for malformed data frames or server error frames. mode selects raw vs.
+// map record materialization (see recordDecodeMode), matching the backfill path
+// so a typed consumer sees the same shape across the cutover.
+func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, error) {
 	var f liveFrame
 	if err := json.Unmarshal(data, &f); err != nil {
 		return Event{}, fmt.Errorf("jetstream: decode live frame: %w", err)
@@ -84,7 +86,7 @@ func decodeLiveFrame(data []byte) (Event, error) {
 
 	switch Kind(f.Kind) {
 	case KindCommit:
-		commit, err := liveCommitToEvent(f.Commit)
+		commit, err := liveCommitToEvent(f.Commit, mode)
 		if err != nil {
 			return Event{}, err
 		}
@@ -116,7 +118,7 @@ func decodeLiveFrame(data []byte) (Event, error) {
 	return out, nil
 }
 
-func liveCommitToEvent(c *liveCommit) (*Commit, error) {
+func liveCommitToEvent(c *liveCommit, mode recordDecodeMode) (*Commit, error) {
 	if c == nil {
 		return nil, fmt.Errorf("jetstream: live commit frame missing commit payload")
 	}
@@ -136,12 +138,18 @@ func liveCommitToEvent(c *liveCommit) (*Commit, error) {
 		if err != nil {
 			return nil, fmt.Errorf("jetstream: decode live record_cbor (collection=%s rkey=%s): %w", c.Collection, c.Rkey, err)
 		}
-		record, err := decodeRecordMap(raw)
-		if err != nil {
-			return nil, fmt.Errorf("jetstream: decode live record (collection=%s rkey=%s): %w", c.Collection, c.Rkey, err)
-		}
-		commit.Record = record
+		// raw is a fresh base64-decoded buffer (already owned), so it is safe to
+		// retain regardless of mode. In raw mode we skip the map build and leave
+		// Record nil; the consumer decodes RecordCBOR into a typed struct. CID is
+		// already on the wire here, so raw mode keeps it (no extra work).
 		commit.RecordCBOR = raw
+		if !mode.raw {
+			record, err := decodeRecordMap(raw)
+			if err != nil {
+				return nil, fmt.Errorf("jetstream: decode live record (collection=%s rkey=%s): %w", c.Collection, c.Rkey, err)
+			}
+			commit.Record = record
+		}
 	case OpDelete:
 		// No record payload on deletes.
 	default:
