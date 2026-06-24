@@ -134,45 +134,50 @@ func decodeRecordMap(payload []byte) (map[string]any, error) {
 	return jsonShapedMap(m), nil
 }
 
-// jsonShapedValue converts one cbor.ReadValue result into its ATProto
-// JSON-shaped form, recursively. The mapping mirrors cbor.ToJSON followed by
-// encoding/json round-tripping exactly:
-//   - int64/float64 -> float64 (encoding/json represents all JSON numbers as
-//     float64 when decoding into any; the old path went through JSON text, so a
-//     CBOR integer surfaced as a float64 — preserved here to stay byte-for-byte
-//     compatible with existing consumers).
+// jsonShapedValue converts one decoded CBOR value into its ATProto JSON-shaped
+// form, recursively. The mapping mirrors cbor.ToJSON followed by encoding/json
+// round-tripping exactly:
+//   - int64 -> float64 (encoding/json represents all JSON numbers as float64
+//     when decoding into any; the old path went through JSON text, so a CBOR
+//     integer surfaced as a float64 — preserved for byte-for-byte compatibility).
 //   - []byte        -> {"$bytes": base64.RawStdEncoding}
 //   - cbor.CID      -> {"$link": cid.String()}
-//   - []any / map   -> converted element-wise.
-//   - string/bool/nil -> unchanged.
+//   - []any / map   -> converted element-wise, in place.
+//   - string/bool/float64/nil -> passed through unchanged (original box reused).
+//
+// It mutates maps and slices in place and reuses the decoder's existing any
+// boxes for unchanged scalars, so it allocates only where the value's JSON shape
+// actually differs from its CBOR form (integers, byte strings, CID links).
 func jsonShapedValue(v any) any {
 	switch val := v.(type) {
-	case nil:
-		return nil
-	case bool:
-		return val
-	case string:
-		return val
 	case int64:
+		// CBOR integers surface as JSON float64 (the canonical cbor.ToJSON +
+		// encoding/json contract). This is the one pass-through-shaped arm that
+		// MUST re-box: the stored kind genuinely changes (int64 box -> float64).
 		return float64(val)
-	case float64:
-		return val
 	case []byte:
 		return map[string]any{"$bytes": base64.RawStdEncoding.EncodeToString(val)}
 	case cbor.CID:
 		return map[string]any{"$link": val.String()}
 	case []any:
-		out := make([]any, len(val))
+		// Rewrite in place rather than allocating a second slice: the slice came
+		// from the decoder and is not retained elsewhere. Only elements that
+		// actually change kind re-box, via the recursion.
 		for i := range val {
-			out[i] = jsonShapedValue(val[i])
+			val[i] = jsonShapedValue(val[i])
 		}
-		return out
+		return val
 	case map[string]any:
 		return jsonShapedMap(val)
 	default:
-		// ReadValue only ever returns the cases above; a new kind would be a
-		// library change. Return as-is rather than dropping data silently.
-		return val
+		// string, bool, float64, nil, and any other already-JSON-shaped scalar
+		// pass through UNCHANGED — and we return the ORIGINAL box v, not a
+		// re-asserted value. Writing `case string: return val` would unbox to a
+		// concrete string and then heap-allocate a FRESH any box on return
+		// (runtime.convTstring), once per scalar leaf — ~22% of decode allocations
+		// (#142). Returning v reuses the box the decoder already produced; output
+		// is byte-identical (same kind, same value).
+		return v
 	}
 }
 
