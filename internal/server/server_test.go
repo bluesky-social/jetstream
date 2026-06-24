@@ -132,6 +132,26 @@ func TestServer_RecordsMetricsForPublicRequests(t *testing.T) {
 	require.Contains(t, metrics, `method="GET"`)
 }
 
+func TestPublicHandler_IndexRendersHTML(t *testing.T) {
+	t.Parallel()
+	base := mountPublic(t, newServer(t))
+
+	resp, err := doGet(t.Context(), base+"/")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "text/html; charset=utf-8", resp.Header.Get("Content-Type"))
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	bodyStr := string(body)
+	require.Contains(t, bodyStr, "<!doctype html>")
+	require.Contains(t, bodyStr, `href="/status"`)
+	require.Contains(t, bodyStr, `class="jet"`)
+	require.Contains(t, bodyStr, "████")
+	require.NotContains(t, bodyStr, "overflow-x: auto")
+}
+
 // TestServer_MetricsCaptureNon200StatusCodes verifies that
 // statusRecorder.WriteHeader is wired correctly: a 404 from the
 // default mux must surface as `code="404"` on the histogram, not
