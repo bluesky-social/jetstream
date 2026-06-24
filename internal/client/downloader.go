@@ -446,23 +446,67 @@ func reassemble(entries []PlanEntry, results <-chan decodeResult, sem chan struc
 // decodeFrame decompresses one block frame, applies the row selector before
 // decode (so filtered/suppressed rows are never materialized), and converts
 // the survivors to events.
+//
+// Commit rows dominate the archive (e.g. app.bsky.feed.like), and each commit's
+// *Commit was one heap allocation. To cut that, the surviving commit rows of a
+// block draw their Commit structs from a single per-block []Commit slab and the
+// events reference &slab[i] — collapsing N allocations to one per block. The
+// slab is sized exactly to the kept-commit count and NEVER appended to, so the
+// &slab[i] pointers stay valid (a realloc would dangle them). It is a fresh
+// allocation per block, dropped to GC with the batch; it is never pooled/reused,
+// so a consumer still holding an earlier batch can never observe a mutation.
 func (d *Downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]Event, error) {
 	rows, err := segment.DecodeBlockFrame(frame)
 	if err != nil {
 		return nil, fmt.Errorf("jetstream: decode block %d of %q: %w", blockIdx, segName, err)
 	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	// One Commit slab + one Event slab for the whole block, instead of a separate
+	// *Commit heap allocation per commit row. Each surviving commit takes the next
+	// slab slot (&commits[ci]); the events reference those pointers. The slab is
+	// sized to len(rows) and NEVER appended to, so &commits[ci] never dangles (a
+	// realloc would). It is sized to the row count rather than the surviving-
+	// commit count to keep this a single pass that runs the selector exactly once;
+	// when a collection/DID filter drops rows, the unused tail slots are zeroed
+	// Commits that are never referenced and are dropped to GC with the block. The
+	// slab is a fresh per-block allocation, never pooled, so a consumer still
+	// holding an earlier batch can never observe a mutation.
+	commits := make([]Commit, len(rows))
 	out := make([]Event, 0, len(rows))
+	ci := 0
 	for i := range rows {
 		if d.selector != nil {
 			if keep, _ := d.selector.Keep(&rows[i]); !keep {
 				continue
 			}
 		}
-		ev, err := decodeSegmentEvent(&rows[i])
+		var commit *Commit
+		if isCommitKind(rows[i].Kind) {
+			commit = &commits[ci]
+			ci++
+		}
+		ev, err := decodeSegmentEventInto(&rows[i], commit)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, ev)
 	}
+	if len(out) == 0 {
+		return nil, nil
+	}
 	return out, nil
+}
+
+// isCommitKind reports whether a segment row kind decodes to a KindCommit event
+// (and therefore consumes a Commit slab slot in decodeFrame).
+func isCommitKind(k segment.Kind) bool {
+	switch k {
+	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
+		return true
+	default:
+		return false
+	}
 }

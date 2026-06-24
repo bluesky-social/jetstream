@@ -235,15 +235,38 @@ func (a bufferAdapter) Replay(ctx context.Context, after gt.Option[uint64]) func
 func (a bufferAdapter) Truncate(throughSeq uint64) error { return a.b.Truncate(throughSeq) }
 func (a bufferAdapter) Close() error                     { return a.b.Close() }
 
+// toPublicEvents converts a block (or batch) of internal events to public
+// events. Commit rows dominate, and each public *Commit was one heap allocation
+// on top of the internal one; here the whole input's commits draw from a single
+// []Commit slab and each public event references &slab[i], collapsing N
+// allocations to one. The slab is sized to len(evs) and never grown, so the
+// &slab[i] pointers stay valid; it is a fresh per-call allocation dropped to GC
+// with the batch and never pooled, so a consumer holding an earlier batch is
+// unaffected. Non-commit kinds (identity/account/sync) are comparatively rare
+// and keep their individual allocations.
 func toPublicEvents(evs []iclient.Event) []Event {
+	if len(evs) == 0 {
+		return nil
+	}
+	commits := make([]Commit, len(evs))
 	out := make([]Event, len(evs))
+	ci := 0
 	for i := range evs {
-		out[i] = toPublicEvent(evs[i])
+		var commit *Commit
+		if evs[i].Kind == iclient.KindCommit && evs[i].Commit != nil {
+			commit = &commits[ci]
+			ci++
+		}
+		out[i] = toPublicEventInto(evs[i], commit)
 	}
 	return out
 }
 
-func toPublicEvent(ev iclient.Event) Event {
+// toPublicEventInto converts one internal event to a public event. For a commit
+// row it fills the caller-provided *commit (a slab slot; see toPublicEvents)
+// rather than allocating; commit must be non-nil exactly when ev is a commit
+// with a non-nil internal Commit. Other kinds allocate their own shape.
+func toPublicEventInto(ev iclient.Event, commit *Commit) Event {
 	out := Event{
 		DID:    ev.DID,
 		Seq:    ev.Seq,
@@ -253,7 +276,7 @@ func toPublicEvent(ev iclient.Event) Event {
 	switch ev.Kind {
 	case iclient.KindCommit:
 		if ev.Commit != nil {
-			out.Commit = &Commit{
+			*commit = Commit{
 				Operation:  Operation(ev.Commit.Operation),
 				Collection: ev.Commit.Collection,
 				Rkey:       ev.Commit.Rkey,
@@ -262,6 +285,7 @@ func toPublicEvent(ev iclient.Event) Event {
 				Record:     ev.Commit.Record,
 				RecordCBOR: ev.Commit.RecordCBOR,
 			}
+			out.Commit = commit
 		}
 	case iclient.KindIdentity:
 		if ev.Identity != nil {

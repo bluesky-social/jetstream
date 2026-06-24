@@ -11,12 +11,27 @@ import (
 )
 
 // decodeSegmentEvent converts a decoded segment row into the engine's
-// region-agnostic Event. It decodes the raw CBOR payload into a generic
-// record map (for commits) and the typed identity/account/sync shapes.
+// region-agnostic Event, allocating a fresh *Commit for a commit row. It is the
+// single-event helper used by tests and one-off callers; the hot decode path
+// uses decodeSegmentEventInto with a per-block Commit slab to avoid one heap
+// allocation per commit.
 //
 // segment.Event payloads alias a shared decompressed block buffer, so any
 // bytes retained in the returned Event (notably RecordCBOR) are copied.
 func decodeSegmentEvent(ev *segment.Event) (Event, error) {
+	var commit Commit
+	return decodeSegmentEventInto(ev, &commit)
+}
+
+// decodeSegmentEventInto is decodeSegmentEvent but writes a commit row's data
+// into the caller-provided *commit instead of allocating one. The caller passes
+// a pointer into a per-block []Commit slab (see decodeFrame), so a whole block's
+// commits cost one slice allocation rather than one *Commit each. commit is only
+// written (and referenced by the returned Event) for commit-kind rows; for
+// identity/account/sync rows it is ignored and those shapes are allocated
+// individually (they are comparatively rare). The caller MUST ensure commit's
+// backing slab is not grown/reallocated while the returned Event is reachable.
+func decodeSegmentEventInto(ev *segment.Event, commit *Commit) (Event, error) {
 	out := Event{
 		DID:    ev.DID,
 		Seq:    ev.Seq,
@@ -24,8 +39,7 @@ func decodeSegmentEvent(ev *segment.Event) (Event, error) {
 	}
 	switch ev.Kind {
 	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
-		commit, err := decodeCommit(ev)
-		if err != nil {
+		if err := decodeCommitInto(ev, commit); err != nil {
 			return Event{}, err
 		}
 		out.Kind = KindCommit
@@ -57,26 +71,40 @@ func decodeSegmentEvent(ev *segment.Event) (Event, error) {
 	return out, nil
 }
 
+// decodeCommit decodes a commit row into a freshly-allocated *Commit. The hot
+// path uses decodeCommitInto with a slab slot; this allocating form is kept for
+// tests and single-event callers.
 func decodeCommit(ev *segment.Event) (*Commit, error) {
-	commit := &Commit{
+	commit := &Commit{}
+	if err := decodeCommitInto(ev, commit); err != nil {
+		return nil, err
+	}
+	return commit, nil
+}
+
+// decodeCommitInto fills *commit from a commit row. On error *commit may hold
+// partial data, but the caller discards the event (and the slab slot is never
+// read) on a decode failure, so the partial write is harmless.
+func decodeCommitInto(ev *segment.Event, commit *Commit) error {
+	*commit = Commit{
 		Operation:  commitOperation(ev.Kind),
 		Collection: ev.Collection,
 		Rkey:       ev.Rkey,
 		Rev:        ev.Rev,
 	}
 	if ev.Kind == segment.KindDelete {
-		return commit, nil
+		return nil
 	}
 
 	record, err := decodeRecordMap(ev.Payload)
 	if err != nil {
-		return nil, fmt.Errorf("jetstream: decode record (did=%s collection=%s rkey=%s seq=%d): %w",
+		return fmt.Errorf("jetstream: decode record (did=%s collection=%s rkey=%s seq=%d): %w",
 			ev.DID, ev.Collection, ev.Rkey, ev.Seq, err)
 	}
 	commit.Record = record
 	commit.CID = cbor.ComputeCID(cbor.CodecDagCBOR, ev.Payload).String()
 	commit.RecordCBOR = bytes.Clone(ev.Payload)
-	return commit, nil
+	return nil
 }
 
 // decodeRecordMap decodes DAG-CBOR record bytes into a generic JSON-shaped
