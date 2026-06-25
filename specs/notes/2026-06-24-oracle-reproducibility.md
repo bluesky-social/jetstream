@@ -1169,14 +1169,38 @@ skipping the gap. Over a real socket, generation and consumption interleave in
 real time so the backlog stays under the cap — which is why the real-socket test
 passed at stress and the bubble does not. Mid-scale (1000 < 1024-ish) passes for
 the same reason.
-FIX DIRECTION (next session, focused): pace event generation so the consumer
-keeps up under the fake clock — interleave `synctest.Wait()` into BOTH the steady
-`generateN` AND the bootstrap traffic generator (a steady-only `synctest.Wait` was
-tried and was insufficient; the cutover backlog is built during bootstrap). And/or
-raise `subscribeReplayLimit` for the in-bubble simulator. Add a `Drops()==0`
-fanout assertion as an anti-vacuity guard regardless. Until fixed, the bubble test
-runs at default mode (the CI-relevant scale); stress remains a separate sweep
-concern.
+REFINED DIAGNOSIS (2026-06-25, after instrumented debugging — earlier hypotheses
+RULED OUT):
+- NOT a fanout drop: `fan.TotalDrops()==0` at the stall (buffer sized to volume).
+- NOT the `generateN` pacing: adding `synctest.Wait()`/drain into generateN
+  changed nothing.
+- NOT the steady wait deadline: setting the steady `steadyAck.Wait` timeout to
+  1 fake-HOUR still failed at ~15s WALL — meaning the fake clock raced to the 1h
+  deadline because the consumer had gone durably-blocked (idle), i.e. it STOPPED
+  delivering, it isn't merely slow.
+- Instrumented facts: at the first `synctest.Wait()` the steady consumer is at
+  highestContiguous=5980 (seen=980); it then advances in WAVES (fake clock jumps
+  between durably-blocked points) but PLATEAUS at exactly 9788 of target 10001
+  (consistently ~213 short) and never resumes.
+LEADING HYPOTHESIS NOW: an atmos live-consumer batching/watermark interaction
+under the fake clock — e.g. the consumer's BatchTimeout/cursor-watermark or the
+per-DID parallel scheduler reaches a state where, with no more wall-time arrivals,
+the last partial batch is never flushed and the bubble idles. The 213-short
+plateau being stable across runs points at a deterministic flush/watermark edge,
+not a race.
+NEXT STEPS (fresh session): (1) trace the atmos consumer's batch-flush + cursor
+path under the fake clock (streaming/client.go readLoop batchTimeout timer at
+~817 — does it fire when the bubble is idle?); (2) check whether the last events
+sit in an unflushed batch awaiting a BatchTimeout that the fake clock should
+advance but doesn't because the reader goroutine is parked in conn.Read (a
+non-durable block over the pipe? verify net.Pipe read is durably-blocking);
+(3) if it's the parked reader, that's the crux — a goroutine blocked in
+`conn.Read` on the pipe may or may not count as durably blocked, which would gate
+whether BatchTimeout ever fires. Until resolved, the bubble test runs at default
+mode (the CI-relevant scale); stress remains a separate sweep concern.
+
+KEPT (sound regardless): `bubbleDrain` seam, `fanout.TotalDrops()`, volume-sized
+fanout buffer. Committed.
 
 ## Decision log (continued)
 - 2026-06-24: Steps 1 (jitter), 2 (LiveDial threading), 4 (HTTPTransport)
