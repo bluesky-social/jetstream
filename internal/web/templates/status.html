@@ -445,14 +445,13 @@ document.addEventListener("input", function (event) {
         <dt>DID</dt><dd><code>{{.Account.DID}}</code></dd>
         <dt>declared handle</dt><dd>{{if .Account.Handle}}<code>{{.Account.Handle}}</code>{{else}}unknown{{end}}</dd>
         <dt>PDS endpoint</dt><dd>{{if .Account.PDS}}<code>{{.Account.PDS}}</code>{{else}}unknown{{end}}</dd>
-        <dt>PDS host</dt><dd>{{if .Account.Host}}<code>{{.Account.Host}}</code>{{else}}unknown{{end}}</dd>
         <dt>Active</dt><dd>{{.Account.Active}}</dd>
       </dl>
     </div>
     <div>
       <dl>
         <dt>Backfill</dt><dd><code>{{.Account.Backfill}}</code></dd>
-        <dt>Attempts</dt><dd>{{.Account.Attempts}}</dd>
+        <dt>Retries</dt><dd>{{.Account.Attempts}}</dd>
         <dt>Last attempted</dt><dd>{{relativeTime .Account.LastAttemptedAt .Now}}</dd>
         <dt>Backfill rev</dt><dd>{{if .Account.BackfillRev}}<code>{{.Account.BackfillRev}}</code>{{else}}unknown{{end}}</dd>
         <dt>Latest rev</dt><dd>{{if .Account.LatestRev}}<code>{{.Account.LatestRev}}</code>{{else}}unknown{{end}}</dd>
