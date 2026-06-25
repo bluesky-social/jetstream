@@ -173,7 +173,7 @@ func TestHandler_RendersOK(t *testing.T) {
 
 	body := rr.Body.String()
 	require.Contains(t, body, "jetstream")
-	require.Contains(t, body, "v1.2.3")
+	require.Contains(t, body, "v1.2.3 (commit abcdef0)")
 	require.Contains(t, body, "steady_state")
 	require.Contains(t, body, "Backfill")
 	require.Contains(t, body, "enumerating repos")

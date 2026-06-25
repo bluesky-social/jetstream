@@ -197,9 +197,7 @@
 <main>
   <h1>jetstream</h1>
   <div class="sub">
-    {{.Process.Version}} (commit {{.Process.Commit}})
-    &middot; built {{.Process.BuiltAt}}
-    &middot; uptime {{humanDuration .Process.Uptime}}
+    {{.Process.Version}}{{if and .Process.Commit (ne .Process.Version .Process.Commit)}} (commit {{.Process.Commit}}){{end}}
   </div>
 
   <nav class="tabs" aria-label="status sections">
