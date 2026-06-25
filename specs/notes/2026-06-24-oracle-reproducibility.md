@@ -1237,15 +1237,43 @@ determinism + instant-generation surfaced, NOT product logic bugs:
      (`afterBatch`/WaitContiguousFrom) from INSIDE the durable-batch commit
      callback, which holds ingest writer locks. A wait-for-consumer must never run
      under those locks.
-   FIX DIRECTION (next session): move the `afterBatch` backpressure wait OUT of
-   the `OnDurableBatch`/`AfterRepoComplete` callback. Options: (a) have
-   `AfterRepoComplete` only ENQUEUE the generate+target and perform the
-   `WaitContiguousFrom` from the harness's own goroutine (e.g. the main test
-   goroutine between phases, or a dedicated pacer) outside any writer lock; or
-   (b) drop the per-batch contiguous wait during bootstrap entirely and rely on
-   the after-bootstrap barrier + a single drain (bootstrap already waits for the
-   barrier). Verify the backfill completion-batcher contract still holds. This is
-   harness-only; no production change.
+   FIX ATTEMPTED + WHAT IT REVEALED (2026-06-25): tried option (b) — set
+   `afterBatch = nil` (drop the in-callback `WaitContiguousFrom`). Result: the
+   100-account DEADLOCK is GONE (it now completes), BUT this UNMASKED a separate,
+   pre-existing flaky bug and regressed the previously-100%-stable default tier to
+   ~50% flaky:
+     `after-bootstrap: timed out waiting for firehose event log cursor=0
+      target=200 expected=289 observed=287 (a dropped row never reaches the
+      expected count)`
+   So the per-batch backpressure wait is LOAD-BEARING: it paces generation slow
+   enough to MASK an underlying ~2-event delivery race at the bootstrap-live
+   consumer's subscribe boundary. Reverted `afterBatch` to restore default
+   stability. Net: the deadlock and the 2-event race are TWO bugs; you cannot
+   simply remove the wait without first fixing the race.
+   THE UNDERLYING RACE (the real thing to fix): a fanout publish-vs-subscribe /
+   ring-replay ordering gap. In `generateOne`/`generateAccountDelete`
+   (world/traffic.go:205,225,228; accounts.go) the order is: `w.seq.Add(1)`
+   (CurrentSeq advances) -> encode -> `persistFirehoseFrame` (ring write) ->
+   `fanout.Publish`. So CurrentSeq and even the ring can lag the seq, and a frame
+   can be published to the fanout in the window around a subscriber's
+   `SubscribeFanout()`+replay such that it is neither replayed (not yet in ring /
+   replay already past) nor delivered live (published before subscribe
+   registered). ~2 events at the boundary are lost intermittently. Over real
+   sockets the consumer's real-time pacing + the backpressure wait hid it; the
+   bubble's instant generation exposes it once the wait is removed.
+   FIX DIRECTION (next session): make delivery lossless at the boundary so the
+   backpressure wait is no longer needed for correctness, THEN remove the
+   in-callback wait (which fixes the deadlock). Candidates: (a) in the simulator,
+   make persist+publish+seq-advance atomic under one lock, and have the subscribe
+   handler hold that lock across SubscribeFanout()+initial ring snapshot so no
+   frame can slip between replay and live; (b) or have the consumer treat the
+   OutdatedCursor #info as a re-subscribe (closer to a real relay) so a gap
+   self-heals. All harness/simulator-only; no production jetstream change.
+
+   STATUS: Blocker-2 deadlock root-caused and a fix path proven (afterBatch=nil
+   clears it) but NOT landed, because it requires first fixing the 2-event fanout
+   race to avoid regressing default mode. Default + high-event-volume bubble runs
+   remain green on committed code; 100-acct/stress still blocked on this race.
 
 ## Decision log (continued)
 - 2026-06-24: Steps 1 (jitter), 2 (LiveDial threading), 4 (HTTPTransport)
