@@ -7,6 +7,137 @@ Now executing the FULL-BUBBLE EXECUTION PLAN below.
 
 Owner: Jim (jcalabro). Started 2026-06-24.
 
+---
+
+# BRANCH REVIEW + AGREED PLAN (2026-06-25, session 2) — start here
+
+A full verified review of the `oracle` branch (7 parallel investigations, each
+adversarially re-checked, on the committed HEAD) ran this session. It found
+**three independent defects + one missing guard**, and **corrected two claims in
+the older handoff below**. Everything here is reproduced/verified against code,
+not inferred. Decisions agreed with Jim are marked **DECISION**.
+
+## What's fixed this session
+
+- **R1 — `just test` / per-push CI crash: FIXED + verified.** `just test` now
+  passes (1837 tests, ~2.6s; was a hard crash with 62 collateral failures).
+  Mechanism: the klauspost/compress zstd `Encoder` builds its worker-pool
+  channel **lazily on the first `EncodeAll`** (`encoder.go` `init.Do(initialize)`),
+  because our globals are built with `NewWriter(nil, …)` (nil writer ⇒ Reset
+  skipped ⇒ no eager channel). The in-bubble lifecycle test triggers that first
+  encode INSIDE the synctest bubble, binding the package-global channel to the
+  bubble; a later out-of-bubble `EncodeAll` (e.g. `TestObserveSegmentsPreserves…`
+  → `Writer.Flush`) does a cross-bubble channel receive → runtime fatal
+  `receive on synctest channel from outside bubble`, aborting the whole binary.
+  This is **mode-independent** — reproduced under both `-short` (`just test`) and
+  `-race` default mode (= the per-push `just test-race` lane), so the per-push CI
+  gate was red too, not just the nightly sweep. `WithEncoderConcurrency(1)` does
+  NOT fix it (channel still made + received).
+  FIX: exported `WarmEncoder()` on `segment`, `internal/overlay`,
+  `internal/subscribe`, called from a new `internal/oracle` `TestMain` BEFORE
+  `m.Run()`, relocating the three encoder channels to the no-bubble process
+  context. The zstd **decoders need no warmup** — `NewReader` creates their
+  channel eagerly at package init. Regression guard:
+  `segment.TestWarmEncoderAllowsCrossBubbleEncode` (in-bubble encode then
+  out-of-bubble encode; crashes the binary if the warmup regresses). Committed
+  files: `segment/zstd.go`, `internal/overlay/format.go`,
+  `internal/subscribe/compress.go`, `internal/oracle/main_test.go`,
+  `segment/zstd_bubble_test.go`. (This crash was NOT in the old handoff TODO.)
+
+## Newly surfaced by the R1 fix (was masked by the crash)
+
+- **R5 — restart-tier flake under full-package `-race`.** With the binary no
+  longer aborting, the restart tier now runs after the bubble test in the same
+  process, and `TestOracle_RestartChainShapeA` intermittently fails
+  `compare oracle model` under the **full-package `-race`** run (~1 of 2 full
+  runs; seed 101). It PASSES in isolation (no-race 0.02s; -race 2.2s) and the
+  restart tier passes in isolation across seeds 101/202/303. So it is a real,
+  interleaving/`-race`-dependent restart flake that the zstd crash was hiding —
+  NOT caused by the R1 fix. TRIAGE NEEDED (separate from the bubble work): is it
+  global-state leakage from the bubble test into the same-process restart tier,
+  or a genuine restart-recovery race? Capture the trace artifact it already
+  writes.
+
+## Confirmed defects still open (with corrected mechanisms)
+
+- **R2 — stress/100-acct DEADLOCK (the `oracle-sweep` "infinite loop").**
+  `oracle-sweep` runs `MODE=stress` (100 accts/5000 events/phase) which deadlocks
+  in the bubble and burns the full per-seed `-timeout` (30m; 90m `-race`) × 10
+  seeds ≈ 5h+. Default mode is green and fast (`ok 0.24s`).
+  MECHANISM (goroutine-dump confirmed): the harness `afterBatch`
+  (`harness_test.go:180`, `bootstrapAck.WaitContiguousFrom`) runs INSIDE the
+  backfill writer's durable-batch commit callback while `ingest.Writer.mu` +
+  `drainMu` are held (`writer.go:288-289`), violating the `OnDurableBatch`
+  contract (`config.go:77-80`). Sibling workers park on `drainMu`; the awaited
+  cursor progress never arrives. It is a **true permanent freeze**: a goroutine
+  blocked on `sync.Mutex.Lock` is NOT durably-blocked under synctest, so the fake
+  clock is frozen and `WaitContiguousFrom`'s own 5-min fake timeout can never
+  fire — only the outer `go test -timeout` ends it.
+  **DOC CORRECTION:** the older handoff calls this "deterministic." It is **~40-67%
+  probabilistic** (interleaving-dependent), matching the doc's *original* "~33%
+  flaky." ⇒ every done-when gate must be **20/20 separate-process runs**; one
+  green run is ~33% likely with NO fix.
+  **DECISION (deadlock fix):** use an **off-writer-goroutine bounded semaphore**
+  (acquired in the bootstrap generation loop, released by `bootstrapAck.Observe`
+  on `OnBootstrapLiveEvent`), NOT `afterBatch=nil`. This honors the under-lock
+  contract structurally and **decouples** the deadlock fix from the fanout-race
+  fix so each can be validated independently.
+
+- **R3 — boundary frame loss (the "2-event fanout race"), mechanism CORRECTED.**
+  Two distinct things wear one costume:
+  - The simulator subscribe-boundary ordering gap IS real: `traffic.go:205`
+    `seq.Add` → `:225` persist → `:228` `Publish`, and the relay handler /
+    `SubscribeFanout` take only the fanout lock, never `w.mutationMu`. TODO-1
+    option (a) (atomic seq+ring+publish under one mutex, held across
+    `SubscribeFanout()`+first `FirehoseRange` snapshot) closes THIS window.
+  - **But the PERMANENT loss is a different bug than the handoff claims.** At the
+    bootstrap→merge cutover, atmos's `readLoop` `ctx.Done()` path
+    (`client.go:1191`) discards in-flight frames WITHOUT `drainResults()` (unlike
+    the error paths). The dropped tail event IS re-delivered on steady
+    re-subscribe (cursor correctly held at N-1), but the **shared pebble
+    Verifier** then rejects it as a rev-replay (`silentDrop`) so it's never
+    appended. The handoff's "cursor skips the tail" is **wrong** — the cursor
+    holds; the shared-verifier rev-replay is what makes it permanent. This also
+    explains the intermittency: loss is permanent only when the dropped tail
+    event is one the verifier already advanced rev state for.
+  **DECISION (race scope):** **simulator-first** — land TODO-1 (simulator-only),
+  then re-measure stress with `afterBatch=nil` across many seeds. If tail-loss
+  persists, that confirms the distinct atmos `readLoop` cutover-drain path and we
+  fix `drainResults()`-on-`ctx.Done` in atmos next. Avoid touching shared atmos
+  streaming until proven necessary.
+
+- **R4 — missing anti-vacuity guard.** `harness_test.go:108-110` promises "assert
+  zero drops at shutdown" but there is **no** `fan.TotalDrops()` assertion. Add
+  `require.Zero(t, fan.TotalDrops())` after shutdown (independent of the others;
+  drops==0 today) so a future fanout overflow fails loud instead of silently
+  corrupting the exact-count acks. Prove it can fail by shrinking `fanoutBuf`.
+
+## DECISION (sweep scale)
+
+**Keep `oracle-sweep` on `MODE=stress`** and **do NOT rework the sweep yet** —
+defer it until the deadlock fix (R2) lands. (Trade-off accepted: until then the
+sweep effectively hangs per-seed to the timeout; that's fine while we fix the
+real bug rather than papering over it.) Once R2/R3 land, revisit per-seed
+timeouts + the stale repro hint + the per-push CI gate (old TODO-5/6).
+
+## Sequenced plan (agreed)
+
+1. **[DONE]** R1 zstd warmup `TestMain` + regression test — unblocks `just test`,
+   `just default`, per-push CI.
+2. R4 `require.Zero(fan.TotalDrops())` after shutdown (S; independent).
+3. R3 simulator subscribe-boundary race fix, TODO-1a (M). Gate: default 20/20
+   with `afterBatch` temporarily nil.
+4. R2 deadlock fix via off-goroutine semaphore (M). Gate: 100-acct 20/20, no
+   timeouts.
+5. R5 triage the restart-tier `-race` flake (separate track).
+6. After R2/R3: rework `oracle-sweep` (timeouts, hint) + wire the per-push CI
+   gate (default `-race`, ~0.25s, artifact-on-failure).
+
+VERIFIED-GOOD, no change needed: restart tier is green in isolation and
+correctly stays a real-process tier (`drain()` is a no-op outside the bubble).
+
+---
+
 ## Problem statement
 
 The `oracle-scheduled` CI sweep fails with some regularity, and **we have
@@ -36,6 +167,15 @@ want *substantially more* reliability and reproducibility, not a proof.
 ---
 
 # HANDOFF TODO (next session — start here) — 2026-06-25
+
+> SUPERSEDED IN PART by the **BRANCH REVIEW + AGREED PLAN (session 2)** at the
+> top of this doc. Notably: TODO-1's "2-event fanout race" root cause is
+> corrected (the permanent loss is the atmos cutover-drain + shared-verifier
+> rev-replay, not "cursor skips the tail"); TODO-2's deadlock is **probabilistic
+> ~40-67%, not deterministic**, and the agreed fix is an off-goroutine semaphore,
+> not `afterBatch=nil`; and a previously-undocumented `just test` zstd-bubble
+> crash (R1) is now fixed. Read the session-2 section first; treat the items
+> below as background detail.
 
 State in one line: the FULL `TestOracle_DefaultLifecycle` runs in a synctest
 bubble (no sockets, fake clock) and is GREEN+stable at fast/default/high-event-

@@ -46,6 +46,18 @@ func init() {
 	}
 }
 
+// WarmEncoder forces the package-global zstd overlay encoder to create its
+// internal worker-pool channel now, outside any testing/synctest bubble. See
+// segment.WarmEncoder for the full rationale: klauspost/compress builds that
+// channel lazily on the first EncodeAll, so the first in-bubble Encode would
+// otherwise bind the global channel to the bubble and a later out-of-bubble
+// EncodeAll would fatal "receive on synctest channel from outside bubble".
+// Warms the encoder directly (not via Encode) so it needs no valid snapshot.
+// Test-support only; cheap and idempotent.
+func WarmEncoder() {
+	_ = overlayEncoder.EncodeAll(nil, nil)
+}
+
 func reasonCode(s string) uint8 {
 	switch s {
 	case "account":

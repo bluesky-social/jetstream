@@ -74,6 +74,26 @@ func encodeEmptyBlockCompressed() []byte {
 	return blockEncoder.EncodeAll(encodeEmptyBlock(), nil)
 }
 
+// WarmEncoder forces the package-global zstd block encoder to create its
+// internal worker-pool channel now, on the calling goroutine's context.
+//
+// klauspost/compress builds that channel LAZILY on the first EncodeAll
+// (Encoder.initialize, gated by a sync.Once) — NewWriter(nil, …) skips it
+// because the nil writer skips Reset. Under testing/synctest, the first
+// EncodeAll inside a bubble would bind this package-global channel to that
+// bubble; a later EncodeAll from outside the bubble then aborts the process
+// with the runtime fatal "receive on synctest channel from outside bubble".
+// Calling WarmEncoder before entering a bubble relocates the channel to the
+// no-bubble process context: in-bubble use is then merely non-durably-blocking
+// (harmless) and post-bubble use is fine. The block DECODER needs no warmup —
+// zstd.NewReader creates its channel eagerly at init, before any bubble.
+//
+// Test-support only; cheap and idempotent (the sync.Once makes repeat calls
+// no-ops). Exported so a TestMain in another package can warm the global.
+func WarmEncoder() {
+	_ = encodeEmptyBlockCompressed()
+}
+
 // decodeBlockCompressed is the inverse: decompress, then decodeBlock.
 //
 // We pass a fresh `nil` dst to DecodeAll so body is a private
