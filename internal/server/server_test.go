@@ -4,9 +4,11 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -211,6 +213,89 @@ func TestServer_LifecycleAndGracefulShutdown(t *testing.T) {
 
 	cancel()
 
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not shut down within deadline")
+	}
+}
+
+// memListener is a minimal in-memory net.Listener used to prove Config's
+// injected-listener path: Run serves it instead of binding TCP.
+type memListener struct {
+	conns  chan net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newMemListener() *memListener {
+	return &memListener{conns: make(chan net.Conn), closed: make(chan struct{})}
+}
+
+func (l *memListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *memListener) Close() error   { l.once.Do(func() { close(l.closed) }); return nil }
+func (l *memListener) Addr() net.Addr { return memAddr{} }
+func (l *memListener) dial() (net.Conn, error) {
+	server, client := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-l.closed:
+		_ = server.Close()
+		_ = client.Close()
+		return nil, net.ErrClosed
+	}
+}
+
+type memAddr struct{}
+
+func (memAddr) Network() string { return "mem" }
+func (memAddr) String() string  { return "mem" }
+
+// TestServer_InjectedListeners proves Config.PublicListener/DebugListener are
+// served instead of binding TCP: a request reaches the handler over an
+// in-memory pipe with no socket.
+func TestServer_InjectedListeners(t *testing.T) {
+	t.Parallel()
+
+	pub := newMemListener()
+	dbg := newMemListener()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(Config{
+		ShutdownTimeout: 5 * time.Second,
+		PublicListener:  pub,
+		DebugListener:   dbg,
+	}, logger, obs.NewMetrics())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) { return dbg.dial() },
+	}}
+	require.Eventually(t, func() bool {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://mem/readyz", nil)
+		if err != nil {
+			return false
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, 2*time.Second, 10*time.Millisecond, "injected-listener server never became ready")
+
+	cancel()
 	select {
 	case err := <-done:
 		require.NoError(t, err)

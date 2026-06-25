@@ -393,6 +393,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		DebugAddr:       opts.DebugAddr,
 		ShutdownTimeout: opts.ShutdownTimeout,
 		StatusHandler:   statusHandler,
+		PublicListener:  opts.PublicListener,
+		DebugListener:   opts.DebugListener,
 	}, processLogger, metrics)
 
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();

@@ -5,6 +5,7 @@ package jetstreamd
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -90,6 +91,14 @@ type Options struct {
 	// listener). The ingestion path runs unchanged. Production leaves it
 	// false; the synctest oracle tier uses it to run with no sockets.
 	Headless bool
+
+	// PublicListener and DebugListener, when non-nil, are served by the
+	// public/debug HTTP servers instead of binding TCP. Production leaves
+	// them nil; the in-process oracle harness passes pipe-backed listeners
+	// so the full runtime (including its public surface) runs with no socket
+	// inside a synctest bubble. Ignored when Headless is true.
+	PublicListener net.Listener
+	DebugListener  net.Listener
 
 	CursorLookback            time.Duration
 	SegmentCacheMaxAge        time.Duration
