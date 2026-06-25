@@ -1,7 +1,9 @@
 # Oracle Test Reproducibility — Living Brainstorm
 
-Status: **DRAFT / ongoing.** This is a working document we edit as we research and
-decide. Nothing here is committed work yet.
+Status: **ACTIVE.** Working document we edit as we go. Foundations (atmos
+Conn/Dial seam, jetstream LiveDial + HTTPTransport + Headless, seeded jitter, and
+a lightweight ingest/compaction synctest tier) are implemented and committed.
+Now executing the FULL-BUBBLE EXECUTION PLAN below.
 
 Owner: Jim (jcalabro). Started 2026-06-24.
 
@@ -30,6 +32,162 @@ here** and comes *after* the suite is trustworthy.
 Non-goal: bit-for-bit determinism. This is Go — the goroutine scheduler, GC, and
 real I/O make perfect reproducibility impractical, and we are not chasing it. We
 want *substantially more* reliability and reproducibility, not a proof.
+
+---
+
+# FULL-BUBBLE EXECUTION PLAN (active, 2026-06-25)
+
+DECISION: build the full oracle lifecycle inside one `testing/synctest` bubble —
+the whole `TestOracle_DefaultLifecycle` (ingest + merge + steady + compaction +
+the client-observer SERVING tiers), no real sockets, fake clock. This is the
+highest-value durable outcome: it turns the oracle from a slow, wall-clock-
+dependent scheduled fuzzer into a fast, socket-free, deterministic-time test that
+can gate every push, and it kills the wall-clock false-failure class outright.
+
+What it buys (precise): (1) whole oracle in ms → gateable on every push;
+(2) the `-race`-lane "barrier not reached / runtime did not exit" timeout noise
+becomes IMPOSSIBLE under a fake clock; (3) the near-vacuous serving/client tiers
+become cheap to exercise hard.
+
+What it does NOT buy by itself: synctest fakes TIME, not GOROUTINE SCHEDULING.
+A seed still does not pin an interleaving. Reproducing a specific
+interleaving-dependent failure on demand needs forced-interleaving harnessing
+(`synctest.Wait()` between steps at the seam under test) — tracked as WI-9, to be
+layered on after the bubble works.
+
+Foundations already shipped this session (do not redo): atmos `Conn`/`Dial` seam
+(committed `15ff15c`); `live.Config.Dial` ← `orchestrator.Config.LiveDial` ←
+`jetstreamd.Options.LiveDial` (`7da62b0`); `jetstreamd.Options.HTTPTransport`
+(`233a433`); `jetstreamd.Options.Headless` + the lightweight ingest tier
+(`d062e52`); seeded backoff jitter (`94c2ff8`); `oracle/inprocess.go`
+(`firehoseConn`, `handlerTransport`, `inProcessDial`). The lightweight tier
+(`TestOracle_Synctest`) is the proven base to grow from.
+
+## Ground rules (synctest invariants — verified against Go 1.26 docs + spikes)
+
+- Fake clock advances ONLY when every bubble goroutine is durably blocked
+  (channel/cond/WaitGroup/`time.Sleep`). Network/file I/O and runnable goroutines
+  are NOT durably blocked → no real sockets, no spin loops.
+- ALL bubble goroutines must exit before the bubble fn returns, else
+  "blocked goroutines remain" panic MASKS the real failure. Always `defer` a
+  drain that cancels, waits `rt.Run`, AND calls `rt.Close()` (verifier pool).
+- Advance the bubble clock past the simulator's logical-clock epoch (~2023)
+  before starting the runtime (verifier rejects >5m-future revs). Already solved
+  by `advanceClockToSimulatorEpoch`.
+- One bubble per process (global zstd encoders bind goroutines to the first
+  bubble). Re-runs = separate `go test` invocations.
+- `websocket.Accept` needs `http.Hijacker`; a real `http.Server.Serve` over a
+  `net.Pipe`-backed listener supplies it (spike-confirmed). `websocket.Dial`
+  accepts an `HTTPClient`, so a PipeListener-backed `http.Client` dials the
+  runtime's `/subscribe` in-memory.
+
+## Work items (check off as completed; keep notes inline)
+
+### WI-1 — PipeListener primitive  [ ]
+A `net.Listener` whose `Accept()` blocks on a channel (durably blockable) and
+returns `net.Pipe()`-backed conns, plus a paired `DialContext`/`http.Client`
+that connects to it in-process. Lives in `internal/oracle` (test-support, non-
+`_test.go` so it's importable). One implementation reused for: runtime public
+server, and the client-observer's HTTP client.
+- [ ] Implement `pipeListener` (Accept/Close/Addr) + `pipeDialer` (DialContext).
+- [ ] Build an `*http.Client` whose `Transport.DialContext` → the listener.
+- [ ] Unit test: `http.Server.Serve(pipeListener)` + a websocket Accept/echo +
+      graceful `Shutdown`, all inside a `synctest.Test` bubble, fake clock
+      advances. (Re-confirm the verifier's spike at home in this repo.)
+- Risk: close/EOF + concurrent Accept correctness. Mitigate with the unit test.
+
+### WI-2 — Server listener injection  [ ]
+Let `internal/server` serve on an injected listener instead of binding TCP.
+- [ ] Add `Config.PublicListener` / `Config.DebugListener` (`net.Listener`, nil
+      = bind TCP as today). Branch `Run` at server.go:166/171 to use them.
+- [ ] Preserve `PublicAddr()`/`DebugAddr()` (read `ln.Addr()` either way).
+- [ ] Thread `jetstreamd.Options.PublicListener`/`DebugListener` →
+      `server.Config` in runtime.go:391. (Keep `Headless` for the ingest-only
+      tier; the full tier passes listeners instead.)
+- [ ] Existing server unit tests still green.
+- Risk: low (mechanical). The handlers are unchanged.
+
+### WI-3 — Simulator over the in-process transport  [ ]
+Serve the simulator mux without `httptest.NewServer`.
+- [ ] In the full-bubble harness, run the simulator handler on a real
+      `http.Server` bound to a PipeListener (preserves CAR streaming + getRepo
+      CAR-truncation fault fidelity that a ResponseRecorder would blur).
+- [ ] Runtime's outbound `HTTPTransport` + `LiveDial` target the simulator
+      (HTTPTransport already proven; LiveDial firehoseConn already proven).
+- [ ] Decide: keep `handlerTransport` (ResponseRecorder) for the ingest-only
+      tier, use the PipeListener server for the full tier. Document why.
+
+### WI-4 — Public client live-dial seam  [ ]
+The client-observer's live `/subscribe-v2` cutover must dial in-process.
+- [ ] DECISION (verified options): `internal/client.Config.Dial` ALREADY exists
+      (engine.go:66) but the root `jetstream` engine never sets it, and
+      `websocket.Dial` accepts an `HTTPClient`. PREFER reusing the existing
+      `WithHTTPClient` (options.go:204) by threading `cfg.httpClient` into the
+      live dial's `websocket.DialOptions.HTTPClient` — avoids a NEW public
+      `WithDial` API. Fallback: add `WithDial` if the HTTPClient path can't carry
+      the in-memory transport through the WS upgrade.
+- [ ] Implement the chosen path in root `engine.go` + `internal/client/live.go`
+      (`liveDialOptions` takes the client's HTTPClient).
+- [ ] Confirm `assertTypedLikeBackfill` (uses `WithBackfillOnly`, no live tail)
+      still works; only `collectClientBackfill` needs the live seam.
+- Risk: this is the one PUBLIC API-surface area. Keep it minimal; if `WithDial`
+  is needed, design the type with only stdlib/atmos types.
+
+### WI-5 — Client-observer transport wiring  [ ]
+Point the observer tier at the runtime in-process.
+- [ ] One shared in-process `*http.Client` (PipeListener-backed) passed to the 3
+      `jetstream.Subscribe` sites (client_observer_test.go:81/245/289) via
+      `WithHTTPClient`.
+- [ ] Replace `http.DefaultClient` at overlay_integration_test.go:29 with it.
+- [ ] `waitForRuntimePublicURL` returns the in-process base URL (no real addr).
+
+### WI-6 — OTEL/metrics guard  [ ]
+- [ ] Confirm the oracle sets no `OTEL_EXPORTER_OTLP_*` (it doesn't) → tracing is
+      noop, no exporter goroutine. Add a defensive assertion/comment. (Likely a
+      no-op; verified `otlpConfigured()` gates the only network exporter.)
+
+### WI-7 — Full-bubble harness entrypoint  [ ]
+The big one. A new `TestOracle_DefaultLifecycle_Synctest` (or refactor the
+existing lifecycle body to run in both modes) that runs the WHOLE lifecycle in a
+bubble.
+- [ ] Extract the lifecycle body so it can run with either real sockets (today)
+      or in-bubble in-process transports, to avoid duplicating ~380 lines.
+- [ ] Move world setup + bootstrap inside the bubble (heavy synchronous work; OK,
+      it doesn't block the bubble).
+- [ ] Move the client-observer assertions into the bubble; replace
+      `require.Eventually`/wall-clock polls with channel blocks or
+      `synctest.Wait()` (Eventually's real-time tick loop won't progress under a
+      fake clock).
+- [ ] Drain: `defer` cancel + `rt.Run` wait + `rt.Close` + simulator server
+      Shutdown + world Close — ALL bubble goroutines must exit.
+- [ ] Verify barriers (`phaseGate`/`seqAck`) work under the fake clock (they use
+      channels + `time.NewTimer`, both faked — should be fine; confirm).
+- Risk: HIGHEST. Whole-graph quiescence. Expect iterative hang/panic debugging;
+  use goroutine dumps to localize the non-durably-blocked goroutine each time.
+
+### WI-8 — Validation & stabilization  [ ]
+- [ ] Passes `-count=1` reliably; `-race` clean.
+- [ ] 20+ separate-process runs green (stability; not `-count` due to one-bubble
+      rule).
+- [ ] Wall-clock runtime recorded (target: seconds, not minutes).
+- [ ] Existing real-socket `TestOracle_DefaultLifecycle` still passes unchanged.
+- [ ] `golangci-lint` clean; `just` recipe added (`just oracle-bubble`).
+- [ ] Doc + decision log updated; atmos `replace` resolution noted.
+
+### WI-9 — (FOLLOW-ON, not full-bubble) Forced-interleaving reproducer  [ ]
+- [ ] On the bubble, drive the resync-vs-compaction seam deterministically with
+      `synctest.Wait()` between steps; assert `CheckCompacted` fails, then goes
+      green on a fix. THIS is the on-demand reproducer for the triaged bug.
+
+## Sequencing & checkpoints
+WI-1 → WI-2 → (WI-3 ‖ WI-4) → WI-5 → WI-6 → WI-7 → WI-8. Commit after each WI.
+Hard checkpoints to raise with Jim: (a) after WI-1 if the PipeListener+websocket
+spike misbehaves; (b) at WI-4 if reusing `WithHTTPClient` fails and a new public
+`WithDial` is required; (c) at WI-7 if whole-graph quiescence proves
+intractable after a bounded effort (timebox: if not converging, fall back to the
+shipped lightweight tier + WI-9 and reassess).
+
+---
 
 ## Why this is happening (contributing factors)
 
