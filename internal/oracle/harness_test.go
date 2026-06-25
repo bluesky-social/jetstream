@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"runtime"
@@ -260,6 +261,10 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-merge", "marker": "after_release"})
 
 	publicURL := waitForRuntimePublicURL(t, cfg, rt, run)
+	// obsClient is the HTTP transport the client-observer tier (client backfill,
+	// typed backfill, overlay fetch) uses to reach the runtime's public surface.
+	// Real sockets here; the in-bubble tier swaps in a pipe-backed client.
+	obsClient := http.DefaultClient
 	passesBeforeSteady := compaction.Count()
 
 	steadyStartSeq := w.CurrentSeq()
@@ -294,12 +299,12 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	// server bug from a client bug). On a CheckCompacted failure we still run
 	// #94's disk-vs-serving bisection to classify durable-defect vs.
 	// serving/client artifact.
-	assertClientBackfillCompacted(t, cfg, run, trace, dataDir, w, compaction, publicURL, steadyCompaction.Watermark, "steady-state-client-backfill")
+	assertClientBackfillCompacted(t, cfg, run, trace, obsClient, dataDir, w, compaction, publicURL, steadyCompaction.Watermark, "steady-state-client-backfill")
 
 	// #146: drive the REAL client through the typed fast path (worker-parallel
 	// decode into bsky.FeedLike) over the same sealed range and assert it decodes
 	// likes cleanly and surfaces exactly the same like set as the map path.
-	assertTypedLikeBackfill(t, cfg, run, publicURL, steadyCompaction.Watermark)
+	assertTypedLikeBackfill(t, cfg, run, obsClient, publicURL, steadyCompaction.Watermark)
 
 	// Exercise the overlay's DID-tombstone section inside the live overlay
 	// window. The earlier bootstrap account-delete and sync tombstones are
@@ -330,7 +335,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	// tombstone set cannot trigger another compaction pass before
 	// shutdown: the blob's W is stable across the fetch->flush window, so
 	// the post-shutdown segment scan is consistent with it.
-	overlayW, overlayM, overlaySnap := fetchOverlayWithDIDTombstone(t, cfg, run, publicURL, string(lateAcct.DID), lateDIDTombstoneSeq)
+	overlayW, overlayM, overlaySnap := fetchOverlayWithDIDTombstone(t, cfg, run, obsClient, publicURL, string(lateAcct.DID), lateDIDTombstoneSeq)
 
 	// steadyAck.Wait above guarantees every steady-state cursor up to
 	// targetSeq has been durably appended (OnEvent fires post-Append), so

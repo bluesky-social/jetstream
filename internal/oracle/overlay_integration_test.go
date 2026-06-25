@@ -17,7 +17,7 @@ import (
 // cross-checks the decoded watermark/maxSeq against the response headers.
 // It returns the decoded (W, M, snapshot) for an end-to-end overlay
 // reconstruction assertion (see CheckOverlayReconstruction).
-func fetchOverlay(t *testing.T, cfg Config, run *runtimeRun, baseURL string) (uint64, uint64, tombstone.Snapshot) {
+func fetchOverlay(t *testing.T, cfg Config, run *runtimeRun, obsClient *http.Client, baseURL string) (uint64, uint64, tombstone.Snapshot) {
 	t.Helper()
 
 	url := baseURL + "/xrpc/network.bsky.jetstream.getTombstones"
@@ -26,7 +26,7 @@ func fetchOverlay(t *testing.T, cfg Config, run *runtimeRun, baseURL string) (ui
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	require.NoError(t, err)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := obsClient.Do(req)
 	if err != nil {
 		select {
 		case <-run.exited:
@@ -56,14 +56,14 @@ func fetchOverlay(t *testing.T, cfg Config, run *runtimeRun, baseURL string) (ui
 	return w, m, snap
 }
 
-func fetchOverlayWithDIDTombstone(t *testing.T, cfg Config, run *runtimeRun, baseURL, did string, seq uint64) (uint64, uint64, tombstone.Snapshot) {
+func fetchOverlayWithDIDTombstone(t *testing.T, cfg Config, run *runtimeRun, obsClient *http.Client, baseURL, did string, seq uint64) (uint64, uint64, tombstone.Snapshot) {
 	t.Helper()
 
 	deadline := time.Now().Add(10 * time.Second)
 	var lastW, lastM uint64
 	var lastSnap tombstone.Snapshot
 	for {
-		w, m, snap := fetchOverlay(t, cfg, run, baseURL)
+		w, m, snap := fetchOverlay(t, cfg, run, obsClient, baseURL)
 		lastW, lastM, lastSnap = w, m, snap
 		if ts, ok := snap.DIDs[did]; ok && ts.Seq == seq && m >= seq {
 			return w, m, snap
