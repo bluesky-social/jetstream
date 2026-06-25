@@ -121,6 +121,66 @@ func TestRunDeleteCompaction_SealsActiveSegmentBeforeSteadyPass(t *testing.T) {
 	require.Equal(t, uint64(2), w.ActiveIndex(), "empty active must not rotate")
 }
 
+// TestRunDeleteCompaction_DropsSupersededRowWhenKeyUpdatedAboveWatermark is the
+// regression for the "superseded record row survived" bug (R6). When live
+// ingestion runs ahead of the compaction watermark, a key can be superseded by
+// an update at-or-below the pass's target watermark AND receive a newer update
+// ABOVE it (still in the active, not-yet-sealed segment). The in-memory
+// tombstone Set collapses the key to its GLOBAL-max seq (the above-watermark
+// update); a snapshot bounded by the target watermark then EXCLUDES the key
+// (its stored seq exceeds the window), so the earlier superseded row is never
+// dropped and the pass commits a watermark it did not actually achieve. The
+// pass must instead fold the on-disk window (max superseding seq <= target),
+// which can only see seqs <= target and so yields the window-correct tombstone.
+//
+// Setup: seg_0 (sealed) holds create(0) + update1(1) for the key, so the pass's
+// target watermark is 1. The in-memory Set additionally observes a synthetic
+// update2 at seq 2 — modelling a live event already ingested above the
+// watermark — which collapses the key's in-memory tombstone to 2. On the buggy
+// code the bounded snapshot SnapshotRange(0, 1) drops the key (2 > 1) and
+// create(0) survives; the fix folds seg_0 and drops it.
+func TestRunDeleteCompaction_DropsSupersededRowWhenKeyUpdatedAboveWatermark(t *testing.T) {
+	t.Parallel()
+
+	const did, coll, rkey = "did:plc:a", "app.bsky.feed.repost", "r"
+	sealed := []segment.Event{
+		{Seq: 0, IndexedAt: 10, Kind: segment.KindCreate, DID: did, Collection: coll, Rkey: rkey, Rev: "1", Payload: []byte("v1")},
+		{Seq: 1, IndexedAt: 20, Kind: segment.KindUpdate, DID: did, Collection: coll, Rkey: rkey, Rev: "2", Payload: []byte("v2")},
+	}
+	dataDir, st, segPath := newCompactionDataDir(t, sealed)
+
+	// In-memory set as the live consumer would hold it: the two sealed rows
+	// PLUS a newer update at seq 2 that lives above the pass's target watermark
+	// (1). This collapses the key's in-memory tombstone to seq 2.
+	liveSet := tombstone.New()
+	for i := range sealed {
+		require.NoError(t, liveSet.Observe(&sealed[i]))
+	}
+	aboveWatermark := segment.Event{Seq: 2, IndexedAt: 30, Kind: segment.KindUpdate, DID: did, Collection: coll, Rkey: rkey, Rev: "3", Payload: []byte("v3")}
+	require.NoError(t, liveSet.Observe(&aboveWatermark))
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	o := &Orchestrator{cfg: Config{
+		DataDir:            dataDir,
+		Store:              st,
+		Logger:             logger,
+		Tombstones:         liveSet,
+		CompactionInterval: time.Hour,
+	}, logger: logger}
+	// liveWriter nil: no active segment to force-rotate; target watermark is
+	// the max sealed seq (1), with the synthetic update2 (seq 2) above it.
+	require.NoError(t, o.runDeleteCompaction(t.Context(), compactionSteady, nil))
+
+	watermark, _, err := loadCompactionWatermark(st)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), watermark, "target watermark is the max sealed seq")
+
+	got := readCompactionSegment(t, segPath)
+	require.Len(t, got, 1, "superseded create must be dropped, surviving update kept")
+	require.Equal(t, segment.KindUpdate, got[0].Kind)
+	require.Equal(t, uint64(1), got[0].Seq)
+}
+
 func TestCompactionCandidateDIDs(t *testing.T) {
 	t.Parallel()
 

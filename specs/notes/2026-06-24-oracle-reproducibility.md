@@ -89,20 +89,60 @@ not inferred. Decisions agreed with Jim are marked **DECISION**.
   `internal/ingest/orchestrator/{config,bootstrap}.go`,
   `internal/jetstreamd/{options,runtime}.go`.
 
-- **R6 — NEW: a DETERMINISTICALLY REPRODUCIBLE `superseded row survived` bug.**
-  This is the payoff of the whole effort. With R2's deadlock gone, the 100-acct
-  config surfaces the CI correctness bug class as a RELIABLE RED TEST: 2 of 20
-  seeds failed `CheckCompacted` with `superseded record row survived` (e.g.
-  `seed=1009 @ 100 accts`: `did=…6mdyc7… repost rkey=22apsp2qszcgn seq=5744
-  tombstone_seq=5801`), and **seed 1009 reproduces it 3/3 runs** — the local
-  red→green loop the doc set out to build. It is NOT R2 (no hang) and NOT R3 (no
-  boundary count gap); it is the storage-tier resync/compaction-eviction defect
-  the original CI triage chased. It does NOT appear at default/25-acct (12/12
-  seeds clean), so it needs the higher account count. STATUS: out of scope for
-  the reproducibility track (which is now delivering its goal); hand off to the
-  bug-fix track with the reproducer `JETSTREAM_ORACLE_ACCOUNTS=100
-  JETSTREAM_ORACLE_LIVE_EVENTS_BOOTSTRAP=200 JETSTREAM_ORACLE_LIVE_EVENTS_STEADY=200
-  JETSTREAM_ORACLE_SEED=1009 go test ./internal/oracle -run 'TestOracle_DefaultLifecycle$'`.
+- **R6 — `superseded row survived` compaction bug: ROOT-CAUSED + FIXED + verified
+  (the payoff of the whole effort).** Discovered by R2: with the deadlock gone, the
+  100-acct config surfaced the CI correctness bug class as a RELIABLE RED TEST
+  (`seed=1009 @ 100 accts` reproduced 3/3 runs). It was a genuine PRODUCTION
+  data-loss/over-retention bug — the test was right.
+
+  ROOT CAUSE (verified by trace + live instrumentation + an independent
+  adversarial re-derivation that confirmed all six steps): the STEADY-state delete
+  compactor built its tombstone snapshot from the IN-MEMORY `tombstone.Set`
+  (`compact_deletes.go` `SnapshotRange(current, targetWatermark)`), not from disk.
+  The Set collapses each record key to a SINGLE seq — the GLOBAL-max superseding
+  seq. When live ingestion runs ahead of the compaction watermark, a key can have
+  a superseding update AT/BELOW the watermark (e.g. disk seq 5800) AND a newer
+  update ABOVE it (5805, in the post-force-rotate active segment). The Set
+  collapses the key to 5805; `SnapshotRange(5797, 5801)`'s upper bound then
+  EXCLUDES the key entirely (5805 > 5801), so the snapshot carries NO tombstone
+  for it. A superseded MERGE-written row at seq 5744 (merge writes survivors with
+  fresh monotonic seqs into data/segments and does NOT feed the in-memory set)
+  therefore was never dropped, yet the pass committed watermark 5801 + `Evict`ed —
+  durably claiming "everything ≤5801 is compacted" while 5744 survived. The
+  trigger rate-limit (`minCompactionTriggerSpacing=30s`) + shutdown meant no later
+  pass with target ≥5805 ever ran to heal it. (This refutes the old WI-10 "steady
+  re-scans every segment so it can't happen" note: WI-10 reasoned about tombstone
+  PRESENCE, not the `(low, high]` windowing of a global-max-collapsed key.)
+
+  Why the bug is real and not a too-strict test: the watermark is a hard durable
+  promise — backfill clients read segments ≤W WITHOUT overlay suppression
+  (`README.md`), so a surviving superseded row ≤W is served as a live record.
+  `CheckCompacted` / `filterCompactedExpectedRows` compute tombstones using only
+  rows ≤W (max-within-window), which is exactly the correct contract. (The served
+  tier passed only by accident — the in-memory set still masked it in the `(W,M]`
+  overlay blob; the durable on-disk `CheckCompacted` is the authoritative check.)
+
+  FIX (`internal/ingest/orchestrator/compact_deletes.go`): route STEADY compaction
+  through the same on-disk `collectCompactionTombstones` fold already used (and
+  trusted) for merge-tail, instead of the in-memory `SnapshotRange`. The disk fold
+  sees only seqs ≤ targetWatermark, so it yields the window-correct "max
+  superseding seq ≤W" per key — matching the oracle exactly and immune to an
+  above-W update. A clamp-in-the-Set alternative was REJECTED: clamping the stored
+  5805 down to W would make `ShouldDrop` over-drop the survivor at 5800 (which must
+  be kept as the materialized current version ≤W). The in-memory Set stays as the
+  read-path overlay's source (`SnapshotRange(W, inf)`) and `Evict` is unchanged.
+  Cost note (for the perf track): the steady fold re-decodes the window's blocks
+  (bounded by block-index pruning + force-rotate), slightly more IO than the O(1)
+  in-memory snapshot; correctness-first, optimize later if measured.
+
+  VALIDATION: seed 1009 red→green proven (revert fix → exact `superseded` failure;
+  apply → green). 100-acct 20/20 (was 18/20 with 2 superseded). Default mode +
+  `-race` clean; restart tier (heavy merge-tail) 4/4; orchestrator suite + `just
+  test` (1842) green. New fast deterministic unit guard
+  `TestRunDeleteCompaction_DropsSupersededRowWhenKeyUpdatedAboveWatermark` fails on
+  the buggy code and passes on the fix, so the regression is pinned without the
+  heavy 100-acct run. Committed files: `internal/ingest/orchestrator/compact_deletes.go`,
+  `internal/ingest/orchestrator/compact_deletes_test.go`.
 
 ## Confirmed defects still open (with corrected mechanisms)
 
@@ -193,10 +233,11 @@ timeouts + the stale repro hint + the per-push CI gate (old TODO-5/6).
 5. R5 triage the restart-tier `-race` flake (separate track).
 6. After R3: rework `oracle-sweep` (timeouts, hint) + wire the per-push CI
    gate (default `-race`, ~0.25s, artifact-on-failure).
-7. **R6 (NEW, bug-fix track, not reproducibility):** fix the now-reproducible
-   `superseded row survived` compaction/resync bug. Reproducer:
-   `JETSTREAM_ORACLE_ACCOUNTS=100 …_BOOTSTRAP=200 …_STEADY=200
-   JETSTREAM_ORACLE_SEED=1009 go test -run 'TestOracle_DefaultLifecycle$'`.
+7. **[DONE]** R6 — fixed the `superseded row survived` compaction bug (steady
+   compactor now folds the on-disk window instead of the global-max-collapsing
+   in-memory set). seed 1009 red→green; 100-acct 20/20; new unit guard pins it.
+   Reproducer (now GREEN): `JETSTREAM_ORACLE_ACCOUNTS=100 …_BOOTSTRAP=200
+   …_STEADY=200 JETSTREAM_ORACLE_SEED=1009 go test -run 'TestOracle_DefaultLifecycle$'`.
 
 VERIFIED-GOOD, no change needed: restart tier is green in isolation and
 correctly stays a real-process tier (`drain()` is a no-op outside the bubble).
