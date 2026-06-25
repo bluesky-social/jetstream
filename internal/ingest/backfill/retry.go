@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -44,7 +45,8 @@ type RetryConfig struct {
 	HostWorkers int
 	MaxDelay    time.Duration
 
-	now func() time.Time
+	now    func() time.Time
+	jitter jitterFunc
 }
 
 type retryCandidate struct {
@@ -122,6 +124,9 @@ func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
 	}
 	if cfg.now == nil {
 		cfg.now = time.Now
+	}
+	if cfg.jitter == nil {
+		cfg.jitter = rand.Int64N
 	}
 
 	xc := &xrpc.Client{
@@ -365,7 +370,7 @@ func (r *retryRunner) nextAttemptAt(err error, retryCount int) time.Time {
 			return ra.UTC()
 		}
 	}
-	return now.Add(selectedBackoffDelay(r.cfg.Interval, r.cfg.MaxDelay, retryCount)).UTC()
+	return now.Add(selectedBackoffDelay(r.cfg.Interval, r.cfg.MaxDelay, retryCount, r.cfg.jitter)).UTC()
 }
 
 func retryFailureHost(candidateHost, responseHost string) string {

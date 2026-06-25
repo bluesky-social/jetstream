@@ -29,6 +29,9 @@ type selectedReposConfig struct {
 	MaxRetries     int
 	RetryBaseDelay time.Duration
 	RetryMaxDelay  time.Duration
+
+	// jitter sources backoff jitter; nil defaults to rand.Int64N.
+	jitter jitterFunc
 }
 
 const (
@@ -42,6 +45,9 @@ const (
 var errSelectedOnCompleteRecorded = errors.New("selected repo backfill: OnComplete recording failed; handler already ran")
 
 func runSelectedRepos(ctx context.Context, cfg selectedReposConfig) error {
+	if cfg.jitter == nil {
+		cfg.jitter = rand.Int64N
+	}
 	r := &selectedRunner{cfg: cfg}
 	for _, did := range cfg.Repos {
 		if err := ctx.Err(); err != nil {
@@ -169,13 +175,13 @@ func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 				return
 			}
 			rlAttempt++
-			delay = selectedRateLimitDelay(err, baseDelay, rlAttempt)
+			delay = selectedRateLimitDelay(err, baseDelay, rlAttempt, r.cfg.jitter)
 		} else {
 			if !xrpc.IsTransient(err) || transientAttempt >= maxRetries {
 				r.recordFail(ctx, did, host, err, attempts)
 				return
 			}
-			delay = selectedBackoffDelay(baseDelay, maxDelay, transientAttempt)
+			delay = selectedBackoffDelay(baseDelay, maxDelay, transientAttempt, r.cfg.jitter)
 			transientAttempt++
 		}
 
@@ -191,7 +197,7 @@ func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 
 // selectedRateLimitDelay mirrors atmos's rateLimitDelay: honor the
 // server-directed reset (clamped), else exponential backoff on baseDelay.
-func selectedRateLimitDelay(err error, baseDelay time.Duration, rlAttempt int) time.Duration {
+func selectedRateLimitDelay(err error, baseDelay time.Duration, rlAttempt int, jitter jitterFunc) time.Duration {
 	if ra := xrpc.RetryAfter(err); !ra.IsZero() {
 		if wait := time.Until(ra); wait > 0 {
 			if wait > selectedRetryRateLimitCeiling {
@@ -200,14 +206,19 @@ func selectedRateLimitDelay(err error, baseDelay time.Duration, rlAttempt int) t
 			return wait
 		}
 	}
-	delay := selectedBackoffDelay(baseDelay, selectedRetryRateLimitCeiling, rlAttempt-1)
+	delay := selectedBackoffDelay(baseDelay, selectedRetryRateLimitCeiling, rlAttempt-1, jitter)
 	if delay < baseDelay {
 		delay = baseDelay
 	}
 	return delay
 }
 
-func selectedBackoffDelay(base, maxDelay time.Duration, attempt int) time.Duration {
+// jitterFunc returns a pseudo-random value in [0, n). Injectable so tests
+// and deterministic harnesses can seed backoff jitter; production uses
+// rand.Int64N.
+type jitterFunc func(n int64) int64
+
+func selectedBackoffDelay(base, maxDelay time.Duration, attempt int, jitter jitterFunc) time.Duration {
 	delay := maxDelay
 	if base > 0 && attempt < bits.LeadingZeros64(uint64(base)) {
 		shifted := base << attempt
@@ -216,7 +227,7 @@ func selectedBackoffDelay(base, maxDelay time.Duration, attempt int) time.Durati
 		}
 	}
 	if half := int64(delay) / 2; half > 0 {
-		delay += time.Duration(rand.Int64N(half))
+		delay += time.Duration(jitter(half))
 	}
 	if delay > maxDelay {
 		return maxDelay
