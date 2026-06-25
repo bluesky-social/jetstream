@@ -46,17 +46,42 @@ not inferred. Decisions agreed with Jim are marked **DECISION**.
 
 ## Newly surfaced by the R1 fix (was masked by the crash)
 
-- **R5 — restart-tier flake under full-package `-race`.** With the binary no
-  longer aborting, the restart tier now runs after the bubble test in the same
-  process, and `TestOracle_RestartChainShapeA` intermittently fails
-  `compare oracle model` under the **full-package `-race`** run (~1 of 2 full
-  runs; seed 101). It PASSES in isolation (no-race 0.02s; -race 2.2s) and the
-  restart tier passes in isolation across seeds 101/202/303. So it is a real,
-  interleaving/`-race`-dependent restart flake that the zstd crash was hiding —
-  NOT caused by the R1 fix. TRIAGE NEEDED (separate from the bubble work): is it
-  global-state leakage from the bubble test into the same-process restart tier,
-  or a genuine restart-recovery race? Capture the trace artifact it already
-  writes.
+- **R5 — restart-tier `-race` flake: INVESTIGATED, NOT a live defect (2026-06-25).**
+  Original symptom: `TestOracle_RestartChainShapeA` failed `compare oracle model`
+  ONCE during a full-package `-race` run. Investigated exhaustively:
+  - **Could not reproduce in ~75+ runs** across every condition: ShapeA
+    standalone `-race` (10/10 + 40/40), full-package `-race` (≈20/20),
+    `-race` under full 32-core CPU saturation + GOMAXPROCS=2 (12/12), restart
+    tier x6 seeds. Zero flakes.
+  - **Ruled out the leading hypotheses with evidence.** Goroutine leakage from
+    the bubble into the restart tier is structurally impossible — `synctest.Test`
+    guarantees ALL bubble goroutines exit before it returns (panics otherwise),
+    and `-v` confirms the bubble test PASSes cleanly before the restart test
+    starts. A timed-out child fails with a distinct timeout/marker message, NOT
+    `compare oracle model`, so the failure required a CLEANLY-completed child with
+    diverged on-disk state. Chain coordinator shared state is `sync.Once`+`mu`
+    synchronized; RNG is seed-local (no `math/rand` global); parent/child are
+    separate processes with separate worlds.
+  - An independent adversarial code audit corroborated: no reachable interleaving
+    yields the divergence on the normal path. The synchronization is sufficient
+    via a load-bearing happens-before — the parent commits the live op to the
+    world (ground truth) BEFORE broadcasting, and the getRepo response is
+    chunked/unflushed so the child sees `io.EOF` only as the handler returns,
+    i.e. strictly AFTER `onServed` generated that live op. Verified by direct
+    timing probe: even with a 300ms sleep in `onServed`, client EOF lands +158µs
+    AFTER `onServed` — the ordering is robust under the current transport.
+  CONCLUSION: the one-off failure is consistent with the **contaminated working
+  tree during the multi-agent session** (concurrent edits / broken builds / stale
+  binary), not a defect in committed code. Note this is the one tier NOT in the
+  synctest bubble (real subprocess + real socket + real time, by design — it
+  tests crash recovery), so it is inherently the least reproducible; a true
+  restart-tier race would be as hard to reproduce as the original CI problem.
+  PERMANENT ACTION TAKEN: documented the load-bearing getRepo-EOF-after-`onServed`
+  ordering in `internal/simulator/http/pds.go` so a future `Content-Length`/
+  `Flush` change (the one way to break it) is flagged for the maintainer. A
+  candidate ordering-invariant test was written and then REMOVED as vacuous: Go's
+  chunked-transfer response cannot be made to fail it without also changing the
+  handler, so it could not actually fail — not kept (anti-vacuity discipline).
 
 ## R2 FIXED (2026-06-25) + a reproducible correctness bug surfaced
 
