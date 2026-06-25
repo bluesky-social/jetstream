@@ -784,6 +784,57 @@ observed bugs are (`client_observer_test.go:286-297` documents that served-repla
 path as the historical leading cause of CheckCompacted flakiness #94 triages).
 Defer the full bubble (items 1,2,4,5,7) as a separate effort.
 
+## Step 5 DONE: lightweight synctest tier shipped (2026-06-24)
+
+`internal/oracle/synctest_test.go` (`TestOracle_Synctest`) + `inprocess.go`. Runs
+the real jetstreamd ingest path (bootstrap → merge → steady → compaction) inside
+a `synctest.Test` bubble with NO sockets and the fake clock. Firehose via
+`LiveDial`→`firehoseConn` (reads the simulator fanout in-memory, mirroring
+relay_subscribe.go's subscribe-before-replay); unary HTTP via
+`handlerTransport` (an `http.Handler`-backed `RoundTripper` over
+`httptest.NewRecorder`); runtime headless (`Options.Headless` skips the public
+server). Asserts `CheckInvariants` + `CheckCompacted` + `Compare` on the durable
+on-disk segments. **~20ms per run; passes under `-race`; 10/10 stable across
+separate process invocations.** Existing real-socket `TestOracle_DefaultLifecycle`
+untouched and still passes.
+
+Synctest gotchas discovered (institutional knowledge for the full-bubble effort):
+1. **Clock epoch mismatch.** synctest's fake clock starts 2000-01-01; the
+   simulator stamps commit revs at its logical-clock epoch (~2023, see
+   `logical_clock.go` `logicalClockBaseMicros`). atmos's verifier rejects revs
+   >5m in the future → every event fails verification (`seen=0`). Fix: sleep the
+   bubble clock forward to just past the simulator epoch before starting the
+   runtime (`advanceClockToSimulatorEpoch`).
+2. **No spin loops.** A `for { synctest.Wait(); select{...; default:} }` barrier
+   keeps a goroutine runnable, so the bubble never reaches "all durably blocked"
+   and the fake clock never advances → hang. Just block on the channel
+   (`<-gate.entered`); that's durably-blocking and lets the clock advance.
+3. **All bubble goroutines must exit before the bubble fn returns.** A failed
+   `require` calls `runtime.Goexit`, leaving the runtime goroutine alive →
+   synctest panics "blocked goroutines remain", MASKING the real assertion error.
+   Fix: `defer` a shutdown that `cancel()`s, drains `rt.Run`, AND calls
+   `rt.Close()` (the verifier worker pool exits only on Close, not on Run return).
+4. **One bubble per process.** The production zstd encoders (overlay/segment/
+   subscribe) are package globals whose worker goroutines+channels bind to the
+   first bubble that uses them; a second same-process bubble (`-count>1`) hits
+   "receive on synctest channel from outside bubble" (fatal). `WithEncoderConcurrency(1)`
+   does NOT fix it (the pool still initializes lazily in-bubble). Guard: skip a
+   second same-process bubble with a clear message; re-runs are separate `go test`
+   invocations. The full-bubble effort will need to grapple with this if it wants
+   `-count` soak in one process (e.g. reset/inject the encoders, or accept
+   process-per-run).
+
+HONEST LIMITATION (what this tier does and does NOT yet buy): synctest removes
+wall-clock skew and gives a fast, socket-free, fake-clock harness — but it does
+NOT serialize goroutine scheduling, so the interleaving is still nondeterministic.
+The triaged failures (superseded-row-survived) are interleaving-dependent
+(resync-vs-compaction ordering), so this tier does not yet SPONTANEOUSLY reproduce
+them on a fixed seed. Its value is: (a) a reliable, fast, no-socket reproduction
+harness with the seams to (b) FORCE the bad interleaving deterministically — a
+small follow-on that drives the resync + compaction pass in a controlled order
+via `synctest.Wait()` between steps. That forced-interleaving test is the actual
+red→green reproducer; this tier is its foundation.
+
 ## Decision log (continued)
 - 2026-06-24: Steps 1 (jitter), 2 (LiveDial threading), 4 (HTTPTransport)
   implemented, tested, committed. Manual clock sweep SKIPPED (synctest auto-fakes
