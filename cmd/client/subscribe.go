@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"os/signal"
 	"time"
@@ -307,22 +308,24 @@ func reportThroughput(ctx context.Context, out io.Writer, client *jetstream.Clie
 	}
 }
 
-// streamItem carries one batch-or-error from the iterator pump.
-type streamItem struct {
-	batch *jetstream.Batch
+// streamItem carries one batch-or-error from the iterator pump. B is the batch
+// type (*jetstream.Batch for the generic stream, *jetstream.TypedBatch[T] for
+// the typed one).
+type streamItem[B any] struct {
+	batch B
 	err   error
 }
 
-// iterPull adapts the push-style Events iterator into a channel so the stats
-// loop can also select on a ticker. The returned stop cancels the pump.
-func iterPull(seq func(func(*jetstream.Batch, error) bool)) (<-chan streamItem, func()) {
-	ch := make(chan streamItem)
+// iterPull adapts a push-style Seq2 iterator into a channel so a stats loop can
+// also select on a ticker. The returned stop cancels the pump.
+func iterPull[B any](seq iter.Seq2[B, error]) (<-chan streamItem[B], func()) {
+	ch := make(chan streamItem[B])
 	done := make(chan struct{})
 	go func() {
 		defer close(ch)
-		seq(func(b *jetstream.Batch, err error) bool {
+		seq(func(b B, err error) bool {
 			select {
-			case ch <- streamItem{batch: b, err: err}:
+			case ch <- streamItem[B]{batch: b, err: err}:
 				return true
 			case <-done:
 				return false
