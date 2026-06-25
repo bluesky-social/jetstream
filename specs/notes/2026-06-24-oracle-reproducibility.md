@@ -242,7 +242,55 @@ wait) but not the fine-grained goroutine interleaving inside the runtime. So:
   stale-order drop decision relative to the compaction snapshot. That hook does
   NOT exist yet → tracked as WI-10 below.
 
-### WI-10 — Yield seam for true forced micro-interleaving  [ ] (follow-on)
+### WI-10 — Yield seam: INVESTIGATED, seam NOT added (2026-06-25)
+
+A multi-agent investigation + adversarial verification (workflow
+`wi10-interleaving-map`) mapped the survivor mechanism against the real code. The
+adversarial pass REFUTED the proposed H1 consumer-side seam, and I independently
+confirmed the two load-bearing facts by reading the code directly:
+
+1. **CheckCompacted keys on the MAX DID tombstone** (compacted.go:33,41,51 — it
+   keeps `ev.Seq > didTombstones[did].seq`). The trace failure is "superseded
+   ACCOUNT row survived ... tombstone_seq=30235" — keyed off the account-delete at
+   30235, NOT the dropped async KindSync at 28989. So forcing the H1 stale-resync
+   drop (which only removes the 28989 sync tombstone) cannot produce THIS failure:
+   the 30235 account tombstone already dominates (30235>421 drops seq=421 via
+   ShouldDrop regardless of the sync).
+2. **A steady pass re-examines EVERY sealed segment against a fresh snapshot**
+   (listSealedCompactionSegments, compact_deletes.go:200-222 returns all sealed
+   files; applyCompactionChunk offers all of them, compact_deletes.go:360). Steady
+   mode is SINGLE-CHUNK (`chunkEnd=targetWatermark`, compact_deletes.go:138; the
+   `for current<targetWatermark` loop runs once), so the H2 "Evict-by-chunkEnd
+   then a later pass skips the old segment" window is STRUCTURALLY IMPOSSIBLE in
+   steady mode (it only collects/chunks in merge-tail mode). The account tombstone
+   is observed under the writer mutex via OnAppend BEFORE its Append returns, and
+   the cap-trigger fires AFTER Append, so the tombstone is provably in the crossing
+   pass's snapshot → seq=421 is dropped → the forced H1 test goes GREEN.
+
+CONCLUSION: the proposed consumer-side prod seam gates the WRONG invariant and a
+forced H1 (and H1+H2-in-steady) test would be GREEN on current code. **Do NOT add
+the production seam.** Decision: NOT adding `onBeforeStaleResyncDrop` (or any new
+prod hook) — it would be dead code justified by a refuted hypothesis.
+
+WHERE THE REAL BUG LIKELY LIVES (redirected triage, for the eventual bug-fix
+work, not this reproducibility track):
+- An **atmos-internal resync DELIVERY ordering** issue: the async KindSync/account
+  events arriving with a seq ABOVE a newer commit's rows, or the account-delete
+  itself being reordered/dropped — only reachable with the atmos Conn/Dial
+  frame-injection seam (Option α), not a jetstream compaction seam.
+- OR a **merge-tail-mode** pass (NOT steady) where `collectCompactionTombstones`
+  + `CompactionTombstoneCap` chunking + the `f.header.MaxSeq<=watermark` segment
+  filter (compact_deletes.go:269) genuinely CAN skip a segment. A merge-tail
+  forced-interleaving test is the more promising reproduction target than the
+  steady consumer seam.
+- OR a crash/rebuild between Observe and the pass (rebuildLiveTombstones).
+
+WHAT WE KEEP: the WI-9 staged tier remains a strong deterministic regression guard
+for the steady resync+compaction seam (proven correct under these orderings). The
+investigation's real value: it RULED OUT the steady-mode H1/H2 hypotheses with
+code evidence, which is genuine progress on the standing triage.
+
+### WI-10 (original, NOT pursued) — Yield seam for true forced micro-interleaving  [x] superseded by the finding above
 - [ ] Add a test-only hook (build-tagged or an injected no-op func) at the
       `dropStaleOrderedAsyncResync` decision point and/or the compaction snapshot,
       so WI-9's staging can pin the EXACT order that produces superseded-row.
