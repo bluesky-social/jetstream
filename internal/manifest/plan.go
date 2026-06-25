@@ -36,6 +36,9 @@ type PlanBackfillRequest struct {
 	BeforeSeq    uint64
 	HasBeforeSeq bool
 
+	// MaxEntries caps the number of work entries a plan may accumulate before
+	// failing with ErrPlanTooLarge. 0 means unlimited (no cap); a negative
+	// value is a malformed limit and is rejected with ErrInvalidPlanRequest.
 	MaxEntries            int
 	WholeSegmentThreshold float64
 }
@@ -77,10 +80,11 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
 	if req.HasAfterSeq && req.HasBeforeSeq && req.BeforeSeq <= req.AfterSeq {
 		return PlanBackfillResult{}, ErrInvalidPlanRequest
 	}
-	// MaxEntries <= 0 is a malformed limit, not an oversized plan. Returning
-	// ErrPlanTooLarge here would mislabel a misconfigured caller; reserve that
-	// sentinel for an actually-exceeded valid limit below.
-	if req.MaxEntries <= 0 {
+	// MaxEntries == 0 means unlimited; a negative value is a malformed limit,
+	// not an oversized plan. Returning ErrPlanTooLarge for it would mislabel a
+	// misconfigured caller; reserve that sentinel for an actually-exceeded
+	// positive limit below.
+	if req.MaxEntries < 0 {
 		return PlanBackfillResult{}, ErrInvalidPlanRequest
 	}
 	if req.WholeSegmentThreshold <= 0 || req.WholeSegmentThreshold > 1 {
@@ -152,7 +156,7 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
 			planned.Blocks = coalesceBlocks(selected)
 			result.Stats.Entries += len(planned.Blocks)
 		}
-		if result.Stats.Entries > req.MaxEntries {
+		if req.MaxEntries > 0 && result.Stats.Entries > req.MaxEntries {
 			return PlanBackfillResult{}, ErrPlanTooLarge
 		}
 		result.Segments = append(result.Segments, planned)

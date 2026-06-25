@@ -594,3 +594,23 @@ func TestPlanBackfill_PlanTooLarge(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	require.Equal(t, "PlanTooLarge", readXRPCError(t, resp))
 }
+
+func TestPlanBackfill_ZeroMaxEntriesDisablesCap(t *testing.T) {
+	t.Parallel()
+
+	// MaxEntries == 0 disables the cap: the same workload that returns
+	// PlanTooLarge under a positive limit must succeed unbounded.
+	cfg := defaultPlanTestConfig()
+	cfg.MaxEntries = 0
+	ts := newPlanTestServer(t, cfg,
+		planEvent(1, "did:plc:target", "app.bsky.feed.post"),
+		planEvent(2, "did:plc:other", "app.bsky.feed.post"),
+		planEvent(3, "did:plc:target", "app.bsky.feed.post"),
+		planEvent(4, "did:plc:other", "app.bsky.feed.post"),
+		planEvent(5, "did:plc:target", "app.bsky.feed.post"),
+	)
+
+	status, out := postPlan(t, ts, map[string]any{"dids": []string{"did:plc:target"}})
+	require.Equal(t, http.StatusOK, status)
+	require.NotEmpty(t, out.Segments)
+}
