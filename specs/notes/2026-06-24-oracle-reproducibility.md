@@ -35,25 +35,71 @@ want *substantially more* reliability and reproducibility, not a proof.
 
 ---
 
-# FULL-BUBBLE EXECUTION PLAN (active, 2026-06-25)
+# EXECUTION PLAN (active, 2026-06-25)
 
-DECISION: build the full oracle lifecycle inside one `testing/synctest` bubble —
-the whole `TestOracle_DefaultLifecycle` (ingest + merge + steady + compaction +
-the client-observer SERVING tiers), no real sockets, fake clock. This is the
-highest-value durable outcome: it turns the oracle from a slow, wall-clock-
-dependent scheduled fuzzer into a fast, socket-free, deterministic-time test that
-can gate every push, and it kills the wall-clock false-failure class outright.
+## Sequencing decision (revised 2026-06-25 after independent review)
 
-What it buys (precise): (1) whole oracle in ms → gateable on every push;
-(2) the `-race`-lane "barrier not reached / runtime did not exit" timeout noise
-becomes IMPOSSIBLE under a fake clock; (3) the near-vacuous serving/client tiers
-become cheap to exercise hard.
+An independent review caught a real contradiction and a sequencing error in the
+first draft of this plan, both confirmed against the code:
 
-What it does NOT buy by itself: synctest fakes TIME, not GOROUTINE SCHEDULING.
-A seed still does not pin an interleaving. Reproducing a specific
-interleaving-dependent failure on demand needs forced-interleaving harnessing
-(`synctest.Wait()` between steps at the seam under test) — tracked as WI-9, to be
-layered on after the bubble works.
+- **WI-9 (forced-interleaving reproducer) is INDEPENDENT of WI-1–8.** The shipped
+  lightweight tier (`TestOracle_Synctest`) ALREADY drives the resync seam
+  (`GenerateSilentMutationThenSyncForTest`, synctest_test.go:210) and ALREADY runs
+  `CheckCompacted` (line 231). The triaged CI bug (#100/#106 superseded-row /
+  over-drop) lives exactly there. So the on-demand reproducer needs nothing from
+  the full-bubble work.
+- **The full bubble does NOT serve the reproduction goal.** By its own honest
+  limitation, synctest fakes TIME, not goroutine SCHEDULING — a seed still does
+  not pin an interleaving. What reproduces the correctness bug is forced
+  interleaving (`synctest.Wait()` between the resync and the compaction pass),
+  i.e. WI-9 — which sits on code that already ships.
+- **The earlier doc decision (§"do NOT full-bubble now") was reversed without
+  reconciliation.** Resolving that now: the full bubble remains DEFERRED as a
+  separate *noise-elimination + speed* play (it kills the `-race`-lane liveness
+  false-failures and makes the serving tiers gateable — real, but orthogonal to
+  reproducing the correctness bug). It is NOT the path to the stated goal.
+
+REVISED ORDER:
+1. **WI-9 FIRST** — forced-interleaving reproducer on the existing lightweight
+   tier. Small, serves the actual goal, validates the reproduction premise before
+   any expensive refactor. ← BUILDING NOW.
+2. **Reassess the full bubble** as a separate decision once WI-9 proves the
+   premise. If pursued, fold in the four gaps the review found (see "Full-bubble
+   gaps" below).
+
+## Full bubble (DEFERRED — value, precise)
+
+What it WOULD buy: (1) whole oracle in ms → gateable on every push; (2) the
+`-race`-lane "barrier not reached / runtime did not exit" timeout noise becomes
+IMPOSSIBLE under a fake clock; (3) the near-vacuous serving/client tiers become
+cheap to exercise hard. What it does NOT buy: reproducing the
+interleaving-dependent correctness bug (that's WI-9). Deferred until after WI-9.
+
+### Full-bubble gaps the review surfaced (fold in IF we build it)
+1. **Fanout is drop-on-full** (`simulator/fanout` Publish: `select{ case ch<-:
+   default: drops++ }`) — a dropped frame is avoidable input nondeterminism
+   (oracle.md:63) and a silent fallback. The full tier must assert `Drops()==0`
+   or prove reconnect-recovery. Not an issue for the lightweight tier (firehoseConn
+   replays from `?cursor=` on reconnect) but the competing-goroutine quiescence
+   window differs under the full bubble.
+2. **`t.Cleanup(client.Close)` + background-ctx watcher goroutines are
+   bubble-illegal** (client_observer_test.go:86,92). `t.Cleanup` runs AFTER the
+   bubble fn returns, but all bubble goroutines must exit BEFORE it returns →
+   "blocked goroutines remain" panic masks the real failure. Every observer's
+   Close + watcher must be drained INSIDE the bubble.
+3. **`-race` happens-before**: reading shared observer state after `synctest.Wait()`
+   needs Wait() to establish the edge or `-race` flags it. WI-8 wants `-race`
+   clean — coupled, must be explicit.
+4. **Ticker poll loops** beyond `require.Eventually`: `WaitAfter`
+   (harness_test.go:776) and `waitForRuntimePublicURL` (client_observer_test.go:25)
+   are `time.NewTicker(10ms)` loops. NOTE: they block in a `select` with no
+   `default`, so under synctest's faked ticker they DO advance the clock (not a
+   hang) — but `waitForRuntimePublicURL` needs rework anyway (no public addr
+   in-bubble), and all such loops should be audited.
+5. **WI-3 justification is FAULT FIDELITY, not "CAR streaming."** getRepo
+   CAR-truncation faults model a mid-stream connection drop; a ResponseRecorder
+   yields a complete-but-short body (a different failure mode than a reset). The
+   PipeListener-for-simulator is justified specifically by reproducing the reset.
 
 Foundations already shipped this session (do not redo): atmos `Conn`/`Dial` seam
 (committed `15ff15c`); `live.Config.Dial` ← `orchestrator.Config.LiveDial` ←
@@ -174,18 +220,34 @@ bubble.
 - [ ] `golangci-lint` clean; `just` recipe added (`just oracle-bubble`).
 - [ ] Doc + decision log updated; atmos `replace` resolution noted.
 
-### WI-9 — (FOLLOW-ON, not full-bubble) Forced-interleaving reproducer  [ ]
-- [ ] On the bubble, drive the resync-vs-compaction seam deterministically with
-      `synctest.Wait()` between steps; assert `CheckCompacted` fails, then goes
-      green on a fix. THIS is the on-demand reproducer for the triaged bug.
+### WI-9 — Forced-interleaving reproducer  [ ] ← ACTIVE, BUILDING FIRST
+On the existing lightweight `TestOracle_Synctest` (NO full-bubble work needed),
+drive the resync-vs-compaction seam deterministically and assert the compaction
+contract, so a real storage-path failure reproduces on demand (red → green on a
+fix). This is the item that serves the stated reproduction goal.
+- [ ] Extend the lightweight tier (or a sibling test) to stage the bad ordering:
+      generate steady traffic, a silent-mutation+sync (resync rows), and a late
+      account-delete tombstone for the same DID, using `synctest.Wait()` between
+      steps to pin the state the runtime has reached at each point.
+- [ ] Force a compaction pass that crosses the tombstone at a controlled
+      watermark (the runtime exposes a compaction trigger via TombstoneCap / the
+      compaction interval; drive it deterministically rather than by wall clock).
+- [ ] Assert `CheckCompacted` / `CheckInvariants` on the resulting on-disk
+      segments — this is where superseded-row-survived shows up.
+- [ ] Anti-vacuity: assert the seam actually fired (resync rows present, tombstone
+      observed, a pass crossed it) so a green result can't be vacuous.
+- [ ] If it reproduces a real defect: capture it, hand off to the (separate) bug
+      fix. If it does NOT on current code: document that the seam is currently
+      correct here and the harness is ready to catch a regression.
 
-## Sequencing & checkpoints
-WI-1 → WI-2 → (WI-3 ‖ WI-4) → WI-5 → WI-6 → WI-7 → WI-8. Commit after each WI.
-Hard checkpoints to raise with Jim: (a) after WI-1 if the PipeListener+websocket
-spike misbehaves; (b) at WI-4 if reusing `WithHTTPClient` fails and a new public
-`WithDial` is required; (c) at WI-7 if whole-graph quiescence proves
-intractable after a bounded effort (timebox: if not converging, fall back to the
-shipped lightweight tier + WI-9 and reassess).
+## Sequencing & checkpoints (revised)
+WI-9 FIRST (now). Then reassess the full bubble (WI-1 → WI-2 → (WI-3 ‖ WI-4) →
+WI-5 → WI-6 → WI-7 → WI-8) as a SEPARATE noise/speed decision.
+Hard checkpoints to raise with Jim: (a) after WI-9, review what it reproduces and
+DECIDE whether the full bubble is worth the XL cost; (b) if the full bubble is
+pursued, at WI-1 if the PipeListener+websocket spike misbehaves; (c) at WI-4 if
+reusing `WithHTTPClient` fails and a new public `WithDial` is required; (d) at
+WI-7 if whole-graph quiescence proves intractable after a timeboxed effort.
 
 ---
 
