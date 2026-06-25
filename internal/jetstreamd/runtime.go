@@ -110,8 +110,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.PlanMaxCollections < 0 {
 		return nil, fmt.Errorf("serve: --plan-max-collections must be >= 0 (PlanMaxCollections must be >= 0), got %d", opts.PlanMaxCollections)
 	}
-	if opts.PlanMaxEntries <= 0 {
-		return nil, fmt.Errorf("serve: --plan-max-entries must be positive (PlanMaxEntries must be positive), got %d", opts.PlanMaxEntries)
+	if opts.PlanMaxEntries < 0 {
+		return nil, fmt.Errorf("serve: --plan-max-entries must be >= 0 (PlanMaxEntries must be >= 0), got %d", opts.PlanMaxEntries)
 	}
 	if opts.PlanWholeSegmentThreshold <= 0 || opts.PlanWholeSegmentThreshold > 1 {
 		return nil, fmt.Errorf("serve: --plan-whole-segment-threshold must be > 0 and <= 1 (PlanWholeSegmentThreshold must be > 0 and <= 1), got %g", opts.PlanWholeSegmentThreshold)

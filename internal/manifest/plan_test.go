@@ -297,7 +297,31 @@ func TestPlanBackfill_InvalidRequest(t *testing.T) {
 	require.ErrorIs(t, err, manifest.ErrInvalidPlanRequest)
 
 	req = planReq()
-	req.MaxEntries = 0
+	req.MaxEntries = -1
 	_, err = m.PlanBackfill(req)
 	require.ErrorIs(t, err, manifest.ErrInvalidPlanRequest)
+}
+
+func TestPlanBackfill_ZeroMaxEntriesIsUnlimited(t *testing.T) {
+	t.Parallel()
+
+	// MaxEntries == 0 disables the cap: a plan that would exceed any positive
+	// limit must still succeed and return all matched work.
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, planDID, postNSID),
+		planEvent(2, otherDID, postNSID),
+		planEvent(3, planDID, postNSID),
+		planEvent(4, otherDID, postNSID),
+		planEvent(5, planDID, postNSID),
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.DIDs = []string{planDID}
+	req.MaxEntries = 0
+
+	got, err := m.PlanBackfill(req)
+	require.NoError(t, err)
+	require.NotEmpty(t, got.Segments)
+	require.Equal(t, 3, got.Stats.Entries)
 }

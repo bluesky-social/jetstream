@@ -91,6 +91,20 @@ func TestOptionsValidateRejectsNegativeCompactionRewriteWorkers(t *testing.T) {
 	require.ErrorContains(t, err, "CompactionRewriteWorkers must be >= 0")
 }
 
+func TestOptionsValidateAcceptsZeroPlanMaxEntries(t *testing.T) {
+	t.Parallel()
+
+	// 0 disables the planBackfill entry cap (unbounded plan size). It must
+	// build successfully rather than being rejected as a misconfiguration.
+	opts := testOptions(t)
+	opts.PlanMaxEntries = 0
+	rt, err := Build(t.Context(), opts)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, rt.Close(context.Background()))
+	})
+}
+
 func TestOptionsValidateRejectsInvalidPlanLimits(t *testing.T) {
 	t.Parallel()
 
@@ -110,14 +124,9 @@ func TestOptionsValidateRejectsInvalidPlanLimits(t *testing.T) {
 			want: "PlanMaxCollections must be >= 0",
 		},
 		{
-			name: "zero entries",
-			edit: func(opts *Options) { opts.PlanMaxEntries = 0 },
-			want: "PlanMaxEntries must be positive",
-		},
-		{
 			name: "negative entries",
 			edit: func(opts *Options) { opts.PlanMaxEntries = -1 },
-			want: "PlanMaxEntries must be positive",
+			want: "PlanMaxEntries must be >= 0",
 		},
 		{
 			name: "zero threshold",

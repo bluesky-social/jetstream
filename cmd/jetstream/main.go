@@ -293,7 +293,7 @@ func serveCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:    "plan-max-entries",
-				Usage:   "Maximum response work entries planBackfill may return before failing with PlanTooLarge.",
+				Usage:   "Maximum response work entries planBackfill may return before failing with PlanTooLarge. 0 disables the limit (unbounded plan size).",
 				Sources: cli.EnvVars("JETSTREAM_PLAN_MAX_ENTRIES"),
 				Value:   xrpcapi.DefaultPlanMaxEntries,
 			},

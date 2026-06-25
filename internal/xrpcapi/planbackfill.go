@@ -31,9 +31,9 @@ type PlanConfig struct {
 }
 
 func (c PlanConfig) withDefaults() PlanConfig {
-	if c.MaxEntries == 0 {
-		c.MaxEntries = DefaultPlanMaxEntries
-	}
+	// MaxEntries is intentionally not defaulted here: 0 is a meaningful value
+	// (unlimited), so remapping it would clobber an operator's explicit choice.
+	// The CLI flag supplies DefaultPlanMaxEntries when the operator omits it.
 	if c.WholeSegmentThreshold == 0 {
 		c.WholeSegmentThreshold = DefaultPlanWholeSegmentThreshold
 	}
@@ -50,8 +50,8 @@ func (c PlanConfig) validate() error {
 	if c.MaxCollections < 0 {
 		return fmt.Errorf("plan max collections must be >= 0, got %d", c.MaxCollections)
 	}
-	if c.MaxEntries <= 0 {
-		return fmt.Errorf("plan max entries must be positive, got %d", c.MaxEntries)
+	if c.MaxEntries < 0 {
+		return fmt.Errorf("plan max entries must be >= 0, got %d", c.MaxEntries)
 	}
 	if c.WholeSegmentThreshold <= 0 || c.WholeSegmentThreshold > 1 {
 		return fmt.Errorf("plan whole segment threshold must be > 0 and <= 1, got %g", c.WholeSegmentThreshold)
