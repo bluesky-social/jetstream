@@ -220,7 +220,40 @@ bubble.
 - [ ] `golangci-lint` clean; `just` recipe added (`just oracle-bubble`).
 - [ ] Doc + decision log updated; atmos `replace` resolution noted.
 
-### WI-9 — Forced-interleaving reproducer  [ ] ← ACTIVE, BUILDING FIRST
+### WI-9 — Forced-interleaving reproducer  [~] DONE (staging) — see outcome below
+
+OUTCOME (2026-06-25): `TestOracle_Synctest` now deterministically STAGES the full
+seam — steady traffic → silent-mutation+sync → silent-mutation+commit (async
+resync) → late account-delete tombstone → a compaction pass crossing the
+tombstone seq — and asserts `CheckCompacted` + `CheckInvariants` + `Compare` on
+the durable segments, with an anti-vacuity guard (tombstone actually observed).
+Committed `a819d69`. GREEN across 12 seeds incl. the 3 CI-failing ones; `-race`
+clean; ~0.2s.
+
+HONEST RESULT: it does NOT spontaneously reproduce the CI failure. Confirmed root
+reason (matches the doc's standing limitation): synctest fakes TIME, not
+goroutine SCHEDULING — replaying a CI seed does not replay its interleaving. The
+test pins the ORDER of staged operations (via acks + the compaction-crossing
+wait) but not the fine-grained goroutine interleaving inside the runtime. So:
+- It is a strong REGRESSION GUARD on the seam, fast and socket-free.
+- It is the SUBSTRATE for true on-demand reproduction, which needs a code seam to
+  force the bad micro-interleaving — specifically a yield/hook at
+  `dropStaleOrderedAsyncResync` (consumer.go) so the test can interpose the
+  stale-order drop decision relative to the compaction snapshot. That hook does
+  NOT exist yet → tracked as WI-10 below.
+
+### WI-10 — Yield seam for true forced micro-interleaving  [ ] (follow-on)
+- [ ] Add a test-only hook (build-tagged or an injected no-op func) at the
+      `dropStaleOrderedAsyncResync` decision point and/or the compaction snapshot,
+      so WI-9's staging can pin the EXACT order that produces superseded-row.
+- [ ] Drive it from the synctest tier with `synctest.Wait()` between the resync
+      drop and the crossing pass; assert `CheckCompacted` goes RED, then GREEN
+      after the production fix. THIS is the on-demand bug reproducer.
+- Decision to raise with Jim: is the seam worth adding to production code (it is
+  test-only and inert in prod), or do we accept the regression-guard + the
+  artifact-driven diagnosis we already proved works on the triaged bug?
+
+### WI-9 (original full-bubble follow-on text retained for reference)  [ ] ← superseded by the OUTCOME above
 On the existing lightweight `TestOracle_Synctest` (NO full-bubble work needed),
 drive the resync-vs-compaction seam deterministically and assert the compaction
 contract, so a real storage-path failure reproduces on demand (red → green on a
