@@ -70,6 +70,19 @@ func (r *Registry) Publish(frame []byte) {
 	}
 }
 
+// TotalDrops sums dropped-frame counts across all currently-attached
+// subscribers. A slow consumer whose buffer fills shows up here; used by tests
+// to assert lossless delivery.
+func (r *Registry) TotalDrops() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var total uint64
+	for s := range r.subs {
+		total += s.drops.Load()
+	}
+	return total
+}
+
 // CloseAll closes every subscriber. Used at simulator shutdown.
 func (r *Registry) CloseAll() {
 	r.mu.Lock()

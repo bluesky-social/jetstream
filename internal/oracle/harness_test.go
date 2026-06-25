@@ -57,6 +57,12 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	// epoch before any event flows. See advanceClockToSimulatorEpoch.
 	advanceClockToSimulatorEpoch()
 
+	// Pace bulk event generation so the in-process consumer keeps up under the
+	// fake clock (see generateN). Cleared on return so it never leaks to a
+	// non-bubble tier.
+	bubbleDrain = synctest.Wait
+	defer func() { bubbleDrain = nil }()
+
 	trace, tracePath, closeTrace := newOracleTrace(t, "oracle-trace.jsonl")
 	defer closeTrace()
 	recordTraceOrError(t, trace, "run_start", map[string]any{
@@ -1036,9 +1042,18 @@ func oracleWaitTimeout(cfg Config) time.Duration {
 func generateN(t *testing.T, w *world.World, n int) {
 	t.Helper()
 
-	for range n {
+	for i := range n {
 		_, err := w.GenerateOneForTest(t.Context())
 		require.NoError(t, err)
+		// In a synctest bubble a tight generate loop emits all N events in zero
+		// fake-time, building a firehose backlog the consumer hasn't drained;
+		// a later (re)subscribe then overruns the relay's bounded replay window
+		// and skips the gap. Periodically yield so the consumer keeps pace,
+		// mirroring the real-time interleaving a socket run gets for free. A
+		// no-op outside a bubble (restart tier), so it stays correct there.
+		if (i+1)%128 == 0 {
+			drain()
+		}
 	}
 }
 

@@ -5,6 +5,21 @@ import (
 	"time"
 )
 
+// bubbleDrain, when non-nil, lets the running goroutine yield until every
+// other bubble goroutine is durably blocked (synctest.Wait). The lifecycle
+// test sets it inside its bubble; it stays nil for the real-process tiers
+// (restart), where synctest.Wait would panic. Used to pace bulk event
+// generation so the consumer keeps up under the fake clock.
+var bubbleDrain func()
+
+// drain yields to the bubble's other goroutines if running in one; a no-op
+// otherwise. Safe to call from any tier.
+func drain() {
+	if bubbleDrain != nil {
+		bubbleDrain()
+	}
+}
+
 // synctestBubbleUsed guards against a second synctest bubble in the same
 // process. The production zstd encoders (overlay/segment/subscribe) are package
 // globals whose worker goroutines + channels bind to whichever synctest bubble
