@@ -7,11 +7,11 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"runtime"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
@@ -26,13 +26,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// nolint:paralleltest
+// TestOracle_DefaultLifecycle drives the full jetstreamd lifecycle (bootstrap
+// -> merge -> steady -> compaction -> client-observer serving tiers ->
+// shutdown) entirely inside a testing/synctest bubble with NO sockets and the
+// fake clock: the upstream firehose is fed in-memory via LiveDial, all outbound
+// HTTP (getRepo/listRepos/PLC) is served in-process via HTTPTransport, and the
+// runtime's public surface (which the observer tier consumes) is served over a
+// pipe-backed listener. CI runs exactly this — the test you run locally is the
+// test CI runs, free of wall-clock skew. One bubble per process (see the guard).
+//
+// nolint:paralleltest // synctest.Test forbids t.Parallel inside the bubble.
 func TestOracle_DefaultLifecycle(t *testing.T) {
+	if synctestBubbleUsed.Swap(true) {
+		t.Skip("oracle synctest tier must run one bubble per process; " +
+			"re-run as a separate `go test` invocation, not -count>1")
+	}
+	synctest.Test(t, testOracleDefaultLifecycle)
+}
+
+func testOracleDefaultLifecycle(t *testing.T) {
 	cfg, err := defaultLifecycleConfig(os.LookupEnv, testing.Short())
 	require.NoError(t, err)
 	if cfg.Mode == "stress" && testing.Short() {
 		t.Skip("skipping stress oracle under -short")
 	}
+
+	// The synctest fake clock starts at 2000-01-01 UTC, but the simulator
+	// stamps commit revs at its logical-clock epoch (~2023). atmos's verifier
+	// rejects a rev >5m in the future, so advance the bubble clock past the
+	// epoch before any event flows. See advanceClockToSimulatorEpoch.
+	advanceClockToSimulatorEpoch()
 
 	trace, tracePath, closeTrace := newOracleTrace(t, "oracle-trace.jsonl")
 	defer closeTrace()
@@ -72,9 +95,18 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	_, err = w.EnsureSeed()
 	require.NoError(t, err)
 	require.NoError(t, w.Bootstrap(t.Context(), slog.Default()))
+	// Size the firehose fanout buffer to comfortably exceed the run's total
+	// event volume. The simulator fanout drops frames on a full per-subscriber
+	// buffer (it models a lossy relay), and in the bubble a dropped frame is
+	// lost for good — the in-process consumer never reconnects+replays the way
+	// a real socket disconnect would, so a drop silently breaks the exact-count
+	// acks. A closed-system test has a known bound; size to it and assert zero
+	// drops at shutdown (below) so any future overflow fails loud, not silent.
+	fanoutBuf := max(8192, simCfg.FirehoseHistory*2)
+	fan := fanout.New(fanoutBuf)
 	require.NoError(t, w.AttachRuntime(
 		rand.New(rand.NewPCG(cfg.Seed^0xfeedf00d, cfg.Seed^0xc0ffee)),
-		fanout.New(4096),
+		fan,
 	))
 
 	faultPlan, err := BuildSwarmFaultPlan(w, cfg)
@@ -94,11 +126,22 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"subscribe_repos_disconnect_threshold_count": len(faultPlan.SubscribeReposDisconnectThresholds),
 	})
 
-	srv := httptest.NewServer(nil)
-	defer srv.Close()
-	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, srv.URL, simhttp.HandlerOptions{
+	// Serve the simulator in-process over a pipe-backed listener (no socket).
+	// A real http.Server is used (not a ResponseRecorder RoundTripper) so CAR
+	// streaming and the getRepo CAR-truncation fault — a mid-stream connection
+	// reset — keep their real wire behavior. simURL is synthetic; the pipe
+	// client routes by connection, not host.
+	const simURL = "http://sim.invalid"
+	simLn := newPipeListener()
+	simSrv := &http.Server{Handler: simhttp.NewHandlerWithOptions(w, simURL, simhttp.HandlerOptions{
 		Faults: faultPlan.SimulatorFaults,
-	})
+	})}
+	simServeDone := make(chan struct{})
+	go func() {
+		defer close(simServeDone)
+		_ = simSrv.Serve(simLn)
+	}()
+	simClient := simLn.httpClient()
 
 	dataDir := t.TempDir()
 	afterBootstrap := newPhaseGate()
@@ -138,18 +181,30 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		Jitter:       gt.Some(false),
 	}
 
+	// The runtime's public surface is served over a pipe-backed listener; the
+	// observer tier (client backfill, typed backfill, overlay fetch) reaches it
+	// through this listener's in-process client. Debug listener likewise.
+	runtimePublicLn := newPipeListener()
+	runtimeDebugLn := newPipeListener()
+	obsClient := runtimePublicLn.httpClient()
+
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
-		PublicAddr:         "127.0.0.1:0",
-		DebugAddr:          "127.0.0.1:0",
 		DataDir:            dataDir,
-		RelayURL:           srv.URL,
-		PLCURL:             srv.URL,
+		RelayURL:           simURL,
+		PLCURL:             simURL,
 		OTelServiceName:    "jetstream-oracle",
 		LogLevel:           "warn",
 		LogFormat:          "text",
 		LogOutput:          testWriter{t: t},
 		ShutdownTimeout:    5 * time.Second,
 		ClientDrainTimeout: time.Second,
+		// In-process transport for the full bubble: pipe listeners for the
+		// runtime's public/debug servers, in-memory firehose dial, and an
+		// HTTP transport that serves the simulator with no socket.
+		PublicListener: runtimePublicLn,
+		DebugListener:  runtimeDebugLn,
+		LiveDial:       subscribeReposDial(simClient),
+		HTTPTransport:  simClient.Transport,
 		// Keep injected transient getRepo 503s fast: a sub-millisecond
 		// retry backoff means each fault adds microseconds, not atmos's
 		// 1s production base delay, so the swarm sweep stays inside its
@@ -235,6 +290,18 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer closeCancel()
 		require.NoError(t, rt.Close(closeCtx))
+		// Reap pooled keep-alive connections on both pipe transports. Over
+		// net.Pipe an idle HTTP/1.1 keep-alive conn parks its client readLoop/
+		// writeLoop and server conn.serve in durably-blocking reads that never
+		// exit on their own; without this the bubble fn returns with those
+		// goroutines alive and synctest panics "blocked goroutines remain".
+		obsClient.CloseIdleConnections()
+		simClient.CloseIdleConnections()
+		// Tear down the in-process simulator server and drain its goroutine:
+		// every bubble goroutine must exit before the bubble function returns.
+		_ = simSrv.Shutdown(closeCtx)
+		_ = simLn.Close()
+		<-simServeDone
 	}()
 
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "wait_begin"})
@@ -261,10 +328,6 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-merge", "marker": "after_release"})
 
 	publicURL := waitForRuntimePublicURL(t, cfg, rt, run)
-	// obsClient is the HTTP transport the client-observer tier (client backfill,
-	// typed backfill, overlay fetch) uses to reach the runtime's public surface.
-	// Real sockets here; the in-bubble tier swaps in a pipe-backed client.
-	obsClient := http.DefaultClient
 	passesBeforeSteady := compaction.Count()
 
 	steadyStartSeq := w.CurrentSeq()
@@ -274,7 +337,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	targetSeq := w.CurrentSeq()
 	recordTraceOrError(t, trace, "steady_target", map[string]any{"target_seq": targetSeq})
-	steadyAck.Wait(t, cfg, targetSeq, run, 30*time.Second)
+	steadyAck.Wait(t, cfg, targetSeq, run, oracleWaitTimeout(cfg))
 	assertFirehoseEventLogMatches(t, trace, w, steadyEventLog, steadyStartSeq, targetSeq, "steady-state")
 
 	asyncIdx := pickActiveOracleAccount(t, w, cfg)
@@ -283,8 +346,8 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	asyncEntry, _, err := w.ListReposPage(asyncIdx, 1)
 	require.NoError(t, err)
 	require.Len(t, asyncEntry, 1)
-	asyncResyncAck.Wait(t, cfg, string(asyncEntry[0].DID), asyncEntry[0].Rev, run, 30*time.Second)
-	steadyCompaction := compaction.WaitAfter(t, cfg, run, passesBeforeSteady, 30*time.Second)
+	asyncResyncAck.Wait(t, cfg, string(asyncEntry[0].DID), asyncEntry[0].Rev, run, oracleWaitTimeout(cfg))
+	steadyCompaction := compaction.WaitAfter(t, cfg, run, passesBeforeSteady, oracleWaitTimeout(cfg))
 	require.Greaterf(t, steadyCompaction.Watermark, afterMergeCompaction.Watermark,
 		"steady compaction watermark did not advance: mode=%s seed=%d after_merge_watermark=%d steady_watermark=%d",
 		cfg.Mode, cfg.Seed, afterMergeCompaction.Watermark, steadyCompaction.Watermark)
@@ -323,7 +386,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"did":          string(lateAcct.DID),
 		"upstream_seq": lateDIDUpstreamSeq,
 	})
-	lateDIDTombstoneSeq := lateOverlayDIDAck.Wait(t, cfg, string(lateAcct.DID), lateDIDUpstreamSeq, run, 30*time.Second)
+	lateDIDTombstoneSeq := lateOverlayDIDAck.Wait(t, cfg, string(lateAcct.DID), lateDIDUpstreamSeq, run, oracleWaitTimeout(cfg))
 	recordTraceOrError(t, trace, "late_overlay_did_tombstone_observed", map[string]any{
 		"did":          string(lateAcct.DID),
 		"upstream_seq": lateDIDUpstreamSeq,
