@@ -193,6 +193,52 @@ not inferred. Decisions agreed with Jim are marked **DECISION**.
   fix `drainResults()`-on-`ctx.Done` in atmos next. Avoid touching shared atmos
   streaming until proven necessary.
 
+  ### R3 MEASURED (2026-06-25) — the simulator gap is NOT the loss; atmos is
+
+  Followed the decision: instrumented the harness to neutralize the backpressure
+  (env `R3_NO_BACKPRESSURE` removes the per-batch + generateN `drain()` pacing;
+  `R3_RAW` additionally removes the final pre-cutover delivery wait). Results:
+  - With the final delivery wait KEPT (only per-batch pacing removed): **0
+    failures in 37 runs** (default ×10, 2000-steady ×12, 100-acct ×15). The
+    simulator subscribe-boundary gap, though structurally real, does NOT lose
+    events. ⇒ **the planned simulator-only fix (TODO-1) would fix the WRONG
+    thing** — do NOT land it (would be churn on a refuted hypothesis, the WI-10
+    trap again).
+  - With ALL delivery sync removed (`R3_RAW`): R3 reproduces exactly as
+    documented — `after-bootstrap: expected=294 observed=293 (a dropped row never
+    reaches the expected count)`, 12/12. Traced the lost cursor: bootstrap
+    delivered 1..199, **cursor 200 missing from BOTH bootstrap and steady —
+    permanently lost**.
+
+  ROOT CAUSE, verified by reading atmos `streaming/client.go` directly: the loss
+  is the **atmos `readLoop` non-drain-on-cancel** + **shared-verifier rev-replay**,
+  exactly as the corrected analysis said. On cutover (`cancelLive` → consumer
+  ctx Done), three points all key on the cancelled ctx and drop in-flight work:
+  (1) the scheduler worker runs `verifyOne(jctx, …)` with the cancelled ctx;
+  (2) `resultCh <- res` has a `case <-ctx.Done()` that discards the result
+  (client.go:740-743); (3) `drainResults` itself bails on `ctx.Done()`
+  (client.go:1107) and the readLoop `ctx.Done()` branch only `flushBatch()`s,
+  never drains (client.go:1191-1195). CRUCIAL permanence mechanism: `verifyOne` →
+  `v.VerifyCommit(ctx, …)` **advances the shared pebble verifier's per-DID rev as
+  a side effect** BEFORE the result is dropped. So on steady re-subscribe the
+  relay faithfully re-delivers cursor 200, but `VerifyCommit` now returns
+  `ops==nil` ("rev replay") → `res.silentDrop=true` (verify_worker.go) → seq
+  advances, event never delivered/appended. The cursor does NOT skip it; the
+  shared verifier makes the drop permanent. (Note `drainResults` bailing on
+  `ctx.Done()` means a naive "just call drainResults in the ctx.Done branch" fix
+  does NOT work — the drain context must not be the cancelled one.)
+
+  **DECISIONS (with Jim, 2026-06-25):** (a) fix the **atmos** cutover-drain (the
+  true root cause), NOT the simulator gap; (b) add a jetstream-side anti-vacuity
+  guard so a future weakening of the backpressure makes the loss FAIL LOUD rather
+  than relying on pacing timing. Production reachability: both bootstrap consumers
+  share `relay/cursor`, so steady re-fetches the tail — production is only exposed
+  to PERMANENT loss via the shared-verifier rev-replay, same as the test; the
+  graceful-cancel-must-be-lossless fix is the right durability invariant
+  regardless. The atmos change must give in-flight verifications a bounded drain
+  window on cancel WITHOUT turning a fast cancel into a hang (test under -race
+  against the full atmos streaming suite).
+
 - **R4 — missing anti-vacuity guard: FIXED + verified.** `harness_test.go:108-110`
   promised "assert zero drops at shutdown" but there was **no** `fan.TotalDrops()`
   assertion. Added `require.Zerof(t, fan.TotalDrops(), …)` after `waitForRuntimeExit`.
