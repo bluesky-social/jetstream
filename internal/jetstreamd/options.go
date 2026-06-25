@@ -116,6 +116,7 @@ type Options struct {
 	CompactionTombstoneCap    int
 	CompactionRewriteWorkers  int
 	OverlayRebuildInterval    time.Duration
+	BarrierBeforeCutover      PhaseBarrier
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
 	OnCompactionPass          func(CompactionPassResult)

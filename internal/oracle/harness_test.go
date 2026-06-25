@@ -162,7 +162,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	steadyEventLog := newEventLogRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
 	emittedBootstrapAccountDelete := false
-	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, func(ctx context.Context) (int64, error) {
+	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, bootstrapAck, oracleWaitTimeout(cfg), func(ctx context.Context) (int64, error) {
 		if !emittedBootstrapAccountDelete {
 			emittedBootstrapAccountDelete = true
 			_, err := w.GenerateAccountDeleteForTest(ctx, 0)
@@ -177,9 +177,6 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		}
 		return w.CurrentSeq(), nil
 	})
-	bootstrapTraffic.afterBatch = func(ctx context.Context, targetSeq int64) error {
-		return bootstrapAck.WaitContiguousFrom(ctx, 1, targetSeq, oracleWaitTimeout(cfg))
-	}
 	liveReconnectBackoff := &streaming.BackoffPolicy{
 		InitialDelay: gt.Some(time.Millisecond),
 		MaxDelay:     gt.Some(time.Millisecond),
@@ -232,6 +229,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		CompactionInterval:        time.Hour,
 		CompactionTombstoneCap:    1,
 		OverlayRebuildInterval:    10 * time.Millisecond,
+		BarrierBeforeCutover:      bootstrapTraffic.WaitDelivered,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
 		OnBeforeCompactionPass: func(targetWatermark uint64) {
@@ -282,9 +280,23 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		close(run.exited)
 	}()
 
+	// Bootstrap traffic runs on its own goroutine (see bootstrapTrafficGenerator
+	// for why it must NOT run under the backfill writer lock). It blocks on the
+	// start signal until the first repo completes, then paces generation against
+	// bootstrapAck off-lock. It exits on ctx cancel; we drain it before the
+	// bubble fn returns so no goroutine is left blocked.
+	bootstrapTrafficDone := make(chan struct{})
+	go func() {
+		defer close(bootstrapTrafficDone)
+		if err := bootstrapTraffic.Run(ctx); err != nil && ctx.Err() == nil {
+			t.Errorf("bootstrap traffic generator: mode=%s seed=%d err=%v", cfg.Mode, cfg.Seed, err)
+		}
+	}()
+
 	runDone := false
 	defer func() {
 		cancel()
+		<-bootstrapTrafficDone
 		if !runDone {
 			waitForRuntimeExit(t, cfg, run)
 			recordTraceOrError(t, trace, "runtime_exit", map[string]any{
@@ -1389,52 +1401,129 @@ func (w testWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// bootstrapTrafficGenerator emits the bootstrap-phase live traffic (an
+// account-delete tombstone followed by ordinary commits) that the
+// bootstrap-live consumer must archive concurrently with backfill.
+//
+// CRITICAL (R2 deadlock fix): generation and its backpressure wait run on a
+// DEDICATED goroutine (Run), NOT inside AfterRepoComplete. AfterRepoComplete is
+// the backfill writer's OnDurableBatch afterDone callback, invoked while
+// ingest.Writer.mu + drainMu are held (writer.go commitDurableBatchLocked); a
+// blocking wait there deadlocks because sibling backfill workers then block on
+// w.mu, and a goroutine blocked on a Mutex is NOT durably-blocked under
+// testing/synctest, so the fake clock freezes and the bootstrap-live consumer
+// can never deliver the awaited cursors. Run does the same batch-generate-then-
+// WaitContiguousFrom pacing off the writer lock: backpressure (which masks the
+// fanout boundary race — see R3) is preserved, but nothing blocks under the
+// lock. AfterRepoComplete is reduced to a non-blocking signal/counter.
 type bootstrapTrafficGenerator struct {
-	mu         sync.Mutex
-	accounts   int
-	target     int
-	completed  int
-	generated  int
-	generate   func(context.Context) (int64, error)
-	afterBatch func(context.Context, int64) error
+	accounts int
+	target   int
+	generate func(context.Context) (int64, error)
+	ack      *seqAck
+	timeout  time.Duration
+
+	startOnce sync.Once
+	started   chan struct{}
+	delivered chan struct{} // closed by Run once all target events are delivered
+
+	mu        sync.Mutex
+	completed int
+	generated int
 }
 
-func newBootstrapTrafficGenerator(accounts, target int, generate func(context.Context) (int64, error)) *bootstrapTrafficGenerator {
+func newBootstrapTrafficGenerator(accounts, target int, ack *seqAck, timeout time.Duration, generate func(context.Context) (int64, error)) *bootstrapTrafficGenerator {
 	return &bootstrapTrafficGenerator{
-		accounts: accounts,
-		target:   target,
-		generate: generate,
+		accounts:  accounts,
+		target:    target,
+		generate:  generate,
+		ack:       ack,
+		timeout:   timeout,
+		started:   make(chan struct{}),
+		delivered: make(chan struct{}),
 	}
 }
 
-func (g *bootstrapTrafficGenerator) AfterRepoComplete(ctx context.Context, _ atmos.DID) error {
+// WaitDelivered blocks until Run has generated and durably delivered every
+// bootstrap event (or ctx is cancelled). Wired to the orchestrator's
+// BarrierBeforeCutover so the cutover does not cancel the bootstrap-live
+// consumer until all injected bootstrap traffic has been archived — the
+// delivery guarantee the old in-callback wait provided implicitly.
+func (g *bootstrapTrafficGenerator) WaitDelivered(ctx context.Context) error {
+	if g == nil || g.target <= 0 {
+		return nil
+	}
+	select {
+	case <-g.delivered:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Run generates the bootstrap live traffic on its own goroutine, blocking only
+// on bubble channels (the start signal, the world generators, and the off-lock
+// WaitContiguousFrom). It waits for the first AfterRepoComplete (so backfill is
+// underway and the bootstrap-live consumer is subscribed) before starting, then
+// emits the target events in small batches, waiting after each batch until every
+// cursor up to the last generated seq has been durably delivered. That wait is
+// the backpressure that keeps the consumer abreast of generation (masking the
+// fanout boundary race) and, because Run finishes well before backfill drains,
+// it also ensures all bootstrap events reach the bootstrap-live consumer before
+// the cutover cancels it. Returns nil on clean ctx cancellation.
+func (g *bootstrapTrafficGenerator) Run(ctx context.Context) error {
 	if g == nil || g.target <= 0 {
 		return nil
 	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	g.completed++
-	remainingEvents := g.target - g.generated
-	if remainingEvents <= 0 {
+	select {
+	case <-g.started:
+	case <-ctx.Done():
 		return nil
 	}
 
-	remainingAccounts := max(1, g.accounts-g.completed+1)
-	n := (remainingEvents + remainingAccounts - 1) / remainingAccounts
-	var lastSeq int64
-	for range n {
-		seq, err := g.generate(ctx)
-		if err != nil {
-			return err
+	// Mirror the old per-completion cadence (~ceil(target/accounts) events
+	// between waits) so the consumer is paced the same way it was under the
+	// in-callback wait, just off the writer lock.
+	batch := max(1, (g.target+g.accounts-1)/g.accounts)
+	var generated int
+	for generated < g.target {
+		n := min(batch, g.target-generated)
+		var lastSeq int64
+		for range n {
+			seq, err := g.generate(ctx)
+			if err != nil {
+				return err
+			}
+			lastSeq = seq
+			generated++
+			g.mu.Lock()
+			g.generated = generated
+			g.mu.Unlock()
 		}
-		lastSeq = seq
-		g.generated++
+		if lastSeq > 0 {
+			if err := g.ack.WaitContiguousFrom(ctx, 1, lastSeq, g.timeout); err != nil {
+				return err
+			}
+		}
 	}
-	if g.afterBatch != nil && lastSeq > 0 {
-		return g.afterBatch(ctx, lastSeq)
+	// Every target event is generated and (per the final WaitContiguousFrom)
+	// durably delivered. Release the pre-cutover barrier.
+	close(g.delivered)
+	return nil
+}
+
+// AfterRepoComplete is the backfill afterDone hook. It runs UNDER the ingest
+// writer lock, so it must NOT block: it only kicks the generator goroutine on
+// the first call and bumps the completed counter for the trace.
+func (g *bootstrapTrafficGenerator) AfterRepoComplete(_ context.Context, _ atmos.DID) error {
+	if g == nil || g.target <= 0 {
+		return nil
 	}
+	g.startOnce.Do(func() { close(g.started) })
+	g.mu.Lock()
+	g.completed++
+	g.mu.Unlock()
 	return nil
 }
 

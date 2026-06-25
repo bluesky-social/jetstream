@@ -58,9 +58,56 @@ not inferred. Decisions agreed with Jim are marked **DECISION**.
   or a genuine restart-recovery race? Capture the trace artifact it already
   writes.
 
+## R2 FIXED (2026-06-25) + a reproducible correctness bug surfaced
+
+- **R2 — stress/100-acct DEADLOCK: FIXED + verified (20/20, no hangs).** The
+  agreed off-writer-goroutine approach is implemented. Goroutine-dump-confirmed
+  chain: `AppendBatch` (writer.go:288 drainMu, :289 mu) → `flushBlockLocked` →
+  `commitDurableBatchLocked`'s deferred `afterDone` (writer.go:755, UNDER both
+  locks) → `AfterRepoComplete` → `afterBatch` → `WaitContiguousFrom` blocked.
+  Siblings parked on `w.mu` (non-durable) froze the fake clock permanently.
+  FIX: the bootstrap traffic generator now runs on a DEDICATED goroutine
+  (`bootstrapTrafficGenerator.Run`) doing the same batch-generate-then-
+  `WaitContiguousFrom` pacing OFF the writer lock; `AfterRepoComplete` is reduced
+  to a non-blocking start-signal + counter. The under-lock wait also implicitly
+  did TWO other jobs we had to preserve: (a) backpressure that paces the consumer
+  (kept — masks R3), and (b) it gated CUTOVER (backfill couldn't drain until the
+  last batch was delivered). (b) was the subtle one: decoupling let backfill
+  drain and `cancelLive` tear down the bootstrap-live consumer before any event
+  was delivered (`seen=0`, 25 completions / 0 bootstrap_live_events). FIX for (b):
+  a new **`BarrierBeforeCutover`** orchestrator `PhaseBarrier` (config.go,
+  bootstrap.go before `cancelLive`; threaded through jetstreamd Options/runtime),
+  **nil/inert in production** (prod re-fetches in-flight live events from the
+  persisted cursor in steady-state). The harness wires it to the generator's
+  `WaitDelivered` so cutover waits until all bootstrap traffic is archived.
+  VALIDATION: 100-acct (200/200) **0 deadlocks in 20 runs** (was permanent hang
+  ~40-67%); default mode 8/8 + `-race` clean (3.7s); orchestrator/jetstreamd
+  suites green; `just test` 1841 tests green. Generator unit tests rewritten for
+  the new contract (Run generates target paced by ack; AfterRepoComplete proven
+  non-blocking). Committed files: `internal/oracle/harness_test.go`,
+  `internal/oracle/bootstrap_traffic_test.go`,
+  `internal/ingest/orchestrator/{config,bootstrap}.go`,
+  `internal/jetstreamd/{options,runtime}.go`.
+
+- **R6 — NEW: a DETERMINISTICALLY REPRODUCIBLE `superseded row survived` bug.**
+  This is the payoff of the whole effort. With R2's deadlock gone, the 100-acct
+  config surfaces the CI correctness bug class as a RELIABLE RED TEST: 2 of 20
+  seeds failed `CheckCompacted` with `superseded record row survived` (e.g.
+  `seed=1009 @ 100 accts`: `did=…6mdyc7… repost rkey=22apsp2qszcgn seq=5744
+  tombstone_seq=5801`), and **seed 1009 reproduces it 3/3 runs** — the local
+  red→green loop the doc set out to build. It is NOT R2 (no hang) and NOT R3 (no
+  boundary count gap); it is the storage-tier resync/compaction-eviction defect
+  the original CI triage chased. It does NOT appear at default/25-acct (12/12
+  seeds clean), so it needs the higher account count. STATUS: out of scope for
+  the reproducibility track (which is now delivering its goal); hand off to the
+  bug-fix track with the reproducer `JETSTREAM_ORACLE_ACCOUNTS=100
+  JETSTREAM_ORACLE_LIVE_EVENTS_BOOTSTRAP=200 JETSTREAM_ORACLE_LIVE_EVENTS_STEADY=200
+  JETSTREAM_ORACLE_SEED=1009 go test ./internal/oracle -run 'TestOracle_DefaultLifecycle$'`.
+
 ## Confirmed defects still open (with corrected mechanisms)
 
-- **R2 — stress/100-acct DEADLOCK (the `oracle-sweep` "infinite loop").**
+- **R2 (historical write-up below kept for the mechanism detail) — stress/100-acct
+  DEADLOCK (the `oracle-sweep` "infinite loop").**
   `oracle-sweep` runs `MODE=stress` (100 accts/5000 events/phase) which deadlocks
   in the bubble and burns the full per-seed `-timeout` (30m; 90m `-race`) × 10
   seeds ≈ 5h+. Default mode is green and fast (`ok 0.24s`).
@@ -137,11 +184,19 @@ timeouts + the stale repro hint + the per-push CI gate (old TODO-5/6).
    counter survive subscriber detach (S; independent).
 3. R3 simulator subscribe-boundary race fix, TODO-1a (M). Gate: default 20/20
    with `afterBatch` temporarily nil.
-4. R2 deadlock fix via off-goroutine semaphore (M). Gate: 100-acct 20/20, no
-   timeouts.
+4. **[DONE]** R2 deadlock fix via dedicated generator goroutine +
+   `BarrierBeforeCutover` (M). Verified: 100-acct 0 deadlocks/20 runs; default
+   8/8 + `-race` clean. NOTE: landed BEFORE R3 — the off-goroutine approach
+   decouples them (the agreed plan), and R2 unblocks running stress in-bubble to
+   measure R3. Re-run R3's `afterBatch=nil`-style measurement is now moot since
+   the wait moved off-lock; R3 to be measured directly at stress scale.
 5. R5 triage the restart-tier `-race` flake (separate track).
-6. After R2/R3: rework `oracle-sweep` (timeouts, hint) + wire the per-push CI
+6. After R3: rework `oracle-sweep` (timeouts, hint) + wire the per-push CI
    gate (default `-race`, ~0.25s, artifact-on-failure).
+7. **R6 (NEW, bug-fix track, not reproducibility):** fix the now-reproducible
+   `superseded row survived` compaction/resync bug. Reproducer:
+   `JETSTREAM_ORACLE_ACCOUNTS=100 …_BOOTSTRAP=200 …_STEADY=200
+   JETSTREAM_ORACLE_SEED=1009 go test -run 'TestOracle_DefaultLifecycle$'`.
 
 VERIFIED-GOOD, no change needed: restart tier is green in isolation and
 correctly stays a real-process tier (`drain()` is a no-op outside the bubble).

@@ -231,6 +231,16 @@ type Config struct {
 	// run; nil-safe.
 	OnSteadyStateWriter func(*ingest.Writer)
 
+	// BarrierBeforeCutover, if non-nil, runs inside runBootstrap after the
+	// backfill engine drains but BEFORE the bootstrap-live consumer's context is
+	// cancelled — i.e. while the bootstrap-live consumer is still delivering.
+	// Intended for deterministic validation harnesses that inject live traffic
+	// during bootstrap and need it fully archived before the cutover tears the
+	// consumer down (production re-fetches any in-flight live events from the
+	// persisted cursor in steady-state, so production leaves this nil and the
+	// cutover proceeds immediately).
+	BarrierBeforeCutover PhaseBarrier
+
 	// BarrierAfterBootstrap, if non-nil, runs after bootstrap has durably
 	// written PhaseMerging and before merge begins. Intended for deterministic
 	// validation harnesses; production leaves it nil.
