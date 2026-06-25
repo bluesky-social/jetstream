@@ -74,6 +74,11 @@ type Options struct {
 	// leaves it nil.
 	LiveReconnectBackoff *streaming.BackoffPolicy
 
+	// LiveDial, when non-nil, overrides atmos's websocket dial for the live
+	// consumer. Production leaves it nil; deterministic harnesses feed the
+	// firehose over an in-memory connection.
+	LiveDial streaming.DialFunc
+
 	CursorLookback            time.Duration
 	SegmentCacheMaxAge        time.Duration
 	PlanMaxDIDs               int

@@ -164,6 +164,11 @@ type Config struct {
 	// consumers. Production leaves it nil.
 	LiveReconnectBackoff *streaming.BackoffPolicy
 
+	// LiveDial, when non-nil, overrides atmos's websocket dial for both
+	// bootstrap-time and steady-state live consumers. Production leaves it
+	// nil; deterministic harnesses feed the firehose in-memory.
+	LiveDial streaming.DialFunc
+
 	// IngestOnAfterSeal is forwarded to every writer that appends to
 	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's
 	// OnSegmentSealed callback. Optional.

@@ -76,6 +76,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			SegmentMetrics:   o.cfg.SegmentMetrics,
 			OnEvent:          o.cfg.OnBootstrapLiveEvent,
 			ReconnectBackoff: o.cfg.LiveReconnectBackoff,
+			Dial:             o.cfg.LiveDial,
 		})
 		if err != nil {
 			if cerr := bw.Close(); cerr != nil {

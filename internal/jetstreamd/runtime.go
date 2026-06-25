@@ -359,6 +359,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		FailedRepoRetryHostWorkers: opts.FailedRepoRetryHostWorkers,
 		FailedRepoRetryMaxDelay:    opts.FailedRepoRetryMaxDelay,
 		LiveReconnectBackoff:       opts.LiveReconnectBackoff,
+		LiveDial:                   opts.LiveDial,
 		IngestOnAfterSeal:          mft.OnSegmentSealed,
 		OnSegmentCompacted:         onSegmentCompacted,
 		SegmentManifestChecksums:   mft.SegmentChecksums,

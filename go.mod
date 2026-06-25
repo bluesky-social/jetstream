@@ -2,6 +2,10 @@ module github.com/bluesky-social/jetstream
 
 go 1.26
 
+// Local atmos checkout while iterating on the streaming.Conn/Dial injection
+// seam (oracle reproducibility work). Drop when a tagged atmos release ships.
+replace github.com/jcalabro/atmos => ../../jcalabro/atmos
+
 require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/coder/websocket v1.8.15
