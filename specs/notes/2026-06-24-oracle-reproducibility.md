@@ -1202,6 +1202,51 @@ mode (the CI-relevant scale); stress remains a separate sweep concern.
 KEPT (sound regardless): `bubbleDrain` seam, `fanout.TotalDrops()`, volume-sized
 fanout buffer. Committed.
 
+### WI-8 ROOT CAUSES FOUND (2026-06-25, full code trace) — two distinct bugs
+
+Researched the atmos consumer batch/flush/cursor path and the jetstream ingest
+writer locking. Ruled out the batchTimeout-stall theory with a spike: a timer
+DOES fire while a goroutine is parked in a coder/websocket `conn.Read` over a
+`net.Pipe` (net.Pipe read blocks on channels = durably-blocking; the fake clock
+advances). Two real, separate bugs — both latent concurrency issues the bubble's
+determinism + instant-generation surfaced, NOT product logic bugs:
+
+1. HIGH EVENT VOLUME (≥~1024 events) — FIXED (committed). The simulator
+   subscribeRepos handler replayed only ONE `subscribeReplayLimit`=1024 page then
+   jumped to live, silently skipping the rest of a large backlog (the consumer
+   treats OutdatedCursor #info as a no-op). Fix: loop `FirehoseRange` to replay
+   the full backlog before the live phase (relay_subscribe.go).
+
+2. HIGH ACCOUNT COUNT (100 accts) — STILL OPEN, root cause identified. A
+   LOCK-ORDER DEADLOCK in the test harness's bootstrap backpressure:
+   - Goroutine dump (100-acct run, at timeout): goroutine holds the backfill
+     `ingest.Writer.mu` (+ `drainMu`) inside `AppendBatch -> appendLocked ->
+     flushBlockLocked -> commitDurableBatchLocked -> OnDurableBatch callback`,
+     which is `backfill.Store.stageCompleteBatch.func3` (also holding
+     `Store.countsMu`) -> the harness `AfterRepoComplete` hook (harness_test.go
+     ~265) -> `bootstrapTraffic.AfterRepoComplete` -> `afterBatch` ->
+     `bootstrapAck.WaitContiguousFrom(1, 2, ...)` (harness_test.go ~181/1423).
+   - That `WaitContiguousFrom` BLOCKS waiting for the bootstrap-live consumer to
+     deliver contiguous cursors — WHILE HOLDING `Writer.mu`+`drainMu`+`countsMu`.
+     Other backfill workers block on `Writer.mu` in `AppendBatch` (writer.go:288).
+     The awaited ingestion progress can't complete because the backfill engine is
+     wedged behind the lock the callback holds. Over a real socket the awaited
+     events usually landed before the flush callback fired; under the fake clock
+     with instant bulk generation the wait blocks first => deterministic deadlock.
+   - THE FLAW: the harness runs a blocking backpressure wait
+     (`afterBatch`/WaitContiguousFrom) from INSIDE the durable-batch commit
+     callback, which holds ingest writer locks. A wait-for-consumer must never run
+     under those locks.
+   FIX DIRECTION (next session): move the `afterBatch` backpressure wait OUT of
+   the `OnDurableBatch`/`AfterRepoComplete` callback. Options: (a) have
+   `AfterRepoComplete` only ENQUEUE the generate+target and perform the
+   `WaitContiguousFrom` from the harness's own goroutine (e.g. the main test
+   goroutine between phases, or a dedicated pacer) outside any writer lock; or
+   (b) drop the per-batch contiguous wait during bootstrap entirely and rely on
+   the after-bootstrap barrier + a single drain (bootstrap already waits for the
+   barrier). Verify the backfill completion-batcher contract still holds. This is
+   harness-only; no production change.
+
 ## Decision log (continued)
 - 2026-06-24: Steps 1 (jitter), 2 (LiveDial threading), 4 (HTTPTransport)
   implemented, tested, committed. Manual clock sweep SKIPPED (synctest auto-fakes
