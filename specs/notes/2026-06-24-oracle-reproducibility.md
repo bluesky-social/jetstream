@@ -106,11 +106,20 @@ not inferred. Decisions agreed with Jim are marked **DECISION**.
   fix `drainResults()`-on-`ctx.Done` in atmos next. Avoid touching shared atmos
   streaming until proven necessary.
 
-- **R4 — missing anti-vacuity guard.** `harness_test.go:108-110` promises "assert
-  zero drops at shutdown" but there is **no** `fan.TotalDrops()` assertion. Add
-  `require.Zero(t, fan.TotalDrops())` after shutdown (independent of the others;
-  drops==0 today) so a future fanout overflow fails loud instead of silently
-  corrupting the exact-count acks. Prove it can fail by shrinking `fanoutBuf`.
+- **R4 — missing anti-vacuity guard: FIXED + verified.** `harness_test.go:108-110`
+  promised "assert zero drops at shutdown" but there was **no** `fan.TotalDrops()`
+  assertion. Added `require.Zerof(t, fan.TotalDrops(), …)` after `waitForRuntimeExit`.
+  SUBTLETY found + fixed: `TotalDrops()` summed only *currently-attached*
+  subscribers, but `Close()`/`CloseAll()` delete a subscriber from the registry
+  (taking its drop count with it), so an after-shutdown assertion would have been
+  **vacuously zero** (the relay subscriber detaches on shutdown; reconnect faults
+  detach mid-run too). Fixed by accumulating a detaching subscriber's drops into a
+  registry-level `detachedDrops atomic.Uint64` in `Close`/`markClosed`, so
+  `TotalDrops()` reflects the whole run's lifetime. New unit tests
+  (`TestRegistry_TotalDropsSumsAttached` / `…SurvivesClose` / `…SurvivesCloseAll`)
+  fail deterministically if the accumulator regresses; verified by neutering it.
+  `just test` green (1840 tests). Committed files: `internal/simulator/fanout/fanout.go`,
+  `internal/simulator/fanout/fanout_test.go`, `internal/oracle/harness_test.go`.
 
 ## DECISION (sweep scale)
 
@@ -124,7 +133,8 @@ timeouts + the stale repro hint + the per-push CI gate (old TODO-5/6).
 
 1. **[DONE]** R1 zstd warmup `TestMain` + regression test — unblocks `just test`,
    `just default`, per-push CI.
-2. R4 `require.Zero(fan.TotalDrops())` after shutdown (S; independent).
+2. **[DONE]** R4 `require.Zero(fan.TotalDrops())` after shutdown + make the
+   counter survive subscriber detach (S; independent).
 3. R3 simulator subscribe-boundary race fix, TODO-1a (M). Gate: default 20/20
    with `afterBatch` temporarily nil.
 4. R2 deadlock fix via off-goroutine semaphore (M). Gate: 100-acct 20/20, no

@@ -421,6 +421,19 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	})
 	runDone = true
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "final-assertions", "marker": "begin"})
+	// Anti-vacuity: the fanout models a lossy relay (drop-on-full per
+	// subscriber, fanout.go Publish), and in the bubble a dropped frame is
+	// lost for good — the in-process consumer never reconnects+replays the way
+	// a real socket disconnect would, so a drop silently breaks the exact-count
+	// acks rather than failing loud. We sized fanoutBuf (above) to exceed the
+	// run's total volume precisely so drops stay at zero; assert that here so a
+	// future overflow (or a buffer-sizing regression) fails loudly instead of
+	// corrupting the reconstructed model. The runtime has exited, so the relay
+	// handler's subscriber has detached and its drop count is folded into the
+	// registry's lifetime accumulator (TotalDrops survives detach).
+	require.Zerof(t, fan.TotalDrops(),
+		"fanout dropped frames: mode=%s seed=%d drops=%d (a full per-subscriber buffer silently lost a frame; raise fanoutBuf or investigate a slow consumer)",
+		cfg.Mode, cfg.Seed, fan.TotalDrops())
 	recordSubscribeReposFaults(t, trace, "steady-state-shutdown-flush", faultPlan)
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
