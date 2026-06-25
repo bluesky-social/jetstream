@@ -329,6 +329,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	assertFaultPlanFired(t, cfg, faultPlan)
 	bootstrapTargetSeq := w.CurrentSeq()
 	assertFirehoseEventLogMatches(t, trace, w, bootstrapEventLog, 0, bootstrapTargetSeq, "after-bootstrap")
+	assertNoPermanentCursorGap(t, bootstrapEventLog, 0, bootstrapTargetSeq, cfg, "after-bootstrap")
 	assertBootstrapOracleMatches(t, dataDir, w, cfg)
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "release"})
 	afterBootstrap.Release()
@@ -357,6 +358,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	recordTraceOrError(t, trace, "steady_target", map[string]any{"target_seq": targetSeq})
 	steadyAck.Wait(t, cfg, targetSeq, run, oracleWaitTimeout(cfg))
 	assertFirehoseEventLogMatches(t, trace, w, steadyEventLog, steadyStartSeq, targetSeq, "steady-state")
+	assertNoPermanentCursorGap(t, steadyEventLog, steadyStartSeq, targetSeq, cfg, "steady-state")
 
 	asyncIdx := pickActiveOracleAccount(t, w, cfg)
 	_, err = w.GenerateSilentMutationThenCommitForTest(t.Context(), asyncIdx)
@@ -619,6 +621,43 @@ func assertFirehoseEventLogMatches(
 	})
 	require.NoErrorf(t, err, "%s: compare firehose event log cursor=%d target=%d expected=%d observed=%d",
 		phase, cursor, target, len(want), len(got))
+}
+
+// assertNoPermanentCursorGap is the anti-vacuity guard for boundary frame loss
+// (R3). It asserts — directly and without waiting — that every upstream relay
+// cursor the simulator generated in (after, through] was observed by the
+// consumer (and therefore durably archived, since OnEvent fires post-Append).
+//
+// This is the loud, immediate backstop for the "graceful cutover dropped an
+// in-flight frame" class of bug: the boundary loss is normally PREVENTED by the
+// harness backpressure + BarrierBeforeCutover (which hold the bootstrap-live
+// consumer abreast of generation and gate the cutover on full delivery), but
+// that is a timing guarantee. If a future change weakens it, the dropped cursor
+// is permanently lost (re-delivery is rev-replay-dropped by the shared
+// verifier), and the existing multiset compare only surfaces it as a 5-minute
+// TIMEOUT. This guard fails fast at quiescence with the exact missing cursors,
+// so the regression cannot hide behind pacing. Run only after the relevant ack
+// has fired, so a present-count check is not racing in-flight delivery.
+func assertNoPermanentCursorGap(t *testing.T, observed *eventLogRecorder, after, through int64, cfg Config, phase string) {
+	t.Helper()
+
+	seen := observed.ObservedUpstreamCursors(after, through)
+	var missing []int64
+	for c := after + 1; c <= through; c++ {
+		if _, ok := seen[c]; !ok {
+			missing = append(missing, c)
+		}
+	}
+	require.Emptyf(t, missing,
+		"%s mode=%s seed=%d: %d upstream cursor(s) permanently lost in (%d,%d] — a graceful-cutover/backpressure regression dropped in-flight frames (first missing: %v)",
+		phase, cfg.Mode, cfg.Seed, len(missing), after, through, firstN(missing, 10))
+}
+
+func firstN(xs []int64, n int) []int64 {
+	if len(xs) <= n {
+		return xs
+	}
+	return xs[:n]
 }
 
 func totalGetRepoHTTPFailuresFired(plan *SwarmFaultPlan) int {

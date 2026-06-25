@@ -129,6 +129,27 @@ func (r *eventLogRecorder) RowsByUpstreamCursor(after, through int64) []EventLog
 	return NormalizeEventLog(observed)
 }
 
+// ObservedUpstreamCursors returns the set of distinct upstream relay cursors
+// the recorder has observed in the (after, through] window. Used by the
+// anti-vacuity boundary-loss guard to assert that no generated cursor was
+// permanently dropped (e.g. a graceful-cutover drain regression), independent
+// of the per-row multiset compare.
+func (r *eventLogRecorder) ObservedUpstreamCursors(after, through int64) map[int64]struct{} {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[int64]struct{})
+	for _, ev := range r.events {
+		if ev.UpstreamRelayCursor <= after || ev.UpstreamRelayCursor > through {
+			continue
+		}
+		out[ev.UpstreamRelayCursor] = struct{}{}
+	}
+	return out
+}
+
 func cloneSegmentEvent(ev segment.Event) segment.Event {
 	ev.Payload = append([]byte(nil), ev.Payload...)
 	return ev

@@ -239,6 +239,44 @@ not inferred. Decisions agreed with Jim are marked **DECISION**.
   window on cancel WITHOUT turning a fast cancel into a hang (test under -race
   against the full atmos streaming suite).
 
+  ### R3 RESOLVED (2026-06-25)
+
+  Outcome: R3 is closed as **already-mitigated by R2** for the jetstream path,
+  plus an atmos robustness fix + a jetstream anti-vacuity guard.
+
+  IMPORTANT correction discovered while fixing: instrumenting the actual cutover
+  showed the atmos scheduler had `pending=0` at cancel — the `R3_RAW` permanent
+  loss is the atmos **reader goroutine dropping an already-read RAW frame** on
+  `ctx.Done()` (before dispatch/verification), NOT an in-flight verification
+  result. So the atmos drain fix below does NOT address the `R3_RAW` loss; that
+  loss is only reachable by artificially removing R2's `BarrierBeforeCutover`
+  (which the normal harness never does — R3 is green 37/37 normally). We chose to
+  keep the atmos fix as genuine defense-in-depth and NOT chase the reader-frame
+  drop (a latent-only path the harness can't hit), per Jim.
+
+  What shipped:
+  1. **atmos `streaming: drain in-flight verification results on graceful cancel`**
+     (branch `streaming-lossless-cancel-drain`, commit f1eaf08). Workers + their
+     resultCh send run under `workCtx = context.WithoutCancel(ctx)`; a graceful
+     cancel drains already-completed results into the final batch (bounded 750ms),
+     then `cancelWork` unblocks any wedged verifier; `cancelWork` runs before
+     `sched.Shutdown()` to avoid a wg.Wait hang. Full atmos streaming suite green
+     under -race incl. the wedged-verifier prompt-cancel test;
+     `TestBatch_CursorAfterBatch` updated (graceful cancel may now deliver a
+     completed trailing batch — loss-free either way).
+  2. **jetstream anti-vacuity guard** `assertNoPermanentCursorGap` (+ recorder
+     `ObservedUpstreamCursors`): asserts at quiescence that every generated
+     upstream cursor in the bootstrap and steady windows was observed (hence
+     durably archived). Defense-in-depth: if `BarrierBeforeCutover`/backpressure
+     is ever weakened, a permanently-lost cursor fails LOUD with the exact missing
+     seqs instead of relying on pacing. Verified: passes normally (12/12 across
+     seeds, no false positives); the loss is caught when exposed.
+
+  NOTE on the temporary atmos `replace` (TODO-7): the R3 fix lives on atmos branch
+  `streaming-lossless-cancel-drain`; before any jetstream merge it must be folded
+  into a tagged atmos release and the `replace` dropped (now carries the Conn/Dial
+  seam AND this drain fix).
+
 - **R4 — missing anti-vacuity guard: FIXED + verified.** `harness_test.go:108-110`
   promised "assert zero drops at shutdown" but there was **no** `fan.TotalDrops()`
   assertion. Added `require.Zerof(t, fan.TotalDrops(), …)` after `waitForRuntimeExit`.
