@@ -5,6 +5,8 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,9 +36,21 @@ var synctestBubbleUsed atomic.Bool
 // (no public server). Time is the bubble's fake clock, so the run is free of
 // wall-clock skew and completes in microseconds.
 //
-// This is the deterministic-tier reproducer for the storage-path compaction
-// failures (superseded-row-survived / over-drop). It asserts the durable
-// on-disk invariants the direct segment observers check.
+// It deterministically STAGES the resync-vs-compaction seam the triaged CI
+// failures (#100/#106 superseded-row / over-drop) live in: steady traffic →
+// silent-mutation+sync (synchronous resync) → silent-mutation+commit (async
+// resync) → late account-delete tombstone → a compaction pass that CROSSES the
+// tombstone seq. It then asserts the compaction contract (CheckCompacted) plus
+// invariants and final-state equivalence on the durable on-disk segments.
+//
+// HONEST SCOPE: synctest fakes TIME, not goroutine SCHEDULING. This pins the
+// ORDER of the staged operations (via the acks + the compaction-crossing wait),
+// but not the fine-grained goroutine interleaving inside the runtime. So a green
+// result means the seam is correct under the orderings this produces; it is a
+// strong regression guard and the substrate for a future forced-interleaving
+// probe (a yield seam at dropStaleOrderedAsyncResync), not a guarantee of
+// reproducing every scheduling-specific CI failure. JETSTREAM_ORACLE_SEED
+// overrides the seed for a separate-process sweep.
 //
 // One bubble per process: the production zstd encoders (overlay/segment/
 // subscribe) are package globals whose worker goroutines + channels bind to
@@ -62,7 +76,14 @@ func TestOracle_Synctest(t *testing.T) {
 		// recent-past and verify cleanly.
 		advanceClockToSimulatorEpoch()
 
-		const seed = uint64(987654321)
+		// Seed defaults to a fixed value; JETSTREAM_ORACLE_SEED overrides it so
+		// a separate-process sweep can explore different worlds/orderings.
+		seed := uint64(987654321)
+		if s, ok := os.LookupEnv(envOracleSeed); ok {
+			if parsed, err := strconv.ParseUint(s, 10, 64); err == nil {
+				seed = parsed
+			}
+		}
 		cfg := Config{
 			Mode:                "fast",
 			Seed:                seed,
@@ -104,7 +125,13 @@ func TestOracle_Synctest(t *testing.T) {
 		afterMerge := newPhaseGate()
 		bootstrapAck := newSeqAck()
 		steadyAck := newSeqAck()
+		lateDIDAck := newAccountTombstoneAck()
 		compaction := newCompactionPassRecorder()
+		// passCh signals each completed compaction pass's watermark. Buffered
+		// generously so OnCompactionPass (called on the compactor goroutine)
+		// never blocks; the staging code drains it to wait for a pass that
+		// crosses a target watermark without a wall-clock poll.
+		passCh := make(chan uint64, 256)
 		ctx, cancel := context.WithCancel(t.Context())
 
 		bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, func(ctx context.Context) (int64, error) {
@@ -156,9 +183,16 @@ func TestOracle_Synctest(t *testing.T) {
 			BarrierAfterMerge:         afterMerge.Barrier,
 			OnCompactionPass: func(result jetstreamd.CompactionPassResult) {
 				compaction.Observe(result)
+				select {
+				case passCh <- result.Watermark:
+				default:
+				}
 			},
 			OnBootstrapLiveEvent: func(ev *segment.Event) { bootstrapAck.Observe(ev) },
-			OnSteadyStateEvent:   func(ev *segment.Event) { steadyAck.Observe(ev) },
+			OnSteadyStateEvent: func(ev *segment.Event) {
+				steadyAck.Observe(ev)
+				lateDIDAck.Observe(ev)
+			},
 			AfterRepoComplete: func(ctx context.Context, did atmos.DID) error {
 				return bootstrapTraffic.AfterRepoComplete(ctx, did)
 			},
@@ -199,44 +233,136 @@ func TestOracle_Synctest(t *testing.T) {
 		waitForBarrierSynctest(t, "after-merge", afterMerge, run)
 		afterMerge.Release()
 
-		// Phase 3: steady-state traffic, then a silent-mutation+sync to
-		// exercise the resync/tombstone compaction seam.
+		// Phase 3: deterministically stage the resync-vs-compaction seam that
+		// the triaged CI failures (#100/#106 superseded-row / over-drop) live
+		// in. Mirrors TestOracle_DefaultLifecycle's steady-state sequence, but
+		// driven step-by-step with synctest.Wait so the ordering is pinned
+		// rather than left to wall-clock racing:
+		//
+		//   steady traffic -> silent-mutation+sync (synchronous resync rows)
+		//   -> silent-mutation+commit (async resync rows on a separate DID)
+		//   -> late account-delete tombstone -> a compaction pass that CROSSES
+		//   that tombstone's seq.
+		//
+		// If a superseded create/update row for the tombstoned DID survives
+		// that crossing pass, CheckCompacted at the final watermark catches it.
 		steadyStart := w.CurrentSeq()
 		for range cfg.LiveEventsSteady {
 			_, err := w.GenerateOneForTest(ctx)
 			require.NoError(t, err)
 		}
-		syncIdx := 0
+		syncIdx := pickActiveOracleAccount(t, w, cfg)
 		_, err = w.GenerateSilentMutationThenSyncForTest(ctx, syncIdx)
 		require.NoError(t, err)
 		target := w.CurrentSeq()
 		require.Greater(t, target, steadyStart)
-
-		// Wait until every steady cursor is durably appended. Under the fake
-		// clock this resolves as soon as the runtime quiesces.
 		require.NoError(t, steadyAck.WaitContiguousFrom(ctx, steadyStart+1, target, time.Minute))
 
-		steadyWatermark := compaction.lastWatermark()
+		// Async resync on a second DID (the path whose stale-ordered drop is
+		// the leading superseded-row suspect). The chain-breaking commit
+		// triggers an out-of-band resync, so we do NOT gate on contiguous
+		// upstream cursors here (the resync rows reorder around the commit);
+		// the compaction-crossing wait below is the real synchronization point.
+		asyncIdx := pickActiveOracleAccount(t, w, cfg)
+		_, err = w.GenerateSilentMutationThenCommitForTest(ctx, asyncIdx)
+		require.NoError(t, err)
+
+		// Late account-delete tombstone: a DID-level tombstone landing above
+		// the current watermark. Every surviving create/update row for this
+		// DID at or below the eventual watermark must be dropped by compaction.
+		lateIdx := pickActiveOracleAccount(t, w, cfg)
+		lateAcct, err := w.LoadAccount(lateIdx)
+		require.NoError(t, err)
+		_, err = w.GenerateAccountDeleteForTest(ctx, lateIdx)
+		require.NoError(t, err)
+		lateUpstreamSeq := w.CurrentSeq()
+
+		// Wait until the account-delete is durably appended, and learn its
+		// assigned durable seq (the account tombstone ack keys on DID +
+		// upstream cursor, returning the durable seq). This guarantees the
+		// #account event is on disk before we drive compaction across it.
+		tombstoneSeq := lateDIDAck.Wait(t, cfg, string(lateAcct.DID), lateUpstreamSeq, run, time.Minute)
+		require.NotZero(t, tombstoneSeq, "late account tombstone never durably observed")
+
+		// Wait for a compaction pass whose watermark reaches or exceeds the
+		// tombstone seq — i.e. a pass that had the chance to drop the
+		// tombstoned DID's superseded rows. Drain pass watermarks (no
+		// wall-clock poll); the fake clock advances the rate-limited compactor
+		// between passes. TombstoneCap=1 means each new tombstone triggers one.
+		crossingWatermark := waitForCompactionAcross(ctx, t, passCh, run, tombstoneSeq)
 
 		// Shutdown and wait for the runtime goroutine to exit before reading
 		// the durable segments (defer'd shutdown is a no-op after this).
 		shutdown()
 
-		// Durable on-disk assertions — the storage tier the triaged failures
-		// live in.
+		// Anti-vacuity: the seam must actually have fired, or a green
+		// CheckCompacted is meaningless.
+		require.NotZero(t, crossingWatermark, "no compaction pass crossed the tombstone")
+		require.GreaterOrEqual(t, crossingWatermark, tombstoneSeq,
+			"crossing pass watermark must reach the tombstone seq")
+
 		events, err := ObserveSegments(dataDir)
 		require.NoError(t, err)
 		require.NoError(t, CheckInvariants(events))
-		if steadyWatermark > 0 {
-			require.NoError(t, CheckCompacted(EventsSortedBySeq(events), steadyWatermark))
-		}
+		sorted := EventsSortedBySeq(events)
+		requireTombstonedDIDObserved(t, sorted, string(lateAcct.DID))
+
+		// The compaction contract: no surviving materialization row superseded
+		// by a tombstone at or below the crossing watermark. This is the exact
+		// check that fails as "superseded ... row survived" in CI.
+		require.NoError(t, CheckCompacted(sorted, crossingWatermark))
 
 		want, err := GroundTruthFromWorld(w)
 		require.NoError(t, err)
-		got, err := Reconstruct(EventsSortedBySeq(events))
+		got, err := Reconstruct(sorted)
 		require.NoError(t, err)
 		require.NoError(t, Compare(want, got))
 	})
+}
+
+// waitForCompactionAcross drains completed-pass watermarks until one reaches
+// target, or fails if the runtime exits first. Channel receives are durably
+// blocking, so the fake clock advances the compactor between passes without a
+// wall-clock poll.
+func waitForCompactionAcross(ctx context.Context, t *testing.T, passCh <-chan uint64, run *runtimeRun, target uint64) uint64 {
+	t.Helper()
+	// Generous fake-clock budget: the steady compactor's interval timer is 1h
+	// and cap-triggered passes are rate-limited (minCompactionTriggerSpacing
+	// 30s), so a crossing pass for the LAST tombstone may have to wait for the
+	// interval timer. Under the fake clock this elapses instantly once every
+	// goroutine is durably blocked.
+	timer := time.NewTimer(3 * time.Hour)
+	defer timer.Stop()
+	for {
+		select {
+		case wm := <-passCh:
+			if wm >= target {
+				return wm
+			}
+		case <-run.exited:
+			t.Fatalf("runtime exited before a compaction pass crossed seq %d: err=%v", target, run.err)
+		case <-ctx.Done():
+			t.Fatalf("context cancelled before a compaction pass crossed seq %d", target)
+		case <-timer.C:
+			t.Fatalf("timeout before a compaction pass crossed seq %d", target)
+		}
+	}
+}
+
+// requireTombstonedDIDObserved asserts the tombstoned DID's account-delete is
+// present in the observed stream, so a passing CheckCompacted reflects a real
+// crossing rather than an absent tombstone. Materialization rows for the DID
+// are NOT required to survive — correct compaction drops them, which is exactly
+// the contract under test; their absence post-compaction is a pass, not a gap.
+func requireTombstonedDIDObserved(t *testing.T, events []ObservedEvent, did string) {
+	t.Helper()
+	for i := range events {
+		if events[i].DID == did && events[i].Kind == segment.KindAccount {
+			return
+		}
+	}
+	require.Failf(t, "tombstone not observed",
+		"tombstoned DID %s account event not present in %d observed events", did, len(events))
 }
 
 // simulatorEpochMicros mirrors the simulator's logical-clock base

@@ -728,17 +728,6 @@ func (r *compactionPassRecorder) Observe(result jetstreamd.CompactionPassResult)
 	r.results = append(r.results, result)
 }
 
-// lastWatermark returns the most recent completed pass's watermark, or 0 if
-// no pass has completed. Lock-guarded; safe to call concurrently.
-func (r *compactionPassRecorder) lastWatermark() uint64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.results) == 0 {
-		return 0
-	}
-	return r.results[len(r.results)-1].Watermark
-}
-
 // ObserveStart records that a compaction pass has begun real rewrite work.
 // Wired to OnBeforeCompactionPass.
 func (r *compactionPassRecorder) ObserveStart() {
