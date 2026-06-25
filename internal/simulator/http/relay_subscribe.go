@@ -77,25 +77,42 @@ func newRelaySubscribeReposHandler(w *world.World, faults *FaultPlan) http.Handl
 		sub := w.SubscribeFanout()
 		defer sub.Close()
 
-		frames, err := w.FirehoseRange(cursor, subscribeReplayLimit)
-		if err != nil {
-			_ = conn.Close(websocket.StatusInternalError, "history")
-			return
-		}
-		// If the consumer asked for events newer than what's retained,
-		// signal the gap with #info OutdatedCursor so they know to
-		// expect a discontinuity. Subscribers that reconnect with the
-		// fresh seq will then resume normally.
-		if cursor > 0 && len(frames) == 0 && w.CurrentSeq() > cursor {
-			info := world.EncodeOutdatedCursorInfo()
-			if writeErr := writer.Write(ctx, info); writeErr != nil {
-				return
+		// Replay the FULL retained backlog from cursor up to the current tip,
+		// looping in subscribeReplayLimit-sized pages. A single capped page
+		// would silently skip the middle of a large backlog (the consumer
+		// treats the OutdatedCursor #info as a no-op, not a re-subscribe), so
+		// any history beyond the first page must be drained here. Live events
+		// published during replay are buffered in the fanout (subscribed
+		// above) and delivered in the live phase below. replayCursor advances
+		// past each page; the tip is sampled once so a fast publisher can't
+		// keep this loop running forever (newer events arrive via the fanout).
+		replayCursor := cursor
+		tip := w.CurrentSeq()
+		if cursor > 0 && tip > cursor {
+			first, ferr := w.FirehoseRange(cursor, 1)
+			if ferr == nil && len(first) == 0 {
+				// cursor predates retained history: signal the discontinuity.
+				info := world.EncodeOutdatedCursorInfo()
+				if writeErr := writer.Write(ctx, info); writeErr != nil {
+					return
+				}
 			}
 		}
-		for _, f := range frames {
-			if err := writer.Write(ctx, f); err != nil {
+		for replayCursor < tip {
+			frames, err := w.FirehoseRange(replayCursor, subscribeReplayLimit)
+			if err != nil {
+				_ = conn.Close(websocket.StatusInternalError, "history")
 				return
 			}
+			if len(frames) == 0 {
+				break
+			}
+			for _, f := range frames {
+				if err := writer.Write(ctx, f); err != nil {
+					return
+				}
+			}
+			replayCursor += int64(len(frames))
 		}
 
 		// Live phase.
