@@ -37,6 +37,11 @@ var keyspacePrefixes = []string{
 
 const topFailingHostLimit = 10
 
+const (
+	hostSortLargest = "largest"
+	hostSortFailing = "failing"
+)
+
 func collectProcess(now time.Time, startedAt time.Time) ProcessInfo {
 	info := version.Get()
 	return ProcessInfo{
@@ -151,9 +156,21 @@ func normalizeRequest(req Request) Request {
 	switch req.Tab {
 	case "", "summary":
 		req.Tab = "summary"
-	case "hosts", "accounts", "collections":
+	case "hosts", "accounts", "collections", "segments":
 	default:
 		req.Tab = "summary"
+	}
+	req.HostSort = strings.ToLower(strings.TrimSpace(req.HostSort))
+	if req.Tab == "hosts" {
+		switch req.HostSort {
+		case "", hostSortLargest:
+			req.HostSort = hostSortLargest
+		case hostSortFailing:
+		default:
+			req.HostSort = hostSortLargest
+		}
+	} else {
+		req.HostSort = ""
 	}
 	req.Account = strings.TrimSpace(req.Account)
 	req.DID = strings.TrimSpace(req.DID)
@@ -177,7 +194,7 @@ func normalizeRequest(req Request) Request {
 	return req
 }
 
-func collectHosts(s *store.Store) (HostDiagnostics, error) {
+func collectHosts(s *store.Store, sortBy string) (HostDiagnostics, error) {
 	statuses, err := backfill.ListHostStatuses(s)
 	if err != nil {
 		return HostDiagnostics{}, err
@@ -186,17 +203,11 @@ func collectHosts(s *store.Store) (HostDiagnostics, error) {
 	for i := range statuses {
 		rows = append(rows, hostRowFromBackfill(&statuses[i]))
 	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].Failed != rows[j].Failed {
-			return rows[i].Failed > rows[j].Failed
-		}
-		if rows[i].Total != rows[j].Total {
-			return rows[i].Total > rows[j].Total
-		}
-		return rows[i].Host < rows[j].Host
-	})
-	top := make([]HostRow, 0, min(topFailingHostLimit, len(rows)))
-	for _, row := range rows {
+	sortHostRows(rows, sortBy)
+	failingRows := append([]HostRow(nil), rows...)
+	sortHostRows(failingRows, hostSortFailing)
+	top := make([]HostRow, 0, min(topFailingHostLimit, len(failingRows)))
+	for _, row := range failingRows {
 		if row.Failed == 0 {
 			continue
 		}
@@ -206,6 +217,21 @@ func collectHosts(s *store.Store) (HostDiagnostics, error) {
 		}
 	}
 	return HostDiagnostics{Rows: rows, TopFailing: top}, nil
+}
+
+func sortHostRows(rows []HostRow, sortBy string) {
+	sort.Slice(rows, func(i, j int) bool {
+		if sortBy == hostSortFailing && rows[i].Failed != rows[j].Failed {
+			return rows[i].Failed > rows[j].Failed
+		}
+		if rows[i].Total != rows[j].Total {
+			return rows[i].Total > rows[j].Total
+		}
+		if rows[i].Failed != rows[j].Failed {
+			return rows[i].Failed > rows[j].Failed
+		}
+		return rows[i].Host < rows[j].Host
+	})
 }
 
 func hostRowFromBackfill(hs *backfill.HostStatus) HostRow {
@@ -302,6 +328,9 @@ func collectAccount(ctx context.Context, s *store.Store, resolver identity.Resol
 	acct.Found = true
 	acct.DID = string(did)
 	acct.Handle = rs.Handle
+	if acct.Handle == "" {
+		acct.Handle = fallbackDeclaredHandle(ctx, resolver, acct.QueryKind, acct.Query, did)
+	}
 	acct.PDS = rs.PDS
 	acct.Host = rs.Host
 	acct.Active = rs.Active
@@ -315,18 +344,25 @@ func collectAccount(ctx context.Context, s *store.Store, resolver identity.Resol
 	acct.RecordCount = rs.RecordCount
 	acct.TotalBytes = rs.TotalBytes
 
-	if rs.Host != "" {
-		hs, ok, err := backfill.LoadHostStatus(s, rs.Host)
-		if err != nil {
-			acct.Error = err.Error()
-			return acct
-		}
-		if ok {
-			row := hostRowFromBackfill(hs)
-			acct.HostContext = &row
-		}
-	}
 	return acct
+}
+
+func fallbackDeclaredHandle(ctx context.Context, resolver identity.Resolver, queryKind, query string, did atmos.DID) string {
+	if queryKind == "handle" && query != "" {
+		return query
+	}
+	if resolver == nil {
+		return ""
+	}
+	doc, err := resolver.ResolveDID(ctx, did)
+	if err != nil || doc == nil {
+		return ""
+	}
+	ident, err := identity.IdentityFromDocument(doc)
+	if err != nil || ident.Handle == "" || ident.Handle == atmos.HandleInvalid {
+		return ""
+	}
+	return string(ident.Handle)
 }
 
 func treeFromManifest(ms manifest.SegmentTreeStats) TreeAggregate {
@@ -652,8 +688,8 @@ func buildForRequest(ctx context.Context, opts Options, startedAt time.Time, req
 	snap.Request = req
 
 	switch req.Tab {
-	case "summary", "hosts":
-		hosts, err := collectHosts(opts.Store)
+	case "hosts":
+		hosts, err := collectHosts(opts.Store, req.HostSort)
 		if err != nil {
 			return nil, err
 		}

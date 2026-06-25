@@ -105,6 +105,10 @@ func newFixtureSnap() *status.Snapshot {
 				CompressedBytes:   1024 * 1024,
 				UncompressedBytes: 4 * 1024 * 1024,
 				DiskBytes:         5 * 1024 * 1024,
+				MinSeq:            100,
+				MaxSeq:            1233,
+				MinIndexedAt:      time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
+				MaxIndexedAt:      time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
 			},
 		},
 		Pebble: status.PebbleStats{
@@ -187,18 +191,18 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "5 repos")
 	require.Contains(t, body, "Duration")
 	require.Contains(t, body, "3d 7h")
-	require.Contains(t, body, "Latest segment")
-	require.Contains(t, body, "1,234")        // EventCount via humanInt
-	require.Contains(t, body, "567")          // UniqueDIDCount via humanInt64Cast
+	require.NotContains(t, body, "Metadata store")
+	require.NotContains(t, body, "Latest segment")
+	require.Contains(t, body, "Cursor lookback")
+	require.Contains(t, body, "1d 12h")       // 36h formatted by humanDuration
+	require.Contains(t, body, "5,000")        // OldestRetainedSeq formatted
+	require.Contains(t, body, "12,345")       // Network event count via humanInt
 	require.Contains(t, body, "[100, 1,233]") // Seq range
 	require.Contains(t, body, "2026-05-24")
 	require.Contains(t, body, "Indexed range")
-	require.Contains(t, body, "Cursor lookback")
-	require.Contains(t, body, "1d 12h") // 36h formatted by humanDuration
-	require.Contains(t, body, "15")     // ManifestSegmentCount
-	require.Contains(t, body, "5,000")  // OldestRetainedSeq formatted
 	require.Contains(t, body, "overflow-wrap: anywhere")
-	require.Contains(t, body, "Top failing hosts")
+	require.Contains(t, body, "Segment Files")
+	require.NotContains(t, body, "Top failing hosts")
 	require.NotContains(t, body, `<h2>Collections</h2>`)
 }
 
@@ -248,15 +252,16 @@ func TestHandler_RendersBackfillingState(t *testing.T) {
 	require.NotContains(t, body, "enumerating repos")
 }
 
-func TestHandler_RendersSummaryWithMissingSegmentTrees(t *testing.T) {
+func TestHandler_RendersSegmentFilesWithMissingSegmentTrees(t *testing.T) {
 	t.Parallel()
 	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "segments"}
 	s.SegmentAggregate.Trees = nil
 	h, err := web.New(web.Options{Snapshotter: &fakeSnapshotter{snap: s}})
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=segments", nil)
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
@@ -284,7 +289,7 @@ func TestHandler_EscapesXSS(t *testing.T) {
 func TestHandler_RendersHostsTab(t *testing.T) {
 	t.Parallel()
 	s := newFixtureSnap()
-	s.Request = status.Request{Tab: "hosts"}
+	s.Request = status.Request{Tab: "hosts", HostSort: "largest"}
 	s.Hosts = status.HostDiagnostics{Rows: []status.HostRow{{
 		Host:             "pds.example.com",
 		Total:            10,
@@ -315,6 +320,14 @@ func TestHandler_RendersHostsTab(t *testing.T) {
 	body := rr.Body.String()
 	require.Contains(t, body, "Hosts")
 	require.Contains(t, body, "host-filter")
+	require.Contains(t, body, "Largest hosts")
+	require.Contains(t, body, "Failing hosts")
+	require.Contains(t, body, `href="/status?tab=hosts&amp;sort=largest"`)
+	require.Contains(t, body, `href="/status?tab=hosts&amp;sort=failing"`)
+	require.Contains(t, body, "Latest error")
+	require.Contains(t, body, "Recent failing repos")
+	require.Contains(t, body, `class="host-errors-row"`)
+	require.Contains(t, body, `class="host-error-item"`)
 	require.Contains(t, body, "sample-did")
 	require.Contains(t, body, "account-link")
 	require.Contains(t, body, `href="/status?tab=accounts&amp;account=did%3aplc%3aaaaaaaaaaaaaaaaaaaaaaaaa"`)
@@ -340,9 +353,6 @@ func TestHandler_RendersAccountsTabWithHandleQuery(t *testing.T) {
 		Backfill:  "failed",
 		Attempts:  3,
 		LastError: "boom",
-		HostContext: &status.HostRow{
-			Host: "pds.example.com", Total: 10, Active: 9, Complete: 7, Failed: 2,
-		},
 	}
 	src := &fakeSnapshotter{snap: s}
 	h, err := web.New(web.Options{Snapshotter: src})
@@ -362,7 +372,7 @@ func TestHandler_RendersAccountsTabWithHandleQuery(t *testing.T) {
 	require.NotContains(t, body, `name="handle" class="lookup-input"`)
 	require.Contains(t, body, "declared handle")
 	require.Contains(t, body, "pds.example.com")
-	require.Contains(t, body, "Host context")
+	require.NotContains(t, body, "Host context")
 	require.Contains(t, body, "boom")
 }
 
@@ -403,11 +413,45 @@ func TestHandler_AutoVerifiesFoundAccount(t *testing.T) {
 	require.Equal(t, 1, actions.verifyCalls)
 	require.Equal(t, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", actions.verifyDID)
 	require.Contains(t, body, "Repo verification")
-	require.Contains(t, body, "match")
+	require.Contains(t, body, "Match")
+	require.Contains(t, body, "match-ok")
 	require.Contains(t, body, "authoritative rev")
 	require.Contains(t, body, "3abc")
 	require.Contains(t, body, "local records")
 	require.Contains(t, body, "42")
+}
+
+func TestHandler_RendersRepoVerificationMismatch(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "accounts", DID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}
+	s.Account = status.AccountLookup{
+		Query:    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Found:    true,
+		DID:      "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Backfill: "complete",
+	}
+	actions := &fakeRepoActions{
+		verifyReport: repoexport.VerifyReport{
+			DID:              "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+			Match:            false,
+			AuthoritativeRev: "3abc",
+			LocalLatestRev:   "3def",
+			Message:          "root mismatch",
+		},
+	}
+	h, err := web.New(web.Options{Snapshotter: &fakeSnapshotter{snap: s}, RepoActions: actions})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&did=did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	body := rr.Body.String()
+	require.Contains(t, body, "Match failure")
+	require.Contains(t, body, "match-fail")
+	require.Contains(t, body, "root mismatch")
 }
 
 func TestHandler_RateLimitsAutomaticRepoVerificationBySourceIP(t *testing.T) {
@@ -511,6 +555,27 @@ func TestHandler_DoesNotVerifyMissingAccount(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.Zero(t, actions.verifyCalls)
 	require.NotContains(t, rr.Body.String(), "Repo verification")
+}
+
+func TestHandler_RendersSegmentFilesTab(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "segments"}
+	h, err := web.New(web.Options{Snapshotter: &fakeSnapshotter{snap: s}})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=segments", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	body := rr.Body.String()
+	require.Contains(t, body, "Network segment files")
+	require.Contains(t, body, "Latest segment")
+	require.Contains(t, body, "1,234") // Latest segment EventCount via humanInt
+	require.Contains(t, body, "567")   // UniqueDIDCount via humanInt64Cast
+	require.NotContains(t, body, "Cursor lookback")
+	require.NotContains(t, body, "<h2>Phase</h2>")
 }
 
 func TestHandler_RendersCollectionsTab(t *testing.T) {
