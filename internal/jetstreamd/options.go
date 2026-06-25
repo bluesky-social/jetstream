@@ -5,6 +5,7 @@ package jetstreamd
 import (
 	"context"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
@@ -78,6 +79,12 @@ type Options struct {
 	// consumer. Production leaves it nil; deterministic harnesses feed the
 	// firehose over an in-memory connection.
 	LiveDial streaming.DialFunc
+
+	// HTTPTransport, when non-nil, is the RoundTripper for every outbound
+	// HTTP client (backfill getRepo/listRepos, identity/PLC resolution).
+	// Production leaves it nil (real sockets); deterministic harnesses serve
+	// the simulator in-process so no socket is involved.
+	HTTPTransport http.RoundTripper
 
 	CursorLookback            time.Duration
 	SegmentCacheMaxAge        time.Duration

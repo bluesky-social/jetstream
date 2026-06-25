@@ -212,10 +212,17 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: derive relay HTTP URL: %w", err))
 	}
 
+	// transportOpt, when an in-process transport is injected, routes every
+	// jttp client through it instead of a real socket (deterministic harness).
+	var transportOpt []jttp.Option
+	if opts.HTTPTransport != nil {
+		transportOpt = []jttp.Option{jttp.WithTransport(opts.HTTPTransport)}
+	}
+
 	backfillMetrics := backfill.NewMetrics(metrics.Registry)
 	xrpcClient := &xrpc.Client{
 		Host:       relayHTTPURL,
-		HTTPClient: gt.Some(jttp.New(xrpc.BulkDownloadOpts()...)),
+		HTTPClient: gt.Some(jttp.New(append(xrpc.BulkDownloadOpts(), transportOpt...)...)),
 	}
 
 	resolver := &identity.DefaultResolver{}
@@ -226,7 +233,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		// operator points us at a local PLC (e.g. the dev simulator at
 		// http://localhost:7777), use a non-strict client so the dial
 		// succeeds.
-		resolver.HTTPClient = gt.Some(jttp.New(xrpc.ATProtoOpts(10 * time.Second)...))
+		resolver.HTTPClient = gt.Some(jttp.New(append(xrpc.ATProtoOpts(10*time.Second), transportOpt...)...))
 	}
 	directory := &identity.Directory{
 		Resolver:               resolver,

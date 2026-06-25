@@ -521,10 +521,34 @@ trivial; the cost is breadth and the discipline to not miss one (a single real
   drives the consumer over an in-memory `memConn` (no socket) and asserts events
   archive through the real pipeline + the derived subscribeRepos URL reaches the
   dialer. Live suite passes under `-race`; orchestrator + jetstreamd suites green.
-- **NEXT:** Step 1 (seed/inject the `rand/v2` jitter in `backfill/selected.go`),
-  then step 4 (clock interface sweep for synctest), then step 5 (oracle synctest
-  tier: in-process transport fake fed by the simulator fanout via `LiveDial`,
-  driven under `testing/synctest`).
+- **Step 1 DONE:** `backfill/selected.go` `selectedBackoffDelay` jitter is now an
+  injectable `jitterFunc` threaded through both retry runners (default
+  `rand.Int64N`), with unit tests for seeded determinism + bounds. Committed.
+- **Step 4 RE-SCOPED (2026-06-24):** Two findings collapsed the planned manual
+  clock sweep into something much smaller:
+  1. **synctest auto-fakes stdlib time.** Per the Go docs, every goroutine inside
+     a `synctest.Test` bubble gets a fake clock for `time.Now/Sleep/Timer/Ticker/
+     After` and `context` deadlines — NO code change needed, transitively for
+     atmos/pebble goroutines too. The existing `now func()` fields default to
+     `time.Now`, so they return fake time inside the bubble for free. A manual
+     `Clock` interface sweep is therefore REDUNDANT inside the bubble. Decided
+     (with Jim) to SKIP it. (A manual sweep would still help the *legacy
+     real-socket* harness's slow-runner flakes, but that's not where we're headed.)
+  2. **SPIKE: pebble works inside a synctest bubble.** Opened a real pebble DB in a
+     bubble, did Set/Get, and a `time.Sleep(1s)` completed instantly under the fake
+     clock — confirming pebble's background goroutines don't prevent the bubble
+     from reaching "all durably blocked." This de-risks running the real runtime
+     (which is pebble-backed) under synctest.
+  So step 4 becomes: **the real prerequisite for step 5 is removing the remaining
+  real sockets, not faking time.** The live firehose socket is already handled by
+  `LiveDial` (step 2). Backfill `getRepo`/`listRepos` and the verifier's
+  `getRepo`/PLC calls still hit the simulator's `httptest` server over a real
+  socket. Inject an in-process `http.RoundTripper` that serves the simulator
+  handler directly (via the existing `jttp.WithTransport` escape hatch + a new
+  optional `jetstreamd.Options` transport field) — no atmos change, no jttp change.
+- **NEXT:** Step 4 (in-process HTTP transport), then step 5 (oracle synctest tier:
+  `synctest.Test` bubble, `LiveDial` fed by the simulator fanout, HTTP served
+  in-process, fake clock automatic).
 
 ## Concrete atmos change options (2026-06-24)
 
