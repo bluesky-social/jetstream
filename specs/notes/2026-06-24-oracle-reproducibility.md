@@ -35,6 +35,161 @@ want *substantially more* reliability and reproducibility, not a proof.
 
 ---
 
+# HANDOFF TODO (next session — start here) — 2026-06-25
+
+State in one line: the FULL `TestOracle_DefaultLifecycle` runs in a synctest
+bubble (no sockets, fake clock) and is GREEN+stable at fast/default/high-event-
+volume scale, committed. It is NOT yet green at stress scale, the restart tier is
+NOT in the bubble (by design), and `just oracle-sweep` / CI are NOT yet on the
+new path. Below is everything left, ordered, with exact file refs. Each item says
+DONE-WHEN so you know when to stop.
+
+How to run what works today (verify before starting):
+- `JETSTREAM_ORACLE_MODE=fast go test ./internal/oracle/ -run 'TestOracle_DefaultLifecycle$' -v`  (~0.04s)
+- `go test ./internal/oracle/ -run 'TestOracle_DefaultLifecycle$' -v`  (default, ~0.25s)
+- `go test ./internal/oracle/ -run 'TestOracle_DefaultLifecycle$' -race -v`  (~1.3s, clean)
+- high event volume (passes): `JETSTREAM_ORACLE_MODE=default JETSTREAM_ORACLE_LIVE_EVENTS_BOOTSTRAP=5000 JETSTREAM_ORACLE_LIVE_EVENTS_STEADY=5000 go test ./internal/oracle/ -run 'TestOracle_DefaultLifecycle$' -timeout 110s`
+- CONSTRAINT: one synctest bubble per process. Do NOT use `-count=N>1` (it skips
+  after the first; guard is `synctestBubbleUsed` in synctest_test.go). Loop
+  separate `go test` invocations instead.
+- Repro the stress failures: 100 accts deadlocks/flakes via
+  `JETSTREAM_ORACLE_ACCOUNTS=100 JETSTREAM_ORACLE_LIVE_EVENTS_BOOTSTRAP=200 JETSTREAM_ORACLE_LIVE_EVENTS_STEADY=200 go test ./internal/oracle/ -run 'TestOracle_DefaultLifecycle$' -timeout 45s`
+
+## TODO-1 — Fix the 2-event fanout delivery race  [ ]  (PRIORITY 1; unblocks everything)
+WHY: this is the real bug the bubble surfaced and the gate for stress scale. It is
+intermittent (~50%) loss of ~2 events at a subscriber's connect boundary.
+SYMPTOM (reproduce): with the in-callback wait removed (see TODO-2) OR at 100
+accts, you see: `after-bootstrap: timed out waiting for firehose event log
+cursor=0 target=200 expected=289 observed=287 (a dropped row never reaches the
+expected count)` at `assertFirehoseEventLogMatches` (harness_test.go ~line 592).
+ROOT CAUSE (verified): in the simulator the per-event order is
+`w.seq.Add(1)` -> encode -> `persistFirehoseFrame`/`stageFirehoseFrame` (ring) ->
+`fanout.Publish`. Refs:
+  - world/traffic.go:205,225,228 (generateOne) and :516,528,531 (the commit path)
+  - world/accounts.go:136,158,165 and :193,229,236 (account events)
+  - world/world.go:80 `CurrentSeq` reads w.seq (advances BEFORE the ring/publish)
+  - fanout/fanout.go `Registry.Publish` (RLock, drop-on-full) and `Subscribe`
+    (Lock, registers subscriber); account_view.go:93 `SubscribeFanout`
+  - simulator/http/relay_subscribe.go: subscribe-before-replay (line 77), then
+    full-backlog replay loop (lines 80-116), then live phase (118-135).
+Because seq advances before the frame is in the ring AND before it's published,
+a frame at the subscribe boundary can be (a) not yet in the ring when replay
+reads it, AND (b) published to the fanout before the subscriber was registered
+=> neither replayed nor delivered live => lost. ~2 boundary events.
+FIX OPTIONS (pick one; simulator/test-only, no production jetstream change):
+  (a) PREFERRED: make seq-advance + ring-write + publish atomic under one mutex,
+      and have the subscribe handler take that same mutex across
+      `SubscribeFanout()` + the first `FirehoseRange` snapshot, so no frame can
+      slip between the replay snapshot and live registration. This closes the
+      window deterministically.
+  (b) Make the consumer treat the OutdatedCursor `#info` as a re-subscribe from
+      the fresh cursor (closer to a real relay), so any gap self-heals. Note
+      internal/ingest/live/events.go:45-49 currently treats #info as a no-op;
+      this option touches ingest, so prefer (a) if you want to stay simulator-only.
+DONE-WHEN: with `afterBatch` set back to nil (TODO-2), default mode passes 20/20
+separate-process runs AND 100-acct passes 10/10, with `fan.TotalDrops()==0`.
+
+## TODO-2 — Land the deadlock fix (remove the in-callback backpressure wait)  [ ]  (after TODO-1)
+WHY: the 100-acct DEADLOCK is a lock-order bug: `afterBatch` (harness_test.go:180-
+182) runs `bootstrapAck.WaitContiguousFrom` from INSIDE the backfill writer's
+durable-batch commit callback (via `AfterRepoComplete`, harness_test.go:264),
+holding `ingest.Writer.mu`+`drainMu` while waiting for consumer progress that
+needs the lock. Confirmed via goroutine dump.
+DO: set `bootstrapTraffic.afterBatch = nil` (harness_test.go:180). This is the
+proven fix — it clears the deadlock. It is SAFE only once TODO-1 is done (the
+wait currently MASKS the TODO-1 race; removing it without TODO-1 regresses
+default mode to ~50% flaky — verified). Add a comment explaining the wait must
+not run under the writer lock. Confirm `bootstrapAck` is still referenced
+(it's Observed at ~line 253); if it becomes fully unused, remove it cleanly.
+DONE-WHEN: 100-acct passes 10/10 separate-process runs; default still 20/20.
+
+## TODO-3 — Make stress mode pass end-to-end in the bubble  [ ]  (after TODO-1/2)
+DO: run `JETSTREAM_ORACLE_MODE=stress go test ./internal/oracle/ -run
+'TestOracle_DefaultLifecycle$' -timeout 600s` (100 accts, 5000 events/phase, swarm
+faults). It is real CPU-heavy (MST work) even at fake-clock speed — expect tens
+of seconds to minutes, not a hang. Watch for any NEW bubble issues at this scale
+(quiescence, additional deadlocks, fault-injection interactions). The swarm
+subscribeRepos disconnect faults DO fire in the bubble now (firehose dials the
+real handler via subscribeReposDial, inprocess.go) — verify the reconnect+replay
+path stays lossless after TODO-1.
+DONE-WHEN: stress passes 5/5 separate-process runs, `-race` clean at least once.
+
+## TODO-4 — Decide + handle the restart tier  [ ]
+CONTEXT: `oracle-sweep` also runs `TestOracle_Restart*` (restart_harness_test.go
++ restart_shape_[a-h]_test.go — 9 tests). These re-exec a REAL child process to
+test crash recovery; they CANNOT run in a single in-process bubble. They still
+pass today (non-bubble) and SHOULD stay real-process — that's the point of the
+tier. They share helpers with the lifecycle test (e.g. `generateN`,
+harness_test.go) — verify nothing in the bubble migration broke them:
+`JETSTREAM_ORACLE_SEED=101 go test ./internal/oracle/ -run 'TestOracle_Restart' -timeout 120s` (currently GREEN).
+DECISION TO MAKE (raise with Jim): keep restart in the sweep as a real-process
+tier (recommended), or split it into its own `just` target. Either way it is NOT
+a bubble candidate — do not try to port it.
+DONE-WHEN: decision recorded; restart tier confirmed green and its sweep role
+explicit.
+
+## TODO-5 — Rework `just oracle-sweep` for the new model  [ ]  (after TODO-3/4)
+CONTEXT: justfile `oracle-sweep` recipe loops per-seed, each seed a SEPARATE
+`go test` (good — sidesteps one-bubble-per-process). It sets
+`JETSTREAM_ORACLE_MODE=stress` and runs both `TestOracle_DefaultLifecycle` and
+`TestOracle_Restart`. Refs: justfile recipe `oracle-sweep` (~line 113 onward);
+CI calls it at .github/workflows/oracle-scheduled.yml:91 (non-race) and :171
+(race lane).
+DO: once stress passes in the bubble, the lifecycle invocation needs no transport
+flags (the bubble + in-process transport are baked into the test now). Decide
+per-seed timeout (fake clock is fast, but stress MST work is real CPU — keep a
+generous wall timeout, maybe lower than the current 30m). The repro hint text in
+the recipe (mentions "real time and real sockets", GOMAXPROCS, -count=200) is now
+STALE for the lifecycle test — rewrite it: the bubble test is deterministic-time
+and socket-free; reproduction is `JETSTREAM_ORACLE_SEED=<seed> go test -run
+'TestOracle_DefaultLifecycle$'` (NO -count>1). Keep the old hint only for the
+restart tier (still real-process/real-time).
+DONE-WHEN: `just oracle-sweep 1` runs green locally end-to-end (lifecycle in
+bubble + restart real-process).
+
+## TODO-6 — CI wiring: gate on the bubble test  [ ]  (the original goal)
+WHY: the whole point — run the deterministic bubble test on EVERY push, not just
+the 6-hour scheduled sweep, so CI failures are reproducible.
+DO: add the bubble `TestOracle_DefaultLifecycle` (default mode, ~0.25s, -race) to
+the per-push `ci` workflow (NOT just oracle-scheduled.yml). It's fast and
+socket-free, so it's a cheap gate. Keep the scheduled stress/race sweep + restart
+tier as the broader nightly. Consider: a failing bubble run should upload the
+JSONL trace (already written) AND, per Strategy 2, the segments/ + pebble dir for
+offline replay. Reconcile with the doc's earlier "fuzzer vs gate" framing.
+DONE-WHEN: a push runs the bubble lifecycle test as a required check.
+
+## TODO-7 — Resolve the temporary atmos `replace`  [ ]  (before any merge)
+CONTEXT: go.mod:7 has `replace github.com/jcalabro/atmos => ../../jcalabro/atmos`.
+The atmos Conn/Dial seam is committed on the atmos `client-interface` branch
+(commit 15ff15c "streaming: inject the websocket dial behind a Conn interface").
+DO: cut a tagged atmos release containing that commit, bump the jetstream
+`require` to it, and DELETE the replace directive. The jetstream-side WithDial /
+LiveHTTPClient work (engine.go, internal/client) depends on it.
+DONE-WHEN: jetstream builds against a tagged atmos with no replace directive.
+
+## TODO-8 — Cleanup / loose ends  [ ]
+- `bubbleDrain` seam (synctest_test.go) + `drain()` call in generateN: KEPT but
+  did NOT fix anything on its own; re-evaluate whether to keep once TODO-1 lands.
+  If the fanout race is fixed properly it may be unnecessary — remove if so.
+- `fanout.Registry.TotalDrops()` (fanout.go): added for diagnosis; keep (it's a
+  reasonable observability method) and USE it as a `require.Zero` anti-vacuity
+  assertion in the lifecycle test after shutdown.
+- Confirm the lifecycle test's one-bubble-per-process skip message is accurate and
+  that no other bubble test exists in the package (the pipeListener spike was
+  deleted; verify nothing reintroduced a 2nd bubble).
+- Run the FULL `internal/oracle` package (`go test ./internal/oracle/`) to confirm
+  the lifecycle test coexists with all unit tests and the bubble guard doesn't
+  skip something important.
+
+## Quick map of what's committed (so you can read the diffs)
+311bc3a pipeListener (WI-1) · 434a5d2 server listener inject (WI-2) ·
+451d537 client WithDial/LiveHTTPClient (WI-4) · 25e1e00 observer transport (WI-5) ·
+3708431 full lifecycle in bubble (WI-3/7) · db41ef5 full-backlog replay ·
+400d40a drain seam + TotalDrops + fanout buffer sizing. Docs commits carry the
+analysis. The deadlock fix (afterBatch=nil) is NOT committed — apply per TODO-2.
+
+---
+
 # EXECUTION PLAN (active, 2026-06-25)
 
 ## Sequencing decision (revised 2026-06-25 after independent review)
