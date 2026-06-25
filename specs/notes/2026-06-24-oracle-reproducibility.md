@@ -546,9 +546,31 @@ trivial; the cost is breadth and the discipline to not miss one (a single real
   socket. Inject an in-process `http.RoundTripper` that serves the simulator
   handler directly (via the existing `jttp.WithTransport` escape hatch + a new
   optional `jetstreamd.Options` transport field) — no atmos change, no jttp change.
-- **NEXT:** Step 4 (in-process HTTP transport), then step 5 (oracle synctest tier:
-  `synctest.Test` bubble, `LiveDial` fed by the simulator fanout, HTTP served
-  in-process, fake clock automatic).
+- **Step 4 DONE:** `jetstreamd.Options.HTTPTransport` (an `http.RoundTripper`)
+  routes every outbound jttp client (backfill getRepo/listRepos, identity/PLC)
+  through an injected transport via `jttp.WithTransport`. Nil = real sockets. No
+  atmos/jttp change. Committed.
+- **Step 5 SCOPING (2026-06-24): the "full bubble" cost center is the public
+  serving path, not ingest.** Two real-socket dependencies block running the FULL
+  `TestOracle_DefaultLifecycle` in a bubble:
+  1. The runtime binds REAL public+debug TCP listeners (`internal/server`
+     `Run` → `net.ListenConfig.Listen` + `http.Server.Serve`); `Accept` goroutines
+     are not durably blocked.
+  2. The oracle client-observer tier drives the runtime's public API over real
+     HTTP/websocket (`waitForRuntimePublicURL` → `/subscribe`, `/xrpc`).
+  KEY FINDING: `websocket.Accept` requires `http.Hijacker` (coder/websocket
+  accept.go:130,159). `httptest.ResponseRecorder` does NOT implement Hijacker, so
+  the client-observer `/subscribe` path cannot be served by a simple
+  handler-RoundTripper — it needs a real `http.Server` over an in-memory
+  `net.Pipe`-backed listener (whose conns support hijack). The unary `/xrpc` +
+  simulator getRepo/listRepos/PLC paths CAN use a `ResponseRecorder`
+  handler-RoundTripper. The firehose path needs neither (handled by `LiveDial`
+  feeding the fanout directly, bypassing the simulator's `websocket.Accept`).
+  So "full bubble" = build an in-memory-listener seam for the runtime's public
+  server + route the client-observer through it. A focused ingest/compaction tier
+  (no public server) needs none of that and still reproduces the
+  superseded-row-survived / resync class. Effort estimate for "full bubble" being
+  produced by a parallel investigation workflow (see decision log).
 
 ## Concrete atmos change options (2026-06-24)
 
@@ -710,3 +732,63 @@ Local repro attempt: 58 iterations of the cheapest non-race failing seed
 reproductions** (the deterministic chain-break WARN fired every run, but the
 correctness assertion never tripped). This is the concrete evidence for failure
 factors 1 and 2.
+
+## Full-bubble effort estimate (2026-06-24, workflow + adversarial verify)
+
+Question: how much work to run the FULL `TestOracle_DefaultLifecycle` inside a
+synctest bubble ("the right way")? Five parallel investigators mapped each
+real-I/O subsystem; an Opus synthesis produced a plan; an adversarial verifier
+ran its own synctest spikes under `-race` (Go 1.26) to refute it.
+
+**Verdict: feasible, NO showstoppers, but XL (~9-15 engineer-days).** Verifier
+confirmed by spike (not just code reading): a full websocket handshake + frames +
+close + graceful `http.Server.Shutdown` over a `net.Pipe`-backed listener runs in
+a bubble; the fake clock advanced 3m30s in 0.00s with an idle keep-alive conn
+open. The load-bearing primitive works.
+
+Work items:
+1. (S) Inject `net.Listener` into `server.Config` (public+debug); branch
+   `server.Run` (internal/server/server.go:166/171); thread through
+   `jetstreamd.Options` + runtime.go:391.
+2. (M) `PipeListener` — `net.Pipe`-backed listener; `Accept` = channel receive
+   (durably blockable); conns are hijackable so `websocket.Accept` works for both
+   the simulator's `/subscribeRepos` and the runtime's `/subscribe`. The keystone.
+3. (M) Serve the simulator over the PipeListener instead of `httptest.NewServer`
+   (preserves CAR streaming + getRepo-truncation fault fidelity).
+4. (M) PUBLIC API change to the jetstream client module: add `WithDial` so the
+   client's live `/subscribe-v2` cutover (`internal/client/live.go:288`) can dial
+   in-memory. `WithHTTPClient` only reaches unary XRPC today. (Verifier's key
+   catch; `assertTypedLikeBackfill` uses `WithBackfillOnly` so it's exempt, but
+   `collectClientBackfill` needs it.)
+5. (M) Thread one in-process client through the 3 observer Subscribe sites +
+   `fetchOverlay` (`overlay_integration_test.go:29`).
+6. (S) OTEL guard — effectively free; already noop without `OTEL_EXPORTER_OTLP_*`.
+7. (L) Wrap lifecycle in `synctest.Test`; move observer assertions into bubble
+   goroutines; re-derive barriers under the fake clock. DOMINANT RISK: whole-graph
+   quiescence — runtime + simulator + atmos + pebble + observer parallel-decode
+   workers must ALL be durably blocked simultaneously; one real-I/O or spinning
+   goroutine = hard-to-localize hang. Also heavy synchronous bootstrap + 2 pebble
+   DBs move inside the bubble; `t.Cleanup(client.Close)` ordering needs care.
+8. (M) Verify pebble + atmos workers never touch real I/O across the FULL
+   lifecycle under `-race`.
+
+**DECISION (recommended by both synthesis and verifier): do NOT full-bubble now.**
+The triaged CI failures (#100/#106 superseded-row / over-drop) live in the STORAGE
+tier (firehose -> live consumer -> pebble -> compaction), observed by the direct
+segment observers (`ObserveSegments`, `compactionOverDropRecorder`,
+`assertCompacted`). That graph is bubble-ready TODAY via `LiveDial` +
+`HTTPTransport` + the proven `memConn` pattern — NO public server, NO
+PipeListener, NO public-API change. ~M / 2-3 days, reproduces the exact defects.
+The full bubble buys SERVING/CLIENT-tier coverage that is real but NOT where the
+observed bugs are (`client_observer_test.go:286-297` documents that served-replay
+path as the historical leading cause of CheckCompacted flakiness #94 triages).
+Defer the full bubble (items 1,2,4,5,7) as a separate effort.
+
+## Decision log (continued)
+- 2026-06-24: Steps 1 (jitter), 2 (LiveDial threading), 4 (HTTPTransport)
+  implemented, tested, committed. Manual clock sweep SKIPPED (synctest auto-fakes
+  time; pebble-in-bubble spike passed).
+- 2026-06-24: Full-bubble estimated XL / 9-15 days via workflow + adversarial
+  verify (spikes confirm primitives, no showstopper). Recommend the focused
+  ingest/compaction synctest tier (~M / 2-3 days) for step 5 instead. Full bubble
+  deferred. Awaiting Jim's call on which to build.
