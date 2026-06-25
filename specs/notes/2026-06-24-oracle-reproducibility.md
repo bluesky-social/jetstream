@@ -1136,6 +1136,48 @@ small follow-on that drives the resync + compaction pass in a controlled order
 via `synctest.Wait()` between steps. That forced-interleaving test is the actual
 red→green reproducer; this tier is its foundation.
 
+## Full-bubble implementation status (2026-06-25)
+
+DONE and committed — the full `TestOracle_DefaultLifecycle` runs entirely inside
+one `testing/synctest` bubble with NO sockets and the fake clock (WI-1..5,7):
+- WI-1 `pipeListener` (net.Pipe-backed listener + http.Client); WI-2 server
+  listener injection; WI-3 simulator served on a pipe listener (real http.Server,
+  fault fidelity); WI-4 client live-dial via `WithHTTPClient`; WI-5 observer tier
+  transport-injectable + in-bubble cleanup; WI-7 the whole lifecycle in the bubble.
+- Firehose dialed through the simulator's REAL subscribeRepos handler over the
+  pipe (so subscribeRepos disconnect faults fire faithfully). Drain-before-return
+  (rt.Close + sim Shutdown + CloseIdleConnections on both pipe transports — idle
+  keep-alive conns over net.Pipe never exit on their own). Clock advanced past the
+  ~2023 sim epoch. One-bubble-per-process guard.
+- VERIFIED: passes at fast (~0.04s), default (~0.25s), and mid (1000 events/phase,
+  ~1.3s) scale; `-race` clean; 8/8 + 15/15 stable across separate-process runs;
+  coexists with the package's other tests (they skip the bubble slot cleanly).
+- This is the alignment win: CI runs exactly the in-bubble test you run locally,
+  free of the wall-clock skew that caused the 8 irreproducible failures.
+
+### WI-8 OPEN: stress/high-volume scale does not yet pass in the bubble
+Symptom: at 5000 events/phase the steady ack stalls ~213 cursors short of target
+(e.g. `seen=4788 highest_contiguous=9788` of 10001), failing fast (~15s wall); at
+100 accounts it stalls to the wall timeout.
+DIAGNOSIS (not a product bug — a harness generation-pattern artifact of the fake
+clock): under fake time, `generateN` / the bootstrap traffic generator produce
+all N events in ZERO fake-time, building a firehose backlog the consumer hasn't
+drained. A (re)subscribe — notably the merge→steady cutover — then exceeds the
+simulator relay's bounded replay window (`subscribeReplayLimit = 1024`,
+relay_subscribe.go:16) and the consumer resumes from the live tail, permanently
+skipping the gap. Over a real socket, generation and consumption interleave in
+real time so the backlog stays under the cap — which is why the real-socket test
+passed at stress and the bubble does not. Mid-scale (1000 < 1024-ish) passes for
+the same reason.
+FIX DIRECTION (next session, focused): pace event generation so the consumer
+keeps up under the fake clock — interleave `synctest.Wait()` into BOTH the steady
+`generateN` AND the bootstrap traffic generator (a steady-only `synctest.Wait` was
+tried and was insufficient; the cutover backlog is built during bootstrap). And/or
+raise `subscribeReplayLimit` for the in-bubble simulator. Add a `Drops()==0`
+fanout assertion as an anti-vacuity guard regardless. Until fixed, the bubble test
+runs at default mode (the CI-relevant scale); stress remains a separate sweep
+concern.
+
 ## Decision log (continued)
 - 2026-06-24: Steps 1 (jitter), 2 (LiveDial threading), 4 (HTTPTransport)
   implemented, tested, committed. Manual clock sweep SKIPPED (synctest auto-fakes
