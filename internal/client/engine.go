@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -64,6 +65,12 @@ type Config struct {
 	XRPC     *xrpc.Client
 	BulkXRPC *xrpc.Client
 	Dial     dialFunc // optional; nil uses the production websocket dialer
+	// LiveHTTPClient, when non-nil, is the *http.Client the live-tail
+	// websocket dial uses for its HTTP/1.1 upgrade. nil uses the default
+	// dialer. Lets a caller route the live tail through a custom transport
+	// (e.g. an in-process pipe) without exposing the websocket types. Ignored
+	// when Dial is set.
+	LiveHTTPClient *http.Client
 	// LiveBackoffMin overrides the live-tail reconnect backoff floor. Zero uses
 	// the package default; tests set a tiny value to avoid real-time waits.
 	LiveBackoffMin time.Duration
@@ -212,6 +219,7 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 		collections: e.cfg.Request.Collections,
 		dids:        e.cfg.Request.DIDs,
 		dial:        e.cfg.Dial,
+		httpClient:  e.cfg.LiveHTTPClient,
 		logger:      e.logger,
 		backoffMin:  e.cfg.LiveBackoffMin,
 		mode:        e.cfg.recordMode(),
@@ -461,6 +469,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		collections: e.cfg.Request.Collections,
 		dids:        e.cfg.Request.DIDs,
 		dial:        e.cfg.Dial,
+		httpClient:  e.cfg.LiveHTTPClient,
 		logger:      e.logger,
 		backoffMin:  e.cfg.LiveBackoffMin,
 		mode:        e.cfg.recordMode(),
