@@ -9,7 +9,7 @@ replace github.com/jcalabro/atmos => ../../jcalabro/atmos
 require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/coder/websocket v1.8.15
-	github.com/jcalabro/atmos v0.2.6
+	github.com/jcalabro/atmos v0.2.8
 	github.com/jcalabro/gloom v0.1.0
 	github.com/jcalabro/gt v0.0.13
 	github.com/jcalabro/jttp v0.0.6
