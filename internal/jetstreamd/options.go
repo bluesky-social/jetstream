@@ -86,6 +86,11 @@ type Options struct {
 	// the simulator in-process so no socket is involved.
 	HTTPTransport http.RoundTripper
 
+	// Headless, when true, skips the public/debug HTTP server (no TCP
+	// listener). The ingestion path runs unchanged. Production leaves it
+	// false; the synctest oracle tier uses it to run with no sockets.
+	Headless bool
+
 	CursorLookback            time.Duration
 	SegmentCacheMaxAge        time.Duration
 	PlanMaxDIDs               int

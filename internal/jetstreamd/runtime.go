@@ -486,9 +486,11 @@ func (r *Runtime) Run(ctx context.Context) error {
 		return nil
 	})
 
-	g.Go(func() error {
-		return r.server.Run(gctx)
-	})
+	if !r.opts.Headless {
+		g.Go(func() error {
+			return r.server.Run(gctx)
+		})
+	}
 
 	g.Go(func() error {
 		return r.orchestrator.Run(gctx)
