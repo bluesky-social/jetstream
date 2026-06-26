@@ -29,6 +29,19 @@ import (
 // nolint:paralleltest
 func runChainThroughCrash(t *testing.T, label string, seedIdx int, point crashpoint.Point) recoveredChainRun {
 	t.Helper()
+	return runChainThroughCrashAt(t, label, seedIdx, point, 1)
+}
+
+// runChainThroughCrashAt is runChainThroughCrash with an explicit 1-based kill
+// ordinal: the first child is SIGKILLed on the ordinal-th hit of point rather
+// than the first. ordinal=1 is the original behavior. This is the mechanism
+// behind the predicate-driven kill tier (#29): a seeded predicate chooses
+// (point, ordinal) so a crash can land "between" named crashpoints by
+// occurrence count (e.g. after the 3rd repo completes).
+//
+// nolint:paralleltest
+func runChainThroughCrashAt(t *testing.T, label string, seedIdx int, point crashpoint.Point, ordinal int) recoveredChainRun {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping restart oracle under -short")
 	}
@@ -54,6 +67,7 @@ func runChainThroughCrash(t *testing.T, label string, seedIdx int, point crashpo
 		"accounts":      cfg.Accounts,
 		"case":          label,
 		"crash_point":   point.String(),
+		"crash_ordinal": ordinal,
 		"chain_did_idx": spec.chainAccountIdx(),
 		"chain_records": len(spec.records),
 	})
@@ -78,13 +92,14 @@ func runChainThroughCrash(t *testing.T, label string, seedIdx int, point crashpo
 		relayURL:        srv.URL,
 		markerPath:      markerPath,
 		crashPoint:      point,
+		crashOrdinal:    ordinal,
 		killAfterMarker: true,
 		timeout:         30 * time.Second,
 		trace:           trace,
 		runLabel:        "first-" + label,
 	})
 	recordTraceOrError(t, trace, "restart_child_result", traceRestartChildResult("first", first))
-	require.Truef(t, wasSIGKILL(first.err), "first child should be killed at %s: err=%v\n%s", point, first.err, first.output)
+	require.Truef(t, wasSIGKILL(first.err), "first child should be killed at %s ordinal=%d: err=%v\n%s", point, ordinal, first.err, first.output)
 
 	// Second child: re-run the merge idempotently to a clean after-merge
 	// exit. The coordinator does NOT regenerate (sync.Once already fired on

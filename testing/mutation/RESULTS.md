@@ -102,6 +102,55 @@ Full gate verification passed:
 gate: PASS — 25 mutants match baseline (commit b6d3f09000c578400264db8b3c0b56b553427c7e)
 ```
 
+## m003 re-disposition 2026-06-26 (#29 — accepted-benign, mechanism nailed down)
+
+Re-examined m003 while building the #29 predicate-driven kill tier (the issue
+named this tier the home for killing m003). m003 remains **SURVIVED** on current
+`main` after #113/#114, and a direct spike confirms it is **architecturally
+benign in every scenario the restart tier can construct** — not a coverage gap.
+This reaffirms the 2026-06-20 "benign, not a gap" disposition below, now with the
+full mechanism nailed down, and three independent guards each of which alone
+neutralizes the mutant:
+
+1. **Source segments are deleted on clean completion, and the cursor is then
+   ignored.** After a full merge, `merge.go` `os.RemoveAll(.../backfill)` removes
+   the source tree; on the next start the restart-after-cleanup guard sees
+   `live_segments` gone, deletes the cursor keys, and returns. So m003's
+   `commitSourceComplete(sf.Idx)` vs `sf.Idx+1` off-by-one is **never read** on a
+   clean restart — there is no source tree left to re-process. Idempotency holds
+   independently of the cursor value.
+
+2. **The restart-chain scenario produces a single source segment** (verified:
+   `live_segments` empties to one merged `segments/seg_0000000000.jss`). With one
+   source, the only mid-merge crashpoint (`AfterMergeDstFlushBeforeSourceCommit`)
+   fires *before* `commitSourceComplete`, so the cursor is uncommitted under both
+   correct and mutant code and the re-run reprocesses identically. There is no
+   "earlier-committed source + later-pending source" gap where `Idx` vs `Idx+1`
+   diverges.
+
+3. **The destination re-stamps seqs** (`ingest.Writer` sets `ev.Seq = nextSeq`),
+   so even a hypothetical re-append is a contract-permitted at-least-once
+   duplicate, which #113's replay-aware `CheckStructuralInvariants` + the `≥`
+   coverage comparator now *correctly* tolerate. The mutant author's predicted
+   kill signal (CheckInvariants duplicate-seq / Compare extra-record) assumed a
+   seq-preserving re-append; the re-stamp defeats it.
+
+Empirical confirmation (#29 work): applying m003 and running the durable-chain
+crash tier at `AfterMergeDstFlushBeforeSourceCommit` (rows kept, unlike the old
+nil-coordinator tier) still **passes** — no duplicate, no loss, final-state
+`Compare` converges. Killing m003 would require a multi-retained-source-segment
+scenario with a crash between per-source commits, which the architecture
+deliberately does not produce and whose cursor mechanics are already covered by
+orchestrator unit tests.
+
+**Disposition: accepted-benign, owned by #29.** Kept in the catalog as a SURVIVED
+documented blind spot (its mutation point is real; it simply has no observable
+effect here), consistent with the enforced baseline. The #29 DoD clause "this
+tier kills m003" is withdrawn; #29 delivers the seeded/predicate-driven
+kill-point selection instead. Note: this is the same class of finding as #114's
+withdrawn convergence-hiding over-drop — a "kill the mutant" goal written before
+the idempotency guarantees were fully traced.
+
 ## Active catalog check 2026-06-15 — retired mutants removed
 
 - commit under test: `767792e`
