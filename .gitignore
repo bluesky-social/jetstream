@@ -42,3 +42,9 @@ go.work.sum
 # Unanchored: the restart child subprocess runs with CWD=internal/oracle, so
 # the default ORACLE_ARTIFACT_DIR can also resolve there.
 oracle-artifacts/
+
+# Local `just mutation-gate` / `mutation-campaign` output (the JSON scorecard).
+# CI writes it under a workspace path (MUTATION_RESULT_JSON); locally it
+# defaults to the repo root. The committed source of truth is
+# testing/mutation/baseline.json, not this run artifact.
+/mutation-result.json
