@@ -5,6 +5,8 @@ package jetstreamd
 import (
 	"context"
 	"io"
+	"net"
+	"net/http"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
@@ -74,6 +76,30 @@ type Options struct {
 	// leaves it nil.
 	LiveReconnectBackoff *streaming.BackoffPolicy
 
+	// LiveDial, when non-nil, overrides atmos's websocket dial for the live
+	// consumer. Production leaves it nil; deterministic harnesses feed the
+	// firehose over an in-memory connection.
+	LiveDial streaming.DialFunc
+
+	// HTTPTransport, when non-nil, is the RoundTripper for every outbound
+	// HTTP client (backfill getRepo/listRepos, identity/PLC resolution).
+	// Production leaves it nil (real sockets); deterministic harnesses serve
+	// the simulator in-process so no socket is involved.
+	HTTPTransport http.RoundTripper
+
+	// Headless, when true, skips the public/debug HTTP server (no TCP
+	// listener). The ingestion path runs unchanged. Production leaves it
+	// false; the synctest oracle tier uses it to run with no sockets.
+	Headless bool
+
+	// PublicListener and DebugListener, when non-nil, are served by the
+	// public/debug HTTP servers instead of binding TCP. Production leaves
+	// them nil; the in-process oracle harness passes pipe-backed listeners
+	// so the full runtime (including its public surface) runs with no socket
+	// inside a synctest bubble. Ignored when Headless is true.
+	PublicListener net.Listener
+	DebugListener  net.Listener
+
 	CursorLookback            time.Duration
 	SegmentCacheMaxAge        time.Duration
 	PlanMaxDIDs               int
@@ -90,6 +116,7 @@ type Options struct {
 	CompactionTombstoneCap    int
 	CompactionRewriteWorkers  int
 	OverlayRebuildInterval    time.Duration
+	BarrierBeforeCutover      PhaseBarrier
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier
 	OnCompactionPass          func(CompactionPassResult)

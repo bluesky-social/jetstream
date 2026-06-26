@@ -338,6 +338,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 	if c.cfg.ReconnectBackoff != nil {
 		opts.Backoff = gt.Some(*c.cfg.ReconnectBackoff)
 	}
+	if c.cfg.Dial != nil {
+		opts.Dial = gt.Some(c.cfg.Dial)
+	}
 
 	client, err := streaming.NewClient(opts)
 	if err != nil {

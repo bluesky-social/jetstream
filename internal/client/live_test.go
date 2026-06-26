@@ -323,7 +323,7 @@ func TestLiveConsumerSubscribeURLCursorZero(t *testing.T) {
 // uncompressed stream.
 func TestLiveDialOptionsOffersCompression(t *testing.T) {
 	t.Parallel()
-	opts := liveDialOptions()
+	opts := liveDialOptions(nil)
 	require.NotNil(t, opts)
 	require.Equal(t, websocket.CompressionContextTakeover, opts.CompressionMode,
 		"live dial must offer permessage-deflate with context takeover")

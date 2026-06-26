@@ -17,6 +17,14 @@ type Registry struct {
 
 	mu   sync.RWMutex
 	subs map[*Subscriber]struct{}
+
+	// detachedDrops accumulates the drop counts of subscribers that have
+	// since detached (Close / CloseAll), so TotalDrops reflects the whole
+	// run's loss rather than only the subscribers still attached. A
+	// reconnecting consumer detaches its old subscriber on every reconnect,
+	// and the relay handler detaches on shutdown, so without this an
+	// after-the-fact "zero drops" assertion would read vacuously zero.
+	detachedDrops atomic.Uint64
 }
 
 // Subscriber is one consumer's view onto the broadcast.
@@ -70,6 +78,20 @@ func (r *Registry) Publish(frame []byte) {
 	}
 }
 
+// TotalDrops sums dropped-frame counts across the registry's whole lifetime:
+// every currently-attached subscriber plus those that have detached. A slow
+// consumer whose buffer fills shows up here; used by tests to assert lossless
+// delivery even after the consumer (and its subscriber) has gone away.
+func (r *Registry) TotalDrops() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	total := r.detachedDrops.Load()
+	for s := range r.subs {
+		total += s.drops.Load()
+	}
+	return total
+}
+
 // CloseAll closes every subscriber. Used at simulator shutdown.
 func (r *Registry) CloseAll() {
 	r.mu.Lock()
@@ -91,12 +113,15 @@ func (s *Subscriber) Drops() uint64 {
 	return s.drops.Load()
 }
 
-// Close detaches the subscriber from the registry. Idempotent.
+// Close detaches the subscriber from the registry. Idempotent. Its drop
+// count is folded into the registry's lifetime accumulator before it
+// detaches, so TotalDrops still reflects this subscriber's losses.
 func (s *Subscriber) Close() {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
 	}
 	s.registry.mu.Lock()
+	s.registry.detachedDrops.Add(s.drops.Load())
 	delete(s.registry.subs, s)
 	s.registry.mu.Unlock()
 	close(s.ch)
@@ -104,6 +129,7 @@ func (s *Subscriber) Close() {
 
 func (s *Subscriber) markClosed() {
 	if s.closed.CompareAndSwap(false, true) {
+		s.registry.detachedDrops.Add(s.drops.Load())
 		close(s.ch)
 	}
 }

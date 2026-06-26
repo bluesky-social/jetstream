@@ -76,6 +76,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			SegmentMetrics:   o.cfg.SegmentMetrics,
 			OnEvent:          o.cfg.OnBootstrapLiveEvent,
 			ReconnectBackoff: o.cfg.LiveReconnectBackoff,
+			Dial:             o.cfg.LiveDial,
 		})
 		if err != nil {
 			if cerr := bw.Close(); cerr != nil {
@@ -132,6 +133,18 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			o.logger.InfoContext(ctx, "cutover begin")
 			if err := o.writeMergingPhase(); err != nil {
 				return err
+			}
+
+			// Optional pre-cutover barrier: the bootstrap-live consumer is
+			// still running here, so a validation harness that injected live
+			// traffic during bootstrap can wait for it to be fully archived
+			// before the cancel below tears the consumer down. Nil in
+			// production (cutover proceeds immediately; any in-flight live
+			// events are re-fetched from the persisted cursor in steady-state).
+			if o.cfg.BarrierBeforeCutover != nil {
+				if err := o.cfg.BarrierBeforeCutover(gctx); err != nil {
+					return fmt.Errorf("orchestrator: before-cutover barrier: %w", err)
+				}
 			}
 
 			// Cancel the bootstrap-live consumer's context. This signals

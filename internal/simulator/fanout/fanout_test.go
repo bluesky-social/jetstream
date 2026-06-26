@@ -36,6 +36,54 @@ func TestRegistry_DropsWhenSubscriberFull(t *testing.T) {
 	require.Equal(t, uint64(1), sub.Drops())
 }
 
+func TestRegistry_TotalDropsSumsAttached(t *testing.T) {
+	t.Parallel()
+	r := New(1)
+	a := r.Subscribe()
+	defer a.Close()
+	b := r.Subscribe()
+	defer b.Close()
+
+	r.Publish([]byte("x")) // fills both buffers (cap 1)
+	r.Publish([]byte("y")) // drop on both
+	r.Publish([]byte("z")) // drop on both
+
+	require.Equal(t, uint64(4), r.TotalDrops(), "2 drops each across 2 attached subscribers")
+}
+
+func TestRegistry_TotalDropsSurvivesClose(t *testing.T) {
+	t.Parallel()
+	// The harness asserts TotalDrops()==0 AFTER the runtime (and its
+	// subscriber) has shut down. A drop count that vanished when the
+	// subscriber detached would make that assertion vacuously zero, so the
+	// registry must retain a detached subscriber's drops for the run's
+	// lifetime. This test fails if that accumulation regresses.
+	r := New(1)
+	sub := r.Subscribe()
+
+	r.Publish([]byte("a")) // fills the cap-1 buffer
+	r.Publish([]byte("b")) // drop
+	require.Equal(t, uint64(1), r.TotalDrops())
+
+	sub.Close()
+	require.Equal(t, uint64(1), r.TotalDrops(),
+		"a detached subscriber's drops must still be counted (assertion would be vacuous otherwise)")
+}
+
+func TestRegistry_TotalDropsSurvivesCloseAll(t *testing.T) {
+	t.Parallel()
+	r := New(1)
+	r.Subscribe()
+
+	r.Publish([]byte("a")) // fills the cap-1 buffer
+	r.Publish([]byte("b")) // drop
+	require.Equal(t, uint64(1), r.TotalDrops())
+
+	r.CloseAll()
+	require.Equal(t, uint64(1), r.TotalDrops(),
+		"CloseAll must fold detached subscribers' drops into the lifetime total")
+}
+
 func TestRegistry_FanOut(t *testing.T) {
 	t.Parallel()
 	r := New(8)

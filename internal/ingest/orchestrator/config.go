@@ -164,6 +164,11 @@ type Config struct {
 	// consumers. Production leaves it nil.
 	LiveReconnectBackoff *streaming.BackoffPolicy
 
+	// LiveDial, when non-nil, overrides atmos's websocket dial for both
+	// bootstrap-time and steady-state live consumers. Production leaves it
+	// nil; deterministic harnesses feed the firehose in-memory.
+	LiveDial streaming.DialFunc
+
 	// IngestOnAfterSeal is forwarded to every writer that appends to
 	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's
 	// OnSegmentSealed callback. Optional.
@@ -225,6 +230,16 @@ type Config struct {
 	// cursor-replay handler. Called exactly once per orchestrator
 	// run; nil-safe.
 	OnSteadyStateWriter func(*ingest.Writer)
+
+	// BarrierBeforeCutover, if non-nil, runs inside runBootstrap after the
+	// backfill engine drains but BEFORE the bootstrap-live consumer's context is
+	// cancelled — i.e. while the bootstrap-live consumer is still delivering.
+	// Intended for deterministic validation harnesses that inject live traffic
+	// during bootstrap and need it fully archived before the cutover tears the
+	// consumer down (production re-fetches any in-flight live events from the
+	// persisted cursor in steady-state, so production leaves this nil and the
+	// cutover proceeds immediately).
+	BarrierBeforeCutover PhaseBarrier
 
 	// BarrierAfterBootstrap, if non-nil, runs after bootstrap has durably
 	// written PhaseMerging and before merge begins. Intended for deterministic

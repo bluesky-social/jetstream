@@ -131,17 +131,29 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 
 		current := watermark
 		for current < targetWatermark {
-			var snap tombstone.Snapshot
-			var chunkEnd uint64
-			if mode == compactionSteady && o.cfg.Tombstones != nil {
-				snap = o.cfg.Tombstones.SnapshotRange(current, targetWatermark)
-				chunkEnd = targetWatermark
-			} else {
-				var err error
-				snap, chunkEnd, err = o.collectCompactionTombstones(ctx, sealed, current, targetWatermark)
-				if err != nil {
-					return err
-				}
+			// Build the pass's tombstone snapshot by folding the sealed rows in
+			// the window (current, targetWatermark] from disk, for BOTH steady
+			// and merge-tail modes.
+			//
+			// We deliberately do NOT use the in-memory tombstone Set here. That
+			// set collapses each key to the GLOBAL-max superseding seq, but a
+			// compaction window needs the max superseding seq *at or below
+			// targetWatermark*. When live ingestion runs ahead of the watermark
+			// (the steady force-rotate seals up to targetWatermark while newer
+			// events land in the fresh active segment), a key updated again above
+			// the watermark has its in-memory seq pushed above the window;
+			// SnapshotRange's upper bound then drops the key entirely and an
+			// older superseded row in a prior segment is never evicted, so the
+			// pass commits a watermark it did not actually achieve (a superseded
+			// row survives at/below W — issue #100 dual). Folding the on-disk
+			// window can only see seqs <= targetWatermark, so it yields the
+			// window-correct tombstone (matching the oracle's CheckCompacted /
+			// filterCompactedExpectedRows) and cannot be fooled by an above-W
+			// update. The in-memory Set remains the read-path overlay's source
+			// (SnapshotRange(W, inf)) and is still Evict-bounded below.
+			snap, chunkEnd, err := o.collectCompactionTombstones(ctx, sealed, current, targetWatermark)
+			if err != nil {
+				return err
 			}
 			if chunkEnd <= current {
 				chunkEnd = targetWatermark

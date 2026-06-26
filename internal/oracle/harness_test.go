@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"net/http/httptest"
+	"net/http"
 	"os"
 	"runtime"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
@@ -25,13 +26,42 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// nolint:paralleltest
+// TestOracle_DefaultLifecycle drives the full jetstreamd lifecycle (bootstrap
+// -> merge -> steady -> compaction -> client-observer serving tiers ->
+// shutdown) entirely inside a testing/synctest bubble with NO sockets and the
+// fake clock: the upstream firehose is fed in-memory via LiveDial, all outbound
+// HTTP (getRepo/listRepos/PLC) is served in-process via HTTPTransport, and the
+// runtime's public surface (which the observer tier consumes) is served over a
+// pipe-backed listener. CI runs exactly this — the test you run locally is the
+// test CI runs, free of wall-clock skew. One bubble per process (see the guard).
+//
+// nolint:paralleltest // synctest.Test forbids t.Parallel inside the bubble.
 func TestOracle_DefaultLifecycle(t *testing.T) {
+	if synctestBubbleUsed.Swap(true) {
+		t.Skip("oracle synctest tier must run one bubble per process; " +
+			"re-run as a separate `go test` invocation, not -count>1")
+	}
+	synctest.Test(t, testOracleDefaultLifecycle)
+}
+
+func testOracleDefaultLifecycle(t *testing.T) {
 	cfg, err := defaultLifecycleConfig(os.LookupEnv, testing.Short())
 	require.NoError(t, err)
 	if cfg.Mode == "stress" && testing.Short() {
 		t.Skip("skipping stress oracle under -short")
 	}
+
+	// The synctest fake clock starts at 2000-01-01 UTC, but the simulator
+	// stamps commit revs at its logical-clock epoch (~2023). atmos's verifier
+	// rejects a rev >5m in the future, so advance the bubble clock past the
+	// epoch before any event flows. See advanceClockToSimulatorEpoch.
+	advanceClockToSimulatorEpoch()
+
+	// Pace bulk event generation so the in-process consumer keeps up under the
+	// fake clock (see generateN). Cleared on return so it never leaks to a
+	// non-bubble tier.
+	bubbleDrain = synctest.Wait
+	defer func() { bubbleDrain = nil }()
 
 	trace, tracePath, closeTrace := newOracleTrace(t, "oracle-trace.jsonl")
 	defer closeTrace()
@@ -71,9 +101,18 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	_, err = w.EnsureSeed()
 	require.NoError(t, err)
 	require.NoError(t, w.Bootstrap(t.Context(), slog.Default()))
+	// Size the firehose fanout buffer to comfortably exceed the run's total
+	// event volume. The simulator fanout drops frames on a full per-subscriber
+	// buffer (it models a lossy relay), and in the bubble a dropped frame is
+	// lost for good — the in-process consumer never reconnects+replays the way
+	// a real socket disconnect would, so a drop silently breaks the exact-count
+	// acks. A closed-system test has a known bound; size to it and assert zero
+	// drops at shutdown (below) so any future overflow fails loud, not silent.
+	fanoutBuf := max(8192, simCfg.FirehoseHistory*2)
+	fan := fanout.New(fanoutBuf)
 	require.NoError(t, w.AttachRuntime(
 		rand.New(rand.NewPCG(cfg.Seed^0xfeedf00d, cfg.Seed^0xc0ffee)),
-		fanout.New(4096),
+		fan,
 	))
 
 	faultPlan, err := BuildSwarmFaultPlan(w, cfg)
@@ -93,11 +132,22 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"subscribe_repos_disconnect_threshold_count": len(faultPlan.SubscribeReposDisconnectThresholds),
 	})
 
-	srv := httptest.NewServer(nil)
-	defer srv.Close()
-	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, srv.URL, simhttp.HandlerOptions{
+	// Serve the simulator in-process over a pipe-backed listener (no socket).
+	// A real http.Server is used (not a ResponseRecorder RoundTripper) so CAR
+	// streaming and the getRepo CAR-truncation fault — a mid-stream connection
+	// reset — keep their real wire behavior. simURL is synthetic; the pipe
+	// client routes by connection, not host.
+	const simURL = "http://sim.invalid"
+	simLn := newPipeListener()
+	simSrv := &http.Server{Handler: simhttp.NewHandlerWithOptions(w, simURL, simhttp.HandlerOptions{
 		Faults: faultPlan.SimulatorFaults,
-	})
+	})}
+	simServeDone := make(chan struct{})
+	go func() {
+		defer close(simServeDone)
+		_ = simSrv.Serve(simLn)
+	}()
+	simClient := simLn.httpClient()
 
 	dataDir := t.TempDir()
 	afterBootstrap := newPhaseGate()
@@ -112,7 +162,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	steadyEventLog := newEventLogRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
 	emittedBootstrapAccountDelete := false
-	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, func(ctx context.Context) (int64, error) {
+	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, bootstrapAck, oracleWaitTimeout(cfg), func(ctx context.Context) (int64, error) {
 		if !emittedBootstrapAccountDelete {
 			emittedBootstrapAccountDelete = true
 			_, err := w.GenerateAccountDeleteForTest(ctx, 0)
@@ -127,9 +177,6 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		}
 		return w.CurrentSeq(), nil
 	})
-	bootstrapTraffic.afterBatch = func(ctx context.Context, targetSeq int64) error {
-		return bootstrapAck.WaitContiguousFrom(ctx, 1, targetSeq, oracleWaitTimeout(cfg))
-	}
 	liveReconnectBackoff := &streaming.BackoffPolicy{
 		InitialDelay: gt.Some(time.Millisecond),
 		MaxDelay:     gt.Some(time.Millisecond),
@@ -137,18 +184,30 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		Jitter:       gt.Some(false),
 	}
 
+	// The runtime's public surface is served over a pipe-backed listener; the
+	// observer tier (client backfill, typed backfill, overlay fetch) reaches it
+	// through this listener's in-process client. Debug listener likewise.
+	runtimePublicLn := newPipeListener()
+	runtimeDebugLn := newPipeListener()
+	obsClient := runtimePublicLn.httpClient()
+
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
-		PublicAddr:         "127.0.0.1:0",
-		DebugAddr:          "127.0.0.1:0",
 		DataDir:            dataDir,
-		RelayURL:           srv.URL,
-		PLCURL:             srv.URL,
+		RelayURL:           simURL,
+		PLCURL:             simURL,
 		OTelServiceName:    "jetstream-oracle",
 		LogLevel:           "warn",
 		LogFormat:          "text",
 		LogOutput:          testWriter{t: t},
 		ShutdownTimeout:    5 * time.Second,
 		ClientDrainTimeout: time.Second,
+		// In-process transport for the full bubble: pipe listeners for the
+		// runtime's public/debug servers, in-memory firehose dial, and an
+		// HTTP transport that serves the simulator with no socket.
+		PublicListener: runtimePublicLn,
+		DebugListener:  runtimeDebugLn,
+		LiveDial:       subscribeReposDial(simClient),
+		HTTPTransport:  simClient.Transport,
 		// Keep injected transient getRepo 503s fast: a sub-millisecond
 		// retry backoff means each fault adds microseconds, not atmos's
 		// 1s production base delay, so the swarm sweep stays inside its
@@ -170,6 +229,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		CompactionInterval:        time.Hour,
 		CompactionTombstoneCap:    1,
 		OverlayRebuildInterval:    10 * time.Millisecond,
+		BarrierBeforeCutover:      bootstrapTraffic.WaitDelivered,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
 		OnBeforeCompactionPass: func(targetWatermark uint64) {
@@ -220,9 +280,23 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		close(run.exited)
 	}()
 
+	// Bootstrap traffic runs on its own goroutine (see bootstrapTrafficGenerator
+	// for why it must NOT run under the backfill writer lock). It blocks on the
+	// start signal until the first repo completes, then paces generation against
+	// bootstrapAck off-lock. It exits on ctx cancel; we drain it before the
+	// bubble fn returns so no goroutine is left blocked.
+	bootstrapTrafficDone := make(chan struct{})
+	go func() {
+		defer close(bootstrapTrafficDone)
+		if err := bootstrapTraffic.Run(ctx); err != nil && ctx.Err() == nil {
+			t.Errorf("bootstrap traffic generator: mode=%s seed=%d err=%v", cfg.Mode, cfg.Seed, err)
+		}
+	}()
+
 	runDone := false
 	defer func() {
 		cancel()
+		<-bootstrapTrafficDone
 		if !runDone {
 			waitForRuntimeExit(t, cfg, run)
 			recordTraceOrError(t, trace, "runtime_exit", map[string]any{
@@ -234,6 +308,18 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer closeCancel()
 		require.NoError(t, rt.Close(closeCtx))
+		// Reap pooled keep-alive connections on both pipe transports. Over
+		// net.Pipe an idle HTTP/1.1 keep-alive conn parks its client readLoop/
+		// writeLoop and server conn.serve in durably-blocking reads that never
+		// exit on their own; without this the bubble fn returns with those
+		// goroutines alive and synctest panics "blocked goroutines remain".
+		obsClient.CloseIdleConnections()
+		simClient.CloseIdleConnections()
+		// Tear down the in-process simulator server and drain its goroutine:
+		// every bubble goroutine must exit before the bubble function returns.
+		_ = simSrv.Shutdown(closeCtx)
+		_ = simLn.Close()
+		<-simServeDone
 	}()
 
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "wait_begin"})
@@ -243,6 +329,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	assertFaultPlanFired(t, cfg, faultPlan)
 	bootstrapTargetSeq := w.CurrentSeq()
 	assertFirehoseEventLogMatches(t, trace, w, bootstrapEventLog, 0, bootstrapTargetSeq, "after-bootstrap")
+	assertNoPermanentCursorGap(t, bootstrapEventLog, 0, bootstrapTargetSeq, cfg, "after-bootstrap")
 	assertBootstrapOracleMatches(t, dataDir, w, cfg)
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "after-bootstrap", "marker": "release"})
 	afterBootstrap.Release()
@@ -269,8 +356,9 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	targetSeq := w.CurrentSeq()
 	recordTraceOrError(t, trace, "steady_target", map[string]any{"target_seq": targetSeq})
-	steadyAck.Wait(t, cfg, targetSeq, run, 30*time.Second)
+	steadyAck.Wait(t, cfg, targetSeq, run, oracleWaitTimeout(cfg))
 	assertFirehoseEventLogMatches(t, trace, w, steadyEventLog, steadyStartSeq, targetSeq, "steady-state")
+	assertNoPermanentCursorGap(t, steadyEventLog, steadyStartSeq, targetSeq, cfg, "steady-state")
 
 	asyncIdx := pickActiveOracleAccount(t, w, cfg)
 	_, err = w.GenerateSilentMutationThenCommitForTest(t.Context(), asyncIdx)
@@ -278,8 +366,8 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	asyncEntry, _, err := w.ListReposPage(asyncIdx, 1)
 	require.NoError(t, err)
 	require.Len(t, asyncEntry, 1)
-	asyncResyncAck.Wait(t, cfg, string(asyncEntry[0].DID), asyncEntry[0].Rev, run, 30*time.Second)
-	steadyCompaction := compaction.WaitAfter(t, cfg, run, passesBeforeSteady, 30*time.Second)
+	asyncResyncAck.Wait(t, cfg, string(asyncEntry[0].DID), asyncEntry[0].Rev, run, oracleWaitTimeout(cfg))
+	steadyCompaction := compaction.WaitAfter(t, cfg, run, passesBeforeSteady, oracleWaitTimeout(cfg))
 	require.Greaterf(t, steadyCompaction.Watermark, afterMergeCompaction.Watermark,
 		"steady compaction watermark did not advance: mode=%s seed=%d after_merge_watermark=%d steady_watermark=%d",
 		cfg.Mode, cfg.Seed, afterMergeCompaction.Watermark, steadyCompaction.Watermark)
@@ -294,12 +382,12 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	// server bug from a client bug). On a CheckCompacted failure we still run
 	// #94's disk-vs-serving bisection to classify durable-defect vs.
 	// serving/client artifact.
-	assertClientBackfillCompacted(t, cfg, run, trace, dataDir, w, compaction, publicURL, steadyCompaction.Watermark, "steady-state-client-backfill")
+	assertClientBackfillCompacted(t, cfg, run, trace, obsClient, dataDir, w, compaction, publicURL, steadyCompaction.Watermark, "steady-state-client-backfill")
 
 	// #146: drive the REAL client through the typed fast path (worker-parallel
 	// decode into bsky.FeedLike) over the same sealed range and assert it decodes
 	// likes cleanly and surfaces exactly the same like set as the map path.
-	assertTypedLikeBackfill(t, cfg, run, publicURL, steadyCompaction.Watermark)
+	assertTypedLikeBackfill(t, cfg, run, obsClient, publicURL, steadyCompaction.Watermark)
 
 	// Exercise the overlay's DID-tombstone section inside the live overlay
 	// window. The earlier bootstrap account-delete and sync tombstones are
@@ -318,7 +406,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 		"did":          string(lateAcct.DID),
 		"upstream_seq": lateDIDUpstreamSeq,
 	})
-	lateDIDTombstoneSeq := lateOverlayDIDAck.Wait(t, cfg, string(lateAcct.DID), lateDIDUpstreamSeq, run, 30*time.Second)
+	lateDIDTombstoneSeq := lateOverlayDIDAck.Wait(t, cfg, string(lateAcct.DID), lateDIDUpstreamSeq, run, oracleWaitTimeout(cfg))
 	recordTraceOrError(t, trace, "late_overlay_did_tombstone_observed", map[string]any{
 		"did":          string(lateAcct.DID),
 		"upstream_seq": lateDIDUpstreamSeq,
@@ -330,7 +418,7 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	// tombstone set cannot trigger another compaction pass before
 	// shutdown: the blob's W is stable across the fetch->flush window, so
 	// the post-shutdown segment scan is consistent with it.
-	overlayW, overlayM, overlaySnap := fetchOverlayWithDIDTombstone(t, cfg, run, publicURL, string(lateAcct.DID), lateDIDTombstoneSeq)
+	overlayW, overlayM, overlaySnap := fetchOverlayWithDIDTombstone(t, cfg, run, obsClient, publicURL, string(lateAcct.DID), lateDIDTombstoneSeq)
 
 	// steadyAck.Wait above guarantees every steady-state cursor up to
 	// targetSeq has been durably appended (OnEvent fires post-Append), so
@@ -347,6 +435,19 @@ func TestOracle_DefaultLifecycle(t *testing.T) {
 	})
 	runDone = true
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "final-assertions", "marker": "begin"})
+	// Anti-vacuity: the fanout models a lossy relay (drop-on-full per
+	// subscriber, fanout.go Publish), and in the bubble a dropped frame is
+	// lost for good — the in-process consumer never reconnects+replays the way
+	// a real socket disconnect would, so a drop silently breaks the exact-count
+	// acks rather than failing loud. We sized fanoutBuf (above) to exceed the
+	// run's total volume precisely so drops stay at zero; assert that here so a
+	// future overflow (or a buffer-sizing regression) fails loudly instead of
+	// corrupting the reconstructed model. The runtime has exited, so the relay
+	// handler's subscriber has detached and its drop count is folded into the
+	// registry's lifetime accumulator (TotalDrops survives detach).
+	require.Zerof(t, fan.TotalDrops(),
+		"fanout dropped frames: mode=%s seed=%d drops=%d (a full per-subscriber buffer silently lost a frame; raise fanoutBuf or investigate a slow consumer)",
+		cfg.Mode, cfg.Seed, fan.TotalDrops())
 	recordSubscribeReposFaults(t, trace, "steady-state-shutdown-flush", faultPlan)
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
@@ -520,6 +621,43 @@ func assertFirehoseEventLogMatches(
 	})
 	require.NoErrorf(t, err, "%s: compare firehose event log cursor=%d target=%d expected=%d observed=%d",
 		phase, cursor, target, len(want), len(got))
+}
+
+// assertNoPermanentCursorGap is the anti-vacuity guard for boundary frame loss
+// (R3). It asserts — directly and without waiting — that every upstream relay
+// cursor the simulator generated in (after, through] was observed by the
+// consumer (and therefore durably archived, since OnEvent fires post-Append).
+//
+// This is the loud, immediate backstop for the "graceful cutover dropped an
+// in-flight frame" class of bug: the boundary loss is normally PREVENTED by the
+// harness backpressure + BarrierBeforeCutover (which hold the bootstrap-live
+// consumer abreast of generation and gate the cutover on full delivery), but
+// that is a timing guarantee. If a future change weakens it, the dropped cursor
+// is permanently lost (re-delivery is rev-replay-dropped by the shared
+// verifier), and the existing multiset compare only surfaces it as a 5-minute
+// TIMEOUT. This guard fails fast at quiescence with the exact missing cursors,
+// so the regression cannot hide behind pacing. Run only after the relevant ack
+// has fired, so a present-count check is not racing in-flight delivery.
+func assertNoPermanentCursorGap(t *testing.T, observed *eventLogRecorder, after, through int64, cfg Config, phase string) {
+	t.Helper()
+
+	seen := observed.ObservedUpstreamCursors(after, through)
+	var missing []int64
+	for c := after + 1; c <= through; c++ {
+		if _, ok := seen[c]; !ok {
+			missing = append(missing, c)
+		}
+	}
+	require.Emptyf(t, missing,
+		"%s mode=%s seed=%d: %d upstream cursor(s) permanently lost in (%d,%d] — a graceful-cutover/backpressure regression dropped in-flight frames (first missing: %v)",
+		phase, cfg.Mode, cfg.Seed, len(missing), after, through, firstN(missing, 10))
+}
+
+func firstN(xs []int64, n int) []int64 {
+	if len(xs) <= n {
+		return xs
+	}
+	return xs[:n]
 }
 
 func totalGetRepoHTTPFailuresFired(plan *SwarmFaultPlan) int {
@@ -968,9 +1106,18 @@ func oracleWaitTimeout(cfg Config) time.Duration {
 func generateN(t *testing.T, w *world.World, n int) {
 	t.Helper()
 
-	for range n {
+	for i := range n {
 		_, err := w.GenerateOneForTest(t.Context())
 		require.NoError(t, err)
+		// In a synctest bubble a tight generate loop emits all N events in zero
+		// fake-time, building a firehose backlog the consumer hasn't drained;
+		// a later (re)subscribe then overruns the relay's bounded replay window
+		// and skips the gap. Periodically yield so the consumer keeps pace,
+		// mirroring the real-time interleaving a socket run gets for free. A
+		// no-op outside a bubble (restart tier), so it stays correct there.
+		if (i+1)%128 == 0 {
+			drain()
+		}
 	}
 }
 
@@ -1293,52 +1440,129 @@ func (w testWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// bootstrapTrafficGenerator emits the bootstrap-phase live traffic (an
+// account-delete tombstone followed by ordinary commits) that the
+// bootstrap-live consumer must archive concurrently with backfill.
+//
+// CRITICAL (R2 deadlock fix): generation and its backpressure wait run on a
+// DEDICATED goroutine (Run), NOT inside AfterRepoComplete. AfterRepoComplete is
+// the backfill writer's OnDurableBatch afterDone callback, invoked while
+// ingest.Writer.mu + drainMu are held (writer.go commitDurableBatchLocked); a
+// blocking wait there deadlocks because sibling backfill workers then block on
+// w.mu, and a goroutine blocked on a Mutex is NOT durably-blocked under
+// testing/synctest, so the fake clock freezes and the bootstrap-live consumer
+// can never deliver the awaited cursors. Run does the same batch-generate-then-
+// WaitContiguousFrom pacing off the writer lock: backpressure (which masks the
+// fanout boundary race — see R3) is preserved, but nothing blocks under the
+// lock. AfterRepoComplete is reduced to a non-blocking signal/counter.
 type bootstrapTrafficGenerator struct {
-	mu         sync.Mutex
-	accounts   int
-	target     int
-	completed  int
-	generated  int
-	generate   func(context.Context) (int64, error)
-	afterBatch func(context.Context, int64) error
+	accounts int
+	target   int
+	generate func(context.Context) (int64, error)
+	ack      *seqAck
+	timeout  time.Duration
+
+	startOnce sync.Once
+	started   chan struct{}
+	delivered chan struct{} // closed by Run once all target events are delivered
+
+	mu        sync.Mutex
+	completed int
+	generated int
 }
 
-func newBootstrapTrafficGenerator(accounts, target int, generate func(context.Context) (int64, error)) *bootstrapTrafficGenerator {
+func newBootstrapTrafficGenerator(accounts, target int, ack *seqAck, timeout time.Duration, generate func(context.Context) (int64, error)) *bootstrapTrafficGenerator {
 	return &bootstrapTrafficGenerator{
-		accounts: accounts,
-		target:   target,
-		generate: generate,
+		accounts:  accounts,
+		target:    target,
+		generate:  generate,
+		ack:       ack,
+		timeout:   timeout,
+		started:   make(chan struct{}),
+		delivered: make(chan struct{}),
 	}
 }
 
-func (g *bootstrapTrafficGenerator) AfterRepoComplete(ctx context.Context, _ atmos.DID) error {
+// WaitDelivered blocks until Run has generated and durably delivered every
+// bootstrap event (or ctx is cancelled). Wired to the orchestrator's
+// BarrierBeforeCutover so the cutover does not cancel the bootstrap-live
+// consumer until all injected bootstrap traffic has been archived — the
+// delivery guarantee the old in-callback wait provided implicitly.
+func (g *bootstrapTrafficGenerator) WaitDelivered(ctx context.Context) error {
+	if g == nil || g.target <= 0 {
+		return nil
+	}
+	select {
+	case <-g.delivered:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Run generates the bootstrap live traffic on its own goroutine, blocking only
+// on bubble channels (the start signal, the world generators, and the off-lock
+// WaitContiguousFrom). It waits for the first AfterRepoComplete (so backfill is
+// underway and the bootstrap-live consumer is subscribed) before starting, then
+// emits the target events in small batches, waiting after each batch until every
+// cursor up to the last generated seq has been durably delivered. That wait is
+// the backpressure that keeps the consumer abreast of generation (masking the
+// fanout boundary race) and, because Run finishes well before backfill drains,
+// it also ensures all bootstrap events reach the bootstrap-live consumer before
+// the cutover cancels it. Returns nil on clean ctx cancellation.
+func (g *bootstrapTrafficGenerator) Run(ctx context.Context) error {
 	if g == nil || g.target <= 0 {
 		return nil
 	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	g.completed++
-	remainingEvents := g.target - g.generated
-	if remainingEvents <= 0 {
+	select {
+	case <-g.started:
+	case <-ctx.Done():
 		return nil
 	}
 
-	remainingAccounts := max(1, g.accounts-g.completed+1)
-	n := (remainingEvents + remainingAccounts - 1) / remainingAccounts
-	var lastSeq int64
-	for range n {
-		seq, err := g.generate(ctx)
-		if err != nil {
-			return err
+	// Mirror the old per-completion cadence (~ceil(target/accounts) events
+	// between waits) so the consumer is paced the same way it was under the
+	// in-callback wait, just off the writer lock.
+	batch := max(1, (g.target+g.accounts-1)/g.accounts)
+	var generated int
+	for generated < g.target {
+		n := min(batch, g.target-generated)
+		var lastSeq int64
+		for range n {
+			seq, err := g.generate(ctx)
+			if err != nil {
+				return err
+			}
+			lastSeq = seq
+			generated++
+			g.mu.Lock()
+			g.generated = generated
+			g.mu.Unlock()
 		}
-		lastSeq = seq
-		g.generated++
+		if lastSeq > 0 {
+			if err := g.ack.WaitContiguousFrom(ctx, 1, lastSeq, g.timeout); err != nil {
+				return err
+			}
+		}
 	}
-	if g.afterBatch != nil && lastSeq > 0 {
-		return g.afterBatch(ctx, lastSeq)
+	// Every target event is generated and (per the final WaitContiguousFrom)
+	// durably delivered. Release the pre-cutover barrier.
+	close(g.delivered)
+	return nil
+}
+
+// AfterRepoComplete is the backfill afterDone hook. It runs UNDER the ingest
+// writer lock, so it must NOT block: it only kicks the generator goroutine on
+// the first call and bumps the completed counter for the trace.
+func (g *bootstrapTrafficGenerator) AfterRepoComplete(_ context.Context, _ atmos.DID) error {
+	if g == nil || g.target <= 0 {
+		return nil
 	}
+	g.startOnce.Do(func() { close(g.started) })
+	g.mu.Lock()
+	g.completed++
+	g.mu.Unlock()
 	return nil
 }
 

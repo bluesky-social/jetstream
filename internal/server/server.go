@@ -43,6 +43,13 @@ type Config struct {
 	// /status on the public listener. cmd/jetstream constructs this via
 	// the web package; tests can pass any http.Handler.
 	StatusHandler http.Handler
+
+	// PublicListener and DebugListener, when non-nil, are served instead of
+	// binding a TCP socket for PublicAddr/DebugAddr. Production leaves them
+	// nil (bind TCP); the in-process oracle harness passes pipe-backed
+	// listeners so the server runs with no socket inside a synctest bubble.
+	PublicListener net.Listener
+	DebugListener  net.Listener
 }
 
 type publicRoute struct {
@@ -161,17 +168,29 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// A zero-value ListenConfig matches the behavior of the package-level
 	// net.Listen but lets the bind respect ctx (e.g. cancelled while a
-	// reverse-resolved DNS lookup is in flight).
+	// reverse-resolved DNS lookup is in flight). Injected listeners
+	// (PublicListener/DebugListener) bypass the bind for the in-process
+	// harness; PublicAddr/DebugAddr below read ln.Addr() either way.
 	var lc net.ListenConfig
-	publicLn, err := lc.Listen(ctx, "tcp", s.cfg.PublicAddr)
-	if err != nil {
-		return fmt.Errorf("bind public listener %q: %w", s.cfg.PublicAddr, err)
+	publicLn := s.cfg.PublicListener
+	if publicLn == nil {
+		var err error
+		publicLn, err = lc.Listen(ctx, "tcp", s.cfg.PublicAddr)
+		if err != nil {
+			return fmt.Errorf("bind public listener %q: %w", s.cfg.PublicAddr, err)
+		}
 	}
 
-	debugLn, err := lc.Listen(ctx, "tcp", s.cfg.DebugAddr)
-	if err != nil {
-		_ = publicLn.Close()
-		return fmt.Errorf("bind debug listener %q: %w", s.cfg.DebugAddr, err)
+	debugLn := s.cfg.DebugListener
+	if debugLn == nil {
+		var err error
+		debugLn, err = lc.Listen(ctx, "tcp", s.cfg.DebugAddr)
+		if err != nil {
+			if s.cfg.PublicListener == nil {
+				_ = publicLn.Close()
+			}
+			return fmt.Errorf("bind debug listener %q: %w", s.cfg.DebugAddr, err)
+		}
 	}
 
 	// Publish the bound addresses so callers (tests, log lines, /readyz

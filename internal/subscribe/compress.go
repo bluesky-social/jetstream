@@ -49,3 +49,14 @@ func mustNewZstdEncoder() *zstd.Encoder {
 func compressFrame(src []byte) []byte {
 	return zstdEncoder.EncodeAll(src, nil)
 }
+
+// WarmEncoder forces the package-global v1 zstd encoder to create its internal
+// worker-pool channel now, outside any testing/synctest bubble. See
+// segment.WarmEncoder for the full rationale: klauspost/compress builds that
+// channel lazily on the first EncodeAll, so the first in-bubble compressFrame
+// would otherwise bind the global channel to the bubble and a later
+// out-of-bubble EncodeAll would fatal "receive on synctest channel from
+// outside bubble". Test-support only; cheap and idempotent.
+func WarmEncoder() {
+	_ = compressFrame(nil)
+}

@@ -212,21 +212,35 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: derive relay HTTP URL: %w", err))
 	}
 
+	// transportOpt, when an in-process transport is injected, routes every
+	// jttp client through it instead of a real socket (deterministic harness).
+	var transportOpt []jttp.Option
+	if opts.HTTPTransport != nil {
+		transportOpt = []jttp.Option{jttp.WithTransport(opts.HTTPTransport)}
+	}
+
 	backfillMetrics := backfill.NewMetrics(metrics.Registry)
 	xrpcClient := &xrpc.Client{
 		Host:       relayHTTPURL,
-		HTTPClient: gt.Some(jttp.New(xrpc.BulkDownloadOpts()...)),
+		HTTPClient: gt.Some(jttp.New(append(xrpc.BulkDownloadOpts(), transportOpt...)...)),
 	}
 
 	resolver := &identity.DefaultResolver{}
 	if opts.PLCURL != "" {
 		resolver.PLCURL = gt.Some(opts.PLCURL)
+	}
+	if opts.PLCURL != "" || opts.HTTPTransport != nil {
 		// atmos's default resolver client enables jttp.WithStrictSSRFProtection,
 		// which refuses loopback even on the initial request. When the
 		// operator points us at a local PLC (e.g. the dev simulator at
 		// http://localhost:7777), use a non-strict client so the dial
-		// succeeds.
-		resolver.HTTPClient = gt.Some(jttp.New(xrpc.ATProtoOpts(10 * time.Second)...))
+		// succeeds. We also install this client whenever an in-process
+		// HTTPTransport is injected (even with the default PLC URL): the
+		// transport is the RoundTripper for every outbound client per
+		// Options.HTTPTransport, so identity/PLC resolution must route
+		// through it too -- otherwise a "socket-free" runtime silently
+		// dials the real network for resolution.
+		resolver.HTTPClient = gt.Some(jttp.New(append(xrpc.ATProtoOpts(10*time.Second), transportOpt...)...))
 	}
 	directory := &identity.Directory{
 		Resolver:               resolver,
@@ -359,6 +373,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		FailedRepoRetryHostWorkers: opts.FailedRepoRetryHostWorkers,
 		FailedRepoRetryMaxDelay:    opts.FailedRepoRetryMaxDelay,
 		LiveReconnectBackoff:       opts.LiveReconnectBackoff,
+		LiveDial:                   opts.LiveDial,
 		IngestOnAfterSeal:          mft.OnSegmentSealed,
 		OnSegmentCompacted:         onSegmentCompacted,
 		SegmentManifestChecksums:   mft.SegmentChecksums,
@@ -367,6 +382,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CompactionRewriteWorkers:   opts.CompactionRewriteWorkers,
 		OnCompactionPass:           onCompactionPass,
 		OnBeforeCompactionPass:     opts.OnBeforeCompactionPass,
+		BarrierBeforeCutover:       phaseBarrier(opts.BarrierBeforeCutover),
 		BarrierAfterBootstrap:      phaseBarrier(opts.BarrierAfterBootstrap),
 		BarrierAfterMerge:          phaseBarrier(opts.BarrierAfterMerge),
 		AfterRepoComplete:          opts.AfterRepoComplete,
@@ -385,6 +401,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		DebugAddr:       opts.DebugAddr,
 		ShutdownTimeout: opts.ShutdownTimeout,
 		StatusHandler:   statusHandler,
+		PublicListener:  opts.PublicListener,
+		DebugListener:   opts.DebugListener,
 	}, processLogger, metrics)
 
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
@@ -478,9 +496,11 @@ func (r *Runtime) Run(ctx context.Context) error {
 		return nil
 	})
 
-	g.Go(func() error {
-		return r.server.Run(gctx)
-	})
+	if !r.opts.Headless {
+		g.Go(func() error {
+			return r.server.Run(gctx)
+		})
+	}
 
 	g.Go(func() error {
 		return r.orchestrator.Run(gctx)

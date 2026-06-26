@@ -146,6 +146,11 @@ type Config struct {
 	// integration harnesses that inject disconnects without paying
 	// production-scale sleeps.
 	ReconnectBackoff *streaming.BackoffPolicy
+
+	// Dial overrides atmos's websocket dial. Nil uses the real socket.
+	// Intended for deterministic harnesses that feed the firehose over an
+	// in-memory connection.
+	Dial streaming.DialFunc
 }
 
 func (c *Config) validate() error {

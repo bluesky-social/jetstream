@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"strconv"
 	"time"
@@ -78,6 +79,7 @@ type liveConfig struct {
 	dedupFloor gt.Option[uint64]
 	readLimit  int64
 	dial       dialFunc
+	httpClient *http.Client // optional; routes the live websocket upgrade through a custom transport
 	logger     *slog.Logger
 	// backoffMin/backoffMax override the reconnect backoff bounds. Zero uses
 	// the package defaults. Tests set tiny values to avoid real-time waits.
@@ -123,7 +125,10 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 		cfg.readLimit = defaultLiveReadLimit
 	}
 	if cfg.dial == nil {
-		cfg.dial = dialWebsocket
+		hc := cfg.httpClient
+		cfg.dial = func(ctx context.Context, rawURL string) (wsConn, error) {
+			return dialWebsocket(ctx, rawURL, hc)
+		}
 	}
 	if cfg.logger == nil {
 		cfg.logger = slog.New(slog.NewTextHandler(discardWriter{}, nil))
@@ -277,15 +282,18 @@ func (c *liveConsumer) subscribeURL() string {
 // auto-negotiates deflate when the client advertises it, which cuts bandwidth
 // substantially on this repetitive JSON firehose. A server that does not
 // negotiate it falls back to an uncompressed stream transparently.
-func liveDialOptions() *websocket.DialOptions {
+func liveDialOptions(hc *http.Client) *websocket.DialOptions {
 	return &websocket.DialOptions{
 		CompressionMode: websocket.CompressionContextTakeover,
+		HTTPClient:      hc, // nil is fine: websocket.Dial falls back to its default
 	}
 }
 
-// dialWebsocket is the production dialer.
-func dialWebsocket(ctx context.Context, rawURL string) (wsConn, error) {
-	conn, resp, err := websocket.Dial(ctx, rawURL, liveDialOptions())
+// dialWebsocket is the production dialer. hc, when non-nil, routes the HTTP/1.1
+// upgrade through a custom transport (e.g. an in-process pipe); nil uses the
+// websocket default.
+func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn, error) {
+	conn, resp, err := websocket.Dial(ctx, rawURL, liveDialOptions(hc))
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}

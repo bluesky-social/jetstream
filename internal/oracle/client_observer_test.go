@@ -2,6 +2,7 @@ package oracle
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -73,17 +74,22 @@ type clientBackfillResult struct {
 // stop condition. Recoverable client errors are COUNTED (not silently
 // swallowed) so the caller can assert them against the run's fault budget; a
 // client-path error is never expected on a no-fault run.
-func collectClientBackfill(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, baseURL string, targetSeq uint64, converged func(events []ObservedEvent) bool) clientBackfillResult {
+func collectClientBackfill(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, obsClient *http.Client, baseURL string, targetSeq uint64, converged func(events []ObservedEvent) bool) clientBackfillResult {
 	t.Helper()
 
 	recordTraceOrError(t, trace, "client_backfill_start", map[string]any{"target_seq": targetSeq})
 
 	client, err := jetstream.Subscribe(baseURL,
+		jetstream.WithHTTPClient(obsClient),
 		jetstream.WithAfterSeq(0), // full archive from the start, then cut over to live
 		jetstream.WithBatchSize(64),
 	)
 	require.NoErrorf(t, err, "client backfill subscribe: mode=%s seed=%d", cfg.Mode, cfg.Seed)
-	t.Cleanup(func() { _ = client.Close() })
+	// Close inside the helper (not t.Cleanup): under testing/synctest the bubble
+	// fn must return with no live goroutines, but t.Cleanup runs AFTER it
+	// returns. The drain below completes before we close, so this is also
+	// correct on the real-socket path.
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), oracleWaitTimeout(cfg))
 	defer cancel()
@@ -182,7 +188,7 @@ func clientEventsAtOrBelow(events []ObservedEvent, watermark uint64) []ObservedE
 //     recoverable download/live errors. On a no-fault run zero are tolerated;
 //     the swarm faults target the upstream relay->jetstream path, not the
 //     client->jetstream path, so the client should see none even under swarm.
-func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, dataDir string, w *world.World, compaction *compactionPassRecorder, baseURL string, watermark uint64, phase string) {
+func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, trace *Trace, obsClient *http.Client, dataDir string, w *world.World, compaction *compactionPassRecorder, baseURL string, watermark uint64, phase string) {
 	t.Helper()
 
 	ground, err := GroundTruthFromWorld(w)
@@ -196,7 +202,7 @@ func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, tr
 		return Compare(ground, got) == nil
 	}
 
-	res := collectClientBackfill(t, cfg, run, trace, baseURL, watermark, converged)
+	res := collectClientBackfill(t, cfg, run, trace, obsClient, baseURL, watermark, converged)
 
 	// 1. Final-state comparison. If the drain converged this passes; if it
 	// timed out (a genuinely dropped/stale/extra record) this surfaces the
@@ -239,10 +245,11 @@ func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, tr
 // strongref the simulator generated, and — the correctness crux — that the SET
 // of (DID,rkey) likes the typed path surfaces equals what the map path observes
 // from the same server. Run as a bounded backfill-only dump so it terminates.
-func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, baseURL string, beforeSeq uint64) {
+func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, obsClient *http.Client, baseURL string, beforeSeq uint64) {
 	t.Helper()
 
 	client, err := jetstream.Subscribe(baseURL,
+		jetstream.WithHTTPClient(obsClient),
 		jetstream.WithCollections([]string{"app.bsky.feed.like"}),
 		jetstream.WithAfterSeq(0),
 		jetstream.WithBeforeSeq(beforeSeq),
@@ -250,7 +257,7 @@ func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, baseURL 
 		jetstream.WithRawRecords(),
 	)
 	require.NoErrorf(t, err, "typed subscribe: mode=%s seed=%d", cfg.Mode, cfg.Seed)
-	t.Cleanup(func() { _ = client.Close() })
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), oracleWaitTimeout(cfg))
 	defer cancel()
@@ -287,13 +294,14 @@ func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, baseURL 
 	// surviving like creates must match exactly, proving the worker-parallel
 	// typed decode neither drops, duplicates, nor mis-decodes vs. the default.
 	mapClient, err := jetstream.Subscribe(baseURL,
+		jetstream.WithHTTPClient(obsClient),
 		jetstream.WithCollections([]string{"app.bsky.feed.like"}),
 		jetstream.WithAfterSeq(0),
 		jetstream.WithBeforeSeq(beforeSeq),
 		jetstream.WithBackfillOnly(),
 	)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = mapClient.Close() })
+	defer func() { _ = mapClient.Close() }()
 	mapLikes := map[string]string{}
 	for batch, err := range mapClient.Events(ctx) {
 		require.NoError(t, err)
