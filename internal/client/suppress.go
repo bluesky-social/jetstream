@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 
@@ -104,12 +105,8 @@ func (s *Suppressor) Merge(other tombstone.Snapshot) {
 		Records: make(map[tombstone.RecordKey]uint64, len(cur.Records)+len(other.Records)),
 		DIDs:    make(map[string]tombstone.DIDTombstone, len(cur.DIDs)+len(other.DIDs)),
 	}
-	for k, v := range cur.Records {
-		next.Records[k] = v
-	}
-	for k, v := range cur.DIDs {
-		next.DIDs[k] = v
-	}
+	maps.Copy(next.Records, cur.Records)
+	maps.Copy(next.DIDs, cur.DIDs)
 	next.Merge(other) // keeps the max seq per key
 	s.live.Store(&next)
 }

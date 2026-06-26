@@ -206,10 +206,7 @@ func selectedRateLimitDelay(err error, baseDelay time.Duration, rlAttempt int, j
 			return wait
 		}
 	}
-	delay := selectedBackoffDelay(baseDelay, selectedRetryRateLimitCeiling, rlAttempt-1, jitter)
-	if delay < baseDelay {
-		delay = baseDelay
-	}
+	delay := max(selectedBackoffDelay(baseDelay, selectedRetryRateLimitCeiling, rlAttempt-1, jitter), baseDelay)
 	return delay
 }
 

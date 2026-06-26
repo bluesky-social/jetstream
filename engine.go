@@ -137,10 +137,7 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	// goroutine at any time and in disjoint phases (backfill fully precedes the
 	// live cutover — Download returns before flipAndDrain), so the shared `stopped`
 	// flag is never touched concurrently. Transform never touches it.
-	size := e.batchSize
-	if size < 1 {
-		size = 1
-	}
+	size := max(e.batchSize, 1)
 	bf := iclient.BackfillSink{
 		Transform: func(_ int, evs []iclient.Event) any {
 			if len(evs) == 0 {

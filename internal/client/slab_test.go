@@ -127,7 +127,7 @@ func TestDecodeFrameSlabAllocations(t *testing.T) {
 		path := dir + "/seg.jss"
 		w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: n + 1})
 		require.NoError(t, err)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			_, err := w.Append(segment.Event{
 				Seq: uint64(i + 1), IndexedAt: int64(i + 1), Kind: segment.KindDelete,
 				DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r" + strconv.Itoa(i), Rev: "rev",

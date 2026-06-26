@@ -153,9 +153,7 @@ func TestSuppressorConcurrentReadWrite(t *testing.T) {
 	// Readers hammer ShouldDrop on both the base key and the keys being merged.
 	stop := make(chan struct{})
 	for range readers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			baseCreate := &segment.Event{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:base", Collection: "c", Rkey: "r"}
 			for {
 				select {
@@ -167,7 +165,7 @@ func TestSuppressorConcurrentReadWrite(t *testing.T) {
 				drop, _ := s.ShouldDrop(baseCreate)
 				require.True(t, drop, "base tombstone must remain visible across concurrent merges")
 			}
-		}()
+		})
 	}
 
 	// One writer merges a stream of distinct live tombstones (copy-on-write).
