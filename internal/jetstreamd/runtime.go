@@ -228,11 +228,18 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	resolver := &identity.DefaultResolver{}
 	if opts.PLCURL != "" {
 		resolver.PLCURL = gt.Some(opts.PLCURL)
+	}
+	if opts.PLCURL != "" || opts.HTTPTransport != nil {
 		// atmos's default resolver client enables jttp.WithStrictSSRFProtection,
 		// which refuses loopback even on the initial request. When the
 		// operator points us at a local PLC (e.g. the dev simulator at
 		// http://localhost:7777), use a non-strict client so the dial
-		// succeeds.
+		// succeeds. We also install this client whenever an in-process
+		// HTTPTransport is injected (even with the default PLC URL): the
+		// transport is the RoundTripper for every outbound client per
+		// Options.HTTPTransport, so identity/PLC resolution must route
+		// through it too -- otherwise a "socket-free" runtime silently
+		// dials the real network for resolution.
 		resolver.HTTPClient = gt.Some(jttp.New(append(xrpc.ATProtoOpts(10*time.Second), transportOpt...)...))
 	}
 	directory := &identity.Directory{
