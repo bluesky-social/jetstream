@@ -1,13 +1,14 @@
 mutant: m025_compaction_overdrop_above_watermark
 target: internal/ingest/orchestrator/compact_deletes.go
 failure-mode: |
-  The steady-state compaction pass collects its tombstone snapshot with an
-  UNBOUNDED high seq (SnapshotRange(current, ^uint64(0))) instead of bounding
-  it at the pass's targetWatermark. A delete that arrived AFTER the active
-  segment was force-rotated (seq > targetWatermark, living in the new active
-  segment) therefore leaks into the snapshot and suppresses its own create —
-  a create at/below the watermark that the pass should have KEPT (its only
-  superseding tombstone is above the watermark, so the create is still a
+  The steady-state compaction pass builds its tombstone snapshot from the live
+  in-memory tombstone set with an UNBOUNDED high seq
+  (SnapshotRange(current, ^uint64(0))) instead of folding sealed rows in the
+  pass's bounded (current, targetWatermark] window. A delete that arrived AFTER
+  the active segment was force-rotated (seq > targetWatermark, living in the
+  new active segment) therefore leaks into the snapshot and suppresses its own
+  create — a create at/below the watermark that the pass should have KEPT (its
+  only superseding tombstone is above the watermark, so the create is still a
   legitimate survivor of this pass). A convergence-hiding compaction over-drop:
   one or more survivors per pass can be wrongly removed (the observed failing
   pass reported dropped=1).
@@ -40,6 +41,9 @@ tiers: stress
 diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
 --- a/internal/ingest/orchestrator/compact_deletes.go
 +++ b/internal/ingest/orchestrator/compact_deletes.go
-@@ -136 +136 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
--				snap = o.cfg.Tombstones.SnapshotRange(current, targetWatermark)
-+				snap = o.cfg.Tombstones.SnapshotRange(current, ^uint64(0))
+@@ -154 +154,4 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
+-			snap, chunkEnd, err := o.collectCompactionTombstones(ctx, sealed, current, targetWatermark)
++			snap, chunkEnd, err := o.collectCompactionTombstones(ctx, sealed, current, targetWatermark)
++			if mode == compactionSteady {
++				snap, chunkEnd, err = o.cfg.Tombstones.SnapshotRange(current, ^uint64(0)), targetWatermark, error(nil)
++			}

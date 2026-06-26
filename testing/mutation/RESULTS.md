@@ -6,15 +6,15 @@ oracle's detection power is visible over time. See
 method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 25 active mutants on disk
-(m001–m027; m007 and m010 retired). Latest full campaign: 2026-06-21,
-recorded in `testing/mutation/baseline.json` (commit field `007abab`) —
-18 killed, 7 survived over m001–m027 (the authoritative current scorecard;
-see the dated section at the end of this file). This is the run that seeded
-`testing/mutation/baseline.json` and is now the enforced gate baseline (#108).
-The dated section below was written against commit `df3fc4b`, which a later
-rebase orphaned; `baseline.json`'s commit field is the machine source of truth.
-Counts inside older dated sections describe the catalog *as of that date* and
-are intentionally not back-edited.**
+(m001–m027; m007 and m010 retired). Latest full gate verification: 2026-06-25
+at `b6d3f09` (`just mutation-gate`) matched `testing/mutation/baseline.json`
+exactly — 18 killed, 7 survived over m001–m027. The enforced baseline remains
+`testing/mutation/baseline.json` (commit field `007abab`), seeded by the
+2026-06-21 full campaign and enforced by #108. The dated 2026-06-21 section
+was written against commit `df3fc4b`, which a later rebase orphaned;
+`baseline.json`'s commit field is the machine source of truth. Counts inside
+older dated sections describe the catalog *as of that date* and are
+intentionally not back-edited.**
 
 ## The baseline gate (#108)
 
@@ -64,6 +64,43 @@ remain below so the reasoning is not lost.
 |---|---|---|
 | m007_compaction_chunk_boundary | 2026-06-15 | Invalid/dead under current compaction chunk construction; the modeled corrupt shape cannot be produced by current chunk snapshots. |
 | m010_nextblockoffset_reset | 2026-06-15 | Stale/dead for sealed oracle observations; `Writer.Seal` rebuilds footer block metadata from physical frames. |
+
+## Campaign 2026-06-25 (m025 stale refresh; gate pass)
+
+- commit under test: `b6d3f09`
+- issue: #159
+- driver:
+  - targeted reproduction before refresh: `just mutation-campaign m025`
+  - targeted verification after refresh: `just mutation-campaign m025`
+  - full gate verification: `just mutation-gate`
+- catalog: 25 active mutants; baseline unchanged
+
+The scheduled mutation gate failed on 2026-06-26 UTC because
+`m025_compaction_overdrop_above_watermark` was `STALE`: its patch still targeted
+the old bounded `SnapshotRange(current, targetWatermark)` compaction snapshot
+line. Current compaction no longer uses that in-memory snapshot path; it folds
+sealed segment rows via `collectCompactionTombstones`, so the mutant had drifted
+after the oracle/compaction fixes.
+
+Refreshed m025 to reintroduce the same failure mode at the current mutation
+point: steady compaction still starts with the real sealed-row fold, then the
+mutant replaces the steady-mode snapshot with
+`Tombstones.SnapshotRange(current, ^uint64(0))`. This keeps merge-tail compaction
+on the real path, preserving m025's intended target: a steady-state
+convergence-hiding over-drop that only the pre/post compaction over-drop
+recorder should catch.
+
+Targeted verification after refresh:
+
+| mutant | result | note |
+|---|---|---|
+| m025_compaction_overdrop_above_watermark | KILLED@stress | `steady-state-shutdown-flush`: `compaction over-drop at watermark=30558 (pre=28782 post=28780 survivors=28781 dropped=1)`; missing expected `app.bsky.feed.repost/22bab3wsv...` create at seq 29284 |
+
+Full gate verification passed:
+
+```text
+gate: PASS — 25 mutants match baseline (commit b6d3f09000c578400264db8b3c0b56b553427c7e)
+```
 
 ## Active catalog check 2026-06-15 — retired mutants removed
 
