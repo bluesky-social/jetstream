@@ -850,3 +850,29 @@ reverting each patch before wiring the gate.
 |---|---|---|
 | m006_merge_commit_error_swallowed | KILLED@storefault | store-fault tier: forced `merge/next_source_idx` commit failure must fail loud; multi-source test also catches the clean-commit early-return. Was SURVIVED (no store-fault tier). |
 | m028_compaction_watermark_save_error_swallowed | KILLED@storefault | store-fault tier: forced `compaction/seq` Set failure must fail loud; durable watermark must not advance. |
+
+**Remaining #30 fault points — fail-loud contract tests (no mutants).** The
+issue lists more high-risk write boundaries than the two with mutants. The
+`KeyPrefixFault` seam covers each; rather than mint a swallow-mutant per site,
+the fail-loud / no-silent-advance contract is pinned directly at each boundary
+(these are regression tests, not gated kills — a single store-fault seam bug is
+already caught by m006/m028):
+
+- **seq/next** — `TestWriter_DurableBatchFailsLoudOnStoreFault`
+  (internal/ingest): a forced `seq/next` durable-batch commit failure must
+  surface out of `Append`/flush; `seq/next` must not become durable.
+- **relay cursor** — `TestConsumer_SaveCursorFailsLoudOnStoreFault`
+  (internal/ingest/live): a forced `relay/cursor` commit failure must surface
+  out of `saveCursorAndSyncState`; the cursor must not advance.
+- **syncstate commits** — `TestStateStore_FlushFailsLoudOnStoreFault`
+  (internal/ingest/syncstate): a forced `sync/` commit failure must surface out
+  of `Flush`; promoted verifier state must not be durable.
+
+**manifest refresh after compaction — N/A (no pebble write).** The DoD names
+"manifest refresh/update after compaction" as a fault point, but the manifest
+reconcile (`manifest.OnSegmentCompacted` → `refreshSegment`) updates only the
+in-memory manifest and the on-disk segment headers; it performs NO
+`store.Store` (pebble) write. The store-fault seam therefore cannot target it,
+and faulting it would require a separate manifest/segment IO-fault seam — out
+of scope for this metadata-store tier. Recorded here so the gap is explicit
+rather than silently unaddressed.
