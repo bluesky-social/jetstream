@@ -55,12 +55,16 @@ RACE_FLAG=()
 default_timeout="5m"
 stress_timeout="30m"
 restart_timeout="10m"
+# The storefault tier runs the same subprocess-restart machinery as the restart
+# tier (two child runtimes), so it shares the restart timeout budget.
+storefault_timeout="10m"
 if [[ "$RACE" -eq 1 ]]; then
     RACE_FLAG=(-race)
     default_timeout="15m"
     stress_timeout="90m"
     restart_timeout="30m"
-    echo "mutation campaign: race detector ENABLED (timeouts default=$default_timeout stress=$stress_timeout restart=$restart_timeout)"
+    storefault_timeout="30m"
+    echo "mutation campaign: race detector ENABLED (timeouts default=$default_timeout stress=$stress_timeout restart=$restart_timeout storefault=$storefault_timeout)"
 fi
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -231,6 +235,23 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                 restart)
                     cmd=(go test "${RACE_FLAG[@]}" ./internal/oracle -run 'TestOracle_RestartCrashPointsDoNotLoseRecords$'
                          -count=1 -timeout "$restart_timeout") ;;
+                storefault)
+                    # Store-fault tier (#30): kills swallowed-persistence-error
+                    # mutants (m006 and kin) at two layers in one `go test`:
+                    #   - oracle level: TestOracle_RestartStoreFault* drives a
+                    #     real runtime through the merge with a metadata-store
+                    #     fault on the source-cursor commit and asserts fail-loud
+                    #     + recovery convergence;
+                    #   - orchestrator unit level: TestMerge_StoreFault*,
+                    #     TestMerge_MultiSourceDrainsAllSources, and
+                    #     TestCompaction_StoreFault* pin the same fail-loud /
+                    #     no-silent-advance contract fast and directly on
+                    #     runMerge / runDeleteCompaction.
+                    # Both packages run so a regression in either layer is a kill.
+                    cmd=(go test "${RACE_FLAG[@]}"
+                         ./internal/oracle ./internal/ingest/orchestrator
+                         -run 'TestOracle_RestartStoreFault|TestMerge_StoreFault|TestMerge_MultiSourceDrainsAllSources|TestCompaction_StoreFault'
+                         -count=1 -timeout "$storefault_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2
                     exit 1 ;;

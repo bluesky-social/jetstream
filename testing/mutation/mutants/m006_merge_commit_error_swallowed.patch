@@ -5,12 +5,15 @@ failure-mode: |
   failed commit is silently ignored and merge proceeds. Models the classic
   inverted err check that swallows a persistence failure.
 expected-detection: |
-  Hard to surface without injecting a store failure; under normal runs the
-  commit succeeds and the early-return-on-nil changes control flow. This is
-  a candidate ESCAPE that argues for a store-fault oracle tier. Predicted to
-  survive unless restart timing exposes a lost cursor.
-expected-tier: stress
-tiers: default,stress,restart
+  Requires forcing the source-cursor batch commit to fail: the store-fault
+  tier (#30) injects a deterministic fault on the merge/next_source_idx commit
+  and asserts the runtime fails LOUD (sentinel surfaced up through
+  Orchestrator.Run) rather than swallowing the error and advancing past
+  unarchived data. The inverted check also early-returns on a CLEAN commit, so
+  the orchestrator multi-source test (every source's survivors must reach dst)
+  catches it too. Both run in the storefault tier.
+expected-tier: storefault
+tiers: storefault
 
 diff --git a/internal/ingest/orchestrator/merge_runner.go b/internal/ingest/orchestrator/merge_runner.go
 index 6118c4c..82424fd 100644

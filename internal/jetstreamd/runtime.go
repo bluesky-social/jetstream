@@ -177,7 +177,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: create segments dir %s: %w", segmentsDir, err))
 	}
 
-	metaStore, err := store.Open(opts.DataDir, storeMetrics)
+	metaStore, err := store.Open(opts.DataDir, storeMetrics, store.WithFaultInjector(opts.StoreFaultInjector))
 	if err != nil {
 		return fail(err)
 	}

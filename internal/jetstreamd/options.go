@@ -11,6 +11,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
@@ -123,8 +124,15 @@ type Options struct {
 	OnBeforeCompactionPass    func(targetWatermark uint64)
 	AfterRepoComplete         func(context.Context, atmos.DID) error
 	CrashInjector             crashpoint.Injector
-	OnBootstrapLiveEvent      func(*segment.Event)
-	OnSteadyStateEvent        func(*segment.Event)
+	// StoreFaultInjector is a test-only deterministic metadata-store write
+	// fault seam (store.FaultInjector). nil in production, where it is never
+	// installed on the store, so the fault path is unreachable. Used by the
+	// oracle store-fault tier to fail selected persistence ops by name and
+	// ordinal and assert the system fails loud rather than swallowing the
+	// error. Mirrors CrashInjector's nil-in-prod contract.
+	StoreFaultInjector   store.FaultInjector
+	OnBootstrapLiveEvent func(*segment.Event)
+	OnSteadyStateEvent   func(*segment.Event)
 }
 
 func (o Options) effectiveBackfillWorkers() int {

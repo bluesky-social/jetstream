@@ -799,3 +799,80 @@ benign/equivalent; m006 #30; m009 #32; m013/m014 dead-path covered by
 m017/m018; m015 footer-index blind spot) — no true escapes. This run seeds
 `baseline.json`; subsequent scheduled runs are diffed against it and a
 KILLED→SURVIVED flip fails the job.
+
+## 2026-06-26 — store-fault tier; m006 killed, m028 added (#30)
+
+Closes the long-standing m006 gap by adding the store-fault injection tier
+the issue called for. Net scorecard change: **m006 SURVIVED→KILLED@storefault**
+and a new **m028 KILLED@storefault**; every other mutant keeps its prior
+disposition (gate: PASS, 26 mutants). `baseline.json` refreshed to bank both.
+
+**The seam.** `store.FaultInjector` is a nil-gated hook on
+`store.Store.Set/Delete/Commit`, installed via the new
+`store.Open(dir, metrics, opts...)` variadic option and threaded through
+`jetstreamd.Options.StoreFaultInjector`. Production never installs one (the
+Options field is nil, mirroring the nil-in-prod `CrashInjector`), so the fault
+path is unreachable off the test harness. `store.KeyPrefixFault` is the
+canonical injector: fail the Ordinal-th write op touching a key prefix,
+optionally scoped to one `WriteOp`; batch commits match against their staged
+keys via the public `BatchReader`.
+
+**The `storefault` campaign tier** runs the kill at two layers in one
+`go test`, so a regression in either fails CI:
+
+- *oracle level* — `TestOracle_RestartStoreFaultOnMergeCursor_FailsLoudThenRecovers`
+  drives a real `jetstreamd` through the merge with a fault on the
+  `merge/next_source_idx` batch commit, asserts the runtime fails LOUD (the
+  injected sentinel surfaces up through `Orchestrator.Run` — never swallowed),
+  then re-runs the merge fault-free and asserts convergence (the data the
+  faulted commit could not persist is not lost). Anti-vacuity: the first
+  child's after-merge barrier must NOT have fired (the fault really aborted the
+  merge).
+- *orchestrator unit level* — `TestMerge_StoreFaultOnCursorCommit_FailsLoudNoSilentAdvance`
+  pins the same contract directly on `runMerge` (fail loud, cursor not
+  advanced, backfill tree preserved); `TestMerge_MultiSourceDrainsAllSources`
+  catches m006's *other* inverted branch (the `err==nil` early-return drops
+  later sources — the pre-existing `TestMerge_MultiSourceContiguousCommit` only
+  checked post-cleanup state and missed this).
+
+**m028 (new, DoD "new swallowed-persistence-error mutants").** Inverts the
+error check on `saveCompactionWatermark` in `runDeleteCompaction` — a distinct
+high-risk fault point named in #30 and a different store op from m006 (a plain
+`Set` on `compaction/seq`, not a batch commit, so it exercises the seam's `Set`
+path). `TestCompaction_StoreFaultOnWatermarkSave_FailsLoudNoAdvance` forces the
+watermark `Set` to fail and asserts the pass fails loud and the durable
+watermark does not advance.
+
+Both kills were verified red-under-mutant / green-on-correct by applying and
+reverting each patch before wiring the gate.
+
+| mutant | result | note |
+|---|---|---|
+| m006_merge_commit_error_swallowed | KILLED@storefault | store-fault tier: forced `merge/next_source_idx` commit failure must fail loud; multi-source test also catches the clean-commit early-return. Was SURVIVED (no store-fault tier). |
+| m028_compaction_watermark_save_error_swallowed | KILLED@storefault | store-fault tier: forced `compaction/seq` Set failure must fail loud; durable watermark must not advance. |
+
+**Remaining #30 fault points — fail-loud contract tests (no mutants).** The
+issue lists more high-risk write boundaries than the two with mutants. The
+`KeyPrefixFault` seam covers each; rather than mint a swallow-mutant per site,
+the fail-loud / no-silent-advance contract is pinned directly at each boundary
+(these are regression tests, not gated kills — a single store-fault seam bug is
+already caught by m006/m028):
+
+- **seq/next** — `TestWriter_DurableBatchFailsLoudOnStoreFault`
+  (internal/ingest): a forced `seq/next` durable-batch commit failure must
+  surface out of `Append`/flush; `seq/next` must not become durable.
+- **relay cursor** — `TestConsumer_SaveCursorFailsLoudOnStoreFault`
+  (internal/ingest/live): a forced `relay/cursor` commit failure must surface
+  out of `saveCursorAndSyncState`; the cursor must not advance.
+- **syncstate commits** — `TestStateStore_FlushFailsLoudOnStoreFault`
+  (internal/ingest/syncstate): a forced `sync/` commit failure must surface out
+  of `Flush`; promoted verifier state must not be durable.
+
+**manifest refresh after compaction — N/A (no pebble write).** The DoD names
+"manifest refresh/update after compaction" as a fault point, but the manifest
+reconcile (`manifest.OnSegmentCompacted` → `refreshSegment`) updates only the
+in-memory manifest and the on-disk segment headers; it performs NO
+`store.Store` (pebble) write. The store-fault seam therefore cannot target it,
+and faulting it would require a separate manifest/segment IO-fault seam — out
+of scope for this metadata-store tier. Recorded here so the gap is explicit
+rather than silently unaddressed.
