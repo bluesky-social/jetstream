@@ -422,17 +422,33 @@ Two sub-checks, both over the post-restart durable segments:
   same coverage, simpler plumbing.) The served wire path stays covered by the
   steady-state + client-driven tiers.
 
-### 4.4 #100 convergence-hiding over-drop mutant (NEW, mutation catalog)
-Per the m024 patch note: the unique power (an over-drop hidden by final-state
-convergence) needs "a survivor dropped at/below W but independently superseded
-ABOVE W … where W need not cover everything." The crash-mid-compaction-pass
-restart provides exactly this: crash at `AfterCompactionRewriteBeforeWatermark`
-(`compact_deletes.go:165`) leaves a rewritten segment with the watermark NOT
-advanced, so on restart W does not cover the just-rewritten rows. With a durable
-record created ≤W but deleted >W, an over-drop of that record is invisible to
-final-state `Compare` (it's deleted in the end anyway) but caught by event-log
-coverage (the create row is missing). We add a crash case at that crashpoint and
-a mutation entry (or re-point m024's tier) — verify it KILLS.
+### 4.4 #100 convergence-hiding over-drop mutant — SUPERSEDED 2026-06-26
+**This subsection's premise was refuted during implementation.** The hypothesis
+below — that crash-mid-compaction-pass on the restart path yields a `create ≤W /
+delete >W` straddle — does not hold: merge-tail compaction runs at a quiescent
+point after the merge has sealed every segment, so `targetWatermark` spans the
+whole durable stream and every durable row is ≤W. Crashing at
+`AfterCompactionRewriteBeforeWatermark` leaves W un-advanced for that *chunk*, but
+the recovered re-merge recomputes a complete snapshot — there is no above-scope
+row to over-drop invisibly. This is now **enforced** by
+`TestOracle_RestartChainShapeB_NoStraddleAfterMergeTailCrash` (`maxDurableSeq ≤
+W`). The convergence-hiding over-drop proof lives in the **steady tier** (m025,
+KILLED@stress), where a delete *can* land in the fresh active segment above the
+force-rotate watermark. No restart-tier over-drop mutant is added. See
+`testing/mutation/RESULTS.md` 2026-06-20 reachability correction + 2026-06-26
+update.
+
+Original (refuted) hypothesis, kept for the audit trail:
+
+> Per the m024 patch note: the unique power (an over-drop hidden by final-state
+> convergence) needs "a survivor dropped at/below W but independently superseded
+> ABOVE W … where W need not cover everything." The crash-mid-compaction-pass
+> restart provides exactly this: crash at `AfterCompactionRewriteBeforeWatermark`
+> leaves a rewritten segment with the watermark NOT advanced, so on restart W
+> does not cover the just-rewritten rows. With a durable record created ≤W but
+> deleted >W, an over-drop of that record is invisible to final-state `Compare`
+> but caught by event-log coverage. We add a crash case at that crashpoint and a
+> mutation entry — verify it KILLS.
 
 ---
 
@@ -519,7 +535,7 @@ crashpoint):
 
 | ID | what | crashpoint | distinct seam |
 |----|------|-----------|----------------|
-| B-crash (#100) | shape B with create ≤W, delete >W, crash mid-compaction-rewrite | `AfterCompactionRewriteBeforeWatermark` (`compact_deletes.go:165`) | the deferred #100 convergence-hiding over-drop: a survivor dropped ≤W but superseded >W is invisible to final-state `Compare` but caught by coverage. Verify it KILLS the m024-class over-drop mutant. |
+| B-crash (#114) — RESOLVED 2026-06-26 | shape B crashed mid-compaction-rewrite | `AfterCompactionRewriteBeforeWatermark` (`compact_deletes.go:178`) | The convergence-hiding over-drop framing was **withdrawn as infeasible in merge-tail** (the `create ≤W / delete >W` straddle cannot form — the pass spans the whole sealed stream; see `testing/mutation/RESULTS.md` 2026-06-20 reachability correction). That infeasibility is now an **enforced test** (`TestOracle_RestartChainShapeB_NoStraddleAfterMergeTailCrash`: `maxDurableSeq ≤ W`). The convergence-hiding over-drop proof stays in the **steady tier** (m025, KILLED@stress). The real restart-tier value — durable intermediates surviving a crash — is delivered by `TestOracle_RestartChainCrashConsistency` (full `assertChainDurable` bundle over the recovered segments, red-first power check). No new restart-tier mutant. |
 
 DID-level shapes:
 

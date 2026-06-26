@@ -577,6 +577,42 @@ restart-tier B-crash variant contemplated by #113's plan was withdrawn as
 structurally infeasible. The exploratory restart-tier merge-segment plumbing
 added during that investigation was reverted to keep the harness lean.
 
+## Update 2026-06-26 (#114 — infeasibility now enforced; crash tier exercises durable intermediates)
+
+The 2026-06-20 "reachability correction" above was prose: it asserted the
+restart/merge-tail path cannot host the `(create ≤ W, delete > W)` straddle, but
+nothing enforced it. #114 (filed after that finding, re-challenging it) is
+resolved by turning the claim into a test and closing the genuine adjacent gap.
+
+- **No-straddle invariant, now enforced**
+  (`internal/oracle/restart_crash_chain_test.go`,
+  `TestOracle_RestartChainShapeB_NoStraddleAfterMergeTailCrash`): crashes shape B
+  at `AfterCompactionRewriteBeforeWatermark` — the exact crashpoint #114 named —
+  recovers, and asserts `maxDurableSeq(on-disk) ≤ W` with anti-vacuity (a real
+  merge-tail watermark committed, the shape-B delete tombstone durable ≤ W, the
+  backfilled create compacted away). Observed `W=26, maxDurableSeq=26`: every
+  durable row sits at or below the watermark, so no convergence-hiding straddle
+  exists on disk. If a future merge-tail refactor ever lets a durable row outrun
+  W, this goes red and the B-crash infeasibility finding must be revisited.
+  Verified red-first: tightening the bound to `W-1` fails with the real seqs.
+- **Crash tier now exercises durable intermediates**
+  (`TestOracle_RestartChainCrashConsistency`): the pre-existing crash tier
+  (`TestOracle_RestartCrashPointsDoNotLoseRecords`) wires a `nil` coordinator, so
+  it only ever landed surviving creates — no update/delete/tombstone was exposed
+  to a crash. The new test runs the full seed-derived chain through SIGKILL +
+  re-merge and asserts `assertChainDurable` (at-least-once coverage `≥`,
+  `CheckCompacted`, no-permanent-tombstone) over the recovered segments, with a
+  red-first power check (dropping the recovered shape-B delete tombstone breaks
+  coverage). This is the crash-consistency coverage #114 is really about, distinct
+  from the (infeasible-here) convergence-hiding over-drop.
+
+**Net for the mutation catalog:** unchanged. The #100 convergence-hiding
+over-drop proof remains m025 in the steady tier (KILLED@stress); no new
+restart-tier mutant is added, because the over-drop it would target cannot form
+in merge-tail (now enforced by the no-straddle test rather than asserted in
+prose). m024 (blanket over-drop, KILLED@default via final-state `Compare`) is
+also unaffected.
+
 ## Campaign 2026-06-20 (m005 re-homed to the restart tier — #110)
 
 The 2026-06-20 full campaign found m005_backfill_status_check_inverted had
