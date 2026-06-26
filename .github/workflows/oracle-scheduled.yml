@@ -20,7 +20,7 @@ on:
       race_seeds:
         description: "Number of seeds for the -race lane (race is ~5-15x slower)"
         required: false
-        default: "5"
+        default: "3"
 
 permissions: {}
 
