@@ -76,6 +76,51 @@ func TestCheckInvariantsRejectsSeqRegression(t *testing.T) {
 	require.ErrorContains(t, err, "seq")
 }
 
+// TestCheckInvariantsRejectsRevRegression locks in the per-DID
+// rev-monotonicity signal that the full CheckInvariants must keep: it is the
+// kill signal for m005 (backfill_status_check_inverted) and a backstop for
+// m018 (commit_rev_dropped). Splitting the structural checks out (for the
+// crash-replay tier) must not weaken this.
+func TestCheckInvariantsRejectsRevRegression(t *testing.T) {
+	t.Parallel()
+
+	events := []ObservedEvent{
+		{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1", Rev: "rev9"},
+		{Seq: 2, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2", Rev: "rev1"},
+	}
+	require.ErrorContains(t, CheckInvariants(events), "rev regression")
+}
+
+// TestCheckStructuralInvariantsToleratesReplayRevRegression proves the split's
+// contract: a recovered stream where a later seq carries an earlier rev (the
+// benign at-least-once merge replay surfaced by the crash-chain tier) passes
+// the structural check, while the full CheckInvariants still rejects it. The
+// structural check must STILL catch seq duplication / non-increase and empty
+// commit revs.
+func TestCheckStructuralInvariantsToleratesReplayRevRegression(t *testing.T) {
+	t.Parallel()
+
+	// Later seq carries an earlier rev (a replayed survivor): structural OK,
+	// full check rejects.
+	replay := []ObservedEvent{
+		{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1", Rev: "rev9"},
+		{Seq: 2, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2", Rev: "rev1"},
+	}
+	require.NoError(t, CheckStructuralInvariants(replay), "structural check must tolerate replay rev order")
+	require.ErrorContains(t, CheckInvariants(replay), "rev regression", "full check must still flag it")
+
+	// Structural check still catches non-increasing seq.
+	require.ErrorContains(t, CheckStructuralInvariants([]ObservedEvent{
+		{Seq: 2, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1", Rev: "rev1"},
+		{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2", Rev: "rev2"},
+	}), "seq")
+
+	// Structural check still catches an empty rev on a commit kind.
+	require.ErrorContains(t, CheckStructuralInvariants([]ObservedEvent{
+		{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+	}), "empty rev")
+}
+
 func TestCheckInvariantsRejectsEmptyRevOnCommitKind(t *testing.T) {
 	t.Parallel()
 

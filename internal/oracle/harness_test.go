@@ -737,12 +737,35 @@ func bisectServedCompactedFailure(
 
 func assertOracleMatches(t *testing.T, dataDir string, w *world.World, cfg Config, phase string) {
 	t.Helper()
+	assertOracleMatchesImpl(t, dataDir, w, cfg, phase, false)
+}
+
+// assertOracleMatchesAfterReplay is the crash-recovery variant: it asserts the
+// same final-state correctness (Compare) but checks only the structural
+// invariants that survive an idempotent at-least-once replay (unique/increasing
+// seq, commit-has-rev), NOT per-DID rev-monotonicity-by-seq. A crash recovered
+// at a merge replay boundary legitimately re-emits already-merged survivors at
+// fresh higher seqs carrying their original lower revs; that is not corruption
+// (Compare still converges), so the strict monotonic check must not run here.
+// Per-record rev correctness and at-least-once coverage are owned by the
+// event-log / chain-coverage tiers.
+func assertOracleMatchesAfterReplay(t *testing.T, dataDir string, w *world.World, cfg Config, phase string) {
+	t.Helper()
+	assertOracleMatchesImpl(t, dataDir, w, cfg, phase, true)
+}
+
+func assertOracleMatchesImpl(t *testing.T, dataDir string, w *world.World, cfg Config, phase string, afterReplay bool) {
+	t.Helper()
 
 	want, err := GroundTruthFromWorld(w)
 	require.NoErrorf(t, err, "%s mode=%s seed=%d: build ground truth", phase, cfg.Mode, cfg.Seed)
 	events, err := ObserveSegments(dataDir)
 	require.NoErrorf(t, err, "%s mode=%s seed=%d: observe segments", phase, cfg.Mode, cfg.Seed)
-	require.NoErrorf(t, CheckInvariants(events), "%s mode=%s seed=%d: check invariants", phase, cfg.Mode, cfg.Seed)
+	if afterReplay {
+		require.NoErrorf(t, CheckStructuralInvariants(events), "%s mode=%s seed=%d: check structural invariants", phase, cfg.Mode, cfg.Seed)
+	} else {
+		require.NoErrorf(t, CheckInvariants(events), "%s mode=%s seed=%d: check invariants", phase, cfg.Mode, cfg.Seed)
+	}
 	got, err := Reconstruct(EventsSortedBySeq(events))
 	require.NoErrorf(t, err, "%s mode=%s seed=%d: reconstruct observed events", phase, cfg.Mode, cfg.Seed)
 	require.NoErrorf(t, Compare(want, got), "%s mode=%s seed=%d: compare oracle model", phase, cfg.Mode, cfg.Seed)

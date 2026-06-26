@@ -142,8 +142,9 @@ func maxDurableSeq(events []ObservedEvent) uint64 {
 func TestOracle_RestartChainShapeB_NoStraddleAfterMergeTailCrash(t *testing.T) {
 	run := runChainThroughCrash(t, "shape-b-nostraddle", 0, crashpoint.AfterCompactionRewriteBeforeWatermark)
 
-	// Final state still converges after the crash.
-	assertOracleMatches(t, run.dataDir, run.w, run.cfg, "shape-b-nostraddle")
+	// Final state still converges after the crash (replay-aware: a recovered
+	// merge boundary may re-emit survivors out of per-DID rev order).
+	assertOracleMatchesAfterReplay(t, run.dataDir, run.w, run.cfg, "shape-b-nostraddle")
 
 	// cov.events carries the real on-disk jetstream seqs (cov.got/.want are
 	// seq-zeroed for key-based coverage comparison, so seq checks MUST read
@@ -197,6 +198,13 @@ func TestOracle_RestartChainShapeB_NoStraddleAfterMergeTailCrash(t *testing.T) {
 // full assertChainDurable bundle (at-least-once coverage, compaction
 // contract, no-permanent-tombstone) over the recovered segments.
 //
+// It crashes the chain at EVERY enumerated crashpoint (#113 "cover all crash
+// points"), so a durable update/delete/tombstone is exposed to a crash at each
+// merge/backfill/compaction seam, not just one. The crashpoint only affects
+// the FIRST child; the second child always re-runs the merge idempotently to a
+// clean after-merge exit, and the chain ops live in the parent-owned world, so
+// recovery converges regardless of where the first child died.
+//
 // Crash timing is wall-clock nondeterministic; the assertions are
 // seq-agnostic and the coverage comparator is at-least-once (>=), which
 // tolerates the benign re-merge duplicate a crash between dst-flush and
@@ -204,20 +212,43 @@ func TestOracle_RestartChainShapeB_NoStraddleAfterMergeTailCrash(t *testing.T) {
 //
 // nolint:paralleltest
 func TestOracle_RestartChainCrashConsistency(t *testing.T) {
-	run := runChainThroughCrash(t, "crash-consistency", 0, crashpoint.AfterCompactionRewriteBeforeWatermark)
+	// Every crashpoint the restart child can be killed at, spanning the
+	// backfill-complete, merge (flush/seal/discovery), bootstrap-live close,
+	// and mid-compaction-rewrite seams. Mirrors the crashpoint set the nil-
+	// coordinator tier (TestOracle_RestartCrashPointsDoNotLoseRecords) uses,
+	// plus the compaction-rewrite seam, now with the chain wired in.
+	crashPoints := []crashpoint.Point{
+		crashpoint.AfterRepoComplete,
+		crashpoint.AfterMergeDstFlushBeforeSourceCommit,
+		crashpoint.AfterMergeDstSealBeforeDiscovery,
+		crashpoint.AfterBootstrapLiveCloseBeforeSeal,
+		crashpoint.AfterCompactionRewriteBeforeWatermark,
+	}
 
-	// Final state converges after crash + recovery.
-	assertOracleMatches(t, run.dataDir, run.w, run.cfg, "crash-consistency")
+	for i, point := range crashPoints {
+		t.Run(point.String(), func(t *testing.T) {
+			label := "crash-consistency-" + point.String()
+			run := runChainThroughCrash(t, label, i, point)
 
-	// The chain's durable intermediates survived the crash: every expected
-	// durable row is present at least once, the compaction contract holds at
-	// the recovered watermark, and the delete->recreate record is visible.
-	assertChainDurable(t, run.dataDir, run.coord, "crash-consistency")
+			// Final state converges after crash + recovery (replay-aware: a
+			// crash at a merge boundary may re-emit already-merged survivors
+			// at fresh seqs in non-rev order — benign per the at-least-once
+			// contract; Compare still converges).
+			assertOracleMatchesAfterReplay(t, run.dataDir, run.w, run.cfg, label)
 
-	// Red-first power check: losing the shape-B live delete tombstone across
-	// the crash boundary must break coverage. Ties the crash test's power to
-	// the actual recovered fixture (mirrors the no-crash shape-B power test).
-	rc := recordChainForShape(t, run.spec, shapeBfCreateDelete)
-	cov := chainCoverage(t, run.dataDir, run.coord)
-	assertCoverageFailsWithoutRow(t, cov, "delete", rc.collection, rc.rkey)
+			// The chain's durable intermediates survived the crash: every
+			// expected durable row is present at least once, the compaction
+			// contract holds at the recovered watermark, and the
+			// delete->recreate record is visible.
+			assertChainDurable(t, run.dataDir, run.coord, label)
+
+			// Red-first power check: losing the shape-B live delete tombstone
+			// across the crash boundary must break coverage. Ties the crash
+			// test's power to the actual recovered fixture at THIS crashpoint
+			// (mirrors the no-crash shape-B power test).
+			rc := recordChainForShape(t, run.spec, shapeBfCreateDelete)
+			cov := chainCoverage(t, run.dataDir, run.coord)
+			assertCoverageFailsWithoutRow(t, cov, "delete", rc.collection, rc.rkey)
+		})
+	}
 }
