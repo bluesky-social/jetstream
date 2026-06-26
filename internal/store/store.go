@@ -56,6 +56,9 @@ const PebbleSubdir = "meta.pebble"
 type Store struct {
 	*pebble.DB
 	metrics *Metrics
+	// faults is a test-only write-fault seam. nil in production (Open
+	// installs nothing); see fault.go.
+	faults FaultInjector
 }
 
 // Open opens (creating if necessary) the metadata pebble database
@@ -68,7 +71,7 @@ type Store struct {
 // observability stay unwired.
 //
 // The returned Store must be Close()d to release file locks.
-func Open(dataDir string, m *Metrics) (*Store, error) {
+func Open(dataDir string, m *Metrics, opts ...Option) (*Store, error) {
 	if dataDir == "" {
 		return nil, fmt.Errorf("store: Open: data dir is required")
 	}
@@ -81,18 +84,22 @@ func Open(dataDir string, m *Metrics) (*Store, error) {
 	// comfortably. A bloom filter on point lookups keeps the hot
 	// per-DID Get path off disk for negative lookups, which the
 	// backfill seed step performs once per relay listRepos entry.
-	opts := &pebble.Options{}
-	opts.EnsureDefaults()
-	for i := range opts.Levels {
-		opts.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
+	pebbleOpts := &pebble.Options{}
+	pebbleOpts.EnsureDefaults()
+	for i := range pebbleOpts.Levels {
+		pebbleOpts.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
 	}
 
-	db, err := pebble.Open(path, opts)
+	db, err := pebble.Open(path, pebbleOpts)
 	if err != nil {
 		return nil, fmt.Errorf("store: open pebble at %s: %w", path, err)
 	}
 
-	return &Store{DB: db, metrics: m}, nil
+	s := &Store{DB: db, metrics: m}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s, nil
 }
 
 // Close releases the metadata db. Idempotent: subsequent calls are
@@ -122,6 +129,9 @@ func (s *Store) Get(key []byte) ([]byte, io.Closer, error) {
 
 // Set is the instrumented version of *pebble.DB.Set.
 func (s *Store) Set(key, value []byte, opts *pebble.WriteOptions) error {
+	if err := s.faultBeforeWrite(WriteOpSet, key); err != nil {
+		return err
+	}
 	start := time.Now()
 	err := s.DB.Set(key, value, opts)
 	s.metrics.ObserveSet(start, err)
@@ -130,6 +140,9 @@ func (s *Store) Set(key, value []byte, opts *pebble.WriteOptions) error {
 
 // Delete is the instrumented version of *pebble.DB.Delete.
 func (s *Store) Delete(key []byte, opts *pebble.WriteOptions) error {
+	if err := s.faultBeforeWrite(WriteOpDelete, key); err != nil {
+		return err
+	}
 	start := time.Now()
 	err := s.DB.Delete(key, opts)
 	s.metrics.ObserveDelete(start, err)
@@ -140,6 +153,9 @@ func (s *Store) Delete(key []byte, opts *pebble.WriteOptions) error {
 // it in place of b.Commit(opts) so the duration histogram captures
 // batch commits alongside single-key writes.
 func (s *Store) Commit(b *pebble.Batch, opts *pebble.WriteOptions) error {
+	if err := s.faultBeforeCommit(b); err != nil {
+		return err
+	}
 	start := time.Now()
 	err := b.Commit(opts)
 	s.metrics.ObserveBatchCommit(start, err)

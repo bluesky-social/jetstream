@@ -23,6 +23,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +39,27 @@ const (
 	// to kill on (default 1). Lets a predicate kill "between" named crashpoints
 	// by occurrence count, e.g. the 3rd AfterRepoComplete.
 	envRestartCrashOrdinal = "JETSTREAM_ORACLE_RESTART_CRASH_ORDINAL"
+
+	// Store-fault tier (#30): the child installs a deterministic metadata-store
+	// write fault that fails the Ordinal-th batch_commit touching a key under
+	// Prefix. This models a Pebble persistence failure (e.g. the merge
+	// source-cursor commit) that the orchestrator must surface rather than
+	// swallow. When the prefix is set the child runs to natural completion (no
+	// SIGKILL): a correct runtime fails the merge LOUD, which the child
+	// recognizes via the injected sentinel and records in the observed-marker
+	// file; a runtime that swallows the error instead completes the merge and
+	// reaches the after-merge barrier, leaving the observed-marker absent.
+	envRestartStoreFaultPrefix   = "JETSTREAM_ORACLE_RESTART_STORE_FAULT_PREFIX"
+	envRestartStoreFaultOrdinal  = "JETSTREAM_ORACLE_RESTART_STORE_FAULT_ORDINAL"
+	envRestartStoreFaultObserved = "JETSTREAM_ORACLE_RESTART_STORE_FAULT_OBSERVED"
 )
+
+// errStoreFaultInjected is the sentinel the store-fault tier injects into the
+// metadata store. The child matches it with errors.Is to distinguish the
+// expected fail-loud merge error (which propagates wrapped up through
+// commitSourceComplete -> mergeRunner.run -> Orchestrator.Run) from any other
+// runtime error, so the kill signal is unambiguous.
+var errStoreFaultInjected = errors.New("oracle: injected store fault (merge cursor commit)")
 
 // nolint:paralleltest
 func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
@@ -278,6 +299,7 @@ func TestOracleRestartChild(t *testing.T) {
 	defer cancel()
 
 	crashInjector := newOracleCrashInjectorFromEnv(t, markerPath)
+	storeFault := newOracleStoreFaultFromEnv(t)
 	var afterMerge jetstreamd.PhaseBarrier
 	if mergeDonePath := os.Getenv(envRestartMergeDone); mergeDonePath != "" {
 		afterMerge = func(context.Context) error {
@@ -316,6 +338,7 @@ func TestOracleRestartChild(t *testing.T) {
 		CompactionInterval:        time.Hour,
 		BarrierAfterMerge:         afterMerge,
 		CrashInjector:             crashInjector,
+		StoreFaultInjector:        storeFault,
 	})
 	require.NoError(t, err)
 
@@ -323,9 +346,55 @@ func TestOracleRestartChild(t *testing.T) {
 	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, rt.Close(closeCtx))
+
+	// Store-fault tier: when a fault is armed, the contract is that the runtime
+	// surfaces it LOUD. The merge error propagates wrapped up through
+	// Orchestrator.Run, so errors.Is finds the sentinel. The child does NOT
+	// assert here — it RECORDS the outcome and lets the parent judge: it writes
+	// the observed-marker IFF it saw the sentinel. Under the m006 mutant the
+	// error is swallowed, the merge completes, the after-merge barrier cancels
+	// the run, and rt.Run returns context.Canceled (not the sentinel) — so the
+	// marker is never written and the parent's require.FileExists fails. Either
+	// way the child exits 0, so the kill signal is the marker's absence, not a
+	// child crash or a timeout.
+	if observedPath := os.Getenv(envRestartStoreFaultObserved); observedPath != "" {
+		if errors.Is(runErr, errStoreFaultInjected) {
+			require.NoError(t, os.WriteFile(observedPath, []byte(runErr.Error()), 0o644))
+		} else {
+			t.Logf("store fault armed but runtime did not surface the sentinel (got %v); "+
+				"observed-marker withheld — parent will treat this as a swallowed-error kill", runErr)
+		}
+		return
+	}
+
 	require.True(t,
 		runErr == nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded),
 		"runtime error: %v", runErr)
+}
+
+// newOracleStoreFaultFromEnv builds the store-fault injector for the child
+// from env, or returns nil when no fault is armed (the common case for the
+// crash/predicate tiers). The fault fails the Ordinal-th batch_commit that
+// touches a key under the configured prefix — the merge source-cursor commit
+// rides merge/next_source_idx, the boundary m006 swallows.
+func newOracleStoreFaultFromEnv(t *testing.T) store.FaultInjector {
+	t.Helper()
+
+	prefix := os.Getenv(envRestartStoreFaultPrefix)
+	if prefix == "" {
+		return nil
+	}
+	ordinal := 1
+	if raw := os.Getenv(envRestartStoreFaultOrdinal); raw != "" {
+		require.NoError(t, parseIntEnv(os.LookupEnv, envRestartStoreFaultOrdinal, &ordinal))
+		require.Greaterf(t, ordinal, 0, "%s must be >= 1", envRestartStoreFaultOrdinal)
+	}
+	return &store.KeyPrefixFault{
+		Prefix:  []byte(prefix),
+		Op:      store.WriteOpBatchCommit,
+		Ordinal: ordinal,
+		Err:     errStoreFaultInjected,
+	}
 }
 
 func newOracleCrashInjectorFromEnv(t *testing.T, markerPath string) crashpoint.Injector {
@@ -443,9 +512,16 @@ type restartChildArgs struct {
 	crashPoint      crashpoint.Point
 	crashOrdinal    int // 1-based kill ordinal; 0 == default (1st hit)
 	killAfterMarker bool
-	timeout         time.Duration
-	trace           *Trace
-	runLabel        string
+	// Store-fault tier (#30): when storeFaultPrefix is set the child arms a
+	// metadata-store write fault on the Ordinal-th batch_commit touching the
+	// prefix, and writes storeFaultObservedPath if (and only if) the runtime
+	// failed loud with the injected sentinel.
+	storeFaultPrefix       string
+	storeFaultOrdinal      int
+	storeFaultObservedPath string
+	timeout                time.Duration
+	trace                  *Trace
+	runLabel               string
 }
 
 type restartChildResult struct {
@@ -484,6 +560,15 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 	)
 	if ordinal > 0 {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", envRestartCrashOrdinal, ordinal))
+	}
+	if args.storeFaultPrefix != "" {
+		cmd.Env = append(cmd.Env,
+			envRestartStoreFaultPrefix+"="+args.storeFaultPrefix,
+			envRestartStoreFaultObserved+"="+args.storeFaultObservedPath,
+		)
+		if args.storeFaultOrdinal > 0 {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", envRestartStoreFaultOrdinal, args.storeFaultOrdinal))
+		}
 	}
 	require.NoError(t, cmd.Start())
 	recordTraceOrError(t, args.trace, "restart_child_process", map[string]any{

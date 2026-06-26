@@ -171,10 +171,10 @@ type mergeFixture struct {
 // the pre-merge per-DID Backfill.Rev (also pre-populates the top-level
 // Rev to that same value, mirroring what the real OnComplete callback
 // does). Both arguments may be nil/empty.
-func newMergeFixture(t *testing.T, sources [][]segment.Event, repoRevs map[string]string) *mergeFixture {
+func newMergeFixture(t *testing.T, sources [][]segment.Event, repoRevs map[string]string, storeOpts ...store.Option) *mergeFixture {
 	t.Helper()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := store.Open(dataDir, nil, storeOpts...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
