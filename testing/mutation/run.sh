@@ -242,13 +242,15 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     #     real runtime through the merge with a metadata-store
                     #     fault on the source-cursor commit and asserts fail-loud
                     #     + recovery convergence;
-                    #   - orchestrator unit level: TestMerge_StoreFault* and
-                    #     TestMerge_MultiSourceDrainsAllSources pin the same
-                    #     contract fast and directly on runMerge.
+                    #   - orchestrator unit level: TestMerge_StoreFault*,
+                    #     TestMerge_MultiSourceDrainsAllSources, and
+                    #     TestCompaction_StoreFault* pin the same fail-loud /
+                    #     no-silent-advance contract fast and directly on
+                    #     runMerge / runDeleteCompaction.
                     # Both packages run so a regression in either layer is a kill.
                     cmd=(go test "${RACE_FLAG[@]}"
                          ./internal/oracle ./internal/ingest/orchestrator
-                         -run 'TestOracle_RestartStoreFault|TestMerge_StoreFault|TestMerge_MultiSourceDrainsAllSources'
+                         -run 'TestOracle_RestartStoreFault|TestMerge_StoreFault|TestMerge_MultiSourceDrainsAllSources|TestCompaction_StoreFault'
                          -count=1 -timeout "$storefault_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2
