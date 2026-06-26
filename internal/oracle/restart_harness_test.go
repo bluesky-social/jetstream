@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -33,6 +34,10 @@ const (
 	envRestartMarker     = "JETSTREAM_ORACLE_RESTART_MARKER"
 	envRestartMergeDone  = "JETSTREAM_ORACLE_RESTART_MERGE_DONE"
 	envRestartCrashPoint = "JETSTREAM_ORACLE_RESTART_CRASH_POINT"
+	// envRestartCrashOrdinal selects the 1-based occurrence of the crashpoint
+	// to kill on (default 1). Lets a predicate kill "between" named crashpoints
+	// by occurrence count, e.g. the 3rd AfterRepoComplete.
+	envRestartCrashOrdinal = "JETSTREAM_ORACLE_RESTART_CRASH_ORDINAL"
 )
 
 // nolint:paralleltest
@@ -335,27 +340,49 @@ func newOracleCrashInjectorFromEnv(t *testing.T, markerPath string) crashpoint.I
 	point, err := crashpoint.Parse(rawPoint)
 	require.NoError(t, err)
 
+	// Optional 1-based ordinal: kill on the Nth hit of the target crashpoint
+	// rather than the first. Absent/empty => 1 (the historical behavior). This
+	// is what lets a seeded predicate kill "between" named crashpoints — e.g.
+	// after the 3rd repo completes, not just the 1st — without adding new
+	// firing sites (Notes: prefer trace-event-count kill points).
+	ordinal := 1
+	if raw := os.Getenv(envRestartCrashOrdinal); raw != "" {
+		require.NoError(t, parseIntEnv(os.LookupEnv, envRestartCrashOrdinal, &ordinal))
+		require.Greaterf(t, ordinal, 0, "%s must be >= 1", envRestartCrashOrdinal)
+	}
+
 	return &oracleCrashInjector{
 		target:     point,
+		ordinal:    ordinal,
 		markerPath: markerPath,
 	}
 }
 
-// oracleCrashInjector fires on the FIRST time the target crashpoint is
-// reached: it writes the marker file (the parent polls for it, then
-// SIGKILLs this child) and blocks until the process is killed. The
-// sync.Once makes the marker write exactly-once even though backfill
-// invokes SimulateCrash from multiple per-DID worker goroutines
-// concurrently.
+// oracleCrashInjector fires the kill-marker when the target crashpoint is
+// reached for the ordinal-th time: it writes the marker file (the parent polls
+// for it, then SIGKILLs this child) and blocks until the process is killed.
+// The atomic hit counter + sync.Once makes the marker write exactly-once even
+// though backfill invokes SimulateCrash from multiple per-DID worker goroutines
+// concurrently; only the goroutine that observes the ordinal-th hit writes the
+// marker, and every hit at/after the ordinal blocks so the process is reliably
+// killed at the chosen point.
 type oracleCrashInjector struct {
 	target     crashpoint.Point
+	ordinal    int
 	markerPath string
+	hits       atomic.Int64
 	once       sync.Once
 	writeErr   error
 }
 
 func (i *oracleCrashInjector) SimulateCrash(ctx context.Context, point crashpoint.Point) error {
 	if point != i.target {
+		return nil
+	}
+
+	// Hits before the target ordinal pass through (the lifecycle proceeds);
+	// the ordinal-th and any later hit arm the kill and block until SIGKILL.
+	if i.hits.Add(1) < int64(i.ordinal) {
 		return nil
 	}
 
@@ -414,6 +441,7 @@ type restartChildArgs struct {
 	markerPath      string
 	mergeDonePath   string
 	crashPoint      crashpoint.Point
+	crashOrdinal    int // 1-based kill ordinal; 0 == default (1st hit)
 	killAfterMarker bool
 	timeout         time.Duration
 	trace           *Trace
@@ -431,10 +459,13 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 
 	logPath, logFile, closeLog := newOracleArtifactFile(t, args.runLabel+"-restart-child.log")
 	defer closeLog()
+	// 0 means "unset"; the child treats a missing ordinal as 1.
+	ordinal := args.crashOrdinal
 	recordTraceOrError(t, args.trace, "restart_child_start", map[string]any{
 		"label":             args.runLabel,
 		"log_path":          logPath,
 		"crash_point":       args.crashPoint.String(),
+		"crash_ordinal":     ordinal,
 		"kill_after_marker": args.killAfterMarker,
 		"marker_path":       args.markerPath,
 		"merge_done_path":   args.mergeDonePath,
@@ -451,6 +482,9 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 		envRestartMergeDone+"="+args.mergeDonePath,
 		envRestartCrashPoint+"="+args.crashPoint.String(),
 	)
+	if ordinal > 0 {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", envRestartCrashOrdinal, ordinal))
+	}
 	require.NoError(t, cmd.Start())
 	recordTraceOrError(t, args.trace, "restart_child_process", map[string]any{
 		"label": args.runLabel,
