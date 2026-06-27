@@ -356,6 +356,35 @@ consumed by bootstrap-live, racing cutover. **Q2 RESOLVED → (a), baseline-gate
   present on a no-crash baseline run (§7 step 0e) before any crash case relies on
   it.
 
+**Q2 ESCALATED → (b), 2026-06-27.** The passive-timing assumption (a) proved
+flaky. Under `JETSTREAM_ORACLE_SEED=11212589348287832646 GOMAXPROCS=2` the
+no-crash baseline `TestOracle_RestartChainDurableIntermediates_Baseline` failed
+~1 in 40 single runs with `oracle: missing <did> <coll>/<rkey> rev=` — a chain
+record present in ground truth but absent on disk. The crash tier
+(`TestOracle_RestartChainCrashConsistency`) inherited the same flake. Cause: the
+chain's tail frames were not always drained into `live_segments` before cutover
+cancelled the bootstrap-live consumer (the §3.1 risk). The seed-chosen chain DID
+was `chainAccountIdx=3` (the *last* of 4), so mitigation (a)'s "early DID" never
+held — the spec picks the host by RNG, not by sort order. Production tolerates
+this via steady-state re-fetch from the persisted cursor, but the restart child
+exits at the after-merge barrier and never runs steady-state.
+
+Implemented (b) as a cross-process cutover gate (the test-process analogue of the
+main harness's in-process `bootstrapTraffic.WaitDelivered`):
+`TestOracleRestartChild` wires a `cutoverDeliveryGate` to `BarrierBeforeCutover`.
+At cutover it samples the relay's firehose tip (a new read-only test endpoint
+`GET /_oracle/firehose-tip`, mounted only under `HandlerOptions.EnableFirehoseTip`)
+and blocks until the bootstrap-live consumer has contiguously archived every
+frame up to it (observed via `OnBootstrapLiveEvent`). Seqs are dense `1..tip`
+(every `world.seq.Add` stages exactly one frame; shape G's silent mutation bumps
+no seq), so the gate is deterministic and non-vacuous; it floors contiguity at the
+lowest observed seq so a child resuming bootstrap at a persisted cursor `C` (e.g.
+an `AfterRepoComplete` crash before the merging-phase write) correctly waits on
+`C+1..tip`. A never-delivered tail fails LOUD (timeout error surfaced by the
+child) rather than silently proceeding. Post-fix: 0 failures in 80× baseline,
+60× crash-consistency, and a 5-seed × full-restart-tier sweep at the flaky seed.
+Unit guards live in `cutover_gate_test.go` (red-first verified).
+
 ### 3.2 Determinism
 
 Seq-assignment order across DIDs is nondeterministic (backfill concurrency,

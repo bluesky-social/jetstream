@@ -2,11 +2,13 @@ package oracle
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -25,6 +27,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 
@@ -311,6 +314,24 @@ func TestOracleRestartChild(t *testing.T) {
 		}
 	}
 
+	// Cross-process cutover gate (#114 flake fix). The parent injects the
+	// durable-intermediate chain on the live firehose during this child's
+	// backfill (chainCoordinator.onGetRepoServed). Those frames must be
+	// durably archived into live_segments BEFORE cutover cancels the
+	// bootstrap-live consumer — otherwise an undrained tail is lost and a
+	// chain record vanishes from disk while staying in ground truth
+	// ("oracle: missing ..."). Production re-fetches such in-flight events
+	// from the persisted cursor in steady-state, but the restart child
+	// exits at the after-merge barrier and never runs steady-state, so the
+	// in-process BarrierBeforeCutover the main harness uses
+	// (bootstrapTraffic.WaitDelivered) has no cross-process analogue here
+	// today. This gate is that analogue: at cutover it samples the relay's
+	// firehose tip and blocks until the bootstrap-live consumer has
+	// contiguously archived every frame up to it. The plan authorized this
+	// escalation once the no-crash baseline proved flaky (specs/notes/
+	// 2026-06-20-restart-tier-intermediates-plan.md §3.1 Q2(b)).
+	cutoverGate := newCutoverDeliveryGate(relayURL, 30*time.Second)
+
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
 		PublicAddr:                "127.0.0.1:0",
 		DebugAddr:                 "127.0.0.1:0",
@@ -336,9 +357,11 @@ func TestOracleRestartChild(t *testing.T) {
 		SubscribeSlowMinRate:      1,
 		CursorBlockIndexCacheSize: 32,
 		CompactionInterval:        time.Hour,
+		BarrierBeforeCutover:      cutoverGate.waitDelivered,
 		BarrierAfterMerge:         afterMerge,
 		CrashInjector:             crashInjector,
 		StoreFaultInjector:        storeFault,
+		OnBootstrapLiveEvent:      cutoverGate.observe,
 	})
 	require.NoError(t, err)
 
@@ -465,6 +488,167 @@ func (i *oracleCrashInjector) SimulateCrash(ctx context.Context, point crashpoin
 	return ctx.Err()
 }
 
+// cutoverDeliveryGate is the cross-process analogue of the main harness's
+// bootstrapTraffic.WaitDelivered (#114 flake fix). The parent injects the
+// durable-intermediate chain on the live firehose during the child's
+// backfill; those frames must be durably archived into live_segments
+// before cutover cancels the bootstrap-live consumer, or an undrained tail
+// is lost (production re-fetches such in-flight events from the persisted
+// cursor in steady-state, but the restart child exits at the after-merge
+// barrier and never runs steady-state).
+//
+// waitDelivered (wired to BarrierBeforeCutover) samples the relay's
+// firehose tip once at cutover and blocks until the bootstrap-live consumer
+// has contiguously archived every frame up to it. observe (wired to
+// OnBootstrapLiveEvent) records each archived frame's upstream seq.
+//
+// Why contiguity-from-lowest-observed is sound: every world seq.Add stages
+// exactly one firehose frame (shape G's silent mutation bumps no seq, so
+// there are no gaps), and every generated frame yields at least one archived
+// event carrying UpstreamRelayCursor == seq. bootstrap-live runs BatchSize=1
+// and fires OnEvent after each durable Append, so observed seqs arrive in
+// archive order. A fresh child resumes at cursor 0 and observes 1..tip; a
+// child recovering in PhaseBootstrap (e.g. an AfterRepoComplete crash before
+// the merging-phase write) resumes at its persisted cursor C and observes
+// C+1..tip — frames 1..C are already durable from the first child, so
+// flooring contiguity at the lowest observed seq is correct in both cases.
+type cutoverDeliveryGate struct {
+	relayURL string
+	timeout  time.Duration
+
+	mu   sync.Mutex
+	seen map[int64]struct{}
+}
+
+func newCutoverDeliveryGate(relayURL string, timeout time.Duration) *cutoverDeliveryGate {
+	return &cutoverDeliveryGate{
+		relayURL: relayURL,
+		timeout:  timeout,
+		seen:     make(map[int64]struct{}),
+	}
+}
+
+// observe records one durably-archived bootstrap-live frame's upstream seq.
+func (g *cutoverDeliveryGate) observe(ev *segment.Event) {
+	if ev == nil || ev.UpstreamRelayCursor <= 0 {
+		return
+	}
+	g.mu.Lock()
+	g.seen[ev.UpstreamRelayCursor] = struct{}{}
+	g.mu.Unlock()
+}
+
+// waitDelivered samples the relay firehose tip and blocks until every frame
+// up to it has been contiguously archived by the bootstrap-live consumer, or
+// ctx is cancelled, or the timeout elapses. A timeout is a genuine delivery
+// failure (the chain never landed durably before cutover) and fails loud
+// rather than silently dropping the unmet tail.
+func (g *cutoverDeliveryGate) waitDelivered(ctx context.Context) error {
+	tip, err := g.fetchTip(ctx)
+	if err != nil {
+		return fmt.Errorf("cutover gate: fetch firehose tip: %w", err)
+	}
+	if tip <= 0 {
+		// No live ops were generated this run (e.g. the nil-coordinator
+		// after-repo-complete case): nothing to wait for.
+		return nil
+	}
+
+	deadline := time.NewTimer(g.timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		if g.contiguousToTip(tip) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			lo, hi := g.contiguousSpan()
+			return fmt.Errorf("cutover gate: timeout after %s waiting for bootstrap-live to archive firehose tip=%d "+
+				"(lowest_observed=%d highest_contiguous=%d observed=%d): the injected chain did not land durably before cutover",
+				g.timeout, tip, lo, hi, g.observedCount())
+		case <-tick.C:
+		}
+	}
+}
+
+func (g *cutoverDeliveryGate) fetchTip(ctx context.Context) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.relayURL+"/_oracle/firehose-tip", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	var out struct {
+		Seq int64 `json:"seq"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.Seq, nil
+}
+
+// contiguousToTip reports whether every seq from the lowest observed up to
+// tip has been archived. With zero observations it is false (keep waiting):
+// a fresh consumer always replays from seq 1, so an empty set means the
+// consumer simply hasn't delivered yet, not that delivery is complete.
+func (g *cutoverDeliveryGate) contiguousToTip(tip int64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.seen) == 0 {
+		return false
+	}
+	lo := g.lowestLocked()
+	for s := lo; s <= tip; s++ {
+		if _, ok := g.seen[s]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (g *cutoverDeliveryGate) contiguousSpan() (lo, hi int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.seen) == 0 {
+		return 0, 0
+	}
+	lo = g.lowestLocked()
+	hi = lo - 1
+	for {
+		if _, ok := g.seen[hi+1]; !ok {
+			return lo, hi
+		}
+		hi++
+	}
+}
+
+func (g *cutoverDeliveryGate) lowestLocked() int64 {
+	lo := int64(-1)
+	for s := range g.seen {
+		if lo == -1 || s < lo {
+			lo = s
+		}
+	}
+	return lo
+}
+
+func (g *cutoverDeliveryGate) observedCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.seen)
+}
+
 func newRestartWorld(t *testing.T, cfg Config) *world.World {
 	t.Helper()
 
@@ -499,6 +683,10 @@ func newRestartServer(t *testing.T, w *world.World, onGetRepoServed func(did str
 	srv.Listener = ln
 	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, "http://"+ln.Addr().String(), simhttp.HandlerOptions{
 		OnGetRepoServed: onGetRepoServed,
+		// The cutover gate (TestOracleRestartChild's BarrierBeforeCutover)
+		// queries the firehose tip so a child can hold cutover until its
+		// bootstrap-live consumer has durably archived every generated frame.
+		EnableFirehoseTip: true,
 	})
 	srv.Start()
 	return srv
