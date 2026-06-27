@@ -2,7 +2,7 @@
 
 ## Orientation
 
-Jetstream v2 is a full-network archive and live-streaming service for atproto. Backfill is served as HTTPS segment-file downloads; live tail is the same JSON websocket protocol as Jetstream v1.
+Jetstream is a full-network archive and live-streaming service for atproto. Backfill is served as HTTPS segment-file downloads; live tail is the same JSON websocket protocol as Jetstream v1.
 
 - `README.md` covers running the app, tests, and the simulator.
 - `docs/*` is for documentation that is intended to be read by humans and agents alike
@@ -55,11 +55,9 @@ just oracle                                                      # heavier stres
 just oracle-sweep                                                # deterministic multi-seed stress sweep
 ```
 
-`specs/oracle.md` is the source of truth for the oracle/simulator testing
-architecture: why the oracle exists, what it can and cannot prove, its current
-tiers, mutation-campaign discipline, and how future testing work should extend
-it. Read it before changing `internal/oracle`, `internal/simulator`, or the
-mutation campaign.
+`specs/oracle.md` is the source of truth for the oracle/simulator testing architecture: why the oracle exists, what it can and cannot prove, its current tiers, mutation-campaign discipline, and how future testing work should extend it. Read it before changing `internal/oracle`, `internal/simulator`, or the mutation campaign.
+
+`specs/oracle/` is a failure diary: one markdown file per oracle test incident, recording the commit, repro command, analysis, root cause, and fix. Read past entries when diagnosing a new oracle flake, and add an entry (see `specs/oracle/README.md` for the convention) whenever you root-cause one.
 
 The default `just` target intentionally runs short tests, so it does not execute non-short restart or stress oracle coverage. Use `just test-long` or the dedicated oracle recipes when the change could affect crash/restart correctness or end-to-end event fidelity.
 
