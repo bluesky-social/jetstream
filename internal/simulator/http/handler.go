@@ -36,6 +36,15 @@ type HandlerOptions struct {
 	// fire on the fault/truncation paths, which do not serve a clean
 	// snapshot.
 	OnGetRepoServed func(did string)
+
+	// EnableFirehoseTip mounts the read-only GET /_oracle/firehose-tip
+	// endpoint, which reports the world's current firehose tip seq. It is
+	// off by default (production never sets it) and exists for the restart
+	// oracle's cutover gate: a child queries the tip so it can hold the
+	// pre-cutover barrier until its bootstrap-live consumer has durably
+	// archived every frame up to it. The path is namespaced off the
+	// atproto xrpc surface so it cannot collide with a real lexicon method.
+	EnableFirehoseTip bool
 }
 
 // NewHandlerWithOptions builds the simulator's HTTP handler, optionally
@@ -48,6 +57,9 @@ func NewHandlerWithOptions(w *world.World, publicURL string, opts HandlerOptions
 	mux.Handle("GET /xrpc/com.atproto.sync.getRepo", newPDSGetRepoHandler(w, opts.Faults, opts.OnGetRepoServed))
 	mux.Handle("GET /xrpc/com.atproto.sync.listRepos", newRelayListReposHandler(w))
 	mux.Handle("GET /xrpc/com.atproto.sync.subscribeRepos", newRelaySubscribeReposHandler(w, opts.Faults))
+	if opts.EnableFirehoseTip {
+		mux.Handle("GET "+oracleFirehoseTipURLPath, newFirehoseTipHandler(w))
+	}
 
 	// PLC's `/<did>` doesn't fit Go ServeMux's path syntax cleanly
 	// because `did:` contains a colon. Pre-route any request whose
