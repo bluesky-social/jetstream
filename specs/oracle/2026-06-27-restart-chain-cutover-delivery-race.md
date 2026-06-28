@@ -7,6 +7,7 @@
 - **Classification:** flaky, wall-clock/scheduling dependent (not seed-deterministic).
 - **Status:** FIXED
 - **Tracking issue:** [#166](https://github.com/bluesky-social/jetstream/issues/166) (related: #114, epic #35).
+- **Original CI run:** https://github.com/bluesky-social/jetstream/actions/runs/28277269841/job/83786320138
 
 ## Repro
 
