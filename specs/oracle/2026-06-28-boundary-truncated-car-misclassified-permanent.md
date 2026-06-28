@@ -13,8 +13,8 @@
   differs between runs only because concurrent trace-row ordering is
   nondeterministic; the failure outcome is fixed by the seed.)
 - **Status:** FIXED
-- **Tracking issue:** (CI run
-  https://github.com/bluesky-social/jetstream/actions/runs/28302460522/job/83853056251)
+- **Tracking issue:** https://github.com/bluesky-social/jetstream/issues/168
+- **Original CI run:** https://github.com/bluesky-social/jetstream/actions/runs/28302460522/job/83853056251)
 
 ## Repro
 
