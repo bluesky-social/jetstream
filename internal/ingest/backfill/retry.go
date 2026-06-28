@@ -293,7 +293,12 @@ func (r *retryRunner) tryRepo(ctx context.Context, did atmos.DID) (string, error
 	}
 	defer func() { _ = body.Close() }()
 
-	rp, commit, err := atmosrepo.LoadFromCAR(bufio.NewReader(body))
+	// LoadCompleteFromCAR (not LoadFromCAR) verifies the downloaded full repo
+	// is structurally complete. A getRepo CAR truncated exactly on a block
+	// boundary parses cleanly but omits referenced blocks; LoadCompleteFromCAR
+	// surfaces that as a transient (io.ErrUnexpectedEOF) error so this retry
+	// pass re-defers the DID rather than completing it on a partial repo.
+	rp, commit, err := atmosrepo.LoadCompleteFromCAR(bufio.NewReader(body))
 	if err != nil {
 		return host, err
 	}

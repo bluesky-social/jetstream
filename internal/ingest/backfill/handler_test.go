@@ -19,7 +19,6 @@ import (
 	"github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/mst"
 	atmosrepo "github.com/jcalabro/atmos/repo"
-	"github.com/jcalabro/atmos/xrpc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -329,7 +328,22 @@ func TestSegmentHandler_DropsRecordThatExceedsSegmentColumnWidth(t *testing.T) {
 		"the skipped record must be visible in dropped_records_total")
 }
 
-func TestSegmentHandler_MissingDownloadedRecordBlockIsTransient(t *testing.T) {
+// TestSegmentHandler_MissingDownloadedRecordBlockSurfacesError pins the
+// handler's post-fix contract for a missing record block. Completeness of a
+// downloaded full repo is now verified UPSTREAM, before HandleRepo runs:
+//   - the atmos backfill engine calls repo.(*Repo).CheckComplete in download()
+//     (covered by atmos backfill/truncation_test.go), and
+//   - jetstream's own direct loaders (retry.go, selected.go) use
+//     repo.LoadCompleteFromCAR.
+//
+// Both classify a block-boundary-truncated CAR as a transient
+// io.ErrUnexpectedEOF and retry it. The handler therefore no longer needs to
+// re-tag a missing block as transient (the previous bandaid that only covered
+// leaf record blocks, never interior MST nodes). It now surfaces the store's
+// error plainly; we assert it is matchable as mst.ErrBlockNotFound so a
+// genuinely-missing block still fails loudly rather than silently dropping a
+// record.
+func TestSegmentHandler_MissingDownloadedRecordBlockSurfacesError(t *testing.T) {
 	t.Parallel()
 
 	w := newTestIngest(t)
@@ -348,7 +362,7 @@ func TestSegmentHandler_MissingDownloadedRecordBlockIsTransient(t *testing.T) {
 
 	err := h.HandleRepo(t.Context(), "did:plc:truncatedcar", r, commit)
 	require.Error(t, err)
-	require.True(t, xrpc.IsTransient(err), "missing downloaded CAR blocks must be retried by atmos backfill")
+	require.ErrorIs(t, err, mst.ErrBlockNotFound, "a missing record block must surface loudly")
 }
 
 // TestSegmentHandler_NilWriterPanics pins the constructor's
