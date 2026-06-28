@@ -244,7 +244,11 @@ func (r *selectedRunner) tryRepo(ctx context.Context, did atmos.DID) (string, er
 	}
 	defer func() { _ = body.Close() }()
 
-	rp, commit, err := atmosrepo.LoadFromCAR(bufio.NewReader(body))
+	// LoadCompleteFromCAR verifies the full repo is structurally complete so a
+	// block-boundary-truncated getRepo CAR (which parses clean but omits
+	// blocks) is surfaced as a transient error and retried, not completed on a
+	// partial repo. Mirrors the engine path in atmos backfill.
+	rp, commit, err := atmosrepo.LoadCompleteFromCAR(bufio.NewReader(body))
 	if err != nil {
 		return host, err
 	}

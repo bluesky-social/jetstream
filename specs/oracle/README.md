@@ -24,3 +24,9 @@ naming the failure mode (not the test).
   durable-intermediate chain frames lost when cutover cancelled the
   bootstrap-live consumer before the tail was archived; fixed with a
   cross-process cutover delivery gate.
+- [2026-06-28 — boundary-truncated getRepo CAR misclassified as permanent](2026-06-28-boundary-truncated-car-misclassified-permanent.md):
+  a getRepo CAR truncated exactly on a block boundary loaded cleanly but
+  incomplete, so a missing interior MST node failed backfill non-transiently
+  (no retry) and a record went missing; fixed in atmos with a repo
+  completeness check (`CheckComplete` / `LoadCompleteFromCAR`) that classifies
+  the truncation as transient, and removed the jetstream handler bandaid.
