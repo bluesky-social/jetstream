@@ -150,8 +150,10 @@ func TestLiveSinkAccountDeleteSuppressesDespiteCollectionFilter(t *testing.T) {
 	require.True(t, drop, "create below the account-delete must be suppressed")
 	require.Equal(t, "account", reason)
 
-	// And the account event itself must NOT pass the delivery filter.
-	require.False(t, sink.wantLive(&acctDel), "account event must be dropped from delivery under a collection filter")
+	// The account event itself now passes the delivery filter even under a
+	// collection filter: DID-level events bypass the collection filter so a
+	// collection-scoped consumer still receives the deletion signal.
+	require.True(t, sink.wantLive(&acctDel), "account event must be delivered under a collection filter")
 }
 
 func TestLiveConsumerDeliversInOrder(t *testing.T) {

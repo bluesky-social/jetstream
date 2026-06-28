@@ -635,12 +635,12 @@ func TestEngineLiveOnlyAppliesCollectionFilter(t *testing.T) {
 		"only the app.bsky.feed.post events (seq 1 and 5) must be delivered")
 }
 
-// TestEngineLiveOnlyCollectionFilterDropsAccountIdentity is a regression guard
-// for #142: with a collection filter set, the live-only path must NOT surface
-// #account or #identity events to the consumer (they carry no collection, so a
-// collection-scoped subscriber did not ask for them). #sync is also not a user
-// record. Only matching commits flow through.
-func TestEngineLiveOnlyCollectionFilterDropsAccountIdentity(t *testing.T) {
+// TestEngineLiveOnlyCollectionFilterDeliversAccountIdentity guards the uniform
+// delivery contract: with a collection filter set, the live-only path still
+// surfaces #account and #identity events (they carry no collection and bypass
+// the collection filter — the consumer's only signal to purge a dead account).
+// Only non-matching commits are dropped.
+func TestEngineLiveOnlyCollectionFilterDeliversAccountIdentity(t *testing.T) {
 	t.Parallel()
 	conn := &scriptedConn{steps: []readStep{
 		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "app.bsky.feed.post", "r1", true)},
@@ -701,12 +701,15 @@ func TestEngineLiveOnlyCollectionFilterDropsAccountIdentity(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	for _, ev := range events {
-		require.Equalf(t, KindCommit, ev.Kind,
-			"only commits may be delivered under a collection filter; leaked kind=%s seq=%d", ev.Kind, ev.Seq)
-		require.Equal(t, "app.bsky.feed.post", ev.Commit.Collection)
+		// Any commit that survives must match the collection filter; the
+		// non-matching like commit (seq 4) must have been dropped.
+		if ev.Kind == KindCommit {
+			require.Equal(t, "app.bsky.feed.post", ev.Commit.Collection,
+				"non-matching commit leaked under a collection filter; seq=%d", ev.Seq)
+		}
 	}
-	require.Equal(t, []uint64{1, 5}, uniqueSeqs(events),
-		"only the app.bsky.feed.post commits (seq 1 and 5) survive; account/identity are dropped")
+	require.Equal(t, []uint64{1, 2, 3, 5}, uniqueSeqs(events),
+		"matching commits (seq 1, 5) plus identity (seq 2) and account (seq 3) survive; the like commit (seq 4) is dropped")
 }
 
 // TestEngineLiveOnlyNoFilterDeliversAccountIdentity guards the other side of

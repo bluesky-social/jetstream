@@ -43,17 +43,6 @@ type Filter struct {
 	wantedDIDs          map[string]struct{} // nil = match-all
 	wantedCollections   *wantedCollections  // nil = match-all
 	maxMessageSizeBytes uint32              // 0 = no cap
-
-	// filterIdentityByCollection selects the /subscribe-v2 presentation
-	// policy: when true, #identity events are subjected to the collection
-	// filter (they carry no collection, so a collection-filtered subscriber
-	// receives none). When false (the v1 /subscribe default), identity
-	// bypasses the collection filter — the v1 README contract. #account
-	// bypasses under BOTH policies: it carries the DID-deletion tombstone the
-	// v2 client folds into its record-suppression set, so dropping it on the
-	// wire would break the client's deletion guarantee. The handler sets this
-	// per endpoint (see Subscription.FilterIdentityByCollection).
-	filterIdentityByCollection bool
 }
 
 // wantedCollections splits the user's preferences into the two shapes
@@ -62,18 +51,6 @@ type Filter struct {
 type wantedCollections struct {
 	fullPaths map[string]struct{}
 	prefixes  []string // each entry ends in "." (e.g. "app.bsky.graph.")
-}
-
-// withIdentityCollectionPolicy returns f with the v2 identity-collection
-// policy applied. A nil receiver stays nil (match-all). Filters are immutable
-// once published, so this is only called at construction time (ParseQuery /
-// ParseUpdatePayload result) before the filter is stored in the atomic pointer.
-func (f *Filter) withIdentityCollectionPolicy(on bool) *Filter {
-	if f == nil {
-		return nil
-	}
-	f.filterIdentityByCollection = on
-	return f
 }
 
 // MaxMessageSizeBytes returns the per-frame size cap, or 0 for "no cap".
@@ -307,16 +284,15 @@ func clampMaxMsgSize(n int) uint32 {
 //   - wantedDIDs applies to all event kinds. If non-empty and evt.DID
 //     is not in the set, drop.
 //   - wantedCollections applies ONLY to commit events
-//     (KindCreate / KindUpdate / KindDelete / KindCreateResync). Account events
-//     always bypass the collection filter (under both endpoints): they carry the
-//     DID-deletion tombstone the v2 client folds into its record-suppression set,
-//     so dropping them on the wire would break the client's deletion guarantee.
-//     Identity events bypass on /subscribe (v1 README: "Regardless of desired
-//     collections, all subscribers receive Account and Identity events"), but are
-//     subjected to the collection filter on /subscribe-v2
-//     (filterIdentityByCollection) — an identity event carries no collection, so
-//     a collection-filtered v2 subscriber receives none. Sync events are filtered
-//     upstream by encoder.go (errSkipEvent) on the v1 wire and pass through here.
+//     (KindCreate / KindUpdate / KindDelete / KindCreateResync). #account,
+//     #identity, and #sync — the DID-level events, which carry no collection —
+//     always bypass the collection filter on BOTH /subscribe (v1) and
+//     /subscribe-v2 (v1 README: "Regardless of desired collections, all
+//     subscribers receive Account and Identity events"). They are the only
+//     signal a collection-scoped consumer has to purge a dead account's
+//     records, so hiding them would create a permanently stale view. They still
+//     respect wantedDids. Sync events are additionally filtered upstream by
+//     encoder.go (errSkipEvent) on the v1 wire and pass through here.
 //
 // Wants does NOT enforce maxMessageSizeBytes; the handler enforces
 // against the encoded byte length post-Encode.
@@ -332,17 +308,9 @@ func (f *Filter) Wants(evt *segment.Event) bool {
 	if f.wantedCollections == nil {
 		return true
 	}
-	// Account always bypasses the collection filter; identity bypasses only
-	// under the v1 policy. Everything else non-commit (sync) bypasses too.
-	if evt.Kind == segment.KindIdentity {
-		if !f.filterIdentityByCollection {
-			return true
-		}
-		// v2 policy: an identity event has no collection, so a
-		// collection-filtered subscriber does not want it.
-		return false
-	}
-	// Collection filter applies only to commit events.
+	// The collection filter applies only to commit events. DID-level events
+	// (#account, #identity, #sync) carry no collection and always bypass it,
+	// subject to the wantedDids filter already applied above.
 	if !isCommitKind(evt.Kind) {
 		return true
 	}

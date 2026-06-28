@@ -109,21 +109,23 @@ func TestMatcherCollectionExactAndWildcard(t *testing.T) {
 // an internal resync signal, not gated by the collection filter). Account
 // tombstone folding happens upstream of this matcher, so dropping account here
 // does not weaken record suppression.
-func TestMatcherCollectionFilterDropsIdentityAccount(t *testing.T) {
+func TestMatcherCollectionFilterDeliversDIDLevelEvents(t *testing.T) {
 	t.Parallel()
 	m := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
 
-	for _, k := range []segment.Kind{segment.KindIdentity, segment.KindAccount} {
+	// #account, #identity, #sync carry no collection and always bypass the
+	// collection filter — the consumer's only signal to purge a dead account.
+	for _, k := range []segment.Kind{segment.KindIdentity, segment.KindAccount, segment.KindSync} {
 		ev := segment.Event{Seq: 1, Kind: k, DID: "did:plc:a"}
-		require.Falsef(t, m.Wants(&ev), "kind %d must be dropped under a collection filter", k)
+		require.Truef(t, m.Wants(&ev), "kind %d must bypass the collection filter", k)
 	}
 
-	// Sync bypasses the collection filter regardless.
-	sync := segment.Event{Seq: 1, Kind: segment.KindSync, DID: "did:plc:a"}
-	require.True(t, m.Wants(&sync), "sync must bypass the collection filter")
+	// A commit whose collection does not match is still dropped.
+	miss := commitRow(2, "did:plc:a", "app.bsky.feed.like")
+	require.False(t, m.Wants(&miss), "non-matching commit must be dropped")
 
 	// A commit with an empty collection bypasses the filter (v1 parity).
-	emptyColl := segment.Event{Seq: 2, Kind: segment.KindCreate, DID: "did:plc:a", Collection: ""}
+	emptyColl := segment.Event{Seq: 3, Kind: segment.KindCreate, DID: "did:plc:a", Collection: ""}
 	require.True(t, m.Wants(&emptyColl))
 }
 
