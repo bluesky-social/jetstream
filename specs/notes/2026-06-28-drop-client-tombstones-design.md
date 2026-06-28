@@ -306,9 +306,14 @@ the concrete anchors — don't rely on an exact site count.) With seqs starting 
   do not conflate them.
 
 **Implementation scope.** Seed `nextSeq = 1` on a fresh archive. The fresh-dir default reads as
-`0` today (`loadNextSeq`, `writer.go:698-702` — missing key → 0); the seed/reconcile point is the
-`if nextSeq == 0` branch at `internal/ingest/orchestrator/compaction_watermark.go:37` (pebble
-reload at `steady.go:27`). **Do NOT touch the running increment** `nextSeq: prepared.MaxSeq()+1`
+`0` today (`loadNextSeq`, `writer.go:698-702` — missing key → 0). The seed/reconcile point is the
+**event-seq** counter (`seq/next`) in the writer's open path: `reconciled := pebbleSeq` then
+`w.nextSeq = reconciled` (`internal/ingest/writer.go:126-142`) — floor `reconciled`/`nextSeq` to 1
+when the pebble key is absent (fresh dir), leaving the crash-recovery reconcile (`maxSeq+1`)
+untouched. NOTE: this is a DIFFERENT counter from the compaction watermark `compaction/seq`
+(`compaction_watermark.go`); do **not** edit `initCompactionWatermarkFloor` — with `nextSeq = 1`
+its existing `else` branch already yields watermark `nextSeq-1 = 0` ("nothing compacted"), which is
+correct. **Do NOT touch the running increment** `nextSeq: prepared.MaxSeq()+1`
 (`async_flush.go:114`) — that is the steady-state advance and is already correct; patching it would
 corrupt the counter. Confirm the `+1` chain yields `1` for the first-ever event given the new seed.
 No migration (nothing deployed). Then *delete* the now-unnecessary presence machinery — most of
