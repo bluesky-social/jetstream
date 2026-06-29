@@ -2,7 +2,11 @@
 
 Date: 2026-06-28
 Branch: `tombstone-query-plan-refactor` (work continues here)
-Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, 5, 8, 9, 10, and 11 landed; step 12 (docs) remains).
+Status: **implementation COMPLETE** (all 12 steps landed: 1, 2, 7, 6, 3, 4, 5, 8, 9, 10, 11, 12).
+Remaining: the final whole-effort gates (`just lint test`, `just test-long ./internal/oracle`,
+`just oracle`, `just oracle-sweep`, `just mutation-campaign` scorecard re-review) and two deferred
+follow-ups (#183 m025 replacement, #184 m022 detecting oracle); optional baseline.json commit-field
+refresh.
 **NOTE (RESOLVED):** step 9 flipped `/subscribe-v2` to reject too-old cursors with a 400, which
 made the oracle's `steady-state-client-backfill` lifecycle check known-red until step 10. **Step 10
 (#181) landed the bufferless pagination loop + client-side 400 re-backfill + `liveRewindMargin`
@@ -1056,7 +1060,25 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
   DID-level markers are covered by the §R4-revised sentinel index, not a plan response field).
 
 **Verify.** Manual read-through; `grep` for stale overlay/0-based/point-in-time language.
-**Status / notes.** _(unstarted)_
+**Status / notes.** ✅ **Done** (#185). `docs/README.md`: added the eventual-consistency /
+cooperative-completeness / fold invariant to §2; rewrote §2.1 to the paginated bufferless loop
+(pin `sealedTipSeq`, page to it, connect `/subscribe` once at S, cold replay covers mid-backfill
+seals); §3.1 (`:160`) now says tombstones are applied physically at compaction, not overlaid at
+delivery; dropped the entire `getTombstones` overlay subsection (kept the compaction narrative)
+and documented the `$account`/`$identity`/`$sync` sentinel-collection index that closes the
+collection-filtered DID-marker gap in the archive; rewrote the planner section for pagination
+(`sealedTipSeq` + per-unit truncation, no `PlanTooLarge`, wildcard collections) and the
+"putting it all together" flow as the loop with the §14 too-old 400 re-backfill; §4.4 now states
+`#account`/`#identity`/`#sync` are delivered unconditionally on v1 AND v2 (dropped the
+fold-before-filter / client-hides-`#account` narrative); §5 documents the v2 too-old → HTTP 400
+(v1 still silently clamps). `specs/oracle.md`: client tier folds-to-converge over paginated
+`planBackfill` (no `getTombstones`/overlay/`(W,M]` snapshot), restart tier uses fold-convergence,
+`m025` noted retired (#178, #183 tracks the replacement). `specs/notes/2026-05-27-cursor-replay-
+design.md:94-95` corrected (v2 live subscribe rejects below-floor with a 400). `planBackfill.json`
+description updated (pagination + inline markers, no tombstone fetch) + `just lexgen` regenerated
+bindings; `go build ./...` clean. `README.md` and root `doc.go` were already correct (verified).
+All `getTombstones`/overlay/0-based/point-in-time/v2-silent-clamp grep hits outside the dated
+reasoning-trail notes are gone.
 
 ---
 
@@ -1108,7 +1130,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged) (#180; oracle known-red until step 10)
 - [x] 10. client pagination loop + delete cutover buffer + 400 re-backfill (#181; oracle green again)
 - [x] 11. Part B oracle scenarios + mutants (#182)
-- [ ] 12. docs rewrite (relaxed cooperative contract)
+- [x] 12. docs rewrite (relaxed cooperative contract) (#185)
 
 Final gates before calling the effort done: `just lint test`, `just test-long ./internal/oracle`,
 `just oracle`, `just oracle-sweep`, `just mutation-campaign` (scorecard re-reviewed, not STALE).
