@@ -1044,7 +1044,7 @@ type JetstreamPlanBackfill_Input struct {
 
 // JetstreamPlanBackfill calls the XRPC procedure "network.bsky.jetstream.planBackfill".
 //
-// Plan sealed-archive downloads for a historical backfill. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested exact DID and collection filters. This is a transport planner only: clients must still decode rows, apply exact filtering, fetch tombstones if needed, and coordinate live-tail subscription independently.
+// Plan sealed-archive downloads for a historical backfill. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested DID and collection filters, and is paginated: pin sealedTipSeq and page with afterSeq=plannedThroughSeq until plannedThroughSeq reaches it. This is a transport planner only: clients must still decode rows, apply exact filtering, fold deletes/updates, and coordinate live-tail subscription independently. Deletion markers (record-level and DID-level) ride inline in the planned blocks; there is no separate tombstone fetch.
 func JetstreamPlanBackfill(ctx context.Context, c *xrpc.Client, input *JetstreamPlanBackfill_Input) (*JetstreamPlanBackfill_Output, error) {
 	var out JetstreamPlanBackfill_Output
 	return &out, c.Procedure(ctx, "network.bsky.jetstream.planBackfill", input, &out)

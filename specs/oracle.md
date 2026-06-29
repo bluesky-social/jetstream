@@ -240,20 +240,26 @@ watermark and later tombstone/update make that absence legal.
 ### Client-Driven Historical Tier
 
 This tier drives the real Go client (`github.com/bluesky-social/jetstream`)
-through the full archive-negotiation path — `getTombstones` → `planBackfill` →
-`getSegment`/`getBlock` → overlay suppression → cutover to `/subscribe-v2` —
-and asserts the documented compaction contract on what the client replayed.
-This is the historical product-path surface: it validates what real clients
-replay through the public APIs, carrying the `(W, M]` snapshot envelope that a
+through the full archive-negotiation path — paginated `planBackfill` →
+`getSegment`/`getBlock` → cutover to `/subscribe-v2` — and asserts the
+documented **fold-convergence** contract on what the client replayed. This is
+the historical product-path surface: it validates what real clients replay
+through the public APIs, exercising the paginated bufferless cutover (pin
+`sealedTipSeq`, page until `plannedThroughSeq` reaches it, connect once) that a
 bespoke whole-archive `/subscribe?cursor=0` replay lacks.
 
-The client is an **observation surface only**. Expected state (the compaction
-watermark, the suppression contract) is derived independently from simulator
-world state and the firehose history; the oracle never compares the client
-against itself. Because the client and Jetstream share `atmos` (and now the
-client shares the segment/overlay decoders with the server), the direct segment
-and event-log tiers remain the independent storage check that distinguishes a
-server bug from a client bug — the client tier runs alongside them, not instead.
+The client is an **observation surface only**, and the check is
+eventually-consistent, not point-in-time: the oracle folds the full emitted
+stream (creates/updates apply; deletes/account-deletes/syncs remove) and
+compares the converged result against ground truth derived independently from
+simulator world state and the firehose history — matching a dead record's
+killer to a DID-level marker by DID, never comparing the client against itself.
+The contract is at-least-once with no silent loss of in-scope retrievable data;
+transient stale rows that a later marker kills are expected, not a violation.
+Because the client and Jetstream share `atmos` (and the client shares the
+segment decoders with the server), the direct segment and event-log tiers remain
+the independent storage check that distinguishes a server bug from a client bug
+— the client tier runs alongside them, not instead.
 
 The client emits jetstream's own seq, so the drain stops at a jetstream-seq
 watermark (e.g. the steady compaction watermark), not the simulator's upstream
@@ -315,17 +321,21 @@ the same seams while the nightly sweep explores the state space:
 Three post-restart checks run over the recovered segments: final-state
 `Compare` (existing); at-least-once event-log **coverage** (every model-derived
 durable row is present at least once, tolerant of the contract-permitted
-re-merge duplicate, sensitive to loss); and the compaction contract +
-overlay/visibility reconstruction. The expected side is model-derived from the
-chain the test issued (oracle independence), using on-disk seqs only to position
-the watermark-compaction filter.
+re-merge duplicate, sensitive to loss); and the compaction contract via
+fold-convergence (fold the recovered stream and compare the converged result to
+ground truth). The expected side is model-derived from the chain the test issued
+(oracle independence), using on-disk seqs only to position the
+watermark-compaction filter.
 
 The convergence-hiding compaction over-drop (#100) is NOT reachable here: the
 merge-tail compaction snapshot always spans the whole sealed stream, so every
-drop decision is complete. That check's end-to-end proof lives in the
+drop decision is complete. That check's end-to-end proof lived in the
 steady-state tier (mutation `m025`), where a delete arriving after the pass's
 force-rotate sits above the watermark and a survivor can be wrongly dropped
-while final state still converges.
+while final state still converges. `m025` was retired when its
+`Set.SnapshotRange` mechanism was deleted in #178 (the on-disk windowed fold can
+no longer reach the above-watermark over-drop it modelled); #183 tracks
+re-deriving a dedicated mutant for the #100 over-drop recorder.
 
 ### Store-Fault Tier
 

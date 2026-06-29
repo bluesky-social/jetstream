@@ -91,8 +91,17 @@ range scan simply finds nothing older than the TTL boundary and
 starts at the oldest available row). No error; no warning log
 beyond the structured request log line.
 
-v2 seq cursors have no window cap. They can replay from the
-beginning of the archive.
+v2 seq cursors can replay from the beginning of the sealed
+archive. But the live `/subscribe-v2` lookback floor is enforced:
+a v2 seq cursor that resolves below the lookback floor is rejected
+with a pre-upgrade HTTP 400 ("cursor too old", carrying the floor
+seq), NOT silently clamped (the v1 timestamp path above still
+clamps). This is the explicit signal a paginated backfill client
+keys on to re-backfill from its last seq rather than silently
+dropping the gap — see the 2026-06-28 drop-client-tombstones
+design §14. (Replaying the sealed archive itself goes through
+paginated `planBackfill` + segment downloads, not the live
+websocket, so "from the beginning" is not bounded by the floor.)
 
 ## Configuration
 
