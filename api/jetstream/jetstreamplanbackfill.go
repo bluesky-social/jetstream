@@ -227,224 +227,6 @@ func (s *JetstreamPlanBackfill_BlockRange) UnmarshalJSONAt(data []byte, pos int)
 	}
 }
 
-// JetstreamPlanBackfill_DidTombstone is a "didTombstone" in the network.bsky.jetstream.planBackfill schema.
-type JetstreamPlanBackfill_DidTombstone struct {
-	LexiconTypeID string `json:"$type,omitempty"`
-	DID           string `json:"did"` // The account whose DID-level tombstone (account-delete or sync) this is.
-	Seq           int64  `json:"seq"` // The jetstream seq of the highest account-delete/sync for this DID within the snapshot range. The ...
-
-	// extra preserves unknown fields for same-format round-trips.
-	extra []extraField
-}
-
-// Precomputed CBOR key tokens for JetstreamPlanBackfill_DidTombstone.
-var (
-	cborKey_JetstreamPlanBackfill_DidTombstone_did         = cbor.AppendTextKey(nil, "did")
-	cborKey_JetstreamPlanBackfill_DidTombstone_seq         = cbor.AppendTextKey(nil, "seq")
-	cborKey_JetstreamPlanBackfill_DidTombstone_dollar_type = cbor.AppendTextKey(nil, "$type")
-)
-
-func (s *JetstreamPlanBackfill_DidTombstone) MarshalCBOR() ([]byte, error) {
-	return s.AppendCBOR(make([]byte, 0, 256))
-}
-
-func (s *JetstreamPlanBackfill_DidTombstone) AppendCBOR(buf []byte) ([]byte, error) {
-	n := 2 + countExtra(s.extra, extraEncodingCBOR)
-	if s.LexiconTypeID != "" {
-		n++
-	}
-	buf = cbor.AppendMapHeader(buf, uint64(n))
-	if len(s.extra) > 0 {
-		ei := 0
-		ei, buf = appendCBORExtrasBefore(s.extra, ei, "did", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_DidTombstone_did...)
-		buf = cbor.AppendText(buf, s.DID)
-		ei, buf = appendCBORExtrasBefore(s.extra, ei, "seq", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_DidTombstone_seq...)
-		buf = cbor.AppendInt(buf, s.Seq)
-		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
-		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_DidTombstone_dollar_type...)
-			buf = cbor.AppendText(buf, s.LexiconTypeID)
-		}
-		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
-	} else {
-		buf = append(buf, cborKey_JetstreamPlanBackfill_DidTombstone_did...)
-		buf = cbor.AppendText(buf, s.DID)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_DidTombstone_seq...)
-		buf = cbor.AppendInt(buf, s.Seq)
-		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_DidTombstone_dollar_type...)
-			buf = cbor.AppendText(buf, s.LexiconTypeID)
-		}
-	}
-	return buf, nil
-}
-
-func (s *JetstreamPlanBackfill_DidTombstone) UnmarshalCBOR(data []byte) error {
-	_, err := s.UnmarshalCBORAt(data, 0)
-	return err
-}
-
-func (s *JetstreamPlanBackfill_DidTombstone) UnmarshalCBORAt(data []byte, pos int) (int, error) {
-	s.extra = clearExtra(s.extra, extraEncodingCBOR)
-	count, pos, err := cbor.ReadMapHeader(data, pos)
-	if err != nil {
-		return 0, err
-	}
-	for i := uint64(0); i < count; i++ {
-		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
-		if err != nil {
-			return 0, err
-		}
-		pos = newPos
-		switch keyEnd - keyStart {
-		case 3:
-			if string(data[keyStart:keyEnd]) == "did" {
-				s.DID, pos, err = cbor.ReadText(data, pos)
-				if err != nil {
-					return 0, err
-				}
-			} else if string(data[keyStart:keyEnd]) == "seq" {
-				s.Seq, pos, err = cbor.ReadInt(data, pos)
-				if err != nil {
-					return 0, err
-				}
-			} else {
-				valueStart := pos
-				pos, err = cbor.SkipValue(data, pos)
-				if err != nil {
-					return 0, err
-				}
-				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
-			}
-		case 5:
-			if string(data[keyStart:keyEnd]) == "$type" {
-				s.LexiconTypeID, pos, err = cbor.ReadText(data, pos)
-				if err != nil {
-					return 0, err
-				}
-			} else {
-				valueStart := pos
-				pos, err = cbor.SkipValue(data, pos)
-				if err != nil {
-					return 0, err
-				}
-				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
-			}
-		default:
-			valueStart := pos
-			pos, err = cbor.SkipValue(data, pos)
-			if err != nil {
-				return 0, err
-			}
-			s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
-		}
-	}
-	return pos, nil
-}
-
-// Precomputed JSON key tokens for JetstreamPlanBackfill_DidTombstone.
-var (
-	jsonKey_JetstreamPlanBackfill_DidTombstone_dollar_type = []byte("\"$type\":")
-	jsonKey_JetstreamPlanBackfill_DidTombstone_did         = []byte("\"did\":")
-	jsonKey_JetstreamPlanBackfill_DidTombstone_seq         = []byte("\"seq\":")
-)
-
-func (s *JetstreamPlanBackfill_DidTombstone) MarshalJSON() ([]byte, error) {
-	return s.AppendJSON(make([]byte, 0, 256))
-}
-
-func (s *JetstreamPlanBackfill_DidTombstone) AppendJSON(buf []byte) ([]byte, error) {
-	buf = append(buf, '{')
-	first := true
-	if s.LexiconTypeID != "" {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_DidTombstone_dollar_type...)
-		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
-		first = false
-	}
-	if !first {
-		buf = append(buf, ',')
-	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_DidTombstone_did...)
-	buf = cbor.AppendJSONString(buf, s.DID)
-	first = false
-	if !first {
-		buf = append(buf, ',')
-	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_DidTombstone_seq...)
-	buf = cbor.AppendJSONInt(buf, s.Seq)
-	first = false
-	for _, ef := range s.extra {
-		if ef.Encoding != extraEncodingJSON {
-			continue
-		}
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = cbor.AppendJSONString(buf, ef.Key)
-		buf = append(buf, ':')
-		buf = append(buf, ef.Value...)
-		first = false
-	}
-	buf = append(buf, '}')
-	return buf, nil
-}
-
-func (s *JetstreamPlanBackfill_DidTombstone) UnmarshalJSON(data []byte) error {
-	_, err := s.UnmarshalJSONAt(data, 0)
-	return err
-}
-
-func (s *JetstreamPlanBackfill_DidTombstone) UnmarshalJSONAt(data []byte, pos int) (int, error) {
-	s.extra = clearExtra(s.extra, extraEncodingJSON)
-	var err error
-	pos, err = cbor.ReadJSONObjectStart(data, pos)
-	if err != nil {
-		return 0, err
-	}
-	for {
-		var done bool
-		pos, done = cbor.ReadJSONObjectEnd(data, pos)
-		if done {
-			return pos, nil
-		}
-		var key string
-		key, pos, err = cbor.ReadJSONKey(data, pos)
-		if err != nil {
-			return 0, err
-		}
-		switch key {
-		case "$type":
-			s.LexiconTypeID, pos, err = cbor.ReadJSONString(data, pos)
-			if err != nil {
-				return 0, err
-			}
-		case "did":
-			s.DID, pos, err = cbor.ReadJSONString(data, pos)
-			if err != nil {
-				return 0, err
-			}
-		case "seq":
-			s.Seq, pos, err = cbor.ReadJSONInt(data, pos)
-			if err != nil {
-				return 0, err
-			}
-		default:
-			valueStart := pos
-			pos, err = cbor.SkipJSONValue(data, pos)
-			if err != nil {
-				return 0, err
-			}
-			s.extra = append(s.extra, extraField{Key: key, Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingJSON})
-		}
-		pos = cbor.SkipJSONComma(data, pos)
-	}
-}
-
 // Error name constants for JetstreamPlanBackfill.
 const (
 	ErrJetstreamPlanBackfill_PlanTooLarge = "PlanTooLarge" // The plan would exceed the server's configured response/work entry limit.
@@ -452,12 +234,10 @@ const (
 
 // Precomputed JSON key tokens for JetstreamPlanBackfill_Output.
 var (
-	jsonKey_JetstreamPlanBackfill_Output_dollar_type           = []byte("\"$type\":")
-	jsonKey_JetstreamPlanBackfill_Output_didTombstones         = []byte("\"didTombstones\":")
-	jsonKey_JetstreamPlanBackfill_Output_didTombstonesIncluded = []byte("\"didTombstonesIncluded\":")
-	jsonKey_JetstreamPlanBackfill_Output_plannedThroughSeq     = []byte("\"plannedThroughSeq\":")
-	jsonKey_JetstreamPlanBackfill_Output_segments              = []byte("\"segments\":")
-	jsonKey_JetstreamPlanBackfill_Output_stats                 = []byte("\"stats\":")
+	jsonKey_JetstreamPlanBackfill_Output_dollar_type       = []byte("\"$type\":")
+	jsonKey_JetstreamPlanBackfill_Output_plannedThroughSeq = []byte("\"plannedThroughSeq\":")
+	jsonKey_JetstreamPlanBackfill_Output_segments          = []byte("\"segments\":")
+	jsonKey_JetstreamPlanBackfill_Output_stats             = []byte("\"stats\":")
 )
 
 func (s *JetstreamPlanBackfill_Output) MarshalJSON() ([]byte, error) {
@@ -473,33 +253,6 @@ func (s *JetstreamPlanBackfill_Output) AppendJSON(buf []byte) ([]byte, error) {
 		}
 		buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
-		first = false
-	}
-	if len(s.DidTombstones) > 0 {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_didTombstones...)
-		buf = append(buf, '[')
-		for i, item := range s.DidTombstones {
-			if i > 0 {
-				buf = append(buf, ',')
-			}
-			var err error
-			buf, err = item.AppendJSON(buf)
-			if err != nil {
-				return nil, err
-			}
-		}
-		buf = append(buf, ']')
-		first = false
-	}
-	if s.DidTombstonesIncluded.HasVal() {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_didTombstonesIncluded...)
-		buf = cbor.AppendJSONBool(buf, s.DidTombstonesIncluded.Val())
 		first = false
 	}
 	if !first {
@@ -582,47 +335,6 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalJSONAt(data []byte, pos int) (in
 			if err != nil {
 				return 0, err
 			}
-		case "didTombstones":
-			if !cbor.IsJSONNull(data, pos) {
-				pos, err = cbor.ReadJSONArrayStart(data, pos)
-				if err != nil {
-					return 0, err
-				}
-				s.DidTombstones = nil
-				for {
-					var done bool
-					pos, done = cbor.ReadJSONArrayEnd(data, pos)
-					if done {
-						break
-					}
-					var elem JetstreamPlanBackfill_DidTombstone
-					pos, err = elem.UnmarshalJSONAt(data, pos)
-					if err != nil {
-						return 0, err
-					}
-					s.DidTombstones = append(s.DidTombstones, elem)
-					pos = cbor.SkipJSONComma(data, pos)
-				}
-			} else {
-				pos, err = cbor.SkipJSONNull(data, pos)
-				if err != nil {
-					return 0, err
-				}
-			}
-		case "didTombstonesIncluded":
-			if cbor.IsJSONNull(data, pos) {
-				pos, err = cbor.SkipJSONNull(data, pos)
-				if err != nil {
-					return 0, err
-				}
-			} else {
-				var v bool
-				v, pos, err = cbor.ReadJSONBool(data, pos)
-				if err != nil {
-					return 0, err
-				}
-				s.DidTombstonesIncluded = gt.Some(v)
-			}
 		case "plannedThroughSeq":
 			s.PlannedThroughSeq, pos, err = cbor.ReadJSONInt(data, pos)
 			if err != nil {
@@ -674,12 +386,10 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalJSONAt(data []byte, pos int) (in
 
 // Precomputed CBOR key tokens for JetstreamPlanBackfill_Output.
 var (
-	cborKey_JetstreamPlanBackfill_Output_dollar_type           = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamPlanBackfill_Output_stats                 = cbor.AppendTextKey(nil, "stats")
-	cborKey_JetstreamPlanBackfill_Output_segments              = cbor.AppendTextKey(nil, "segments")
-	cborKey_JetstreamPlanBackfill_Output_didTombstones         = cbor.AppendTextKey(nil, "didTombstones")
-	cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq     = cbor.AppendTextKey(nil, "plannedThroughSeq")
-	cborKey_JetstreamPlanBackfill_Output_didTombstonesIncluded = cbor.AppendTextKey(nil, "didTombstonesIncluded")
+	cborKey_JetstreamPlanBackfill_Output_dollar_type       = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamPlanBackfill_Output_stats             = cbor.AppendTextKey(nil, "stats")
+	cborKey_JetstreamPlanBackfill_Output_segments          = cbor.AppendTextKey(nil, "segments")
+	cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq = cbor.AppendTextKey(nil, "plannedThroughSeq")
 )
 
 func (s *JetstreamPlanBackfill_Output) MarshalCBOR() ([]byte, error) {
@@ -689,12 +399,6 @@ func (s *JetstreamPlanBackfill_Output) MarshalCBOR() ([]byte, error) {
 func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 3 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
-		n++
-	}
-	if len(s.DidTombstones) > 0 {
-		n++
-	}
-	if s.DidTombstonesIncluded.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -724,26 +428,9 @@ func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
-		ei, buf = appendCBORExtrasBefore(s.extra, ei, "didTombstones", buf)
-		if len(s.DidTombstones) > 0 {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Output_didTombstones...)
-			buf = cbor.AppendArrayHeader(buf, uint64(len(s.DidTombstones)))
-			for _, item := range s.DidTombstones {
-				var err error
-				buf, err = item.AppendCBOR(buf)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "plannedThroughSeq", buf)
 		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq...)
 		buf = cbor.AppendInt(buf, s.PlannedThroughSeq)
-		ei, buf = appendCBORExtrasBefore(s.extra, ei, "didTombstonesIncluded", buf)
-		if s.DidTombstonesIncluded.HasVal() {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Output_didTombstonesIncluded...)
-			buf = cbor.AppendBool(buf, s.DidTombstonesIncluded.Val())
-		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		if s.LexiconTypeID != "" {
@@ -767,23 +454,8 @@ func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
-		if len(s.DidTombstones) > 0 {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Output_didTombstones...)
-			buf = cbor.AppendArrayHeader(buf, uint64(len(s.DidTombstones)))
-			for _, item := range s.DidTombstones {
-				var err error
-				buf, err = item.AppendCBOR(buf)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
 		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq...)
 		buf = cbor.AppendInt(buf, s.PlannedThroughSeq)
-		if s.DidTombstonesIncluded.HasVal() {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Output_didTombstonesIncluded...)
-			buf = cbor.AppendBool(buf, s.DidTombstonesIncluded.Val())
-		}
 	}
 	return buf, nil
 }
@@ -852,58 +524,11 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalCBORAt(data []byte, pos int) (in
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
-		case 13:
-			if string(data[keyStart:keyEnd]) == "didTombstones" {
-				{
-					arrLen, newPos, err := cbor.ReadArrayHeader(data, pos)
-					if err != nil {
-						return 0, err
-					}
-					if err := cbor.CheckArrayLen(arrLen, data, newPos); err != nil {
-						return 0, err
-					}
-					pos = newPos
-					s.DidTombstones = make([]JetstreamPlanBackfill_DidTombstone, arrLen)
-					for idx := range arrLen {
-						pos, err = s.DidTombstones[idx].UnmarshalCBORAt(data, pos)
-						if err != nil {
-							return 0, err
-						}
-					}
-				}
-			} else {
-				valueStart := pos
-				pos, err = cbor.SkipValue(data, pos)
-				if err != nil {
-					return 0, err
-				}
-				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
-			}
 		case 17:
 			if string(data[keyStart:keyEnd]) == "plannedThroughSeq" {
 				s.PlannedThroughSeq, pos, err = cbor.ReadInt(data, pos)
 				if err != nil {
 					return 0, err
-				}
-			} else {
-				valueStart := pos
-				pos, err = cbor.SkipValue(data, pos)
-				if err != nil {
-					return 0, err
-				}
-				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
-			}
-		case 21:
-			if string(data[keyStart:keyEnd]) == "didTombstonesIncluded" {
-				if cbor.IsNull(data, pos) {
-					pos++
-				} else {
-					var v bool
-					v, pos, err = cbor.ReadBool(data, pos)
-					if err != nil {
-						return 0, err
-					}
-					s.DidTombstonesIncluded = gt.Some(v)
 				}
 			} else {
 				valueStart := pos
@@ -926,12 +551,10 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalCBORAt(data []byte, pos int) (in
 }
 
 type JetstreamPlanBackfill_Output struct {
-	LexiconTypeID         string                               `json:"$type,omitempty"`
-	DidTombstones         []JetstreamPlanBackfill_DidTombstone `json:"didTombstones,omitempty"`        // DID-level tombstones (account-delete / sync) with seq in (afterSeq, plannedThroughSeq], intersect...
-	DidTombstonesIncluded gt.Option[bool]                      `json:"didTombstonesIncluded,omitzero"` // True iff this response carries the DID-tombstone snapshot (i.e. wantDidTombstones was set on the ...
-	PlannedThroughSeq     int64                                `json:"plannedThroughSeq"`              // Highest sealed seq covered by this plan, capped by beforeSeq when provided.
-	Segments              []JetstreamPlanBackfill_Segment      `json:"segments"`
-	Stats                 JetstreamPlanBackfill_Stats          `json:"stats"`
+	LexiconTypeID     string                          `json:"$type,omitempty"`
+	PlannedThroughSeq int64                           `json:"plannedThroughSeq"` // Highest sealed seq covered by this plan, capped by beforeSeq when provided.
+	Segments          []JetstreamPlanBackfill_Segment `json:"segments"`
+	Stats             JetstreamPlanBackfill_Stats     `json:"stats"`
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -939,12 +562,11 @@ type JetstreamPlanBackfill_Output struct {
 
 // Precomputed JSON key tokens for JetstreamPlanBackfill_Input.
 var (
-	jsonKey_JetstreamPlanBackfill_Input_dollar_type       = []byte("\"$type\":")
-	jsonKey_JetstreamPlanBackfill_Input_afterSeq          = []byte("\"afterSeq\":")
-	jsonKey_JetstreamPlanBackfill_Input_beforeSeq         = []byte("\"beforeSeq\":")
-	jsonKey_JetstreamPlanBackfill_Input_collections       = []byte("\"collections\":")
-	jsonKey_JetstreamPlanBackfill_Input_dids              = []byte("\"dids\":")
-	jsonKey_JetstreamPlanBackfill_Input_wantDidTombstones = []byte("\"wantDidTombstones\":")
+	jsonKey_JetstreamPlanBackfill_Input_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamPlanBackfill_Input_afterSeq    = []byte("\"afterSeq\":")
+	jsonKey_JetstreamPlanBackfill_Input_beforeSeq   = []byte("\"beforeSeq\":")
+	jsonKey_JetstreamPlanBackfill_Input_collections = []byte("\"collections\":")
+	jsonKey_JetstreamPlanBackfill_Input_dids        = []byte("\"dids\":")
 )
 
 func (s *JetstreamPlanBackfill_Input) MarshalJSON() ([]byte, error) {
@@ -1006,14 +628,6 @@ func (s *JetstreamPlanBackfill_Input) AppendJSON(buf []byte) ([]byte, error) {
 			buf = cbor.AppendJSONString(buf, item)
 		}
 		buf = append(buf, ']')
-		first = false
-	}
-	if s.WantDidTombstones.HasVal() {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Input_wantDidTombstones...)
-		buf = cbor.AppendJSONBool(buf, s.WantDidTombstones.Val())
 		first = false
 	}
 	for _, ef := range s.extra {
@@ -1143,20 +757,6 @@ func (s *JetstreamPlanBackfill_Input) UnmarshalJSONAt(data []byte, pos int) (int
 					return 0, err
 				}
 			}
-		case "wantDidTombstones":
-			if cbor.IsJSONNull(data, pos) {
-				pos, err = cbor.SkipJSONNull(data, pos)
-				if err != nil {
-					return 0, err
-				}
-			} else {
-				var v bool
-				v, pos, err = cbor.ReadJSONBool(data, pos)
-				if err != nil {
-					return 0, err
-				}
-				s.WantDidTombstones = gt.Some(v)
-			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipJSONValue(data, pos)
@@ -1171,12 +771,11 @@ func (s *JetstreamPlanBackfill_Input) UnmarshalJSONAt(data []byte, pos int) (int
 
 // Precomputed CBOR key tokens for JetstreamPlanBackfill_Input.
 var (
-	cborKey_JetstreamPlanBackfill_Input_dids              = cbor.AppendTextKey(nil, "dids")
-	cborKey_JetstreamPlanBackfill_Input_dollar_type       = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamPlanBackfill_Input_afterSeq          = cbor.AppendTextKey(nil, "afterSeq")
-	cborKey_JetstreamPlanBackfill_Input_beforeSeq         = cbor.AppendTextKey(nil, "beforeSeq")
-	cborKey_JetstreamPlanBackfill_Input_collections       = cbor.AppendTextKey(nil, "collections")
-	cborKey_JetstreamPlanBackfill_Input_wantDidTombstones = cbor.AppendTextKey(nil, "wantDidTombstones")
+	cborKey_JetstreamPlanBackfill_Input_dids        = cbor.AppendTextKey(nil, "dids")
+	cborKey_JetstreamPlanBackfill_Input_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamPlanBackfill_Input_afterSeq    = cbor.AppendTextKey(nil, "afterSeq")
+	cborKey_JetstreamPlanBackfill_Input_beforeSeq   = cbor.AppendTextKey(nil, "beforeSeq")
+	cborKey_JetstreamPlanBackfill_Input_collections = cbor.AppendTextKey(nil, "collections")
 )
 
 func (s *JetstreamPlanBackfill_Input) MarshalCBOR() ([]byte, error) {
@@ -1198,9 +797,6 @@ func (s *JetstreamPlanBackfill_Input) AppendCBOR(buf []byte) ([]byte, error) {
 		n++
 	}
 	if len(s.Collections) > 0 {
-		n++
-	}
-	if s.WantDidTombstones.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -1237,11 +833,6 @@ func (s *JetstreamPlanBackfill_Input) AppendCBOR(buf []byte) ([]byte, error) {
 				buf = cbor.AppendText(buf, item)
 			}
 		}
-		ei, buf = appendCBORExtrasBefore(s.extra, ei, "wantDidTombstones", buf)
-		if s.WantDidTombstones.HasVal() {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_wantDidTombstones...)
-			buf = cbor.AppendBool(buf, s.WantDidTombstones.Val())
-		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		if len(s.Dids) > 0 {
@@ -1269,10 +860,6 @@ func (s *JetstreamPlanBackfill_Input) AppendCBOR(buf []byte) ([]byte, error) {
 			for _, item := range s.Collections {
 				buf = cbor.AppendText(buf, item)
 			}
-		}
-		if s.WantDidTombstones.HasVal() {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_wantDidTombstones...)
-			buf = cbor.AppendBool(buf, s.WantDidTombstones.Val())
 		}
 	}
 	return buf, nil
@@ -1404,26 +991,6 @@ func (s *JetstreamPlanBackfill_Input) UnmarshalCBORAt(data []byte, pos int) (int
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
-		case 17:
-			if string(data[keyStart:keyEnd]) == "wantDidTombstones" {
-				if cbor.IsNull(data, pos) {
-					pos++
-				} else {
-					var v bool
-					v, pos, err = cbor.ReadBool(data, pos)
-					if err != nil {
-						return 0, err
-					}
-					s.WantDidTombstones = gt.Some(v)
-				}
-			} else {
-				valueStart := pos
-				pos, err = cbor.SkipValue(data, pos)
-				if err != nil {
-					return 0, err
-				}
-				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
-			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipValue(data, pos)
@@ -1437,12 +1004,11 @@ func (s *JetstreamPlanBackfill_Input) UnmarshalCBORAt(data []byte, pos int) (int
 }
 
 type JetstreamPlanBackfill_Input struct {
-	LexiconTypeID     string           `json:"$type,omitempty"`
-	AfterSeq          gt.Option[int64] `json:"afterSeq,omitzero"`          // Lower exclusive sequence bound. Rows with seq <= afterSeq are outside the requested window.
-	BeforeSeq         gt.Option[int64] `json:"beforeSeq,omitzero"`         // Upper inclusive sequence bound. Rows with seq > beforeSeq are outside the requested window.
-	Collections       []string         `json:"collections,omitempty"`      // Collection filters to match. Each entry is either an exact NSID (e.g. app.bsky.feed.post) or a na...
-	Dids              []string         `json:"dids,omitempty"`             // Exact DIDs to match. Missing or empty means all DIDs.
-	WantDidTombstones gt.Option[bool]  `json:"wantDidTombstones,omitzero"` // Set true ONLY on the first page of a fresh backfill to request the DID-level tombstone snapshot o...
+	LexiconTypeID string           `json:"$type,omitempty"`
+	AfterSeq      gt.Option[int64] `json:"afterSeq,omitzero"`     // Lower exclusive sequence bound. Rows with seq <= afterSeq are outside the requested window.
+	BeforeSeq     gt.Option[int64] `json:"beforeSeq,omitzero"`    // Upper inclusive sequence bound. Rows with seq > beforeSeq are outside the requested window.
+	Collections   []string         `json:"collections,omitempty"` // Collection filters to match. Each entry is either an exact NSID (e.g. app.bsky.feed.post) or a na...
+	Dids          []string         `json:"dids,omitempty"`        // Exact DIDs to match. Missing or empty means all DIDs.
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -1450,7 +1016,7 @@ type JetstreamPlanBackfill_Input struct {
 
 // JetstreamPlanBackfill calls the XRPC procedure "network.bsky.jetstream.planBackfill".
 //
-// Plan sealed-archive downloads for a historical backfill. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested exact DID and collection filters. This is a transport planner only: clients must still decode rows, apply exact filtering, and coordinate live-tail subscription independently. On the first page (wantDidTombstones), the response also carries a DID-level tombstone snapshot so a collection-filtered backfill can suppress records of accounts deleted within the planned range.
+// Plan sealed-archive downloads for a historical backfill. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested exact DID and collection filters. This is a transport planner only: clients must still decode rows, apply exact filtering, fetch tombstones if needed, and coordinate live-tail subscription independently.
 func JetstreamPlanBackfill(ctx context.Context, c *xrpc.Client, input *JetstreamPlanBackfill_Input) (*JetstreamPlanBackfill_Output, error) {
 	var out JetstreamPlanBackfill_Output
 	return &out, c.Procedure(ctx, "network.bsky.jetstream.planBackfill", input, &out)

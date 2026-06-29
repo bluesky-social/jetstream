@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Plan sealed-archive downloads for a historical backfill. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested exact DID and collection filters. This is a transport planner only: clients must still decode rows, apply exact filtering, and coordinate live-tail subscription independently. On the first page (wantDidTombstones), the response also carries a DID-level tombstone snapshot so a collection-filtered backfill can suppress records of accounts deleted within the planned range.",
+      "description": "Plan sealed-archive downloads for a historical backfill. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested exact DID and collection filters. This is a transport planner only: clients must still decode rows, apply exact filtering, fetch tombstones if needed, and coordinate live-tail subscription independently.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -29,10 +29,6 @@
               "type": "integer",
               "minimum": 0,
               "description": "Upper inclusive sequence bound. Rows with seq > beforeSeq are outside the requested window."
-            },
-            "wantDidTombstones": {
-              "type": "boolean",
-              "description": "Set true ONLY on the first page of a fresh backfill to request the DID-level tombstone snapshot over (afterSeq, plannedThroughSeq]. A collection-filtered backfill never downloads account-delete/sync markers (they carry an empty collection and ride in no collection block), so without this snapshot a folding consumer would keep a deleted account's records forever. DID-level only; record-level tombstones ride inline through the normal download. Subsequent pages omit this."
             }
           }
         }
@@ -52,16 +48,7 @@
               "type": "array",
               "items": { "type": "ref", "ref": "#segment" }
             },
-            "stats": { "type": "ref", "ref": "#stats" },
-            "didTombstonesIncluded": {
-              "type": "boolean",
-              "description": "True iff this response carries the DID-tombstone snapshot (i.e. wantDidTombstones was set on the request and the server honored it). The client MUST gate on this flag, not on didTombstones being non-empty: an empty snapshot is a legitimate result, but a missing snapshot from a too-old server must be treated as a fatal fail-closed condition (proceeding with an empty suppression set would silently retain deleted accounts' records)."
-            },
-            "didTombstones": {
-              "type": "array",
-              "description": "DID-level tombstones (account-delete / sync) with seq in (afterSeq, plannedThroughSeq], intersected with the request's DID filter when one is set. Present only when didTombstonesIncluded is true. The client folds these as seq-scoped, DID-only suppression of its own emitted create/update rows (drop a row iff its DID's tombstone seq is strictly greater than the row's seq); it MUST NOT synthesize delete/account events from them.",
-              "items": { "type": "ref", "ref": "#didTombstone" }
-            }
+            "stats": { "type": "ref", "ref": "#stats" }
           }
         }
       },
@@ -96,14 +83,6 @@
       "properties": {
         "first": { "type": "integer", "minimum": 0, "description": "First block index in this inclusive range." },
         "last": { "type": "integer", "minimum": 0, "description": "Last block index in this inclusive range." }
-      }
-    },
-    "didTombstone": {
-      "type": "object",
-      "required": ["did", "seq"],
-      "properties": {
-        "did": { "type": "string", "format": "did", "description": "The account whose DID-level tombstone (account-delete or sync) this is." },
-        "seq": { "type": "integer", "minimum": 0, "description": "The jetstream seq of the highest account-delete/sync for this DID within the snapshot range. The client drops its own emitted create/update rows for this DID with a strictly smaller seq." }
       }
     },
     "stats": {

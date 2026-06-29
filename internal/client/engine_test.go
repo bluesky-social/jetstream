@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -59,13 +58,6 @@ type engineHarness struct {
 	planned   uint64
 	planEntry []planSeg // segments to name in the plan, in order
 	liveSteps []readStep
-	// didTombstones is the §R4 start-snapshot the planBackfill mock returns.
-	// nil is the common "nothing deleted in range" case (an INCLUDED empty
-	// snapshot). The flag is included by default; omitDIDTombstoneFlag models a
-	// too-old server that never sends it, exercising the client's fail-closed
-	// path.
-	didTombstones        []DIDTombstone
-	omitDIDTombstoneFlag bool
 }
 
 type planSeg struct {
@@ -92,20 +84,8 @@ func (h *engineHarness) planJSON() string {
 			`{"name":%q,"index":%d,"checksum":"deadbeefdeadbeef","minSeq":%d,"maxSeq":%d,"mode":"segment"}`,
 			s.name, s.index, s.minSeq, s.maxSeq))
 	}
-	// The §R4 snapshot fields. By default the server includes the snapshot (the
-	// flag is true) so the engine's fail-closed gate is satisfied; the entries
-	// default to empty ("nothing deleted in range"). omitDIDTombstoneFlag models
-	// a too-old server so the fail-closed path can be tested.
-	snapFields := ""
-	if !h.omitDIDTombstoneFlag {
-		var tombs []string
-		for _, ts := range h.didTombstones {
-			tombs = append(tombs, fmt.Sprintf(`{"did":%q,"seq":%d}`, ts.DID, ts.Seq))
-		}
-		snapFields = fmt.Sprintf(`,"didTombstonesIncluded":true,"didTombstones":[%s]`, strings.Join(tombs, ","))
-	}
-	return fmt.Sprintf(`{"plannedThroughSeq":%d,"segments":[%s],"stats":{"segmentsExamined":%d,"segmentsMatched":%d,"blocksMatched":0,"entries":%d}%s}`,
-		h.planned, strings.Join(segs, ","), len(h.planEntry), len(h.planEntry), len(h.planEntry), snapFields)
+	return fmt.Sprintf(`{"plannedThroughSeq":%d,"segments":[%s],"stats":{"segmentsExamined":%d,"segmentsMatched":%d,"blocksMatched":0,"entries":%d}}`,
+		h.planned, strings.Join(segs, ","), len(h.planEntry), len(h.planEntry), len(h.planEntry))
 }
 
 func (h *engineHarness) cfg() Config {
@@ -343,86 +323,6 @@ func TestEngineBackfillOnly(t *testing.T) {
 	defer mu.Unlock()
 	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, uniqueSeqs(events), "all sealed seqs emitted, no live seq 7")
 	require.Equal(t, 0, *dials, "backfill-only must never dial the live websocket")
-}
-
-// TestEngineFailsClosedWhenSnapshotMissing covers the §R6.6 fail-closed
-// contract: the engine requests the DID-tombstone snapshot on page 1, and if the
-// server does not include it (a too-old server — didTombstonesIncluded absent),
-// the engine MUST abort with a FATAL error rather than backfill with an empty
-// suppression set, which would silently retain deleted accounts' records. Crash
-// over corruption. Covers both backfill paths.
-func TestEngineFailsClosedWhenSnapshotMissing(t *testing.T) {
-	t.Parallel()
-	for _, backfillOnly := range []bool{false, true} {
-		name := "backfill-then-live"
-		if backfillOnly {
-			name = "backfill-only"
-		}
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			h := newEngineHarness(t)
-			h.as.addSegment(t, "seg_0000000000.jss", []segment.Event{
-				makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
-			})
-			h.planned = 1
-			h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 1}}
-			h.omitDIDTombstoneFlag = true // too-old server: never sends the snapshot
-			h.installHandlers()
-
-			cfg := h.cfg()
-			cfg.BackfillOnly = backfillOnly
-
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			var (
-				mu        sync.Mutex
-				events    []Event
-				errs      []error
-				fatalSeen bool
-			)
-			eng := NewEngine(cfg)
-			finished := make(chan struct{})
-			go func() {
-				defer close(finished)
-				eng.Run(ctx,
-					func(batch []Event) bool {
-						mu.Lock()
-						events = append(events, batch...)
-						mu.Unlock()
-						return true
-					},
-					func(err error) bool {
-						mu.Lock()
-						errs = append(errs, err)
-						if errors.Is(err, ErrFatal) {
-							fatalSeen = true
-						}
-						mu.Unlock()
-						// Returning true keeps consuming, but a fatal abort stops the
-						// engine regardless; cancel to ensure the backfill-then-live
-						// path's live tail doesn't keep the run alive.
-						cancel()
-						return true
-					},
-				)
-			}()
-
-			select {
-			case <-finished:
-			case <-time.After(5 * time.Second):
-				cancel()
-				<-finished
-				t.Fatal("engine did not abort on the missing snapshot within 5s")
-			}
-
-			mu.Lock()
-			defer mu.Unlock()
-			require.True(t, fatalSeen, "a missing DID-tombstone snapshot must surface a FATAL error")
-			require.Empty(t, events, "no archive rows may be emitted when the snapshot is missing (fail closed before download)")
-			require.ErrorIs(t, errs[0], errSnapshotMissing)
-		})
-	}
 }
 
 // TestEngineBackfillThenLiveOrdering asserts backfill rows precede live rows

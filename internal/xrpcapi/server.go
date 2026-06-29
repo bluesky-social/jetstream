@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
 	"go.opentelemetry.io/otel/trace"
@@ -42,25 +41,17 @@ type Server struct {
 // Config holds the dependencies for the XRPC server. Zero values are valid:
 // a nil Logger defaults to slog.Default(); a nil Ready disables the readiness
 // gate; a zero CacheMaxAge disables segment/block caching; a nil Overlay omits
-// getTombstones; a nil Tombstones makes planBackfill ignore wantDidTombstones
-// (responding without the snapshot); nil Metrics/Tracer make getBlock
-// observability no-ops. Plan must be populated for planBackfill to accept
-// non-empty filters.
+// getTombstones; nil Metrics/Tracer make getBlock observability no-ops. Plan
+// must be populated for planBackfill to accept non-empty filters.
 type Config struct {
 	Src         SegmentSource
 	Logger      *slog.Logger
 	Ready       ReadyFunc
 	CacheMaxAge time.Duration
 	Overlay     OverlaySource
-	// Tombstones is the live in-memory DID/record tombstone set. planBackfill
-	// reads a DID-level snapshot from it when a page-1 client sets
-	// wantDidTombstones, so a collection-filtered backfill can suppress records
-	// of accounts deleted within the planned range (the §R4 start-snapshot). It
-	// is read-only here; the orchestrator owns mutation.
-	Tombstones *tombstone.Set
-	Plan       PlanConfig
-	Metrics    *Metrics
-	Tracer     trace.Tracer
+	Plan        PlanConfig
+	Metrics     *Metrics
+	Tracer      trace.Tracer
 }
 
 // New constructs the XRPC server and registers all jetstream NSIDs.
@@ -78,7 +69,7 @@ func New(cfg Config) *Server {
 		metrics: cfg.Metrics, tracer: cfg.Tracer,
 	}))
 	s.xrpc.HandleQuery("network.bsky.jetstream.listSegments", withReady(cfg.Ready, newListSegmentsHandler(cfg.Src)))
-	s.xrpc.HandleProcedure("network.bsky.jetstream.planBackfill", withReady(cfg.Ready, newPlanBackfillHandler(cfg.Src, cfg.Plan, cfg.Tombstones)))
+	s.xrpc.HandleProcedure("network.bsky.jetstream.planBackfill", withReady(cfg.Ready, newPlanBackfillHandler(cfg.Src, cfg.Plan)))
 	if cfg.Overlay != nil {
 		s.xrpc.HandleQuery("network.bsky.jetstream.getTombstones", withReady(cfg.Ready, newGetTombstonesHandler(cfg.Overlay)))
 	}

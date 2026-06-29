@@ -11,11 +11,9 @@ import (
 	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
-	"github.com/jcalabro/gt"
 )
 
 const (
@@ -61,7 +59,7 @@ func (c PlanConfig) validate() error {
 	return nil
 }
 
-func newPlanBackfillHandler(src SegmentSource, cfg PlanConfig, tombstones *tombstone.Set) xrpcserver.Handler {
+func newPlanBackfillHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handler {
 	cfg = cfg.withDefaults()
 	// Validate once at construction rather than per request. runtime.Build
 	// already validates these limits at startup, so a non-nil cfgErr only
@@ -99,76 +97,8 @@ func newPlanBackfillHandler(src SegmentSource, cfg PlanConfig, tombstones *tombs
 		if err != nil {
 			return nil, err
 		}
-		// §R4 start-snapshot: when a page-1 client asks, attach the DID-level
-		// tombstone snapshot over the planned range, co-atomically with the plan
-		// (one handler invocation, under the same request view). The client folds
-		// it as DID-only suppression so a collection-filtered backfill drops the
-		// records of accounts deleted within (afterSeq, plannedThroughSeq] —
-		// markers it would otherwise never download (they carry an empty
-		// collection). didTombstonesIncluded is the authoritative presence flag:
-		// the client fails closed if it asked and the field is absent.
-		if input != nil && input.WantDidTombstones.HasVal() && input.WantDidTombstones.Val() {
-			if tombstones == nil {
-				// The server cannot honor the request (misconfiguration: the
-				// tombstone set was not wired). Fail loud rather than silently
-				// returning an empty snapshot the client would trust.
-				return nil, xrpcserver.InternalError("planBackfill cannot serve DID-tombstone snapshot: tombstone set unavailable")
-			}
-			if err := attachDIDTombstones(out, tombstones, req.AfterSeq, plan.PlannedThroughSeq, req.DIDs); err != nil {
-				return nil, err
-			}
-		}
 		return out, nil
 	})
-}
-
-// attachDIDTombstones populates the §R4 DID-tombstone snapshot on out from the
-// live tombstone set over (afterSeq, plannedThroughSeq], intersected with the
-// requested DIDs when a DID filter is set (bounding the payload). The upper
-// bound is the plan's own sealed tip, captured in this same invocation, so the
-// snapshot range lines up exactly with the bytes the client will download.
-// (§3↔§8 seam: when pagination lands, plannedThroughSeq becomes the
-// continuation cursor and this upper bound must be re-pinned to sealedTipSeq.)
-//
-// didTombstonesIncluded is set true unconditionally here — an EMPTY snapshot is
-// a valid, common result (most ranges delete no accounts), and the client
-// distinguishes "included but empty" from "absent (too-old server)" by this
-// flag, never by array length.
-func attachDIDTombstones(out *jetstream.JetstreamPlanBackfill_Output, tombstones *tombstone.Set, afterSeq, plannedThroughSeq uint64, dids []string) error {
-	snap := tombstones.SnapshotRange(afterSeq, plannedThroughSeq)
-	out.DidTombstonesIncluded = gt.Some(true)
-
-	// Intersect with the request's DID filter server-side to bound the payload.
-	var didFilter map[string]struct{}
-	if len(dids) > 0 {
-		didFilter = make(map[string]struct{}, len(dids))
-		for _, d := range dids {
-			didFilter[d] = struct{}{}
-		}
-	}
-
-	out.DidTombstones = make([]jetstream.JetstreamPlanBackfill_DidTombstone, 0, len(snap.DIDs))
-	for did, ts := range snap.DIDs {
-		if didFilter != nil {
-			if _, ok := didFilter[did]; !ok {
-				continue
-			}
-		}
-		// SnapshotRange already clamped ts.Seq to (afterSeq, plannedThroughSeq],
-		// and seqs never exceed int64 in practice; guard the widening anyway. Fail
-		// loud rather than dropping the entry: a silently dropped tombstone would
-		// leave the client retaining the victim's records (silent data loss).
-		// (Unreachable on the real path.)
-		seq, err := int64FromUint64(ts.Seq)
-		if err != nil {
-			return err
-		}
-		out.DidTombstones = append(out.DidTombstones, jetstream.JetstreamPlanBackfill_DidTombstone{
-			DID: did,
-			Seq: seq,
-		})
-	}
-	return nil
 }
 
 func planRequestFromInput(input *jetstream.JetstreamPlanBackfill_Input, cfg PlanConfig) (manifest.PlanBackfillRequest, error) {
