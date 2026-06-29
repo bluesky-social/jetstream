@@ -298,9 +298,10 @@ func TestZeroValueClientFailsClosed(t *testing.T) {
 // countingEngine records how many times close() is invoked, so tests can
 // assert Close drives the engine exactly once even under concurrency.
 type countingEngine struct {
-	closes  atomic.Int64
-	runErr  error
-	started atomic.Bool
+	closes     atomic.Int64
+	runErr     error
+	started    atomic.Bool
+	statsValue Stats
 }
 
 func (e *countingEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
@@ -309,9 +310,25 @@ func (e *countingEngine) run(ctx context.Context, yield func(*Batch, error) bool
 	yield(nil, e.runErr)
 }
 
+func (e *countingEngine) stats() Stats { return e.statsValue }
+
 func (e *countingEngine) close() error {
 	e.closes.Add(1)
 	return nil
+}
+
+// TestStatsDelegatesToEngine asserts Client.Stats forwards the engine's
+// snapshot, and that a zero-value Client (no engine) reports a zero snapshot
+// rather than panicking — the same defensive contract as the other methods.
+func TestStatsDelegatesToEngine(t *testing.T) {
+	t.Parallel()
+	want := Stats{Pages: 3, SealedTip: 60, PlannedThrough: 60, ResidualGap: 0, RebackfillCycles: 1}
+	c := &Client{engine: &countingEngine{statsValue: want}}
+	require.Equal(t, want, c.Stats(), "Stats must forward the engine snapshot")
+
+	var zero *Client
+	require.Equal(t, Stats{}, zero.Stats(), "Stats on a nil Client must be a zero snapshot, not a panic")
+	require.Equal(t, Stats{}, (&Client{}).Stats(), "Stats on an engine-less Client must be a zero snapshot")
 }
 
 // TestCloseConcurrentClosesEngineOnce asserts Close is idempotent and

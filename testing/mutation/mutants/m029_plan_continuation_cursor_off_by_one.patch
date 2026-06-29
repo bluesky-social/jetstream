@@ -1,0 +1,25 @@
+mutant: m029_plan_continuation_cursor_off_by_one
+target: internal/manifest/plan.go
+failure-mode: |
+  The truncated-page continuation cursor is advanced one seq too far
+  (lastUnitMaxSeq + 1 instead of lastUnitMaxSeq). PlannedThroughSeq is an
+  EXCLUSIVE lower bound for the next page (afterSeq = PlannedThroughSeq), so
+  reporting last+1 makes the next page start at afterSeq = last+1, which drops
+  every block whose MaxSeq == last+1 (the very next unit) — a silently skipped
+  page boundary. Under the paginated client loop the union of pages is missing
+  the row(s) straddling each truncation seam.
+expected-detection: |
+  Killed by TestPartB_MultiPageBackfillCutover / TestPartB_MidSegmentTruncation
+  (#182, partb tier): the union of paginated pages no longer equals ground
+  truth (a boundary row is skipped), so emittedSeqs diverges from the expected
+  contiguous run. Not reachable from TestOracle_DefaultLifecycle, whose default
+  MaxEntries never truncates a plan.
+expected-tier: partb
+tiers: partb
+
+diff --git a/internal/manifest/plan.go b/internal/manifest/plan.go
+--- a/internal/manifest/plan.go
++++ b/internal/manifest/plan.go
+@@ -225 +225 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+-		result.PlannedThroughSeq = lastUnitMaxSeq
++		result.PlannedThroughSeq = lastUnitMaxSeq + 1

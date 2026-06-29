@@ -871,6 +871,84 @@ func TestEngineLiveOnlyErrorRejectStopsBatching(t *testing.T) {
 	require.False(t, batchAfter, "no batch may be emitted after the consumer rejected an error")
 }
 
+// TestEngineStatsReportsResidualGap pins the §8/§10 observability accessor: as
+// the engine pages the sealed archive, Stats() must report a monotonically
+// advancing page count, the pinned sealed tip S, the continuation cursor it has
+// reached, and the residual gap (S - plannedThrough) — which converges to zero
+// once the whole sealed range is consumed. This is the metric the sustained-
+// ingest oracle scenario reads to assert the loop converges rather than diverges.
+func TestEngineStatsReportsResidualGap(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	// 3 sealed segments, 2 events each: seq 1..6. Sealed tip S = 6.
+	for s := range 3 {
+		var sealed []segment.Event
+		for i := range 2 {
+			seq := uint64(s*2 + i + 1)
+			sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+		}
+		h.as.addSegment(t, segName(s), sealed)
+	}
+	pages := map[int64]string{
+		0: planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}, 2, 6),
+		2: planPageJSON([]planSeg{{name: segName(1), index: 1, minSeq: 3, maxSeq: 4}}, 4, 6),
+		4: planPageJSON([]planSeg{{name: segName(2), index: 2, minSeq: 5, maxSeq: 6}}, 6, 6),
+	}
+	h.planResponder = func(req planReqWire) string {
+		page, ok := pages[req.AfterSeq]
+		require.Truef(t, ok, "unexpected afterSeq %d", req.AfterSeq)
+		return page
+	}
+	for i := uint64(7); i <= 9; i++ {
+		h.liveSteps = append(h.liveSteps, readStep{
+			data: liveCommitFrame(t, i, "did:plc:a", "create", "app.bsky.feed.post", "r"+itoaU(i), true),
+		})
+	}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func(batch []Event) bool {
+				mu.Lock()
+				events = append(events, batch...)
+				seen := uniqueSeqs(events)
+				mu.Unlock()
+				if len(seen) >= 9 {
+					cancel()
+					return false
+				}
+				return true
+			},
+			func(error) bool { return true },
+		)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("engine did not reach seq 9 within 5s")
+	}
+
+	st := eng.Stats()
+	require.GreaterOrEqual(t, st.Pages, uint64(3), "the loop must record at least one page per segment")
+	require.EqualValues(t, 6, st.SealedTip, "Stats must report the pinned sealed tip S")
+	require.EqualValues(t, 6, st.PlannedThrough, "the continuation cursor must reach the sealed tip")
+	require.Zero(t, st.ResidualGap, "the residual gap must converge to zero once the sealed archive is consumed")
+}
+
 func uniqueSeqs(events []Event) []uint64 {
 	seen := map[uint64]bool{}
 	var out []uint64

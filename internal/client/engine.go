@@ -110,6 +110,65 @@ type Engine struct {
 	// resume cursor failed to advance, bounded by maxRebackfillStalls. Touched
 	// only on the single run goroutine in runBackfillThenLive.
 	rebackfillStalls int
+
+	// stats accumulates backfill-loop progress for the Stats() accessor. Written
+	// on the single run goroutine (sweepSealedArchive / the re-backfill loop) and
+	// read by Stats(); the mutex makes a concurrent read by a monitoring caller
+	// race-free.
+	statsMu sync.Mutex
+	stats   Stats
+}
+
+// Stats is a point-in-time snapshot of backfill-loop progress, exposed via
+// Engine.Stats for operational visibility (design §8/§10). The client library
+// has no Prometheus registry, so this accessor is how a caller observes the
+// residual gap a sustained-ingest backfill is closing.
+type Stats struct {
+	// Pages is the number of planBackfill pages downloaded across all sweeps
+	// (including re-backfill cycles). Monotonically non-decreasing.
+	Pages uint64
+	// SealedTip is the most recently learned sealed-archive tip S (the pinned
+	// pagination goal of the current sweep).
+	SealedTip uint64
+	// PlannedThrough is the continuation cursor the loop has reached: the highest
+	// sealed seq accounted for so far. Equals SealedTip once a sweep completes.
+	PlannedThrough uint64
+	// ResidualGap is SealedTip - PlannedThrough: the sealed seqs still to be
+	// downloaded before cutover. Zero once the sweep has consumed the archive.
+	ResidualGap uint64
+	// RebackfillCycles is the number of §14 too-old re-backfill cycles triggered
+	// (a fell-behind/slow-handoff signal). Zero on the common path.
+	RebackfillCycles uint64
+}
+
+// Stats returns a snapshot of backfill-loop progress. Safe to call from another
+// goroutine while Run is in flight (e.g. a monitoring ticker).
+func (e *Engine) Stats() Stats {
+	e.statsMu.Lock()
+	defer e.statsMu.Unlock()
+	return e.stats
+}
+
+// recordPage updates the progress snapshot after a page is planned. tip is the
+// pinned sealed tip; through is the continuation cursor reached.
+func (e *Engine) recordPage(tip, through uint64) {
+	e.statsMu.Lock()
+	defer e.statsMu.Unlock()
+	e.stats.Pages++
+	e.stats.SealedTip = tip
+	e.stats.PlannedThrough = through
+	if tip > through {
+		e.stats.ResidualGap = tip - through
+	} else {
+		e.stats.ResidualGap = 0
+	}
+}
+
+// recordRebackfill bumps the re-backfill cycle counter (a §14 too-old handoff).
+func (e *Engine) recordRebackfill() {
+	e.statsMu.Lock()
+	defer e.statsMu.Unlock()
+	e.stats.RebackfillCycles++
 }
 
 // NewEngine builds an Engine from cfg.
@@ -394,6 +453,7 @@ func (e *Engine) sweepSealedArchive(ctx context.Context, dl *Downloader, emit fu
 			sealedTip = plan.SealedTipSeq
 			pinned = true
 		}
+		e.recordPage(sealedTip, plan.PlannedThroughSeq)
 
 		if derr := dl.Download(ctx, plan.Entries, emit); derr != nil {
 			return sealedTip, false, derr // ctx cancelled
@@ -501,6 +561,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		// the cycles and require the resume cursor to strictly advance past the
 		// cursor this sweep started from — a non-advancing re-backfill is a
 		// pathological loop, not a real fall-behind, and is surfaced as fatal.
+		e.recordRebackfill()
 		if resume <= cursor {
 			e.rebackfillStalls++
 			if e.rebackfillStalls >= maxRebackfillStalls {

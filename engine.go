@@ -181,6 +181,10 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	)
 }
 
+func (e *realEngine) stats() Stats {
+	return Stats(e.eng.Stats())
+}
+
 func (e *realEngine) close() error {
 	// Cancel any in-flight run so a live tail actually stops (the documented
 	// "natural way to stop a live tail"). We do NOT wait for the run to finish: a

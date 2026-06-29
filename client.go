@@ -64,6 +64,39 @@ func (b *Batch) LastCursor() uint64 {
 	return max
 }
 
+// Stats is a point-in-time snapshot of backfill-loop progress, returned by
+// Client.Stats. The Jetstream client library has no metrics registry, so this
+// accessor is how a caller observes how far a backfill has progressed and the
+// residual gap a sustained-ingest stream is still closing before cutover.
+type Stats struct {
+	// Pages is the number of planBackfill pages downloaded across all sweeps
+	// (including §14 re-backfill cycles). Monotonically non-decreasing.
+	Pages uint64
+	// SealedTip is the most recently learned sealed-archive tip S — the pinned
+	// pagination goal of the current sweep.
+	SealedTip uint64
+	// PlannedThrough is the continuation cursor reached so far: the highest
+	// sealed seq accounted for. Equals SealedTip once a sweep completes.
+	PlannedThrough uint64
+	// ResidualGap is SealedTip - PlannedThrough: the sealed seqs still to
+	// download before cutover. Zero once the sweep has consumed the archive.
+	ResidualGap uint64
+	// RebackfillCycles counts §14 too-old re-backfill cycles (a slow-handoff or
+	// fell-behind signal). Zero on the common path.
+	RebackfillCycles uint64
+}
+
+// Stats returns a snapshot of backfill-loop progress. It is safe to call from
+// another goroutine while Events is running (e.g. a monitoring ticker), and
+// after it returns. A zero-value Client (not built by Subscribe) reports a zero
+// snapshot.
+func (c *Client) Stats() Stats {
+	if c == nil || c.engine == nil {
+		return Stats{}
+	}
+	return c.engine.stats()
+}
+
 // Subscribe creates a Client for the given Jetstream host. host may be a bare
 // hostname ("jetstream.us-west.bsky.network"), a host:port, or a full
 // http(s):// URL; the scheme defaults to https.
@@ -157,6 +190,8 @@ type engine interface {
 	// error. It returns when ctx is done, the stream ends, or yield returns
 	// false.
 	run(ctx context.Context, yield func(*Batch, error) bool)
+	// stats returns a snapshot of backfill-loop progress for the Stats accessor.
+	stats() Stats
 	close() error
 }
 

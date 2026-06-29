@@ -1,0 +1,26 @@
+mutant: m030_plan_midsegment_cut_reports_segment_maxseq
+target: internal/manifest/plan.go
+failure-mode: |
+  A mid-segment block-mode truncation sets the continuation cursor from the
+  enclosing segment's MaxSeq (seg.Header.MaxSeq) instead of the last INCLUDED
+  block range's MaxSeq (seg.Blocks[br.Last].MaxSeq). The §12.1 hazard: the next
+  page's exclusive afterSeq = segment MaxSeq drops every un-included tail block
+  of that segment forever (their MaxSeq <= the segment MaxSeq), so a
+  collection/DID-filtered backfill silently loses the segment's later matched
+  blocks.
+expected-detection: |
+  Killed by TestPartB_MidSegmentTruncation (#182, partb tier): the DID-filtered
+  client paginates inside a single segment whose matched blocks are
+  non-contiguous; reporting the segment MaxSeq skips the tail blocks, so the
+  emitted seqs are missing the later matched blocks and diverge from ground
+  truth. The manifest unit test TestPlanBackfill_MidSegmentCutCursorIsBlockMaxSeq
+  also covers this directly, but the partb tier proves the end-to-end loss.
+expected-tier: partb
+tiers: partb
+
+diff --git a/internal/manifest/plan.go b/internal/manifest/plan.go
+--- a/internal/manifest/plan.go
++++ b/internal/manifest/plan.go
+@@ -213 +213 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+-			lastUnitMaxSeq = seg.Blocks[br.Last].MaxSeq
++			lastUnitMaxSeq = seg.Header.MaxSeq

@@ -252,6 +252,24 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          ./internal/oracle ./internal/ingest/orchestrator
                          -run 'TestOracle_RestartStoreFault|TestMerge_StoreFault|TestMerge_MultiSourceDrainsAllSources|TestCompaction_StoreFault'
                          -count=1 -timeout "$storefault_timeout") ;;
+                partb)
+                    # Part-B tier (#182): kills paginated-cutover mutants
+                    # (continuation-cursor off-by-one, mid-segment cut reporting
+                    # the enclosing segment MaxSeq, zero-units-unadvanced
+                    # livelock, the §14 below-floor 400 silently clamped, and the
+                    # client treating that 400 as fatal instead of
+                    # re-backfilling). These paths are NOT exercised by
+                    # TestOracle_DefaultLifecycle (default config never truncates a
+                    # plan or ages a cursor below the floor). Two layers run in one
+                    # `go test`: the oracle's hermetic §16 end-to-end scenarios
+                    # (TestPartB*) and the manifest planner's per-page truncation
+                    # unit tests (TestPlanBackfill*), which kill the planner
+                    # mutants fast and directly without waiting on a client-loop
+                    # livelock timeout. Fast (~1s).
+                    cmd=(go test "${RACE_FLAG[@]}"
+                         ./internal/oracle ./internal/manifest
+                         -run 'TestPartB|TestPlanBackfill'
+                         -count=1 -short -timeout "$default_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2
                     exit 1 ;;

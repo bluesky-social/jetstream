@@ -1,0 +1,24 @@
+mutant: m031_plan_truncation_zero_units_unadvanced
+target: internal/manifest/plan.go
+failure-mode: |
+  The per-page cap check is off by one (Entries+1 >= MaxEntries instead of
+  Entries >= MaxEntries), so with MaxEntries=1 the FIRST work unit trips the cap
+  before it is admitted: the page returns zero units with lastUnitMaxSeq still 0,
+  so PlannedThroughSeq is set to 0 (unadvanced). The §12 always-admit-≥1-unit
+  invariant is broken — the client's pagination loop re-requests afterSeq=0
+  forever (zero-progress livelock) and never reaches the sealed tip.
+expected-detection: |
+  Killed by TestPlanBackfill_OneUnitOverCapStillAdvances (#179) and
+  TestPlanBackfill_TruncatesAtUnitBoundary in the manifest planner, run in the
+  partb tier (#182): a page that admits zero units / does not advance the cursor
+  fails the "always returns ≥1 unit and advances" assertion directly and fast,
+  rather than only surfacing as a client-loop hang.
+expected-tier: partb
+tiers: partb
+
+diff --git a/internal/manifest/plan.go b/internal/manifest/plan.go
+--- a/internal/manifest/plan.go
++++ b/internal/manifest/plan.go
+@@ -155 +155 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+-		return req.MaxEntries > 0 && result.Stats.Entries >= req.MaxEntries
++		return req.MaxEntries > 0 && result.Stats.Entries+1 >= req.MaxEntries
