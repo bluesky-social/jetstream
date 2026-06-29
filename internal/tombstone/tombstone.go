@@ -1,15 +1,14 @@
 // Package tombstone maintains the live in-memory delete/update
-// tombstone set consumed by the delete compactor (and, later, the
-// read-path overlay). See the compaction spec §3/§3.4: a tombstone is
-// a key plus the max seq of any superseding event; suppression drops
-// Create/Update rows with a strictly smaller seq.
+// tombstone set consumed by the delete compactor. See the compaction
+// spec §3/§3.4: a tombstone is a key plus the max seq of any superseding
+// event; suppression drops Create/Update rows with a strictly smaller seq.
 package tombstone
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
@@ -42,13 +41,7 @@ type Set struct {
 	records map[RecordKey]uint64
 	dids    map[string]DIDTombstone
 	bytes   int64
-	dirty   atomic.Uint64
 }
-
-// Dirty returns a monotonically increasing value that changes on every
-// mutation (Observe, Evict, Replace). The overlay cache uses it to skip
-// rebuilds when the set is unchanged.
-func (s *Set) Dirty() uint64 { return s.dirty.Load() }
 
 func New() *Set {
 	return &Set{
@@ -62,31 +55,21 @@ func (s *Set) Observe(ev *segment.Event) error {
 	defer s.mu.Unlock()
 	added, err := observeLocked(s.records, s.dids, ev)
 	s.bytes += added
-	s.dirty.Add(1)
 	return err
 }
 
-func (s *Set) Snapshot(maxSeq uint64) Snapshot {
-	return s.SnapshotRange(0, maxSeq)
-}
-
-func (s *Set) SnapshotRange(lowExclusive, highInclusive uint64) Snapshot {
+// Snapshot returns a copy of the full current tombstone set. Used by
+// compaction tests to assert the in-memory set matches an independently
+// folded one; production reads only Len and ApproxBytes.
+func (s *Set) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := Snapshot{
 		Records: make(map[RecordKey]uint64, len(s.records)),
 		DIDs:    make(map[string]DIDTombstone, len(s.dids)),
 	}
-	for k, seq := range s.records {
-		if seq > lowExclusive && seq <= highInclusive {
-			out.Records[k] = seq
-		}
-	}
-	for did, ts := range s.dids {
-		if ts.Seq > lowExclusive && ts.Seq <= highInclusive {
-			out.DIDs[did] = ts
-		}
-	}
+	maps.Copy(out.Records, s.records)
+	maps.Copy(out.DIDs, s.dids)
 	return out
 }
 
@@ -105,7 +88,6 @@ func (s *Set) Evict(maxSeq uint64) {
 			s.bytes -= didEntryBytes(did)
 		}
 	}
-	s.dirty.Add(1)
 }
 
 func (s *Set) Replace(snapshot Snapshot) {
@@ -122,7 +104,6 @@ func (s *Set) Replace(snapshot Snapshot) {
 		s.dids[did] = ts
 		s.bytes += didEntryBytes(did)
 	}
-	s.dirty.Add(1)
 }
 
 func (s *Set) Len() int {

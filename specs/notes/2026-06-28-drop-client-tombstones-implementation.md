@@ -568,7 +568,37 @@ two `Set` methods that produced snapshots for the overlay go away. Re-grep befor
   compaction-internal structure" (also `compact_deletes.go:152` comment).
 
 Do not over-prune: re-grep each symbol across the tree before deleting.
-**Verify.** `just test ./internal/tombstone ./internal/ingest/...`. **Status / notes.** _(unstarted)_
+**Verify.** `just test ./internal/tombstone ./internal/ingest/...`.
+
+**Status / notes.** ✅ **Done** (#178). The pre-deletion re-grep changed the prune set materially
+from the speculative bullets above — recorded here as the reasoning trail:
+
+- **Removed (production-dead, overlay-only):** `Set.SnapshotRange` (the overlay's bounded-window
+  readout) and `Set.Snapshot(maxSeq)` (its wrapper); `Set.Dirty()` + the `dirty atomic.Uint64`
+  field + the three `s.dirty.Add(1)` calls (Observe/Evict/Replace) + the now-unused `sync/atomic`
+  import. The overlay cache was the only `Dirty()` reader and the only consumer of bounded
+  snapshots; #177 deleted it.
+- **KEPT — the audit overturned the "remove if unused" bullets (live compaction callers):**
+  - `ApproxBytes` + `bytes` accounting + `entryOverheadBytes`/`recordEntryBytes`/`didEntryBytes`
+    → feeds the **compaction** gauge `jetstream_compaction_tombstone_set_bytes`
+    (`metrics.go:152,158`), NOT overlay-only. Stays.
+  - single-event `Fold` → `compact_deletes.go:538,552`. Stays.
+  - `Snapshot.Merge` → `compact_deletes.go:309,543,556`. Stays.
+- **Deviation from "delete both `Set` methods":** the external `orchestrator` test
+  (`TestRebuildLiveTombstones_BoundedByWatermark`) and the internal tombstone property tests must
+  read Set contents to assert rebuild==incremental. Rather than drop a valuable property test or
+  reach into unexported state cross-package, the two bounded variants were **collapsed into a
+  single no-arg `Set.Snapshot()`** returning the full contents (existing public `Snapshot` type).
+  Overlay-coupled windowing gone; one honest inspection accessor remains.
+- **Post-overlay invariant confirmed:** production never reads the in-memory `Set`'s *contents* —
+  only `Len()` (compaction-cap trigger, `consumer.go:508`) and `ApproxBytes()` (the size gauge).
+- **Doc sweep:** package doc (`tombstone.go:1-5`) dropped "(and, later, the read-path overlay)";
+  `compact_deletes.go:152-153` comment rewritten ("used only for the compaction-cap trigger
+  (Len) and the size gauge (ApproxBytes)"); two stale `SnapshotRange` comment refs reworded.
+- **Tests:** deleted `TestSetDirtyChangesOnMutation` and `TestSnapshotRangeFiltersLowAndHighBounds`
+  (subjects removed); repointed all `Snapshot(N)`/`SnapshotRange(0,max)` inspection calls.
+- **Verify:** `just test ./internal/tombstone ./internal/ingest/...` (436), full `just lint` (0)
+  + `just test` (1657), `just test-long ./internal/oracle` (156), `just oracle` (21s) — all green.
 
 ---
 
@@ -870,7 +900,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 6. oracle fold-convergence + DID-tombstone delivery tests (gates 3) (#174)
 - [x] 3. DID-marker sentinel collections close the §R3 gap inline (#175; replaced the reverted start-snapshot)
 - [x] 4. remove getTombstones overlay endpoint (#177)
-- [ ] 5. prune overlay-only tombstone API (SnapshotRange now removable post-overlay-deletion)
+- [x] 5. prune overlay-only tombstone API (#178)
 - [ ] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation)
 - [ ] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged)
 - [ ] 10. client pagination loop + delete cutover buffer + 400 re-backfill
