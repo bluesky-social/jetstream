@@ -1134,6 +1134,355 @@ func TestEngineTooOldHandoffReBackfills(t *testing.T) {
 	require.GreaterOrEqual(t, dials.Load(), int64(2), "must have re-dialed after the too-old 400")
 }
 
+// TestEngineReBackfillDropsAlreadyDeliveredStraddlingRows pins the §14 seam
+// hygiene fixed alongside the matcher seq-floor advance: after a fell-off-live
+// 400, the re-backfill resumes at afterSeq=resume (the live tail's highest
+// delivered seq). The server planner prunes whole units at/below resume, but its
+// one-sided contract still admits the ONE work unit that STRADDLES resume — a
+// segment sealed during the handoff that holds both the live events already
+// delivered (<= resume) and genuinely-new ones (> resume). The engine must
+// advance the row matcher's floor to resume so that straddling unit's
+// already-delivered rows are dropped before decode, NOT re-emitted out of order
+// after the live tail already shipped them. A seq-dedup consumer would still
+// converge, but the client should not re-ship rows it just delivered.
+//
+// Here resume=6: seg1 (seqs 5..8) seals during the handoff. The re-backfill
+// downloads it; rows 5,6 (already delivered live) must be filtered, 7,8 kept.
+// The full ordered stream must be exactly [1,2,5,6,7,8,9] — no duplicate 5,6,
+// and no dropped 7,8/9 (which would mean the floor was raised too far).
+func TestEngineReBackfillDropsAlreadyDeliveredStraddlingRows(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	// Sealed archive page 1: seg0 holds seqs 1,2. S is pinned at 2.
+	h.as.addSegment(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+	})
+	// seg1 seals DURING the handoff and straddles the resume point (6): it holds
+	// the live-delivered 5,6 AND the new 7,8. The re-backfill (afterSeq=6) plans
+	// it because its MaxSeq (8) > 6; the matcher floor must drop 5,6 on decode.
+	h.as.addSegment(t, segName(1), []segment.Event{
+		makeCreate(t, 5, "did:plc:a", "app.bsky.feed.post", "r5"),
+		makeCreate(t, 6, "did:plc:a", "app.bsky.feed.post", "r6"),
+		makeCreate(t, 7, "did:plc:a", "app.bsky.feed.post", "r7"),
+		makeCreate(t, 8, "did:plc:a", "app.bsky.feed.post", "r8"),
+	})
+	pages := map[int64]string{
+		// First sweep: only seg0 is sealed; S = 2.
+		0: planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}, 2, 2),
+		// Re-backfill sweep (afterSeq=6): seg1 has sealed; it straddles 6 (5..8).
+		6: planPageJSON([]planSeg{{name: segName(1), index: 1, minSeq: 5, maxSeq: 8}}, 8, 8),
+	}
+	h.planResponder = func(req planReqWire) string {
+		page, ok := pages[req.AfterSeq]
+		require.Truef(t, ok, "unexpected afterSeq %d", req.AfterSeq)
+		return page
+	}
+
+	// Live tail #1 (cutover at S=2) delivers 5,6, then EOFs so the engine
+	// reconnects; the reconnect (now anchored at lastSeq=6) gets the too-old 400.
+	// After the re-backfill cuts over at S'=8, live tail #2 delivers 9.
+	conn1 := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
+		{data: liveCommitFrame(t, 6, "did:plc:a", "create", "app.bsky.feed.post", "r6", true)},
+	}}
+	conn2 := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 9, "did:plc:a", "create", "app.bsky.feed.post", "r9", true)},
+	}}
+	var dialN atomic.Int64
+	dial := func(_ context.Context, _ string) (wsConn, error) {
+		switch dialN.Add(1) {
+		case 1:
+			return conn1, nil // delivers 5,6, then EOF -> reconnect
+		case 2:
+			return nil, errLiveCursorTooOld // reconnect at cursor=6 is too old -> re-backfill
+		default:
+			return conn2, nil // after re-backfill (cutover=8), tail delivers 9
+		}
+	}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.Dial = dial
+
+	events := h.runUntilSeq(t, cfg, 9)
+
+	require.Equal(t, []uint64{1, 2, 5, 6, 7, 8, 9}, seqs(events),
+		"the straddling re-backfill must drop already-delivered 5,6 (no out-of-order dups) and keep new 7,8")
+	require.GreaterOrEqual(t, dialN.Load(), int64(3), "must have re-dialed live after the too-old re-backfill")
+}
+
+// TestEngineRunResetsAdvancedMatcherFloor pins that RunWithBackfill resets the
+// row matcher's seq floor at the start of every run. The §14 re-backfill mutates
+// the long-lived engine matcher (setAfterSeq), and the public Client permits
+// SEQUENTIAL Events() re-iterations on the same engine. Without a per-run reset,
+// a prior run's elevated floor would leak into the next run and silently drop
+// every row at/below it. Here we simulate a prior run that advanced the floor to
+// 3, then run a fresh backfill from AfterSeq=0: all of 1..4 must be delivered.
+func TestEngineRunResetsAdvancedMatcherFloor(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	as.addSegment(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+		makeCreate(t, 3, "did:plc:a", "app.bsky.feed.post", "r3"),
+		makeCreate(t, 4, "did:plc:a", "app.bsky.feed.post", "r4"),
+	})
+	h := &engineHarness{as: as}
+	h.planResponder = func(planReqWire) string {
+		return planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 4}}, 4, 4)
+	}
+	h.installHandlers()
+
+	cfg := Config{
+		Host:         as.srv.URL,
+		Request:      PlanRequest{AfterSeq: 0},
+		Backfill:     true,
+		BackfillOnly: true, // no live tail needed to exercise the matcher reset
+		BatchSize:    1,
+		Concurrency:  4,
+		XRPC:         &xrpc.Client{Host: as.srv.URL},
+	}
+
+	eng := NewEngine(cfg)
+	// Simulate the residue of a prior run's §14 re-backfill: the matcher floor
+	// was advanced to 3. A correct run must reset it before planning.
+	eng.matcher.setAfterSeq(3)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	eng.RunWithBackfill(ctx,
+		func(batch []Event) bool {
+			mu.Lock()
+			events = append(events, batch...)
+			mu.Unlock()
+			return true
+		},
+		func(error) bool { return true },
+		BackfillSink{},
+	)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []uint64{1, 2, 3, 4}, seqs(events),
+		"a fresh run must reset the matcher floor; a leaked floor of 3 would drop 1,2,3")
+}
+
+// TestEngineReBackfillCutoverDoesNotRewindBelowDelivered pins that the §14
+// re-backfill cutover never rewinds below the last delivered seq. A live tail
+// routinely delivers events from the active (unsealed) segment PAST the sealed
+// tip; if it then 400s, the re-learned sealedTip can be BELOW the last delivered
+// cursor (those events have not sealed yet). Cutting over at that lower tip would
+// seed the live dedup floor below already-delivered rows and re-deliver them
+// out of order. The engine must cut over at max(sealedTip, cursor).
+//
+// The regression is multi-cycle (the immediate single-cycle case is masked by
+// the matcher floor already standing at the prior resume). It needs THREE live
+// connects:
+//
+//	tail#1: deliver 3,4,5 (active-segment events past the sealed tip 2), then
+//	        too-old -> cursor=5, matcher floor=5.
+//	tail#2: deliver NOTHING, immediate too-old. Seeded dedupFloor = cutover.
+//	        Without the guard, cutover = stale sealedTip = 2, so LastSeq()=2 and
+//	        resume=2 — REGRESSING cursor to 2 and the matcher floor to 2 (the
+//	        setAfterSeq invariant breaks). With the guard, cutover=max(2,5)=5, so
+//	        resume=5 and nothing regresses.
+//	tail#3: deliver 3,4,5,6. With the floor regressed to 2, 3,4,5 are re-delivered
+//	        as duplicates; with the floor held at 5, only 6 passes.
+//
+// The archive only ever holds seqs 1,2, so every sweep reports sealedTip=2 —
+// below the delivered cursor — which is what makes the rewind reachable.
+func TestEngineReBackfillCutoverDoesNotRewindBelowDelivered(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	h.as.addSegment(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+	})
+	h.planResponder = func(req planReqWire) string {
+		// Every sweep sees the same sealed tip 2, regardless of afterSeq.
+		return planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}, 2, 2)
+	}
+
+	conn1 := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 3, "did:plc:a", "create", "app.bsky.feed.post", "r3", true)},
+		{data: liveCommitFrame(t, 4, "did:plc:a", "create", "app.bsky.feed.post", "r4", true)},
+		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
+		{err: errLiveCursorTooOld},
+	}}
+	// Delivers nothing, then immediately too-old — so LastSeq() stays at the
+	// seeded dedup floor (the cutover), which is the rewind lever.
+	conn2 := &scriptedConn{steps: []readStep{
+		{err: errLiveCursorTooOld},
+	}}
+	// Replays 3,4,5,6 from the cutover. A correct engine (floor held at 5) dedups
+	// 3,4,5 and emits 6; a rewound engine (floor=2) re-emits 3,4,5 then 6.
+	conn3 := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 3, "did:plc:a", "create", "app.bsky.feed.post", "r3", true)},
+		{data: liveCommitFrame(t, 4, "did:plc:a", "create", "app.bsky.feed.post", "r4", true)},
+		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
+		{data: liveCommitFrame(t, 6, "did:plc:a", "create", "app.bsky.feed.post", "r6", true)},
+	}}
+	var dialN atomic.Int64
+	dial := func(_ context.Context, _ string) (wsConn, error) {
+		switch dialN.Add(1) {
+		case 1:
+			return conn1, nil
+		case 2:
+			return conn2, nil
+		default:
+			return conn3, nil
+		}
+	}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.Dial = dial
+
+	events := h.runUntilSeq(t, cfg, 6)
+
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, seqs(events),
+		"the re-backfill cutover must not rewind below the last delivered seq; a rewound floor re-delivers 3,4,5")
+}
+
+// TestEngineRunResetsRebackfillStalls pins that RunWithBackfill resets the
+// anti-ping-pong stall counter per run. rebackfillStalls is long-lived engine
+// state (like the matcher); a prior run that stopped mid-stall (e.g. cancelled
+// after a few non-advancing §14 cycles) must not make the NEXT run trip the
+// fatal "no progress" guard after fewer than maxRebackfillStalls cycles of its
+// own. We pre-load a near-trip stall count, then run a clean backfill and assert
+// the counter was reset to 0 at run start.
+func TestEngineRunResetsRebackfillStalls(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	as.addSegment(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+	})
+	h := &engineHarness{as: as}
+	h.planResponder = func(planReqWire) string {
+		return planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 1}}, 1, 1)
+	}
+	h.installHandlers()
+
+	cfg := Config{
+		Host:         as.srv.URL,
+		Request:      PlanRequest{AfterSeq: 0},
+		Backfill:     true,
+		BackfillOnly: true,
+		BatchSize:    1,
+		Concurrency:  4,
+		XRPC:         &xrpc.Client{Host: as.srv.URL},
+	}
+	eng := NewEngine(cfg)
+	// Residue of a prior run that stalled but did not trip the fatal guard.
+	eng.rebackfillStalls = maxRebackfillStalls - 1
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	eng.RunWithBackfill(ctx,
+		func([]Event) bool { return true },
+		func(error) bool { return true },
+		BackfillSink{},
+	)
+
+	require.Equal(t, 0, eng.rebackfillStalls,
+		"RunWithBackfill must reset the stall counter at run start so a prior run's partial count cannot trip the guard early")
+}
+
+// TestEngineReBackfillFlushesBufferedLiveRowsBeforeSweep pins the fast-path seam
+// ordering at a §14 re-backfill. On the fast path (bf.Transform set, which the
+// public/typed clients use), live cutover rows flow through the serial batcher
+// while re-backfill archive rows are emitted directly via bf.Emit, bypassing it.
+// If the live tail leaves a partially-filled batch when the too-old 400 fires,
+// the next sweep's newer archive rows (seq > resume) must NOT reach the consumer
+// before those buffered older live rows. The engine flushes the batcher before
+// re-sweeping; without it the older rows are delivered out of order (after the
+// newer ones) or lost entirely if the consumer stops on the inverted batch.
+//
+// BatchSize=10 keeps the 2 live rows (5,6) buffered (no auto-flush at size), and
+// a long MaxBatchDelay keeps the periodic flusher from masking the race, so the
+// assertion is deterministic.
+func TestEngineReBackfillFlushesBufferedLiveRowsBeforeSweep(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	h.as.addSegment(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+	})
+	// seg1 straddles resume=6: blocks {5,6},{7,8}. The re-backfill emits its
+	// new rows (7,8) via bf.Emit; the buffered live rows (5,6) must precede them.
+	h.as.addSegment(t, segName(1), []segment.Event{
+		makeCreate(t, 5, "did:plc:a", "app.bsky.feed.post", "r5"),
+		makeCreate(t, 6, "did:plc:a", "app.bsky.feed.post", "r6"),
+		makeCreate(t, 7, "did:plc:a", "app.bsky.feed.post", "r7"),
+		makeCreate(t, 8, "did:plc:a", "app.bsky.feed.post", "r8"),
+	})
+	pages := map[int64]string{
+		0: planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}, 2, 2),
+		6: planPageJSON([]planSeg{{name: segName(1), index: 1, minSeq: 5, maxSeq: 8}}, 8, 8),
+	}
+	h.planResponder = func(req planReqWire) string {
+		page, ok := pages[req.AfterSeq]
+		require.Truef(t, ok, "unexpected afterSeq %d", req.AfterSeq)
+		return page
+	}
+
+	// conn1 delivers 5,6 then returns the too-old error AS A MID-STREAM READ
+	// (the "fell-off-live" case, live.go's documented second too-old path). This
+	// is deliberate: a too-old surfaced via a *reconnect dial* would first route
+	// an "reconnecting" error through b.emitError, which flushes the buffer as a
+	// side effect — masking the very inversion under test. A mid-stream read
+	// too-old returns straight out of consumer.Run with NO emitError, so 5,6 stay
+	// buffered exactly as the fast-path seam bug requires.
+	conn1 := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
+		{data: liveCommitFrame(t, 6, "did:plc:a", "create", "app.bsky.feed.post", "r6", true)},
+		{err: errLiveCursorTooOld},
+	}}
+	// After the re-backfill cuts over at S'=8, this benign conn lets the live tail
+	// reconnect-loop quietly; the test stops at seq 8 (a re-backfill row) first.
+	conn2 := &scriptedConn{}
+	var dialN atomic.Int64
+	dial := func(_ context.Context, _ string) (wsConn, error) {
+		if dialN.Add(1) == 1 {
+			return conn1, nil
+		}
+		return conn2, nil
+	}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.Dial = dial
+	cfg.BatchSize = 10            // keep live 5,6 buffered (no size auto-flush)
+	cfg.MaxBatchDelay = time.Hour // disable the periodic flusher's masking
+
+	// Stop once the re-backfill row 8 has been delivered: by then a correct
+	// engine has already flushed 5,6 (before the re-sweep), so they precede 7,8.
+	events := h.runUntilSeq(t, cfg, 8)
+
+	got := seqs(events)
+	// 5,6 must be present (not lost) and must precede 7 (not inverted after it).
+	idx := func(s uint64) int {
+		for i, v := range got {
+			if v == s {
+				return i
+			}
+		}
+		return -1
+	}
+	require.NotEqual(t, -1, idx(5), "buffered live row 5 must not be lost at the re-backfill seam: %v", got)
+	require.NotEqual(t, -1, idx(6), "buffered live row 6 must not be lost at the re-backfill seam: %v", got)
+	require.Less(t, idx(5), idx(7), "live row 5 must be delivered before the newer re-backfill row 7: %v", got)
+	require.Less(t, idx(6), idx(7), "live row 6 must be delivered before the newer re-backfill row 7: %v", got)
+}
+
 // TestEngineTooOldPingPongIsFatal guards the anti-ping-pong bound: a connect
 // cursor that keeps resolving too-old without the re-backfill making progress
 // (the archive never grows, so each re-sweep lands at the same sealed tip) must

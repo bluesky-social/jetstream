@@ -177,6 +177,192 @@ func TestOpen_SealedSegmentReconcilesPastZeroSeq(t *testing.T) {
 		"first append after reopen must not reuse a sealed-segment seq")
 }
 
+// TestOpen_EmptyHighestSealedSegmentReconcilesPastLowerSegment pins the
+// sealed-TAIL recovery floor. The highest segment can be sealed-but-empty
+// (MaxSeq==0) while a LOWER segment holds real seqs — the orchestrator's
+// bootstrap rolls forward to a fresh seg_<N+1> and SealActiveAndClose seals that
+// empty file (bootstrap.go). Inspecting only the highest segment's header would
+// see MaxSeq==0, find no envelope, and (with an illegal seq/next=0) floor
+// nextSeq to 1 — reusing seqs the lower segment already owns. Open must walk the
+// sealed tail back to the highest non-empty segment and floor past ITS MaxSeq.
+func TestOpen_EmptyHighestSealedSegmentReconcilesPastLowerSegment(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		Logger:            logger,
+		MaxEventsPerBlock: 64,
+		MaxSegmentBytes:   1 << 30,
+	}
+	require.NoError(t, os.MkdirAll(segDir, 0o755))
+
+	// seg0: a sealed segment holding seqs 1..n (the real envelope).
+	const n = 5
+	seg0Path := filepath.Join(segDir, SegmentFilename(0))
+	sw0, err := segment.New(segment.Config{Path: seg0Path, MaxEventsPerBlock: 64})
+	require.NoError(t, err)
+	for i := uint64(1); i <= n; i++ {
+		_, err := sw0.Append(segment.Event{Seq: i, Kind: segment.KindCreate, DID: "did:plc:a"})
+		require.NoError(t, err)
+	}
+	require.NoError(t, sw0.Flush())
+	_, err = sw0.Seal()
+	require.NoError(t, err)
+
+	// seg1: the HIGHEST segment, sealed but EMPTY (MaxSeq==0) — the rolled-forward
+	// trailing segment the orchestrator seals at bootstrap.
+	seg1Path := filepath.Join(segDir, SegmentFilename(1))
+	sw1, err := segment.New(segment.Config{Path: seg1Path, MaxEventsPerBlock: 64})
+	require.NoError(t, err)
+	_, err = sw1.Seal()
+	require.NoError(t, err)
+
+	ins0, err := segment.Inspect(seg0Path)
+	require.NoError(t, err)
+	require.EqualValues(t, n, ins0.Header.MaxSeq, "precondition: seg0 holds the real envelope")
+	ins1, err := segment.Inspect(seg1Path)
+	require.NoError(t, err)
+	require.True(t, ins1.Sealed, "precondition: highest segment sealed")
+	require.EqualValues(t, 0, ins1.Header.MaxSeq, "precondition: highest segment is empty (MaxSeq==0)")
+
+	// Illegal seq/next=0 forces the recovery floor to do real work.
+	require.NoError(t, saveNextSeq(st, seqNextKey, 0))
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.Equal(t, uint64(n+1), w.NextSeq(),
+		"Open must walk the sealed tail past an empty highest segment and floor past seg0's MaxSeq, not to 1")
+
+	ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:b"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.Equal(t, uint64(n+1), ev.Seq,
+		"first append after reopen must not reuse a seq the lower sealed segment owns")
+}
+
+// TestOpen_CompactedEmptySealedSegmentReconcilesPastZeroSeq pins the
+// compacted-empty edge of the sealed-segment recovery floor. A fully-compacted
+// sealed segment has EventCount==0 (every row dropped) but PRESERVES its
+// historical MaxSeq envelope (segment.Rewrite restores MinSeq/MaxSeq even when
+// all rows drop). Those seqs are still owned by the segment, so when it is the
+// highest segment AND pebble carries an illegal seq/next=0, Open must reconcile
+// nextSeq past the envelope's MaxSeq — gating on MaxSeq, not EventCount. Gating
+// on EventCount (the obvious-but-wrong choice) would leave foundEvents=false and
+// floor nextSeq to 1, reusing seqs the compacted segment already owns.
+func TestOpen_CompactedEmptySealedSegmentReconcilesPastZeroSeq(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		Logger:            logger,
+		MaxEventsPerBlock: 64,
+		MaxSegmentBytes:   1 << 30,
+	}
+
+	// Write + seal a segment with n events, then compact every row out of it so
+	// it becomes EventCount==0 / MaxSeq==n — the post-compaction envelope state.
+	w1, err := Open(cfg)
+	require.NoError(t, err)
+	const n = 5
+	for range n {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
+		require.NoError(t, w1.Append(t.Context(), &ev))
+	}
+	require.NoError(t, w1.SealActiveAndClose())
+
+	path := filepath.Join(segDir, SegmentFilename(0))
+	res, err := segment.Rewrite(path, func(*segment.Event) segment.RowDecision { return segment.RowDrop }, segment.RewriteOptions{})
+	require.NoError(t, err)
+	require.EqualValues(t, n, res.RowsDropped, "precondition: all rows dropped")
+
+	ins, err := segment.Inspect(path)
+	require.NoError(t, err)
+	require.True(t, ins.Sealed, "precondition: trailing segment must be sealed")
+	require.EqualValues(t, 0, ins.Header.EventCount, "precondition: compacted-empty (EventCount==0)")
+	require.EqualValues(t, n, ins.Header.MaxSeq, "precondition: historical MaxSeq envelope preserved")
+
+	// Corrupt the persisted counter to the illegal 0 value.
+	require.NoError(t, saveNextSeq(st, seqNextKey, 0))
+
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w2.Close() })
+
+	require.Equal(t, uint64(n+1), w2.NextSeq(),
+		"Open must reconcile nextSeq past a COMPACTED-empty segment's MaxSeq envelope, not floor to 1")
+
+	ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:b"}
+	require.NoError(t, w2.Append(t.Context(), &ev))
+	require.Equal(t, uint64(n+1), ev.Seq,
+		"first append after reopen must not reuse a seq the compacted envelope owns")
+}
+
+// TestOpen_SealedSegmentRejectsCorruptHeader pins that the sealed-segment
+// nextSeq recovery does NOT trust an unverified header. The recovery branch
+// exists as a corruption safety net (illegal seq/next=0), so it must itself
+// verify the segment's xxh3 checksum — which covers MaxSeq/EventCount —
+// rather than flooring nextSeq off a header field read blindly. Here we
+// corrupt MaxSeq in a sealed segment WITHOUT recomputing the checksum;
+// Open must fail loud (ErrChecksumMismatch) instead of silently seeding
+// nextSeq from the garbage value (which would gap or reuse seqs). Crash >
+// corruption.
+func TestOpen_SealedSegmentRejectsCorruptHeader(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		Logger:            logger,
+		MaxEventsPerBlock: 64,
+		MaxSegmentBytes:   1 << 30,
+	}
+
+	// Write + seal a segment, mirroring the cutover state.
+	w1, err := Open(cfg)
+	require.NoError(t, err)
+	const n = 5
+	for range n {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
+		require.NoError(t, w1.Append(t.Context(), &ev))
+	}
+	require.NoError(t, w1.SealActiveAndClose())
+
+	path := filepath.Join(segDir, SegmentFilename(0))
+	ins, err := segment.Inspect(path)
+	require.NoError(t, err)
+	require.True(t, ins.Sealed, "precondition: trailing segment must be sealed")
+	require.Equal(t, uint64(n), ins.Header.MaxSeq)
+
+	// Corrupt MaxSeq (header bytes 34..42) to a large bogus value WITHOUT
+	// fixing the checksum. ReadSealedHeader would happily return this; only
+	// the checksum-verifying Reader catches it.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	var bogus [8]byte
+	binary.LittleEndian.PutUint64(bogus[:], 1<<40)
+	_, err = f.WriteAt(bogus[:], 34)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// An illegal seq/next=0 forces the recovery branch to actually consult
+	// the sealed header — otherwise the floor would never read MaxSeq.
+	require.NoError(t, saveNextSeq(st, seqNextKey, 0))
+
+	_, err = Open(cfg)
+	require.Error(t, err, "Open must reject a sealed segment whose header fails checksum, not floor nextSeq off garbage")
+	require.ErrorIs(t, err, segment.ErrChecksumMismatch,
+		"the corruption must surface as a checksum mismatch, not a silent recovery")
+}
+
 // TestAppend_AllocatesMonotonicSeq pins the seq-allocation contract:
 // N appends produce ev.Seq values in [1, N] in call order (seq 0 is a
 // reserved "nothing yet" sentinel; the first-ever event is seq 1).

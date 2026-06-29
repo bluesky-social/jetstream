@@ -116,6 +116,20 @@ func (m *Matcher) Keep(ev *segment.Event) (bool, string) {
 	return false, "filtered"
 }
 
+// setAfterSeq raises the matcher's exclusive lower bound to afterSeq. It is used
+// on a §14 re-backfill: the sweep re-runs planBackfill from the last
+// durably-processed seq (the live tail's highest delivered seq), and the matcher
+// must track that resume point so the one work unit that STRADDLES it (admitted
+// whole under the planner's one-sided contract) has its already-delivered rows
+// dropped before decode rather than re-emitted out of order. Only the seq floor
+// moves; the DID/collection filters and the (user-supplied) beforeSeq bound are
+// untouched. The bound only ever moves FORWARD across a backfill loop's life
+// (resume >= cutover >= the prior floor), so this never widens the window. See
+// the call site in runBackfillThenLive for the full scope/safety argument.
+func (m *Matcher) setAfterSeq(afterSeq uint64) {
+	m.afterSeq = afterSeq
+}
+
 func (m *Matcher) wantsSeq(seq uint64) bool {
 	// afterSeq is a RESUME-AFTER bound (seq > afterSeq), but only when one was
 	// actually requested. afterSeq==0 means "from the start of the archive"

@@ -219,6 +219,25 @@ func (e *Engine) Run(ctx context.Context, emitBatch func([]Event) bool, emitErr 
 // RunWithBackfill is Run with an optional backfill fast path (see BackfillSink).
 // A zero BackfillSink (nil Transform) is exactly equivalent to Run.
 func (e *Engine) RunWithBackfill(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
+	// Reset the row matcher to the configured request at the START of every run.
+	// A §14 re-backfill mutates the matcher's seq floor (setAfterSeq below), and
+	// the matcher is long-lived engine state (built once in NewEngine, reused for
+	// the Client's lifetime). The public Client permits sequential — not
+	// concurrent — Events() re-iterations, so without this reset a later run
+	// would inherit the prior run's elevated floor and silently drop every row in
+	// (cfg.Request.AfterSeq, priorResume]. Runs are non-concurrent (driveRun is
+	// single-goroutine), so this races nothing. A nil matcher (match-all) stays
+	// nil.
+	if e.matcher != nil {
+		e.matcher = NewMatcher(e.cfg.Request)
+	}
+	// rebackfillStalls counts CONSECUTIVE non-advancing §14 cycles within the
+	// current run (the anti-ping-pong guard). It is long-lived engine state like
+	// the matcher, so it must also reset per run: a prior run that stopped with a
+	// partial stall count (e.g. cancelled after 3 non-advancing cycles) would
+	// otherwise make the next run trip the fatal guard after fewer than
+	// maxRebackfillStalls consecutive cycles of its own.
+	e.rebackfillStalls = 0
 	if e.cfg.Backfill {
 		if e.cfg.BackfillOnly {
 			e.runBackfillOnly(ctx, emitBatch, emitErr, bf)
@@ -556,9 +575,39 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 			break
 		}
 
-		resume, tooOld := e.tailLiveFromCutover(loopCtx, b, sealedTip)
+		// Cut over at the HIGHER of the freshly-learned sealed tip and the cursor
+		// we already processed through. The cursor holds the last durably-delivered
+		// seq (the prior cycle's resume); a live tail routinely delivers events from
+		// the active, unsealed segment PAST the sealed tip, so on a §14 re-backfill
+		// the re-learned sealedTip can be BELOW cursor (those live-delivered events
+		// have not sealed into the archive yet). Cutting over at the lower sealedTip
+		// would seed the live consumer's dedup floor below rows already delivered,
+		// re-delivering (sealedTip, cursor] out of order. Worse, if that tail then
+		// delivers nothing and returns too-old, resume = LastSeq() falls back to the
+		// seeded floor (the low sealedTip), regressing both cursor and the matcher
+		// floor below the prior resume — which silently re-enables the duplicate
+		// delivery the matcher floor was guarding. max() keeps the cutover (and thus
+		// the dedup floor and resume) monotonic non-decreasing, so the matcher-floor
+		// invariant below (resume >= cutover >= prior floor) actually holds.
+		cutover := max(sealedTip, cursor)
+		resume, tooOld := e.tailLiveFromCutover(loopCtx, b, cutover)
 		if !tooOld {
 			// Clean stop: ctx cancelled or the consumer broke the iterator.
+			break
+		}
+
+		// Flush the live tail's partially-filled batch BEFORE the next sweep. On
+		// the fast path (bf.Transform set, which production uses) live cutover rows
+		// go through the serial batcher b while re-backfill archive rows are
+		// emitted directly via bf.Emit, bypassing b. The live rows that advanced
+		// resume (seq in (cutover, resume]) may still sit in b.buf — add() only
+		// auto-flushes at batch size. The next sweep emits archive rows with
+		// seq > resume via bf.Emit; without this flush those newer rows reach the
+		// consumer BEFORE the buffered older live rows (which would otherwise
+		// flush only on the periodic flusher tick or the final flush), inverting
+		// delivery order at the seam. A folding consumer still converges, but the
+		// seam must stay in seq order. A flush stop means the consumer is done.
+		if !b.flush() {
 			break
 		}
 
@@ -567,6 +616,38 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		// cursor this sweep started from — a non-advancing re-backfill is a
 		// pathological loop, not a real fall-behind, and is surfaced as fatal.
 		e.recordRebackfill()
+
+		// Advance the row matcher's seq floor to the resume point BEFORE the next
+		// sweep, so the matcher's exact filter lines up with where re-backfill
+		// actually resumes.
+		//
+		// Scope of this fix (measured against the planner, not assumed): the
+		// re-backfill plan request carries afterSeq=resume, and the server planner
+		// already prunes whole segments/blocks with MaxSeq <= afterSeq
+		// (manifest/plan.go segmentOverlapsSeq/blockOverlapsSeq). cursor advances
+		// monotonically (resume = the live tail's highest delivered seq >= cutover
+		// >= this sweep's sealed tip), so the archive at or below resume is NOT
+		// re-planned or re-downloaded — there is no whole-history re-fetch to guard
+		// against, and this saves zero network bytes. What it does fix is the ONE
+		// work unit that STRADDLES resume: the planner's one-sided contract admits
+		// the whole straddling segment/block (MaxSeq > resume but containing rows
+		// <= resume), and the downloader runs the selector per row before decode
+		// (downloader.go decodeFrame). Without this update the stale matcher
+		// (afterSeq = the ORIGINAL request floor, e.g. 0) keeps those already-
+		// delivered rows: they are re-decoded and re-emitted out of order, after
+		// newer live seqs. A folding / seq-dedup consumer still converges
+		// (design §13/§R7), so this is not a correctness fix; it is a bounded
+		// cleanup that drops the straddling unit's redundant prefix before decode
+		// and keeps the cutover seam in per-DID seq order.
+		//
+		// Safety: every row in (origAfter, resume] was already delivered (backfill
+		// covered (origAfter, cutover]; the live tail covered (cutover, resume]),
+		// and a genuinely-new event has seq > resume, so raising the floor to
+		// resume can never drop an undelivered row. dl.selector IS e.matcher (same
+		// pointer, NewDownloader above), and the live consumer that read e.matcher
+		// has already returned, so this between-sweeps write races nothing.
+		e.matcher.setAfterSeq(resume)
+
 		if resume <= cursor {
 			e.rebackfillStalls++
 			if e.rebackfillStalls >= maxRebackfillStalls {
