@@ -2,7 +2,7 @@
 
 Date: 2026-06-28
 Branch: `tombstone-query-plan-refactor` (work continues here)
-Status: **implementation in progress** (steps 1, 2, 7, 6, 3, and 4 landed; steps 5, 8, 9, 10, 11, and 12 remain)
+Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, and 5 landed; steps 8, 9, 10, 11, and 12 remain)
 Design source of truth: `specs/notes/2026-06-28-drop-client-tombstones-design.md`
 Authoritative sections of the design: the Revision block **§R1–R8** (everything below
 the "READING ORDER" banner, §1–§16, is the reasoning trail only — §R wins on conflict).
@@ -544,7 +544,7 @@ lines. Verified: `just lint` (0), `just test` (1659), `just test-long ./internal
 
 ---
 
-### ☐ Step 5 — `tombstone: prune overlay-only API` (design §4.3) — gated on step 4
+### ✅ Step 5 — `tombstone: prune overlay-only API` (design §4.3) — gated on step 4
 
 **Goal.** Remove `tombstone.Set` members only the overlay used; keep everything compaction needs
 (`Observe`, `Evict`, `FoldRange`, `Snapshot.ShouldDrop`, the compaction `decide` path).
