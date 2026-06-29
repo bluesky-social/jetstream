@@ -53,22 +53,25 @@ type clientBackfillResult struct {
 }
 
 // collectClientBackfill drives the REAL public jetstream client through the
-// full archive-negotiation path (getTombstones -> planBackfill ->
-// getSegment/getBlock -> overlay suppression -> cutover to /subscribe-v2),
-// the transport real clients actually use (issue #77). The client is an
-// OBSERVATION SURFACE ONLY — expected state is still derived independently
-// from simulator world + firehose history, never from the client itself.
+// full archive-negotiation path (planBackfill -> getSegment/getBlock -> cutover
+// to /subscribe-v2), the transport real clients actually use (issue #77). The
+// client is an OBSERVATION SURFACE ONLY — expected state is still derived
+// independently from simulator world + firehose history, never from the client
+// itself.
 //
 // It drains the client's full emitted stream — archive AND live tail — until
 // the reconstructed final state converges to the independently-derived ground
 // truth (converged returns true on a clean Compare), or the deadline fires.
-// Draining PAST the compaction watermark to convergence is deliberate: the
-// client emits a SUPPRESSED stream (a create/update kept on disk at watermark
-// W can still be dropped by the client when a tombstone above W supersedes it),
-// so its (-inf, W] window is a subset of the on-disk rows and a per-seq
-// completeness check over that window is unsound. Final state, by contrast, is
-// key-based and seq-space-agnostic: it is comparable exactly when the client
-// has caught up to the quiescent world, which is what convergence detects.
+// Draining to convergence is the load-bearing stop condition under the relaxed
+// eventually-consistent contract (drop-client-tombstones §R1/§R7): backfill is
+// AT-LEAST-ONCE, so the client may emit a create that a later delete supersedes
+// (no client-side suppression remains). A per-seq completeness check over any
+// fixed window is therefore unsound — transient stale rows are expected. Final
+// state, by contrast, is key-based and seq-space-agnostic: Reconstruct folds the
+// full emitted stream and it is comparable exactly when the client has caught up
+// to the quiescent world, which is what convergence detects. This Reconstruct +
+// Compare-to-convergence over the UNFILTERED stream IS the fold-convergence
+// invariant (CheckFoldConvergence) for the no-collection-filter query.
 //
 // The live tail never ends on its own; convergence (or the deadline) is the
 // stop condition. Recoverable client errors are COUNTED (not silently

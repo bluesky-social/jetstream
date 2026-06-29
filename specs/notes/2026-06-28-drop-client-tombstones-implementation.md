@@ -364,7 +364,49 @@ at-start) — killed by eviction-interleaving. Keep `m022`, `m025`, `m027`, etc.
 **Verify.** `just test ./internal/oracle` (new fold-convergence passes on the
 eventually-consistent path), `just test-long ./internal/oracle`. The eviction-interleaving and
 reactivation tests **fail here** (no snapshot yet) — that failure is the gate for step 3.
-**Status / notes.** _(unstarted)_
+**Status / notes.** ✅ **Done** (issue #174). Replaced the point-in-time
+`CheckOverlayReconstruction` with `CheckFoldConvergence` (`internal/oracle/foldconvergence.go`,
+renamed from `overlay.go`): folds the **full emitted** stream, restricts the OUTPUT by collection,
+matches killers **by DID**, and compares against an **independent** ground truth
+(`groundTruthLive` over the full observed stream — NOT a filtered-vs-filtered self-comparison,
+§R7). Switched `groundTruthLive`/the checker to the oracle's own `RecordKey` and **dropped the
+`internal/tombstone` import** — the oracle's correctness model is now independent of the
+production package it checks. Deleted the dead `toSegmentEvent`/`maxU64`. Unit tests rewritten
+(`foldconvergence_test.go`): added the checker's own gate
+(`TestFoldConvergence_MissingDIDKillerDiverges` — a filtered stream missing the DID-killer folds
+to *present* → divergent; passes now) + stale-version, reactivation, collection/wildcard
+restriction cases. Deleted `overlay_integration_test.go` (the `getTombstones` HTTP path). Harness
+(`harness_test.go`): removed the late-DID-tombstone overlay-blob capture + the now-dead
+`accountTombstoneAck` type/helpers + `assertOverlayReconstruction`; the late account-delete
+injection added no fold coverage (it landed after the client drain). `client_observer_test.go`:
+re-doc'd the unfiltered Reconstruct→Compare-to-convergence as the no-filter fold-convergence
+invariant under §R1/§R7 (it already converges — the gap is collection-filtered only).
+`trace_determinism_test.go`: dropped the two `late_overlay_did_tombstone*` allowlist kinds (no
+longer emitted). Kept `overlay.WarmEncoder()` in `main_test.go` (the overlay package is still
+server-side until step 4). **The step-3 gate** is
+`TestFoldConvergence_CollectionFilteredDIDTombstoneGap` (`foldconvergence_gate_test.go`): a
+real-socket (httptest, **no synctest bubble** — one bubble per process, owned by the lifecycle
+test) collection-filtered backfill-only client over hand-built sealed segments (create C in the
+filter; account-delete D with empty collection in its own segment, both below the tip). **Captured
+failure**: `client stream folds to a record that ground truth DELETED: {did:plc:victim
+app.bsky.feed.post rkey} emitted_seq=1` — C downloaded, the empty-collection D never delivered to a
+collection-filtered plan. Per the review decision, the failure was captured once as gate evidence,
+then the test is `t.Skip`'d referencing #174/step-3 to keep the tree green; step 3 removes the
+skip. Verified: `just lint` (0 issues), `just test` (1675), `just test-long ./internal/oracle`,
+explicit `TestOracle_DefaultLifecycle` (synctest, fast + swarm), `TestOracle_SameSeedTraceDeterminism`
+(20 deterministic sections identical), and `just oracle` (20s stress) all green.
+
+**Deferred (recorded, per §R7 / dependency order):**
+- *Eviction-interleaving **between pages*** needs the pagination loop (step 10) and
+  *snapshot-before-first-fetch ordering* needs the snapshot fetch (step 3); the single-shot
+  filtered gate above gates step 3 at the right granularity. The mid-pagination sharpening +
+  the ordering test land in steps 11 / 3.
+- *Mutation campaign* (retire `m020`/`m021`/`m023`, add a snapshot-at-seam mutant): the
+  overlay-format mutants reference `internal/overlay` (deleted in step 4) — refresh **after**
+  step 4 so the mutants compile, alongside the step-11 Part-B mutants.
+- **Step 12 doc debt found:** `options.go:100-102` (`WithCollections` doc) still claims
+  "records for a deleted account are correctly suppressed — you just don't see the Account event
+  itself" — false under the dropped suppression; coupled to the §4.4 narrative, fold into step 12.
 
 ---
 
@@ -776,7 +818,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 1. deliver #account/#identity/#sync on v1+v2 (#171)
 - [x] 2. remove client tombstone suppression (#172)
 - [x] 7. seqs start at 1 (+ collapse presence machinery) (#173)
-- [ ] 6. oracle fold-convergence + DID-tombstone delivery tests (gates 3)
+- [x] 6. oracle fold-convergence + DID-tombstone delivery tests (gates 3) (#174)
 - [ ] 3. backfill DID-tombstone start-snapshot (fail-closed, ordering invariant)
 - [ ] 4. remove getTombstones overlay endpoint (gated on 3)
 - [ ] 5. prune overlay-only tombstone API (keep SnapshotRange)
