@@ -149,7 +149,7 @@ func (c *Client) Close() error {
 var errClientNotInitialized = fmt.Errorf("jetstream: client not initialized (use Subscribe)")
 
 // engine is the internal seam between the public Client and the orchestration
-// implementation (planning, download, suppression, cutover, live tail). The
+// implementation (planning, paginated download, cutover, live tail). The
 // concrete engine is wired in subsequent work; this interface keeps the public
 // surface stable while that lands.
 type engine interface {

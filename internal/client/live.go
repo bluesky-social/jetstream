@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -107,6 +109,12 @@ type liveConsumer struct {
 	seenAny bool
 }
 
+// LastSeq returns the highest seq the consumer has delivered, or its seeded
+// dedup floor if it delivered nothing. Read it only after Run returns (the
+// field is mutated on Run's goroutine); the cutover engine uses it to resume a
+// re-backfill from the last durably-processed seq after a too-old 400.
+func (c *liveConsumer) LastSeq() uint64 { return c.lastSeq }
+
 func newLiveConsumer(cfg liveConfig) *liveConsumer {
 	if cfg.readLimit <= 0 {
 		cfg.readLimit = defaultLiveReadLimit
@@ -150,6 +158,15 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error)
 		}
 		if errors.Is(err, errEmitStop) {
 			return nil
+		}
+		// A too-old cursor is terminal, not transient: the seq will not become
+		// valid by reconnecting (the lookback floor only advances). Return it so
+		// the cutover engine re-enters the backfill pagination loop from the last
+		// durably-processed seq (design §14 client side) instead of churning
+		// reconnects against a cursor the server will keep rejecting. This covers
+		// both the terminal handoff connect and a mid-stream fell-off-live drop.
+		if errors.Is(err, errLiveCursorTooOld) {
+			return err
 		}
 		// A session that made progress (delivered new events) is healthy; reset
 		// backoff so a long-lived connection that finally drops reconnects
@@ -271,16 +288,39 @@ func liveDialOptions(hc *http.Client) *websocket.DialOptions {
 	}
 }
 
+// errLiveCursorTooOld marks a terminal /subscribe-v2 connect refusal: the seq
+// cursor resolved below the server's lookback floor and the server returned a
+// pre-upgrade HTTP 400 (subscribe §14 / design §14). It is NOT a transient dial
+// failure to reconnect-loop on — the cursor will not become valid by retrying.
+// The cutover engine catches it and re-enters the backfill pagination loop from
+// the last durably-processed seq (design §14 client side). The wrapped message
+// carries the server's floor-seq body for observability.
+var errLiveCursorTooOld = errors.New("jetstream: live cursor too old")
+
 // dialWebsocket is the production dialer. hc, when non-nil, routes the HTTP/1.1
 // upgrade through a custom transport (e.g. an in-process pipe); nil uses the
 // websocket default.
+//
+// A pre-upgrade HTTP 400 "cursor too old" from /subscribe-v2 is mapped to the
+// typed errLiveCursorTooOld so the consumer surfaces it terminally rather than
+// reconnect-looping. coder/websocket leaves the first 1024 bytes of the
+// response body readable on a non-101 handshake, which carries the floor seq.
 func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn, error) {
 	conn, resp, err := websocket.Dial(ctx, rawURL, liveDialOptions(hc))
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusBadRequest && resp.Body != nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			_ = resp.Body.Close()
+			if strings.Contains(string(body), "cursor too old") {
+				return nil, fmt.Errorf("%w: %s", errLiveCursorTooOld, strings.TrimSpace(string(body)))
+			}
+		} else if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, err
+	}
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
-	}
-	if err != nil {
-		return nil, err
 	}
 	return conn, nil
 }

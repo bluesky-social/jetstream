@@ -62,10 +62,6 @@ func subscribeCommand() *cli.Command {
 				Usage: "Bounded concurrency for sealed segment/block downloads (0 = auto-size from CPU count)",
 				Value: 0,
 			},
-			&cli.StringFlag{
-				Name:  "live-buffer-file",
-				Usage: "Path to a durable JSONL live buffer (default: in-memory)",
-			},
 			&cli.BoolFlag{
 				Name:  "print",
 				Usage: "Print each event as JSON instead of throughput stats",
@@ -173,14 +169,6 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 			return fmt.Errorf("--backfill-only requires --after-seq and/or --before-seq")
 		}
 		opts = append(opts, jetstream.WithBackfillOnly())
-	}
-
-	if path := cmd.String("live-buffer-file"); path != "" {
-		buf, err := jetstream.NewFileLiveBuffer(path)
-		if err != nil {
-			return err
-		}
-		opts = append(opts, jetstream.WithLiveBuffer(buf))
 	}
 
 	// --typed-likes-client decodes records straight into bsky.FeedLike via the

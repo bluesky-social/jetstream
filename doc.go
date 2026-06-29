@@ -30,14 +30,22 @@
 //
 // A bare Subscribe(host) with no backfill options is a pure live tail from the
 // current tip. Supplying WithAfterSeq or WithBeforeSeq triggers the full
-// archive-negotiation path (plan, download sealed segments, apply compaction
-// tombstones, then cut over to live).
+// archive-negotiation path: the client pages planBackfill over the sealed
+// archive (downloading every matching sealed segment), then connects /subscribe
+// once at the sealed tip to pick up the active segment and the live tail. There
+// is no client-side buffer and no record suppression.
 //
-// Delivery is at-least-once: the caller must process events idempotently. A
-// record deleted or updated after it was first delivered arrives as its own
-// later event, exactly as on the upstream firehose.
+// Delivery is at-least-once and the contract is eventually-consistent: the
+// caller must process events idempotently and FOLD the stream (creates/updates
+// apply; deletes, account-deletes, and syncs remove). A record deleted or
+// updated after it was first delivered arrives as its own later event, exactly
+// as on the upstream firehose; deleted-account markers (#account/#identity/
+// #sync) are always delivered (even under a collection filter) so a folding
+// consumer can purge the dead account's records. If the live cursor ages below
+// the server's lookback window during a slow handoff, the client transparently
+// re-backfills from its last processed seq rather than silently skipping the gap.
 //
 // The client deliberately exposes a minimal public surface: the Client, its
-// options, and the decoded Event shape. All transport, planning, download,
-// and tombstone-suppression machinery lives in internal packages.
+// options, and the decoded Event shape. All transport, planning, download, and
+// cutover machinery lives in internal packages.
 package jetstream

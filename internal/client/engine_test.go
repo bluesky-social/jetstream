@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -13,43 +14,8 @@ import (
 
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/xrpc"
-	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
-
-// memBuffer is the engine Buffer backed by an in-memory list, for tests.
-type memBuffer struct {
-	mu     sync.Mutex
-	frames []LiveFrame
-}
-
-func (b *memBuffer) Append(frames []LiveFrame) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, f := range frames {
-		b.frames = append(b.frames, LiveFrame{Seq: f.Seq, Data: append([]byte(nil), f.Data...)})
-	}
-	return nil
-}
-
-func (b *memBuffer) Replay(ctx context.Context, after gt.Option[uint64]) func(yield func(LiveFrame, error) bool) {
-	return func(yield func(LiveFrame, error) bool) {
-		b.mu.Lock()
-		snap := append([]LiveFrame(nil), b.frames...)
-		b.mu.Unlock()
-		for _, f := range snap {
-			if after.HasVal() && f.Seq <= after.Val() {
-				continue
-			}
-			if !yield(f, nil) {
-				return
-			}
-		}
-	}
-}
-
-func (b *memBuffer) Truncate(uint64) error { return nil }
-func (b *memBuffer) Close() error          { return nil }
 
 // engineHarness wires an archive XRPC server (plan + segment/block) and a
 // scripted live websocket transport into a configured Engine.
@@ -58,6 +24,12 @@ type engineHarness struct {
 	planned   uint64
 	planEntry []planSeg // segments to name in the plan, in order
 	liveSteps []readStep
+	// planResponder, when set, computes the planBackfill JSON response for a
+	// given request, enabling multi-page pagination tests. When nil the harness
+	// serves a single-shot plan (all planEntry; plannedThroughSeq == sealedTipSeq
+	// == planned), which the bufferless engine consumes in exactly one page.
+	planResponder func(req planReqWire) string
+	planCalls     atomic.Int64
 }
 
 type planSeg struct {
@@ -66,28 +38,47 @@ type planSeg struct {
 	minSeq, maxSeq uint64
 }
 
+// planReqWire is the decoded planBackfill input the responder branches on.
+type planReqWire struct {
+	AfterSeq  int64 `json:"afterSeq"`
+	BeforeSeq int64 `json:"beforeSeq"`
+}
+
 func newEngineHarness(t *testing.T) *engineHarness {
 	return &engineHarness{as: newArchiveServer(t)}
 }
 
 func (h *engineHarness) installHandlers() {
 	h.as.mux.HandleFunc("/xrpc/network.bsky.jetstream.planBackfill", func(w http.ResponseWriter, r *http.Request) {
+		h.planCalls.Add(1)
+		var req planReqWire
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "application/json")
+		if h.planResponder != nil {
+			_, _ = w.Write([]byte(h.planResponder(req)))
+			return
+		}
 		_, _ = w.Write([]byte(h.planJSON()))
 	})
 }
 
+// planJSON renders a single-shot plan: the whole planEntry set in one page with
+// the continuation cursor already at the sealed tip.
 func (h *engineHarness) planJSON() string {
+	return planPageJSON(h.planEntry, h.planned, h.planned)
+}
+
+// planPageJSON renders one planBackfill page: the given segments, with the
+// continuation cursor plannedThroughSeq and the pinned goal sealedTipSeq.
+func planPageJSON(entries []planSeg, plannedThrough, sealedTip uint64) string {
 	var segs []string
-	for _, s := range h.planEntry {
+	for _, s := range entries {
 		segs = append(segs, fmt.Sprintf(
 			`{"name":%q,"index":%d,"checksum":"deadbeefdeadbeef","minSeq":%d,"maxSeq":%d,"mode":"segment"}`,
 			s.name, s.index, s.minSeq, s.maxSeq))
 	}
-	// This harness models the single-shot (un-paginated) plan, so the
-	// continuation cursor already equals the sealed tip.
 	return fmt.Sprintf(`{"plannedThroughSeq":%d,"sealedTipSeq":%d,"segments":[%s],"stats":{"segmentsExamined":%d,"segmentsMatched":%d,"blocksMatched":0,"entries":%d}}`,
-		h.planned, h.planned, strings.Join(segs, ","), len(h.planEntry), len(h.planEntry), len(h.planEntry))
+		plannedThrough, sealedTip, strings.Join(segs, ","), len(entries), len(entries), len(entries))
 }
 
 func (h *engineHarness) cfg() Config {
@@ -99,7 +90,6 @@ func (h *engineHarness) cfg() Config {
 		Backfill:    true,
 		BatchSize:   1,
 		Concurrency: 4,
-		Buffer:      &memBuffer{},
 		XRPC:        &xrpc.Client{Host: h.as.srv.URL},
 		Dial:        dial,
 		// Tiny reconnect backoff: the scripted transport EOFs after its frames,
@@ -817,187 +807,6 @@ func TestEngineLiveOnlyBreakOnQuietTail(t *testing.T) {
 	}
 }
 
-// failOnNthAppendBuffer wraps memBuffer and fails the Nth Append call, modeling
-// a durable-buffer write failure during the cutover. The frame whose append
-// fails (and every later frame) is therefore NOT persisted.
-type failOnNthAppendBuffer struct {
-	memBuffer
-	failAt  int // 1-based append index to fail
-	appends atomic.Int64
-}
-
-func (b *failOnNthAppendBuffer) Append(frames []LiveFrame) error {
-	if int(b.appends.Add(1)) == b.failAt {
-		return fmt.Errorf("simulated buffer append failure")
-	}
-	return b.memBuffer.Append(frames)
-}
-
-// TestEngineCutoverAppendFailureSurfaces is the B3 regression guard: a live
-// buffer Append failure during the buffering phase must be surfaced as an
-// error, not silently swallowed. Before the fix, onLive returned false, the
-// live consumer exited cleanly (errEmitStop -> nil), and flipAndDrain replayed
-// a truncated buffer — silently dropping every un-persisted live frame and
-// exiting "successfully". That is the silent-data-loss class we forbid.
-func TestEngineCutoverAppendFailureSurfaces(t *testing.T) {
-	t.Parallel()
-	h := newEngineHarness(t)
-
-	// Small sealed archive (seqs 1..2), plannedThroughSeq = 2.
-	h.as.addSegment(t, "seg_0000000000.jss", []segment.Event{
-		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
-		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
-	})
-	h.planned = 2
-	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 2}}
-
-	// Live frames above the sealed tip that the cutover must not lose.
-	for i := uint64(3); i <= 5; i++ {
-		h.liveSteps = append(h.liveSteps, readStep{
-			data: liveCommitFrame(t, i, "did:plc:a", "create", "app.bsky.feed.post", "r"+itoaU(i), true),
-		})
-	}
-	h.installHandlers()
-
-	// Gate getSegment until at least one live frame has been appended, so the
-	// failing append happens during the buffering phase (before flipAndDrain).
-	gate := make(chan struct{})
-	h.as.mu.Lock()
-	h.as.segGate = gate
-	h.as.mu.Unlock()
-
-	buf := &failOnNthAppendBuffer{failAt: 1}
-	cfg := h.cfg()
-	cfg.Buffer = buf
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var (
-		mu      sync.Mutex
-		gotErr  error
-		opened  = make(chan struct{})
-		onceOpn sync.Once
-	)
-	eng := NewEngine(cfg)
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		eng.Run(ctx,
-			func([]Event) bool { return true },
-			func(err error) bool {
-				mu.Lock()
-				if gotErr == nil {
-					gotErr = err
-				}
-				mu.Unlock()
-				return true
-			},
-		)
-	}()
-
-	// Release the backfill once the first append has been attempted (and failed).
-	go func() {
-		for {
-			if buf.appends.Load() >= 1 {
-				onceOpn.Do(func() { close(opened) })
-				return
-			}
-			select {
-			case <-finished:
-				onceOpn.Do(func() { close(opened) })
-				return
-			case <-time.After(time.Millisecond):
-			}
-		}
-	}()
-	select {
-	case <-opened:
-	case <-time.After(5 * time.Second):
-		t.Fatal("no live append attempted within 5s")
-	}
-	close(gate)
-
-	select {
-	case <-finished:
-	case <-time.After(5 * time.Second):
-		cancel()
-		<-finished
-		t.Fatal("engine did not return within 5s after cutover append failure")
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	require.Error(t, gotErr, "a cutover buffer append failure must surface as an error, not be silently swallowed")
-	require.Contains(t, gotErr.Error(), "append live buffer")
-}
-
-// replayErrBuffer appends normally but always fails Replay, modeling a durable
-// buffer that cannot be read back at cutover time.
-type replayErrBuffer struct {
-	memBuffer
-}
-
-func (b *replayErrBuffer) Replay(context.Context, gt.Option[uint64]) func(yield func(LiveFrame, error) bool) {
-	return func(yield func(LiveFrame, error) bool) {
-		yield(LiveFrame{}, fmt.Errorf("simulated replay failure"))
-	}
-}
-
-// TestEngineCutoverReplayErrorUnwinds is the B2 regression guard: when
-// flipAndDrain returns a replay error, the engine must cancel the live consumer
-// and return, rather than fall into liveWG.Wait() and block until the parent
-// ctx is cancelled. The tail is quiet after the buffered frames, so the only
-// thing that can unwind the live goroutine is an explicit stopLive — exactly
-// what the buggy fall-through omitted. The test does NOT cancel ctx; the engine
-// must self-unwind.
-func TestEngineCutoverReplayErrorUnwinds(t *testing.T) {
-	t.Parallel()
-	h := newEngineHarness(t)
-
-	h.as.addSegment(t, "seg_0000000000.jss", []segment.Event{
-		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
-		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
-	})
-	h.planned = 2
-	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 2}}
-
-	// One live frame above the tip so the buffering phase has something to
-	// append; after it the scripted conn EOFs and the tail goes quiet.
-	h.liveSteps = append(h.liveSteps, readStep{
-		data: liveCommitFrame(t, 3, "did:plc:a", "create", "app.bsky.feed.post", "r3", true),
-	})
-	h.installHandlers()
-
-	cfg := h.cfg()
-	cfg.Buffer = &replayErrBuffer{}
-
-	var sawErr atomic.Bool
-	eng := NewEngine(cfg)
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		// Background ctx: NOT cancelled by the test. The engine must unwind on
-		// its own via the replay-error branch's stopLive.
-		eng.Run(context.Background(),
-			func([]Event) bool { return true },
-			func(err error) bool {
-				if err != nil {
-					sawErr.Store(true)
-				}
-				return true
-			},
-		)
-	}()
-
-	select {
-	case <-finished:
-	case <-time.After(5 * time.Second):
-		t.Fatal("engine did not unwind after a cutover replay error (deadlock on liveWG.Wait)")
-	}
-	require.True(t, sawErr.Load(), "the replay error must be surfaced before unwinding")
-}
-
 // TestEngineLiveOnlyErrorRejectStopsBatching is the B4 regression guard: in the
 // live-only path, when the consumer rejects an emitted error (emitErr returns
 // false), batching must stop and no batch may be delivered afterward. Before
@@ -1086,4 +895,229 @@ func hasRkey(events []Event, rkey string) bool {
 
 func itoaU(n uint64) string {
 	return strconv.FormatUint(n, 10)
+}
+
+// segName already exists for the fast-path test; reuse it for paginated archives.
+
+// TestEngineMultiPageBackfillCutover drives the bufferless pagination loop over
+// a 3-page sealed archive (one segment per page), then cuts over to the live
+// tail. The union of pages, folded in seq order, must equal ground truth with
+// every event delivered exactly once (no skip at a page boundary, no dup at the
+// cutover seam). The done predicate is plannedThroughSeq >= sealedTipSeq.
+func TestEngineMultiPageBackfillCutover(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	// 3 sealed segments, 2 events each: seq 1..6. Sealed tip S = 6.
+	for s := range 3 {
+		var sealed []segment.Event
+		for i := range 2 {
+			seq := uint64(s*2 + i + 1)
+			sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+		}
+		h.as.addSegment(t, segName(s), sealed)
+	}
+	// One page per segment, keyed by the exclusive afterSeq cursor.
+	pages := map[int64]string{
+		0: planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}, 2, 6),
+		2: planPageJSON([]planSeg{{name: segName(1), index: 1, minSeq: 3, maxSeq: 4}}, 4, 6),
+		4: planPageJSON([]planSeg{{name: segName(2), index: 2, minSeq: 5, maxSeq: 6}}, 6, 6),
+	}
+	h.planResponder = func(req planReqWire) string {
+		page, ok := pages[req.AfterSeq]
+		require.Truef(t, ok, "unexpected afterSeq %d", req.AfterSeq)
+		return page
+	}
+
+	// Live tail above the sealed tip: the active segment + steady state, 7..9.
+	for i := uint64(7); i <= 9; i++ {
+		h.liveSteps = append(h.liveSteps, readStep{
+			data: liveCommitFrame(t, i, "did:plc:a", "create", "app.bsky.feed.post", "r"+itoaU(i), true),
+		})
+	}
+	h.installHandlers()
+
+	events := h.runUntilSeq(t, h.cfg(), 9)
+
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9}, seqs(events),
+		"every page + the live tail must be delivered exactly once, in order")
+	require.GreaterOrEqual(t, h.planCalls.Load(), int64(3), "the loop must page at least 3 times")
+}
+
+// TestEnginePinnedBeforeSeqAcrossPages asserts the §11 correction: beforeSeq is
+// pinned to the page-1 sealedTipSeq for every subsequent page, so the loop scans
+// exactly (afterSeq, S] and never chases a moving tip.
+func TestEnginePinnedBeforeSeqAcrossPages(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	for s := range 2 {
+		var sealed []segment.Event
+		for i := range 2 {
+			seq := uint64(s*2 + i + 1)
+			sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+		}
+		h.as.addSegment(t, segName(s), sealed)
+	}
+
+	var (
+		mu   sync.Mutex
+		reqs []planReqWire
+	)
+	pages := map[int64]string{
+		0: planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}, 2, 4),
+		2: planPageJSON([]planSeg{{name: segName(1), index: 1, minSeq: 3, maxSeq: 4}}, 4, 4),
+	}
+	h.planResponder = func(req planReqWire) string {
+		mu.Lock()
+		reqs = append(reqs, req)
+		mu.Unlock()
+		return pages[req.AfterSeq]
+	}
+
+	h.liveSteps = append(h.liveSteps, readStep{
+		data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true),
+	})
+	h.installHandlers()
+
+	_ = h.runUntilSeq(t, h.cfg(), 5)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(reqs), 2, "must have paged at least twice")
+	// Page 1: full backfill from the start, no beforeSeq pin yet.
+	require.EqualValues(t, 0, reqs[0].AfterSeq, "page 1 starts at afterSeq=0")
+	require.EqualValues(t, 0, reqs[0].BeforeSeq, "page 1 carries no beforeSeq (0 = unset)")
+	// Page 2: continuation cursor + beforeSeq pinned to the page-1 sealed tip (4).
+	require.EqualValues(t, 2, reqs[1].AfterSeq, "page 2 resumes at the continuation cursor")
+	require.EqualValues(t, 4, reqs[1].BeforeSeq, "page 2 must pin beforeSeq to the page-1 sealed tip")
+}
+
+// rebackfillDialer fails the first failN dials with errLiveCursorTooOld (the §14
+// pre-upgrade 400), then hands out the given conn. It models a slow handoff whose
+// connect cursor aged below the lookback floor.
+func rebackfillDialer(failN int, conn *scriptedConn) (dialFunc, *atomic.Int64) {
+	var dials atomic.Int64
+	return func(ctx context.Context, _ string) (wsConn, error) {
+		n := dials.Add(1)
+		if int(n) <= failN {
+			return nil, errLiveCursorTooOld
+		}
+		return conn, nil
+	}, &dials
+}
+
+// TestEngineTooOldHandoffReBackfills is the §14 client contract: a too-old 400
+// at the terminal connect must NOT be fatal — the engine re-enters the
+// pagination loop from its last seq and converges once the connect succeeds. The
+// archive grows by one segment between the two sweeps (modelling segments sealed
+// during the slow handoff), which the re-backfill then downloads via HTTP.
+func TestEngineTooOldHandoffReBackfills(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	// Two segments, but the second only becomes plannable on the SECOND sweep
+	// (afterSeq=2), modelling a seal during the handoff.
+	h.as.addSegment(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+	})
+	h.as.addSegment(t, segName(1), []segment.Event{
+		makeCreate(t, 3, "did:plc:a", "app.bsky.feed.post", "r3"),
+		makeCreate(t, 4, "did:plc:a", "app.bsky.feed.post", "r4"),
+	})
+	pages := map[int64]string{
+		// First sweep: only seg0 is sealed; S = 2.
+		0: planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}, 2, 2),
+		// Re-backfill sweep (afterSeq=2): seg1 has since sealed; S = 4.
+		2: planPageJSON([]planSeg{{name: segName(1), index: 1, minSeq: 3, maxSeq: 4}}, 4, 4),
+	}
+	h.planResponder = func(req planReqWire) string {
+		page, ok := pages[req.AfterSeq]
+		require.Truef(t, ok, "unexpected afterSeq %d", req.AfterSeq)
+		return page
+	}
+
+	// The live tail (second connect) delivers the active-segment events 5,6.
+	conn := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
+		{data: liveCommitFrame(t, 6, "did:plc:a", "create", "app.bsky.feed.post", "r6", true)},
+	}}
+	dial, dials := rebackfillDialer(1, conn) // first connect 400s, second succeeds
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.Dial = dial
+
+	events := h.runUntilSeq(t, cfg, 6)
+
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, seqs(events),
+		"re-backfill must download the handoff-sealed segment and converge, no skip/dup")
+	require.GreaterOrEqual(t, dials.Load(), int64(2), "must have re-dialed after the too-old 400")
+}
+
+// TestEngineTooOldPingPongIsFatal guards the anti-ping-pong bound: a connect
+// cursor that keeps resolving too-old without the re-backfill making progress
+// (the archive never grows, so each re-sweep lands at the same sealed tip) must
+// fail fatally after maxRebackfillStalls cycles rather than loop forever.
+func TestEngineTooOldPingPongIsFatal(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	h.as.addSegment(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+	})
+	// Every sweep (afterSeq 0 then 2) lands at the same sealed tip 2: the archive
+	// never grows, so the re-backfill resume cursor cannot advance.
+	pages := map[int64]string{
+		0: planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}, 2, 2),
+		2: planPageJSON(nil, 2, 2),
+	}
+	h.planResponder = func(req planReqWire) string { return pages[req.AfterSeq] }
+
+	// Every connect 400s.
+	dial, dials := rebackfillDialer(1<<30, &scriptedConn{})
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.Dial = dial
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var (
+		mu     sync.Mutex
+		gotErr error
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func([]Event) bool { return true },
+			func(err error) bool {
+				mu.Lock()
+				if gotErr == nil {
+					gotErr = err
+				}
+				mu.Unlock()
+				return true
+			},
+		)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("engine did not surface a fatal error on a too-old ping-pong (looping forever?)")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.ErrorIs(t, gotErr, ErrFatal, "a non-advancing re-backfill ping-pong must be fatal, not infinite")
+	require.Contains(t, gotErr.Error(), "re-backfill made no progress")
+	// Bounded: maxRebackfillStalls connect attempts, give or take the first.
+	require.LessOrEqual(t, dials.Load(), int64(maxRebackfillStalls+2), "re-backfill cycles must be bounded")
 }

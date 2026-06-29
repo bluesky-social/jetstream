@@ -2,39 +2,24 @@ package client
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/jcalabro/atmos/xrpc"
-	"github.com/jcalabro/gt"
 )
 
-// LiveFrame is one buffered live event: its seq and the raw JSON frame bytes.
-// Mirrors the root jetstream.LiveFrame; the root adapts its public LiveBuffer
-// to the engine's Buffer interface to avoid an import cycle.
-type LiveFrame struct {
-	Seq  uint64
-	Data []byte
-}
-
-// Buffer is the engine's view of the cutover live buffer. The root package
-// supplies an adapter over the user-facing jetstream.LiveBuffer.
-type Buffer interface {
-	Append(frames []LiveFrame) error
-	// Replay yields buffered frames after the given exclusive lower bound. None
-	// replays from the beginning (including seq 0); Some(n) yields only Seq > n.
-	Replay(ctx context.Context, after gt.Option[uint64]) func(yield func(LiveFrame, error) bool)
-	Truncate(throughSeq uint64) error
-	Close() error
-}
-
-// liveRewindMargin is how far below plannedThroughSeq the live tail starts, so
-// the record-stream handoff leans on at-least-once across the overlap rather
-// than trusting an exact boundary. Duplicates are deduped by seq. The cost is a
-// few extra live frames re-tailed, never a gap.
-const liveRewindMargin = 256
+// maxRebackfillStalls bounds consecutive re-backfill cycles that make no
+// forward progress, the anti-ping-pong guard for the §14 too-old handoff
+// (design §14). A re-backfill triggered by a too-old 400 normally advances the
+// connect cursor (the consumer delivered live events before falling off, or the
+// archive sealed new segments above the old tip); a cursor that fails to advance
+// this many times in a row is a pathological loop (e.g. a misconfigured
+// sub-archive lookback) and is surfaced as fatal rather than spun on forever.
+const maxRebackfillStalls = 5
 
 // defaultMaxBatchDelay bounds how long a partially-filled batch waits before
 // being flushed, so a low-volume live tail still delivers promptly rather than
@@ -57,7 +42,6 @@ type Config struct {
 	// the steady-state live tail. Zero uses defaultMaxBatchDelay.
 	MaxBatchDelay time.Duration
 	Concurrency   int
-	Buffer        Buffer
 	// XRPC drives the short XRPC negotiation calls (planBackfill).
 	// BulkXRPC drives the large getSegment/getBlock downloads;
 	// it gets bulk-transfer HTTP tuning (no short wall-clock timeout). When
@@ -121,6 +105,11 @@ type Engine struct {
 	planner *Planner
 	matcher *Matcher
 	logger  *slog.Logger
+
+	// rebackfillStalls counts consecutive §14 too-old re-backfill cycles whose
+	// resume cursor failed to advance, bounded by maxRebackfillStalls. Touched
+	// only on the single run goroutine in runBackfillThenLive.
+	rebackfillStalls int
 }
 
 // NewEngine builds an Engine from cfg.
@@ -224,11 +213,10 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	// rejects stops batching (and fires onStop -> stopLive) instead of being
 	// emitted concurrently and then ignored.
 	//
-	// Apply the caller's exact DID/collection filter here: the server streams
-	// ALL collections to /subscribe-v2 (the client does not forward
-	// wantedCollections on the wire), so the engine must drop non-matching
-	// events itself. The backfill+cutover path filters via liveSink.wantLive;
-	// the pure live-only path has no sink, so it filters inline. A nil/empty
+	// Apply the caller's exact DID/collection filter here via wantsLive (shared
+	// with the cutover tail): the server streams ALL collections to
+	// /subscribe-v2 (the client does not forward wantedCollections as a hard
+	// filter), so the engine must drop non-matching events itself. A nil/empty
 	// matcher matches everything, so an unfiltered tail is unaffected.
 	_ = consumer.Run(liveCtx, func(ev *Event, _ []byte, err error) bool {
 		if err != nil {
@@ -245,11 +233,12 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	}
 }
 
-// wantsLive reports whether a live-only event passes the caller's exact
-// DID/collection filter. The live-only path runs no backfill and seeds no
-// suppressor (there are no historical rows to suppress against), so unlike the
-// cutover's liveSink.wantLive it applies only the matcher. A nil matcher
-// matches everything.
+// wantsLive reports whether a live event passes the caller's exact
+// DID/collection filter, applied client-side because /subscribe-v2 streams all
+// collections (the client does not forward wantedCollections as a hard filter).
+// There is no client-side tombstone suppression (design §5.1): every matching
+// row is delivered and a folding consumer converges. Shared by the live-only
+// path and the backfill cutover tail. A nil matcher matches everything.
 func (e *Engine) wantsLive(ev *Event) bool {
 	if e.matcher == nil {
 		return true
@@ -355,84 +344,189 @@ func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (
 		}
 }
 
-// Records in the active (unsealed) segment, seq in (plannedThroughSeq, M], are
-// only reachable via the live tail and are therefore NOT delivered by a dump.
-// That is the defining trade-off of BackfillOnly: a clean point-in-time slice
-// of the sealed archive, not the full up-to-the-instant stream.
-func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
-	// 1. Plan. Terminal on failure: there is no archive transport plan to run.
-	plan, err := e.planner.Plan(ctx, e.cfg.Request)
-	if err != nil {
-		emitErr(fatal(err))
-		return
-	}
+// sweepSealedArchive pages planBackfill from startCursor, downloading and
+// emitting every matching row in seq order until the whole sealed archive has
+// been consumed (design §11/§12). It returns the pinned sealed tip S (the
+// cutover cursor), whether the consumer asked to stop mid-sweep, and a terminal
+// plan/context error.
+//
+// The mechanics that make this gap-free and progressing (design §12.1, verified
+// by the manifest planner tests):
+//
+//   - beforeSeq is PINNED to S, the sealedTipSeq read on the FIRST page, so the
+//     loop scans exactly (startCursor, S]. Segments sealed during the sweep carry
+//     seqs > S and are deliberately left to the terminal /subscribe cold replay
+//     (§14.1) rather than chased by a moving tip.
+//   - The continuation cursor is plannedThroughSeq (exclusive lower bound for the
+//     next page). A truncated page reports the MaxSeq of its last included work
+//     unit (which strictly advances); a non-truncated page reports S. So
+//     plannedThroughSeq >= S is the unambiguous done predicate even for a sparse
+//     filter that matched zero segments in a sub-range (design §12.2).
+//
+// DID-level markers (#account/#identity/#sync) ride inline through every page
+// whose plan touches their blocks, via the §R4-revised sentinel index — no
+// snapshot, no client-side suppression. The folding consumer converges.
+func (e *Engine) sweepSealedArchive(ctx context.Context, dl *Downloader, emit func(EntryResult) bool, backfillStopped func() bool, startCursor uint64) (sealedTip uint64, stopped bool, err error) {
+	cursor := startCursor
+	pinned := false
+	for {
+		req := e.cfg.Request
+		req.AfterSeq = cursor
+		if pinned {
+			// Pin beforeSeq to the page-1 sealed tip for every subsequent page.
+			req.HasBeforeSeq = true
+			req.BeforeSeq = sealedTip
+		}
+		plan, perr := e.planner.Plan(ctx, req)
+		if perr != nil {
+			return sealedTip, false, perr
+		}
+		if !pinned {
+			sealedTip = plan.SealedTipSeq
+			pinned = true
+		}
 
-	// 2. Download + emit in plan order. Rows are filtered (exact DID/collection/
-	// seq) before decode by the matcher. Backfill emits every matching row with no
-	// tombstone suppression — a folding consumer converges (design §5.1).
+		if derr := dl.Download(ctx, plan.Entries, emit); derr != nil {
+			return sealedTip, false, derr // ctx cancelled
+		}
+		// backfillStopped() (not just b.stopped()): on the fast path the consumer
+		// stop is observed via bf.Emit returning false, NOT through the batcher.
+		if backfillStopped() {
+			return sealedTip, true, nil
+		}
+
+		cursor = plan.PlannedThroughSeq
+		if cursor >= sealedTip {
+			// Whole sealed archive (startCursor, S] consumed. An empty archive is
+			// sealedTip==0 and terminates here on the first page (cursor 0 >= 0).
+			return sealedTip, false, nil
+		}
+	}
+}
+
+// runBackfillOnly executes a one-time dump of the sealed archive: page
+// planBackfill until the sealed tip is reached, downloading + emitting the
+// matched range, then return. No websocket is ever dialed.
+//
+// Records in the active (unsealed) segment, seq in (sealedTip, M], are only
+// reachable via the live tail and are therefore NOT delivered by a dump. That is
+// the defining trade-off of BackfillOnly: a clean point-in-time slice of the
+// sealed archive, not the full up-to-the-instant stream.
+func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
 	dl.SetRecordMode(e.cfg.recordMode())
-	emit, _ := e.backfillEmitFunc(b, bf, dl)
-	_ = dl.Download(ctx, plan.Entries, emit)
+	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
 
-	// 3. Flush the partial tail. On the fast path b carries no backfill events
-	// (they went straight through bf.Emit), so this is a no-op there; on the
-	// legacy path it flushes the final partial batch. flushLocked is a no-op once
-	// the batcher has stopped.
+	_, _, err := e.sweepSealedArchive(ctx, dl, emit, backfillStopped, e.cfg.Request.AfterSeq)
+	if err != nil && ctx.Err() == nil {
+		// A plan failure mid-pagination is terminal: there is no archive transport
+		// plan to run. A ctx-cancellation (ctx.Err() != nil) is a clean stop.
+		b.emitError(fatal(err))
+	}
+
+	// Flush the partial tail. On the fast path b carries no backfill events (they
+	// went straight through bf.Emit), so this is a no-op there.
 	if !b.stopped() {
 		b.flush()
 	}
 }
 
-// runBackfillThenLive executes the full archive negotiation and cutover:
+// runBackfillThenLive executes the paginated archive download and the bufferless
+// cutover to live (design §11/§13/§14):
 //
-//  1. plan the backfill (records plannedThroughSeq, the sealed tip);
-//  2. start the live tail from plannedThroughSeq-margin into a buffering sink;
-//  3. download + emit the backfill (filtered), seq <= sealed tip;
-//  4. flip the sink: drain buffered live frames (seq > sealed tip), then
-//     forward the live tail directly in steady state.
+//  1. page planBackfill (pinning beforeSeq = S, the page-1 sealed tip) and
+//     download + emit the whole sealed range (startCursor, S] in seq order;
+//  2. connect /subscribe ONCE at cursor = S — no rewind margin, no client buffer.
+//     The consumer dedups its own at-least-once overlap by seq; segments sealed
+//     during the download are picked up by /subscribe's cold replay (§14.1).
 //
-// The record-stream handoff is at plannedThroughSeq: records in the active
-// (unsealed) segment above the sealed tip are not downloadable from the archive
-// and are delivered by the live tail instead. Backfill emits every matching row
-// with no tombstone suppression — a folding consumer converges (design §5.1).
+// A pre-upgrade HTTP 400 "cursor too old" at connect (the slow-handoff or
+// fell-off-live case, §14) is NOT fatal: the loop re-enters pagination from the
+// last durably-processed seq (the live consumer's highest delivered seq, or S if
+// it delivered nothing). Re-backfill cycles are bounded and must advance the
+// cursor (anti-ping-pong); a fresh sweep re-learns the CURRENT sealed tip, which
+// is >= the lookback floor, so the realistic case converges in one extra cycle.
+//
+// The archive download alone is the historical record; backfill emits every
+// matching row with no tombstone suppression — a folding consumer converges
+// (design §5.1, §R1). DID-level markers ride inline via the sentinel index.
 func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
-	// 1. Plan. A plan failure is terminal: there is no archive transport plan to
-	// execute.
-	plan, err := e.planner.Plan(ctx, e.cfg.Request)
-	if err != nil {
-		emitErr(fatal(err))
-		return
+	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
+	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
+	dl.SetRecordMode(e.cfg.recordMode())
+	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
+
+	// loopCtx unwinds the whole engine when the consumer breaks the iterator. The
+	// batcher's onStop cancels it, so even a quiet steady-state tail (no arriving
+	// events) unwinds via the periodic flusher's stop-propagating yield rather
+	// than blocking until the parent ctx is cancelled. onStop MUST be registered
+	// before the flusher can drive a stopping emit (batcher contract).
+	loopCtx, stopLoop := context.WithCancel(ctx)
+	defer stopLoop()
+	b.setOnStop(stopLoop)
+	stopFlusher := e.startFlusher(loopCtx, b)
+	defer stopFlusher()
+
+	cursor := e.cfg.Request.AfterSeq
+	for {
+		sealedTip, stopped, serr := e.sweepSealedArchive(loopCtx, dl, emit, backfillStopped, cursor)
+		if serr != nil {
+			// A plan failure is terminal; a ctx cancellation is a clean stop.
+			if loopCtx.Err() == nil {
+				b.emitError(fatal(serr))
+			}
+			break
+		}
+		if stopped {
+			break
+		}
+
+		resume, tooOld := e.tailLiveFromCutover(loopCtx, b, sealedTip)
+		if !tooOld {
+			// Clean stop: ctx cancelled or the consumer broke the iterator.
+			break
+		}
+
+		// §14 too-old 400: re-backfill from the last durably-processed seq. Bound
+		// the cycles and require the resume cursor to strictly advance past the
+		// cursor this sweep started from — a non-advancing re-backfill is a
+		// pathological loop, not a real fall-behind, and is surfaced as fatal.
+		if resume <= cursor {
+			e.rebackfillStalls++
+			if e.rebackfillStalls >= maxRebackfillStalls {
+				b.emitError(fatal(fmt.Errorf(
+					"jetstream: re-backfill made no progress after %d cursor-too-old cycles at seq %d",
+					e.rebackfillStalls, resume)))
+				break
+			}
+		} else {
+			e.rebackfillStalls = 0
+		}
+		cursor = resume
 	}
 
-	// 2. Start the live tail into a buffering sink before downloading, so no
-	// live event between the plan and the cutover is lost.
-	liveStart := plan.PlannedThroughSeq
-	if liveStart > liveRewindMargin {
-		liveStart -= liveRewindMargin
-	} else {
-		liveStart = 0
+	stopFlusher()
+	if !b.stopped() {
+		b.flush()
 	}
-	// The cutover always replays from liveStart, and the dedup floor matches it.
-	// An empty archive is liveStart==0: the live tail owns the whole stream and
-	// the floor of 0 ("nothing delivered yet") lets the first real event (seq 1)
-	// through. A non-empty archive seeds the floor at liveStart so the
-	// at-least-once rewind-margin overlap is deduped. Under 1-based seqs no
-	// special "covered nothing" case is needed (design §R8).
-	dedupFloor := liveStart
-	sink := newLiveSink(e.cfg.Buffer, e.matcher, e.cfg.recordMode())
-	liveCtx, stopLive := context.WithCancel(ctx)
-	defer stopLive()
+}
+
+// tailLiveFromCutover connects /subscribe ONCE at cutover (the sealed tip) and
+// tails live, forwarding each matching event to the batcher. It returns the
+// highest seq durably processed and whether the connect/tail ended on a §14
+// too-old 400 (signalling the caller to re-backfill). A nil/clean return
+// (resume, false) means the stream ended (ctx cancel or consumer stop).
+//
+// The dedup floor is the cutover seq: the backfill already emitted through it,
+// so the server's inclusive replay of cutover itself is deduped, and the first
+// genuinely-new live event (seq > cutover) passes. No rewind margin is needed —
+// the consumer's seq dedup makes the seam at-least-once with no gap (design §13).
+func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover uint64) (resume uint64, tooOld bool) {
 	consumer := newLiveConsumer(liveConfig{
-		host: e.cfg.Host,
-		// The cutover always replays from liveStart (cursor=0 replays from the
-		// beginning for an empty/small archive), so the (plannedThroughSeq, tip]
-		// band is never dropped.
-		cursor:     liveStart,
-		dedupFloor: dedupFloor,
-		// Forward the filters so the server prunes the live tail server-side;
-		// liveSink.wantLive (the matcher) remains the backstop.
+		host:        e.cfg.Host,
+		cursor:      cutover,
+		dedupFloor:  cutover,
 		collections: e.cfg.Request.Collections,
 		dids:        e.cfg.Request.DIDs,
 		dial:        e.cfg.Dial,
@@ -441,90 +535,16 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		backoffMin:  e.cfg.LiveBackoffMin,
 		mode:        e.cfg.recordMode(),
 	})
-	var liveWG sync.WaitGroup
-	liveWG.Go(func() {
-		_ = consumer.Run(liveCtx, sink.onLive)
-	})
-
-	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
-
-	// 3. Download + emit the backfill in plan order. Rows are filtered (exact
-	// DID/collection/seq) before decode by the matcher. Errors flow through the
-	// batcher (b.emitError) so they stay serialized with batch emission once the
-	// flusher goroutine starts in phase 4. On the fast path (bf.Transform != nil)
-	// the per-event conversion+batching runs on the decode workers and batches are
-	// delivered via bf.Emit; b carries no backfill events. All backfill batches are
-	// delivered synchronously inside Download — which returns only after the
-	// reassembler drains — so the cutover in phase 4 still installs the live forward
-	// path strictly AFTER the last backfill batch.
-	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
-	dl.SetRecordMode(e.cfg.recordMode())
-	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
-	derr := dl.Download(ctx, plan.Entries, emit)
-	if derr != nil { // ctx cancelled
-		stopLive()
-		liveWG.Wait()
-		if !b.stopped() {
-			b.flush()
+	err := consumer.Run(ctx, func(ev *Event, _ []byte, cerr error) bool {
+		if cerr != nil {
+			// A recoverable live read/reconnect error: surface it (do not swallow —
+			// CLAUDE.md) but keep tailing. The consumer rejecting it stops batching.
+			return b.emitError(cerr)
 		}
-		return
-	}
-	// Use backfillStopped() (not just b.stopped()): on the fast path the consumer
-	// stop is observed via bf.Emit returning false, NOT through the batcher, so a
-	// bare b.stopped() would miss it and we would needlessly dial/forward the live
-	// tail after the consumer already quit.
-	if backfillStopped() {
-		stopLive()
-		liveWG.Wait()
-		return
-	}
-
-	// 4. Flip the sink: from here, buffered then live frames flow through the
-	// same batcher. Drain everything strictly above the sealed tip (the
-	// backfill already emitted <= plannedThroughSeq); when the backfill covered
-	// nothing (empty archive) drain from the beginning so the buffered seq 0 is
-	// not skipped by the strict-> replay bound.
-	//
-	// When emission stops (the consumer broke the iterator), cancel the live
-	// context so the live consumer exits and liveWG.Wait below returns. The
-	// stop is observed two ways: an arriving live event whose b.add returns
-	// false, and — crucially for a quiet tail — the periodic flusher's yield
-	// returning false, which fires the batcher's onStop. Without the latter, a
-	// steady-state stream with no new events never unwinds until ctx cancel.
-	//
-	// onStop MUST be registered before the flusher starts: otherwise the
-	// flusher's first yield could latch the batcher's once-guard with a nil
-	// onStop, and stopLive would never fire.
-	b.setOnStop(stopLive)
-	// Start the max-latency flusher so steady-state low-volume tail batches
-	// deliver promptly.
-	stopFlusher := e.startFlusher(ctx, b)
-	defer stopFlusher()
-	emitLive := func(ev Event) bool { return b.add(ev) }
-	// coveredThrough is the sealed tip the backfill emitted through (0 for an
-	// empty archive, which drains the buffer from the beginning). Under 1-based
-	// seqs no "covered nothing" special case is needed.
-	if err := sink.flipAndDrain(ctx, plan.PlannedThroughSeq, emitLive, b.emitError); err != nil {
-		// A cutover replay/append failure breaks the at-least-once handoff
-		// guarantee: surface it as fatal so the consumer aborts rather than
-		// continues against a truncated stream.
-		b.emitError(fatal(err))
-		// flipAndDrain failed before installing the forward path, so the
-		// batcher's onStop can never fire and a quiet live tail would never
-		// observe a stop. Cancel the live consumer explicitly so liveWG.Wait
-		// below returns instead of blocking until parent-ctx cancel (mirrors the
-		// ctx-cancel and b.stopped early-return branches above).
-		stopLive()
-		liveWG.Wait()
-		return
-	}
-
-	// 5. Steady state: the live consumer now forwards directly through the
-	// sink to the batcher. Block until the live tail ends (ctx cancel or the
-	// consumer-driven stopLive above).
-	liveWG.Wait()
-	stopFlusher()
-	if !b.stopped() {
-		b.flush()
-	}
+		if !e.wantsLive(ev) {
+			return true
+		}
+		return b.add(*ev)
+	})
+	return consumer.LastSeq(), errors.Is(err, errLiveCursorTooOld)
 }

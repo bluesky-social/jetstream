@@ -2,11 +2,12 @@
 
 Date: 2026-06-28
 Branch: `tombstone-query-plan-refactor` (work continues here)
-Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, 5, 8, and 9 landed; steps 10, 11, and 12 remain).
-**NOTE:** step 9 flips `/subscribe-v2` to reject too-old cursors with a 400, which makes the
-oracle's `steady-state-client-backfill` lifecycle check **known-red until step 10** lands the
-client-side 400 re-backfill + `liveRewindMargin` removal (see step 9 status for the full
-root-cause). This is a deliberate, user-approved interim state.
+Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, 5, 8, 9, and 10 landed; steps 11 and 12 remain).
+**NOTE (RESOLVED):** step 9 flipped `/subscribe-v2` to reject too-old cursors with a 400, which
+made the oracle's `steady-state-client-backfill` lifecycle check known-red until step 10. **Step 10
+(#181) landed the bufferless pagination loop + client-side 400 re-backfill + `liveRewindMargin`
+removal, and the oracle is green again** (`just test`, `just test-long ./internal/oracle`,
+`just oracle` 20s stress all pass).
 Design source of truth: `specs/notes/2026-06-28-drop-client-tombstones-design.md`
 Authoritative sections of the design: the Revision block **§R1–R8** (everything below
 the "READING ORDER" banner, §1–§16, is the reasoning trail only — §R wins on conflict).
@@ -778,6 +779,10 @@ path. Standalone server change.
   `newCursorReplaySubscription` helper over a recent single-segment archive.
 - **Verify.** `just test ./internal/subscribe` (232) + `just lint` (0) green.
 
+> ✅ **RESOLVED by step 10 (#181).** The oracle is green again — step 10 deleted `liveRewindMargin`
+> (connect exactly at the sealed tip) and handles the §14 400 by re-entering the pagination loop.
+> The historical root-cause analysis below is retained as the reasoning trail.
+>
 > ⚠ **KNOWN-RED, INTENTIONAL until step 10** (user-approved 2026-06-29). Flipping the v2 route to
 > `RejectCursorBelowFloor: true` makes `just test`'s `TestOracle_DefaultLifecycle /
 > steady-state-client-backfill` fail. **Root cause** (diagnosed, not a bug in this step): the
@@ -867,7 +872,60 @@ carries the floor seq.
 
 **Tests.** Covered end-to-end by step 11; add client-unit tests for the loop's done-predicate,
 the pinned-`beforeSeq` range, and the 400-driven re-backfill (bounded, monotonic).
-**Verify.** `just test ./internal/client`, then the oracle recipes. **Status / notes.** _(unstarted)_
+**Verify.** `just test ./internal/client`, then the oracle recipes. **Status / notes.**
+✅ **Done** (#181).
+
+- **Engine (`internal/client/engine.go`).** Both archive paths now share
+  `sweepSealedArchive(ctx, dl, emit, backfillStopped, startCursor)`: it pages `planBackfill` from
+  `startCursor`, **pins `beforeSeq = S`** (the page-1 `sealedTipSeq`) for every subsequent page,
+  downloads + emits each page in seq order, advances `cursor = plannedThroughSeq`, and returns when
+  `cursor >= S` (the unambiguous done predicate — works for a sparse filter that matched zero
+  segments in a sub-range, and an empty archive terminates on page 1 at `0 >= 0`). `runBackfillOnly`
+  is just the sweep + flush, no websocket. `runBackfillThenLive` is the sweep then a single
+  `tailLiveFromCutover` connect at `cursor = S` (dedup floor `S`, **no rewind margin**); the
+  consumer's seq dedup makes the seam at-least-once with no gap. Mid-download seals (seqs `> S`) are
+  left to `/subscribe`'s cold replay (§14.1), not chased by a moving tip.
+- **§14 too-old 400 handling.** `internal/client/live.go`: the dialer maps a pre-upgrade HTTP 400
+  whose body contains "cursor too old" to the typed `errLiveCursorTooOld`; `liveConsumer.Run`
+  returns it **terminally** (not a reconnect-loop — the floor only advances), and exposes
+  `LastSeq()`. The engine catches it in the loop and re-enters pagination from the consumer's last
+  durably-processed seq (or `S` if it delivered nothing). Re-backfill cycles are **bounded**
+  (`maxRebackfillStalls = 5`) and the resume cursor must **strictly advance** past the cursor the
+  prior sweep started from; a non-advancing ping-pong is surfaced as **fatal** (crash-loud, never a
+  silent infinite loop). A fresh sweep re-learns the *current* sealed tip (≥ floor), so the
+  realistic slow-handoff case converges in one extra cycle.
+- **Deleted (bufferless cutover).** `internal/client/livesink.go` (whole file); the engine `Buffer`
+  interface + `LiveFrame` type; `liveRewindMargin`; the concurrent live-tail-during-download
+  goroutine + `liveWG`/`flipAndDrain`/`sink` machinery. Root package: `buffer.go`, `buffer_mem.go`,
+  `buffer_file.go`, `buffer_test.go`, the public `LiveBuffer`/`LiveFrame`, `NewMemLiveBuffer`,
+  `NewFileLiveBuffer`, `WithLiveBuffer`, `bufferAdapter`, the `cfg.liveBuffer`/`buf`/`ownBuf` wiring
+  (`engine.go`), and the `cmd/client --live-buffer-file` flag. `doc.go` + `options.go` + `client.go`
+  docs rewritten to the loop model (no buffer, no suppression, fold-to-converge, transparent
+  re-backfill on a too-old cursor).
+- **Telemetry (the §8/§10 open item).** Deferred a dedicated `Stats()` accessor: the client library
+  has no Prometheus registry and the §14 400 already carries the floor seq for the only
+  operationally-interesting event (a fall-behind). Re-evaluate alongside the step-11 residual-gap
+  oracle assertion rather than add an unexercised accessor now (kaizen — recorded, not built).
+- **Tests.** `internal/client/engine_test.go`: harness reworked to serve **paginated** plan
+  responses keyed by `afterSeq` (`planResponder`/`planPageJSON`); removed the buffer-era
+  `memBuffer`/`failOnNthAppendBuffer`/`replayErrBuffer` + the two `TestEngineCutover*` sink tests.
+  Added `TestEngineMultiPageBackfillCutover` (3-page union folds to ground truth, exactly-once
+  across page + cutover seams), `TestEnginePinnedBeforeSeqAcrossPages` (page 2 carries
+  `afterSeq=cont, beforeSeq=page-1 tip`), `TestEngineTooOldHandoffReBackfills` (a handoff-sealed
+  segment is downloaded by the re-backfill, converges, no skip/dup), `TestEngineTooOldPingPongIsFatal`
+  (non-advancing re-backfill is fatal + bounded). `internal/client/live_test.go`:
+  `TestLiveConsumerCursorTooOldIsTerminal` (terminal, no reconnect-loop) and the matcher-level
+  `TestLiveAccountDeleteDeliveredDespiteCollectionFilter` (replacing the deleted `newLiveSink` test).
+- **Verify.** `just test ./internal/client . ./cmd/client` (green); `go test -race` on the client +
+  root (clean); full `just lint` (0) + `just test` (1649); `just test-long ./internal/oracle` (156);
+  `just oracle` (21s stress). The previously known-red `TestOracle_DefaultLifecycle /
+  steady-state-client-backfill` is **green**.
+
+**Carried to step 11:** the multi-page / mid-segment-truncation / mid-download-seal / caught-up-handoff
+/ stale-cursor / fell-off-live / exhaust-sealed / sustained-ingest **oracle** scenarios + their
+mutants (§16) — the client-unit tests above gate the loop mechanics at the right granularity; the
+end-to-end + residual-gap-metric coverage is step 11's job. The §8 client-telemetry decision
+(Stats accessor) is folded into that residual-gap work.
 
 ---
 
@@ -998,7 +1056,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 5. prune overlay-only tombstone API (#178)
 - [x] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation) (#179)
 - [x] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged) (#180; oracle known-red until step 10)
-- [ ] 10. client pagination loop + delete cutover buffer + 400 re-backfill
+- [x] 10. client pagination loop + delete cutover buffer + 400 re-backfill (#181; oracle green again)
 - [ ] 11. Part B oracle scenarios + mutants
 - [ ] 12. docs rewrite (relaxed cooperative contract)
 

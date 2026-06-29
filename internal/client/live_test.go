@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,31 +119,24 @@ func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error
 	return events, errs
 }
 
-// TestLiveSinkAccountDeleteDeliveredDespiteCollectionFilter guards that, with no
-// client-side suppression, the live sink still DELIVERS an account-delete under a
-// collection filter (it carries no collection and bypasses the filter). This is
-// the consumer's only signal to purge a dead account's records, so it must not
-// be dropped.
-func TestLiveSinkAccountDeleteDeliveredDespiteCollectionFilter(t *testing.T) {
+// TestLiveAccountDeleteDeliveredDespiteCollectionFilter guards that, with no
+// client-side suppression, the cutover live tail still DELIVERS an account-delete
+// under a collection filter (it carries no collection and bypasses the filter via
+// the engine's wantsLive matcher). This is the consumer's only signal to purge a
+// dead account's records, so it must not be dropped — while a non-matching commit
+// still is.
+func TestLiveAccountDeleteDeliveredDespiteCollectionFilter(t *testing.T) {
 	t.Parallel()
 
-	matcher := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
-	sink := newLiveSink(&memBuffer{}, matcher, recordDecodeMode{})
+	e := &Engine{matcher: NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})}
 
-	// A live account-delete for did:plc:a arrives during buffering.
 	acctDel, err := decodeLiveFrame(liveAccountFrame(100, "did:plc:a", false, "deleted"), recordDecodeMode{})
 	require.NoError(t, err)
+	require.True(t, e.wantsLive(&acctDel), "account-delete must be delivered under a collection filter")
 
-	keep := sink.onLive(&acctDel, liveAccountFrame(100, "did:plc:a", false, "deleted"), nil)
-	require.True(t, keep, "sink must keep tailing after an account-delete")
-
-	// The account event passes the delivery filter even under a collection filter.
-	require.True(t, sink.wantLive(&acctDel), "account-delete must be delivered under a collection filter")
-
-	// A commit in a non-matching collection is still dropped by the matcher.
 	likeCreate, err := decodeLiveFrame(liveCommitFrame(t, 101, "did:plc:a", "create", "app.bsky.feed.like", "r1", true), recordDecodeMode{})
 	require.NoError(t, err)
-	require.False(t, sink.wantLive(&likeCreate), "non-matching commit must be dropped")
+	require.False(t, e.wantsLive(&likeCreate), "non-matching commit must be dropped")
 }
 
 func TestLiveConsumerDeliversInOrder(t *testing.T) {
@@ -366,6 +360,34 @@ func TestLiveConsumerReconnectResumesFromLastSeq(t *testing.T) {
 	// The reconnect must resume from the highest seq delivered (3), not re-anchor
 	// at the tip (which would omit the cursor and drop events during downtime).
 	require.Contains(t, urls[1], "cursor=3", "reconnect must resume from lastSeq; got %s", urls[1])
+}
+
+// TestLiveConsumerCursorTooOldIsTerminal pins the §14 handoff signal: a dial
+// that fails with errLiveCursorTooOld must end Run with that error (NOT a clean
+// nil and NOT a reconnect loop), so the cutover engine re-enters the backfill
+// loop rather than churning reconnects against a cursor the server keeps
+// rejecting. The dialer fails every attempt; if Run reconnect-looped the test
+// would hang past its deadline.
+func TestLiveConsumerCursorTooOldIsTerminal(t *testing.T) {
+	t.Parallel()
+	var dials atomic.Int64
+	dial := func(ctx context.Context, _ string) (wsConn, error) {
+		dials.Add(1)
+		return nil, errLiveCursorTooOld
+	}
+	c := newLiveConsumer(liveConfig{host: "https://h", dial: dial, backoffMin: time.Millisecond})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.Run(context.Background(), func(*Event, []byte, error) bool { return true })
+	}()
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, errLiveCursorTooOld, "a too-old dial must end Run terminally")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return on a too-old dial (reconnect-looping?)")
+	}
+	require.LessOrEqual(t, dials.Load(), int64(2), "must not reconnect-loop on a terminal too-old cursor")
 }
 
 func TestLiveConsumerContextCancelCleanStop(t *testing.T) {

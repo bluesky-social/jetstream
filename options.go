@@ -22,7 +22,6 @@ type config struct {
 	liveCursor   uint64
 	batchSize    int
 	downloadConc int
-	liveBuffer   LiveBuffer
 	// httpClient is a caller override. nil is the sentinel for "unset":
 	// the engine then builds its own per-workload jttp clients
 	// (xrpc.ATProtoOpts for XRPC, xrpc.BulkDownloadOpts for bulk
@@ -180,18 +179,6 @@ func WithDownloadConcurrency(n int) Option {
 	return func(c *config) {
 		if n > 0 {
 			c.downloadConc = n
-		}
-	}
-}
-
-// WithLiveBuffer supplies the buffer used to hold live-tail events received
-// during the backfill-to-live cutover. The default is an in-memory buffer.
-// A durable, file-backed implementation is available for long-running
-// backfills; see NewFileLiveBuffer.
-func WithLiveBuffer(b LiveBuffer) Option {
-	return func(c *config) {
-		if b != nil {
-			c.liveBuffer = b
 		}
 	}
 }
