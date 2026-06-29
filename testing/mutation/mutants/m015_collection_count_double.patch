@@ -2,7 +2,9 @@ mutant: m015_collection_count_double
 target: segment/seal.go
 failure-mode: |
   The per-collection event count in the footer is incremented by 2 instead
-  of 1, corrupting the collection index. Models a stray increment.
+  of 1, corrupting the collection index. Models a stray increment. (The
+  increment moved into the shared internCollection helper in #175; the count
+  is now guarded by countEvent so sentinel ids do not inflate it.)
 expected-detection: |
   PREDICTED SURVIVAL: the oracle decodes every block sequentially and never
   consults the footer collection index, so a corrupt count is invisible to
@@ -11,15 +13,8 @@ expected-tier: none
 tiers: default,stress
 
 diff --git a/segment/seal.go b/segment/seal.go
-index b7ef050..6dcfe2c 100644
 --- a/segment/seal.go
 +++ b/segment/seal.go
-@@ -332,7 +332,7 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
- 					res.collectionEventCounts = append(res.collectionEventCounts, 0)
- 					res.collectionIDByName[col] = id
- 				}
--				res.collectionEventCounts[id]++
-+				res.collectionEventCounts[id] += 2
- 				blockCollections[id] = struct{}{}
- 			}
- 		}
+@@ -244 +244 @@ func (res *blockWalkResult) internCollection(collection string, countEvent bool,
+-		res.collectionEventCounts[id]++
++		res.collectionEventCounts[id] += 2

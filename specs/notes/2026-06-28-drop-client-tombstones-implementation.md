@@ -2,7 +2,7 @@
 
 Date: 2026-06-28
 Branch: `tombstone-query-plan-refactor` (work continues here)
-Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, 5, 8, 9, and 10 landed; steps 11 and 12 remain).
+Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, 5, 8, 9, 10, and 11 landed; step 12 (docs) remains).
 **NOTE (RESOLVED):** step 9 flipped `/subscribe-v2` to reject too-old cursors with a 400, which
 made the oracle's `steady-state-client-backfill` lifecycle check known-red until step 10. **Step 10
 (#181) landed the bufferless pagination loop + client-side 400 re-backfill + `liveRewindMargin`
@@ -970,7 +970,46 @@ returning zero units with the cursor unadvanced. Wire each to the killing test a
 `just mutation-campaign`; refresh `RESULTS.md` + `baseline.json`.
 
 **Verify.** `just test ./internal/oracle`, `just test-long ./internal/oracle`, `just oracle`,
-`just oracle-sweep`, `just mutation-campaign`. **Status / notes.** _(unstarted)_
+`just oracle-sweep`, `just mutation-campaign`. **Status / notes.** ✅ **Done** (#182).
+
+- **Client telemetry (the §8/§10 deferred item) — DECIDED: `Stats()` accessor.** Added
+  `Engine.Stats()` (internal/client) → `Client.Stats()` (root), reporting `Pages`, `SealedTip`,
+  `PlannedThrough`, `ResidualGap` (= SealedTip − PlannedThrough), and `RebackfillCycles`. The
+  internal engine records each on the single run goroutine (`recordPage` in `sweepSealedArchive`,
+  `recordRebackfill` on the §14 too-old loop) behind a mutex so a monitoring caller can read it
+  concurrently. The sustained-ingest scenario asserts `ResidualGap == 0` at convergence. Unit
+  tests: `TestEngineStatsReportsResidualGap` (internal), `TestStatsDelegatesToEngine` (root, incl.
+  the nil/zero-Client contract).
+- **Hermetic Part-B harness (`internal/oracle/partb_harness_test.go`).** `pagedCutoverServer`
+  serves BOTH the archive XRPC (planBackfill/getSegment/getBlock at `/xrpc/`) and the live
+  `/subscribe-v2` (RejectCursorBelowFloor=true) on ONE httptest socket, backed by one
+  sealed-segment archive + manifest + store + writer + hot-ring Tail + ColdReader. Real sockets,
+  NOT the synctest bubble (one bubble per process, owned by `TestOracle_DefaultLifecycle`).
+  Configurable `MaxEntries`/`WholeSegmentThreshold` (planner truncation) and `Lookback` (the §14
+  floor); `SealMore`/`AppendLive` drive mid-flight ingest; an `onPlanServed` hook seals at a
+  deterministic point in the pagination loop (page 1 pins S). Mid-flight seals land strictly above
+  the writer's active index so cold replay's `WalkActive` never decodes a sealed file as active.
+- **Eight §16 scenarios (`partb_scenarios_test.go`), all real-socket, folded against independent
+  ground truth (`groundTruthLive` over the on-disk + fed-live events):** multi-page backfill
+  cutover (union folds to truth, ≥3 pages); mid-segment truncation (interleaved DIDs → 3
+  non-contiguous block ranges, MaxEntries=1 cuts inside the segment, no skip); mid-download seal
+  (seqs > pinned S ride `/subscribe` cold replay, NOT a page — `SealedTip` stays 4); caught-up
+  handoff below-floor re-backfill (fresh in-window segment seals after page 1 → connect at the old
+  cursor 400s → `RebackfillCycles ≥ 1`, converges); stale-cursor 400 signal (below-floor cursor →
+  HTTP 400 w/ floor in body; in-window → 101); exhaust-sealed cold replay (in-window handoff,
+  `RebackfillCycles == 0`); sustained-ingest convergence (`ResidualGap == 0`). Stable across
+  `-count=5` and `-race`.
+- **Mutants (§16).** Retired the overlay-format mutants `m020`/`m021`/`m023` (`internal/overlay`
+  deleted in #177 — they no longer apply). Added `m029`–`m033`: continuation-cursor off-by-one
+  (`lastUnitMaxSeq + 1`), mid-segment cut reporting the enclosing segment `MaxSeq`,
+  zero-units-unadvanced livelock (`Entries+1 >= MaxEntries`), v2 below-floor silent clamp
+  (`if false` on the RejectBelowFloor branch), and client treating the §14 400 as fatal
+  (`false && …` so the cutover never reports tooOld). New **`partb` runner tier** runs `TestPartB*`
+  + the manifest `TestPlanBackfill*` unit tests (the planner mutants kill fast there rather than
+  via a client-loop livelock timeout). Each new mutant verified KILLED@partb individually.
+- **Verify.** `just lint` (0); `just test ./internal/client . ./internal/oracle ./internal/manifest
+  ./internal/subscribe` green; `-race` on the Part-B suite clean. Full `just mutation-campaign` +
+  `baseline.json`/`RESULTS.md` refresh: _(campaign running; numbers folded in on completion)_.
 
 ---
 
@@ -1057,7 +1096,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation) (#179)
 - [x] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged) (#180; oracle known-red until step 10)
 - [x] 10. client pagination loop + delete cutover buffer + 400 re-backfill (#181; oracle green again)
-- [ ] 11. Part B oracle scenarios + mutants
+- [x] 11. Part B oracle scenarios + mutants (#182)
 - [ ] 12. docs rewrite (relaxed cooperative contract)
 
 Final gates before calling the effort done: `just lint test`, `just test-long ./internal/oracle`,
