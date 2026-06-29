@@ -14,8 +14,11 @@ the `partb` tier (paginated-cutover scenarios) with m029–m033, retired the
 overlay-format mutants m020/m021/m023 (`internal/overlay` deleted in #177) and
 m025 (its `Set.SnapshotRange` mechanism deleted in #178; #183 tracks
 re-deriving a #100-recorder mutant), and refreshed m015 to its post-#175
-location. The 7 survivors (m002, m003, m009, m013, m014, m015, m022) are
-pre-existing documented escapes. Counts inside older dated sections describe the
+location. Of the 7 survivors (m002, m003, m009, m013, m014, m015, m022), six are
+pre-existing documented escapes; **m022 is a KILLED→SURVIVED regression this
+branch introduced** (its overlay-reconstruction oracle was deleted with
+`internal/overlay` in #177) — it mutates live data-loss code, so #184 tracks
+re-deriving a detecting oracle. Counts inside older dated sections describe the
 catalog *as of that date* and are intentionally not back-edited.**
 
 ## The baseline gate (#108)
@@ -109,11 +112,18 @@ hidden m015 (STALE) and m025 (BUILD-BROKEN) since #175/#178 landed.
 | m033_client_too_old_400_not_rebackfilled | KILLED@partb | cutover never reports the §14 too-old 400, so the client stops at the seam instead of re-backfilling (TestPartB_CaughtUpHandoffBelowFloorReBackfills). |
 
 The other 22 rows are unchanged from the 2026-06-25 gate pass (m020/m021/m023/m025
-removed from the catalog). The 7 survivors — m002, m003, m009, m013, m014, m015,
-m022 — are all pre-existing documented escapes (watermark-floor off-by-one,
+removed from the catalog). Six of the 7 survivors — m002, m003, m009, m013, m014,
+m015 — are pre-existing documented escapes (watermark-floor off-by-one,
 merge-cursor no-advance, checksum-range off-by-one, collection/rkey swap on a
 path the oracle folds through, rev-dropped on a non-asserted field, footer count
-blind spot, and the DID-seq ShouldDrop inversion that final-state masks).
+blind spot). The seventh, **m022 (DID-seq ShouldDrop inversion), is a regression
+this branch introduced, not a pre-existing escape**: it was `KILLED@default` on
+`main` by the overlay-reconstruction oracle, which this branch deleted with
+`internal/overlay` (#177). The mutation drops live records on the delete-compaction
+path (`compact_deletes.go:357`), so its escape is a genuine coverage loss, not an
+inherently-undetectable mutant — #184 tracks re-deriving a steady-state oracle to
+return it to KILLED. The baseline records SURVIVED because the *current* oracle
+genuinely cannot kill it; the gate would otherwise be perpetually red.
 
 ## Campaign 2026-06-25 (m025 stale refresh; gate pass)
 
