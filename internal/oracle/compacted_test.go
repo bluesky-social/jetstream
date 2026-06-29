@@ -60,6 +60,40 @@ func TestCheckCompactedRejectsSurvivingSyncSupersededRow(t *testing.T) {
 	require.ErrorContains(t, err, "superseded sync row survived")
 }
 
+// TestCheckCompactedFailureIncludesOffendingDIDTimeline locks the
+// observability contract (#186): a superseded-survivor failure must carry the
+// offending DID's full on-disk row timeline — every row's seq/kind, the
+// watermark, and the killer tombstone — so a rare nightly-sweep occurrence is
+// diagnosable from the artifact alone instead of just "seq=2 tombstone_seq=13".
+func TestCheckCompactedFailureIncludesOffendingDIDTimeline(t *testing.T) {
+	t.Parallel()
+
+	events := []ObservedEvent{
+		{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:victim", Collection: "app.bsky.feed.post", Rkey: "rk1", Payload: []byte("v1")},
+		{Seq: 2, Kind: segment.KindCreate, DID: "did:plc:other", Collection: "app.bsky.feed.like", Rkey: "lk1", Payload: []byte("keep")},
+		{Seq: 5, Kind: segment.KindAccount, DID: "did:plc:victim", Payload: oracleAccountPayload(t, false, "deleted")},
+	}
+
+	err := CheckCompacted(events, 5)
+	require.Error(t, err)
+	msg := err.Error()
+
+	// Core verdict (unchanged contract).
+	require.Contains(t, msg, "superseded account row survived")
+	require.Contains(t, msg, "did:plc:victim")
+	require.Contains(t, msg, "watermark=5")
+
+	// Enriched timeline: every on-disk row for the offending DID, with the
+	// surviving row and the killer both identifiable.
+	require.Contains(t, msg, "timeline for did:plc:victim")
+	require.Contains(t, msg, "seq=1 kind=create")      // the survivor
+	require.Contains(t, msg, "seq=5 kind=account")     // the killer
+	require.Contains(t, msg, "app.bsky.feed.post/rk1") // survivor coordinates
+
+	// The timeline is DID-scoped: an unrelated DID's row must not be dragged in.
+	require.NotContains(t, msg, "did:plc:other")
+}
+
 func TestCheckCompactedIgnoresNonDeletedAccountStatuses(t *testing.T) {
 	t.Parallel()
 
