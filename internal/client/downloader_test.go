@@ -145,10 +145,6 @@ func (as *archiveServer) noKeepAliveDownloader(concurrency int) *Downloader {
 	return NewDownloader(xc, concurrency, nil)
 }
 
-func (as *archiveServer) downloaderWith(concurrency int, sel RowSelector) *Downloader {
-	return NewDownloader(&xrpc.Client{Host: as.srv.URL}, concurrency, sel)
-}
-
 // makeCreate builds a create-commit segment row carrying a minimal CBOR record.
 func makeCreate(t *testing.T, seq uint64, did, collection, rkey string) segment.Event {
 	t.Helper()

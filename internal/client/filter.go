@@ -104,6 +104,18 @@ func (m *Matcher) Wants(ev *segment.Event) bool {
 	return false
 }
 
+// Keep makes *Matcher satisfy the downloader's RowSelector: a row is kept iff it
+// passes the exact filters. The drop reason is "filtered" for a filter miss.
+// Backfill no longer suppresses tombstoned rows — every matching row is emitted
+// and a folding consumer converges (design §5.1) — so the matcher is the whole
+// keep/drop decision.
+func (m *Matcher) Keep(ev *segment.Event) (bool, string) {
+	if m.Wants(ev) {
+		return true, ""
+	}
+	return false, "filtered"
+}
+
 func (m *Matcher) wantsSeq(seq uint64) bool {
 	// afterSeq is a RESUME-AFTER bound (seq > afterSeq), but only when one was
 	// actually requested. afterSeq==0 means "from the start of the archive"

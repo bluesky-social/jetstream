@@ -14,21 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/overlay"
-	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/cbor"
 )
-
-// emptyOverlayBlob is a valid getTombstones response carrying no tombstones
-// (watermark=0, maxSeq=0), so the engine's suppressor seed succeeds and the
-// failure under test is isolated to planBackfill.
-func emptyOverlayBlob() []byte {
-	return overlay.Encode(tombstone.Snapshot{
-		Records: map[tombstone.RecordKey]uint64{},
-		DIDs:    map[string]tombstone.DIDTombstone{},
-	}, 0, 0)
-}
 
 // syncBuffer is a concurrency-safe bytes.Buffer for capturing CLI output while
 // a goroutine polls it.
@@ -93,15 +81,10 @@ func commitFrame(t *testing.T, seq uint64, did, coll, rkey string) string {
 func TestSubscribeFatalBackfillReturnsError(t *testing.T) {
 	t.Parallel()
 
-	// Server: getTombstones succeeds (empty overlay) but planBackfill fails, so
-	// the engine aborts the backfill fatally before any event is delivered.
+	// Server: planBackfill fails, so the engine aborts the backfill fatally
+	// before any event is delivered.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/xrpc/network.bsky.jetstream.getTombstones":
-			w.Header().Set("Content-Type", "application/octet-stream")
-			// A minimal valid empty overlay blob: watermark=0, maxSeq=0, no rows.
-			// The real decoder tolerates an empty body as an empty snapshot.
-			_, _ = w.Write(emptyOverlayBlob())
 		case "/xrpc/network.bsky.jetstream.planBackfill":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)

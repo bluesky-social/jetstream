@@ -191,7 +191,24 @@ assertions. The end-to-end correctness regression is covered by the oracle in st
 authored before step 3, but step 2 itself is a pure removal — its safety is that the oracle
 still passes the *eventually-consistent* contract once step 6 lands).
 
-**Verify.** `just test ./internal/client`. **Status / notes.** _(unstarted)_
+**Verify.** `just test ./internal/client`. **Status / notes.** ✅ **Done** (issue #172).
+Deleted `suppress.go`/`suppress_test.go` + `selector.go`/`selector_test.go`. `*Matcher` now
+satisfies `RowSelector` directly via a new `Keep` method (deleted the `rowSelector`
+indirection). `engine.go`: removed the `suppressor` field/`NewSuppressor`, both
+`SeedFromOverlay` steps, and passes `e.matcher` straight to `NewDownloader`; renumbered the
+phase comments. `livesink.go`: removed the `suppressor` field, `observeTombstone`, and the
+`ShouldDrop` check — `wantLive` is matcher-only now. `segview.go`: dropped `accountPayload`
+(was only needed for tombstone folding; the matcher never reads Payload). Tests: deleted the
+client-side suppression property test `reconstruct_test.go` (the fold-convergence property
+moves to the oracle in step 6); flipped `live_test.go`, `engine_test.go`
+(`TestEngineBackfillCreateThenLiveDeleteConverges` now asserts the create is emitted + the
+live delete arrives), `slab_test.go`; stripped the overlay mock from the engine harness and
+`cmd/client/subscribe_test.go`. Full `just lint test`, `just test ./internal/client`, and
+`just test-long ./internal/oracle` all green (end-to-end backfill still converges: the client
+emits dead creates and folds the live-tail deletes).
+**Note for step 4:** `internal/overlay`, `internal/obs/overlay.go`, the `getTombstones`
+handler/route/lexicon/stub, and the server-side overlay cache/ticker are now ONLY referenced
+by server-side wiring + the oracle's `overlay_*` files — no client/cmd consumer remains.
 
 ---
 
@@ -740,7 +757,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 ## 6. Checklist (update as we land)
 
 - [x] 1. deliver #account/#identity/#sync on v1+v2 (#171)
-- [ ] 2. remove client tombstone suppression
+- [x] 2. remove client tombstone suppression (#172)
 - [ ] 7. seqs start at 1 (+ collapse presence machinery)
 - [ ] 6. oracle fold-convergence + DID-tombstone delivery tests (gates 3)
 - [ ] 3. backfill DID-tombstone start-snapshot (fail-closed, ordering invariant)

@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/overlay"
-	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
@@ -53,13 +51,10 @@ func (b *memBuffer) Replay(ctx context.Context, after gt.Option[uint64]) func(yi
 func (b *memBuffer) Truncate(uint64) error { return nil }
 func (b *memBuffer) Close() error          { return nil }
 
-// engineHarness wires an archive XRPC server (overlay + plan + segment/block)
-// and a scripted live websocket transport into a configured Engine.
+// engineHarness wires an archive XRPC server (plan + segment/block) and a
+// scripted live websocket transport into a configured Engine.
 type engineHarness struct {
 	as        *archiveServer
-	overlayW  uint64
-	overlayM  uint64
-	overlay   tombstone.Snapshot
 	planned   uint64
 	planEntry []planSeg // segments to name in the plan, in order
 	liveSteps []readStep
@@ -72,15 +67,10 @@ type planSeg struct {
 }
 
 func newEngineHarness(t *testing.T) *engineHarness {
-	return &engineHarness{as: newArchiveServer(t), overlay: emptySnapshot()}
+	return &engineHarness{as: newArchiveServer(t)}
 }
 
 func (h *engineHarness) installHandlers() {
-	h.as.mux.HandleFunc("/xrpc/network.bsky.jetstream.getTombstones", func(w http.ResponseWriter, r *http.Request) {
-		blob := overlay.Encode(h.overlay, h.overlayW, h.overlayM)
-		w.Header().Set("Content-Type", "application/octet-stream")
-		_, _ = w.Write(blob)
-	})
 	h.as.mux.HandleFunc("/xrpc/network.bsky.jetstream.planBackfill", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(h.planJSON()))
@@ -213,10 +203,8 @@ func TestEngineActiveSegmentGap(t *testing.T) {
 	h.planned = 10
 	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 10}}
 
-	// Overlay M = 15: the tombstone horizon sits above the sealed tip because
-	// the active segment holds seqs 11..15. The live tail must deliver 11..15.
-	h.overlayW = 0
-	h.overlayM = 15
+	// The active segment holds seqs 11..15 above the sealed tip; the live tail
+	// must deliver 11..15.
 
 	// Live tail (from plannedThroughSeq-margin) delivers the active-segment
 	// records 11..15 plus steady-state 16..18.
@@ -250,12 +238,10 @@ func TestEngineEmptyArchiveCutoverDeliversSeqZero(t *testing.T) {
 	t.Parallel()
 	h := newEngineHarness(t)
 
-	// Empty sealed archive: no segments, no plan entries, plannedThroughSeq=0,
-	// tombstone horizon at 0. This is the freshly-bootstrapped state.
+	// Empty sealed archive: no segments, no plan entries, plannedThroughSeq=0.
+	// This is the freshly-bootstrapped state.
 	h.planned = 0
 	h.planEntry = nil
-	h.overlayW = 0
-	h.overlayM = 0
 
 	// The live tail carries the entire stream from the first-ever event (seq 0).
 	for i := uint64(0); i <= 3; i++ {
@@ -276,10 +262,10 @@ func TestEngineEmptyArchiveCutoverDeliversSeqZero(t *testing.T) {
 }
 
 // TestEngineBackfillOnly covers the one-time-dump path: with BackfillOnly the
-// engine seeds the overlay, plans, downloads + emits the sealed archive, and
-// returns WITHOUT ever dialing the live websocket. The run self-terminates when
-// the download completes (the test never cancels ctx), and the live dial count
-// stays zero — the property that distinguishes a dump from backfill+cutover.
+// engine plans, downloads + emits the sealed archive, and returns WITHOUT ever
+// dialing the live websocket. The run self-terminates when the download
+// completes (the test never cancels ctx), and the live dial count stays zero —
+// the property that distinguishes a dump from backfill+cutover.
 func TestEngineBackfillOnly(t *testing.T) {
 	t.Parallel()
 	h := newEngineHarness(t)
@@ -291,7 +277,6 @@ func TestEngineBackfillOnly(t *testing.T) {
 	h.as.addSegment(t, "seg_0000000000.jss", sealed)
 	h.planned = 6
 	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 6}}
-	h.overlayM = 6
 	// Script a live frame too: if the engine wrongly started the live tail it
 	// would dial and deliver seq 7, which the assertions below would catch.
 	h.liveSteps = append(h.liveSteps, readStep{
@@ -353,7 +338,6 @@ func TestEngineBackfillThenLiveOrdering(t *testing.T) {
 	h.as.addSegment(t, "seg_0000000000.jss", sealed)
 	h.planned = 4
 	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 4}}
-	h.overlayM = 4
 
 	// Live re-delivers 3,4 (rewind-margin overlap) then 5,6.
 	for i := uint64(3); i <= 6; i++ {
@@ -467,14 +451,16 @@ func isNonDecreasing(xs []uint64) bool {
 	return true
 }
 
-// TestEngineLiveDeleteSuppressesBackfillCreate verifies the eager combined-set
-// suppression across the cutover: a delete arriving on the live tail during
-// backfill must suppress a historical create downloaded afterwards.
-func TestEngineLiveDeleteSuppressesBackfillCreate(t *testing.T) {
+// TestEngineBackfillCreateThenLiveDeleteConverges verifies the
+// eventually-consistent model (design §5.1): the backfill emits a historical
+// create with NO suppression (even though it is later deleted), and the delete
+// arrives as its own row on the live tail so a folding consumer converges. We
+// no longer hide the create at delivery time.
+func TestEngineBackfillCreateThenLiveDeleteConverges(t *testing.T) {
 	t.Parallel()
 	h := newEngineHarness(t)
 
-	// Sealed create of (did:plc:a, post, r1) at seq 2.
+	// Sealed creates of r1 and r2.
 	h.as.addSegment(t, "seg_0000000000.jss", []segment.Event{
 		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r1"),
 		makeCreate(t, 3, "did:plc:a", "app.bsky.feed.post", "r2"),
@@ -482,23 +468,33 @@ func TestEngineLiveDeleteSuppressesBackfillCreate(t *testing.T) {
 	h.planned = 3
 	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 2, maxSeq: 3}}
 
-	// Overlay already knows r1 was deleted at seq 50 (> create seq 2): the
-	// backfill create of r1 must be suppressed; r2 survives.
-	h.overlay = recordTombstoneSnapshot("did:plc:a", "app.bsky.feed.post", "r1", 50)
-	h.overlayW = 0
-	h.overlayM = 50
+	// A live delete of r1 arrives after the backfill. It flows through as its own
+	// row rather than retroactively hiding the create.
+	h.liveSteps = append(h.liveSteps, readStep{
+		data: liveCommitFrame(t, 4, "did:plc:a", "delete", "app.bsky.feed.post", "r1", false),
+	})
 	h.installHandlers()
 
-	// r2 is at seq 3; once it arrives the backfill has emitted everything it
-	// will (r1 is suppressed), so wait for seq 3 then assert r1 never appeared.
-	events := h.runUntilSeq(t, h.cfg(), 3)
+	// Drive until the live delete (seq 4) is emitted.
+	events := h.runUntilSeq(t, h.cfg(), 4)
+
+	// The backfill create of r1 IS emitted (no suppression)...
+	var sawCreateR1, sawDeleteR1 bool
 	for _, ev := range events {
-		if ev.Kind == KindCommit && ev.Commit.Rkey == "r1" && ev.Commit.Operation == OpCreate {
-			t.Fatalf("suppressed create of r1 (deleted at seq 50) was emitted at seq %d", ev.Seq)
+		if ev.Kind != KindCommit || ev.Commit.Rkey != "r1" {
+			continue
+		}
+		switch ev.Commit.Operation {
+		case OpCreate:
+			sawCreateR1 = true
+		case OpDelete:
+			sawDeleteR1 = true
 		}
 	}
-	// r2 (no tombstone) must be present.
-	require.True(t, hasRkey(events, "r2"), "unsuppressed r2 must be emitted")
+	require.True(t, sawCreateR1, "backfill must emit the create of r1 (no suppression)")
+	// ...and the delete arrives so a folding consumer converges.
+	require.True(t, sawDeleteR1, "live delete of r1 must be delivered")
+	require.True(t, hasRkey(events, "r2"), "r2 must be emitted")
 }
 
 // TestEngineLiveOnly covers the no-backfill path: Subscribe with no seq bound
@@ -853,7 +849,6 @@ func TestEngineCutoverAppendFailureSurfaces(t *testing.T) {
 	})
 	h.planned = 2
 	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 2}}
-	h.overlayM = 2
 
 	// Live frames above the sealed tip that the cutover must not lose.
 	for i := uint64(3); i <= 5; i++ {
@@ -965,7 +960,6 @@ func TestEngineCutoverReplayErrorUnwinds(t *testing.T) {
 	})
 	h.planned = 2
 	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 2}}
-	h.overlayM = 2
 
 	// One live frame above the tip so the buffering phase has something to
 	// append; after it the scripted conn EOFs and the tail goes quiet.

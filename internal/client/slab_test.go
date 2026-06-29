@@ -85,13 +85,13 @@ func TestDecodeFrameSlabMixedKindsAndFilter(t *testing.T) {
 		makeCreate(t, 6, "did:plc:a", "app.bsky.feed.like", "drop2"), // filtered out
 		makeCreate(t, 7, "did:plc:a", "app.bsky.feed.post", "keep3"),
 	}
-	// Selector keeps only app.bsky.feed.post commits; non-commits always pass the
-	// matcher (identity/account have no collection) — mirrors real filtering.
-	sel := newRowSelector(NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}}), NewSuppressor())
+	// Matcher keeps only app.bsky.feed.post commits; non-commits (identity/
+	// account/sync) carry no collection and always bypass the collection filter.
+	sel := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
 	out := decodeOneFrameForTest(t, sel, rows)
 
-	// Expect the 3 kept posts (identity/account are dropped by the collection
-	// filter per issue #142 semantics; likes are filtered).
+	// Expect the 3 kept posts; the likes are filtered out. (Identity/account also
+	// survive but carry no Commit, so they don't contribute rkeys below.)
 	var gotRkeys []string
 	commits := map[*Commit]bool{}
 	for _, ev := range out {

@@ -12,9 +12,7 @@ import (
 // two phases:
 //
 //	buffering — while the backfill downloads, every live event is appended to
-//	            the buffer (raw frame, for durable replay) and every live
-//	            tombstone is folded into the suppressor so later-downloaded
-//	            historical rows are suppressed by tombstones already seen live.
+//	            the buffer (raw frame, for durable replay).
 //	forwarding — after flipAndDrain, live events are passed straight to the
 //	             batcher in the main emission goroutine.
 //
@@ -23,10 +21,9 @@ import (
 // that arrive during the flip are emitted directly instead. This keeps a
 // single, ordered emission path with no concurrent yield.
 type liveSink struct {
-	buf        Buffer
-	suppressor *Suppressor
-	matcher    *Matcher
-	mode       recordDecodeMode // raw vs. map record decode for drained buffered frames
+	buf     Buffer
+	matcher *Matcher
+	mode    recordDecodeMode // raw vs. map record decode for drained buffered frames
 
 	mu         sync.Mutex
 	forwarding bool
@@ -38,14 +35,14 @@ type liveSink struct {
 	fatalErr error
 }
 
-func newLiveSink(buf Buffer, suppressor *Suppressor, matcher *Matcher, mode recordDecodeMode) *liveSink {
-	return &liveSink{buf: buf, suppressor: suppressor, matcher: matcher, mode: mode}
+func newLiveSink(buf Buffer, matcher *Matcher, mode recordDecodeMode) *liveSink {
+	return &liveSink{buf: buf, matcher: matcher, mode: mode}
 }
 
 // onLive is the live consumer's emit callback. raw is the verbatim JSON frame
-// (nil on an error report). During buffering it stores the raw frame and folds
-// tombstones; after the flip it forwards the decoded event directly. It returns
-// false only to stop the live consumer (when the downstream batcher stops).
+// (nil on an error report). During buffering it stores the raw frame; after the
+// flip it forwards the decoded event directly. It returns false only to stop
+// the live consumer (when the downstream batcher stops).
 func (s *liveSink) onLive(ev *Event, raw []byte, err error) bool {
 	if err != nil {
 		// A live read/decode hiccup during cutover: keep tailing. The engine's
@@ -56,13 +53,8 @@ func (s *liveSink) onLive(ev *Event, raw []byte, err error) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Always fold tombstones so the suppressor reflects live deletes/updates
-	// regardless of phase (a delete arriving now must suppress a historical
-	// create downloaded later).
-	s.observeTombstone(ev)
-
 	if s.forwarding {
-		// Filter + suppress, then forward straight to the batcher.
+		// Filter, then forward straight to the batcher.
 		if !s.wantLive(ev) {
 			return true
 		}
@@ -86,7 +78,7 @@ func (s *liveSink) onLive(ev *Event, raw []byte, err error) bool {
 
 // flipAndDrain transitions from buffering to forwarding: it drains buffered
 // frames after coveredThrough (the sealed tip the backfill already covered),
-// emitting each via emit (filtered + suppressed, deduped), then installs the
+// emitting each via emit (filtered, deduped), then installs the
 // forward path so subsequent live events go straight through. Held under mu so
 // no live event is lost or doubly-delivered across the flip.
 //
@@ -154,22 +146,12 @@ func (s *liveSink) flipAndDrain(ctx context.Context, coveredThrough gt.Option[ui
 	return nil
 }
 
-// wantLive applies the exact filter and tombstone suppression to a live event.
-// Tombstones (deletes), identity, account, and sync always pass the suppressor
-// (only materializations are dropped); the matcher applies the user's filters.
+// wantLive applies the caller's exact DID/collection/seq filter to a live
+// event. A nil matcher matches everything.
 func (s *liveSink) wantLive(ev *Event) bool {
-	se := segmentViewOf(ev)
-	if s.matcher != nil && !s.matcher.Wants(&se) {
-		return false
+	if s.matcher == nil {
+		return true
 	}
-	if drop, _ := s.suppressor.ShouldDrop(&se); drop {
-		return false
-	}
-	return true
-}
-
-// observeTombstone folds a live event into the suppressor if it is a tombstone.
-func (s *liveSink) observeTombstone(ev *Event) {
 	se := segmentViewOf(ev)
-	_ = s.suppressor.ObserveLive(&se)
+	return s.matcher.Wants(&se)
 }

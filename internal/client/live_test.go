@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
@@ -120,40 +119,31 @@ func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error
 	return events, errs
 }
 
-// TestLiveSinkAccountDeleteSuppressesDespiteCollectionFilter is the headline
-// correctness guard for #142: under a collection filter, the live sink must
-// fold an account-delete tombstone into the suppressor BEFORE applying the
-// delivery filter. So even though the account event itself is dropped from
-// delivery (a collection-scoped subscriber does not want it), a later
-// historical create for that DID is still suppressed. Dropping account events
-// from the user-facing stream must NOT weaken the record-deletion guarantee.
-func TestLiveSinkAccountDeleteSuppressesDespiteCollectionFilter(t *testing.T) {
+// TestLiveSinkAccountDeleteDeliveredDespiteCollectionFilter guards that, with no
+// client-side suppression, the live sink still DELIVERS an account-delete under a
+// collection filter (it carries no collection and bypasses the filter). This is
+// the consumer's only signal to purge a dead account's records, so it must not
+// be dropped.
+func TestLiveSinkAccountDeleteDeliveredDespiteCollectionFilter(t *testing.T) {
 	t.Parallel()
 
-	suppressor := NewSuppressor()
-	// Collection filter set: account/identity are not delivered.
 	matcher := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
-	sink := newLiveSink(&memBuffer{}, suppressor, matcher, recordDecodeMode{})
+	sink := newLiveSink(&memBuffer{}, matcher, recordDecodeMode{})
 
-	// A live account-delete for did:plc:a at seq 100 arrives during buffering.
+	// A live account-delete for did:plc:a arrives during buffering.
 	acctDel, err := decodeLiveFrame(liveAccountFrame(100, "did:plc:a", false, "deleted"), recordDecodeMode{})
 	require.NoError(t, err)
 
-	// Buffering phase: onLive must fold the tombstone (it returns true to keep
-	// tailing) even though the account event will never be delivered.
 	keep := sink.onLive(&acctDel, liveAccountFrame(100, "did:plc:a", false, "deleted"), nil)
 	require.True(t, keep, "sink must keep tailing after an account-delete")
 
-	// The suppressor must now drop a historical create for that DID below seq 100.
-	staleCreate := segment.Event{Seq: 50, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r1"}
-	drop, reason := suppressor.ShouldDrop(&staleCreate)
-	require.True(t, drop, "create below the account-delete must be suppressed")
-	require.Equal(t, "account", reason)
+	// The account event passes the delivery filter even under a collection filter.
+	require.True(t, sink.wantLive(&acctDel), "account-delete must be delivered under a collection filter")
 
-	// The account event itself now passes the delivery filter even under a
-	// collection filter: DID-level events bypass the collection filter so a
-	// collection-scoped consumer still receives the deletion signal.
-	require.True(t, sink.wantLive(&acctDel), "account event must be delivered under a collection filter")
+	// A commit in a non-matching collection is still dropped by the matcher.
+	likeCreate, err := decodeLiveFrame(liveCommitFrame(t, 101, "did:plc:a", "create", "app.bsky.feed.like", "r1", true), recordDecodeMode{})
+	require.NoError(t, err)
+	require.False(t, sink.wantLive(&likeCreate), "non-matching commit must be dropped")
 }
 
 func TestLiveConsumerDeliversInOrder(t *testing.T) {

@@ -113,15 +113,14 @@ func (c Config) bulkClient() *xrpc.Client {
 	return c.XRPC
 }
 
-// Engine orchestrates the whole stream: overlay seed, backfill plan +
-// download, the backfill-to-live cutover, and the steady-state live tail. It
-// emits batches through Run.
+// Engine orchestrates the whole stream: backfill plan + download, the
+// backfill-to-live cutover, and the steady-state live tail. It emits batches
+// through Run.
 type Engine struct {
-	cfg        Config
-	planner    *Planner
-	matcher    *Matcher
-	suppressor *Suppressor
-	logger     *slog.Logger
+	cfg     Config
+	planner *Planner
+	matcher *Matcher
+	logger  *slog.Logger
 }
 
 // NewEngine builds an Engine from cfg.
@@ -131,11 +130,10 @@ func NewEngine(cfg Config) *Engine {
 		logger = slog.New(slog.NewTextHandler(discardWriter{}, nil))
 	}
 	return &Engine{
-		cfg:        cfg,
-		planner:    NewPlanner(cfg.XRPC),
-		matcher:    NewMatcher(cfg.Request),
-		suppressor: NewSuppressor(),
-		logger:     logger,
+		cfg:     cfg,
+		planner: NewPlanner(cfg.XRPC),
+		matcher: NewMatcher(cfg.Request),
+		logger:  logger,
 	}
 }
 
@@ -298,10 +296,10 @@ func (e *Engine) startFlusher(ctx context.Context, b *batcher) func() {
 	}
 }
 
-// runBackfillOnly executes a one-time dump of the sealed archive: seed the
-// suppressor from the overlay, plan, then download + emit the matched range and
-// return. It is a strict subset of runBackfillThenLive with the live tail,
-// cutover, and steady-state phases removed — no websocket is ever dialed.
+// runBackfillOnly executes a one-time dump of the sealed archive: plan, then
+// download + emit the matched range and return. It is a strict subset of
+// runBackfillThenLive with the live tail, cutover, and steady-state phases
+// removed — no websocket is ever dialed.
 //
 // backfillEmitFunc builds the Download emit callback shared by both backfill
 // paths, and installs the fast-path transform on dl when bf provides one.
@@ -365,32 +363,23 @@ func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (
 // That is the defining trade-off of BackfillOnly: a clean point-in-time slice
 // of the sealed archive, not the full up-to-the-instant stream.
 func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
-	// 1. Overlay seed. Terminal on failure: without the tombstone base the
-	// suppressor cannot honor the deletion guarantee, so abort rather than emit
-	// unsuppressed historical rows.
-	if _, _, err := e.suppressor.SeedFromOverlay(ctx, e.cfg.XRPC); err != nil {
-		emitErr(fatal(err))
-		return
-	}
-
-	// 2. Plan. Terminal on failure: there is no archive transport plan to run.
+	// 1. Plan. Terminal on failure: there is no archive transport plan to run.
 	plan, err := e.planner.Plan(ctx, e.cfg.Request)
 	if err != nil {
 		emitErr(fatal(err))
 		return
 	}
 
-	// 3. Download + emit in plan order. Rows are filtered + suppressed before
-	// decode by the downloader's selector. No live buffer is consulted, so the
-	// suppressor only carries the overlay-seeded tombstones (no live deletes can
-	// arrive during a dump).
+	// 2. Download + emit in plan order. Rows are filtered (exact DID/collection/
+	// seq) before decode by the matcher. Backfill emits every matching row with no
+	// tombstone suppression — a folding consumer converges (design §5.1).
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
-	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
+	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
 	dl.SetRecordMode(e.cfg.recordMode())
 	emit, _ := e.backfillEmitFunc(b, bf, dl)
 	_ = dl.Download(ctx, plan.Entries, emit)
 
-	// 4. Flush the partial tail. On the fast path b carries no backfill events
+	// 3. Flush the partial tail. On the fast path b carries no backfill events
 	// (they went straight through bf.Emit), so this is a no-op there; on the
 	// legacy path it flushes the final partial batch. flushLocked is a no-op once
 	// the batcher has stopped.
@@ -401,27 +390,18 @@ func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bo
 
 // runBackfillThenLive executes the full archive negotiation and cutover:
 //
-//  1. seed the suppressor from the overlay (records M, the tombstone horizon);
-//  2. plan the backfill (records plannedThroughSeq, the sealed tip);
-//  3. start the live tail from plannedThroughSeq-margin into a buffering sink,
-//     folding live tombstones into the suppressor as they arrive;
-//  4. download + emit the backfill (filtered + suppressed), seq <= sealed tip;
-//  5. flip the sink: drain buffered live frames (seq > sealed tip), then
+//  1. plan the backfill (records plannedThroughSeq, the sealed tip);
+//  2. start the live tail from plannedThroughSeq-margin into a buffering sink;
+//  3. download + emit the backfill (filtered), seq <= sealed tip;
+//  4. flip the sink: drain buffered live frames (seq > sealed tip), then
 //     forward the live tail directly in steady state.
 //
-// The record-stream handoff is at plannedThroughSeq, NOT at M: records in the
-// active (unsealed) segment, seq in (plannedThroughSeq, M], are not
-// downloadable from the archive and are delivered by the live tail instead.
+// The record-stream handoff is at plannedThroughSeq: records in the active
+// (unsealed) segment above the sealed tip are not downloadable from the archive
+// and are delivered by the live tail instead. Backfill emits every matching row
+// with no tombstone suppression — a folding consumer converges (design §5.1).
 func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
-	// 1. Overlay seed. A seed failure is terminal: without the tombstone base
-	// the suppressor cannot honor the deletion guarantee, so abort fatally
-	// rather than emit unsuppressed historical rows.
-	if _, _, err := e.suppressor.SeedFromOverlay(ctx, e.cfg.XRPC); err != nil {
-		emitErr(fatal(err))
-		return
-	}
-
-	// 2. Plan. A plan failure is terminal: there is no archive transport plan to
+	// 1. Plan. A plan failure is terminal: there is no archive transport plan to
 	// execute.
 	plan, err := e.planner.Plan(ctx, e.cfg.Request)
 	if err != nil {
@@ -429,7 +409,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		return
 	}
 
-	// 3. Start the live tail into a buffering sink before downloading, so no
+	// 2. Start the live tail into a buffering sink before downloading, so no
 	// live event between the plan and the cutover is lost.
 	liveStart := plan.PlannedThroughSeq
 	if liveStart > liveRewindMargin {
@@ -450,7 +430,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	if backfillCoveredNothing {
 		dedupFloor = gt.None[uint64]()
 	}
-	sink := newLiveSink(e.cfg.Buffer, e.suppressor, e.matcher, e.cfg.recordMode())
+	sink := newLiveSink(e.cfg.Buffer, e.matcher, e.cfg.recordMode())
 	liveCtx, stopLive := context.WithCancel(ctx)
 	defer stopLive()
 	consumer := newLiveConsumer(liveConfig{
@@ -465,7 +445,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		cursor:     gt.Some(liveStart),
 		dedupFloor: dedupFloor,
 		// Forward the filters so the server prunes the live tail server-side;
-		// liveSink.wantLive (matcher + suppressor) remains the backstop.
+		// liveSink.wantLive (the matcher) remains the backstop.
 		collections: e.cfg.Request.Collections,
 		dids:        e.cfg.Request.DIDs,
 		dial:        e.cfg.Dial,
@@ -481,16 +461,16 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 
-	// 4. Download + emit the backfill in plan order. Rows are filtered +
-	// suppressed before decode by the downloader's selector. Errors flow
-	// through the batcher (b.emitError) so they stay serialized with batch
-	// emission once the flusher goroutine starts in phase 5. On the fast path
-	// (bf.Transform != nil) the per-event conversion+batching runs on the decode
-	// workers and batches are delivered via bf.Emit; b carries no backfill events.
-	// All backfill batches are delivered synchronously inside Download — which
-	// returns only after the reassembler drains — so the cutover in phase 5 still
-	// installs the live forward path strictly AFTER the last backfill batch.
-	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newRowSelector(e.matcher, e.suppressor))
+	// 3. Download + emit the backfill in plan order. Rows are filtered (exact
+	// DID/collection/seq) before decode by the matcher. Errors flow through the
+	// batcher (b.emitError) so they stay serialized with batch emission once the
+	// flusher goroutine starts in phase 4. On the fast path (bf.Transform != nil)
+	// the per-event conversion+batching runs on the decode workers and batches are
+	// delivered via bf.Emit; b carries no backfill events. All backfill batches are
+	// delivered synchronously inside Download — which returns only after the
+	// reassembler drains — so the cutover in phase 4 still installs the live forward
+	// path strictly AFTER the last backfill batch.
+	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
 	dl.SetRecordMode(e.cfg.recordMode())
 	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
 	derr := dl.Download(ctx, plan.Entries, emit)
@@ -512,7 +492,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		return
 	}
 
-	// 5. Flip the sink: from here, buffered then live frames flow through the
+	// 4. Flip the sink: from here, buffered then live frames flow through the
 	// same batcher. Drain everything strictly above the sealed tip (the
 	// backfill already emitted <= plannedThroughSeq); when the backfill covered
 	// nothing (empty archive) drain from the beginning so the buffered seq 0 is
@@ -553,7 +533,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		return
 	}
 
-	// 6. Steady state: the live consumer now forwards directly through the
+	// 5. Steady state: the live consumer now forwards directly through the
 	// sink to the batcher. Block until the live tail ends (ctx cancel or the
 	// consumer-driven stopLive above).
 	liveWG.Wait()
