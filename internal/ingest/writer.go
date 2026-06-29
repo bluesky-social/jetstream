@@ -94,6 +94,29 @@ func Open(cfg Config) (*Writer, error) {
 				return nil, fmt.Errorf("ingest: scan_max_seq %s: %w", path, err)
 			}
 		case errors.Is(segErr, segment.ErrSegmentSealed):
+			// The highest-index segment is already sealed (e.g. the
+			// orchestrator sealed it at cutover). Read its header MaxSeq so
+			// the reconcile below can floor nextSeq past it — symmetric with
+			// the active-branch ScanMaxSeq above. Normally seq/next was
+			// persisted before the seal (rotateLocked flushes the counter,
+			// then seals), so this is a no-op; but if the counter is missing
+			// or an illegal 0, this is what stops the next append from reusing
+			// a seq the sealed segment already contains.
+			f, openErr := os.Open(path)
+			if openErr != nil {
+				return nil, fmt.Errorf("ingest: open sealed %s: %w", path, openErr)
+			}
+			hdr, hdrErr := segment.ReadSealedHeader(f)
+			if closeErr := f.Close(); closeErr != nil {
+				return nil, fmt.Errorf("ingest: close sealed %s: %w", path, closeErr)
+			}
+			if hdrErr != nil {
+				return nil, fmt.Errorf("ingest: read sealed header %s: %w", path, hdrErr)
+			}
+			if hdr.EventCount > 0 {
+				maxSeq, foundEvents = hdr.MaxSeq, true
+			}
+
 			w.activeIdx = idx + 1
 			path = filepath.Join(cfg.SegmentsDir, SegmentFilename(w.activeIdx))
 			seg, segErr = segment.New(segment.Config{
@@ -123,7 +146,7 @@ func Open(cfg Config) (*Writer, error) {
 		w.activeBytes = 0
 	}
 
-	pebbleSeq, seqPresent, err := loadNextSeq(cfg.Store, cfg.SeqKey)
+	pebbleSeq, err := loadNextSeq(cfg.Store, cfg.SeqKey)
 	if err != nil {
 		_ = w.active.Close()
 		return nil, err
@@ -139,14 +162,17 @@ func Open(cfg Config) (*Writer, error) {
 			return nil, err
 		}
 	}
-	// Fresh archive (no persisted counter and no recovered events): seed
-	// nextSeq=1 so the first-ever event is seq 1, leaving seq 0 as a pure
-	// "nothing yet" sentinel (design §R8). Seeded in memory only — Open still
-	// never writes pebble for a fresh dir; the first block flush (or Close)
-	// persists the counter as usual. The crash-recovery reconcile above
-	// (maxSeq+1) is untouched: a recovered dir always has a counter or events,
-	// so reconciled is already >= 1 and this floor is a no-op there.
-	if !seqPresent && reconciled < 1 {
+	// nextSeq is never 0: seq 0 is the pure "nothing yet" sentinel (design §R8)
+	// and is never allocated to an event. reconciled == 0 here means no recovered
+	// events AND a persisted counter of 0 — either a fresh dir (absent counter,
+	// GetUint64LE -> 0) or an illegal persisted seq/next=0 (no current build
+	// writes one; only a pre-seed build or on-disk corruption could). Both floor
+	// to 1, so the first-ever event is seq 1. Floored in memory only — placed
+	// after the reconcile save above, so Open still never writes pebble for a
+	// fresh dir; the first block flush (or Close) persists the counter as usual.
+	// The crash-recovery reconcile (maxSeq+1) yields >= 2 when foundEvents, so
+	// this is a no-op on any dir that recovered events.
+	if reconciled < 1 {
 		reconciled = 1
 	}
 	w.nextSeq = reconciled
@@ -705,12 +731,13 @@ func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
 	return last.Idx, true, nil
 }
 
-// loadNextSeq reads the persisted seq/next counter for key. present is false
-// when the key is absent ("fresh data dir"); the caller seeds nextSeq=1 in that
-// case so the first-ever event is seq 1 and seq 0 stays a pure "nothing yet"
-// sentinel (design §R8).
-func loadNextSeq(st *store.Store, key string) (val uint64, present bool, err error) {
-	return st.GetUint64LE(key)
+// loadNextSeq reads the persisted seq/next counter for key, returning 0 for a
+// fresh data dir (absent key). The caller floors nextSeq to 1 either way, so the
+// first-ever event is seq 1 and seq 0 stays a pure "nothing yet" sentinel
+// (design §R8); the absent-vs-zero distinction is therefore irrelevant here.
+func loadNextSeq(st *store.Store, key string) (val uint64, err error) {
+	v, _, err := st.GetUint64LE(key)
+	return v, err
 }
 
 // saveNextSeq durably persists the seq counter for key via pebble.Sync.

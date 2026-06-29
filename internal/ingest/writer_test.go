@@ -87,6 +87,96 @@ func TestOpen_FreshDir(t *testing.T) {
 	require.ErrorIs(t, err, pebble.ErrNotFound)
 }
 
+// TestOpen_FloorsPersistedZeroSeq pins the nextSeq-never-0 invariant
+// against an illegal persisted seq/next=0 with no recovered events. No
+// current build writes a 0 counter (a fresh dir seeds 1 in memory and
+// the first flush/Close persists >= 1), so this state is only reachable
+// via a pre-seed build or on-disk corruption. Open must floor nextSeq to
+// 1 regardless, so the first event is seq 1 and seq 0 stays the pure
+// "nothing yet" sentinel (design §R8) — otherwise the first event would
+// be allocated seq 0 and the client dedup floor would silently drop it.
+func TestOpen_FloorsPersistedZeroSeq(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		Logger:            logger,
+		MaxEventsPerBlock: 64,
+		MaxSegmentBytes:   1 << 30,
+	}
+
+	// Pre-seed an illegal persisted counter of 0 before any event exists.
+	require.NoError(t, saveNextSeq(st, seqNextKey, 0))
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.Equal(t, uint64(1), w.NextSeq(),
+		"Open must floor a persisted seq/next=0 (no events) up to 1")
+
+	ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.Equal(t, uint64(1), ev.Seq,
+		"first event after flooring must be seq 1, not the seq-0 sentinel")
+}
+
+// TestOpen_SealedSegmentReconcilesPastZeroSeq is the sealed-segment
+// companion to the floor test above. When the highest-index segment is
+// already sealed (the orchestrator's cutover state) AND pebble carries an
+// illegal seq/next=0, Open must read the sealed header's MaxSeq and
+// reconcile nextSeq past it — not blindly floor to 1, which would hand the
+// next append a seq the sealed segment already contains, corrupting replay
+// ordering. The flooring test alone would pass even with this bug, since it
+// has no on-disk events.
+func TestOpen_SealedSegmentReconcilesPastZeroSeq(t *testing.T) {
+	t.Parallel()
+	segDir := filepath.Join(t.TempDir(), "segments")
+	st := newTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		Logger:            logger,
+		MaxEventsPerBlock: 64,
+		MaxSegmentBytes:   1 << 30,
+	}
+
+	// Write a few events and seal the segment, mirroring the cutover state.
+	w1, err := Open(cfg)
+	require.NoError(t, err)
+	const n = 5
+	for range n {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
+		require.NoError(t, w1.Append(t.Context(), &ev))
+	}
+	require.NoError(t, w1.SealActiveAndClose())
+
+	path := filepath.Join(segDir, SegmentFilename(0))
+	ins, err := segment.Inspect(path)
+	require.NoError(t, err)
+	require.True(t, ins.Sealed, "precondition: trailing segment must be sealed")
+	require.Equal(t, uint64(n), ins.Header.MaxSeq)
+
+	// Corrupt the persisted counter to the illegal 0 value.
+	require.NoError(t, saveNextSeq(st, seqNextKey, 0))
+
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w2.Close() })
+
+	require.Equal(t, uint64(n+1), w2.NextSeq(),
+		"Open must reconcile nextSeq past the sealed segment's MaxSeq, not floor to 1")
+
+	ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:b"}
+	require.NoError(t, w2.Append(t.Context(), &ev))
+	require.Equal(t, uint64(n+1), ev.Seq,
+		"first append after reopen must not reuse a sealed-segment seq")
+}
+
 // TestAppend_AllocatesMonotonicSeq pins the seq-allocation contract:
 // N appends produce ev.Seq values in [1, N] in call order (seq 0 is a
 // reserved "nothing yet" sentinel; the first-ever event is seq 1).
@@ -147,7 +237,7 @@ func TestClose_PersistsNextSeq(t *testing.T) {
 	store := w.cfg.Store
 	require.NoError(t, w.Close())
 
-	got, _, err := loadNextSeq(store, seqNextKey)
+	got, err := loadNextSeq(store, seqNextKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), got, "Close must persist nextSeq")
 }
@@ -373,7 +463,7 @@ func TestOpen_ReconcilesDriftedPebble(t *testing.T) {
 	require.Equal(t, uint64(blockSize+1), w2.NextSeq(),
 		"reconcile: nextSeq must advance past the segment's max seq")
 
-	got, _, err := loadNextSeq(st, seqNextKey)
+	got, err := loadNextSeq(st, seqNextKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(blockSize+1), got,
 		"reconcile must persist the corrected value")
@@ -501,11 +591,11 @@ func TestOpen_HonorsCustomSeqKey(t *testing.T) {
 	require.NoError(t, wA.Close())
 	require.NoError(t, wB.Close())
 
-	persistedA, _, err := loadNextSeq(st, "seq/next")
+	persistedA, err := loadNextSeq(st, "seq/next")
 	require.NoError(t, err)
 	require.Equal(t, uint64(6), persistedA)
 
-	persistedB, _, err := loadNextSeq(st, "live_segments/seq/next")
+	persistedB, err := loadNextSeq(st, "live_segments/seq/next")
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), persistedB)
 }
@@ -609,7 +699,7 @@ func TestAppendBatch_DurableCommitNotAbortedByCanceledContext(t *testing.T) {
 	require.Equal(t, "yes", string(got))
 	require.NoError(t, closer.Close())
 
-	persisted, _, err := loadNextSeq(st, w.cfg.SeqKey)
+	persisted, err := loadNextSeq(st, w.cfg.SeqKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), persisted)
 }
@@ -649,7 +739,7 @@ func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "yes", string(got))
 	require.NoError(t, closer.Close())
-	persisted, _, err := loadNextSeq(st, w.cfg.SeqKey)
+	persisted, err := loadNextSeq(st, w.cfg.SeqKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), persisted)
 }
@@ -1023,7 +1113,7 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 		require.Equal(t, "ok", string(got))
 		require.NoError(t, closer.Close())
 	}
-	persisted, _, err := loadNextSeq(st, seqNextKey)
+	persisted, err := loadNextSeq(st, seqNextKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), persisted)
 
@@ -1071,7 +1161,7 @@ func TestDurableBatchClose_RunsAfterPendingEvents(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "ok", string(got))
 	require.NoError(t, closer.Close())
-	persisted, _, err := loadNextSeq(st, seqNextKey)
+	persisted, err := loadNextSeq(st, seqNextKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), persisted)
 }
@@ -1553,7 +1643,7 @@ func TestAppendBatch_AsyncFlushPersistsBlocksAndSeqBeforeReturn(t *testing.T) {
 	}
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 
-	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(5), persisted)
 
@@ -1654,7 +1744,7 @@ func TestAppendBatch_AsyncFlushRotatesWhenFullIncludingPendingRows(t *testing.T)
 
 	require.Equal(t, uint64(1), w.ActiveIndex(),
 		"oversized async segment must rotate at end of AppendBatch, flushing the trailing partial block")
-	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), persisted,
 		"seq/next must cover every appended event (incl. the flushed remainder) before the seal")
@@ -1810,7 +1900,7 @@ func TestWriter_AsyncCloseFlushesPendingBlockAndPersistsNextSeq(t *testing.T) {
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 	require.NoError(t, w.Close())
 
-	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), persisted)
 
@@ -1840,7 +1930,7 @@ func TestWriter_AsyncSealActiveAndCloseSealsPendingBlock(t *testing.T) {
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 	require.NoError(t, w.SealActiveAndClose())
 
-	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), persisted)
 
@@ -2183,7 +2273,7 @@ func TestAsyncFlush_RotationIsSizeDrivenNotPipelineDepth(t *testing.T) {
 		"full segment must rotate even with a pending remainder and in-flight pipeline depth")
 	require.Equal(t, 1.0, testutil.ToFloat64(w.cfg.Metrics.SegmentsRotated))
 
-	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(11), persisted,
 		"seq/next must be committed for every event before the seal")
