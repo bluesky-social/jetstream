@@ -28,16 +28,20 @@ re-opens a correctness hole):
   depends on. **Do not reorder.** (Verified: lines 155–195.)
 - **`getBlock`/`getSegment` read on-disk truth at fetch time** (no planned-checksum trust).
   The §R4 proof relies on this.
-- **DID-level tombstones carry an empty collection** and are never indexed into a block's
-  collection summary, so a collection-filtered `planBackfill` never downloads them. This is
-  the entire reason §R4's start-snapshot exists. (`segment/event.go`, `segment/seal.go`,
-  `selectPlanBlocks`/`collectionIDsForSegment` in `internal/manifest/plan.go`.)
-- **`tombstone.Set.SnapshotRange(lowExcl, highIncl)`** already exists and already filters to
-  `seq ∈ (low, high]`, keyed by DID and RecordKey (`tombstone.go:73-91`). §R4 reuses it; it
-  is **kept**, not pruned (overriding the older §4.3 "likely removable" note).
-- **`Snapshot.ShouldDrop`** checks BOTH DID-level and record-level entries
-  (`tombstone.go:172-184`). §R4 step 3 requires a **DID-only** application; we will add a
-  DID-only variant (or pass a snapshot whose `Records` map is empty).
+- **DID-level tombstones carry an empty collection** and so are not indexed under a real
+  collection. **The §R4-revised fix (step 3, shipped):** the seal/rewrite index tags each
+  marker-bearing block with a reserved sentinel collection (`$account`/`$identity`/`$sync`,
+  `segment/sentinel.go`), and `collectionIDsForSegment` admits those sentinels under every
+  collection filter, so the markers are selected and ride inline through `getBlock` — the same
+  path record-level deletes take. (`segment/event.go`, `segment/seal.go`, `segment/rewrite.go`,
+  `selectPlanBlocks`/`collectionIDsForSegment` in `internal/manifest/plan.go`.) The original
+  §R4 start-snapshot that this bullet used to motivate was reverted.
+- **`tombstone.Set.SnapshotRange` / `Snapshot` are NOT used by the read path** anymore (the
+  snapshot was reverted; the sentinel index needs no tombstone state on reads). Compaction folds
+  on-disk via `FoldRange`, so post-overlay-deletion these become removable (§8 step 5).
+- **`Snapshot.ShouldDrop`** is compaction-internal (the `decide` callback in
+  `compact_deletes.go`); the read path no longer calls it. No DID-only read-path variant is
+  needed — there is no read-path suppression.
 - **Seq counter seed point** is `internal/ingest/writer.go:126-142` (`reconciled := pebbleSeq;
   if foundEvents && maxSeq+1 > reconciled { reconciled = maxSeq+1 }; w.nextSeq = reconciled`).
   `loadNextSeq` (`:700-703`) **discards the present-bit** from `store.GetUint64LE` (which does
@@ -67,8 +71,11 @@ re-opens a correctness hole):
 
 ## 1. Global rules for this effort
 
-- **TDD, gated.** Where the design says a fix is gated by a test (notably §R7 gating step 3,
-  and the §16 mutants), the test is written **first** and must **fail** without the change.
+- **TDD, gated.** Where the design says a fix is gated by a test (notably §R7's
+  collection-filtered fold-convergence gate gating step 3, and the §16 mutants), the test is
+  written **first** and must **fail** without the change. (Step 3's gate is
+  `TestFoldConvergence_CollectionFilteredDIDTombstoneGap`; it failed until the sentinel index
+  landed.)
 - **One issue per step.** Title `subsystem: …` per AGENTS.md. Comment on start / approach
   change / finding. Close via `Closes #N`.
 - **No tech debt, cut deep.** Delete dead code outright (nothing is deployed, no consumers —
@@ -357,13 +364,15 @@ and re-run after it.
 - `harness_test.go`: no longer wires `FilterIdentityByCollection` (step 1) — verify.
 
 **Mutation campaign (§6.1).** Retire the overlay-format mutants (`m020`, `m021`, `m023`) and
-add a mutant that **reverts the snapshot/suppression path** (snapshot-at-seam instead of
-at-start) — killed by eviction-interleaving. Keep `m022`, `m025`, `m027`, etc. Refresh
+add a mutant that **reverts the sentinel index** (seal: skip `indexEventCollection`'s sentinel
+branch; or planner: drop the `IsDIDMarkerSentinelCollection` admit) — killed by the
+collection-filtered fold-convergence gate. Keep `m022`, `m025`, `m027`, etc. Refresh
 `testing/mutation/baseline.json`; a STALE scorecard is expected until re-reviewed.
 
 **Verify.** `just test ./internal/oracle` (new fold-convergence passes on the
-eventually-consistent path), `just test-long ./internal/oracle`. The eviction-interleaving and
-reactivation tests **fail here** (no snapshot yet) — that failure is the gate for step 3.
+eventually-consistent path), `just test-long ./internal/oracle`. The collection-filtered gate
+test **fails here** (the gap is unclosed until step 3's sentinel index) — that failure is the
+gate for step 3.
 **Status / notes.** ✅ **Done** (issue #174). Replaced the point-in-time
 `CheckOverlayReconstruction` with `CheckFoldConvergence` (`internal/oracle/foldconvergence.go`,
 renamed from `overlay.go`): folds the **full emitted** stream, restricts the OUTPUT by collection,
@@ -397,12 +406,12 @@ explicit `TestOracle_DefaultLifecycle` (synctest, fast + swarm), `TestOracle_Sam
 (20 deterministic sections identical), and `just oracle` (20s stress) all green.
 
 **Deferred (recorded, per §R7 / dependency order):**
-- *Eviction-interleaving **between pages*** needs the pagination loop (step 10) and
-  *snapshot-before-first-fetch ordering* needs the snapshot fetch (step 3); the single-shot
-  filtered gate above gates step 3 at the right granularity. The mid-pagination sharpening +
-  the ordering test land in steps 11 / 3.
-- *Mutation campaign* (retire `m020`/`m021`/`m023`, add a snapshot-at-seam mutant): the
-  overlay-format mutants reference `internal/overlay` (deleted in step 4) — refresh **after**
+- *Eviction-interleaving **between pages*** needs the pagination loop (step 10); the single-shot
+  filtered gate above gates step 3 at the right granularity. (The snapshot-before-first-fetch
+  ordering test is **moot** under the revised step 3 — there is no snapshot fetch.) The
+  mid-pagination convergence sharpening lands in step 11.
+- *Mutation campaign* (retire `m020`/`m021`/`m023`, add a **sentinel-index-reverting** mutant):
+  the overlay-format mutants reference `internal/overlay` (deleted in step 4) — refresh **after**
   step 4 so the mutants compile, alongside the step-11 Part-B mutants.
 - **Step 12 doc debt found:** `options.go:100-102` (`WithCollections` doc) still claims
   "records for a deleted account are correctly suppressed — you just don't see the Account event
@@ -410,87 +419,67 @@ explicit `TestOracle_DefaultLifecycle` (synctest, fast + swarm), `TestOracle_Sam
 
 ---
 
-### ☐ Step 3 — `client: backfill DID-tombstone start-snapshot` (§R4, §R4.1, §R6) — finding-#1 fix
+### ✅ Step 3 — `segment+manifest: DID-marker sentinel collections` (§R4 REVISED, #175) — finding-#1 fix
 
-**Goal.** Close the collection-filtered DID-tombstone gap with a backfill-start snapshot of the
-server's in-memory `tombstone.Set`, piggybacked on `planBackfill` page 1. This is the single
-most correctness-sensitive step. **Gated by step 6's eviction-interleaving + reactivation
-tests** (they must already be failing).
+> **2026-06-29: approach changed.** The original step 3 (a `wantDidTombstones`
+> start-snapshot piggybacked on `planBackfill`) was implemented (commit 154eee3) and then
+> **reverted** in favor of an in-archive **reserved DID-marker sentinel collection** index.
+> The snapshot text that was here is preserved in the design doc's "§R4 (ORIGINAL,
+> SUPERSEDED)" as the reasoning trail. This entry records the mechanism that shipped.
 
-**Wire surface (§R4.1) — lexicon + codegen.**
-- `lexicons/network/bsky/jetstream/planBackfill.json`:
-  - **Input**: add optional `wantDidTombstones: boolean` ("set true only on the first page of a
-    fresh backfill to request the DID-tombstone snapshot over `(afterSeq, sealedTipSeq]`").
-  - **Output**: add `didTombstones: array of #didTombstone` where
-    `#didTombstone = { did: string (did), seq: integer }`. Populated **only** when
-    `wantDidTombstones` was set. DID-level only; record-level tombstones are never sent (they
-    ride inline). Also add `sealedTipSeq` here? — **No**: `sealedTipSeq` is added in **step 8**
-    (pagination). Step 3 can land before step 8 by reading the snapshot range as
-    `(afterSeq, plannedThroughSeq]` (today `plannedThroughSeq` == the tip for a single plan).
-    When step 8 introduces the continuation/goal split, the snapshot range becomes
-    `(afterSeq, sealedTipSeq]`. **Note this seam explicitly in both issues** so the range is
-    re-pinned to `S = sealedTipSeq` when step 8 lands.
-- `just lexgen`; rebuild; the generated `JetstreamPlanBackfill_Input/_Output` gain the fields.
+**Goal.** Close the collection-filtered DID-tombstone gap **where it originates — the segment
+index** — so DID-level markers (#account/#identity/#sync) become selectable by a
+collection-filtered plan and ride inline through `getBlock`, the same path record-level deletes
+already take. No wire field, no client snapshot, no `tombstone.Set` on the read path, no
+fail-closed gate, no snapshot-before-first-fetch ordering invariant, no race proof.
 
-**Server (`internal/xrpcapi/planbackfill.go`, `server.go`, `runtime.go`).**
-- Thread the live `*tombstone.Set` into the planBackfill handler: add `Tombstones
-  *tombstone.Set` to `xrpcapi.Config`, pass `tombstones` from `runtime.go` (the set
-  constructed at `runtime.go:273`), and into `newPlanBackfillHandler`.
-- In the handler, when `input.WantDidTombstones` is true, after planning, populate
-  `didTombstones` from `Set.SnapshotRange(afterSeq, <upper>).DIDs` where `<upper>` is the
-  plan's tip (`plannedThroughSeq` pre-step-8; `sealedTipSeq` post-step-8). For a DID-filtered
-  request, **filter the snapshot to the requested DIDs server-side** (bound the payload).
-- **Co-atomicity (§R4 step 2 / §R6.2).** Capture the tip and the snapshot in the **same handler
-  invocation**. The manifest lock (tip) and tombstone lock (snapshot) are independent; the
-  race-freedom proof relies on rewrite-before-evict + on-disk-read-at-fetch, **not** on holding
-  both locks. State this in code comments at the capture site, and note that re-ordering the
-  two reads is safe *for the server* but the **client-side** ordering (snapshot strictly before
-  first `getBlock`) is the hard invariant — guaranteed structurally because the snapshot rides
-  on the page-1 response that precedes all downloads.
+**Mechanism (shipped).**
+- **Reserved sentinels (`segment/sentinel.go`).** `SentinelCollectionAccount = "$account"`,
+  `…Identity = "$identity"`, `…Sync = "$sync"`. `didMarkerSentinel(Kind)` maps the three
+  DID-level marker kinds to their name (others → `""`); `IsDIDMarkerSentinelCollection(name)`
+  is the planner's predicate. The `$` prefix makes them invalid NSIDs, and planBackfill only
+  admits real NSIDs / NSID-authority wildcard prefixes, so **no client request can name or
+  prefix-match a sentinel** — locked by `TestSentinelCollectionsAreInvalidNSIDs`. These strings
+  are written into sealed footers and are therefore on-disk format (load-bearing once sealed).
+- **Index at seal AND rewrite (one shared helper).** Extracted
+  `blockWalkResult.internCollection` + `indexEventCollection` (in `segment/seal.go`), called by
+  both `walkActiveFrames` (seal) and `accumulateRewriteBlock` (compaction rewrite) so the two
+  index paths cannot drift. For a marker-bearing block, the sentinel id is added to the block's
+  collection set; the marker's empty collection is still not interned, and the sentinel does
+  **not** increment `collectionEventCounts` (selection hint, not traffic). Rewrite re-derives
+  the index, so a marker that survives compaction keeps its sentinel.
+- **Admit in the planner (`manifest.collectionIDsForSegment`).** When building the matched
+  collection-id set under a collection filter, always include the segment's sentinel ids. This
+  only widens the set (one-sided no-false-negatives contract preserved); the per-block DID bloom
+  still narrows by DID, so a collection+DID-filtered request pulls only marker blocks that may
+  contain the requested DID.
+- **Client: nothing new.** The exact `Matcher` already delivers the markers under a collection
+  filter (step 1, `!Kind.IsCommit()` bypass). The marker arrives inline in seq order, the
+  consumer folds it, and reactivation is handled for free (no synthesized event, no suppression
+  to mis-scope).
 
-**Client (`internal/client/planner.go`, `engine.go`).**
-- `Planner.Plan` / `PlanRequest`: add a `WantDIDTombstones bool` input flag and surface
-  `DIDTombstones []DIDTombstone` (`{DID string; Seq uint64}`) on the `Plan` result. Validate
-  the wire ints (non-negative, ≤ MaxInt64) symmetric with existing guards.
-- `engine.runBackfillThenLive` / `runBackfillOnly`:
-  1. On the **first** `planBackfill` call set `WantDIDTombstones=true`; read `didTombstones`
-     into a held snapshot (`tombstone.Snapshot` with only `DIDs` populated, `Records` empty).
-  2. **Fail closed (§R6.6).** If the snapshot field is absent/unparseable on a page-1 response
-     that requested it, that is **fatal** (`emitErr(fatal(...))`, return). An empty snapshot is
-     shape-indistinguishable from a fetch failure only if we don't gate on the
-     request/response contract — so gate on "we asked, the server is post-refactor, the field
-     must be present (possibly empty array)". A *missing* field from a too-old server is fatal.
-  3. Fold the snapshot as **DID-only, seq-scoped suppression** in the download row filter:
-     drop an emitted materialization row iff `snap.DIDs[row.DID].Seq > row.Seq`. Use a DID-only
-     path (do **not** consult `Records`). Add `tombstone.Snapshot.ShouldDropDID(ev)` or pass a
-     `Records`-empty snapshot to `ShouldDrop`. **Never synthesize an `#account`/`#delete`
-     event** from a snapshot entry (reactivation note, §R4).
-  4. Encode **snapshot-before-first-fetch** as a hard ordering constraint: capture the snapshot
-     from the page-1 plan *before* constructing/running the `Downloader`. A step-6 test pins
-     this.
-- **Pinned upper bound.** Pre-step-8 there is one plan, so the range is naturally fixed at the
-  tip. The plan's §R6.1 "pin `beforeSeq = S` for the whole backfill" becomes load-bearing in
-  step 10 (pagination); record in the step-10 issue that the snapshot range and the paginated
-  download range must both be `(afterSeq, S]` with `S` pinned from page 1.
+**Race-freedom.** Trivial: `getBlock` reads on-disk truth at fetch time, and the killer marker
+is downloaded by the same plan, in seq order, as its victim. There is no second source of truth
+to be stale, so the original §R4 eviction-interleaving race does not arise.
 
-**Reactivation correctness (§R4 note).** `Set.Observe` records only the max account-delete seq
-and does not clear on reactivation. Correct for us: the snapshot suppresses only the client's
-own emitted creates with `seq < D` inside `(afterSeq, S]`; a record re-created at `seq > D` is
-retained, and the reactivation `#account` arrives on the live tail above `S`. A client must
-**never** treat a snapshot DID entry as "this account is dead now, purge it."
+**Tests.** `segment/sentinel_test.go` (NSID rejection; seal indexes per-kind without inflating
+counts; coalesced marker+real-collection block; rewrite re-indexes); `internal/manifest/plan_test.go`
+(collection-filtered plan selects marker blocks; collection+DID filter narrows by bloom); the
+§R7 gate `TestFoldConvergence_CollectionFilteredDIDTombstoneGap` — **skip removed, now PASSES**
+via the inline path, with `serveArchive` wiring **no** `tombstone.Set`.
 
-**Tests.** Step 6's eviction-interleaving + reactivation + snapshot-ordering tests now **pass**.
-Add a client-unit test for the DID-only suppression fold and the fail-closed path.
-
-**Verify.** `just test ./internal/client ./internal/xrpcapi ./internal/oracle`,
-`just test-long ./internal/oracle`, `just oracle`. **Status / notes.** _(unstarted)_
+**Verify.** `just lint`, `just test`, `just test-long ./internal/oracle`,
+`TestOracle_DefaultLifecycle`, `just oracle`, `just fuzz` on `segment`. **Status / notes.**
+✅ **Done** (#175), replacing the reverted snapshot. **§3↔§8 seam is GONE:** the sentinel index
+is independent of `plannedThroughSeq`/`sealedTipSeq`, so step 8's pagination needs no re-pinning
+of any snapshot range (there is no range). One fewer cross-step coupling.
 
 ---
 
 ### ☐ Step 4 — `server: remove getTombstones overlay endpoint` (design §4.2) — gated on step 3
 
-**Goal.** Delete the overlay machinery now that §R4's snapshot replaces its DID-tombstone
-coverage. **Do not start before step 3 lands.**
+**Goal.** Delete the overlay machinery now that the §R4-revised sentinel index replaces its
+DID-tombstone coverage. **Do not start before step 3 lands.**
 
 **Delete.**
 - `internal/overlay/` — entire package (`format.go`, `cache.go`, `doc.go`, `metrics.go`,
@@ -520,9 +509,12 @@ outside the design notes; `just lint test`. **Status / notes.** _(unstarted)_
 
 ### ☐ Step 5 — `tombstone: prune overlay-only API` (design §4.3) — gated on step 4
 
-**Goal.** Remove `tombstone.Set` members only the overlay used; **keep `SnapshotRange`** (step 3
-now uses it) and everything compaction needs (`Observe`, `Evict`, `FoldRange`,
-`Snapshot.ShouldDrop`, the compaction `decide` path).
+**Goal.** Remove `tombstone.Set` members only the overlay used; keep everything compaction needs
+(`Observe`, `Evict`, `FoldRange`, `Snapshot.ShouldDrop`, the compaction `decide` path).
+**2026-06-29 update:** with the snapshot reverted, `SnapshotRange` (and `Snapshot`, which wraps
+it) is **overlay-only again** — step 3's sentinel index does not use it, and compaction folds
+on-disk via `FoldRange` — so once step 4 deletes the overlay, `SnapshotRange`/`Snapshot` become
+removable. Re-grep before deleting.
 
 **Audit & remove (only if no remaining caller after steps 3–4).**
 - `Set.Dirty` / `dirty atomic.Uint64` (`tombstone.go:48-51,65,108,125`) — overlay-cache only.
@@ -819,9 +811,9 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 2. remove client tombstone suppression (#172)
 - [x] 7. seqs start at 1 (+ collapse presence machinery) (#173)
 - [x] 6. oracle fold-convergence + DID-tombstone delivery tests (gates 3) (#174)
-- [ ] 3. backfill DID-tombstone start-snapshot (fail-closed, ordering invariant)
+- [x] 3. DID-marker sentinel collections close the §R3 gap inline (#175; replaced the reverted start-snapshot)
 - [ ] 4. remove getTombstones overlay endpoint (gated on 3)
-- [ ] 5. prune overlay-only tombstone API (keep SnapshotRange)
+- [ ] 5. prune overlay-only tombstone API (SnapshotRange now removable post-overlay-deletion)
 - [ ] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation)
 - [ ] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged)
 - [ ] 10. client pagination loop + delete cutover buffer + 400 re-backfill

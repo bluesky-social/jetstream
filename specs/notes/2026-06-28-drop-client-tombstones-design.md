@@ -81,6 +81,55 @@ from segments, so a backfill never even emits them — nothing to reconcile. The
 records a consumer may transiently hold that are already dead live in the uncompacted
 tail `(W, tip]` (≈ one compaction interval). Those converge as their markers arrive.
 
+> # ⚠ REVISION 2026-06-29 — §R4 mechanism REPLACED (READ FIRST)
+> #
+> # §R3 (the gap) stands exactly as written. §R4's **mechanism** does not: the
+> # `wantDidTombstones` / `didTombstones` planBackfill start-snapshot (shipped as
+> # step 3, commit 154eee3) has been **reverted and replaced** by an in-archive
+> # **reserved DID-marker sentinel collection** index (issue #175, decided with
+> # Jim). The gap is now closed where it originates — the segment index — instead
+> # of with a cross-process side-channel snapshot.
+> #
+> # **The replacement, in one paragraph.** DID-level markers (#account, #identity,
+> # #sync) carry an empty collection, so the seal/rewrite index now tags each
+> # marker-bearing block with a reserved sentinel collection name (`$account`,
+> # `$identity`, `$sync`; see `segment/sentinel.go`). These names are invalid
+> # NSIDs (`atmos.ParseNSID` rejects a `$`-leading, <3-segment string) and the
+> # planBackfill request validator only admits real NSIDs / NSID-authority
+> # wildcard prefixes, so a client can never name or prefix-match a sentinel — it
+> # cannot collide with real traffic. The planner
+> # (`manifest.collectionIDsForSegment`) unconditionally admits a segment's
+> # sentinel ids under any collection filter, so marker blocks are always
+> # selected; the per-block DID bloom still narrows by DID. The markers then ride
+> # **inline** through the normal getBlock download, exactly as record-level
+> # deletes already do, and a folding consumer converges with **zero** client-side
+> # special-casing.
+> #
+> # **Why this is better.** It deletes the entire snapshot surface — the
+> # `wantDidTombstones` input, the `didTombstones`/`didTombstonesIncluded` output,
+> # the client `snapshotSelector`/suppression fold, `planBackfillStart`, the
+> # fail-closed `errSnapshotMissing` gate, the server `attachDIDTombstones` +
+> # `Tombstones` wiring, and the whole snapshot-before-first-fetch ordering
+> # invariant and its race-freedom proof. The DID-level case collapses into the
+> # already-solved record-level case (getBlock reads on-disk truth at fetch time;
+> # the killer is downloaded in seq order alongside its victim). It is also
+> # simpler for third-party clients (a future TS client needs no snapshot logic),
+> # more precise under a DID filter (the block DID bloom narrows server-side, no
+> # hand-rolled `didTombstones`-vs-`dids` intersection), and requires no new wire
+> # field. Cost: a localized change to the seal/rewrite index path (metadata only;
+> # seq envelopes preserved) and, in a deployed world, a reseal/reindex of
+> # pre-existing segments — which is free today because nothing is deployed.
+> #
+> # **What this does NOT change.** §R3 (the gap), §R5 (pagination), §R6 invariants
+> # 1/4/5/7/8 (pin `beforeSeq=S`, deliver markers on both live wires, connect
+> # `/subscribe` at S, getBlock reads on-disk truth, the §14 too-old signal), §R7's
+> # by-DID fold-convergence oracle check, and §R8 (1-based seqs) all stand. §R6
+> # invariants **2, 3, and 6** (snapshot-once, snapshot-as-suppression, fail-closed
+> # on snapshot fetch) are **deleted** — there is no snapshot. Read the §R4 body
+> # below through the rewritten "§R4 (REVISED)" subsection that immediately follows
+> # the original; the original §R4 text is retained only as the reasoning trail for
+> # why the snapshot was *considered*, and must not be implemented.
+
 ## R3. The one real gap this revision closes: DID-level tombstones under a filter
 
 Record-level deletes/updates carry a collection, so a collection-filtered backfill
@@ -103,7 +152,75 @@ specific:
 the DID bloom pulls the account-delete blocks. The gap is collection-filtered queries
 only.)
 
-## R4. The fix — a backfill-start DID-tombstone snapshot (verified race-free)
+## R4 (REVISED 2026-06-29). The fix — reserved DID-marker sentinel collections (inline, no snapshot)
+
+> This is the **implemented** mechanism (issue #175). It replaces the original §R4
+> snapshot below, which was shipped then reverted (commit 154eee3). See the
+> REVISION banner above §R3 for the rationale.
+
+The gap is closed in the **segment index**, so DID-level markers become selectable
+by a collection-filtered plan and ride **inline** through the existing download —
+the same path record-level deletes already take. No side channel, no client
+suppression, no ordering invariant, no race proof.
+
+1. **Reserve a sentinel collection name per DID-level marker kind**
+   (`segment/sentinel.go`): `$account`, `$identity`, `$sync`. They begin with `$`,
+   which makes them invalid NSIDs (`atmos.ParseNSID` requires ≥3 dot-separated
+   segments). Requested collections are validated as exact NSIDs or NSID-authority
+   wildcard prefixes, so **no client request can name or prefix-match a sentinel** —
+   it can never collide with real collection traffic. Locked by a test asserting
+   `ParseNSID` rejects each sentinel. The names are written into sealed footers'
+   collection string tables and are therefore part of the on-disk format (load-bearing
+   once sealed; rename ⇒ reseal).
+
+2. **Index the sentinel at seal AND rewrite time** (one shared helper,
+   `blockWalkResult.indexEventCollection`, used by both `segment/seal.go` and
+   `segment/rewrite.go` so the two index paths cannot drift): for a block containing a
+   marker of kind K, add `didMarkerSentinel(K)` to that block's collection set. The
+   marker's own (empty) collection is still not interned, and the sentinel does **not**
+   increment `collectionEventCounts` (it is a selection hint, not per-collection
+   traffic). Compaction's rewrite re-derives the index from scratch, so a marker that
+   survives compaction keeps its sentinel.
+
+3. **Admit the sentinel in the planner unconditionally under a collection filter**
+   (`manifest.collectionIDsForSegment`): when building the matched collection-id set
+   for a segment, always include that segment's DID-marker sentinel ids
+   (`segment.IsDIDMarkerSentinelCollection`). This only widens the set, preserving the
+   one-sided no-false-negatives contract. The per-block **DID bloom still applies**, so
+   a collection+DID-filtered request pulls only marker blocks that may contain the
+   requested DID — strictly more precise than the reverted server-side
+   `didTombstones`-vs-`dids` intersection.
+
+4. **The client needs nothing new.** The exact `Matcher` already delivers
+   `#account`/`#identity`/`#sync` under a collection filter (issue #171, the
+   `!Kind.IsCommit()` bypass at `internal/client/filter.go`). The marker arrives via
+   `getBlock` in seq order, the consumer folds it, and a record the account re-created
+   after the delete (seq > marker) is naturally retained (reactivation, §R4 original
+   step’s concern — now handled for free because there is no synthesized event and no
+   suppression to mis-scope).
+
+**Why race-free (trivially).** `getBlock` reads on-disk truth at fetch time. The
+killer marker D is selected and downloaded by the same plan, in seq order, as its
+victim create C — there is no separate snapshot that could be stale relative to the
+bytes. The original §R4's entire eviction-interleaving race (and its proof) does not
+arise because there is no second source of truth. The §R7 eviction-interleaving and
+reactivation oracle scenarios still apply as **convergence** checks (fold the full
+stream, match killers by DID); they no longer gate a snapshot-vs-seam distinction.
+
+**Coverage note (§R3 boundary).** Unfiltered and DID-only backfills were already
+safe and are unchanged. The sentinel makes **collection-filtered** backfills safe by
+selection, closing exactly the §R3 gap. `#identity` is included for symmetry and
+future coverage; it kills no records, so it never affected fold-convergence, but it
+now reaches a collection-filtered backfill inline at no extra cost.
+
+---
+
+> ⚠ SUPERSEDED BY §R4 (REVISED) above. The snapshot mechanism below was implemented
+> (step 3 / commit 154eee3) and then **reverted** in favor of the sentinel index.
+> Kept only as the reasoning trail for why a snapshot was considered. **Do not
+> implement.** Its §R6 invariants 2/3/6 and §R4.1 wire surface are void.
+
+## R4 (ORIGINAL, SUPERSEDED). The fix — a backfill-start DID-tombstone snapshot (verified race-free)
 
 No segment-format change. No pebble persistence. We **reuse the in-memory
 `tombstone.Set`** that the server already maintains for compaction (it already holds
@@ -169,6 +286,13 @@ snapshot DID entry as "this account is dead now, purge it" — it must not.
 
 ### R4.1 Wire surface: piggyback the DID-tombstone snapshot on planBackfill page 1
 
+> ⚠ VOID — SUPERSEDED BY §R4 (REVISED). There is no wire surface: `wantDidTombstones`,
+> `didTombstones`, and `didTombstonesIncluded` were added then reverted. The sentinel
+> index needs **no new lexicon field, no generated-binding change, and no
+> `tombstone.Set` on the read path.** Post-revert, `SnapshotRange` is overlay-only again
+> (planBackfill no longer calls it), so §8 step 5 can remove it after the overlay is
+> deleted. Text below is void.
+
 The snapshot must cross a process boundary — the client reaches the server only over XRPC,
 `SnapshotRange` is an in-memory server method (`tombstone.go:73`) with no caller once the
 overlay/`getTombstones` bridge is deleted (§8 step 4). **Decision: piggyback it on the
@@ -210,31 +334,39 @@ range is consumed, then one `/subscribe` connect. This revision slots in cleanly
   `(afterSeq, S]` line up *exactly* with the bytes the loop will download. Floating the
   upper bound (chasing a live tip) is what reintroduces the leak, so the pinned-range
   pagination model is also the *correct* one.
-- The DID-tombstone snapshot is a single extra read taken alongside the first
-  `planBackfill` call, then carried as client state across the pages — no per-page cost,
-  no coupling to the page boundaries.
+- **(REVISED 2026-06-29.)** There is no per-backfill snapshot to carry: DID-level
+  markers are selected inline by every page whose plan touches their blocks (via the
+  sentinel index), so they need no client state and no coupling to page boundaries. The
+  pinned `beforeSeq = S` range still matters — it bounds the paginated scan — but it no
+  longer has to "line up with a snapshot," only with the bytes the loop downloads.
 - The done predicate (`plannedThroughSeq >= sealedTipSeq`, where here `sealedTipSeq` is
-  pinned to `S`) and the `/subscribe` connect at `cursor = S` are unchanged from Part B;
-  the snapshot just rides along.
+  pinned to `S`) and the `/subscribe` connect at `cursor = S` are unchanged from Part B.
 
 ## R6. Required invariants (implementers MUST encode all of these)
 
+> ⚠ REVISED 2026-06-29: invariants **2, 3, and 6 are VOID** — they governed the
+> reverted snapshot and there is no snapshot. Their replacement is a single
+> invariant **2′** (the sentinel index). Invariants 1, 4, 5, 7, 8 stand unchanged.
+
 1. **Pin `beforeSeq = S`** for the entire backfill; never let the upper bound float per
    page.
-2. **Snapshot the DID-tombstone set exactly once at backfill start**, strictly **before
-   the first `getBlock`**, over `(afterSeq, S]`; hold it for the whole backfill. Encode
-   *snapshot-before-first-fetch* as a hard ordering constraint — `S` (manifest lock) and
-   the snapshot (tombstone lock) are independent locks, so a careless refactor could
-   silently reorder them and reopen the race. A test must pin this.
-3. **Consume the snapshot as suppression** (`seq < tombstone.Seq` ⇒ drop the emitted
-   create/update), **never as a synthesized delivered event.**
+2. **(REPLACES old 2/3/6.) Index DID-level markers under their reserved sentinel
+   collection at seal AND rewrite, and admit those sentinels in every
+   collection-filtered plan.** The markers then ride inline through `getBlock` in seq
+   order; the consumer folds them with no suppression and no synthesized events. Tests
+   must pin: (a) `ParseNSID` rejects every sentinel (collision-proof); (b) seal and
+   rewrite both index the sentinel for a marker-bearing block without inflating
+   collection event counts; (c) a collection-filtered plan selects marker blocks while
+   the DID bloom still narrows; (d) end-to-end fold-convergence for a collection-filtered
+   backfill whose victim's killer is a DID-level marker (the §R7 gate test).
 4. **Deliver `#account`/`#sync`/`#identity` unconditionally on both live wires**, so
    post-`S` state (incl. reactivation) reaches the consumer.
 5. **Connect `/subscribe` at `cursor = S`** after the loop; rely on inclusive replay +
    client seq dedup; cold replay covers segments sealed during backfill.
-6. **Fail closed.** A failed or unavailable snapshot fetch is **fatal** (an empty
-   snapshot is shape-indistinguishable from a fetch failure; silently proceeding with an
-   empty suppression set would retain dead creates). Crash over corruption.
+6. **(VOID — was: fail closed on snapshot fetch.)** No snapshot is fetched, so there is
+   nothing to fail closed on. A planner that fails to admit the sentinel, or a seal that
+   fails to index it, is a correctness bug caught by the invariant-2′ tests, not a
+   runtime fail-closed gate.
 7. **Keep `getBlock` reading on-disk truth at fetch time** and segment seq-envelope
    preservation as **load-bearing invariants.** The race-freedom proof depends on them;
    gate any future block-repacking or "trust the planned checksum" optimization on
@@ -246,26 +378,37 @@ range is consumed, then one `/subscribe` connect. This revision slots in cleanly
 
 ## R7. Oracle / test additions for this revision
 
-- **Eviction-interleaving (the core race):** drive a collection-filtered backfill;
-  between pages, advance compaction so it crosses an account-delete `D` whose victim
-  create `C < D` was already downloaded. Assert the client does **not** end up holding
-  `C` (the start-snapshot suppressed it). A mutant that snapshots at the seam instead of
-  at start must **fail** this.
-- **Reactivation-after-snapshotted-delete:** account deleted at `D ≤ S`, reactivated and
-  re-creates a record at `R > S`. Assert the snapshot suppresses only `seq < D` creates
-  and the post-`S` reactivation + new record (from the live tail) are retained.
-- **`afterSeq < W` boundary:** a backfill whose `afterSeq` is below the watermark; assert
-  no create in `(afterSeq, W]` survives un-dropped on disk while lacking a snapshot
-  tombstone (it cannot, by rewrite-before-evict — but it is a sharp invariant worth
-  locking).
-- **Collection-filtered fold-convergence (replaces old §6 invariant 3):** fold the
-  *full* received stream, then restrict the *output* record set by collection; match a
-  dead record's killer to a DID-level tombstone **by DID** (not collection). Do **not**
+> ⚠ REVISED 2026-06-29 for the sentinel-index mechanism. The **fold-convergence**
+> check (match killers by DID, output-restricted) is unchanged and is the load-bearing
+> invariant. The snapshot-specific scaffolding (snapshot-at-start vs at-seam,
+> snapshot-before-first-fetch ordering) is **dropped** — there is no snapshot. The
+> eviction-interleaving and reactivation scenarios remain valuable as convergence
+> checks; they just no longer distinguish a snapshot timing.
+
+- **Collection-filtered fold-convergence (THE gate, replaces old §6 invariant 3):** fold
+  the *full* received stream, then restrict the *output* record set by collection; match
+  a dead record's killer to a DID-level marker **by DID** (not collection). Do **not**
   cross-check filtered-vs-filtered on the same server (that self-comparison is blind to
-  the gap). Retire the overlay-format mutants only after adding a mutant that reverts the
-  snapshot/suppression path.
-- **Snapshot-before-first-fetch ordering:** a test that fails if the snapshot is read
-  after any `getBlock`.
+  the gap). Implemented as `TestFoldConvergence_CollectionFilteredDIDTombstoneGap`
+  (`internal/oracle/foldconvergence_gate_test.go`) — now PASSES via the inline sentinel
+  path. A mutant that reverts the sentinel index (seal or planner) must FAIL it.
+- **Sentinel index unit coverage** (`segment/sentinel_test.go`,
+  `internal/manifest/plan_test.go`): `ParseNSID` rejects each sentinel; seal AND rewrite
+  index the sentinel for a marker block without inflating event counts; a
+  collection-filtered plan selects marker blocks; a collection+DID-filtered plan still
+  narrows by the block DID bloom.
+- **Eviction-interleaving (now a convergence check, not a race check):** drive a
+  collection-filtered backfill; advance compaction across an account-delete `D` whose
+  victim create `C < D` was already downloaded. Assert the client converges to `C`-dead.
+  Race-freedom is structural now (getBlock reads on-disk truth; `D` is selected inline by
+  the same plan), so there is no snapshot-timing mutant to kill — but the convergence
+  assertion still guards against a regression that drops `D` from selection.
+- **Reactivation-after-delete:** account deleted at `D`, reactivated and re-creates a
+  record at `R > D`. Assert the folded result retains the `R` record and drops the `< D`
+  creates — naturally, since markers fold inline and there is no suppression to mis-scope.
+- **`afterSeq < W` boundary:** a backfill whose `afterSeq` is below the watermark; assert
+  no create in `(afterSeq, W]` survives un-dropped on disk (rewrite-before-evict). Sharp
+  invariant worth locking; unaffected by the mechanism change.
 
 ## R8. Sequence numbers start at 1, not 0 (decided 2026-06-28b)
 
@@ -698,19 +841,26 @@ STALE scorecard is expected until the mutants are re-reviewed.
 2. **`client: remove tombstone suppression from backfill`** (§5.1). Delete `suppress.go`,
    collapse `selector.go` to matcher-only, strip the suppressor from `engine.go`. (Do NOT yet
    touch the cutover buffer — that's step 7.) Update/delete the suppressor tests.
-3. **`client: backfill DID-tombstone start-snapshot`** (§R4 — the finding-#1 fix). Pin
-   `beforeSeq=S`; take `SnapshotRange(afterSeq,S)` once before the first `getBlock`; fold as
-   seq-scoped suppression; **fail closed** on snapshot-fetch failure. Encode
-   snapshot-before-first-fetch as a hard ordering invariant. Depends on step 1 (live markers)
-   and the §R4 server hook exposing the snapshot to the client. **This step is gated by the
-   §R7 eviction-interleaving + reactivation oracle tests, which must be written first and must
-   fail without it.**
+3. **`segment+manifest: DID-marker sentinel collections close the §R3 gap`** (§R4 REVISED,
+   issue #175). **REPLACES the reverted `client: backfill DID-tombstone start-snapshot`
+   (commit 154eee3).** Reserve `$account`/`$identity`/`$sync` sentinel collection names
+   (`segment/sentinel.go`); index them per marker-bearing block at seal AND rewrite (shared
+   `indexEventCollection` helper); admit them unconditionally under a collection filter in
+   `manifest.collectionIDsForSegment`. The markers then ride inline through getBlock — no wire
+   field, no client snapshot, no `tombstone.Set` on the read path, no fail-closed gate, no
+   ordering invariant. Depends on step 1 (the client `Matcher` already delivers the markers).
+   Gated by the §R7 fold-convergence gate test (`TestFoldConvergence_CollectionFilteredDIDTombstoneGap`),
+   which fails without the index and passes with it.
 4. **`server: remove getTombstones overlay endpoint`** (§4.2). Delete `internal/overlay`,
    `gettombstones.go`, `overlay_source.go`, overlay metrics, runtime ticker, lexicon, stub;
-   unregister the route. **Gated on step 3** (the snapshot must replace the overlay's
+   unregister the route. **Gated on step 3** (the sentinel index must replace the overlay's
    DID-tombstone coverage first — do not delete the overlay before its replacement lands).
-5. **`tombstone: prune overlay-only API`** (§4.3). Remove members only the overlay used; KEEP
-   `SnapshotRange` (step 3 now uses it) and everything compaction needs. Depends on step 4.
+5. **`tombstone: prune overlay-only API`** (§4.3). Remove members only the overlay used.
+   **Note (2026-06-29):** with the snapshot reverted, `SnapshotRange` is **overlay-only again**
+   — compaction folds on-disk (`FoldRange`/`collectCompactionTombstones`), it does not call
+   `SnapshotRange` — so once step 4 deletes the overlay, `SnapshotRange` (and `Snapshot`, which
+   wraps it) become removable. Keep `Observe`/`Evict`/`FoldRange`/`Snapshot.ShouldDrop` and
+   everything compaction needs. Depends on step 4.
 6. **`oracle: fold-convergence + DID-tombstone delivery`** (§R7). Replace
    `CheckOverlayReconstruction` with the §R7 invariants (output-restricted fold; by-DID
    killers; eviction-interleaving; reactivation; `afterSeq<W`; snapshot-ordering). Refresh the
