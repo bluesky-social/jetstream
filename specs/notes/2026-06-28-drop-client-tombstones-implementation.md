@@ -1007,9 +1007,20 @@ returning zero units with the cursor unadvanced. Wire each to the killing test a
   (`false && …` so the cutover never reports tooOld). New **`partb` runner tier** runs `TestPartB*`
   + the manifest `TestPlanBackfill*` unit tests (the planner mutants kill fast there rather than
   via a client-loop livelock timeout). Each new mutant verified KILLED@partb individually.
+- **Mutation campaign (full, baseline regenerated).** `b9543d9`: **27 mutants, 20 KILLED, 7
+  SURVIVED, zero STALE/BUILD-BROKEN**; `baseline.json` regenerated + gate-verified
+  self-consistent (`gate: PASS`). The full re-run surfaced two pre-existing breakages the stale
+  baseline had hidden since #175/#178: **m015** had drifted STALE (the count increment moved into
+  `internCollection` in #175 — refreshed, still a documented footer-index blind spot) and **m025**
+  was BUILD-BROKEN (its `Set.SnapshotRange` mechanism was deleted in #178; the above-watermark
+  over-drop is unreachable on the on-disk windowed fold since `targetWatermark` is the last sealed
+  segment's MaxSeq — **retired**, with #183 filed to re-derive a dedicated mutant for the #100
+  over-drop recorder). The 7 survivors are all pre-existing documented escapes. `RESULTS.md`
+  carries the dated 2026-06-29 section.
 - **Verify.** `just lint` (0); `just test ./internal/client . ./internal/oracle ./internal/manifest
-  ./internal/subscribe` green; `-race` on the Part-B suite clean. Full `just mutation-campaign` +
-  `baseline.json`/`RESULTS.md` refresh: _(campaign running; numbers folded in on completion)_.
+  ./internal/subscribe` green; `-race` on the Part-B suite clean; full mutation campaign green
+  (above). `just test-long ./internal/oracle` + `TestOracle_DefaultLifecycle` (synctest) + `just
+  oracle` stress regression re-run after the harness/Stats changes.
 
 ---
 

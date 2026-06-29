@@ -5,16 +5,18 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 25 active mutants on disk
-(m001–m027; m007 and m010 retired). Latest full gate verification: 2026-06-25
-at `b6d3f09` (`just mutation-gate`) matched `testing/mutation/baseline.json`
-exactly — 18 killed, 7 survived over m001–m027. The enforced baseline remains
-`testing/mutation/baseline.json` (commit field `007abab`), seeded by the
-2026-06-21 full campaign and enforced by #108. The dated 2026-06-21 section
-was written against commit `df3fc4b`, which a later rebase orphaned;
-`baseline.json`'s commit field is the machine source of truth. Counts inside
-older dated sections describe the catalog *as of that date* and are
-intentionally not back-edited.**
+**Current catalog (keep this line current): 27 active mutants on disk
+(m001–m033; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
+2026-06-29 at `b9543d9` (step 11, #182) — 20 killed, 7 survived, zero
+STALE/BUILD-BROKEN; `testing/mutation/baseline.json` was regenerated from it
+(commit field `b9543d9`) and gate-verified self-consistent. This campaign added
+the `partb` tier (paginated-cutover scenarios) with m029–m033, retired the
+overlay-format mutants m020/m021/m023 (`internal/overlay` deleted in #177) and
+m025 (its `Set.SnapshotRange` mechanism deleted in #178; #183 tracks
+re-deriving a #100-recorder mutant), and refreshed m015 to its post-#175
+location. The 7 survivors (m002, m003, m009, m013, m014, m015, m022) are
+pre-existing documented escapes. Counts inside older dated sections describe the
+catalog *as of that date* and are intentionally not back-edited.**
 
 ## The baseline gate (#108)
 
@@ -64,6 +66,54 @@ remain below so the reasoning is not lost.
 |---|---|---|
 | m007_compaction_chunk_boundary | 2026-06-15 | Invalid/dead under current compaction chunk construction; the modeled corrupt shape cannot be produced by current chunk snapshots. |
 | m010_nextblockoffset_reset | 2026-06-15 | Stale/dead for sealed oracle observations; `Writer.Seal` rebuilds footer block metadata from physical frames. |
+| m020_overlay_drop_did_tombstones | 2026-06-29 | Targets `internal/overlay/format.go`, the read-path overlay deleted in #177 (drop-client-tombstones). No served overlay remains; DID-marker coverage is now the in-archive sentinel index (#175). |
+| m021_overlay_record_seq_base_zero | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
+| m023_overlay_drop_record_tombstones | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
+| m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178; #183 tracks re-deriving a dedicated mutant for the #100 over-drop recorder. |
+
+## Campaign 2026-06-29 (step 11 #182 — partb tier; catalog refresh; baseline regen)
+
+Full campaign at `b9543d9` after step 11 of the drop-client-tombstones +
+paginated-bufferless-cutover refactor. **27 mutants: 20 KILLED, 7 SURVIVED, zero
+STALE/BUILD-BROKEN.** `testing/mutation/baseline.json` was regenerated from this
+run and gate-verified self-consistent (`gate: PASS — 27 mutants match
+baseline`).
+
+**New `partb` tier.** `TestOracle_DefaultLifecycle` never truncates a plan
+(default `MaxEntries`) nor ages a cursor below the lookback floor, so the
+paginated-cutover paths had no mutation coverage. The new tier runs the §16
+hermetic end-to-end scenarios (`TestPartB*`, `internal/oracle`) plus the manifest
+planner's per-page truncation unit tests (`TestPlanBackfill*`, so the planner
+mutants kill fast rather than via a client-loop livelock timeout). All five new
+mutants kill there.
+
+**Catalog churn.** Retired the overlay-format mutants m020/m021/m023
+(`internal/overlay` deleted in #177) and m025 (its `Set.SnapshotRange` mechanism
+deleted in #178 — the above-watermark over-drop is unreachable on the on-disk
+windowed fold since `targetWatermark` is the last sealed segment's MaxSeq; #183
+tracks re-deriving a dedicated #100-over-drop-recorder mutant). Refreshed m015 to
+its post-#175 location (the per-collection count increment moved into the shared
+`internCollection` helper). Both refreshes surfaced only because step 11's full
+campaign re-ran every mutant against current code — the prior baseline had
+hidden m015 (STALE) and m025 (BUILD-BROKEN) since #175/#178 landed.
+
+### Scorecard (new and refreshed rows)
+
+| mutant | result | note |
+|---|---|---|
+| m015_collection_count_double | SURVIVED | refreshed to internCollection (seal.go:244); still a documented footer-index blind spot the row-by-row oracle cannot see (predicted survival). |
+| m029_plan_continuation_cursor_off_by_one | KILLED@partb | `PlannedThroughSeq = lastUnitMaxSeq + 1` skips a page boundary; union of pages no longer folds to ground truth (TestPartB_MultiPageBackfillCutover / _MidSegmentTruncation). |
+| m030_plan_midsegment_cut_reports_segment_maxseq | KILLED@partb | mid-segment cut reports the enclosing segment MaxSeq; the un-included tail blocks are skipped forever (TestPartB_MidSegmentTruncation). |
+| m031_plan_truncation_zero_units_unadvanced | KILLED@partb | `Entries+1 >= MaxEntries` trips the cap before the first unit is admitted → zero units, cursor unadvanced (TestPlanBackfill_OneUnitOverCapStillAdvances). |
+| m032_v2_below_floor_silent_clamp | KILLED@partb | `if false` on the RejectBelowFloor branch re-introduces the v1 silent clamp; a below-floor v2 cursor no longer 400s (TestPartB_StaleCursorSignal / _CaughtUpHandoffBelowFloorReBackfills). |
+| m033_client_too_old_400_not_rebackfilled | KILLED@partb | cutover never reports the §14 too-old 400, so the client stops at the seam instead of re-backfilling (TestPartB_CaughtUpHandoffBelowFloorReBackfills). |
+
+The other 22 rows are unchanged from the 2026-06-25 gate pass (m020/m021/m023/m025
+removed from the catalog). The 7 survivors — m002, m003, m009, m013, m014, m015,
+m022 — are all pre-existing documented escapes (watermark-floor off-by-one,
+merge-cursor no-advance, checksum-range off-by-one, collection/rkey swap on a
+path the oracle folds through, rev-dropped on a non-asserted field, footer count
+blind spot, and the DID-seq ShouldDrop inversion that final-state masks).
 
 ## Campaign 2026-06-25 (m025 stale refresh; gate pass)
 
