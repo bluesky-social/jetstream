@@ -372,7 +372,8 @@ range is consumed, then one `/subscribe` connect. This revision slots in cleanly
    gate any future block-repacking or "trust the planned checksum" optimization on
    re-proving the chain.
 8. **The §14 explicit "cursor too old" signal is still required and separate.** Pinning
-   closes the snapshot race, but a very slow backfill can still push `S` below the live
+   `beforeSeq = S` bounds the paginated sealed-range scan, but a very slow backfill can still
+   push `S` below the live
    lookback floor by connect time; without the explicit signal the terminal `/subscribe`
    hop silently drops `(S, floor]`. (See §10.1/§14.)
 
@@ -718,12 +719,14 @@ At-least-once and dedup are preserved exactly: the `liveRewindMargin` overlap an
 
 ### 5.2 Delivery contract: account + identity always delivered
 
-> ⚠ REFINED BY §R3 + §R4. The wire policy below is correct (now also covering `#sync` and v2),
-> but it governs only **live delivery**. It does NOT make a collection-filtered *backfill*
-> complete: the planner cannot fetch collection-less DID-level markers from sealed blocks, so
-> the client must also take the §R4 start-snapshot of the in-memory `tombstone.Set` over
-> `(afterSeq, S]` and fold it as seq-scoped suppression. The "permanently stale view" this
-> section warns against is exactly finding #1; §R3+§R4 together are what actually prevent it.
+> ⚠ REFINED BY §R3 + §R4-revised. The wire policy below is correct (now also covering `#sync`
+> and v2), but it governs only **live delivery**. On its own it does NOT make a
+> collection-filtered *backfill* complete for the DID-level markers — those carry no real
+> collection. §R4-revised closes that gap **in the archive**: seal/rewrite tag each
+> marker-bearing block with a reserved sentinel collection and the planner admits those
+> sentinels under every collection filter, so the markers are selected and ride inline through
+> `getBlock` with no client snapshot and no suppression. The "permanently stale view" this
+> section warns against is exactly finding #1; §R3 + §R4-revised together are what prevent it.
 
 `Matcher.Wants` (`internal/client/filter.go`) and `subscribe.Filter.Wants`
 (`internal/subscribe/filter.go`) both change so that, when a collection filter is set:
@@ -972,16 +975,17 @@ The buffer (`liveSink`, `Buffer`, `flipAndDrain`, the concurrent live-tail-durin
 goroutine, the dedup-floor / `backfillCoveredNothing` edge cases) exists only to bridge a
 **single** plan's `S` to live without losing the `(S, M]` band. It is the most
 intricate, most edge-case-laden code in the client. The insight (your coworker's):
-**jetstream's durable archive already IS the buffer.** If the client keeps re-planning, every
-event sealed during the previous download is picked up by the next plan — no client buffer
-needed.
+**jetstream's durable archive already IS the buffer.** The paginated loop drains the whole
+sealed range `(afterSeq, S]`, and the terminal `/subscribe` cold replay (§14.1) picks up any
+segment sealed *during* the download (its seqs are `> S`, so they fall to the cutover, not to a
+later page) — no client buffer needed.
 
 ## 11. Target model: pagination over planBackfill
 
-> ⚠ TWO CORRECTIONS to the pseudocode below (read with §R4 + §14-rewritten):
+> ⚠ TWO CORRECTIONS to the pseudocode below (read with §R4-revised + §14-rewritten):
 > (1) `beforeSeq` must be **pinned to `S`** (the sealed tip read on the first page), NOT
-> `request.BeforeSeq` floating per page — pinning is required for the §R4 snapshot range to line
-> up and to avoid the moving-tip leak. (2) The `subscribe(cursor=cursor)` connect is **NOT
+> `request.BeforeSeq` floating per page — pinning bounds the sealed-range scan to `(afterSeq, S]`
+> and avoids chasing a moving tip. There is no §R4 snapshot range (§R4-revised). (2) The `subscribe(cursor=cursor)` connect is **NOT
 > "never clamped"** (that claim is the unsound proof, finding #2). It CAN resolve below the floor
 > under a slow handoff; the server returns the §14 HTTP 400 "too old" and the client re-backfills
 > from its last seq. The loop structure (re-plan, advance cursor, done at `>= sealedTipSeq`) is
@@ -1016,9 +1020,13 @@ Why each step is correct (grounded in code read this session):
   cursor resolution. `planBackfill` (`internal/manifest/plan.go`) and `getSegment`/`getBlock`
   read durable files with no time bound. A 100-hour backfill is fine; segments don't age out
   (compaction only rewrites in place, preserving seq ranges).
-- **Re-planning absorbs mid-download seals.** Segments sealed while page *k* downloaded are
-  returned by page *k+1*'s `planBackfill(afterSeq=cursor)`. This is precisely why the client
-  buffer becomes unnecessary.
+- **The terminal `/subscribe` cold replay absorbs mid-download seals.** Because `beforeSeq` is
+  pinned to the page-1 sealed tip `S` (§11 correction), the pagination loop scans only
+  `(afterSeq, S]`; a segment sealed *during* the download carries seqs `> S` and is therefore
+  outside every page's range. Those just-sealed segments are picked up at the cutover by
+  `/subscribe`'s cold replay (`WalkFromCursor` re-reads the manifest at connect, §14.1), not by a
+  later page. This is precisely why the client buffer becomes unnecessary — the durable archive
+  plus cold replay cover the whole `(afterSeq, M]` band with no in-client bridge.
 - **The terminal `/subscribe` hop is serviceable; if its cursor has aged out, the §14 400
   catches it.** CORRECTION (2026-06-28b, findings #2 + #16): the original claim here — "never
   clamped, because the floor ≤ the sealed tip" — is unsound. `LookbackFloor`
@@ -1121,9 +1129,10 @@ mapping `ErrPlanTooLarge` to an error response.
 
 ## 13. Client changes: delete the buffer, loop the plan
 
-> ⚠ AUGMENTED by §R4 + §R8. This section is correct but incomplete as written; the rewritten
-> `runBackfillThenLive` must ALSO: (a) pin `beforeSeq=S` and take the §R4 DID-tombstone
-> start-snapshot before the first download, folding it as suppression; (b) handle the §14 HTTP
+> ⚠ AUGMENTED by §R4-revised + §R8. This section is correct but incomplete as written; the
+> rewritten `runBackfillThenLive` must ALSO: (a) pin `beforeSeq=S`; DID-level marker coverage
+> comes inline from the §R4-revised sentinel index, with no snapshot, no `wantDidTombstones`,
+> and no client suppression; (b) handle the §14 HTTP
 > 400 "too old" by re-entering the loop from `Batch.LastCursor` (the #4 client work); (c) the
 > "`backfillCoveredNothing` / dedup-floor special-casing" listed for deletion is deleted by §R8
 > (1-based seqs), and the `liveRewindMargin` overlap likewise goes — no rewind margin needed
@@ -1300,8 +1309,10 @@ The oracle must now exercise pagination and the bufferless handoff, not just a s
   count and assert the planner still returns that one unit and advances (no zero-progress
   livelock).
 - **Mid-download seal.** Seal new segments *between* pages (the simulator can drive ingest
-  during the paged download) and assert page *k+1* picks them up — i.e. nothing sealed during
-  page *k* is lost without a client buffer.
+  during the paged download). Their seqs are `> S` (the page-1 sealed tip, pinned as `beforeSeq`),
+  so they fall **outside** every page's `(afterSeq, S]` range and are NOT picked up by page
+  *k+1*; assert instead that they arrive via the terminal `/subscribe` cold replay at cutover
+  (`WalkFromCursor`, §14.1) — i.e. nothing sealed during page *k* is lost, with no client buffer.
 - **Caught-up handoff.** Assert the client connects `/subscribe` exactly when
   `plannedThroughSeq >= sealedTipSeq`. The connect cursor MAY be below the lookback floor (a
   slow handoff); assert that when it is, the §14 HTTP 400 fires and the client re-enters the

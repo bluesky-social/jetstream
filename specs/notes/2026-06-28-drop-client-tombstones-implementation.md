@@ -81,20 +81,27 @@ re-opens a correctness hole):
 - **No tech debt, cut deep.** Delete dead code outright (nothing is deployed, no consumers —
   per the design's deployment-context note). No compat shims, no renamed `_unused` vars, no
   "removed" comments.
-- **On-disk segment format is frozen.** None of these steps change the segment file format.
-  (The wire/lexicon and the in-memory/Pebble `seq/next` *seed* change; segment bytes do not.)
+- **On-disk segment format (schema) is frozen.** None of these steps add a footer section, bump
+  a format version, or change framing/layout. (The wire/lexicon and the in-memory/Pebble
+  `seq/next` *seed* change.) **Caveat (step 3):** marker-bearing segments now carry reserved
+  sentinel collection names (`$account`/`$identity`/`$sync`) in their footer string table and the
+  sentinel id in the block's collection set — same schema, but new *content* that is load-bearing
+  once sealed (see §R4-revised). Event payload bytes and seq envelopes are unchanged.
 - **Run the right tests after each correctness-touching step** (3, 6, 7, 8, 10, 11):
   `just test ./internal/oracle`, `just test-long ./internal/oracle`, and the
   `just oracle` / `just oracle-sweep` recipes; plus `just lint test` for the whole tree.
-- **Crash loud, never corrupt.** Snapshot-fetch failure is fatal (§R6.6). Invalid *external*
-  data (relay/firehose/backfill rows) is dropped-with-metric, never fatal.
+- **Crash loud, never corrupt.** Missing DID-marker coverage is a correctness bug, not a
+  runtime fail-closed path: sentinel indexing (seal/rewrite) and planner sentinel admission are
+  locked by tests + a §R7 mutant and must fail loudly during verification (§R4-revised — there is
+  no snapshot to fail closed on). Invalid *external* data (relay/firehose/backfill rows) is
+  dropped-with-metric, never fatal.
 
 ---
 
 ## 2. Dependency graph (from design §8, restated)
 
 ```
-Part A:  [6 oracle tests] ──gates──> [3 snapshot fix] ──> [4 remove overlay] ──> [5 prune tombstone API]
+Part A:  [6 oracle tests] ──gates──> [3 sentinel-index fix] ──> [4 remove overlay] ──> [5 prune tombstone API]
          [1 deliver acct/id/sync] ──> [3]
 Part B:  [7 seqs@1]  (do early; simplifies 8,9,10)
          [8 paginate planBackfill] ─┐
@@ -336,6 +343,15 @@ and re-run after it.
    contains the delete/update/account-delete/sync row that kills it.
 
 **New tests (§R7) — author NOW, several must fail until step 3:**
+
+> ⚠ SUPERSEDED by the §R4-revised mechanism (see this step's ✅ Status/notes below and the
+> Deferred section). The snapshot-flavored bullets that follow (start-snapshot suppression,
+> snapshot-at-seam mutant, "snapshot suppresses only `seq < D`", snapshot-before-first-fetch
+> ordering) describe the **reverted** design and were NOT the tests shipped. What shipped:
+> `CheckFoldConvergence` + the collection-filtered gate `TestFoldConvergence_*DIDTombstoneGap`
+> and the **sentinel-index-reverting** mutant. The snapshot-before-first-fetch ordering test is
+> moot — there is no snapshot. The original bullets are retained below only as the reasoning trail.
+
 - **Eviction-interleaving (the core race).** Drive a collection-filtered backfill; between
   pages advance compaction so it crosses an account-delete `D` whose victim create `C < D` was
   already downloaded. Assert the client does **not** end up holding `C` (the start-snapshot
@@ -511,10 +527,12 @@ outside the design notes; `just lint test`. **Status / notes.** _(unstarted)_
 
 **Goal.** Remove `tombstone.Set` members only the overlay used; keep everything compaction needs
 (`Observe`, `Evict`, `FoldRange`, `Snapshot.ShouldDrop`, the compaction `decide` path).
-**2026-06-29 update:** with the snapshot reverted, `SnapshotRange` (and `Snapshot`, which wraps
-it) is **overlay-only again** — step 3's sentinel index does not use it, and compaction folds
-on-disk via `FoldRange` — so once step 4 deletes the overlay, `SnapshotRange`/`Snapshot` become
-removable. Re-grep before deleting.
+**2026-06-29 update:** with the snapshot reverted, the `Set.SnapshotRange` method (and the
+`Set.Snapshot` method, which wraps it) is **overlay-only again** — step 3's sentinel index does
+not use it, and compaction folds on-disk via `FoldRange` — so once step 4 deletes the overlay,
+both `Set` methods become removable. Keep the `Snapshot` **type** and its `ShouldDrop` method
+(compaction's `decide` path builds a `Snapshot` via `FoldRange` and calls `ShouldDrop`); only the
+two `Set` methods that produced snapshots for the overlay go away. Re-grep before deleting.
 
 **Audit & remove (only if no remaining caller after steps 3–4).**
 - `Set.Dirty` / `dirty atomic.Uint64` (`tombstone.go:48-51,65,108,125`) — overlay-cache only.
@@ -604,8 +622,13 @@ tree compiles between steps.
 ### ☐ Step 9 — `subscribe: v2 too-old cursor → HTTP 400` (design §14, D5) — before step 10
 
 **Goal.** `/subscribe-v2` returns a pre-upgrade HTTP 400 with the floor seq when a v2 seq
-cursor resolves below the lookback floor. `/subscribe` (v1) keeps silent clamping (legacy
-parity). Standalone server change.
+cursor resolves below the lookback floor. `/subscribe` (v1) keeps silent clamping — **wire
+parity with jetstream-legacy** (`bluesky-social/jetstream-legacy`), whose `/subscribe` never
+rejects a too-old cursor (a future cursor live-tails, an old cursor replays what's available);
+real legacy consumers depend on that contract, so v1 must not start returning a 400. This is
+**not** a violation of the no-silent-loss goal: the loss is made operator-visible via a distinct
+metric label (finding #14), and the at-least-once/no-silent-loss contract is delivered on the v2
+path. Standalone server change.
 
 **Changes (`internal/subscribe/cursor.go`, `handler.go`, `runtime.go`).**
 - `CursorEnv` gains `RejectBelowFloor bool`.
@@ -633,7 +656,8 @@ parity). Standalone server change.
 ### ☐ Step 10 — `client: paginate backfill, delete the cutover buffer` (design §11, §13, §R4, §R8)
 
 **Goal.** Rewrite `runBackfillThenLive` as the pagination loop; delete the cutover buffer
-entirely; pin `beforeSeq = S`; carry the §R4 snapshot across pages; handle the §14 400 by
+entirely; pin `beforeSeq = S`; rely on the §R4-revised sentinel index for DID-level marker
+coverage (no snapshot, no client suppression, no `wantDidTombstones`); handle the §14 400 by
 re-entering the loop. Depends on steps 2, 3, 7, 8, 9.
 
 **Delete (`internal/client/` + root).**
@@ -645,23 +669,26 @@ re-entering the loop. Depends on steps 2, 3, 7, 8, 9.
   interface + `LiveFrame`, `NewMemLiveBuffer`/`NewFileLiveBuffer`, `WithLiveBuffer`
   (`options.go:185-192`), and `bufferAdapter` (`engine.go:221-224`). Update `doc.go` examples.
 
-**Rewrite `runBackfillThenLive` (the §11 loop, with §R4 + §14 corrections).**
+**Rewrite `runBackfillThenLive` (the §11 loop, with §R4-revised + §14 corrections).**
 ```
-// page 1: learn S and the snapshot, co-atomically
-p := plan(afterSeq=cursor, wantDidTombstones=true)        // cursor = request.AfterSeq (0 = full)
-S := p.SealedTipSeq                                        // PIN this for the whole backfill
-snap := p.DIDTombstones                                   // held for the whole backfill
-// fail closed if snap missing (§R6.6)
-download+emit p.Segments  (filter = matcher AND DID-only snapshot suppression, range (afterSeq,S])
+// page 1: learn S, the sealed upper bound, and PIN it for the whole backfill
+p := plan(afterSeq=cursor)                                // cursor = request.AfterSeq (0 = full)
+S := p.SealedTipSeq                                       // PIN this for the whole backfill
+download+emit p.Segments  (filter = matcher only, range (afterSeq,S])  // DID markers ride inline via sentinels
 cursor = p.PlannedThroughSeq
 for cursor < S {
-    p = plan(afterSeq=cursor, beforeSeq=S)                // wantDidTombstones=false; beforeSeq PINNED to S
+    p = plan(afterSeq=cursor, beforeSeq=S)                // beforeSeq PINNED to S
     download+emit p.Segments
     cursor = p.PlannedThroughSeq
 }
 // done: every sealed segment in (request.AfterSeq, S] consumed
 subscribe(cursor=S)                                       // connect ONCE; may clamp → §14 400
 ```
+There is no DID-tombstone snapshot, no `wantDidTombstones` plan flag, no fail-closed gate, and
+no client-side suppression: DID-level markers (`#account`/`#identity`/`#sync`) are selected
+inline by every page whose plan touches their blocks (via the §R4-revised sentinel index) and
+folded by the consumer with no special handling — the same download path a record-level delete
+takes.
 - **Done predicate**: `plannedThroughSeq >= sealedTipSeq` (here pinned `S`). No boolean, no
   empty-segment inference (sparse filters can match zero segments yet have data above).
 - **Connect `/subscribe` at `cursor = S`.** Replay is inclusive + the consumer dedups by seq,
@@ -710,8 +737,14 @@ the pinned-`beforeSeq` range, and the 400-driven re-backfill (bounded, monotonic
 - **Mid-segment truncation**: continuation cursor = last included block range's `MaxSeq`
   (inside the segment); next page emits the un-included tail blocks; cursor strictly advances;
   one-unit-over-cap case advances.
-- **Mid-download seal**: seal segments between pages; assert page k+1 picks them up (no client
-  buffer).
+- **Mid-download seal**: seal segments between pages; their seqs are `> S` (the page-1 sealed
+  tip, pinned as `beforeSeq` for the whole loop), so they are **outside** every page's
+  `(afterSeq, S]` range and are **not** picked up by page k+1. Assert instead that they are
+  delivered by the terminal `/subscribe` cold replay at cutover (`WalkFromCursor` re-reads the
+  manifest at connect, §14.1) — losslessly and with no client buffer. (Note: pinning vs floating
+  `beforeSeq` is a simplicity/efficiency choice, not a correctness one — a floating upper bound
+  would still deliver these seals losslessly, just via page k+1 instead of cold replay — so this
+  test asserts *which channel* delivers them under the pinned model, not loss-vs-no-loss.)
 - **Caught-up handoff**: client connects `/subscribe` exactly when
   `plannedThroughSeq >= sealedTipSeq`. The connect cursor **MAY** be below the lookback floor
   (slow handoff) → assert §14 400 fires and the client re-enters pagination; when in-window,
@@ -747,10 +780,11 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - `docs/README.md`: rewrite §3.3 to drop the `getTombstones` overlay subsection (`:352-394`)
   while keeping the compaction narrative — the in-memory tombstone set is now
   compaction-internal with no read-time exposure. Rewrite the "putting it all together" client
-  flow (`:406-417`) to the loop model: `planBackfill (page 1: learn S + DID-tombstone snapshot)
+  flow (`:406-417`) to the loop model: `planBackfill (page 1: learn S)
   → page until plannedThroughSeq ≥ sealedTipSeq → connect /subscribe at S`. No overlay download,
-  no record suppression; the only client-side suppression is the bounded DID-only start-snapshot
-  over `(W, S]` (the §R5 "bounded suppression, not zero suppression" wording). Update §4.4
+  no record suppression, no DID-tombstone snapshot; DID-level markers are delivered inline
+  because the segment index tags marker blocks with reserved sentinel collections that the
+  planner always admits under a collection filter (the §R4-revised mechanism). Update §4.4
   (`:558-568`) to "account + identity (+ sync) always delivered on v1 and v2"; delete the
   "tombstone folding happens before the delivery filter" justification. Update `:58`
   (1-based seqs) and `:160` (overlay-at-delivery-time). Add an explicit **eventual
@@ -765,7 +799,8 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - Correct the stale `specs/notes/2026-05-27-cursor-replay-design.md:94-95` "v2 seq cursors have
   no window cap" claim (v2 now rejects too-old with a 400; v1 still clamps).
 - Lexicon docs / generated index: ensure `getTombstones` is gone; `planBackfill` description
-  updated (it now paginates and optionally returns `didTombstones` + `sealedTipSeq`).
+  updated (it now paginates and returns `sealedTipSeq`; there is no `didTombstones` field —
+  DID-level markers are covered by the §R4-revised sentinel index, not a plan response field).
 
 **Verify.** Manual read-through; `grep` for stale overlay/0-based/point-in-time language.
 **Status / notes.** _(unstarted)_
@@ -776,9 +811,9 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 
 | Risk | Where addressed | Backstop |
 |---|---|---|
-| Collection-filtered consumer keeps a deleted account's records forever (finding #1) | Step 3 (§R4 snapshot) | Step 6 eviction-interleaving test gates step 3 |
-| Snapshot/`S` reordered by a careless refactor → race re-opens (§R6.2) | Step 3 (snapshot-before-first-fetch invariant) | Step 6 snapshot-ordering test |
-| Empty snapshot indistinguishable from fetch failure (§R6.6) | Step 3 fail-closed on missing field | Crash over corruption (CLAUDE.md) |
+| Collection-filtered consumer keeps a deleted account's records forever (finding #1) | Step 3 (§R4-revised sentinel index: seal/rewrite tags marker blocks, planner admits sentinels) | Step 6 collection-filtered fold-convergence gate + sentinel-index unit tests |
+| Sentinel not indexed at seal/rewrite, or not admitted by the planner → DID markers omitted from a collection-filtered backfill | Step 3 shared `indexEventCollection` helper + planner sentinel admit | Mutant removing the sentinel branch or planner admit must fail the §R7 fold-convergence gate |
+| Reverted snapshot wire/client suppression accidentally reintroduced | Step 3 deletes the snapshot surface; steps 10/12 describe matcher-only inline delivery | Grep for `wantDidTombstones`/`DIDTombstones`/snapshot suppression before completing those steps |
 | seq-0 swallow on from-empty handoff (#112) | Step 7 (1-based seqs make it structurally impossible) | Re-pointed regression test |
 | Mid-segment truncation skips the segment's tail blocks (§12.1) | Step 8 cursor = last **unit** `MaxSeq` | Step 11 mid-segment-truncation test + mutant |
 | Zero-progress livelock at the page cap | Step 8 always-admit-≥1-unit | Step 11 one-unit-over-cap test + mutant |
@@ -792,10 +827,11 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 
 ## 5. Open items to resolve **during** implementation (not blockers)
 
-- **Step 3 vs step 8 snapshot-range seam.** Pre-step-8 the snapshot range is
-  `(afterSeq, plannedThroughSeq]`; step 8 must re-pin it to `(afterSeq, sealedTipSeq]` and
-  step 10 must pin `beforeSeq = S` across pages. Tracked as an explicit cross-reference in the
-  step 3, 8, and 10 issues so the range stays correct as the fields split.
+- **Step 3 vs step 8 snapshot-range seam — RESOLVED (2026-06-29).** The sentinel-index
+  replacement removed the snapshot, so there is no snapshot range to re-pin when `sealedTipSeq`
+  lands. Step 8 still adds `sealedTipSeq` for pagination and step 10 must pin `beforeSeq = S`
+  across pages, but DID-level marker coverage now comes from the segment/planner sentinel path
+  and is independent of `plannedThroughSeq`/`sealedTipSeq` — one fewer cross-step coupling.
 - **Step 10 client telemetry mechanism** (Stats accessor vs progress callback) — the §8
   still-open item; decide in the step-10 issue. Lean: lightweight `Stats()` on the engine.
 - **`tombstone_set_bytes` gauge ownership** (step 5) — confirm it is a compaction metric before
