@@ -242,13 +242,25 @@ func blockBloomMayContainAny(seg *SegmentMetadata, blockIdx int, dids []string) 
 }
 
 // collectionIDsForSegment returns the segment-local collection indices whose
-// NSID is exact-matched by want OR is covered by one of prefixes. Prefixes only
-// widen the matched set, preserving the planner's one-sided contract (no false
-// negatives). Matching prefixes against this segment's own resident collection
-// table is equivalent to expanding each prefix against the global collection
-// union and exact-matching, because a segment can only contain collections that
-// exist in that union — but it needs no global cache and stays current under
-// the manifest read lock.
+// NSID is exact-matched by want OR is covered by one of prefixes, PLUS the
+// segment's reserved DID-level marker sentinel ids (segment.IsDIDMarkerSentinelCollection).
+// Both the request match and the sentinel union only widen the matched set,
+// preserving the planner's one-sided contract (no false negatives).
+//
+// The sentinel union is what closes the collection-filtered DID-tombstone gap:
+// #account/#identity/#sync markers carry no real collection, so the seal/rewrite
+// index tags their blocks with a reserved sentinel collection instead. Always
+// admitting those sentinels under a collection filter makes the marker-bearing
+// blocks selectable; the per-block DID bloom still narrows by DID. A client can
+// never request a sentinel itself — the names are invalid NSIDs and the request
+// validator only accepts NSIDs/NSID-authority prefixes — so the sentinels enter
+// the matched set only here, never via want/prefixes.
+//
+// Matching prefixes against this segment's own resident collection table is
+// equivalent to expanding each prefix against the global collection union and
+// exact-matching, because a segment can only contain collections that exist in
+// that union — but it needs no global cache and stays current under the manifest
+// read lock.
 func collectionIDsForSegment(seg *SegmentMetadata, want map[string]struct{}, prefixes []string) map[uint32]struct{} {
 	out := make(map[uint32]struct{}, min(len(want)+len(prefixes), len(seg.Collections)))
 	for id, collection := range seg.Collections {
@@ -257,6 +269,13 @@ func collectionIDsForSegment(seg *SegmentMetadata, want map[string]struct{}, pre
 		// dead weight. Skipping it cannot cause a false negative (no block
 		// could reference it), preserving the one-sided contract.
 		if id > math.MaxUint32 {
+			continue
+		}
+		// DID-level marker sentinels are always admitted under a collection
+		// filter so the markers (which carry no real collection) stay
+		// selectable; see the doc comment.
+		if segment.IsDIDMarkerSentinelCollection(collection) {
+			out[uint32(id)] = struct{}{}
 			continue
 		}
 		if _, ok := want[collection]; ok {

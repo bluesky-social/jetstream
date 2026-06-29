@@ -95,6 +95,71 @@ func TestPlanBackfill_DIDFilterCoalescesSparseBlocks(t *testing.T) {
 	require.Equal(t, 1, got.Stats.Entries)
 }
 
+// markerEvent builds a DID-level marker event (empty collection) of the given
+// kind for the planner sentinel-selection tests.
+func markerEvent(seq uint64, did string, kind segment.Kind) segment.Event {
+	return segment.Event{Seq: seq, Kind: kind, DID: did, Payload: []byte{0xa0}}
+}
+
+// TestPlanBackfill_CollectionFilterSelectsDIDMarkerBlocks is the planner-level
+// guard for the §R3 gap fix: a collection-filtered plan must select the blocks
+// holding DID-level markers (#account/#identity/#sync) even though those markers
+// carry no real collection, because the seal index tags their blocks with a
+// reserved sentinel collection that the planner always admits. Without the
+// sentinel union the marker block (seq 2) would be dropped and the killer never
+// downloaded.
+func TestPlanBackfill_CollectionFilterSelectsDIDMarkerBlocks(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, planDID, postNSID),                // in-filter create
+		markerEvent(2, planDID, segment.KindAccount),   // killer, empty collection
+		planEvent(3, otherDID, likeNSID),               // out-of-filter create
+		markerEvent(4, otherDID, segment.KindIdentity), // identity marker
+		markerEvent(5, planDID, segment.KindSync),      // sync marker
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.Collections = []string{postNSID}
+
+	got, err := m.PlanBackfill(req)
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	require.Equal(t, manifest.PlanModeBlocks, got.Segments[0].Mode)
+
+	// Blocks selected: 0 (post create), and the three marker blocks 1, 3, 4
+	// (account/identity/sync sentinels), regardless of the post filter. Block 2
+	// (other DID's like, out of filter, no marker) is the only one dropped.
+	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 1}, {First: 3, Last: 4}}, got.Segments[0].Blocks)
+}
+
+// TestPlanBackfill_CollectionAndDIDFilterNarrowsMarkerBlocks proves the DID
+// bloom still narrows sentinel-selected blocks: a collection+DID-filtered plan
+// pulls only marker blocks whose block bloom may contain the requested DID, not
+// every marker block in the segment.
+func TestPlanBackfill_CollectionAndDIDFilterNarrowsMarkerBlocks(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, planDID, postNSID),               // block 0: wanted DID + collection
+		markerEvent(2, planDID, segment.KindAccount),  // block 1: wanted DID marker
+		markerEvent(3, otherDID, segment.KindAccount), // block 2: other DID marker
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.Collections = []string{postNSID}
+	req.DIDs = []string{planDID}
+
+	got, err := m.PlanBackfill(req)
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	// Block 2 (otherDID's marker) is pruned by the DID bloom; blocks 0 and 1
+	// (planDID) survive.
+	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 1}}, got.Segments[0].Blocks)
+}
+
 func TestPlanBackfill_CollectionFilterUsesResidentCollectionIndex(t *testing.T) {
 	t.Parallel()
 

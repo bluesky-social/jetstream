@@ -22,8 +22,10 @@ import (
 const gateVictimDID = "did:plc:victim"
 
 // gateCollection is the filtered collection. The victim's record lives here; the
-// account-delete that kills it carries an EMPTY collection and so rides in no
-// collection block (segment/seal.go only indexes non-empty collections).
+// account-delete that kills it carries an EMPTY collection. The seal index tags
+// the marker's block with the reserved $account sentinel collection
+// (segment/sentinel.go), which the planner always admits under a collection
+// filter, so the marker is selected and downloaded inline.
 const gateCollection = "app.bsky.feed.post"
 
 // writeSealedSegment writes events to one sealed segment file at idx, one event
@@ -49,10 +51,13 @@ func writeSealedSegment(t *testing.T, segDir string, idx uint64, events ...segme
 // getSegment + getBlock) over a pre-built segments dir, on a real httptest
 // socket. It deliberately does NOT use a synctest bubble: the oracle package
 // allows exactly one bubble per process (owned by TestOracle_DefaultLifecycle),
-// so every other server-driving test runs on real sockets. Note there is NO
-// tombstone.Set wired in — step 3 adds the DID-tombstone snapshot to
-// planBackfill; until then the archive cannot tell a collection-filtered client
-// about the empty-collection account-delete.
+// so every other server-driving test runs on real sockets.
+//
+// No tombstone.Set is wired in, and none is needed: the §R3 gap is closed in
+// the archive itself. DID-level markers are indexed under a reserved sentinel
+// collection at seal time (segment/sentinel.go), so the planner selects their
+// blocks under any collection filter and the markers ride inline through
+// getBlock — the same download path record-level deletes already take.
 func serveArchive(t *testing.T, segDir string) string {
 	t.Helper()
 	m, err := manifest.Open(manifest.Options{
@@ -75,37 +80,31 @@ func serveArchive(t *testing.T, segDir string) string {
 	return ts.URL
 }
 
-// TestFoldConvergence_CollectionFilteredDIDTombstoneGap is the STEP-3 GATE
-// (design §R3/§R4/§R7, issue #174). It reproduces the one real gap the
-// drop-client-tombstones revision must close: a collection-filtered backfill
-// downloads an in-scope create C but never receives C's DID-level killer D (an
-// account-delete carrying an empty collection, sealed below the tip, indexed in
-// no collection block), so a folding consumer keeps C forever — a silent
-// violation of the no-data-loss contract (§R1).
+// TestFoldConvergence_CollectionFilteredDIDTombstoneGap guards the one real gap
+// the drop-client-tombstones revision must close (design §R3, issue #174): a
+// collection-filtered backfill downloads an in-scope create C and must also
+// receive C's DID-level killer D (an account-delete carrying an empty
+// collection, sealed below the tip), or a folding consumer keeps C forever — a
+// silent violation of the no-data-loss contract (§R1).
 //
 // Layout (both segments sealed, both below the tip):
 //
 //	seg 0: create C  (seq 1, did:plc:victim, app.bsky.feed.post) — IN the filter
 //	seg 1: account-delete D (seq 2, did:plc:victim, EMPTY collection) — the killer
 //
-// A client filtered to app.bsky.feed.post plans only seg 0 (seg 1's
-// empty-collection summary is never selected), downloads C, and ends backfill
-// holding C with no killer. CheckFoldConvergence then DIVERGES: ground truth
-// (folding the full on-disk stream, killer matched by DID) has C dead, the
-// client's filtered fold has C live.
+// The gap is closed in the archive itself: seal indexes D's block under the
+// reserved $account sentinel collection (segment/sentinel.go), and the planner
+// always admits that sentinel under a collection filter. So a client filtered to
+// app.bsky.feed.post plans BOTH seg 0 (the real collection) and seg 1 (the
+// sentinel), downloads C and D inline, and folds to C-dead — converging with
+// ground truth (which matches the killer by DID). No snapshot, no suppression,
+// no tombstone.Set on the read path: D rides the same inline download as a
+// record-level delete.
 //
-// PER REVIEW DECISION (skip-with-step-3-ref): this test FAILS today because the
-// gap is real and unclosed. It was run once to capture that failure as the gate
-// evidence for step 3, then skipped here so the tree stays green between steps.
-// Step 3 (the DID-tombstone start-snapshot piggybacked on planBackfill page 1)
-// makes the client suppress C, at which point this test passes and the skip is
-// removed.
+// A planner that fails to admit the sentinel (or a seal that fails to index it)
+// regresses this to the original gap: seg 1 is never selected, the client folds
+// to C-live, and CheckFoldConvergence diverges.
 func TestFoldConvergence_CollectionFilteredDIDTombstoneGap(t *testing.T) {
-	t.Skip("gated on step 3 (DID-tombstone start-snapshot); see issue #174. " +
-		"Reproduces the §R3 collection-filtered gap and FAILS until #3 lands " +
-		"(captured failure: client folds to a record ground truth DELETED — the " +
-		"empty-collection account-delete is never delivered to a collection-filtered " +
-		"backfill). Step 3's snapshot suppresses C; then remove this skip.")
 	t.Parallel()
 
 	dataDir := t.TempDir()
@@ -121,8 +120,9 @@ func TestFoldConvergence_CollectionFilteredDIDTombstoneGap(t *testing.T) {
 		Rev:        "rev1",
 		Payload:    []byte{0xa0}, // empty DAG-CBOR map; decodes cleanly in map mode
 	}
-	// D is the DID-level account-delete: empty collection, so it is indexed in
-	// no collection block and a collection-filtered plan never selects it.
+	// D is the DID-level account-delete: empty collection on the wire, but the
+	// seal index tags its block with the $account sentinel so a
+	// collection-filtered plan still selects it.
 	deleteD := segment.Event{
 		Seq:       2,
 		IndexedAt: int64(1_730_000_000_000_000 + 2),

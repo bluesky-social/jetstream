@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math"
 	"os"
 )
 
@@ -247,7 +246,8 @@ func readSealedFrame(f io.ReaderAt, b BlockInfo) ([]byte, error) {
 func accumulateRewriteBlock(walk *blockWalkResult, events []Event) error {
 	blockDIDs := map[string]struct{}{}
 	blockCollections := map[uint32]struct{}{}
-	for _, ev := range events {
+	for i := range events {
+		ev := &events[i]
 		if ev.DID != "" {
 			if _, ok := walk.uniqueDIDs[ev.DID]; !ok {
 				did := string([]byte(ev.DID))
@@ -257,20 +257,8 @@ func accumulateRewriteBlock(walk *blockWalkResult, events []Event) error {
 				blockDIDs[string([]byte(ev.DID))] = struct{}{}
 			}
 		}
-		if ev.Collection != "" {
-			id, ok := walk.collectionIDByName[ev.Collection]
-			if !ok {
-				if uint64(len(walk.collectionStringTable)) >= math.MaxUint32 {
-					return fmt.Errorf("%w: too many distinct collections", ErrInvalidFooter)
-				}
-				col := string([]byte(ev.Collection))
-				id = uint32(len(walk.collectionStringTable))
-				walk.collectionStringTable = append(walk.collectionStringTable, col)
-				walk.collectionEventCounts = append(walk.collectionEventCounts, 0)
-				walk.collectionIDByName[col] = id
-			}
-			walk.collectionEventCounts[id]++
-			blockCollections[id] = struct{}{}
+		if err := walk.indexEventCollection(ev, blockCollections); err != nil {
+			return err
 		}
 	}
 	ids := make([]uint32, 0, len(blockCollections))
