@@ -37,6 +37,37 @@ func TestResolveCursor_FutureSeqDropsToLive(t *testing.T) {
 	require.True(t, p.Clamped, "Clamped is informational here; future-cursor is a special clamp case")
 }
 
+// TestResolveCursor_ZeroNextSeqDropsToLive pins the CursorEnv.NextSeq contract:
+// NextSeq==0 means the writer has not started, so any finite seq cursor is "in
+// the future" and resolves to live — even with a manifest floor and
+// RejectBelowFloor set, which would otherwise return ErrCursorTooOld. Without
+// the NextSeq==0 short-circuit the cursor falls through to the floor logic and
+// a below-floor cursor 400s instead of dropping to live, contradicting the doc.
+func TestResolveCursor_ZeroNextSeqDropsToLive(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
+		minSeq: 200, maxSeq: 299,
+		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:   10,
+	})
+	m := mustOpenManifest(t, dir)
+
+	// Cursor 50 is below the floor (200); with NextSeq>0 and RejectBelowFloor
+	// this would return ErrCursorTooOld. NextSeq==0 must short-circuit to live.
+	p, err := subscribe.ResolveCursor("50", subscribe.CursorEnv{
+		Manifest:         m,
+		NextSeq:          0,
+		Lookback:         36 * time.Hour,
+		RejectBelowFloor: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeLive, p.Mode)
+	require.True(t, p.Clamped, "future-cursor drop-to-live is reported as a clamp")
+}
+
 func TestResolveCursor_FutureTimestampDropsToLive(t *testing.T) {
 	t.Parallel()
 	now := time.Now().UnixMicro()

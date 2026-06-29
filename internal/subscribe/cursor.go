@@ -130,8 +130,11 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 		plan.Mode = ModeReplaySeq
 		// Future-seq check: a requested cursor at or beyond the writer's
 		// next-to-allocate seq has no events to replay, so we drop to
-		// live mode.
-		if env.NextSeq > 0 && uint64(n) >= env.NextSeq {
+		// live mode. NextSeq==0 means the writer has not started (see the
+		// CursorEnv.NextSeq contract): any finite requested seq is "in the
+		// future", so it also drops to live rather than falling through to
+		// seq replay or the RejectBelowFloor too-old rejection.
+		if env.NextSeq == 0 || uint64(n) >= env.NextSeq {
 			return CursorPlan{Mode: ModeLive, Requested: n, Clamped: true}, nil
 		}
 		startSeq := uint64(n)
