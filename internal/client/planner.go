@@ -13,6 +13,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 )
 
 // DownloadMode selects how a planned segment's rows are fetched.
@@ -68,6 +69,16 @@ type PlanEntry struct {
 	Blocks []BlockRange
 }
 
+// DIDTombstone is one DID-level tombstone (account-delete or sync) from the
+// §R4 backfill-start snapshot: the highest such seq for DID within the planned
+// range. The client folds it as DID-only, seq-scoped suppression — it drops its
+// own emitted create/update rows for DID with a strictly smaller seq — and
+// NEVER synthesizes a delete/account event from it (reactivation, design §R4).
+type DIDTombstone struct {
+	DID string
+	Seq uint64
+}
+
 // Plan is the ordered transport plan returned by the server for a historical
 // backfill query, plus the sealed-archive coverage horizon.
 type Plan struct {
@@ -80,6 +91,17 @@ type Plan struct {
 	// many entries the filters matched — a filter that matches nothing in a
 	// non-empty archive still reports the tip.
 	PlannedThroughSeq uint64
+	// DIDTombstones is the §R4 DID-level tombstone snapshot over
+	// (afterSeq, PlannedThroughSeq], present only when the request set
+	// WantDIDTombstones and the server honored it (see DIDTombstonesIncluded).
+	DIDTombstones []DIDTombstone
+	// DIDTombstonesIncluded reports whether the server attached the
+	// DID-tombstone snapshot. It is the authoritative presence flag: an empty
+	// DIDTombstones with this true is a valid "no deletions in range" result,
+	// whereas this being false on a page-1 request that asked is a fatal
+	// fail-closed condition (a too-old server) — proceeding with no suppression
+	// would silently retain deleted accounts' records (design §R6.6).
+	DIDTombstonesIncluded bool
 	// Stats are server-side planner diagnostics (segments examined/matched,
 	// blocks matched, work entries). Useful for anti-vacuity assertions.
 	Stats PlanStats
@@ -102,6 +124,11 @@ type PlanRequest struct {
 	AfterSeq     uint64
 	HasBeforeSeq bool
 	BeforeSeq    uint64
+	// WantDIDTombstones requests the §R4 DID-tombstone start-snapshot. The
+	// engine sets it only on the FIRST planBackfill call of a fresh backfill;
+	// later pages omit it (the snapshot is held client-side for the whole
+	// backfill).
+	WantDIDTombstones bool
 }
 
 // ErrPlanTooLarge is returned by Plan when the server refuses the query
@@ -161,6 +188,9 @@ func planInput(req PlanRequest) *jetstream.JetstreamPlanBackfill_Input {
 	if req.HasBeforeSeq {
 		in.BeforeSeq = optInt64(req.BeforeSeq)
 	}
+	if req.WantDIDTombstones {
+		in.WantDidTombstones = gt.Some(true)
+	}
 	return in
 }
 
@@ -184,6 +214,24 @@ func planFromOutput(out *jetstream.JetstreamPlanBackfill_Output) (*Plan, error) 
 			return nil, err
 		}
 		plan.Entries = append(plan.Entries, entry)
+	}
+	// The DID-tombstone snapshot is present iff the server set the flag. Gate on
+	// the flag, never on len(DIDTombstones): an empty snapshot is a valid
+	// "nothing deleted in range" result, while the engine treats a missing flag
+	// on a page-1 request as fatal (design §R6.6 fail-closed).
+	plan.DIDTombstonesIncluded = out.DidTombstonesIncluded.HasVal() && out.DidTombstonesIncluded.Val()
+	if len(out.DidTombstones) > 0 {
+		plan.DIDTombstones = make([]DIDTombstone, 0, len(out.DidTombstones))
+		for i := range out.DidTombstones {
+			ts := &out.DidTombstones[i]
+			if ts.DID == "" {
+				return nil, fmt.Errorf("jetstream: planBackfill DID tombstone %d missing DID", i)
+			}
+			if ts.Seq < 0 {
+				return nil, fmt.Errorf("jetstream: planBackfill DID tombstone %q has negative seq %d", ts.DID, ts.Seq)
+			}
+			plan.DIDTombstones = append(plan.DIDTombstones, DIDTombstone{DID: ts.DID, Seq: uint64(ts.Seq)})
+		}
 	}
 	return plan, nil
 }

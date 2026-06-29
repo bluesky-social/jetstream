@@ -12,6 +12,7 @@ import (
 	"github.com/bluesky-social/jetstream"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -49,20 +50,39 @@ func writeSealedSegment(t *testing.T, segDir string, idx uint64, events ...segme
 // getSegment + getBlock) over a pre-built segments dir, on a real httptest
 // socket. It deliberately does NOT use a synctest bubble: the oracle package
 // allows exactly one bubble per process (owned by TestOracle_DefaultLifecycle),
-// so every other server-driving test runs on real sockets. Note there is NO
-// tombstone.Set wired in — step 3 adds the DID-tombstone snapshot to
-// planBackfill; until then the archive cannot tell a collection-filtered client
-// about the empty-collection account-delete.
-func serveArchive(t *testing.T, segDir string) string {
+// so every other server-driving test runs on real sockets.
+//
+// It wires a tombstone.Set populated from the on-disk stream, mirroring what the
+// running orchestrator maintains for compaction — this is the set planBackfill
+// snapshots for the §R4 DID-tombstone start-snapshot. The DID-level
+// account-delete D lands in it (keyed by DID), which is exactly what lets the
+// collection-filtered client suppress C without ever downloading D.
+func serveArchive(t *testing.T, dataDir, segDir string) string {
 	t.Helper()
 	m, err := manifest.Open(manifest.Options{
 		SegmentsDir: segDir,
 		Logger:      slog.New(slog.NewTextHandler(testWriter{t: t}, &slog.HandlerOptions{Level: slog.LevelWarn})),
 	})
 	require.NoError(t, err)
+
+	// Build the live tombstone set from the durable stream, the way the
+	// orchestrator does as it ingests (the active set holds the uncompacted tail;
+	// here nothing is compacted, so it holds every DID-level marker).
+	tombstones := tombstone.New()
+	full, err := ObserveSegments(dataDir)
+	require.NoError(t, err)
+	for _, oe := range EventsSortedBySeq(full) {
+		se := segment.Event{
+			Seq: oe.Seq, Kind: oe.Kind, DID: oe.DID,
+			Collection: oe.Collection, Rkey: oe.Rkey, Rev: oe.Rev, Payload: oe.Payload,
+		}
+		require.NoError(t, tombstones.Observe(&se))
+	}
+
 	srv := xrpcapi.New(xrpcapi.Config{
-		Src:    m,
-		Logger: slog.New(slog.NewTextHandler(testWriter{t: t}, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		Src:        m,
+		Logger:     slog.New(slog.NewTextHandler(testWriter{t: t}, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		Tombstones: tombstones,
 		Plan: xrpcapi.PlanConfig{
 			MaxDIDs:               xrpcapi.DefaultPlanMaxDIDs,
 			MaxCollections:        xrpcapi.DefaultPlanMaxCollections,
@@ -94,18 +114,12 @@ func serveArchive(t *testing.T, segDir string) string {
 // (folding the full on-disk stream, killer matched by DID) has C dead, the
 // client's filtered fold has C live.
 //
-// PER REVIEW DECISION (skip-with-step-3-ref): this test FAILS today because the
-// gap is real and unclosed. It was run once to capture that failure as the gate
-// evidence for step 3, then skipped here so the tree stays green between steps.
-// Step 3 (the DID-tombstone start-snapshot piggybacked on planBackfill page 1)
-// makes the client suppress C, at which point this test passes and the skip is
-// removed.
+// This was the step-3 gate: it FAILED until the DID-tombstone start-snapshot
+// landed (issue #175). The snapshot, piggybacked on planBackfill page 1, makes
+// the collection-filtered backfill suppress C (its DID was account-deleted at a
+// higher seq within the planned range), so the client now converges to ground
+// truth. The skip was removed when step 3 landed.
 func TestFoldConvergence_CollectionFilteredDIDTombstoneGap(t *testing.T) {
-	t.Skip("gated on step 3 (DID-tombstone start-snapshot); see issue #174. " +
-		"Reproduces the §R3 collection-filtered gap and FAILS until #3 lands " +
-		"(captured failure: client folds to a record ground truth DELETED — the " +
-		"empty-collection account-delete is never delivered to a collection-filtered " +
-		"backfill). Step 3's snapshot suppresses C; then remove this skip.")
 	t.Parallel()
 
 	dataDir := t.TempDir()
@@ -133,7 +147,7 @@ func TestFoldConvergence_CollectionFilteredDIDTombstoneGap(t *testing.T) {
 	writeSealedSegment(t, segDir, 0, createC)
 	writeSealedSegment(t, segDir, 1, deleteD)
 
-	baseURL := serveArchive(t, segDir)
+	baseURL := serveArchive(t, dataDir, segDir)
 
 	// Independent ground truth: fold the FULL on-disk stream (both segments).
 	// Never derived from the filtered client output (§R7).

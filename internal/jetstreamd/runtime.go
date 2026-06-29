@@ -447,6 +447,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		},
 		CacheMaxAge: opts.SegmentCacheMaxAge,
 		Overlay:     overlayCache,
+		Tombstones:  tombstones,
 		Plan: xrpcapi.PlanConfig{
 			MaxDIDs:               opts.PlanMaxDIDs,
 			MaxCollections:        opts.PlanMaxCollections,

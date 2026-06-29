@@ -14,6 +14,14 @@ import (
 // continuing.
 var ErrFatal = errors.New("jetstream: fatal stream error")
 
+// errSnapshotMissing is the §R6.6 fail-closed condition: the client requested
+// the §R4 DID-tombstone start-snapshot on page 1 but the server's response did
+// not include it (didTombstonesIncluded false — a too-old server). Proceeding
+// with an empty suppression set would silently retain the records of accounts
+// deleted within the planned range, so the engine treats this as fatal. Crash
+// over corruption.
+var errSnapshotMissing = errors.New("jetstream: server did not return the requested DID-tombstone snapshot (too-old server?); refusing to backfill without it to avoid retaining deleted accounts' records")
+
 // fatal wraps err so errors.Is(_, ErrFatal) reports true while preserving the
 // original error for unwrapping and message context.
 func fatal(err error) error {

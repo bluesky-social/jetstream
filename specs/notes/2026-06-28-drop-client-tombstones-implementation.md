@@ -392,7 +392,8 @@ failure**: `client stream folds to a record that ground truth DELETED: {did:plc:
 app.bsky.feed.post rkey} emitted_seq=1` — C downloaded, the empty-collection D never delivered to a
 collection-filtered plan. Per the review decision, the failure was captured once as gate evidence,
 then the test is `t.Skip`'d referencing #174/step-3 to keep the tree green; step 3 removes the
-skip. Verified: `just lint` (0 issues), `just test` (1675), `just test-long ./internal/oracle`,
+skip. **(Step 3 has since landed (#175): the skip is gone and this test now passes.)** Verified:
+`just lint` (0 issues), `just test` (1675), `just test-long ./internal/oracle`,
 explicit `TestOracle_DefaultLifecycle` (synctest, fast + swarm), `TestOracle_SameSeedTraceDeterminism`
 (20 deterministic sections identical), and `just oracle` (20s stress) all green.
 
@@ -483,7 +484,34 @@ retained, and the reactivation `#account` arrives on the live tail above `S`. A 
 Add a client-unit test for the DID-only suppression fold and the fail-closed path.
 
 **Verify.** `just test ./internal/client ./internal/xrpcapi ./internal/oracle`,
-`just test-long ./internal/oracle`, `just oracle`. **Status / notes.** _(unstarted)_
+`just test-long ./internal/oracle`, `just oracle`. **Status / notes.** ✅ **Done** (issue #175).
+Wire (`lexicons/.../planBackfill.json` + `just lexgen`): input `wantDidTombstones: boolean`;
+output `didTombstones: [#didTombstone{did,seq}]` + **`didTombstonesIncluded: boolean`** — I added
+the explicit presence flag rather than relying on empty-array-vs-absent (JSON can't distinguish
+them robustly), so the §R6.6 fail-closed gate is unambiguous. Server (`xrpcapi.Config.Tombstones`,
+`newPlanBackfillHandler`, `attachDIDTombstones`): when `wantDidTombstones` is set, snapshots
+`Set.SnapshotRange(afterSeq, plannedThroughSeq).DIDs` co-atomically with the plan, filtered to the
+requested DIDs server-side, and sets the flag true (even when empty); **fails loud (500)** if the
+set is unwired. Wired `Tombstones: tombstones` in `runtime.go`. Client
+(`planner.go`/`engine.go`/new `snapshot.go`): `PlanRequest.WantDIDTombstones`,
+`Plan.DIDTombstones`/`DIDTombstonesIncluded`; new `planBackfillStart` requests the snapshot on
+page 1, **fails closed** (`errSnapshotMissing`, wrapped `fatal`) if `!DIDTombstonesIncluded`, and
+captures the snapshot strictly **before** building the Downloader (snapshot-before-first-fetch
+ordering). `snapshotSelector` composes the matcher with DID-only seq-scoped suppression (drop a
+materialization row iff `snap[DID] > row.Seq`, strictly-greater so reactivation survives); applied
+to the backfill downloader ONLY, never the live sink. Tests: removed the `t.Skip` from the step-6
+gate (`TestFoldConvergence_CollectionFilteredDIDTombstoneGap` — now **passes**, with its
+`serveArchive` helper wiring a populated `tombstone.Set`); added planner wire-parse tests
+(request flag, snapshot decode, included-but-empty vs absent, malformed-entry rejection), client
+`snapshot_test.go` (suppression/reactivation/compose), an engine fail-closed test (both backfill
+paths), and xrpcapi server tests (gated, DID-filtered, seq-window, fail-closed-when-unwired).
+Verified: `just lint` (0), `just test` (1698), `just test-long ./internal/oracle`,
+`TestOracle_DefaultLifecycle` (default + swarm), `just oracle` (20s stress) all green.
+**⚠ §3↔§8 seam (carried to step 8):** the snapshot upper bound is currently
+`plannedThroughSeq` (single-plan == tip today). When step 8 splits continuation-cursor vs
+`sealedTipSeq`, `attachDIDTombstones` MUST re-pin the upper bound to `sealedTipSeq`, and step 10
+must pin `beforeSeq = S` across pages so the snapshot range `(afterSeq, S]` lines up with the
+downloaded bytes. Comment in `attachDIDTombstones` flags this.
 
 ---
 
@@ -819,7 +847,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 2. remove client tombstone suppression (#172)
 - [x] 7. seqs start at 1 (+ collapse presence machinery) (#173)
 - [x] 6. oracle fold-convergence + DID-tombstone delivery tests (gates 3) (#174)
-- [ ] 3. backfill DID-tombstone start-snapshot (fail-closed, ordering invariant)
+- [x] 3. backfill DID-tombstone start-snapshot (fail-closed, ordering invariant) (#175)
 - [ ] 4. remove getTombstones overlay endpoint (gated on 3)
 - [ ] 5. prune overlay-only tombstone API (keep SnapshotRange)
 - [ ] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation)

@@ -185,6 +185,93 @@ func TestPlanInputOmitsEmptyFilters(t *testing.T) {
 	require.False(t, hasBefore, "unset beforeSeq must be omitted")
 }
 
+// TestPlanRequestsDIDTombstonesOnlyWhenAsked guards the wire request flag: the
+// engine sets WantDIDTombstones only on a fresh backfill's first page, so the
+// input must carry wantDidTombstones=true exactly then and omit it otherwise.
+func TestPlanRequestsDIDTombstonesOnlyWhenAsked(t *testing.T) {
+	t.Parallel()
+	resp := `{"plannedThroughSeq":0,"segments":[],"stats":{},"didTombstonesIncluded":true,"didTombstones":[]}`
+
+	t.Run("asked", func(t *testing.T) {
+		t.Parallel()
+		ps := newPlanServer(t, http.StatusOK, resp)
+		_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0, WantDIDTombstones: true})
+		require.NoError(t, err)
+		in := ps.decodeInput(t)
+		require.Equal(t, true, in["wantDidTombstones"])
+	})
+
+	t.Run("not asked", func(t *testing.T) {
+		t.Parallel()
+		ps := newPlanServer(t, http.StatusOK, `{"plannedThroughSeq":0,"segments":[],"stats":{}}`)
+		_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+		require.NoError(t, err)
+		in := ps.decodeInput(t)
+		_, has := in["wantDidTombstones"]
+		require.False(t, has, "wantDidTombstones must be omitted when not requested")
+	})
+}
+
+// TestPlanParsesDIDTombstoneSnapshot covers the §R4 snapshot decode: the
+// presence flag and the entries are surfaced on the Plan, and the
+// included-but-empty case is distinct from absent.
+func TestPlanParsesDIDTombstoneSnapshot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("included with entries", func(t *testing.T) {
+		t.Parallel()
+		resp := `{"plannedThroughSeq":500,"segments":[],"stats":{},
+			"didTombstonesIncluded":true,
+			"didTombstones":[{"did":"did:plc:a","seq":100},{"did":"did:plc:b","seq":250}]}`
+		ps := newPlanServer(t, http.StatusOK, resp)
+		plan, err := ps.planner().Plan(context.Background(), PlanRequest{WantDIDTombstones: true})
+		require.NoError(t, err)
+		require.True(t, plan.DIDTombstonesIncluded)
+		require.ElementsMatch(t, []DIDTombstone{{DID: "did:plc:a", Seq: 100}, {DID: "did:plc:b", Seq: 250}}, plan.DIDTombstones)
+	})
+
+	t.Run("included but empty", func(t *testing.T) {
+		t.Parallel()
+		resp := `{"plannedThroughSeq":500,"segments":[],"stats":{},"didTombstonesIncluded":true,"didTombstones":[]}`
+		ps := newPlanServer(t, http.StatusOK, resp)
+		plan, err := ps.planner().Plan(context.Background(), PlanRequest{WantDIDTombstones: true})
+		require.NoError(t, err)
+		require.True(t, plan.DIDTombstonesIncluded, "an empty snapshot is still INCLUDED — distinct from absent")
+		require.Empty(t, plan.DIDTombstones)
+	})
+
+	t.Run("absent (too-old server)", func(t *testing.T) {
+		t.Parallel()
+		// No didTombstonesIncluded field at all: a pre-refactor server.
+		resp := `{"plannedThroughSeq":500,"segments":[],"stats":{}}`
+		ps := newPlanServer(t, http.StatusOK, resp)
+		plan, err := ps.planner().Plan(context.Background(), PlanRequest{WantDIDTombstones: true})
+		require.NoError(t, err, "the planner parses fine; the ENGINE fails closed on !DIDTombstonesIncluded")
+		require.False(t, plan.DIDTombstonesIncluded)
+		require.Empty(t, plan.DIDTombstones)
+	})
+}
+
+// TestPlanRejectsMalformedDIDTombstone guards the snapshot validation: a missing
+// DID or a negative seq is a corrupt response, not a silent drop.
+func TestPlanRejectsMalformedDIDTombstone(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		resp string
+	}{
+		{name: "missing did", resp: `{"plannedThroughSeq":10,"segments":[],"stats":{},"didTombstonesIncluded":true,"didTombstones":[{"did":"","seq":5}]}`},
+		{name: "negative seq", resp: `{"plannedThroughSeq":10,"segments":[],"stats":{},"didTombstonesIncluded":true,"didTombstones":[{"did":"did:plc:a","seq":-1}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ps := newPlanServer(t, http.StatusOK, tc.resp)
+			_, err := ps.planner().Plan(context.Background(), PlanRequest{WantDIDTombstones: true})
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestPlanTooLarge(t *testing.T) {
 	t.Parallel()
 	resp := `{"error":"PlanTooLarge","message":"too many entries"}`

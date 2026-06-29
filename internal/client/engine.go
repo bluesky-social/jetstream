@@ -355,23 +355,52 @@ func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (
 		}
 }
 
+// planBackfillStart runs the FIRST planBackfill call of a fresh backfill,
+// requesting the §R4 DID-tombstone start-snapshot, and returns the plan plus the
+// built suppression set. It fails closed (design §R6.6): if the snapshot was
+// requested but the server did not include it (a too-old server), that is fatal
+// — proceeding with an empty suppression set would silently retain the records
+// of accounts deleted within the planned range. An INCLUDED-but-empty snapshot
+// is the normal "nothing deleted in range" case and suppresses nothing.
+//
+// The snapshot is captured here, strictly BEFORE the caller constructs and runs
+// the Downloader, which is the hard snapshot-before-first-fetch ordering
+// constraint the race-freedom proof relies on (design §R6.2).
+func (e *Engine) planBackfillStart(ctx context.Context) (*Plan, didTombstoneSnapshot, error) {
+	req := e.cfg.Request
+	req.WantDIDTombstones = true
+	plan, err := e.planner.Plan(ctx, req)
+	if err != nil {
+		// A plan failure is terminal: there is no archive transport plan to run.
+		return nil, nil, fatal(err)
+	}
+	if !plan.DIDTombstonesIncluded {
+		return nil, nil, fatal(errSnapshotMissing)
+	}
+	return plan, newDIDTombstoneSnapshot(plan.DIDTombstones), nil
+}
+
 // Records in the active (unsealed) segment, seq in (plannedThroughSeq, M], are
 // only reachable via the live tail and are therefore NOT delivered by a dump.
 // That is the defining trade-off of BackfillOnly: a clean point-in-time slice
 // of the sealed archive, not the full up-to-the-instant stream.
 func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
-	// 1. Plan. Terminal on failure: there is no archive transport plan to run.
-	plan, err := e.planner.Plan(ctx, e.cfg.Request)
+	// 1. Plan + capture the §R4 DID-tombstone snapshot (fail-closed). Terminal on
+	// failure: there is no archive transport plan to run.
+	plan, snapshot, err := e.planBackfillStart(ctx)
 	if err != nil {
-		emitErr(fatal(err))
+		emitErr(err)
 		return
 	}
 
 	// 2. Download + emit in plan order. Rows are filtered (exact DID/collection/
-	// seq) before decode by the matcher. Backfill emits every matching row with no
-	// tombstone suppression — a folding consumer converges (design §5.1).
+	// seq) before decode by the matcher, then DID-only suppressed by the
+	// start-snapshot so a collection-filtered dump does not surface records of
+	// accounts deleted in range (the markers carry an empty collection and are
+	// never downloaded). Otherwise backfill emits every matching row and a
+	// folding consumer converges (design §5.1).
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
-	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
+	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newSnapshotSelector(e.matcher, snapshot))
 	dl.SetRecordMode(e.cfg.recordMode())
 	emit, _ := e.backfillEmitFunc(b, bf, dl)
 	_ = dl.Download(ctx, plan.Entries, emit)
@@ -396,13 +425,14 @@ func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bo
 // The record-stream handoff is at plannedThroughSeq: records in the active
 // (unsealed) segment above the sealed tip are not downloadable from the archive
 // and are delivered by the live tail instead. Backfill emits every matching row
-// with no tombstone suppression — a folding consumer converges (design §5.1).
+// except those a deleted account's §R4 start-snapshot suppresses; a folding
+// consumer converges (design §5.1, §R4).
 func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
-	// 1. Plan. A plan failure is terminal: there is no archive transport plan to
-	// execute.
-	plan, err := e.planner.Plan(ctx, e.cfg.Request)
+	// 1. Plan + capture the §R4 DID-tombstone snapshot (fail-closed). A plan
+	// failure is terminal: there is no archive transport plan to execute.
+	plan, snapshot, err := e.planBackfillStart(ctx)
 	if err != nil {
-		emitErr(fatal(err))
+		emitErr(err)
 		return
 	}
 
@@ -457,7 +487,11 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	// delivered synchronously inside Download — which returns only after the
 	// reassembler drains — so the cutover in phase 4 still installs the live forward
 	// path strictly AFTER the last backfill batch.
-	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
+	// The backfill download applies the start-snapshot's DID-only suppression on
+	// top of the matcher; the live sink (sink.onLive above) deliberately does NOT
+	// — post-sealed-tip events, including account reactivation, are authoritative
+	// and must never be suppressed (design §R4).
+	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, newSnapshotSelector(e.matcher, snapshot))
 	dl.SetRecordMode(e.cfg.recordMode())
 	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
 	derr := dl.Download(ctx, plan.Entries, emit)
