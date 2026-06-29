@@ -1121,3 +1121,78 @@ func TestEngineTooOldPingPongIsFatal(t *testing.T) {
 	// Bounded: maxRebackfillStalls connect attempts, give or take the first.
 	require.LessOrEqual(t, dials.Load(), int64(maxRebackfillStalls+2), "re-backfill cycles must be bounded")
 }
+
+// TestEngineLiveOnlyCursorTooOldIsFatal pins the pure-live (no-backfill) §14
+// contract: when a saved WithLiveCursor resolves below the server's lookback
+// floor, the terminal /subscribe-v2 400 maps to errLiveCursorTooOld, which
+// liveConsumer.Run returns WITHOUT routing through the batcher (it returns
+// before the reconnect-report emit). The pure-live path has no archive to
+// re-enter, so it must surface that error as fatal rather than letting the
+// iterator end silently (CLAUDE.md: no silent fallbacks) — a stale-cursor tail
+// that yields neither events nor an error leaves the caller unable to tell its
+// cursor must be reset/re-backfilled. Before the fix runLiveOnly discarded the
+// Run return with `_ =`, so the stream just ended clean.
+func TestEngineLiveOnlyCursorTooOldIsFatal(t *testing.T) {
+	t.Parallel()
+
+	// Every dial fails with the §14 too-old signal: a saved cursor aged below
+	// the floor will never become valid by reconnecting.
+	var dials atomic.Int64
+	dial := func(context.Context, string) (wsConn, error) {
+		dials.Add(1)
+		return nil, errLiveCursorTooOld
+	}
+	cfg := Config{
+		Host:           "https://h",
+		Backfill:       false,
+		LiveCursor:     42, // a non-zero saved resume cursor (not from-tip)
+		BatchSize:      1,
+		MaxBatchDelay:  time.Millisecond,
+		LiveBackoffMin: time.Millisecond,
+		Dial:           dial,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var (
+		mu      sync.Mutex
+		gotErr  error
+		batches int
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func([]Event) bool {
+				mu.Lock()
+				batches++
+				mu.Unlock()
+				return true
+			},
+			func(err error) bool {
+				mu.Lock()
+				if gotErr == nil {
+					gotErr = err
+				}
+				mu.Unlock()
+				return true
+			},
+		)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("live-only too-old engine did not return within 5s (silently looping?)")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.ErrorIs(t, gotErr, ErrFatal,
+		"a too-old saved cursor on the pure-live path must be surfaced as fatal, not ended silently")
+	require.ErrorIs(t, gotErr, errLiveCursorTooOld, "the fatal error must wrap the too-old cause")
+	require.Zero(t, batches, "no events should be delivered on a doomed-cursor live tail")
+}

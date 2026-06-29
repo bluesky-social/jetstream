@@ -218,7 +218,7 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	// /subscribe-v2 (the client does not forward wantedCollections as a hard
 	// filter), so the engine must drop non-matching events itself. A nil/empty
 	// matcher matches everything, so an unfiltered tail is unaffected.
-	_ = consumer.Run(liveCtx, func(ev *Event, _ []byte, err error) bool {
+	runErr := consumer.Run(liveCtx, func(ev *Event, _ []byte, err error) bool {
 		if err != nil {
 			return b.emitError(err)
 		}
@@ -227,6 +227,15 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 		}
 		return b.add(*ev)
 	})
+	// A terminal Run error (today only errLiveCursorTooOld) returns WITHOUT having
+	// routed through the batcher's error path (live.go returns it before the
+	// emit-on-error report). On the pure-live path there is no archive to
+	// re-enter, so the stale cursor is fatal: surface it rather than letting the
+	// iterator end silently (CLAUDE.md: no silent fallbacks). A ctx cancellation
+	// or an already-stopped consumer is a clean shutdown, not an error.
+	if runErr != nil && liveCtx.Err() == nil && !b.stopped() {
+		b.emitError(fatal(runErr))
+	}
 	stopFlusher()
 	if !b.stopped() {
 		b.flush()
