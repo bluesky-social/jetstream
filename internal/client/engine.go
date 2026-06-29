@@ -453,11 +453,16 @@ func (e *Engine) sweepSealedArchive(ctx context.Context, dl *Downloader, emit fu
 			sealedTip = plan.SealedTipSeq
 			pinned = true
 		}
-		e.recordPage(sealedTip, plan.PlannedThroughSeq)
-
 		if derr := dl.Download(ctx, plan.Entries, emit); derr != nil {
 			return sealedTip, false, derr // ctx cancelled
 		}
+		// Record the page only AFTER it is downloaded + emitted: Stats.Pages is
+		// documented as pages "downloaded" and ResidualGap as seqs "still to be
+		// downloaded", so a monitoring goroutine must never observe a page count
+		// or a shrunk ResidualGap for work not yet delivered (a plan-time record
+		// would falsely report convergence on the final page before the sweep's
+		// last download completes).
+		e.recordPage(sealedTip, plan.PlannedThroughSeq)
 		// backfillStopped() (not just b.stopped()): on the fast path the consumer
 		// stop is observed via bf.Emit returning false, NOT through the batcher.
 		if backfillStopped() {
