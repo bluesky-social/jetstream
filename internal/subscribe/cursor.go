@@ -21,7 +21,7 @@ import (
 //   - Any legitimate v1 cursor within the 36h window has
 //     time_us >= now() - 36h (~1.74e15 as of 2026-05-28), comfortably
 //     above the threshold.
-//   - v2 seq is a monotonic counter starting at 0. At sustained 100K
+//   - v2 seq is a monotonic counter starting at 1. At sustained 100K
 //     events/sec (10x current network throughput), reaching 1e15 takes
 //     >300 years.
 //

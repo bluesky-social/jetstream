@@ -28,15 +28,13 @@ func itoa(n uint64) string {
 }
 
 // drain replays frames with Seq strictly greater than from (the exclusive
-// lower bound). Use drainAll for the None "from the beginning, including seq 0"
-// case.
+// lower bound). Use drainAll for the None "from the beginning" case.
 func drain(t *testing.T, b LiveBuffer, from uint64) []LiveFrame {
 	t.Helper()
 	return drainAfter(t, b, gt.Some(from))
 }
 
-// drainAll replays every buffered frame, including the first-ever event at
-// seq 0 (the None lower bound).
+// drainAll replays every buffered frame (the None lower bound).
 func drainAll(t *testing.T, b LiveBuffer) []LiveFrame {
 	t.Helper()
 	return drainAfter(t, b, gt.None[uint64]())
@@ -88,14 +86,14 @@ func bufferContract(t *testing.T, mk func(t *testing.T) LiveBuffer) {
 		require.Empty(t, drain(t, b, 0))
 	})
 
-	// The None lower bound replays the first-ever event at seq 0; Some(0) skips
-	// it. This is the 0-based seq-space distinction the empty-archive cutover
-	// relies on (an exclusive Some(0) would swallow the first event).
-	t.Run("none replays seq 0, some(0) skips it", func(t *testing.T) {
+	// The None lower bound replays from the very beginning; Some(n) skips frames
+	// with Seq <= n. (Seqs start at 1, so this is the generic exclusive-bound
+	// contract; the buffer itself is seq-value agnostic.)
+	t.Run("none replays all, some(n) skips at-or-below", func(t *testing.T) {
 		b := mk(t)
-		require.NoError(t, b.Append([]LiveFrame{frame(0, "z"), frame(1, "a")}))
-		require.Equal(t, []uint64{0, 1}, frameSeqs(drainAll(t, b)), "None must include seq 0")
-		require.Equal(t, []uint64{1}, frameSeqs(drain(t, b, 0)), "Some(0) must skip seq 0")
+		require.NoError(t, b.Append([]LiveFrame{frame(1, "a"), frame(2, "b")}))
+		require.Equal(t, []uint64{1, 2}, frameSeqs(drainAll(t, b)), "None must replay all frames")
+		require.Equal(t, []uint64{2}, frameSeqs(drain(t, b, 1)), "Some(1) must skip seq 1")
 	})
 }
 

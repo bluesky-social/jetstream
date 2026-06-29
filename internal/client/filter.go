@@ -119,11 +119,10 @@ func (m *Matcher) Keep(ev *segment.Event) (bool, string) {
 func (m *Matcher) wantsSeq(seq uint64) bool {
 	// afterSeq is a RESUME-AFTER bound (seq > afterSeq), but only when one was
 	// actually requested. afterSeq==0 means "from the start of the archive"
-	// (WithAfterSeq(0)), and jetstream's seq space is 0-based — the first-ever
-	// event is seq 0 — so a bare seq <= afterSeq check would drop that first
-	// event. Gate on afterSeq>0 so 0 imposes no lower bound, matching the server
-	// (which omits the wire field and applies no bound when afterSeq is 0). See
-	// #111.
+	// (WithAfterSeq(0)). Seqs start at 1, so afterSeq==0 imposes no lower bound
+	// and the first-ever event (seq 1) is included, matching the server (which
+	// omits the wire field and applies no bound when afterSeq is 0). The
+	// afterSeq>0 gate keeps that 0-imposes-nothing behavior.
 	if m.afterSeq > 0 && seq <= m.afterSeq {
 		return false
 	}

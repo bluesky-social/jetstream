@@ -45,7 +45,7 @@ func (b *memLiveBuffer) Replay(ctx context.Context, after gt.Option[uint64]) ite
 
 		sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].Seq < snapshot[j].Seq })
 		for _, f := range snapshot {
-			// None replays everything (incl. seq 0); Some(n) skips Seq <= n.
+			// None replays everything (seqs start at 1); Some(n) skips Seq <= n.
 			if after.HasVal() && f.Seq <= after.Val() {
 				continue
 			}

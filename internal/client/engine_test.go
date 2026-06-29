@@ -227,14 +227,13 @@ func TestEngineActiveSegmentGap(t *testing.T) {
 	require.Equal(t, want, got, "no record gap across sealed->active->live; gap (10,15] must be live-delivered")
 }
 
-// TestEngineEmptyArchiveCutoverDeliversSeqZero is a regression guard for the
-// empty-archive seq-0 drop (the cutover analog of #111/#112). A freshly
-// bootstrapped server has NO sealed segments: planBackfill returns an empty
-// plan with plannedThroughSeq=0, so the backfill downloads nothing and the
-// live tail covers the WHOLE stream from seq 0. The first-ever network event
-// is seq 0, and it must be delivered exactly once — not swallowed by a dedup
-// floor seeded as if the (empty) backfill had already covered through seq 0.
-func TestEngineEmptyArchiveCutoverDeliversSeqZero(t *testing.T) {
+// TestEngineEmptyArchiveCutoverDeliversFirstEvent is a regression guard for the
+// empty-archive first-event drop. A freshly bootstrapped server has NO sealed
+// segments: planBackfill returns an empty plan with plannedThroughSeq=0, so the
+// backfill downloads nothing and the live tail covers the WHOLE stream from the
+// first-ever event (seq 1). It must be delivered exactly once — not swallowed by
+// a dedup floor seeded as if the (empty) backfill had already covered it.
+func TestEngineEmptyArchiveCutoverDeliversFirstEvent(t *testing.T) {
 	t.Parallel()
 	h := newEngineHarness(t)
 
@@ -243,22 +242,22 @@ func TestEngineEmptyArchiveCutoverDeliversSeqZero(t *testing.T) {
 	h.planned = 0
 	h.planEntry = nil
 
-	// The live tail carries the entire stream from the first-ever event (seq 0).
-	for i := uint64(0); i <= 3; i++ {
+	// The live tail carries the entire stream from the first-ever event (seq 1).
+	for i := uint64(1); i <= 4; i++ {
 		h.liveSteps = append(h.liveSteps, readStep{
 			data: liveCommitFrame(t, i, "did:plc:a", "create", "app.bsky.feed.post", "r"+itoaU(i), true),
 		})
 	}
 	h.installHandlers()
 
-	events := h.runUntilSeq(t, h.cfg(), 3)
+	events := h.runUntilSeq(t, h.cfg(), 4)
 
 	// Assert on the RAW (non-deduped) seq list so the test fails on BOTH a
-	// dropped seq 0 (the bug) AND a double-delivered seq 0 (the buffer drain
+	// dropped first event (the bug) AND a double-delivered one (the buffer drain
 	// and the post-flip forward path overlapping): the empty-archive cutover
 	// must deliver every event exactly once, in order.
-	require.Equal(t, []uint64{0, 1, 2, 3}, seqs(events),
-		"empty-archive cutover must deliver the first-ever live event (seq 0) exactly once")
+	require.Equal(t, []uint64{1, 2, 3, 4}, seqs(events),
+		"empty-archive cutover must deliver the first-ever live event (seq 1) exactly once")
 }
 
 // TestEngineBackfillOnly covers the one-time-dump path: with BackfillOnly the

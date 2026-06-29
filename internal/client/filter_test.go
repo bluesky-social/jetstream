@@ -36,19 +36,19 @@ func TestMatcherSeqWindow(t *testing.T) {
 	}
 }
 
-// TestMatcherAfterSeqZeroIncludesFirstEvent guards #111: jetstream's seq space
-// is 0-based (a fresh data dir's first event is seq 0), and WithAfterSeq(0)
-// means "from the start of the archive". An exclusive seq <= afterSeq check
-// would reject the genuine first event at seq 0, silently dropping it from
-// every backfill. afterSeq=0 must therefore impose NO lower bound, matching the
+// TestMatcherAfterSeqZeroIncludesFirstEvent: seqs start at 1, and
+// WithAfterSeq(0) means "from the start of the archive". afterSeq=0 must impose
+// NO lower bound so the genuine first event (seq 1) is included, matching the
 // server (which omits the wire field entirely when afterSeq is 0).
 func TestMatcherAfterSeqZeroIncludesFirstEvent(t *testing.T) {
 	t.Parallel()
 	m := NewMatcher(PlanRequest{AfterSeq: 0})
-	ev := commitRow(0, "did:plc:a", "app.bsky.feed.post")
-	require.True(t, m.Wants(&ev), "afterSeq=0 must include the first event at seq 0")
+	// Seqs start at 1; afterSeq=0 imposes no lower bound, so the first-ever
+	// event (seq 1) is included.
 	ev1 := commitRow(1, "did:plc:a", "app.bsky.feed.post")
-	require.True(t, m.Wants(&ev1), "afterSeq=0 must include seq 1")
+	require.True(t, m.Wants(&ev1), "afterSeq=0 must include the first event at seq 1")
+	ev2 := commitRow(2, "did:plc:a", "app.bsky.feed.post")
+	require.True(t, m.Wants(&ev2), "afterSeq=0 must include seq 2")
 }
 
 // TestMatcherAfterSeqPositiveStaysExclusive guards that a non-zero afterSeq

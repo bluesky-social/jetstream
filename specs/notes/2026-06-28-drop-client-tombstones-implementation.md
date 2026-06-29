@@ -287,7 +287,24 @@ site and collapse those that existed only to distinguish "seq 0" from "nothing":
 **No migration** (nothing deployed).
 **Verify.** `just test ./internal/ingest ./internal/client ./internal/subscribe`, then
 `just test ./internal/oracle` and `just test-long ./internal/oracle`.
-**Status / notes.** _(unstarted)_
+**Status / notes.** ✅ **Done** (issue #173). Writer: `loadNextSeq` now returns the
+present-bit; `Open` seeds `nextSeq=1` **in memory only** on a fresh dir (no persisted counter
+AND no recovered events), preserving the "Open never writes pebble for a fresh dir" invariant.
+Crash-recovery reconcile (`maxSeq+1`) and the running increments untouched;
+`initCompactionWatermarkFloor` untouched (its `else` already yields watermark 0 under
+`nextSeq=1`). Presence machinery collapsed: `live.go` `cursor`/`dedupFloor`/`lastSeq` are now
+plain `uint64`; the "live from tip" sentinel is an explicit `fromTip bool` (set by `runLiveOnly`
+when `LiveCursor==0`); `engine.go` dropped `backfillCoveredNothing` + the `dedupFloor`/
+`coveredThrough` Some/None splits; `livesink.go` `flipAndDrain` takes a plain `uint64` (converts
+to the buffer's `Option` at the `Replay` boundary, since 0↔None are now equivalent — no event
+is seq 0). Comments/docs updated (`docs/README.md:58`, `cursor.go`, `filter.go`, root buffer
+comments; cleared the #111/#112 anchors). Tests: ingest +1 shifts (delegated, verified — no
+production bugs, fresh-dir resume/reconcile tests kept their seeded-value semantics); client
+`live_test.go`/`engine_test.go`/`filter_test.go` re-pointed to seq 1 (incl. the from-empty
+backfill→live regression test `TestEngineEmptyArchiveCutoverDeliversFirstEvent` and the live
+analog `TestLiveConsumerDeliversFirstEvent`); root `buffer_test.go` generalized off the seq-0
+rationale. Verified: `just lint`, full `just test`, `just test-long ./internal/ingest`,
+`just test-long ./internal/oracle`, `just oracle` (20s stress) all green.
 
 ---
 
@@ -758,7 +775,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 
 - [x] 1. deliver #account/#identity/#sync on v1+v2 (#171)
 - [x] 2. remove client tombstone suppression (#172)
-- [ ] 7. seqs start at 1 (+ collapse presence machinery)
+- [x] 7. seqs start at 1 (+ collapse presence machinery) (#173)
 - [ ] 6. oracle fold-convergence + DID-tombstone delivery tests (gates 3)
 - [ ] 3. backfill DID-tombstone start-snapshot (fail-closed, ordering invariant)
 - [ ] 4. remove getTombstones overlay endpoint (gated on 3)

@@ -78,17 +78,15 @@ func (s *liveSink) onLive(ev *Event, raw []byte, err error) bool {
 
 // flipAndDrain transitions from buffering to forwarding: it drains buffered
 // frames after coveredThrough (the sealed tip the backfill already covered),
-// emitting each via emit (filtered, deduped), then installs the
-// forward path so subsequent live events go straight through. Held under mu so
-// no live event is lost or doubly-delivered across the flip.
+// emitting each via emit (filtered, deduped), then installs the forward path so
+// subsequent live events go straight through. Held under mu so no live event is
+// lost or doubly-delivered across the flip.
 //
-// coveredThrough is an optional so the 0-based seq space's 0 is not overloaded:
-// Some(seq) means the backfill emitted through seq (drain seq > coveredThrough,
-// and dedup post-flip overlap at or below it); None means the backfill covered
-// NOTHING (empty archive), so the buffer drains from the very beginning —
-// including the first-ever event at seq 0 — and the post-flip forward path has
-// no lower dedup floor until it has itself delivered an event.
-func (s *liveSink) flipAndDrain(ctx context.Context, coveredThrough gt.Option[uint64], emit func(Event) bool, emitErr func(error) bool) error {
+// coveredThrough is the sealed tip the backfill emitted through: the drain
+// yields seq > coveredThrough and the post-flip overlap dedups at or below it.
+// 0 means the backfill covered nothing (empty archive), so the buffer drains
+// from the very beginning and the first real event (seq >= 1) passes.
+func (s *liveSink) flipAndDrain(ctx context.Context, coveredThrough uint64, emit func(Event) bool, emitErr func(error) bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -103,11 +101,16 @@ func (s *liveSink) flipAndDrain(ctx context.Context, coveredThrough gt.Option[ui
 	}
 
 	// lastDelivered tracks the highest seq actually drained, as the post-flip
-	// dedup floor. Seed it from coveredThrough (None when the backfill covered
-	// nothing) so a drain that emits nothing leaves the floor unset and a
-	// post-flip seq 0 is not swallowed.
+	// dedup floor. Seeded from coveredThrough; 0 ("nothing covered") lets the
+	// first real event (seq >= 1) through.
 	lastDelivered := coveredThrough
-	for fr, err := range s.buf.Replay(ctx, coveredThrough) {
+	// The buffer's Replay takes an exclusive lower bound as an optional; a 0
+	// coveredThrough maps to None (replay everything) since no event is seq 0.
+	var replayAfter gt.Option[uint64]
+	if coveredThrough > 0 {
+		replayAfter = gt.Some(coveredThrough)
+	}
+	for fr, err := range s.buf.Replay(ctx, replayAfter) {
 		if err != nil {
 			return err
 		}
@@ -116,7 +119,7 @@ func (s *liveSink) flipAndDrain(ctx context.Context, coveredThrough gt.Option[ui
 			emitErr(fmt.Errorf("jetstream: corrupt buffered live frame seq=%d: %w", fr.Seq, decErr))
 			continue
 		}
-		lastDelivered = gt.Some(fr.Seq)
+		lastDelivered = fr.Seq
 		if !s.wantLive(&ev) {
 			continue
 		}
@@ -132,14 +135,14 @@ func (s *liveSink) flipAndDrain(ctx context.Context, coveredThrough gt.Option[ui
 	// Install the forward path. Dedup against the highest seq drained (or the
 	// coveredThrough floor) so a live event still sitting in the consumer's
 	// pipeline (already buffered AND about to arrive again post-flip) is not
-	// double-emitted. A None floor (empty archive, nothing drained) lets the
-	// first post-flip event — even seq 0 — through.
+	// double-emitted. A 0 floor (empty archive, nothing drained) lets the first
+	// real event (seq >= 1) through.
 	lastForwarded := lastDelivered
 	s.forward = func(ev Event) bool {
-		if lastForwarded.HasVal() && ev.Seq <= lastForwarded.Val() {
+		if lastForwarded > 0 && ev.Seq <= lastForwarded {
 			return true // dedup overlap
 		}
-		lastForwarded = gt.Some(ev.Seq)
+		lastForwarded = ev.Seq
 		return emit(ev)
 	}
 	s.forwarding = true

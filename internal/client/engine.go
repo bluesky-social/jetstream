@@ -199,19 +199,16 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	stopFlusher := e.startFlusher(liveCtx, b)
 	defer stopFlusher()
 	// LiveCursor is a pure-live resume point with 0 meaning "from the current
-	// tip" (the documented WithLiveCursor contract): map 0 -> None so the
-	// consumer omits the cursor, and a non-zero cursor -> Some(seq) to resume.
-	var liveCursor gt.Option[uint64]
-	if e.cfg.LiveCursor > 0 {
-		liveCursor = gt.Some(e.cfg.LiveCursor)
-	}
+	// tip" (the documented WithLiveCursor contract): 0 -> fromTip (omit the wire
+	// cursor), a non-zero cursor -> resume from it.
 	consumer := newLiveConsumer(liveConfig{
-		host:   e.cfg.Host,
-		cursor: liveCursor,
+		host:    e.cfg.Host,
+		cursor:  e.cfg.LiveCursor,
+		fromTip: e.cfg.LiveCursor == 0,
 		// Pure-live resume: a saved LiveCursor means the caller already holds
-		// events through it, so it is also the dedup floor. A None (live from
-		// tip) leaves the floor None so the first event delivered passes.
-		dedupFloor: liveCursor,
+		// events through it, so it is also the dedup floor. From-tip (0) leaves
+		// the floor 0 so the first event delivered passes.
+		dedupFloor: e.cfg.LiveCursor,
 		// Forward the filters so the server prunes server-side; the inline
 		// wantsLive matcher above remains the correctness backstop.
 		collections: e.cfg.Request.Collections,
@@ -417,32 +414,22 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	} else {
 		liveStart = 0
 	}
-	// An empty plan (no sealed segments matched, and the sealed tip is 0) means
-	// the backfill covered NOTHING: the live tail owns the entire stream from the
-	// start, including the first-ever event at seq 0. plannedThroughSeq==0 alone
-	// is ambiguous (it is also a single sealed event at seq 0), so we key off the
-	// plan having no entries AND a zero horizon — the unambiguous "nothing sealed"
-	// signal. In that case the dedup floor must be None (nothing delivered yet) so
-	// live seq 0 passes; otherwise the cutover already emitted through the sealed
-	// tip and Some(liveStart) is the correct floor.
-	backfillCoveredNothing := len(plan.Entries) == 0 && plan.PlannedThroughSeq == 0
-	dedupFloor := gt.Some(liveStart)
-	if backfillCoveredNothing {
-		dedupFloor = gt.None[uint64]()
-	}
+	// The cutover always replays from liveStart, and the dedup floor matches it.
+	// An empty archive is liveStart==0: the live tail owns the whole stream and
+	// the floor of 0 ("nothing delivered yet") lets the first real event (seq 1)
+	// through. A non-empty archive seeds the floor at liveStart so the
+	// at-least-once rewind-margin overlap is deduped. Under 1-based seqs no
+	// special "covered nothing" case is needed (design §R8).
+	dedupFloor := liveStart
 	sink := newLiveSink(e.cfg.Buffer, e.matcher, e.cfg.recordMode())
 	liveCtx, stopLive := context.WithCancel(ctx)
 	defer stopLive()
 	consumer := newLiveConsumer(liveConfig{
 		host: e.cfg.Host,
-		// The cutover always means "replay from liveStart", so the WIRE cursor is
-		// always present — including Some(0) when the sealed tip is below the
-		// rewind margin or the archive is empty. Some(0) sends cursor=0 (replay
-		// from the start) rather than the None "live from tip" sentinel, so the
-		// (plannedThroughSeq, tip] band is not dropped. See #112. The dedup floor
-		// is decoupled (see dedupFloor above): it is None for an empty archive so
-		// the first-ever live event at seq 0 is delivered, not swallowed.
-		cursor:     gt.Some(liveStart),
+		// The cutover always replays from liveStart (cursor=0 replays from the
+		// beginning for an empty/small archive), so the (plannedThroughSeq, tip]
+		// band is never dropped.
+		cursor:     liveStart,
 		dedupFloor: dedupFloor,
 		// Forward the filters so the server prunes the live tail server-side;
 		// liveSink.wantLive (the matcher) remains the backstop.
@@ -514,11 +501,10 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	stopFlusher := e.startFlusher(ctx, b)
 	defer stopFlusher()
 	emitLive := func(ev Event) bool { return b.add(ev) }
-	coveredThrough := gt.Some(plan.PlannedThroughSeq)
-	if backfillCoveredNothing {
-		coveredThrough = gt.None[uint64]()
-	}
-	if err := sink.flipAndDrain(ctx, coveredThrough, emitLive, b.emitError); err != nil {
+	// coveredThrough is the sealed tip the backfill emitted through (0 for an
+	// empty archive, which drains the buffer from the beginning). Under 1-based
+	// seqs no "covered nothing" special case is needed.
+	if err := sink.flipAndDrain(ctx, plan.PlannedThroughSeq, emitLive, b.emitError); err != nil {
 		// A cutover replay/append failure breaks the at-least-once handoff
 		// guarantee: surface it as fatal so the consumer aborts rather than
 		// continues against a truncated stream.

@@ -67,12 +67,13 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 
 // TestOpen_FreshDir creates a fresh segments dir and confirms Open
 // initializes seg_0000000000.jss with the 256-byte reserved header
-// and starts at nextSeq=0.
+// and seeds nextSeq=1 in memory (seq 0 is a reserved "nothing yet"
+// sentinel; the first-ever event is seq 1, design §R8).
 func TestOpen_FreshDir(t *testing.T) {
 	t.Parallel()
 	w := newTestWriter(t, Config{})
 
-	require.Equal(t, uint64(0), w.NextSeq())
+	require.Equal(t, uint64(1), w.NextSeq())
 	require.Equal(t, uint64(0), w.ActiveIndex())
 
 	path := filepath.Join(w.cfg.SegmentsDir, "seg_0000000000.jss")
@@ -87,7 +88,8 @@ func TestOpen_FreshDir(t *testing.T) {
 }
 
 // TestAppend_AllocatesMonotonicSeq pins the seq-allocation contract:
-// N appends produce ev.Seq values in [0, N) in call order.
+// N appends produce ev.Seq values in [1, N] in call order (seq 0 is a
+// reserved "nothing yet" sentinel; the first-ever event is seq 1).
 func TestAppend_AllocatesMonotonicSeq(t *testing.T) {
 	t.Parallel()
 	w := newTestWriter(t, Config{MaxEventsPerBlock: 64})
@@ -99,9 +101,9 @@ func TestAppend_AllocatesMonotonicSeq(t *testing.T) {
 			DID:       "did:plc:a",
 		}
 		require.NoError(t, w.Append(t.Context(), &ev))
-		require.Equal(t, uint64(i), ev.Seq, "append %d", i)
+		require.Equal(t, uint64(i+1), ev.Seq, "append %d", i)
 	}
-	require.Equal(t, uint64(10), w.NextSeq())
+	require.Equal(t, uint64(11), w.NextSeq())
 }
 
 // TestAppend_RejectsClosed pins the closed-writer behavior.
@@ -145,9 +147,9 @@ func TestClose_PersistsNextSeq(t *testing.T) {
 	store := w.cfg.Store
 	require.NoError(t, w.Close())
 
-	got, err := loadNextSeq(store, seqNextKey)
+	got, _, err := loadNextSeq(store, seqNextKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), got, "Close must persist nextSeq")
+	require.Equal(t, uint64(4), got, "Close must persist nextSeq")
 }
 
 // TestBlockFlush_AdvancesPebbleSeq confirms the durability ordering
@@ -166,8 +168,8 @@ func TestBlockFlush_AdvancesPebbleSeq(t *testing.T) {
 	val, closer, err := w.cfg.Store.Get([]byte(seqNextKey))
 	require.NoError(t, err)
 	defer func() { _ = closer.Close() }()
-	require.Equal(t, uint64(blockSize), binary.LittleEndian.Uint64(val))
-	require.Equal(t, uint64(blockSize), w.NextSeq())
+	require.Equal(t, uint64(blockSize+1), binary.LittleEndian.Uint64(val))
+	require.Equal(t, uint64(blockSize+1), w.NextSeq())
 }
 
 // TestBlockFlush_SegmentBytesGrow confirms activeBytes advances after
@@ -257,13 +259,13 @@ func TestResume_ExistingActive(t *testing.T) {
 		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
 		require.NoError(t, w1.Append(t.Context(), &ev))
 	}
-	require.Equal(t, uint64(blockSize), w1.NextSeq())
+	require.Equal(t, uint64(blockSize+1), w1.NextSeq())
 	require.NoError(t, w1.Close())
 
 	// Run 2: same dir, same store. Open must resume.
 	w2, err := Open(cfg)
 	require.NoError(t, err)
-	require.Equal(t, uint64(blockSize), w2.NextSeq(),
+	require.Equal(t, uint64(blockSize+1), w2.NextSeq(),
 		"resumed nextSeq must match the last block's high water mark")
 	require.Equal(t, uint64(0), w2.ActiveIndex(),
 		"still on segment 0; we have not rotated")
@@ -272,7 +274,7 @@ func TestResume_ExistingActive(t *testing.T) {
 	for i := range blockSize {
 		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:b"}
 		require.NoError(t, w2.Append(t.Context(), &ev))
-		require.Equal(t, uint64(blockSize+i), ev.Seq)
+		require.Equal(t, uint64(blockSize+1+i), ev.Seq)
 	}
 	require.NoError(t, w2.Close())
 }
@@ -368,12 +370,12 @@ func TestOpen_ReconcilesDriftedPebble(t *testing.T) {
 	w2, err := Open(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w2.Close() })
-	require.Equal(t, uint64(blockSize), w2.NextSeq(),
+	require.Equal(t, uint64(blockSize+1), w2.NextSeq(),
 		"reconcile: nextSeq must advance past the segment's max seq")
 
-	got, err := loadNextSeq(st, seqNextKey)
+	got, _, err := loadNextSeq(st, seqNextKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(blockSize), got,
+	require.Equal(t, uint64(blockSize+1), got,
 		"reconcile must persist the corrected value")
 }
 
@@ -418,7 +420,7 @@ func TestOpen_RecoversFromTornTail(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w2.Close() })
 
-	require.Equal(t, uint64(blockSize), w2.NextSeq())
+	require.Equal(t, uint64(blockSize+1), w2.NextSeq())
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
@@ -453,7 +455,7 @@ func TestAppend_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	require.Equal(t, uint64(goroutines*perGoroutine), w.NextSeq())
+	require.Equal(t, uint64(goroutines*perGoroutine+1), w.NextSeq())
 }
 
 // TestOpen_HonorsCustomSeqKey verifies that two Writers with
@@ -485,12 +487,12 @@ func TestOpen_HonorsCustomSeqKey(t *testing.T) {
 	for i := range 5 {
 		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "x.y", Rkey: "r", Rev: "1", Payload: []byte{0x01}}
 		require.NoError(t, wA.Append(t.Context(), &ev))
-		require.Equal(t, uint64(i), ev.Seq)
+		require.Equal(t, uint64(i+1), ev.Seq)
 	}
 	for i := range 3 {
 		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:b", Collection: "x.y", Rkey: "r", Rev: "1", Payload: []byte{0x02}}
 		require.NoError(t, wB.Append(t.Context(), &ev))
-		require.Equal(t, uint64(i), ev.Seq, "live writer's seq is independent of backfill writer's")
+		require.Equal(t, uint64(i+1), ev.Seq, "live writer's seq is independent of backfill writer's")
 	}
 
 	// Close the writers so their final nextSeq values are persisted
@@ -499,13 +501,13 @@ func TestOpen_HonorsCustomSeqKey(t *testing.T) {
 	require.NoError(t, wA.Close())
 	require.NoError(t, wB.Close())
 
-	persistedA, err := loadNextSeq(st, "seq/next")
+	persistedA, _, err := loadNextSeq(st, "seq/next")
 	require.NoError(t, err)
-	require.Equal(t, uint64(5), persistedA)
+	require.Equal(t, uint64(6), persistedA)
 
-	persistedB, err := loadNextSeq(st, "live_segments/seq/next")
+	persistedB, _, err := loadNextSeq(st, "live_segments/seq/next")
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), persistedB)
+	require.Equal(t, uint64(4), persistedB)
 }
 
 // TestOpen_DefaultSeqKey pins back-compat: zero-value SeqKey resolves
@@ -607,9 +609,9 @@ func TestAppendBatch_DurableCommitNotAbortedByCanceledContext(t *testing.T) {
 	require.Equal(t, "yes", string(got))
 	require.NoError(t, closer.Close())
 
-	persisted, err := loadNextSeq(st, w.cfg.SeqKey)
+	persisted, _, err := loadNextSeq(st, w.cfg.SeqKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), persisted)
+	require.Equal(t, uint64(2), persisted)
 }
 
 func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
@@ -642,14 +644,14 @@ func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 		{Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2", Rev: "1"},
 	}))
 
-	require.Equal(t, uint64(2), hookSeq)
+	require.Equal(t, uint64(3), hookSeq)
 	got, closer, err := st.Get([]byte("hook/ran"))
 	require.NoError(t, err)
 	require.Equal(t, "yes", string(got))
 	require.NoError(t, closer.Close())
-	persisted, err := loadNextSeq(st, w.cfg.SeqKey)
+	persisted, _, err := loadNextSeq(st, w.cfg.SeqKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(2), persisted)
+	require.Equal(t, uint64(3), persisted)
 }
 
 // TestFlush_OnAfterFlushErrorPropagates verifies that an error from
@@ -712,7 +714,7 @@ func TestSealActiveAndClose_SealsAndCloses(t *testing.T) {
 	persisted, closer, err := w.cfg.Store.Get([]byte(seqNextKey))
 	require.NoError(t, err)
 	defer func() { _ = closer.Close() }()
-	require.Equal(t, uint64(3), binary.LittleEndian.Uint64(persisted))
+	require.Equal(t, uint64(4), binary.LittleEndian.Uint64(persisted))
 }
 
 // TestSealActiveAndClose_Idempotent verifies the second call is a
@@ -836,7 +838,7 @@ func TestSealActiveAndClose_OnAfterSealErrorPropagatesAfterDurableSeal(t *testin
 	persisted, closer, getErr := st.Get([]byte(seqNextKey))
 	require.NoError(t, getErr)
 	defer func() { _ = closer.Close() }()
-	require.Equal(t, uint64(3), binary.LittleEndian.Uint64(persisted),
+	require.Equal(t, uint64(4), binary.LittleEndian.Uint64(persisted),
 		"hook failure happens after seq/next is persisted")
 	require.ErrorIs(t, w.Append(t.Context(), &segment.Event{IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:a"}), ErrClosed)
 }
@@ -867,12 +869,12 @@ func TestForceRotate_SealsAndOpensNext(t *testing.T) {
 	persisted, closer, err := w.cfg.Store.Get([]byte(seqNextKey))
 	require.NoError(t, err)
 	defer func() { _ = closer.Close() }()
-	require.Equal(t, uint64(3), binary.LittleEndian.Uint64(persisted))
+	require.Equal(t, uint64(4), binary.LittleEndian.Uint64(persisted))
 
 	// The writer remains usable on the next segment.
 	ev := segment.Event{IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:b"}
 	require.NoError(t, w.Append(t.Context(), &ev))
-	require.Equal(t, uint64(3), ev.Seq)
+	require.Equal(t, uint64(4), ev.Seq)
 }
 
 // TestForceRotate_EmptyActiveIsNoOp: rotating an empty active segment
@@ -918,7 +920,7 @@ func TestDrainDurability_CommitsHookWithoutPendingEvents(t *testing.T) {
 
 	require.NoError(t, w.DrainDurability(t.Context()))
 	require.True(t, gotForce)
-	require.Equal(t, uint64(0), gotNextSeq)
+	require.Equal(t, uint64(1), gotNextSeq)
 	select {
 	case err := <-afterDone:
 		require.NoError(t, err)
@@ -963,7 +965,7 @@ func TestDrainDurability_AsyncCommitsHookWithoutPendingEvents(t *testing.T) {
 	select {
 	case got := <-calls:
 		require.True(t, got.force)
-		require.Equal(t, uint64(0), got.nextSeq)
+		require.Equal(t, uint64(1), got.nextSeq)
 	default:
 		require.Fail(t, "durable hook did not run")
 	}
@@ -1010,8 +1012,8 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 
 	gotCalls := []durableCall{<-calls, <-calls}
 	require.ElementsMatch(t, []durableCall{
-		{nextSeq: 1, force: false},
-		{nextSeq: 1, force: true},
+		{nextSeq: 2, force: false},
+		{nextSeq: 2, force: true},
 	}, gotCalls)
 	require.Empty(t, calls)
 
@@ -1021,9 +1023,9 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 		require.Equal(t, "ok", string(got))
 		require.NoError(t, closer.Close())
 	}
-	persisted, err := loadNextSeq(st, seqNextKey)
+	persisted, _, err := loadNextSeq(st, seqNextKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), persisted)
+	require.Equal(t, uint64(2), persisted)
 
 	path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))
 	var gotEvents []segment.Event
@@ -1032,7 +1034,7 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 		return nil
 	}))
 	require.Len(t, gotEvents, 1)
-	require.Equal(t, uint64(0), gotEvents[0].Seq)
+	require.Equal(t, uint64(1), gotEvents[0].Seq)
 }
 
 func TestDurableBatchClose_RunsAfterPendingEvents(t *testing.T) {
@@ -1064,14 +1066,14 @@ func TestDurableBatchClose_RunsAfterPendingEvents(t *testing.T) {
 	require.NoError(t, w.Append(t.Context(), &ev))
 	require.NoError(t, w.Close())
 
-	require.Equal(t, durableCall{nextSeq: 1, force: true}, requireDurableCall(t, calls))
+	require.Equal(t, durableCall{nextSeq: 2, force: true}, requireDurableCall(t, calls))
 	got, closer, err := st.Get([]byte("metadata/close"))
 	require.NoError(t, err)
 	require.Equal(t, "ok", string(got))
 	require.NoError(t, closer.Close())
-	persisted, err := loadNextSeq(st, seqNextKey)
+	persisted, _, err := loadNextSeq(st, seqNextKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), persisted)
+	require.Equal(t, uint64(2), persisted)
 }
 
 func TestSealActiveAndClose_RunsDurableBatchHookAfterPendingEvents(t *testing.T) {
@@ -1103,7 +1105,7 @@ func TestSealActiveAndClose_RunsDurableBatchHookAfterPendingEvents(t *testing.T)
 	require.NoError(t, w.Append(t.Context(), &ev))
 	require.NoError(t, w.SealActiveAndClose())
 
-	require.Equal(t, durableCall{nextSeq: 1, force: true}, requireDurableCall(t, calls))
+	require.Equal(t, durableCall{nextSeq: 2, force: true}, requireDurableCall(t, calls))
 	got, closer, err := st.Get([]byte("metadata/seal-close"))
 	require.NoError(t, err)
 	require.Equal(t, "ok", string(got))
@@ -1147,8 +1149,8 @@ func TestWriter_DurableBatchAsyncCloseRunsAfterPendingEvents(t *testing.T) {
 
 	gotCalls := []durableCall{requireDurableCall(t, calls), requireDurableCall(t, calls)}
 	require.ElementsMatch(t, []durableCall{
-		{nextSeq: 1, force: false},
-		{nextSeq: 1, force: true},
+		{nextSeq: 2, force: false},
+		{nextSeq: 2, force: true},
 	}, gotCalls)
 	for _, key := range []string{"metadata/async-close/false", "metadata/async-close/true"} {
 		got, closer, err := st.Get([]byte(key))
@@ -1191,8 +1193,8 @@ func TestWriter_AsyncSealActiveAndCloseRunsDurableBatchHookAfterPendingEvents(t 
 
 	gotCalls := []durableCall{requireDurableCall(t, calls), requireDurableCall(t, calls)}
 	require.ElementsMatch(t, []durableCall{
-		{nextSeq: 1, force: false},
-		{nextSeq: 1, force: true},
+		{nextSeq: 2, force: false},
+		{nextSeq: 2, force: true},
 	}, gotCalls)
 	ins, err := segment.Inspect(filepath.Join(dir, "segments", SegmentFilename(0)))
 	require.NoError(t, err)
@@ -1294,7 +1296,7 @@ func TestForceRotate_ConcurrentWithAppends(t *testing.T) {
 	wg.Wait()
 	require.NoError(t, w.Close())
 
-	require.Equal(t, uint64(goroutines*perGoroutine), w.NextSeq())
+	require.Equal(t, uint64(goroutines*perGoroutine+1), w.NextSeq())
 
 	// Count events across all segments (sealed + trailing active).
 	files, err := SegmentFiles(w.cfg.SegmentsDir)
@@ -1491,8 +1493,8 @@ func TestAppend_OnAppendFiresBeforeSealVisibility(t *testing.T) {
 	}
 
 	require.Equal(t, uint64(1), w.ActiveIndex(), "the second append must have sealed segment 0")
-	require.Equal(t, []uint64{0, 1}, observed)
-	require.Equal(t, []uint64{0, 1}, observedAtSeal,
+	require.Equal(t, []uint64{1, 2}, observed)
+	require.Equal(t, []uint64{1, 2}, observedAtSeal,
 		"every event of the sealed segment must be observed before the seal is visible")
 }
 
@@ -1531,9 +1533,9 @@ func TestAppendBatch_AllocatesMonotonicSeq(t *testing.T) {
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 
 	for i := range events {
-		require.Equal(t, uint64(i), events[i].Seq, "event %d", i)
+		require.Equal(t, uint64(i+1), events[i].Seq, "event %d", i)
 	}
-	require.Equal(t, uint64(len(events)), w.NextSeq())
+	require.Equal(t, uint64(len(events)+1), w.NextSeq())
 }
 
 func TestAppendBatch_AsyncFlushPersistsBlocksAndSeqBeforeReturn(t *testing.T) {
@@ -1551,9 +1553,9 @@ func TestAppendBatch_AsyncFlushPersistsBlocksAndSeqBeforeReturn(t *testing.T) {
 	}
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 
-	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(4), persisted)
+	require.Equal(t, uint64(5), persisted)
 
 	require.NoError(t, w.Close())
 	path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))
@@ -1563,10 +1565,10 @@ func TestAppendBatch_AsyncFlushPersistsBlocksAndSeqBeforeReturn(t *testing.T) {
 		return nil
 	}))
 	require.Len(t, blocks, 2)
-	require.Equal(t, uint64(0), blocks[0][0].Seq)
-	require.Equal(t, uint64(1), blocks[0][1].Seq)
-	require.Equal(t, uint64(2), blocks[1][0].Seq)
-	require.Equal(t, uint64(3), blocks[1][1].Seq)
+	require.Equal(t, uint64(1), blocks[0][0].Seq)
+	require.Equal(t, uint64(2), blocks[0][1].Seq)
+	require.Equal(t, uint64(3), blocks[1][0].Seq)
+	require.Equal(t, uint64(4), blocks[1][1].Seq)
 }
 
 func TestAppendBatch_AsyncFlushRunsDurableBatchHook(t *testing.T) {
@@ -1588,8 +1590,8 @@ func TestAppendBatch_AsyncFlushRunsDurableBatchHook(t *testing.T) {
 			if force {
 				return nil, nil, fmt.Errorf("force = true")
 			}
-			if nextSeq != 2 {
-				return nil, nil, fmt.Errorf("nextSeq = %d, want 2", nextSeq)
+			if nextSeq != 3 {
+				return nil, nil, fmt.Errorf("nextSeq = %d, want 3", nextSeq)
 			}
 			if err := b.Set([]byte("async/hook"), []byte("ok"), nil); err != nil {
 				return nil, nil, fmt.Errorf("stage async/hook: %w", err)
@@ -1652,9 +1654,9 @@ func TestAppendBatch_AsyncFlushRotatesWhenFullIncludingPendingRows(t *testing.T)
 
 	require.Equal(t, uint64(1), w.ActiveIndex(),
 		"oversized async segment must rotate at end of AppendBatch, flushing the trailing partial block")
-	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), persisted,
+	require.Equal(t, uint64(4), persisted,
 		"seq/next must cover every appended event (incl. the flushed remainder) before the seal")
 
 	// The sealed segment must contain ALL three events: the full async
@@ -1712,7 +1714,7 @@ func TestAppendBatch_AsyncFlushConcurrentBatchesRemainContiguous(t *testing.T) {
 	require.Len(t, seqs, goroutines*perBatch)
 	slices.Sort(seqs)
 	for i, seq := range seqs {
-		require.Equal(t, uint64(i), seq)
+		require.Equal(t, uint64(i+1), seq)
 	}
 }
 
@@ -1788,7 +1790,7 @@ func TestAsyncFlush_ConcurrentProducersRotateWithoutSeqCorruption(t *testing.T) 
 	require.Len(t, seqs, total, "every concurrently-appended event survives rotation exactly once")
 	slices.Sort(seqs)
 	for i := range seqs {
-		require.Equal(t, uint64(i), seqs[i],
+		require.Equal(t, uint64(i+1), seqs[i],
 			"seqs contiguous across concurrent rotations (no gaps, no duplicates)")
 	}
 }
@@ -1808,9 +1810,9 @@ func TestWriter_AsyncCloseFlushesPendingBlockAndPersistsNextSeq(t *testing.T) {
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 	require.NoError(t, w.Close())
 
-	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), persisted)
+	require.Equal(t, uint64(4), persisted)
 
 	path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))
 	var got []segment.Event
@@ -1820,7 +1822,7 @@ func TestWriter_AsyncCloseFlushesPendingBlockAndPersistsNextSeq(t *testing.T) {
 	}))
 	require.Len(t, got, 3)
 	for i := range got {
-		require.Equal(t, uint64(i), got[i].Seq)
+		require.Equal(t, uint64(i+1), got[i].Seq)
 	}
 }
 
@@ -1838,9 +1840,9 @@ func TestWriter_AsyncSealActiveAndCloseSealsPendingBlock(t *testing.T) {
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 	require.NoError(t, w.SealActiveAndClose())
 
-	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(2), persisted)
+	require.Equal(t, uint64(3), persisted)
 
 	path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))
 	r, err := segment.Open(segment.ReaderConfig{Path: path})
@@ -1898,8 +1900,8 @@ func TestAppendBatch_OnAppendFiresBeforeSealVisibility(t *testing.T) {
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 
 	require.Equal(t, uint64(1), w.ActiveIndex(), "batch append must seal segment 0")
-	require.Equal(t, []uint64{0, 1}, observed)
-	require.Equal(t, []uint64{0, 1}, observedAtSeal,
+	require.Equal(t, []uint64{1, 2}, observed)
+	require.Equal(t, []uint64{1, 2}, observedAtSeal,
 		"every event of the sealed segment must be observed before the seal is visible")
 }
 
@@ -2058,7 +2060,7 @@ func TestAsyncFlush_RotatesUnderSustainedLoad(t *testing.T) {
 	require.Len(t, seqs, total, "every appended event must survive rotation")
 	slices.Sort(seqs)
 	for i := range seqs {
-		require.Equal(t, uint64(i), seqs[i], "seqs must be contiguous with no gaps or duplicates")
+		require.Equal(t, uint64(i+1), seqs[i], "seqs must be contiguous with no gaps or duplicates")
 	}
 }
 
@@ -2126,13 +2128,13 @@ func TestAsyncFlush_SeqIntegrityAcrossRotationAndReopen(t *testing.T) {
 	require.NoError(t, w1.Close())
 
 	nextAfterClose := w1.NextSeq()
-	require.Equal(t, uint64(n1), nextAfterClose, "nextSeq covers every appended event")
+	require.Equal(t, uint64(n1+1), nextAfterClose, "nextSeq covers every appended event")
 
 	// Reopen against the same dir + store: must resume without regressing or
 	// re-allocating any seq.
 	w2 := mkWriter()
-	require.Equal(t, uint64(n1), w2.NextSeq(),
-		"reopen must reconcile nextSeq to exactly the prior count (no gap, no rewind)")
+	require.Equal(t, uint64(n1+1), w2.NextSeq(),
+		"reopen must reconcile nextSeq to exactly the prior high water mark (no gap, no rewind)")
 	appendPrimedBatches(w2, 20)
 	require.NoError(t, w2.DrainDurability(t.Context()))
 	require.NoError(t, w2.Close())
@@ -2143,7 +2145,7 @@ func TestAsyncFlush_SeqIntegrityAcrossRotationAndReopen(t *testing.T) {
 		"every event across both runs must be present exactly once (no dups, no losses)")
 	slices.Sort(seqs)
 	for i := range seqs {
-		require.Equal(t, uint64(i), seqs[i],
+		require.Equal(t, uint64(i+1), seqs[i],
 			"contiguous seqs across rotation seams and the reopen boundary")
 	}
 }
@@ -2181,9 +2183,9 @@ func TestAsyncFlush_RotationIsSizeDrivenNotPipelineDepth(t *testing.T) {
 		"full segment must rotate even with a pending remainder and in-flight pipeline depth")
 	require.Equal(t, 1.0, testutil.ToFloat64(w.cfg.Metrics.SegmentsRotated))
 
-	persisted, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
+	persisted, _, err := loadNextSeq(w.cfg.Store, w.cfg.SeqKey)
 	require.NoError(t, err)
-	require.Equal(t, uint64(10), persisted,
+	require.Equal(t, uint64(11), persisted,
 		"seq/next must be committed for every event before the seal")
 
 	r, err := segment.Open(segment.ReaderConfig{Path: filepath.Join(w.cfg.SegmentsDir, SegmentFilename(0))})

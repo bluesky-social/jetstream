@@ -156,7 +156,7 @@ func (b *fileLiveBuffer) Replay(ctx context.Context, after gt.Option[uint64]) it
 			if !ok {
 				return false // corrupt line: stop at the recovery boundary
 			}
-			// None replays everything (incl. seq 0); Some(n) skips Seq <= n.
+			// None replays everything (seqs start at 1); Some(n) skips Seq <= n.
 			if after.HasVal() && fr.Seq <= after.Val() {
 				return true
 			}

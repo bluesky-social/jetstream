@@ -123,7 +123,7 @@ func Open(cfg Config) (*Writer, error) {
 		w.activeBytes = 0
 	}
 
-	pebbleSeq, err := loadNextSeq(cfg.Store, cfg.SeqKey)
+	pebbleSeq, seqPresent, err := loadNextSeq(cfg.Store, cfg.SeqKey)
 	if err != nil {
 		_ = w.active.Close()
 		return nil, err
@@ -138,6 +138,16 @@ func Open(cfg Config) (*Writer, error) {
 			_ = w.active.Close()
 			return nil, err
 		}
+	}
+	// Fresh archive (no persisted counter and no recovered events): seed
+	// nextSeq=1 so the first-ever event is seq 1, leaving seq 0 as a pure
+	// "nothing yet" sentinel (design §R8). Seeded in memory only — Open still
+	// never writes pebble for a fresh dir; the first block flush (or Close)
+	// persists the counter as usual. The crash-recovery reconcile above
+	// (maxSeq+1) is untouched: a recovered dir always has a counter or events,
+	// so reconciled is already >= 1 and this floor is a no-op there.
+	if !seqPresent && reconciled < 1 {
+		reconciled = 1
 	}
 	w.nextSeq = reconciled
 	w.durableNextSeq = reconciled
@@ -695,11 +705,12 @@ func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
 	return last.Idx, true, nil
 }
 
-// loadNextSeq reads the persisted seq/next counter for key. A missing
-// key is not an error; it means "fresh data dir" and reads as zero.
-func loadNextSeq(st *store.Store, key string) (uint64, error) {
-	v, _, err := st.GetUint64LE(key)
-	return v, err
+// loadNextSeq reads the persisted seq/next counter for key. present is false
+// when the key is absent ("fresh data dir"); the caller seeds nextSeq=1 in that
+// case so the first-ever event is seq 1 and seq 0 stays a pure "nothing yet"
+// sentinel (design §R8).
+func loadNextSeq(st *store.Store, key string) (val uint64, present bool, err error) {
+	return st.GetUint64LE(key)
 }
 
 // saveNextSeq durably persists the seq counter for key via pebble.Sync.
