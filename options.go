@@ -94,12 +94,14 @@ func (c *config) backfillRequested() bool {
 // ending in ".*" (e.g. "app.bsky.feed.*"). Empty or unset means all
 // collections.
 //
-// Setting a collection filter also suppresses Account and Identity events:
-// they carry no collection, so a collection-scoped subscriber does not receive
-// them. (Account deletions are still applied internally as tombstones, so
-// records for a deleted account are correctly suppressed — you just don't see
-// the Account event itself.) With no collection filter, Account and Identity
-// events are delivered, subject to WithDIDs. See issue #142.
+// A collection filter does NOT suppress DID-level events: Account, Identity,
+// and Sync carry no collection but always bypass the collection filter
+// (subject to WithDIDs), because they are a folding consumer's only signal to
+// purge a deleted account's records — hiding them would create a permanently
+// stale view. The client no longer suppresses deleted-account records during
+// backfill; consumers fold those markers themselves. With no collection
+// filter, Account and Identity events are likewise delivered, subject to
+// WithDIDs. See issue #142.
 func WithCollections(collections []string) Option {
 	return func(c *config) { c.collections = append([]string(nil), collections...) }
 }

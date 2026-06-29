@@ -2,7 +2,7 @@
 
 Date: 2026-06-28
 Branch: `tombstone-query-plan-refactor` (work continues here)
-Status: **plan — awaiting review** (not yet implemented)
+Status: **implementation in progress** (steps 1, 2, 7, 6, 3, and 4 landed; steps 5, 8, 9, 10, 11, and 12 remain)
 Design source of truth: `specs/notes/2026-06-28-drop-client-tombstones-design.md`
 Authoritative sections of the design: the Revision block **§R1–R8** (everything below
 the "READING ORDER" banner, §1–§16, is the reasoning trail only — §R wins on conflict).
@@ -538,7 +538,9 @@ reverted-snapshot comments in `foldconvergence_gate_test.go`, and overlay-mechan
 `compact_deletes.go:152`, plus the `tombstone.Set.SnapshotRange`/`Snapshot` methods —
 `overlay_source.go` was their last caller, now gone, so step 5 deletes the methods. Net −1407
 lines. Verified: `just lint` (0), `just test` (1659), `just test-long ./internal/oracle` (156),
-`just oracle` (20s stress) all green; final grep gate clean.
+`just oracle` (20s stress) all green. `getTombstones`/`GetTombstones` grep is clean; the
+`overlay` substring still matches the known step-5 Go comment/API leftovers listed above
+(`tombstone.go:3,49`, `compact_deletes.go:152`).
 
 ---
 
