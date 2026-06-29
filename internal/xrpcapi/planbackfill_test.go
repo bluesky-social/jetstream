@@ -23,6 +23,7 @@ const planURLPath = "/xrpc/network.bsky.jetstream.planBackfill"
 
 type planResp struct {
 	PlannedThroughSeq int64 `json:"plannedThroughSeq"`
+	SealedTipSeq      int64 `json:"sealedTipSeq"`
 	Segments          []struct {
 		Name     string `json:"name"`
 		Index    int64  `json:"index"`
@@ -276,6 +277,7 @@ func TestPlanBackfill_ReturnsBlockPlan(t *testing.T) {
 	})
 	require.Equal(t, http.StatusOK, status)
 	require.EqualValues(t, 4, out.PlannedThroughSeq)
+	require.EqualValues(t, 4, out.SealedTipSeq, "un-truncated page reports the tip on both cursors")
 	require.Len(t, out.Segments, 1)
 	seg := out.Segments[0]
 	require.Equal(t, ingest.SegmentFilename(0), seg.Name)
@@ -576,9 +578,13 @@ func TestPlanBackfill_InvalidJSON(t *testing.T) {
 	require.Equal(t, "InvalidRequest", readXRPCError(t, resp))
 }
 
-func TestPlanBackfill_PlanTooLarge(t *testing.T) {
+func TestPlanBackfill_TruncatesAndPaginatesOverWire(t *testing.T) {
 	t.Parallel()
 
+	// target on odd seqs → sparse non-adjacent blocks → three coalesced
+	// ranges. MaxEntries=2 truncates the first page after two ranges and
+	// reports a continuation cursor below the sealed tip; the client pages
+	// from there and the union covers everything.
 	cfg := defaultPlanTestConfig()
 	cfg.MaxEntries = 2
 	ts := newPlanTestServer(t, cfg,
@@ -589,17 +595,29 @@ func TestPlanBackfill_PlanTooLarge(t *testing.T) {
 		planEvent(5, "did:plc:target", "app.bsky.feed.post"),
 	)
 
-	resp := doPostJSON(t, ts.URL+planURLPath, map[string]any{"dids": []string{"did:plc:target"}})
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	require.Equal(t, "PlanTooLarge", readXRPCError(t, resp))
+	status, page1 := postPlan(t, ts, map[string]any{"dids": []string{"did:plc:target"}})
+	require.Equal(t, http.StatusOK, status, "truncation paginates, never 400s")
+	require.EqualValues(t, 2, page1.Stats.Entries, "first page capped at MaxEntries")
+	require.EqualValues(t, 5, page1.SealedTipSeq, "tip pinned at the true sealed tip")
+	require.Less(t, page1.PlannedThroughSeq, page1.SealedTipSeq, "page truncated below the tip")
+	require.EqualValues(t, 3, page1.PlannedThroughSeq, "cursor = last included block's MaxSeq")
+
+	status, page2 := postPlan(t, ts, map[string]any{
+		"dids":     []string{"did:plc:target"},
+		"afterSeq": page1.PlannedThroughSeq,
+	})
+	require.Equal(t, http.StatusOK, status)
+	require.EqualValues(t, 5, page2.PlannedThroughSeq, "second page reaches the tip")
+	require.EqualValues(t, 5, page2.SealedTipSeq)
+	require.NotEmpty(t, page2.Segments, "the un-included tail block is delivered on page 2")
 }
 
-func TestPlanBackfill_ZeroMaxEntriesDisablesCap(t *testing.T) {
+func TestPlanBackfill_ZeroMaxEntriesDisablesPagination(t *testing.T) {
 	t.Parallel()
 
-	// MaxEntries == 0 disables the cap: the same workload that returns
-	// PlanTooLarge under a positive limit must succeed unbounded.
+	// MaxEntries == 0 disables the per-page cap: the same workload that
+	// paginates under a positive limit returns in one un-truncated page whose
+	// continuation cursor already equals the sealed tip.
 	cfg := defaultPlanTestConfig()
 	cfg.MaxEntries = 0
 	ts := newPlanTestServer(t, cfg,
@@ -613,4 +631,6 @@ func TestPlanBackfill_ZeroMaxEntriesDisablesCap(t *testing.T) {
 	status, out := postPlan(t, ts, map[string]any{"dids": []string{"did:plc:target"}})
 	require.Equal(t, http.StatusOK, status)
 	require.NotEmpty(t, out.Segments)
+	require.EqualValues(t, 5, out.SealedTipSeq)
+	require.EqualValues(t, out.SealedTipSeq, out.PlannedThroughSeq, "un-truncated: cursor == tip")
 }

@@ -227,15 +227,11 @@ func (s *JetstreamPlanBackfill_BlockRange) UnmarshalJSONAt(data []byte, pos int)
 	}
 }
 
-// Error name constants for JetstreamPlanBackfill.
-const (
-	ErrJetstreamPlanBackfill_PlanTooLarge = "PlanTooLarge" // The plan would exceed the server's configured response/work entry limit.
-)
-
 // Precomputed JSON key tokens for JetstreamPlanBackfill_Output.
 var (
 	jsonKey_JetstreamPlanBackfill_Output_dollar_type       = []byte("\"$type\":")
 	jsonKey_JetstreamPlanBackfill_Output_plannedThroughSeq = []byte("\"plannedThroughSeq\":")
+	jsonKey_JetstreamPlanBackfill_Output_sealedTipSeq      = []byte("\"sealedTipSeq\":")
 	jsonKey_JetstreamPlanBackfill_Output_segments          = []byte("\"segments\":")
 	jsonKey_JetstreamPlanBackfill_Output_stats             = []byte("\"stats\":")
 )
@@ -260,6 +256,12 @@ func (s *JetstreamPlanBackfill_Output) AppendJSON(buf []byte) ([]byte, error) {
 	}
 	buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_plannedThroughSeq...)
 	buf = cbor.AppendJSONInt(buf, s.PlannedThroughSeq)
+	first = false
+	if !first {
+		buf = append(buf, ',')
+	}
+	buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_sealedTipSeq...)
+	buf = cbor.AppendJSONInt(buf, s.SealedTipSeq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
@@ -340,6 +342,11 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalJSONAt(data []byte, pos int) (in
 			if err != nil {
 				return 0, err
 			}
+		case "sealedTipSeq":
+			s.SealedTipSeq, pos, err = cbor.ReadJSONInt(data, pos)
+			if err != nil {
+				return 0, err
+			}
 		case "segments":
 			if !cbor.IsJSONNull(data, pos) {
 				pos, err = cbor.ReadJSONArrayStart(data, pos)
@@ -389,6 +396,7 @@ var (
 	cborKey_JetstreamPlanBackfill_Output_dollar_type       = cbor.AppendTextKey(nil, "$type")
 	cborKey_JetstreamPlanBackfill_Output_stats             = cbor.AppendTextKey(nil, "stats")
 	cborKey_JetstreamPlanBackfill_Output_segments          = cbor.AppendTextKey(nil, "segments")
+	cborKey_JetstreamPlanBackfill_Output_sealedTipSeq      = cbor.AppendTextKey(nil, "sealedTipSeq")
 	cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq = cbor.AppendTextKey(nil, "plannedThroughSeq")
 )
 
@@ -397,7 +405,7 @@ func (s *JetstreamPlanBackfill_Output) MarshalCBOR() ([]byte, error) {
 }
 
 func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
-	n := 3 + countExtra(s.extra, extraEncodingCBOR)
+	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
 	}
@@ -428,6 +436,9 @@ func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "sealedTipSeq", buf)
+		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_sealedTipSeq...)
+		buf = cbor.AppendInt(buf, s.SealedTipSeq)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "plannedThroughSeq", buf)
 		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq...)
 		buf = cbor.AppendInt(buf, s.PlannedThroughSeq)
@@ -454,6 +465,8 @@ func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
+		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_sealedTipSeq...)
+		buf = cbor.AppendInt(buf, s.SealedTipSeq)
 		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq...)
 		buf = cbor.AppendInt(buf, s.PlannedThroughSeq)
 	}
@@ -524,6 +537,20 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalCBORAt(data []byte, pos int) (in
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
+		case 12:
+			if string(data[keyStart:keyEnd]) == "sealedTipSeq" {
+				s.SealedTipSeq, pos, err = cbor.ReadInt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
 		case 17:
 			if string(data[keyStart:keyEnd]) == "plannedThroughSeq" {
 				s.PlannedThroughSeq, pos, err = cbor.ReadInt(data, pos)
@@ -552,7 +579,8 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalCBORAt(data []byte, pos int) (in
 
 type JetstreamPlanBackfill_Output struct {
 	LexiconTypeID     string                          `json:"$type,omitempty"`
-	PlannedThroughSeq int64                           `json:"plannedThroughSeq"` // Highest sealed seq covered by this plan, capped by beforeSeq when provided.
+	PlannedThroughSeq int64                           `json:"plannedThroughSeq"` // Continuation cursor: the highest sealed seq this page accounts for. When the page is truncated to...
+	SealedTipSeq      int64                           `json:"sealedTipSeq"`      // Pagination goal: the sealed-archive tip, capped by beforeSeq when provided. Stable across pages o...
 	Segments          []JetstreamPlanBackfill_Segment `json:"segments"`
 	Stats             JetstreamPlanBackfill_Stats     `json:"stats"`
 

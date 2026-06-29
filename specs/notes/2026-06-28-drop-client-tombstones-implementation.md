@@ -2,7 +2,7 @@
 
 Date: 2026-06-28
 Branch: `tombstone-query-plan-refactor` (work continues here)
-Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, and 5 landed; steps 8, 9, 10, 11, and 12 remain)
+Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, 5, and 8 landed; steps 9, 10, 11, and 12 remain)
 Design source of truth: `specs/notes/2026-06-28-drop-client-tombstones-design.md`
 Authoritative sections of the design: the Revision block **§R1–R8** (everything below
 the "READING ORDER" banner, §1–§16, is the reasoning trail only — §R wins on conflict).
@@ -666,7 +666,59 @@ tree compiles between steps.
   (tip still reported).
 
 **Verify.** `just test ./internal/manifest ./internal/xrpcapi`, then
-`just test ./internal/oracle`. **Status / notes.** _(unstarted)_
+`just test ./internal/oracle`. **Status / notes.** ✅ **Done** (#179).
+
+- **Planner (`internal/manifest/plan.go`).** Per-unit truncation: the segment loop
+  admits one work unit at a time (a whole-segment entry, or — in block mode — one coalesced
+  block range) and stops at the cap, so truncation can land mid-segment. `atCap()` checks
+  `Entries >= MaxEntries` **before** admitting the next unit, so the first unit of a page is
+  always admitted (Entries==0) even at `MaxEntries=1` → no zero-progress livelock. Continuation
+  cursor (`PlannedThroughSeq` on truncation) = `seg.Blocks[range.Last].MaxSeq` (block mode) or
+  `seg.Header.MaxSeq` (whole-segment mode) of the **last included unit** — never the enclosing
+  segment's `MaxSeq` after a mid-segment cut, which would skip the un-included tail blocks
+  forever. Added `SealedTipSeq` (= old `PlannedThroughSeq`: sealed tip capped by `beforeSeq`,
+  match-stable); `PlannedThroughSeq` now defaults to it and is overwritten only on truncation.
+  Per-page `Stats` (`SegmentsMatched`/`BlocksMatched`/`Entries`) count only what's in the page.
+- **Gap-free proof (locked by tests).** Blocks within a segment are seq-disjoint and
+  index-monotonic (writer assigns seqs under one lock; seal walks frames in ascending offset),
+  so a range's `MaxSeq=X` cleanly separates included (`<=X`) from not-yet (`MinSeq>X`); the next
+  page's exclusive `afterSeq=X` re-admits exactly the next block, and `X` strictly exceeds the
+  prior cursor whenever ≥1 unit was admitted.
+- **`ErrPlanTooLarge` removed end-to-end** (zero-tech-debt, nothing returns it post-change): the
+  `manifest` error var, the lexicon `PlanTooLarge` error + regenerated
+  `ErrJetstreamPlanBackfill_PlanTooLarge` const, the xrpcapi 400 mapping, and the client
+  `ErrPlanTooLarge` var + `isPlanTooLarge` helper + the wrapping branch. `ErrInvalidPlanRequest`
+  stays for malformed input (negative `MaxEntries`, inverted window, bad threshold). The lexgen
+  deletion *forced* the client cleanup to compile — confirming no live consumer remained.
+- **Lexicon + codegen.** `planBackfill.json` output gained required `sealedTipSeq`;
+  `plannedThroughSeq` re-described as the continuation cursor; `PlanTooLarge` error removed.
+  `just lexgen` regenerated `api/jetstream/jetstreamplanbackfill.go`.
+- **Wire/client.** `planOutput` populates `sealedTipSeq` (overflow-guarded via `int64FromUint64`);
+  client `Plan` surfaces `SealedTipSeq`, and `planFromOutput` rejects an incoherent
+  `plannedThroughSeq > sealedTipSeq` (and negative `sealedTipSeq`) so a buggy server can't make
+  the step-10 loop livelock or skip the tail. CLI `--plan-max-entries` usage reworded
+  (per-page cap → paginate, not refuse).
+- **Intermediate state.** The single-shot client path (`runBackfillThenLive`) is untouched and
+  keeps using `PlannedThroughSeq`; with the default `MaxEntries=100000` nothing truncates, so
+  `PlannedThroughSeq == SealedTipSeq` and the oracle/engine stay correct until step 10 adds the
+  pagination loop. Tree compiles and all tests pass throughout.
+- **Tests.** manifest: `TestPlanBackfill_TruncatesAtUnitBoundary` (block-range pagination, union
+  covers all, no skip/dup), `…_MidSegmentCutCursorIsBlockMaxSeq` (cursor strictly inside the
+  segment; full page-walk delivers every matching block once and strictly advances),
+  `…_OneUnitOverCapStillAdvances`, `…_TruncatesAtSegmentBoundary`, plus `SealedTipSeq` assertions
+  on the `beforeSeq`-cap and match-nothing cases; removed `…_PlanTooLargeDoesNotReturnTruncatedResult`.
+  xrpcapi: `…_TruncatesAndPaginatesOverWire` + `…_ZeroMaxEntriesDisablesPagination` (replaced the
+  `PlanTooLarge`-400 tests); `sealedTipSeq` on the wire. client: `TestPlanSurfacesContinuationCursorAndTip`,
+  `TestPlanRejectsCursorAboveTip`, `TestPlanXRPCErrorIsWrapped` (replaced the `ErrPlanTooLarge`
+  tests); all fixtures carry `sealedTipSeq`.
+- **Verify.** `just test ./internal/manifest ./internal/xrpcapi ./internal/client` (289), full
+  `just lint` (0) + `just test` (1661), `just test-long ./internal/oracle` (156), `just oracle`
+  (21s stress) — all green.
+
+**Carried to step 10:** the §12.2 open-item "PlanTooLarge lexicon error removal — confirm no
+consumer" is **resolved** (removed; lexgen-forced client cleanup proved no consumer). Step 10's
+`runBackfillThenLive` rewrite now consumes `Plan.SealedTipSeq` + the `PlannedThroughSeq`
+continuation cursor to drive the pagination loop.
 
 ---
 
@@ -887,8 +939,9 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
   still-open item; decide in the step-10 issue. Lean: lightweight `Stats()` on the engine.
 - **`tombstone_set_bytes` gauge ownership** (step 5) — confirm it is a compaction metric before
   keeping the `ApproxBytes`/`bytes` accounting.
-- **`PlanTooLarge` lexicon error removal** (step 8) — confirm no consumer expects it before
-  deleting the error from the lexicon + generated bindings.
+- **`PlanTooLarge` lexicon error removal** (step 8) — **RESOLVED (#179):** removed from the
+  lexicon + generated bindings + the manifest/xrpcapi/client surface; the lexgen deletion forced
+  the client cleanup to compile, proving no remaining consumer.
 
 ---
 
@@ -901,7 +954,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 3. DID-marker sentinel collections close the §R3 gap inline (#175; replaced the reverted start-snapshot)
 - [x] 4. remove getTombstones overlay endpoint (#177)
 - [x] 5. prune overlay-only tombstone API (#178)
-- [ ] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation)
+- [x] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation) (#179)
 - [ ] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged)
 - [ ] 10. client pagination loop + delete cutover buffer + 400 re-backfill
 - [ ] 11. Part B oracle scenarios + mutants

@@ -5,14 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net/http"
 	"strings"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/jcalabro/atmos"
-	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
 )
 
@@ -76,13 +74,6 @@ func newPlanBackfillHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handle
 		}
 		plan, err := src.PlanBackfill(req)
 		if err != nil {
-			if errors.Is(err, manifest.ErrPlanTooLarge) {
-				return nil, &xrpc.Error{
-					StatusCode: http.StatusBadRequest,
-					Name:       jetstream.ErrJetstreamPlanBackfill_PlanTooLarge,
-					Message:    "plan would exceed configured limit",
-				}
-			}
 			if errors.Is(err, manifest.ErrInvalidPlanRequest) {
 				// Defense in depth: planRequestFromInput already rejects the
 				// window/threshold conditions the planner guards, so this is
@@ -258,8 +249,13 @@ func planOutput(plan manifest.PlanBackfillResult) (*jetstream.JetstreamPlanBackf
 	if err != nil {
 		return nil, err
 	}
+	sealedTip, err := int64FromUint64(plan.SealedTipSeq)
+	if err != nil {
+		return nil, err
+	}
 	out := &jetstream.JetstreamPlanBackfill_Output{
 		PlannedThroughSeq: plannedThrough,
+		SealedTipSeq:      sealedTip,
 		Segments:          make([]jetstream.JetstreamPlanBackfill_Segment, 0, len(plan.Segments)),
 		Stats: jetstream.JetstreamPlanBackfill_Stats{
 			SegmentsExamined: int64(plan.Stats.SegmentsExamined),

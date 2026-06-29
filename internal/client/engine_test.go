@@ -84,8 +84,10 @@ func (h *engineHarness) planJSON() string {
 			`{"name":%q,"index":%d,"checksum":"deadbeefdeadbeef","minSeq":%d,"maxSeq":%d,"mode":"segment"}`,
 			s.name, s.index, s.minSeq, s.maxSeq))
 	}
-	return fmt.Sprintf(`{"plannedThroughSeq":%d,"segments":[%s],"stats":{"segmentsExamined":%d,"segmentsMatched":%d,"blocksMatched":0,"entries":%d}}`,
-		h.planned, strings.Join(segs, ","), len(h.planEntry), len(h.planEntry), len(h.planEntry))
+	// This harness models the single-shot (un-paginated) plan, so the
+	// continuation cursor already equals the sealed tip.
+	return fmt.Sprintf(`{"plannedThroughSeq":%d,"sealedTipSeq":%d,"segments":[%s],"stats":{"segmentsExamined":%d,"segmentsMatched":%d,"blocksMatched":0,"entries":%d}}`,
+		h.planned, h.planned, strings.Join(segs, ","), len(h.planEntry), len(h.planEntry), len(h.planEntry))
 }
 
 func (h *engineHarness) cfg() Config {

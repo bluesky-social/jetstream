@@ -37,12 +37,17 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["plannedThroughSeq", "segments", "stats"],
+          "required": ["plannedThroughSeq", "sealedTipSeq", "segments", "stats"],
           "properties": {
             "plannedThroughSeq": {
               "type": "integer",
               "minimum": 0,
-              "description": "Highest sealed seq covered by this plan, capped by beforeSeq when provided."
+              "description": "Continuation cursor: the highest sealed seq this page accounts for. When the page is truncated to fit the server's per-page entry limit it is the MaxSeq of the last included work unit; otherwise it equals sealedTipSeq. Fetch the next page with afterSeq=plannedThroughSeq (exclusive). The whole sealed archive has been consumed once plannedThroughSeq >= sealedTipSeq."
+            },
+            "sealedTipSeq": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Pagination goal: the sealed-archive tip, capped by beforeSeq when provided. Stable across pages of the same archive snapshot; pin it once and page until plannedThroughSeq reaches it."
             },
             "segments": {
               "type": "array",
@@ -51,10 +56,7 @@
             "stats": { "type": "ref", "ref": "#stats" }
           }
         }
-      },
-      "errors": [
-        { "name": "PlanTooLarge", "description": "The plan would exceed the server's configured response/work entry limit." }
-      ]
+      }
     },
     "segment": {
       "type": "object",

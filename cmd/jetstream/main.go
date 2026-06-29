@@ -293,7 +293,7 @@ func serveCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:    "plan-max-entries",
-				Usage:   "Maximum response work entries planBackfill may return before failing with PlanTooLarge. 0 disables the limit (unbounded plan size).",
+				Usage:   "Maximum response work entries a single planBackfill page may contain. When matched work exceeds it the plan is truncated at a work-unit boundary and the caller paginates via plannedThroughSeq. 0 disables pagination (one unbounded page).",
 				Sources: cli.EnvVars("JETSTREAM_PLAN_MAX_ENTRIES"),
 				Value:   xrpcapi.DefaultPlanMaxEntries,
 			},
