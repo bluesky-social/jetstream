@@ -2,7 +2,11 @@
 
 Date: 2026-06-28
 Branch: `tombstone-query-plan-refactor` (work continues here)
-Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, 5, and 8 landed; steps 9, 10, 11, and 12 remain)
+Status: **implementation in progress** (steps 1, 2, 7, 6, 3, 4, 5, 8, and 9 landed; steps 10, 11, and 12 remain).
+**NOTE:** step 9 flips `/subscribe-v2` to reject too-old cursors with a 400, which makes the
+oracle's `steady-state-client-backfill` lifecycle check **known-red until step 10** lands the
+client-side 400 re-backfill + `liveRewindMargin` removal (see step 9 status for the full
+root-cause). This is a deliberate, user-approved interim state.
 Design source of truth: `specs/notes/2026-06-28-drop-client-tombstones-design.md`
 Authoritative sections of the design: the Revision block **§R1–R8** (everything below
 the "READING ORDER" banner, §1–§16, is the reasoning trail only — §R wins on conflict).
@@ -752,7 +756,45 @@ path. Standalone server change.
 - v2 below-floor seq → `ErrCursorTooOld` (and the handler returns 400 with the floor in the
   body); v1 below-floor seq → still clamps (no error). The §16 "Stale-cursor signal" oracle
   test (step 11) is the end-to-end version.
-**Verify.** `just test ./internal/subscribe`. **Status / notes.** _(unstarted)_
+**Verify.** `just test ./internal/subscribe`. **Status / notes.** ✅ **Done** (#180).
+
+- **Resolver (`cursor.go`).** Added `CursorEnv.RejectBelowFloor bool` and the exported
+  `ErrCursorTooOld`. In the `ModeReplaySeq` path, when `startSeq < floorSeq` **and**
+  `RejectBelowFloor`, return `fmt.Errorf("%w: cursor %d below lookback floor %d; re-backfill
+  from your last seq", ErrCursorTooOld, n, floorSeq)` **instead of** clamping. With the flag
+  unset (v1) the clamp is byte-for-byte unchanged. The **timestamp path always clamps** under
+  both endpoints (legacy v1 timestamp translation contract); the asymmetry is commented at the
+  clamp site (finding #14).
+- **Handler (`handler.go`).** Added `Subscription.RejectCursorBelowFloor bool`, plumbed into the
+  `CursorEnv`. The existing pre-upgrade `if err != nil { http.Error(w, err.Error(), 400) }`
+  surfaces the floor seq in the body verbatim — no new mapping. A too-old reject is counted under
+  a distinct `too_old` metric label (v1 clamps stay under `clamped`, finding #14).
+- **Route (`runtime.go`).** `RejectCursorBelowFloor: true` on `/subscribe-v2` only; v1 default
+  false. Metric Help updated to list `too_old`.
+- **Tests.** `cursor_test.go`: `…SeqBelowFloorRejectedWhenRejectBelowFloor` (typed error carries
+  both seqs), `…SeqBelowFloorClampsWhenV1` (parity), `…TimeUSBelowFloorClampsEvenWhenRejectBelowFloor`
+  (asymmetry). `handler_integration_test.go`: `TestHandler_V2TooOldCursorReturns400` (400 + floor
+  in body), `TestHandler_V1TooOldCursorClampsAndUpgrades` (v1 clamps + upgrades), via a
+  `newCursorReplaySubscription` helper over a recent single-segment archive.
+- **Verify.** `just test ./internal/subscribe` (232) + `just lint` (0) green.
+
+> ⚠ **KNOWN-RED, INTENTIONAL until step 10** (user-approved 2026-06-29). Flipping the v2 route to
+> `RejectCursorBelowFloor: true` makes `just test`'s `TestOracle_DefaultLifecycle /
+> steady-state-client-backfill` fail. **Root cause** (diagnosed, not a bug in this step): the
+> oracle drives the *real* pre-step-10 client, which connects its live tail at
+> `plannedThroughSeq − liveRewindMargin` and **relies on the old silent clamp** when that dips
+> below the floor. In the oracle the floor is artificially high — all simulator events are
+> 2023-dated while `LookbackFloor` compares real wall-clock `now()`, so every sealed segment is
+> "older than the floor" and the floor collapses to the *last* segment's MinSeq — so the rewind
+> margin readily dips below it. The new v2 400 turns that silent clamp into fatal reconnect-churn.
+> **Step 10 fixes it** (its job per design §14 client-side): it (a) deletes `liveRewindMargin` and
+> connects exactly at `S = sealedTip` (≥ floor, no dip in the common case), and (b) handles a
+> genuine below-floor 400 by re-entering the pagination loop from `Batch.LastCursor()`. The
+> server-side oracle checks (`after-bootstrap`, `after-merge`) still PASS; only the real-client
+> backfill→live handoff churns. Step 9's own verify scope (`./internal/subscribe`) is green; the
+> plan's oracle-gating list (global rule) is steps 3/6/7/8/10/11 — step 9 is intentionally not
+> oracle-gated. **Do not "fix" this in production to satisfy the oracle — it is the step-10 cutover
+> rewrite's responsibility.**
 
 ---
 
@@ -955,7 +997,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 4. remove getTombstones overlay endpoint (#177)
 - [x] 5. prune overlay-only tombstone API (#178)
 - [x] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation) (#179)
-- [ ] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged)
+- [x] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged) (#180; oracle known-red until step 10)
 - [ ] 10. client pagination loop + delete cutover buffer + 400 re-backfill
 - [ ] 11. Part B oracle scenarios + mutants
 - [ ] 12. docs rewrite (relaxed cooperative contract)

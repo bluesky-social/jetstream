@@ -80,11 +80,28 @@ type CursorEnv struct {
 	// negative disables clamping (cursor still replays as far back as
 	// the manifest can serve).
 	Lookback time.Duration
+
+	// RejectBelowFloor selects the v2 too-old policy for the SEQ cursor
+	// path: when set, a seq cursor that resolves below the lookback floor
+	// returns ErrCursorTooOld instead of being silently clamped up to the
+	// floor, so the client learns it fell behind and can re-backfill rather
+	// than silently skipping (requestedSeq, floor]. Unset (the v1 default)
+	// keeps the legacy silent clamp. It governs ONLY the seq path; the
+	// timestamp path always clamps (legacy v1 timestamp translation), under
+	// both endpoints.
+	RejectBelowFloor bool
 }
 
 // ErrInvalidCursor wraps any user-visible parse failure of the
 // ?cursor= query parameter. The handler converts this into HTTP 400.
 var ErrInvalidCursor = errors.New("subscribe: invalid cursor")
+
+// ErrCursorTooOld is returned (only when CursorEnv.RejectBelowFloor is set —
+// the v2 policy) when a seq cursor resolves below the lookback floor. The
+// handler converts it into HTTP 400; its message carries both the requested
+// seq and the floor seq so the client can re-backfill from its last seq. v1
+// never returns this (it clamps instead).
+var ErrCursorTooOld = errors.New("subscribe: cursor too old")
 
 // ResolveCursor parses the raw query value and decides how the
 // connection should proceed. See cursor_test.go for the matrix of
@@ -124,6 +141,14 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 		if env.Manifest != nil && env.Lookback > 0 {
 			floorSeq, _ := env.Manifest.LookbackFloor(env.Lookback)
 			if startSeq < floorSeq {
+				// v2 (RejectBelowFloor) refuses a too-old seq cursor with a
+				// typed error rather than silently clamping, so the client
+				// learns it fell behind and re-backfills from its last seq
+				// instead of silently skipping (requestedSeq, floorSeq]. v1
+				// keeps the legacy silent clamp for wire compatibility.
+				if env.RejectBelowFloor {
+					return CursorPlan{}, fmt.Errorf("%w: cursor %d below lookback floor %d; re-backfill from your last seq", ErrCursorTooOld, n, floorSeq)
+				}
 				startSeq = floorSeq
 				plan.Clamped = true
 			}
@@ -146,6 +171,14 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 	}
 	// Apply lookback floor on top of translation. The floor is in
 	// seq units; if the translated seq is below it, we clamp.
+	//
+	// This path always clamps, even under RejectBelowFloor (v2): a timestamp
+	// cursor is the legacy jetstream-v1 translation, whose documented contract
+	// is that a too-old timestamp simply starts at the oldest retained event
+	// (2026-05-27-cursor-replay-design.md). RejectBelowFloor governs only the
+	// v2 SEQ path; rejecting a legacy timestamp would break that contract. The
+	// asymmetry is intentional (finding #14) — v1's silent clamp is bounded,
+	// deliberately-retained legacy debt, kept observable via the metric label.
 	if env.Manifest != nil && env.Lookback > 0 {
 		floorSeq, _ := env.Manifest.LookbackFloor(env.Lookback)
 		if plan.StartSeq < floorSeq {

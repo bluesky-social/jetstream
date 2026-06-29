@@ -409,6 +409,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Metrics:                   subscribeMetrics,
 		Lookback:                  opts.CursorLookback,
 		EmitResyncReplacementRows: true,
+		RejectCursorBelowFloor:    true,
 	}))
 
 	// XRPC surface: whole-file segment download + listing. The atmos

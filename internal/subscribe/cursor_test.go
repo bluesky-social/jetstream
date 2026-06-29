@@ -75,6 +75,101 @@ func TestResolveCursor_SeqBelowFloorClamped(t *testing.T) {
 	require.True(t, p.Clamped)
 }
 
+// TestResolveCursor_SeqBelowFloorRejectedWhenRejectBelowFloor is the §14/D5
+// v2 contract: with RejectBelowFloor set, a v2 seq cursor that resolves below
+// the lookback floor returns a typed ErrCursorTooOld carrying both the
+// requested seq and the floor seq — instead of the v1 silent clamp — so the
+// client can re-backfill from its last seq rather than silently skipping
+// (requestedSeq, floor].
+func TestResolveCursor_SeqBelowFloorRejectedWhenRejectBelowFloor(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
+		minSeq: 100, maxSeq: 199,
+		minIndexedAt: now - int64(50*time.Hour/time.Microsecond),
+		maxIndexedAt: now - int64(40*time.Hour/time.Microsecond),
+		eventCount:   10,
+	})
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
+		minSeq: 200, maxSeq: 299,
+		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:   10,
+	})
+	m := mustOpenManifest(t, dir)
+
+	_, err := subscribe.ResolveCursor("50", subscribe.CursorEnv{
+		Manifest:         m,
+		NextSeq:          300,
+		Lookback:         36 * time.Hour,
+		RejectBelowFloor: true,
+	})
+	require.ErrorIs(t, err, subscribe.ErrCursorTooOld)
+	// Both the requested seq and the floor seq must be in the message so the
+	// client can log how far behind it was and re-backfill from its last seq.
+	require.Contains(t, err.Error(), "50")
+	require.Contains(t, err.Error(), "200")
+}
+
+// TestResolveCursor_SeqBelowFloorClampsWhenV1 pins the v1 parity guarantee:
+// with RejectBelowFloor unset (the v1 default), a below-floor seq cursor is
+// still silently clamped to the floor with no error — the legacy jetstream-v1
+// wire contract is unchanged.
+func TestResolveCursor_SeqBelowFloorClampsWhenV1(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
+		minSeq: 200, maxSeq: 299,
+		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:   10,
+	})
+	m := mustOpenManifest(t, dir)
+
+	p, err := subscribe.ResolveCursor("50", subscribe.CursorEnv{
+		Manifest: m,
+		NextSeq:  300,
+		Lookback: 36 * time.Hour,
+		// RejectBelowFloor defaults false (v1).
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeReplaySeq, p.Mode)
+	require.Equal(t, uint64(200), p.StartSeq)
+	require.True(t, p.Clamped)
+}
+
+// TestResolveCursor_TimeUSBelowFloorClampsEvenWhenRejectBelowFloor pins the
+// intentional asymmetry: RejectBelowFloor governs only the v2 SEQ path. A
+// timestamp cursor (v1-style legacy translation) keeps clamping under both
+// endpoints, because rejecting a legacy timestamp would break the v1 contract
+// that a too-old timestamp simply starts at the oldest retained event.
+func TestResolveCursor_TimeUSBelowFloorClampsEvenWhenRejectBelowFloor(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
+		minSeq: 100, maxSeq: 199,
+		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxIndexedAt: now - int64(5*time.Hour/time.Microsecond),
+		eventCount:   10,
+	})
+	m := mustOpenManifest(t, dir)
+
+	cursor := now - int64(72*time.Hour/time.Microsecond)
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(cursor, 10), subscribe.CursorEnv{
+		Manifest:         m,
+		NextSeq:          200,
+		Lookback:         36 * time.Hour,
+		RejectBelowFloor: true,
+	})
+	require.NoError(t, err, "timestamp path never rejects, even under RejectBelowFloor")
+	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
+	require.True(t, p.Clamped)
+	require.Equal(t, uint64(100), p.StartSeq)
+}
+
 func TestResolveCursor_SeqAboveFloorPreserved(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

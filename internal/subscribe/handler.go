@@ -56,6 +56,12 @@ type Subscription struct {
 	// /subscribe-v2. The default false preserves Jetstream v1 behavior by
 	// advancing over Sync 1.1 resync replacement rows without emitting them.
 	EmitResyncReplacementRows bool
+
+	// RejectCursorBelowFloor enables the v2 too-old policy: a seq cursor that
+	// resolves below the lookback floor returns a pre-upgrade HTTP 400 carrying
+	// the floor seq, instead of being silently clamped. Set true on
+	// /subscribe-v2; the default false preserves v1's legacy silent clamp.
+	RejectCursorBelowFloor bool
 }
 
 func (d Subscription) writer() *ingest.Writer {
@@ -163,12 +169,19 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		}
 		resolveStart := time.Now()
 		plan, err := ResolveCursor(rawCursor, CursorEnv{
-			Manifest: deps.Manifest,
-			NextSeq:  deps.writer().NextSeq(),
-			Lookback: deps.Lookback,
+			Manifest:         deps.Manifest,
+			NextSeq:          deps.writer().NextSeq(),
+			Lookback:         deps.Lookback,
+			RejectBelowFloor: deps.RejectCursorBelowFloor,
 		})
 		deps.Metrics.observeCursorResolveSeconds(time.Since(resolveStart).Seconds())
 		if err != nil {
+			// A too-old v2 seq cursor is a distinct, expected signal (the client
+			// re-backfills), not a malformed request; label it separately so it
+			// stays visible apart from parse-error 400s.
+			if errors.Is(err, ErrCursorTooOld) {
+				deps.Metrics.incCursorRequests("too_old")
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

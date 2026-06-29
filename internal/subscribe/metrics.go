@@ -100,7 +100,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		CursorRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "cursor_requests_total",
-			Help: "Number of /subscribe connections by cursor resolution mode. Mode is one of: live, seq, time_us, clamped, disabled, unavailable.",
+			Help: "Number of /subscribe connections by cursor resolution mode. Mode is one of: live, seq, time_us, clamped, disabled, unavailable, too_old (v2 seq cursor below the lookback floor, rejected with HTTP 400).",
 		}, []string{"mode"}),
 		CursorResolveSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
