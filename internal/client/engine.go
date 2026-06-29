@@ -58,8 +58,8 @@ type Config struct {
 	MaxBatchDelay time.Duration
 	Concurrency   int
 	Buffer        Buffer
-	// XRPC drives the short XRPC negotiation calls (getTombstones,
-	// planBackfill). BulkXRPC drives the large getSegment/getBlock downloads;
+	// XRPC drives the short XRPC negotiation calls (planBackfill).
+	// BulkXRPC drives the large getSegment/getBlock downloads;
 	// it gets bulk-transfer HTTP tuning (no short wall-clock timeout). When
 	// BulkXRPC is nil the engine reuses XRPC. See design note §5.1.
 	XRPC     *xrpc.Client

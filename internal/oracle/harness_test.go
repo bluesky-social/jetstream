@@ -184,8 +184,8 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	}
 
 	// The runtime's public surface is served over a pipe-backed listener; the
-	// observer tier (client backfill, typed backfill, overlay fetch) reaches it
-	// through this listener's in-process client. Debug listener likewise.
+	// observer tier (client backfill, typed backfill) reaches it through this
+	// listener's in-process client. Debug listener likewise.
 	runtimePublicLn := newPipeListener()
 	runtimeDebugLn := newPipeListener()
 	obsClient := runtimePublicLn.httpClient()
@@ -227,7 +227,6 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		CursorBlockIndexCacheSize: 32,
 		CompactionInterval:        time.Hour,
 		CompactionTombstoneCap:    1,
-		OverlayRebuildInterval:    10 * time.Millisecond,
 		BarrierBeforeCutover:      bootstrapTraffic.WaitDelivered,
 		BarrierAfterBootstrap:     afterBootstrap.Barrier,
 		BarrierAfterMerge:         afterMerge.Barrier,
@@ -370,9 +369,8 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		"steady compaction watermark did not advance: mode=%s seed=%d after_merge_watermark=%d steady_watermark=%d",
 		cfg.Mode, cfg.Seed, afterMergeCompaction.Watermark, steadyCompaction.Watermark)
 	// Client-driven historical observation (#77): drive the REAL public client
-	// through the full archive path (plan -> segment/block download -> overlay
-	// suppression -> live cutover) and assert the compaction contract on what
-	// it replayed. This replaces the bespoke /subscribe?cursor=0 whole-archive
+	// through the full archive path (plan -> segment/block download -> live
+	// cutover) and assert the compaction contract on what it replayed. This replaces the bespoke /subscribe?cursor=0 whole-archive
 	// replay (the live-tail-transport misuse for sealed history #77 flagged,
 	// and the leading cause of the served CheckCompacted flakiness that #94's
 	// bisection was built to triage). It runs ALONGSIDE the direct segment

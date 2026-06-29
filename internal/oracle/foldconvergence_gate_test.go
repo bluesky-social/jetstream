@@ -143,9 +143,9 @@ func TestFoldConvergence_CollectionFilteredDIDTombstoneGap(t *testing.T) {
 
 	// Drive the real collection-filtered client as a one-shot archive dump over
 	// (0, tip]. Backfill-only is the deterministic surface: it touches only the
-	// archive XRPC endpoints (no live tail), and exercises step 3's
-	// runBackfillOnly snapshot path. D is below the tip, so even the live tail
-	// would never re-deliver it — backfill-only loses nothing the gap test needs.
+	// archive XRPC endpoints (no live tail), and exercises step 3's inline
+	// sentinel path. D is below the tip, so even the live tail would never
+	// re-deliver it — backfill-only loses nothing the gap test needs.
 	client, err := jetstream.Subscribe(baseURL,
 		jetstream.WithCollections([]string{gateCollection}),
 		jetstream.WithAfterSeq(0),
@@ -166,11 +166,13 @@ func TestFoldConvergence_CollectionFilteredDIDTombstoneGap(t *testing.T) {
 		}
 	}
 
-	// THE GATE: until step 3, the filtered client folds to C-live while ground
-	// truth (killer matched by DID) folds to C-dead. After step 3 the
-	// start-snapshot suppresses C and both converge to empty.
+	// THE GATE: without step 3 the filtered client folds to C-live while ground
+	// truth (killer matched by DID) folds to C-dead. With the sentinel index, the
+	// account-delete D is selected under the collection filter and delivered
+	// inline; the client folds C out and both converge.
 	require.NoError(t,
 		CheckFoldConvergence(emitted, full, []string{gateCollection}),
 		"collection-filtered backfill must converge to ground truth: the DID-level "+
-			"account-delete must suppress the victim's in-scope record (step 3 snapshot)")
+			"account-delete (selected via the $account sentinel) must fold out the "+
+			"victim's in-scope record")
 }

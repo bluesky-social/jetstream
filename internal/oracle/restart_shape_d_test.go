@@ -11,8 +11,9 @@ import (
 // (specs/notes/2026-06-20-restart-tier-intermediates-plan.md §6): a record
 // created, deleted, then RECREATED on the same rkey at a higher seq. The
 // seam it proves is record-level no-permanent-tombstone (docs/README.md:358):
-// the overlay mask is half-open (seq < tombstone.seq), so the recreate
-// ABOVE the tombstone is not masked and the record reconstructs as present.
+// the compaction tombstone mask is half-open (seq < tombstone.seq), so the
+// recreate ABOVE the tombstone is not masked and the record reconstructs as
+// present.
 //
 // Red-first power test: with the recreate row removed, reconstruction must
 // show the record ABSENT — i.e. the recreate is the only thing making it

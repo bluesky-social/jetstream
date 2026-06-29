@@ -46,15 +46,6 @@ func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
 	require.ErrorContains(t, err, "SegmentCacheMaxAge must be >= 0")
 }
 
-func TestOptionsValidateRejectsNegativeOverlayRebuildInterval(t *testing.T) {
-	t.Parallel()
-
-	opts := testOptions(t)
-	opts.OverlayRebuildInterval = -time.Second
-	_, err := Build(t.Context(), opts)
-	require.ErrorContains(t, err, "OverlayRebuildInterval must be >= 0")
-}
-
 func TestOptionsValidateRejectsNegativeBackfillWorkers(t *testing.T) {
 	t.Parallel()
 

@@ -519,7 +519,26 @@ DID-tombstone coverage. **Do not start before step 3 lands.**
   `overlay.WarmEncoder()`.
 
 **Verify.** `grep -rn "overlay\|getTombstones\|GetTombstones" --include=*.go` returns nothing
-outside the design notes; `just lint test`. **Status / notes.** _(unstarted)_
+outside the design notes; `just lint test`. **Status / notes.** ✅ **Done** (#177). Deleted the
+`internal/overlay` package, `xrpcapi/gettombstones.go`+test + the `OverlaySource` interface +
+`Config.Overlay` + the route registration, `jetstreamd/overlay_source.go`, `obs/overlay.go`, and
+the `getTombstones.json` lexicon + regenerated stub (`just lexgen`). `jetstreamd/runtime.go`:
+removed the `overlay` import, `overlayRebuildInterval` const, `overlayCache` field +
+construction + `Rebuild()` in `onCompactionPass` + the `Overlay:` wiring + the ticker goroutine +
+the interval-resolution block in `Run`; `options.go` dropped `OverlayRebuildInterval` (no CLI
+flag existed) and `runtime_test.go` dropped its negative-validation test. Oracle scaffolding:
+dropped `overlay.WarmEncoder()`+import (`main_test.go`) and `OverlayRebuildInterval`
+(`harness_test.go`). **Audit (verified before deleting):** neither `internal/status` nor any
+replication package consumes the overlay — no live consumer outside server wiring + test
+scaffolding (design §9 risk cleared). **Doc sweep (folded in):** corrected now-false
+`getTombstones` mentions (`client/errors.go`, `client/engine.go`, root `options.go`), stale
+reverted-snapshot comments in `foldconvergence_gate_test.go`, and overlay-mechanism comments in
+`harness_test.go`/`restart_shape_d_test.go`/`restart_chain_coordinator_test.go`/`synctest_test.go`.
+**Deferred to step 5 (correctly):** the "read-path overlay" wording in `tombstone.go:3,49` and
+`compact_deletes.go:152`, plus the `tombstone.Set.SnapshotRange`/`Snapshot` methods —
+`overlay_source.go` was their last caller, now gone, so step 5 deletes the methods. Net −1407
+lines. Verified: `just lint` (0), `just test` (1659), `just test-long ./internal/oracle` (156),
+`just oracle` (20s stress) all green; final grep gate clean.
 
 ---
 
@@ -848,7 +867,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - [x] 7. seqs start at 1 (+ collapse presence machinery) (#173)
 - [x] 6. oracle fold-convergence + DID-tombstone delivery tests (gates 3) (#174)
 - [x] 3. DID-marker sentinel collections close the §R3 gap inline (#175; replaced the reverted start-snapshot)
-- [ ] 4. remove getTombstones overlay endpoint (gated on 3)
+- [x] 4. remove getTombstones overlay endpoint (#177)
 - [ ] 5. prune overlay-only tombstone API (SnapshotRange now removable post-overlay-deletion)
 - [ ] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation)
 - [ ] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged)

@@ -205,7 +205,7 @@ func (c *chainCoordinator) recordedOps() []world.GeneratedChainOp {
 
 // readCompactionWatermark opens the child's metadata store read-only
 // (post-exit) and returns the merge-tail compaction watermark W. A
-// missing key means no pass ran → W=0 (overlay covers everything).
+// missing key means no pass ran → W=0 (nothing compacted yet).
 func readCompactionWatermark(t *testing.T, dataDir string) uint64 {
 	t.Helper()
 	st, err := store.Open(dataDir, nil)

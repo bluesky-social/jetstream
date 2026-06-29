@@ -197,7 +197,7 @@ func WithLiveBuffer(b LiveBuffer) Option {
 // WithHTTPClient overrides the HTTP client used for both XRPC negotiation
 // and bulk segment/block downloads. It is an override: when unset, the
 // client builds its own jttp clients tuned per workload — xrpc.ATProtoOpts
-// for the short XRPC calls (getTombstones/planBackfill) and
+// for the short XRPC calls (planBackfill) and
 // xrpc.BulkDownloadOpts for the streaming segment/block downloads, whose
 // large transfers a short wall-clock timeout would prematurely kill.
 // Supplying a client here replaces both with the single client given.
