@@ -33,6 +33,7 @@ import (
 // Regression test for the cold-read rotation seam (issue #190), fixed by the
 // convergence loop in WalkFromCursor.
 func TestWalkFromCursor_ConcurrentRotationSeam(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
@@ -67,18 +68,27 @@ func TestWalkFromCursor_ConcurrentRotationSeam(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Bound by WORK, not wall-clock: the producer appends until the writer
+	// has rotated targetRotations times, then stops. Each rotation is one
+	// seal->publish->bump->open cycle — exactly the seam window — so a few
+	// hundred of them, hammered concurrently by the walkers, gives dense
+	// coverage and completes in a fraction of a second. (The pre-fix bug
+	// reproduced within the first ~5 rotations, 100% of runs.)
+	const targetRotations = 300
+
 	var (
 		wg          sync.WaitGroup
-		appendStop  atomic.Bool
+		producerErr atomic.Pointer[error]
 		highestSeq  atomic.Uint64 // highest seq durably appended (NextSeq-1)
 		walkRuns    atomic.Uint64
 		holeFound   atomic.Bool
 		holeMessage atomic.Pointer[string]
 	)
 
-	// Producer: append contiguous events forever until told to stop.
+	// Producer: append contiguous events until the writer has rotated
+	// targetRotations times (activeIdx counts rotations, starting at 0).
 	wg.Go(func() {
-		for !appendStop.Load() {
+		for w.ActiveIndex() < targetRotations {
 			ev := segment.Event{
 				IndexedAt:  time.Now().UnixMicro(),
 				Kind:       segment.KindCreate,
@@ -89,6 +99,7 @@ func TestWalkFromCursor_ConcurrentRotationSeam(t *testing.T) {
 				Payload:    []byte{0xa0},
 			}
 			if err := w.Append(ctx, &ev); err != nil {
+				producerErr.Store(&err)
 				return
 			}
 			highestSeq.Store(ev.Seq)
@@ -97,14 +108,18 @@ func TestWalkFromCursor_ConcurrentRotationSeam(t *testing.T) {
 
 	// Walkers: repeatedly walk from a trailing cursor that straddles the
 	// sealed -> active boundary and assert contiguity of the emitted seqs.
+	// The trailing window is kept short (a couple of segments' worth) so each
+	// walk is cheap and many interleave with live rotations rather than a few
+	// long cold scans dominating the run.
+	const trailingWindow = 24 // ~1.5 segments at 16 events/segment
 	checkWalk := func() {
 		tip := highestSeq.Load()
 		if tip < 2 {
 			return
 		}
 		start := uint64(1)
-		if tip > 96 {
-			start = tip - 96 // straddle several recent segments + active
+		if tip > trailingWindow {
+			start = tip - trailingWindow // straddle the active boundary
 		}
 
 		var emitted []uint64
@@ -142,39 +157,33 @@ func TestWalkFromCursor_ConcurrentRotationSeam(t *testing.T) {
 		}
 	}
 
-	const walkers = 4
+	// Walkers run until the producer is done (activeIdx reached the target)
+	// or a hole is found. They keep pace with the producer so walks interleave
+	// with live rotations across the whole run.
+	const walkers = 16
 	for range walkers {
 		wg.Go(func() {
-			for !holeFound.Load() {
-				select {
-				case <-ctx.Done():
+			for !holeFound.Load() && w.ActiveIndex() < targetRotations {
+				if err := ctx.Err(); err != nil {
 					return
-				default:
 				}
 				checkWalk()
 			}
+			// A final sweep after the producer stopped, so a hole created by
+			// the very last rotation is still exercised.
+			checkWalk()
 		})
 	}
 
-	// Run for a bounded budget, or stop early once a hole is found.
-	deadline := time.After(20 * time.Second)
-	for {
-		if holeFound.Load() {
-			break
-		}
-		select {
-		case <-deadline:
-			goto done
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-done:
-	appendStop.Store(true)
-	cancel()
 	wg.Wait()
+	cancel()
 
-	t.Logf("walk runs completed: %d, highest seq appended: %d, active idx: %d",
+	if perr := producerErr.Load(); perr != nil {
+		require.NoError(t, *perr, "producer append failed")
+	}
+	t.Logf("walk runs completed: %d, highest seq appended: %d, rotations: %d",
 		walkRuns.Load(), highestSeq.Load(), w.ActiveIndex())
+	require.Positive(t, walkRuns.Load(), "no walks ran concurrently with rotations")
 
 	if holeFound.Load() {
 		t.Fatalf("data-loss gap reproduced: %s", *holeMessage.Load())
@@ -202,6 +211,7 @@ done:
 // Regression test for the cold-read rotation seam (issue #190), fixed by the
 // convergence loop in WalkFromCursor.
 func TestWalkFromCursor_RotationSeamDeterministic(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
@@ -334,6 +344,7 @@ func TestWalkFromCursor_RotationSeamDeterministic(t *testing.T) {
 // lands a moment after the walk began — and exercises the re-sweep that fills
 // the hole instead of dropping it.
 func TestWalkFromCursor_RotationSeamConverges(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
@@ -435,6 +446,7 @@ func TestWalkFromCursor_RotationSeamConverges(t *testing.T) {
 // retry — so the SECOND sealed sweep is what recovers it. This proves the
 // retry mechanic itself fills holes, contiguously, with no jump.
 func TestWalkFromCursor_SeamRetryFillsHoleViaActiveRegion(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
@@ -539,6 +551,7 @@ func TestWalkFromCursor_SeamRetryFillsHoleViaActiveRegion(t *testing.T) {
 // in a single pass. A strict walk here would wedge: it would stop at the first
 // event above the start cursor and never resume.
 func TestWalkFromCursor_NilManifestLenient(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
@@ -607,6 +620,7 @@ func TestWalkFromCursor_NilManifestLenient(t *testing.T) {
 // contiguous range. Regression test for the cold-read rotation seam (issue
 // #190), empty-active-successor variant.
 func TestWalkFromCursor_EmptyActiveSuccessorSeam(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))

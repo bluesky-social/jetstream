@@ -163,7 +163,9 @@ func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Eve
 			if current >= input.Writer.NextSeq() {
 				return nil
 			}
-			hole = true
+			// Otherwise fall through to the retry: a sub-tip gap the empty
+			// active successor could not serve. (We do not set hole=true —
+			// it is not read again before the next pass reassigns it.)
 		}
 
 		// A hole was detected (either the active region saw an event above

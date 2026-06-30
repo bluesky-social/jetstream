@@ -66,6 +66,7 @@ func collectWalk(path string) ([]uint64, error) {
 // are always intact. The risk is purely what walkActiveFrames does when it
 // continues past footerOffset into the footer bytes.
 func TestWalkActive_AfterSeal_StaticParse(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_active.jss")
 
@@ -129,6 +130,7 @@ func TestWalkActive_AfterSeal_StaticParse(t *testing.T) {
 // torn/duplicated/holed event stream. The producer writes a fixed active file
 // once; a sealer seals it at a random-ish moment while many walkers read.
 func TestWalkActive_ConcurrentSeal(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 
 	var (
