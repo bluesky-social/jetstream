@@ -9,6 +9,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/segment"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -53,6 +54,43 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			tombstoneCap = 0
 		}
 
+		// Net-new DID backfill (issue #188). A DID can first appear on the
+		// firehose in steady state that we never backfilled — e.g. a PDS that
+		// was unreachable during the bootstrap listRepos sweep becomes
+		// reachable and replays its backlog. We enqueue a StatusPending repo
+		// row for it so the failed-repo retry loop performs a full getRepo.
+		//
+		// This is wired ONLY in steady state, and only when that retry loop is
+		// enabled (it is what drains pending rows). During bootstrap the gap
+		// does not exist: a DID that first appears mid-sweep is still
+		// enumerated later in the same listRepos pagination, so the backfill
+		// engine discovers it correctly there.
+		//
+		// The enqueuer and the retry runner share ONE *backfill.Store so their
+		// counts/host-aggregate read-modify-writes serialize on a single
+		// countsMu. Two Stores over the same pebble db would race those RMWs
+		// and corrupt the aggregates.
+		var enqueuer *backfill.LiveEnqueuer
+		var backfillStore *backfill.Store
+		onEvent := o.cfg.OnEvent
+		if o.cfg.FailedRepoRetryInterval > 0 {
+			backfillStore = backfill.NewStore(o.cfg.Store, o.cfg.BackfillMetrics)
+			enqueuer = backfill.NewLiveEnqueuer(backfill.LiveEnqueuerConfig{
+				Store:   backfillStore,
+				Metrics: o.cfg.BackfillMetrics,
+				Logger:  o.cfg.Logger,
+			})
+			downstream := o.cfg.OnEvent
+			onEvent = func(ev *segment.Event) {
+				// Observe is non-blocking and pebble-free; safe to run inline on
+				// the live consumer's per-event hot path before fan-out.
+				enqueuer.Observe(ev.DID)
+				if downstream != nil {
+					downstream(ev)
+				}
+			}
+		}
+
 		c, err := live.Open(live.Config{
 			SegmentsDir: segmentsDir,
 			Store:       o.cfg.Store,
@@ -69,7 +107,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			TombstoneCap:      tombstoneCap,
 			CompactionTrigger: o.compactionTrigger,
 			SegmentMetrics:    o.cfg.SegmentMetrics,
-			OnEvent:           o.cfg.OnEvent,
+			OnEvent:           onEvent,
 			OnAfterSeal:       o.cfg.IngestOnAfterSeal,
 			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
 			Dial:              o.cfg.LiveDial,
@@ -106,17 +144,28 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 		if o.cfg.FailedRepoRetryInterval > 0 {
 			g.Go(func() error {
 				err := backfill.RunFailedRepoRetry(gctx, backfill.RetryConfig{
-					Store:       o.cfg.Store,
-					Writer:      c.Writer(),
-					HTTPClient:  o.cfg.HTTPClient,
-					RelayURL:    o.cfg.RelayURL,
-					Logger:      o.cfg.Logger,
-					Metrics:     o.cfg.BackfillMetrics,
-					Interval:    o.cfg.FailedRepoRetryInterval,
-					Workers:     o.cfg.FailedRepoRetryWorkers,
-					HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
-					MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
+					Store:         o.cfg.Store,
+					BackfillStore: backfillStore,
+					Writer:        c.Writer(),
+					HTTPClient:    o.cfg.HTTPClient,
+					RelayURL:      o.cfg.RelayURL,
+					Logger:        o.cfg.Logger,
+					Metrics:       o.cfg.BackfillMetrics,
+					Interval:      o.cfg.FailedRepoRetryInterval,
+					Workers:       o.cfg.FailedRepoRetryWorkers,
+					HostWorkers:   o.cfg.FailedRepoRetryHostWorkers,
+					MaxDelay:      o.cfg.FailedRepoRetryMaxDelay,
 				})
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
+				return err
+			})
+
+			// Background worker that drains net-new DID candidates from the
+			// firehose hot path and durably enqueues them (issue #188).
+			g.Go(func() error {
+				err := enqueuer.Run(gctx)
 				if errors.Is(err, context.Canceled) {
 					return nil
 				}

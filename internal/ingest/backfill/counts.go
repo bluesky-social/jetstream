@@ -13,6 +13,7 @@ import (
 type Counts struct {
 	Total       uint64 `json:"total"`
 	Discovered  uint64 `json:"discovered"`
+	Pending     uint64 `json:"pending"`
 	Complete    uint64 `json:"complete"`
 	Failed      uint64 `json:"failed"`
 	Unavailable uint64 `json:"unavailable"`
@@ -110,6 +111,8 @@ func CountStatuses(s *store.Store) (Counts, error) {
 		switch rs.Backfill.Status {
 		case StatusNotStarted:
 			c.Discovered++
+		case StatusPending:
+			c.Pending++
 		case StatusComplete:
 			c.Complete++
 		case StatusFailed:

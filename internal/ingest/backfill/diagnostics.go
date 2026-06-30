@@ -342,6 +342,8 @@ func hostStatusBucket(h *HostStatus, st Status) *uint64 {
 	switch st {
 	case StatusNotStarted:
 		return &h.NotStarted
+	case StatusPending:
+		return &h.Pending
 	case StatusComplete:
 		return &h.Complete
 	case StatusFailed:

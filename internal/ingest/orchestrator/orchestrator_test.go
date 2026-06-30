@@ -82,6 +82,55 @@ func TestRun_EndToEnd_BootstrapToSteadyState(t *testing.T) {
 	}
 }
 
+// TestRun_SteadyState_WithNetNewEnqueuerWired exercises the steady-state path
+// with FailedRepoRetryInterval set, which is what activates the net-new DID
+// enqueuer (issue #188): its construction, the background worker goroutine, and
+// the OnEvent-wrapping hot-path hook. The fake relay emits no firehose events,
+// so this asserts the wiring stands up and tears down cleanly rather than the
+// enqueue behavior itself (covered by backfill unit tests).
+func TestRun_SteadyState_WithNetNewEnqueuerWired(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	relay := newFakeRelay(t, nil)
+	verifier := newTestVerifier(t, relay.URL())
+
+	o, err := New(Config{
+		DataDir:                 dataDir,
+		Store:                   st,
+		RelayURL:                relay.URL(),
+		HTTPClient:              &http.Client{Timeout: 5 * time.Second},
+		Directory:               testIdentityDirectory(),
+		Verifier:                verifier,
+		Logger:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		FailedRepoRetryInterval: time.Hour,
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	done := make(chan error, 1)
+	go func() { done <- o.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		got, err := lifecycle.ReadPhase(st)
+		return err == nil && got == lifecycle.PhaseSteadyState
+	}, 10*time.Second, 50*time.Millisecond, "phase did not reach steady_state")
+
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
 func TestRun_BarrierAfterBootstrapBlocksBeforeMerge(t *testing.T) {
 	t.Parallel()
 

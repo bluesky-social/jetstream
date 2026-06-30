@@ -106,6 +106,7 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 	return BackfillStats{
 		TotalDIDs:       counts.Total,
 		Discovered:      counts.Discovered,
+		Pending:         counts.Pending,
 		Complete:        counts.Complete,
 		Failed:          counts.Failed,
 		Unavailable:     counts.Unavailable,
@@ -140,6 +141,7 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 	return BackfillStats{
 		TotalDIDs:       counts.Total,
 		Discovered:      counts.Discovered,
+		Pending:         counts.Pending,
 		Complete:        counts.Complete,
 		Failed:          counts.Failed,
 		Unavailable:     counts.Unavailable,
@@ -240,6 +242,7 @@ func hostRowFromBackfill(hs *backfill.HostStatus) HostRow {
 		Total:            hs.Total,
 		Active:           hs.Active,
 		NotStarted:       hs.NotStarted,
+		Pending:          hs.Pending,
 		Complete:         hs.Complete,
 		Failed:           hs.Failed,
 		Unavailable:      hs.Unavailable,

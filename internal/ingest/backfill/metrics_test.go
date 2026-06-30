@@ -36,6 +36,12 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	m.incRetrySucceeded()
 	m.incRetryFailed()
 	m.incRetrySkippedHostParked()
+	m.incEnqueuedNetNew()
+	m.incEnqueueAlreadyKnown()
+	m.incEnqueueSeenCacheHit()
+	m.incEnqueueDropped()
+	m.incEnqueueInvalidDID()
+	m.setEnqueueQueueDepth(7)
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.Discovered), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.Completed), 0)
@@ -58,6 +64,12 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetrySucceeded), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetryFailed), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetrySkippedHostParked), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.EnqueuedNetNew), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.EnqueueAlreadyKnown), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.EnqueueSeenCacheHit), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.EnqueueDropped), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.EnqueueInvalidDID), 0)
+	require.InDelta(t, 7.0, testutil.ToFloat64(m.EnqueueQueueDepth), 0)
 	requireNoDebugMetricFields(t, m)
 	requireNoDebugMetrics(t, reg)
 }
@@ -87,6 +99,12 @@ func TestNewMetrics_NilSafe(t *testing.T) {
 		m.incRetrySucceeded()
 		m.incRetryFailed()
 		m.incRetrySkippedHostParked()
+		m.incEnqueuedNetNew()
+		m.incEnqueueAlreadyKnown()
+		m.incEnqueueSeenCacheHit()
+		m.incEnqueueDropped()
+		m.incEnqueueInvalidDID()
+		m.setEnqueueQueueDepth(1)
 	})
 }
 
