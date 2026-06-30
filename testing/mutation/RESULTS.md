@@ -7,27 +7,22 @@ method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 27 active mutants on disk
 (m001–m033; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
-2026-06-29 at `b9543d9` (step 11, #182) — 20 killed, 7 survived, zero
-STALE/BUILD-BROKEN; `testing/mutation/baseline.json` was regenerated from it
-(commit field `b9543d9`) and gate-verified self-consistent. This campaign added
-the `partb` tier (paginated-cutover scenarios) with m029–m033, retired the
-overlay-format mutants m020/m021/m023 (`internal/overlay` deleted in #177) and
-m025 (its `Set.SnapshotRange` mechanism deleted in #178; #183 tracks
-re-deriving a #100-recorder mutant), and refreshed m015 to its post-#175
-location. Of the 7 survivors (m002, m003, m009, m013, m014, m015, m022), six are
-pre-existing documented escapes; **m022 was a KILLED→SURVIVED regression this
-branch introduced** (its overlay-reconstruction oracle was deleted with
-`internal/overlay` in #177) — it mutates live data-loss code. **#184 is now
-addressed (2026-06-30 review remediation):** a new `tombstone` campaign tier
-runs `./internal/tombstone`, whose `TestSnapshotShouldDropDIDChainsWithSpecificReason`
-asserts `Snapshot.ShouldDrop` in BOTH seq directions (a row below the DID
-tombstone seq is dropped; a reactivation row above it survives), so it kills the
-m022 inversion; m022's patch header now declares `tiers: tombstone`. The
-`baseline.json` disposition is still SURVIVED from the `b9543d9` run; the next
-full campaign surfaces m022 as a SURVIVED→KILLED **IMPROVEMENT** (the gate
-reports it, does not fail) and `just mutation-baseline` re-banks it KILLED.
-Counts inside older dated sections describe the catalog *as of that date* and
-are intentionally not back-edited.**
+2026-06-30 at `dba121e` (review remediation) — **21 killed, 6 survived, zero
+STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was regenerated from it
+(commit field `dba121e`) and gate-verified self-consistent (`gate: PASS — 27
+mutants match baseline`). This campaign added the `tombstone` tier (runs
+`./internal/tombstone`) and re-banked **m022 as KILLED@tombstone** — closing the
+KILLED→SURVIVED regression #182 introduced when `internal/overlay` (m022's old
+oracle) was deleted in #177. The kill comes from
+`TestSnapshotShouldDropDIDChainsWithSpecificReason`, which asserts
+`Snapshot.ShouldDrop` in BOTH seq directions (a row below the DID tombstone seq
+is dropped; a reactivation row above it survives); m022's patch header declares
+`tiers: tombstone`. No other disposition changed vs the `b9543d9` run and there
+was no catalog drift. The remaining 6 survivors (m002, m003, m009, m013, m014,
+m015) are all pre-existing documented escapes. (#183 still tracks re-deriving a
+#100-recorder mutant to replace the retired m025.) Counts inside older dated
+sections describe the catalog *as of that date* and are intentionally not
+back-edited.**
 
 ## The baseline gate (#108)
 
@@ -944,3 +939,48 @@ in-memory manifest and the on-disk segment headers; it performs NO
 and faulting it would require a separate manifest/segment IO-fault seam — out
 of scope for this metadata-store tier. Recorded here so the gap is explicit
 rather than silently unaddressed.
+
+## Campaign 2026-06-30 — full catalog at HEAD (review remediation, `tombstone` tier + m022 re-bank)
+
+- commit under test: `dba121e` (branch `tombstone-query-plan-refactor`, the
+  pre-ship review remediation that added F1–F10 fixes).
+- driver: `testing/mutation/run.sh --json testing/mutation/baseline.json`
+  (full catalog, fixed campaign seed).
+- catalog: 27 active mutants (m001–m033; m007, m010, m020, m021, m023, m025
+  retired) — unchanged from the `b9543d9` campaign.
+- result: **21 KILLED, 6 SURVIVED, zero STALE/BUILD-BROKEN.** `baseline.json`
+  regenerated and gate-verified self-consistent (`gate: PASS — 27 mutants match
+  baseline`).
+- purpose: re-bank **m022** as KILLED after the new `tombstone` tier restored
+  its detection, and confirm the F1–F10 code changes did not weaken detection of
+  any other mutant.
+
+### What changed vs the 2026-06-29 (`b9543d9`) campaign
+
+- **m022_shoulddrop_did_seq_inverted: SURVIVED → KILLED@tombstone.** The only
+  disposition change. A new `tombstone` campaign tier runs `./internal/tombstone`,
+  whose `TestSnapshotShouldDropDIDChainsWithSpecificReason` now asserts
+  `Snapshot.ShouldDrop` in BOTH seq directions — a materialization below the DID
+  tombstone seq is dropped, AND a reactivation row above it survives. The m022
+  inversion (`ts.Seq > ev.Seq` → `<`) fails that assertion, so the tier kills it.
+  This closes the regression #182 introduced when `internal/overlay` (m022's old
+  overlay-reconstruction oracle) was deleted in #177.
+- Root cause was harness wiring, not a missing assertion: the killing test
+  already existed, but no campaign tier ran `./internal/tombstone` (every tier
+  ran only the oracle + a couple of packages). m022's patch header now declares
+  `tiers: tombstone`.
+- **No other disposition changed and there was no catalog drift** — verified by
+  diffing the fresh result against the prior baseline. The F1–F10 fixes touched
+  the planner/cursor/client/segment paths several mutants target (notably
+  m029–m033 in the `partb` tier and m032/m033 specifically), and all stayed
+  KILLED, confirming the remediation did not regress detection.
+
+### Survivors (6) — all pre-existing documented escapes
+
+m002 (fixed-seed variance; stress sweep kills ~4/5), m003 (benign/equivalent in
+this scenario), m009 (symmetric checksum closed loop, #32), m013 (dead path in
+this config; m017 covers the hot path), m014 (dead path; m018 covers the hot
+path), m015 (footer collection index unread by the oracle — a documented
+footer-index blind spot). See the earlier dated sections for the per-mutant
+analysis; none is a new escape. (#183 still tracks re-deriving a #100-recorder
+mutant to replace the retired m025.)

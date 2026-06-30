@@ -275,10 +275,13 @@ After each fix: targeted package tests. Final gate: `just lint`, full `go test .
 
 ## Outstanding human follow-up
 
-- **F8 baseline re-bank:** run `just mutation-baseline` (full campaign at HEAD) so the
-  `tombstone` tier's SURVIVED→KILLED improvement for m022 is recorded in
-  `testing/mutation/baseline.json` and the gate prints PASS rather than an IMPROVEMENT
-  notice. Code + test + tier are already in place and verified to kill m022.
+- **F8 baseline re-bank — DONE (2026-06-30).** Ran the full campaign at `dba121e`
+  (`just mutation-baseline` equivalent): **21 KILLED, 6 SURVIVED, zero
+  STALE/BUILD-BROKEN**. Diffed the fresh result against the prior baseline — the ONLY
+  disposition change is m022 SURVIVED→KILLED@tombstone (no catalog drift, no other
+  regression; m029–m033 the F1–F4 changes touch all stayed KILLED). `baseline.json`
+  regenerated and `go run ./testing/mutation/gate` reports `PASS — 27 mutants match
+  baseline`. RESULTS.md catalog line + a dated section updated.
 - **#183** (pre-existing, unrelated to this review): re-derive a dedicated mutant for the
   #100 above-watermark over-drop recorder (m025 was retired in #178). Left as-is.
 
