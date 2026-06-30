@@ -125,7 +125,19 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
 	// continuation cursor reaches it.
 	var result PlanBackfillResult
 	if len(m.segments) > 0 {
-		tip := m.segments[len(m.segments)-1].MaxSeq
+		// The sealed tip is the highest MaxSeq across all segments. With the
+		// Idx-order==seq-order invariant (enforced at load/refresh by
+		// validateSegmentSeqMonotonicity), that is the last segment's MaxSeq.
+		// We nonetheless scan for the true max as defense-in-depth: a too-low
+		// SealedTipSeq would make a paginating client stop early and silently
+		// skip the higher-seq tail (a prime-directive violation), so this read
+		// must not depend on the ordering invariant holding.
+		var tip uint64
+		for i := range m.segments {
+			if m.segments[i].MaxSeq > tip {
+				tip = m.segments[i].MaxSeq
+			}
+		}
 		result.SealedTipSeq = tip
 		if req.HasBeforeSeq && req.BeforeSeq < result.SealedTipSeq {
 			result.SealedTipSeq = req.BeforeSeq

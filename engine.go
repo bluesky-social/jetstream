@@ -115,11 +115,23 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	// per ~4096-event block, negligible) so internal/client never names the public
 	// types. A nil return means an empty/filtered block (nothing to emit).
 	//
-	// Emit and the live emitBatch/emitErr closures below all run on the single
-	// run goroutine, never concurrently: the engine sweeps the sealed archive to
-	// completion, then tails live, alternating sequentially across any §14
-	// re-backfill cycles. So the shared `stopped` flag is never touched
-	// concurrently. Transform runs on the decode workers and never touches it.
+	// Concurrency of the shared `stopped` flag (subtle — read before refactoring):
+	// the backfill fast-path Emit closure runs on the engine's single run
+	// goroutine, but the live emitBatch/emitErr closures can ALSO be driven by the
+	// internal batcher's periodic flusher goroutine (internal/client startFlusher
+	// → b.flush()), not only the run goroutine. The flag is nonetheless race-free,
+	// for two reasons the older comment omitted:
+	//   1. The batcher serializes every emit under its own mutex, so a
+	//      flusher-driven emitBatch and a run-goroutine emit never overlap; and
+	//   2. Emit (fast-path backfill) and the live emitBatch/emitErr are never
+	//      BOTH live at once on the production path: backfill rows bypass the
+	//      batcher entirely (Emit), and the live tail's batcher buffer is flushed
+	//      before each re-sweep (internal/client runBackfillThenLive), so the
+	//      flusher's b.flush() finds an empty buffer and never calls emitBatch
+	//      while a sweep's Emit is running.
+	// Transform runs on the decode workers and never touches `stopped`. If a future
+	// refactor breaks invariant (2) (e.g. live rows left buffered across a sweep),
+	// promote `stopped` to an atomic.Bool rather than relying on this argument.
 	size := max(e.batchSize, 1)
 	bf := iclient.BackfillSink{
 		Transform: func(_ int, evs []iclient.Event) any {

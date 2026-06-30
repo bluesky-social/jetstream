@@ -474,11 +474,17 @@ func validateBlockOffsets(blocks []BlockInfo, footerOffset uint64) error {
 	var prevMaxSeq uint64
 	hasPrevSeq := false
 	for i, b := range blocks {
-		// Guard against b.CompressedSize+8 overflowing uint64 on
-		// hostile input.
-		if uint64(b.CompressedSize) > footerOffset {
-			return fmt.Errorf("%w: block %d compressed_size %d > footer_offset %d",
-				ErrInvalidBlockIndex, i, b.CompressedSize, footerOffset)
+		// Reject an offset at or past the footer BEFORE computing end. This is
+		// both a real bound (a block's 8-byte length prefix must start strictly
+		// before the footer) and the overflow guard for the addition below:
+		// footerOffset is validated <= fileSize <= MaxInt64 by
+		// validateHeaderOffsets, so once b.Offset < footerOffset the sum
+		// b.Offset + 8 + CompressedSize (CompressedSize is a uint32) cannot wrap
+		// uint64. Without this a hostile b.Offset near MaxUint64 would wrap end
+		// to a small value and slip past the `end > footerOffset` range check.
+		if b.Offset >= footerOffset {
+			return fmt.Errorf("%w: block %d offset %d at or past footer_offset %d",
+				ErrInvalidBlockIndex, i, b.Offset, footerOffset)
 		}
 		end := b.Offset + 8 + uint64(b.CompressedSize)
 		if b.Offset < uint64(ReservedHeaderBytes) || end > footerOffset {

@@ -65,7 +65,8 @@ func TestFoldConvergence_CollectionRestrictionAfterFold(t *testing.T) {
 // proves CheckFoldConvergence detects the §R3 DID-tombstone gap. A
 // collection-filtered client downloads the in-scope create but NEVER receives
 // the (empty-collection) account-delete that kills it — exactly the gap the
-// step-3 start-snapshot closes. The emitted stream folds to "record present"
+// DID-marker sentinel index closes (segment/sentinel.go + the planner's
+// sentinel union). The emitted stream folds to "record present"
 // while ground truth (which sees the killer) folds to "deleted", so the check
 // must report divergence. This is the synthetic stand-in for the end-to-end
 // gate test; it passes NOW because it asserts the checker reports the bug.

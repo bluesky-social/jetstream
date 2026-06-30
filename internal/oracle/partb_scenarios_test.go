@@ -128,6 +128,28 @@ func emittedSeqs(events []ObservedEvent) []uint64 {
 	return out
 }
 
+// requireEmittedInSeqOrderPerDID asserts the RAW delivery order is per-DID
+// monotonic non-decreasing across the whole backfill→cutover→live stream. The
+// prime directive requires "in seq order" delivery, but the convergence checks
+// (emittedSeqs sorts; mapsEqualU64 is order-insensitive) are order-BLIND by
+// construction, so a server-side ordering regression in the real cold-replay /
+// hot-ring / cutover-seam path would fold to the same set and pass unnoticed.
+// This guards that contract at the full-stack layer. Duplicates (at-least-once
+// re-delivery across the seam) are allowed: we check non-decreasing, not
+// strictly-increasing. Per-DID because the planner interleaves distinct DIDs'
+// segments, but each DID's own rows must arrive in order.
+func requireEmittedInSeqOrderPerDID(t *testing.T, events []ObservedEvent) {
+	t.Helper()
+	lastByDID := map[string]uint64{}
+	for i, e := range events {
+		if prev, ok := lastByDID[e.DID]; ok && e.Seq < prev {
+			t.Fatalf("out-of-seq-order delivery for did=%s at index %d: seq %d arrived after seq %d",
+				e.DID, i, e.Seq, prev)
+		}
+		lastByDID[e.DID] = e.Seq
+	}
+}
+
 // rangeCreates builds a contiguous run of create events [lo,hi] for one DID and
 // collection, rkey = "r<seq>".
 func rangeCreates(lo, hi uint64, did, collection string) []segment.Event {
@@ -198,6 +220,11 @@ func TestPartB_MultiPageBackfillCutover(t *testing.T) {
 
 	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9}, emittedSeqs(res.emitted),
 		"every page + the live tail must be delivered, no boundary skip")
+	// Full-stack ordering contract: the single DID's rows must arrive in seq
+	// order across every page boundary AND the backfill→live cutover seam, not
+	// merely as the right set. This catches a server-side cold-replay / hot-ring /
+	// seam reordering regression that the order-insensitive fold would mask.
+	requireEmittedInSeqOrderPerDID(t, res.emitted)
 	require.Zero(t, res.downloadErrs, "no recoverable error expected on a clean archive")
 	require.GreaterOrEqual(t, res.stats.Pages, uint64(3), "small MaxEntries must force multi-page paging")
 }
@@ -248,6 +275,7 @@ func TestPartB_MidSegmentTruncation(t *testing.T) {
 
 	require.Equal(t, []uint64{1, 3, 5, 6}, emittedSeqs(res.emitted),
 		"a mid-segment cut must still deliver every matched block, no skip")
+	requireEmittedInSeqOrderPerDID(t, res.emitted)
 	require.Zero(t, res.downloadErrs)
 	require.GreaterOrEqual(t, res.stats.Pages, uint64(2),
 		"matched block ranges over MaxEntries must paginate inside the segment")

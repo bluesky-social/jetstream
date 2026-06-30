@@ -68,9 +68,11 @@
 //     subscribers receive Account and Identity events." Locked down by
 //     TestWants_IdentityBypassesCollectionFilter.
 //
-//   - #sync events are deliberately not emitted. v1 didn't emit them
-//     either; the v2 archive path is authoritative for #sync.
-//     Implemented in encoder.go via errSkipEvent.
+//   - #sync events are deliberately not emitted on the SIMPLE (non-extended)
+//     JSON wire — v1 didn't emit them either (encoder.go Encode →
+//     errSkipEvent). The EXTENDED wire (?extended=true) DOES emit #sync
+//     (EncodeExtended), which is what the bundled Go client uses. #account
+//     and #identity are emitted on both wires.
 //
 //   - Unknown SubscriberSourcedMessage.Type values are logged and
 //     ignored, not fatal. v1 has the same policy. Locked down by
@@ -107,10 +109,23 @@
 //
 // ?cursor= replay IS supported (cursor.go + the cold reader), resolving a
 // seq or time_us cursor against the manifest, clamped to the configured
-// --cursor-lookback floor. A cursor older than the floor is clamped, not
-// rejected. Setting --cursor-lookback=0 disables replay: a cursor param
-// is then accepted but resolves to the live tip rather than 400-ing, so
-// v1 clients that always send a cursor still connect.
+// --cursor-lookback floor. The too-old-cursor policy is endpoint-specific
+// (Subscription.RejectCursorBelowFloor, set true only on /subscribe-v2):
+//
+//   - /subscribe (v1): a seq cursor below the floor is silently CLAMPED up
+//     to the floor (legacy v1 wire parity), made observable via the
+//     "clamped" cursorRequests metric label.
+//   - /subscribe-v2: a seq cursor below the floor is REJECTED with a
+//     pre-upgrade HTTP 400 carrying the floor seq (ErrCursorTooOld), so a
+//     backfilling client detects a slow handoff and re-backfills from its
+//     last seq instead of silently skipping (requestedSeq, floor].
+//   - The time_us cursor path always clamps under BOTH endpoints: a legacy
+//     timestamp cursor's documented contract is to start at the oldest
+//     retained event, and RejectCursorBelowFloor governs only the seq path.
+//
+// Setting --cursor-lookback=0 disables replay: a cursor param is then
+// accepted but resolves to the live tip rather than 400-ing, so v1 clients
+// that always send a cursor still connect.
 //
 // Two compression schemes are offered, and a client may use at most one:
 //

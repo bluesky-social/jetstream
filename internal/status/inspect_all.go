@@ -280,6 +280,14 @@ func foldInspection(tree *TreeAggregate, ins *segment.Inspection, collections ma
 	// uint32 — so len(ins.Collections) <= MaxUint32 holds and the
 	// uint32(i) cast below is safe.
 	for i, nsid := range ins.Collections {
+		// DID-marker sentinels ($account/$identity/$sync) are interned into the
+		// collection string table only as a planner selection hint; they carry
+		// no real per-collection traffic (countEvent=false at seal/rewrite). Skip
+		// them here so they don't surface as phantom collections (events=0 but
+		// real segment/block counts) in operator-facing stats.
+		if segment.IsDIDMarkerSentinelCollection(nsid) {
+			continue
+		}
 		agg, ok := collections[nsid]
 		if !ok {
 			agg = &CollectionAggregate{NSID: nsid}

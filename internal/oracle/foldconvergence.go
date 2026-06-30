@@ -35,8 +35,14 @@ import (
 //     downloads an in-scope create C but never receives C's DID-level killer D
 //     (because D carries an empty collection and rides in no collection block,
 //     and sits below the live tip) folds to C-PRESENT while ground truth has C
-//     PURGED — so this check DIVERGES. That divergence is exactly the gate for
-//     step 3's DID-tombstone start-snapshot.
+//     PURGED — so this check DIVERGES. That divergence is exactly what the
+//     shipped fix closes: the DID-marker sentinel index (segment/sentinel.go;
+//     the planner unions sentinel collection ids in
+//     manifest.collectionIDsForSegment) tags marker-bearing blocks with
+//     $account/$identity/$sync so a collection-filtered plan selects them and D
+//     rides inline. (An earlier design used a client-side DID-tombstone
+//     start-snapshot here; that was reverted in favor of the sentinel index —
+//     see foldconvergence_gate_test.go and design §R4 REVISED.)
 //
 // emitted is the client's complete emitted stream for the query (the OBSERVED
 // side). full is the complete, independently-observed event stream for the

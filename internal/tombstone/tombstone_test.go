@@ -24,6 +24,16 @@ func TestSnapshotShouldDropRecordChains(t *testing.T) {
 	drop, _ = snap.ShouldDrop(&segment.Event{Seq: 11, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r"})
 	require.False(t, drop)
 
+	// Boundary: a materialization at EXACTLY the record-tombstone seq must be
+	// retained. The record tombstone for an update is produced BY that same
+	// update (observeLocked stores records[key]=ev.Seq for KindUpdate), so the
+	// update sits at its own tombstone seq and is the current value — it must
+	// survive. This is the strict-`>` boundary; the `seq > ev.Seq -> seq >= ev.Seq`
+	// mutant drops this live update (data loss). Asserting it here kills that
+	// mutant at the unit tier, mirroring the DID-overlay boundary assertion.
+	drop, _ = snap.ShouldDrop(&segment.Event{Seq: 10, Kind: segment.KindUpdate, DID: "did:plc:a", Collection: "c", Rkey: "r"})
+	require.False(t, drop, "the update materialization at its own record-tombstone seq must be kept")
+
 	drop, _ = snap.ShouldDrop(&segment.Event{Seq: 9, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r"})
 	require.False(t, drop, "delete markers are retained forever")
 }

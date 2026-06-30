@@ -552,6 +552,45 @@ func TestValidateBlockOffsetsCrossBlockSeqMonotonicity(t *testing.T) {
 	})
 }
 
+// TestValidateBlockOffsetsOffsetOverflow pins the uint64-overflow corner: a
+// corrupt block Offset near MaxUint64 must be rejected, not slip past the range
+// check by wrapping `end := Offset + 8 + CompressedSize` to a small value. The
+// range check `end > footerOffset` alone would accept it; the explicit
+// `Offset >= footerOffset` guard before the addition is what catches it.
+func TestValidateBlockOffsetsOffsetOverflow(t *testing.T) {
+	t.Parallel()
+
+	const footer = uint64(ReservedHeaderBytes) + 1024
+
+	t.Run("offset near MaxUint64 that wraps end is rejected", func(t *testing.T) {
+		t.Parallel()
+		// Offset + 8 + 57 == 2^64 + 14, wrapping end to 14 (< footer). Pre-fix
+		// this passed validation; now it must fail loud.
+		blocks := []BlockInfo{{
+			Offset:         ^uint64(0) - 50, // MaxUint64 - 50
+			CompressedSize: 57,
+			EventCount:     1,
+			MinSeq:         1,
+			MaxSeq:         1,
+		}}
+		err := validateBlockOffsets(blocks, footer)
+		require.ErrorIs(t, err, ErrInvalidBlockIndex)
+	})
+
+	t.Run("offset exactly at footer is rejected", func(t *testing.T) {
+		t.Parallel()
+		blocks := []BlockInfo{{
+			Offset:         footer,
+			CompressedSize: 1,
+			EventCount:     1,
+			MinSeq:         1,
+			MaxSeq:         1,
+		}}
+		err := validateBlockOffsets(blocks, footer)
+		require.ErrorIs(t, err, ErrInvalidBlockIndex)
+	})
+}
+
 func TestReaderConcurrentDecodeBlock(t *testing.T) {
 	t.Parallel()
 
