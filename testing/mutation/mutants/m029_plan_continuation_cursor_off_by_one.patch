@@ -20,6 +20,12 @@ tiers: partb
 diff --git a/internal/manifest/plan.go b/internal/manifest/plan.go
 --- a/internal/manifest/plan.go
 +++ b/internal/manifest/plan.go
-@@ -225 +225 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+@@ -234,7 +234,7 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+ 	}
+
+ 	if truncated {
 -		result.PlannedThroughSeq = lastUnitMaxSeq
 +		result.PlannedThroughSeq = lastUnitMaxSeq + 1
+ 	}
+
+ 	return result, nil

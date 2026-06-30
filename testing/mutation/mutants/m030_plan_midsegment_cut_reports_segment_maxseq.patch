@@ -21,6 +21,12 @@ tiers: partb
 diff --git a/internal/manifest/plan.go b/internal/manifest/plan.go
 --- a/internal/manifest/plan.go
 +++ b/internal/manifest/plan.go
-@@ -213 +213 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+@@ -222,7 +222,7 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+ 			planned.Blocks = append(planned.Blocks, br)
+ 			result.Stats.Entries++
+ 			result.Stats.BlocksMatched += br.Last - br.First + 1
 -			lastUnitMaxSeq = seg.Blocks[br.Last].MaxSeq
 +			lastUnitMaxSeq = seg.Header.MaxSeq
+ 		}
+ 		if len(planned.Blocks) > 0 {
+ 			result.Stats.SegmentsMatched++
