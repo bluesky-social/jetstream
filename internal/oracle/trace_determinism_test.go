@@ -31,7 +31,8 @@ import (
 // WHY TWO CHILD PROCESSES (not a loop)
 //
 // The lifecycle runs inside a testing/synctest bubble, and the harness enforces
-// ONE bubble per process (synctestBubbleUsed in harness_test.go). So we cannot
+// ONE bubble per process (the synctestBubbleUsed guard defined in
+// synctest_test.go, checked at the top of the harness). So we cannot
 // run it twice in-process; instead we re-exec THIS test binary twice with
 // `-test.run=^TestOracle_DefaultLifecycle$`, each child pinned to the same seed
 // and writing its trace to a temp dir we then read back. This mirrors the

@@ -650,8 +650,9 @@ func totalIntMap(values map[string]int) int {
 	return total
 }
 
-// bisectServedCompactedFailure classifies a served /subscribe replay
-// CheckCompacted failure by re-running the identical check against the
+// bisectServedCompactedFailure classifies a client-backfill CheckCompacted
+// failure (the paginated planBackfill -> getSegment/getBlock -> /subscribe-v2
+// cutover path real clients use) by re-running the identical check against the
 // on-disk segments at the SAME watermark, then fails with a self-classifying
 // verdict (DURABLE_DEFECT vs SERVING_DEFECT vs INCONCLUSIVE). It snapshots the
 // compaction-pass count around the on-disk scan so a pass that races the scan
@@ -691,7 +692,7 @@ func bisectServedCompactedFailure(
 		"passes_during_scan": passesDuringScan,
 		"disk_event_count":   len(disk),
 	})
-	require.Failf(t, "served subscribe replay compacted check failed",
+	require.Failf(t, "client-backfill compacted check failed",
 		"mode=%s seed=%d: %v", cfg.Mode, cfg.Seed, v.Err())
 }
 

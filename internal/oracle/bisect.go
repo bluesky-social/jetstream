@@ -2,22 +2,26 @@ package oracle
 
 import "fmt"
 
-// CompactedFailureVerdict classifies WHY a served /subscribe replay tripped
-// CheckCompacted, by re-running the identical contract check against the
-// on-disk segments at the same watermark.
+// CompactedFailureVerdict classifies WHY the client-backfill serving path
+// tripped CheckCompacted, by re-running the identical contract check against
+// the on-disk segments at the same watermark.
 //
-// The served replay and the on-disk segments are two independent observation
-// surfaces of the same compaction contract (docs/README.md §3.3). When the
-// served surface reports a superseded survivor, the on-disk surface tells us
-// which side is actually wrong:
+// The served (client-backfill) stream and the on-disk segments are two
+// independent observation surfaces of the same compaction contract
+// (docs/README.md §3.3). The served surface is the paginated client backfill —
+// planBackfill -> getSegment/getBlock -> /subscribe-v2 cutover — that real
+// clients use (this replaced the bespoke whole-archive /subscribe?cursor=0
+// replay; see specs/oracle.md "Client-Driven Historical Tier"). When that
+// surface reports a superseded survivor, the on-disk surface tells us which
+// side is actually wrong:
 //
 //   - on-disk ALSO violates  -> Jetstream physically persisted a superseded
 //     row: a durable storage/compaction defect (highest severity).
 //   - on-disk is CLEAN       -> the bytes are correct; the violation is a
-//     serving-path artifact, e.g. a long /subscribe replay reading a
-//     pre-compaction prefix and a post-compaction suffix across many
-//     un-pinned cold batches. This points at the live-tail-transport misuse
-//     for sealed history tracked in #77, not a storage bug.
+//     serving-path artifact, e.g. a cold-batch handoff across the paginated
+//     getSegment/getBlock download mixing a pre-compaction prefix with a
+//     post-compaction suffix. This points at the serving/transport path, not a
+//     storage bug.
 //
 // A clean on-disk result is only trustworthy when no compaction pass mutated
 // the segment directory during the scan: a rename mid-scan can hide or
@@ -28,7 +32,7 @@ import "fmt"
 type CompactedFailureVerdict struct {
 	// Verdict is the classification.
 	Verdict Verdict
-	// ServedErr is the original served-replay CheckCompacted failure that
+	// ServedErr is the original client-backfill CheckCompacted failure that
 	// triggered the bisection. Always non-nil.
 	ServedErr error
 	// DiskErr is the result of CheckCompacted over the on-disk segments at
@@ -51,18 +55,19 @@ const (
 	// contract. Jetstream persisted wrong bytes. Highest severity.
 	VerdictDurableDefect Verdict = "DURABLE_DEFECT"
 	// VerdictServingDefect: on-disk is clean and the scan was not raced, so
-	// the violation lives only in the served replay surface (serving/transport).
+	// the violation lives only in the client-backfill serving surface
+	// (serving/transport), not in the durable bytes.
 	VerdictServingDefect Verdict = "SERVING_DEFECT"
 	// VerdictInconclusive: on-disk is clean but a compaction pass raced the
 	// scan, so the clean result cannot be trusted to rule out a durable defect.
 	VerdictInconclusive Verdict = "INCONCLUSIVE"
 )
 
-// ClassifyCompactedFailure bisects a served-replay CheckCompacted failure.
+// ClassifyCompactedFailure bisects a client-backfill CheckCompacted failure.
 // servedErr MUST be the non-nil error returned by CheckCompacted over the
-// served replay; disk is the on-disk segment stream observed at the same
-// watermark; passesDuringScan is the number of compaction passes that
-// completed while the on-disk scan ran (0 means the scan was not raced).
+// client-backfill serving stream; disk is the on-disk segment stream observed
+// at the same watermark; passesDuringScan is the number of compaction passes
+// that completed while the on-disk scan ran (0 means the scan was not raced).
 //
 // PRECONDITION on watermark capture: watermark MUST be captured no later than
 // the scan's first segment read. The DURABLE verdict's soundness under a race
@@ -116,10 +121,10 @@ func (v CompactedFailureVerdict) Err() error {
 		return fmt.Errorf("compaction bisection: %s at watermark=%d: on-disk segments ALSO violate the compaction contract -> Jetstream persisted a superseded row (storage/compaction defect, NOT a serving artifact). served=[%w] disk=[%w]",
 			v.Verdict, v.Watermark, v.ServedErr, v.DiskErr)
 	case VerdictServingDefect:
-		return fmt.Errorf("compaction bisection: %s at watermark=%d: on-disk segments are clean but the served /subscribe replay surfaced a superseded row -> serving/transport inconsistency (e.g. un-pinned multi-batch cold replay of sealed history; see #77), NOT a storage defect. served=[%w]",
+		return fmt.Errorf("compaction bisection: %s at watermark=%d: on-disk segments are clean but the client backfill (planBackfill -> getSegment/getBlock -> /subscribe-v2 cutover) surfaced a superseded row -> serving/transport inconsistency (e.g. a cold-batch handoff across the paginated download mixing a pre- and post-compaction generation), NOT a storage defect. served=[%w]",
 			v.Verdict, v.Watermark, v.ServedErr)
 	case VerdictInconclusive:
-		return fmt.Errorf("compaction bisection: %s at watermark=%d: served replay surfaced a superseded row and on-disk segments are clean, BUT a compaction pass raced the on-disk scan so the clean result cannot rule out a durable defect. Re-run with the compaction trigger quiesced around the scan, or capture the on-disk segments under a paused compactor. served=[%w]",
+		return fmt.Errorf("compaction bisection: %s at watermark=%d: the client backfill surfaced a superseded row and on-disk segments are clean, BUT a compaction pass raced the on-disk scan so the clean result cannot rule out a durable defect. Re-run with the compaction trigger quiesced around the scan, or capture the on-disk segments under a paused compactor. served=[%w]",
 			v.Verdict, v.Watermark, v.ServedErr)
 	default:
 		return fmt.Errorf("compaction bisection: unknown verdict %q at watermark=%d: served=[%w] disk=[%s]",
