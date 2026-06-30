@@ -78,6 +78,14 @@ func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEnt
 	switch rs.Backfill.Status {
 	case StatusNotStarted:
 		st = atmosbackfill.StateDiscovered
+	case StatusPending:
+		// Net-new steady-state DID awaiting its first getRepo (issue #188).
+		// atmos has no dedicated "discovered live, retry-eligible" state, so
+		// project to StateFailed: the steady-state retry loop treats failed
+		// and pending rows identically (scanDue selects both), and the atmos
+		// bootstrap engine never sees a pending row — those are only created
+		// after bootstrap, in steady state.
+		st = atmosbackfill.StateFailed
 	case StatusComplete:
 		st = atmosbackfill.StateComplete
 	case StatusFailed:
@@ -119,13 +127,26 @@ func (s *Store) putRepoStatusAndCounts(
 	old Status,
 	updateHost func(*HostStatus),
 ) error {
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+	return s.putRepoStatusAndCountsLocked(did, rs, hadRow, old, updateHost)
+}
+
+// putRepoStatusAndCountsLocked is putRepoStatusAndCounts's body with the
+// caller already holding countsMu. Extracted so callers that must perform a
+// read-check-create atomically (EnqueueNetNewRepo) can hold the lock across
+// the existence check and the write without a TOCTOU window.
+func (s *Store) putRepoStatusAndCountsLocked(
+	did atmos.DID,
+	rs *RepoStatus,
+	hadRow bool,
+	old Status,
+	updateHost func(*HostStatus),
+) error {
 	enc, err := encodeRepoStatus(rs)
 	if err != nil {
 		return err
 	}
-
-	s.countsMu.Lock()
-	defer s.countsMu.Unlock()
 
 	counts, ok, err := LoadCounts(s.db)
 	if err != nil {
@@ -431,6 +452,8 @@ func countBucket(c *Counts, st Status) *uint64 {
 	switch st {
 	case StatusNotStarted:
 		return &c.Discovered
+	case StatusPending:
+		return &c.Pending
 	case StatusComplete:
 		return &c.Complete
 	case StatusFailed:
@@ -690,6 +713,56 @@ func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) er
 	return nil
 }
 
+// EnqueueNetNewRepo durably creates a repo/<did> row at StatusPending for a
+// net-new DID first observed on the steady-state firehose (issue #188), so the
+// failed-repo retry loop performs a full getRepo on its next pass. It is
+// idempotent: if any row already exists for the DID — at any status, including
+// a prior pending/failed/complete/unavailable — it is a no-op and returns
+// (false, nil). The bool reports whether a new pending row was created.
+//
+// The existence check and the create are performed under countsMu so two
+// concurrent observers of the same brand-new DID cannot both create a row (and
+// double-count it). NextAttemptAt is left zero so the row is immediately due.
+//
+// This is intentionally NOT part of the atmos bootstrap Store contract: during
+// bootstrap a DID that first appears mid-sweep is still enumerated later in the
+// same listRepos pagination, so the bootstrap engine discovers it correctly via
+// OnDiscover. The net-new gap only exists in steady state, after the listRepos
+// sweep has completed, which is the only phase this method is wired into.
+func (s *Store) EnqueueNetNewRepo(ctx context.Context, did atmos.DID, active bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+
+	existing, err := s.readRepoStatus(did)
+	if err != nil {
+		return false, err
+	}
+	if existing != nil {
+		// Already known — the firehose seen-cache missed (eviction or cold
+		// start), but the durable row is the source of truth. No-op.
+		s.metrics.incEnqueueAlreadyKnown()
+		return false, nil
+	}
+
+	now := timeNow()
+	rs := &RepoStatus{
+		Backfill: RepoBackfillStatus{
+			Status:    StatusPending,
+			StartedAt: now,
+		},
+		Active: active,
+	}
+	if err := s.putRepoStatusAndCountsLocked(did, rs, false, "", nil); err != nil {
+		return false, err
+	}
+	s.metrics.incEnqueuedNetNew()
+	return true, nil
+}
+
 // OnUpdate flips the Active flag on an existing row. The lifecycle
 // Status is preserved — atmos fires OnUpdate only when the
 // listRepos.Active value differs from what the Store last saw, and
@@ -891,7 +964,12 @@ func (s *Store) RecordRetryFailure(ctx context.Context, did atmos.DID, host stri
 		if !hadRow {
 			return nil, fmt.Errorf("backfill: retry failure %s: missing row", did)
 		}
-		if old != StatusFailed {
+		// Guard against a concurrent terminal transition (e.g. a completion
+		// that raced this attempt): only record a failure for a row still in a
+		// retry-eligible state. A pending row (net-new DID, issue #188) whose
+		// first getRepo fails transitions pending->failed here, after which it
+		// is retried on the failed-repo cadence like any other failure.
+		if !isRetryEligibleStatus(old) {
 			return nil, nil
 		}
 		rs.Backfill.Status = StatusFailed
@@ -921,10 +999,12 @@ func (s *Store) RecordRetryFailure(ctx context.Context, did atmos.DID, host stri
 	return nil
 }
 
-// DeferRetryAttempt persists host-level backpressure for a due failed repo
-// that was not actually attempted because another repo on the same host
-// received a rate-limit response. It intentionally does not increment
-// Attempts, RetryCount, LastAttemptedAt, or host error samples.
+// DeferRetryAttempt persists host-level backpressure for a due retry-eligible
+// repo (failed, or pending per issue #188) that was not actually attempted
+// because another repo on the same host received a rate-limit response. It
+// intentionally does not increment Attempts, RetryCount, LastAttemptedAt, or
+// host error samples — the repo keeps its current status and is simply
+// rescheduled past the host's parked-until instant.
 func (s *Store) DeferRetryAttempt(ctx context.Context, did atmos.DID, nextAttemptAt time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -940,7 +1020,7 @@ func (s *Store) DeferRetryAttempt(ctx context.Context, did atmos.DID, nextAttemp
 	if rs == nil {
 		return fmt.Errorf("backfill: defer retry %s: missing row", did)
 	}
-	if rs.Backfill.Status != StatusFailed {
+	if !isRetryEligibleStatus(rs.Backfill.Status) {
 		return nil
 	}
 	next := nextAttemptAt.UTC()

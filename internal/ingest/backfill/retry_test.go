@@ -108,6 +108,151 @@ func TestRetryRunner_ScanDueRejectsCorruptRows(t *testing.T) {
 	require.ErrorContains(t, err, "decode RepoStatus")
 }
 
+func TestRetryRunner_ScanDueIncludesPending(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+
+	rows := map[atmos.DID]*RepoStatus{
+		// Net-new pending DID with zero NextAttemptAt: immediately due.
+		"did:plc:pending-due": {
+			Backfill: RepoBackfillStatus{Status: StatusPending},
+			Host:     "pds-a.example.com",
+			Active:   true,
+		},
+		// Pending but inactive: skipped like any inactive row.
+		"did:plc:pending-inactive": {
+			Backfill: RepoBackfillStatus{Status: StatusPending},
+			Host:     "pds-b.example.com",
+			Active:   false,
+		},
+		// Pending but deferred into the future (host was parked): skipped.
+		"did:plc:pending-future": {
+			Backfill: RepoBackfillStatus{Status: StatusPending, NextAttemptAt: now.Add(time.Hour)},
+			Host:     "pds-c.example.com",
+			Active:   true,
+		},
+	}
+	for did, rs := range rows {
+		require.NoError(t, s.putRepoStatus(did, rs))
+	}
+
+	r := &retryRunner{cfg: RetryConfig{Store: s.db}}
+	var got []retryCandidate
+	require.NoError(t, r.scanDue(context.Background(), now, func(c retryCandidate) error {
+		got = append(got, c)
+		return nil
+	}))
+
+	require.Equal(t, []retryCandidate{
+		{DID: "did:plc:pending-due", Host: "pds-a.example.com", Retry: 0},
+	}, got)
+}
+
+func TestRetryRunner_PendingNetNewBackfillsToComplete(t *testing.T) {
+	t.Parallel()
+	st, w, segmentsDir := newRetryTestWriter(t)
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:netnew")
+	fixture := buildRepoFixture(t, did)
+	srv := newStubServer(t, map[atmos.DID]repoFixture{did: fixture})
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+
+	// Simulate the steady-state enqueuer creating a pending row for a net-new
+	// DID first seen on the firehose.
+	created, err := bs.EnqueueNetNewRepo(ctx, did, true)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	r, err := newRetryRunner(RetryConfig{
+		Store:         st,
+		BackfillStore: bs,
+		Writer:        w,
+		HTTPClient:    srv.srv.Client(),
+		RelayURL:      srv.srv.URL,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Interval:      time.Hour,
+		Workers:       1,
+		HostWorkers:   1,
+		MaxDelay:      24 * time.Hour,
+		now:           func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.runPass(ctx))
+
+	// The pending repo is backfilled exactly like a failed-repo retry: a
+	// KindSync tombstone followed by KindCreateResync rows.
+	events := collectActiveEvents(t, filepath.Join(segmentsDir, ingest.SegmentFilename(0)))
+	require.Len(t, events, 2)
+	require.Equal(t, segment.KindSync, events[0].Kind)
+	require.Equal(t, segment.KindCreateResync, events[1].Kind)
+
+	rs, err := bs.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusComplete, rs.Backfill.Status)
+
+	// Counts must reflect pending -> complete with no double-counting.
+	counts, ok, err := LoadCounts(st)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), counts.Total)
+	require.Equal(t, uint64(0), counts.Pending)
+	require.Equal(t, uint64(1), counts.Complete)
+	scanned, scanErr := CountStatuses(st)
+	require.NoError(t, scanErr)
+	require.Equal(t, counts, scanned)
+}
+
+func TestRetryRunner_PendingFailureTransitionsToFailed(t *testing.T) {
+	t.Parallel()
+	st, w, _ := newRetryTestWriter(t)
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:netnewfail")
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+
+	srv := newStubServer(t, map[atmos.DID]repoFixture{})
+	srv.failGetRepo = map[atmos.DID]bool{did: true}
+	srv.failGetRepoCode = http.StatusServiceUnavailable
+
+	created, err := bs.EnqueueNetNewRepo(ctx, did, true)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	r, err := newRetryRunner(RetryConfig{
+		Store:         st,
+		BackfillStore: bs,
+		Writer:        w,
+		HTTPClient:    srv.srv.Client(),
+		RelayURL:      srv.srv.URL,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Interval:      time.Hour,
+		Workers:       1,
+		HostWorkers:   1,
+		MaxDelay:      24 * time.Hour,
+		now:           func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.runPass(ctx))
+
+	rs, err := bs.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusFailed, rs.Backfill.Status, "a pending DID whose getRepo fails becomes failed")
+	require.False(t, rs.Backfill.NextAttemptAt.IsZero(), "failed row should be rescheduled")
+
+	// Counts: pending -> failed, no double count.
+	counts, ok, err := LoadCounts(st)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), counts.Total)
+	require.Equal(t, uint64(0), counts.Pending)
+	require.Equal(t, uint64(1), counts.Failed)
+	scanned, scanErr := CountStatuses(st)
+	require.NoError(t, scanErr)
+	require.Equal(t, counts, scanned)
+}
+
 func TestRetryRunner_SuccessAppendsResyncAndCompletes(t *testing.T) {
 	t.Parallel()
 	st, w, segmentsDir := newRetryTestWriter(t)

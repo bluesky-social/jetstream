@@ -40,6 +40,13 @@ type RetryConfig struct {
 	Logger     *slog.Logger
 	Metrics    *Metrics
 
+	// BackfillStore, when non-nil, is the shared *Store the runner uses for
+	// all metadata reads/writes instead of constructing its own over Store.
+	// The steady-state path injects the same instance the LiveEnqueuer holds
+	// so their counts/host-aggregate read-modify-writes serialize on one
+	// countsMu; two Stores over the same pebble db would race those RMWs.
+	BackfillStore *Store
+
 	Interval    time.Duration
 	Workers     int
 	HostWorkers int
@@ -134,7 +141,10 @@ func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
 		HTTPClient: gt.Some(cfg.HTTPClient),
 		Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
 	}
-	st := NewStore(cfg.Store, cfg.Metrics)
+	st := cfg.BackfillStore
+	if st == nil {
+		st = NewStore(cfg.Store, cfg.Metrics)
+	}
 	handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 	return &retryRunner{
 		cfg:        cfg,
@@ -217,7 +227,12 @@ func (r *retryRunner) scanDue(ctx context.Context, now time.Time, yield func(ret
 		if err != nil {
 			return err
 		}
-		if rs.Backfill.Status != StatusFailed || !rs.Active {
+		// Both failed repos (exhausted bootstrap retry) and pending repos
+		// (net-new DIDs first seen on the steady-state firehose, issue #188)
+		// are retry-eligible: a pending row is a repo we have never attempted
+		// to download, so the same getRepo→verify→complete pass that retries a
+		// failure performs its initial backfill.
+		if !isRetryEligibleStatus(rs.Backfill.Status) || !rs.Active {
 			continue
 		}
 		if !rs.Backfill.NextAttemptAt.IsZero() && rs.Backfill.NextAttemptAt.After(now) {
@@ -386,6 +401,14 @@ func retryFailureHost(candidateHost, responseHost string) string {
 		return candidateHost
 	}
 	return failedRepoRetryUnknownHost
+}
+
+// isRetryEligibleStatus reports whether a repo row should be picked up by a
+// steady-state retry pass. StatusFailed covers repos that exhausted their
+// bootstrap retry budget; StatusPending covers net-new DIDs first observed on
+// the steady-state firehose that have never been downloaded (issue #188).
+func isRetryEligibleStatus(st Status) bool {
+	return st == StatusFailed || st == StatusPending
 }
 
 func isLocalRetryError(err error) bool {

@@ -54,6 +54,7 @@ type PhaseInfo struct {
 type BackfillStats struct {
 	TotalDIDs       uint64
 	Discovered      uint64
+	Pending         uint64
 	Complete        uint64
 	Failed          uint64
 	Unavailable     uint64
@@ -76,6 +77,7 @@ type HostRow struct {
 	Total            uint64
 	Active           uint64
 	NotStarted       uint64
+	Pending          uint64
 	Complete         uint64
 	Failed           uint64
 	Unavailable      uint64

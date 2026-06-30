@@ -424,8 +424,13 @@ type Status string
 
 const (
     StatusNotStarted Status = "not_started"
+    // discovered live in steady state, awaiting initial getRepo (issue #188)
+    StatusPending Status = "pending"
     StatusComplete   Status = "complete"
     StatusFailed     Status = "failed"
+    // account exists but its repo is unfetchable (deactivated/suspended/
+    // taken down); terminal and never retried
+    StatusUnavailable Status = "unavailable"
 )
 
 type RepoStatus struct {
@@ -510,6 +515,8 @@ The steady-state phase simply consumes from the upstream firehose and writes eve
 Every block seal commits a single pebble batch that advances `relay/cursor` and refreshes `repo/<did>.LatestRev` for every DID in the block. We always fsync the segment block first and then commit the pebble batch with `sync=true`, so the persisted cursor can never get ahead of the durable event data. A crash between the two steps is handled by the active-segment recovery path described in Section 3.1, and the upstream resumes from whatever cursor pebble last saw.
 
 If there were any accounts that failed to download during the initial backfill phase (i.e. `repo/<did>.Status == StatusFailed`), we periodically retry downloading them with exponential backoff in the background until they succeed. Retry eligibility and backoff are stored on `repo/<did>` via `RetryCount` and `NextAttemptAt` so process restarts do not create retry storms. When we do successfully download a repo that previously failed, we treat it similar to a whole-repo `#sync` event: mark all previous events for that DID as deleted, and recreate from the downloaded CAR file.
+
+The same loop also backfills **net-new DIDs** ([#188](https://github.com/bluesky-social/jetstream/issues/188)). A repo can show up live that we never backfilled — say its PDS was firewalled during the `listRepos` sweep and only later starts replaying, so the first event we see is #101 and we missed #1–100. When the live consumer archives an event for a DID with no `repo/<did>` row, it writes one at `StatusPending`. The retry loop treats pending and failed the same way, so the next pass downloads it over the usual `getRepo` path. This only matters in steady state; during bootstrap a DID that appears mid-sweep still turns up later in the same `listRepos` pagination.
 
 ### 4.4 Identity, Account, and Sync Events
 

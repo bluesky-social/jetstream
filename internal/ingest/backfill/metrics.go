@@ -35,6 +35,13 @@ type Metrics struct {
 	RetrySucceeded           prometheus.Counter
 	RetryFailed              prometheus.Counter
 	RetrySkippedHostParked   prometheus.Counter
+
+	// Net-new steady-state DID enqueue (issue #188).
+	EnqueuedNetNew      prometheus.Counter
+	EnqueueAlreadyKnown prometheus.Counter
+	EnqueueSeenCacheHit prometheus.Counter
+	EnqueueDropped      prometheus.Counter
+	EnqueueQueueDepth   prometheus.Gauge
 }
 
 // NewMetrics registers the backfill counters against reg. Pass the
@@ -154,6 +161,31 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "failed_repo_retry_skipped_host_parked_total",
 			Help: "Number of eligible failed repo retries skipped because their host was parked by a rate-limit response.",
 		}),
+		EnqueuedNetNew: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "net_new_enqueued_total",
+			Help: "Number of net-new DIDs first seen on the steady-state firehose for which a pending backfill row was created.",
+		}),
+		EnqueueAlreadyKnown: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "net_new_already_known_total",
+			Help: "Number of net-new enqueue attempts that found an existing repo row (seen-cache miss but row present); no-op.",
+		}),
+		EnqueueSeenCacheHit: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "net_new_seen_cache_hit_total",
+			Help: "Number of firehose events whose DID was served from the in-memory seen cache without touching pebble.",
+		}),
+		EnqueueDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "net_new_dropped_total",
+			Help: "Number of net-new DID enqueue requests dropped because the background enqueue queue was full. Self-healing: an active DID re-emits and is retried on the next event.",
+		}),
+		EnqueueQueueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "net_new_queue_depth",
+			Help: "Current number of candidate net-new DIDs waiting for the background enqueue worker.",
+		}),
 	}
 	reg.MustRegister(
 		m.Discovered, m.Completed, m.Failed, m.ActiveFlips, m.OnFailErrors,
@@ -163,6 +195,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.CompletionQueueWait, m.ForcedCheckpointFlushes,
 		m.RetryPasses, m.RetryCandidates, m.RetryAttempts,
 		m.RetrySucceeded, m.RetryFailed, m.RetrySkippedHostParked,
+		m.EnqueuedNetNew, m.EnqueueAlreadyKnown, m.EnqueueSeenCacheHit,
+		m.EnqueueDropped, m.EnqueueQueueDepth,
 	)
 	return m
 }
@@ -296,5 +330,35 @@ func (m *Metrics) incRetryFailed() {
 func (m *Metrics) incRetrySkippedHostParked() {
 	if m != nil {
 		m.RetrySkippedHostParked.Inc()
+	}
+}
+
+func (m *Metrics) incEnqueuedNetNew() {
+	if m != nil {
+		m.EnqueuedNetNew.Inc()
+	}
+}
+
+func (m *Metrics) incEnqueueAlreadyKnown() {
+	if m != nil {
+		m.EnqueueAlreadyKnown.Inc()
+	}
+}
+
+func (m *Metrics) incEnqueueSeenCacheHit() {
+	if m != nil {
+		m.EnqueueSeenCacheHit.Inc()
+	}
+}
+
+func (m *Metrics) incEnqueueDropped() {
+	if m != nil {
+		m.EnqueueDropped.Inc()
+	}
+}
+
+func (m *Metrics) setEnqueueQueueDepth(v int) {
+	if m != nil {
+		m.EnqueueQueueDepth.Set(float64(v))
 	}
 }

@@ -271,6 +271,7 @@ document.addEventListener("input", function (event) {
         <dl>
           <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
           <dt>Downloaded</dt><dd>{{humanInt .Backfill.Complete}} repos</dd>
+          <dt>Pending</dt><dd>{{humanInt .Backfill.Pending}} repos</dd>
           <dt>Errored</dt><dd>{{humanInt .Backfill.Failed}} repos</dd>
           <dt>Unavailable</dt><dd>{{humanInt .Backfill.Unavailable}} repos</dd>
           {{template "backfillDuration" .}}
