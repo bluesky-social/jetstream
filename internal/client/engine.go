@@ -488,11 +488,21 @@ func (e *Engine) sweepSealedArchive(ctx context.Context, dl *Downloader, emit fu
 			return sealedTip, true, nil
 		}
 
+		prevCursor := cursor
 		cursor = plan.PlannedThroughSeq
 		if cursor >= sealedTip {
 			// Whole sealed archive (startCursor, S] consumed. An empty archive is
 			// sealedTip==0 and terminates here on the first page (cursor 0 >= 0).
 			return sealedTip, false, nil
+		}
+		// PlannedThroughSeq is an XRPC field from the server; planFromOutput only
+		// rejects negatives and values above SealedTipSeq, not stalls. A stale,
+		// buggy, or hostile server can return a continuation cursor at or below the
+		// one we just sent while sealedTip stays higher, which would reissue an
+		// identical request forever. Fail fatally instead of spinning — the §14
+		// re-backfill loop guards the same way (maxRebackfillStalls).
+		if cursor <= prevCursor {
+			return sealedTip, false, fmt.Errorf("jetstream: planBackfill made no progress: afterSeq=%d plannedThroughSeq=%d sealedTipSeq=%d", prevCursor, cursor, sealedTip)
 		}
 	}
 }

@@ -161,6 +161,18 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 			return CursorPlan{Mode: ModeLive, Requested: n, Clamped: true}, nil
 		}
 		startSeq := uint64(n)
+		// Seq 0 is the pure "nothing yet" sentinel (design §R8): it is never
+		// allocated to an event, so the lowest real event is seq 1. The
+		// bufferless cutover sends cursor=0 to mean "replay from the first
+		// event" on an empty archive (see internal/client live consumer). With
+		// the writer now flooring NextSeq to 1, cursor 0 falls through here as a
+		// replay; floor it to 1 so the cold reader walks from the first real
+		// event instead of returning a non-advancing next==0 that disconnects
+		// the subscriber.
+		if startSeq == 0 {
+			startSeq = 1
+			plan.Clamped = true
+		}
 		// Clamp to the lookback floor when the manifest knows the floor
 		// and lookback clamping is enabled. A zero or negative Lookback
 		// disables clamping (replays as far back as the manifest can).
@@ -215,6 +227,16 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 			plan.StartSeq = floorSeq
 			plan.Clamped = true
 		}
+	}
+	// Floor the replay start to seq 1: seq 0 is the pure "nothing yet" sentinel
+	// (design §R8) and is never allocated to an event. translateTimeUSToSeq
+	// returns 0 when there are no sealed segments; without this floor a v1
+	// timestamp cursor on an empty archive would start the cold reader at 0 and
+	// get a non-advancing next==0 that disconnects the subscriber — the same
+	// trap the seq-cursor path floors away above.
+	if plan.StartSeq == 0 {
+		plan.StartSeq = 1
+		plan.Clamped = true
 	}
 	return plan, nil
 }

@@ -317,6 +317,75 @@ func TestEngineBackfillOnly(t *testing.T) {
 	require.Equal(t, 0, *dials, "backfill-only must never dial the live websocket")
 }
 
+// TestEngineSweepNonAdvancingPlanIsFatal guards the sweep loop against a server
+// that returns a continuation cursor at or below the one we just sent while the
+// sealed tip stays higher. planFromOutput only rejects negative values and
+// PlannedThroughSeq > SealedTipSeq, not stalls, so without an explicit progress
+// guard the loop reissues an identical request forever. The sweep must instead
+// surface a fatal "made no progress" error.
+func TestEngineSweepNonAdvancingPlanIsFatal(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	h.as.addSegment(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+	})
+	// Page 1 (afterSeq 0) reports PlannedThroughSeq=1 with SealedTipSeq=6: it
+	// advanced (1 > 0) but stays below the tip, so the loop pages again at
+	// afterSeq=1. Page 2 then reports the SAME PlannedThroughSeq=1 — a stall the
+	// validator does not catch.
+	pages := map[int64]string{
+		0: planPageJSON([]planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}, 1, 6),
+		1: planPageJSON(nil, 1, 6),
+	}
+	h.planResponder = func(req planReqWire) string {
+		page, ok := pages[req.AfterSeq]
+		require.Truef(t, ok, "unexpected afterSeq %d", req.AfterSeq)
+		return page
+	}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var (
+		mu     sync.Mutex
+		gotErr error
+	)
+	eng := NewEngine(cfg)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		eng.Run(ctx,
+			func([]Event) bool { return true },
+			func(err error) bool {
+				mu.Lock()
+				if gotErr == nil {
+					gotErr = err
+				}
+				mu.Unlock()
+				return true
+			},
+		)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("sweep did not surface a fatal error on a non-advancing plan (looping forever?)")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.ErrorIs(t, gotErr, ErrFatal, "a non-advancing planBackfill must be fatal, not infinite")
+	require.Contains(t, gotErr.Error(), "made no progress")
+}
+
 // TestEngineBackfillThenLiveOrdering asserts backfill rows precede live rows
 // and the whole stream is in seq order with the overlap deduped.
 func TestEngineBackfillThenLiveOrdering(t *testing.T) {

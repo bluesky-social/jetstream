@@ -135,3 +135,20 @@ func TestFoldConvergence_WildcardCollectionRestriction(t *testing.T) {
 	require.NoError(t, CheckFoldConvergence(emitted, full, []string{"app.bsky.graph.*"}),
 		"wildcard restriction must select the in-namespace record and exclude the sibling namespace")
 }
+
+// TestFoldConvergence_MalformedAccountPayloadFailsLoud guards the oracle's
+// fidelity: a corrupt account-delete payload must surface a hard error, not
+// fold as deleted=false. Silently dropping a malformed DID tombstone could turn
+// a real purge into a no-op and report a false-green convergence — exactly the
+// failure the sibling oracle paths (CheckCompacted, Reconstruct) refuse to make.
+func TestFoldConvergence_MalformedAccountPayloadFailsLoud(t *testing.T) {
+	t.Parallel()
+	full := []ObservedEvent{
+		{Seq: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r"},
+		// Not valid CBOR for SyncSubscribeRepos_Account.
+		{Seq: 20, Kind: segment.KindAccount, DID: "did:plc:a", Payload: []byte{0xff, 0x00, 0x13, 0x37}},
+	}
+	err := CheckFoldConvergence(full, full, nil)
+	require.Error(t, err, "a malformed account payload must fail the convergence check, not be silently ignored")
+	require.Contains(t, err.Error(), "fold failed")
+}

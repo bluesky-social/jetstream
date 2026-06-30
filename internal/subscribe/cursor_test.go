@@ -57,6 +57,46 @@ func TestResolveCursor_EmptyMeansLive(t *testing.T) {
 	require.Equal(t, subscribe.ModeLive, p.Mode)
 }
 
+// TestResolveCursor_ZeroSeqFloorsToOne guards the bufferless cutover's
+// empty-archive path: the live consumer sends cursor=0 to mean "replay from the
+// first event". Seq 0 is the pure "nothing yet" sentinel (design §R8) and is
+// never allocated, so the lowest real event is seq 1. Once the writer has
+// started (NextSeq>=1), cursor=0 must resolve to a seq replay floored to
+// StartSeq=1 — NOT StartSeq=0, which would dive the cold reader into an empty
+// (0, ...] range and return a non-advancing next==0 that disconnects the
+// subscriber and spins the reconnect loop.
+func TestResolveCursor_ZeroSeqFloorsToOne(t *testing.T) {
+	t.Parallel()
+	p, err := subscribe.ResolveCursor("0", subscribe.CursorEnv{NextSeq: 1})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeReplaySeq, p.Mode,
+		"cursor=0 with a started writer is a replay from the start, not live")
+	require.Equal(t, uint64(1), p.StartSeq,
+		"seq 0 is a sentinel; replay must floor to the first real event (seq 1)")
+	require.True(t, p.Clamped, "flooring 0 up to 1 is a clamp")
+}
+
+// TestResolveCursor_TimestampEmptyArchiveFloorsToOne is the timestamp-path
+// sibling of the seq-cursor floor: a v1 unix-micros cursor on an archive with no
+// sealed segments translates to StartSeq=0 (translateTimeUSToSeq's no-segments
+// branch). Seq 0 is the "nothing yet" sentinel and is never a valid replay
+// start — left at 0 the cold reader returns a non-advancing next==0 and
+// disconnects the subscriber. The resolver must floor it to 1.
+func TestResolveCursor_TimestampEmptyArchiveFloorsToOne(t *testing.T) {
+	t.Parallel()
+	// A past timestamp in the v1 namespace (>= CursorSeqMaxThreshold), with no
+	// manifest: translation hits the no-sealed-segments branch and returns 0.
+	pastMicros := time.Now().Add(-time.Hour).UnixMicro()
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(pastMicros, 10), subscribe.CursorEnv{
+		NextSeq: 100,
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
+	require.Equal(t, uint64(1), p.StartSeq,
+		"a timestamp cursor on an empty archive must floor to seq 1, not the seq-0 sentinel")
+	require.True(t, p.Clamped)
+}
+
 func TestResolveCursor_NonNumericRejected(t *testing.T) {
 	t.Parallel()
 	_, err := subscribe.ResolveCursor("abc", subscribe.CursorEnv{})
@@ -382,11 +422,14 @@ func TestResolveCursor_TimeUSAtThresholdExactly(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	now := time.Now().UnixMicro()
+	// Seqs are 1-based (design §R8): the first real event is seq 1, so a real
+	// segment's MinSeq is never 0. The threshold timestamp is older than this
+	// segment, so translation clamps to the first segment's MinSeq (1).
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 9,
+		minSeq: 1, maxSeq: 9,
 		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
 		maxIndexedAt: now - int64(5*time.Hour/time.Microsecond),
-		eventCount:   10,
+		eventCount:   9,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -396,5 +439,5 @@ func TestResolveCursor_TimeUSAtThresholdExactly(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
 	require.True(t, p.Clamped)
-	require.Equal(t, uint64(0), p.StartSeq)
+	require.Equal(t, uint64(1), p.StartSeq)
 }

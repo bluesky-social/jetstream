@@ -46,8 +46,16 @@ import (
 // the whole stream). DO NOT pass the filtered stream as `full`: cross-checking
 // filtered-vs-filtered on the same server is blind to the gap (§R7).
 func CheckFoldConvergence(emitted, full []ObservedEvent, collections []string) error {
-	want := restrictByCollection(groundTruthLive(full), collections)
-	got := restrictByCollection(groundTruthLive(emitted), collections)
+	fullLive, err := groundTruthLive(full)
+	if err != nil {
+		return fmt.Errorf("oracle fold-convergence: ground-truth fold failed: %w", err)
+	}
+	emittedLive, err := groundTruthLive(emitted)
+	if err != nil {
+		return fmt.Errorf("oracle fold-convergence: emitted fold failed: %w", err)
+	}
+	want := restrictByCollection(fullLive, collections)
+	got := restrictByCollection(emittedLive, collections)
 
 	for key, gseq := range want {
 		eseq, ok := got[key]
@@ -115,7 +123,7 @@ func hasPrefix(s, prefix string) bool {
 // This is the oracle's INDEPENDENT model of network truth: it folds an observed
 // event stream directly and shares no code with the production tombstone
 // package, so it cannot mask a bug in that package.
-func groundTruthLive(events []ObservedEvent) map[RecordKey]uint64 {
+func groundTruthLive(events []ObservedEvent) (map[RecordKey]uint64, error) {
 	type rec struct {
 		seq  uint64
 		live bool
@@ -152,7 +160,15 @@ func groundTruthLive(events []ObservedEvent) map[RecordKey]uint64 {
 				didKill[ev.DID] = ev.Seq
 			}
 		case segment.KindAccount:
-			deleted, _ := oracleAccountDeleted(ev.Payload)
+			// A malformed account payload must fail loud, not fold as
+			// deleted=false: silently dropping a corrupt DID tombstone could
+			// turn a real purge into a no-op and report a false-green
+			// convergence. The sibling oracle paths (CheckCompacted,
+			// Reconstruct) already treat this decode failure as fatal.
+			deleted, err := oracleAccountDeleted(ev.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("decode account payload at seq=%d did=%s: %w", ev.Seq, ev.DID, err)
+			}
 			if deleted && ev.Seq > didKill[ev.DID] {
 				didKill[ev.DID] = ev.Seq
 			}
@@ -164,5 +180,5 @@ func groundTruthLive(events []ObservedEvent) map[RecordKey]uint64 {
 			out[key] = r.seq
 		}
 	}
-	return out
+	return out, nil
 }

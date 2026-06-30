@@ -62,7 +62,9 @@ func drainClientToConvergence(t *testing.T, srv *pagedCutoverServer, opts []jets
 		// Converge once the folded emitted stream (restricted by the query's
 		// collection filter) equals ground truth. Final state is the load-bearing
 		// check under the eventually-consistent contract (§R1/§R7).
-		got := restrictByCollection(groundTruthLive(res.emitted), collections)
+		emittedLive, err := groundTruthLive(res.emitted)
+		require.NoError(t, err)
+		got := restrictByCollection(emittedLive, collections)
 		if mapsEqualU64(got, want) {
 			break
 		}
@@ -86,12 +88,15 @@ func mapsEqualU64(a, b map[RecordKey]uint64) bool {
 
 // foldOracle folds a flat event slice into live ground truth (the oracle's
 // independent model), the want side of a convergence check.
-func foldOracle(events []segment.Event) map[RecordKey]uint64 {
+func foldOracle(t *testing.T, events []segment.Event) map[RecordKey]uint64 {
+	t.Helper()
 	obs := make([]ObservedEvent, 0, len(events))
 	for _, ev := range events {
 		obs = append(obs, observedFromSegment(ev))
 	}
-	return groundTruthLive(obs)
+	live, err := groundTruthLive(obs)
+	require.NoError(t, err)
+	return live
 }
 
 // observedFromSegment adapts a segment.Event into the oracle's ObservedEvent
@@ -186,7 +191,7 @@ func TestPartB_MultiPageBackfillCutover(t *testing.T) {
 		srv.AppendLive(live...)
 	}()
 
-	want := foldOracle(all)
+	want := foldOracle(t, all)
 	res := drainClientToConvergence(t, srv,
 		[]jetstream.Option{jetstream.WithAfterSeq(0), jetstream.WithBatchSize(4)},
 		want, nil)
@@ -233,7 +238,7 @@ func TestPartB_MidSegmentTruncation(t *testing.T) {
 			target = append(target, ev)
 		}
 	}
-	want := foldOracle(target)
+	want := foldOracle(t, target)
 	res := drainClientToConvergence(t, srv,
 		[]jetstream.Option{
 			jetstream.WithDIDs([]string{pbDID}),
@@ -285,7 +290,7 @@ func TestPartB_MidDownloadSeal(t *testing.T) {
 	var all []segment.Event
 	all = append(all, rangeCreates(1, 4, pbDID, pbColl)...)
 	all = append(all, handoffSealed...)
-	want := foldOracle(all)
+	want := foldOracle(t, all)
 
 	res := drainClientToConvergence(t, srv,
 		[]jetstream.Option{jetstream.WithAfterSeq(0), jetstream.WithBatchSize(4)},
@@ -374,7 +379,7 @@ func TestPartB_CaughtUpHandoffBelowFloorReBackfills(t *testing.T) {
 	var all []segment.Event
 	all = append(all, old...)
 	all = append(all, fresh...)
-	want := foldOracle(all)
+	want := foldOracle(t, all)
 
 	res := drainClientToConvergence(t, srv,
 		[]jetstream.Option{jetstream.WithAfterSeq(0), jetstream.WithBatchSize(4)},
@@ -419,7 +424,7 @@ func TestPartB_ExhaustSealedThenColdReplay(t *testing.T) {
 	all = append(all, initial...)
 	all = append(all, resumed...)
 	all = append(all, makeOracleCreate(7, pbDID, pbColl, "r7"))
-	want := foldOracle(all)
+	want := foldOracle(t, all)
 
 	res := drainClientToConvergence(t, srv,
 		[]jetstream.Option{jetstream.WithAfterSeq(0), jetstream.WithBatchSize(4)},
@@ -459,7 +464,7 @@ func TestPartB_SustainedIngestConvergence(t *testing.T) {
 	var all []segment.Event
 	all = append(all, initial...)
 	all = append(all, live...)
-	want := foldOracle(all)
+	want := foldOracle(t, all)
 
 	res := drainClientToConvergence(t, srv,
 		[]jetstream.Option{jetstream.WithAfterSeq(0), jetstream.WithBatchSize(4)},
