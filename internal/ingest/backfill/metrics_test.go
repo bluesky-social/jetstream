@@ -40,6 +40,7 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	m.incEnqueueAlreadyKnown()
 	m.incEnqueueSeenCacheHit()
 	m.incEnqueueDropped()
+	m.incEnqueueInvalidDID()
 	m.setEnqueueQueueDepth(7)
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.Discovered), 0)
@@ -67,6 +68,7 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.EnqueueAlreadyKnown), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.EnqueueSeenCacheHit), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.EnqueueDropped), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.EnqueueInvalidDID), 0)
 	require.InDelta(t, 7.0, testutil.ToFloat64(m.EnqueueQueueDepth), 0)
 	requireNoDebugMetricFields(t, m)
 	requireNoDebugMetrics(t, reg)
@@ -101,6 +103,7 @@ func TestNewMetrics_NilSafe(t *testing.T) {
 		m.incEnqueueAlreadyKnown()
 		m.incEnqueueSeenCacheHit()
 		m.incEnqueueDropped()
+		m.incEnqueueInvalidDID()
 		m.setEnqueueQueueDepth(1)
 	})
 }

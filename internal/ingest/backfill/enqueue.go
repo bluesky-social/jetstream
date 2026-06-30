@@ -29,6 +29,19 @@
 // The seen cache is an optimization, never the source of truth: the worker's
 // EnqueueNetNewRepo re-checks pebble and is a no-op when a row already exists,
 // so an eviction (or a cold start) costs at most one redundant point read.
+//
+// Durability window (accepted limitation). Observe is deliberately async and
+// pebble-free, so the durable StatusPending write lags the live consumer. The
+// relay cursor can advance past a DID's archived event (a block flush inside
+// writer.Append persists relay/cursor) before the worker drains that DID and
+// writes its row. A process crash — or a transient EnqueueNetNewRepo failure
+// racing the DID's last event — in that window loses the in-memory candidate,
+// and the relay does not redeliver. This is only unrecoverable for a DID that
+// emits exactly ONE event in that window: any DID that emits another event
+// re-observes and re-enqueues (the fast-path last and seen cache are cleared on
+// failure precisely so a later event retries). We accept this rather than make
+// the per-event hot path take a synchronous pebble write at firehose rate; a
+// genuinely active repo that we missed will almost always emit again.
 package backfill
 
 import (
@@ -145,6 +158,22 @@ func (e *LiveEnqueuer) Observe(did string) {
 		return
 	}
 
+	// Drop malformed DIDs here, on the hot path, before they consume a queue
+	// slot or a durable write. #identity events (and #account verification
+	// failures) are not DID-syntax-verified upstream, so a malformed DID can
+	// reach Observe. A bad DID is non-retryable — re-validating it forever would
+	// be pure churn — so cache it (and set last) exactly like a handled DID: the
+	// fast path and seen cache then absorb every later event for it instead of
+	// re-running validation. EnqueueNetNewRepo re-checks at the durable boundary
+	// as defense in depth, so a malformed key can never become a repo/ row that
+	// wedges the retry scan.
+	if err := atmos.DID(did).Validate(); err != nil {
+		e.cache.store(did)
+		e.setLast(did)
+		e.metrics.incEnqueueInvalidDID()
+		return
+	}
+
 	// Unknown DID: hand it to the worker without blocking the firehose.
 	select {
 	case e.queue <- did:
@@ -196,7 +225,19 @@ func (e *LiveEnqueuer) process(ctx context.Context, did string) {
 		if ctx.Err() != nil {
 			return
 		}
+		// Evict the seen cache FIRST, then clear the burst-absorber, so a later
+		// event re-enqueues this DID. Order matters and is concurrency-critical:
+		// Observe (firehose goroutine) checks last before the cache. If we
+		// cleared last first, a same-DID Observe racing between the clear and the
+		// cache eviction would find last==nil, hit the still-present cache entry,
+		// and call setLast(did) — repopulating last with the failed DID and
+		// re-suppressing the retry forever. Removing the cache entry first means
+		// that once last is cleared, Observe can no longer repopulate it from the
+		// cache, so the next same-DID event genuinely re-enqueues.
 		e.cache.remove(did)
+		if last := e.last.Load(); last != nil && *last == did {
+			e.last.CompareAndSwap(last, nil)
+		}
 		e.logger.WarnContext(ctx, "failed to enqueue net-new repo for backfill",
 			"did", did,
 			"err", err,

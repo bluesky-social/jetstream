@@ -2,11 +2,13 @@ package backfill
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
 	"github.com/stretchr/testify/require"
 )
@@ -192,6 +194,107 @@ func TestEnqueueNetNewRepo_CreatesPendingAndCounts(t *testing.T) {
 	scanned, err := CountStatuses(s.db)
 	require.NoError(t, err)
 	require.Equal(t, counts, scanned)
+}
+
+func TestLiveEnqueuer_MalformedDIDDroppedOnHotPathNotQueued(t *testing.T) {
+	t.Parallel()
+	s := newEnqueueTestStore(t)
+	e := NewLiveEnqueuer(LiveEnqueuerConfig{Store: s})
+	bad := "not-a-did"
+
+	// A malformed DID must be absorbed on the hot path: never queued, never a
+	// durable write. It is non-retryable, so a repeat must be absorbed by the
+	// seen cache / fast path rather than re-validated and re-dropped each event.
+	e.Observe(bad)
+	require.Equal(t, 0, e.QueueLen(), "malformed DID must not be queued")
+	require.True(t, e.cache.seen(bad), "malformed DID must be cached so repeats are absorbed")
+
+	// A burst of the same malformed DID stays absorbed (no queue growth).
+	for range 1000 {
+		e.Observe(bad)
+	}
+	require.Equal(t, 0, e.QueueLen())
+
+	// A valid DID interleaved still enqueues normally.
+	e.Observe("did:plc:valid")
+	require.Equal(t, 1, e.QueueLen())
+}
+
+func TestEnqueueNetNewRepo_RejectsInvalidDID(t *testing.T) {
+	t.Parallel()
+	s := newEnqueueTestStore(t)
+	ctx := context.Background()
+
+	// #identity events (and #account verification failures) reach the enqueuer
+	// without DID-syntax verification, so a malformed upstream DID can arrive
+	// here. It must be rejected at the durable boundary, never persisted: a
+	// persisted unparseable repo/ key wedges scanDue (which ParseDIDs every key
+	// on each retry pass) and survives restarts.
+	for _, bad := range []string{"not-a-did", "did:", "did:plc:", "plc:abc", "did:PLC:abc"} {
+		created, err := s.EnqueueNetNewRepo(ctx, atmos.DID(bad), true)
+		require.Error(t, err, "malformed DID %q must be rejected", bad)
+		require.False(t, created)
+
+		rs, rerr := s.readRepoStatus(atmos.DID(bad))
+		require.NoError(t, rerr)
+		require.Nil(t, rs, "malformed DID %q must not be persisted", bad)
+	}
+
+	// No bad row means no poisoned key, and the counts row stays empty.
+	counts, ok, err := LoadCounts(s.db)
+	if ok {
+		require.NoError(t, err)
+		require.Equal(t, uint64(0), counts.Total)
+	}
+}
+
+func TestLiveEnqueuer_FailedEnqueueClearsLastSoRetryWorks(t *testing.T) {
+	t.Parallel()
+	// Fail the first batch_commit touching repo/ (the EnqueueNetNewRepo write),
+	// then let later writes succeed. This models a transient pebble write
+	// failure for a net-new DID's first enqueue.
+	fault := &store.KeyPrefixFault{
+		Prefix:  []byte("repo/"),
+		Op:      store.WriteOpBatchCommit,
+		Ordinal: 1,
+		Err:     errors.New("injected enqueue write failure"),
+	}
+	db, err := store.Open(t.TempDir(), nil, store.WithFaultInjector(fault))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	s := NewStore(db, nil)
+
+	e := NewLiveEnqueuer(LiveEnqueuerConfig{Store: s})
+	did := "did:plc:failsfirst"
+
+	// First observation enqueues the candidate and marks last+cache.
+	e.Observe(did)
+	require.Equal(t, 1, e.QueueLen())
+
+	// Drain it: the durable write fails, so process must clear last and evict
+	// the cache rather than leaving the DID permanently short-circuited.
+	runEnqueuerOnce(t, e)
+
+	rs, err := s.readRepoStatus(atmos.DID(did))
+	require.NoError(t, err)
+	require.Nil(t, rs, "first enqueue must have failed (no row)")
+
+	// The fast-path burst absorber must no longer hold the failed DID; if it
+	// did, this same-DID event would be silently dropped and never retried.
+	if p := e.last.Load(); p != nil {
+		require.NotEqual(t, did, *p, "failed DID must be cleared from the last pointer")
+	}
+	require.False(t, e.cache.seen(did), "failed DID must be evicted from the seen cache")
+
+	// A later event for the still-active DID must re-enqueue (write now succeeds).
+	e.Observe(did)
+	require.Equal(t, 1, e.QueueLen(), "failed DID must re-enqueue on its next event")
+	runEnqueuerOnce(t, e)
+
+	rs, err = s.readRepoStatus(atmos.DID(did))
+	require.NoError(t, err)
+	require.NotNil(t, rs, "retry must durably create the pending row")
+	require.Equal(t, StatusPending, rs.Backfill.Status)
 }
 
 func TestEnqueueNetNewRepo_ConcurrentSameDIDCreatesOnce(t *testing.T) {

@@ -41,6 +41,7 @@ type Metrics struct {
 	EnqueueAlreadyKnown prometheus.Counter
 	EnqueueSeenCacheHit prometheus.Counter
 	EnqueueDropped      prometheus.Counter
+	EnqueueInvalidDID   prometheus.Counter
 	EnqueueQueueDepth   prometheus.Gauge
 }
 
@@ -181,6 +182,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "net_new_dropped_total",
 			Help: "Number of net-new DID enqueue requests dropped because the background enqueue queue was full. Self-healing: an active DID re-emits and is retried on the next event.",
 		}),
+		EnqueueInvalidDID: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "net_new_invalid_did_total",
+			Help: "Number of firehose events whose DID failed syntactic validation and were dropped from net-new enqueue (e.g. malformed #identity DIDs that are not signature-verified upstream). A rising value indicates upstream relay data quality issues.",
+		}),
 		EnqueueQueueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "net_new_queue_depth",
@@ -196,7 +202,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.RetryPasses, m.RetryCandidates, m.RetryAttempts,
 		m.RetrySucceeded, m.RetryFailed, m.RetrySkippedHostParked,
 		m.EnqueuedNetNew, m.EnqueueAlreadyKnown, m.EnqueueSeenCacheHit,
-		m.EnqueueDropped, m.EnqueueQueueDepth,
+		m.EnqueueDropped, m.EnqueueInvalidDID, m.EnqueueQueueDepth,
 	)
 	return m
 }
@@ -354,6 +360,12 @@ func (m *Metrics) incEnqueueSeenCacheHit() {
 func (m *Metrics) incEnqueueDropped() {
 	if m != nil {
 		m.EnqueueDropped.Inc()
+	}
+}
+
+func (m *Metrics) incEnqueueInvalidDID() {
+	if m != nil {
+		m.EnqueueInvalidDID.Inc()
 	}
 }
 

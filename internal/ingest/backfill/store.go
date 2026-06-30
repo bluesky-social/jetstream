@@ -734,6 +734,17 @@ func (s *Store) EnqueueNetNewRepo(ctx context.Context, did atmos.DID, active boo
 		return false, err
 	}
 
+	// Reject a DID we cannot round-trip through ParseDID before it becomes a
+	// durable row. The steady-state firehose only signature-verifies #commit
+	// and #sync events; #identity events (and #account verification failures)
+	// flow through to the enqueuer unverified, so a malformed upstream DID can
+	// reach here. scanDue ParseDIDs every repo/ key on each retry pass, so a
+	// persisted unparseable key would otherwise wedge the whole retry loop
+	// (and survive restarts). Drop it at the durable boundary instead.
+	if _, err := atmos.ParseDID(string(did)); err != nil {
+		return false, fmt.Errorf("backfill: enqueue net-new repo %q: invalid DID: %w", did, err)
+	}
+
 	s.countsMu.Lock()
 	defer s.countsMu.Unlock()
 
