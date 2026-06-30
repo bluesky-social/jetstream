@@ -144,7 +144,7 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 // Recoverable read/dial failures trigger a reconnect with backoff (reported to
 // emit as a non-nil error with a nil event so the caller can observe churn);
 // a context cancellation is a clean stop and returns nil.
-func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error) bool) error {
+func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) error {
 	minB, maxB := c.cfg.minBackoff(), c.cfg.maxBackoff()
 	backoff := minB
 	for {
@@ -177,7 +177,7 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error)
 			backoff = minB
 		}
 		// Report the disconnect and back off before reconnecting.
-		if err != nil && !emit(nil, nil, fmt.Errorf("jetstream: live tail reconnecting: %w", err)) {
+		if err != nil && !emit(nil, fmt.Errorf("jetstream: live tail reconnecting: %w", err)) {
 			return nil
 		}
 		if !sleep(ctx, backoff) {
@@ -192,7 +192,7 @@ var errEmitStop = errors.New("jetstream: live emit stop")
 
 // session runs one connection: dial, read-decode-emit until an error or stop.
 // A successful read resets the caller's backoff via the return path (nil err).
-func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, error) bool) error {
+func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) bool) error {
 	conn, err := c.cfg.dial(ctx, c.subscribeURL())
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -215,7 +215,7 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, er
 		if derr != nil {
 			// A malformed data frame is upstream input; surface it but keep the
 			// connection (one bad frame must not drop the tail).
-			if !emit(nil, nil, derr) {
+			if !emit(nil, derr) {
 				return errEmitStop
 			}
 			continue
@@ -230,9 +230,7 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, er
 		c.lastSeq = ev.Seq
 		c.seenAny = true
 		evCopy := ev
-		// Pass the raw frame too so the cutover buffer can persist verbatim
-		// bytes (re-decoded on replay) rather than re-marshal the decoded event.
-		if !emit(&evCopy, data, nil) {
+		if !emit(&evCopy, nil) {
 			return errEmitStop
 		}
 	}
@@ -297,6 +295,15 @@ func liveDialOptions(hc *http.Client) *websocket.DialOptions {
 // carries the server's floor-seq body for observability.
 var errLiveCursorTooOld = errors.New("jetstream: live cursor too old")
 
+// cursorTooOldMarker is the substring the server embeds in its pre-upgrade
+// "cursor too old" HTTP 400 body, which dialWebsocket matches to recognize a
+// too-old refusal. It MUST equal internal/subscribe.CursorTooOldMarker (the
+// server's source of truth); the client cannot import that package without
+// pulling the server's storage deps into the public module, so the literal is
+// duplicated here and pinned equal by TestDialWebsocketMatchesServerTooOld
+// (live_subscribe_contract_test.go), which fails CI if either side drifts.
+const cursorTooOldMarker = "cursor too old"
+
 // dialWebsocket is the production dialer. hc, when non-nil, routes the HTTP/1.1
 // upgrade through a custom transport (e.g. an in-process pipe); nil uses the
 // websocket default.
@@ -311,7 +318,7 @@ func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn,
 		if resp != nil && resp.StatusCode == http.StatusBadRequest && resp.Body != nil {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 			_ = resp.Body.Close()
-			if strings.Contains(string(body), "cursor too old") {
+			if strings.Contains(string(body), cursorTooOldMarker) {
 				return nil, fmt.Errorf("%w: %s", errLiveCursorTooOld, strings.TrimSpace(string(body)))
 			}
 		} else if resp != nil && resp.Body != nil {

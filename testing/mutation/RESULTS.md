@@ -15,11 +15,19 @@ overlay-format mutants m020/m021/m023 (`internal/overlay` deleted in #177) and
 m025 (its `Set.SnapshotRange` mechanism deleted in #178; #183 tracks
 re-deriving a #100-recorder mutant), and refreshed m015 to its post-#175
 location. Of the 7 survivors (m002, m003, m009, m013, m014, m015, m022), six are
-pre-existing documented escapes; **m022 is a KILLED→SURVIVED regression this
+pre-existing documented escapes; **m022 was a KILLED→SURVIVED regression this
 branch introduced** (its overlay-reconstruction oracle was deleted with
-`internal/overlay` in #177) — it mutates live data-loss code, so #184 tracks
-re-deriving a detecting oracle. Counts inside older dated sections describe the
-catalog *as of that date* and are intentionally not back-edited.**
+`internal/overlay` in #177) — it mutates live data-loss code. **#184 is now
+addressed (2026-06-30 review remediation):** a new `tombstone` campaign tier
+runs `./internal/tombstone`, whose `TestSnapshotShouldDropDIDChainsWithSpecificReason`
+asserts `Snapshot.ShouldDrop` in BOTH seq directions (a row below the DID
+tombstone seq is dropped; a reactivation row above it survives), so it kills the
+m022 inversion; m022's patch header now declares `tiers: tombstone`. The
+`baseline.json` disposition is still SURVIVED from the `b9543d9` run; the next
+full campaign surfaces m022 as a SURVIVED→KILLED **IMPROVEMENT** (the gate
+reports it, does not fail) and `just mutation-baseline` re-banks it KILLED.
+Counts inside older dated sections describe the catalog *as of that date* and
+are intentionally not back-edited.**
 
 ## The baseline gate (#108)
 

@@ -25,7 +25,8 @@ import (
 //     events/sec (10x current network throughput), reaching 1e15 takes
 //     >300 years.
 //
-// See docs/superpowers/specs/2026-05-28-jetstream-v1-cursor-design.md §4.1.
+// See specs/notes/2026-05-27-cursor-replay-design.md (the non-overlap argument)
+// and docs/README.md §5.1, which carry the authoritative 1e15 value.
 const CursorSeqMaxThreshold uint64 = 1_000_000_000_000_000
 
 // CursorMode discriminates the resolved cursor's intended replay
@@ -96,12 +97,34 @@ type CursorEnv struct {
 // ?cursor= query parameter. The handler converts this into HTTP 400.
 var ErrInvalidCursor = errors.New("subscribe: invalid cursor")
 
+// CursorTooOldMarker is the stable substring every "cursor too old" rejection
+// message contains. It is the WIRE CONTRACT the Go client keys on: the
+// pre-upgrade HTTP 400 body is returned verbatim to the client, which maps it
+// to a terminal "re-backfill" signal by matching this substring (see
+// internal/client live.go dialWebsocket and the cross-package contract test
+// that asserts the two literals stay equal). The client cannot import this
+// package (it would pull the server's pebble/manifest deps into the public
+// client module), so the literal is duplicated there and locked by that test.
+// Changing this string is a wire-contract change — update both sides together.
+const CursorTooOldMarker = "cursor too old"
+
 // ErrCursorTooOld is returned (only when CursorEnv.RejectBelowFloor is set —
 // the v2 policy) when a seq cursor resolves below the lookback floor. The
 // handler converts it into HTTP 400; its message carries both the requested
 // seq and the floor seq so the client can re-backfill from its last seq. v1
-// never returns this (it clamps instead).
-var ErrCursorTooOld = errors.New("subscribe: cursor too old")
+// never returns this (it clamps instead). Its message embeds CursorTooOldMarker
+// so the client's substring match has a single source of truth.
+var ErrCursorTooOld = errors.New("subscribe: " + CursorTooOldMarker)
+
+// ErrCursorResolveFailed marks a SERVER-side failure while resolving a
+// well-formed cursor — a segment read/decode/index-load fault during
+// timestamp-to-seq translation, not bad client input. It is distinct from
+// ErrInvalidCursor (a client parse error → HTTP 400): a disk/decode fault is
+// 5xx-class, the client should retry, operators must see it on the 5xx signal,
+// and the internal segment path/index it wraps must NOT be echoed to the
+// client. The handler maps it to HTTP 503 with a generic body and logs the
+// wrapped detail server-side.
+var ErrCursorResolveFailed = errors.New("subscribe: cursor resolution failed")
 
 // ResolveCursor parses the raw query value and decides how the
 // connection should proceed. See cursor_test.go for the matrix of
@@ -166,7 +189,11 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 	}
 	startSeq, clamped, err := translateTimeUSToSeq(env, n)
 	if err != nil {
-		return CursorPlan{}, fmt.Errorf("subscribe: translate cursor: %w", err)
+		// A segment read/decode/index-load fault here is a SERVER fault, not bad
+		// client input: tag it so the handler returns 5xx (retryable, visible on
+		// the 5xx signal) rather than a 400 that the client treats as permanent —
+		// and so the wrapped internal segment path is not echoed to the client.
+		return CursorPlan{}, fmt.Errorf("%w: %w", ErrCursorResolveFailed, err)
 	}
 	plan.StartSeq = startSeq
 	if clamped {

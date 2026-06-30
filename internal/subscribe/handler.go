@@ -176,10 +176,22 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		})
 		deps.Metrics.observeCursorResolveSeconds(time.Since(resolveStart).Seconds())
 		if err != nil {
-			// A too-old v2 seq cursor is a distinct, expected signal (the client
-			// re-backfills), not a malformed request; label it separately so it
-			// stays visible apart from parse-error 400s.
-			if errors.Is(err, ErrCursorTooOld) {
+			switch {
+			case errors.Is(err, ErrCursorResolveFailed):
+				// A SERVER-side fault while resolving a well-formed cursor (a
+				// segment read/decode/index-load failure during timestamp
+				// translation). This is 5xx-class, not a client bad-request: the
+				// client should retry, operators must see it on the 5xx signal,
+				// and the wrapped internal segment path must NOT leak to the
+				// client. Log the detail server-side; return a generic 503.
+				logger.Error("cursor resolution failed", "err", err, "raw_cursor", rawCursor)
+				deps.Metrics.incCursorRequests("resolve_failed")
+				http.Error(w, "service not ready: cursor resolution failed", http.StatusServiceUnavailable)
+				return
+			case errors.Is(err, ErrCursorTooOld):
+				// A too-old v2 seq cursor is a distinct, expected signal (the
+				// client re-backfills), not a malformed request; label it
+				// separately so it stays visible apart from parse-error 400s.
 				deps.Metrics.incCursorRequests("too_old")
 			}
 			http.Error(w, err.Error(), http.StatusBadRequest)

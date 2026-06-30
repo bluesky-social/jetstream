@@ -10,9 +10,14 @@ import (
 // ScanMaxSeq returns the maximum Seq value across all fully-durable
 // blocks of an active segment file. The bool reports whether any
 // events were observed; on an empty active segment (zero blocks) it
-// returns (0, false, nil). The bool disambiguates "max is 0" from
-// "no events" — seq=0 is a valid first-event value, so callers must
-// gate forward-correction on found=true.
+// returns (0, false, nil).
+//
+// Under the 1-based seq design (§R8) the first real event is seq 1 and
+// seq 0 is the reserved "nothing yet" sentinel, never a stored event
+// value. The bool therefore disambiguates an empty active segment
+// (0, false) from a real seq envelope; callers must still gate
+// forward-correction (e.g. flooring nextSeq to maxSeq+1) on found=true
+// rather than on maxSeq>0, since a recovered segment's max is always >=1.
 //
 // Intended for crash recovery in callers that own the active-segment
 // lifecycle (e.g. internal/ingest). The walk is bounded by

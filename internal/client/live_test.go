@@ -89,7 +89,7 @@ func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = c.Run(ctx, func(ev *Event, _ []byte, err error) bool {
+		_ = c.Run(ctx, func(ev *Event, err error) bool {
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -282,13 +282,14 @@ func TestLiveConsumerSubscribeURLForwardsFilters(t *testing.T) {
 	require.NotContains(t, u2, "wantedDids", "no DID filter -> no param")
 }
 
-// TestLiveConsumerSubscribeURLCursorZero guards the backfill->live cutover whose
-// rewind start lands at seq 0 (sealed tip below the rewind margin, or an empty
-// archive): it must REPLAY from the beginning, not live-tail from the tip. A
-// cursor of 0 with fromTip unset sends cursor=0 onto the wire (the server
-// resolves it as a replay from the start); fromTip is the distinct "live from
-// tip" contract that omits the param. Without sending cursor=0 the entire
-// (plannedThroughSeq, tip] band would be dropped.
+// TestLiveConsumerSubscribeURLCursorZero guards the bufferless cutover's
+// empty-archive case: when the sealed archive is empty the cutover seq is 0, so
+// the live consumer connects with cursor=0, which must REPLAY from the first
+// event, not live-tail from the tip. A cursor of 0 with fromTip unset sends
+// cursor=0 onto the wire (the server resolves it as a replay from the start);
+// fromTip is the distinct WithLiveCursor(0) "live from tip" contract that omits
+// the param. Without sending cursor=0 the first events on a from-empty archive
+// would be skipped.
 func TestLiveConsumerSubscribeURLCursorZero(t *testing.T) {
 	t.Parallel()
 	c := newLiveConsumer(liveConfig{host: "https://h", cursor: 0})
@@ -379,7 +380,7 @@ func TestLiveConsumerCursorTooOldIsTerminal(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.Run(context.Background(), func(*Event, []byte, error) bool { return true })
+		errCh <- c.Run(context.Background(), func(*Event, error) bool { return true })
 	}()
 	select {
 	case err := <-errCh:
@@ -402,7 +403,7 @@ func TestLiveConsumerContextCancelCleanStop(t *testing.T) {
 	var got int
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.Run(ctx, func(ev *Event, _ []byte, err error) bool {
+		errCh <- c.Run(ctx, func(ev *Event, err error) bool {
 			if err == nil && ev != nil {
 				got++
 				cancel()

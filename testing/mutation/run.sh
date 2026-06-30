@@ -270,6 +270,18 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          ./internal/oracle ./internal/manifest
                          -run 'TestPartB|TestPlanBackfill'
                          -count=1 -short -timeout "$default_timeout") ;;
+                tombstone)
+                    # Tombstone tier (#184): kills live compaction-suppression
+                    # mutants in tombstone.Snapshot.ShouldDrop / observeLocked
+                    # (e.g. m022, which inverts the DID-tombstone seq guard so a
+                    # superseded row survives and a reactivated row is dropped —
+                    # a data-loss path). TestOracle_DefaultLifecycle no longer
+                    # reaches these directly (the overlay-reconstruction oracle
+                    # that used to was deleted in #177), but the tombstone unit
+                    # tests assert ShouldDrop in BOTH seq directions, so they
+                    # kill the inversion fast and without an end-to-end run.
+                    cmd=(go test "${RACE_FLAG[@]}" ./internal/tombstone
+                         -count=1 -timeout "$default_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2
                     exit 1 ;;

@@ -127,6 +127,11 @@ func WithAfterSeq(seq uint64) Option {
 // WithBeforeSeq sets the inclusive upper sequence bound for backfill: only
 // events with seq <= beforeSeq are delivered from the archive. Enables the
 // historical backfill path.
+//
+// It requires WithBackfillOnly: a beforeSeq is meaningful only as a bounded
+// archive dump. On a backfill-then-live subscription the same upper bound would
+// gate the live tail and silently drop every event past beforeSeq, so Subscribe
+// rejects WithBeforeSeq unless WithBackfillOnly is also set.
 func WithBeforeSeq(seq uint64) Option {
 	return func(c *config) {
 		c.hasBeforeSeq = true

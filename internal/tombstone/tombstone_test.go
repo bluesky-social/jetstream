@@ -58,12 +58,23 @@ func TestSnapshotShouldDropDIDChainsWithSpecificReason(t *testing.T) {
 				Records: map[RecordKey]uint64{},
 				DIDs:    map[string]DIDTombstone{"did:plc:a": tc.tombstone},
 			}
+			// A materialization BELOW the tombstone seq is superseded → dropped.
 			drop, reason := snap.ShouldDrop(&segment.Event{Seq: 9, Kind: segment.KindUpdate, DID: "did:plc:a"})
-			require.True(t, drop)
+			require.True(t, drop, "a row below the DID tombstone seq must be dropped")
 			require.Equal(t, tc.reason, reason)
 
+			// The tombstone marker seq itself is retained (boundary: not strictly less).
 			drop, _ = snap.ShouldDrop(&segment.Event{Seq: 10, Kind: segment.KindCreate, DID: "did:plc:a"})
 			require.False(t, drop, "tombstone marker seq itself must be retained")
+
+			// A materialization ABOVE the tombstone seq is a post-delete
+			// reactivation and MUST survive. This is the data-loss direction the
+			// m022 mutant inverts (ts.Seq > ev.Seq -> <): under the inversion this
+			// live row would be dropped while the superseded seq-9 row above would
+			// be kept. Asserting both directions is what makes the tombstone unit
+			// suite kill m022 (see the mutation `tombstone` tier).
+			drop, _ = snap.ShouldDrop(&segment.Event{Seq: 11, Kind: segment.KindCreate, DID: "did:plc:a"})
+			require.False(t, drop, "a row above the DID tombstone seq (reactivation) must survive")
 		})
 	}
 }

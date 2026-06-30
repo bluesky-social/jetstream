@@ -481,6 +481,77 @@ func TestReaderOpenRejectsOverlappingBlockIndex(t *testing.T) {
 	require.True(t, errors.Is(err, ErrInvalidBlockIndex))
 }
 
+// TestValidateBlockOffsetsCrossBlockSeqMonotonicity exercises the load-bearing
+// cross-block seq-disjointness invariant the backfill planner's continuation
+// cursor depends on (internal/manifest/plan.go): a later non-empty block must
+// never carry a MinSeq <= a prior non-empty block's MaxSeq, or the planner would
+// silently skip it. Empty (compacted-to-empty) blocks keep stale seq bounds and
+// must be excluded from the comparison.
+func TestValidateBlockOffsetsCrossBlockSeqMonotonicity(t *testing.T) {
+	t.Parallel()
+
+	// Build contiguous, valid offsets so ONLY the seq check can fail. Each
+	// block occupies [off, off+8+size); footer sits past the last block.
+	const size = 10
+	mk := func(infos ...BlockInfo) ([]BlockInfo, uint64) {
+		off := uint64(ReservedHeaderBytes)
+		out := make([]BlockInfo, len(infos))
+		for i, b := range infos {
+			b.Offset = off
+			b.CompressedSize = size
+			out[i] = b
+			off += 8 + size
+		}
+		return out, off // footerOffset just past the last block
+	}
+
+	t.Run("ascending disjoint blocks pass", func(t *testing.T) {
+		t.Parallel()
+		blocks, footer := mk(
+			BlockInfo{EventCount: 2, MinSeq: 1, MaxSeq: 5},
+			BlockInfo{EventCount: 2, MinSeq: 6, MaxSeq: 9},
+		)
+		require.NoError(t, validateBlockOffsets(blocks, footer))
+	})
+
+	t.Run("out-of-order block max_seq is rejected", func(t *testing.T) {
+		t.Parallel()
+		// Block 1's MinSeq (4) <= block 0's MaxSeq (5): the planner would set
+		// afterSeq=5 after block 0 and then drop block 1 (MaxSeq 8 > 5 keeps it,
+		// but a block whose MaxSeq <= prior would be skipped). The disjointness
+		// guard rejects the overlap itself.
+		blocks, footer := mk(
+			BlockInfo{EventCount: 2, MinSeq: 1, MaxSeq: 5},
+			BlockInfo{EventCount: 2, MinSeq: 4, MaxSeq: 8},
+		)
+		err := validateBlockOffsets(blocks, footer)
+		require.ErrorIs(t, err, ErrInvalidBlockIndex)
+	})
+
+	t.Run("later block fully below prior is rejected (the silent-skip shape)", func(t *testing.T) {
+		t.Parallel()
+		blocks, footer := mk(
+			BlockInfo{EventCount: 2, MinSeq: 10, MaxSeq: 20},
+			BlockInfo{EventCount: 2, MinSeq: 3, MaxSeq: 7}, // MaxSeq 7 <= prior afterSeq 20 => skipped
+		)
+		err := validateBlockOffsets(blocks, footer)
+		require.ErrorIs(t, err, ErrInvalidBlockIndex)
+	})
+
+	t.Run("empty compacted blocks with stale bounds are skipped", func(t *testing.T) {
+		t.Parallel()
+		// A compaction-to-empty rewrite keeps the original [MinSeq,MaxSeq]
+		// envelope on a now-zero-event block. Its stale bounds (here overlapping
+		// the neighbors) must NOT trip the monotonicity check.
+		blocks, footer := mk(
+			BlockInfo{EventCount: 2, MinSeq: 1, MaxSeq: 5},
+			BlockInfo{EventCount: 0, MinSeq: 1, MaxSeq: 9}, // emptied, stale envelope
+			BlockInfo{EventCount: 2, MinSeq: 6, MaxSeq: 9},
+		)
+		require.NoError(t, validateBlockOffsets(blocks, footer))
+	})
+}
+
 func TestReaderConcurrentDecodeBlock(t *testing.T) {
 	t.Parallel()
 

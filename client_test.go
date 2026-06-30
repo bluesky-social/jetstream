@@ -135,13 +135,20 @@ func TestSubscribeValidation(t *testing.T) {
 	_, err := Subscribe("")
 	require.Error(t, err, "empty host must error")
 
-	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(100))
+	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(100), WithBackfillOnly())
 	require.Error(t, err, "beforeSeq must be strictly greater than afterSeq")
 
-	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(50))
+	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(50), WithBackfillOnly())
 	require.Error(t, err)
 
-	c, err := Subscribe("host", WithAfterSeq(10), WithBeforeSeq(100))
+	// WithBeforeSeq requires WithBackfillOnly: on a backfill-then-live
+	// subscription the archive upper bound would also gate the live tail and
+	// silently drop every event past beforeSeq (F1).
+	_, err = Subscribe("host", WithAfterSeq(10), WithBeforeSeq(100))
+	require.ErrorContains(t, err, "WithBeforeSeq requires WithBackfillOnly")
+
+	// With WithBackfillOnly it is a coherent bounded dump.
+	c, err := Subscribe("host", WithAfterSeq(10), WithBeforeSeq(100), WithBackfillOnly())
 	require.NoError(t, err)
 	require.NoError(t, c.Close())
 

@@ -296,7 +296,7 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	// /subscribe-v2 (the client does not forward wantedCollections as a hard
 	// filter), so the engine must drop non-matching events itself. A nil/empty
 	// matcher matches everything, so an unfiltered tail is unaffected.
-	runErr := consumer.Run(liveCtx, func(ev *Event, _ []byte, err error) bool {
+	runErr := consumer.Run(liveCtx, func(ev *Event, err error) bool {
 		if err != nil {
 			return b.emitError(err)
 		}
@@ -691,7 +691,7 @@ func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover ui
 		backoffMin:  e.cfg.LiveBackoffMin,
 		mode:        e.cfg.recordMode(),
 	})
-	err := consumer.Run(ctx, func(ev *Event, _ []byte, cerr error) bool {
+	err := consumer.Run(ctx, func(ev *Event, cerr error) bool {
 		if cerr != nil {
 			// A recoverable live read/reconnect error: surface it (do not swallow —
 			// CLAUDE.md) but keep tailing. The consumer rejecting it stops batching.

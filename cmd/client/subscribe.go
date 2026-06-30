@@ -40,7 +40,7 @@ func subscribeCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:  "before-seq",
-				Usage: "Backfill upper bound (inclusive); 0 means unset",
+				Usage: "Backfill upper bound (inclusive); 0 means unset. Requires --backfill-only (a bounded dump); it cannot be combined with the live cutover.",
 				Value: 0,
 			},
 			&cli.BoolFlag{
@@ -141,6 +141,13 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 	// bounded backfill into an unbounded one with no signal.
 	if before := cmd.Int("before-seq"); before < 0 {
 		return fmt.Errorf("--before-seq must be >= 0, got %d", before)
+	}
+	// --before-seq is an archive upper bound and only makes sense as a bounded
+	// dump: combining it with the live cutover would silently drop every live
+	// event past the bound (the library rejects it too; surface it here with an
+	// actionable CLI message first).
+	if cmd.Int("before-seq") > 0 && !cmd.Bool("backfill-only") {
+		return fmt.Errorf("--before-seq requires --backfill-only")
 	}
 	if lc := cmd.Int("live-cursor"); lc < 0 {
 		return fmt.Errorf("--live-cursor must be >= 0, got %d", lc)

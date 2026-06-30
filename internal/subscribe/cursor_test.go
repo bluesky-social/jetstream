@@ -1,6 +1,7 @@
 package subscribe_test
 
 import (
+	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -9,6 +10,45 @@ import (
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/stretchr/testify/require"
 )
+
+// TestResolveCursor_TranslateIOFaultIsResolveFailed verifies that a server-side
+// segment read failure during timestamp-to-seq translation is classified as
+// ErrCursorResolveFailed (5xx-class) rather than ErrInvalidCursor/ErrCursorTooOld
+// (client-error, 400) — so the handler returns a retryable 503 and does not echo
+// the internal segment path. The cursor is in-window and well-formed: the only
+// fault is the missing segment file the manifest still references.
+func TestResolveCursor_TranslateIOFaultIsResolveFailed(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	segPath := filepath.Join(dir, "seg_0000000000.jss")
+	mustWriteSealedSegment(t, segPath, sealedFixture{
+		minSeq: 1, maxSeq: 9,
+		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:   9,
+	})
+	m := mustOpenManifest(t, dir)
+
+	// Remove the segment file AFTER the manifest cached its bounds, so the
+	// translation's block-scan segment.Open fails on a well-formed in-window
+	// cursor (a stand-in for a corrupt/transiently-unreadable sealed file).
+	require.NoError(t, os.Remove(segPath))
+
+	// A cursor strictly inside the segment's indexed-at range routes past the
+	// older/newer-than-all short-circuits into the block scan that opens the file.
+	cursor := now - int64(5*time.Hour/time.Microsecond)
+	_, err := subscribe.ResolveCursor(strconv.FormatInt(cursor, 10), subscribe.CursorEnv{
+		Manifest: m,
+		NextSeq:  10,
+		Lookback: 36 * time.Hour,
+	})
+	require.Error(t, err)
+	require.ErrorIs(t, err, subscribe.ErrCursorResolveFailed,
+		"a segment-read fault during translation must be a server resolve failure, not a client error")
+	require.NotErrorIs(t, err, subscribe.ErrInvalidCursor)
+	require.NotErrorIs(t, err, subscribe.ErrCursorTooOld)
+}
 
 func TestResolveCursor_EmptyMeansLive(t *testing.T) {
 	t.Parallel()

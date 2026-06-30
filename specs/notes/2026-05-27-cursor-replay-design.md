@@ -1,5 +1,20 @@
 # Subscriber cursor replay — design
 
+> ⚠ SUPERSEDED VALUES (2026-06-30). This note states the v2/v1 cursor
+> disambiguation floor as `1.5e15` throughout (the table at "Wire contract", the
+> "Risk notes", and the Constraints). The value that actually ships is **`1e15`**
+> (`CursorSeqMaxThreshold = 1_000_000_000_000_000`, `internal/subscribe/cursor.go`;
+> `docs/README.md` §5.1 is authoritative). Read every `1.5e15` here as `1e15`. The
+> argument still holds at `1e15`: `1e15` unix-micros is 2001-09-09, an order of
+> magnitude below any current timestamp (~1.75e15) and the 36h lookback floor, and
+> a 1-based v2 seq counter does not approach `1e15` for centuries at any realistic
+> ingest rate — so the two namespaces remain provably non-overlapping. (The note's
+> "predates atproto ~Jan 2017" wording was specific to 1.5e15 and does not apply to
+> the shipped 1e15; the bound is the timestamp/seq order-of-magnitude gap, not the
+> 2017 anchor.) Also note v2 `/subscribe-v2` now REJECTS a too-old below-floor seq
+> cursor with HTTP 400 rather than the "no window cap" replay this note describes;
+> v1 still clamps. This note is kept as the reasoning trail only.
+
 ## Problem
 
 Today the `/subscribe` handler only delivers live events: a connecting

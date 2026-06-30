@@ -446,12 +446,33 @@ func (r *Reader) BlocksContainingDID(did string) ([]int, error) {
 
 // validateBlockOffsets verifies every block's [offset, offset+8+size]
 // range fits before the footer, that ranges are strictly ascending and
-// non-overlapping (since that's how Seal writes them), and that
-// MaxSeq >= MinSeq within each entry. A malformed block index that
-// passes per-entry bounds checks but is internally inconsistent could
-// otherwise surface as confusing decode errors at DecodeBlock time.
+// non-overlapping (since that's how Seal writes them), that
+// MaxSeq >= MinSeq within each entry, and that consecutive non-empty
+// blocks are seq-disjoint and index-monotonic (block[i].MaxSeq <
+// block[i+1].MinSeq). A malformed block index that passes per-entry
+// bounds checks but is internally inconsistent could otherwise surface
+// as confusing decode errors at DecodeBlock time.
+//
+// The cross-block seq-monotonicity check is load-bearing for the backfill
+// planner: PlanBackfill's truncation continuation cursor is the last
+// included block's MaxSeq, and the next page's exclusive afterSeq drops
+// every block with MaxSeq <= that cursor (internal/manifest/plan.go). That
+// is gap-free ONLY if a later block never carries a smaller MaxSeq; a
+// segment that reached disk with out-of-order per-block seq bounds would
+// otherwise make the planner silently skip a block (silent data loss). The
+// single-writer ingest path holds this invariant (seqs assigned under one
+// lock, seal walks frames in ascending offset), so this check fails loud
+// on a corrupt/foreign/regressed segment rather than letting it serve.
 func validateBlockOffsets(blocks []BlockInfo, footerOffset uint64) error {
 	var prevEnd uint64 = ReservedHeaderBytes
+	// prevMaxSeq tracks the MaxSeq of the most recent NON-EMPTY block.
+	// Empty (EventCount==0) blocks are skipped: a compaction-to-empty
+	// rewrite preserves the block's original MinSeq/MaxSeq envelope
+	// (segment/rewrite.go) even though it now holds no rows, so its stale
+	// bounds must not gate the monotonicity comparison. hasPrevSeq guards
+	// the first non-empty block.
+	var prevMaxSeq uint64
+	hasPrevSeq := false
 	for i, b := range blocks {
 		// Guard against b.CompressedSize+8 overflowing uint64 on
 		// hostile input.
@@ -480,6 +501,15 @@ func validateBlockOffsets(blocks []BlockInfo, footerOffset uint64) error {
 			return fmt.Errorf(
 				"%w: block %d has max_indexed_at %d < min_indexed_at %d",
 				ErrInvalidBlockIndex, i, b.MaxIndexedAt, b.MinIndexedAt)
+		}
+		if b.EventCount > 0 {
+			if hasPrevSeq && b.MinSeq <= prevMaxSeq {
+				return fmt.Errorf(
+					"%w: block %d min_seq %d not greater than prior non-empty block max_seq %d (blocks must be seq-disjoint and index-monotonic; the backfill planner cursor depends on it)",
+					ErrInvalidBlockIndex, i, b.MinSeq, prevMaxSeq)
+			}
+			prevMaxSeq = b.MaxSeq
+			hasPrevSeq = true
 		}
 		prevEnd = end
 	}

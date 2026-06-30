@@ -5,11 +5,13 @@ failure-mode: |
   account-delete/sync tombstones suppress the wrong rows: superseded
   records survive and live records get dropped.
 expected-detection: |
-  CheckCompacted ('superseded account/sync row survived') and/or
-  assertOverlayReconstruction in TestOracle_DefaultLifecycle. Default
-  tier.
-expected-tier: default
-tiers: default
+  tombstone tier: TestSnapshotShouldDropDIDChainsWithSpecificReason asserts
+  ShouldDrop in BOTH seq directions (a row below the DID tombstone seq is
+  dropped; a reactivation row above it survives), so the inversion fails the
+  unit suite. The overlay-reconstruction oracle that previously killed it was
+  deleted with internal/overlay in #177; this tier (#184) restores the gate.
+expected-tier: tombstone
+tiers: tombstone
 
 diff --git a/internal/tombstone/tombstone.go b/internal/tombstone/tombstone.go
 index 7ef135e..d8287e7 100644
