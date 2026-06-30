@@ -589,6 +589,135 @@ func TestWalkFromCursor_NilManifestLenient(t *testing.T) {
 		"nil-manifest walk stopped short: last %d, highest %d", emitted[len(emitted)-1], highest)
 }
 
+// TestWalkFromCursor_EmptyActiveSuccessorSeam pins the rotation seam variant
+// with NO in-band hole signal: rotation sealed+published segment N, bumped
+// activeIdx to N+1, and opened an EMPTY N+1 with no events yet appended. A walk
+// whose sealed sweep snapshotted the manifest BEFORE N was published stops at
+// the start of N's range, then reads the empty active successor — which emits
+// nothing and reports hole=false because no event sits ABOVE the cursor.
+//
+// The other seam tests all keep the active segment NON-empty (events above the
+// gap drive hole=true); none exercise this empty-successor state. Without the
+// convergence check on Writer.NextSeq(), WalkFromCursor returns here with the
+// cursor unchanged, so ColdReader.Read hands the subscriber loop a
+// non-advancing (next==cursor) batch and handler.go disconnects it — even
+// though N is durable and recoverable from the manifest. This test withholds N,
+// publishes it from the onSeamRetry hook (the only callback that fires, since
+// nothing is emitted on pass 1), and asserts the walk converges to the full
+// contiguous range. Regression test for the cold-read rotation seam (issue
+// #190), empty-active-successor variant.
+func TestWalkFromCursor_EmptyActiveSuccessorSeam(t *testing.T) {
+	dir := t.TempDir()
+	segDir := filepath.Join(dir, "segments")
+	require.NoError(t, os.MkdirAll(segDir, 0o755))
+
+	st, err := store.Open(dir, store.NewMetrics(prometheus.NewRegistry()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	m, err := manifest.Open(manifest.Options{
+		SegmentsDir: segDir,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	require.NoError(t, m.Wait(context.Background()))
+
+	type sealEvent struct {
+		idx  uint64
+		path string
+	}
+	var seals []sealEvent
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       segDir,
+		Store:             st,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   512,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           ingest.NewMetrics(prometheus.NewRegistry()),
+		OnAfterSeal: func(idx uint64, path string) error {
+			seals = append(seals, sealEvent{idx, path})
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	// Append until the writer has rotated to active index 3. The append that
+	// triggers each rotation seals the just-filled segment and opens an empty
+	// successor; we stop the instant ActiveIndex first reaches 3, so segment 3
+	// (the active file) holds ZERO events and ZERO pending — the empty
+	// successor this test is about. seals == [0,1,2].
+	for w.ActiveIndex() < 3 {
+		ev := segment.Event{
+			IndexedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
+			DID: "did:plc:emptyseam", Collection: "app.bsky.feed.post",
+			Rkey: "r", Rev: "v", Payload: []byte{0xa0},
+		}
+		require.NoError(t, w.Append(context.Background(), &ev))
+	}
+	require.GreaterOrEqual(t, len(seals), 3, "need segments 0,1,2 sealed with 3 active+empty")
+	require.Empty(t, w.SnapshotPending(), "active successor must be empty for this seam")
+
+	// Publish segments 0 and 1; WITHHOLD segment 2 (the gap N). The walk's
+	// first sealed sweep therefore stops at the start of segment 2's range,
+	// and the empty active successor (index 3) cannot fill it.
+	require.NoError(t, m.OnSegmentSealed(seals[0].idx, seals[0].path))
+	require.NoError(t, m.OnSegmentSealed(seals[1].idx, seals[1].path))
+	segN := seals[2]
+
+	rN, err := segment.Open(segment.ReaderConfig{Path: segN.path})
+	require.NoError(t, err)
+	segNMin := rN.Header().MinSeq
+	require.NoError(t, rN.Close())
+
+	// With segment 2 the last sealed and the active successor empty, the live
+	// tip is exactly one past segment 2's max.
+	highest := w.NextSeq() - 1
+	require.Greater(t, highest, segNMin, "withheld segment must hold >= 1 event above the start cursor")
+
+	var published atomic.Bool
+	var retries []uint64
+	var emitted []uint64
+	input := subscribe.WithSeamRetryObserver(subscribe.WalkInput{
+		StartSeq: segNMin,
+		Manifest: m,
+		Writer:   w,
+	}, func(holeSeq uint64) {
+		retries = append(retries, holeSeq)
+		// Publish the withheld gap segment exactly once, at the moment the walk
+		// detects the sub-tip gap and decides to retry. This is the ONLY
+		// callback that fires on pass 1 — the empty active emits nothing — so
+		// the seam is invisible to the emit callback the converge test relies
+		// on. A walk that returned at !hole would never reach this hook.
+		if published.CompareAndSwap(false, true) {
+			require.NoError(t, m.OnSegmentSealed(segN.idx, segN.path))
+		}
+	})
+	err = subscribe.WalkFromCursor(context.Background(), input, func(ev *segment.Event) error {
+		emitted = append(emitted, ev.Seq)
+		return nil
+	})
+	require.NoError(t, err)
+
+	// The seam must have been detected with no in-band hole signal: the only
+	// way to observe it is the NextSeq() convergence check.
+	require.NotEmpty(t, retries, "empty-active-successor seam was not detected (no retry fired)")
+
+	// The walk must converge to the full contiguous run [segNMin..highest].
+	// Without the fix, emitted is empty (the walk returns at the unchanged
+	// cursor) and these assertions fail.
+	require.NotEmpty(t, emitted, "walk emitted nothing: empty-active seam dropped the withheld segment")
+	require.Equal(t, segNMin, emitted[0])
+	for i := 1; i < len(emitted); i++ {
+		require.Equalf(t, emitted[i-1]+1, emitted[i],
+			"hole in converged walk at index %d: %v", i, tailOf(emitted, i+1))
+	}
+	require.Equalf(t, highest, emitted[len(emitted)-1],
+		"converged walk stopped short: last emitted %d, highest durable %d", emitted[len(emitted)-1], highest)
+	t.Logf("empty-active seam converged: retries at %v, emitted contiguous [%d..%d] (%d events)",
+		retries, emitted[0], emitted[len(emitted)-1], len(emitted))
+}
+
 func firstN(s []uint64, n int) []uint64 {
 	if len(s) < n {
 		return s

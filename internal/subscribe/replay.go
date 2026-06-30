@@ -33,8 +33,9 @@ type WalkInput struct {
 	BlockCache *blockCache
 
 	// onSeamRetry, when non-nil, is invoked once for each rotation-seam
-	// convergence retry (i.e. each time the active region reports a hole and
-	// the walk re-enters the sealed sweep to fill it). Optional; used by
+	// convergence retry (i.e. each time the active region reports a hole — or
+	// an empty active successor leaves a sub-tip gap — and the walk re-enters
+	// the sealed sweep to fill it). Optional; used by
 	// tests to assert the retry path is exercised, and a natural hook point
 	// for a future operator metric counting how often the cold-read seam is
 	// hit. It carries the seq at which the hole was observed.
@@ -81,7 +82,11 @@ type WalkInput struct {
 //     never jumped over. This holds even if the loop below did nothing.
 //
 //   - Convergence (seamlessness / no spurious disconnect): on a detected hole
-//     we re-enter the sealed sweep from `current` and retry. This fills the
+//     we re-enter the sealed sweep from `current` and retry. A hole is either
+//     an in-band gap (the active region saw an event above `current`) or a
+//     sub-tip gap with NO in-band signal: rotation sealed+published N, bumped
+//     activeIdx to N+1, and opened an EMPTY N+1, so the active sweep emits
+//     nothing yet `current < Writer.NextSeq()`. Both retry. This fills the
 //     hole within the same call instead of forcing a caller re-invocation
 //     (which, at a hot-ring miss, would surface as a disconnect). It is sound
 //     and bounded because:
@@ -141,12 +146,31 @@ func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Eve
 		current = next
 
 		if !hole {
-			return nil
+			// The active region reported no in-band hole, but a rotation can
+			// still have left an UNFILLED gap below the live tip that the
+			// active sweep cannot see: rotateLocked seals+publishes segment N,
+			// bumps activeIdx to N+1, and opens an EMPTY N+1. A walk that read
+			// the manifest before N was published then sees an empty active
+			// successor — it emits nothing and reports hole=false, yet
+			// current still sits at the start of N's range. Returning here
+			// would hand the caller a non-advancing batch (next==cursor) and
+			// disconnect the subscriber even though N is now recoverable from
+			// the manifest. So: if the writer has durably allocated seqs at or
+			// above current, the gap is fillable — treat it as a hole and
+			// retry the sealed sweep, which (per the happens-before below)
+			// now sees the freshly-published segment(s). Only when current has
+			// reached the live tip is the walk genuinely complete.
+			if current >= input.Writer.NextSeq() {
+				return nil
+			}
+			hole = true
 		}
 
-		// A hole was detected: the active region sits above an unfilled gap.
-		// Retry the sealed sweep, which (per the happens-before above) now
-		// sees the freshly-published segment(s).
+		// A hole was detected (either the active region saw an event above
+		// current, or the convergence check above found durable seqs the
+		// active successor could not serve). Retry the sealed sweep, which
+		// (per the happens-before above) now sees the freshly-published
+		// segment(s).
 		if input.onSeamRetry != nil {
 			input.onSeamRetry(current)
 		}
