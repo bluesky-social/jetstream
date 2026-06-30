@@ -57,16 +57,11 @@ type Subscription struct {
 	// advancing over Sync 1.1 resync replacement rows without emitting them.
 	EmitResyncReplacementRows bool
 
-	// FilterIdentityByCollection enables the v2 presentation policy used by
-	// /subscribe-v2: a subscriber with a collection filter does not receive
-	// #identity events (which carry no collection). The default false
-	// preserves Jetstream v1 behavior, where identity events bypass the
-	// collection filter entirely (v1 README: "Regardless of desired
-	// collections, all subscribers receive Account and Identity events").
-	// #account events bypass the collection filter under BOTH policies because
-	// they carry the DID-deletion tombstone the v2 client needs to suppress
-	// stale records; see Filter.Wants.
-	FilterIdentityByCollection bool
+	// RejectCursorBelowFloor enables the v2 too-old policy: a seq cursor that
+	// resolves below the lookback floor returns a pre-upgrade HTTP 400 carrying
+	// the floor seq, instead of being silently clamped. Set true on
+	// /subscribe-v2; the default false preserves v1's legacy silent clamp.
+	RejectCursorBelowFloor bool
 }
 
 func (d Subscription) writer() *ingest.Writer {
@@ -123,7 +118,6 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		http.Error(w, perr.Error(), http.StatusBadRequest)
 		return
 	}
-	initialFilter = initialFilter.withIdentityCollectionPolicy(deps.FilterIdentityByCollection)
 
 	requireHello := parseRequireHello(values)
 	extended := values.Get("extended") == "true"
@@ -175,12 +169,31 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		}
 		resolveStart := time.Now()
 		plan, err := ResolveCursor(rawCursor, CursorEnv{
-			Manifest: deps.Manifest,
-			NextSeq:  deps.writer().NextSeq(),
-			Lookback: deps.Lookback,
+			Manifest:         deps.Manifest,
+			NextSeq:          deps.writer().NextSeq(),
+			Lookback:         deps.Lookback,
+			RejectBelowFloor: deps.RejectCursorBelowFloor,
 		})
 		deps.Metrics.observeCursorResolveSeconds(time.Since(resolveStart).Seconds())
 		if err != nil {
+			switch {
+			case errors.Is(err, ErrCursorResolveFailed):
+				// A SERVER-side fault while resolving a well-formed cursor (a
+				// segment read/decode/index-load failure during timestamp
+				// translation). This is 5xx-class, not a client bad-request: the
+				// client should retry, operators must see it on the 5xx signal,
+				// and the wrapped internal segment path must NOT leak to the
+				// client. Log the detail server-side; return a generic 503.
+				logger.Error("cursor resolution failed", "err", err, "raw_cursor", rawCursor)
+				deps.Metrics.incCursorRequests("resolve_failed")
+				http.Error(w, "service not ready: cursor resolution failed", http.StatusServiceUnavailable)
+				return
+			case errors.Is(err, ErrCursorTooOld):
+				// A too-old v2 seq cursor is a distinct, expected signal (the
+				// client re-backfills), not a malformed request; label it
+				// separately so it stays visible apart from parse-error 400s.
+				deps.Metrics.incCursorRequests("too_old")
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -325,7 +338,6 @@ func runReader(
 				_ = conn.Close(websocket.StatusPolicyViolation, truncateCloseReason(err.Error()))
 				return
 			}
-			newFilter = newFilter.withIdentityCollectionPolicy(deps.FilterIdentityByCollection)
 			filterPtr.Store(newFilter)
 			deps.Metrics.incOptionsUpdates()
 			signalHello()

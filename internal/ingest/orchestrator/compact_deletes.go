@@ -142,15 +142,16 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			// (the steady force-rotate seals up to targetWatermark while newer
 			// events land in the fresh active segment), a key updated again above
 			// the watermark has its in-memory seq pushed above the window;
-			// SnapshotRange's upper bound then drops the key entirely and an
+			// an upper-bounded readout would then drop the key entirely and an
 			// older superseded row in a prior segment is never evicted, so the
 			// pass commits a watermark it did not actually achieve (a superseded
 			// row survives at/below W — issue #100 dual). Folding the on-disk
 			// window can only see seqs <= targetWatermark, so it yields the
 			// window-correct tombstone (matching the oracle's CheckCompacted /
 			// filterCompactedExpectedRows) and cannot be fooled by an above-W
-			// update. The in-memory Set remains the read-path overlay's source
-			// (SnapshotRange(W, inf)) and is still Evict-bounded below.
+			// update. The in-memory Set is used only for the compaction-cap
+			// trigger (Len) and the size gauge (ApproxBytes); it is still
+			// Evict-bounded below.
 			snap, chunkEnd, err := o.collectCompactionTombstones(ctx, sealed, current, targetWatermark)
 			if err != nil {
 				return err

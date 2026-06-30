@@ -20,7 +20,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/obs"
-	"github.com/bluesky-social/jetstream/internal/overlay"
 	"github.com/bluesky-social/jetstream/internal/server"
 	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -39,12 +38,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// overlayRebuildInterval bounds how stale the served overlay blob can
-// be relative to the live tail (spec §5.5). The blob's reported maxSeq
-// is always honest; staleness only adds a few seconds of live replay on
-// the consumer side.
-const overlayRebuildInterval = 2 * time.Second
-
 // Runtime is one fully constructed jetstream daemon instance.
 type Runtime struct {
 	opts Options
@@ -57,7 +50,6 @@ type Runtime struct {
 	metaStore      *store.Store
 	manifest       *manifest.Manifest
 	tail           *subscribe.Tail
-	overlayCache   *overlay.Cache
 	verifier       *atmossync.Verifier
 	orchestrator   *orchestrator.Orchestrator
 	server         *server.Server
@@ -73,9 +65,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	if opts.CompactionInterval < 0 {
 		return nil, fmt.Errorf("serve: --compaction-interval must be >= 0 (CompactionInterval must be >= 0), got %s", opts.CompactionInterval)
-	}
-	if opts.OverlayRebuildInterval < 0 {
-		return nil, fmt.Errorf("serve: overlay rebuild interval must be >= 0 (OverlayRebuildInterval must be >= 0), got %s", opts.OverlayRebuildInterval)
 	}
 	if opts.CompactionTombstoneCap < 0 {
 		return nil, fmt.Errorf("serve: --compaction-tombstone-cap must be >= 0 (CompactionTombstoneCap must be >= 0), got %d", opts.CompactionTombstoneCap)
@@ -271,9 +260,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	stateStore := syncstate.New(metaStore)
 	tombstones := tombstone.New()
-	overlayMetrics := obs.NewOverlayMetrics(metrics.Registry)
-	overlayCache := overlay.NewCache(overlaySource{set: tombstones, store: metaStore}, overlayMetrics)
-	rt.overlayCache = overlayCache
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
@@ -334,9 +320,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return nil
 	}
 	onCompactionPass := func(result orchestrator.CompactionPassResult) {
-		// The compaction pass just evicted tombstones <= the new
-		// watermark; rebuild the overlay so served W/M reflect it.
-		overlayCache.Rebuild()
 		if opts.OnCompactionPass != nil {
 			opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
 		}
@@ -418,15 +401,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Lookback:  opts.CursorLookback,
 	}))
 	srv.RegisterPublicRoute("GET /subscribe-v2", subscribe.NewHandler(subscribe.Subscription{
-		Tail:                       tail,
-		Store:                      metaStore,
-		Manifest:                   mft,
-		WriterRef:                  &writerPtr,
-		Logger:                     processLogger,
-		Metrics:                    subscribeMetrics,
-		Lookback:                   opts.CursorLookback,
-		EmitResyncReplacementRows:  true,
-		FilterIdentityByCollection: true,
+		Tail:                      tail,
+		Store:                     metaStore,
+		Manifest:                  mft,
+		WriterRef:                 &writerPtr,
+		Logger:                    processLogger,
+		Metrics:                   subscribeMetrics,
+		Lookback:                  opts.CursorLookback,
+		EmitResyncReplacementRows: true,
+		RejectCursorBelowFloor:    true,
 	}))
 
 	// XRPC surface: whole-file segment download + listing. The atmos
@@ -447,7 +430,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			return nil
 		},
 		CacheMaxAge: opts.SegmentCacheMaxAge,
-		Overlay:     overlayCache,
 		Plan: xrpcapi.PlanConfig{
 			MaxDIDs:               opts.PlanMaxDIDs,
 			MaxCollections:        opts.PlanMaxCollections,
@@ -475,10 +457,6 @@ func (r *Runtime) PublicAddr() string {
 // fatal subsystem error.
 func (r *Runtime) Run(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
-	overlayInterval := r.opts.OverlayRebuildInterval
-	if overlayInterval == 0 {
-		overlayInterval = overlayRebuildInterval
-	}
 
 	g.Go(func() error {
 		<-gctx.Done()
@@ -504,14 +482,6 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 	g.Go(func() error {
 		return r.orchestrator.Run(gctx)
-	})
-
-	g.Go(func() error {
-		err := r.overlayCache.RunTicker(gctx, overlayInterval)
-		if errors.Is(err, context.Canceled) {
-			return nil
-		}
-		return err
 	})
 
 	// Graceful client drain. Live websocket subscribers are hijacked

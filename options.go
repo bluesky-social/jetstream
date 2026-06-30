@@ -22,7 +22,6 @@ type config struct {
 	liveCursor   uint64
 	batchSize    int
 	downloadConc int
-	liveBuffer   LiveBuffer
 	// httpClient is a caller override. nil is the sentinel for "unset":
 	// the engine then builds its own per-workload jttp clients
 	// (xrpc.ATProtoOpts for XRPC, xrpc.BulkDownloadOpts for bulk
@@ -94,12 +93,14 @@ func (c *config) backfillRequested() bool {
 // ending in ".*" (e.g. "app.bsky.feed.*"). Empty or unset means all
 // collections.
 //
-// Setting a collection filter also suppresses Account and Identity events:
-// they carry no collection, so a collection-scoped subscriber does not receive
-// them. (Account deletions are still applied internally as tombstones, so
-// records for a deleted account are correctly suppressed — you just don't see
-// the Account event itself.) With no collection filter, Account and Identity
-// events are delivered, subject to WithDIDs. See issue #142.
+// A collection filter does NOT suppress DID-level events: Account, Identity,
+// and Sync carry no collection but always bypass the collection filter
+// (subject to WithDIDs), because they are a folding consumer's only signal to
+// purge a deleted account's records — hiding them would create a permanently
+// stale view. The client no longer suppresses deleted-account records during
+// backfill; consumers fold those markers themselves. With no collection
+// filter, Account and Identity events are likewise delivered, subject to
+// WithDIDs. See issue #142.
 func WithCollections(collections []string) Option {
 	return func(c *config) { c.collections = append([]string(nil), collections...) }
 }
@@ -126,6 +127,11 @@ func WithAfterSeq(seq uint64) Option {
 // WithBeforeSeq sets the inclusive upper sequence bound for backfill: only
 // events with seq <= beforeSeq are delivered from the archive. Enables the
 // historical backfill path.
+//
+// It requires WithBackfillOnly: a beforeSeq is meaningful only as a bounded
+// archive dump. On a backfill-then-live subscription the same upper bound would
+// gate the live tail and silently drop every event past beforeSeq, so Subscribe
+// rejects WithBeforeSeq unless WithBackfillOnly is also set.
 func WithBeforeSeq(seq uint64) Option {
 	return func(c *config) {
 		c.hasBeforeSeq = true
@@ -182,22 +188,10 @@ func WithDownloadConcurrency(n int) Option {
 	}
 }
 
-// WithLiveBuffer supplies the buffer used to hold live-tail events received
-// during the backfill-to-live cutover. The default is an in-memory buffer.
-// A durable, file-backed implementation is available for long-running
-// backfills; see NewFileLiveBuffer.
-func WithLiveBuffer(b LiveBuffer) Option {
-	return func(c *config) {
-		if b != nil {
-			c.liveBuffer = b
-		}
-	}
-}
-
 // WithHTTPClient overrides the HTTP client used for both XRPC negotiation
 // and bulk segment/block downloads. It is an override: when unset, the
 // client builds its own jttp clients tuned per workload — xrpc.ATProtoOpts
-// for the short XRPC calls (getTombstones/planBackfill) and
+// for the short XRPC calls (planBackfill) and
 // xrpc.BulkDownloadOpts for the streaming segment/block downloads, whose
 // large transfers a short wall-clock timeout would prematurely kill.
 // Supplying a client here replaces both with the single client given.

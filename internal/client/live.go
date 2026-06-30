@@ -4,14 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/jcalabro/gt"
 )
 
 const (
@@ -40,20 +41,18 @@ type dialFunc func(ctx context.Context, url string) (wsConn, error)
 // liveConfig configures a liveConsumer.
 type liveConfig struct {
 	host string // normalized base URL, e.g. "https://host"
-	// cursor is the initial WIRE resume point — the value sent as ?cursor= on
-	// the first connection — as an explicit optional so the seq space's 0
-	// sentinel is never overloaded:
-	//
-	//   - None      -> "live from the current tip"; the cursor param is omitted.
-	//   - Some(seq) -> replay/resume from seq; the param is always sent, including
-	//     Some(0) (the #112 cutover from a sealed tip below the rewind margin, and
-	//     the empty-archive cutover, both of which must replay from the start
-	//     rather than anchor at the tip).
-	//
-	// The server replays inclusively (it delivers seq >= cursor; see
+	// cursor is the initial WIRE resume point sent as ?cursor= on the first
+	// connection. cursor=0 means "replay from the beginning" (everything, since
+	// the first real event is seq 1); a positive value resumes from that seq. The
+	// server replays inclusively (it delivers seq >= cursor; see
 	// internal/subscribe/replay.go); the consumer's own seq dedup turns that into
-	// the effective "> last delivered" on resume.
-	cursor gt.Option[uint64]
+	// the effective "> last delivered" on resume. Ignored when fromTip is set.
+	cursor uint64
+	// fromTip, when true, omits the ?cursor= param so the server starts at the
+	// live tip with no replay. This is the WithLiveCursor(0) "live from tip"
+	// user-API contract — distinct from cursor=0 ("replay everything"). Only the
+	// pure live-only path sets it; the cutover always sends an explicit cursor.
+	fromTip bool
 	// collections and dids are the caller's filters, forwarded on the wire as
 	// repeated wantedCollections/wantedDids query params so the server filters
 	// server-side (v1 ParseQuery) rather than streaming the full firehose for
@@ -61,22 +60,11 @@ type liveConfig struct {
 	// The client-side matcher remains a correctness backstop.
 	collections []string
 	dids        []string
-	// dedupFloor is the initial value of lastSeq, the seq dedup floor. It is kept
-	// SEPARATE from cursor because the wire resume point and the dedup floor are
-	// not always the same value:
-	//
-	//   - On a resume/replay where the caller already HOLDS the events up to seq
-	//     (a saved resume cursor, or the #112 small-tip cutover where the backfill
-	//     emitted through the sealed tip), dedupFloor == cursor == Some(seq): the
-	//     at-least-once re-delivery of seq itself is dropped.
-	//   - On an EMPTY-archive cutover the backfill covered NOTHING, so the live
-	//     tail owns the whole stream from the start: the wire cursor is Some(0)
-	//     (replay from seq 0) but dedupFloor is None (nothing delivered yet), so
-	//     the genuine first-ever event at seq 0 passes the dedup instead of being
-	//     swallowed against a Some(0) floor it never actually delivered.
-	//
-	// None means "nothing delivered yet" — the first event, even seq 0, passes.
-	dedupFloor gt.Option[uint64]
+	// dedupFloor seeds lastSeq: the highest seq the caller already holds, so the
+	// at-least-once re-delivery at or below it is dropped. 0 means "nothing
+	// delivered yet", so the first real event (seq >= 1) always passes — the
+	// seq-0 swallow is structurally impossible under 1-based seqs (design §R8).
+	dedupFloor uint64
 	readLimit  int64
 	dial       dialFunc
 	httpClient *http.Client // optional; routes the live websocket upgrade through a custom transport
@@ -112,13 +100,20 @@ func (c liveConfig) maxBackoff() time.Duration {
 type liveConsumer struct {
 	cfg liveConfig
 	// lastSeq is the highest seq delivered, used both as the dedup floor and the
-	// reconnect resume cursor. It is an optional because the seq space is 0-based
-	// (a fresh archive assigns the first event seq 0): None means "nothing
-	// delivered yet" and Some(0) means "seq 0 has been delivered". Collapsing the
-	// two onto a bare 0 would make the dedup (ev.Seq <= lastSeq) swallow the
-	// first-ever event and make a reconnect re-anchor at the tip.
-	lastSeq gt.Option[uint64]
+	// reconnect resume cursor. 0 means "nothing delivered yet" (the first real
+	// event is seq >= 1, so it passes the ev.Seq <= lastSeq dedup); a positive
+	// value resumes/dedups above it. seenAny disambiguates a from-tip start
+	// (lastSeq 0, nothing delivered → omit the wire cursor on reconnect) from a
+	// replay-from-0 start.
+	lastSeq uint64
+	seenAny bool
 }
+
+// LastSeq returns the highest seq the consumer has delivered, or its seeded
+// dedup floor if it delivered nothing. Read it only after Run returns (the
+// field is mutated on Run's goroutine); the cutover engine uses it to resume a
+// re-backfill from the last durably-processed seq after a too-old 400.
+func (c *liveConsumer) LastSeq() uint64 { return c.lastSeq }
 
 func newLiveConsumer(cfg liveConfig) *liveConsumer {
 	if cfg.readLimit <= 0 {
@@ -134,13 +129,13 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 		cfg.logger = slog.New(slog.NewTextHandler(discardWriter{}, nil))
 	}
 	// Seed lastSeq (the dedup floor) from dedupFloor, NOT from the wire cursor:
-	// the two diverge in the empty-archive cutover, where the wire cursor is
-	// Some(0) (replay from the start) but dedupFloor is None (the live tail
-	// delivers the first-ever event, so nothing has been delivered yet). A None
-	// dedupFloor leaves lastSeq None so the first event delivered — even seq 0 —
-	// passes the dedup. A Some(seq) dedupFloor (a genuine resume, or the #112
-	// small-tip cutover where the backfill already emitted through seq) drops the
-	// at-least-once re-delivery of seq itself. See liveConfig.dedupFloor.
+	// the two diverge in the empty-archive cutover, where the wire cursor is 0
+	// (replay from the start) but dedupFloor is 0 meaning "nothing delivered yet"
+	// so the first real event (seq >= 1) passes the dedup. A positive dedupFloor
+	// (a genuine resume, or a small-tip cutover where the backfill already emitted
+	// through seq) drops the at-least-once re-delivery of seq itself. seenAny
+	// stays false until the first delivery so reconnect knows whether to omit the
+	// wire cursor (from-tip) or resume. See liveConfig.dedupFloor.
 	return &liveConsumer{cfg: cfg, lastSeq: cfg.dedupFloor}
 }
 
@@ -149,7 +144,7 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 // Recoverable read/dial failures trigger a reconnect with backoff (reported to
 // emit as a non-nil error with a nil event so the caller can observe churn);
 // a context cancellation is a clean stop and returns nil.
-func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error) bool) error {
+func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) error {
 	minB, maxB := c.cfg.minBackoff(), c.cfg.maxBackoff()
 	backoff := minB
 	for {
@@ -164,16 +159,25 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, []byte, error)
 		if errors.Is(err, errEmitStop) {
 			return nil
 		}
+		// A too-old cursor is terminal, not transient: the seq will not become
+		// valid by reconnecting (the lookback floor only advances). Return it so
+		// the cutover engine re-enters the backfill pagination loop from the last
+		// durably-processed seq (design §14 client side) instead of churning
+		// reconnects against a cursor the server will keep rejecting. This covers
+		// both the terminal handoff connect and a mid-stream fell-off-live drop.
+		if errors.Is(err, errLiveCursorTooOld) {
+			return err
+		}
 		// A session that made progress (delivered new events) is healthy; reset
 		// backoff so a long-lived connection that finally drops reconnects
 		// promptly rather than at the accumulated max. lastSeq advances
-		// monotonically (None -> Some, then strictly increasing), so any change
+		// monotonically (strictly increasing on each delivery), so any change
 		// means the session delivered at least one new event.
 		if c.lastSeq != seqBefore {
 			backoff = minB
 		}
 		// Report the disconnect and back off before reconnecting.
-		if err != nil && !emit(nil, nil, fmt.Errorf("jetstream: live tail reconnecting: %w", err)) {
+		if err != nil && !emit(nil, fmt.Errorf("jetstream: live tail reconnecting: %w", err)) {
 			return nil
 		}
 		if !sleep(ctx, backoff) {
@@ -188,7 +192,7 @@ var errEmitStop = errors.New("jetstream: live emit stop")
 
 // session runs one connection: dial, read-decode-emit until an error or stop.
 // A successful read resets the caller's backoff via the return path (nil err).
-func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, error) bool) error {
+func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) bool) error {
 	conn, err := c.cfg.dial(ctx, c.subscribeURL())
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -211,24 +215,22 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, []byte, er
 		if derr != nil {
 			// A malformed data frame is upstream input; surface it but keep the
 			// connection (one bad frame must not drop the tail).
-			if !emit(nil, nil, derr) {
+			if !emit(nil, derr) {
 				return errEmitStop
 			}
 			continue
 		}
 		// Deduplicate the at-least-once reconnect overlap: skip anything at or
-		// below the highest seq already delivered. While lastSeq is None nothing
-		// has been delivered yet, so the first event always passes — this is what
-		// lets a from-tip / replay-from-0 start deliver the first-ever event
-		// (seq 0) instead of swallowing it against a bare zero floor.
-		if c.lastSeq.HasVal() && ev.Seq <= c.lastSeq.Val() {
+		// below the highest seq already delivered. lastSeq 0 with nothing yet
+		// delivered means the first real event (seq >= 1) passes — the seq-0
+		// swallow is structurally impossible under 1-based seqs.
+		if ev.Seq <= c.lastSeq {
 			continue
 		}
-		c.lastSeq = gt.Some(ev.Seq)
+		c.lastSeq = ev.Seq
+		c.seenAny = true
 		evCopy := ev
-		// Pass the raw frame too so the cutover buffer can persist verbatim
-		// bytes (re-decoded on replay) rather than re-marshal the decoded event.
-		if !emit(&evCopy, data, nil) {
+		if !emit(&evCopy, nil) {
 			return errEmitStop
 		}
 	}
@@ -245,23 +247,18 @@ func (c *liveConsumer) subscribeURL() string {
 	u.Path = "/subscribe-v2"
 	q := url.Values{}
 	q.Set("extended", "true")
-	// Wire cursor: resume from lastSeq (the highest seq delivered) once anything
-	// has been delivered, otherwise from the initial wire cursor (cfg.cursor).
-	// subscribeURL is rebuilt on every reconnect, so anchoring each new session
-	// at lastSeq is what keeps a live-from-tip stream from re-anchoring at the
-	// reconnect-time tip and silently dropping events produced while disconnected.
-	// Before any delivery lastSeq is the dedupFloor (which is None in the
-	// empty-archive cutover), so we fall back to cfg.cursor to send the intended
-	// replay-from-start cursor=0 rather than omitting the param (= live from tip)
-	// and dropping the whole stream. The optional carries presence directly:
-	// Some(seq) sends cursor=seq (a resume point, a replay-from-0 cutover, or any
-	// delivered event including seq 0); None omits the param = "live from tip".
-	wireCursor := c.lastSeq
-	if !wireCursor.HasVal() {
-		wireCursor = c.cfg.cursor
-	}
-	if wireCursor.HasVal() {
-		q.Set("cursor", strconv.FormatUint(wireCursor.Val(), 10))
+	// Wire cursor: once any event has been delivered, resume each new session at
+	// lastSeq (the highest seq delivered). subscribeURL is rebuilt on every
+	// reconnect, so anchoring at lastSeq is what keeps a stream from re-anchoring
+	// at the reconnect-time tip and silently dropping events produced while
+	// disconnected. Before any delivery we use the configured start: omit the
+	// param when fromTip (the WithLiveCursor(0) "live from tip" contract),
+	// otherwise send cursor=cfg.cursor (cursor=0 replays from the beginning).
+	switch {
+	case c.seenAny:
+		q.Set("cursor", strconv.FormatUint(c.lastSeq, 10))
+	case !c.cfg.fromTip:
+		q.Set("cursor", strconv.FormatUint(c.cfg.cursor, 10))
 	}
 	// Forward the caller's filters server-side. v1's ParseQuery reads each
 	// collection/DID as its own repeated param, so append (not Set) one entry
@@ -289,16 +286,48 @@ func liveDialOptions(hc *http.Client) *websocket.DialOptions {
 	}
 }
 
+// errLiveCursorTooOld marks a terminal /subscribe-v2 connect refusal: the seq
+// cursor resolved below the server's lookback floor and the server returned a
+// pre-upgrade HTTP 400 (subscribe §14 / design §14). It is NOT a transient dial
+// failure to reconnect-loop on — the cursor will not become valid by retrying.
+// The cutover engine catches it and re-enters the backfill pagination loop from
+// the last durably-processed seq (design §14 client side). The wrapped message
+// carries the server's floor-seq body for observability.
+var errLiveCursorTooOld = errors.New("jetstream: live cursor too old")
+
+// cursorTooOldMarker is the substring the server embeds in its pre-upgrade
+// "cursor too old" HTTP 400 body, which dialWebsocket matches to recognize a
+// too-old refusal. It MUST equal internal/subscribe.CursorTooOldMarker (the
+// server's source of truth); the client cannot import that package without
+// pulling the server's storage deps into the public module, so the literal is
+// duplicated here and pinned equal by TestDialWebsocketMatchesServerTooOld
+// (live_subscribe_contract_test.go), which fails CI if either side drifts.
+const cursorTooOldMarker = "cursor too old"
+
 // dialWebsocket is the production dialer. hc, when non-nil, routes the HTTP/1.1
 // upgrade through a custom transport (e.g. an in-process pipe); nil uses the
 // websocket default.
+//
+// A pre-upgrade HTTP 400 "cursor too old" from /subscribe-v2 is mapped to the
+// typed errLiveCursorTooOld so the consumer surfaces it terminally rather than
+// reconnect-looping. coder/websocket leaves the first 1024 bytes of the
+// response body readable on a non-101 handshake, which carries the floor seq.
 func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn, error) {
 	conn, resp, err := websocket.Dial(ctx, rawURL, liveDialOptions(hc))
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusBadRequest && resp.Body != nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			_ = resp.Body.Close()
+			if strings.Contains(string(body), cursorTooOldMarker) {
+				return nil, fmt.Errorf("%w: %s", errLiveCursorTooOld, strings.TrimSpace(string(body)))
+			}
+		} else if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, err
+	}
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
-	}
-	if err != nil {
-		return nil, err
 	}
 	return conn, nil
 }

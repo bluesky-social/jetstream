@@ -1,13 +1,12 @@
 // Package client implements the Jetstream Go client's orchestration:
-// backfill-plan negotiation, sealed-segment/block download, tombstone
-// suppression, the backfill-to-live cutover, and the live tail. It is
-// internal: third parties consume only the root jetstream package, which
-// wires this engine behind its public Client.
+// backfill-plan negotiation, sealed-segment/block download, the
+// backfill-to-live cutover, and the live tail. It is internal: third parties
+// consume only the root jetstream package, which wires this engine behind its
+// public Client.
 package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 
@@ -73,13 +72,18 @@ type PlanEntry struct {
 type Plan struct {
 	// Entries are the segments/block-ranges to download, in ascending order.
 	Entries []PlanEntry
-	// PlannedThroughSeq is the highest sealed seq this plan accounts for
-	// (the sealed tip, capped by beforeSeq when provided). It is the record-
-	// stream cutover cursor: the live tail resumes from here so the active-
-	// segment gap above the sealed tip is re-covered live. Independent of how
-	// many entries the filters matched — a filter that matches nothing in a
-	// non-empty archive still reports the tip.
+	// PlannedThroughSeq is the continuation cursor: the highest sealed seq this
+	// page accounts for. When the server truncates the page to fit its per-page
+	// entry limit it is the MaxSeq of the last included work unit; otherwise it
+	// equals SealedTipSeq. Fetch the next page with AfterSeq=PlannedThroughSeq
+	// (exclusive). The whole sealed archive has been consumed once
+	// PlannedThroughSeq >= SealedTipSeq.
 	PlannedThroughSeq uint64
+	// SealedTipSeq is the pagination goal: the sealed-archive tip, capped by
+	// BeforeSeq when provided. Stable across pages of the same archive
+	// snapshot; the cutover loop pins it once and pages until PlannedThroughSeq
+	// reaches it, then resumes the live tail from here.
+	SealedTipSeq uint64
 	// Stats are server-side planner diagnostics (segments examined/matched,
 	// blocks matched, work entries). Useful for anti-vacuity assertions.
 	Stats PlanStats
@@ -104,12 +108,6 @@ type PlanRequest struct {
 	BeforeSeq    uint64
 }
 
-// ErrPlanTooLarge is returned by Plan when the server refuses the query
-// because it would exceed the configured response/work-entry limit. The
-// caller must narrow the query (tighter seq window, fewer DIDs/collections)
-// rather than expect a silently truncated plan.
-var ErrPlanTooLarge = errors.New("jetstream: backfill plan too large; narrow the query")
-
 // Planner negotiates backfill plans with a Jetstream server over XRPC.
 type Planner struct {
 	xc *xrpc.Client
@@ -121,8 +119,9 @@ func NewPlanner(xc *xrpc.Client) *Planner {
 }
 
 // Plan calls network.bsky.jetstream.planBackfill and converts the response
-// into an ordered Plan. It returns ErrPlanTooLarge (wrapped) when the server
-// rejects the query as too large.
+// into an ordered Plan. The plan may be a truncated page when the server's
+// per-page entry limit is exceeded; the caller pages by re-issuing Plan with
+// AfterSeq=Plan.PlannedThroughSeq until PlannedThroughSeq reaches SealedTipSeq.
 func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 	// The planBackfill lexicon fields are int64; reject a uint64 cursor that
 	// would wrap negative rather than silently plan from the wrong range
@@ -136,9 +135,6 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 	in := planInput(req)
 	out, err := jetstream.JetstreamPlanBackfill(ctx, p.xc, in)
 	if err != nil {
-		if isPlanTooLarge(err) {
-			return nil, fmt.Errorf("%w: %w", ErrPlanTooLarge, err)
-		}
 		return nil, fmt.Errorf("jetstream: planBackfill: %w", err)
 	}
 	return planFromOutput(out)
@@ -168,8 +164,15 @@ func planFromOutput(out *jetstream.JetstreamPlanBackfill_Output) (*Plan, error) 
 	if out.PlannedThroughSeq < 0 {
 		return nil, fmt.Errorf("jetstream: planBackfill returned negative plannedThroughSeq %d", out.PlannedThroughSeq)
 	}
+	if out.SealedTipSeq < 0 {
+		return nil, fmt.Errorf("jetstream: planBackfill returned negative sealedTipSeq %d", out.SealedTipSeq)
+	}
+	if out.PlannedThroughSeq > out.SealedTipSeq {
+		return nil, fmt.Errorf("jetstream: planBackfill plannedThroughSeq %d exceeds sealedTipSeq %d", out.PlannedThroughSeq, out.SealedTipSeq)
+	}
 	plan := &Plan{
 		PlannedThroughSeq: uint64(out.PlannedThroughSeq),
+		SealedTipSeq:      uint64(out.SealedTipSeq),
 		Entries:           make([]PlanEntry, 0, len(out.Segments)),
 		Stats: PlanStats{
 			SegmentsExamined: nonNegU64(out.Stats.SegmentsExamined),
@@ -233,11 +236,4 @@ func planEntryFromSegment(seg *jetstream.JetstreamPlanBackfill_Segment) (PlanEnt
 		return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q has unknown mode %q", seg.Name, seg.Mode)
 	}
 	return entry, nil
-}
-
-func isPlanTooLarge(err error) bool {
-	if xErr, ok := errors.AsType[*xrpc.Error](err); ok {
-		return xErr.Name == jetstream.ErrJetstreamPlanBackfill_PlanTooLarge
-	}
-	return false
 }

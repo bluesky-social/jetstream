@@ -116,7 +116,6 @@ type Options struct {
 	CompactionInterval        time.Duration
 	CompactionTombstoneCap    int
 	CompactionRewriteWorkers  int
-	OverlayRebuildInterval    time.Duration
 	BarrierBeforeCutover      PhaseBarrier
 	BarrierAfterBootstrap     PhaseBarrier
 	BarrierAfterMerge         PhaseBarrier

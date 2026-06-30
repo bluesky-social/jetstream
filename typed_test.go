@@ -24,6 +24,7 @@ func (e *scriptEngine) run(_ context.Context, yield func(*Batch, error) bool) {
 	}
 }
 func (e *scriptEngine) close() error { return nil }
+func (e *scriptEngine) stats() Stats { return Stats{} }
 
 func clientWithBatches(batches ...*Batch) *Client {
 	return &Client{engine: &scriptEngine{batches: batches}}
@@ -193,6 +194,7 @@ func (e *errThenBatchEngine) run(_ context.Context, yield func(*Batch, error) bo
 	yield(e.batch, nil)
 }
 func (e *errThenBatchEngine) close() error { return nil }
+func (e *errThenBatchEngine) stats() Stats { return Stats{} }
 
 // TestTypedBatchLastCursor mirrors Batch.LastCursor for the typed batch.
 func TestTypedBatchLastCursor(t *testing.T) {

@@ -141,6 +141,12 @@ func typedRun[T any, PT interface {
 	*T
 	UnmarshalCBOR([]byte) error
 }](ctx context.Context, re *realEngine, collection string, yield func(*TypedBatch[T], error) bool) {
+	// `stopped` is shared between the fast-path Emit closure and the live
+	// emitBatch/emitErr closures, which can be driven by the batcher's periodic
+	// flusher goroutine — not just this run goroutine. It is race-free for the
+	// same two reasons documented at realEngine.run (batcher mutex serialization +
+	// the live buffer being empty during any backfill sweep); see that comment
+	// before refactoring.
 	stopped := false
 	bf := iclient.BackfillSink{
 		Transform: func(_ int, evs []iclient.Event) any {

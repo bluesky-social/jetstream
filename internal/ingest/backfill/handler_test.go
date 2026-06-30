@@ -108,7 +108,7 @@ func TestSegmentHandler_EmitsOneEventPerRecord(t *testing.T) {
 
 	require.NoError(t, h.HandleRepo(context.Background(), "did:plc:test", r, commit))
 
-	require.Equal(t, uint64(1), w.NextSeq(),
+	require.Equal(t, uint64(2), w.NextSeq(),
 		"one record yields exactly one event")
 }
 
@@ -147,7 +147,7 @@ func TestSegmentHandler_HandleRepoQueuesCompletionWithoutFlush(t *testing.T) {
 
 	events := collectActiveEvents(t, filepath.Join(segmentsDir, ingest.SegmentFilename(0)))
 	require.Empty(t, events, "HandleRepo must not force a per-repo segment flush")
-	require.Equal(t, completionWatermark{lastSeq: 0, appended: true}, cb.watermarks[did])
+	require.Equal(t, completionWatermark{lastSeq: 1, appended: true}, cb.watermarks[did])
 
 	require.NoError(t, bs.OnComplete(t.Context(), did, "", commit))
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
@@ -177,7 +177,7 @@ func TestSegmentHandler_MultiBlockRepoCompletesOnlyWithFinalBlock(t *testing.T) 
 	cb := NewCompletionBatcher(bs, nil)
 
 	const perBlock = 2
-	const records = 5 // seqs 0..4 across 3 blocks: [0,1] [2,3] [4]
+	const records = 5 // seqs 1..5 across 3 blocks: [1,2] [3,4] [5]
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       filepath.Join(dir, "segments"),
 		Store:             st,
@@ -199,22 +199,22 @@ func TestSegmentHandler_MultiBlockRepoCompletesOnlyWithFinalBlock(t *testing.T) 
 
 	require.NoError(t, h.HandleRepo(t.Context(), did, r, commit))
 
-	// HandleRepo appended all 5 events; the two full blocks [0,1] and [2,3]
+	// HandleRepo appended all 5 events; the two full blocks [1,2] and [3,4]
 	// auto-flushed during AppendBatch and committed durably (seq/next advanced
-	// to 4), but the final event seq 4 sits in an un-fsynced pending block. The
+	// to 5), but the final event seq 5 sits in an un-fsynced pending block. The
 	// watermark records the repo's final event seq before OnComplete consumes
 	// it (QueueComplete deletes the watermark entry).
-	require.Equal(t, completionWatermark{lastSeq: uint64(records - 1), appended: true}, cb.watermarks[did],
+	require.Equal(t, completionWatermark{lastSeq: uint64(records), appended: true}, cb.watermarks[did],
 		"watermark must record the repo's final event seq")
-	require.Equal(t, uint64(records), w.NextSeq())
+	require.Equal(t, uint64(records+1), w.NextSeq())
 
 	require.NoError(t, bs.OnComplete(t.Context(), did, "", commit))
-	// The completion must NOT be durable yet: its watermark lastSeq=4 is not
-	// below the durable seq/next=4 (final event's block not fsynced).
+	// The completion must NOT be durable yet: its watermark lastSeq=5 is not
+	// below the durable seq/next=5 (final event's block not fsynced).
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
 	require.Len(t, cb.queued, 1, "completion stays queued until the final block is durable")
 
-	// Draining flushes the trailing block (seq 4), fsyncs it, then commits the
+	// Draining flushes the trailing block (seq 5), fsyncs it, then commits the
 	// completion in the same durable batch. Only now may it be complete.
 	require.NoError(t, w.DrainDurability(t.Context()))
 	requireLookupState(t, bs, did, atmosbackfill.StateComplete)
@@ -323,7 +323,7 @@ func TestSegmentHandler_DropsRecordThatExceedsSegmentColumnWidth(t *testing.T) {
 
 	require.NoError(t, h.HandleRepo(t.Context(), "did:plc:widefield", r, commit))
 	require.NoError(t, writerErr, "invalid upstream record data must not abort the local writer")
-	require.Equal(t, uint64(0), w.NextSeq(), "skipped records must not allocate seqs")
+	require.Equal(t, uint64(1), w.NextSeq(), "skipped records must not allocate seqs (NextSeq stays at the fresh-dir seed)")
 	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DroppedRecords), 0,
 		"the skipped record must be visible in dropped_records_total")
 }

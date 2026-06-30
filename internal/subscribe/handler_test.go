@@ -281,13 +281,13 @@ func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
 	require.Equal(t, "create", commit["operation"])
 }
 
-// TestHandler_V2FilterIdentityByCollection guards the /subscribe-v2 policy
-// (#142): a subscriber with a collection filter does NOT receive #identity
-// events (they carry no collection), but DOES still receive #account events
-// (which carry the DID-deletion tombstone the v2 client needs). We publish an
-// identity (must be skipped) followed by an account (must arrive), then a
-// matching commit, to prove identity was filtered without stalling the stream.
-func TestHandler_V2FilterIdentityByCollection(t *testing.T) {
+// A subscriber with a collection filter receives #identity AND #account events
+// (they carry no collection and always bypass the collection filter, on v1 and
+// v2 alike). After dropping client-side tombstone suppression these DID-level
+// events are a collection-scoped consumer's only signal to purge a dead
+// account's records, so they must be delivered. We publish an identity, then an
+// account, then a matching commit, and assert all three arrive in order.
+func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
@@ -295,11 +295,10 @@ func TestHandler_V2FilterIdentityByCollection(t *testing.T) {
 	require.NoError(t, err)
 
 	h := NewHandler(Subscription{
-		Tail:                       b,
-		Store:                      st,
-		Logger:                     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		EmitResyncReplacementRows:  true,
-		FilterIdentityByCollection: true,
+		Tail:                      b,
+		Store:                     st,
+		Logger:                    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		EmitResyncReplacementRows: true,
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -319,9 +318,9 @@ func TestHandler_V2FilterIdentityByCollection(t *testing.T) {
 	waitForTailBlocked(t, b)
 
 	var seq uint64
-	// Identity must be filtered out under the collection filter.
+	// Identity bypasses the collection filter and must be delivered.
 	publishIdentity(t, b, &seq, "did:plc:ident", 1)
-	// Account must still be delivered (DID-deletion tombstone bearer).
+	// Account (DID-deletion tombstone bearer) must be delivered too.
 	acct := &comatproto.SyncSubscribeRepos_Account{
 		DID: "did:plc:acct", Active: false, Status: gt.Some("deleted"), Seq: 2, Time: "2026-05-27T00:00:00Z",
 	}
@@ -333,14 +332,21 @@ func TestHandler_V2FilterIdentityByCollection(t *testing.T) {
 	// Matching commit, to bound the test.
 	publishCommit(t, b, &seq, "did:plc:acct", "app.bsky.feed.post", 3)
 
-	// First frame must be the account (identity was skipped).
+	// First frame must be the identity.
+	identFrame := readOneFrame(t, ctx, conn)
+	var gotIdent map[string]any
+	require.NoError(t, json.Unmarshal(identFrame, &gotIdent))
+	require.Equal(t, "identity", gotIdent["kind"], "identity must pass the collection filter")
+	require.Equal(t, "did:plc:ident", gotIdent["did"])
+
+	// Second frame must be the account.
 	acctFrame := readOneFrame(t, ctx, conn)
 	var gotAcct map[string]any
 	require.NoError(t, json.Unmarshal(acctFrame, &gotAcct))
-	require.Equal(t, "account", gotAcct["kind"], "account must pass the collection filter; identity must have been skipped")
+	require.Equal(t, "account", gotAcct["kind"], "account must pass the collection filter")
 	require.Equal(t, "did:plc:acct", gotAcct["did"])
 
-	// Second frame must be the matching commit.
+	// Third frame must be the matching commit.
 	commitFrame := readOneFrame(t, ctx, conn)
 	var gotCommit map[string]any
 	require.NoError(t, json.Unmarshal(commitFrame, &gotCommit))

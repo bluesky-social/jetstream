@@ -3,7 +3,6 @@ package oracle
 import (
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/overlay"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 )
@@ -13,7 +12,7 @@ import (
 // context rather than to whichever test first encodes.
 //
 // TestOracle_DefaultLifecycle runs the whole runtime inside a testing/synctest
-// bubble and writes segments/overlay/subscribe frames there. klauspost/compress
+// bubble and writes segments/subscribe frames there. klauspost/compress
 // builds an Encoder's worker channel lazily on the first EncodeAll (the
 // encoders were constructed with NewWriter(nil, …), which skips the eager
 // init). Without this warmup the bubble's first encode would bind those package
@@ -27,7 +26,6 @@ import (
 // eagerly in NewReader, at package init, before any bubble exists.
 func TestMain(m *testing.M) {
 	segment.WarmEncoder()
-	overlay.WarmEncoder()
 	subscribe.WarmEncoder()
 	m.Run()
 }

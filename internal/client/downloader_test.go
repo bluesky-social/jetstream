@@ -33,8 +33,8 @@ type archiveServer struct {
 	blockReqs atomic.Int64
 	segReqs   atomic.Int64
 	// segGate, when non-nil, is awaited at the start of every getSegment before
-	// the response is served. Cutover tests use it to deterministically order a
-	// live-buffer append ahead of the backfill completing.
+	// the response is served, letting a test deterministically delay a download
+	// (e.g. to order a live event ahead of the backfill completing).
 	segGate <-chan struct{}
 }
 
@@ -143,10 +143,6 @@ func (as *archiveServer) noKeepAliveDownloader(concurrency int) *Downloader {
 	hc := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 	xc := &xrpc.Client{Host: as.srv.URL, HTTPClient: gt.Some(hc)}
 	return NewDownloader(xc, concurrency, nil)
-}
-
-func (as *archiveServer) downloaderWith(concurrency int, sel RowSelector) *Downloader {
-	return NewDownloader(&xrpc.Client{Host: as.srv.URL}, concurrency, sel)
 }
 
 // makeCreate builds a create-commit segment row carrying a minimal CBOR record.

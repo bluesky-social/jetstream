@@ -58,6 +58,7 @@ func TestPlanWholeSegmentAndBlocks(t *testing.T) {
 	t.Parallel()
 	resp := `{
 		"plannedThroughSeq": 500,
+		"sealedTipSeq": 500,
 		"segments": [
 			{"name":"seg_0000000000.jss","index":0,"checksum":"00112233aabbccdd","minSeq":1,"maxSeq":200,"mode":"segment"},
 			{"name":"seg_0000000001.jss","index":1,"checksum":"44556677eeff0011","minSeq":201,"maxSeq":500,"mode":"blocks","blocks":[{"first":2,"last":4},{"first":7,"last":7}]}
@@ -70,6 +71,7 @@ func TestPlanWholeSegmentAndBlocks(t *testing.T) {
 	require.NoError(t, err)
 
 	require.EqualValues(t, 500, plan.PlannedThroughSeq)
+	require.EqualValues(t, 500, plan.SealedTipSeq)
 	require.Len(t, plan.Entries, 2)
 
 	require.Equal(t, "seg_0000000000.jss", plan.Entries[0].SegmentName)
@@ -100,12 +102,13 @@ func TestPlanFilterMatchesNothingButReportsTip(t *testing.T) {
 	t.Parallel()
 	// A filter that matches no segment in a non-empty archive still reports
 	// the sealed tip as the cutover cursor.
-	resp := `{"plannedThroughSeq":900,"segments":[],"stats":{"segmentsExamined":3,"segmentsMatched":0,"blocksMatched":0,"entries":0}}`
+	resp := `{"plannedThroughSeq":900,"sealedTipSeq":900,"segments":[],"stats":{"segmentsExamined":3,"segmentsMatched":0,"blocksMatched":0,"entries":0}}`
 	ps := newPlanServer(t, http.StatusOK, resp)
 
 	plan, err := ps.planner().Plan(context.Background(), PlanRequest{Collections: []string{"app.example.absent"}})
 	require.NoError(t, err)
 	require.EqualValues(t, 900, plan.PlannedThroughSeq)
+	require.EqualValues(t, 900, plan.SealedTipSeq)
 	require.Empty(t, plan.Entries)
 }
 
@@ -185,23 +188,48 @@ func TestPlanInputOmitsEmptyFilters(t *testing.T) {
 	require.False(t, hasBefore, "unset beforeSeq must be omitted")
 }
 
-func TestPlanTooLarge(t *testing.T) {
+func TestPlanSurfacesContinuationCursorAndTip(t *testing.T) {
 	t.Parallel()
-	resp := `{"error":"PlanTooLarge","message":"too many entries"}`
-	ps := newPlanServer(t, http.StatusBadRequest, resp)
+	// A truncated page: the continuation cursor is below the sealed tip, so the
+	// caller knows to page again. Both horizons must surface on the Plan.
+	resp := `{
+		"plannedThroughSeq": 300,
+		"sealedTipSeq": 500,
+		"segments": [
+			{"name":"seg_0000000000.jss","index":0,"checksum":"00112233aabbccdd","minSeq":1,"maxSeq":300,"mode":"segment"}
+		],
+		"stats": {"segmentsExamined":2,"segmentsMatched":1,"blocksMatched":3,"entries":1}
+	}`
+	ps := newPlanServer(t, http.StatusOK, resp)
 
-	_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
-	require.ErrorIs(t, err, ErrPlanTooLarge)
+	plan, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+	require.NoError(t, err)
+	require.EqualValues(t, 300, plan.PlannedThroughSeq)
+	require.EqualValues(t, 500, plan.SealedTipSeq)
+	require.Less(t, plan.PlannedThroughSeq, plan.SealedTipSeq, "truncated page: more to fetch")
 }
 
-func TestPlanOtherXRPCError(t *testing.T) {
+func TestPlanRejectsCursorAboveTip(t *testing.T) {
+	t.Parallel()
+	// A server that reports plannedThroughSeq > sealedTipSeq is incoherent (the
+	// continuation cursor can never exceed the pagination goal); the client
+	// must reject it rather than loop forever or skip the tail.
+	resp := `{"plannedThroughSeq":600,"sealedTipSeq":500,"segments":[],"stats":{}}`
+	ps := newPlanServer(t, http.StatusOK, resp)
+
+	_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exceeds sealedTipSeq")
+}
+
+func TestPlanXRPCErrorIsWrapped(t *testing.T) {
 	t.Parallel()
 	resp := `{"error":"InternalError","message":"boom"}`
 	ps := newPlanServer(t, http.StatusInternalServerError, resp)
 
 	_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
 	require.Error(t, err)
-	require.NotErrorIs(t, err, ErrPlanTooLarge)
+	require.Contains(t, err.Error(), "planBackfill")
 }
 
 func TestPlanRejectsMalformedSegments(t *testing.T) {
@@ -210,13 +238,13 @@ func TestPlanRejectsMalformedSegments(t *testing.T) {
 		name string
 		resp string
 	}{
-		{name: "missing name", resp: `{"plannedThroughSeq":10,"segments":[{"name":"","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"segment"}],"stats":{}}`},
-		{name: "unknown mode", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"bogus"}],"stats":{}}`},
-		{name: "blocks mode no ranges", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"blocks"}],"stats":{}}`},
-		{name: "inverted block range", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"blocks","blocks":[{"first":5,"last":2}]}],"stats":{}}`},
-		{name: "inverted seq range", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":500,"maxSeq":200,"mode":"segment"}],"stats":{}}`},
-		{name: "index exceeds uint32", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":4294967296,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"segment"}],"stats":{}}`},
-		{name: "block last exceeds uint32", resp: `{"plannedThroughSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"blocks","blocks":[{"first":0,"last":4294967296}]}],"stats":{}}`},
+		{name: "missing name", resp: `{"plannedThroughSeq":10,"sealedTipSeq":10,"segments":[{"name":"","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"segment"}],"stats":{}}`},
+		{name: "unknown mode", resp: `{"plannedThroughSeq":10,"sealedTipSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"bogus"}],"stats":{}}`},
+		{name: "blocks mode no ranges", resp: `{"plannedThroughSeq":10,"sealedTipSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"blocks"}],"stats":{}}`},
+		{name: "inverted block range", resp: `{"plannedThroughSeq":10,"sealedTipSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"blocks","blocks":[{"first":5,"last":2}]}],"stats":{}}`},
+		{name: "inverted seq range", resp: `{"plannedThroughSeq":10,"sealedTipSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":500,"maxSeq":200,"mode":"segment"}],"stats":{}}`},
+		{name: "index exceeds uint32", resp: `{"plannedThroughSeq":10,"sealedTipSeq":10,"segments":[{"name":"s","index":4294967296,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"segment"}],"stats":{}}`},
+		{name: "block last exceeds uint32", resp: `{"plannedThroughSeq":10,"sealedTipSeq":10,"segments":[{"name":"s","index":0,"checksum":"x","minSeq":1,"maxSeq":2,"mode":"blocks","blocks":[{"first":0,"last":4294967296}]}],"stats":{}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

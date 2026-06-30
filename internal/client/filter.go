@@ -11,26 +11,17 @@ import (
 // negatives, possible false positives via DID blooms and per-block collection
 // summaries), so the client MUST re-apply exact filtering after decode.
 //
-// The presentation contract is the v2 Go-client contract (NOT v1 wire parity):
-// a subscriber that asked for specific collections wants only those record
-// types, so account and identity events — which carry no collection — are
-// dropped when a collection filter is set. With no collection filter they flow
-// (subject to the DID filter). Concretely:
+// The presentation contract matches the server's /subscribe wire policy:
 //
 //   - DID filter applies to all event kinds.
 //   - With a collection filter set: only commit events whose collection matches
-//     are delivered; identity and account events are dropped (they carry no
-//     collection). A commit with an empty collection still bypasses the filter.
-//   - With no collection filter: identity and account events are delivered
-//     (subject to the DID filter), matching "give me the whole stream".
-//   - Sync events bypass the collection filter regardless: they are an internal
-//     resync signal, never surfaced as a user record.
-//
-// IMPORTANT: this filter governs what is DELIVERED to the consumer, not what
-// the engine observes internally. Account-deletion tombstones are folded into
-// the Suppressor BEFORE this matcher runs (liveSink.onLive observes the
-// tombstone, then calls wantLive), so dropping an account event here never
-// weakens the client's record-deletion guarantee.
+//     are delivered. A commit with an empty collection still bypasses the
+//     filter. #account, #identity, and #sync — the DID-level events, which carry
+//     no collection — always bypass the collection filter (subject to the DID
+//     filter), because they are the consumer's only signal to purge a dead
+//     account's records; hiding them would create a permanently stale view.
+//   - With no collection filter: every kind is delivered (subject to the DID
+//     filter), matching "give me the whole stream".
 //
 // The seq window is the client's exact (afterSeq, beforeSeq] bound, applied on
 // top of the planner's coarse per-segment/block seq pruning.
@@ -90,16 +81,13 @@ func (m *Matcher) Wants(ev *segment.Event) bool {
 	if !m.hasCollectionFilter() {
 		return true
 	}
-	// Sync is an internal resync signal, never gated by the collection filter.
-	if ev.Kind == segment.KindSync {
-		return true
-	}
-	// With a collection filter set, identity and account events (which carry no
-	// collection) are not what a collection-scoped subscriber asked for. Drop
-	// them from delivery. Tombstone folding for account-deletes already happened
-	// upstream (see the type doc), so this does not affect record suppression.
+	// DID-level events (#account, #identity, #sync) carry no collection and
+	// always bypass the collection filter, subject to the DID filter applied
+	// above. They are the consumer's only signal to purge a dead account's
+	// records, so hiding them under a collection filter would create a
+	// permanently stale view (see the type doc).
 	if !ev.Kind.IsCommit() {
-		return false
+		return true
 	}
 	// A commit lacking a collection bypasses the filter (v1 parity).
 	if ev.Collection == "" {
@@ -116,14 +104,39 @@ func (m *Matcher) Wants(ev *segment.Event) bool {
 	return false
 }
 
+// Keep makes *Matcher satisfy the downloader's RowSelector: a row is kept iff it
+// passes the exact filters. The drop reason is "filtered" for a filter miss.
+// Backfill no longer suppresses tombstoned rows — every matching row is emitted
+// and a folding consumer converges (design §5.1) — so the matcher is the whole
+// keep/drop decision.
+func (m *Matcher) Keep(ev *segment.Event) (bool, string) {
+	if m.Wants(ev) {
+		return true, ""
+	}
+	return false, "filtered"
+}
+
+// setAfterSeq raises the matcher's exclusive lower bound to afterSeq. It is used
+// on a §14 re-backfill: the sweep re-runs planBackfill from the last
+// durably-processed seq (the live tail's highest delivered seq), and the matcher
+// must track that resume point so the one work unit that STRADDLES it (admitted
+// whole under the planner's one-sided contract) has its already-delivered rows
+// dropped before decode rather than re-emitted out of order. Only the seq floor
+// moves; the DID/collection filters and the (user-supplied) beforeSeq bound are
+// untouched. The bound only ever moves FORWARD across a backfill loop's life
+// (resume >= cutover >= the prior floor), so this never widens the window. See
+// the call site in runBackfillThenLive for the full scope/safety argument.
+func (m *Matcher) setAfterSeq(afterSeq uint64) {
+	m.afterSeq = afterSeq
+}
+
 func (m *Matcher) wantsSeq(seq uint64) bool {
 	// afterSeq is a RESUME-AFTER bound (seq > afterSeq), but only when one was
 	// actually requested. afterSeq==0 means "from the start of the archive"
-	// (WithAfterSeq(0)), and jetstream's seq space is 0-based — the first-ever
-	// event is seq 0 — so a bare seq <= afterSeq check would drop that first
-	// event. Gate on afterSeq>0 so 0 imposes no lower bound, matching the server
-	// (which omits the wire field and applies no bound when afterSeq is 0). See
-	// #111.
+	// (WithAfterSeq(0)). Seqs start at 1, so afterSeq==0 imposes no lower bound
+	// and the first-ever event (seq 1) is included, matching the server (which
+	// omits the wire field and applies no bound when afterSeq is 0). The
+	// afterSeq>0 gate keeps that 0-imposes-nothing behavior.
 	if m.afterSeq > 0 && seq <= m.afterSeq {
 		return false
 	}

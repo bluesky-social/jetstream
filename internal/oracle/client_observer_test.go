@@ -53,22 +53,25 @@ type clientBackfillResult struct {
 }
 
 // collectClientBackfill drives the REAL public jetstream client through the
-// full archive-negotiation path (getTombstones -> planBackfill ->
-// getSegment/getBlock -> overlay suppression -> cutover to /subscribe-v2),
-// the transport real clients actually use (issue #77). The client is an
-// OBSERVATION SURFACE ONLY — expected state is still derived independently
-// from simulator world + firehose history, never from the client itself.
+// full archive-negotiation path (planBackfill -> getSegment/getBlock -> cutover
+// to /subscribe-v2), the transport real clients actually use (issue #77). The
+// client is an OBSERVATION SURFACE ONLY — expected state is still derived
+// independently from simulator world + firehose history, never from the client
+// itself.
 //
 // It drains the client's full emitted stream — archive AND live tail — until
 // the reconstructed final state converges to the independently-derived ground
 // truth (converged returns true on a clean Compare), or the deadline fires.
-// Draining PAST the compaction watermark to convergence is deliberate: the
-// client emits a SUPPRESSED stream (a create/update kept on disk at watermark
-// W can still be dropped by the client when a tombstone above W supersedes it),
-// so its (-inf, W] window is a subset of the on-disk rows and a per-seq
-// completeness check over that window is unsound. Final state, by contrast, is
-// key-based and seq-space-agnostic: it is comparable exactly when the client
-// has caught up to the quiescent world, which is what convergence detects.
+// Draining to convergence is the load-bearing stop condition under the relaxed
+// eventually-consistent contract (drop-client-tombstones §R1/§R7): backfill is
+// AT-LEAST-ONCE, so the client may emit a create that a later delete supersedes
+// (no client-side suppression remains). A per-seq completeness check over any
+// fixed window is therefore unsound — transient stale rows are expected. Final
+// state, by contrast, is key-based and seq-space-agnostic: Reconstruct folds the
+// full emitted stream and it is comparable exactly when the client has caught up
+// to the quiescent world, which is what convergence detects. This Reconstruct +
+// Compare-to-convergence over the UNFILTERED stream IS the fold-convergence
+// invariant (CheckFoldConvergence) for the no-collection-filter query.
 //
 // The live tail never ends on its own; convergence (or the deadline) is the
 // stop condition. Recoverable client errors are COUNTED (not silently
@@ -240,11 +243,19 @@ func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, tr
 // path (jetstream.TypedEvents[bsky.FeedLike] over WithRawRecords) against the
 // running server, decoding every app.bsky.feed.like create on the parallel
 // decode workers. It is the end-to-end guard for #146's worker-parallel typed
-// decode: it asserts the typed path reaches the watermark, decodes likes with
-// ZERO decode errors, that every decoded like carries the well-formed subject
-// strongref the simulator generated, and — the correctness crux — that the SET
-// of (DID,rkey) likes the typed path surfaces equals what the map path observes
-// from the same server. Run as a bounded backfill-only dump so it terminates.
+// decode: it asserts the typed path decodes likes with ZERO decode errors, that
+// at least one like decoded, that every decoded like carries the well-formed
+// subject strongref the simulator generated, and — the correctness crux — that
+// the SET of (DID,rkey) likes the typed path surfaces equals what the map path
+// observes from the same server over the same (0, beforeSeq] range. It is run
+// as a bounded backfill-only dump (WithBeforeSeq+WithBackfillOnly) so it
+// terminates. This helper does NOT assert full watermark coverage: maxSeq
+// tracks only like-collection events, which need not reach the global
+// beforeSeq watermark; archive-tail completeness against an independent ground
+// truth is owned by assertClientBackfillCompacted, run over the same range just
+// before this. The map-vs-typed set equality is a differential check (it would
+// not catch a truncation that hits both paths identically); its job is to prove
+// the two decode paths agree, not to prove coverage.
 func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, obsClient *http.Client, baseURL string, beforeSeq uint64) {
 	t.Helper()
 
@@ -270,13 +281,17 @@ func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, obsClien
 	}()
 
 	typedLikes := map[string]string{} // did/rkey -> subject URI (decoded via the typed path)
-	var decoded, decodeErrs, maxSeq uint64
+	var decoded, maxSeq uint64
 	for tb, err := range jetstream.TypedEvents[bsky.FeedLike](ctx, client, "app.bsky.feed.like") {
 		require.NoErrorf(t, err, "typed backfill stream: mode=%s seed=%d", cfg.Mode, cfg.Seed)
 		for _, te := range tb.Events() {
 			if te.Event.Seq > maxSeq {
 				maxSeq = te.Event.Seq
 			}
+			// Per-event decode-error guard: this is the load-bearing zero-error
+			// assertion (it fails the test on the first decode error). We do NOT
+			// keep a redundant aggregate counter — it would be zero by
+			// construction here and read as a backstop that can never fire.
 			require.NoErrorf(t, te.DecodeErr, "typed like decode error seq=%d", te.Event.Seq)
 			if te.Record == nil {
 				// Only like creates decode; deletes (no record) pass through.
@@ -287,7 +302,6 @@ func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, obsClien
 			typedLikes[te.Event.DID+"/"+te.Event.Commit.Rkey] = te.Record.Subject.URI
 		}
 	}
-	require.Zerof(t, decodeErrs, "typed backfill had %d decode errors", decodeErrs)
 	require.Positivef(t, decoded, "typed backfill decoded no likes: mode=%s seed=%d", cfg.Mode, cfg.Seed)
 
 	// Cross-check against the MAP path over the same bounded range: the set of

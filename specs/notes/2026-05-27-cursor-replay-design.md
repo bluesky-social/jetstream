@@ -1,5 +1,20 @@
 # Subscriber cursor replay — design
 
+> ⚠ SUPERSEDED VALUES (2026-06-30). This note states the v2/v1 cursor
+> disambiguation floor as `1.5e15` throughout (the table at "Wire contract", the
+> "Risk notes", and the Constraints). The value that actually ships is **`1e15`**
+> (`CursorSeqMaxThreshold = 1_000_000_000_000_000`, `internal/subscribe/cursor.go`;
+> `docs/README.md` §5.1 is authoritative). Read every `1.5e15` here as `1e15`. The
+> argument still holds at `1e15`: `1e15` unix-micros is 2001-09-09, an order of
+> magnitude below any current timestamp (~1.75e15) and the 36h lookback floor, and
+> a 1-based v2 seq counter does not approach `1e15` for centuries at any realistic
+> ingest rate — so the two namespaces remain provably non-overlapping. (The note's
+> "predates atproto ~Jan 2017" wording was specific to 1.5e15 and does not apply to
+> the shipped 1e15; the bound is the timestamp/seq order-of-magnitude gap, not the
+> 2017 anchor.) Also note v2 `/subscribe-v2` now REJECTS a too-old below-floor seq
+> cursor with HTTP 400 rather than the "no window cap" replay this note describes;
+> v1 still clamps. This note is kept as the reasoning trail only.
+
 ## Problem
 
 Today the `/subscribe` handler only delivers live events: a connecting
@@ -91,8 +106,17 @@ range scan simply finds nothing older than the TTL boundary and
 starts at the oldest available row). No error; no warning log
 beyond the structured request log line.
 
-v2 seq cursors have no window cap. They can replay from the
-beginning of the archive.
+v2 seq cursors can replay from the beginning of the sealed
+archive. But the live `/subscribe-v2` lookback floor is enforced:
+a v2 seq cursor that resolves below the lookback floor is rejected
+with a pre-upgrade HTTP 400 ("cursor too old", carrying the floor
+seq), NOT silently clamped (the v1 timestamp path above still
+clamps). This is the explicit signal a paginated backfill client
+keys on to re-backfill from its last seq rather than silently
+dropping the gap — see the 2026-06-28 drop-client-tombstones
+design §14. (Replaying the sealed archive itself goes through
+paginated `planBackfill` + segment downloads, not the live
+websocket, so "from the beginning" is not bounded by the floor.)
 
 ## Configuration
 

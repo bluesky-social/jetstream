@@ -125,7 +125,7 @@ func TestOpen_UsesConfiguredSeqKey(t *testing.T) {
 	val, closer, err := st.Get([]byte(customKey))
 	require.NoError(t, err)
 	defer func() { _ = closer.Close() }()
-	require.Equal(t, uint64(1), binary.LittleEndian.Uint64(val),
+	require.Equal(t, uint64(2), binary.LittleEndian.Uint64(val),
 		"custom SeqKey must hold the writer's persisted nextSeq")
 
 	_, _, err = st.Get([]byte("seq/next"))

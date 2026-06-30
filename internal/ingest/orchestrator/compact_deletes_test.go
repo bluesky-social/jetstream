@@ -136,9 +136,9 @@ func TestRunDeleteCompaction_SealsActiveSegmentBeforeSteadyPass(t *testing.T) {
 // Setup: seg_0 (sealed) holds create(0) + update1(1) for the key, so the pass's
 // target watermark is 1. The in-memory Set additionally observes a synthetic
 // update2 at seq 2 — modelling a live event already ingested above the
-// watermark — which collapses the key's in-memory tombstone to 2. On the buggy
-// code the bounded snapshot SnapshotRange(0, 1) drops the key (2 > 1) and
-// create(0) survives; the fix folds seg_0 and drops it.
+// watermark — which collapses the key's in-memory tombstone to 2. The original
+// bug read the in-memory Set with an upper bound of 1, which dropped the key
+// (2 > 1) so create(0) survived; the fix folds seg_0 from disk and drops it.
 func TestRunDeleteCompaction_DropsSupersededRowWhenKeyUpdatedAboveWatermark(t *testing.T) {
 	t.Parallel()
 
@@ -659,10 +659,9 @@ func TestRebuildLiveTombstones_BoundedByWatermark(t *testing.T) {
 	for i := range segB {
 		require.NoError(t, want.Observe(&segB[i]))
 	}
-	maxSeq := ^uint64(0)
-	require.Equal(t, want.SnapshotRange(0, maxSeq).Records, set.SnapshotRange(0, maxSeq).Records)
-	require.Equal(t, want.SnapshotRange(0, maxSeq).DIDs, set.SnapshotRange(0, maxSeq).DIDs)
-	require.NotContains(t, set.SnapshotRange(0, maxSeq).Records,
+	require.Equal(t, want.Snapshot().Records, set.Snapshot().Records)
+	require.Equal(t, want.Snapshot().DIDs, set.Snapshot().DIDs)
+	require.NotContains(t, set.Snapshot().Records,
 		tombstone.RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "r"},
 		"tombstones at or below the watermark are already applied and must not rebuild")
 }

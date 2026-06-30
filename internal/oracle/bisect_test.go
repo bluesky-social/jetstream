@@ -34,10 +34,9 @@ func TestClassifyCompactedFailure_DiskAlsoViolates_DurableDefect(t *testing.T) {
 	require.ErrorContains(t, v.Err(), "DURABLE")
 }
 
-// A served failure whose on-disk segments are CLEAN at the same watermark is a
-// serving-path inconsistency (a torn cross-batch /subscribe read), not a
-// storage bug. This is the outcome that points at the live-tail-transport
-// misuse tracked in #77.
+// A client-backfill failure whose on-disk segments are CLEAN at the same
+// watermark is a serving-path inconsistency (e.g. a torn cold-batch handoff
+// across the paginated getSegment/getBlock download), not a storage bug.
 func TestClassifyCompactedFailure_DiskClean_ServingDefect(t *testing.T) {
 	t.Parallel()
 

@@ -14,18 +14,6 @@ import (
 // newEngine builds the real orchestration engine in internal/client and adapts
 // it to the root Client's engine interface.
 func newEngine(host string, cfg config) (engine, error) {
-	// A backfill-only dump never starts the live tail, so it needs no cutover
-	// buffer. Skip allocating the default in-memory buffer in that case; a
-	// caller-supplied buffer is still honored (and closed) if one was set.
-	buf := cfg.liveBuffer
-	if buf == nil && !cfg.backfillOnly {
-		buf = NewMemLiveBuffer()
-	}
-	var bufAdapter iclient.Buffer
-	if buf != nil {
-		bufAdapter = bufferAdapter{buf}
-	}
-
 	ec := iclient.Config{
 		Host: host,
 		Request: iclient.PlanRequest{
@@ -40,7 +28,6 @@ func newEngine(host string, cfg config) (engine, error) {
 		LiveCursor:   cfg.liveCursor,
 		BatchSize:    cfg.batchSize,
 		Concurrency:  cfg.downloadConc,
-		Buffer:       bufAdapter,
 		XRPC:         newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second)),
 		BulkXRPC:     newXRPCClient(host, cfg, xrpc.BulkDownloadOpts()),
 		// Route the live-tail websocket upgrade through the caller's HTTP
@@ -52,10 +39,7 @@ func newEngine(host string, cfg config) (engine, error) {
 		RawRecordsCopied: cfg.rawRecordsCopied,
 		RawRecordCIDs:    cfg.rawRecordCIDs,
 	}
-	// ownBuf gates whether close() calls buf.Close(); only true when we created
-	// the buffer ourselves. When buf is nil (backfill-only, no caller buffer)
-	// it must stay false so close() never dereferences a nil buffer.
-	return &realEngine{eng: iclient.NewEngine(ec), buf: buf, ownBuf: buf != nil && cfg.liveBuffer == nil, batchSize: cfg.batchSize}, nil
+	return &realEngine{eng: iclient.NewEngine(ec), batchSize: cfg.batchSize}, nil
 }
 
 // newXRPCClient builds an xrpc.Client for host. When the caller supplied an
@@ -80,9 +64,7 @@ func newXRPCClient(host string, cfg config, opts []jttp.Option) *xrpc.Client {
 // realEngine adapts internal/client.Engine to the root engine interface,
 // translating the engine's events into public jetstream.Event/Batch values.
 type realEngine struct {
-	eng    *iclient.Engine
-	buf    LiveBuffer
-	ownBuf bool // close the buffer on engine close only if we created it
+	eng *iclient.Engine
 	// batchSize is the consumer's BatchSize, used by the backfill fast path to
 	// chunk a decoded block's events into public batches ON the decode workers
 	// (see run). The live path uses the internal batcher's own size.
@@ -133,10 +115,23 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	// per ~4096-event block, negligible) so internal/client never names the public
 	// types. A nil return means an empty/filtered block (nothing to emit).
 	//
-	// Emit and the live emitBatch/emitErr closures below all run on a single
-	// goroutine at any time and in disjoint phases (backfill fully precedes the
-	// live cutover — Download returns before flipAndDrain), so the shared `stopped`
-	// flag is never touched concurrently. Transform never touches it.
+	// Concurrency of the shared `stopped` flag (subtle — read before refactoring):
+	// the backfill fast-path Emit closure runs on the engine's single run
+	// goroutine, but the live emitBatch/emitErr closures can ALSO be driven by the
+	// internal batcher's periodic flusher goroutine (internal/client startFlusher
+	// → b.flush()), not only the run goroutine. The flag is nonetheless race-free,
+	// for two reasons the older comment omitted:
+	//   1. The batcher serializes every emit under its own mutex, so a
+	//      flusher-driven emitBatch and a run-goroutine emit never overlap; and
+	//   2. Emit (fast-path backfill) and the live emitBatch/emitErr are never
+	//      BOTH live at once on the production path: backfill rows bypass the
+	//      batcher entirely (Emit), and the live tail's batcher buffer is flushed
+	//      before each re-sweep (internal/client runBackfillThenLive), so the
+	//      flusher's b.flush() finds an empty buffer and never calls emitBatch
+	//      while a sweep's Emit is running.
+	// Transform runs on the decode workers and never touches `stopped`. If a future
+	// refactor breaks invariant (2) (e.g. live rows left buffered across a sweep),
+	// promote `stopped` to an atomic.Bool rather than relying on this argument.
 	size := max(e.batchSize, 1)
 	bf := iclient.BackfillSink{
 		Transform: func(_ int, evs []iclient.Event) any {
@@ -198,13 +193,15 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	)
 }
 
+func (e *realEngine) stats() Stats {
+	return Stats(e.eng.Stats())
+}
+
 func (e *realEngine) close() error {
-	// Cancel any in-flight run first so a live tail actually stops (the
-	// documented "natural way to stop a live tail"). We do NOT wait for the run
-	// to finish: a consumer may call Close from inside its own Events loop, and
-	// blocking here would deadlock. The buffer's own methods are close-safe
-	// (they return errBufferClosed rather than panicking), so a run still
-	// unwinding when we close the buffer below cannot corrupt or crash.
+	// Cancel any in-flight run so a live tail actually stops (the documented
+	// "natural way to stop a live tail"). We do NOT wait for the run to finish: a
+	// consumer may call Close from inside its own Events loop, and blocking here
+	// would deadlock. The bufferless cutover holds no resources to release.
 	e.mu.Lock()
 	e.closed = true
 	cancel := e.runCancel
@@ -212,37 +209,8 @@ func (e *realEngine) close() error {
 	if cancel != nil {
 		cancel()
 	}
-	if e.ownBuf {
-		return e.buf.Close()
-	}
 	return nil
 }
-
-// bufferAdapter bridges the public LiveBuffer to the engine's Buffer interface
-// (the two differ only in the LiveFrame type, kept distinct to avoid an import
-// cycle between the root package and internal/client).
-type bufferAdapter struct{ b LiveBuffer }
-
-func (a bufferAdapter) Append(frames []iclient.LiveFrame) error {
-	pub := make([]LiveFrame, len(frames))
-	for i, f := range frames {
-		pub[i] = LiveFrame{Seq: f.Seq, Data: f.Data}
-	}
-	return a.b.Append(pub)
-}
-
-func (a bufferAdapter) Replay(ctx context.Context, after gt.Option[uint64]) func(yield func(iclient.LiveFrame, error) bool) {
-	return func(yield func(iclient.LiveFrame, error) bool) {
-		for f, err := range a.b.Replay(ctx, after) {
-			if !yield(iclient.LiveFrame{Seq: f.Seq, Data: f.Data}, err) {
-				return
-			}
-		}
-	}
-}
-
-func (a bufferAdapter) Truncate(throughSeq uint64) error { return a.b.Truncate(throughSeq) }
-func (a bufferAdapter) Close() error                     { return a.b.Close() }
 
 // toPublicEvents converts a block (or batch) of internal events to public
 // events. Commit rows dominate, and each public *Commit was one heap allocation

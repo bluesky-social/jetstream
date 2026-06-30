@@ -1,0 +1,31 @@
+mutant: m032_v2_below_floor_silent_clamp
+target: internal/subscribe/cursor.go
+failure-mode: |
+  The v2 too-old policy is disabled: a seq cursor below the lookback floor is
+  silently clamped to the floor (the v1 legacy behaviour) instead of returning
+  the typed ErrCursorTooOld that maps to a pre-upgrade HTTP 400. The §10.1 bug
+  re-introduced: a client whose cursor aged below the floor is handed a stream
+  starting at the floor while believing it resumed at its cursor, silently
+  skipping (requestedSeq, floorSeq] — a data-loss gap with no signal to
+  re-backfill.
+expected-detection: |
+  Killed by TestPartB_StaleCursorSignal (#182, partb tier): a below-floor v2
+  cursor must return HTTP 400 carrying the floor seq; with the clamp restored
+  the dial upgrades (101) and the assertion on the 400 status fails.
+  TestPartB_CaughtUpHandoffBelowFloorReBackfills also regresses (the client
+  never sees the 400, so it never re-backfills the fresh segment).
+expected-tier: partb
+tiers: partb
+
+diff --git a/internal/subscribe/cursor.go b/internal/subscribe/cursor.go
+--- a/internal/subscribe/cursor.go
++++ b/internal/subscribe/cursor.go
+@@ -184,7 +184,7 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
+ 				// learns it fell behind and re-backfills from its last seq
+ 				// instead of silently skipping (requestedSeq, floorSeq]. v1
+ 				// keeps the legacy silent clamp for wire compatibility.
+-				if env.RejectBelowFloor {
++				if false {
+ 					return CursorPlan{}, fmt.Errorf("%w: cursor %d below lookback floor %d; re-backfill from your last seq", ErrCursorTooOld, n, floorSeq)
+ 				}
+ 				startSeq = floorSeq

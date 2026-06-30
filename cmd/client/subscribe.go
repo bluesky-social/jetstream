@@ -40,7 +40,7 @@ func subscribeCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:  "before-seq",
-				Usage: "Backfill upper bound (inclusive); 0 means unset",
+				Usage: "Backfill upper bound (inclusive); 0 means unset. Requires --backfill-only (a bounded dump); it cannot be combined with the live cutover.",
 				Value: 0,
 			},
 			&cli.BoolFlag{
@@ -61,10 +61,6 @@ func subscribeCommand() *cli.Command {
 				Name:  "download-concurrency",
 				Usage: "Bounded concurrency for sealed segment/block downloads (0 = auto-size from CPU count)",
 				Value: 0,
-			},
-			&cli.StringFlag{
-				Name:  "live-buffer-file",
-				Usage: "Path to a durable JSONL live buffer (default: in-memory)",
 			},
 			&cli.BoolFlag{
 				Name:  "print",
@@ -146,6 +142,13 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 	if before := cmd.Int("before-seq"); before < 0 {
 		return fmt.Errorf("--before-seq must be >= 0, got %d", before)
 	}
+	// --before-seq is an archive upper bound and only makes sense as a bounded
+	// dump: combining it with the live cutover would silently drop every live
+	// event past the bound (the library rejects it too; surface it here with an
+	// actionable CLI message first).
+	if cmd.Int("before-seq") > 0 && !cmd.Bool("backfill-only") {
+		return fmt.Errorf("--before-seq requires --backfill-only")
+	}
 	if lc := cmd.Int("live-cursor"); lc < 0 {
 		return fmt.Errorf("--live-cursor must be >= 0, got %d", lc)
 	}
@@ -173,14 +176,6 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 			return fmt.Errorf("--backfill-only requires --after-seq and/or --before-seq")
 		}
 		opts = append(opts, jetstream.WithBackfillOnly())
-	}
-
-	if path := cmd.String("live-buffer-file"); path != "" {
-		buf, err := jetstream.NewFileLiveBuffer(path)
-		if err != nil {
-			return err
-		}
-		opts = append(opts, jetstream.WithLiveBuffer(buf))
 	}
 
 	// --typed-likes-client decodes records straight into bsky.FeedLike via the

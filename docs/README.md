@@ -55,7 +55,7 @@ Jetstream is a single static executable that runs on a single server. We support
 
 It completes full network backfill, transitions to the live tail seamlessly. Then, its clients to subscribe to the full network or certain data slices (similar to Jetstream v1).
 
-It tracks each event via its own `sequence number`, a monotonic 64-bit integer assigned at ingestion time (this sequence number is also known as the `cursor`). The cursor is *inclusive*: `?cursor=N` replays starting at the event with seq N (we deliver events with seq >= cursor). The seq space is 0-based, so `?cursor=0` replays the first-ever event. Combined with at-least-once delivery (see the invariants below), a client resuming from its last-seen cursor re-receives that last event, so clients must be idempotent (the bundled Go client dedups by seq, re-anchoring at last-seen-seq and dropping the re-delivery). The client can use this to either backfill data starting from the beginning of time, some arbitrary point, or just start streaming the current live tip.
+It tracks each event via its own `sequence number`, a monotonic 64-bit integer assigned at ingestion time (this sequence number is also known as the `cursor`). The cursor is *inclusive*: `?cursor=N` replays starting at the event with seq N (we deliver events with seq >= cursor). Sequence numbers start at 1; seq 0 is a reserved "nothing yet" sentinel, so `?cursor=0` replays from before the first event (i.e. everything). Combined with at-least-once delivery (see the invariants below), a client resuming from its last-seen cursor re-receives that last event, so clients must be idempotent (the bundled Go client dedups by seq, re-anchoring at last-seen-seq and dropping the re-delivery). The client can use this to either backfill data starting from the beginning of time, some arbitrary point, or just start streaming the current live tip.
 
 Same as the normal firehose, cursors are instance-local. Each jetstream instance assigns its own seq values independently, so on failover to a replica, clients should rewind their cursor by a small margin and rely on at-least-once delivery to cover the overlap.
 
@@ -69,6 +69,11 @@ We enforce some invariants that are required for building correctly on atproto:
 3. At least once delivery
     - We explicitly don't enforce exactly once delivery
     - All clients must be idempotent to repeated calls (all existing jetstream v1 clients should be doing this already anyways!)
+4. Eventually-consistent, cooperative completeness
+    - Jetstream is an at-least-once, filter-honoring event log, not a live mirror of current network truth. It delivers create rows for records that are already dead on the network and does **not** silently fold them away. Deletions are positive marker events (`#delete`, `#update`, `#account` with `active=false, status=deleted`, `#sync`), retained durably forever, never silent absences.
+    - The completeness guarantee is **no silent loss of in-scope, retrievable data**: every event matching a subscription's filter that the server can still serve is delivered at least once, in seq order. (If the server holds a matching event and walks past it without delivering it, that's a bug — we crash rather than corrupt.)
+    - A correct consumer reaches network truth by **folding** the stream it receives: creates/updates apply; deletes, account-deletes, and syncs remove. Completeness is a joint property of the server (preserves every marker, delivers every in-scope event), the client (folds idempotently), and the user (subscribes to the markers their data model needs). The bundled clients fold for you; third-party clients must too.
+    - Bounded incompleteness: below the compaction watermark, superseded create/update rows are physically gone, so a backfill never emits them — nothing to reconcile. The only already-dead records a consumer transiently holds live in the uncompacted tail `(W, tip]` (≈ one compaction interval); those converge as their markers arrive.
 
 Jetstream goes through a bootstrap phase where it seeds a user list from a relay's `com.atproto.sync.listRepos` endpoint, saving all DIDs to a file. During the iteration through the `listRepos` call, it also downloads DID docs to find the user's PDS, calling `com.atproto.sync.getRepo` to backfill the repo to disk. We lay out each event's data on disk in a custom file format called `segment files` as described in Section 3. Once a repo has been downloaded and saved to disk, we mark it as complete in our per-DID tracking file.
 
@@ -128,9 +133,9 @@ For instance, if a user requests all `standard.site` documents since two weeks a
 
 Just like the firehose, the way the data is laid out on disk naturally ensures events within a single DID are delivered in order (though multiple DIDs may be interleaved together).
 
-Once the server notices the client library has reached the end of the available HTTPS files to download in parallel, the server tells the client to pick up the websocket endpoint with a given cursor value to ensure zero events are missed. Jetstream is capable of replaying some number of recent events via the websocket endpoint so that way there is a buffer period where the backfill to live cut over can happen without the potential for data loss (say, a 72 hour replay window, configurable by the server operator).
+The client paginates `planBackfill` over the sealed archive — each page names the segments/blocks to download and reports a `sealedTipSeq` (the archive tip, pinned for the whole backfill) and a `plannedThroughSeq` continuation cursor. The client downloads and emits each page, advancing the cursor, until `plannedThroughSeq >= sealedTipSeq`. Only then does it connect `/subscribe` once, at the sealed tip, to pick up the active segment and the live tail. There is no client-side cutover buffer ("jetstream is your buffer"); the websocket lookback window is no longer load-bearing for correctness. Segments sealed *during* the backfill are picked up by the cold-replay path when `/subscribe` re-reads the manifest at connect, and the live tail is deduped by seq, so the seam is at-least-once with no gap.
 
-The client must also be aware of deletion/update tombstones and respect that appropriately (more on this later).
+The client folds the stream as it goes (creates/updates apply; deletes/account-deletes/syncs remove); it does not need to download a tombstone overlay or suppress rows — deletion markers arrive inline as their own events (more on this later).
 
 ## 3. Data Layout
 
@@ -157,7 +162,7 @@ On crash/restart, we seek to the active segment back to the last complete block 
 
 After a segment file accumulates enough blocks (~256MB of compressed data), we seal it by writing the variable-length footer at the end of the file, seeking to offset 0 and overwriting the reserved 256 bytes with the finalized fixed header, fsync, and rotate to a new active file. The process continues until the heat death of the universe.
 
-Deletions and updates do not modify segment files synchronously. Every delete and update is treated as a tombstoned, keyed by its AT URI (Section 3.3). Readers (both the server-side scanner and remote clients) logically overlay the tomstones on top of segment events at delivery time.
+Deletions and updates do not modify segment files synchronously. Every delete and update is recorded as a tombstone, keyed by its AT URI (Section 3.3), and applied physically during compaction — the server rewrites sealed segments to drop superseded creates/updates below the compaction watermark. There is no read-time overlay: the server does not suppress rows at delivery time, and clients fold the stream they receive (creates/updates apply; deletes/account-deletes/syncs remove) rather than consulting a separate tombstone set.
 
 Every so often, we compact updates/deletions into the sealed segments. Compaction snapshots tombstones above `compaction/seq`, rewrites sealed segments atomically, and refreshes serving metadata for changed files. See Section 3.3 for more details.
 
@@ -349,72 +354,29 @@ Tombstones are retained as event rows forever. Record tombstones come from `Kind
 
 Segment rewrites preserve block topology and historical seq/indexed-at envelopes. A block whose rows are all dropped remains present as an `event_count=0` block, so manifest block indexes, cursor translation, and cold replay can continue to use stable block numbers across generations. Rewritten files get new checksums; HTTP downloads derive validators from the file descriptor they serve, and the subscribe block cache keys decoded blocks by segment checksum.
 
-We also store tombstones since the most recent compaction in memory in the server. This powers steady-state compaction and early cap-triggered passes, and it backs the read-time overlay endpoint described next, which exposes the same structure to backfill clients so they can suppress rows newer than the physical compaction watermark.
+We also store tombstones since the most recent compaction in memory in the server. This is purely a compaction-internal structure — it powers steady-state compaction and early cap-triggered passes (it gates when a pass runs and feeds the size gauge). There is **no read-time overlay endpoint**: the server never exposes the tombstone set to clients and never suppresses rows at delivery time. Backfill clients converge by folding the markers they receive inline (Section 4.4), not by downloading a separate suppression set.
 
-#### Compaction overlay endpoint (`network.bsky.jetstream.getTombstones`)
-
-The server exposes the in-memory tombstone set as an XRPC query, `network.bsky.jetstream.getTombstones`, an `application/octet-stream` query like `getSegment`. It serves a precomputed, immutable, zstd-compressed binary blob covering the seq range `(W, M]`, where `W` is the compaction watermark (`compaction/seq`) and `M` is the highest seq folded into the blob. The blob is rebuilt on each compaction pass and on a short coalescing interval, then shared verbatim by all readers (no per-request encode). This endpoint is not CDN-cacheable in practice — deletes/updates arrive continuously, so the blob changes every second or so — but it still emits a strong ETag for opportunistic revalidation.
-
-The blob unifies the three compaction data types into one seq-bounded suppression set: record deletions and record updates key `(did, collection, rkey) → seq`; account deletions (`active=false, status=deleted`) and `#sync` divergences key `did → (seq, reason)`. A client suppresses any `Create`/`Update` row whose `seq` is strictly less than the matching tombstone's `seq`. Because the mask is a half-open seq window (`seq < tombstone.seq`), there is **no permanent-tombstone problem**: a DID deleted at seq 100 and reactivated/posting at seq 200 is not masked (200 ≥ 100). Updates carry no payload in the overlay — the replacement `#commit` row is delivered by its own segment/live row; the overlay only suppresses the stale create.
-
-The wire format is self-describing. All multi-byte integers are little-endian; "varint" is LEB128 unsigned. `W` and `M` live in the uncompressed framing so a query plan can read the coverage envelope without decompressing the body (they are also echoed in the `Jetstream-Overlay-Watermark` / `Jetstream-Overlay-Max-Seq` response headers):
-
-```
-getTombstones overlay blob (.jsto framing):
-┌──────────────────────────────────────────────────────────┐
-│ Uncompressed framing (32 bytes)                          │
-│   magic:      [4]byte = "jsto"                           │
-│   version:    uint16 = 1                                 │
-│   flags:      uint16 (reserved, 0)                       │
-│   watermark:  uint64  (W = compaction/seq at build time) │
-│   max_seq:    uint64  (M = highest seq folded in)        │
-│   body_len:   uint64  (compressed byte length)           │
-├──────────────────────────────────────────────────────────┤
-│ Body (single ZSTD frame), decompresses to:               │
-│   DID string table:    count varint, (len varint, bytes)*│
-│     -> didID = table index                               │
-│   Collection NSID table: count varint, (len varint,bytes)*│
-│     -> collID = table index                              │
-│   Record tombstones, grouped by didID ascending:         │
-│     group_count varint                                   │
-│     per group: didID varint, entry_count varint,         │
-│       entries sorted by seq (seq delta-varint within the │
-│       group, first delta = seq - W):                     │
-│         collID varint, rkey_len varint, rkey [len]byte,  │
-│         seq_delta varint                                 │
-│   DID tombstones, ascending by didID:                    │
-│     did_tomb_count varint                                │
-│     per entry: didID varint, seq_delta varint (first vs  │
-│       W, then vs prev), reason uint8 (1=account, 2=sync) │
-└──────────────────────────────────────────────────────────┘
-```
-
-The columnar layout with DID/NSID dictionaries and delta-varint seqs is measurably smaller than flat rows after zstd (~20% fewer wire bytes at 1M tombstones), because an explicit dictionary dedups DIDs globally where zstd's bounded match window cannot. An empty overlay (nothing in `(W, M]`) is valid and common: zero-count tables and a tiny body, not an error.
-
-**A stale blob is stale-but-coherent, not incorrect.** Each build is an atomic snapshot, so the blob always reports the exact `W` and `M` it covers — it can never claim an `M` it does not cover. A correct client starts its live `/subscribe` tail from the blob's actual `M`, so whatever a slightly-stale overlay omits above `M` is delivered on the live tail instead. Staleness only costs a few seconds of extra live replay, never correctness.
+The one case folding-inline does not cover on its own is a **collection-filtered** backfill that needs DID-level markers (account-delete, `#sync`). Those markers carry an empty collection, so a naïve collection-filtered plan would never select their blocks, and a deleted account's records would survive forever in that consumer's fold — a silent loss. We close this in the segment index rather than with an overlay: when a block contains a DID-level marker, the seal/rewrite indexer tags it with a reserved sentinel collection (`$account`, `$identity`, `$sync` — see `segment/sentinel.go`). These names begin with `$`, which makes them invalid NSIDs, and the planner only admits real NSIDs / NSID-authority wildcard prefixes, so no client request can name or prefix-match a sentinel. The planner unconditionally admits a segment's sentinel ids under any collection filter, so marker blocks are always selected (the per-block DID bloom still narrows by DID). The markers then ride inline through `getBlock` in seq order, exactly as record-level deletes do, and a folding consumer converges with zero client-side special-casing.
 
 #### Historical backfill planner endpoint (`network.bsky.jetstream.planBackfill`)
 
-The server exposes sealed-archive transport planning as an XRPC procedure, `network.bsky.jetstream.planBackfill`. It accepts exact DID filters, exact collection filters, and an optional seq window with `(afterSeq, beforeSeq]` semantics. Missing or empty DID/collection filters mean match all. The v1 planner deliberately does not include overlay negotiation, live-tail cutover, active-segment planning, pagination, or wildcard collection matching.
+The server exposes sealed-archive transport planning as an XRPC procedure, `network.bsky.jetstream.planBackfill`. It accepts exact DID filters, collection filters (exact NSIDs or `.*` namespace wildcards), and an optional seq window with `(afterSeq, beforeSeq]` semantics. Missing or empty DID/collection filters mean match all.
 
-The planner runs over manifest-resident sealed-segment metadata: segment seq bounds, block seq bounds, segment DID blooms, per-block DID blooms, and per-block collection summaries. It never opens segment files on the normal path. It returns an ordered list of whole segments or inclusive block ranges that may contain matching rows, plus `plannedThroughSeq`, the sealed archive tip covered by the plan capped by `beforeSeq` when present.
+The planner runs over manifest-resident sealed-segment metadata: segment seq bounds, block seq bounds, segment DID blooms, per-block DID blooms, and per-block collection summaries. It never opens segment files on the normal path. It returns an ordered list of whole segments or inclusive block ranges that may contain matching rows, plus two seq fields: `sealedTipSeq`, the sealed-archive tip (capped by `beforeSeq` when present), stable across pages of the same archive; and `plannedThroughSeq`, the continuation cursor — the highest sealed seq this page accounts for.
 
-The planner has a one-sided correctness contract: no false negatives, possible false positives. DID bloom filters may include blocks that do not contain the requested DID, and block-level collection summaries are still only transport hints. Clients must decode rows, apply exact DID/collection filtering, apply overlay tombstones, and de-duplicate/idempotently process events.
+The planner has a one-sided correctness contract: no false negatives, possible false positives. DID bloom filters may include blocks that do not contain the requested DID, and block-level collection summaries are still only transport hints. Clients must decode rows, apply exact DID/collection filtering, fold deletes/updates, and de-duplicate/idempotently process events.
 
-Servers bound planner cost with configurable limits: maximum distinct DIDs, maximum distinct collections, maximum response/work entries, and a whole-segment density threshold. If a plan would exceed the entry limit, the server returns `PlanTooLarge`; it must not silently truncate.
+**Pagination.** Servers bound per-page cost with configurable limits: maximum distinct DIDs, maximum distinct collections, maximum response/work entries, and a whole-segment density threshold. When a plan would exceed the per-page entry limit, the server **truncates at a work-unit boundary** (a whole segment, or one coalesced block range) and reports `plannedThroughSeq` as the `MaxSeq` of the last included unit — never the enclosing segment's `MaxSeq` after a mid-segment cut, which would skip the un-included tail blocks. The server never silently truncates or refuses: there is no `PlanTooLarge`. At least one unit is always admitted per page, so a single oversized unit still makes progress (no zero-progress livelock). When a page is not truncated, `plannedThroughSeq == sealedTipSeq`.
 
-Putting it all together, the query plan and client code looks something like the following:
+Putting it all together, the client's backfill→live loop looks like:
 
-1. The client downloads the overlay blob of recent deletions and updates above `compaction/seq` from `network.bsky.jetstream.getTombstones`
-2. The client starts `/subscribe` from the overlay blob's actual `M` and buffers or processes live rows idempotently
-3. The client calls `network.bsky.jetstream.planBackfill` to learn which sealed segment files or block ranges may satisfy its historical query (i.e. “give me all `standard.site` documents”)
-4. The client downloads the planned segment files/blocks and decompresses them in an attempt to emit records that match the user’s query
-5. If the record's DID is in the overlay's DID-tombstone suppression set (deleted account or sync divergence) at a higher seq, suppress the row
-6. If the record's URI maps to an overlay record tombstone (delete/update) at a higher seq, suppress the row
-7. The replacement for an updated record is delivered as its own `#commit` row (suppress-old + deliver-new), so the overlay carries no payloads
-8. Emit the row as-is (no updates or deletes have been applied to this record)
+1. The client calls `planBackfill(afterSeq=cursor)` (page 1) to learn which sealed segments/blocks may satisfy its query (i.e. "give me all `standard.site` documents") and pins `S = sealedTipSeq` as the upper bound for the whole backfill.
+2. The client downloads the planned segments/blocks, decodes them, applies exact DID/collection filtering, and emits matching rows. DID-level markers (`#account`/`#identity`/`#sync`) ride inline via the sentinel index (Section 3.3), so a collection-filtered backfill receives the deletions it needs to fold.
+3. The client advances `cursor = plannedThroughSeq` and, while `cursor < S`, calls `planBackfill(afterSeq=cursor, beforeSeq=S)` again (pinning `beforeSeq = S` so the range never floats) and repeats step 2.
+4. Once `plannedThroughSeq >= S`, the sealed range is fully consumed. The client connects `/subscribe` exactly once at `cursor = S` to pick up the active segment and the live tail. Inclusive replay plus client-side seq dedup makes the seam at-least-once with no rewind margin; segments sealed during the backfill arrive via cold replay (the server re-reads the manifest at connect).
+5. The client folds every row it receives (creates/updates apply; deletes/account-deletes/syncs remove). It applies no overlay and suppresses nothing.
 
-The server endpoints for the overlay and historical backfill planning are intentionally separate. The client owns the orchestration among overlay download, live subscription, historical block/segment downloads, exact filtering, and overlay application.
+There is no overlay download and no separate tombstone-negotiation step. The client owns the orchestration among paginated planning, historical block/segment downloads, exact filtering, folding, and the single live-tail cutover. A crashed backfill resumes from its last continuation cursor rather than restarting. If the handoff cursor `S` ages below the server's lookback floor during a slow backfill, the terminal `/subscribe` connect returns an explicit HTTP 400 "cursor too old" (Section 5) and the client transparently re-enters the pagination loop from its last processed seq rather than silently skipping the `(S, floor]` gap.
 
 ### 3.4 File Organization
 
@@ -559,11 +521,7 @@ Internally, Jetstream doesn't care about handles, identity updates, or hosting s
 
 The legacy `/subscribe` (v1) endpoint preserves the original Jetstream contract: regardless of `wantedCollections`, all subscribers receive `#account` and `#identity` events (they are still gated by `wantedDids`). This is intentional backwards compatibility and must not change.
 
-The `/subscribe-v2` endpoint and the Go client library use a more intuitive policy (see [#142](https://github.com/bluesky-social/jetstream/issues/142)). A subscriber that requests specific collections (e.g. `app.bsky.feed.post`) is asking for those record types; receiving unrelated `#account`/`#identity` events is surprising. So:
-
-- **No collection filter and no DID filter:** all `#account`/`#identity` events are delivered (the whole stream).
-- **DID filter only:** `#account`/`#identity` events are delivered for the matching DIDs only (the DID filter already applies to every kind).
-- **Collection filter set:** `#identity` events are not delivered. On the wire, `/subscribe-v2` still forwards `#account` events (and the Go client folds them) because an `#account` delete (`active=false, status=deleted`) is a DID-level tombstone the client needs to suppress that account's stale records; the Go client then hides the `#account` event from user-level code so a collection-scoped subscriber sees only matching commits. Record-deletion correctness is preserved because tombstone folding happens before the delivery filter.
+`#account` and `#identity` are delivered **unconditionally** — regardless of `wantedCollections`, on **both** the simple and extended wires of `/subscribe` (v1) and `/subscribe-v2`, and by the Go client (still gated by `wantedDids`). `#sync` is also unconditional with respect to `wantedCollections`, but it is only emitted on the **extended** wire (`?extended=true`): the simple, v1-compatible JSON wire skips `#sync` for v1 parity (v1 never emitted it — `encoder.go` returns `errSkipEvent` for the simple `Encode`, while `EncodeExtended` emits it). The bundled Go client connects in extended mode, so it receives `#sync`; a third party on the plain JSON wire does not. Earlier drafts dropped `#identity` (and hid `#account`) under a collection filter; that policy is gone (see [#142](https://github.com/bluesky-social/jetstream/issues/142), [#171](https://github.com/bluesky-social/jetstream/issues/171)). The reason is correctness, not just intuitiveness: a DID-level marker (an account delete `active=false, status=deleted`, or a `#sync` divergence) is what a folding consumer uses to purge a dead account's records, so it must reach every subscriber — including a collection-scoped one. There is no client-side suppression and no "fold before the delivery filter" step; the markers are delivered as ordinary events and the consumer folds them. (For the *backfill* path, the same coverage is provided in the archive by the DID-marker sentinel index described in Section 3.3, so a collection-filtered backfill selects those marker blocks too.)
 
 Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we store the `KindSync` row followed by the authoritative replacement records returned by the verifier. The `KindSync` row is a DID tombstone for compaction (see Section 3.3), so older pre-divergence record rows are physically removed once the relevant sealed segment is compacted.
 
@@ -573,7 +531,7 @@ We ship client libraries in TypeScript and Go. They are relatively "thick" in th
 
 For the live-tail use-case, clients are simple: it's compatible with the existing Jetstream v1 WebSocket JSON payload and query parameters. Existing Jetstream v1 consumers will continue to work as-is (i.e. no client wrapper library is even needed for those simple use-cases).
 
-It gets more complicated when the caller requests data that is older than the current active segment. The client asks the server something like "I want all likes since 2024", and the server begins sending over the sealed segment files in order, the update/deletion tombstones, and then seamlessly cuts over to the live websocket payload. That cutover is transparent to callers, who use a Go `iter.Seq2` or a TypeScript async iterable to provide an excellent devex.
+It gets more complicated when the caller requests data that is older than the current active segment. The client asks the server something like "I want all likes since 2024", pages `planBackfill` over the sealed segment files (downloading and emitting each page's blocks in order, including the inline deletion/update markers), and once it has consumed the sealed range it seamlessly cuts over to the live websocket payload. That cutover is transparent to callers, who use a Go `iter.Seq2` or a TypeScript async iterable to provide an excellent devex.
 
 Most callers will want to use the client wrapper (even for the trivial use case) so they don't need to repeatedly implement the same websocket logic, and may seamlessly handle the case where they want to perform backfill some day.
 
@@ -611,7 +569,12 @@ The `time_us` field is the jetstream v2 instance's own indexed at timestamp for 
 
 For backwards compatibility with jetstream v1, the server also accepts a v1-style unix-microsecond timestamp on the same `?cursor=` query parameter. The two namespaces are distinguished by magnitude: a value strictly less than 1×10^15 is interpreted as a v2 sequence number; a value greater than or equal to 1×10^15 is interpreted as a v1 unix-microsecond timestamp. The split is provably non-overlapping under our 36h lookback ceiling (any legitimate v1 timestamp within 36h of "now" is well above 10^15, and v2 seq won't approach 10^15 for centuries).
 
-Cursor lookback is bounded to the most recent 36 hours by default (matching jetstream v1), tunable via `--cursor-lookback`. Cursors older than the floor are clamped silently. Cursors in the future drop into live-tip mode (no replay).
+Cursor lookback is bounded to the most recent 36 hours by default (matching jetstream v1), tunable via `--cursor-lookback`. The two endpoints handle a too-old cursor differently, on purpose:
+
+- `/subscribe` (v1) clamps a below-floor cursor **silently** and starts at the oldest event in the window, preserving wire parity with jetstream-legacy (real legacy consumers depend on this; a v1 `/subscribe` never rejects an old cursor). The clamp is made operator-visible via a distinct metric label.
+- `/subscribe-v2` **rejects** a below-floor seq cursor with a pre-upgrade HTTP 400 whose body carries the floor seq ("cursor … below lookback floor …"), rather than silently dropping the `(cursor, floor]` gap. This is what lets a backfilling client detect a slow handoff and re-backfill from its last seq (Section 2.1). The v2 timestamp-cursor path still clamps (legacy timestamp translation).
+
+Cursors in the future drop into live-tip mode (no replay) on both endpoints.
 
 ### 5.2 Extended JSON Payload
 

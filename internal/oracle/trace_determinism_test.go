@@ -31,7 +31,8 @@ import (
 // WHY TWO CHILD PROCESSES (not a loop)
 //
 // The lifecycle runs inside a testing/synctest bubble, and the harness enforces
-// ONE bubble per process (synctestBubbleUsed in harness_test.go). So we cannot
+// ONE bubble per process (the synctestBubbleUsed guard defined in
+// synctest_test.go, checked at the top of the harness). So we cannot
 // run it twice in-process; instead we re-exec THIS test binary twice with
 // `-test.run=^TestOracle_DefaultLifecycle$`, each child pinned to the same seed
 // and writing its trace to a temp dir we then read back. This mirrors the
@@ -47,7 +48,7 @@ import (
 // them to match would mean serializing the concurrency the oracle exists to
 // exercise — the wrong fix. So we compare only the kinds whose content is a
 // pure function of the seed (config, fault schedule, phase progression,
-// event-log equivalence counts, final tombstone observation): see
+// event-log equivalence counts): see
 // deterministicTraceKinds below. This empirical split was measured (run twice,
 // diff) before the allowlist was written; do not widen it without re-measuring.
 //
@@ -129,17 +130,15 @@ const (
 //     depend on exactly where steady-state shutdown lands relative to the
 //     compaction watermark — a timing boundary, not a seed input.
 var deterministicTraceKinds = map[string]bool{
-	"run_start":                           true, // config echo (seed, counts, mode)
-	"simulator_config":                    true, // simulator world config
-	"fault_plan":                          true, // seeded fault schedule (also a #27 DoD: seeded jitter/faults)
-	"phase":                               true, // lifecycle phase progression
-	"faults_fired":                        true, // which scheduled faults fired (seeded)
-	"event_log_compare":                   true, // expected/observed event-log equivalence counts per phase
-	"steady_target":                       true, // steady-state target seq
-	"late_overlay_did_tombstone":          true, // seeded late account-tombstone injection
-	"late_overlay_did_tombstone_observed": true, // its observation
-	"shutdown_start":                      true,
-	"runtime_exit":                        true,
+	"run_start":         true, // config echo (seed, counts, mode)
+	"simulator_config":  true, // simulator world config
+	"fault_plan":        true, // seeded fault schedule (also a #27 DoD: seeded jitter/faults)
+	"phase":             true, // lifecycle phase progression
+	"faults_fired":      true, // which scheduled faults fired (seeded)
+	"event_log_compare": true, // expected/observed event-log equivalence counts per phase
+	"steady_target":     true, // steady-state target seq
+	"shutdown_start":    true,
+	"runtime_exit":      true,
 }
 
 // normalizedTraceFields are deterministic-section payload fields that vary by

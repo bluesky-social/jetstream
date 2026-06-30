@@ -322,54 +322,39 @@ func TestWants_DIDFilter(t *testing.T) {
 	require.False(t, f.Wants(ev(segment.KindCreate, "did:plc:other", "app.bsky.feed.post")))
 }
 
-// V1 PARITY (/subscribe, filterIdentityByCollection=false): identity and
-// account events bypass wantedCollections. They DO still respect wantedDids.
-// The v1 README documents this: "Regardless of desired collections, all
-// subscribers receive Account and Identity events."
-func TestWants_IdentityBypassesCollectionFilter(t *testing.T) {
+// #account, #identity, and #sync bypass wantedCollections on BOTH /subscribe
+// (v1) and /subscribe-v2 (they carry no collection). They DO still respect
+// wantedDids. The v1 README documents this: "Regardless of desired collections,
+// all subscribers receive Account and Identity events." After dropping
+// client-side tombstone suppression, these DID-level events are a
+// collection-scoped consumer's only signal to purge a dead account's records,
+// so v2 must deliver them too — v1 and v2 are identical on this axis.
+func TestWants_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	t.Parallel()
 	f, err := ParseQuery(url.Values{
 		"wantedCollections": []string{"app.bsky.feed.post"},
 	})
 	require.NoError(t, err)
-	require.True(t, f.Wants(ev(segment.KindIdentity, "did:plc:any", "")))
-	require.True(t, f.Wants(ev(segment.KindAccount, "did:plc:any", "")))
-}
-
-// V2 POLICY (/subscribe-v2, filterIdentityByCollection=true, #142): with a
-// collection filter set, #identity events are dropped (they carry no
-// collection, so a collection-scoped subscriber does not want them). #account
-// still bypasses on the wire under BOTH policies: it carries the DID-deletion
-// tombstone the v2 client folds into its record-suppression set, so dropping it
-// would break the client's deletion guarantee. The client hides #account from
-// user code itself once the tombstone is folded.
-func TestWants_V2IdentityFilteredByCollection_AccountStays(t *testing.T) {
-	t.Parallel()
-	f, err := ParseQuery(url.Values{
-		"wantedCollections": []string{"app.bsky.feed.post"},
-	})
-	require.NoError(t, err)
-	f = f.withIdentityCollectionPolicy(true)
-	require.False(t, f.Wants(ev(segment.KindIdentity, "did:plc:any", "")),
-		"v2: identity must be dropped under a collection filter")
+	require.True(t, f.Wants(ev(segment.KindIdentity, "did:plc:any", "")),
+		"identity must bypass the collection filter")
 	require.True(t, f.Wants(ev(segment.KindAccount, "did:plc:any", "")),
-		"v2: account must stay on the wire (DID-deletion tombstone)")
+		"account must bypass the collection filter")
+	require.True(t, f.Wants(ev(segment.KindSync, "did:plc:any", "")),
+		"sync must bypass the collection filter")
 }
 
-// V2 POLICY with no collection filter: identity flows again (the subscriber
-// asked for the whole stream), still respecting any DID filter.
-func TestWants_V2IdentityDeliveredWithoutCollectionFilter(t *testing.T) {
+// With no collection filter, identity/account/sync flow (the subscriber asked
+// for the whole stream), still respecting any DID filter.
+func TestWants_DIDLevelEventsDeliveredWithoutCollectionFilter(t *testing.T) {
 	t.Parallel()
 	f, err := ParseQuery(url.Values{})
 	require.NoError(t, err)
-	f = f.withIdentityCollectionPolicy(true)
 	require.True(t, f.Wants(ev(segment.KindIdentity, "did:plc:any", "")))
 	require.True(t, f.Wants(ev(segment.KindAccount, "did:plc:any", "")))
 
-	// DID-only filter under the v2 policy: identity respects the DID filter.
+	// DID-only filter: identity respects the DID filter.
 	fd, err := ParseQuery(url.Values{"wantedDids": []string{"did:plc:want"}})
 	require.NoError(t, err)
-	fd = fd.withIdentityCollectionPolicy(true)
 	require.True(t, fd.Wants(ev(segment.KindIdentity, "did:plc:want", "")))
 	require.False(t, fd.Wants(ev(segment.KindIdentity, "did:plc:other", "")))
 }

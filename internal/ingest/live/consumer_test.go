@@ -213,7 +213,7 @@ func TestOpen_ForwardsWriterMetricsToOwnedIngestWriter(t *testing.T) {
 	require.NoError(t, c.Writer().Append(t.Context(), &ev))
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(writerMetrics.EventsAppended), 0)
-	require.InDelta(t, 1.0, testutil.ToFloat64(writerMetrics.NextSeq), 0)
+	require.InDelta(t, 2.0, testutil.ToFloat64(writerMetrics.NextSeq), 0)
 }
 
 // TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer pins the
@@ -340,7 +340,7 @@ func TestProcessBatch_OverwideRecordKeyDoesNotShutDownConsumer(t *testing.T) {
 		"overwide upstream record fields must not propagate an append error out of processBatch")
 	require.Equal(t, int64(44), c.LastUpstreamSeq(),
 		"the upstream cursor must advance past recognized-but-unarchivable external data")
-	require.Equal(t, uint64(0), c.Writer().NextSeq(), "unarchivable records must not be written")
+	require.Equal(t, uint64(1), c.Writer().NextSeq(), "unarchivable records must not be written (NextSeq stays at the fresh-dir seed)")
 	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DroppedEvents), 0,
 		"the skipped event must be visible in dropped_events_total")
 }
@@ -504,7 +504,7 @@ func TestConsumer_Run_HappyPath(t *testing.T) {
 		gotSeqs[i] = ev.Seq
 	}
 	for i := range gotSeqs {
-		require.Equal(t, uint64(i), gotSeqs[i],
+		require.Equal(t, uint64(i+1), gotSeqs[i],
 			"ingest.Writer allocates seq monotonically")
 	}
 }
@@ -1070,5 +1070,5 @@ func TestProcessBatch_OnEventCalledAfterAppend(t *testing.T) {
 	defer mu.Unlock()
 	require.Len(t, received, 1)
 	require.Equal(t, segment.KindIdentity, received[0].Kind)
-	require.Equal(t, uint64(0), received[0].Seq, "first event in an empty writer must be Seq=0")
+	require.Equal(t, uint64(1), received[0].Seq, "first event in a fresh writer must be Seq=1")
 }

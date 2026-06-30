@@ -213,7 +213,11 @@ func (m *Manifest) load(ctx context.Context) error {
 		return m.segments[i].Idx < m.segments[j].Idx
 	})
 	segmentCount := len(m.segments)
+	verr := validateSegmentSeqMonotonicity(m.segments)
 	m.mu.Unlock()
+	if verr != nil {
+		return verr
+	}
 
 	if m.opts.Metrics != nil {
 		m.opts.Metrics.SegmentsLoaded.Set(float64(segmentCount))
@@ -437,6 +441,13 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 			}
 		}
 		for i, nsid := range meta.Collections {
+			// DID-marker sentinels ($account/$identity/$sync) are a planner
+			// selection hint interned with countEvent=false, not real collection
+			// traffic; skip them so they don't appear as phantom zero-event
+			// collections in operator stats (mirrors inspect_all.go).
+			if segment.IsDIDMarkerSentinelCollection(nsid) {
+				continue
+			}
 			agg, ok := collections[nsid]
 			if !ok {
 				agg = &CollectionStats{NSID: nsid}
@@ -691,6 +702,10 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 	})
 	switch {
 	case i < len(m.segments) && m.segments[i].Idx == idx:
+		// In-place refresh of an existing segment (the compaction-rewrite
+		// path): the seq envelope is preserved across rewrites, so this can
+		// only re-validate an already-valid neighbour relationship. Still
+		// re-checked below so a genuinely corrupt refreshed header is caught.
 		m.segments[i] = meta
 	case i == len(m.segments):
 		m.segments = append(m.segments, meta)
@@ -700,9 +715,63 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 		m.segments[i] = meta
 	}
 
+	// Enforce the cross-segment seq-monotonicity invariant the backfill planner
+	// (and SegmentForSeq/LookbackFloor) rely on. A refresh that introduces an
+	// out-of-order seq envelope is corrupt internal state; refuse it loudly
+	// rather than serve a manifest the planner would silently mis-paginate.
+	if verr := validateSegmentSeqMonotonicity(m.segments); verr != nil {
+		return verr
+	}
+
 	if m.opts.Metrics != nil {
 		m.opts.Metrics.SegmentsLoaded.Set(float64(len(m.segments)))
 		m.opts.Metrics.BlockIndexLoadSeconds.Observe(time.Since(start).Seconds())
+	}
+	return nil
+}
+
+// ErrSegmentSeqOverlap reports that two sealed segments carry overlapping or
+// out-of-order seq ranges when ordered by Idx — corrupt internal state that
+// breaks the manifest's load-bearing Idx-order==seq-order assumption.
+var ErrSegmentSeqOverlap = errors.New("manifest: cross-segment seq ranges out of order")
+
+// validateSegmentSeqMonotonicity enforces that sealed segments, ordered by Idx
+// (the order segs must already be in), have strictly ascending, disjoint seq
+// ranges: for every adjacent pair of NON-EMPTY segments,
+// prev.MaxSeq < next.MinSeq.
+//
+// This is the cross-segment analog of segment.validateBlockOffsets's per-block
+// check, and it is just as load-bearing: PlanBackfill reads the pagination goal
+// as the LAST segment's MaxSeq and walks segments in Idx order trusting that to
+// be global seq order (its continuation cursor and lastUnitMaxSeq monotonicity
+// depend on it); SegmentForSeq and LookbackFloor binary-search by MaxSeq over
+// the same Idx-sorted slice. The single-writer ingest path and the bootstrap
+// merge (which re-seeds the steady seq counter) hold this by construction, and
+// compaction rewrites preserve the seq envelope — so a violation means a
+// reordered/foreign/seq-reset/corrupt segment reached disk. Per CLAUDE.md we
+// refuse to serve it (crash > silently mis-paginating and dropping the tail of
+// the higher-seq segment) rather than letting the planner compute a too-low
+// SealedTipSeq and silently skip in-scope data.
+//
+// EMPTY (EventCount==0) segments are skipped: a compacted-to-empty segment
+// retains its original (now stale) MinSeq/MaxSeq envelope while owning no rows,
+// exactly as the per-block check skips empty blocks. The comparison threads
+// through only non-empty segments, so an empty segment between two non-empty
+// ones does not break the chain. Callers must hold m.mu.
+func validateSegmentSeqMonotonicity(segs []SegmentMetadata) error {
+	var prevMaxSeq uint64
+	hasPrev := false
+	for i := range segs {
+		if segs[i].Header.EventCount == 0 {
+			continue
+		}
+		if hasPrev && segs[i].MinSeq <= prevMaxSeq {
+			return fmt.Errorf(
+				"%w: segment idx %d min_seq %d not greater than prior non-empty segment max_seq %d",
+				ErrSegmentSeqOverlap, segs[i].Idx, segs[i].MinSeq, prevMaxSeq)
+		}
+		prevMaxSeq = segs[i].MaxSeq
+		hasPrev = true
 	}
 	return nil
 }

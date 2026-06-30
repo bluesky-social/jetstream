@@ -94,6 +94,44 @@ func Open(cfg Config) (*Writer, error) {
 				return nil, fmt.Errorf("ingest: scan_max_seq %s: %w", path, err)
 			}
 		case errors.Is(segErr, segment.ErrSegmentSealed):
+			// The highest-index segment is already sealed (e.g. the
+			// orchestrator sealed it at cutover). Read its header MaxSeq so
+			// the reconcile below can floor nextSeq past it — symmetric with
+			// the active-branch ScanMaxSeq above. Normally seq/next was
+			// persisted before the seal (rotateLocked flushes the counter,
+			// then seals), so this is a no-op; but if the counter is missing
+			// or an illegal 0, this is what stops the next append from reusing
+			// a seq the sealed segment already contains.
+			//
+			// Open via the checksum-verifying Reader, NOT ReadSealedHeader:
+			// this floor IS a corruption safety net, so it must not itself
+			// trust an unverified header. ReadSealedHeader only validates
+			// magic/version; it does not verify the xxh3 over header+footer,
+			// which covers MaxSeq/EventCount. A corrupt MaxSeq read blindly
+			// would floor nextSeq off garbage (silent seq reuse or a seq gap).
+			// segment.Open fails loud on a bad checksum — crash > corruption.
+			r, openErr := segment.Open(segment.ReaderConfig{Path: path})
+			if openErr != nil {
+				return nil, fmt.Errorf("ingest: open sealed %s: %w", path, openErr)
+			}
+			hdr := r.Header()
+			if closeErr := r.Close(); closeErr != nil {
+				return nil, fmt.Errorf("ingest: close sealed %s: %w", path, closeErr)
+			}
+			// Gate on MaxSeq, not EventCount: a fully-compacted segment validly
+			// has EventCount==0 (every row dropped) while a rewrite PRESERVES the
+			// original MaxSeq envelope (segment/rewrite.go restores MinSeq/MaxSeq
+			// even when all rows are dropped). That historical envelope still owns
+			// seqs (MinSeq..MaxSeq], so the floor must advance past it. Seqs start
+			// at 1 (design §R8), so MaxSeq==0 is the unambiguous "never held an
+			// event" sentinel — a truly empty fresh-sealed segment, which correctly
+			// falls through to the nextSeq=1 floor below. Without this an
+			// EventCount==0/MaxSeq>0 highest segment plus a missing/illegal-0
+			// seq/next would floor nextSeq to 1 and reuse the envelope's seqs.
+			if hdr.MaxSeq > 0 {
+				maxSeq, foundEvents = hdr.MaxSeq, true
+			}
+
 			w.activeIdx = idx + 1
 			path = filepath.Join(cfg.SegmentsDir, SegmentFilename(w.activeIdx))
 			seg, segErr = segment.New(segment.Config{
@@ -123,6 +161,27 @@ func Open(cfg Config) (*Writer, error) {
 		w.activeBytes = 0
 	}
 
+	// If the highest segment yielded no seq envelope — a truly empty active
+	// segment (ScanMaxSeq found nothing) OR an empty / compacted-to-empty sealed
+	// segment (MaxSeq==0) — the recovery floor must still account for seqs owned
+	// by LOWER sealed segments. Segments are seq-monotonic in creation order, so
+	// the highest non-empty segment below idx holds the global max envelope.
+	// Without this, a missing or illegal-0 seq/next would floor nextSeq to 1 and
+	// reuse seqs those lower segments already own (the exact corruption this
+	// recovery path defends against). Only runs in that rare recovery case: a
+	// healthy highest segment with events sets foundEvents=true above, and a
+	// fresh dir has no existing segments.
+	if !foundEvents && hasExisting {
+		tailMax, tailFound, tailErr := recoverSealedTailMaxSeq(cfg.SegmentsDir, idx)
+		if tailErr != nil {
+			_ = w.active.Close()
+			return nil, tailErr
+		}
+		if tailFound {
+			maxSeq, foundEvents = tailMax, true
+		}
+	}
+
 	pebbleSeq, err := loadNextSeq(cfg.Store, cfg.SeqKey)
 	if err != nil {
 		_ = w.active.Close()
@@ -138,6 +197,19 @@ func Open(cfg Config) (*Writer, error) {
 			_ = w.active.Close()
 			return nil, err
 		}
+	}
+	// nextSeq is never 0: seq 0 is the pure "nothing yet" sentinel (design §R8)
+	// and is never allocated to an event. reconciled == 0 here means no recovered
+	// events AND a persisted counter of 0 — either a fresh dir (absent counter,
+	// GetUint64LE -> 0) or an illegal persisted seq/next=0 (no current build
+	// writes one; only a pre-seed build or on-disk corruption could). Both floor
+	// to 1, so the first-ever event is seq 1. Floored in memory only — placed
+	// after the reconcile save above, so Open still never writes pebble for a
+	// fresh dir; the first block flush (or Close) persists the counter as usual.
+	// The crash-recovery reconcile (maxSeq+1) yields >= 2 when foundEvents, so
+	// this is a no-op on any dir that recovered events.
+	if reconciled < 1 {
+		reconciled = 1
 	}
 	w.nextSeq = reconciled
 	w.durableNextSeq = reconciled
@@ -680,6 +752,49 @@ func SegmentFiles(dir string) ([]SegmentFile, error) {
 	return out, nil
 }
 
+// recoverSealedTailMaxSeq finds the highest seq envelope among the sealed
+// segments STRICTLY BELOW highestIdx, scanning newest-first and returning the
+// first non-empty one (segments are seq-monotonic in creation order, so the
+// highest-index non-empty segment holds the global max). It is the fallback for
+// Open's recovery floor when the highest segment carries no envelope of its own
+// (a truly empty active segment, or an empty/compacted-empty sealed segment):
+// without it a missing/illegal-0 seq/next would reuse seqs a lower segment owns.
+//
+// Each candidate is opened with the checksum-verifying segment.Open (not
+// ReadSealedHeader): like the highest-segment branch, this is a corruption
+// safety net and must not floor nextSeq off an unverified header. A still-active
+// (unsealed) lower segment is impossible here — only the highest index is ever
+// the active file — but ErrActiveSegment is treated as "no usable envelope" and
+// skipped rather than failing the open, so a partially-rotated dir still
+// recovers. Any other open error is returned: a corrupt lower segment must
+// crash Open, not silently lower the floor.
+func recoverSealedTailMaxSeq(dir string, highestIdx uint64) (maxSeq uint64, found bool, err error) {
+	files, err := SegmentFiles(dir)
+	if err != nil {
+		return 0, false, err
+	}
+	for i := len(files) - 1; i >= 0; i-- {
+		if files[i].Idx >= highestIdx {
+			continue
+		}
+		r, openErr := segment.Open(segment.ReaderConfig{Path: files[i].Path})
+		if openErr != nil {
+			if errors.Is(openErr, segment.ErrActiveSegment) {
+				continue // an unsealed file carries no committed envelope; skip it
+			}
+			return 0, false, fmt.Errorf("ingest: open sealed tail %s: %w", files[i].Path, openErr)
+		}
+		hdr := r.Header()
+		if closeErr := r.Close(); closeErr != nil {
+			return 0, false, fmt.Errorf("ingest: close sealed tail %s: %w", files[i].Path, closeErr)
+		}
+		if hdr.MaxSeq > 0 {
+			return hdr.MaxSeq, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
 // scanSegmentsDir lists cfg.SegmentsDir and returns the highest seg_*
 // index seen and whether any matching files exist. Thin wrapper over
 // SegmentFiles preserved for the writer-open path.
@@ -695,9 +810,11 @@ func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
 	return last.Idx, true, nil
 }
 
-// loadNextSeq reads the persisted seq/next counter for key. A missing
-// key is not an error; it means "fresh data dir" and reads as zero.
-func loadNextSeq(st *store.Store, key string) (uint64, error) {
+// loadNextSeq reads the persisted seq/next counter for key, returning 0 for a
+// fresh data dir (absent key). The caller floors nextSeq to 1 either way, so the
+// first-ever event is seq 1 and seq 0 stays a pure "nothing yet" sentinel
+// (design §R8); the absent-vs-zero distinction is therefore irrelevant here.
+func loadNextSeq(st *store.Store, key string) (val uint64, err error) {
 	v, _, err := st.GetUint64LE(key)
 	return v, err
 }

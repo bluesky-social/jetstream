@@ -24,6 +24,16 @@ func TestSnapshotShouldDropRecordChains(t *testing.T) {
 	drop, _ = snap.ShouldDrop(&segment.Event{Seq: 11, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r"})
 	require.False(t, drop)
 
+	// Boundary: a materialization at EXACTLY the record-tombstone seq must be
+	// retained. The record tombstone for an update is produced BY that same
+	// update (observeLocked stores records[key]=ev.Seq for KindUpdate), so the
+	// update sits at its own tombstone seq and is the current value — it must
+	// survive. This is the strict-`>` boundary; the `seq > ev.Seq -> seq >= ev.Seq`
+	// mutant drops this live update (data loss). Asserting it here kills that
+	// mutant at the unit tier, mirroring the DID-overlay boundary assertion.
+	drop, _ = snap.ShouldDrop(&segment.Event{Seq: 10, Kind: segment.KindUpdate, DID: "did:plc:a", Collection: "c", Rkey: "r"})
+	require.False(t, drop, "the update materialization at its own record-tombstone seq must be kept")
+
 	drop, _ = snap.ShouldDrop(&segment.Event{Seq: 9, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r"})
 	require.False(t, drop, "delete markers are retained forever")
 }
@@ -34,12 +44,12 @@ func TestObserveAccountDeletedOnlyPurgesLiteralDeleted(t *testing.T) {
 		set := New()
 		payload := accountPayload(t, false, status)
 		require.NoError(t, set.Observe(&segment.Event{Seq: 5, Kind: segment.KindAccount, DID: "did:plc:a", Payload: payload}))
-		require.Empty(t, set.Snapshot(10).DIDs)
+		require.Empty(t, set.Snapshot().DIDs)
 	}
 
 	set := New()
 	require.NoError(t, set.Observe(&segment.Event{Seq: 5, Kind: segment.KindAccount, DID: "did:plc:a", Payload: accountPayload(t, false, "deleted")}))
-	require.Equal(t, DIDTombstone{Seq: 5, Reason: "account"}, set.Snapshot(10).DIDs["did:plc:a"])
+	require.Equal(t, DIDTombstone{Seq: 5, Reason: "account"}, set.Snapshot().DIDs["did:plc:a"])
 }
 
 func TestSnapshotShouldDropDIDChainsWithSpecificReason(t *testing.T) {
@@ -58,42 +68,25 @@ func TestSnapshotShouldDropDIDChainsWithSpecificReason(t *testing.T) {
 				Records: map[RecordKey]uint64{},
 				DIDs:    map[string]DIDTombstone{"did:plc:a": tc.tombstone},
 			}
+			// A materialization BELOW the tombstone seq is superseded → dropped.
 			drop, reason := snap.ShouldDrop(&segment.Event{Seq: 9, Kind: segment.KindUpdate, DID: "did:plc:a"})
-			require.True(t, drop)
+			require.True(t, drop, "a row below the DID tombstone seq must be dropped")
 			require.Equal(t, tc.reason, reason)
 
+			// The tombstone marker seq itself is retained (boundary: not strictly less).
 			drop, _ = snap.ShouldDrop(&segment.Event{Seq: 10, Kind: segment.KindCreate, DID: "did:plc:a"})
 			require.False(t, drop, "tombstone marker seq itself must be retained")
+
+			// A materialization ABOVE the tombstone seq is a post-delete
+			// reactivation and MUST survive. This is the data-loss direction the
+			// m022 mutant inverts (ts.Seq > ev.Seq -> <): under the inversion this
+			// live row would be dropped while the superseded seq-9 row above would
+			// be kept. Asserting both directions is what makes the tombstone unit
+			// suite kill m022 (see the mutation `tombstone` tier).
+			drop, _ = snap.ShouldDrop(&segment.Event{Seq: 11, Kind: segment.KindCreate, DID: "did:plc:a"})
+			require.False(t, drop, "a row above the DID tombstone seq (reactivation) must survive")
 		})
 	}
-}
-
-func TestSnapshotRangeFiltersLowAndHighBounds(t *testing.T) {
-	t.Parallel()
-
-	set := New()
-	require.NoError(t, set.Observe(&segment.Event{Seq: 3, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "old"}))
-	require.NoError(t, set.Observe(&segment.Event{Seq: 5, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "in"}))
-	require.NoError(t, set.Observe(&segment.Event{Seq: 7, Kind: segment.KindSync, DID: "did:plc:a"}))
-	require.NoError(t, set.Observe(&segment.Event{Seq: 9, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "future"}))
-
-	snap := set.SnapshotRange(3, 7)
-	require.NotContains(t, snap.Records, RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "old"})
-	require.Contains(t, snap.Records, RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "in"})
-	require.NotContains(t, snap.Records, RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "future"})
-	require.Equal(t, DIDTombstone{Seq: 7, Reason: "sync"}, snap.DIDs["did:plc:a"])
-}
-
-func TestSetDirtyChangesOnMutation(t *testing.T) {
-	t.Parallel()
-	s := New()
-	d0 := s.Dirty()
-	ev := segment.Event{Seq: 1, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r"}
-	require.NoError(t, s.Observe(&ev))
-	require.NotEqual(t, d0, s.Dirty())
-	d1 := s.Dirty()
-	s.Evict(1)
-	require.NotEqual(t, d1, s.Dirty())
 }
 
 func accountPayload(t *testing.T, active bool, status string) []byte {
@@ -112,7 +105,7 @@ func TestObserveAccountStatusMatrixRetains(t *testing.T) {
 	// purges.
 	set := New()
 	require.NoError(t, set.Observe(&segment.Event{Seq: 5, Kind: segment.KindAccount, DID: "did:plc:a", Payload: accountPayload(t, true, "deleted")}))
-	require.Empty(t, set.Snapshot(10).DIDs, "Active==true must retain regardless of status")
+	require.Empty(t, set.Snapshot().DIDs, "Active==true must retain regardless of status")
 
 	// Inactive with ABSENT status must retain (unknown reason).
 	set = New()
@@ -120,7 +113,7 @@ func TestObserveAccountStatusMatrixRetains(t *testing.T) {
 	payload, err := acc.MarshalCBOR()
 	require.NoError(t, err)
 	require.NoError(t, set.Observe(&segment.Event{Seq: 5, Kind: segment.KindAccount, DID: "did:plc:a", Payload: payload}))
-	require.Empty(t, set.Snapshot(10).DIDs, "Active==false with absent status must retain")
+	require.Empty(t, set.Snapshot().DIDs, "Active==false with absent status must retain")
 }
 
 func TestObserveMalformedAccountPayloadErrorsWithRowIdentity(t *testing.T) {
@@ -142,7 +135,7 @@ func TestEvictDropsOnlyAtOrBelowWatermark(t *testing.T) {
 
 	set.Evict(4)
 	require.Equal(t, 2, set.Len())
-	snap := set.Snapshot(^uint64(0))
+	snap := set.Snapshot()
 	require.NotContains(t, snap.Records, RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "r3"})
 	require.Contains(t, snap.Records, RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "r5"})
 	require.NotContains(t, snap.DIDs, "did:plc:b")
@@ -232,9 +225,8 @@ func TestRebuildEqualsIncremental(t *testing.T) {
 		rebuilt := New()
 		rebuilt.Replace(folded)
 
-		maxSeq := ^uint64(0)
-		require.Equal(t, incremental.SnapshotRange(0, maxSeq).Records, rebuilt.SnapshotRange(0, maxSeq).Records, "seed %d", seed)
-		require.Equal(t, incremental.SnapshotRange(0, maxSeq).DIDs, rebuilt.SnapshotRange(0, maxSeq).DIDs, "seed %d", seed)
+		require.Equal(t, incremental.Snapshot().Records, rebuilt.Snapshot().Records, "seed %d", seed)
+		require.Equal(t, incremental.Snapshot().DIDs, rebuilt.Snapshot().DIDs, "seed %d", seed)
 		require.Equal(t, incremental.Len(), rebuilt.Len(), "seed %d", seed)
 	}
 }

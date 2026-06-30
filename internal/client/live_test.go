@@ -6,12 +6,11 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
-	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -90,7 +89,7 @@ func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = c.Run(ctx, func(ev *Event, _ []byte, err error) bool {
+		_ = c.Run(ctx, func(ev *Event, err error) bool {
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -120,38 +119,24 @@ func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error
 	return events, errs
 }
 
-// TestLiveSinkAccountDeleteSuppressesDespiteCollectionFilter is the headline
-// correctness guard for #142: under a collection filter, the live sink must
-// fold an account-delete tombstone into the suppressor BEFORE applying the
-// delivery filter. So even though the account event itself is dropped from
-// delivery (a collection-scoped subscriber does not want it), a later
-// historical create for that DID is still suppressed. Dropping account events
-// from the user-facing stream must NOT weaken the record-deletion guarantee.
-func TestLiveSinkAccountDeleteSuppressesDespiteCollectionFilter(t *testing.T) {
+// TestLiveAccountDeleteDeliveredDespiteCollectionFilter guards that, with no
+// client-side suppression, the cutover live tail still DELIVERS an account-delete
+// under a collection filter (it carries no collection and bypasses the filter via
+// the engine's wantsLive matcher). This is the consumer's only signal to purge a
+// dead account's records, so it must not be dropped — while a non-matching commit
+// still is.
+func TestLiveAccountDeleteDeliveredDespiteCollectionFilter(t *testing.T) {
 	t.Parallel()
 
-	suppressor := NewSuppressor()
-	// Collection filter set: account/identity are not delivered.
-	matcher := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
-	sink := newLiveSink(&memBuffer{}, suppressor, matcher, recordDecodeMode{})
+	e := &Engine{matcher: NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})}
 
-	// A live account-delete for did:plc:a at seq 100 arrives during buffering.
 	acctDel, err := decodeLiveFrame(liveAccountFrame(100, "did:plc:a", false, "deleted"), recordDecodeMode{})
 	require.NoError(t, err)
+	require.True(t, e.wantsLive(&acctDel), "account-delete must be delivered under a collection filter")
 
-	// Buffering phase: onLive must fold the tombstone (it returns true to keep
-	// tailing) even though the account event will never be delivered.
-	keep := sink.onLive(&acctDel, liveAccountFrame(100, "did:plc:a", false, "deleted"), nil)
-	require.True(t, keep, "sink must keep tailing after an account-delete")
-
-	// The suppressor must now drop a historical create for that DID below seq 100.
-	staleCreate := segment.Event{Seq: 50, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r1"}
-	drop, reason := suppressor.ShouldDrop(&staleCreate)
-	require.True(t, drop, "create below the account-delete must be suppressed")
-	require.Equal(t, "account", reason)
-
-	// And the account event itself must NOT pass the delivery filter.
-	require.False(t, sink.wantLive(&acctDel), "account event must be dropped from delivery under a collection filter")
+	likeCreate, err := decodeLiveFrame(liveCommitFrame(t, 101, "did:plc:a", "create", "app.bsky.feed.like", "r1", true), recordDecodeMode{})
+	require.NoError(t, err)
+	require.False(t, e.wantsLive(&likeCreate), "non-matching commit must be dropped")
 }
 
 func TestLiveConsumerDeliversInOrder(t *testing.T) {
@@ -167,36 +152,34 @@ func TestLiveConsumerDeliversInOrder(t *testing.T) {
 	require.Equal(t, []uint64{1, 2, 3}, seqs(events))
 }
 
-// TestLiveConsumerDeliversSeqZero guards against the 0-based-seq-space drop
-// (the live analog of #111): the seq space starts at 0, so a from-tip stream
-// against a fresh archive can legitimately deliver seq 0 as its first event.
-// The dedup must not treat the zero-initialized lastSeq as "already delivered
-// seq 0" and swallow it.
-func TestLiveConsumerDeliversSeqZero(t *testing.T) {
+// TestLiveConsumerDeliversFirstEvent guards that a from-tip stream delivers the
+// first-ever event (seq 1) and does not swallow it against the zero-initialized
+// dedup floor (0 means "nothing delivered yet" under 1-based seqs).
+func TestLiveConsumerDeliversFirstEvent(t *testing.T) {
 	t.Parallel()
 	conn := &scriptedConn{steps: []readStep{
-		{data: liveCommitFrame(t, 0, "did:plc:a", "create", "c", "r0", true)},
 		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)},
+		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "c", "r2", true)},
 	}}
 	dial, _ := scriptedDialer(conn)
 
-	// None cursor: pure live-from-tip start.
-	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial}, 2)
-	require.Equal(t, []uint64{0, 1}, seqs(events), "seq 0 must not be swallowed by the zero-initialized dedup cursor")
+	// fromTip: pure live-from-tip start.
+	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial, fromTip: true}, 2)
+	require.Equal(t, []uint64{1, 2}, seqs(events), "the first real event (seq 1) must not be swallowed by the zero-initialized dedup floor")
 }
 
-// TestLiveConsumerReconnectResumesFromSeqZero pins the interaction between the
-// seq-0 fix and the reconnect-resume fix: after delivering seq 0 on a from-tip
-// stream, a reconnect must resume from cursor=0 (an established resume point),
-// NOT re-anchor at the tip by omitting the cursor.
-func TestLiveConsumerReconnectResumesFromSeqZero(t *testing.T) {
+// TestLiveConsumerReconnectResumesFromFirstSeq pins the reconnect-resume fix:
+// after delivering seq 1 on a from-tip stream, a reconnect must resume from
+// cursor=1 (an established resume point), NOT re-anchor at the tip by omitting
+// the cursor.
+func TestLiveConsumerReconnectResumesFromFirstSeq(t *testing.T) {
 	t.Parallel()
 	first := &scriptedConn{steps: []readStep{
-		{data: liveCommitFrame(t, 0, "did:plc:a", "create", "c", "r0", true)},
+		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)},
 		{err: errors.New("connection reset")},
 	}}
 	second := &scriptedConn{steps: []readStep{
-		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)},
+		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "c", "r2", true)},
 	}}
 	var (
 		mu   sync.Mutex
@@ -204,14 +187,14 @@ func TestLiveConsumerReconnectResumesFromSeqZero(t *testing.T) {
 	)
 	dial := capturingDialer(&urls, &mu, first, second)
 
-	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial}, 2)
-	require.Equal(t, []uint64{0, 1}, seqs(events))
+	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial, fromTip: true}, 2)
+	require.Equal(t, []uint64{1, 2}, seqs(events))
 
 	mu.Lock()
 	defer mu.Unlock()
 	require.GreaterOrEqual(t, len(urls), 2, "must have reconnected")
 	require.NotContains(t, urls[0], "cursor=", "initial from-tip dial omits cursor; got %s", urls[0])
-	require.Contains(t, urls[1], "cursor=0", "reconnect after delivering seq 0 must resume from cursor=0, not re-anchor at tip; got %s", urls[1])
+	require.Contains(t, urls[1], "cursor=1", "reconnect after delivering seq 1 must resume from cursor=1, not re-anchor at tip; got %s", urls[1])
 }
 
 func TestLiveConsumerDedupsReconnectOverlap(t *testing.T) {
@@ -257,17 +240,17 @@ func TestLiveConsumerSkipsControlAndMalformed(t *testing.T) {
 
 func TestLiveConsumerSubscribeURL(t *testing.T) {
 	t.Parallel()
-	c := newLiveConsumer(liveConfig{host: "https://jetstream.example", cursor: gt.Some[uint64](123)})
+	c := newLiveConsumer(liveConfig{host: "https://jetstream.example", cursor: 123})
 	u := c.subscribeURL()
 	require.True(t, strings.HasPrefix(u, "wss://jetstream.example/subscribe-v2?"), "got %s", u)
 	require.Contains(t, u, "extended=true")
 	require.Contains(t, u, "cursor=123")
 
-	c2 := newLiveConsumer(liveConfig{host: "http://localhost:8080"})
+	c2 := newLiveConsumer(liveConfig{host: "http://localhost:8080", fromTip: true})
 	u2 := c2.subscribeURL()
 	require.True(t, strings.HasPrefix(u2, "ws://localhost:8080/subscribe-v2?"), "got %s", u2)
 	require.Contains(t, u2, "extended=true")
-	require.NotContains(t, u2, "cursor=", "no cursor when none (live from tip)")
+	require.NotContains(t, u2, "cursor=", "no cursor when fromTip (live from tip)")
 }
 
 // TestLiveConsumerSubscribeURLForwardsFilters verifies the live tail forwards
@@ -299,21 +282,23 @@ func TestLiveConsumerSubscribeURLForwardsFilters(t *testing.T) {
 	require.NotContains(t, u2, "wantedDids", "no DID filter -> no param")
 }
 
-// TestLiveConsumerSubscribeURLCursorZero guards #112: a backfill->live cutover
-// whose rewind start lands at seq 0 (sealed tip below the rewind margin) must
-// REPLAY from seq 0, not live-tail from the tip. A present cursor of Some(0)
-// sends cursor=0 onto the wire (which the server resolves as a seq replay from
-// the start), while a None cursor stays the "live from tip" sentinel. Without
-// the Some(0) distinction the entire (plannedThroughSeq, tip] band is dropped.
+// TestLiveConsumerSubscribeURLCursorZero guards the bufferless cutover's
+// empty-archive case: when the sealed archive is empty the cutover seq is 0, so
+// the live consumer connects with cursor=0, which must REPLAY from the first
+// event, not live-tail from the tip. A cursor of 0 with fromTip unset sends
+// cursor=0 onto the wire (the server resolves it as a replay from the start);
+// fromTip is the distinct WithLiveCursor(0) "live from tip" contract that omits
+// the param. Without sending cursor=0 the first events on a from-empty archive
+// would be skipped.
 func TestLiveConsumerSubscribeURLCursorZero(t *testing.T) {
 	t.Parallel()
-	c := newLiveConsumer(liveConfig{host: "https://h", cursor: gt.Some[uint64](0)})
+	c := newLiveConsumer(liveConfig{host: "https://h", cursor: 0})
 	u := c.subscribeURL()
-	require.Contains(t, u, "cursor=0", "Some(0) must send cursor=0 for a replay from the start; got %s", u)
+	require.Contains(t, u, "cursor=0", "cursor=0 (not fromTip) must replay from the start; got %s", u)
 
-	// None cursor keeps the "live from tip" sentinel.
-	c2 := newLiveConsumer(liveConfig{host: "https://h"})
-	require.NotContains(t, c2.subscribeURL(), "cursor=", "None cursor must remain live-from-tip")
+	// fromTip keeps the "live from tip" sentinel (no cursor param).
+	c2 := newLiveConsumer(liveConfig{host: "https://h", fromTip: true})
+	require.NotContains(t, c2.subscribeURL(), "cursor=", "fromTip must remain live-from-tip")
 }
 
 // TestLiveDialOptionsOffersCompression verifies the production dialer offers
@@ -348,7 +333,7 @@ func capturingDialer(urls *[]string, mu *sync.Mutex, conns ...*scriptedConn) dia
 // the disconnect window. The reconnect must request cursor=<highest delivered>.
 func TestLiveConsumerReconnectResumesFromLastSeq(t *testing.T) {
 	t.Parallel()
-	// Live-from-tip start (None cursor): first session delivers 1,2,3 then errors.
+	// Live-from-tip start (fromTip): first session delivers 1,2,3 then errors.
 	first := &scriptedConn{steps: []readStep{
 		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)},
 		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "c", "r2", true)},
@@ -365,7 +350,7 @@ func TestLiveConsumerReconnectResumesFromLastSeq(t *testing.T) {
 	)
 	dial := capturingDialer(&urls, &mu, first, second)
 
-	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial}, 4)
+	events, _ := runConsumer(t, liveConfig{host: "https://h", dial: dial, fromTip: true}, 4)
 	require.Equal(t, []uint64{1, 2, 3, 4}, seqs(events))
 
 	mu.Lock()
@@ -376,6 +361,34 @@ func TestLiveConsumerReconnectResumesFromLastSeq(t *testing.T) {
 	// The reconnect must resume from the highest seq delivered (3), not re-anchor
 	// at the tip (which would omit the cursor and drop events during downtime).
 	require.Contains(t, urls[1], "cursor=3", "reconnect must resume from lastSeq; got %s", urls[1])
+}
+
+// TestLiveConsumerCursorTooOldIsTerminal pins the §14 handoff signal: a dial
+// that fails with errLiveCursorTooOld must end Run with that error (NOT a clean
+// nil and NOT a reconnect loop), so the cutover engine re-enters the backfill
+// loop rather than churning reconnects against a cursor the server keeps
+// rejecting. The dialer fails every attempt; if Run reconnect-looped the test
+// would hang past its deadline.
+func TestLiveConsumerCursorTooOldIsTerminal(t *testing.T) {
+	t.Parallel()
+	var dials atomic.Int64
+	dial := func(ctx context.Context, _ string) (wsConn, error) {
+		dials.Add(1)
+		return nil, errLiveCursorTooOld
+	}
+	c := newLiveConsumer(liveConfig{host: "https://h", dial: dial, backoffMin: time.Millisecond})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.Run(context.Background(), func(*Event, error) bool { return true })
+	}()
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, errLiveCursorTooOld, "a too-old dial must end Run terminally")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return on a too-old dial (reconnect-looping?)")
+	}
+	require.LessOrEqual(t, dials.Load(), int64(2), "must not reconnect-loop on a terminal too-old cursor")
 }
 
 func TestLiveConsumerContextCancelCleanStop(t *testing.T) {
@@ -390,7 +403,7 @@ func TestLiveConsumerContextCancelCleanStop(t *testing.T) {
 	var got int
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.Run(ctx, func(ev *Event, _ []byte, err error) bool {
+		errCh <- c.Run(ctx, func(ev *Event, err error) bool {
 			if err == nil && ev != nil {
 				got++
 				cancel()

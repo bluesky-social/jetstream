@@ -220,6 +220,54 @@ type blockWalkResult struct {
 	sawAny bool
 }
 
+// internCollection records collection under the segment-wide string
+// table (assigning a stable id on first sight, bumping its event count)
+// and adds that id to blockCollections. It is the shared collection-index
+// step for both the seal walk (walkActiveFrames) and the compaction
+// rewrite walk (accumulateRewriteBlock), so the two index paths cannot
+// drift. countEvent is false for synthetic sentinel ids (DID-level marker
+// sentinels are a selection hint, not real per-collection traffic, so they
+// must not inflate collectionEventCounts).
+func (res *blockWalkResult) internCollection(collection string, countEvent bool, blockCollections map[uint32]struct{}) error {
+	id, ok := res.collectionIDByName[collection]
+	if !ok {
+		if uint64(len(res.collectionStringTable)) >= math.MaxUint32 {
+			return fmt.Errorf("%w: too many distinct collections", ErrInvalidFooter)
+		}
+		col := string([]byte(collection))
+		id = uint32(len(res.collectionStringTable))
+		res.collectionStringTable = append(res.collectionStringTable, col)
+		res.collectionEventCounts = append(res.collectionEventCounts, 0)
+		res.collectionIDByName[col] = id
+	}
+	if countEvent {
+		res.collectionEventCounts[id]++
+	}
+	blockCollections[id] = struct{}{}
+	return nil
+}
+
+// indexEventCollection adds ev's collection coordinates to blockCollections
+// via internCollection: the real collection for commit rows that carry one,
+// and a reserved DID-level marker sentinel ($account/$identity/$sync) for
+// marker kinds, which carry no collection on the wire. Indexing the sentinel
+// is what lets a collection-filtered backfill select marker-bearing blocks
+// (see segment/sentinel.go); the sentinel does not count as a collection
+// event so it stays invisible in per-collection stats.
+func (res *blockWalkResult) indexEventCollection(ev *Event, blockCollections map[uint32]struct{}) error {
+	if ev.Collection != "" {
+		if err := res.internCollection(ev.Collection, true, blockCollections); err != nil {
+			return err
+		}
+	}
+	if sentinel := didMarkerSentinel(ev.Kind); sentinel != "" {
+		if err := res.internCollection(sentinel, false, blockCollections); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // walkBlocks walks the framed-block region of the active file from
 // ReservedHeaderBytes to footerOffset. Wrapper around walkActiveFrames
 // so the seal path keeps its existing call shape.
@@ -324,21 +372,8 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 					blockDIDs[string([]byte(ev.DID))] = struct{}{}
 				}
 			}
-			if ev.Collection != "" {
-				id, ok := res.collectionIDByName[ev.Collection]
-				if !ok {
-					if uint64(len(res.collectionStringTable)) >= math.MaxUint32 {
-						return res, fmt.Errorf(
-							"%w: too many distinct collections", ErrInvalidFooter)
-					}
-					col := string([]byte(ev.Collection))
-					id = uint32(len(res.collectionStringTable))
-					res.collectionStringTable = append(res.collectionStringTable, col)
-					res.collectionEventCounts = append(res.collectionEventCounts, 0)
-					res.collectionIDByName[col] = id
-				}
-				res.collectionEventCounts[id]++
-				blockCollections[id] = struct{}{}
+			if err := res.indexEventCollection(&ev, blockCollections); err != nil {
+				return res, err
 			}
 		}
 

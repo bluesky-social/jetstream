@@ -21,7 +21,7 @@ func drain() {
 }
 
 // synctestBubbleUsed guards against a second synctest bubble in the same
-// process. The production zstd encoders (overlay/segment/subscribe) are package
+// process. The production zstd encoders (segment/subscribe) are package
 // globals whose worker goroutines + channels bind to whichever synctest bubble
 // first uses them; a second bubble in the same process (go test -count=N>1)
 // then receives on the first bubble's channels and the runtime aborts with

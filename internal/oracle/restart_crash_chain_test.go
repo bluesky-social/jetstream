@@ -142,9 +142,15 @@ func maxDurableSeq(events []ObservedEvent) uint64 {
 // form in merge-tail: the pass runs at a quiescent point after the merge has
 // sealed every segment, so its targetWatermark spans the whole durable stream
 // and every durable row sits at or below W. The convergence-hiding property
-// is real but lives in the STEADY tier (mutant m025, KILLED@stress), where a
-// delete can land in the fresh active segment above the force-rotate
-// watermark.
+// is real but lives in the STEADY tier, where a delete can land in the fresh
+// active segment above the force-rotate watermark; it is NOT reachable from
+// this merge-tail crash. That steady-tier over-drop was historically modeled by
+// mutant m025 (KILLED@stress), but m025 was RETIRED in #178 when its
+// Set.SnapshotRange mechanism was deleted — the on-disk windowed fold can no
+// longer reach the above-watermark over-drop — so the property currently has no
+// live mutant; re-deriving a dedicated #100 over-drop recorder is an open gap
+// tracked by #183 (see specs/oracle.md "Crash And Restart Tier" and
+// testing/mutation/RESULTS.md).
 //
 // This test crashes shape B (R_bf create@backfill -> live delete) at
 // AfterCompactionRewriteBeforeWatermark — the exact crashpoint #114 named —

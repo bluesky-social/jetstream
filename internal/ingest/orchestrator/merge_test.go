@@ -135,8 +135,8 @@ func TestMerge_PublishesTerminalSealToManifest(t *testing.T) {
 	require.Len(t, entries, 1)
 	require.Equal(t, uint64(0), entries[0].Idx)
 	require.Equal(t, uint32(1), entries[0].EventCount)
-	require.Equal(t, uint64(0), entries[0].MinSeq)
-	require.Equal(t, uint64(0), entries[0].MaxSeq)
+	require.Equal(t, uint64(1), entries[0].MinSeq)
+	require.Equal(t, uint64(1), entries[0].MaxSeq)
 }
 
 func TestMerge_RefreshesRepoRev_PreservesBackfillRev(t *testing.T) {
