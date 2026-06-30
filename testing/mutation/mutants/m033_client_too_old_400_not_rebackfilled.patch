@@ -19,6 +19,10 @@ tiers: partb
 diff --git a/internal/client/engine.go b/internal/client/engine.go
 --- a/internal/client/engine.go
 +++ b/internal/client/engine.go
-@@ -624 +624 @@ func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover ui
+@@ -712,5 +712,5 @@ func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover ui
+ 		}
+ 		return b.add(*ev)
+ 	})
 -	return consumer.LastSeq(), errors.Is(err, errLiveCursorTooOld)
 +	return consumer.LastSeq(), false && errors.Is(err, errLiveCursorTooOld)
+ }

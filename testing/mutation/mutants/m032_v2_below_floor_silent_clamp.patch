@@ -20,6 +20,12 @@ tiers: partb
 diff --git a/internal/subscribe/cursor.go b/internal/subscribe/cursor.go
 --- a/internal/subscribe/cursor.go
 +++ b/internal/subscribe/cursor.go
-@@ -152 +152 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
+@@ -184,7 +184,7 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
+ 				// learns it fell behind and re-backfills from its last seq
+ 				// instead of silently skipping (requestedSeq, floorSeq]. v1
+ 				// keeps the legacy silent clamp for wire compatibility.
 -				if env.RejectBelowFloor {
 +				if false {
+ 					return CursorPlan{}, fmt.Errorf("%w: cursor %d below lookback floor %d; re-backfill from your last seq", ErrCursorTooOld, n, floorSeq)
+ 				}
+ 				startSeq = floorSeq

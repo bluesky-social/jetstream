@@ -19,6 +19,12 @@ tiers: partb
 diff --git a/internal/manifest/plan.go b/internal/manifest/plan.go
 --- a/internal/manifest/plan.go
 +++ b/internal/manifest/plan.go
-@@ -155 +155 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+@@ -164,7 +164,7 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+ 	// paginating client). Once at least one unit is in, reaching the cap
+ 	// truncates before the next unit.
+ 	atCap := func() bool {
 -		return req.MaxEntries > 0 && result.Stats.Entries >= req.MaxEntries
 +		return req.MaxEntries > 0 && result.Stats.Entries+1 >= req.MaxEntries
+ 	}
+
+ 	for i := range m.segments {
