@@ -331,7 +331,10 @@ document.addEventListener("input", function (event) {
         {{if or (gt .RowsValid 0) (gt .RowsRejected 0)}}
         <dt>Rows</dt><dd>{{humanInt .RowsValid}} valid, {{humanInt .RowsRejected}} rejected</dd>
         {{end}}
-        {{if gt .SegmentsPatched 0}}
+        {{/* Gate on examined, not patched: a completed idempotent re-import
+             examines segments and mutates zero rows, and "0 patched of N
+             examined" IS the result the operator ran it to see. */}}
+        {{if gt .SegmentsExamined 0}}
         <dt>Segments patched</dt><dd>{{humanInt64Cast .SegmentsPatched}} of {{humanInt64Cast .SegmentsExamined}} examined</dd>
         <dt>Rows mutated</dt><dd>{{humanInt .RowsMutated}}</dd>
         {{end}}

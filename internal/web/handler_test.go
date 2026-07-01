@@ -256,6 +256,41 @@ func TestHandler_RendersImportPanel(t *testing.T) {
 	require.Contains(t, body, "2,500") // rows mutated
 }
 
+// TestHandler_RendersNoOpImportOutcome: a completed idempotent re-import
+// (segments examined, zero patched/mutated) must still render its outcome —
+// "0 of N examined" is the result the operator ran it for.
+func TestHandler_RendersNoOpImportOutcome(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Import = &status.ImportInfo{
+		JobID:            "20260525T130000.000Z-noop",
+		State:            "complete",
+		Phase:            "apply",
+		SubmittedAt:      time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+		FinishedAt:       time.Date(2026, 5, 25, 12, 5, 0, 0, time.UTC),
+		Bucketed:         true,
+		RowsValid:        1000,
+		SegmentsExamined: 4,
+		SegmentsPatched:  0,
+		RowsMutated:      0,
+	}
+	src := &fakeSnapshotter{snap: s}
+	h, err := web.New(web.Options{
+		Snapshotter: src,
+		Now:         func() time.Time { return time.Date(2026, 5, 25, 12, 10, 0, 0, time.UTC) },
+	})
+	require.NoError(t, err)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	body := rr.Body.String()
+	require.Contains(t, body, "Segments patched")
+	require.Contains(t, body, "0 of 4 examined")
+	require.Contains(t, body, "Rows mutated")
+}
+
 func TestHandler_RendersUnknownBackfillDurationForOldSteadyStateData(t *testing.T) {
 	t.Parallel()
 	s := newFixtureSnap()

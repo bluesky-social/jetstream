@@ -158,7 +158,10 @@ func TestImport_EndToEnd(t *testing.T) {
 	// commit), so the drain here is load-bearing, not decoration.
 	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		// Run suppresses context.Canceled on a caller-driven shutdown, so any
+		// error here is a real shutdown-path regression.
+		require.NoError(t, err, "runtime Run returned an error on graceful shutdown")
 	case <-time.After(10 * time.Second):
 		t.Fatal("runtime did not shut down within deadline")
 	}
