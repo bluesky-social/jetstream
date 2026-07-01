@@ -241,10 +241,10 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 	return plan, nil
 }
 
-// translateTimeUSToSeq finds the smallest seq whose IndexedAt >=
+// translateTimeUSToSeq finds the smallest seq whose WitnessedAt >=
 // timeUS, walking the manifest's sealed segments for the candidate
 // segment, then its block index for the candidate block, then the
-// block's indexed_at column.
+// block's witnessed_at column.
 //
 // Returns (seq, clamped, error). clamped is true iff timeUS is older
 // than every sealed segment (caller resolves to the first segment's
@@ -273,7 +273,7 @@ func translateTimeUSToSeq(env CursorEnv, timeUS int64) (uint64, bool, error) {
 	// and we clamp to that segment's MinSeq without scanning.
 	all := env.Manifest.AllBounds()
 	first := all[0]
-	if timeUS <= first.MinIndexedAt {
+	if timeUS <= first.MinWitnessedAt {
 		return first.MinSeq, true, nil
 	}
 
@@ -282,13 +282,13 @@ func translateTimeUSToSeq(env CursorEnv, timeUS int64) (uint64, bool, error) {
 		return 0, false, fmt.Errorf("load block index for seg %d: %w", candidate.Idx, err)
 	}
 
-	// Binary-search blocks by MaxIndexedAt: the first block whose
-	// MaxIndexedAt >= timeUS is the candidate.
+	// Binary-search blocks by MaxWitnessedAt: the first block whose
+	// MaxWitnessedAt >= timeUS is the candidate.
 	blockI := sort.Search(len(blocks), func(i int) bool {
-		return blocks[i].MaxIndexedAt >= timeUS
+		return blocks[i].MaxWitnessedAt >= timeUS
 	})
 	if blockI == len(blocks) {
-		// Per manifest contract, candidate.MaxIndexedAt >= timeUS,
+		// Per manifest contract, candidate.MaxWitnessedAt >= timeUS,
 		// so this branch is reachable only on internally-inconsistent
 		// metadata. Fall back to the candidate's MinSeq so the replay
 		// walks the whole segment.
@@ -306,12 +306,12 @@ func translateTimeUSToSeq(env CursorEnv, timeUS int64) (uint64, bool, error) {
 		return 0, false, fmt.Errorf("decode seg %d block %d: %w", candidate.Idx, blockI, err)
 	}
 	for _, ev := range events {
-		if ev.IndexedAt >= timeUS {
+		if ev.WitnessedAt >= timeUS {
 			return ev.Seq, false, nil
 		}
 	}
 	// All events in this block are older than timeUS, but manifest
-	// said the block's MaxIndexedAt >= timeUS — implies a single-event
-	// block whose indexed_at == timeUS. Use the block's MaxSeq.
+	// said the block's MaxWitnessedAt >= timeUS — implies a single-event
+	// block whose witnessed_at == timeUS. Use the block's MaxSeq.
 	return blocks[blockI].MaxSeq, false, nil
 }

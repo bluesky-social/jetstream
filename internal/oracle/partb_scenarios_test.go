@@ -103,14 +103,14 @@ func foldOracle(t *testing.T, events []segment.Event) map[RecordKey]uint64 {
 // (the harness builds events directly as segment.Event).
 func observedFromSegment(ev segment.Event) ObservedEvent {
 	return ObservedEvent{
-		Seq:        ev.Seq,
-		IndexedAt:  ev.IndexedAt,
-		Kind:       ev.Kind,
-		DID:        ev.DID,
-		Collection: ev.Collection,
-		Rkey:       ev.Rkey,
-		Rev:        ev.Rev,
-		Payload:    ev.Payload,
+		Seq:         ev.Seq,
+		WitnessedAt: ev.WitnessedAt,
+		Kind:        ev.Kind,
+		DID:         ev.DID,
+		Collection:  ev.Collection,
+		Rkey:        ev.Rkey,
+		Rev:         ev.Rev,
+		Payload:     ev.Payload,
 	}
 }
 

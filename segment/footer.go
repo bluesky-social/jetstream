@@ -27,11 +27,11 @@ type BlockInfo struct {
 	// MinSeq, MaxSeq bound the seq column. MaxSeq >= MinSeq.
 	MinSeq, MaxSeq uint64
 
-	// MinIndexedAt, MaxIndexedAt bound the indexed_at column in
-	// unix microseconds. MaxIndexedAt >= MinIndexedAt. The type
-	// matches Header.MinIndexedAt/MaxIndexedAt and the per-event
-	// indexed_at column in §3.2 of DESIGN.md.
-	MinIndexedAt, MaxIndexedAt int64
+	// MinWitnessedAt, MaxWitnessedAt bound the witnessed_at column in
+	// unix microseconds. MaxWitnessedAt >= MinWitnessedAt. The type
+	// matches Header.MinWitnessedAt/MaxWitnessedAt and the per-event
+	// witnessed_at column in §3.2 of DESIGN.md.
+	MinWitnessedAt, MaxWitnessedAt int64
 }
 
 // blockIndexEntrySize is the wire-format size of one block index
@@ -52,8 +52,8 @@ func encodeBlockIndex(infos []BlockInfo) []byte {
 		le.PutUint32(buf[off+16:off+20], info.EventCount)
 		le.PutUint64(buf[off+20:off+28], info.MinSeq)
 		le.PutUint64(buf[off+28:off+36], info.MaxSeq)
-		le.PutUint64(buf[off+36:off+44], uint64(info.MinIndexedAt))
-		le.PutUint64(buf[off+44:off+52], uint64(info.MaxIndexedAt))
+		le.PutUint64(buf[off+36:off+44], uint64(info.MinWitnessedAt))
+		le.PutUint64(buf[off+44:off+52], uint64(info.MaxWitnessedAt))
 	}
 	return buf
 }
@@ -81,8 +81,8 @@ func decodeBlockIndex(buf []byte, count uint32) ([]BlockInfo, error) {
 			EventCount:       le.Uint32(buf[off+16 : off+20]),
 			MinSeq:           le.Uint64(buf[off+20 : off+28]),
 			MaxSeq:           le.Uint64(buf[off+28 : off+36]),
-			MinIndexedAt:     int64(le.Uint64(buf[off+36 : off+44])),
-			MaxIndexedAt:     int64(le.Uint64(buf[off+44 : off+52])),
+			MinWitnessedAt:   int64(le.Uint64(buf[off+36 : off+44])),
+			MaxWitnessedAt:   int64(le.Uint64(buf[off+44 : off+52])),
 		}
 	}
 	return infos, nil

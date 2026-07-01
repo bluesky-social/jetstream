@@ -382,8 +382,8 @@ func treeFromManifest(ms manifest.SegmentTreeStats) TreeAggregate {
 		NewestMTime:       ms.NewestMTime,
 		MinSeq:            ms.MinSeq,
 		MaxSeq:            ms.MaxSeq,
-		MinIndexedAt:      microsToTime(ms.MinIndexedAt),
-		MaxIndexedAt:      microsToTime(ms.MaxIndexedAt),
+		MinWitnessedAt:    microsToTime(ms.MinWitnessedAt),
+		MaxWitnessedAt:    microsToTime(ms.MaxWitnessedAt),
 	}
 	if ms.LatestSegment != nil {
 		tree.LatestSegment = &SegmentSummary{
@@ -395,8 +395,8 @@ func treeFromManifest(ms manifest.SegmentTreeStats) TreeAggregate {
 			CollectionCount: ms.LatestSegment.CollectionCount,
 			MinSeq:          ms.LatestSegment.MinSeq,
 			MaxSeq:          ms.LatestSegment.MaxSeq,
-			MinIndexedAt:    microsToTime(ms.LatestSegment.MinIndexedAt),
-			MaxIndexedAt:    microsToTime(ms.LatestSegment.MaxIndexedAt),
+			MinWitnessedAt:  microsToTime(ms.LatestSegment.MinWitnessedAt),
+			MaxWitnessedAt:  microsToTime(ms.LatestSegment.MaxWitnessedAt),
 			SizeBytes:       ms.LatestSegment.SizeBytes,
 		}
 	}
@@ -491,8 +491,8 @@ func scanActiveTail(root string, collections map[string]*CollectionAggregate) (T
 		CollectionCount: len(ins.Collections),
 		MinSeq:          ins.MinSeq,
 		MaxSeq:          ins.MaxSeq,
-		MinIndexedAt:    microsToTime(ins.MinIndexedAt),
-		MaxIndexedAt:    microsToTime(ins.MaxIndexedAt),
+		MinWitnessedAt:  microsToTime(ins.MinWitnessedAt),
+		MaxWitnessedAt:  microsToTime(ins.MaxWitnessedAt),
 		SizeBytes:       ins.FileSize,
 	}
 	foldInspection(&tree, ins, collections)
@@ -521,11 +521,11 @@ func mergeTree(dst *TreeAggregate, src TreeAggregate) {
 		if src.MaxSeq > dst.MaxSeq {
 			dst.MaxSeq = src.MaxSeq
 		}
-		if !src.MinIndexedAt.IsZero() && (dst.MinIndexedAt.IsZero() || src.MinIndexedAt.Before(dst.MinIndexedAt)) {
-			dst.MinIndexedAt = src.MinIndexedAt
+		if !src.MinWitnessedAt.IsZero() && (dst.MinWitnessedAt.IsZero() || src.MinWitnessedAt.Before(dst.MinWitnessedAt)) {
+			dst.MinWitnessedAt = src.MinWitnessedAt
 		}
-		if src.MaxIndexedAt.After(dst.MaxIndexedAt) {
-			dst.MaxIndexedAt = src.MaxIndexedAt
+		if src.MaxWitnessedAt.After(dst.MaxWitnessedAt) {
+			dst.MaxWitnessedAt = src.MaxWitnessedAt
 		}
 	}
 	if src.LatestSegment != nil && (dst.LatestSegment == nil || src.LatestSegment.Index >= dst.LatestSegment.Index) {

@@ -56,7 +56,7 @@ func (k Kind) IsResyncReplacement() bool {
 //	Rev:        up to 255   bytes (uint8  column)
 //	Payload:    up to math.MaxUint32 bytes
 //
-// IndexedAt and RenderedAt are unix microseconds. RenderedAt == 0
+// WitnessedAt and IndexedAt are unix microseconds. IndexedAt == 0
 // means "no operator-supplied timestamp" (DESIGN.md §3.2).
 //
 // For non-commit kinds (Identity, Account, Sync), Collection, Rkey,
@@ -64,9 +64,9 @@ func (k Kind) IsResyncReplacement() bool {
 // any combination; emptiness is not enforced as a per-Kind invariant
 // at this layer.
 type Event struct {
-	Seq        uint64
-	IndexedAt  int64
-	RenderedAt int64
+	Seq         uint64
+	WitnessedAt int64
+	IndexedAt   int64
 	// UpstreamRelayCursor is the relay subscribeRepos cursor that produced
 	// this event. It is carried in memory for extended websocket clients;
 	// the current segment block format does not persist it.

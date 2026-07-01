@@ -30,8 +30,8 @@ func TestRenderInspectAll_Basic(t *testing.T) {
 				BlockCount:        12,
 				MinSeq:            10,
 				MaxSeq:            1243,
-				MinIndexedAt:      time.Date(2026, 5, 27, 0, 0, 0, 0, time.UTC),
-				MaxIndexedAt:      time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC),
+				MinWitnessedAt:    time.Date(2026, 5, 27, 0, 0, 0, 0, time.UTC),
+				MaxWitnessedAt:    time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC),
 				OldestMTime:       time.Date(2026, 5, 27, 0, 1, 0, 0, time.UTC),
 				NewestMTime:       time.Date(2026, 5, 28, 0, 1, 0, 0, time.UTC),
 				LatestSegment: &status.SegmentSummary{
@@ -65,8 +65,8 @@ func TestRenderInspectAll_Basic(t *testing.T) {
 			DiskBytes:         3 * 1024 * 1024,
 			MinSeq:            10,
 			MaxSeq:            1243,
-			MinIndexedAt:      time.Date(2026, 5, 27, 0, 0, 0, 0, time.UTC),
-			MaxIndexedAt:      time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC),
+			MinWitnessedAt:    time.Date(2026, 5, 27, 0, 0, 0, 0, time.UTC),
+			MaxWitnessedAt:    time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC),
 		},
 		Warnings: []string{
 			"/data/segments/seg_0000000002.jss: corrupt segment: bad magic \"XXXX\"",

@@ -34,12 +34,12 @@ type Model struct {
 // ObservedEvent is a single durable event read back from segments, flattened
 // into the fields the oracle compares and reconstructs from.
 type ObservedEvent struct {
-	Seq        uint64
-	IndexedAt  int64
-	Kind       segment.Kind
-	DID        string
-	Collection string
-	Rkey       string
-	Rev        string
-	Payload    []byte
+	Seq         uint64
+	WitnessedAt int64
+	Kind        segment.Kind
+	DID         string
+	Collection  string
+	Rkey        string
+	Rev         string
+	Payload     []byte
 }

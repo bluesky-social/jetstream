@@ -18,9 +18,9 @@ import (
 )
 
 type coldReaderSealedFixture struct {
-	minSeq, maxSeq             uint64
-	minIndexedAt, maxIndexedAt int64
-	eventCount                 int
+	minSeq, maxSeq                 uint64
+	minWitnessedAt, maxWitnessedAt int64
+	eventCount                     int
 }
 
 func TestColdReader_InvalidateSegmentPurgesDecodedBlocks(t *testing.T) {
@@ -28,7 +28,7 @@ func TestColdReader_InvalidateSegmentPurgesDecodedBlocks(t *testing.T) {
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	mustWriteColdReaderSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), coldReaderSealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	m := mustOpenColdReaderManifest(t, segDir)
 	st, w := openColdReaderWriterAtTip(t, dir, 10)
@@ -63,12 +63,12 @@ func mustWriteColdReaderSealedSegment(tb testing.TB, path string, f coldReaderSe
 		if i == f.eventCount-1 {
 			seq = f.maxSeq
 		}
-		ts := f.minIndexedAt + int64(i)*((f.maxIndexedAt-f.minIndexedAt+1)/int64(f.eventCount))
+		ts := f.minWitnessedAt + int64(i)*((f.maxWitnessedAt-f.minWitnessedAt+1)/int64(f.eventCount))
 		if i == f.eventCount-1 {
-			ts = f.maxIndexedAt
+			ts = f.maxWitnessedAt
 		}
 		_, err := w.Append(segment.Event{
-			Seq: seq, IndexedAt: ts, Kind: segment.KindCreate,
+			Seq: seq, WitnessedAt: ts, Kind: segment.KindCreate,
 			DID: "did:plc:fixture", Collection: "app.bsky.feed.post",
 			Rkey: "abc", Rev: "rev", Payload: []byte{0xa0},
 		})

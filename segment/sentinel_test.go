@@ -88,11 +88,11 @@ func TestSealIndexesDIDMarkerSentinels(t *testing.T) {
 	require.NoError(t, err)
 
 	events := []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a",
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a",
 			Collection: "app.bsky.feed.post", Rkey: "k1", Rev: "v1", Payload: []byte("p1")},
-		{Seq: 2, IndexedAt: 200, Kind: KindAccount, DID: "did:plc:a"},
-		{Seq: 3, IndexedAt: 300, Kind: KindIdentity, DID: "did:plc:a"},
-		{Seq: 4, IndexedAt: 400, Kind: KindSync, DID: "did:plc:a"},
+		{Seq: 2, WitnessedAt: 200, Kind: KindAccount, DID: "did:plc:a"},
+		{Seq: 3, WitnessedAt: 300, Kind: KindIdentity, DID: "did:plc:a"},
+		{Seq: 4, WitnessedAt: 400, Kind: KindSync, DID: "did:plc:a"},
 	}
 	for _, ev := range events {
 		full, err := w.Append(ev)
@@ -146,9 +146,9 @@ func TestSealCoalescesMarkerWithRealCollectionInBlock(t *testing.T) {
 	w, err := New(Config{Path: path, MaxEventsPerBlock: 16})
 	require.NoError(t, err)
 	for _, ev := range []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a",
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a",
 			Collection: "app.bsky.feed.post", Rkey: "k1", Rev: "v1", Payload: []byte("p1")},
-		{Seq: 2, IndexedAt: 200, Kind: KindAccount, DID: "did:plc:a"},
+		{Seq: 2, WitnessedAt: 200, Kind: KindAccount, DID: "did:plc:a"},
 	} {
 		_, err := w.Append(ev)
 		require.NoError(t, err)
@@ -183,11 +183,11 @@ func TestRewriteReindexesDIDMarkerSentinels(t *testing.T) {
 	require.NoError(t, err)
 	for _, ev := range []Event{
 		// A create that the rewrite will drop (its account was deleted).
-		{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a",
+		{Seq: 1, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a",
 			Collection: "app.bsky.feed.post", Rkey: "r1", Payload: []byte("p1")},
 		// The account-delete marker (empty collection) — must be retained
 		// and keep its sentinel after rewrite.
-		{Seq: 2, IndexedAt: 20, Kind: KindAccount, DID: "did:plc:a"},
+		{Seq: 2, WitnessedAt: 20, Kind: KindAccount, DID: "did:plc:a"},
 	} {
 		full, err := w.Append(ev)
 		require.NoError(t, err)

@@ -34,7 +34,7 @@ func TestHandler_ReplaysFromCursor(t *testing.T) {
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 10)
@@ -141,9 +141,9 @@ func recentSealedSegment(t *testing.T, dir string, minSeq, maxSeq uint64) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: minSeq, maxSeq: maxSeq,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 }
 

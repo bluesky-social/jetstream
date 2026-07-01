@@ -27,10 +27,10 @@ func TestSegmentMetrics_RecordsHistogram(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = w.Append(segment.Event{
-		IndexedAt: 1,
-		Kind:      segment.KindCreate,
-		DID:       "did:plc:test",
-		Seq:       1,
+		WitnessedAt: 1,
+		Kind:        segment.KindCreate,
+		DID:         "did:plc:test",
+		Seq:         1,
 	})
 	require.NoError(t, err)
 

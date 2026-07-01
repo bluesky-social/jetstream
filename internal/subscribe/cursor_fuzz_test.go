@@ -31,9 +31,9 @@ func FuzzResolveCursor(f *testing.F) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(f, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 100, maxSeq: 199,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m, err := manifest.Open(manifest.Options{
 		SegmentsDir: dir,

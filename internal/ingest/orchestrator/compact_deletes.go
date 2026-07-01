@@ -572,37 +572,37 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 }
 
 func compactionWatermarkLagSeconds(sealed []sealedCompactionSegment, watermark uint64) float64 {
-	var tipIndexedAt int64
-	var watermarkIndexedAt int64
-	var oldestIndexedAt int64
+	var tipWitnessedAt int64
+	var watermarkWitnessedAt int64
+	var oldestWitnessedAt int64
 	for _, f := range sealed {
 		if f.header.EventCount == 0 {
 			continue
 		}
-		if f.header.MaxIndexedAt > tipIndexedAt {
-			tipIndexedAt = f.header.MaxIndexedAt
+		if f.header.MaxWitnessedAt > tipWitnessedAt {
+			tipWitnessedAt = f.header.MaxWitnessedAt
 		}
-		if oldestIndexedAt == 0 || f.header.MinIndexedAt < oldestIndexedAt {
-			oldestIndexedAt = f.header.MinIndexedAt
+		if oldestWitnessedAt == 0 || f.header.MinWitnessedAt < oldestWitnessedAt {
+			oldestWitnessedAt = f.header.MinWitnessedAt
 		}
-		if f.header.MaxSeq <= watermark && f.header.MaxIndexedAt > watermarkIndexedAt {
-			watermarkIndexedAt = f.header.MaxIndexedAt
+		if f.header.MaxSeq <= watermark && f.header.MaxWitnessedAt > watermarkWitnessedAt {
+			watermarkWitnessedAt = f.header.MaxWitnessedAt
 		}
 	}
 
-	if watermarkIndexedAt == 0 {
+	if watermarkWitnessedAt == 0 {
 		// Nothing compacted yet: without this floor the gauge would
 		// report tip-since-epoch (a false ~50-year spike on the
 		// operator paging signal). The honest lag is the span of
 		// uncompacted data.
-		watermarkIndexedAt = oldestIndexedAt
+		watermarkWitnessedAt = oldestWitnessedAt
 	}
 
-	if tipIndexedAt <= watermarkIndexedAt {
+	if tipWitnessedAt <= watermarkWitnessedAt {
 		return 0
 	}
 
-	return float64(tipIndexedAt-watermarkIndexedAt) / 1_000_000
+	return float64(tipWitnessedAt-watermarkWitnessedAt) / 1_000_000
 }
 
 // removeStaleCompactionTemps deletes leftover *.jss.tmp files from a

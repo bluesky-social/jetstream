@@ -26,15 +26,15 @@ func TestValidateAcceptsHappyPath(t *testing.T) {
 
 	for _, kind := range []Kind{KindCreate, KindCreateResync} {
 		require.NoError(t, ValidateEvent(Event{
-			Seq:        42,
-			IndexedAt:  1_700_000_000_000_000,
-			RenderedAt: 0,
-			Kind:       kind,
-			DID:        "did:plc:abcdefghijklmnopqrstuvwx",
-			Collection: "app.bsky.feed.post",
-			Rkey:       "3l3qo2vuowo2b",
-			Rev:        "3l3qo2vutsw2b",
-			Payload:    []byte("any DAG-CBOR bytes"),
+			Seq:         42,
+			WitnessedAt: 1_700_000_000_000_000,
+			IndexedAt:   0,
+			Kind:        kind,
+			DID:         "did:plc:abcdefghijklmnopqrstuvwx",
+			Collection:  "app.bsky.feed.post",
+			Rkey:        "3l3qo2vuowo2b",
+			Rev:         "3l3qo2vutsw2b",
+			Payload:     []byte("any DAG-CBOR bytes"),
 		}))
 	}
 }
@@ -97,12 +97,12 @@ func TestEncodeBlockUncompressedHandcrafted(t *testing.T) {
 
 	events := []Event{
 		{
-			Seq: 1, IndexedAt: 100, RenderedAt: 0, Kind: KindCreate,
+			Seq: 1, WitnessedAt: 100, IndexedAt: 0, Kind: KindCreate,
 			DID: "d1", Collection: "c1", Rkey: "r1", Rev: "v1",
 			Payload: []byte{0xAA, 0xBB},
 		},
 		{
-			Seq: 2, IndexedAt: 200, RenderedAt: 250, Kind: KindIdentity,
+			Seq: 2, WitnessedAt: 200, IndexedAt: 250, Kind: KindIdentity,
 			DID: "d22", Collection: "", Rkey: "", Rev: "",
 			Payload: nil,
 		},
@@ -121,9 +121,9 @@ func TestEncodeBlockUncompressedHandcrafted(t *testing.T) {
 	w(uint32(2)) // event_count
 	w(uint64(1)) // seq[]
 	w(uint64(2))
-	w(int64(100)) // indexed_at[]
+	w(int64(100)) // witnessed_at[]
 	w(int64(200))
-	w(int64(0)) // rendered_at[]
+	w(int64(0)) // indexed_at[]
 	w(int64(250))
 	w(uint8(KindCreate)) // kind[]
 	w(uint8(KindIdentity))
@@ -167,12 +167,12 @@ func TestDecodeBlockRoundtripHandcrafted(t *testing.T) {
 
 	events := []Event{
 		{
-			Seq: 1, IndexedAt: 100, RenderedAt: 0, Kind: KindCreate,
+			Seq: 1, WitnessedAt: 100, IndexedAt: 0, Kind: KindCreate,
 			DID: "d1", Collection: "c1", Rkey: "r1", Rev: "v1",
 			Payload: []byte{0xAA, 0xBB},
 		},
 		{
-			Seq: 2, IndexedAt: 200, RenderedAt: 250, Kind: KindIdentity,
+			Seq: 2, WitnessedAt: 200, IndexedAt: 250, Kind: KindIdentity,
 			DID: "d22", Collection: "", Rkey: "", Rev: "",
 			Payload: nil,
 		},
@@ -248,8 +248,8 @@ func TestDecodeBlockRejectsOutOfRangeKind(t *testing.T) {
 	require.NoError(t, err)
 
 	// Locate and corrupt the kind[] byte. encodeBlock writes:
-	//   event_count u32 (4) + seq u64 (8) + indexed_at i64 (8) +
-	//   rendered_at i64 (8) + kind u8 (1) ...
+	//   event_count u32 (4) + seq u64 (8) + witnessed_at i64 (8) +
+	//   indexed_at i64 (8) + kind u8 (1) ...
 	// So kind[0] is at offset 4 + 8 + 8 + 8 = 28.
 	const kindOffset = 4 + 8 + 8 + 8
 	corrupted := append([]byte{}, encoded...)
@@ -279,8 +279,8 @@ func TestEncodeBlockCompressedRoundtrip(t *testing.T) {
 	t.Parallel()
 
 	events := []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
-		{Seq: 2, IndexedAt: 200, Kind: KindCreate, DID: "did:plc:b", Payload: []byte("x")},
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, WitnessedAt: 200, Kind: KindCreate, DID: "did:plc:b", Payload: []byte("x")},
 	}
 
 	frame, err := encodeBlockCompressed(events)
@@ -350,15 +350,15 @@ func genEvent(r *rand.Rand) Event {
 	payloadLen := pickPayloadLen(r)
 
 	return Event{
-		Seq:        r.Uint64(),
-		IndexedAt:  int64(r.Uint64()),
-		RenderedAt: int64(r.Uint64()),
-		Kind:       Kind(1 + r.Intn(7)),
-		DID:        randString(r, didLen),
-		Collection: randString(r, collLen),
-		Rkey:       randString(r, rkeyLen),
-		Rev:        randString(r, revLen),
-		Payload:    randBytes(r, payloadLen),
+		Seq:         r.Uint64(),
+		WitnessedAt: int64(r.Uint64()),
+		IndexedAt:   int64(r.Uint64()),
+		Kind:        Kind(1 + r.Intn(7)),
+		DID:         randString(r, didLen),
+		Collection:  randString(r, collLen),
+		Rkey:        randString(r, rkeyLen),
+		Rev:         randString(r, revLen),
+		Payload:     randBytes(r, payloadLen),
 	}
 }
 
@@ -462,8 +462,8 @@ func TestEncodeBlockRoundtripProperty(t *testing.T) {
 // testing — though our decoder produces nil for zero-length, we
 // guard against test-helper drift.
 func eventsEqual(a, b Event) bool {
-	if a.Seq != b.Seq || a.IndexedAt != b.IndexedAt ||
-		a.RenderedAt != b.RenderedAt || a.Kind != b.Kind ||
+	if a.Seq != b.Seq || a.WitnessedAt != b.WitnessedAt ||
+		a.IndexedAt != b.IndexedAt || a.Kind != b.Kind ||
 		a.DID != b.DID || a.Collection != b.Collection ||
 		a.Rkey != b.Rkey || a.Rev != b.Rev {
 		return false

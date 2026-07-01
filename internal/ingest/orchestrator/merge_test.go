@@ -26,15 +26,15 @@ import (
 // ev is a brief constructor for synthetic source events. seq is left
 // at 0 — the source ingest.Writer will assign one when the event is
 // appended.
-func ev(did, rev string, kind segment.Kind, indexedAtMicros int64) segment.Event {
+func ev(did, rev string, kind segment.Kind, witnessedAtMicros int64) segment.Event {
 	return segment.Event{
-		IndexedAt:  indexedAtMicros,
-		Kind:       kind,
-		DID:        did,
-		Collection: "app.bsky.feed.post",
-		Rkey:       "rkey-" + rev,
-		Rev:        rev,
-		Payload:    []byte("payload-" + rev),
+		WitnessedAt: witnessedAtMicros,
+		Kind:        kind,
+		DID:         did,
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "rkey-" + rev,
+		Rev:         rev,
+		Payload:     []byte("payload-" + rev),
 	}
 }
 
@@ -85,11 +85,11 @@ func TestMerge_DropsCoveredCommits_KeepsOthers(t *testing.T) {
 	t.Parallel()
 	// did:plc:a backfilled at rev=3l5; did:plc:b never backfilled.
 	srcEvs := []segment.Event{
-		ev("did:plc:a", "3l3", segment.KindCreate, 1000),                // drop (covered)
-		ev("did:plc:a", "3l5", segment.KindCreate, 1001),                // drop (== BackfillRev)
-		ev("did:plc:a", "3l6", segment.KindCreate, 1002),                // keep
-		ev("did:plc:b", "3l4", segment.KindCreate, 1003),                // keep (no backfill)
-		{Kind: segment.KindIdentity, DID: "did:plc:a", IndexedAt: 1004}, // keep (non-commit)
+		ev("did:plc:a", "3l3", segment.KindCreate, 1000),                  // drop (covered)
+		ev("did:plc:a", "3l5", segment.KindCreate, 1001),                  // drop (== BackfillRev)
+		ev("did:plc:a", "3l6", segment.KindCreate, 1002),                  // keep
+		ev("did:plc:b", "3l4", segment.KindCreate, 1003),                  // keep (no backfill)
+		{Kind: segment.KindIdentity, DID: "did:plc:a", WitnessedAt: 1004}, // keep (non-commit)
 	}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
@@ -101,10 +101,10 @@ func TestMerge_DropsCoveredCommits_KeepsOthers(t *testing.T) {
 	got := readDestEvents(t, fix.dataDir)
 	require.Len(t, got, 3, "want 3 survivors (a@3l6, b@3l4, identity)")
 
-	// IndexedAt re-stamping: every survivor > max(source IndexedAt).
+	// WitnessedAt re-stamping: every survivor > max(source WitnessedAt).
 	const maxSrc = int64(1004)
 	for _, e := range got {
-		require.Greater(t, e.IndexedAt, maxSrc, "survivor IndexedAt must be re-stamped to merge time")
+		require.Greater(t, e.WitnessedAt, maxSrc, "survivor WitnessedAt must be re-stamped to merge time")
 	}
 }
 

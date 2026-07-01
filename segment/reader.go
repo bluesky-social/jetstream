@@ -503,10 +503,10 @@ func validateBlockOffsets(blocks []BlockInfo, footerOffset uint64) error {
 				"%w: block %d has max_seq %d < min_seq %d",
 				ErrInvalidBlockIndex, i, b.MaxSeq, b.MinSeq)
 		}
-		if b.MaxIndexedAt < b.MinIndexedAt {
+		if b.MaxWitnessedAt < b.MinWitnessedAt {
 			return fmt.Errorf(
-				"%w: block %d has max_indexed_at %d < min_indexed_at %d",
-				ErrInvalidBlockIndex, i, b.MaxIndexedAt, b.MinIndexedAt)
+				"%w: block %d has max_witnessed_at %d < min_witnessed_at %d",
+				ErrInvalidBlockIndex, i, b.MaxWitnessedAt, b.MinWitnessedAt)
 		}
 		if b.EventCount > 0 {
 			if hasPrevSeq && b.MinSeq <= prevMaxSeq {

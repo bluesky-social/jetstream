@@ -40,9 +40,11 @@ type Event struct {
 	// Persist the last seen Seq (via Batch.LastCursor) to resume later.
 	Seq uint64 `json:"cursor"`
 
-	// TimeUS is Jetstream's own indexed-at timestamp, microseconds since the
-	// Unix epoch. This is the server's ingest time, not the record's
-	// client-supplied createdAt.
+	// TimeUS is the event's display timestamp, microseconds since the Unix
+	// epoch: the operator-imported indexed_at value if one was set, otherwise
+	// the witnessed_at time Jetstream first saw the event. It is not the
+	// record's client-supplied createdAt. Absent any timestamp import, this
+	// is simply the server's ingest (witnessed) time.
 	TimeUS int64 `json:"time_us"`
 
 	// Kind selects which of the payload pointers below is populated.

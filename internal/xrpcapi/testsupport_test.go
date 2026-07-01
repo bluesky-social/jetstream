@@ -57,14 +57,14 @@ func writeSealedSegment(t *testing.T, dir string, idx uint64, seqStart uint64) s
 	require.NoError(t, err)
 	for i := range uint64(4) {
 		_, err = w.Append(segment.Event{
-			Seq:        seqStart + i,
-			IndexedAt:  int64(1_730_000_000_000_000 + (seqStart+i)*1_000),
-			Kind:       segment.KindCreate,
-			DID:        "did:plc:test",
-			Collection: "app.bsky.feed.post",
-			Rkey:       "rkey",
-			Rev:        "rev",
-			Payload:    []byte{0xa0},
+			Seq:         seqStart + i,
+			WitnessedAt: int64(1_730_000_000_000_000 + (seqStart+i)*1_000),
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:test",
+			Collection:  "app.bsky.feed.post",
+			Rkey:        "rkey",
+			Rev:         "rev",
+			Payload:     []byte{0xa0},
 		})
 		require.NoError(t, err)
 	}
@@ -97,7 +97,7 @@ func writeSealedSegmentBlocks(t *testing.T, dir string, idx, seqStart uint64, pe
 	for b := range blockCount {
 		for range perBlock {
 			_, err = w.Append(segment.Event{
-				Seq: seq, IndexedAt: int64(1_730_000_000_000_000 + seq*1_000),
+				Seq: seq, WitnessedAt: int64(1_730_000_000_000_000 + seq*1_000),
 				Kind: segment.KindCreate, DID: "did:plc:test",
 				Collection: "app.bsky.feed.post", Rkey: "rkey", Rev: "rev",
 				Payload: []byte{0xa0},

@@ -46,12 +46,12 @@ func TestOpen_LoadsSealedSegmentBounds(t *testing.T) {
 	dir := t.TempDir()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 99,
-		minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000,
+		minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000,
 		eventCount: 100,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 100, maxSeq: 199,
-		minIndexedAt: 1_700_000_010_000_001, maxIndexedAt: 1_700_000_020_000_000,
+		minWitnessedAt: 1_700_000_010_000_001, maxWitnessedAt: 1_700_000_020_000_000,
 		eventCount: 100,
 	})
 
@@ -66,8 +66,8 @@ func TestOpen_LoadsSealedSegmentBounds(t *testing.T) {
 	require.Equal(t, uint64(0), bounds[0].Idx)
 	require.Equal(t, uint64(0), bounds[0].MinSeq)
 	require.Equal(t, uint64(99), bounds[0].MaxSeq)
-	require.Equal(t, int64(1_700_000_000_000_000), bounds[0].MinIndexedAt)
-	require.Equal(t, int64(1_700_000_010_000_000), bounds[0].MaxIndexedAt)
+	require.Equal(t, int64(1_700_000_000_000_000), bounds[0].MinWitnessedAt)
+	require.Equal(t, int64(1_700_000_010_000_000), bounds[0].MaxWitnessedAt)
 
 	require.Equal(t, uint64(1), bounds[1].Idx)
 	require.Equal(t, uint64(100), bounds[1].MinSeq)
@@ -123,10 +123,10 @@ func TestSegmentForSeq(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 99, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000, eventCount: 10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
-		minSeq: 100, maxSeq: 199, minIndexedAt: 1_700_000_010_000_001, maxIndexedAt: 1_700_000_020_000_000, eventCount: 10,
+		minSeq: 100, maxSeq: 199, minWitnessedAt: 1_700_000_010_000_001, maxWitnessedAt: 1_700_000_020_000_000, eventCount: 10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -154,10 +154,10 @@ func TestSegmentForTimeUS(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 99, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000, eventCount: 10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
-		minSeq: 100, maxSeq: 199, minIndexedAt: 1_700_000_010_000_001, maxIndexedAt: 1_700_000_020_000_000, eventCount: 10,
+		minSeq: 100, maxSeq: 199, minWitnessedAt: 1_700_000_010_000_001, maxWitnessedAt: 1_700_000_020_000_000, eventCount: 10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -183,15 +183,15 @@ func TestLookbackFloor(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 99,
-		minIndexedAt: now - int64(48*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(40*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(48*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(40*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 100, maxSeq: 199,
-		minIndexedAt: now - int64(12*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(12*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -217,7 +217,7 @@ func TestOnSegmentSealed(t *testing.T) {
 
 	path := filepath.Join(dir, "seg_0000000000.jss")
 	mustWriteSealedSegment(t, path, sealedFixture{
-		minSeq: 0, maxSeq: 99, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000, eventCount: 10,
 	})
 
 	require.NoError(t, m.OnSegmentSealed(0, path))
@@ -233,7 +233,7 @@ func TestOnSegmentSealed_ReplacesExistingIdx(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_0000000000.jss")
 	mustWriteSealedSegment(t, path, sealedFixture{
-		minSeq: 0, maxSeq: 99, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000, eventCount: 10,
 	})
 	m := mustOpenManifest(t, dir)
 	require.Equal(t, 1, m.SegmentCount())
@@ -247,7 +247,7 @@ func TestOnSegmentCompacted_ReplacesResidentMetadata(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_0000000000.jss")
 	mustWriteSealedSegment(t, path, sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	m := mustOpenManifest(t, dir)
 	before, _, _ := m.ListFrom(0, 1)
@@ -293,7 +293,7 @@ func TestBlockIndex_LoadsAndCaches(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_0000000000.jss")
 	mustWriteSealedSegment(t, path, sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_001_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_001_000_000, eventCount: 10,
 	})
 
 	reg := prometheus.NewRegistry()
@@ -333,11 +333,11 @@ func TestBlockIndex_AllSegmentsStayResident(t *testing.T) {
 		mustWriteSealedSegment(t,
 			filepath.Join(dir, fmt.Sprintf("seg_%010d.jss", i)),
 			sealedFixture{
-				minSeq:       uint64(i * 10),
-				maxSeq:       uint64(i*10 + 9),
-				minIndexedAt: int64(1_700_000_000_000_000 + i*1_000_000),
-				maxIndexedAt: int64(1_700_000_000_000_000 + (i+1)*1_000_000),
-				eventCount:   10,
+				minSeq:         uint64(i * 10),
+				maxSeq:         uint64(i*10 + 9),
+				minWitnessedAt: int64(1_700_000_000_000_000 + i*1_000_000),
+				maxWitnessedAt: int64(1_700_000_000_000_000 + (i+1)*1_000_000),
+				eventCount:     10,
 			})
 	}
 

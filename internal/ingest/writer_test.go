@@ -372,9 +372,9 @@ func TestAppend_AllocatesMonotonicSeq(t *testing.T) {
 
 	for i := range 10 {
 		ev := segment.Event{
-			IndexedAt: 1,
-			Kind:      segment.KindCreate,
-			DID:       "did:plc:a",
+			WitnessedAt: 1,
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:a",
 		}
 		require.NoError(t, w.Append(t.Context(), &ev))
 		require.Equal(t, uint64(i+1), ev.Seq, "append %d", i)
@@ -963,9 +963,9 @@ func TestSealActiveAndClose_SealsAndCloses(t *testing.T) {
 
 	for i := range 3 {
 		ev := segment.Event{
-			IndexedAt: int64(i + 1),
-			Kind:      segment.KindCreate,
-			DID:       "did:plc:a",
+			WitnessedAt: int64(i + 1),
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:a",
 		}
 		require.NoError(t, w.Append(t.Context(), &ev))
 	}
@@ -974,7 +974,7 @@ func TestSealActiveAndClose_SealsAndCloses(t *testing.T) {
 
 	// Subsequent appends fail with ErrClosed.
 	err := w.Append(t.Context(), &segment.Event{
-		IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:a",
+		WitnessedAt: 4, Kind: segment.KindCreate, DID: "did:plc:a",
 	})
 	require.ErrorIs(t, err, ErrClosed)
 
@@ -1059,7 +1059,7 @@ func TestSealActiveAndClose_OnAfterSealFiresOnce(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close() })
 
 	ev := segment.Event{
-		IndexedAt: 1, Kind: segment.KindCreate,
+		WitnessedAt: 1, Kind: segment.KindCreate,
 		DID: "did:plc:a", Payload: []byte{0xa0},
 	}
 	require.NoError(t, w.Append(t.Context(), &ev))
@@ -1094,9 +1094,9 @@ func TestSealActiveAndClose_OnAfterSealErrorPropagatesAfterDurableSeal(t *testin
 
 	for i := range 3 {
 		ev := segment.Event{
-			IndexedAt: int64(i + 1),
-			Kind:      segment.KindCreate,
-			DID:       "did:plc:a",
+			WitnessedAt: int64(i + 1),
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:a",
 		}
 		require.NoError(t, w.Append(t.Context(), &ev))
 	}
@@ -1116,7 +1116,7 @@ func TestSealActiveAndClose_OnAfterSealErrorPropagatesAfterDurableSeal(t *testin
 	defer func() { _ = closer.Close() }()
 	require.Equal(t, uint64(4), binary.LittleEndian.Uint64(persisted),
 		"hook failure happens after seq/next is persisted")
-	require.ErrorIs(t, w.Append(t.Context(), &segment.Event{IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:a"}), ErrClosed)
+	require.ErrorIs(t, w.Append(t.Context(), &segment.Event{WitnessedAt: 4, Kind: segment.KindCreate, DID: "did:plc:a"}), ErrClosed)
 }
 
 // TestForceRotate_SealsAndOpensNext pins the compaction-time forced
@@ -1128,7 +1128,7 @@ func TestForceRotate_SealsAndOpensNext(t *testing.T) {
 	w := newTestWriter(t, Config{MaxEventsPerBlock: 64})
 
 	for i := range 3 {
-		ev := segment.Event{IndexedAt: int64(i + 1), Kind: segment.KindCreate, DID: "did:plc:a"}
+		ev := segment.Event{WitnessedAt: int64(i + 1), Kind: segment.KindCreate, DID: "did:plc:a"}
 		require.NoError(t, w.Append(t.Context(), &ev))
 	}
 
@@ -1148,7 +1148,7 @@ func TestForceRotate_SealsAndOpensNext(t *testing.T) {
 	require.Equal(t, uint64(4), binary.LittleEndian.Uint64(persisted))
 
 	// The writer remains usable on the next segment.
-	ev := segment.Event{IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:b"}
+	ev := segment.Event{WitnessedAt: 4, Kind: segment.KindCreate, DID: "did:plc:b"}
 	require.NoError(t, w.Append(t.Context(), &ev))
 	require.Equal(t, uint64(4), ev.Seq)
 }
@@ -1281,7 +1281,7 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
+	ev := segment.Event{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
 	require.NoError(t, w.Append(t.Context(), &ev))
 
 	require.NoError(t, w.DrainDurability(t.Context()))
@@ -1338,7 +1338,7 @@ func TestDurableBatchClose_RunsAfterPendingEvents(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:close"}
+	ev := segment.Event{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:close"}
 	require.NoError(t, w.Append(t.Context(), &ev))
 	require.NoError(t, w.Close())
 
@@ -1377,7 +1377,7 @@ func TestSealActiveAndClose_RunsDurableBatchHookAfterPendingEvents(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:seal-close"}
+	ev := segment.Event{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:seal-close"}
 	require.NoError(t, w.Append(t.Context(), &ev))
 	require.NoError(t, w.SealActiveAndClose())
 
@@ -1419,7 +1419,7 @@ func TestWriter_DurableBatchAsyncCloseRunsAfterPendingEvents(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:async-close"}
+	ev := segment.Event{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:async-close"}
 	require.NoError(t, w.Append(t.Context(), &ev))
 	require.NoError(t, w.Close())
 
@@ -1463,7 +1463,7 @@ func TestWriter_AsyncSealActiveAndCloseRunsDurableBatchHookAfterPendingEvents(t 
 	})
 	require.NoError(t, err)
 
-	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:async-seal-close"}
+	ev := segment.Event{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:async-seal-close"}
 	require.NoError(t, w.Append(t.Context(), &ev))
 	require.NoError(t, w.SealActiveAndClose())
 
@@ -1497,7 +1497,7 @@ func TestForceRotate_FlushedButUnsealedRotates(t *testing.T) {
 	t.Parallel()
 	w := newTestWriter(t, Config{MaxEventsPerBlock: 64})
 
-	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
+	ev := segment.Event{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
 	require.NoError(t, w.Append(t.Context(), &ev))
 	require.NoError(t, w.Flush(t.Context()))
 
@@ -1536,7 +1536,7 @@ func TestForceRotate_FiresOnAfterSeal(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
+	ev := segment.Event{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
 	require.NoError(t, w.Append(t.Context(), &ev))
 	require.NoError(t, w.ForceRotate(t.Context()))
 	require.Equal(t, 1, calls)
@@ -1561,7 +1561,7 @@ func TestForceRotate_ConcurrentWithAppends(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range perGoroutine {
-				ev := segment.Event{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
+				ev := segment.Event{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"}
 				require.NoError(t, w.Append(t.Context(), &ev))
 			}
 		}()
@@ -1676,7 +1676,7 @@ func TestWriter_OnAfterSeal_FiresOnRotation(t *testing.T) {
 	// seals at idx 0, 1, 2.
 	for i := 1; i <= 3; i++ {
 		ev := segment.Event{
-			IndexedAt: int64(i), Kind: segment.KindCreate,
+			WitnessedAt: int64(i), Kind: segment.KindCreate,
 			DID: "did:plc:a", Payload: []byte{0xa0},
 		}
 		require.NoError(t, w.Append(t.Context(), &ev))
@@ -1713,7 +1713,7 @@ func TestWriter_OnAfterSeal_ErrorPropagates(t *testing.T) {
 	// First append fills the block + triggers a rotation; the seal hook
 	// returns wantErr, which Append must surface.
 	ev := segment.Event{
-		IndexedAt: 1, Kind: segment.KindCreate,
+		WitnessedAt: 1, Kind: segment.KindCreate,
 		DID: "did:plc:a", Payload: []byte{0xa0},
 	}
 	err = w.Append(t.Context(), &ev)
@@ -1724,7 +1724,7 @@ func TestWriter_OnAfterSeal_ErrorPropagates(t *testing.T) {
 	// We don't pin the exact error class — what matters is that a
 	// caller can't accidentally write into limbo state.
 	ev2 := segment.Event{
-		IndexedAt: 2, Kind: segment.KindCreate,
+		WitnessedAt: 2, Kind: segment.KindCreate,
 		DID: "did:plc:a", Payload: []byte{0xa0},
 	}
 	require.Error(t, w.Append(t.Context(), &ev2),
@@ -1800,9 +1800,9 @@ func TestAppendBatch_AllocatesMonotonicSeq(t *testing.T) {
 	events := make([]segment.Event, 10)
 	for i := range events {
 		events[i] = segment.Event{
-			IndexedAt: int64(i + 1),
-			Kind:      segment.KindCreate,
-			DID:       "did:plc:a",
+			WitnessedAt: int64(i + 1),
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:a",
 		}
 	}
 
@@ -1822,10 +1822,10 @@ func TestAppendBatch_AsyncFlushPersistsBlocksAndSeqBeforeReturn(t *testing.T) {
 	})
 
 	events := []segment.Event{
-		{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"},
-		{IndexedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b"},
-		{IndexedAt: 3, Kind: segment.KindCreate, DID: "did:plc:c"},
-		{IndexedAt: 4, Kind: segment.KindCreate, DID: "did:plc:d"},
+		{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"},
+		{WitnessedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b"},
+		{WitnessedAt: 3, Kind: segment.KindCreate, DID: "did:plc:c"},
+		{WitnessedAt: 4, Kind: segment.KindCreate, DID: "did:plc:d"},
 	}
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 
@@ -1922,9 +1922,9 @@ func TestAppendBatch_AsyncFlushRotatesWhenFullIncludingPendingRows(t *testing.T)
 	})
 
 	events := []segment.Event{
-		{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a", Payload: []byte("one")},
-		{IndexedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b", Payload: []byte("two")},
-		{IndexedAt: 3, Kind: segment.KindCreate, DID: "did:plc:c", Payload: []byte("three")},
+		{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a", Payload: []byte("one")},
+		{WitnessedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b", Payload: []byte("two")},
+		{WitnessedAt: 3, Kind: segment.KindCreate, DID: "did:plc:c", Payload: []byte("three")},
 	}
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 
@@ -1963,10 +1963,10 @@ func TestAppendBatch_AsyncFlushConcurrentBatchesRemainContiguous(t *testing.T) {
 			events := make([]segment.Event, perBatch)
 			for i := range events {
 				events[i] = segment.Event{
-					IndexedAt: int64(g*perBatch + i + 1),
-					Kind:      segment.KindCreate,
-					DID:       fmt.Sprintf("did:plc:test%02d%02d", g, i),
-					Payload:   []byte{byte(g), byte(i)},
+					WitnessedAt: int64(g*perBatch + i + 1),
+					Kind:        segment.KindCreate,
+					DID:         fmt.Sprintf("did:plc:test%02d%02d", g, i),
+					Payload:     []byte{byte(g), byte(i)},
 				}
 			}
 			errs <- w.AppendBatch(t.Context(), events)
@@ -2032,10 +2032,10 @@ func TestAsyncFlush_ConcurrentProducersRotateWithoutSeqCorruption(t *testing.T) 
 				events := make([]segment.Event, perBatch)
 				for i := range events {
 					events[i] = segment.Event{
-						IndexedAt: int64(b*perBatch + i + 1),
-						Kind:      segment.KindCreate,
-						DID:       fmt.Sprintf("did:plc:g%02db%02di%02d", g, b, i),
-						Payload:   incompressiblePayload(rng, payloadBytes),
+						WitnessedAt: int64(b*perBatch + i + 1),
+						Kind:        segment.KindCreate,
+						DID:         fmt.Sprintf("did:plc:g%02db%02di%02d", g, b, i),
+						Payload:     incompressiblePayload(rng, payloadBytes),
 					}
 				}
 				if err := w.AppendBatch(t.Context(), events); err != nil {
@@ -2079,9 +2079,9 @@ func TestWriter_AsyncCloseFlushesPendingBlockAndPersistsNextSeq(t *testing.T) {
 	})
 
 	events := []segment.Event{
-		{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"},
-		{IndexedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b"},
-		{IndexedAt: 3, Kind: segment.KindCreate, DID: "did:plc:c"},
+		{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"},
+		{WitnessedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b"},
+		{WitnessedAt: 3, Kind: segment.KindCreate, DID: "did:plc:c"},
 	}
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 	require.NoError(t, w.Close())
@@ -2110,8 +2110,8 @@ func TestWriter_AsyncSealActiveAndCloseSealsPendingBlock(t *testing.T) {
 	})
 
 	events := []segment.Event{
-		{IndexedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"},
-		{IndexedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b"},
+		{WitnessedAt: 1, Kind: segment.KindCreate, DID: "did:plc:a"},
+		{WitnessedAt: 2, Kind: segment.KindCreate, DID: "did:plc:b"},
 	}
 	require.NoError(t, w.AppendBatch(t.Context(), events))
 	require.NoError(t, w.SealActiveAndClose())
@@ -2291,13 +2291,13 @@ func TestAsyncFlush_RotatesUnderSustainedLoad(t *testing.T) {
 	rng := mathrand.New(mathrand.NewPCG(0x5eed, 0x1dea))
 	mkEvent := func(n int) segment.Event {
 		return segment.Event{
-			IndexedAt:  int64(n + 1),
-			Kind:       segment.KindCreate,
-			DID:        fmt.Sprintf("did:plc:user%06d", n),
-			Collection: "app.bsky.feed.post",
-			Rkey:       fmt.Sprintf("rk%06d", n),
-			Rev:        "3kabc",
-			Payload:    incompressiblePayload(rng, payloadBytes),
+			WitnessedAt: int64(n + 1),
+			Kind:        segment.KindCreate,
+			DID:         fmt.Sprintf("did:plc:user%06d", n),
+			Collection:  "app.bsky.feed.post",
+			Rkey:        fmt.Sprintf("rk%06d", n),
+			Rev:         "3kabc",
+			Payload:     incompressiblePayload(rng, payloadBytes),
 		}
 	}
 
@@ -2371,10 +2371,10 @@ func TestAsyncFlush_SeqIntegrityAcrossRotationAndReopen(t *testing.T) {
 	seq := 0
 	mkEvent := func() segment.Event {
 		ev := segment.Event{
-			IndexedAt: int64(seq + 1),
-			Kind:      segment.KindCreate,
-			DID:       fmt.Sprintf("did:plc:u%06d", seq),
-			Payload:   incompressiblePayload(rng, 512),
+			WitnessedAt: int64(seq + 1),
+			Kind:        segment.KindCreate,
+			DID:         fmt.Sprintf("did:plc:u%06d", seq),
+			Payload:     incompressiblePayload(rng, 512),
 		}
 		seq++
 		return ev
@@ -2447,10 +2447,10 @@ func TestAsyncFlush_RotationIsSizeDrivenNotPipelineDepth(t *testing.T) {
 	events := make([]segment.Event, 10)
 	for i := range events {
 		events[i] = segment.Event{
-			IndexedAt: int64(i + 1),
-			Kind:      segment.KindCreate,
-			DID:       fmt.Sprintf("did:plc:x%02d", i),
-			Payload:   []byte("payload"),
+			WitnessedAt: int64(i + 1),
+			Kind:        segment.KindCreate,
+			DID:         fmt.Sprintf("did:plc:x%02d", i),
+			Payload:     []byte("payload"),
 		}
 	}
 	require.NoError(t, w.AppendBatch(t.Context(), events))

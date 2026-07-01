@@ -195,7 +195,7 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 	m.CompactionWatermarkLag = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
 		Name: "watermark_lag_seconds",
-		Help: "Header-granular indexed_at lag between the sealed segment tip and the compaction watermark.",
+		Help: "Header-granular witnessed_at lag between the sealed segment tip and the compaction watermark.",
 	})
 	reg.MustRegister(
 		m.Phase,

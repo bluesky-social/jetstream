@@ -68,7 +68,7 @@ func TestConvertEvent_Swarm(t *testing.T) {
 	expectedErrSeen := 0
 	unknownErrSeen := 0
 
-	const indexedAt int64 = 1_700_000_000_000_000
+	const witnessedAt int64 = 1_700_000_000_000_000
 
 	for i := range swarmIterations(t) {
 		c := nextSwarmCase(t, r)
@@ -84,7 +84,7 @@ func TestConvertEvent_Swarm(t *testing.T) {
 					t.Fatalf("iter %d (%s): ConvertEvent panicked: %v", i, c.desc, rec)
 				}
 			}()
-			got, gotErr = ConvertEvent(c.evt, indexedAt)
+			got, gotErr = ConvertEvent(c.evt, witnessedAt)
 		}()
 
 		switch {
@@ -118,7 +118,7 @@ func TestConvertEvent_Swarm(t *testing.T) {
 					"iter %d (%s): kind[%d]", i, c.desc, j)
 			}
 			for j, ev := range got {
-				assertSegmentInvariants(t, i, c.desc, j, ev, indexedAt)
+				assertSegmentInvariants(t, i, c.desc, j, ev, witnessedAt)
 				successByKind[ev.Kind]++
 			}
 			expectedErrSeen++
@@ -132,7 +132,7 @@ func TestConvertEvent_Swarm(t *testing.T) {
 					"iter %d (%s): kind[%d]", i, c.desc, j)
 			}
 			for j, ev := range got {
-				assertSegmentInvariants(t, i, c.desc, j, ev, indexedAt)
+				assertSegmentInvariants(t, i, c.desc, j, ev, witnessedAt)
 				successByKind[ev.Kind]++
 			}
 		}
@@ -157,10 +157,10 @@ func TestConvertEvent_Swarm(t *testing.T) {
 // requirements that segment encoding will impose downstream. Anything
 // ConvertEvent emits MUST satisfy these or the segment writer will
 // reject it at runtime.
-func assertSegmentInvariants(t *testing.T, iter int, desc string, j int, ev segment.Event, indexedAt int64) {
+func assertSegmentInvariants(t *testing.T, iter int, desc string, j int, ev segment.Event, witnessedAt int64) {
 	t.Helper()
-	require.Equal(t, indexedAt, ev.IndexedAt,
-		"iter %d (%s) ev[%d]: IndexedAt must be propagated", iter, desc, j)
+	require.Equal(t, witnessedAt, ev.WitnessedAt,
+		"iter %d (%s) ev[%d]: WitnessedAt must be propagated", iter, desc, j)
 	require.Equal(t, uint64(0), ev.Seq,
 		"iter %d (%s) ev[%d]: Seq is allocated downstream", iter, desc, j)
 	require.NotEmpty(t, ev.DID,

@@ -13,9 +13,9 @@ import (
 )
 
 type sealedFixture struct {
-	minSeq, maxSeq             uint64
-	minIndexedAt, maxIndexedAt int64
-	eventCount                 int
+	minSeq, maxSeq                 uint64
+	minWitnessedAt, maxWitnessedAt int64
+	eventCount                     int
 }
 
 func mustWriteSealedSegment(tb testing.TB, path string, f sealedFixture) {
@@ -31,12 +31,12 @@ func mustWriteSealedSegment(tb testing.TB, path string, f sealedFixture) {
 		if i == f.eventCount-1 {
 			seq = f.maxSeq
 		}
-		ts := f.minIndexedAt + int64(i)*((f.maxIndexedAt-f.minIndexedAt+1)/int64(f.eventCount))
+		ts := f.minWitnessedAt + int64(i)*((f.maxWitnessedAt-f.minWitnessedAt+1)/int64(f.eventCount))
 		if i == f.eventCount-1 {
-			ts = f.maxIndexedAt
+			ts = f.maxWitnessedAt
 		}
 		_, err := w.Append(segment.Event{
-			Seq: seq, IndexedAt: ts, Kind: segment.KindCreate,
+			Seq: seq, WitnessedAt: ts, Kind: segment.KindCreate,
 			DID: "did:plc:fixture", Collection: "app.bsky.feed.post",
 			Rkey: "abc", Rev: "rev", Payload: []byte{0xa0},
 		})

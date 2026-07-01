@@ -22,10 +22,10 @@ func TestSegmentStats_ExcludesSentinelCollections(t *testing.T) {
 	// A segment with a real commit plus all three DID-level markers, so seal
 	// tags the block with $account/$identity/$sync.
 	mustWriteSealedSegmentWithEvents(t, filepath.Join(dir, "seg_0000000000.jss"), 4096, []segment.Event{
-		{Seq: 1, IndexedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "rev1", Payload: []byte{0xa0}},
-		{Seq: 2, IndexedAt: 1_700_000_001_000_000, Kind: segment.KindIdentity, DID: "did:plc:a"},
-		{Seq: 3, IndexedAt: 1_700_000_002_000_000, Kind: segment.KindAccount, DID: "did:plc:a"},
-		{Seq: 4, IndexedAt: 1_700_000_003_000_000, Kind: segment.KindSync, DID: "did:plc:a"},
+		{Seq: 1, WitnessedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "rev1", Payload: []byte{0xa0}},
+		{Seq: 2, WitnessedAt: 1_700_000_001_000_000, Kind: segment.KindIdentity, DID: "did:plc:a"},
+		{Seq: 3, WitnessedAt: 1_700_000_002_000_000, Kind: segment.KindAccount, DID: "did:plc:a"},
+		{Seq: 4, WitnessedAt: 1_700_000_003_000_000, Kind: segment.KindSync, DID: "did:plc:a"},
 	})
 
 	m, err := manifest.Open(manifest.Options{

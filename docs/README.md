@@ -184,8 +184,8 @@ Jetstream Sealed Segment File (.jss):
 │   unique_did_count:        uint32                        │
 │   min_seq:                 uint64                        │
 │   max_seq:                 uint64                        │
-│   min_indexed_at:          int64   (unix micros)         │
-│   max_indexed_at:          int64   (unix micros)         │
+│   min_witnessed_at:        int64   (unix micros)         │
+│   max_witnessed_at:        int64   (unix micros)         │
 │   footer_offset:           uint64                        │
 │   did_bloom_offset:        uint64                        │
 │   block_did_bloom_offset:  uint64                        │
@@ -209,8 +209,8 @@ Jetstream Sealed Segment File (.jss):
 │     event_count:       uint32                            │
 │     min_seq:           uint64                            │
 │     max_seq:           uint64                            │
-│     min_indexed_at:    int64   (unix micros)             │
-│     max_indexed_at:    int64   (unix micros)             │
+│     min_witnessed_at:  int64   (unix micros)             │
+│     max_witnessed_at:  int64   (unix micros)             │
 │   DID Bloom Filter                                       │
 │     Serialized gloom.Filter (MarshalBinary)              │
 │     Covers all unique DIDs in this segment               │
@@ -308,8 +308,8 @@ Compressed block (single ZSTD frame):
 ├──────────────────────────────────────────────────────────┤
 │ Fixed-size columns (contiguous arrays):                  │
 │   seq[]              event_count × uint64 (LE)           │
+│   witnessed_at[]     event_count × int64  (LE)           │
 │   indexed_at[]       event_count × int64  (LE)           │
-│   rendered_at[]      event_count × int64  (LE)           │
 │   kind[]             event_count × uint8                 │
 │   collection_len[]   event_count × uint8                 │
 │   did_len[]          event_count × uint16                │
@@ -327,6 +327,8 @@ Compressed block (single ZSTD frame):
 ```
 
 The `event_count` field is required because record deletions may mean we have fewer than the configured max number of events per block.
+
+Each event carries two timestamps. `witnessed_at` is when this jetstream instance first saw the event; we assign it at ingestion and never change it, and it stays monotonic with the sequence number (our range scans and the `?cursor=<timestamp>` lookback rely on that). `indexed_at` is the "display" timestamp we hand to clients as `time_us`; it defaults to `witnessed_at` and a value of `0` means "not set, fall back to `witnessed_at`". Only a timestamp import (Section 8) writes `indexed_at`. Both are unix microseconds. This is the same two-column layout as before — the columns were previously named `indexed_at` and `rendered_at` — so the block bytes and the segment `version` are unchanged.
 
 The `kind` column is a `uint8` discriminator that identifies which firehose event type each row represents:
 
@@ -352,7 +354,7 @@ In the pebble kv store, we keep track of `compaction/seq`, the highest sequence 
 
 Tombstones are retained as event rows forever. Record tombstones come from `KindDelete` and `KindUpdate`; DID tombstones come from account deletes (`active=false`, `status=deleted`) and `KindSync`. Compaction physically removes only superseded `KindCreate` and `KindUpdate` rows older than the tombstone seq. Delete, account, identity, and sync rows are retained so mid-stream clients and future audit tooling can observe the event history.
 
-Segment rewrites preserve block topology and historical seq/indexed-at envelopes. A block whose rows are all dropped remains present as an `event_count=0` block, so manifest block indexes, cursor translation, and cold replay can continue to use stable block numbers across generations. Rewritten files get new checksums; HTTP downloads derive validators from the file descriptor they serve, and the subscribe block cache keys decoded blocks by segment checksum.
+Segment rewrites preserve block topology and historical seq/witnessed-at envelopes. A block whose rows are all dropped remains present as an `event_count=0` block, so manifest block indexes, cursor translation, and cold replay can continue to use stable block numbers across generations. Rewritten files get new checksums; HTTP downloads derive validators from the file descriptor they serve, and the subscribe block cache keys decoded blocks by segment checksum.
 
 We also store tombstones since the most recent compaction in memory in the server. This is purely a compaction-internal structure — it powers steady-state compaction and early cap-triggered passes (it gates when a pass runs and feeds the size gauge). There is **no read-time overlay endpoint**: the server never exposes the tombstone set to clients and never suppresses rows at delivery time. Backfill clients converge by folding the markers they receive inline (Section 4.4), not by downloading a separate suppression set.
 
@@ -394,7 +396,7 @@ data/
       seg_0000000000.jss
 ```
 
-Segments are named with a counter as a 10-digit zero-padded base-36 string. Segment files and seq ranges sort lexicographically in creation order. This means that all events in segment file 0 have indexed at timestamps before all events in segment file 1.
+Segments are named with a counter as a 10-digit zero-padded base-36 string. Segment files and seq ranges sort lexicographically in creation order. This means that all events in segment file 0 have witnessed at timestamps before all events in segment file 1.
 
 ### 3.5 Metadata Store
 
@@ -572,7 +574,7 @@ An example commit event looks like:
 }
 ```
 
-The `time_us` field is the jetstream v2 instance's own indexed at timestamp for the event in microseconds since the unix epoch. The `cursor` field is jetstream v2's monotonic per-event sequence number (a JSON number); clients that want to resume from a saved point pass `?cursor=N` on reconnect.
+The `time_us` field is the event's display timestamp in microseconds since the unix epoch: the `indexed_at` value if a timestamp import set one, otherwise the `witnessed_at` time jetstream first saw the event (see Section 8). Until an operator runs an import, every event's `time_us` is just its `witnessed_at`. The `cursor` field is jetstream v2's monotonic per-event sequence number (a JSON number); clients that want to resume from a saved point pass `?cursor=N` on reconnect.
 
 For backwards compatibility with jetstream v1, the server also accepts a v1-style unix-microsecond timestamp on the same `?cursor=` query parameter. The two namespaces are distinguished by magnitude: a value strictly less than 1×10^15 is interpreted as a v2 sequence number; a value greater than or equal to 1×10^15 is interpreted as a v1 unix-microsecond timestamp. The split is provably non-overlapping under our 36h lookback ceiling (any legitimate v1 timestamp within 36h of "now" is well above 10^15, and v2 seq won't approach 10^15 for centuries).
 
@@ -670,7 +672,7 @@ The job buckets the URIs by DID, uses the segment and per-block DID blooms to fi
 
 1. **Why store data by indexed timestamp rather than collection?**
 
-> I did a v0 of this system storing data by collection, and it has some nice properties. If you only want to download `app.bsky.feed.post`, it's simple and efficient to do so. However, when creating real-world AppViews, the requirement to replay events in order for a single DID would require a k-way sort if we ordered by collection. That's a deal breaker. Ordering by indexed at timestamp has the property that events within a single DID are ordered in the order in which they were created (though there is no global ordering).
+> I did a v0 of this system storing data by collection, and it has some nice properties. If you only want to download `app.bsky.feed.post`, it's simple and efficient to do so. However, when creating real-world AppViews, the requirement to replay events in order for a single DID would require a k-way sort if we ordered by collection. That's a deal breaker. Ordering by witnessed at timestamp has the property that events within a single DID are ordered in the order in which they were created (though there is no global ordering).
 > 
 1. **What is the latency between a record being read from the live firehose and it being sent to client consumers during steady-state?**
 

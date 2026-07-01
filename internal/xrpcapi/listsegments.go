@@ -48,15 +48,15 @@ func newListSegmentsHandler(src SegmentSource) xrpcserver.Handler {
 		}
 		for _, e := range entries {
 			out.Segments = append(out.Segments, jetstream.JetstreamListSegments_Segment{
-				Name:         ingest.SegmentFilename(e.Idx),
-				Index:        int64(e.Idx),
-				SizeBytes:    e.SizeBytes,
-				Checksum:     checksumHex(e.Checksum),
-				EventCount:   int64(e.EventCount),
-				MinSeq:       int64(e.MinSeq),
-				MaxSeq:       int64(e.MaxSeq),
-				MinIndexedAt: e.MinIndexedAt,
-				MaxIndexedAt: e.MaxIndexedAt,
+				Name:           ingest.SegmentFilename(e.Idx),
+				Index:          int64(e.Idx),
+				SizeBytes:      e.SizeBytes,
+				Checksum:       checksumHex(e.Checksum),
+				EventCount:     int64(e.EventCount),
+				MinSeq:         int64(e.MinSeq),
+				MaxSeq:         int64(e.MaxSeq),
+				MinWitnessedAt: e.MinWitnessedAt,
+				MaxWitnessedAt: e.MaxWitnessedAt,
 			})
 		}
 		if more {

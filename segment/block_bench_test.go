@@ -16,7 +16,7 @@ func makeBenchEvents(b *testing.B, n int, opts benchOpts) []Event {
 	events := make([]Event, n)
 	for i := range events {
 		ev := Event{
-			Seq: uint64(i), IndexedAt: int64(i), Kind: KindCreate,
+			Seq: uint64(i), WitnessedAt: int64(i), Kind: KindCreate,
 			DID: "did:plc:abcdefghijklmnopqrstuvwx",
 		}
 		switch {
@@ -87,8 +87,8 @@ func BenchmarkEncodeColumnsPending(b *testing.B) {
 			p.preallocate(tc.n)
 			for _, ev := range events {
 				p.seq = append(p.seq, ev.Seq)
+				p.witnessedAt = append(p.witnessedAt, ev.WitnessedAt)
 				p.indexedAt = append(p.indexedAt, ev.IndexedAt)
-				p.renderedAt = append(p.renderedAt, ev.RenderedAt)
 				p.kind = append(p.kind, uint8(ev.Kind))
 				p.collLen = append(p.collLen, uint8(len(ev.Collection)))
 				p.didLen = append(p.didLen, uint16(len(ev.DID)))

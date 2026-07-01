@@ -192,13 +192,13 @@ func observeActiveSegment(path string) ([]ObservedEvent, error) {
 
 func observedEventFromSegment(ev segment.Event) ObservedEvent {
 	return ObservedEvent{
-		Seq:        ev.Seq,
-		IndexedAt:  ev.IndexedAt,
-		Kind:       ev.Kind,
-		DID:        ev.DID,
-		Collection: ev.Collection,
-		Rkey:       ev.Rkey,
-		Rev:        ev.Rev,
-		Payload:    append([]byte(nil), ev.Payload...),
+		Seq:         ev.Seq,
+		WitnessedAt: ev.WitnessedAt,
+		Kind:        ev.Kind,
+		DID:         ev.DID,
+		Collection:  ev.Collection,
+		Rkey:        ev.Rkey,
+		Rev:         ev.Rev,
+		Payload:     append([]byte(nil), ev.Payload...),
 	}
 }

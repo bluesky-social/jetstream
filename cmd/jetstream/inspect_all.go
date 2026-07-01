@@ -94,8 +94,8 @@ func renderNetwork(bw *errWriter, n status.NetworkTotals) {
 	bw.printf("  collections:            %d distinct NSIDs\n", n.Collections)
 	if n.Events > 0 {
 		bw.printf("  seq range:              [%d, %d]\n", n.MinSeq, n.MaxSeq)
-		bw.printf("  indexed_at range:       %s → %s\n",
-			formatTime(n.MinIndexedAt), formatTime(n.MaxIndexedAt))
+		bw.printf("  witnessed_at range:       %s → %s\n",
+			formatTime(n.MinWitnessedAt), formatTime(n.MaxWitnessedAt))
 	}
 	bw.printf("  payload (uncompressed): %s\n", format.Bytes(n.UncompressedBytes))
 	bw.printf("  payload (compressed):   %s\n", format.Bytes(n.CompressedBytes))
@@ -123,8 +123,8 @@ func renderTrees(bw *errWriter, trees []status.TreeAggregate) {
 		bw.printf("        blocks:       %s\n", format.Int(t.BlockCount))
 		if t.EventCount > 0 {
 			bw.printf("        seq range:    [%d, %d]\n", t.MinSeq, t.MaxSeq)
-			bw.printf("        indexed_at:   %s → %s\n",
-				formatTime(t.MinIndexedAt), formatTime(t.MaxIndexedAt))
+			bw.printf("        witnessed_at:   %s → %s\n",
+				formatTime(t.MinWitnessedAt), formatTime(t.MaxWitnessedAt))
 		}
 		if !t.OldestMTime.IsZero() {
 			bw.printf("        oldest mtime: %s\n", formatTime(t.OldestMTime))

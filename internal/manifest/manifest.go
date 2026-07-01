@@ -22,12 +22,12 @@ import (
 // file on disk; the four bound fields support cursor-resolution lookups
 // without touching the file again.
 type SegmentBounds struct {
-	Idx          uint64
-	Path         string
-	MinSeq       uint64
-	MaxSeq       uint64
-	MinIndexedAt int64
-	MaxIndexedAt int64
+	Idx            uint64
+	Path           string
+	MinSeq         uint64
+	MaxSeq         uint64
+	MinWitnessedAt int64
+	MaxWitnessedAt int64
 }
 
 // SegmentMetadata is the immutable metadata manifest keeps resident for
@@ -64,8 +64,8 @@ type SegmentTreeStats struct {
 	NewestMTime       time.Time
 	MinSeq            uint64
 	MaxSeq            uint64
-	MinIndexedAt      int64
-	MaxIndexedAt      int64
+	MinWitnessedAt    int64
+	MaxWitnessedAt    int64
 	LatestSegment     *SegmentSummary
 	Collections       []CollectionStats
 }
@@ -79,8 +79,8 @@ type SegmentSummary struct {
 	CollectionCount int
 	MinSeq          uint64
 	MaxSeq          uint64
-	MinIndexedAt    int64
-	MaxIndexedAt    int64
+	MinWitnessedAt  int64
+	MaxWitnessedAt  int64
 	SizeBytes       int64
 }
 
@@ -95,14 +95,14 @@ type CollectionStats struct {
 // SegmentListEntry is the lightweight per-segment row returned by ListFrom.
 // It deliberately excludes blooms, block indexes, and the file path.
 type SegmentListEntry struct {
-	Idx          uint64
-	SizeBytes    int64
-	Checksum     uint64
-	EventCount   uint32
-	MinSeq       uint64
-	MaxSeq       uint64
-	MinIndexedAt int64
-	MaxIndexedAt int64
+	Idx            uint64
+	SizeBytes      int64
+	Checksum       uint64
+	EventCount     uint32
+	MinSeq         uint64
+	MaxSeq         uint64
+	MinWitnessedAt int64
+	MaxWitnessedAt int64
 }
 
 // SegmentFileRef is what a download handler needs to serve one sealed
@@ -372,14 +372,14 @@ func (m *Manifest) ListFrom(startIdx uint64, limit int) (entries []SegmentListEn
 	for i := start; i < end; i++ {
 		meta := &m.segments[i]
 		entries = append(entries, SegmentListEntry{
-			Idx:          meta.Idx,
-			SizeBytes:    meta.FileSize,
-			Checksum:     meta.Header.Checksum,
-			EventCount:   meta.Header.EventCount,
-			MinSeq:       meta.Header.MinSeq,
-			MaxSeq:       meta.Header.MaxSeq,
-			MinIndexedAt: meta.Header.MinIndexedAt,
-			MaxIndexedAt: meta.Header.MaxIndexedAt,
+			Idx:            meta.Idx,
+			SizeBytes:      meta.FileSize,
+			Checksum:       meta.Header.Checksum,
+			EventCount:     meta.Header.EventCount,
+			MinSeq:         meta.Header.MinSeq,
+			MaxSeq:         meta.Header.MaxSeq,
+			MinWitnessedAt: meta.Header.MinWitnessedAt,
+			MaxWitnessedAt: meta.Header.MaxWitnessedAt,
 		})
 	}
 
@@ -420,11 +420,11 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 			if meta.Header.MaxSeq > stats.MaxSeq {
 				stats.MaxSeq = meta.Header.MaxSeq
 			}
-			if stats.MinIndexedAt == 0 || meta.Header.MinIndexedAt < stats.MinIndexedAt {
-				stats.MinIndexedAt = meta.Header.MinIndexedAt
+			if stats.MinWitnessedAt == 0 || meta.Header.MinWitnessedAt < stats.MinWitnessedAt {
+				stats.MinWitnessedAt = meta.Header.MinWitnessedAt
 			}
-			if meta.Header.MaxIndexedAt > stats.MaxIndexedAt {
-				stats.MaxIndexedAt = meta.Header.MaxIndexedAt
+			if meta.Header.MaxWitnessedAt > stats.MaxWitnessedAt {
+				stats.MaxWitnessedAt = meta.Header.MaxWitnessedAt
 			}
 		}
 		if meta.ModTime.Before(stats.OldestMTime) {
@@ -472,8 +472,8 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 		CollectionCount: len(latest.Collections),
 		MinSeq:          latest.Header.MinSeq,
 		MaxSeq:          latest.Header.MaxSeq,
-		MinIndexedAt:    latest.Header.MinIndexedAt,
-		MaxIndexedAt:    latest.Header.MaxIndexedAt,
+		MinWitnessedAt:  latest.Header.MinWitnessedAt,
+		MaxWitnessedAt:  latest.Header.MaxWitnessedAt,
 		SizeBytes:       latest.FileSize,
 	}
 	stats.Collections = make([]CollectionStats, 0, len(collections))
@@ -525,12 +525,12 @@ func readSealedMetadata(idx uint64, path string, verifyChecksum bool) (SegmentMe
 
 	return SegmentMetadata{
 		SegmentBounds: SegmentBounds{
-			Idx:          idx,
-			Path:         path,
-			MinSeq:       h.MinSeq,
-			MaxSeq:       h.MaxSeq,
-			MinIndexedAt: h.MinIndexedAt,
-			MaxIndexedAt: h.MaxIndexedAt,
+			Idx:            idx,
+			Path:           path,
+			MinSeq:         h.MinSeq,
+			MaxSeq:         h.MaxSeq,
+			MinWitnessedAt: h.MinWitnessedAt,
+			MaxWitnessedAt: h.MaxWitnessedAt,
 		},
 		FileSize:              info.Size(),
 		ModTime:               info.ModTime(),
@@ -585,15 +585,15 @@ func (m *Manifest) SegmentForSeq(seq uint64) (SegmentBounds, bool) {
 }
 
 // SegmentForTimeUS returns the smallest sealed segment whose
-// MaxIndexedAt >= timeUS. If timeUS is older than every sealed
+// MaxWitnessedAt >= timeUS. If timeUS is older than every sealed
 // segment, returns the first segment (caller then clamps to the
 // lookback floor). Returns (zero, false) only if timeUS is newer
 // than every sealed segment, or the manifest is empty.
 //
 // Timestamp ranges across segments may overlap slightly in the
 // presence of clock skew on the upstream relay; we still pick the
-// smallest segment whose MaxIndexedAt covers the request, which
-// gives the earliest possible event with indexed_at >= timeUS.
+// smallest segment whose MaxWitnessedAt covers the request, which
+// gives the earliest possible event with witnessed_at >= timeUS.
 func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
 	if err := m.waitReady(); err != nil {
 		return SegmentBounds{}, false
@@ -604,7 +604,7 @@ func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
 		return SegmentBounds{}, false
 	}
 	i := sort.Search(len(m.segments), func(i int) bool {
-		return m.segments[i].MaxIndexedAt >= timeUS
+		return m.segments[i].MaxWitnessedAt >= timeUS
 	})
 	if i == len(m.segments) {
 		return SegmentBounds{}, false
@@ -616,9 +616,9 @@ func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
 // retained under the given lookback duration, computed against the
 // segment bounds and the current wall clock.
 //
-// The result is conservative: we return the MinSeq / MinIndexedAt of
+// The result is conservative: we return the MinSeq / MinWitnessedAt of
 // the segment that contains (or is newer than) the floor timestamp,
-// not the exact event with indexed_at >= floor. This means cursor
+// not the exact event with witnessed_at >= floor. This means cursor
 // clamps may yield up to one segment's worth of extra lookback,
 // never less.
 //
@@ -636,15 +636,15 @@ func (m *Manifest) LookbackFloor(lookback time.Duration) (uint64, int64) {
 	}
 	floorTimeUS := time.Now().UnixMicro() - lookback.Microseconds()
 	i := sort.Search(len(m.segments), func(i int) bool {
-		return m.segments[i].MaxIndexedAt >= floorTimeUS
+		return m.segments[i].MaxWitnessedAt >= floorTimeUS
 	})
 	if i == len(m.segments) {
 		// All segments are older than the floor; clamp to the freshest
 		// segment's MinSeq (lookback is shorter than retention skew).
 		last := m.segments[len(m.segments)-1]
-		return last.MinSeq, last.MinIndexedAt
+		return last.MinSeq, last.MinWitnessedAt
 	}
-	return m.segments[i].MinSeq, m.segments[i].MinIndexedAt
+	return m.segments[i].MinSeq, m.segments[i].MinWitnessedAt
 }
 
 // OnSegmentSealed publishes a freshly-sealed segment into the manifest.

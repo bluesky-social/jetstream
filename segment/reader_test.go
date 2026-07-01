@@ -35,9 +35,9 @@ func TestReaderOpenSucceeds(t *testing.T) {
 
 	dir := t.TempDir()
 	events := []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a",
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a",
 			Collection: "app.bsky.feed.post", Rkey: "k1", Rev: "v1"},
-		{Seq: 2, IndexedAt: 200, Kind: KindCreate, DID: "did:plc:b",
+		{Seq: 2, WitnessedAt: 200, Kind: KindCreate, DID: "did:plc:b",
 			Collection: "app.bsky.feed.like", Rkey: "k2", Rev: "v2"},
 	}
 	path := sealedSegmentForReader(t, dir, events, 2)
@@ -166,13 +166,13 @@ func TestReaderDecodeBlockReturnsEvents(t *testing.T) {
 
 	dir := t.TempDir()
 	events := []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a",
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a",
 			Collection: "app.bsky.feed.post", Rkey: "k1", Rev: "v1",
 			Payload: []byte("p1")},
-		{Seq: 2, IndexedAt: 200, Kind: KindCreate, DID: "did:plc:b",
+		{Seq: 2, WitnessedAt: 200, Kind: KindCreate, DID: "did:plc:b",
 			Collection: "app.bsky.feed.like", Rkey: "k2", Rev: "v2",
 			Payload: []byte("p2")},
-		{Seq: 3, IndexedAt: 300, Kind: KindUpdate, DID: "did:plc:a",
+		{Seq: 3, WitnessedAt: 300, Kind: KindUpdate, DID: "did:plc:a",
 			Collection: "app.bsky.feed.post", Rkey: "k1", Rev: "v3",
 			Payload: []byte("p3")},
 	}
@@ -637,21 +637,21 @@ func TestReaderConcurrentDecodeBlock(t *testing.T) {
 	}
 }
 
-// TestReaderOpenRejectsInvertedIndexedAtBounds asserts the
+// TestReaderOpenRejectsInvertedWitnessedAtBounds asserts the
 // validateBlockOffsets pass refuses a file whose block-index entry
-// has max_indexed_at < min_indexed_at. Mirrors the existing seq
+// has max_witnessed_at < min_witnessed_at. Mirrors the existing seq
 // invariant test pattern.
-func TestReaderOpenRejectsInvertedIndexedAtBounds(t *testing.T) {
+func TestReaderOpenRejectsInvertedWitnessedAtBounds(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	path := sealedSegmentForReader(t, dir, []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
-		{Seq: 2, IndexedAt: 200, Kind: KindCreate, DID: "did:plc:b"},
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, WitnessedAt: 200, Kind: KindCreate, DID: "did:plc:b"},
 	}, 2)
 
-	// Patch the FIRST block-index entry's max_indexed_at to a value
-	// less than its min_indexed_at. The two indexed_at fields live at
+	// Patch the FIRST block-index entry's max_witnessed_at to a value
+	// less than its min_witnessed_at. The two witnessed_at fields live at
 	// entry-relative offsets [36:44] and [44:52].
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	require.NoError(t, err)
@@ -686,13 +686,13 @@ func TestReader_CollectionEventCounts(t *testing.T) {
 	// 3 posts, 2 likes, 1 follow → 6 events with non-empty Collection.
 	// Plus one Identity event with empty Collection that must NOT count.
 	events := []Event{
-		{Seq: 1, IndexedAt: 1_000_000, Kind: KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "1", Rev: "r"},
-		{Seq: 2, IndexedAt: 1_000_001, Kind: KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "2", Rev: "r"},
-		{Seq: 3, IndexedAt: 1_000_002, Kind: KindCreate, DID: "did:plc:c", Collection: "app.bsky.feed.post", Rkey: "3", Rev: "r"},
-		{Seq: 4, IndexedAt: 1_000_003, Kind: KindCreate, DID: "did:plc:d", Collection: "app.bsky.feed.like", Rkey: "4", Rev: "r"},
-		{Seq: 5, IndexedAt: 1_000_004, Kind: KindCreate, DID: "did:plc:e", Collection: "app.bsky.feed.like", Rkey: "5", Rev: "r"},
-		{Seq: 6, IndexedAt: 1_000_005, Kind: KindCreate, DID: "did:plc:f", Collection: "app.bsky.graph.follow", Rkey: "6", Rev: "r"},
-		{Seq: 7, IndexedAt: 1_000_006, Kind: KindIdentity, DID: "did:plc:a"},
+		{Seq: 1, WitnessedAt: 1_000_000, Kind: KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "1", Rev: "r"},
+		{Seq: 2, WitnessedAt: 1_000_001, Kind: KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "2", Rev: "r"},
+		{Seq: 3, WitnessedAt: 1_000_002, Kind: KindCreate, DID: "did:plc:c", Collection: "app.bsky.feed.post", Rkey: "3", Rev: "r"},
+		{Seq: 4, WitnessedAt: 1_000_003, Kind: KindCreate, DID: "did:plc:d", Collection: "app.bsky.feed.like", Rkey: "4", Rev: "r"},
+		{Seq: 5, WitnessedAt: 1_000_004, Kind: KindCreate, DID: "did:plc:e", Collection: "app.bsky.feed.like", Rkey: "5", Rev: "r"},
+		{Seq: 6, WitnessedAt: 1_000_005, Kind: KindCreate, DID: "did:plc:f", Collection: "app.bsky.graph.follow", Rkey: "6", Rev: "r"},
+		{Seq: 7, WitnessedAt: 1_000_006, Kind: KindIdentity, DID: "did:plc:a"},
 	}
 	for _, ev := range events {
 		full, err := w.Append(ev)

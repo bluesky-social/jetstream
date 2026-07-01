@@ -16,7 +16,7 @@ func TestColdReadBatch_BoundedAndResumes(t *testing.T) {
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 99, minIndexedAt: 1_000, maxIndexedAt: 100_000, eventCount: 100,
+		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_000, maxWitnessedAt: 100_000, eventCount: 100,
 	})
 	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 100)
@@ -47,7 +47,7 @@ func TestColdReadBatch_ExhaustsBeforeMax(t *testing.T) {
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 10)

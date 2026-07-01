@@ -20,7 +20,7 @@ type Inspection struct {
 
 	// Header is fully populated when Sealed. For active files the
 	// fields are zero; the ones that are still meaningful (block
-	// counts, seq/indexed_at ranges, etc.) live on the dedicated
+	// counts, seq/witnessed_at ranges, etc.) live on the dedicated
 	// fields below.
 	Header Header
 
@@ -48,8 +48,8 @@ type Inspection struct {
 	TotalEvents    uint64
 	UniqueDIDCount uint32
 	MinSeq, MaxSeq uint64
-	MinIndexedAt   int64
-	MaxIndexedAt   int64
+	MinWitnessedAt int64
+	MaxWitnessedAt int64
 
 	// Footer-section sizes; zero for active files.
 	BlockIndexBytes      uint64
@@ -171,8 +171,8 @@ func inspectSealed(path string, fileSize int64, headerBytes []byte) (*Inspection
 		UniqueDIDCount:        header.UniqueDIDCount,
 		MinSeq:                header.MinSeq,
 		MaxSeq:                header.MaxSeq,
-		MinIndexedAt:          header.MinIndexedAt,
-		MaxIndexedAt:          header.MaxIndexedAt,
+		MinWitnessedAt:        header.MinWitnessedAt,
+		MaxWitnessedAt:        header.MaxWitnessedAt,
 		BlockIndexBytes:       blockIndexBytes,
 		SegmentBloomBytes:     segmentBloomBytes,
 		BlockBloomsBytes:      blockBloomsBytes,
@@ -226,8 +226,8 @@ func inspectActive(path string, f *os.File, fileSize int64) (*Inspection, error)
 		UniqueDIDCount:        uint32(len(walk.uniqueDIDs)),
 		MinSeq:                walk.minSeq,
 		MaxSeq:                walk.maxSeq,
-		MinIndexedAt:          walk.minIndexedAt,
-		MaxIndexedAt:          walk.maxIndexedAt,
+		MinWitnessedAt:        walk.minWitnessedAt,
+		MaxWitnessedAt:        walk.maxWitnessedAt,
 	}
 	if walkErr != nil {
 		ins.PartialError = walkErr

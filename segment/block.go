@@ -50,8 +50,8 @@ func ValidateEvent(ev Event) error {
 type columns interface {
 	Len() int
 	Seq(i int) uint64
+	WitnessedAt(i int) int64
 	IndexedAt(i int) int64
-	RenderedAt(i int) int64
 	Kind(i int) uint8
 
 	CollectionLen(i int) uint8
@@ -100,10 +100,10 @@ func encodeBlockInto(dst []byte, c columns) []byte {
 		dst = le.AppendUint64(dst, c.Seq(i))
 	}
 	for i := range n {
-		dst = le.AppendUint64(dst, uint64(c.IndexedAt(i)))
+		dst = le.AppendUint64(dst, uint64(c.WitnessedAt(i)))
 	}
 	for i := range n {
-		dst = le.AppendUint64(dst, uint64(c.RenderedAt(i)))
+		dst = le.AppendUint64(dst, uint64(c.IndexedAt(i)))
 	}
 	for i := range n {
 		dst = append(dst, c.Kind(i))
@@ -153,8 +153,8 @@ type eventColumns []Event
 
 func (e eventColumns) Len() int                  { return len(e) }
 func (e eventColumns) Seq(i int) uint64          { return e[i].Seq }
+func (e eventColumns) WitnessedAt(i int) int64   { return e[i].WitnessedAt }
 func (e eventColumns) IndexedAt(i int) int64     { return e[i].IndexedAt }
-func (e eventColumns) RenderedAt(i int) int64    { return e[i].RenderedAt }
 func (e eventColumns) Kind(i int) uint8          { return uint8(e[i].Kind) }
 func (e eventColumns) CollectionLen(i int) uint8 { return uint8(len(e[i].Collection)) }
 func (e eventColumns) DIDLen(i int) uint16       { return uint16(len(e[i].DID)) }
@@ -327,6 +327,15 @@ func decodeBlock(buf []byte) ([]Event, error) {
 		events[i].Seq = le.Uint64(chunk[i*8 : i*8+8])
 	}
 
+	// witnessed_at[]
+	chunk, err = read(nEvents * 8)
+	if err != nil {
+		return nil, err
+	}
+	for i := range nEvents {
+		events[i].WitnessedAt = int64(le.Uint64(chunk[i*8 : i*8+8]))
+	}
+
 	// indexed_at[]
 	chunk, err = read(nEvents * 8)
 	if err != nil {
@@ -334,15 +343,6 @@ func decodeBlock(buf []byte) ([]Event, error) {
 	}
 	for i := range nEvents {
 		events[i].IndexedAt = int64(le.Uint64(chunk[i*8 : i*8+8]))
-	}
-
-	// rendered_at[]
-	chunk, err = read(nEvents * 8)
-	if err != nil {
-		return nil, err
-	}
-	for i := range nEvents {
-		events[i].RenderedAt = int64(le.Uint64(chunk[i*8 : i*8+8]))
 	}
 
 	// kind[]

@@ -8,7 +8,7 @@ network totals:
   events:                 1,234
   collections:            3 distinct NSIDs
   seq range:              [10, 1243]
-  indexed_at range:       2026-05-27T00:00:00.000000Z → 2026-05-28T00:00:00.000000Z
+  witnessed_at range:       2026-05-27T00:00:00.000000Z → 2026-05-28T00:00:00.000000Z
   payload (uncompressed): 6.00 MiB
   payload (compressed):   2.00 MiB
   disk usage:             3.00 MiB
@@ -20,7 +20,7 @@ trees:
         events:       1,234
         blocks:       12
         seq range:    [10, 1243]
-        indexed_at:   2026-05-27T00:00:00.000000Z → 2026-05-28T00:00:00.000000Z
+        witnessed_at:   2026-05-27T00:00:00.000000Z → 2026-05-28T00:00:00.000000Z
         oldest mtime: 2026-05-27T00:01:00.000000Z
         newest mtime: 2026-05-28T00:01:00.000000Z
         compressed:   2.00 MiB

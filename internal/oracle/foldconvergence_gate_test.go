@@ -111,24 +111,24 @@ func TestFoldConvergence_CollectionFilteredDIDTombstoneGap(t *testing.T) {
 	segDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 	createC := segment.Event{
-		Seq:        1,
-		IndexedAt:  int64(1_730_000_000_000_000 + 1),
-		Kind:       segment.KindCreate,
-		DID:        gateVictimDID,
-		Collection: gateCollection,
-		Rkey:       "rkey",
-		Rev:        "rev1",
-		Payload:    []byte{0xa0}, // empty DAG-CBOR map; decodes cleanly in map mode
+		Seq:         1,
+		WitnessedAt: int64(1_730_000_000_000_000 + 1),
+		Kind:        segment.KindCreate,
+		DID:         gateVictimDID,
+		Collection:  gateCollection,
+		Rkey:        "rkey",
+		Rev:         "rev1",
+		Payload:     []byte{0xa0}, // empty DAG-CBOR map; decodes cleanly in map mode
 	}
 	// D is the DID-level account-delete: empty collection on the wire, but the
 	// seal index tags its block with the $account sentinel so a
 	// collection-filtered plan still selects it.
 	deleteD := segment.Event{
-		Seq:       2,
-		IndexedAt: int64(1_730_000_000_000_000 + 2),
-		Kind:      segment.KindAccount,
-		DID:       gateVictimDID,
-		Payload:   oracleAccountPayload(t, false, "deleted"),
+		Seq:         2,
+		WitnessedAt: int64(1_730_000_000_000_000 + 2),
+		Kind:        segment.KindAccount,
+		DID:         gateVictimDID,
+		Payload:     oracleAccountPayload(t, false, "deleted"),
 	}
 	writeSealedSegment(t, segDir, 0, createC)
 	writeSealedSegment(t, segDir, 1, deleteD)

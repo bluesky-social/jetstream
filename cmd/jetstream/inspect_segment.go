@@ -104,8 +104,8 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 		bw.printf("  unique_did_count:  %d (from walk; not durable until seal)\n", ins.UniqueDIDCount)
 	}
 	bw.printf("  seq range:         [%d, %d]\n", ins.MinSeq, ins.MaxSeq)
-	bw.printf("  indexed_at range:  [%s, %s]\n",
-		formatMicros(ins.MinIndexedAt), formatMicros(ins.MaxIndexedAt))
+	bw.printf("  witnessed_at range:  [%s, %s]\n",
+		formatMicros(ins.MinWitnessedAt), formatMicros(ins.MaxWitnessedAt))
 
 	bw.printf("\n")
 	if ins.Sealed {
@@ -184,7 +184,7 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 	}
 
 	bw.printf("\nblocks (%d total):\n", len(ins.Blocks))
-	bw.printf("  idx       offset  comp_size  uncomp_size  events     min_seq     max_seq                  min_indexed_at                  max_indexed_at  cols\n")
+	bw.printf("  idx       offset  comp_size  uncomp_size  events     min_seq     max_seq                  min_witnessed_at                  max_witnessed_at  cols\n")
 
 	emitRow := func(i int) {
 		b := ins.Blocks[i]
@@ -195,7 +195,7 @@ func renderInspection(w io.Writer, ins *segment.Inspection, blocksMode string, b
 		bw.printf("  %3d  0x%010x  %9d  %11d  %6d  %10d  %10d  %30s  %30s  %4d\n",
 			i, b.Offset, b.CompressedSize, b.UncompressedSize,
 			b.EventCount, b.MinSeq, b.MaxSeq,
-			formatMicros(b.MinIndexedAt), formatMicros(b.MaxIndexedAt),
+			formatMicros(b.MinWitnessedAt), formatMicros(b.MaxWitnessedAt),
 			cols)
 		if blocksMode == "full" && i < len(ins.BlockCollections) && len(ins.BlockCollections[i]) > 0 {
 			names := make([]string, 0, len(ins.BlockCollections[i]))

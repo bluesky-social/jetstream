@@ -3,7 +3,7 @@
 Date: 2026-07-01
 Branch: `timestamp-import-design` (design); impl branches per milestone (§9)
 Tracking issue: [#193](https://github.com/bluesky-social/jetstream/issues/193)
-Status: design DONE + §8 rewritten; implementation NOT STARTED
+Status: design DONE + §8 rewritten; impl M0–M1 DONE (rename landed), M2+ pending
 Author: jcalabro (with Claude)
 
 > This is the **living document** for **§8 Timestamp Import** of `docs/README.md`.
@@ -682,37 +682,52 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 - [x] `docs/README.md` §8 rewrite + drop resolved TODO. — commit `e6c926d`
 - [x] Tracking issue #193.
 
-### M1 — The rename (no behavior change, no format change)
+### M1 — The rename (no behavior change, no format change)  ✅ DONE
 > Pure code/comment/wire rename. Lands first and alone so the diff is reviewable
 > as "nothing changed but names." Format bytes untouched; goldens keep their bytes.
-> Do the two mappings **atomically** (they collide — see §6a): `RenderedAt →
-> IndexedAt` and `IndexedAt → WitnessedAt` in one pass.
+> Did the two mappings via an **ordered** textual sweep (not per-symbol gopls,
+> since every token is globally unique + must rename): `IndexedAt → WitnessedAt`
+> fully first, then `RenderedAt → IndexedAt` (once step 1 leaves zero `IndexedAt`
+> tokens, step 2 can't collide). Compiler + full `-race` suite + byte-golden are
+> the safety net.
 
-- [ ] **`segment/`**: `Event.IndexedAt → WitnessedAt`, `Event.RenderedAt →
+- [x] **`segment/`**: `Event.IndexedAt → WitnessedAt`, `Event.RenderedAt →
   IndexedAt`; block encode/decode column comments (`block.go` "indexed_at[]" →
   "witnessed_at[]", "rendered_at[]" → "indexed_at[]"); `eventColumns` +
-  `pendingBlock` accessors; `event.go` doc (`RenderedAt == 0` → `IndexedAt == 0`
-  sentinel on the *display* column).
-- [ ] **Header/footer/seal**: `Header.{Min,Max}IndexedAt → {Min,Max}WitnessedAt`;
+  `pendingBlock` accessors; `event.go` doc. **Physical column order preserved**
+  (`seq`, `witnessed_at`, `indexed_at`) — verified byte-identical.
+- [x] **Header/footer/seal**: `Header.{Min,Max}IndexedAt → {Min,Max}WitnessedAt`;
   `BlockInfo.{Min,Max}IndexedAt`; `SealResult.*`; `seal.go` envelope fill reads
   `ev.WitnessedAt`.
-- [ ] **`internal/manifest`**: all `{Min,Max}IndexedAt` → `WitnessedAt`;
+- [x] **`internal/manifest`**: all `{Min,Max}IndexedAt` → `WitnessedAt`;
   `SegmentForTimeUS` doc/comments say "witnessed".
-- [ ] **`internal/subscribe`**: `cursor.go translateTimeUSToSeq` scan + comments
-  (searches `WitnessedAt`); `encoder.go` `TimeUS` now = **display** resolver, not
-  raw field (see M2 for the resolver — here just rename the field it reads and add
-  a TODO, or land M2's resolver in the same milestone; decide at impl time).
-- [ ] **`internal/status`, `cmd/jetstream/inspect_*`**: envelope fields + any
-  status-page column headers / labels.
-- [ ] **Lexicon + regen (Q-WIRE-NAMES)**: `lexicons/network/bsky/jetstream/
-  listSegments.json` `minIndexedAt/maxIndexedAt → minWitnessedAt/maxWitnessedAt`
-  (+ descriptions); regenerate `api/jetstream` via lexgen (do **not** hand-edit).
-- [ ] **Tests/goldens/fuzz/bench**: rename field setters + comments; confirm
-  golden *bytes* unchanged (proves no format change).
-- [ ] **Docs**: `docs/README.md` §3.2 column list, §3.1.2 header
-  (`min/max_witnessed_at`), §5.1 `time_us` clarification.
-- [ ] Full suite + `-race` + lint green; grep proves zero stray `RenderedAt` /
-  old-meaning `IndexedAt`.
+- [x] **`internal/subscribe`**: `cursor.go translateTimeUSToSeq` scan + comments
+  (searches `WitnessedAt`). NOTE: `encoder.go` `TimeUS` still reads the renamed
+  raw field (now `evt.WitnessedAt`) — the **display resolver is M2**, deferred so
+  M1 stays behavior-preserving. (Pre-import display==witnessed, so no behavior
+  change either way, but keeping it in M2 keeps M1 a pure rename.)
+- [x] **`internal/status`, `cmd/jetstream/inspect_*`**: envelope fields + inspect
+  printf labels (`witnessed_at range`); regenerated `inspect_all_basic.golden`.
+- [x] **`internal/web`**: `status.html` template fields `.MinIndexedAt →
+  .MinWitnessedAt` + user label "Indexed range" → "Witnessed range"; test
+  assertion updated. (`.html` was missed in the first `.go`-only sweep — caught by
+  the web tests.)
+- [x] **Lexicon + regen (Q-WIRE-NAMES)**: `listSegments.json`
+  `minIndexedAt/maxIndexedAt → minWitnessedAt/maxWitnessedAt` (+ descriptions);
+  regenerated `api/jetstream` via `just lexgen`.
+- [x] **Tests/goldens/fuzz/bench**: renamed field setters + comments; **golden
+  `testdata/golden_block.bin` bytes unchanged** (NOT regenerated — the pre-rename
+  fixture still matches post-rename encode output, proving the 4.5-day archive
+  reads correctly). `inspect_all_basic.golden` regenerated for the label change.
+- [x] **Docs**: `docs/README.md` §3.2 column list + new two-timestamp paragraph
+  (states layout/version unchanged), §3.1.2 header (`min/max_witnessed_at`), §5.1
+  `time_us` clarification, prose (segment ordering, FAQ), root `event.go` client
+  `TimeUS` comment.
+- [x] Full suite (`go test ./...`) + lint (`golangci-lint`, gofmt) green; byte
+  goldens (`TestGolden`, `TestSealGolden`) pass; grep proves zero stray
+  `RenderedAt` and zero old-meaning envelope tokens. (`-race`: pre-existing
+  atmos-streaming iterator flake under parallel load in `internal/ingest/live`,
+  unrelated to rename — passes in isolation.)
 
 ### M2 — Display resolver on the wire (`time_us = imported ?: witnessed`)
 > Tiny, but it's the first behavioral change. Safe: identical to today until an

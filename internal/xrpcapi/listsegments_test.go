@@ -15,15 +15,15 @@ import (
 type listResp struct {
 	Cursor   string `json:"cursor"`
 	Segments []struct {
-		Name         string `json:"name"`
-		Index        int64  `json:"index"`
-		SizeBytes    int64  `json:"sizeBytes"`
-		Checksum     string `json:"checksum"`
-		EventCount   int64  `json:"eventCount"`
-		MinSeq       int64  `json:"minSeq"`
-		MaxSeq       int64  `json:"maxSeq"`
-		MinIndexedAt int64  `json:"minIndexedAt"`
-		MaxIndexedAt int64  `json:"maxIndexedAt"`
+		Name           string `json:"name"`
+		Index          int64  `json:"index"`
+		SizeBytes      int64  `json:"sizeBytes"`
+		Checksum       string `json:"checksum"`
+		EventCount     int64  `json:"eventCount"`
+		MinSeq         int64  `json:"minSeq"`
+		MaxSeq         int64  `json:"maxSeq"`
+		MinWitnessedAt int64  `json:"minWitnessedAt"`
+		MaxWitnessedAt int64  `json:"maxWitnessedAt"`
 	} `json:"segments"`
 }
 

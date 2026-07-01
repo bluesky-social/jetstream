@@ -129,7 +129,7 @@ func TestDecodeFrameSlabAllocations(t *testing.T) {
 		require.NoError(t, err)
 		for i := range n {
 			_, err := w.Append(segment.Event{
-				Seq: uint64(i + 1), IndexedAt: int64(i + 1), Kind: segment.KindDelete,
+				Seq: uint64(i + 1), WitnessedAt: int64(i + 1), Kind: segment.KindDelete,
 				DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r" + strconv.Itoa(i), Rev: "rev",
 			})
 			require.NoError(t, err)
@@ -173,12 +173,12 @@ func TestDecodeFrameSlabAllocations(t *testing.T) {
 
 func identityRow(t *testing.T, seq uint64, did string) segment.Event {
 	t.Helper()
-	return segment.Event{Seq: seq, IndexedAt: int64(seq), Kind: segment.KindIdentity, DID: did, Payload: identityPayload(t, did)}
+	return segment.Event{Seq: seq, WitnessedAt: int64(seq), Kind: segment.KindIdentity, DID: did, Payload: identityPayload(t, did)}
 }
 
 func accountRow(t *testing.T, seq uint64, did string) segment.Event {
 	t.Helper()
-	return segment.Event{Seq: seq, IndexedAt: int64(seq), Kind: segment.KindAccount, DID: did, Payload: accountActivePayload(t, did)}
+	return segment.Event{Seq: seq, WitnessedAt: int64(seq), Kind: segment.KindAccount, DID: did, Payload: accountActivePayload(t, did)}
 }
 
 func identityPayload(t *testing.T, did string) []byte {

@@ -14,11 +14,11 @@ func seedN(t *testing.T, dir string, n int) {
 	for i := range n {
 		base := uint64(i)*100 + 1
 		mustWriteSealedSegment(t, filepath.Join(dir, ingest.SegmentFilename(uint64(i))), sealedFixture{
-			minSeq:       base,
-			maxSeq:       base + 9,
-			minIndexedAt: 1_700_000_000_000_000 + int64(i)*1_000_000,
-			maxIndexedAt: 1_700_000_000_000_000 + int64(i)*1_000_000 + 500_000,
-			eventCount:   10,
+			minSeq:         base,
+			maxSeq:         base + 9,
+			minWitnessedAt: 1_700_000_000_000_000 + int64(i)*1_000_000,
+			maxWitnessedAt: 1_700_000_000_000_000 + int64(i)*1_000_000 + 500_000,
+			eventCount:     10,
 		})
 	}
 }
@@ -109,11 +109,11 @@ func TestManifest_ListFrom_NonContiguousIndices(t *testing.T) {
 	for _, idx := range []uint64{0, 1, 5, 10} {
 		base := idx*100 + 1
 		mustWriteSealedSegment(t, filepath.Join(dir, ingest.SegmentFilename(idx)), sealedFixture{
-			minSeq:       base,
-			maxSeq:       base + 9,
-			minIndexedAt: 1_700_000_000_000_000 + int64(idx)*1_000_000,
-			maxIndexedAt: 1_700_000_000_000_000 + int64(idx)*1_000_000 + 500_000,
-			eventCount:   10,
+			minSeq:         base,
+			maxSeq:         base + 9,
+			minWitnessedAt: 1_700_000_000_000_000 + int64(idx)*1_000_000,
+			maxWitnessedAt: 1_700_000_000_000_000 + int64(idx)*1_000_000 + 500_000,
+			eventCount:     10,
 		})
 	}
 	m := mustOpenManifest(t, dir)

@@ -82,8 +82,8 @@ func newFixtureSnap() *status.Snapshot {
 						CollectionCount: 3,
 						MinSeq:          100,
 						MaxSeq:          1233,
-						MinIndexedAt:    time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
-						MaxIndexedAt:    time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+						MinWitnessedAt:  time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
+						MaxWitnessedAt:  time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
 						SizeBytes:       512 * 1024,
 					},
 				},
@@ -107,8 +107,8 @@ func newFixtureSnap() *status.Snapshot {
 				DiskBytes:         5 * 1024 * 1024,
 				MinSeq:            100,
 				MaxSeq:            1233,
-				MinIndexedAt:      time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
-				MaxIndexedAt:      time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+				MinWitnessedAt:    time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
+				MaxWitnessedAt:    time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
 			},
 		},
 		Pebble: status.PebbleStats{
@@ -199,7 +199,7 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "12,345")       // Network event count via humanInt
 	require.Contains(t, body, "[100, 1,233]") // Seq range
 	require.Contains(t, body, "2026-05-24")
-	require.Contains(t, body, "Indexed range")
+	require.Contains(t, body, "Witnessed range")
 	require.Contains(t, body, "overflow-wrap: anywhere")
 	require.Contains(t, body, "Segment Files")
 	require.NotContains(t, body, "Top failing hosts")

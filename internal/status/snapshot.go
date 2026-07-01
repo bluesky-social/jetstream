@@ -137,8 +137,8 @@ type SegmentSummary struct {
 	CollectionCount int
 	MinSeq          uint64
 	MaxSeq          uint64
-	MinIndexedAt    time.Time
-	MaxIndexedAt    time.Time
+	MinWitnessedAt  time.Time
+	MaxWitnessedAt  time.Time
 	SizeBytes       int64
 }
 

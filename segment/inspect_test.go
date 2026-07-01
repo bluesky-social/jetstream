@@ -17,11 +17,11 @@ func makeSealedFixture(t *testing.T, dir string) (string, SealResult) {
 	w, err := New(Config{Path: path, MaxEventsPerBlock: 4})
 	require.NoError(t, err)
 	events := []Event{
-		{Seq: 1, IndexedAt: 1_000_000, Kind: KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "a", Rev: "r1", Payload: []byte("p1")},
-		{Seq: 2, IndexedAt: 1_000_001, Kind: KindCreate, DID: "did:plc:bob", Collection: "app.bsky.feed.post", Rkey: "b", Rev: "r2", Payload: []byte("p2")},
-		{Seq: 3, IndexedAt: 1_000_002, Kind: KindCreate, DID: "did:plc:carol", Collection: "app.bsky.feed.like", Rkey: "c", Rev: "r3", Payload: []byte("p3")},
-		{Seq: 4, IndexedAt: 1_000_003, Kind: KindUpdate, DID: "did:plc:alice", Collection: "app.bsky.feed.like", Rkey: "d", Rev: "r4", Payload: []byte("p4")},
-		{Seq: 5, IndexedAt: 1_000_004, Kind: KindCreate, DID: "did:plc:dan", Collection: "app.bsky.graph.follow", Rkey: "e", Rev: "r5", Payload: []byte("p5")},
+		{Seq: 1, WitnessedAt: 1_000_000, Kind: KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "a", Rev: "r1", Payload: []byte("p1")},
+		{Seq: 2, WitnessedAt: 1_000_001, Kind: KindCreate, DID: "did:plc:bob", Collection: "app.bsky.feed.post", Rkey: "b", Rev: "r2", Payload: []byte("p2")},
+		{Seq: 3, WitnessedAt: 1_000_002, Kind: KindCreate, DID: "did:plc:carol", Collection: "app.bsky.feed.like", Rkey: "c", Rev: "r3", Payload: []byte("p3")},
+		{Seq: 4, WitnessedAt: 1_000_003, Kind: KindUpdate, DID: "did:plc:alice", Collection: "app.bsky.feed.like", Rkey: "d", Rev: "r4", Payload: []byte("p4")},
+		{Seq: 5, WitnessedAt: 1_000_004, Kind: KindCreate, DID: "did:plc:dan", Collection: "app.bsky.graph.follow", Rkey: "e", Rev: "r5", Payload: []byte("p5")},
 	}
 	for i, ev := range events {
 		full, err := w.Append(ev)
@@ -75,14 +75,14 @@ func TestInspect_SealedRoundtrip(t *testing.T) {
 	require.Equal(t, uint32(2), byName["app.bsky.feed.like"])
 	require.Equal(t, uint32(1), byName["app.bsky.graph.follow"])
 
-	// Per-block indexed_at bounds round-trip through seal.
+	// Per-block witnessed_at bounds round-trip through seal.
 	for i, b := range ins.Blocks {
-		require.LessOrEqual(t, b.MinIndexedAt, b.MaxIndexedAt,
-			"block %d has inverted indexed_at bounds", i)
-		require.GreaterOrEqual(t, b.MinIndexedAt, int64(1_000_000),
-			"block %d min_indexed_at below fixture floor", i)
-		require.LessOrEqual(t, b.MaxIndexedAt, int64(1_000_004),
-			"block %d max_indexed_at above fixture ceiling", i)
+		require.LessOrEqual(t, b.MinWitnessedAt, b.MaxWitnessedAt,
+			"block %d has inverted witnessed_at bounds", i)
+		require.GreaterOrEqual(t, b.MinWitnessedAt, int64(1_000_000),
+			"block %d min_witnessed_at below fixture floor", i)
+		require.LessOrEqual(t, b.MaxWitnessedAt, int64(1_000_004),
+			"block %d max_witnessed_at above fixture ceiling", i)
 	}
 
 	require.EqualValues(t, sealRes.EventCount, ins.TotalEvents)
@@ -160,10 +160,10 @@ func TestInspect_ActiveFileWithBlocks(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close() })
 
 	events := []Event{
-		{Seq: 10, IndexedAt: 2_000_000, Kind: KindCreate, DID: "did:plc:x", Collection: "app.bsky.feed.post", Rkey: "1", Rev: "r"},
-		{Seq: 11, IndexedAt: 2_000_001, Kind: KindCreate, DID: "did:plc:y", Collection: "app.bsky.feed.post", Rkey: "2", Rev: "r"},
-		{Seq: 12, IndexedAt: 2_000_002, Kind: KindUpdate, DID: "did:plc:x", Collection: "app.bsky.feed.like", Rkey: "3", Rev: "r"},
-		{Seq: 13, IndexedAt: 2_000_003, Kind: KindCreate, DID: "did:plc:z", Collection: "app.bsky.feed.like", Rkey: "4", Rev: "r"},
+		{Seq: 10, WitnessedAt: 2_000_000, Kind: KindCreate, DID: "did:plc:x", Collection: "app.bsky.feed.post", Rkey: "1", Rev: "r"},
+		{Seq: 11, WitnessedAt: 2_000_001, Kind: KindCreate, DID: "did:plc:y", Collection: "app.bsky.feed.post", Rkey: "2", Rev: "r"},
+		{Seq: 12, WitnessedAt: 2_000_002, Kind: KindUpdate, DID: "did:plc:x", Collection: "app.bsky.feed.like", Rkey: "3", Rev: "r"},
+		{Seq: 13, WitnessedAt: 2_000_003, Kind: KindCreate, DID: "did:plc:z", Collection: "app.bsky.feed.like", Rkey: "4", Rev: "r"},
 	}
 	for _, ev := range events {
 		full, err := w.Append(ev)
@@ -200,11 +200,11 @@ func TestInspect_ActiveFileWithBlocks(t *testing.T) {
 	require.Equal(t, uint32(2), byName["app.bsky.feed.like"])
 
 	for i, b := range ins.Blocks {
-		require.LessOrEqual(t, b.MinIndexedAt, b.MaxIndexedAt,
-			"active block %d has inverted indexed_at bounds", i)
-		require.GreaterOrEqual(t, b.MinIndexedAt, int64(2_000_000),
+		require.LessOrEqual(t, b.MinWitnessedAt, b.MaxWitnessedAt,
+			"active block %d has inverted witnessed_at bounds", i)
+		require.GreaterOrEqual(t, b.MinWitnessedAt, int64(2_000_000),
 			"active block %d min below fixture floor", i)
-		require.LessOrEqual(t, b.MaxIndexedAt, int64(2_000_003),
+		require.LessOrEqual(t, b.MaxWitnessedAt, int64(2_000_003),
 			"active block %d max above fixture ceiling", i)
 	}
 }

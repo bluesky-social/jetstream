@@ -742,7 +742,7 @@ func TestWriterBlocks_PendingNotIncluded(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close() })
 
 	_, err = w.Append(Event{
-		Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a",
+		Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a",
 	})
 	require.NoError(t, err)
 	require.Empty(t, w.Blocks(), "Pending events must not appear in Blocks()")
@@ -753,7 +753,7 @@ func TestWriterBlocks_PendingNotIncluded(t *testing.T) {
 
 // TestWriterBlocks_AppendsOnFlush — two flushes produce two blocks
 // with correct offsets, sizes, event counts, seq bounds, and
-// indexed_at bounds.
+// witnessed_at bounds.
 func TestWriterBlocks_AppendsOnFlush(t *testing.T) {
 	t.Parallel()
 
@@ -764,21 +764,21 @@ func TestWriterBlocks_AppendsOnFlush(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	// Block 0: seq 1..2, indexed_at 100..250.
+	// Block 0: seq 1..2, witnessed_at 100..250.
 	for _, ev := range []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
-		{Seq: 2, IndexedAt: 250, Kind: KindCreate, DID: "did:plc:b"},
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, WitnessedAt: 250, Kind: KindCreate, DID: "did:plc:b"},
 	} {
 		_, err := w.Append(ev)
 		require.NoError(t, err)
 	}
 	require.NoError(t, w.Flush())
 
-	// Block 1: seq 3..4, indexed_at 50..1000 (out-of-order to prove
+	// Block 1: seq 3..4, witnessed_at 50..1000 (out-of-order to prove
 	// min/max really track min and max, not first and last).
 	for _, ev := range []Event{
-		{Seq: 3, IndexedAt: 1000, Kind: KindCreate, DID: "did:plc:c"},
-		{Seq: 4, IndexedAt: 50, Kind: KindUpdate, DID: "did:plc:d"},
+		{Seq: 3, WitnessedAt: 1000, Kind: KindCreate, DID: "did:plc:c"},
+		{Seq: 4, WitnessedAt: 50, Kind: KindUpdate, DID: "did:plc:d"},
 	} {
 		_, err := w.Append(ev)
 		require.NoError(t, err)
@@ -792,8 +792,8 @@ func TestWriterBlocks_AppendsOnFlush(t *testing.T) {
 	require.EqualValues(t, 2, got[0].EventCount)
 	require.EqualValues(t, 1, got[0].MinSeq)
 	require.EqualValues(t, 2, got[0].MaxSeq)
-	require.EqualValues(t, 100, got[0].MinIndexedAt)
-	require.EqualValues(t, 250, got[0].MaxIndexedAt)
+	require.EqualValues(t, 100, got[0].MinWitnessedAt)
+	require.EqualValues(t, 250, got[0].MaxWitnessedAt)
 	require.NotZero(t, got[0].CompressedSize)
 	require.NotZero(t, got[0].UncompressedSize)
 
@@ -803,8 +803,8 @@ func TestWriterBlocks_AppendsOnFlush(t *testing.T) {
 	require.EqualValues(t, 2, got[1].EventCount)
 	require.EqualValues(t, 3, got[1].MinSeq)
 	require.EqualValues(t, 4, got[1].MaxSeq)
-	require.EqualValues(t, 50, got[1].MinIndexedAt)
-	require.EqualValues(t, 1000, got[1].MaxIndexedAt)
+	require.EqualValues(t, 50, got[1].MinWitnessedAt)
+	require.EqualValues(t, 1000, got[1].MaxWitnessedAt)
 }
 
 // TestWriterBlocks_ReturnsCopy — mutating the returned slice must
@@ -819,7 +819,7 @@ func TestWriterBlocks_ReturnsCopy(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	_, err = w.Append(Event{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "d"})
+	_, err = w.Append(Event{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "d"})
 	require.NoError(t, err)
 	require.NoError(t, w.Flush())
 
@@ -843,8 +843,8 @@ func TestWriterBlocks_RebuiltOnResume(t *testing.T) {
 	w1, err := New(Config{Path: path, MaxEventsPerBlock: 2})
 	require.NoError(t, err)
 	for _, ev := range []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
-		{Seq: 2, IndexedAt: 200, Kind: KindCreate, DID: "did:plc:b"},
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, WitnessedAt: 200, Kind: KindCreate, DID: "did:plc:b"},
 	} {
 		_, err := w1.Append(ev)
 		require.NoError(t, err)
@@ -862,8 +862,8 @@ func TestWriterBlocks_RebuiltOnResume(t *testing.T) {
 	require.EqualValues(t, 2, got[0].EventCount)
 	require.EqualValues(t, 1, got[0].MinSeq)
 	require.EqualValues(t, 2, got[0].MaxSeq)
-	require.EqualValues(t, 100, got[0].MinIndexedAt)
-	require.EqualValues(t, 200, got[0].MaxIndexedAt)
+	require.EqualValues(t, 100, got[0].MinWitnessedAt)
+	require.EqualValues(t, 200, got[0].MaxWitnessedAt)
 }
 
 // TestWriterBlocks_NilAfterSeal — Seal closes the writer; Blocks()
@@ -878,7 +878,7 @@ func TestWriterBlocks_NilAfterSeal(t *testing.T) {
 
 	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
 	require.NoError(t, err)
-	_, err = w.Append(Event{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "d"})
+	_, err = w.Append(Event{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "d"})
 	require.NoError(t, err)
 
 	_, err = w.Seal()
@@ -912,8 +912,8 @@ func TestWriter_SnapshotPending_ReturnsAllPending(t *testing.T) {
 	defer func() { _ = w.Close() }()
 
 	events := []Event{
-		{Seq: 1, IndexedAt: 1000, RenderedAt: 9001, Kind: KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "abc", Rev: "rev1", Payload: []byte{0xa1, 0x61, 0x78, 0x01}},
-		{Seq: 2, IndexedAt: 2000, RenderedAt: 9002, Kind: KindUpdate, DID: "did:plc:b", Collection: "app.bsky.feed.like", Rkey: "def", Rev: "rev2", Payload: []byte{0xa1, 0x61, 0x79, 0x02}},
+		{Seq: 1, WitnessedAt: 1000, IndexedAt: 9001, Kind: KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "abc", Rev: "rev1", Payload: []byte{0xa1, 0x61, 0x78, 0x01}},
+		{Seq: 2, WitnessedAt: 2000, IndexedAt: 9002, Kind: KindUpdate, DID: "did:plc:b", Collection: "app.bsky.feed.like", Rkey: "def", Rev: "rev2", Payload: []byte{0xa1, 0x61, 0x79, 0x02}},
 	}
 	for _, ev := range events {
 		full, err := w.Append(ev)
@@ -925,8 +925,8 @@ func TestWriter_SnapshotPending_ReturnsAllPending(t *testing.T) {
 	require.Len(t, got, 2)
 	for i, ev := range events {
 		require.Equal(t, ev.Seq, got[i].Seq)
+		require.Equal(t, ev.WitnessedAt, got[i].WitnessedAt)
 		require.Equal(t, ev.IndexedAt, got[i].IndexedAt)
-		require.Equal(t, ev.RenderedAt, got[i].RenderedAt)
 		require.Equal(t, ev.Kind, got[i].Kind)
 		require.Equal(t, ev.DID, got[i].DID)
 		require.Equal(t, ev.Collection, got[i].Collection)
@@ -946,7 +946,7 @@ func TestWriter_SnapshotPending_AfterFlushIsEmpty(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = w.Close() }()
 
-	_, err = w.Append(Event{Seq: 1, IndexedAt: 1, Kind: KindCreate, DID: "did:plc:a", Payload: []byte{0xa0}})
+	_, err = w.Append(Event{Seq: 1, WitnessedAt: 1, Kind: KindCreate, DID: "did:plc:a", Payload: []byte{0xa0}})
 	require.NoError(t, err)
 
 	require.NoError(t, w.Flush())
@@ -969,7 +969,7 @@ func TestWriter_SnapshotPending_PayloadIsSafeAgainstFurtherAppend(t *testing.T) 
 	defer func() { _ = w.Close() }()
 
 	original := []byte{0xa1, 0x61, 0x78, 0xff}
-	_, err = w.Append(Event{Seq: 1, IndexedAt: 1, Kind: KindCreate, DID: "did:plc:a", Payload: original})
+	_, err = w.Append(Event{Seq: 1, WitnessedAt: 1, Kind: KindCreate, DID: "did:plc:a", Payload: original})
 	require.NoError(t, err)
 
 	got := w.SnapshotPending()
@@ -982,7 +982,7 @@ func TestWriter_SnapshotPending_PayloadIsSafeAgainstFurtherAppend(t *testing.T) 
 	// (16 with our seq=1 baseline) so we don't trigger a flush mid-test.
 	for i := 2; i <= 15; i++ {
 		_, err := w.Append(Event{
-			Seq: uint64(i), IndexedAt: int64(i), Kind: KindCreate,
+			Seq: uint64(i), WitnessedAt: int64(i), Kind: KindCreate,
 			DID: "did:plc:a", Payload: bytes.Repeat([]byte{0xff}, 1024),
 		})
 		require.NoError(t, err)

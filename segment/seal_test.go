@@ -82,13 +82,13 @@ func TestSealRoundtripSmallStream(t *testing.T) {
 	require.NoError(t, err)
 
 	events := []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a",
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a",
 			Collection: "app.bsky.feed.post", Rkey: "k1", Rev: "v1",
 			Payload: []byte("p1")},
-		{Seq: 2, IndexedAt: 200, Kind: KindCreate, DID: "did:plc:b",
+		{Seq: 2, WitnessedAt: 200, Kind: KindCreate, DID: "did:plc:b",
 			Collection: "app.bsky.feed.like", Rkey: "k2", Rev: "v2",
 			Payload: []byte("p2")},
-		{Seq: 3, IndexedAt: 300, Kind: KindUpdate, DID: "did:plc:a",
+		{Seq: 3, WitnessedAt: 300, Kind: KindUpdate, DID: "did:plc:a",
 			Collection: "app.bsky.feed.post", Rkey: "k1", Rev: "v3",
 			Payload: []byte("p3")},
 	}
@@ -107,8 +107,8 @@ func TestSealRoundtripSmallStream(t *testing.T) {
 	require.EqualValues(t, 2, res.UniqueDIDCount)
 	require.EqualValues(t, 1, res.MinSeq)
 	require.EqualValues(t, 3, res.MaxSeq)
-	require.EqualValues(t, 100, res.MinIndexedAt)
-	require.EqualValues(t, 300, res.MaxIndexedAt)
+	require.EqualValues(t, 100, res.MinWitnessedAt)
+	require.EqualValues(t, 300, res.MaxWitnessedAt)
 	require.NotZero(t, res.Checksum)
 
 	// Verify the on-disk header reflects the same values.
@@ -164,14 +164,14 @@ func TestSealReaderRoundtripProperty(t *testing.T) {
 		var events []Event
 		for i := range nEvents {
 			ev := Event{
-				Seq:        uint64(i + 1),
-				IndexedAt:  int64(it*1000 + i),
-				Kind:       Kind(1 + r.IntN(7)),
-				DID:        "did:plc:" + string(rune('a'+r.IntN(26))),
-				Collection: "app.bsky.feed." + string(rune('a'+r.IntN(5))),
-				Rkey:       "k" + string(rune('a'+r.IntN(26))),
-				Rev:        "rev" + string(rune('a'+r.IntN(26))),
-				Payload:    []byte{byte(r.IntN(256))},
+				Seq:         uint64(i + 1),
+				WitnessedAt: int64(it*1000 + i),
+				Kind:        Kind(1 + r.IntN(7)),
+				DID:         "did:plc:" + string(rune('a'+r.IntN(26))),
+				Collection:  "app.bsky.feed." + string(rune('a'+r.IntN(5))),
+				Rkey:        "k" + string(rune('a'+r.IntN(26))),
+				Rev:         "rev" + string(rune('a'+r.IntN(26))),
+				Payload:     []byte{byte(r.IntN(256))},
 			}
 			events = append(events, ev)
 			full, err := w.Append(ev)
@@ -212,10 +212,10 @@ func TestSealReaderRoundtripProperty(t *testing.T) {
 	}
 }
 
-// TestSealPopulatesPerBlockIndexedAtBounds asserts the seal walk
-// records min/max indexed_at on every block in the on-disk block
+// TestSealPopulatesPerBlockWitnessedAtBounds asserts the seal walk
+// records min/max witnessed_at on every block in the on-disk block
 // index, mirroring how it already records min/max seq.
-func TestSealPopulatesPerBlockIndexedAtBounds(t *testing.T) {
+func TestSealPopulatesPerBlockWitnessedAtBounds(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -225,13 +225,13 @@ func TestSealPopulatesPerBlockIndexedAtBounds(t *testing.T) {
 	require.NoError(t, err)
 
 	// Two flushes -> two blocks.
-	// Block 0: indexed_at in [100, 250]
-	// Block 1: indexed_at in [400, 1000]
+	// Block 0: witnessed_at in [100, 250]
+	// Block 1: witnessed_at in [400, 1000]
 	events := []Event{
-		{Seq: 1, IndexedAt: 100, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
-		{Seq: 2, IndexedAt: 250, Kind: KindCreate, DID: "did:plc:b", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
-		{Seq: 3, IndexedAt: 400, Kind: KindCreate, DID: "did:plc:c", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
-		{Seq: 4, IndexedAt: 1000, Kind: KindCreate, DID: "did:plc:d", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
+		{Seq: 2, WitnessedAt: 250, Kind: KindCreate, DID: "did:plc:b", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
+		{Seq: 3, WitnessedAt: 400, Kind: KindCreate, DID: "did:plc:c", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
+		{Seq: 4, WitnessedAt: 1000, Kind: KindCreate, DID: "did:plc:d", Collection: "c", Rkey: "r", Rev: "v", Payload: []byte("p")},
 	}
 	for _, ev := range events {
 		full, err := w.Append(ev)
@@ -250,10 +250,10 @@ func TestSealPopulatesPerBlockIndexedAtBounds(t *testing.T) {
 	blocks := r.Blocks()
 	require.Len(t, blocks, 2)
 
-	require.EqualValues(t, 100, blocks[0].MinIndexedAt)
-	require.EqualValues(t, 250, blocks[0].MaxIndexedAt)
-	require.EqualValues(t, 400, blocks[1].MinIndexedAt)
-	require.EqualValues(t, 1000, blocks[1].MaxIndexedAt)
+	require.EqualValues(t, 100, blocks[0].MinWitnessedAt)
+	require.EqualValues(t, 250, blocks[0].MaxWitnessedAt)
+	require.EqualValues(t, 400, blocks[1].MinWitnessedAt)
+	require.EqualValues(t, 1000, blocks[1].MaxWitnessedAt)
 }
 
 // TestSealGolden pins the byte-exact output of a deterministic seal.
@@ -269,10 +269,10 @@ func TestSealGolden(t *testing.T) {
 	require.NoError(t, err)
 
 	events := []Event{
-		{Seq: 1, IndexedAt: 100, RenderedAt: 0, Kind: KindCreate,
+		{Seq: 1, WitnessedAt: 100, IndexedAt: 0, Kind: KindCreate,
 			DID: "did:plc:a", Collection: "app.bsky.feed.post",
 			Rkey: "k1", Rev: "v1", Payload: []byte("p1")},
-		{Seq: 2, IndexedAt: 200, RenderedAt: 250, Kind: KindCreate,
+		{Seq: 2, WitnessedAt: 200, IndexedAt: 250, Kind: KindCreate,
 			DID: "did:plc:b", Collection: "app.bsky.feed.like",
 			Rkey: "k2", Rev: "v2", Payload: []byte("p2")},
 	}

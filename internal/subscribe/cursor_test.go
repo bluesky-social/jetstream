@@ -24,9 +24,9 @@ func TestResolveCursor_TranslateIOFaultIsResolveFailed(t *testing.T) {
 	segPath := filepath.Join(dir, "seg_0000000000.jss")
 	mustWriteSealedSegment(t, segPath, sealedFixture{
 		minSeq: 1, maxSeq: 9,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   9,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     9,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -35,7 +35,7 @@ func TestResolveCursor_TranslateIOFaultIsResolveFailed(t *testing.T) {
 	// cursor (a stand-in for a corrupt/transiently-unreadable sealed file).
 	require.NoError(t, os.Remove(segPath))
 
-	// A cursor strictly inside the segment's indexed-at range routes past the
+	// A cursor strictly inside the segment's witnessed-at range routes past the
 	// older/newer-than-all short-circuits into the block scan that opens the file.
 	cursor := now - int64(5*time.Hour/time.Microsecond)
 	_, err := subscribe.ResolveCursor(strconv.FormatInt(cursor, 10), subscribe.CursorEnv{
@@ -129,9 +129,9 @@ func TestResolveCursor_ZeroNextSeqDropsToLive(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 200, maxSeq: 299,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -163,15 +163,15 @@ func TestResolveCursor_SeqBelowFloorClamped(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 100, maxSeq: 199,
-		minIndexedAt: now - int64(50*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(40*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(50*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(40*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 200, maxSeq: 299,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -198,15 +198,15 @@ func TestResolveCursor_SeqBelowFloorRejectedWhenRejectBelowFloor(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 100, maxSeq: 199,
-		minIndexedAt: now - int64(50*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(40*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(50*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(40*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 200, maxSeq: 299,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -233,9 +233,9 @@ func TestResolveCursor_SeqBelowFloorClampsWhenV1(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 200, maxSeq: 299,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -262,9 +262,9 @@ func TestResolveCursor_TimeUSBelowFloorClampsEvenWhenRejectBelowFloor(t *testing
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 100, maxSeq: 199,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(5*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(5*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -287,9 +287,9 @@ func TestResolveCursor_SeqAboveFloorPreserved(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 200, maxSeq: 299,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -309,9 +309,9 @@ func TestResolveCursor_ZeroSeqClampsToFloor(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 200, maxSeq: 299,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -331,9 +331,9 @@ func TestResolveCursor_ZeroLookbackDisablesClamp(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 200, maxSeq: 299,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -353,9 +353,9 @@ func TestResolveCursor_TimeUSTranslatesToSeq(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 9,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -377,9 +377,9 @@ func TestResolveCursor_TimeUSNewerThanAllSegments(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 9,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(5*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(5*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -400,9 +400,9 @@ func TestResolveCursor_TimeUSOlderThanAllSegmentsClampsToFloor(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 100, maxSeq: 199,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(5*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(5*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -427,9 +427,9 @@ func TestResolveCursor_TimeUSAtThresholdExactly(t *testing.T) {
 	// segment, so translation clamps to the first segment's MinSeq (1).
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 1, maxSeq: 9,
-		minIndexedAt: now - int64(10*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(5*time.Hour/time.Microsecond),
-		eventCount:   9,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(5*time.Hour/time.Microsecond),
+		eventCount:     9,
 	})
 	m := mustOpenManifest(t, dir)
 

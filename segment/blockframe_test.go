@@ -24,14 +24,14 @@ func buildMultiBlockSegment(t *testing.T, perBlock, blockCount int) string {
 		for range perBlock {
 			seq++
 			_, err = w.Append(Event{
-				Seq:        seq,
-				IndexedAt:  int64(1_730_000_000_000_000 + seq*1_000),
-				Kind:       KindCreate,
-				DID:        "did:plc:test",
-				Collection: "app.bsky.feed.post",
-				Rkey:       "rkey",
-				Rev:        "rev",
-				Payload:    []byte{0xa0},
+				Seq:         seq,
+				WitnessedAt: int64(1_730_000_000_000_000 + seq*1_000),
+				Kind:        KindCreate,
+				DID:         "did:plc:test",
+				Collection:  "app.bsky.feed.post",
+				Rkey:        "rkey",
+				Rev:         "rev",
+				Payload:     []byte{0xa0},
 			})
 			require.NoError(t, err)
 		}
@@ -183,9 +183,9 @@ func TestReadBlockFrame_EmptyCompactedBlockDecodesToZeroEvents(t *testing.T) {
 	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
 	require.NoError(t, err)
 	for _, ev := range []Event{
-		{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
-		{Seq: 2, IndexedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
-		{Seq: 3, IndexedAt: 30, Kind: KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 1, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 2, WitnessedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
+		{Seq: 3, WitnessedAt: 30, Kind: KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
 	} {
 		full, err := w.Append(ev)
 		require.NoError(t, err)

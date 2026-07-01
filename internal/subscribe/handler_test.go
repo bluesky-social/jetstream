@@ -111,10 +111,10 @@ func TestHandler_HappyPath_DeliversIdentityEvent(t *testing.T) {
 	require.NoError(t, err)
 	var seq uint64
 	appendSeq(b, &seq, &segment.Event{
-		IndexedAt: 1779719010267528,
-		Kind:      segment.KindIdentity,
-		DID:       "did:plc:test",
-		Payload:   payload,
+		WitnessedAt: 1779719010267528,
+		Kind:        segment.KindIdentity,
+		DID:         "did:plc:test",
+		Payload:     payload,
 	})
 
 	_, frame, err := conn.Read(ctx)
@@ -167,7 +167,7 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	payload, err := id.MarshalCBOR()
 	require.NoError(t, err)
 	appendSeq(b, &seq, &segment.Event{
-		IndexedAt: 2, Kind: segment.KindIdentity,
+		WitnessedAt: 2, Kind: segment.KindIdentity,
 		DID: "did:plc:i", Payload: payload,
 	})
 
@@ -213,13 +213,13 @@ func TestHandler_DefaultModeDoesNotEmitResyncReplacementRows(t *testing.T) {
 
 	var seq uint64
 	appendSeq(b, &seq, &segment.Event{
-		IndexedAt:  1,
-		Kind:       segment.KindCreateResync,
-		DID:        "did:plc:resync",
-		Collection: "app.bsky.feed.post",
-		Rkey:       "resync",
-		Rev:        "3lresync",
-		Payload:    []byte{0xa0},
+		WitnessedAt: 1,
+		Kind:        segment.KindCreateResync,
+		DID:         "did:plc:resync",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "resync",
+		Rev:         "3lresync",
+		Payload:     []byte{0xa0},
 	})
 	publishIdentity(t, b, &seq, "did:plc:afterresync", 2)
 
@@ -262,13 +262,13 @@ func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
 
 	var seq uint64
 	appendSeq(b, &seq, &segment.Event{
-		IndexedAt:  1,
-		Kind:       segment.KindCreateResync,
-		DID:        "did:plc:resync",
-		Collection: "app.bsky.feed.post",
-		Rkey:       "resync",
-		Rev:        "3lresync",
-		Payload:    []byte{0xa0},
+		WitnessedAt: 1,
+		Kind:        segment.KindCreateResync,
+		DID:         "did:plc:resync",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "resync",
+		Rev:         "3lresync",
+		Payload:     []byte{0xa0},
 	})
 
 	frame := readOneFrame(t, ctx, conn)
@@ -327,7 +327,7 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	acctPayload, err := acct.MarshalCBOR()
 	require.NoError(t, err)
 	appendSeq(b, &seq, &segment.Event{
-		IndexedAt: 2, Kind: segment.KindAccount, DID: "did:plc:acct", Payload: acctPayload,
+		WitnessedAt: 2, Kind: segment.KindAccount, DID: "did:plc:acct", Payload: acctPayload,
 	})
 	// Matching commit, to bound the test.
 	publishCommit(t, b, &seq, "did:plc:acct", "app.bsky.feed.post", 3)
@@ -385,7 +385,7 @@ func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
 	var seq uint64
 	payload := []byte{0xa0}
 	appendSeq(b, &seq, &segment.Event{
-		IndexedAt:           1779719010267528,
+		WitnessedAt:         1779719010267528,
 		UpstreamRelayCursor: 111,
 		Kind:                segment.KindCreate,
 		DID:                 "did:plc:extended",
@@ -413,7 +413,7 @@ func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
 	syncPayload, err := syncEvt.MarshalCBOR()
 	require.NoError(t, err)
 	appendSeq(b, &seq, &segment.Event{
-		IndexedAt:           1779719010267529,
+		WitnessedAt:         1779719010267529,
 		UpstreamRelayCursor: 222,
 		Kind:                segment.KindSync,
 		DID:                 "did:plc:extended",
@@ -461,7 +461,7 @@ func TestHandler_DefaultModeDoesNotEmitExtendedFields(t *testing.T) {
 
 	var seq uint64
 	appendSeq(b, &seq, &segment.Event{
-		IndexedAt:           1779719010267528,
+		WitnessedAt:         1779719010267528,
 		UpstreamRelayCursor: 111,
 		Kind:                segment.KindCreate,
 		DID:                 "did:plc:simple",
@@ -521,37 +521,37 @@ func appendSeq(tl *Tail, seqCtr *uint64, ev *segment.Event) {
 }
 
 // publishIdentity publishes a minimal identity event the encoder can render.
-func publishIdentity(t *testing.T, tl *Tail, seqCtr *uint64, did string, indexedAt int64) {
+func publishIdentity(t *testing.T, tl *Tail, seqCtr *uint64, did string, witnessedAt int64) {
 	t.Helper()
 	id := &comatproto.SyncSubscribeRepos_Identity{
-		DID: did, Seq: indexedAt, Time: "2026-05-27T00:00:00Z",
+		DID: did, Seq: witnessedAt, Time: "2026-05-27T00:00:00Z",
 	}
 	payload, err := id.MarshalCBOR()
 	require.NoError(t, err)
 	appendSeq(tl, seqCtr, &segment.Event{
-		IndexedAt: indexedAt, Kind: segment.KindIdentity,
+		WitnessedAt: witnessedAt, Kind: segment.KindIdentity,
 		DID: did, Payload: payload,
 	})
 }
 
 // publishCommit publishes a minimal create commit. The Payload is a
 // DAG-CBOR-encoded empty map (0xa0), which the encoder will turn into "{}".
-func publishCommit(t *testing.T, tl *Tail, seqCtr *uint64, did, collection string, indexedAt int64) {
+func publishCommit(t *testing.T, tl *Tail, seqCtr *uint64, did, collection string, witnessedAt int64) {
 	t.Helper()
 	appendSeq(tl, seqCtr, &segment.Event{
-		IndexedAt:  indexedAt,
-		Kind:       segment.KindCreate,
-		DID:        did,
-		Collection: collection,
-		Rkey:       "abcd1234",
-		Rev:        "3lXrev",
-		Payload:    []byte{0xa0}, // CBOR empty map
+		WitnessedAt: witnessedAt,
+		Kind:        segment.KindCreate,
+		DID:         did,
+		Collection:  collection,
+		Rkey:        "abcd1234",
+		Rev:         "3lXrev",
+		Payload:     []byte{0xa0}, // CBOR empty map
 	})
 }
 
 // publishOversizeCommit publishes a commit with a payload large enough
 // that the encoded JSON envelope will exceed any modest maxMessageSizeBytes.
-func publishOversizeCommit(t *testing.T, tl *Tail, seqCtr *uint64, did, collection string, indexedAt int64) {
+func publishOversizeCommit(t *testing.T, tl *Tail, seqCtr *uint64, did, collection string, witnessedAt int64) {
 	t.Helper()
 	// CBOR map of 1 entry: key "x" → byte string of 4096 bytes.
 	// 0xa1 = map(1); 0x61 = text(1); 0x78 ... = bytes header.
@@ -564,13 +564,13 @@ func publishOversizeCommit(t *testing.T, tl *Tail, seqCtr *uint64, did, collecti
 	big.WriteByte(0x00)
 	big.Write(make([]byte, 0x1000)) // 4096 zero bytes
 	appendSeq(tl, seqCtr, &segment.Event{
-		IndexedAt:  indexedAt,
-		Kind:       segment.KindCreate,
-		DID:        did,
-		Collection: collection,
-		Rkey:       "abcd1234",
-		Rev:        "3lXrev",
-		Payload:    big.Bytes(),
+		WitnessedAt: witnessedAt,
+		Kind:        segment.KindCreate,
+		DID:         did,
+		Collection:  collection,
+		Rkey:        "abcd1234",
+		Rev:         "3lXrev",
+		Payload:     big.Bytes(),
 	})
 }
 

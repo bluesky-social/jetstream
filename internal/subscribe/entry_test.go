@@ -15,7 +15,7 @@ func TestEntry_EncodedMemoizesOnce(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int64
 	ev := &segment.Event{
-		Seq: 7, IndexedAt: 1000, Kind: segment.KindIdentity,
+		Seq: 7, WitnessedAt: 1000, Kind: segment.KindIdentity,
 		DID: "did:plc:x", Payload: nil,
 	}
 	e := newEntry(ev)
@@ -152,7 +152,7 @@ func TestEntry_CompressedExtended_SyncEmitsDecodableFrame(t *testing.T) {
 
 	e := newEntry(&segment.Event{
 		Seq:                 77,
-		IndexedAt:           1_700_000_000_000_000,
+		WitnessedAt:         1_700_000_000_000_000,
 		UpstreamRelayCursor: 555,
 		Kind:                segment.KindSync,
 		DID:                 "did:plc:testsync",

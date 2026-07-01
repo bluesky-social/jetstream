@@ -87,13 +87,13 @@ func generateScenario(rng *rand.Rand) scenario {
 			kind = segment.KindSync
 		}
 		ev := segment.Event{
-			IndexedAt:  int64(1000 + k),
-			Kind:       kind,
-			DID:        did,
-			Collection: "app.bsky.feed.post",
-			Rkey:       "rkey-" + strconv.Itoa(k),
-			Rev:        rev,
-			Payload:    []byte("p"),
+			WitnessedAt: int64(1000 + k),
+			Kind:        kind,
+			DID:         did,
+			Collection:  "app.bsky.feed.post",
+			Rkey:        "rkey-" + strconv.Itoa(k),
+			Rev:         rev,
+			Payload:     []byte("p"),
 		}
 		// Non-commit kinds carry no rev in production.
 		if kind == segment.KindIdentity || kind == segment.KindAccount || kind == segment.KindSync {
@@ -219,13 +219,13 @@ func runSwarmIteration(t *testing.T, rng *rand.Rand) {
 		}
 	}
 
-	// Invariant 7: every survivor has IndexedAt > max source IndexedAt.
+	// Invariant 7: every survivor has WitnessedAt > max source WitnessedAt.
 	// generator caps total events at 50 + IntN(450) = 499.
-	// IndexedAts are 1000..1000+totalEvents-1, so the strict upper
+	// WitnessedAts are 1000..1000+totalEvents-1, so the strict upper
 	// bound is 1499. Use 1499 directly so an off-by-one regression
 	// here surfaces as a test failure.
-	const maxSrcIndexedAt int64 = 1499
+	const maxSrcWitnessedAt int64 = 1499
 	for _, e := range allEvs {
-		require.Greater(t, e.IndexedAt, maxSrcIndexedAt)
+		require.Greater(t, e.WitnessedAt, maxSrcWitnessedAt)
 	}
 }
