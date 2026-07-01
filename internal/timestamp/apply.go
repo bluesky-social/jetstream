@@ -217,6 +217,26 @@ func BuildPatchPlan(offsetFilePath string, rr *RowReader) (*PatchPlan, error) {
 	return plan, nil
 }
 
+// CandidateDIDs returns the distinct DIDs this plan targets, for
+// segment.Patch's segment-level bloom prefilter. Order is irrelevant to the
+// probe. Empty when the plan is empty.
+func (p *PatchPlan) CandidateDIDs() []string {
+	seen := make(map[string]struct{}, len(p.byPath))
+	dids := make([]string, 0, len(p.byPath))
+	for key := range p.byPath {
+		if _, ok := seen[key.did]; ok {
+			continue
+		}
+		seen[key.did] = struct{}{}
+		dids = append(dids, key.did)
+	}
+	return dids
+}
+
+// Empty reports whether the plan folded in zero rows (so the segment can be
+// skipped without opening it).
+func (p *PatchPlan) Empty() bool { return len(p.byPath) == 0 }
+
 // add folds one validated row into the plan, applying last-write-wins.
 func (p *PatchPlan) add(row Row) {
 	p.rowsPlanned++

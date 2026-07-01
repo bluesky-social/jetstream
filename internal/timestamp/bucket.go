@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/bluesky-social/jetstream/internal/manifest"
 )
@@ -353,10 +354,40 @@ func (b *Bucketer) evictFileIfNeeded() error {
 	return nil
 }
 
+// offsetFilePrefix / offsetFileSuffix bracket a per-segment offset file's name.
+const (
+	offsetFilePrefix = "offsets_"
+	offsetFileSuffix = ".bin"
+)
+
 // OffsetFileName is the per-segment offset file's base name for segment idx.
 // Exported so Phase C (M5) can locate the files a job produced.
 func OffsetFileName(idx uint64) string {
-	return fmt.Sprintf("offsets_%010d.bin", idx)
+	return fmt.Sprintf("%s%010d%s", offsetFilePrefix, idx, offsetFileSuffix)
+}
+
+// ParseOffsetFileName is the inverse of OffsetFileName: it extracts the segment
+// index from an offset file's base name, returning ok=false for any name that
+// is not one this package wrote. Phase C uses it to pair offset files with
+// their segments.
+func ParseOffsetFileName(name string) (idx uint64, ok bool) {
+	if !strings.HasPrefix(name, offsetFilePrefix) || !strings.HasSuffix(name, offsetFileSuffix) {
+		return 0, false
+	}
+	digits := name[len(offsetFilePrefix) : len(name)-len(offsetFileSuffix)]
+	if len(digits) == 0 {
+		return 0, false
+	}
+	if _, err := fmt.Sscanf(digits, "%d", &idx); err != nil {
+		return 0, false
+	}
+	// Round-trip guard: reject names with the right brackets but a
+	// non-canonical body (leading garbage, wrong width) so we never pair an
+	// offset file with the wrong segment.
+	if OffsetFileName(idx) != name {
+		return 0, false
+	}
+	return idx, true
 }
 
 func (b *Bucketer) offsetPath(idx uint64) string {
