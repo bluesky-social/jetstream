@@ -606,11 +606,21 @@ func (r *Runtime) Close(ctx context.Context) error {
 		r.cancelImport()
 		r.cancelImport = nil
 	}
+	importDrained := true
 	if r.importer != nil {
 		if err := r.importer.Wait(ctx); err != nil {
-			r.logger.Warn("import drain did not complete within budget", "err", err)
+			// The import goroutine may still be about to write a checkpoint.
+			// Closing pebble under it converts a slow shutdown into a panic,
+			// so we leave the store open and let process exit tear it down —
+			// pebble's WAL recovers cleanly on the next boot.
+			importDrained = false
+			r.logger.Error("import drain did not complete within budget; leaving metadata store open", "err", err)
+			errs = append(errs, fmt.Errorf("import drain: %w", err))
+		} else {
+			// Only forget the importer once it actually drained: a repeated
+			// Close must re-wait, not skip straight to closing the store.
+			r.importer = nil
 		}
-		r.importer = nil
 	}
 
 	if r.verifier != nil {
@@ -627,7 +637,7 @@ func (r *Runtime) Close(ctx context.Context) error {
 	// verifier state run ahead of the archive. Pending (unpromoted)
 	// entries are deliberately dropped — their events' rows were never
 	// archived and redelivery re-verifies them.
-	if r.metaStore != nil {
+	if r.metaStore != nil && importDrained {
 		if err := r.metaStore.Close(); err != nil {
 			r.logger.Error("close metadata store", "err", err)
 			errs = append(errs, fmt.Errorf("close metadata store: %w", err))

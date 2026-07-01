@@ -467,6 +467,12 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	runErr := rt.Run(runCtx)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cmd.Duration("shutdown-timeout"))
 	defer cancel()
-	_ = rt.Close(shutdownCtx)
-	return runErr
+	// Run suppresses caller-driven cancellation to nil, so on a clean signal
+	// shutdown Close's error (e.g. a failed import drain) is the only failure
+	// signal left — it must reach the exit status, not be swallowed.
+	closeErr := rt.Close(shutdownCtx)
+	if runErr != nil {
+		return runErr
+	}
+	return closeErr
 }
