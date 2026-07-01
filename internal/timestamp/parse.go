@@ -390,6 +390,33 @@ func (c columns) validate(rec []string, offset int64) (Row, RejectReason, string
 	return row, "", "", ""
 }
 
+// parseOneRow reads a single CSV record from src and validates it against
+// cols, returning (row, true, nil) on success and (zero, false, nil) when the
+// record is unreadable or fails validation. A non-CSV read error is returned.
+// It is the shared kernel Phase C's positioned RowReader uses to re-derive a
+// row's meaning from an offset without trusting Phase B's classification.
+func parseOneRow(src io.Reader, offset int64, cols columns) (Row, bool, error) {
+	r := csv.NewReader(src)
+	// A positioned read starts mid-file with no header, so the field count is
+	// unknown; disable the fixed-count check and let validate index defensively.
+	r.FieldsPerRecord = -1
+	rec, err := r.Read()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return Row{}, false, nil
+		}
+		if _, ok := errors.AsType[*csv.ParseError](err); ok {
+			return Row{}, false, nil
+		}
+		return Row{}, false, fmt.Errorf("timestamp: read row at offset %d: %w", offset, err)
+	}
+	row, reason, _, _ := cols.validate(rec, offset)
+	if reason != "" {
+		return Row{}, false, nil
+	}
+	return row, true, nil
+}
+
 func truncate(s string) string {
 	if len(s) <= maxDiagnosticValueLen {
 		return s
