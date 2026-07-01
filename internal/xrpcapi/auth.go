@@ -2,6 +2,7 @@ package xrpcapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
 	"strings"
@@ -25,15 +26,21 @@ import (
 // would be theater. The operator is responsible for fronting the endpoint with
 // TLS (documented in the operator notes).
 func withBearer(token string, h xrpcserver.Handler) xrpcserver.Handler {
-	tokenBytes := []byte(token)
+	// Compare sha256 digests, not the raw bytes: ConstantTimeCompare returns
+	// immediately on a length mismatch, so a raw compare would leak the
+	// configured token's length. Fixed-width digests keep every rejection —
+	// disabled, missing header, wrong token — on the same code path with the
+	// same body, so neither the response nor its timing reveals which case hit.
+	tokenHash := sha256.Sum256([]byte(token))
+	enabled := len(token) > 0
 	return xrpcserver.HandlerFunc(func(ctx context.Context, w http.ResponseWriter, r *xrpcserver.Request) error {
-		if len(tokenBytes) == 0 {
-			return xrpcserver.AuthRequired("timestamp import is not enabled")
-		}
 		presented, ok := bearerToken(r.HTTPReq)
-		// Always run the constant-time compare, even on a missing header, so
-		// the auth path's timing does not reveal whether a token was presented.
-		if subtle.ConstantTimeCompare([]byte(presented), tokenBytes) != 1 || !ok {
+		presentedHash := sha256.Sum256([]byte(presented))
+		match := subtle.ConstantTimeCompare(presentedHash[:], tokenHash[:]) == 1
+		// enabled is checked in the same branch (not early-returned): when the
+		// token is empty a presented empty string would hash-match, and the
+		// disabled case must reject everything.
+		if !enabled || !ok || !match {
 			return xrpcserver.AuthRequired("invalid or missing bearer token")
 		}
 		return h.ServeXRPC(ctx, w, r)

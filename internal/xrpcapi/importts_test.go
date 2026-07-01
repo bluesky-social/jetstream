@@ -3,6 +3,7 @@ package xrpcapi
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -99,6 +100,39 @@ func TestImportTimestamps_DisabledWhenNoToken(t *testing.T) {
 	resp2 := postJSON(t, ts.URL+importNSID, "anything", `{"path":"a.csv"}`)
 	defer func() { _ = resp2.Body.Close() }()
 	require.Equal(t, http.StatusUnauthorized, resp2.StatusCode)
+
+	// An empty presented token must not match an empty configured token (the
+	// hash-compare would otherwise "match"): the empty header is a missing
+	// token, and disabled means nothing is accepted.
+	resp3, err := http.Post(ts.URL+importNSID, "application/json", strings.NewReader(`{"path":"a.csv"}`))
+	require.NoError(t, err)
+	defer func() { _ = resp3.Body.Close() }()
+	require.Equal(t, http.StatusUnauthorized, resp3.StatusCode)
+}
+
+// TestImportTimestamps_DisabledIndistinguishableFromWrongToken enforces the
+// withBearer doc contract: a probe must not be able to learn whether import is
+// enabled by comparing 401 responses, so the disabled and wrong-token
+// rejections must carry identical status codes and bodies.
+func TestImportTimestamps_DisabledIndistinguishableFromWrongToken(t *testing.T) {
+	t.Parallel()
+	readBody := func(url string) (int, string) {
+		resp := postJSON(t, url+importNSID, "some-token", `{"path":"a.csv"}`)
+		defer func() { _ = resp.Body.Close() }()
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		return resp.StatusCode, string(b)
+	}
+
+	disabled := importTestServer(t, &fakeImportManager{}, "")
+	enabled := importTestServer(t, &fakeImportManager{}, "s3cret")
+
+	disabledCode, disabledBody := readBody(disabled.URL)
+	wrongCode, wrongBody := readBody(enabled.URL)
+	require.Equal(t, http.StatusUnauthorized, disabledCode)
+	require.Equal(t, wrongCode, disabledCode)
+	require.Equal(t, wrongBody, disabledBody,
+		"disabled vs wrong-token 401 bodies must be identical")
 }
 
 func TestImportTimestamps_WrongTokenRejected(t *testing.T) {
