@@ -24,14 +24,14 @@ func liveCommitFrame(t *testing.T, seq uint64, did, op, coll, rkey string, withR
 	return []byte(frame)
 }
 
-// liveIdentityFrame builds an extended-wire #identity frame.
+// liveIdentityFrame builds a v2-wire #identity frame.
 func liveIdentityFrame(seq uint64, did, handle string) []byte {
 	s := strconv.FormatUint(seq, 10)
 	return []byte(`{"did":"` + did + `","time_us":1,"cursor":` + s + `,"seq":` + s +
 		`,"kind":"identity","identity":{"did":"` + did + `","handle":"` + handle + `","seq":` + s + `,"time":"t"}}`)
 }
 
-// liveAccountFrame builds an extended-wire #account frame. A deleted account
+// liveAccountFrame builds a v2-wire #account frame. A deleted account
 // (active=false, status="deleted") doubles as a DID-level tombstone.
 func liveAccountFrame(seq uint64, did string, active bool, status string) []byte {
 	s := strconv.FormatUint(seq, 10)
@@ -68,7 +68,7 @@ func TestDecodeLiveFrameDelete(t *testing.T) {
 
 func TestDecodeLiveFrameCreateMissingCBOR(t *testing.T) {
 	t.Parallel()
-	// A create without record_cbor (i.e. not extended mode) must error.
+	// A create without record_cbor (i.e. not a v2 frame) must error.
 	_, err := decodeLiveFrame(liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r", false), recordDecodeMode{})
 	require.ErrorContains(t, err, "record_cbor")
 }

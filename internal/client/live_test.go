@@ -243,13 +243,12 @@ func TestLiveConsumerSubscribeURL(t *testing.T) {
 	c := newLiveConsumer(liveConfig{host: "https://jetstream.example", cursor: 123})
 	u := c.subscribeURL()
 	require.True(t, strings.HasPrefix(u, "wss://jetstream.example/subscribe-v2?"), "got %s", u)
-	require.Contains(t, u, "extended=true")
+	require.NotContains(t, u, "extended=", "the removed extended param must not be sent")
 	require.Contains(t, u, "cursor=123")
 
 	c2 := newLiveConsumer(liveConfig{host: "http://localhost:8080", fromTip: true})
 	u2 := c2.subscribeURL()
-	require.True(t, strings.HasPrefix(u2, "ws://localhost:8080/subscribe-v2?"), "got %s", u2)
-	require.Contains(t, u2, "extended=true")
+	require.True(t, strings.HasPrefix(u2, "ws://localhost:8080/subscribe-v2"), "got %s", u2)
 	require.NotContains(t, u2, "cursor=", "no cursor when fromTip (live from tip)")
 }
 
