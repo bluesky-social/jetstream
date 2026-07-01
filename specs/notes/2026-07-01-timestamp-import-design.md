@@ -1,9 +1,16 @@
 # Timestamp import + witnessed/indexed timestamp rename
 
 Date: 2026-07-01
-Branch: `timestamp-import-design` (design); impl branches per milestone (§9)
+Branch: `timestamp-import-design` (design); impl accumulated on
+`timestamp-import-m4` (M0–M7 + roast fixes — the per-milestone branch→PR plan
+in §9 was not followed; the whole epic lands as one branch)
 Tracking issue: [#193](https://github.com/bluesky-social/jetstream/issues/193)
-Status: design DONE + §8 rewritten; impl M0–M6 DONE (rename + display resolver + segment.Patch + Phase A/B parse+bucket + Phase C apply wired through the compactor + bearer-gated XRPC job model with durable resume, status panel, and metrics), M7 (docs close-out) in progress
+Status: **implementation COMPLETE** — design DONE + §8 rewritten; impl M0–M7 DONE
+(rename + display resolver + segment.Patch + Phase A/B parse+bucket + Phase C
+apply wired through the compactor + bearer-gated XRPC job model with durable
+resume, status panel, metrics, operator docs) + two adversarial roast rounds
+fixed and converged. Remaining is landing only: rebase onto main (PR #195
+rm-extended touches renamed files), push, PR, close #193.
 
 > **M4 revised two decisions during implementation** (recorded in place below):
 > **Q-FORMAT** dropped zstd — the import CSV is now **plain (uncompressed)** so
@@ -977,11 +984,47 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
   status panel render; metrics folded + phase reset. Commits `e8f0ef0`,
   `3d94104`, `3c64325`, `338f382`, `a300382`, `832b535`.
 
-### M7 — Docs + close-out
-- [ ] Reconcile `docs/README.md` §8 with the final wire/flag names if they drifted.
-- [ ] Operator note: CSV schema, DID-sort recommendation, `specific_version`
-  needs per-version CIDs (only some collections), token setup.
-- [ ] Update this tracker to DONE; close #193.
+### M7 — Docs + close-out  ✅ DONE (code/docs); landing steps remain
+- [x] Reconcile `docs/README.md` §8 with the final wire/flag names. — commit
+  `ea57c4c`; verified against code: flags `--timestamp-import-token` /
+  `--timestamp-import-dir` (+ env vars) match `cmd/jetstream/main.go`, endpoint
+  IDs match `lexicons/network/bsky/jetstream/{importTimestamps,getImportStatus}.json`.
+- [x] Operator note (`docs/README.md` §8.1): CSV schema, DID-sort
+  recommendation, `specific_version` needs per-version CIDs (only some
+  collections), token setup, TLS-at-proxy, path confinement, crash-safe
+  auto-resume, no-dry-run. — commit `ea57c4c`
+- [x] Update this tracker to DONE. Verified 2026-07-01 on `776777d`: full
+  `go test ./...` + `-race` + `golangci-lint` green; zero stray
+  `rendered_at`/`RenderedAt` tokens outside this doc (the §3.7 historical
+  mapping table is intentional).
+- [ ] **Land it**: rebase `timestamp-import-m4` onto main (PR #195 rm-extended
+  merged 2026-07-01, touches `segment/event.go` + `internal/subscribe/encoder.go`
+  + `docs/README.md` — expect real conflicts with the M1 rename and the §2
+  extended-wire `witnessed_at` field, which #195 removed along with the entire
+  extended wire's `?extended=true` form); push; PR; close #193.
+
+### Post-M6 hardening (adversarial roast rounds — both converged clean)
+Not part of the original milestone plan; recorded so the tracker reflects the
+branch's full history.
+
+- [x] **M4/M5 roast** (commit `4a2d320`): 3 verified findings fixed red-first —
+  manifest.refreshSegment validates a candidate copy before commit+generation
+  bump; `RowReader.ReadRow` rejects offset 0 and any offset not preceded by
+  `\n`; `removeStaleCompactionTemps` runs under `withRewriteLock` at both call
+  sites. Accepted limitation (documented in `ReadRow`): a newline embedded in a
+  quoted CSV field still satisfies the offset check — the operator is the only
+  actor who can swap the CSV, and hardening further was judged overly defensive.
+- [x] **M6 roast** (commits `1d6ec0f`..`64e6f16` + follow-up `776777d`): 13
+  verified findings fixed red-first. Highlights: Submit checks persisted
+  `import/current` under the manager lock (HTTP serves before ResumeIncomplete);
+  `Bucketer.Close` fsyncs offset files + dir-syncs before the `Bucketed=true`
+  checkpoint (power-loss resume must not skip Phase A/B); runtime leaves pebble
+  OPEN rather than closing under an undrained import goroutine (WAL recovers);
+  one uniform 401 body with sha256-digest `ConstantTimeCompare`; Phase C folds
+  results + refreshes the manifest before returning a worker error;
+  pause-vs-fail classified by walking the returned error tree
+  (`orchestrator.IsCancellationOnly`, shared by importer.run and observeJob —
+  when touching cancellation classification, update ALL classifier copies).
 
 ### Cross-cutting notes for the implementer
 - **Format is NOT changing** (§3.7/§3.8). Any milestone that alters segment bytes
