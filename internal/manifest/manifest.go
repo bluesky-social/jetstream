@@ -142,6 +142,17 @@ type Manifest struct {
 	segments []SegmentMetadata // sorted by Idx ascending
 	loadErr  error
 	ready    chan struct{}
+
+	// generation increments (under mu) on every mutation of the resident
+	// segment set that could change which segments or blocks a DID resolves
+	// to: initial load, seal, and compaction refresh. The Phase B import
+	// bucketer caches DID->candidate-segment selections and tags each entry
+	// with the generation it was computed under; a lookup at a newer
+	// generation is a forced miss that recomputes against the current
+	// manifest. This is what keeps that cache provably consistent with the
+	// manifest at point-of-use, so a segment sealed mid-import cannot cause a
+	// stale cache to silently misroute (drop) a row's patch.
+	generation uint64
 }
 
 // Open scans dir, parses every sealed seg_*.jss file's fixed header,
@@ -212,6 +223,7 @@ func (m *Manifest) load(ctx context.Context) error {
 	sort.Slice(m.segments, func(i, j int) bool {
 		return m.segments[i].Idx < m.segments[j].Idx
 	})
+	m.generation++
 	segmentCount := len(m.segments)
 	verr := validateSegmentSeqMonotonicity(m.segments)
 	m.mu.Unlock()
@@ -723,11 +735,36 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 		return verr
 	}
 
+	// Bump only after the mutation is committed and validated: a rejected
+	// refresh returns above with the resident set unchanged, so its
+	// generation must not move (a cache tagged with it is still valid).
+	m.generation++
+
 	if m.opts.Metrics != nil {
 		m.opts.Metrics.SegmentsLoaded.Set(float64(len(m.segments)))
 		m.opts.Metrics.BlockIndexLoadSeconds.Observe(time.Since(start).Seconds())
 	}
 	return nil
+}
+
+// Generation returns a monotonic counter that strictly increases on every
+// mutation of the resident sealed-segment set that could change which
+// segments or blocks a DID resolves to: initial load, OnSegmentSealed, and
+// OnSegmentCompacted. Read-only queries never advance it.
+//
+// It exists for consumers that cache a manifest-derived selection and need a
+// cheap staleness check without diffing the segment set. The import Phase B
+// bucketer tags each cached DID->candidate-segment selection with the
+// generation it was computed under and discards (recomputes) any entry whose
+// generation is older than the current one, keeping the cache consistent with
+// the manifest at point-of-use.
+func (m *Manifest) Generation() uint64 {
+	if err := m.waitReady(); err != nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.generation
 }
 
 // ErrSegmentSeqOverlap reports that two sealed segments carry overlapping or

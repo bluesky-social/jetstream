@@ -278,6 +278,46 @@ func TestOnSegmentCompacted_ReplacesResidentMetadata(t *testing.T) {
 	require.EqualValues(t, 5, events)
 }
 
+// TestGenerationAdvancesOnMutation pins the contract the Phase B import
+// bucketer's DID->candidate-segments cache relies on: Generation() is a
+// monotonic counter that strictly increases on every event that could change
+// which segments (or blocks) a DID resolves to -- initial load, seal, and
+// compaction refresh. A cache entry tagged with an older generation must be
+// treated as stale. Read-only queries must NOT advance it (or the cache would
+// never hit).
+func TestGenerationAdvancesOnMutation(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	m := mustOpenManifest(t, dir)
+
+	// Initial load of an empty dir still establishes a baseline generation.
+	g0 := m.Generation()
+
+	// Read-only queries must not move it.
+	_ = m.SegmentCount()
+	_, _ = m.SelectBlocksForDID("did:plc:whatever")
+	require.Equal(t, g0, m.Generation(), "read-only queries must not advance the generation")
+
+	path := filepath.Join(dir, "seg_0000000000.jss")
+	mustWriteSealedSegment(t, path, sealedFixture{
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
+	})
+	require.NoError(t, m.OnSegmentSealed(0, path))
+	g1 := m.Generation()
+	require.Greater(t, g1, g0, "seal must advance the generation")
+
+	_, err := segment.Rewrite(path, func(ev *segment.Event) segment.RowDecision {
+		if ev.Seq < 5 {
+			return segment.RowDrop
+		}
+		return segment.RowKeep
+	}, segment.RewriteOptions{})
+	require.NoError(t, err)
+	require.NoError(t, m.OnSegmentCompacted(0, path))
+	g2 := m.Generation()
+	require.Greater(t, g2, g1, "compaction refresh must advance the generation")
+}
+
 func mustOpenManifest(t *testing.T, dir string) *manifest.Manifest {
 	t.Helper()
 	m, err := manifest.Open(manifest.Options{
