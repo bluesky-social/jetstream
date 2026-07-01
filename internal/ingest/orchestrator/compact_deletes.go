@@ -161,7 +161,15 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			}
 
 			if !snap.Empty() {
-				if err := o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode); err != nil {
+				// Hold the rewrite lock for the segment-mutating chunk so a
+				// concurrent timestamp-import pass cannot race this on any
+				// segment's tmp+rename (design §3.3, §6 H). Scoped to the chunk
+				// (not the whole pass) so an import may interleave between
+				// chunks; that is safe because delete-rewrite preserves
+				// IndexedAt and both passes are per-segment atomic + idempotent.
+				if err := o.withRewriteLock(func() error {
+					return o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode)
+				}); err != nil {
 					return err
 				}
 			}
