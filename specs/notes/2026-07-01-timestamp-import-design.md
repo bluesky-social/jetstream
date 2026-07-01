@@ -3,7 +3,7 @@
 Date: 2026-07-01
 Branch: `timestamp-import-design` (design); impl branches per milestone (§9)
 Tracking issue: [#193](https://github.com/bluesky-social/jetstream/issues/193)
-Status: design DONE + §8 rewritten; impl M0–M2 DONE (rename + display resolver), M3+ pending
+Status: design DONE + §8 rewritten; impl M0–M3 DONE (rename + display resolver + segment.Patch), M4+ pending
 Author: jcalabro (with Claude)
 
 > This is the **living document** for **§8 Timestamp Import** of `docs/README.md`.
@@ -751,18 +751,37 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 > New sibling to `Rewrite`. Mutates the display column only; preserves topology,
 > blooms, collection index, and the witnessed envelope verbatim.
 
-- [ ] `segment/patch.go`: `Patch(path, mutate func(*Event) bool, opts
+- [x] `segment/patch.go`: `Patch(path, mutate func(*Event) bool, opts
   PatchOptions) (PatchResult, error)`. Decompress each candidate block, run
-  `mutate`, re-encode only changed blocks; **copy footer structures verbatim**
-  (do not rebuild blooms/collection index); recompute checksum; atomic
-  tmp+fsync+rename+dir-sync; reuse `CrashInjector` + `CandidateDIDs` bloom
-  pre-filter.
-- [ ] Early-return when `mutatedCount == 0` (skip rename) → idempotent.
-- [ ] Debug/test assert: only `IndexedAt` changed on mutated rows; witnessed
-  envelope + blooms + collection index byte-identical to source.
-- [ ] Tests: patch subset of rows → other rows/cols unchanged, blooms/index
-  preserved, checksum valid, re-open decodes; zero-mutation → no rename; crash
-  injection at each point recovers; fuzz/swarm parity with `Rewrite` where shared.
+  `mutate`, re-encode only dirty blocks; **copy the footer tail (segment DID
+  bloom + per-block DID blooms + collection index) verbatim** in one pread —
+  those regions are keyed only on DID/collection/counts and embed no absolute
+  offsets, so a display-only patch leaves them byte-identical. Only the block
+  index (Offset/CompressedSize shift after recompression), header section
+  offsets, and checksum are rebuilt. Atomic tmp+fsync+rename+dir-sync; reuses
+  `CandidateDIDs` bloom pre-filter + new `CrashInjector` seams.
+- [x] Early-return when `rowsMutated == 0` (skip rename) → byte-identical file,
+  inode + mtime preserved. Idempotent for a fixed `mutate` (re-run finds every
+  target already at value → no-op).
+- [x] **Correctness enforced at the durable boundary, not just asserted**:
+  `eventGuard` snapshots every non-display field before each `mutate` call and
+  refuses to persist (returns `ErrInvalidConfig`, source untouched) if `mutate`
+  changed Seq/WitnessedAt/Kind/DID/Collection/Rkey/Rev/Payload-len — a changed
+  DID would silently invalidate the verbatim-copied blooms. Also asserts each
+  dirty block's uncompressed size is invariant (IndexedAt is fixed-width) and
+  the rebuilt block index length matches source (block count invariant). Crash
+  beats corruption.
+- [x] Crash seams: 4 new `CrashPointPatch*` constants (segment/crash.go),
+  registered in `internal/crashpoint` (AllPoints 12→16, count-pin test bumped).
+  Mirror the rewrite tmp→fsync→rename→dir-sync recovery contract.
+- [x] Tests (`segment/patch_test.go`): patch subset → only IndexedAt moves, all
+  other columns + per-block blooms (byte-compared) + collection table/counts/
+  bitmasks + witnessed/seq envelope preserved, `DisplayTimeUS()` reflects import;
+  reopen with checksum verification; zero-mutation → no rename + inode/mtime
+  intact; idempotent re-run; immutable-field-mutation table (8 fields) each
+  rejected + source untouched; CandidateDIDs skip; 4 crash seams (reopens
+  pristine-or-fully-patched, never torn); `FuzzPatch` (20s clean). Full suite +
+  `-race` + lint green.
 
 ### M4 — CSV parse + validate + DID bucketing (Phases A/B)
 > Streaming, disk-backed. No segment writes yet — output is per-segment patch
