@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"context"
+	"errors"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -107,17 +109,25 @@ func (m *ImportMetrics) setPhase(v float64) {
 
 // observeJob folds a finished job's result into the counters and records its
 // duration + terminal result. Called once per RunImport return.
+//
+// A context-cancelled run is a graceful pause (the manager leaves the job
+// non-terminal and auto-resumes it next boot), not a terminal outcome: it must
+// not count toward jobs_total{result="error"} or the duration histogram, or
+// every clean shutdown mid-import would fire failed-job alerts. Its partial
+// row/segment counters still fold in — that work happened.
 func (m *ImportMetrics) observeJob(start time.Time, result ImportResult, err error) {
 	if m == nil {
 		return
 	}
 	m.Phase.Set(ImportPhaseGaugeIdle)
-	res := "ok"
-	if err != nil {
-		res = "error"
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		res := "ok"
+		if err != nil {
+			res = "error"
+		}
+		m.Jobs.WithLabelValues(res).Inc()
+		m.JobDuration.Observe(time.Since(start).Seconds())
 	}
-	m.Jobs.WithLabelValues(res).Inc()
-	m.JobDuration.Observe(time.Since(start).Seconds())
 
 	if result.Parse.RowsTotal > 0 {
 		m.RowsParsed.Add(float64(result.Parse.RowsTotal))

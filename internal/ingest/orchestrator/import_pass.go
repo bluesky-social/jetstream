@@ -171,12 +171,15 @@ func (o *Orchestrator) RunImport(ctx context.Context, job ImportJob) (ImportResu
 					return err
 				}
 			}
+			// Fold the stats in BEFORE the error check: a cancelled or failed
+			// parse still counted rows, and observeJob's partial-counter fold
+			// on the error path depends on them being present.
 			parseStats, bucketStats, err := o.runImportBucket(ctx, job)
+			result.Parse = parseStats
+			result.Bucket = bucketStats
 			if err != nil {
 				return err
 			}
-			result.Parse = parseStats
-			result.Bucket = bucketStats
 		}
 
 		// Phase C: apply, under the rewrite lock (mutually exclusive with
@@ -225,7 +228,10 @@ func (o *Orchestrator) runImportBucket(ctx context.Context, job ImportJob) (time
 		err = closeErr
 	}
 	if err != nil {
-		return timestamp.Stats{}, timestamp.BucketStats{}, fmt.Errorf("orchestrator: import: parse/bucket: %w", err)
+		// Return the partial stats alongside the error: Parse accumulates
+		// them up to the aborting row, and the metrics fold on the error path
+		// records that work (a paused run's rows_parsed must not vanish).
+		return parseStats, bucketer.Stats(), fmt.Errorf("orchestrator: import: parse/bucket: %w", err)
 	}
 	o.logger.InfoContext(ctx, "timestamp import parse+bucket complete",
 		"rows_valid", parseStats.RowsValid,
@@ -300,10 +306,18 @@ func (o *Orchestrator) runImportApply(ctx context.Context, job ImportJob, result
 				if err != nil {
 					return err
 				}
-				// Checkpoint AFTER the segment's atomic rewrite is durable
-				// (segment.Patch fsync+rename+dir-sync'd, or confirmed the
-				// segment was already at target). A crash later in the pass
-				// then resumes past this segment. Fired before the
+				// Record the result BEFORE the checkpoint hook: the rewrite is
+				// already durable on disk (segment.Patch fsync+rename+dir-
+				// sync'd), so even if checkpointing fails the fold below must
+				// still refresh the in-memory manifest for this segment, or
+				// the process would serve the old checksum/size for a file
+				// that was replaced.
+				mu.Lock()
+				results = append(results, res)
+				mu.Unlock()
+				// Checkpoint AFTER the segment's atomic rewrite is durable, or
+				// confirmed the segment was already at target. A crash later
+				// in the pass then resumes past this segment. Fired before the
 				// same-process manifest refresh, which is safe: a restart
 				// rebuilds the manifest from the patched file's own header, so
 				// a skipped-on-resume segment still serves correct metadata.
@@ -312,27 +326,27 @@ func (o *Orchestrator) runImportApply(ctx context.Context, job ImportJob, result
 						return fmt.Errorf("orchestrator: import: checkpoint segment %d: %w", seg.file.Idx, err)
 					}
 				}
-				mu.Lock()
-				results = append(results, res)
-				mu.Unlock()
 			}
 			return nil
 		})
 	}
+sendLoop:
 	for _, seg := range segments {
 		select {
 		case jobs <- seg:
 		case <-gctx.Done():
-			close(jobs)
-			return g.Wait()
+			break sendLoop
 		}
 	}
 	close(jobs)
-	if err := g.Wait(); err != nil {
-		return err
-	}
+	waitErr := g.Wait()
 
-	// Deterministic order for the manifest-refresh loop and logs.
+	// Fold results and refresh the manifest even when a worker errored:
+	// other workers may have durably rewritten segments (fsync+rename) before
+	// the failure, and skipping their OnSegmentCompacted would leave the
+	// in-memory manifest serving the OLD checksum/size for a file already
+	// replaced on disk until restart. Deterministic order for the refresh
+	// loop and logs.
 	sort.Slice(results, func(i, j int) bool { return results[i].idx < results[j].idx })
 	for _, r := range results {
 		result.RowsCorruptOffset += r.plan.RowsCorrupt
@@ -352,9 +366,12 @@ func (o *Orchestrator) runImportApply(ctx context.Context, job ImportJob, result
 		)
 		if o.cfg.OnSegmentCompacted != nil {
 			if err := o.cfg.OnSegmentCompacted(r.idx, r.path); err != nil {
-				return fmt.Errorf("orchestrator: import: refresh manifest %s: %w", r.path, err)
+				return errors.Join(waitErr, fmt.Errorf("orchestrator: import: refresh manifest %s: %w", r.path, err))
 			}
 		}
+	}
+	if waitErr != nil {
+		return waitErr
 	}
 	o.logger.InfoContext(ctx, "timestamp import apply complete",
 		"segments_examined", result.SegmentsExamined,

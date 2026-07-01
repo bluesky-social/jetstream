@@ -292,6 +292,13 @@ func TestRunImport_SegmentAppliedCheckpointErrorAborts(t *testing.T) {
 		OnSegmentApplied: func(uint64) error { return sentinel },
 	})
 	require.ErrorIs(t, err, sentinel)
+
+	// The abort must NOT skip the manifest refresh for the segment whose
+	// rewrite already hit the disk (fsync+rename): the in-memory manifest
+	// would otherwise serve the old checksum/size for the replaced file until
+	// restart.
+	require.Equal(t, []uint64{0}, rig.refreshed,
+		"durably-rewritten segment still refreshes the manifest on abort")
 }
 
 // TestRunImport_MetricsObserved proves the import metrics fold the job's
@@ -319,6 +326,33 @@ func TestRunImport_MetricsObserved(t *testing.T) {
 	require.EqualValues(t, 1, testutil.ToFloat64(im.Jobs.WithLabelValues("ok")))
 	require.Greater(t, testutil.ToFloat64(im.BytesRewritten), 0.0, "patched file bytes accounted")
 	require.EqualValues(t, ImportPhaseGaugeIdle, testutil.ToFloat64(im.Phase), "phase reset to idle after job")
+}
+
+// TestRunImport_CancelledJobNotCountedAsTerminal proves a context-cancelled
+// run — a graceful pause the manager will auto-resume — does not increment
+// jobs_total in either label (it is not a terminal result), while the phase
+// gauge still resets to idle.
+func TestRunImport_CancelledJobNotCountedAsTerminal(t *testing.T) {
+	t.Parallel()
+	events := []segment.Event{
+		{Seq: 1, WitnessedAt: 1_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "1", Payload: []byte("v1")},
+	}
+	rig := newImportTestRig(t, events)
+	im := NewImportMetrics(prometheus.NewRegistry())
+	rig.o.cfg.ImportMetrics = im
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the run starts: parse aborts on the first row
+	csv := writeImportCSVFile(t, "uri,timestamp,scope,cid",
+		"at://did:plc:alice/app.bsky.feed.post/r1,2021-12-20T11:33:20Z,all_versions,")
+	_, err := rig.o.RunImport(ctx, ImportJob{CSVPath: csv, JobDir: filepath.Join(t.TempDir(), "job")})
+	require.ErrorIs(t, err, context.Canceled)
+
+	require.EqualValues(t, 0, testutil.ToFloat64(im.Jobs.WithLabelValues("error")), "pause is not a terminal error")
+	require.EqualValues(t, 0, testutil.ToFloat64(im.Jobs.WithLabelValues("ok")))
+	require.EqualValues(t, ImportPhaseGaugeIdle, testutil.ToFloat64(im.Phase), "phase reset to idle on pause")
+	// Partial work still folds in: the row parsed before the abort counts.
+	require.EqualValues(t, 1, testutil.ToFloat64(im.RowsParsed), "partial parse counters survive a pause")
 }
 
 // TestRunImport_MutualExclusionWithRewriteLock proves an in-flight import holds
