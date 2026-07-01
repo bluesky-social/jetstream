@@ -16,6 +16,8 @@ import (
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/cbor"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -290,6 +292,33 @@ func TestRunImport_SegmentAppliedCheckpointErrorAborts(t *testing.T) {
 		OnSegmentApplied: func(uint64) error { return sentinel },
 	})
 	require.ErrorIs(t, err, sentinel)
+}
+
+// TestRunImport_MetricsObserved proves the import metrics fold the job's
+// counters and reset the phase gauge to idle on completion.
+func TestRunImport_MetricsObserved(t *testing.T) {
+	t.Parallel()
+	events := []segment.Event{
+		{Seq: 1, WitnessedAt: 1_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "1", Payload: []byte("v1")},
+		{Seq: 2, WitnessedAt: 2_000, Kind: segment.KindUpdate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "2", Payload: []byte("v2")},
+	}
+	rig := newImportTestRig(t, events)
+	im := NewImportMetrics(prometheus.NewRegistry())
+	rig.o.cfg.ImportMetrics = im
+
+	csv := writeImportCSVFile(t, "uri,timestamp,scope,cid",
+		"at://did:plc:alice/app.bsky.feed.post/r1,2021-12-20T11:33:20Z,all_versions,",
+		"bad-row-no-uri,,,")
+	_, err := rig.o.RunImport(context.Background(), ImportJob{CSVPath: csv, JobDir: filepath.Join(t.TempDir(), "job")})
+	require.NoError(t, err)
+
+	require.EqualValues(t, 2, testutil.ToFloat64(im.RowsParsed), "2 rows read (1 valid + 1 rejected)")
+	require.EqualValues(t, 2, testutil.ToFloat64(im.RowsMutated), "both alice versions patched")
+	require.EqualValues(t, 2, testutil.ToFloat64(im.RowsMatched.WithLabelValues("all_versions")))
+	require.EqualValues(t, 1, testutil.ToFloat64(im.SegmentsPatched))
+	require.EqualValues(t, 1, testutil.ToFloat64(im.Jobs.WithLabelValues("ok")))
+	require.Greater(t, testutil.ToFloat64(im.BytesRewritten), 0.0, "patched file bytes accounted")
+	require.EqualValues(t, ImportPhaseGaugeIdle, testutil.ToFloat64(im.Phase), "phase reset to idle after job")
 }
 
 // TestRunImport_MutualExclusionWithRewriteLock proves an in-flight import holds

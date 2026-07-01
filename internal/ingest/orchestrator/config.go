@@ -194,6 +194,10 @@ type Config struct {
 	// disables import (RunImport returns ErrImportUnavailable).
 	ImportSelector timestamp.Selector
 
+	// ImportMetrics observes timestamp-import job progress and outcomes
+	// (design §6 J). Optional; nil means no import counters increment.
+	ImportMetrics *ImportMetrics
+
 	// CompactionBloomNarrowMaxDIDs bounds the candidate-DID set handed to the
 	// segment-level bloom prefilter; larger tombstone sets skip narrowing
 	// (probing would cost more than it saves — spec §5). Zero selects the

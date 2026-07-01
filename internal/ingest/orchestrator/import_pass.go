@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -130,6 +131,10 @@ type ImportResult struct {
 	RowsMatchedSpecific    uint64
 	SpecificCIDsUnmatched  uint64
 	RowsCorruptOffset      uint64
+
+	// BytesRewritten is the total on-disk size of the segment files import
+	// rewrote (summed patched-file sizes), for the bytes_rewritten metric.
+	BytesRewritten uint64
 }
 
 // RunImport executes a full timestamp-import job: Phase A+B (parse + bucket,
@@ -147,6 +152,7 @@ func (o *Orchestrator) RunImport(ctx context.Context, job ImportJob) (ImportResu
 		return ImportResult{}, fmt.Errorf("orchestrator: import: JobDir is required")
 	}
 
+	start := time.Now()
 	var result ImportResult
 	err := obs.Span(ctx, func(ctx context.Context) error {
 		if err := os.MkdirAll(job.JobDir, 0o755); err != nil {
@@ -159,6 +165,7 @@ func (o *Orchestrator) RunImport(ctx context.Context, job ImportJob) (ImportResu
 		// skips this: re-running it would O_APPEND a second copy of every
 		// offset onto the existing files.
 		if !job.SkipBucket {
+			o.cfg.ImportMetrics.setPhase(ImportPhaseGaugeParseBucket)
 			if job.OnPhase != nil {
 				if err := job.OnPhase(ImportPhaseParseBucket, 0); err != nil {
 					return err
@@ -174,10 +181,15 @@ func (o *Orchestrator) RunImport(ctx context.Context, job ImportJob) (ImportResu
 
 		// Phase C: apply, under the rewrite lock (mutually exclusive with
 		// delete-compaction).
+		o.cfg.ImportMetrics.setPhase(ImportPhaseGaugeApply)
 		return o.withRewriteLock(func() error {
 			return o.runImportApply(ctx, job, &result)
 		})
 	})
+	// Fold the job's counters into metrics and reset the phase gauge to idle,
+	// on both the success and error paths (a partial result still carries the
+	// work done before the failure).
+	o.cfg.ImportMetrics.observeJob(start, result, err)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -332,6 +344,7 @@ func (o *Orchestrator) runImportApply(ctx context.Context, job ImportJob, result
 		}
 		result.SegmentsPatched++
 		result.RowsMutated += r.patch.RowsMutated
+		result.BytesRewritten += r.bytes
 		o.logger.InfoContext(ctx, "timestamp import patched segment",
 			"segment", r.path,
 			"rows_mutated", r.patch.RowsMutated,
@@ -357,6 +370,7 @@ type importApplyResult struct {
 	plan  timestamp.PlanStats
 	apply timestamp.ApplyStats
 	patch segment.PatchResult
+	bytes uint64 // on-disk size of the patched file (0 when not patched)
 }
 
 // applyImportSegment builds the patch plan for one segment from its offset file
@@ -384,6 +398,18 @@ func (o *Orchestrator) applyImportSegment(seg importSegment, rr *timestamp.RowRe
 	}
 	res.apply = mutate.Stats()
 	res.patch = patchRes
+	if patchRes.Patched {
+		// Record the rewritten file's on-disk size for the bytes_rewritten
+		// metric. A stat failure here is non-fatal: the rewrite already
+		// succeeded and is durable, so we log-and-continue rather than fail the
+		// whole job over a metric.
+		if info, statErr := os.Stat(seg.file.Path); statErr == nil {
+			res.bytes = uint64(info.Size())
+		} else {
+			o.logger.Warn("timestamp import: stat patched segment for byte accounting",
+				"segment", seg.file.Path, "err", statErr)
+		}
+	}
 	return res, nil
 }
 

@@ -344,6 +344,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		OnSegmentCompacted:         onSegmentCompacted,
 		SegmentManifestChecksums:   mft.SegmentChecksums,
 		ImportSelector:             mft,
+		ImportMetrics:              orchestrator.NewImportMetrics(metrics.Registry),
 		CompactionInterval:         opts.CompactionInterval,
 		CompactionTombstoneCap:     opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers:   opts.CompactionRewriteWorkers,

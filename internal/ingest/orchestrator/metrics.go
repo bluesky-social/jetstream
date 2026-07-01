@@ -12,6 +12,15 @@ const (
 	metricsNamespace           = "jetstream"
 	metricsSubsystem           = "orchestrator"
 	compactionMetricsSubsystem = "compaction"
+	importMetricsSubsystem     = "import"
+)
+
+// Import phase gauge values (stable wire values for dashboards). 0 = idle
+// (no import running), matching the prometheus default for a never-set gauge.
+const (
+	ImportPhaseGaugeIdle        = 0
+	ImportPhaseGaugeParseBucket = 1
+	ImportPhaseGaugeApply       = 2
 )
 
 // Phase gauge values. These are stable wire values — operators
