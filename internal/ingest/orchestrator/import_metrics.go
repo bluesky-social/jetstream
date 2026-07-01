@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -107,6 +106,43 @@ func (m *ImportMetrics) setPhase(v float64) {
 	}
 }
 
+// IsCancellationOnly reports whether every leaf of err's tree is a context
+// cancellation (Canceled or DeadlineExceeded). It is the shared pause-vs-fail
+// classifier for a timestamp-import run: the import manager (importer.run) uses
+// it to decide whether a returned error is a resumable pause (pure
+// cancellation) or a terminal failure, and observeJob uses the same predicate
+// so a job recorded terminal there is also counted terminal here.
+//
+// A plain errors.Is(err, context.Canceled) is insufficient: RunImport can
+// return errors.Join(context.Canceled, realFailure) — a worker cancelled at
+// shutdown joined with, say, a failed manifest refresh — and errors.Is matches
+// ANY leaf, which would launder the real failure into a pause. Report
+// cancellation only when it is the whole story.
+func IsCancellationOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == context.Canceled || err == context.DeadlineExceeded { //nolint:errorlint // leaves compared after unwrapping below
+		return true
+	}
+	switch u := err.(type) { //nolint:errorlint // deliberate tree walk
+	case interface{ Unwrap() []error }:
+		children := u.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !IsCancellationOnly(child) {
+				return false
+			}
+		}
+		return true
+	case interface{ Unwrap() error }:
+		return IsCancellationOnly(u.Unwrap())
+	}
+	return false
+}
+
 // observeJob folds a finished job's result into the counters and records its
 // duration + terminal result. Called once per RunImport return.
 //
@@ -120,7 +156,14 @@ func (m *ImportMetrics) observeJob(start time.Time, result ImportResult, err err
 		return
 	}
 	m.Phase.Set(ImportPhaseGaugeIdle)
-	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	// Classify with IsCancellationOnly, not a bare errors.Is: a job that
+	// FAILED while a shutdown cancellation raced it returns
+	// errors.Join(context.Canceled, realFailure), which errors.Is(Canceled)
+	// would treat as a pause and drop from jobs_total — hiding the very
+	// failure its alert exists to catch. This must match the manager's
+	// pause-vs-fail decision (importer.run), or a job recorded terminal here
+	// escapes the terminal-result counter there.
+	if !IsCancellationOnly(err) {
 		res := "ok"
 		if err != nil {
 			res = "error"

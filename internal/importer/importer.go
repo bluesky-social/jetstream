@@ -417,8 +417,11 @@ func (m *Manager) run(ctx context.Context, rec Record, resume bool) {
 		// which does NOT auto-resume — re-running a deterministically-failing
 		// job would loop; the operator re-submits. Classify by the RETURNED
 		// error, not ctx.Err(): a real failure racing shutdown cancellation
-		// must not be laundered into a resumable pause.
-		if isCancellationOnly(runErr) {
+		// must not be laundered into a resumable pause. This is the SAME
+		// predicate the orchestrator's import metrics use to decide whether a
+		// run counts as terminal, so the manager's pause/fail decision and the
+		// jobs_total counter can never disagree.
+		if orchestrator.IsCancellationOnly(runErr) {
 			m.pause(rec.ID)
 			return
 		}
@@ -426,37 +429,6 @@ func (m *Manager) run(ctx context.Context, rec Record, resume bool) {
 		return
 	}
 	m.finishSuccess(rec.ID, result)
-}
-
-// isCancellationOnly reports whether every leaf of err's tree is a context
-// cancellation. errors.Is alone is not enough: the orchestrator can return
-// errors.Join(context.Canceled, realFailure) — a worker cancelled at shutdown
-// joined with, say, a failed manifest refresh — and errors.Is matches ANY
-// leaf, which would launder the real failure into a resumable pause. Pause
-// only when cancellation is the whole story.
-func isCancellationOnly(err error) bool {
-	if err == nil {
-		return false
-	}
-	if err == context.Canceled || err == context.DeadlineExceeded { //nolint:errorlint // leaves compared after unwrapping below
-		return true
-	}
-	switch u := err.(type) { //nolint:errorlint // deliberate tree walk
-	case interface{ Unwrap() []error }:
-		children := u.Unwrap()
-		if len(children) == 0 {
-			return false
-		}
-		for _, child := range children {
-			if !isCancellationOnly(child) {
-				return false
-			}
-		}
-		return true
-	case interface{ Unwrap() error }:
-		return isCancellationOnly(u.Unwrap())
-	}
-	return false
 }
 
 // onPhase records phase entry. Entering the apply phase means Phase A+B is
