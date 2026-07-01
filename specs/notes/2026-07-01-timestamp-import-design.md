@@ -3,7 +3,17 @@
 Date: 2026-07-01
 Branch: `timestamp-import-design` (design); impl branches per milestone (§9)
 Tracking issue: [#193](https://github.com/bluesky-social/jetstream/issues/193)
-Status: design DONE + §8 rewritten; impl M0–M3 DONE (rename + display resolver + segment.Patch), M4+ pending
+Status: design DONE + §8 rewritten; impl M0–M4 DONE (rename + display resolver + segment.Patch + Phase A/B parse+bucket), M5+ pending
+
+> **M4 revised two decisions during implementation** (recorded in place below):
+> **Q-FORMAT** dropped zstd — the import CSV is now **plain (uncompressed)** so
+> it is randomly seekable, which lets Phase B store per-row byte offsets and
+> Phase C `Seek`+decode a single row with no decompression subsystem and no
+> scratch copy. **Phase B grouping** uses a bounded generation-gated
+> DID→candidate-segments LRU absorber (mirroring the #188 LiveEnqueuer) instead
+> of an external merge sort, and the per-segment intermediate is an **offset
+> file** (packed `uint64` offsets into the plain CSV), not a re-emitted
+> patch-tuple file. See §3.2 / §4a / Q-FORMAT / Q-SORT / Q-RESUME.
 Author: jcalabro (with Claude)
 
 > This is the **living document** for **§8 Timestamp Import** of `docs/README.md`.
@@ -216,17 +226,29 @@ collection index — only block *bodies* and the file checksum. So:
 "Bucket by DID" cannot be an in-RAM map — full-network history is billions of
 rows. Disk-backed, produces exactly one rewrite per touched segment:
 
-- **Phase A — parse & validate.** Stream the input; parse+validate each row
-  (`uri`, `timestamp`, `scope`, optional `cid`); extract the DID. Reject
-  malformed rows at this durable boundary (the #188 lesson: reject bad data at the
-  edge so it can't wedge a later pass). External-sort / group to disk by DID.
-- **Phase B — assign to segments via blooms.** For each DID group, test it against
-  every sealed segment's in-RAM DID bloom (cheap; one-sided, no false negatives so
-  no candidate missed) and append its `(did, collection, rkey[, cid])→ts` patches
-  to a per-segment temp file.
-- **Phase C — patch.** For each segment with a patch file, load it into a lookup
-  map and run **one** mutate-mode rewrite. On success emit `segment_compacted`
-  (reusing the §6 notification path).
+- **Phase A — parse & validate.** Stream the **plain (uncompressed) CSV**;
+  parse+validate each row (`uri`, `timestamp`, `scope`, optional `cid`); extract
+  the DID. Reject malformed rows at this durable boundary (the #188 lesson:
+  reject bad data at the edge so it can't wedge a later pass). Capture each valid
+  row's **byte offset** into the CSV (`csv.Reader.InputOffset`) — the plain
+  (not zstd) file is randomly seekable, so the offset is all Phase C needs to
+  re-read a row.
+- **Phase B — assign to segments via blooms.** For each row's DID, resolve its
+  candidate sealed segments from the manifest's in-RAM DID blooms
+  (`SelectBlocksForDID`; one-sided, no false negatives so no candidate missed)
+  and append the row's byte offset to each candidate segment's **offset file**
+  (packed `uint64` offsets into the CSV). A bounded, **manifest-generation-gated**
+  DID→candidate-segments LRU absorbs the recommended DID-grouped input to ~one
+  bloom selection per distinct DID (Q-SORT); a bounded FD pool caps open offset
+  files. **Phases A and B are fused into one streaming pass** (Phase B is the
+  `OnRow` sink of the Phase A parser). Generation-gating is the correctness core:
+  a segment sealed/compacted mid-import invalidates any stale cached selection
+  rather than silently misrouting a row.
+- **Phase C — patch.** For each segment with an offset file, `Seek` each offset
+  in the plain CSV, decode+revalidate that single row into a
+  `(did, collection, rkey[, cid])→ts` lookup map, and run **one** mutate-mode
+  `segment.Patch`. On success emit `segment_compacted` (reusing the §6
+  notification path). *(M5.)*
 
 ### 3.3 Concurrency (correctness-critical)
 
@@ -359,9 +381,15 @@ the record's CID addresses. So recomputing the CID reproduces it exactly.
 `ComputeCID(codec, data) CID`, `ParseCIDString(s) (CID, error)`, `CID.Equal`.
 
 **Phase A (parse):** for a `specific_version` row, parse the operator CID **once**
-with `ParseCIDString` and store the 33-byte binary CID in the patch (validate at
-the durable boundary; unparseable CID → reject the row, per Q-REJECT). This keeps
-Phase C off the string-parse path.
+with `ParseCIDString` to validate it at the durable boundary (unparseable CID →
+reject the row, per Q-REJECT). *(Implementation note, revised in M4: because the
+per-segment intermediate is a byte-offset into the plain CSV — not a re-emitted
+patch record — the parsed CID is not separately persisted; Phase C re-reads and
+re-parses the one row it seeks to. The parsed `cbor.CID` is 36 bytes via
+`CID.Bytes()`, not 33 as an earlier draft stated; irrelevant now that it isn't
+stored, but corrected for the record. Re-parsing one already-validated CID per
+matched `specific_version` row in Phase C is negligible against that row's block
+decompress+recompress.)*
 
 **Phase C (patch), per candidate row in a decompressed block:**
 
@@ -451,21 +479,37 @@ segments. Backstop remains full idempotency (re-applying → zero mutations → 
 rename), so even a lost checkpoint degrades to a cheap re-scan rather than
 corruption.
 
-### Q-FORMAT — upload file format — **DECIDED: CSV + header + zstd, ONLY**
+### Q-FORMAT — upload file format — **DECIDED (revised M4): plain CSV + header, ONLY**
 Canonical and **sole** accepted format: **RFC4180 CSV with a header row,
-zstd-compressed** (`.csv.zst`). No NDJSON, no Parquet, no other formats — one
+uncompressed** (`.csv`). No NDJSON, no Parquet, no zstd, no other formats — one
 parser surface, kept minimal.
 
-- Legible when decompressed; streamable **row-at-a-time** (Phase A cannot load
-  tens of GB into RAM); zero new dependency (stdlib `encoding/csv` + the `zstd`
-  already used for blocks).
-- Header row names the columns so optional `cid`/`scope` are positional-agnostic.
-- **DID-sort is recommended, not required (DECIDED — Q-SORT).** DIDs repeat
-  massively → long common prefixes compress hard under zstd, and DID-grouped input
-  lets Phase-B bucketing stream without a re-sort. But sortedness is an
-  **optimization, not a correctness requirement**: Phase A external-sorts if the
-  input isn't grouped. We do **not** hard-fail on unsorted input (don't push work
-  onto operators or abort late on huge files).
+- **Revised from `.csv.zst` to plain `.csv` during M4** for one mechanical
+  reason: a zstd stream is **forward-only**, not randomly seekable, so "record a
+  byte offset in Phase B and `ReadAt` it in Phase C" is impossible against a
+  `.zst` without either a full re-decompress-and-scan per segment or a plaintext
+  scratch copy. A plain CSV **is** seekable, so Phase B stores a `uint64` offset
+  per row and Phase C seeks straight to it — no decompression subsystem, no
+  scratch copy, minimal machinery (the operator's staged file *is* the seekable
+  working store). **Tradeoff:** the on-box file is larger uncompressed (a
+  full-network export is hundreds of GB vs. tens compressed). Accepted: the file
+  is staged server-local out-of-band (Q-TRANSPORT) onto a box that already holds
+  the multi-TB segment archive, and the operator can `zstd -d` during staging.
+- Legible; streamable **row-at-a-time** (Phase A cannot load tens of GB into
+  RAM); zero new dependency (stdlib `encoding/csv`).
+- Header row names the columns so optional `cid`/`scope` are positional-agnostic;
+  an unrecognized/duplicate/missing-required column fails the whole file loudly
+  (a bad header makes every row ambiguous), distinct from per-row skip-and-report.
+- **DID-sort is recommended, not required (DECIDED — Q-SORT).** DID-grouped input
+  lets Phase-B bucketing stream with a warm DID→segments cache (~one bloom
+  selection per distinct DID). But sortedness is an **optimization, not a
+  correctness requirement**. *(Revised M4: the tolerance mechanism is a bounded
+  generation-gated DID→candidate-segments LRU absorber, not an external merge
+  sort. Unsorted input stays fully correct — a cache miss just recomputes
+  `SelectBlocksForDID`, a cheap resident-bloom test with no disk I/O.
+  Pathologically-shuffled huge input pays extra bloom selections but never blows
+  memory and never misroutes.)* We do **not** hard-fail on unsorted input (don't
+  push work onto operators or abort late on huge files).
 
 ### Q-MIGRATE — **DISSOLVED: no format change, so no migration hazard**
 This fork existed only under the false assumption of a byte-level format change.
@@ -654,8 +698,8 @@ Regardless of (a)/(b): regenerate, don't hand-edit, the lexgen output.
 | Q-TRANSPORT | how the GB-scale file reaches the server | server-local path reference | **DECIDED** |
 | Q-JOBMODEL | sync request vs. async job + status | async job id + status endpoint + status page | **DECIDED** |
 | Q-RESUME | crash resumability | persist checkpoint, auto-resume | **DECIDED** |
-| Q-FORMAT | CSV+zstd / NDJSON / Parquet | CSV+header+zstd only | **DECIDED** |
-| Q-SORT | require+verify DID-sortedness vs. recommend | recommend + tolerate (Phase A sorts) | **DECIDED** |
+| Q-FORMAT | CSV+zstd / NDJSON / Parquet | plain CSV+header only (zstd dropped M4 for seekability) | **DECIDED** |
+| Q-SORT | require+verify DID-sortedness vs. recommend | recommend + tolerate (gen-gated LRU absorber, M4) | **DECIDED** |
 | Q-OVERWRITE | re-import clobber vs. fill-only | overwrite | **DECIDED** |
 | Q-REJECT | skip-and-report vs. whole-file reject | skip-and-report + bounded status (counts + sample + durable artifact) | **DECIDED** |
 | Q-EXPOSE | surface "was imported?" bit | do not expose (fully internal) | **DECIDED** |
@@ -783,21 +827,48 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
   pristine-or-fully-patched, never torn); `FuzzPatch` (20s clean). Full suite +
   `-race` + lint green.
 
-### M4 — CSV parse + validate + DID bucketing (Phases A/B)
-> Streaming, disk-backed. No segment writes yet — output is per-segment patch
-> files. Independently testable end-to-end on a fixture archive.
+### M4 — CSV parse + validate + DID bucketing (Phases A/B)  ✅ DONE
+> Streaming, disk-backed. No segment writes yet — output is per-segment offset
+> files. Independently testable end-to-end. Branch `timestamp-import-m4` on M3.
+> **Note the two in-flight decision revisions (Q-FORMAT plain CSV, Q-SORT LRU
+> absorber) recorded above.**
 
-- [ ] `internal/timestamp/` (new pkg): zstd+CSV streaming reader (header row;
-  columns `uri,timestamp,scope,cid`); per-row validate (`atmos.ParseATURI`,
-  RFC3339 → micros, scope enum default `all_versions`, `ParseCIDString` when
-  `specific_version`); **skip-and-report** bad rows (count + list).
-- [ ] External sort/group by DID if input isn't grouped (Q-SORT tolerate).
-- [ ] Phase B: test each DID group against segment DID blooms (manifest-resident,
-  one-sided) → append `(did,collection,rkey,cid?,ts,scope)` to per-segment patch
-  temp files under `data/imports/<job>/`.
-- [ ] Tests: malformed rows skipped+counted; scope defaulting; specific_version
-  requires parseable cid; bucketing routes to correct candidate segments; huge
-  input doesn't blow memory (streaming assertion).
+- [x] **`manifest.Generation()`** (commit `b47b0dd`): monotonic counter bumped
+  under `mu` on load/seal/compact (never on read-only queries; refresh bump only
+  after the seq-monotonicity gate passes). The cache-coherence primitive Phase B
+  gates on. Red-first test pins seal & compact each advance it and reads do not.
+- [x] **Phase A — `internal/timestamp` parse+validate** (commit `b4bed29`):
+  `Parse(io.Reader, Options)` streams a **plain** CSV (header `uri,timestamp,
+  scope,cid`), validates each row (`atmos.ParseATURI` → DID/collection/rkey with
+  handle-authority and incomplete-URI rejects; RFC3339 → micros with a
+  non-positive reject so a stored value can't collide with the sentinel-0;
+  scope enum default `all_versions`; `cbor.ParseCIDString` required iff
+  `specific_version`, ignored for `all_versions` per §4 D), and invokes an
+  `OnRow` hook per valid row carrying the row's **byte offset**
+  (`csv.InputOffset`). **Skip-and-report** bad rows: complete counts-by-reason
+  (10 stable reasons) + a **bounded** in-memory sample (Q-REJECT) + an `OnReject`
+  hook (M6's durable-artifact seam). Structural header errors fail the whole file
+  (`ErrHeader`). One bad row never aborts the file.
+- [x] **Phase B — `internal/timestamp` bucketer** (commit `35c8069`): `Bucketer`
+  is the `OnRow` sink. Resolves each row's DID to candidate segments via
+  `manifest.SelectBlocksForDID` (resident blooms, no disk I/O) and appends the
+  row's offset to per-segment **offset files** (`offsets_<idx>.bin`, packed
+  `uint64` LE) under the job dir. Bounded **generation-gated** DID→segments LRU
+  (Q-SORT tolerate; the gen is sampled *before* the select so a raced seal is
+  never falsely-fresh) + bounded FD pool (offset files reopened `O_APPEND` after
+  eviction). Phases A+B are one fused streaming pass. `var _ Selector =
+  (*manifest.Manifest)(nil)` pins the M5 wiring.
+- [x] Tests: malformed rows skipped+counted (per-reason); scope defaulting incl.
+  absent column; `specific_version` requires parseable cid; offset seeks back to
+  the exact row bytes; bounded reject sample + `OnReject` fires for all;
+  bucketing routes to correct candidate segments + fan-out counts; **stale cache
+  recomputes on generation bump**; **seal-during-selection is not falsely
+  fresh**; DID-cache & FD-pool eviction are correctness-transparent; end-to-end
+  `Parse`→`Route`→offset-seek-back. Full suite + `-race` + lint green.
+- Follow-up for M5 (Phase C): `Seek` each offset in the plain CSV, decode+
+  revalidate the one row, build the per-segment `(did,collection,rkey[,cid])→ts`
+  map, run one `segment.Patch`, emit `segment_compacted`. (No orchestrator wiring
+  or durable job checkpoint yet — those are M5/M6.)
 
 ### M5 — Phase C: apply via `segment.Patch`, wired through the compactor  [§6 H]
 - [ ] Build the per-segment `(did,collection,rkey[,cid])→ts` lookup; `mutate`
