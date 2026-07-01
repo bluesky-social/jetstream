@@ -206,6 +206,56 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.NotContains(t, body, `<h2>Collections</h2>`)
 }
 
+func TestHandler_OmitsImportPanelWhenNoImport(t *testing.T) {
+	t.Parallel()
+	src := &fakeSnapshotter{snap: newFixtureSnap()} // Import is nil
+	h, err := web.New(web.Options{Snapshotter: src})
+	require.NoError(t, err)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.NotContains(t, rr.Body.String(), "Timestamp import")
+}
+
+func TestHandler_RendersImportPanel(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Import = &status.ImportInfo{
+		JobID:            "20260525T120000.000Z-abcd",
+		State:            "complete",
+		Phase:            "apply",
+		SubmittedAt:      time.Date(2026, 5, 25, 11, 0, 0, 0, time.UTC),
+		FinishedAt:       time.Date(2026, 5, 25, 11, 30, 0, 0, time.UTC),
+		Bucketed:         true,
+		SegmentsToApply:  4,
+		SegmentsApplied:  4,
+		RowsValid:        1000,
+		RowsRejected:     3,
+		SegmentsExamined: 4,
+		SegmentsPatched:  4,
+		RowsMutated:      2500,
+	}
+	src := &fakeSnapshotter{snap: s}
+	h, err := web.New(web.Options{
+		Snapshotter: src,
+		Now:         func() time.Time { return time.Date(2026, 5, 25, 12, 0, 5, 0, time.UTC) },
+	})
+	require.NoError(t, err)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	body := rr.Body.String()
+	require.Contains(t, body, "Timestamp import")
+	require.Contains(t, body, "20260525T120000.000Z-abcd")
+	require.Contains(t, body, "complete")
+	require.Contains(t, body, "4 / 4") // segments applied / to apply
+	require.Contains(t, body, "1,000 valid, 3 rejected")
+	require.Contains(t, body, "2,500") // rows mutated
+}
+
 func TestHandler_RendersUnknownBackfillDurationForOldSteadyStateData(t *testing.T) {
 	t.Parallel()
 	s := newFixtureSnap()

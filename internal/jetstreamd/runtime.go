@@ -241,27 +241,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		SkipHandleVerification: true,
 	}
 
-	statusCollector, err := status.New(status.Options{
-		Store:            metaStore,
-		DataDir:          opts.DataDir,
-		Manifest:         mft,
-		CursorLookback:   opts.CursorLookback,
-		IdentityResolver: resolver,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build status collector: %w", err))
-	}
-
-	statusHandler, err := web.New(web.Options{
-		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(opts.DataDir, resolver, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
-		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
-		Logger:                     processLogger,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build status handler: %w", err))
-	}
-
 	stateStore := syncstate.New(metaStore)
 	tombstones := tombstone.New()
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
@@ -411,6 +390,29 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: build import manager: %w", err))
 	}
 	rt.importer = importMgr
+
+	// Status collector + handler are built here (after the import manager) so
+	// the status page can surface the current import job.
+	statusCollector, err := status.New(status.Options{
+		Store:            metaStore,
+		DataDir:          opts.DataDir,
+		Manifest:         mft,
+		CursorLookback:   opts.CursorLookback,
+		IdentityResolver: resolver,
+		ImportReporter:   importReporter{mgr: importMgr},
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build status collector: %w", err))
+	}
+	statusHandler, err := web.New(web.Options{
+		Snapshotter:                statusCollector,
+		RepoActions:                web.NewRepoActions(opts.DataDir, resolver, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
+		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
+		Logger:                     processLogger,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build status handler: %w", err))
+	}
 
 	srv := server.New(server.Config{
 		PublicAddr:      opts.PublicAddr,
@@ -655,6 +657,38 @@ func (r *Runtime) cancelManifestLoad() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// importReporter adapts *importer.Manager to status.ImportReporter, translating
+// the importer's Record into the status package's rendering view so status
+// stays decoupled from the importer's concrete types.
+type importReporter struct{ mgr *importer.Manager }
+
+func (r importReporter) CurrentImport() (status.ImportInfo, bool) {
+	rec, ok := r.mgr.Current()
+	if !ok {
+		return status.ImportInfo{}, false
+	}
+	return status.ImportInfo{
+		JobID:                 rec.ID,
+		State:                 string(rec.State),
+		Phase:                 string(rec.Phase),
+		Error:                 rec.Error,
+		SubmittedAt:           rec.SubmittedAt,
+		FinishedAt:            rec.FinishedAt,
+		Bucketed:              rec.Bucketed,
+		SegmentsToApply:       rec.SegmentsToApply,
+		SegmentsApplied:       rec.SegmentsApplied,
+		RowsTotal:             rec.RowsTotal,
+		RowsValid:             rec.RowsValid,
+		RowsRejected:          rec.RowsRejected,
+		SegmentsExamined:      rec.SegmentsExamined,
+		SegmentsPatched:       rec.SegmentsPatched,
+		RowsMutated:           rec.RowsMutated,
+		RowsMatchedSpecific:   rec.RowsMatchedSpecific,
+		SpecificCIDsUnmatched: rec.SpecificCIDsUnmatched,
+		RowsCorruptOffset:     rec.RowsCorruptOffset,
+	}, true
 }
 
 func phaseBarrier(barrier PhaseBarrier) orchestrator.PhaseBarrier {

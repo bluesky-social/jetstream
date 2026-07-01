@@ -669,6 +669,12 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		Pebble:           pdb,
 	}
 
+	if opts.ImportReporter != nil {
+		if info, ok := opts.ImportReporter.CurrentImport(); ok {
+			snap.Import = &info
+		}
+	}
+
 	snap.CursorLookback.ConfiguredLookback = opts.CursorLookback
 	if opts.Manifest != nil && opts.CursorLookback > 0 {
 		snap.CursorLookback.ManifestSegmentCount = opts.Manifest.SegmentCount()

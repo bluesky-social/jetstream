@@ -21,6 +21,39 @@ type Snapshot struct {
 	CursorLookback   CursorLookbackStats
 	Hosts            HostDiagnostics
 	Account          AccountLookup
+	Import           *ImportInfo
+}
+
+// ImportInfo is the status-page view of the current (or most recent)
+// timestamp-import job. Nil on the Snapshot when import has never run this
+// data dir. Populated from the importer job manager via an ImportReporter, so
+// the status package stays decoupled from the importer's concrete types.
+type ImportInfo struct {
+	JobID                 string
+	State                 string
+	Phase                 string
+	Error                 string
+	SubmittedAt           time.Time
+	FinishedAt            time.Time
+	Bucketed              bool
+	SegmentsToApply       int
+	SegmentsApplied       int
+	RowsTotal             uint64
+	RowsValid             uint64
+	RowsRejected          uint64
+	SegmentsExamined      int
+	SegmentsPatched       int
+	RowsMutated           uint64
+	RowsMatchedSpecific   uint64
+	SpecificCIDsUnmatched uint64
+	RowsCorruptOffset     uint64
+}
+
+// ImportReporter yields the current or most recent import job for the status
+// page. Implemented by the importer job manager (adapted in jetstreamd). ok is
+// false when no import has run.
+type ImportReporter interface {
+	CurrentImport() (ImportInfo, bool)
 }
 
 // Request selects the status-page view and optional account lookup.
