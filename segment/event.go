@@ -85,3 +85,19 @@ type Event struct {
 	// must clone via append([]byte(nil), p...) first.
 	Payload []byte
 }
+
+// DisplayTimeUS resolves the timestamp shown to subscribers on the wire
+// (the event's time_us). It applies the sentinel-0 fallback from
+// DESIGN.md §3.2: when an operator has imported an indexed_at value
+// (IndexedAt != 0) that display value wins; otherwise it falls back to
+// WitnessedAt, the immutable time Jetstream first saw the event.
+//
+// Absent any timestamp import every IndexedAt column is 0, so this
+// returns WitnessedAt for every event — display == witnessed, matching
+// pre-import behavior exactly.
+func (e *Event) DisplayTimeUS() int64 {
+	if e.IndexedAt != 0 {
+		return e.IndexedAt
+	}
+	return e.WitnessedAt
+}

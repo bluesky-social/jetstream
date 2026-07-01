@@ -3,7 +3,7 @@
 Date: 2026-07-01
 Branch: `timestamp-import-design` (design); impl branches per milestone (§9)
 Tracking issue: [#193](https://github.com/bluesky-social/jetstream/issues/193)
-Status: design DONE + §8 rewritten; impl M0–M1 DONE (rename landed), M2+ pending
+Status: design DONE + §8 rewritten; impl M0–M2 DONE (rename + display resolver), M3+ pending
 Author: jcalabro (with Claude)
 
 > This is the **living document** for **§8 Timestamp Import** of `docs/README.md`.
@@ -733,12 +733,19 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 > Tiny, but it's the first behavioral change. Safe: identical to today until an
 > import runs (all display columns are 0 → resolves to witnessed).
 
-- [ ] `displayOf(ev) = ev.IndexedAt if ev.IndexedAt != 0 else ev.WitnessedAt`
-  helper (segment or subscribe pkg).
-- [ ] `encoder.go`: the four `TimeUS:` sites use `displayOf(evt)`.
-- [ ] Tests: un-imported event → `time_us == witnessed`; event with non-zero
-  display → `time_us == display`; `#identity/#account/#sync` → `time_us ==
-  witnessed` (display stays 0).
+- [x] Resolver implemented as `(*segment.Event).DisplayTimeUS()` (method, not a
+  free `displayOf` — it's a property of the event, self-documenting, and lives
+  next to the columns M3's `Patch` mutate func will touch). Pure sentinel check:
+  `IndexedAt != 0 ? IndexedAt : WitnessedAt`. Docstring cites §3.2 and states the
+  pre-import invariant (all IndexedAt==0 → display==witnessed).
+- [x] `encoder.go`: all four `TimeUS:` sites (v1 commit/identity/account +
+  extended envelope) now call `evt.DisplayTimeUS()`.
+- [x] Tests: `segment/event_test.go` `TestEvent_DisplayTimeUS` (table:
+  unimported→witnessed, imported wins, future-import wins, both-zero→0).
+  `encoder_test.go` `TestEncode_TimeUSResolvesDisplayValue` proves the resolver
+  reaches the wire across every encoder entry point + kind (v1 commit/identity/
+  account; extended adds #sync). Full suite + lint green; v1 golden round-trips
+  unchanged (goldens carry IndexedAt==0, so display==witnessed as before).
 
 ### M3 — `segment.Patch` (mutate-mode rewrite)  [§6 I]
 > New sibling to `Rewrite`. Mutates the display column only; preserves topology,

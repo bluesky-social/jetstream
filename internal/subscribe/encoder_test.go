@@ -498,6 +498,96 @@ func TestEncodeExtended_UnknownKindReturnsError(t *testing.T) {
 	require.NotErrorIs(t, err, errSkipEvent)
 }
 
+// TestEncode_TimeUSResolvesDisplayValue is the M2 behavioral guarantee: the
+// wire time_us is the imported IndexedAt when one was set, otherwise it falls
+// back to WitnessedAt. This must hold across every encoder entry point (v1 +
+// extended) and every kind, because time_us lives on the shared envelope. A
+// #sync event has no v1 form, so it is exercised only on the extended path.
+func TestEncode_TimeUSResolvesDisplayValue(t *testing.T) {
+	t.Parallel()
+
+	const witnessed = int64(1_700_000_000_000_000)
+	const imported = int64(1_600_000_000_000_000)
+
+	ident := &comatproto.SyncSubscribeRepos_Identity{DID: "did:plc:x", Seq: 1, Time: "2026-05-25T00:00:00Z"}
+	identPayload, err := ident.MarshalCBOR()
+	require.NoError(t, err)
+	acct := &comatproto.SyncSubscribeRepos_Account{DID: "did:plc:x", Active: true, Seq: 2, Time: "2026-05-25T00:00:01Z"}
+	acctPayload, err := acct.MarshalCBOR()
+	require.NoError(t, err)
+	sync := &comatproto.SyncSubscribeRepos_Sync{DID: "did:plc:x", Rev: "r", Seq: 3, Time: "2026-05-25T00:00:02Z", Blocks: []byte{0x01}}
+	syncPayload, err := sync.MarshalCBOR()
+	require.NoError(t, err)
+
+	// event returns a fresh segment.Event of the given kind with the given
+	// witnessed/indexed columns; the payload is picked to match the kind so
+	// every encoder path decodes cleanly.
+	event := func(kind segment.Kind, w, idx int64) *segment.Event {
+		e := &segment.Event{
+			Seq:         42,
+			WitnessedAt: w,
+			IndexedAt:   idx,
+			Kind:        kind,
+			DID:         "did:plc:x",
+		}
+		switch kind {
+		case segment.KindIdentity:
+			e.Payload = identPayload
+		case segment.KindAccount:
+			e.Payload = acctPayload
+		case segment.KindSync:
+			e.Payload = syncPayload
+		default: // commit kinds
+			e.Collection = "app.bsky.feed.post"
+			e.Rkey = "abc"
+			e.Rev = "rev1"
+			e.Payload = []byte{0xa0}
+		}
+		return e
+	}
+
+	timeUSOf := func(t *testing.T, body []byte) int64 {
+		t.Helper()
+		var m map[string]any
+		require.NoError(t, json.Unmarshal(body, &m))
+		f, ok := m["time_us"].(float64)
+		require.True(t, ok, "time_us not a float64 in %s", body)
+		return int64(f)
+	}
+
+	// v1 Encode: commit, identity, account (sync has no v1 form).
+	for _, kind := range []segment.Kind{segment.KindCreate, segment.KindIdentity, segment.KindAccount} {
+		t.Run("v1_unimported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+			t.Parallel()
+			body, err := Encode(event(kind, witnessed, 0))
+			require.NoError(t, err)
+			require.Equal(t, witnessed, timeUSOf(t, body), "unimported must fall back to witnessed")
+		})
+		t.Run("v1_imported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+			t.Parallel()
+			body, err := Encode(event(kind, witnessed, imported))
+			require.NoError(t, err)
+			require.Equal(t, imported, timeUSOf(t, body), "imported display value must win")
+		})
+	}
+
+	// Extended path covers all kinds including #sync.
+	for _, kind := range []segment.Kind{segment.KindCreate, segment.KindIdentity, segment.KindAccount, segment.KindSync} {
+		t.Run("ext_unimported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+			t.Parallel()
+			body, err := EncodeExtended(event(kind, witnessed, 0))
+			require.NoError(t, err)
+			require.Equal(t, witnessed, timeUSOf(t, body), "unimported must fall back to witnessed")
+		})
+		t.Run("ext_imported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+			t.Parallel()
+			body, err := EncodeExtended(event(kind, witnessed, imported))
+			require.NoError(t, err)
+			require.Equal(t, imported, timeUSOf(t, body), "imported display value must win")
+		})
+	}
+}
+
 func TestEncode_CursorOmittedWhenZero(t *testing.T) {
 	t.Parallel()
 	evt := &segment.Event{
