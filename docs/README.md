@@ -668,6 +668,30 @@ Imports run against a live server with no downtime. The operator stages a plain 
 
 The job buckets the URIs by DID, uses the segment and per-block DID blooms to find candidate blocks, then decompresses each one and patches the `indexed_at` column for the matching rows. Rather than maintain a separate timestamp table that has to be kept in sync with the segments, we write straight into the segment files — the import piggybacks on the compaction machinery, so it shares the same rewrite path, re-seals touched segments with fresh checksums, and fires the usual segment-compaction notification. It's the same atomic rewrite we already do for deletes, just mutating a column instead of dropping rows. Bad rows are skipped and reported rather than failing the whole import, and re-running is safe: an already-applied file just produces no changes.
 
+### 8.1 Operating an import
+
+**Enable it.** Set a bearer token at startup: `--timestamp-import-token` (or `JETSTREAM_TIMESTAMP_IMPORT_TOKEN`). With no token the two endpoints always return 401 and are indistinguishable from "disabled" — that's the secure default. Stage the CSV under the confinement directory, which defaults to `<data-dir>/imports` and is overridable with `--timestamp-import-dir` (`JETSTREAM_TIMESTAMP_IMPORT_DIR`). The submitted path is resolved and confined to that directory; `..` traversal and symlinks that escape it are rejected.
+
+**Front it with TLS.** The token is a bearer secret. Jetstream serves plain HTTP and expects TLS to be terminated by your proxy, so terminate TLS in front of the import endpoint — jetstream does not enforce it in-process (an in-process check would inspect a connection that is already plaintext).
+
+**The two endpoints** (both bearer-gated, under `/xrpc/`):
+
+- `network.bsky.jetstream.importTimestamps` (procedure) — body `{ "path": "<file>" }`, where `<file>` is relative to the import directory (or an absolute path inside it). Returns `{ "job": "<id>" }`. Only one import runs at a time; a concurrent submit gets `409 ImportInProgress`. A bad path gets `400 InvalidPath`.
+- `network.bsky.jetstream.getImportStatus` (query) — `?job=<id>` (or omit it for the current/most-recent job) reports lifecycle state, phase, per-phase progress, and, on completion, the parse/mutation totals. The same summary appears on the operator `/status` page.
+
+**CSV schema.** Header row `uri,timestamp,scope,cid` (column order is read from the header, so it need not be canonical):
+
+- `uri` — `at://<did>/<collection>/<rkey>`.
+- `timestamp` — RFC3339 (e.g. `2022-01-02T03:04:05Z`), parsed to microseconds.
+- `scope` — `all_versions` (default when empty) patches every create/update/resync sharing the URI; `specific_version` patches only the version whose stored DAG-CBOR payload recomputes to `cid`.
+- `cid` — required iff `scope=specific_version`, ignored otherwise.
+
+Sorting the CSV by DID is *recommended, not required*: it keeps the bucketer's per-DID cache warm (roughly one bloom lookup per distinct DID). Unsorted input is still correct, just with more cache misses.
+
+**`specific_version` needs per-version CIDs.** Only collections whose source kept full per-version history with CIDs can use it (e.g. `site.standard.document`). Sources that keep only the latest version of a record (like the `posts` table) can't supply a CID for historical versions — those use the `all_versions` default, which smears one timestamp across every version of the URI.
+
+**Crash safety.** Progress is checkpointed in the metadata store per segment, so a process restart auto-resumes the same job without re-submission and skips segments it already patched. Even if the checkpoint is lost the job is safe to re-run: an already-applied segment produces zero mutations and is skipped. There is no dry-run mode — a real run is safe to start and watch via `getImportStatus`.
+
 ## 9. FAQ
 
 1. **Why store data by indexed timestamp rather than collection?**

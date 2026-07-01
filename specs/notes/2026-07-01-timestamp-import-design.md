@@ -3,7 +3,7 @@
 Date: 2026-07-01
 Branch: `timestamp-import-design` (design); impl branches per milestone (§9)
 Tracking issue: [#193](https://github.com/bluesky-social/jetstream/issues/193)
-Status: design DONE + §8 rewritten; impl M0–M5 DONE (rename + display resolver + segment.Patch + Phase A/B parse+bucket + Phase C apply wired through the compactor), M6+ pending
+Status: design DONE + §8 rewritten; impl M0–M6 DONE (rename + display resolver + segment.Patch + Phase A/B parse+bucket + Phase C apply wired through the compactor + bearer-gated XRPC job model with durable resume, status panel, and metrics), M7 (docs close-out) in progress
 
 > **M4 revised two decisions during implementation** (recorded in place below):
 > **Q-FORMAT** dropped zstd — the import CSV is now **plain (uncompressed)** so
@@ -450,10 +450,17 @@ so the offline-CLI option is rejected. Import runs as an **in-server job**:
   always returns HTTP 401.** Only server admins holding the token may upload or
   modify timestamps. This is jetstream's **first** authenticated surface — no
   admin-auth infra exists today, so we build a minimal bearer-check middleware.
-- Compare tokens in **constant time** (`crypto/subtle.ConstantTimeCompare`) and
-  require the connection be TLS (token is a bearer secret). Wrong/missing token →
-  401; disabled (no token configured) → 401 (do not distinguish, to avoid leaking
-  whether import is enabled).
+- Compare tokens in **constant time** (`crypto/subtle.ConstantTimeCompare`).
+  Wrong/missing token → 401; disabled (no token configured) → 401 (do not
+  distinguish, to avoid leaking whether import is enabled).
+- **REVISED in M6 (drop the in-code TLS requirement).** The original design said
+  "require the connection be TLS." Jetstream serves plain HTTP on a bare TCP
+  listener with TLS terminated at an upstream proxy, so an in-process `r.TLS`
+  check would inspect a connection that is plaintext by construction — it would
+  be theater, not enforcement (Jim's call: "that is a stupid requirement, we
+  should drop it"). The token is still a bearer secret; the **operator is
+  responsible for fronting the endpoint with TLS at the proxy**, documented in
+  the operator notes (§8). No in-code TLS check ships.
 
 **Transport (DECIDED — Q-TRANSPORT): server-local path reference.** The admin
 stages the (tens-of-GB) file onto the box out-of-band (scp/rsync/object-store
@@ -465,7 +472,11 @@ path and confine it to a configured import directory — reject `..`/symlink
 escapes — so the endpoint can't be used to read arbitrary files off the host.)
 
 **Job model (DECIDED — Q-JOBMODEL): async job + status endpoint.** The POST
-validates auth + input, enqueues the job, and returns **202 with a job ID**.
+validates auth + input, enqueues the job, and returns a **job ID**. *(M6 impl
+note: the atmos `xrpcserver` framework serializes a successful procedure as
+HTTP 200, not 202 — it does not expose a per-handler success status — so the
+endpoint returns 200 + `{ "job": "<id>" }`. The async semantics are unchanged;
+only the success code differs from the original "202" phrasing.)*
 A bearer-gated `getImportStatus?job=<id>` reports phase (A/B/C), rows
 parsed/rejected/mutated, segments touched/total, and terminal state. **Only one
 import at a time** (it holds the rewrite lock); a concurrent submit → **409
@@ -918,23 +929,53 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
   checkpoint / status surface / metrics — all M6. `RunImport` is the callable
   core M6 will expose.
 
-### M6 — Job model, auth, resumability, status  [Q-JOB / Q-TRANSPORT / Q-JOBMODEL / Q-RESUME]
-- [ ] Bearer middleware: `--timestamp-import-token` / `JETSTREAM_TIMESTAMP_IMPORT_TOKEN`
-  serve flags (`cmd/jetstream/main.go`); **disabled → 401** when unset;
-  constant-time compare (`crypto/subtle`); require TLS.
-- [ ] XRPC: `network.bsky.jetstream.importTimestamps` (procedure; input =
-  server-local path, confined to a configured import dir — reject `..`/symlink
-  escape) → 202 + job id; `getImportStatus` (query; bearer-gated). Register in
-  `internal/xrpcapi/server.go`; add lexicons + regen `api/jetstream`.
-- [ ] Single-job guard → 409 on concurrent submit.
-- [ ] Checkpoint in pebble (`import/<job>/progress`, per-segment done set) →
-  auto-resume on restart; full-idempotency backstop.
-- [ ] Status page: import job phase/progress panel (Q-JOBMODEL). No per-event
-  imported bit (Q-EXPOSE).
-- [ ] Metrics (§6 J): rows parsed/rejected(by reason)/mutated, DIDs matched,
-  segments examined/skipped-by-bloom/patched, bytes rewritten, phase, duration.
-- [ ] Tests: 401 default + wrong token; path-escape rejection; 409; crash
-  mid-import → resume skips done segments; status/metrics surfaced.
+### M6 — Job model, auth, resumability, status  [Q-JOB / Q-TRANSPORT / Q-JOBMODEL / Q-RESUME]  ✅ DONE
+- [x] **Resume + progress hooks in `RunImport`** (`orchestrator/import_pass.go`):
+  optional `SkipBucket` / `SkipSegment` / `OnSegmentApplied` / `OnPhase` on
+  `ImportJob`. All optional; a zero-value job runs the pre-M6 behavior. The
+  checkpoint fires from the worker right after a segment's atomic rewrite is
+  durable, and a failed checkpoint aborts the job (resume safety lost → stop
+  loud). Red-first tests: resume-skip, SkipBucket-no-reparse, checkpoint-error.
+- [x] **`internal/importer` store-backed single-job manager**: Submit confines
+  the CSV path to the import dir (lexical `..` check *before* touching the fs,
+  then a post-`EvalSymlinks` check for symlink escape), refuses a second
+  concurrent job (`ErrJobInProgress` → 409), persists an initial record, runs
+  async. Durable pebble checkpoint under `import/{current,job/<id>/meta,
+  job/<id>/seg/<idx>}`; `ResumeIncomplete` auto-resumes a non-terminal job at
+  boot; a ctx-cancelled run **pauses** (stays resumable) rather than failing;
+  `Wait` drains in-flight runs before the store closes. TDD caught 3 real bugs
+  (mutex re-entrancy deadlock, store-close-vs-goroutine race, path-order).
+- [x] **Bearer middleware** (`xrpcapi/auth.go`): 401-by-default when no token,
+  constant-time compare (`crypto/subtle`), disabled ≠ wrong-token
+  indistinguishable. **In-code TLS check dropped** — see revised Q-JOB above;
+  the operator fronts the endpoint with TLS at the proxy.
+- [x] **XRPC** (`xrpcapi/importts.go` + lexicons + regen): `importTimestamps`
+  (procedure; server-local path confined to the import dir) → job id;
+  `getImportStatus` (query). Manager sentinels → lexicon error names
+  (`ImportInProgress`→409, `InvalidPath`→400, `JobNotFound`→404). Registered
+  only when a manager is wired; both bearer-gated.
+- [x] **Serve flags**: `--timestamp-import-token` /
+  `JETSTREAM_TIMESTAMP_IMPORT_TOKEN` and `--timestamp-import-dir` /
+  `JETSTREAM_TIMESTAMP_IMPORT_DIR` (default `<data-dir>/imports`). Runtime
+  builds the manager (Runner = orchestrator, `ImportSelector` = manifest,
+  sharing the rewrite lock), auto-resumes at boot, and on shutdown cancels +
+  drains import goroutines **before** closing the store.
+- [x] **Status page**: `status.ImportInfo` + `ImportReporter` seam (status stays
+  decoupled from the importer's types) → "Timestamp import" summary panel
+  (state/phase, apply progress, row totals, error). No per-event imported bit
+  (Q-EXPOSE).
+- [x] **Metrics** (§6 J): `jetstream_import_*` — jobs_total by result,
+  job_duration, phase gauge (0=idle/1=parse_bucket/2=apply), rows
+  parsed/rejected-by-reason/mutated/matched-by-scope/corrupt, DIDs matched,
+  segments examined/patched, bytes_rewritten. (Note: "skipped-by-bloom" is not
+  separately surfaced — the segment-level bloom prefilter happens inside
+  `segment.Patch` after the DID already routed the segment into Phase C, so a
+  bloom-skip here would double-count against `segments_examined`; the metric we
+  ship, patched-vs-examined, is the operationally meaningful one.)
+- [x] Tests: 401 default + wrong token + missing header; path-escape 400; 409
+  concurrent; crash(ctx-cancel) mid-import → resume skips checkpointed segments;
+  status panel render; metrics folded + phase reset. Commits `e8f0ef0`,
+  `3d94104`, `3c64325`, `338f382`, `a300382`, `832b535`.
 
 ### M7 — Docs + close-out
 - [ ] Reconcile `docs/README.md` §8 with the final wire/flag names if they drifted.
