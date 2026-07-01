@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -195,6 +196,100 @@ func TestRunImport_NoCandidateSegmentIsNoop(t *testing.T) {
 	require.EqualValues(t, 1, res.Bucket.RowsNoCandidate)
 	require.EqualValues(t, 0, res.SegmentsExamined)
 	require.EqualValues(t, 0, res.SegmentsPatched)
+}
+
+// TestRunImport_ResumeSkipsCheckpointedSegments proves the resume seam: a job
+// that reuses an existing offset file (SkipBucket) and reports a segment as
+// already-done (SkipSegment) never opens that segment, and the phase/applied
+// callbacks fire with the expected shape.
+func TestRunImport_ResumeSkipsCheckpointedSegments(t *testing.T) {
+	t.Parallel()
+	events := []segment.Event{
+		{Seq: 1, WitnessedAt: 1_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "1", Payload: []byte("v1")},
+	}
+	rig := newImportTestRig(t, events)
+	csv := writeImportCSVFile(t, "uri,timestamp,scope,cid",
+		"at://did:plc:alice/app.bsky.feed.post/r1,2021-12-20T11:33:20Z,all_versions,")
+
+	// First run: bucket + apply normally, capturing which segments completed.
+	jobDir := filepath.Join(t.TempDir(), "job")
+	var applied []uint64
+	var phases []ImportPhase
+	_, err := rig.o.RunImport(context.Background(), ImportJob{
+		CSVPath:          csv,
+		JobDir:           jobDir,
+		OnSegmentApplied: func(idx uint64) error { applied = append(applied, idx); return nil },
+		OnPhase:          func(p ImportPhase, _ int) error { phases = append(phases, p); return nil },
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{0}, applied, "segment 0 applied+checkpointed")
+	require.Equal(t, []ImportPhase{ImportPhaseParseBucket, ImportPhaseApply}, phases)
+
+	// Second run resumes: reuse the offset files (SkipBucket) and treat segment
+	// 0 as already done. It must open nothing and apply nothing.
+	rig.refreshed = nil
+	var applyPhaseSegments = -1
+	res, err := rig.o.RunImport(context.Background(), ImportJob{
+		CSVPath:     csv,
+		JobDir:      jobDir,
+		SkipBucket:  true,
+		SkipSegment: func(idx uint64) bool { return idx == 0 },
+		OnPhase: func(p ImportPhase, n int) error {
+			if p == ImportPhaseApply {
+				applyPhaseSegments = n
+			}
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, res.SegmentsExamined, "checkpointed segment skipped, none examined")
+	require.EqualValues(t, 0, res.SegmentsPatched)
+	require.Equal(t, 0, applyPhaseSegments, "apply phase reports zero segments to process after resume-skip")
+	require.Nil(t, rig.refreshed, "no manifest refresh on a fully-resumed job")
+}
+
+// TestRunImport_SkipBucketDoesNotReparse proves SkipBucket reuses the offset
+// files verbatim: with SkipBucket set and no offset files present, Phase C has
+// nothing to do (it does not re-run the parser).
+func TestRunImport_SkipBucketDoesNotReparse(t *testing.T) {
+	t.Parallel()
+	events := []segment.Event{
+		{Seq: 1, WitnessedAt: 1_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "1", Payload: []byte("v1")},
+	}
+	rig := newImportTestRig(t, events)
+	csv := writeImportCSVFile(t, "uri,timestamp,scope,cid",
+		"at://did:plc:alice/app.bsky.feed.post/r1,2021-12-20T11:33:20Z,all_versions,")
+
+	jobDir := filepath.Join(t.TempDir(), "empty-job")
+	require.NoError(t, os.MkdirAll(jobDir, 0o755))
+	res, err := rig.o.RunImport(context.Background(), ImportJob{
+		CSVPath:    csv,
+		JobDir:     jobDir,
+		SkipBucket: true,
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, res.Parse.RowsValid, "parser did not run under SkipBucket")
+	require.EqualValues(t, 0, res.SegmentsExamined, "no offset files -> nothing to apply")
+}
+
+// TestRunImport_SegmentAppliedCheckpointErrorAborts proves a failed checkpoint
+// aborts the job (resume safety lost -> stop loudly, not continue silently).
+func TestRunImport_SegmentAppliedCheckpointErrorAborts(t *testing.T) {
+	t.Parallel()
+	events := []segment.Event{
+		{Seq: 1, WitnessedAt: 1_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "1", Payload: []byte("v1")},
+	}
+	rig := newImportTestRig(t, events)
+	csv := writeImportCSVFile(t, "uri,timestamp,scope,cid",
+		"at://did:plc:alice/app.bsky.feed.post/r1,2021-12-20T11:33:20Z,all_versions,")
+
+	sentinel := errors.New("checkpoint write failed")
+	_, err := rig.o.RunImport(context.Background(), ImportJob{
+		CSVPath:          csv,
+		JobDir:           filepath.Join(t.TempDir(), "job"),
+		OnSegmentApplied: func(uint64) error { return sentinel },
+	})
+	require.ErrorIs(t, err, sentinel)
 }
 
 // TestRunImport_MutualExclusionWithRewriteLock proves an in-flight import holds

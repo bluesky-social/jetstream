@@ -40,7 +40,30 @@ import (
 // configured with an ImportSelector (import disabled).
 var ErrImportUnavailable = errors.New("orchestrator: timestamp import not configured")
 
+// ImportPhase identifies which phase of a running import a progress callback
+// refers to (design §3.2). The string values are stable: they surface on the
+// operator status page and in persisted job records, so alerting/dashboards
+// key on them.
+type ImportPhase string
+
+const (
+	// ImportPhaseParseBucket is Phase A+B: streaming the CSV, validating rows,
+	// and routing offsets to per-segment offset files.
+	ImportPhaseParseBucket ImportPhase = "parse_bucket"
+	// ImportPhaseApply is Phase C: patching each touched segment via
+	// segment.Patch under the rewrite lock.
+	ImportPhaseApply ImportPhase = "apply"
+)
+
 // ImportJob describes one timestamp-import run.
+//
+// The Skip*/On* hooks are the seam a durable job manager (internal/importer,
+// M6) uses to checkpoint progress and resume after a crash. They are all
+// optional: a zero-value ImportJob (only CSVPath+JobDir set) runs a complete,
+// un-checkpointed import — the pre-M6 behavior — and stays correct because the
+// whole pipeline is idempotent (design §3.4). The hooks only make a resumed
+// job cheaper (skip re-parsing, skip already-applied segments), never change
+// the result.
 type ImportJob struct {
 	// CSVPath is the plain (uncompressed) import CSV, staged server-local
 	// (design Q-TRANSPORT). Must be seekable.
@@ -50,6 +73,41 @@ type ImportJob struct {
 	// is created if absent. Callers should use a unique dir per job so a
 	// resumed/re-run job's offset files do not mingle with another's.
 	JobDir string
+
+	// SkipBucket, when true, skips Phase A+B and applies the offset files
+	// already present in JobDir. A resuming manager sets this only after it
+	// durably recorded that bucketing completed on a prior run: re-running
+	// Phase A+B would O_APPEND a second copy of every offset onto the existing
+	// files (double-counting, though still idempotent at apply). When false
+	// (the default) the caller is responsible for JobDir being empty of stale
+	// offset files, exactly as before.
+	SkipBucket bool
+
+	// SkipSegment, when non-nil, is consulted in Phase C before each touched
+	// segment is opened; returning true skips it (a prior run already applied
+	// and durably checkpointed it). This is an optimization over the
+	// full-idempotency backstop — always returning false is correct, just
+	// re-decompresses already-patched segments. Called concurrently from Phase
+	// C worker goroutines, so it must be safe for concurrent use.
+	SkipSegment func(idx uint64) bool
+
+	// OnSegmentApplied, when non-nil, is called after a touched segment has
+	// been processed in Phase C (patched, or confirmed already at target) and
+	// its bytes are durable on disk, so a manager can add it to its resume
+	// done-set. It fires from the worker goroutine right after the segment's
+	// atomic rewrite, so a crash later in the pass still leaves the completed
+	// segments checkpointed. Returning an error aborts the whole job: a
+	// checkpoint that cannot be persisted means resume safety is lost, and per
+	// the durability directive we stop loudly rather than continue
+	// un-checkpointed. Called concurrently from Phase C workers.
+	OnSegmentApplied func(idx uint64) error
+
+	// OnPhase, when non-nil, is called once as the import enters each phase,
+	// from the RunImport goroutine (never a worker). segmentsToApply is the
+	// number of touched segments Phase C will process (after resume-skips);
+	// it is 0 for ImportPhaseParseBucket, where the count is not yet known. A
+	// returned error aborts the job.
+	OnPhase func(phase ImportPhase, segmentsToApply int) error
 }
 
 // ImportResult aggregates the pipeline's counters for job status (design §6 J).
@@ -97,13 +155,22 @@ func (o *Orchestrator) RunImport(ctx context.Context, job ImportJob) (ImportResu
 
 		// Phase A+B: parse + bucket. No segment is touched, so this runs
 		// outside the rewrite lock. The offset files it writes are the
-		// hand-off to Phase C.
-		parseStats, bucketStats, err := o.runImportBucket(ctx, job)
-		if err != nil {
-			return err
+		// hand-off to Phase C. A resuming job that already durably bucketed
+		// skips this: re-running it would O_APPEND a second copy of every
+		// offset onto the existing files.
+		if !job.SkipBucket {
+			if job.OnPhase != nil {
+				if err := job.OnPhase(ImportPhaseParseBucket, 0); err != nil {
+					return err
+				}
+			}
+			parseStats, bucketStats, err := o.runImportBucket(ctx, job)
+			if err != nil {
+				return err
+			}
+			result.Parse = parseStats
+			result.Bucket = bucketStats
 		}
-		result.Parse = parseStats
-		result.Bucket = bucketStats
 
 		// Phase C: apply, under the rewrite lock (mutually exclusive with
 		// delete-compaction).
@@ -165,9 +232,28 @@ type importSegment struct {
 // runImportApply runs Phase C: patch every segment that has an offset file.
 // Called under the rewrite lock.
 func (o *Orchestrator) runImportApply(ctx context.Context, job ImportJob, result *ImportResult) error {
-	segments, err := o.importTouchedSegments(job.JobDir)
+	all, err := o.importTouchedSegments(job.JobDir)
 	if err != nil {
 		return err
+	}
+	// Drop segments a prior run already applied and checkpointed. The
+	// full-idempotency backstop makes skipping optional, but it avoids
+	// re-decompressing every already-patched segment on a resume.
+	segments := all
+	if job.SkipSegment != nil {
+		segments = segments[:0:0]
+		for _, seg := range all {
+			if job.SkipSegment(seg.file.Idx) {
+				continue
+			}
+			segments = append(segments, seg)
+		}
+	}
+
+	if job.OnPhase != nil {
+		if err := job.OnPhase(ImportPhaseApply, len(segments)); err != nil {
+			return err
+		}
 	}
 	if len(segments) == 0 {
 		return nil
@@ -201,6 +287,18 @@ func (o *Orchestrator) runImportApply(ctx context.Context, job ImportJob, result
 				res, err := o.applyImportSegment(seg, rr)
 				if err != nil {
 					return err
+				}
+				// Checkpoint AFTER the segment's atomic rewrite is durable
+				// (segment.Patch fsync+rename+dir-sync'd, or confirmed the
+				// segment was already at target). A crash later in the pass
+				// then resumes past this segment. Fired before the
+				// same-process manifest refresh, which is safe: a restart
+				// rebuilds the manifest from the patched file's own header, so
+				// a skipped-on-resume segment still serves correct metadata.
+				if job.OnSegmentApplied != nil {
+					if err := job.OnSegmentApplied(seg.file.Idx); err != nil {
+						return fmt.Errorf("orchestrator: import: checkpoint segment %d: %w", seg.file.Idx, err)
+					}
 				}
 				mu.Lock()
 				results = append(results, res)
