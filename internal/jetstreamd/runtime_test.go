@@ -3,6 +3,8 @@ package jetstreamd
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -140,6 +142,38 @@ func TestOptionsValidateRejectsInvalidPlanLimits(t *testing.T) {
 			require.ErrorContains(t, err, tt.want)
 		})
 	}
+}
+
+func TestBuild_CreatesImportDir(t *testing.T) {
+	t.Parallel()
+
+	t.Run("default under data dir", func(t *testing.T) {
+		t.Parallel()
+		opts := testOptions(t)
+		opts.TimestampImportToken = "secret"
+		rt, err := Build(t.Context(), opts)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, rt.Close(context.Background())) })
+
+		info, statErr := os.Stat(filepath.Join(opts.DataDir, "imports"))
+		require.NoError(t, statErr)
+		require.True(t, info.IsDir())
+		require.NotNil(t, rt.importer, "import manager wired even (endpoints 401 without token)")
+	})
+
+	t.Run("explicit dir", func(t *testing.T) {
+		t.Parallel()
+		opts := testOptions(t)
+		dir := filepath.Join(t.TempDir(), "staged")
+		opts.TimestampImportDir = dir
+		rt, err := Build(t.Context(), opts)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, rt.Close(context.Background())) })
+
+		info, statErr := os.Stat(dir)
+		require.NoError(t, statErr)
+		require.True(t, info.IsDir())
+	})
 }
 
 func testOptions(t *testing.T) Options {

@@ -116,13 +116,20 @@ type Options struct {
 	CompactionInterval        time.Duration
 	CompactionTombstoneCap    int
 	CompactionRewriteWorkers  int
-	BarrierBeforeCutover      PhaseBarrier
-	BarrierAfterBootstrap     PhaseBarrier
-	BarrierAfterMerge         PhaseBarrier
-	OnCompactionPass          func(CompactionPassResult)
-	OnBeforeCompactionPass    func(targetWatermark uint64)
-	AfterRepoComplete         func(context.Context, atmos.DID) error
-	CrashInjector             crashpoint.Injector
+
+	// TimestampImportToken is the bearer token gating the timestamp-import
+	// XRPC endpoints. Empty disables import (endpoints return 401).
+	TimestampImportToken string
+	// TimestampImportDir confines the CSV paths the import endpoint may read.
+	// Empty resolves to <DataDir>/imports.
+	TimestampImportDir     string
+	BarrierBeforeCutover   PhaseBarrier
+	BarrierAfterBootstrap  PhaseBarrier
+	BarrierAfterMerge      PhaseBarrier
+	OnCompactionPass       func(CompactionPassResult)
+	OnBeforeCompactionPass func(targetWatermark uint64)
+	AfterRepoComplete      func(context.Context, atmos.DID) error
+	CrashInjector          crashpoint.Injector
 	// StoreFaultInjector is a test-only deterministic metadata-store write
 	// fault seam (store.FaultInjector). nil in production, where it is never
 	// installed on the store, so the fault path is unreachable. Used by the

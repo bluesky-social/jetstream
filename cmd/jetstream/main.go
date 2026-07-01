@@ -357,6 +357,18 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_COMPACTION_REWRITE_WORKERS"),
 				Value:   0,
 			},
+			&cli.StringFlag{
+				Name:    "timestamp-import-token",
+				Usage:   "Bearer token gating the timestamp-import XRPC endpoints. Empty (default) disables import: the endpoints always return 401. Front the endpoint with TLS (terminated by your proxy); the token is a bearer secret.",
+				Sources: cli.EnvVars("JETSTREAM_TIMESTAMP_IMPORT_TOKEN"),
+				Value:   "",
+			},
+			&cli.StringFlag{
+				Name:    "timestamp-import-dir",
+				Usage:   "Directory the timestamp-import endpoint may read staged CSVs from. Submitted paths are confined here (.. and symlink escapes rejected). Empty uses <data-dir>/imports.",
+				Sources: cli.EnvVars("JETSTREAM_TIMESTAMP_IMPORT_DIR"),
+				Value:   "",
+			},
 		},
 		Action: runServe,
 	}
@@ -410,6 +422,8 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		CompactionInterval:          cmd.Duration("compaction-interval"),
 		CompactionTombstoneCap:      cmd.Int("compaction-tombstone-cap"),
 		CompactionRewriteWorkers:    cmd.Int("compaction-rewrite-workers"),
+		TimestampImportToken:        cmd.String("timestamp-import-token"),
+		TimestampImportDir:          cmd.String("timestamp-import-dir"),
 	}, nil
 }
 
