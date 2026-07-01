@@ -3,11 +3,13 @@ package importer_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -236,6 +238,96 @@ func TestSubmit_PathConfinement(t *testing.T) {
 		_, err := m.Submit(context.Background(), "link.csv")
 		require.ErrorIs(t, err, importer.ErrPathEscape)
 	})
+	t.Run("fifo", func(t *testing.T) {
+		require.NoError(t, syscall.Mkfifo(filepath.Join(importDir, "pipe.csv"), 0o644))
+		_, err := m.Submit(context.Background(), "pipe.csv")
+		require.ErrorIs(t, err, importer.ErrNotAFile)
+	})
+}
+
+// TestSubmit_SymlinkedImportDirAccepted: the configured import dir may itself
+// be a symlink (common operator layout: /data/import -> /mnt/storage/csv).
+// Valid paths within it — relative, absolute via the real dir, and absolute
+// via the symlink alias — must all be accepted, and escapes still rejected.
+func TestSubmit_SymlinkedImportDirAccepted(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real-imports")
+	require.NoError(t, os.MkdirAll(realDir, 0o755))
+	linkDir := filepath.Join(base, "import-alias")
+	require.NoError(t, os.Symlink(realDir, linkDir))
+
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	m, err := importer.New(importer.Config{
+		Store:      st,
+		Runner:     &fakeRunner{},
+		ImportDir:  linkDir, // configured through the symlink
+		ScratchDir: filepath.Join(dataDir, "scratch"),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Wait(ctx)
+	})
+	csv := writeCSV(t, realDir, "a.csv")
+
+	id, err := m.Submit(context.Background(), "a.csv")
+	require.NoError(t, err, "relative path within a symlinked import dir")
+	waitTerminal(t, m, id)
+
+	id, err = m.Submit(context.Background(), csv)
+	require.NoError(t, err, "absolute path via the real dir")
+	waitTerminal(t, m, id)
+
+	id, err = m.Submit(context.Background(), filepath.Join(linkDir, "a.csv"))
+	require.NoError(t, err, "absolute path via the symlink alias")
+	waitTerminal(t, m, id)
+
+	_, err = m.Submit(context.Background(), "../../etc/passwd")
+	require.ErrorIs(t, err, importer.ErrPathEscape, "escape still rejected")
+}
+
+// TestSubmit_RelativeImportDirAcceptsAbsolutePath: the default data dir is
+// relative, so the import dir often is too. An absolute submitted path inside
+// it must still be accepted (Rel against a relative root would reject it).
+func TestSubmit_RelativeImportDirAcceptsAbsolutePath(t *testing.T) {
+	// Not Parallel: t.Chdir (relative import dir resolves against cwd).
+	base := t.TempDir()
+	t.Chdir(base)
+	absImportDir := filepath.Join(base, "imports")
+	require.NoError(t, os.MkdirAll(absImportDir, 0o755))
+
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	m, err := importer.New(importer.Config{
+		Store:      st,
+		Runner:     &fakeRunner{},
+		ImportDir:  "imports", // relative spelling, resolves against cwd
+		ScratchDir: filepath.Join(dataDir, "scratch"),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Wait(ctx)
+	})
+	csv := writeCSV(t, absImportDir, "a.csv")
+
+	id, err := m.Submit(context.Background(), csv) // absolute path, relative root
+	require.NoError(t, err)
+	waitTerminal(t, m, id)
+
+	id, err = m.Submit(context.Background(), "a.csv") // relative still works
+	require.NoError(t, err)
+	waitTerminal(t, m, id)
 }
 
 func TestSubmit_AbsolutePathWithinImportDirAccepted(t *testing.T) {
@@ -385,4 +477,109 @@ func TestResumeIncomplete_SkipsCheckpointedSegments(t *testing.T) {
 	require.NotNil(t, job.SkipSegment)
 	require.True(t, job.SkipSegment(0), "segment 0 checkpointed -> skipped")
 	require.False(t, job.SkipSegment(1), "segment 1 not checkpointed -> applied")
+}
+
+// failDuringShutdownRunner returns a genuine (non-cancellation) error only
+// after the run context is cancelled, modelling a real failure racing a
+// graceful shutdown. The job must be marked failed (terminal), not laundered
+// into a resumable pause by the coincidentally-cancelled context.
+type failDuringShutdownRunner struct {
+	cause error
+}
+
+func (r *failDuringShutdownRunner) RunImport(ctx context.Context, _ orchestrator.ImportJob) (orchestrator.ImportResult, error) {
+	<-ctx.Done()
+	return orchestrator.ImportResult{}, r.cause
+}
+
+func TestRun_RealErrorDuringShutdownIsTerminal(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("checkpoint write failed")
+	m, importDir, _ := newTestManager(t, &failDuringShutdownRunner{cause: sentinel})
+	writeCSV(t, importDir, "a.csv")
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	id, err := m.Submit(runCtx, "a.csv")
+	require.NoError(t, err)
+	cancel()
+
+	rec := waitTerminal(t, m, id)
+	require.Equal(t, importer.StateFailed, rec.State,
+		"a genuine error racing shutdown must be terminal, not a pause")
+	require.Contains(t, rec.Error, "checkpoint write failed")
+}
+
+// TestRun_JoinedCancellationAndRealErrorIsTerminal: the orchestrator can
+// return errors.Join(context.Canceled, realFailure) — a worker cancelled at
+// shutdown joined with a failed manifest refresh. errors.Is matches any leaf,
+// so a naive check would pause; the real failure must stay terminal.
+func TestRun_JoinedCancellationAndRealErrorIsTerminal(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("manifest refresh failed")
+	joined := errors.Join(context.Canceled, sentinel)
+	m, importDir, _ := newTestManager(t, &failDuringShutdownRunner{cause: joined})
+	writeCSV(t, importDir, "a.csv")
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	id, err := m.Submit(runCtx, "a.csv")
+	require.NoError(t, err)
+	cancel()
+
+	rec := waitTerminal(t, m, id)
+	require.Equal(t, importer.StateFailed, rec.State,
+		"cancellation joined with a real error must be terminal")
+	require.Contains(t, rec.Error, "manifest refresh failed")
+}
+
+// TestRun_WrappedCancellationPauses: a %w-wrapped pure cancellation (the
+// normal shutdown shape from RunImport) must still classify as a pause.
+func TestRun_WrappedCancellationPauses(t *testing.T) {
+	t.Parallel()
+	wrapped := fmt.Errorf("orchestrator: import: parse/bucket: %w", context.Canceled)
+	m, importDir, _ := newTestManager(t, &failDuringShutdownRunner{cause: wrapped})
+	writeCSV(t, importDir, "a.csv")
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	id, err := m.Submit(runCtx, "a.csv")
+	require.NoError(t, err)
+	cancel()
+	require.NoError(t, m.Wait(context.Background()))
+
+	rec, err := m.Status(id)
+	require.NoError(t, err)
+	require.Equal(t, importer.StateRunning, rec.State,
+		"pure wrapped cancellation stays non-terminal (resumable pause)")
+}
+
+// TestSubmit_RejectedWhilePersistedJobAwaitsResume models the startup window
+// where the HTTP server is already accepting requests but ResumeIncomplete has
+// not yet adopted a persisted non-terminal job: a fresh Manager (m.running ==
+// nil) over a store whose import/current points at a resumable job must refuse
+// a new submit, or it would overwrite the pointer and orphan the paused job.
+func TestSubmit_RejectedWhilePersistedJobAwaitsResume(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+	writeCSV(t, env.importDir, "a.csv")
+
+	stopped := make(chan struct{})
+	crashRunner := &crashAfterSegmentRunner{segments: []uint64{0}, applyOK: nil, stopped: stopped}
+	m1 := env.manager(t, crashRunner)
+	runCtx, cancel := context.WithCancel(context.Background())
+	id, err := m1.Submit(runCtx, "a.csv")
+	require.NoError(t, err)
+	<-stopped
+	cancel() // paused: persisted record stays non-terminal, import/current set
+	require.NoError(t, m1.Wait(context.Background()))
+
+	// "Restarted" manager, resume not yet run: submit must 409.
+	m2 := env.manager(t, &recordingRunner{})
+	_, err = m2.Submit(context.Background(), "a.csv")
+	require.ErrorIs(t, err, importer.ErrJobInProgress)
+
+	// After the paused job resumes and completes, a new submit is accepted.
+	require.NoError(t, m2.ResumeIncomplete(context.Background()))
+	rec := waitTerminal(t, m2, id)
+	require.Equal(t, importer.StateComplete, rec.State)
+	_, err = m2.Submit(context.Background(), "a.csv")
+	require.NoError(t, err)
 }

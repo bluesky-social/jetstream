@@ -74,7 +74,8 @@ var (
 	ErrPathEscape = errors.New("importer: csv path escapes the import directory")
 	// ErrPathNotFound is returned when the resolved path does not exist.
 	ErrPathNotFound = errors.New("importer: csv path not found")
-	// ErrNotAFile is returned when the resolved path is a directory.
+	// ErrNotAFile is returned when the resolved path is not a regular file
+	// (a directory, FIFO, device, or socket).
 	ErrNotAFile = errors.New("importer: csv path is not a regular file")
 	// ErrJobNotFound is returned by Status for an unknown job id.
 	ErrJobNotFound = errors.New("importer: job not found")
@@ -237,6 +238,25 @@ func (m *Manager) Submit(runCtx context.Context, requestedPath string) (string, 
 		m.mu.Unlock()
 		return "", ErrJobInProgress
 	}
+	// The in-memory pointer is not enough: at startup the HTTP server begins
+	// serving before ResumeIncomplete adopts a persisted non-terminal job, so a
+	// submit landing in that window would overwrite import/current and orphan
+	// the resumable job. The persisted pointer is the cross-restart source of
+	// truth; consult it under the same lock.
+	if currentID, ok, err := m.getCurrent(); err != nil {
+		m.mu.Unlock()
+		return "", err
+	} else if ok {
+		current, found, err := m.getRecord(currentID)
+		if err != nil {
+			m.mu.Unlock()
+			return "", err
+		}
+		if found && !current.State.Terminal() {
+			m.mu.Unlock()
+			return "", ErrJobInProgress
+		}
+	}
 	id := m.newJobID()
 	rec := &Record{
 		ID:          id,
@@ -390,13 +410,15 @@ func (m *Manager) run(ctx context.Context, rec Record, resume bool) {
 
 	result, runErr := m.runner.RunImport(ctx, job)
 	if runErr != nil {
-		// A cancelled context is a graceful stop (shutdown), not a job
+		// A cancellation error is a graceful stop (shutdown), not a job
 		// failure: leave the record non-terminal (StateRunning) and the
 		// current-job pointer set so the next boot auto-resumes from the
 		// checkpoint. Only a genuine error marks the job failed (terminal),
 		// which does NOT auto-resume — re-running a deterministically-failing
-		// job would loop; the operator re-submits.
-		if ctx.Err() != nil {
+		// job would loop; the operator re-submits. Classify by the RETURNED
+		// error, not ctx.Err(): a real failure racing shutdown cancellation
+		// must not be laundered into a resumable pause.
+		if isCancellationOnly(runErr) {
 			m.pause(rec.ID)
 			return
 		}
@@ -404,6 +426,37 @@ func (m *Manager) run(ctx context.Context, rec Record, resume bool) {
 		return
 	}
 	m.finishSuccess(rec.ID, result)
+}
+
+// isCancellationOnly reports whether every leaf of err's tree is a context
+// cancellation. errors.Is alone is not enough: the orchestrator can return
+// errors.Join(context.Canceled, realFailure) — a worker cancelled at shutdown
+// joined with, say, a failed manifest refresh — and errors.Is matches ANY
+// leaf, which would launder the real failure into a resumable pause. Pause
+// only when cancellation is the whole story.
+func isCancellationOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == context.Canceled || err == context.DeadlineExceeded { //nolint:errorlint // leaves compared after unwrapping below
+		return true
+	}
+	switch u := err.(type) { //nolint:errorlint // deliberate tree walk
+	case interface{ Unwrap() []error }:
+		children := u.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !isCancellationOnly(child) {
+				return false
+			}
+		}
+		return true
+	case interface{ Unwrap() error }:
+		return isCancellationOnly(u.Unwrap())
+	}
+	return false
 }
 
 // onPhase records phase entry. Entering the apply phase means Phase A+B is
@@ -550,15 +603,26 @@ func (m *Manager) resolveImportPath(requestedPath string) (string, error) {
 	}
 
 	// Resolve the confinement root first; a non-existent import dir is an
-	// operator/config error, surfaced as a generic error (not a 400).
-	root, err := filepath.EvalSymlinks(m.importDir)
+	// operator/config error, surfaced as a generic error (not a 400). The root
+	// is absolutized before symlink resolution: a relative import dir (the
+	// default data dir is relative) would otherwise make filepath.Rel compare
+	// a relative root against absolute submissions and reject them all.
+	aliasRoot, err := filepath.Abs(m.importDir)
+	if err != nil {
+		return "", fmt.Errorf("importer: resolve import dir %q: %w", m.importDir, err)
+	}
+	root, err := filepath.EvalSymlinks(aliasRoot)
 	if err != nil {
 		return "", fmt.Errorf("importer: resolve import dir %q: %w", m.importDir, err)
 	}
 
+	// Relative candidates join to the RESOLVED root, not the alias: when the
+	// configured import dir is itself a symlink the two spellings diverge, and
+	// joining to the unresolved spelling would make every valid relative path
+	// look like an escape against root below.
 	cand := requestedPath
 	if !filepath.IsAbs(cand) {
-		cand = filepath.Join(m.importDir, cand)
+		cand = filepath.Join(root, cand)
 	}
 	cand = filepath.Clean(cand)
 
@@ -568,8 +632,11 @@ func (m *Manager) resolveImportPath(requestedPath string) (string, error) {
 	// out-of-root file exists and mislabel a clear escape attempt). Checking
 	// the cleaned path against the resolved root catches ".." regardless of
 	// existence; the post-EvalSymlinks check below then additionally catches a
-	// symlink whose target escapes.
-	if escapes(root, cand) {
+	// symlink whose target escapes. An absolute path spelled through the
+	// symlinked import-dir alias must also pass: it is checked against the
+	// alias spelling here, and the authoritative post-resolution check against
+	// root still gates it.
+	if escapes(root, cand) && escapes(aliasRoot, cand) {
 		return "", fmt.Errorf("%w: %s", ErrPathEscape, requestedPath)
 	}
 
@@ -591,7 +658,10 @@ func (m *Manager) resolveImportPath(requestedPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("importer: stat csv path %q: %w", requestedPath, err)
 	}
-	if info.IsDir() {
+	// Mode().IsRegular, not !IsDir: a FIFO would pass Submit and then block
+	// RunImport's os.Open in an open(2) that context cancellation cannot
+	// interrupt, wedging the single job slot.
+	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("%w: %s", ErrNotAFile, requestedPath)
 	}
 	return resolved, nil
