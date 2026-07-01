@@ -253,7 +253,7 @@ worth it. Operators with only CIDs resolve them upstream first. (A per-row
 `scope=specific_version` may *additionally* supply a CID to disambiguate a
 version — see §4 D and Q-SCOPE — but the primary key is always the URI.)
 
-### 3.6 DECIDED: 3-way per-row scope selector
+### 3.6 DECIDED: 2-way per-row scope selector
 
 Each row chooses which record version(s) the timestamp applies to, so jetstream
 isn't tied to Atlantis's storage semantics (Atlantis keeps only latest for posts,
@@ -263,8 +263,20 @@ but full history for e.g. `site.standard.document`; other operators differ):
    `(did, collection, rkey)`. Matches "sorted_at is stable across edits."
 2. `specific_version` — requires `cid`; recompute the CID from the stored raw
    DAG-CBOR payload on disk and patch only the matching row.
-3. `latest` — patch the row that survives compaction (highest rev for the path in
-   the segment).
+
+**Dropped: `latest` scope.** An earlier draft had a third `latest` scope ("patch
+the row that survives compaction"). We are **not** implementing it. Its semantics
+are ambiguous under our three-phase pipeline: import runs mutually-exclusive with
+(not after) delete-compaction (§3.3, §6 H), so the same `(did, collection, rkey)`
+can still have multiple un-compacted materializations spread across sealed
+segments at import time. A single global "surviving version" would require a
+cross-segment resolution pass the pipeline doesn't have; resolving "highest rev
+within each segment" independently would instead patch *one row per candidate
+segment* — multiple rows for one path — which is not "latest" in any useful sense.
+Rather than ship an ambiguous scope nobody needs yet, we omit it. `all_versions`
+covers the common case; `specific_version` covers per-version targeting. If a real
+`latest` use case appears, add it then with an explicit cross-segment resolution
+design.
 
 ### 3.7 DECIDED: there is NO on-disk format change and NO migration
 
@@ -323,11 +335,12 @@ Leaning these; call out any you want changed.
   - `uri` — `at://did/collection/rkey`.
   - `timestamp` — **RFC3339** (legible, atproto-conventional), parsed to unix
     micros internally.
-  - `scope` — `all_versions` (default when empty) | `specific_version` | `latest`.
+  - `scope` — `all_versions` (default when empty) | `specific_version`.
   - `cid` — required iff `scope=specific_version`; ignored otherwise.
 - **Validation (durable boundary):** reject malformed URIs, non-positive
   timestamps, `specific_version` without a parseable CID. **Skip-and-report**
-  bad rows with a rejects list + count (§5 Q-REJECT), never whole-file abort.
+  bad rows with counts-by-reason + a bounded sample + a durable rejects artifact
+  (§5 Q-REJECT), never whole-file abort.
 - **E. Conflict semantics:** **last-write-wins** within a file and across
   re-runs; re-importing the same value → zero mutations → skip. Import
   **overwrites** an already-imported display value (§5 Q-OVERWRITE — operator is
@@ -386,8 +399,8 @@ Rules and rationale:
 **Operational limitation (document in §8):** `specific_version` requires the
 operator to *have* a per-version CID for each row. Sources that keep only the
 latest version (e.g. Atlantis's `posts` table stores one `cid`) can't supply it
-for historical versions — those collections use `all_versions` (default) or
-`latest`. `specific_version` is the opt-in path for sources with full per-version
+for historical versions — those collections use `all_versions` (default).
+`specific_version` is the opt-in path for sources with full per-version
 history + CIDs (e.g. `site.standard.document`), letting each historical edit carry
 its own original witnessed time instead of one timestamp smeared across versions.
 
@@ -466,11 +479,18 @@ A new import **clobbers** a prior imported (non-zero) display value. The operato
 is authoritative; this is what lets a bad earlier import be corrected by
 re-running. Idempotent when the value is unchanged (zero mutations → skip rename).
 
-### Q-REJECT — bad-row handling — **DECIDED: skip-and-report**
+### Q-REJECT — bad-row handling — **DECIDED: skip-and-report, bounded status**
 Skip malformed rows (bad URI, non-positive timestamp, `specific_version`
-missing/unparseable CID), continue, and **report a rejects count + a rejects
-list** in job status. A billion-row file must not abort on one typo. Non-silent
-(the count/list is surfaced), satisfying the "no silent fallback" directive.
+missing/unparseable CID), continue, and **report counts-by-reason** in job status.
+A billion-row file must not abort on one typo — but it also must not force an
+unbounded status payload: a mostly-malformed (or adversarial) input has as many
+rejects as rows, so the surfaced list must be capped. Job status therefore returns
+**counts by reason + the first `N` reject samples** (default `N=100`: row number,
+reason, offending field), never the full list. The complete rejected-row set is
+persisted durably to `data/imports/<job>/rejects.csv.zst` (row number, reason,
+bounded diagnostic fields) for offline inspection. Non-silent (counts + sample +
+durable artifact are all surfaced), satisfying the "no silent fallback" directive
+without letting status memory/response grow with the reject count.
 
 ### Q-EXPOSE — surface the "was imported?" bit — **DECIDED: do NOT expose**
 The sentinel-0 imported/not distinction stays **purely internal**. No per-event
@@ -615,8 +635,9 @@ Regardless of (a)/(b): regenerate, don't hand-edit, the lexgen output.
 ## 7. Downstream doc edits once decisions land
 
 - `docs/README.md` §8 — rewrite around this model.
-- §3.2 (block format) — rename columns; note sentinel-0 display semantics + the
-  version bump.
+- §3.2 (block format) — rename columns; note sentinel-0 display semantics, and
+  explicitly state that the block layout and segment `version` do **not** change
+  (§3.7/§3.8).
 - §3.1.2 (header) — `min/max_indexed_at` → `min/max_witnessed_at`.
 - §5.1 — clarify `time_us` = resolved display; retire the line-718 "rendered vs
   indexed" TODO.
@@ -636,7 +657,7 @@ Regardless of (a)/(b): regenerate, don't hand-edit, the lexgen output.
 | Q-FORMAT | CSV+zstd / NDJSON / Parquet | CSV+header+zstd only | **DECIDED** |
 | Q-SORT | require+verify DID-sortedness vs. recommend | recommend + tolerate (Phase A sorts) | **DECIDED** |
 | Q-OVERWRITE | re-import clobber vs. fill-only | overwrite | **DECIDED** |
-| Q-REJECT | skip-and-report vs. whole-file reject | skip-and-report + rejects list | **DECIDED** |
+| Q-REJECT | skip-and-report vs. whole-file reject | skip-and-report + bounded status (counts + sample + durable artifact) | **DECIDED** |
 | Q-EXPOSE | surface "was imported?" bit | do not expose (fully internal) | **DECIDED** |
 | Q-MIGRATE | active-segment format on upgrade | dissolved — no format change | **DISSOLVED** |
 | Q-WIRE-NAMES | rename external wire fields (minIndexedAt→minWitnessedAt) too? | rename wire too, regen lexgen | **DECIDED** |
@@ -739,14 +760,13 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 
 ### M5 — Phase C: apply via `segment.Patch`, wired through the compactor  [§6 H]
 - [ ] Build the per-segment `(did,collection,rkey[,cid])→ts` lookup; `mutate`
-  applies scope rules (`all_versions` / `latest` / `specific_version` with
+  applies scope rules (`all_versions` / `specific_version` with
   `ComputeCID(CodecDagCBOR, payload).Equal` — patch all CID matches, §4a); report
   unmatched CIDs.
 - [ ] Run as a **compaction-pass variant** in `orchestrator/compact_deletes.go`
   worker pool: swap `segment.Rewrite(decide)` → `segment.Patch(mutate)`; share the
   rewrite lock (mutual exclusion with delete-compaction); reuse manifest refresh +
   `segment_compacted` emit.
-- [ ] `latest` scope: resolve highest-rev row per path within the segment.
 - [ ] Tests: e2e on fixture archive — display column patched, witnessed/seq
   untouched, manifest envelope unchanged, `time_us` reflects import after; import
   vs. delete-compaction mutual exclusion; idempotent re-run = no-op.
