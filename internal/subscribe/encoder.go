@@ -36,19 +36,20 @@ func Encode(evt *segment.Event) ([]byte, error) {
 	}
 }
 
-// EncodeExtended renders evt as the extended Jetstream v2 JSON wire
-// format. It is a superset of the v1-compatible shape for v1-visible
-// events, and additionally emits archived #sync events.
-func EncodeExtended(evt *segment.Event) ([]byte, error) {
+// EncodeV2 renders evt as the Jetstream /subscribe-v2 JSON wire format.
+// It is a superset of the v1-compatible shape for v1-visible events
+// (adding seq and commit.record_cbor), and additionally emits archived
+// #sync events.
+func EncodeV2(evt *segment.Event) ([]byte, error) {
 	switch evt.Kind {
 	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
-		return encodeExtendedCommit(evt)
+		return encodeV2Commit(evt)
 	case segment.KindIdentity:
-		return encodeExtendedIdentity(evt)
+		return encodeV2Identity(evt)
 	case segment.KindAccount:
-		return encodeExtendedAccount(evt)
+		return encodeV2Account(evt)
 	case segment.KindSync:
-		return encodeExtendedSync(evt)
+		return encodeV2Sync(evt)
 	default:
 		return nil, fmt.Errorf("subscribe: unknown event kind %d", evt.Kind)
 	}
@@ -85,20 +86,19 @@ func encodeCommit(evt *segment.Event) ([]byte, error) {
 	return json.Marshal(env)
 }
 
-type extendedEvent struct {
-	DID                 string                                  `json:"did"`
-	TimeUS              int64                                   `json:"time_us"`
-	Cursor              uint64                                  `json:"cursor"`
-	Kind                string                                  `json:"kind"`
-	Seq                 uint64                                  `json:"seq"`
-	UpstreamRelayCursor int64                                   `json:"upstream_relay_cursor"`
-	Commit              *extendedCommit                         `json:"commit,omitempty"`
-	Account             *comatproto.SyncSubscribeRepos_Account  `json:"account,omitempty"`
-	Identity            *comatproto.SyncSubscribeRepos_Identity `json:"identity,omitempty"`
-	Sync                *extendedSync                           `json:"sync,omitempty"`
+type v2Event struct {
+	DID      string                                  `json:"did"`
+	TimeUS   int64                                   `json:"time_us"`
+	Cursor   uint64                                  `json:"cursor"`
+	Kind     string                                  `json:"kind"`
+	Seq      uint64                                  `json:"seq"`
+	Commit   *v2Commit                               `json:"commit,omitempty"`
+	Account  *comatproto.SyncSubscribeRepos_Account  `json:"account,omitempty"`
+	Identity *comatproto.SyncSubscribeRepos_Identity `json:"identity,omitempty"`
+	Sync     *v2Sync                                 `json:"sync,omitempty"`
 }
 
-type extendedCommit struct {
+type v2Commit struct {
 	Rev        string          `json:"rev"`
 	Operation  string          `json:"operation"`
 	Collection string          `json:"collection"`
@@ -108,9 +108,9 @@ type extendedCommit struct {
 	RecordCBOR string          `json:"record_cbor,omitempty"`
 }
 
-// Keep Jetstream's extended wire shape independent from atmos's generated
+// Keep Jetstream's v2 wire shape independent from atmos's generated
 // atproto JSON encoding for bytes, which uses DAG-JSON {"$bytes": "..."}.
-type extendedSync struct {
+type v2Sync struct {
 	LexiconTypeID string `json:"$type,omitempty"`
 	Blocks        []byte `json:"blocks"`
 	DID           string `json:"did"`
@@ -119,19 +119,18 @@ type extendedSync struct {
 	Time          string `json:"time"`
 }
 
-func extendedEnvelope(evt *segment.Event, kind string) extendedEvent {
-	return extendedEvent{
-		DID:                 evt.DID,
-		TimeUS:              evt.IndexedAt,
-		Cursor:              evt.Seq,
-		Kind:                kind,
-		Seq:                 evt.Seq,
-		UpstreamRelayCursor: evt.UpstreamRelayCursor,
+func v2Envelope(evt *segment.Event, kind string) v2Event {
+	return v2Event{
+		DID:    evt.DID,
+		TimeUS: evt.IndexedAt,
+		Cursor: evt.Seq,
+		Kind:   kind,
+		Seq:    evt.Seq,
 	}
 }
 
-func encodeExtendedCommit(evt *segment.Event) ([]byte, error) {
-	commit := &extendedCommit{
+func encodeV2Commit(evt *segment.Event) ([]byte, error) {
+	commit := &v2Commit{
 		Rev:        evt.Rev,
 		Operation:  commitOpString(evt.Kind),
 		Collection: evt.Collection,
@@ -152,7 +151,7 @@ func encodeExtendedCommit(evt *segment.Event) ([]byte, error) {
 		commit.RecordCBOR = base64.StdEncoding.EncodeToString(evt.Payload)
 	}
 
-	env := extendedEnvelope(evt, streaming.JetstreamKindCommit)
+	env := v2Envelope(evt, streaming.JetstreamKindCommit)
 	env.Commit = commit
 	return json.Marshal(&env)
 }
@@ -170,33 +169,33 @@ func commitOpString(k segment.Kind) string {
 	}
 }
 
-func encodeExtendedIdentity(evt *segment.Event) ([]byte, error) {
+func encodeV2Identity(evt *segment.Event) ([]byte, error) {
 	var id comatproto.SyncSubscribeRepos_Identity
 	if err := id.UnmarshalCBOR(evt.Payload); err != nil {
 		return nil, fmt.Errorf("subscribe: decode identity: %w", err)
 	}
-	env := extendedEnvelope(evt, streaming.JetstreamKindIdentity)
+	env := v2Envelope(evt, streaming.JetstreamKindIdentity)
 	env.Identity = &id
 	return json.Marshal(&env)
 }
 
-func encodeExtendedAccount(evt *segment.Event) ([]byte, error) {
+func encodeV2Account(evt *segment.Event) ([]byte, error) {
 	var acct comatproto.SyncSubscribeRepos_Account
 	if err := acct.UnmarshalCBOR(evt.Payload); err != nil {
 		return nil, fmt.Errorf("subscribe: decode account: %w", err)
 	}
-	env := extendedEnvelope(evt, streaming.JetstreamKindAccount)
+	env := v2Envelope(evt, streaming.JetstreamKindAccount)
 	env.Account = &acct
 	return json.Marshal(&env)
 }
 
-func encodeExtendedSync(evt *segment.Event) ([]byte, error) {
+func encodeV2Sync(evt *segment.Event) ([]byte, error) {
 	var sync comatproto.SyncSubscribeRepos_Sync
 	if err := sync.UnmarshalCBOR(evt.Payload); err != nil {
 		return nil, fmt.Errorf("subscribe: decode sync: %w", err)
 	}
-	env := extendedEnvelope(evt, "sync")
-	env.Sync = &extendedSync{
+	env := v2Envelope(evt, "sync")
+	env.Sync = &v2Sync{
 		LexiconTypeID: sync.LexiconTypeID,
 		Blocks:        sync.Blocks,
 		DID:           sync.DID,

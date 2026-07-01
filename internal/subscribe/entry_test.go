@@ -57,32 +57,32 @@ func TestEntry_MemoizesSkipSentinel(t *testing.T) {
 	require.Nil(t, body2)
 }
 
-func TestEntry_MemoizesSimpleAndExtendedIndependently(t *testing.T) {
+func TestEntry_MemoizesV1AndV2Independently(t *testing.T) {
 	t.Parallel()
-	var simpleCalls atomic.Int64
-	var extendedCalls atomic.Int64
+	var v1Calls atomic.Int64
+	var v2Calls atomic.Int64
 	e := newEntry(&segment.Event{Seq: 1, Kind: segment.KindDelete, DID: "did:plc:s"})
 	e.encodeFn = func(*segment.Event) ([]byte, error) {
-		simpleCalls.Add(1)
-		return []byte(`{"mode":"simple"}`), nil
+		v1Calls.Add(1)
+		return []byte(`{"mode":"v1"}`), nil
 	}
-	e.encodeExtendedFn = func(*segment.Event) ([]byte, error) {
-		extendedCalls.Add(1)
-		return []byte(`{"mode":"extended"}`), nil
+	e.encodeV2Fn = func(*segment.Event) ([]byte, error) {
+		v2Calls.Add(1)
+		return []byte(`{"mode":"v2"}`), nil
 	}
 
 	for range 3 {
 		body, err := e.Encoded()
 		require.NoError(t, err)
-		require.Equal(t, []byte(`{"mode":"simple"}`), body)
+		require.Equal(t, []byte(`{"mode":"v1"}`), body)
 
-		body, err = e.EncodedExtended()
+		body, err = e.EncodedV2()
 		require.NoError(t, err)
-		require.Equal(t, []byte(`{"mode":"extended"}`), body)
+		require.Equal(t, []byte(`{"mode":"v2"}`), body)
 	}
 
-	require.Equal(t, int64(1), simpleCalls.Load())
-	require.Equal(t, int64(1), extendedCalls.Load())
+	require.Equal(t, int64(1), v1Calls.Load())
+	require.Equal(t, int64(1), v2Calls.Load())
 }
 
 func TestEntry_CompressedMemoizesOnceAndDecodes(t *testing.T) {
@@ -132,12 +132,12 @@ func TestEntry_CompressedPropagatesSkipSentinel(t *testing.T) {
 	require.Nil(t, body)
 }
 
-// TestEntry_CompressedExtended_SyncEmitsDecodableFrame pins the divergence
-// between the v1 and extended wire shapes for KindSync events: the v1 path
-// returns errSkipEvent (no frame emitted) while the extended path emits a
-// real frame. This catches any future mis-wiring of CompressedExtended to
+// TestEntry_CompressedV2_SyncEmitsDecodableFrame pins the divergence
+// between the v1 and v2 wire shapes for KindSync events: the v1 path
+// returns errSkipEvent (no frame emitted) while the v2 path emits a
+// real frame. This catches any future mis-wiring of CompressedV2 to
 // the v1 source.
-func TestEntry_CompressedExtended_SyncEmitsDecodableFrame(t *testing.T) {
+func TestEntry_CompressedV2_SyncEmitsDecodableFrame(t *testing.T) {
 	t.Parallel()
 
 	sync := &comatproto.SyncSubscribeRepos_Sync{
@@ -151,13 +151,12 @@ func TestEntry_CompressedExtended_SyncEmitsDecodableFrame(t *testing.T) {
 	require.NoError(t, err)
 
 	e := newEntry(&segment.Event{
-		Seq:                 77,
-		IndexedAt:           1_700_000_000_000_000,
-		UpstreamRelayCursor: 555,
-		Kind:                segment.KindSync,
-		DID:                 "did:plc:testsync",
-		Rev:                 "rev-sync-test",
-		Payload:             payload,
+		Seq:       77,
+		IndexedAt: 1_700_000_000_000_000,
+		Kind:      segment.KindSync,
+		DID:       "did:plc:testsync",
+		Rev:       "rev-sync-test",
+		Payload:   payload,
 	})
 
 	// v1 path must skip #sync events.
@@ -165,15 +164,15 @@ func TestEntry_CompressedExtended_SyncEmitsDecodableFrame(t *testing.T) {
 	require.ErrorIs(t, compressedErr, errSkipEvent, "v1 Compressed must return errSkipEvent for KindSync")
 	require.Nil(t, compressedBody)
 
-	// Extended path must emit a decodable frame.
-	extBody, extErr := e.CompressedExtended()
-	require.NoError(t, extErr, "CompressedExtended must not return an error for KindSync")
-	require.NotNil(t, extBody, "CompressedExtended must return a non-nil frame for KindSync")
+	// v2 path must emit a decodable frame.
+	v2Body, v2Err := e.CompressedV2()
+	require.NoError(t, v2Err, "CompressedV2 must not return an error for KindSync")
+	require.NotNil(t, v2Body, "CompressedV2 must return a non-nil frame for KindSync")
 
 	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionary))
 	require.NoError(t, err)
 	defer dec.Close()
-	decoded, err := dec.DecodeAll(extBody, nil)
+	decoded, err := dec.DecodeAll(v2Body, nil)
 	require.NoError(t, err)
 
 	require.Contains(t, string(decoded), `"kind":"sync"`, "decoded frame must contain kind:sync")

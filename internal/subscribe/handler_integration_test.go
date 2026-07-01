@@ -167,10 +167,10 @@ func newCursorReplaySubscription(t *testing.T, minSeq, maxSeq uint64, rejectBelo
 
 	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{
 		Tail: b, Store: st, Manifest: m, Writer: w,
-		Logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Metrics:                subscribe.NewMetrics(prometheus.NewRegistry()),
-		Lookback:               36 * time.Hour,
-		RejectCursorBelowFloor: rejectBelowFloor,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:  subscribe.NewMetrics(prometheus.NewRegistry()),
+		Lookback: 36 * time.Hour,
+		V2:       rejectBelowFloor,
 	}))
 	t.Cleanup(srv.Close)
 	return srv

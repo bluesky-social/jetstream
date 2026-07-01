@@ -13,7 +13,7 @@ import (
 // emitting.
 var errSkipFrame = errors.New("jetstream: skip live frame")
 
-// liveFrame is the extended Jetstream JSON wire shape (/subscribe-v2?extended=true).
+// liveFrame is the Jetstream /subscribe-v2 JSON wire shape.
 // Only the fields the client consumes are modeled; unknown fields are ignored,
 // and unknown kinds are skipped so future control frames don't break old
 // clients.
@@ -62,7 +62,7 @@ type liveSync struct {
 	Time string `json:"time"`
 }
 
-// decodeLiveFrame parses one extended JSON frame into an engine Event. It
+// decodeLiveFrame parses one /subscribe-v2 JSON frame into an engine Event. It
 // returns errSkipFrame for control frames and unknown kinds, and a wrapped
 // error for malformed data frames or server error frames. mode selects raw vs.
 // map record materialization (see recordDecodeMode), matching the backfill path
@@ -77,8 +77,8 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, error) {
 	}
 
 	out := Event{DID: f.DID, Seq: f.Seq, TimeUS: f.TimeUS}
-	// The simple wire format omits seq and carries the value only in cursor;
-	// extended always sets both. Fall back to cursor so a server that only
+	// The v1 wire format omits seq and carries the value only in cursor;
+	// v2 always sets both. Fall back to cursor so a server that only
 	// populates cursor still yields a usable seq.
 	if out.Seq == 0 {
 		out.Seq = f.Cursor
@@ -132,7 +132,7 @@ func liveCommitToEvent(c *liveCommit, mode recordDecodeMode) (*Commit, error) {
 	switch commit.Operation {
 	case OpCreate, OpUpdate:
 		if c.RecordCBOR == "" {
-			return nil, fmt.Errorf("jetstream: live %s commit missing record_cbor (collection=%s rkey=%s); connect with extended=true", c.Operation, c.Collection, c.Rkey)
+			return nil, fmt.Errorf("jetstream: live %s commit missing record_cbor (collection=%s rkey=%s); is the server a /subscribe-v2 endpoint?", c.Operation, c.Collection, c.Rkey)
 		}
 		raw, err := base64.StdEncoding.DecodeString(c.RecordCBOR)
 		if err != nil {

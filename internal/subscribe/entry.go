@@ -17,23 +17,23 @@ type Entry struct {
 	body []byte
 	err  error
 
-	extendedOnce sync.Once
-	extendedBody []byte
-	extendedErr  error
+	v2Once sync.Once
+	v2Body []byte
+	v2Err  error
 
 	compressedOnce sync.Once
 	compressedBody []byte
 	compressedErr  error
 
-	compressedExtendedOnce sync.Once
-	compressedExtendedBody []byte
-	compressedExtendedErr  error
+	compressedV2Once sync.Once
+	compressedV2Body []byte
+	compressedV2Err  error
 
 	// encodeFn defaults to Encode; overridable in tests.
 	encodeFn func(*segment.Event) ([]byte, error)
 
-	// encodeExtendedFn defaults to EncodeExtended; overridable in tests.
-	encodeExtendedFn func(*segment.Event) ([]byte, error)
+	// encodeV2Fn defaults to EncodeV2; overridable in tests.
+	encodeV2Fn func(*segment.Event) ([]byte, error)
 }
 
 // newEntry wraps ev. The event's Payload is treated as read-only (it may
@@ -57,16 +57,16 @@ func (e *Entry) Encoded() ([]byte, error) {
 	return e.body, e.err
 }
 
-// EncodedExtended returns the memoized extended wire encoding for this entry.
-func (e *Entry) EncodedExtended() ([]byte, error) {
-	e.extendedOnce.Do(func() {
-		fn := e.encodeExtendedFn
+// EncodedV2 returns the memoized /subscribe-v2 wire encoding for this entry.
+func (e *Entry) EncodedV2() ([]byte, error) {
+	e.v2Once.Do(func() {
+		fn := e.encodeV2Fn
 		if fn == nil {
-			fn = EncodeExtended
+			fn = EncodeV2
 		}
-		e.extendedBody, e.extendedErr = fn(e.Event)
+		e.v2Body, e.v2Err = fn(e.Event)
 	})
-	return e.extendedBody, e.extendedErr
+	return e.v2Body, e.v2Err
 }
 
 // Compressed returns the memoized v1-shape JSON encoding compressed as a
@@ -87,17 +87,17 @@ func (e *Entry) Compressed() ([]byte, error) {
 	return e.compressedBody, e.compressedErr
 }
 
-// CompressedExtended is Compressed for the extended (v2) wire shape.
-func (e *Entry) CompressedExtended() ([]byte, error) {
-	e.compressedExtendedOnce.Do(func() {
-		body, err := e.EncodedExtended()
+// CompressedV2 is Compressed for the /subscribe-v2 wire shape.
+func (e *Entry) CompressedV2() ([]byte, error) {
+	e.compressedV2Once.Do(func() {
+		body, err := e.EncodedV2()
 		if err != nil {
-			e.compressedExtendedErr = err
+			e.compressedV2Err = err
 			return
 		}
-		e.compressedExtendedBody = compressFrame(body)
+		e.compressedV2Body = compressFrame(body)
 	})
-	return e.compressedExtendedBody, e.compressedExtendedErr
+	return e.compressedV2Body, e.compressedV2Err
 }
 
 // approxBytes estimates the entry's memory footprint for the hot ring's
@@ -105,7 +105,7 @@ func (e *Entry) CompressedExtended() ([]byte, error) {
 // memoized encodings are intentionally excluded — they are bounded by the
 // same ring (evicted FIFO with the entry) and counting them would
 // double-count the shared bytes. An entry may memoize up to four payloads
-// (simple/extended JSON × plain/zstd) when a mix of subscriber types is
+// (v1/v2 JSON × plain/zstd) when a mix of subscriber types is
 // connected; the off-budget overhang stays O(ring length).
 func (e *Entry) approxBytes() int {
 	ev := e.Event

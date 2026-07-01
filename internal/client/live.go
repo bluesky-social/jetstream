@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	// defaultLiveReadLimit bounds a single websocket message. Extended frames
+	// defaultLiveReadLimit bounds a single websocket message. v2 frames
 	// carry base64 record CBOR; a generous ceiling tolerates large records
 	// without allowing an unbounded allocation from a hostile server.
 	defaultLiveReadLimit = 32 << 20 // 32 MiB
@@ -92,7 +92,7 @@ func (c liveConfig) maxBackoff() time.Duration {
 	return liveBackoffMax
 }
 
-// liveConsumer tails /subscribe-v2 in extended mode, decoding frames into
+// liveConsumer tails /subscribe-v2, decoding frames into
 // engine events, deduplicating the at-least-once overlap by seq, and
 // reconnecting with bounded exponential backoff. It is the live half of the
 // stream: the engine consumes its output during cutover (buffered) and in
@@ -246,7 +246,6 @@ func (c *liveConsumer) subscribeURL() string {
 	}
 	u.Path = "/subscribe-v2"
 	q := url.Values{}
-	q.Set("extended", "true")
 	// Wire cursor: once any event has been delivered, resume each new session at
 	// lastSeq (the highest seq delivered). subscribeURL is rebuilt on every
 	// reconnect, so anchoring at lastSeq is what keeps a stream from re-anchoring

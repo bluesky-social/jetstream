@@ -275,8 +275,8 @@ reads go through the client-driven tier above (the archive transport real
 clients use), per issue #77.
 
 The replay tier validates hot tail / cold reader handoff, cursor semantics,
-JSON encoding, extended events, pending writer snapshots, manifest refresh,
-and compaction cache invalidation.
+JSON encoding (v1 and v2 wire shapes), pending writer snapshots, manifest
+refresh, and compaction cache invalidation.
 
 ### XRPC Segment Egress Tier
 

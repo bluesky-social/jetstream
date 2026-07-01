@@ -52,16 +52,19 @@ type Subscription struct {
 	// cursor replay entirely (cursors are silently dropped to live).
 	Lookback time.Duration
 
-	// EmitResyncReplacementRows enables the v2 presentation policy used by
-	// /subscribe-v2. The default false preserves Jetstream v1 behavior by
-	// advancing over Sync 1.1 resync replacement rows without emitting them.
-	EmitResyncReplacementRows bool
-
-	// RejectCursorBelowFloor enables the v2 too-old policy: a seq cursor that
-	// resolves below the lookback floor returns a pre-upgrade HTTP 400 carrying
-	// the floor seq, instead of being silently clamped. Set true on
-	// /subscribe-v2; the default false preserves v1's legacy silent clamp.
-	RejectCursorBelowFloor bool
+	// V2 selects the /subscribe-v2 presentation policy as a bundle:
+	//
+	//   - the v2 wire shape (seq + commit.record_cbor on every event, and
+	//     archived #sync events emitted rather than skipped),
+	//   - Sync 1.1 resync replacement rows are emitted (v1 advances over
+	//     them silently for wire parity),
+	//   - a seq cursor below the lookback floor is REJECTED with a
+	//     pre-upgrade HTTP 400 carrying the floor seq (v1 silently clamps).
+	//
+	// The default false preserves Jetstream v1 behavior on /subscribe.
+	// These are deliberately one flag: the policies describe one endpoint
+	// contract and must not be mixed and matched.
+	V2 bool
 }
 
 func (d Subscription) writer() *ingest.Writer {
@@ -120,7 +123,6 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	}
 
 	requireHello := parseRequireHello(values)
-	extended := values.Get("extended") == "true"
 
 	// Resolve cursor BEFORE upgrade so a bad cursor returns HTTP 400.
 	rawCursor := values.Get("cursor")
@@ -172,7 +174,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 			Manifest:         deps.Manifest,
 			NextSeq:          deps.writer().NextSeq(),
 			Lookback:         deps.Lookback,
-			RejectBelowFloor: deps.RejectCursorBelowFloor,
+			RejectBelowFloor: deps.V2,
 		})
 		deps.Metrics.observeCursorResolveSeconds(time.Since(resolveStart).Seconds())
 		if err != nil {
@@ -295,7 +297,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		startSeq = deps.Tail.Tip()
 	}
 
-	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, extended, wantZstd, logger)
+	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, wantZstd, logger)
 }
 
 func runReader(
@@ -363,7 +365,6 @@ func runSubscriberLoop(
 	deps Subscription,
 	filterPtr *atomic.Pointer[Filter],
 	startSeq uint64,
-	extended bool,
 	compress bool,
 	logger *slog.Logger,
 ) {
@@ -426,7 +427,7 @@ func runSubscriberLoop(
 
 		for _, e := range batch {
 			f := filterPtr.Load()
-			if e.Event.Kind.IsResyncReplacement() && !deps.EmitResyncReplacementRows {
+			if e.Event.Kind.IsResyncReplacement() && !deps.V2 {
 				deps.Metrics.incEventsSkippedResync()
 				continue
 			}
@@ -442,8 +443,8 @@ func runSubscriberLoop(
 			// A deliberate, documented divergence from v1.
 			var body []byte
 			var eerr error
-			if extended {
-				body, eerr = e.EncodedExtended()
+			if deps.V2 {
+				body, eerr = e.EncodedV2()
 			} else {
 				body, eerr = e.Encoded()
 			}
@@ -471,8 +472,8 @@ func runSubscriberLoop(
 			payload := body
 			if compress {
 				var cerr error
-				if extended {
-					payload, cerr = e.CompressedExtended()
+				if deps.V2 {
+					payload, cerr = e.CompressedV2()
 				} else {
 					payload, cerr = e.Compressed()
 				}
