@@ -75,7 +75,14 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 
 	return obs.Span(ctx, func(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
-		if err := removeStaleCompactionTemps(segmentsDir); err != nil {
+		// Cleanup must hold the rewrite lock: a timestamp-import Phase C in
+		// flight has a live seg_*.jss.tmp open (segment.Patch), and unlinking
+		// it here would make the import's rename fail spuriously. Under the
+		// lock, any *.jss.tmp we see is genuinely stale — no rewrite is in
+		// flight while we hold it.
+		if err := o.withRewriteLock(func() error {
+			return removeStaleCompactionTemps(segmentsDir)
+		}); err != nil {
 			return err
 		}
 

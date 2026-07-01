@@ -77,8 +77,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 		// A crash mid-rewrite can leave a segment-sized *.jss.tmp
 		// behind; reclaim it at boot even when compaction is disabled
-		// (each pass also cleans at start).
-		if err := removeStaleCompactionTemps(filepath.Join(o.cfg.DataDir, "segments")); err != nil {
+		// (each pass also cleans at start). Under the rewrite lock so a
+		// live rewrite's tmp is never unlinked, should an import be
+		// dispatched this early.
+		if err := o.withRewriteLock(func() error {
+			return removeStaleCompactionTemps(filepath.Join(o.cfg.DataDir, "segments"))
+		}); err != nil {
 			return err
 		}
 

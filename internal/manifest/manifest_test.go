@@ -318,6 +318,45 @@ func TestGenerationAdvancesOnMutation(t *testing.T) {
 	require.Greater(t, g2, g1, "compaction refresh must advance the generation")
 }
 
+// TestRefreshSegment_RejectedRefreshLeavesManifestUntouched pins the
+// commit-or-nothing contract of a manifest refresh: a refresh rejected by the
+// seq-monotonicity validation must leave BOTH the resident segment set and the
+// generation exactly as they were. If the rejected metadata stayed resident
+// while the generation did not move, serving paths would observe the corrupt
+// set and generation-tagged caches (the import bucketer) would keep treating
+// their entries as fresh against it.
+func TestRefreshSegment_RejectedRefreshLeavesManifestUntouched(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path0 := filepath.Join(dir, "seg_0000000000.jss")
+	path1 := filepath.Join(dir, "seg_0000000001.jss")
+	mustWriteSealedSegment(t, path0, sealedFixture{
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 1_999, eventCount: 10,
+	})
+	mustWriteSealedSegment(t, path1, sealedFixture{
+		minSeq: 10, maxSeq: 19, minWitnessedAt: 2_000, maxWitnessedAt: 2_999, eventCount: 10,
+	})
+	m := mustOpenManifest(t, dir)
+	genBefore := m.Generation()
+	before, _, _ := m.ListFrom(0, 2)
+	require.Len(t, before, 2)
+
+	// Replace segment 1 on disk with a seq envelope overlapping segment 0 and
+	// refresh it: validation must reject the refresh.
+	overlapping := filepath.Join(dir, "overlap.jss.staging")
+	mustWriteSealedSegment(t, overlapping, sealedFixture{
+		minSeq: 5, maxSeq: 15, minWitnessedAt: 1_500, maxWitnessedAt: 2_500, eventCount: 10,
+	})
+	require.NoError(t, os.Rename(overlapping, path1))
+	require.ErrorIs(t, m.OnSegmentSealed(1, path1), manifest.ErrSegmentSeqOverlap)
+
+	require.Equal(t, genBefore, m.Generation(),
+		"rejected refresh must not advance the generation")
+	after, _, _ := m.ListFrom(0, 2)
+	require.Equal(t, before, after,
+		"rejected refresh must leave the resident segment set untouched")
+}
+
 func mustOpenManifest(t *testing.T, dir string) *manifest.Manifest {
 	t.Helper()
 	m, err := manifest.Open(manifest.Options{

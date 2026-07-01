@@ -104,6 +104,32 @@ func (rr *RowReader) ReadRow(off int64) (Row, error) {
 	if off < 0 || off >= rr.size {
 		return Row{}, fmt.Errorf("%w: offset %d out of range [0,%d)", ErrCorruptOffset, off, rr.size)
 	}
+	// A genuine Phase B offset is always a record start: the byte before it is
+	// the previous row's terminating newline (offset 0 is the header, never a
+	// data row, so it is rejected too). Without this check a stale offset into
+	// a swapped file could land mid-record and still parse: a suffix that
+	// happens to decode as a valid row would be applied even though Phase A
+	// never accepted it. Field-level re-validation cannot catch that case;
+	// only the boundary can.
+	//
+	// Known limitation (accepted): a newline embedded in a quoted field also
+	// satisfies this check, so an offset into such a multi-line record could
+	// still parse as a suffix row. Closing it needs global quote parity (a
+	// full re-scan or a size+hash binding of CSV to job) — deliberately not
+	// done: the only actor who can swap the CSV is the operator, who can
+	// already import arbitrary timestamps honestly, and an accidental desync
+	// producing a valid-parsing suffix behind a quoted newline is vanishingly
+	// unlikely.
+	if off == 0 {
+		return Row{}, fmt.Errorf("%w: offset 0 points at the header, not a data row", ErrCorruptOffset)
+	}
+	var prev [1]byte
+	if _, err := rr.f.ReadAt(prev[:], off-1); err != nil {
+		return Row{}, fmt.Errorf("timestamp: read byte before offset %d: %w", off, err)
+	}
+	if prev[0] != '\n' {
+		return Row{}, fmt.Errorf("%w: offset %d is not at a row boundary", ErrCorruptOffset, off)
+	}
 	span := min(rr.size-off, maxRowScanBytes)
 	sr := io.NewSectionReader(rr.f, off, span)
 	row, ok, err := parseOneRow(sr, off, rr.cols)

@@ -709,35 +709,41 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	i := sort.Search(len(m.segments), func(i int) bool {
-		return m.segments[i].Idx >= idx
+	// Build the refreshed set in a candidate copy and validate it BEFORE
+	// committing, so a rejected refresh leaves the resident set (and the
+	// generation) exactly as they were: serving paths must never observe the
+	// rejected metadata, and a generation-tagged cache entry (the import
+	// bucketer's) tagged with the unmoved generation must still describe the
+	// unmoved resident set.
+	next := make([]SegmentMetadata, len(m.segments), len(m.segments)+1)
+	copy(next, m.segments)
+	i := sort.Search(len(next), func(i int) bool {
+		return next[i].Idx >= idx
 	})
 	switch {
-	case i < len(m.segments) && m.segments[i].Idx == idx:
+	case i < len(next) && next[i].Idx == idx:
 		// In-place refresh of an existing segment (the compaction-rewrite
 		// path): the seq envelope is preserved across rewrites, so this can
 		// only re-validate an already-valid neighbour relationship. Still
 		// re-checked below so a genuinely corrupt refreshed header is caught.
-		m.segments[i] = meta
-	case i == len(m.segments):
-		m.segments = append(m.segments, meta)
+		next[i] = meta
+	case i == len(next):
+		next = append(next, meta)
 	default:
-		m.segments = append(m.segments, SegmentMetadata{})
-		copy(m.segments[i+1:], m.segments[i:])
-		m.segments[i] = meta
+		next = append(next, SegmentMetadata{})
+		copy(next[i+1:], next[i:])
+		next[i] = meta
 	}
 
 	// Enforce the cross-segment seq-monotonicity invariant the backfill planner
 	// (and SegmentForSeq/LookbackFloor) rely on. A refresh that introduces an
 	// out-of-order seq envelope is corrupt internal state; refuse it loudly
 	// rather than serve a manifest the planner would silently mis-paginate.
-	if verr := validateSegmentSeqMonotonicity(m.segments); verr != nil {
+	if verr := validateSegmentSeqMonotonicity(next); verr != nil {
 		return verr
 	}
 
-	// Bump only after the mutation is committed and validated: a rejected
-	// refresh returns above with the resident set unchanged, so its
-	// generation must not move (a cache tagged with it is still valid).
+	m.segments = next
 	m.generation++
 
 	if m.opts.Metrics != nil {

@@ -112,6 +112,39 @@ func TestRowReader_CorruptOffsetRejected(t *testing.T) {
 	// Offset past EOF.
 	_, err = rr.ReadRow(1 << 30)
 	require.ErrorIs(t, err, timestamp.ErrCorruptOffset)
+
+	// Offset 0 is the header, never a data row.
+	_, err = rr.ReadRow(0)
+	require.ErrorIs(t, err, timestamp.ErrCorruptOffset)
+}
+
+// TestRowReader_MidRecordOffsetRejectedEvenIfSuffixParses pins the row-boundary
+// check: an offset whose preceding byte is not a newline is corrupt (Phase B
+// only ever records record starts) and must be rejected EVEN when the bytes
+// from that offset happen to decode as a valid row. Field re-validation alone
+// cannot catch this: here the uri field carries leading spaces (trimmed by
+// validation), so the suffix starting two bytes in parses to the same valid
+// row — a stale offset into a swapped file could otherwise apply an
+// instruction Phase A never accepted.
+func TestRowReader_MidRecordOffsetRejectedEvenIfSuffixParses(t *testing.T) {
+	t.Parallel()
+	path := writeImportCSV(t, "uri,timestamp,scope,cid",
+		"  at://did:plc:alice/app.bsky.feed.post/r1,2022-01-02T03:04:05Z,,")
+	rr, err := timestamp.OpenRowReader(path)
+	require.NoError(t, err)
+	defer func() { _ = rr.Close() }()
+
+	headerLen := int64(len("uri,timestamp,scope,cid") + 1)
+
+	// The true record start (leading spaces included) reads fine.
+	got, err := rr.ReadRow(headerLen)
+	require.NoError(t, err)
+	require.Equal(t, "did:plc:alice", got.DID)
+
+	// Two bytes in, the suffix alone would still validate ("at://..." after
+	// TrimSpace) — but it is not a record boundary, so it must be rejected.
+	_, err = rr.ReadRow(headerLen + 2)
+	require.ErrorIs(t, err, timestamp.ErrCorruptOffset)
 }
 
 func TestRowReader_HonorsHeaderColumnOrder(t *testing.T) {
