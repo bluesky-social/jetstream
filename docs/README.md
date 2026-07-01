@@ -653,21 +653,18 @@ This is of course an implementation detail of the Bluesky-hosted instance. Other
 
 ## 8. Timestamp Import
 
-There is a requirement for building real-world AppViews with any new firehose indexer: they must retain the previous indexed at timestamps as the system that came before it.
+Any new firehose indexer has the same problem: it stamps every record with roughly the time it backfilled, so a post from 2022 looks like it was made today. `createdAt` doesn't save us — it's client-supplied and spoofable, which is both a bad product experience and a trust-and-safety hole. To build a real AppView you have to carry over the original indexer's timestamps. Bluesky's dataplane has been running since 2022 and has them; a fresh jetstream does not.
 
-Concretely, we can't rebuild the production Bluesky AppView unless we also carry over its indexed at timestamps because the created at timestamp (if present) is spoofable by the client. This can lead to a poor app experience and trust and safety concerns where users edit their timestamps to be misleading.
+So we keep two timestamps per event:
 
-If we don't import the existing indexed at timestamps at all, it would look like any post made before 2026 was indeed created in 2026. That's obviously not acceptable.
+- `witnessed_at` — when *this* jetstream first saw the event. We assign it at ingestion time and never change it. It's what our range scans and the `?cursor=<timestamp>` lookback are built on, so it has to stay honest and monotonic with the sequence number.
+- `indexed_at` — the timestamp we hand to clients as `time_us`, i.e. the one they should actually display. By default it's just `witnessed_at`, but an operator can overwrite it with the value the old indexer recorded. This is the "display" timestamp.
 
-To work around this, we are creating an optional bulk indexed at timestamp API where a jetstream operator can upload a large CSV of AT URIs and their preferred `rendered at` timestamp. The jetstream instance ensures that it stores both the indexed at timestamp (when did jetstream itself see the record) as well as the optional rendered at timestamp (when did the Bluesky AppView originally see the record). The subscribers of jetstream receive both timestamp values and can choose which one they'd prefer to use (usually the rendered at timestamp).
+Only the operator can change `indexed_at`, and it's off by default: the import endpoint is disabled and returns 401 unless a bearer token was configured at startup. We're not letting random callers rewrite timestamps.
 
-Only the operator of jetstream may alter timestamps. This is an authenticated feature.
+Imports run against a live server with no downtime. The operator stages a zstd-compressed CSV of AT URIs and timestamps somewhere on the box, then kicks off an import job pointing at that path. Each row can say whether the timestamp applies to every version of the record (the default), one specific version by CID, or just the latest. We key on AT URI rather than CID because the URI contains the DID, which lets the segment-level DID bloom do almost all the filtering for free; CID-keyed imports would mean scanning everything or maintaining a second bloom, which isn't worth it. Operators who only have CIDs can resolve them to URIs first.
 
-Rather than maintaining a separate timestamp table that has to be kept in sync alongside segments and replicated on its own channel, we apply timestamp imports directly into segment files as part of the upload operation. The flow is: the operator POSTs a large CSV; the server buckets the URIs by DID; the segment-level DID bloom narrows to candidate segments; the per-block DID blooms narrow to candidate blocks; and each candidate block is decompressed, its `rendered_at` column is patched for the matching rows, and the block is re-encoded.
-
-We require uploads to be keyed by AT URI rather than by CID. URIs contain the DID, which lets us use the existing segment-level DID bloom to do almost all the filtering work. CID-keyed imports would force either a full scan of every segment or a second per-segment bloom over CIDs; both are expensive enough that it's not worth paying for unless we see a concrete need. Operators that only have CIDs can resolve them upstream before uploading.
-
-Once the compaction pass has rewritten all affected segments and resealed them with new checksums, the segment-compaction notification path from Section 6 fires for each touched file, and replicas re-download and swap them in exactly as they would for any other compaction. No additional replication mechanism is required for timestamps.
+The job buckets the URIs by DID, uses the segment and per-block DID blooms to find candidate blocks, then decompresses each one and patches the `indexed_at` column for the matching rows. Rather than maintain a separate timestamp table that has to be kept in sync with the segments, we write straight into the segment files — the import piggybacks on the compaction machinery, so it shares the same rewrite path, re-seals touched segments with fresh checksums, and fires the usual segment-compaction notification. It's the same atomic rewrite we already do for deletes, just mutating a column instead of dropping rows. Bad rows are skipped and reported rather than failing the whole import, and re-running is safe: an already-applied file just produces no changes.
 
 ## 9. FAQ
 
@@ -714,5 +711,3 @@ Once the compaction pass has rewritten all affected segments and resealed them w
 8. https://github.com/jcalabro/gloom
 
 NOTE (jrc): we should treat the existing jetstream HTTP API surface as legacy, and is only there for backwards compatability. We will instead be building on XRPC. We’ll maintain the old surface, but also duplicate the existing API to XRPC, and all net-new stuff will be XRPC.
-
-NOTE (jrc): clarify rendered at vs. indexed at. it should not leak through to the user at all
