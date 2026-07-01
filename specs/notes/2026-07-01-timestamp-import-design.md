@@ -1,15 +1,16 @@
 # Timestamp import + witnessed/indexed timestamp rename
 
 Date: 2026-07-01
-Branch: TBD
-Status: design / working document (not yet implemented)
+Branch: `timestamp-import-design` (design); impl branches per milestone (§9)
+Tracking issue: [#193](https://github.com/bluesky-social/jetstream/issues/193)
+Status: design DONE + §8 rewritten; implementation NOT STARTED
 Author: jcalabro (with Claude)
 
-> This is the working document for **§8 Timestamp Import** of `docs/README.md`.
-> It captures the decisions we've locked in, the reasoning behind them, and the
-> open questions we still need to resolve. We will edit this in place as we
-> settle the open items, then fold the result back into `docs/README.md` §8 (and
-> the affected parts of §3.2, §3.5, §5.1).
+> This is the **living document** for **§8 Timestamp Import** of `docs/README.md`.
+> §0–§8 capture the decisions and their rationale (all settled). **§9 is the
+> implementation plan / progress tracker — update it as we go.** The `docs/README.md`
+> §8 prose has already been rewritten to match; remaining doc touches (§3.2, §3.1.2,
+> §5.1 terminology) land with the rename milestone (§9, M1).
 
 ---
 
@@ -644,3 +645,141 @@ Regardless of (a)/(b): regenerate, don't hand-edit, the lexgen output.
 | H. Integration | standalone vs. compactor pass | compactor pass variant (shares lock + notify) | **DECIDED** |
 | J. Observability | metrics surface | compaction-style counters + job status | **DECIDED** |
 | K. Dry-run | build vs. skip | **no dry-run** (keep simple) | **DECIDED** |
+
+---
+
+## 9. Implementation plan / progress tracker (LIVING — update as we go)
+
+Sequenced into milestones. Each milestone is one branch → one PR. Commits within
+a milestone are small and independently green (`go test ./... -race` + lint).
+Check boxes off as landed; add a one-line note + PR/commit ref per box.
+
+Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
+
+### M0 — Design + docs  ✅ DONE
+- [x] Design doc + all decisions (this file). — commit `1b76825`
+- [x] `docs/README.md` §8 rewrite + drop resolved TODO. — commit `e6c926d`
+- [x] Tracking issue #193.
+
+### M1 — The rename (no behavior change, no format change)
+> Pure code/comment/wire rename. Lands first and alone so the diff is reviewable
+> as "nothing changed but names." Format bytes untouched; goldens keep their bytes.
+> Do the two mappings **atomically** (they collide — see §6a): `RenderedAt →
+> IndexedAt` and `IndexedAt → WitnessedAt` in one pass.
+
+- [ ] **`segment/`**: `Event.IndexedAt → WitnessedAt`, `Event.RenderedAt →
+  IndexedAt`; block encode/decode column comments (`block.go` "indexed_at[]" →
+  "witnessed_at[]", "rendered_at[]" → "indexed_at[]"); `eventColumns` +
+  `pendingBlock` accessors; `event.go` doc (`RenderedAt == 0` → `IndexedAt == 0`
+  sentinel on the *display* column).
+- [ ] **Header/footer/seal**: `Header.{Min,Max}IndexedAt → {Min,Max}WitnessedAt`;
+  `BlockInfo.{Min,Max}IndexedAt`; `SealResult.*`; `seal.go` envelope fill reads
+  `ev.WitnessedAt`.
+- [ ] **`internal/manifest`**: all `{Min,Max}IndexedAt` → `WitnessedAt`;
+  `SegmentForTimeUS` doc/comments say "witnessed".
+- [ ] **`internal/subscribe`**: `cursor.go translateTimeUSToSeq` scan + comments
+  (searches `WitnessedAt`); `encoder.go` `TimeUS` now = **display** resolver, not
+  raw field (see M2 for the resolver — here just rename the field it reads and add
+  a TODO, or land M2's resolver in the same milestone; decide at impl time).
+- [ ] **`internal/status`, `cmd/jetstream/inspect_*`**: envelope fields + any
+  status-page column headers / labels.
+- [ ] **Lexicon + regen (Q-WIRE-NAMES)**: `lexicons/network/bsky/jetstream/
+  listSegments.json` `minIndexedAt/maxIndexedAt → minWitnessedAt/maxWitnessedAt`
+  (+ descriptions); regenerate `api/jetstream` via lexgen (do **not** hand-edit).
+- [ ] **Tests/goldens/fuzz/bench**: rename field setters + comments; confirm
+  golden *bytes* unchanged (proves no format change).
+- [ ] **Docs**: `docs/README.md` §3.2 column list, §3.1.2 header
+  (`min/max_witnessed_at`), §5.1 `time_us` clarification.
+- [ ] Full suite + `-race` + lint green; grep proves zero stray `RenderedAt` /
+  old-meaning `IndexedAt`.
+
+### M2 — Display resolver on the wire (`time_us = imported ?: witnessed`)
+> Tiny, but it's the first behavioral change. Safe: identical to today until an
+> import runs (all display columns are 0 → resolves to witnessed).
+
+- [ ] `displayOf(ev) = ev.IndexedAt if ev.IndexedAt != 0 else ev.WitnessedAt`
+  helper (segment or subscribe pkg).
+- [ ] `encoder.go`: the four `TimeUS:` sites use `displayOf(evt)`.
+- [ ] Tests: un-imported event → `time_us == witnessed`; event with non-zero
+  display → `time_us == display`; `#identity/#account/#sync` → `time_us ==
+  witnessed` (display stays 0).
+
+### M3 — `segment.Patch` (mutate-mode rewrite)  [§6 I]
+> New sibling to `Rewrite`. Mutates the display column only; preserves topology,
+> blooms, collection index, and the witnessed envelope verbatim.
+
+- [ ] `segment/patch.go`: `Patch(path, mutate func(*Event) bool, opts
+  PatchOptions) (PatchResult, error)`. Decompress each candidate block, run
+  `mutate`, re-encode only changed blocks; **copy footer structures verbatim**
+  (do not rebuild blooms/collection index); recompute checksum; atomic
+  tmp+fsync+rename+dir-sync; reuse `CrashInjector` + `CandidateDIDs` bloom
+  pre-filter.
+- [ ] Early-return when `mutatedCount == 0` (skip rename) → idempotent.
+- [ ] Debug/test assert: only `IndexedAt` changed on mutated rows; witnessed
+  envelope + blooms + collection index byte-identical to source.
+- [ ] Tests: patch subset of rows → other rows/cols unchanged, blooms/index
+  preserved, checksum valid, re-open decodes; zero-mutation → no rename; crash
+  injection at each point recovers; fuzz/swarm parity with `Rewrite` where shared.
+
+### M4 — CSV parse + validate + DID bucketing (Phases A/B)
+> Streaming, disk-backed. No segment writes yet — output is per-segment patch
+> files. Independently testable end-to-end on a fixture archive.
+
+- [ ] `internal/timestamp/` (new pkg): zstd+CSV streaming reader (header row;
+  columns `uri,timestamp,scope,cid`); per-row validate (`atmos.ParseATURI`,
+  RFC3339 → micros, scope enum default `all_versions`, `ParseCIDString` when
+  `specific_version`); **skip-and-report** bad rows (count + list).
+- [ ] External sort/group by DID if input isn't grouped (Q-SORT tolerate).
+- [ ] Phase B: test each DID group against segment DID blooms (manifest-resident,
+  one-sided) → append `(did,collection,rkey,cid?,ts,scope)` to per-segment patch
+  temp files under `data/imports/<job>/`.
+- [ ] Tests: malformed rows skipped+counted; scope defaulting; specific_version
+  requires parseable cid; bucketing routes to correct candidate segments; huge
+  input doesn't blow memory (streaming assertion).
+
+### M5 — Phase C: apply via `segment.Patch`, wired through the compactor  [§6 H]
+- [ ] Build the per-segment `(did,collection,rkey[,cid])→ts` lookup; `mutate`
+  applies scope rules (`all_versions` / `latest` / `specific_version` with
+  `ComputeCID(CodecDagCBOR, payload).Equal` — patch all CID matches, §4a); report
+  unmatched CIDs.
+- [ ] Run as a **compaction-pass variant** in `orchestrator/compact_deletes.go`
+  worker pool: swap `segment.Rewrite(decide)` → `segment.Patch(mutate)`; share the
+  rewrite lock (mutual exclusion with delete-compaction); reuse manifest refresh +
+  `segment_compacted` emit.
+- [ ] `latest` scope: resolve highest-rev row per path within the segment.
+- [ ] Tests: e2e on fixture archive — display column patched, witnessed/seq
+  untouched, manifest envelope unchanged, `time_us` reflects import after; import
+  vs. delete-compaction mutual exclusion; idempotent re-run = no-op.
+
+### M6 — Job model, auth, resumability, status  [Q-JOB / Q-TRANSPORT / Q-JOBMODEL / Q-RESUME]
+- [ ] Bearer middleware: `--timestamp-import-token` / `JETSTREAM_TIMESTAMP_IMPORT_TOKEN`
+  serve flags (`cmd/jetstream/main.go`); **disabled → 401** when unset;
+  constant-time compare (`crypto/subtle`); require TLS.
+- [ ] XRPC: `network.bsky.jetstream.importTimestamps` (procedure; input =
+  server-local path, confined to a configured import dir — reject `..`/symlink
+  escape) → 202 + job id; `getImportStatus` (query; bearer-gated). Register in
+  `internal/xrpcapi/server.go`; add lexicons + regen `api/jetstream`.
+- [ ] Single-job guard → 409 on concurrent submit.
+- [ ] Checkpoint in pebble (`import/<job>/progress`, per-segment done set) →
+  auto-resume on restart; full-idempotency backstop.
+- [ ] Status page: import job phase/progress panel (Q-JOBMODEL). No per-event
+  imported bit (Q-EXPOSE).
+- [ ] Metrics (§6 J): rows parsed/rejected(by reason)/mutated, DIDs matched,
+  segments examined/skipped-by-bloom/patched, bytes rewritten, phase, duration.
+- [ ] Tests: 401 default + wrong token; path-escape rejection; 409; crash
+  mid-import → resume skips done segments; status/metrics surfaced.
+
+### M7 — Docs + close-out
+- [ ] Reconcile `docs/README.md` §8 with the final wire/flag names if they drifted.
+- [ ] Operator note: CSV schema, DID-sort recommendation, `specific_version`
+  needs per-version CIDs (only some collections), token setup.
+- [ ] Update this tracker to DONE; close #193.
+
+### Cross-cutting notes for the implementer
+- **Format is NOT changing** (§3.7/§3.8). Any milestone that alters segment bytes
+  beyond the display column, or bumps `version`, is a bug — stop.
+- **Witnessed is load-bearing** for range scans + `?cursor=<timestamp>` lookback;
+  never import into it, keep it seq-monotonic.
+- **Idempotency everywhere**: re-running any phase must converge (zero-mutation
+  skip). This is what makes crash-resume + operator re-run safe.
+- Keep the giant-file bytes off the HTTP path (server-local path only).
