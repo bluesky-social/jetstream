@@ -3,7 +3,7 @@
 Date: 2026-07-01
 Branch: `timestamp-import-design` (design); impl branches per milestone (§9)
 Tracking issue: [#193](https://github.com/bluesky-social/jetstream/issues/193)
-Status: design DONE + §8 rewritten; impl M0–M4 DONE (rename + display resolver + segment.Patch + Phase A/B parse+bucket), M5+ pending
+Status: design DONE + §8 rewritten; impl M0–M5 DONE (rename + display resolver + segment.Patch + Phase A/B parse+bucket + Phase C apply wired through the compactor), M6+ pending
 
 > **M4 revised two decisions during implementation** (recorded in place below):
 > **Q-FORMAT** dropped zstd — the import CSV is now **plain (uncompressed)** so
@@ -592,6 +592,12 @@ An in-flight import and a scheduled delete-compaction are **mutually exclusive**
 (both take the rewrite lock); the loser waits. Only one import at a time (§
 Q-JOBMODEL 409).
 
+*(M5 impl note: the "rewrite lock" was implicit before import existed — only the
+single `runSteadyCompactor` goroutine ran rewrites. Import is dispatched from a
+separate request-handler goroutine, so M5 added an **explicit**
+`Orchestrator.rewriteMu`/`withRewriteLock` both passes acquire. Same guarantee,
+now enforced by a lock rather than goroutine topology.)*
+
 ### J. Observability — **DECIDED: mirror compaction metrics + job status**
 Counters/gauges in the existing compaction-metrics style: rows parsed, rows
 rejected (by reason), DIDs matched, segments examined, segments skipped-by-bloom,
@@ -870,18 +876,47 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
   map, run one `segment.Patch`, emit `segment_compacted`. (No orchestrator wiring
   or durable job checkpoint yet — those are M5/M6.)
 
-### M5 — Phase C: apply via `segment.Patch`, wired through the compactor  [§6 H]
-- [ ] Build the per-segment `(did,collection,rkey[,cid])→ts` lookup; `mutate`
-  applies scope rules (`all_versions` / `specific_version` with
-  `ComputeCID(CodecDagCBOR, payload).Equal` — patch all CID matches, §4a); report
-  unmatched CIDs.
-- [ ] Run as a **compaction-pass variant** in `orchestrator/compact_deletes.go`
-  worker pool: swap `segment.Rewrite(decide)` → `segment.Patch(mutate)`; share the
-  rewrite lock (mutual exclusion with delete-compaction); reuse manifest refresh +
-  `segment_compacted` emit.
-- [ ] Tests: e2e on fixture archive — display column patched, witnessed/seq
-  untouched, manifest envelope unchanged, `time_us` reflects import after; import
-  vs. delete-compaction mutual exclusion; idempotent re-run = no-op.
+### M5 — Phase C: apply via `segment.Patch`, wired through the compactor  [§6 H]  ✅ DONE
+- [x] **Phase C apply core** (`internal/timestamp/apply.go`, commit `4d62d93`):
+  `RowReader` seeks+revalidates a single row from the plain CSV by byte offset
+  (header column mapping parsed once at open, so a non-canonical column order
+  still decodes a header-less mid-file row); re-validation is deliberate defense
+  in depth against a resumed job reading offsets a prior process wrote.
+  `BuildPatchPlan` folds a segment's offset file into a per-path
+  `(did,collection,rkey)→{allVersionsTS, cid→ts}` lookup (last-write-wins;
+  corrupt offset counted+skipped, torn offset file rejected). `BuildMutate`'s
+  closure applies scope rules (materialization-only; `specific_version` via
+  `ComputeCID(CodecDagCBOR,payload).Equal` **wins over** `all_versions` and
+  patches **all** CID matches, §4a; sets only `IndexedAt`, returns true iff
+  changed → preserves `segment.Patch` guard + zero-mutation idempotency);
+  unmatched specific CIDs counted.
+- [x] **Explicit rewrite lock** (`orchestrator.go`, commit `010f73e`): **design
+  deviation, recorded.** §3.3/§6 H assumed import and delete-compaction are
+  mutually exclusive "through the same rewrite owner." In the code that owner
+  was *implicit* — only the single `runSteadyCompactor` goroutine ever called a
+  rewrite pass. M6 dispatches import from a **separate request-handler
+  goroutine**, so the implicit guarantee no longer holds. Added an explicit
+  `Orchestrator.rewriteMu` + `withRewriteLock`; delete-compaction wraps its
+  per-chunk `applyCompactionChunk`, import wraps its whole Phase C worker pool.
+  The two are now mutually exclusive with the loser waiting, exactly as §6 H
+  specifies — just enforced by a real lock instead of goroutine topology.
+- [x] **Import pass wired** (`orchestrator/import_pass.go`, commit `a66b172`):
+  `RunImport(ctx, ImportJob{CSVPath, JobDir}) (ImportResult, error)` runs A+B
+  unlocked (parse+bucket → offset files) then C under the rewrite lock (worker
+  pool → `segment.Patch(mutate)` per touched segment, `CandidateDIDs` bloom
+  prefilter, `OnSegmentCompacted` manifest refresh, `crashpoint.ForSegment`
+  seams). New `Config.ImportSelector` (manifest; nil → `ErrImportUnavailable`).
+  A segment that vanished between B and C is skipped+warned; a re-run
+  re-buckets it (§3.4).
+- [x] Tests: e2e on a real sealed segment + real manifest — display column
+  patched, witnessed/seq/other columns + envelope byte-intact, `DisplayTimeUS`
+  reflects import, idempotent re-run = no-op; `specific_version` CID-only match;
+  no-candidate row = no-op; disabled-without-selector errors; in-flight import
+  holds the rewrite lock against a competing acquirer. Full suite + `-race` +
+  lint green; whole tree builds.
+- Not yet: no XRPC endpoint / bearer auth / job model / durable resume
+  checkpoint / status surface / metrics — all M6. `RunImport` is the callable
+  core M6 will expose.
 
 ### M6 — Job model, auth, resumability, status  [Q-JOB / Q-TRANSPORT / Q-JOBMODEL / Q-RESUME]
 - [ ] Bearer middleware: `--timestamp-import-token` / `JETSTREAM_TIMESTAMP_IMPORT_TOKEN`
