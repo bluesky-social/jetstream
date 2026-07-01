@@ -345,6 +345,12 @@ func (b *Bucketer) evictFileIfNeeded() error {
 			return nil
 		}
 		fe := asFDEntry(oldest)
+		// fsync before close: an evicted file may never be reopened, so this
+		// is its only chance at durability before Close's final pass syncs
+		// whatever is still open (see Close for why that matters).
+		if err := syncFile(fe.f); err != nil {
+			return fmt.Errorf("timestamp: sync evicted offset file for segment %d: %w", fe.idx, err)
+		}
 		if err := fe.f.Close(); err != nil {
 			return fmt.Errorf("timestamp: close evicted offset file for segment %d: %w", fe.idx, err)
 		}
@@ -394,20 +400,58 @@ func (b *Bucketer) offsetPath(idx uint64) string {
 	return filepath.Join(b.jobDir, OffsetFileName(idx))
 }
 
-// Close flushes and closes every open offset file. It must be called after the
-// parse completes (and before Phase C reads the files). Returns the first close
-// error, if any, after attempting to close all files.
+// Close fsyncs and closes every open offset file, then fsyncs the job dir so
+// the files' directory entries are durable. It must be called after the parse
+// completes (and before Phase C reads the files). Returns the first error, if
+// any, after attempting to sync+close all files.
+//
+// The fsyncs are load-bearing for resume (design Q-RESUME): the import manager
+// persists Bucketed=true — the "skip re-parsing on resume" checkpoint — right
+// after Close returns, with a synced pebble write. Without syncing the offset
+// files first, a power loss could persist the checkpoint while losing the
+// files it vouches for, and the resumed run would skip Phase A/B against a
+// missing or truncated offset set: a silently incomplete import. Files evicted
+// from the FD pool were synced at eviction (and re-synced here if reopened).
 func (b *Bucketer) Close() error {
 	var firstErr error
 	for el := b.fileLRU.Front(); el != nil; el = el.Next() {
 		fe := asFDEntry(el)
+		if err := syncFile(fe.f); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("timestamp: sync offset file for segment %d: %w", fe.idx, err)
+		}
 		if err := fe.f.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("timestamp: close offset file for segment %d: %w", fe.idx, err)
 		}
 	}
 	b.files = make(map[uint64]*list.Element)
 	b.fileLRU.Init()
-	return firstErr
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := syncDir(b.jobDir); err != nil {
+		return fmt.Errorf("timestamp: sync job dir: %w", err)
+	}
+	// And the parent, so the job dir's own entry survives: losing the whole
+	// dir while the Bucketed checkpoint survives would resume into an empty
+	// recreated dir and "complete" with zero mutations.
+	if err := syncDir(filepath.Dir(b.jobDir)); err != nil {
+		return fmt.Errorf("timestamp: sync job dir parent: %w", err)
+	}
+	return nil
+}
+
+// syncDir fsyncs a directory so the entries created within it are durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := syncFile(d)
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 // Stats returns a snapshot of the bucketer's counters. SegmentsTouched is

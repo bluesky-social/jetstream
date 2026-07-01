@@ -101,6 +101,20 @@ func TestBucket_RoutesToCandidateSegments(t *testing.T) {
 	require.Equal(t, 2, stats.SegmentsTouched)
 }
 
+// TestBucket_CloseSyncsJobDir guards the durability anchor the import
+// manager's Bucketed=true checkpoint depends on: Close must fsync the job dir
+// (and so must notice it vanished), not just close file descriptors. Real
+// power-loss durability isn't testable here; error-on-missing-dir proves the
+// directory fsync is present and ordered before Close returns success.
+func TestBucket_CloseSyncsJobDir(t *testing.T) {
+	t.Parallel()
+	sel := &fakeSelector{gen: 1, routes: map[string][]uint64{"did:plc:alice": {2}}}
+	b, jobDir := newBucketer(t, sel, timestamp.BucketerConfig{})
+	require.NoError(t, b.Route(timestamp.Row{DID: "did:plc:alice", Offset: 100}))
+	require.NoError(t, os.RemoveAll(jobDir))
+	require.Error(t, b.Close(), "Close must surface a job-dir sync failure")
+}
+
 func TestBucket_NoCandidateRowsCounted(t *testing.T) {
 	t.Parallel()
 	sel := &fakeSelector{gen: 1, routes: map[string][]uint64{
