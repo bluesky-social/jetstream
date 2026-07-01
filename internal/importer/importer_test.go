@@ -295,8 +295,9 @@ func TestSubmit_SymlinkedImportDirAccepted(t *testing.T) {
 // TestSubmit_RelativeImportDirAcceptsAbsolutePath: the default data dir is
 // relative, so the import dir often is too. An absolute submitted path inside
 // it must still be accepted (Rel against a relative root would reject it).
+//
+//nolint:paralleltest // intentionally serial: t.Chdir mutates the process-global cwd
 func TestSubmit_RelativeImportDirAcceptsAbsolutePath(t *testing.T) {
-	// Not Parallel: t.Chdir (relative import dir resolves against cwd).
 	base := t.TempDir()
 	t.Chdir(base)
 	absImportDir := filepath.Join(base, "imports")

@@ -104,7 +104,10 @@ func TestImportTimestamps_DisabledWhenNoToken(t *testing.T) {
 	// An empty presented token must not match an empty configured token (the
 	// hash-compare would otherwise "match"): the empty header is a missing
 	// token, and disabled means nothing is accepted.
-	resp3, err := http.Post(ts.URL+importNSID, "application/json", strings.NewReader(`{"path":"a.csv"}`))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, ts.URL+importNSID, strings.NewReader(`{"path":"a.csv"}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp3, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp3.Body.Close() }()
 	require.Equal(t, http.StatusUnauthorized, resp3.StatusCode)
