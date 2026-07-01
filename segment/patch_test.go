@@ -258,6 +258,17 @@ func TestPatchRejectsMutationOfImmutableField(t *testing.T) {
 		{"Rkey", func(ev *Event) { ev.Rkey = "hacked" }},
 		{"Rev", func(ev *Event) { ev.Rev = "hacked" }},
 		{"Payload", func(ev *Event) { ev.Payload = append(ev.Payload, 0xff) }},
+		// Equal-length content mutation: length and uncompressed-size
+		// invariants both pass, so only the payload-content hash guard
+		// catches this. Clone first (Payload aliases the block buffer).
+		{"PayloadContentSameLen", func(ev *Event) {
+			if len(ev.Payload) == 0 {
+				return
+			}
+			p := append([]byte(nil), ev.Payload...)
+			p[0] ^= 0xff
+			ev.Payload = p
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -277,6 +288,36 @@ func TestPatchRejectsMutationOfImmutableField(t *testing.T) {
 			require.Equal(t, before, after, "a rejected patch must leave the source untouched")
 		})
 	}
+}
+
+// TestPatchRejectsCrossRowMutation covers a mutate that retains a pointer to an
+// earlier row and mutates a forbidden field on it during a later row's
+// callback. The guard must catch this even though the earlier row's callback
+// already returned — verification runs after every callback in the block.
+func TestPatchRejectsCrossRowMutation(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// Block size 2 places rows 0 and 1 of the fixture in the same block.
+	path := sealedSegmentForReader(t, dir, patchFixtureEvents(), 2)
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	var first *Event
+	_, err = Patch(path, func(ev *Event) bool {
+		if first == nil {
+			first = ev
+			return false
+		}
+		// Second row's callback: reach back and corrupt the first row's
+		// immutable DID after its own callback already returned clean.
+		first.DID = "did:plc:evil"
+		return false
+	}, PatchOptions{})
+	require.ErrorIs(t, err, ErrInvalidConfig, "cross-row mutation of an immutable field must be rejected")
+
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "a rejected patch must leave the source untouched")
 }
 
 func TestPatchCandidateDIDsSkipDisjointSegment(t *testing.T) {

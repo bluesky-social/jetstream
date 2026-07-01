@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+
+	"github.com/zeebo/xxh3"
 )
 
 // PatchOptions configures a Patch call. It mirrors RewriteOptions: a nil
@@ -117,6 +119,19 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 		return PatchResult{}, fmt.Errorf("%w: block index %d bytes exceeds footer %d",
 			ErrInvalidFooter, blockIndexLen, len(srcFooter))
 	}
+	// Open only checks that the footer section offsets are monotonic, not that
+	// the DID bloom begins immediately after the block index. Patch copies
+	// srcFooter[blockIndexLen:] verbatim as the bloom-and-onward tail and
+	// re-derives DIDBloomOffset as FooterOffset+blockIndexLen, so any padding
+	// between the block index and the bloom in the source would be silently
+	// reinterpreted as bloom bytes under a freshly-valid checksum. Reject that
+	// rather than persist a desynced footer.
+	wantDIDBloomOffset := header.FooterOffset + uint64(blockIndexLen)
+	if header.DIDBloomOffset != wantDIDBloomOffset {
+		return PatchResult{}, fmt.Errorf(
+			"%w: did_bloom_offset %d != footer_offset+block_index_len %d",
+			ErrInvalidFooter, header.DIDBloomOffset, wantDIDBloomOffset)
+	}
 	footerTail := srcFooter[blockIndexLen:]
 
 	type outBlock struct {
@@ -143,16 +158,30 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 				ErrInvalidBlockIndex, i, len(events), orig.EventCount)
 		}
 
+		// Snapshot every row before running any callback, then verify every
+		// row after all callbacks have run. A single interleaved
+		// mutate-then-verify loop would let a callback that retains a pointer
+		// (or Payload slice) to an earlier row mutate a forbidden field during
+		// a later row's callback, after that earlier row already passed its
+		// guard. Splitting the passes closes that cross-row window.
+		guards := make([]eventGuard, len(events))
+		oldIndexed := make([]int64, len(events))
+		for j := range events {
+			ev := &events[j]
+			guards[j] = guardSnapshot(ev)
+			oldIndexed[j] = ev.IndexedAt
+		}
+		for j := range events {
+			mutate(&events[j])
+		}
+
 		var dirty bool
 		for j := range events {
 			ev := &events[j]
-			before := guardSnapshot(ev)
-			oldIndexed := ev.IndexedAt
-			mutate(ev)
-			if err := before.verify(ev); err != nil {
+			if err := guards[j].verify(ev); err != nil {
 				return PatchResult{}, fmt.Errorf("segment: patch block %d row %d: %w", i, j, err)
 			}
-			if ev.IndexedAt != oldIndexed {
+			if ev.IndexedAt != oldIndexed[j] {
 				dirty = true
 				rowsMutated++
 			}
@@ -326,6 +355,7 @@ type eventGuard struct {
 	rkey        string
 	rev         string
 	payloadLen  int
+	payloadHash uint64
 }
 
 func guardSnapshot(ev *Event) eventGuard {
@@ -338,14 +368,17 @@ func guardSnapshot(ev *Event) eventGuard {
 		rkey:        ev.Rkey,
 		rev:         ev.Rev,
 		payloadLen:  len(ev.Payload),
+		payloadHash: xxh3.Hash(ev.Payload),
 	}
 }
 
 // verify reports the first forbidden field mutate changed. Strings compare
 // cheaply (they are short repo/collection identifiers). Payload is checked by
-// length only: it is documented read-only DAG-CBOR (event.go), and the
-// uncompressed-size invariant in Patch catches any length change a mutate
-// might still introduce.
+// length and an allocation-free xxh3 of its bytes: it is documented read-only
+// DAG-CBOR (event.go) that Patch re-encodes verbatim, so an equal-length
+// content mutation must still be rejected — the uncompressed-size invariant
+// only catches length changes, and hashing avoids a per-row string copy on the
+// bulk-rewrite path.
 func (g eventGuard) verify(ev *Event) error {
 	switch {
 	case ev.Seq != g.seq:
@@ -364,6 +397,8 @@ func (g eventGuard) verify(ev *Event) error {
 		return fmt.Errorf("%w: mutate changed Rev", ErrInvalidConfig)
 	case len(ev.Payload) != g.payloadLen:
 		return fmt.Errorf("%w: mutate changed Payload length %d->%d", ErrInvalidConfig, g.payloadLen, len(ev.Payload))
+	case xxh3.Hash(ev.Payload) != g.payloadHash:
+		return fmt.Errorf("%w: mutate changed Payload content", ErrInvalidConfig)
 	}
 	return nil
 }
