@@ -241,34 +241,47 @@ func (m *Manager) Submit(runCtx context.Context, requestedPath string) (string, 
 	if err != nil {
 		return "", err
 	}
-
-	m.mu.Lock()
-	if m.running != nil && !m.running.State.Terminal() {
-		m.mu.Unlock()
-		return "", ErrJobInProgress
+	rec, err := m.beginJob(csvPath)
+	if err != nil {
+		return "", err
 	}
+	go func() {
+		defer m.wg.Done()
+		m.run(runCtx, rec, false)
+	}()
+	return rec.ID, nil
+}
+
+// beginJob is Submit's critical section: refuse a second concurrent job,
+// persist the new record + current-job pointer, install the live record, and
+// register the run goroutine with wg. Returns a clone for the caller to hand
+// to run() outside the lock.
+func (m *Manager) beginJob(csvPath string) (Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.running != nil && !m.running.State.Terminal() {
+		return Record{}, ErrJobInProgress
+	}
+
 	// The in-memory pointer is not enough: at startup the HTTP server begins
 	// serving before ResumeIncomplete adopts a persisted non-terminal job, so a
 	// submit landing in that window would overwrite import/current and orphan
 	// the resumable job. The persisted pointer is the cross-restart source of
 	// truth; consult it under the same lock.
 	if currentID, ok, err := m.getCurrent(); err != nil {
-		m.mu.Unlock()
-		return "", err
+		return Record{}, err
 	} else if ok {
 		current, found, err := m.getRecord(currentID)
 		if err != nil {
-			m.mu.Unlock()
-			return "", err
+			return Record{}, err
 		}
 		if found && !current.State.Terminal() {
-			m.mu.Unlock()
-			return "", ErrJobInProgress
+			return Record{}, ErrJobInProgress
 		}
 	}
-	id := m.newJobID()
 	rec := &Record{
-		ID:          id,
+		ID:          m.newJobID(),
 		CSVPath:     csvPath,
 		State:       StateRunning,
 		Phase:       orchestrator.ImportPhaseParseBucket,
@@ -278,22 +291,14 @@ func (m *Manager) Submit(runCtx context.Context, requestedPath string) (string, 
 	// so a concurrent Status/restart sees a consistent view. A persistence
 	// failure here means we cannot guarantee resume — fail the submit.
 	if err := m.putRecordLocked(rec); err != nil {
-		m.mu.Unlock()
-		return "", err
+		return Record{}, err
 	}
-	if err := m.setCurrent(id); err != nil {
-		m.mu.Unlock()
-		return "", err
+	if err := m.setCurrent(rec.ID); err != nil {
+		return Record{}, err
 	}
 	m.running = rec
 	m.wg.Add(1)
-	m.mu.Unlock()
-
-	go func() {
-		defer m.wg.Done()
-		m.run(runCtx, rec.clone(), false)
-	}()
-	return id, nil
+	return rec.clone(), nil
 }
 
 // ResumeIncomplete relaunches the persisted current job if it is non-terminal
@@ -315,36 +320,55 @@ func (m *Manager) ResumeIncomplete(runCtx context.Context) error {
 		return nil
 	}
 
-	m.mu.Lock()
-	if m.running != nil && !m.running.State.Terminal() {
-		m.mu.Unlock()
+	live, adopted := m.adoptJob(rec)
+	if !adopted {
 		return nil // already running (defensive; ResumeIncomplete is start-only)
+	}
+
+	m.logger.Info("resuming incomplete import", "job", id, "bucketed", rec.Bucketed)
+	go func() {
+		defer m.wg.Done()
+		m.run(runCtx, live, true)
+	}()
+	return nil
+}
+
+// adoptJob is ResumeIncomplete's critical section: install rec as the live
+// running record (reset to a clean running state) and register the run
+// goroutine with wg. adopted is false when a live job already occupies the
+// slot. Returns a clone for the caller to hand to run() outside the lock.
+func (m *Manager) adoptJob(rec Record) (Record, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.running != nil && !m.running.State.Terminal() {
+		return Record{}, false
 	}
 	rec.State = StateRunning
 	rec.Error = ""
 	m.running = &rec
 	m.wg.Add(1)
-	m.mu.Unlock()
+	return rec.clone(), true
+}
 
-	m.logger.Info("resuming incomplete import", "job", id, "bucketed", rec.Bucketed)
-	go func() {
-		defer m.wg.Done()
-		m.run(runCtx, rec.clone(), true)
-	}()
-	return nil
+// liveClone returns a clone of the live running record when it matches id
+// ("" matches any live record). ok is false when idle or the id differs.
+func (m *Manager) liveClone(id string) (Record, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.running == nil || (id != "" && m.running.ID != id) {
+		return Record{}, false
+	}
+	return m.running.clone(), true
 }
 
 // Status returns the job record for id. Prefers the live in-memory record when
 // id is the running job, else reads pebble. ErrJobNotFound for an unknown id.
 func (m *Manager) Status(id string) (Record, error) {
-	m.mu.Lock()
-	if m.running != nil && m.running.ID == id {
-		out := m.running.clone()
-		m.mu.Unlock()
-		return out, nil
+	if rec, ok := m.liveClone(id); ok {
+		return rec, nil
 	}
-	m.mu.Unlock()
-
 	rec, ok, err := m.getRecord(id)
 	if err != nil {
 		return Record{}, err
@@ -360,14 +384,9 @@ func (m *Manager) Status(id string) (Record, error) {
 // id. ok is false when no job has been submitted this process lifetime and none
 // is persisted as current.
 func (m *Manager) Current() (Record, bool) {
-	m.mu.Lock()
-	if m.running != nil {
-		out := m.running.clone()
-		m.mu.Unlock()
-		return out, true
+	if rec, ok := m.liveClone(""); ok {
+		return rec, true
 	}
-	m.mu.Unlock()
-
 	id, ok, err := m.getCurrent()
 	if err != nil || !ok {
 		return Record{}, false
