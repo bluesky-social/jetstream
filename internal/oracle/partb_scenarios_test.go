@@ -3,7 +3,7 @@ package oracle
 import (
 	"context"
 	"errors"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -124,7 +124,7 @@ func emittedSeqs(events []ObservedEvent) []uint64 {
 			out = append(out, e.Seq)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
