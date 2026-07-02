@@ -82,7 +82,6 @@ func TestEncode_CommitGoldenRoundTrips(t *testing.T) {
 	golden := loadGolden(t)
 
 	for i, want := range golden {
-		i, want := i, want
 		kind, ok := want["kind"].(string)
 		if !ok || kind != "commit" {
 			continue
@@ -342,7 +341,7 @@ func TestEncode_CursorFieldOnAccount(t *testing.T) {
 	require.Contains(t, string(body), `"cursor":12345`)
 }
 
-func TestEncodeExtended_CommitSupersetWithRecordCBOR(t *testing.T) {
+func TestEncodeV2_CommitSupersetWithRecordCBOR(t *testing.T) {
 	t.Parallel()
 	payload := []byte{0xa0}
 	evt := &segment.Event{
@@ -357,51 +356,49 @@ func TestEncodeExtended_CommitSupersetWithRecordCBOR(t *testing.T) {
 		Payload:             payload,
 	}
 
-	simpleBody, err := Encode(evt)
+	v1Body, err := Encode(evt)
 	require.NoError(t, err)
-	extendedBody, err := EncodeExtended(evt)
+	v2Body, err := EncodeV2(evt)
 	require.NoError(t, err)
 
-	var simple, extended map[string]any
-	require.NoError(t, json.Unmarshal(simpleBody, &simple))
-	require.NoError(t, json.Unmarshal(extendedBody, &extended))
+	var v1, v2 map[string]any
+	require.NoError(t, json.Unmarshal(v1Body, &v1))
+	require.NoError(t, json.Unmarshal(v2Body, &v2))
 
 	for _, key := range []string{"did", "time_us", "cursor", "kind"} {
-		require.Equal(t, simple[key], extended[key], "extended must preserve simple top-level field %q", key)
+		require.Equal(t, v1[key], v2[key], "v2 must preserve v1 top-level field %q", key)
 	}
-	require.Equal(t, float64(12345), extended["seq"])
-	require.Equal(t, float64(98765), extended["upstream_relay_cursor"])
+	require.Equal(t, float64(12345), v2["seq"])
+	require.NotContains(t, v2, "upstream_relay_cursor", "internal relay cursor must not leak onto the wire")
 
-	simpleCommit, ok := simple["commit"].(map[string]any)
-	require.True(t, ok, "simple commit not a map")
-	extendedCommit, ok := extended["commit"].(map[string]any)
-	require.True(t, ok, "extended commit not a map")
+	v1Commit, ok := v1["commit"].(map[string]any)
+	require.True(t, ok, "v1 commit not a map")
+	v2Commit, ok := v2["commit"].(map[string]any)
+	require.True(t, ok, "v2 commit not a map")
 	for _, key := range []string{"rev", "operation", "collection", "rkey", "cid", "record"} {
-		require.Equal(t, simpleCommit[key], extendedCommit[key], "extended must preserve simple commit field %q", key)
+		require.Equal(t, v1Commit[key], v2Commit[key], "v2 must preserve v1 commit field %q", key)
 	}
-	require.Equal(t, base64.StdEncoding.EncodeToString(payload), extendedCommit["record_cbor"])
+	require.Equal(t, base64.StdEncoding.EncodeToString(payload), v2Commit["record_cbor"])
 }
 
-func TestEncodeExtended_CommitDeleteOmitsRecordPayloads(t *testing.T) {
+func TestEncodeV2_CommitDeleteOmitsRecordPayloads(t *testing.T) {
 	t.Parallel()
 	evt := &segment.Event{
-		Seq:                 9,
-		WitnessedAt:         123,
-		UpstreamRelayCursor: 456,
-		Kind:                segment.KindDelete,
-		DID:                 "did:plc:test",
-		Collection:          "app.bsky.feed.post",
-		Rkey:                "abc",
-		Rev:                 "rev1",
+		Seq:         9,
+		WitnessedAt: 123,
+		Kind:        segment.KindDelete,
+		DID:         "did:plc:test",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "abc",
+		Rev:         "rev1",
 	}
 
-	body, err := EncodeExtended(evt)
+	body, err := EncodeV2(evt)
 	require.NoError(t, err)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(body, &got))
 	require.Equal(t, "commit", got["kind"])
 	require.Equal(t, float64(9), got["seq"])
-	require.Equal(t, float64(456), got["upstream_relay_cursor"])
 
 	commit, ok := got["commit"].(map[string]any)
 	require.True(t, ok, "commit not a map")
@@ -411,7 +408,7 @@ func TestEncodeExtended_CommitDeleteOmitsRecordPayloads(t *testing.T) {
 	require.NotContains(t, commit, "record_cbor")
 }
 
-func TestEncodeExtended_IdentityAndAccountCarryCursors(t *testing.T) {
+func TestEncodeV2_IdentityAndAccountCarryCursors(t *testing.T) {
 	t.Parallel()
 	ident := &comatproto.SyncSubscribeRepos_Identity{
 		DID: "did:plc:test", Seq: 99, Time: "2026-05-25T00:00:00Z",
@@ -435,13 +432,12 @@ func TestEncodeExtended_IdentityAndAccountCarryCursors(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			body, err := EncodeExtended(&segment.Event{
-				Seq:                 123,
-				WitnessedAt:         1_700_000_000_000_000,
-				UpstreamRelayCursor: 321,
-				Kind:                tc.kind,
-				DID:                 "did:plc:test",
-				Payload:             tc.payload,
+			body, err := EncodeV2(&segment.Event{
+				Seq:         123,
+				WitnessedAt: 1_700_000_000_000_000,
+				Kind:        tc.kind,
+				DID:         "did:plc:test",
+				Payload:     tc.payload,
 			})
 			require.NoError(t, err)
 			var got map[string]any
@@ -449,13 +445,12 @@ func TestEncodeExtended_IdentityAndAccountCarryCursors(t *testing.T) {
 			require.Equal(t, tc.name, got["kind"])
 			require.Equal(t, float64(123), got["cursor"])
 			require.Equal(t, float64(123), got["seq"])
-			require.Equal(t, float64(321), got["upstream_relay_cursor"])
 			require.Contains(t, got, tc.wantKey)
 		})
 	}
 }
 
-func TestEncodeExtended_SyncEmitsArchivedEvent(t *testing.T) {
+func TestEncodeV2_SyncEmitsArchivedEvent(t *testing.T) {
 	t.Parallel()
 	sync := &comatproto.SyncSubscribeRepos_Sync{
 		DID:    "did:plc:test",
@@ -466,14 +461,13 @@ func TestEncodeExtended_SyncEmitsArchivedEvent(t *testing.T) {
 	}
 	payload, err := sync.MarshalCBOR()
 	require.NoError(t, err)
-	body, err := EncodeExtended(&segment.Event{
-		Seq:                 77,
-		WitnessedAt:         1_700_000_000_000_000,
-		UpstreamRelayCursor: 444,
-		Kind:                segment.KindSync,
-		DID:                 "did:plc:test",
-		Rev:                 "rev-sync",
-		Payload:             payload,
+	body, err := EncodeV2(&segment.Event{
+		Seq:         77,
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindSync,
+		DID:         "did:plc:test",
+		Rev:         "rev-sync",
+		Payload:     payload,
 	})
 	require.NoError(t, err)
 
@@ -481,7 +475,6 @@ func TestEncodeExtended_SyncEmitsArchivedEvent(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &got))
 	require.Equal(t, "sync", got["kind"])
 	require.Equal(t, float64(77), got["seq"])
-	require.Equal(t, float64(444), got["upstream_relay_cursor"])
 	require.Contains(t, got, "sync")
 
 	syncJSON, ok := got["sync"].(map[string]any)
@@ -491,9 +484,9 @@ func TestEncodeExtended_SyncEmitsArchivedEvent(t *testing.T) {
 	require.Equal(t, base64.StdEncoding.EncodeToString(sync.Blocks), syncJSON["blocks"])
 }
 
-func TestEncodeExtended_UnknownKindReturnsError(t *testing.T) {
+func TestEncodeV2_UnknownKindReturnsError(t *testing.T) {
 	t.Parallel()
-	_, err := EncodeExtended(&segment.Event{Kind: segment.Kind(99)})
+	_, err := EncodeV2(&segment.Event{Kind: segment.Kind(99)})
 	require.Error(t, err)
 	require.NotErrorIs(t, err, errSkipEvent)
 }
@@ -571,17 +564,17 @@ func TestEncode_TimeUSResolvesDisplayValue(t *testing.T) {
 		})
 	}
 
-	// Extended path covers all kinds including #sync.
+	// v2 path covers all kinds including #sync.
 	for _, kind := range []segment.Kind{segment.KindCreate, segment.KindIdentity, segment.KindAccount, segment.KindSync} {
-		t.Run("ext_unimported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+		t.Run("v2_unimported_"+string(rune('0'+int(kind))), func(t *testing.T) {
 			t.Parallel()
-			body, err := EncodeExtended(event(kind, witnessed, 0))
+			body, err := EncodeV2(event(kind, witnessed, 0))
 			require.NoError(t, err)
 			require.Equal(t, witnessed, timeUSOf(t, body), "unimported must fall back to witnessed")
 		})
-		t.Run("ext_imported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+		t.Run("v2_imported_"+string(rune('0'+int(kind))), func(t *testing.T) {
 			t.Parallel()
-			body, err := EncodeExtended(event(kind, witnessed, imported))
+			body, err := EncodeV2(event(kind, witnessed, imported))
 			require.NoError(t, err)
 			require.Equal(t, imported, timeUSOf(t, body), "imported display value must win")
 		})

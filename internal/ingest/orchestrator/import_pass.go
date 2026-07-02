@@ -2,8 +2,7 @@ package orchestrator
 
 // import_pass.go wires the timestamp-import pipeline (design §8, milestones
 // M4/M5) into the orchestrator so it shares the segment-rewrite lock and the
-// manifest-refresh/notification path with delete-compaction (design §3.3,
-// §6 H).
+// manifest-refresh path with delete-compaction (design §3.3, §6 H).
 //
 // Phases (design §3.2):
 //   - A+B (parse + bucket): stream the plain import CSV, validate each row, and

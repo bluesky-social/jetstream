@@ -238,10 +238,10 @@ func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
 	require.NoError(t, err)
 
 	h := NewHandler(Subscription{
-		Tail:                      b,
-		Store:                     st,
-		Logger:                    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		EmitResyncReplacementRows: true,
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		V2:     true,
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -295,10 +295,10 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	require.NoError(t, err)
 
 	h := NewHandler(Subscription{
-		Tail:                      b,
-		Store:                     st,
-		Logger:                    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		EmitResyncReplacementRows: true,
+		Tail:   b,
+		Store:  st,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		V2:     true,
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -353,7 +353,7 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	require.Equal(t, "commit", gotCommit["kind"])
 }
 
-func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
+func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
@@ -364,11 +364,12 @@ func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
 		Tail:   b,
 		Store:  st,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		V2:     true,
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?extended=true"
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -388,7 +389,7 @@ func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
 		WitnessedAt:         1779719010267528,
 		UpstreamRelayCursor: 111,
 		Kind:                segment.KindCreate,
-		DID:                 "did:plc:extended",
+		DID:                 "did:plc:v2",
 		Collection:          "app.bsky.feed.post",
 		Rkey:                "abcd1234",
 		Rev:                 "3lXrev",
@@ -401,13 +402,13 @@ func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
 	require.Equal(t, "commit", commit["kind"])
 	require.Equal(t, float64(0), commit["cursor"])
 	require.Equal(t, float64(0), commit["seq"])
-	require.Equal(t, float64(111), commit["upstream_relay_cursor"])
+	require.NotContains(t, commit, "upstream_relay_cursor")
 	commitPayload, ok := commit["commit"].(map[string]any)
 	require.True(t, ok, "commit payload not a map")
 	require.Equal(t, base64.StdEncoding.EncodeToString(payload), commitPayload["record_cbor"])
 
 	syncEvt := &comatproto.SyncSubscribeRepos_Sync{
-		DID: "did:plc:extended", Rev: "rev-sync", Seq: 222, Time: "2026-05-25T00:00:00Z",
+		DID: "did:plc:v2", Rev: "rev-sync", Seq: 222, Time: "2026-05-25T00:00:00Z",
 		Blocks: []byte{0x01},
 	}
 	syncPayload, err := syncEvt.MarshalCBOR()
@@ -416,7 +417,7 @@ func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
 		WitnessedAt:         1779719010267529,
 		UpstreamRelayCursor: 222,
 		Kind:                segment.KindSync,
-		DID:                 "did:plc:extended",
+		DID:                 "did:plc:v2",
 		Rev:                 "rev-sync",
 		Payload:             syncPayload,
 	})
@@ -426,11 +427,10 @@ func TestHandler_ExtendedDeliversRecordCBORAndSync(t *testing.T) {
 	require.NoError(t, json.Unmarshal(syncFrame, &syncGot))
 	require.Equal(t, "sync", syncGot["kind"])
 	require.Equal(t, float64(1), syncGot["cursor"])
-	require.Equal(t, float64(222), syncGot["upstream_relay_cursor"])
 	require.Contains(t, syncGot, "sync")
 }
 
-func TestHandler_DefaultModeDoesNotEmitExtendedFields(t *testing.T) {
+func TestHandler_V1ModeDoesNotEmitV2Fields(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)

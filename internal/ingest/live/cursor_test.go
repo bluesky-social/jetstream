@@ -39,13 +39,13 @@ func TestUpstreamCursor_DistinctKeys(t *testing.T) {
 	st := newTestStore(t)
 
 	require.NoError(t, SaveUpstreamCursor(st, "relay/cursor", 10))
-	require.NoError(t, SaveUpstreamCursor(st, "replica/upstream_cursor", 20))
+	require.NoError(t, SaveUpstreamCursor(st, "other/cursor", 20))
 
 	a, err := LoadUpstreamCursor(st, "relay/cursor")
 	require.NoError(t, err)
 	require.Equal(t, int64(10), a)
 
-	b, err := LoadUpstreamCursor(st, "replica/upstream_cursor")
+	b, err := LoadUpstreamCursor(st, "other/cursor")
 	require.NoError(t, err)
 	require.Equal(t, int64(20), b)
 }

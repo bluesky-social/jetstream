@@ -68,8 +68,9 @@ type Event struct {
 	WitnessedAt int64
 	IndexedAt   int64
 	// UpstreamRelayCursor is the relay subscribeRepos cursor that produced
-	// this event. It is carried in memory for extended websocket clients;
-	// the current segment block format does not persist it.
+	// this event. It is carried in memory for internal consumers (sync-state
+	// hosting promotion, the simulator oracle); it is not on any subscriber
+	// wire and the current segment block format does not persist it.
 	UpstreamRelayCursor int64
 	Kind                Kind
 

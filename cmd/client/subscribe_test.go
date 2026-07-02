@@ -37,7 +37,7 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// liveServer serves a fixed set of extended /subscribe-v2 commit frames.
+// liveServer serves a fixed set of /subscribe-v2 commit frames.
 func liveServer(t *testing.T, frames []string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -392,7 +392,6 @@ func TestSubscribeLiveTailEndToEnd(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/subscribe-v2", r.URL.Path)
-		require.Equal(t, "true", r.URL.Query().Get("extended"))
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -497,8 +496,8 @@ func TestCloseStopsRunningEventsWithoutCtxCancel(t *testing.T) {
 	}
 }
 
-// liveCommitFrameJSON builds an extended commit frame with a minimal CBOR
-// record, base64-encoded, matching the /subscribe-v2 extended wire shape.
+// liveCommitFrameJSON builds a commit frame with a minimal CBOR
+// record, base64-encoded, matching the /subscribe-v2 wire shape.
 func liveCommitFrameJSON(seq uint64, did, coll, rkey string) string {
 	rec, _ := cbor.Marshal(map[string]any{"$type": coll, "text": "hi " + rkey})
 	b64 := base64.StdEncoding.EncodeToString(rec)

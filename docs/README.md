@@ -20,9 +20,9 @@ Jetstream v2 is designed with the following use-cases in mind:
 3. Transparently replace Jetstream v1 while providing the ability for independent parties to interrogate the validity of its data
 4. Provide a CDN-friendly downloadable archive for all known accounts and events
 5. Maintain a database of witness timestamps on records
-6. Dead-simple and cheap for us and others to operate on a single server or in a HA setup
+6. Dead-simple and cheap for us and others to operate on a single server
     1. The machine doesn't need much CPU, but it would benefit from a fair bit of ram for initial backfill, and a reasonably large disk (a few TB)
-    2. If you create a replica from another live jetstream instance, it actually shouldn't need much RAM either
+    2. High availability is a future goal; the earlier replication design was dropped (see Section 6)
 
 We also have the following non-goals, which are explicitly not included in this design:
 
@@ -33,7 +33,7 @@ We also have the following non-goals, which are explicitly not included in this 
 3. Query engine with arbitrary queries or point lookups
     1. This is a replay cache, not a general purpose database. We only support large range scans
 4. Distributed consensus
-    1. We instead support bootstrapping from a live instance to create a read-replica that could be promoted in disaster recovery scenarios
+    1. High availability will be addressed by a separate design later (see Section 6)
     2. Doing distributed consensus is quite challenging, and I want to ship a robust system quickly
     3. This isn’t a one-way door; we can add raft on segment blocks eventually. But I want to avoid ballooning the complexity of the original design so we can ship on reasonably short timelines
 
@@ -51,13 +51,13 @@ Finally, Jetstream v1 is a user-friendly tool and is cheap to run, but drops all
 
 ## 2. Architecture Overview
 
-Jetstream is a single static executable that runs on a single server. We support replication for an primary/read-replica HA setup. We do this for simplicity and so we can ship in a reasonable amount of time.
+Jetstream is a single static executable that runs on a single server. High availability is deferred to a future design (Section 6). We do this for simplicity and so we can ship in a reasonable amount of time.
 
 It completes full network backfill, transitions to the live tail seamlessly. Then, its clients to subscribe to the full network or certain data slices (similar to Jetstream v1).
 
 It tracks each event via its own `sequence number`, a monotonic 64-bit integer assigned at ingestion time (this sequence number is also known as the `cursor`). The cursor is *inclusive*: `?cursor=N` replays starting at the event with seq N (we deliver events with seq >= cursor). Sequence numbers start at 1; seq 0 is a reserved "nothing yet" sentinel, so `?cursor=0` replays from before the first event (i.e. everything). Combined with at-least-once delivery (see the invariants below), a client resuming from its last-seen cursor re-receives that last event, so clients must be idempotent (the bundled Go client dedups by seq, re-anchoring at last-seen-seq and dropping the re-delivery). The client can use this to either backfill data starting from the beginning of time, some arbitrary point, or just start streaming the current live tip.
 
-Same as the normal firehose, cursors are instance-local. Each jetstream instance assigns its own seq values independently, so on failover to a replica, clients should rewind their cursor by a small margin and rely on at-least-once delivery to cover the overlap.
+Same as the normal firehose, cursors are instance-local. Each jetstream instance assigns its own seq values independently, so when switching between instances, clients should rewind their cursor by a small margin and rely on at-least-once delivery to cover the overlap.
 
 We enforce some invariants that are required for building correctly on atproto:
 
@@ -166,7 +166,7 @@ Deletions and updates do not modify segment files synchronously. Every delete an
 
 Every so often, we compact updates/deletions into the sealed segments. Compaction snapshots tombstones above `compaction/seq`, rewrites sealed segments atomically, and refreshes serving metadata for changed files. See Section 3.3 for more details.
 
-The net of this is that segment files are immutable between compaction passes and only rewrite on the merge-tail pass or the steady-state compaction cadence. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy replication to read-replicas that seed from a given jetstream instance.
+The net of this is that segment files are immutable between compaction passes and only rewrite on the merge-tail pass or the steady-state compaction cadence. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy seeding of another instance from a given jetstream instance's archive.
 
 ### 3.1.2 File Format
 
@@ -414,7 +414,6 @@ compaction/seq          -> the highest-watermark sequence number of the most rec
 repo/<did>              -> JSON<RepoStatus> per-DID backfill and steady-state bookkeeping
 account/<did>           -> JSON<AccountStatus> hosting status, only present when non-active
 sync/<did>              -> JSON<SyncState> present while a resync is in progress
-replica/upstream_cursor -> uint64 (replica-only) last seq consumed from the upstream leader
 ```
 
 The `backfill/timing/*` keys are operator diagnostics, not control-plane state. When the bootstrap backfill engine drains, the orchestrator commits `phase=merging`, `phase/entered_at`, `backfill/timing/started_at`, and `backfill/timing/completed_at` in one synced pebble batch. That makes the status page's completed-backfill duration durable without creating a recovery dependency on it. Older data directories that predate these keys can still enter steady state; they simply render the completed backfill duration as unknown.
@@ -530,7 +529,7 @@ Internally, Jetstream doesn't care about handles, identity updates, or hosting s
 
 The legacy `/subscribe` (v1) endpoint preserves the original Jetstream contract: regardless of `wantedCollections`, all subscribers receive `#account` and `#identity` events (they are still gated by `wantedDids`). This is intentional backwards compatibility and must not change.
 
-`#account` and `#identity` are delivered **unconditionally** — regardless of `wantedCollections`, on **both** the simple and extended wires of `/subscribe` (v1) and `/subscribe-v2`, and by the Go client (still gated by `wantedDids`). `#sync` is also unconditional with respect to `wantedCollections`, but it is only emitted on the **extended** wire (`?extended=true`): the simple, v1-compatible JSON wire skips `#sync` for v1 parity (v1 never emitted it — `encoder.go` returns `errSkipEvent` for the simple `Encode`, while `EncodeExtended` emits it). The bundled Go client connects in extended mode, so it receives `#sync`; a third party on the plain JSON wire does not. Earlier drafts dropped `#identity` (and hid `#account`) under a collection filter; that policy is gone (see [#142](https://github.com/bluesky-social/jetstream/issues/142), [#171](https://github.com/bluesky-social/jetstream/issues/171)). The reason is correctness, not just intuitiveness: a DID-level marker (an account delete `active=false, status=deleted`, or a `#sync` divergence) is what a folding consumer uses to purge a dead account's records, so it must reach every subscriber — including a collection-scoped one. There is no client-side suppression and no "fold before the delivery filter" step; the markers are delivered as ordinary events and the consumer folds them. (For the *backfill* path, the same coverage is provided in the archive by the DID-marker sentinel index described in Section 3.3, so a collection-filtered backfill selects those marker blocks too.)
+`#account` and `#identity` are delivered **unconditionally** — regardless of `wantedCollections`, on **both** `/subscribe` (v1) and `/subscribe-v2`, and by the Go client (still gated by `wantedDids`). `#sync` is also unconditional with respect to `wantedCollections`, but it is only emitted on **`/subscribe-v2`**: the v1-compatible JSON wire skips `#sync` for v1 parity (v1 never emitted it — `encoder.go` returns `errSkipEvent` for the v1 `Encode`, while `EncodeV2` emits it). The bundled Go client connects to `/subscribe-v2`, so it receives `#sync`; a v1 `/subscribe` consumer does not. Earlier drafts dropped `#identity` (and hid `#account`) under a collection filter; that policy is gone (see [#142](https://github.com/bluesky-social/jetstream/issues/142), [#171](https://github.com/bluesky-social/jetstream/issues/171)). The reason is correctness, not just intuitiveness: a DID-level marker (an account delete `active=false, status=deleted`, or a `#sync` divergence) is what a folding consumer uses to purge a dead account's records, so it must reach every subscriber — including a collection-scoped one. There is no client-side suppression and no "fold before the delivery filter" step; the markers are delivered as ordinary events and the consumer folds them. (For the *backfill* path, the same coverage is provided in the archive by the DID-marker sentinel index described in Section 3.3, so a collection-filtered backfill selects those marker blocks too.)
 
 Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we store the `KindSync` row followed by the authoritative replacement records returned by the verifier. The `KindSync` row is a DID tombstone for compaction (see Section 3.3), so older pre-divergence record rows are physically removed once the relevant sealed segment is compacted.
 
@@ -585,65 +584,26 @@ Cursor lookback is bounded to the most recent 36 hours by default (matching jets
 
 Cursors in the future drop into live-tip mode (no replay) on both endpoints.
 
-### 5.2 Extended JSON Payload
+### 5.2 The /subscribe-v2 JSON Payload
 
-Subscribers that need everything Jetstream knows about an event can opt in by appending `?extended=true` to the websocket URL. The extended form is a strict superset of the simple form: all the same fields are present, plus:
+The `/subscribe-v2` endpoint delivers a strict superset of the v1 shape: all the same fields are present (including the decoded `commit.record` JSON), plus:
 
-- `seq`: Jetstream's own monotonic 64-bit cursor assigned to this event at ingestion time.
-- `upstream_relay_cursor`: the upstream relay firehose cursor this event came from. Useful to any subscriber that wants to eventually promote itself into a primary and pick up from the relay with minimal overlap.
+- `seq`: Jetstream's own monotonic 64-bit cursor assigned to this event at ingestion time (the same value as `cursor`; v1 only carries `cursor`).
 - `commit.record_cbor`: the raw DAG-CBOR payload of the record, base64-encoded. Only populated for `kind: "commit"`. This is the byte-exact form written to the segment file, suitable for verifying against a PDS or reconstructing the MST.
-- `sync`: the archived `#sync` event. `sync.blocks` is the raw CAR payload, base64-encoded. Only populated for `kind: "sync"`.
+- `sync`: the archived `#sync` event, which v1 never emits. `sync.blocks` is the raw CAR payload, base64-encoded. Only populated for `kind: "sync"`.
 - TODO: `prevRev`  on all events (Fig suggestion)
 
-A replica is just an extended-mode subscriber with the additional behavior of writing what it receives into its own segments. See Section 6.
+The bundled Go client consumes this wire on its live tail; the raw DAG-CBOR is what lets a typed consumer decode records with its own lexicon codegen, byte-exactly.
 
-On extended connections, the stream also interleaves control events that don't flow on simple connections. These use new `kind` values:
+`/subscribe-v2` also diverges from v1 in presentation policy (both are deliberate, per-endpoint contracts): it emits Sync 1.1 resync replacement rows (v1 advances over them silently for wire parity), and it rejects a below-floor seq cursor with a pre-upgrade HTTP 400 as described in Section 5.1 (v1 silently clamps).
 
-```
-kind values (extended-only):
-  segment_sealed      upstream sealed a segment file
-  segment_compacted   upstream rewrote a previously-sealed segment (tombstone compaction
-                      or timestamp import)
-  heartbeat           keepalive; carries cursor values for liveness detection
-```
+`/subscribe-v2` subscriptions are not authenticated, but they're more expensive to produce (base64-encoded CBOR, heavier per-event payload) so we may more strictly rate limit them compared to the v1 firehose on the Bluesky-hosted instance.
 
-Each control event carries a small payload: `segment_sealed` and `segment_compacted` carry `{name, sha256, min_seq, max_seq}`; `heartbeat` carries `{seq, upstream_relay_cursor}`.
-
-Extended-mode subscriptions are not authenticated, but they're more expensive to produce (base64-encoded CBOR, heavier per-event payload) so we may more strictly rate limit them compared to the simple firehose on the Bluesky-hosted instance.
+> Historical note: earlier drafts specified an `?extended=true` opt-in carrying `upstream_relay_cursor` and interleaved control events (`segment_sealed`, `segment_compacted`, `heartbeat`) to serve the Section 6 replication protocol. That replication design was dropped before shipping and the extended mode was removed with it; `/subscribe-v2` always carries the superset payload described above.
 
 ## 6. Replication
 
-NOTE (jrc): this section is still pretty early-days and I want to review it myself a fair bit more before getting seriously in-depth review from others. This will come much later in the implementation, so I'm not overly fixated on getting it perfect yet.
-
-We support a simple asynchronous replication protocol for active-passive high availability setups. This allows for the leader instance to handle writes and a relatively small read workload, and there can be some large number of read replicas (or read-replica chains) that can distribute read traffic across many sites.
-
-The guiding principle is that as much as possible, we only replicate source data, not metadata stores. Everything pebble holds on the leader is either derivable from the event stream the replica already consumes (per-DID `LatestRev`, `AccountStatus`), reconstructible on promotion by calling `com.atproto.sync.listRepos` on the relay (the DID list itself), or deliberately leader-only and not needed by a passive replica (retry attempt counters, `LastError` strings, in-flight sync state). A promoted replica rebuilds any missing per-DID backfill lifecycle rows from the authoritative DID list and its local archive state.
-
-### 6.1 The Replication Protocol
-
-Replication has two moving parts: bulk transfer of sealed segment files over plain HTTP downloads (the same CDN-friendly downloads that end-user clients use), and a persistent websocket between the replica and its upstream that carries live events and the control signals replicas depend on. That websocket is just an extended-mode subscription to the same streaming endpoint end-user clients use, as described in Section 5.2. There is no separate replication protocol.
-
-Everything a replica needs to stay caught up is already carried on an extended-mode connection: the raw DAG-CBOR of each record (so the replica can write bit-exact payloads into its own segments), the jetstream-local `seq` (so the replica can persist its own upstream cursor), the upstream relay cursor (so a promoted replica can pick up the relay firehose with minimal overlap), and the `segment_sealed` and `segment_compacted` control events. Because end-user clients with `?extended=true` receive the same frames, replicas aren't a privileged special case at the protocol layer; they're just the most aggressive consumer.
-
-Idempotency matters for the bootstrap-to-live handoff. Duplicate events are deduplicated by `(did, seq)` at the block boundary; duplicate segment-seal or segment-compacted events redownload the same file and produce the same on-disk state. This lets the bootstrap-time bulk transfers overlap with live control events at the boundary without a strict handoff.
-
-### 6.2 Bootstrapping a Replica
-
-To bootstrap a new read replica, start the server with the `--upstream=jetstream.us-east.bsky.network` flag. The replica goes through the following steps:
-
-1. Open an extended-mode websocket to the upstream with no cursor, and start buffering frames in memory. Doing this first ensures no live events or control signals are lost during the bulk-transfer phase.
-2. Download every sealed segment file the upstream currently lists, verifying each one's sha256 checksum against the value in its fixed header.
-3. Begin processing buffered websocket frames: write events into the active segment and handle `segment_sealed` and `segment_compacted` by downloading and swapping the named file.
-
-The replica writes events into its own active segment exactly as a primary would, and seals independently when its active segment fills. Replica sealed segments are not expected to be bitwise-identical to the upstream's, since block boundaries depend on local timing. They're logically equivalent, and each file's self-contained sha256 checksum is what we verify against.
-
-### 6.3 Promoting a Replica to Leader
-
-To promote a replica to leader, remove the `--upstream` flag and point it at a relay firehose instead. The promoted leader uses the last `upstream_relay_cursor` it observed on the extended stream as its starting point and rewinds slightly to lean on at-least-once delivery across the overlap. It then calls `com.atproto.sync.listRepos` to get the authoritative DID list, diffs it against `repo/<did>` in pebble and the local archive state, and queues unknown or incomplete active DIDs for initial backfill or retry. This means a promoted leader has a warmup window measured in minutes (dominated by `listRepos` pagination) before retry work resumes, which we consider acceptable given our non-goal of sub-minute failover.
-
-We accept a few cosmetic regressions on failover: `Attempts` counters reset to zero, `LastError` strings are lost (operators can consult logs for debugging history), and any accounts that are legitimately empty at the relay may be redundantly re-fetched once. None of these affect correctness.
-
-Timestamp imports (Section 8) flow to replicas entirely through `segment_compacted` events on the extended stream and do not need a parallel channel.
+> **STATUS: DROPPED — to be redesigned.** An earlier draft of this section specified an asynchronous active-passive replication protocol built on an `?extended=true` websocket payload (carrying `upstream_relay_cursor` and `segment_sealed`/`segment_compacted`/`heartbeat` control events). That design — and the extended wire mode it required — has been removed; nothing of it was ever implemented. High availability will be addressed by a different mechanism designed later; see `specs/notes/2026-06-27-high-availability-clustering.md` for the current exploration. Jetstream today runs single-node.
 
 ## 7. Rate Limits
 
@@ -666,7 +626,9 @@ Only the operator can change `indexed_at`, and it's off by default: the import e
 
 Imports run against a live server with no downtime. The operator stages a plain (uncompressed) CSV of AT URIs and timestamps somewhere on the box, then kicks off an import job pointing at that path. Uncompressed on purpose: the import records a byte offset for each valid row during its single streaming validation pass and seeks straight back to that row when it's time to patch, which a compressed stream can't do without re-scanning or spilling a plaintext copy — and the box already holds the multi-terabyte segment archive, so the extra disk is a cheap trade. Each row can say whether the timestamp applies to every version of the record (the default) or one specific version by CID. We key on AT URI rather than CID because the URI contains the DID, which lets the segment-level DID bloom do almost all the filtering for free; operators who only have CIDs can resolve them to URIs first.
 
-The job buckets the URIs by DID, uses the segment and per-block DID blooms to find candidate blocks, then decompresses each one and patches the `indexed_at` column for the matching rows. Rather than maintain a separate timestamp table that has to be kept in sync with the segments, we write straight into the segment files — the import piggybacks on the compaction machinery, so it shares the same rewrite path, re-seals touched segments with fresh checksums, and fires the usual segment-compaction notification. It's the same atomic rewrite we already do for deletes, just mutating a column instead of dropping rows. Bad rows are skipped and reported rather than failing the whole import, and re-running is safe: an already-applied file just produces no changes.
+The job buckets the URIs by DID, uses the segment and per-block DID blooms to find candidate blocks, then decompresses each one and patches the `indexed_at` column for the matching rows. Rather than maintain a separate timestamp table that has to be kept in sync with the segments, we write straight into the segment files — the import piggybacks on the compaction machinery, so it shares the same rewrite path and re-seals touched segments with fresh checksums. It's the same atomic rewrite we already do for deletes, just mutating a column instead of dropping rows. Bad rows are skipped and reported rather than failing the whole import, and re-running is safe: an already-applied file just produces no changes.
+
+Once the import has rewritten the affected segments, the manifest lists the new files and backfilling clients pick them up on their next segment listing. (The dropped Section 6 replication design would have pushed `segment_compacted` notifications to replicas; whatever HA mechanism replaces it must account for compacted-segment propagation.)
 
 ### 8.1 Operating an import
 

@@ -1,7 +1,10 @@
 # Go Client Design
 
 Date: 2026-06-18
-Status: design / planning
+Status: design / planning (historical note: the `?extended=true` mode referenced
+below was later folded into `/subscribe-v2` unconditionally and the query param,
+`upstream_relay_cursor` wire field, and extended control events were removed —
+see docs/README.md §5.2)
 Labels: `client`, `testing`
 Related: #77 (oracle: drive historical reads through the real Go client)
 

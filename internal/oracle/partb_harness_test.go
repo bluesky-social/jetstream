@@ -30,7 +30,7 @@ import (
 // partb_harness_test.go builds the hermetic, real-socket fixture the §16 Part-B
 // oracle scenarios drive: a single httptest server that serves BOTH the
 // paginated archive XRPC (planBackfill/getSegment/getBlock, mounted at /xrpc/)
-// and the live /subscribe-v2 websocket (with the v2 RejectCursorBelowFloor
+// and the live /subscribe-v2 websocket (with the v2 reject-below-floor
 // too-old policy), backed by one sealed-segment archive + manifest + writer +
 // hot-ring Tail. It deliberately avoids the synctest bubble — the oracle package
 // allows exactly one bubble per process (owned by TestOracle_DefaultLifecycle),
@@ -219,15 +219,14 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 		}
 	}))
 	mux.Handle("GET /subscribe-v2", subscribe.NewHandler(subscribe.Subscription{
-		Tail:                      tail,
-		Store:                     st,
-		Manifest:                  m,
-		Writer:                    w,
-		Logger:                    logger,
-		Metrics:                   subscribe.NewMetrics(prometheus.NewRegistry()),
-		Lookback:                  cfg.Lookback,
-		EmitResyncReplacementRows: true,
-		RejectCursorBelowFloor:    true,
+		Tail:     tail,
+		Store:    st,
+		Manifest: m,
+		Writer:   w,
+		Logger:   logger,
+		Metrics:  subscribe.NewMetrics(prometheus.NewRegistry()),
+		Lookback: cfg.Lookback,
+		V2:       true,
 	}))
 
 	ts := httptest.NewServer(mux)
@@ -281,7 +280,7 @@ func (s *pagedCutoverServer) tipLocked() uint64 { return s.nextSeq.Load() }
 // is the raw §14 signal the client's re-backfill keys on.
 func dialSubscribeV2(t *testing.T, baseURL string, cursor uint64) (status int, body string) {
 	t.Helper()
-	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/subscribe-v2?extended=true&cursor=" + strconv.FormatUint(cursor, 10)
+	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/subscribe-v2?cursor=" + strconv.FormatUint(cursor, 10)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	conn, resp, err := websocket.Dial(ctx, wsURL, nil)

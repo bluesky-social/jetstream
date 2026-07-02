@@ -68,11 +68,11 @@
 //     subscribers receive Account and Identity events." Locked down by
 //     TestWants_IdentityBypassesCollectionFilter.
 //
-//   - #sync events are deliberately not emitted on the SIMPLE (non-extended)
-//     JSON wire — v1 didn't emit them either (encoder.go Encode →
-//     errSkipEvent). The EXTENDED wire (?extended=true) DOES emit #sync
-//     (EncodeExtended), which is what the bundled Go client uses. #account
-//     and #identity are emitted on both wires.
+//   - #sync events are deliberately not emitted on the v1 /subscribe wire —
+//     v1 didn't emit them either (encoder.go Encode → errSkipEvent). The
+//     /subscribe-v2 wire DOES emit #sync (EncodeV2), which is what the
+//     bundled Go client consumes. #account and #identity are emitted on
+//     both wires.
 //
 //   - Unknown SubscriberSourcedMessage.Type values are logged and
 //     ignored, not fatal. v1 has the same policy. Locked down by
@@ -110,7 +110,7 @@
 // ?cursor= replay IS supported (cursor.go + the cold reader), resolving a
 // seq or time_us cursor against the manifest, clamped to the configured
 // --cursor-lookback floor. The too-old-cursor policy is endpoint-specific
-// (Subscription.RejectCursorBelowFloor, set true only on /subscribe-v2):
+// (Subscription.V2, set true only on /subscribe-v2):
 //
 //   - /subscribe (v1): a seq cursor below the floor is silently CLAMPED up
 //     to the floor (legacy v1 wire parity), made observable via the
@@ -121,7 +121,7 @@
 //     last seq instead of silently skipping (requestedSeq, floor].
 //   - The time_us cursor path always clamps under BOTH endpoints: a legacy
 //     timestamp cursor's documented contract is to start at the oldest
-//     retained event, and RejectCursorBelowFloor governs only the seq path.
+//     retained event, and the v2 reject policy governs only the seq path.
 //
 // Setting --cursor-lookback=0 disables replay: a cursor param is then
 // accepted but resolves to the live tip rather than 400-ing, so v1 clients
