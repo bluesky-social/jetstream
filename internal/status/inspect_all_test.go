@@ -66,9 +66,9 @@ func TestInspectAll_SingleSegment(t *testing.T) {
 	dir := t.TempDir()
 
 	events := []segment.Event{
-		{Seq: 10, IndexedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "a", Rev: "r1", Payload: []byte("p1")},
-		{Seq: 11, IndexedAt: 1_700_000_000_500_000, Kind: segment.KindCreate, DID: "did:plc:bob", Collection: "app.bsky.feed.like", Rkey: "b", Rev: "r2", Payload: []byte("p2")},
-		{Seq: 12, IndexedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "c", Rev: "r3", Payload: []byte("p3")},
+		{Seq: 10, WitnessedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "a", Rev: "r1", Payload: []byte("p1")},
+		{Seq: 11, WitnessedAt: 1_700_000_000_500_000, Kind: segment.KindCreate, DID: "did:plc:bob", Collection: "app.bsky.feed.like", Rkey: "b", Rev: "r2", Payload: []byte("p2")},
+		{Seq: 12, WitnessedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "c", Rev: "r3", Payload: []byte("p3")},
 	}
 	writeSealedSegment(t, dir, 1, events)
 
@@ -88,9 +88,9 @@ func TestInspectAll_SingleSegment(t *testing.T) {
 	require.Greater(t, tree.DiskBytes, int64(0))
 	require.Equal(t, uint64(10), tree.MinSeq)
 	require.Equal(t, uint64(12), tree.MaxSeq)
-	require.False(t, tree.MinIndexedAt.IsZero())
-	require.False(t, tree.MaxIndexedAt.IsZero())
-	require.True(t, tree.MaxIndexedAt.After(tree.MinIndexedAt) || tree.MaxIndexedAt.Equal(tree.MinIndexedAt))
+	require.False(t, tree.MinWitnessedAt.IsZero())
+	require.False(t, tree.MaxWitnessedAt.IsZero())
+	require.True(t, tree.MaxWitnessedAt.After(tree.MinWitnessedAt) || tree.MaxWitnessedAt.Equal(tree.MinWitnessedAt))
 	require.NotNil(t, tree.LatestSegment)
 	require.Equal(t, uint64(1), tree.LatestSegment.Index)
 	require.True(t, tree.LatestSegment.Sealed)
@@ -123,18 +123,18 @@ func TestInspectAll_MultiTreeMergesCollections(t *testing.T) {
 
 	// Seg 1 in segments/: 2 posts, 1 like.
 	writeSealedSegment(t, segDir, 1, []segment.Event{
-		{Seq: 1, IndexedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "x", Rev: "r1", Payload: []byte("p")},
-		{Seq: 2, IndexedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "y", Rev: "r2", Payload: []byte("p")},
-		{Seq: 3, IndexedAt: 1_700_000_002_000_000, Kind: segment.KindCreate, DID: "did:plc:c", Collection: "app.bsky.feed.like", Rkey: "z", Rev: "r3", Payload: []byte("p")},
+		{Seq: 1, WitnessedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "x", Rev: "r1", Payload: []byte("p")},
+		{Seq: 2, WitnessedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "y", Rev: "r2", Payload: []byte("p")},
+		{Seq: 3, WitnessedAt: 1_700_000_002_000_000, Kind: segment.KindCreate, DID: "did:plc:c", Collection: "app.bsky.feed.like", Rkey: "z", Rev: "r3", Payload: []byte("p")},
 	})
 	// Seg 2 in segments/: 1 post, 1 follow.
 	writeSealedSegment(t, segDir, 2, []segment.Event{
-		{Seq: 4, IndexedAt: 1_700_000_003_000_000, Kind: segment.KindCreate, DID: "did:plc:d", Collection: "app.bsky.feed.post", Rkey: "w", Rev: "r4", Payload: []byte("p")},
-		{Seq: 5, IndexedAt: 1_700_000_004_000_000, Kind: segment.KindCreate, DID: "did:plc:e", Collection: "app.bsky.graph.follow", Rkey: "v", Rev: "r5", Payload: []byte("p")},
+		{Seq: 4, WitnessedAt: 1_700_000_003_000_000, Kind: segment.KindCreate, DID: "did:plc:d", Collection: "app.bsky.feed.post", Rkey: "w", Rev: "r4", Payload: []byte("p")},
+		{Seq: 5, WitnessedAt: 1_700_000_004_000_000, Kind: segment.KindCreate, DID: "did:plc:e", Collection: "app.bsky.graph.follow", Rkey: "v", Rev: "r5", Payload: []byte("p")},
 	})
 	// Seg 1 in backfill/live_segments/: 1 post (overlaps NSID with segments/).
 	writeSealedSegment(t, liveDir, 1, []segment.Event{
-		{Seq: 6, IndexedAt: 1_700_000_005_000_000, Kind: segment.KindCreate, DID: "did:plc:f", Collection: "app.bsky.feed.post", Rkey: "u", Rev: "r6", Payload: []byte("p")},
+		{Seq: 6, WitnessedAt: 1_700_000_005_000_000, Kind: segment.KindCreate, DID: "did:plc:f", Collection: "app.bsky.feed.post", Rkey: "u", Rev: "r6", Payload: []byte("p")},
 	})
 
 	agg, err := status.InspectAll([]string{segDir, liveDir}, status.InspectAllOptions{})
@@ -171,13 +171,13 @@ func TestInspectAll_CorruptNonTailFileIsWarning(t *testing.T) {
 
 	// Three segments. We'll corrupt #2 (middle); #3 is the tail.
 	writeSealedSegment(t, dir, 1, []segment.Event{
-		{Seq: 1, IndexedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "x", Rev: "r1", Payload: []byte("p")},
+		{Seq: 1, WitnessedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "x", Rev: "r1", Payload: []byte("p")},
 	})
 	corruptPath := writeSealedSegment(t, dir, 2, []segment.Event{
-		{Seq: 2, IndexedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "y", Rev: "r2", Payload: []byte("p")},
+		{Seq: 2, WitnessedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "y", Rev: "r2", Payload: []byte("p")},
 	})
 	writeSealedSegment(t, dir, 3, []segment.Event{
-		{Seq: 3, IndexedAt: 1_700_000_002_000_000, Kind: segment.KindCreate, DID: "did:plc:c", Collection: "app.bsky.feed.post", Rkey: "z", Rev: "r3", Payload: []byte("p")},
+		{Seq: 3, WitnessedAt: 1_700_000_002_000_000, Kind: segment.KindCreate, DID: "did:plc:c", Collection: "app.bsky.feed.post", Rkey: "z", Rev: "r3", Payload: []byte("p")},
 	})
 
 	// Corrupt the middle file by overwriting its magic.
@@ -201,10 +201,10 @@ func TestInspectAll_CorruptTailFileIsSilent(t *testing.T) {
 	dir := t.TempDir()
 
 	writeSealedSegment(t, dir, 1, []segment.Event{
-		{Seq: 1, IndexedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "x", Rev: "r1", Payload: []byte("p")},
+		{Seq: 1, WitnessedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "x", Rev: "r1", Payload: []byte("p")},
 	})
 	tailPath := writeSealedSegment(t, dir, 2, []segment.Event{
-		{Seq: 2, IndexedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "y", Rev: "r2", Payload: []byte("p")},
+		{Seq: 2, WitnessedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "y", Rev: "r2", Payload: []byte("p")},
 	})
 
 	// Corrupt the tail file.
@@ -245,10 +245,10 @@ func TestInspectAll_SkipUnsealed(t *testing.T) {
 	dir := t.TempDir()
 
 	writeSealedSegment(t, dir, 1, []segment.Event{
-		{Seq: 1, IndexedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "x", Rev: "r1", Payload: []byte("p")},
+		{Seq: 1, WitnessedAt: 1_700_000_000_000_000, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "x", Rev: "r1", Payload: []byte("p")},
 	})
 	writeActiveSegment(t, dir, 2, []segment.Event{
-		{Seq: 2, IndexedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.like", Rkey: "y", Rev: "r2", Payload: []byte("p")},
+		{Seq: 2, WitnessedAt: 1_700_000_001_000_000, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.like", Rkey: "y", Rev: "r2", Payload: []byte("p")},
 	})
 
 	// Without skip: both files contribute.

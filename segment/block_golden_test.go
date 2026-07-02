@@ -19,7 +19,7 @@ var updateGolden = flag.Bool("update", false, "regenerate golden testdata")
 func goldenEvents() []Event {
 	return []Event{
 		{
-			Seq: 1, IndexedAt: 1700000000_000000, RenderedAt: 0,
+			Seq: 1, WitnessedAt: 1700000000_000000, IndexedAt: 0,
 			Kind:       KindCreate,
 			DID:        "did:plc:abcdefghijklmnopqrstuvwx",
 			Collection: "app.bsky.feed.post",
@@ -28,12 +28,12 @@ func goldenEvents() []Event {
 			Payload:    []byte{0xA1, 0x65, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x05},
 		},
 		{
-			Seq: 2, IndexedAt: 1700000001_000000, RenderedAt: 1700000000_500000,
+			Seq: 2, WitnessedAt: 1700000001_000000, IndexedAt: 1700000000_500000,
 			Kind: KindIdentity,
 			DID:  "did:web:example.com",
 		},
 		{
-			Seq: 3, IndexedAt: 1700000002_000000, RenderedAt: 0,
+			Seq: 3, WitnessedAt: 1700000002_000000, IndexedAt: 0,
 			Kind:       KindDelete,
 			DID:        "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz",
 			Collection: "app.bsky.feed.like",

@@ -342,9 +342,9 @@ func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, obsClien
 func observedEventFromClient(t *testing.T, ev jetstream.Event) ObservedEvent {
 	t.Helper()
 	oe := ObservedEvent{
-		Seq:       ev.Seq,
-		IndexedAt: ev.TimeUS,
-		DID:       ev.DID,
+		Seq:         ev.Seq,
+		WitnessedAt: ev.TimeUS,
+		DID:         ev.DID,
 	}
 	switch ev.Kind {
 	case jetstream.KindCommit:

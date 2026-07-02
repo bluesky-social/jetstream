@@ -114,8 +114,8 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 			EventCount:       uint32(len(kept)),
 			MinSeq:           orig.MinSeq,
 			MaxSeq:           orig.MaxSeq,
-			MinIndexedAt:     orig.MinIndexedAt,
-			MaxIndexedAt:     orig.MaxIndexedAt,
+			MinWitnessedAt:   orig.MinWitnessedAt,
+			MaxWitnessedAt:   orig.MaxWitnessedAt,
 		}
 		nextOffset += uint64(8 + len(outFrame))
 		outBlocks = append(outBlocks, outBlock{frame: outFrame, info: info})
@@ -166,8 +166,8 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	}
 	newHeader.MinSeq = header.MinSeq
 	newHeader.MaxSeq = header.MaxSeq
-	newHeader.MinIndexedAt = header.MinIndexedAt
-	newHeader.MaxIndexedAt = header.MaxIndexedAt
+	newHeader.MinWitnessedAt = header.MinWitnessedAt
+	newHeader.MaxWitnessedAt = header.MaxWitnessedAt
 
 	headerBytes := encodeHeader(newHeader)
 	checksum := xxh3HeaderFooter(headerBytes, footerBytes)

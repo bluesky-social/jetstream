@@ -76,6 +76,31 @@ func TestDecodeSegmentCreateResyncIsCommit(t *testing.T) {
 	require.Equal(t, OpCreate, ev.Commit.Operation, "resync replacement presents as a create")
 }
 
+// TestDecodeSegmentTimeUSResolvesDisplayValue pins the backfill decode path to
+// the same time_us contract as the live wire: an operator-imported indexed_at
+// wins; otherwise witnessed_at. A backfill/live divergence here would show the
+// same event with two different timestamps depending on how the client saw it.
+func TestDecodeSegmentTimeUSResolvesDisplayValue(t *testing.T) {
+	t.Parallel()
+	payload := mustRecord(t, "app.bsky.feed.post")
+
+	unimported, err := decodeSegmentEvent(&segment.Event{
+		Seq: 1, Kind: segment.KindCreate, DID: "did:plc:a",
+		Collection: "app.bsky.feed.post", Rkey: "r1", Payload: payload,
+		WitnessedAt: 5_000,
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 5_000, unimported.TimeUS, "unimported row falls back to witnessed_at")
+
+	imported, err := decodeSegmentEvent(&segment.Event{
+		Seq: 2, Kind: segment.KindCreate, DID: "did:plc:a",
+		Collection: "app.bsky.feed.post", Rkey: "r2", Payload: payload,
+		WitnessedAt: 5_000, IndexedAt: 1_600,
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 1_600, imported.TimeUS, "imported indexed_at wins over witnessed_at")
+}
+
 func TestDecodeSegmentUnknownKindFails(t *testing.T) {
 	t.Parallel()
 	_, err := decodeSegmentEvent(&segment.Event{Seq: 1, Kind: segment.Kind(99), DID: "did:plc:a"})

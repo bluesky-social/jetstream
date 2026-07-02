@@ -76,8 +76,8 @@ func TestRunDeleteCompaction_SealsActiveSegmentBeforeSteadyPass(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	create := segment.Event{IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")}
-	del := segment.Event{IndexedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"}
+	create := segment.Event{WitnessedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")}
+	del := segment.Event{WitnessedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"}
 	require.NoError(t, w.Append(t.Context(), &create))
 	require.NoError(t, w.Append(t.Context(), &del))
 	// Deliberately no flush: both rows sit in the active segment's
@@ -107,7 +107,7 @@ func TestRunDeleteCompaction_SealsActiveSegmentBeforeSteadyPass(t *testing.T) {
 
 	// The writer survives the forced rotation: subsequent appends land
 	// in the next segment with monotonic seqs.
-	next := segment.Event{IndexedAt: 30, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("new")}
+	next := segment.Event{WitnessedAt: 30, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("new")}
 	require.NoError(t, w.Append(t.Context(), &next))
 	require.Equal(t, del.Seq+1, next.Seq)
 	require.Equal(t, uint64(1), w.ActiveIndex())
@@ -144,8 +144,8 @@ func TestRunDeleteCompaction_DropsSupersededRowWhenKeyUpdatedAboveWatermark(t *t
 
 	const did, coll, rkey = "did:plc:a", "app.bsky.feed.repost", "r"
 	sealed := []segment.Event{
-		{Seq: 0, IndexedAt: 10, Kind: segment.KindCreate, DID: did, Collection: coll, Rkey: rkey, Rev: "1", Payload: []byte("v1")},
-		{Seq: 1, IndexedAt: 20, Kind: segment.KindUpdate, DID: did, Collection: coll, Rkey: rkey, Rev: "2", Payload: []byte("v2")},
+		{Seq: 0, WitnessedAt: 10, Kind: segment.KindCreate, DID: did, Collection: coll, Rkey: rkey, Rev: "1", Payload: []byte("v1")},
+		{Seq: 1, WitnessedAt: 20, Kind: segment.KindUpdate, DID: did, Collection: coll, Rkey: rkey, Rev: "2", Payload: []byte("v2")},
 	}
 	dataDir, st, segPath := newCompactionDataDir(t, sealed)
 
@@ -156,7 +156,7 @@ func TestRunDeleteCompaction_DropsSupersededRowWhenKeyUpdatedAboveWatermark(t *t
 	for i := range sealed {
 		require.NoError(t, liveSet.Observe(&sealed[i]))
 	}
-	aboveWatermark := segment.Event{Seq: 2, IndexedAt: 30, Kind: segment.KindUpdate, DID: did, Collection: coll, Rkey: rkey, Rev: "3", Payload: []byte("v3")}
+	aboveWatermark := segment.Event{Seq: 2, WitnessedAt: 30, Kind: segment.KindUpdate, DID: did, Collection: coll, Rkey: rkey, Rev: "3", Payload: []byte("v3")}
 	require.NoError(t, liveSet.Observe(&aboveWatermark))
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -212,8 +212,8 @@ func TestRunDeleteCompaction_RewriteBeforeWatermarkCrashIsIdempotent(t *testing.
 	t.Cleanup(func() { _ = st.Close() })
 
 	path := writeCompactionSegment(t, segmentsDir, 0, []segment.Event{
-		{Seq: 1, IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
-		{Seq: 2, IndexedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
+		{Seq: 1, WitnessedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
+		{Seq: 2, WitnessedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
 	})
 
 	crashErr := errors.New("simulated compaction crash")
@@ -249,6 +249,90 @@ func TestRunDeleteCompaction_RewriteBeforeWatermarkCrashIsIdempotent(t *testing.
 	require.Equal(t, segment.KindDelete, events[0].Kind)
 }
 
+// cancelAtPointInjector cancels a context when a specific crashpoint is
+// reached, without returning an error — simulating an operator shutdown that
+// lands while a rewrite worker is mid-segment.
+type cancelAtPointInjector struct {
+	point  crashpoint.Point
+	cancel context.CancelFunc
+}
+
+func (c cancelAtPointInjector) SimulateCrash(_ context.Context, p crashpoint.Point) error {
+	if p == c.point {
+		c.cancel()
+	}
+	return nil
+}
+
+// TestRunDeleteCompaction_CancelMidChunkDoesNotAdvanceWatermark pins the
+// chunk-apply cancellation contract: a cancel that lands while a rewrite
+// worker is mid-segment makes the send loop drop the undelivered segments and
+// the workers exit nil through the closed channel — the chunk must still
+// surface context.Canceled. Returning nil would commit the chunk watermark
+// and evict tombstones for rewrites that never ran, leaving superseded rows
+// below the watermark alive permanently.
+func TestRunDeleteCompaction_CancelMidChunkDoesNotAdvanceWatermark(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	segmentsDir := filepath.Join(dataDir, "segments")
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Two sealed segments, each holding a superseded row + its delete.
+	writeCompactionSegment(t, segmentsDir, 0, []segment.Event{
+		{Seq: 1, WitnessedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
+		{Seq: 2, WitnessedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
+	})
+	path1 := writeCompactionSegment(t, segmentsDir, 1, []segment.Event{
+		{Seq: 3, WitnessedAt: 30, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
+		{Seq: 4, WitnessedAt: 40, Kind: segment.KindDelete, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	o := &Orchestrator{cfg: Config{
+		DataDir:            dataDir,
+		Store:              st,
+		Logger:             logger,
+		CompactionInterval: time.Hour,
+		// One worker: while it rewrites segment 0 (cancelling mid-rewrite via
+		// the crashpoint hook), the send loop is still holding segment 1 and
+		// drops it on gctx.Done(); the worker then exits nil via the closed
+		// channel without ever observing gctx.Err() at loop top.
+		CompactionRewriteWorkers: 1,
+		CrashInjector: cancelAtPointInjector{
+			point:  crashpoint.AfterSegmentRewriteRenamed,
+			cancel: cancel,
+		},
+	}, logger: logger}
+
+	err = o.runDeleteCompaction(ctx, compactionMergeTail, nil)
+	require.ErrorIs(t, err, context.Canceled,
+		"a chunk cut short by cancellation must not report success: the caller would commit the watermark over never-rewritten segments")
+
+	watermark, _, err := loadCompactionWatermark(st)
+	require.NoError(t, err)
+	require.Zero(t, watermark, "watermark must not advance past a dropped segment")
+
+	// Segment 1's superseded row is still on disk (its rewrite never ran)...
+	events := readCompactionSegment(t, path1)
+	require.Len(t, events, 2, "segment 1 untouched by the cancelled chunk")
+
+	// ...and a clean re-run compacts it.
+	o.cfg.CrashInjector = nil
+	require.NoError(t, o.runDeleteCompaction(context.Background(), compactionMergeTail, nil))
+	watermark, _, err = loadCompactionWatermark(st)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), watermark)
+	events = readCompactionSegment(t, path1)
+	require.Len(t, events, 1, "retry drops the superseded row")
+	require.Equal(t, segment.KindDelete, events[0].Kind)
+}
+
 func TestRunDeleteCompaction_ManifestRefreshFailureReconcilesOnRetry(t *testing.T) {
 	t.Parallel()
 
@@ -260,8 +344,8 @@ func TestRunDeleteCompaction_ManifestRefreshFailureReconcilesOnRetry(t *testing.
 	t.Cleanup(func() { _ = st.Close() })
 
 	path := writeCompactionSegment(t, segmentsDir, 0, []segment.Event{
-		{Seq: 1, IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
-		{Seq: 2, IndexedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
+		{Seq: 1, WitnessedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
+		{Seq: 2, WitnessedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
 	})
 	ts := tombstone.New()
 	require.NoError(t, ts.Observe(&segment.Event{Seq: 2, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r"}))
@@ -316,12 +400,12 @@ func TestRunDeleteCompaction_ChunkWatermarkCrashResumesAtNextChunk(t *testing.T)
 	t.Cleanup(func() { _ = st.Close() })
 
 	path0 := writeCompactionSegment(t, segmentsDir, 0, []segment.Event{
-		{Seq: 1, IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old-a")},
-		{Seq: 2, IndexedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
+		{Seq: 1, WitnessedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old-a")},
+		{Seq: 2, WitnessedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
 	})
 	path1 := writeCompactionSegment(t, segmentsDir, 1, []segment.Event{
-		{Seq: 3, IndexedAt: 30, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "3", Payload: []byte("old-b")},
-		{Seq: 4, IndexedAt: 40, Kind: segment.KindDelete, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "4"},
+		{Seq: 3, WitnessedAt: 30, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "3", Payload: []byte("old-b")},
+		{Seq: 4, WitnessedAt: 40, Kind: segment.KindDelete, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "4"},
 	})
 
 	crashErr := errors.New("simulated chunk crash")
@@ -356,10 +440,10 @@ func TestRunDeleteCompaction_SteadyLiveSetMatchesScanFold(t *testing.T) {
 	t.Parallel()
 
 	events := []segment.Event{
-		{Seq: 1, IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old-a")},
-		{Seq: 2, IndexedAt: 20, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old-b")},
-		{Seq: 3, IndexedAt: 30, Kind: segment.KindUpdate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2", Payload: []byte("new-a")},
-		{Seq: 4, IndexedAt: 40, Kind: segment.KindDelete, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
+		{Seq: 1, WitnessedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old-a")},
+		{Seq: 2, WitnessedAt: 20, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old-b")},
+		{Seq: 3, WitnessedAt: 30, Kind: segment.KindUpdate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2", Payload: []byte("new-a")},
+		{Seq: 4, WitnessedAt: 40, Kind: segment.KindDelete, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
 	}
 
 	scanDir, scanStore, scanPath := newCompactionDataDir(t, events)
@@ -421,24 +505,24 @@ func BenchmarkDeleteCompactionSyntheticArchive(b *testing.B) {
 				rkey := fmt.Sprintf("r-%d-%d", segmentIdx, eventIdx)
 				seq++
 				events = append(events, segment.Event{
-					Seq:        seq,
-					IndexedAt:  int64(seq),
-					Kind:       segment.KindCreate,
-					DID:        did,
-					Collection: "app.bsky.feed.post",
-					Rkey:       rkey,
-					Rev:        fmt.Sprintf("%d-a", seq),
-					Payload:    []byte(`{"text":"old"}`),
+					Seq:         seq,
+					WitnessedAt: int64(seq),
+					Kind:        segment.KindCreate,
+					DID:         did,
+					Collection:  "app.bsky.feed.post",
+					Rkey:        rkey,
+					Rev:         fmt.Sprintf("%d-a", seq),
+					Payload:     []byte(`{"text":"old"}`),
 				})
 				seq++
 				events = append(events, segment.Event{
-					Seq:        seq,
-					IndexedAt:  int64(seq),
-					Kind:       segment.KindDelete,
-					DID:        did,
-					Collection: "app.bsky.feed.post",
-					Rkey:       rkey,
-					Rev:        fmt.Sprintf("%d-b", seq),
+					Seq:         seq,
+					WitnessedAt: int64(seq),
+					Kind:        segment.KindDelete,
+					DID:         did,
+					Collection:  "app.bsky.feed.post",
+					Rkey:        rkey,
+					Rev:         fmt.Sprintf("%d-b", seq),
 				})
 			}
 			writeCompactionSegmentB(b, segmentsDir, uint64(segmentIdx), events)
@@ -624,12 +708,12 @@ func TestRebuildLiveTombstones_BoundedByWatermark(t *testing.T) {
 	t.Parallel()
 
 	segA := []segment.Event{
-		{Seq: 1, IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "1", Payload: []byte("x")},
-		{Seq: 2, IndexedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "2"},
+		{Seq: 1, WitnessedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "1", Payload: []byte("x")},
+		{Seq: 2, WitnessedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "2"},
 	}
 	segB := []segment.Event{
-		{Seq: 3, IndexedAt: 30, Kind: segment.KindDelete, DID: "did:plc:b", Collection: "c", Rkey: "r", Rev: "3"},
-		{Seq: 4, IndexedAt: 40, Kind: segment.KindSync, DID: "did:plc:c", Rev: "4", Payload: []byte{0xa0}},
+		{Seq: 3, WitnessedAt: 30, Kind: segment.KindDelete, DID: "did:plc:b", Collection: "c", Rkey: "r", Rev: "3"},
+		{Seq: 4, WitnessedAt: 40, Kind: segment.KindSync, DID: "did:plc:c", Rev: "4", Payload: []byte{0xa0}},
 	}
 
 	dataDir := t.TempDir()
@@ -678,7 +762,7 @@ func TestRebuildLiveTombstones_DisabledWhenCompactionOff(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	writeCompactionSegment(t, segmentsDir, 0, []segment.Event{
-		{Seq: 1, IndexedAt: 10, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "1"},
+		{Seq: 1, WitnessedAt: 10, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r", Rev: "1"},
 	})
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

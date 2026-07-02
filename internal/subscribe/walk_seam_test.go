@@ -90,13 +90,13 @@ func TestWalkFromCursor_ConcurrentRotationSeam(t *testing.T) {
 	wg.Go(func() {
 		for w.ActiveIndex() < targetRotations {
 			ev := segment.Event{
-				IndexedAt:  time.Now().UnixMicro(),
-				Kind:       segment.KindCreate,
-				DID:        "did:plc:seamtest",
-				Collection: "app.bsky.feed.post",
-				Rkey:       "rkey",
-				Rev:        "rev",
-				Payload:    []byte{0xa0},
+				WitnessedAt: time.Now().UnixMicro(),
+				Kind:        segment.KindCreate,
+				DID:         "did:plc:seamtest",
+				Collection:  "app.bsky.feed.post",
+				Rkey:        "rkey",
+				Rev:         "rev",
+				Payload:     []byte{0xa0},
 			}
 			if err := w.Append(ctx, &ev); err != nil {
 				producerErr.Store(&err)
@@ -259,7 +259,7 @@ func TestWalkFromCursor_RotationSeamDeterministic(t *testing.T) {
 	// runs dry at the hole.
 	for w.ActiveIndex() < 3 {
 		ev := segment.Event{
-			IndexedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
+			WitnessedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
 			DID: "did:plc:seam", Collection: "app.bsky.feed.post",
 			Rkey: "r", Rev: "v", Payload: []byte{0xa0},
 		}
@@ -270,7 +270,7 @@ func TestWalkFromCursor_RotationSeamDeterministic(t *testing.T) {
 	// the active region.
 	for range 3 {
 		ev := segment.Event{
-			IndexedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
+			WitnessedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
 			DID: "did:plc:seam", Collection: "app.bsky.feed.post",
 			Rkey: "r", Rev: "v", Payload: []byte{0xa0},
 		}
@@ -382,7 +382,7 @@ func TestWalkFromCursor_RotationSeamConverges(t *testing.T) {
 
 	for w.ActiveIndex() < 3 {
 		ev := segment.Event{
-			IndexedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
+			WitnessedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
 			DID: "did:plc:seam", Collection: "app.bsky.feed.post",
 			Rkey: "r", Rev: "v", Payload: []byte{0xa0},
 		}
@@ -484,7 +484,7 @@ func TestWalkFromCursor_SeamRetryFillsHoleViaActiveRegion(t *testing.T) {
 
 	for w.ActiveIndex() < 3 {
 		ev := segment.Event{
-			IndexedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
+			WitnessedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
 			DID: "did:plc:seam", Collection: "app.bsky.feed.post",
 			Rkey: "r", Rev: "v", Payload: []byte{0xa0},
 		}
@@ -492,7 +492,7 @@ func TestWalkFromCursor_SeamRetryFillsHoleViaActiveRegion(t *testing.T) {
 	}
 	for range 3 { // non-empty active segment: events above the gap
 		ev := segment.Event{
-			IndexedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
+			WitnessedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
 			DID: "did:plc:seam", Collection: "app.bsky.feed.post",
 			Rkey: "r", Rev: "v", Payload: []byte{0xa0},
 		}
@@ -565,7 +565,7 @@ func TestWalkFromCursor_NilManifestLenient(t *testing.T) {
 	const total = 10
 	for range total {
 		ev := segment.Event{
-			IndexedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
+			WitnessedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
 			DID: "did:plc:nilman", Collection: "app.bsky.feed.post",
 			Rkey: "r", Rev: "v", Payload: []byte{0xa0},
 		}
@@ -574,7 +574,7 @@ func TestWalkFromCursor_NilManifestLenient(t *testing.T) {
 	require.NoError(t, w.Flush(context.Background())) // flush some; later appends stay pending
 	for range 4 {
 		ev := segment.Event{
-			IndexedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
+			WitnessedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
 			DID: "did:plc:nilman", Collection: "app.bsky.feed.post",
 			Rkey: "r", Rev: "v", Payload: []byte{0xa0},
 		}
@@ -663,7 +663,7 @@ func TestWalkFromCursor_EmptyActiveSuccessorSeam(t *testing.T) {
 	// successor this test is about. seals == [0,1,2].
 	for w.ActiveIndex() < 3 {
 		ev := segment.Event{
-			IndexedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
+			WitnessedAt: time.Now().UnixMicro(), Kind: segment.KindCreate,
 			DID: "did:plc:emptyseam", Collection: "app.bsky.feed.post",
 			Rkey: "r", Rev: "v", Payload: []byte{0xa0},
 		}

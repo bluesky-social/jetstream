@@ -100,7 +100,7 @@ func TestSealSwarm(t *testing.T) {
 				payload[j] = byte(r.IntN(256))
 			}
 			ev := Event{
-				Seq: uint64(i + 1), IndexedAt: int64(i),
+				Seq: uint64(i + 1), WitnessedAt: int64(i),
 				Kind: Kind(1 + r.IntN(7)),
 				DID:  did, Collection: coll, Rkey: "k", Rev: "rev",
 				Payload: payload,

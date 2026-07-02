@@ -13,6 +13,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/timestamp"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
@@ -186,6 +187,16 @@ type Config struct {
 	// OnSegmentCompacted only on mismatch, keeping no-op passes cheap.
 	// Optional; nil makes reconcile refresh every sealed segment.
 	SegmentManifestChecksums func() map[uint64]uint64
+
+	// ImportSelector resolves a DID to the sealed segments that may contain it,
+	// from the manifest's resident blooms (no disk I/O). Wired by cmd/jetstream
+	// to the manifest; required only to run a timestamp-import job (M5+). nil
+	// disables import (RunImport returns ErrImportUnavailable).
+	ImportSelector timestamp.Selector
+
+	// ImportMetrics observes timestamp-import job progress and outcomes
+	// (design §6 J). Optional; nil means no import counters increment.
+	ImportMetrics *ImportMetrics
 
 	// CompactionBloomNarrowMaxDIDs bounds the candidate-DID set handed to the
 	// segment-level bloom prefilter; larger tombstone sets skip narrowing

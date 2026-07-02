@@ -46,12 +46,12 @@ func TestOpen_LoadsSealedSegmentBounds(t *testing.T) {
 	dir := t.TempDir()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 99,
-		minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000,
+		minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000,
 		eventCount: 100,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 100, maxSeq: 199,
-		minIndexedAt: 1_700_000_010_000_001, maxIndexedAt: 1_700_000_020_000_000,
+		minWitnessedAt: 1_700_000_010_000_001, maxWitnessedAt: 1_700_000_020_000_000,
 		eventCount: 100,
 	})
 
@@ -66,8 +66,8 @@ func TestOpen_LoadsSealedSegmentBounds(t *testing.T) {
 	require.Equal(t, uint64(0), bounds[0].Idx)
 	require.Equal(t, uint64(0), bounds[0].MinSeq)
 	require.Equal(t, uint64(99), bounds[0].MaxSeq)
-	require.Equal(t, int64(1_700_000_000_000_000), bounds[0].MinIndexedAt)
-	require.Equal(t, int64(1_700_000_010_000_000), bounds[0].MaxIndexedAt)
+	require.Equal(t, int64(1_700_000_000_000_000), bounds[0].MinWitnessedAt)
+	require.Equal(t, int64(1_700_000_010_000_000), bounds[0].MaxWitnessedAt)
 
 	require.Equal(t, uint64(1), bounds[1].Idx)
 	require.Equal(t, uint64(100), bounds[1].MinSeq)
@@ -123,10 +123,10 @@ func TestSegmentForSeq(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 99, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000, eventCount: 10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
-		minSeq: 100, maxSeq: 199, minIndexedAt: 1_700_000_010_000_001, maxIndexedAt: 1_700_000_020_000_000, eventCount: 10,
+		minSeq: 100, maxSeq: 199, minWitnessedAt: 1_700_000_010_000_001, maxWitnessedAt: 1_700_000_020_000_000, eventCount: 10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -154,10 +154,10 @@ func TestSegmentForTimeUS(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 99, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000, eventCount: 10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
-		minSeq: 100, maxSeq: 199, minIndexedAt: 1_700_000_010_000_001, maxIndexedAt: 1_700_000_020_000_000, eventCount: 10,
+		minSeq: 100, maxSeq: 199, minWitnessedAt: 1_700_000_010_000_001, maxWitnessedAt: 1_700_000_020_000_000, eventCount: 10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -183,15 +183,15 @@ func TestLookbackFloor(t *testing.T) {
 	now := time.Now().UnixMicro()
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 99,
-		minIndexedAt: now - int64(48*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(40*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(48*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(40*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 100, maxSeq: 199,
-		minIndexedAt: now - int64(12*time.Hour/time.Microsecond),
-		maxIndexedAt: now - int64(1*time.Hour/time.Microsecond),
-		eventCount:   10,
+		minWitnessedAt: now - int64(12*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(1*time.Hour/time.Microsecond),
+		eventCount:     10,
 	})
 	m := mustOpenManifest(t, dir)
 
@@ -217,7 +217,7 @@ func TestOnSegmentSealed(t *testing.T) {
 
 	path := filepath.Join(dir, "seg_0000000000.jss")
 	mustWriteSealedSegment(t, path, sealedFixture{
-		minSeq: 0, maxSeq: 99, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000, eventCount: 10,
 	})
 
 	require.NoError(t, m.OnSegmentSealed(0, path))
@@ -233,7 +233,7 @@ func TestOnSegmentSealed_ReplacesExistingIdx(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_0000000000.jss")
 	mustWriteSealedSegment(t, path, sealedFixture{
-		minSeq: 0, maxSeq: 99, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_010_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000, eventCount: 10,
 	})
 	m := mustOpenManifest(t, dir)
 	require.Equal(t, 1, m.SegmentCount())
@@ -247,7 +247,7 @@ func TestOnSegmentCompacted_ReplacesResidentMetadata(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_0000000000.jss")
 	mustWriteSealedSegment(t, path, sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	m := mustOpenManifest(t, dir)
 	before, _, _ := m.ListFrom(0, 1)
@@ -278,6 +278,85 @@ func TestOnSegmentCompacted_ReplacesResidentMetadata(t *testing.T) {
 	require.EqualValues(t, 5, events)
 }
 
+// TestGenerationAdvancesOnMutation pins the contract the Phase B import
+// bucketer's DID->candidate-segments cache relies on: Generation() is a
+// monotonic counter that strictly increases on every event that could change
+// which segments (or blocks) a DID resolves to -- initial load, seal, and
+// compaction refresh. A cache entry tagged with an older generation must be
+// treated as stale. Read-only queries must NOT advance it (or the cache would
+// never hit).
+func TestGenerationAdvancesOnMutation(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	m := mustOpenManifest(t, dir)
+
+	// Initial load of an empty dir still establishes a baseline generation.
+	g0 := m.Generation()
+
+	// Read-only queries must not move it.
+	_ = m.SegmentCount()
+	_, _ = m.SelectBlocksForDID("did:plc:whatever")
+	require.Equal(t, g0, m.Generation(), "read-only queries must not advance the generation")
+
+	path := filepath.Join(dir, "seg_0000000000.jss")
+	mustWriteSealedSegment(t, path, sealedFixture{
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
+	})
+	require.NoError(t, m.OnSegmentSealed(0, path))
+	g1 := m.Generation()
+	require.Greater(t, g1, g0, "seal must advance the generation")
+
+	_, err := segment.Rewrite(path, func(ev *segment.Event) segment.RowDecision {
+		if ev.Seq < 5 {
+			return segment.RowDrop
+		}
+		return segment.RowKeep
+	}, segment.RewriteOptions{})
+	require.NoError(t, err)
+	require.NoError(t, m.OnSegmentCompacted(0, path))
+	g2 := m.Generation()
+	require.Greater(t, g2, g1, "compaction refresh must advance the generation")
+}
+
+// TestRefreshSegment_RejectedRefreshLeavesManifestUntouched pins the
+// commit-or-nothing contract of a manifest refresh: a refresh rejected by the
+// seq-monotonicity validation must leave BOTH the resident segment set and the
+// generation exactly as they were. If the rejected metadata stayed resident
+// while the generation did not move, serving paths would observe the corrupt
+// set and generation-tagged caches (the import bucketer) would keep treating
+// their entries as fresh against it.
+func TestRefreshSegment_RejectedRefreshLeavesManifestUntouched(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path0 := filepath.Join(dir, "seg_0000000000.jss")
+	path1 := filepath.Join(dir, "seg_0000000001.jss")
+	mustWriteSealedSegment(t, path0, sealedFixture{
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 1_999, eventCount: 10,
+	})
+	mustWriteSealedSegment(t, path1, sealedFixture{
+		minSeq: 10, maxSeq: 19, minWitnessedAt: 2_000, maxWitnessedAt: 2_999, eventCount: 10,
+	})
+	m := mustOpenManifest(t, dir)
+	genBefore := m.Generation()
+	before, _, _ := m.ListFrom(0, 2)
+	require.Len(t, before, 2)
+
+	// Replace segment 1 on disk with a seq envelope overlapping segment 0 and
+	// refresh it: validation must reject the refresh.
+	overlapping := filepath.Join(dir, "overlap.jss.staging")
+	mustWriteSealedSegment(t, overlapping, sealedFixture{
+		minSeq: 5, maxSeq: 15, minWitnessedAt: 1_500, maxWitnessedAt: 2_500, eventCount: 10,
+	})
+	require.NoError(t, os.Rename(overlapping, path1))
+	require.ErrorIs(t, m.OnSegmentSealed(1, path1), manifest.ErrSegmentSeqOverlap)
+
+	require.Equal(t, genBefore, m.Generation(),
+		"rejected refresh must not advance the generation")
+	after, _, _ := m.ListFrom(0, 2)
+	require.Equal(t, before, after,
+		"rejected refresh must leave the resident segment set untouched")
+}
+
 func mustOpenManifest(t *testing.T, dir string) *manifest.Manifest {
 	t.Helper()
 	m, err := manifest.Open(manifest.Options{
@@ -293,7 +372,7 @@ func TestBlockIndex_LoadsAndCaches(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_0000000000.jss")
 	mustWriteSealedSegment(t, path, sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_700_000_000_000_000, maxIndexedAt: 1_700_000_001_000_000, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_001_000_000, eventCount: 10,
 	})
 
 	reg := prometheus.NewRegistry()
@@ -333,11 +412,11 @@ func TestBlockIndex_AllSegmentsStayResident(t *testing.T) {
 		mustWriteSealedSegment(t,
 			filepath.Join(dir, fmt.Sprintf("seg_%010d.jss", i)),
 			sealedFixture{
-				minSeq:       uint64(i * 10),
-				maxSeq:       uint64(i*10 + 9),
-				minIndexedAt: int64(1_700_000_000_000_000 + i*1_000_000),
-				maxIndexedAt: int64(1_700_000_000_000_000 + (i+1)*1_000_000),
-				eventCount:   10,
+				minSeq:         uint64(i * 10),
+				maxSeq:         uint64(i*10 + 9),
+				minWitnessedAt: int64(1_700_000_000_000_000 + i*1_000_000),
+				maxWitnessedAt: int64(1_700_000_000_000_000 + (i+1)*1_000_000),
+				eventCount:     10,
 			})
 	}
 

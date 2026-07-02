@@ -770,8 +770,8 @@ func traceSegmentEvent(ev *segment.Event) map[string]any {
 	}
 	out := map[string]any{
 		"seq":                   ev.Seq,
+		"witnessed_at":          ev.WitnessedAt,
 		"indexed_at":            ev.IndexedAt,
-		"rendered_at":           ev.RenderedAt,
 		"upstream_relay_cursor": ev.UpstreamRelayCursor,
 		"kind":                  eventLogKind(ev.Kind),
 		"kind_code":             uint8(ev.Kind),

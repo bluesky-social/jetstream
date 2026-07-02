@@ -1,0 +1,750 @@
+// Package importer is the operator-facing job manager for timestamp import
+// (design §8, milestone M6). It wraps the orchestrator's idempotent RunImport
+// core (Phases A/B/C) with the durable, single-at-a-time job lifecycle the
+// bearer-gated XRPC surface needs:
+//
+//   - Submit validates + confines the operator-supplied CSV path, refuses a
+//     second concurrent job (design Q-JOBMODEL: one import at a time, 409), and
+//     launches the run asynchronously, returning a job id immediately (200).
+//   - Progress is checkpointed in pebble under import/job/<id>/ so a process
+//     restart auto-resumes the in-flight job (design Q-RESUME): per-segment
+//     done markers let a resumed run skip already-patched segments, and a
+//     "bucketed" flag lets it skip re-parsing the CSV. The full-idempotency of
+//     RunImport is the backstop — a lost checkpoint degrades to a cheap re-scan,
+//     never corruption.
+//   - Status is served from the live in-memory record for the running job and
+//     from pebble for finished jobs, feeding both getImportStatus and the
+//     operator status page.
+//
+// Path confinement (design Q-TRANSPORT guard rail): the CSV path is resolved
+// through EvalSymlinks and must live within the configured import directory, so
+// the endpoint cannot be used to read arbitrary host files via .. or a symlink.
+package importer
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
+	"github.com/bluesky-social/jetstream/internal/store"
+)
+
+// Runner is the import core the manager drives. *orchestrator.Orchestrator
+// satisfies it; tests pass a fake to exercise the lifecycle without real
+// segments.
+//
+// Contract: on error, the returned ImportResult still carries the counters for
+// work completed before the failure (partial parse totals, segments applied).
+// The manager folds them into the durable job record so a paused or failed
+// job's progress is visible in status, matching what the Prometheus metrics
+// already recorded.
+type Runner interface {
+	RunImport(ctx context.Context, job orchestrator.ImportJob) (orchestrator.ImportResult, error)
+}
+
+// State is a job's lifecycle state. Stable string values: they are persisted
+// and surfaced on the status page / getImportStatus.
+type State string
+
+const (
+	// StateRunning: the job is executing (parse/bucket or apply).
+	StateRunning State = "running"
+	// StateComplete: the job finished successfully.
+	StateComplete State = "complete"
+	// StateFailed: the job aborted with an error (see Record.Error).
+	StateFailed State = "failed"
+)
+
+// Terminal reports whether s is a finished state.
+func (s State) Terminal() bool { return s == StateComplete || s == StateFailed }
+
+// Sentinel errors. Submit callers map these to HTTP status codes:
+// ErrJobInProgress -> 409, ErrPathRequired/ErrPathEscape/ErrPathNotFound ->
+// 400, ErrNotADir/anything else -> 500.
+var (
+	// ErrJobInProgress is returned by Submit when another import is running.
+	ErrJobInProgress = errors.New("importer: an import job is already in progress")
+	// ErrPathRequired is returned when the submitted path is empty.
+	ErrPathRequired = errors.New("importer: csv path is required")
+	// ErrPathEscape is returned when the resolved path escapes the import dir.
+	ErrPathEscape = errors.New("importer: csv path escapes the import directory")
+	// ErrPathNotFound is returned when the resolved path does not exist.
+	ErrPathNotFound = errors.New("importer: csv path not found")
+	// ErrNotAFile is returned when the resolved path is not a regular file
+	// (a directory, FIFO, device, or socket).
+	ErrNotAFile = errors.New("importer: csv path is not a regular file")
+	// ErrJobNotFound is returned by Status for an unknown job id.
+	ErrJobNotFound = errors.New("importer: job not found")
+)
+
+// Record is the durable + rendering view of one import job. Persisted as JSON
+// under import/job/<id>/meta; also the shape getImportStatus and the status
+// page consume. Counts are best-effort progress: SegmentsApplied advances live
+// during Phase C, while the parse/mutation totals are filled from the final
+// ImportResult (they are not known until the run returns).
+type Record struct {
+	ID          string                   `json:"id"`
+	CSVPath     string                   `json:"csvPath"`
+	State       State                    `json:"state"`
+	Phase       orchestrator.ImportPhase `json:"phase,omitempty"`
+	Error       string                   `json:"error,omitempty"`
+	SubmittedAt time.Time                `json:"submittedAt"`
+	FinishedAt  time.Time                `json:"finishedAt,omitzero"`
+
+	// Bucketed is set once Phase A+B completes and the offset files are durable.
+	// A resumed run keys on it to decide whether to skip re-parsing.
+	Bucketed bool `json:"bucketed"`
+
+	// Live Phase C progress.
+	SegmentsToApply int `json:"segmentsToApply"`
+	SegmentsApplied int `json:"segmentsApplied"`
+
+	// Run totals, folded from each run's ImportResult (foldResult): parse
+	// totals come from the last run that executed Phase A; apply counters
+	// accumulate across a pause/resume chain (each run applies a disjoint,
+	// checkpoint-guarded set of segments).
+	RowsTotal              uint64            `json:"rowsTotal"`
+	RowsValid              uint64            `json:"rowsValid"`
+	RowsRejected           uint64            `json:"rowsRejected"`
+	RejectsByReason        map[string]uint64 `json:"rejectsByReason,omitempty"`
+	SegmentsExamined       int               `json:"segmentsExamined"`
+	SegmentsPatched        int               `json:"segmentsPatched"`
+	RowsMutated            uint64            `json:"rowsMutated"`
+	RowsMatchedAllVersions uint64            `json:"rowsMatchedAllVersions"`
+	RowsMatchedSpecific    uint64            `json:"rowsMatchedSpecific"`
+	SpecificCIDsUnmatched  uint64            `json:"specificCidsUnmatched"`
+	RowsCorruptOffset      uint64            `json:"rowsCorruptOffset"`
+}
+
+func (r Record) clone() Record {
+	if r.RejectsByReason != nil {
+		m := make(map[string]uint64, len(r.RejectsByReason))
+		maps.Copy(m, r.RejectsByReason)
+		r.RejectsByReason = m
+	}
+	return r
+}
+
+// Config configures a Manager. Store, Runner, ImportDir, and ScratchDir are
+// required.
+type Config struct {
+	// Store is the metadata pebble db for job records + checkpoints.
+	Store *store.Store
+	// Runner is the import core (the orchestrator in production).
+	Runner Runner
+	// ImportDir is the confinement root: a submitted CSV path is resolved
+	// within this directory. Must exist.
+	ImportDir string
+	// ScratchDir is the parent for per-job offset-file directories
+	// (ScratchDir/<jobID>). Created on demand; distinct from ImportDir so job
+	// scratch never mingles with the operator's staged CSVs.
+	ScratchDir string
+	// Logger is optional; nil uses slog.Default().
+	Logger *slog.Logger
+	// Now is the clock; nil uses time.Now. Injected for tests.
+	Now func() time.Time
+	// NewJobID mints a job id; nil uses a UTC-timestamp + random-suffix scheme.
+	// Injected for deterministic tests.
+	NewJobID func() string
+}
+
+// Manager owns the single-import-at-a-time lifecycle. Safe for concurrent use.
+type Manager struct {
+	store      *store.Store
+	runner     Runner
+	importDir  string
+	scratchDir string
+	logger     *slog.Logger
+	now        func() time.Time
+	newJobID   func() string
+
+	mu      sync.Mutex
+	running *Record // the live record while a job runs; nil when idle
+
+	// wg tracks in-flight background run goroutines so Wait can drain them
+	// before the store is closed at shutdown.
+	wg sync.WaitGroup
+}
+
+// Wait blocks until any in-flight background import goroutine returns, or ctx
+// is done. Call it during shutdown (after cancelling the run context) so the
+// job's final store writes complete before the metadata store is closed. A
+// paused (ctx-cancelled) job returns promptly; Wait then observes it drained.
+func (m *Manager) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// New validates cfg and returns a Manager.
+func New(cfg Config) (*Manager, error) {
+	if cfg.Store == nil {
+		return nil, fmt.Errorf("importer: Store is required")
+	}
+	if cfg.Runner == nil {
+		return nil, fmt.Errorf("importer: Runner is required")
+	}
+	if cfg.ImportDir == "" {
+		return nil, fmt.Errorf("importer: ImportDir is required")
+	}
+	if cfg.ScratchDir == "" {
+		return nil, fmt.Errorf("importer: ScratchDir is required")
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
+	newJobID := cfg.NewJobID
+	if newJobID == nil {
+		newJobID = func() string { return defaultJobID(now()) }
+	}
+	return &Manager{
+		store:      cfg.Store,
+		runner:     cfg.Runner,
+		importDir:  cfg.ImportDir,
+		scratchDir: cfg.ScratchDir,
+		logger:     logger.With(slog.String("component", "importer")),
+		now:        now,
+		newJobID:   newJobID,
+	}, nil
+}
+
+// Submit validates + confines requestedPath, refuses a second concurrent job,
+// persists an initial record, and launches the run asynchronously. It returns
+// the new job id (served in a plain 200 response). runCtx roots the background
+// run; cancel it (e.g. on shutdown) to stop the job — a stopped mid-run job is
+// left non-terminal and auto-resumes on the next ResumeIncomplete.
+func (m *Manager) Submit(runCtx context.Context, requestedPath string) (string, error) {
+	csvPath, err := m.resolveImportPath(requestedPath)
+	if err != nil {
+		return "", err
+	}
+	rec, err := m.beginJob(csvPath)
+	if err != nil {
+		return "", err
+	}
+	go func() {
+		defer m.wg.Done()
+		m.run(runCtx, rec, false)
+	}()
+	return rec.ID, nil
+}
+
+// beginJob is Submit's critical section: refuse a second concurrent job,
+// persist the new record + current-job pointer, install the live record, and
+// register the run goroutine with wg. Returns a clone for the caller to hand
+// to run() outside the lock.
+func (m *Manager) beginJob(csvPath string) (Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.running != nil && !m.running.State.Terminal() {
+		return Record{}, ErrJobInProgress
+	}
+
+	// The in-memory pointer is not enough: at startup the HTTP server begins
+	// serving before ResumeIncomplete adopts a persisted non-terminal job, so a
+	// submit landing in that window would overwrite import/current and orphan
+	// the resumable job. The persisted pointer is the cross-restart source of
+	// truth; consult it under the same lock.
+	if currentID, ok, err := m.getCurrent(); err != nil {
+		return Record{}, err
+	} else if ok {
+		current, found, err := m.getRecord(currentID)
+		if err != nil {
+			return Record{}, err
+		}
+		if found && !current.State.Terminal() {
+			return Record{}, ErrJobInProgress
+		}
+	}
+	rec := &Record{
+		ID:          m.newJobID(),
+		CSVPath:     csvPath,
+		State:       StateRunning,
+		Phase:       orchestrator.ImportPhaseParseBucket,
+		SubmittedAt: m.now(),
+	}
+	// Persist the record and the current-job pointer before releasing the lock
+	// so a concurrent Status/restart sees a consistent view. A persistence
+	// failure here means we cannot guarantee resume — fail the submit.
+	if err := m.putRecordLocked(rec); err != nil {
+		return Record{}, err
+	}
+	if err := m.setCurrent(rec.ID); err != nil {
+		return Record{}, err
+	}
+	m.running = rec
+	m.wg.Add(1)
+	return rec.clone(), nil
+}
+
+// ResumeIncomplete relaunches the persisted current job if it is non-terminal
+// (a crash/restart mid-import). It is a no-op when there is no current job or
+// the current job already finished. Call once at startup before serving.
+func (m *Manager) ResumeIncomplete(runCtx context.Context) error {
+	id, ok, err := m.getCurrent()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	rec, ok, err := m.getRecord(id)
+	if err != nil {
+		return err
+	}
+	if !ok || rec.State.Terminal() {
+		return nil
+	}
+
+	live, adopted := m.adoptJob(rec)
+	if !adopted {
+		return nil // already running (defensive; ResumeIncomplete is start-only)
+	}
+
+	m.logger.Info("resuming incomplete import", "job", id, "bucketed", rec.Bucketed)
+	go func() {
+		defer m.wg.Done()
+		m.run(runCtx, live, true)
+	}()
+	return nil
+}
+
+// adoptJob is ResumeIncomplete's critical section: install rec as the live
+// running record (reset to a clean running state) and register the run
+// goroutine with wg. adopted is false when a live job already occupies the
+// slot. Returns a clone for the caller to hand to run() outside the lock.
+func (m *Manager) adoptJob(rec Record) (Record, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.running != nil && !m.running.State.Terminal() {
+		return Record{}, false
+	}
+	rec.State = StateRunning
+	rec.Error = ""
+	m.running = &rec
+	m.wg.Add(1)
+	return rec.clone(), true
+}
+
+// liveClone returns a clone of the live running record when it matches id
+// ("" matches any live record). ok is false when idle or the id differs.
+func (m *Manager) liveClone(id string) (Record, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.running == nil || (id != "" && m.running.ID != id) {
+		return Record{}, false
+	}
+	return m.running.clone(), true
+}
+
+// Status returns the job record for id. Prefers the live in-memory record when
+// id is the running job, else reads pebble. ErrJobNotFound for an unknown id.
+func (m *Manager) Status(id string) (Record, error) {
+	if rec, ok := m.liveClone(id); ok {
+		return rec, nil
+	}
+	rec, ok, err := m.getRecord(id)
+	if err != nil {
+		return Record{}, err
+	}
+	if !ok {
+		return Record{}, ErrJobNotFound
+	}
+	return rec, nil
+}
+
+// Current returns the live record of the running (or most recently submitted)
+// job, if any. Used by the status page to show the active import without a job
+// id. ok is false when no job has been submitted this process lifetime and none
+// is persisted as current.
+func (m *Manager) Current() (Record, bool) {
+	if rec, ok := m.liveClone(""); ok {
+		return rec, true
+	}
+	id, ok, err := m.getCurrent()
+	if err != nil || !ok {
+		return Record{}, false
+	}
+	rec, ok, err := m.getRecord(id)
+	if err != nil || !ok {
+		return Record{}, false
+	}
+	return rec, true
+}
+
+// run executes the job on a background goroutine, threading resume + checkpoint
+// hooks into RunImport and folding the final result / any error into the record.
+func (m *Manager) run(ctx context.Context, rec Record, resume bool) {
+	jobDir := m.jobDir(rec.ID)
+
+	// On a fresh (non-resume) run, or a resume that had not yet finished
+	// bucketing, start from a clean scratch dir so Phase A+B does not O_APPEND
+	// onto partially-written offset files from a prior attempt.
+	skipBucket := resume && rec.Bucketed
+	if !skipBucket {
+		if err := os.RemoveAll(jobDir); err != nil {
+			m.finish(rec.ID, fmt.Errorf("importer: clear scratch dir: %w", err), orchestrator.ImportResult{}, false)
+			return
+		}
+	}
+
+	done, err := m.loadDoneSegments(rec.ID)
+	if err != nil {
+		m.finish(rec.ID, err, orchestrator.ImportResult{}, false)
+		return
+	}
+	// The done-set is the authoritative applied count: the record's persisted
+	// SegmentsApplied can lag it after a hard crash (checkpoint keys land per
+	// segment; the record only persists on phase changes and pauses).
+	m.mu.Lock()
+	if m.running != nil && m.running.ID == rec.ID {
+		m.running.SegmentsApplied = len(done)
+	}
+	m.mu.Unlock()
+
+	job := orchestrator.ImportJob{
+		CSVPath:    rec.CSVPath,
+		JobDir:     jobDir,
+		SkipBucket: skipBucket,
+		SkipSegment: func(idx uint64) bool {
+			_, ok := done[idx]
+			return ok
+		},
+		OnSegmentApplied: func(idx uint64) error {
+			return m.onSegmentApplied(rec.ID, idx)
+		},
+		OnPhase: func(phase orchestrator.ImportPhase, segmentsToApply int) error {
+			return m.onPhase(rec.ID, phase, segmentsToApply)
+		},
+	}
+
+	// parsed: whether this run executed Phase A (so its Parse totals are
+	// authoritative). A SkipBucket resume reports zero parse stats — folding
+	// those over the totals the pausing run persisted would erase them.
+	parsed := !skipBucket
+
+	result, runErr := m.runner.RunImport(ctx, job)
+	if runErr != nil {
+		// A cancellation error is a graceful stop (shutdown), not a job
+		// failure: leave the record non-terminal (StateRunning) and the
+		// current-job pointer set so the next boot auto-resumes from the
+		// checkpoint. Only a genuine error marks the job failed (terminal),
+		// which does NOT auto-resume — re-running a deterministically-failing
+		// job would loop; the operator re-submits. Classify by the RETURNED
+		// error, not ctx.Err(): a real failure racing shutdown cancellation
+		// must not be laundered into a resumable pause. This is the SAME
+		// predicate the orchestrator's import metrics use to decide whether a
+		// run counts as terminal, so the manager's pause/fail decision and the
+		// jobs_total counter can never disagree.
+		if orchestrator.IsCancellationOnly(runErr) {
+			m.pause(rec.ID, result, parsed)
+			return
+		}
+		m.finish(rec.ID, runErr, result, parsed)
+		return
+	}
+	m.finishSuccess(rec.ID, result, parsed)
+}
+
+// foldResult folds one run's counters into rec. Parse totals are overwritten
+// only when the run actually parsed (a SkipBucket resume reports zeros, and
+// the pausing run's persisted totals must survive). Apply counters ACCUMULATE:
+// a resumed run processes only segments its predecessor had not durably
+// checkpointed, so the per-run counts are disjoint and their sum is the job
+// total. A hard crash (no graceful pause) loses the dying run's counters —
+// same as the Prometheus fold — leaving the totals an undercount; the durable
+// done-set still makes the resume itself correct.
+func foldResult(rec *Record, result orchestrator.ImportResult, parsed bool) {
+	if parsed {
+		rec.RowsTotal = result.Parse.RowsTotal
+		rec.RowsValid = result.Parse.RowsValid
+		rec.RowsRejected = result.Parse.RowsRejected
+		rec.RejectsByReason = nil
+		if len(result.Parse.RejectsByReason) > 0 {
+			rec.RejectsByReason = make(map[string]uint64, len(result.Parse.RejectsByReason))
+			for reason, n := range result.Parse.RejectsByReason {
+				rec.RejectsByReason[string(reason)] = n
+			}
+		}
+	}
+	rec.SegmentsExamined += result.SegmentsExamined
+	rec.SegmentsPatched += result.SegmentsPatched
+	rec.RowsMutated += result.RowsMutated
+	rec.RowsMatchedAllVersions += result.RowsMatchedAllVersions
+	rec.RowsMatchedSpecific += result.RowsMatchedSpecific
+	rec.SpecificCIDsUnmatched += result.SpecificCIDsUnmatched
+	rec.RowsCorruptOffset += result.RowsCorruptOffset
+}
+
+// onPhase records phase entry. Entering the apply phase means Phase A+B is
+// complete and the offset files are durable, so we flip Bucketed (the resume
+// key) and persist.
+func (m *Manager) onPhase(id string, phase orchestrator.ImportPhase, segmentsToApply int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running == nil || m.running.ID != id {
+		return nil
+	}
+	m.running.Phase = phase
+	if phase == orchestrator.ImportPhaseApply {
+		m.running.Bucketed = true
+		// segmentsToApply is this RUN's workload (after resume-skips); the
+		// record reports the job total, so add the segments already applied —
+		// at phase entry SegmentsApplied is exactly the done-set size (seeded
+		// in run(), not yet advanced by this run's workers).
+		m.running.SegmentsToApply = segmentsToApply + m.running.SegmentsApplied
+	}
+	return m.putRecordLocked(m.running)
+}
+
+// onSegmentApplied durably marks a segment done and advances the live count. It
+// fires concurrently from Phase C workers; the mutex serializes the record
+// update and the seg-key write. A pebble write failure is returned so RunImport
+// aborts the job (resume safety lost -> stop loudly).
+func (m *Manager) onSegmentApplied(id string, idx uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.checkpointSegmentLocked(id, idx); err != nil {
+		return err
+	}
+	if m.running != nil && m.running.ID == id {
+		m.running.SegmentsApplied++
+	}
+	return nil
+}
+
+// pause handles a graceful stop (ctx cancelled mid-run): it folds the run's
+// partial counters into the record, persists it, and clears the in-memory
+// running pointer — but leaves the record non-terminal and import/current set,
+// so the next process boot auto-resumes from the checkpoint. Persisting the
+// partial progress keeps status truthful across the restart (the Prometheus
+// fold already counted this work; the record must agree).
+func (m *Manager) pause(id string, result orchestrator.ImportResult, parsed bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running != nil && m.running.ID == id {
+		foldResult(m.running, result, parsed)
+		if err := m.putRecordLocked(m.running); err != nil {
+			m.logger.Error("persist paused import record", "job", id, "err", err)
+		}
+		m.running = nil
+	}
+	m.logger.Info("import job paused (context cancelled); will resume on next start", "job", id)
+}
+
+// finish records a terminal failure, folding the run's partial counters into
+// the record (work done before the error stays visible in status).
+// import/current stays pointing at the failed job so Current() serves it as
+// the most-recent job; both Submit and ResumeIncomplete check
+// State.Terminal(), so it neither blocks a re-submit nor auto-resumes (a
+// deterministically-failing job would loop — the operator retries with a
+// fresh submit).
+func (m *Manager) finish(id string, cause error, result orchestrator.ImportResult, parsed bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec := m.running
+	if rec == nil || rec.ID != id {
+		// The running pointer moved on (shouldn't happen: one job at a time).
+		// Persist a standalone failed record so status reflects the failure.
+		stored, ok, err := m.getRecord(id)
+		if err != nil || !ok {
+			m.logger.Error("import job failed but record is missing", "job", id, "err", cause)
+			return
+		}
+		rec = &stored
+	}
+	foldResult(rec, result, parsed)
+	rec.State = StateFailed
+	rec.Error = cause.Error()
+	rec.FinishedAt = m.now()
+	m.logger.Error("import job failed", "job", id, "err", cause)
+	if err := m.putRecordLocked(rec); err != nil {
+		m.logger.Error("persist failed import record", "job", id, "err", err)
+	}
+	m.releaseJobResourcesLocked(id)
+	if m.running != nil && m.running.ID == id {
+		m.running = nil
+	}
+}
+
+// finishSuccess folds the final run's result into the record (accumulating
+// over any counters a paused predecessor persisted), marks it complete, and
+// removes the now-unneeded scratch dir. Like a failed job, a completed one
+// keeps import/current pointing at it: Current() must keep serving the
+// most-recent job's summary (the no-param getImportStatus and the status page
+// depend on it), and both Submit and ResumeIncomplete check State.Terminal()
+// before treating the current job as blocking or resumable.
+func (m *Manager) finishSuccess(id string, result orchestrator.ImportResult, parsed bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec := m.running
+	if rec == nil || rec.ID != id {
+		stored, ok, err := m.getRecord(id)
+		if err != nil || !ok {
+			m.logger.Error("import job completed but record is missing", "job", id)
+			return
+		}
+		rec = &stored
+	}
+	foldResult(rec, result, parsed)
+	rec.State = StateComplete
+	rec.Phase = orchestrator.ImportPhaseApply
+	rec.FinishedAt = m.now()
+	if err := m.putRecordLocked(rec); err != nil {
+		m.logger.Error("persist completed import record", "job", id, "err", err)
+	}
+	m.releaseJobResourcesLocked(id)
+	// Clear only the live pointer; import/current stays so Current() serves
+	// this terminal record from pebble as the most-recent job.
+	if m.running != nil && m.running.ID == id {
+		m.running = nil
+	}
+	m.logger.Info("import job complete",
+		"job", id,
+		"rows_valid", rec.RowsValid,
+		"rows_rejected", rec.RowsRejected,
+		"segments_patched", rec.SegmentsPatched,
+		"rows_mutated", rec.RowsMutated,
+	)
+}
+
+func (m *Manager) jobDir(id string) string { return filepath.Join(m.scratchDir, id) }
+
+// releaseJobResourcesLocked drops a terminal job's scratch dir (offset files)
+// and seg checkpoint keys. A terminal job can never resume — a retry is a
+// fresh submit with a fresh id and job dir — so keeping either would leak them
+// for the daemon's life. Failures are logged, not fatal: the job outcome is
+// already durably recorded, and a leaked dir/key-set costs space, not
+// correctness. Called under m.mu.
+func (m *Manager) releaseJobResourcesLocked(id string) {
+	if err := os.RemoveAll(m.jobDir(id)); err != nil {
+		m.logger.Warn("remove import scratch dir", "job", id, "err", err)
+	}
+	if err := m.dropSegCheckpoints(id); err != nil {
+		m.logger.Warn("drop import seg checkpoints", "job", id, "err", err)
+	}
+}
+
+// resolveImportPath confines requestedPath to the import directory. A relative
+// path is joined to importDir; an absolute path is confined as-is. The path is
+// resolved through EvalSymlinks (so a symlink pointing outside is rejected) and
+// checked to be a regular file within the resolved import root.
+func (m *Manager) resolveImportPath(requestedPath string) (string, error) {
+	requestedPath = strings.TrimSpace(requestedPath)
+	if requestedPath == "" {
+		return "", ErrPathRequired
+	}
+
+	// Resolve the confinement root first; a non-existent import dir is an
+	// operator/config error, surfaced as a generic error (not a 400). The root
+	// is absolutized before symlink resolution: a relative import dir (the
+	// default data dir is relative) would otherwise make filepath.Rel compare
+	// a relative root against absolute submissions and reject them all.
+	aliasRoot, err := filepath.Abs(m.importDir)
+	if err != nil {
+		return "", fmt.Errorf("importer: resolve import dir %q: %w", m.importDir, err)
+	}
+	root, err := filepath.EvalSymlinks(aliasRoot)
+	if err != nil {
+		return "", fmt.Errorf("importer: resolve import dir %q: %w", m.importDir, err)
+	}
+
+	// Relative candidates join to the RESOLVED root, not the alias: when the
+	// configured import dir is itself a symlink the two spellings diverge, and
+	// joining to the unresolved spelling would make every valid relative path
+	// look like an escape against root below.
+	cand := requestedPath
+	if !filepath.IsAbs(cand) {
+		cand = filepath.Join(root, cand)
+	}
+	cand = filepath.Clean(cand)
+
+	// Lexical confinement FIRST, before touching the filesystem: a ".."
+	// traversal that resolves to a non-existent path outside the root must be
+	// reported as an escape, not "not found" (which would leak whether an
+	// out-of-root file exists and mislabel a clear escape attempt). Checking
+	// the cleaned path against the resolved root catches ".." regardless of
+	// existence; the post-EvalSymlinks check below then additionally catches a
+	// symlink whose target escapes. An absolute path spelled through the
+	// symlinked import-dir alias must also pass: it is checked against the
+	// alias spelling here, and the authoritative post-resolution check against
+	// root still gates it.
+	if escapes(root, cand) && escapes(aliasRoot, cand) {
+		return "", fmt.Errorf("%w: %s", ErrPathEscape, requestedPath)
+	}
+
+	resolved, err := filepath.EvalSymlinks(cand)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("%w: %s", ErrPathNotFound, requestedPath)
+		}
+		return "", fmt.Errorf("importer: resolve csv path %q: %w", requestedPath, err)
+	}
+	// Symlink escape: EvalSymlinks has collapsed any link into its real target,
+	// so a link inside the root pointing out is caught here even though the
+	// lexical check above passed.
+	if escapes(root, resolved) {
+		return "", fmt.Errorf("%w: %s", ErrPathEscape, requestedPath)
+	}
+
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("importer: stat csv path %q: %w", requestedPath, err)
+	}
+	// Mode().IsRegular, not !IsDir: a FIFO would pass Submit and then block
+	// RunImport's os.Open in an open(2) that context cancellation cannot
+	// interrupt, wedging the single job slot.
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: %s", ErrNotAFile, requestedPath)
+	}
+	return resolved, nil
+}
+
+// escapes reports whether path lies outside root (path is neither root itself
+// nor strictly under it). Both must be cleaned absolute paths.
+func escapes(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return true
+	}
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// defaultJobID mints a lexicographically-sortable id: a UTC timestamp plus a
+// short random suffix to disambiguate submits within the same second.
+func defaultJobID(now time.Time) string {
+	var b [4]byte
+	// crypto/rand.Read never returns a short read; on the astronomically
+	// unlikely error we fall back to the timestamp alone, still unique enough
+	// under the one-job-at-a-time invariant.
+	if _, err := rand.Read(b[:]); err != nil {
+		return now.UTC().Format("20060102T150405.000Z")
+	}
+	return now.UTC().Format("20060102T150405.000Z") + "-" + hex.EncodeToString(b[:])
+}

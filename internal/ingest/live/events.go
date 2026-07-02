@@ -5,7 +5,7 @@
 // branch returns an error rather than panicking on malformed bytes.
 //
 // All segment.Events derived from a single upstream event share the
-// same indexedAt timestamp. Per-record timestamps would imply false
+// same witnessedAt timestamp. Per-record timestamps would imply false
 // ordering (DESIGN.md §3.4 requires per-DID ingest order is preserved).
 //
 // Seq is left zero on the returned events — ingest.Writer.Append
@@ -30,18 +30,18 @@ import (
 // in the slice are still archivable); callers should fall through
 // rather than discard the result. See the consumer's processBatch
 // for the canonical handling.
-func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
+func ConvertEvent(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
 	switch {
 	case evt.Resync != streaming.ResyncNone && evt.Sync == nil:
 		return nil, fmt.Errorf("livestream: resync event missing sync envelope: %w", ErrUnknownEventKind)
 	case evt.Commit != nil:
-		return convertCommit(evt, indexedAt)
+		return convertCommit(evt, witnessedAt)
 	case evt.Identity != nil:
-		return convertIdentity(evt, indexedAt)
+		return convertIdentity(evt, witnessedAt)
 	case evt.Account != nil:
-		return convertAccount(evt, indexedAt)
+		return convertAccount(evt, witnessedAt)
 	case evt.Sync != nil:
-		return convertSync(evt, indexedAt)
+		return convertSync(evt, witnessedAt)
 	case evt.Info != nil:
 		// #info is informational: archival no-op, but the seq is
 		// still ours to record so we let the caller advance the
@@ -60,7 +60,7 @@ func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error)
 		//      Operations() yields nothing in that case, so we fall
 		//      through to ErrUnknownEventKind and the consumer refuses
 		//      to advance its cursor past this seq.
-		return convertVerifiedOps(evt, indexedAt)
+		return convertVerifiedOps(evt, witnessedAt)
 	}
 }
 
@@ -68,7 +68,7 @@ func ConvertEvent(evt streaming.Event, indexedAt int64) ([]segment.Event, error)
 // into a segment.Event. Used for the verifier-resync emission path
 // where the upstream wire envelope is absent and the only signal is
 // the iterator yielding ops.
-func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
+func convertVerifiedOps(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
 	var out []segment.Event
 	var dropped []DroppedOp
 	for op, err := range evt.Operations() {
@@ -82,7 +82,7 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, 
 		}
 
 		segEv := segment.Event{
-			IndexedAt:           indexedAt,
+			WitnessedAt:         witnessedAt,
 			UpstreamRelayCursor: evt.Seq,
 			Kind:                kind,
 			DID:                 string(op.Repo),
@@ -131,7 +131,7 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event, 
 	return out, nil
 }
 
-func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
+func convertCommit(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
 	commit := evt.Commit
 	ops := make([]segment.Event, 0, len(commit.Ops))
 	var dropped []DroppedOp
@@ -147,7 +147,7 @@ func convertCommit(evt streaming.Event, indexedAt int64) ([]segment.Event, error
 		}
 
 		segEv := segment.Event{
-			IndexedAt:           indexedAt,
+			WitnessedAt:         witnessedAt,
 			UpstreamRelayCursor: evt.Seq,
 			Kind:                kind,
 			DID:                 commit.Repo,
@@ -211,13 +211,13 @@ func actionKind(a streaming.Action) (segment.Kind, error) {
 	}
 }
 
-func convertIdentity(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
+func convertIdentity(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
 	payload, err := evt.Identity.MarshalCBOR()
 	if err != nil {
 		return nil, fmt.Errorf("livestream: marshal identity: %w", err)
 	}
 	return []segment.Event{{
-		IndexedAt:           indexedAt,
+		WitnessedAt:         witnessedAt,
 		UpstreamRelayCursor: evt.Seq,
 		Kind:                segment.KindIdentity,
 		DID:                 evt.Identity.DID,
@@ -225,13 +225,13 @@ func convertIdentity(evt streaming.Event, indexedAt int64) ([]segment.Event, err
 	}}, nil
 }
 
-func convertAccount(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
+func convertAccount(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
 	payload, err := evt.Account.MarshalCBOR()
 	if err != nil {
 		return nil, fmt.Errorf("livestream: marshal account: %w", err)
 	}
 	return []segment.Event{{
-		IndexedAt:           indexedAt,
+		WitnessedAt:         witnessedAt,
 		UpstreamRelayCursor: evt.Seq,
 		Kind:                segment.KindAccount,
 		DID:                 evt.Account.DID,
@@ -239,13 +239,13 @@ func convertAccount(evt streaming.Event, indexedAt int64) ([]segment.Event, erro
 	}}, nil
 }
 
-func convertSync(evt streaming.Event, indexedAt int64) ([]segment.Event, error) {
+func convertSync(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
 	payload, err := evt.Sync.MarshalCBOR()
 	if err != nil {
 		return nil, fmt.Errorf("livestream: marshal sync: %w", err)
 	}
 	out := []segment.Event{{
-		IndexedAt:           indexedAt,
+		WitnessedAt:         witnessedAt,
 		UpstreamRelayCursor: evt.Seq,
 		Kind:                segment.KindSync,
 		DID:                 evt.Sync.DID,
@@ -270,7 +270,7 @@ func convertSync(evt streaming.Event, indexedAt int64) ([]segment.Event, error) 
 			return nil, fmt.Errorf("livestream: did=%s: %w", op.Repo, err)
 		}
 		segEv := segment.Event{
-			IndexedAt:           indexedAt,
+			WitnessedAt:         witnessedAt,
 			UpstreamRelayCursor: evt.Seq,
 			Kind:                kind,
 			DID:                 string(op.Repo),

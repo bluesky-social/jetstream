@@ -31,13 +31,13 @@ func FuzzEncode(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, kind uint8, did, collection, rkey, rev string, payload []byte) {
 		evt := &segment.Event{
-			Kind:       segment.Kind(kind),
-			DID:        did,
-			Collection: collection,
-			Rkey:       rkey,
-			Rev:        rev,
-			Payload:    payload,
-			IndexedAt:  1,
+			Kind:        segment.Kind(kind),
+			DID:         did,
+			Collection:  collection,
+			Rkey:        rkey,
+			Rev:         rev,
+			Payload:     payload,
+			WitnessedAt: 1,
 		}
 
 		out, err := Encode(evt)
@@ -80,13 +80,13 @@ func FuzzEncodeV2(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, kind uint8, did, collection, rkey, rev string, payload []byte) {
 		evt := &segment.Event{
-			Kind:       segment.Kind(kind),
-			DID:        did,
-			Collection: collection,
-			Rkey:       rkey,
-			Rev:        rev,
-			Payload:    payload,
-			IndexedAt:  1,
+			Kind:        segment.Kind(kind),
+			DID:         did,
+			Collection:  collection,
+			Rkey:        rkey,
+			Rev:         rev,
+			Payload:     payload,
+			WitnessedAt: 1,
 		}
 
 		out, err := EncodeV2(evt)

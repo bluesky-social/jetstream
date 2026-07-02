@@ -56,7 +56,7 @@ func (k Kind) IsResyncReplacement() bool {
 //	Rev:        up to 255   bytes (uint8  column)
 //	Payload:    up to math.MaxUint32 bytes
 //
-// IndexedAt and RenderedAt are unix microseconds. RenderedAt == 0
+// WitnessedAt and IndexedAt are unix microseconds. IndexedAt == 0
 // means "no operator-supplied timestamp" (DESIGN.md §3.2).
 //
 // For non-commit kinds (Identity, Account, Sync), Collection, Rkey,
@@ -64,9 +64,9 @@ func (k Kind) IsResyncReplacement() bool {
 // any combination; emptiness is not enforced as a per-Kind invariant
 // at this layer.
 type Event struct {
-	Seq        uint64
-	IndexedAt  int64
-	RenderedAt int64
+	Seq         uint64
+	WitnessedAt int64
+	IndexedAt   int64
 	// UpstreamRelayCursor is the relay subscribeRepos cursor that produced
 	// this event. It is carried in memory for internal consumers (sync-state
 	// hosting promotion, the simulator oracle); it is not on any subscriber
@@ -85,4 +85,20 @@ type Event struct {
 	// other event sharing that block. Callers that need to modify
 	// must clone via append([]byte(nil), p...) first.
 	Payload []byte
+}
+
+// DisplayTimeUS resolves the timestamp shown to subscribers on the wire
+// (the event's time_us). It applies the sentinel-0 fallback from
+// DESIGN.md §3.2: when an operator has imported an indexed_at value
+// (IndexedAt != 0) that display value wins; otherwise it falls back to
+// WitnessedAt, the immutable time Jetstream first saw the event.
+//
+// Absent any timestamp import every IndexedAt column is 0, so this
+// returns WitnessedAt for every event — display == witnessed, matching
+// pre-import behavior exactly.
+func (e *Event) DisplayTimeUS() int64 {
+	if e.IndexedAt != 0 {
+		return e.IndexedAt
+	}
+	return e.WitnessedAt
 }

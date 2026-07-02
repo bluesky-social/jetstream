@@ -21,12 +21,12 @@ func TestQuickStats_Sealed(t *testing.T) {
 	require.NoError(t, err)
 	for i := range 4 {
 		full, err := w.Append(segment.Event{
-			Seq:        uint64(i + 1),
-			Kind:       segment.KindCreate,
-			DID:        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
-			IndexedAt:  1700000000_000_000,
-			Collection: "app.bsky.feed.post",
-			Payload:    []byte("hello"),
+			Seq:         uint64(i + 1),
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+			WitnessedAt: 1700000000_000_000,
+			Collection:  "app.bsky.feed.post",
+			Payload:     []byte("hello"),
 		})
 		require.NoError(t, err)
 		if full {
@@ -58,12 +58,12 @@ func TestQuickStats_Active(t *testing.T) {
 	require.NoError(t, err)
 	for i := range 2 {
 		_, err := w.Append(segment.Event{
-			Seq:        uint64(i + 1),
-			Kind:       segment.KindCreate,
-			DID:        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
-			IndexedAt:  1700000000_000_000,
-			Collection: "app.bsky.feed.post",
-			Payload:    []byte("hi"),
+			Seq:         uint64(i + 1),
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+			WitnessedAt: 1700000000_000_000,
+			Collection:  "app.bsky.feed.post",
+			Payload:     []byte("hi"),
 		})
 		require.NoError(t, err)
 	}

@@ -297,7 +297,7 @@ document.addEventListener("input", function (event) {
       <dt>Collections</dt><dd>{{.Network.Collections}} distinct NSIDs</dd>
       {{if gt .Network.Events 0}}
       <dt>Seq range</dt><dd>[{{humanInt .Network.MinSeq}}, {{humanInt .Network.MaxSeq}}]</dd>
-      {{if not .Network.MinIndexedAt.IsZero}}<dt>Indexed range</dt><dd>{{.Network.MinIndexedAt.Format "2006-01-02 15:04:05"}} ... {{.Network.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>{{end}}
+      {{if not .Network.MinWitnessedAt.IsZero}}<dt>Witnessed range</dt><dd>{{.Network.MinWitnessedAt.Format "2006-01-02 15:04:05"}} ... {{.Network.MaxWitnessedAt.Format "2006-01-02 15:04:05"}}</dd>{{end}}
       {{end}}
     </dl>
     {{end}}
@@ -312,6 +312,38 @@ document.addEventListener("input", function (event) {
       <dd>{{if .CursorLookback.OldestRetainedAt.IsZero}}<em>n/a</em>{{else}}{{humanInt64Cast .CursorLookback.OldestRetainedSeq}} <small>({{relativeTime .CursorLookback.OldestRetainedAt .Now}})</small>{{end}}</dd>
     </dl>
   </section>
+
+  {{with .Import}}
+  <section>
+    <h2>Timestamp import</h2>
+    <dl>
+      <dt>Job</dt><dd><code>{{.JobID}}</code></dd>
+      <dt>State</dt><dd><code>{{.State}}</code>{{if .Phase}} <small>(phase: {{.Phase}})</small>{{end}}</dd>
+      {{if .Error}}<dt>Error</dt><dd class="error-text">{{.Error}}</dd>{{end}}
+      <dt>Submitted</dt><dd>{{relativeTime .SubmittedAt $.Now}}</dd>
+      {{if not .FinishedAt.IsZero}}<dt>Finished</dt><dd>{{relativeTime .FinishedAt $.Now}}</dd>{{end}}
+      {{if .Bucketed}}
+      <dt>Segments applied</dt><dd>{{humanInt64Cast .SegmentsApplied}} / {{humanInt64Cast .SegmentsToApply}}</dd>
+      {{else}}
+      <dt>Phase</dt><dd>parsing + bucketing (not yet applying)</dd>
+      {{end}}
+      {{if .State}}
+        {{if or (gt .RowsValid 0) (gt .RowsRejected 0)}}
+        <dt>Rows</dt><dd>{{humanInt .RowsValid}} valid, {{humanInt .RowsRejected}} rejected</dd>
+        {{end}}
+        {{/* Gate on examined, not patched: a completed idempotent re-import
+             examines segments and mutates zero rows, and "0 patched of N
+             examined" IS the result the operator ran it to see. */}}
+        {{if gt .SegmentsExamined 0}}
+        <dt>Segments patched</dt><dd>{{humanInt64Cast .SegmentsPatched}} of {{humanInt64Cast .SegmentsExamined}} examined</dd>
+        <dt>Rows mutated</dt><dd>{{humanInt .RowsMutated}}</dd>
+        {{end}}
+        {{if gt .SpecificCIDsUnmatched 0}}<dt>Unmatched specific CIDs</dt><dd>{{humanInt .SpecificCIDsUnmatched}}</dd>{{end}}
+        {{if gt .RowsCorruptOffset 0}}<dt>Corrupt offsets</dt><dd>{{humanInt .RowsCorruptOffset}}</dd>{{end}}
+      {{end}}
+    </dl>
+  </section>
+  {{end}}
 {{end}}
 
 {{define "segmentFiles"}}
@@ -325,7 +357,7 @@ document.addEventListener("input", function (event) {
       <dt>Collections</dt><dd>{{.Network.Collections}} distinct NSIDs</dd>
       {{if gt .Network.Events 0}}
       <dt>Seq range</dt><dd>[{{humanInt .Network.MinSeq}}, {{humanInt .Network.MaxSeq}}]</dd>
-      {{if not .Network.MinIndexedAt.IsZero}}<dt>Indexed range</dt><dd>{{.Network.MinIndexedAt.Format "2006-01-02 15:04:05"}} ... {{.Network.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>{{end}}
+      {{if not .Network.MinWitnessedAt.IsZero}}<dt>Witnessed range</dt><dd>{{.Network.MinWitnessedAt.Format "2006-01-02 15:04:05"}} ... {{.Network.MaxWitnessedAt.Format "2006-01-02 15:04:05"}}</dd>{{end}}
       {{end}}
       <dt>Compressed</dt><dd>{{humanBytes .Network.CompressedBytes}}</dd>
       <dt>Uncompressed</dt><dd>{{humanBytes .Network.UncompressedBytes}}</dd>
@@ -547,7 +579,7 @@ document.addEventListener("input", function (event) {
       <dt>Blocks</dt><dd>{{humanInt64Cast .BlockCount}}</dd>
       <dt>Collections</dt><dd>{{.CollectionCount}}</dd>
       <dt>Seq range</dt><dd>[{{humanInt .MinSeq}}, {{humanInt .MaxSeq}}]</dd>
-      {{if not .MinIndexedAt.IsZero}}<dt>Indexed range</dt><dd>{{.MinIndexedAt.Format "2006-01-02 15:04:05"}}<br>... {{.MaxIndexedAt.Format "2006-01-02 15:04:05"}}</dd>{{end}}
+      {{if not .MinWitnessedAt.IsZero}}<dt>Witnessed range</dt><dd>{{.MinWitnessedAt.Format "2006-01-02 15:04:05"}}<br>... {{.MaxWitnessedAt.Format "2006-01-02 15:04:05"}}</dd>{{end}}
       <dt>Size</dt><dd>{{humanBytes .SizeBytes}}</dd>
     </dl>
   </div>

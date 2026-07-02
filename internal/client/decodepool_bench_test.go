@@ -33,14 +33,14 @@ func buildLikeBlockFrame(tb testing.TB, n int) []byte {
 	require.NoError(tb, err)
 	for i := range n {
 		_, err := w.Append(segment.Event{
-			Seq:        uint64(i + 1),
-			IndexedAt:  int64(1_730_000_000_000_000 + i),
-			Kind:       segment.KindCreate,
-			DID:        "did:plc:atu3zhe7rhhq5ujaqe7yjpnn",
-			Collection: "app.bsky.feed.like",
-			Rkey:       "3lbfb65ejz" + strconv.Itoa(i%10) + "2c",
-			Rev:        "3mfvujdqdjt2t",
-			Payload:    payload,
+			Seq:         uint64(i + 1),
+			WitnessedAt: int64(1_730_000_000_000_000 + i),
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:atu3zhe7rhhq5ujaqe7yjpnn",
+			Collection:  "app.bsky.feed.like",
+			Rkey:        "3lbfb65ejz" + strconv.Itoa(i%10) + "2c",
+			Rev:         "3mfvujdqdjt2t",
+			Payload:     payload,
 		})
 		require.NoError(tb, err)
 	}

@@ -11,14 +11,14 @@ func benchEvents(n int) []Event {
 	out := make([]Event, n)
 	for i := range out {
 		out[i] = Event{
-			Seq:        uint64(i + 1),
-			IndexedAt:  int64(i),
-			Kind:       KindCreate,
-			DID:        "did:plc:" + string(rune('a'+(i%26))),
-			Collection: "app.bsky.feed.post",
-			Rkey:       "k",
-			Rev:        "rev",
-			Payload:    make([]byte, 512),
+			Seq:         uint64(i + 1),
+			WitnessedAt: int64(i),
+			Kind:        KindCreate,
+			DID:         "did:plc:" + string(rune('a'+(i%26))),
+			Collection:  "app.bsky.feed.post",
+			Rkey:        "k",
+			Rev:         "rev",
+			Payload:     make([]byte, 512),
 		}
 	}
 	return out

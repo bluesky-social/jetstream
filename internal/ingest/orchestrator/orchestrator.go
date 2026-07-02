@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
@@ -25,6 +26,20 @@ type Orchestrator struct {
 	logger *slog.Logger
 
 	compactionTrigger chan struct{}
+
+	// rewriteMu serializes every in-place segment rewrite (delete-compaction
+	// AND timestamp import) so two rewrites can never race on the
+	// tmp+fsync+rename of the same segment file — the loser of that race would
+	// silently drop the winner's changes (design §3.3, §6 H).
+	//
+	// Until timestamp import existed, mutual exclusion was implicit: only the
+	// single runSteadyCompactor goroutine ever called a rewrite pass. Import
+	// (M6) is dispatched from a separate request-handler goroutine, so that
+	// implicit guarantee no longer holds and the exclusion must be explicit.
+	// Both passes acquire this through withRewriteLock; an import and a
+	// delete-compaction pass are therefore mutually exclusive, and the loser
+	// waits (design §6 H).
+	rewriteMu sync.Mutex
 }
 
 // New validates cfg and returns an Orchestrator ready to Run.
@@ -62,8 +77,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 		// A crash mid-rewrite can leave a segment-sized *.jss.tmp
 		// behind; reclaim it at boot even when compaction is disabled
-		// (each pass also cleans at start).
-		if err := removeStaleCompactionTemps(filepath.Join(o.cfg.DataDir, "segments")); err != nil {
+		// (each pass also cleans at start). Under the rewrite lock so a
+		// live rewrite's tmp is never unlinked, should an import be
+		// dispatched this early.
+		if err := o.withRewriteLock(func() error {
+			return removeStaleCompactionTemps(filepath.Join(o.cfg.DataDir, "segments"))
+		}); err != nil {
 			return err
 		}
 
@@ -126,6 +145,17 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			return fmt.Errorf("orchestrator: unrecognized phase %q", phase)
 		}
 	})
+}
+
+// withRewriteLock runs fn while holding the segment-rewrite mutex, so
+// delete-compaction and timestamp-import passes are mutually exclusive on the
+// tmp+fsync+rename of any segment file (design §3.3, §6 H). fn should be the
+// segment-mutating body of a pass; read-only preamble (sweeping the dir,
+// reconciling checksums) can run outside the lock.
+func (o *Orchestrator) withRewriteLock(fn func() error) error {
+	o.rewriteMu.Lock()
+	defer o.rewriteMu.Unlock()
+	return fn()
 }
 
 func (o *Orchestrator) simulateCrash(ctx context.Context, point crashpoint.Point) error {

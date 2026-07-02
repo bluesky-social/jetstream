@@ -55,8 +55,8 @@ func TestCompaction_StoreFaultOnWatermarkSave_FailsLoudNoAdvance(t *testing.T) {
 	// (dropping the create) and then advances the watermark to seq 2 — the Set
 	// our fault aborts.
 	path := writeCompactionSegment(t, segmentsDir, 0, []segment.Event{
-		{Seq: 1, IndexedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
-		{Seq: 2, IndexedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
+		{Seq: 1, WitnessedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
+		{Seq: 2, WitnessedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
 	})
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

@@ -41,7 +41,7 @@ import (
 // control the three Part-B variables the scenarios need:
 //
 //   - MaxEntries (the planner per-page cap) → multi-page / mid-segment cuts;
-//   - the lookback floor (via segment IndexedAt vs the configured Lookback) →
+//   - the lookback floor (via segment WitnessedAt vs the configured Lookback) →
 //     the §14 too-old 400 / stale-cursor / fell-off-live cases;
 //   - sealing new segments + appending live events mid-flight (SealMore /
 //     AppendLive) → mid-download seal and exhaust-sealed cold-replay backstop.
@@ -98,7 +98,7 @@ type pagedCutoverConfig struct {
 }
 
 // recentMicros returns a timestamp `ago` before now, in microseconds — the unit
-// segment IndexedAt and the lookback floor compare in.
+// segment WitnessedAt and the lookback floor compare in.
 func recentMicros(ago time.Duration) int64 {
 	return time.Now().UnixMicro() - ago.Microseconds()
 }
@@ -313,14 +313,14 @@ func encodeUint64LEOracle(v uint64) []byte {
 // timestamp order, which the manifest's lookback-floor search relies on.
 func makeOracleCreate(seq uint64, did, collection, rkey string) segment.Event {
 	return segment.Event{
-		Seq:        seq,
-		IndexedAt:  recentMicros(time.Hour) + int64(seq), // recent, monotonic in seq
-		Kind:       segment.KindCreate,
-		DID:        did,
-		Collection: collection,
-		Rkey:       rkey,
-		Rev:        "rev" + rkey,
-		Payload:    []byte{0xa0}, // empty DAG-CBOR map; decodes cleanly in map mode
+		Seq:         seq,
+		WitnessedAt: recentMicros(time.Hour) + int64(seq), // recent, monotonic in seq
+		Kind:        segment.KindCreate,
+		DID:         did,
+		Collection:  collection,
+		Rkey:        rkey,
+		Rev:         "rev" + rkey,
+		Payload:     []byte{0xa0}, // empty DAG-CBOR map; decodes cleanly in map mode
 	}
 }
 
@@ -328,6 +328,6 @@ func makeOracleCreate(seq uint64, did, collection, rkey string) segment.Event {
 // before now, so a test can place a segment below a short lookback floor.
 func makeOracleCreateAged(seq uint64, did, collection, rkey string, age time.Duration) segment.Event {
 	ev := makeOracleCreate(seq, did, collection, rkey)
-	ev.IndexedAt = recentMicros(age) + int64(seq)
+	ev.WitnessedAt = recentMicros(age) + int64(seq)
 	return ev
 }

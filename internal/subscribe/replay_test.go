@@ -21,7 +21,7 @@ func TestWalkFromCursor_SingleSealedSegment(t *testing.T) {
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	m := mustOpenManifest(t, segDir)
 
@@ -46,7 +46,7 @@ func TestWalkFromCursor_SealedThenActive(t *testing.T) {
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	m := mustOpenManifest(t, segDir)
 
@@ -56,7 +56,7 @@ func TestWalkFromCursor_SealedThenActive(t *testing.T) {
 	// 5 events appended into the active segment's pending block.
 	for i := 10; i < 15; i++ {
 		require.NoError(t, w.Append(context.Background(), &segment.Event{
-			IndexedAt: int64(i * 1000), Kind: segment.KindCreate,
+			WitnessedAt: int64(i * 1000), Kind: segment.KindCreate,
 			DID: "did:plc:active", Payload: []byte{0xa0},
 		}))
 	}
@@ -79,7 +79,7 @@ func TestWalkFromCursor_HaltsOnCallbackError(t *testing.T) {
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 10)
@@ -142,10 +142,10 @@ func TestWalkFromCursor_CompactedTrailingGapTerminates(t *testing.T) {
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000001.jss"), sealedFixture{
-		minSeq: 10, maxSeq: 19, minIndexedAt: 10_000, maxIndexedAt: 19_999, eventCount: 10,
+		minSeq: 10, maxSeq: 19, minWitnessedAt: 10_000, maxWitnessedAt: 19_999, eventCount: 10,
 	})
 
 	// Compact away seg0's trailing rows (8 and 9). The envelope
@@ -191,10 +191,10 @@ func TestWalkFromCursor_FullyEmptiedSegmentTerminates(t *testing.T) {
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
-		minSeq: 0, maxSeq: 9, minIndexedAt: 1_000, maxIndexedAt: 9_999, eventCount: 10,
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000001.jss"), sealedFixture{
-		minSeq: 10, maxSeq: 19, minIndexedAt: 10_000, maxIndexedAt: 19_999, eventCount: 10,
+		minSeq: 10, maxSeq: 19, minWitnessedAt: 10_000, maxWitnessedAt: 19_999, eventCount: 10,
 	})
 	res, err := segment.Rewrite(filepath.Join(segDir, "seg_0000000000.jss"),
 		func(*segment.Event) segment.RowDecision { return segment.RowDrop }, segment.RewriteOptions{})

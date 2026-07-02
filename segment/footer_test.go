@@ -20,8 +20,8 @@ func TestEncodeBlockIndexRoundtrip(t *testing.T) {
 			EventCount:       16,
 			MinSeq:           1,
 			MaxSeq:           16,
-			MinIndexedAt:     100,
-			MaxIndexedAt:     1600,
+			MinWitnessedAt:   100,
+			MaxWitnessedAt:   1600,
 		},
 		{
 			Offset:           ReservedHeaderBytes + 1024 + 8,
@@ -30,8 +30,8 @@ func TestEncodeBlockIndexRoundtrip(t *testing.T) {
 			EventCount:       32,
 			MinSeq:           17,
 			MaxSeq:           48,
-			MinIndexedAt:     1601,
-			MaxIndexedAt:     4800,
+			MinWitnessedAt:   1601,
+			MaxWitnessedAt:   4800,
 		},
 	}
 
@@ -56,8 +56,8 @@ func TestEncodeBlockIndexEntryFieldOffsets(t *testing.T) {
 		EventCount:       0x31323334,
 		MinSeq:           0x4142434445464748,
 		MaxSeq:           0x5152535455565758,
-		MinIndexedAt:     0x6162636465666768,
-		MaxIndexedAt:     0x7172737475767778,
+		MinWitnessedAt:   0x6162636465666768,
+		MaxWitnessedAt:   0x7172737475767778,
 	}
 	buf := encodeBlockIndex([]BlockInfo{info})
 	require.Len(t, buf, blockIndexEntrySize)
@@ -112,8 +112,8 @@ func TestEncodeBlockIndexProperty(t *testing.T) {
 				EventCount:       r.Uint32(),
 				MinSeq:           r.Uint64(),
 				MaxSeq:           r.Uint64(),
-				MinIndexedAt:     int64(r.Uint64()),
-				MaxIndexedAt:     int64(r.Uint64()),
+				MinWitnessedAt:   int64(r.Uint64()),
+				MaxWitnessedAt:   int64(r.Uint64()),
 			}
 		}
 		buf := encodeBlockIndex(infos)

@@ -105,7 +105,7 @@ func (r *mergeRunner) simulateCrash(ctx context.Context, point crashpoint.Point)
 
 // processSourceSegment opens one source seg, iterates its blocks,
 // applies the keep/drop predicate, appends survivors with re-stamped
-// IndexedAt, returns the per-DID last-seen rev map. dst.Flush is
+// WitnessedAt, returns the per-DID last-seen rev map. dst.Flush is
 // called before returning so the cursor commit that follows is
 // ordered after a fsync (§5.2).
 func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.SegmentFile) (map[string]string, error) {
@@ -137,7 +137,7 @@ func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.Segmen
 					r.metrics.incMergeEventsDropped()
 					continue
 				}
-				ev.IndexedAt = r.now().UnixMicro() // §3.4 re-stamp
+				ev.WitnessedAt = r.now().UnixMicro() // §3.4 re-stamp
 				if err := r.dst.Append(ctx, ev); err != nil {
 					return nil, fmt.Errorf("orchestrator: merge: append: %w", err)
 				}

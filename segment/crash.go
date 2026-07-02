@@ -33,3 +33,27 @@ const (
 	// replacement is durable; callers must still tolerate an error here.
 	CrashPointRewriteDirSynced = "after-segment-rewrite-dir-synced"
 )
+
+// Segment-patch crash seams. Patch (mutate-mode rewrite of the indexed_at
+// display column) uses the same tmp+fsync+rename+dir-sync durability
+// sequence as Rewrite, so its recovery semantics are identical: a crash at
+// or before TempSynced leaves the original file intact; a crash at Renamed
+// or later means the patched file is already the durable one. Distinct point
+// strings keep patch-vs-rewrite injection unambiguous in tests and traces.
+const (
+	// CrashPointPatchTempWritten fires after the patch has written all bytes
+	// to the temporary replacement file but before fsyncing it.
+	CrashPointPatchTempWritten = "after-segment-patch-temp-written"
+
+	// CrashPointPatchTempSynced fires after the temporary replacement file is
+	// fsynced but before renaming it over the original.
+	CrashPointPatchTempSynced = "after-segment-patch-temp-synced"
+
+	// CrashPointPatchRenamed fires after the replacement file is renamed over
+	// the original but before fsyncing the parent dir.
+	CrashPointPatchRenamed = "after-segment-patch-renamed"
+
+	// CrashPointPatchDirSynced fires after the parent dir is fsynced. The
+	// replacement is durable; callers must still tolerate an error here.
+	CrashPointPatchDirSynced = "after-segment-patch-dir-synced"
+)

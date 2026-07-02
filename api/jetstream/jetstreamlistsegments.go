@@ -336,16 +336,16 @@ func JetstreamListSegments(ctx context.Context, c *xrpc.Client, cursor string, l
 
 // JetstreamListSegments_Segment is a "segment" in the network.bsky.jetstream.listSegments schema.
 type JetstreamListSegments_Segment struct {
-	LexiconTypeID string `json:"$type,omitempty"`
-	Checksum      string `json:"checksum"`     // Segment-format xxh3 metadata checksum as 16-char hex; equals the getSegment ETag.
-	EventCount    int64  `json:"eventCount"`   // Number of events in the segment.
-	Index         int64  `json:"index"`        // Zero-based segment index.
-	MaxIndexedAt  int64  `json:"maxIndexedAt"` // Latest indexed-at, unix microseconds.
-	MaxSeq        int64  `json:"maxSeq"`
-	MinIndexedAt  int64  `json:"minIndexedAt"` // Earliest indexed-at, unix microseconds.
-	MinSeq        int64  `json:"minSeq"`
-	Name          string `json:"name"`      // Segment filename; pass to getSegment.
-	SizeBytes     int64  `json:"sizeBytes"` // File size in bytes.
+	LexiconTypeID  string `json:"$type,omitempty"`
+	Checksum       string `json:"checksum"`   // Segment-format xxh3 metadata checksum as 16-char hex; equals the getSegment ETag.
+	EventCount     int64  `json:"eventCount"` // Number of events in the segment.
+	Index          int64  `json:"index"`      // Zero-based segment index.
+	MaxSeq         int64  `json:"maxSeq"`
+	MaxWitnessedAt int64  `json:"maxWitnessedAt"` // Latest witnessed-at, unix microseconds.
+	MinSeq         int64  `json:"minSeq"`
+	MinWitnessedAt int64  `json:"minWitnessedAt"` // Earliest witnessed-at, unix microseconds.
+	Name           string `json:"name"`           // Segment filename; pass to getSegment.
+	SizeBytes      int64  `json:"sizeBytes"`      // File size in bytes.
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -353,16 +353,16 @@ type JetstreamListSegments_Segment struct {
 
 // Precomputed CBOR key tokens for JetstreamListSegments_Segment.
 var (
-	cborKey_JetstreamListSegments_Segment_name         = cbor.AppendTextKey(nil, "name")
-	cborKey_JetstreamListSegments_Segment_dollar_type  = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamListSegments_Segment_index        = cbor.AppendTextKey(nil, "index")
-	cborKey_JetstreamListSegments_Segment_maxSeq       = cbor.AppendTextKey(nil, "maxSeq")
-	cborKey_JetstreamListSegments_Segment_minSeq       = cbor.AppendTextKey(nil, "minSeq")
-	cborKey_JetstreamListSegments_Segment_checksum     = cbor.AppendTextKey(nil, "checksum")
-	cborKey_JetstreamListSegments_Segment_sizeBytes    = cbor.AppendTextKey(nil, "sizeBytes")
-	cborKey_JetstreamListSegments_Segment_eventCount   = cbor.AppendTextKey(nil, "eventCount")
-	cborKey_JetstreamListSegments_Segment_maxIndexedAt = cbor.AppendTextKey(nil, "maxIndexedAt")
-	cborKey_JetstreamListSegments_Segment_minIndexedAt = cbor.AppendTextKey(nil, "minIndexedAt")
+	cborKey_JetstreamListSegments_Segment_name           = cbor.AppendTextKey(nil, "name")
+	cborKey_JetstreamListSegments_Segment_dollar_type    = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamListSegments_Segment_index          = cbor.AppendTextKey(nil, "index")
+	cborKey_JetstreamListSegments_Segment_maxSeq         = cbor.AppendTextKey(nil, "maxSeq")
+	cborKey_JetstreamListSegments_Segment_minSeq         = cbor.AppendTextKey(nil, "minSeq")
+	cborKey_JetstreamListSegments_Segment_checksum       = cbor.AppendTextKey(nil, "checksum")
+	cborKey_JetstreamListSegments_Segment_sizeBytes      = cbor.AppendTextKey(nil, "sizeBytes")
+	cborKey_JetstreamListSegments_Segment_eventCount     = cbor.AppendTextKey(nil, "eventCount")
+	cborKey_JetstreamListSegments_Segment_maxWitnessedAt = cbor.AppendTextKey(nil, "maxWitnessedAt")
+	cborKey_JetstreamListSegments_Segment_minWitnessedAt = cbor.AppendTextKey(nil, "minWitnessedAt")
 )
 
 func (s *JetstreamListSegments_Segment) MarshalCBOR() ([]byte, error) {
@@ -403,12 +403,12 @@ func (s *JetstreamListSegments_Segment) AppendCBOR(buf []byte) ([]byte, error) {
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "eventCount", buf)
 		buf = append(buf, cborKey_JetstreamListSegments_Segment_eventCount...)
 		buf = cbor.AppendInt(buf, s.EventCount)
-		ei, buf = appendCBORExtrasBefore(s.extra, ei, "maxIndexedAt", buf)
-		buf = append(buf, cborKey_JetstreamListSegments_Segment_maxIndexedAt...)
-		buf = cbor.AppendInt(buf, s.MaxIndexedAt)
-		ei, buf = appendCBORExtrasBefore(s.extra, ei, "minIndexedAt", buf)
-		buf = append(buf, cborKey_JetstreamListSegments_Segment_minIndexedAt...)
-		buf = cbor.AppendInt(buf, s.MinIndexedAt)
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "maxWitnessedAt", buf)
+		buf = append(buf, cborKey_JetstreamListSegments_Segment_maxWitnessedAt...)
+		buf = cbor.AppendInt(buf, s.MaxWitnessedAt)
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "minWitnessedAt", buf)
+		buf = append(buf, cborKey_JetstreamListSegments_Segment_minWitnessedAt...)
+		buf = cbor.AppendInt(buf, s.MinWitnessedAt)
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		buf = append(buf, cborKey_JetstreamListSegments_Segment_name...)
@@ -429,10 +429,10 @@ func (s *JetstreamListSegments_Segment) AppendCBOR(buf []byte) ([]byte, error) {
 		buf = cbor.AppendInt(buf, s.SizeBytes)
 		buf = append(buf, cborKey_JetstreamListSegments_Segment_eventCount...)
 		buf = cbor.AppendInt(buf, s.EventCount)
-		buf = append(buf, cborKey_JetstreamListSegments_Segment_maxIndexedAt...)
-		buf = cbor.AppendInt(buf, s.MaxIndexedAt)
-		buf = append(buf, cborKey_JetstreamListSegments_Segment_minIndexedAt...)
-		buf = cbor.AppendInt(buf, s.MinIndexedAt)
+		buf = append(buf, cborKey_JetstreamListSegments_Segment_maxWitnessedAt...)
+		buf = cbor.AppendInt(buf, s.MaxWitnessedAt)
+		buf = append(buf, cborKey_JetstreamListSegments_Segment_minWitnessedAt...)
+		buf = cbor.AppendInt(buf, s.MinWitnessedAt)
 	}
 	return buf, nil
 }
@@ -549,14 +549,14 @@ func (s *JetstreamListSegments_Segment) UnmarshalCBORAt(data []byte, pos int) (i
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
-		case 12:
-			if string(data[keyStart:keyEnd]) == "maxIndexedAt" {
-				s.MaxIndexedAt, pos, err = cbor.ReadInt(data, pos)
+		case 14:
+			if string(data[keyStart:keyEnd]) == "maxWitnessedAt" {
+				s.MaxWitnessedAt, pos, err = cbor.ReadInt(data, pos)
 				if err != nil {
 					return 0, err
 				}
-			} else if string(data[keyStart:keyEnd]) == "minIndexedAt" {
-				s.MinIndexedAt, pos, err = cbor.ReadInt(data, pos)
+			} else if string(data[keyStart:keyEnd]) == "minWitnessedAt" {
+				s.MinWitnessedAt, pos, err = cbor.ReadInt(data, pos)
 				if err != nil {
 					return 0, err
 				}
@@ -582,16 +582,16 @@ func (s *JetstreamListSegments_Segment) UnmarshalCBORAt(data []byte, pos int) (i
 
 // Precomputed JSON key tokens for JetstreamListSegments_Segment.
 var (
-	jsonKey_JetstreamListSegments_Segment_dollar_type  = []byte("\"$type\":")
-	jsonKey_JetstreamListSegments_Segment_checksum     = []byte("\"checksum\":")
-	jsonKey_JetstreamListSegments_Segment_eventCount   = []byte("\"eventCount\":")
-	jsonKey_JetstreamListSegments_Segment_index        = []byte("\"index\":")
-	jsonKey_JetstreamListSegments_Segment_maxIndexedAt = []byte("\"maxIndexedAt\":")
-	jsonKey_JetstreamListSegments_Segment_maxSeq       = []byte("\"maxSeq\":")
-	jsonKey_JetstreamListSegments_Segment_minIndexedAt = []byte("\"minIndexedAt\":")
-	jsonKey_JetstreamListSegments_Segment_minSeq       = []byte("\"minSeq\":")
-	jsonKey_JetstreamListSegments_Segment_name         = []byte("\"name\":")
-	jsonKey_JetstreamListSegments_Segment_sizeBytes    = []byte("\"sizeBytes\":")
+	jsonKey_JetstreamListSegments_Segment_dollar_type    = []byte("\"$type\":")
+	jsonKey_JetstreamListSegments_Segment_checksum       = []byte("\"checksum\":")
+	jsonKey_JetstreamListSegments_Segment_eventCount     = []byte("\"eventCount\":")
+	jsonKey_JetstreamListSegments_Segment_index          = []byte("\"index\":")
+	jsonKey_JetstreamListSegments_Segment_maxSeq         = []byte("\"maxSeq\":")
+	jsonKey_JetstreamListSegments_Segment_maxWitnessedAt = []byte("\"maxWitnessedAt\":")
+	jsonKey_JetstreamListSegments_Segment_minSeq         = []byte("\"minSeq\":")
+	jsonKey_JetstreamListSegments_Segment_minWitnessedAt = []byte("\"minWitnessedAt\":")
+	jsonKey_JetstreamListSegments_Segment_name           = []byte("\"name\":")
+	jsonKey_JetstreamListSegments_Segment_sizeBytes      = []byte("\"sizeBytes\":")
 )
 
 func (s *JetstreamListSegments_Segment) MarshalJSON() ([]byte, error) {
@@ -630,26 +630,26 @@ func (s *JetstreamListSegments_Segment) AppendJSON(buf []byte) ([]byte, error) {
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamListSegments_Segment_maxIndexedAt...)
-	buf = cbor.AppendJSONInt(buf, s.MaxIndexedAt)
-	first = false
-	if !first {
-		buf = append(buf, ',')
-	}
 	buf = append(buf, jsonKey_JetstreamListSegments_Segment_maxSeq...)
 	buf = cbor.AppendJSONInt(buf, s.MaxSeq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamListSegments_Segment_minIndexedAt...)
-	buf = cbor.AppendJSONInt(buf, s.MinIndexedAt)
+	buf = append(buf, jsonKey_JetstreamListSegments_Segment_maxWitnessedAt...)
+	buf = cbor.AppendJSONInt(buf, s.MaxWitnessedAt)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
 	buf = append(buf, jsonKey_JetstreamListSegments_Segment_minSeq...)
 	buf = cbor.AppendJSONInt(buf, s.MinSeq)
+	first = false
+	if !first {
+		buf = append(buf, ',')
+	}
+	buf = append(buf, jsonKey_JetstreamListSegments_Segment_minWitnessedAt...)
+	buf = cbor.AppendJSONInt(buf, s.MinWitnessedAt)
 	first = false
 	if !first {
 		buf = append(buf, ',')
@@ -723,23 +723,23 @@ func (s *JetstreamListSegments_Segment) UnmarshalJSONAt(data []byte, pos int) (i
 			if err != nil {
 				return 0, err
 			}
-		case "maxIndexedAt":
-			s.MaxIndexedAt, pos, err = cbor.ReadJSONInt(data, pos)
-			if err != nil {
-				return 0, err
-			}
 		case "maxSeq":
 			s.MaxSeq, pos, err = cbor.ReadJSONInt(data, pos)
 			if err != nil {
 				return 0, err
 			}
-		case "minIndexedAt":
-			s.MinIndexedAt, pos, err = cbor.ReadJSONInt(data, pos)
+		case "maxWitnessedAt":
+			s.MaxWitnessedAt, pos, err = cbor.ReadJSONInt(data, pos)
 			if err != nil {
 				return 0, err
 			}
 		case "minSeq":
 			s.MinSeq, pos, err = cbor.ReadJSONInt(data, pos)
+			if err != nil {
+				return 0, err
+			}
+		case "minWitnessedAt":
+			s.MinWitnessedAt, pos, err = cbor.ReadJSONInt(data, pos)
 			if err != nil {
 				return 0, err
 			}

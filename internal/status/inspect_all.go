@@ -60,8 +60,8 @@ type TreeAggregate struct {
 	NewestMTime       time.Time
 	MinSeq            uint64 // 0 if no records
 	MaxSeq            uint64
-	MinIndexedAt      time.Time // zero if no records
-	MaxIndexedAt      time.Time
+	MinWitnessedAt    time.Time // zero if no records
+	MaxWitnessedAt    time.Time
 	LatestSegment     *SegmentSummary
 }
 
@@ -88,8 +88,8 @@ type NetworkTotals struct {
 	DiskBytes         int64
 	MinSeq            uint64
 	MaxSeq            uint64
-	MinIndexedAt      time.Time
-	MaxIndexedAt      time.Time
+	MinWitnessedAt    time.Time
+	MaxWitnessedAt    time.Time
 }
 
 // InspectAllOptions controls the scan.
@@ -214,8 +214,8 @@ func scanTree(root string, opts InspectAllOptions, collections map[string]*Colle
 			CollectionCount: len(ins.Collections),
 			MinSeq:          ins.MinSeq,
 			MaxSeq:          ins.MaxSeq,
-			MinIndexedAt:    microsToTime(ins.MinIndexedAt),
-			MaxIndexedAt:    microsToTime(ins.MaxIndexedAt),
+			MinWitnessedAt:  microsToTime(ins.MinWitnessedAt),
+			MaxWitnessedAt:  microsToTime(ins.MaxWitnessedAt),
 			SizeBytes:       ins.FileSize,
 		}
 
@@ -253,13 +253,13 @@ func foldInspection(tree *TreeAggregate, ins *segment.Inspection, collections ma
 		if ins.MaxSeq > tree.MaxSeq {
 			tree.MaxSeq = ins.MaxSeq
 		}
-		minIA := microsToTime(ins.MinIndexedAt)
-		maxIA := microsToTime(ins.MaxIndexedAt)
-		if !minIA.IsZero() && (tree.MinIndexedAt.IsZero() || minIA.Before(tree.MinIndexedAt)) {
-			tree.MinIndexedAt = minIA
+		minIA := microsToTime(ins.MinWitnessedAt)
+		maxIA := microsToTime(ins.MaxWitnessedAt)
+		if !minIA.IsZero() && (tree.MinWitnessedAt.IsZero() || minIA.Before(tree.MinWitnessedAt)) {
+			tree.MinWitnessedAt = minIA
 		}
-		if maxIA.After(tree.MaxIndexedAt) {
-			tree.MaxIndexedAt = maxIA
+		if maxIA.After(tree.MaxWitnessedAt) {
+			tree.MaxWitnessedAt = maxIA
 		}
 	}
 
@@ -323,7 +323,7 @@ func materializeCollections(m map[string]*CollectionAggregate) []CollectionAggre
 }
 
 // computeNetworkTotals sums the per-tree counters into a single
-// NetworkTotals. Bounds (MinSeq/MinIndexedAt/MaxSeq/MaxIndexedAt) are
+// NetworkTotals. Bounds (MinSeq/MinWitnessedAt/MaxSeq/MaxWitnessedAt) are
 // only contributed by trees whose own counters are non-zero so empty
 // trees do not pull min bounds to zero.
 func computeNetworkTotals(trees []TreeAggregate, collectionCount int) NetworkTotals {
@@ -347,11 +347,11 @@ func computeNetworkTotals(trees []TreeAggregate, collectionCount int) NetworkTot
 		if t.MaxSeq > tot.MaxSeq {
 			tot.MaxSeq = t.MaxSeq
 		}
-		if !t.MinIndexedAt.IsZero() && (tot.MinIndexedAt.IsZero() || t.MinIndexedAt.Before(tot.MinIndexedAt)) {
-			tot.MinIndexedAt = t.MinIndexedAt
+		if !t.MinWitnessedAt.IsZero() && (tot.MinWitnessedAt.IsZero() || t.MinWitnessedAt.Before(tot.MinWitnessedAt)) {
+			tot.MinWitnessedAt = t.MinWitnessedAt
 		}
-		if t.MaxIndexedAt.After(tot.MaxIndexedAt) {
-			tot.MaxIndexedAt = t.MaxIndexedAt
+		if t.MaxWitnessedAt.After(tot.MaxWitnessedAt) {
+			tot.MaxWitnessedAt = t.MaxWitnessedAt
 		}
 	}
 	return tot

@@ -20,8 +20,8 @@ type Header struct {
 	EventCount            uint32
 	UniqueDIDCount        uint32
 	MinSeq, MaxSeq        uint64
-	MinIndexedAt          int64 // unix micros
-	MaxIndexedAt          int64 // unix micros
+	MinWitnessedAt        int64 // unix micros
+	MaxWitnessedAt        int64 // unix micros
 	FooterOffset          uint64
 	DIDBloomOffset        uint64
 	BlockDIDBloomOffset   uint64
@@ -50,8 +50,8 @@ func encodeHeader(h Header) []byte {
 	le.PutUint32(buf[22:26], h.UniqueDIDCount)
 	le.PutUint64(buf[26:34], h.MinSeq)
 	le.PutUint64(buf[34:42], h.MaxSeq)
-	le.PutUint64(buf[42:50], uint64(h.MinIndexedAt))
-	le.PutUint64(buf[50:58], uint64(h.MaxIndexedAt))
+	le.PutUint64(buf[42:50], uint64(h.MinWitnessedAt))
+	le.PutUint64(buf[50:58], uint64(h.MaxWitnessedAt))
 	le.PutUint64(buf[58:66], h.FooterOffset)
 	le.PutUint64(buf[66:74], h.DIDBloomOffset)
 	le.PutUint64(buf[74:82], h.BlockDIDBloomOffset)
@@ -95,8 +95,8 @@ func decodeHeader(buf []byte) (Header, error) {
 		UniqueDIDCount:        le.Uint32(buf[22:26]),
 		MinSeq:                le.Uint64(buf[26:34]),
 		MaxSeq:                le.Uint64(buf[34:42]),
-		MinIndexedAt:          int64(le.Uint64(buf[42:50])),
-		MaxIndexedAt:          int64(le.Uint64(buf[50:58])),
+		MinWitnessedAt:        int64(le.Uint64(buf[42:50])),
+		MaxWitnessedAt:        int64(le.Uint64(buf[50:58])),
 		FooterOffset:          le.Uint64(buf[58:66]),
 		DIDBloomOffset:        le.Uint64(buf[66:74]),
 		BlockDIDBloomOffset:   le.Uint64(buf[74:82]),

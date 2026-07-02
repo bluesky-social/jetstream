@@ -38,7 +38,7 @@
     },
     "segment": {
       "type": "object",
-      "required": ["name", "index", "sizeBytes", "checksum", "eventCount", "minSeq", "maxSeq", "minIndexedAt", "maxIndexedAt"],
+      "required": ["name", "index", "sizeBytes", "checksum", "eventCount", "minSeq", "maxSeq", "minWitnessedAt", "maxWitnessedAt"],
       "properties": {
         "name": { "type": "string", "description": "Segment filename; pass to getSegment." },
         "index": { "type": "integer", "description": "Zero-based segment index." },
@@ -47,8 +47,8 @@
         "eventCount": { "type": "integer", "description": "Number of events in the segment." },
         "minSeq": { "type": "integer" },
         "maxSeq": { "type": "integer" },
-        "minIndexedAt": { "type": "integer", "description": "Earliest indexed-at, unix microseconds." },
-        "maxIndexedAt": { "type": "integer", "description": "Latest indexed-at, unix microseconds." }
+        "minWitnessedAt": { "type": "integer", "description": "Earliest witnessed-at, unix microseconds." },
+        "maxWitnessedAt": { "type": "integer", "description": "Latest witnessed-at, unix microseconds." }
       }
     }
   }

@@ -661,10 +661,10 @@ func TestCollect_WithManifestIncludesWritableTails(t *testing.T) {
 	require.NoError(t, err)
 
 	writeActiveSegment(t, segmentsDir, 1, []segment.Event{
-		{Seq: 3, IndexedAt: 1_700_000_000_000_003, Kind: segment.KindCreate, DID: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", Collection: "app.bsky.feed.like", Rkey: "r", Rev: "v", Payload: []byte("p")},
+		{Seq: 3, WitnessedAt: 1_700_000_000_000_003, Kind: segment.KindCreate, DID: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", Collection: "app.bsky.feed.like", Rkey: "r", Rev: "v", Payload: []byte("p")},
 	})
 	writeActiveSegment(t, liveDir, 0, []segment.Event{
-		{Seq: 4, IndexedAt: 1_700_000_000_000_004, Kind: segment.KindCreate, DID: "did:plc:cccccccccccccccccccccccc", Collection: "app.bsky.graph.follow", Rkey: "r", Rev: "v", Payload: []byte("p")},
+		{Seq: 4, WitnessedAt: 1_700_000_000_000_004, Kind: segment.KindCreate, DID: "did:plc:cccccccccccccccccccccccc", Collection: "app.bsky.graph.follow", Rkey: "r", Rev: "v", Payload: []byte("p")},
 	})
 
 	require.NoError(t, backfill.SaveCounts(st, backfill.Counts{Total: 10, Discovered: 10, Complete: 8}))
@@ -727,12 +727,12 @@ func makeSealedStatusSegment(path string) error {
 	}
 	for i := range 2 {
 		if _, err := w.Append(segment.Event{
-			Seq:        uint64(i + 1),
-			Kind:       segment.KindCreate,
-			DID:        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
-			IndexedAt:  1_700_000_000_000_000 + int64(i),
-			Collection: "app.bsky.feed.post",
-			Payload:    []byte("hello"),
+			Seq:         uint64(i + 1),
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+			WitnessedAt: 1_700_000_000_000_000 + int64(i),
+			Collection:  "app.bsky.feed.post",
+			Payload:     []byte("hello"),
 		}); err != nil {
 			return err
 		}

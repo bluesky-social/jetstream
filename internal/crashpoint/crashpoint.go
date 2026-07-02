@@ -82,6 +82,27 @@ const (
 	// the parent dir. The replacement is durable; callers must still tolerate
 	// receiving an error at this checkpoint.
 	AfterSegmentRewriteDirSynced Point = Point(segment.CrashPointRewriteDirSynced)
+
+	// The four segment-patch seams mirror the rewrite seams above but fire in
+	// segment.Patch (mutate-mode indexed_at rewrite for timestamp import).
+	// Derived from segment's strings for the same compile-time-link reason.
+
+	// AfterSegmentPatchTempWritten fires after a segment patch has written all
+	// bytes to the temporary replacement file but before fsyncing it.
+	AfterSegmentPatchTempWritten Point = Point(segment.CrashPointPatchTempWritten)
+
+	// AfterSegmentPatchTempSynced fires after a segment patch has fsynced the
+	// temporary replacement file but before renaming it over the original.
+	AfterSegmentPatchTempSynced Point = Point(segment.CrashPointPatchTempSynced)
+
+	// AfterSegmentPatchRenamed fires after a segment patch has renamed the
+	// replacement file over the original but before fsyncing the parent dir.
+	AfterSegmentPatchRenamed Point = Point(segment.CrashPointPatchRenamed)
+
+	// AfterSegmentPatchDirSynced fires after a segment patch has fsynced the
+	// parent dir. The replacement is durable; callers must still tolerate
+	// receiving an error at this checkpoint.
+	AfterSegmentPatchDirSynced Point = Point(segment.CrashPointPatchDirSynced)
 )
 
 // AllPoints is the single source of truth for the set of declared
@@ -101,6 +122,10 @@ var AllPoints = []Point{
 	AfterSegmentRewriteTempSynced,
 	AfterSegmentRewriteRenamed,
 	AfterSegmentRewriteDirSynced,
+	AfterSegmentPatchTempWritten,
+	AfterSegmentPatchTempSynced,
+	AfterSegmentPatchRenamed,
+	AfterSegmentPatchDirSynced,
 }
 
 var knownPoints = func() map[Point]struct{} {

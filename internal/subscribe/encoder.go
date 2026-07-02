@@ -78,7 +78,7 @@ func encodeCommit(evt *segment.Event) ([]byte, error) {
 
 	env := &streaming.JetstreamEvent{
 		DID:    evt.DID,
-		TimeUS: evt.IndexedAt,
+		TimeUS: evt.DisplayTimeUS(),
 		Cursor: evt.Seq,
 		Kind:   streaming.JetstreamKindCommit,
 		Commit: commit,
@@ -122,7 +122,7 @@ type v2Sync struct {
 func v2Envelope(evt *segment.Event, kind string) v2Event {
 	return v2Event{
 		DID:    evt.DID,
-		TimeUS: evt.IndexedAt,
+		TimeUS: evt.DisplayTimeUS(),
 		Cursor: evt.Seq,
 		Kind:   kind,
 		Seq:    evt.Seq,
@@ -213,7 +213,7 @@ func encodeIdentity(evt *segment.Event) ([]byte, error) {
 	}
 	env := &streaming.JetstreamEvent{
 		DID:      evt.DID,
-		TimeUS:   evt.IndexedAt,
+		TimeUS:   evt.DisplayTimeUS(),
 		Cursor:   evt.Seq,
 		Kind:     streaming.JetstreamKindIdentity,
 		Identity: &id,
@@ -228,7 +228,7 @@ func encodeAccount(evt *segment.Event) ([]byte, error) {
 	}
 	env := &streaming.JetstreamEvent{
 		DID:     evt.DID,
-		TimeUS:  evt.IndexedAt,
+		TimeUS:  evt.DisplayTimeUS(),
 		Cursor:  evt.Seq,
 		Kind:    streaming.JetstreamKindAccount,
 		Account: &acct,

@@ -74,14 +74,14 @@ func BenchmarkDecodeRecordMapPost(b *testing.B) {
 // the dominant like shape.
 func BenchmarkDecodeSegmentEventLike(b *testing.B) {
 	ev := &segment.Event{
-		Seq:        1,
-		IndexedAt:  1_730_000_000_000_000,
-		Kind:       segment.KindCreate,
-		DID:        "did:plc:atu3zhe7rhhq5ujaqe7yjpnn",
-		Collection: "app.bsky.feed.like",
-		Rkey:       "3lbfb65ejz62c",
-		Rev:        "3mfvujdqdjt2t",
-		Payload:    benchLikePayload(b),
+		Seq:         1,
+		WitnessedAt: 1_730_000_000_000_000,
+		Kind:        segment.KindCreate,
+		DID:         "did:plc:atu3zhe7rhhq5ujaqe7yjpnn",
+		Collection:  "app.bsky.feed.like",
+		Rkey:        "3lbfb65ejz62c",
+		Rev:         "3mfvujdqdjt2t",
+		Payload:     benchLikePayload(b),
 	}
 	b.ReportAllocs()
 	for b.Loop() {

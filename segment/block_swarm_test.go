@@ -162,12 +162,12 @@ func buildSwarmEvent(r *rand.Rand, f swarmFlags, pickKind func() Kind) Event {
 	// Mostly-zero columns axis.
 	if f[axisMostlyZeroColumns] {
 		ev.Seq = 0
+		ev.WitnessedAt = 0
 		ev.IndexedAt = 0
-		ev.RenderedAt = 0
 	} else {
 		ev.Seq = r.Uint64()
+		ev.WitnessedAt = int64(r.Uint64())
 		ev.IndexedAt = int64(r.Uint64())
-		ev.RenderedAt = int64(r.Uint64())
 	}
 
 	// Length-prefix-bytes axis: stuff payload with bytes that look

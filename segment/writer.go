@@ -191,7 +191,7 @@ func New(cfg Config) (*Writer, error) {
 			return nil, walkErr
 		}
 		// walk.infos already carries every field we care about
-		// because the seal walk populates the indexed_at bounds.
+		// because the seal walk populates the witnessed_at bounds.
 		w.flushedBlocks = walk.infos
 	}
 
@@ -337,15 +337,15 @@ func lastGoodOffset(f *os.File, size int64) (int64, error) {
 // underlying arrays grow once. Every slice is reset via s = s[:0]
 // on flush to retain capacity.
 type pendingBlock struct {
-	seq        []uint64
-	indexedAt  []int64
-	renderedAt []int64
-	kind       []uint8
-	collLen    []uint8
-	didLen     []uint16
-	rkeyLen    []uint8
-	revLen     []uint8
-	eventLen   []uint32
+	seq         []uint64
+	witnessedAt []int64
+	indexedAt   []int64
+	kind        []uint8
+	collLen     []uint8
+	didLen      []uint16
+	rkeyLen     []uint8
+	revLen      []uint8
+	eventLen    []uint32
 
 	collections []byte
 	dids        []byte
@@ -353,7 +353,7 @@ type pendingBlock struct {
 	revs        []byte
 	payloads    []byte
 
-	// pendingBounds is the running min/max of seq and indexed_at
+	// pendingBounds is the running min/max of seq and witnessed_at
 	// across the events currently buffered. Reset on flushLocked
 	// after the BlockInfo for this block is finalized.
 	pendingBounds blockBounds
@@ -364,8 +364,8 @@ type pendingBlock struct {
 // by Append so flushLocked can finalize a BlockInfo without
 // re-walking the events.
 type blockBounds struct {
-	minSeq, maxSeq             uint64
-	minIndexedAt, maxIndexedAt int64
+	minSeq, maxSeq                 uint64
+	minWitnessedAt, maxWitnessedAt int64
 }
 
 // count returns the number of events currently buffered. All column
@@ -381,8 +381,8 @@ func (p *pendingBlock) count() int { return len(p.seq) }
 // growth pattern — append still amortizes cleanly.
 func (p *pendingBlock) preallocate(cap int) {
 	p.seq = make([]uint64, 0, cap)
+	p.witnessedAt = make([]int64, 0, cap)
 	p.indexedAt = make([]int64, 0, cap)
-	p.renderedAt = make([]int64, 0, cap)
 	p.kind = make([]uint8, 0, cap)
 	p.collLen = make([]uint8, 0, cap)
 	p.didLen = make([]uint16, 0, cap)
@@ -400,8 +400,8 @@ func (p *pendingBlock) preallocate(cap int) {
 // capacity. Callers use this after a successful flush.
 func (p *pendingBlock) reset() {
 	p.seq = p.seq[:0]
+	p.witnessedAt = p.witnessedAt[:0]
 	p.indexedAt = p.indexedAt[:0]
-	p.renderedAt = p.renderedAt[:0]
 	p.kind = p.kind[:0]
 	p.collLen = p.collLen[:0]
 	p.didLen = p.didLen[:0]
@@ -449,11 +449,11 @@ func (w *Writer) Close() error {
 // each row's offset, making a single encode O(n²); appending the entire
 // variable region per column keeps it O(n).
 
-func (p *pendingBlock) Len() int               { return p.count() }
-func (p *pendingBlock) Seq(i int) uint64       { return p.seq[i] }
-func (p *pendingBlock) IndexedAt(i int) int64  { return p.indexedAt[i] }
-func (p *pendingBlock) RenderedAt(i int) int64 { return p.renderedAt[i] }
-func (p *pendingBlock) Kind(i int) uint8       { return p.kind[i] }
+func (p *pendingBlock) Len() int                { return p.count() }
+func (p *pendingBlock) Seq(i int) uint64        { return p.seq[i] }
+func (p *pendingBlock) WitnessedAt(i int) int64 { return p.witnessedAt[i] }
+func (p *pendingBlock) IndexedAt(i int) int64   { return p.indexedAt[i] }
+func (p *pendingBlock) Kind(i int) uint8        { return p.kind[i] }
 
 func (p *pendingBlock) CollectionLen(i int) uint8 { return p.collLen[i] }
 func (p *pendingBlock) DIDLen(i int) uint16       { return p.didLen[i] }
@@ -542,8 +542,8 @@ func (w *Writer) flushLocked() error {
 		EventCount:       uint32(w.pending.count()),
 		MinSeq:           w.pending.pendingBounds.minSeq,
 		MaxSeq:           w.pending.pendingBounds.maxSeq,
-		MinIndexedAt:     w.pending.pendingBounds.minIndexedAt,
-		MaxIndexedAt:     w.pending.pendingBounds.maxIndexedAt,
+		MinWitnessedAt:   w.pending.pendingBounds.minWitnessedAt,
+		MaxWitnessedAt:   w.pending.pendingBounds.maxWitnessedAt,
 	}
 	w.flushedBlocks = append(w.flushedBlocks, info)
 	w.nextBlockOffset += uint64(len(w.wireScratch))
@@ -573,8 +573,8 @@ func (w *Writer) prepareFlushLocked(dst []byte) (*PreparedBlock, error) {
 		EventCount:       uint32(w.pending.count()),
 		MinSeq:           w.pending.pendingBounds.minSeq,
 		MaxSeq:           w.pending.pendingBounds.maxSeq,
-		MinIndexedAt:     w.pending.pendingBounds.minIndexedAt,
-		MaxIndexedAt:     w.pending.pendingBounds.maxIndexedAt,
+		MinWitnessedAt:   w.pending.pendingBounds.minWitnessedAt,
+		MaxWitnessedAt:   w.pending.pendingBounds.maxWitnessedAt,
 	}
 	w.pending.reset()
 	prepared := &PreparedBlock{
@@ -679,8 +679,8 @@ func (w *Writer) Append(ev Event) (full bool, err error) {
 
 	p := &w.pending
 	p.seq = append(p.seq, ev.Seq)
+	p.witnessedAt = append(p.witnessedAt, ev.WitnessedAt)
 	p.indexedAt = append(p.indexedAt, ev.IndexedAt)
-	p.renderedAt = append(p.renderedAt, ev.RenderedAt)
 	p.kind = append(p.kind, uint8(ev.Kind))
 	p.collLen = append(p.collLen, uint8(len(ev.Collection)))
 	p.didLen = append(p.didLen, uint16(len(ev.DID)))
@@ -696,8 +696,8 @@ func (w *Writer) Append(ev Event) (full bool, err error) {
 	if !p.sawAny {
 		p.pendingBounds.minSeq = ev.Seq
 		p.pendingBounds.maxSeq = ev.Seq
-		p.pendingBounds.minIndexedAt = ev.IndexedAt
-		p.pendingBounds.maxIndexedAt = ev.IndexedAt
+		p.pendingBounds.minWitnessedAt = ev.WitnessedAt
+		p.pendingBounds.maxWitnessedAt = ev.WitnessedAt
 		p.sawAny = true
 	} else {
 		if ev.Seq < p.pendingBounds.minSeq {
@@ -706,11 +706,11 @@ func (w *Writer) Append(ev Event) (full bool, err error) {
 		if ev.Seq > p.pendingBounds.maxSeq {
 			p.pendingBounds.maxSeq = ev.Seq
 		}
-		if ev.IndexedAt < p.pendingBounds.minIndexedAt {
-			p.pendingBounds.minIndexedAt = ev.IndexedAt
+		if ev.WitnessedAt < p.pendingBounds.minWitnessedAt {
+			p.pendingBounds.minWitnessedAt = ev.WitnessedAt
 		}
-		if ev.IndexedAt > p.pendingBounds.maxIndexedAt {
-			p.pendingBounds.maxIndexedAt = ev.IndexedAt
+		if ev.WitnessedAt > p.pendingBounds.maxWitnessedAt {
+			p.pendingBounds.maxWitnessedAt = ev.WitnessedAt
 		}
 	}
 
@@ -756,15 +756,15 @@ func (w *Writer) SnapshotPending() []Event {
 		payloadN := uint64(p.eventLen[i])
 
 		out[i] = Event{
-			Seq:        p.seq[i],
-			IndexedAt:  p.indexedAt[i],
-			RenderedAt: p.renderedAt[i],
-			Kind:       Kind(p.kind[i]),
-			DID:        string(p.dids[didOff : didOff+didN]),
-			Collection: string(p.collections[collOff : collOff+collN]),
-			Rkey:       string(p.rkeys[rkeyOff : rkeyOff+rkeyN]),
-			Rev:        string(p.revs[revOff : revOff+revN]),
-			Payload:    append([]byte(nil), p.payloads[payloadOff:payloadOff+payloadN]...),
+			Seq:         p.seq[i],
+			WitnessedAt: p.witnessedAt[i],
+			IndexedAt:   p.indexedAt[i],
+			Kind:        Kind(p.kind[i]),
+			DID:         string(p.dids[didOff : didOff+didN]),
+			Collection:  string(p.collections[collOff : collOff+collN]),
+			Rkey:        string(p.rkeys[rkeyOff : rkeyOff+rkeyN]),
+			Rev:         string(p.revs[revOff : revOff+revN]),
+			Payload:     append([]byte(nil), p.payloads[payloadOff:payloadOff+payloadN]...),
 		}
 
 		collOff += collN

@@ -19,8 +19,8 @@ func TestEncodeHeaderRoundtrip(t *testing.T) {
 		UniqueDIDCount:        9_999,
 		MinSeq:                1,
 		MaxSeq:                123_456,
-		MinIndexedAt:          1_700_000_000_000_000,
-		MaxIndexedAt:          1_700_000_001_000_000,
+		MinWitnessedAt:        1_700_000_000_000_000,
+		MaxWitnessedAt:        1_700_000_001_000_000,
 		FooterOffset:          1 << 20,
 		DIDBloomOffset:        (1 << 20) + 1024,
 		BlockDIDBloomOffset:   (1 << 20) + 4096,
@@ -51,8 +51,8 @@ func TestEncodeHeaderFieldOffsets(t *testing.T) {
 		UniqueDIDCount:        4,
 		MinSeq:                5,
 		MaxSeq:                6,
-		MinIndexedAt:          7,
-		MaxIndexedAt:          8,
+		MinWitnessedAt:        7,
+		MaxWitnessedAt:        8,
 		FooterOffset:          9,
 		DIDBloomOffset:        10,
 		BlockDIDBloomOffset:   11,
@@ -78,9 +78,9 @@ func TestEncodeHeaderFieldOffsets(t *testing.T) {
 	require.Equal(t, uint64(6), binary.LittleEndian.Uint64(buf[34:42]),
 		"max_seq at offset 34")
 	require.Equal(t, int64(7), int64(binary.LittleEndian.Uint64(buf[42:50])),
-		"min_indexed_at at offset 42")
+		"min_witnessed_at at offset 42")
 	require.Equal(t, int64(8), int64(binary.LittleEndian.Uint64(buf[50:58])),
-		"max_indexed_at at offset 50")
+		"max_witnessed_at at offset 50")
 	require.Equal(t, uint64(9), binary.LittleEndian.Uint64(buf[58:66]),
 		"footer_offset at offset 58")
 	require.Equal(t, uint64(10), binary.LittleEndian.Uint64(buf[66:74]),

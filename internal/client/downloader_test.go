@@ -152,14 +152,14 @@ func makeCreate(t *testing.T, seq uint64, did, collection, rkey string) segment.
 	payload, err := cbor.Marshal(rec)
 	require.NoError(t, err)
 	return segment.Event{
-		Seq:        seq,
-		IndexedAt:  int64(1_730_000_000_000_000 + seq*1_000),
-		Kind:       segment.KindCreate,
-		DID:        did,
-		Collection: collection,
-		Rkey:       rkey,
-		Rev:        "rev" + strconv.FormatUint(seq, 10),
-		Payload:    payload,
+		Seq:         seq,
+		WitnessedAt: int64(1_730_000_000_000_000 + seq*1_000),
+		Kind:        segment.KindCreate,
+		DID:         did,
+		Collection:  collection,
+		Rkey:        rkey,
+		Rev:         "rev" + strconv.FormatUint(seq, 10),
+		Payload:     payload,
 	}
 }
 

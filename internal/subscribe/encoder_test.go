@@ -112,12 +112,12 @@ func TestEncode_CommitGoldenRoundTrips(t *testing.T) {
 			require.True(t, ok, "rev not a string")
 
 			segEvt := &segment.Event{
-				IndexedAt:  int64(timeUS),
-				Kind:       commitKindFromOp(op),
-				DID:        did,
-				Collection: collection,
-				Rkey:       rkey,
-				Rev:        rev,
+				WitnessedAt: int64(timeUS),
+				Kind:        commitKindFromOp(op),
+				DID:         did,
+				Collection:  collection,
+				Rkey:        rkey,
+				Rev:         rev,
 			}
 			if op != "delete" {
 				segEvt.Payload = recordCBOR(t, commit["record"])
@@ -172,10 +172,10 @@ func TestEncode_IdentityGoldenRoundTrip(t *testing.T) {
 			require.True(t, ok, "did not a string")
 
 			segEvt := &segment.Event{
-				IndexedAt: int64(timeUS),
-				Kind:      segment.KindIdentity,
-				DID:       did,
-				Payload:   payload,
+				WitnessedAt: int64(timeUS),
+				Kind:        segment.KindIdentity,
+				DID:         did,
+				Payload:     payload,
 			}
 
 			gotJSON, err := Encode(segEvt)
@@ -227,10 +227,10 @@ func TestEncode_AccountGoldenRoundTrip(t *testing.T) {
 			require.True(t, ok, "did not a string")
 
 			segEvt := &segment.Event{
-				IndexedAt: int64(timeUS),
-				Kind:      segment.KindAccount,
-				DID:       did,
-				Payload:   payload,
+				WitnessedAt: int64(timeUS),
+				Kind:        segment.KindAccount,
+				DID:         did,
+				Payload:     payload,
 			}
 
 			gotJSON, err := Encode(segEvt)
@@ -255,14 +255,14 @@ func TestEncode_CreateResyncUsesCreateWireOperation(t *testing.T) {
 	t.Parallel()
 
 	body, err := Encode(&segment.Event{
-		Seq:        123,
-		IndexedAt:  1_700_000_000_000_000,
-		Kind:       segment.KindCreateResync,
-		DID:        "did:plc:x",
-		Collection: "app.bsky.feed.post",
-		Rkey:       "r1",
-		Rev:        "rev1",
-		Payload:    []byte{0xa0},
+		Seq:         123,
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindCreateResync,
+		DID:         "did:plc:x",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "r1",
+		Rev:         "rev1",
+		Payload:     []byte{0xa0},
 	})
 	require.NoError(t, err)
 
@@ -286,14 +286,14 @@ func TestEncode_CursorFieldOnCommit(t *testing.T) {
 	// and re-encode it as JSON; the test only asserts the envelope's
 	// cursor field, not the record contents.
 	evt := &segment.Event{
-		Seq:        12345,
-		IndexedAt:  1_700_000_000_000_000,
-		Kind:       segment.KindCreate,
-		DID:        "did:plc:test",
-		Collection: "app.bsky.feed.post",
-		Rkey:       "abc",
-		Rev:        "rev1",
-		Payload:    []byte{0xa0},
+		Seq:         12345,
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindCreate,
+		DID:         "did:plc:test",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "abc",
+		Rev:         "rev1",
+		Payload:     []byte{0xa0},
 	}
 	body, err := Encode(evt)
 	require.NoError(t, err)
@@ -309,11 +309,11 @@ func TestEncode_CursorFieldOnIdentity(t *testing.T) {
 	payload, err := ident.MarshalCBOR()
 	require.NoError(t, err)
 	evt := &segment.Event{
-		Seq:       12345,
-		IndexedAt: 1_700_000_000_000_000,
-		Kind:      segment.KindIdentity,
-		DID:       "did:plc:test",
-		Payload:   payload,
+		Seq:         12345,
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindIdentity,
+		DID:         "did:plc:test",
+		Payload:     payload,
 	}
 	body, err := Encode(evt)
 	require.NoError(t, err)
@@ -330,11 +330,11 @@ func TestEncode_CursorFieldOnAccount(t *testing.T) {
 	payload, err := acct.MarshalCBOR()
 	require.NoError(t, err)
 	evt := &segment.Event{
-		Seq:       12345,
-		IndexedAt: 1_700_000_000_000_000,
-		Kind:      segment.KindAccount,
-		DID:       "did:plc:test",
-		Payload:   payload,
+		Seq:         12345,
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindAccount,
+		DID:         "did:plc:test",
+		Payload:     payload,
 	}
 	body, err := Encode(evt)
 	require.NoError(t, err)
@@ -345,14 +345,15 @@ func TestEncodeV2_CommitSupersetWithRecordCBOR(t *testing.T) {
 	t.Parallel()
 	payload := []byte{0xa0}
 	evt := &segment.Event{
-		Seq:        12345,
-		IndexedAt:  1_700_000_000_000_000,
-		Kind:       segment.KindCreate,
-		DID:        "did:plc:test",
-		Collection: "app.bsky.feed.post",
-		Rkey:       "abc",
-		Rev:        "rev1",
-		Payload:    payload,
+		Seq:                 12345,
+		WitnessedAt:         1_700_000_000_000_000,
+		UpstreamRelayCursor: 98765,
+		Kind:                segment.KindCreate,
+		DID:                 "did:plc:test",
+		Collection:          "app.bsky.feed.post",
+		Rkey:                "abc",
+		Rev:                 "rev1",
+		Payload:             payload,
 	}
 
 	v1Body, err := Encode(evt)
@@ -383,13 +384,13 @@ func TestEncodeV2_CommitSupersetWithRecordCBOR(t *testing.T) {
 func TestEncodeV2_CommitDeleteOmitsRecordPayloads(t *testing.T) {
 	t.Parallel()
 	evt := &segment.Event{
-		Seq:        9,
-		IndexedAt:  123,
-		Kind:       segment.KindDelete,
-		DID:        "did:plc:test",
-		Collection: "app.bsky.feed.post",
-		Rkey:       "abc",
-		Rev:        "rev1",
+		Seq:         9,
+		WitnessedAt: 123,
+		Kind:        segment.KindDelete,
+		DID:         "did:plc:test",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "abc",
+		Rev:         "rev1",
 	}
 
 	body, err := EncodeV2(evt)
@@ -432,11 +433,11 @@ func TestEncodeV2_IdentityAndAccountCarryCursors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			body, err := EncodeV2(&segment.Event{
-				Seq:       123,
-				IndexedAt: 1_700_000_000_000_000,
-				Kind:      tc.kind,
-				DID:       "did:plc:test",
-				Payload:   tc.payload,
+				Seq:         123,
+				WitnessedAt: 1_700_000_000_000_000,
+				Kind:        tc.kind,
+				DID:         "did:plc:test",
+				Payload:     tc.payload,
 			})
 			require.NoError(t, err)
 			var got map[string]any
@@ -461,12 +462,12 @@ func TestEncodeV2_SyncEmitsArchivedEvent(t *testing.T) {
 	payload, err := sync.MarshalCBOR()
 	require.NoError(t, err)
 	body, err := EncodeV2(&segment.Event{
-		Seq:       77,
-		IndexedAt: 1_700_000_000_000_000,
-		Kind:      segment.KindSync,
-		DID:       "did:plc:test",
-		Rev:       "rev-sync",
-		Payload:   payload,
+		Seq:         77,
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindSync,
+		DID:         "did:plc:test",
+		Rev:         "rev-sync",
+		Payload:     payload,
 	})
 	require.NoError(t, err)
 
@@ -490,17 +491,107 @@ func TestEncodeV2_UnknownKindReturnsError(t *testing.T) {
 	require.NotErrorIs(t, err, errSkipEvent)
 }
 
+// TestEncode_TimeUSResolvesDisplayValue is the M2 behavioral guarantee: the
+// wire time_us is the imported IndexedAt when one was set, otherwise it falls
+// back to WitnessedAt. This must hold across every encoder entry point (v1 +
+// extended) and every kind, because time_us lives on the shared envelope. A
+// #sync event has no v1 form, so it is exercised only on the extended path.
+func TestEncode_TimeUSResolvesDisplayValue(t *testing.T) {
+	t.Parallel()
+
+	const witnessed = int64(1_700_000_000_000_000)
+	const imported = int64(1_600_000_000_000_000)
+
+	ident := &comatproto.SyncSubscribeRepos_Identity{DID: "did:plc:x", Seq: 1, Time: "2026-05-25T00:00:00Z"}
+	identPayload, err := ident.MarshalCBOR()
+	require.NoError(t, err)
+	acct := &comatproto.SyncSubscribeRepos_Account{DID: "did:plc:x", Active: true, Seq: 2, Time: "2026-05-25T00:00:01Z"}
+	acctPayload, err := acct.MarshalCBOR()
+	require.NoError(t, err)
+	sync := &comatproto.SyncSubscribeRepos_Sync{DID: "did:plc:x", Rev: "r", Seq: 3, Time: "2026-05-25T00:00:02Z", Blocks: []byte{0x01}}
+	syncPayload, err := sync.MarshalCBOR()
+	require.NoError(t, err)
+
+	// event returns a fresh segment.Event of the given kind with the given
+	// witnessed/indexed columns; the payload is picked to match the kind so
+	// every encoder path decodes cleanly.
+	event := func(kind segment.Kind, w, idx int64) *segment.Event {
+		e := &segment.Event{
+			Seq:         42,
+			WitnessedAt: w,
+			IndexedAt:   idx,
+			Kind:        kind,
+			DID:         "did:plc:x",
+		}
+		switch kind {
+		case segment.KindIdentity:
+			e.Payload = identPayload
+		case segment.KindAccount:
+			e.Payload = acctPayload
+		case segment.KindSync:
+			e.Payload = syncPayload
+		default: // commit kinds
+			e.Collection = "app.bsky.feed.post"
+			e.Rkey = "abc"
+			e.Rev = "rev1"
+			e.Payload = []byte{0xa0}
+		}
+		return e
+	}
+
+	timeUSOf := func(t *testing.T, body []byte) int64 {
+		t.Helper()
+		var m map[string]any
+		require.NoError(t, json.Unmarshal(body, &m))
+		f, ok := m["time_us"].(float64)
+		require.True(t, ok, "time_us not a float64 in %s", body)
+		return int64(f)
+	}
+
+	// v1 Encode: commit, identity, account (sync has no v1 form).
+	for _, kind := range []segment.Kind{segment.KindCreate, segment.KindIdentity, segment.KindAccount} {
+		t.Run("v1_unimported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+			t.Parallel()
+			body, err := Encode(event(kind, witnessed, 0))
+			require.NoError(t, err)
+			require.Equal(t, witnessed, timeUSOf(t, body), "unimported must fall back to witnessed")
+		})
+		t.Run("v1_imported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+			t.Parallel()
+			body, err := Encode(event(kind, witnessed, imported))
+			require.NoError(t, err)
+			require.Equal(t, imported, timeUSOf(t, body), "imported display value must win")
+		})
+	}
+
+	// v2 path covers all kinds including #sync.
+	for _, kind := range []segment.Kind{segment.KindCreate, segment.KindIdentity, segment.KindAccount, segment.KindSync} {
+		t.Run("v2_unimported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+			t.Parallel()
+			body, err := EncodeV2(event(kind, witnessed, 0))
+			require.NoError(t, err)
+			require.Equal(t, witnessed, timeUSOf(t, body), "unimported must fall back to witnessed")
+		})
+		t.Run("v2_imported_"+string(rune('0'+int(kind))), func(t *testing.T) {
+			t.Parallel()
+			body, err := EncodeV2(event(kind, witnessed, imported))
+			require.NoError(t, err)
+			require.Equal(t, imported, timeUSOf(t, body), "imported display value must win")
+		})
+	}
+}
+
 func TestEncode_CursorOmittedWhenZero(t *testing.T) {
 	t.Parallel()
 	evt := &segment.Event{
-		Seq:        0,
-		IndexedAt:  1_700_000_000_000_000,
-		Kind:       segment.KindCreate,
-		DID:        "did:plc:test",
-		Collection: "app.bsky.feed.post",
-		Rkey:       "abc",
-		Rev:        "rev1",
-		Payload:    []byte{0xa0},
+		Seq:         0,
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindCreate,
+		DID:         "did:plc:test",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "abc",
+		Rev:         "rev1",
+		Payload:     []byte{0xa0},
 	}
 	body, err := Encode(evt)
 	require.NoError(t, err)

@@ -18,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const testIndexedAt int64 = 1_700_000_000_000_000
+const testWitnessedAt int64 = 1_700_000_000_000_000
 
 // buildCommit constructs a real #commit event with the given
 // (collection, rkey) record creates. Each create writes a tiny CBOR
@@ -90,7 +90,7 @@ func TestConvertEvent_CommitCreate(t *testing.T) {
 		struct{ Coll, Rkey string }{"app.bsky.feed.like", "rec1"},
 	)
 
-	got, err := ConvertEvent(evt, testIndexedAt)
+	got, err := ConvertEvent(evt, testWitnessedAt)
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 
@@ -107,7 +107,7 @@ func TestConvertEvent_CommitCreate(t *testing.T) {
 		require.Equal(t, want.coll, ev.Collection)
 		require.Equal(t, want.rkey, ev.Rkey)
 		require.Equal(t, "3l3qo2vutsw2b", ev.Rev)
-		require.Equal(t, testIndexedAt, ev.IndexedAt)
+		require.Equal(t, testWitnessedAt, ev.WitnessedAt)
 		require.Equal(t, uint64(0), ev.Seq, "Seq is allocated downstream by ingest.Writer")
 		require.Equal(t, int64(42), ev.UpstreamRelayCursor)
 		require.Equal(t, want.payload, ev.Payload)
@@ -125,12 +125,12 @@ func TestConvertEvent_Identity(t *testing.T) {
 	}
 	evt := streaming.Event{Seq: 99, Identity: id}
 
-	got, err := ConvertEvent(evt, testIndexedAt)
+	got, err := ConvertEvent(evt, testWitnessedAt)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, segment.KindIdentity, got[0].Kind)
 	require.Equal(t, "did:plc:bbb", got[0].DID)
-	require.Equal(t, testIndexedAt, got[0].IndexedAt)
+	require.Equal(t, testWitnessedAt, got[0].WitnessedAt)
 	require.Equal(t, int64(99), got[0].UpstreamRelayCursor)
 
 	// Round-trip the payload to confirm faithful serialization.
@@ -155,7 +155,7 @@ func TestConvertEvent_Account(t *testing.T) {
 	}
 	evt := streaming.Event{Seq: 100, Account: acc}
 
-	got, err := ConvertEvent(evt, testIndexedAt)
+	got, err := ConvertEvent(evt, testWitnessedAt)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, segment.KindAccount, got[0].Kind)
@@ -182,7 +182,7 @@ func TestConvertEvent_Sync(t *testing.T) {
 	}
 	evt := streaming.Event{Seq: 101, Sync: sync}
 
-	got, err := ConvertEvent(evt, testIndexedAt)
+	got, err := ConvertEvent(evt, testWitnessedAt)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, segment.KindSync, got[0].Kind)
@@ -209,7 +209,7 @@ func TestConvertEvent_AsyncResyncEmptyRepoEmitsSyncTombstone(t *testing.T) {
 		Resync: streaming.ResyncAsync,
 	}
 
-	got, err := ConvertEvent(evt, testIndexedAt)
+	got, err := ConvertEvent(evt, testWitnessedAt)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, segment.KindSync, got[0].Kind)
@@ -226,7 +226,7 @@ func TestConvertEvent_AsyncResyncEmptyRepoEmitsSyncTombstone(t *testing.T) {
 func TestConvertEvent_ResyncWithoutSyncEnvelopeErrors(t *testing.T) {
 	t.Parallel()
 
-	got, err := ConvertEvent(streaming.Event{Resync: streaming.ResyncAsync}, testIndexedAt)
+	got, err := ConvertEvent(streaming.Event{Resync: streaming.ResyncAsync}, testWitnessedAt)
 	require.ErrorIs(t, err, ErrUnknownEventKind)
 	require.Contains(t, err.Error(), "resync event missing sync envelope")
 	require.Nil(t, got)
@@ -235,7 +235,7 @@ func TestConvertEvent_ResyncWithoutSyncEnvelopeErrors(t *testing.T) {
 func TestConvertEvent_InfoEmits_Nothing(t *testing.T) {
 	t.Parallel()
 	evt := streaming.Event{Info: &comatproto.SyncSubscribeRepos_Info{}}
-	got, err := ConvertEvent(evt, testIndexedAt)
+	got, err := ConvertEvent(evt, testWitnessedAt)
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
@@ -247,7 +247,7 @@ func TestConvertEvent_InfoEmits_Nothing(t *testing.T) {
 // in consumer.processBatch.
 func TestConvertEvent_EmptyEvent_UnknownKind(t *testing.T) {
 	t.Parallel()
-	got, err := ConvertEvent(streaming.Event{Seq: 7}, testIndexedAt)
+	got, err := ConvertEvent(streaming.Event{Seq: 7}, testWitnessedAt)
 	require.ErrorIs(t, err, ErrUnknownEventKind)
 	require.Nil(t, got)
 }
@@ -285,7 +285,7 @@ func TestConvertEvent_CommitDelete_PayloadNil(t *testing.T) {
 		Blocks: carBuf.Bytes(),
 	}
 
-	got, err := ConvertEvent(streaming.Event{Seq: 5, Commit: commit}, testIndexedAt)
+	got, err := ConvertEvent(streaming.Event{Seq: 5, Commit: commit}, testWitnessedAt)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, segment.KindDelete, got[0].Kind)
@@ -333,7 +333,7 @@ func TestConvertEvent_CommitMissingCAR_DropsBadOpKeepsRest(t *testing.T) {
 		evt.Commit.Ops[0], orphanOp, evt.Commit.Ops[1],
 	}
 
-	got, err := ConvertEvent(evt, testIndexedAt)
+	got, err := ConvertEvent(evt, testWitnessedAt)
 
 	// The typed error must be reachable via errors.AsType, carrying
 	// per-op detail.
@@ -376,7 +376,7 @@ func TestConvertEvent_CommitResync(t *testing.T) {
 	// resolution.
 	evt.Commit.Ops[0].Action = "resync"
 
-	got, err := ConvertEvent(evt, testIndexedAt)
+	got, err := ConvertEvent(evt, testWitnessedAt)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, segment.KindCreateResync, got[0].Kind, "ActionResync must map to KindCreateResync")
@@ -416,7 +416,7 @@ func TestConvertEvent_CommitUnknownAction_Errors(t *testing.T) {
 		Blocks: carBuf.Bytes(),
 	}
 
-	_, err = ConvertEvent(streaming.Event{Commit: commit}, testIndexedAt)
+	_, err = ConvertEvent(streaming.Event{Commit: commit}, testWitnessedAt)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unknown commit action")
 }

@@ -36,7 +36,7 @@ func decodeSegmentEventInto(ev *segment.Event, commit *Commit, mode recordDecode
 	out := Event{
 		DID:    ev.DID,
 		Seq:    ev.Seq,
-		TimeUS: ev.IndexedAt,
+		TimeUS: ev.DisplayTimeUS(),
 	}
 	switch ev.Kind {
 	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:

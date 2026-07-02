@@ -43,7 +43,7 @@ func TestRun_ResumeFromMerging_AdvancesToSteadyState(t *testing.T) {
 	// seals data/segments/, removes data/backfill/, and the
 	// orchestrator advances phase=steady_state.
 	fix := newMergeFixture(t, [][]segment.Event{{
-		{Kind: segment.KindIdentity, DID: "did:plc:resume-test", IndexedAt: 1000},
+		{Kind: segment.KindIdentity, DID: "did:plc:resume-test", WitnessedAt: 1000},
 	}}, nil)
 
 	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
@@ -80,7 +80,7 @@ func TestRun_CrashAfterSteadyPhaseBeforeSteadyRunLeavesSteadyPhase(t *testing.T)
 	t.Parallel()
 
 	fix := newMergeFixture(t, [][]segment.Event{{
-		{Kind: segment.KindIdentity, DID: "did:plc:steady-crash", IndexedAt: 1000},
+		{Kind: segment.KindIdentity, DID: "did:plc:steady-crash", WitnessedAt: 1000},
 	}}, nil)
 	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 

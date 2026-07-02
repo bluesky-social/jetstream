@@ -22,12 +22,12 @@ import (
 // file on disk; the four bound fields support cursor-resolution lookups
 // without touching the file again.
 type SegmentBounds struct {
-	Idx          uint64
-	Path         string
-	MinSeq       uint64
-	MaxSeq       uint64
-	MinIndexedAt int64
-	MaxIndexedAt int64
+	Idx            uint64
+	Path           string
+	MinSeq         uint64
+	MaxSeq         uint64
+	MinWitnessedAt int64
+	MaxWitnessedAt int64
 }
 
 // SegmentMetadata is the immutable metadata manifest keeps resident for
@@ -64,8 +64,8 @@ type SegmentTreeStats struct {
 	NewestMTime       time.Time
 	MinSeq            uint64
 	MaxSeq            uint64
-	MinIndexedAt      int64
-	MaxIndexedAt      int64
+	MinWitnessedAt    int64
+	MaxWitnessedAt    int64
 	LatestSegment     *SegmentSummary
 	Collections       []CollectionStats
 }
@@ -79,8 +79,8 @@ type SegmentSummary struct {
 	CollectionCount int
 	MinSeq          uint64
 	MaxSeq          uint64
-	MinIndexedAt    int64
-	MaxIndexedAt    int64
+	MinWitnessedAt  int64
+	MaxWitnessedAt  int64
 	SizeBytes       int64
 }
 
@@ -95,14 +95,14 @@ type CollectionStats struct {
 // SegmentListEntry is the lightweight per-segment row returned by ListFrom.
 // It deliberately excludes blooms, block indexes, and the file path.
 type SegmentListEntry struct {
-	Idx          uint64
-	SizeBytes    int64
-	Checksum     uint64
-	EventCount   uint32
-	MinSeq       uint64
-	MaxSeq       uint64
-	MinIndexedAt int64
-	MaxIndexedAt int64
+	Idx            uint64
+	SizeBytes      int64
+	Checksum       uint64
+	EventCount     uint32
+	MinSeq         uint64
+	MaxSeq         uint64
+	MinWitnessedAt int64
+	MaxWitnessedAt int64
 }
 
 // SegmentFileRef is what a download handler needs to serve one sealed
@@ -142,6 +142,17 @@ type Manifest struct {
 	segments []SegmentMetadata // sorted by Idx ascending
 	loadErr  error
 	ready    chan struct{}
+
+	// generation increments (under mu) on every mutation of the resident
+	// segment set that could change which segments or blocks a DID resolves
+	// to: initial load, seal, and compaction refresh. The Phase B import
+	// bucketer caches DID->candidate-segment selections and tags each entry
+	// with the generation it was computed under; a lookup at a newer
+	// generation is a forced miss that recomputes against the current
+	// manifest. This is what keeps that cache provably consistent with the
+	// manifest at point-of-use, so a segment sealed mid-import cannot cause a
+	// stale cache to silently misroute (drop) a row's patch.
+	generation uint64
 }
 
 // Open scans dir, parses every sealed seg_*.jss file's fixed header,
@@ -212,6 +223,7 @@ func (m *Manifest) load(ctx context.Context) error {
 	sort.Slice(m.segments, func(i, j int) bool {
 		return m.segments[i].Idx < m.segments[j].Idx
 	})
+	m.generation++
 	segmentCount := len(m.segments)
 	verr := validateSegmentSeqMonotonicity(m.segments)
 	m.mu.Unlock()
@@ -372,14 +384,14 @@ func (m *Manifest) ListFrom(startIdx uint64, limit int) (entries []SegmentListEn
 	for i := start; i < end; i++ {
 		meta := &m.segments[i]
 		entries = append(entries, SegmentListEntry{
-			Idx:          meta.Idx,
-			SizeBytes:    meta.FileSize,
-			Checksum:     meta.Header.Checksum,
-			EventCount:   meta.Header.EventCount,
-			MinSeq:       meta.Header.MinSeq,
-			MaxSeq:       meta.Header.MaxSeq,
-			MinIndexedAt: meta.Header.MinIndexedAt,
-			MaxIndexedAt: meta.Header.MaxIndexedAt,
+			Idx:            meta.Idx,
+			SizeBytes:      meta.FileSize,
+			Checksum:       meta.Header.Checksum,
+			EventCount:     meta.Header.EventCount,
+			MinSeq:         meta.Header.MinSeq,
+			MaxSeq:         meta.Header.MaxSeq,
+			MinWitnessedAt: meta.Header.MinWitnessedAt,
+			MaxWitnessedAt: meta.Header.MaxWitnessedAt,
 		})
 	}
 
@@ -420,11 +432,11 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 			if meta.Header.MaxSeq > stats.MaxSeq {
 				stats.MaxSeq = meta.Header.MaxSeq
 			}
-			if stats.MinIndexedAt == 0 || meta.Header.MinIndexedAt < stats.MinIndexedAt {
-				stats.MinIndexedAt = meta.Header.MinIndexedAt
+			if stats.MinWitnessedAt == 0 || meta.Header.MinWitnessedAt < stats.MinWitnessedAt {
+				stats.MinWitnessedAt = meta.Header.MinWitnessedAt
 			}
-			if meta.Header.MaxIndexedAt > stats.MaxIndexedAt {
-				stats.MaxIndexedAt = meta.Header.MaxIndexedAt
+			if meta.Header.MaxWitnessedAt > stats.MaxWitnessedAt {
+				stats.MaxWitnessedAt = meta.Header.MaxWitnessedAt
 			}
 		}
 		if meta.ModTime.Before(stats.OldestMTime) {
@@ -472,8 +484,8 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 		CollectionCount: len(latest.Collections),
 		MinSeq:          latest.Header.MinSeq,
 		MaxSeq:          latest.Header.MaxSeq,
-		MinIndexedAt:    latest.Header.MinIndexedAt,
-		MaxIndexedAt:    latest.Header.MaxIndexedAt,
+		MinWitnessedAt:  latest.Header.MinWitnessedAt,
+		MaxWitnessedAt:  latest.Header.MaxWitnessedAt,
 		SizeBytes:       latest.FileSize,
 	}
 	stats.Collections = make([]CollectionStats, 0, len(collections))
@@ -525,12 +537,12 @@ func readSealedMetadata(idx uint64, path string, verifyChecksum bool) (SegmentMe
 
 	return SegmentMetadata{
 		SegmentBounds: SegmentBounds{
-			Idx:          idx,
-			Path:         path,
-			MinSeq:       h.MinSeq,
-			MaxSeq:       h.MaxSeq,
-			MinIndexedAt: h.MinIndexedAt,
-			MaxIndexedAt: h.MaxIndexedAt,
+			Idx:            idx,
+			Path:           path,
+			MinSeq:         h.MinSeq,
+			MaxSeq:         h.MaxSeq,
+			MinWitnessedAt: h.MinWitnessedAt,
+			MaxWitnessedAt: h.MaxWitnessedAt,
 		},
 		FileSize:              info.Size(),
 		ModTime:               info.ModTime(),
@@ -585,15 +597,15 @@ func (m *Manifest) SegmentForSeq(seq uint64) (SegmentBounds, bool) {
 }
 
 // SegmentForTimeUS returns the smallest sealed segment whose
-// MaxIndexedAt >= timeUS. If timeUS is older than every sealed
+// MaxWitnessedAt >= timeUS. If timeUS is older than every sealed
 // segment, returns the first segment (caller then clamps to the
 // lookback floor). Returns (zero, false) only if timeUS is newer
 // than every sealed segment, or the manifest is empty.
 //
 // Timestamp ranges across segments may overlap slightly in the
 // presence of clock skew on the upstream relay; we still pick the
-// smallest segment whose MaxIndexedAt covers the request, which
-// gives the earliest possible event with indexed_at >= timeUS.
+// smallest segment whose MaxWitnessedAt covers the request, which
+// gives the earliest possible event with witnessed_at >= timeUS.
 func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
 	if err := m.waitReady(); err != nil {
 		return SegmentBounds{}, false
@@ -604,7 +616,7 @@ func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
 		return SegmentBounds{}, false
 	}
 	i := sort.Search(len(m.segments), func(i int) bool {
-		return m.segments[i].MaxIndexedAt >= timeUS
+		return m.segments[i].MaxWitnessedAt >= timeUS
 	})
 	if i == len(m.segments) {
 		return SegmentBounds{}, false
@@ -616,9 +628,9 @@ func (m *Manifest) SegmentForTimeUS(timeUS int64) (SegmentBounds, bool) {
 // retained under the given lookback duration, computed against the
 // segment bounds and the current wall clock.
 //
-// The result is conservative: we return the MinSeq / MinIndexedAt of
+// The result is conservative: we return the MinSeq / MinWitnessedAt of
 // the segment that contains (or is newer than) the floor timestamp,
-// not the exact event with indexed_at >= floor. This means cursor
+// not the exact event with witnessed_at >= floor. This means cursor
 // clamps may yield up to one segment's worth of extra lookback,
 // never less.
 //
@@ -636,15 +648,15 @@ func (m *Manifest) LookbackFloor(lookback time.Duration) (uint64, int64) {
 	}
 	floorTimeUS := time.Now().UnixMicro() - lookback.Microseconds()
 	i := sort.Search(len(m.segments), func(i int) bool {
-		return m.segments[i].MaxIndexedAt >= floorTimeUS
+		return m.segments[i].MaxWitnessedAt >= floorTimeUS
 	})
 	if i == len(m.segments) {
 		// All segments are older than the floor; clamp to the freshest
 		// segment's MinSeq (lookback is shorter than retention skew).
 		last := m.segments[len(m.segments)-1]
-		return last.MinSeq, last.MinIndexedAt
+		return last.MinSeq, last.MinWitnessedAt
 	}
-	return m.segments[i].MinSeq, m.segments[i].MinIndexedAt
+	return m.segments[i].MinSeq, m.segments[i].MinWitnessedAt
 }
 
 // OnSegmentSealed publishes a freshly-sealed segment into the manifest.
@@ -697,37 +709,68 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	i := sort.Search(len(m.segments), func(i int) bool {
-		return m.segments[i].Idx >= idx
+	// Build the refreshed set in a candidate copy and validate it BEFORE
+	// committing, so a rejected refresh leaves the resident set (and the
+	// generation) exactly as they were: serving paths must never observe the
+	// rejected metadata, and a generation-tagged cache entry (the import
+	// bucketer's) tagged with the unmoved generation must still describe the
+	// unmoved resident set.
+	next := make([]SegmentMetadata, len(m.segments), len(m.segments)+1)
+	copy(next, m.segments)
+	i := sort.Search(len(next), func(i int) bool {
+		return next[i].Idx >= idx
 	})
 	switch {
-	case i < len(m.segments) && m.segments[i].Idx == idx:
+	case i < len(next) && next[i].Idx == idx:
 		// In-place refresh of an existing segment (the compaction-rewrite
 		// path): the seq envelope is preserved across rewrites, so this can
 		// only re-validate an already-valid neighbour relationship. Still
 		// re-checked below so a genuinely corrupt refreshed header is caught.
-		m.segments[i] = meta
-	case i == len(m.segments):
-		m.segments = append(m.segments, meta)
+		next[i] = meta
+	case i == len(next):
+		next = append(next, meta)
 	default:
-		m.segments = append(m.segments, SegmentMetadata{})
-		copy(m.segments[i+1:], m.segments[i:])
-		m.segments[i] = meta
+		next = append(next, SegmentMetadata{})
+		copy(next[i+1:], next[i:])
+		next[i] = meta
 	}
 
 	// Enforce the cross-segment seq-monotonicity invariant the backfill planner
 	// (and SegmentForSeq/LookbackFloor) rely on. A refresh that introduces an
 	// out-of-order seq envelope is corrupt internal state; refuse it loudly
 	// rather than serve a manifest the planner would silently mis-paginate.
-	if verr := validateSegmentSeqMonotonicity(m.segments); verr != nil {
+	if verr := validateSegmentSeqMonotonicity(next); verr != nil {
 		return verr
 	}
+
+	m.segments = next
+	m.generation++
 
 	if m.opts.Metrics != nil {
 		m.opts.Metrics.SegmentsLoaded.Set(float64(len(m.segments)))
 		m.opts.Metrics.BlockIndexLoadSeconds.Observe(time.Since(start).Seconds())
 	}
 	return nil
+}
+
+// Generation returns a monotonic counter that strictly increases on every
+// mutation of the resident sealed-segment set that could change which
+// segments or blocks a DID resolves to: initial load, OnSegmentSealed, and
+// OnSegmentCompacted. Read-only queries never advance it.
+//
+// It exists for consumers that cache a manifest-derived selection and need a
+// cheap staleness check without diffing the segment set. The import Phase B
+// bucketer tags each cached DID->candidate-segment selection with the
+// generation it was computed under and discards (recomputes) any entry whose
+// generation is older than the current one, keeping the cache consistent with
+// the manifest at point-of-use.
+func (m *Manifest) Generation() uint64 {
+	if err := m.waitReady(); err != nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.generation
 }
 
 // ErrSegmentSeqOverlap reports that two sealed segments carry overlapping or

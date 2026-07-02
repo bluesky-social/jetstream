@@ -19,9 +19,9 @@ func TestRewriteDropsRowsAndKeepsEmptyBlocks(t *testing.T) {
 	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
 	require.NoError(t, err)
 	for _, ev := range []Event{
-		{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
-		{Seq: 2, IndexedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
-		{Seq: 3, IndexedAt: 30, Kind: KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 1, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 2, WitnessedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
+		{Seq: 3, WitnessedAt: 30, Kind: KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
 	} {
 		full, err := w.Append(ev)
 		require.NoError(t, err)
@@ -62,7 +62,7 @@ func TestRewriteDropsRowsAndKeepsEmptyBlocks(t *testing.T) {
 func TestRewriteZeroDropLeavesFileUntouched(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	path := sealedSegmentForReader(t, dir, []Event{{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a"}}, 2)
+	path := sealedSegmentForReader(t, dir, []Event{{Seq: 1, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a"}}, 2)
 	before, err := os.ReadFile(path)
 	require.NoError(t, err)
 	res, err := Rewrite(path, func(ev *Event) RowDecision { return RowKeep }, RewriteOptions{})
@@ -78,8 +78,8 @@ func TestRewritePreservesSourcePerBlockBloomParams(t *testing.T) {
 
 	dir := t.TempDir()
 	path := sealedSegmentForReader(t, dir, []Event{
-		{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a"},
-		{Seq: 2, IndexedAt: 20, Kind: KindCreate, DID: "did:plc:b"},
+		{Seq: 1, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, WitnessedAt: 20, Kind: KindCreate, DID: "did:plc:b"},
 	}, 2)
 
 	before, err := Open(ReaderConfig{Path: path})
@@ -112,7 +112,7 @@ func TestRewritePreservesSourcePerBlockBloomParams(t *testing.T) {
 func TestRewriteCandidateDIDsSkipDisjointSegment(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	path := sealedSegmentForReader(t, dir, []Event{{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a"}}, 2)
+	path := sealedSegmentForReader(t, dir, []Event{{Seq: 1, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a"}}, 2)
 	res, err := Rewrite(path, func(*Event) RowDecision {
 		t.Fatal("decider must not run when candidate DIDs miss the segment bloom")
 		return RowKeep
@@ -137,8 +137,8 @@ func TestRewriteCrashSeams(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			path := sealedSegmentForReader(t, t.TempDir(), []Event{
-				{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a"},
-				{Seq: 2, IndexedAt: 20, Kind: KindDelete, DID: "did:plc:a"},
+				{Seq: 1, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a"},
+				{Seq: 2, WitnessedAt: 20, Kind: KindDelete, DID: "did:plc:a"},
 			}, 2)
 
 			crashErr := errors.New("simulated segment rewrite crash")
@@ -189,9 +189,9 @@ func TestRewriteAllDropProducesValidSealedSegment(t *testing.T) {
 	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
 	require.NoError(t, err)
 	events := []Event{
-		{Seq: 5, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
-		{Seq: 6, IndexedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
-		{Seq: 7, IndexedAt: 30, Kind: KindUpdate, DID: "did:plc:b", Collection: "c", Rkey: "r3"},
+		{Seq: 5, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 6, WitnessedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
+		{Seq: 7, WitnessedAt: 30, Kind: KindUpdate, DID: "did:plc:b", Collection: "c", Rkey: "r3"},
 	}
 	for _, ev := range events {
 		full, err := w.Append(ev)
@@ -234,8 +234,8 @@ func TestRewritePreservesSeqEnvelopeWhenEdgeRowsDrop(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	path := sealedSegmentForReader(t, dir, []Event{
-		{Seq: 10, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
-		{Seq: 11, IndexedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
+		{Seq: 10, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 11, WitnessedAt: 20, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r2"},
 	}, 4)
 
 	res, err := Rewrite(path, func(ev *Event) RowDecision {
@@ -259,7 +259,7 @@ func TestRewritePreservesSeqEnvelopeWhenEdgeRowsDrop(t *testing.T) {
 func TestRewriteZeroDropKeepsInodeAndMtime(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	path := sealedSegmentForReader(t, dir, []Event{{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a"}}, 2)
+	path := sealedSegmentForReader(t, dir, []Event{{Seq: 1, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a"}}, 2)
 	before, err := os.Stat(path)
 	require.NoError(t, err)
 
@@ -282,8 +282,8 @@ func TestRewriteZeroDropKeepsInodeAndMtime(t *testing.T) {
 func FuzzRewrite(f *testing.F) {
 	dir := f.TempDir()
 	seedPath := sealedSegmentForReader(f, dir, []Event{
-		{Seq: 1, IndexedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
-		{Seq: 2, IndexedAt: 20, Kind: KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 1, WitnessedAt: 10, Kind: KindCreate, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
+		{Seq: 2, WitnessedAt: 20, Kind: KindDelete, DID: "did:plc:a", Collection: "c", Rkey: "r1"},
 	}, 2)
 	seed, err := os.ReadFile(seedPath)
 	if err != nil {

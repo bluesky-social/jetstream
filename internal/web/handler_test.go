@@ -82,8 +82,8 @@ func newFixtureSnap() *status.Snapshot {
 						CollectionCount: 3,
 						MinSeq:          100,
 						MaxSeq:          1233,
-						MinIndexedAt:    time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
-						MaxIndexedAt:    time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+						MinWitnessedAt:  time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
+						MaxWitnessedAt:  time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
 						SizeBytes:       512 * 1024,
 					},
 				},
@@ -107,8 +107,8 @@ func newFixtureSnap() *status.Snapshot {
 				DiskBytes:         5 * 1024 * 1024,
 				MinSeq:            100,
 				MaxSeq:            1233,
-				MinIndexedAt:      time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
-				MaxIndexedAt:      time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+				MinWitnessedAt:    time.Date(2026, 5, 24, 0, 0, 0, 0, time.UTC),
+				MaxWitnessedAt:    time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
 			},
 		},
 		Pebble: status.PebbleStats{
@@ -199,11 +199,96 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "12,345")       // Network event count via humanInt
 	require.Contains(t, body, "[100, 1,233]") // Seq range
 	require.Contains(t, body, "2026-05-24")
-	require.Contains(t, body, "Indexed range")
+	require.Contains(t, body, "Witnessed range")
 	require.Contains(t, body, "overflow-wrap: anywhere")
 	require.Contains(t, body, "Segment Files")
 	require.NotContains(t, body, "Top failing hosts")
 	require.NotContains(t, body, `<h2>Collections</h2>`)
+}
+
+func TestHandler_OmitsImportPanelWhenNoImport(t *testing.T) {
+	t.Parallel()
+	src := &fakeSnapshotter{snap: newFixtureSnap()} // Import is nil
+	h, err := web.New(web.Options{Snapshotter: src})
+	require.NoError(t, err)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.NotContains(t, rr.Body.String(), "Timestamp import")
+}
+
+func TestHandler_RendersImportPanel(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Import = &status.ImportInfo{
+		JobID:            "20260525T120000.000Z-abcd",
+		State:            "complete",
+		Phase:            "apply",
+		SubmittedAt:      time.Date(2026, 5, 25, 11, 0, 0, 0, time.UTC),
+		FinishedAt:       time.Date(2026, 5, 25, 11, 30, 0, 0, time.UTC),
+		Bucketed:         true,
+		SegmentsToApply:  4,
+		SegmentsApplied:  4,
+		RowsValid:        1000,
+		RowsRejected:     3,
+		SegmentsExamined: 4,
+		SegmentsPatched:  4,
+		RowsMutated:      2500,
+	}
+	src := &fakeSnapshotter{snap: s}
+	h, err := web.New(web.Options{
+		Snapshotter: src,
+		Now:         func() time.Time { return time.Date(2026, 5, 25, 12, 0, 5, 0, time.UTC) },
+	})
+	require.NoError(t, err)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	body := rr.Body.String()
+	require.Contains(t, body, "Timestamp import")
+	require.Contains(t, body, "20260525T120000.000Z-abcd")
+	require.Contains(t, body, "complete")
+	require.Contains(t, body, "4 / 4") // segments applied / to apply
+	require.Contains(t, body, "1,000 valid, 3 rejected")
+	require.Contains(t, body, "2,500") // rows mutated
+}
+
+// TestHandler_RendersNoOpImportOutcome: a completed idempotent re-import
+// (segments examined, zero patched/mutated) must still render its outcome —
+// "0 of N examined" is the result the operator ran it for.
+func TestHandler_RendersNoOpImportOutcome(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Import = &status.ImportInfo{
+		JobID:            "20260525T130000.000Z-noop",
+		State:            "complete",
+		Phase:            "apply",
+		SubmittedAt:      time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+		FinishedAt:       time.Date(2026, 5, 25, 12, 5, 0, 0, time.UTC),
+		Bucketed:         true,
+		RowsValid:        1000,
+		SegmentsExamined: 4,
+		SegmentsPatched:  0,
+		RowsMutated:      0,
+	}
+	src := &fakeSnapshotter{snap: s}
+	h, err := web.New(web.Options{
+		Snapshotter: src,
+		Now:         func() time.Time { return time.Date(2026, 5, 25, 12, 10, 0, 0, time.UTC) },
+	})
+	require.NoError(t, err)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status", nil)
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	body := rr.Body.String()
+	require.Contains(t, body, "Segments patched")
+	require.Contains(t, body, "0 of 4 examined")
+	require.Contains(t, body, "Rows mutated")
 }
 
 func TestHandler_RendersUnknownBackfillDurationForOldSteadyStateData(t *testing.T) {

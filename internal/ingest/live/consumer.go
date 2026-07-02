@@ -386,12 +386,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 // processBatch writes one batch of decoded events into the writer.
 func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
-		indexedAt := c.cfg.now().UnixMicro()
+		witnessedAt := c.cfg.now().UnixMicro()
 
 		for _, evt := range batch {
 			c.cfg.Metrics.incEventsReceived()
 
-			segEvts, err := ConvertEvent(evt, indexedAt)
+			segEvts, err := ConvertEvent(evt, witnessedAt)
 			dme, isDropped := errors.AsType[*DroppedMissingBlocksError](err)
 			switch {
 			case errors.Is(err, ErrUnknownEventKind):

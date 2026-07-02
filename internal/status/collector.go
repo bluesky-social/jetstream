@@ -33,6 +33,10 @@ type Options struct {
 	// IdentityResolver resolves one operator-supplied handle on the accounts
 	// tab. Optional; nil means handle lookup is limited to the local index.
 	IdentityResolver identity.Resolver
+
+	// ImportReporter yields the current/most-recent timestamp-import job for
+	// the status page. Optional; nil means the import panel is omitted.
+	ImportReporter ImportReporter
 }
 
 // Collector builds Snapshots on demand. Concurrent callers share one

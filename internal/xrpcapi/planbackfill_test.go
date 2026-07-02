@@ -46,14 +46,14 @@ type planResp struct {
 
 func planEvent(seq uint64, did, collection string) segment.Event {
 	return segment.Event{
-		Seq:        seq,
-		IndexedAt:  int64(1_730_000_000_000_000 + seq),
-		Kind:       segment.KindCreate,
-		DID:        did,
-		Collection: collection,
-		Rkey:       "rkey",
-		Rev:        "rev",
-		Payload:    []byte{0xa0},
+		Seq:         seq,
+		WitnessedAt: int64(1_730_000_000_000_000 + seq),
+		Kind:        segment.KindCreate,
+		DID:         did,
+		Collection:  collection,
+		Rkey:        "rkey",
+		Rev:         "rev",
+		Payload:     []byte{0xa0},
 	}
 }
 

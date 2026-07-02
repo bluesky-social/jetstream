@@ -12,6 +12,7 @@ import (
 	"time"
 
 	identcache "github.com/bluesky-social/jetstream/internal/identity"
+	"github.com/bluesky-social/jetstream/internal/importer"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
@@ -52,6 +53,9 @@ type Runtime struct {
 	tail           *subscribe.Tail
 	verifier       *atmossync.Verifier
 	orchestrator   *orchestrator.Orchestrator
+	importer       *importer.Manager
+	importRunCtx   context.Context
+	cancelImport   context.CancelFunc
 	server         *server.Server
 
 	closeMu sync.Mutex
@@ -237,27 +241,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		SkipHandleVerification: true,
 	}
 
-	statusCollector, err := status.New(status.Options{
-		Store:            metaStore,
-		DataDir:          opts.DataDir,
-		Manifest:         mft,
-		CursorLookback:   opts.CursorLookback,
-		IdentityResolver: resolver,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build status collector: %w", err))
-	}
-
-	statusHandler, err := web.New(web.Options{
-		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(opts.DataDir, resolver, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
-		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
-		Logger:                     processLogger,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build status handler: %w", err))
-	}
-
 	stateStore := syncstate.New(metaStore)
 	tombstones := tombstone.New()
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
@@ -360,6 +343,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		IngestOnAfterSeal:          mft.OnSegmentSealed,
 		OnSegmentCompacted:         onSegmentCompacted,
 		SegmentManifestChecksums:   mft.SegmentChecksums,
+		ImportSelector:             mft,
+		ImportMetrics:              orchestrator.NewImportMetrics(metrics.Registry),
 		CompactionInterval:         opts.CompactionInterval,
 		CompactionTombstoneCap:     opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers:   opts.CompactionRewriteWorkers,
@@ -378,6 +363,57 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: build orchestrator: %w", err))
 	}
 	rt.orchestrator = orch
+
+	// Timestamp-import job manager (design §8 M6). Always constructed so the
+	// endpoints exist and return a secure-by-default 401 when no token is set;
+	// the manager confines CSV paths to the import dir and shares the
+	// orchestrator's rewrite lock via RunImport. The import dir defaults to
+	// <data-dir>/imports; per-job scratch (offset files) lives under
+	// <data-dir>/import-scratch, kept separate from the operator's staged CSVs.
+	importDir := opts.TimestampImportDir
+	if importDir == "" {
+		importDir = filepath.Join(opts.DataDir, "imports")
+	}
+	if err := os.MkdirAll(importDir, 0o755); err != nil {
+		return fail(fmt.Errorf("serve: create import dir %s: %w", importDir, err))
+	}
+	importRunCtx, cancelImport := context.WithCancel(context.Background())
+	rt.importRunCtx = importRunCtx
+	rt.cancelImport = cancelImport
+	importMgr, err := importer.New(importer.Config{
+		Store:      metaStore,
+		Runner:     orch,
+		ImportDir:  importDir,
+		ScratchDir: filepath.Join(opts.DataDir, "import-scratch"),
+		Logger:     processLogger,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build import manager: %w", err))
+	}
+	rt.importer = importMgr
+
+	// Status collector + handler are built here (after the import manager) so
+	// the status page can surface the current import job.
+	statusCollector, err := status.New(status.Options{
+		Store:            metaStore,
+		DataDir:          opts.DataDir,
+		Manifest:         mft,
+		CursorLookback:   opts.CursorLookback,
+		IdentityResolver: resolver,
+		ImportReporter:   importReporter{mgr: importMgr},
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build status collector: %w", err))
+	}
+	statusHandler, err := web.New(web.Options{
+		Snapshotter:                statusCollector,
+		RepoActions:                web.NewRepoActions(opts.DataDir, resolver, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
+		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
+		Logger:                     processLogger,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build status handler: %w", err))
+	}
 
 	srv := server.New(server.Config{
 		PublicAddr:      opts.PublicAddr,
@@ -437,6 +473,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		},
 		Metrics: xrpcMetrics,
 		Tracer:  obs.Tracer("xrpcapi"),
+		Import: xrpcapi.ImportConfig{
+			Manager: importMgr,
+			Token:   opts.TimestampImportToken,
+			RunCtx:  importRunCtx,
+		},
 	})
 	srv.RegisterPublicRoute("/xrpc/", xrpcSrv.Handler())
 	rt.server = srv
@@ -482,6 +523,16 @@ func (r *Runtime) Run(ctx context.Context) error {
 	g.Go(func() error {
 		return r.orchestrator.Run(gctx)
 	})
+
+	// Auto-resume a timestamp-import job that a prior process left incomplete
+	// (design Q-RESUME). Best-effort: a resume failure is logged, not fatal —
+	// the archive still serves, and the operator can re-submit. The job's
+	// background run is rooted at importRunCtx (cancelled in Close), not gctx.
+	if r.importer != nil {
+		if err := r.importer.ResumeIncomplete(r.importRunCtx); err != nil {
+			r.logger.Warn("resume incomplete import failed", "err", err)
+		}
+	}
 
 	// Graceful client drain. Live websocket subscribers are hijacked
 	// connections, so http.Server.Shutdown neither tracks nor closes
@@ -544,6 +595,33 @@ func (r *Runtime) Close(ctx context.Context) error {
 	defer r.closeMu.Unlock()
 
 	var errs []error
+
+	// Stop any in-flight timestamp-import job and drain its goroutine BEFORE
+	// closing the metadata store: the manager writes job records + checkpoints
+	// to the store from its background run, and a write after Close would panic
+	// (pebble: closed). A cancelled run pauses (stays resumable), so the next
+	// boot picks it up.
+	if r.cancelImport != nil {
+		r.cancelImport()
+		r.cancelImport = nil
+	}
+	importDrained := true
+	if r.importer != nil {
+		if err := r.importer.Wait(ctx); err != nil {
+			// The import goroutine may still be about to write a checkpoint.
+			// Closing pebble under it converts a slow shutdown into a panic,
+			// so we leave the store open and let process exit tear it down —
+			// pebble's WAL recovers cleanly on the next boot.
+			importDrained = false
+			r.logger.Error("import drain did not complete within budget; leaving metadata store open", "err", err)
+			errs = append(errs, fmt.Errorf("import drain: %w", err))
+		} else {
+			// Only forget the importer once it actually drained: a repeated
+			// Close must re-wait, not skip straight to closing the store.
+			r.importer = nil
+		}
+	}
+
 	if r.verifier != nil {
 		if err := r.verifier.Close(); err != nil {
 			r.logger.Error("verifier close", "err", err)
@@ -558,7 +636,7 @@ func (r *Runtime) Close(ctx context.Context) error {
 	// verifier state run ahead of the archive. Pending (unpromoted)
 	// entries are deliberately dropped — their events' rows were never
 	// archived and redelivery re-verifies them.
-	if r.metaStore != nil {
+	if r.metaStore != nil && importDrained {
 		if err := r.metaStore.Close(); err != nil {
 			r.logger.Error("close metadata store", "err", err)
 			errs = append(errs, fmt.Errorf("close metadata store: %w", err))
@@ -589,6 +667,38 @@ func (r *Runtime) cancelManifestLoad() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// importReporter adapts *importer.Manager to status.ImportReporter, translating
+// the importer's Record into the status package's rendering view so status
+// stays decoupled from the importer's concrete types.
+type importReporter struct{ mgr *importer.Manager }
+
+func (r importReporter) CurrentImport() (status.ImportInfo, bool) {
+	rec, ok := r.mgr.Current()
+	if !ok {
+		return status.ImportInfo{}, false
+	}
+	return status.ImportInfo{
+		JobID:                 rec.ID,
+		State:                 string(rec.State),
+		Phase:                 string(rec.Phase),
+		Error:                 rec.Error,
+		SubmittedAt:           rec.SubmittedAt,
+		FinishedAt:            rec.FinishedAt,
+		Bucketed:              rec.Bucketed,
+		SegmentsToApply:       rec.SegmentsToApply,
+		SegmentsApplied:       rec.SegmentsApplied,
+		RowsTotal:             rec.RowsTotal,
+		RowsValid:             rec.RowsValid,
+		RowsRejected:          rec.RowsRejected,
+		SegmentsExamined:      rec.SegmentsExamined,
+		SegmentsPatched:       rec.SegmentsPatched,
+		RowsMutated:           rec.RowsMutated,
+		RowsMatchedSpecific:   rec.RowsMatchedSpecific,
+		SpecificCIDsUnmatched: rec.SpecificCIDsUnmatched,
+		RowsCorruptOffset:     rec.RowsCorruptOffset,
+	}, true
 }
 
 func phaseBarrier(barrier PhaseBarrier) orchestrator.PhaseBarrier {

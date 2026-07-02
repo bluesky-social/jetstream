@@ -19,8 +19,8 @@ type SealResult struct {
 	UniqueDIDCount uint32
 	MinSeq         uint64
 	MaxSeq         uint64
-	MinIndexedAt   int64
-	MaxIndexedAt   int64
+	MinWitnessedAt int64
+	MaxWitnessedAt int64
 	Checksum       uint64
 	FooterOffset   uint64
 	FileSize       int64
@@ -174,8 +174,8 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 		UniqueDIDCount: header.UniqueDIDCount,
 		MinSeq:         header.MinSeq,
 		MaxSeq:         header.MaxSeq,
-		MinIndexedAt:   header.MinIndexedAt,
-		MaxIndexedAt:   header.MaxIndexedAt,
+		MinWitnessedAt: header.MinWitnessedAt,
+		MaxWitnessedAt: header.MaxWitnessedAt,
 		Checksum:       checksum,
 		FooterOffset:   header.FooterOffset,
 		FileSize:       stat,
@@ -203,8 +203,8 @@ type blockWalkResult struct {
 	uniqueDIDs      map[string]struct{}
 	minSeq          uint64
 	maxSeq          uint64
-	minIndexedAt    int64
-	maxIndexedAt    int64
+	minWitnessedAt  int64
+	maxWitnessedAt  int64
 
 	// Per-block bloom inputs and collection IDs.
 	perBlockDIDs        []map[string]struct{}
@@ -215,7 +215,7 @@ type blockWalkResult struct {
 	collectionEventCounts []uint32 // parallel-indexed with collectionStringTable
 	collectionIDByName    map[string]uint32
 
-	// Did we see any events at all? minSeq/minIndexedAt are only
+	// Did we see any events at all? minSeq/minWitnessedAt are only
 	// meaningful when this is true.
 	sawAny bool
 }
@@ -318,8 +318,8 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 			if i == 0 {
 				info.MinSeq = ev.Seq
 				info.MaxSeq = ev.Seq
-				info.MinIndexedAt = ev.IndexedAt
-				info.MaxIndexedAt = ev.IndexedAt
+				info.MinWitnessedAt = ev.WitnessedAt
+				info.MaxWitnessedAt = ev.WitnessedAt
 			}
 			if ev.Seq < info.MinSeq {
 				info.MinSeq = ev.Seq
@@ -327,18 +327,18 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 			if ev.Seq > info.MaxSeq {
 				info.MaxSeq = ev.Seq
 			}
-			if ev.IndexedAt < info.MinIndexedAt {
-				info.MinIndexedAt = ev.IndexedAt
+			if ev.WitnessedAt < info.MinWitnessedAt {
+				info.MinWitnessedAt = ev.WitnessedAt
 			}
-			if ev.IndexedAt > info.MaxIndexedAt {
-				info.MaxIndexedAt = ev.IndexedAt
+			if ev.WitnessedAt > info.MaxWitnessedAt {
+				info.MaxWitnessedAt = ev.WitnessedAt
 			}
 
 			if !res.sawAny {
 				res.minSeq = ev.Seq
 				res.maxSeq = ev.Seq
-				res.minIndexedAt = ev.IndexedAt
-				res.maxIndexedAt = ev.IndexedAt
+				res.minWitnessedAt = ev.WitnessedAt
+				res.maxWitnessedAt = ev.WitnessedAt
 				res.sawAny = true
 			} else {
 				if ev.Seq < res.minSeq {
@@ -347,11 +347,11 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 				if ev.Seq > res.maxSeq {
 					res.maxSeq = ev.Seq
 				}
-				if ev.IndexedAt < res.minIndexedAt {
-					res.minIndexedAt = ev.IndexedAt
+				if ev.WitnessedAt < res.minWitnessedAt {
+					res.minWitnessedAt = ev.WitnessedAt
 				}
-				if ev.IndexedAt > res.maxIndexedAt {
-					res.maxIndexedAt = ev.IndexedAt
+				if ev.WitnessedAt > res.maxWitnessedAt {
+					res.maxWitnessedAt = ev.WitnessedAt
 				}
 			}
 
@@ -467,8 +467,8 @@ func buildFooterWithBloomParams(walk blockWalkResult, maxEventsPerBlock int, foo
 		UniqueDIDCount:        uint32(len(walk.uniqueDIDs)),
 		MinSeq:                walk.minSeq,
 		MaxSeq:                walk.maxSeq,
-		MinIndexedAt:          walk.minIndexedAt,
-		MaxIndexedAt:          walk.maxIndexedAt,
+		MinWitnessedAt:        walk.minWitnessedAt,
+		MaxWitnessedAt:        walk.maxWitnessedAt,
 		FooterOffset:          uint64(footerOffset),
 		DIDBloomOffset:        didBloomOffset,
 		BlockDIDBloomOffset:   blockDIDBloomOffset,

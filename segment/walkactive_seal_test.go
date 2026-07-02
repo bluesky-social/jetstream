@@ -23,7 +23,7 @@ func writeActiveWithFlushedBlocks(t *testing.T, path string, blocks, perBlock in
 	for range blocks {
 		for range perBlock {
 			full, err := w.Append(Event{
-				Seq: seq, IndexedAt: int64(seq) * 1000, Kind: KindCreate,
+				Seq: seq, WitnessedAt: int64(seq) * 1000, Kind: KindCreate,
 				DID: "did:plc:walkseal", Collection: "app.bsky.feed.post",
 				Rkey: "r", Rev: "v", Payload: []byte{0xa0},
 			})

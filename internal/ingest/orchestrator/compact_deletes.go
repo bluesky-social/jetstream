@@ -75,7 +75,14 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 
 	return obs.Span(ctx, func(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
-		if err := removeStaleCompactionTemps(segmentsDir); err != nil {
+		// Cleanup must hold the rewrite lock: a timestamp-import Phase C in
+		// flight has a live seg_*.jss.tmp open (segment.Patch), and unlinking
+		// it here would make the import's rename fail spuriously. Under the
+		// lock, any *.jss.tmp we see is genuinely stale — no rewrite is in
+		// flight while we hold it.
+		if err := o.withRewriteLock(func() error {
+			return removeStaleCompactionTemps(segmentsDir)
+		}); err != nil {
 			return err
 		}
 
@@ -161,7 +168,15 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			}
 
 			if !snap.Empty() {
-				if err := o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode); err != nil {
+				// Hold the rewrite lock for the segment-mutating chunk so a
+				// concurrent timestamp-import pass cannot race this on any
+				// segment's tmp+rename (design §3.3, §6 H). Scoped to the chunk
+				// (not the whole pass) so an import may interleave between
+				// chunks; that is safe because delete-rewrite preserves
+				// IndexedAt and both passes are per-segment atomic + idempotent.
+				if err := o.withRewriteLock(func() error {
+					return o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode)
+				}); err != nil {
 					return err
 				}
 			}
@@ -370,17 +385,27 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
 			return nil
 		})
 	}
+sendLoop:
 	for _, f := range sealed {
 		select {
 		case jobs <- f:
 		case <-gctx.Done():
-			close(jobs)
-			return g.Wait()
+			break sendLoop
 		}
 	}
 	close(jobs)
-	if err := g.Wait(); err != nil {
-		return err
+	waitErr := g.Wait()
+	// A cancel can land while every worker is mid-rewrite or idle: the send
+	// loop drops the undelivered segments and the workers return nil, so
+	// g.Wait() alone can be nil for a chunk that was cut short. Fold the
+	// context in — returning nil here would let the caller commit the chunk
+	// watermark and evict tombstones for rewrites that never ran, leaving
+	// superseded rows below the watermark alive permanently.
+	if waitErr == nil {
+		waitErr = ctx.Err()
+	}
+	if waitErr != nil {
+		return waitErr
 	}
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].file.Idx < results[j].file.Idx
@@ -572,37 +597,37 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 }
 
 func compactionWatermarkLagSeconds(sealed []sealedCompactionSegment, watermark uint64) float64 {
-	var tipIndexedAt int64
-	var watermarkIndexedAt int64
-	var oldestIndexedAt int64
+	var tipWitnessedAt int64
+	var watermarkWitnessedAt int64
+	var oldestWitnessedAt int64
 	for _, f := range sealed {
 		if f.header.EventCount == 0 {
 			continue
 		}
-		if f.header.MaxIndexedAt > tipIndexedAt {
-			tipIndexedAt = f.header.MaxIndexedAt
+		if f.header.MaxWitnessedAt > tipWitnessedAt {
+			tipWitnessedAt = f.header.MaxWitnessedAt
 		}
-		if oldestIndexedAt == 0 || f.header.MinIndexedAt < oldestIndexedAt {
-			oldestIndexedAt = f.header.MinIndexedAt
+		if oldestWitnessedAt == 0 || f.header.MinWitnessedAt < oldestWitnessedAt {
+			oldestWitnessedAt = f.header.MinWitnessedAt
 		}
-		if f.header.MaxSeq <= watermark && f.header.MaxIndexedAt > watermarkIndexedAt {
-			watermarkIndexedAt = f.header.MaxIndexedAt
+		if f.header.MaxSeq <= watermark && f.header.MaxWitnessedAt > watermarkWitnessedAt {
+			watermarkWitnessedAt = f.header.MaxWitnessedAt
 		}
 	}
 
-	if watermarkIndexedAt == 0 {
+	if watermarkWitnessedAt == 0 {
 		// Nothing compacted yet: without this floor the gauge would
 		// report tip-since-epoch (a false ~50-year spike on the
 		// operator paging signal). The honest lag is the span of
 		// uncompacted data.
-		watermarkIndexedAt = oldestIndexedAt
+		watermarkWitnessedAt = oldestWitnessedAt
 	}
 
-	if tipIndexedAt <= watermarkIndexedAt {
+	if tipWitnessedAt <= watermarkWitnessedAt {
 		return 0
 	}
 
-	return float64(tipIndexedAt-watermarkIndexedAt) / 1_000_000
+	return float64(tipWitnessedAt-watermarkWitnessedAt) / 1_000_000
 }
 
 // removeStaleCompactionTemps deletes leftover *.jss.tmp files from a

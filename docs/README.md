@@ -184,8 +184,8 @@ Jetstream Sealed Segment File (.jss):
 │   unique_did_count:        uint32                        │
 │   min_seq:                 uint64                        │
 │   max_seq:                 uint64                        │
-│   min_indexed_at:          int64   (unix micros)         │
-│   max_indexed_at:          int64   (unix micros)         │
+│   min_witnessed_at:        int64   (unix micros)         │
+│   max_witnessed_at:        int64   (unix micros)         │
 │   footer_offset:           uint64                        │
 │   did_bloom_offset:        uint64                        │
 │   block_did_bloom_offset:  uint64                        │
@@ -209,8 +209,8 @@ Jetstream Sealed Segment File (.jss):
 │     event_count:       uint32                            │
 │     min_seq:           uint64                            │
 │     max_seq:           uint64                            │
-│     min_indexed_at:    int64   (unix micros)             │
-│     max_indexed_at:    int64   (unix micros)             │
+│     min_witnessed_at:  int64   (unix micros)             │
+│     max_witnessed_at:  int64   (unix micros)             │
 │   DID Bloom Filter                                       │
 │     Serialized gloom.Filter (MarshalBinary)              │
 │     Covers all unique DIDs in this segment               │
@@ -308,8 +308,8 @@ Compressed block (single ZSTD frame):
 ├──────────────────────────────────────────────────────────┤
 │ Fixed-size columns (contiguous arrays):                  │
 │   seq[]              event_count × uint64 (LE)           │
+│   witnessed_at[]     event_count × int64  (LE)           │
 │   indexed_at[]       event_count × int64  (LE)           │
-│   rendered_at[]      event_count × int64  (LE)           │
 │   kind[]             event_count × uint8                 │
 │   collection_len[]   event_count × uint8                 │
 │   did_len[]          event_count × uint16                │
@@ -327,6 +327,8 @@ Compressed block (single ZSTD frame):
 ```
 
 The `event_count` field is required because record deletions may mean we have fewer than the configured max number of events per block.
+
+Each event carries two timestamps. `witnessed_at` is when this jetstream instance first saw the event; we assign it at ingestion and never change it, and it stays monotonic with the sequence number (our range scans and the `?cursor=<timestamp>` lookback rely on that). `indexed_at` is the "display" timestamp we hand to clients as `time_us`; it defaults to `witnessed_at` and a value of `0` means "not set, fall back to `witnessed_at`". Only a timestamp import (Section 8) writes `indexed_at`. Both are unix microseconds. This is the same two-column layout as before — the columns were previously named `indexed_at` and `rendered_at` — so the block bytes and the segment `version` are unchanged.
 
 The `kind` column is a `uint8` discriminator that identifies which firehose event type each row represents:
 
@@ -352,7 +354,7 @@ In the pebble kv store, we keep track of `compaction/seq`, the highest sequence 
 
 Tombstones are retained as event rows forever. Record tombstones come from `KindDelete` and `KindUpdate`; DID tombstones come from account deletes (`active=false`, `status=deleted`) and `KindSync`. Compaction physically removes only superseded `KindCreate` and `KindUpdate` rows older than the tombstone seq. Delete, account, identity, and sync rows are retained so mid-stream clients and future audit tooling can observe the event history.
 
-Segment rewrites preserve block topology and historical seq/indexed-at envelopes. A block whose rows are all dropped remains present as an `event_count=0` block, so manifest block indexes, cursor translation, and cold replay can continue to use stable block numbers across generations. Rewritten files get new checksums; HTTP downloads derive validators from the file descriptor they serve, and the subscribe block cache keys decoded blocks by segment checksum.
+Segment rewrites preserve block topology and historical seq/witnessed-at envelopes. A block whose rows are all dropped remains present as an `event_count=0` block, so manifest block indexes, cursor translation, and cold replay can continue to use stable block numbers across generations. Rewritten files get new checksums; HTTP downloads derive validators from the file descriptor they serve, and the subscribe block cache keys decoded blocks by segment checksum.
 
 We also store tombstones since the most recent compaction in memory in the server. This is purely a compaction-internal structure — it powers steady-state compaction and early cap-triggered passes (it gates when a pass runs and feeds the size gauge). There is **no read-time overlay endpoint**: the server never exposes the tombstone set to clients and never suppresses rows at delivery time. Backfill clients converge by folding the markers they receive inline (Section 4.4), not by downloading a separate suppression set.
 
@@ -394,7 +396,7 @@ data/
       seg_0000000000.jss
 ```
 
-Segments are named with a counter as a 10-digit zero-padded base-36 string. Segment files and seq ranges sort lexicographically in creation order. This means that all events in segment file 0 have indexed at timestamps before all events in segment file 1.
+Segments are named with a counter as a 10-digit zero-padded base-36 string. Segment files and seq ranges sort lexicographically in creation order. This means that all events in segment file 0 have witnessed at timestamps before all events in segment file 1.
 
 ### 3.5 Metadata Store
 
@@ -571,7 +573,7 @@ An example commit event looks like:
 }
 ```
 
-The `time_us` field is the jetstream v2 instance's own indexed at timestamp for the event in microseconds since the unix epoch. The `cursor` field is jetstream v2's monotonic per-event sequence number (a JSON number); clients that want to resume from a saved point pass `?cursor=N` on reconnect.
+The `time_us` field is the event's display timestamp in microseconds since the unix epoch: the `indexed_at` value if a timestamp import set one, otherwise the `witnessed_at` time jetstream first saw the event (see Section 8). Until an operator runs an import, every event's `time_us` is just its `witnessed_at`. The `cursor` field is jetstream v2's monotonic per-event sequence number (a JSON number); clients that want to resume from a saved point pass `?cursor=N` on reconnect.
 
 For backwards compatibility with jetstream v1, the server also accepts a v1-style unix-microsecond timestamp on the same `?cursor=` query parameter. The two namespaces are distinguished by magnitude: a value strictly less than 1×10^15 is interpreted as a v2 sequence number; a value greater than or equal to 1×10^15 is interpreted as a v1 unix-microsecond timestamp. The split is provably non-overlapping under our 36h lookback ceiling (any legitimate v1 timestamp within 36h of "now" is well above 10^15, and v2 seq won't approach 10^15 for centuries).
 
@@ -613,27 +615,52 @@ This is of course an implementation detail of the Bluesky-hosted instance. Other
 
 ## 8. Timestamp Import
 
-There is a requirement for building real-world AppViews with any new firehose indexer: they must retain the previous indexed at timestamps as the system that came before it.
+Any new firehose indexer has the same problem: it stamps every record with roughly the time it backfilled, so a post from 2022 looks like it was made today. `createdAt` doesn't save us — it's client-supplied and spoofable, which is both a bad product experience and a trust-and-safety hole. To build a real AppView you have to carry over the original indexer's timestamps. Bluesky's dataplane has been running since 2022 and has them; a fresh jetstream does not.
 
-Concretely, we can't rebuild the production Bluesky AppView unless we also carry over its indexed at timestamps because the created at timestamp (if present) is spoofable by the client. This can lead to a poor app experience and trust and safety concerns where users edit their timestamps to be misleading.
+So we keep two timestamps per event:
 
-If we don't import the existing indexed at timestamps at all, it would look like any post made before 2026 was indeed created in 2026. That's obviously not acceptable.
+- `witnessed_at` — when *this* jetstream first saw the event. We assign it at ingestion time and never change it. It's what our range scans and the `?cursor=<timestamp>` lookback are built on, so it has to stay honest and monotonic with the sequence number.
+- `indexed_at` — the timestamp we hand to clients as `time_us`, i.e. the one they should actually display. By default it's just `witnessed_at`, but an operator can overwrite it with the value the old indexer recorded. This is the "display" timestamp.
 
-To work around this, we are creating an optional bulk indexed at timestamp API where a jetstream operator can upload a large CSV of AT URIs and their preferred `rendered at` timestamp. The jetstream instance ensures that it stores both the indexed at timestamp (when did jetstream itself see the record) as well as the optional rendered at timestamp (when did the Bluesky AppView originally see the record). The subscribers of jetstream receive both timestamp values and can choose which one they'd prefer to use (usually the rendered at timestamp).
+Only the operator can change `indexed_at`, and it's off by default: the import endpoint is disabled and returns 401 unless a bearer token was configured at startup. We're not letting random callers rewrite timestamps.
 
-Only the operator of jetstream may alter timestamps. This is an authenticated feature.
+Imports run against a live server with no downtime. The operator stages a plain (uncompressed) CSV of AT URIs and timestamps somewhere on the box, then kicks off an import job pointing at that path. Uncompressed on purpose: the import records a byte offset for each valid row during its single streaming validation pass and seeks straight back to that row when it's time to patch, which a compressed stream can't do without re-scanning or spilling a plaintext copy — and the box already holds the multi-terabyte segment archive, so the extra disk is a cheap trade. Each row can say whether the timestamp applies to every version of the record (the default) or one specific version by CID. We key on AT URI rather than CID because the URI contains the DID, which lets the segment-level DID bloom do almost all the filtering for free; operators who only have CIDs can resolve them to URIs first.
 
-Rather than maintaining a separate timestamp table that has to be kept in sync alongside segments and replicated on its own channel, we apply timestamp imports directly into segment files as part of the upload operation. The flow is: the operator POSTs a large CSV; the server buckets the URIs by DID; the segment-level DID bloom narrows to candidate segments; the per-block DID blooms narrow to candidate blocks; and each candidate block is decompressed, its `rendered_at` column is patched for the matching rows, and the block is re-encoded.
+The job buckets the URIs by DID, uses the segment and per-block DID blooms to find candidate blocks, then decompresses each one and patches the `indexed_at` column for the matching rows. Rather than maintain a separate timestamp table that has to be kept in sync with the segments, we write straight into the segment files — the import piggybacks on the compaction machinery, so it shares the same rewrite path and re-seals touched segments with fresh checksums. It's the same atomic rewrite we already do for deletes, just mutating a column instead of dropping rows. Bad rows are skipped and reported rather than failing the whole import, and re-running is safe: an already-applied file just produces no changes.
 
-We require uploads to be keyed by AT URI rather than by CID. URIs contain the DID, which lets us use the existing segment-level DID bloom to do almost all the filtering work. CID-keyed imports would force either a full scan of every segment or a second per-segment bloom over CIDs; both are expensive enough that it's not worth paying for unless we see a concrete need. Operators that only have CIDs can resolve them upstream before uploading.
+Once the import has rewritten the affected segments, the manifest lists the new files and backfilling clients pick them up on their next segment listing. (The dropped Section 6 replication design would have pushed `segment_compacted` notifications to replicas; whatever HA mechanism replaces it must account for compacted-segment propagation.)
 
-Once the compaction pass has rewritten all affected segments and resealed them with new checksums, the manifest lists the new files and backfilling clients pick them up on their next segment listing. (The dropped Section 6 replication design would have pushed `segment_compacted` notifications to replicas; whatever HA mechanism replaces it must account for compacted-segment propagation.)
+### 8.1 Operating an import
+
+**Enable it.** Set a bearer token at startup: `--timestamp-import-token` (or `JETSTREAM_TIMESTAMP_IMPORT_TOKEN`). With no token the two endpoints always return 401 and are indistinguishable from "disabled" — that's the secure default. Stage the CSV under the confinement directory, which defaults to `<data-dir>/imports` and is overridable with `--timestamp-import-dir` (`JETSTREAM_TIMESTAMP_IMPORT_DIR`). The submitted path is resolved and confined to that directory; `..` traversal and symlinks that escape it are rejected.
+
+**Front it with TLS.** The token is a bearer secret. Jetstream serves plain HTTP and expects TLS to be terminated by your proxy, so terminate TLS in front of the import endpoint — jetstream does not enforce it in-process (an in-process check would inspect a connection that is already plaintext).
+
+**The two endpoints** (both bearer-gated, under `/xrpc/`):
+
+- `network.bsky.jetstream.importTimestamps` (procedure) — body `{ "path": "<file>" }`, where `<file>` is relative to the import directory (or an absolute path inside it). Returns `{ "job": "<id>" }`. Only one import runs at a time; a concurrent submit gets `409 ImportInProgress`. A bad path gets `400 InvalidPath`.
+- `network.bsky.jetstream.getImportStatus` (query) — `?job=<id>` (or omit it for the current/most-recent job) reports lifecycle state, phase, per-phase progress, and, on completion, the parse/mutation totals. The same summary appears on the operator `/status` page.
+
+**CSV schema.** Header row `uri,timestamp,scope,cid`. Column order is read from the header, so it need not be canonical, and the optional `scope`/`cid` columns can be omitted entirely. The header is strict: an unrecognized or duplicate column name fails the whole file up front (it's almost always a typo of a real column, and mis-mapping every row is worse than a loud error).
+
+- `uri` — `at://<did>/<collection>/<rkey>`. Required.
+- `timestamp` — RFC3339 (e.g. `2022-01-02T03:04:05Z`), parsed to microseconds. Required.
+- `scope` — `all_versions` (default when empty or absent) patches every create/update/resync sharing the URI; `specific_version` patches only the version whose stored DAG-CBOR payload recomputes to `cid`.
+- `cid` — required iff `scope=specific_version`, ignored otherwise.
+
+Bad data rows are skipped and counted, but a bare/unclosed quote aborts the file: it makes everything after it unparseable, so silently treating it as one bad row would drop the rest of the import.
+
+Sorting the CSV by DID is *recommended, not required*: it keeps the bucketer's per-DID cache warm (roughly one bloom lookup per distinct DID). Unsorted input is still correct, just with more cache misses.
+
+**`specific_version` needs per-version CIDs.** Only collections whose source kept full per-version history with CIDs can use it (e.g. `site.standard.document`). Sources that keep only the latest version of a record (like the `posts` table) can't supply a CID for historical versions — those use the `all_versions` default, which smears one timestamp across every version of the URI.
+
+**Crash safety.** Progress is checkpointed in the metadata store per segment, so a process restart auto-resumes the same job without re-submission and skips segments it already patched. Even if the checkpoint is lost the job is safe to re-run: an already-applied segment produces zero mutations and is skipped. There is no dry-run mode — a real run is safe to start and watch via `getImportStatus`.
 
 ## 9. FAQ
 
 1. **Why store data by indexed timestamp rather than collection?**
 
-> I did a v0 of this system storing data by collection, and it has some nice properties. If you only want to download `app.bsky.feed.post`, it's simple and efficient to do so. However, when creating real-world AppViews, the requirement to replay events in order for a single DID would require a k-way sort if we ordered by collection. That's a deal breaker. Ordering by indexed at timestamp has the property that events within a single DID are ordered in the order in which they were created (though there is no global ordering).
+> I did a v0 of this system storing data by collection, and it has some nice properties. If you only want to download `app.bsky.feed.post`, it's simple and efficient to do so. However, when creating real-world AppViews, the requirement to replay events in order for a single DID would require a k-way sort if we ordered by collection. That's a deal breaker. Ordering by witnessed at timestamp has the property that events within a single DID are ordered in the order in which they were created (though there is no global ordering).
 > 
 1. **What is the latency between a record being read from the live firehose and it being sent to client consumers during steady-state?**
 
@@ -674,5 +701,3 @@ Once the compaction pass has rewritten all affected segments and resealed them w
 8. https://github.com/jcalabro/gloom
 
 NOTE (jrc): we should treat the existing jetstream HTTP API surface as legacy, and is only there for backwards compatability. We will instead be building on XRPC. We’ll maintain the old surface, but also duplicate the existing API to XRPC, and all net-new stuff will be XRPC.
-
-NOTE (jrc): clarify rendered at vs. indexed at. it should not leak through to the user at all

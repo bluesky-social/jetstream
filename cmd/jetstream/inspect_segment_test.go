@@ -19,14 +19,14 @@ func makeSealedFixture(t *testing.T) string {
 	require.NoError(t, err)
 	for _, seq := range []uint64{1, 2, 3, 4} {
 		full, err := w.Append(segment.Event{
-			Seq:        seq,
-			IndexedAt:  int64(1_700_000_000_000_000) + int64(seq),
-			Kind:       segment.KindCreate,
-			DID:        "did:plc:demo",
-			Collection: "app.bsky.feed.post",
-			Rkey:       "r",
-			Rev:        "v",
-			Payload:    []byte("p"),
+			Seq:         seq,
+			WitnessedAt: int64(1_700_000_000_000_000) + int64(seq),
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:demo",
+			Collection:  "app.bsky.feed.post",
+			Rkey:        "r",
+			Rev:         "v",
+			Payload:     []byte("p"),
 		})
 		require.NoError(t, err)
 		if full {
@@ -318,10 +318,10 @@ func TestInspectSegmentCommand_RejectsMissingArg(t *testing.T) {
 	require.Contains(t, err.Error(), "expected exactly one path argument")
 }
 
-// TestRenderInspection_PerBlockIndexedAtColumns asserts the per-block
-// table includes min_indexed_at and max_indexed_at columns and emits
+// TestRenderInspection_PerBlockWitnessedAtColumns asserts the per-block
+// table includes min_witnessed_at and max_witnessed_at columns and emits
 // formatted timestamps for them.
-func TestRenderInspection_PerBlockIndexedAtColumns(t *testing.T) {
+func TestRenderInspection_PerBlockWitnessedAtColumns(t *testing.T) {
 	t.Parallel()
 
 	path := makeSealedFixture(t)
@@ -332,9 +332,9 @@ func TestRenderInspection_PerBlockIndexedAtColumns(t *testing.T) {
 	require.NoError(t, renderInspection(&buf, ins, "table", 100))
 
 	out := buf.String()
-	require.Contains(t, out, "min_indexed_at")
-	require.Contains(t, out, "max_indexed_at")
-	// makeSealedFixture seeds IndexedAt with 1_700_000_000_000_000 + seq,
+	require.Contains(t, out, "min_witnessed_at")
+	require.Contains(t, out, "max_witnessed_at")
+	// makeSealedFixture seeds WitnessedAt with 1_700_000_000_000_000 + seq,
 	// which renders as a 2023-11 timestamp. Spot-check the year prefix.
 	require.Contains(t, out, "2023-11-")
 }
