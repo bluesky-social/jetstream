@@ -11,7 +11,7 @@ import (
 
 // Error name constants for JetstreamGetImportStatus.
 const (
-	ErrJetstreamGetImportStatus_JobNotFound = "JobNotFound" // No import job matches the supplied id.
+	ErrJetstreamGetImportStatus_JobNotFound = "JobNotFound" // No import job matches the supplied id, or no job has ever run when the id is omitted.
 )
 
 // Precomputed JSON key tokens for JetstreamGetImportStatus_Output.

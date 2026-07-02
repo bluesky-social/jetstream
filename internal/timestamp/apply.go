@@ -84,12 +84,6 @@ func OpenRowReader(path string) (*RowReader, error) {
 // Close releases the underlying file.
 func (rr *RowReader) Close() error { return rr.f.Close() }
 
-// maxRowScanBytes bounds how far ReadRow reads from an offset while looking for
-// the row's terminating newline. A single import row is a URI + RFC3339 stamp +
-// short scope + CID -- well under 1 KiB; this ceiling stops a corrupt offset
-// (or a truncated file with no newline) from reading the whole file into RAM.
-const maxRowScanBytes = 64 * 1024
-
 // ReadRow reads and re-validates the CSV row that begins at off. It re-runs the
 // same validation Phase A applied, so a row that no longer validates (the file
 // changed underneath the offsets, or the offset is corrupt) is rejected rather
@@ -130,11 +124,19 @@ func (rr *RowReader) ReadRow(off int64) (Row, error) {
 	if prev[0] != '\n' {
 		return Row{}, fmt.Errorf("%w: offset %d is not at a row boundary", ErrCorruptOffset, off)
 	}
-	span := min(rr.size-off, maxRowScanBytes)
+	// MaxRowBytes is the Phase A ↔ Phase C contract (see the const in parse.go):
+	// Parse rejected any row this long, so a record that fills the whole window
+	// while more file remains was truncated by it — the offsets have desynced
+	// from the file. Reject it; a truncated suffix can still validate (e.g. rkey
+	// "rkey12345" cut to "rkey") and would patch the wrong record.
+	span := min(rr.size-off, MaxRowBytes)
 	sr := io.NewSectionReader(rr.f, off, span)
-	row, ok, err := parseOneRow(sr, off, rr.cols)
+	row, consumed, ok, err := parseOneRow(sr, off, rr.cols)
 	if err != nil {
 		return Row{}, err
+	}
+	if consumed >= span && off+span < rr.size {
+		return Row{}, fmt.Errorf("%w: row at offset %d exceeds %d bytes (truncated by the scan window)", ErrCorruptOffset, off, MaxRowBytes)
 	}
 	if !ok {
 		return Row{}, fmt.Errorf("%w: no valid row at offset %d", ErrCorruptOffset, off)

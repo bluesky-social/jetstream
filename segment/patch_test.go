@@ -3,6 +3,7 @@ package segment
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -146,6 +147,155 @@ func TestPatchMutatesOnlyDisplayColumn(t *testing.T) {
 				require.Equal(t, a.WitnessedAt, a.DisplayTimeUS())
 			}
 		}
+	}
+}
+
+// TestPatchFooterTailCopiedByteVerbatim pins the copy-verbatim contract at the
+// byte level: everything from the segment DID bloom onward (blooms +
+// collection index) must be byte-identical after a patch, and the re-encoded
+// block index must keep its length. Snapshot-based equality (decode + compare)
+// can't see a re-encode that round-trips; only bytes can.
+func TestPatchFooterTailCopiedByteVerbatim(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := sealedSegmentForReader(t, dir, patchFixtureEvents(), 2)
+
+	tailOf := func(path string) []byte {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		h, err := decodeHeader(data[:ReservedHeaderBytes])
+		require.NoError(t, err)
+		return data[h.DIDBloomOffset:]
+	}
+	beforeTail := tailOf(path)
+
+	res, err := Patch(path, func(ev *Event) bool {
+		ev.IndexedAt = 1_600_000_000_000_000
+		return true
+	}, PatchOptions{})
+	require.NoError(t, err)
+	require.True(t, res.Patched)
+
+	require.Equal(t, beforeTail, tailOf(path),
+		"bloom + collection-index tail must be byte-identical after a patch")
+}
+
+// TestPatchRejectsBloomOffsetPadding pins the padded-footer reject branch:
+// Patch re-derives DIDBloomOffset as FooterOffset+blockIndexLen when it
+// rebuilds the header, so a source file with padding between the block index
+// and the bloom (offsets valid and checksummed, but not contiguous) must be
+// rejected up front — copying its tail verbatim would silently reinterpret
+// the pad bytes as bloom bytes under a freshly-valid checksum.
+func TestPatchRejectsBloomOffsetPadding(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := sealedSegmentForReader(t, dir, patchFixtureEvents(), 2)
+
+	// Rebuild the file with pad bytes inserted between the block index and
+	// the DID bloom, shifting the bloom-and-onward offsets and re-checksumming
+	// so Open still accepts it.
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	h, err := decodeHeader(data[:ReservedHeaderBytes])
+	require.NoError(t, err)
+
+	const pad = 16
+	var out []byte
+	out = append(out, data[:h.DIDBloomOffset]...) // header + blocks + block index
+	out = append(out, make([]byte, pad)...)       // padding
+	out = append(out, data[h.DIDBloomOffset:]...) // bloom + rest, shifted
+	h.DIDBloomOffset += pad
+	h.BlockDIDBloomOffset += pad
+	h.CollectionIndexOffset += pad
+	headerBytes := encodeHeader(h)
+	checksum := xxh3HeaderFooter(headerBytes, out[h.FooterOffset:])
+	binary.LittleEndian.PutUint64(headerBytes[4:12], checksum)
+	copy(out[:ReservedHeaderBytes], headerBytes)
+	require.NoError(t, os.WriteFile(path, out, 0o644))
+
+	// The padded file still opens cleanly (offsets are monotonic and the
+	// checksum matches) — the reject must come from Patch's contiguity check.
+	r, err := Open(ReaderConfig{Path: path})
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+
+	_, err = Patch(path, func(ev *Event) bool {
+		ev.IndexedAt = 1
+		return true
+	}, PatchOptions{})
+	require.ErrorIs(t, err, ErrInvalidFooter)
+
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, out, after, "rejected patch must leave the source untouched")
+}
+
+// TestPatchBlocksTouchedCountsOnlyDirtyBlocks: BlocksTouched counts blocks
+// that were actually re-encoded, not every block scanned.
+func TestPatchBlocksTouchedCountsOnlyDirtyBlocks(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// Block size 2 over the 5-event fixture -> blocks {seq1,seq2} {seq3,seq4}
+	// {seq5}. Patching only seq 1 dirties exactly the first block.
+	path := sealedSegmentForReader(t, dir, patchFixtureEvents(), 2)
+
+	res, err := Patch(path, func(ev *Event) bool {
+		if ev.Seq == 1 {
+			ev.IndexedAt = 1_600_000_000_000_000
+			return true
+		}
+		return false
+	}, PatchOptions{})
+	require.NoError(t, err)
+	require.True(t, res.Patched)
+	require.EqualValues(t, 1, res.RowsMutated)
+	require.EqualValues(t, 1, res.BlocksTouched, "only the block holding seq 1 re-encodes")
+}
+
+// TestPatchLeavesNoTempFileOnFailure: every failure path (guard violation,
+// crash at each seam) must clean up or have already renamed the sibling .tmp —
+// a leftover would make the next rewrite of this segment fail its O_EXCL
+// create until the stale-temp sweep runs.
+func TestPatchLeavesNoTempFileOnFailure(t *testing.T) {
+	t.Parallel()
+
+	noTemps := func(t *testing.T, dir string) {
+		t.Helper()
+		matches, err := filepath.Glob(filepath.Join(dir, "*.tmp"))
+		require.NoError(t, err)
+		require.Empty(t, matches, "no .tmp may survive a failed patch")
+	}
+
+	t.Run("guard violation", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		path := sealedSegmentForReader(t, dir, patchFixtureEvents(), 2)
+		_, err := Patch(path, func(ev *Event) bool {
+			ev.Seq++
+			return true
+		}, PatchOptions{})
+		require.Error(t, err)
+		noTemps(t, dir)
+	})
+
+	for _, point := range []string{
+		CrashPointPatchTempWritten,
+		CrashPointPatchTempSynced,
+		CrashPointPatchRenamed,
+		CrashPointPatchDirSynced,
+	} {
+		t.Run(point, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := sealedSegmentForReader(t, dir, patchFixtureEvents(), 2)
+			crashErr := errors.New("simulated crash")
+			_, err := Patch(path, func(ev *Event) bool {
+				ev.IndexedAt = 1
+				return true
+			}, PatchOptions{CrashInjector: patchPointInjector{point: point, err: crashErr}})
+			require.ErrorIs(t, err, crashErr)
+			noTemps(t, dir)
+		})
 	}
 }
 

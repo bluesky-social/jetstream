@@ -345,7 +345,9 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 // eventGuard is a snapshot of every Event field a Patch mutate is forbidden
 // to touch. Comparing it before/after the mutate call is the tripwire that
 // keeps the verbatim-copied footer (blooms, collection index) and the
-// carried-over witnessed/seq envelope honest.
+// carried-over witnessed/seq envelope honest. UpstreamRelayCursor is
+// deliberately unguarded: the block format does not persist it (event.go), so
+// no mutation of it can reach disk.
 type eventGuard struct {
 	seq         uint64
 	witnessedAt int64

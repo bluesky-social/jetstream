@@ -191,12 +191,12 @@ func (o *Orchestrator) RunImport(ctx context.Context, job ImportJob) (ImportResu
 	})
 	// Fold the job's counters into metrics and reset the phase gauge to idle,
 	// on both the success and error paths (a partial result still carries the
-	// work done before the failure).
+	// work done before the failure). The partial result is also RETURNED with
+	// the error so the job manager can fold the same counters into the durable
+	// job record — a paused or failed run's progress must not vanish from
+	// status while the metrics remember it.
 	o.cfg.ImportMetrics.observeJob(start, result, err)
-	if err != nil {
-		return ImportResult{}, err
-	}
-	return result, nil
+	return result, err
 }
 
 // runImportBucket runs Phase A+B: parse the CSV and route each valid row's
@@ -276,7 +276,6 @@ func (o *Orchestrator) runImportApply(ctx context.Context, job ImportJob, result
 	if len(segments) == 0 {
 		return nil
 	}
-	result.SegmentsExamined = len(segments)
 
 	rr, err := timestamp.OpenRowReader(job.CSVPath)
 	if err != nil {
@@ -340,6 +339,15 @@ sendLoop:
 	}
 	close(jobs)
 	waitErr := g.Wait()
+	// A cancel can land while every worker is idling in `for seg := range jobs`:
+	// the send loop drops the undelivered segments, the workers drain nothing
+	// and return nil, and g.Wait() is nil even though the pass was cut short.
+	// Fold the context in so a paused run never reports success — the manager
+	// would otherwise mark the job complete and delete its checkpoint with
+	// segments still unapplied.
+	if waitErr == nil {
+		waitErr = ctx.Err()
+	}
 
 	// Fold results and refresh the manifest even when a worker errored:
 	// other workers may have durably rewritten segments (fsync+rename) before
@@ -348,6 +356,9 @@ sendLoop:
 	// replaced on disk until restart. Deterministic order for the refresh
 	// loop and logs.
 	sort.Slice(results, func(i, j int) bool { return results[i].idx < results[j].idx })
+	// Count from results, not len(segments): a paused/failed pass examined only
+	// the segments its workers actually processed.
+	result.SegmentsExamined = len(results)
 	for _, r := range results {
 		result.RowsCorruptOffset += r.plan.RowsCorrupt
 		result.RowsMatchedAllVersions += r.apply.RowsMatchedAllVersions

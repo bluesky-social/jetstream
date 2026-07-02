@@ -32,11 +32,19 @@ type importTestRig struct {
 }
 
 func newImportTestRig(t *testing.T, events []segment.Event) *importTestRig {
+	return newImportTestRigSegs(t, events)
+}
+
+// newImportTestRigSegs is newImportTestRig for multiple segments: segs[i]
+// becomes segment i.
+func newImportTestRigSegs(t *testing.T, segs ...[]segment.Event) *importTestRig {
 	t.Helper()
 	dataDir := t.TempDir()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
-	writeCompactionSegment(t, segmentsDir, 0, events)
+	for i, events := range segs {
+		writeCompactionSegment(t, segmentsDir, uint64(i), events)
+	}
 
 	mft, err := manifest.Open(manifest.Options{
 		SegmentsDir: segmentsDir,
@@ -353,6 +361,65 @@ func TestRunImport_CancelledJobNotCountedAsTerminal(t *testing.T) {
 	require.EqualValues(t, ImportPhaseGaugeIdle, testutil.ToFloat64(im.Phase), "phase reset to idle on pause")
 	// Partial work still folds in: the row parsed before the abort counts.
 	require.EqualValues(t, 1, testutil.ToFloat64(im.RowsParsed), "partial parse counters survive a pause")
+}
+
+// TestRunImport_CancelMidApplyIsPauseNotSuccess pins the Phase C cancellation
+// contract: a job cancelled between segments must surface context.Canceled so
+// the manager classifies it as a pause and keeps the checkpoint — NOT return
+// nil, which would mark the job StateComplete and delete the checkpoint with
+// segments still unapplied. The undelivered segments are silently dropped by
+// the send loop on cancel; only the returned error tells the caller the pass
+// was cut short.
+func TestRunImport_CancelMidApplyIsPauseNotSuccess(t *testing.T) {
+	t.Parallel()
+	seg0 := []segment.Event{
+		{Seq: 1, WitnessedAt: 1_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "1", Payload: []byte("v1")},
+	}
+	seg1 := []segment.Event{
+		{Seq: 2, WitnessedAt: 2_000, Kind: segment.KindCreate, DID: "did:plc:bob", Collection: "app.bsky.feed.post", Rkey: "r2", Rev: "1", Payload: []byte("v2")},
+	}
+	rig := newImportTestRigSegs(t, seg0, seg1)
+	// One worker so the send loop is still holding segment 1 when the cancel
+	// from segment 0's checkpoint hook fires, making the drop deterministic.
+	rig.o.cfg.CompactionRewriteWorkers = 1
+
+	csv := writeImportCSVFile(t, "uri,timestamp,scope,cid",
+		"at://did:plc:alice/app.bsky.feed.post/r1,2021-12-20T11:33:20Z,all_versions,",
+		"at://did:plc:bob/app.bsky.feed.post/r2,2021-12-20T11:33:20Z,all_versions,")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	jobDir := filepath.Join(t.TempDir(), "job")
+	var applied []uint64
+	_, err := rig.o.RunImport(ctx, ImportJob{
+		CSVPath: csv,
+		JobDir:  jobDir,
+		OnSegmentApplied: func(idx uint64) error {
+			applied = append(applied, idx)
+			cancel() // operator pause lands between segments
+			return nil
+		},
+	})
+	require.ErrorIs(t, err, context.Canceled,
+		"a run cut short by cancellation must not report success: the manager would mark the job complete and delete the checkpoint with segments unapplied")
+	require.Equal(t, []uint64{0}, applied, "only segment 0 completed before the pause")
+
+	// Segment 1 really was left unapplied on disk.
+	bobRows := readCompactionSegment(t, filepath.Join(rig.segmentsDir, "seg_0000000001.jss"))
+	require.Len(t, bobRows, 1)
+	require.EqualValues(t, 0, bobRows[0].IndexedAt, "segment 1 must be untouched after the pause")
+
+	// Resume (SkipBucket + skip the checkpointed segment 0) finishes the job.
+	res, err := rig.o.RunImport(context.Background(), ImportJob{
+		CSVPath:     csv,
+		JobDir:      jobDir,
+		SkipBucket:  true,
+		SkipSegment: func(idx uint64) bool { return idx == 0 },
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.SegmentsPatched, "resume applies the dropped segment")
+	bobRows = readCompactionSegment(t, filepath.Join(rig.segmentsDir, "seg_0000000001.jss"))
+	require.EqualValues(t, 1_640_000_000_000_000, bobRows[0].IndexedAt)
 }
 
 // TestRunImport_MutualExclusionWithRewriteLock proves an in-flight import holds

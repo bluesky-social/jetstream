@@ -200,11 +200,12 @@ func pollImportStatus(t *testing.T, ctx context.Context, client *http.Client, ba
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := client.Do(req)
 		require.NoError(t, err)
-		var out importStatusResp
-		decErr := json.NewDecoder(resp.Body).Decode(&out)
+		body, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		require.NoError(t, decErr)
-		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.NoError(t, readErr)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "getImportStatus body: %s", body)
+		var out importStatusResp
+		require.NoError(t, json.Unmarshal(body, &out))
 		if out.State == "complete" || out.State == "failed" {
 			return out
 		}

@@ -147,6 +147,123 @@ func TestRowReader_MidRecordOffsetRejectedEvenIfSuffixParses(t *testing.T) {
 	require.ErrorIs(t, err, timestamp.ErrCorruptOffset)
 }
 
+// TestRowReader_TruncatedRowRejected pins the Phase C truncation detector: a
+// row that fills ReadRow's whole scan window without reaching its terminating
+// newline (offset-file desync against a swapped/rewritten CSV — Phase A now
+// rejects such rows at parse time) must be ErrCorruptOffset, not a silently
+// truncated parse. Without the detector the truncated suffix can still
+// validate and would patch a different rkey than the file actually holds.
+func TestRowReader_TruncatedRowRejected(t *testing.T) {
+	t.Parallel()
+	// Size the padding so the MaxRowBytes scan window cuts the row exactly one
+	// character into the rkey: the truncated suffix ("…/rkey1") still validates
+	// as a syntactically perfect row for the WRONG rkey. Without the detector,
+	// ReadRow would return that wrong row instead of an error.
+	const ts = "2022-01-02T03:04:05Z"
+	const uri = "at://did:plc:alice/app.bsky.feed.post/rkey12345"
+	cutInsideRkey := len(uri) - len("2345")
+	pad := strings.Repeat(" ", timestamp.MaxRowBytes-len(ts)-1-cutInsideRkey)
+	overlong := ts + "," + pad + uri
+	path := writeImportCSV(t, "timestamp,uri",
+		overlong,
+		"2023-06-07T08:09:10Z,at://did:plc:bob/app.bsky.feed.like/r2")
+	rr, err := timestamp.OpenRowReader(path)
+	require.NoError(t, err)
+	defer func() { _ = rr.Close() }()
+
+	headerLen := int64(len("timestamp,uri") + 1)
+	_, err = rr.ReadRow(headerLen)
+	require.ErrorIs(t, err, timestamp.ErrCorruptOffset,
+		"a row overflowing the scan window must be rejected, not truncated to a shorter rkey")
+
+	// The row after the overlong one still reads fine by its own offset.
+	got, err := rr.ReadRow(headerLen + int64(len(overlong)) + 1)
+	require.NoError(t, err)
+	require.Equal(t, "did:plc:bob", got.DID)
+}
+
+// TestParseRouteReadRow_HostileRoundTrip drives a deliberately nasty CSV
+// through the full Phase A→B→C bridge: Parse validates, the Bucketer records
+// offsets, and every recorded offset must re-read (via ReadRow, exactly as
+// BuildPatchPlan does) to a row identical to the one Parse accepted. Quoted
+// fields with embedded commas and newlines, CRLF terminators, blank lines,
+// leading whitespace, and interleaved garbage rows all shift byte positions in
+// ways that would surface any offset-accounting drift between the phases.
+func TestParseRouteReadRow_HostileRoundTrip(t *testing.T) {
+	t.Parallel()
+	src := "uri,timestamp,scope,cid\r\n" +
+		// plain row, CRLF-terminated
+		"at://did:plc:alice/app.bsky.feed.post/r1,2022-01-02T03:04:05Z,,\r\n" +
+		// garbage row (rejected; must not desync the rows after it)
+		"not-a-uri,not-a-time,,\n" +
+		// blank lines csv silently skips; the next row's offset points at them
+		"\n\n" +
+		// quoted uri with an embedded comma: quotes parse fine, but a comma is
+		// not a legal rkey character, so validation rejects it (bad_uri)
+		"\"at://did:plc:zed/app.bsky.feed.like/r,x\",2023-06-07T08:09:10Z,all_versions,\n" +
+		// quoted valid uri: the quote chars shift every later byte position
+		"\"at://did:plc:bob/app.bsky.feed.like/r2\",2023-06-07T08:09:10Z,all_versions,\n" +
+		// quoted timestamp with an embedded newline inside the quotes -> bad
+		// timestamp, rejected, but consumes two physical lines
+		"at://did:plc:carol/app.bsky.feed.post/r3,\"2023-06-07\n08:09:10Z\",,\n" +
+		// leading spaces (trimmed by validation) + specific_version with CID
+		"  at://did:plc:dave/app.bsky.feed.post/r4  ,2024-01-02T03:04:05Z,specific_version," + validCID + "\n" +
+		// trailing valid row with no terminating newline
+		"at://did:plc:erin/app.bsky.feed.repost/r5,2025-01-02T03:04:05Z,,"
+
+	path := filepath.Join(t.TempDir(), "hostile.csv")
+	require.NoError(t, os.WriteFile(path, []byte(src), 0o644))
+
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	jobDir := t.TempDir()
+	b, err := timestamp.NewBucketer(timestamp.BucketerConfig{Selector: &oneSegmentSelector{idx: 7}, JobDir: jobDir})
+	require.NoError(t, err)
+
+	var accepted []timestamp.Row
+	stats, err := timestamp.Parse(f, timestamp.Options{OnRow: func(r timestamp.Row) error {
+		accepted = append(accepted, r)
+		return b.Route(r)
+	}})
+	require.NoError(t, err)
+	require.NoError(t, b.Close())
+	require.EqualValues(t, 4, stats.RowsValid)
+	require.EqualValues(t, 3, stats.RowsRejected)
+
+	rr, err := timestamp.OpenRowReader(path)
+	require.NoError(t, err)
+	defer func() { _ = rr.Close() }()
+
+	// Every offset the Bucketer recorded must re-read to the exact row Parse
+	// accepted — same identity, scope, CID, and timestamp.
+	offsets := readOffsets(t, jobDir, 7)
+	require.Len(t, offsets, len(accepted))
+	for i, off := range offsets {
+		want := accepted[i]
+		require.Equal(t, want.Offset, off, "bucketer must record the row's own offset")
+		got, err := rr.ReadRow(off)
+		require.NoError(t, err, "offset %d must re-read", off)
+		require.Equal(t, want.DID, got.DID)
+		require.Equal(t, want.Collection, got.Collection)
+		require.Equal(t, want.Rkey, got.Rkey)
+		require.Equal(t, want.Scope, got.Scope)
+		require.Equal(t, want.TimestampMicros, got.TimestampMicros)
+		require.True(t, want.CID.Equal(got.CID))
+	}
+
+	// Spot-check the trickiest identities survived intact.
+	require.Equal(t, "did:plc:bob", accepted[1].DID, "quoted uri row accepted")
+	require.Equal(t, "did:plc:dave", accepted[2].DID, "leading-space row trimmed")
+	require.Equal(t, timestamp.ScopeSpecificVersion, accepted[2].Scope)
+	require.Equal(t, "did:plc:erin", accepted[3].DID, "no-trailing-newline row accepted")
+	require.EqualValues(t, 2, stats.RejectsByReason[timestamp.ReasonBadURI],
+		"garbage row + embedded-comma rkey both rejected as bad_uri")
+	require.EqualValues(t, 1, stats.RejectsByReason[timestamp.ReasonBadTimestamp],
+		"quoted embedded-newline timestamp rejected, consuming two physical lines")
+}
+
 func TestRowReader_HonorsHeaderColumnOrder(t *testing.T) {
 	t.Parallel()
 	// Non-canonical column order: the reader must map columns from the header,

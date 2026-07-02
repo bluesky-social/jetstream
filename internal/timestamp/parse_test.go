@@ -163,6 +163,45 @@ func TestParse_WrongFieldCountRowRejected(t *testing.T) {
 	require.Len(t, rows, 2)
 }
 
+// TestParse_OverlongRowRejected pins the Phase A row-length bound: a row whose
+// on-disk footprint reaches MaxRowBytes must be rejected at parse time, because
+// Phase C re-reads rows through a MaxRowBytes window and a longer row would be
+// silently truncated there — a truncated suffix can still validate and patch
+// the WRONG record (e.g. rkey "rkey12345" truncated to "rkey").
+func TestParse_OverlongRowRejected(t *testing.T) {
+	t.Parallel()
+	pad := strings.Repeat(" ", timestamp.MaxRowBytes) // spaces are trimmed by validation, so the row is otherwise valid
+	src := "timestamp,uri\n" +
+		"2022-01-02T03:04:05Z," + pad + "at://did:plc:alice/app.bsky.feed.post/rkey12345\n" +
+		"2023-06-07T08:09:10Z,at://did:plc:bob/app.bsky.feed.like/r2\n"
+
+	rows, stats := collectRows(t, src, timestamp.Options{})
+	require.EqualValues(t, 1, stats.RowsValid, "the overlong row must not be accepted")
+	require.EqualValues(t, 1, stats.RejectsByReason[timestamp.ReasonRowTooLong])
+	require.Len(t, rows, 1)
+	require.Equal(t, "did:plc:bob", rows[0].DID)
+}
+
+// TestParse_BareQuoteFailsFileLoudly: an unclosed quote makes encoding/csv
+// consume input to EOF hunting for the closing quote, so everything after it
+// is unparseable. Treating it as one skipped row would silently drop the whole
+// rest of the file — it must fail the file loudly instead (like ErrHeader).
+func TestParse_BareQuoteFailsFileLoudly(t *testing.T) {
+	t.Parallel()
+	src := "uri,timestamp\n" +
+		"at://did:plc:alice/app.bsky.feed.post/r1,2022-01-02T03:04:05Z\n" +
+		"at://did:plc:bob/app.bsky.feed.post/\"r2,2022-01-02T03:04:05Z\n" + // stray quote
+		"at://did:plc:carol/app.bsky.feed.post/r3,2022-01-02T03:04:05Z\n" +
+		"at://did:plc:dave/app.bsky.feed.post/r4,2022-01-02T03:04:05Z\n"
+
+	var rows []timestamp.Row
+	_, err := timestamp.Parse(strings.NewReader(src), timestamp.Options{
+		OnRow: func(r timestamp.Row) error { rows = append(rows, r); return nil },
+	})
+	require.Error(t, err, "a quote error swallows the rest of the file; it must abort, not skip")
+	require.Len(t, rows, 1, "rows before the quote error were processed")
+}
+
 func TestParse_OffsetSeeksBackToRow(t *testing.T) {
 	t.Parallel()
 	// Two valid rows; capture their offsets and prove a Seek to each offset
@@ -179,6 +218,28 @@ func TestParse_OffsetSeeksBackToRow(t *testing.T) {
 		"offset of row 0 must land on its first byte")
 	require.True(t, strings.HasPrefix(src[rows[1].Offset:], row2),
 		"offset of row 1 must land on its first byte")
+}
+
+// TestParse_CRLFLineEndings: a Windows-authored CSV (CRLF row terminators)
+// parses identically, and the recorded offsets still point at row starts —
+// the byte before each offset is the previous row's '\n', which is exactly
+// the boundary check Phase C's ReadRow applies.
+func TestParse_CRLFLineEndings(t *testing.T) {
+	t.Parallel()
+	src := "uri,timestamp,scope,cid\r\n" +
+		"at://did:plc:alice/app.bsky.feed.post/r1,2022-01-02T03:04:05Z,,\r\n" +
+		"at://did:plc:bob/app.bsky.feed.like/r2,2023-06-07T08:09:10Z,all_versions,\r\n"
+
+	rows, stats := collectRows(t, src, timestamp.Options{})
+	require.EqualValues(t, 2, stats.RowsValid)
+	require.EqualValues(t, 0, stats.RowsRejected)
+	require.Equal(t, "did:plc:alice", rows[0].DID)
+	require.Equal(t, "did:plc:bob", rows[1].DID)
+	for _, r := range rows {
+		require.Equal(t, byte('\n'), src[r.Offset-1], "offset must sit just past a newline")
+		require.True(t, strings.HasPrefix(src[r.Offset:], "at://"+r.DID+"/"),
+			"offset lands on the row's own bytes")
+	}
 }
 
 func TestParse_RejectSampleIsBounded(t *testing.T) {

@@ -51,7 +51,7 @@
         }
       },
       "errors": [
-        { "name": "JobNotFound", "description": "No import job matches the supplied id." }
+        { "name": "JobNotFound", "description": "No import job matches the supplied id, or no job has ever run when the id is omitted." }
       ]
     }
   }

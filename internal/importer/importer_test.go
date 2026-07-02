@@ -16,6 +16,8 @@ import (
 	"github.com/bluesky-social/jetstream/internal/importer"
 	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/timestamp"
+	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/require"
 )
 
@@ -178,9 +180,15 @@ func TestSubmit_HappyPathCompletes(t *testing.T) {
 	require.Equal(t, 2, rec.SegmentsApplied)
 	require.True(t, rec.Bucketed)
 
-	// A completed job clears the current pointer.
-	_, ok := m.Current()
-	require.False(t, ok, "current pointer cleared after completion")
+	// The completed job stays "most recent": Current() keeps serving its
+	// terminal record so the no-param getImportStatus and the status page can
+	// show the final summary (the lexicon promises "the current or most recent
+	// job"). Failed jobs already behave this way; complete must match.
+	cur, ok := m.Current()
+	require.True(t, ok, "completed job remains the most-recent job")
+	require.Equal(t, id, cur.ID)
+	require.Equal(t, importer.StateComplete, cur.State)
+	require.EqualValues(t, 5, cur.RowsMutated)
 }
 
 func TestSubmit_ConcurrentJobRejected(t *testing.T) {
@@ -363,10 +371,265 @@ func TestRun_FailurePersistsError(t *testing.T) {
 	require.Equal(t, importer.StateFailed, rec.State)
 	require.Contains(t, rec.Error, "boom")
 
-	// A failed job leaves current set (resumable); a re-submit is allowed
-	// because the running pointer is terminal.
+	// A failed job is terminal (ResumeIncomplete skips it; only a fresh
+	// submit retries), so a re-submit is allowed.
 	_, err = m.Submit(context.Background(), "a.csv")
 	require.NoError(t, err)
+}
+
+// countSegCheckpoints counts the persisted import/job/<id>/seg/* keys — the
+// per-segment resume done-set. Terminal jobs must not leave these behind.
+func countSegCheckpoints(t *testing.T, st *store.Store, id string) int {
+	t.Helper()
+	prefix := []byte("import/job/" + id + "/seg/")
+	it, err := st.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: store.PrefixUpperBound(prefix),
+	})
+	require.NoError(t, err)
+	defer func() { _ = it.Close() }()
+	n := 0
+	for it.First(); it.Valid(); it.Next() {
+		n++
+	}
+	require.NoError(t, it.Error())
+	return n
+}
+
+// failAfterApplyRunner checkpoints its segments (driving OnPhase +
+// OnSegmentApplied like a real Phase C), then fails. It models a job that
+// died partway with durable per-segment progress on disk.
+type failAfterApplyRunner struct {
+	segments []uint64
+	cause    error
+}
+
+func (r *failAfterApplyRunner) RunImport(_ context.Context, job orchestrator.ImportJob) (orchestrator.ImportResult, error) {
+	if job.OnPhase != nil {
+		if err := job.OnPhase(orchestrator.ImportPhaseApply, len(r.segments)); err != nil {
+			return orchestrator.ImportResult{}, err
+		}
+	}
+	for _, s := range r.segments {
+		if job.OnSegmentApplied != nil {
+			if err := job.OnSegmentApplied(s); err != nil {
+				return orchestrator.ImportResult{}, err
+			}
+		}
+	}
+	// Leave a scratch artifact like Phase B would, so the test can assert the
+	// terminal cleanup removes the whole job dir.
+	if err := os.MkdirAll(job.JobDir, 0o755); err != nil {
+		return orchestrator.ImportResult{}, err
+	}
+	if err := os.WriteFile(filepath.Join(job.JobDir, "seg_0000000000.off"), []byte{1}, 0o644); err != nil {
+		return orchestrator.ImportResult{}, err
+	}
+	return orchestrator.ImportResult{}, r.cause
+}
+
+// TestTerminalJobs_ReleaseScratchAndCheckpoints: a terminal job — failed or
+// complete — can never resume (a re-submit mints a fresh id and job dir), so
+// keeping its offset files and seg checkpoint keys would leak them forever:
+// per-segment keys accrue per job, and a whole-archive import writes tens of
+// thousands. Both terminal paths must drop the scratch dir and seg keys; the
+// meta record stays so Status(id) keeps serving the outcome.
+func TestTerminalJobs_ReleaseScratchAndCheckpoints(t *testing.T) {
+	t.Parallel()
+
+	t.Run("failed", func(t *testing.T) {
+		t.Parallel()
+		env := newTestEnv(t)
+		writeCSV(t, env.importDir, "a.csv")
+		m := env.manager(t, &failAfterApplyRunner{segments: []uint64{0, 1, 2}, cause: errors.New("boom")})
+
+		id, err := m.Submit(context.Background(), "a.csv")
+		require.NoError(t, err)
+		rec := waitTerminal(t, m, id)
+		require.Equal(t, importer.StateFailed, rec.State)
+		require.Equal(t, 3, rec.SegmentsApplied, "checkpoints landed before the failure")
+
+		require.Zero(t, countSegCheckpoints(t, env.store, id), "failed job's seg checkpoint keys released")
+		require.NoDirExists(t, filepath.Join(env.scratchDir, id), "failed job's scratch dir removed")
+
+		// The meta record survives for status.
+		got, err := m.Status(id)
+		require.NoError(t, err)
+		require.Equal(t, importer.StateFailed, got.State)
+	})
+
+	t.Run("complete", func(t *testing.T) {
+		t.Parallel()
+		env := newTestEnv(t)
+		writeCSV(t, env.importDir, "a.csv")
+		m := env.manager(t, &fakeRunner{segments: []uint64{0, 1}})
+
+		id, err := m.Submit(context.Background(), "a.csv")
+		require.NoError(t, err)
+		rec := waitTerminal(t, m, id)
+		require.Equal(t, importer.StateComplete, rec.State)
+
+		require.Zero(t, countSegCheckpoints(t, env.store, id), "completed job's seg checkpoint keys released")
+		require.NoDirExists(t, filepath.Join(env.scratchDir, id), "completed job's scratch dir removed")
+	})
+}
+
+// funcRunner adapts a closure to importer.Runner so a test can script the
+// exact hook sequence and the (result, err) pair a run returns.
+type funcRunner struct {
+	fn func(context.Context, orchestrator.ImportJob) (orchestrator.ImportResult, error)
+}
+
+func (f funcRunner) RunImport(ctx context.Context, job orchestrator.ImportJob) (orchestrator.ImportResult, error) {
+	return f.fn(ctx, job)
+}
+
+// TestPause_PersistsPartialProgress: RunImport returns its partial counters
+// alongside a cancellation error (a graceful pause). The paused record must
+// carry that partial progress — the same counters the Prometheus fold already
+// records — so the status page and getImportStatus do not show a bucketing
+// job stuck at zero rows across a restart.
+func TestPause_PersistsPartialProgress(t *testing.T) {
+	t.Parallel()
+	partial := orchestrator.ImportResult{
+		Parse: timestamp.Stats{
+			RowsTotal:       10,
+			RowsValid:       9,
+			RowsRejected:    1,
+			RejectsByReason: map[timestamp.RejectReason]uint64{timestamp.ReasonBadURI: 1},
+		},
+	}
+	runner := funcRunner{fn: func(_ context.Context, job orchestrator.ImportJob) (orchestrator.ImportResult, error) {
+		if e := job.OnPhase(orchestrator.ImportPhaseParseBucket, 0); e != nil {
+			return orchestrator.ImportResult{}, e
+		}
+		// Pause lands mid-parse: partial stats + a pure cancellation error.
+		return partial, fmt.Errorf("orchestrator: import: parse/bucket: %w", context.Canceled)
+	}}
+	m, importDir, _ := newTestManager(t, runner)
+	writeCSV(t, importDir, "a.csv")
+
+	id, err := m.Submit(context.Background(), "a.csv")
+	require.NoError(t, err)
+	require.NoError(t, m.Wait(context.Background()))
+
+	rec, err := m.Status(id)
+	require.NoError(t, err)
+	require.Equal(t, importer.StateRunning, rec.State, "paused job stays non-terminal")
+	require.EqualValues(t, 10, rec.RowsTotal, "partial parse totals persisted on pause")
+	require.EqualValues(t, 9, rec.RowsValid)
+	require.EqualValues(t, 1, rec.RowsRejected)
+	require.Equal(t, map[string]uint64{"bad_uri": 1}, rec.RejectsByReason)
+}
+
+// TestFail_PersistsPartialProgress: a terminal failure also folds the work
+// done before the error into the record, matching the metrics fold.
+func TestFail_PersistsPartialProgress(t *testing.T) {
+	t.Parallel()
+	partial := orchestrator.ImportResult{
+		Parse:            timestamp.Stats{RowsTotal: 7, RowsValid: 7},
+		SegmentsExamined: 2,
+		SegmentsPatched:  1,
+		RowsMutated:      3,
+	}
+	runner := funcRunner{fn: func(context.Context, orchestrator.ImportJob) (orchestrator.ImportResult, error) {
+		return partial, errors.New("boom")
+	}}
+	m, importDir, _ := newTestManager(t, runner)
+	writeCSV(t, importDir, "a.csv")
+
+	id, err := m.Submit(context.Background(), "a.csv")
+	require.NoError(t, err)
+	rec := waitTerminal(t, m, id)
+	require.Equal(t, importer.StateFailed, rec.State)
+	require.EqualValues(t, 7, rec.RowsTotal, "partial parse totals persisted on failure")
+	require.EqualValues(t, 1, rec.SegmentsPatched)
+	require.EqualValues(t, 3, rec.RowsMutated)
+}
+
+// TestResume_AccumulatesCountersAcrossRuns is the pause-mid-apply lifecycle:
+// run 1 parses the CSV (totals 10/9/1), applies + checkpoints segment 0 of 2,
+// and pauses; run 2 resumes with SkipBucket (so it reports ZERO parse stats),
+// applies segment 1, and completes. The final record must keep run 1's parse
+// totals — the resumed run never re-parsed, so overwriting from its result
+// would zero them — and sum the apply counters across both runs (the
+// checkpoint done-set guarantees the runs processed disjoint segments).
+func TestResume_AccumulatesCountersAcrossRuns(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+	writeCSV(t, env.importDir, "a.csv")
+
+	run1 := funcRunner{fn: func(_ context.Context, job orchestrator.ImportJob) (orchestrator.ImportResult, error) {
+		if e := job.OnPhase(orchestrator.ImportPhaseParseBucket, 0); e != nil {
+			return orchestrator.ImportResult{}, e
+		}
+		if e := job.OnPhase(orchestrator.ImportPhaseApply, 2); e != nil {
+			return orchestrator.ImportResult{}, e
+		}
+		if e := job.OnSegmentApplied(0); e != nil {
+			return orchestrator.ImportResult{}, e
+		}
+		return orchestrator.ImportResult{
+			Parse: timestamp.Stats{
+				RowsTotal:       10,
+				RowsValid:       9,
+				RowsRejected:    1,
+				RejectsByReason: map[timestamp.RejectReason]uint64{timestamp.ReasonBadURI: 1},
+			},
+			SegmentsExamined:       1,
+			SegmentsPatched:        1,
+			RowsMutated:            3,
+			RowsMatchedAllVersions: 3,
+		}, fmt.Errorf("orchestrator: import: %w", context.Canceled)
+	}}
+	m1 := env.manager(t, run1)
+	id, err := m1.Submit(context.Background(), "a.csv")
+	require.NoError(t, err)
+	require.NoError(t, m1.Wait(context.Background()))
+
+	paused, err := m1.Status(id)
+	require.NoError(t, err)
+	require.Equal(t, importer.StateRunning, paused.State)
+	require.EqualValues(t, 10, paused.RowsTotal)
+	require.Equal(t, 1, paused.SegmentsApplied)
+
+	// "Restart": run 2 resumes with SkipBucket, skips checkpointed segment 0,
+	// applies segment 1, completes cleanly with only ITS OWN counters.
+	run2 := funcRunner{fn: func(_ context.Context, job orchestrator.ImportJob) (orchestrator.ImportResult, error) {
+		if !job.SkipBucket {
+			return orchestrator.ImportResult{}, errors.New("resume must skip bucketing")
+		}
+		if !job.SkipSegment(0) {
+			return orchestrator.ImportResult{}, errors.New("segment 0 must be checkpointed")
+		}
+		if e := job.OnPhase(orchestrator.ImportPhaseApply, 1); e != nil {
+			return orchestrator.ImportResult{}, e
+		}
+		if e := job.OnSegmentApplied(1); e != nil {
+			return orchestrator.ImportResult{}, e
+		}
+		return orchestrator.ImportResult{
+			SegmentsExamined:       1,
+			SegmentsPatched:        1,
+			RowsMutated:            2,
+			RowsMatchedAllVersions: 2,
+		}, nil
+	}}
+	m2 := env.manager(t, run2)
+	require.NoError(t, m2.ResumeIncomplete(context.Background()))
+	rec := waitTerminal(t, m2, id)
+
+	require.Equal(t, importer.StateComplete, rec.State)
+	require.EqualValues(t, 10, rec.RowsTotal, "parse totals survive a SkipBucket resume")
+	require.EqualValues(t, 9, rec.RowsValid)
+	require.EqualValues(t, 1, rec.RowsRejected)
+	require.Equal(t, map[string]uint64{"bad_uri": 1}, rec.RejectsByReason)
+	require.EqualValues(t, 2, rec.SegmentsExamined, "apply counters sum across runs")
+	require.EqualValues(t, 2, rec.SegmentsPatched)
+	require.EqualValues(t, 5, rec.RowsMutated, "3 from run 1 + 2 from run 2")
+	require.EqualValues(t, 5, rec.RowsMatchedAllVersions)
+	require.Equal(t, 2, rec.SegmentsApplied, "applied count is cumulative")
+	require.Equal(t, 2, rec.SegmentsToApply, "toApply shows the job total, not the resumed run's remainder")
 }
 
 // crashAfterSegmentRunner reports bucketing complete, checkpoints the segments

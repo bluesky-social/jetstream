@@ -664,7 +664,7 @@ So we keep two timestamps per event:
 
 Only the operator can change `indexed_at`, and it's off by default: the import endpoint is disabled and returns 401 unless a bearer token was configured at startup. We're not letting random callers rewrite timestamps.
 
-Imports run against a live server with no downtime. The operator stages a plain (uncompressed) CSV of AT URIs and timestamps somewhere on the box, then kicks off an import job pointing at that path. The CSV is uncompressed on purpose: the import records a byte offset for each valid row during its single streaming validation pass and seeks straight back to that row when it's time to patch, which a compressed stream can't do without either re-scanning or spilling a plaintext copy. It costs more disk than a compressed file, but the box already holds the multi-terabyte segment archive, so that's a cheap trade for keeping the machinery minimal. Each row can say whether the timestamp applies to every version of the record (the default) or one specific version by CID. We key on AT URI rather than CID because the URI contains the DID, which lets the segment-level DID bloom do almost all the filtering for free; CID-keyed imports would mean scanning everything or maintaining a second bloom, which isn't worth it. Operators who only have CIDs can resolve them to URIs first.
+Imports run against a live server with no downtime. The operator stages a plain (uncompressed) CSV of AT URIs and timestamps somewhere on the box, then kicks off an import job pointing at that path. Uncompressed on purpose: the import records a byte offset for each valid row during its single streaming validation pass and seeks straight back to that row when it's time to patch, which a compressed stream can't do without re-scanning or spilling a plaintext copy — and the box already holds the multi-terabyte segment archive, so the extra disk is a cheap trade. Each row can say whether the timestamp applies to every version of the record (the default) or one specific version by CID. We key on AT URI rather than CID because the URI contains the DID, which lets the segment-level DID bloom do almost all the filtering for free; operators who only have CIDs can resolve them to URIs first.
 
 The job buckets the URIs by DID, uses the segment and per-block DID blooms to find candidate blocks, then decompresses each one and patches the `indexed_at` column for the matching rows. Rather than maintain a separate timestamp table that has to be kept in sync with the segments, we write straight into the segment files — the import piggybacks on the compaction machinery, so it shares the same rewrite path, re-seals touched segments with fresh checksums, and fires the usual segment-compaction notification. It's the same atomic rewrite we already do for deletes, just mutating a column instead of dropping rows. Bad rows are skipped and reported rather than failing the whole import, and re-running is safe: an already-applied file just produces no changes.
 
@@ -679,12 +679,14 @@ The job buckets the URIs by DID, uses the segment and per-block DID blooms to fi
 - `network.bsky.jetstream.importTimestamps` (procedure) — body `{ "path": "<file>" }`, where `<file>` is relative to the import directory (or an absolute path inside it). Returns `{ "job": "<id>" }`. Only one import runs at a time; a concurrent submit gets `409 ImportInProgress`. A bad path gets `400 InvalidPath`.
 - `network.bsky.jetstream.getImportStatus` (query) — `?job=<id>` (or omit it for the current/most-recent job) reports lifecycle state, phase, per-phase progress, and, on completion, the parse/mutation totals. The same summary appears on the operator `/status` page.
 
-**CSV schema.** Header row `uri,timestamp,scope,cid` (column order is read from the header, so it need not be canonical):
+**CSV schema.** Header row `uri,timestamp,scope,cid`. Column order is read from the header, so it need not be canonical, and the optional `scope`/`cid` columns can be omitted entirely. The header is strict: an unrecognized or duplicate column name fails the whole file up front (it's almost always a typo of a real column, and mis-mapping every row is worse than a loud error).
 
-- `uri` — `at://<did>/<collection>/<rkey>`.
-- `timestamp` — RFC3339 (e.g. `2022-01-02T03:04:05Z`), parsed to microseconds.
-- `scope` — `all_versions` (default when empty) patches every create/update/resync sharing the URI; `specific_version` patches only the version whose stored DAG-CBOR payload recomputes to `cid`.
+- `uri` — `at://<did>/<collection>/<rkey>`. Required.
+- `timestamp` — RFC3339 (e.g. `2022-01-02T03:04:05Z`), parsed to microseconds. Required.
+- `scope` — `all_versions` (default when empty or absent) patches every create/update/resync sharing the URI; `specific_version` patches only the version whose stored DAG-CBOR payload recomputes to `cid`.
 - `cid` — required iff `scope=specific_version`, ignored otherwise.
+
+Bad data rows are skipped and counted, but a bare/unclosed quote aborts the file: it makes everything after it unparseable, so silently treating it as one bad row would drop the rest of the import.
 
 Sorting the CSV by DID is *recommended, not required*: it keeps the bucketer's per-DID cache warm (roughly one bloom lookup per distinct DID). Unsorted input is still correct, just with more cache misses.
 

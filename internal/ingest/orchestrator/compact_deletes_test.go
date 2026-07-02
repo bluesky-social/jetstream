@@ -249,6 +249,90 @@ func TestRunDeleteCompaction_RewriteBeforeWatermarkCrashIsIdempotent(t *testing.
 	require.Equal(t, segment.KindDelete, events[0].Kind)
 }
 
+// cancelAtPointInjector cancels a context when a specific crashpoint is
+// reached, without returning an error — simulating an operator shutdown that
+// lands while a rewrite worker is mid-segment.
+type cancelAtPointInjector struct {
+	point  crashpoint.Point
+	cancel context.CancelFunc
+}
+
+func (c cancelAtPointInjector) SimulateCrash(_ context.Context, p crashpoint.Point) error {
+	if p == c.point {
+		c.cancel()
+	}
+	return nil
+}
+
+// TestRunDeleteCompaction_CancelMidChunkDoesNotAdvanceWatermark pins the
+// chunk-apply cancellation contract: a cancel that lands while a rewrite
+// worker is mid-segment makes the send loop drop the undelivered segments and
+// the workers exit nil through the closed channel — the chunk must still
+// surface context.Canceled. Returning nil would commit the chunk watermark
+// and evict tombstones for rewrites that never ran, leaving superseded rows
+// below the watermark alive permanently.
+func TestRunDeleteCompaction_CancelMidChunkDoesNotAdvanceWatermark(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	segmentsDir := filepath.Join(dataDir, "segments")
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Two sealed segments, each holding a superseded row + its delete.
+	writeCompactionSegment(t, segmentsDir, 0, []segment.Event{
+		{Seq: 1, WitnessedAt: 10, Kind: segment.KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
+		{Seq: 2, WitnessedAt: 20, Kind: segment.KindDelete, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
+	})
+	path1 := writeCompactionSegment(t, segmentsDir, 1, []segment.Event{
+		{Seq: 3, WitnessedAt: 30, Kind: segment.KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "1", Payload: []byte("old")},
+		{Seq: 4, WitnessedAt: 40, Kind: segment.KindDelete, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r", Rev: "2"},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	o := &Orchestrator{cfg: Config{
+		DataDir:            dataDir,
+		Store:              st,
+		Logger:             logger,
+		CompactionInterval: time.Hour,
+		// One worker: while it rewrites segment 0 (cancelling mid-rewrite via
+		// the crashpoint hook), the send loop is still holding segment 1 and
+		// drops it on gctx.Done(); the worker then exits nil via the closed
+		// channel without ever observing gctx.Err() at loop top.
+		CompactionRewriteWorkers: 1,
+		CrashInjector: cancelAtPointInjector{
+			point:  crashpoint.AfterSegmentRewriteRenamed,
+			cancel: cancel,
+		},
+	}, logger: logger}
+
+	err = o.runDeleteCompaction(ctx, compactionMergeTail, nil)
+	require.ErrorIs(t, err, context.Canceled,
+		"a chunk cut short by cancellation must not report success: the caller would commit the watermark over never-rewritten segments")
+
+	watermark, _, err := loadCompactionWatermark(st)
+	require.NoError(t, err)
+	require.Zero(t, watermark, "watermark must not advance past a dropped segment")
+
+	// Segment 1's superseded row is still on disk (its rewrite never ran)...
+	events := readCompactionSegment(t, path1)
+	require.Len(t, events, 2, "segment 1 untouched by the cancelled chunk")
+
+	// ...and a clean re-run compacts it.
+	o.cfg.CrashInjector = nil
+	require.NoError(t, o.runDeleteCompaction(context.Background(), compactionMergeTail, nil))
+	watermark, _, err = loadCompactionWatermark(st)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), watermark)
+	events = readCompactionSegment(t, path1)
+	require.Len(t, events, 1, "retry drops the superseded row")
+	require.Equal(t, segment.KindDelete, events[0].Kind)
+}
+
 func TestRunDeleteCompaction_ManifestRefreshFailureReconcilesOnRetry(t *testing.T) {
 	t.Parallel()
 

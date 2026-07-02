@@ -154,6 +154,45 @@ func TestImportTimestamps_WrongTokenRejected(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, resp2.StatusCode)
 }
 
+// TestImportTimestamps_AuthHeaderVariants pins bearerToken's parsing: the
+// scheme is case-insensitive (RFC 7235), the token itself is byte-exact, and
+// non-Bearer schemes or malformed spacing are rejected.
+func TestImportTimestamps_AuthHeaderVariants(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		header string
+		want   int
+	}{
+		{"canonical", "Bearer s3cret", http.StatusOK},
+		{"lowercase scheme", "bearer s3cret", http.StatusOK},
+		{"uppercase scheme", "BEARER s3cret", http.StatusOK},
+		{"basic scheme", "Basic s3cret", http.StatusUnauthorized},
+		{"no scheme", "s3cret", http.StatusUnauthorized},
+		{"leading space in token", "Bearer  s3cret", http.StatusUnauthorized},
+		// net/http trims OWS around header values (RFC 7230 §3.2) before the
+		// handler sees them, so a trailing space never reaches bearerToken.
+		{"trailing space trimmed by transport", "Bearer s3cret ", http.StatusOK},
+		{"token case-sensitive", "Bearer S3CRET", http.StatusUnauthorized},
+		{"empty token", "Bearer ", http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ts := importTestServer(t, &fakeImportManager{submitID: "job1"}, "s3cret")
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+				ts.URL+importNSID, strings.NewReader(`{"path":"a.csv"}`))
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", tc.header)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+			require.Equal(t, tc.want, resp.StatusCode)
+		})
+	}
+}
+
 func TestImportTimestamps_CorrectTokenSubmits(t *testing.T) {
 	t.Parallel()
 	mgr := &fakeImportManager{submitID: "job-42"}
@@ -217,6 +256,46 @@ func TestGetImportStatus_ReportsRecord(t *testing.T) {
 	require.Equal(t, "complete", out.State)
 	require.EqualValues(t, 3, out.SegmentsPatched)
 	require.EqualValues(t, 9, out.RowsMutated)
+}
+
+func TestGetImportStatus_NoParamReportsCurrent(t *testing.T) {
+	t.Parallel()
+	mgr := &fakeImportManager{current: &importer.Record{
+		ID:          "job-7",
+		State:       importer.StateComplete,
+		RowsMutated: 4,
+	}}
+	ts := importTestServer(t, mgr, "s3cret")
+
+	resp := getReq(t, ts.URL+statusNSID, "s3cret")
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out struct {
+		Job         string `json:"job"`
+		State       string `json:"state"`
+		RowsMutated int64  `json:"rowsMutated"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.Equal(t, "job-7", out.Job)
+	require.Equal(t, "complete", out.State)
+	require.EqualValues(t, 4, out.RowsMutated)
+}
+
+func TestGetImportStatus_NoParamNoJobs404(t *testing.T) {
+	t.Parallel()
+	mgr := &fakeImportManager{} // current == nil: no job has ever run
+	ts := importTestServer(t, mgr, "s3cret")
+
+	resp := getReq(t, ts.URL+statusNSID, "s3cret")
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	var out struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.Equal(t, "JobNotFound", out.Error)
 }
 
 func TestGetImportStatus_UnknownJob404(t *testing.T) {

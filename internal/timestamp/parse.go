@@ -64,9 +64,13 @@ func (s Scope) String() string {
 // Row is one validated import instruction. All string fields are non-empty and
 // already syntactically valid; CID is Defined() iff Scope == ScopeSpecificVersion.
 type Row struct {
-	// Offset is the byte offset of this row's first byte within the source
-	// CSV. Phase C reopens the file, Seeks here, and reads exactly this row
-	// back. Valid only for the exact file that produced it.
+	// Offset is the byte offset within the source CSV from which reading one
+	// CSV record yields exactly this row: Phase C reopens the file, Seeks
+	// here, and decodes it back. Usually the row's first byte, but when csv
+	// silently skips blank lines before the record, Offset points at the
+	// first skipped line — decoding from there still yields this row, which
+	// is the contract that matters. Valid only for the exact file that
+	// produced it.
 	Offset int64
 
 	// DID is the repo identifier extracted from the AT URI authority. Import
@@ -106,7 +110,22 @@ const (
 	ReasonUnknownScope    RejectReason = "unknown_scope"
 	ReasonMissingCID      RejectReason = "specific_version_missing_cid"
 	ReasonBadCID          RejectReason = "bad_cid"
+	ReasonRowTooLong      RejectReason = "row_too_long"
 )
+
+// MaxRowBytes bounds a single CSV row's on-disk footprint (from its recorded
+// offset through its terminating newline, including any blank lines csv skips
+// before it). A real import row is a URI + RFC3339 stamp + short scope + CID —
+// well under 1 KiB; 64 KiB is generous headroom.
+//
+// The bound is a Phase A ↔ Phase C contract, enforced at BOTH ends: Parse
+// rejects any row whose footprint reaches it, and RowReader.ReadRow scans at
+// most this many bytes from an offset and treats a record that fills the whole
+// window as corrupt. Without the Phase A half, an accepted overlong row would
+// be silently truncated at the window in Phase C — and a truncated suffix can
+// still validate (e.g. rkey "rkey12345" cut to "rkey"), patching the WRONG
+// record. Rejecting at parse time makes the window provably sufficient.
+const MaxRowBytes = 64 * 1024
 
 // Reject describes one skipped row for reporting. RowNumber is 1-based over
 // data rows (the header is not counted). Field/Value carry a bounded diagnostic
@@ -146,9 +165,9 @@ type Options struct {
 	OnRow func(Row) error
 
 	// OnReject, if non-nil, is called once per skipped row, in file order,
-	// before the reject is folded into Stats. M6 wires the durable
-	// rejects-artifact writer here; the bounded in-memory sample is
-	// independent of it.
+	// before the reject is folded into Stats. The importer's durable
+	// rejects-artifact writer hangs off this seam; the bounded in-memory
+	// sample is independent of it.
 	OnReject func(Reject)
 
 	// RejectSampleLimit overrides DefaultRejectSampleLimit when > 0. A
@@ -230,11 +249,19 @@ func Parse(src io.Reader, opts Options) (Stats, error) {
 		}
 		rowNum++
 		if readErr != nil {
-			// A wrong-field-count or malformed-quote row: csv reports it and
-			// can continue with the next line. Skip-and-report, don't abort.
+			// A wrong-field-count row: csv reports it and continues cleanly
+			// with the next line. Skip-and-report, don't abort.
 			if errors.Is(readErr, csv.ErrFieldCount) {
 				reject(rowNum, offset, ReasonMissingField, "", strings.Join(rec, ","))
 				continue
+			}
+			// A bare/unclosed quote is structural, like a bad header: csv
+			// consumes input all the way to EOF hunting for the closing quote,
+			// so every row after it is already swallowed. Skip-and-report here
+			// would silently drop the rest of the file behind a single reject
+			// line — fail the file loudly instead.
+			if errors.Is(readErr, csv.ErrBareQuote) || errors.Is(readErr, csv.ErrQuote) {
+				return stats, fmt.Errorf("timestamp: row %d: unbalanced quote makes the rest of the file unparseable: %w", rowNum, readErr)
 			}
 			if _, ok := errors.AsType[*csv.ParseError](readErr); ok {
 				reject(rowNum, offset, ReasonMalformedCSV, "", readErr.Error())
@@ -242,6 +269,14 @@ func Parse(src io.Reader, opts Options) (Stats, error) {
 			}
 			// A non-CSV read error (I/O) is unrecoverable.
 			return stats, fmt.Errorf("timestamp: read row %d: %w", rowNum, readErr)
+		}
+
+		// Enforce the Phase A half of the MaxRowBytes contract (see the const):
+		// footprint is measured offset→offset so it includes the terminating
+		// newline and any blank lines csv silently skipped before the record.
+		if footprint := r.InputOffset() - offset; footprint >= MaxRowBytes {
+			reject(rowNum, offset, ReasonRowTooLong, "", fmt.Sprintf("row spans %d bytes (limit %d)", footprint, MaxRowBytes))
+			continue
 		}
 
 		row, reason, field, value := cols.validate(rec, offset)
@@ -391,11 +426,13 @@ func (c columns) validate(rec []string, offset int64) (Row, RejectReason, string
 }
 
 // parseOneRow reads a single CSV record from src and validates it against
-// cols, returning (row, true, nil) on success and (zero, false, nil) when the
-// record is unreadable or fails validation. A non-CSV read error is returned.
-// It is the shared kernel Phase C's positioned RowReader uses to re-derive a
-// row's meaning from an offset without trusting Phase B's classification.
-func parseOneRow(src io.Reader, offset int64, cols columns) (Row, bool, error) {
+// cols, returning (row, consumed, true, nil) on success and (zero, consumed,
+// false, nil) when the record is unreadable or fails validation; consumed is
+// how many bytes of src the record spanned, so the caller can detect a record
+// truncated by its read window. A non-CSV read error is returned. It is the
+// shared kernel Phase C's positioned RowReader uses to re-derive a row's
+// meaning from an offset without trusting Phase B's classification.
+func parseOneRow(src io.Reader, offset int64, cols columns) (Row, int64, bool, error) {
 	r := csv.NewReader(src)
 	// A positioned read starts mid-file with no header, so the field count is
 	// unknown; disable the fixed-count check and let validate index defensively.
@@ -403,18 +440,19 @@ func parseOneRow(src io.Reader, offset int64, cols columns) (Row, bool, error) {
 	rec, err := r.Read()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return Row{}, false, nil
+			return Row{}, r.InputOffset(), false, nil
 		}
 		if _, ok := errors.AsType[*csv.ParseError](err); ok {
-			return Row{}, false, nil
+			return Row{}, r.InputOffset(), false, nil
 		}
-		return Row{}, false, fmt.Errorf("timestamp: read row at offset %d: %w", offset, err)
+		return Row{}, r.InputOffset(), false, fmt.Errorf("timestamp: read row at offset %d: %w", offset, err)
 	}
+	consumed := r.InputOffset()
 	row, reason, _, _ := cols.validate(rec, offset)
 	if reason != "" {
-		return Row{}, false, nil
+		return Row{}, consumed, false, nil
 	}
-	return row, true, nil
+	return row, consumed, true, nil
 }
 
 func truncate(s string) string {

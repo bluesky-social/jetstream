@@ -14,15 +14,15 @@ expected-tier: default
 tiers: default,stress
 
 diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
-index c9d264e..4ed61f9 100644
+index 711a199..e81a0f9 100644
 --- a/internal/ingest/live/events.go
 +++ b/internal/ingest/live/events.go
-@@ -247,14 +247,8 @@ func convertSync(evt streaming.Event, indexedAt int64) ([]segment.Event, error)
+@@ -244,14 +244,8 @@ func convertSync(evt streaming.Event, witnessedAt int64) ([]segment.Event, error
  	if err != nil {
  		return nil, fmt.Errorf("livestream: marshal sync: %w", err)
  	}
 -	out := []segment.Event{{
--		IndexedAt:           indexedAt,
+-		WitnessedAt:         witnessedAt,
 -		UpstreamRelayCursor: evt.Seq,
 -		Kind:                segment.KindSync,
 -		DID:                 evt.Sync.DID,

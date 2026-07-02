@@ -12,7 +12,6 @@ import (
 const (
 	ErrJetstreamImportTimestamps_ImportInProgress = "ImportInProgress" // Another import job is already running; only one runs at a time.
 	ErrJetstreamImportTimestamps_InvalidPath      = "InvalidPath"      // The path is empty, escapes the import directory, does not exist, or is not a regular file.
-	ErrJetstreamImportTimestamps_ImportDisabled   = "ImportDisabled"   // Timestamp import is not configured on this server.
 )
 
 // Precomputed JSON key tokens for JetstreamImportTimestamps_Output.

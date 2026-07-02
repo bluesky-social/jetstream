@@ -3,11 +3,16 @@ package jetstreamd
 import (
 	"bytes"
 	"context"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/importer"
+	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/stretchr/testify/require"
 )
@@ -174,6 +179,69 @@ func TestBuild_CreatesImportDir(t *testing.T) {
 		require.NoError(t, statErr)
 		require.True(t, info.IsDir())
 	})
+}
+
+// stubbornRunner ignores context cancellation and blocks until its gate is
+// closed, modelling an import goroutine wedged in an uninterruptible syscall.
+type stubbornRunner struct{ gate chan struct{} }
+
+func (r *stubbornRunner) RunImport(context.Context, orchestrator.ImportJob) (orchestrator.ImportResult, error) {
+	<-r.gate
+	return orchestrator.ImportResult{}, context.Canceled
+}
+
+// TestClose_FailedImportDrainLeavesStoreOpen pins the Close contract for an
+// undrained import goroutine: pebble must NOT be closed underneath it (a
+// checkpoint write after Close panics), Close must surface the drain error,
+// and a repeated Close must re-wait and finish the teardown once the goroutine
+// exits — not skip straight to closing the store.
+func TestClose_FailedImportDrainLeavesStoreOpen(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+
+	gate := make(chan struct{})
+	importDir := filepath.Join(dataDir, "imports")
+	require.NoError(t, os.MkdirAll(importDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(importDir, "a.csv"), []byte("uri,timestamp,scope,cid\n"), 0o644))
+	mgr, err := importer.New(importer.Config{
+		Store:      st,
+		Runner:     &stubbornRunner{gate: gate},
+		ImportDir:  importDir,
+		ScratchDir: filepath.Join(dataDir, "scratch"),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	runCtx, cancelImport := context.WithCancel(context.Background())
+	rt := &Runtime{
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metaStore:    st,
+		importer:     mgr,
+		importRunCtx: runCtx,
+		cancelImport: cancelImport,
+	}
+
+	_, err = mgr.Submit(runCtx, "a.csv")
+	require.NoError(t, err)
+
+	// First Close: the runner ignores the cancel, so the bounded drain fails.
+	closeCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err = rt.Close(closeCtx)
+	require.ErrorContains(t, err, "import drain")
+
+	// The store must still be open: the wedged goroutine will write its final
+	// job record through it when it eventually returns.
+	require.NoError(t, st.Set([]byte("probe"), []byte{1}, store.SyncWrites),
+		"metadata store must remain open under an undrained import goroutine")
+
+	// The goroutine exits; a repeated Close re-waits, then closes the store.
+	close(gate)
+	require.NoError(t, rt.Close(context.Background()))
+	require.Nil(t, rt.metaStore, "second Close must close the store once drained")
 }
 
 func testOptions(t *testing.T) Options {

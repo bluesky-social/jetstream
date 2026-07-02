@@ -83,9 +83,19 @@ func (m *Manager) getCurrent() (string, bool, error) {
 	return string(val), true, nil
 }
 
-func (m *Manager) clearCurrent() error {
-	if err := m.store.Delete([]byte(importCurrentKey), store.SyncWrites); err != nil {
-		return fmt.Errorf("importer: clear current job: %w", err)
+// dropSegCheckpoints range-deletes every import/job/<id>/seg/* key. Called
+// when job id reaches a terminal state: a terminal job can never resume (a
+// retry is a fresh submit with a fresh id), so its done-set is dead weight —
+// one key per touched segment per job, unbounded across the daemon's life.
+func (m *Manager) dropSegCheckpoints(id string) error {
+	prefix := []byte(segPrefix(id))
+	batch := m.store.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.DeleteRange(prefix, store.PrefixUpperBound(prefix), nil); err != nil {
+		return fmt.Errorf("importer: stage seg-checkpoint delete for job %s: %w", id, err)
+	}
+	if err := m.store.Commit(batch, store.SyncWrites); err != nil {
+		return fmt.Errorf("importer: drop seg checkpoints for job %s: %w", id, err)
 	}
 	return nil
 }

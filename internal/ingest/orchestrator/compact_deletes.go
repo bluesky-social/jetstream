@@ -385,17 +385,27 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
 			return nil
 		})
 	}
+sendLoop:
 	for _, f := range sealed {
 		select {
 		case jobs <- f:
 		case <-gctx.Done():
-			close(jobs)
-			return g.Wait()
+			break sendLoop
 		}
 	}
 	close(jobs)
-	if err := g.Wait(); err != nil {
-		return err
+	waitErr := g.Wait()
+	// A cancel can land while every worker is mid-rewrite or idle: the send
+	// loop drops the undelivered segments and the workers return nil, so
+	// g.Wait() alone can be nil for a chunk that was cut short. Fold the
+	// context in — returning nil here would let the caller commit the chunk
+	// watermark and evict tombstones for rewrites that never ran, leaving
+	// superseded rows below the watermark alive permanently.
+	if waitErr == nil {
+		waitErr = ctx.Err()
+	}
+	if waitErr != nil {
+		return waitErr
 	}
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].file.Idx < results[j].file.Idx
