@@ -1,67 +1,33 @@
 # Contributing
 
-Jetstream accepts contributions, but maintainers prioritize high-quality issues and pull requests that are small, well-scoped, and discussed before significant implementation work starts.
+While we do accept contributions, we prioritize high quality issues and pull requests. Adhering to the below guidelines will ensure a more timely review.
 
-For high-level atproto discussion, design questions, and community support, use the [atproto discussion forum](https://github.com/bluesky-social/atproto/discussions). Do not open a Jetstream issue for general protocol support.
+For high-level atproto discussion, design questions, and community support, use the [atproto discussion forum](https://github.com/bluesky-social/atproto/discussions). Please don't open a Jetstream issue for general protocol support.
 
-## Rules
+Rules:
 
-- We may not respond to every issue or pull request.
-- We may close an issue or pull request without extensive feedback.
-- We may lock discussions or contributions if maintainer attention is being overloaded.
-- We do not provide general support for local build or environment issues.
+- We may not respond to your issue or PR.
+- We may close an issue or PR without much feedback.
+- We may lock discussions or contributions if our attention is getting DDOSed.
+- We do not provide support for development build issues or self-hosting.
+- We expect _you_ to fully understand and vouch for all contributions including issues, PR descriptions, and code changes (don't just lob low quality LLM-assisted contributions over the fence).
 
-## Issues
+Guidelines:
 
-Before filing an issue, search existing issues and confirm the report is about Jetstream itself. Use issues for bugs, concrete feature requests, and small maintenance tasks.
+- Check for existing issues before filing a new one, please.
+- Open an issue and give some time for discussion before submitting a PR.
+- If submitting a PR that includes a lexicon change, please get sign off on the lexicon change before doing the implementation.
+- Issues are for bugs & feature requests related to Jetstream only, no other services.
+    - For high-level discussions, please use the [atproto discussion forum](https://github.com/bluesky-social/atproto/discussions)
+    - We do not do self-hosting customer support
+- Stay away from PRs that:
+    - Refactor large parts of the codebase
+    - Add entirely new features without prior discussion
+    - Change the tooling or frameworks used without prior discussion
+    - Introduce new unnecessary dependencies
 
-A good issue includes:
-
-- Context: what is wrong or missing, and why it matters.
-- Definition of done: the observable behavior, test, metric, or document change that would close the issue.
-- Notes: relevant alternatives, constraints, or follow-up work that should not be included in the current change.
-
-## Pull Requests
-
-Open an issue and allow time for discussion before submitting substantial changes. Pull requests are easiest to review when they solve one problem, keep commits focused, and include the right tests or documentation updates.
-
-Avoid pull requests that:
-
-- Refactor large parts of the codebase without prior discussion.
-- Add entirely new features without prior discussion.
-- Change the tooling, workflows, or frameworks used without prior discussion.
-- Introduce unnecessary dependencies.
-
-## Development
-
-Jetstream uses Nix for its pinned Go and toolchain environment. Start with:
-
-```sh
-./dev.sh
-# or
-just dev
-```
-
-Common checks:
-
-```sh
-just        # lint and short tests
-just lint
-just test
-just test-race
-just oracle
-```
-
-Use the `justfile` recipes instead of calling tools directly where possible. They are the interface CI uses and keep local behavior aligned with the repo.
+Remember, we serve a wide community of users. Our day-to-day involves us constantly asking "which top priority is our top priority." If you submit well-written PRs that solve problems concisely, that's an awesome contribution. Otherwise, as much as we'd love to accept your ideas and contributions, we really don't have the bandwidth.
 
 ## Security
 
 Do not report possible security vulnerabilities in public GitHub issues or discussion threads. Follow [SECURITY.md](SECURITY.md) instead.
-
-## CI for External Contributions
-
-CI intentionally runs on `push` events only. It does not run on fork pull requests, because that would execute untrusted contributor code in GitHub Actions.
-
-For an external contribution, a maintainer must push the branch or commits to this repository before CI runs. If your pull request does not show CI results, that does not necessarily mean CI is broken.
-
-Maintainers should preserve this security posture unless the workflow threat model is updated in the same change.
