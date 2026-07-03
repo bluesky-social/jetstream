@@ -11,6 +11,10 @@ install-tools:
     go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
     go install golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.20.0
 
+# Enters the pinned Nix development shell.
+dev *ARGS="":
+    exec nix --extra-experimental-features 'nix-command flakes' develop {{ARGS}}
+
 # Lints the code
 lint:
     golangci-lint run --timeout 5m ./...

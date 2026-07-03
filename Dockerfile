@@ -3,7 +3,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Build stage
 # ──────────────────────────────────────────────────────────────────────────────
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.4-bookworm AS build
 
 # Build-args set by `docker buildx build` (or stamped manually from CI).
 # VERSION/COMMIT/DATE are linked into internal/version via -ldflags.
