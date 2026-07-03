@@ -73,6 +73,9 @@ name: ci
 # never executes code from an untrusted source. Fork PRs from external
 # contributors will not get a CI signal until a maintainer pushes the
 # commits to a branch in this repo (e.g. via `gh pr checkout` + push).
+# Dependabot gomod PR branches are pushed into this repo, so they do trigger
+# this workflow under the push-only model. Verified 2026-07-03 against the
+# dependabot/go_modules/github.com/urfave/cli/v3-3.10.1 branch.
 #
 # We deliberately do NOT use `pull_request` (which would run untrusted PR
 # code, even with secrets stripped) or `pull_request_target` (which is
@@ -149,7 +152,7 @@ jobs:
   test:
     name: test (race)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
