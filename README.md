@@ -10,13 +10,14 @@ The original jetstream codebase is available [here](https://github.com/bluesky-s
 
 ## Getting started
 
-You'll need a recent Go (see [go.mod](https://github.com/bluesky-social/jetstream/blob/main/go.mod) for the version) and [`just`](https://github.com/casey/just). If you use Nix, `just dev` enters the pinned development shell.
-
-Once you have those, run this for first-time repo setup:
+Jetstream development uses Nix for a pinned Go and toolchain environment. Install Nix, then enter the dev shell with either:
 
 ```sh
-just install-tools  # run once after cloning
+./dev.sh
+just dev
 ```
+
+Inside that shell, all `just` recipes use the pinned tools from `flake.lock`.
 
 ## Running Locally
 

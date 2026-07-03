@@ -36,10 +36,8 @@
 #      with secrets stripped) or `pull_request_target` (runs untrusted PR
 #      code WITH secrets — the canonical "GitHub Actions PR pwn" vector).
 #
-#   6. `GOTOOLCHAIN=local` pins us to the Go version setup-go installs. Go's
-#      auto-toolchain feature would otherwise silently download and run a
-#      different version if `go.mod` declared something newer, defeating the
-#      whole point of pinning.
+#   6. The Nix flake pins Go and all development tools. CI enters that same
+#      shell for lint/tests so local and CI toolchains cannot drift.
 #
 #   7. The runner image is pinned to a specific Ubuntu version, not
 #      `ubuntu-latest`, so a Microsoft-side image roll can't change build
@@ -94,13 +92,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-env:
-  # Defeat the Go auto-toolchain. Without this, `go test` would silently
-  # download and use whatever toolchain `go.mod` points at, ignoring the
-  # version we just installed and, worse, executing arbitrary downloaded
-  # binaries before the linter runs.
-  GOTOOLCHAIN: local
-
 jobs:
   lint:
     name: lint
@@ -113,12 +104,15 @@ jobs:
         uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
         with:
           egress-policy: block
-          # Endpoints required by checkout + setup-go + setup-just + the
-          # `go install` calls in `just install-tools`. Any access outside
-          # this list is blocked at the firewall level.
+          # Endpoints required by checkout, Nix installation/evaluation,
+          # binary substitutes, and Go module downloads during the build.
+          # Any access outside this list is blocked at the firewall level.
           allowed-endpoints: >
             api.github.com:443
+            cache.nixos.org:443
+            codeload.github.com:443
             github.com:443
+            install.determinate.systems:443
             objects.githubusercontent.com:443
             release-assets.githubusercontent.com:443
             raw.githubusercontent.com:443
@@ -134,33 +128,22 @@ jobs:
           # steps (and any code they execute) could read it.
           persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
-          # Reads the `go 1.26` line from go.mod so the source of truth
-          # stays in one place.
-          go-version-file: go.mod
-          # Caching is deliberately disabled — see item 11 in the security
-          # posture preamble. The cost is a few seconds of re-downloading
-          # modules per run; the benefit is no shared mutable state for a
-          # compromised actor to poison.
-          cache: false
-
-      - name: Set up just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-
-      - name: Install tooling
-        run: just install-tools
+          determinate: false
+          diagnostic-endpoint: ""
+          github-token: ""
 
       - name: Lint
-        run: just lint
+        run: ./dev.sh --command just lint
 
       # Fail if the committed generated XRPC code in api/ has drifted from
       # the lexicons in ./lexicons. Regenerating must be a no-op; if it
       # isn't, someone edited a lexicon without running `just lexgen`.
       - name: Verify lexicon codegen is up to date
         run: |
-          just lexgen
+          ./dev.sh --command just lexgen
           git diff --exit-code -- api/
 
   test:
@@ -176,7 +159,10 @@ jobs:
           egress-policy: block
           allowed-endpoints: >
             api.github.com:443
+            cache.nixos.org:443
+            codeload.github.com:443
             github.com:443
+            install.determinate.systems:443
             objects.githubusercontent.com:443
             release-assets.githubusercontent.com:443
             raw.githubusercontent.com:443
@@ -190,20 +176,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: Set up just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-
-      - name: Install tooling
-        run: just install-tools
+          determinate: false
+          diagnostic-endpoint: ""
+          github-token: ""
 
       - name: Test (race detector)
-        run: just test-race
+        run: ./dev.sh --command just test-race
 
   docker-build:
     name: docker build
@@ -222,11 +203,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          determinate: false
+          diagnostic-endpoint: ""
+          github-token: ""
 
       - name: Build Docker image
-        run: just docker-build
+        run: ./dev.sh --command just docker-build
 
       - name: Verify Docker build stamp
         run: |

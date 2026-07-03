@@ -4,16 +4,9 @@ set dotenv-load
 # Runs the linter and tests
 default: lint test
 
-# Ensures that all tools required for local development are installed
-install-tools:
-    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1
-    go install gotest.tools/gotestsum@v1.13.0
-    go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
-    go install golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.20.0
-
 # Enters the pinned Nix development shell.
 dev *ARGS="":
-    exec nix --extra-experimental-features 'nix-command flakes' develop {{ARGS}}
+    exec ./dev.sh {{ARGS}}
 
 # Lints the code
 lint:
