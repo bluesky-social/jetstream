@@ -8,6 +8,8 @@ The original jetstream codebase is available [here](https://github.com/bluesky-s
 
 **NOTE:** This project is not yet deployed to production, and there will be backwards-incompatible changes to the on-disk format in the next few days. Do not run this yourself and expect it to remain stable until we tag a 1.0 release (coming soon!).
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
+
 ## Getting started
 
 Jetstream development uses Nix for a pinned Go and toolchain environment. Install Nix, then enter the dev shell with either:
