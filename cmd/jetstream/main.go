@@ -55,8 +55,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -67,6 +69,8 @@ import (
 	"github.com/jcalabro/atmos"
 	"github.com/urfave/cli/v3"
 )
+
+const jetstreamEnvPrefix = "JETSTREAM_"
 
 func main() {
 	if err := newApp().Run(context.Background(), os.Args); err != nil {
@@ -93,6 +97,10 @@ func newApp() *cli.Command {
 		Name:    "jetstream",
 		Usage:   "Full-network archive and streaming service for atproto",
 		Version: fmt.Sprintf("%s (commit %s, built %s)", info.Version, info.Commit, info.Date),
+		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
+			warnUnknownJetstreamEnvVars(cmd.Root(), os.Environ())
+			return ctx, nil
+		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "log-level",
@@ -475,4 +483,62 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		return runErr
 	}
 	return closeErr
+}
+
+func warnUnknownJetstreamEnvVars(root *cli.Command, environ []string) {
+	for _, key := range unknownJetstreamEnvVars(root, environ) {
+		_, _ = fmt.Fprintf(commandErrWriter(root), "jetstream: warning: unrecognized %s environment variable %s\n", jetstreamEnvPrefix, key)
+	}
+}
+
+func unknownJetstreamEnvVars(root *cli.Command, environ []string) []string {
+	known := knownEnvVars(root)
+	seen := make(map[string]struct{})
+	var unknown []string
+	for _, entry := range environ {
+		key, _, _ := strings.Cut(entry, "=")
+		if !strings.HasPrefix(key, jetstreamEnvPrefix) {
+			continue
+		}
+		if _, ok := known[key]; ok {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unknown = append(unknown, key)
+	}
+	sort.Strings(unknown)
+	return unknown
+}
+
+func knownEnvVars(root *cli.Command) map[string]struct{} {
+	out := make(map[string]struct{})
+	walkCommands(root, func(cmd *cli.Command) {
+		for _, flag := range cmd.Flags {
+			docFlag, ok := flag.(cli.DocGenerationFlag)
+			if !ok {
+				continue
+			}
+			for _, key := range docFlag.GetEnvVars() {
+				out[key] = struct{}{}
+			}
+		}
+	})
+	return out
+}
+
+func walkCommands(cmd *cli.Command, visit func(*cli.Command)) {
+	visit(cmd)
+	for _, sub := range cmd.Commands {
+		walkCommands(sub, visit)
+	}
+}
+
+func commandErrWriter(cmd *cli.Command) io.Writer {
+	if cmd != nil && cmd.ErrWriter != nil {
+		return cmd.ErrWriter
+	}
+	return os.Stderr
 }

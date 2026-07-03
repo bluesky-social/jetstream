@@ -92,62 +92,76 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 60*time.Second, opts.SubscribeSlowWindow)
 	require.Equal(t, float64(5), opts.SubscribeSlowMinRate)
 	require.Equal(t, 32, opts.CursorBlockIndexCacheSize)
+	require.Equal(t, 4*time.Hour, opts.CompactionInterval)
+	require.Equal(t, 32_000_000, opts.CompactionTombstoneCap)
 	require.Equal(t, 0, opts.CompactionRewriteWorkers)
+	require.Equal(t, "", opts.TimestampImportToken)
+	require.Equal(t, "", opts.TimestampImportDir)
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
 }
 
-// withClearedEnv unsets every environment variable the serve flags bind
-// to, restoring the prior values via t.Cleanup. urfave/cli treats those
-// vars as flag sources, so a default-value assertion is only meaningful
-// in an environment where none of them are set. The caller must NOT be
-// parallel: this mutates global process state.
+// withClearedEnv unsets every JETSTREAM_* variable plus every non-prefixed
+// environment variable the flags bind to, restoring the prior values via
+// t.Cleanup. urfave/cli treats those vars as flag sources, so a default-value
+// assertion is only meaningful in an environment where none of them are set.
+// The caller must NOT be parallel: this mutates global process state.
 func withClearedEnv(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{
-		"JETSTREAM_ADDR",
-		"JETSTREAM_DEBUG_ADDR",
-		"JETSTREAM_DATA_DIR",
-		"JETSTREAM_RELAY_URL",
-		"JETSTREAM_PLC_URL",
-		"OTEL_SERVICE_NAME",
-		"JETSTREAM_LOG_LEVEL",
-		"JETSTREAM_LOG_FORMAT",
-		"JETSTREAM_SHUTDOWN_TIMEOUT",
-		"JETSTREAM_CLIENT_DRAIN_TIMEOUT",
-		"JETSTREAM_MAX_BACKFILL_REPOS",
-		"JETSTREAM_BACKFILL_WORKERS",
-		"JETSTREAM_BACKFILL_BATCH_SIZE",
-		"JETSTREAM_BACKFILL_ASYNC_FLUSH_WORKERS",
-		"JETSTREAM_BACKFILL_REPOS",
-		"JETSTREAM_SKIP_MERGE_DISCOVERY",
-		"JETSTREAM_FAILED_REPO_RETRY_INTERVAL",
-		"JETSTREAM_FAILED_REPO_RETRY_WORKERS",
-		"JETSTREAM_FAILED_REPO_RETRY_HOST_WORKERS",
-		"JETSTREAM_FAILED_REPO_RETRY_MAX_DELAY",
-		"JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS",
-		"JETSTREAM_CURSOR_LOOKBACK",
-		"JETSTREAM_SEGMENT_CACHE_MAX_AGE",
-		"JETSTREAM_PLAN_MAX_DIDS",
-		"JETSTREAM_PLAN_MAX_COLLECTIONS",
-		"JETSTREAM_PLAN_MAX_ENTRIES",
-		"JETSTREAM_PLAN_WHOLE_SEGMENT_THRESHOLD",
-		"JETSTREAM_SUBSCRIBE_HOT_TAIL_BYTES",
-		"JETSTREAM_SUBSCRIBE_BLOCK_CACHE_BYTES",
-		"JETSTREAM_SUBSCRIBE_READ_BATCH",
-		"JETSTREAM_SUBSCRIBE_SLOW_WINDOW",
-		"JETSTREAM_SUBSCRIBE_SLOW_MIN_RATE",
-		"JETSTREAM_CURSOR_BLOCK_INDEX_CACHE_SIZE",
-		"JETSTREAM_COMPACTION_INTERVAL",
-		"JETSTREAM_COMPACTION_TOMBSTONE_CAP",
-		"JETSTREAM_COMPACTION_REWRITE_WORKERS",
-	} {
+	keys := knownEnvVars(newApp())
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, jetstreamEnvPrefix) {
+			keys[key] = struct{}{}
+		}
+	}
+	for key := range keys {
+		key := key
 		if prev, ok := os.LookupEnv(key); ok {
 			require.NoError(t, os.Unsetenv(key))
 			t.Cleanup(func() { _ = os.Setenv(key, prev) })
 		}
 	}
+}
+
+func TestNewApp_WarnsOnUnknownJetstreamEnvVars(t *testing.T) {
+	withClearedEnv(t)
+	t.Setenv("JETSTREAM_ADDR", "127.0.0.1:0")
+	t.Setenv("JETSTREAM_ADDR_TYPO", "127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example.com:4318")
+
+	var errBuf bytes.Buffer
+	app := newApp()
+	app.ErrWriter = &errBuf
+	for _, cmd := range app.Commands {
+		if cmd.Name != "serve" {
+			continue
+		}
+		cmd.Action = func(context.Context, *cli.Command) error {
+			return nil
+		}
+		break
+	}
+
+	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
+
+	errOut := errBuf.String()
+	require.Contains(t, errOut, "jetstream: warning: unrecognized JETSTREAM_ environment variable JETSTREAM_ADDR_TYPO")
+	require.NotContains(t, errOut, "JETSTREAM_ADDR\n")
+	require.NotContains(t, errOut, "OTEL_EXPORTER_OTLP_ENDPOINT")
+}
+
+func TestUnknownJetstreamEnvVars_SortedAndDedupesKnownFlags(t *testing.T) {
+	t.Parallel()
+
+	got := unknownJetstreamEnvVars(newApp(), []string{
+		"JETSTREAM_ZZZ=1",
+		"JETSTREAM_ADDR=127.0.0.1:0",
+		"OTEL_SERVICE_NAME=jetstream-test",
+		"JETSTREAM_AAA=value=with=equals",
+	})
+	require.Equal(t, []string{"JETSTREAM_AAA", "JETSTREAM_ZZZ"}, got)
 }
 
 func TestServeOptionsFromCLI_Overrides(t *testing.T) {
@@ -202,7 +216,11 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--subscribe-slow-window=22s",
 		"--subscribe-slow-min-rate=9.5",
 		"--cursor-block-index-cache-size=99",
+		"--compaction-interval=9h",
+		"--compaction-tombstone-cap=123456",
 		"--compaction-rewrite-workers=3",
+		"--timestamp-import-token=test-token",
+		"--timestamp-import-dir=/tmp/jetstream-imports",
 	}))
 	require.Equal(t, "127.0.0.1:18080", opts.PublicAddr)
 	require.Equal(t, "127.0.0.1:16060", opts.DebugAddr)
@@ -238,7 +256,11 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 22*time.Second, opts.SubscribeSlowWindow)
 	require.Equal(t, 9.5, opts.SubscribeSlowMinRate)
 	require.Equal(t, 99, opts.CursorBlockIndexCacheSize)
+	require.Equal(t, 9*time.Hour, opts.CompactionInterval)
+	require.Equal(t, 123456, opts.CompactionTombstoneCap)
 	require.Equal(t, 3, opts.CompactionRewriteWorkers)
+	require.Equal(t, "test-token", opts.TimestampImportToken)
+	require.Equal(t, "/tmp/jetstream-imports", opts.TimestampImportDir)
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
