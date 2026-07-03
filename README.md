@@ -14,10 +14,9 @@ Jetstream development uses Nix for a pinned Go and toolchain environment. Instal
 
 ```sh
 ./dev.sh
+# or
 just dev
 ```
-
-Inside that shell, all `just` recipes use the pinned tools from `flake.lock`.
 
 ## Running Locally
 
