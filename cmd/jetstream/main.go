@@ -1,4 +1,4 @@
-// Command jetstream is the entry point for the jetstream-v2 process.
+// Command jetstream is the entry point for the jetstream process.
 //
 // # Configuration surface
 //

@@ -700,4 +700,7 @@ Sorting the CSV by DID is *recommended, not required*: it keeps the bucketer's p
 7. https://github.com/bluesky-social/indigo/tree/main/cmd/tap
 8. https://github.com/jcalabro/gloom
 
-NOTE (jrc): we should treat the existing jetstream HTTP API surface as legacy, and is only there for backwards compatability. We will instead be building on XRPC. We’ll maintain the old surface, but also duplicate the existing API to XRPC, and all net-new stuff will be XRPC.
+The existing Jetstream HTTP API surface is maintained for backward
+compatibility with Jetstream v1 clients. New control-plane APIs should be XRPC,
+and existing HTTP endpoints should gain XRPC equivalents before the legacy
+surface expands.

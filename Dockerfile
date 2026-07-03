@@ -3,7 +3,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Build stage
 # ──────────────────────────────────────────────────────────────────────────────
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.4-bookworm AS build
 
 # Build-args set by `docker buildx build` (or stamped manually from CI).
 # VERSION/COMMIT/DATE are linked into internal/version via -ldflags.
@@ -43,9 +43,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -buildvcs=false \
       -ldflags " \
         -extldflags=-static \
-        -X github.com/bluesky-social/jetstream-v2/internal/version.Version=${VERSION} \
-        -X github.com/bluesky-social/jetstream-v2/internal/version.Commit=${COMMIT} \
-        -X github.com/bluesky-social/jetstream-v2/internal/version.Date=${DATE}" \
+        -X github.com/bluesky-social/jetstream/internal/version.Version=${VERSION} \
+        -X github.com/bluesky-social/jetstream/internal/version.Commit=${COMMIT} \
+        -X github.com/bluesky-social/jetstream/internal/version.Date=${DATE}" \
       -o /out/jetstream \
       ./cmd/jetstream
 

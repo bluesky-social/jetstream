@@ -107,7 +107,7 @@ const fallbackTracerName = "observe"
 // tracerForCallerInfo turns a gt.CallerInfo into the project-scoped
 // tracer for that frame. We trim the repo prefix and a leading
 // "internal/" so a span emitted from
-// github.com/bluesky-social/jetstream-v2/internal/ingest/live lands
+// github.com/bluesky-social/jetstream/internal/ingest/live lands
 // under jetstream/ingest/live.
 func tracerForCallerInfo(info gt.CallerInfo) trace.Tracer {
 	pkg := strings.TrimPrefix(info.Package, repoPathPrefix)

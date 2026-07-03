@@ -1,6 +1,6 @@
 # Jetstream
 
-[![ci](https://github.com/bluesky-social/jetstream-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/bluesky-social/jetstream-v2/actions/workflows/ci.yml)
+[![ci](https://github.com/bluesky-social/jetstream/actions/workflows/ci.yml/badge.svg)](https://github.com/bluesky-social/jetstream/actions/workflows/ci.yml)
 
 Full-network archive and streaming service for atproto.
 
@@ -8,14 +8,16 @@ The original jetstream codebase is available [here](https://github.com/bluesky-s
 
 **NOTE:** This project is not yet deployed to production, and there will be backwards-incompatible changes to the on-disk format in the next few days. Do not run this yourself and expect it to remain stable until we tag a 1.0 release (coming soon!).
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
 ## Getting started
 
-You'll need a recent Go (see [go.mod](https://github.com/bluesky-social/jetstream-v2/blob/main/go.mod) for the version) and [`just`](https://github.com/casey/just).
-
-Once you have those, run this for first-time repo setup:
+Jetstream development uses Nix for a pinned Go and toolchain environment. Install Nix, then enter the dev shell with either:
 
 ```sh
-just install-tools  # run once after cloning
+./dev.sh
+# or
+just dev
 ```
 
 ## Running Locally

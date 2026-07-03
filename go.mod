@@ -1,6 +1,6 @@
 module github.com/bluesky-social/jetstream
 
-go 1.26
+go 1.26.4
 
 require (
 	github.com/cockroachdb/pebble v1.1.5

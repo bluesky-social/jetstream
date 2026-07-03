@@ -6,7 +6,7 @@ package version
 
 // These variables are set via:
 //
-//	go build -ldflags "-X github.com/bluesky-social/jetstream-v2/internal/version.Version=v1.2.3 ..."
+//	go build -ldflags "-X github.com/bluesky-social/jetstream/internal/version.Version=v1.2.3 ..."
 var (
 	Version = "dev"
 	Commit  = "unknown"

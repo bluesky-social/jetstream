@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	docsLink = "https://github.com/bluesky-social/jetstream-v2"
+	docsLink = "https://github.com/bluesky-social/jetstream"
 )
 
 var (

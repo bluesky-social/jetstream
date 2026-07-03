@@ -1,0 +1,115 @@
+# Scheduled CI lanes that are too slow or network-dependent for push CI.
+#
+# Keep this separate from oracle-scheduled.yml and mutation-campaign-scheduled.yml:
+# those are simulator/oracle bug-hunting jobs, while this workflow covers
+# dependency vulnerability scanning and hostile-input fuzzing.
+
+name: ci-scheduled
+
+on:
+  schedule:
+    # Every 6 hours, offset from oracle-scheduled.yml's minute 17.
+    - cron: "47 1,7,13,19 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            cache.nixos.org:443
+            codeload.github.com:443
+            github.com:443
+            install.determinate.systems:443
+            releases.nixos.org:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            dl.google.com:443
+            vuln.go.dev:443
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          determinate: false
+          diagnostic-endpoint: ""
+          github-token: ""
+
+      - name: govulncheck
+        run: ./dev.sh --command just vuln
+
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            cache.nixos.org:443
+            codeload.github.com:443
+            github.com:443
+            install.determinate.systems:443
+            releases.nixos.org:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            dl.google.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          determinate: false
+          diagnostic-endpoint: ""
+          github-token: ""
+
+      - name: Fuzz
+        run: ./dev.sh --command just fuzz 60s
+
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-failure-corpus
+          path: |
+            **/testdata/fuzz/**
+          if-no-files-found: warn
+          retention-days: 14

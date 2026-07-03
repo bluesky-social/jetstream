@@ -4,15 +4,17 @@ set dotenv-load
 # Runs the linter and tests
 default: lint test
 
-# Ensures that all tools required for local development are installed
-install-tools:
-    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1
-    go install gotest.tools/gotestsum@v1.13.0
-    go install golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.20.0
+# Enters the pinned Nix development shell.
+dev *ARGS="":
+    exec ./dev.sh {{ARGS}}
 
 # Lints the code
 lint:
     golangci-lint run --timeout 5m ./...
+
+# Scans module dependencies and reachable code for known Go vulnerabilities.
+vuln *ARGS="./...":
+    govulncheck {{ARGS}}
 
 # Apply Go modernization rewrites
 modernize *ARGS="./...":
@@ -37,6 +39,27 @@ build:
         name="$(basename "${cmd}")"
         go build -trimpath -ldflags "${ldflags}" -o "bin/${name}" "${cmd}"
     done
+
+# Build the Docker image locally, stamping the same build info as `just build`.
+# `--load` intentionally keeps this to one platform so the image can be run
+# immediately for smoke checks (`docker run --rm jetstream:local version`).
+docker-build TAG="jetstream:local" PLATFORM="linux/amd64":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+    commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    if ! git diff --quiet HEAD 2>/dev/null; then
+        commit="${commit}-dirty"
+    fi
+    date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    docker buildx build \
+        --load \
+        --platform "{{PLATFORM}}" \
+        --build-arg "VERSION=${version}" \
+        --build-arg "COMMIT=${commit}" \
+        --build-arg "DATE=${date}" \
+        --tag "{{TAG}}" \
+        .
 
 # Remove build artifacts and local data.
 clean:
