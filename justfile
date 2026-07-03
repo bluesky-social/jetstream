@@ -38,6 +38,27 @@ build:
         go build -trimpath -ldflags "${ldflags}" -o "bin/${name}" "${cmd}"
     done
 
+# Build the Docker image locally, stamping the same build info as `just build`.
+# `--load` intentionally keeps this to one platform so the image can be run
+# immediately for smoke checks (`docker run --rm jetstream:local version`).
+docker-build TAG="jetstream:local" PLATFORM="linux/amd64":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+    commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    if ! git diff --quiet HEAD 2>/dev/null; then
+        commit="${commit}-dirty"
+    fi
+    date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    docker buildx build \
+        --load \
+        --platform "{{PLATFORM}}" \
+        --build-arg "VERSION=${version}" \
+        --build-arg "COMMIT=${commit}" \
+        --build-arg "DATE=${date}" \
+        --tag "{{TAG}}" \
+        .
+
 # Remove build artifacts and local data.
 clean:
     rm -rf bin

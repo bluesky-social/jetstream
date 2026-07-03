@@ -1,4 +1,4 @@
-# CI for jetstream-v2.
+# CI for jetstream.
 #
 # Security posture
 # ----------------
@@ -204,3 +204,37 @@ jobs:
 
       - name: Test (race detector)
         run: just test-race
+
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # This job intentionally does not use harden-runner's egress blocklist.
+    # It has no secrets and no package write token; it only proves that the
+    # Dockerfile still builds and stamps version metadata. Docker registries
+    # redirect layer downloads through changing CDN/storage hosts, so a strict
+    # allowlist here is noisy without materially improving this job's risk.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Build Docker image
+        run: just docker-build
+
+      - name: Verify Docker build stamp
+        run: |
+          out="$(docker run --rm jetstream:local version)"
+          echo "${out}"
+          case "${out}" in
+            *" version dev "*|*"commit unknown"*|*"built unknown"*)
+              echo "Docker build did not stamp version metadata" >&2
+              exit 1
+              ;;
+          esac

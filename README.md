@@ -1,6 +1,6 @@
 # Jetstream
 
-[![ci](https://github.com/bluesky-social/jetstream-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/bluesky-social/jetstream-v2/actions/workflows/ci.yml)
+[![ci](https://github.com/bluesky-social/jetstream/actions/workflows/ci.yml/badge.svg)](https://github.com/bluesky-social/jetstream/actions/workflows/ci.yml)
 
 Full-network archive and streaming service for atproto.
 
@@ -10,7 +10,7 @@ The original jetstream codebase is available [here](https://github.com/bluesky-s
 
 ## Getting started
 
-You'll need a recent Go (see [go.mod](https://github.com/bluesky-social/jetstream-v2/blob/main/go.mod) for the version) and [`just`](https://github.com/casey/just).
+You'll need a recent Go (see [go.mod](https://github.com/bluesky-social/jetstream/blob/main/go.mod) for the version) and [`just`](https://github.com/casey/just).
 
 Once you have those, run this for first-time repo setup:
 
