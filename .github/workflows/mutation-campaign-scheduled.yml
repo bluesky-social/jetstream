@@ -54,6 +54,7 @@ jobs:
             codeload.github.com:443
             github.com:443
             install.determinate.systems:443
+            releases.nixos.org:443
             objects.githubusercontent.com:443
             release-assets.githubusercontent.com:443
             raw.githubusercontent.com:443
