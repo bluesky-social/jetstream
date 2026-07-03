@@ -721,6 +721,9 @@ func TestResumeIncomplete_SkipsCheckpointedSegments(t *testing.T) {
 	require.NoError(t, err)
 	<-stopped // segment 0 checkpointed; runner now blocked on ctx
 	cancel()  // simulate shutdown/crash mid-import
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	require.NoError(t, m1.Wait(waitCtx), "first manager must drain its pause write before restart")
 
 	// The paused job stays current + resumable (non-terminal); it is not
 	// cleared like a completed job.

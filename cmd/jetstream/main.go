@@ -95,13 +95,20 @@ func main() {
 // Concretely this means both `jetstream --log-level=debug serve` and
 // `JETSTREAM_LOG_LEVEL=debug jetstream serve` work.
 func newApp() *cli.Command {
+	return newAppWithEnviron(os.Environ)
+}
+
+func newAppWithEnviron(environ func() []string) *cli.Command {
+	if environ == nil {
+		environ = os.Environ
+	}
 	info := version.Get()
 	return &cli.Command{
 		Name:    "jetstream",
 		Usage:   "Full-network archive and streaming service for atproto",
 		Version: fmt.Sprintf("%s (commit %s, built %s)", info.Version, info.Commit, info.Date),
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
-			return ctx, rejectUnknownJetstreamEnvVars(cmd.Root(), os.Environ())
+			return ctx, rejectUnknownJetstreamEnvVars(cmd.Root(), environ())
 		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{

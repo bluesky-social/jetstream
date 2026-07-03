@@ -43,7 +43,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	// env here is safe.
 	withClearedEnv(t)
 
-	app := newApp()
+	app := newTestApp()
 	var opts jetstreamd.Options
 	for _, cmd := range app.Commands {
 		if cmd.Name != "serve" {
@@ -109,7 +109,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 // The caller must NOT be parallel: this mutates global process state.
 func withClearedEnv(t *testing.T) {
 	t.Helper()
-	keys := knownEnvVars(newApp())
+	keys := knownEnvVars(newTestApp())
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
 		if strings.HasPrefix(key, jetstreamEnvPrefix) {
@@ -126,13 +126,14 @@ func withClearedEnv(t *testing.T) {
 }
 
 func TestNewApp_RejectsUnknownJetstreamEnvVars(t *testing.T) {
-	withClearedEnv(t)
-	t.Setenv("JETSTREAM_ADDR", "127.0.0.1:0")
-	t.Setenv("JETSTREAM_ADDR_TYPO", "127.0.0.1:1")
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example.com:4318")
-
 	var actionCalled bool
-	app := newApp()
+	app := newAppWithEnviron(func() []string {
+		return []string{
+			"JETSTREAM_ADDR=127.0.0.1:0",
+			"JETSTREAM_ADDR_TYPO=127.0.0.1:1",
+			"OTEL_EXPORTER_OTLP_ENDPOINT=http://otel.example.com:4318",
+		}
+	})
 	for _, cmd := range app.Commands {
 		if cmd.Name != "serve" {
 			continue
@@ -156,7 +157,7 @@ func TestNewApp_RejectsUnknownJetstreamEnvVars(t *testing.T) {
 func TestUnknownJetstreamEnvVars_SortedAndDedupesKnownFlags(t *testing.T) {
 	t.Parallel()
 
-	got := unknownJetstreamEnvVars(newApp(), []string{
+	got := unknownJetstreamEnvVars(newTestApp(), []string{
 		"JETSTREAM_ZZZ=1",
 		"JETSTREAM_ADDR=127.0.0.1:0",
 		"JETSTREAM_SIM_DATA_DIR=./data-sim",
@@ -169,7 +170,7 @@ func TestUnknownJetstreamEnvVars_SortedAndDedupesKnownFlags(t *testing.T) {
 func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	t.Parallel()
 
-	app := newApp()
+	app := newTestApp()
 	var opts jetstreamd.Options
 	for _, cmd := range app.Commands {
 		if cmd.Name != "serve" {
@@ -271,7 +272,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
 	withClearedEnv(t)
 
-	app := newApp()
+	app := newTestApp()
 	var opts jetstreamd.Options
 	for _, cmd := range app.Commands {
 		if cmd.Name != "serve" {
@@ -306,7 +307,7 @@ func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
 func TestServeOptionsFromCLI_DisableRepoActionRateLimitsEnv(t *testing.T) {
 	withClearedEnv(t)
 
-	app := newApp()
+	app := newTestApp()
 	var opts jetstreamd.Options
 	for _, cmd := range app.Commands {
 		if cmd.Name != "serve" {
@@ -329,7 +330,7 @@ func TestServeOptionsFromCLI_DisableRepoActionRateLimitsEnv(t *testing.T) {
 func TestServeOptionsFromCLI_RejectsBackfillReposWithMaxBackfillRepos(t *testing.T) {
 	t.Parallel()
 
-	err := newApp().Run(t.Context(), []string{
+	err := newTestApp().Run(t.Context(), []string{
 		"jetstream", "serve",
 		"--max-backfill-repos=1",
 		"--backfill-repos=did:plc:aaa",
@@ -341,7 +342,7 @@ func TestServeOptionsFromCLI_RejectsBackfillReposWithMaxBackfillRepos(t *testing
 func TestServeOptionsFromCLI_MaxBackfillReposOverride(t *testing.T) {
 	t.Parallel()
 
-	app := newApp()
+	app := newTestApp()
 	var opts jetstreamd.Options
 	for _, cmd := range app.Commands {
 		if cmd.Name != "serve" {
@@ -366,7 +367,7 @@ func TestServeOptionsFromCLI_MaxBackfillReposOverride(t *testing.T) {
 func TestServeOptionsFromCLI_RejectsDuplicateBackfillRepos(t *testing.T) {
 	t.Parallel()
 
-	err := newApp().Run(t.Context(), []string{
+	err := newTestApp().Run(t.Context(), []string{
 		"jetstream", "serve",
 		"--backfill-repos=did:plc:aaa,did:plc:aaa",
 	})
@@ -448,7 +449,7 @@ func TestServe_BootstrapsAndShutsDownCleanly(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- newApp().Run(ctx, []string{
+		done <- newTestApp().Run(ctx, []string{
 			"jetstream",
 			"--log-format=text",
 			"--log-level=warn",
@@ -595,7 +596,7 @@ func TestServe_StartsInSteadyStatePhase(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- newApp().Run(ctx, []string{
+		done <- newTestApp().Run(ctx, []string{
 			"jetstream",
 			"--log-format=text",
 			"--log-level=warn",
@@ -671,7 +672,7 @@ func TestServe_AdvancesFromMergingToSteadyState(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- newApp().Run(ctx, []string{
+		done <- newTestApp().Run(ctx, []string{
 			"jetstream",
 			"--log-format=text",
 			"--log-level=warn",

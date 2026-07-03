@@ -278,7 +278,7 @@ func TestInspectSegmentCommand_EndToEndAgainstRealFile(t *testing.T) {
 	path := makeSealedFixture(t)
 
 	var buf bytes.Buffer
-	app := newApp()
+	app := newTestApp()
 	app.Writer = &buf
 
 	err := app.Run(t.Context(), []string{
@@ -300,7 +300,7 @@ func TestInspectSegmentCommand_RejectsBadFlag(t *testing.T) {
 	t.Parallel()
 	path := makeSealedFixture(t)
 
-	app := newApp()
+	app := newTestApp()
 	app.Writer = new(bytes.Buffer)
 	err := app.Run(t.Context(), []string{
 		"jetstream", "inspect-segment", "--blocks=foo", path,
@@ -311,7 +311,7 @@ func TestInspectSegmentCommand_RejectsBadFlag(t *testing.T) {
 
 func TestInspectSegmentCommand_RejectsMissingArg(t *testing.T) {
 	t.Parallel()
-	app := newApp()
+	app := newTestApp()
 	app.Writer = new(bytes.Buffer)
 	err := app.Run(t.Context(), []string{"jetstream", "inspect-segment"})
 	require.Error(t, err)
