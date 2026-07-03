@@ -125,31 +125,32 @@ func withClearedEnv(t *testing.T) {
 	}
 }
 
-func TestNewApp_WarnsOnUnknownJetstreamEnvVars(t *testing.T) {
+func TestNewApp_RejectsUnknownJetstreamEnvVars(t *testing.T) {
 	withClearedEnv(t)
 	t.Setenv("JETSTREAM_ADDR", "127.0.0.1:0")
 	t.Setenv("JETSTREAM_ADDR_TYPO", "127.0.0.1:1")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example.com:4318")
 
-	var errBuf bytes.Buffer
+	var actionCalled bool
 	app := newApp()
-	app.ErrWriter = &errBuf
 	for _, cmd := range app.Commands {
 		if cmd.Name != "serve" {
 			continue
 		}
 		cmd.Action = func(context.Context, *cli.Command) error {
+			actionCalled = true
 			return nil
 		}
 		break
 	}
 
-	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
+	err := app.Run(t.Context(), []string{"jetstream", "serve"})
 
-	errOut := errBuf.String()
-	require.Contains(t, errOut, "jetstream: warning: unrecognized JETSTREAM_ environment variable JETSTREAM_ADDR_TYPO")
-	require.NotContains(t, errOut, "JETSTREAM_ADDR\n")
-	require.NotContains(t, errOut, "OTEL_EXPORTER_OTLP_ENDPOINT")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "unrecognized JETSTREAM_ environment variable JETSTREAM_ADDR_TYPO")
+	require.NotContains(t, err.Error(), "JETSTREAM_ADDR ")
+	require.NotContains(t, err.Error(), "OTEL_EXPORTER_OTLP_ENDPOINT")
+	require.False(t, actionCalled)
 }
 
 func TestUnknownJetstreamEnvVars_SortedAndDedupesKnownFlags(t *testing.T) {
@@ -158,6 +159,7 @@ func TestUnknownJetstreamEnvVars_SortedAndDedupesKnownFlags(t *testing.T) {
 	got := unknownJetstreamEnvVars(newApp(), []string{
 		"JETSTREAM_ZZZ=1",
 		"JETSTREAM_ADDR=127.0.0.1:0",
+		"JETSTREAM_SIM_DATA_DIR=./data-sim",
 		"OTEL_SERVICE_NAME=jetstream-test",
 		"JETSTREAM_AAA=value=with=equals",
 	})

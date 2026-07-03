@@ -55,7 +55,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"sort"
@@ -71,6 +70,10 @@ import (
 )
 
 const jetstreamEnvPrefix = "JETSTREAM_"
+
+var knownForeignJetstreamEnvPrefixes = []string{
+	"JETSTREAM_SIM_",
+}
 
 func main() {
 	if err := newApp().Run(context.Background(), os.Args); err != nil {
@@ -98,8 +101,7 @@ func newApp() *cli.Command {
 		Usage:   "Full-network archive and streaming service for atproto",
 		Version: fmt.Sprintf("%s (commit %s, built %s)", info.Version, info.Commit, info.Date),
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
-			warnUnknownJetstreamEnvVars(cmd.Root(), os.Environ())
-			return ctx, nil
+			return ctx, rejectUnknownJetstreamEnvVars(cmd.Root(), os.Environ())
 		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -485,9 +487,15 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	return closeErr
 }
 
-func warnUnknownJetstreamEnvVars(root *cli.Command, environ []string) {
-	for _, key := range unknownJetstreamEnvVars(root, environ) {
-		_, _ = fmt.Fprintf(commandErrWriter(root), "jetstream: warning: unrecognized %s environment variable %s\n", jetstreamEnvPrefix, key)
+func rejectUnknownJetstreamEnvVars(root *cli.Command, environ []string) error {
+	unknown := unknownJetstreamEnvVars(root, environ)
+	switch len(unknown) {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("unrecognized %s environment variable %s", jetstreamEnvPrefix, unknown[0])
+	default:
+		return fmt.Errorf("unrecognized %s environment variables: %s", jetstreamEnvPrefix, strings.Join(unknown, ", "))
 	}
 }
 
@@ -498,6 +506,9 @@ func unknownJetstreamEnvVars(root *cli.Command, environ []string) []string {
 	for _, entry := range environ {
 		key, _, _ := strings.Cut(entry, "=")
 		if !strings.HasPrefix(key, jetstreamEnvPrefix) {
+			continue
+		}
+		if hasAnyPrefix(key, knownForeignJetstreamEnvPrefixes) {
 			continue
 		}
 		if _, ok := known[key]; ok {
@@ -511,6 +522,15 @@ func unknownJetstreamEnvVars(root *cli.Command, environ []string) []string {
 	}
 	sort.Strings(unknown)
 	return unknown
+}
+
+func hasAnyPrefix(key string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func knownEnvVars(root *cli.Command) map[string]struct{} {
@@ -534,11 +554,4 @@ func walkCommands(cmd *cli.Command, visit func(*cli.Command)) {
 	for _, sub := range cmd.Commands {
 		walkCommands(sub, visit)
 	}
-}
-
-func commandErrWriter(cmd *cli.Command) io.Writer {
-	if cmd != nil && cmd.ErrWriter != nil {
-		return cmd.ErrWriter
-	}
-	return os.Stderr
 }
