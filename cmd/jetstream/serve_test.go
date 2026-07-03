@@ -126,6 +126,8 @@ func withClearedEnv(t *testing.T) {
 }
 
 func TestNewApp_RejectsUnknownJetstreamEnvVars(t *testing.T) {
+	t.Parallel()
+
 	var actionCalled bool
 	app := newAppWithEnviron(func() []string {
 		return []string{
