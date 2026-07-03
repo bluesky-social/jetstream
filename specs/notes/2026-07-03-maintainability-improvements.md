@@ -3,7 +3,8 @@
 Status: **active planning doc.** Split out of
 `2026-07-02-tech-debt-paydown-ideation.md` (§0/§3/§4) after Jim's review; the
 parent doc holds the full exploration evidence and decision trail. This doc is
-the forward-looking plan only. No issues filed yet.
+the forward-looking plan only. Issues are linked on individual items as work is
+split out.
 
 Scope note: oracle/simulator testing work lives in
 `2026-07-03-oracle-testing-improvements.md`. Explicitly out of scope per Jim:
@@ -102,8 +103,8 @@ user-facing documentation, HA mode.
   ENOSPC → clean crash → clean recovery, no corrupt tail (oracle doc, work
   item 3), plus coverage in the advanced tiers (crashpoint/mutation) as they
   apply.
-- **Unrecognized-env-var warning at startup** — a typo'd `JETSTREAM_*` var is
-  silently ignored today; ~30 lines to warn on unknown prefix matches.
+- **Unrecognized-env-var rejection at startup** (#223) — a typo'd `JETSTREAM_*` var is
+  silently ignored today; reject unknown prefix matches before command execution.
 - **Panic posture for long-lived goroutines** — one `recover()` in the whole
   codebase; an ingest/orchestrator panic dies as a bare stderr traceback that
   log shippers mangle. Top-of-goroutine recover-log-rethrow in

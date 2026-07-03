@@ -57,6 +57,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -67,6 +68,12 @@ import (
 	"github.com/jcalabro/atmos"
 	"github.com/urfave/cli/v3"
 )
+
+const jetstreamEnvPrefix = "JETSTREAM_"
+
+var knownForeignJetstreamEnvPrefixes = []string{
+	"JETSTREAM_SIM_",
+}
 
 func main() {
 	if err := newApp().Run(context.Background(), os.Args); err != nil {
@@ -88,11 +95,21 @@ func main() {
 // Concretely this means both `jetstream --log-level=debug serve` and
 // `JETSTREAM_LOG_LEVEL=debug jetstream serve` work.
 func newApp() *cli.Command {
+	return newAppWithEnviron(os.Environ)
+}
+
+func newAppWithEnviron(environ func() []string) *cli.Command {
+	if environ == nil {
+		environ = os.Environ
+	}
 	info := version.Get()
 	return &cli.Command{
 		Name:    "jetstream",
 		Usage:   "Full-network archive and streaming service for atproto",
 		Version: fmt.Sprintf("%s (commit %s, built %s)", info.Version, info.Commit, info.Date),
+		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
+			return ctx, rejectUnknownJetstreamEnvVars(cmd.Root(), environ())
+		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "log-level",
@@ -475,4 +492,73 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 		return runErr
 	}
 	return closeErr
+}
+
+func rejectUnknownJetstreamEnvVars(root *cli.Command, environ []string) error {
+	unknown := unknownJetstreamEnvVars(root, environ)
+	switch len(unknown) {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("unrecognized %s environment variable %s", jetstreamEnvPrefix, unknown[0])
+	default:
+		return fmt.Errorf("unrecognized %s environment variables: %s", jetstreamEnvPrefix, strings.Join(unknown, ", "))
+	}
+}
+
+func unknownJetstreamEnvVars(root *cli.Command, environ []string) []string {
+	known := knownEnvVars(root)
+	seen := make(map[string]struct{})
+	var unknown []string
+	for _, entry := range environ {
+		key, _, _ := strings.Cut(entry, "=")
+		if !strings.HasPrefix(key, jetstreamEnvPrefix) {
+			continue
+		}
+		if hasAnyPrefix(key, knownForeignJetstreamEnvPrefixes) {
+			continue
+		}
+		if _, ok := known[key]; ok {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unknown = append(unknown, key)
+	}
+	sort.Strings(unknown)
+	return unknown
+}
+
+func hasAnyPrefix(key string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func knownEnvVars(root *cli.Command) map[string]struct{} {
+	out := make(map[string]struct{})
+	walkCommands(root, func(cmd *cli.Command) {
+		for _, flag := range cmd.Flags {
+			docFlag, ok := flag.(cli.DocGenerationFlag)
+			if !ok {
+				continue
+			}
+			for _, key := range docFlag.GetEnvVars() {
+				out[key] = struct{}{}
+			}
+		}
+	})
+	return out
+}
+
+func walkCommands(cmd *cli.Command, visit func(*cli.Command)) {
+	visit(cmd)
+	for _, sub := range cmd.Commands {
+		walkCommands(sub, visit)
+	}
 }

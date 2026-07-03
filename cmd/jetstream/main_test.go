@@ -15,7 +15,7 @@ func TestNewApp_VersionCommandPrintsToStdout(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	app := newApp()
+	app := newTestApp()
 	app.Writer = &buf
 
 	err := app.Run(t.Context(), []string{"jetstream", "version"})
@@ -33,7 +33,7 @@ func TestNewApp_InspectSegmentRunsAgainstSealedFile(t *testing.T) {
 	path := makeSealedFixture(t)
 
 	var buf bytes.Buffer
-	app := newApp()
+	app := newTestApp()
 	app.Writer = &buf
 
 	err := app.Run(t.Context(), []string{"jetstream", "inspect-segment", path})
