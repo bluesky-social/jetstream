@@ -8,11 +8,16 @@ default: lint test
 install-tools:
     go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1
     go install gotest.tools/gotestsum@v1.13.0
+    go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
     go install golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.20.0
 
 # Lints the code
 lint:
     golangci-lint run --timeout 5m ./...
+
+# Scans module dependencies and reachable code for known Go vulnerabilities.
+vuln *ARGS="./...":
+    govulncheck {{ARGS}}
 
 # Apply Go modernization rewrites
 modernize *ARGS="./...":

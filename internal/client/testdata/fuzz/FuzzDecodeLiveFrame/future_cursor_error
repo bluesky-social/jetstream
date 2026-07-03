@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"error\":\"FutureCursor\",\"message\":\"cursor is ahead of the live tail\"}")

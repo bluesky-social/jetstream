@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"kind\":\"commit\",\"commit\":{\"operation\":\"create\",\"record_cbor\":\"not-base64!!\"}}")

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("uri,timestamp\n\"\nat://did:plc:dave/app.bsky.feed.post/r4\",2022-01-02T03:04:05Z\n")

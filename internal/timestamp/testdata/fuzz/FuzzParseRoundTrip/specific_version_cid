@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("uri,timestamp,scope,cid\nat://did:plc:a/app.bsky.feed.post/r1,2022-01-02T03:04:05Z,specific_version,bafyreigxghauz5fskz6ozly6jly4e6qcz6vi5bamruzctdklab54n4nene\n")
