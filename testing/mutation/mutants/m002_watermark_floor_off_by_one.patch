@@ -6,13 +6,15 @@ failure-mode: |
   compacted is below the compaction line. Classic inclusive/exclusive
   boundary mistake when initializing a cursor from a "next" value.
 expected-detection: |
-  assertCompacted should fail: CheckCompacted re-derives which rows must
-  be gone at-or-below the watermark, and a row at the boundary seq can
-  survive uncompacted. Likely seed-dependent — only fires when the
-  boundary seq carries a superseding event. If it survives the default
-  seed, run the seed sweep before recording it as an escape.
-expected-tier: stress
-tiers: default,stress
+  The compaction tier's boundary-exact scenario
+  (TestMerge_FirstInitWatermarkFloor_BoundarySeqCompacts, #199) pins a
+  superseding delete EXACTLY at the first merged seq: the mutated floor
+  claims that seq as already-compacted, the merge-tail pass no-ops, and
+  the superseded create survives permanently — killed deterministically,
+  no seed luck. The stress tier remains as the end-to-end backstop
+  (assertCompacted/CheckCompacted, historically 4/5 seeds).
+expected-tier: compaction
+tiers: compaction,default,stress
 
 diff --git a/internal/ingest/orchestrator/compaction_watermark.go b/internal/ingest/orchestrator/compaction_watermark.go
 index 7403134..b98a633 100644

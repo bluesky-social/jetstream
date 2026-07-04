@@ -7,22 +7,17 @@ method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 27 active mutants on disk
 (m001–m033; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
-2026-06-30 at `dba121e` (review remediation) — **21 killed, 6 survived, zero
+2026-07-03 at `075fafd` (#199) — **22 killed, 5 survived, zero
 STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was regenerated from it
-(commit field `dba121e`) and gate-verified self-consistent (`gate: PASS — 27
-mutants match baseline`). This campaign added the `tombstone` tier (runs
-`./internal/tombstone`) and re-banked **m022 as KILLED@tombstone** — closing the
-KILLED→SURVIVED regression #182 introduced when `internal/overlay` (m022's old
-oracle) was deleted in #177. The kill comes from
-`TestSnapshotShouldDropDIDChainsWithSpecificReason`, which asserts
-`Snapshot.ShouldDrop` in BOTH seq directions (a row below the DID tombstone seq
-is dropped; a reactivation row above it survives); m022's patch header declares
-`tiers: tombstone`. No other disposition changed vs the `b9543d9` run and there
-was no catalog drift. The remaining 6 survivors (m002, m003, m009, m013, m014,
-m015) are all pre-existing documented escapes. (#183 still tracks re-deriving a
-#100-recorder mutant to replace the retired m025.) Counts inside older dated
-sections describe the catalog *as of that date* and are intentionally not
-back-edited.**
+(commit field `075fafd`) and gate-verified self-consistent (`gate: PASS — 27
+mutants match baseline`). This campaign added the `compaction` tier and banked
+**m002 SURVIVED→KILLED@compaction** — the watermark-boundary off-by-one is now
+detected deterministically by a boundary-exact scenario instead of 4/5 stress
+seeds. The remaining 5 survivors (m003, m009, m013, m014, m015) are all
+pre-existing documented escapes with owning issues (#209, #208, #204, #204,
+#208). (#183 still tracks re-deriving a #100-recorder mutant to replace the
+retired m025.) Counts inside older dated sections describe the catalog *as of
+that date* and are intentionally not back-edited.**
 
 ## The baseline gate (#108)
 
@@ -984,3 +979,48 @@ path), m015 (footer collection index unread by the oracle — a documented
 footer-index blind spot). See the earlier dated sections for the per-mutant
 analysis; none is a new escape. (#183 still tracks re-deriving a #100-recorder
 mutant to replace the retired m025.)
+
+## Campaign 2026-07-03 — `compaction` tier; m002 SURVIVED→KILLED (#199)
+
+Full campaign at `075fafd`. **27 mutants: 22 KILLED, 5 SURVIVED, zero
+STALE/BUILD-BROKEN.** `testing/mutation/baseline.json` regenerated from this run
+and gate-verified self-consistent (`gate: PASS — 27 mutants match baseline`).
+
+**New `compaction` tier; m002 banked KILLED@compaction.** m002 (first-init
+compaction watermark floor off-by-one, `initCompactionWatermarkFloor` returning
+`nextSeq` instead of `nextSeq-1`) had been a documented seed-dependent escape:
+the fixed-seed campaign recorded SURVIVED and only ~4/5 stress seeds killed it,
+because detection required a seed to place a superseding event exactly at the
+watermark boundary. #199's position: a boundary invariant should be checked
+boundary-exactly, not probabilistically.
+
+The new tier runs two deterministic orchestrator tests
+(`internal/ingest/orchestrator`, <1s, seed-independent):
+
+- `TestMerge_FirstInitWatermarkFloor_BoundarySeqCompacts` constructs the
+  boundary by hand: a sealed bootstrap create at seq 1 leaves `seq/next = 2`;
+  a live-source delete of the same record survives the merge rev-filter and
+  merges at seq 2 — exactly where the first-init floor lands. Correct floor
+  (`nextSeq-1 = 1`): the merge-tail pass folds window (1,2] and physically
+  drops the superseded create. Mutated floor (`nextSeq = 2`): the pass no-ops
+  (`targetWatermark <= watermark`) and the miss is **permanent** — every later
+  pass folds `(W, target]`, exclusive below, so the boundary delete is never
+  folded again and the superseded row survives forever. The test asserts the
+  committed watermark, the survivor contract, and anti-vacuity (the boundary
+  delete itself must survive the merge filter).
+- `TestInitCompactionWatermarkFloor_*` pins the floor contract directly
+  (nextSeq-1; zero-seq floors at 0; an existing watermark is never re-floored).
+
+Red-first verified: both fail under the m002 patch with the modeled failure
+(`oracle: superseded record row survived ... seq=1 watermark=2`) and pass
+clean. m002's header now declares `expected-tier: compaction` with
+`tiers: compaction,default,stress` — the stress tier stays as the end-to-end
+backstop for the same class.
+
+### Survivors (5) — all pre-existing documented escapes with owning issues
+
+m003 (multi-source-segment scenario ceiling, #209), m009 (symmetric checksum
+closed loop; drift pin tracked in #208), m013/m014 (dead paths in this
+simulator config; adversarial-traffic modes in #204 make them live), m015
+(footer-index blind spot, #208). No disposition regressed vs the `dba121e`
+baseline; the only change is m002 SURVIVED→KILLED — a bankable improvement.
