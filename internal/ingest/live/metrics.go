@@ -11,12 +11,15 @@ const (
 // consumer. A nil *Metrics is a valid zero-value: every method is a
 // no-op, so tests can skip metric registration entirely.
 type Metrics struct {
-	EventsReceived      prometheus.Counter
-	Reconnects          prometheus.Counter
-	DecodeErrors        prometheus.Counter
-	UnknownEvents       prometheus.Counter
-	StaleResyncsDropped prometheus.Counter
-	UpstreamCursor      prometheus.Gauge
+	EventsReceived        prometheus.Counter
+	Reconnects            prometheus.Counter
+	DecodeErrors          prometheus.Counter
+	SequenceGaps          prometheus.Counter
+	SequenceGapMissedSeqs prometheus.Counter
+	UnknownEvents         prometheus.Counter
+	StaleResyncsDropped   prometheus.Counter
+	ReplayedAccountsDrop  prometheus.Counter
+	UpstreamCursor        prometheus.Gauge
 }
 
 // NewMetrics registers the livestream counters/gauges against reg.
@@ -37,13 +40,36 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		DecodeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "decode_errors_total",
-			Help: "Number of upstream frames that failed to decode.",
+			Help: "Number of upstream frames that failed to decode (garbage or " +
+				"malformed frames). Relay-side sequence gaps are counted separately " +
+				"in sequence_gaps_total.",
+		}),
+		SequenceGaps: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "sequence_gaps_total",
+			Help: "Number of forward gaps observed in the upstream relay's seq stream. " +
+				"A non-zero rate means the relay skipped seqs we never received — " +
+				"upstream data loss, not local decode trouble.",
+		}),
+		SequenceGapMissedSeqs: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "sequence_gap_missed_seqs_total",
+			Help: "Total count of upstream seqs skipped across all observed sequence " +
+				"gaps (sum of gap widths). Sizes the loss that sequence_gaps_total counts.",
 		}),
 		UnknownEvents: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "unknown_events_total",
 			Help: "Number of upstream events whose kind ConvertEvent did not recognize. " +
 				"These do NOT advance the upstream cursor so a future build can replay them.",
+		}),
+		ReplayedAccountsDrop: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "replayed_account_events_dropped_total",
+			Help: "Number of #account events dropped because their upstream seq was at or " +
+				"below the DID's applied hosting-state seq — relay seq replays " +
+				"(duplicate or regressed streams) whose row is already archived. " +
+				"Re-archiving them would let a stale account-delete land above newer rows.",
 		}),
 		StaleResyncsDropped: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -60,8 +86,9 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.EventsReceived, m.Reconnects,
-		m.DecodeErrors, m.UnknownEvents,
-		m.StaleResyncsDropped, m.UpstreamCursor,
+		m.DecodeErrors, m.SequenceGaps, m.SequenceGapMissedSeqs,
+		m.UnknownEvents, m.StaleResyncsDropped,
+		m.ReplayedAccountsDrop, m.UpstreamCursor,
 	)
 	return m
 }
@@ -84,9 +111,24 @@ func (m *Metrics) incDecodeErrors() {
 	}
 }
 
+func (m *Metrics) noteSequenceGap(missed int64) {
+	if m != nil {
+		m.SequenceGaps.Inc()
+		if missed > 0 {
+			m.SequenceGapMissedSeqs.Add(float64(missed))
+		}
+	}
+}
+
 func (m *Metrics) incUnknownEvents() {
 	if m != nil {
 		m.UnknownEvents.Inc()
+	}
+}
+
+func (m *Metrics) incReplayedAccountEventsDropped() {
+	if m != nil {
+		m.ReplayedAccountsDrop.Inc()
 	}
 }
 

@@ -176,6 +176,40 @@ func (p *PebbleStateStore) LoadHosting(_ context.Context, did atmos.DID) (*atmos
 	return &state, nil
 }
 
+// LoadAppliedHosting returns the hosting state for did EXCLUDING pending
+// entries: promoted-but-unflushed state first, then pebble. Pending state
+// is staged at verification time, possibly by a later pipelined event
+// whose rows have not been appended yet, so it must not inform decisions
+// about what has already been applied to the archive. The live consumer
+// uses this view to detect relay-replayed #account events: an event whose
+// seq is at or below this seq has already had its row appended (per-DID
+// delivery is seq-ordered and promotion happens synchronously after
+// append), so a second delivery is a relay duplicate, not new data.
+func (p *PebbleStateStore) LoadAppliedHosting(_ context.Context, did atmos.DID) (*atmossync.HostingState, error) {
+	p.mu.Lock()
+	var buf []byte
+	if promoted, ok := p.promotedHosting[did]; ok {
+		buf = append([]byte(nil), promoted...)
+	}
+	p.mu.Unlock()
+	if buf == nil {
+		val, closer, err := p.s.Get(hostKey(did))
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("syncstate: load applied hosting %s: %w", did, err)
+		}
+		buf = append([]byte(nil), val...)
+		_ = closer.Close()
+	}
+	state, err := decodeHostingState(buf)
+	if err != nil {
+		return nil, fmt.Errorf("syncstate: load applied hosting %s: %w", did, err)
+	}
+	return &state, nil
+}
+
 func (p *PebbleStateStore) SaveHosting(_ context.Context, did atmos.DID, state atmossync.HostingState) error {
 	buf, err := encodeHostingState(state)
 	if err != nil {

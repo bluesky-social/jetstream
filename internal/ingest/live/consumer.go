@@ -221,6 +221,42 @@ func (c *Consumer) dropStaleOrderedAsyncResync(ctx context.Context, evt streamin
 	return true, nil
 }
 
+// dropReplayedAccountEvent guards against relay seq replays of #account
+// events. atmos's verifier replay-drops duplicate #commit/#sync
+// deliveries (rev-replay protection), but OnAccountEvent's seq guard only
+// suppresses verifier STATE updates — the event still flows to the
+// consumer. Without this check a relay regression (e.g. restored from
+// backup) re-archives the #account row at a fresh jetstream seq, and a
+// replayed account-delete landing ABOVE a later reactivate+recreate makes
+// every fold (oracle reconstruct, tombstone set, compaction) erase live
+// records permanently. The comparison uses the APPLIED hosting seq
+// (promoted or pebble-durable, never pending): promotion happens
+// synchronously after this DID's row is appended and per-DID delivery is
+// seq-ordered, so seq <= applied means this exact event's row is already
+// in the archive — a second delivery is a duplicate by construction.
+// Pending state is excluded because a later pipelined event could stage
+// it before its own rows land, and consulting it would drop a legitimate
+// intermediate event.
+func (c *Consumer) dropReplayedAccountEvent(ctx context.Context, segEvts []segment.Event) (bool, error) {
+	if c.cfg.SyncStateStore == nil || len(segEvts) != 1 || segEvts[0].Kind != segment.KindAccount {
+		return false, nil
+	}
+	state, err := c.cfg.SyncStateStore.LoadAppliedHosting(ctx, atmos.DID(segEvts[0].DID))
+	if err != nil {
+		return false, fmt.Errorf("livestream: account replay guard: %w", err)
+	}
+	if state == nil || segEvts[0].UpstreamRelayCursor > state.Seq {
+		return false, nil
+	}
+	c.cfg.Metrics.incReplayedAccountEventsDropped()
+	c.logger.WarnContext(ctx, "dropped replayed account event",
+		"did", segEvts[0].DID,
+		"seq", segEvts[0].UpstreamRelayCursor,
+		"applied_seq", state.Seq,
+	)
+	return true, nil
+}
+
 // cursorValue returns the safe-to-persist upstream cursor: atmos's
 // watermark when a streaming.Client is attached, falling back to
 // lastUpstream otherwise (tests + early shutdown before any events
@@ -368,12 +404,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 	for batch, err := range client.Events(ctx) {
 		if err != nil {
-			// Decode / sequence-gap errors flow through here;
-			// atmos has already flushed the partial batch as nil
-			// + err. Log and continue — the next iteration will
-			// either reconnect or yield the next batch.
-			c.cfg.Metrics.incDecodeErrors()
-			c.logger.WarnContext(ctx, "stream error", "err", err)
+			// Stream-level errors flow through here; atmos has
+			// already flushed the partial batch as nil + err.
+			// Classify, log, and continue — the next iteration
+			// will either reconnect or yield the next batch.
+			c.noteStreamError(ctx, err)
 			continue
 		}
 
@@ -383,6 +418,25 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 
 	return ctx.Err()
+}
+
+// noteStreamError records one stream-level (nil, err) yield from the
+// atmos iterator. Gaps are counted apart from decode errors: a gap is
+// the relay telling us data we can never fetch again is gone (upstream
+// loss), while a decode error is a garbage frame we chose to skip.
+// Operators alert on them differently.
+func (c *Consumer) noteStreamError(ctx context.Context, err error) {
+	if gap, ok := errors.AsType[*streaming.GapError](err); ok {
+		c.cfg.Metrics.noteSequenceGap(gap.Got - gap.Expected)
+		c.logger.WarnContext(ctx, "upstream sequence gap",
+			"expected", gap.Expected,
+			"got", gap.Got,
+			"missed", gap.Got-gap.Expected,
+		)
+		return
+	}
+	c.cfg.Metrics.incDecodeErrors()
+	c.logger.WarnContext(ctx, "stream error", "err", err)
 }
 
 // processBatch writes one batch of decoded events into the writer.
@@ -480,6 +534,13 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			if stale, err := c.dropStaleOrderedAsyncResync(ctx, evt, segEvts); err != nil {
 				return err
 			} else if stale {
+				continue
+			}
+
+			if replayed, err := c.dropReplayedAccountEvent(ctx, segEvts); err != nil {
+				return err
+			} else if replayed {
+				c.noteUpstreamSeq(evt.Seq)
 				continue
 			}
 

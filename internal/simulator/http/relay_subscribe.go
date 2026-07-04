@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -40,11 +41,15 @@ func newRelaySubscribeReposHandler(w *world.World, faults *FaultPlan) http.Handl
 		defer func() { _ = conn.CloseNow() }()
 
 		framesBeforeClose, faultArmed := faults.onSubscribeConnect()
+		replay, replayArmed := faults.onSubscribeConnectReplay()
 		writer := subscribeFaultWriter{
 			conn:              conn,
+			world:             w,
 			faults:            faults,
 			framesBeforeClose: framesBeforeClose,
 			faultArmed:        faultArmed,
+			replay:            replay,
+			replayArmed:       replayArmed,
 		}
 
 		var cursor int64
@@ -138,10 +143,17 @@ func newRelaySubscribeReposHandler(w *world.World, faults *FaultPlan) http.Handl
 
 type subscribeFaultWriter struct {
 	conn              *websocket.Conn
+	world             *world.World
 	faults            *FaultPlan
 	framesBeforeClose int
 	framesWritten     int
 	faultArmed        bool
+
+	replay      SubscribeReposReplayFault
+	replayArmed bool
+	// recent is a ring of the last replay.DuplicateLast frames written,
+	// maintained only while a duplicate-mode replay fault is armed.
+	recent [][]byte
 }
 
 func (w *subscribeFaultWriter) Write(ctx context.Context, frame []byte) error {
@@ -149,10 +161,61 @@ func (w *subscribeFaultWriter) Write(ctx context.Context, frame []byte) error {
 		return err
 	}
 	w.framesWritten++
+	if w.replayArmed {
+		if w.replay.DuplicateLast > 0 {
+			w.recent = append(w.recent, frame)
+			if len(w.recent) > w.replay.DuplicateLast {
+				w.recent = w.recent[1:]
+			}
+		}
+		if w.framesWritten >= w.replay.AfterFrames {
+			if err := w.fireReplay(ctx); err != nil {
+				return err
+			}
+		}
+	}
 	if !w.faultArmed || w.framesWritten < w.framesBeforeClose {
 		return nil
 	}
 	w.faultArmed = false
 	w.faults.noteSubscribeDisconnect()
 	return w.conn.Close(websocket.StatusTryAgainLater, "simulated subscribeRepos disconnect")
+}
+
+// fireReplay re-sends previously delivered frames verbatim — duplicate
+// seqs on the wire, exactly what a relay restored from backup would
+// emit. Re-sent frames bypass Write so they don't advance
+// framesWritten (the disconnect threshold) or re-trigger this fault.
+func (w *subscribeFaultWriter) fireReplay(ctx context.Context) error {
+	w.replayArmed = false
+	var frames [][]byte
+	if w.replay.DuplicateLast > 0 {
+		frames = w.recent
+		w.recent = nil
+	} else {
+		// Regress mode: replay every retained frame in (RegressToSeq, tip].
+		// The tip is sampled once at fire time; pages are bounded by the
+		// same cap the normal replay path uses.
+		cursor := w.replay.RegressToSeq
+		tip := w.world.CurrentSeq()
+		for cursor < tip {
+			page, err := w.world.FirehoseRange(cursor, subscribeReplayLimit)
+			if err != nil {
+				_ = w.conn.Close(websocket.StatusInternalError, "replay fault history")
+				return fmt.Errorf("simulator: replay fault firehose range from %d: %w", cursor, err)
+			}
+			if len(page) == 0 {
+				break
+			}
+			frames = append(frames, page...)
+			cursor += int64(len(page))
+		}
+	}
+	for _, f := range frames {
+		if err := w.conn.Write(ctx, websocket.MessageBinary, f); err != nil {
+			return err
+		}
+	}
+	w.faults.noteSubscribeReplay(len(frames))
+	return nil
 }
