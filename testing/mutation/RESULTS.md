@@ -1169,9 +1169,10 @@ will close, now unblocked by this gate).
 Original campaign at `c1dbc39` (branch `relay-seq-replay-205`, pre-rebase):
 **28 mutants: 23 KILLED, 5 SURVIVED, zero STALE/BUILD-BROKEN.** The branch was
 subsequently rebased onto main at `3921e5f` (post-#228/#229, which added m034
-and the #197 gate); the post-rebase full campaign covering all 29 mutants
-(m034 + m035 together) is recorded in the baseline regenerated at the rebased
-head.
+and the #197 gate) and the full campaign re-run at the rebased head `5d6fc9e`:
+**29 mutants: 24 KILLED, 5 SURVIVED, zero STALE/BUILD-BROKEN** — m034 and m035
+both KILLED side by side, every prior disposition reproduced, gate PASS.
+`baseline.json` re-banked from that run.
 
 **New `replay` tier; m035 banked KILLED@replay.** #205 made relay seq
 duplicates and regressions live: atmos's gap check is forward-only
