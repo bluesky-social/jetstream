@@ -369,10 +369,39 @@ log bounded diagnostics, and continue running.
 
 ### Real-Data Corpus Tier
 
-This tier breaks the `atmos` closed loop by running real firehose frames and
-real getRepo CARs from diverse implementations through stable regression
-tests. Corpus outputs should be normalized to metadata and hashes where
-possible, with privacy and size constraints explicit.
+This tier breaks the `atmos` closed loop by running real network bytes with
+expectations pinned by foreign implementations through stable offline
+regression tests. It lives in `internal/corpus` (separate from the lifecycle
+oracle) and runs in normal CI; the `corpus` mutation tier gates it.
+
+Four fixture families, all under `internal/corpus/testdata/` with provenance
+and the re-capture procedure in its README:
+
+- a contiguous raw relay firehose window (byte-for-byte websocket frames)
+  replayed through the complete production live path — atmos frame decode,
+  offline Sync 1.1 signature verification against captured DID documents,
+  ConvertEvent, ingest, segment seal — with the v1 JSON output required to
+  match what production Jetstream v1 (an independent implementation) served
+  concurrently for the same events;
+- a production getRepo CAR (maintainer-owned repo) through the backfill
+  handler, with rows and recomputed record CIDs compared to a listing pinned
+  by indigo's `goat` at capture time;
+- a byte-pinned golden sealed segment built from the real CAR's records,
+  compared byte-exactly on the write side and opened through the full reader
+  path on the read side — the committed bytes are facts from a known-good
+  build, so a symmetric writer+reader bug (the m009 class the closed loop
+  structurally cannot see) fails against them from both directions;
+- malformed variants derived mechanically from the real bytes (truncated
+  frames, bit flips, cut CARs) asserting the drop-and-continue and fail-loud
+  contracts on production-shaped garbage.
+
+Independence discipline: fixture expectations must never be derived with
+atmos. The capture tool is built on `bluesky-social/indigo` and is
+deliberately NOT committed (indigo must not enter this module's dependency
+graph); its source is preserved on issue #32. Manifest event counts serve as
+anti-vacuity assertions, and the committed corpus stays small (~640 KiB) —
+production incident fixtures can be added as new windows via the documented
+re-capture procedure.
 
 ### Soak Tier
 
