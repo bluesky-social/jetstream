@@ -255,7 +255,7 @@ func TestSegmentHandler_HandleEmptyRepoRecordsEmptyWatermark(t *testing.T) {
 		Store: blockStore,
 		Tree:  mst.NewTree(blockStore),
 	}
-	commit := &atmosrepo.Commit{DID: string(did), Rev: "rev-empty"}
+	commit := &atmosrepo.Commit{DID: string(did), Rev: "3l3qo2vutsw2b"}
 	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	h.SetCompletionBatcher(cb)
 
@@ -310,8 +310,9 @@ func TestSegmentHandler_DropsRecordThatExceedsSegmentColumnWidth(t *testing.T) {
 	t.Parallel()
 
 	w := newTestIngest(t)
-	metrics := NewMetrics(prometheus.NewRegistry())
-	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics)
+	dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
+	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h.dropMetrics = dropMetrics
 
 	var writerErr error
 	h.onWriterError = func(err error) { writerErr = err }
@@ -324,8 +325,120 @@ func TestSegmentHandler_DropsRecordThatExceedsSegmentColumnWidth(t *testing.T) {
 	require.NoError(t, h.HandleRepo(t.Context(), "did:plc:widefield", r, commit))
 	require.NoError(t, writerErr, "invalid upstream record data must not abort the local writer")
 	require.Equal(t, uint64(1), w.NextSeq(), "skipped records must not allocate seqs (NextSeq stays at the fresh-dir seed)")
-	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DroppedRecords), 0,
-		"the skipped record must be visible in dropped_records_total")
+	require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceBackfill, ingest.DropReasonFieldTooLong)), 0,
+		"the skipped record must be visible under field_too_long — a spec-valid rkey we chose not to represent")
+}
+
+// TestSegmentHandler_InvalidRevFailsRepo pins the #197 backfill rev
+// gate: a commit whose rev is not a spec-valid TID fails the whole
+// repo (visible in failed-repo diagnostics, retried by the retry
+// loop) rather than silently archiving records under a rev that
+// merge/compaction ordering cannot reason about. atmos's repo loader
+// already rejects invalid NON-empty revs before HandleRepo runs, so
+// the empty rev is the reachable case — but the gate rejects both.
+func TestSegmentHandler_InvalidRevFailsRepo(t *testing.T) {
+	t.Parallel()
+
+	for _, rev := range []string{"", "not-a-tid"} {
+		w := newTestIngest(t)
+		dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
+		h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		h.dropMetrics = dropMetrics
+
+		r, commit := buildSingleRecordRepo(t,
+			"did:plc:badrev", "app.bsky.feed.post", "rkey1",
+			map[string]any{"text": "x"})
+		commit.Rev = rev
+
+		err := h.HandleRepo(t.Context(), "did:plc:badrev", r, commit)
+		require.Error(t, err, "rev=%q must fail the repo", rev)
+		require.Equal(t, uint64(1), w.NextSeq(),
+			"rev=%q: no record may be archived under an invalid rev", rev)
+		require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceBackfill, ingest.DropReasonInvalidRev)), 0)
+	}
+}
+
+// buildHostileKeyRepo builds a repo whose MST contains records
+// inserted under raw keys, bypassing Repo.Create's path validation —
+// the shape a hostile or buggy PDS's CAR produces (mst.LoadTree
+// decodes keys from CBOR without spec validation).
+func buildHostileKeyRepo(t *testing.T, did atmos.DID, keys ...string) (*atmosrepo.Repo, *atmosrepo.Commit) {
+	t.Helper()
+	mstore := mst.NewMemBlockStore()
+	tree := mst.NewTree(mstore)
+	for i, key := range keys {
+		blk, err := cbor.Marshal(map[string]any{"v": i})
+		require.NoError(t, err)
+		cid := cbor.ComputeCID(cbor.CodecDagCBOR, blk)
+		require.NoError(t, mstore.PutBlock(cid, blk))
+		require.NoError(t, tree.Insert(key, cid))
+	}
+	r := &atmosrepo.Repo{
+		DID:   did,
+		Clock: atmos.NewTIDClock(0),
+		Store: mstore,
+		Tree:  tree,
+	}
+	return r, &atmosrepo.Commit{DID: string(did), Rev: "3l3qo2vutsw2b"}
+}
+
+// TestSegmentHandler_SpecInvalidPathDropsRecordKeepsSiblings pins the
+// per-record half of the gate: a record whose MST key fails atproto
+// path validation (spec-invalid NSID or record key — including keys
+// the MST charset allows but the specs don't) is dropped and counted
+// while well-formed siblings archive normally. Pre-#197 a malformed
+// key failed the whole repo.
+func TestSegmentHandler_SpecInvalidPathDropsRecordKeepsSiblings(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		key    string
+		reason ingest.DropReason
+	}{
+		{"nodots/rkey1", ingest.DropReasonInvalidCollection},
+		{"two.segments/rkey1", ingest.DropReasonInvalidCollection},
+		{"justonepart", ingest.DropReasonInvalidCollection},
+		{"app.bsky.feed.post/..", ingest.DropReasonInvalidRkey},
+		{"app.bsky.feed.post/bad/extra", ingest.DropReasonInvalidRkey},
+	} {
+		w := newTestIngest(t)
+		dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
+		h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		h.dropMetrics = dropMetrics
+
+		r, commit := buildHostileKeyRepo(t, "did:plc:hostilekeys",
+			"app.bsky.feed.post/good", tc.key)
+
+		require.NoError(t, h.HandleRepo(t.Context(), "did:plc:hostilekeys", r, commit),
+			"key=%q: a droppable record must not fail the repo", tc.key)
+		require.Equal(t, uint64(2), w.NextSeq(),
+			"key=%q: exactly the well-formed sibling must be archived", tc.key)
+		require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceBackfill, tc.reason)), 0,
+			"key=%q must count under %s", tc.key, tc.reason)
+	}
+}
+
+// TestSegmentHandler_ResyncDropsInvalidPathOnceKeepsSiblings pins the
+// resync path's consistency: the pre-validation walk must classify a
+// spec-invalid key as droppable (not fail the repo before the
+// tombstone is appended) and the drop is counted exactly once — by
+// the appending walk, not the pre-check.
+func TestSegmentHandler_ResyncDropsInvalidPathOnceKeepsSiblings(t *testing.T) {
+	t.Parallel()
+
+	w := newTestIngest(t)
+	dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
+	h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h.dropMetrics = dropMetrics
+
+	r, commit := buildHostileKeyRepo(t, "did:plc:resynchostile",
+		"app.bsky.feed.post/good", "nodots/evil")
+
+	require.NoError(t, h.HandleRepoResync(t.Context(), "did:plc:resynchostile", r, commit))
+	require.Equal(t, uint64(3), w.NextSeq(),
+		"the KindSync tombstone plus the surviving record must be archived")
+	require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceBackfill, ingest.DropReasonInvalidCollection)), 0,
+		"the drop must be counted exactly once across pre-check and append walks")
 }
 
 // TestSegmentHandler_MissingDownloadedRecordBlockSurfacesError pins the
@@ -358,7 +471,7 @@ func TestSegmentHandler_MissingDownloadedRecordBlockSurfacesError(t *testing.T) 
 		Store: store,
 		Tree:  tree,
 	}
-	commit := &atmosrepo.Commit{Rev: "rev1"}
+	commit := &atmosrepo.Commit{Rev: "3l3qo2vutsw2b"}
 
 	err := h.HandleRepo(t.Context(), "did:plc:truncatedcar", r, commit)
 	require.Error(t, err)
@@ -372,26 +485,34 @@ func TestSegmentHandler_NilWriterPanics(t *testing.T) {
 	require.Panics(t, func() { _ = NewSegmentHandler(nil, nil, nil) })
 }
 
-// TestSplitMSTKey rounds the helper through happy and unhappy cases.
-func TestSplitMSTKey(t *testing.T) {
+// TestSplitRecordPath rounds the gate helper through happy and
+// unhappy cases, pinning which half of the path each reason blames.
+func TestSplitRecordPath(t *testing.T) {
 	t.Parallel()
 
 	t.Run("ok", func(t *testing.T) {
-		c, k, err := splitMSTKey("app.bsky.feed.post/rkey1")
-		require.NoError(t, err)
+		c, k, reason := splitRecordPath("app.bsky.feed.post/rkey1")
+		require.Equal(t, ingest.DropReason(""), reason)
 		require.Equal(t, "app.bsky.feed.post", c)
 		require.Equal(t, "rkey1", k)
 	})
 
-	bad := []string{
-		"",
-		"justonepart",
-		"/leading-slash",
-		"trailing-slash/",
-		"too/many/slashes",
-	}
-	for _, in := range bad {
-		_, _, err := splitMSTKey(in)
-		require.Error(t, err, "expected error for %q", in)
+	for _, tc := range []struct {
+		in     string
+		reason ingest.DropReason
+	}{
+		{"", ingest.DropReasonInvalidCollection},
+		{"justonepart", ingest.DropReasonInvalidCollection},
+		{"/leading-slash", ingest.DropReasonInvalidCollection},
+		{"nodots/rkey", ingest.DropReasonInvalidCollection},
+		{"$account/rkey", ingest.DropReasonInvalidCollection},
+		{"app.bsky.feed.post/", ingest.DropReasonInvalidRkey},
+		{"app.bsky.feed.post/.", ingest.DropReasonInvalidRkey},
+		{"app.bsky.feed.post/..", ingest.DropReasonInvalidRkey},
+		{"app.bsky.feed.post/too/many", ingest.DropReasonInvalidRkey},
+		{"app.bsky.feed.post/" + strings.Repeat("x", 513), ingest.DropReasonInvalidRkey},
+	} {
+		_, _, reason := splitRecordPath(tc.in)
+		require.Equal(t, tc.reason, reason, "input %q", tc.in)
 	}
 }

@@ -5,21 +5,20 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 27 active mutants on disk
-(m001–m033; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
-2026-07-03 at `075fafd` (#199) — **22 killed, 5 survived, zero
-STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was regenerated from it
-(commit field `075fafd`) and gate-verified self-consistent (`gate: PASS — 27
-mutants match baseline`). This campaign added the `compaction` tier and banked
-**m002 SURVIVED→KILLED@compaction** — the watermark-boundary off-by-one is now
-detected deterministically by a boundary-exact scenario instead of 4/5 stress
-seeds. The remaining 5 survivors (m003, m009, m013, m014, m015) are all
-pre-existing documented escapes with owning issues (#209, #208, #204, #204,
-#208). (#183 closed 2026-07-04: no recorder-unique replacement for the retired
-m025 exists post-#178 — see the dated analysis section; the #100 over-drop
-recorder is a regression assertion without a gated mutant.) Counts inside older
-dated sections describe the catalog *as of that date* and are intentionally not
-back-edited.**
+**Current catalog (keep this line current): 28 active mutants on disk
+(m001–m034; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
+2026-07-04 at `d08ed8b` (#197 ingest validation gate) — **23 killed, 5
+survived, zero STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was
+regenerated from it (commit field `d08ed8b`) and gate-verified
+self-consistent. No disposition changed vs the `40e79cc` run: the #197 gate
+rewrites the `events.go`/`handler.go` conversion paths but every mutant hunk
+still applies and every kill reproduces. The 5 survivors (m003, m009, m013,
+m014, m015) are all pre-existing documented escapes with owning issues (#209,
+#208, #204, #204, #208). (#183 closed 2026-07-04: no recorder-unique
+replacement for the retired m025 exists post-#178 — see the dated analysis
+section; the #100 over-drop recorder's gated mutant m034 guards its hook
+integrity, not its drop logic.) Counts inside older dated sections describe
+the catalog *as of that date* and are intentionally not back-edited.**
 
 ## The baseline gate (#108)
 
@@ -1109,12 +1108,70 @@ than scope-crept here:**
   entirely (a same-seq DID-tombstone/materialization pair cannot exist, so
   the edit is a no-op — an equivalent mutant, not an escape).
 
+## Campaign 2026-07-04 — m034 recorder hook-integrity mutant (#226)
+
+Full campaign at `40e79cc`. **28 mutants: 23 KILLED, 5 SURVIVED, zero
+STALE/BUILD-BROKEN.** `testing/mutation/baseline.json` regenerated from this
+run and gate-verified self-consistent.
+
+**New m034_overdrop_hook_stale_watermark, KILLED@default.** The #183
+adversarial re-derivation analysis (previous section) surfaced this as
+candidate C9: a single edit passing the stale committed `watermark` instead of
+`targetWatermark` to `OnBeforeCompactionPass` (`compact_deletes.go:136`) bounds
+both of the #100 over-drop recorder's scans BELOW every drop the pass makes,
+so pre == post trivially and the recorder passes vacuously — anti-vacuity
+guards included (older survivors keep `survivorsChecked` positive), with every
+other tier legitimately green (the pass still compacts correctly). A watchdog
+that can be blinded by a one-token production edit with zero red tests is not
+a trustworthy watchdog.
+
+The detecting check: `compactionOverDropRecorder.ObserveAfter` now cross-checks
+its pending scan bound against the watermark the pass actually committed
+(`result.Watermark != pendingW` → scan error surfaced by `Assert`). A
+successful watermark-advancing pass commits exactly the targetWatermark
+`ObserveBefore` was handed, so any divergence means the hook fed the recorder a
+wrong bound. Red-first verified: with the m034 edit applied, -short
+`TestOracle_DefaultLifecycle` fails with `oracle: over-drop recorder watermark
+mismatch: pre-pass hook saw 20 but the pass committed 33`; the clean tree is
+green. Kills in the default tier (the merge-tail pass already exposes the
+mismatch), no stress needed.
+
+No other disposition changed vs the `075fafd` baseline; the 5 survivors remain
+the documented escapes with owning issues (m003→#209, m009/m015→#208,
+m013/m014→#204).
+
+## Campaign 2026-07-04 — full catalog after the #197 ingest validation gate
+
+Full campaign at `d08ed8b` (ingest: validate rev and repo path on upstream
+events, closes #197). **28 mutants: 23 KILLED, 5 SURVIVED, zero
+STALE/BUILD-BROKEN.** `testing/mutation/baseline.json` regenerated from this
+run and gate-verified self-consistent (`gate: PASS — 28 mutants match
+baseline`).
+
+**Why this run mattered:** #197 rewrites both ingest conversion paths —
+`live/events.go` gains rev/op-path validation and generalizes
+`DroppedMissingBlocksError` to `DroppedOpsError`; `backfill/handler.go` gains
+the rev gate and replaces `splitMSTKey` (fail-whole-repo) with
+`splitRecordPath` (drop-record-keep-siblings). Seven mutants patch those
+exact files (m001, m013, m014, m017, m018, m019, m026), so this was the
+STALE-risk re-run the catalog discipline requires after major ingest changes.
+Result: every hunk still applies under `--unidiff-zero` (the mutated struct
+literals and switch arms were relocated, not rewritten) and every prior kill
+reproduces at the same tier with the same shape of note.
+
+No disposition changed. The 5 survivors remain the documented escapes with
+owning issues: m003 → #209 (merge cursor no-advance), m009/m015 → #208
+(footer/checksum blind spots), m013/m014 → #204 (verified-ops path is dead
+under polite simulator traffic — exactly the gap the #204 adversarial modes
+will close, now unblocked by this gate).
+
 ## Campaign 2026-07-04 — `corpus` tier; m009 SURVIVED→KILLED (#32)
 
 Targeted run at `af7c00a` (`testing/mutation/run.sh m009`):
 **m009 KILLED@corpus** (default and stress tiers still pass it, as the
 structural analysis predicts — the kill comes from the new tier).
-`baseline.json` updated for m009 only; no other disposition touched.
+Banked into the `d08ed8b` baseline for m009 only; no other disposition
+touched, leaving 24 KILLED / 4 SURVIVED.
 
 **New `corpus` tier; the symmetric-checksum blind spot is closed.** m009
 (`xxh3HeaderFooter` computing over `headerBytes[13:]` instead of `[12:]`) was
@@ -1158,5 +1215,4 @@ atmos-closed-loop class (`specs/oracle.md` "Real-Data Corpus Tier"), not just
 the checksum instance. Fixture provenance and the re-capture procedure:
 `internal/corpus/testdata/README.md`; capture-tool source preserved on #32.
 
-Remaining survivors are unchanged: m003 (#209), m013/m014 (#204), m015
-(#208).
+Remaining survivors: m003 (#209), m013/m014 (#204), m015 (#208).

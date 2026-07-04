@@ -41,7 +41,7 @@ type swarmCase struct {
 	evt                        streaming.Event
 	expectErr                  error          // non-nil → errors.Is(got, expectErr) must hold; got events MUST be nil
 	expectAnyErr               bool           // if true, any non-nil error is acceptable; got events MUST be nil
-	expectDroppedMissingBlocks bool           // partial-success: errors.AsType[*DroppedMissingBlocksError] must succeed; got events MAY be empty or non-empty
+	expectDroppedMissingBlocks bool           // partial-success: errors.AsType[*DroppedOpsError] must succeed; got events MAY be empty or non-empty
 	expectN                    int            // exact number of segment.Events expected (used by both success and partial paths)
 	expectK                    []segment.Kind // kinds in order (success and partial paths)
 }
@@ -106,10 +106,10 @@ func TestConvertEvent_Swarm(t *testing.T) {
 		case c.expectDroppedMissingBlocks:
 			// Partial success: an error is returned alongside a
 			// possibly-non-empty events slice (the surviving ops).
-			// *DroppedMissingBlocksError is the canonical example.
-			_, ok := errors.AsType[*DroppedMissingBlocksError](gotErr)
+			// *DroppedOpsError is the canonical example.
+			_, ok := errors.AsType[*DroppedOpsError](gotErr)
 			require.True(t, ok,
-				"iter %d (%s): expected *DroppedMissingBlocksError, got %v",
+				"iter %d (%s): expected *DroppedOpsError, got %v",
 				i, c.desc, gotErr)
 			require.Len(t, got, c.expectN,
 				"iter %d (%s): wrong surviving-event count", i, c.desc)
@@ -243,7 +243,7 @@ func wellFormedDelete(t *testing.T, r *rand.Rand) swarmCase {
 			Seq: int64(r.Uint32()),
 			Commit: &comatproto.SyncSubscribeRepos_Commit{
 				Repo: did,
-				Rev:  "rev-del",
+				Rev:  "3l3qo2vutsw2d",
 				Ops: []comatproto.SyncSubscribeRepos_RepoOp{{
 					Action: "delete",
 					Path:   randomCollection(r) + "/" + randomRkey(r),
@@ -364,7 +364,7 @@ func wellFormedSync(r *rand.Rand) swarmCase {
 			Seq: int64(r.Uint32()),
 			Sync: &comatproto.SyncSubscribeRepos_Sync{
 				DID:    randomDID(r),
-				Rev:    "rev",
+				Rev:    "3l3qo2vutsw2h",
 				Blocks: []byte{0x01, 0x02},
 				Time:   "2026-05-21T00:00:00Z",
 			},
@@ -409,7 +409,7 @@ func commitWithUnknownAction(t *testing.T, r *rand.Rand) swarmCase {
 			Seq: int64(r.Uint32()),
 			Commit: &comatproto.SyncSubscribeRepos_Commit{
 				Repo: did,
-				Rev:  "rev-bad",
+				Rev:  "3l3qo2vutsw2f",
 				Ops: []comatproto.SyncSubscribeRepos_RepoOp{{
 					Action: bogusActions[r.IntN(len(bogusActions))],
 					Path:   "x.y/r",
@@ -453,7 +453,7 @@ func commitWithMissingCAR(t *testing.T, r *rand.Rand) swarmCase {
 			Seq: int64(r.Uint32()),
 			Commit: &comatproto.SyncSubscribeRepos_Commit{
 				Repo: did,
-				Rev:  "rev-orphan",
+				Rev:  "3l3qo2vutsw2g",
 				Ops: []comatproto.SyncSubscribeRepos_RepoOp{{
 					Action: "create",
 					Path:   "app.bsky.feed.post/orphan",
@@ -462,7 +462,7 @@ func commitWithMissingCAR(t *testing.T, r *rand.Rand) swarmCase {
 				Blocks: carBuf.Bytes(),
 			},
 		},
-		// All (one) ops dropped → *DroppedMissingBlocksError alongside
+		// All (one) ops dropped → *DroppedOpsError alongside
 		// an empty surviving-events slice. The caller (consumer)
 		// archives nothing for this commit but does not abort.
 		expectDroppedMissingBlocks: true,

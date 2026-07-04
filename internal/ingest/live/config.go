@@ -67,6 +67,10 @@ type Config struct {
 	// Metrics is optional; nil means no /metrics counters incrementing.
 	Metrics *Metrics
 
+	// DropMetrics is the shared ingest drop counter family, labeled
+	// by (source, reason). Optional; nil skips counting.
+	DropMetrics *ingest.DropMetrics
+
 	// WriterMetrics flows through to the consumer's internal ingest.Writer.
 	// Steady-state callers pass the canonical ingest metrics for the durable
 	// archive; bootstrap-time live_segments callers leave it nil because that

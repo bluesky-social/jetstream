@@ -323,6 +323,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Metrics:                    orchestrator.NewMetrics(metrics.Registry, tombstones),
 		IngestMetrics:              ingest.NewMetrics(metrics.Registry),
 		LiveMetrics:                live.NewMetrics(metrics.Registry),
+		DropMetrics:                ingest.NewDropMetrics(metrics.Registry),
 		BackfillMetrics:            backfillMetrics,
 		SegmentMetrics:             segmentMetrics,
 		OnEvent:                    onSteadyStateEvent,

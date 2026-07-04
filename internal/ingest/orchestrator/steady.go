@@ -100,6 +100,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			// Bare cfg.Logger; live.Open sets its own component.
 			Logger:            o.cfg.Logger,
 			Metrics:           o.cfg.LiveMetrics,
+			DropMetrics:       o.cfg.DropMetrics,
 			WriterMetrics:     o.cfg.IngestMetrics,
 			Verifier:          o.cfg.Verifier,
 			SyncStateStore:    o.cfg.SyncStateStore,
@@ -151,6 +152,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 					RelayURL:      o.cfg.RelayURL,
 					Logger:        o.cfg.Logger,
 					Metrics:       o.cfg.BackfillMetrics,
+					DropMetrics:   o.cfg.DropMetrics,
 					Interval:      o.cfg.FailedRepoRetryInterval,
 					Workers:       o.cfg.FailedRepoRetryWorkers,
 					HostWorkers:   o.cfg.FailedRepoRetryHostWorkers,
