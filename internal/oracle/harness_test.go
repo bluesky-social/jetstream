@@ -989,6 +989,24 @@ func (r *compactionOverDropRecorder) ObserveAfter(result jetstreamd.CompactionPa
 		return
 	}
 
+	// Cross-check the scan bound against the watermark the pass actually
+	// committed. A successful watermark-advancing pass commits exactly the
+	// targetWatermark ObserveBefore was handed, so a mismatch means the
+	// OnBeforeCompactionPass hook fed this recorder a stale/wrong bound —
+	// and a stale bound BELOW the pass's drops makes pre == post trivially
+	// true, silently disarming the over-drop check while every other oracle
+	// tier stays green (#226). Fail loud instead of comparing blind.
+	if result.Watermark != pendingW {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		// "oracle:" prefix so the mutation driver's note-grep surfaces this
+		// as the kill reason instead of "see log".
+		r.scanErr = errors.Join(r.scanErr, fmt.Errorf(
+			"oracle: over-drop recorder watermark mismatch: pre-pass hook saw %d but the pass committed %d (recorder scans bounded at the wrong seq would vacuously pass)",
+			pendingW, result.Watermark))
+		return
+	}
+
 	post, err := r.scanSealed(pendingW)
 	r.mu.Lock()
 	defer r.mu.Unlock()

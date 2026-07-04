@@ -1,0 +1,30 @@
+mutant: m034_overdrop_hook_stale_watermark
+target: internal/ingest/orchestrator/compact_deletes.go
+failure-mode: |
+  runDeleteCompaction passes the stale committed watermark to
+  OnBeforeCompactionPass instead of the pass's targetWatermark. Both of the
+  #100 over-drop recorder's scans then bound BELOW every drop the pass makes,
+  so pre == post trivially and the recorder passes vacuously — including its
+  anti-vacuity guards (older survivors keep survivorsChecked positive). The
+  pass itself still compacts correctly, so no other oracle tier goes red: a
+  single edit that silently disarms the over-drop watchdog rather than
+  corrupting data. Found by the #183 adversarial re-derivation analysis
+  (RESULTS.md 2026-07-04 section, candidate C9); tracked as #226.
+expected-detection: |
+  Killed by the recorder's watermark cross-check in ObserveAfter
+  (internal/oracle/harness_test.go): a successful watermark-advancing pass
+  commits exactly the targetWatermark ObserveBefore was handed, so the stale
+  bound surfaces as "over-drop recorder watermark mismatch: pre-pass hook saw
+  W_old but the pass committed W_new" at overDrop.Assert
+  (steady-state-shutdown-flush). Fires in -short mode on the merge-tail pass
+  already (hook sees the stale 0/bootstrap watermark, pass commits the merge
+  target), so the default tier kills it deterministically.
+expected-tier: default
+tiers: default
+
+diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
+--- a/internal/ingest/orchestrator/compact_deletes.go
++++ b/internal/ingest/orchestrator/compact_deletes.go
+@@ -136 +136 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compaction
+-			o.cfg.OnBeforeCompactionPass(targetWatermark)
++			o.cfg.OnBeforeCompactionPass(watermark)

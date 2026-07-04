@@ -5,20 +5,19 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 27 active mutants on disk
-(m001–m033; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
-2026-07-03 at `075fafd` (#199) — **22 killed, 5 survived, zero
+**Current catalog (keep this line current): 28 active mutants on disk
+(m001–m034; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
+2026-07-04 at `40e79cc` (#226) — **23 killed, 5 survived, zero
 STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was regenerated from it
-(commit field `075fafd`) and gate-verified self-consistent (`gate: PASS — 27
-mutants match baseline`). This campaign added the `compaction` tier and banked
-**m002 SURVIVED→KILLED@compaction** — the watermark-boundary off-by-one is now
-detected deterministically by a boundary-exact scenario instead of 4/5 stress
-seeds. The remaining 5 survivors (m003, m009, m013, m014, m015) are all
-pre-existing documented escapes with owning issues (#209, #208, #204, #204,
-#208). (#183 closed 2026-07-04: no recorder-unique replacement for the retired
-m025 exists post-#178 — see the dated analysis section; the #100 over-drop
-recorder is a regression assertion without a gated mutant.) Counts inside older
-dated sections describe the catalog *as of that date* and are intentionally not
+(commit field `40e79cc`) and gate-verified self-consistent. This campaign added
+**m034 (over-drop recorder disarmed via a stale hook watermark),
+KILLED@default** by the recorder's new watermark cross-check. The 5 survivors
+(m003, m009, m013, m014, m015) are all pre-existing documented escapes with
+owning issues (#209, #208, #204, #204, #208). (#183 closed 2026-07-04: no
+recorder-unique replacement for the retired m025 exists post-#178 — see the
+dated analysis section; the #100 over-drop recorder's gated mutant m034 guards
+its hook integrity, not its drop logic.) Counts inside older dated sections
+describe the catalog *as of that date* and are intentionally not
 back-edited.**
 
 ## The baseline gate (#108)
@@ -1108,3 +1107,35 @@ than scope-crept here:**
 - `ShouldDrop`'s DID branch `ts.Seq > ev.Seq` → `>=` survives every tier
   entirely (a same-seq DID-tombstone/materialization pair cannot exist, so
   the edit is a no-op — an equivalent mutant, not an escape).
+
+## Campaign 2026-07-04 — m034 recorder hook-integrity mutant (#226)
+
+Full campaign at `40e79cc`. **28 mutants: 23 KILLED, 5 SURVIVED, zero
+STALE/BUILD-BROKEN.** `testing/mutation/baseline.json` regenerated from this
+run and gate-verified self-consistent.
+
+**New m034_overdrop_hook_stale_watermark, KILLED@default.** The #183
+adversarial re-derivation analysis (previous section) surfaced this as
+candidate C9: a single edit passing the stale committed `watermark` instead of
+`targetWatermark` to `OnBeforeCompactionPass` (`compact_deletes.go:136`) bounds
+both of the #100 over-drop recorder's scans BELOW every drop the pass makes,
+so pre == post trivially and the recorder passes vacuously — anti-vacuity
+guards included (older survivors keep `survivorsChecked` positive), with every
+other tier legitimately green (the pass still compacts correctly). A watchdog
+that can be blinded by a one-token production edit with zero red tests is not
+a trustworthy watchdog.
+
+The detecting check: `compactionOverDropRecorder.ObserveAfter` now cross-checks
+its pending scan bound against the watermark the pass actually committed
+(`result.Watermark != pendingW` → scan error surfaced by `Assert`). A
+successful watermark-advancing pass commits exactly the targetWatermark
+`ObserveBefore` was handed, so any divergence means the hook fed the recorder a
+wrong bound. Red-first verified: with the m034 edit applied, -short
+`TestOracle_DefaultLifecycle` fails with `oracle: over-drop recorder watermark
+mismatch: pre-pass hook saw 20 but the pass committed 33`; the clean tree is
+green. Kills in the default tier (the merge-tail pass already exposes the
+mismatch), no stress needed.
+
+No other disposition changed vs the `075fafd` baseline; the 5 survivors remain
+the documented escapes with owning issues (m003→#209, m009/m015→#208,
+m013/m014→#204).
