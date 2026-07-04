@@ -33,6 +33,7 @@ type SegmentHandler struct {
 	logger        *slog.Logger
 	now           func() time.Time
 	metrics       *Metrics
+	dropMetrics   *ingest.DropMetrics
 	onWriterError func(error)
 	completions   *completionBatcher
 }
@@ -57,6 +58,12 @@ func NewSegmentHandler(writer *ingest.Writer, logger *slog.Logger, m *Metrics) *
 		now:     time.Now,
 		metrics: m,
 	}
+}
+
+// SetDropMetrics wires the shared ingest drop counter family.
+// Construction-time wiring, like SetCompletionBatcher.
+func (h *SegmentHandler) SetDropMetrics(m *ingest.DropMetrics) {
+	h.dropMetrics = m
 }
 
 // SetCompletionBatcher queues repo completion watermarks for durable batch
@@ -87,6 +94,18 @@ func (h *SegmentHandler) handleRepo(ctx context.Context, did atmos.DID, r *repo.
 		trace.SpanFromContext(ctx).SetAttributes(attribute.String("did", string(did)))
 		start := time.Now()
 		defer func() { h.metrics.observeHandleRepo(start, retErr) }()
+
+		// #197 rev gate: every archived row shares commit.Rev, and rev
+		// ordering drives merge/compaction decisions, so an invalid rev
+		// fails the whole repo — visible in failed-repo diagnostics and
+		// retried by the retry loop — rather than silently archiving
+		// unorderable rows. atmos's repo loader already rejects invalid
+		// non-empty revs before HandleRepo runs; the empty rev is the
+		// reachable case here.
+		if _, err := atmos.ParseTID(commit.Rev); err != nil {
+			h.dropMetrics.IncDropped(ingest.DropSourceBackfill, ingest.DropReasonInvalidRev)
+			return fmt.Errorf("backfill: did=%s: commit rev is not a valid TID: %w", did, err)
+		}
 
 		now := h.now().UTC()
 		witnessedAt := now.UnixMicro()
@@ -124,9 +143,9 @@ func (h *SegmentHandler) handleRepo(ctx context.Context, did atmos.DID, r *repo.
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			collection, rkey, err := splitMSTKey(key)
-			if err != nil {
-				return fmt.Errorf("backfill: did=%s: %w", did, err)
+			collection, rkey, ok := h.validRecordPath(ctx, did, key)
+			if !ok {
+				return nil
 			}
 			payload, err := r.Store.GetBlock(cid)
 			if err != nil {
@@ -144,7 +163,7 @@ func (h *SegmentHandler) handleRepo(ctx context.Context, did atmos.DID, r *repo.
 			}
 			if err := segment.ValidateEvent(ev); err != nil {
 				if errors.Is(err, segment.ErrFieldTooLong) {
-					h.metrics.incDroppedRecords()
+					h.dropMetrics.IncDropped(ingest.DropSourceBackfill, ingest.DropReasonFieldTooLong)
 					h.logger.WarnContext(ctx, "dropped unarchivable upstream record",
 						"did", string(did),
 						"did_len", len(string(did)),
@@ -176,14 +195,65 @@ func (h *SegmentHandler) handleRepo(ctx context.Context, did atmos.DID, r *repo.
 	})
 }
 
+// validRecordPath applies the #197 per-record path gate on the
+// appending walk: a spec-invalid MST key drops that record — counted
+// on the shared drop family, no log line (hostile CARs must not
+// drive log volume; the labeled counter is the operator signal) —
+// while siblings archive normally. Returns ok=false for a drop.
+func (h *SegmentHandler) validRecordPath(ctx context.Context, did atmos.DID, key string) (collection, rkey string, ok bool) {
+	collection, rkey, reason := splitRecordPath(key)
+	if reason == "" {
+		return collection, rkey, true
+	}
+	h.dropMetrics.IncDropped(ingest.DropSourceBackfill, reason)
+	span := trace.SpanFromContext(ctx)
+	if span.IsRecording() {
+		span.AddEvent("dropped_invalid_record", attributeReasonDID(reason, did))
+	}
+	return "", "", false
+}
+
+// splitRecordPath splits an MST key and validates both halves against
+// the atproto specs (NSID + record key — the same checks as
+// atmos.ParseRepoPath). The MST layer's own key charset is broader
+// than the specs, and mst.LoadTree decodes keys from a downloaded CAR
+// without spec validation, so a hostile PDS can put arbitrary
+// MST-legal keys in front of this walk. reason == "" means valid.
+func splitRecordPath(key string) (collection, rkey string, reason ingest.DropReason) {
+	collection, rkey, found := strings.Cut(key, "/")
+	if !found {
+		return "", "", ingest.DropReasonInvalidCollection
+	}
+	if _, err := atmos.ParseNSID(collection); err != nil {
+		return collection, rkey, ingest.DropReasonInvalidCollection
+	}
+	if _, err := atmos.ParseRecordKey(rkey); err != nil {
+		return collection, rkey, ingest.DropReasonInvalidRkey
+	}
+	return collection, rkey, ""
+}
+
+func attributeReasonDID(reason ingest.DropReason, did atmos.DID) trace.SpanStartEventOption {
+	return trace.WithAttributes(
+		attribute.String("reason", string(reason)),
+		attribute.String("did", string(did)),
+	)
+}
+
+// validateRepoMaterializations pre-checks every replacement row a
+// resync will append, so a malformed CAR cannot leave a durable
+// KindSync tombstone without its replacement rows. Droppable records
+// (spec-invalid paths, over-wide fields) are SKIPPED here without
+// counting — the appending walk makes the same classification and
+// owns the metric, keeping each drop counted exactly once.
 func (h *SegmentHandler) validateRepoMaterializations(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit, materializedKind segment.Kind, witnessedAt int64) error {
 	return r.Tree.Walk(func(key string, cid cbor.CID) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		collection, rkey, err := splitMSTKey(key)
-		if err != nil {
-			return fmt.Errorf("backfill: did=%s: %w", did, err)
+		collection, rkey, reason := splitRecordPath(key)
+		if reason != "" {
+			return nil
 		}
 		payload, err := r.Store.GetBlock(cid)
 		if err != nil {
@@ -231,19 +301,4 @@ func (h *SegmentHandler) abortOnWriterError(err error) {
 	if h.onWriterError != nil {
 		h.onWriterError(err)
 	}
-}
-
-// splitMSTKey splits "collection/rkey" into its parts. The MST
-// validates the key shape on insert (atmos/mst.IsValidMstKey), so a
-// malformed key here is a data-integrity violation we surface
-// rather than swallow.
-func splitMSTKey(key string) (collection, rkey string, err error) {
-	idx := strings.IndexByte(key, '/')
-	if idx <= 0 || idx == len(key)-1 {
-		return "", "", fmt.Errorf("malformed MST key %q (expected collection/rkey)", key)
-	}
-	if strings.Contains(key[idx+1:], "/") {
-		return "", "", fmt.Errorf("MST key %q has more than one slash", key)
-	}
-	return key[:idx], key[idx+1:], nil
 }

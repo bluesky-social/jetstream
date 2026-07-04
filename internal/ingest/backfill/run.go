@@ -51,6 +51,10 @@ type Config struct {
 	// /metrics counters incrementing.
 	Metrics *Metrics
 
+	// DropMetrics is the shared ingest validation-drop counter family,
+	// forwarded to the SegmentHandler. Optional.
+	DropMetrics *ingest.DropMetrics
+
 	// AfterRepoComplete is a test-only restart hook invoked after a
 	// repo completion row is durably written. Leave nil in production.
 	AfterRepoComplete func(context.Context, atmos.DID) error
@@ -217,6 +221,7 @@ func Run(ctx context.Context, cfg Config) error {
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 		handler.onWriterError = recordFatal
 		handler.SetCompletionBatcher(completions)
+		handler.SetDropMetrics(cfg.DropMetrics)
 		logger := cfg.Logger.With(slog.String("component", "backfill/run"))
 
 		if len(cfg.BackfillRepos) > 0 {

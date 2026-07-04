@@ -7,18 +7,18 @@ method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 28 active mutants on disk
 (m001–m034; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
-2026-07-04 at `40e79cc` (#226) — **23 killed, 5 survived, zero
-STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was regenerated from it
-(commit field `40e79cc`) and gate-verified self-consistent. This campaign added
-**m034 (over-drop recorder disarmed via a stale hook watermark),
-KILLED@default** by the recorder's new watermark cross-check. The 5 survivors
-(m003, m009, m013, m014, m015) are all pre-existing documented escapes with
-owning issues (#209, #208, #204, #204, #208). (#183 closed 2026-07-04: no
-recorder-unique replacement for the retired m025 exists post-#178 — see the
-dated analysis section; the #100 over-drop recorder's gated mutant m034 guards
-its hook integrity, not its drop logic.) Counts inside older dated sections
-describe the catalog *as of that date* and are intentionally not
-back-edited.**
+2026-07-04 at `d08ed8b` (#197 ingest validation gate) — **23 killed, 5
+survived, zero STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was
+regenerated from it (commit field `d08ed8b`) and gate-verified
+self-consistent. No disposition changed vs the `40e79cc` run: the #197 gate
+rewrites the `events.go`/`handler.go` conversion paths but every mutant hunk
+still applies and every kill reproduces. The 5 survivors (m003, m009, m013,
+m014, m015) are all pre-existing documented escapes with owning issues (#209,
+#208, #204, #204, #208). (#183 closed 2026-07-04: no recorder-unique
+replacement for the retired m025 exists post-#178 — see the dated analysis
+section; the #100 over-drop recorder's gated mutant m034 guards its hook
+integrity, not its drop logic.) Counts inside older dated sections describe
+the catalog *as of that date* and are intentionally not back-edited.**
 
 ## The baseline gate (#108)
 
@@ -1139,3 +1139,28 @@ mismatch), no stress needed.
 No other disposition changed vs the `075fafd` baseline; the 5 survivors remain
 the documented escapes with owning issues (m003→#209, m009/m015→#208,
 m013/m014→#204).
+
+## Campaign 2026-07-04 — full catalog after the #197 ingest validation gate
+
+Full campaign at `d08ed8b` (ingest: validate rev and repo path on upstream
+events, closes #197). **28 mutants: 23 KILLED, 5 SURVIVED, zero
+STALE/BUILD-BROKEN.** `testing/mutation/baseline.json` regenerated from this
+run and gate-verified self-consistent (`gate: PASS — 28 mutants match
+baseline`).
+
+**Why this run mattered:** #197 rewrites both ingest conversion paths —
+`live/events.go` gains rev/op-path validation and generalizes
+`DroppedMissingBlocksError` to `DroppedOpsError`; `backfill/handler.go` gains
+the rev gate and replaces `splitMSTKey` (fail-whole-repo) with
+`splitRecordPath` (drop-record-keep-siblings). Seven mutants patch those
+exact files (m001, m013, m014, m017, m018, m019, m026), so this was the
+STALE-risk re-run the catalog discipline requires after major ingest changes.
+Result: every hunk still applies under `--unidiff-zero` (the mutated struct
+literals and switch arms were relocated, not rewritten) and every prior kill
+reproduces at the same tier with the same shape of note.
+
+No disposition changed. The 5 survivors remain the documented escapes with
+owning issues: m003 → #209 (merge cursor no-advance), m009/m015 → #208
+(footer/checksum blind spots), m013/m014 → #204 (verified-ops path is dead
+under polite simulator traffic — exactly the gap the #204 adversarial modes
+will close, now unblocked by this gate).

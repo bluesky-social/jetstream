@@ -22,6 +22,8 @@ import (
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/jcalabro/gt"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Consumer drives the upstream firehose into a directory of
@@ -392,7 +394,8 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			c.cfg.Metrics.incEventsReceived()
 
 			segEvts, err := ConvertEvent(evt, witnessedAt)
-			dme, isDropped := errors.AsType[*DroppedMissingBlocksError](err)
+			dme, isDropped := errors.AsType[*DroppedOpsError](err)
+			ive, isInvalid := errors.AsType[*InvalidEventError](err)
 			switch {
 			case errors.Is(err, ErrUnknownEventKind):
 				// Forward-compat hole: a future relay variant we don't
@@ -413,26 +416,52 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					"seq", evt.Seq,
 				)
 				continue
+			case isInvalid:
+				// Whole-event validation drop (e.g. non-TID rev): the
+				// event is recognized but spec-invalid, so no later
+				// build can archive it — count it and advance the
+				// cursor past it. No log line: hostile upstream input
+				// must not be able to drive our log volume; the
+				// labeled counter is the operator signal.
+				c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, ive.Reason)
+				span := trace.SpanFromContext(ctx)
+				if span.IsRecording() {
+					span.AddEvent("dropped_invalid_event", trace.WithAttributes(
+						attribute.String("reason", string(ive.Reason)),
+						attribute.String("did", ive.DID),
+						attribute.Int64("seq", evt.Seq),
+					))
+				}
+				c.noteUpstreamSeq(evt.Seq)
+				continue
 			case isDropped:
-				// Partial-CAR commit from a non-canonical PDS: one or
-				// more create/update ops referenced CIDs whose blocks
-				// were absent from the CAR diff. Bump the metric, log
-				// the offending DID, and fall through to archive the
-				// surviving ops (segEvts is non-nil and contains the
-				// well-formed events). A misbehaving upstream must NOT
-				// take the firehose down — a single such commit took
-				// down a multi-hour bootstrap backfill before this
-				// arm was added.
-				c.cfg.Metrics.addDroppedOpsMissingBlock(len(dme.Dropped))
-				// One log line per affected event keeps volume
-				// bounded under a misbehaving PDS spamming the
-				// firehose; per-op detail is on dme.Dropped for a
-				// future flag that wants it.
-				c.logger.WarnContext(ctx, "dropped ops with missing record blocks",
-					"seq", evt.Seq,
-					"count", len(dme.Dropped),
-					"did", dme.Dropped[0].DID,
-				)
+				// Per-op drops: missing record blocks (partial-CAR
+				// commit from a non-canonical PDS) or spec-invalid op
+				// paths. Bump the labeled counters and fall through to
+				// archive the surviving ops (segEvts is non-nil and
+				// contains the well-formed events). A misbehaving
+				// upstream must NOT take the firehose down — a single
+				// partial-CAR commit took down a multi-hour bootstrap
+				// backfill before this arm was added.
+				missingBlocks := 0
+				for reason, n := range dme.CountByReason() {
+					c.cfg.DropMetrics.AddDropped(ingest.DropSourceLive, reason, n)
+					if reason == ingest.DropReasonMissingBlock {
+						missingBlocks = n
+					}
+				}
+				// One log line per affected event — for missing-block
+				// drops only — keeps volume bounded under a misbehaving
+				// PDS spamming the firehose; per-op detail is on
+				// dme.Dropped for a future flag that wants it.
+				// Validation drops are counter-only by contract.
+				if missingBlocks > 0 {
+					c.logger.WarnContext(ctx, "dropped ops with missing record blocks",
+						"seq", evt.Seq,
+						"count", missingBlocks,
+						"did", dme.Dropped[0].DID,
+					)
+				}
 			case err != nil:
 				c.cfg.Metrics.incDecodeErrors()
 				// Bad shape from upstream is invalid external input,
@@ -457,7 +486,13 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			for i := range segEvts {
 				if err := segment.ValidateEvent(segEvts[i]); err != nil {
 					if errors.Is(err, segment.ErrFieldTooLong) {
-						c.cfg.Metrics.incDroppedEvents()
+						// Spec-valid but unrepresentable (e.g. a legal
+						// 256–512 byte rkey exceeds our 255-byte
+						// column): distinct reason so operators can
+						// tell "garbage" from "we chose not to
+						// represent". The log stays — these are rare
+						// and each one is a deliberate archival gap.
+						c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, ingest.DropReasonFieldTooLong)
 						c.logger.WarnContext(ctx, "dropped unarchivable upstream event",
 							"seq", evt.Seq,
 							"kind", segEvts[i].Kind,

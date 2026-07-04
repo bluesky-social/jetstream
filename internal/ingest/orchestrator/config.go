@@ -93,6 +93,11 @@ type Config struct {
 	// bootstrap phase only. Optional.
 	BackfillMetrics *backfill.Metrics
 
+	// DropMetrics is the shared ingest validation-drop counter family,
+	// labeled by (source, reason). Flows to both live consumers and
+	// every backfill SegmentHandler. Optional.
+	DropMetrics *ingest.DropMetrics
+
 	// SegmentMetrics is shared by every *ingest.Writer the orchestrator
 	// constructs (the bootstrap-time backfill writer, the bootstrap-time
 	// live consumer's internal writer, and the bootstrap-seal reopen).
