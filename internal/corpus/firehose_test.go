@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
@@ -117,7 +118,7 @@ func newCorpusVerifier(t *testing.T, docs map[string][]byte, onFailure func(did 
 // wantEvents is the number of segment events the frames must produce;
 // the helper fails if the consumer stalls before reaching it. Callers
 // injecting corrupted frames pass the reduced count they expect.
-func runCorpusConsumer(t *testing.T, frames [][]byte, docs map[string][]byte, wantEvents int, onVerifyFailure func(did atmos.DID, err error)) ([]segment.Event, []segment.Event, *live.Metrics) {
+func runCorpusConsumer(t *testing.T, frames [][]byte, docs map[string][]byte, wantEvents int, onVerifyFailure func(did atmos.DID, err error)) ([]segment.Event, []segment.Event, *live.Metrics, *ingest.DropMetrics) {
 	t.Helper()
 
 	st, err := store.Open(t.TempDir(), nil)
@@ -125,7 +126,9 @@ func runCorpusConsumer(t *testing.T, frames [][]byte, docs map[string][]byte, wa
 	t.Cleanup(func() { _ = st.Close() })
 
 	dir := filepath.Join(t.TempDir(), "segments")
-	metrics := live.NewMetrics(prometheus.NewRegistry())
+	reg := prometheus.NewRegistry()
+	metrics := live.NewMetrics(reg)
+	dropMetrics := ingest.NewDropMetrics(reg)
 
 	var (
 		mu       sync.Mutex
@@ -141,6 +144,7 @@ func runCorpusConsumer(t *testing.T, frames [][]byte, docs map[string][]byte, wa
 		RelayURL:    "https://relay.invalid",
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:     metrics,
+		DropMetrics: dropMetrics,
 		Verifier:    newCorpusVerifier(t, docs, onVerifyFailure),
 		OnEvent: func(ev *segment.Event) {
 			mu.Lock()
@@ -184,7 +188,24 @@ func runCorpusConsumer(t *testing.T, frames [][]byte, docs map[string][]byte, wa
 
 	mu.Lock()
 	defer mu.Unlock()
-	return readAllSegmentEvents(t, dir), liveSeen, metrics
+	return readAllSegmentEvents(t, dir), liveSeen, metrics, dropMetrics
+}
+
+// requireNoLiveDrops asserts every (live, reason) drop series is zero:
+// a clean corpus replay must not shed a single op or event at the
+// ingest validation gate.
+func requireNoLiveDrops(t *testing.T, dm *ingest.DropMetrics) {
+	t.Helper()
+	for _, reason := range []ingest.DropReason{
+		ingest.DropReasonInvalidRev,
+		ingest.DropReasonInvalidCollection,
+		ingest.DropReasonInvalidRkey,
+		ingest.DropReasonFieldTooLong,
+		ingest.DropReasonMissingBlock,
+	} {
+		require.Zerof(t, testutil.ToFloat64(dm.Counter(ingest.DropSourceLive, reason)),
+			"live drop reason %q fired on clean corpus", reason)
+	}
 }
 
 // readAllSegmentEvents seals any active segment in dir and decodes
@@ -280,7 +301,7 @@ func TestCorpusFirehoseReplay(t *testing.T) {
 	docs := loadDIDDocs(t)
 
 	var verifyFailures atomic.Int64
-	events, _, metrics := runCorpusConsumer(t, frames, docs, m.V1Events,
+	events, _, metrics, dropMetrics := runCorpusConsumer(t, frames, docs, m.V1Events,
 		func(did atmos.DID, err error) {
 			verifyFailures.Add(1)
 			t.Errorf("verification failure for %s: %v", did, err)
@@ -291,8 +312,7 @@ func TestCorpusFirehoseReplay(t *testing.T) {
 	require.Zero(t, verifyFailures.Load())
 	require.Zero(t, testutil.ToFloat64(metrics.DecodeErrors), "decode errors on clean corpus")
 	require.Zero(t, testutil.ToFloat64(metrics.UnknownEvents), "unknown events on clean corpus")
-	require.Zero(t, testutil.ToFloat64(metrics.DroppedEvents), "dropped events on clean corpus")
-	require.Zero(t, testutil.ToFloat64(metrics.DroppedOpsMissingBlock), "dropped ops on clean corpus")
+	requireNoLiveDrops(t, dropMetrics)
 	require.EqualValues(t, m.Frames, testutil.ToFloat64(metrics.EventsReceived))
 
 	// Encode every archived event as v1 JSON and index by match key.

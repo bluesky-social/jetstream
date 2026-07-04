@@ -22,7 +22,7 @@ func frameSeq(m manifest, i int) int64 { return m.SeqFirst + int64(i) }
 // clean replay's live stream, whose events retain UpstreamRelayCursor.
 func buildSeqEventCounts(t *testing.T, m manifest, frames [][]byte, docs map[string][]byte) (map[int64]int, map[int64]string) {
 	t.Helper()
-	_, live, _ := runCorpusConsumer(t, frames, docs, m.V1Events, nil)
+	_, live, _, _ := runCorpusConsumer(t, frames, docs, m.V1Events, nil)
 	counts := make(map[int64]int, len(live))
 	dids := make(map[int64]string, len(live))
 	for _, ev := range live {
@@ -107,7 +107,7 @@ func TestCorpusMalformedFrames(t *testing.T) {
 
 			wantEvents := m.V1Events - poisonEvents
 			var verifyFailures atomic.Int64
-			events, live, metrics := runCorpusConsumer(t, mutated, docs, wantEvents,
+			events, live, metrics, _ := runCorpusConsumer(t, mutated, docs, wantEvents,
 				func(atmos.DID, error) { verifyFailures.Add(1) })
 
 			require.Len(t, events, wantEvents,
