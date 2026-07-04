@@ -15,9 +15,11 @@ mutants match baseline`). This campaign added the `compaction` tier and banked
 detected deterministically by a boundary-exact scenario instead of 4/5 stress
 seeds. The remaining 5 survivors (m003, m009, m013, m014, m015) are all
 pre-existing documented escapes with owning issues (#209, #208, #204, #204,
-#208). (#183 still tracks re-deriving a #100-recorder mutant to replace the
-retired m025.) Counts inside older dated sections describe the catalog *as of
-that date* and are intentionally not back-edited.**
+#208). (#183 closed 2026-07-04: no recorder-unique replacement for the retired
+m025 exists post-#178 — see the dated analysis section; the #100 over-drop
+recorder is a regression assertion without a gated mutant.) Counts inside older
+dated sections describe the catalog *as of that date* and are intentionally not
+back-edited.**
 
 ## The baseline gate (#108)
 
@@ -70,7 +72,7 @@ remain below so the reasoning is not lost.
 | m020_overlay_drop_did_tombstones | 2026-06-29 | Targets `internal/overlay/format.go`, the read-path overlay deleted in #177 (drop-client-tombstones). No served overlay remains; DID-marker coverage is now the in-archive sentinel index (#175). |
 | m021_overlay_record_seq_base_zero | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m023_overlay_drop_record_tombstones | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
-| m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178; #183 tracks re-deriving a dedicated mutant for the #100 over-drop recorder. |
+| m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178. #183's re-derivation analysis (2026-07-04 section below) concluded no single-edit replacement exists: the recorder is a regression assertion without a gated mutant. |
 
 ## Campaign 2026-06-29 (step 11 #182 — partb tier; catalog refresh; baseline regen)
 
@@ -1024,3 +1026,85 @@ closed loop; drift pin tracked in #208), m013/m014 (dead paths in this
 simulator config; adversarial-traffic modes in #204 make them live), m015
 (footer-index blind spot, #208). No disposition regressed vs the `dba121e`
 baseline; the only change is m002 SURVIVED→KILLED — a bankable improvement.
+
+## Analysis 2026-07-04 — #183: no recorder-unique over-drop mutant exists post-#178
+
+Closes the question #183 left open when m025 was retired: can a single-edit
+mutant be re-derived that the #100 compaction over-drop recorder
+(`compactionOverDropRecorder.Assert`) catches UNIQUELY — an at/below-watermark
+survivor wrongly dropped while final-state Compare stays green because the
+record is independently superseded above the watermark? **Conclusion: no.**
+The recorder is downgraded to a pure regression assertion (it still runs on
+every oracle lifecycle run; it has no gated mutant). The issue's
+definition-of-done explicitly permitted this exit when analysis shows the
+recorder can no longer be uniquely tripped under the current architecture.
+
+The argument has two load-bearing halves, each verified by independent
+adversarial review (two reviewers, boundary-arithmetic and lifecycle lenses,
+each instructed to refute; both upheld after tracing ~10 candidate single
+edits each):
+
+1. **Filter-legality: every genuinely-folded drop is recorder-invisible by
+   construction.** Post-#178 the pass's tombstone snapshot is folded from the
+   exact on-disk sealed window `(current, targetWatermark]` it is about to
+   compact, and `targetWatermark` is *defined* as the max `MaxSeq` over those
+   same sealed segments (`listSealedCompactionSegments`) — no fold input
+   exceeds the window, so the m025 mechanism (an above-watermark tombstone
+   leaking into the snapshot) has no source to leak from; re-widening
+   `FoldRange`'s upper bound to `^uint64(0)` is a literal no-op. The
+   recorder's expected side (`filterCompactedExpectedRows`) recomputes
+   tombstones from the identical pre-pass bytes at the identical
+   targetWatermark with the same strict `tombstoneSeq > rowSeq`, per-key max.
+   Any drop justified by a real folded tombstone is therefore also
+   filter-approved — the recorder cannot see it. Edits that *shrink* or
+   mis-bound the snapshot (fold-bound flips, `Snapshot.Merge` min-for-max,
+   segment/block window-skip inversions, cap `chunkEnd` corruption) produce
+   **under-drops** against the committed watermark — `CheckCompacted`'s
+   exclusive domain, asserted earlier in the harness. The cap path was probed
+   specifically: snapshot tombstones can never exceed `chunkEnd` (segments
+   fold whole, ascending, and the cap break sets `chunkEnd` to the tripping
+   segment's own MaxSeq), so the `ev.Seq > chunkEnd` keep-guard edits are
+   no-ops, and cap bugs corrupt the *watermark contract* (CheckCompacted),
+   never the *drop justification* (the recorder).
+
+2. **Maximality: the only edits that manufacture a filter-illegal drop are
+   caught by Compare first, on every seed.** Producing a drop the filter
+   rejects requires corrupting a seq comparison or seq value
+   (`ShouldDrop`'s strict `>` → `>=`, `observeLocked`'s `ev.Seq` → `ev.Seq+1`).
+   Because segment seqs are unique, the only new victim such an edit creates
+   is the tombstone-row-itself — the self-superseding update — so the edit is
+   maximal: it kills *every* update row at/below the watermark, including
+   records whose final state is that update. The merge-tail pass compacts the
+   entire bootstrap stream, and `assertOracleMatches` (final-state Compare)
+   runs at after-merge, long before `overDrop.Assert` at shutdown — Compare
+   goes red on every realistic seed. There is no single edit that isolates
+   the convergence-hiding shape (dropped survivor re-superseded above W)
+   without also dropping final-state updates; that selectivity was exactly
+   what the deleted `Set.SnapshotRange(current, ^uint64(0))` readout provided
+   and nothing in the current architecture reintroduces.
+
+Also verified in passing: the in-memory `tombstone.Set` feeds no drop decision
+(production consumers are `Observe`/`Evict`/`Replace`/`Len`/`ApproxBytes` —
+trigger accounting and gauges only), and `segment.Rewrite`'s candidate-DID
+bloom prefilter can only skip-vs-scan (under-drop or no-op, never over-drop).
+
+**What the recorder is now for.** It remains live insurance: it is the only
+checker whose contract is "the pass dropped exactly what the documented filter
+says at W," so any future re-architecture that reintroduces an out-of-window
+tombstone source (an in-memory readout, a cross-window cache, a
+manifest-derived snapshot) reactivates its unique power. Anyone making such a
+change must re-derive a mutant for it at that point — this analysis is
+architecture-specific, not a permanent pardon.
+
+**Residual gaps found by the adversarial review, filed as follow-ups rather
+than scope-crept here:**
+
+- A single edit can vacuously *disarm* the recorder without failing anything:
+  `runDeleteCompaction` passing the stale `watermark` instead of
+  `targetWatermark` to `OnBeforeCompactionPass` bounds both recorder scans
+  below every drop the pass makes, so pre == post trivially. The recorder
+  should cross-check its observed watermark against the pass result's
+  committed watermark (tracked in a follow-up issue).
+- `ShouldDrop`'s DID branch `ts.Seq > ev.Seq` → `>=` survives every tier
+  entirely (a same-seq DID-tombstone/materialization pair cannot exist, so
+  the edit is a no-op — an equivalent mutant, not an escape).

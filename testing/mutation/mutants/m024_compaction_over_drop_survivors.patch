@@ -23,12 +23,12 @@ expected-detection: |
   refuted empirically: a delete arriving in the new active segment AFTER the
   force-rotate has seq > targetWatermark and remains in the live tombstone set
   above W, so the straddle (create <= W, delete > W) is the normal steady-state
-  shape. The end-to-end convergence-hiding over-drop IS reachable in steady
-  mode and is now exercised by m025_compaction_overdrop_above_watermark, which
-  the steady compactionOverDropRecorder kills while final-state stays green.
-  (It is NOT reachable via the restart/merge-tail path, where the tombstone
-  snapshot always spans the whole sealed stream — so #103/#113's restart tier
-  is not its home.)
+  shape. The end-to-end convergence-hiding over-drop was exercised by
+  m025_compaction_overdrop_above_watermark until its Set.SnapshotRange
+  mechanism was deleted in #178; the #183 analysis (2026-07-04 RESULTS.md
+  section) concluded no single-edit replacement exists under the windowed-fold
+  architecture, so the recorder is a regression assertion without a gated
+  mutant. This blanket mutant remains the compaction data-loss coverage.
 expected-tier: default
 tiers: default
 

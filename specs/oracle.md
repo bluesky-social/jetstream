@@ -334,8 +334,20 @@ steady-state tier (mutation `m025`), where a delete arriving after the pass's
 force-rotate sits above the watermark and a survivor can be wrongly dropped
 while final state still converges. `m025` was retired when its
 `Set.SnapshotRange` mechanism was deleted in #178 (the on-disk windowed fold can
-no longer reach the above-watermark over-drop it modelled); #183 tracks
-re-deriving a dedicated mutant for the #100 over-drop recorder.
+no longer reach the above-watermark over-drop it modelled). #183's re-derivation
+analysis concluded that NO single-edit mutant can uniquely trip the recorder
+under the windowed-fold architecture: the pass folds its tombstones from the
+exact on-disk window it compacts (so every genuinely-folded drop is also
+approved by the recorder's identically-bounded filter — invisible to it), and
+the only edits that manufacture a filter-illegal drop (seq-comparison or
+seq-value corruption, whose sole new victim is the self-superseding update row)
+are maximal and die at after-merge final-state Compare on every seed. The
+recorder is therefore a **regression assertion without a gated mutant**: it
+still runs on every lifecycle run, and its unique power reactivates only if a
+future change reintroduces an out-of-window tombstone source (an in-memory
+readout, a cross-window cache) — whoever makes such a change must re-derive a
+mutant for it then. Full argument: the 2026-07-04 section of
+`testing/mutation/RESULTS.md`.
 
 ### Store-Fault Tier
 
