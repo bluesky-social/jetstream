@@ -28,6 +28,7 @@
     {"id":"m031_plan_truncation_zero_units_unadvanced","disposition":"KILLED","result":"KILLED@partb","note":"see log"},
     {"id":"m032_v2_below_floor_silent_clamp","disposition":"KILLED","result":"KILLED@partb","note":"see log"},
     {"id":"m033_client_too_old_400_not_rebackfilled","disposition":"KILLED","result":"KILLED@partb","note":"see log"},
-    {"id":"m034_overdrop_hook_stale_watermark","disposition":"KILLED","result":"KILLED@default","note":"oracle: over-drop recorder watermark mismatch: pre-pass hook saw 20 but the pass committed 33 (recorder scans bounded at the wrong seq would"}
+    {"id":"m034_overdrop_hook_stale_watermark","disposition":"KILLED","result":"KILLED@default","note":"oracle: over-drop recorder watermark mismatch: pre-pass hook saw 20 but the pass committed 33 (recorder scans bounded at the wrong seq would"},
+    {"id":"m035_account_replay_guard_inverted","disposition":"KILLED","result":"KILLED@replay","note":"see log"}
   ]
 }
