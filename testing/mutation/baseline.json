@@ -1,15 +1,15 @@
 {
-  "commit": "dba121e3ba51c59fdd48d2cfb4b735ee1bf2b13a",
+  "commit": "075fafdbd4379bbf2599c5ae193e94e1de7e5629",
   "mutants": [
     {"id":"m001_delete_mapped_to_update","disposition":"KILLED","result":"KILLED@default","note":"see log"},
-    {"id":"m002_watermark_floor_off_by_one","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m002_watermark_floor_off_by_one","disposition":"KILLED","result":"KILLED@compaction","note":"oracle: superseded record row survived at/below the first-init watermark: seq=1 watermark=2 (m002 boundary miss is permanent: later fold win"},
     {"id":"m003_merge_cursor_no_advance","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
     {"id":"m004_rev_filter_inverted","disposition":"KILLED","result":"KILLED@default","note":"oracle: missing did:plc:iv2erqbe5k4ltaawmik4tfeo app.bsky.actor.profile/22auixj3zqj3g rev="},
     {"id":"m005_backfill_status_check_inverted","disposition":"KILLED","result":"KILLED@restart","note":"oracle: rev regression for DID did:plc:xe6kimero4ysp4mpzse6npbs at event 13: seq=20 app.bsky.feed.post/22avhp53lzac4 rev="},
     {"id":"m006_merge_commit_error_swallowed","disposition":"KILLED","result":"KILLED@storefault","note":"see log"},
     {"id":"m008_header_offset_byteslice","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m009_checksum_range_off_by_one","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
-    {"id":"m011_wire_frame_length","disposition":"KILLED","result":"KILLED@default","note":"oracle: walk active segment /tmp/TestOracle_DefaultLifecycle1202675196/003/segments/seg_0000000000.jss: segment: walk active frames: segment"},
+    {"id":"m011_wire_frame_length","disposition":"KILLED","result":"KILLED@default","note":"oracle: walk active segment /tmp/TestOracle_DefaultLifecycle3982613638/003/segments/seg_0000000000.jss: segment: walk active frames: segment"},
     {"id":"m012_block_event_count_off_by_one","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m013_collection_rkey_swap","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
     {"id":"m014_rev_dropped","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
