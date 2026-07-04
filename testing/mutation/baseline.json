@@ -1,5 +1,5 @@
 {
-  "commit": "40e79cc26e21ecf1a4bbd1cad17b49e8f10e0b6a",
+  "commit": "d08ed8b471cb71d91ef6ad4706eef05c72203490",
   "mutants": [
     {"id":"m001_delete_mapped_to_update","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m002_watermark_floor_off_by_one","disposition":"KILLED","result":"KILLED@compaction","note":"oracle: superseded record row survived at/below the first-init watermark: seq=1 watermark=2 (m002 boundary miss is permanent: later fold win"},
@@ -9,7 +9,7 @@
     {"id":"m006_merge_commit_error_swallowed","disposition":"KILLED","result":"KILLED@storefault","note":"see log"},
     {"id":"m008_header_offset_byteslice","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m009_checksum_range_off_by_one","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
-    {"id":"m011_wire_frame_length","disposition":"KILLED","result":"KILLED@default","note":"oracle: walk active segment /tmp/TestOracle_DefaultLifecycle4015434081/003/segments/seg_0000000000.jss: segment: walk active frames: segment"},
+    {"id":"m011_wire_frame_length","disposition":"KILLED","result":"KILLED@default","note":"oracle: walk active segment /tmp/TestOracle_DefaultLifecycle3677620291/003/segments/seg_0000000000.jss: segment: walk active frames: segment"},
     {"id":"m012_block_event_count_off_by_one","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m013_collection_rkey_swap","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
     {"id":"m014_rev_dropped","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
