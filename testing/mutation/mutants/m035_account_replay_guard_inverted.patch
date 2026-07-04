@@ -1,0 +1,37 @@
+mutant: m035_account_replay_guard_inverted
+target: internal/ingest/live/consumer.go
+failure-mode: |
+  The #account replay guard's kind check is inverted (!= becomes ==), so
+  the guard never examines an #account event — the exact pre-#231 state.
+  A relay seq regression (relay restored from backup) re-delivers an
+  account-delete which re-archives at a fresh jetstream seq ABOVE a later
+  reactivate + recreate; every fold (oracle reconstruct, the tombstone
+  set, compaction) then treats the account as deleted after the recreate
+  and permanently erases live records from folded state and, after
+  compaction, from the archive.
+expected-detection: |
+  replay tier: TestOracle_RelaySeqDuplicates / TestOracle_RelaySeqRegression
+  drive the real live consumer against the simulator relay with a
+  seq-replay fault over an account-delete/reactivate/recreate window and
+  assert final-state convergence + exact-multiset event log + the guard's
+  drop counter (anti-vacuity). With the guard vacuously disabled the
+  replayed account-delete re-archives above the recreate: the drop-counter
+  anti-vacuity assert fails first, and final-state Compare reports the
+  recreated record missing. The live-package unit test
+  TestProcessBatch_ReplayedAccountEventIsDroppedNotReArchived also fails.
+expected-tier: replay
+tiers: replay
+
+diff --git a/internal/ingest/live/consumer.go b/internal/ingest/live/consumer.go
+index 374f39c..5308212 100644
+--- a/internal/ingest/live/consumer.go
++++ b/internal/ingest/live/consumer.go
+@@ -236,7 +236,7 @@ func (c *Consumer) dropStaleOrderedAsyncResync(ctx context.Context, evt streamin
+ // it before its own rows land, and consulting it would drop a legitimate
+ // intermediate event.
+ func (c *Consumer) dropReplayedAccountEvent(ctx context.Context, segEvts []segment.Event) (bool, error) {
+-	if c.cfg.SyncStateStore == nil || len(segEvts) != 1 || segEvts[0].Kind != segment.KindAccount {
++	if c.cfg.SyncStateStore == nil || len(segEvts) != 1 || segEvts[0].Kind == segment.KindAccount {
+ 		return false, nil
+ 	}
+ 	state, err := c.cfg.SyncStateStore.LoadAppliedHosting(ctx, atmos.DID(segEvts[0].DID))

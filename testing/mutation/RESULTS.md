@@ -1164,6 +1164,61 @@ owning issues: m003 → #209 (merge cursor no-advance), m009/m015 → #208
 (footer/checksum blind spots), m013/m014 → #204 (verified-ops path is dead
 under polite simulator traffic — exactly the gap the #204 adversarial modes
 will close, now unblocked by this gate).
+## Campaign 2026-07-04 — `replay` tier; m035 banked (#205, #231)
+
+Original campaign at `c1dbc39` (branch `relay-seq-replay-205`, pre-rebase):
+**28 mutants: 23 KILLED, 5 SURVIVED, zero STALE/BUILD-BROKEN.** The branch was
+subsequently rebased onto main at `3921e5f` (post-#228/#229, which added m034
+and the #197 gate) and the full campaign re-run at the rebased head `5d6fc9e`:
+**29 mutants: 24 KILLED, 5 SURVIVED, zero STALE/BUILD-BROKEN** — m034 and m035
+both KILLED side by side, every prior disposition reproduced, gate PASS.
+`baseline.json` re-banked from that run.
+
+**New `replay` tier; m035 banked KILLED@replay.** #205 made relay seq
+duplicates and regressions live: atmos's gap check is forward-only
+(`seq > last+1`), so a relay that re-delivers frames — a duplicate burst or a
+whole window replayed by a relay restored from backup — passes silently. The
+simulator gained `SubscribeReposReplayFault` schedules (duplicate-last-N,
+regress-to-K) that re-send previously delivered frame bytes verbatim, with
+fired/replayed-frame counters for anti-vacuity.
+
+Building the oracle scenario found a production bug before the assertions were
+even written (#231): the verifier rev-replay-drops duplicate #commit/#sync, but
+replayed **#account** events flowed through and re-archived at fresh jetstream
+seqs. A replayed account-delete landing above a later reactivate + recreate
+made every fold — oracle reconstruct, the tombstone set, compaction — treat
+the account as deleted after the recreate: permanent erasure of live records
+from folded state and, post-compaction, from the archive. Fixed with a consumer
+guard dropping #account events at/below the DID's APPLIED hosting-state seq
+(promoted/pebble only, never pending — pending state can run ahead under
+pipelined verification and would drop legitimate intermediates), metric
+`replayed_account_events_dropped_total`.
+
+The replay contract is therefore exact, not merely bounded: durable rows must
+equal the once-per-frame expansion of the world's firehose
+(`CompareEventLogMultiset` — zero bloat, zero loss), final state must converge,
+and structural invariants must hold. `TestOracle_RelaySeqDuplicates` /
+`TestOracle_RelaySeqRegression` (internal/oracle/replay_fault_test.go, <1s)
+drive the REAL live consumer — real websocket, real atmos pipeline,
+pebble-backed verifier state — against the simulator relay over a
+delete→reactivate→recreate window, with anti-vacuity on the fault firing, the
+exact replayed-frame count, and the guard's drop counter.
+
+m035 (`m035_account_replay_guard_inverted`) inverts the guard's kind check so
+it never examines an #account event — the exact pre-#231 production state.
+Red-first verified: with the guard disabled both scenarios fail on final-state
+divergence (`oracle: missing ... recreated1`); clean tree green. KILLED@replay.
+
+Also in this change, riding along per the issue body: relay sequence gaps split
+out of `decode_errors_total` into `sequence_gaps_total` +
+`sequence_gap_missed_seqs_total`, so relay data loss is
+operator-distinguishable from garbage frames.
+
+### Survivors (5) — unchanged, all documented escapes with owning issues
+
+m003 (#209), m009 (#208), m013/m014 (#204), m015 (#208). No disposition
+regressed vs the `075fafd` baseline; the only change is m035 added KILLED.
+
 
 ## Campaign 2026-07-04 — `corpus` tier; m009 SURVIVED→KILLED (#32)
 
@@ -1216,3 +1271,4 @@ the checksum instance. Fixture provenance and the re-capture procedure:
 `internal/corpus/testdata/README.md`; capture-tool source preserved on #32.
 
 Remaining survivors: m003 (#209), m013/m014 (#204), m015 (#208).
+
