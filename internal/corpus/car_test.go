@@ -109,7 +109,7 @@ func TestCorpusCARBackfill(t *testing.T) {
 
 	got := make(map[string]segment.Event, len(events))
 	for _, ev := range events {
-		require.Equal(t, segment.KindCreate, segment.Kind(ev.Kind))
+		require.Equal(t, segment.KindCreate, ev.Kind)
 		require.Equal(t, did, ev.DID)
 		require.Equal(t, rev, ev.Rev, "backfill rows carry the commit rev")
 		key := ev.Collection + "/" + ev.Rkey
