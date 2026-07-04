@@ -1108,3 +1108,55 @@ than scope-crept here:**
 - `ShouldDrop`'s DID branch `ts.Seq > ev.Seq` → `>=` survives every tier
   entirely (a same-seq DID-tombstone/materialization pair cannot exist, so
   the edit is a no-op — an equivalent mutant, not an escape).
+
+## Campaign 2026-07-04 — `corpus` tier; m009 SURVIVED→KILLED (#32)
+
+Targeted run at `af7c00a` (`testing/mutation/run.sh m009`):
+**m009 KILLED@corpus** (default and stress tiers still pass it, as the
+structural analysis predicts — the kill comes from the new tier).
+`baseline.json` updated for m009 only; no other disposition touched.
+
+**New `corpus` tier; the symmetric-checksum blind spot is closed.** m009
+(`xxh3HeaderFooter` computing over `headerBytes[13:]` instead of `[12:]`) was
+the catalog's canonical structural escape: seal and `Reader.Open` share the
+function, so the mutated writer and mutated reader always agree, and every
+write-then-read-back check in the tree — the whole oracle included — passes.
+The 2026-06-16 analysis dispositioned it "accepted blind spot — only an
+independent checksum oracle (or a committed golden segment with a known-good
+checksum) would catch it." #32 built exactly that.
+
+The tier runs `internal/corpus` (<150ms, offline): real network bytes with
+expected outputs pinned by foreign implementations at capture time
+(production Jetstream v1 JSON for a contiguous relay firehose window,
+indigo/goat for a production getRepo CAR), plus
+`testdata/golden_corpus_segment.jss` — a sealed segment produced from the
+real CAR's records by a known-good build. `TestCorpusSegmentGolden` kills
+m009 twice over:
+
+- write side: the mutated seal produces a different checksum in the fixed
+  header, so the byte-exact compare against the committed golden fails;
+- read side: `segment.Open` on the COMMITTED file recomputes the digest with
+  the mutated range and rejects the stored (correct) checksum.
+
+Either alone suffices; together they also pin the failure a symmetric shift
+actually causes in production — every segment the mutated build writes is
+checksum-corrupt for any correct build that later opens it (rolling upgrade,
+downgrade, `inspect-segment`, external tooling).
+
+Red-first verified during development: the golden test failed under the m009
+patch (header bytes `41 b6 8f 2c...` vs golden `dc ca c2 5d...`) before the
+tier was wired. m009's header now declares `expected-tier: corpus` with
+`tiers: default,stress,corpus` — default/stress stay as documentation that
+the closed loop still cannot see it.
+
+Beyond m009, the tier's firehose replay pins the full live path (raw relay
+CBOR frames → atmos decode → offline Sync 1.1 signature verification →
+ConvertEvent → ingest → v1 JSON vs production Jetstream's own output,
+field-for-field), and the CAR test pins atmos's MST walk + CID derivation
+against indigo's on the same real repo — coverage for the broader
+atmos-closed-loop class (`specs/oracle.md` "Real-Data Corpus Tier"), not just
+the checksum instance. Fixture provenance and the re-capture procedure:
+`internal/corpus/testdata/README.md`; capture-tool source preserved on #32.
+
+Remaining survivors are unchanged: m003 (#209), m013/m014 (#204), m015
+(#208).
