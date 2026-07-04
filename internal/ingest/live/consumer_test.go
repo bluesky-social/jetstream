@@ -239,7 +239,7 @@ func TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer(t *testing.T) {
 	// Real metrics registry so we can assert the dropped-ops counter
 	// was bumped — both that the typed-error arm fired AND that the
 	// AsType extraction inside that arm reached len(dme.Dropped).
-	metrics := NewMetrics(prometheus.NewRegistry())
+	dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
 
 	c, err := Open(Config{
 		SegmentsDir: dir,
@@ -249,7 +249,7 @@ func TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer(t *testing.T) {
 		RelayURL:    "https://example.invalid",
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Verifier:    newTestVerifier(t),
-		Metrics:     metrics,
+		DropMetrics: dropMetrics,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
@@ -257,7 +257,7 @@ func TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer(t *testing.T) {
 	// Build a #commit with one valid create plus one orphan create
 	// whose CID parses but isn't in the CAR.
 	did := "did:plc:partialcar"
-	evt, _ := buildCommit(t, did, "rev-mixed",
+	evt, _ := buildCommit(t, did, "3l3qo2vutsw2b",
 		struct{ Coll, Rkey string }{"app.bsky.feed.post", "good"},
 	)
 	orphanCID := cbor.ComputeCID(cbor.CodecDagCBOR, []byte("not-in-the-car"))
@@ -273,7 +273,7 @@ func TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer(t *testing.T) {
 	require.Equal(t, int64(42), c.LastUpstreamSeq(),
 		"the upstream cursor must advance past a partial-CAR commit; "+
 			"otherwise restart hits the same commit and re-crashes")
-	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DroppedOpsMissingBlock), 0,
+	require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceLive, ingest.DropReasonMissingBlock)), 0,
 		"the consumer must extract per-op detail from the typed error and bump the counter")
 }
 
@@ -297,7 +297,7 @@ func TestProcessBatch_MalformedCommitDoesNotShutDownConsumer(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 
-	evt, _ := buildCommit(t, "did:plc:badcommit", "rev-bad",
+	evt, _ := buildCommit(t, "did:plc:badcommit", "3l3qo2vutsw2f",
 		struct{ Coll, Rkey string }{"app.bsky.feed.post", "rec0"},
 	)
 	evt.Seq = 43
@@ -316,7 +316,7 @@ func TestProcessBatch_OverwideRecordKeyDoesNotShutDownConsumer(t *testing.T) {
 
 	st := newTestStore(t)
 	dir := filepath.Join(t.TempDir(), "live_segments")
-	metrics := NewMetrics(prometheus.NewRegistry())
+	dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
 
 	c, err := Open(Config{
 		SegmentsDir: dir,
@@ -326,12 +326,15 @@ func TestProcessBatch_OverwideRecordKeyDoesNotShutDownConsumer(t *testing.T) {
 		RelayURL:    "https://example.invalid",
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Verifier:    newTestVerifier(t),
-		Metrics:     metrics,
+		DropMetrics: dropMetrics,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 
-	evt, _ := buildCommit(t, "did:plc:widerkey", "rev-wide",
+	// A spec-valid rkey can be up to 512 bytes, but our segment rkey
+	// column holds 255 — this is the field_too_long path, distinct
+	// from spec-invalid input.
+	evt, _ := buildCommit(t, "did:plc:widerkey", "3l3qo2vutsw2b",
 		struct{ Coll, Rkey string }{"app.bsky.feed.post", strings.Repeat("x", 256)},
 	)
 	evt.Seq = 44
@@ -341,8 +344,87 @@ func TestProcessBatch_OverwideRecordKeyDoesNotShutDownConsumer(t *testing.T) {
 	require.Equal(t, int64(44), c.LastUpstreamSeq(),
 		"the upstream cursor must advance past recognized-but-unarchivable external data")
 	require.Equal(t, uint64(1), c.Writer().NextSeq(), "unarchivable records must not be written (NextSeq stays at the fresh-dir seed)")
-	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.DroppedEvents), 0,
-		"the skipped event must be visible in dropped_events_total")
+	require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceLive, ingest.DropReasonFieldTooLong)), 0,
+		"the skipped event must be visible in the shared drop family under field_too_long")
+}
+
+// TestProcessBatch_InvalidRevDropsEventAndAdvancesCursor pins the #197
+// whole-event gate at the consumer level: a #commit with a non-TID rev
+// is counted under invalid_rev, nothing is archived, and the cursor
+// advances past it (the input can never become valid, so there is
+// nothing to replay).
+func TestProcessBatch_InvalidRevDropsEventAndAdvancesCursor(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
+
+	c, err := Open(Config{
+		SegmentsDir: dir,
+		Store:       st,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		DropMetrics: dropMetrics,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	evt, _ := buildCommit(t, "did:plc:badrev", "not-a-tid",
+		struct{ Coll, Rkey string }{"app.bsky.feed.post", "rec0"},
+	)
+	evt.Seq = 45
+
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{evt}),
+		"a spec-invalid rev must not propagate an error out of processBatch")
+	require.Equal(t, int64(45), c.LastUpstreamSeq(),
+		"the cursor must advance past a permanently-invalid event")
+	require.Equal(t, uint64(1), c.Writer().NextSeq(),
+		"no row of an invalid-rev commit may be archived")
+	require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceLive, ingest.DropReasonInvalidRev)), 0)
+}
+
+// TestProcessBatch_InvalidOpPathDropsOpArchivesSiblings pins the
+// per-op gate end-to-end: the hostile op is counted under its reason
+// and the well-formed sibling still lands in the archive.
+func TestProcessBatch_InvalidOpPathDropsOpArchivesSiblings(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
+
+	c, err := Open(Config{
+		SegmentsDir: dir,
+		Store:       st,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		DropMetrics: dropMetrics,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	evt, _ := buildCommit(t, "did:plc:evilpath", "3l3qo2vutsw2b",
+		struct{ Coll, Rkey string }{"app.bsky.feed.post", "good"},
+	)
+	// Sentinel-shadowing collection on a spliced op that reuses the
+	// valid record's CID so only the path check can reject it.
+	evil := evt.Commit.Ops[0]
+	evil.Path = "$account/evil"
+	evt.Commit.Ops = append(evt.Commit.Ops, evil)
+	evt.Seq = 46
+
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{evt}))
+	require.Equal(t, int64(46), c.LastUpstreamSeq())
+	require.Equal(t, uint64(2), c.Writer().NextSeq(),
+		"exactly the surviving sibling must be archived")
+	require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceLive, ingest.DropReasonInvalidCollection)), 0)
 }
 
 func encodeAccountFrame(t *testing.T, did string, seq int64) []byte {

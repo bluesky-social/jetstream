@@ -40,6 +40,10 @@ type RetryConfig struct {
 	Logger     *slog.Logger
 	Metrics    *Metrics
 
+	// DropMetrics is the shared ingest validation-drop counter family,
+	// forwarded to the SegmentHandler. Optional.
+	DropMetrics *ingest.DropMetrics
+
 	// BackfillStore, when non-nil, is the shared *Store the runner uses for
 	// all metadata reads/writes instead of constructing its own over Store.
 	// The steady-state path injects the same instance the LiveEnqueuer holds
@@ -146,6 +150,7 @@ func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
 		st = NewStore(cfg.Store, cfg.Metrics)
 	}
 	handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
+	handler.SetDropMetrics(cfg.DropMetrics)
 	return &retryRunner{
 		cfg:        cfg,
 		syncClient: atmossync.NewClient(atmossync.Options{Client: xc}),

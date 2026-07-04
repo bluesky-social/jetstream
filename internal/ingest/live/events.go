@@ -15,7 +15,9 @@ package live
 import (
 	"fmt"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 )
 
@@ -64,6 +66,76 @@ func ConvertEvent(evt streaming.Event, witnessedAt int64) ([]segment.Event, erro
 	}
 }
 
+// validateRev enforces the #197 ingest gate on a commit/sync rev: it
+// must be a spec-valid TID, because rev ordering drives the merge
+// filter, the stale-resync guard, and compaction tombstone folding.
+// Returns a typed *InvalidEventError so the caller drops the whole
+// event and counts it — every row of the event shares the rev, so no
+// part of it is archivable.
+func validateRev(did, rev string) error {
+	if _, err := atmos.ParseTID(rev); err != nil {
+		return &InvalidEventError{
+			Reason: ingest.DropReasonInvalidRev,
+			DID:    did,
+			Detail: err.Error(),
+		}
+	}
+	return nil
+}
+
+// validateOpPath enforces the per-op half of the gate: collection
+// must be a spec-valid NSID (which also rejects `$`-prefixed names
+// that could shadow the $account/$identity/$sync sentinels) and rkey
+// a spec-valid record key. Returns the DroppedOp to record, or nil if
+// the op is clean. Wire op paths are attacker-controlled and atmos
+// deliberately does not re-validate them (streaming.Operation doc).
+func validateOpPath(op *streaming.Operation) *DroppedOp {
+	var reason ingest.DropReason
+	switch {
+	case op.Collection.Validate() != nil:
+		reason = ingest.DropReasonInvalidCollection
+	case op.RKey.Validate() != nil:
+		reason = ingest.DropReasonInvalidRkey
+	default:
+		return nil
+	}
+	return &DroppedOp{
+		Reason:     reason,
+		DID:        string(op.Repo),
+		Collection: string(op.Collection),
+		RKey:       string(op.RKey),
+		Action:     string(op.Action),
+		CID:        opCIDString(op),
+	}
+}
+
+// validateOp gates one op whose rev is archived from op.Rev itself
+// (the verified-ops and sync-resync paths; convertCommit archives
+// the already-validated commit.Rev instead and skips the rev half).
+// Returns the DroppedOp to record, or nil if the op is clean.
+func validateOp(op *streaming.Operation) *DroppedOp {
+	if op.Rev.Validate() != nil {
+		return &DroppedOp{
+			Reason:     ingest.DropReasonInvalidRev,
+			DID:        string(op.Repo),
+			Collection: string(op.Collection),
+			RKey:       string(op.RKey),
+			Action:     string(op.Action),
+			CID:        opCIDString(op),
+		}
+	}
+	return validateOpPath(op)
+}
+
+// opCIDString renders the op's CID for drop diagnostics; deletes have
+// no CID and render empty rather than a garbage zero-value encoding.
+func opCIDString(op *streaming.Operation) string {
+	if !op.CID.Defined() {
+		return ""
+	}
+	return op.CID.String()
+}
+
 // convertVerifiedOps drains evt.Operations() and converts each op
 // into a segment.Event. Used for the verifier-resync emission path
 // where the upstream wire envelope is absent and the only signal is
@@ -79,6 +151,13 @@ func convertVerifiedOps(evt streaming.Event, witnessedAt int64) ([]segment.Event
 		kind, err := actionKind(op.Action)
 		if err != nil {
 			return nil, fmt.Errorf("livestream: did=%s: %w", op.Repo, err)
+		}
+
+		// No shared envelope rev exists on this path; each op carries
+		// its own. An invalid field drops just that op.
+		if d := validateOp(&op); d != nil {
+			dropped = append(dropped, *d)
+			continue
 		}
 
 		segEv := segment.Event{
@@ -98,7 +177,7 @@ func convertVerifiedOps(evt streaming.Event, witnessedAt int64) ([]segment.Event
 		// drop rather than crash to keep the property uniform with
 		// convertCommit: a misbehaving upstream should not be able
 		// to take the firehose down. The drop is surfaced via
-		// DroppedMissingBlocksError so it is never silent: when the
+		// DroppedOpsError so it is never silent: when the
 		// event also carries a KindSync DID tombstone, a record
 		// skipped here is permanently absent from the post-compaction
 		// archive, and the operator needs the signal.
@@ -106,6 +185,7 @@ func convertVerifiedOps(evt streaming.Event, witnessedAt int64) ([]segment.Event
 			block := op.BlockData()
 			if block == nil {
 				dropped = append(dropped, DroppedOp{
+					Reason:     ingest.DropReasonMissingBlock,
 					DID:        string(op.Repo),
 					Collection: string(op.Collection),
 					RKey:       string(op.RKey),
@@ -120,7 +200,7 @@ func convertVerifiedOps(evt streaming.Event, witnessedAt int64) ([]segment.Event
 	}
 
 	if len(dropped) > 0 {
-		return out, &DroppedMissingBlocksError{Dropped: dropped}
+		return out, &DroppedOpsError{Dropped: dropped}
 	}
 	if len(out) == 0 {
 		// Iterator yielded nothing at all — this is a true unknown
@@ -133,6 +213,9 @@ func convertVerifiedOps(evt streaming.Event, witnessedAt int64) ([]segment.Event
 
 func convertCommit(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
 	commit := evt.Commit
+	if err := validateRev(commit.Repo, commit.Rev); err != nil {
+		return nil, err
+	}
 	ops := make([]segment.Event, 0, len(commit.Ops))
 	var dropped []DroppedOp
 
@@ -144,6 +227,11 @@ func convertCommit(evt streaming.Event, witnessedAt int64) ([]segment.Event, err
 		kind, err := actionKind(op.Action)
 		if err != nil {
 			return nil, fmt.Errorf("livestream: did=%s: %w", commit.Repo, err)
+		}
+
+		if d := validateOpPath(&op); d != nil {
+			dropped = append(dropped, *d)
+			continue
 		}
 
 		segEv := segment.Event{
@@ -172,6 +260,7 @@ func convertCommit(evt streaming.Event, witnessedAt int64) ([]segment.Event, err
 			block := op.BlockData()
 			if block == nil {
 				dropped = append(dropped, DroppedOp{
+					Reason:     ingest.DropReasonMissingBlock,
 					DID:        commit.Repo,
 					Collection: string(op.Collection),
 					RKey:       string(op.RKey),
@@ -185,7 +274,7 @@ func convertCommit(evt streaming.Event, witnessedAt int64) ([]segment.Event, err
 		ops = append(ops, segEv)
 	}
 	if len(dropped) > 0 {
-		return ops, &DroppedMissingBlocksError{Dropped: dropped}
+		return ops, &DroppedOpsError{Dropped: dropped}
 	}
 	return ops, nil
 }
@@ -240,6 +329,13 @@ func convertAccount(evt streaming.Event, witnessedAt int64) ([]segment.Event, er
 }
 
 func convertSync(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
+	// The #sync rev seeds a DID tombstone that compaction folds by
+	// rev comparison; a garbage rev would give the tombstone wrong
+	// ordering power, so the whole event (tombstone + replacement
+	// rows, which share the rev) is dropped.
+	if err := validateRev(evt.Sync.DID, evt.Sync.Rev); err != nil {
+		return nil, err
+	}
 	payload, err := evt.Sync.MarshalCBOR()
 	if err != nil {
 		return nil, fmt.Errorf("livestream: marshal sync: %w", err)
@@ -269,6 +365,14 @@ func convertSync(evt streaming.Event, witnessedAt int64) ([]segment.Event, error
 		if err != nil {
 			return nil, fmt.Errorf("livestream: did=%s: %w", op.Repo, err)
 		}
+		// Resync ops materialize records repaired under this #sync's
+		// tombstone; a spec-invalid field drops just that record (the
+		// tombstone and its siblings stay archivable — replacement
+		// rows carry their own op.Rev, hence the per-op rev check).
+		if d := validateOp(&op); d != nil {
+			dropped = append(dropped, *d)
+			continue
+		}
 		segEv := segment.Event{
 			WitnessedAt:         witnessedAt,
 			UpstreamRelayCursor: evt.Seq,
@@ -287,6 +391,7 @@ func convertSync(evt streaming.Event, witnessedAt int64) ([]segment.Event, error
 				// compaction permanently erase it from the archive.
 				// Surface the drop so the consumer counts and logs it.
 				dropped = append(dropped, DroppedOp{
+					Reason:     ingest.DropReasonMissingBlock,
 					DID:        string(op.Repo),
 					Collection: string(op.Collection),
 					RKey:       string(op.RKey),
@@ -300,7 +405,7 @@ func convertSync(evt streaming.Event, witnessedAt int64) ([]segment.Event, error
 		out = append(out, segEv)
 	}
 	if len(dropped) > 0 {
-		return out, &DroppedMissingBlocksError{Dropped: dropped}
+		return out, &DroppedOpsError{Dropped: dropped}
 	}
 	return out, nil
 }

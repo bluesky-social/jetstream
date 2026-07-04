@@ -21,7 +21,6 @@ type Metrics struct {
 	OnFailErrors             prometheus.Counter
 	HandleRepoDuration       prometheus.Histogram
 	ProgressCompleted        prometheus.Gauge
-	DroppedRecords           prometheus.Counter
 	CompletionQueued         prometheus.Counter
 	CompletionQueueDepth     prometheus.Gauge
 	CompletionDurableBatches prometheus.Counter
@@ -90,11 +89,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "progress_completed",
 			Help: "Number of repos the engine has reported complete in the current Run.",
-		}),
-		DroppedRecords: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "dropped_records_total",
-			Help: "Number of upstream repo records skipped because their fields cannot be represented in the segment format.",
 		}),
 		CompletionQueued: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -195,7 +189,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.Discovered, m.Completed, m.Failed, m.ActiveFlips, m.OnFailErrors,
-		m.HandleRepoDuration, m.ProgressCompleted, m.DroppedRecords,
+		m.HandleRepoDuration, m.ProgressCompleted,
 		m.CompletionQueued, m.CompletionQueueDepth, m.CompletionDurableBatches,
 		m.CompletionDurableRepos, m.CompletionStageErrors,
 		m.CompletionQueueWait, m.ForcedCheckpointFlushes,
@@ -254,12 +248,6 @@ func (m *Metrics) observeHandleRepo(start time.Time, err error) {
 func (m *Metrics) setProgressCompleted(v int64) {
 	if m != nil {
 		m.ProgressCompleted.Set(float64(v))
-	}
-}
-
-func (m *Metrics) incDroppedRecords() {
-	if m != nil {
-		m.DroppedRecords.Inc()
 	}
 }
 
