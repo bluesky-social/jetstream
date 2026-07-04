@@ -282,6 +282,19 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     # kill the inversion fast and without an end-to-end run.
                     cmd=(go test "${RACE_FLAG[@]}" ./internal/tombstone
                          -count=1 -timeout "$default_timeout") ;;
+                compaction)
+                    # Compaction-boundary tier (#199): kills watermark boundary
+                    # mutants (e.g. m002, the first-init floor off-by-one) with
+                    # deterministic boundary-exact scenarios instead of stress
+                    # seed luck. The orchestrator tests pin a tombstone/survivor
+                    # pair EXACTLY at the first-init watermark: the mutant's
+                    # floor claims that seq as already-compacted, the merge-tail
+                    # pass no-ops, and the superseded row survives permanently
+                    # (fold windows are exclusive below W, so the miss can never
+                    # heal). Fast (<1s) and seed-independent.
+                    cmd=(go test "${RACE_FLAG[@]}" ./internal/ingest/orchestrator
+                         -run 'TestInitCompactionWatermarkFloor|TestMerge_FirstInitWatermarkFloor'
+                         -count=1 -timeout "$default_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2
                     exit 1 ;;

@@ -117,7 +117,6 @@ func withClearedEnv(t *testing.T) {
 		}
 	}
 	for key := range keys {
-		key := key
 		if prev, ok := os.LookupEnv(key); ok {
 			require.NoError(t, os.Unsetenv(key))
 			t.Cleanup(func() { _ = os.Setenv(key, prev) })
