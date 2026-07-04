@@ -282,6 +282,18 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     # kill the inversion fast and without an end-to-end run.
                     cmd=(go test "${RACE_FLAG[@]}" ./internal/tombstone
                          -count=1 -timeout "$default_timeout") ;;
+                corpus)
+                    # Real-data corpus tier (#32): kills symmetric protocol
+                    # bugs the closed atmos loop structurally cannot see
+                    # (e.g. m009, the checksum-range off-by-one where the
+                    # write and read sides shift identically so every
+                    # write-then-read-back check passes). The corpus pins
+                    # real network bytes and byte-exact golden outputs
+                    # produced by known-good builds and foreign
+                    # implementations, so a symmetric shift fails against
+                    # the committed facts. Offline and fast (<1s).
+                    cmd=(go test "${RACE_FLAG[@]}" ./internal/corpus
+                         -count=1 -timeout "$default_timeout") ;;
                 compaction)
                     # Compaction-boundary tier (#199): kills watermark boundary
                     # mutants (e.g. m002, the first-init floor off-by-one) with

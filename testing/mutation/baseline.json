@@ -8,7 +8,7 @@
     {"id":"m005_backfill_status_check_inverted","disposition":"KILLED","result":"KILLED@restart","note":"oracle: rev regression for DID did:plc:xe6kimero4ysp4mpzse6npbs at event 16: seq=23 app.bsky.feed.post/22avhp53lzac4 rev="},
     {"id":"m006_merge_commit_error_swallowed","disposition":"KILLED","result":"KILLED@storefault","note":"see log"},
     {"id":"m008_header_offset_byteslice","disposition":"KILLED","result":"KILLED@default","note":"see log"},
-    {"id":"m009_checksum_range_off_by_one","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m009_checksum_range_off_by_one","disposition":"KILLED","result":"KILLED@corpus","note":"corpus golden segment breaks the write==read checksum symmetry (#32)"},
     {"id":"m011_wire_frame_length","disposition":"KILLED","result":"KILLED@default","note":"oracle: walk active segment /tmp/TestOracle_DefaultLifecycle3677620291/003/segments/seg_0000000000.jss: segment: walk active frames: segment"},
     {"id":"m012_block_event_count_off_by_one","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m013_collection_rkey_swap","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
