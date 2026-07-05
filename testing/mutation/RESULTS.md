@@ -5,16 +5,14 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 28 active mutants on disk
-(m001–m034; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
-2026-07-04 at `d08ed8b` (#197 ingest validation gate) — **23 killed, 5
-survived, zero STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was
-regenerated from it (commit field `d08ed8b`) and gate-verified
-self-consistent. No disposition changed vs the `40e79cc` run: the #197 gate
-rewrites the `events.go`/`handler.go` conversion paths but every mutant hunk
-still applies and every kill reproduces. The 5 survivors (m003, m009, m013,
-m014, m015) are all pre-existing documented escapes with owning issues (#209,
-#208, #204, #204, #208). (#183 closed 2026-07-04: no recorder-unique
+**Current catalog (keep this line current): 30 active mutants on disk
+(m001–m036; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
+2026-07-05 at `248b9c5` (#206 frames tier) — **26 killed, 4 survived, zero
+STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was regenerated from it
+(commit field `248b9c5`) and gate-verified self-consistent. No disposition
+changed vs the `5d6fc9e` baseline; the delta is m036 added KILLED@frames.
+The 4 survivors (m003, m013, m014, m015) are all pre-existing documented
+escapes with owning issues (#209, #204, #204, #208). (#183 closed 2026-07-04: no recorder-unique
 replacement for the retired m025 exists post-#178 — see the dated analysis
 section; the #100 over-drop recorder's gated mutant m034 guards its hook
 integrity, not its drop logic.) Counts inside older dated sections describe
@@ -1272,3 +1270,45 @@ the checksum instance. Fixture provenance and the re-capture procedure:
 
 Remaining survivors: m003 (#209), m013/m014 (#204), m015 (#208).
 
+
+
+## Campaign 2026-07-05 — `frames` tier; m036 banked (#206)
+
+Full campaign at `248b9c5` (branch `frame-adversity-206`):
+**30 mutants: 26 KILLED, 4 SURVIVED, zero STALE/BUILD-BROKEN.**
+`baseline.json` re-banked from this run (commit field `248b9c5`) and
+gate-verified self-consistent. No disposition changed vs the `5d6fc9e`
+baseline; the only delta is m036 added KILLED@frames. Survivors are the
+four documented escapes with owning issues: m003 (#209), m013/m014
+(#204), m015 (#208).
+
+**New `frames` tier; m036 banked KILLED@frames.** #206 made frame-level
+wire adversity live: the simulator relay can inject arbitrary bytes on
+the subscribeRepos socket (`SubscribeReposInjectFault` — inject-only,
+inject+swallow positional replace, swallow-only pure gap) and emit
+partial-CAR commits whose ops reference record leaf blocks absent from
+the CAR (`GenerateMultiOpCommitForTest` with per-op `StripBlock`; the
+commit block and MST nodes always survive, so the fault is precisely
+"op without its block", not a malformed CAR). Six oracle scenarios
+(internal/oracle/frame_fault_test.go, real consumer end-to-end) pin the
+poison-frame contract: garbage CBOR (decode counter, same-conn
+continue), unknown frame type (unknown counter, body seq suppresses the
+spurious gap), op=-1 error frame (`stream_error_frames_total{code}`),
+oversized frame (read-limit reconnect, #205 guards keep redelivery at
+zero loss and zero bloat), swallowed frame (a REAL gap, loss bounded to
+exactly the swallowed window, chain-break resync self-heal), and
+stripped leaf block (`dropped_events_total{source=live,
+reason=missing_block}` per op, siblings archive, NO chain break).
+
+m036 (`m036_missing_block_arm_discards_siblings`) makes the consumer's
+per-op-drop arm advance the cursor and `continue` instead of falling
+through to the append — the well-formed siblings of a partial-CAR
+commit are silently discarded while the drop counters report exactly
+the drops the operator expects to see. The tier kills it at two layers:
+the oracle scenario's surviving-rows barrier times out, and the
+live-package unit test fails its new `WriterMetrics.EventsAppended==1`
+assertion. That assertion was added FOR this mutant: pre-strengthening,
+`TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer` passed under
+m036 (cursor advanced, counter bumped, no error propagated) while the
+survivor was discarded — a vacuity worth recording. Red-first verified
+in both directions before the patch was banked.
