@@ -5,20 +5,21 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 28 active mutants on disk
-(m001–m034; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
-2026-07-04 at `d08ed8b` (#197 ingest validation gate) — **23 killed, 5
-survived, zero STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was
-regenerated from it (commit field `d08ed8b`) and gate-verified
-self-consistent. No disposition changed vs the `40e79cc` run: the #197 gate
-rewrites the `events.go`/`handler.go` conversion paths but every mutant hunk
-still applies and every kill reproduces. The 5 survivors (m003, m009, m013,
-m014, m015) are all pre-existing documented escapes with owning issues (#209,
-#208, #204, #204, #208). (#183 closed 2026-07-04: no recorder-unique
-replacement for the retired m025 exists post-#178 — see the dated analysis
-section; the #100 over-drop recorder's gated mutant m034 guards its hook
-integrity, not its drop logic.) Counts inside older dated sections describe
-the catalog *as of that date* and are intentionally not back-edited.**
+**Current catalog (keep this line current): 32 active mutants on disk
+(m001–m040; m007, m010, m013, m014, m020, m021, m023, m025 retired). Latest
+full campaign: 2026-07-05 at merge head `389b29c` (#204 adversarial ingest
+traffic ∪ #230 corpus ∪ #232 replay) — **30 killed, 2 survived, zero
+STALE/BUILD-BROKEN**; gate PASS against `testing/mutation/baseline.json`
+(union bank; commit field `a4e96c5` is provenance-only). The 2 survivors
+(m003, m015) are documented escapes with owning issues (#209, #208).
+m013/m014 retired 2026-07-04: dead path under atmos v0.2.10, not
+dormant-under-polite-traffic — see the #204 campaign section; their bug
+class is covered by m017/m018 (convertCommit) and m036/m037 (convertSync).
+(#183 closed 2026-07-04: no recorder-unique replacement for the retired
+m025 exists post-#178 — see the dated analysis section; the #100 over-drop
+recorder's gated mutant m034 guards its hook integrity, not its drop
+logic.) Counts inside older dated sections describe the catalog *as of that
+date* and are intentionally not back-edited.**
 
 ## The baseline gate (#108)
 
@@ -1328,3 +1329,14 @@ The full campaign was re-run at the merge head to verify the union bank
 Survivors at this branch's own run: m003 → #209 (merge cursor no-advance),
 m009/m015 → #208 (footer/checksum blind spots; m009's corpus kill lives on
 main and joins at the merge).
+
+## Campaign 2026-07-05 — merge-head verification of the #204 union bank
+
+Full campaign + gate at the merge commit `389b29c` (adversarial-ingest-
+traffic-204 ∪ main's #230 corpus + #232 replay): **gate PASS — 32 mutants
+match baseline, 30 KILLED / 2 SURVIVED, zero STALE/BUILD-BROKEN.** Every
+disposition from both parents reproduced side by side at one head: m009
+KILLED@corpus and m035 KILLED@replay (main's banks) alongside m036–m040
+KILLED@default (this branch's #204 gate mutants), with m013/m014 absent
+(retired). Survivors: m003 → #209, m015 → #208. The union-merge resolution
+described in the section above is verified, not just asserted.
