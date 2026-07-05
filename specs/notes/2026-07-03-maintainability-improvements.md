@@ -190,4 +190,5 @@ use.
 4. ENOSPC decision + gauge (+ hands off to oracle doc item 3).
 5. Nix flake (~1 day).
 6. Remaining CI items, DX recipes, OSS hygiene as fill-in work.
-7. Migration policy + `--verify` mode when touching segment next.
+7. Migration policy when touching the segment format next (`--verify` mode
+   dropped — see Format longevity).

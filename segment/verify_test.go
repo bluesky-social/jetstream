@@ -52,6 +52,30 @@ func TestVerifySealedMetadataRejectsCollectionCountMismatch(t *testing.T) {
 	require.ErrorContains(t, err, "collection \"app.bsky.feed.post\" count mismatch")
 }
 
+func TestVerifySealedMetadataRejectsDuplicateFooterCollection(t *testing.T) {
+	t.Parallel()
+
+	path := verifyFixture(t)
+	rewriteCollectionIndex(t, path, func(idx *collectionIndex) {
+		for i, name := range idx.stringTable {
+			if name == "app.bsky.feed.post" {
+				// Duplicate the entry with its correct row-derived count so
+				// only the dedup check can reject it.
+				idx.stringTable = append(idx.stringTable, name)
+				idx.eventCounts = append(idx.eventCounts, idx.eventCounts[i])
+				return
+			}
+		}
+		t.Fatal("fixture missing app.bsky.feed.post")
+	})
+
+	r := openVerifyFixture(t, path)
+	defer func() { require.NoError(t, r.Close()) }()
+
+	err := VerifySealedMetadata(r)
+	require.ErrorContains(t, err, "duplicate footer collection \"app.bsky.feed.post\"")
+}
+
 func TestVerifySealedMetadataRejectsBlockCollectionMismatch(t *testing.T) {
 	t.Parallel()
 

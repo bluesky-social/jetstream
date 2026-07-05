@@ -2,6 +2,7 @@ package segment
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/jcalabro/gloom"
 )
@@ -179,7 +180,13 @@ func (e verifyExpected) checkHeaderEnvelope(path string, h Header) error {
 }
 
 func verifyCollectionCounts(path string, collections []string, counts []uint32, expected verifyExpected) error {
+	seenFooter := make(map[string]struct{}, len(collections))
 	for i, collection := range collections {
+		if _, dup := seenFooter[collection]; dup {
+			return fmt.Errorf("segment: verify %s: duplicate footer collection %q (id=%d)",
+				path, collection, i)
+		}
+		seenFooter[collection] = struct{}{}
 		if _, ok := expected.seenCollections[collection]; !ok {
 			return fmt.Errorf("segment: verify %s: footer collection %q (id=%d) is absent from decoded rows",
 				path, collection, i)
@@ -191,14 +198,7 @@ func verifyCollectionCounts(path string, collections []string, counts []uint32, 
 		}
 	}
 	for collection := range expected.seenCollections {
-		found := false
-		for _, got := range collections {
-			if got == collection {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(collections, collection) {
 			return fmt.Errorf("segment: verify %s: decoded collection %q missing from footer index",
 				path, collection)
 		}
