@@ -1273,15 +1273,15 @@ the checksum instance. Fixture provenance and the re-capture procedure:
 Remaining survivors: m003 (#209), m013/m014 (#204), m015 (#208).
 
 
-## Campaign 2026-07-04 — m036 identity-swallowed mutant (#202)
+## Campaign 2026-07-04 — m041 identity-swallowed mutant (#202)
 
-Full 30-mutant campaign at `d77fa93` (the m036 commit, on the #202 branch
+Full 30-mutant campaign at `d77fa93` (the m041-mutant commit, on the #202 branch
 with the identity traffic + harness asserts): **26 KILLED / 4 SURVIVED,
 zero STALE / BUILD-BROKEN**. Survivors unchanged and all owned:
 m003 (#209), m013/m014 (#204, dead-path retirement planned), m015 (#208).
 Baseline re-banked.
 
-**m036_identity_swallowed — KILLED@default, banked on arrival.**
+**m041_identity_swallowed — KILLED@default, banked on arrival.**
 `convertIdentity` returns `nil, nil` (the legitimate #info no-op shape),
 modeling a ConvertEvent dispatch refactor that folds #identity into the
 "informational, nothing to archive" branch. Before #202 the simulator

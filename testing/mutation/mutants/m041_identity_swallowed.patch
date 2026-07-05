@@ -1,4 +1,4 @@
-mutant: m036_identity_swallowed
+mutant: m041_identity_swallowed
 target: internal/ingest/live/events.go
 failure-mode: |
   convertIdentity silently swallows every #identity event (returns
