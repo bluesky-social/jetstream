@@ -77,6 +77,7 @@ func Open(cfg Config) (*Writer, error) {
 			Path:              path,
 			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
 			Metrics:           cfg.SegmentMetrics,
+			IOFaultInjector:   cfg.SegmentIOFaultInjector,
 		})
 		switch {
 		case segErr == nil:
@@ -138,14 +139,15 @@ func Open(cfg Config) (*Writer, error) {
 				Path:              path,
 				MaxEventsPerBlock: cfg.MaxEventsPerBlock,
 				Metrics:           cfg.SegmentMetrics,
+				IOFaultInjector:   cfg.SegmentIOFaultInjector,
 			})
 			if segErr != nil {
-				return nil, fmt.Errorf("ingest: open next segment %s: %w", path, segErr)
+				return nil, cfg.wrapSegmentPersistenceError("opening next active segment", fmt.Errorf("ingest: open next segment %s: %w", path, segErr))
 			}
 			w.active = seg
 			w.activeBytes = 0
 		default:
-			return nil, fmt.Errorf("ingest: open existing %s: %w", path, segErr)
+			return nil, cfg.wrapSegmentPersistenceError("opening existing active segment", fmt.Errorf("ingest: open existing %s: %w", path, segErr))
 		}
 	} else {
 		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(0))
@@ -153,9 +155,10 @@ func Open(cfg Config) (*Writer, error) {
 			Path:              path,
 			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
 			Metrics:           cfg.SegmentMetrics,
+			IOFaultInjector:   cfg.SegmentIOFaultInjector,
 		})
 		if segErr != nil {
-			return nil, fmt.Errorf("ingest: create %s: %w", path, segErr)
+			return nil, cfg.wrapSegmentPersistenceError("creating active segment", fmt.Errorf("ingest: create %s: %w", path, segErr))
 		}
 		w.active = seg
 		w.activeBytes = 0
@@ -255,7 +258,7 @@ func (w *Writer) Close() error {
 		return nil
 	}
 	if err := w.active.Close(); err != nil {
-		return fmt.Errorf("ingest: close active segment: %w", err)
+		return w.wrapSegmentPersistenceError("closing active segment", fmt.Errorf("ingest: close active segment: %w", err))
 	}
 	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
@@ -302,7 +305,7 @@ func (w *Writer) SealActiveAndClose() error {
 		if cerr := w.active.Close(); cerr != nil {
 			w.cfg.Logger.Warn("close after failed seal", "err", cerr)
 		}
-		return fmt.Errorf("ingest: seal active segment: %w", err)
+		return w.wrapSegmentPersistenceError("sealing active segment", fmt.Errorf("ingest: seal active segment: %w", err))
 	}
 	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
@@ -586,7 +589,7 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 // The caller MUST hold w.mu.
 func (w *Writer) flushBlockLocked(ctx context.Context) error {
 	if err := w.active.Flush(); err != nil {
-		return fmt.Errorf("ingest: flush block: %w", err)
+		return w.wrapSegmentPersistenceError("flushing active segment block", fmt.Errorf("ingest: flush block: %w", err))
 	}
 	w.cfg.Metrics.incBlocksFlushed()
 
@@ -637,7 +640,7 @@ func (w *Writer) rotateLocked(ctx context.Context) error {
 		sealedIdx := w.activeIdx
 		sealedPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(sealedIdx))
 		if _, err := w.active.Seal(); err != nil {
-			return fmt.Errorf("ingest: seal segment %d: %w", sealedIdx, err)
+			return w.wrapSegmentPersistenceError("sealing active segment", fmt.Errorf("ingest: seal segment %d: %w", sealedIdx, err))
 		}
 
 		if err := w.onAfterSealLocked(sealedIdx, sealedPath); err != nil {
@@ -652,9 +655,10 @@ func (w *Writer) rotateLocked(ctx context.Context) error {
 			Path:              nextPath,
 			MaxEventsPerBlock: w.cfg.MaxEventsPerBlock,
 			Metrics:           w.cfg.SegmentMetrics,
+			IOFaultInjector:   w.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
-			return fmt.Errorf("ingest: open new active segment %s: %w", nextPath, err)
+			return w.wrapSegmentPersistenceError("opening new active segment", fmt.Errorf("ingest: open new active segment %s: %w", nextPath, err))
 		}
 		w.active = next
 		w.activeBytes = 0

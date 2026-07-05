@@ -25,6 +25,11 @@ const defaultMaxEventsPerBlock = segment.DefaultMaxEventsPerBlock
 
 // Config controls Writer behavior.
 type Config struct {
+	// DataDir is the root jetstream data directory. Optional outside the
+	// production orchestrator; when set it is included in fatal persistence
+	// errors such as ENOSPC.
+	DataDir string
+
 	// SegmentsDir is the directory holding seg_*.jss files (typically
 	// <data-dir>/segments). Required. Created if missing.
 	SegmentsDir string
@@ -129,6 +134,10 @@ type Config struct {
 	// SegmentMetrics is forwarded to every segment.New call this writer
 	// makes (initial open, post-rotation new active). Optional.
 	SegmentMetrics segment.SealObserver
+
+	// SegmentIOFaultInjector is a test-only seam forwarded to segment.Writer.
+	// Nil in production.
+	SegmentIOFaultInjector segment.IOFaultInjector
 }
 
 func (c *Config) validate() error {

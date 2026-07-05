@@ -287,7 +287,7 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 		}
 	}()
 
-	if err := initializeNewSegment(f); err != nil {
+	if err := initializeNewSegment(f, Config{Path: tmp}); err != nil {
 		return PatchResult{}, err
 	}
 	for _, b := range outBlocks {
@@ -325,7 +325,7 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 	if err := simulatePatchCrash(opts, CrashPointPatchRenamed); err != nil {
 		return PatchResult{}, err
 	}
-	if err := syncParentDir(path); err != nil {
+	if err := syncParentDir(path, nil); err != nil {
 		return PatchResult{}, err
 	}
 	if err := simulatePatchCrash(opts, CrashPointPatchDirSynced); err != nil {

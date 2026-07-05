@@ -202,6 +202,10 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "Witnessed range")
 	require.Contains(t, body, "overflow-wrap: anywhere")
 	require.Contains(t, body, "Segment Files")
+	require.NotContains(t, strings.ToLower(body), "free bytes")
+	require.NotContains(t, strings.ToLower(body), "disk free")
+	require.NotContains(t, strings.ToLower(body), "data_dir_free")
+	require.NotContains(t, strings.ToLower(body), "capacity")
 	require.NotContains(t, body, "Top failing hosts")
 	require.NotContains(t, body, `<h2>Collections</h2>`)
 }

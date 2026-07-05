@@ -164,6 +164,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if err := os.MkdirAll(opts.DataDir, 0o755); err != nil {
 		return fail(fmt.Errorf("serve: create data dir %s: %w", opts.DataDir, err))
 	}
+	obs.RegisterDataDirFreeBytes(metrics.Registry, opts.DataDir)
 
 	segmentsDir := filepath.Join(opts.DataDir, "segments")
 	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {

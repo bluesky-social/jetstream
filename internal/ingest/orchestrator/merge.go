@@ -70,6 +70,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 
 		dst, err := ingest.Open(ingest.Config{
 			SegmentsDir:    segmentsDir,
+			DataDir:        o.cfg.DataDir,
 			Store:          o.cfg.Store,
 			SeqKey:         live.SteadySeqKey,
 			Logger:         o.cfg.Logger,
@@ -165,6 +166,7 @@ func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDi
 
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:     liveSegmentsDir,
+		DataDir:         o.cfg.DataDir,
 		Store:           o.cfg.Store,
 		SeqKey:          live.BootstrapSeqKey,
 		Logger:          o.cfg.Logger,
