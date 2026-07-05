@@ -1,0 +1,30 @@
+mutant: m038_live_op_path_gate_skipped
+target: internal/ingest/live/events.go
+failure-mode: |
+  convertCommit's per-op #197 validation gate is disabled (validateOpPath
+  result ignored), so spec-invalid op paths — $-prefixed collections that
+  can shadow the sentinel index, null-byte/oversized rkeys — archive
+  verbatim instead of dropping. Models the validation-skipped regression
+  class: a refactor that accidentally bypasses the gate.
+expected-detection: |
+  The #204 adversarial phase emits live op lies every run: the expected
+  event log excludes ledgered lie rows, so an archived lie fails the
+  steady-state multiset compare as an extra observed event; the
+  adversarial drop-counter floors also go unmet. Default tier (red-first
+  verified at introduction: extra "bad\x00key" row).
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index 1600512..eaa350b 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -229,7 +229,7 @@ func convertCommit(evt streaming.Event, witnessedAt int64) ([]segment.Event, err
+ 			return nil, fmt.Errorf("livestream: did=%s: %w", commit.Repo, err)
+ 		}
+ 
+-		if d := validateOpPath(&op); d != nil {
++		if d := validateOpPath(&op); false && d != nil {
+ 			dropped = append(dropped, *d)
+ 			continue
+ 		}
