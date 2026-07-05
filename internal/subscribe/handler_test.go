@@ -1485,6 +1485,17 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
+	// Prove no subscriber registered before hello: an eager (buggy) live
+	// subscriber would park at the empty tip and signal blocked almost
+	// immediately after the dial completes. Without this check, the
+	// publish below could race ahead of an eager subscription and the
+	// NotContains assertion would pass vacuously.
+	select {
+	case <-b.blocked:
+		t.Fatal("subscriber registered before hello")
+	case <-time.After(10 * time.Millisecond):
+	}
+
 	// Append a matching event. The subscriber loop hasn't started yet (it
 	// waits for hello), so it will begin reading at the live tip — which is
 	// already past this event. A pre-hello event is therefore never
@@ -1763,6 +1774,16 @@ func TestHandler_RequireHello_NoLeakOnClientDisconnect(t *testing.T) {
 	require.NoError(t, err)
 	if resp != nil && resp.Body != nil {
 		defer func() { _ = resp.Body.Close() }()
+	}
+
+	// Give serve() time to reach its hello wait, and assert no subscriber
+	// registered while we did: a blocked signal here means requireHello
+	// subscribed eagerly, and the disconnect below would no longer be
+	// exercising the hello-wait path this test exists to cover.
+	select {
+	case <-b.blocked:
+		t.Fatal("requireHello subscribed before hello")
+	case <-time.After(10 * time.Millisecond):
 	}
 
 	// Client closes without sending hello. The handler's reader goroutine
