@@ -75,8 +75,16 @@ func expectedSegmentEventsFromFirehoseEvent(w *world.World, evt streaming.Event)
 			if kind != segment.KindDelete {
 				payload := op.BlockData()
 				if payload == nil {
-					return nil, fmt.Errorf("oracle: expected commit op missing payload did=%s seq=%d %s/%s action=%s",
-						evt.Commit.Repo, evt.Commit.Seq, op.Collection, op.RKey, op.Action)
+					// Partial-CAR commit: the op references a CID whose
+					// record block is absent from the frame's CAR diff.
+					// Jetstream's contract is to drop exactly that op and
+					// archive the siblings (DropReasonMissingBlock), so
+					// the expected log mirrors the drop. This cannot mask
+					// a simulator bug that omits blocks unintentionally:
+					// the record still exists in world ground truth, so
+					// the final-state convergence fold fails unless the
+					// scenario deliberately reconciles the divergence.
+					continue
 				}
 				row.Payload = append([]byte(nil), payload...)
 			}

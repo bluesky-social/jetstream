@@ -5,13 +5,16 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 33 active mutants on disk
-(m001–m041; m007, m010, m013, m014, m020, m021, m023, m025 retired). Latest
-full campaign: 2026-07-05 after #208 footer-index/bloom verification —
-**33 killed, 0 survived, zero STALE/BUILD-BROKEN**; baseline refreshed in
-`testing/mutation/baseline.json` (commit field `0a89f40` is
-provenance-only; campaign ran from a temporary worktree carrying the #208
-changes).
+**Current catalog (keep this line current): 34 active mutants on disk
+(m001–m042; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+union baseline after #206 frame-tier coverage and #208 footer-index/bloom
+verification: **34 killed, 0 survived, zero STALE/BUILD-BROKEN** in
+`testing/mutation/baseline.json` (commit field `0a89f40` is provenance-only;
+refreshed from the #208 temporary worktree and unioned with #206's m042).
+m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
+at this merge — the #204 branch minted m036–m040 concurrently; same
+precedent as m041's renumber in 82b2dd9.
+m015 is now KILLED@default by the #208 sealed metadata verifier.
 m013/m014 retired 2026-07-04: dead path under atmos v0.2.10, not
 dormant-under-polite-traffic — see the #204 campaign section; their bug
 class is covered by m017/m018 (convertCommit) and m036/m037 (convertSync).
@@ -1415,6 +1418,69 @@ KILLED@replay (#232), m009 KILLED@corpus (#230), with m013/m014 absent
 short suites, default + stress lifecycle, -race on oracle/simulator,
 lint. This is the PR-merge state for #235.
 
+## Campaign 2026-07-05 — `frames` tier; m042 banked (#206)
+
+Original campaign at `248b9c5` (branch `frame-adversity-206`, pre-merge,
+where this mutant was numbered m036): **30 mutants: 26 KILLED, 4
+SURVIVED, zero STALE/BUILD-BROKEN**; no disposition changed vs the
+`5d6fc9e` baseline. Merging origin/main first pulled in the #204 ∪ #202 ∪
+#230 ∪ #232 union above; that collided with the #204 branch's freshly-minted
+m036–m040, so the frames mutant was renumbered to **m042** (same precedent as
+m041's renumber in 82b2dd9). A later merge pulled in #209's
+`restart-multisource` tier, changing m003 from SURVIVED to KILLED. The current
+baseline.json resolves as the full union: main's 33 dispositions with m003
+KILLED@restart-multisource plus m042 KILLED@frames — **34 mutants, 33 KILLED /
+1 SURVIVED** (m015 #208).
+
+**New `frames` tier; m042 banked KILLED@frames.** #206 made frame-level
+wire adversity live: the simulator relay can inject arbitrary bytes on
+the subscribeRepos socket (`SubscribeReposInjectFault` — inject-only,
+inject+swallow positional replace, swallow-only pure gap) and emit
+partial-CAR commits whose ops reference record leaf blocks absent from
+the CAR (`GenerateMultiOpCommitForTest` with per-op `StripBlock`; the
+commit block and MST nodes always survive, so the fault is precisely
+"op without its block", not a malformed CAR). Six oracle scenarios
+(internal/oracle/frame_fault_test.go, real consumer end-to-end) pin the
+poison-frame contract: garbage CBOR (decode counter, same-conn
+continue), unknown frame type (unknown counter, body seq suppresses the
+spurious gap), op=-1 error frame (`stream_error_frames_total{code}`),
+oversized frame (read-limit reconnect, #205 guards keep redelivery at
+zero loss and zero bloat), swallowed frame (a REAL gap, loss bounded to
+exactly the swallowed window, chain-break resync self-heal), and
+stripped leaf block (`dropped_events_total{source=live,
+reason=missing_block}` per op, siblings archive, NO chain break).
+
+m042 (`m042_missing_block_arm_discards_siblings`) makes the consumer's
+per-op-drop arm advance the cursor and `continue` instead of falling
+through to the append — the well-formed siblings of a partial-CAR
+commit are silently discarded while the drop counters report exactly
+the drops the operator expects to see. The tier kills it at two layers:
+the oracle scenario's surviving-rows barrier times out, and the
+live-package unit test fails its new `WriterMetrics.EventsAppended==1`
+assertion. That assertion was added FOR this mutant: pre-strengthening,
+`TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer` passed under
+m042 (cursor advanced, counter bumped, no error propagated) while the
+survivor was discarded — a vacuity worth recording. Red-first verified
+in both directions before the patch was banked.
+
+## Campaign 2026-07-05 — verification at the #206 merge head
+
+Full campaign + gate at `1fa6640` (frame-adversity-206 ∪ main's #204 ∪
+#202 ∪ #201): **gate PASS — 34 mutants match baseline, 32 KILLED / 2
+SURVIVED, zero STALE/BUILD-BROKEN.** All in-flight banks reproduce side
+by side at one head: m042 KILLED@frames (#206), m036–m040 KILLED@default
+(#204 gate mutants), m041 KILLED@default (#202 identity), m035
+KILLED@replay (#232), m009 KILLED@corpus (#230). Survivors: m003 → #209,
+m015 → #208.
+
+One STALE fixed en route: the first merge-head run flagged m011 (its
+flushLocked hunk moved when #201 inserted the beforeIO fault hook above
+the file write). Hunk regenerated against the current writer.go — the
+mutation itself is unchanged — and the re-run banked it KILLED@default.
+Also green at this head: short suites (2017 tests), lint, -race over
+oracle/live/simulator, and 3× repeats of the frame + replay oracle
+tiers under atmos v0.2.13.
+
 ## Campaign 2026-07-05 — #209 deterministic multi-source restart tier
 
 Full campaign at `fdbfaa7` after adding
@@ -1435,3 +1501,12 @@ source and the precise no-reprocess assertion fails.
 Incidental maintenance: m011's patch context was refreshed for the existing
 `beforeIO(IOOpWrite)` hook in `segment/writer.go`; the modeled bug and kill
 tier are unchanged, and the full campaign re-confirmed **KILLED@default**.
+
+## Merge resolution 2026-07-05 — #206 frame adversity ∪ #209 restart-multisource
+
+Merging origin/main after #209 into `frame-adversity-206` produced the expected
+scorecard conflict: #206 had added m042 KILLED@frames, while #209 had changed
+m003 from SURVIVED to KILLED@restart-multisource. The resolved baseline is the
+union: **34 active mutants, 33 KILLED / 1 SURVIVED**, with m015 as the only
+remaining survivor. The m011 conflict was metadata-only; both sides carried the
+same mutation body and current `segment/writer.go` context.
