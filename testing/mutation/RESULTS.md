@@ -7,12 +7,11 @@ method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 33 active mutants on disk
 (m001–m041; m007, m010, m013, m014, m020, m021, m023, m025 retired). Latest
-full campaign: 2026-07-05 at the second #204 merge head (#204 adversarial
-ingest traffic ∪ #202 identity/m041 ∪ #230 corpus ∪ #232 replay) —
-**31 killed, 2 survived, zero STALE/BUILD-BROKEN**; gate PASS against
-`testing/mutation/baseline.json` (union bank; commit field `a4e96c5` is
-provenance-only). The 2 survivors (m003, m015) are documented escapes with
-owning issues (#209, #208).
+full campaign: 2026-07-05 after the #209 deterministic multi-source restart
+tier — **32 killed, 1 survived, zero STALE/BUILD-BROKEN**; baseline refreshed
+in `testing/mutation/baseline.json` (commit field `fdbfaa7` is
+provenance-only). The remaining survivor (m015) is a documented escape with
+owning issue #208.
 m013/m014 retired 2026-07-04: dead path under atmos v0.2.10, not
 dormant-under-polite-traffic — see the #204 campaign section; their bug
 class is covered by m017/m018 (convertCommit) and m036/m037 (convertSync).
@@ -1398,3 +1397,24 @@ KILLED@replay (#232), m009 KILLED@corpus (#230), with m013/m014 absent
 (retired). Survivors: m003 → #209, m015 → #208. Also green at this head:
 short suites, default + stress lifecycle, -race on oracle/simulator,
 lint. This is the PR-merge state for #235.
+
+## Campaign 2026-07-05 — #209 deterministic multi-source restart tier
+
+Full campaign at `fdbfaa7` after adding
+`TestOracle_RestartMultiSourceMergeCursorNoReprocess` and the
+`restart-multisource` mutation tier: **33 active mutants, 32 KILLED / 1
+SURVIVED, zero STALE/BUILD-BROKEN.** The baseline was refreshed with m003
+banked as **KILLED@restart-multisource**; m015 remains the sole survivor and
+continues to belong to #208.
+
+The new tier forces bootstrap-live to rotate after every accepted event
+(`MaxEventsPerBlock=1`, `MaxSegmentBytes=1`), kills the restart child at the
+9th `AfterMergeDstFlushBeforeSourceCommit` occurrence, captures rows from the
+already-committed source immediately before the crash boundary, then proves
+surviving captured rows appear exactly once after recovery. Under m003's
+`commitSourceComplete(sf.Idx)` off-by-one, restart reprocesses that committed
+source and the precise no-reprocess assertion fails.
+
+Incidental maintenance: m011's patch context was refreshed for the existing
+`beforeIO(IOOpWrite)` hook in `segment/writer.go`; the modeled bug and kill
+tier are unchanged, and the full campaign re-confirmed **KILLED@default**.

@@ -235,6 +235,16 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                 restart)
                     cmd=(go test "${RACE_FLAG[@]}" ./internal/oracle -run 'TestOracle_RestartCrashPointsDoNotLoseRecords$'
                          -count=1 -timeout "$restart_timeout") ;;
+                restart-multisource)
+                    # Multi-source restart tier (#209): kills m003, the merge
+                    # source-cursor off-by-one. The test forces one
+                    # bootstrap-live event per source segment, kills after a
+                    # later source is flushed but before its cursor commit, and
+                    # asserts a previously committed source is not reprocessed
+                    # during recovery.
+                    cmd=(go test "${RACE_FLAG[@]}" ./internal/oracle
+                         -run 'TestOracle_RestartMultiSourceMergeCursorNoReprocess$'
+                         -count=1 -timeout "$restart_timeout") ;;
                 storefault)
                     # Store-fault tier (#30): kills swallowed-persistence-error
                     # mutants (m006 and kin) at two layers in one `go test`:

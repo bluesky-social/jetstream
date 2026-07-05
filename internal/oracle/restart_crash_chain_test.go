@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -42,34 +43,99 @@ func runChainThroughCrash(t *testing.T, label string, seedIdx int, point crashpo
 // nolint:paralleltest
 func runChainThroughCrashAt(t *testing.T, label string, seedIdx int, point crashpoint.Point, ordinal int) recoveredChainRun {
 	t.Helper()
+	return runChainThroughCrashWithOptions(t, restartChainCrashOptions{
+		label:               label,
+		seedIdx:             seedIdx,
+		point:               point,
+		ordinal:             ordinal,
+		accounts:            4,
+		minInitialRecords:   1,
+		maxInitialRecords:   4,
+		liveEventsBootstrap: 4,
+		liveEventsSteady:    4,
+	})
+}
+
+type restartChainCrashOptions struct {
+	label   string
+	seedIdx int
+	point   crashpoint.Point
+	ordinal int
+
+	accounts            int
+	minInitialRecords   int
+	maxInitialRecords   int
+	liveEventsBootstrap int
+	liveEventsSteady    int
+
+	bootstrapLiveMaxSegmentBytes   int64
+	bootstrapLiveMaxEventsPerBlock int
+	minMergeSourceSegments         int
+	captureCommittedSourceRows     bool
+}
+
+func (o restartChainCrashOptions) resolved() restartChainCrashOptions {
+	if o.accounts == 0 {
+		o.accounts = 4
+	}
+	if o.minInitialRecords == 0 {
+		o.minInitialRecords = 1
+	}
+	if o.maxInitialRecords == 0 {
+		o.maxInitialRecords = 4
+	}
+	if o.liveEventsBootstrap == 0 {
+		o.liveEventsBootstrap = 4
+	}
+	if o.liveEventsSteady == 0 {
+		o.liveEventsSteady = 4
+	}
+	if o.ordinal == 0 {
+		o.ordinal = 1
+	}
+	return o
+}
+
+// runChainThroughCrashWithOptions is the configurable implementation behind
+// the restart-chain crash helpers. Most callers use runChainThroughCrashAt's
+// defaults; the multi-source m003 tier overrides the bootstrap-live writer
+// sizing so every accepted live event rotates into its own merge source.
+//
+// nolint:paralleltest
+func runChainThroughCrashWithOptions(t *testing.T, opts restartChainCrashOptions) recoveredChainRun {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping restart oracle under -short")
 	}
+	opts = opts.resolved()
 
 	cfg := Config{
 		Mode:                "restart",
-		Seed:                restartSeed(seedIdx),
-		Accounts:            4,
-		MinInitialRecords:   1,
-		MaxInitialRecords:   4,
-		LiveEventsBootstrap: 4,
-		LiveEventsSteady:    4,
+		Seed:                restartSeed(opts.seedIdx),
+		Accounts:            opts.accounts,
+		MinInitialRecords:   opts.minInitialRecords,
+		MaxInitialRecords:   opts.maxInitialRecords,
+		LiveEventsBootstrap: opts.liveEventsBootstrap,
+		LiveEventsSteady:    opts.liveEventsSteady,
 	}
-	trace, _, closeTrace := newOracleTrace(t, "restart-chain-crash-"+label+".jsonl")
+	trace, _, closeTrace := newOracleTrace(t, "restart-chain-crash-"+opts.label+".jsonl")
 	t.Cleanup(closeTrace)
 
 	spec := deriveChainSpec(cfg.Seed, cfg.Accounts)
 	recordTraceOrError(t, trace, "run_start", map[string]any{
-		"mode":          cfg.Mode,
-		"seed":          cfg.Seed,
-		"go_version":    runtime.Version(),
-		"gomaxprocs":    runtime.GOMAXPROCS(0),
-		"accounts":      cfg.Accounts,
-		"case":          label,
-		"crash_point":   point.String(),
-		"crash_ordinal": ordinal,
-		"chain_did_idx": spec.chainAccountIdx(),
-		"chain_records": len(spec.records),
+		"mode":                                cfg.Mode,
+		"seed":                                cfg.Seed,
+		"go_version":                          runtime.Version(),
+		"gomaxprocs":                          runtime.GOMAXPROCS(0),
+		"accounts":                            cfg.Accounts,
+		"case":                                opts.label,
+		"crash_point":                         opts.point.String(),
+		"crash_ordinal":                       opts.ordinal,
+		"chain_did_idx":                       spec.chainAccountIdx(),
+		"chain_records":                       len(spec.records),
+		"bootstrap_live_max_segment_bytes":    opts.bootstrapLiveMaxSegmentBytes,
+		"bootstrap_live_max_events_per_block": opts.bootstrapLiveMaxEventsPerBlock,
+		"min_merge_source_segments":           opts.minMergeSourceSegments,
 	})
 
 	w := newRestartWorld(t, cfg)
@@ -81,42 +147,85 @@ func runChainThroughCrashAt(t *testing.T, label string, seedIdx int, point crash
 
 	dataDir := t.TempDir()
 	markersDir := t.TempDir()
-	markerPath := filepath.Join(markersDir, point.String())
+	markerPath := filepath.Join(markersDir, opts.point.String())
 	mergeDonePath := filepath.Join(markersDir, "after-merge")
 
 	// First child: backfill serves the chain DID's getRepo (coordinator
 	// generates the chain over the live firehose), the merge drains it
 	// durably, then we SIGKILL mid-recovery at the crashpoint.
 	first := runRestartChild(t, restartChildArgs{
-		dataDir:         dataDir,
-		relayURL:        srv.URL,
-		markerPath:      markerPath,
-		crashPoint:      point,
-		crashOrdinal:    ordinal,
-		killAfterMarker: true,
-		timeout:         30 * time.Second,
-		trace:           trace,
-		runLabel:        "first-" + label,
+		dataDir:                        dataDir,
+		relayURL:                       srv.URL,
+		markerPath:                     markerPath,
+		crashPoint:                     opts.point,
+		crashOrdinal:                   opts.ordinal,
+		killAfterMarker:                true,
+		timeout:                        30 * time.Second,
+		trace:                          trace,
+		runLabel:                       "first-" + opts.label,
+		bootstrapLiveMaxSegmentBytes:   opts.bootstrapLiveMaxSegmentBytes,
+		bootstrapLiveMaxEventsPerBlock: opts.bootstrapLiveMaxEventsPerBlock,
 	})
 	recordTraceOrError(t, trace, "restart_child_result", traceRestartChildResult("first", first))
-	require.Truef(t, wasSIGKILL(first.err), "first child should be killed at %s ordinal=%d: err=%v\n%s", point, ordinal, first.err, first.output)
+	require.Truef(t, wasSIGKILL(first.err), "first child should be killed at %s ordinal=%d: err=%v\n%s", opts.point, opts.ordinal, first.err, first.output)
+
+	var committedSourceRows []EventLogRow
+	if opts.minMergeSourceSegments > 0 || opts.captureCommittedSourceRows {
+		files := requireMergeSourceSegments(t, dataDir, opts.minMergeSourceSegments)
+		recordTraceOrError(t, trace, "restart_source_segments_after_kill", map[string]any{
+			"count": len(files),
+		})
+		if opts.captureCommittedSourceRows {
+			committedIdx := opts.ordinal - 2
+			require.GreaterOrEqualf(t, committedIdx, 0,
+				"cannot capture committed source rows for ordinal %d: no source committed before crash", opts.ordinal)
+			require.Lessf(t, committedIdx, len(files),
+				"committed source index %d out of range for %d source segments", committedIdx, len(files))
+			committedSourceRows = readSourceRowsForNoReprocessCheck(t, files[committedIdx].Path)
+			recordTraceOrError(t, trace, "restart_committed_source_rows_after_kill", map[string]any{
+				"source_idx": committedIdx,
+				"rows":       len(committedSourceRows),
+			})
+		}
+	}
 
 	// Second child: re-run the merge idempotently to a clean after-merge
 	// exit. The coordinator does NOT regenerate (sync.Once already fired on
 	// the first child's getRepo, and the chain ops are durable in the world).
 	second := runRestartChild(t, restartChildArgs{
-		dataDir:       dataDir,
-		relayURL:      srv.URL,
-		mergeDonePath: mergeDonePath,
-		timeout:       30 * time.Second,
-		trace:         trace,
-		runLabel:      "second-" + label,
+		dataDir:                        dataDir,
+		relayURL:                       srv.URL,
+		mergeDonePath:                  mergeDonePath,
+		timeout:                        30 * time.Second,
+		trace:                          trace,
+		runLabel:                       "second-" + opts.label,
+		bootstrapLiveMaxSegmentBytes:   opts.bootstrapLiveMaxSegmentBytes,
+		bootstrapLiveMaxEventsPerBlock: opts.bootstrapLiveMaxEventsPerBlock,
 	})
 	recordTraceOrError(t, trace, "restart_child_result", traceRestartChildResult("second", second))
 	require.NoErrorf(t, second.err, "restart child should exit cleanly\n%s", second.output)
 	require.FileExistsf(t, mergeDonePath, "restart child must reach after-merge barrier before exiting")
 
-	return recoveredChainRun{cfg: cfg, spec: spec, w: w, coord: coord, dataDir: dataDir}
+	return recoveredChainRun{cfg: cfg, spec: spec, w: w, coord: coord, dataDir: dataDir, committedSourceRows: committedSourceRows}
+}
+
+func requireMergeSourceSegments(t *testing.T, dataDir string, minCount int) []ingest.SegmentFile {
+	t.Helper()
+
+	files, err := ingest.SegmentFiles(filepath.Join(dataDir, "backfill", "live_segments"))
+	require.NoError(t, err, "list merge source segments after restart child kill")
+	require.GreaterOrEqualf(t, len(files), minCount,
+		"restart fixture must produce at least %d merge source segments", minCount)
+	return files
+}
+
+func readSourceRowsForNoReprocessCheck(t *testing.T, path string) []EventLogRow {
+	t.Helper()
+
+	events, err := observeSealedSegment(path)
+	require.NoErrorf(t, err, "read committed merge source %s", path)
+	require.NotEmptyf(t, events, "committed merge source %s must contain rows", path)
+	return zeroRowSeqs(NormalizeEventLog(events))
 }
 
 // maxDurableSeq returns the highest jetstream seq among observed on-disk

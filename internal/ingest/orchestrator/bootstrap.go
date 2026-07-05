@@ -65,21 +65,23 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		// Bootstrap-time live consumer.
 		bootstrapLive, err := live.Open(live.Config{
-			DataDir:          o.cfg.DataDir,
-			SegmentsDir:      liveSegmentsDir,
-			Store:            o.cfg.Store,
-			SeqKey:           live.BootstrapSeqKey,
-			CursorKey:        live.CursorKey,
-			RelayURL:         o.cfg.RelayURL,
-			Logger:           o.cfg.Logger,
-			Metrics:          o.cfg.LiveMetrics,
-			DropMetrics:      o.cfg.DropMetrics,
-			Verifier:         o.cfg.Verifier,
-			SyncStateStore:   o.cfg.SyncStateStore,
-			SegmentMetrics:   o.cfg.SegmentMetrics,
-			OnEvent:          o.cfg.OnBootstrapLiveEvent,
-			ReconnectBackoff: o.cfg.LiveReconnectBackoff,
-			Dial:             o.cfg.LiveDial,
+			DataDir:           o.cfg.DataDir,
+			SegmentsDir:       liveSegmentsDir,
+			Store:             o.cfg.Store,
+			SeqKey:            live.BootstrapSeqKey,
+			CursorKey:         live.CursorKey,
+			RelayURL:          o.cfg.RelayURL,
+			Logger:            o.cfg.Logger,
+			Metrics:           o.cfg.LiveMetrics,
+			DropMetrics:       o.cfg.DropMetrics,
+			Verifier:          o.cfg.Verifier,
+			SyncStateStore:    o.cfg.SyncStateStore,
+			MaxSegmentBytes:   o.cfg.BootstrapLiveMaxSegmentBytes,
+			MaxEventsPerBlock: o.cfg.BootstrapLiveMaxEventsPerBlock,
+			SegmentMetrics:    o.cfg.SegmentMetrics,
+			OnEvent:           o.cfg.OnBootstrapLiveEvent,
+			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
+			Dial:              o.cfg.LiveDial,
 		})
 		if err != nil {
 			if cerr := bw.Close(); cerr != nil {

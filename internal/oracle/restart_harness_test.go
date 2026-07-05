@@ -41,7 +41,9 @@ const (
 	// envRestartCrashOrdinal selects the 1-based occurrence of the crashpoint
 	// to kill on (default 1). Lets a predicate kill "between" named crashpoints
 	// by occurrence count, e.g. the 3rd AfterRepoComplete.
-	envRestartCrashOrdinal = "JETSTREAM_ORACLE_RESTART_CRASH_ORDINAL"
+	envRestartCrashOrdinal                   = "JETSTREAM_ORACLE_RESTART_CRASH_ORDINAL"
+	envRestartBootstrapLiveMaxSegmentBytes   = "JETSTREAM_ORACLE_RESTART_BOOTSTRAP_LIVE_MAX_SEGMENT_BYTES"
+	envRestartBootstrapLiveMaxEventsPerBlock = "JETSTREAM_ORACLE_RESTART_BOOTSTRAP_LIVE_MAX_EVENTS_PER_BLOCK"
 
 	// Store-fault tier (#30): the child installs a deterministic metadata-store
 	// write fault that fails the Ordinal-th batch_commit touching a key under
@@ -212,6 +214,11 @@ type recoveredChainRun struct {
 	w       *world.World
 	coord   *chainCoordinator
 	dataDir string
+	// committedSourceRows carries the normalized rows from a source segment
+	// whose merge cursor commit completed before the first child was killed.
+	// Multi-source restart tests use it to prove recovery does not reprocess
+	// an already-committed source segment.
+	committedSourceRows []EventLogRow
 }
 
 // runChainToMergeNoCrash builds a restart world, installs the chain
@@ -303,6 +310,7 @@ func TestOracleRestartChild(t *testing.T) {
 
 	crashInjector := newOracleCrashInjectorFromEnv(t, markerPath)
 	storeFault := newOracleStoreFaultFromEnv(t)
+	bootstrapLiveMaxSegmentBytes, bootstrapLiveMaxEventsPerBlock := restartBootstrapLiveLimitsFromEnv(t)
 	var afterMerge jetstreamd.PhaseBarrier
 	if mergeDonePath := os.Getenv(envRestartMergeDone); mergeDonePath != "" {
 		afterMerge = func(context.Context) error {
@@ -333,35 +341,37 @@ func TestOracleRestartChild(t *testing.T) {
 	cutoverGate := newCutoverDeliveryGate(relayURL, 30*time.Second)
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
-		PublicAddr:                "127.0.0.1:0",
-		DebugAddr:                 "127.0.0.1:0",
-		DataDir:                   dataDir,
-		RelayURL:                  relayURL,
-		PLCURL:                    relayURL,
-		OTelServiceName:           "jetstream-oracle-restart",
-		LogLevel:                  "warn",
-		LogFormat:                 "text",
-		LogOutput:                 testWriter{t: t},
-		ShutdownTimeout:           5 * time.Second,
-		ClientDrainTimeout:        time.Second,
-		CursorLookback:            36 * time.Hour,
-		SegmentCacheMaxAge:        0,
-		PlanMaxDIDs:               xrpcapi.DefaultPlanMaxDIDs,
-		PlanMaxCollections:        xrpcapi.DefaultPlanMaxCollections,
-		PlanMaxEntries:            xrpcapi.DefaultPlanMaxEntries,
-		PlanWholeSegmentThreshold: xrpcapi.DefaultPlanWholeSegmentThreshold,
-		SubscribeHotTailBytes:     16 << 20,
-		SubscribeBlockCacheBytes:  16 << 20,
-		SubscribeReadBatch:        1024,
-		SubscribeSlowWindow:       time.Second,
-		SubscribeSlowMinRate:      1,
-		CursorBlockIndexCacheSize: 32,
-		CompactionInterval:        time.Hour,
-		BarrierBeforeCutover:      cutoverGate.waitDelivered,
-		BarrierAfterMerge:         afterMerge,
-		CrashInjector:             crashInjector,
-		StoreFaultInjector:        storeFault,
-		OnBootstrapLiveEvent:      cutoverGate.observe,
+		PublicAddr:                     "127.0.0.1:0",
+		DebugAddr:                      "127.0.0.1:0",
+		DataDir:                        dataDir,
+		RelayURL:                       relayURL,
+		PLCURL:                         relayURL,
+		OTelServiceName:                "jetstream-oracle-restart",
+		LogLevel:                       "warn",
+		LogFormat:                      "text",
+		LogOutput:                      testWriter{t: t},
+		ShutdownTimeout:                5 * time.Second,
+		ClientDrainTimeout:             time.Second,
+		CursorLookback:                 36 * time.Hour,
+		SegmentCacheMaxAge:             0,
+		PlanMaxDIDs:                    xrpcapi.DefaultPlanMaxDIDs,
+		PlanMaxCollections:             xrpcapi.DefaultPlanMaxCollections,
+		PlanMaxEntries:                 xrpcapi.DefaultPlanMaxEntries,
+		PlanWholeSegmentThreshold:      xrpcapi.DefaultPlanWholeSegmentThreshold,
+		SubscribeHotTailBytes:          16 << 20,
+		SubscribeBlockCacheBytes:       16 << 20,
+		SubscribeReadBatch:             1024,
+		SubscribeSlowWindow:            time.Second,
+		SubscribeSlowMinRate:           1,
+		CursorBlockIndexCacheSize:      32,
+		CompactionInterval:             time.Hour,
+		BootstrapLiveMaxSegmentBytes:   bootstrapLiveMaxSegmentBytes,
+		BootstrapLiveMaxEventsPerBlock: bootstrapLiveMaxEventsPerBlock,
+		BarrierBeforeCutover:           cutoverGate.waitDelivered,
+		BarrierAfterMerge:              afterMerge,
+		CrashInjector:                  crashInjector,
+		StoreFaultInjector:             storeFault,
+		OnBootstrapLiveEvent:           cutoverGate.observe,
 	})
 	require.NoError(t, err)
 
@@ -393,6 +403,24 @@ func TestOracleRestartChild(t *testing.T) {
 	require.True(t,
 		runErr == nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded),
 		"runtime error: %v", runErr)
+}
+
+func restartBootstrapLiveLimitsFromEnv(t *testing.T) (int64, int) {
+	t.Helper()
+
+	var maxSegmentBytes int64
+	if raw := os.Getenv(envRestartBootstrapLiveMaxSegmentBytes); raw != "" {
+		require.NoError(t, parseInt64Env(os.LookupEnv, envRestartBootstrapLiveMaxSegmentBytes, &maxSegmentBytes))
+		require.Greaterf(t, maxSegmentBytes, int64(0), "%s must be positive", envRestartBootstrapLiveMaxSegmentBytes)
+	}
+
+	var maxEventsPerBlock int
+	if raw := os.Getenv(envRestartBootstrapLiveMaxEventsPerBlock); raw != "" {
+		require.NoError(t, parseIntEnv(os.LookupEnv, envRestartBootstrapLiveMaxEventsPerBlock, &maxEventsPerBlock))
+		require.Greaterf(t, maxEventsPerBlock, 0, "%s must be positive", envRestartBootstrapLiveMaxEventsPerBlock)
+	}
+
+	return maxSegmentBytes, maxEventsPerBlock
 }
 
 // newOracleStoreFaultFromEnv builds the store-fault injector for the child
@@ -693,13 +721,15 @@ func newRestartServer(t *testing.T, w *world.World, onGetRepoServed func(did str
 }
 
 type restartChildArgs struct {
-	dataDir         string
-	relayURL        string
-	markerPath      string
-	mergeDonePath   string
-	crashPoint      crashpoint.Point
-	crashOrdinal    int // 1-based kill ordinal; 0 == default (1st hit)
-	killAfterMarker bool
+	dataDir                        string
+	relayURL                       string
+	markerPath                     string
+	mergeDonePath                  string
+	crashPoint                     crashpoint.Point
+	crashOrdinal                   int // 1-based kill ordinal; 0 == default (1st hit)
+	killAfterMarker                bool
+	bootstrapLiveMaxSegmentBytes   int64
+	bootstrapLiveMaxEventsPerBlock int
 	// Store-fault tier (#30): when storeFaultPrefix is set the child arms a
 	// metadata-store write fault on the Ordinal-th batch_commit touching the
 	// prefix, and writes storeFaultObservedPath if (and only if) the runtime
@@ -726,13 +756,15 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 	// 0 means "unset"; the child treats a missing ordinal as 1.
 	ordinal := args.crashOrdinal
 	recordTraceOrError(t, args.trace, "restart_child_start", map[string]any{
-		"label":             args.runLabel,
-		"log_path":          logPath,
-		"crash_point":       args.crashPoint.String(),
-		"crash_ordinal":     ordinal,
-		"kill_after_marker": args.killAfterMarker,
-		"marker_path":       args.markerPath,
-		"merge_done_path":   args.mergeDonePath,
+		"label":                               args.runLabel,
+		"log_path":                            logPath,
+		"crash_point":                         args.crashPoint.String(),
+		"crash_ordinal":                       ordinal,
+		"kill_after_marker":                   args.killAfterMarker,
+		"marker_path":                         args.markerPath,
+		"merge_done_path":                     args.mergeDonePath,
+		"bootstrap_live_max_segment_bytes":    args.bootstrapLiveMaxSegmentBytes,
+		"bootstrap_live_max_events_per_block": args.bootstrapLiveMaxEventsPerBlock,
 	})
 
 	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestOracleRestartChild$", "-test.v")
@@ -748,6 +780,12 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 	)
 	if ordinal > 0 {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", envRestartCrashOrdinal, ordinal))
+	}
+	if args.bootstrapLiveMaxSegmentBytes > 0 {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", envRestartBootstrapLiveMaxSegmentBytes, args.bootstrapLiveMaxSegmentBytes))
+	}
+	if args.bootstrapLiveMaxEventsPerBlock > 0 {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", envRestartBootstrapLiveMaxEventsPerBlock, args.bootstrapLiveMaxEventsPerBlock))
 	}
 	if args.storeFaultPrefix != "" {
 		cmd.Env = append(cmd.Env,
