@@ -104,6 +104,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	_, err = w.EnsureSeed()
 	require.NoError(t, err)
 	require.NoError(t, w.Bootstrap(t.Context(), slog.Default()))
+	configureOracleUnavailableRepos(t, w, cfg, trace)
 	// Size the firehose fanout buffer to comfortably exceed the run's total
 	// event volume. The simulator fanout drops frames on a full per-subscriber
 	// buffer (it models a lossy relay), and in the bubble a dropped frame is
@@ -407,6 +408,14 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	// lost, exactly as the ledger asserts.
 	acctOp, acctSyncLie, acctVerifier := pickAdversarialAccounts(t, w, cfg)
 	steadyStartSeq := w.CurrentSeq()
+	// #203 account-status lifecycle FIRST, before the random steady traffic:
+	// the m043 mutation gate needs these rows at or below a steady compaction
+	// watermark, and the pass that provides it is triggered by the steady
+	// traffic's first tombstone (CompactionTombstoneCap=1). Injecting before
+	// generateN guarantees the lifecycle rows are already archived when that
+	// pass force-rotates, so its watermark covers them. The shutdown-flush
+	// anti-vacuity assertion below enforces this coverage.
+	accountStatusDID := injectOracleAccountStatusLifecycle(t, w, cfg)
 	generateN(t, w, cfg.LiveEventsSteady)
 	// Deterministic #202 identity injections, independent of the random
 	// mix: a handle-change payload (the optional-field shape) and a
@@ -440,6 +449,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	assertNoPermanentCursorGapExcept(t, steadyEventLog, steadyStartSeq, targetSeq, cfg, "steady-state",
 		newAdversarialFilter(w.AdversarialLedger().Entries()))
 	assertIdentityArchived(t, cfg, bootstrapEventLog, steadyEventLog, identityDID(t, w, identityIdx))
+	accountStatusMaxSeq := assertAccountStatusLifecycleArchived(t, cfg, steadyEventLog, accountStatusDID)
 	// The malformed-DID identity must be rejected by the net-new
 	// enqueuer's validation gate (metric via the debug /metrics surface,
 	// scraped while the runtime is still serving), and at least one VALID
@@ -505,6 +515,9 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		"err":   traceErr(run.err),
 	})
 	runDone = true
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	require.NoError(t, rt.Close(closeCtx))
+	closeCancel()
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "final-assertions", "marker": "begin"})
 	// Anti-vacuity: the fanout models a lossy relay (drop-on-full per
 	// subscriber, fanout.go Publish), and in the bubble a dropped frame is
@@ -521,7 +534,16 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		cfg.Mode, cfg.Seed, fan.TotalDrops())
 	recordSubscribeReposFaults(t, trace, "steady-state-shutdown-flush", faultPlan)
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
+	assertUnavailableRepoStatuses(t, dataDir, w, cfg)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
+	// Anti-vacuity for the #203 / m043 gate: the tombstone-exactness fold only
+	// touches rows at or below a pass watermark, so the lifecycle's account
+	// rows must be covered by the final watermark or the "non-deleted statuses
+	// never fold as tombstones" property was never actually exercised
+	// end-to-end this run.
+	require.GreaterOrEqualf(t, compaction.Last(t).Watermark, accountStatusMaxSeq,
+		"final compaction watermark did not cover the #203 account-status lifecycle rows (mode=%s seed=%d): the tombstone-exactness fold never saw them, so the m043 gate is vacuous — inject earlier or ensure a later pass",
+		cfg.Mode, cfg.Seed)
 	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "steady-state-shutdown-flush")
 	// Compaction over-drop / data-loss check (#100): every compaction pass
 	// must have preserved each row the documented filter says survives at its
@@ -1347,13 +1369,11 @@ func generateN(t *testing.T, w *world.World, n int) {
 func pickActiveOracleAccount(t *testing.T, w *world.World, cfg Config) int {
 	t.Helper()
 	for idx := range cfg.Accounts {
-		deleted, err := w.IsAccountDeleted(idx)
-		require.NoError(t, err)
-		if !deleted {
+		if oracleAccountFetchable(t, w, idx) {
 			return idx
 		}
 	}
-	t.Fatal("oracle requires at least one active account for sync divergence")
+	t.Fatal("oracle requires at least one fetchable active account for sync divergence")
 	return 0
 }
 

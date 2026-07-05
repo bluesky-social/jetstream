@@ -136,6 +136,67 @@ func TestGenerateAccountReactivateForTest_ClearsDeletedAndEmitsActiveFrame(t *te
 	require.True(t, entries[0].Active, "reactivated account must list as active")
 }
 
+func TestGenerateAccountStatusForTest_NonDeletedStatusesDoNotMarkDeleted(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Accounts = 2
+	cfg.InitialRecords = 1
+	w, err := New(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	require.NoError(t, w.Bootstrap(context.Background(), slog.Default()))
+	require.NoError(t, w.AttachRuntime(rand.New(rand.NewPCG(1, 2)), fanout.New(16)))
+
+	for _, status := range []string{"takendown", "suspended", "deactivated", "unknown"} {
+		frame, err := w.GenerateAccountStatusForTest(context.Background(), 0, false, status)
+		require.NoError(t, err)
+		acct := decodeAccountFrameForTest(t, frame)
+		require.False(t, acct.Active)
+		require.Equal(t, status, acct.Status.Val())
+
+		deleted, err := w.IsAccountDeleted(0)
+		require.NoError(t, err)
+		require.Falsef(t, deleted, "status %q must not mark the world account deleted", status)
+	}
+
+	frame, err := w.GenerateAccountStatusForTest(context.Background(), 0, true, "")
+	require.NoError(t, err)
+	acct := decodeAccountFrameForTest(t, frame)
+	require.True(t, acct.Active)
+	require.False(t, acct.Status.HasVal())
+
+	entries, _, err := w.ListReposPage(0, 10)
+	require.NoError(t, err)
+	require.True(t, entries[0].Active, "non-deleted account statuses must not flip listRepos active")
+}
+
+func TestSetRepoUnavailableForTest_LeavesListReposActive(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Accounts = 2
+	cfg.InitialRecords = 1
+	w, err := New(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	require.NoError(t, w.Bootstrap(context.Background(), slog.Default()))
+
+	require.NoError(t, w.SetRepoUnavailableForTest(1, "suspended"))
+	status, ok, err := w.RepoUnavailableStatus(1)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "suspended", status)
+
+	entries, _, err := w.ListReposPage(0, 10)
+	require.NoError(t, err)
+	require.True(t, entries[0].Active)
+	require.True(t, entries[1].Active, "unavailable repos must still dispatch to getRepo")
+	require.Error(t, w.SetRepoUnavailableForTest(1, "unknown"))
+}
+
 func TestGenerateAccountDeleteForTestUsesDeterministicTime(t *testing.T) {
 	t.Parallel()
 

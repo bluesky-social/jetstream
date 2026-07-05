@@ -5,12 +5,14 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 34 active mutants on disk
-(m001–m042; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
-union baseline after #206 frame-tier coverage and #208 footer-index/bloom
-verification: **34 killed, 0 survived, zero STALE/BUILD-BROKEN** in
-`testing/mutation/baseline.json` (commit field `0a89f40` is provenance-only;
-refreshed from the #208 temporary worktree and unioned with #206's m042).
+**Current catalog (keep this line current): 35 active mutants on disk
+(m001–m043; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+union baseline after #206 frame-tier coverage, #208 footer-index/bloom
+verification, and #203 account-status exactness: **35 killed, 0 survived,
+zero STALE/BUILD-BROKEN** in
+`testing/mutation/baseline.json` (commit field `4f2c153` is
+provenance-only). #208 banked the old m015 footer-index survivor as
+KILLED@default; #203 added m043 and banks it as KILLED@default.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -76,6 +78,47 @@ remain below so the reasoning is not lost.
 | m021_overlay_record_seq_base_zero | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m023_overlay_drop_record_tombstones | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178. #183's re-derivation analysis (2026-07-04 section below) concluded no single-edit replacement exists: the recorder is a regression assertion without a gated mutant. |
+
+## Campaign 2026-07-05 (#203 — account lifecycle statuses and getRepo unavailable)
+
+Full campaign at `2450fec` after adding deterministic simulator/oracle coverage
+for non-deleted account lifecycle statuses (`takendown`, `suspended`,
+`deactivated`, `unknown`), reactivation, and terminal `getRepo`
+`RepoTakendown`/`RepoSuspended`/`RepoDeactivated` classification. **35 active
+mutants: 34 KILLED, 1 SURVIVED, zero STALE/BUILD-BROKEN.** At that point the
+only survivor was the documented m015 footer-count escape; #208 later banked it
+as KILLED@default.
+
+**Re-run at `4f2c153` (same day) after an adversarial-review finding proved the
+`2450fec` result vacuous at the end-to-end tier.** m043 originally declared
+`tiers: tombstone,default`; the driver stops at the first killing tier, so the
+pre-existing tombstone unit matrix killed the mutant and
+`TestOracle_DefaultLifecycle` never gated the new #203 lifecycle coverage —
+confirmed by hand-applying the mutant: the default tier PASSED, because the
+lifecycle was injected at the end of the steady window, above every compaction
+watermark, where the tombstone-exactness fold never touches rows. Fixes: the
+lifecycle injection moved to the start of the steady window (below the
+tombstone-triggered pass watermark), the harness now asserts the final
+watermark covers the lifecycle rows (anti-vacuity), and m043's tiers reordered
+to `default,tombstone` so the end-to-end tier is the recorded killer. The
+mutant's expected-detection block also cited a nonexistent test
+(`TestTombstoneSet_AccountStatusExactness`); corrected to the real unit
+backstops (`TestObserveAccountDeletedOnlyPurgesLiteralDeleted`,
+`TestObserveAccountStatusMatrixRetains`). m001's recorded tier also moved
+stress→default in this regen (tier-order note only; disposition unchanged).
+
+Drivers:
+
+```bash
+testing/mutation/run.sh m043 --json /tmp/m043.json
+testing/mutation/run.sh --json testing/mutation/baseline.json
+```
+
+### Scorecard
+
+| mutant | result | note |
+|---|---|---|
+| m043_account_status_exactness | KILLED@default | `oracle: missing did:plc:jqwkem7rbggmxanbfb7e6gbl app.bsky.feed.like/...` — under the mutant the fixture account's inactive statuses fold as DID tombstones and compaction over-drops its records; the tombstone unit matrix remains the fast backstop tier. |
 
 ## Campaign 2026-07-05 (#208 — footer-index/bloom verification)
 

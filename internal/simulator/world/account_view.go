@@ -191,6 +191,17 @@ func (w *World) GenerateAccountReactivateForTest(ctx context.Context, idx int) (
 	return w.generateAccountReactivate(ctx, idx)
 }
 
+// GenerateAccountStatusForTest emits a #account frame with the caller-supplied
+// active/status pair without mutating the world's repo or deleted flag. Oracle
+// tests use this to pin non-deleted hosting statuses end-to-end: only
+// Active:false,status:"deleted" is a tombstone.
+func (w *World) GenerateAccountStatusForTest(ctx context.Context, idx int, active bool, status string) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
+	return w.generateAccountStatus(ctx, idx, active, status)
+}
+
 // GenerateIdentityForTest emits one polite #identity frame for account
 // idx: handle-absent (the dominant production shape) or, with
 // handleChange, a handle-change payload backed by the account's
@@ -223,4 +234,20 @@ func (w *World) GenerateMalformedIdentityForTest(ctx context.Context) ([]byte, e
 
 func (w *World) IsAccountDeleted(idx int) (bool, error) {
 	return w.isAccountDeleted(idx)
+}
+
+// SetRepoUnavailableForTest makes getRepo for account idx return a terminal
+// unavailable XRPC error. Status must be "takendown", "suspended", or
+// "deactivated".
+func (w *World) SetRepoUnavailableForTest(idx int, status string) error {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
+	return w.setRepoUnavailableStatus(idx, status)
+}
+
+// RepoUnavailableStatus returns the terminal getRepo-unavailable status for
+// account idx, if one has been configured.
+func (w *World) RepoUnavailableStatus(idx int) (string, bool, error) {
+	return w.repoUnavailableStatus(idx)
 }

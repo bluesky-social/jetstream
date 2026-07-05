@@ -227,6 +227,28 @@ func TestBuildSwarmFaultPlanSingleDIDWorld(t *testing.T) {
 	require.Equal(t, 1, plan.TotalGetRepoCARTruncations())
 }
 
+func TestBuildSwarmFaultPlanSkipsRepoUnavailableDIDs(t *testing.T) {
+	t.Parallel()
+
+	w := newFaultPlanWorld(t, 8)
+	for idx := range 7 {
+		require.NoError(t, w.SetRepoUnavailableForTest(idx, "suspended"))
+	}
+	acct, err := w.LoadAccount(7)
+	require.NoError(t, err)
+
+	cfg := Config{
+		Seed:             123,
+		Accounts:         8,
+		LiveEventsSteady: 25,
+		FaultMode:        FaultModeSwarm,
+	}
+	plan, err := BuildSwarmFaultPlan(w, cfg)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{string(acct.DID): 2}, plan.GetRepoHTTPFailures)
+	require.Equal(t, map[string]int{string(acct.DID): 1}, plan.GetRepoCARTruncations)
+}
+
 func TestBuildSwarmFaultPlanNoopsWhenFaultModeNone(t *testing.T) {
 	t.Parallel()
 

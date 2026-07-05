@@ -268,6 +268,20 @@ func worldDIDs(w *world.World) ([]string, error) {
 	}
 	dids := make([]string, 0, len(page))
 	for _, entry := range page {
+		acct, ok, err := w.FindAccountByDID(entry.DID)
+		if err != nil {
+			return nil, fmt.Errorf("oracle: resolve fault-plan DID %s: %w", entry.DID, err)
+		}
+		if !ok {
+			return nil, fmt.Errorf("oracle: fault-plan DID %s missing from simulator world", entry.DID)
+		}
+		_, unavailable, err := w.RepoUnavailableStatus(acct.Index)
+		if err != nil {
+			return nil, fmt.Errorf("oracle: inspect fault-plan DID %s availability: %w", entry.DID, err)
+		}
+		if unavailable {
+			continue
+		}
 		dids = append(dids, string(entry.DID))
 	}
 	return dids, nil
