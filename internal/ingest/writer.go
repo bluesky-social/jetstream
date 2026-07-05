@@ -349,7 +349,21 @@ func (w *Writer) SealActiveAndClose() error {
 //     internally consumed a seq; the downstream hot ring heals the gap by
 //     resetting (see subscribe.hotRing) — acceptable because writer
 //     errors on this path abort ingestion anyway.
+//
+// Mutually exclusive with AsyncFlushWorkers: panics on an async-flush writer.
+// The async paths deliver to the sink after PrepareFlush detaches a filled
+// block but before the background commit lands it in the file, so a delivered
+// event can transiently be readable NOWHERE on the cold path (not in
+// SnapshotPending, not in the active file). A hot-ring eviction inside that
+// window would leave subscribers' cold fallback staring at a hole. No
+// production wiring needs sink+async (the sink feeds /subscribe from the sync
+// steady writer; async is bootstrap-backfill-only), so this is invalid
+// internal wiring — fail loud at startup rather than document a landmine.
+// The #248 readable-log refactor deletes this dichotomy.
 func (w *Writer) SetOrderedEventSink(sink func(ev *segment.Event)) {
+	if w.async != nil {
+		panic("ingest: SetOrderedEventSink is not supported with AsyncFlushWorkers (see issue #249)")
+	}
 	w.drainMu.Lock()
 	defer w.drainMu.Unlock()
 	w.orderedSink = sink
@@ -366,10 +380,10 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 		job, err := w.appendLocked(ctx, ev)
 		w.mu.Unlock()
 		if err == nil {
+			// No orderedSink delivery here: the sink cannot be installed on
+			// an async writer (SetOrderedEventSink panics), because a
+			// just-prepared block is not yet cold-readable. See #249.
 			w.submitAsyncFlushes([]*asyncFlushJob{job})
-			if w.orderedSink != nil {
-				w.orderedSink(ev)
-			}
 		}
 		w.drainMu.Unlock()
 		if err != nil {

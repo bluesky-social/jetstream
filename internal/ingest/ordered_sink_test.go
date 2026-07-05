@@ -93,32 +93,24 @@ func TestOrderedSink_ConcurrentProducersStayOrdered(t *testing.T) {
 	requireDense(t, got)
 }
 
-// TestOrderedSink_AsyncWriterCovered: the async-flush (backfill) writer
-// variant routes through different Append/AppendBatch bodies; the sink
-// contract must hold there too.
-func TestOrderedSink_AsyncWriterCovered(t *testing.T) {
+// TestOrderedSink_AsyncWriterRejected: the sink is mutually exclusive with
+// AsyncFlushWorkers — the async paths would advertise events to the sink
+// before their prepared block is cold-readable (#249). Installing a sink on
+// an async writer is invalid internal wiring and must fail loud at startup,
+// not surface later as a subscriber gap. The #248 readable-log refactor
+// removes this restriction along with the mode dichotomy itself.
+func TestOrderedSink_AsyncWriterRejected(t *testing.T) {
 	t.Parallel()
 	w := newTestWriter(t, Config{AsyncFlushWorkers: 2})
 
-	// Deliberately unsynchronized, like the concurrent test above: the
-	// sink must be serialized by drainMu in async mode too, and the race
-	// detector proves it.
-	var got []uint64
-	w.SetOrderedEventSink(func(ev *segment.Event) { got = append(got, ev.Seq) })
+	require.PanicsWithValue(t,
+		"ingest: SetOrderedEventSink is not supported with AsyncFlushWorkers (see issue #249)",
+		func() { w.SetOrderedEventSink(func(*segment.Event) {}) })
 
-	var wg sync.WaitGroup
-	for range 4 {
-		wg.Go(func() {
-			for range 50 {
-				batch := []segment.Event{sinkEvent("did:plc:a"), sinkEvent("did:plc:b")}
-				require.NoError(t, w.AppendBatch(context.Background(), batch))
-			}
-		})
-	}
-	wg.Wait()
-
-	require.Len(t, got, 4*50*2)
-	requireDense(t, got)
+	// The writer itself stays usable — only the sink install is rejected.
+	ev := sinkEvent("did:plc:async")
+	require.NoError(t, w.Append(context.Background(), &ev))
+	require.Equal(t, uint64(1), ev.Seq)
 }
 
 // TestOrderedSink_NotInstalledIsFree: a writer with no sink behaves as
