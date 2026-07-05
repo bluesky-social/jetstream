@@ -8,7 +8,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	metastore "github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/api/comatproto"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/stretchr/testify/require"
@@ -150,7 +149,7 @@ func assertUnavailableRepoStatuses(t *testing.T, dataDir string, w *world.World,
 	for _, tc := range oracleUnavailableRepos {
 		acct, err := w.LoadAccount(tc.accountIdx)
 		require.NoError(t, err)
-		did := atmos.DID(acct.DID)
+		did := acct.DID
 		rs, ok, err := backfill.LoadRepoStatus(st, did)
 		require.NoErrorf(t, err, "load repo status for unavailable DID %s", did)
 		require.Truef(t, ok, "missing repo status for unavailable DID %s", did)

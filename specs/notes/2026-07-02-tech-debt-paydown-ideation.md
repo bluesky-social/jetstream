@@ -524,10 +524,9 @@ server and client version in lockstep — document that.
   docs §3.1: does a v2 reader read v1 files in place (preferred at multi-TB
   scale)? Is `segment/rewrite.go` the migration vehicle? Decision, not code —
   but it constrains what the 158 reserved header bytes can be used for.
-- `inspect-segment --verify` deep-check mode (recompute checksums, re-derive
-  blooms, check index monotonicity) — doubles as the invariant doc *and* the
-  fsck tool operators will eventually beg for; also intersects §2 P1's
-  independent-checksum idea.
+- Dropped 2026-07-05 (jrc): do not add an `inspect-segment --verify`
+  deep-check mode. Footer/index/bloom verification belongs in reusable segment
+  code and oracle coverage (#208), not a new operator CLI surface.
 
 **Local DX (small, cheap):** `just cover` (coverage of `segment/` +
 `internal/ingest/` is the number worth watching), `just profile-cpu`/`heap`

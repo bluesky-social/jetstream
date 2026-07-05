@@ -11,7 +11,7 @@
     {"id":"m009_checksum_range_off_by_one","disposition":"KILLED","result":"KILLED@corpus","note":"see log"},
     {"id":"m011_wire_frame_length","disposition":"KILLED","result":"KILLED@default","note":"oracle: walk active segment /tmp/TestOracle_DefaultLifecycle3644852033/003/segments/seg_0000000000.jss: segment: walk active frames: segment"},
     {"id":"m012_block_event_count_off_by_one","disposition":"KILLED","result":"KILLED@default","note":"see log"},
-    {"id":"m015_collection_count_double","disposition":"SURVIVED","result":"SURVIVED","note":"escape — analyze and disposition"},
+    {"id":"m015_collection_count_double","disposition":"KILLED","result":"KILLED@default","note":"oracle: verify sealed segment /tmp/TestOracle_DefaultLifecycle3283866725/003/backfill/live_segments/seg_0000000000.jss footer metadata: segm"},
     {"id":"m016_bloom_size_off_by_one","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m017_commit_collection_rkey_swap","disposition":"KILLED","result":"KILLED@default","note":"oracle: event mismatch at index 2: want seq=3 kind=create did=did:plc:iv2erqbe5k4ltaawmik4tfeo key=app.bsky.actor.profile/22bgjqcoc57xt rev="},
     {"id":"m018_commit_rev_dropped","disposition":"KILLED","result":"KILLED@default","note":"oracle: event mismatch at index 2: want seq=3 kind=create did=did:plc:iv2erqbe5k4ltaawmik4tfeo key=app.bsky.actor.profile/22bgjqcoc57xt rev="},

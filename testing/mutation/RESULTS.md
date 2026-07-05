@@ -7,13 +7,16 @@ method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 35 active mutants on disk
 (m001–m043; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
-union baseline: **34 killed, 1 survived, zero STALE/BUILD-BROKEN** in
+union baseline after #206 frame-tier coverage, #208 footer-index/bloom
+verification, and #203 account-status exactness: **35 killed, 0 survived,
+zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (commit field `4f2c153` is
-provenance-only). The remaining survivor (m015) is a documented escape with
-owning issue #208.
+provenance-only). #208 banked the old m015 footer-index survivor as
+KILLED@default; #203 added m043 and banks it as KILLED@default.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
+m015 is now KILLED@default by the #208 sealed metadata verifier.
 m013/m014 retired 2026-07-04: dead path under atmos v0.2.10, not
 dormant-under-polite-traffic — see the #204 campaign section; their bug
 class is covered by m017/m018 (convertCommit) and m036/m037 (convertSync).
@@ -82,8 +85,9 @@ Full campaign at `2450fec` after adding deterministic simulator/oracle coverage
 for non-deleted account lifecycle statuses (`takendown`, `suspended`,
 `deactivated`, `unknown`), reactivation, and terminal `getRepo`
 `RepoTakendown`/`RepoSuspended`/`RepoDeactivated` classification. **35 active
-mutants: 34 KILLED, 1 SURVIVED, zero STALE/BUILD-BROKEN.** The only survivor is
-the existing documented m015 footer-count escape.
+mutants: 34 KILLED, 1 SURVIVED, zero STALE/BUILD-BROKEN.** At that point the
+only survivor was the documented m015 footer-count escape; #208 later banked it
+as KILLED@default.
 
 **Re-run at `4f2c153` (same day) after an adversarial-review finding proved the
 `2450fec` result vacuous at the end-to-end tier.** m043 originally declared
@@ -115,6 +119,23 @@ testing/mutation/run.sh --json testing/mutation/baseline.json
 | mutant | result | note |
 |---|---|---|
 | m043_account_status_exactness | KILLED@default | `oracle: missing did:plc:jqwkem7rbggmxanbfb7e6gbl app.bsky.feed.like/...` — under the mutant the fixture account's inactive statuses fold as DID tombstones and compaction over-drops its records; the tombstone unit matrix remains the fast backstop tier. |
+
+## Campaign 2026-07-05 (#208 — footer-index/bloom verification)
+
+Full campaign at temporary-worktree commit `0a89f40` carrying the #208 changes.
+**33 active mutants: 33 KILLED, 0 SURVIVED, zero STALE/BUILD-BROKEN.**
+`testing/mutation/baseline.json` was regenerated from this run.
+
+The surviving m015 footer-index blind spot is now banked as a kill. The new
+segment verifier re-derives footer collection counts, per-block collection
+sets, segment DID bloom membership, and per-block DID bloom membership from
+decoded rows, then the oracle calls it from sealed segment observation. The
+mutant's doubled collection count now fails in the default oracle tier before
+row-level reconstruction can mask it:
+
+| mutant | result | note |
+|---|---|---|
+| m015_collection_count_double | KILLED@default | `oracle: verify sealed segment ... footer metadata: segment: verify ... collection "app.bsky.actor.profile" count mismatch: footer=2 rows=1` |
 
 ## Campaign 2026-06-29 (step 11 #182 — partb tier; catalog refresh; baseline regen)
 
