@@ -6,10 +6,11 @@ failure-mode: |
   increment moved into the shared internCollection helper in #175; the count
   is now guarded by countEvent so sentinel ids do not inflate it.)
 expected-detection: |
-  PREDICTED SURVIVAL: the oracle decodes every block sequentially and never
-  consults the footer collection index, so a corrupt count is invisible to
-  it. This mutant documents a known read-path/footer-index blind spot.
-expected-tier: none
+  KILLED@default: the oracle's sealed segment observer now re-derives footer
+  collection counts from decoded rows and compares them with the persisted
+  collection index, so a doubled count is caught even when row bytes are
+  otherwise intact.
+expected-tier: default
 tiers: default,stress
 
 diff --git a/segment/seal.go b/segment/seal.go

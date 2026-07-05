@@ -125,10 +125,10 @@ user-facing documentation, HA mode.
   at multi-TB scale)? Is `segment/rewrite.go` the migration vehicle? A
   decision, not code — and it constrains what the 158 reserved header bytes
   can be used for. Extra weight now that `segment/` is confirmed public API.
-- **`inspect-segment --verify` deep-check mode** — recompute checksums,
-  re-derive blooms, check block-index monotonicity. Doubles as the
-  consolidated invariant list and the fsck tool operators will eventually beg
-  for. Overlaps oracle doc work item 6 (footer-index read-path coverage).
+- **Dropped: `inspect-segment --verify` deep-check mode** — 2026-07-05
+  decision (jrc): do not add this operator CLI surface. Recompute/re-derive
+  footer, index, and bloom invariants in reusable segment code and oracle
+  coverage instead (#208).
 
 ## Agent-docs bundle (~1 day total; full analysis in parent doc §4)
 
@@ -190,4 +190,5 @@ use.
 4. ENOSPC decision + gauge (+ hands off to oracle doc item 3).
 5. Nix flake (~1 day).
 6. Remaining CI items, DX recipes, OSS hygiene as fill-in work.
-7. Migration policy + `--verify` mode when touching segment next.
+7. Migration policy when touching the segment format next (`--verify` mode
+   dropped — see Format longevity).

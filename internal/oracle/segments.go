@@ -119,6 +119,9 @@ func observeSealedSegment(path string) ([]ObservedEvent, error) {
 	if err := checkSegmentStructure(path, header, blocks); err != nil {
 		return nil, err
 	}
+	if err := segment.VerifySealedMetadata(rd); err != nil {
+		return nil, fmt.Errorf("oracle: verify sealed segment %s footer metadata: %w", path, err)
+	}
 
 	var out []ObservedEvent
 	for i := range int(header.BlockCount) {

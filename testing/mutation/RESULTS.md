@@ -7,13 +7,14 @@ method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 34 active mutants on disk
 (m001–m042; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
-union baseline: **33 killed, 1 survived, zero STALE/BUILD-BROKEN** in
-`testing/mutation/baseline.json` (commit field `fdbfaa7` is
-provenance-only). The remaining survivor (m015) is a documented escape with
-owning issue #208.
+union baseline after #206 frame-tier coverage and #208 footer-index/bloom
+verification: **34 killed, 0 survived, zero STALE/BUILD-BROKEN** in
+`testing/mutation/baseline.json` (commit field `0a89f40` is provenance-only;
+refreshed from the #208 temporary worktree and unioned with #206's m042).
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
+m015 is now KILLED@default by the #208 sealed metadata verifier.
 m013/m014 retired 2026-07-04: dead path under atmos v0.2.10, not
 dormant-under-polite-traffic — see the #204 campaign section; their bug
 class is covered by m017/m018 (convertCommit) and m036/m037 (convertSync).
@@ -75,6 +76,23 @@ remain below so the reasoning is not lost.
 | m021_overlay_record_seq_base_zero | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m023_overlay_drop_record_tombstones | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178. #183's re-derivation analysis (2026-07-04 section below) concluded no single-edit replacement exists: the recorder is a regression assertion without a gated mutant. |
+
+## Campaign 2026-07-05 (#208 — footer-index/bloom verification)
+
+Full campaign at temporary-worktree commit `0a89f40` carrying the #208 changes.
+**33 active mutants: 33 KILLED, 0 SURVIVED, zero STALE/BUILD-BROKEN.**
+`testing/mutation/baseline.json` was regenerated from this run.
+
+The surviving m015 footer-index blind spot is now banked as a kill. The new
+segment verifier re-derives footer collection counts, per-block collection
+sets, segment DID bloom membership, and per-block DID bloom membership from
+decoded rows, then the oracle calls it from sealed segment observation. The
+mutant's doubled collection count now fails in the default oracle tier before
+row-level reconstruction can mask it:
+
+| mutant | result | note |
+|---|---|---|
+| m015_collection_count_double | KILLED@default | `oracle: verify sealed segment ... footer metadata: segment: verify ... collection "app.bsky.actor.profile" count mismatch: footer=2 rows=1` |
 
 ## Campaign 2026-06-29 (step 11 #182 — partb tier; catalog refresh; baseline regen)
 
