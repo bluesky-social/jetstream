@@ -155,7 +155,7 @@ func TestGenerateAdversarialSyncForTest_GarbageEnvelopeRev(t *testing.T) {
 	t.Parallel()
 	w := newTestWorld(t)
 
-	for _, badRev := range []string{"", "not-a-tid", "zzzzzzzzzzzzz"} {
+	for _, badRev := range []string{"not-a-tid", "zzzzzzzzzzzzz"} {
 		frame, err := w.GenerateAdversarialSyncForTest(context.Background(), 0, badRev)
 		require.NoError(t, err)
 
@@ -177,14 +177,40 @@ func TestGenerateAdversarialSyncForTest_GarbageEnvelopeRev(t *testing.T) {
 	_, err := w.GenerateAdversarialSyncForTest(context.Background(), 0, "3lzzzzzzzzz2a")
 	require.Error(t, err)
 
+	// Rejects an empty rev: it sorts below the head rev, so the
+	// verifier's replay check would silently eat the frame before the
+	// gate — the scenario would be vacuously green.
+	_, err = w.GenerateAdversarialSyncForTest(context.Background(), 0, "")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "replay check")
+
+	// Two entries per lie: the whole-event seq + the per-record
+	// exclusion for the silently-created record the drop orphans.
 	entries := w.AdversarialLedger().Entries()
-	require.Len(t, entries, 3)
-	for _, e := range entries {
+	require.Len(t, entries, 4)
+	for i, e := range entries {
 		require.Equal(t, AdversarialSourceLive, e.Source)
 		require.Equal(t, AdversarialLayerGate, e.Layer)
 		require.Equal(t, "invalid_rev", e.Reason)
-		require.True(t, e.WholeEvent)
 		require.Positive(t, e.Seq)
+		if i%2 == 0 {
+			require.True(t, e.WholeEvent)
+			require.Empty(t, e.Rkey)
+		} else {
+			require.False(t, e.WholeEvent)
+			require.NotEmpty(t, e.Rkey, "per-record exclusion entry must carry the orphaned record's coordinates")
+			require.Equal(t, entries[i-1].Seq, e.Seq, "exclusion entry shares the whole-event seq")
+		}
+	}
+
+	// Each lie frame must be preceded by NO #commit for the silent
+	// mutation — the mutation's only carrier is the dropped #sync.
+	frames, err := w.FirehoseRange(0, 10)
+	require.NoError(t, err)
+	require.Len(t, frames, 2, "exactly the two #sync frames, no commit frames")
+	for _, f := range frames {
+		_, ok := bytes.CutPrefix(f, frameHeaderSync)
+		require.True(t, ok, "every emitted frame is a #sync")
 	}
 }
 

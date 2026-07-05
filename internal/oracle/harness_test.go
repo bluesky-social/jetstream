@@ -115,6 +115,21 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		fan,
 	))
 
+	// Backfill-side adversarial lies (#204): spec-invalid MST keys
+	// committed silently into account 1's repo before jetstream
+	// bootstraps, so the ordinary getRepo download walks into them and
+	// the backfill gate must drop each with the right reason while the
+	// account's honest records archive (final-state Compare owns the
+	// survivors assertion). Account 1, not 0: the bootstrap-traffic
+	// generator deletes account 0 (below), which would make the lies'
+	// backfill fate a race against the delete. Account 1 is also
+	// acctOp — first active post-delete — which is deliberate: the
+	// steady-state sync divergence on that account re-serves these
+	// keys through the verifier's resync, and the live gate must
+	// re-drop every one (the counter floors are ≥, so the re-drops
+	// only add signal).
+	injectAdversarialBackfillLies(t, w, 1)
+
 	faultPlan, err := BuildSwarmFaultPlan(w, cfg)
 	require.NoError(t, err)
 	// Fail loud at plan construction if the swarm ever schedules more
@@ -155,6 +170,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	bootstrapAck := newSeqAck()
 	steadyAck := newSeqAck()
 	asyncResyncAck := newSyncTombstoneAck()
+	verifierRepairAck := newSyncTombstoneAck()
 	compaction := newCompactionPassRecorder()
 	overDrop := newCompactionOverDropRecorder(dataDir)
 	bootstrapEventLog := newEventLogRecorder()
@@ -189,6 +205,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	runtimePublicLn := newPipeListener()
 	runtimeDebugLn := newPipeListener()
 	obsClient := runtimePublicLn.httpClient()
+	runtimeDebugClient := runtimeDebugLn.httpClient()
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
 		DataDir:            dataDir,
@@ -253,6 +270,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		OnSteadyStateEvent: func(ev *segment.Event) {
 			steadyAck.Observe(ev)
 			asyncResyncAck.Observe(ev)
+			verifierRepairAck.Observe(ev)
 			steadyEventLog.Observe(ev)
 			recordTraceOrError(t, trace, "steady_state_event", traceSegmentEvent(ev))
 		},
@@ -346,16 +364,52 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	publicURL := waitForRuntimePublicURL(t, cfg, rt, run)
 	passesBeforeSteady := compaction.Count()
 
+	// Adversarial ingest-gate phase (#204): the world tells verifier-
+	// consistent lies the #197 gate must drop with the right reason
+	// while archiving benign siblings and keeping the cursor
+	// advancing. Deterministic ≥1-per-mode injection, not seed-luck.
+	// Account discipline + in-window ordering are load-bearing — see
+	// adversarial_harness_test.go's header. The op lies precede the
+	// sync divergence so the divergence resync serves a deterministic
+	// post-lie snapshot (and re-drops the lie records on the resync
+	// path — extra coverage; the counter floors are ≥). The
+	// adversarial #sync is the window's LAST frame; its account stays
+	// quiescent afterward so the permanently-lost silent record stays
+	// lost, exactly as the ledger asserts.
+	acctOp, acctSyncLie, acctVerifier := pickAdversarialAccounts(t, w, cfg)
 	steadyStartSeq := w.CurrentSeq()
 	generateN(t, w, cfg.LiveEventsSteady)
 	syncIdx := pickActiveOracleAccount(t, w, cfg)
+	require.Equalf(t, acctOp, syncIdx,
+		"adversarial op-lie account must be the sync-divergence account (both = first active): the deterministic-resync-snapshot ordering depends on it")
+	injectAdversarialLiveOpLies(t, w, cfg, acctOp)
 	_, err = w.GenerateSilentMutationThenSyncForTest(t.Context(), syncIdx)
 	require.NoError(t, err)
+	_, err = w.GenerateAdversarialSyncForTest(t.Context(), acctSyncLie, "not-a-tid")
+	require.NoErrorf(t, err, "adversarial sync lie: mode=%s seed=%d", cfg.Mode, cfg.Seed)
+	exemptWholeEventSeqs(steadyAck, w.AdversarialLedger().Entries())
+
 	targetSeq := w.CurrentSeq()
 	recordTraceOrError(t, trace, "steady_target", map[string]any{"target_seq": targetSeq})
 	steadyAck.Wait(t, cfg, targetSeq, run, oracleWaitTimeout(cfg))
 	assertFirehoseEventLogMatches(t, trace, w, steadyEventLog, steadyStartSeq, targetSeq, "steady-state")
-	assertNoPermanentCursorGap(t, steadyEventLog, steadyStartSeq, targetSeq, cfg, "steady-state")
+	assertNoPermanentCursorGapExcept(t, steadyEventLog, steadyStartSeq, targetSeq, cfg, "steady-state",
+		newAdversarialFilter(w.AdversarialLedger().Entries()))
+	// Quiesce the bubble before scraping: the whole-event sync lie
+	// produces no ack-visible row, so only drain() guarantees the
+	// consumer has processed it and settled the counters.
+	drain()
+	assertAdversarialDropCounters(t, trace, w, cfg, runtimeDebugClient, "steady-state")
+
+	// Verifier-owned rev lie (#204, layered-ownership contract): a
+	// signed-in non-TID rev is rejected by atmos's verifier pre-gate;
+	// the honest follow-up commit chain-breaks and the verifier
+	// repairs the account via async resync. Runs OUTSIDE the event-log
+	// compare window (the follow-up's seq is silently swallowed by the
+	// chain-break, like the async-divergence phase below); the repair
+	// tombstone ack + final-state Compare own the assertions.
+	verifierRepairDID, verifierRepairRev := injectVerifierRejectedCommitAndRepair(t, w, cfg, acctVerifier)
+	verifierRepairAck.Wait(t, cfg, verifierRepairDID, verifierRepairRev, run, oracleWaitTimeout(cfg))
 
 	asyncIdx := pickActiveOracleAccount(t, w, cfg)
 	_, err = w.GenerateSilentMutationThenCommitForTest(t.Context(), asyncIdx)
@@ -441,6 +495,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		"shutdown_start",
 		"runtime_exit",
 		"compaction_over_drop_check",
+		"adversarial_drop_counters",
 	)
 }
 
@@ -1224,6 +1279,21 @@ func (a *seqAck) Observe(ev *segment.Event) {
 	}
 	a.mu.Lock()
 	a.seen[ev.UpstreamRelayCursor] = struct{}{}
+	a.maybeDoneLocked()
+	a.mu.Unlock()
+}
+
+// Exempt marks seq as satisfied without an observation. For events the
+// ingest gate drops WHOLE by contract (#204 adversarial lies): the
+// consumer counts them and advances its cursor past them, but no
+// archived row ever carries their cursor, so the gap-free wait would
+// otherwise deadlock on an intentional drop.
+func (a *seqAck) Exempt(seq int64) {
+	if seq <= 0 {
+		return
+	}
+	a.mu.Lock()
+	a.seen[seq] = struct{}{}
 	a.maybeDoneLocked()
 	a.mu.Unlock()
 }

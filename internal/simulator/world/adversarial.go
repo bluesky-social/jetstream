@@ -80,16 +80,50 @@ type AdversarialEntry struct {
 }
 
 // AdversarialLedger accumulates every lie the world told, in emission
-// order. Guarded by World.mutationMu (same lock as all generation).
+// order, plus a key index so honest traffic can refuse to touch lie
+// records (see pickUntouchedRecord).
 type AdversarialLedger struct {
 	mu      sync.Mutex
 	entries []AdversarialEntry
+	keys    map[string]struct{}
 }
 
 func (l *AdversarialLedger) record(e AdversarialEntry) {
+	l.recordWithKey(e, "")
+}
+
+// recordWithKey records e and indexes rawKey (the verbatim MST key)
+// for ContainsKey. rawKey is passed separately because
+// repo.SplitMSTKey is lossy: a no-slash key like "nosslash" splits to
+// ("nosslash", ""), which would re-join as "nosslash/" and never match
+// the real MST key again.
+func (l *AdversarialLedger) recordWithKey(e AdversarialEntry, rawKey string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.entries = append(l.entries, e)
+	if rawKey == "" && (e.Collection != "" || e.Rkey != "") {
+		rawKey = e.Collection + "/" + e.Rkey
+	}
+	if rawKey != "" {
+		if l.keys == nil {
+			l.keys = make(map[string]struct{})
+		}
+		l.keys[rawKey] = struct{}{}
+	}
+}
+
+// ContainsKey reports whether any recorded lie carries the MST key
+// (collection/rkey form). Honest traffic generators consult this so
+// they never mutate a lie record: a spec-valid-but-unrepresentable
+// key (e.g. a 300-byte rkey) passes every spec check, but an honest
+// single-op commit touching it would be gate-dropped whole and its
+// cursor would never be archived — starving the oracle's gap-free
+// cursor accounting on an event the ledger never promised to drop.
+func (l *AdversarialLedger) ContainsKey(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.keys[key]
+	return ok
 }
 
 // Entries returns a copy of all recorded lies in emission order.
@@ -161,7 +195,7 @@ func (w *World) GenerateAdversarialOpForTest(ctx context.Context, idx int, badKe
 	_ = frame
 
 	badColl, badRkey := repo.SplitMSTKey(badKey)
-	w.adversarial.record(AdversarialEntry{
+	w.adversarial.recordWithKey(AdversarialEntry{
 		Source:     AdversarialSourceLive,
 		Layer:      AdversarialLayerGate,
 		Reason:     reason,
@@ -169,7 +203,7 @@ func (w *World) GenerateAdversarialOpForTest(ctx context.Context, idx int, badKe
 		DID:        string(author.DID),
 		Collection: badColl,
 		Rkey:       badRkey,
-	})
+	}, badKey)
 	return GeneratedChainOp{
 		Action:     "create",
 		Collection: sibColl,
@@ -224,27 +258,45 @@ func (w *World) InjectAdversarialRecordForBackfill(ctx context.Context, idx int,
 	}
 
 	badColl, badRkey := repo.SplitMSTKey(badKey)
-	w.adversarial.record(AdversarialEntry{
+	w.adversarial.recordWithKey(AdversarialEntry{
 		Source:     AdversarialSourceBackfill,
 		Layer:      AdversarialLayerGate,
 		Reason:     reason,
 		DID:        string(author.DID),
 		Collection: badColl,
 		Rkey:       badRkey,
-	})
+	}, badKey)
 	return nil
 }
 
-// GenerateAdversarialSyncForTest emits a #sync frame for account idx's
-// current head whose ENVELOPE rev is the caller-supplied lie (empty or
-// garbage — anything ParseTID rejects). atmos's verifier has no
-// ParseTID gate on #sync envelopes and its future-rev check skips
-// unparseable revs, so the frame reaches jetstream's convertSync where
-// validateRev drops the WHOLE event ({live, invalid_rev}).
+// GenerateAdversarialSyncForTest silently mutates account idx (no
+// #commit frame), then emits a #sync frame whose ENVELOPE rev is the
+// caller-supplied lie. The silent mutation is load-bearing: it makes
+// the sync's data CID diverge from the consumer's chain state, which
+// is the only route to the gate —
 //
-// The CAR body still carries the honest signed head commit; only the
-// envelope lies. Records the lie as WholeEvent so the oracle exempts
-// the seq from cursor-gap accounting.
+//   - rev lexically <= chain state's rev → the verifier's rev-replay
+//     check silently drops the frame (empty rev always lands here);
+//   - rev above state but data MATCHING → the verifier's no-op fast
+//     path cross-checks envelope vs inner rev → FieldMismatchError,
+//     verifier-owned;
+//   - rev above state and data DIVERGENT → the verifier resyncs
+//     (fetches the authoritative repo) and yields ops; the event —
+//     still carrying the lying envelope rev — reaches jetstream's
+//     convertSync where validateRev drops the WHOLE event
+//     ({live, invalid_rev}).
+//
+// badRev must be unparseable as a TID and lexically greater than
+// every TID (start it with a byte above 'j', e.g. "not-a-tid") so the
+// replay check cannot eat it.
+//
+// PERMANENT ARCHIVAL LOSS, by design: the verifier's resync repairs
+// its own chain state to the post-mutation head, so a later honest
+// #sync at the same rev is replay-dropped — the silently-created
+// record's only carrier was the dropped event. The record is ledgered
+// (dropped-op coordinates + whole-event seq) so the oracle excludes
+// it from ground truth and cursor-gap accounting; this is exactly the
+// documented loss semantics of refusing spec-invalid input.
 func (w *World) GenerateAdversarialSyncForTest(ctx context.Context, idx int, badRev string) ([]byte, error) {
 	w.mutationMu.Lock()
 	defer w.mutationMu.Unlock()
@@ -254,6 +306,28 @@ func (w *World) GenerateAdversarialSyncForTest(ctx context.Context, idx int, bad
 	}
 	if _, err := atmos.ParseTID(badRev); err == nil {
 		return nil, fmt.Errorf("simulator: adversarial sync rev %q is a valid TID; use GenerateSyncForTest for honest syncs", badRev)
+	}
+	state, err := w.loadState(idx)
+	if err != nil {
+		return nil, err
+	}
+	if badRev <= state.Rev {
+		return nil, fmt.Errorf("simulator: adversarial sync rev %q sorts at or below head rev %q; the verifier's replay check would silently drop it before the gate", badRev, state.Rev)
+	}
+
+	// Targeted silent create so the ledger knows the exact record the
+	// dropped sync would have materialized.
+	author, rp, _, _, err := w.loadRepoForTargetedCommit(idx)
+	if err != nil {
+		return nil, err
+	}
+	coll := chooseCreateCollection(w.rng)
+	rkey := newRkey(w.rng)
+	if _, _, err := w.applyTargetedOp(rp, idx, "create", coll, rkey); err != nil {
+		return nil, err
+	}
+	if _, err := w.commitAndPersist(author, rp); err != nil {
+		return nil, err
 	}
 
 	// The honest path stamps Time by parsing the rev; the lie is
@@ -269,6 +343,8 @@ func (w *World) GenerateAdversarialSyncForTest(ctx context.Context, idx int, bad
 	if err != nil {
 		return nil, err
 	}
+	// Whole-event entry: exempts the seq from cursor-gap accounting
+	// and drops the KindSync + replacement rows from the expected log.
 	w.adversarial.record(AdversarialEntry{
 		Source:     AdversarialSourceLive,
 		Layer:      AdversarialLayerGate,
@@ -276,6 +352,17 @@ func (w *World) GenerateAdversarialSyncForTest(ctx context.Context, idx int, bad
 		Seq:        seq,
 		DID:        did,
 		WholeEvent: true,
+	})
+	// Dropped-op entry: excludes the permanently-unarchivable silent
+	// record from final-state ground truth.
+	w.adversarial.record(AdversarialEntry{
+		Source:     AdversarialSourceLive,
+		Layer:      AdversarialLayerGate,
+		Reason:     "invalid_rev",
+		Seq:        seq,
+		DID:        did,
+		Collection: coll,
+		Rkey:       rkey,
 	})
 	return frame, nil
 }
