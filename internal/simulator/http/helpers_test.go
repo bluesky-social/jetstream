@@ -24,6 +24,9 @@ func newTestWorld(t *testing.T, accounts, initialRecords int) *world.World {
 	cfg.DataDir = filepath.Join(t.TempDir(), "simulator")
 	cfg.Accounts = accounts
 	cfg.InitialRecords = initialRecords
+	// Several tests in this package decode every pump frame as a
+	// #commit; identity frames have their own coverage in package world.
+	cfg.TrafficMix.Identity = 0
 	w, err := world.New(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
