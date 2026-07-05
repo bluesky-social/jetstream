@@ -33,6 +33,11 @@ type World struct {
 	rng        *rand.Rand
 	fanout     *fanout.Registry
 	seq        atomic.Int64
+
+	// adversarial records every deliberate lie told by the test-targeted
+	// generators in adversarial.go, for oracle reconciliation. Empty
+	// under default traffic.
+	adversarial AdversarialLedger
 }
 
 // New opens (creating if needed) the simulator pebble db at

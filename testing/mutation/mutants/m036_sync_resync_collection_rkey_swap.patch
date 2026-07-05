@@ -1,0 +1,32 @@
+mutant: m036_sync_resync_collection_rkey_swap
+target: internal/ingest/live/events.go
+failure-mode: |
+  In convertSync's resync-op loop (the path that materializes replacement
+  rows under a #sync DID tombstone), Collection is sourced from op.RKey,
+  swapping two adjacent struct fields. Models the m013/m017 copy-paste
+  class on the THIRD copy of this field mapping. Successor to the retired
+  m013: convertVerifiedOps is dead under atmos v0.2.10 (every verified
+  event carries a Commit/Sync envelope), but this loop runs on every
+  sync-divergence resync the oracle generates.
+expected-detection: |
+  The steady-state event-log multiset compare expands the #sync frame's
+  expected replacement rows from the world's repo snapshot with correct
+  (Collection, Rkey); swapped coordinates mismatch. Final-state Compare
+  (post-resync records keyed by DID/Collection/Rkey) backs it up.
+  Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index 1600512..7312b6b 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -378,7 +378,7 @@ func convertSync(evt streaming.Event, witnessedAt int64) ([]segment.Event, error
+ 			UpstreamRelayCursor: evt.Seq,
+ 			Kind:                kind,
+ 			DID:                 string(op.Repo),
+-			Collection:          string(op.Collection),
++			Collection:          string(op.RKey),
+ 			Rkey:                string(op.RKey),
+ 			Rev:                 string(op.Rev),
+ 		}

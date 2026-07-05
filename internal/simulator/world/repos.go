@@ -108,6 +108,26 @@ func (w *World) commitAndPersist(a account, rp *repo.Repo) (repoState, error) {
 	if err != nil {
 		return repoState{}, err
 	}
+	return w.commitAndPersistStaged(a, rp, b, rev)
+}
+
+// commitAndPersistWithRev is commitAndPersist with a caller-supplied
+// rev instead of the logical clock's next TID. Adversarial-only: it
+// signs the lie into the inner commit so the persisted head carries an
+// invalid (empty/garbage) rev for backfill-gate scenarios. The logical
+// clock is NOT advanced. The account's persisted state ends up with
+// the bad rev, so callers must quiesce the account afterward (no
+// further honest traffic on it) — a subsequent honest commit would
+// advertise Since = the bad rev.
+func (w *World) commitAndPersistWithRev(a account, rp *repo.Repo, rev string) (repoState, error) {
+	b := w.db.NewBatch()
+	defer func() { _ = b.Close() }()
+	return w.commitAndPersistStaged(a, rp, b, rev)
+}
+
+// commitAndPersistStaged is the shared tail: sign the commit at rev,
+// stage blocks + MST index + state into b, and commit the batch.
+func (w *World) commitAndPersistStaged(a account, rp *repo.Repo, b *pebble.Batch, rev string) (repoState, error) {
 	commit, err := commitWithRev(a, rp, rev)
 	if err != nil {
 		return repoState{}, fmt.Errorf("world: commit account %d: %w", a.Index, err)
