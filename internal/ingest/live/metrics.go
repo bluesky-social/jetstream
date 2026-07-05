@@ -72,11 +72,15 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "stream_error_frames_total",
 			Help: "Number of op=-1 error frames received from the relay, labeled by " +
-				"machine-readable code (e.g. FutureCursor, ConsumerTooSlow). The relay " +
-				"usually closes the connection after sending one; atmos reconnects with " +
-				"backoff. A steadily climbing FutureCursor count means our persisted " +
-				"cursor is ahead of the relay (cursor corruption or a relay restored " +
-				"from backup) — that loop never self-resolves and needs an operator.",
+				"machine-readable code. Codes the subscribeRepos lexicon defines " +
+				"(FutureCursor, ConsumerTooSlow) keep their name; anything else " +
+				"collapses to \"other\" (or \"missing\" when empty) because the code " +
+				"is relay-controlled input — the raw value is in the log line. The " +
+				"relay usually closes the connection after sending one; atmos " +
+				"reconnects with backoff. A steadily climbing FutureCursor count " +
+				"means our persisted cursor is ahead of the relay (cursor corruption " +
+				"or a relay restored from backup) — that loop never self-resolves " +
+				"and needs an operator.",
 		}, []string{"code"}),
 		ReplayedAccountsDrop: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -143,7 +147,24 @@ func (m *Metrics) incUnknownEvents() {
 
 func (m *Metrics) incStreamErrorFrames(code string) {
 	if m != nil {
-		m.StreamErrorFrames.WithLabelValues(code).Inc()
+		m.StreamErrorFrames.WithLabelValues(normalizeStreamErrorCode(code)).Inc()
+	}
+}
+
+// normalizeStreamErrorCode bounds the metric's label space. The code
+// arrives verbatim from the relay's op=-1 frame — untrusted wire input —
+// so passing it through would let a faulty or hostile relay mint one
+// time series per distinct string. Only the codes the
+// com.atproto.sync.subscribeRepos lexicon defines keep their name; the
+// raw value still reaches the log line in noteStreamError.
+func normalizeStreamErrorCode(code string) string {
+	switch code {
+	case "FutureCursor", "ConsumerTooSlow":
+		return code
+	case "":
+		return "missing"
+	default:
+		return "other"
 	}
 }
 

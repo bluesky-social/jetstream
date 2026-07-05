@@ -89,6 +89,11 @@ func TestNoteStreamError_ClassifiesStreamErrors(t *testing.T) {
 	c.noteStreamError(t.Context(), &streaming.StreamError{Code: "FutureCursor", Message: "cursor in the future"})
 	c.noteStreamError(t.Context(), &streaming.StreamError{Code: "FutureCursor"})
 	c.noteStreamError(t.Context(), &streaming.StreamError{Code: "ConsumerTooSlow"})
+	// The code is relay-controlled wire input: unknown values must not
+	// mint unbounded label cardinality, they collapse to "other".
+	c.noteStreamError(t.Context(), &streaming.StreamError{Code: "TotallyMadeUp-1"})
+	c.noteStreamError(t.Context(), &streaming.StreamError{Code: "TotallyMadeUp-2"})
+	c.noteStreamError(t.Context(), &streaming.StreamError{Code: ""})
 
 	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.SequenceGaps), 0,
 		"each GapError yield must count one gap")
@@ -100,4 +105,9 @@ func TestNoteStreamError_ClassifiesStreamErrors(t *testing.T) {
 		"unknown frames (direct or wrapped) land on unknown_events_total")
 	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("FutureCursor")), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("ConsumerTooSlow")), 0)
+	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("other")), 0,
+		"unrecognized relay error codes must share one label, not one series each")
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("missing")), 0)
+	require.Zero(t, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("TotallyMadeUp-1")),
+		"raw upstream code must never become a label value")
 }

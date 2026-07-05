@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/coder/websocket v1.8.15
-	github.com/jcalabro/atmos v0.2.10
+	github.com/jcalabro/atmos v0.2.11
 	github.com/jcalabro/gloom v0.1.0
 	github.com/jcalabro/gt v0.0.13
 	github.com/jcalabro/jttp v0.0.6
@@ -73,5 +73,3 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/jcalabro/atmos => /home/jcalabro/go/src/github.com/jcalabro/atmos
