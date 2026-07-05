@@ -145,7 +145,7 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 		touched[op.Path] = struct{}{}
 	}
 
-	frame, _, err := w.commitAndBroadcast(author, rp, store, prevState, wireOps)
+	frame, _, err := w.commitAndBroadcast(author, rp, store, prevState, wireOps, nil)
 	return frame, err
 }
 
@@ -155,12 +155,20 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 // frame. Callers must have applied their ops to rp (a *repo.Repo whose
 // Store is the supplied diffStore) and assembled the matching wireOps.
 //
+// omitBlocks, when non-nil, names block CIDs to exclude from the CAR
+// diff — the wire frame then carries ops referencing blocks the CAR
+// does not contain, the partial-CAR shape a non-canonical PDS emits.
+// The world's own persisted repo state is NOT affected; only the
+// broadcast frame is partial. Callers must only omit record LEAF
+// blocks: omitting the commit block or an MST node would fail the
+// verifier's inversion and model a different (malformed-CAR) fault.
+//
 // Returns the wire frame and the post-commit state. The returned state is
 // the authoritative source for the rev/CID this frame carries — callers
 // MUST use it rather than re-reading via loadState, which would race a
 // concurrent commit on the same account and report a rev that disagrees
 // with the broadcast frame.
-func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffStore, prevState repoState, wireOps []comatproto.SyncSubscribeRepos_RepoOp) ([]byte, repoState, error) {
+func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffStore, prevState repoState, wireOps []comatproto.SyncSubscribeRepos_RepoOp, omitBlocks map[cbor.CID]struct{}) ([]byte, repoState, error) {
 	// Persist the new state. commitAndPersist signs + flushes blocks
 	// + updates the MST index in one batch.
 	newState, err := w.commitAndPersist(author, rp)
@@ -184,10 +192,16 @@ func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffSto
 		if cid == newState.CommitCID {
 			continue
 		}
+		if _, omit := omitBlocks[cid]; omit {
+			continue
+		}
 		carBlocks = append(carBlocks, car.Block{CID: cid, Data: store.writes[cid]})
 	}
 	for _, cid := range sortedCIDs(store.reads) {
 		if _, written := store.writes[cid]; written {
+			continue
+		}
+		if _, omit := omitBlocks[cid]; omit {
 			continue
 		}
 		carBlocks = append(carBlocks, car.Block{CID: cid, Data: store.reads[cid]})
@@ -301,7 +315,7 @@ func (w *World) GenerateRecordOpForTest(ctx context.Context, idx int, action, co
 	// commit on this account between the broadcast and a re-read would make
 	// the descriptor's rev disagree with the rev carried in the frame we just
 	// published — silently corrupting any oracle row derived from it.
-	frame, newState, err := w.commitAndBroadcast(author, rp, store, prevState, []comatproto.SyncSubscribeRepos_RepoOp{op})
+	frame, newState, err := w.commitAndBroadcast(author, rp, store, prevState, []comatproto.SyncSubscribeRepos_RepoOp{op}, nil)
 	if err != nil {
 		return nil, GeneratedChainOp{}, err
 	}
@@ -312,6 +326,121 @@ func (w *World) GenerateRecordOpForTest(ctx context.Context, idx int, action, co
 		Rev:        newState.Rev,
 		Payload:    payload,
 	}, nil
+}
+
+// TargetedOpSpec describes one op in a GenerateMultiOpCommitForTest
+// commit. StripBlock excludes the op's record leaf block from the
+// broadcast CAR diff — the wire op still references the block's CID,
+// so the frame carries the partial-CAR shape a non-canonical PDS
+// emits (spec-permitted; the record is unarchivable from the frame
+// alone). Only valid on create/update: deletes carry no block.
+type TargetedOpSpec struct {
+	Action     string
+	Collection string
+	Rkey       string
+	StripBlock bool
+}
+
+// GenerateMultiOpCommitForTest applies several targeted ops on account
+// idx in ONE commit, optionally stripping chosen record leaf blocks
+// from the CAR diff (see TargetedOpSpec.StripBlock). Only record leaf
+// blocks are ever stripped — the commit block and every MST node stay
+// in the CAR, so the frame still verifies (atmos's inversion needs the
+// tree, not the leaves) and the fault is precisely "ops whose record
+// block is absent", not a malformed CAR. The world's own persisted
+// repo state includes every op; only the wire frame is partial.
+//
+// Specs must name distinct (collection, rkey) paths: atmos's verifier
+// rejects duplicate paths in a single commit, and applyTargetedOp's
+// create-on-existing guard would trip anyway for repeated creates.
+func (w *World) GenerateMultiOpCommitForTest(ctx context.Context, idx int, specs []TargetedOpSpec) ([]byte, []GeneratedChainOp, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if len(specs) == 0 {
+		return nil, nil, fmt.Errorf("simulator: multi-op commit needs at least one op")
+	}
+	if idx < 0 || idx >= w.cfg.Accounts {
+		return nil, nil, fmt.Errorf("simulator: chain account index %d out of range", idx)
+	}
+	deleted, err := w.isAccountDeleted(idx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if deleted {
+		return nil, nil, fmt.Errorf("simulator: chain account %d is deleted", idx)
+	}
+	author, err := w.loadAccount(idx)
+	if err != nil {
+		return nil, nil, err
+	}
+	prevState, err := w.loadState(idx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	store := &diffStore{base: &pebbleStore{db: w.db, idx: idx}}
+	tree := mst.NewTree(store)
+	if prevState.DataCID.Defined() {
+		tree = mst.LoadTree(store, prevState.DataCID)
+	}
+	rp := &repo.Repo{
+		DID:   author.DID,
+		Clock: atmos.NewTIDClock(0),
+		Store: store,
+		Tree:  tree,
+	}
+
+	wireOps := make([]comatproto.SyncSubscribeRepos_RepoOp, 0, len(specs))
+	payloads := make([][]byte, 0, len(specs))
+	seenPaths := make(map[string]struct{}, len(specs))
+	var omitBlocks map[cbor.CID]struct{}
+	for _, spec := range specs {
+		path := spec.Collection + "/" + spec.Rkey
+		if _, dup := seenPaths[path]; dup {
+			return nil, nil, fmt.Errorf("simulator: multi-op commit duplicates path %s", path)
+		}
+		seenPaths[path] = struct{}{}
+
+		op, payload, err := w.applyTargetedOp(rp, idx, spec.Action, spec.Collection, spec.Rkey)
+		if err != nil {
+			return nil, nil, err
+		}
+		if spec.StripBlock {
+			if spec.Action == "delete" {
+				return nil, nil, fmt.Errorf("simulator: cannot strip block from delete op %s", path)
+			}
+			cid, err := cbor.ParseCIDString(op.CID.Val().Link)
+			if err != nil {
+				return nil, nil, fmt.Errorf("simulator: parse stripped op CID for %s: %w", path, err)
+			}
+			if omitBlocks == nil {
+				omitBlocks = make(map[cbor.CID]struct{})
+			}
+			omitBlocks[cid] = struct{}{}
+		}
+		wireOps = append(wireOps, op)
+		payloads = append(payloads, payload)
+	}
+
+	frame, newState, err := w.commitAndBroadcast(author, rp, store, prevState, wireOps, omitBlocks)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make([]GeneratedChainOp, 0, len(specs))
+	for i, spec := range specs {
+		out = append(out, GeneratedChainOp{
+			Action:     spec.Action,
+			Collection: spec.Collection,
+			Rkey:       spec.Rkey,
+			Rev:        newState.Rev,
+			Payload:    payloads[i],
+		})
+	}
+	return frame, out, nil
 }
 
 // applyTargetedOp performs one op on rp against the exact (coll, rkey)

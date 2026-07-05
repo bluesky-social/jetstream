@@ -5,7 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -25,7 +27,11 @@ import (
 //   - swallowed frame    → a REAL sequence gap end-to-end, loss bounded
 //     to exactly the swallowed frame and self-healed by resync;
 //   - oversized frame    → client read-limit trips, reconnect, the #205
-//     replay guards keep redelivery at zero loss AND zero bloat.
+//     replay guards keep redelivery at zero loss AND zero bloat;
+//   - stripped leaf block → a partial-CAR commit (op CID on the wire,
+//     record block absent) drops exactly that op onto
+//     dropped_events_total{missing_block} while siblings archive and
+//     the commit chain stays intact.
 //
 // Every scenario ends with the final-state convergence fold, so a poison
 // frame can never silently corrupt the archive.
@@ -203,6 +209,88 @@ func TestOracle_FrameOversizedReconnects(t *testing.T) {
 		"each oversized frame must cost one reconnect")
 	require.Zero(t, testutil.ToFloat64(h.Metrics.DecodeErrors),
 		"the read-limit trip is a connection error, not a frame decode error")
+}
+
+// TestOracle_FrameStrippedLeafBlockDropsOp pins the partial-CAR
+// contract end-to-end: a #commit whose ops list references a record
+// block absent from the CAR diff (spec-permitted; the shape a
+// non-canonical PDS emits) drops EXACTLY that op onto
+// dropped_events_total{source=live,reason=missing_block} while the
+// sibling ops in the same commit archive verbatim. The stripped op is
+// a drop, not a fault: the MST nodes are all present so the verifier's
+// inversion succeeds, the chain does NOT break, no resync fires, and
+// the connection survives. The stripped record is then reconciled with
+// a delete so the final-state fold proves the archive converges to
+// world truth once the divergence the relay caused is retired.
+func TestOracle_FrameStrippedLeafBlockDropsOp(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	h := newLiveTailHarness(t, ctx)
+	w := h.World
+	_, ops, err := w.GenerateMultiOpCommitForTest(ctx, 0, []world.TargetedOpSpec{
+		{Action: "create", Collection: "app.bsky.feed.post", Rkey: "survivor1"},
+		{Action: "create", Collection: "app.bsky.feed.post", Rkey: "stripped1", StripBlock: true},
+		{Action: "create", Collection: "app.bsky.feed.post", Rkey: "survivor2"},
+	})
+	require.NoError(t, err)
+	require.Len(t, ops, 3)
+
+	acct0, err := w.LoadAccount(0)
+	require.NoError(t, err)
+	did0 := string(acct0.DID)
+
+	h.StartConsumer(t, ctx)
+
+	// Barrier: the survivors' rows land. The expected model mirrors the
+	// missing-block drop, so it expects exactly 2 rows for the commit.
+	tip := w.CurrentSeq()
+	expectedPrefix, err := ExpectedEventLogFromFirehose(w, 0, int(tip))
+	require.NoError(t, err)
+	require.Len(t, expectedPrefix, 2, "the model must drop the stripped op")
+	require.True(t, h.Recorder.waitForRowCount(ctx, 0, tip, len(expectedPrefix)),
+		"timed out waiting for the surviving sibling rows")
+
+	// Reconcile the divergence: delete the stripped record so world
+	// ground truth no longer holds a record the archive can never have.
+	// The delete op carries no block, so it archives normally — and its
+	// arrival is also the ordered-stream proof that the consumer moved
+	// past the partial commit without a chain break.
+	_, _, err = w.GenerateRecordOpForTest(ctx, 0, "delete", "app.bsky.feed.post", "stripped1")
+	require.NoError(t, err)
+	finalTip := w.CurrentSeq()
+	expected, err := ExpectedEventLogFromFirehose(w, 0, int(finalTip))
+	require.NoError(t, err)
+	require.True(t, h.Recorder.waitForRowCount(ctx, 0, finalTip, len(expected)),
+		"timed out waiting for %d expected durable rows", len(expected))
+
+	h.StopConsumer(t)
+
+	// The drop landed on the labeled counter — exactly one op, exactly
+	// missing_block, exactly the live source.
+	require.InDelta(t, 1.0,
+		testutil.ToFloat64(h.DropMetrics.Counter(ingest.DropSourceLive, ingest.DropReasonMissingBlock)), 0,
+		"the stripped op must land on dropped_events_total{source=live,reason=missing_block}")
+
+	// A partial CAR is a drop, not a wire fault: no decode error, no
+	// gap, no unknown, no reconnect — and no chain break, so no resync
+	// row ever materializes for the stripped record.
+	require.Zero(t, testutil.ToFloat64(h.Metrics.DecodeErrors))
+	require.Zero(t, testutil.ToFloat64(h.Metrics.SequenceGaps))
+	require.Zero(t, testutil.ToFloat64(h.Metrics.UnknownEvents))
+	require.Equal(t, 1, h.Faults.SubscribeReposConnections(),
+		"a partial-CAR commit must not cost the connection")
+	require.False(t, recorderHasResyncRow(h.Recorder, did0, "stripped1"),
+		"the stripped record is dropped by contract, not self-healed by resync")
+
+	// Exact multiset: survivors + the reconciling delete, nothing else —
+	// in particular no row for the stripped create.
+	observed := h.Recorder.RowsByUpstreamCursor(0, finalTip)
+	require.NoError(t, CompareEventLogMultiset(expected, observed),
+		"durable rows must be exactly the expected log with the stripped op absent")
+	assertLiveTailConverged(t, h, h.ObservedEvents(t),
+		"final state must converge to world ground truth after the stripped record is reconciled")
 }
 
 // runSwallowHealScenario drives the shape where the injected bytes

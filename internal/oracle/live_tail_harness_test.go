@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
@@ -48,8 +49,9 @@ type liveTailHarness struct {
 	URL    string
 
 	// Consumer-side fixtures, populated by StartConsumer.
-	Metrics  *live.Metrics
-	Recorder *eventLogRecorder
+	Metrics     *live.Metrics
+	DropMetrics *ingest.DropMetrics
+	Recorder    *eventLogRecorder
 
 	verifier  *atmossync.Verifier
 	dataDir   string
@@ -119,7 +121,9 @@ func newLiveTailHarness(t *testing.T, ctx context.Context) *liveTailHarness {
 
 func (h *liveTailHarness) openConsumer(t *testing.T, st *store.Store, stateStore *syncstate.PebbleStateStore) {
 	t.Helper()
-	h.Metrics = live.NewMetrics(prometheus.NewRegistry())
+	reg := prometheus.NewRegistry()
+	h.Metrics = live.NewMetrics(reg)
+	h.DropMetrics = ingest.NewDropMetrics(reg)
 	h.Recorder = newEventLogRecorder()
 	consumer, err := live.Open(live.Config{
 		SegmentsDir:    filepath.Join(h.dataDir, "segments"),
@@ -131,6 +135,7 @@ func (h *liveTailHarness) openConsumer(t *testing.T, st *store.Store, stateStore
 		Verifier:       h.verifier,
 		SyncStateStore: stateStore,
 		Metrics:        h.Metrics,
+		DropMetrics:    h.DropMetrics,
 		// Fast reconnect: fault scenarios that kill the connection
 		// (oversized frames tripping the client read limit) must not pay
 		// atmos's production 1s base delay.
