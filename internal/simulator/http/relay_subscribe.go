@@ -42,6 +42,7 @@ func newRelaySubscribeReposHandler(w *world.World, faults *FaultPlan) http.Handl
 
 		framesBeforeClose, faultArmed := faults.onSubscribeConnect()
 		replay, replayArmed := faults.onSubscribeConnectReplay()
+		inject, injectArmed := faults.onSubscribeConnectInject()
 		writer := subscribeFaultWriter{
 			conn:              conn,
 			world:             w,
@@ -50,6 +51,8 @@ func newRelaySubscribeReposHandler(w *world.World, faults *FaultPlan) http.Handl
 			faultArmed:        faultArmed,
 			replay:            replay,
 			replayArmed:       replayArmed,
+			inject:            inject,
+			injectArmed:       injectArmed,
 		}
 
 		var cursor int64
@@ -154,9 +157,25 @@ type subscribeFaultWriter struct {
 	// recent is a ring of the last replay.DuplicateLast frames written,
 	// maintained only while a duplicate-mode replay fault is armed.
 	recent [][]byte
+
+	inject      SubscribeReposInjectFault
+	injectArmed bool
+	// swallowNext is set when a fired inject fault's SwallowNext takes
+	// effect: the next real frame is suppressed from the wire instead
+	// of written.
+	swallowNext bool
 }
 
 func (w *subscribeFaultWriter) Write(ctx context.Context, frame []byte) error {
+	// A fired SwallowNext consumes this frame before it reaches the
+	// wire. It does not count toward framesWritten (nothing was
+	// written), so disconnect/replay thresholds are unaffected, and it
+	// never enters the replay ring.
+	if w.swallowNext {
+		w.swallowNext = false
+		w.faults.noteSubscribeSwallow()
+		return nil
+	}
 	if err := w.conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
 		return err
 	}
@@ -174,12 +193,35 @@ func (w *subscribeFaultWriter) Write(ctx context.Context, frame []byte) error {
 			}
 		}
 	}
+	if w.injectArmed && w.framesWritten >= w.inject.AfterFrames {
+		if err := w.fireInject(ctx); err != nil {
+			return err
+		}
+	}
 	if !w.faultArmed || w.framesWritten < w.framesBeforeClose {
 		return nil
 	}
 	w.faultArmed = false
 	w.faults.noteSubscribeDisconnect()
 	return w.conn.Close(websocket.StatusTryAgainLater, "simulated subscribeRepos disconnect")
+}
+
+// fireInject writes the fault's frame bytes verbatim onto the wire
+// (bypassing Write so they don't advance framesWritten, the disconnect
+// threshold, or the replay ring) and arms the SwallowNext suppression.
+// Fires immediately after the AfterFrames-th counted frame, so the
+// injected bytes land between that frame and the next real one — and
+// with SwallowNext set, positionally replace the next real frame.
+func (w *subscribeFaultWriter) fireInject(ctx context.Context) error {
+	w.injectArmed = false
+	if len(w.inject.Frame) > 0 {
+		if err := w.conn.Write(ctx, websocket.MessageBinary, w.inject.Frame); err != nil {
+			return err
+		}
+	}
+	w.swallowNext = w.inject.SwallowNext
+	w.faults.noteSubscribeInject()
+	return nil
 }
 
 // fireReplay re-sends previously delivered frames verbatim — duplicate
