@@ -35,7 +35,7 @@ type service struct {
 
 // newPLCHandler returns a handler matching atmos's PLC resolution
 // pattern: GET <plcURL>/<did> → JSON DID document.
-func newPLCHandler(w *world.World, pdsEndpoint string) http.Handler {
+func newPLCHandler(w *world.World, pdsEndpoint string, faults *FaultPlan) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		didStr := strings.TrimPrefix(r.URL.Path, "/")
 		did, err := atmos.ParseDID(didStr)
@@ -52,20 +52,37 @@ func newPLCHandler(w *world.World, pdsEndpoint string) http.Handler {
 			http.NotFound(rw, r)
 			return
 		}
+		mode, faulted := faults.maybePLCFault(string(did))
+		if faulted && mode == PLCFaultResolutionFailure {
+			http.Error(rw, "simulated PLC resolution failure", http.StatusServiceUnavailable)
+			return
+		}
+		handle := "at://user-" + acct.HandleSuffix() + ".test"
+		serviceEndpoint := pdsEndpoint
+		if faulted {
+			switch mode {
+			case PLCFaultMalformedHandle:
+				handle = "not an at-uri"
+			case PLCFaultMalformedPDSEndpoint:
+				serviceEndpoint = "://not-a-url"
+			}
+		}
 		doc := didDoc{
 			ID:          string(acct.DID),
-			AlsoKnownAs: []string{"at://user-" + acct.HandleSuffix() + ".test"},
+			AlsoKnownAs: []string{handle},
 			VerificationMethod: []verificationMethod{{
 				ID:                 string(acct.DID) + "#atproto",
 				Type:               "Multikey",
 				Controller:         string(acct.DID),
 				PublicKeyMultibase: acct.PubkeyMultibase(),
 			}},
-			Service: []service{{
+		}
+		if !faulted || mode != PLCFaultMissingPDSEndpoint {
+			doc.Service = []service{{
 				ID:              "#atproto_pds",
 				Type:            "AtprotoPersonalDataServer",
-				ServiceEndpoint: pdsEndpoint,
-			}},
+				ServiceEndpoint: serviceEndpoint,
+			}}
 		}
 		rw.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(rw).Encode(doc)

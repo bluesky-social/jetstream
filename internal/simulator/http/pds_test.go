@@ -3,12 +3,14 @@ package http_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	stdsync "sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/jcalabro/atmos"
@@ -155,6 +157,81 @@ func TestPDS_GetRepoFaultHandlerServesTransient503ThenCAR(t *testing.T) {
 	require.Equal(t, a.DID, rp.DID)
 	require.NotEmpty(t, commit.Sig)
 	require.Equal(t, 1, faults.GetRepoHTTPFailuresFired(string(a.DID)))
+}
+
+func TestPDS_GetRepoResponseFaultServesXRPCBodyAndRateLimitHeaders(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 5, 2)
+	a, err := w.LoadAccount(0)
+	require.NoError(t, err)
+
+	reset := time.Now().UTC().Add(10 * time.Minute).Unix()
+	faults := simhttp.NewFaultPlan()
+	faults.AddGetRepoResponseFault(string(a.DID), simhttp.GetRepoResponseFault{
+		Status:  http.StatusTooManyRequests,
+		Error:   "RateLimitExceeded",
+		Message: "slow down",
+		Headers: map[string]string{
+			"RateLimit-Limit":     "100",
+			"RateLimit-Remaining": "0",
+			"RateLimit-Reset":     fmt.Sprintf("%d", reset),
+		},
+	}, 1)
+
+	srv := httptest.NewServer(simhttp.NewHandlerWithOptions(w, "http://example.test", simhttp.HandlerOptions{
+		Faults: faults,
+	}))
+	defer srv.Close()
+
+	xc := &xrpc.Client{
+		Host:       srv.URL,
+		HTTPClient: gt.Some(http.DefaultClient),
+		Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+	}
+	sc := sync.NewClient(sync.Options{Client: xc})
+
+	body, err := sc.GetRepoStream(context.Background(), a.DID, "")
+	require.Error(t, err)
+	require.Nil(t, body)
+	var xerr *xrpc.Error
+	require.ErrorAs(t, err, &xerr)
+	require.Equal(t, http.StatusTooManyRequests, xerr.StatusCode)
+	require.Equal(t, "RateLimitExceeded", xerr.Name)
+	require.Equal(t, "slow down", xerr.Message)
+	require.NotNil(t, xerr.RateLimit)
+	require.Equal(t, time.Unix(reset, 0), xerr.RateLimit.Reset)
+	require.Equal(t, 1, faults.GetRepoResponseFaultsFired(string(a.DID)))
+}
+
+func TestPDS_GetRepoResponseFaultCanRedirect(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 5, 2)
+	a, err := w.LoadAccount(0)
+	require.NoError(t, err)
+
+	faults := simhttp.NewFaultPlan()
+	faults.AddGetRepoResponseFault(string(a.DID), simhttp.GetRepoResponseFault{
+		Status:           http.StatusFound,
+		RedirectLocation: "https://pds.example.test/xrpc/com.atproto.sync.getRepo?did=" + string(a.DID),
+	}, 1)
+
+	srv := httptest.NewServer(simhttp.NewHandlerWithOptions(w, "http://example.test", simhttp.HandlerOptions{
+		Faults: faults,
+	}))
+	defer srv.Close()
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+		srv.URL+"/xrpc/com.atproto.sync.getRepo?did="+string(a.DID), nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+	require.Equal(t, "https://pds.example.test/xrpc/com.atproto.sync.getRepo?did="+string(a.DID), resp.Header.Get("Location"))
+	require.Equal(t, 1, faults.GetRepoResponseFaultsFired(string(a.DID)))
 }
 
 // TestPDS_GetRepoFaultHandlerServesTruncatedCARThenCAR pins the simulator

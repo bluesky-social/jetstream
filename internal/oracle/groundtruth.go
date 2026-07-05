@@ -17,7 +17,11 @@ import (
 // wrongly-archived lie still fails Compare as an extra observed record.
 func GroundTruthFromWorld(w *world.World) (*Model, error) {
 	out := &Model{Accounts: make(map[string]RepoSnapshot, w.AccountCount())}
-	for idx := range w.AccountCount() {
+	indices, err := w.AccountIndicesForTest()
+	if err != nil {
+		return nil, err
+	}
+	for _, idx := range indices {
 		acct, err := w.LoadAccount(idx)
 		if err != nil {
 			return nil, err

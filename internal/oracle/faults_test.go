@@ -41,15 +41,19 @@ func TestBuildSwarmFaultPlanIsDeterministicAndBounded(t *testing.T) {
 
 	// Determinism: same seed + same world => identical schedule.
 	require.Equal(t, first.GetRepoHTTPFailures, second.GetRepoHTTPFailures)
+	require.Equal(t, first.GetRepoResponseFailures, second.GetRepoResponseFailures)
 	require.Equal(t, first.GetRepoCARTruncations, second.GetRepoCARTruncations)
 
 	// Exact swarm contract for a multi-DID world: precisely two distinct
-	// DIDs, one "hot" with 2 failures and one secondary with 1. Asserting
+	// DIDs, one "hot" with a raw failure + typed response failure and one
+	// secondary with a raw failure. Asserting
 	// the exact shape (not just ">= 2 DIDs" / "max > 1") pins the planner
 	// so a regression that, say, faulted every DID once or collapsed both
 	// onto a single DID would fail here.
-	require.Len(t, first.GetRepoHTTPFailures, 2, "swarm faults exactly two distinct DIDs")
-	require.Equal(t, 3, first.TotalGetRepoHTTPFailures(), "2 (hot) + 1 (secondary)")
+	require.Len(t, first.GetRepoHTTPFailures, 2, "swarm raw-HTTP faults exactly two distinct DIDs")
+	require.Equal(t, 2, first.TotalGetRepoHTTPFailures(), "1 (hot) + 1 (secondary)")
+	require.Len(t, first.GetRepoResponseFailures, 1, "swarm typed-response faults the hot DID once")
+	require.Equal(t, 1, first.TotalGetRepoResponseFailures())
 	require.Len(t, first.GetRepoCARTruncations, 1, "swarm faults one DID with a truncated CAR")
 	require.Equal(t, 1, first.TotalGetRepoCARTruncations())
 
@@ -58,14 +62,14 @@ func TestBuildSwarmFaultPlanIsDeterministicAndBounded(t *testing.T) {
 		counts = append(counts, c)
 	}
 	slices.Sort(counts)
-	require.Equal(t, []int{1, 2}, counts, "one hot DID (2 failures) and one secondary DID (1 failure)")
+	require.Equal(t, []int{1, 1}, counts, "one hot DID (1 raw failure) and one secondary DID (1 raw failure)")
 }
 
 // TestSwarmFaultPlanWithinRetryBudget pins the #109 invariant: the swarm
 // plan leaves every faulted DID at least one clean getRepo attempt, keyed
-// off the real backfill retry budget. The hot DID's 3 faults (2 HTTP + 1
-// CAR) sit one below the 4-attempt ceiling; the guard must accept that and
-// reject a plan that reaches/exceeds the ceiling.
+// off the real backfill retry budget. The hot DID's 3 faults (1 HTTP + 1
+// typed response + 1 CAR) sit one below the 4-attempt ceiling; the guard must
+// accept that and reject a plan that reaches/exceeds the ceiling.
 func TestSwarmFaultPlanWithinRetryBudget(t *testing.T) {
 	t.Parallel()
 
@@ -90,16 +94,16 @@ func TestSwarmFaultPlanWithinRetryBudget(t *testing.T) {
 	require.NoError(t, (*SwarmFaultPlan)(nil).CheckWithinRetryBudget())
 
 	// Pushing a DID's combined faults to the attempt ceiling must trip the
-	// guard. Find the hot DID (2 HTTP failures) and add CAR truncations
-	// until consumed == DefaultMaxRetries+1.
+	// guard. Find the hot DID (the one with the typed response failure) and
+	// add CAR truncations until consumed == DefaultMaxRetries+1.
 	var hot string
-	for did, n := range plan.GetRepoHTTPFailures {
-		if n == 2 {
-			hot = did
-		}
+	for did := range plan.GetRepoResponseFailures {
+		hot = did
+		break
 	}
-	require.NotEmpty(t, hot, "expected a hot DID with 2 HTTP failures")
-	// hot already has 2 HTTP + 1 CAR = 3; one more CAR truncation -> 4 == ceiling.
+	require.NotEmpty(t, hot, "expected a hot DID with a typed response failure")
+	// hot already has 1 HTTP + 1 typed response + 1 CAR = 3; one more CAR
+	// truncation -> 4 == ceiling.
 	plan.GetRepoCARTruncations[hot]++
 	require.Error(t, plan.CheckWithinRetryBudget(),
 		"a plan that consumes all 4 attempts for a DID must be rejected")
@@ -221,8 +225,10 @@ func TestBuildSwarmFaultPlanSingleDIDWorld(t *testing.T) {
 
 	plan, err := BuildSwarmFaultPlan(w, cfg)
 	require.NoError(t, err)
-	require.Len(t, plan.GetRepoHTTPFailures, 1, "single-DID world faults only the hot DID")
-	require.Equal(t, 2, plan.TotalGetRepoHTTPFailures())
+	require.Len(t, plan.GetRepoHTTPFailures, 1, "single-DID world raw-HTTP faults only the hot DID")
+	require.Equal(t, 1, plan.TotalGetRepoHTTPFailures())
+	require.Len(t, plan.GetRepoResponseFailures, 1, "single-DID world typed-response faults only the hot DID")
+	require.Equal(t, 1, plan.TotalGetRepoResponseFailures())
 	require.Len(t, plan.GetRepoCARTruncations, 1, "single-DID world truncates only the hot DID")
 	require.Equal(t, 1, plan.TotalGetRepoCARTruncations())
 }
@@ -241,6 +247,8 @@ func TestBuildSwarmFaultPlanNoopsWhenFaultModeNone(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, plan.GetRepoHTTPFailures)
 	require.Zero(t, plan.TotalGetRepoHTTPFailures())
+	require.Empty(t, plan.GetRepoResponseFailures)
+	require.Zero(t, plan.TotalGetRepoResponseFailures())
 	require.Empty(t, plan.GetRepoCARTruncations)
 	require.Zero(t, plan.TotalGetRepoCARTruncations())
 }

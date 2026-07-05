@@ -561,6 +561,49 @@ func TestMerge_DiscoveryWalksMultiplePages(t *testing.T) {
 	require.False(t, rs2.Active)
 }
 
+func TestMerge_DiscoveryToleratesDuplicateEntriesAndDetectsCursorLoop(t *testing.T) {
+	t.Parallel()
+
+	fix := newMergeFixture(t, nil, nil)
+	fix.seedBootstrapLastCursor(t, "pageA")
+
+	fix.relay.pages = map[string]listReposPage{
+		"pageA": {
+			Cursor: "pageB",
+			Repos: []listReposEntry{
+				{DID: "did:plc:duplicate", Active: true},
+			},
+		},
+		"pageB": {
+			Cursor: "pageB",
+			Repos: []listReposEntry{
+				{DID: "did:plc:duplicate", Active: true},
+				{DID: "did:plc:beforeloop", Active: false},
+			},
+		},
+	}
+
+	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	o, err := New(fix.cfg)
+	require.NoError(t, err)
+	err = o.runMerge(t.Context())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "cursor loop")
+
+	for _, did := range []string{"did:plc:duplicate", "did:plc:beforeloop"} {
+		val, closer, err := fix.store.Get(backfill.RepoKey(did))
+		require.NoError(t, err, "expected discovered row for %s before loop abort", did)
+		rs, err := backfill.DecodeRepoStatus(val)
+		require.NoError(t, err)
+		_ = closer.Close()
+		require.Equal(t, backfill.StatusFailed, rs.Backfill.Status)
+	}
+
+	bcur, err := backfill.LoadBootstrapLastListReposCursor(fix.store)
+	require.NoError(t, err)
+	require.Equal(t, "pageA", bcur, "failed discovery must leave bootstrap resume cursor intact")
+}
+
 // TestMerge_DiscoveryRelayErrorAborts confirms that a relay-side
 // failure during the discovery walk is surfaced as a runMerge error
 // rather than silently swallowed. The drained source data is durable

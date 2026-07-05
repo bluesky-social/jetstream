@@ -49,6 +49,7 @@ func (r *mergeRunner) runDiscovery(ctx context.Context, relayURL string, httpCli
 		}
 		sc := atmossync.NewClient(atmossync.Options{Client: xc})
 
+		seenCursors := map[string]struct{}{cursor: {}}
 		for page, perr := range sc.ListRepos(ctx, listReposPageLimit, cursor) {
 			if perr != nil {
 				return fmt.Errorf("orchestrator: merge: discovery listRepos: %w", perr)
@@ -57,6 +58,12 @@ func (r *mergeRunner) runDiscovery(ctx context.Context, relayURL string, httpCli
 				if err := r.maybeWriteDiscoveredRow(ctx, entry); err != nil {
 					return err
 				}
+			}
+			if page.NextCursor != "" {
+				if _, ok := seenCursors[page.NextCursor]; ok {
+					return fmt.Errorf("orchestrator: merge: discovery listRepos cursor loop at %q", page.NextCursor)
+				}
+				seenCursors[page.NextCursor] = struct{}{}
 			}
 		}
 		return nil

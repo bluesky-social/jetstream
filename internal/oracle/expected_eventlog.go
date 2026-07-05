@@ -114,7 +114,11 @@ func expectedSegmentEventsFromFirehoseEvent(w *world.World, evt streaming.Event)
 }
 
 func expectedSyncReplacementRows(w *world.World, did, rev string) ([]segment.Event, error) {
-	for idx := range w.AccountCount() {
+	indices, err := w.AccountIndicesForTest()
+	if err != nil {
+		return nil, err
+	}
+	for _, idx := range indices {
 		acct, err := w.LoadAccount(idx)
 		if err != nil {
 			return nil, err

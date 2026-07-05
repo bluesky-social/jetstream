@@ -2,8 +2,11 @@ package http_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
@@ -35,6 +38,35 @@ func TestListRepos_PagesAcrossAllAccounts(t *testing.T) {
 		}
 	}
 	require.Equal(t, total, len(seen))
+}
+
+func TestListReposFaults_ModelDuplicateLoopAndShrinkPages(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 25, 1)
+	faults := simhttp.NewFaultPlan()
+	faults.AddListReposFault("10", simhttp.ListReposFaultDuplicatePreviousPage, 1)
+	faults.AddListReposFault("20", simhttp.ListReposFaultCursorLoop, 1)
+	faults.AddListReposFault("0", simhttp.ListReposFaultShrinkPage, 1)
+
+	srv := httptest.NewServer(simhttp.NewHandlerWithOptions(w, "", simhttp.HandlerOptions{
+		Faults: faults,
+	}))
+	defer srv.Close()
+
+	first := getListReposRaw(t, srv.URL, "0", 10)
+	require.Len(t, first.Repos, 5, "shrink-page fault halves the requested page")
+	require.Equal(t, "5", first.Cursor)
+	require.Equal(t, 1, faults.ListReposFaultsFired("0"))
+
+	page10 := getListReposRaw(t, srv.URL, "10", 10)
+	require.Len(t, page10.Repos, 10)
+	require.Equal(t, "20", page10.Cursor, "duplicate-previous-page still advances the requested cursor")
+	require.Equal(t, 1, faults.ListReposFaultsFired("10"))
+
+	page20 := getListReposRaw(t, srv.URL, "20", 10)
+	require.Len(t, page20.Repos, 5)
+	require.Equal(t, "20", page20.Cursor, "cursor-loop fault repeats the cursor after serving the page")
+	require.Equal(t, 1, faults.ListReposFaultsFired("20"))
 }
 
 func TestListRepos_GetRepoVerifiesCommitSignature(t *testing.T) {
@@ -82,4 +114,36 @@ func TestListRepos_GetRepoVerifiesCommitSignature(t *testing.T) {
 	pub, err := id.PublicKey()
 	require.NoError(t, err)
 	require.NoError(t, commit.VerifySignature(pub))
+}
+
+type rawListReposPage struct {
+	Cursor string `json:"cursor,omitempty"`
+	Repos  []struct {
+		DID    string `json:"did"`
+		Head   string `json:"head"`
+		Rev    string `json:"rev"`
+		Active bool   `json:"active"`
+	} `json:"repos"`
+}
+
+func getListReposRaw(t *testing.T, baseURL, cursor string, limit int) rawListReposPage {
+	t.Helper()
+	u, err := url.Parse(baseURL + "/xrpc/com.atproto.sync.listRepos")
+	require.NoError(t, err)
+	q := u.Query()
+	q.Set("limit", fmt.Sprintf("%d", limit))
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, u.String(), nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var out rawListReposPage
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	return out
 }

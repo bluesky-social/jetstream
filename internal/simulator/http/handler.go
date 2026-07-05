@@ -55,7 +55,7 @@ type HandlerOptions struct {
 func NewHandlerWithOptions(w *world.World, publicURL string, opts HandlerOptions) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /xrpc/com.atproto.sync.getRepo", newPDSGetRepoHandler(w, opts.Faults, opts.OnGetRepoServed))
-	mux.Handle("GET /xrpc/com.atproto.sync.listRepos", newRelayListReposHandler(w))
+	mux.Handle("GET /xrpc/com.atproto.sync.listRepos", newRelayListReposHandler(w, opts.Faults))
 	mux.Handle("GET /xrpc/com.atproto.sync.subscribeRepos", newRelaySubscribeReposHandler(w, opts.Faults))
 	if opts.EnableFirehoseTip {
 		mux.Handle("GET "+oracleFirehoseTipURLPath, newFirehoseTipHandler(w))
@@ -64,7 +64,7 @@ func NewHandlerWithOptions(w *world.World, publicURL string, opts HandlerOptions
 	// PLC's `/<did>` doesn't fit Go ServeMux's path syntax cleanly
 	// because `did:` contains a colon. Pre-route any request whose
 	// first path segment starts with `did:` through the PLC handler.
-	plc := newPLCHandler(w, strings.TrimRight(publicURL, "/"))
+	plc := newPLCHandler(w, strings.TrimRight(publicURL, "/"), opts.Faults)
 	root := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/did:") {
 			plc.ServeHTTP(rw, r)

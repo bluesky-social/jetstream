@@ -408,7 +408,7 @@ func (w *World) applyTargetedOp(rp *repo.Repo, authorIdx int, action, coll, rkey
 // *repo.Repo over a diffStore so the commit's touched blocks can be
 // packaged into a CAR diff. Caller must hold mutationMu.
 func (w *World) loadRepoForTargetedCommit(idx int) (account, *repo.Repo, *diffStore, repoState, error) {
-	if idx < 0 || idx >= w.cfg.Accounts {
+	if idx < 0 {
 		return account{}, nil, nil, repoState{}, fmt.Errorf("simulator: account index %d out of range", idx)
 	}
 	deleted, err := w.isAccountDeleted(idx)
