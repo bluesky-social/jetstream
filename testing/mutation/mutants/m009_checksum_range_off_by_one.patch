@@ -2,14 +2,22 @@ mutant: m009_checksum_range_off_by_one
 target: segment/header.go
 failure-mode: |
   The header/footer checksum is computed over headerBytes[13:] instead of
-  [12:], excluding one byte from the digest. Sealed files then fail checksum
-  verification on reopen despite being byte-intact. Models an off-by-one in
-  a checksum byte range.
+  [12:], excluding one byte from the digest. The shift is SYMMETRIC: seal
+  and Reader.Open share xxh3HeaderFooter, so every file the mutated build
+  writes verifies cleanly under the mutated reader. Nothing inside the
+  process ever disagrees — but every segment written is checksum-corrupt
+  for any correct build that later opens it (rolling upgrade, downgrade,
+  external tooling). Models an off-by-one in a checksum byte range.
 expected-detection: |
-  Reader.Open should reject the segment on checksum mismatch, so
-  ObserveSegments errors and the harness fails. Default tier.
-expected-tier: default
-tiers: default,stress
+  Corpus tier. The oracle's write-then-read-back loop structurally cannot
+  see a symmetric shift (SURVIVED baseline, analyzed in RESULTS.md and
+  #32). internal/corpus breaks the symmetry with committed facts from a
+  known-good build: TestCorpusSegmentGolden fails on the write side (the
+  sealed bytes differ from the golden file) AND on the read side (the
+  committed golden's stored checksum no longer matches the mutated
+  reader's digest).
+expected-tier: corpus
+tiers: default,stress,corpus
 
 diff --git a/segment/header.go b/segment/header.go
 index b3e6cee..5f5ece0 100644

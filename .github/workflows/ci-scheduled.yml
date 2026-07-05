@@ -102,7 +102,7 @@ jobs:
           github-token: ""
 
       - name: Fuzz
-        run: ./dev.sh --command just fuzz 60s
+        run: ./dev.sh --command just fuzz 300s
 
       - name: Upload fuzz artifacts
         if: failure()

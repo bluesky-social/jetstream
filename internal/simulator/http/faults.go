@@ -15,6 +15,26 @@ type FaultPlan struct {
 	subscribeRepos *subscribeReposFaults
 }
 
+// SubscribeReposReplayFault schedules one seq-replay fault on a
+// subscribeRepos connection: after AfterFrames frames have been written,
+// the relay re-sends previously delivered frames verbatim — duplicate
+// and regressed seqs, the wire shape of a relay restored from backup.
+// Exactly one of DuplicateLast / RegressToSeq selects the mode:
+//
+//   - DuplicateLast > 0: re-send the last N frames this connection
+//     already delivered (a short duplicate burst).
+//   - RegressToSeq > 0: re-send every retained frame with seq >
+//     RegressToSeq up to the tip at fire time (a whole replayed window).
+//
+// Re-sent frames do not count toward AfterFrames or the disconnect
+// schedule's thresholds, so replay and disconnect faults compose
+// deterministically on one connection.
+type SubscribeReposReplayFault struct {
+	AfterFrames   int
+	DuplicateLast int
+	RegressToSeq  int64
+}
+
 type getRepoFaults struct {
 	mu            sync.Mutex
 	httpByDID     map[string]httpFaultState
@@ -38,6 +58,15 @@ type subscribeReposFaults struct {
 	nextConn    int
 	connections int
 	disconnects int
+
+	replaySchedule []SubscribeReposReplayFault
+	replayNextConn int
+	replaysFired   int
+	// replayedFrames is the total count of frames re-sent by fired
+	// replay faults, across all connections. The oracle uses it to
+	// bound storage bloat: re-archived rows can never exceed the rows
+	// that were re-delivered.
+	replayedFrames int
 }
 
 // NewFaultPlan constructs an empty fault plan.
@@ -168,6 +197,72 @@ func (p *FaultPlan) maybeGetRepoCARTruncation(did string) bool {
 	st.fired++
 	p.getRepo.truncateByDID[did] = st
 	return true
+}
+
+// SetSubscribeReposReplaySchedule installs per-connection seq-replay
+// faults. Each accepted subscribeRepos connection consumes at most one
+// entry; connections after the schedule is exhausted serve normally. A
+// zero-valued entry (neither DuplicateLast nor RegressToSeq set) arms
+// nothing for that connection.
+func (p *FaultPlan) SetSubscribeReposReplaySchedule(faults []SubscribeReposReplayFault) {
+	if p == nil || p.subscribeRepos == nil {
+		return
+	}
+	p.subscribeRepos.mu.Lock()
+	defer p.subscribeRepos.mu.Unlock()
+	p.subscribeRepos.replaySchedule = append(p.subscribeRepos.replaySchedule[:0], faults...)
+	p.subscribeRepos.replayNextConn = 0
+	p.subscribeRepos.replaysFired = 0
+	p.subscribeRepos.replayedFrames = 0
+}
+
+// SubscribeReposReplaysFired reports how many scheduled seq-replay faults
+// have fired.
+func (p *FaultPlan) SubscribeReposReplaysFired() int {
+	if p == nil || p.subscribeRepos == nil {
+		return 0
+	}
+	p.subscribeRepos.mu.Lock()
+	defer p.subscribeRepos.mu.Unlock()
+	return p.subscribeRepos.replaysFired
+}
+
+// SubscribeReposReplayedFrames reports the total number of frames re-sent
+// by fired seq-replay faults. This is the oracle's storage-bloat bound:
+// duplicate rows in the archive cannot exceed the rows expanded from
+// these re-delivered frames.
+func (p *FaultPlan) SubscribeReposReplayedFrames() int {
+	if p == nil || p.subscribeRepos == nil {
+		return 0
+	}
+	p.subscribeRepos.mu.Lock()
+	defer p.subscribeRepos.mu.Unlock()
+	return p.subscribeRepos.replayedFrames
+}
+
+func (p *FaultPlan) onSubscribeConnectReplay() (SubscribeReposReplayFault, bool) {
+	if p == nil || p.subscribeRepos == nil {
+		return SubscribeReposReplayFault{}, false
+	}
+	p.subscribeRepos.mu.Lock()
+	defer p.subscribeRepos.mu.Unlock()
+	if p.subscribeRepos.replayNextConn >= len(p.subscribeRepos.replaySchedule) {
+		return SubscribeReposReplayFault{}, false
+	}
+	f := p.subscribeRepos.replaySchedule[p.subscribeRepos.replayNextConn]
+	p.subscribeRepos.replayNextConn++
+	armed := f.DuplicateLast > 0 || f.RegressToSeq > 0
+	return f, armed
+}
+
+func (p *FaultPlan) noteSubscribeReplay(frames int) {
+	if p == nil || p.subscribeRepos == nil {
+		return
+	}
+	p.subscribeRepos.mu.Lock()
+	p.subscribeRepos.replaysFired++
+	p.subscribeRepos.replayedFrames += frames
+	p.subscribeRepos.mu.Unlock()
 }
 
 func (p *FaultPlan) onSubscribeConnect() (int, bool) {

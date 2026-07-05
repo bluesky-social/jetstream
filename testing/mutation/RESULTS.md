@@ -1164,12 +1164,120 @@ owning issues: m003 → #209 (merge cursor no-advance), m009/m015 → #208
 (footer/checksum blind spots), m013/m014 → #204 (verified-ops path is dead
 under polite simulator traffic — exactly the gap the #204 adversarial modes
 will close, now unblocked by this gate).
+## Campaign 2026-07-04 — `replay` tier; m035 banked (#205, #231)
+
+Original campaign at `c1dbc39` (branch `relay-seq-replay-205`, pre-rebase):
+**28 mutants: 23 KILLED, 5 SURVIVED, zero STALE/BUILD-BROKEN.** The branch was
+subsequently rebased onto main at `3921e5f` (post-#228/#229, which added m034
+and the #197 gate) and the full campaign re-run at the rebased head `5d6fc9e`:
+**29 mutants: 24 KILLED, 5 SURVIVED, zero STALE/BUILD-BROKEN** — m034 and m035
+both KILLED side by side, every prior disposition reproduced, gate PASS.
+`baseline.json` re-banked from that run.
+
+**New `replay` tier; m035 banked KILLED@replay.** #205 made relay seq
+duplicates and regressions live: atmos's gap check is forward-only
+(`seq > last+1`), so a relay that re-delivers frames — a duplicate burst or a
+whole window replayed by a relay restored from backup — passes silently. The
+simulator gained `SubscribeReposReplayFault` schedules (duplicate-last-N,
+regress-to-K) that re-send previously delivered frame bytes verbatim, with
+fired/replayed-frame counters for anti-vacuity.
+
+Building the oracle scenario found a production bug before the assertions were
+even written (#231): the verifier rev-replay-drops duplicate #commit/#sync, but
+replayed **#account** events flowed through and re-archived at fresh jetstream
+seqs. A replayed account-delete landing above a later reactivate + recreate
+made every fold — oracle reconstruct, the tombstone set, compaction — treat
+the account as deleted after the recreate: permanent erasure of live records
+from folded state and, post-compaction, from the archive. Fixed with a consumer
+guard dropping #account events at/below the DID's APPLIED hosting-state seq
+(promoted/pebble only, never pending — pending state can run ahead under
+pipelined verification and would drop legitimate intermediates), metric
+`replayed_account_events_dropped_total`.
+
+The replay contract is therefore exact, not merely bounded: durable rows must
+equal the once-per-frame expansion of the world's firehose
+(`CompareEventLogMultiset` — zero bloat, zero loss), final state must converge,
+and structural invariants must hold. `TestOracle_RelaySeqDuplicates` /
+`TestOracle_RelaySeqRegression` (internal/oracle/replay_fault_test.go, <1s)
+drive the REAL live consumer — real websocket, real atmos pipeline,
+pebble-backed verifier state — against the simulator relay over a
+delete→reactivate→recreate window, with anti-vacuity on the fault firing, the
+exact replayed-frame count, and the guard's drop counter.
+
+m035 (`m035_account_replay_guard_inverted`) inverts the guard's kind check so
+it never examines an #account event — the exact pre-#231 production state.
+Red-first verified: with the guard disabled both scenarios fail on final-state
+divergence (`oracle: missing ... recreated1`); clean tree green. KILLED@replay.
+
+Also in this change, riding along per the issue body: relay sequence gaps split
+out of `decode_errors_total` into `sequence_gaps_total` +
+`sequence_gap_missed_seqs_total`, so relay data loss is
+operator-distinguishable from garbage frames.
+
+### Survivors (5) — unchanged, all documented escapes with owning issues
+
+m003 (#209), m009 (#208), m013/m014 (#204), m015 (#208). No disposition
+regressed vs the `075fafd` baseline; the only change is m035 added KILLED.
+
+
+## Campaign 2026-07-04 — `corpus` tier; m009 SURVIVED→KILLED (#32)
+
+Targeted run at `af7c00a` (`testing/mutation/run.sh m009`):
+**m009 KILLED@corpus** (default and stress tiers still pass it, as the
+structural analysis predicts — the kill comes from the new tier).
+Banked into the `d08ed8b` baseline for m009 only; no other disposition
+touched, leaving 24 KILLED / 4 SURVIVED.
+
+**New `corpus` tier; the symmetric-checksum blind spot is closed.** m009
+(`xxh3HeaderFooter` computing over `headerBytes[13:]` instead of `[12:]`) was
+the catalog's canonical structural escape: seal and `Reader.Open` share the
+function, so the mutated writer and mutated reader always agree, and every
+write-then-read-back check in the tree — the whole oracle included — passes.
+The 2026-06-16 analysis dispositioned it "accepted blind spot — only an
+independent checksum oracle (or a committed golden segment with a known-good
+checksum) would catch it." #32 built exactly that.
+
+The tier runs `internal/corpus` (<150ms, offline): real network bytes with
+expected outputs pinned by foreign implementations at capture time
+(production Jetstream v1 JSON for a contiguous relay firehose window,
+indigo/goat for a production getRepo CAR), plus
+`testdata/golden_corpus_segment.jss` — a sealed segment produced from the
+real CAR's records by a known-good build. `TestCorpusSegmentGolden` kills
+m009 twice over:
+
+- write side: the mutated seal produces a different checksum in the fixed
+  header, so the byte-exact compare against the committed golden fails;
+- read side: `segment.Open` on the COMMITTED file recomputes the digest with
+  the mutated range and rejects the stored (correct) checksum.
+
+Either alone suffices; together they also pin the failure a symmetric shift
+actually causes in production — every segment the mutated build writes is
+checksum-corrupt for any correct build that later opens it (rolling upgrade,
+downgrade, `inspect-segment`, external tooling).
+
+Red-first verified during development: the golden test failed under the m009
+patch (header bytes `41 b6 8f 2c...` vs golden `dc ca c2 5d...`) before the
+tier was wired. m009's header now declares `expected-tier: corpus` with
+`tiers: default,stress,corpus` — default/stress stay as documentation that
+the closed loop still cannot see it.
+
+Beyond m009, the tier's firehose replay pins the full live path (raw relay
+CBOR frames → atmos decode → offline Sync 1.1 signature verification →
+ConvertEvent → ingest → v1 JSON vs production Jetstream's own output,
+field-for-field), and the CAR test pins atmos's MST walk + CID derivation
+against indigo's on the same real repo — coverage for the broader
+atmos-closed-loop class (`specs/oracle.md` "Real-Data Corpus Tier"), not just
+the checksum instance. Fixture provenance and the re-capture procedure:
+`internal/corpus/testdata/README.md`; capture-tool source preserved on #32.
+
+Remaining survivors: m003 (#209), m013/m014 (#204), m015 (#208).
 
 ## Campaign 2026-07-04 — #204 adversarial ingest traffic; m013/m014 retired, five gate mutants added
 
-Full campaign at `a4e96c5` (branch adversarial-ingest-traffic-204). **31
-mutants: 28 KILLED, 3 SURVIVED, zero STALE/BUILD-BROKEN.** Baseline
-regenerated and banked.
+Full campaign at `a4e96c5` (branch adversarial-ingest-traffic-204, forked
+from main before the `replay`/`corpus` sections above landed). **31 mutants:
+28 KILLED, 3 SURVIVED, zero STALE/BUILD-BROKEN.** Baseline regenerated and
+banked.
 
 **Catalog changes:**
 
@@ -1206,10 +1314,17 @@ gate-enforced. The five new kills all depend on machinery this branch adds
 a regression in any of it now fails the scheduled gate, not just the
 lifecycle test.
 
-Survivors: m003 → #209 (merge cursor no-advance), m009/m015 → #208
-(footer/checksum blind spots). NOTE: this branch forked before the #32
-corpus tier merged to main (m009 KILLED@corpus there) and before #205's
-m035; the baseline will need the same union-merge resolution as the #230/#232
-merges when this PR lands (keep m009 KILLED@corpus + m035 KILLED@replay from
-main, add m036–m040 + the m013/m014 retirement from this branch, and re-run
-the campaign at the merge head to re-bank).
+**Merge resolution 2026-07-05.** Merging origin/main (post-#230 corpus +
+#232 replay) into this branch produced the predicted baseline conflict;
+resolved as the union: m009 stays KILLED@corpus and m035 KILLED@replay from
+main's bank, m013/m014 removed and m036–m040 KILLED@default from this
+branch's bank. The merged baseline is **32 mutants, 30 KILLED / 2
+SURVIVED** (m003 → #209, m015 → #208 — m009 no longer survives). The
+`commit` field records `a4e96c5` (this branch's campaign head); per the
+#228 precedent that field is provenance-only — the gate diffs dispositions.
+The full campaign was re-run at the merge head to verify the union bank
+(see the 2026-07-05 section below).
+
+Survivors at this branch's own run: m003 → #209 (merge cursor no-advance),
+m009/m015 → #208 (footer/checksum blind spots; m009's corpus kill lives on
+main and joins at the merge).

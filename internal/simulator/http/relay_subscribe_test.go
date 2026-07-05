@@ -150,6 +150,143 @@ func TestSubscribeRepos_DisconnectFaultClosesAfterThresholdAndReconnectResumes(t
 	require.Equal(t, 1, faults.SubscribeReposDisconnects())
 }
 
+// TestSubscribeRepos_ReplayFaultDuplicatesLastFrames pins duplicate-N
+// mode: after AfterFrames frames, the relay re-sends the last N frames
+// verbatim — same bytes, same seqs — modeling a relay double-delivery.
+func TestSubscribeRepos_ReplayFaultDuplicatesLastFrames(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 5, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for range 3 {
+		_, err := w.GenerateOneForTest(ctx)
+		require.NoError(t, err)
+	}
+
+	faults := simhttp.NewFaultPlan()
+	faults.SetSubscribeReposReplaySchedule([]simhttp.SubscribeReposReplayFault{
+		{AfterFrames: 3, DuplicateLast: 2},
+	})
+
+	srv := httptest.NewServer(nil)
+	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, srv.URL, simhttp.HandlerOptions{
+		Faults: faults,
+	})
+	defer srv.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http") + "/xrpc/com.atproto.sync.subscribeRepos"
+	conn, resp, err := websocket.Dial(ctx, wsBase+"?cursor=0", nil)
+	require.NoError(t, err)
+	closeResp(resp)
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	wantSeqs := []int64{1, 2, 3, 2, 3}
+	for i, want := range wantSeqs {
+		_, got, rerr := conn.Read(ctx)
+		require.NoError(t, rerr, "frame %d", i)
+		require.Equal(t, want, subscribeCommitSeq(t, got), "frame %d", i)
+	}
+	require.Equal(t, 1, faults.SubscribeReposReplaysFired())
+	require.Equal(t, 2, faults.SubscribeReposReplayedFrames())
+}
+
+// TestSubscribeRepos_ReplayFaultRegressesToSeq pins regress-to-K mode:
+// after AfterFrames frames, the relay re-sends the whole retained window
+// above K — the wire shape of a relay restored from a backup at seq K.
+func TestSubscribeRepos_ReplayFaultRegressesToSeq(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 5, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for range 4 {
+		_, err := w.GenerateOneForTest(ctx)
+		require.NoError(t, err)
+	}
+
+	faults := simhttp.NewFaultPlan()
+	faults.SetSubscribeReposReplaySchedule([]simhttp.SubscribeReposReplayFault{
+		{AfterFrames: 4, RegressToSeq: 1},
+	})
+
+	srv := httptest.NewServer(nil)
+	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, srv.URL, simhttp.HandlerOptions{
+		Faults: faults,
+	})
+	defer srv.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http") + "/xrpc/com.atproto.sync.subscribeRepos"
+	conn, resp, err := websocket.Dial(ctx, wsBase+"?cursor=0", nil)
+	require.NoError(t, err)
+	closeResp(resp)
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	wantSeqs := []int64{1, 2, 3, 4, 2, 3, 4}
+	for i, want := range wantSeqs {
+		_, got, rerr := conn.Read(ctx)
+		require.NoError(t, rerr, "frame %d", i)
+		require.Equal(t, want, subscribeCommitSeq(t, got), "frame %d", i)
+	}
+	require.Equal(t, 1, faults.SubscribeReposReplaysFired())
+	require.Equal(t, 3, faults.SubscribeReposReplayedFrames())
+
+	// Live traffic after the replayed window resumes at the true tip.
+	_, err = w.GenerateOneForTest(ctx)
+	require.NoError(t, err)
+	_, got, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(5), subscribeCommitSeq(t, got),
+		"post-replay live traffic must resume at the real tip seq")
+}
+
+// TestSubscribeRepos_ReplayAndDisconnectFaultsCompose pins that a replay
+// fault and a disconnect fault armed on the same connection fire in a
+// deterministic order: replayed frames do not count toward the
+// disconnect threshold.
+func TestSubscribeRepos_ReplayAndDisconnectFaultsCompose(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 5, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for range 3 {
+		_, err := w.GenerateOneForTest(ctx)
+		require.NoError(t, err)
+	}
+
+	faults := simhttp.NewFaultPlan()
+	faults.SetSubscribeReposReplaySchedule([]simhttp.SubscribeReposReplayFault{
+		{AfterFrames: 2, DuplicateLast: 1},
+	})
+	faults.SetSubscribeReposDisconnectSchedule([]int{3})
+
+	srv := httptest.NewServer(nil)
+	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, srv.URL, simhttp.HandlerOptions{
+		Faults: faults,
+	})
+	defer srv.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http") + "/xrpc/com.atproto.sync.subscribeRepos"
+	conn, resp, err := websocket.Dial(ctx, wsBase+"?cursor=0", nil)
+	require.NoError(t, err)
+	closeResp(resp)
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	// Writes 1,2 then the replay fires (dup of 2); write 3 crosses the
+	// disconnect threshold (replayed frame did not count).
+	wantSeqs := []int64{1, 2, 2, 3}
+	for i, want := range wantSeqs {
+		_, got, rerr := conn.Read(ctx)
+		require.NoError(t, rerr, "frame %d", i)
+		require.Equal(t, want, subscribeCommitSeq(t, got), "frame %d", i)
+	}
+	_, _, err = conn.Read(ctx)
+	require.Error(t, err, "disconnect fault must close after the third counted frame")
+	require.Equal(t, 1, faults.SubscribeReposReplaysFired())
+	require.Equal(t, 1, faults.SubscribeReposDisconnects())
+}
+
 func subscribeCommitSeq(t *testing.T, frame []byte) int64 {
 	t.Helper()
 
