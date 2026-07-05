@@ -385,9 +385,11 @@ The adversarial ingest-gate modes (#204) set the tier's conventions:
 - **Every lie is ledgered.** `world.AdversarialLedger` records each lie at
   generation time; the oracle filters expected event logs, final-state ground
   truth, and cursor-gap accounting through it (one-directional-safe: a
-  wrongly-archived lie still fails compares as an extra), and asserts
-  per-(source, reason) drop-counter floors — the anti-vacuity proof that
-  every scheduled mode fired.
+  wrongly-archived lie still fails compares as an extra). Anti-vacuity is
+  per-layer: gate-owned lies assert per-(source, reason) drop-counter floors
+  (`ExpectedDropFloors` skips verifier-layer entries — they never reach the
+  gate counter); verifier-owned lies prove they fired through their own
+  observable (the awaited resync-repair tombstone).
 - **Honest traffic must not touch lie records** (`pickUntouchedRecord` skips
   ledgered keys): an honest mutation of an unrepresentable-but-spec-valid
   record would be gate-dropped as an unledgered event and corrupt the

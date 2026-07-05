@@ -329,6 +329,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		// exit on their own; without this the bubble fn returns with those
 		// goroutines alive and synctest panics "blocked goroutines remain".
 		obsClient.CloseIdleConnections()
+		runtimeDebugClient.CloseIdleConnections()
 		simClient.CloseIdleConnections()
 		// Tear down the in-process simulator server and drain its goroutine:
 		// every bubble goroutine must exit before the bubble function returns.

@@ -17,7 +17,7 @@ and/or the spike (see §Spike).
 | Adversarial input | Live path owner | Observable | Backfill path owner | Observable |
 |---|---|---|---|---|
 | non-TID rev (#commit) | verifier `VerifyCommit` (`InvalidRevError`, pre-lock, policy-bypassing) | consumer "stream error" branch → `incDecodeErrors` + `verifier_failures` | atmos `repo/load.go` rejects non-empty invalid rev at CAR load → repo FAILS | failed-repo diagnostics |
-| empty rev | verifier for #commit envelope (as above); the #sync-envelope case is gate-owned (see the garbage-#sync row) | — | GATE-OWNED: `repo/load.go` skips validation when rev is empty; jetstream `handler.go:105` ParseTID fails → repo FAILS + `{backfill,invalid_rev}` | shared counter |
+| empty rev | verifier for #commit envelope (as above); the #sync-envelope case never reaches the gate in practice — an empty rev sorts at/below any established head rev, so the verifier's replay check silently drops the frame (the shipped `GenerateAdversarialSyncForTest` rejects empty revs for exactly this reason; only the no-prior-chain-state corner could differ, and it is not exercised) | — | GATE-OWNED: `repo/load.go` skips validation when rev is empty; jetstream `handler.go:105` ParseTID fails → repo FAILS + `{backfill,invalid_rev}` | shared counter |
 | regressing rev (#commit) | verifier chain check → `RevRegressionError` → PolicyResync silently repairs (resync) | no gate counter; archive converges via `KindCreateResync` rows | n/a (backfill loads one head) | — |
 | future rev >5m (#commit, #sync) | verifier `checkFutureRev` → `FutureRevError`, event rejected pre-gate | `verifier_failures` + decode-error yield | n/a — backfill has no future-rev check; a future-but-valid TID archives normally | none (documented) |
 | garbage rev on #sync envelope | GATE-OWNED: reaches `convertSync`'s `validateRev` → `{live,invalid_rev}` whole-event drop (see note 3) | shared counter | n/a | — |
@@ -100,7 +100,9 @@ Generator design (follows `GenerateRecordOpForTest` targeted-op precedent,
   via a rev-override variant of commitAndPersist (empty/garbage/regressing/
   future), Time from logical clock.
 - `GenerateAdversarialSyncForTest(ctx, idx, rev)` — #sync frame with a
-  garbage/empty envelope rev (gate-owned live invalid_rev case).
+  garbage envelope rev (gate-owned live invalid_rev case). Empty revs are
+  rejected by the generator: they sort below the head rev and would be
+  replay-dropped by the verifier before reaching the gate.
 - Backfill lies ride bootstrap: adversarial keys inserted into an account's
   MST pre-bootstrap (before jetstream's listRepos/getRepo pass) so the
   normal backfill walk hits `splitRecordPath`.
