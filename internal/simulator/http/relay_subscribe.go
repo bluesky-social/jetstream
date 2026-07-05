@@ -180,6 +180,15 @@ func (w *subscribeFaultWriter) Write(ctx context.Context, frame []byte) error {
 		return err
 	}
 	w.framesWritten++
+	// Inject fires before replay so the injected bytes keep their
+	// documented position immediately after the AfterFrames-th counted
+	// frame even when both faults trip on the same frame; the replay
+	// burst then follows the injection.
+	if w.injectArmed && w.framesWritten >= w.inject.AfterFrames {
+		if err := w.fireInject(ctx); err != nil {
+			return err
+		}
+	}
 	if w.replayArmed {
 		if w.replay.DuplicateLast > 0 {
 			w.recent = append(w.recent, frame)
@@ -191,11 +200,6 @@ func (w *subscribeFaultWriter) Write(ctx context.Context, frame []byte) error {
 			if err := w.fireReplay(ctx); err != nil {
 				return err
 			}
-		}
-	}
-	if w.injectArmed && w.framesWritten >= w.inject.AfterFrames {
-		if err := w.fireInject(ctx); err != nil {
-			return err
 		}
 	}
 	if !w.faultArmed || w.framesWritten < w.framesBeforeClose {
@@ -212,6 +216,9 @@ func (w *subscribeFaultWriter) Write(ctx context.Context, frame []byte) error {
 // Fires immediately after the AfterFrames-th counted frame, so the
 // injected bytes land between that frame and the next real one — and
 // with SwallowNext set, positionally replace the next real frame.
+// When a replay fault trips on the same counted frame, the injection
+// still fires first (Write checks inject before replay), so this
+// positional promise holds and the replay burst follows the poison.
 // The fire is noted BEFORE the write: an injected frame can kill the
 // connection mid-write (e.g. an oversized frame tripping the client's
 // read limit closes the socket under the server's in-flight write), and

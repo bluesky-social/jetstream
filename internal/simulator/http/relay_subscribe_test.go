@@ -491,6 +491,65 @@ func TestSubscribeRepos_InjectAndDisconnectFaultsCompose(t *testing.T) {
 	require.Equal(t, 1, faults.SubscribeReposDisconnects())
 }
 
+// TestSubscribeRepos_InjectAndReplayFaultsCompose pins the order when
+// an inject fault and a replay fault trip on the same counted frame:
+// the injection fires first, preserving its documented position
+// immediately after the AfterFrames-th counted frame, and the replay
+// burst follows it.
+func TestSubscribeRepos_InjectAndReplayFaultsCompose(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t, 5, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for range 3 {
+		_, err := w.GenerateOneForTest(ctx)
+		require.NoError(t, err)
+	}
+
+	garbage := []byte{0xba, 0xdc, 0x0f, 0xfe}
+	faults := simhttp.NewFaultPlan()
+	faults.SetSubscribeReposInjectSchedule([]simhttp.SubscribeReposInjectFault{
+		{AfterFrames: 2, Frame: garbage},
+	})
+	faults.SetSubscribeReposReplaySchedule([]simhttp.SubscribeReposReplayFault{
+		{AfterFrames: 2, DuplicateLast: 1},
+	})
+
+	srv := httptest.NewServer(nil)
+	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, srv.URL, simhttp.HandlerOptions{
+		Faults: faults,
+	})
+	defer srv.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http") + "/xrpc/com.atproto.sync.subscribeRepos"
+	conn, resp, err := websocket.Dial(ctx, wsBase+"?cursor=0", nil)
+	require.NoError(t, err)
+	closeResp(resp)
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+
+	// Frames 1,2 then both faults trip on frame 2: garbage first
+	// (positional promise), then the replayed dup of 2, then real 3.
+	for i, want := range []int64{1, 2} {
+		_, got, rerr := conn.Read(ctx)
+		require.NoError(t, rerr, "frame %d", i)
+		require.Equal(t, want, subscribeCommitSeq(t, got), "frame %d", i)
+	}
+	_, got, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Equal(t, garbage, got,
+		"injected bytes must land immediately after the 2nd counted frame, before the replay burst")
+	for i, want := range []int64{2, 3} {
+		_, got, rerr := conn.Read(ctx)
+		require.NoError(t, rerr, "post-inject frame %d", i)
+		require.Equal(t, want, subscribeCommitSeq(t, got), "post-inject frame %d", i)
+	}
+
+	require.Equal(t, 1, faults.SubscribeReposInjectsFired())
+	require.Equal(t, 1, faults.SubscribeReposReplaysFired())
+	require.Equal(t, 1, faults.SubscribeReposReplayedFrames())
+}
+
 func subscribeCommitSeq(t *testing.T, frame []byte) int64 {
 	t.Helper()
 
