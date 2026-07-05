@@ -183,6 +183,52 @@ func TestProcessBatch_ReplayedIdentityEventIsDroppedNotReArchived(t *testing.T) 
 		"replay drops must still advance the in-memory upstream watermark")
 }
 
+// TestProcessBatch_IdentityRatchetDurableAtBlockBoundary pins the
+// crash-window ordering of #234: Append can synchronously flush a full
+// block, and that flush commits the cursor+syncstate batch. The ratchet
+// must therefore be recorded by the writer's OnAppend hook (before the
+// flush), NOT after Append returns — otherwise a crash right after the
+// in-Append flush leaves the identity row durable with no durable
+// ratchet, and a restart redelivery re-archives it. Asserted by reading
+// the ratchet back through a FRESH syncstate store (empty in-memory
+// maps, so only pebble answers) without closing the consumer.
+func TestProcessBatch_IdentityRatchetDurableAtBlockBoundary(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	stateStore := syncstate.New(st)
+
+	const did = "did:plc:identblockedge"
+
+	c, err := Open(Config{
+		SegmentsDir:       dir,
+		Store:             st,
+		SeqKey:            "live_segments/seq/next",
+		CursorKey:         "relay/cursor",
+		RelayURL:          "https://example.invalid",
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:          newTestVerifier(t),
+		SyncStateStore:    stateStore,
+		MaxEventsPerBlock: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	// MaxEventsPerBlock=1: this append fills the block, so Append
+	// itself flushes it and fires OnAfterFlush before returning.
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		identityEvent(did, 5),
+	}))
+
+	// Deliberately no Close: simulate the crash window. A fresh store
+	// over the same pebble db sees only what is durable.
+	applied, err := syncstate.New(st).LoadAppliedIdentitySeq(t.Context(), atmos.DID(did))
+	require.NoError(t, err)
+	require.Equal(t, int64(5), applied,
+		"identity ratchet must be durable once the row's block has flushed")
+}
+
 // TestProcessBatch_IdentityReplayGuardSurvivesRestart pins the durable
 // half of #234: the ratchet persists via the syncstate flush, so a
 // replay delivered to a FRESH consumer over the same store (the

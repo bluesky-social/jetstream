@@ -88,10 +88,30 @@ func Open(cfg Config) (*Consumer, error) {
 	// window where a freshly sealed header's MaxSeq covers a
 	// tombstone the set does not yet contain, and the pass would
 	// durably advance the watermark past it, evicting it unapplied.
+	//
+	// The #identity applied-seq ratchet (#234) records here for the
+	// same before-any-flush reason: Append can synchronously flush a
+	// full block, and that flush fires OnAfterFlush, which commits the
+	// cursor + StageFlush batch. Recording post-Append (where hosting
+	// promotes) would open a crash window where the identity row and
+	// the cursor batch are durable but the ratchet is not — a restart
+	// redelivery would then re-archive the row as a permanent
+	// duplicate, the exact bug the guard exists to prevent.
 	var onAppend func(ev *segment.Event) error
-	if cfg.Tombstones != nil {
+	if cfg.Tombstones != nil || cfg.SyncStateStore != nil {
 		ts := cfg.Tombstones
-		onAppend = func(ev *segment.Event) error { return ts.Observe(ev) }
+		ss := cfg.SyncStateStore
+		onAppend = func(ev *segment.Event) error {
+			if ts != nil {
+				if err := ts.Observe(ev); err != nil {
+					return err
+				}
+			}
+			if ss != nil && ev.Kind == segment.KindIdentity {
+				ss.RecordIdentitySeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+			}
+			return nil
+		}
 	}
 
 	w, err := ingest.Open(ingest.Config{
@@ -179,12 +199,9 @@ func (c *Consumer) promoteSyncState(segEvts []segment.Event) {
 		if segEvts[i].Kind == segment.KindAccount {
 			c.cfg.SyncStateStore.PromoteHosting(atmos.DID(segEvts[i].DID), segEvts[i].UpstreamRelayCursor)
 		}
-		if segEvts[i].Kind == segment.KindIdentity {
-			// Identity has no verifier pending phase; record the
-			// applied-seq ratchet directly at the same post-append
-			// point where hosting promotes (#234 replay guard).
-			c.cfg.SyncStateStore.RecordIdentitySeq(atmos.DID(segEvts[i].DID), segEvts[i].UpstreamRelayCursor)
-		}
+		// The #identity applied-seq ratchet (#234) is NOT recorded here:
+		// it records in the writer's OnAppend hook (Open), before any
+		// full-block flush can commit the cursor batch without it.
 	}
 	if maxRev != "" {
 		c.cfg.SyncStateStore.PromoteChain(did, maxRev)
@@ -271,11 +288,22 @@ func (c *Consumer) dropReplayedAccountEvent(ctx context.Context, segEvts []segme
 // in the immutable archive. Identity rows never fold, so unlike #231
 // this is bloat rather than erasure, but it breaks the zero-bloat
 // exact-multiset contract all the same. The applied seq is jetstream's
-// own ratchet, recorded post-append in promoteSyncState and flushed
-// with the cursor batch (after the segment fsync), so seq <= applied
-// means this exact event's row is already archived. A ratchet of 0
-// means no identity row has ever been applied for the DID; real relay
-// seqs start at 1 so 0 is never a valid applied value.
+// own ratchet, recorded in the writer's OnAppend hook (before any
+// full-block flush can commit the cursor batch) and flushed with the
+// cursor batch (after the segment fsync).
+//
+// The check is a MAX ratchet (seq <= applied drops), the same
+// semantics as the #231 account guard: an exact-seq membership set
+// would be unbounded state. The deliberate tradeoff: if an identity
+// seq was lost in a tolerated relay gap and a later one archived, a
+// subsequent relay regression that re-serves the gapped seq gets
+// dropped here even though it never archived — we prefer that over
+// the alternative (an equality-only check), which would re-archive a
+// duplicate for every below-ratchet replay of a row we DID archive.
+// Gapped events are already counted/logged at gap time.
+//
+// A ratchet of 0 means no identity row has ever been applied for the
+// DID; real relay seqs start at 1 so 0 is never a valid applied value.
 func (c *Consumer) dropReplayedIdentityEvent(ctx context.Context, segEvts []segment.Event) (bool, error) {
 	if c.cfg.SyncStateStore == nil || len(segEvts) != 1 || segEvts[0].Kind != segment.KindIdentity {
 		return false, nil
@@ -329,8 +357,14 @@ func (c *Consumer) onAfterFlush(ctx context.Context) error {
 	if cur == 0 {
 		// Block flushed before any upstream event was fully
 		// processed (only possible during very early startup if
-		// the writer has pre-existing state). Skip the save —
-		// nothing to persist.
+		// the writer has pre-existing state). No cursor to save,
+		// but promoted syncstate — including the #identity ratchet
+		// recorded by OnAppend for rows in the block just fsynced —
+		// can already exist. Persist it on its own so a crash here
+		// can't leave a durable identity row unguarded (#234).
+		if c.cfg.SyncStateStore != nil {
+			return c.cfg.SyncStateStore.Flush()
+		}
 		return nil
 	}
 	if err := c.saveCursorAndSyncState(cur); err != nil {

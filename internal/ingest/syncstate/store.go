@@ -64,9 +64,10 @@ type PebbleStateStore struct {
 	// promotedIdent is the per-DID applied #identity seq ratchet
 	// (#234). Unlike chain/hosting it is jetstream-owned, not verifier
 	// state — atmos does not process #identity events, so there is no
-	// pending phase: the consumer records the seq directly at the same
-	// post-append point where hosting promotes, and StageFlush persists
-	// it with the cursor batch. Values only ratchet upward.
+	// pending phase: the consumer records the seq from the writer's
+	// OnAppend hook (under the writer mutex, before the row's block can
+	// flush), and StageFlush persists it with the cursor batch. Values
+	// only ratchet upward.
 	promotedIdent map[atmos.DID]int64
 
 	// captured* record exactly which promoted values the most recent
@@ -268,11 +269,14 @@ func (p *PebbleStateStore) LoadAppliedIdentitySeq(_ context.Context, did atmos.D
 // RecordIdentitySeq stages the applied #identity seq for did, to be
 // flushed by the next StageFlush batch. Ratchet-only: a seq at or
 // below the staged value is ignored, so out-of-order calls can never
-// move the guard backwards. Callers must invoke it only AFTER the
-// event's row has been appended to the segment writer (the same
-// contract as PromoteHosting) — the flush batch commits after the
-// segment fsync, so a durable ratchet value always has its row durable
-// too.
+// move the guard backwards. Callers must invoke it from the writer's
+// OnAppend hook — after the row is buffered, before its block can
+// flush. That ordering guarantees the ratchet is staged before ANY
+// cursor batch that could cover the row commits (a full-block flush
+// inside Append fires OnAfterFlush synchronously), so a durable
+// identity row always has a durable ratchet, and the flush batch
+// commits after the segment fsync, so a durable ratchet value always
+// has its row durable too.
 func (p *PebbleStateStore) RecordIdentitySeq(did atmos.DID, seq int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

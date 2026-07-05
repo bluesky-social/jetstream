@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"path/filepath"
 	"testing"
@@ -139,4 +140,20 @@ func TestTrafficMix_ZeroValueDefaultsAndValidation(t *testing.T) {
 	bad.TrafficMix = TrafficMix{Create: -1}
 	_, err = New(context.Background(), bad)
 	require.ErrorContains(t, err, "TrafficMix.Create")
+
+	// Non-finite weights are rejected loudly: NaN fails every
+	// comparison and +Inf is not < 0, so a plain range check would
+	// let them reach the weighted tables (empty-table panic in
+	// weightedChoice, or an Inf-dominated draw).
+	for name, val := range map[string]float64{
+		"nan":     math.NaN(),
+		"pos-inf": math.Inf(1),
+		"neg-inf": math.Inf(-1),
+	} {
+		nf := DefaultConfig()
+		nf.DataDir = filepath.Join(t.TempDir(), "simulator-"+name)
+		nf.TrafficMix = TrafficMix{Create: 75, Update: val}
+		_, err = New(context.Background(), nf)
+		require.ErrorContains(t, err, "TrafficMix.Update", "weight %v must be rejected", val)
+	}
 }

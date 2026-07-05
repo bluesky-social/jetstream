@@ -3,6 +3,7 @@ package world
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -128,6 +129,12 @@ func (m TrafficMix) validate() error {
 		{"Create", m.Create}, {"Update", m.Update},
 		{"Delete", m.Delete}, {"Identity", m.Identity},
 	} {
+		// NaN fails every comparison and +Inf is not < 0, so a plain
+		// range check would let non-finite weights through to the
+		// weighted tables (empty-table panic or an Inf-dominated draw).
+		if math.IsNaN(w.val) || math.IsInf(w.val, 0) {
+			return fmt.Errorf("world: TrafficMix.%s must be finite (got %v)", w.name, w.val)
+		}
 		if w.val < 0 {
 			return fmt.Errorf("world: TrafficMix.%s must be >= 0 (got %v)", w.name, w.val)
 		}
