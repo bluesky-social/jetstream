@@ -309,7 +309,7 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          -count=1 -timeout "$default_timeout") ;;
                 frames)
                     # Frame-adversity tier (#206): kills mutants that disarm
-                    # the consumer's poison-frame handling (e.g. m036, the
+                    # the consumer's poison-frame handling (e.g. m042, the
                     # per-op-drop arm discarding well-formed siblings of a
                     # partial-CAR commit). Two layers in one `go test`: the
                     # oracle's frame-fault scenarios drive the REAL consumer
