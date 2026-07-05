@@ -149,15 +149,11 @@ func (w *World) ListReposPage(start, limit int) (entries []ListReposEntry, nextS
 		if err != nil {
 			return nil, 0, err
 		}
-		_, unavailable, err := w.repoUnavailableStatus(i)
-		if err != nil {
-			return nil, 0, err
-		}
 		out = append(out, ListReposEntry{
 			DID:    a.DID,
 			Rev:    state.Rev,
 			Head:   state.CommitCID.String(),
-			Active: !deleted && !unavailable,
+			Active: !deleted,
 		})
 	}
 	return out, end, nil

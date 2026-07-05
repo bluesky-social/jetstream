@@ -75,7 +75,7 @@ func parseConfigFromLookupEnv(lookupenv func(string) (string, bool)) (Config, er
 	switch mode {
 	case "default":
 	case "fast":
-		cfg.Accounts = 4
+		cfg.Accounts = 8
 		cfg.MaxInitialRecords = 10
 		cfg.LiveEventsBootstrap = 12
 		cfg.LiveEventsSteady = 12

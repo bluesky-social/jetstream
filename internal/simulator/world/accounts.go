@@ -157,6 +157,21 @@ func (w *World) setRepoUnavailableStatus(idx int, status string) error {
 	return nil
 }
 
+func (w *World) accountCanAuthor(idx int) (bool, error) {
+	deleted, err := w.isAccountDeleted(idx)
+	if err != nil {
+		return false, err
+	}
+	if deleted {
+		return false, nil
+	}
+	_, unavailable, err := w.repoUnavailableStatus(idx)
+	if err != nil {
+		return false, err
+	}
+	return !unavailable, nil
+}
+
 func (w *World) generateAccountDelete(ctx context.Context, idx int) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

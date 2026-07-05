@@ -109,12 +109,12 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int, action
 	if authorIdx < 0 || authorIdx >= w.cfg.Accounts {
 		return nil, fmt.Errorf("simulator: author index %d out of range", authorIdx)
 	}
-	deleted, err := w.isAccountDeleted(authorIdx)
+	canAuthor, err := w.accountCanAuthor(authorIdx)
 	if err != nil {
 		return nil, err
 	}
-	if deleted {
-		return nil, fmt.Errorf("simulator: author account %d is deleted", authorIdx)
+	if !canAuthor {
+		return nil, fmt.Errorf("simulator: author account %d is unavailable", authorIdx)
 	}
 	author, err := w.loadAccount(authorIdx)
 	if err != nil {
@@ -381,12 +381,12 @@ func (w *World) GenerateMultiOpCommitForTest(ctx context.Context, idx int, specs
 	if idx < 0 || idx >= w.cfg.Accounts {
 		return nil, nil, fmt.Errorf("simulator: chain account index %d out of range", idx)
 	}
-	deleted, err := w.isAccountDeleted(idx)
+	canAuthor, err := w.accountCanAuthor(idx)
 	if err != nil {
 		return nil, nil, err
 	}
-	if deleted {
-		return nil, nil, fmt.Errorf("simulator: chain account %d is deleted", idx)
+	if !canAuthor {
+		return nil, nil, fmt.Errorf("simulator: chain account %d is unavailable", idx)
 	}
 	author, err := w.loadAccount(idx)
 	if err != nil {
@@ -542,12 +542,12 @@ func (w *World) loadRepoForTargetedCommit(idx int) (account, *repo.Repo, *diffSt
 	if idx < 0 || idx >= w.cfg.Accounts {
 		return account{}, nil, nil, repoState{}, fmt.Errorf("simulator: account index %d out of range", idx)
 	}
-	deleted, err := w.isAccountDeleted(idx)
+	canAuthor, err := w.accountCanAuthor(idx)
 	if err != nil {
 		return account{}, nil, nil, repoState{}, err
 	}
-	if deleted {
-		return account{}, nil, nil, repoState{}, fmt.Errorf("simulator: account %d is deleted", idx)
+	if !canAuthor {
+		return account{}, nil, nil, repoState{}, fmt.Errorf("simulator: account %d is unavailable", idx)
 	}
 	author, err := w.loadAccount(idx)
 	if err != nil {
@@ -630,12 +630,12 @@ func (w *World) silentCreateForAccount(idx int) error {
 	if idx < 0 || idx >= w.cfg.Accounts {
 		return fmt.Errorf("simulator: silent account index %d out of range", idx)
 	}
-	deleted, err := w.isAccountDeleted(idx)
+	canAuthor, err := w.accountCanAuthor(idx)
 	if err != nil {
 		return err
 	}
-	if deleted {
-		return fmt.Errorf("simulator: silent account %d is deleted", idx)
+	if !canAuthor {
+		return fmt.Errorf("simulator: silent account %d is unavailable", idx)
 	}
 	author, err := w.loadAccount(idx)
 	if err != nil {
@@ -686,12 +686,12 @@ func (w *World) emitSyncWithRev(ctx context.Context, idx int, rev, timeStr strin
 	if idx < 0 || idx >= w.cfg.Accounts {
 		return nil, 0, "", fmt.Errorf("simulator: sync account index %d out of range", idx)
 	}
-	deleted, err := w.isAccountDeleted(idx)
+	canAuthor, err := w.accountCanAuthor(idx)
 	if err != nil {
 		return nil, 0, "", err
 	}
-	if deleted {
-		return nil, 0, "", fmt.Errorf("simulator: sync account %d is deleted", idx)
+	if !canAuthor {
+		return nil, 0, "", fmt.Errorf("simulator: sync account %d is unavailable", idx)
 	}
 	author, err := w.loadAccount(idx)
 	if err != nil {
@@ -873,20 +873,20 @@ func (w *World) pickTargetAccount(authorIdx int) (atmos.DID, error) {
 func (w *World) pickActiveAuthor() (int, error) {
 	for attempts := 0; attempts < max(1, w.cfg.Accounts*4); attempts++ {
 		idx := zipfian(w.rng, 1.07, w.cfg.Accounts)
-		deleted, err := w.isAccountDeleted(idx)
+		canAuthor, err := w.accountCanAuthor(idx)
 		if err != nil {
 			return 0, err
 		}
-		if !deleted {
+		if canAuthor {
 			return idx, nil
 		}
 	}
 	for idx := range w.cfg.Accounts {
-		deleted, err := w.isAccountDeleted(idx)
+		canAuthor, err := w.accountCanAuthor(idx)
 		if err != nil {
 			return 0, err
 		}
-		if !deleted {
+		if canAuthor {
 			return idx, nil
 		}
 	}

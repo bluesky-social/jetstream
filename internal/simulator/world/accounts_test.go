@@ -172,7 +172,7 @@ func TestGenerateAccountStatusForTest_NonDeletedStatusesDoNotMarkDeleted(t *test
 	require.True(t, entries[0].Active, "non-deleted account statuses must not flip listRepos active")
 }
 
-func TestSetRepoUnavailableForTest_MarksListReposInactive(t *testing.T) {
+func TestSetRepoUnavailableForTest_LeavesListReposActive(t *testing.T) {
 	t.Parallel()
 
 	cfg := DefaultConfig()
@@ -193,7 +193,7 @@ func TestSetRepoUnavailableForTest_MarksListReposInactive(t *testing.T) {
 	entries, _, err := w.ListReposPage(0, 10)
 	require.NoError(t, err)
 	require.True(t, entries[0].Active)
-	require.False(t, entries[1].Active, "unavailable repo must list inactive")
+	require.True(t, entries[1].Active, "unavailable repos must still dispatch to getRepo")
 	require.Error(t, w.SetRepoUnavailableForTest(1, "unknown"))
 }
 
