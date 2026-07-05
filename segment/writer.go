@@ -42,6 +42,10 @@ type Config struct {
 	// Metrics is optional; nil disables segment-package metrics
 	// (e.g. seal duration).
 	Metrics SealObserver
+
+	// IOFaultInjector is a test-only seam for deterministic write/fsync
+	// failures. Nil in production.
+	IOFaultInjector IOFaultInjector
 }
 
 func (c Config) validate() error {
@@ -159,7 +163,7 @@ func New(cfg Config) (*Writer, error) {
 	}
 
 	if info.Size() == 0 {
-		if err := initializeNewSegment(f); err != nil {
+		if err := initializeNewSegment(f, cfg); err != nil {
 			return nil, err
 		}
 		// On POSIX filesystems, the directory entry that names a freshly
@@ -168,7 +172,7 @@ func New(cfg Config) (*Writer, error) {
 		// can drop the entire segment file even though we fsynced its
 		// contents — violating the "no data loss" invariant in §2 of
 		// the spec.
-		if err := syncParentDir(cfg.Path); err != nil {
+		if err := syncParentDir(cfg.Path, cfg.IOFaultInjector); err != nil {
 			return nil, err
 		}
 	} else {
@@ -203,12 +207,17 @@ func New(cfg Config) (*Writer, error) {
 // the dirent for a freshly-created or truncated file is durable.
 // On filesystems where this is a no-op (e.g. some Windows configs)
 // the call is still cheap.
-func syncParentDir(path string) error {
+func syncParentDir(path string, faults IOFaultInjector) error {
 	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return fmt.Errorf("segment: open parent dir: %w", err)
 	}
 	defer func() { _ = dir.Close() }()
+	if faults != nil {
+		if err := faults.BeforeSegmentIO(path, IOOpSync); err != nil {
+			return fmt.Errorf("segment: fsync parent dir: %w", err)
+		}
+	}
 	if err := syncFile(dir); err != nil {
 		return fmt.Errorf("segment: fsync parent dir: %w", err)
 	}
@@ -221,19 +230,32 @@ func syncParentDir(path string) error {
 // ReservedHeaderBytes total. The returned error is already wrapped
 // for the caller; the caller is responsible for closing f on
 // failure.
-func initializeNewSegment(f *os.File) error {
+func initializeNewSegment(f *os.File, cfg Config) error {
 	header := make([]byte, ReservedHeaderBytes)
 	copy(header, segmentMagic)
 
+	if err := cfg.beforeIO(IOOpWrite); err != nil {
+		return fmt.Errorf("segment: write header: %w", err)
+	}
 	if _, err := f.Write(header); err != nil {
 		return fmt.Errorf("segment: write header: %w", err)
 	}
 
+	if err := cfg.beforeIO(IOOpSync); err != nil {
+		return fmt.Errorf("segment: fsync header: %w", err)
+	}
 	if err := syncFile(f); err != nil {
 		return fmt.Errorf("segment: fsync header: %w", err)
 	}
 
 	return nil
+}
+
+func (c Config) beforeIO(op IOOp) error {
+	if c.IOFaultInjector == nil {
+		return nil
+	}
+	return c.IOFaultInjector.BeforeSegmentIO(c.Path, op)
 }
 
 // resumeExistingSegment validates that f is a well-formed segment
@@ -528,6 +550,10 @@ func (w *Writer) flushLocked() error {
 	w.wireScratch = blockEncoder.EncodeAll(w.bodyScratch, w.wireScratch)
 	binary.LittleEndian.PutUint64(w.wireScratch[:8], uint64(len(w.wireScratch)-8))
 
+	if err := w.cfg.beforeIO(IOOpWrite); err != nil {
+		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
+		return w.stickyErr
+	}
 	if _, err := w.file.Write(w.wireScratch); err != nil {
 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 		return w.stickyErr
@@ -552,6 +578,10 @@ func (w *Writer) flushLocked() error {
 	// same rows on a retry.
 	w.pending.reset()
 
+	if err := w.cfg.beforeIO(IOOpSync); err != nil {
+		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
+		return w.stickyErr
+	}
 	if err := syncFile(w.file); err != nil {
 		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
 		return w.stickyErr
@@ -638,6 +668,10 @@ func (w *Writer) commitPreparedFlushLocked(prepared *PreparedBlock, wire []byte)
 			prepared.id, w.nextPreparedCommitID)
 	}
 	binary.LittleEndian.PutUint64(wire[:8], uint64(len(wire)-8))
+	if err := w.cfg.beforeIO(IOOpWrite); err != nil {
+		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
+		return w.stickyErr
+	}
 	if _, err := w.file.Write(wire); err != nil {
 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 		return w.stickyErr
@@ -648,6 +682,10 @@ func (w *Writer) commitPreparedFlushLocked(prepared *PreparedBlock, wire []byte)
 	w.flushedBlocks = append(w.flushedBlocks, info)
 	w.nextBlockOffset += uint64(len(wire))
 
+	if err := w.cfg.beforeIO(IOOpSync); err != nil {
+		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
+		return w.stickyErr
+	}
 	if err := syncFile(w.file); err != nil {
 		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
 		return w.stickyErr

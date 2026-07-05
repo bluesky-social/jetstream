@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -55,14 +56,106 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	if overrides.AsyncFlushWorkers != 0 {
 		cfg.AsyncFlushWorkers = overrides.AsyncFlushWorkers
 	}
+	if overrides.DataDir != "" {
+		cfg.DataDir = overrides.DataDir
+	}
 	if overrides.Metrics != nil {
 		cfg.Metrics = overrides.Metrics
+	}
+	if overrides.SegmentIOFaultInjector != nil {
+		cfg.SegmentIOFaultInjector = overrides.SegmentIOFaultInjector
 	}
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 	return w
+}
+
+type segmentIOFault struct {
+	op      segment.IOOp
+	ordinal int
+	err     error
+	seen    atomic.Int64
+}
+
+func (f *segmentIOFault) BeforeSegmentIO(_ string, op segment.IOOp) error {
+	if op != f.op {
+		return nil
+	}
+	if int(f.seen.Add(1)) == f.ordinal {
+		return f.err
+	}
+	return nil
+}
+
+func TestWriter_ENOSPCSyncFlushReturnsFatalOperatorMessage(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	w, err := Open(Config{
+		DataDir:                dataDir,
+		SegmentsDir:            filepath.Join(dataDir, "segments"),
+		Store:                  st,
+		MaxEventsPerBlock:      2,
+		Logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:                NewMetrics(prometheus.NewRegistry()),
+		SegmentIOFaultInjector: &segmentIOFault{op: segment.IOOpWrite, ordinal: 2, err: syscall.ENOSPC},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	for i := 0; i < 2; i++ {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
+		err = w.Append(t.Context(), &ev)
+		if err != nil {
+			break
+		}
+	}
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	require.ErrorContains(t, err, "fatal persistence error")
+	require.ErrorContains(t, err, "disk full")
+	require.ErrorContains(t, err, dataDir)
+	require.ErrorContains(t, err, "restart jetstream")
+}
+
+func TestWriter_ENOSPCAsyncFlushReturnsFatalOperatorMessage(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	w, err := Open(Config{
+		DataDir:                dataDir,
+		SegmentsDir:            filepath.Join(dataDir, "segments"),
+		Store:                  st,
+		MaxEventsPerBlock:      2,
+		AsyncFlushWorkers:      1,
+		Logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:                NewMetrics(prometheus.NewRegistry()),
+		SegmentIOFaultInjector: &segmentIOFault{op: segment.IOOpSync, ordinal: 3, err: syscall.ENOSPC},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	for i := 0; i < 2; i++ {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
+		err = w.Append(t.Context(), &ev)
+		if err != nil {
+			break
+		}
+	}
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	require.ErrorContains(t, err, "fatal persistence error")
+	require.ErrorContains(t, err, "disk full")
+	require.ErrorContains(t, err, dataDir)
+	require.ErrorContains(t, err, "restart jetstream")
 }
 
 // TestOpen_FreshDir creates a fresh segments dir and confirms Open

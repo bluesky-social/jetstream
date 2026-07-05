@@ -116,6 +116,7 @@ func Open(cfg Config) (*Consumer, error) {
 
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       cfg.SegmentsDir,
+		DataDir:           cfg.DataDir,
 		Store:             cfg.Store,
 		SeqKey:            cfg.SeqKey,
 		MaxSegmentBytes:   cfg.MaxSegmentBytes,
@@ -128,10 +129,11 @@ func Open(cfg Config) (*Consumer, error) {
 
 		// WriterMetrics is nil for bootstrap live_segments and shared
 		// with the canonical ingest metrics in steady-state.
-		Metrics:        cfg.WriterMetrics,
-		OnAfterFlush:   c.onAfterFlush,
-		OnAfterSeal:    cfg.OnAfterSeal,
-		SegmentMetrics: cfg.SegmentMetrics,
+		Metrics:                cfg.WriterMetrics,
+		OnAfterFlush:           c.onAfterFlush,
+		OnAfterSeal:            cfg.OnAfterSeal,
+		SegmentMetrics:         cfg.SegmentMetrics,
+		SegmentIOFaultInjector: cfg.SegmentIOFaultInjector,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("livestream: open writer: %w", err)
