@@ -8,7 +8,7 @@ method and `testing/mutation/run.sh` for the driver.
 **Current catalog (keep this line current): 35 active mutants on disk
 (m001–m043; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
 union baseline: **34 killed, 1 survived, zero STALE/BUILD-BROKEN** in
-`testing/mutation/baseline.json` (commit field `2450fec` is
+`testing/mutation/baseline.json` (commit field `4f2c153` is
 provenance-only). The remaining survivor (m015) is a documented escape with
 owning issue #208.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
@@ -85,6 +85,24 @@ for non-deleted account lifecycle statuses (`takendown`, `suspended`,
 mutants: 34 KILLED, 1 SURVIVED, zero STALE/BUILD-BROKEN.** The only survivor is
 the existing documented m015 footer-count escape.
 
+**Re-run at `4f2c153` (same day) after an adversarial-review finding proved the
+`2450fec` result vacuous at the end-to-end tier.** m043 originally declared
+`tiers: tombstone,default`; the driver stops at the first killing tier, so the
+pre-existing tombstone unit matrix killed the mutant and
+`TestOracle_DefaultLifecycle` never gated the new #203 lifecycle coverage —
+confirmed by hand-applying the mutant: the default tier PASSED, because the
+lifecycle was injected at the end of the steady window, above every compaction
+watermark, where the tombstone-exactness fold never touches rows. Fixes: the
+lifecycle injection moved to the start of the steady window (below the
+tombstone-triggered pass watermark), the harness now asserts the final
+watermark covers the lifecycle rows (anti-vacuity), and m043's tiers reordered
+to `default,tombstone` so the end-to-end tier is the recorded killer. The
+mutant's expected-detection block also cited a nonexistent test
+(`TestTombstoneSet_AccountStatusExactness`); corrected to the real unit
+backstops (`TestObserveAccountDeletedOnlyPurgesLiteralDeleted`,
+`TestObserveAccountStatusMatrixRetains`). m001's recorded tier also moved
+stress→default in this regen (tier-order note only; disposition unchanged).
+
 Drivers:
 
 ```bash
@@ -96,7 +114,7 @@ testing/mutation/run.sh --json testing/mutation/baseline.json
 
 | mutant | result | note |
 |---|---|---|
-| m043_account_status_exactness | KILLED@tombstone | `accountDeleted` treating any inactive status as a DID tombstone is killed by the tombstone exactness tier; the default lifecycle also injects archived non-deleted statuses after a probe create. |
+| m043_account_status_exactness | KILLED@default | `oracle: missing did:plc:jqwkem7rbggmxanbfb7e6gbl app.bsky.feed.like/...` — under the mutant the fixture account's inactive statuses fold as DID tombstones and compaction over-drops its records; the tombstone unit matrix remains the fast backstop tier. |
 
 ## Campaign 2026-06-29 (step 11 #182 — partb tier; catalog refresh; baseline regen)
 
