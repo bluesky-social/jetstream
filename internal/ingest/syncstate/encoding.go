@@ -11,12 +11,32 @@ import (
 const (
 	chainStateV1 = 0x01
 	hostStateV1  = 0x01
+	identSeqV1   = 0x01
 
 	// cidByteLen is the on-the-wire size of cbor.CID.Bytes() output:
 	// version varint (1B = 0x01) + codec varint (1B) + sha2-256
 	// multihash prefix (2B = 0x12 0x20) + 32B hash = 36 bytes.
 	cidByteLen = 36
 )
+
+// encodeIdentitySeq serializes the applied #identity seq ratchet
+// (#234): version byte + big-endian int64.
+func encodeIdentitySeq(seq int64) []byte {
+	buf := make([]byte, 9)
+	buf[0] = identSeqV1
+	binary.BigEndian.PutUint64(buf[1:], uint64(seq))
+	return buf
+}
+
+func decodeIdentitySeq(buf []byte) (int64, error) {
+	if len(buf) != 9 {
+		return 0, fmt.Errorf("syncstate: identity seq has %d bytes, want 9", len(buf))
+	}
+	if buf[0] != identSeqV1 {
+		return 0, fmt.Errorf("syncstate: unknown identity seq version 0x%02x", buf[0])
+	}
+	return int64(binary.BigEndian.Uint64(buf[1:])), nil
+}
 
 // encodeChainState serializes a sync.ChainState to a compact binary
 // shape. Refuses to encode a zero CID — the StateStore contract

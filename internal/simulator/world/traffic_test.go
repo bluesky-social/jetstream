@@ -22,12 +22,22 @@ func newTestWorld(t *testing.T) *World {
 	return newRuntimeWorld(t, 25, 1)
 }
 
+// commitOnlyMix disables #identity for tests that decode every pump
+// frame as a #commit (or advance repo state on every tick). Identity
+// generation has its own coverage in identity_test.go.
+func commitOnlyMix() TrafficMix {
+	m := DefaultTrafficMix()
+	m.Identity = 0
+	return m
+}
+
 func newRuntimeWorld(t *testing.T, accounts, initialRecords int) *World {
 	t.Helper()
 	cfg := DefaultConfig()
 	cfg.DataDir = filepath.Join(t.TempDir(), "simulator")
 	cfg.Accounts = accounts
 	cfg.InitialRecords = initialRecords
+	cfg.TrafficMix = commitOnlyMix()
 	w, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -207,6 +217,7 @@ func TestGenerateOne_RevsAdvancePastBootstrapForEveryAccount(t *testing.T) {
 	cfg.InitialRecordsMin = 0
 	cfg.InitialRecordsMax = 1000
 	cfg.Seed = 42
+	cfg.TrafficMix = commitOnlyMix()
 
 	w, err := New(context.Background(), cfg)
 	require.NoError(t, err)
@@ -325,6 +336,7 @@ func TestGenerateOne_NoDuplicateOpPaths(t *testing.T) {
 	cfg.DataDir = filepath.Join(t.TempDir(), "simulator")
 	cfg.Accounts = 5
 	cfg.InitialRecords = 1
+	cfg.TrafficMix = commitOnlyMix()
 	w, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })

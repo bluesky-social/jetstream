@@ -55,6 +55,20 @@ func (r *eventLogRecorder) Observe(ev *segment.Event) {
 	r.mu.Unlock()
 }
 
+// snapshotEvents returns a copy of every observed event, unfiltered.
+// Used by per-kind anti-vacuity asserts that scan the whole run rather
+// than an upstream-cursor window.
+func (r *eventLogRecorder) snapshotEvents() []segment.Event {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]segment.Event, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
 // rowCountInRange returns how many normalized rows fall in the
 // (after, through] upstream-cursor window. Caller must hold r.mu.
 func (r *eventLogRecorder) rowCountInRangeLocked(after, through int64) int {

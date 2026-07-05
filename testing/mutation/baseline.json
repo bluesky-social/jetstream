@@ -32,6 +32,7 @@
     {"id":"m037_sync_resync_rev_dropped","disposition":"KILLED","result":"KILLED@default","note":"oracle: event mismatch at index 22: want seq=32 kind=create_resync did=did:plc:iv2erqbe5k4ltaawmik4tfeo key=app.bsky.actor.profile/22bgd52hp"},
     {"id":"m038_live_op_path_gate_skipped","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m039_backfill_rkey_gate_skipped","disposition":"KILLED","result":"KILLED@default","note":"oracle: extra did:plc:iv2erqbe5k4ltaawmik4tfeo app.bsky.feed.post/.."},
-    {"id":"m040_live_op_drop_escalated_whole_event","disposition":"KILLED","result":"KILLED@default","note":"see log"}
+    {"id":"m040_live_op_drop_escalated_whole_event","disposition":"KILLED","result":"KILLED@default","note":"see log"},
+    {"id":"m041_identity_swallowed","disposition":"KILLED","result":"KILLED@default","note":"see log"}
   ]
 }

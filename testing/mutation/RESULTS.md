@@ -5,13 +5,14 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 32 active mutants on disk
-(m001–m040; m007, m010, m013, m014, m020, m021, m023, m025 retired). Latest
-full campaign: 2026-07-05 at merge head `389b29c` (#204 adversarial ingest
-traffic ∪ #230 corpus ∪ #232 replay) — **30 killed, 2 survived, zero
-STALE/BUILD-BROKEN**; gate PASS against `testing/mutation/baseline.json`
-(union bank; commit field `a4e96c5` is provenance-only). The 2 survivors
-(m003, m015) are documented escapes with owning issues (#209, #208).
+**Current catalog (keep this line current): 33 active mutants on disk
+(m001–m041; m007, m010, m013, m014, m020, m021, m023, m025 retired). Latest
+full campaign: 2026-07-05 at the second #204 merge head (#204 adversarial
+ingest traffic ∪ #202 identity/m041 ∪ #230 corpus ∪ #232 replay) —
+**31 killed, 2 survived, zero STALE/BUILD-BROKEN**; gate PASS against
+`testing/mutation/baseline.json` (union bank; commit field `a4e96c5` is
+provenance-only). The 2 survivors (m003, m015) are documented escapes with
+owning issues (#209, #208).
 m013/m014 retired 2026-07-04: dead path under atmos v0.2.10, not
 dormant-under-polite-traffic — see the #204 campaign section; their bug
 class is covered by m017/m018 (convertCommit) and m036/m037 (convertSync).
@@ -1273,6 +1274,38 @@ the checksum instance. Fixture provenance and the re-capture procedure:
 
 Remaining survivors: m003 (#209), m013/m014 (#204), m015 (#208).
 
+## Campaign 2026-07-04 — m041 identity-swallowed mutant (#202)
+
+Full 30-mutant campaign at `d77fa93` (the m041-mutant commit, on the #202 branch
+with the identity traffic + harness asserts): **26 KILLED / 4 SURVIVED,
+zero STALE / BUILD-BROKEN**. Survivors unchanged and all owned:
+m003 (#209), m013/m014 (#204, dead-path retirement planned), m015 (#208).
+Baseline re-banked.
+
+**m041_identity_swallowed — KILLED@default, banked on arrival.**
+`convertIdentity` returns `nil, nil` (the legitimate #info no-op shape),
+modeling a ConvertEvent dispatch refactor that folds #identity into the
+"informational, nothing to archive" branch. Before #202 the simulator
+never emitted #identity, so this exact edit was invisible to every
+oracle tier — the m013/m014 green-by-vacancy class, now with a live
+path. Kill mechanism: the bootstrap traffic closure injects a
+deterministic #identity frame whose archive ack never fires under the
+mutant, so the after-bootstrap barrier times out; if pacing ever let a
+run proceed, `assertIdentityArchived` (injection-keyed anti-vacuity)
+and the exact-multiset event-log compares (the expected side decodes
+#identity from firehose history) catch the missing rows, and 11
+unit/corpus tests fail besides. Red-first verified before the harness
+asserts landed.
+
+Context: #202 also made the default `TrafficMix` emit #identity (~3%,
+vs 0.061% measured on production 2026-07-04 — deliberately above rate
+for statistical reach at oracle scale), and its first non-short run
+found production bug #234 (#identity relay-replay re-archival; fixed
+same branch — durable applied-seq ratchet + consumer guard, the #231
+sibling). The enqueuer's malformed-DID gate is now oracle-asserted via
+the harness's first debug-/metrics scrape (two-sided: invalid_did ≥ 1
+AND already_known ≥ 1).
+
 ## Campaign 2026-07-04 — #204 adversarial ingest traffic; m013/m014 retired, five gate mutants added
 
 Full campaign at `a4e96c5` (branch adversarial-ingest-traffic-204, forked
@@ -1340,3 +1373,16 @@ KILLED@corpus and m035 KILLED@replay (main's banks) alongside m036–m040
 KILLED@default (this branch's #204 gate mutants), with m013/m014 absent
 (retired). Survivors: m003 → #209, m015 → #208. The union-merge resolution
 described in the section above is verified, not just asserted.
+
+## Campaign 2026-07-05 — second union merge: #204 ∪ #202 (m041)
+
+Merging origin/main (post-#236, the #202 identity work with m041 and its
+30-mutant bank at `d77fa93`) into the #204 branch produced the same
+baseline-conflict shape as the #230/#232 merges; resolved as the union:
+m041 KILLED@default from main's bank (already renumbered from its original
+m036 id in 82b2dd9 to avoid colliding with this branch's m036), m013/m014
+absent and m036–m040 KILLED@default from this branch's bank. The merged
+baseline is **33 mutants, 31 KILLED / 2 SURVIVED** (m003 → #209,
+m015 → #208). The `commit` field stays `a4e96c5` (provenance-only). The
+full campaign was re-run at this second merge head to verify the union —
+results in the section below.

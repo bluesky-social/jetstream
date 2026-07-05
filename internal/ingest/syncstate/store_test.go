@@ -243,3 +243,40 @@ func TestStateStore_TwoDIDs(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "rev-b", gb.Rev)
 }
+
+// TestStateStore_IdentitySeqRatchet pins the #234 applied-identity-seq
+// lifecycle: absent reads as 0, RecordIdentitySeq only ratchets upward,
+// the value survives a Flush + fresh store (restart), and Delete
+// removes it alongside chain/hosting.
+func TestStateStore_IdentitySeqRatchet(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:eeeeeeeeeeeeeeeeeeeeeeee")
+
+	got, err := s.LoadAppliedIdentitySeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Zero(t, got, "absent ratchet must read as 0")
+
+	s.RecordIdentitySeq(did, 7)
+	got, err = s.LoadAppliedIdentitySeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, int64(7), got, "staged ratchet must be visible before flush")
+
+	// Ratchet-only: an older (replayed) seq can never move it backwards.
+	s.RecordIdentitySeq(did, 5)
+	got, err = s.LoadAppliedIdentitySeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, int64(7), got, "ratchet must not regress")
+
+	require.NoError(t, s.Flush())
+	fresh := New(raw)
+	got, err = fresh.LoadAppliedIdentitySeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, int64(7), got, "flushed ratchet must survive a restart")
+
+	require.NoError(t, fresh.Delete(t.Context(), did))
+	got, err = fresh.LoadAppliedIdentitySeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Zero(t, got, "Delete must remove the ratchet")
+}

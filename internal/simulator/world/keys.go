@@ -35,6 +35,13 @@ func keyAccountDeleted(idx int) []byte {
 	return fmt.Appendf(nil, "sim/account/%010d/deleted", idx)
 }
 
+// keyAccountHandleChanges builds "sim/account/<idx>/handle_changes": a
+// big-endian uint64 counter of #identity handle changes emitted for
+// this account. Absence means zero.
+func keyAccountHandleChanges(idx int) []byte {
+	return fmt.Appendf(nil, "sim/account/%010d/handle_changes", idx)
+}
+
 // keyAccountBlock builds "sim/account/<idx>/blocks/<cidBytes>". The
 // CID bytes are appended raw — we never iterate by CID, only point-
 // look up.
