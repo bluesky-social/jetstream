@@ -1448,3 +1448,21 @@ assertion. That assertion was added FOR this mutant: pre-strengthening,
 m042 (cursor advanced, counter bumped, no error propagated) while the
 survivor was discarded — a vacuity worth recording. Red-first verified
 in both directions before the patch was banked.
+
+## Campaign 2026-07-05 — verification at the #206 merge head
+
+Full campaign + gate at `1fa6640` (frame-adversity-206 ∪ main's #204 ∪
+#202 ∪ #201): **gate PASS — 34 mutants match baseline, 32 KILLED / 2
+SURVIVED, zero STALE/BUILD-BROKEN.** All in-flight banks reproduce side
+by side at one head: m042 KILLED@frames (#206), m036–m040 KILLED@default
+(#204 gate mutants), m041 KILLED@default (#202 identity), m035
+KILLED@replay (#232), m009 KILLED@corpus (#230). Survivors: m003 → #209,
+m015 → #208.
+
+One STALE fixed en route: the first merge-head run flagged m011 (its
+flushLocked hunk moved when #201 inserted the beforeIO fault hook above
+the file write). Hunk regenerated against the current writer.go — the
+mutation itself is unchanged — and the re-run banked it KILLED@default.
+Also green at this head: short suites (2017 tests), lint, -race over
+oracle/live/simulator, and 3× repeats of the frame + replay oracle
+tiers under atmos v0.2.13.
