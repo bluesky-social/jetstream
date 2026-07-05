@@ -212,15 +212,21 @@ func (w *subscribeFaultWriter) Write(ctx context.Context, frame []byte) error {
 // Fires immediately after the AfterFrames-th counted frame, so the
 // injected bytes land between that frame and the next real one — and
 // with SwallowNext set, positionally replace the next real frame.
+// The fire is noted BEFORE the write: an injected frame can kill the
+// connection mid-write (e.g. an oversized frame tripping the client's
+// read limit closes the socket under the server's in-flight write), and
+// "fired" means the fault took effect, not that the peer accepted the
+// bytes. Tests barrier on InjectsFired, so it must not race the peer's
+// reaction to the poison.
 func (w *subscribeFaultWriter) fireInject(ctx context.Context) error {
 	w.injectArmed = false
+	w.swallowNext = w.inject.SwallowNext
+	w.faults.noteSubscribeInject()
 	if len(w.inject.Frame) > 0 {
 		if err := w.conn.Write(ctx, websocket.MessageBinary, w.inject.Frame); err != nil {
 			return err
 		}
 	}
-	w.swallowNext = w.inject.SwallowNext
-	w.faults.noteSubscribeInject()
 	return nil
 }
 
