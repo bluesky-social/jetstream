@@ -446,10 +446,15 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	exemptWholeEventSeqs(steadyAck, w.AdversarialLedger().Entries())
 	var hiddenAcct world.Account
 	if netNewOracle {
-		// Keep the hidden repo empty until its live commit: the retry scan is
-		// still required to fetch and complete it, while client-backfill
-		// watermark checks stay tied to firehose-visible state.
-		hiddenIdx, acct, err := w.AddHiddenAccountForTest(t.Context(), 0)
+		// Seed ONE backfill-only record: it exists in the hidden repo before
+		// the live commit, so the firehose never carries it and the ONLY path
+		// that can archive it is the LiveEnqueuer -> pending -> retry-getRepo
+		// resync. That makes the final-state Compare (and the client-stream
+		// compare, which caught #244) fail unless the net-new backfill truly
+		// ran and its rows reached both the archive and /subscribe — a
+		// zero-record hidden repo would converge from the live commit alone,
+		// leaving this scenario vacuous.
+		hiddenIdx, acct, err := w.AddHiddenAccountForTest(t.Context(), 1)
 		require.NoErrorf(t, err, "create hidden net-new account: mode=%s seed=%d", cfg.Mode, cfg.Seed)
 		hiddenAcct = acct
 		_, _, err = w.GenerateRecordOpForTest(t.Context(), hiddenIdx, "create", "app.bsky.feed.post", "net-new-oracle-probe")

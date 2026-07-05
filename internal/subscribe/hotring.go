@@ -22,8 +22,24 @@ func newHotRing(maxBytes int) *hotRing {
 
 // append adds e to the back of the ring and evicts from the front until
 // the byte budget holds. e.Event.Seq must equal r.tipSeq when the ring is
-// non-empty (dense, monotonic). The first append seeds baseSeq.
-func (r *hotRing) append(e *Entry) {
+// non-empty (dense, monotonic) — lookup's index math depends on it. The
+// first append seeds baseSeq.
+//
+// A non-dense append (gap or regression) reports reset=true: the ring
+// drops all residency and restarts at e. Retaining entries across a hole
+// would serve WRONG-SEQ events at every cursor past it (#244). Dense
+// delivery is owned by the ingest writer's ordered append hook; this is
+// the defense-in-depth backstop for any producer that bypasses it,
+// degrading the dropped window to a cold (disk) read instead of
+// corrupting the fanout.
+func (r *hotRing) append(e *Entry) (reset bool) {
+	if r.hasData && e.Event.Seq != r.tipSeq {
+		reset = true
+		clear(r.buf)
+		r.buf = r.buf[:0]
+		r.curBytes = 0
+		r.hasData = false
+	}
 	if !r.hasData {
 		r.baseSeq = e.Event.Seq
 		r.tipSeq = e.Event.Seq
@@ -33,6 +49,7 @@ func (r *hotRing) append(e *Entry) {
 	r.curBytes += e.approxBytes()
 	r.tipSeq = e.Event.Seq + 1
 	r.evict()
+	return reset
 }
 
 // evict drops oldest entries until curBytes <= maxBytes. Always keeps at
@@ -60,7 +77,16 @@ func (r *hotRing) lookup(cursor uint64) (entries []*Entry, ok bool) {
 	if cursor < r.baseSeq || cursor >= r.tipSeq {
 		return nil, false
 	}
+	// Bounds guard: with the dense invariant (append resets on any gap)
+	// len(buf) always equals tipSeq-baseSeq, making this unreachable. It
+	// stays as the last line of defense because the failure mode of index
+	// drift is not an error return but serving the WRONG event — or an
+	// out-of-range panic in the caller while it holds the tail mutex,
+	// wedging every subscriber and the ingest hot path (#244).
 	idx := int(cursor - r.baseSeq)
+	if idx < 0 || idx >= len(r.buf) {
+		return nil, false
+	}
 	return r.buf[idx:], true
 }
 

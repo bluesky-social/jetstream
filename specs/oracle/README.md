@@ -30,3 +30,10 @@ naming the failure mode (not the test).
   (no retry) and a record went missing; fixed in atmos with a repo
   completeness check (`CheckComplete` / `LoadCompleteFromCAR`) that classifies
   the truncation as transient, and removed the jetstream handler bandaid.
+- [2026-07-05 — retry appends bypass the /subscribe tail](2026-07-05-retry-appends-bypass-subscribe-tail.md):
+  failed-repo/net-new retry rows consumed shared-writer seqs but never fed
+  the hot ring (consumer-scoped OnEvent vs writer-scoped allocator), punching
+  a seq hole that served wrong events to replaying clients and could panic
+  while holding the tail mutex, wedging ingestion; fixed with a writer-level
+  ordered event sink feeding the tail from the shared append path, plus
+  ring reset-on-gap hardening (#244).

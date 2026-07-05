@@ -34,8 +34,8 @@ func (w *World) AddHiddenAccountForTest(ctx context.Context, initialRecords int)
 	}
 
 	b := w.db.NewBatch()
+	defer func() { _ = b.Close() }()
 	if err := w.saveAccount(b, a); err != nil {
-		_ = b.Close()
 		return 0, Account{}, err
 	}
 	if err := b.Commit(nil); err != nil {

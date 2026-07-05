@@ -110,17 +110,30 @@ func newTail(cfg tailConfig) *Tail {
 // tip. Non-blocking (honors ingest's no-block OnEvent contract). The event
 // struct is copied; Payload is shared read-only (the caller must not retain
 // or mutate ev's payload after Append returns).
+//
+// Events MUST arrive in dense seq order (the ingest writer's ordered
+// append hook guarantees this in production). A non-dense append resets
+// the ring — readers inside the dropped window fall through to the cold
+// path — and is surfaced loudly here: it means a producer is appending
+// durable events without feeding the tail, the #244 bug class.
 func (t *Tail) Append(ev *segment.Event) {
 	cp := *ev
 	e := newEntry(&cp)
 	t.mu.Lock()
-	t.ring.append(e)
+	reset := t.ring.append(e)
 	t.metrics.incEventsAppended()
+	if reset {
+		t.metrics.incHotRingResets()
+	}
 	t.metrics.setHotRingBytes(t.ring.bytes())
 	old := t.notify
 	t.notify = make(chan struct{})
 	t.mu.Unlock()
 	close(old) // wake all waiters; they re-read under the lock
+	if reset && t.logger != nil {
+		t.logger.Warn("hot ring reset on non-dense append; a durable-writer producer is bypassing the tail feed",
+			"seq", cp.Seq)
+	}
 }
 
 // liveTipLocked returns the seq at which a subscriber is caught up to the live
@@ -186,12 +199,17 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 		notify := t.notify
 		t.mu.Unlock()
 
-		if ok {
+		if ok && len(out) > 0 {
 			// Hot hit: serve from the resident ring.
 			next := out[len(out)-1].Event.Seq + 1
 			t.metrics.incHotReads()
 			return out, next, nil
 		}
+		// ok with an empty batch cannot happen (lookup returns a non-empty
+		// suffix or !ok) — but if index math ever drifted again (#244), an
+		// unguarded out[len(out)-1] would panic. The mutex is already
+		// released here, but subscribers would still crash-loop; fall
+		// through to the cold/block classification instead.
 
 		// Ring can't serve it. A cursor below the cold threshold is on disk
 		// (evicted, or pre-ring history); anything at/above it is the live
