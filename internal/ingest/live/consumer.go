@@ -421,10 +421,20 @@ func (c *Consumer) Run(ctx context.Context) error {
 }
 
 // noteStreamError records one stream-level (nil, err) yield from the
-// atmos iterator. Gaps are counted apart from decode errors: a gap is
-// the relay telling us data we can never fetch again is gone (upstream
-// loss), while a decode error is a garbage frame we chose to skip.
-// Operators alert on them differently.
+// atmos iterator. The classes carry different operator remediations, so
+// each lands on its own counter:
+//
+//   - GapError: the relay skipped seqs — upstream data loss, nothing we
+//     can do locally.
+//   - UnknownFrameError: a well-formed frame this build can't represent —
+//     a relay speaking a newer protocol; the fix is upgrading jetstream.
+//   - StreamError: an op=-1 server error frame (e.g. FutureCursor,
+//     ConsumerTooSlow), normally followed by a server-side close and an
+//     atmos reconnect. A persistent FutureCursor loop means our cursor is
+//     ahead of the relay (cursor corruption or a relay restored from an
+//     older backup) and never self-resolves — the labeled counter is the
+//     operator's signal to intervene.
+//   - anything else: a garbage frame we chose to skip (decode error).
 func (c *Consumer) noteStreamError(ctx context.Context, err error) {
 	if gap, ok := errors.AsType[*streaming.GapError](err); ok {
 		c.cfg.Metrics.noteSequenceGap(gap.Got - gap.Expected)
@@ -432,6 +442,23 @@ func (c *Consumer) noteStreamError(ctx context.Context, err error) {
 			"expected", gap.Expected,
 			"got", gap.Got,
 			"missed", gap.Got-gap.Expected,
+		)
+		return
+	}
+	if uf, ok := errors.AsType[*streaming.UnknownFrameError](err); ok {
+		c.cfg.Metrics.incUnknownEvents()
+		c.logger.WarnContext(ctx, "unknown frame from relay",
+			"t", uf.T,
+			"op", uf.Op,
+			"seq", uf.Seq,
+		)
+		return
+	}
+	if se, ok := errors.AsType[*streaming.StreamError](err); ok {
+		c.cfg.Metrics.incStreamErrorFrames(se.Code)
+		c.logger.WarnContext(ctx, "error frame from relay",
+			"code", se.Code,
+			"message", se.Message,
 		)
 		return
 	}
@@ -452,19 +479,24 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			ive, isInvalid := errors.AsType[*InvalidEventError](err)
 			switch {
 			case errors.Is(err, ErrUnknownEventKind):
-				// Forward-compat hole: a future relay variant we don't
-				// know how to archive. Count and log; the cursor we
-				// persist to relay/cursor comes from atmos's
-				// watermark, which advances past unknown kinds either
-				// way. A later build that learns this kind will
-				// re-fetch from cursor and any events at-or-after the
-				// last persisted watermark — under Parallelism>1 the
-				// watermark trails the highest yielded seq, so most
-				// near-real-time unknowns are still recoverable on
-				// restart, but events that fall behind the watermark
-				// before a restart are unreachable. Acceptable trade
-				// for cross-DID throughput; revisit if the unknown-
-				// event rate ever becomes non-trivial.
+				// Forward-compat hole: atmos decoded the frame but
+				// yielded an event with no envelope we can archive.
+				// (Wire-level unknown frame types never get this far —
+				// atmos surfaces those as *UnknownFrameError on the
+				// error slot, handled in noteStreamError; both paths
+				// land on the same unknown_events_total counter.)
+				// Count and log; the cursor we persist to relay/cursor
+				// comes from atmos's watermark, which advances past
+				// unknown kinds either way. A later build that learns
+				// this kind will re-fetch from cursor and any events
+				// at-or-after the last persisted watermark — under
+				// Parallelism>1 the watermark trails the highest
+				// yielded seq, so most near-real-time unknowns are
+				// still recoverable on restart, but events that fall
+				// behind the watermark before a restart are
+				// unreachable. Acceptable trade for cross-DID
+				// throughput; revisit if the unknown-event rate ever
+				// becomes non-trivial.
 				c.cfg.Metrics.incUnknownEvents()
 				c.logger.WarnContext(ctx, "unknown event kind",
 					"seq", evt.Seq,

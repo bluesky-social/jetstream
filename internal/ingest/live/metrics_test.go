@@ -23,6 +23,10 @@ func TestNewMetrics_RegistersAllSeries(t *testing.T) {
 	m := NewMetrics(reg)
 	require.NotNil(t, m)
 
+	// StreamErrorFrames is a labeled vec: no series exists until the
+	// first observation, so touch one label to make Gather see it.
+	m.incStreamErrorFrames("FutureCursor")
+
 	gathered, err := reg.Gather()
 	require.NoError(t, err)
 	names := make(map[string]struct{}, len(gathered))
@@ -36,6 +40,7 @@ func TestNewMetrics_RegistersAllSeries(t *testing.T) {
 		"jetstream_livestream_sequence_gaps_total",
 		"jetstream_livestream_sequence_gap_missed_seqs_total",
 		"jetstream_livestream_unknown_events_total",
+		"jetstream_livestream_stream_error_frames_total",
 		"jetstream_livestream_stale_resyncs_dropped_total",
 		"jetstream_livestream_replayed_account_events_dropped_total",
 		"jetstream_livestream_upstream_cursor",
@@ -60,11 +65,14 @@ func TestNewMetrics_RegistersAllSeries(t *testing.T) {
 	require.Panics(t, func() { _ = NewMetrics(reg) })
 }
 
-// TestNoteStreamError_ClassifiesGapsApartFromDecodeErrors pins the
-// operator contract: relay data loss (GapError) and garbage frames
-// (everything else) land on different counters, and the gap-width
-// counter accumulates the number of seqs the relay skipped.
-func TestNoteStreamError_ClassifiesGapsApartFromDecodeErrors(t *testing.T) {
+// TestNoteStreamError_ClassifiesStreamErrors pins the operator
+// contract for the iterator's error slot: each error class lands on
+// its own counter, because each carries a different remediation —
+// relay data loss (GapError), a relay speaking a newer protocol
+// (UnknownFrameError → upgrade jetstream), a server error frame
+// (StreamError, labeled by code; a FutureCursor loop needs an
+// operator), and garbage frames (everything else → decode errors).
+func TestNoteStreamError_ClassifiesStreamErrors(t *testing.T) {
 	t.Parallel()
 	metrics := NewMetrics(prometheus.NewRegistry())
 	c := &Consumer{
@@ -76,11 +84,20 @@ func TestNoteStreamError_ClassifiesGapsApartFromDecodeErrors(t *testing.T) {
 	c.noteStreamError(t.Context(), &streaming.GapError{Expected: 20, Got: 21})
 	c.noteStreamError(t.Context(), fmt.Errorf("wrapped: %w", &streaming.DecodeError{Err: errors.New("bad cbor")}))
 	c.noteStreamError(t.Context(), errors.New("some other stream error"))
+	c.noteStreamError(t.Context(), &streaming.UnknownFrameError{T: "#futureThing", Op: 1, Seq: 30})
+	c.noteStreamError(t.Context(), fmt.Errorf("wrapped: %w", &streaming.UnknownFrameError{T: "#other", Op: 2}))
+	c.noteStreamError(t.Context(), &streaming.StreamError{Code: "FutureCursor", Message: "cursor in the future"})
+	c.noteStreamError(t.Context(), &streaming.StreamError{Code: "FutureCursor"})
+	c.noteStreamError(t.Context(), &streaming.StreamError{Code: "ConsumerTooSlow"})
 
 	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.SequenceGaps), 0,
 		"each GapError yield must count one gap")
 	require.InDelta(t, 6.0, testutil.ToFloat64(metrics.SequenceGapMissedSeqs), 0,
 		"gap widths must accumulate: (15-10) + (21-20)")
 	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.DecodeErrors), 0,
-		"non-gap stream errors must stay on decode_errors_total")
+		"only unclassified stream errors land on decode_errors_total")
+	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.UnknownEvents), 0,
+		"unknown frames (direct or wrapped) land on unknown_events_total")
+	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("FutureCursor")), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("ConsumerTooSlow")), 0)
 }

@@ -17,6 +17,7 @@ type Metrics struct {
 	SequenceGaps          prometheus.Counter
 	SequenceGapMissedSeqs prometheus.Counter
 	UnknownEvents         prometheus.Counter
+	StreamErrorFrames     *prometheus.CounterVec
 	StaleResyncsDropped   prometheus.Counter
 	ReplayedAccountsDrop  prometheus.Counter
 	UpstreamCursor        prometheus.Gauge
@@ -60,9 +61,23 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		UnknownEvents: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "unknown_events_total",
-			Help: "Number of upstream events whose kind ConvertEvent did not recognize. " +
-				"These do NOT advance the upstream cursor so a future build can replay them.",
+			Help: "Number of upstream frames or events this build does not recognize " +
+				"(unknown frame type/op from the relay, or an event kind ConvertEvent " +
+				"cannot map). Each one is an archival hole a jetstream upgrade would fix: " +
+				"the seq is consumed upstream but nothing is stored. The watermark cursor " +
+				"advances past them once later events flush, so they are NOT re-delivered " +
+				"to a future build unless it re-backfills the range.",
 		}),
+		StreamErrorFrames: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "stream_error_frames_total",
+			Help: "Number of op=-1 error frames received from the relay, labeled by " +
+				"machine-readable code (e.g. FutureCursor, ConsumerTooSlow). The relay " +
+				"usually closes the connection after sending one; atmos reconnects with " +
+				"backoff. A steadily climbing FutureCursor count means our persisted " +
+				"cursor is ahead of the relay (cursor corruption or a relay restored " +
+				"from backup) — that loop never self-resolves and needs an operator.",
+		}, []string{"code"}),
 		ReplayedAccountsDrop: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "replayed_account_events_dropped_total",
@@ -87,7 +102,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	reg.MustRegister(
 		m.EventsReceived, m.Reconnects,
 		m.DecodeErrors, m.SequenceGaps, m.SequenceGapMissedSeqs,
-		m.UnknownEvents, m.StaleResyncsDropped,
+		m.UnknownEvents, m.StreamErrorFrames, m.StaleResyncsDropped,
 		m.ReplayedAccountsDrop, m.UpstreamCursor,
 	)
 	return m
@@ -123,6 +138,12 @@ func (m *Metrics) noteSequenceGap(missed int64) {
 func (m *Metrics) incUnknownEvents() {
 	if m != nil {
 		m.UnknownEvents.Inc()
+	}
+}
+
+func (m *Metrics) incStreamErrorFrames(code string) {
+	if m != nil {
+		m.StreamErrorFrames.WithLabelValues(code).Inc()
 	}
 }
 
