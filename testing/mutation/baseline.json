@@ -33,6 +33,7 @@
     {"id":"m038_live_op_path_gate_skipped","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m039_backfill_rkey_gate_skipped","disposition":"KILLED","result":"KILLED@default","note":"oracle: extra did:plc:iv2erqbe5k4ltaawmik4tfeo app.bsky.feed.post/.."},
     {"id":"m040_live_op_drop_escalated_whole_event","disposition":"KILLED","result":"KILLED@default","note":"see log"},
-    {"id":"m041_identity_swallowed","disposition":"KILLED","result":"KILLED@default","note":"see log"}
+    {"id":"m041_identity_swallowed","disposition":"KILLED","result":"KILLED@default","note":"see log"},
+    {"id":"m042_missing_block_arm_discards_siblings","disposition":"KILLED","result":"KILLED@frames","note":"see log"}
   ]
 }

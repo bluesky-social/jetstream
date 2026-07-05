@@ -13,7 +13,7 @@ expected-tier: stress
 tiers: default,stress,restart
 
 diff --git a/segment/writer.go b/segment/writer.go
-index e5c7c45..9b53bbb 100644
+index 1bba456..084a262 100644
 --- a/segment/writer.go
 +++ b/segment/writer.go
 @@ -548,7 +548,7 @@ func (w *Writer) flushLocked() error {

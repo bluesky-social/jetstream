@@ -1,0 +1,39 @@
+mutant: m042_missing_block_arm_discards_siblings
+target: internal/ingest/live/consumer.go
+failure-mode: |
+  The consumer's per-op-drop arm (DroppedOpsError: missing record
+  blocks / spec-invalid op paths) advances the cursor and `continue`s
+  instead of falling through to the append — silently discarding the
+  WELL-FORMED sibling ops of the same commit along with the dropped
+  one. A single partial-CAR commit from a non-canonical PDS (the
+  production shape that motivated the arm) then costs every record it
+  carried, not just the block-less op: permanent, metric-invisible
+  data loss that the drop counters actively mask (they report exactly
+  the drops the operator expects to see).
+expected-detection: |
+  frames tier: TestOracle_FrameStrippedLeafBlockDropsOp drives the real
+  consumer over a simulator commit whose CAR omits one record leaf
+  block among three create ops and barriers on the surviving siblings'
+  durable rows — under this mutant the siblings never land and the
+  waitForRowCount barrier times out ("timed out waiting for the
+  surviving sibling rows"). The live-package unit test
+  TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer kills faster
+  and directly: its WriterMetrics.EventsAppended assertion ("the
+  surviving sibling op must be archived, not discarded with the
+  dropped one") reads 0 instead of 1.
+expected-tier: frames
+tiers: frames
+
+diff --git a/internal/ingest/live/consumer.go b/internal/ingest/live/consumer.go
+index 08f2d77..78bfc72 100644
+--- a/internal/ingest/live/consumer.go
++++ b/internal/ingest/live/consumer.go
+@@ -548,6 +548,8 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
+ 						"did", dme.Dropped[0].DID,
+ 					)
+ 				}
++				c.noteUpstreamSeq(evt.Seq)
++				continue
+ 			case err != nil:
+ 				c.cfg.Metrics.incDecodeErrors()
+ 				// Bad shape from upstream is invalid external input,

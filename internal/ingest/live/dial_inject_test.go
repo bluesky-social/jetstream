@@ -13,6 +13,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -177,4 +178,97 @@ func TestConsumer_Run_SequenceGapCountsGapMetricNotDecodeErrors(t *testing.T) {
 
 	got := readAllSegmentEvents(t, dir)
 	require.Len(t, got, len(frames), "events on either side of the gap must still archive")
+}
+
+// TestConsumer_Run_UnknownAndErrorFramesClassified drives an unknown
+// frame type (with a seq in its body) and an op=-1 error frame through
+// the REAL atmos pipeline, between recognized events, and pins the
+// end-to-end metric contract:
+//
+//   - the unknown frame lands on unknown_events_total — NOT
+//     sequence_gaps_total (its body seq suppresses the spurious gap)
+//     and NOT decode_errors_total (it is well-formed);
+//   - the error frame lands on stream_error_frames_total{code};
+//   - the recognized events around both still archive, so neither
+//     frame class can stall the consumer.
+func TestConsumer_Run_UnknownAndErrorFramesClassified(t *testing.T) {
+	t.Parallel()
+
+	unknownBody := cbor.AppendMapHeader(nil, 2)
+	unknownBody = append(unknownBody, cbor.AppendTextKey(nil, "seq")...)
+	unknownBody = cbor.AppendInt(unknownBody, 2)
+	unknownBody = append(unknownBody, cbor.AppendTextKey(nil, "did")...)
+	unknownBody = cbor.AppendText(unknownBody, "did:plc:future")
+
+	errHdr := cbor.AppendMapHeader(nil, 1)
+	errHdr = append(errHdr, cbor.AppendTextKey(nil, "op")...)
+	errHdr = cbor.AppendInt(errHdr, -1)
+	errBody := cbor.AppendMapHeader(nil, 2)
+	errBody = append(errBody, cbor.AppendTextKey(nil, "error")...)
+	errBody = cbor.AppendText(errBody, "FutureCursor")
+	errBody = append(errBody, cbor.AppendTextKey(nil, "message")...)
+	errBody = cbor.AppendText(errBody, "cursor beyond relay head")
+
+	frames := [][]byte{
+		encodeIdentityFrame(t, "did:plc:aaa", 1),
+		encodeFrame(t, "#futureThing", unknownBody),
+		encodeIdentityFrame(t, "did:plc:bbb", 3),
+		append(errHdr, errBody...),
+		encodeIdentityFrame(t, "did:plc:ccc", 4),
+	}
+	conn := newMemConn(frames...)
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	metrics := NewMetrics(prometheus.NewRegistry())
+
+	var delivered atomic.Int64
+	c, err := Open(Config{
+		SegmentsDir:       dir,
+		Store:             st,
+		SeqKey:            "live_segments/seq/next",
+		CursorKey:         "relay/cursor",
+		RelayURL:          "https://relay.invalid",
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:          newTestVerifier(t),
+		Metrics:           metrics,
+		MaxEventsPerBlock: 2,
+		OnEvent:           func(*segment.Event) { delivered.Add(1) },
+		Dial: func(context.Context, string) (streaming.Conn, *http.Response, error) {
+			return conn, nil, nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- c.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		return delivered.Load() >= 3
+	}, 3*time.Second, 10*time.Millisecond,
+		"consumer never delivered the recognized events around the unknown/error frames")
+
+	cancel()
+	select {
+	case <-runErr:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	require.NoError(t, c.Close())
+
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.UnknownEvents), 0,
+		"the unknown frame type must land on unknown_events_total")
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("FutureCursor")), 0,
+		"the op=-1 frame must land on stream_error_frames_total{code=FutureCursor}")
+	require.Zero(t, testutil.ToFloat64(metrics.SequenceGaps),
+		"the unknown frame's body seq must suppress the spurious gap")
+	require.Zero(t, testutil.ToFloat64(metrics.DecodeErrors),
+		"well-formed unknown/error frames must NOT count as decode errors")
+
+	got := readAllSegmentEvents(t, dir)
+	require.Len(t, got, 3, "recognized events on all sides must archive")
 }

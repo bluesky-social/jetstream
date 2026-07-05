@@ -188,7 +188,7 @@ func (w *World) GenerateAdversarialOpForTest(ctx context.Context, idx int, badKe
 		CID:    gt.Some(lextypes.LexCIDLink{Link: sibCID.String()}),
 	}
 
-	frame, newState, err := w.commitAndBroadcast(author, rp, store, prevState, []comatproto.SyncSubscribeRepos_RepoOp{sibOp, badOp})
+	frame, newState, err := w.commitAndBroadcast(author, rp, store, prevState, []comatproto.SyncSubscribeRepos_RepoOp{sibOp, badOp}, nil)
 	if err != nil {
 		return GeneratedChainOp{}, err
 	}
@@ -376,7 +376,7 @@ func (w *World) commitAndBroadcastWithRev(author account, rp *repo.Repo, store *
 	if err != nil {
 		return nil, err
 	}
-	carBuf, err := packageCARDiff(store, newState.CommitCID)
+	carBuf, err := packageCARDiff(store, newState.CommitCID, nil)
 	if err != nil {
 		return nil, err
 	}
