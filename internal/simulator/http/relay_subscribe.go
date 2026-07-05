@@ -211,11 +211,17 @@ func (w *subscribeFaultWriter) fireReplay(ctx context.Context) error {
 			cursor += int64(len(page))
 		}
 	}
+	// Note the replay BEFORE writing: once the client has read a replayed
+	// frame there must be a happens-before with the counters, or a test
+	// polling SubscribeReposReplaysFired after draining the frames races
+	// this goroutine. On a mid-replay write failure this overcounts
+	// delivered frames, which keeps replayedFrames a valid upper bound
+	// for the oracle's storage-bloat check.
+	w.faults.noteSubscribeReplay(len(frames))
 	for _, f := range frames {
 		if err := w.conn.Write(ctx, websocket.MessageBinary, f); err != nil {
 			return err
 		}
 	}
-	w.faults.noteSubscribeReplay(len(frames))
 	return nil
 }
