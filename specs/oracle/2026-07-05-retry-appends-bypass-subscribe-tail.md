@@ -92,3 +92,16 @@ When a fanout cache is keyed to a shared allocator's output, feed it from the
 allocator, not from one of the producers. Assumption-carrying data structures
 (dense-index rings) need their invariant either enforced at the single choke
 point or checked at use — this one had neither.
+
+## Follow-up
+
+Post-commit adversarial review of the fix (589f632) found a latent defect in
+the sink×async-flush combination: the async writer delivers to the sink after
+`PrepareFlush` detaches a filled block but before the background commit lands
+it, so a delivered event can transiently be cold-readable nowhere. Unreachable
+in production wiring (sink is steady-writer-only; async is bootstrap-only);
+contained by construction in #249 (`SetOrderedEventSink` panics on an async
+writer, 90769e1). The structural fix — visibility owned by the writer instead
+of being an accident of durability-pipeline position — is the #248
+readable-log refactor; analysis and benchmarks in
+`specs/notes/2026-07-05-readable-log-writer-design.md`.
