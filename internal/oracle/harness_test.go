@@ -408,6 +408,14 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	// lost, exactly as the ledger asserts.
 	acctOp, acctSyncLie, acctVerifier := pickAdversarialAccounts(t, w, cfg)
 	steadyStartSeq := w.CurrentSeq()
+	// #203 account-status lifecycle FIRST, before the random steady traffic:
+	// the m043 mutation gate needs these rows at or below a steady compaction
+	// watermark, and the pass that provides it is triggered by the steady
+	// traffic's first tombstone (CompactionTombstoneCap=1). Injecting before
+	// generateN guarantees the lifecycle rows are already archived when that
+	// pass force-rotates, so its watermark covers them. The shutdown-flush
+	// anti-vacuity assertion below enforces this coverage.
+	accountStatusDID := injectOracleAccountStatusLifecycle(t, w, cfg)
 	generateN(t, w, cfg.LiveEventsSteady)
 	// Deterministic #202 identity injections, independent of the random
 	// mix: a handle-change payload (the optional-field shape) and a
@@ -426,7 +434,6 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	injectAdversarialLiveOpLies(t, w, cfg, acctOp)
 	_, err = w.GenerateSilentMutationThenSyncForTest(t.Context(), syncIdx)
 	require.NoError(t, err)
-	accountStatusDID := injectOracleAccountStatusLifecycle(t, w, cfg)
 	_, err = w.GenerateAdversarialSyncForTest(t.Context(), acctSyncLie, "not-a-tid")
 	require.NoErrorf(t, err, "adversarial sync lie: mode=%s seed=%d", cfg.Mode, cfg.Seed)
 	exemptWholeEventSeqs(steadyAck, w.AdversarialLedger().Entries())
@@ -442,7 +449,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	assertNoPermanentCursorGapExcept(t, steadyEventLog, steadyStartSeq, targetSeq, cfg, "steady-state",
 		newAdversarialFilter(w.AdversarialLedger().Entries()))
 	assertIdentityArchived(t, cfg, bootstrapEventLog, steadyEventLog, identityDID(t, w, identityIdx))
-	assertAccountStatusLifecycleArchived(t, cfg, steadyEventLog, accountStatusDID)
+	accountStatusMaxSeq := assertAccountStatusLifecycleArchived(t, cfg, steadyEventLog, accountStatusDID)
 	// The malformed-DID identity must be rejected by the net-new
 	// enqueuer's validation gate (metric via the debug /metrics surface,
 	// scraped while the runtime is still serving), and at least one VALID
@@ -529,6 +536,14 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	assertSubscribeReposFaultPlanFired(t, cfg, faultPlan)
 	assertUnavailableRepoStatuses(t, dataDir, w, cfg)
 	assertOracleMatches(t, dataDir, w, cfg, "steady-state-shutdown-flush")
+	// Anti-vacuity for the #203 / m043 gate: the tombstone-exactness fold only
+	// touches rows at or below a pass watermark, so the lifecycle's account
+	// rows must be covered by the final watermark or the "non-deleted statuses
+	// never fold as tombstones" property was never actually exercised
+	// end-to-end this run.
+	require.GreaterOrEqualf(t, compaction.Last(t).Watermark, accountStatusMaxSeq,
+		"final compaction watermark did not cover the #203 account-status lifecycle rows (mode=%s seed=%d): the tombstone-exactness fold never saw them, so the m043 gate is vacuous — inject earlier or ensure a later pass",
+		cfg.Mode, cfg.Seed)
 	assertCompacted(t, dataDir, compaction.Last(t).Watermark, cfg, "steady-state-shutdown-flush")
 	// Compaction over-drop / data-loss check (#100): every compaction pass
 	// must have preserved each row the documented filter says survives at its

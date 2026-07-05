@@ -55,6 +55,16 @@ func configureOracleUnavailableRepos(t *testing.T, w *world.World, cfg Config, t
 	})
 }
 
+// injectOracleAccountStatusLifecycle emits the deterministic #203 lifecycle
+// for the fixture account: a probe create, then every non-deleted inactive
+// status, then an active=true reactivation. It MUST run at the START of the
+// steady window, before the random steady traffic: the m043 mutation gate
+// depends on a later compaction fold covering these rows (a status frame
+// misclassified as a deletion tombstone then drops the probe row and the
+// account's backfilled records), and only rows appended before the steady
+// traffic's tombstone-triggered compaction passes reliably land at or below
+// a pass watermark. assertAccountStatusLifecycleArchived returns the archived
+// row seqs so the harness can assert that coverage (anti-vacuity).
 func injectOracleAccountStatusLifecycle(t *testing.T, w *world.World, cfg Config) string {
 	t.Helper()
 	require.Truef(t, oracleAccountFetchable(t, w, oracleAccountStatusLifecycleIndex),
@@ -73,23 +83,32 @@ func injectOracleAccountStatusLifecycle(t *testing.T, w *world.World, cfg Config
 	return string(acct.DID)
 }
 
-func assertAccountStatusLifecycleArchived(t *testing.T, cfg Config, steady *eventLogRecorder, did string) {
+// assertAccountStatusLifecycleArchived proves the injected lifecycle archived
+// faithfully and returns the highest archived seq among the lifecycle rows.
+// The caller asserts the final compaction watermark reached that seq: without
+// that coverage the m043 tombstone-exactness gate is vacuous (a fold that
+// misclassifies these statuses as deletions only drops rows at or below a
+// pass watermark).
+func assertAccountStatusLifecycleArchived(t *testing.T, cfg Config, steady *eventLogRecorder, did string) uint64 {
 	t.Helper()
 
 	statusCounts := make(map[string]int, len(oracleNonDeletedAccountStatuses))
 	var sawProbeCreate bool
 	var sawReactivation bool
+	var maxSeq uint64
 	for _, ev := range steady.snapshotEvents() {
 		if ev.DID != did {
 			continue
 		}
 		if ev.Kind == segment.KindCreate && ev.Collection == "app.bsky.feed.post" && ev.Rkey == oracleAccountStatusRkey {
 			sawProbeCreate = true
+			maxSeq = max(maxSeq, ev.Seq)
 			continue
 		}
 		if ev.Kind != segment.KindAccount {
 			continue
 		}
+		maxSeq = max(maxSeq, ev.Seq)
 		var acc comatproto.SyncSubscribeRepos_Account
 		require.NoErrorf(t, acc.UnmarshalCBOR(ev.Payload),
 			"decode archived account status did=%s seq=%d mode=%s seed=%d", did, ev.Seq, cfg.Mode, cfg.Seed)
@@ -117,6 +136,7 @@ func assertAccountStatusLifecycleArchived(t *testing.T, cfg Config, steady *even
 	require.Truef(t, sawReactivation,
 		"account-status lifecycle active=true reactivation did=%s was not archived: mode=%s seed=%d",
 		did, cfg.Mode, cfg.Seed)
+	return maxSeq
 }
 
 func assertUnavailableRepoStatuses(t *testing.T, dataDir string, w *world.World, cfg Config) {
