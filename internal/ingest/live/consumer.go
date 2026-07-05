@@ -179,6 +179,12 @@ func (c *Consumer) promoteSyncState(segEvts []segment.Event) {
 		if segEvts[i].Kind == segment.KindAccount {
 			c.cfg.SyncStateStore.PromoteHosting(atmos.DID(segEvts[i].DID), segEvts[i].UpstreamRelayCursor)
 		}
+		if segEvts[i].Kind == segment.KindIdentity {
+			// Identity has no verifier pending phase; record the
+			// applied-seq ratchet directly at the same post-append
+			// point where hosting promotes (#234 replay guard).
+			c.cfg.SyncStateStore.RecordIdentitySeq(atmos.DID(segEvts[i].DID), segEvts[i].UpstreamRelayCursor)
+		}
 	}
 	if maxRev != "" {
 		c.cfg.SyncStateStore.PromoteChain(did, maxRev)
@@ -253,6 +259,39 @@ func (c *Consumer) dropReplayedAccountEvent(ctx context.Context, segEvts []segme
 		"did", segEvts[0].DID,
 		"seq", segEvts[0].UpstreamRelayCursor,
 		"applied_seq", state.Seq,
+	)
+	return true, nil
+}
+
+// dropReplayedIdentityEvent is the #identity analogue of the #account
+// guard above (#234). #identity events have no replay protection at any
+// other layer: atmos does not process them (no rev, no verifier state,
+// no OnAccountEvent path), so a relay seq replay after a reconnect
+// re-archives the row at a fresh jetstream seq — a permanent duplicate
+// in the immutable archive. Identity rows never fold, so unlike #231
+// this is bloat rather than erasure, but it breaks the zero-bloat
+// exact-multiset contract all the same. The applied seq is jetstream's
+// own ratchet, recorded post-append in promoteSyncState and flushed
+// with the cursor batch (after the segment fsync), so seq <= applied
+// means this exact event's row is already archived. A ratchet of 0
+// means no identity row has ever been applied for the DID; real relay
+// seqs start at 1 so 0 is never a valid applied value.
+func (c *Consumer) dropReplayedIdentityEvent(ctx context.Context, segEvts []segment.Event) (bool, error) {
+	if c.cfg.SyncStateStore == nil || len(segEvts) != 1 || segEvts[0].Kind != segment.KindIdentity {
+		return false, nil
+	}
+	applied, err := c.cfg.SyncStateStore.LoadAppliedIdentitySeq(ctx, atmos.DID(segEvts[0].DID))
+	if err != nil {
+		return false, fmt.Errorf("livestream: identity replay guard: %w", err)
+	}
+	if applied == 0 || segEvts[0].UpstreamRelayCursor > applied {
+		return false, nil
+	}
+	c.cfg.Metrics.incReplayedIdentityEventsDropped()
+	c.logger.WarnContext(ctx, "dropped replayed identity event",
+		"did", segEvts[0].DID,
+		"seq", segEvts[0].UpstreamRelayCursor,
+		"applied_seq", applied,
 	)
 	return true, nil
 }
@@ -538,6 +577,13 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			}
 
 			if replayed, err := c.dropReplayedAccountEvent(ctx, segEvts); err != nil {
+				return err
+			} else if replayed {
+				c.noteUpstreamSeq(evt.Seq)
+				continue
+			}
+
+			if replayed, err := c.dropReplayedIdentityEvent(ctx, segEvts); err != nil {
 				return err
 			} else if replayed {
 				c.noteUpstreamSeq(evt.Seq)

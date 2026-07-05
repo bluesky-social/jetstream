@@ -104,3 +104,130 @@ func TestProcessBatch_ReplayedAccountEventIsDroppedNotReArchived(t *testing.T) {
 	require.Equal(t, int64(7), c.LastUpstreamSeq(),
 		"replay drops must still advance the in-memory upstream watermark")
 }
+
+func archivedIdentitySeq(t *testing.T, payload []byte) int64 {
+	t.Helper()
+	var ident comatproto.SyncSubscribeRepos_Identity
+	require.NoError(t, ident.UnmarshalCBOR(payload))
+	return ident.Seq
+}
+
+func identityEvent(did string, seq int64) streaming.Event {
+	return streaming.Event{Seq: seq, Identity: &comatproto.SyncSubscribeRepos_Identity{
+		DID:  did,
+		Seq:  seq,
+		Time: "2026-07-04T00:00:00Z",
+	}}
+}
+
+// TestProcessBatch_ReplayedIdentityEventIsDroppedNotReArchived pins the
+// #234 guard: #identity events have no replay protection at any other
+// layer (atmos does not process them), so a relay seq replay after a
+// reconnect would re-archive the row as a permanent duplicate. The
+// guard's ratchet is recorded by the consumer itself at append time —
+// so unlike the #account arrangement above, archiving through
+// processBatch IS the arrangement: a second delivery of the same seq
+// must drop, a higher seq must archive, and a fresh DID must pass.
+func TestProcessBatch_ReplayedIdentityEventIsDroppedNotReArchived(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	metrics := NewMetrics(prometheus.NewRegistry())
+	stateStore := syncstate.New(st)
+
+	const did = "did:plc:identreplay"
+
+	c, err := Open(Config{
+		SegmentsDir:    dir,
+		Store:          st,
+		SeqKey:         "live_segments/seq/next",
+		CursorKey:      "relay/cursor",
+		RelayURL:       "https://example.invalid",
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:       newTestVerifier(t),
+		SyncStateStore: stateStore,
+		Metrics:        metrics,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	// First delivery archives and records the applied-seq ratchet.
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		identityEvent(did, 5),
+	}))
+	// Relay replays: at and below the applied seq. Both must drop.
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		identityEvent(did, 5),
+		identityEvent(did, 4),
+	}))
+	// New data above the ratchet must archive; a fresh DID must pass.
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		identityEvent(did, 6),
+		identityEvent("did:plc:identfresh", 7),
+	}))
+	require.NoError(t, c.Close())
+
+	got := readAllSegmentEvents(t, dir)
+	require.Len(t, got, 3, "replayed identity events must not re-archive")
+	require.Equal(t, int64(5), archivedIdentitySeq(t, got[0].Payload))
+	require.Equal(t, did, got[0].DID)
+	require.Equal(t, int64(6), archivedIdentitySeq(t, got[1].Payload))
+	require.Equal(t, did, got[1].DID)
+	require.Equal(t, int64(7), archivedIdentitySeq(t, got[2].Payload))
+	require.Equal(t, "did:plc:identfresh", got[2].DID)
+
+	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.ReplayedIdentityDrop), 0,
+		"both replayed identity events must be counted")
+	require.Equal(t, int64(7), c.LastUpstreamSeq(),
+		"replay drops must still advance the in-memory upstream watermark")
+}
+
+// TestProcessBatch_IdentityReplayGuardSurvivesRestart pins the durable
+// half of #234: the ratchet persists via the syncstate flush, so a
+// replay delivered to a FRESH consumer over the same store (the
+// restart + relay-regression window) still drops.
+func TestProcessBatch_IdentityReplayGuardSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	stateStore := syncstate.New(st)
+
+	const did = "did:plc:identrestart"
+
+	open := func(m *Metrics) *Consumer {
+		c, err := Open(Config{
+			SegmentsDir:    dir,
+			Store:          st,
+			SeqKey:         "live_segments/seq/next",
+			CursorKey:      "relay/cursor",
+			RelayURL:       "https://example.invalid",
+			Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Verifier:       newTestVerifier(t),
+			SyncStateStore: stateStore,
+			Metrics:        m,
+		})
+		require.NoError(t, err)
+		return c
+	}
+
+	c1 := open(nil)
+	require.NoError(t, c1.processBatch(t.Context(), []streaming.Event{
+		identityEvent(did, 9),
+	}))
+	// Close flushes promoted syncstate (the ratchet) to pebble.
+	require.NoError(t, c1.Close())
+
+	metrics := NewMetrics(prometheus.NewRegistry())
+	c2 := open(metrics)
+	t.Cleanup(func() { _ = c2.Close() })
+	require.NoError(t, c2.processBatch(t.Context(), []streaming.Event{
+		identityEvent(did, 9),
+	}))
+	require.NoError(t, c2.Close())
+
+	got := readAllSegmentEvents(t, dir)
+	require.Len(t, got, 1, "cross-restart identity replay must not re-archive")
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.ReplayedIdentityDrop), 0)
+}

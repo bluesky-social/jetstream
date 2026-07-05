@@ -24,6 +24,33 @@ type Config struct {
 	CommitsPerSec     float64
 	RateMultiplier    float64
 	FirehoseHistory   int
+	TrafficMix        TrafficMix
+}
+
+// TrafficMix is the weighted event-kind distribution the live traffic
+// pump draws from. Weights are relative, not percentages. It is a
+// Config field (rather than a package constant) so future swarm-style
+// tiers can draw a different mix per seed (#233).
+//
+// The commit-action weights are deliberately NOT production-shaped: a
+// 180s production sample (2026-07-04) measured create 95.5 / delete
+// 3.9 / update 0.6 and identity at 0.061% of all events. The mix
+// over-weights tombstone-forming ops (update/delete) because that is
+// where compaction bugs live, and holds identity well above its
+// production rate so a default-scale oracle run (~200 live events)
+// still exercises the path several times instead of 0.12 times.
+// Production-shaped regression coverage is the corpus tier's job.
+type TrafficMix struct {
+	Create   float64
+	Update   float64
+	Delete   float64
+	Identity float64
+}
+
+// DefaultTrafficMix returns the design-doc action distribution plus
+// the identity weight discussed on #202.
+func DefaultTrafficMix() TrafficMix {
+	return TrafficMix{Create: 75, Update: 15, Delete: 10, Identity: 3}
 }
 
 // DefaultConfig returns simulator defaults matching the design doc.
@@ -39,6 +66,7 @@ func DefaultConfig() Config {
 		CommitsPerSec:     10,
 		RateMultiplier:    1.0,
 		FirehoseHistory:   10000,
+		TrafficMix:        DefaultTrafficMix(),
 	}
 }
 
@@ -86,7 +114,38 @@ func (c Config) validate() error {
 	if c.FirehoseHistory < 0 {
 		return fmt.Errorf("world: FirehoseHistory must be >= 0 (got %d)", c.FirehoseHistory)
 	}
+	if err := c.TrafficMix.validate(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (m TrafficMix) validate() error {
+	for _, w := range []struct {
+		name string
+		val  float64
+	}{
+		{"Create", m.Create}, {"Update", m.Update},
+		{"Delete", m.Delete}, {"Identity", m.Identity},
+	} {
+		if w.val < 0 {
+			return fmt.Errorf("world: TrafficMix.%s must be >= 0 (got %v)", w.name, w.val)
+		}
+	}
+	return nil
+}
+
+// isZero reports whether the mix is entirely unset. New treats a
+// zero-value mix as "use DefaultTrafficMix" (matching the zero-value
+// defaulting convention elsewhere, e.g. backfill.LiveEnqueuerConfig)
+// so literal Config construction keeps working. An explicit all-zero
+// mix is indistinguishable from unset by design: a mix that generates
+// nothing is never a meaningful configuration, and weightedChoice
+// would silently return the last option. A partial mix (e.g. only
+// Identity set) is honored as-is — a future swarm tier (#233) may
+// deliberately omit kinds.
+func (m TrafficMix) isZero() bool {
+	return m == TrafficMix{}
 }
 
 // canonicalPath returns an absolute, symlink-resolved version of p.

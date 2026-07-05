@@ -48,17 +48,31 @@ func (w *World) nextTrafficDelay(mean float64) float64 {
 	return exponentialDelay(w.rng, mean)
 }
 
-// actionMix is the design-doc weighted action distribution.
-var actionMix = []weighted[string]{
-	{value: "create", weight: 75},
-	{value: "update", weight: 15},
-	{value: "delete", weight: 10},
+// buildTrafficMixTables precomputes the weighted-draw tables from a
+// TrafficMix. Zero-weight kinds are omitted entirely rather than kept
+// at weight 0: weightedChoice's final-option fallback could otherwise
+// return a disabled kind, and a future swarm tier (#233) relies on
+// omission being genuine absence.
+func buildTrafficMixTables(m TrafficMix) (kindMix, actionMix []weighted[string]) {
+	add := func(dst []weighted[string], name string, wt float64) []weighted[string] {
+		if wt > 0 {
+			dst = append(dst, weighted[string]{value: name, weight: wt})
+		}
+		return dst
+	}
+	actionMix = add(actionMix, "create", m.Create)
+	actionMix = add(actionMix, "update", m.Update)
+	actionMix = add(actionMix, "delete", m.Delete)
+	kindMix = append(kindMix, actionMix...)
+	kindMix = add(kindMix, "identity", m.Identity)
+	return kindMix, actionMix
 }
 
-// generateOne is one tick of the live commit pump: pick an account
-// (Zipfian), apply N ops (mostly 1) of a chosen action, sign + persist,
-// build a CAR diff with only the new blocks, and broadcast the frame.
-// Returns the wire frame so tests can inspect it.
+// generateOne is one tick of the live traffic pump: draw a frame kind
+// from the configured mix, pick an account (Zipfian), and emit either
+// a #commit (apply N ops — mostly 1 — of the drawn action, sign +
+// persist, build a CAR diff with only the new blocks) or an #identity
+// frame. Returns the wire frame so tests can inspect it.
 func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 	w.mutationMu.Lock()
 	defer w.mutationMu.Unlock()
@@ -70,16 +84,22 @@ func (w *World) generateOneLocked(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 
+	kind := weightedChoice(w.rng, w.kindMix)
+
 	// Choose an active author. Deleted accounts keep their historical repo
-	// state for backfill/compaction tests, but must not emit new commits.
+	// state for backfill/compaction tests, but must not emit new commits —
+	// and their #identity churn is not modeled either.
 	authorIdx, err := w.pickActiveAuthor()
 	if err != nil {
 		return nil, err
 	}
-	return w.generateOneForAccount(ctx, authorIdx)
+	if kind == "identity" {
+		return w.generateIdentity(ctx, authorIdx)
+	}
+	return w.generateOneForAccount(ctx, authorIdx, kind)
 }
 
-func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byte, error) {
+func (w *World) generateOneForAccount(ctx context.Context, authorIdx int, action string) ([]byte, error) {
 	// Honor cancellation before doing work, consistent with every sibling
 	// generate helper (generateOneLocked, the targeted/sync/silent paths). The
 	// check consumes no RNG, so it does not perturb the deterministic draw stream.
@@ -131,7 +151,6 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 	// duplicates before publishing. A small repo + multi-op commit
 	// (~30%, via geometric distribution) makes collisions on
 	// update/delete likely without this guard.
-	action := weightedChoice(w.rng, actionMix)
 	nOps := geometricAtLeastOne(w.rng, 0.7)
 	wireOps := make([]comatproto.SyncSubscribeRepos_RepoOp, 0, nOps)
 	touched := make(map[string]struct{}, nOps)
@@ -435,7 +454,14 @@ func (w *World) GenerateSilentMutationThenCommitForTest(ctx context.Context, idx
 	if err := w.silentCreateForAccount(idx); err != nil {
 		return nil, err
 	}
-	return w.generateOneForAccount(ctx, idx)
+	// Draw from the commit-action mix, never the full kind mix: this
+	// helper's contract is "the next frame for this DID is a #commit
+	// whose prevData chain-breaks" — an #identity draw here would
+	// silently defuse the divergence the caller is setting up.
+	if len(w.actionMix) == 0 {
+		return nil, errors.New("simulator: silent-mutation trigger commit needs a commit action in the TrafficMix")
+	}
+	return w.generateOneForAccount(ctx, idx, weightedChoice(w.rng, w.actionMix))
 }
 
 func (w *World) silentCreateForAccount(idx int) error {
