@@ -10,7 +10,11 @@ import (
 
 // GroundTruthFromWorld builds the authoritative final-state Model directly from
 // the simulator world's repos, skipping deleted accounts, for comparison
-// against the reconstructed model.
+// against the reconstructed model. Records the world's adversarial ledger
+// marks as intentional gate drops (#204) are excluded: the world commits each
+// lie into its own MST for real (the CAR/signature pipeline must stay honest),
+// but jetstream is required never to archive them. One-directional-safe — a
+// wrongly-archived lie still fails Compare as an extra observed record.
 func GroundTruthFromWorld(w *world.World) (*Model, error) {
 	out := &Model{Accounts: make(map[string]RepoSnapshot, w.AccountCount())}
 	for idx := range w.AccountCount() {
@@ -35,6 +39,7 @@ func GroundTruthFromWorld(w *world.World) (*Model, error) {
 		}
 		out.Accounts[string(acct.DID)] = snap
 	}
+	newAdversarialFilter(w.AdversarialLedger().Entries()).FilterGroundTruth(out)
 	return out, nil
 }
 

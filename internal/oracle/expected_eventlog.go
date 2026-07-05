@@ -14,20 +14,24 @@ import (
 // ExpectedEventLogFromFirehose derives the event log Jetstream should produce by
 // decoding the simulator world's firehose frames after cursor (up to limit) and
 // expanding them into normalized rows, including the per-record rows a sync frame
-// implies.
+// implies. Rows the world's adversarial ledger marks as intentional gate drops
+// (#204) are excluded — jetstream is contractually required never to archive
+// them, and the exclusion is one-directional-safe: a wrongly-archived lie still
+// fails the multiset compare as an extra observed row.
 func ExpectedEventLogFromFirehose(w *world.World, cursor int64, limit int) ([]EventLogRow, error) {
 	frames, err := w.FirehoseRange(cursor, limit)
 	if err != nil {
 		return nil, err
 	}
 
+	filter := newAdversarialFilter(w.AdversarialLedger().Entries())
 	var out []EventLogRow
 	for _, frame := range frames {
 		rows, err := expectedEventLogRowsFromFrame(w, frame)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, rows...)
+		out = append(out, filter.FilterExpectedRows(rows)...)
 	}
 	return out, nil
 }

@@ -1,0 +1,34 @@
+mutant: m040_live_op_drop_escalated_whole_event
+target: internal/ingest/live/events.go
+failure-mode: |
+  convertCommit escalates a per-op validation drop to a whole-event
+  InvalidEventError, killing the benign sibling ops that share the
+  commit. Models the wrong-severity class: the survivors contract says
+  drop the op, keep siblings; this drops everything, silently losing
+  well-formed records whenever any op in a commit is spec-invalid.
+expected-detection: |
+  Every #204 adversarial op commit carries a benign sibling the expected
+  event log requires archived; whole-event escalation makes the sibling
+  a missing expected row in the steady-state multiset compare (and the
+  cursor-gap guard sees an unexempted lost cursor). Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index 1600512..013d14c 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -230,8 +230,11 @@ func convertCommit(evt streaming.Event, witnessedAt int64) ([]segment.Event, err
+ 		}
+ 
+ 		if d := validateOpPath(&op); d != nil {
+-			dropped = append(dropped, *d)
+-			continue
++			return nil, &InvalidEventError{
++				Reason: d.Reason,
++				DID:    d.DID,
++				Detail: "invalid op path",
++			}
+ 		}
+ 
+ 		segEv := segment.Event{

@@ -1,0 +1,29 @@
+mutant: m037_sync_resync_rev_dropped
+target: internal/ingest/live/events.go
+failure-mode: |
+  In convertSync's resync-op loop, the replacement row's Rev is dropped
+  (set to ""). Models forgetting to copy a field when materializing
+  post-resync records. Successor to the retired m014 (convertVerifiedOps
+  is dead under atmos v0.2.10); this loop runs on every sync-divergence
+  resync. A rev-less replacement row would break compaction's tombstone
+  folding for the repaired records.
+expected-detection: |
+  CheckInvariants rejects an empty rev on any commit-kind row
+  (KindCreateResync included), and the event-log compare's expected
+  replacement rows carry the #sync rev. Default tier.
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index 1600512..be04c64 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -380,7 +380,7 @@ func convertSync(evt streaming.Event, witnessedAt int64) ([]segment.Event, error
+ 			DID:                 string(op.Repo),
+ 			Collection:          string(op.Collection),
+ 			Rkey:                string(op.RKey),
+-			Rev:                 string(op.Rev),
++			Rev:                 "",
+ 		}
+ 		if kind != segment.KindDelete {
+ 			block := op.BlockData()

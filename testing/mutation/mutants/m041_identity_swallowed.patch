@@ -1,0 +1,41 @@
+mutant: m041_identity_swallowed
+target: internal/ingest/live/events.go
+failure-mode: |
+  convertIdentity silently swallows every #identity event (returns
+  nil, nil — the same shape as the legitimate #info no-op arm), so
+  identity events vanish from the archive while the cursor advances
+  past them. This models the info-style-no-op regression class: a
+  refactor of ConvertEvent's dispatch that folds #identity into the
+  "informational, nothing to archive" branch would ship exactly this
+  bug, permanently and silently losing an entire event kind. Before
+  #202 the simulator never emitted #identity, so this exact edit was
+  invisible to every oracle tier (the m013/m014 green-by-vacancy
+  lesson).
+expected-detection: |
+  default tier: the world's default TrafficMix emits #identity frames
+  and the harness injects deterministic ones (bootstrap handle-absent,
+  steady handle-change + malformed-DID). With conversion swallowed the
+  bootstrap-live consumer archives nothing for the injected identity
+  frame, the exact-count bootstrap ack never reaches its target, and
+  the after-bootstrap barrier times out; if traffic pacing lets the run
+  proceed, assertIdentityArchived and the exact-multiset event-log
+  compares (expected side decodes #identity from firehose history) fail
+  on the missing rows. The live-package unit tests for convertIdentity
+  and the corpus tier's real-frame decode regression also fail.
+expected-tier: default
+tiers: default
+
+diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index 1600512..274b394 100644
+--- a/internal/ingest/live/events.go
++++ b/internal/ingest/live/events.go
+@@ -301,6 +301,9 @@ func actionKind(a streaming.Action) (segment.Kind, error) {
+ }
+ 
+ func convertIdentity(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
++	if evt.Identity != nil {
++		return nil, nil
++	}
+ 	payload, err := evt.Identity.MarshalCBOR()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("livestream: marshal identity: %w", err)

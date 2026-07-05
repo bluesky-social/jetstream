@@ -1,0 +1,30 @@
+mutant: m039_backfill_rkey_gate_skipped
+target: internal/ingest/backfill/handler.go
+failure-mode: |
+  splitRecordPath stops classifying invalid record keys (returns ""
+  reason for a spec-invalid rkey), so hostile MST keys in downloaded
+  CARs — invalid UTF-8, ../oversized rkeys — archive during backfill
+  instead of dropping. The NSID half of the gate stays intact, modeling
+  a partial-refactor regression.
+expected-detection: |
+  The #204 backfill lies ride account 1's MST into bootstrap: ground
+  truth excludes ledgered lie records, so an archived lie fails the
+  after-bootstrap final-state Compare as an extra record; the backfill
+  invalid_rkey counter floor also goes unmet. Default tier (red-first
+  verified at introduction: extra "app.bsky.feed.post/.." record).
+expected-tier: default
+tiers: default,stress
+
+diff --git a/internal/ingest/backfill/handler.go b/internal/ingest/backfill/handler.go
+index 78fe894..751f284 100644
+--- a/internal/ingest/backfill/handler.go
++++ b/internal/ingest/backfill/handler.go
+@@ -228,7 +228,7 @@ func splitRecordPath(key string) (collection, rkey string, reason ingest.DropRea
+ 		return collection, rkey, ingest.DropReasonInvalidCollection
+ 	}
+ 	if _, err := atmos.ParseRecordKey(rkey); err != nil {
+-		return collection, rkey, ingest.DropReasonInvalidRkey
++		return collection, rkey, ""
+ 	}
+ 	return collection, rkey, ""
+ }

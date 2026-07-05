@@ -5,18 +5,25 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 30 active mutants on disk
-(m001–m036; m007, m010, m020, m021, m023, m025 retired). Latest full campaign:
-2026-07-05 at `248b9c5` (#206 frames tier) — **26 killed, 4 survived, zero
-STALE/BUILD-BROKEN**; `testing/mutation/baseline.json` was regenerated from it
-(commit field `248b9c5`) and gate-verified self-consistent. No disposition
-changed vs the `5d6fc9e` baseline; the delta is m036 added KILLED@frames.
-The 4 survivors (m003, m013, m014, m015) are all pre-existing documented
-escapes with owning issues (#209, #204, #204, #208). (#183 closed 2026-07-04: no recorder-unique
-replacement for the retired m025 exists post-#178 — see the dated analysis
-section; the #100 over-drop recorder's gated mutant m034 guards its hook
-integrity, not its drop logic.) Counts inside older dated sections describe
-the catalog *as of that date* and are intentionally not back-edited.**
+**Current catalog (keep this line current): 34 active mutants on disk
+(m001–m042; m007, m010, m013, m014, m020, m021, m023, m025 retired). Latest
+full campaign: 2026-07-05 at the #206 merge head (#206 frame adversity ∪
+#204 adversarial ingest traffic ∪ #202 identity/m041 ∪ #230 corpus ∪ #232
+replay) — **32 killed, 2 survived, zero STALE/BUILD-BROKEN**; gate PASS
+against `testing/mutation/baseline.json` (union bank; the commit field is
+provenance-only). The 2 survivors (m003, m015) are documented escapes with
+owning issues (#209, #208).
+m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
+at this merge — the #204 branch minted m036–m040 concurrently; same
+precedent as m041's renumber in 82b2dd9.
+m013/m014 retired 2026-07-04: dead path under atmos v0.2.10, not
+dormant-under-polite-traffic — see the #204 campaign section; their bug
+class is covered by m017/m018 (convertCommit) and m036/m037 (convertSync).
+(#183 closed 2026-07-04: no recorder-unique replacement for the retired
+m025 exists post-#178 — see the dated analysis section; the #100 over-drop
+recorder's gated mutant m034 guards its hook integrity, not its drop
+logic.) Counts inside older dated sections describe the catalog *as of that
+date* and are intentionally not back-edited.**
 
 ## The baseline gate (#108)
 
@@ -1270,19 +1277,148 @@ the checksum instance. Fixture provenance and the re-capture procedure:
 
 Remaining survivors: m003 (#209), m013/m014 (#204), m015 (#208).
 
+## Campaign 2026-07-04 — m041 identity-swallowed mutant (#202)
+
+Full 30-mutant campaign at `d77fa93` (the m041-mutant commit, on the #202 branch
+with the identity traffic + harness asserts): **26 KILLED / 4 SURVIVED,
+zero STALE / BUILD-BROKEN**. Survivors unchanged and all owned:
+m003 (#209), m013/m014 (#204, dead-path retirement planned), m015 (#208).
+Baseline re-banked.
+
+**m041_identity_swallowed — KILLED@default, banked on arrival.**
+`convertIdentity` returns `nil, nil` (the legitimate #info no-op shape),
+modeling a ConvertEvent dispatch refactor that folds #identity into the
+"informational, nothing to archive" branch. Before #202 the simulator
+never emitted #identity, so this exact edit was invisible to every
+oracle tier — the m013/m014 green-by-vacancy class, now with a live
+path. Kill mechanism: the bootstrap traffic closure injects a
+deterministic #identity frame whose archive ack never fires under the
+mutant, so the after-bootstrap barrier times out; if pacing ever let a
+run proceed, `assertIdentityArchived` (injection-keyed anti-vacuity)
+and the exact-multiset event-log compares (the expected side decodes
+#identity from firehose history) catch the missing rows, and 11
+unit/corpus tests fail besides. Red-first verified before the harness
+asserts landed.
+
+Context: #202 also made the default `TrafficMix` emit #identity (~3%,
+vs 0.061% measured on production 2026-07-04 — deliberately above rate
+for statistical reach at oracle scale), and its first non-short run
+found production bug #234 (#identity relay-replay re-archival; fixed
+same branch — durable applied-seq ratchet + consumer guard, the #231
+sibling). The enqueuer's malformed-DID gate is now oracle-asserted via
+the harness's first debug-/metrics scrape (two-sided: invalid_did ≥ 1
+AND already_known ≥ 1).
+
+## Campaign 2026-07-04 — #204 adversarial ingest traffic; m013/m014 retired, five gate mutants added
+
+Full campaign at `a4e96c5` (branch adversarial-ingest-traffic-204, forked
+from main before the `replay`/`corpus` sections above landed). **31 mutants:
+28 KILLED, 3 SURVIVED, zero STALE/BUILD-BROKEN.** Baseline regenerated and
+banked.
+
+**Catalog changes:**
+
+- **m013/m014 RETIRED (dead path, not sleeping).** Both mutated
+  `convertVerifiedOps`, the ConvertEvent default arm. Under atmos v0.2.10
+  that arm is unreachable: `verify_worker.go` mutates the original event in
+  place (the Commit envelope stays set) and async resyncs are wrapped in a
+  synthetic Sync envelope by `eventFromAsyncResync`, so every verified-ops
+  event routes through `convertCommit` or `convertSync`. No traffic mode can
+  ever execute the mutated lines — they model bugs in dead code, and the
+  catalog convention retires dead mutants. The tracking doc's original
+  prediction ("#204 kills m013/m014 by making the path live") was WRONG in an
+  instructive way: the path is not dormant-under-polite-traffic, it is
+  structurally dead. The bug class stays covered by m017/m018 (the
+  convertCommit copy of the field mapping) and the new m036/m037 (the
+  convertSync copy).
+- **m036/m037 ADDED** — collection/rkey swap and rev-drop in `convertSync`'s
+  resync-op loop, the third copy of the field mapping, live under every
+  sync-divergence resync. Both KILLED@default via the steady-state event-log
+  compare (expected replacement rows carry correct coordinates/rev).
+- **m038 ADDED** — live per-op #197 gate skipped (`validateOpPath` result
+  ignored in convertCommit). KILLED@default: the #204 adversarial phase's
+  ledger-filtered expected log flags the archived lie as an extra row.
+- **m039 ADDED** — backfill rkey gate declassified in `splitRecordPath`.
+  KILLED@default: ledger-filtered ground truth flags the archived backfill
+  lie as an extra record at the after-bootstrap Compare.
+- **m040 ADDED** — per-op drop escalated to whole-event drop in convertCommit
+  (survivors-contract break). KILLED@default: the benign sibling in every
+  adversarial commit becomes a missing expected row.
+
+**Why this run mattered:** it banks the #204 adversarial coverage as
+gate-enforced. The five new kills all depend on machinery this branch adds
+(world adversarial ledger, expected-side filtering, drop-counter floors), so
+a regression in any of it now fails the scheduled gate, not just the
+lifecycle test.
+
+**Merge resolution 2026-07-05.** Merging origin/main (post-#230 corpus +
+#232 replay) into this branch produced the predicted baseline conflict;
+resolved as the union: m009 stays KILLED@corpus and m035 KILLED@replay from
+main's bank, m013/m014 removed and m036–m040 KILLED@default from this
+branch's bank. The merged baseline is **32 mutants, 30 KILLED / 2
+SURVIVED** (m003 → #209, m015 → #208 — m009 no longer survives). The
+`commit` field records `a4e96c5` (this branch's campaign head); per the
+#228 precedent that field is provenance-only — the gate diffs dispositions.
+The full campaign was re-run at the merge head to verify the union bank
+(see the 2026-07-05 section below).
+
+Survivors at this branch's own run: m003 → #209 (merge cursor no-advance),
+m009/m015 → #208 (footer/checksum blind spots; m009's corpus kill lives on
+main and joins at the merge).
+
+## Campaign 2026-07-05 — merge-head verification of the #204 union bank
+
+Full campaign + gate at the merge commit `389b29c` (adversarial-ingest-
+traffic-204 ∪ main's #230 corpus + #232 replay): **gate PASS — 32 mutants
+match baseline, 30 KILLED / 2 SURVIVED, zero STALE/BUILD-BROKEN.** Every
+disposition from both parents reproduced side by side at one head: m009
+KILLED@corpus and m035 KILLED@replay (main's banks) alongside m036–m040
+KILLED@default (this branch's #204 gate mutants), with m013/m014 absent
+(retired). Survivors: m003 → #209, m015 → #208. The union-merge resolution
+described in the section above is verified, not just asserted.
+
+## Campaign 2026-07-05 — second union merge: #204 ∪ #202 (m041)
+
+Merging origin/main (post-#236, the #202 identity work with m041 and its
+30-mutant bank at `d77fa93`) into the #204 branch produced the same
+baseline-conflict shape as the #230/#232 merges; resolved as the union:
+m041 KILLED@default from main's bank (already renumbered from its original
+m036 id in 82b2dd9 to avoid colliding with this branch's m036), m013/m014
+absent and m036–m040 KILLED@default from this branch's bank. The merged
+baseline is **33 mutants, 31 KILLED / 2 SURVIVED** (m003 → #209,
+m015 → #208). The `commit` field stays `a4e96c5` (provenance-only). The
+full campaign was re-run at this second merge head to verify the union —
+results in the section below.
+
+## Campaign 2026-07-05 — verification at the second merge head
+
+Full campaign + gate at the merge commit `09f44f6` (#204 ∪ #202/m041 ∪
+#230 corpus ∪ #232 replay): **gate PASS — 33 mutants match baseline,
+31 KILLED / 2 SURVIVED, zero STALE/BUILD-BROKEN.** All four in-flight
+banks now reproduce side by side at one head: m036–m040 KILLED@default
+(#204 gate mutants), m041 KILLED@default (#202 identity), m035
+KILLED@replay (#232), m009 KILLED@corpus (#230), with m013/m014 absent
+(retired). Survivors: m003 → #209, m015 → #208. Also green at this head:
+short suites, default + stress lifecycle, -race on oracle/simulator,
+lint. This is the PR-merge state for #235.
 
 
-## Campaign 2026-07-05 — `frames` tier; m036 banked (#206)
 
-Full campaign at `248b9c5` (branch `frame-adversity-206`):
-**30 mutants: 26 KILLED, 4 SURVIVED, zero STALE/BUILD-BROKEN.**
-`baseline.json` re-banked from this run (commit field `248b9c5`) and
-gate-verified self-consistent. No disposition changed vs the `5d6fc9e`
-baseline; the only delta is m036 added KILLED@frames. Survivors are the
-four documented escapes with owning issues: m003 (#209), m013/m014
-(#204), m015 (#208).
+## Campaign 2026-07-05 — `frames` tier; m042 banked (#206)
 
-**New `frames` tier; m036 banked KILLED@frames.** #206 made frame-level
+Original campaign at `248b9c5` (branch `frame-adversity-206`, pre-merge,
+where this mutant was numbered m036): **30 mutants: 26 KILLED, 4
+SURVIVED, zero STALE/BUILD-BROKEN**; no disposition changed vs the
+`5d6fc9e` baseline. Merging origin/main (the #204 ∪ #202 ∪ #230 ∪ #232
+union above) collided with the #204 branch's freshly-minted m036–m040,
+so the frames mutant was renumbered to **m042** (same precedent as
+m041's renumber in 82b2dd9). baseline.json resolved as the union: main's
+33 dispositions verbatim plus m042 KILLED@frames — **34 mutants, 32
+KILLED / 2 SURVIVED** (m003 #209, m015 #208). The full campaign was
+re-run at the merge head to verify the union bank — results in the
+section below.
+
+**New `frames` tier; m042 banked KILLED@frames.** #206 made frame-level
 wire adversity live: the simulator relay can inject arbitrary bytes on
 the subscribeRepos socket (`SubscribeReposInjectFault` — inject-only,
 inject+swallow positional replace, swallow-only pure gap) and emit
@@ -1300,7 +1436,7 @@ exactly the swallowed window, chain-break resync self-heal), and
 stripped leaf block (`dropped_events_total{source=live,
 reason=missing_block}` per op, siblings archive, NO chain break).
 
-m036 (`m036_missing_block_arm_discards_siblings`) makes the consumer's
+m042 (`m042_missing_block_arm_discards_siblings`) makes the consumer's
 per-op-drop arm advance the cursor and `continue` instead of falling
 through to the append — the well-formed siblings of a partial-CAR
 commit are silently discarded while the drop counters report exactly
@@ -1309,6 +1445,6 @@ the oracle scenario's surviving-rows barrier times out, and the
 live-package unit test fails its new `WriterMetrics.EventsAppended==1`
 assertion. That assertion was added FOR this mutant: pre-strengthening,
 `TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer` passed under
-m036 (cursor advanced, counter bumped, no error propagated) while the
+m042 (cursor advanced, counter bumped, no error propagated) while the
 survivor was discarded — a vacuity worth recording. Red-first verified
 in both directions before the patch was banked.

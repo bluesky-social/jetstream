@@ -48,17 +48,31 @@ func (w *World) nextTrafficDelay(mean float64) float64 {
 	return exponentialDelay(w.rng, mean)
 }
 
-// actionMix is the design-doc weighted action distribution.
-var actionMix = []weighted[string]{
-	{value: "create", weight: 75},
-	{value: "update", weight: 15},
-	{value: "delete", weight: 10},
+// buildTrafficMixTables precomputes the weighted-draw tables from a
+// TrafficMix. Zero-weight kinds are omitted entirely rather than kept
+// at weight 0: weightedChoice's final-option fallback could otherwise
+// return a disabled kind, and a future swarm tier (#233) relies on
+// omission being genuine absence.
+func buildTrafficMixTables(m TrafficMix) (kindMix, actionMix []weighted[string]) {
+	add := func(dst []weighted[string], name string, wt float64) []weighted[string] {
+		if wt > 0 {
+			dst = append(dst, weighted[string]{value: name, weight: wt})
+		}
+		return dst
+	}
+	actionMix = add(actionMix, "create", m.Create)
+	actionMix = add(actionMix, "update", m.Update)
+	actionMix = add(actionMix, "delete", m.Delete)
+	kindMix = append(kindMix, actionMix...)
+	kindMix = add(kindMix, "identity", m.Identity)
+	return kindMix, actionMix
 }
 
-// generateOne is one tick of the live commit pump: pick an account
-// (Zipfian), apply N ops (mostly 1) of a chosen action, sign + persist,
-// build a CAR diff with only the new blocks, and broadcast the frame.
-// Returns the wire frame so tests can inspect it.
+// generateOne is one tick of the live traffic pump: draw a frame kind
+// from the configured mix, pick an account (Zipfian), and emit either
+// a #commit (apply N ops — mostly 1 — of the drawn action, sign +
+// persist, build a CAR diff with only the new blocks) or an #identity
+// frame. Returns the wire frame so tests can inspect it.
 func (w *World) generateOne(ctx context.Context) ([]byte, error) {
 	w.mutationMu.Lock()
 	defer w.mutationMu.Unlock()
@@ -70,16 +84,22 @@ func (w *World) generateOneLocked(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 
+	kind := weightedChoice(w.rng, w.kindMix)
+
 	// Choose an active author. Deleted accounts keep their historical repo
-	// state for backfill/compaction tests, but must not emit new commits.
+	// state for backfill/compaction tests, but must not emit new commits —
+	// and their #identity churn is not modeled either.
 	authorIdx, err := w.pickActiveAuthor()
 	if err != nil {
 		return nil, err
 	}
-	return w.generateOneForAccount(ctx, authorIdx)
+	if kind == "identity" {
+		return w.generateIdentity(ctx, authorIdx)
+	}
+	return w.generateOneForAccount(ctx, authorIdx, kind)
 }
 
-func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byte, error) {
+func (w *World) generateOneForAccount(ctx context.Context, authorIdx int, action string) ([]byte, error) {
 	// Honor cancellation before doing work, consistent with every sibling
 	// generate helper (generateOneLocked, the targeted/sync/silent paths). The
 	// check consumes no RNG, so it does not perturb the deterministic draw stream.
@@ -131,7 +151,6 @@ func (w *World) generateOneForAccount(ctx context.Context, authorIdx int) ([]byt
 	// duplicates before publishing. A small repo + multi-op commit
 	// (~30%, via geometric distribution) makes collisions on
 	// update/delete likely without this guard.
-	action := weightedChoice(w.rng, actionMix)
 	nOps := geometricAtLeastOne(w.rng, 0.7)
 	wireOps := make([]comatproto.SyncSubscribeRepos_RepoOp, 0, nOps)
 	touched := make(map[string]struct{}, nOps)
@@ -176,20 +195,41 @@ func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffSto
 		return nil, repoState{}, err
 	}
 
-	// Build a CAR diff containing every block our diffStore touched:
-	// writes (new MST nodes + new record blocks + the commit block)
-	// AND reads (existing MST nodes traversed during op application).
-	// atmos's verifier inverts each op against the post-state MST
-	// loaded from this CAR; reading a path back to an unchanged
-	// neighbor requires that neighbor be present in the diff.
-	commitData, err := store.GetBlock(newState.CommitCID)
+	carBuf, err := packageCARDiff(store, newState.CommitCID, omitBlocks)
 	if err != nil {
 		return nil, repoState{}, err
 	}
+	revTID, err := atmos.ParseTID(newState.Rev)
+	if err != nil {
+		return nil, repoState{}, fmt.Errorf("simulator: parse generated rev: %w", err)
+	}
+
+	frame, _, err := w.broadcastCommitFrame(author, newState, prevState, wireOps, carBuf,
+		revTID.Time().UTC().Format("2006-01-02T15:04:05.000Z"))
+	if err != nil {
+		return nil, repoState{}, err
+	}
+	return frame, newState, nil
+}
+
+// packageCARDiff builds a CAR containing every block the diffStore
+// touched: writes (new MST nodes + new record blocks + the commit
+// block) AND reads (existing MST nodes traversed during op
+// application). atmos's verifier inverts each op against the
+// post-state MST loaded from this CAR; reading a path back to an
+// unchanged neighbor requires that neighbor be present in the diff.
+// omitBlocks (nil for the honest paths) names block CIDs to exclude —
+// see commitAndBroadcast for the partial-CAR contract.
+func packageCARDiff(store *diffStore, commitCID cbor.CID, omitBlocks map[cbor.CID]struct{}) (carBytesWriter, error) {
+	var carBuf carBytesWriter
+	commitData, err := store.GetBlock(commitCID)
+	if err != nil {
+		return carBuf, err
+	}
 	carBlocks := make([]car.Block, 0, len(store.writes)+len(store.reads)+1)
-	carBlocks = append(carBlocks, car.Block{CID: newState.CommitCID, Data: commitData})
+	carBlocks = append(carBlocks, car.Block{CID: commitCID, Data: commitData})
 	for _, cid := range sortedCIDs(store.writes) {
-		if cid == newState.CommitCID {
+		if cid == commitCID {
 			continue
 		}
 		if _, omit := omitBlocks[cid]; omit {
@@ -206,22 +246,23 @@ func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffSto
 		}
 		carBlocks = append(carBlocks, car.Block{CID: cid, Data: store.reads[cid]})
 	}
-	var carBuf carBytesWriter
-	if err := car.WriteAll(&carBuf, []cbor.CID{newState.CommitCID}, carBlocks); err != nil {
-		return nil, repoState{}, fmt.Errorf("simulator: write CAR diff: %w", err)
+	if err := car.WriteAll(&carBuf, []cbor.CID{commitCID}, carBlocks); err != nil {
+		return carBuf, fmt.Errorf("simulator: write CAR diff: %w", err)
 	}
-	revTID, err := atmos.ParseTID(newState.Rev)
-	if err != nil {
-		return nil, repoState{}, fmt.Errorf("simulator: parse generated rev: %w", err)
-	}
+	return carBuf, nil
+}
 
-	// Allocate the seq and assemble the envelope.
+// broadcastCommitFrame allocates a seq, assembles + encodes the
+// #commit envelope, persists it to firehose history, and publishes it.
+// newState supplies the rev/CID the frame claims; prevState supplies
+// Since/PrevData. Returns the frame and its seq.
+func (w *World) broadcastCommitFrame(author account, newState, prevState repoState, wireOps []comatproto.SyncSubscribeRepos_RepoOp, carBuf carBytesWriter, timeStr string) ([]byte, int64, error) {
 	seq := w.seq.Add(1)
 	envelope := &comatproto.SyncSubscribeRepos_Commit{
 		Repo:   string(author.DID),
 		Rev:    newState.Rev,
 		Seq:    seq,
-		Time:   revTID.Time().UTC().Format("2006-01-02T15:04:05.000Z"),
+		Time:   timeStr,
 		Commit: lextypes.LexCIDLink{Link: newState.CommitCID.String()},
 		Blocks: carBuf.bytes(),
 		Ops:    wireOps,
@@ -233,14 +274,14 @@ func (w *World) commitAndBroadcast(author account, rp *repo.Repo, store *diffSto
 
 	frame, err := encodeCommitFrame(envelope)
 	if err != nil {
-		return nil, repoState{}, err
+		return nil, 0, err
 	}
 
 	if err := w.persistFirehoseFrame(seq, frame); err != nil {
-		return nil, repoState{}, err
+		return nil, 0, err
 	}
 	w.fanout.Publish(frame)
-	return frame, newState, nil
+	return frame, seq, nil
 }
 
 // GeneratedChainOp describes one op injected via GenerateRecordOpForTest,
@@ -273,35 +314,9 @@ func (w *World) GenerateRecordOpForTest(ctx context.Context, idx int, action, co
 	if err := ctx.Err(); err != nil {
 		return nil, GeneratedChainOp{}, err
 	}
-	if idx < 0 || idx >= w.cfg.Accounts {
-		return nil, GeneratedChainOp{}, fmt.Errorf("simulator: chain account index %d out of range", idx)
-	}
-	deleted, err := w.isAccountDeleted(idx)
+	author, rp, store, prevState, err := w.loadRepoForTargetedCommit(idx)
 	if err != nil {
 		return nil, GeneratedChainOp{}, err
-	}
-	if deleted {
-		return nil, GeneratedChainOp{}, fmt.Errorf("simulator: chain account %d is deleted", idx)
-	}
-	author, err := w.loadAccount(idx)
-	if err != nil {
-		return nil, GeneratedChainOp{}, err
-	}
-	prevState, err := w.loadState(idx)
-	if err != nil {
-		return nil, GeneratedChainOp{}, err
-	}
-
-	store := &diffStore{base: &pebbleStore{db: w.db, idx: idx}}
-	tree := mst.NewTree(store)
-	if prevState.DataCID.Defined() {
-		tree = mst.LoadTree(store, prevState.DataCID)
-	}
-	rp := &repo.Repo{
-		DID:   author.DID,
-		Clock: atmos.NewTIDClock(0),
-		Store: store,
-		Tree:  tree,
 	}
 
 	op, payload, err := w.applyTargetedOp(rp, idx, action, coll, rkey)
@@ -519,6 +534,43 @@ func (w *World) applyTargetedOp(rp *repo.Repo, authorIdx int, action, coll, rkey
 	}
 }
 
+// loadRepoForTargetedCommit is the shared prelude of every targeted
+// (test-driven) commit generator: bounds/deleted checks, then a
+// *repo.Repo over a diffStore so the commit's touched blocks can be
+// packaged into a CAR diff. Caller must hold mutationMu.
+func (w *World) loadRepoForTargetedCommit(idx int) (account, *repo.Repo, *diffStore, repoState, error) {
+	if idx < 0 || idx >= w.cfg.Accounts {
+		return account{}, nil, nil, repoState{}, fmt.Errorf("simulator: account index %d out of range", idx)
+	}
+	deleted, err := w.isAccountDeleted(idx)
+	if err != nil {
+		return account{}, nil, nil, repoState{}, err
+	}
+	if deleted {
+		return account{}, nil, nil, repoState{}, fmt.Errorf("simulator: account %d is deleted", idx)
+	}
+	author, err := w.loadAccount(idx)
+	if err != nil {
+		return account{}, nil, nil, repoState{}, err
+	}
+	prevState, err := w.loadState(idx)
+	if err != nil {
+		return account{}, nil, nil, repoState{}, err
+	}
+	store := &diffStore{base: &pebbleStore{db: w.db, idx: idx}}
+	tree := mst.NewTree(store)
+	if prevState.DataCID.Defined() {
+		tree = mst.LoadTree(store, prevState.DataCID)
+	}
+	rp := &repo.Repo{
+		DID:   author.DID,
+		Clock: atmos.NewTIDClock(0),
+		Store: store,
+		Tree:  tree,
+	}
+	return author, rp, store, prevState, nil
+}
+
 // GenerateSyncForTest emits a real subscribeRepos #sync frame for the current
 // head of account idx. It does not mutate the repo; it packages the current
 // commit block in the #sync CAR body, persists the frame to firehose history,
@@ -564,7 +616,14 @@ func (w *World) GenerateSilentMutationThenCommitForTest(ctx context.Context, idx
 	if err := w.silentCreateForAccount(idx); err != nil {
 		return nil, err
 	}
-	return w.generateOneForAccount(ctx, idx)
+	// Draw from the commit-action mix, never the full kind mix: this
+	// helper's contract is "the next frame for this DID is a #commit
+	// whose prevData chain-breaks" — an #identity draw here would
+	// silently defuse the divergence the caller is setting up.
+	if len(w.actionMix) == 0 {
+		return nil, errors.New("simulator: silent-mutation trigger commit needs a commit action in the TrafficMix")
+	}
+	return w.generateOneForAccount(ctx, idx, weightedChoice(w.rng, w.actionMix))
 }
 
 func (w *World) silentCreateForAccount(idx int) error {
@@ -602,63 +661,78 @@ func (w *World) silentCreateForAccount(idx int) error {
 }
 
 func (w *World) emitSyncForAccount(ctx context.Context, idx int) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if idx < 0 || idx >= w.cfg.Accounts {
-		return nil, fmt.Errorf("simulator: sync account index %d out of range", idx)
-	}
-	deleted, err := w.isAccountDeleted(idx)
-	if err != nil {
-		return nil, err
-	}
-	if deleted {
-		return nil, fmt.Errorf("simulator: sync account %d is deleted", idx)
-	}
-	author, err := w.loadAccount(idx)
-	if err != nil {
-		return nil, err
-	}
 	state, err := w.loadState(idx)
 	if err != nil {
 		return nil, err
 	}
+	revTID, err := atmos.ParseTID(state.Rev)
+	if err != nil {
+		return nil, fmt.Errorf("simulator: parse sync rev: %w", err)
+	}
+	frame, _, _, err := w.emitSyncWithRev(ctx, idx, state.Rev,
+		revTID.Time().UTC().Format("2006-01-02T15:04:05.000Z"))
+	return frame, err
+}
+
+// emitSyncWithRev emits a #sync frame for account idx's current head
+// whose envelope carries the caller-supplied rev and Time. The honest
+// path (emitSyncForAccount) passes the persisted head rev; the
+// adversarial path passes a lie. The CAR body always carries the real
+// head commit block. Returns the frame, its seq, and the author DID.
+func (w *World) emitSyncWithRev(ctx context.Context, idx int, rev, timeStr string) ([]byte, int64, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, "", err
+	}
+	if idx < 0 || idx >= w.cfg.Accounts {
+		return nil, 0, "", fmt.Errorf("simulator: sync account index %d out of range", idx)
+	}
+	deleted, err := w.isAccountDeleted(idx)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	if deleted {
+		return nil, 0, "", fmt.Errorf("simulator: sync account %d is deleted", idx)
+	}
+	author, err := w.loadAccount(idx)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	state, err := w.loadState(idx)
+	if err != nil {
+		return nil, 0, "", err
+	}
 	if !state.CommitCID.Defined() {
-		return nil, fmt.Errorf("simulator: sync account %d has no commit", idx)
+		return nil, 0, "", fmt.Errorf("simulator: sync account %d has no commit", idx)
 	}
 	commitData, err := (&pebbleStore{db: w.db, idx: idx}).GetBlock(state.CommitCID)
 	if err != nil {
-		return nil, fmt.Errorf("simulator: load sync commit block: %w", err)
+		return nil, 0, "", fmt.Errorf("simulator: load sync commit block: %w", err)
 	}
 	var carBuf carBytesWriter
 	if err := car.WriteAll(&carBuf, []cbor.CID{state.CommitCID}, []car.Block{{
 		CID:  state.CommitCID,
 		Data: commitData,
 	}}); err != nil {
-		return nil, fmt.Errorf("simulator: write sync CAR: %w", err)
-	}
-	revTID, err := atmos.ParseTID(state.Rev)
-	if err != nil {
-		return nil, fmt.Errorf("simulator: parse sync rev: %w", err)
+		return nil, 0, "", fmt.Errorf("simulator: write sync CAR: %w", err)
 	}
 
 	seq := w.seq.Add(1)
 	envelope := &comatproto.SyncSubscribeRepos_Sync{
 		DID:    string(author.DID),
-		Rev:    state.Rev,
+		Rev:    rev,
 		Seq:    seq,
-		Time:   revTID.Time().UTC().Format("2006-01-02T15:04:05.000Z"),
+		Time:   timeStr,
 		Blocks: carBuf.bytes(),
 	}
 	frame, err := encodeSyncFrame(envelope)
 	if err != nil {
-		return nil, err
+		return nil, 0, "", err
 	}
 	if err := w.persistFirehoseFrame(seq, frame); err != nil {
-		return nil, err
+		return nil, 0, "", err
 	}
 	w.fanout.Publish(frame)
-	return frame, nil
+	return frame, seq, string(author.DID), nil
 }
 
 // applyOp performs a single create/update/delete on rp and returns
@@ -820,15 +894,24 @@ func (w *World) pickActiveAuthor() (int, error) {
 }
 
 // pickUntouchedRecord chooses one (collection, rkey) at random from
-// the account's current MST, excluding any path already in `touched`.
-// ok=false when the repo is empty or every record was already touched
-// by an earlier op in the same commit; callers fall back to create in
-// that case.
+// the account's current MST, excluding any path already in `touched`
+// and any adversarial lie key (adversarial.go). The lie exclusion is
+// load-bearing two ways: a spec-INVALID pick would fail
+// repo.Update/Delete's validation loudly, and a spec-valid-but-
+// unrepresentable pick (300-byte rkey) would ride an honest commit
+// that the gate then drops — an unledgered drop that starves the
+// oracle's gap-free cursor accounting. No honest PDS actor mutates
+// records that could never have been honestly created. ok=false when
+// the repo is empty or every record was already touched by an earlier
+// op in the same commit; callers fall back to create in that case.
 func (w *World) pickUntouchedRecord(rp *repo.Repo, touched map[string]struct{}) (collection, rkey string, ok bool) {
 	type entry struct{ coll, rkey string }
 	var entries []entry
 	_ = rp.Tree.Walk(func(key string, _ cbor.CID) error {
 		if _, dup := touched[key]; dup {
+			return nil
+		}
+		if w.adversarial.ContainsKey(key) {
 			return nil
 		}
 		c, k := repo.SplitMSTKey(key)

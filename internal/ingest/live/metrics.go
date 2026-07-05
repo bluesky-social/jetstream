@@ -20,6 +20,7 @@ type Metrics struct {
 	StreamErrorFrames     *prometheus.CounterVec
 	StaleResyncsDropped   prometheus.Counter
 	ReplayedAccountsDrop  prometheus.Counter
+	ReplayedIdentityDrop  prometheus.Counter
 	UpstreamCursor        prometheus.Gauge
 }
 
@@ -90,6 +91,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 				"(duplicate or regressed streams) whose row is already archived. " +
 				"Re-archiving them would let a stale account-delete land above newer rows.",
 		}),
+		ReplayedIdentityDrop: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "replayed_identity_events_dropped_total",
+			Help: "Number of #identity events dropped because their upstream seq was at or " +
+				"below the DID's applied identity seq — relay seq replays whose row is " +
+				"already archived. Re-archiving them would bloat the immutable archive " +
+				"with duplicate rows.",
+		}),
 		StaleResyncsDropped: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "stale_resyncs_dropped_total",
@@ -107,7 +116,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.EventsReceived, m.Reconnects,
 		m.DecodeErrors, m.SequenceGaps, m.SequenceGapMissedSeqs,
 		m.UnknownEvents, m.StreamErrorFrames, m.StaleResyncsDropped,
-		m.ReplayedAccountsDrop, m.UpstreamCursor,
+		m.ReplayedAccountsDrop, m.ReplayedIdentityDrop, m.UpstreamCursor,
 	)
 	return m
 }
@@ -171,6 +180,12 @@ func normalizeStreamErrorCode(code string) string {
 func (m *Metrics) incReplayedAccountEventsDropped() {
 	if m != nil {
 		m.ReplayedAccountsDrop.Inc()
+	}
+}
+
+func (m *Metrics) incReplayedIdentityEventsDropped() {
+	if m != nil {
+		m.ReplayedIdentityDrop.Inc()
 	}
 }
 

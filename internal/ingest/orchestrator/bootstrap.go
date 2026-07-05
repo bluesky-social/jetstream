@@ -51,6 +51,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 		// Backfill writer (shared with the backfill engine).
 		bw, err := ingest.Open(ingest.Config{
 			SegmentsDir:       segmentsDir,
+			DataDir:           o.cfg.DataDir,
 			Store:             o.cfg.Store,
 			Logger:            o.cfg.Logger,
 			Metrics:           o.cfg.IngestMetrics,
@@ -64,6 +65,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		// Bootstrap-time live consumer.
 		bootstrapLive, err := live.Open(live.Config{
+			DataDir:          o.cfg.DataDir,
 			SegmentsDir:      liveSegmentsDir,
 			Store:            o.cfg.Store,
 			SeqKey:           live.BootstrapSeqKey,
@@ -241,6 +243,7 @@ func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.
 
 		sealW, err := ingest.Open(ingest.Config{
 			SegmentsDir: liveSegmentsDir,
+			DataDir:     o.cfg.DataDir,
 			Store:       o.cfg.Store,
 			SeqKey:      live.BootstrapSeqKey,
 			// Bare cfg.Logger; ingest.Open sets its own component.

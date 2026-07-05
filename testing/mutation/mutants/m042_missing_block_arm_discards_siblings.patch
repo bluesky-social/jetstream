@@ -1,4 +1,4 @@
-mutant: m036_missing_block_arm_discards_siblings
+mutant: m042_missing_block_arm_discards_siblings
 target: internal/ingest/live/consumer.go
 failure-mode: |
   The consumer's per-op-drop arm (DroppedOpsError: missing record

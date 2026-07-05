@@ -153,7 +153,7 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 		}
 
 		if err := w.active.CommitPreparedFlush(job.prepared, frame); err != nil {
-			return fmt.Errorf("ingest: async flush block: %w", err)
+			return w.wrapSegmentPersistenceError("flushing active segment block", fmt.Errorf("ingest: async flush block: %w", err))
 		}
 		w.cfg.Metrics.incBlocksFlushed()
 
@@ -280,7 +280,7 @@ func (w *Writer) closeAsync() error {
 		return flushErr
 	}
 	if closeErr != nil {
-		return fmt.Errorf("ingest: close active segment: %w", closeErr)
+		return w.wrapSegmentPersistenceError("closing active segment", fmt.Errorf("ingest: close active segment: %w", closeErr))
 	}
 	return w.commitTerminalDurableBatchLocked()
 }
@@ -310,7 +310,7 @@ func (w *Writer) sealActiveAndCloseAsync() error {
 		if cerr := w.active.Close(); cerr != nil {
 			w.cfg.Logger.Warn("close after failed seal", "err", cerr)
 		}
-		return fmt.Errorf("ingest: seal active segment: %w", err)
+		return w.wrapSegmentPersistenceError("sealing active segment", fmt.Errorf("ingest: seal active segment: %w", err))
 	}
 	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err

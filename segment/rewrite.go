@@ -145,7 +145,7 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 		}
 	}()
 
-	if err := initializeNewSegment(f); err != nil {
+	if err := initializeNewSegment(f, Config{Path: tmp}); err != nil {
 		return RewriteResult{}, err
 	}
 	for _, b := range outBlocks {
@@ -198,7 +198,7 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if err := simulateRewriteCrash(opts, CrashPointRewriteRenamed); err != nil {
 		return RewriteResult{}, err
 	}
-	if err := syncParentDir(path); err != nil {
+	if err := syncParentDir(path, nil); err != nil {
 		return RewriteResult{}, err
 	}
 	if err := simulateRewriteCrash(opts, CrashPointRewriteDirSynced); err != nil {

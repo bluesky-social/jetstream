@@ -191,6 +191,36 @@ func (w *World) GenerateAccountReactivateForTest(ctx context.Context, idx int) (
 	return w.generateAccountReactivate(ctx, idx)
 }
 
+// GenerateIdentityForTest emits one polite #identity frame for account
+// idx: handle-absent (the dominant production shape) or, with
+// handleChange, a handle-change payload backed by the account's
+// persisted change counter. Oracle tests use it to pin deterministic
+// identity coverage independent of the random traffic mix.
+func (w *World) GenerateIdentityForTest(ctx context.Context, idx int, handleChange bool) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
+	if idx < 0 || idx >= w.cfg.Accounts {
+		return nil, fmt.Errorf("simulator: identity account index %d out of range", idx)
+	}
+	if handleChange {
+		return w.generateIdentityHandleChange(ctx, idx)
+	}
+	return w.generateIdentityAbsent(ctx, idx)
+}
+
+// GenerateMalformedIdentityForTest emits an #identity frame whose DID
+// (MalformedIdentityDID) fails atproto DID syntax, modeling the
+// unverified-upstream reality that #identity bodies are not
+// signature-checked by relays. Injection-only adversarial input — the
+// random traffic mix never produces it.
+func (w *World) GenerateMalformedIdentityForTest(ctx context.Context) ([]byte, error) {
+	w.mutationMu.Lock()
+	defer w.mutationMu.Unlock()
+
+	return w.generateMalformedIdentity(ctx)
+}
+
 func (w *World) IsAccountDeleted(idx int) (bool, error) {
 	return w.isAccountDeleted(idx)
 }

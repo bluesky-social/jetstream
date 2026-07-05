@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -71,4 +72,49 @@ func TestWriter_DurableBatchFailsLoudOnStoreFault(t *testing.T) {
 	_, _, getErr := st.Get([]byte(seqNextKey))
 	require.ErrorIs(t, getErr, pebble.ErrNotFound,
 		"seq/next must not be durable when its commit failed")
+}
+
+// TestWriter_DurableBatchENOSPCReturnsFatalOperatorMessage pins that a
+// disk-full failure on the seq/next durable commit — the pebble half of the
+// ingest persistence boundary, not just the segment file — carries the same
+// fatal operator guidance as segment write/fsync ENOSPC (issue #201).
+func TestWriter_DurableBatchENOSPCReturnsFatalOperatorMessage(t *testing.T) {
+	t.Parallel()
+
+	fault := &store.KeyPrefixFault{
+		Prefix:  []byte(seqNextKey),
+		Op:      store.WriteOpBatchCommit,
+		Ordinal: 1,
+		Err:     syscall.ENOSPC,
+	}
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil, store.WithFaultInjector(fault))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	const blockSize = 4
+	w, err := Open(Config{
+		DataDir:           dataDir,
+		SegmentsDir:       filepath.Join(dataDir, "segments"),
+		Store:             st,
+		SeqKey:            seqNextKey,
+		MaxEventsPerBlock: blockSize,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:           NewMetrics(prometheus.NewRegistry()),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	var appendErr error
+	for range blockSize {
+		ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:a"}
+		if appendErr = w.Append(t.Context(), &ev); appendErr != nil {
+			break
+		}
+	}
+	require.ErrorIs(t, appendErr, syscall.ENOSPC)
+	require.ErrorContains(t, appendErr, "fatal persistence error")
+	require.ErrorContains(t, appendErr, "disk full")
+	require.ErrorContains(t, appendErr, dataDir)
+	require.ErrorContains(t, appendErr, "restart jetstream")
 }

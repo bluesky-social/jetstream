@@ -5,12 +5,14 @@ go 1.26.4
 require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/coder/websocket v1.8.15
-	github.com/jcalabro/atmos v0.2.11
+	github.com/jcalabro/atmos v0.2.13
 	github.com/jcalabro/gloom v0.1.0
 	github.com/jcalabro/gt v0.0.13
 	github.com/jcalabro/jttp v0.0.6
 	github.com/klauspost/compress v1.18.6
 	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/client_model v0.6.2
+	github.com/prometheus/common v0.66.1
 	github.com/stretchr/testify v1.11.1
 	github.com/urfave/cli/v3 v3.10.1
 	github.com/zeebo/xxh3 v1.1.0
@@ -21,6 +23,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
 	golang.org/x/sync v0.21.0
+	golang.org/x/sys v0.46.0
 )
 
 require (
@@ -50,8 +53,6 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
-	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/puzpuzpuz/xsync/v4 v4.5.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
@@ -64,7 +65,6 @@ require (
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect

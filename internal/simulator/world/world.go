@@ -22,16 +22,31 @@ type World struct {
 	cfg Config
 	db  *pebble.DB
 
+	// kindMix and actionMix are precomputed weighted-draw tables derived
+	// from cfg.TrafficMix at construction: kindMix spans every frame kind
+	// the pump can emit; actionMix spans only the commit actions, for
+	// callers that need a commit specifically (silent-mutation tests).
+	kindMix   []weighted[string]
+	actionMix []weighted[string]
+
 	mutationMu sync.Mutex
 	rng        *rand.Rand
 	fanout     *fanout.Registry
 	seq        atomic.Int64
+
+	// adversarial records every deliberate lie told by the test-targeted
+	// generators in adversarial.go, for oracle reconciliation. Empty
+	// under default traffic.
+	adversarial AdversarialLedger
 }
 
 // New opens (creating if needed) the simulator pebble db at
 // cfg.DataDir. With cfg.Reset = true, removes the directory first.
 // Refuses to operate when cfg.DataDir resolves to "./data".
 func New(_ context.Context, cfg Config) (*World, error) {
+	if cfg.TrafficMix.isZero() {
+		cfg.TrafficMix = DefaultTrafficMix()
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -47,7 +62,8 @@ func New(_ context.Context, cfg Config) (*World, error) {
 	if err != nil {
 		return nil, fmt.Errorf("world: open pebble at %s: %w", cfg.DataDir, err)
 	}
-	return &World{cfg: cfg, db: db}, nil
+	kindMix, actionMix := buildTrafficMixTables(cfg.TrafficMix)
+	return &World{cfg: cfg, db: db, kindMix: kindMix, actionMix: actionMix}, nil
 }
 
 // Close releases the pebble db. Idempotent.
