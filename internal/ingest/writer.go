@@ -58,7 +58,7 @@ func Open(cfg Config) (*Writer, error) {
 	cfg.Logger = cfg.Logger.With(slog.String("component", "ingest/writer"))
 
 	if err := os.MkdirAll(cfg.SegmentsDir, 0o755); err != nil {
-		return nil, fmt.Errorf("ingest: mkdir %s: %w", cfg.SegmentsDir, err)
+		return nil, cfg.wrapSegmentPersistenceError("creating segments directory", fmt.Errorf("ingest: mkdir %s: %w", cfg.SegmentsDir, err))
 	}
 
 	idx, hasExisting, err := scanSegmentsDir(cfg.SegmentsDir)
@@ -198,7 +198,7 @@ func Open(cfg Config) (*Writer, error) {
 	if reconciled > pebbleSeq {
 		if err := saveNextSeq(cfg.Store, cfg.SeqKey, reconciled); err != nil {
 			_ = w.active.Close()
-			return nil, err
+			return nil, cfg.wrapSegmentPersistenceError("reconciling durable seq metadata", err)
 		}
 	}
 	// nextSeq is never 0: seq 0 is the pure "nothing yet" sentinel (design §R8)
@@ -879,7 +879,7 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 
 	commitErr = w.cfg.Store.Commit(b, store.SyncWrites)
 	if commitErr != nil {
-		return fmt.Errorf("ingest: commit durable batch: %w", commitErr)
+		return w.wrapSegmentPersistenceError("committing durable metadata batch", fmt.Errorf("ingest: commit durable batch: %w", commitErr))
 	}
 	w.durableNextSeq = nextSeq
 	if afterCommit != nil {
