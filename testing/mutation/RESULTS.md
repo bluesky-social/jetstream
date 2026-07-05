@@ -1386,3 +1386,15 @@ baseline is **33 mutants, 31 KILLED / 2 SURVIVED** (m003 → #209,
 m015 → #208). The `commit` field stays `a4e96c5` (provenance-only). The
 full campaign was re-run at this second merge head to verify the union —
 results in the section below.
+
+## Campaign 2026-07-05 — verification at the second merge head
+
+Full campaign + gate at the merge commit `09f44f6` (#204 ∪ #202/m041 ∪
+#230 corpus ∪ #232 replay): **gate PASS — 33 mutants match baseline,
+31 KILLED / 2 SURVIVED, zero STALE/BUILD-BROKEN.** All four in-flight
+banks now reproduce side by side at one head: m036–m040 KILLED@default
+(#204 gate mutants), m041 KILLED@default (#202 identity), m035
+KILLED@replay (#232), m009 KILLED@corpus (#230), with m013/m014 absent
+(retired). Survivors: m003 → #209, m015 → #208. Also green at this head:
+short suites, default + stress lifecycle, -race on oracle/simulator,
+lint. This is the PR-merge state for #235.
