@@ -1164,3 +1164,52 @@ owning issues: m003 → #209 (merge cursor no-advance), m009/m015 → #208
 (footer/checksum blind spots), m013/m014 → #204 (verified-ops path is dead
 under polite simulator traffic — exactly the gap the #204 adversarial modes
 will close, now unblocked by this gate).
+
+## Campaign 2026-07-04 — #204 adversarial ingest traffic; m013/m014 retired, five gate mutants added
+
+Full campaign at `a4e96c5` (branch adversarial-ingest-traffic-204). **31
+mutants: 28 KILLED, 3 SURVIVED, zero STALE/BUILD-BROKEN.** Baseline
+regenerated and banked.
+
+**Catalog changes:**
+
+- **m013/m014 RETIRED (dead path, not sleeping).** Both mutated
+  `convertVerifiedOps`, the ConvertEvent default arm. Under atmos v0.2.10
+  that arm is unreachable: `verify_worker.go` mutates the original event in
+  place (the Commit envelope stays set) and async resyncs are wrapped in a
+  synthetic Sync envelope by `eventFromAsyncResync`, so every verified-ops
+  event routes through `convertCommit` or `convertSync`. No traffic mode can
+  ever execute the mutated lines — they model bugs in dead code, and the
+  catalog convention retires dead mutants. The tracking doc's original
+  prediction ("#204 kills m013/m014 by making the path live") was WRONG in an
+  instructive way: the path is not dormant-under-polite-traffic, it is
+  structurally dead. The bug class stays covered by m017/m018 (the
+  convertCommit copy of the field mapping) and the new m036/m037 (the
+  convertSync copy).
+- **m036/m037 ADDED** — collection/rkey swap and rev-drop in `convertSync`'s
+  resync-op loop, the third copy of the field mapping, live under every
+  sync-divergence resync. Both KILLED@default via the steady-state event-log
+  compare (expected replacement rows carry correct coordinates/rev).
+- **m038 ADDED** — live per-op #197 gate skipped (`validateOpPath` result
+  ignored in convertCommit). KILLED@default: the #204 adversarial phase's
+  ledger-filtered expected log flags the archived lie as an extra row.
+- **m039 ADDED** — backfill rkey gate declassified in `splitRecordPath`.
+  KILLED@default: ledger-filtered ground truth flags the archived backfill
+  lie as an extra record at the after-bootstrap Compare.
+- **m040 ADDED** — per-op drop escalated to whole-event drop in convertCommit
+  (survivors-contract break). KILLED@default: the benign sibling in every
+  adversarial commit becomes a missing expected row.
+
+**Why this run mattered:** it banks the #204 adversarial coverage as
+gate-enforced. The five new kills all depend on machinery this branch adds
+(world adversarial ledger, expected-side filtering, drop-counter floors), so
+a regression in any of it now fails the scheduled gate, not just the
+lifecycle test.
+
+Survivors: m003 → #209 (merge cursor no-advance), m009/m015 → #208
+(footer/checksum blind spots). NOTE: this branch forked before the #32
+corpus tier merged to main (m009 KILLED@corpus there) and before #205's
+m035; the baseline will need the same union-merge resolution as the #230/#232
+merges when this PR lands (keep m009 KILLED@corpus + m035 KILLED@replay from
+main, add m036–m040 + the m013/m014 retirement from this branch, and re-run
+the campaign at the merge head to re-bank).

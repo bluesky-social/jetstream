@@ -367,6 +367,32 @@ Each invalid-input case must define whether Jetstream should archive surviving
 good events, drop an unarchivable event, advance a cursor, increment a metric,
 log bounded diagnostics, and continue running.
 
+The adversarial ingest-gate modes (#204) set the tier's conventions:
+
+- **The world lies through the honest pipeline, not around it.** Op-path lies
+  enter via raw `mst.Tree.Insert` (bypassing `repo.Create` validation) inside
+  otherwise-real signed commits, so atmos's verifier — which checks MST
+  consistency, not spec validity — passes them through to the ingest gate.
+  Rev lies are signed into the inner commit. A lie the verifier would reject
+  structurally proves nothing about the gate.
+- **Layer ownership is explicit.** Each case is asserted at the layer that
+  owns it: gate-owned cases assert the labeled reason on
+  `jetstream_ingest_dropped_events_total`; verifier-owned cases (non-TID /
+  future / regressing #commit revs) assert rejection or resync repair with no
+  bad archive. `internal/simulator/world/adversarial.go` documents which lies
+  land where; the wire itself blocks one class (invalid UTF-8 cannot ride a
+  live op.Path — CBOR text strings reject it — so it is backfill-only).
+- **Every lie is ledgered.** `world.AdversarialLedger` records each lie at
+  generation time; the oracle filters expected event logs, final-state ground
+  truth, and cursor-gap accounting through it (one-directional-safe: a
+  wrongly-archived lie still fails compares as an extra), and asserts
+  per-(source, reason) drop-counter floors — the anti-vacuity proof that
+  every scheduled mode fired.
+- **Honest traffic must not touch lie records** (`pickUntouchedRecord` skips
+  ledgered keys): an honest mutation of an unrepresentable-but-spec-valid
+  record would be gate-dropped as an unledgered event and corrupt the
+  cursor accounting.
+
 ### Real-Data Corpus Tier
 
 This tier breaks the `atmos` closed loop by running real firehose frames and
