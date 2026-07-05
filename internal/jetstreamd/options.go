@@ -51,16 +51,18 @@ type Options struct {
 	ShutdownTimeout    time.Duration
 	ClientDrainTimeout time.Duration
 
-	MaxBackfillRepos           int
-	BackfillWorkers            int
-	BackfillBatchSize          int
-	BackfillAsyncFlushWorkers  int
-	BackfillRepos              []atmos.DID
-	SkipMergeDiscovery         bool
-	FailedRepoRetryInterval    time.Duration
-	FailedRepoRetryWorkers     int
-	FailedRepoRetryHostWorkers int
-	FailedRepoRetryMaxDelay    time.Duration
+	MaxBackfillRepos               int
+	BackfillWorkers                int
+	BackfillBatchSize              int
+	BackfillAsyncFlushWorkers      int
+	BootstrapLiveMaxSegmentBytes   int64
+	BootstrapLiveMaxEventsPerBlock int
+	BackfillRepos                  []atmos.DID
+	SkipMergeDiscovery             bool
+	FailedRepoRetryInterval        time.Duration
+	FailedRepoRetryWorkers         int
+	FailedRepoRetryHostWorkers     int
+	FailedRepoRetryMaxDelay        time.Duration
 
 	// DisableRepoActionRateLimits disables the per-source-IP limiter for
 	// expensive operator-triggered repo actions on the status UI.

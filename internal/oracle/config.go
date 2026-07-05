@@ -193,3 +193,19 @@ func parseIntEnv(lookupenv func(string) (string, bool), key string, out *int) er
 	*out = parsed
 	return nil
 }
+
+func parseInt64Env(lookupenv func(string) (string, bool), key string, out *int64) error {
+	value, ok := lookupenv(key)
+	if !ok {
+		return nil
+	}
+	if value == "" {
+		return fmt.Errorf("%s must not be empty", key)
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("%s: parse int64 %q: %w", key, value, err)
+	}
+	*out = parsed
+	return nil
+}

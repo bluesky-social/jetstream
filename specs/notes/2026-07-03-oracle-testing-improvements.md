@@ -93,14 +93,15 @@ Capture a few hundred real firehose frames + a handful of real getRepo CARs
 regression tests. As-is storage, no privacy gymnastics. Low expected yield;
 cheap insurance against decode regressions.
 
-### 5. Random-time kill loop + multi-source-segment worlds
+### 5. Deterministic multi-source restart kills
 
-Nightly seeded SIGKILL at random wall-clock offsets and random ordinals of
-high-frequency crashpoints, over a world configured to produce **multiple
-merge source segments** (the missing scenario that makes m003 unkillable).
-The assertion bundle already exists; new machinery is the kill scheduler and
-the bigger bootstrap. Closest cheap analogue to VOPR's "explore timings nobody
-named."
+Nightly/mutation-gated seeded SIGKILL at deterministic crashpoint ordinals,
+over a world configured to produce **multiple merge source segments** (the
+missing scenario that makes m003 unkillable). Random wall-clock offsets are
+deliberately out of scope for this mutation-campaign item: they are harder to
+reproduce and not needed to expose the merge cursor off-by-one. The assertion
+bundle already exists; new machinery is the multi-source restart fixture and
+the precise duplicate/no-reprocess assertion.
 
 ### 6. Footer-index/bloom read-path oracle coverage (m015 class)
 

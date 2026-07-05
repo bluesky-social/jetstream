@@ -288,8 +288,10 @@ checksums, block indexes, and post-compaction refresh.
 ### Crash And Restart Tier
 
 This tier kills real child processes and reopens real persistent state. It
-must not be replaced with in-memory storage. Enumerated crashpoints are useful
-for known seams; random-time kill loops explore timing gaps that nobody named.
+must not be replaced with in-memory storage. Enumerated crashpoints and seeded
+crashpoint ordinals are the preferred mutation-gated form because failures
+replay exactly; random wall-clock kills are not part of the mutation campaign
+contract.
 
 Beyond "no records lost across a crash," this tier lands **durable
 intermediate events** through the merge so it can exercise the lost-intermediate
