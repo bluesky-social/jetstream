@@ -1272,3 +1272,35 @@ the checksum instance. Fixture provenance and the re-capture procedure:
 
 Remaining survivors: m003 (#209), m013/m014 (#204), m015 (#208).
 
+
+## Campaign 2026-07-04 — m036 identity-swallowed mutant (#202)
+
+Full 30-mutant campaign at `d77fa93` (the m036 commit, on the #202 branch
+with the identity traffic + harness asserts): **26 KILLED / 4 SURVIVED,
+zero STALE / BUILD-BROKEN**. Survivors unchanged and all owned:
+m003 (#209), m013/m014 (#204, dead-path retirement planned), m015 (#208).
+Baseline re-banked.
+
+**m036_identity_swallowed — KILLED@default, banked on arrival.**
+`convertIdentity` returns `nil, nil` (the legitimate #info no-op shape),
+modeling a ConvertEvent dispatch refactor that folds #identity into the
+"informational, nothing to archive" branch. Before #202 the simulator
+never emitted #identity, so this exact edit was invisible to every
+oracle tier — the m013/m014 green-by-vacancy class, now with a live
+path. Kill mechanism: the bootstrap traffic closure injects a
+deterministic #identity frame whose archive ack never fires under the
+mutant, so the after-bootstrap barrier times out; if pacing ever let a
+run proceed, `assertIdentityArchived` (injection-keyed anti-vacuity)
+and the exact-multiset event-log compares (the expected side decodes
+#identity from firehose history) catch the missing rows, and 11
+unit/corpus tests fail besides. Red-first verified before the harness
+asserts landed.
+
+Context: #202 also made the default `TrafficMix` emit #identity (~3%,
+vs 0.061% measured on production 2026-07-04 — deliberately above rate
+for statistical reach at oracle scale), and its first non-short run
+found production bug #234 (#identity relay-replay re-archival; fixed
+same branch — durable applied-seq ratchet + consumer guard, the #231
+sibling). The enqueuer's malformed-DID gate is now oracle-asserted via
+the harness's first debug-/metrics scrape (two-sided: invalid_did ≥ 1
+AND already_known ≥ 1).
