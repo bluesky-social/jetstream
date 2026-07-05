@@ -1,0 +1,30 @@
+mutant: m043_account_status_exactness
+target: internal/tombstone/tombstone.go
+failure-mode: |
+  DID tombstone classification treats every inactive #account status
+  as a deletion instead of requiring the exact atproto deletion shape
+  active=false,status=deleted. Real relay/PDS account lifecycle statuses
+  such as takendown, suspended, deactivated, and unknown would then fold as
+  DID tombstones during compaction, allowing the compactor to drop unrelated
+  live records for accounts that still exist. This is permanent data loss:
+  a moderation/unavailability event becomes indistinguishable from account
+  deletion at the tombstone layer.
+expected-detection: |
+  tombstone tier: TestTombstoneSet_AccountStatusExactness and the oracle's
+  compaction helpers require exact status=="deleted" semantics, so inactive
+  non-deleted statuses must not produce DID tombstones. The default lifecycle
+  also injects a deterministic account-status sequence with takendown,
+  suspended, deactivated, unknown, and active=true reactivation after a probe
+  create; under this mutant the compaction/final-state checks report the probe
+  row as missing or superseded.
+expected-tier: tombstone
+tiers: tombstone,default
+
+diff --git a/internal/tombstone/tombstone.go b/internal/tombstone/tombstone.go
+index 4d34cf1..b73d0f7 100644
+--- a/internal/tombstone/tombstone.go
++++ b/internal/tombstone/tombstone.go
+@@ -241 +241 @@ func accountDeleted(payload []byte) (bool, error) {
+-	return !acc.Active && acc.Status.HasVal() && acc.Status.Val() == "deleted", nil
++	return !acc.Active && acc.Status.HasVal(), nil
+ }

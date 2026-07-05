@@ -5,10 +5,10 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 34 active mutants on disk
-(m001–m042; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
-union baseline: **33 killed, 1 survived, zero STALE/BUILD-BROKEN** in
-`testing/mutation/baseline.json` (commit field `fdbfaa7` is
+**Current catalog (keep this line current): 35 active mutants on disk
+(m001–m043; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+union baseline: **34 killed, 1 survived, zero STALE/BUILD-BROKEN** in
+`testing/mutation/baseline.json` (commit field `2450fec` is
 provenance-only). The remaining survivor (m015) is a documented escape with
 owning issue #208.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
@@ -75,6 +75,28 @@ remain below so the reasoning is not lost.
 | m021_overlay_record_seq_base_zero | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m023_overlay_drop_record_tombstones | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178. #183's re-derivation analysis (2026-07-04 section below) concluded no single-edit replacement exists: the recorder is a regression assertion without a gated mutant. |
+
+## Campaign 2026-07-05 (#203 — account lifecycle statuses and getRepo unavailable)
+
+Full campaign at `2450fec` after adding deterministic simulator/oracle coverage
+for non-deleted account lifecycle statuses (`takendown`, `suspended`,
+`deactivated`, `unknown`), reactivation, and terminal `getRepo`
+`RepoTakendown`/`RepoSuspended`/`RepoDeactivated` classification. **35 active
+mutants: 34 KILLED, 1 SURVIVED, zero STALE/BUILD-BROKEN.** The only survivor is
+the existing documented m015 footer-count escape.
+
+Drivers:
+
+```bash
+testing/mutation/run.sh m043 --json /tmp/m043.json
+testing/mutation/run.sh --json testing/mutation/baseline.json
+```
+
+### Scorecard
+
+| mutant | result | note |
+|---|---|---|
+| m043_account_status_exactness | KILLED@tombstone | `accountDeleted` treating any inactive status as a DID tombstone is killed by the tombstone exactness tier; the default lifecycle also injects archived non-deleted statuses after a probe create. |
 
 ## Campaign 2026-06-29 (step 11 #182 — partb tier; catalog refresh; baseline regen)
 
