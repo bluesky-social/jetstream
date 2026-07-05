@@ -10,15 +10,19 @@ failure-mode: |
   a moderation/unavailability event becomes indistinguishable from account
   deletion at the tombstone layer.
 expected-detection: |
-  tombstone tier: TestTombstoneSet_AccountStatusExactness and the oracle's
-  compaction helpers require exact status=="deleted" semantics, so inactive
-  non-deleted statuses must not produce DID tombstones. The default lifecycle
-  also injects a deterministic account-status sequence with takendown,
-  suspended, deactivated, unknown, and active=true reactivation after a probe
-  create; under this mutant the compaction/final-state checks report the probe
-  row as missing or superseded.
-expected-tier: tombstone
-tiers: tombstone,default
+  default tier: the lifecycle injects a deterministic account-status sequence
+  (takendown, suspended, deactivated, unknown, then active=true reactivation)
+  for a fixture account after a probe create; under this mutant those inactive
+  statuses fold as DID tombstones, so compaction drops the probe row and the
+  compaction/final-state checks report it missing or superseded. The default
+  tier is listed first deliberately: the pre-existing tombstone unit matrix
+  (TestObserveAccountDeletedOnlyPurgesLiteralDeleted,
+  TestObserveAccountStatusMatrixRetains) also kills this mutant, and the
+  driver stops at the first killing tier — tombstone-first would record a kill
+  without ever exercising the #203 end-to-end coverage this mutant gates.
+  tombstone tier remains as the fast unit backstop.
+expected-tier: default
+tiers: default,tombstone
 
 diff --git a/internal/tombstone/tombstone.go b/internal/tombstone/tombstone.go
 index 4d34cf1..b73d0f7 100644
