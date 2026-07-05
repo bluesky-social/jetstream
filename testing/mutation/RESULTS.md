@@ -6,13 +6,11 @@ oracle's detection power is visible over time. See
 method and `testing/mutation/run.sh` for the driver.
 
 **Current catalog (keep this line current): 34 active mutants on disk
-(m001–m042; m007, m010, m013, m014, m020, m021, m023, m025 retired). Latest
-full campaign: 2026-07-05 at the #206 merge head (#206 frame adversity ∪
-#204 adversarial ingest traffic ∪ #202 identity/m041 ∪ #230 corpus ∪ #232
-replay) — **32 killed, 2 survived, zero STALE/BUILD-BROKEN**; gate PASS
-against `testing/mutation/baseline.json` (union bank; the commit field is
-provenance-only). The 2 survivors (m003, m015) are documented escapes with
-owning issues (#209, #208).
+(m001–m042; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+union baseline: **33 killed, 1 survived, zero STALE/BUILD-BROKEN** in
+`testing/mutation/baseline.json` (commit field `fdbfaa7` is
+provenance-only). The remaining survivor (m015) is a documented escape with
+owning issue #208.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -1402,21 +1400,19 @@ KILLED@replay (#232), m009 KILLED@corpus (#230), with m013/m014 absent
 short suites, default + stress lifecycle, -race on oracle/simulator,
 lint. This is the PR-merge state for #235.
 
-
-
 ## Campaign 2026-07-05 — `frames` tier; m042 banked (#206)
 
 Original campaign at `248b9c5` (branch `frame-adversity-206`, pre-merge,
 where this mutant was numbered m036): **30 mutants: 26 KILLED, 4
 SURVIVED, zero STALE/BUILD-BROKEN**; no disposition changed vs the
-`5d6fc9e` baseline. Merging origin/main (the #204 ∪ #202 ∪ #230 ∪ #232
-union above) collided with the #204 branch's freshly-minted m036–m040,
-so the frames mutant was renumbered to **m042** (same precedent as
-m041's renumber in 82b2dd9). baseline.json resolved as the union: main's
-33 dispositions verbatim plus m042 KILLED@frames — **34 mutants, 32
-KILLED / 2 SURVIVED** (m003 #209, m015 #208). The full campaign was
-re-run at the merge head to verify the union bank — results in the
-section below.
+`5d6fc9e` baseline. Merging origin/main first pulled in the #204 ∪ #202 ∪
+#230 ∪ #232 union above; that collided with the #204 branch's freshly-minted
+m036–m040, so the frames mutant was renumbered to **m042** (same precedent as
+m041's renumber in 82b2dd9). A later merge pulled in #209's
+`restart-multisource` tier, changing m003 from SURVIVED to KILLED. The current
+baseline.json resolves as the full union: main's 33 dispositions with m003
+KILLED@restart-multisource plus m042 KILLED@frames — **34 mutants, 33 KILLED /
+1 SURVIVED** (m015 #208).
 
 **New `frames` tier; m042 banked KILLED@frames.** #206 made frame-level
 wire adversity live: the simulator relay can inject arbitrary bytes on
@@ -1466,3 +1462,33 @@ mutation itself is unchanged — and the re-run banked it KILLED@default.
 Also green at this head: short suites (2017 tests), lint, -race over
 oracle/live/simulator, and 3× repeats of the frame + replay oracle
 tiers under atmos v0.2.13.
+
+## Campaign 2026-07-05 — #209 deterministic multi-source restart tier
+
+Full campaign at `fdbfaa7` after adding
+`TestOracle_RestartMultiSourceMergeCursorNoReprocess` and the
+`restart-multisource` mutation tier: **33 active mutants, 32 KILLED / 1
+SURVIVED, zero STALE/BUILD-BROKEN.** The baseline was refreshed with m003
+banked as **KILLED@restart-multisource**; m015 remains the sole survivor and
+continues to belong to #208.
+
+The new tier forces bootstrap-live to rotate after every accepted event
+(`MaxEventsPerBlock=1`, `MaxSegmentBytes=1`), kills the restart child at the
+9th `AfterMergeDstFlushBeforeSourceCommit` occurrence, captures rows from the
+already-committed source immediately before the crash boundary, then proves
+surviving captured rows appear exactly once after recovery. Under m003's
+`commitSourceComplete(sf.Idx)` off-by-one, restart reprocesses that committed
+source and the precise no-reprocess assertion fails.
+
+Incidental maintenance: m011's patch context was refreshed for the existing
+`beforeIO(IOOpWrite)` hook in `segment/writer.go`; the modeled bug and kill
+tier are unchanged, and the full campaign re-confirmed **KILLED@default**.
+
+## Merge resolution 2026-07-05 — #206 frame adversity ∪ #209 restart-multisource
+
+Merging origin/main after #209 into `frame-adversity-206` produced the expected
+scorecard conflict: #206 had added m042 KILLED@frames, while #209 had changed
+m003 from SURVIVED to KILLED@restart-multisource. The resolved baseline is the
+union: **34 active mutants, 33 KILLED / 1 SURVIVED**, with m015 as the only
+remaining survivor. The m011 conflict was metadata-only; both sides carried the
+same mutation body and current `segment/writer.go` context.

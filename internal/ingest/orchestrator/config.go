@@ -140,6 +140,13 @@ type Config struct {
 	// the bootstrap backfill writer only. Zero keeps synchronous flushing.
 	BackfillAsyncFlushWorkers int
 
+	// BootstrapLiveMaxSegmentBytes and BootstrapLiveMaxEventsPerBlock forward
+	// to the bootstrap-time live_segments writer. Zero leaves ingest defaults.
+	// Production leaves these unset; restart oracle tests use tiny limits to
+	// force multiple merge source segments without large payloads.
+	BootstrapLiveMaxSegmentBytes   int64
+	BootstrapLiveMaxEventsPerBlock int
+
 	// BackfillRepos, when non-empty, replaces bootstrap listRepos
 	// discovery with this explicit DID list. Debug-only knob for
 	// targeted production smoke tests; leave empty in production.
@@ -294,6 +301,12 @@ func (c *Config) validate() error {
 	}
 	if c.BackfillAsyncFlushWorkers < 0 {
 		return fmt.Errorf("%w: BackfillAsyncFlushWorkers must be >= 0", ErrInvalidConfig)
+	}
+	if c.BootstrapLiveMaxSegmentBytes < 0 {
+		return fmt.Errorf("%w: BootstrapLiveMaxSegmentBytes must be >= 0", ErrInvalidConfig)
+	}
+	if c.BootstrapLiveMaxEventsPerBlock < 0 {
+		return fmt.Errorf("%w: BootstrapLiveMaxEventsPerBlock must be >= 0", ErrInvalidConfig)
 	}
 	if c.FailedRepoRetryInterval < 0 {
 		return fmt.Errorf("%w: FailedRepoRetryInterval must be >= 0", ErrInvalidConfig)
