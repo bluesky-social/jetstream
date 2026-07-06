@@ -280,3 +280,38 @@ func TestStateStore_IdentitySeqRatchet(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, got, "Delete must remove the ratchet")
 }
+
+// TestStateStore_AccountSeqRatchet pins the append-owned #account replay
+// ratchet: absent reads as 0, RecordAccountSeq only ratchets upward, the
+// value survives a Flush + fresh store, and Delete removes it.
+func TestStateStore_AccountSeqRatchet(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:ffffffffffffffffffffffff")
+
+	got, err := s.LoadAppliedAccountSeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Zero(t, got, "absent ratchet must read as 0")
+
+	s.RecordAccountSeq(did, 7)
+	got, err = s.LoadAppliedAccountSeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, int64(7), got, "staged ratchet must be visible before flush")
+
+	s.RecordAccountSeq(did, 5)
+	got, err = s.LoadAppliedAccountSeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, int64(7), got, "ratchet must not regress")
+
+	require.NoError(t, s.Flush())
+	fresh := New(raw)
+	got, err = fresh.LoadAppliedAccountSeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, int64(7), got, "flushed ratchet must survive a restart")
+
+	require.NoError(t, fresh.Delete(t.Context(), did))
+	got, err = fresh.LoadAppliedAccountSeq(t.Context(), did)
+	require.NoError(t, err)
+	require.Zero(t, got, "Delete must remove the ratchet")
+}

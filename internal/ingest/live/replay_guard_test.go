@@ -105,6 +105,93 @@ func TestProcessBatch_ReplayedAccountEventIsDroppedNotReArchived(t *testing.T) {
 		"replay drops must still advance the in-memory upstream watermark")
 }
 
+// TestProcessBatch_ReplayedAccountEventDropsWhenHostingPromotionBlocked
+// reproduces the CI failure mode from #254: atmos can stage newer same-DID
+// hosting state before Jetstream appends an older #account row. The older row
+// must not promote that newer pending state, but its own append still has to
+// arm archive-level replay dedupe so a duplicate older frame does not append.
+func TestProcessBatch_ReplayedAccountEventDropsWhenHostingPromotionBlocked(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	metrics := NewMetrics(prometheus.NewRegistry())
+	stateStore := syncstate.New(st)
+
+	const did = "did:plc:blockedpromote"
+	atmosDID := atmos.DID(did)
+	require.NoError(t, stateStore.SaveHosting(t.Context(), atmosDID,
+		atmossync.HostingState{Active: true, Seq: 6}))
+
+	c, err := Open(Config{
+		SegmentsDir:    dir,
+		Store:          st,
+		SeqKey:         "live_segments/seq/next",
+		CursorKey:      "relay/cursor",
+		RelayURL:       "https://example.invalid",
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:       newTestVerifier(t),
+		SyncStateStore: stateStore,
+		Metrics:        metrics,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		accountEvent(did, 5, false),
+	}))
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		accountEvent(did, 5, false),
+	}))
+	require.NoError(t, c.Close())
+
+	got := readAllSegmentEvents(t, dir)
+	require.Len(t, got, 1, "blocked hosting promotion must not let account replay re-archive")
+	require.Equal(t, int64(5), archivedAccountSeq(t, got[0].Payload))
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.ReplayedAccountsDrop), 0)
+
+	hosting, err := stateStore.LoadAppliedHosting(t.Context(), atmosDID)
+	require.NoError(t, err)
+	require.Nil(t, hosting, "older row must not promote newer pending hosting state")
+}
+
+// TestProcessBatch_AccountRatchetDurableAtBlockBoundary mirrors the identity
+// crash-window guard for #account rows: a full-block append commits the cursor
+// batch inside Append, so the account replay ratchet must be recorded by
+// OnAppend before that flush.
+func TestProcessBatch_AccountRatchetDurableAtBlockBoundary(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	stateStore := syncstate.New(st)
+
+	const did = "did:plc:acctblockedge"
+
+	c, err := Open(Config{
+		SegmentsDir:       dir,
+		Store:             st,
+		SeqKey:            "live_segments/seq/next",
+		CursorKey:         "relay/cursor",
+		RelayURL:          "https://example.invalid",
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:          newTestVerifier(t),
+		SyncStateStore:    stateStore,
+		MaxEventsPerBlock: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		accountEvent(did, 5, false),
+	}))
+
+	applied, err := syncstate.New(st).LoadAppliedAccountSeq(t.Context(), atmos.DID(did))
+	require.NoError(t, err)
+	require.Equal(t, int64(5), applied,
+		"account ratchet must be durable once the row's block has flushed")
+}
+
 func archivedIdentitySeq(t *testing.T, payload []byte) int64 {
 	t.Helper()
 	var ident comatproto.SyncSubscribeRepos_Identity

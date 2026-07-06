@@ -90,14 +90,13 @@ func Open(cfg Config) (*Consumer, error) {
 	// tombstone the set does not yet contain, and the pass would
 	// durably advance the watermark past it, evicting it unapplied.
 	//
-	// The #identity applied-seq ratchet (#234) records here for the
-	// same before-any-flush reason: Append can synchronously flush a
-	// full block, and that flush commits the cursor + StageFlush durable
-	// batch. Recording post-Append (where hosting
-	// promotes) would open a crash window where the identity row and
-	// the cursor batch are durable but the ratchet is not — a restart
-	// redelivery would then re-archive the row as a permanent
-	// duplicate, the exact bug the guard exists to prevent.
+	// The #identity and #account applied-seq ratchets record here for
+	// the same before-any-flush reason: Append can synchronously flush
+	// a full block, and that flush commits the cursor + StageFlush
+	// durable batch. Recording post-Append would open a crash window
+	// where the row and cursor batch are durable but the ratchet is not
+	// — a restart redelivery would then re-archive the row as a
+	// permanent duplicate, the exact bug the guards exist to prevent.
 	var onAppend func(ev *segment.Event) error
 	if cfg.Tombstones != nil || cfg.SyncStateStore != nil {
 		ts := cfg.Tombstones
@@ -108,8 +107,13 @@ func Open(cfg Config) (*Consumer, error) {
 					return err
 				}
 			}
-			if ss != nil && ev.Kind == segment.KindIdentity {
-				ss.RecordIdentitySeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+			if ss != nil {
+				switch ev.Kind {
+				case segment.KindAccount:
+					ss.RecordAccountSeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+				case segment.KindIdentity:
+					ss.RecordIdentitySeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+				}
 			}
 			return nil
 		}
@@ -233,37 +237,42 @@ func (c *Consumer) dropStaleOrderedAsyncResync(ctx context.Context, evt streamin
 }
 
 // dropReplayedAccountEvent guards against relay seq replays of #account
-// events. atmos's verifier replay-drops duplicate #commit/#sync
-// deliveries (rev-replay protection), but OnAccountEvent's seq guard only
-// suppresses verifier STATE updates — the event still flows to the
-// consumer. Without this check a relay regression (e.g. restored from
-// backup) re-archives the #account row at a fresh jetstream seq, and a
-// replayed account-delete landing ABOVE a later reactivate+recreate makes
-// every fold (oracle reconstruct, tombstone set, compaction) erase live
-// records permanently. The comparison uses the APPLIED hosting seq
-// (promoted or pebble-durable, never pending): promotion happens
-// synchronously after this DID's row is appended and per-DID delivery is
-// seq-ordered, so seq <= applied means this exact event's row is already
-// in the archive — a second delivery is a duplicate by construction.
-// Pending state is excluded because a later pipelined event could stage
-// it before its own rows land, and consulting it would drop a legitimate
-// intermediate event.
+// events. atmos's verifier replay-drops duplicate #commit/#sync deliveries
+// (rev-replay protection), but OnAccountEvent's seq guard only suppresses
+// verifier STATE updates — the event still flows to the consumer. Without
+// this check a relay regression (e.g. restored from backup) re-archives the
+// #account row at a fresh jetstream seq, and a replayed account-delete
+// landing ABOVE a later reactivate+recreate makes every fold (oracle
+// reconstruct, tombstone set, compaction) erase live records permanently.
+// The primary comparison uses Jetstream's append-owned applied account seq
+// ratchet, recorded in the writer's OnAppend hook. Applied hosting state is
+// only a backward-compatible fallback: pending hosting state cannot be used
+// because a later pipelined event can stage it before its own rows land, and
+// consulting it would drop a legitimate intermediate event.
 func (c *Consumer) dropReplayedAccountEvent(ctx context.Context, segEvts []segment.Event) (bool, error) {
 	if c.cfg.SyncStateStore == nil || len(segEvts) != 1 || segEvts[0].Kind != segment.KindAccount {
 		return false, nil
 	}
-	state, err := c.cfg.SyncStateStore.LoadAppliedHosting(ctx, atmos.DID(segEvts[0].DID))
+	did := atmos.DID(segEvts[0].DID)
+	appliedSeq, err := c.cfg.SyncStateStore.LoadAppliedAccountSeq(ctx, did)
 	if err != nil {
 		return false, fmt.Errorf("livestream: account replay guard: %w", err)
 	}
-	if state == nil || segEvts[0].UpstreamRelayCursor > state.Seq {
+	state, err := c.cfg.SyncStateStore.LoadAppliedHosting(ctx, did)
+	if err != nil {
+		return false, fmt.Errorf("livestream: account replay guard: %w", err)
+	}
+	if state != nil && state.Seq > appliedSeq {
+		appliedSeq = state.Seq
+	}
+	if appliedSeq == 0 || segEvts[0].UpstreamRelayCursor > appliedSeq {
 		return false, nil
 	}
 	c.cfg.Metrics.incReplayedAccountEventsDropped()
 	c.logger.WarnContext(ctx, "dropped replayed account event",
 		"did", segEvts[0].DID,
 		"seq", segEvts[0].UpstreamRelayCursor,
-		"applied_seq", state.Seq,
+		"applied_seq", appliedSeq,
 	)
 	return true, nil
 }
