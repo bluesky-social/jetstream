@@ -116,19 +116,7 @@ func (e *Entry) CompressedV2() ([]byte, error) {
 	return e.compressedV2Body, e.compressedV2Err
 }
 
-// approxBytes estimates the entry's memory footprint for retention accounting:
-// the payload plus the small fixed-size string fields. The
-// memoized encodings are intentionally excluded — they are bounded by the
-// same retention window (evicted FIFO with the entry) and counting them would
-// double-count the shared bytes. An entry may memoize up to four payloads
-// (v1/v2 JSON × plain/zstd) when a mix of subscriber types is
-// connected; the off-budget overhang stays O(ring length).
-func (e *Entry) approxBytes() int {
-	ev := e.Event
-	return len(ev.Payload) + len(ev.DID) + len(ev.Collection) +
-		len(ev.Rkey) + len(ev.Rev) + entryFixedOverhead
-}
-
 // entryFixedOverhead approximates the per-entry struct + pointer overhead
-// so a flood of tiny events still has a bounded count in the ring.
+// so a flood of tiny events still has a bounded count in the block cache's
+// byte accounting.
 const entryFixedOverhead = 128

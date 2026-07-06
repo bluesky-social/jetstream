@@ -109,7 +109,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			TombstoneCap:          tombstoneCap,
 			CompactionTrigger:     o.compactionTrigger,
 			SegmentMetrics:        o.cfg.SegmentMetrics,
-			ReadLogRetentionBytes: int64(o.cfg.ReadLogRetentionBytes),
+			ReadLogRetentionBytes: o.cfg.ReadLogRetentionBytes,
 			OnEvent:               onEvent,
 			OnAfterSeal:           o.cfg.IngestOnAfterSeal,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,

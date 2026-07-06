@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -71,6 +73,20 @@ func appendReplayEvent(t *testing.T, w *ingest.Writer, did string) uint64 {
 	return ev.Seq
 }
 
+func firstOr(s []uint64, def uint64) uint64 {
+	if len(s) == 0 {
+		return def
+	}
+	return s[0]
+}
+
+func lastOr(s []uint64, def uint64) uint64 {
+	if len(s) == 0 {
+		return def
+	}
+	return s[len(s)-1]
+}
+
 func TestWalkFromCursor_ReadLogFloorConcurrentRotation(t *testing.T) {
 	t.Parallel()
 	m, w := openFloorReplayFixture(t, nil)
@@ -124,17 +140,36 @@ func TestWalkFromCursor_ReadLogFloorConcurrentRotation(t *testing.T) {
 			return nil
 		})
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// A "made no progress / rotation seam invariant violated" error must
+			// NEVER fire in this fixture: every seq below the floor is dense and
+			// durable (no compaction), so the convergence loop must always fill a
+			// seam gap. Any other error is the documented benign concurrent-seal
+			// transient (WalkActive racing a Seal reads footer bytes and fails
+			// loud with a zstd magic mismatch); a real subscriber just reconnects
+			// and retries from the same cursor, so the test does too — it never
+			// advances a cursor, so retrying loses no coverage.
+			if strings.Contains(err.Error(), "rotation seam invariant violated") {
+				holeFound.Store(true)
+				t.Errorf("floor-bounded walk failed to converge below the floor: %v", err)
+			}
 			return
 		}
 		walkRuns.Add(1)
-		for i := 1; i < len(emitted); i++ {
-			if emitted[i] != emitted[i-1]+1 && emitted[i-1]+1 < floor {
-				holeFound.Store(true)
-				return
-			}
+		// Completeness: the walk must serve EXACTLY [start, floor) — contiguous,
+		// no holes, and reaching floor-1. The single-pass seam bug (issue #190
+		// regression) manifests as an early clean stop below floor-1, which a
+		// contiguity-only check cannot see.
+		want := make([]uint64, 0, floor-start)
+		for s := start; s < floor; s++ {
+			want = append(want, s)
 		}
-		if len(emitted) > 0 {
-			require.Less(t, emitted[len(emitted)-1], floor, "cold replay must stop before the readable-log floor")
+		if !slices.Equal(emitted, want) {
+			holeFound.Store(true)
+			t.Errorf("floor-bounded walk incomplete: got %d..%d (len %d), want %d..%d (len %d)",
+				firstOr(emitted, 0), lastOr(emitted, 0), len(emitted), start, floor-1, len(want))
 		}
 	}
 
@@ -207,8 +242,88 @@ func TestWalkFromCursor_GapBelowReadLogFloorFailsLoud(t *testing.T) {
 		return nil
 	})
 	require.Error(t, err, "missing data below the readable-log floor must not be skipped")
-	require.Contains(t, err.Error(), "cold replay gap")
+	require.Contains(t, err.Error(), "made no progress")
 	require.Empty(t, emitted, "walk must not emit past the missing segment")
+}
+
+// TestWalkFromCursor_SeamConvergesWhenSegmentPublishedLate deterministically
+// models the rotation seam issue #190 guards: a sealed segment is present on
+// disk and owns seqs below the floor, but the walk's first manifest snapshot
+// predates its publish. Without the convergence loop the single-pass walk would
+// stop below the floor and the cold reader would jump the cursor to the floor,
+// silently dropping the segment. Here we publish the withheld segment on the
+// first seam retry (standing in for rotateLocked's publish-before-bump
+// happens-before) and assert the walk then serves the full range.
+func TestWalkFromCursor_SeamConvergesWhenSegmentPublishedLate(t *testing.T) {
+	t.Parallel()
+	type sealEvent struct {
+		idx  uint64
+		path string
+	}
+	var seals []sealEvent
+	m, w := openFloorReplayFixture(t, func(*manifest.Manifest) func(uint64, string) error {
+		return func(idx uint64, path string) error {
+			seals = append(seals, sealEvent{idx: idx, path: path})
+			return nil
+		}
+	})
+
+	// Fill and seal several segments (MaxEventsPerBlock=4, MaxSegmentBytes=512
+	// rotate quickly), then flush the tail so every seq below the floor is
+	// durable and file-visible.
+	for w.ActiveIndex() < 3 {
+		appendReplayEvent(t, w, "did:plc:seam")
+	}
+	for range 4 {
+		appendReplayEvent(t, w, "did:plc:seam")
+	}
+	require.NoError(t, w.Flush(context.Background()))
+	require.GreaterOrEqual(t, len(seals), 3)
+
+	// Publish every sealed segment EXCEPT the first into the manifest. The
+	// first segment is the one whose publish "races" the walk: it is absent
+	// from the initial snapshot and only becomes visible on the seam retry.
+	withheld := seals[0]
+	for _, s := range seals[1:] {
+		require.NoError(t, m.OnSegmentSealed(s.idx, s.path))
+	}
+
+	r, err := segment.Open(segment.ReaderConfig{Path: withheld.path})
+	require.NoError(t, err)
+	start := r.Header().MinSeq
+	require.NoError(t, r.Close())
+
+	floor := w.ReadLog().FloorSeq()
+	require.Greater(t, floor, start)
+
+	var retries int
+	var emitted []uint64
+	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
+		StartSeq: start,
+		StopSeq:  floor,
+		Manifest: m,
+		Writer:   w,
+		OnSeamRetry: func(uint64) {
+			// Publish the withheld segment exactly once, on the first retry —
+			// the deterministic analogue of rotateLocked publishing N before
+			// the next manifest read.
+			if retries == 0 {
+				require.NoError(t, m.OnSegmentSealed(withheld.idx, withheld.path))
+			}
+			retries++
+		},
+	}, func(ev *segment.Event) error {
+		emitted = append(emitted, ev.Seq)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Positive(t, retries, "the seam retry path must be exercised")
+
+	want := make([]uint64, 0, floor-start)
+	for s := start; s < floor; s++ {
+		want = append(want, s)
+	}
+	require.Equal(t, want, emitted, "seam convergence must serve the full [start, floor) range gap-free")
 }
 
 func TestWalkFromCursor_DoesNotReplayPendingMemory(t *testing.T) {

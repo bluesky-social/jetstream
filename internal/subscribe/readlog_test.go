@@ -49,7 +49,8 @@ func newReadLogTail(t *testing.T, retentionBytes int64, cold coldReader) (*Tail,
 func writerForTail(t *testing.T, tl *Tail) *ingest.Writer {
 	t.Helper()
 	if got, ok := testTailWriters.Load(tl); ok {
-		return got.(*ingest.Writer)
+		w, _ := got.(*ingest.Writer)
+		return w
 	}
 	st, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
