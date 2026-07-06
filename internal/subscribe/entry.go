@@ -7,8 +7,8 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 )
 
-// Entry is one event held in the hot ring: the decoded event plus a
-// lazily-memoized wire encoding shared across every caught-up subscriber.
+// Entry is one event visible to subscribe readers: the decoded event plus a
+// lazily-memoized wire encoding shared across subscribers while it is resident.
 // Encode runs at most once per Entry; the result (bytes or sentinel error)
 // is cached so the shared path reproduces deliverEvent's branching exactly.
 type Entry struct {
@@ -116,10 +116,10 @@ func (e *Entry) CompressedV2() ([]byte, error) {
 	return e.compressedV2Body, e.compressedV2Err
 }
 
-// approxBytes estimates the entry's memory footprint for the hot ring's
-// byte budget: the payload plus the small fixed-size string fields. The
+// approxBytes estimates the entry's memory footprint for retention accounting:
+// the payload plus the small fixed-size string fields. The
 // memoized encodings are intentionally excluded — they are bounded by the
-// same ring (evicted FIFO with the entry) and counting them would
+// same retention window (evicted FIFO with the entry) and counting them would
 // double-count the shared bytes. An entry may memoize up to four payloads
 // (v1/v2 JSON × plain/zstd) when a mix of subscriber types is
 // connected; the off-budget overhang stays O(ring length).

@@ -358,7 +358,7 @@ func TestOracleRestartChild(t *testing.T) {
 		PlanMaxCollections:             xrpcapi.DefaultPlanMaxCollections,
 		PlanMaxEntries:                 xrpcapi.DefaultPlanMaxEntries,
 		PlanWholeSegmentThreshold:      xrpcapi.DefaultPlanWholeSegmentThreshold,
-		SubscribeHotTailBytes:          16 << 20,
+		SubscribeReadLogRetentionBytes: 16 << 20,
 		SubscribeBlockCacheBytes:       16 << 20,
 		SubscribeReadBatch:             1024,
 		SubscribeSlowWindow:            time.Second,

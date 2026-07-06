@@ -73,8 +73,7 @@ func TestHandler_RejectsWhenNotSteadyState(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseBootstrap, time.Now().UTC()))
 
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -98,8 +97,7 @@ func TestHandler_HappyPath_DeliversIdentityEvent(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -132,7 +130,7 @@ func TestHandler_HappyPath_DeliversIdentityEvent(t *testing.T) {
 	payload, err := id.MarshalCBOR()
 	require.NoError(t, err)
 	var seq uint64
-	appendSeq(b, &seq, &segment.Event{
+	appendSeq(t, b, &seq, &segment.Event{
 		WitnessedAt: 1779719010267528,
 		Kind:        segment.KindIdentity,
 		DID:         "did:plc:test",
@@ -152,8 +150,7 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -181,14 +178,14 @@ func TestHandler_SyncEventNotEmitted(t *testing.T) {
 	// identity (which the encoder emits). Only the identity should
 	// arrive on the wire.
 	var seq uint64
-	appendSeq(b, &seq, &segment.Event{Kind: segment.KindSync, DID: "did:plc:s"})
+	appendSeq(t, b, &seq, &segment.Event{Kind: segment.KindSync, DID: "did:plc:s"})
 
 	id := &comatproto.SyncSubscribeRepos_Identity{
 		DID: "did:plc:i", Seq: 1, Time: "2026-05-25T00:00:00Z",
 	}
 	payload, err := id.MarshalCBOR()
 	require.NoError(t, err)
-	appendSeq(b, &seq, &segment.Event{
+	appendSeq(t, b, &seq, &segment.Event{
 		WitnessedAt: 2, Kind: segment.KindIdentity,
 		DID: "did:plc:i", Payload: payload,
 	})
@@ -208,8 +205,7 @@ func TestHandler_DefaultModeDoesNotEmitResyncReplacementRows(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -234,7 +230,7 @@ func TestHandler_DefaultModeDoesNotEmitResyncReplacementRows(t *testing.T) {
 	waitForTailBlocked(t, b)
 
 	var seq uint64
-	appendSeq(b, &seq, &segment.Event{
+	appendSeq(t, b, &seq, &segment.Event{
 		WitnessedAt: 1,
 		Kind:        segment.KindCreateResync,
 		DID:         "did:plc:resync",
@@ -256,8 +252,7 @@ func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -283,7 +278,7 @@ func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
 	waitForTailBlocked(t, b)
 
 	var seq uint64
-	appendSeq(b, &seq, &segment.Event{
+	appendSeq(t, b, &seq, &segment.Event{
 		WitnessedAt: 1,
 		Kind:        segment.KindCreateResync,
 		DID:         "did:plc:resync",
@@ -313,8 +308,7 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -348,7 +342,7 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	}
 	acctPayload, err := acct.MarshalCBOR()
 	require.NoError(t, err)
-	appendSeq(b, &seq, &segment.Event{
+	appendSeq(t, b, &seq, &segment.Event{
 		WitnessedAt: 2, Kind: segment.KindAccount, DID: "did:plc:acct", Payload: acctPayload,
 	})
 	// Matching commit, to bound the test.
@@ -379,8 +373,7 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -407,7 +400,7 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 
 	var seq uint64
 	payload := []byte{0xa0}
-	appendSeq(b, &seq, &segment.Event{
+	appendSeq(t, b, &seq, &segment.Event{
 		WitnessedAt:         1779719010267528,
 		UpstreamRelayCursor: 111,
 		Kind:                segment.KindCreate,
@@ -422,8 +415,8 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 	var commit map[string]any
 	require.NoError(t, json.Unmarshal(commitFrame, &commit))
 	require.Equal(t, "commit", commit["kind"])
-	require.Equal(t, float64(0), commit["cursor"])
-	require.Equal(t, float64(0), commit["seq"])
+	require.Equal(t, float64(1), commit["cursor"])
+	require.Equal(t, float64(1), commit["seq"])
 	require.NotContains(t, commit, "upstream_relay_cursor")
 	commitPayload, ok := commit["commit"].(map[string]any)
 	require.True(t, ok, "commit payload not a map")
@@ -435,7 +428,7 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 	}
 	syncPayload, err := syncEvt.MarshalCBOR()
 	require.NoError(t, err)
-	appendSeq(b, &seq, &segment.Event{
+	appendSeq(t, b, &seq, &segment.Event{
 		WitnessedAt:         1779719010267529,
 		UpstreamRelayCursor: 222,
 		Kind:                segment.KindSync,
@@ -448,7 +441,7 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 	var syncGot map[string]any
 	require.NoError(t, json.Unmarshal(syncFrame, &syncGot))
 	require.Equal(t, "sync", syncGot["kind"])
-	require.Equal(t, float64(1), syncGot["cursor"])
+	require.Equal(t, float64(2), syncGot["cursor"])
 	require.Contains(t, syncGot, "sync")
 }
 
@@ -456,8 +449,7 @@ func TestHandler_V1ModeDoesNotEmitV2Fields(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -482,7 +474,7 @@ func TestHandler_V1ModeDoesNotEmitV2Fields(t *testing.T) {
 	waitForTailBlocked(t, b)
 
 	var seq uint64
-	appendSeq(b, &seq, &segment.Event{
+	appendSeq(t, b, &seq, &segment.Event{
 		WitnessedAt:         1779719010267528,
 		UpstreamRelayCursor: 111,
 		Kind:                segment.KindCreate,
@@ -534,12 +526,13 @@ func readOneZstdFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) [
 	return got
 }
 
-// appendSeq assigns the next dense seq and appends, mirroring how ingest
-// drives the Tail in production (Append after durable seq assignment).
-func appendSeq(tl *Tail, seqCtr *uint64, ev *segment.Event) {
-	ev.Seq = *seqCtr
-	*seqCtr++
-	tl.Append(ev)
+// appendSeq appends through the writer that backs tl, mirroring production
+// visibility through the writer readable log.
+func appendSeq(t *testing.T, tl *Tail, seqCtr *uint64, ev *segment.Event) {
+	t.Helper()
+	w := writerForTail(t, tl)
+	appendToWriter(t, w, ev)
+	*seqCtr = ev.Seq + 1
 }
 
 // publishIdentity publishes a minimal identity event the encoder can render.
@@ -550,7 +543,7 @@ func publishIdentity(t *testing.T, tl *Tail, seqCtr *uint64, did string, witness
 	}
 	payload, err := id.MarshalCBOR()
 	require.NoError(t, err)
-	appendSeq(tl, seqCtr, &segment.Event{
+	appendSeq(t, tl, seqCtr, &segment.Event{
 		WitnessedAt: witnessedAt, Kind: segment.KindIdentity,
 		DID: did, Payload: payload,
 	})
@@ -560,7 +553,7 @@ func publishIdentity(t *testing.T, tl *Tail, seqCtr *uint64, did string, witness
 // DAG-CBOR-encoded empty map (0xa0), which the encoder will turn into "{}".
 func publishCommit(t *testing.T, tl *Tail, seqCtr *uint64, did, collection string, witnessedAt int64) {
 	t.Helper()
-	appendSeq(tl, seqCtr, &segment.Event{
+	appendSeq(t, tl, seqCtr, &segment.Event{
 		WitnessedAt: witnessedAt,
 		Kind:        segment.KindCreate,
 		DID:         did,
@@ -585,7 +578,7 @@ func publishOversizeCommit(t *testing.T, tl *Tail, seqCtr *uint64, did, collecti
 	big.WriteByte(0x10) // 0x1000 = 4096
 	big.WriteByte(0x00)
 	big.Write(make([]byte, 0x1000)) // 4096 zero bytes
-	appendSeq(tl, seqCtr, &segment.Event{
+	appendSeq(t, tl, seqCtr, &segment.Event{
 		WitnessedAt: witnessedAt,
 		Kind:        segment.KindCreate,
 		DID:         did,
@@ -600,8 +593,7 @@ func TestHandler_Filter_RejectsInvalidQuery(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -629,8 +621,7 @@ func TestHandler_Filter_RejectsTooManyQueryParams(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -664,8 +655,7 @@ func TestHandler_ZstdQueryParam_DeliversDictCompressedFrames(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -706,8 +696,7 @@ func TestHandler_ZstdSocketEncodingHeader_DeliversDictCompressedFrames(t *testin
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -747,8 +736,7 @@ func TestHandler_RejectsZstdAndDeflateTogether(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -779,8 +767,7 @@ func TestHandler_AllowsCompressFalse(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -812,8 +799,7 @@ func TestHandler_NegotiatesCompression_WhenClientOffers(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -857,8 +843,7 @@ func TestHandler_NoCompression_WhenClientDoesNotOffer(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -898,8 +883,7 @@ func TestHandler_Filter_WantedCollections_DeliversMatching(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -946,8 +930,7 @@ func TestHandler_Filter_WantedCollections_TopLevelPrefix(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -990,8 +973,7 @@ func TestHandler_Filter_WantedCollections_PrefixMatch(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1029,8 +1011,7 @@ func TestHandler_Filter_WantedDIDs_DeliversMatching(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1066,8 +1047,7 @@ func TestHandler_Filter_IdentityBypassesCollectionFilter(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1102,8 +1082,7 @@ func TestHandler_Filter_IdentityRespectsDIDFilter(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1139,8 +1118,7 @@ func TestHandler_Filter_MaxMessageSize_DropsOversize(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1181,8 +1159,7 @@ func TestHandler_Filter_MaxMessageSize_EmptyMeansNoCap(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1208,8 +1185,7 @@ func TestHandler_Filter_MaxMessageSize_NegativeMeansNoCap(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1234,8 +1210,7 @@ func TestHandler_OptionsUpdate_ChangesFilter(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	metrics := NewMetrics(prometheus.NewRegistry())
 	h := NewHandler(Subscription{
 		Tail:    b,
@@ -1284,8 +1259,7 @@ func TestHandler_OptionsUpdate_InvalidPayloadDisconnects(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1321,8 +1295,7 @@ func TestHandler_OptionsUpdate_BadNSIDDisconnects(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1362,8 +1335,7 @@ func TestHandler_OptionsUpdate_OversizePayload(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	h := NewHandler(Subscription{
 		Tail:   b,
 		Store:  st,
@@ -1407,8 +1379,7 @@ func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 	metrics := NewMetrics(prometheus.NewRegistry())
 	h := NewHandler(Subscription{
 		Tail:    b,
@@ -1462,8 +1433,7 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -1530,8 +1500,7 @@ func TestHandler_RequireHello_FilterFromHelloApplies(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,
@@ -1613,8 +1582,7 @@ func TestHandler_RequireHello_InvalidUpdateDisconnects(t *testing.T) {
 			t.Parallel()
 
 			st := newSteadyStateStore(t)
-			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-			require.NoError(t, err)
+			b, _ := newReadLogTail(t, 1<<20, noCold)
 
 			h := NewHandler(Subscription{
 				Tail:   b,
@@ -1668,8 +1636,7 @@ func TestHandler_RequireHello_FalseHasNoEffect(t *testing.T) {
 			t.Parallel()
 
 			st := newSteadyStateStore(t)
-			b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-			require.NoError(t, err)
+			b, _ := newReadLogTail(t, 1<<20, noCold)
 
 			h := NewHandler(Subscription{
 				Tail:   b,
@@ -1743,8 +1710,7 @@ func TestHandler_RequireHello_NoLeakOnClientDisconnect(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	// Wrap the real handler so we can observe ServeHTTP returning. That
 	// signal is deterministic: serve() returning means its deferred
@@ -1802,8 +1768,7 @@ func TestHandler_RequireHello_MultipleUpdatesDoNotPanic(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
-	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
-	require.NoError(t, err)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
 
 	h := NewHandler(Subscription{
 		Tail:   b,

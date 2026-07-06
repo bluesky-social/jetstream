@@ -32,7 +32,7 @@ import (
 // paginated archive XRPC (planBackfill/getSegment/getBlock, mounted at /xrpc/)
 // and the live /subscribe-v2 websocket (with the v2 reject-below-floor
 // too-old policy), backed by one sealed-segment archive + manifest + writer +
-// hot-ring Tail. It deliberately avoids the synctest bubble — the oracle package
+// writer-readable-log Tail. It deliberately avoids the synctest bubble — the oracle package
 // allows exactly one bubble per process (owned by TestOracle_DefaultLifecycle),
 // so every other server-driving test runs on real sockets (see serveArchive in
 // foldconvergence_gate_test.go).
@@ -45,8 +45,6 @@ import (
 //     the §14 too-old 400 / stale-cursor / fell-off-live cases;
 //   - sealing new segments + appending live events mid-flight (SealMore /
 //     AppendLive) → mid-download seal and exhaust-sealed cold-replay backstop.
-
-const partBHotRingBytes = 1 << 20 // 1 MiB hot ring: ample for the small Part-B streams.
 
 // pagedCutoverServer is a running hermetic archive+live server. Construct it
 // with newPagedCutoverServer; URL is the base the public jetstream client dials
@@ -61,15 +59,7 @@ type pagedCutoverServer struct {
 	writer   *ingest.Writer
 	tail     *subscribe.Tail
 
-	mu      sync.Mutex
-	nextIdx uint64 // next sealed-segment file index to write (under mu)
-	// nextSeq is the next unallocated seq (the live tip the running server is
-	// actually at); live appends draw from here. Atomic, NOT under mu: the Tail's
-	// tip callback reads it while holding the Tail's lock, and SealMore/AppendLive
-	// write it while holding mu and then calling tail.Append (which takes the
-	// Tail's lock) — guarding nextSeq with mu would invert that lock order and
-	// deadlock. An atomic sidesteps the ordering entirely.
-	nextSeq   atomic.Uint64
+	mu        sync.Mutex
 	planCalls atomic.Int64
 
 	// onPlanServed, when set, is invoked AFTER each planBackfill response is
@@ -126,13 +116,11 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 				maxSeq = ev.Seq
 			}
 		}
-		s.nextIdx = uint64(i) + 1
 	}
 	nextSeq := maxSeq + 1
 	if nextSeq == 0 {
 		nextSeq = 1 // empty archive: first live event is seq 1 (§R8 1-based seqs)
 	}
-	s.nextSeq.Store(nextSeq)
 
 	logger := slog.New(slog.NewTextHandler(testWriter{t: t}, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
@@ -151,22 +139,12 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 		Store:       st,
 		Logger:      logger,
 		Metrics:     ingest.NewMetrics(prometheus.NewRegistry()),
+		OnAfterSeal: m.OnSegmentSealed,
 	})
 	require.NoError(t, err)
 	s.writer = w
 
 	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
-
-	// Mid-flight seals must land STRICTLY ABOVE the writer's active segment
-	// index: WalkActive (cold replay) opens SegmentsDir/seg_<activeIdx> and
-	// decodes it as an ACTIVE file. A sealed file written at that index would
-	// fail to decode (sealed vs active framing). The writer never appends here
-	// (the harness drives ingest only via SealMore/AppendLive), so its active
-	// slot stays an absent file (WalkActive treats os.ErrNotExist as "no active
-	// segment") and we seal at activeIdx+1 onward.
-	if next := w.ActiveIndex() + 1; next > s.nextIdx {
-		s.nextIdx = next
-	}
 
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
@@ -176,16 +154,11 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 		BlockCacheBytes: 1 << 20,
 	})
 	tail, err := subscribe.New(subscribe.Config{
-		Logger:       logger,
-		Metrics:      subscribe.NewMetrics(prometheus.NewRegistry()),
-		HotTailBytes: partBHotRingBytes,
-		// The live tip is the harness's nextSeq, NOT w.NextSeq(): the writer never
-		// appends here (ingest is driven only via SealMore/AppendLive), so its
-		// NextSeq would stay frozen at the startup seed while the server's real tip
-		// advances — a stale tip would mis-resolve cutover cursors (the v2 future-seq
-		// drop-to-live in ResolveCursor) and the empty-ring tip fallback.
-	}, cold.Read, func() uint64 { return s.nextSeq.Load() })
+		Logger:  logger,
+		Metrics: subscribe.NewMetrics(prometheus.NewRegistry()),
+	}, cold.Read, w.NextSeq)
 	require.NoError(t, err)
+	tail.SetReadLogSource(func() *ingest.ReadableLog { return w.ReadLog() })
 	s.tail = tail
 
 	t.Cleanup(func() {
@@ -235,43 +208,36 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 	return s
 }
 
-// SealMore writes a new sealed segment for evs (one block per event), publishes
-// it to the manifest, and advances the writer tip past it — modelling a segment
-// sealed during a paged download or after the loop has reached the tip. The
-// seqs in evs must be strictly above the current writer tip (caller's
-// responsibility; the harness asserts it).
+// SealMore appends evs through the real writer and force-rotates the active
+// segment, modelling a segment sealed during a paged download or after the loop
+// has reached the tip. The seqs in evs must match the writer's next seq.
 func (s *pagedCutoverServer) SealMore(evs ...segment.Event) {
 	s.t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	idx := s.nextIdx
-	writeSealedSegment(s.t, s.segDir, idx, evs...)
-	require.NoError(s.t, s.manifest.OnSegmentSealed(idx, filepath.Join(s.segDir, ingest.SegmentFilename(idx))))
-	s.nextIdx++
 	for _, ev := range evs {
-		require.Greaterf(s.t, ev.Seq, s.tipLocked()-1, "SealMore seq %d must be above the writer tip", ev.Seq)
-		if ev.Seq >= s.nextSeq.Load() {
-			s.nextSeq.Store(ev.Seq + 1)
-		}
+		wantSeq := ev.Seq
+		require.Equalf(s.t, s.writer.NextSeq(), wantSeq, "SealMore seq %d must match the writer tip", wantSeq)
+		require.NoError(s.t, s.writer.Append(context.Background(), &ev))
+		require.Equal(s.t, wantSeq, ev.Seq)
 	}
+	require.NoError(s.t, s.writer.ForceRotate(context.Background()))
 }
 
-// AppendLive publishes events to the live hot ring (the /subscribe-v2 tail),
-// advancing the writer tip — modelling steady-state ingest above the sealed tip.
+// AppendLive appends events through the real writer, modelling steady-state
+// ingest above the sealed tip.
 func (s *pagedCutoverServer) AppendLive(evs ...segment.Event) {
 	s.t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range evs {
 		ev := evs[i]
-		s.tail.Append(&ev)
-		if ev.Seq >= s.nextSeq.Load() {
-			s.nextSeq.Store(ev.Seq + 1)
-		}
+		wantSeq := ev.Seq
+		require.Equalf(s.t, s.writer.NextSeq(), wantSeq, "AppendLive seq %d must match the writer tip", wantSeq)
+		require.NoError(s.t, s.writer.Append(context.Background(), &ev))
+		require.Equal(s.t, wantSeq, ev.Seq)
 	}
 }
-
-func (s *pagedCutoverServer) tipLocked() uint64 { return s.nextSeq.Load() }
 
 // dialSubscribeV2 performs a raw /subscribe-v2 websocket handshake at the given
 // cursor and reports the HTTP status the server returned pre-upgrade, plus the

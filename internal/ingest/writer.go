@@ -703,24 +703,6 @@ func (w *Writer) ReadLog() *ReadableLog {
 	return w.readLog
 }
 
-// SnapshotPending returns a copy of every event currently buffered in
-// the active segment's pending block (not yet flushed to disk). The
-// snapshot is taken under w.mu so it is consistent with concurrent
-// Append calls; the returned events have their variable-length fields
-// copied out of the writer's column buffers and are safe to retain.
-//
-// Used by the lookback replay engine in internal/subscribe to bridge
-// disk events to live events at a cursor handoff without forcing a
-// flush.
-func (w *Writer) SnapshotPending() []segment.Event {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.closed || w.active == nil {
-		return nil
-	}
-	return w.active.SnapshotPending()
-}
-
 // ActiveIndex returns the numeric index of the current active segment.
 func (w *Writer) ActiveIndex() uint64 {
 	w.mu.Lock()

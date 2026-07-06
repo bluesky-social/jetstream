@@ -387,12 +387,19 @@ func TestPartB_CaughtUpHandoffBelowFloorReBackfills(t *testing.T) {
 	})
 
 	// A fresh, IN-WINDOW segment (seqs 100..101) seals right AFTER page 1 — i.e.
-	// during the slow handoff, after S was pinned at the old tip. It advances the
-	// lookback floor to 100, so when the client connects /subscribe at cursor=2
-	// (>= S=2, caught up to the pinned tip) that cursor is now BELOW the floor and
-	// the §14 400 fires. The re-backfill's fresh sweep (afterSeq=2) re-learns
-	// tip=101, downloads the fresh segment, and connects at 101 (in-window) — the
-	// transparent recovery, never fatal.
+	// during the slow handoff, after S was pinned at the old tip. The real writer
+	// is dense, so seqs 3..99 are first sealed as old rows for a different DID.
+	// The client filters to pbDID, so those filler rows satisfy the writer
+	// invariant without changing this scenario's observed stream. The fresh
+	// segment advances the lookback floor to 100, so when the client connects
+	// /subscribe at cursor=2 (>= S=2, caught up to the pinned tip) that cursor is
+	// now BELOW the floor and the §14 400 fires. The re-backfill's fresh sweep
+	// (afterSeq=2) re-learns tip=101, downloads the fresh segment, and connects at
+	// 101 (in-window) — the transparent recovery, never fatal.
+	var filler []segment.Event
+	for seq := uint64(3); seq < 100; seq++ {
+		filler = append(filler, makeOracleCreateAged(seq, "did:plc:partb-filler", pbColl, "r"+itoaOracle(seq), 48*time.Hour))
+	}
 	fresh := []segment.Event{
 		makeOracleCreate(100, pbDID, pbColl, "r100"),
 		makeOracleCreate(101, pbDID, pbColl, "r101"),
@@ -400,7 +407,10 @@ func TestPartB_CaughtUpHandoffBelowFloorReBackfills(t *testing.T) {
 	var sealOnce sync.Once
 	srv.onPlanServed = func(n int64) {
 		if n == 1 {
-			sealOnce.Do(func() { srv.SealMore(fresh...) })
+			sealOnce.Do(func() {
+				srv.SealMore(filler...)
+				srv.SealMore(fresh...)
+			})
 		}
 	}
 
@@ -410,7 +420,7 @@ func TestPartB_CaughtUpHandoffBelowFloorReBackfills(t *testing.T) {
 	want := foldOracle(t, all)
 
 	res := drainClientToConvergence(t, srv,
-		[]jetstream.Option{jetstream.WithAfterSeq(0), jetstream.WithBatchSize(4)},
+		[]jetstream.Option{jetstream.WithDIDs([]string{pbDID}), jetstream.WithAfterSeq(0), jetstream.WithBatchSize(4)},
 		want, nil)
 
 	require.Equal(t, []uint64{1, 2, 100, 101}, emittedSeqs(res.emitted),

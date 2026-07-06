@@ -15,19 +15,19 @@
 //
 // ReadFrom resolves a cursor against two tiers:
 //
-//   - The hot ring (hotring.go): a byte-bounded, seq-indexed FIFO of the
-//     most recent decoded events, shared encode-once across all caught-up
-//     subscribers via Entry (entry.go). Caught-up live readers park here
-//     and wake on the next Append.
+//   - The writer readable log: a byte-bounded, seq-indexed FIFO owned by the
+//     ingest writer. It exposes recently appended events to subscribers
+//     immediately and shares encode-once memoization via Entry (entry.go).
+//     Caught-up live readers park here and wake on the next writer append.
 //
-//   - The cold reader (replay.go): when a cursor falls below the ring's
-//     resident base (evicted to disk) or replays pre-ring history, the
+//   - The cold reader (replay.go): when a cursor falls below the readable
+//     log's resident base (evicted to disk) or replays older history, the
 //     read falls through to a bounded disk walk over sealed segments +
-//     the active segment, routed through a shared byte-bounded decoded-
+//     the active segment's flushed region, routed through a shared byte-bounded decoded-
 //     block LRU cache (blockcache.go) so concurrent cold readers don't
 //     each re-decode the same block.
 //
-// Tail (tail.go) owns the ring, the cold reader, and the graceful-close
+// Tail (tail.go) owns the readable-log adapter, the cold reader, and the graceful-close
 // connection registry. The hot/cold boundary is transparent to ReadFrom
 // callers. An adversarially-slow client — far behind the tip AND scanning
 // the log below a floor rate for a sustained window — is dropped by the

@@ -253,18 +253,16 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:           mft,
-		WriterRef:          &writerPtr,
-		BlockCacheBytes:    opts.SubscribeBlockCacheBytes,
-		StopAtReadLogFloor: true,
+		Manifest:        mft,
+		WriterRef:       &writerPtr,
+		BlockCacheBytes: opts.SubscribeBlockCacheBytes,
 	})
 	tail, err := subscribe.New(subscribe.Config{
-		Logger:       processLogger,
-		Metrics:      subscribeMetrics,
-		HotTailBytes: opts.effectiveSubscribeHotTailBytes(),
-		ReadBatch:    opts.SubscribeReadBatch,
-		SlowWindow:   opts.SubscribeSlowWindow,
-		SlowMinRate:  opts.SubscribeSlowMinRate,
+		Logger:      processLogger,
+		Metrics:     subscribeMetrics,
+		ReadBatch:   opts.SubscribeReadBatch,
+		SlowWindow:  opts.SubscribeSlowWindow,
+		SlowMinRate: opts.SubscribeSlowMinRate,
 	}, coldRd.Read, func() uint64 {
 		if w := writerPtr.Load(); w != nil {
 			return w.NextSeq()
@@ -345,7 +343,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		BackfillWorkers:                opts.effectiveBackfillWorkers(),
 		BackfillBatchSize:              opts.effectiveBackfillBatchSize(),
 		BackfillAsyncFlushWorkers:      opts.BackfillAsyncFlushWorkers,
-		ReadLogRetentionBytes:          int64(opts.effectiveSubscribeHotTailBytes()),
+		ReadLogRetentionBytes:          int64(opts.effectiveSubscribeReadLogRetentionBytes()),
 		BootstrapLiveMaxSegmentBytes:   opts.BootstrapLiveMaxSegmentBytes,
 		BootstrapLiveMaxEventsPerBlock: opts.BootstrapLiveMaxEventsPerBlock,
 		BackfillRepos:                  opts.BackfillRepos,
