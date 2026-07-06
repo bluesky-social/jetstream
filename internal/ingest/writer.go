@@ -41,6 +41,12 @@ type Writer struct {
 	durableNextSeq uint64
 	closed         bool
 
+	// orderedSink, when set, receives every successfully appended event in
+	// global seq order. Guarded by drainMu (written by SetOrderedEventSink,
+	// read by Append/AppendBatch while they hold drainMu). See
+	// SetOrderedEventSink for the full contract.
+	orderedSink func(ev *segment.Event)
+
 	async            *asyncFlushPipeline
 	asyncJobs        sync.WaitGroup
 	nextAsyncFlushID uint64
@@ -318,6 +324,54 @@ func (w *Writer) SealActiveAndClose() error {
 	return nil
 }
 
+// SetOrderedEventSink installs sink to receive every successfully appended
+// event — from ALL producers sharing this writer — in global seq order with
+// no gaps between successful appends. Wire it before any producer starts;
+// installing it mid-stream would present the sink with a truncated prefix.
+//
+// This is the tail-feed seam for /subscribe (#244): unlike the per-consumer
+// OnEvent hook (which only the live consumer fires), the sink fires inside
+// Append/AppendBatch under the writer's admission barrier (drainMu), after
+// the internal mutex is released — so producers that bypass consumer hooks
+// (the failed-repo retry runner writing through the shared steady writer)
+// still reach the sink, and two concurrent producers can never deliver out
+// of seq order.
+//
+// Contract:
+//   - The sink runs on the append hot path for every event; it must be
+//     fast and non-blocking.
+//   - It must not call back into the Writer: it runs under drainMu, so
+//     Flush/DrainDurability/Append re-entry would self-deadlock. (Reading
+//     NextSeq from OTHER goroutines while the sink runs is fine — the
+//     lock order drainMu → sink-internal locks → w.mu stays acyclic.)
+//   - The *segment.Event is only valid for the duration of the call; the
+//     sink must copy what it retains (same aliasing rule as OnEvent).
+//   - Delivery is pre-durability (the event sits in the pending block),
+//     matching the live consumer's existing OnEvent semantics.
+//   - On an append error the failed event is NOT delivered even if it
+//     internally consumed a seq; the downstream hot ring heals the gap by
+//     resetting (see subscribe.hotRing) — acceptable because writer
+//     errors on this path abort ingestion anyway.
+//
+// Mutually exclusive with AsyncFlushWorkers: panics on an async-flush writer.
+// The async paths deliver to the sink after PrepareFlush detaches a filled
+// block but before the background commit lands it in the file, so a delivered
+// event can transiently be readable NOWHERE on the cold path (not in
+// SnapshotPending, not in the active file). A hot-ring eviction inside that
+// window would leave subscribers' cold fallback staring at a hole. No
+// production wiring needs sink+async (the sink feeds /subscribe from the sync
+// steady writer; async is bootstrap-backfill-only), so this is invalid
+// internal wiring — fail loud at startup rather than document a landmine.
+// The #248 readable-log refactor deletes this dichotomy.
+func (w *Writer) SetOrderedEventSink(sink func(ev *segment.Event)) {
+	if w.async != nil {
+		panic("ingest: SetOrderedEventSink is not supported with AsyncFlushWorkers (see issue #249)")
+	}
+	w.drainMu.Lock()
+	defer w.drainMu.Unlock()
+	w.orderedSink = sink
+}
+
 // Append writes one event into the active segment. On success,
 // mutates ev.Seq in place to the allocated value; on error ev.Seq
 // is left untouched so callers can safely retry without observing
@@ -329,6 +383,9 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 		job, err := w.appendLocked(ctx, ev)
 		w.mu.Unlock()
 		if err == nil {
+			// No orderedSink delivery here: the sink cannot be installed on
+			// an async writer (SetOrderedEventSink panics), because a
+			// just-prepared block is not yet cold-readable. See #249.
 			w.submitAsyncFlushes([]*asyncFlushJob{job})
 		}
 		w.drainMu.Unlock()
@@ -343,11 +400,19 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 
 	w.drainMu.Lock()
 	defer w.drainMu.Unlock()
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	_, err := w.appendLocked(ctx, ev)
-	return err
+	err := func() error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		_, err := w.appendLocked(ctx, ev)
+		return err
+	}()
+	if err != nil {
+		return err
+	}
+	if w.orderedSink != nil {
+		w.orderedSink(ev)
+	}
+	return nil
 }
 
 // AppendBatch writes a bounded caller-provided event batch while holding the
@@ -365,6 +430,7 @@ func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error 
 	var jobs []*asyncFlushJob
 	var appendErr error
 
+	appended := 0
 	for i := range events {
 		job, err := w.appendLocked(ctx, &events[i])
 		if job != nil {
@@ -374,9 +440,19 @@ func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error 
 			appendErr = err
 			break
 		}
+		appended++
 	}
 	w.mu.Unlock()
 	w.submitAsyncFlushes(jobs)
+	if w.orderedSink != nil {
+		// Deliver the successfully appended prefix even on a partial batch
+		// failure: those events consumed seqs and sit in the segment, so
+		// withholding them would punch a permanent hole in the sink's view
+		// while the seq space moved on.
+		for i := range appended {
+			w.orderedSink(&events[i])
+		}
+	}
 	w.drainMu.Unlock()
 
 	flushErr := w.waitSubmittedAsyncFlushes(jobs)

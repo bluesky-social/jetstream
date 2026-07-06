@@ -35,6 +35,12 @@ type Metrics struct {
 	ColdReads        prometheus.Counter
 	AdversarialDrops prometheus.Counter
 	HotRingBytes     prometheus.Gauge
+
+	// HotRingResets counts non-dense tail appends (#244): a durable-writer
+	// producer bypassed the ordered tail feed and the ring dropped its
+	// residency to avoid serving wrong-seq events. Zero in a healthy
+	// process; any increment is a wiring bug to chase.
+	HotRingResets prometheus.Counter
 }
 
 // NewMetrics registers the subscribe series against reg. Calls
@@ -128,6 +134,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "adversarial_drops_total",
 			Help: "Number of /subscribe connections dropped by the adversarially-slow detector.",
 		}),
+		HotRingResets: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "hot_ring_resets_total",
+			Help: "Non-dense hot-tail appends that forced a ring reset (#244); zero in a healthy process.",
+		}),
 		HotRingBytes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "hot_ring_bytes",
@@ -141,7 +152,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.OptionsUpdates, m.OptionsUpdateErrors,
 		m.CursorRequests, m.CursorResolveSeconds,
 		m.EventsAppended, m.HotReads, m.ColdReads,
-		m.AdversarialDrops, m.HotRingBytes,
+		m.AdversarialDrops, m.HotRingBytes, m.HotRingResets,
 	)
 	return m
 }
@@ -254,4 +265,10 @@ func (m *Metrics) setHotRingBytes(n int) {
 		return
 	}
 	m.HotRingBytes.Set(float64(n))
+}
+func (m *Metrics) incHotRingResets() {
+	if m == nil {
+		return
+	}
+	m.HotRingResets.Inc()
 }

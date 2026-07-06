@@ -46,6 +46,13 @@ type Tail struct {
 	nextSeq func() uint64
 	logger  *slog.Logger
 
+	// regressFloor is the durable live-edge floor of the most recent non-dense
+	// append (a #244-class bypass/gap/regression). A reset means the ring will
+	// never replay part of the durable history hot; ring misses below this
+	// floor must go cold instead of parking on notify forever. Zero when no
+	// reset has established a floor. Guarded by mu.
+	regressFloor uint64
+
 	metrics   *Metrics
 	readBatch int
 	slowCfg   slowConfig
@@ -110,17 +117,51 @@ func newTail(cfg tailConfig) *Tail {
 // tip. Non-blocking (honors ingest's no-block OnEvent contract). The event
 // struct is copied; Payload is shared read-only (the caller must not retain
 // or mutate ev's payload after Append returns).
+//
+// Events MUST arrive in dense seq order (the ingest writer's ordered
+// append hook guarantees this in production). A non-dense append resets
+// the ring — readers inside the dropped window fall through to the cold
+// path — and is surfaced loudly here: it means a producer is appending
+// durable events without feeding the tail, the #244 bug class.
 func (t *Tail) Append(ev *segment.Event) {
 	cp := *ev
 	e := newEntry(&cp)
 	t.mu.Lock()
-	t.ring.append(e)
+	oldTip := t.ring.tip()
+	hadData := t.ring.has()
+	reset := t.ring.append(e)
+	if reset && hadData {
+		// A non-dense reset means at least one durable-writer producer bypassed
+		// the tail, so the writer's NextSeq may be far above either side of the
+		// reset. The reset ring will not replay the dropped durable window hot;
+		// raise the cold floor to the durable live edge when available so
+		// ReadFrom sends those cursors to disk instead of parking forever.
+		floor := t.ring.tip()
+		if oldTip > floor {
+			floor = oldTip
+		}
+		if t.nextSeq != nil {
+			if next := t.nextSeq(); next > floor {
+				floor = next
+			}
+		}
+		if floor > t.regressFloor {
+			t.regressFloor = floor
+		}
+	}
 	t.metrics.incEventsAppended()
+	if reset {
+		t.metrics.incHotRingResets()
+	}
 	t.metrics.setHotRingBytes(t.ring.bytes())
 	old := t.notify
 	t.notify = make(chan struct{})
 	t.mu.Unlock()
 	close(old) // wake all waiters; they re-read under the lock
+	if reset && t.logger != nil {
+		t.logger.Warn("hot ring reset on non-dense append; a durable-writer producer is bypassing the tail feed",
+			"seq", cp.Seq)
+	}
 }
 
 // liveTipLocked returns the seq at which a subscriber is caught up to the live
@@ -135,8 +176,17 @@ func (t *Tail) Append(ev *segment.Event) {
 // is empty (cold start / bootstrap, before any Append has been seen) do we
 // fall back to the durable writer's NextSeq, which may legitimately be far
 // ahead of an empty ring. Caller must hold t.mu.
+//
+// After a regression reset the ring tip sits below regressFloor, and
+// [ring.tip, regressFloor) is the cold-classified history window (see
+// coldThresholdLocked): a fresh live subscriber seeded at ring.tip would
+// replay that history, violating Tip's start-at-the-live-edge contract. The
+// floor is the live edge until the ring catches back up past it.
 func (t *Tail) liveTipLocked() uint64 {
 	if t.ring.has() {
+		if t.regressFloor > t.ring.tip() {
+			return t.regressFloor
+		}
 		return t.ring.tip()
 	}
 	if t.nextSeq != nil {
@@ -150,8 +200,19 @@ func (t *Tail) liveTipLocked() uint64 {
 // reader instead of blocking. With a populated ring, anything below its base
 // was evicted to disk. With an empty ring, anything below the durable tip is
 // replayable history not yet (or never) captured live. Caller must hold t.mu.
+//
+// After a REGRESSING append resets the ring backwards (#244 class), cursors
+// in [ring.tip, regressFloor) point at durable events the ring will never
+// replay — they must go cold, not park on notify forever (an idle stream
+// would strand them). regressFloor keeps that window cold without touching
+// the dense-operation invariant that a cursor at the in-flight tip (between
+// writer.Append and tail.Append) BLOCKS for the imminent hot append rather
+// than diving to disk (see TestTail_ReadFrom_InFlightTipBlocksNotCold).
 func (t *Tail) coldThresholdLocked() uint64 {
 	if t.ring.has() {
+		if t.regressFloor > t.ring.tip() {
+			return t.regressFloor
+		}
 		return t.ring.base()
 	}
 	return t.liveTipLocked()
@@ -186,12 +247,17 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 		notify := t.notify
 		t.mu.Unlock()
 
-		if ok {
+		if ok && len(out) > 0 {
 			// Hot hit: serve from the resident ring.
 			next := out[len(out)-1].Event.Seq + 1
 			t.metrics.incHotReads()
 			return out, next, nil
 		}
+		// ok with an empty batch cannot happen (lookup returns a non-empty
+		// suffix or !ok) — but if index math ever drifted again (#244), an
+		// unguarded out[len(out)-1] would panic. The mutex is already
+		// released here, but subscribers would still crash-loop; fall
+		// through to the cold/block classification instead.
 
 		// Ring can't serve it. A cursor below the cold threshold is on disk
 		// (evicted, or pre-ring history); anything at/above it is the live

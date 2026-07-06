@@ -3,6 +3,7 @@ package world
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
@@ -80,6 +81,40 @@ func (w *World) FindAccountByDID(did atmos.DID) (Account, bool, error) {
 		return Account{}, false, fmt.Errorf("world: did lookup iter: %w", err)
 	}
 	return Account{}, false, nil
+}
+
+// AccountIndicesForTest returns every account index persisted in the world,
+// including hidden test accounts that AccountCount/ListReposPage intentionally
+// omit.
+func (w *World) AccountIndicesForTest() ([]int, error) {
+	iter, err := w.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte("sim/account/"),
+		UpperBound: []byte("sim/account/\xff"),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("world: account index iter: %w", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	var out []int
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		const suffix = "/did"
+		if len(key) < len(suffix) || string(key[len(key)-len(suffix):]) != suffix {
+			continue
+		}
+		rest := key[len("sim/account/") : len(key)-len(suffix)]
+		idx, err := strconv.Atoi(string(rest))
+		if err != nil {
+			return nil, fmt.Errorf("world: bad account key %q: %w", key, err)
+		}
+		out = append(out, idx)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("world: account index iter: %w", err)
+	}
+	sort.Ints(out)
+	return out, nil
 }
 
 // HandleSuffix is the cosmetic handle disambiguator: just the index.

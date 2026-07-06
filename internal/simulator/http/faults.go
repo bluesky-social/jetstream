@@ -1,6 +1,9 @@
 package http
 
-import "sync"
+import (
+	"net/http"
+	"sync"
+)
 
 // FaultPlan is a deterministic, test-owned simulator fault schedule.
 // Methods are goroutine-safe because backfill workers may issue getRepo
@@ -12,6 +15,8 @@ import "sync"
 // configured.
 type FaultPlan struct {
 	getRepo        *getRepoFaults
+	listRepos      *listReposFaults
+	plc            *plcFaults
 	subscribeRepos *subscribeReposFaults
 }
 
@@ -69,6 +74,7 @@ type SubscribeReposInjectFault struct {
 type getRepoFaults struct {
 	mu            sync.Mutex
 	httpByDID     map[string]httpFaultState
+	responseByDID map[string]getRepoResponseFaultState
 	truncateByDID map[string]countFaultState
 }
 
@@ -78,7 +84,69 @@ type httpFaultState struct {
 	fired     int
 }
 
+// GetRepoResponseFault is a realistic, complete getRepo HTTP/XRPC response
+// shape. Use this instead of a raw status when the response body or headers are
+// part of the contract under test.
+type GetRepoResponseFault struct {
+	Status           int
+	Error            string
+	Message          string
+	Headers          map[string]string
+	RedirectLocation string
+}
+
+type getRepoResponseFaultState struct {
+	fault     GetRepoResponseFault
+	remaining int
+	fired     int
+}
+
 type countFaultState struct {
+	remaining int
+	fired     int
+}
+
+// ListReposFaultMode names the realistic listRepos pagination fault families
+// the relay simulator can inject. These model relay restore/pagination
+// inconsistency shapes, not arbitrary malformed JSON.
+type ListReposFaultMode string
+
+const (
+	ListReposFaultDuplicatePreviousPage ListReposFaultMode = "duplicate_previous_page"
+	ListReposFaultCursorLoop            ListReposFaultMode = "cursor_loop"
+	ListReposFaultShrinkPage            ListReposFaultMode = "shrink_page"
+)
+
+type listReposFaults struct {
+	mu       sync.Mutex
+	byCursor map[string]listReposFaultState
+}
+
+type listReposFaultState struct {
+	mode      ListReposFaultMode
+	remaining int
+	fired     int
+}
+
+// PLCFaultMode names DID-document faults. These are deliberately DID-scoped so
+// tests can hit one realistic bad identity provider without turning the whole
+// simulated PLC into white noise.
+type PLCFaultMode string
+
+const (
+	PLCFaultMissingPDSEndpoint   PLCFaultMode = "missing_pds_endpoint"
+	PLCFaultMalformedHandle      PLCFaultMode = "malformed_handle"
+	PLCFaultMalformedPDSEndpoint PLCFaultMode = "malformed_pds_endpoint"
+	PLCFaultResolutionFailure    PLCFaultMode = "resolution_failure"
+)
+
+type plcFaults struct {
+	mu    sync.Mutex
+	byDID map[string]plcFaultState
+}
+
+type plcFaultState struct {
+	mode      PLCFaultMode
 	remaining int
 	fired     int
 }
@@ -114,8 +182,11 @@ func NewFaultPlan() *FaultPlan {
 	return &FaultPlan{
 		getRepo: &getRepoFaults{
 			httpByDID:     make(map[string]httpFaultState),
+			responseByDID: make(map[string]getRepoResponseFaultState),
 			truncateByDID: make(map[string]countFaultState),
 		},
+		listRepos:      &listReposFaults{byCursor: make(map[string]listReposFaultState)},
+		plc:            &plcFaults{byDID: make(map[string]plcFaultState)},
 		subscribeRepos: &subscribeReposFaults{},
 	}
 }
@@ -134,6 +205,23 @@ func (p *FaultPlan) AddGetRepoHTTPFailures(did string, status, count int) {
 	p.getRepo.httpByDID[did] = st
 }
 
+// AddGetRepoResponseFault schedules count complete getRepo HTTP/XRPC
+// responses for did before getRepo returns to normal simulator behavior.
+func (p *FaultPlan) AddGetRepoResponseFault(did string, fault GetRepoResponseFault, count int) {
+	if p == nil || p.getRepo == nil || did == "" || count <= 0 {
+		return
+	}
+	if fault.Status == 0 {
+		fault.Status = http.StatusInternalServerError
+	}
+	p.getRepo.mu.Lock()
+	defer p.getRepo.mu.Unlock()
+	st := p.getRepo.responseByDID[did]
+	st.fault = fault
+	st.remaining += count
+	p.getRepo.responseByDID[did] = st
+}
+
 // GetRepoHTTPFailuresFired reports how many scheduled getRepo HTTP
 // failures have fired for did.
 func (p *FaultPlan) GetRepoHTTPFailuresFired(did string) int {
@@ -143,6 +231,17 @@ func (p *FaultPlan) GetRepoHTTPFailuresFired(did string) int {
 	p.getRepo.mu.Lock()
 	defer p.getRepo.mu.Unlock()
 	return p.getRepo.httpByDID[did].fired
+}
+
+// GetRepoResponseFaultsFired reports how many scheduled complete getRepo
+// response faults have fired for did.
+func (p *FaultPlan) GetRepoResponseFaultsFired(did string) int {
+	if p == nil || p.getRepo == nil {
+		return 0
+	}
+	p.getRepo.mu.Lock()
+	defer p.getRepo.mu.Unlock()
+	return p.getRepo.responseByDID[did].fired
 }
 
 // AddGetRepoCARTruncations schedules count successful-status getRepo
@@ -168,6 +267,54 @@ func (p *FaultPlan) GetRepoCARTruncationsFired(did string) int {
 	p.getRepo.mu.Lock()
 	defer p.getRepo.mu.Unlock()
 	return p.getRepo.truncateByDID[did].fired
+}
+
+// AddListReposFault schedules a pagination fault for the request cursor.
+// The empty cursor targets the first page.
+func (p *FaultPlan) AddListReposFault(cursor string, mode ListReposFaultMode, count int) {
+	if p == nil || p.listRepos == nil || count <= 0 {
+		return
+	}
+	p.listRepos.mu.Lock()
+	defer p.listRepos.mu.Unlock()
+	st := p.listRepos.byCursor[cursor]
+	st.mode = mode
+	st.remaining += count
+	p.listRepos.byCursor[cursor] = st
+}
+
+// ListReposFaultsFired reports how many scheduled listRepos faults fired for
+// cursor.
+func (p *FaultPlan) ListReposFaultsFired(cursor string) int {
+	if p == nil || p.listRepos == nil {
+		return 0
+	}
+	p.listRepos.mu.Lock()
+	defer p.listRepos.mu.Unlock()
+	return p.listRepos.byCursor[cursor].fired
+}
+
+// AddPLCFault schedules count DID-document resolution faults for did.
+func (p *FaultPlan) AddPLCFault(did string, mode PLCFaultMode, count int) {
+	if p == nil || p.plc == nil || did == "" || count <= 0 {
+		return
+	}
+	p.plc.mu.Lock()
+	defer p.plc.mu.Unlock()
+	st := p.plc.byDID[did]
+	st.mode = mode
+	st.remaining += count
+	p.plc.byDID[did] = st
+}
+
+// PLCFaultsFired reports how many scheduled PLC faults fired for did.
+func (p *FaultPlan) PLCFaultsFired(did string) int {
+	if p == nil || p.plc == nil {
+		return 0
+	}
+	p.plc.mu.Lock()
+	defer p.plc.mu.Unlock()
+	return p.plc.byDID[did].fired
 }
 
 // SetSubscribeReposDisconnectSchedule installs per-connection frame
@@ -223,6 +370,22 @@ func (p *FaultPlan) maybeGetRepoHTTPFault(did string) (int, bool) {
 	return st.status, true
 }
 
+func (p *FaultPlan) maybeGetRepoResponseFault(did string) (GetRepoResponseFault, bool) {
+	if p == nil || p.getRepo == nil {
+		return GetRepoResponseFault{}, false
+	}
+	p.getRepo.mu.Lock()
+	defer p.getRepo.mu.Unlock()
+	st, ok := p.getRepo.responseByDID[did]
+	if !ok || st.remaining <= 0 {
+		return GetRepoResponseFault{}, false
+	}
+	st.remaining--
+	st.fired++
+	p.getRepo.responseByDID[did] = st
+	return st.fault, true
+}
+
 func (p *FaultPlan) maybeGetRepoCARTruncation(did string) bool {
 	if p == nil || p.getRepo == nil {
 		return false
@@ -237,6 +400,38 @@ func (p *FaultPlan) maybeGetRepoCARTruncation(did string) bool {
 	st.fired++
 	p.getRepo.truncateByDID[did] = st
 	return true
+}
+
+func (p *FaultPlan) maybeListReposFault(cursor string) (ListReposFaultMode, bool) {
+	if p == nil || p.listRepos == nil {
+		return "", false
+	}
+	p.listRepos.mu.Lock()
+	defer p.listRepos.mu.Unlock()
+	st, ok := p.listRepos.byCursor[cursor]
+	if !ok || st.remaining <= 0 {
+		return "", false
+	}
+	st.remaining--
+	st.fired++
+	p.listRepos.byCursor[cursor] = st
+	return st.mode, true
+}
+
+func (p *FaultPlan) maybePLCFault(did string) (PLCFaultMode, bool) {
+	if p == nil || p.plc == nil {
+		return "", false
+	}
+	p.plc.mu.Lock()
+	defer p.plc.mu.Unlock()
+	st, ok := p.plc.byDID[did]
+	if !ok || st.remaining <= 0 {
+		return "", false
+	}
+	st.remaining--
+	st.fired++
+	p.plc.byDID[did] = st
+	return st.mode, true
 }
 
 // SetSubscribeReposReplaySchedule installs per-connection seq-replay

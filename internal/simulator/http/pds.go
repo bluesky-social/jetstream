@@ -32,6 +32,26 @@ func newPDSGetRepoHandler(w *world.World, faults *FaultPlan, onServed func(did s
 			http.Error(rw, "simulated getRepo fault", status)
 			return
 		}
+		if fault, ok := faults.maybeGetRepoResponseFault(string(did)); ok {
+			for k, v := range fault.Headers {
+				rw.Header().Set(k, v)
+			}
+			if fault.RedirectLocation != "" {
+				http.Redirect(rw, r, fault.RedirectLocation, fault.Status)
+				return
+			}
+			if fault.Error != "" || fault.Message != "" {
+				rw.Header().Set("Content-Type", "application/json")
+				rw.WriteHeader(fault.Status)
+				_ = json.NewEncoder(rw).Encode(map[string]string{
+					"error":   fault.Error,
+					"message": fault.Message,
+				})
+				return
+			}
+			http.Error(rw, "simulated getRepo fault", fault.Status)
+			return
+		}
 		acct, ok, err := w.FindAccountByDID(did)
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)

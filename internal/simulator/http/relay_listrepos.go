@@ -23,12 +23,13 @@ type listReposOutputEntry struct {
 // newRelayListReposHandler serves com.atproto.sync.listRepos. Cursor
 // is the stringified next-start index; "" means start at 0. Limit is
 // capped at 1000 (the protocol max).
-func newRelayListReposHandler(w *world.World) http.Handler {
+func newRelayListReposHandler(w *world.World, faults *FaultPlan, pageLimitCap int) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
+		cursor := q.Get("cursor")
 		start := 0
-		if c := q.Get("cursor"); c != "" {
-			n, err := strconv.Atoi(c)
+		if cursor != "" {
+			n, err := strconv.Atoi(cursor)
 			if err != nil || n < 0 {
 				http.Error(rw, "bad cursor", http.StatusBadRequest)
 				return
@@ -44,10 +45,25 @@ func newRelayListReposHandler(w *world.World) http.Handler {
 			}
 			limit = n
 		}
-		entries, next, err := w.ListReposPage(start, limit)
+		if pageLimitCap > 0 && limit > pageLimitCap {
+			limit = pageLimitCap
+		}
+		mode, faulted := faults.maybeListReposFault(cursor)
+		pageStart := start
+		pageLimit := limit
+		if faulted && mode == ListReposFaultDuplicatePreviousPage && start > 0 {
+			pageStart = max(0, start-limit)
+		}
+		if faulted && mode == ListReposFaultShrinkPage {
+			pageLimit = max(1, limit/2)
+		}
+		entries, next, err := w.ListReposPage(pageStart, pageLimit)
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if faulted && mode == ListReposFaultDuplicatePreviousPage {
+			next = start
 		}
 		out := listReposOutput{
 			Repos: make([]listReposOutputEntry, len(entries)),
@@ -61,7 +77,13 @@ func newRelayListReposHandler(w *world.World) http.Handler {
 			}
 		}
 		// Cursor is omitted on the last page.
-		if next < w.AccountCount() {
+		if faulted && mode == ListReposFaultCursorLoop {
+			if cursor != "" {
+				out.Cursor = cursor
+			} else {
+				out.Cursor = strconv.Itoa(start)
+			}
+		} else if next < w.AccountCount() {
 			out.Cursor = strconv.Itoa(next)
 		}
 		rw.Header().Set("Content-Type", "application/json")

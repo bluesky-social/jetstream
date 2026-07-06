@@ -146,6 +146,8 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	recordTraceOrError(t, trace, "fault_plan", map[string]any{
 		"scheduled_get_repo_http_failures":           faultPlan.TotalGetRepoHTTPFailures(),
 		"scheduled_get_repo_http_failure_dids":       len(faultPlan.GetRepoHTTPFailures),
+		"scheduled_get_repo_response_failures":       faultPlan.TotalGetRepoResponseFailures(),
+		"scheduled_get_repo_response_failure_dids":   len(faultPlan.GetRepoResponseFailures),
 		"scheduled_get_repo_car_truncations":         faultPlan.TotalGetRepoCARTruncations(),
 		"scheduled_get_repo_car_truncation_dids":     len(faultPlan.GetRepoCARTruncations),
 		"subscribe_repos_disconnect_threshold_count": len(faultPlan.SubscribeReposDisconnectThresholds),
@@ -180,6 +182,11 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	bootstrapEventLog := newEventLogRecorder()
 	steadyEventLog := newEventLogRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
+	netNewOracle := cfg.Mode == "fast"
+	failedRepoRetryInterval := time.Hour
+	if netNewOracle {
+		failedRepoRetryInterval = time.Millisecond
+	}
 	emittedBootstrapAccountDelete := false
 	emittedBootstrapIdentity := false
 	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, bootstrapAck, oracleWaitTimeout(cfg), func(ctx context.Context) (int64, error) {
@@ -254,11 +261,13 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		LiveReconnectBackoff:   liveReconnectBackoff,
 		// Activate the net-new DID enqueuer (issue #188 wiring) inside the
 		// bubble so the malformed-DID #identity injection exercises the
-		// LiveEnqueuer's validation gate end-to-end (#202). The retry scan
-		// itself is a no-op between scans under the fake clock (nothing
-		// pending), so the only live machinery this adds per event is the
-		// enqueuer's lock-free Observe.
-		FailedRepoRetryInterval:   time.Hour,
+		// LiveEnqueuer's validation gate end-to-end (#202). Fast-mode oracle
+		// lowers the retry cadence so issue #207's hidden-account injection
+		// also proves a valid net-new DID reaches pending state and is
+		// backfilled inside the same synctest bubble; stress keeps the
+		// production-like hour cadence so ordinary failed/adversarial repos are
+		// not retried during the observer window.
+		FailedRepoRetryInterval:   failedRepoRetryInterval,
 		CursorLookback:            36 * time.Hour,
 		SegmentCacheMaxAge:        0,
 		PlanMaxDIDs:               xrpcapi.DefaultPlanMaxDIDs,
@@ -393,6 +402,13 @@ func testOracleDefaultLifecycle(t *testing.T) {
 
 	publicURL := waitForRuntimePublicURL(t, cfg, rt, run)
 	passesBeforeSteady := compaction.Count()
+	var netNewBaseline map[string]float64
+	if netNewOracle {
+		netNewBaseline = scrapeDebugMetrics(t, cfg, debugClient,
+			"jetstream_backfill_net_new_enqueued_total",
+			"jetstream_backfill_failed_repo_retry_succeeded_total",
+		)
+	}
 
 	// Adversarial ingest-gate phase (#204): the world tells verifier-
 	// consistent lies the #197 gate must drop with the right reason
@@ -437,10 +453,30 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	_, err = w.GenerateAdversarialSyncForTest(t.Context(), acctSyncLie, "not-a-tid")
 	require.NoErrorf(t, err, "adversarial sync lie: mode=%s seed=%d", cfg.Mode, cfg.Seed)
 	exemptWholeEventSeqs(steadyAck, w.AdversarialLedger().Entries())
+	var hiddenAcct world.Account
+	if netNewOracle {
+		// Seed ONE backfill-only record: it exists in the hidden repo before
+		// the live commit, so the firehose never carries it and the ONLY path
+		// that can archive it is the LiveEnqueuer -> pending -> retry-getRepo
+		// resync. That makes the final-state Compare (and the client-stream
+		// compare, which caught #244) fail unless the net-new backfill truly
+		// ran and its rows reached both the archive and /subscribe — a
+		// zero-record hidden repo would converge from the live commit alone,
+		// leaving this scenario vacuous.
+		hiddenIdx, acct, err := w.AddHiddenAccountForTest(t.Context(), 1)
+		require.NoErrorf(t, err, "create hidden net-new account: mode=%s seed=%d", cfg.Mode, cfg.Seed)
+		hiddenAcct = acct
+		_, _, err = w.GenerateRecordOpForTest(t.Context(), hiddenIdx, "create", "app.bsky.feed.post", "net-new-oracle-probe")
+		require.NoErrorf(t, err, "emit hidden net-new commit: mode=%s seed=%d did=%s",
+			cfg.Mode, cfg.Seed, hiddenAcct.DID)
+	}
 
 	targetSeq := w.CurrentSeq()
 	recordTraceOrError(t, trace, "steady_target", map[string]any{"target_seq": targetSeq})
 	steadyAck.Wait(t, cfg, targetSeq, run, oracleWaitTimeout(cfg))
+	if netNewOracle {
+		assertNetNewDIDBackfilled(t, cfg, debugClient, run, string(hiddenAcct.DID), netNewBaseline)
+	}
 	assertFirehoseEventLogMatches(t, trace, w, steadyEventLog, steadyStartSeq, targetSeq, "steady-state")
 	// Ledger-aware variant of the plain cursor-gap guard: #204's
 	// whole-event drops advance the cursor without an archived row and
@@ -661,6 +697,37 @@ func assertEnqueueInvalidDIDFired(t *testing.T, cfg Config, debugClient *http.Cl
 		cfg.Mode, cfg.Seed)
 }
 
+func assertNetNewDIDBackfilled(t *testing.T, cfg Config, debugClient *http.Client, run *runtimeRun, did string, baseline map[string]float64) {
+	t.Helper()
+
+	const (
+		enqueuedMetric = "jetstream_backfill_net_new_enqueued_total"
+		retriedMetric  = "jetstream_backfill_failed_repo_retry_succeeded_total"
+	)
+	deadline := time.NewTimer(oracleWaitTimeout(cfg))
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+
+	var last map[string]float64
+	for {
+		drain()
+		last = scrapeDebugMetrics(t, cfg, debugClient, enqueuedMetric, retriedMetric)
+		if last[enqueuedMetric] > baseline[enqueuedMetric] && last[retriedMetric] > baseline[retriedMetric] {
+			return
+		}
+		select {
+		case <-run.exited:
+			t.Fatalf("steady-state ingestion stopped before net-new DID backfill completed: did=%s mode=%s seed=%d metrics=%v baseline=%v err=%v",
+				did, cfg.Mode, cfg.Seed, last, baseline, run.err)
+		case <-deadline.C:
+			t.Fatalf("timeout waiting for net-new DID backfill: did=%s mode=%s seed=%d metrics=%v baseline=%v",
+				did, cfg.Mode, cfg.Seed, last, baseline)
+		case <-tick.C:
+		}
+	}
+}
+
 // scrapeDebugMetrics fetches /metrics from the debug listener and
 // returns the values of the requested un-labeled series. Metrics the
 // scrape does not contain report as 0 (prometheus counters are only
@@ -717,10 +784,13 @@ func assertFaultPlanFired(t *testing.T, cfg Config, plan *SwarmFaultPlan) {
 	if cfg.FaultMode == FaultModeSwarm {
 		require.NotEmpty(t, plan.GetRepoHTTPFailures,
 			"swarm mode must schedule at least one getRepo HTTP fault; empty plan means injection is disabled")
+		require.NotEmpty(t, plan.GetRepoResponseFailures,
+			"swarm mode must schedule at least one getRepo typed response fault; empty plan means response-fault injection is disabled")
 		require.NotEmpty(t, plan.GetRepoCARTruncations,
 			"swarm mode must schedule at least one getRepo CAR truncation; empty plan means injection is disabled")
 	}
 	require.Empty(t, plan.UnfiredGetRepoHTTPFailures(), "configured getRepo HTTP faults must fire")
+	require.Empty(t, plan.UnfiredGetRepoResponseFailures(), "configured getRepo typed response faults must fire")
 	require.Empty(t, plan.UnfiredGetRepoCARTruncations(), "configured getRepo CAR truncation faults must fire")
 }
 
@@ -742,17 +812,22 @@ func recordGetRepoFaults(t *testing.T, trace *Trace, phase string, plan *SwarmFa
 	t.Helper()
 
 	unfiredHTTP := plan.UnfiredGetRepoHTTPFailures()
+	unfiredResponseFailures := plan.UnfiredGetRepoResponseFailures()
 	unfiredCAR := plan.UnfiredGetRepoCARTruncations()
 	recordTraceOrError(t, trace, "faults_fired", map[string]any{
-		"phase":                                phase,
-		"scheduled_get_repo_http_failures":     plan.TotalGetRepoHTTPFailures(),
-		"fired_get_repo_http_failures":         totalGetRepoHTTPFailuresFired(plan),
-		"unfired_get_repo_http_failure_dids":   len(unfiredHTTP),
-		"unfired_get_repo_http_failures":       totalIntMap(unfiredHTTP),
-		"scheduled_get_repo_car_truncations":   plan.TotalGetRepoCARTruncations(),
-		"fired_get_repo_car_truncations":       totalGetRepoCARTruncationsFired(plan),
-		"unfired_get_repo_car_truncation_dids": len(unfiredCAR),
-		"unfired_get_repo_car_truncations":     totalIntMap(unfiredCAR),
+		"phase":                                  phase,
+		"scheduled_get_repo_http_failures":       plan.TotalGetRepoHTTPFailures(),
+		"fired_get_repo_http_failures":           totalGetRepoHTTPFailuresFired(plan),
+		"unfired_get_repo_http_failure_dids":     len(unfiredHTTP),
+		"unfired_get_repo_http_failures":         totalIntMap(unfiredHTTP),
+		"scheduled_get_repo_response_failures":   plan.TotalGetRepoResponseFailures(),
+		"fired_get_repo_response_failures":       totalGetRepoResponseFailuresFired(plan),
+		"unfired_get_repo_response_failure_dids": len(unfiredResponseFailures),
+		"unfired_get_repo_response_failures":     totalIntMap(unfiredResponseFailures),
+		"scheduled_get_repo_car_truncations":     plan.TotalGetRepoCARTruncations(),
+		"fired_get_repo_car_truncations":         totalGetRepoCARTruncationsFired(plan),
+		"unfired_get_repo_car_truncation_dids":   len(unfiredCAR),
+		"unfired_get_repo_car_truncations":       totalIntMap(unfiredCAR),
 	})
 }
 
@@ -870,6 +945,17 @@ func totalGetRepoHTTPFailuresFired(plan *SwarmFaultPlan) int {
 	var total int
 	for did := range plan.GetRepoHTTPFailures {
 		total += plan.SimulatorFaults.GetRepoHTTPFailuresFired(did)
+	}
+	return total
+}
+
+func totalGetRepoResponseFailuresFired(plan *SwarmFaultPlan) int {
+	if plan == nil || plan.SimulatorFaults == nil {
+		return 0
+	}
+	var total int
+	for did := range plan.GetRepoResponseFailures {
+		total += plan.SimulatorFaults.GetRepoResponseFaultsFired(did)
 	}
 	return total
 }
