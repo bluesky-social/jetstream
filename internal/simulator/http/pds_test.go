@@ -3,6 +3,8 @@ package http_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -279,4 +281,57 @@ func TestPDS_GetRepoFaultHandlerServesTruncatedCARThenCAR(t *testing.T) {
 	require.Equal(t, a.DID, rp.DID)
 	require.NotEmpty(t, commit.Sig)
 	require.Equal(t, 1, faults.GetRepoCARTruncationsFired(string(a.DID)))
+}
+
+func TestPDS_GetRepoUnavailableReturnsXRPCError(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		status string
+		name   string
+	}{
+		{status: "takendown", name: "RepoTakendown"},
+		{status: "suspended", name: "RepoSuspended"},
+		{status: "deactivated", name: "RepoDeactivated"},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			t.Parallel()
+			w := newTestWorld(t, 5, 2)
+			a, err := w.LoadAccount(0)
+			require.NoError(t, err)
+			require.NoError(t, w.SetRepoUnavailableForTest(0, tc.status))
+
+			srv := httptest.NewServer(simhttp.NewHandler(w, "http://example.test"))
+			defer srv.Close()
+
+			xc := &xrpc.Client{
+				Host:       srv.URL,
+				HTTPClient: gt.Some(http.DefaultClient),
+				Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+			}
+			sc := sync.NewClient(sync.Options{Client: xc})
+
+			body, err := sc.GetRepoStream(context.Background(), a.DID, "")
+			require.Nil(t, body)
+			var xerr *xrpc.Error
+			require.True(t, errors.As(err, &xerr), "getRepo unavailable must parse as *xrpc.Error")
+			require.Equal(t, http.StatusBadRequest, xerr.StatusCode)
+			require.Equal(t, tc.name, xerr.Name)
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+				srv.URL+"/xrpc/com.atproto.sync.getRepo?did="+string(a.DID), nil)
+			require.NoError(t, err)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+			var envelope struct {
+				Error   string `json:"error"`
+				Message string `json:"message"`
+			}
+			require.NoError(t, json.NewDecoder(resp.Body).Decode(&envelope))
+			require.Equal(t, tc.name, envelope.Error)
+			require.Contains(t, envelope.Message, tc.status)
+		})
+	}
 }

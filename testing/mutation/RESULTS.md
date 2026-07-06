@@ -5,14 +5,18 @@ oracle's detection power is visible over time. See
 `docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
 method and `testing/mutation/run.sh` for the driver.
 
-**Current catalog (keep this line current): 33 active mutants on disk
-(m001–m041; m007, m010, m013, m014, m020, m021, m023, m025 retired). Latest
-full campaign: 2026-07-05 at the second #204 merge head (#204 adversarial
-ingest traffic ∪ #202 identity/m041 ∪ #230 corpus ∪ #232 replay) —
-**31 killed, 2 survived, zero STALE/BUILD-BROKEN**; gate PASS against
-`testing/mutation/baseline.json` (union bank; commit field `a4e96c5` is
-provenance-only). The 2 survivors (m003, m015) are documented escapes with
-owning issues (#209, #208).
+**Current catalog (keep this line current): 35 active mutants on disk
+(m001–m043; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+union baseline after #206 frame-tier coverage, #208 footer-index/bloom
+verification, and #203 account-status exactness: **35 killed, 0 survived,
+zero STALE/BUILD-BROKEN** in
+`testing/mutation/baseline.json` (commit field `4f2c153` is
+provenance-only). #208 banked the old m015 footer-index survivor as
+KILLED@default; #203 added m043 and banks it as KILLED@default.
+m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
+at this merge — the #204 branch minted m036–m040 concurrently; same
+precedent as m041's renumber in 82b2dd9.
+m015 is now KILLED@default by the #208 sealed metadata verifier.
 m013/m014 retired 2026-07-04: dead path under atmos v0.2.10, not
 dormant-under-polite-traffic — see the #204 campaign section; their bug
 class is covered by m017/m018 (convertCommit) and m036/m037 (convertSync).
@@ -74,6 +78,64 @@ remain below so the reasoning is not lost.
 | m021_overlay_record_seq_base_zero | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m023_overlay_drop_record_tombstones | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178. #183's re-derivation analysis (2026-07-04 section below) concluded no single-edit replacement exists: the recorder is a regression assertion without a gated mutant. |
+
+## Campaign 2026-07-05 (#203 — account lifecycle statuses and getRepo unavailable)
+
+Full campaign at `2450fec` after adding deterministic simulator/oracle coverage
+for non-deleted account lifecycle statuses (`takendown`, `suspended`,
+`deactivated`, `unknown`), reactivation, and terminal `getRepo`
+`RepoTakendown`/`RepoSuspended`/`RepoDeactivated` classification. **35 active
+mutants: 34 KILLED, 1 SURVIVED, zero STALE/BUILD-BROKEN.** At that point the
+only survivor was the documented m015 footer-count escape; #208 later banked it
+as KILLED@default.
+
+**Re-run at `4f2c153` (same day) after an adversarial-review finding proved the
+`2450fec` result vacuous at the end-to-end tier.** m043 originally declared
+`tiers: tombstone,default`; the driver stops at the first killing tier, so the
+pre-existing tombstone unit matrix killed the mutant and
+`TestOracle_DefaultLifecycle` never gated the new #203 lifecycle coverage —
+confirmed by hand-applying the mutant: the default tier PASSED, because the
+lifecycle was injected at the end of the steady window, above every compaction
+watermark, where the tombstone-exactness fold never touches rows. Fixes: the
+lifecycle injection moved to the start of the steady window (below the
+tombstone-triggered pass watermark), the harness now asserts the final
+watermark covers the lifecycle rows (anti-vacuity), and m043's tiers reordered
+to `default,tombstone` so the end-to-end tier is the recorded killer. The
+mutant's expected-detection block also cited a nonexistent test
+(`TestTombstoneSet_AccountStatusExactness`); corrected to the real unit
+backstops (`TestObserveAccountDeletedOnlyPurgesLiteralDeleted`,
+`TestObserveAccountStatusMatrixRetains`). m001's recorded tier also moved
+stress→default in this regen (tier-order note only; disposition unchanged).
+
+Drivers:
+
+```bash
+testing/mutation/run.sh m043 --json /tmp/m043.json
+testing/mutation/run.sh --json testing/mutation/baseline.json
+```
+
+### Scorecard
+
+| mutant | result | note |
+|---|---|---|
+| m043_account_status_exactness | KILLED@default | `oracle: missing did:plc:jqwkem7rbggmxanbfb7e6gbl app.bsky.feed.like/...` — under the mutant the fixture account's inactive statuses fold as DID tombstones and compaction over-drops its records; the tombstone unit matrix remains the fast backstop tier. |
+
+## Campaign 2026-07-05 (#208 — footer-index/bloom verification)
+
+Full campaign at temporary-worktree commit `0a89f40` carrying the #208 changes.
+**33 active mutants: 33 KILLED, 0 SURVIVED, zero STALE/BUILD-BROKEN.**
+`testing/mutation/baseline.json` was regenerated from this run.
+
+The surviving m015 footer-index blind spot is now banked as a kill. The new
+segment verifier re-derives footer collection counts, per-block collection
+sets, segment DID bloom membership, and per-block DID bloom membership from
+decoded rows, then the oracle calls it from sealed segment observation. The
+mutant's doubled collection count now fails in the default oracle tier before
+row-level reconstruction can mask it:
+
+| mutant | result | note |
+|---|---|---|
+| m015_collection_count_double | KILLED@default | `oracle: verify sealed segment ... footer metadata: segment: verify ... collection "app.bsky.actor.profile" count mismatch: footer=2 rows=1` |
 
 ## Campaign 2026-06-29 (step 11 #182 — partb tier; catalog refresh; baseline regen)
 
@@ -1398,3 +1460,96 @@ KILLED@replay (#232), m009 KILLED@corpus (#230), with m013/m014 absent
 (retired). Survivors: m003 → #209, m015 → #208. Also green at this head:
 short suites, default + stress lifecycle, -race on oracle/simulator,
 lint. This is the PR-merge state for #235.
+
+## Campaign 2026-07-05 — `frames` tier; m042 banked (#206)
+
+Original campaign at `248b9c5` (branch `frame-adversity-206`, pre-merge,
+where this mutant was numbered m036): **30 mutants: 26 KILLED, 4
+SURVIVED, zero STALE/BUILD-BROKEN**; no disposition changed vs the
+`5d6fc9e` baseline. Merging origin/main first pulled in the #204 ∪ #202 ∪
+#230 ∪ #232 union above; that collided with the #204 branch's freshly-minted
+m036–m040, so the frames mutant was renumbered to **m042** (same precedent as
+m041's renumber in 82b2dd9). A later merge pulled in #209's
+`restart-multisource` tier, changing m003 from SURVIVED to KILLED. The current
+baseline.json resolves as the full union: main's 33 dispositions with m003
+KILLED@restart-multisource plus m042 KILLED@frames — **34 mutants, 33 KILLED /
+1 SURVIVED** (m015 #208).
+
+**New `frames` tier; m042 banked KILLED@frames.** #206 made frame-level
+wire adversity live: the simulator relay can inject arbitrary bytes on
+the subscribeRepos socket (`SubscribeReposInjectFault` — inject-only,
+inject+swallow positional replace, swallow-only pure gap) and emit
+partial-CAR commits whose ops reference record leaf blocks absent from
+the CAR (`GenerateMultiOpCommitForTest` with per-op `StripBlock`; the
+commit block and MST nodes always survive, so the fault is precisely
+"op without its block", not a malformed CAR). Six oracle scenarios
+(internal/oracle/frame_fault_test.go, real consumer end-to-end) pin the
+poison-frame contract: garbage CBOR (decode counter, same-conn
+continue), unknown frame type (unknown counter, body seq suppresses the
+spurious gap), op=-1 error frame (`stream_error_frames_total{code}`),
+oversized frame (read-limit reconnect, #205 guards keep redelivery at
+zero loss and zero bloat), swallowed frame (a REAL gap, loss bounded to
+exactly the swallowed window, chain-break resync self-heal), and
+stripped leaf block (`dropped_events_total{source=live,
+reason=missing_block}` per op, siblings archive, NO chain break).
+
+m042 (`m042_missing_block_arm_discards_siblings`) makes the consumer's
+per-op-drop arm advance the cursor and `continue` instead of falling
+through to the append — the well-formed siblings of a partial-CAR
+commit are silently discarded while the drop counters report exactly
+the drops the operator expects to see. The tier kills it at two layers:
+the oracle scenario's surviving-rows barrier times out, and the
+live-package unit test fails its new `WriterMetrics.EventsAppended==1`
+assertion. That assertion was added FOR this mutant: pre-strengthening,
+`TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer` passed under
+m042 (cursor advanced, counter bumped, no error propagated) while the
+survivor was discarded — a vacuity worth recording. Red-first verified
+in both directions before the patch was banked.
+
+## Campaign 2026-07-05 — verification at the #206 merge head
+
+Full campaign + gate at `1fa6640` (frame-adversity-206 ∪ main's #204 ∪
+#202 ∪ #201): **gate PASS — 34 mutants match baseline, 32 KILLED / 2
+SURVIVED, zero STALE/BUILD-BROKEN.** All in-flight banks reproduce side
+by side at one head: m042 KILLED@frames (#206), m036–m040 KILLED@default
+(#204 gate mutants), m041 KILLED@default (#202 identity), m035
+KILLED@replay (#232), m009 KILLED@corpus (#230). Survivors: m003 → #209,
+m015 → #208.
+
+One STALE fixed en route: the first merge-head run flagged m011 (its
+flushLocked hunk moved when #201 inserted the beforeIO fault hook above
+the file write). Hunk regenerated against the current writer.go — the
+mutation itself is unchanged — and the re-run banked it KILLED@default.
+Also green at this head: short suites (2017 tests), lint, -race over
+oracle/live/simulator, and 3× repeats of the frame + replay oracle
+tiers under atmos v0.2.13.
+
+## Campaign 2026-07-05 — #209 deterministic multi-source restart tier
+
+Full campaign at `fdbfaa7` after adding
+`TestOracle_RestartMultiSourceMergeCursorNoReprocess` and the
+`restart-multisource` mutation tier: **33 active mutants, 32 KILLED / 1
+SURVIVED, zero STALE/BUILD-BROKEN.** The baseline was refreshed with m003
+banked as **KILLED@restart-multisource**; m015 remains the sole survivor and
+continues to belong to #208.
+
+The new tier forces bootstrap-live to rotate after every accepted event
+(`MaxEventsPerBlock=1`, `MaxSegmentBytes=1`), kills the restart child at the
+9th `AfterMergeDstFlushBeforeSourceCommit` occurrence, captures rows from the
+already-committed source immediately before the crash boundary, then proves
+surviving captured rows appear exactly once after recovery. Under m003's
+`commitSourceComplete(sf.Idx)` off-by-one, restart reprocesses that committed
+source and the precise no-reprocess assertion fails.
+
+Incidental maintenance: m011's patch context was refreshed for the existing
+`beforeIO(IOOpWrite)` hook in `segment/writer.go`; the modeled bug and kill
+tier are unchanged, and the full campaign re-confirmed **KILLED@default**.
+
+## Merge resolution 2026-07-05 — #206 frame adversity ∪ #209 restart-multisource
+
+Merging origin/main after #209 into `frame-adversity-206` produced the expected
+scorecard conflict: #206 had added m042 KILLED@frames, while #209 had changed
+m003 from SURVIVED to KILLED@restart-multisource. The resolved baseline is the
+union: **34 active mutants, 33 KILLED / 1 SURVIVED**, with m015 as the only
+remaining survivor. The m011 conflict was metadata-only; both sides carried the
+same mutation body and current `segment/writer.go` context.

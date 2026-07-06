@@ -75,7 +75,7 @@ func parseConfigFromLookupEnv(lookupenv func(string) (string, bool)) (Config, er
 	switch mode {
 	case "default":
 	case "fast":
-		cfg.Accounts = 4
+		cfg.Accounts = 8
 		cfg.MaxInitialRecords = 10
 		cfg.LiveEventsBootstrap = 12
 		cfg.LiveEventsSteady = 12
@@ -189,6 +189,22 @@ func parseIntEnv(lookupenv func(string) (string, bool), key string, out *int) er
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return fmt.Errorf("%s: parse int %q: %w", key, value, err)
+	}
+	*out = parsed
+	return nil
+}
+
+func parseInt64Env(lookupenv func(string) (string, bool), key string, out *int64) error {
+	value, ok := lookupenv(key)
+	if !ok {
+		return nil
+	}
+	if value == "" {
+		return fmt.Errorf("%s must not be empty", key)
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("%s: parse int64 %q: %w", key, value, err)
 	}
 	*out = parsed
 	return nil

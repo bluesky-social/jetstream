@@ -6,10 +6,29 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+type opOrdinalIOFault struct {
+	op      IOOp
+	ordinal int
+	err     error
+	seen    atomic.Int64
+}
+
+func (f *opOrdinalIOFault) BeforeSegmentIO(_ string, op IOOp) error {
+	if op != f.op {
+		return nil
+	}
+	if int(f.seen.Add(1)) == f.ordinal {
+		return f.err
+	}
+	return nil
+}
 
 func TestNewCreatesEmpty256ByteFile(t *testing.T) {
 	t.Parallel()
@@ -34,6 +53,40 @@ func TestNewCreatesEmpty256ByteFile(t *testing.T) {
 	for i, b := range contents[len(segmentMagic):] {
 		require.Zerof(t, b, "padding byte %d should be zero", i+len(segmentMagic))
 	}
+}
+
+func TestFlushReturnsENOSPCOnBlockWrite(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+	fault := &opOrdinalIOFault{op: IOOpWrite, ordinal: 2, err: syscall.ENOSPC}
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2, IOFaultInjector: fault})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:a"})
+	require.NoError(t, err)
+	err = w.Flush()
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	require.ErrorContains(t, err, "segment: write block")
+}
+
+func TestFlushReturnsENOSPCOnBlockFsync(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.jss")
+	fault := &opOrdinalIOFault{op: IOOpSync, ordinal: 3, err: syscall.ENOSPC}
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2, IOFaultInjector: fault})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:a"})
+	require.NoError(t, err)
+	err = w.Flush()
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	require.ErrorContains(t, err, "segment: fsync block")
 }
 
 func TestNewRejectsTooSmallFile(t *testing.T) {

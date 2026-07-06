@@ -33,6 +33,13 @@ func GroundTruthFromWorld(w *world.World) (*Model, error) {
 		if deleted {
 			continue
 		}
+		_, unavailable, err := w.RepoUnavailableStatus(idx)
+		if err != nil {
+			return nil, err
+		}
+		if unavailable {
+			continue
+		}
 		rp, _, err := w.LoadRepo(idx)
 		if err != nil {
 			return nil, err

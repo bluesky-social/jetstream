@@ -86,6 +86,32 @@ func TestExpectedEventLogFromFirehoseHonorsCursorAndLimit(t *testing.T) {
 	require.Equal(t, "sync", rows[0].Kind)
 }
 
+// TestExpectedEventLogFromFirehoseDropsMissingBlockOps pins the model's
+// mirror of the consumer's partial-CAR contract: an op whose record
+// block is stripped from the CAR diff produces NO expected row, while
+// sibling ops in the same commit expand normally.
+func TestExpectedEventLogFromFirehoseDropsMissingBlockOps(t *testing.T) {
+	t.Parallel()
+
+	w := newExpectedEventLogWorld(t)
+	_, ops, err := w.GenerateMultiOpCommitForTest(context.Background(), 0, []world.TargetedOpSpec{
+		{Action: "create", Collection: "app.bsky.feed.post", Rkey: "survivor1"},
+		{Action: "create", Collection: "app.bsky.feed.post", Rkey: "stripped1", StripBlock: true},
+		{Action: "create", Collection: "app.bsky.feed.post", Rkey: "survivor2"},
+	})
+	require.NoError(t, err)
+	require.Len(t, ops, 3)
+
+	rows, err := ExpectedEventLogFromFirehose(w, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 2, "the stripped op must not produce an expected row")
+	for _, row := range rows {
+		require.Equal(t, "create", row.Kind)
+		require.Contains(t, []string{"survivor1", "survivor2"}, row.Rkey)
+		require.NotZero(t, row.PayloadLen)
+	}
+}
+
 func newExpectedEventLogWorld(t *testing.T) *world.World {
 	t.Helper()
 

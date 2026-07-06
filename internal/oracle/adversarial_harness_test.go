@@ -78,22 +78,32 @@ var adversarialGateReasonMatrix = map[string][]string{
 	"backfill": {"invalid_collection", "invalid_rkey", "field_too_long"},
 }
 
-// pickAdversarialAccounts returns three distinct active accounts
-// (acctOp, acctSyncLie, acctVerifier). Fast mode has exactly three
-// active accounts (of four; bootstrap deletes account 0), so every
-// mode can host the full lie set.
+// pickAdversarialAccounts returns three distinct fetchable, active accounts
+// (acctOp, acctSyncLie, acctVerifier). Fast mode keeps accounts 1-3 in that
+// set after bootstrap deletes account 0; later deterministic fixtures use
+// higher account indexes so they do not steal an adversarial role.
 func pickAdversarialAccounts(t *testing.T, w *world.World, cfg Config) (acctOp, acctSyncLie, acctVerifier int) {
 	t.Helper()
 	var picked []int
 	for idx := 0; idx < cfg.Accounts && len(picked) < 3; idx++ {
-		deleted, err := w.IsAccountDeleted(idx)
-		require.NoError(t, err)
-		if !deleted {
+		if oracleAccountFetchable(t, w, idx) {
 			picked = append(picked, idx)
 		}
 	}
-	require.Lenf(t, picked, 3, "adversarial phase needs 3 active accounts, mode=%s has fewer", cfg.Mode)
+	require.Lenf(t, picked, 3, "adversarial phase needs 3 fetchable active accounts, mode=%s has fewer", cfg.Mode)
 	return picked[0], picked[1], picked[2]
+}
+
+func oracleAccountFetchable(t *testing.T, w *world.World, idx int) bool {
+	t.Helper()
+	deleted, err := w.IsAccountDeleted(idx)
+	require.NoError(t, err)
+	if deleted {
+		return false
+	}
+	_, unavailable, err := w.RepoUnavailableStatus(idx)
+	require.NoError(t, err)
+	return !unavailable
 }
 
 // injectAdversarialBackfillLies commits the backfill lie set into

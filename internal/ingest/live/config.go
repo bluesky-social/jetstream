@@ -37,6 +37,11 @@ const (
 
 // Config controls Consumer behavior.
 type Config struct {
+	// DataDir is the root jetstream data directory. Optional outside the
+	// production orchestrator; forwarded to ingest.Writer for fatal
+	// persistence error context.
+	DataDir string
+
 	// SegmentsDir is where the consumer writes seg_*.jss files.
 	// For bootstrap phase this is "<data-dir>/backfill/live_segments".
 	// Once the merge step lands, steady-state callers point this at
@@ -118,6 +123,10 @@ type Config struct {
 	// SegmentMetrics flows through the consumer's internal *ingest.Writer
 	// to every segment.New it makes. Optional.
 	SegmentMetrics segment.SealObserver
+
+	// SegmentIOFaultInjector is a test-only seam forwarded to segment.Writer.
+	// Nil in production.
+	SegmentIOFaultInjector segment.IOFaultInjector
 
 	// OnEvent is called once per segment.Event after it has been
 	// durably appended to the writer. The event passed in carries

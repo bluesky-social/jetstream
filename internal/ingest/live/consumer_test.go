@@ -239,17 +239,20 @@ func TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer(t *testing.T) {
 	// Real metrics registry so we can assert the dropped-ops counter
 	// was bumped — both that the typed-error arm fired AND that the
 	// AsType extraction inside that arm reached len(dme.Dropped).
-	dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
+	reg := prometheus.NewRegistry()
+	dropMetrics := ingest.NewDropMetrics(reg)
+	writerMetrics := ingest.NewMetrics(reg)
 
 	c, err := Open(Config{
-		SegmentsDir: dir,
-		Store:       st,
-		SeqKey:      "live_segments/seq/next",
-		CursorKey:   "relay/cursor",
-		RelayURL:    "https://example.invalid",
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Verifier:    newTestVerifier(t),
-		DropMetrics: dropMetrics,
+		SegmentsDir:   dir,
+		Store:         st,
+		SeqKey:        "live_segments/seq/next",
+		CursorKey:     "relay/cursor",
+		RelayURL:      "https://example.invalid",
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:      newTestVerifier(t),
+		DropMetrics:   dropMetrics,
+		WriterMetrics: writerMetrics,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
@@ -275,6 +278,12 @@ func TestProcessBatch_MissingBlockOpDoesNotShutDownConsumer(t *testing.T) {
 			"otherwise restart hits the same commit and re-crashes")
 	require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceLive, ingest.DropReasonMissingBlock)), 0,
 		"the consumer must extract per-op detail from the typed error and bump the counter")
+	// The drop is per-OP, not per-event: the well-formed sibling op in
+	// the same commit must still be archived. Without this the arm could
+	// silently discard survivors (count the drop, skip the append) and
+	// every assertion above would still pass.
+	require.InDelta(t, 1.0, testutil.ToFloat64(writerMetrics.EventsAppended), 0,
+		"the surviving sibling op must be archived, not discarded with the dropped one")
 }
 
 func TestProcessBatch_MalformedCommitDoesNotShutDownConsumer(t *testing.T) {

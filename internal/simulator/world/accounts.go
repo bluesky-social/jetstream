@@ -124,6 +124,54 @@ func (w *World) isAccountDeleted(idx int) (bool, error) {
 	return len(val) == 1 && val[0] == 1, nil
 }
 
+func (w *World) repoUnavailableStatus(idx int) (string, bool, error) {
+	val, closer, err := w.db.Get(keyAccountRepoUnavailable(idx))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("world: load account %d repo unavailable status: %w", idx, err)
+	}
+	defer func() { _ = closer.Close() }()
+	status := string(val)
+	switch status {
+	case "takendown", "suspended", "deactivated":
+		return status, true, nil
+	default:
+		return "", false, fmt.Errorf("world: account %d has invalid repo unavailable status %q", idx, status)
+	}
+}
+
+func (w *World) setRepoUnavailableStatus(idx int, status string) error {
+	if idx < 0 || idx >= w.cfg.Accounts {
+		return fmt.Errorf("simulator: repo-unavailable account index %d out of range", idx)
+	}
+	switch status {
+	case "takendown", "suspended", "deactivated":
+	default:
+		return fmt.Errorf("simulator: unsupported repo unavailable status %q", status)
+	}
+	if err := w.db.Set(keyAccountRepoUnavailable(idx), []byte(status), pebble.NoSync); err != nil {
+		return fmt.Errorf("world: set account %d repo unavailable status: %w", idx, err)
+	}
+	return nil
+}
+
+func (w *World) accountCanAuthor(idx int) (bool, error) {
+	deleted, err := w.isAccountDeleted(idx)
+	if err != nil {
+		return false, err
+	}
+	if deleted {
+		return false, nil
+	}
+	_, unavailable, err := w.repoUnavailableStatus(idx)
+	if err != nil {
+		return false, err
+	}
+	return !unavailable, nil
+}
+
 func (w *World) generateAccountDelete(ctx context.Context, idx int) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -160,6 +208,51 @@ func (w *World) generateAccountDelete(ctx context.Context, idx int) ([]byte, err
 	}
 	if err := b.Commit(pebble.NoSync); err != nil {
 		return nil, fmt.Errorf("world: commit account delete: %w", err)
+	}
+	if w.fanout != nil {
+		w.fanout.Publish(frame)
+	}
+	return frame, nil
+}
+
+func (w *World) generateAccountStatus(ctx context.Context, idx int, active bool, status string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if idx < 0 || idx >= w.cfg.Accounts {
+		return nil, fmt.Errorf("simulator: account-status index %d out of range", idx)
+	}
+	a, err := w.loadAccount(idx)
+	if err != nil {
+		return nil, err
+	}
+
+	seq := w.seq.Add(1)
+	b := w.db.NewBatch()
+	defer func() { _ = b.Close() }()
+	eventMicros, err := w.nextLogicalClockMicros(b)
+	if err != nil {
+		return nil, err
+	}
+	envelope := &comatproto.SyncSubscribeRepos_Account{
+		DID:    string(a.DID),
+		Active: active,
+		Seq:    seq,
+		Time:   formatLogicalClockTime(eventMicros),
+	}
+	if status != "" {
+		envelope.Status = gt.Some(status)
+	}
+	frame, err := encodeAccountFrame(envelope)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := stageFirehoseFrame(b, seq, frame, w.cfg.FirehoseHistory); err != nil {
+		return nil, err
+	}
+	if err := b.Commit(pebble.NoSync); err != nil {
+		return nil, fmt.Errorf("world: commit account status: %w", err)
 	}
 	if w.fanout != nil {
 		w.fanout.Publish(frame)

@@ -1,0 +1,34 @@
+mutant: m043_account_status_exactness
+target: internal/tombstone/tombstone.go
+failure-mode: |
+  DID tombstone classification treats every inactive #account status
+  as a deletion instead of requiring the exact atproto deletion shape
+  active=false,status=deleted. Real relay/PDS account lifecycle statuses
+  such as takendown, suspended, deactivated, and unknown would then fold as
+  DID tombstones during compaction, allowing the compactor to drop unrelated
+  live records for accounts that still exist. This is permanent data loss:
+  a moderation/unavailability event becomes indistinguishable from account
+  deletion at the tombstone layer.
+expected-detection: |
+  default tier: the lifecycle injects a deterministic account-status sequence
+  (takendown, suspended, deactivated, unknown, then active=true reactivation)
+  for a fixture account after a probe create; under this mutant those inactive
+  statuses fold as DID tombstones, so compaction drops the probe row and the
+  compaction/final-state checks report it missing or superseded. The default
+  tier is listed first deliberately: the pre-existing tombstone unit matrix
+  (TestObserveAccountDeletedOnlyPurgesLiteralDeleted,
+  TestObserveAccountStatusMatrixRetains) also kills this mutant, and the
+  driver stops at the first killing tier — tombstone-first would record a kill
+  without ever exercising the #203 end-to-end coverage this mutant gates.
+  tombstone tier remains as the fast unit backstop.
+expected-tier: default
+tiers: default,tombstone
+
+diff --git a/internal/tombstone/tombstone.go b/internal/tombstone/tombstone.go
+index 4d34cf1..b73d0f7 100644
+--- a/internal/tombstone/tombstone.go
++++ b/internal/tombstone/tombstone.go
+@@ -241 +241 @@ func accountDeleted(payload []byte) (bool, error) {
+-	return !acc.Active && acc.Status.HasVal() && acc.Status.Val() == "deleted", nil
++	return !acc.Active && acc.Status.HasVal(), nil
+ }

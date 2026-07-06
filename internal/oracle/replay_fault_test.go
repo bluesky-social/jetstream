@@ -2,28 +2,11 @@ package oracle
 
 import (
 	"context"
-	"io"
-	"log/slog"
-	"math/rand/v2"
-	"net/http"
-	"net/http/httptest"
-	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/ingest/live"
-	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/bluesky-social/jetstream/segment"
-	"github.com/jcalabro/atmos/identity"
-	atmossync "github.com/jcalabro/atmos/sync"
-	"github.com/jcalabro/atmos/xrpc"
-	"github.com/jcalabro/gt"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -43,16 +26,16 @@ import (
 //     expansion of the world's firehose: zero storage bloat, structural
 //     invariants hold, final state converges.
 //
-// Each scenario drives the REAL live consumer (real websocket, real atmos
-// pipeline, pebble-backed verifier state) against the simulator relay
-// with a replay fault armed, over a traffic shape that puts an
-// account-delete + reactivate + recreate inside the replayed window —
-// the shape that corrupts state if any protection regresses. Anti-vacuity:
-// the fault must fire, frames must actually be re-delivered, and the #231
-// guard must report drops (proving the account replay reached it).
+// Each scenario drives the shared live-tail harness (see
+// live_tail_harness_test.go) with a replay fault armed, over a traffic
+// shape that puts an account-delete + reactivate + recreate inside the
+// replayed window — the shape that corrupts state if any protection
+// regresses. Anti-vacuity: the fault must fire, frames must actually be
+// re-delivered, and the #231 guard must report drops (proving the
+// account replay reached it).
 
-// replayScenarioTraffic drives the world through the corrupting shape and
-// returns the account-0 record rkey recreated after reactivation.
+// replayScenarioTraffic drives the world through the corrupting shape:
+// two commits, then account-0 delete + reactivate + recreate.
 func replayScenarioTraffic(t *testing.T, ctx context.Context, w *world.World) {
 	t.Helper()
 	_, err := w.GenerateOneForTest(ctx)
@@ -67,100 +50,29 @@ func replayScenarioTraffic(t *testing.T, ctx context.Context, w *world.World) {
 	require.NoError(t, err)
 }
 
-// runReplayFaultScenario stands up world + simulator relay + real live
-// consumer, arms the given replay fault to fire after every real frame
-// has been delivered, generates one post-replay commit to prove the
-// stream continues, and returns the observed archive plus fixtures.
+// runReplayFaultScenario arms the given replay fault to fire after every
+// real frame has been delivered, generates one post-replay commit to
+// prove the stream continues, and returns the observed archive plus
+// fixtures.
 func runReplayFaultScenario(t *testing.T, fault simhttp.SubscribeReposReplayFault) (
-	[]ObservedEvent, []EventLogRow, []EventLogRow, *world.World, *simhttp.FaultPlan, *live.Metrics,
+	[]ObservedEvent, []EventLogRow, []EventLogRow, *liveTailHarness,
 ) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
-	cfg := world.DefaultConfig()
-	cfg.DataDir = t.TempDir()
-	cfg.Accounts = 2
-	// No bootstrap-seeded records: this harness archives the live tail
-	// only (no backfill), so ground truth must be derivable purely from
-	// firehose traffic.
-	cfg.InitialRecords = 0
-	cfg.InitialRecordsMax = 0
-	w, err := world.New(ctx, cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = w.Close() })
-	_, err = w.EnsureSeed()
-	require.NoError(t, err)
-	require.NoError(t, w.Bootstrap(ctx, slog.Default()))
-	require.NoError(t, w.AttachRuntime(rand.New(rand.NewPCG(7, 11)), fanout.New(1024)))
-
-	faults := simhttp.NewFaultPlan()
-	srv := httptest.NewServer(nil)
-	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, srv.URL, simhttp.HandlerOptions{Faults: faults})
-	t.Cleanup(srv.Close)
-
-	replayScenarioTraffic(t, ctx, w)
-	preReplayTip := w.CurrentSeq()
+	h := newLiveTailHarness(t, ctx)
+	replayScenarioTraffic(t, ctx, h.World)
+	preReplayTip := h.World.CurrentSeq()
 
 	// Fire after the connection has delivered every pre-replay frame, so
 	// the replayed window deterministically contains the account
 	// lifecycle. AfterFrames counts frames on the connection (fresh
 	// cursor=0 subscription => all of history).
 	fault.AfterFrames = int(preReplayTip)
-	faults.SetSubscribeReposReplaySchedule([]simhttp.SubscribeReposReplayFault{fault})
+	h.Faults.SetSubscribeReposReplaySchedule([]simhttp.SubscribeReposReplayFault{fault})
 
-	st, err := store.Open(t.TempDir(), nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
-	stateStore := syncstate.New(st)
-
-	directory := &identity.Directory{
-		Resolver: &identity.DefaultResolver{
-			PLCURL: gt.Some(srv.URL),
-			// Plain client: jttp's SSRF protection blocks the loopback
-			// httptest server by design.
-			HTTPClient: gt.Some(http.DefaultClient),
-		},
-		SkipHandleVerification: true,
-	}
-	xc := &xrpc.Client{Host: srv.URL, HTTPClient: gt.Some(http.DefaultClient)}
-	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
-		Directory:  directory,
-		StateStore: stateStore,
-		SyncClient: gt.Some(atmossync.NewClient(atmossync.Options{Client: xc, Directory: gt.Some(directory)})),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = verifier.Close() })
-
-	dataDir := t.TempDir()
-	metrics := live.NewMetrics(prometheus.NewRegistry())
-	recorder := newEventLogRecorder()
-	var mu sync.Mutex
-	var appended int
-	consumer, err := live.Open(live.Config{
-		SegmentsDir:    filepath.Join(dataDir, "segments"),
-		Store:          st,
-		SeqKey:         live.SteadySeqKey,
-		CursorKey:      live.CursorKey,
-		RelayURL:       srv.URL,
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Verifier:       verifier,
-		SyncStateStore: stateStore,
-		Metrics:        metrics,
-		OnEvent: func(ev *segment.Event) {
-			recorder.Observe(ev)
-			mu.Lock()
-			appended++
-			mu.Unlock()
-		},
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = consumer.Close() })
-
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-	runErr := make(chan error, 1)
-	go func() { runErr <- consumer.Run(runCtx) }()
+	h.StartConsumer(t, ctx)
 
 	// Wait for the replay fault to fire (all real frames delivered first
 	// by construction), then generate one post-replay commit and wait for
@@ -168,29 +80,22 @@ func runReplayFaultScenario(t *testing.T, fault simhttp.SubscribeReposReplayFaul
 	// everything the relay sent, including the replayed window that
 	// preceded it on the same ordered websocket.
 	require.Eventually(t, func() bool {
-		return faults.SubscribeReposReplaysFired() == 1
+		return h.Faults.SubscribeReposReplaysFired() == 1
 	}, 30*time.Second, 10*time.Millisecond, "replay fault never fired")
 
-	_, err = w.GenerateOneForTest(ctx)
+	_, err := h.World.GenerateOneForTest(ctx)
 	require.NoError(t, err)
-	finalTip := w.CurrentSeq()
-	expected, err := ExpectedEventLogFromFirehose(w, 0, int(finalTip))
+	finalTip := h.World.CurrentSeq()
+	expected, err := ExpectedEventLogFromFirehose(h.World, 0, int(finalTip))
 	require.NoError(t, err)
-	require.True(t, recorder.waitForRowCount(ctx, 0, finalTip, len(expected)),
+	require.True(t, h.Recorder.waitForRowCount(ctx, 0, finalTip, len(expected)),
 		"timed out waiting for %d expected durable rows", len(expected))
 
-	runCancel()
-	select {
-	case <-runErr:
-	case <-time.After(10 * time.Second):
-		t.Fatal("consumer.Run did not return after cancel")
-	}
-	require.NoError(t, consumer.Close())
+	h.StopConsumer(t)
 
-	events, err := ObserveSegments(dataDir)
-	require.NoError(t, err)
-	observed := recorder.RowsByUpstreamCursor(0, finalTip)
-	return events, observed, expected, w, faults, metrics
+	events := h.ObservedEvents(t)
+	observed := h.Recorder.RowsByUpstreamCursor(0, finalTip)
+	return events, observed, expected, h
 }
 
 // assertReplayScenarioContracts runs the #205 contract bundle over one
@@ -199,9 +104,7 @@ func assertReplayScenarioContracts(
 	t *testing.T,
 	events []ObservedEvent,
 	observed, expected []EventLogRow,
-	w *world.World,
-	faults *simhttp.FaultPlan,
-	metrics *live.Metrics,
+	h *liveTailHarness,
 	wantReplayedFrames int,
 ) {
 	t.Helper()
@@ -210,10 +113,10 @@ func assertReplayScenarioContracts(
 	// #231 consumer guard saw at least one replayed #account (proving the
 	// dangerous frame class reached it rather than the run passing on an
 	// account-free window).
-	require.Equal(t, 1, faults.SubscribeReposReplaysFired(), "replay fault must fire exactly once")
-	require.Equal(t, wantReplayedFrames, faults.SubscribeReposReplayedFrames(),
+	require.Equal(t, 1, h.Faults.SubscribeReposReplaysFired(), "replay fault must fire exactly once")
+	require.Equal(t, wantReplayedFrames, h.Faults.SubscribeReposReplayedFrames(),
 		"replay fault must re-deliver the exact scheduled window")
-	require.GreaterOrEqual(t, testutil.ToFloat64(metrics.ReplayedAccountsDrop), 1.0,
+	require.GreaterOrEqual(t, testutil.ToFloat64(h.Metrics.ReplayedAccountsDrop), 1.0,
 		"the replayed window must exercise the #account replay guard")
 
 	// Structural invariants on the physical stream: unique, strictly
@@ -230,11 +133,7 @@ func assertReplayScenarioContracts(
 	// Final state: folding the durable stream converges to world truth.
 	// This is the assertion that catches the #231 corruption — a replayed
 	// account-delete archived above the recreate erases it from the fold.
-	got, err := Reconstruct(EventsSortedBySeq(events))
-	require.NoError(t, err)
-	want, err := GroundTruthFromWorld(w)
-	require.NoError(t, err)
-	require.NoError(t, Compare(want, got),
+	assertLiveTailConverged(t, h, events,
 		"final state must converge to world ground truth under seq replay")
 }
 
@@ -243,9 +142,9 @@ func assertReplayScenarioContracts(
 // verbatim after delivering them once.
 func TestOracle_RelaySeqDuplicates(t *testing.T) {
 	t.Parallel()
-	events, observed, expected, w, faults, metrics := runReplayFaultScenario(t,
+	events, observed, expected, h := runReplayFaultScenario(t,
 		simhttp.SubscribeReposReplayFault{DuplicateLast: 3})
-	assertReplayScenarioContracts(t, events, observed, expected, w, faults, metrics, 3)
+	assertReplayScenarioContracts(t, events, observed, expected, h, 3)
 }
 
 // TestOracle_RelaySeqRegression covers regress-to-K mode: the relay
@@ -253,9 +152,9 @@ func TestOracle_RelaySeqDuplicates(t *testing.T) {
 // lifecycle, everything — as a relay restored from backup would.
 func TestOracle_RelaySeqRegression(t *testing.T) {
 	t.Parallel()
-	events, observed, expected, w, faults, metrics := runReplayFaultScenario(t,
+	events, observed, expected, h := runReplayFaultScenario(t,
 		simhttp.SubscribeReposReplayFault{RegressToSeq: 2})
 	// The pre-replay tip is 5 (2 commits + delete + reactivate + recreate),
 	// so regressing to 2 re-delivers seqs 3..5.
-	assertReplayScenarioContracts(t, events, observed, expected, w, faults, metrics, 3)
+	assertReplayScenarioContracts(t, events, observed, expected, h, 3)
 }

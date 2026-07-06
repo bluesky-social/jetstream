@@ -22,6 +22,8 @@ import (
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/gt"
 	"github.com/klauspost/compress/zstd"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,6 +42,26 @@ func waitForTailBlocked(t *testing.T, b *Tail) {
 	case <-b.blocked:
 	case <-time.After(2 * time.Second):
 		t.Fatal("subscriber did not park at live tip")
+	}
+}
+
+func waitForOptionsUpdates(t *testing.T, m *Metrics, want float64) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if testutil.ToFloat64(m.OptionsUpdates) >= want {
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-deadline:
+			if testutil.ToFloat64(m.OptionsUpdates) >= want {
+				return
+			}
+			t.Fatalf("timed out waiting for options_updates_total >= %v", want)
+		}
 	}
 }
 
@@ -1214,10 +1236,12 @@ func TestHandler_OptionsUpdate_ChangesFilter(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
+	metrics := NewMetrics(prometheus.NewRegistry())
 	h := NewHandler(Subscription{
-		Tail:   b,
-		Store:  st,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Tail:    b,
+		Store:   st,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics: metrics,
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -1243,10 +1267,7 @@ func TestHandler_OptionsUpdate_ChangesFilter(t *testing.T) {
 		}),
 	}
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, update)))
-
-	// Give the reader goroutine a moment to apply the update.
-	time.Sleep(10 * time.Millisecond)
-
+	waitForOptionsUpdates(t, metrics, 1)
 	var seq uint64
 	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.post", 1)
 	publishCommit(t, b, &seq, "did:plc:abc", "app.bsky.feed.like", 2)
@@ -1388,10 +1409,12 @@ func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
 	st := newSteadyStateStore(t)
 	b, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
 	require.NoError(t, err)
+	metrics := NewMetrics(prometheus.NewRegistry())
 	h := NewHandler(Subscription{
-		Tail:   b,
-		Store:  st,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Tail:    b,
+		Store:   st,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics: metrics,
 	})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -1416,8 +1439,17 @@ func TestHandler_OptionsUpdate_UnknownTypeIgnored(t *testing.T) {
 	}
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, unknown)))
 
-	// Subsequent events must still flow.
-	time.Sleep(10 * time.Millisecond)
+	// A following valid update proves the prior unknown frame was read and
+	// ignored before we publish the probe event.
+	update := SubscriberSourcedMessage{
+		Type: SubMessageTypeOptionsUpdate,
+		Payload: jsonMust(t, UpdatePayload{
+			WantedDIDs: []string{"did:plc:still-alive"},
+		}),
+	}
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, jsonMust(t, update)))
+	waitForOptionsUpdates(t, metrics, 1)
+
 	var seq uint64
 	publishIdentity(t, b, &seq, "did:plc:still-alive", 1)
 	frame := readOneFrame(t, ctx, conn)
@@ -1453,9 +1485,16 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
-	// Give the handler time to start the reader goroutine but NOT
-	// time to subscribe (it shouldn't subscribe until hello).
-	time.Sleep(10 * time.Millisecond)
+	// Prove no subscriber registered before hello: an eager (buggy) live
+	// subscriber would park at the empty tip and signal blocked almost
+	// immediately after the dial completes. Without this check, the
+	// publish below could race ahead of an eager subscription and the
+	// NotContains assertion would pass vacuously.
+	select {
+	case <-b.blocked:
+		t.Fatal("subscriber registered before hello")
+	case <-time.After(10 * time.Millisecond):
+	}
 
 	// Append a matching event. The subscriber loop hasn't started yet (it
 	// waits for hello), so it will begin reading at the live tip — which is
@@ -1463,11 +1502,6 @@ func TestHandler_RequireHello_BlocksUntilOptionsUpdate(t *testing.T) {
 	// delivered: live subscribers do not replay history.
 	var seq uint64
 	publishIdentity(t, b, &seq, "did:plc:pre-hello", 1)
-
-	// Wait long enough to ensure that IF the event were going to be
-	// delivered, it would have been (but it won't be, because we
-	// haven't sent hello yet).
-	time.Sleep(10 * time.Millisecond)
 
 	// Send the hello.
 	hello := SubscriberSourcedMessage{
@@ -1742,9 +1776,15 @@ func TestHandler_RequireHello_NoLeakOnClientDisconnect(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 	}
 
-	// Let the handler get into its hello wait. The reader goroutine
-	// is running; the writer-side serve() body is blocked on helloCh.
-	time.Sleep(10 * time.Millisecond)
+	// Give serve() time to reach its hello wait, and assert no subscriber
+	// registered while we did: a blocked signal here means requireHello
+	// subscribed eagerly, and the disconnect below would no longer be
+	// exercising the hello-wait path this test exists to cover.
+	select {
+	case <-b.blocked:
+		t.Fatal("requireHello subscribed before hello")
+	case <-time.After(10 * time.Millisecond):
+	}
 
 	// Client closes without sending hello. The handler's reader goroutine
 	// observes the read error, defer cancel()s the connection context,

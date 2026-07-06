@@ -235,6 +235,16 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                 restart)
                     cmd=(go test "${RACE_FLAG[@]}" ./internal/oracle -run 'TestOracle_RestartCrashPointsDoNotLoseRecords$'
                          -count=1 -timeout "$restart_timeout") ;;
+                restart-multisource)
+                    # Multi-source restart tier (#209): kills m003, the merge
+                    # source-cursor off-by-one. The test forces one
+                    # bootstrap-live event per source segment, kills after a
+                    # later source is flushed but before its cursor commit, and
+                    # asserts a previously committed source is not reprocessed
+                    # during recovery.
+                    cmd=(go test "${RACE_FLAG[@]}" ./internal/oracle
+                         -run 'TestOracle_RestartMultiSourceMergeCursorNoReprocess$'
+                         -count=1 -timeout "$restart_timeout") ;;
                 storefault)
                     # Store-fault tier (#30): kills swallowed-persistence-error
                     # mutants (m006 and kin) at two layers in one `go test`:
@@ -307,6 +317,22 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     cmd=(go test "${RACE_FLAG[@]}" ./internal/ingest/orchestrator
                          -run 'TestInitCompactionWatermarkFloor|TestMerge_FirstInitWatermarkFloor'
                          -count=1 -timeout "$default_timeout") ;;
+                frames)
+                    # Frame-adversity tier (#206): kills mutants that disarm
+                    # the consumer's poison-frame handling (e.g. m042, the
+                    # per-op-drop arm discarding well-formed siblings of a
+                    # partial-CAR commit). Two layers in one `go test`: the
+                    # oracle's frame-fault scenarios drive the REAL consumer
+                    # against the simulator relay with injected garbage /
+                    # unknown-type / error / oversized / swallowed / stripped-
+                    # leaf frames and assert exact-multiset archives, labeled
+                    # counters, and self-heal; the live-package unit tests pin
+                    # the missing-block and malformed-event arms directly.
+                    # Fast (~1s).
+                    cmd=(go test "${RACE_FLAG[@]}"
+                         ./internal/oracle ./internal/ingest/live
+                         -run 'TestOracle_Frame|TestProcessBatch'
+                         -count=1 -short -timeout "$default_timeout") ;;
                 replay)
                     # Relay seq-replay tier (#205): kills mutants that disarm
                     # the replay protections (e.g. m035, the #account replay

@@ -35,6 +35,14 @@ func keyAccountDeleted(idx int) []byte {
 	return fmt.Appendf(nil, "sim/account/%010d/deleted", idx)
 }
 
+// keyAccountRepoUnavailable builds "sim/account/<idx>/repo_unavailable".
+// Absence means getRepo serves the repo normally. Presence is one of
+// "takendown", "suspended", or "deactivated" and makes getRepo return the
+// matching terminal XRPC error.
+func keyAccountRepoUnavailable(idx int) []byte {
+	return fmt.Appendf(nil, "sim/account/%010d/repo_unavailable", idx)
+}
+
 // keyAccountHandleChanges builds "sim/account/<idx>/handle_changes": a
 // big-endian uint64 counter of #identity handle changes emitted for
 // this account. Absence means zero.

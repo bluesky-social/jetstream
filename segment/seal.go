@@ -130,8 +130,16 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 	binary.LittleEndian.PutUint64(headerBytes[4:12], checksum)
 
 	// Footer write.
+	if err := w.cfg.beforeIO(IOOpWrite); err != nil {
+		w.stickyErr = fmt.Errorf("segment: write footer: %w", err)
+		return SealResult{}, w.stickyErr
+	}
 	if _, err := w.file.WriteAt(footerBytes, footerOffset); err != nil {
 		w.stickyErr = fmt.Errorf("segment: write footer: %w", err)
+		return SealResult{}, w.stickyErr
+	}
+	if err := w.cfg.beforeIO(IOOpSync); err != nil {
+		w.stickyErr = fmt.Errorf("segment: fsync footer: %w", err)
 		return SealResult{}, w.stickyErr
 	}
 	if err := syncFile(w.file); err != nil {
@@ -140,6 +148,15 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 	}
 
 	// Header pwrite.
+	if err := w.cfg.beforeIO(IOOpWrite); err != nil {
+		writeErr := fmt.Errorf("segment: write header: %w", err)
+		if truncErr := w.truncateFooterTail(footerOffset); truncErr != nil {
+			w.stickyErr = fmt.Errorf("%w (also: %w)", writeErr, truncErr)
+		} else {
+			w.stickyErr = writeErr
+		}
+		return SealResult{}, w.stickyErr
+	}
 	if _, err := w.file.WriteAt(headerBytes, 0); err != nil {
 		// Footer is durable but header is zero. Truncate the footer
 		// back off so the file is restored to active-state invariants.
@@ -151,6 +168,10 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 		} else {
 			w.stickyErr = writeErr
 		}
+		return SealResult{}, w.stickyErr
+	}
+	if err := w.cfg.beforeIO(IOOpSync); err != nil {
+		w.stickyErr = fmt.Errorf("segment: fsync sealed file: %w", err)
 		return SealResult{}, w.stickyErr
 	}
 	if err := syncFile(w.file); err != nil {

@@ -3,6 +3,7 @@ package http
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
@@ -60,6 +61,14 @@ func newPDSGetRepoHandler(w *world.World, faults *FaultPlan, onServed func(did s
 			http.NotFound(rw, r)
 			return
 		}
+		if status, unavailable, err := w.RepoUnavailableStatus(acct.Index); err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		} else if unavailable {
+			writeXRPCError(rw, http.StatusBadRequest, unavailableGetRepoErrorName(status),
+				fmt.Sprintf("repo %s is %s", did, status))
+			return
+		}
 		rw.Header().Set("Content-Type", "application/vnd.ipld.car")
 		if faults.maybeGetRepoCARTruncation(string(did)) {
 			var buf bytes.Buffer
@@ -100,5 +109,30 @@ func newPDSGetRepoHandler(w *world.World, faults *FaultPlan, onServed func(did s
 		if onServed != nil {
 			onServed(string(did))
 		}
+	})
+}
+
+func unavailableGetRepoErrorName(status string) string {
+	switch status {
+	case "takendown":
+		return "RepoTakendown"
+	case "suspended":
+		return "RepoSuspended"
+	case "deactivated":
+		return "RepoDeactivated"
+	default:
+		return "InvalidRequest"
+	}
+}
+
+func writeXRPCError(rw http.ResponseWriter, status int, name, message string) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	_ = json.NewEncoder(rw).Encode(struct {
+		Error   string `json:"error"`
+		Message string `json:"message,omitempty"`
+	}{
+		Error:   name,
+		Message: message,
 	})
 }

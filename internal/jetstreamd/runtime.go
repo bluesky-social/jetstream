@@ -82,6 +82,12 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.BackfillAsyncFlushWorkers < 0 {
 		return nil, fmt.Errorf("serve: --backfill-async-flush-workers must be >= 0 (BackfillAsyncFlushWorkers must be >= 0), got %d", opts.BackfillAsyncFlushWorkers)
 	}
+	if opts.BootstrapLiveMaxSegmentBytes < 0 {
+		return nil, fmt.Errorf("serve: BootstrapLiveMaxSegmentBytes must be >= 0, got %d", opts.BootstrapLiveMaxSegmentBytes)
+	}
+	if opts.BootstrapLiveMaxEventsPerBlock < 0 {
+		return nil, fmt.Errorf("serve: BootstrapLiveMaxEventsPerBlock must be >= 0, got %d", opts.BootstrapLiveMaxEventsPerBlock)
+	}
 	if opts.FailedRepoRetryInterval < 0 {
 		return nil, fmt.Errorf("serve: --failed-repo-retry-interval must be >= 0 (FailedRepoRetryInterval must be >= 0), got %s", opts.FailedRepoRetryInterval)
 	}
@@ -164,6 +170,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if err := os.MkdirAll(opts.DataDir, 0o755); err != nil {
 		return fail(fmt.Errorf("serve: create data dir %s: %w", opts.DataDir, err))
 	}
+	obs.RegisterDataDirFreeBytes(metrics.Registry, opts.DataDir)
 
 	segmentsDir := filepath.Join(opts.DataDir, "segments")
 	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
@@ -326,43 +333,45 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		// Bare logger; orchestrator.New attaches component=orchestrator
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.
-		Logger:                     processLogger,
-		Metrics:                    orchestrator.NewMetrics(metrics.Registry, tombstones),
-		IngestMetrics:              ingest.NewMetrics(metrics.Registry),
-		LiveMetrics:                live.NewMetrics(metrics.Registry),
-		DropMetrics:                ingest.NewDropMetrics(metrics.Registry),
-		BackfillMetrics:            backfillMetrics,
-		SegmentMetrics:             segmentMetrics,
-		OnEvent:                    onSteadyStateEvent,
-		OnBootstrapLiveEvent:       opts.OnBootstrapLiveEvent,
-		MaxBackfillRepos:           opts.MaxBackfillRepos,
-		BackfillWorkers:            opts.effectiveBackfillWorkers(),
-		BackfillBatchSize:          opts.effectiveBackfillBatchSize(),
-		BackfillAsyncFlushWorkers:  opts.BackfillAsyncFlushWorkers,
-		BackfillRepos:              opts.BackfillRepos,
-		SkipMergeDiscovery:         opts.SkipMergeDiscovery,
-		BackfillRetryBaseDelay:     opts.BackfillRetryBaseDelay,
-		FailedRepoRetryInterval:    opts.FailedRepoRetryInterval,
-		FailedRepoRetryWorkers:     opts.FailedRepoRetryWorkers,
-		FailedRepoRetryHostWorkers: opts.FailedRepoRetryHostWorkers,
-		FailedRepoRetryMaxDelay:    opts.FailedRepoRetryMaxDelay,
-		LiveReconnectBackoff:       opts.LiveReconnectBackoff,
-		LiveDial:                   opts.LiveDial,
-		IngestOnAfterSeal:          mft.OnSegmentSealed,
-		OnSegmentCompacted:         onSegmentCompacted,
-		SegmentManifestChecksums:   mft.SegmentChecksums,
-		ImportSelector:             mft,
-		ImportMetrics:              orchestrator.NewImportMetrics(metrics.Registry),
-		CompactionInterval:         opts.CompactionInterval,
-		CompactionTombstoneCap:     opts.CompactionTombstoneCap,
-		CompactionRewriteWorkers:   opts.CompactionRewriteWorkers,
-		OnCompactionPass:           onCompactionPass,
-		OnBeforeCompactionPass:     opts.OnBeforeCompactionPass,
-		BarrierBeforeCutover:       phaseBarrier(opts.BarrierBeforeCutover),
-		BarrierAfterBootstrap:      phaseBarrier(opts.BarrierAfterBootstrap),
-		BarrierAfterMerge:          phaseBarrier(opts.BarrierAfterMerge),
-		AfterRepoComplete:          opts.AfterRepoComplete,
-		CrashInjector:              opts.CrashInjector,
+		Logger:                         processLogger,
+		Metrics:                        orchestrator.NewMetrics(metrics.Registry, tombstones),
+		IngestMetrics:                  ingest.NewMetrics(metrics.Registry),
+		LiveMetrics:                    live.NewMetrics(metrics.Registry),
+		DropMetrics:                    ingest.NewDropMetrics(metrics.Registry),
+		BackfillMetrics:                backfillMetrics,
+		SegmentMetrics:                 segmentMetrics,
+		OnEvent:                        onSteadyStateEvent,
+		OnBootstrapLiveEvent:           opts.OnBootstrapLiveEvent,
+		MaxBackfillRepos:               opts.MaxBackfillRepos,
+		BackfillWorkers:                opts.effectiveBackfillWorkers(),
+		BackfillBatchSize:              opts.effectiveBackfillBatchSize(),
+		BackfillAsyncFlushWorkers:      opts.BackfillAsyncFlushWorkers,
+		BootstrapLiveMaxSegmentBytes:   opts.BootstrapLiveMaxSegmentBytes,
+		BootstrapLiveMaxEventsPerBlock: opts.BootstrapLiveMaxEventsPerBlock,
+		BackfillRepos:                  opts.BackfillRepos,
+		SkipMergeDiscovery:             opts.SkipMergeDiscovery,
+		BackfillRetryBaseDelay:         opts.BackfillRetryBaseDelay,
+		FailedRepoRetryInterval:        opts.FailedRepoRetryInterval,
+		FailedRepoRetryWorkers:         opts.FailedRepoRetryWorkers,
+		FailedRepoRetryHostWorkers:     opts.FailedRepoRetryHostWorkers,
+		FailedRepoRetryMaxDelay:        opts.FailedRepoRetryMaxDelay,
+		LiveReconnectBackoff:           opts.LiveReconnectBackoff,
+		LiveDial:                       opts.LiveDial,
+		IngestOnAfterSeal:              mft.OnSegmentSealed,
+		OnSegmentCompacted:             onSegmentCompacted,
+		SegmentManifestChecksums:       mft.SegmentChecksums,
+		ImportSelector:                 mft,
+		ImportMetrics:                  orchestrator.NewImportMetrics(metrics.Registry),
+		CompactionInterval:             opts.CompactionInterval,
+		CompactionTombstoneCap:         opts.CompactionTombstoneCap,
+		CompactionRewriteWorkers:       opts.CompactionRewriteWorkers,
+		OnCompactionPass:               onCompactionPass,
+		OnBeforeCompactionPass:         opts.OnBeforeCompactionPass,
+		BarrierBeforeCutover:           phaseBarrier(opts.BarrierBeforeCutover),
+		BarrierAfterBootstrap:          phaseBarrier(opts.BarrierAfterBootstrap),
+		BarrierAfterMerge:              phaseBarrier(opts.BarrierAfterMerge),
+		AfterRepoComplete:              opts.AfterRepoComplete,
+		CrashInjector:                  opts.CrashInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			// Fires after the steady writer opens and before any producer
 			// (live consumer, retry runner, compactor) starts, so the sink

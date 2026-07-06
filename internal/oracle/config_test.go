@@ -31,7 +31,7 @@ func TestDefaultLifecycleConfigUsesFastModeUnderShort(t *testing.T) {
 	cfg, err := defaultLifecycleConfig(lookupEnvMap(nil), true)
 	require.NoError(t, err)
 	require.Equal(t, "fast", cfg.Mode)
-	require.Equal(t, 4, cfg.Accounts)
+	require.Equal(t, 8, cfg.Accounts)
 	require.Equal(t, 10, cfg.MaxInitialRecords)
 }
 
