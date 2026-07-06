@@ -45,6 +45,11 @@ type HandlerOptions struct {
 	// archived every frame up to it. The path is namespaced off the
 	// atproto xrpc surface so it cannot collide with a real lexicon method.
 	EnableFirehoseTip bool
+
+	// ListReposPageLimit caps com.atproto.sync.listRepos page size below the
+	// client-requested limit. Zero means no test cap. This lets e2e tests force
+	// pagination without constructing thousands of simulator accounts.
+	ListReposPageLimit int
 }
 
 // NewHandlerWithOptions builds the simulator's HTTP handler, optionally
@@ -55,7 +60,7 @@ type HandlerOptions struct {
 func NewHandlerWithOptions(w *world.World, publicURL string, opts HandlerOptions) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /xrpc/com.atproto.sync.getRepo", newPDSGetRepoHandler(w, opts.Faults, opts.OnGetRepoServed))
-	mux.Handle("GET /xrpc/com.atproto.sync.listRepos", newRelayListReposHandler(w, opts.Faults))
+	mux.Handle("GET /xrpc/com.atproto.sync.listRepos", newRelayListReposHandler(w, opts.Faults, opts.ListReposPageLimit))
 	mux.Handle("GET /xrpc/com.atproto.sync.subscribeRepos", newRelaySubscribeReposHandler(w, opts.Faults))
 	if opts.EnableFirehoseTip {
 		mux.Handle("GET "+oracleFirehoseTipURLPath, newFirehoseTipHandler(w))

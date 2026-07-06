@@ -45,6 +45,8 @@ func TestClassifyBackfillError(t *testing.T) {
 	require.Equal(t, ErrorClassInvalidPDS, classifyBackfillError(errors.New("missing AtprotoPersonalDataServer endpoint")))
 	require.Equal(t, ErrorClassHTTP429, classifyBackfillError(errors.New("xrpc: HTTP 429: rate limited")))
 	require.Equal(t, ErrorClassHTTP5xx, classifyBackfillError(errors.New("xrpc: HTTP 503: unavailable")))
+	require.Equal(t, ErrorClassHTTP429, classifyBackfillError(&xrpc.Error{StatusCode: 429, Name: "RateLimitExceeded"}))
+	require.Equal(t, ErrorClassHTTP5xx, classifyBackfillError(&xrpc.Error{StatusCode: 503, Name: "Unavailable"}))
 	require.Equal(t, ErrorClassTimeout, classifyBackfillError(context.DeadlineExceeded))
 	require.Equal(t, ErrorClassCAR, classifyBackfillError(errors.New("car: invalid header")))
 	require.Equal(t, ErrorClassVerification, classifyBackfillError(errors.New("verify commit: signature mismatch")))

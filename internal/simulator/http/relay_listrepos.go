@@ -23,7 +23,7 @@ type listReposOutputEntry struct {
 // newRelayListReposHandler serves com.atproto.sync.listRepos. Cursor
 // is the stringified next-start index; "" means start at 0. Limit is
 // capped at 1000 (the protocol max).
-func newRelayListReposHandler(w *world.World, faults *FaultPlan) http.Handler {
+func newRelayListReposHandler(w *world.World, faults *FaultPlan, pageLimitCap int) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		cursor := q.Get("cursor")
@@ -45,6 +45,9 @@ func newRelayListReposHandler(w *world.World, faults *FaultPlan) http.Handler {
 			}
 			limit = n
 		}
+		if pageLimitCap > 0 && limit > pageLimitCap {
+			limit = pageLimitCap
+		}
 		mode, faulted := faults.maybeListReposFault(cursor)
 		pageStart := start
 		pageLimit := limit
@@ -60,7 +63,7 @@ func newRelayListReposHandler(w *world.World, faults *FaultPlan) http.Handler {
 			return
 		}
 		if faulted && mode == ListReposFaultDuplicatePreviousPage {
-			next = min(start+limit, w.AccountCount())
+			next = start
 		}
 		out := listReposOutput{
 			Repos: make([]listReposOutputEntry, len(entries)),

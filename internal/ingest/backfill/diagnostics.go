@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -234,6 +235,15 @@ func classifyBackfillError(err error) ErrorClass {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ErrorClassTimeout
+	}
+	var xerr *xrpc.Error
+	if errors.As(err, &xerr) {
+		switch {
+		case xerr.StatusCode == http.StatusTooManyRequests:
+			return ErrorClassHTTP429
+		case xerr.StatusCode >= 500 && xerr.StatusCode < 600:
+			return ErrorClassHTTP5xx
+		}
 	}
 
 	msg := strings.ToLower(err.Error())

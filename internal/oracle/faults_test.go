@@ -251,7 +251,8 @@ func TestBuildSwarmFaultPlanSkipsRepoUnavailableDIDs(t *testing.T) {
 	}
 	plan, err := BuildSwarmFaultPlan(w, cfg)
 	require.NoError(t, err)
-	require.Equal(t, map[string]int{string(acct.DID): 2}, plan.GetRepoHTTPFailures)
+	require.Equal(t, map[string]int{string(acct.DID): 1}, plan.GetRepoHTTPFailures)
+	require.Equal(t, map[string]int{string(acct.DID): 1}, plan.GetRepoResponseFailures)
 	require.Equal(t, map[string]int{string(acct.DID): 1}, plan.GetRepoCARTruncations)
 }
 

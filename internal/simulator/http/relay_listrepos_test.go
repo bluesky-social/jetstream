@@ -60,7 +60,7 @@ func TestListReposFaults_ModelDuplicateLoopAndShrinkPages(t *testing.T) {
 
 	page10 := getListReposRaw(t, srv.URL, "10", 10)
 	require.Len(t, page10.Repos, 10)
-	require.Equal(t, "20", page10.Cursor, "duplicate-previous-page still advances the requested cursor")
+	require.Equal(t, "10", page10.Cursor, "duplicate-previous-page retries the requested cursor after serving the previous page")
 	require.Equal(t, 1, faults.ListReposFaultsFired("10"))
 
 	page20 := getListReposRaw(t, srv.URL, "20", 10)
