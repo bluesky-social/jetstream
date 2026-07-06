@@ -252,10 +252,7 @@ func initializeNewSegment(f *os.File, cfg Config) error {
 }
 
 func (c Config) beforeIO(op IOOp) error {
-	if c.IOFaultInjector == nil {
-		return nil
-	}
-	return c.IOFaultInjector.BeforeSegmentIO(c.Path, op)
+	return beforeSegmentIO(c.IOFaultInjector, c.Path, op)
 }
 
 // resumeExistingSegment validates that f is a well-formed segment

@@ -17,7 +17,10 @@ const (
 
 type RewriteOptions struct {
 	CrashInjector CrashInjector
-	CandidateDIDs []string
+	// IOFaultInjector is a test-only seam consulted before every tmp-file
+	// write, fsync, and the commit rename. Nil in production.
+	IOFaultInjector IOFaultInjector
+	CandidateDIDs   []string
 }
 
 type RewriteResult struct {
@@ -145,14 +148,20 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 		}
 	}()
 
-	if err := initializeNewSegment(f, Config{Path: tmp}); err != nil {
+	if err := initializeNewSegment(f, Config{Path: tmp, IOFaultInjector: opts.IOFaultInjector}); err != nil {
 		return RewriteResult{}, err
 	}
 	for _, b := range outBlocks {
 		var lenBuf [8]byte
 		binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(b.frame)))
+		if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
+			return RewriteResult{}, fmt.Errorf("segment: rewrite write frame len: %w", err)
+		}
 		if _, err := f.Write(lenBuf[:]); err != nil {
 			return RewriteResult{}, fmt.Errorf("segment: rewrite write frame len: %w", err)
+		}
+		if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
+			return RewriteResult{}, fmt.Errorf("segment: rewrite write frame: %w", err)
 		}
 		if _, err := f.Write(b.frame); err != nil {
 			return RewriteResult{}, fmt.Errorf("segment: rewrite write frame: %w", err)
@@ -174,14 +183,23 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	newHeader.Checksum = checksum
 	binary.LittleEndian.PutUint64(headerBytes[4:12], checksum)
 
+	if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
+		return RewriteResult{}, fmt.Errorf("segment: rewrite write footer: %w", err)
+	}
 	if _, err := f.WriteAt(footerBytes, footerOffset); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite write footer: %w", err)
+	}
+	if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
+		return RewriteResult{}, fmt.Errorf("segment: rewrite write header: %w", err)
 	}
 	if _, err := f.WriteAt(headerBytes, 0); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite write header: %w", err)
 	}
 	if err := simulateRewriteCrash(opts, CrashPointRewriteTempWritten); err != nil {
 		return RewriteResult{}, err
+	}
+	if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpSync); err != nil {
+		return RewriteResult{}, fmt.Errorf("segment: rewrite fsync tmp: %w", err)
 	}
 	if err := syncFile(f); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite fsync tmp: %w", err)
@@ -192,13 +210,16 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if err := f.Close(); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite close tmp: %w", err)
 	}
+	if err := beforeSegmentIO(opts.IOFaultInjector, path, IOOpRename); err != nil {
+		return RewriteResult{}, fmt.Errorf("segment: rewrite rename: %w", err)
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite rename: %w", err)
 	}
 	if err := simulateRewriteCrash(opts, CrashPointRewriteRenamed); err != nil {
 		return RewriteResult{}, err
 	}
-	if err := syncParentDir(path, nil); err != nil {
+	if err := syncParentDir(path, opts.IOFaultInjector); err != nil {
 		return RewriteResult{}, err
 	}
 	if err := simulateRewriteCrash(opts, CrashPointRewriteDirSynced); err != nil {
