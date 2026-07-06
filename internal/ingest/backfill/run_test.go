@@ -245,6 +245,7 @@ type stubServer struct {
 	// saw on its first listRepos request. Lets tests verify that a
 	// pre-seeded resume cursor is passed through correctly.
 	firstListReposCursor   string
+	firstListReposLimit    string
 	firstListReposCursorMu sync.Mutex
 	firstListReposCursorOK bool
 
@@ -286,6 +287,7 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 		s.firstListReposCursorMu.Lock()
 		if !s.firstListReposCursorOK {
 			s.firstListReposCursor = cursor
+			s.firstListReposLimit = r.URL.Query().Get("limit")
 			s.firstListReposCursorOK = true
 		}
 		s.firstListReposCursorMu.Unlock()
@@ -885,13 +887,9 @@ func TestRun_PersistsCursorAfterDrain(t *testing.T) {
 }
 
 // TestRun_MaxRepos_StopsEarly is the debug-flag smoke test.
-// With MaxRepos=1 and several fixtures, Run must return nil
-// (not a context.Canceled error) so the orchestrator can advance
-// to the merge phase. We only assert that at least the limit was
-// reached and Run returned nil; how many extra repos completed
-// before the cancel propagated is implementation-dependent
-// (atmos worker-pool scheduling and HTTP timing) and not the
-// contract this test pins.
+// With MaxRepos=1 and several fixtures, Run must request only one
+// listRepos entry, download exactly one repo, and return nil so the
+// orchestrator can advance to the merge phase.
 func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 	t.Parallel()
 
@@ -931,8 +929,6 @@ func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 	}
 	require.NoError(t, Run(t.Context(), cfg))
 
-	// At least one repo must have reached Complete; otherwise
-	// OnProgress never fired and the limit logic is dead code.
 	bf := NewStore(db, nil)
 	completed := 0
 	for _, did := range dids {
@@ -942,7 +938,10 @@ func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 			completed++
 		}
 	}
-	require.GreaterOrEqual(t, completed, 1, "MaxRepos=1 should have completed at least one repo")
+	require.Equal(t, 1, completed, "MaxRepos=1 should complete exactly one repo")
+	require.Equal(t, int64(1), srv.listReposHit.Load(), "MaxRepos=1 should only need one listRepos page")
+	require.Equal(t, "1", srv.firstListReposLimit, "MaxRepos=1 should pass limit=1 to listRepos")
+	require.Equal(t, int64(1), srv.getRepoHit.Load(), "MaxRepos=1 should download exactly one repo")
 }
 
 // TestRun_PassesSavedCursorToRelay confirms the resume path: a

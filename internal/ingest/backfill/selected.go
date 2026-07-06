@@ -82,8 +82,10 @@ func (r *selectedRunner) reconcileAndProcess(ctx context.Context, did atmos.DID)
 		}
 	}
 
-	if err := r.recordIdentityMetadata(ctx, did); err != nil {
-		return err
+	if r.cfg.IdentityResolver != nil {
+		if err := r.recordIdentityMetadata(ctx, did); err != nil {
+			return err
+		}
 	}
 	if rec.State == atmosbackfill.StateComplete {
 		return nil

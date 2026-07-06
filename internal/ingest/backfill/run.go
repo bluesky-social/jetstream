@@ -7,12 +7,10 @@ package backfill
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
@@ -64,18 +62,15 @@ type Config struct {
 	CrashInjector crashpoint.Injector
 
 	// MaxRepos, when > 0, is a debug-only ceiling on the number of
-	// repos this Run will fully download before stopping early and
-	// returning nil so the orchestrator can advance to the merge
-	// phase. Counts atmos progress callbacks (Stats.Completed), i.e.
-	// repos transitioned to StateComplete during this Run; pre-Complete
-	// repos from a prior Run are skipped before they reach the
-	// counter and do not count.
+	// active, not-yet-complete listRepos entries this Run will select
+	// and download before returning nil so the orchestrator can advance
+	// to the merge phase. Pre-Complete repos from a prior Run are skipped
+	// before they reach the counter and do not count.
 	//
 	// Intended for fast local-dev iteration against the production
-	// relay (millions of users); leave 0 in production. Cursor
-	// advancement remains batch/checkpoint-bound and may advance for a
-	// fully completed durable batch, but MaxRepos does not force
-	// terminal empty-cursor advancement.
+	// relay (millions of users); leave 0 in production. This mode does
+	// not advance the durable listRepos cursor because it is an intentional
+	// debug-scoped partial crawl, not resumable whole-network bootstrap.
 	MaxRepos int
 
 	// BackfillWorkers, when > 0, overrides atmos's repo download worker count.
@@ -272,12 +267,57 @@ func Run(ctx context.Context, cfg Config) error {
 			logger.InfoContext(ctx, "resuming from saved cursor", "cursor", startCursor)
 		}
 
-		// runCtx is what we hand to the atmos engine. We cancel it for
-		// local writer failures and for MaxRepos so workers stop before
-		// atmos can record a per-DID failure for infrastructure state.
-		// limitTripped distinguishes "debug ceiling reached" (return nil)
-		// from "outer ctx cancelled" (propagate).
-		var limitTripped atomic.Bool
+		if cfg.MaxRepos > 0 {
+			if err := DeleteBootstrapLastListReposCursor(cfg.Store); err != nil {
+				return fmt.Errorf("backfill: limited repo mode: %w", err)
+			}
+			logger.InfoContext(ctx, "starting limited listRepos backfill",
+				"relay", cfg.RelayURL,
+				"max_repos", cfg.MaxRepos,
+			)
+			repos, err := collectLimitedListRepos(runCtx, sc, st, startCursor, cfg.MaxRepos)
+			if err != nil {
+				if fatal := loadFatal(); fatal != nil {
+					logger.ErrorContext(ctx, "limited listRepos backfill aborted after local writer error", "err", fatal)
+					return fmt.Errorf("backfill: %w", fatal)
+				}
+				logger.ErrorContext(ctx, "limited listRepos backfill discovery returned error", "err", err)
+				return fmt.Errorf("backfill: %w", err)
+			}
+			logger.InfoContext(ctx, "collected limited listRepos backfill repos",
+				"requested", cfg.MaxRepos,
+				"repos", len(repos),
+			)
+			err = runSelectedRepos(runCtx, selectedReposConfig{
+				Repos:          repos,
+				Store:          st,
+				Handler:        handler,
+				SyncClient:     sc,
+				Metrics:        cfg.Metrics,
+				MaxRetries:     cfg.MaxRetries,
+				RetryBaseDelay: cfg.RetryBaseDelay,
+				RetryMaxDelay:  cfg.RetryMaxDelay,
+				OnError: func(did atmos.DID, err error) {
+					if !shouldLogBackfillError(err) {
+						return
+					}
+					logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
+				},
+			})
+			if err != nil {
+				if fatal := loadFatal(); fatal != nil {
+					logger.ErrorContext(ctx, "limited listRepos backfill aborted after local writer error", "err", fatal)
+					return fmt.Errorf("backfill: %w", fatal)
+				}
+				logger.ErrorContext(ctx, "limited listRepos backfill returned error", "err", err)
+				return fmt.Errorf("backfill: %w", err)
+			}
+			if fatal := loadFatal(); fatal != nil {
+				logger.ErrorContext(ctx, "limited listRepos backfill aborted after local writer error", "err", fatal)
+				return fmt.Errorf("backfill: %w", fatal)
+			}
+			return drainDurability()
+		}
 
 		engineOpts := atmosbackfill.Options{
 			SyncClient:      sc,
@@ -294,15 +334,6 @@ func Run(ctx context.Context, cfg Config) error {
 			}),
 			OnProgress: gt.Some(func(stats atmosbackfill.Stats) {
 				cfg.Metrics.setProgressCompleted(stats.Completed)
-				if cfg.MaxRepos > 0 && stats.Completed >= int64(cfg.MaxRepos) {
-					if limitTripped.CompareAndSwap(false, true) {
-						logger.WarnContext(ctx, "max-backfill-repos limit reached; stopping backfill early",
-							"limit", cfg.MaxRepos,
-							"completed", stats.Completed,
-						)
-						cancelRun()
-					}
-				}
 			}),
 		}
 
@@ -334,13 +365,6 @@ func Run(ctx context.Context, cfg Config) error {
 				logger.ErrorContext(ctx, "engine aborted after local writer error", "err", fatal)
 				return fmt.Errorf("backfill: %w", fatal)
 			}
-			// Internal limit-driven cancel: the outer ctx is still healthy,
-			// only our derived runCtx was cancelled. Treat as a clean drain
-			// so the orchestrator advances to merge.
-			if limitTripped.Load() && errors.Is(err, context.Canceled) && ctx.Err() == nil {
-				logger.InfoContext(ctx, "engine drained early via max-backfill-repos")
-				return drainDurability()
-			}
 			logger.ErrorContext(ctx, "engine returned error", "err", err)
 			return fmt.Errorf("backfill: %w", err)
 		}
@@ -352,6 +376,39 @@ func Run(ctx context.Context, cfg Config) error {
 		logger.InfoContext(ctx, "engine drained")
 		return finishCleanEngineDrain()
 	})
+}
+
+func collectLimitedListRepos(ctx context.Context, sc *atmossync.Client, st *Store, startCursor string, maxRepos int) ([]atmos.DID, error) {
+	if maxRepos <= 0 {
+		return nil, nil
+	}
+
+	repos := make([]atmos.DID, 0, maxRepos)
+	for page, err := range sc.ListRepos(ctx, int64(maxRepos), startCursor) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("limited listRepos: %w", err)
+		}
+		for _, entry := range page.Entries {
+			if !entry.Active {
+				continue
+			}
+			rec, err := st.Lookup(ctx, entry.DID)
+			if err != nil {
+				return nil, fmt.Errorf("limited listRepos lookup %s: %w", entry.DID, err)
+			}
+			if rec.State == atmosbackfill.StateComplete {
+				continue
+			}
+			repos = append(repos, entry.DID)
+			if len(repos) >= maxRepos {
+				return repos, nil
+			}
+		}
+	}
+	return repos, nil
 }
 
 func (cfg Config) validate() error {

@@ -218,7 +218,7 @@ func serveCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:    "max-backfill-repos",
-				Usage:   "DEBUG ONLY: stop the backfill phase after N successfully downloaded repos and proceed to merge. 0 = unlimited (production default). Intended for fast local-dev iteration against the production relay's millions of users; safe to leave set in production but unnecessary there.",
+				Usage:   "DEBUG ONLY: select and download up to N repos from listRepos and proceed to merge. 0 = unlimited (production default).",
 				Sources: cli.EnvVars("JETSTREAM_MAX_BACKFILL_REPOS"),
 				Value:   0,
 			},
@@ -248,7 +248,7 @@ func serveCommand() *cli.Command {
 			},
 			&cli.BoolFlag{
 				Name:    "skip-merge-discovery",
-				Usage:   "DEBUG ONLY: skip the end-of-merge listRepos rescan that discovers accounts created during the merge phase. Intended for fast local-dev iteration against the production relay's millions of users; safe to leave set in production but unnecessary there.",
+				Usage:   "DEBUG ONLY: skip the end-of-merge listRepos rescan that discovers accounts created during the merge phase. Automatically enabled by --max-backfill-repos and --backfill-repos for fast local iteration.",
 				Sources: cli.EnvVars("JETSTREAM_SKIP_MERGE_DISCOVERY"),
 				Value:   false,
 			},
@@ -401,6 +401,11 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		return jetstreamd.Options{}, fmt.Errorf("serve: --backfill-repos cannot be combined with --max-backfill-repos")
 	}
 
+	skipMergeDiscovery := cmd.Bool("skip-merge-discovery")
+	if maxBackfillRepos > 0 || len(backfillRepos) > 0 {
+		skipMergeDiscovery = true
+	}
+
 	return jetstreamd.Options{
 		PublicAddr:                     cmd.String("addr"),
 		DebugAddr:                      cmd.String("debug-addr"),
@@ -418,7 +423,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		BackfillBatchSize:              cmd.Int("backfill-batch-size"),
 		BackfillAsyncFlushWorkers:      cmd.Int("backfill-async-flush-workers"),
 		BackfillRepos:                  backfillRepos,
-		SkipMergeDiscovery:             cmd.Bool("skip-merge-discovery"),
+		SkipMergeDiscovery:             skipMergeDiscovery,
 		FailedRepoRetryInterval:        cmd.Duration("failed-repo-retry-interval"),
 		FailedRepoRetryWorkers:         cmd.Int("failed-repo-retry-workers"),
 		FailedRepoRetryHostWorkers:     cmd.Int("failed-repo-retry-host-workers"),

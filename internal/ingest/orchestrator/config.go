@@ -118,10 +118,10 @@ type Config struct {
 	// production leaves it nil so bootstrap events are not user-visible.
 	OnBootstrapLiveEvent func(*segment.Event)
 
-	// MaxBackfillRepos, when > 0, caps the bootstrap-phase backfill
-	// engine at this many fully-downloaded repos and then advances to
-	// the merge phase. Debug-only knob for fast local-dev iteration
-	// against a relay with millions of users; leave 0 in production.
+	// MaxBackfillRepos, when > 0, limits bootstrap to this many selected
+	// listRepos entries and then advances to the merge phase. Debug-only
+	// knob for fast local-dev iteration against a relay with millions of
+	// users; leave 0 in production.
 	// See backfill.Config.MaxRepos for the precise semantics.
 	MaxBackfillRepos int
 

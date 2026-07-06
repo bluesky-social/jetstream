@@ -362,7 +362,36 @@ func TestServeOptionsFromCLI_MaxBackfillReposOverride(t *testing.T) {
 		"--max-backfill-repos=17",
 	}))
 	require.Equal(t, 17, opts.MaxBackfillRepos)
+	require.Equal(t, jetstreamd.DefaultBackfillBatchSize, opts.BackfillBatchSize)
 	require.Empty(t, opts.BackfillRepos)
+	require.True(t, opts.SkipMergeDiscovery)
+}
+
+func TestServeOptionsFromCLI_BackfillReposSkipsMergeDiscoveryByDefault(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp()
+	var opts jetstreamd.Options
+	for _, cmd := range app.Commands {
+		if cmd.Name != "serve" {
+			continue
+		}
+		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			opts, err = serveOptionsFromCommand(cmd)
+			return err
+		}
+		break
+	}
+
+	require.NoError(t, app.Run(t.Context(), []string{
+		"jetstream", "serve",
+		"--backfill-repos=did:plc:aaa",
+	}))
+	require.Equal(t, 0, opts.MaxBackfillRepos)
+	require.Equal(t, jetstreamd.DefaultBackfillBatchSize, opts.BackfillBatchSize)
+	require.Equal(t, []atmos.DID{"did:plc:aaa"}, opts.BackfillRepos)
+	require.True(t, opts.SkipMergeDiscovery)
 }
 
 func TestServeOptionsFromCLI_RejectsDuplicateBackfillRepos(t *testing.T) {
