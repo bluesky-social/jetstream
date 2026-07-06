@@ -202,6 +202,47 @@ func TestTail_RegressionResetFloorsAtDurableTip(t *testing.T) {
 	require.Equal(t, uint64(50), batch[0].Event.Seq)
 }
 
+// TestTail_ForwardGapResetFloorsAtDurableTip covers the sibling of the
+// backwards-regression case above: a forward gap also means the ring dropped a
+// durable history window that it will never replay hot. If the durable writer
+// ran far ahead before the reset event reached the tail, cursors between the
+// reset tip and NextSeq must go cold instead of parking forever.
+func TestTail_ForwardGapResetFloorsAtDurableTip(t *testing.T) {
+	t.Parallel()
+	cold := func(_ context.Context, cursor uint64, _ int) ([]*Entry, uint64, error) {
+		return []*Entry{newEntry(gapEvent(cursor))}, cursor + 1, nil
+	}
+	tl := newTail(tailConfig{
+		hotBytes: 1 << 20,
+		cold:     cold,
+		nextSeq:  func() uint64 { return 100 }, // bypassing producer ran far ahead
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	for seq := uint64(10); seq <= 14; seq++ {
+		tl.Append(gapEvent(seq))
+	}
+	tl.Append(gapEvent(50)) // forward gap reset; durable rows 51..99 exist on disk
+
+	done := make(chan struct{})
+	var batch []*Entry
+	var err error
+	go func() {
+		defer close(done)
+		batch, _, err = tl.ReadFrom(context.Background(), 60, 1)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cursor=60: ReadFrom parked on a durable seq below the writer tip after a forward gap reset")
+	}
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+	require.Equal(t, uint64(60), batch[0].Event.Seq)
+
+	require.Equal(t, uint64(100), tl.Tip(),
+		"post-reset: a fresh live subscriber must start at the durable live edge, not the reset ring tip")
+}
+
 // TestTail_TipHonorsRegressFloor: Tip() seeds fresh no-cursor (live)
 // subscribers, whose contract is "start at the live edge; never replay
 // history". After a regression reset the ring tip sits below regressFloor,

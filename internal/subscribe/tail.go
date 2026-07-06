@@ -46,13 +46,11 @@ type Tail struct {
 	nextSeq func() uint64
 	logger  *slog.Logger
 
-	// regressFloor is the pre-reset ring tip of the most recent REGRESSING
-	// append (a #244-class duplicate/backwards feed). Every seq below it was
-	// once resident — hence already appended to the durable writer — so a
-	// ring-miss below it must go cold, not park on notify: after a backwards
-	// reset the ring will never replay (reset point, old tip) hot, and on an
-	// idle stream the parked reader would be stranded forever. Zero when no
-	// regression has occurred. Guarded by mu.
+	// regressFloor is the durable live-edge floor of the most recent non-dense
+	// append (a #244-class bypass/gap/regression). A reset means the ring will
+	// never replay part of the durable history hot; ring misses below this
+	// floor must go cold instead of parking on notify forever. Zero when no
+	// reset has established a floor. Guarded by mu.
 	regressFloor uint64
 
 	metrics   *Metrics
@@ -132,14 +130,16 @@ func (t *Tail) Append(ev *segment.Event) {
 	oldTip := t.ring.tip()
 	hadData := t.ring.has()
 	reset := t.ring.append(e)
-	if reset && hadData && cp.Seq < oldTip {
-		// Backwards reset: the ring will never again serve seqs at/above the
-		// reset point that the durable writer already owns, and a regression by
-		// definition means a producer is bypassing the tail — so the writer's
-		// NextSeq may be far above the old ring tip. Everything below it is
-		// cold-readable; raise the cold floor to max(oldTip, NextSeq) so
-		// ReadFrom sends those cursors to disk instead of parking them forever.
-		floor := oldTip
+	if reset && hadData {
+		// A non-dense reset means at least one durable-writer producer bypassed
+		// the tail, so the writer's NextSeq may be far above either side of the
+		// reset. The reset ring will not replay the dropped durable window hot;
+		// raise the cold floor to the durable live edge when available so
+		// ReadFrom sends those cursors to disk instead of parking forever.
+		floor := t.ring.tip()
+		if oldTip > floor {
+			floor = oldTip
+		}
 		if t.nextSeq != nil {
 			if next := t.nextSeq(); next > floor {
 				floor = next
