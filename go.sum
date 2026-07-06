@@ -52,8 +52,8 @@ github.com/jcalabro/atmos v0.2.13 h1:aOZH7QKiuTFayzQHbRrxDy+6SPS4WkAMRQnn6zZ/RSQ
 github.com/jcalabro/atmos v0.2.13/go.mod h1:Y4JMdKpw+fDp75ASvLVUAwA/dXDpbN1aNv/JzqsjfMk=
 github.com/jcalabro/gloom v0.1.0 h1:Z8VTAMrdRNXr11tt9c5pIpDDJxAHg3QIBrHFt5x2I2M=
 github.com/jcalabro/gloom v0.1.0/go.mod h1:6uAawINljQYLN3a2YsekJ8LDYT/SobmJyfeKrSjHVx0=
-github.com/jcalabro/gt v0.0.13 h1:eYqMquSBWU/QXxwrAzWlOkPXAaw04nJBCZYA61LdueI=
-github.com/jcalabro/gt v0.0.13/go.mod h1:iBnF7jE8LG8mW0zjXVYTuXoT+L9UfwP7RNgMrmuuOTs=
+github.com/jcalabro/gt v0.0.14 h1:m5Go+0xX+Atb3PbS1rLuNrFWiO0w1bdZlAoxbBITzXc=
+github.com/jcalabro/gt v0.0.14/go.mod h1:iBnF7jE8LG8mW0zjXVYTuXoT+L9UfwP7RNgMrmuuOTs=
 github.com/jcalabro/jttp v0.0.6 h1:LT3SXo7Fw+E1eL+OZK4Gsm1Ravv7DG5dur9x1YfH6GM=
 github.com/jcalabro/jttp v0.0.6/go.mod h1:la0ParzfXnWxZCwzJ0VXT3Vr2SyDtEhB/yyG3zSVgME=
 github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=
