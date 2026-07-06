@@ -10,8 +10,9 @@
 // upstream firehose events to segment.Events lives in events.go
 // as a pure function so it is straightforward to unit-test
 // against arbitrary input. Cursor durability is delegated to the
-// writer's OnAfterFlush hook so persisted cursor ≤ durable events
-// holds for free, as DESIGN.md §3.1.1 requires.
+// writer's durable batch hook so persisted cursor ≤ durable events
+// holds in the same synced Pebble commit as seq/next, as DESIGN.md §3.1.1
+// requires.
 //
 // Sync 1.1 verification is required: Config.Verifier must be a
 // non-nil *sync.Verifier or Open returns ErrInvalidConfig. The

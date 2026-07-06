@@ -3,11 +3,12 @@ package subscribe
 import (
 	"sync"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
-// Entry is one event held in the hot ring: the decoded event plus a
-// lazily-memoized wire encoding shared across every caught-up subscriber.
+// Entry is one event visible to subscribe readers: the decoded event plus a
+// lazily-memoized wire encoding shared across subscribers while it is resident.
 // Encode runs at most once per Entry; the result (bytes or sentinel error)
 // is cached so the shared path reproduces deliverEvent's branching exactly.
 type Entry struct {
@@ -40,6 +41,21 @@ type Entry struct {
 // alias a shared decompressed block buffer).
 func newEntry(ev *segment.Event) *Entry {
 	return &Entry{Event: ev, encodeFn: Encode}
+}
+
+func entryFromReadLog(le *ingest.ReadLogEntry) *Entry {
+	if memo := le.LoadMemo(); memo != nil {
+		if e, ok := memo.(*Entry); ok {
+			return e
+		}
+	}
+	e := newEntry(le.Event())
+	if memo := le.LoadOrStoreMemo(e); memo != nil {
+		if got, ok := memo.(*Entry); ok {
+			return got
+		}
+	}
+	return e
 }
 
 // Encoded returns the memoized wire encoding for this entry. The first
@@ -100,19 +116,7 @@ func (e *Entry) CompressedV2() ([]byte, error) {
 	return e.compressedV2Body, e.compressedV2Err
 }
 
-// approxBytes estimates the entry's memory footprint for the hot ring's
-// byte budget: the payload plus the small fixed-size string fields. The
-// memoized encodings are intentionally excluded — they are bounded by the
-// same ring (evicted FIFO with the entry) and counting them would
-// double-count the shared bytes. An entry may memoize up to four payloads
-// (v1/v2 JSON × plain/zstd) when a mix of subscriber types is
-// connected; the off-budget overhang stays O(ring length).
-func (e *Entry) approxBytes() int {
-	ev := e.Event
-	return len(ev.Payload) + len(ev.DID) + len(ev.Collection) +
-		len(ev.Rkey) + len(ev.Rev) + entryFixedOverhead
-}
-
 // entryFixedOverhead approximates the per-entry struct + pointer overhead
-// so a flood of tiny events still has a bounded count in the ring.
+// so a flood of tiny events still has a bounded count in the block cache's
+// byte accounting.
 const entryFixedOverhead = 128

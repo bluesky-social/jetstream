@@ -53,13 +53,15 @@ func TestWalkFromCursor_SealedThenActive(t *testing.T) {
 	st, w := openWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
 
-	// 5 events appended into the active segment's pending block.
+	// 5 events appended into the active segment and flushed so cold replay can
+	// serve them from the active file without reading pending memory.
 	for i := 10; i < 15; i++ {
 		require.NoError(t, w.Append(context.Background(), &segment.Event{
 			WitnessedAt: int64(i * 1000), Kind: segment.KindCreate,
 			DID: "did:plc:active", Payload: []byte{0xa0},
 		}))
 	}
+	require.NoError(t, w.Flush(context.Background()))
 
 	var got []uint64
 	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{

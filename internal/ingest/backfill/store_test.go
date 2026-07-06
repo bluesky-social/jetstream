@@ -256,7 +256,7 @@ func TestStore_OnCompleteQueuesWhenBatcherConfigured(t *testing.T) {
 	require.Len(t, cb.queued, 1)
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(ctx, b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(ctx, b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -779,7 +779,7 @@ func TestStore_StaleActiveFlipCannotRegressCompletedStatus(t *testing.T) {
 	require.NoError(t, cb.QueueComplete(ctx, did, "", &repo.Commit{DID: string(did), Rev: "rev-complete"}))
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(ctx, b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(ctx, b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)

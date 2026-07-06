@@ -951,10 +951,9 @@ func TestConsumer_Run_VerifierAcceptsValidChain(t *testing.T) {
 	require.Equal(t, uint64(0), stats.ChainBreaks,
 		"properly chained commits must not register a chain break")
 
-	// relay/cursor must reflect the last verified seq. This proves
-	// the OnAfterFlush hook (driven by the writer's per-block flush
-	// path) fires through to pebble — a regression that broke the
-	// cursor-write path on verified commits would not be caught by
+	// relay/cursor must reflect the last verified seq. This proves the writer's
+	// per-block durable batch fires through to pebble — a regression that broke
+	// the cursor-write path on verified commits would not be caught by
 	// LastUpstreamSeq alone.
 	persisted, err := LoadUpstreamCursor(st, "relay/cursor")
 	require.NoError(t, err)

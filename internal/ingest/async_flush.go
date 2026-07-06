@@ -13,10 +13,11 @@ import (
 )
 
 type asyncFlushJob struct {
-	id       uint64
-	prepared *segment.PreparedBlock
-	nextSeq  uint64
-	done     chan asyncFlushDone
+	id           uint64
+	prepared     *segment.PreparedBlock
+	nextSeq      uint64
+	prepareValue any
+	done         chan asyncFlushDone
 }
 
 type asyncFlushDone struct {
@@ -101,6 +102,7 @@ func (p *asyncFlushPipeline) finish(result asyncFlushResult) {
 }
 
 func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
+	prepareValue := w.sampleDurableBatchPrepareValueLocked()
 	prepared, err := w.active.PrepareFlush()
 	if err != nil {
 		return nil, fmt.Errorf("ingest: prepare async flush: %w", err)
@@ -109,10 +111,11 @@ func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
 		return nil, nil
 	}
 	job := &asyncFlushJob{
-		id:       w.nextAsyncFlushID,
-		prepared: prepared,
-		nextSeq:  prepared.MaxSeq() + 1,
-		done:     make(chan asyncFlushDone, 1),
+		id:           w.nextAsyncFlushID,
+		prepared:     prepared,
+		nextSeq:      prepared.MaxSeq() + 1,
+		prepareValue: prepareValue,
+		done:         make(chan asyncFlushDone, 1),
 	}
 	w.nextAsyncFlushID++
 	w.asyncJobs.Add(1)
@@ -157,7 +160,7 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 		}
 		w.cfg.Metrics.incBlocksFlushed()
 
-		if err := w.commitDurableBatchLocked(ctx, job.nextSeq, false); err != nil {
+		if err := w.commitDurableBatchLocked(ctx, job.nextSeq, false, job.prepareValue); err != nil {
 			return err
 		}
 

@@ -117,8 +117,9 @@ type Config struct {
 
 	// MaxSegmentBytes / MaxEventsPerBlock forward to ingest.Config.
 	// Zero means use ingest defaults.
-	MaxSegmentBytes   int64
-	MaxEventsPerBlock int
+	MaxSegmentBytes       int64
+	MaxEventsPerBlock     int
+	ReadLogRetentionBytes int64
 
 	// SegmentMetrics flows through the consumer's internal *ingest.Writer
 	// to every segment.New it makes. Optional.

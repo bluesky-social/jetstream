@@ -272,11 +272,10 @@ func (p *PebbleStateStore) LoadAppliedIdentitySeq(_ context.Context, did atmos.D
 // move the guard backwards. Callers must invoke it from the writer's
 // OnAppend hook — after the row is buffered, before its block can
 // flush. That ordering guarantees the ratchet is staged before ANY
-// cursor batch that could cover the row commits (a full-block flush
-// inside Append fires OnAfterFlush synchronously), so a durable
-// identity row always has a durable ratchet, and the flush batch
-// commits after the segment fsync, so a durable ratchet value always
-// has its row durable too.
+// cursor batch that could cover the row commits (a full-block flush inside
+// Append stages the durable batch synchronously), so a durable identity row
+// always has a durable ratchet, and the flush batch commits after the segment
+// fsync, so a durable ratchet value always has its row durable too.
 func (p *PebbleStateStore) RecordIdentitySeq(did atmos.DID, seq int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -86,7 +86,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, xrpcapi.DefaultPlanMaxCollections, opts.PlanMaxCollections)
 	require.Equal(t, xrpcapi.DefaultPlanMaxEntries, opts.PlanMaxEntries)
 	require.Equal(t, xrpcapi.DefaultPlanWholeSegmentThreshold, opts.PlanWholeSegmentThreshold)
-	require.Equal(t, 256<<20, opts.SubscribeHotTailBytes)
+	require.Equal(t, 256<<20, opts.SubscribeReadLogRetentionBytes)
 	require.Equal(t, 64<<20, opts.SubscribeBlockCacheBytes)
 	require.Equal(t, 1024, opts.SubscribeReadBatch)
 	require.Equal(t, 60*time.Second, opts.SubscribeSlowWindow)
@@ -214,7 +214,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--plan-max-collections=4",
 		"--plan-max-entries=123",
 		"--plan-whole-segment-threshold=0.6",
-		"--subscribe-hot-tail-bytes=123456",
+		"--subscribe-read-log-retention-bytes=123456",
 		"--subscribe-block-cache-bytes=654321",
 		"--subscribe-read-batch=77",
 		"--subscribe-slow-window=22s",
@@ -254,7 +254,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 4, opts.PlanMaxCollections)
 	require.Equal(t, 123, opts.PlanMaxEntries)
 	require.Equal(t, 0.6, opts.PlanWholeSegmentThreshold)
-	require.Equal(t, 123456, opts.SubscribeHotTailBytes)
+	require.Equal(t, 123456, opts.SubscribeReadLogRetentionBytes)
 	require.Equal(t, 654321, opts.SubscribeBlockCacheBytes)
 	require.Equal(t, 77, opts.SubscribeReadBatch)
 	require.Equal(t, 22*time.Second, opts.SubscribeSlowWindow)
@@ -741,27 +741,27 @@ func TestServe_StatusEndpoint(t *testing.T) {
 	t.Cleanup(relay.Close)
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
-		PublicAddr:                "127.0.0.1:0",
-		DebugAddr:                 "127.0.0.1:0",
-		DataDir:                   dataDir,
-		RelayURL:                  relay.URL,
-		OTelServiceName:           "jetstream-test",
-		LogLevel:                  "warn",
-		LogFormat:                 "text",
-		LogOutput:                 io.Discard,
-		ShutdownTimeout:           5 * time.Second,
-		ClientDrainTimeout:        10 * time.Second,
-		CursorLookback:            36 * time.Hour,
-		PlanMaxDIDs:               xrpcapi.DefaultPlanMaxDIDs,
-		PlanMaxCollections:        xrpcapi.DefaultPlanMaxCollections,
-		PlanMaxEntries:            xrpcapi.DefaultPlanMaxEntries,
-		PlanWholeSegmentThreshold: xrpcapi.DefaultPlanWholeSegmentThreshold,
-		SubscribeHotTailBytes:     1 << 20,
-		SubscribeBlockCacheBytes:  1 << 20,
-		SubscribeReadBatch:        128,
-		SubscribeSlowWindow:       time.Second,
-		SubscribeSlowMinRate:      5,
-		CursorBlockIndexCacheSize: 32,
+		PublicAddr:                     "127.0.0.1:0",
+		DebugAddr:                      "127.0.0.1:0",
+		DataDir:                        dataDir,
+		RelayURL:                       relay.URL,
+		OTelServiceName:                "jetstream-test",
+		LogLevel:                       "warn",
+		LogFormat:                      "text",
+		LogOutput:                      io.Discard,
+		ShutdownTimeout:                5 * time.Second,
+		ClientDrainTimeout:             10 * time.Second,
+		CursorLookback:                 36 * time.Hour,
+		PlanMaxDIDs:                    xrpcapi.DefaultPlanMaxDIDs,
+		PlanMaxCollections:             xrpcapi.DefaultPlanMaxCollections,
+		PlanMaxEntries:                 xrpcapi.DefaultPlanMaxEntries,
+		PlanWholeSegmentThreshold:      xrpcapi.DefaultPlanWholeSegmentThreshold,
+		SubscribeReadLogRetentionBytes: 1 << 20,
+		SubscribeBlockCacheBytes:       1 << 20,
+		SubscribeReadBatch:             128,
+		SubscribeSlowWindow:            time.Second,
+		SubscribeSlowMinRate:           5,
+		CursorBlockIndexCacheSize:      32,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {

@@ -149,7 +149,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		//     between the cursor and the tip.
 		//   - A live (no-cursor) client would anchor at the bogus tip 0;
 		//     once real events arrive at a high seq, that client sits below
-		//     the hot ring's base and dives the ENTIRE archive cold — the
+		//     the readable-log floor and dives the ENTIRE archive cold — the
 		//     replay storm this fan-out path exists to avoid.
 		//
 		// Refuse both with a retryable 503 until the writer is published;

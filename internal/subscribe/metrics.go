@@ -30,17 +30,9 @@ type Metrics struct {
 	CursorResolveSeconds prometheus.Histogram
 
 	// Pull-fanout series (2026-05-31):
-	EventsAppended   prometheus.Counter
 	HotReads         prometheus.Counter
 	ColdReads        prometheus.Counter
 	AdversarialDrops prometheus.Counter
-	HotRingBytes     prometheus.Gauge
-
-	// HotRingResets counts non-dense tail appends (#244): a durable-writer
-	// producer bypassed the ordered tail feed and the ring dropped its
-	// residency to avoid serving wrong-seq events. Zero in a healthy
-	// process; any increment is a wiring bug to chase.
-	HotRingResets prometheus.Counter
 }
 
 // NewMetrics registers the subscribe series against reg. Calls
@@ -114,15 +106,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Wall-clock duration of ResolveCursor (parse + manifest lookup + optional block scan).",
 			Buckets: prometheus.ExponentialBuckets(0.0001, 4, 8),
 		}),
-		EventsAppended: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "events_appended_total",
-			Help: "Number of segment.Events ingest has appended into the hot-tail ring.",
-		}),
 		HotReads: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "hot_reads_total",
-			Help: "Number of ReadFrom calls served from the in-memory hot ring.",
+			Help: "Number of ReadFrom calls served from the writer readable log.",
 		}),
 		ColdReads: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -134,16 +121,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "adversarial_drops_total",
 			Help: "Number of /subscribe connections dropped by the adversarially-slow detector.",
 		}),
-		HotRingResets: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "hot_ring_resets_total",
-			Help: "Non-dense hot-tail appends that forced a ring reset (#244); zero in a healthy process.",
-		}),
-		HotRingBytes: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "hot_ring_bytes",
-			Help: "Current resident byte size of the in-memory hot-tail ring.",
-		}),
 	}
 	reg.MustRegister(
 		m.Subscribers, m.CleanDisconnects,
@@ -151,8 +128,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.EventsFiltered, m.EventsOversize,
 		m.OptionsUpdates, m.OptionsUpdateErrors,
 		m.CursorRequests, m.CursorResolveSeconds,
-		m.EventsAppended, m.HotReads, m.ColdReads,
-		m.AdversarialDrops, m.HotRingBytes, m.HotRingResets,
+		m.HotReads, m.ColdReads, m.AdversarialDrops,
 	)
 	return m
 }
@@ -236,12 +212,6 @@ func (m *Metrics) observeCursorResolveSeconds(d float64) {
 	}
 }
 
-func (m *Metrics) incEventsAppended() {
-	if m == nil {
-		return
-	}
-	m.EventsAppended.Inc()
-}
 func (m *Metrics) incHotReads() {
 	if m == nil {
 		return
@@ -259,16 +229,4 @@ func (m *Metrics) incAdversarialDrops() {
 		return
 	}
 	m.AdversarialDrops.Inc()
-}
-func (m *Metrics) setHotRingBytes(n int) {
-	if m == nil {
-		return
-	}
-	m.HotRingBytes.Set(float64(n))
-}
-func (m *Metrics) incHotRingResets() {
-	if m == nil {
-		return
-	}
-	m.HotRingResets.Inc()
 }

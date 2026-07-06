@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
@@ -103,21 +104,21 @@ type Options struct {
 	PublicListener net.Listener
 	DebugListener  net.Listener
 
-	CursorLookback            time.Duration
-	SegmentCacheMaxAge        time.Duration
-	PlanMaxDIDs               int
-	PlanMaxCollections        int
-	PlanMaxEntries            int
-	PlanWholeSegmentThreshold float64
-	SubscribeHotTailBytes     int
-	SubscribeBlockCacheBytes  int
-	SubscribeReadBatch        int
-	SubscribeSlowWindow       time.Duration
-	SubscribeSlowMinRate      float64
-	CursorBlockIndexCacheSize int
-	CompactionInterval        time.Duration
-	CompactionTombstoneCap    int
-	CompactionRewriteWorkers  int
+	CursorLookback                 time.Duration
+	SegmentCacheMaxAge             time.Duration
+	PlanMaxDIDs                    int
+	PlanMaxCollections             int
+	PlanMaxEntries                 int
+	PlanWholeSegmentThreshold      float64
+	SubscribeReadLogRetentionBytes int
+	SubscribeBlockCacheBytes       int
+	SubscribeReadBatch             int
+	SubscribeSlowWindow            time.Duration
+	SubscribeSlowMinRate           float64
+	CursorBlockIndexCacheSize      int
+	CompactionInterval             time.Duration
+	CompactionTombstoneCap         int
+	CompactionRewriteWorkers       int
 
 	// TimestampImportToken is the bearer token gating the timestamp-import
 	// XRPC endpoints. Empty disables import (endpoints return 401).
@@ -155,4 +156,11 @@ func (o Options) effectiveBackfillBatchSize() int {
 		return o.BackfillBatchSize
 	}
 	return DefaultBackfillBatchSize
+}
+
+func (o Options) effectiveSubscribeReadLogRetentionBytes() int {
+	if o.SubscribeReadLogRetentionBytes > 0 {
+		return o.SubscribeReadLogRetentionBytes
+	}
+	return int(ingest.DefaultReadLogRetentionBytes)
 }

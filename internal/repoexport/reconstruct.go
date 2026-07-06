@@ -71,8 +71,8 @@ type Config struct {
 	// created moments ago (e.g. a like) is reflected in the snapshot
 	// immediately, rather than only after the next compaction-driven
 	// flush rotates the active segment. Optional; nil when no live writer
-	// is available. The slice is the caller's already-copied
-	// SnapshotPending() result and is not mutated.
+	// is available. The slice is the caller's already-copied result and is
+	// not mutated.
 	PendingEvents []segment.Event
 }
 

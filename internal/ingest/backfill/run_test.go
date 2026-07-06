@@ -1042,7 +1042,7 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 		"two repos × 1 record each = 2 events; max seq must be at least 1")
 }
 
-func TestRun_WriterFlushErrorAbortsAfterDurableCompletion(t *testing.T) {
+func TestRun_AfterCompleteErrorAbortsAfterDurableCompletion(t *testing.T) {
 	t.Parallel()
 
 	did := atmos.DID("did:plc:flush-fails")
@@ -1054,7 +1054,7 @@ func TestRun_WriterFlushErrorAbortsAfterDurableCompletion(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	errFlush := errors.New("flush failed")
+	errComplete := errors.New("after complete failed")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       filepath.Join(dataDir, "segments"),
@@ -1062,9 +1062,6 @@ func TestRun_WriterFlushErrorAbortsAfterDurableCompletion(t *testing.T) {
 		Logger:            logger,
 		MaxEventsPerBlock: 4096,
 		MaxSegmentBytes:   1 << 30,
-		OnAfterFlush: func(context.Context) error {
-			return errFlush
-		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -1075,13 +1072,16 @@ func TestRun_WriterFlushErrorAbortsAfterDurableCompletion(t *testing.T) {
 		Writer:     w,
 		RelayURL:   srv.srv.URL,
 		Logger:     logger,
+		AfterRepoComplete: func(context.Context, atmos.DID) error {
+			return errComplete
+		},
 	})
-	require.ErrorIs(t, err, errFlush)
+	require.ErrorIs(t, err, errComplete)
 
 	got, err := NewStore(db, nil).Lookup(t.Context(), did)
 	require.NoError(t, err)
 	require.Equal(t, atmosbackfill.StateComplete, got.State,
-		"completion is committed in the same durable batch before legacy OnAfterFlush runs")
+		"completion is committed before post-completion hook failure is surfaced")
 }
 
 func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
@@ -1098,16 +1098,13 @@ func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	errFlush := errors.New("flush failed after completion commit")
+	errComplete := errors.New("after complete failed after completion commit")
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       filepath.Join(dataDir, "segments"),
 		Store:             db,
 		Logger:            logger,
 		MaxEventsPerBlock: 4096,
 		MaxSegmentBytes:   1 << 30,
-		OnAfterFlush: func(context.Context) error {
-			return errFlush
-		},
 	})
 	require.NoError(t, err)
 
@@ -1117,8 +1114,11 @@ func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
 		Writer:     w,
 		RelayURL:   srv.srv.URL,
 		Logger:     logger,
+		AfterRepoComplete: func(context.Context, atmos.DID) error {
+			return errComplete
+		},
 	})
-	require.ErrorIs(t, err, errFlush)
+	require.ErrorIs(t, err, errComplete)
 	require.NoError(t, w.Close())
 	firstGetRepo := srv.getRepoHit.Load()
 	require.Equal(t, int64(1), firstGetRepo)

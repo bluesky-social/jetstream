@@ -887,12 +887,10 @@ func TestOpen_DefaultSeqKey(t *testing.T) {
 	require.Equal(t, "seq/next", w.cfg.SeqKey)
 }
 
-// TestFlush_InvokesOnAfterFlushHook pins the durability hook contract:
-// after each block flush the writer calls OnAfterFlush exactly once,
-// AFTER segment.Flush has fsynced and AFTER saveNextSeq has been
-// pebble.Sync'd. The live consumer uses this to durably advance the
-// upstream relay cursor with the same per-block cadence as seq/next.
-func TestFlush_InvokesOnAfterFlushHook(t *testing.T) {
+// TestFlush_InvokesDurableBatchHook pins the durability hook contract: after
+// each block flush the writer calls OnDurableBatch exactly once, in the same
+// synced Pebble batch as seq/next.
+func TestFlush_InvokesDurableBatchHook(t *testing.T) {
 	t.Parallel()
 
 	var calls atomic.Int32
@@ -902,9 +900,12 @@ func TestFlush_InvokesOnAfterFlushHook(t *testing.T) {
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
 		MaxEventsPerBlock: 2,
-		OnAfterFlush: func(_ context.Context) error {
+		OnDurableBatch: func(_ context.Context, _ *pebble.Batch, _ uint64, force bool, _ any) (func(), func(error), error) {
+			if force {
+				return nil, nil, nil
+			}
 			calls.Add(1)
-			return nil
+			return nil, nil, nil
 		},
 	})
 	require.NoError(t, err)
@@ -949,7 +950,7 @@ func TestAppendBatch_DurableCommitNotAbortedByCanceledContext(t *testing.T) {
 		Store:             st,
 		MaxEventsPerBlock: 1, // every append fills a block -> durable commit
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, _ uint64, _ bool) (func(), func(error), error) {
+		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
 			hookCalls++
 			// Mirror the completion batcher's leading guard: a cancelled
 			// context here would abort the post-fsync durable commit.
@@ -997,7 +998,7 @@ func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 		Store:             st,
 		MaxEventsPerBlock: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			if force {
 				return nil, nil, nil
 			}
@@ -1023,10 +1024,10 @@ func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 	require.Equal(t, uint64(3), persisted)
 }
 
-// TestFlush_OnAfterFlushErrorPropagates verifies that an error from
+// TestFlush_OnDurableBatchErrorPropagates verifies that an error from
 // the hook surfaces back through Append so the errgroup can tear
 // the process down. AGENTS.md: crashing > silent corruption.
-func TestFlush_OnAfterFlushErrorPropagates(t *testing.T) {
+func TestFlush_OnDurableBatchErrorPropagates(t *testing.T) {
 	t.Parallel()
 
 	want := errors.New("hook boom")
@@ -1036,7 +1037,9 @@ func TestFlush_OnAfterFlushErrorPropagates(t *testing.T) {
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
 		MaxEventsPerBlock: 1,
-		OnAfterFlush:      func(_ context.Context) error { return want },
+		OnDurableBatch: func(_ context.Context, _ *pebble.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
+			return nil, nil, want
+		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -1278,7 +1281,7 @@ func TestDrainDurability_CommitsHookWithoutPendingEvents(t *testing.T) {
 		SegmentsDir: filepath.Join(dir, "segments"),
 		Store:       st,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			gotForce = force
 			gotNextSeq = nextSeq
 			return nil, func(err error) { afterDone <- err }, b.Set([]byte("metadata/only"), []byte("ok"), nil)
@@ -1321,7 +1324,7 @@ func TestDrainDurability_AsyncCommitsHookWithoutPendingEvents(t *testing.T) {
 		Store:             st,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			return nil, nil, b.Set([]byte("metadata/async-only"), []byte("ok"), nil)
 		},
@@ -1365,7 +1368,7 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 		MaxEventsPerBlock: 64,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			key := fmt.Sprintf("metadata/async-pending/%t", force)
 			return nil, nil, b.Set([]byte(key), []byte("ok"), nil)
@@ -1424,7 +1427,7 @@ func TestDurableBatchClose_RunsAfterPendingEvents(t *testing.T) {
 		Store:             st,
 		MaxEventsPerBlock: 64,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			return nil, nil, b.Set([]byte("metadata/close"), []byte("ok"), nil)
 		},
@@ -1463,7 +1466,7 @@ func TestSealActiveAndClose_RunsDurableBatchHookAfterPendingEvents(t *testing.T)
 		Store:             st,
 		MaxEventsPerBlock: 64,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			return nil, nil, b.Set([]byte("metadata/seal-close"), []byte("ok"), nil)
 		},
@@ -1504,7 +1507,7 @@ func TestWriter_DurableBatchAsyncCloseRunsAfterPendingEvents(t *testing.T) {
 		MaxEventsPerBlock: 64,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			key := fmt.Sprintf("metadata/async-close/%t", force)
 			return nil, nil, b.Set([]byte(key), []byte("ok"), nil)
@@ -1548,7 +1551,7 @@ func TestWriter_AsyncSealActiveAndCloseRunsDurableBatchHookAfterPendingEvents(t 
 		MaxEventsPerBlock: 64,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			key := fmt.Sprintf("metadata/async-seal-close/%t", force)
 			return nil, nil, b.Set([]byte(key), []byte("ok"), nil)
@@ -1955,7 +1958,7 @@ func TestAppendBatch_AsyncFlushRunsDurableBatchHook(t *testing.T) {
 		MaxEventsPerBlock: 2,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			if force {
 				return nil, nil, fmt.Errorf("force = true")
 			}

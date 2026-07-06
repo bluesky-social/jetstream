@@ -215,8 +215,8 @@ func TestProcessBatch_IdentityRatchetDurableAtBlockBoundary(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 
-	// MaxEventsPerBlock=1: this append fills the block, so Append
-	// itself flushes it and fires OnAfterFlush before returning.
+	// MaxEventsPerBlock=1: this append fills the block, so Append itself
+	// flushes it and commits the durable cursor batch before returning.
 	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
 		identityEvent(did, 5),
 	}))

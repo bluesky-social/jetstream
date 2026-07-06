@@ -7,10 +7,6 @@ import (
 )
 
 const (
-	// DefaultHotTailBytes bounds the in-memory hot ring. 256 MiB holds a
-	// large burst plus several seconds of steady-state tip history.
-	DefaultHotTailBytes = 256 << 20
-
 	// DefaultReadBatch is the max events ReadFrom returns per call.
 	DefaultReadBatch = 1024
 
@@ -36,7 +32,6 @@ type Config struct {
 	Logger  *slog.Logger // required
 	Metrics *Metrics     // optional; nil = no-op
 
-	HotTailBytes     int           // 0 -> DefaultHotTailBytes
 	ReadBatch        int           // 0 -> DefaultReadBatch
 	SlowWindow       time.Duration // 0 -> DefaultSlowWindow
 	SlowMinRate      float64       // 0 -> DefaultSlowMinRate
@@ -51,9 +46,6 @@ func (c *Config) validate() error {
 }
 
 func (c *Config) applyDefaults() {
-	if c.HotTailBytes <= 0 {
-		c.HotTailBytes = DefaultHotTailBytes
-	}
 	if c.ReadBatch <= 0 {
 		c.ReadBatch = DefaultReadBatch
 	}

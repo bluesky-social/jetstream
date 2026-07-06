@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/bluesky-social/jetstream/segment"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 )
 
 // errColdUnavailable is returned by the cold reader when disk replay deps
@@ -22,15 +22,15 @@ var errColdUnavailable = errors.New("subscribe: cold reader unavailable")
 type coldReader func(ctx context.Context, cursor uint64, max int) ([]*Entry, uint64, error)
 
 type tailConfig struct {
-	hotBytes int
-	cold     coldReader
-	logger   *slog.Logger
+	cold   coldReader
+	logger *slog.Logger
 
 	// nextSeq returns the authoritative next (one-past-newest) durable seq.
 	// Tail uses it to position fresh live subscribers and to classify an
 	// empty/edge cursor as "block at tip" vs "read cold from disk". Optional
 	// in tests; nil means "use the ring's resident tip only".
 	nextSeq func() uint64
+	readLog func() *ingest.ReadableLog
 }
 
 // Tail is the unified event-fanout core. Ingest calls Append; every
@@ -39,27 +39,20 @@ type tailConfig struct {
 // the injected coldReader. Replaces the old push-based fanout.
 type Tail struct {
 	mu      sync.Mutex
-	ring    *hotRing
-	notify  chan struct{} // closed + replaced on each Append to wake tip waiters
+	notify  chan struct{} // closed when a read-log source is installed
 	blocked chan uint64   // nonblocking test/diagnostic signal when a reader parks at the tip
 	cold    coldReader
 	nextSeq func() uint64
+	readLog func() *ingest.ReadableLog
 	logger  *slog.Logger
-
-	// regressFloor is the durable live-edge floor of the most recent non-dense
-	// append (a #244-class bypass/gap/regression). A reset means the ring will
-	// never replay part of the durable history hot; ring misses below this
-	// floor must go cold instead of parking on notify forever. Zero when no
-	// reset has established a floor. Guarded by mu.
-	regressFloor uint64
 
 	metrics   *Metrics
 	readBatch int
 	slowCfg   slowConfig
 
 	// connMu guards the graceful-close registry below. It is distinct
-	// from mu: mu guards the hot ring fanout; the conn registry tracks the
-	// websocket connections themselves so Shutdown can send each a clean
+	// from mu: mu guards read-log source publication; the conn registry tracks
+	// the websocket connections themselves so Shutdown can send each a clean
 	// close frame regardless of which read phase it's in.
 	connMu   sync.Mutex
 	conns    map[uint64]func()
@@ -67,21 +60,19 @@ type Tail struct {
 	draining bool
 }
 
-// New validates cfg, builds the hot ring + cold-backed Tail, and returns it
-// ready for Append and ReadFrom. cold is the disk-backed reader (from
-// NewColdReader); nextSeq is the authoritative durable next-seq source
-// (ingest writer's NextSeq, resolved through the late-publication pointer).
-// Both may be nil in tests that stay hot.
+// New validates cfg, builds the cold-backed Tail, and returns it ready for
+// ReadFrom. cold is the disk-backed reader (from NewColdReader); nextSeq is the
+// authoritative durable next-seq source used before the writer read log is
+// published.
 func New(cfg Config, cold coldReader, nextSeq func() uint64) (*Tail, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	cfg.applyDefaults()
 	t := newTail(tailConfig{
-		hotBytes: cfg.HotTailBytes,
-		cold:     cold,
-		nextSeq:  nextSeq,
-		logger:   cfg.Logger.With(slog.String("component", "subscribe/tail")),
+		cold:    cold,
+		nextSeq: nextSeq,
+		logger:  cfg.Logger.With(slog.String("component", "subscribe/tail")),
 	})
 	t.metrics = cfg.Metrics
 	t.readBatch = cfg.ReadBatch
@@ -104,118 +95,25 @@ func newTail(cfg tailConfig) *Tail {
 		}
 	}
 	return &Tail{
-		ring:    newHotRing(cfg.hotBytes),
 		notify:  make(chan struct{}),
 		blocked: make(chan uint64, 1024),
 		cold:    cfg.cold,
 		nextSeq: cfg.nextSeq,
+		readLog: cfg.readLog,
 		logger:  cfg.logger,
+		conns:   make(map[uint64]func()),
 	}
 }
 
-// Append copies ev into the hot ring and wakes any readers parked at the
-// tip. Non-blocking (honors ingest's no-block OnEvent contract). The event
-// struct is copied; Payload is shared read-only (the caller must not retain
-// or mutate ev's payload after Append returns).
-//
-// Events MUST arrive in dense seq order (the ingest writer's ordered
-// append hook guarantees this in production). A non-dense append resets
-// the ring — readers inside the dropped window fall through to the cold
-// path — and is surfaced loudly here: it means a producer is appending
-// durable events without feeding the tail, the #244 bug class.
-func (t *Tail) Append(ev *segment.Event) {
-	cp := *ev
-	e := newEntry(&cp)
+// SetReadLogSource points the tail at the writer-owned readable log. Wire it
+// before publishing the steady-state writer to subscribers.
+func (t *Tail) SetReadLogSource(fn func() *ingest.ReadableLog) {
 	t.mu.Lock()
-	oldTip := t.ring.tip()
-	hadData := t.ring.has()
-	reset := t.ring.append(e)
-	if reset && hadData {
-		// A non-dense reset means at least one durable-writer producer bypassed
-		// the tail, so the writer's NextSeq may be far above either side of the
-		// reset. The reset ring will not replay the dropped durable window hot;
-		// raise the cold floor to the durable live edge when available so
-		// ReadFrom sends those cursors to disk instead of parking forever.
-		floor := t.ring.tip()
-		if oldTip > floor {
-			floor = oldTip
-		}
-		if t.nextSeq != nil {
-			if next := t.nextSeq(); next > floor {
-				floor = next
-			}
-		}
-		if floor > t.regressFloor {
-			t.regressFloor = floor
-		}
-	}
-	t.metrics.incEventsAppended()
-	if reset {
-		t.metrics.incHotRingResets()
-	}
-	t.metrics.setHotRingBytes(t.ring.bytes())
 	old := t.notify
 	t.notify = make(chan struct{})
-	t.mu.Unlock()
-	close(old) // wake all waiters; they re-read under the lock
-	if reset && t.logger != nil {
-		t.logger.Warn("hot ring reset on non-dense append; a durable-writer producer is bypassing the tail feed",
-			"seq", cp.Seq)
-	}
-}
-
-// liveTipLocked returns the seq at which a subscriber is caught up to the live
-// edge and should block for the next Append (and where a fresh live subscriber
-// starts).
-//
-// When the ring holds events, its tip IS the live edge: the ingest loop calls
-// writer.Append then tail.Append per event, so the durable writer is at most
-// one event ahead of the ring tip, and that single in-flight event arrives in
-// the ring momentarily. Blocking for it — rather than diving to disk — keeps a
-// caught-up live subscriber on the hot, encode-once path. Only when the ring
-// is empty (cold start / bootstrap, before any Append has been seen) do we
-// fall back to the durable writer's NextSeq, which may legitimately be far
-// ahead of an empty ring. Caller must hold t.mu.
-//
-// After a regression reset the ring tip sits below regressFloor, and
-// [ring.tip, regressFloor) is the cold-classified history window (see
-// coldThresholdLocked): a fresh live subscriber seeded at ring.tip would
-// replay that history, violating Tip's start-at-the-live-edge contract. The
-// floor is the live edge until the ring catches back up past it.
-func (t *Tail) liveTipLocked() uint64 {
-	if t.ring.has() {
-		if t.regressFloor > t.ring.tip() {
-			return t.regressFloor
-		}
-		return t.ring.tip()
-	}
-	if t.nextSeq != nil {
-		return t.nextSeq()
-	}
-	return 0
-}
-
-// coldThresholdLocked returns the seq below which events live on disk rather
-// than in the ring, i.e. the boundary that sends a ring-miss to the cold
-// reader instead of blocking. With a populated ring, anything below its base
-// was evicted to disk. With an empty ring, anything below the durable tip is
-// replayable history not yet (or never) captured live. Caller must hold t.mu.
-//
-// After a REGRESSING append resets the ring backwards (#244 class), cursors
-// in [ring.tip, regressFloor) point at durable events the ring will never
-// replay — they must go cold, not park on notify forever (an idle stream
-// would strand them). regressFloor keeps that window cold without touching
-// the dense-operation invariant that a cursor at the in-flight tip (between
-// writer.Append and tail.Append) BLOCKS for the imminent hot append rather
-// than diving to disk (see TestTail_ReadFrom_InFlightTipBlocksNotCold).
-func (t *Tail) coldThresholdLocked() uint64 {
-	if t.ring.has() {
-		if t.regressFloor > t.ring.tip() {
-			return t.regressFloor
-		}
-		return t.ring.base()
-	}
-	return t.liveTipLocked()
+	defer t.mu.Unlock()
+	t.readLog = fn
+	close(old)
 }
 
 // ReadFrom returns up to max entries with Seq >= cursor in seq order, plus
@@ -228,43 +126,39 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 			return nil, cursor, err
 		}
 		t.mu.Lock()
-		entries, ok := t.ring.lookup(cursor)
-		// lookup returns a slice aliasing the ring's backing array. A
-		// concurrent Append→evict nils and reslices that array, which would
-		// race with — and corrupt — a slice handed to the caller after we
-		// unlock. Copy the (bounded) pointer slice out under the lock; the
-		// *Entry values are immutable post-construction, so sharing the
-		// pointers themselves is safe.
-		var out []*Entry
-		if ok {
-			if len(entries) > max {
-				entries = entries[:max]
-			}
-			out = make([]*Entry, len(entries))
-			copy(out, entries)
-		}
-		coldBelow := t.coldThresholdLocked()
+		readLog := t.readLog
 		notify := t.notify
+		nextSeq := t.nextSeq
 		t.mu.Unlock()
-
-		if ok && len(out) > 0 {
-			// Hot hit: serve from the resident ring.
-			next := out[len(out)-1].Event.Seq + 1
-			t.metrics.incHotReads()
-			return out, next, nil
+		if readLog != nil {
+			if log := readLog(); log != nil {
+				entries, notify, ok, atTip := log.ReadFrom(cursor, max)
+				if ok {
+					out := make([]*Entry, len(entries))
+					for i := range entries {
+						out[i] = entryFromReadLog(entries[i])
+					}
+					next := out[len(out)-1].Event.Seq + 1
+					t.metrics.incHotReads()
+					return out, next, nil
+				}
+				if !atTip && cursor < log.FloorSeq() {
+					t.metrics.incColdReads()
+					return t.cold(ctx, cursor, max)
+				}
+				select {
+				case t.blocked <- cursor:
+				default:
+				}
+				select {
+				case <-ctx.Done():
+					return nil, cursor, ctx.Err()
+				case <-notify:
+					continue
+				}
+			}
 		}
-		// ok with an empty batch cannot happen (lookup returns a non-empty
-		// suffix or !ok) — but if index math ever drifted again (#244), an
-		// unguarded out[len(out)-1] would panic. The mutex is already
-		// released here, but subscribers would still crash-loop; fall
-		// through to the cold/block classification instead.
-
-		// Ring can't serve it. A cursor below the cold threshold is on disk
-		// (evicted, or pre-ring history); anything at/above it is the live
-		// edge — at most the single in-flight event between writer.Append and
-		// tail.Append — so block for the imminent Append rather than reading
-		// it cold from the pending block.
-		if cursor < coldBelow {
+		if nextSeq != nil && cursor < nextSeq() {
 			t.metrics.incColdReads()
 			return t.cold(ctx, cursor, max)
 		}
@@ -285,15 +179,18 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 // will block until the next Append rather than replaying history.
 func (t *Tail) Tip() uint64 {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.liveTipLocked()
-}
-
-// ringBytes returns the current hot-ring byte fill under the lock.
-func (t *Tail) ringBytes() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.ring.bytes()
+	readLog := t.readLog
+	nextSeq := t.nextSeq
+	t.mu.Unlock()
+	if readLog != nil {
+		if log := readLog(); log != nil {
+			return log.TipSeq()
+		}
+	}
+	if nextSeq != nil {
+		return nextSeq()
+	}
+	return 0
 }
 
 // RegisterConn enrolls a websocket connection's graceful-close function

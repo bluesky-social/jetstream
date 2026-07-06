@@ -19,6 +19,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/jcalabro/gt"
@@ -56,11 +57,11 @@ type Consumer struct {
 	// across a crash, dropping it from the archive permanently.
 	lastUpstream atomic.Int64
 
-	// client is set once at the top of Run after NewClient succeeds,
-	// and consulted by onAfterFlush and Close to read the
-	// watermark-correct cursor. nil before Run starts, after a Run
-	// failure that never reached client construction, and in tests
-	// that exercise processBatch in isolation.
+	// client is set once at the top of Run after NewClient succeeds, and
+	// consulted by the durable-batch cursor sampler to read the
+	// watermark-correct cursor. nil before Run starts, after a Run failure
+	// that never reached client construction, and in tests that exercise
+	// processBatch in isolation.
 	client atomic.Pointer[streaming.Client]
 
 	closeMu sync.Mutex
@@ -91,8 +92,8 @@ func Open(cfg Config) (*Consumer, error) {
 	//
 	// The #identity applied-seq ratchet (#234) records here for the
 	// same before-any-flush reason: Append can synchronously flush a
-	// full block, and that flush fires OnAfterFlush, which commits the
-	// cursor + StageFlush batch. Recording post-Append (where hosting
+	// full block, and that flush commits the cursor + StageFlush durable
+	// batch. Recording post-Append (where hosting
 	// promotes) would open a crash window where the identity row and
 	// the cursor batch are durable but the ratchet is not — a restart
 	// redelivery would then re-archive the row as a permanent
@@ -115,13 +116,14 @@ func Open(cfg Config) (*Consumer, error) {
 	}
 
 	w, err := ingest.Open(ingest.Config{
-		SegmentsDir:       cfg.SegmentsDir,
-		DataDir:           cfg.DataDir,
-		Store:             cfg.Store,
-		SeqKey:            cfg.SeqKey,
-		MaxSegmentBytes:   cfg.MaxSegmentBytes,
-		MaxEventsPerBlock: cfg.MaxEventsPerBlock,
-		OnAppend:          onAppend,
+		SegmentsDir:           cfg.SegmentsDir,
+		DataDir:               cfg.DataDir,
+		Store:                 cfg.Store,
+		SeqKey:                cfg.SeqKey,
+		MaxSegmentBytes:       cfg.MaxSegmentBytes,
+		MaxEventsPerBlock:     cfg.MaxEventsPerBlock,
+		ReadLogRetentionBytes: cfg.ReadLogRetentionBytes,
+		OnAppend:              onAppend,
 
 		// Bare cfg.Logger; ingest.Open sets its own
 		// component=ingest/writer attribute.
@@ -129,11 +131,12 @@ func Open(cfg Config) (*Consumer, error) {
 
 		// WriterMetrics is nil for bootstrap live_segments and shared
 		// with the canonical ingest metrics in steady-state.
-		Metrics:                cfg.WriterMetrics,
-		OnAfterFlush:           c.onAfterFlush,
-		OnAfterSeal:            cfg.OnAfterSeal,
-		SegmentMetrics:         cfg.SegmentMetrics,
-		SegmentIOFaultInjector: cfg.SegmentIOFaultInjector,
+		Metrics:                  cfg.WriterMetrics,
+		DurableBatchPrepareValue: c.cursorValueForDurableBatch,
+		OnDurableBatch:           c.onDurableBatch,
+		OnAfterSeal:              cfg.OnAfterSeal,
+		SegmentMetrics:           cfg.SegmentMetrics,
+		SegmentIOFaultInjector:   cfg.SegmentIOFaultInjector,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("livestream: open writer: %w", err)
@@ -155,27 +158,10 @@ func (c *Consumer) Close() error {
 	if c.writer == nil {
 		return nil
 	}
-	// Flush the active segment and persist the next-seq counter.
+	// Flush the active segment and persist the next-seq counter plus the
+	// prepare-time cursor/sync-state metadata in one synced durable batch.
 	if err := c.writer.Close(); err != nil {
 		return fmt.Errorf("livestream: close: %w", err)
-	}
-	// The writer.Close → segment.Close → flushLocked does not invoke
-	// OnAfterFlush (that's only called during Append's full-block
-	// path). Persist the final cursor explicitly.
-	cur := c.cursorValue()
-	if cur > 0 {
-		if err := c.saveCursorAndSyncState(cur); err != nil {
-			return fmt.Errorf("livestream: close: save cursor: %w", err)
-		}
-		c.cfg.Metrics.setUpstreamCursor(cur)
-	} else if c.cfg.SyncStateStore != nil {
-		// No cursor to persist (shutdown before the first yielded
-		// event), but promoted verifier state can still exist — its
-		// rows were appended and writer.Close fsynced them above.
-		// Flush it so it isn't silently dropped.
-		if err := c.cfg.SyncStateStore.Flush(); err != nil {
-			return fmt.Errorf("livestream: close: flush sync state: %w", err)
-		}
 	}
 	return nil
 }
@@ -338,6 +324,10 @@ func (c *Consumer) cursorValue() int64 {
 	return c.lastUpstream.Load()
 }
 
+func (c *Consumer) cursorValueForDurableBatch() any {
+	return c.cursorValue()
+}
+
 // LastUpstreamSeq returns the highest upstream seq whose ops have
 // all been buffered into the active segment. This is the in-memory
 // value, NOT the persisted relay/cursor — the persisted cursor
@@ -348,14 +338,18 @@ func (c *Consumer) LastUpstreamSeq() int64 {
 	return c.lastUpstream.Load()
 }
 
-// onAfterFlush is the ingest.Writer hook that runs after every
-// block flush. Persists atmos's safe watermark cursor to
-// relay/cursor with pebble.Sync. The watermark is the smallest
-// in-flight seq minus one (or the highest yielded seq when
-// nothing is in flight); persisting it can never skip a
-// still-being-verified smaller seq across a crash.
-func (c *Consumer) onAfterFlush(ctx context.Context) error {
-	cur := c.cursorValue()
+// onDurableBatch stages the block-specific relay cursor and verifier sync
+// state into the writer's seq/next durable batch. cur is sampled before the
+// block is detached/flushed, so async commits cannot persist a cursor that
+// covers events in a later, not-yet-durable prepared block.
+func (c *Consumer) onDurableBatch(ctx context.Context, b *pebble.Batch, _ uint64, _ bool, prepareValue any) (func(), func(error), error) {
+	cur, ok := prepareValue.(int64)
+	if !ok {
+		return nil, nil, fmt.Errorf("livestream: durable batch cursor sample has type %T", prepareValue)
+	}
+	if cur < 0 {
+		return nil, nil, fmt.Errorf("livestream: refuse to save negative cursor %d to %s", cur, c.cfg.CursorKey)
+	}
 	if cur == 0 {
 		// Block flushed before any upstream event was fully
 		// processed (only possible during very early startup if
@@ -365,15 +359,27 @@ func (c *Consumer) onAfterFlush(ctx context.Context) error {
 		// can already exist. Persist it on its own so a crash here
 		// can't leave a durable identity row unguarded (#234).
 		if c.cfg.SyncStateStore != nil {
-			return c.cfg.SyncStateStore.Flush()
+			if err := c.cfg.SyncStateStore.StageFlush(b); err != nil {
+				return nil, nil, err
+			}
+			return func() { c.cfg.SyncStateStore.CommitStaged() }, nil, nil
 		}
-		return nil
+		return nil, nil, nil
 	}
-	if err := c.saveCursorAndSyncState(cur); err != nil {
-		return err
+	if err := b.Set([]byte(c.cfg.CursorKey), store.EncodeVersionedUint64LE(cursorV1, uint64(cur)), nil); err != nil {
+		return nil, nil, fmt.Errorf("livestream: stage %s: %w", c.cfg.CursorKey, err)
 	}
-	c.cfg.Metrics.setUpstreamCursor(cur)
-	return nil
+	if c.cfg.SyncStateStore != nil {
+		if err := c.cfg.SyncStateStore.StageFlush(b); err != nil {
+			return nil, nil, err
+		}
+	}
+	return func() {
+		if c.cfg.SyncStateStore != nil {
+			c.cfg.SyncStateStore.CommitStaged()
+		}
+		c.cfg.Metrics.setUpstreamCursor(cur)
+	}, nil, nil
 }
 
 func (c *Consumer) saveCursorAndSyncState(cur int64) error {
@@ -382,19 +388,15 @@ func (c *Consumer) saveCursorAndSyncState(cur int64) error {
 	}
 	b := c.cfg.Store.NewBatch()
 	defer func() { _ = b.Close() }()
-	if err := b.Set([]byte(c.cfg.CursorKey), store.EncodeVersionedUint64LE(cursorV1, uint64(cur)), nil); err != nil {
-		return fmt.Errorf("livestream: stage %s: %w", c.cfg.CursorKey, err)
-	}
-	if c.cfg.SyncStateStore != nil {
-		if err := c.cfg.SyncStateStore.StageFlush(b); err != nil {
-			return err
-		}
+	afterCommit, _, err := c.onDurableBatch(context.Background(), b, 0, true, cur)
+	if err != nil {
+		return err
 	}
 	if err := c.cfg.Store.Commit(b, store.SyncWrites); err != nil {
 		return fmt.Errorf("livestream: save %s: %w", c.cfg.CursorKey, err)
 	}
-	if c.cfg.SyncStateStore != nil {
-		c.cfg.SyncStateStore.CommitStaged()
+	if afterCommit != nil {
+		afterCommit()
 	}
 	return nil
 }
