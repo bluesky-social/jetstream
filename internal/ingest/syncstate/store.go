@@ -17,6 +17,7 @@ const (
 	chainPrefix = "sync/chain/"
 	hostPrefix  = "sync/host/"
 	identPrefix = "sync/ident/"
+	acctPrefix  = "sync/acct/"
 )
 
 // PebbleStateStore implements sync.StateStore against a *store.Store.
@@ -70,6 +71,12 @@ type PebbleStateStore struct {
 	// only ratchet upward.
 	promotedIdent map[atmos.DID]int64
 
+	// promotedAccount is the per-DID applied #account seq ratchet. It is
+	// intentionally separate from verifier hosting state: hosting promotion
+	// is gated by the pending event that produced it, but archival replay
+	// dedupe only needs to know that this account row was appended.
+	promotedAccount map[atmos.DID]int64
+
 	// captured* record exactly which promoted values the most recent
 	// StageFlush wrote into its batch. CommitStaged clears only those,
 	// so a promotion that lands between StageFlush and CommitStaged is
@@ -77,6 +84,7 @@ type PebbleStateStore struct {
 	capturedChain   map[atmos.DID][]byte
 	capturedHosting map[atmos.DID][]byte
 	capturedIdent   map[atmos.DID]int64
+	capturedAccount map[atmos.DID]int64
 }
 
 type pendingChainState struct {
@@ -100,6 +108,7 @@ func New(s *store.Store) *PebbleStateStore {
 		promotedChain:   make(map[atmos.DID][]byte),
 		promotedHosting: make(map[atmos.DID][]byte),
 		promotedIdent:   make(map[atmos.DID]int64),
+		promotedAccount: make(map[atmos.DID]int64),
 	}
 }
 
@@ -113,6 +122,10 @@ func hostKey(did atmos.DID) []byte {
 
 func identKey(did atmos.DID) []byte {
 	return []byte(identPrefix + string(did))
+}
+
+func acctKey(did atmos.DID) []byte {
+	return []byte(acctPrefix + string(did))
 }
 
 func (p *PebbleStateStore) LoadChain(_ context.Context, did atmos.DID) (*atmossync.ChainState, error) {
@@ -266,6 +279,34 @@ func (p *PebbleStateStore) LoadAppliedIdentitySeq(_ context.Context, did atmos.D
 	return got, nil
 }
 
+// LoadAppliedAccountSeq returns the highest #account seq whose row has
+// been appended for did (promoted-but-unflushed first, then pebble), or
+// 0 when the DID has never had an account row. This is Jetstream's
+// archive-owned replay ratchet; it deliberately does not consult verifier
+// hosting state, whose pending/promotion lifecycle has a different contract.
+func (p *PebbleStateStore) LoadAppliedAccountSeq(_ context.Context, did atmos.DID) (int64, error) {
+	p.mu.Lock()
+	seq, ok := p.promotedAccount[did]
+	p.mu.Unlock()
+	if ok {
+		return seq, nil
+	}
+
+	val, closer, err := p.s.Get(acctKey(did))
+	if errors.Is(err, store.ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("syncstate: load applied account seq %s: %w", did, err)
+	}
+	defer func() { _ = closer.Close() }()
+	got, err := decodeIdentitySeq(val)
+	if err != nil {
+		return 0, fmt.Errorf("syncstate: load applied account seq %s: %w", did, err)
+	}
+	return got, nil
+}
+
 // RecordIdentitySeq stages the applied #identity seq for did, to be
 // flushed by the next StageFlush batch. Ratchet-only: a seq at or
 // below the staged value is ignored, so out-of-order calls can never
@@ -283,6 +324,18 @@ func (p *PebbleStateStore) RecordIdentitySeq(did atmos.DID, seq int64) {
 		return
 	}
 	p.promotedIdent[did] = seq
+}
+
+// RecordAccountSeq stages the applied #account seq for did, to be flushed
+// by the next StageFlush batch. Ratchet-only, with the same append-before-
+// flush ordering requirement as RecordIdentitySeq.
+func (p *PebbleStateStore) RecordAccountSeq(did atmos.DID, seq int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if cur, ok := p.promotedAccount[did]; ok && cur >= seq {
+		return
+	}
+	p.promotedAccount[did] = seq
 }
 
 // PromoteChain marks the pending chain entry for did as flushable iff
@@ -328,6 +381,7 @@ func (p *PebbleStateStore) StageFlush(b *pebble.Batch) error {
 	p.capturedChain = make(map[atmos.DID][]byte, len(p.promotedChain))
 	p.capturedHosting = make(map[atmos.DID][]byte, len(p.promotedHosting))
 	p.capturedIdent = make(map[atmos.DID]int64, len(p.promotedIdent))
+	p.capturedAccount = make(map[atmos.DID]int64, len(p.promotedAccount))
 	for did, val := range p.promotedChain {
 		if err := b.Set(chainKey(did), val, nil); err != nil {
 			return fmt.Errorf("syncstate: stage chain %s: %w", did, err)
@@ -345,6 +399,12 @@ func (p *PebbleStateStore) StageFlush(b *pebble.Batch) error {
 			return fmt.Errorf("syncstate: stage identity seq %s: %w", did, err)
 		}
 		p.capturedIdent[did] = seq
+	}
+	for did, seq := range p.promotedAccount {
+		if err := b.Set(acctKey(did), encodeIdentitySeq(seq), nil); err != nil {
+			return fmt.Errorf("syncstate: stage account seq %s: %w", did, err)
+		}
+		p.capturedAccount[did] = seq
 	}
 	return nil
 }
@@ -372,9 +432,15 @@ func (p *PebbleStateStore) CommitStaged() {
 			delete(p.promotedIdent, did)
 		}
 	}
+	for did, captured := range p.capturedAccount {
+		if cur, ok := p.promotedAccount[did]; ok && cur == captured {
+			delete(p.promotedAccount, did)
+		}
+	}
 	p.capturedChain = nil
 	p.capturedHosting = nil
 	p.capturedIdent = nil
+	p.capturedAccount = nil
 }
 
 // Flush commits promoted state by itself, outside the consumer's
@@ -412,9 +478,11 @@ func (p *PebbleStateStore) Delete(_ context.Context, did atmos.DID) error {
 	delete(p.promotedChain, did)
 	delete(p.promotedHosting, did)
 	delete(p.promotedIdent, did)
+	delete(p.promotedAccount, did)
 	delete(p.capturedChain, did)
 	delete(p.capturedHosting, did)
 	delete(p.capturedIdent, did)
+	delete(p.capturedAccount, did)
 	p.mu.Unlock()
 
 	b := p.s.NewBatch()
@@ -428,6 +496,9 @@ func (p *PebbleStateStore) Delete(_ context.Context, did atmos.DID) error {
 	}
 	if err := b.Delete(identKey(did), nil); err != nil {
 		return fmt.Errorf("syncstate: delete identity seq %s: %w", did, err)
+	}
+	if err := b.Delete(acctKey(did), nil); err != nil {
+		return fmt.Errorf("syncstate: delete account seq %s: %w", did, err)
 	}
 	if err := p.s.Commit(b, store.SyncWrites); err != nil {
 		return fmt.Errorf("syncstate: delete %s: %w", did, err)
