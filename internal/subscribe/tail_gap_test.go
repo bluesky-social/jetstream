@@ -104,6 +104,126 @@ func TestTail_GapFeedNeverServesWrongSeq(t *testing.T) {
 	}
 }
 
+// TestTail_RegressionResetDoesNotStrandDurableCursors: a regressing append
+// resets the ring BACKWARDS (base/tip drop below the durable writer's
+// NextSeq). Cursors above the reset tip but below the durable tip point at
+// events that are durably readable from disk; they must fall through to the
+// cold path, not park on notify forever waiting for an Append that an idle
+// (or wedged) producer will never send.
+func TestTail_RegressionResetDoesNotStrandDurableCursors(t *testing.T) {
+	t.Parallel()
+	cold := func(_ context.Context, cursor uint64, _ int) ([]*Entry, uint64, error) {
+		return []*Entry{newEntry(gapEvent(cursor))}, cursor + 1, nil
+	}
+	tl := newTail(tailConfig{
+		hotBytes: 1 << 20,
+		cold:     cold,
+		nextSeq:  func() uint64 { return 15 }, // durable writer: seqs 1..14 on disk
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	for seq := uint64(10); seq <= 14; seq++ {
+		tl.Append(gapEvent(seq))
+	}
+	tl.Append(gapEvent(12)) // regression: ring resets to base=12, tip=13
+
+	// Cursors 13 and 14 are above the reset ring tip but durable on disk:
+	// they must be served cold, immediately.
+	for cursor := uint64(13); cursor <= 14; cursor++ {
+		done := make(chan struct{})
+		var batch []*Entry
+		var err error
+		go func() {
+			defer close(done)
+			batch, _, err = tl.ReadFrom(context.Background(), cursor, 1)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("cursor=%d: ReadFrom blocked on a durable seq after a regression reset", cursor)
+		}
+		require.NoErrorf(t, err, "cursor=%d", cursor)
+		require.Lenf(t, batch, 1, "cursor=%d", cursor)
+		require.Equalf(t, cursor, batch[0].Event.Seq, "cursor=%d", cursor)
+	}
+
+	// Cursor 15 == durable NextSeq: genuinely at the live edge, must block.
+	blocked := make(chan struct{})
+	go func() {
+		defer close(blocked)
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_, _, _ = tl.ReadFrom(ctx, 15, 1)
+	}()
+	select {
+	case cur := <-tl.blocked:
+		require.Equal(t, uint64(15), cur, "live-edge cursor must park, not read cold")
+	case <-time.After(2 * time.Second):
+		t.Fatal("cursor=15 never parked at the live edge")
+	}
+	<-blocked
+}
+
+// TestTail_RegressionResetFloorsAtDurableTip: the regression path by
+// definition involves a producer bypassing the tail, so the durable writer's
+// NextSeq can be far above the pre-reset ring tip. Every seq below NextSeq is
+// durably cold-readable and the reset ring will never replay it hot — the
+// cold floor must rise to NextSeq at reset time, not just to the old tip, or
+// cursors in [oldTip, NextSeq) park forever on an idle stream.
+func TestTail_RegressionResetFloorsAtDurableTip(t *testing.T) {
+	t.Parallel()
+	cold := func(_ context.Context, cursor uint64, _ int) ([]*Entry, uint64, error) {
+		return []*Entry{newEntry(gapEvent(cursor))}, cursor + 1, nil
+	}
+	tl := newTail(tailConfig{
+		hotBytes: 1 << 20,
+		cold:     cold,
+		nextSeq:  func() uint64 { return 100 }, // bypassing producer ran far ahead
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	for seq := uint64(10); seq <= 14; seq++ {
+		tl.Append(gapEvent(seq))
+	}
+	tl.Append(gapEvent(12)) // regression reset; durable rows 15..99 exist on disk
+
+	done := make(chan struct{})
+	var batch []*Entry
+	var err error
+	go func() {
+		defer close(done)
+		batch, _, err = tl.ReadFrom(context.Background(), 50, 1)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cursor=50: ReadFrom parked on a durable seq below the writer tip after a regression reset")
+	}
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+	require.Equal(t, uint64(50), batch[0].Event.Seq)
+}
+
+// TestTail_TipHonorsRegressFloor: Tip() seeds fresh no-cursor (live)
+// subscribers, whose contract is "start at the live edge; never replay
+// history". After a regression reset the ring tip sits below regressFloor,
+// and [ring.tip, regressFloor) is exactly the cold-classified history window
+// — a fresh live subscriber starting at ring.tip would replay it. Tip must
+// honor the floor like coldThresholdLocked does.
+func TestTail_TipHonorsRegressFloor(t *testing.T) {
+	t.Parallel()
+	tl := newTail(tailConfig{
+		hotBytes: 1 << 20,
+		nextSeq:  func() uint64 { return 15 },
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	for seq := uint64(10); seq <= 14; seq++ {
+		tl.Append(gapEvent(seq))
+	}
+	require.Equal(t, uint64(15), tl.Tip(), "dense: tip is the ring tip")
+	tl.Append(gapEvent(12)) // regression reset: ring tip drops to 13
+	require.Equal(t, uint64(15), tl.Tip(),
+		"post-reset: a fresh live subscriber must start at the durable live edge, not replay the cold window")
+}
+
 // TestTail_GapFeedDoesNotWedgeAppend guards the crash blast radius: even if
 // a reader hits the gap window concurrently, Append (called synchronously on
 // the ingest hot path) must never block behind a poisoned tail mutex.

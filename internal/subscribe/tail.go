@@ -46,6 +46,15 @@ type Tail struct {
 	nextSeq func() uint64
 	logger  *slog.Logger
 
+	// regressFloor is the pre-reset ring tip of the most recent REGRESSING
+	// append (a #244-class duplicate/backwards feed). Every seq below it was
+	// once resident — hence already appended to the durable writer — so a
+	// ring-miss below it must go cold, not park on notify: after a backwards
+	// reset the ring will never replay (reset point, old tip) hot, and on an
+	// idle stream the parked reader would be stranded forever. Zero when no
+	// regression has occurred. Guarded by mu.
+	regressFloor uint64
+
 	metrics   *Metrics
 	readBatch int
 	slowCfg   slowConfig
@@ -120,7 +129,26 @@ func (t *Tail) Append(ev *segment.Event) {
 	cp := *ev
 	e := newEntry(&cp)
 	t.mu.Lock()
+	oldTip := t.ring.tip()
+	hadData := t.ring.has()
 	reset := t.ring.append(e)
+	if reset && hadData && cp.Seq < oldTip {
+		// Backwards reset: the ring will never again serve seqs at/above the
+		// reset point that the durable writer already owns, and a regression by
+		// definition means a producer is bypassing the tail — so the writer's
+		// NextSeq may be far above the old ring tip. Everything below it is
+		// cold-readable; raise the cold floor to max(oldTip, NextSeq) so
+		// ReadFrom sends those cursors to disk instead of parking them forever.
+		floor := oldTip
+		if t.nextSeq != nil {
+			if next := t.nextSeq(); next > floor {
+				floor = next
+			}
+		}
+		if floor > t.regressFloor {
+			t.regressFloor = floor
+		}
+	}
 	t.metrics.incEventsAppended()
 	if reset {
 		t.metrics.incHotRingResets()
@@ -148,8 +176,17 @@ func (t *Tail) Append(ev *segment.Event) {
 // is empty (cold start / bootstrap, before any Append has been seen) do we
 // fall back to the durable writer's NextSeq, which may legitimately be far
 // ahead of an empty ring. Caller must hold t.mu.
+//
+// After a regression reset the ring tip sits below regressFloor, and
+// [ring.tip, regressFloor) is the cold-classified history window (see
+// coldThresholdLocked): a fresh live subscriber seeded at ring.tip would
+// replay that history, violating Tip's start-at-the-live-edge contract. The
+// floor is the live edge until the ring catches back up past it.
 func (t *Tail) liveTipLocked() uint64 {
 	if t.ring.has() {
+		if t.regressFloor > t.ring.tip() {
+			return t.regressFloor
+		}
 		return t.ring.tip()
 	}
 	if t.nextSeq != nil {
@@ -163,8 +200,19 @@ func (t *Tail) liveTipLocked() uint64 {
 // reader instead of blocking. With a populated ring, anything below its base
 // was evicted to disk. With an empty ring, anything below the durable tip is
 // replayable history not yet (or never) captured live. Caller must hold t.mu.
+//
+// After a REGRESSING append resets the ring backwards (#244 class), cursors
+// in [ring.tip, regressFloor) point at durable events the ring will never
+// replay — they must go cold, not park on notify forever (an idle stream
+// would strand them). regressFloor keeps that window cold without touching
+// the dense-operation invariant that a cursor at the in-flight tip (between
+// writer.Append and tail.Append) BLOCKS for the imminent hot append rather
+// than diving to disk (see TestTail_ReadFrom_InFlightTipBlocksNotCold).
 func (t *Tail) coldThresholdLocked() uint64 {
 	if t.ring.has() {
+		if t.regressFloor > t.ring.tip() {
+			return t.regressFloor
+		}
 		return t.ring.base()
 	}
 	return t.liveTipLocked()
