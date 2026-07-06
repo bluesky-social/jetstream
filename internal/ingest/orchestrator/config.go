@@ -286,6 +286,13 @@ type Config struct {
 	// CrashInjector is a test-only deterministic crash simulator. Production
 	// leaves it nil, making every simulateCrash checkpoint a no-op.
 	CrashInjector crashpoint.Injector
+
+	// SegmentIOFaultInjector is a test-only deterministic segment-file I/O
+	// fault seam, forwarded to every segment writer the orchestrator opens
+	// (backfill, bootstrap-live, merge, steady-state) and to the
+	// compaction-rewrite and import-patch call sites. Production leaves it
+	// nil, mirroring CrashInjector.
+	SegmentIOFaultInjector segment.IOFaultInjector
 }
 
 func (c *Config) validate() error {

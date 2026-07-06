@@ -114,6 +114,8 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			OnAfterSeal:           o.cfg.IngestOnAfterSeal,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,
 			Dial:                  o.cfg.LiveDial,
+
+			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)

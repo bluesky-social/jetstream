@@ -50,14 +50,15 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		// Backfill writer (shared with the backfill engine).
 		bw, err := ingest.Open(ingest.Config{
-			SegmentsDir:       segmentsDir,
-			DataDir:           o.cfg.DataDir,
-			Store:             o.cfg.Store,
-			Logger:            o.cfg.Logger,
-			Metrics:           o.cfg.IngestMetrics,
-			SegmentMetrics:    o.cfg.SegmentMetrics,
-			AsyncFlushWorkers: o.cfg.BackfillAsyncFlushWorkers,
-			OnAfterSeal:       o.cfg.IngestOnAfterSeal,
+			SegmentsDir:            segmentsDir,
+			DataDir:                o.cfg.DataDir,
+			Store:                  o.cfg.Store,
+			Logger:                 o.cfg.Logger,
+			Metrics:                o.cfg.IngestMetrics,
+			SegmentMetrics:         o.cfg.SegmentMetrics,
+			AsyncFlushWorkers:      o.cfg.BackfillAsyncFlushWorkers,
+			OnAfterSeal:            o.cfg.IngestOnAfterSeal,
+			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: open backfill ingest writer: %w", err)
@@ -82,6 +83,8 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			OnEvent:           o.cfg.OnBootstrapLiveEvent,
 			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
 			Dial:              o.cfg.LiveDial,
+
+			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
 			if cerr := bw.Close(); cerr != nil {
@@ -259,7 +262,8 @@ func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.
 			// histogram is a global concern and we want every
 			// segment.Writer in the process recording into the same
 			// series.
-			SegmentMetrics: o.cfg.SegmentMetrics,
+			SegmentMetrics:         o.cfg.SegmentMetrics,
+			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: re-open bootstrap-live writer for seal: %w", err)

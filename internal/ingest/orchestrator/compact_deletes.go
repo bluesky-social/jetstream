@@ -374,9 +374,14 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
 						return segment.RowDrop
 					}
 					return segment.RowKeep
-				}, segment.RewriteOptions{CrashInjector: crashpoint.ForSegment(o.cfg.CrashInjector), CandidateDIDs: candidateDIDs})
+				}, segment.RewriteOptions{
+					CrashInjector:   crashpoint.ForSegment(o.cfg.CrashInjector),
+					IOFaultInjector: o.cfg.SegmentIOFaultInjector,
+					CandidateDIDs:   candidateDIDs,
+				})
 				if err != nil {
-					return fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err)
+					return ingest.WrapDiskFull(o.cfg.DataDir, "rewriting segment during compaction",
+						fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err))
 				}
 				mu.Lock()
 				results = append(results, compactionRewriteResult{file: f, result: res, droppedByReason: droppedByReason})

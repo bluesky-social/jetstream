@@ -69,14 +69,15 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		}
 
 		dst, err := ingest.Open(ingest.Config{
-			SegmentsDir:    segmentsDir,
-			DataDir:        o.cfg.DataDir,
-			Store:          o.cfg.Store,
-			SeqKey:         live.SteadySeqKey,
-			Logger:         o.cfg.Logger,
-			Metrics:        o.cfg.IngestMetrics,
-			SegmentMetrics: o.cfg.SegmentMetrics,
-			OnAfterSeal:    o.cfg.IngestOnAfterSeal,
+			SegmentsDir:            segmentsDir,
+			DataDir:                o.cfg.DataDir,
+			Store:                  o.cfg.Store,
+			SeqKey:                 live.SteadySeqKey,
+			Logger:                 o.cfg.Logger,
+			Metrics:                o.cfg.IngestMetrics,
+			SegmentMetrics:         o.cfg.SegmentMetrics,
+			OnAfterSeal:            o.cfg.IngestOnAfterSeal,
+			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)
@@ -165,14 +166,15 @@ func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDi
 	}
 
 	w, err := ingest.Open(ingest.Config{
-		SegmentsDir:     liveSegmentsDir,
-		DataDir:         o.cfg.DataDir,
-		Store:           o.cfg.Store,
-		SeqKey:          live.BootstrapSeqKey,
-		Logger:          o.cfg.Logger,
-		Metrics:         nil,
-		SegmentMetrics:  o.cfg.SegmentMetrics,
-		MaxSegmentBytes: 0,
+		SegmentsDir:            liveSegmentsDir,
+		DataDir:                o.cfg.DataDir,
+		Store:                  o.cfg.Store,
+		SeqKey:                 live.BootstrapSeqKey,
+		Logger:                 o.cfg.Logger,
+		Metrics:                nil,
+		SegmentMetrics:         o.cfg.SegmentMetrics,
+		MaxSegmentBytes:        0,
+		SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 	})
 	if err != nil {
 		return fmt.Errorf("orchestrator: merge: reopen active source for seal: %w", err)
