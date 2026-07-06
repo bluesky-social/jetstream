@@ -12,6 +12,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
@@ -155,4 +156,11 @@ func (o Options) effectiveBackfillBatchSize() int {
 		return o.BackfillBatchSize
 	}
 	return DefaultBackfillBatchSize
+}
+
+func (o Options) effectiveSubscribeHotTailBytes() int {
+	if o.SubscribeHotTailBytes > 0 {
+		return o.SubscribeHotTailBytes
+	}
+	return subscribe.DefaultHotTailBytes
 }

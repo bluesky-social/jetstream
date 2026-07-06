@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -31,6 +32,7 @@ type tailConfig struct {
 	// empty/edge cursor as "block at tip" vs "read cold from disk". Optional
 	// in tests; nil means "use the ring's resident tip only".
 	nextSeq func() uint64
+	readLog func() *ingest.ReadableLog
 }
 
 // Tail is the unified event-fanout core. Ingest calls Append; every
@@ -44,6 +46,7 @@ type Tail struct {
 	blocked chan uint64   // nonblocking test/diagnostic signal when a reader parks at the tip
 	cold    coldReader
 	nextSeq func() uint64
+	readLog func() *ingest.ReadableLog
 	logger  *slog.Logger
 
 	// regressFloor is the durable live-edge floor of the most recent non-dense
@@ -109,8 +112,17 @@ func newTail(cfg tailConfig) *Tail {
 		blocked: make(chan uint64, 1024),
 		cold:    cfg.cold,
 		nextSeq: cfg.nextSeq,
+		readLog: cfg.readLog,
 		logger:  cfg.logger,
 	}
+}
+
+// SetReadLogSource points the tail at the writer-owned readable log. Wire it
+// before publishing the steady-state writer to subscribers.
+func (t *Tail) SetReadLogSource(fn func() *ingest.ReadableLog) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.readLog = fn
 }
 
 // Append copies ev into the hot ring and wakes any readers parked at the
@@ -228,6 +240,37 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 			return nil, cursor, err
 		}
 		t.mu.Lock()
+		readLog := t.readLog
+		t.mu.Unlock()
+		if readLog != nil {
+			if log := readLog(); log != nil {
+				entries, notify, ok, atTip := log.ReadFrom(cursor, max)
+				if ok {
+					out := make([]*Entry, len(entries))
+					for i := range entries {
+						out[i] = entryFromReadLog(entries[i])
+					}
+					next := out[len(out)-1].Event.Seq + 1
+					t.metrics.incHotReads()
+					return out, next, nil
+				}
+				if !atTip && cursor < log.FloorSeq() {
+					t.metrics.incColdReads()
+					return t.cold(ctx, cursor, max)
+				}
+				select {
+				case t.blocked <- cursor:
+				default:
+				}
+				select {
+				case <-ctx.Done():
+					return nil, cursor, ctx.Err()
+				case <-notify:
+					continue
+				}
+			}
+		}
+		t.mu.Lock()
 		entries, ok := t.ring.lookup(cursor)
 		// lookup returns a slice aliasing the ring's backing array. A
 		// concurrent Append→evict nils and reslices that array, which would
@@ -284,6 +327,14 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 // Tip returns the live-edge seq where a no-cursor (live) subscriber starts: it
 // will block until the next Append rather than replaying history.
 func (t *Tail) Tip() uint64 {
+	t.mu.Lock()
+	readLog := t.readLog
+	t.mu.Unlock()
+	if readLog != nil {
+		if log := readLog(); log != nil {
+			return log.TipSeq()
+		}
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.liveTipLocked()

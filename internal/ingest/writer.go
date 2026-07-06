@@ -39,13 +39,8 @@ type Writer struct {
 	activeIdx      uint64
 	nextSeq        uint64
 	durableNextSeq uint64
+	readLog        *ReadableLog
 	closed         bool
-
-	// orderedSink, when set, receives every successfully appended event in
-	// global seq order. Guarded by drainMu (written by SetOrderedEventSink,
-	// read by Append/AppendBatch while they hold drainMu). See
-	// SetOrderedEventSink for the full contract.
-	orderedSink func(ev *segment.Event)
 
 	async            *asyncFlushPipeline
 	asyncJobs        sync.WaitGroup
@@ -222,6 +217,7 @@ func Open(cfg Config) (*Writer, error) {
 	}
 	w.nextSeq = reconciled
 	w.durableNextSeq = reconciled
+	w.readLog = newReadableLog(reconciled, cfg.ReadLogRetentionBytes, cfg.Metrics)
 
 	w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
@@ -324,54 +320,6 @@ func (w *Writer) SealActiveAndClose() error {
 	return nil
 }
 
-// SetOrderedEventSink installs sink to receive every successfully appended
-// event — from ALL producers sharing this writer — in global seq order with
-// no gaps between successful appends. Wire it before any producer starts;
-// installing it mid-stream would present the sink with a truncated prefix.
-//
-// This is the tail-feed seam for /subscribe (#244): unlike the per-consumer
-// OnEvent hook (which only the live consumer fires), the sink fires inside
-// Append/AppendBatch under the writer's admission barrier (drainMu), after
-// the internal mutex is released — so producers that bypass consumer hooks
-// (the failed-repo retry runner writing through the shared steady writer)
-// still reach the sink, and two concurrent producers can never deliver out
-// of seq order.
-//
-// Contract:
-//   - The sink runs on the append hot path for every event; it must be
-//     fast and non-blocking.
-//   - It must not call back into the Writer: it runs under drainMu, so
-//     Flush/DrainDurability/Append re-entry would self-deadlock. (Reading
-//     NextSeq from OTHER goroutines while the sink runs is fine — the
-//     lock order drainMu → sink-internal locks → w.mu stays acyclic.)
-//   - The *segment.Event is only valid for the duration of the call; the
-//     sink must copy what it retains (same aliasing rule as OnEvent).
-//   - Delivery is pre-durability (the event sits in the pending block),
-//     matching the live consumer's existing OnEvent semantics.
-//   - On an append error the failed event is NOT delivered even if it
-//     internally consumed a seq; the downstream hot ring heals the gap by
-//     resetting (see subscribe.hotRing) — acceptable because writer
-//     errors on this path abort ingestion anyway.
-//
-// Mutually exclusive with AsyncFlushWorkers: panics on an async-flush writer.
-// The async paths deliver to the sink after PrepareFlush detaches a filled
-// block but before the background commit lands it in the file, so a delivered
-// event can transiently be readable NOWHERE on the cold path (not in
-// SnapshotPending, not in the active file). A hot-ring eviction inside that
-// window would leave subscribers' cold fallback staring at a hole. No
-// production wiring needs sink+async (the sink feeds /subscribe from the sync
-// steady writer; async is bootstrap-backfill-only), so this is invalid
-// internal wiring — fail loud at startup rather than document a landmine.
-// The #248 readable-log refactor deletes this dichotomy.
-func (w *Writer) SetOrderedEventSink(sink func(ev *segment.Event)) {
-	if w.async != nil {
-		panic("ingest: SetOrderedEventSink is not supported with AsyncFlushWorkers (see issue #249)")
-	}
-	w.drainMu.Lock()
-	defer w.drainMu.Unlock()
-	w.orderedSink = sink
-}
-
 // Append writes one event into the active segment. On success,
 // mutates ev.Seq in place to the allocated value; on error ev.Seq
 // is left untouched so callers can safely retry without observing
@@ -383,9 +331,6 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 		job, err := w.appendLocked(ctx, ev)
 		w.mu.Unlock()
 		if err == nil {
-			// No orderedSink delivery here: the sink cannot be installed on
-			// an async writer (SetOrderedEventSink panics), because a
-			// just-prepared block is not yet cold-readable. See #249.
 			w.submitAsyncFlushes([]*asyncFlushJob{job})
 		}
 		w.drainMu.Unlock()
@@ -409,9 +354,6 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	if err != nil {
 		return err
 	}
-	if w.orderedSink != nil {
-		w.orderedSink(ev)
-	}
 	return nil
 }
 
@@ -430,7 +372,6 @@ func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error 
 	var jobs []*asyncFlushJob
 	var appendErr error
 
-	appended := 0
 	for i := range events {
 		job, err := w.appendLocked(ctx, &events[i])
 		if job != nil {
@@ -440,19 +381,9 @@ func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error 
 			appendErr = err
 			break
 		}
-		appended++
 	}
 	w.mu.Unlock()
 	w.submitAsyncFlushes(jobs)
-	if w.orderedSink != nil {
-		// Deliver the successfully appended prefix even on a partial batch
-		// failure: those events consumed seqs and sit in the segment, so
-		// withholding them would punch a permanent hole in the sink's view
-		// while the seq space moved on.
-		for i := range appended {
-			w.orderedSink(&events[i])
-		}
-	}
 	w.drainMu.Unlock()
 
 	flushErr := w.waitSubmittedAsyncFlushes(jobs)
@@ -482,6 +413,7 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 	w.nextSeq++
 	w.cfg.Metrics.incEventsAppended()
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
+	w.readLog.append(&candidate)
 
 	if w.cfg.OnAppend != nil {
 		if err := w.cfg.OnAppend(ev); err != nil {
@@ -576,7 +508,7 @@ func (w *Writer) drainAsync(ctx context.Context) error {
 	if w.closed {
 		return ErrClosed
 	}
-	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true)
+	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, w.sampleDurableBatchPrepareValueLocked())
 }
 
 func (w *Writer) drainSync(ctx context.Context) error {
@@ -593,7 +525,7 @@ func (w *Writer) drainSync(ctx context.Context) error {
 			return err
 		}
 	}
-	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true)
+	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, w.sampleDurableBatchPrepareValueLocked())
 }
 
 // DrainDurability forces pending event-backed metadata to its block durability
@@ -619,7 +551,7 @@ func (w *Writer) SetDurableBatchHook(h DurableBatchHook) {
 }
 
 func (w *Writer) commitTerminalDurableBatchLocked() error {
-	return w.commitDurableBatchLocked(context.Background(), w.nextSeq, true)
+	return w.commitDurableBatchLocked(context.Background(), w.nextSeq, true, w.sampleDurableBatchPrepareValueLocked())
 }
 
 // flushAndRotateLocked is the post-Append durability commit. The
@@ -661,22 +593,18 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 }
 
 // flushBlockLocked is the shared flush-side of the durability commit:
-// fsync the pending block, pebble.Sync seq/next, fire OnAfterFlush.
+// fsync the pending block, then pebble.Sync seq/next and durable-batch
+// metadata.
 // The caller MUST hold w.mu.
 func (w *Writer) flushBlockLocked(ctx context.Context) error {
+	prepareValue := w.sampleDurableBatchPrepareValueLocked()
 	if err := w.active.Flush(); err != nil {
 		return w.wrapSegmentPersistenceError("flushing active segment block", fmt.Errorf("ingest: flush block: %w", err))
 	}
 	w.cfg.Metrics.incBlocksFlushed()
 
-	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false); err != nil {
+	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, prepareValue); err != nil {
 		return err
-	}
-
-	if w.cfg.OnAfterFlush != nil {
-		if err := w.cfg.OnAfterFlush(ctx); err != nil {
-			return fmt.Errorf("ingest: on_after_flush: %w", err)
-		}
 	}
 	return nil
 }
@@ -689,8 +617,11 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
 // upstream relay is down) for no compliance benefit. Goroutine-safe;
 // concurrent Appends serialize against the rotation on w.mu.
 func (w *Writer) ForceRotate(ctx context.Context) error {
+	w.drainMu.Lock()
+	defer w.drainMu.Unlock()
+
 	if w.async != nil {
-		return fmt.Errorf("ingest: force rotate is not supported with async flush")
+		w.asyncJobs.Wait()
 	}
 
 	w.mu.Lock()
@@ -765,6 +696,11 @@ func (w *Writer) NextSeq() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.nextSeq
+}
+
+// ReadLog returns the writer-owned readable log.
+func (w *Writer) ReadLog() *ReadableLog {
+	return w.readLog
 }
 
 // SnapshotPending returns a copy of every event currently buffered in
@@ -918,7 +854,14 @@ func stageNextSeq(b *pebble.Batch, key string, v uint64) error {
 	return nil
 }
 
-func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force bool) error {
+func (w *Writer) sampleDurableBatchPrepareValueLocked() any {
+	if w.cfg.DurableBatchPrepareValue == nil {
+		return nil
+	}
+	return w.cfg.DurableBatchPrepareValue()
+}
+
+func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force bool, prepareValue any) error {
 	// The block this commit describes is already fsynced by the time we get
 	// here (flushBlockLocked / commitAsyncFlush / the drain paths all flush
 	// first). The durable metadata commit must therefore run to completion
@@ -940,7 +883,7 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 	var afterDone func(error)
 	var commitErr error
 	if w.cfg.OnDurableBatch != nil {
-		cb, done, err := w.cfg.OnDurableBatch(ctx, b, nextSeq, force)
+		cb, done, err := w.cfg.OnDurableBatch(ctx, b, nextSeq, force, prepareValue)
 		if err != nil {
 			return fmt.Errorf("ingest: on_durable_batch: %w", err)
 		}
@@ -958,6 +901,7 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 		return w.wrapSegmentPersistenceError("committing durable metadata batch", fmt.Errorf("ingest: commit durable batch: %w", commitErr))
 	}
 	w.durableNextSeq = nextSeq
+	w.readLog.advanceDurable(nextSeq)
 	if afterCommit != nil {
 		afterCommit()
 	}

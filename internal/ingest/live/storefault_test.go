@@ -10,17 +10,16 @@ import (
 
 // TestConsumer_SaveCursorFailsLoudOnStoreFault pins the fail-loud contract for
 // the relay-cursor commit boundary (issue #30 fault point: "relay cursor
-// writes"). saveCursorAndSyncState is the production path that persists the
-// firehose resume cursor (batched with verifier sync state under one Sync
-// commit). A failed commit must surface as an error so the caller
-// (onAfterFlush -> the ingest flush hook -> the consumer Run loop) tears the
-// process down, rather than reporting a durable cursor advance that never
-// reached disk — which across a restart would resume the firehose from a seq
-// that was never persisted, silently skipping events.
+// writes"). The production writer durable-batch path stages the same cursor
+// write with verifier sync state under one Sync commit. A failed commit must
+// surface as an error so the consumer Run loop tears the process down, rather
+// than reporting a durable cursor advance that never reached disk — which
+// across a restart would resume the firehose from a seq that was never
+// persisted, silently skipping events.
 //
 // The fault targets the relay/cursor batch commit; the assertion is that
-// saveCursorAndSyncState propagates the injected error AND the cursor is not
-// durable (no silent advance).
+// saveCursorAndSyncState exercises the same staging helper and must propagate
+// the injected error AND leave the cursor non-durable (no silent advance).
 func TestConsumer_SaveCursorFailsLoudOnStoreFault(t *testing.T) {
 	t.Parallel()
 

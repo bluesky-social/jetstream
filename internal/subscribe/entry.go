@@ -3,6 +3,7 @@ package subscribe
 import (
 	"sync"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -40,6 +41,21 @@ type Entry struct {
 // alias a shared decompressed block buffer).
 func newEntry(ev *segment.Event) *Entry {
 	return &Entry{Event: ev, encodeFn: Encode}
+}
+
+func entryFromReadLog(le *ingest.ReadLogEntry) *Entry {
+	if memo := le.LoadMemo(); memo != nil {
+		if e, ok := memo.(*Entry); ok {
+			return e
+		}
+	}
+	e := newEntry(le.Event())
+	if memo := le.LoadOrStoreMemo(e); memo != nil {
+		if got, ok := memo.(*Entry); ok {
+			return got
+		}
+	}
+	return e
 }
 
 // Encoded returns the memoized wire encoding for this entry. The first

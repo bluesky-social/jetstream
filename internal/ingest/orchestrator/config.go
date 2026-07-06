@@ -140,6 +140,11 @@ type Config struct {
 	// the bootstrap backfill writer only. Zero keeps synchronous flushing.
 	BackfillAsyncFlushWorkers int
 
+	// ReadLogRetentionBytes bounds the steady-state writer readable log's
+	// durable retention window. Bootstrap writers leave this zero so they retain
+	// only not-yet-durable pinned entries while no subscribers are admitted.
+	ReadLogRetentionBytes int64
+
 	// BootstrapLiveMaxSegmentBytes and BootstrapLiveMaxEventsPerBlock forward
 	// to the bootstrap-time live_segments writer. Zero leaves ingest defaults.
 	// Production leaves these unset; restart oracle tests use tiny limits to

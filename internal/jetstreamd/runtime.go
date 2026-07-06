@@ -253,14 +253,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        mft,
-		WriterRef:       &writerPtr,
-		BlockCacheBytes: opts.SubscribeBlockCacheBytes,
+		Manifest:           mft,
+		WriterRef:          &writerPtr,
+		BlockCacheBytes:    opts.SubscribeBlockCacheBytes,
+		StopAtReadLogFloor: true,
 	})
 	tail, err := subscribe.New(subscribe.Config{
 		Logger:       processLogger,
 		Metrics:      subscribeMetrics,
-		HotTailBytes: opts.SubscribeHotTailBytes,
+		HotTailBytes: opts.effectiveSubscribeHotTailBytes(),
 		ReadBatch:    opts.SubscribeReadBatch,
 		SlowWindow:   opts.SubscribeSlowWindow,
 		SlowMinRate:  opts.SubscribeSlowMinRate,
@@ -297,13 +298,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// (backfill engine, bootstrap-time live consumer, steady-state
 	// live consumer). The runtime is no longer phase-aware.
 	//
-	// The /subscribe tail is fed from the steady writer's ordered event
-	// sink (installed in OnSteadyStateWriter below), NOT from the live
-	// consumer's OnEvent hook: every producer sharing the steady writer —
-	// the live consumer AND the failed-repo retry runner — must reach the
-	// hot ring in global seq order, or the ring's dense-seq index math
-	// serves wrong events and can wedge the tail mutex (#244). OnEvent
-	// remains the live-consumer-only observation hook for tests/oracle.
+	// The /subscribe tail reads the steady writer's readable log (wired in
+	// OnSteadyStateWriter below), not the live consumer's OnEvent hook: every
+	// producer sharing the steady writer — the live consumer AND the failed-repo
+	// retry runner — must become visible through the writer-owned seq stream.
+	// OnEvent remains the live-consumer-only observation hook for tests/oracle.
 	onSteadyStateEvent := func(ev *segment.Event) {
 		if opts.OnSteadyStateEvent != nil {
 			opts.OnSteadyStateEvent(ev)
@@ -346,6 +345,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		BackfillWorkers:                opts.effectiveBackfillWorkers(),
 		BackfillBatchSize:              opts.effectiveBackfillBatchSize(),
 		BackfillAsyncFlushWorkers:      opts.BackfillAsyncFlushWorkers,
+		ReadLogRetentionBytes:          int64(opts.effectiveSubscribeHotTailBytes()),
 		BootstrapLiveMaxSegmentBytes:   opts.BootstrapLiveMaxSegmentBytes,
 		BootstrapLiveMaxEventsPerBlock: opts.BootstrapLiveMaxEventsPerBlock,
 		BackfillRepos:                  opts.BackfillRepos,
@@ -374,9 +374,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CrashInjector:                  opts.CrashInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			// Fires after the steady writer opens and before any producer
-			// (live consumer, retry runner, compactor) starts, so the sink
-			// sees the seq stream from its first event.
-			w.SetOrderedEventSink(tail.Append)
+			// (live consumer, retry runner, compactor) starts, so subscribers
+			// read the writer-owned log from its first event.
+			tail.SetReadLogSource(func() *ingest.ReadableLog { return w.ReadLog() })
 			writerPtr.Store(w)
 		},
 	})

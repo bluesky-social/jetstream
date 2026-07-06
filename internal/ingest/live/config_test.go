@@ -144,10 +144,10 @@ func TestOpen_UsesConfiguredSeqKey(t *testing.T) {
 //     to relay/cursor on Close even when no block flush ever fired
 //     (e.g. a low-volume restart that buffers <1 block of events).
 //
-// Without the explicit cursor save on Close, a clean shutdown could
-// regress relay/cursor to whatever value the OnAfterFlush hook last
-// wrote — which on a slow stream might be 0 (never flushed) and
-// would replay the entire bootstrap window on next start.
+// Without the terminal durable batch on Close, a clean shutdown could regress
+// relay/cursor to whatever value the last block-flush durable batch wrote —
+// which on a slow stream might be 0 (never flushed) and would replay the entire
+// bootstrap window on next start.
 func TestClose_Idempotent_AndPersistsCursor(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
@@ -175,7 +175,7 @@ func TestClose_Idempotent_AndPersistsCursor(t *testing.T) {
 	// Pre-Close, cursor must NOT yet be persisted (no flush happened).
 	_, _, err = st.Get([]byte("relay/cursor"))
 	require.ErrorIs(t, err, pebble.ErrNotFound,
-		"no flush has fired yet, so OnAfterFlush should not have run")
+		"no flush has fired yet, so no cursor durable batch should have run")
 
 	require.NoError(t, c.Close())
 	require.NoError(t, c.Close(), "second Close must be a no-op")

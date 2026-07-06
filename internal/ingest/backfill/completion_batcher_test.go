@@ -32,7 +32,7 @@ func TestCompletionBatcherStagesCompletionAtDurableSeq(t *testing.T) {
 	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev1"}))
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -71,7 +71,7 @@ func TestCompletionBatcherDoesNotStageCompletionAtEqualDurableSeq(t *testing.T) 
 	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-equal"}))
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.Nil(t, afterCommit)
 	require.Nil(t, afterDone)
@@ -80,7 +80,7 @@ func TestCompletionBatcherDoesNotStageCompletionAtEqualDurableSeq(t *testing.T) 
 	require.NoError(t, b.Close())
 
 	b = st.NewBatch()
-	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 43, false)
+	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 43, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -133,7 +133,7 @@ func TestCompletionBatcherStagesExplicitEmptyRepoCompletion(t *testing.T) {
 	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-empty"}))
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 0, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 0, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -180,7 +180,7 @@ func TestCompletionBatcherCommitsMultipleCompletionsInOneBatch(t *testing.T) {
 	// nextSeq=42 means events through seq 41 are durable, so both completions
 	// are eligible and must stage into the same batch.
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -236,7 +236,7 @@ func TestCompletionBatcherForcedStageRejectsNonDurableAppendedCompletion(t *test
 	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-forced"}))
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, true)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, true, nil)
 	require.Error(t, err, "forced commit must reject an appended completion whose events are not durable")
 	require.ErrorContains(t, err, "events not durable")
 	require.Nil(t, afterCommit)
@@ -251,7 +251,7 @@ func TestCompletionBatcherForcedStageRejectsNonDurableAppendedCompletion(t *test
 	// completion queued until its block becomes durable. This proves the guard
 	// is force-only and does not disturb the steady per-block path.
 	b2 := st.NewBatch()
-	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b2, 42, false)
+	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b2, 42, false, nil)
 	require.NoError(t, err)
 	require.Nil(t, afterCommit)
 	require.Nil(t, afterDone)
@@ -281,7 +281,7 @@ func TestCompletionBatcherQueueCompleteReplacesDuplicateDID(t *testing.T) {
 	require.Equal(t, completionWatermark{lastSeq: 42, appended: true}, cb.queued[0].watermark)
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 43, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 43, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -322,7 +322,7 @@ func TestCompletionBatcherHoldsCountsLockUntilAfterDone(t *testing.T) {
 
 	b := st.NewBatch()
 	defer func() { _ = b.Close() }()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -378,7 +378,7 @@ func TestCompletionBatcherAfterCommitRemovesOnlyStagedCompletions(t *testing.T) 
 	require.NoError(t, cb.QueueComplete(t.Context(), pending, "", &repo.Commit{DID: string(pending), Rev: "rev-pending"}))
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -402,7 +402,7 @@ func TestCompletionBatcherAfterCommitRemovesOnlyStagedCompletions(t *testing.T) 
 	require.Equal(t, pending, cb.queued[0].did)
 
 	b = st.NewBatch()
-	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 51, false)
+	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 51, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -446,7 +446,7 @@ func TestCompletionBatcherRecordsQueueAndDurableBatchMetrics(t *testing.T) {
 	require.InDelta(t, 2.0, testutil.ToFloat64(metrics.CompletionQueueDepth), 0)
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -484,7 +484,7 @@ func TestCompletionBatcherCommitFailureKeepsStagedCompletionQueued(t *testing.T)
 	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-retry"}))
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -497,7 +497,7 @@ func TestCompletionBatcherCommitFailureKeepsStagedCompletionQueued(t *testing.T)
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
 
 	b = st.NewBatch()
-	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 42, false)
+	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -533,7 +533,7 @@ func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *te
 	require.NoError(t, cb.QueueComplete(t.Context(), did, "", &repo.Commit{DID: string(did), Rev: "rev-old"}))
 
 	b := st.NewBatch()
-	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false)
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
@@ -555,7 +555,7 @@ func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *te
 	require.Equal(t, "rev-new", cb.queued[0].commit.Rev)
 
 	b = st.NewBatch()
-	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 43, false)
+	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 43, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)

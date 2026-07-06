@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/require"
 )
 
@@ -78,7 +79,7 @@ func TestConfigValidate_RejectsNegativeAsyncFlushWorkers(t *testing.T) {
 	require.ErrorContains(t, err, "AsyncFlushWorkers")
 }
 
-func TestConfigValidate_RejectsAsyncFlushWithOnAfterFlush(t *testing.T) {
+func TestConfigValidate_AllowsAsyncFlushWithDurableBatchHook(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
@@ -86,10 +87,11 @@ func TestConfigValidate_RejectsAsyncFlushWithOnAfterFlush(t *testing.T) {
 		Store:             &store.Store{},
 		Logger:            logger,
 		AsyncFlushWorkers: 1,
-		OnAfterFlush:      func(_ context.Context) error { return nil },
+		OnDurableBatch: func(context.Context, *pebble.Batch, uint64, bool, any) (func(), func(error), error) {
+			return nil, nil, nil
+		},
 	}
 
 	err := cfg.validate()
-	require.ErrorIs(t, err, ErrInvalidConfig)
-	require.ErrorContains(t, err, "OnAfterFlush")
+	require.NoError(t, err)
 }

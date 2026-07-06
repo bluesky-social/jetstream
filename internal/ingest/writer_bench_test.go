@@ -110,10 +110,8 @@ func BenchmarkWriterBackfillShape(b *testing.B) {
 }
 
 // BenchmarkWriterLiveShape drives the writer the way the steady-state
-// live consumer does: single goroutine, per-event Append, with an
-// installed ordered sink (nil-cost check when absent). Reports
-// events/sec and captures the block-boundary flush stall that a sync
-// appender pays inline.
+// live consumer does: single goroutine, per-event Append. Reports events/sec
+// and captures the block-boundary flush stall that a sync appender pays inline.
 func BenchmarkWriterLiveShape(b *testing.B) {
 	payload := make([]byte, 200)
 	for i := range payload {
@@ -123,12 +121,9 @@ func BenchmarkWriterLiveShape(b *testing.B) {
 	for _, mode := range []struct {
 		name  string
 		async int
-		sink  bool
 	}{
-		{"sync/nosink", 0, false},
-		{"sync/sink", 0, true},
-		// No async+sink mode: SetOrderedEventSink rejects async writers (#249).
-		{"async4/nosink", 4, false},
+		{"sync", 0},
+		{"async4", 4},
 	} {
 		b.Run(mode.name, func(b *testing.B) {
 			root := os.Getenv("BENCH_DIR")
@@ -143,10 +138,6 @@ func BenchmarkWriterLiveShape(b *testing.B) {
 				b.Cleanup(func() { _ = os.RemoveAll(root) })
 			}
 			w := newBenchWriter(b, root, mode.async)
-			var sunk uint64
-			if mode.sink {
-				w.SetOrderedEventSink(func(ev *segment.Event) { sunk += ev.Seq & 1 })
-			}
 
 			b.ResetTimer()
 			for b.Loop() {

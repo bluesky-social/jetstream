@@ -12,8 +12,9 @@ import (
 
 // DurableBatchHook stages block-specific metadata into the same synced Pebble
 // batch that persists the writer's next sequence after a segment block is
-// durable.
-type DurableBatchHook func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool) (afterCommit func(), afterDone func(error), err error)
+// durable. prepareValue is the value sampled by DurableBatchPrepareValue before
+// the block was detached/flushed.
+type DurableBatchHook func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool, prepareValue any) (afterCommit func(), afterDone func(error), err error)
 
 // defaultMaxSegmentBytes is the rotation threshold. DESIGN.md §3.1.1
 // names ~256MB as the target sealed-segment size. Operator-tunable
@@ -48,10 +49,14 @@ type Config struct {
 
 	// AsyncFlushWorkers enables a backfill-oriented pipeline that detaches
 	// full segment blocks under the writer mutex, compresses them outside the
-	// mutex, then commits them in order before AppendBatch returns. This must
-	// not be used with OnAfterFlush until that hook is made block-specific;
-	// the live consumer currently uses it to persist a mutable cursor.
+	// mutex, then commits them in order before AppendBatch returns.
 	AsyncFlushWorkers int
+
+	// ReadLogRetentionBytes bounds the durable tail retained in the writer's
+	// readable log. Events that are not yet durable are pinned regardless of
+	// this budget. Zero is legal and means "retain only pinned events". Negative
+	// values are rejected.
+	ReadLogRetentionBytes int64
 
 	// SeqKey is the pebble key holding the writer's seq counter.
 	// Default "seq/next" preserves backfill-writer behavior. The
@@ -60,24 +65,11 @@ type Config struct {
 	// when a single pebble store is shared between multiple writers.
 	SeqKey string
 
-	// OnAfterFlush, if non-nil, runs after each block flush has
-	// completed: segment.Flush has fsynced and SeqKey has been
-	// pebble.Sync'd. Errors propagate up through Append. A nil hook
-	// is a no-op. Used by the live consumer to advance "relay/cursor"
-	// with the same per-block cadence as seq/next.
-	//
-	// Hooks must not call back into the Writer (that would deadlock
-	// on the writer mutex) or perform unbounded I/O (that would stall
-	// every Append in the active worker pool).
-	OnAfterFlush func(ctx context.Context) error
-
 	// OnDurableBatch, if non-nil, stages extra metadata into the same synced
 	// Pebble batch that persists SeqKey after a segment block has been fsynced.
 	// The hook may return an afterCommit callback, which runs only after the
 	// batch commit succeeds, and an afterDone callback, which runs after the
-	// batch commit attempt on both success and failure. Unlike OnAfterFlush,
-	// this hook is supported with AsyncFlushWorkers because it is tied to a
-	// specific durable block.
+	// batch commit attempt on both success and failure.
 	//
 	// The hook, afterCommit callback, and afterDone callback run under the
 	// writer mutex. Hooks must not call back into the Writer (that would
@@ -92,6 +84,16 @@ type Config struct {
 	// gate every staged row on nextSeq, never on force, or it would mark data
 	// durable ahead of its segment fsync (violating DESIGN.md §3.1.1 ordering).
 	OnDurableBatch DurableBatchHook
+
+	// DurableBatchPrepareValue, if non-nil, is sampled while the writer mutex is
+	// held immediately before a block is detached/flushed. The sampled value is
+	// carried to OnDurableBatch for that specific block, including async flush
+	// jobs. Force/terminal durable commits sample it at commit time. This is for
+	// metadata that must be tied to the block's prepare-time view, such as the
+	// live relay cursor watermark.
+	//
+	// The sampler must not call back into the Writer and must be cheap.
+	DurableBatchPrepareValue func() any
 
 	// OnAppend, if non-nil, runs synchronously inside Append after
 	// the event's Seq is assigned and BEFORE the block can flush or
@@ -162,9 +164,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("%w: AsyncFlushWorkers must be >= 0 (got %d)",
 			ErrInvalidConfig, c.AsyncFlushWorkers)
 	}
-	if c.AsyncFlushWorkers > 0 && c.OnAfterFlush != nil {
-		return fmt.Errorf("%w: AsyncFlushWorkers cannot be used with OnAfterFlush",
-			ErrInvalidConfig)
+	if c.ReadLogRetentionBytes < 0 {
+		return fmt.Errorf("%w: ReadLogRetentionBytes must be >= 0 (got %d)",
+			ErrInvalidConfig, c.ReadLogRetentionBytes)
 	}
 	return nil
 }

@@ -19,13 +19,17 @@ type WalkInput struct {
 	// Seq < StartSeq are skipped silently.
 	StartSeq uint64
 
+	// StopSeq, when non-zero, is the exclusive upper bound for cold replay.
+	// Production passes the writer readable-log floor so WalkFromCursor only
+	// serves durable data below that boundary.
+	StopSeq uint64
+
 	// Manifest is the in-memory segment manifest. May be nil; callers
 	// without sealed segments still walk the active segment + pending.
 	Manifest *manifest.Manifest
 
-	// Writer is the ingest writer; the walker reads its active
-	// segment's flushed blocks and SnapshotPending() events to extend
-	// past the sealed-segment region. Required.
+	// Writer is the ingest writer; the walker reads its active segment's
+	// flushed blocks to extend past the sealed-segment region. Required.
 	Writer *ingest.Writer
 
 	// BlockCache, when non-nil, serves sealed-block decodes through the shared
@@ -46,8 +50,7 @@ type WalkInput struct {
 // Seq >= input.StartSeq, in seq order, across:
 //
 //  1. the sealed-segment region from the manifest,
-//  2. the active segment's flushed blocks,
-//  3. the active segment's in-memory pending block.
+//  2. the active segment's flushed blocks.
 //
 // Halts when emit returns a non-nil error and surfaces the error
 // (errors.Is is honored).
@@ -160,7 +163,11 @@ func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Eve
 			// retry the sealed sweep, which (per the happens-before below)
 			// now sees the freshly-published segment(s). Only when current has
 			// reached the live tip is the walk genuinely complete.
-			if current >= input.Writer.NextSeq() {
+			tip := input.Writer.NextSeq()
+			if input.StopSeq != 0 {
+				tip = input.StopSeq
+			}
+			if current >= tip {
 				return nil
 			}
 			// Otherwise fall through to the retry: a sub-tip gap the empty
@@ -294,8 +301,13 @@ func walkActiveRegion(input WalkInput, start uint64, strict bool, emit func(*seg
 		return current, hole, fmt.Errorf("walk active: %w", walkErr)
 	}
 
-	// Pending in-memory block (only reached when the flushed walk did not
-	// hit a hole).
+	if strict && input.StopSeq != 0 {
+		return current, hole, nil
+	}
+
+	// Pending in-memory block for nil-manifest test callers. Production cold
+	// replay runs in strict mode behind the writer read log and must not read
+	// not-yet-durable memory here.
 	pending := input.Writer.SnapshotPending()
 	for i := range pending {
 		if emitOne(&pending[i]) {
@@ -377,6 +389,10 @@ type ColdReaderConfig struct {
 	Manifest        *manifest.Manifest
 	WriterRef       *atomic.Pointer[ingest.Writer]
 	BlockCacheBytes int // 0 -> DefaultBlockCacheBytes
+	// StopAtReadLogFloor bounds cold replay at Writer.ReadLog().FloorSeq().
+	// Enable this when Tail is wired to the writer read log; leave false for
+	// tests that model hot delivery through Tail.Append without a writer log.
+	StopAtReadLogFloor bool
 }
 
 // errBatchFull is the sentinel the bounded collector returns to stop the
@@ -389,6 +405,7 @@ type ColdReader struct {
 	manifest  *manifest.Manifest
 	writerRef *atomic.Pointer[ingest.Writer]
 	cache     *blockCache
+	stopFloor bool
 }
 
 // NewColdReader returns a ColdReader that serves bounded batches from disk
@@ -404,6 +421,7 @@ func NewColdReader(cfg ColdReaderConfig) *ColdReader {
 		manifest:  cfg.Manifest,
 		writerRef: cfg.WriterRef,
 		cache:     newBlockCache(bytes),
+		stopFloor: cfg.StopAtReadLogFloor,
 	}
 }
 
@@ -427,12 +445,20 @@ func (r *ColdReader) Read(ctx context.Context, cursor uint64, max int) ([]*Entry
 	}
 	batch := make([]*Entry, 0, max)
 	next := cursor
+	var floor uint64
+	if r.stopFloor {
+		floor = w.ReadLog().FloorSeq()
+	}
 	err := WalkFromCursor(ctx, WalkInput{
 		StartSeq:   cursor,
+		StopSeq:    floor,
 		Manifest:   r.manifest,
 		Writer:     w,
 		BlockCache: r.cache,
 	}, func(ev *segment.Event) error {
+		if floor > 0 && ev.Seq >= floor {
+			return errBatchFull
+		}
 		cp := *ev
 		batch = append(batch, newEntry(&cp))
 		next = ev.Seq + 1
@@ -443,6 +469,9 @@ func (r *ColdReader) Read(ctx context.Context, cursor uint64, max int) ([]*Entry
 	})
 	if err != nil && !errors.Is(err, errBatchFull) {
 		return nil, cursor, err
+	}
+	if len(batch) == 0 && floor > cursor {
+		next = floor
 	}
 	return batch, next, nil
 }

@@ -86,7 +86,7 @@ func (b *completionBatcher) QueueComplete(ctx context.Context, did atmos.DID, ho
 	return nil
 }
 
-func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batch, nextSeq uint64, force bool) (func(), func(error), error) {
+func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
