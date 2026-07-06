@@ -378,35 +378,9 @@ func (w *World) GenerateMultiOpCommitForTest(ctx context.Context, idx int, specs
 	if len(specs) == 0 {
 		return nil, nil, fmt.Errorf("simulator: multi-op commit needs at least one op")
 	}
-	if idx < 0 || idx >= w.cfg.Accounts {
-		return nil, nil, fmt.Errorf("simulator: chain account index %d out of range", idx)
-	}
-	canAuthor, err := w.accountCanAuthor(idx)
+	author, rp, store, prevState, err := w.loadRepoForTargetedCommit(idx)
 	if err != nil {
 		return nil, nil, err
-	}
-	if !canAuthor {
-		return nil, nil, fmt.Errorf("simulator: chain account %d is unavailable", idx)
-	}
-	author, err := w.loadAccount(idx)
-	if err != nil {
-		return nil, nil, err
-	}
-	prevState, err := w.loadState(idx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	store := &diffStore{base: &pebbleStore{db: w.db, idx: idx}}
-	tree := mst.NewTree(store)
-	if prevState.DataCID.Defined() {
-		tree = mst.LoadTree(store, prevState.DataCID)
-	}
-	rp := &repo.Repo{
-		DID:   author.DID,
-		Clock: atmos.NewTIDClock(0),
-		Store: store,
-		Tree:  tree,
 	}
 
 	wireOps := make([]comatproto.SyncSubscribeRepos_RepoOp, 0, len(specs))
