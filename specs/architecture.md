@@ -23,7 +23,7 @@ Ingest is a lifecycle state machine that walks through three phases. The orchest
 
 - **Bootstrap** (`internal/ingest/backfill` + `internal/ingest/live`): on first start, two things run in parallel — a live consumer captures the firehose into a temporary `backfill/live_segments/` tree so nothing is missed, while the backfill engine paginates listRepos and downloads every repo via getRepo straight into the archive.
 - **Merge** (`internal/ingest/orchestrator`): once backfill drains, the captured live segments are drained into the permanent `segments/` tree, dropping events already covered by each repo's backfilled head, then a tombstone compaction runs so the archive is delete/update-correct before cutover.
-- **Steady state** (`internal/ingest/live` again): one live consumer pumps the firehose into `segments/`. On the side, a retry loop re-downloads repos that failed during bootstrap and backfills net-new DIDs that first appear live (issue #188). Compaction runs periodically.
+- **Steady state** (`internal/ingest/live` again): one live consumer pumps the firehose into `segments/`. On the side, a retry loop re-downloads repos that failed during bootstrap and backfills net-new DIDs that first appear live (issue #188). Compaction runs periodically to clean up deleted and updated records.
 
 The live consumer and backfill both write through a shared `ingest.Writer` (`internal/ingest`), which owns segment append/flush/fsync, seq assignment, and the in-memory readable log the live tail reads from. All upstream data is untrusted: a validation gate at each conversion point drops bad revs, bad op paths, and unrepresentable fields with a labeled metric rather than crashing or corrupting (`docs/README.md` §4.4).
 
@@ -38,7 +38,7 @@ The durability ordering between these two is the invariant that keeps a crash sa
 
 ### Serve — getting data out
 
-- **`/subscribe` websocket** (`internal/subscribe`): pull-based fan-out. Every subscriber runs the same loop and is served from wherever its cursor points — the writer's readable log (the hot tail) for recent events, or the cold reader (a bounded disk walk over sealed segments through a shared block cache) for older cursors. There's no per-client outbound queue, so a slow reader can't blow up server memory. This package carries a lot of deliberate v1 wire-compatibility quirks; `internal/subscribe/doc.go` lists them.
+- **`/subscribe` websocket** (`internal/subscribe`): pull-based fan-out. Every subscriber runs the same loop and is served from wherever its cursor points — the writer's readable log (the hot tail) for recent events, or the cold reader (a bounded disk walk over sealed segments through a shared block cache) for older cursors. There's no per-client outbound queue, so a slow reader can't blow up server memory. This package carries a lot of deliberate v1 wire-compatibility quirks; `internal/subscribe/doc.go` lists them. This maintains backwards compatibility with the original https://github.com/bluesky-social/jetstream-legacy system.
 - **Archive download over HTTP/XRPC** (`internal/xrpcapi`): the paginated `planBackfill` → `getSegment`/`getBlock` path clients use to pull sealed history before cutover.
 - **HTTP plumbing** (`internal/server`): the public (:8080) and debug (:6060) listeners and middleware. Status, health, and metrics live off these (`internal/status`, `internal/obs`).
 - **Client library** (`internal/client` and the module root): the "thick" Go client that negotiates the archive, folds the stream, dedupes by seq, and cuts over to live. `docs/README.md` §5.
