@@ -146,7 +146,9 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	}
 	success := false
 	defer func() {
-		_ = f.Close()
+		if f != nil {
+			_ = f.Close()
+		}
 		if !success {
 			_ = removeSegmentFile(opts.FS, tmp)
 		}
@@ -217,6 +219,7 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if err := f.Close(); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite close tmp: %w", err)
 	}
+	f = nil
 	if err := beforeSegmentIO(opts.IOFaultInjector, path, IOOpRename); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite rename: %w", err)
 	}

@@ -287,7 +287,9 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 	}
 	success := false
 	defer func() {
-		_ = f.Close()
+		if f != nil {
+			_ = f.Close()
+		}
 		if !success {
 			_ = removeSegmentFile(opts.FS, tmp)
 		}
@@ -343,6 +345,7 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 	if err := f.Close(); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch close tmp: %w", err)
 	}
+	f = nil
 	if err := beforeSegmentIO(opts.IOFaultInjector, path, IOOpRename); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch rename: %w", err)
 	}
