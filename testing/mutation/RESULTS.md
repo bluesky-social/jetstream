@@ -5,15 +5,18 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 42 active mutants on disk
-(m001–m050; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+**Current catalog (keep this line current): 43 active mutants on disk
+(m001–m051; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
 union baseline after #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **42 killed, 0 survived,
+coverage: **43 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
 m046-m050 cover fsync omission/reordering and Linux SyncWrites downgrades.
+m051 covers the merge-cleanup data-dir fsync ordering (the powerloss tier now
+also runs `./internal/ingest/orchestrator`'s `TestRunMerge_StrictMemPowerLoss*`
+to catch it and the restart-after-cleanup guard sibling).
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -95,6 +98,7 @@ reverted by `testing/mutation/run.sh`.
 | m048_patch_parent_dir_fsync_deleted | KILLED@segmentfault | Patch seam-count sweep catches the missing parent-dir fsync |
 | m049_ingest_flush_order_inverted | KILLED@powerloss | ingest operation-order test catches seq/next commit before segment data fsync |
 | m050_store_syncwrites_linux_nosync | KILLED@powerloss | strict-mem store test catches `store.SyncWrites` losing durability |
+| m051_merge_cleanup_dir_fsync_deleted | KILLED@powerloss | strict-mem merge test (`TestRunMerge_StrictMemPowerLossCleanupComplete`) catches a re-drain that duplicates survivors when the data-dir fsync before the SyncWrites cursor deletes is dropped |
 
 ## Campaign 2026-07-05 (#203 — account lifecycle statuses and getRepo unavailable)
 

@@ -42,6 +42,7 @@
     {"id":"m047_rewrite_parent_dir_fsync_deleted","disposition":"KILLED","result":"KILLED@segmentfault","note":"see log"},
     {"id":"m048_patch_parent_dir_fsync_deleted","disposition":"KILLED","result":"KILLED@segmentfault","note":"see log"},
     {"id":"m049_ingest_flush_order_inverted","disposition":"KILLED","result":"KILLED@powerloss","note":"see log"},
-    {"id":"m050_store_syncwrites_linux_nosync","disposition":"KILLED","result":"KILLED@powerloss","note":"see log"}
+    {"id":"m050_store_syncwrites_linux_nosync","disposition":"KILLED","result":"KILLED@powerloss","note":"see log"},
+    {"id":"m051_merge_cleanup_dir_fsync_deleted","disposition":"KILLED","result":"KILLED@powerloss","note":"see log"}
   ]
 }

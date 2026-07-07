@@ -292,11 +292,15 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     # ordering checks for fsync omission/reordering mutants.
                     # This is deliberately narrow and fast: segment/store/ingest
                     # package tests prove written-vs-synced state is discarded
-                    # correctly, and the oracle tests exercise the shared
-                    # segment+Pebble strict FS plus the durable-op checker.
+                    # correctly, the oracle tests exercise the shared
+                    # segment+Pebble strict FS plus the durable-op checker, and
+                    # the orchestrator's TestRunMerge_StrictMemPowerLoss* pin the
+                    # merge-cleanup / restart-after-cleanup guard fsync ordering
+                    # (kills m051, the data-dir fsync deletion that lets a power
+                    # loss re-drain already-merged survivors).
                     cmd=(go test "${RACE_FLAG[@]}"
-                         ./segment ./internal/store ./internal/ingest ./internal/oracle
-                         -run 'TestStrictMem|TestOpen_StrictMemDropsUnsyncedWrites|TestWriterStrictMem|TestWriterFlushOrdersSegmentSyncBeforeStoreCommit|TestDurableOrderRecorder|TestOracle_PowerLossStrictMemDropsUnsyncedState'
+                         ./segment ./internal/store ./internal/ingest ./internal/ingest/orchestrator ./internal/oracle
+                         -run 'TestStrictMem|TestOpen_StrictMemDropsUnsyncedWrites|TestWriterStrictMem|TestWriterFlushOrdersSegmentSyncBeforeStoreCommit|TestDurableOrderRecorder|TestOracle_PowerLossStrictMemDropsUnsyncedState|TestRunMerge_StrictMemPowerLoss'
                          -count=1 -short -timeout "$default_timeout") ;;
                 partb)
                     # Part-B tier (#182): kills paginated-cutover mutants

@@ -1,0 +1,33 @@
+mutant: m051_merge_cleanup_dir_fsync_deleted
+target: internal/ingest/orchestrator/merge.go
+failure-mode: |
+  Merge cleanup removes the data/backfill subtree and then deletes the merge
+  cursors, but the data-dir fsync between the unlink and the SyncWrites cursor
+  deletes is gone. deleteMergeCursor commits with store.SyncWrites, so the cursor
+  deletion is durable immediately while the dirent removal is not. A power loss
+  in that window rolls back the removal while keeping the cursor deletion: on
+  restart the phase is still PhaseMerging, backfill/live_segments reappears, the
+  restart-after-cleanup guard is skipped, and the drain re-runs from cursor 0,
+  appending already-merged survivors a second time into data/segments and
+  corrupting the archive with duplicate events.
+expected-detection: |
+  Killed by the powerloss tier's
+  TestRunMerge_StrictMemPowerLossCleanupComplete. The test drains a survivor
+  (rev above the backfill watermark) into data/segments, fires the
+  AfterMergeCleanupComplete crashpoint to simulate a power cut on strict-mem,
+  resets to the durable synced state, re-runs runMerge, and requires the
+  survivor to appear exactly once. Under this mutant the rolled-back backfill
+  tree drives a re-drain and the survivor lands twice (count 2, want 1). The
+  default oracle lifecycle does not catch it: without a real power cut the
+  data-dir fsync is invisible to normal operation.
+expected-tier: powerloss
+tiers: powerloss
+
+diff --git a/internal/ingest/orchestrator/merge.go b/internal/ingest/orchestrator/merge.go
+index e325856..a558005 100644
+--- a/internal/ingest/orchestrator/merge.go
++++ b/internal/ingest/orchestrator/merge.go
+@@ -152,3 +151,0 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
+-		if err := syncStorageDirFS(o.cfg.FS, o.cfg.DataDir); err != nil {
+-			return fmt.Errorf("orchestrator: merge: sync data dir after backfill removal: %w", err)
+-		}
