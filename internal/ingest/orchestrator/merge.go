@@ -1,6 +1,7 @@
-// Package orchestrator: merge.go owns the State 5 cutover step that
+// merge.go owns the State 5 cutover step that
 // drains data/backfill/live_segments/ into data/segments/. Spec:
-// docs/superpowers/specs/2026-05-27-merge-phase-design.md.
+// specs/notes/2026-05-27-merge-phase-design.md.
+
 package orchestrator
 
 import (

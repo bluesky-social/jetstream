@@ -18,7 +18,7 @@ var (
 // frame decompress to gigabytes before any of decodeBlock's careful
 // length-validation runs (a classic "zstd bomb"). The cap is
 // generous: a legitimate block is bounded above by the segment
-// file's ~256 MB target (DESIGN.md §3.1.1), so 1 GiB leaves headroom
+// file's ~256 MB target (docs/README.md §3.1.1), so 1 GiB leaves headroom
 // for the segment-size knob without giving an attacker a runway.
 const maxDecodedBlockBytes uint64 = 1 << 30 // 1 GiB
 

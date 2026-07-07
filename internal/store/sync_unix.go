@@ -5,7 +5,7 @@ package store
 import "github.com/cockroachdb/pebble"
 
 // SyncWrites is the *pebble.WriteOptions every metadata write
-// passes when it wants the DESIGN.md §3.1.1 durability anchor.
+// passes when it wants the docs/README.md §3.1.1 durability anchor.
 // On non-darwin platforms pebble.Sync issues a plain fsync(2),
 // which is fast enough that no test-mode override is warranted.
 //

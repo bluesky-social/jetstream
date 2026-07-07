@@ -1,7 +1,7 @@
 // Package ingest owns the active-segment writer for jetstream. It
 // allocates monotonic seq numbers, rotates segment files at a
 // configurable byte threshold, and commits the per-block durability
-// batch to pebble (DESIGN.md §3.1.1, §3.4).
+// batch to pebble (docs/README.md §3.1.1, §3.4).
 //
 // One *ingest.Writer is shared across all goroutines that produce
 // events: the bootstrap-phase backfill workers today, the live-tail

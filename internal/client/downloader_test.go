@@ -108,15 +108,21 @@ func writeXRPCError(w http.ResponseWriter, status int, name string) {
 
 func (as *archiveServer) addSegment(t *testing.T, name string, events []segment.Event) {
 	t.Helper()
+	as.addSegmentWithBlockSize(t, name, events, 2)
+}
+
+func (as *archiveServer) addSegmentWithBlockSize(t *testing.T, name string, events []segment.Event, maxEventsPerBlock int) {
+	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, name)
-	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: 2})
+	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: maxEventsPerBlock})
 	require.NoError(t, err)
 	for i := range events {
 		_, err := w.Append(events[i])
 		require.NoError(t, err)
-		// Flush block boundaries every 2 events to produce multiple blocks.
-		if (i+1)%2 == 0 && i != len(events)-1 {
+		// Flush block boundaries at the requested size to produce predictable
+		// multi-block fixtures.
+		if (i+1)%maxEventsPerBlock == 0 && i != len(events)-1 {
 			require.NoError(t, w.Flush())
 		}
 	}
@@ -151,6 +157,19 @@ func makeCreate(t *testing.T, seq uint64, did, collection, rkey string) segment.
 	rec := map[string]any{"$type": collection, "text": "hello " + rkey}
 	payload, err := cbor.Marshal(rec)
 	require.NoError(t, err)
+	return segment.Event{
+		Seq:         seq,
+		WitnessedAt: int64(1_730_000_000_000_000 + seq*1_000),
+		Kind:        segment.KindCreate,
+		DID:         did,
+		Collection:  collection,
+		Rkey:        rkey,
+		Rev:         "rev" + strconv.FormatUint(seq, 10),
+		Payload:     payload,
+	}
+}
+
+func makeCreateWithPayload(seq uint64, did, collection, rkey string, payload []byte) segment.Event {
 	return segment.Event{
 		Seq:         seq,
 		WitnessedAt: int64(1_730_000_000_000_000 + seq*1_000),
@@ -237,6 +256,70 @@ func TestDownloadTransformOrdering(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, nSeg*(perSeg/2), count, "one payload per non-empty block")
+}
+
+func TestDownloadDropsMalformedRecordNotWholeBlock(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	invalidUTF8TextRecord := []byte{
+		0xa1,                     // map(1)
+		0x64, 't', 'e', 'x', 't', // "text"
+		0x63, 0xed, 0xa0, 0xbc, // text(3), invalid UTF-8 surrogate bytes
+	}
+	as.addSegmentWithBlockSize(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "good1"),
+		makeCreateWithPayload(2, "did:plc:a", "app.bsky.feed.post", "bad", invalidUTF8TextRecord),
+		makeCreate(t, 3, "did:plc:a", "app.bsky.feed.post", "good2"),
+	}, 4)
+
+	var results []EntryResult
+	err := as.downloader(1).Download(context.Background(), []PlanEntry{{
+		SegmentName: segName(0),
+		Index:       0,
+		Mode:        ModeWholeSegment,
+	}}, func(res EntryResult) bool {
+		results = append(results, res)
+		return true
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Error(t, results[0].Err)
+	require.ErrorContains(t, results[0].Err, "seq=2")
+	require.ErrorContains(t, results[0].Err, "invalid UTF-8")
+	require.Equal(t, []uint64{1, 3}, seqs(results[0].Events))
+}
+
+func TestDownloadTransformKeepsPayloadWithMalformedRecordError(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	invalidUTF8TextRecord := []byte{
+		0xa1,
+		0x64, 't', 'e', 'x', 't',
+		0x63, 0xed, 0xa0, 0xbc,
+	}
+	as.addSegmentWithBlockSize(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "good1"),
+		makeCreateWithPayload(2, "did:plc:a", "app.bsky.feed.post", "bad", invalidUTF8TextRecord),
+		makeCreate(t, 3, "did:plc:a", "app.bsky.feed.post", "good2"),
+	}, 4)
+
+	d := as.downloader(1)
+	d.SetTransform(func(_ int, evs []Event) any {
+		return seqs(evs)
+	})
+	var results []EntryResult
+	err := d.Download(context.Background(), []PlanEntry{{
+		SegmentName: segName(0),
+		Index:       0,
+		Mode:        ModeWholeSegment,
+	}}, func(res EntryResult) bool {
+		results = append(results, res)
+		return true
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Error(t, results[0].Err)
+	require.Equal(t, []uint64{1, 3}, results[0].Payload)
 }
 
 // TestDownloadTransformPanicNoHang guards FIX #1: a transform that panics on one

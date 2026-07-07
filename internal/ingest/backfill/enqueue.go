@@ -1,4 +1,4 @@
-// Package backfill: enqueue.go implements LiveEnqueuer, the steady-state
+// enqueue.go implements LiveEnqueuer, the steady-state
 // firehose hook that detects net-new DIDs and schedules a full repo backfill
 // for them (issue #188).
 //
@@ -42,6 +42,7 @@
 // failure precisely so a later event retries). We accept this rather than make
 // the per-event hot path take a synchronous pebble write at firehose rate; a
 // genuinely active repo that we missed will almost always emit again.
+
 package backfill
 
 import (

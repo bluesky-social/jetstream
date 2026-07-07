@@ -16,7 +16,7 @@ import (
 // the block was detached/flushed.
 type DurableBatchHook func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool, prepareValue any) (afterCommit func(), afterDone func(error), err error)
 
-// defaultMaxSegmentBytes is the rotation threshold. DESIGN.md §3.1.1
+// defaultMaxSegmentBytes is the rotation threshold. docs/README.md §3.1.1
 // names ~256MB as the target sealed-segment size. Operator-tunable
 // via Config.MaxSegmentBytes.
 const defaultMaxSegmentBytes int64 = 256 << 20
@@ -82,7 +82,7 @@ type Config struct {
 	// stage metadata whose backing events are not yet durable: a hook that ties
 	// metadata to event durability (e.g. backfill repo completion) must still
 	// gate every staged row on nextSeq, never on force, or it would mark data
-	// durable ahead of its segment fsync (violating DESIGN.md §3.1.1 ordering).
+	// durable ahead of its segment fsync (violating docs/README.md §3.1.1 ordering).
 	OnDurableBatch DurableBatchHook
 
 	// DurableBatchPrepareValue, if non-nil, is sampled while the writer mutex is

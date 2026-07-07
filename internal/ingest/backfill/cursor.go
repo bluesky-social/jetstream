@@ -1,4 +1,4 @@
-// Package backfill: cursor.go persists the relay's listRepos resume
+// cursor.go persists the relay's listRepos resume
 // cursor in pebble so a process restart can skip listRepos pages
 // already fully processed in a prior Run.
 //
@@ -17,6 +17,7 @@
 // queued repo completions and their segment data are durably visible.
 // The checkpoint uses pebble.Sync, so a successful callback means the
 // cursor advance is durable too.
+
 package backfill
 
 import (
@@ -89,7 +90,7 @@ func SaveListReposCheckpoint(db *store.Store, relayCursor, bootstrapCursor strin
 // phase. The merge phase reads this to resume listRepos against
 // the relay and discover DIDs born during the bootstrap window
 // (merge-phase spec §4.7,
-// docs/superpowers/specs/2026-05-27-merge-phase-design.md).
+// specs/notes/2026-05-27-merge-phase-design.md).
 //
 // We need a separate key from listReposCursorKey because the
 // existing cursor is allowed (correctly) to drain to "" when

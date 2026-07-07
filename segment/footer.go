@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// BlockInfo is one entry of the block index (DESIGN.md §3.1.2). It
+// BlockInfo is one entry of the block index (docs/README.md §3.1.2). It
 // describes a block's location and bounds within a sealed segment
 // file.
 type BlockInfo struct {
@@ -30,7 +30,7 @@ type BlockInfo struct {
 	// MinWitnessedAt, MaxWitnessedAt bound the witnessed_at column in
 	// unix microseconds. MaxWitnessedAt >= MinWitnessedAt. The type
 	// matches Header.MinWitnessedAt/MaxWitnessedAt and the per-event
-	// witnessed_at column in §3.2 of DESIGN.md.
+	// witnessed_at column in §3.2 of docs/README.md.
 	MinWitnessedAt, MaxWitnessedAt int64
 }
 

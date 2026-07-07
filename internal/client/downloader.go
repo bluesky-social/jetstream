@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -83,9 +84,11 @@ func NewDownloader(xc *xrpc.Client, concurrency int, selector RowSelector) *Down
 // the consumer can emit in order. A single plan entry streams as MULTIPLE
 // EntryResults — one per decoded block — all carrying the same Index/Entry, so
 // the downloader never holds a whole segment's decoded events in memory at
-// once. Err is non-nil if a block could not be downloaded or decoded; Events is
-// then nil, and that entry stops streaming after the error (any earlier blocks
-// of the same entry were already emitted).
+// once. Err is non-nil for recoverable failures. If a whole block could not be
+// downloaded or structurally decoded, Events/Payload are nil and that entry
+// stops streaming after the error. If only individual selected rows were
+// semantically malformed, Err is non-nil alongside the valid decoded rows, so
+// consumers can surface the warning without dropping the rest of the block.
 type EntryResult struct {
 	Index  int // position in the plan's Entries slice
 	Entry  PlanEntry
@@ -94,7 +97,8 @@ type EntryResult struct {
 	// Payload is the opaque output of the Downloader's transform (when one is
 	// set), already computed in parallel on the decode workers and forwarded here
 	// in seq order. nil when no transform is set (legacy []Event path) or for an
-	// error result. The caller that supplied the transform type-asserts it.
+	// error result with no valid decoded rows. The caller that supplied the
+	// transform type-asserts it.
 	Payload any
 }
 
@@ -113,7 +117,9 @@ type decodeJob struct {
 // decodeResult is a decoded block leaving the pool, keyed by the same global
 // seq for reassembly. emit is false for a wholly filtered/suppressed block (no
 // events, no error): the reassembler still consumes its seq to keep the space
-// dense but calls no emit. Exactly one of events/err is meaningful.
+// dense but calls no emit. events/payload may be present with err when one or
+// more selected rows in the block were semantically malformed but other rows
+// decoded cleanly.
 type decodeResult struct {
 	seq      uint64
 	entryIdx int
@@ -372,11 +378,8 @@ func (d *Downloader) runDecodeWorker(ctx context.Context, entries []PlanEntry, j
 			res.emit = true
 		default:
 			events, err := d.decodeFrame(j.frame, entries[j.entryIdx].SegmentName, j.blockIdx)
-			switch {
-			case err != nil:
-				res.err = err
-				res.emit = true
-			case d.transform != nil:
+			res.err = err
+			if len(events) > 0 && d.transform != nil {
 				// Fast path: run the caller's per-block transform HERE, in parallel,
 				// so the expensive per-event work is off the serial reassembler.
 				// The transform is caller-supplied (root) code running on a pool
@@ -384,12 +387,13 @@ func (d *Downloader) runDecodeWorker(ctx context.Context, entries []PlanEntry, j
 				// close(results) hung and wedge the whole Download. Convert a panic
 				// into an in-order recoverable error instead (crash-visible to the
 				// consumer, pipeline still drains) — never a silent hang.
-				res.payload, res.err = d.runTransform(j.entryIdx, events)
-				res.emit = res.payload != nil || res.err != nil
-			default:
+				var transformErr error
+				res.payload, transformErr = d.runTransform(j.entryIdx, events)
+				res.err = errors.Join(res.err, transformErr)
+			} else if len(events) > 0 {
 				res.events = events
-				res.emit = len(events) > 0 // skip wholly filtered/suppressed blocks
 			}
+			res.emit = len(events) > 0 || res.err != nil
 		}
 		select {
 		case results <- res:
@@ -454,7 +458,9 @@ func reassemble(entries []PlanEntry, results <-chan decodeResult, sem chan struc
 
 // decodeFrame decompresses one block frame, applies the row selector before
 // decode (so filtered/suppressed rows are never materialized), and converts
-// the survivors to events.
+// the survivors to events. Malformed selected rows are dropped and returned as a
+// joined recoverable error alongside any valid decoded rows; one bad upstream
+// record must not make the client lose the rest of the block.
 //
 // Commit rows dominate the archive (e.g. app.bsky.feed.like), and each commit's
 // *Commit was one heap allocation. To cut that, the surviving commit rows of a
@@ -485,6 +491,7 @@ func (d *Downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]
 	// holding an earlier batch can never observe a mutation.
 	commits := make([]Commit, len(rows))
 	out := make([]Event, 0, len(rows))
+	var decodeErrs []error
 	ci := 0
 	for i := range rows {
 		if d.selector != nil {
@@ -499,14 +506,15 @@ func (d *Downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]
 		}
 		ev, err := decodeSegmentEventInto(&rows[i], commit, d.mode)
 		if err != nil {
-			return nil, err
+			decodeErrs = append(decodeErrs, err)
+			continue
 		}
 		out = append(out, ev)
 	}
 	if len(out) == 0 {
-		return nil, nil
+		return nil, errors.Join(decodeErrs...)
 	}
-	return out, nil
+	return out, errors.Join(decodeErrs...)
 }
 
 // isCommitKind reports whether a segment row kind decodes to a KindCommit event

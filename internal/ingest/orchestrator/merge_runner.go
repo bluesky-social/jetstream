@@ -1,6 +1,7 @@
-// Package orchestrator: merge_runner.go owns the per-source-segment
+// merge_runner.go owns the per-source-segment
 // drain loop. One goroutine, serial, no fan-out. Spec:
-// docs/superpowers/specs/2026-05-27-merge-phase-design.md §4.2.
+// specs/notes/2026-05-27-merge-phase-design.md §4.2.
+
 package orchestrator
 
 import (

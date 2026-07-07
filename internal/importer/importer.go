@@ -680,6 +680,7 @@ func (m *Manager) resolveImportPath(requestedPath string) (string, error) {
 	// joining to the unresolved spelling would make every valid relative path
 	// look like an escape against root below.
 	cand := requestedPath
+	relativeCandidate := !filepath.IsAbs(cand)
 	if !filepath.IsAbs(cand) {
 		cand = filepath.Join(root, cand)
 	}
@@ -695,13 +696,17 @@ func (m *Manager) resolveImportPath(requestedPath string) (string, error) {
 	// symlinked import-dir alias must also pass: it is checked against the
 	// alias spelling here, and the authoritative post-resolution check against
 	// root still gates it.
-	if escapes(root, cand) && escapes(aliasRoot, cand) {
+	lexicallyEscapes := escapes(root, cand) && escapes(aliasRoot, cand)
+	if relativeCandidate && lexicallyEscapes {
 		return "", fmt.Errorf("%w: %s", ErrPathEscape, requestedPath)
 	}
 
 	resolved, err := filepath.EvalSymlinks(cand)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if lexicallyEscapes {
+				return "", fmt.Errorf("%w: %s", ErrPathEscape, requestedPath)
+			}
 			return "", fmt.Errorf("%w: %s", ErrPathNotFound, requestedPath)
 		}
 		return "", fmt.Errorf("importer: resolve csv path %q: %w", requestedPath, err)

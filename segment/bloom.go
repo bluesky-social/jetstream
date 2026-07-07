@@ -8,13 +8,13 @@ import (
 )
 
 // Bloom-filter sizing knobs. Both apply to DID blooms (segment-level
-// and per-block) per DESIGN.md §3.1.3 and the project FP-rate guidance
-// in AGENTS.md/DESIGN.md.
+// and per-block) per docs/README.md §3.1.3 and the project FP-rate guidance
+// in AGENTS.md/docs/README.md.
 //
 // The 0.001 (0.1%) false-positive rate balances on-disk size
 // (negligible relative to a ~256 MB segment) against scan-time false
 // positives (each FP costs a full block decompress + column scan,
-// which is meaningfully expensive). AGENTS.md and DESIGN.md
+// which is meaningfully expensive). AGENTS.md and docs/README.md
 // document RAM as cheap on these servers, so we don't penny-pinch.
 const (
 	perBlockBloomFPRate = 0.001
@@ -50,7 +50,7 @@ const (
 const blockBloomsRegionHeaderSize = 8
 
 // encodeBlockBloomsRegion serializes the per-block blooms region
-// (DESIGN.md §3.1.3, spec §5.4). Every filter must marshal to an
+// (docs/README.md §3.1.3, spec §5.4). Every filter must marshal to an
 // identical length; this is the invariant that lets the reader index
 // blooms by multiplication. We assert it here so a violation is loud
 // rather than a silent on-disk corruption.

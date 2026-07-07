@@ -15,7 +15,7 @@ const (
 	DefaultMaxEventsPerBlock = 4096
 
 	// ReservedHeaderBytes is the size of the fixed header at the start
-	// of every segment file (DESIGN.md §3.1.2). The first len(segmentMagic)
+	// of every segment file (docs/README.md §3.1.2). The first len(segmentMagic)
 	// bytes are the magic; the remainder is zero-filled placeholder until
 	// Seal populates the finalized header. ReservedHeaderBytes is also
 	// the byte offset at which the framed-block region begins.
@@ -285,7 +285,7 @@ func resumeExistingSegment(f *os.File, size int64, path string) error {
 	// Sealed-vs-active detection: bytes 4..11 are zero on an active
 	// file (initializeNewSegment writes only the magic into the
 	// reserved 256-byte header) and non-zero on a sealed file (Seal
-	// patches in the xxh3 checksum). DESIGN.md §3.1.2 names this the
+	// patches in the xxh3 checksum). docs/README.md §3.1.2 names this the
 	// "checksum at offset 4" signal; spec §8 documents the convention.
 	var checksumBuf [8]byte
 	if _, err := f.ReadAt(checksumBuf[:], 4); err != nil {

@@ -1,4 +1,4 @@
-// Package backfill: store.go implements the atmos backfill.Store
+// store.go implements the atmos backfill.Store
 // interface against pebble. Keys live at repo/<did>; values are the
 // JSON-encoded RepoStatus from status.go.
 //
@@ -10,6 +10,7 @@
 // add to RepoStatus (e.g. RecordCount). They serialize through countsMu
 // with aggregate writes and deferred completion staging so a stale
 // callback cannot overwrite a just-committed completion row.
+
 package backfill
 
 import (
@@ -788,7 +789,7 @@ func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) erro
 
 // OnComplete records a successful repo download. The commit's rev is
 // stored in both Backfill.Rev (the rev at end of initial download
-// per DESIGN.md §3.5) and the top-level Rev (the latest known rev).
+// per docs/README.md §3.5) and the top-level Rev (the latest known rev).
 // They're equal here because initial backfill is the only thing
 // updating Rev in this PR; steady-state ingest will diverge them.
 //
@@ -852,8 +853,8 @@ func (s *Store) simulateCrash(ctx context.Context, point crashpoint.Point) error
 
 // OnFail records a failed repo download. atmos passes the total
 // attempt count for the current Run (initial + retries). We overwrite
-// rather than accumulate across Runs — DESIGN.md §6.3 calls out
-// resetting Attempts on failover as an acceptable cosmetic regression.
+// rather than accumulate across Runs; resetting Attempts on failover
+// is an acceptable cosmetic regression.
 //
 // CompletedAt and Backfill.Rev from a prior successful Run are
 // preserved. This is defensive — within this PR the engine never

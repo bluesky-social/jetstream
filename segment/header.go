@@ -10,7 +10,7 @@ import (
 )
 
 // Header is the parsed form of the 256-byte fixed header at offset 0
-// of every sealed segment file. See DESIGN.md §3.1.2 for the wire
+// of every sealed segment file. See docs/README.md §3.1.2 for the wire
 // layout, and the spec §5.1 for byte-offset details.
 //
 // All offsets are absolute file offsets.
@@ -122,7 +122,7 @@ func ReadSealedHeader(r io.ReaderAt) (Header, error) {
 }
 
 // xxh3HeaderFooter computes xxh3 over headerBytes[12:] followed by
-// footerBytes — i.e. version through end-of-footer per DESIGN.md
+// footerBytes — i.e. version through end-of-footer per docs/README.md
 // §3.1.2. The magic and the checksum field itself are excluded so a
 // reader can verify the file's integrity without first knowing the
 // checksum value.

@@ -1,4 +1,4 @@
-// Package manifest materializes DESIGN.md §3.5's "segment manifest"
+// Package manifest materializes docs/README.md §3.5's "segment manifest"
 // concept in memory: an authoritative slice of bounds (MinSeq, MaxSeq,
 // MinWitnessedAt, MaxWitnessedAt) for every sealed segment, plus a small
 // LRU of per-segment block indices for callers that need to seek

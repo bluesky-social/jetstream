@@ -1,8 +1,9 @@
-// Package orchestrator: merge_filter.go owns the per-event keep/drop
+// merge_filter.go owns the per-event keep/drop
 // predicate that decides whether a live_segments survivor should be
 // promoted into the steady-state segments tree, plus the per-DID
 // repo/<did> lookup cache that backs it. Spec:
-// docs/superpowers/specs/2026-05-27-merge-phase-design.md §4.3–§4.4.
+// specs/notes/2026-05-27-merge-phase-design.md §4.3–§4.4.
+
 package orchestrator
 
 import (
@@ -15,7 +16,7 @@ import (
 )
 
 // isCommitKind reports whether k is one of the three commit-shaped
-// event kinds (DESIGN.md §3.2). Only these carry a per-event Rev
+// event kinds (docs/README.md §3.2). Only these carry a per-event Rev
 // that maps to the repo MST and can therefore be filtered against
 // repo/<did>.Backfill.Rev.
 func isCommitKind(k segment.Kind) bool {

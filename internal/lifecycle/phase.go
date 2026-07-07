@@ -19,7 +19,7 @@ const (
 	PhaseBootstrap Phase = "bootstrap"
 
 	// PhaseMerging means initial backfill has drained but the merge
-	// step (DESIGN.md §4.2) has not yet completed. A process restart
+	// step (docs/README.md §4.2) has not yet completed. A process restart
 	// in this phase resumes the cutover state machine at the merge
 	// step; backfill and the bootstrap-phase live consumer are not
 	// restarted.

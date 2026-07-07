@@ -104,7 +104,7 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batc
 		// completion excluded here means its final event is not durable at
 		// a forced checkpoint — which would let saveBatchCursor advance the
 		// listRepos cursor past a non-durable completion (silent data loss).
-		// Crash rather than corrupt (AGENTS.md / DESIGN.md §3.1.1 ordering).
+		// Crash rather than corrupt (AGENTS.md / docs/README.md §3.1.1 ordering).
 		if force {
 			b.mu.Unlock()
 			b.metrics.incCompletionStageErrors()
