@@ -111,6 +111,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			Logger:      o.cfg.Logger,
 			Metrics:     o.cfg.BackfillMetrics,
 			DropMetrics: o.cfg.DropMetrics,
+			Interval:    o.cfg.FailedRepoRetryInterval,
 			Workers:     o.cfg.FailedRepoRetryWorkers,
 			HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
 			MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,

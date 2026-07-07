@@ -252,6 +252,55 @@ func TestRunPendingRepoRetryPassProcessesOnlyPending(t *testing.T) {
 	require.Equal(t, StatusFailed, rs.Backfill.Status)
 }
 
+// TestRunPendingRepoRetryPassReschedulesOnConfiguredInterval guards the merge
+// crash-recovery call site (orchestrator/merge.go): RunPendingRepoRetryPass must
+// forward Interval so a transient getRepo failure reschedules the interrupted
+// bootstrap repo on the configured failed-repo cadence. If Interval is omitted,
+// selectedBackoffDelay(base=0) falls straight through to MaxDelay, deferring a
+// crash-recovery repo ~7 days instead of hours (#262).
+func TestRunPendingRepoRetryPassReschedulesOnConfiguredInterval(t *testing.T) {
+	t.Parallel()
+	st, w, _ := newRetryTestWriter(t)
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:pending-transient-fail")
+	now := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+
+	srv := newStubServer(t, map[atmos.DID]repoFixture{})
+	srv.failGetRepo = map[atmos.DID]bool{did: true}
+	srv.failGetRepoCode = http.StatusServiceUnavailable
+
+	require.NoError(t, bs.putRepoStatus(did, &RepoStatus{
+		Backfill: RepoBackfillStatus{Status: StatusPending},
+		Active:   true,
+	}))
+
+	const interval = time.Hour
+	const maxDelay = 7 * 24 * time.Hour
+	require.NoError(t, RunPendingRepoRetryPass(ctx, RetryConfig{
+		Store:       st,
+		Writer:      w,
+		HTTPClient:  srv.srv.Client(),
+		RelayURL:    srv.srv.URL,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Interval:    interval,
+		Workers:     1,
+		HostWorkers: 1,
+		MaxDelay:    maxDelay,
+		now:         func() time.Time { return now },
+		jitter:      func(int64) int64 { return 0 },
+	}))
+
+	rs, err := bs.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusFailed, rs.Backfill.Status)
+	// retryCount==0 => base<<0 == Interval, jitter pinned to 0.
+	require.Equal(t, now.Add(interval).UTC(), rs.Backfill.NextAttemptAt,
+		"transient failure must reschedule on the configured interval, not MaxDelay")
+	require.True(t, rs.Backfill.NextAttemptAt.Before(now.Add(maxDelay)),
+		"reschedule must be well short of MaxDelay")
+}
+
 func TestRetryRunner_PendingFailureTransitionsToFailed(t *testing.T) {
 	t.Parallel()
 	st, w, _ := newRetryTestWriter(t)
