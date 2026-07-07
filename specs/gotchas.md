@@ -15,7 +15,7 @@ Each entry says what the thing is, why it's the way it is, and roughly where in 
 
 This one repeatedly confuses agents into thinking there's a data-loss bug. There isn't; the behavior is intentional. Here's what actually happens so you don't try to harden it.
 
-A repo can appear live that we never backfilled — say its PDS was firewalled during the bootstrap listRepos sweep, so the first event we ever see for it is well past its start. When the steady-state live consumer archives an event for a DID with no `repo/<did>` row, it writes one at `StatusPending` (`EnqueueNetNewRepo`). The retry loop treats `pending` exactly like a failed repo, so its next pass does a full `getRepo` and captures the repo's current state — the same model we use for a `#sync` resync.
+A repo can appear live that we never backfilled — say its PDS was firewalled during the bootstrap listRepos sweep, so the first event we ever see for it is well past its start. When the steady-state live consumer archives an event for a DID with no `repo/<did>` row, it writes one at `StatusPending` (`EnqueueNetNewRepo`). The retry loop treats `pending` exactly like a failed repo, so its next pass does a full `getRepo` and captures the repo's current state — the same model we use for a `#sync` resync. `StatusPending` is also used for bootstrap crash recovery of a pre-existing `not_started` row; that producer is separate from the net-new DID path.
 
 Two things that look like problems but aren't:
 

@@ -204,6 +204,54 @@ func TestRetryRunner_PendingNetNewBackfillsToComplete(t *testing.T) {
 	require.Equal(t, counts, scanned)
 }
 
+func TestRunPendingRepoRetryPassProcessesOnlyPending(t *testing.T) {
+	t.Parallel()
+	st, w, segmentsDir := newRetryTestWriter(t)
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	pending := atmos.DID("did:plc:pending-only")
+	failed := atmos.DID("did:plc:failed-skip")
+	fixtures := map[atmos.DID]repoFixture{
+		pending: buildRepoFixture(t, pending),
+		failed:  buildRepoFixture(t, failed),
+	}
+	srv := newStubServer(t, fixtures)
+
+	require.NoError(t, bs.putRepoStatus(pending, &RepoStatus{
+		Backfill: RepoBackfillStatus{Status: StatusPending},
+		Active:   true,
+	}))
+	require.NoError(t, bs.putRepoStatus(failed, &RepoStatus{
+		Backfill: RepoBackfillStatus{Status: StatusFailed},
+		Active:   true,
+	}))
+
+	require.NoError(t, RunPendingRepoRetryPass(ctx, RetryConfig{
+		Store:       st,
+		Writer:      w,
+		HTTPClient:  srv.srv.Client(),
+		RelayURL:    srv.srv.URL,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Workers:     1,
+		HostWorkers: 1,
+		MaxDelay:    24 * time.Hour,
+	}))
+
+	events := collectActiveEvents(t, filepath.Join(segmentsDir, ingest.SegmentFilename(0)))
+	require.Len(t, events, 2)
+	require.Equal(t, segment.KindSync, events[0].Kind)
+	require.Equal(t, segment.KindCreateResync, events[1].Kind)
+	require.Equal(t, string(pending), events[0].DID)
+	require.Equal(t, string(pending), events[1].DID)
+
+	rs, err := bs.readRepoStatus(pending)
+	require.NoError(t, err)
+	require.Equal(t, StatusComplete, rs.Backfill.Status)
+	rs, err = bs.readRepoStatus(failed)
+	require.NoError(t, err)
+	require.Equal(t, StatusFailed, rs.Backfill.Status)
+}
+
 func TestRetryRunner_PendingFailureTransitionsToFailed(t *testing.T) {
 	t.Parallel()
 	st, w, _ := newRetryTestWriter(t)

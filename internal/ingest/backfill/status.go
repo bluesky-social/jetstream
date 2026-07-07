@@ -28,17 +28,17 @@ const (
 	StatusNotStarted Status = "not_started"
 	StatusComplete   Status = "complete"
 	StatusFailed     Status = "failed"
-	// StatusPending is a net-new DID first observed on the steady-state
-	// firehose (issue #188): an account whose events we are now archiving
-	// but whose historical repo we never backfilled (its PDS was
-	// unreachable or private during bootstrap, then became reachable). The
-	// row is created at pending with NextAttemptAt zero so the steady-state
-	// failed-repo retry loop picks it up on its next pass and runs a full
-	// getRepo, reusing the exact same download/verify/complete machinery as
-	// a failed-repo retry. It is distinct from StatusFailed so dashboards do
-	// not conflate "discovered live, never attempted" with repos that
-	// actually failed to download, and distinct from StatusNotStarted, which
-	// is reserved for the bootstrap engine's listRepos discovery.
+	// StatusPending is a DID awaiting a whole-repo replacement through the
+	// retry path. The common producer is a net-new DID first observed on the
+	// steady-state firehose (issue #188): an account whose events we are now
+	// archiving but whose historical repo we never backfilled. Bootstrap crash
+	// recovery also promotes a pre-existing StatusNotStarted row to pending
+	// instead of re-downloading it at low seqs (#262). The row is created with
+	// NextAttemptAt zero so the post-merge/steady retry loop can run a full
+	// getRepo immediately, reusing the same download/verify/complete machinery
+	// as a failed-repo retry. It is distinct from StatusFailed so dashboards do
+	// not conflate "needs first successful replacement" with repos that
+	// actually failed to download.
 	StatusPending Status = "pending"
 	// StatusUnavailable is a terminal, non-failure state: the account
 	// exists but its repo cannot be fetched (deactivated, suspended, or

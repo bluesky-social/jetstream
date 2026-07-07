@@ -170,8 +170,9 @@ type Config struct {
 	BackfillRetryBaseDelay time.Duration
 
 	// FailedRepoRetryInterval controls steady-state retry scans for repos that
-	// exhausted bootstrap retry and remain StatusFailed. Zero disables the
-	// background retry loop.
+	// exhausted bootstrap retry and remain StatusFailed, plus StatusPending
+	// rows for net-new DIDs. Zero disables the background retry loop; merge
+	// still runs its one-shot pending pass for bootstrap crash recovery.
 	FailedRepoRetryInterval    time.Duration
 	FailedRepoRetryWorkers     int
 	FailedRepoRetryHostWorkers int

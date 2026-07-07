@@ -56,8 +56,9 @@ type RetryConfig struct {
 	HostWorkers int
 	MaxDelay    time.Duration
 
-	now    func() time.Time
-	jitter jitterFunc
+	now            func() time.Time
+	jitter         jitterFunc
+	eligibleStatus func(Status) bool
 }
 
 type retryCandidate struct {
@@ -103,6 +104,18 @@ func RunFailedRepoRetry(ctx context.Context, cfg RetryConfig) error {
 			timer.Reset(r.cfg.Interval)
 		}
 	}
+}
+
+// RunPendingRepoRetryPass performs one immediate retry scan for pending repos.
+// Merge uses this for bootstrap-recovery rows that must be materialized above
+// the captured live tail before serving ungates.
+func RunPendingRepoRetryPass(ctx context.Context, cfg RetryConfig) error {
+	cfg.eligibleStatus = func(st Status) bool { return st == StatusPending }
+	r, err := newRetryRunner(cfg)
+	if err != nil {
+		return err
+	}
+	return r.runPass(ctx)
 }
 
 func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
@@ -237,7 +250,11 @@ func (r *retryRunner) scanDue(ctx context.Context, now time.Time, yield func(ret
 		// are retry-eligible: a pending row is a repo we have never attempted
 		// to download, so the same getRepo→verify→complete pass that retries a
 		// failure performs its initial backfill.
-		if !isRetryEligibleStatus(rs.Backfill.Status) || !rs.Active {
+		eligibleStatus := r.cfg.eligibleStatus
+		if eligibleStatus == nil {
+			eligibleStatus = isRetryEligibleStatus
+		}
+		if !eligibleStatus(rs.Backfill.Status) || !rs.Active {
 			continue
 		}
 		if !rs.Backfill.NextAttemptAt.IsZero() && rs.Backfill.NextAttemptAt.After(now) {

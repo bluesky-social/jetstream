@@ -58,11 +58,57 @@ func chainCoverage(t *testing.T, dataDir string, coord *chainCoordinator) chainC
 	}
 
 	return chainCoverageView{
-		want:      zeroRowSeqs(filterCompactedExpectedRows(wantSeqed, watermark)),
+		want:      zeroRowSeqs(filterCompactedExpectedRowsWithObservedTombstones(wantSeqed, diskRows, watermark)),
 		got:       zeroRowSeqs(diskRows),
 		events:    events,
 		watermark: watermark,
 	}
+}
+
+func filterCompactedExpectedRowsWithObservedTombstones(want, observed []EventLogRow, watermark uint64) []EventLogRow {
+	recordTombstones := make(map[RecordKey]uint64)
+	didTombstones := make(map[string]uint64)
+	observeTombstone := func(row EventLogRow) {
+		if row.Seq > watermark {
+			return
+		}
+		switch row.Kind {
+		case "delete", "update":
+			key := RecordKey{DID: row.DID, Collection: row.Collection, Rkey: row.Rkey}
+			if row.Seq > recordTombstones[key] {
+				recordTombstones[key] = row.Seq
+			}
+		case "sync":
+			if row.Seq > didTombstones[row.DID] {
+				didTombstones[row.DID] = row.Seq
+			}
+		case "account":
+			if !row.AccountDeleted {
+				return
+			}
+			if row.Seq > didTombstones[row.DID] {
+				didTombstones[row.DID] = row.Seq
+			}
+		}
+	}
+	for _, row := range want {
+		observeTombstone(row)
+	}
+	for _, row := range observed {
+		observeTombstone(row)
+	}
+
+	out := make([]EventLogRow, 0, len(want))
+	for _, row := range want {
+		if row.Seq <= watermark && (row.Kind == "create" || row.Kind == "update" || row.Kind == "create_resync") {
+			key := RecordKey{DID: row.DID, Collection: row.Collection, Rkey: row.Rkey}
+			if recordTombstones[key] > row.Seq || didTombstones[row.DID] > row.Seq {
+				continue
+			}
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func assertChainDurable(t *testing.T, dataDir string, coord *chainCoordinator, phase string) {

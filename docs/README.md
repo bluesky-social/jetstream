@@ -425,7 +425,8 @@ type Status string
 
 const (
     StatusNotStarted Status = "not_started"
-    // discovered live in steady state, awaiting initial getRepo (issue #188)
+    // awaiting whole-repo replacement via getRepo (net-new live DID or
+    // interrupted bootstrap repo)
     StatusPending Status = "pending"
     StatusComplete   Status = "complete"
     StatusFailed     Status = "failed"
@@ -519,7 +520,7 @@ Every block seal commits a single pebble batch that advances `relay/cursor` and 
 
 If there were any accounts that failed to download during the initial backfill phase (i.e. `repo/<did>.Status == StatusFailed`), we periodically retry downloading them with exponential backoff in the background until they succeed. Retry eligibility and backoff are stored on `repo/<did>` via `RetryCount` and `NextAttemptAt` so process restarts do not create retry storms. When we do successfully download a repo that previously failed, we treat it similar to a whole-repo `#sync` event: mark all previous events for that DID as deleted, and recreate from the downloaded CAR file.
 
-The same loop also backfills **net-new DIDs** ([#188](https://github.com/bluesky-social/jetstream/issues/188)). A repo can show up live that we never backfilled — say its PDS was firewalled during the `listRepos` sweep and only later starts replaying, so the first event we see is #101 and we missed #1–100. When the live consumer archives an event for a DID with no `repo/<did>` row, it writes one at `StatusPending`. The retry loop treats pending and failed the same way, so the next pass downloads it over the usual `getRepo` path. This only matters in steady state; during bootstrap a DID that appears mid-sweep still turns up later in the same `listRepos` pagination.
+The same retry machinery also backfills `StatusPending` repos. A repo can show up live that we never backfilled — say its PDS was firewalled during the `listRepos` sweep and only later starts replaying, so the first event we see is #101 and we missed #1–100. When the live consumer archives an event for a DID with no `repo/<did>` row, it writes one at `StatusPending` ([#188](https://github.com/bluesky-social/jetstream/issues/188)). Bootstrap crash recovery can also promote a pre-existing `StatusNotStarted` row to `StatusPending` ([#262](https://github.com/bluesky-social/jetstream/issues/262)) instead of re-downloading it at low seqs; merge runs one immediate pending retry pass after draining the captured live tail, then steady state's periodic retry loop handles any remaining pending rows. Pending retries use the same whole-repo `#sync`-like replacement shape as failed-repo retries.
 
 The `/subscribe` live tail reads the steady writer's readable log ([#248](https://github.com/bluesky-social/jetstream/issues/248)). The steady writer is shared by multiple producers — the live consumer plus the failed-repo/net-new retry runner above — so visibility hangs off the seq allocator itself: every event appended through the writer is copied into an ordered in-memory log as soon as it receives a seq, before any flush, async compression, or rotation can move it between durability stages. The writer advances the log's durable watermark only after the segment block is fsynced and the `seq/next` Pebble batch commits. Entries at or above that watermark are pinned; durable entries below it are retained under the configured byte budget. `/subscribe` reads the log for resident seqs and uses the cold reader only for cursors below the log floor, which are durable by construction.
 

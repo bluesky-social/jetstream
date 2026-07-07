@@ -39,6 +39,8 @@ type Store struct {
 	crashInjector      crashpoint.Injector
 	countsMu           sync.Mutex
 	completions        *completionBatcher
+	runMu              sync.Mutex
+	discoveredThisRun  map[atmos.DID]struct{}
 }
 
 // Compile-time guarantee that Store satisfies the atmos contract.
@@ -60,7 +62,7 @@ func (s *Store) SetCompletionBatcher(b *completionBatcher) {
 // Lookup reads repo/<did> and projects the on-disk RepoStatus into
 // atmos's StoreEntry shape. A missing row returns StateUnknown — that's
 // how atmos tells the engine to fire OnDiscover.
-func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEntry, error) {
+func (s *Store) Lookup(ctx context.Context, did atmos.DID) (atmosbackfill.StoreEntry, error) {
 	val, closer, err := s.db.Get(repoKey(did))
 	if errors.Is(err, store.ErrNotFound) {
 		return atmosbackfill.StoreEntry{State: atmosbackfill.StateUnknown}, nil
@@ -78,7 +80,20 @@ func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEnt
 	var st atmosbackfill.State
 	switch rs.Backfill.Status {
 	case StatusNotStarted:
-		st = atmosbackfill.StateDiscovered
+		if s.discoveredInThisRun(did) {
+			st = atmosbackfill.StateDiscovered
+			break
+		}
+		// A pre-existing not_started row means this download may be replaying
+		// after a crash. Re-downloading through the bootstrap writer would
+		// assign low seqs; stale account/sync tombstones from bootstrap-live can
+		// then merge above those rows and erase them (#262). Defer it to the
+		// post-merge pending retry pass instead, where the whole-repo
+		// replacement lands above the captured live tail.
+		if err := s.deferInterruptedBootstrapRepo(ctx, did); err != nil {
+			return atmosbackfill.StoreEntry{}, err
+		}
+		st = atmosbackfill.StateComplete
 	case StatusPending:
 		// Net-new steady-state DID awaiting its first getRepo (issue #188).
 		// atmos has no dedicated "discovered live, retry-eligible" state, so
@@ -86,7 +101,11 @@ func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEnt
 		// and pending rows identically (scanDue selects both), and the atmos
 		// bootstrap engine never sees a pending row — those are only created
 		// after bootstrap, in steady state.
-		st = atmosbackfill.StateFailed
+		//
+		// If a bootstrap restart does see a pending row, it is already deferred
+		// to the post-merge/steady retry path. Return StateComplete so atmos
+		// advances listRepos without dispatching a low-seq download.
+		st = atmosbackfill.StateComplete
 	case StatusComplete:
 		st = atmosbackfill.StateComplete
 	case StatusFailed:
@@ -103,6 +122,39 @@ func (s *Store) Lookup(_ context.Context, did atmos.DID) (atmosbackfill.StoreEnt
 	}
 
 	return atmosbackfill.StoreEntry{State: st, Active: rs.Active}, nil
+}
+
+func (s *Store) markDiscoveredThisRun(did atmos.DID) {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if s.discoveredThisRun == nil {
+		s.discoveredThisRun = make(map[atmos.DID]struct{})
+	}
+	s.discoveredThisRun[did] = struct{}{}
+}
+
+func (s *Store) discoveredInThisRun(did atmos.DID) bool {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	_, ok := s.discoveredThisRun[did]
+	return ok
+}
+
+func (s *Store) deferInterruptedBootstrapRepo(ctx context.Context, did atmos.DID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, old Status) (func(*HostStatus), error) {
+		if old != StatusNotStarted {
+			return nil, nil
+		}
+		rs.Backfill.Status = StatusPending
+		rs.Backfill.LastError = ""
+		rs.Backfill.Attempts = 0
+		rs.Backfill.RetryCount = 0
+		rs.Backfill.NextAttemptAt = time.Time{}
+		return nil, nil
+	})
 }
 
 // putRepoStatus writes the value durably. It is a test-only setter that
@@ -710,6 +762,7 @@ func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) er
 	if err := s.putRepoStatusAndCounts(entry.DID, rs, false, "", nil); err != nil {
 		return err
 	}
+	s.markDiscoveredThisRun(entry.DID)
 	s.metrics.incDiscovered()
 	return nil
 }
