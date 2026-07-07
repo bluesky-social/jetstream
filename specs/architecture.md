@@ -70,7 +70,8 @@ This is unusually central to the project, so it's worth knowing even if you're n
 | The Go client | `internal/client`, module root, `docs/README.md` §5 |
 | Compaction / tombstones | `internal/tombstone`, `docs/README.md` §3.3 |
 | Timestamp import | `internal/timestamp`, `docs/README.md` §8 |
-| The oracle / simulator / mutation rig | `specs/oracle.md`, `internal/oracle/doc.go`, `internal/simulator/doc.go` |
+| The oracle / simulator | `specs/oracle.md`, `internal/oracle/doc.go`, `internal/simulator/doc.go` |
+| The mutation campaign (oracle scorecard) | `specs/mutation.md`, `testing/mutation/RESULTS.md` |
 | Coding conventions, workflow, task tracking | `AGENTS.md` |
 | Design history / why a thing is the way it is | `specs/notes/` (dated design + implementation notes) |
 

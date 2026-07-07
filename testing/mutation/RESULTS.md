@@ -2,8 +2,8 @@
 
 Each campaign appends a dated section; history is never overwritten so the
 oracle's detection power is visible over time. See
-`docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md` for the
-method and `testing/mutation/run.sh` for the driver.
+`specs/mutation.md` for the method and `testing/mutation/run.sh` for the
+driver.
 
 **Current catalog (keep this line current): 35 active mutants on disk
 (m001–m043; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current

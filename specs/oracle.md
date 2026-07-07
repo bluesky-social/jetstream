@@ -204,7 +204,9 @@ records by default.
 
 `testing/mutation` measures oracle detection power with curated, realistic
 single-edit bugs. A mutant is not a production patch; it is a bug model with a
-documented failure mode and expected detection tier.
+documented failure mode and expected detection tier. `specs/mutation.md` is the
+dedicated design guide for the campaign; the summary here is enough to place it
+in the oracle's context.
 
 The mutation campaign is the scorecard for major oracle improvements:
 
