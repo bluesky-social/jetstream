@@ -49,6 +49,17 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 
 		// Restart-after-cleanup guard.
 		if _, err := statStorageFS(o.cfg.FS, liveSegmentsDir); isStorageNotExist(err) {
+			// The prior process removed the backfill tree but may have died
+			// (e.g. SIGKILL, page cache intact) before that dirent removal was
+			// made durable. Observing live_segments as gone does not prove the
+			// removal reached stable storage, and the cursor deletes below are
+			// SyncWrites (durable immediately). Fsync the data dir first so a
+			// power loss here cannot leave the cursors deleted while the backfill
+			// tree reappears — which would skip this guard next boot and re-drain
+			// from cursor 0, duplicating already-merged events.
+			if err := syncStorageDirFS(o.cfg.FS, o.cfg.DataDir); err != nil {
+				return fmt.Errorf("orchestrator: merge: sync data dir in restart-after-cleanup guard: %w", err)
+			}
 			if err := deleteMergeCursor(o.cfg.Store); err != nil {
 				return err
 			}
@@ -130,10 +141,24 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		if err := removeAllStorageFS(o.cfg.FS, filepath.Join(o.cfg.DataDir, "backfill")); err != nil {
 			return fmt.Errorf("orchestrator: merge: remove backfill dir: %w", err)
 		}
+		// Make the backfill-subtree removal durable before deleting the merge
+		// cursors. deleteMergeCursor commits with store.SyncWrites, so without
+		// this fsync a power loss could leave the cursor deletion durable while
+		// the data/backfill dirent removal is not. On restart the phase is
+		// still PhaseMerging, live_segments would reappear, the
+		// restart-after-cleanup guard would be skipped, and the drain would
+		// re-run from cursor 0 — appending already-merged events into
+		// data/segments and corrupting the archive.
+		if err := syncStorageDirFS(o.cfg.FS, o.cfg.DataDir); err != nil {
+			return fmt.Errorf("orchestrator: merge: sync data dir after backfill removal: %w", err)
+		}
 		if err := deleteMergeCursor(o.cfg.Store); err != nil {
 			return err
 		}
 		if err := backfill.DeleteBootstrapLastListReposCursor(o.cfg.Store); err != nil {
+			return err
+		}
+		if err := o.simulateCrash(ctx, crashpoint.AfterMergeCleanupComplete); err != nil {
 			return err
 		}
 		return nil

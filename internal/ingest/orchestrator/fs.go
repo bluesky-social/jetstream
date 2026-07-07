@@ -26,6 +26,25 @@ func removeAllStorageFS(fs vfs.FS, path string) error {
 	return nil
 }
 
+// syncStorageDirFS fsyncs a directory so that entry creations or removals in
+// it (e.g. a RemoveAll of a child subtree) are durable before a subsequent
+// store mutation that assumes them. Without this, a power loss can leave a
+// durable store change ordered ahead of a not-yet-durable dirent change.
+func syncStorageDirFS(fs vfs.FS, path string) error {
+	dir, err := storageFS(fs).OpenDir(path)
+	if err != nil {
+		return fmt.Errorf("orchestrator: open dir %s for sync: %w", path, err)
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return fmt.Errorf("orchestrator: fsync dir %s: %w", path, err)
+	}
+	if err := dir.Close(); err != nil {
+		return fmt.Errorf("orchestrator: close dir %s after sync: %w", path, err)
+	}
+	return nil
+}
+
 func isStorageNotExist(err error) bool {
 	return os.IsNotExist(err) || oserror.IsNotExist(err)
 }

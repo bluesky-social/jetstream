@@ -40,6 +40,15 @@ const (
 	// discovery idempotently and still complete cleanup.
 	AfterMergeDiscoveryBeforeCleanup Point = "after-merge-discovery-before-cleanup"
 
+	// AfterMergeCleanupComplete fires at the tail of merge cleanup, after the
+	// backfill subtree has been removed and both merge cursor keys have been
+	// durably deleted, but before runMerge returns (and thus before
+	// phase=steady_state is written). Recovery re-enters PhaseMerging and must
+	// still converge: the backfill removal must be durable, so the
+	// restart-after-cleanup guard sees live_segments gone rather than re-running
+	// the drain from cursor 0 and duplicating already-merged events.
+	AfterMergeCleanupComplete Point = "after-merge-cleanup-complete"
+
 	// AfterBootstrapLiveCloseBeforeSeal fires after bootstrap-live Close flushes
 	// data and cursor state but before its active segment is sealed for merge.
 	// Recovery must not assume the source tree is already fully sealed.
@@ -114,6 +123,7 @@ var AllPoints = []Point{
 	AfterMergeDstFlushBeforeSourceCommit,
 	AfterMergeDstSealBeforeDiscovery,
 	AfterMergeDiscoveryBeforeCleanup,
+	AfterMergeCleanupComplete,
 	AfterBootstrapLiveCloseBeforeSeal,
 	AfterSteadyPhaseBeforeSteadyRun,
 	AfterCompactionRewriteBeforeWatermark,

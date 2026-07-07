@@ -96,6 +96,20 @@ func strictPowerLossRuntimeCases() []strictPowerLossRuntimeCase {
 			preLiveEvents: 4,
 		},
 		{
+			// End-to-end recovery coverage for a strict-FS power cut at the tail
+			// of merge cleanup (after the backfill removal and the durable
+			// SyncWrites cursor deletes, before phase=steady_state). Whether this
+			// seed keeps any merge survivors depends on the simulator, so the
+			// duplicate-on-re-drain regression this window guards is pinned
+			// deterministically by
+			// orchestrator.TestRunMerge_StrictMemPowerLossCleanupComplete, which
+			// forces a survivor. This case verifies the full runtime still
+			// converges through the crashpoint.
+			name:          "after-merge-cleanup-complete",
+			point:         crashpoint.AfterMergeCleanupComplete,
+			preLiveEvents: 4,
+		},
+		{
 			name:          "after-bootstrap-live-close-before-seal",
 			point:         crashpoint.AfterBootstrapLiveCloseBeforeSeal,
 			preLiveEvents: 4,
