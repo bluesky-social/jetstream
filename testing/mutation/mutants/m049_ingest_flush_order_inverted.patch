@@ -1,0 +1,37 @@
+mutant: m049_ingest_flush_order_inverted
+target: internal/ingest/writer.go
+failure-mode: |
+  flushBlockLocked commits seq/next and any durable-batch cursor metadata before
+  fsyncing the segment block. A power loss in that window can recover Pebble's
+  cursor advancement without the segment bytes it claims, permanently skipping
+  upstream events.
+expected-detection: |
+  Killed by the powerloss tier's TestWriterFlushOrdersSegmentSyncBeforeStoreCommit,
+  which records the block data write, segment fsync, and seq/next commit order
+  and requires the fsync after the data write but before the store commit. The
+  default oracle durable-order checker asserts the same invariant over the full
+  lifecycle.
+expected-tier: powerloss
+tiers: powerloss,default
+
+diff --git a/internal/ingest/writer.go b/internal/ingest/writer.go
+index 83c6e76..804e9f5 100644
+--- a/internal/ingest/writer.go
++++ b/internal/ingest/writer.go
+@@ -607,12 +607,12 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
+ func (w *Writer) flushBlockLocked(ctx context.Context) error {
+ 	prepareValue := w.sampleDurableBatchPrepareValueLocked()
++	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, prepareValue); err != nil {
++		return err
++	}
+ 	if err := w.active.Flush(); err != nil {
+ 		return w.wrapSegmentPersistenceError("flushing active segment block", fmt.Errorf("ingest: flush block: %w", err))
+ 	}
+ 	w.cfg.Metrics.incBlocksFlushed()
+ 
+-	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, prepareValue); err != nil {
+-		return err
+-	}
+ 	return nil
+ }
+ 

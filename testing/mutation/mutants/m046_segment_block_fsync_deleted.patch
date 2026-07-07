@@ -1,0 +1,32 @@
+mutant: m046_segment_block_fsync_deleted
+target: segment/writer.go
+failure-mode: |
+  flushLocked writes an active-segment block but skips the file fsync before
+  returning success. The ingest writer can then commit seq/next and the relay
+  cursor to Pebble while the covering segment bytes exist only in volatile
+  cache, so a power loss can recover a durable cursor that points past missing
+  archive data.
+expected-detection: |
+  Killed by the powerloss tier. TestStrictMemDropsUnsyncedFlushedBlock and
+  TestWriterStrictMemPowerLossDropsUnsyncedSegmentAndStoreState reset Pebble's
+  strict in-memory FS to its synced state and require only fsynced blocks to
+  survive. The oracle durable-order checker also observes a segment data write
+  followed by a seq/next commit with no intervening segment file sync.
+expected-tier: powerloss
+tiers: powerloss,default
+
+diff --git a/segment/writer.go b/segment/writer.go
+index d783e9f..7e8bb88 100644
+--- a/segment/writer.go
++++ b/segment/writer.go
+@@ -565,10 +565,6 @@ func (w *Writer) flushLocked() error {
+ 		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
+ 		return w.stickyErr
+ 	}
+-	if err := syncSegmentFile(w.cfg.FS, w.file); err != nil {
+-		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
+-		return w.stickyErr
+-	}
+ 	return nil
+ }
+ 

@@ -1,0 +1,23 @@
+mutant: m050_store_syncwrites_linux_nosync
+target: internal/store/sync_unix.go
+failure-mode: |
+  Linux metadata writes use pebble.NoSync instead of pebble.Sync. Segment blocks
+  may still fsync, but seq/next, relay/cursor, compaction watermarks, and other
+  metadata commits no longer reach the storage durability boundary before the
+  caller observes success.
+expected-detection: |
+  Killed by the powerloss tier's TestOpen_StrictMemDropsUnsyncedWrites. The test
+  writes one key with store.SyncWrites and one with pebble.NoSync, simulates a
+  power cut with vfs.NewStrictMem.ResetToSyncedState, and requires only the
+  SyncWrites key to survive. Under this mutant both writes are NoSync and the
+  synced key disappears.
+expected-tier: powerloss
+tiers: powerloss
+
+diff --git a/internal/store/sync_unix.go b/internal/store/sync_unix.go
+index 229b4ff..a925e98 100644
+--- a/internal/store/sync_unix.go
++++ b/internal/store/sync_unix.go
+@@ -14 +14 @@ import "github.com/cockroachdb/pebble"
+-var SyncWrites = pebble.Sync
++var SyncWrites = pebble.NoSync

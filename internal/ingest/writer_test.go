@@ -119,9 +119,18 @@ func TestWriterFlushOrdersSegmentSyncBeforeStoreCommit(t *testing.T) {
 
 	rec := &durableOrderRecorder{}
 	fs := vfs.WithLogging(baseFS, func(format string, args ...any) {
-		msg := fmt.Sprintf(format, args...)
-		if strings.HasPrefix(msg, "sync: ") && strings.Contains(msg, ".jss") {
-			rec.add("segment-sync")
+		switch format {
+		case "write-at(%d, %d): %s":
+			offset, ok := args[0].(int64)
+			if ok && offset >= int64(segment.ReservedHeaderBytes) {
+				if path, ok := args[2].(string); ok && strings.Contains(path, ".jss") {
+					rec.add("segment-data-write")
+				}
+			}
+		case "sync: %s":
+			if path, ok := args[0].(string); ok && strings.Contains(path, ".jss") {
+				rec.add("segment-sync")
+			}
 		}
 	})
 
@@ -149,7 +158,10 @@ func TestWriterFlushOrdersSegmentSyncBeforeStoreCommit(t *testing.T) {
 	ops := rec.snapshot()
 	storeCommit := slices.Index(ops, "store-seq-commit")
 	require.NotEqual(t, -1, storeCommit, "expected seq/next commit in op stream: %v", ops)
-	require.Contains(t, ops[:storeCommit], "segment-sync", "segment fsync must happen before seq/next commit: %v", ops)
+	dataWrite := slices.Index(ops, "segment-data-write")
+	require.NotEqual(t, -1, dataWrite, "expected segment data write in op stream: %v", ops)
+	syncAfterWrite := slices.Index(ops[dataWrite:storeCommit], "segment-sync")
+	require.NotEqual(t, -1, syncAfterWrite, "segment data fsync must happen after block write and before seq/next commit: %v", ops)
 }
 
 func TestWriterStrictMemPowerLossDropsUnsyncedSegmentAndStoreState(t *testing.T) {

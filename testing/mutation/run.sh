@@ -287,6 +287,17 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          ./internal/oracle ./internal/ingest/orchestrator ./segment
                          -run 'TestOracle_RestartSegmentFault|TestOracle_RestartTornActiveSegmentTail|TestRunDeleteCompaction_ENOSPC|TestRunImport_ENOSPC|TestRunImport_SegmentIOFaultSweep|TestFlushReturnsENOSPC|TestPatchIOFaultSweep|TestRewriteIOFaultSweep|TestNewRemovesEmptyFileWhenInitFails'
                          -count=1 -timeout "$segmentfault_timeout") ;;
+                powerloss)
+                    # Power-loss tier (#264): strict in-memory storage and
+                    # ordering checks for fsync omission/reordering mutants.
+                    # This is deliberately narrow and fast: segment/store/ingest
+                    # package tests prove written-vs-synced state is discarded
+                    # correctly, and the oracle tests exercise the shared
+                    # segment+Pebble strict FS plus the durable-op checker.
+                    cmd=(go test "${RACE_FLAG[@]}"
+                         ./segment ./internal/store ./internal/ingest ./internal/oracle
+                         -run 'TestStrictMem|TestOpen_StrictMemDropsUnsyncedWrites|TestWriterStrictMem|TestWriterFlushOrdersSegmentSyncBeforeStoreCommit|TestDurableOrderRecorder|TestOracle_PowerLossStrictMemDropsUnsyncedState'
+                         -count=1 -short -timeout "$default_timeout") ;;
                 partb)
                     # Part-B tier (#182): kills paginated-cutover mutants
                     # (continuation-cursor off-by-one, mid-segment cut reporting

@@ -23,6 +23,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/jcalabro/gt"
@@ -171,6 +172,8 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	simClient := simLn.httpClient()
 
 	dataDir := t.TempDir()
+	durableOrder := newDurableOrderRecorder()
+	storageFS := durableOrder.WrapFS(vfs.Default)
 	afterBootstrap := newPhaseGate()
 	afterMerge := newPhaseGate()
 	bootstrapAck := newSeqAck()
@@ -238,6 +241,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
 		DataDir:            dataDir,
+		StorageFS:          storageFS,
 		RelayURL:           simURL,
 		PLCURL:             simURL,
 		OTelServiceName:    "jetstream-oracle",
@@ -300,6 +304,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 				"err":       traceErr(result.Err),
 			})
 		},
+		StoreFaultInjector: durableOrder,
 		OnBootstrapLiveEvent: func(ev *segment.Event) {
 			bootstrapAck.Observe(ev)
 			bootstrapEventLog.Observe(ev)
@@ -586,6 +591,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	// watermark. The runtime has exited, so all passes are captured and none
 	// can race this assertion.
 	overDrop.Assert(t, cfg, trace, "steady-state-shutdown-flush")
+	durableOrder.Assert(t)
 
 	recordTraceOrError(t, trace, "phase", map[string]any{"phase": "final-assertions", "marker": "done"})
 	assertTraceContainsKinds(t, tracePath,

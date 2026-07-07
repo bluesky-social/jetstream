@@ -5,14 +5,15 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 35 active mutants on disk
-(m001–m043; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+**Current catalog (keep this line current): 42 active mutants on disk
+(m001–m050; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
 union baseline after #206 frame-tier coverage, #208 footer-index/bloom
-verification, and #203 account-status exactness: **35 killed, 0 survived,
+verification, #203 account-status exactness, and #264 power-loss durability
+coverage: **42 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
-`testing/mutation/baseline.json` (commit field `4f2c153` is
-provenance-only). #208 banked the old m015 footer-index survivor as
+`testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
+m046-m050 cover fsync omission/reordering and Linux SyncWrites downgrades.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -78,6 +79,22 @@ remain below so the reasoning is not lost.
 | m021_overlay_record_seq_base_zero | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m023_overlay_drop_record_tombstones | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178. #183's re-derivation analysis (2026-07-04 section below) concluded no single-edit replacement exists: the recorder is a regression assertion without a gated mutant. |
+
+## Campaign 2026-07-07 (#264 — power-loss durability boundary)
+
+Targeted clean-copy mutation-driver runs after adding the power-loss tier and
+the durable-operation recorder. The shared working tree was dirty by design
+while this change was under construction, so the five new mutants were verified
+in a temporary clean git repo copied from this tree; each was applied and
+reverted by `testing/mutation/run.sh`.
+
+| mutant | result | note |
+|---|---|---|
+| m046_segment_block_fsync_deleted | KILLED@powerloss | strict-mem segment/ingest tests and durable-order checks catch a block write with no covering segment fsync |
+| m047_rewrite_parent_dir_fsync_deleted | KILLED@segmentfault | Rewrite seam-count sweep catches the missing parent-dir fsync |
+| m048_patch_parent_dir_fsync_deleted | KILLED@segmentfault | Patch seam-count sweep catches the missing parent-dir fsync |
+| m049_ingest_flush_order_inverted | KILLED@powerloss | ingest operation-order test catches seq/next commit before segment data fsync |
+| m050_store_syncwrites_linux_nosync | KILLED@powerloss | strict-mem store test catches `store.SyncWrites` losing durability |
 
 ## Campaign 2026-07-05 (#203 — account lifecycle statuses and getRepo unavailable)
 

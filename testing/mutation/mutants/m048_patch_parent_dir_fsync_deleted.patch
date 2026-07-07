@@ -1,0 +1,28 @@
+mutant: m048_patch_parent_dir_fsync_deleted
+target: segment/patch.go
+failure-mode: |
+  segment.Patch fsyncs the temporary replacement file and renames it over the
+  sealed segment, but skips the parent directory fsync that makes the rename
+  durable. A timestamp-import checkpoint can then become durable while the
+  patched segment dirent is still vulnerable to power-loss rollback.
+expected-detection: |
+  Killed by the segmentfault tier's TestPatchIOFaultSweep, whose fault-free
+  reference run asserts Patch consults exactly three sync seams: new-segment
+  initialization, temporary-file fsync, and parent-directory fsync.
+expected-tier: segmentfault
+tiers: segmentfault
+
+diff --git a/segment/patch.go b/segment/patch.go
+index 3181839..f5f75ff 100644
+--- a/segment/patch.go
++++ b/segment/patch.go
+@@ -330,9 +330,6 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResu
+ 	if err := simulatePatchCrash(opts, CrashPointPatchRenamed); err != nil {
+ 		return PatchResult{}, err
+ 	}
+-	if err := syncParentDirFS(opts.FS, path, opts.IOFaultInjector); err != nil {
+-		return PatchResult{}, err
+-	}
+ 	if err := simulatePatchCrash(opts, CrashPointPatchDirSynced); err != nil {
+ 		return PatchResult{}, err
+ 	}
