@@ -400,7 +400,14 @@ func TestOracleRestartChild(t *testing.T) {
 	runErr := rt.Run(ctx)
 	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	require.NoError(t, rt.Close(closeCtx))
+	// Fault tiers use a record-don't-assert protocol: the child writes the
+	// observed-marker and lets the PARENT judge the outcome. Capture Close
+	// rather than asserting it inline so a Close failure can't pre-empt the
+	// marker write below and turn a correctly-surfaced fault into an opaque
+	// non-zero child exit. Close is still asserted in every path, folded with
+	// the marker-write error (errors.Join) so neither failure can mask the
+	// other, once the marker is durable.
+	closeErr := rt.Close(closeCtx)
 
 	// Store-fault tier: when a fault is armed, the contract is that the runtime
 	// surfaces it LOUD. The merge error propagates wrapped up through
@@ -413,12 +420,16 @@ func TestOracleRestartChild(t *testing.T) {
 	// way the child exits 0, so the kill signal is the marker's absence, not a
 	// child crash or a timeout.
 	if observedPath := os.Getenv(envRestartStoreFaultObserved); observedPath != "" {
+		var markerErr error
 		if errors.Is(runErr, errStoreFaultInjected) {
-			require.NoError(t, os.WriteFile(observedPath, []byte(runErr.Error()), 0o644))
+			markerErr = os.WriteFile(observedPath, []byte(runErr.Error()), 0o644)
 		} else {
 			t.Logf("store fault armed but runtime did not surface the sentinel (got %v); "+
 				"observed-marker withheld — parent will treat this as a swallowed-error kill", runErr)
 		}
+		// Fold marker + Close so a marker-write failure can't pre-empt the Close
+		// assertion: both must hold on every store-fault path.
+		require.NoError(t, errors.Join(markerErr, closeErr))
 		return
 	}
 
@@ -427,15 +438,20 @@ func TestOracleRestartChild(t *testing.T) {
 	// parent can additionally assert message contracts (e.g. the ENOSPC
 	// disk-full operator message) without re-plumbing the error.
 	if observedPath := os.Getenv(envRestartSegmentFaultObserved); observedPath != "" {
+		var markerErr error
 		if runErr != nil && errors.Is(runErr, errSegmentFaultInjected) {
-			require.NoError(t, os.WriteFile(observedPath, []byte(runErr.Error()), 0o644))
+			markerErr = os.WriteFile(observedPath, []byte(runErr.Error()), 0o644)
 		} else {
 			t.Logf("segment fault armed but runtime did not surface the sentinel (got %v); "+
 				"observed-marker withheld — parent will treat this as a swallowed-error kill", runErr)
 		}
+		// Fold marker + Close so a marker-write failure can't pre-empt the Close
+		// assertion: both must hold on every segment-fault path.
+		require.NoError(t, errors.Join(markerErr, closeErr))
 		return
 	}
 
+	require.NoError(t, closeErr)
 	require.True(t,
 		runErr == nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded),
 		"runtime error: %v", runErr)
