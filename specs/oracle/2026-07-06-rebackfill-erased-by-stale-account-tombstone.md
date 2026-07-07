@@ -73,3 +73,36 @@ The chain-coverage assertion now also accounts for observed repair tombstones
 when deciding which expected materialization rows compaction legitimately
 removed; otherwise the new synthetic sync could make a correct repair look like
 a lost intermediate.
+
+## Follow-up: false failure from an over-strict visibility assertion (2026-07-07)
+
+After un-skipping this case, `oracle-sweep` surfaced a NON-deterministic (real
+wall-clock crash-timing dependent, ~1-in-6) failure at a swept base seed:
+
+```
+segmentfault-write-shortwrite-first-flush: recreated record
+  app.bsky.feed.post/… must be visible (no permanent tombstone)
+```
+
+This was NOT data loss and NOT a re-manifestation of #262. Evidence: the full
+final-state oracle `Compare(want, got)` PASSED in the same run — jetstream's
+archive exactly equalled the world ground truth — while only the per-shape
+`assertRecreatedRecordsVisible` check failed. Dumping ground truth showed the
+world itself no longer had the record at head: this case carries
+`liveEventsBetweenChildren: 2`, and `generateN` picks a random active author +
+random action. When it draws the chain-host account with `action=delete`,
+`pickUntouchedRecord` (world/traffic.go) can select the just-recreated record
+and legitimately delete it — a valid world mutation the archive faithfully
+reproduced.
+
+The bug was in the assertion: it assumed a `shapeLiveDeleteRecreate` record is
+ALWAYS present at head, which is only true absent later traffic on that key.
+Fixed by gating the check on ground truth (restart_chain_assert_test.go): the
+record must be present on disk iff ground truth has it. This still catches a
+masked recreate (truth has it → disk must too) AND a failure to honor a later
+delete (truth dropped it → disk must too), without flagging a correctly-absent
+record as a permanent tombstone. Lesson: a per-shape invariant that hardcodes an
+expected final state is fragile when random background traffic can mutate the
+same key — assert against ground truth, not a static assumption. When only a
+narrow per-shape check fails but the full `Compare` passes, suspect the check,
+not the system under test.

@@ -125,16 +125,26 @@ func assertChainDurable(t *testing.T, dataDir string, coord *chainCoordinator, p
 	require.NoErrorf(t, CheckCompacted(cov.events, cov.watermark),
 		"%s: compaction contract (W=%d)", phase, cov.watermark)
 
-	// No-permanent-tombstone: every delete→recreate record reconstructs as
-	// present at head.
-	assertRecreatedRecordsVisible(t, cov.events, coord.spec, coord.hostDID, phase)
+	// No-permanent-tombstone: every delete→recreate record reconstructs at
+	// head exactly as the world's ground truth has it.
+	truth, err := GroundTruthFromWorld(coord.w)
+	require.NoErrorf(t, err, "%s: ground truth for visibility", phase)
+	assertRecreatedRecordsVisible(t, cov.events, coord.spec, coord.hostDID, truth, phase)
 }
 
 // assertRecreatedRecordsVisible reconstructs the durable stream and checks
-// that each shapeLiveDeleteRecreate record is present in the host repo's
-// final state — proving the recreate above the delete tombstone is not
-// masked (no permanent tombstone, docs/README.md:358).
-func assertRecreatedRecordsVisible(t *testing.T, events []ObservedEvent, spec chainSpec, hostDID, phase string) {
+// that each shapeLiveDeleteRecreate record's on-disk head state matches the
+// world's ground truth. In the common case the record survives to head, so
+// this proves the recreate above the delete tombstone is not masked (no
+// permanent tombstone, docs/README.md:358). But random inter-child firehose
+// traffic (liveEventsBetweenChildren) can legitimately re-delete the recreated
+// record on the chain host: when it does, ground truth no longer has the record
+// and disk must agree. Asserting equality against ground truth (rather than
+// unconditional presence) catches BOTH a masked recreate (truth has it, disk
+// lost it) AND a failure to honor a later delete (truth dropped it, disk kept
+// it), without falsely flagging a correctly-absent record as a permanent
+// tombstone.
+func assertRecreatedRecordsVisible(t *testing.T, events []ObservedEvent, spec chainSpec, hostDID string, truth *Model, phase string) {
 	t.Helper()
 
 	model, err := Reconstruct(events)
@@ -145,11 +155,19 @@ func assertRecreatedRecordsVisible(t *testing.T, events []ObservedEvent, spec ch
 			continue
 		}
 		key := RecordKey{DID: hostDID, Collection: rc.collection, Rkey: rc.rkey}
+		_, wantPresent := truth.Accounts[hostDID].Records[key]
+
 		snap, ok := model.Accounts[hostDID]
 		require.Truef(t, ok, "%s: host DID %s absent from reconstructed model", phase, hostDID)
-		_, present := snap.Records[key]
-		require.Truef(t, present,
-			"%s: recreated record %s/%s must be visible (no permanent tombstone)", phase, rc.collection, rc.rkey)
+		_, gotPresent := snap.Records[key]
+
+		if wantPresent {
+			require.Truef(t, gotPresent,
+				"%s: recreated record %s/%s must be visible (no permanent tombstone)", phase, rc.collection, rc.rkey)
+		} else {
+			require.Falsef(t, gotPresent,
+				"%s: record %s/%s was deleted by later live traffic and must be absent at head", phase, rc.collection, rc.rkey)
+		}
 	}
 }
 
