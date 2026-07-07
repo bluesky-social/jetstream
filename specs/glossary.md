@@ -50,6 +50,6 @@ Words that show up all over the code and docs, with a one-line meaning and where
 
 **Bubble** — a `testing/synctest` bubble: a test scope with a fake clock where the runtime knows when every goroutine is blocked, so the system quiesces deterministically. Only one is allowed per process. Source: `internal/oracle/doc.go`, `specs/oracle.md`.
 
-**Tier** — one family of oracle checks that share helpers but fail with a distinct explanation (storage, event-log, replay, XRPC egress, crash/restart, store-fault, simulator fidelity, corpus, soak, determinism). Source: `specs/oracle.md`.
+**Tier** — one family of oracle checks that share helpers but fail with a distinct explanation (storage, event-log, replay, XRPC egress, crash/restart, store-fault, segment-fault, simulator fidelity, corpus, soak, determinism). Source: `specs/oracle.md`.
 
 **Mutant / mutation campaign** — a curated single-edit bug (a "mutant") that models a realistic failure; the campaign applies each one and checks the oracle catches it, measuring the oracle's bug-detection power. Never fix production code to match a mutant. Source: `AGENTS.md`, `testing/mutation/RESULTS.md`, `specs/oracle.md`.

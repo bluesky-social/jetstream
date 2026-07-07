@@ -61,6 +61,7 @@ One giant oracle test would be hard to understand and hard to debug. The testing
 - compaction and tombstone invariants;
 - crash/restart durability;
 - local store-fault behavior;
+- local segment-file I/O fault behavior;
 - adversarial simulator fidelity;
 - real-data corpus independence;
 - long-horizon soak behavior;
