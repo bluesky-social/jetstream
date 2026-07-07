@@ -30,7 +30,7 @@ Words that show up all over the code and docs, with a one-line meaning and where
 
 **Cutover** — the whole bootstrap → merging → steady-state transition, anchored by two durable commit points (`phase=merging`, `phase=steady_state`) so a crash mid-cutover recovers by re-entering the state machine. Source: `docs/README.md` §4, `internal/ingest/orchestrator/doc.go`.
 
-**Steady state** — normal operation after cutover: one live consumer pumps the firehose into `segments/`, net-new DIDs get backfilled on the side, and compaction runs periodically. Source: `docs/README.md` §4.3.
+**Steady state** — normal operation after cutover: one live consumer pumps the firehose into `segments/`, failed backfills retry on the side, and compaction runs periodically. Source: `docs/README.md` §4.3.
 
 **Cursor (seq, sequence number)** — the monotonic 64-bit id jetstream assigns each event at ingestion. Also the value clients pass as `?cursor=`. Inclusive, starts at 1, instance-local. Source: `docs/README.md` §2. See also `specs/invariants.md`.
 

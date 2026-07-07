@@ -142,15 +142,12 @@ func (m TrafficMix) validate() error {
 	return nil
 }
 
-// isZero reports whether the mix is entirely unset. New treats a
-// zero-value mix as "use DefaultTrafficMix" (matching the zero-value
-// defaulting convention elsewhere, e.g. backfill.LiveEnqueuerConfig)
-// so literal Config construction keeps working. An explicit all-zero
-// mix is indistinguishable from unset by design: a mix that generates
-// nothing is never a meaningful configuration, and weightedChoice
-// would silently return the last option. A partial mix (e.g. only
-// Identity set) is honored as-is — a future swarm tier (#233) may
-// deliberately omit kinds.
+// isZero reports whether the mix is entirely unset. New treats a zero-value mix
+// as "use DefaultTrafficMix" so literal Config construction keeps working. An
+// explicit all-zero mix is indistinguishable from unset by design: a mix that
+// generates nothing is never a meaningful configuration, and weightedChoice
+// would silently return the last option. A partial mix (e.g. only Identity set)
+// is honored as-is — a future swarm tier (#233) may deliberately omit kinds.
 func (m TrafficMix) isZero() bool {
 	return m == TrafficMix{}
 }

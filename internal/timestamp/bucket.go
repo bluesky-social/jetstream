@@ -6,8 +6,7 @@ package timestamp
 // each segment, replays its offset file against the plain CSV, and applies one
 // segment.Patch per touched segment.
 //
-// Two mechanical-sympathy structures keep this streaming and bounded, mirroring
-// the #188 LiveEnqueuer:
+// Two mechanical-sympathy structures keep this streaming and bounded:
 //
 //  1. A bounded LRU DID->candidate-segments cache absorbs the recommended
 //     DID-grouped input to ~one bloom selection per distinct DID. Unsorted

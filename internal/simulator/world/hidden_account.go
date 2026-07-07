@@ -11,8 +11,8 @@ import (
 // AddHiddenAccountForTest creates a real simulator account outside the
 // listRepos roster. getRepo/PLC lookup can find it by DID, and it can emit
 // signed live traffic, but AccountCount/ListReposPage still expose only the
-// original cfg.Accounts accounts. This models a DID first seen on the steady
-// firehose after the bootstrap listRepos sweep omitted it.
+// original cfg.Accounts accounts. This is useful for tests that need a repo
+// reachable by DID but deliberately omitted from listRepos.
 func (w *World) AddHiddenAccountForTest(ctx context.Context, initialRecords int) (int, Account, error) {
 	w.mutationMu.Lock()
 	defer w.mutationMu.Unlock()

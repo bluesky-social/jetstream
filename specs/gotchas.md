@@ -11,18 +11,17 @@ Each entry says what the thing is, why it's the way it is, and roughly where in 
 
 ## Accepted limitations
 
-### Net-new DID backfill is correct by design — don't "fix" it
+### Live first sighting is not a getRepo trigger
 
-This one repeatedly confuses agents into thinking there's a data-loss bug. There isn't; the behavior is intentional. Here's what actually happens so you don't try to harden it.
+This one repeatedly tempts agents into "repairing" a perceived missing-history gap. Do not reintroduce first-sighting backfill.
 
-A repo can appear live that we never backfilled — say its PDS was firewalled during the bootstrap listRepos sweep, so the first event we ever see for it is well past its start. When the steady-state live consumer archives an event for a DID with no `repo/<did>` row, it writes one at `StatusPending` (`EnqueueNetNewRepo`). The retry loop treats `pending` exactly like a failed repo, so its next pass does a full `getRepo` and captures the repo's current state — the same model we use for a `#sync` resync. `StatusPending` is also used for bootstrap crash recovery of a pre-existing `not_started` row; that producer is separate from the net-new DID path.
+A repo can appear live that we never backfilled — say its PDS was firewalled during the bootstrap `listRepos` sweep, so the first event we ever see for it is well past its start. Jetstream archives the live event it actually received and does **not** create a `repo/<did>` row, mark it pending, or call `getRepo` merely because this is the first time we saw the DID.
 
-Two things that look like problems but aren't:
+Why: a first live event is not an authoritative repair signal. If the repo was hidden behind a firewall and later comes online, that is a PDS/operator condition; the operator should emit a fresh `#sync` event to trigger a full re-download through the sync verifier. A speculative `getRepo` from Jetstream captures current state, not event history, and conflates relay discovery with repo repair.
 
-- The event that triggered the discovery **is** archived normally. It isn't dropped while we go fetch the repo.
-- Events that predate our first sighting were never on our wire and can't be recovered event-by-event — `getRepo` serves the current head, not history. That's inherent to atproto, not a jetstream defect. The current repo state is captured; the archive stays correct going forward.
+The retained background download path is only for repos discovered by authoritative `listRepos` bookkeeping that failed their original download (`StatusFailed`), including the post-merge discovery pass. `StatusPending` is also used for bootstrap crash recovery of a pre-existing `not_started` row (#262), but that producer is separate: merge runs an explicit one-shot pending pass after the captured live tail has landed. New live first sightings must not create pending rows, and the steady-state failed-repo retry loop must not treat pending as eligible.
 
-This only matters in steady state. During bootstrap, a DID that first appears mid-sweep is still enumerated later in the same listRepos pagination, so there's no gap to close there. Area: `internal/ingest/backfill/enqueue.go` and `store.go` (`EnqueueNetNewRepo`), `docs/README.md` §4.3, issue #188.
+Area: `internal/ingest/backfill/retry.go`, `internal/ingest/orchestrator/steady.go`, `docs/README.md` §4.3, issue #247.
 
 ### Timestamp-import ReadRow can accept a suffix behind a quoted newline
 
