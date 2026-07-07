@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -314,6 +315,8 @@ func newStrictMemMergeOrchestrator(
 			DataDir:            dataDir,
 			FS:                 fs,
 			Store:              st,
+			RelayURL:           "http://127.0.0.1",
+			HTTPClient:         &http.Client{Timeout: 5 * time.Second},
 			Logger:             logger,
 			CompactionInterval: time.Hour,
 			SkipMergeDiscovery: true,
