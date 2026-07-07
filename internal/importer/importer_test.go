@@ -143,6 +143,13 @@ func writeCSV(t *testing.T, dir, name string) string {
 	return p
 }
 
+func resolvedPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	require.NoError(t, err)
+	return resolved
+}
+
 func waitTerminal(t *testing.T, m *importer.Manager, id string) importer.Record {
 	t.Helper()
 	var rec importer.Record
@@ -174,7 +181,7 @@ func TestSubmit_HappyPathCompletes(t *testing.T) {
 
 	rec := waitTerminal(t, m, id)
 	require.Equal(t, importer.StateComplete, rec.State)
-	require.Equal(t, csv, rec.CSVPath)
+	require.Equal(t, resolvedPath(t, csv), rec.CSVPath)
 	require.EqualValues(t, 2, rec.SegmentsPatched)
 	require.EqualValues(t, 5, rec.RowsMutated)
 	require.Equal(t, 2, rec.SegmentsApplied)
@@ -298,6 +305,46 @@ func TestSubmit_SymlinkedImportDirAccepted(t *testing.T) {
 
 	_, err = m.Submit(context.Background(), "../../etc/passwd")
 	require.ErrorIs(t, err, importer.ErrPathEscape, "escape still rejected")
+}
+
+// TestSubmit_AbsolutePathViaSiblingAncestorAliasAccepted covers macOS-style
+// path aliases such as /var -> /private/var. The import dir and requested CSV
+// can be spelled through different aliases of the same ancestor; the resolved
+// target is still under the resolved import root and must be accepted.
+func TestSubmit_AbsolutePathViaSiblingAncestorAliasAccepted(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	realBase := filepath.Join(base, "real-base")
+	require.NoError(t, os.MkdirAll(filepath.Join(realBase, "real-imports"), 0o755))
+
+	aliasBase := filepath.Join(base, "alias-base")
+	require.NoError(t, os.Symlink(realBase, aliasBase))
+	linkDir := filepath.Join(aliasBase, "import-alias")
+	require.NoError(t, os.Symlink(filepath.Join(aliasBase, "real-imports"), linkDir))
+
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	m, err := importer.New(importer.Config{
+		Store:      st,
+		Runner:     &fakeRunner{},
+		ImportDir:  linkDir,
+		ScratchDir: filepath.Join(dataDir, "scratch"),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Wait(ctx)
+	})
+	csv := writeCSV(t, filepath.Join(aliasBase, "real-imports"), "a.csv")
+
+	id, err := m.Submit(context.Background(), csv)
+	require.NoError(t, err)
+	rec := waitTerminal(t, m, id)
+	require.Equal(t, resolvedPath(t, csv), rec.CSVPath)
 }
 
 // TestSubmit_RelativeImportDirAcceptsAbsolutePath: the default data dir is
