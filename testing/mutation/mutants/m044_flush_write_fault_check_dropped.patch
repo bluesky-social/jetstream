@@ -9,16 +9,17 @@ failure-mode: |
   hit the disk — silent data loss at the exact boundary the #201/#200 seam
   exists to keep loud.
 expected-detection: |
-  Killed by the segmentfault tier's segment unit layer:
-  TestFlushReturnsENOSPCOnBlockWrite arms IOOpWrite on the block-flush
-  consult and requires ENOSPC out of Flush; the mutant returns nil (the
-  consult still runs — ordinals are unchanged — but its error is dropped).
-  The oracle layer does NOT currently kill this mutant: the write-fault
-  scenario that reaches flushLocked (write-shortwrite-first-flush, ordinal 3)
-  is t.Skip'd on the pre-existing #262 data-loss bug, and the ENOSPC@1 case
-  fires in initializeNewSegment, whose consult this mutant leaves intact.
-  When #262 is fixed and the skip lifted, the oracle layer becomes a second
-  independent kill.
+  Killed by the segmentfault tier at two independent layers:
+  1. Segment unit layer: TestFlushReturnsENOSPCOnBlockWrite arms IOOpWrite on
+     the block-flush consult and requires ENOSPC out of Flush; the mutant
+     returns nil (the consult still runs — ordinals are unchanged — but its
+     error is dropped).
+  2. Oracle layer: with #262 fixed the write-shortwrite-first-flush case
+     (ordinal 3, reaches flushLocked) is un-skipped, so the swallowed flush
+     error means the runtime no longer fails loud — the observed-marker is
+     withheld and TestOracle_RestartSegmentFault_FailsLoudThenRecovers trips.
+     (The ENOSPC@1 case fires in initializeNewSegment, whose consult this
+     mutant leaves intact, so that case alone would not catch it.)
 expected-tier: segmentfault
 tiers: segmentfault
 

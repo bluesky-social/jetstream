@@ -37,9 +37,9 @@ func TestAddHiddenAccountForTest_OmittedFromListReposButServableAndLive(t *testi
 	require.NoError(t, err)
 	require.Equal(t, acct.DID, rp.DID)
 
-	frame, op, err := w.GenerateRecordOpForTest(context.Background(), idx, "create", collPost, "net-new-proof")
+	frame, op, err := w.GenerateRecordOpForTest(context.Background(), idx, "create", collPost, "hidden-account-proof")
 	require.NoError(t, err)
-	require.Equal(t, "net-new-proof", op.Rkey)
+	require.Equal(t, "hidden-account-proof", op.Rkey)
 
 	body, ok := bytes.CutPrefix(frame, frameHeaderCommit)
 	require.True(t, ok)
@@ -55,7 +55,7 @@ func TestAddHiddenAccountForTest_OmittedFromListReposButServableAndLive(t *testi
 
 // Hidden accounts live at indices >= cfg.Accounts; the multi-op targeted
 // generator must accept them just like GenerateRecordOpForTest does, or
-// net-new accounts can never emit multi-op / partial-CAR fault traffic.
+// omitted accounts can never emit multi-op / partial-CAR fault traffic.
 func TestGenerateMultiOpCommitForTest_AcceptsHiddenAccount(t *testing.T) {
 	t.Parallel()
 	w := newRuntimeWorld(t, 4, 1)
@@ -65,8 +65,8 @@ func TestGenerateMultiOpCommitForTest_AcceptsHiddenAccount(t *testing.T) {
 	require.Equal(t, 4, idx)
 
 	frame, ops, err := w.GenerateMultiOpCommitForTest(context.Background(), idx, []TargetedOpSpec{
-		{Action: "create", Collection: collPost, Rkey: "net-new-multi-a"},
-		{Action: "create", Collection: collPost, Rkey: "net-new-multi-b"},
+		{Action: "create", Collection: collPost, Rkey: "hidden-multi-a"},
+		{Action: "create", Collection: collPost, Rkey: "hidden-multi-b"},
 	})
 	require.NoError(t, err)
 	require.Len(t, ops, 2)

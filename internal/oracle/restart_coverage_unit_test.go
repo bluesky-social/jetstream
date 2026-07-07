@@ -114,3 +114,18 @@ func TestExpectedChainRows_CompactionFilterDropsSupersededCreate(t *testing.T) {
 	straddle := filterCompactedExpectedRows(rows, 10)
 	require.Len(t, straddle, 2)
 }
+
+func TestExpectedChainRows_ObservedSyncTombstoneDropsSupersededMaterialization(t *testing.T) {
+	t.Parallel()
+
+	want := []EventLogRow{
+		{Seq: 0, Kind: "update", DID: "did:a", Collection: "c", Rkey: "k1", Rev: "r2"},
+	}
+	observed := []EventLogRow{
+		{Seq: 20, Kind: "sync", DID: "did:a", Rev: "r3"},
+		{Seq: 21, Kind: "create_resync", DID: "did:a", Collection: "c", Rkey: "k1", Rev: "r3"},
+	}
+
+	filtered := filterCompactedExpectedRowsWithObservedTombstones(want, observed, 20)
+	require.Empty(t, filtered)
+}

@@ -110,6 +110,29 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return err
 		}
 
+		// Bootstrap restart can defer pre-existing not_started rows to pending
+		// (#262). Repair them only after the captured live tail has merged, so
+		// the synthetic sync + replacement rows land above any stale account
+		// tombstones that were replayed from live_segments.
+		if err := backfill.RunPendingRepoRetryPass(ctx, backfill.RetryConfig{
+			Store:       o.cfg.Store,
+			Writer:      dst,
+			HTTPClient:  o.cfg.HTTPClient,
+			RelayURL:    o.cfg.RelayURL,
+			Logger:      o.cfg.Logger,
+			Metrics:     o.cfg.BackfillMetrics,
+			DropMetrics: o.cfg.DropMetrics,
+			Interval:    o.cfg.FailedRepoRetryInterval,
+			Workers:     o.cfg.FailedRepoRetryWorkers,
+			HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
+			MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
+		}); err != nil {
+			if cerr := dst.Close(); cerr != nil {
+				o.logger.WarnContext(ctx, "dst writer close after pending retry error", "err", cerr)
+			}
+			return fmt.Errorf("orchestrator: merge: pending repo retry: %w", err)
+		}
+
 		if err := dst.SealActiveAndClose(); err != nil {
 			return fmt.Errorf("orchestrator: merge: seal dst: %w", err)
 		}

@@ -176,7 +176,8 @@ type Config struct {
 
 	// FailedRepoRetryInterval controls steady-state retry scans for repos that
 	// exhausted bootstrap retry and remain StatusFailed. Zero disables the
-	// background retry loop.
+	// background retry loop; merge still runs its one-shot pending pass for
+	// bootstrap crash recovery.
 	FailedRepoRetryInterval    time.Duration
 	FailedRepoRetryWorkers     int
 	FailedRepoRetryHostWorkers int
