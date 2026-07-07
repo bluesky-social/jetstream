@@ -108,6 +108,64 @@ func (r seqCommitRecorder) BeforeWrite(op store.WriteOp, keys [][]byte) error {
 	return nil
 }
 
+// TestMkdirAllFSSyncsParentDir guards the durability fsync in mkdirAllFS:
+// after creating a directory it must fsync the parent so the new dirent
+// survives power loss. The regression this pins is a guard that fsynced only
+// under an injected FS and skipped it on the production (nil FS → vfs.Default)
+// path — nothing else ever syncs SegmentsDir's parent, so a fresh segments
+// dir could be orphaned by a crash. We assert the sync happens on the resolved
+// filesystem for every caller, injected or not.
+func TestMkdirAllFSSyncsParentDir(t *testing.T) {
+	t.Parallel()
+
+	baseFS := vfs.NewStrictMem()
+	require.NoError(t, baseFS.MkdirAll("/data", 0o755))
+	syncStrictTestDir(t, baseFS, "/")
+
+	synced := recordSyncedDirs(t, baseFS, func(fs vfs.FS) {
+		require.NoError(t, mkdirAllFS(fs, "/data/segments", 0o755))
+	})
+	require.Contains(t, synced, "/data", "mkdirAllFS must fsync the parent of the created dir")
+}
+
+// TestMkdirAllSyncedFSSyncsEveryNewParent pins the multi-level durability
+// contract: MkdirAll creating several nested dirents needs a parent fsync per
+// new dirent, not just the leaf's. Syncing only the leaf's parent leaves the
+// intermediate entries vulnerable to power-loss rollback, orphaning the synced
+// deeper tree. Here /data pre-exists and /data/a/b/c is created fresh, so the
+// parents of a, b, and c (/data, /data/a, /data/a/b) must all be fsynced.
+func TestMkdirAllSyncedFSSyncsEveryNewParent(t *testing.T) {
+	t.Parallel()
+
+	baseFS := vfs.NewStrictMem()
+	require.NoError(t, baseFS.MkdirAll("/data", 0o755))
+	syncStrictTestDir(t, baseFS, "/")
+
+	synced := recordSyncedDirs(t, baseFS, func(fs vfs.FS) {
+		require.NoError(t, MkdirAllSyncedFS(fs, "/data/a/b/c", 0o755, "test"))
+	})
+	for _, parent := range []string{"/data", "/data/a", "/data/a/b"} {
+		require.Contains(t, synced, parent,
+			"MkdirAllSyncedFS must fsync the parent of every newly-created dir")
+	}
+}
+
+// recordSyncedDirs runs fn against a logging wrapper over baseFS and returns
+// the paths of every directory sync it observed.
+func recordSyncedDirs(t *testing.T, baseFS *vfs.MemFS, fn func(vfs.FS)) []string {
+	t.Helper()
+	var synced []string
+	fs := vfs.WithLogging(baseFS, func(format string, args ...any) {
+		if format == "sync: %s" {
+			if path, ok := args[0].(string); ok {
+				synced = append(synced, path)
+			}
+		}
+	})
+	fn(fs)
+	return synced
+}
+
 func TestWriterFlushOrdersSegmentSyncBeforeStoreCommit(t *testing.T) {
 	t.Parallel()
 

@@ -31,9 +31,14 @@ func openSegmentReadWrite(fs vfs.FS, path string) (vfs.File, error) {
 }
 
 // createSegmentFileExclusive creates path, failing loudly if it already
-// exists. This backs the tmp-file step of Patch/Rewrite, where a
-// pre-existing tmp signals a concurrent or crashed writer we must not
-// clobber.
+// exists. This backs the tmp-file step of Patch/Rewrite. Both callers
+// unlink any leftover tmp immediately before calling this (a crashed
+// prior run's tmp is expected debris the rename never consumed, so it is
+// safe to reclaim); the exclusive create is then the loud backstop for a
+// tmp that reappears between the unlink and the create — which, given the
+// orchestrator's rewrite lock serializes all Patch/Rewrite on a path,
+// should be impossible, so ErrExist here means our concurrency assumption
+// was violated and we must not silently overwrite.
 //
 // Production (fs == nil) uses a real O_CREATE|O_EXCL open so the
 // exclusivity is atomic at the syscall boundary — a concurrent creator
