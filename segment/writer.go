@@ -164,6 +164,11 @@ func New(cfg Config) (*Writer, error) {
 
 	if info.Size() == 0 {
 		if err := initializeNewSegment(f, cfg); err != nil {
+			// Unlink the still-empty file: a surviving 0-byte segment is a
+			// permanent recovery wedge (resume and the manifest loader both
+			// reject it as corrupt on every subsequent boot). Nothing durable
+			// is lost — the file never held a byte of data.
+			_ = os.Remove(cfg.Path)
 			return nil, err
 		}
 		// On POSIX filesystems, the directory entry that names a freshly
@@ -252,10 +257,7 @@ func initializeNewSegment(f *os.File, cfg Config) error {
 }
 
 func (c Config) beforeIO(op IOOp) error {
-	if c.IOFaultInjector == nil {
-		return nil
-	}
-	return c.IOFaultInjector.BeforeSegmentIO(c.Path, op)
+	return beforeSegmentIO(c.IOFaultInjector, c.Path, op)
 }
 
 // resumeExistingSegment validates that f is a well-formed segment

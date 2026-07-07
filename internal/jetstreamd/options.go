@@ -139,9 +139,17 @@ type Options struct {
 	// oracle store-fault tier to fail selected persistence ops by name and
 	// ordinal and assert the system fails loud rather than swallowing the
 	// error. Mirrors CrashInjector's nil-in-prod contract.
-	StoreFaultInjector   store.FaultInjector
-	OnBootstrapLiveEvent func(*segment.Event)
-	OnSteadyStateEvent   func(*segment.Event)
+	StoreFaultInjector store.FaultInjector
+	// SegmentIOFaultInjector is a test-only deterministic segment-file I/O
+	// fault seam (segment.IOFaultInjector), forwarded to the orchestrator so
+	// every segment writer plus the compaction-rewrite and import-patch paths
+	// consult it before each write/fsync/rename. nil in production. Used by
+	// the oracle segment-fault tier to fail selected segment I/O ops by op
+	// kind and ordinal and assert the system fails loud rather than
+	// swallowing the error. Mirrors CrashInjector's nil-in-prod contract.
+	SegmentIOFaultInjector segment.IOFaultInjector
+	OnBootstrapLiveEvent   func(*segment.Event)
+	OnSteadyStateEvent     func(*segment.Event)
 }
 
 func (o Options) effectiveBackfillWorkers() int {

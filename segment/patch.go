@@ -15,7 +15,10 @@ import (
 // none of the targeted repos are present.
 type PatchOptions struct {
 	CrashInjector CrashInjector
-	CandidateDIDs []string
+	// IOFaultInjector is a test-only seam consulted before every tmp-file
+	// write, fsync, and the commit rename. Nil in production.
+	IOFaultInjector IOFaultInjector
+	CandidateDIDs   []string
 }
 
 // PatchResult reports what a Patch call did so the caller (the import
@@ -287,28 +290,43 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 		}
 	}()
 
-	if err := initializeNewSegment(f, Config{Path: tmp}); err != nil {
+	if err := initializeNewSegment(f, Config{Path: tmp, IOFaultInjector: opts.IOFaultInjector}); err != nil {
 		return PatchResult{}, err
 	}
 	for _, b := range outBlocks {
 		var lenBuf [8]byte
 		binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(b.frame)))
+		if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
+			return PatchResult{}, fmt.Errorf("segment: patch write frame len: %w", err)
+		}
 		if _, err := f.Write(lenBuf[:]); err != nil {
 			return PatchResult{}, fmt.Errorf("segment: patch write frame len: %w", err)
+		}
+		if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
+			return PatchResult{}, fmt.Errorf("segment: patch write frame: %w", err)
 		}
 		if _, err := f.Write(b.frame); err != nil {
 			return PatchResult{}, fmt.Errorf("segment: patch write frame: %w", err)
 		}
 	}
 
+	if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
+		return PatchResult{}, fmt.Errorf("segment: patch write footer: %w", err)
+	}
 	if _, err := f.WriteAt(footerBytes, footerOffset); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch write footer: %w", err)
+	}
+	if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
+		return PatchResult{}, fmt.Errorf("segment: patch write header: %w", err)
 	}
 	if _, err := f.WriteAt(headerBytes, 0); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch write header: %w", err)
 	}
 	if err := simulatePatchCrash(opts, CrashPointPatchTempWritten); err != nil {
 		return PatchResult{}, err
+	}
+	if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpSync); err != nil {
+		return PatchResult{}, fmt.Errorf("segment: patch fsync tmp: %w", err)
 	}
 	if err := syncFile(f); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch fsync tmp: %w", err)
@@ -319,13 +337,16 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 	if err := f.Close(); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch close tmp: %w", err)
 	}
+	if err := beforeSegmentIO(opts.IOFaultInjector, path, IOOpRename); err != nil {
+		return PatchResult{}, fmt.Errorf("segment: patch rename: %w", err)
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch rename: %w", err)
 	}
 	if err := simulatePatchCrash(opts, CrashPointPatchRenamed); err != nil {
 		return PatchResult{}, err
 	}
-	if err := syncParentDir(path, nil); err != nil {
+	if err := syncParentDir(path, opts.IOFaultInjector); err != nil {
 		return PatchResult{}, err
 	}
 	if err := simulatePatchCrash(opts, CrashPointPatchDirSynced); err != nil {

@@ -998,7 +998,10 @@ in-memory manifest and the on-disk segment headers; it performs NO
 `store.Store` (pebble) write. The store-fault seam therefore cannot target it,
 and faulting it would require a separate manifest/segment IO-fault seam — out
 of scope for this metadata-store tier. Recorded here so the gap is explicit
-rather than silently unaddressed.
+rather than silently unaddressed. *(Update 2026-07-06: that seam now exists —
+`segment.IOFaultInjector` covers every segment-file write/fsync/rename
+including the header rewrites the reconcile reads back, and the `segmentfault`
+tier (#200, m044/m045) gates it. The pebble-write N/A stands.)*
 
 ## Campaign 2026-06-30 — full catalog at HEAD (review remediation, `tombstone` tier + m022 re-bank)
 
@@ -1553,3 +1556,35 @@ m003 from SURVIVED to KILLED@restart-multisource. The resolved baseline is the
 union: **34 active mutants, 33 KILLED / 1 SURVIVED**, with m015 as the only
 remaining survivor. The m011 conflict was metadata-only; both sides carried the
 same mutation body and current `segment/writer.go` context.
+
+## Campaign 2026-07-06 — `segmentfault` tier; m044/m045 banked, m035 refreshed (#200)
+
+Full campaign at `ad35629` (branch `segment-io-fault-200`) after landing the
+segment I/O fault layer: **37 active mutants, 37 KILLED, zero
+STALE/BUILD-BROKEN.** Baseline refreshed.
+
+New tier `segmentfault` (#200), the segment-file sibling of storefault: one
+`go test` across `./internal/oracle ./internal/ingest/orchestrator ./segment`
+covering the oracle restart segment-fault scenarios (fail-loud observed-marker
+protocol, ENOSPC operator-message e2e, rename fault deterministically landing
+on the merge-tail compaction rewrite), the torn-tail corruption sweep, the
+orchestrator-level compaction/import ENOSPC + import fault sweeps, and the
+segment package's exhaustive (op, ordinal) Patch/Rewrite sweeps.
+
+| mutant | result | note |
+|---|---|---|
+| m044_flush_write_fault_check_dropped | KILLED@segmentfault | flushLocked drops the pre-write fault consult's error; killed fast by TestFlushReturnsENOSPCOnBlockWrite. Oracle-layer second kill pending #262 (the flush-reaching case is that bug's skipped repro). |
+| m045_compaction_rewrite_error_swallowed | KILLED@segmentfault | compaction-rewrite call-site err check inverted (m006's shape on the segment path); killed at BOTH layers — oracle rename-eio observed-marker absent AND TestRunDeleteCompaction_ENOSPCRewriteReturnsFatalOperatorMessage. |
+
+Both kills verified non-vacuously by hand-applying each patch before banking.
+
+Incidental maintenance: m035's patch context was refreshed for the #255
+account-replay-guard rewrite (`a350dd5` moved its context lines); the modeled
+bug and kill tier are unchanged, and the scoped re-run plus this full campaign
+re-confirmed **KILLED@replay**.
+
+The tier's first end-to-end run also flushed out a real pre-existing data-loss
+bug (#262: stale account tombstone erases re-backfilled records after a
+mid-backfill crash) — filed with a diary entry
+(`specs/oracle/2026-07-06-rebackfill-erased-by-stale-account-tombstone.md`);
+its deterministic repro is the `t.Skip`'d `write-shortwrite-first-flush` case.

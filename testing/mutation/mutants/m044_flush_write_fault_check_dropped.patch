@@ -1,0 +1,34 @@
+mutant: m044_flush_write_fault_check_dropped
+target: segment/writer.go
+failure-mode: |
+  flushLocked drops the pre-write I/O fault consult (the beforeIO error is
+  discarded), so an injected write failure on the active segment's block
+  flush is silently ignored and the flush proceeds as if durable. Models a
+  swallowed segment write error on the hottest persistence path: the caller's
+  cursor/seq commit then advances past a block that (on real hardware) never
+  hit the disk — silent data loss at the exact boundary the #201/#200 seam
+  exists to keep loud.
+expected-detection: |
+  Killed by the segmentfault tier's segment unit layer:
+  TestFlushReturnsENOSPCOnBlockWrite arms IOOpWrite on the block-flush
+  consult and requires ENOSPC out of Flush; the mutant returns nil (the
+  consult still runs — ordinals are unchanged — but its error is dropped).
+  The oracle layer does NOT currently kill this mutant: the write-fault
+  scenario that reaches flushLocked (write-shortwrite-first-flush, ordinal 3)
+  is t.Skip'd on the pre-existing #262 data-loss bug, and the ENOSPC@1 case
+  fires in initializeNewSegment, whose consult this mutant leaves intact.
+  When #262 is fixed and the skip lifted, the oracle layer becomes a second
+  independent kill.
+expected-tier: segmentfault
+tiers: segmentfault
+
+diff --git a/segment/writer.go b/segment/writer.go
+index d783e9f..abc7e6c 100644
+--- a/segment/writer.go
++++ b/segment/writer.go
+@@ -555,4 +555 @@ func (w *Writer) flushLocked() error {
+-	if err := w.cfg.beforeIO(IOOpWrite); err != nil {
+-		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
+-		return w.stickyErr
+-	}
++	_ = w.cfg.beforeIO(IOOpWrite)

@@ -370,6 +370,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		BarrierAfterMerge:              phaseBarrier(opts.BarrierAfterMerge),
 		AfterRepoComplete:              opts.AfterRepoComplete,
 		CrashInjector:                  opts.CrashInjector,
+		SegmentIOFaultInjector:         opts.SegmentIOFaultInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			// Fires after the steady writer opens and before any producer
 			// (live consumer, retry runner, compactor) starts, so subscribers

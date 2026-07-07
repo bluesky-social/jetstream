@@ -417,11 +417,13 @@ func (o *Orchestrator) applyImportSegment(seg importSegment, rr *timestamp.RowRe
 
 	mutate := plan.BuildMutate()
 	patchRes, err := segment.Patch(seg.file.Path, mutate.Fn(), segment.PatchOptions{
-		CrashInjector: crashpoint.ForSegment(o.cfg.CrashInjector),
-		CandidateDIDs: plan.CandidateDIDs(),
+		CrashInjector:   crashpoint.ForSegment(o.cfg.CrashInjector),
+		IOFaultInjector: o.cfg.SegmentIOFaultInjector,
+		CandidateDIDs:   plan.CandidateDIDs(),
 	})
 	if err != nil {
-		return importApplyResult{}, fmt.Errorf("orchestrator: import: patch %s: %w", seg.file.Path, err)
+		return importApplyResult{}, ingest.WrapDiskFull(o.cfg.DataDir, "patching segment during timestamp import",
+			fmt.Errorf("orchestrator: import: patch %s: %w", seg.file.Path, err))
 	}
 	res.apply = mutate.Stats()
 	res.patch = patchRes

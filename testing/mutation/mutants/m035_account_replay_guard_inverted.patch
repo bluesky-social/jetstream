@@ -23,15 +23,15 @@ expected-tier: replay
 tiers: replay
 
 diff --git a/internal/ingest/live/consumer.go b/internal/ingest/live/consumer.go
-index 374f39c..5308212 100644
+index c85366e..d74fd28 100644
 --- a/internal/ingest/live/consumer.go
 +++ b/internal/ingest/live/consumer.go
-@@ -236,7 +236,7 @@ func (c *Consumer) dropStaleOrderedAsyncResync(ctx context.Context, evt streamin
- // it before its own rows land, and consulting it would drop a legitimate
- // intermediate event.
+@@ -250,7 +250,7 @@ func (c *Consumer) dropStaleOrderedAsyncResync(ctx context.Context, evt streamin
+ // because a later pipelined event can stage it before its own rows land, and
+ // consulting it would drop a legitimate intermediate event.
  func (c *Consumer) dropReplayedAccountEvent(ctx context.Context, segEvts []segment.Event) (bool, error) {
 -	if c.cfg.SyncStateStore == nil || len(segEvts) != 1 || segEvts[0].Kind != segment.KindAccount {
 +	if c.cfg.SyncStateStore == nil || len(segEvts) != 1 || segEvts[0].Kind == segment.KindAccount {
  		return false, nil
  	}
- 	state, err := c.cfg.SyncStateStore.LoadAppliedHosting(ctx, atmos.DID(segEvts[0].DID))
+ 	did := atmos.DID(segEvts[0].DID)

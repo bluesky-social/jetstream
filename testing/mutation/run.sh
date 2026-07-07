@@ -56,15 +56,18 @@ default_timeout="5m"
 stress_timeout="30m"
 restart_timeout="10m"
 # The storefault tier runs the same subprocess-restart machinery as the restart
-# tier (two child runtimes), so it shares the restart timeout budget.
+# tier (two child runtimes), so it shares the restart timeout budget. The
+# segmentfault tier is its segment-I/O sibling and shares the same shape.
 storefault_timeout="10m"
+segmentfault_timeout="10m"
 if [[ "$RACE" -eq 1 ]]; then
     RACE_FLAG=(-race)
     default_timeout="15m"
     stress_timeout="90m"
     restart_timeout="30m"
     storefault_timeout="30m"
-    echo "mutation campaign: race detector ENABLED (timeouts default=$default_timeout stress=$stress_timeout restart=$restart_timeout storefault=$storefault_timeout)"
+    segmentfault_timeout="30m"
+    echo "mutation campaign: race detector ENABLED (timeouts default=$default_timeout stress=$stress_timeout restart=$restart_timeout storefault=$storefault_timeout segmentfault=$segmentfault_timeout)"
 fi
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -262,6 +265,28 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          ./internal/oracle ./internal/ingest/orchestrator
                          -run 'TestOracle_RestartStoreFault|TestMerge_StoreFault|TestMerge_MultiSourceDrainsAllSources|TestCompaction_StoreFault'
                          -count=1 -timeout "$storefault_timeout") ;;
+                segmentfault)
+                    # Segment-fault tier (#200): kills swallowed segment-file
+                    # I/O error mutants (m044, m045) at three layers in one
+                    # `go test`:
+                    #   - oracle level: TestOracle_RestartSegmentFault* drives a
+                    #     real runtime with a deterministic segment I/O fault
+                    #     (write/sync/rename by process-wide ordinal) and asserts
+                    #     fail-loud + recovery convergence; the rename case
+                    #     deterministically lands on the merge-tail compaction
+                    #     rewrite. TestOracle_RestartTornActiveSegmentTail*
+                    #     covers post-crash truncate/corrupt-at-offset recovery.
+                    #   - orchestrator unit level: TestRunDeleteCompaction_ENOSPC*
+                    #     and TestRunImport_*SegmentIOFault*/ENOSPC* pin the
+                    #     fail-loud + disk-full operator-message contract
+                    #     directly on runDeleteCompaction / RunImport.
+                    #   - segment unit level: TestFlushReturnsENOSPC* and the
+                    #     Patch/Rewrite (op, ordinal) fault sweeps pin every seam
+                    #     consult, so a dropped/reordered consult is a fast kill.
+                    cmd=(go test "${RACE_FLAG[@]}"
+                         ./internal/oracle ./internal/ingest/orchestrator ./segment
+                         -run 'TestOracle_RestartSegmentFault|TestOracle_RestartTornActiveSegmentTail|TestRunDeleteCompaction_ENOSPC|TestRunImport_ENOSPC|TestRunImport_SegmentIOFaultSweep|TestFlushReturnsENOSPC|TestPatchIOFaultSweep|TestRewriteIOFaultSweep|TestNewRemovesEmptyFileWhenInitFails'
+                         -count=1 -timeout "$segmentfault_timeout") ;;
                 partb)
                     # Part-B tier (#182): kills paginated-cutover mutants
                     # (continuation-cursor off-by-one, mid-segment cut reporting
