@@ -377,12 +377,11 @@ func (e *Engine) startFlusher(ctx context.Context, b *batcher) func() {
 // backfillEmitFunc builds the Download emit callback shared by both backfill
 // paths, and installs the fast-path transform on dl when bf provides one.
 //
-// Error results ALWAYS route through the batcher's emitError (which flushes any
-// buffered events first, preserving error-after-data ordering) BEFORE the
-// fast-path Emit is consulted — so bf.Emit is only ever called for a non-error
-// result, and the payload it receives is always a real transform output. On the
-// legacy path (bf.Transform == nil) events flow through the per-event batcher
-// exactly as before.
+// Results may carry both decoded rows and a recoverable row-level error: the
+// valid rows are emitted first, then the error is surfaced. Whole-block failures
+// carry no rows and therefore route only through emitError. On the legacy path
+// (bf.Transform == nil) events flow through the per-event batcher exactly as
+// before.
 //
 // The returned stopped() reports whether the consumer asked to stop during the
 // backfill. On the legacy path that is just b.stopped(); on the fast path the
@@ -393,13 +392,13 @@ func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (
 	if bf.Transform == nil {
 		// Legacy path: per-event batching on the serial reassembler goroutine.
 		return func(res EntryResult) bool {
-			if res.Err != nil {
-				return b.emitError(res.Err)
-			}
 			for _, ev := range res.Events {
 				if !b.add(ev) {
 					return false
 				}
+			}
+			if res.Err != nil {
+				return b.emitError(res.Err)
 			}
 			return true
 		}, b.stopped
@@ -410,20 +409,21 @@ func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (
 	dl.SetTransform(bf.Transform)
 	var consumerStopped bool
 	return func(res EntryResult) bool {
+			if res.Payload != nil {
+				if !bf.Emit(res) {
+					consumerStopped = true
+					return false
+				}
+			}
 			if res.Err != nil {
 				// Route errors (incl. a transform panic surfaced as Err) through the
-				// batcher so they stay ordered after any prior events and reuse the
-				// fatal/recoverable plumbing. b holds no backfill events on this path,
-				// so emitError just flushes-nothing then emits the error in order.
+				// batcher so they stay ordered after any valid events from the same
+				// result and reuse the fatal/recoverable plumbing. b holds no backfill
+				// events on this path, so emitError just emits the error in order.
 				if !b.emitError(res.Err) {
 					consumerStopped = true
 					return false
 				}
-				return true
-			}
-			if !bf.Emit(res) {
-				consumerStopped = true
-				return false
 			}
 			return true
 		}, func() bool {
