@@ -117,6 +117,52 @@ func runIOFaultSweep(t *testing.T, target ioFaultSweepTarget, fixture, committed
 	}
 }
 
+// TestNewRemovesEmptyFileWhenInitFails pins the torn-creation cleanup
+// contract: when New creates a brand-new segment file and the reserved-header
+// initialization fails (e.g. ENOSPC on the first write), the empty file must
+// be unlinked before the error returns. Leaving it behind wedges restart
+// recovery permanently — the manifest loader rejects a 0-byte segment as
+// corrupt on every subsequent boot (found by the #200 oracle segment-fault
+// tier, write-enospc-first-header case).
+func TestNewRemovesEmptyFileWhenInitFails(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		fault *opOrdinalIOFault
+	}{
+		{name: "header-write-enospc", fault: &opOrdinalIOFault{op: IOOpWrite, ordinal: 1, err: syscall.ENOSPC}},
+		{name: "header-fsync-eio", fault: &opOrdinalIOFault{op: IOOpSync, ordinal: 1, err: syscall.EIO}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "seg.jss")
+			_, err := New(Config{Path: path, IOFaultInjector: tc.fault})
+			require.ErrorIs(t, err, tc.fault.err)
+			require.NoFileExists(t, path,
+				"failed initialization must not leave an empty segment file (permanent recovery wedge)")
+		})
+	}
+}
+
+// TestNewKeepsPreexistingEmptyFileContractHealed: a 0-byte segment file left
+// by a hard kill between create and header write (the dirent survives a
+// process crash) must be healed by the next successful New, not rejected.
+func TestNewHealsPreexistingEmptyFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "seg.jss")
+	require.NoError(t, os.WriteFile(path, nil, 0o644))
+
+	w, err := New(Config{Path: path})
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.EqualValues(t, ReservedHeaderBytes, info.Size())
+}
+
 func TestPatchIOFaultSweep(t *testing.T) {
 	t.Parallel()
 	fixture := ioFaultSweepFixture(t)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -57,6 +58,18 @@ const (
 	envRestartStoreFaultPrefix   = "JETSTREAM_ORACLE_RESTART_STORE_FAULT_PREFIX"
 	envRestartStoreFaultOrdinal  = "JETSTREAM_ORACLE_RESTART_STORE_FAULT_ORDINAL"
 	envRestartStoreFaultObserved = "JETSTREAM_ORACLE_RESTART_STORE_FAULT_OBSERVED"
+
+	// Segment-fault tier (#200): the child installs a deterministic segment
+	// I/O fault (segment.IOFaultInjector) that fails the Ordinal-th
+	// occurrence of one I/O op kind (write/sync/rename) across every segment
+	// writer plus the compaction-rewrite and import-patch paths. Same
+	// fail-loud protocol as the store-fault tier: the child runs to natural
+	// completion, and writes the observed-marker IFF the runtime surfaced
+	// the injected sentinel through rt.Run; marker absence is the kill.
+	envRestartSegmentFaultOp       = "JETSTREAM_ORACLE_RESTART_SEGMENT_FAULT_OP"
+	envRestartSegmentFaultOrdinal  = "JETSTREAM_ORACLE_RESTART_SEGMENT_FAULT_ORDINAL"
+	envRestartSegmentFaultKind     = "JETSTREAM_ORACLE_RESTART_SEGMENT_FAULT_KIND"
+	envRestartSegmentFaultObserved = "JETSTREAM_ORACLE_RESTART_SEGMENT_FAULT_OBSERVED"
 )
 
 // errStoreFaultInjected is the sentinel the store-fault tier injects into the
@@ -65,6 +78,13 @@ const (
 // commitSourceComplete -> mergeRunner.run -> Orchestrator.Run) from any other
 // runtime error, so the kill signal is unambiguous.
 var errStoreFaultInjected = errors.New("oracle: injected store fault (merge cursor commit)")
+
+// errSegmentFaultInjected is the segment-fault tier's sentinel. The injected
+// error always wraps it (so the child can recognize the fault via errors.Is
+// on rt.Run's error) and, depending on the armed kind, also wraps the
+// syscall errno the scenario models — notably syscall.ENOSPC, so the
+// disk-full operator-message contract (#201) triggers on the real path.
+var errSegmentFaultInjected = errors.New("oracle: injected segment I/O fault")
 
 // nolint:paralleltest
 func TestOracle_RestartCrashPointsDoNotLoseRecords(t *testing.T) {
@@ -310,6 +330,7 @@ func TestOracleRestartChild(t *testing.T) {
 
 	crashInjector := newOracleCrashInjectorFromEnv(t, markerPath)
 	storeFault := newOracleStoreFaultFromEnv(t)
+	segmentFault := newOracleSegmentIOFaultFromEnv(t)
 	bootstrapLiveMaxSegmentBytes, bootstrapLiveMaxEventsPerBlock := restartBootstrapLiveLimitsFromEnv(t)
 	var afterMerge jetstreamd.PhaseBarrier
 	if mergeDonePath := os.Getenv(envRestartMergeDone); mergeDonePath != "" {
@@ -371,6 +392,7 @@ func TestOracleRestartChild(t *testing.T) {
 		BarrierAfterMerge:              afterMerge,
 		CrashInjector:                  crashInjector,
 		StoreFaultInjector:             storeFault,
+		SegmentIOFaultInjector:         segmentFault,
 		OnBootstrapLiveEvent:           cutoverGate.observe,
 	})
 	require.NoError(t, err)
@@ -395,6 +417,20 @@ func TestOracleRestartChild(t *testing.T) {
 			require.NoError(t, os.WriteFile(observedPath, []byte(runErr.Error()), 0o644))
 		} else {
 			t.Logf("store fault armed but runtime did not surface the sentinel (got %v); "+
+				"observed-marker withheld — parent will treat this as a swallowed-error kill", runErr)
+		}
+		return
+	}
+
+	// Segment-fault tier (#200): same record-don't-assert protocol as the
+	// store-fault tier. The marker carries rt.Run's full error text so the
+	// parent can additionally assert message contracts (e.g. the ENOSPC
+	// disk-full operator message) without re-plumbing the error.
+	if observedPath := os.Getenv(envRestartSegmentFaultObserved); observedPath != "" {
+		if runErr != nil && errors.Is(runErr, errSegmentFaultInjected) {
+			require.NoError(t, os.WriteFile(observedPath, []byte(runErr.Error()), 0o644))
+		} else {
+			t.Logf("segment fault armed but runtime did not surface the sentinel (got %v); "+
 				"observed-marker withheld — parent will treat this as a swallowed-error kill", runErr)
 		}
 		return
@@ -445,6 +481,79 @@ func newOracleStoreFaultFromEnv(t *testing.T) store.FaultInjector {
 		Op:      store.WriteOpBatchCommit,
 		Ordinal: ordinal,
 		Err:     errStoreFaultInjected,
+	}
+}
+
+// oracleSegmentIOFault fails the ordinal-th occurrence of one segment I/O op
+// kind across the whole child process (every writer plus Patch/Rewrite),
+// mirroring opOrdinalIOFault in segment/writer_test.go. The atomic counter
+// makes the ordinal race-safe across backfill worker goroutines; which
+// concrete file operation lands on the ordinal may vary run-to-run for
+// write/sync (concurrent writers), but the fail-loud contract under test is
+// op-agnostic. IOOpRename is deterministic: only Patch/Rewrite rename.
+type oracleSegmentIOFault struct {
+	op      segment.IOOp
+	ordinal int
+	err     error
+	seen    atomic.Int64
+}
+
+func (f *oracleSegmentIOFault) BeforeSegmentIO(_ string, op segment.IOOp) error {
+	if op != f.op {
+		return nil
+	}
+	if int(f.seen.Add(1)) == f.ordinal {
+		return f.err
+	}
+	return nil
+}
+
+// newOracleSegmentIOFaultFromEnv builds the segment-fault injector for the
+// child from env, or returns nil when no fault is armed. The op env value is
+// parsed against the segment package's own IOOp constants (the parent sets it
+// from the same constants), so there is no cross-package string duplication
+// to drift — an unknown op fails the child loudly here instead of arming a
+// fault that can never fire (a vacuous kill).
+func newOracleSegmentIOFaultFromEnv(t *testing.T) segment.IOFaultInjector {
+	t.Helper()
+
+	rawOp := os.Getenv(envRestartSegmentFaultOp)
+	if rawOp == "" {
+		return nil
+	}
+	op := segment.IOOp(rawOp)
+	switch op {
+	case segment.IOOpWrite, segment.IOOpSync, segment.IOOpRename:
+	default:
+		t.Fatalf("%s: unknown segment I/O op %q", envRestartSegmentFaultOp, rawOp)
+	}
+
+	ordinal := 1
+	if raw := os.Getenv(envRestartSegmentFaultOrdinal); raw != "" {
+		require.NoError(t, parseIntEnv(os.LookupEnv, envRestartSegmentFaultOrdinal, &ordinal))
+		require.Greaterf(t, ordinal, 0, "%s must be >= 1", envRestartSegmentFaultOrdinal)
+	}
+
+	// The injected error always wraps the tier sentinel (child-side
+	// errors.Is recognition) and the errno modelling the scenario, so the
+	// production ENOSPC contract (#201 operator message) triggers exactly as
+	// it would on a real full disk.
+	var errno error
+	switch kind := os.Getenv(envRestartSegmentFaultKind); kind {
+	case "", "eio":
+		errno = syscall.EIO
+	case "enospc":
+		errno = syscall.ENOSPC
+	case "shortwrite":
+		errno = io.ErrShortWrite
+	default:
+		t.Fatalf("%s: unknown fault kind %q", envRestartSegmentFaultKind, kind)
+	}
+
+	return &oracleSegmentIOFault{
+		op:      op,
+		ordinal: ordinal,
+		err:     fmt.Errorf("%w: %w", errSegmentFaultInjected, errno),
 	}
 }
 
@@ -737,9 +846,18 @@ type restartChildArgs struct {
 	storeFaultPrefix       string
 	storeFaultOrdinal      int
 	storeFaultObservedPath string
-	timeout                time.Duration
-	trace                  *Trace
-	runLabel               string
+	// Segment-fault tier (#200): when segmentFaultOp is set the child arms a
+	// segment I/O fault on the Ordinal-th occurrence of that op kind, and
+	// writes segmentFaultObservedPath IFF the runtime failed loud with the
+	// injected sentinel. segmentFaultKind selects the wrapped errno:
+	// "eio" (default), "enospc", or "shortwrite".
+	segmentFaultOp           segment.IOOp
+	segmentFaultOrdinal      int
+	segmentFaultKind         string
+	segmentFaultObservedPath string
+	timeout                  time.Duration
+	trace                    *Trace
+	runLabel                 string
 }
 
 type restartChildResult struct {
@@ -794,6 +912,18 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 		)
 		if args.storeFaultOrdinal > 0 {
 			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", envRestartStoreFaultOrdinal, args.storeFaultOrdinal))
+		}
+	}
+	if args.segmentFaultOp != "" {
+		cmd.Env = append(cmd.Env,
+			envRestartSegmentFaultOp+"="+string(args.segmentFaultOp),
+			envRestartSegmentFaultObserved+"="+args.segmentFaultObservedPath,
+		)
+		if args.segmentFaultOrdinal > 0 {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", envRestartSegmentFaultOrdinal, args.segmentFaultOrdinal))
+		}
+		if args.segmentFaultKind != "" {
+			cmd.Env = append(cmd.Env, envRestartSegmentFaultKind+"="+args.segmentFaultKind)
 		}
 	}
 	require.NoError(t, cmd.Start())
