@@ -1588,3 +1588,26 @@ bug (#262: stale account tombstone erases re-backfilled records after a
 mid-backfill crash) — filed with a diary entry
 (`specs/oracle/2026-07-06-rebackfill-erased-by-stale-account-tombstone.md`);
 its deterministic repro is the `t.Skip`'d `write-shortwrite-first-flush` case.
+
+## Update 2026-07-07 — #262 fixed, m044 oracle-layer second kill now active
+
+#262 is fixed (branch `issue-262`): bootstrap crash recovery now defers an
+inherited `not_started` row to the pending-retry path instead of re-downloading
+it at low seqs, so a stale account tombstone can no longer erase the
+re-backfilled records. The `write-shortwrite-first-flush` oracle case is
+un-skipped and green.
+
+Consequence for the catalog: **m044's oracle-layer second kill is now active**,
+as its `expected-detection` predicted. Verified by hand-applying the m044 patch
+and running only `./internal/oracle -run TestOracle_RestartSegmentFault` (no
+unit/orchestrator layer): the swallowed flush error means the runtime no longer
+fails loud, the observed-marker is withheld, and
+`TestOracle_RestartSegmentFault_FailsLoudThenRecovers/write-shortwrite-first-flush`
+trips. m044/m045 both re-confirmed KILLED@segmentfault. The m044 patch header's
+`expected-detection` was updated to describe both kill layers as active. No
+baseline change (both were already KILLED); this only promotes m044's second
+executioner from "pending #262" to "active".
+
+Full-campaign re-run deferred to Jim on a clean tree per the mutation-gate
+dirty-tree guard; the scoped m044/m045 re-runs above cover the tier this change
+touches.

@@ -54,8 +54,9 @@ type RetryConfig struct {
 	HostWorkers int
 	MaxDelay    time.Duration
 
-	now    func() time.Time
-	jitter jitterFunc
+	now            func() time.Time
+	jitter         jitterFunc
+	eligibleStatus func(Status) bool
 }
 
 type retryCandidate struct {
@@ -101,6 +102,18 @@ func RunFailedRepoRetry(ctx context.Context, cfg RetryConfig) error {
 			timer.Reset(r.cfg.Interval)
 		}
 	}
+}
+
+// RunPendingRepoRetryPass performs one immediate retry scan for pending repos.
+// Merge uses this for bootstrap-recovery rows that must be materialized above
+// the captured live tail before serving ungates.
+func RunPendingRepoRetryPass(ctx context.Context, cfg RetryConfig) error {
+	cfg.eligibleStatus = func(st Status) bool { return st == StatusPending }
+	r, err := newRetryRunner(cfg)
+	if err != nil {
+		return err
+	}
+	return r.runPass(ctx)
 }
 
 func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
@@ -230,7 +243,11 @@ func (r *retryRunner) scanDue(ctx context.Context, now time.Time, yield func(ret
 		if err != nil {
 			return err
 		}
-		if !isRetryEligibleStatus(rs.Backfill.Status) || !rs.Active {
+		eligibleStatus := r.cfg.eligibleStatus
+		if eligibleStatus == nil {
+			eligibleStatus = isRetryEligibleStatus
+		}
+		if !eligibleStatus(rs.Backfill.Status) || !rs.Active {
 			continue
 		}
 		if !rs.Backfill.NextAttemptAt.IsZero() && rs.Backfill.NextAttemptAt.After(now) {
@@ -408,6 +425,14 @@ func retryFailureHost(candidateHost, responseHost string) string {
 // to an explicit #sync from the PDS operator.
 func isRetryEligibleStatus(st Status) bool {
 	return st == StatusFailed
+}
+
+// isRetryFailureRecordableStatus reports whether a retry attempt that was
+// already selected may record transient failure/backoff. StatusPending is
+// included for the explicit post-merge pending pass; the steady-state scanner
+// still excludes pending rows via isRetryEligibleStatus.
+func isRetryFailureRecordableStatus(st Status) bool {
+	return st == StatusFailed || st == StatusPending
 }
 
 func isLocalRetryError(err error) bool {

@@ -28,12 +28,13 @@ const (
 	StatusNotStarted Status = "not_started"
 	StatusComplete   Status = "complete"
 	StatusFailed     Status = "failed"
-	// StatusPending is a legacy value from the removed live-first-sighting
-	// enqueue path. Keep it decodable so older stores do not become corrupt,
-	// but do not create new pending rows and do not treat them as retryable.
-	// Re-downloading a repo because we first saw a live event is not a sound
-	// recovery signal; PDS operators should emit #sync when a repo needs a
-	// full re-download.
+	// StatusPending is a DID awaiting a whole-repo replacement through the
+	// explicit pending retry pass. Bootstrap crash recovery promotes a
+	// pre-existing StatusNotStarted row to pending instead of re-downloading
+	// it at low seqs (#262); merge then retries it after the captured live tail
+	// lands. Older stores may also contain pending rows from the removed
+	// live-first-sighting enqueue path, but new live first sightings must not
+	// create pending rows.
 	StatusPending Status = "pending"
 	// StatusUnavailable is a terminal, non-failure state: the account
 	// exists but its repo cannot be fetched (deactivated, suspended, or

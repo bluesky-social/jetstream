@@ -425,8 +425,8 @@ type Status string
 
 const (
     StatusNotStarted Status = "not_started"
-    // legacy value from the removed live-first-sighting enqueue path;
-    // retained only so older stores decode
+    // awaiting whole-repo replacement via the explicit post-merge pending
+    // retry pass; currently produced by interrupted bootstrap recovery
     StatusPending Status = "pending"
     StatusComplete   Status = "complete"
     StatusFailed     Status = "failed"
@@ -520,7 +520,9 @@ Every block seal commits a single pebble batch that advances `relay/cursor` and 
 
 If there were any accounts that failed to download during the initial backfill phase or the post-merge `listRepos` discovery pass (i.e. `repo/<did>.Status == StatusFailed`), we periodically retry downloading them with exponential backoff in the background until they succeed. Retry eligibility and backoff are stored on `repo/<did>` via `RetryCount` and `NextAttemptAt` so process restarts do not create retry storms. When we do successfully download a repo that previously failed, we treat it similar to a whole-repo `#sync` event: mark all previous events for that DID as deleted, and recreate from the downloaded CAR file.
 
-A live first sighting is **not** a `getRepo` trigger. If a repo was behind a firewall or otherwise hidden from the relay during bootstrap and later starts emitting live traffic, Jetstream archives the live events it receives and does not create a `repo/<did>` row or enqueue a background download for that DID. That condition is a PDS/operator repair case: the PDS should emit a new `#sync` event when the repo needs an authoritative full re-download. `StatusPending` remains a decodable legacy metadata value from the removed first-sighting enqueue path, but new code must not create it and the retry loop does not treat it as eligible.
+Bootstrap crash recovery can promote a pre-existing `StatusNotStarted` row to `StatusPending` ([#262](https://github.com/bluesky-social/jetstream/issues/262)) instead of re-downloading it at low seqs. Merge runs one immediate pending retry pass after draining the captured live tail, so the synthetic sync and replacement rows land above the live tail. If that pending attempt fails transiently, the row becomes `StatusFailed` with normal backoff metadata and the periodic failed-repo loop handles later retries.
+
+A live first sighting is **not** a `getRepo` trigger. If a repo was behind a firewall or otherwise hidden from the relay during bootstrap and later starts emitting live traffic, Jetstream archives the live events it receives and does not create a `repo/<did>` row or enqueue a background download for that DID. That condition is a PDS/operator repair case: the PDS should emit a new `#sync` event when the repo needs an authoritative full re-download. `StatusPending` rows from the removed first-sighting enqueue path remain decodable, but new live first sightings must not create them and the steady-state failed-repo retry scan does not treat them as eligible.
 
 The `/subscribe` live tail reads the steady writer's readable log ([#248](https://github.com/bluesky-social/jetstream/issues/248)). The steady writer is shared by multiple producers — the live consumer plus the failed-repo retry runner above — so visibility hangs off the seq allocator itself: every event appended through the writer is copied into an ordered in-memory log as soon as it receives a seq, before any flush, async compression, or rotation can move it between durability stages. The writer advances the log's durable watermark only after the segment block is fsynced and the `seq/next` Pebble batch commits. Entries at or above that watermark are pinned; durable entries below it are retained under the configured byte budget. `/subscribe` reads the log for resident seqs and uses the cold reader only for cursors below the log floor, which are durable by construction.
 

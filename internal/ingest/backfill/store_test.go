@@ -51,10 +51,10 @@ func TestStore_Lookup_StatusMapping(t *testing.T) {
 		status   Status
 		expected atmosbackfill.State
 	}{
-		{"not_started -> Discovered", StatusNotStarted, atmosbackfill.StateDiscovered},
-		{"legacy pending -> Complete", StatusPending, atmosbackfill.StateComplete},
+		{"not_started -> Complete", StatusNotStarted, atmosbackfill.StateComplete},
 		{"complete -> Complete", StatusComplete, atmosbackfill.StateComplete},
 		{"failed -> Failed", StatusFailed, atmosbackfill.StateFailed},
+		{"pending -> Complete", StatusPending, atmosbackfill.StateComplete},
 		{"unavailable -> Complete", StatusUnavailable, atmosbackfill.StateComplete},
 	}
 	for _, tc := range tests {
@@ -73,6 +73,34 @@ func TestStore_Lookup_StatusMapping(t *testing.T) {
 			require.True(t, got.Active)
 		})
 	}
+}
+
+func TestStore_Lookup_DefersExistingNotStartedToPending(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	did := atmos.DID("did:plc:interrupted")
+	require.NoError(t, s.putRepoStatus(did, &RepoStatus{
+		Backfill: RepoBackfillStatus{Status: StatusNotStarted},
+		Active:   true,
+	}))
+
+	got, err := s.Lookup(context.Background(), did)
+	require.NoError(t, err)
+	require.Equal(t, atmosbackfill.StateComplete, got.State,
+		"bootstrap engine must skip the low-seq re-download")
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusPending, rs.Backfill.Status,
+		"post-merge retry pass must pick up the interrupted repo")
+	require.Zero(t, rs.Backfill.RetryCount)
+	require.True(t, rs.Backfill.NextAttemptAt.IsZero())
+
+	counts, ok, err := LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), counts.Pending)
+	require.Equal(t, uint64(0), counts.Discovered)
 }
 
 // TestStore_Lookup_CorruptRow asserts decode failures are surfaced as
@@ -124,11 +152,6 @@ func TestStore_OnDiscover_WritesNotStarted(t *testing.T) {
 		Active: true,
 	})
 	require.NoError(t, err)
-
-	got, err := s.Lookup(context.Background(), did)
-	require.NoError(t, err)
-	require.Equal(t, atmosbackfill.StateDiscovered, got.State)
-	require.True(t, got.Active)
 
 	rs, err := s.readRepoStatus(did)
 	require.NoError(t, err)

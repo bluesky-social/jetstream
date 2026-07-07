@@ -81,17 +81,7 @@ func TestOracle_RestartSegmentFault_FailsLoudThenRecovers(t *testing.T) {
 	}{
 		{name: "write-enospc-first-header", op: segment.IOOpWrite, ordinal: 1, kind: "enospc", wantOperatorMessage: true},
 		{name: "sync-eio-writer-open", op: segment.IOOpSync, ordinal: 2, kind: "eio"},
-		{name: "write-shortwrite-first-flush", op: segment.IOOpWrite, ordinal: 3, kind: "shortwrite", liveEventsBetweenChildren: 2,
-			// This case crashes mid-backfill AFTER the chain coordinator's
-			// account-delete→reactivate→create rode the firehose but BEFORE
-			// they were archived. Recovery then re-backfills the repo at low
-			// seqs, the stale account-delete archives above them, and
-			// compaction's DID tombstone permanently erases the re-backfilled
-			// records: a real pre-existing data-loss bug, not a tier defect.
-			// Deterministic repro preserved here; un-skip as the red-first
-			// proof when fixing. Diary: specs/oracle/
-			// 2026-07-06-rebackfill-erased-by-stale-account-tombstone.md.
-			skip: "known data-loss bug #262: stale account tombstone erases re-backfilled records"},
+		{name: "write-shortwrite-first-flush", op: segment.IOOpWrite, ordinal: 3, kind: "shortwrite", liveEventsBetweenChildren: 2},
 		{name: "rename-eio-compaction-rewrite", op: segment.IOOpRename, ordinal: 1, kind: "eio"},
 	}
 
