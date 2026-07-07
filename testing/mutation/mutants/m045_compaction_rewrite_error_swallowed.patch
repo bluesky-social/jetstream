@@ -1,0 +1,34 @@
+mutant: m045_compaction_rewrite_error_swallowed
+target: internal/ingest/orchestrator/compact_deletes.go
+failure-mode: |
+  The error check on the compaction-rewrite call site is inverted (== nil),
+  so a failed segment.Rewrite is silently ignored and the pass records the
+  un-rewritten segment as compacted — then advances the durable watermark
+  past rows that were never physically removed. The exact segment-path
+  sibling of m006 (merge cursor commit swallow): a swallowed persistence
+  failure that turns fail-loud into silent non-compliance (deleted rows
+  survive on disk permanently, and on ENOSPC the pass "succeeds" on a full
+  disk). The inversion also errors on every CLEAN rewrite, so the healthy
+  path breaks too.
+expected-detection: |
+  The segmentfault tier kills it at two layers in one `go test`:
+    - oracle level: TestOracle_RestartSegmentFault_FailsLoudThenRecovers
+      (rename-eio-compaction-rewrite arms IOOpRename ordinal 1 — only
+      Patch/Rewrite rename, so the fault deterministically lands on the
+      merge-tail compaction rewrite; under the mutant the error is swallowed,
+      the lifecycle reaches the after-merge barrier, the observed-marker is
+      never written, and the parent's require.FileExists fails).
+    - orchestrator unit level: TestRunDeleteCompaction_ENOSPCRewriteReturnsFatalOperatorMessage
+      requires the ENOSPC operator message out of runDeleteCompaction (the
+      mutant returns success), and every healthy-path compaction test fails
+      on the inverted clean-rewrite branch.
+expected-tier: segmentfault
+tiers: segmentfault
+
+diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
+index 97d3860..4900b3e 100644
+--- a/internal/ingest/orchestrator/compact_deletes.go
++++ b/internal/ingest/orchestrator/compact_deletes.go
+@@ -382 +382 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
+-				if err != nil {
++				if err == nil {
