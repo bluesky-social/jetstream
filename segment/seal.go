@@ -415,7 +415,7 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 }
 
 // buildFooter assembles the four footer sections in the layout
-// specified in DESIGN.md §3.1.2 and spec §5.6 and returns them
+// specified in docs/README.md §3.1.2 and spec §5.6 and returns them
 // concatenated, plus the partially-populated Header (Checksum left
 // zero; the caller fills it in after computing xxh3).
 func buildFooter(walk blockWalkResult, maxEventsPerBlock int, footerOffset int64) ([]byte, Header, error) {

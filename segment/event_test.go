@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestEvent_DisplayTimeUS pins the sentinel-0 display resolver (DESIGN.md
+// TestEvent_DisplayTimeUS pins the sentinel-0 display resolver (docs/README.md
 // §3.2): the wire time_us is the imported IndexedAt when one was set
 // (non-zero), otherwise it falls back to WitnessedAt. Absent any import
 // every IndexedAt is 0, so display == witnessed for every event.

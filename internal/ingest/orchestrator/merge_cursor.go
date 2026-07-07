@@ -1,7 +1,8 @@
-// Package orchestrator: merge_cursor.go owns the merge/next_source_idx
+// merge_cursor.go owns the merge/next_source_idx
 // pebble cursor and the atomic per-source commit batch that advances
 // the cursor alongside per-DID repo/<did>.Rev refreshes. Spec:
-// docs/superpowers/specs/2026-05-27-merge-phase-design.md §4.5–§4.6.
+// specs/notes/2026-05-27-merge-phase-design.md §4.5–§4.6.
+
 package orchestrator
 
 import (

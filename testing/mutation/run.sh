@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Oracle mutation campaign driver.
-# See docs/superpowers/specs/2026-06-12-oracle-mutation-campaign-design.md
+# See specs/mutation.md
 #
 # Usage:
 #   testing/mutation/run.sh                 # run every mutant

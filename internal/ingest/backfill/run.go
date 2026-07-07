@@ -1,8 +1,9 @@
-// Package backfill: run.go is the entrypoint cmd/jetstream calls
+// run.go is the entrypoint cmd/jetstream calls
 // from its errgroup. Run constructs the atmos engine and drives it
 // to completion. Returns nil on clean drain (every DID either skipped
 // at Complete or downloaded + recorded), the engine's error
 // otherwise.
+
 package backfill
 
 import (

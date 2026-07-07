@@ -1,5 +1,5 @@
 // Package store owns the lifecycle of the metadata pebble database
-// at <data-dir>/meta.pebble (DESIGN.md §3.4 / §3.5).
+// at <data-dir>/meta.pebble (docs/README.md §3.4 / §3.5).
 //
 // The package is deliberately keyspace-agnostic. It knows how to
 // open and close the database, picks pebble configuration that fits
@@ -33,7 +33,7 @@ import (
 )
 
 // PebbleSubdir is the on-disk name of the metadata store relative
-// to the configured data directory. DESIGN.md §3.4 pins this layout
+// to the configured data directory. docs/README.md §3.4 pins this layout
 // so the on-disk format is stable across replicas.
 const PebbleSubdir = "meta.pebble"
 

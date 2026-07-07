@@ -2,16 +2,16 @@
 // relay's com.atproto.sync.subscribeRepos firehose into a
 // directory of segment files. The package is deliberately generic:
 // it is used during the bootstrap phase to populate
-// data/backfill/live_segments (DESIGN.md §4.1 step 1), and the
+// data/backfill/live_segments (docs/README.md §4.1 step 1), and the
 // same Consumer type will be reused after the merge step lands
-// to populate data/segments in steady state (DESIGN.md §4.3).
+// to populate data/segments in steady state (docs/README.md §4.3).
 //
 // The Consumer wraps a dedicated *ingest.Writer. The mapping from
 // upstream firehose events to segment.Events lives in events.go
 // as a pure function so it is straightforward to unit-test
 // against arbitrary input. Cursor durability is delegated to the
 // writer's durable batch hook so persisted cursor ≤ durable events
-// holds in the same synced Pebble commit as seq/next, as DESIGN.md §3.1.1
+// holds in the same synced Pebble commit as seq/next, as docs/README.md §3.1.1
 // requires.
 //
 // Sync 1.1 verification is required: Config.Verifier must be a

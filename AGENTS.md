@@ -11,24 +11,53 @@ Jetstream is a full-network archive and live-streaming service for atproto. Back
 - `specs/*` is documentation intended to be read only by agents
 - `specs/notes/*` are specs and plans documentation that catalogs our train of thought while working on tasks as we go
 
+Agent-facing living docs, in a good reading order for getting oriented:
+
+- `specs/architecture.md` — the high-level map: the big subsystems, how they fit, and a "where to look" table routing each topic to its authoritative source. Start here.
+- `specs/invariants.md` — the short list of rules that must never break. Read before changing anything on the ingest, storage, or serve paths.
+- `specs/glossary.md` — one-line definitions of the terms that show up everywhere.
+- `specs/gotchas.md` — accepted limitations and hard-won lessons: things that look like bugs but are deliberate, and mistakes not worth making twice.
+- `specs/oracle.md` — the source of truth for the oracle/simulator testing rig.
+- `specs/mutation.md` — how the mutation campaign measures the oracle's bug-detection power.
+
+These summarize and route; `docs/README.md` and each package's `doc.go` remain authoritative. When a living doc disagrees with them, fix the living doc.
+
 ## Repo layout
 
 ```
 cmd/
-  jetstream/      main binary: `serve`, `inspect-segment`
+  jetstream/      main binary: serve, inspect-segment, timestamp import, version
   simulator/      local PLC + PDS + Relay on :7777
-segment/          on-disk segment file format (header, blocks, footer, reader, writer, sealer)
+segment/          on-disk segment file format (header, blocks, footer, reader, writer, sealer); public API
 internal/
-  ingest/         backfill + live firehose + orchestrator that merges them
-  subscribe/      websocket /subscribe endpoint (v1 protocol parity)
+  ingest/         the segment Writer (append/flush/seal, seq, readable log)
+    backfill/     initial full-network backfill (listRepos + getRepo)
+    live/         live firehose consumer (subscribeRepos)
+    orchestrator/ ingestion lifecycle state machine + merge/cutover
+    syncstate/    sync 1.1 resync bookkeeping
+  subscribe/      websocket /subscribe endpoint (v1 protocol parity) + cold reader
+  xrpcapi/        archive download over HTTP/XRPC (planBackfill, getSegment, getBlock)
+  client/         thick Go client: archive negotiation, fold, cutover to live
   server/         HTTP listeners (public :8080, debug :6060) and middleware
   store/          pebble-backed cursor + metadata store
-  simulator/      simulator internals (world, traffic, http handlers)
+  manifest/       segment manifest (directory scan + self-describing headers)
+  tombstone/      delete/update/account tombstone set for compaction
+  timestamp/      operator timestamp-import pipeline
+  importer/       import job manager
+  repoexport/     reconstruct a repo CAR/MST from archived events
   identity/       DID resolution
   status/         /status endpoint collector
+  diskspace/      data-dir free-space accounting
+  crashpoint/     deterministic crash-injection seams (test-gated)
+  simulator/      fake atproto network: world (traffic), http (PLC/PDS/relay), fanout
+  oracle/         end-to-end correctness harness (see specs/oracle.md)
+  corpus/         real-data corpus tests (independent of the lifecycle oracle)
+  format/         shared wire/format helpers
   obs/            metrics, tracing, slog setup
   lifecycle/      graceful start/stop helpers
-  web/            static UI assets
+  jetstreamd/     process runtime wiring (options, startup, shutdown)
+  version/        build version stamp
+  web/            static debug UI assets
 ```
 
 Atproto lexicon JSON (authoritative for XRPC and record schemas) lives at `~/go/src/github.com/bluesky-social/atproto/lexicons` on dev machines.
@@ -141,3 +170,30 @@ gh issue view <N> --comments                # full history of one unit
     - Treat all upstream relay/firehose/backfill data as user input. Invalid external records must not abort, stop, exit, or crash the server.
     - If upstream record data cannot be represented safely in Jetstream's internal format (for example a field exceeds a segment column width), drop that record or event, increment a warning/error metric, and log bounded diagnostic fields. Do not silently truncate or coerce it.
     - Preserve crash-loud behavior for invalid internal state, persistence corruption, fsync/store failures, and other conditions where continuing could corrupt Jetstream-owned data.
+
+## Which checks to run for which change
+
+`just` is the source of truth for build/test/lint (see "Working in the codebase" above for the less-obvious recipes). Beyond the default `just` (lint + short tests), match the change to the extra coverage it needs:
+
+| If you changed… | Also run |
+|---|---|
+| anything | `just` (lint + short tests) — always |
+| segment format, ingest, orchestrator, cursor, or restart/recovery | `just test-long ./internal/oracle`, `just oracle-sweep`, and the relevant fuzz targets (`just fuzz 30s ./segment`) — short tests skip the crash/restart and stress oracle coverage |
+| the oracle, simulator, or mutation catalog | `just test ./internal/oracle`, then re-run the mutation campaign (`just mutation-campaign`) and check the scorecard didn't regress |
+| anything that could move a mutant's target code | `just mutation-gate` — but on a **clean working tree**: the driver applies/reverts patches with git and aborts on a dirty tree (see `specs/gotchas.md`) |
+| parsing of untrusted input (frames, CARs, CSV) | the matching fuzz target (`just fuzz`), plus a corpus check if `internal/corpus` is affected |
+| lexicon-derived code | `just lexgen` and confirm no drift |
+| hot-path code (segment writer/sealer) | `just bench ./segment` and compare against the baseline |
+
+When in doubt, `specs/oracle.md` explains which tier catches which class of bug.
+
+## Memory promotion
+
+Any per-session or per-machine memory (an agent's private scratchpad) is exactly that — a scratchpad. It is invisible to the next agent and to Jim. **If a fact is worth knowing in a second session, promote it to a durable, checked-in home in the same PR that discovered it:**
+
+- an accepted limitation or a "we tried X, don't do it again" lesson → `specs/gotchas.md`
+- an oracle failure you root-caused → a `specs/oracle/` diary entry
+- a rule others must follow → this file
+- behavior of the system → the relevant `doc.go` (or note it for `docs/README.md`, which Jim owns)
+
+The test: if forgetting it would let a future agent re-introduce a bug or re-litigate a settled decision, it doesn't belong only in memory.

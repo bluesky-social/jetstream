@@ -1,7 +1,7 @@
 package segment
 
 // Kind discriminates which firehose event type a row represents.
-// Values are the on-disk wire format from DESIGN.md §3.2.
+// Values are the on-disk wire format from docs/README.md §3.2.
 type Kind uint8
 
 const (
@@ -57,7 +57,7 @@ func (k Kind) IsResyncReplacement() bool {
 //	Payload:    up to math.MaxUint32 bytes
 //
 // WitnessedAt and IndexedAt are unix microseconds. IndexedAt == 0
-// means "no operator-supplied timestamp" (DESIGN.md §3.2).
+// means "no operator-supplied timestamp" (docs/README.md §3.2).
 //
 // For non-commit kinds (Identity, Account, Sync), Collection, Rkey,
 // Rev, and Payload are typically empty / nil. The encoder accepts
@@ -89,7 +89,7 @@ type Event struct {
 
 // DisplayTimeUS resolves the timestamp shown to subscribers on the wire
 // (the event's time_us). It applies the sentinel-0 fallback from
-// DESIGN.md §3.2: when an operator has imported an indexed_at value
+// docs/README.md §3.2: when an operator has imported an indexed_at value
 // (IndexedAt != 0) that display value wins; otherwise it falls back to
 // WitnessedAt, the immutable time Jetstream first saw the event.
 //

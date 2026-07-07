@@ -7,7 +7,7 @@ import (
 )
 
 // TestSegmentFilename_BaseFormat pins the on-disk filename format
-// (DESIGN.md §3.4: 10-digit zero-padded base-36 string).
+// (docs/README.md §3.4: 10-digit zero-padded base-36 string).
 func TestSegmentFilename_BaseFormat(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

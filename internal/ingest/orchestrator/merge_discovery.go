@@ -1,7 +1,8 @@
-// Package orchestrator: merge_discovery.go runs the post-merge
+// merge_discovery.go runs the post-merge
 // listRepos resume that picks up DIDs born during the bootstrap
 // window. Spec:
-// docs/superpowers/specs/2026-05-27-merge-phase-design.md §4.7.
+// specs/notes/2026-05-27-merge-phase-design.md §4.7.
+
 package orchestrator
 
 import (

@@ -102,7 +102,7 @@ func readSegFiles(dir string) ([]string, error) {
 }
 
 // isSealed returns true if the segment file at path has been sealed
-// per DESIGN.md §3.1.1. Delegates to segment.Inspect so the
+// per docs/README.md §3.1.1. Delegates to segment.Inspect so the
 // "what does sealed mean on disk" knowledge stays in one place.
 func isSealed(t *testing.T, path string) bool {
 	t.Helper()

@@ -7,7 +7,7 @@ import (
 )
 
 // collectionIndex is the parsed form of the collection block index
-// (DESIGN.md §3.1.4, spec §5.5). stringTable is the unique NSIDs in
+// (docs/README.md §3.1.4, spec §5.5). stringTable is the unique NSIDs in
 // first-seen order; the index of each NSID in stringTable is its
 // "collection ID". eventCounts[i] is the total number of events with
 // collection-id i across the whole segment (parallel-indexed with

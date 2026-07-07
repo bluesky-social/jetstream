@@ -8,7 +8,7 @@ import (
 	"github.com/jcalabro/atmos"
 )
 
-// repoKeyPrefix is the pebble key prefix for per-DID rows. DESIGN.md
+// repoKeyPrefix is the pebble key prefix for per-DID rows. docs/README.md
 // §3.5 pins this layout so the on-disk format is stable across
 // replicas.
 const repoKeyPrefix = "repo/"
@@ -19,7 +19,7 @@ func repoKey(did atmos.DID) []byte {
 }
 
 // Status is the lifecycle state of a single DID's initial backfill.
-// Values match DESIGN.md §3.5; the StatusNotStarted value is what
+// Values match docs/README.md §3.5; the StatusNotStarted value is what
 // OnDiscover writes — a row's mere existence at not_started indicates
 // the engine has seen it but not yet downloaded it.
 type Status string
@@ -50,7 +50,7 @@ const (
 	StatusUnavailable Status = "unavailable"
 )
 
-// RepoBackfillStatus tracks initial-backfill state per DESIGN.md §3.5.
+// RepoBackfillStatus tracks initial-backfill state per docs/README.md §3.5.
 type RepoBackfillStatus struct {
 	Status        Status    `json:"status"`
 	Rev           string    `json:"rev,omitempty"`
@@ -63,7 +63,7 @@ type RepoBackfillStatus struct {
 }
 
 // RepoStatus is the JSON value stored at repo/<did>. The shape matches
-// DESIGN.md §3.5; this PR only populates Backfill and Active. The
+// docs/README.md §3.5; this PR only populates Backfill and Active. The
 // other fields (PDS, Host, Handle, Rev, UpdatedAt, LastAttemptedAt,
 // RecordCount, TotalBytes) are reserved for steady-state ingest and
 // diagnostics and remain zero here so we don't force a future schema
@@ -71,7 +71,7 @@ type RepoBackfillStatus struct {
 //
 // Active records the last-observed listRepos.Active value. atmos
 // requires it on every row to detect liveness flips without an extra
-// round-trip; DESIGN.md §3.5 doesn't pin a JSON tag for it (the
+// round-trip; docs/README.md §3.5 doesn't pin a JSON tag for it (the
 // original draft predated atmos's active-flip callback) so we add one
 // here.
 type RepoStatus struct {
