@@ -52,6 +52,7 @@ func TestStore_Lookup_StatusMapping(t *testing.T) {
 		expected atmosbackfill.State
 	}{
 		{"not_started -> Discovered", StatusNotStarted, atmosbackfill.StateDiscovered},
+		{"legacy pending -> Complete", StatusPending, atmosbackfill.StateComplete},
 		{"complete -> Complete", StatusComplete, atmosbackfill.StateComplete},
 		{"failed -> Failed", StatusFailed, atmosbackfill.StateFailed},
 		{"unavailable -> Complete", StatusUnavailable, atmosbackfill.StateComplete},

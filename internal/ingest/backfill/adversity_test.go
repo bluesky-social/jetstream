@@ -129,7 +129,7 @@ func TestRun_GetRepoRepoNotFoundCompletesTerminalFromSimulator(t *testing.T) {
 	}
 }
 
-func TestRetryRunner_PendingRepoNotFoundCompletesTerminalFromSimulator(t *testing.T) {
+func TestRetryRunner_FailedRepoNotFoundCompletesTerminalFromSimulator(t *testing.T) {
 	t.Parallel()
 
 	faults := simhttp.NewFaultPlan()
@@ -146,9 +146,9 @@ func TestRetryRunner_PendingRepoNotFoundCompletesTerminalFromSimulator(t *testin
 	metrics := NewMetrics(prometheus.NewRegistry())
 	bs := NewStore(st, metrics)
 	ctx := context.Background()
-	created, err := bs.EnqueueNetNewRepo(ctx, acct.DID, true)
-	require.NoError(t, err)
-	require.True(t, created)
+	host := mustURLHost(t, srv.URL)
+	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: acct.DID, Active: true}))
+	require.NoError(t, bs.OnFail(ctx, acct.DID, host, fmt.Errorf("xrpc: HTTP 503: bootstrap unavailable"), 1))
 
 	r, err := newRetryRunner(RetryConfig{
 		Store:         st,
@@ -165,7 +165,7 @@ func TestRetryRunner_PendingRepoNotFoundCompletesTerminalFromSimulator(t *testin
 		now:           func() time.Time { return time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC) },
 	})
 	require.NoError(t, err)
-	require.NoError(t, r.processCandidate(ctx, retryCandidate{DID: acct.DID, Host: mustURLHost(t, srv.URL), Retry: 0}))
+	require.NoError(t, r.processCandidate(ctx, retryCandidate{DID: acct.DID, Host: host, Retry: 0}))
 
 	rs, err := bs.readRepoStatus(acct.DID)
 	require.NoError(t, err)
@@ -174,16 +174,16 @@ func TestRetryRunner_PendingRepoNotFoundCompletesTerminalFromSimulator(t *testin
 	require.Equal(t, 0, rs.Backfill.Attempts)
 	require.Equal(t, 0, rs.Backfill.RetryCount)
 	require.True(t, rs.Backfill.NextAttemptAt.IsZero())
-	require.Equal(t, mustURLHost(t, srv.URL), rs.Host)
+	require.Equal(t, host, rs.Host)
 
-	hs, ok, err := loadHostStatus(st, mustURLHost(t, srv.URL))
+	hs, ok, err := loadHostStatus(st, host)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, uint64(1), hs.Total)
 	require.Equal(t, uint64(1), hs.Complete)
 	require.Equal(t, uint64(0), hs.Failed)
-	require.Empty(t, hs.RecentErrors)
-	require.Empty(t, hs.ErrorClassCounts)
+	require.NotEmpty(t, hs.RecentErrors, "successful retry must not erase historical bootstrap diagnostics")
+	require.NotEmpty(t, hs.ErrorClassCounts)
 	require.Equal(t, 1, faults.GetRepoResponseFaultsFired(string(acct.DID)))
 }
 

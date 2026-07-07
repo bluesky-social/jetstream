@@ -82,13 +82,10 @@ func TestRun_EndToEnd_BootstrapToSteadyState(t *testing.T) {
 	}
 }
 
-// TestRun_SteadyState_WithNetNewEnqueuerWired exercises the steady-state path
-// with FailedRepoRetryInterval set, which is what activates the net-new DID
-// enqueuer (issue #188): its construction, the background worker goroutine, and
-// the OnEvent-wrapping hot-path hook. The fake relay emits no firehose events,
-// so this asserts the wiring stands up and tears down cleanly rather than the
-// enqueue behavior itself (covered by backfill unit tests).
-func TestRun_SteadyState_WithNetNewEnqueuerWired(t *testing.T) {
+// TestRun_SteadyState_WithFailedRepoRetryWired exercises the steady-state path
+// with FailedRepoRetryInterval set. The fake relay emits no firehose events, so
+// this asserts the failed-repo retry goroutine stands up and tears down cleanly.
+func TestRun_SteadyState_WithFailedRepoRetryWired(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()

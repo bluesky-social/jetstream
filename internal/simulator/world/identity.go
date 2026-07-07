@@ -79,10 +79,9 @@ func (w *World) generateIdentityHandleChange(ctx context.Context, idx int) ([]by
 // generateMalformedIdentity emits an #identity frame whose DID fails
 // atproto DID syntax ('!' is outside the identifier charset). Upstream
 // relays do not signature-verify #identity bodies, so a malformed DID
-// reaches consumers as-is; jetstream archives it byte-faithfully and
-// the net-new backfill enqueuer is the validation boundary that must
-// reject it. Never part of the random mix — injection-only, so the
-// polite-by-default world contract holds.
+// reaches consumers as-is; jetstream archives it byte-faithfully. Never part
+// of the random mix — injection-only, so the polite-by-default world contract
+// holds.
 func (w *World) generateMalformedIdentity(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -91,8 +90,8 @@ func (w *World) generateMalformedIdentity(ctx context.Context) ([]byte, error) {
 }
 
 // MalformedIdentityDID is the syntactically-invalid DID carried by
-// GenerateMalformedIdentityForTest frames. Exported so oracle asserts
-// can locate the archived row and the enqueuer rejection it must cause.
+// GenerateMalformedIdentityForTest frames. Exported so oracle asserts can
+// locate the archived row.
 const MalformedIdentityDID = "did:plc:oracle!malformed"
 
 // emitIdentityFrame is the shared tail: allocate a seq, stamp the
