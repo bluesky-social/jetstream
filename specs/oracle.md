@@ -358,6 +358,28 @@ boundaries. It tests fail-loud and no-corruption contracts for cursor saves,
 seq/next writes, repo status writes, syncstate commits, compaction watermark
 updates, and manifest refreshes.
 
+### Segment-Fault Tier
+
+The segment-file sibling of the store-fault tier (#200): deterministic
+segment I/O faults (write/fsync/rename, selected by op kind and process-wide
+ordinal, wrapping a chosen errno) injected through `segment.IOFaultInjector`
+into a real restart-child runtime, with the same fail-loud observed-marker
+protocol and recovery-convergence bundle. It proves fail-loud on the active
+writer's open/flush paths, ENOSPC end-to-end including the disk-full operator
+message on `rt.Run`'s error, and the compaction-rewrite path (rename faults
+are deterministic — only Patch/Rewrite rename, and the restart child's only
+rewrite driver is merge-tail compaction). A companion torn-tail sweep
+SIGKILLs a child mid-backfill, mutates the active segment's un-fsynced tail
+(truncated length prefix / torn frame with hostile garbage body), and
+requires strict recovery convergence through the torn-tail walk.
+Import-patch faults are covered at the orchestrator level (RunImport drives
+the identical Patch seam; the restart child never runs an operator-submitted
+XRPC import), and the segment package pins every seam consult with
+exhaustive (op, ordinal) sweeps over Patch and Rewrite. Gated by the
+`segmentfault` mutation tier (m044, m045). The tier's first run flushed out
+the pre-existing #262 data-loss bug; its deterministic repro is the skipped
+`write-shortwrite-first-flush` case.
+
 ### Simulator Fidelity Tier
 
 This tier expands upstream behavior beyond polite happy paths: identity
