@@ -101,6 +101,10 @@ func Open(dataDir string, m *Metrics, opts ...Option) (*Store, error) {
 		opt(&openOpts)
 	}
 
+	// filepath.Join, not openOpts.fs.PathJoin: the two agree on every
+	// '/'-separated filesystem (our prod targets and the strict-mem oracle
+	// FS, which joins with path.Join) and diverge only on Windows, which we
+	// do not support.
 	path := filepath.Join(dataDir, PebbleSubdir)
 	if openOpts.fs != nil {
 		if err := openOpts.fs.MkdirAll(path, 0o755); err != nil {

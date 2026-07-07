@@ -72,6 +72,11 @@ func Open(cfg Config) (*Writer, error) {
 	var maxSeq uint64
 	var foundEvents bool
 
+	// Segment paths use filepath.Join, not cfg.FS's PathJoin, even when a
+	// vfs.FS is injected. The two agree on every '/'-separated filesystem
+	// (all our prod targets and the strict-mem oracle FS, which uses
+	// path.Join); they diverge only on Windows separators, which we do not
+	// support. Keeping filepath.Join here matches the rest of the package.
 	if hasExisting {
 		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(idx))
 		seg, segErr := segment.New(segment.Config{
