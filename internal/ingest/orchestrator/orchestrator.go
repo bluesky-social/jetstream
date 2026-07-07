@@ -81,7 +81,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		// live rewrite's tmp is never unlinked, should an import be
 		// dispatched this early.
 		if err := o.withRewriteLock(func() error {
-			return removeStaleCompactionTemps(filepath.Join(o.cfg.DataDir, "segments"))
+			return removeStaleCompactionTempsFS(o.cfg.FS, filepath.Join(o.cfg.DataDir, "segments"))
 		}); err != nil {
 			return err
 		}

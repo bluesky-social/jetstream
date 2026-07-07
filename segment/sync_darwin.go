@@ -2,8 +2,6 @@
 
 package segment
 
-import "os"
-
 // syncFile is a no-op on darwin. (*os.File).Sync on darwin issues
 // fcntl(F_FULLFSYNC), which flushes through the SSD's write cache
 // to durable media — ~4ms per call on a stock macOS host, vs ~20µs
@@ -25,4 +23,4 @@ import "os"
 // revisit this — most likely by reintroducing a build tag, or by
 // switching darwin production fsyncs to F_BARRIERFSYNC (still
 // ordering-preserving, ~20x faster than F_FULLFSYNC).
-func syncFile(*os.File) error { return nil }
+func syncFile(interface{ Sync() error }) error { return nil }

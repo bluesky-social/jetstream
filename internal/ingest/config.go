@@ -8,6 +8,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 // DurableBatchHook stages block-specific metadata into the same synced Pebble
@@ -34,6 +35,10 @@ type Config struct {
 	// SegmentsDir is the directory holding seg_*.jss files (typically
 	// <data-dir>/segments). Required. Created if missing.
 	SegmentsDir string
+
+	// FS is the filesystem used for segment I/O. Nil uses the host OS
+	// filesystem.
+	FS vfs.FS
 
 	// Store is the shared metadata pebble db. Required.
 	Store *store.Store

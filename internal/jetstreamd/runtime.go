@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -167,17 +166,20 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
 	manifestMetrics := manifest.NewMetrics(metrics.Registry)
 
-	if err := os.MkdirAll(opts.DataDir, 0o755); err != nil {
+	if err := mkdirAllRuntimeFS(opts.StorageFS, opts.DataDir, 0o755); err != nil {
 		return fail(fmt.Errorf("serve: create data dir %s: %w", opts.DataDir, err))
 	}
 	obs.RegisterDataDirFreeBytes(metrics.Registry, opts.DataDir)
 
 	segmentsDir := filepath.Join(opts.DataDir, "segments")
-	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
+	if err := mkdirAllRuntimeFS(opts.StorageFS, segmentsDir, 0o755); err != nil {
 		return fail(fmt.Errorf("serve: create segments dir %s: %w", segmentsDir, err))
 	}
 
-	metaStore, err := store.Open(opts.DataDir, storeMetrics, store.WithFaultInjector(opts.StoreFaultInjector))
+	metaStore, err := store.Open(opts.DataDir, storeMetrics,
+		store.WithFS(opts.StorageFS),
+		store.WithFaultInjector(opts.StoreFaultInjector),
+	)
 	if err != nil {
 		return fail(err)
 	}
@@ -187,6 +189,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.cancelManifest = cancelManifest
 	mft, err := manifest.OpenBackground(manifestCtx, manifest.Options{
 		SegmentsDir:         segmentsDir,
+		FS:                  opts.StorageFS,
 		BlockIndexCacheSize: opts.CursorBlockIndexCacheSize,
 		Logger:              processLogger,
 		Metrics:             manifestMetrics,
@@ -255,6 +258,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
 		Manifest:        mft,
 		WriterRef:       &writerPtr,
+		FS:              opts.StorageFS,
 		BlockCacheBytes: opts.SubscribeBlockCacheBytes,
 	})
 	tail, err := subscribe.New(subscribe.Config{
@@ -320,6 +324,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	orch, err := orchestrator.New(orchestrator.Config{
 		DataDir:        opts.DataDir,
+		FS:             opts.StorageFS,
 		Store:          metaStore,
 		RelayURL:       opts.RelayURL,
 		HTTPClient:     xrpcClient.HTTPClient.Val(),
@@ -394,7 +399,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if importDir == "" {
 		importDir = filepath.Join(opts.DataDir, "imports")
 	}
-	if err := os.MkdirAll(importDir, 0o755); err != nil {
+	if err := mkdirAllRuntimeFS(opts.StorageFS, importDir, 0o755); err != nil {
 		return fail(fmt.Errorf("serve: create import dir %s: %w", importDir, err))
 	}
 	importRunCtx, cancelImport := context.WithCancel(context.Background())
@@ -451,6 +456,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Tail:      tail,
 		Store:     metaStore,
 		Manifest:  mft,
+		FS:        opts.StorageFS,
 		WriterRef: &writerPtr,
 		Logger:    processLogger,
 		Metrics:   subscribeMetrics,
@@ -460,6 +466,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Tail:      tail,
 		Store:     metaStore,
 		Manifest:  mft,
+		FS:        opts.StorageFS,
 		WriterRef: &writerPtr,
 		Logger:    processLogger,
 		Metrics:   subscribeMetrics,

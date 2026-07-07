@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -17,6 +16,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble/vfs"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -81,7 +81,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 		// lock, any *.jss.tmp we see is genuinely stale — no rewrite is in
 		// flight while we hold it.
 		if err := o.withRewriteLock(func() error {
-			return removeStaleCompactionTemps(segmentsDir)
+			return removeStaleCompactionTempsFS(o.cfg.FS, segmentsDir)
 		}); err != nil {
 			return err
 		}
@@ -226,14 +226,14 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 // force-rotate the live writer before this sweep, so the only active
 // segment left holds events appended after the pass began.
 func (o *Orchestrator) listSealedCompactionSegments(segmentsDir string) ([]sealedCompactionSegment, uint64, error) {
-	files, err := ingest.SegmentFiles(segmentsDir)
+	files, err := ingest.SegmentFilesFS(o.cfg.FS, segmentsDir)
 	if err != nil {
 		return nil, 0, fmt.Errorf("orchestrator: compaction: list segments: %w", err)
 	}
 	sealed := make([]sealedCompactionSegment, 0, len(files))
 	var targetWatermark uint64
 	for _, f := range files {
-		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, SkipChecksum: true})
+		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, FS: o.cfg.FS, SkipChecksum: true})
 		if err != nil {
 			if errors.Is(err, segment.ErrActiveSegment) {
 				continue
@@ -300,7 +300,7 @@ func (o *Orchestrator) collectCompactionTombstones(ctx context.Context, sealed [
 		if err := ctx.Err(); err != nil {
 			return tombstone.Snapshot{}, 0, err
 		}
-		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, SkipChecksum: true})
+		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, FS: o.cfg.FS, SkipChecksum: true})
 		if err != nil {
 			return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: open source %s: %w", f.Path, err)
 		}
@@ -375,6 +375,7 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
 					}
 					return segment.RowKeep
 				}, segment.RewriteOptions{
+					FS:              o.cfg.FS,
 					CrashInjector:   crashpoint.ForSegment(o.cfg.CrashInjector),
 					IOFaultInjector: o.cfg.SegmentIOFaultInjector,
 					CandidateDIDs:   candidateDIDs,
@@ -422,7 +423,7 @@ sendLoop:
 			for reason, n := range r.droppedByReason {
 				o.cfg.Metrics.addCompactionRowsDropped(reason, n)
 			}
-			if info, err := os.Stat(r.file.Path); err == nil {
+			if info, err := statStorageFS(o.cfg.FS, r.file.Path); err == nil {
 				o.cfg.Metrics.addCompactionBytesRewritten(info.Size())
 			}
 			o.logger.Info("compaction rewrote segment",
@@ -535,7 +536,7 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 		return err
 	}
 
-	files, err := ingest.SegmentFiles(segmentsDir)
+	files, err := ingest.SegmentFilesFS(o.cfg.FS, segmentsDir)
 	if err != nil {
 		return fmt.Errorf("orchestrator: compaction: rebuild tombstones list: %w", err)
 	}
@@ -545,7 +546,7 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, SkipChecksum: true})
+		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, FS: o.cfg.FS, SkipChecksum: true})
 		if err == nil {
 			// Segments and blocks entirely at or below the watermark
 			// are already physically compacted; their tombstones can
@@ -579,7 +580,7 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 		if !errors.Is(err, segment.ErrActiveSegment) {
 			return fmt.Errorf("orchestrator: compaction: rebuild open %s: %w", f.Path, err)
 		}
-		if err := segment.WalkActive(f.Path, func(events []segment.Event) error {
+		if err := segment.WalkActiveFS(o.cfg.FS, f.Path, func(events []segment.Event) error {
 			part, err := tombstone.Fold(events, watermark)
 			if err != nil {
 				return err
@@ -635,25 +636,34 @@ func compactionWatermarkLagSeconds(sealed []sealedCompactionSegment, watermark u
 	return float64(tipWitnessedAt-watermarkWitnessedAt) / 1_000_000
 }
 
-// removeStaleCompactionTemps deletes leftover *.jss.tmp files from a
+// removeStaleCompactionTempsFS deletes leftover *.jss.tmp files from a
 // crashed rewrite. Runs at process startup (Orchestrator.Run) and at
 // the start of every pass. A missing directory is fine — bootstrap has
 // not created it yet.
-func removeStaleCompactionTemps(dir string) error {
-	entries, err := os.ReadDir(dir)
+func removeStaleCompactionTempsFS(fs vfs.FS, dir string) error {
+	sfs := storageFS(fs)
+	entries, err := sfs.List(dir)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if isStorageNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("orchestrator: compaction: readdir tmp cleanup: %w", err)
 	}
 
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jss.tmp") {
+	for _, name := range entries {
+		path := sfs.PathJoin(dir, name)
+		info, statErr := sfs.Stat(path)
+		if statErr != nil {
+			if isStorageNotExist(statErr) {
+				continue
+			}
+			return fmt.Errorf("orchestrator: compaction: stat tmp %s: %w", name, statErr)
+		}
+		if info.IsDir() || !strings.HasSuffix(name, ".jss.tmp") {
 			continue
 		}
-		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("orchestrator: compaction: remove tmp %s: %w", e.Name(), err)
+		if err := sfs.Remove(path); err != nil && !isStorageNotExist(err) {
+			return fmt.Errorf("orchestrator: compaction: remove tmp %s: %w", name, err)
 		}
 	}
 

@@ -2,8 +2,6 @@
 
 package segment
 
-import "os"
-
 // syncFile fsyncs a regular-file or directory handle to disk. Every
 // production durability anchor in this package routes through it
 // (block flush, header pwrite, parent-dir fsync after creation,
@@ -14,4 +12,4 @@ import "os"
 //
 // See sync_darwin.go for why darwin needs a different
 // implementation.
-func syncFile(f *os.File) error { return f.Sync() }
+func syncFile(f interface{ Sync() error }) error { return f.Sync() }

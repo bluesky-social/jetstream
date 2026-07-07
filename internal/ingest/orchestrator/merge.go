@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -49,7 +48,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 
 		// Restart-after-cleanup guard.
-		if _, err := os.Stat(liveSegmentsDir); errors.Is(err, os.ErrNotExist) {
+		if _, err := statStorageFS(o.cfg.FS, liveSegmentsDir); isStorageNotExist(err) {
 			if err := deleteMergeCursor(o.cfg.Store); err != nil {
 				return err
 			}
@@ -72,6 +71,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		dst, err := ingest.Open(ingest.Config{
 			SegmentsDir:            segmentsDir,
 			DataDir:                o.cfg.DataDir,
+			FS:                     o.cfg.FS,
 			Store:                  o.cfg.Store,
 			SeqKey:                 live.SteadySeqKey,
 			Logger:                 o.cfg.Logger,
@@ -90,7 +90,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return err
 		}
 
-		runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
+		runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.FS, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
 
 		if err := runner.run(ctx); err != nil {
 			if cerr := dst.Close(); cerr != nil {
@@ -127,7 +127,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return err
 		}
 
-		if err := os.RemoveAll(filepath.Join(o.cfg.DataDir, "backfill")); err != nil {
+		if err := removeAllStorageFS(o.cfg.FS, filepath.Join(o.cfg.DataDir, "backfill")); err != nil {
 			return fmt.Errorf("orchestrator: merge: remove backfill dir: %w", err)
 		}
 		if err := deleteMergeCursor(o.cfg.Store); err != nil {
@@ -149,7 +149,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 // files[len-1] is sufficient. Idempotent — a no-op when the trailing
 // segment is already sealed.
 func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDir string) error {
-	files, err := ingest.SegmentFiles(liveSegmentsDir)
+	files, err := ingest.SegmentFilesFS(o.cfg.FS, liveSegmentsDir)
 	if err != nil {
 		return fmt.Errorf("orchestrator: merge: list source segments before seal guard: %w", err)
 	}
@@ -158,7 +158,7 @@ func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDi
 	}
 
 	latest := files[len(files)-1]
-	rd, err := segment.Open(segment.ReaderConfig{Path: latest.Path})
+	rd, err := segment.Open(segment.ReaderConfig{Path: latest.Path, FS: o.cfg.FS})
 	if err == nil {
 		return rd.Close()
 	}
@@ -169,6 +169,7 @@ func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDi
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:            liveSegmentsDir,
 		DataDir:                o.cfg.DataDir,
+		FS:                     o.cfg.FS,
 		Store:                  o.cfg.Store,
 		SeqKey:                 live.BootstrapSeqKey,
 		Logger:                 o.cfg.Logger,

@@ -30,6 +30,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 // PebbleSubdir is the on-disk name of the metadata store relative
@@ -61,6 +62,25 @@ type Store struct {
 	faults FaultInjector
 }
 
+type openOptions struct {
+	faults FaultInjector
+	fs     vfs.FS
+}
+
+// Option configures a Store at Open time. Production callers normally pass
+// no options; tests can install fault injection or an alternate Pebble VFS.
+type Option func(*openOptions)
+
+// WithFS opens Pebble on fs instead of the process filesystem. Passing nil is
+// a no-op.
+func WithFS(fs vfs.FS) Option {
+	return func(o *openOptions) {
+		if fs != nil {
+			o.fs = fs
+		}
+	}
+}
+
 // Open opens (creating if necessary) the metadata pebble database
 // at <dataDir>/meta.pebble. The data directory itself must already
 // exist; pebble will create the inner db directory and any needed
@@ -76,7 +96,20 @@ func Open(dataDir string, m *Metrics, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("store: Open: data dir is required")
 	}
 
+	var openOpts openOptions
+	for _, opt := range opts {
+		opt(&openOpts)
+	}
+
 	path := filepath.Join(dataDir, PebbleSubdir)
+	if openOpts.fs != nil {
+		if err := openOpts.fs.MkdirAll(path, 0o755); err != nil {
+			return nil, fmt.Errorf("store: create pebble dir %s: %w", path, err)
+		}
+		if err := syncStoreDir(openOpts.fs, openOpts.fs.PathDir(path)); err != nil {
+			return nil, fmt.Errorf("store: sync pebble parent dir %s: %w", openOpts.fs.PathDir(path), err)
+		}
+	}
 
 	// We deliberately keep the pebble configuration close to defaults.
 	// The metadata store carries one row per DID (~30M today) plus a
@@ -86,6 +119,9 @@ func Open(dataDir string, m *Metrics, opts ...Option) (*Store, error) {
 	// backfill seed step performs once per relay listRepos entry.
 	pebbleOpts := &pebble.Options{}
 	pebbleOpts.EnsureDefaults()
+	if openOpts.fs != nil {
+		pebbleOpts.FS = openOpts.fs
+	}
 	for i := range pebbleOpts.Levels {
 		pebbleOpts.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
 	}
@@ -95,11 +131,17 @@ func Open(dataDir string, m *Metrics, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("store: open pebble at %s: %w", path, err)
 	}
 
-	s := &Store{DB: db, metrics: m}
-	for _, opt := range opts {
-		opt(s)
-	}
+	s := &Store{DB: db, metrics: m, faults: openOpts.faults}
 	return s, nil
+}
+
+func syncStoreDir(fs vfs.FS, path string) error {
+	dir, err := fs.OpenDir(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	return dir.Sync()
 }
 
 // Close releases the metadata db. Idempotent: subsequent calls are

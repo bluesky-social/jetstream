@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,6 +54,50 @@ func TestNewCreatesEmpty256ByteFile(t *testing.T) {
 	for i, b := range contents[len(segmentMagic):] {
 		require.Zerof(t, b, "padding byte %d should be zero", i+len(segmentMagic))
 	}
+}
+
+func TestStrictMemDropsUnsyncedFlushedBlock(t *testing.T) {
+	t.Parallel()
+
+	fs := vfs.NewStrictMem()
+	dir := "/segments"
+	path := filepath.Join(dir, "seg.jss")
+	require.NoError(t, fs.MkdirAll(dir, 0o755))
+	syncStrictTestDir(t, fs, "/")
+
+	w, err := New(Config{Path: path, FS: fs, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:a"})
+	require.NoError(t, err)
+	require.NoError(t, w.Flush())
+
+	fs.SetIgnoreSyncs(true)
+	_, err = w.Append(Event{Seq: 2, Kind: KindCreate, DID: "did:plc:b"})
+	require.NoError(t, err)
+	require.NoError(t, w.Flush())
+	require.NoError(t, w.Close())
+
+	fs.ResetToSyncedState()
+	fs.SetIgnoreSyncs(false)
+
+	var got []uint64
+	err = WalkActiveFS(fs, path, func(events []Event) error {
+		for i := range events {
+			got = append(got, events[i].Seq)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1}, got)
+}
+
+func syncStrictTestDir(t *testing.T, fs *vfs.MemFS, dir string) {
+	t.Helper()
+	f, err := fs.OpenDir(dir)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
 }
 
 func TestFlushReturnsENOSPCOnBlockWrite(t *testing.T) {

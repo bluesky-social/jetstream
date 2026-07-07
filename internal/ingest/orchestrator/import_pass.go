@@ -417,6 +417,7 @@ func (o *Orchestrator) applyImportSegment(seg importSegment, rr *timestamp.RowRe
 
 	mutate := plan.BuildMutate()
 	patchRes, err := segment.Patch(seg.file.Path, mutate.Fn(), segment.PatchOptions{
+		FS:              o.cfg.FS,
 		CrashInjector:   crashpoint.ForSegment(o.cfg.CrashInjector),
 		IOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		CandidateDIDs:   plan.CandidateDIDs(),
@@ -432,7 +433,7 @@ func (o *Orchestrator) applyImportSegment(seg importSegment, rr *timestamp.RowRe
 		// metric. A stat failure here is non-fatal: the rewrite already
 		// succeeded and is durable, so we log-and-continue rather than fail the
 		// whole job over a metric.
-		if info, statErr := os.Stat(seg.file.Path); statErr == nil {
+		if info, statErr := statStorageFS(o.cfg.FS, seg.file.Path); statErr == nil {
 			res.bytes = uint64(info.Size())
 		} else {
 			o.logger.Warn("timestamp import: stat patched segment for byte accounting",
@@ -463,8 +464,8 @@ func (o *Orchestrator) importTouchedSegments(jobDir string) ([]importSegment, er
 			continue
 		}
 		segPath := filepath.Join(segmentsDir, ingest.SegmentFilename(idx))
-		if _, err := os.Stat(segPath); err != nil {
-			if os.IsNotExist(err) {
+		if _, err := statStorageFS(o.cfg.FS, segPath); err != nil {
+			if isStorageNotExist(err) {
 				o.logger.Warn("timestamp import: segment for offset file vanished; skipping",
 					"segment_idx", idx, "offset_file", e.Name())
 				continue

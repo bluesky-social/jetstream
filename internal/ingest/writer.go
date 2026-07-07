@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -15,6 +14,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -58,11 +58,11 @@ func Open(cfg Config) (*Writer, error) {
 	cfg.applyDefaults()
 	cfg.Logger = cfg.Logger.With(slog.String("component", "ingest/writer"))
 
-	if err := os.MkdirAll(cfg.SegmentsDir, 0o755); err != nil {
-		return nil, cfg.wrapSegmentPersistenceError("creating segments directory", fmt.Errorf("ingest: mkdir %s: %w", cfg.SegmentsDir, err))
+	if err := mkdirAllFS(cfg.FS, cfg.SegmentsDir, 0o755); err != nil {
+		return nil, cfg.wrapSegmentPersistenceError("creating segments directory", err)
 	}
 
-	idx, hasExisting, err := scanSegmentsDir(cfg.SegmentsDir)
+	idx, hasExisting, err := scanSegmentsDir(cfg.FS, cfg.SegmentsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +76,7 @@ func Open(cfg Config) (*Writer, error) {
 		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(idx))
 		seg, segErr := segment.New(segment.Config{
 			Path:              path,
+			FS:                cfg.FS,
 			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
 			Metrics:           cfg.SegmentMetrics,
 			IOFaultInjector:   cfg.SegmentIOFaultInjector,
@@ -83,14 +84,14 @@ func Open(cfg Config) (*Writer, error) {
 		switch {
 		case segErr == nil:
 			w.active = seg
-			info, statErr := os.Stat(path)
+			info, statErr := statFS(cfg.FS, path)
 			if statErr != nil {
 				_ = seg.Close()
 				return nil, fmt.Errorf("ingest: stat %s: %w", path, statErr)
 			}
 			w.activeBytes = info.Size() - int64(segment.ReservedHeaderBytes)
 
-			maxSeq, foundEvents, err = segment.ScanMaxSeq(path)
+			maxSeq, foundEvents, err = segment.ScanMaxSeqFS(cfg.FS, path)
 			if err != nil {
 				_ = seg.Close()
 				return nil, fmt.Errorf("ingest: scan_max_seq %s: %w", path, err)
@@ -112,7 +113,7 @@ func Open(cfg Config) (*Writer, error) {
 			// which covers MaxSeq/EventCount. A corrupt MaxSeq read blindly
 			// would floor nextSeq off garbage (silent seq reuse or a seq gap).
 			// segment.Open fails loud on a bad checksum — crash > corruption.
-			r, openErr := segment.Open(segment.ReaderConfig{Path: path})
+			r, openErr := segment.Open(segment.ReaderConfig{Path: path, FS: cfg.FS})
 			if openErr != nil {
 				return nil, fmt.Errorf("ingest: open sealed %s: %w", path, openErr)
 			}
@@ -138,6 +139,7 @@ func Open(cfg Config) (*Writer, error) {
 			path = filepath.Join(cfg.SegmentsDir, SegmentFilename(w.activeIdx))
 			seg, segErr = segment.New(segment.Config{
 				Path:              path,
+				FS:                cfg.FS,
 				MaxEventsPerBlock: cfg.MaxEventsPerBlock,
 				Metrics:           cfg.SegmentMetrics,
 				IOFaultInjector:   cfg.SegmentIOFaultInjector,
@@ -154,6 +156,7 @@ func Open(cfg Config) (*Writer, error) {
 		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(0))
 		seg, segErr := segment.New(segment.Config{
 			Path:              path,
+			FS:                cfg.FS,
 			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
 			Metrics:           cfg.SegmentMetrics,
 			IOFaultInjector:   cfg.SegmentIOFaultInjector,
@@ -176,7 +179,7 @@ func Open(cfg Config) (*Writer, error) {
 	// healthy highest segment with events sets foundEvents=true above, and a
 	// fresh dir has no existing segments.
 	if !foundEvents && hasExisting {
-		tailMax, tailFound, tailErr := recoverSealedTailMaxSeq(cfg.SegmentsDir, idx)
+		tailMax, tailFound, tailErr := recoverSealedTailMaxSeq(cfg.FS, cfg.SegmentsDir, idx)
 		if tailErr != nil {
 			_ = w.active.Close()
 			return nil, tailErr
@@ -577,7 +580,7 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 		}
 
 		path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))
-		info, statErr := os.Stat(path)
+		info, statErr := statFS(w.cfg.FS, path)
 		if statErr != nil {
 			return fmt.Errorf("ingest: stat active segment: %w", statErr)
 		}
@@ -660,6 +663,7 @@ func (w *Writer) rotateLocked(ctx context.Context) error {
 		nextPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))
 		next, err := segment.New(segment.Config{
 			Path:              nextPath,
+			FS:                w.cfg.FS,
 			MaxEventsPerBlock: w.cfg.MaxEventsPerBlock,
 			Metrics:           w.cfg.SegmentMetrics,
 			IOFaultInjector:   w.cfg.SegmentIOFaultInjector,
@@ -731,20 +735,31 @@ type SegmentFile struct {
 // creation order: the merge phase draining live_segments/, the
 // delete/update compactor, and inspect tooling.
 func SegmentFiles(dir string) ([]SegmentFile, error) {
-	entries, err := os.ReadDir(dir)
+	return SegmentFilesFS(nil, dir)
+}
+
+// SegmentFilesFS is SegmentFiles against fs. Nil fs uses the host OS filesystem.
+func SegmentFilesFS(fs vfs.FS, dir string) ([]SegmentFile, error) {
+	sfs := ingestFS(fs)
+	entries, err := sfs.List(dir)
 	if err != nil {
 		return nil, fmt.Errorf("ingest: readdir %s: %w", dir, err)
 	}
 	out := make([]SegmentFile, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		idx, ok := ParseSegmentIndex(e.Name())
+	for _, name := range entries {
+		idx, ok := ParseSegmentIndex(name)
 		if !ok {
 			continue
 		}
-		out = append(out, SegmentFile{Idx: idx, Path: filepath.Join(dir, e.Name())})
+		path := sfs.PathJoin(dir, name)
+		info, statErr := sfs.Stat(path)
+		if statErr != nil {
+			return nil, fmt.Errorf("ingest: stat %s: %w", path, statErr)
+		}
+		if info.IsDir() {
+			continue
+		}
+		out = append(out, SegmentFile{Idx: idx, Path: path})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Idx < out[j].Idx })
 	return out, nil
@@ -766,8 +781,8 @@ func SegmentFiles(dir string) ([]SegmentFile, error) {
 // skipped rather than failing the open, so a partially-rotated dir still
 // recovers. Any other open error is returned: a corrupt lower segment must
 // crash Open, not silently lower the floor.
-func recoverSealedTailMaxSeq(dir string, highestIdx uint64) (maxSeq uint64, found bool, err error) {
-	files, err := SegmentFiles(dir)
+func recoverSealedTailMaxSeq(fs vfs.FS, dir string, highestIdx uint64) (maxSeq uint64, found bool, err error) {
+	files, err := SegmentFilesFS(fs, dir)
 	if err != nil {
 		return 0, false, err
 	}
@@ -775,7 +790,7 @@ func recoverSealedTailMaxSeq(dir string, highestIdx uint64) (maxSeq uint64, foun
 		if files[i].Idx >= highestIdx {
 			continue
 		}
-		r, openErr := segment.Open(segment.ReaderConfig{Path: files[i].Path})
+		r, openErr := segment.Open(segment.ReaderConfig{Path: files[i].Path, FS: fs})
 		if openErr != nil {
 			if errors.Is(openErr, segment.ErrActiveSegment) {
 				continue // an unsealed file carries no committed envelope; skip it
@@ -796,8 +811,8 @@ func recoverSealedTailMaxSeq(dir string, highestIdx uint64) (maxSeq uint64, foun
 // scanSegmentsDir lists cfg.SegmentsDir and returns the highest seg_*
 // index seen and whether any matching files exist. Thin wrapper over
 // SegmentFiles preserved for the writer-open path.
-func scanSegmentsDir(dir string) (idx uint64, has bool, err error) {
-	files, err := SegmentFiles(dir)
+func scanSegmentsDir(fs vfs.FS, dir string) (idx uint64, has bool, err error) {
+	files, err := SegmentFilesFS(fs, dir)
 	if err != nil {
 		return 0, false, err
 	}

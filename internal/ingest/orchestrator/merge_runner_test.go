@@ -30,7 +30,7 @@ func TestMergeRunner_EmptySourceDir(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dst.Close() })
 
-	r := newMergeRunner(dst, st, srcDir, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	r := newMergeRunner(dst, st, srcDir, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 
 	require.NoError(t, r.run(t.Context()))
 
@@ -81,7 +81,7 @@ func TestMergeRunner_SourceIndexGap(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dst.Close() })
 
-	r := newMergeRunner(dst, st, srcDir, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	r := newMergeRunner(dst, st, srcDir, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 	err = r.run(t.Context())
 	require.ErrorContains(t, err, "source index gap")
 }
@@ -111,7 +111,7 @@ func TestMergeRunner_DiscoverySkipsWhenNoBootstrapCursor(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dst.Close() })
 
-	r := newMergeRunner(dst, st, srcDir, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	r := newMergeRunner(dst, st, srcDir, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 
 	// If runDiscovery were to actually call out (via the xrpc client it
 	// would build internally), it would dereference the nil HTTPClient

@@ -16,6 +16,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/timestamp"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/streaming"
@@ -42,6 +43,10 @@ type Config struct {
 	// DataDir is the root data directory. The orchestrator writes to
 	// <DataDir>/segments and <DataDir>/backfill/live_segments.
 	DataDir string
+
+	// FS is the filesystem used for Jetstream-owned durable storage under
+	// DataDir. Nil uses the host OS filesystem.
+	FS vfs.FS
 
 	// Store is the shared metadata pebble db. Required.
 	Store *store.Store

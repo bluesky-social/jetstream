@@ -14,6 +14,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 )
@@ -40,9 +41,12 @@ type CompactionPassResult struct {
 // Options is the typed runtime configuration for one jetstream daemon
 // instance, after CLI and environment inputs have been resolved.
 type Options struct {
-	PublicAddr         string
-	DebugAddr          string
-	DataDir            string
+	PublicAddr string
+	DebugAddr  string
+	DataDir    string
+	// StorageFS is the filesystem for Jetstream-owned durable storage under
+	// DataDir (segments + Pebble). Nil uses the host OS filesystem.
+	StorageFS          vfs.FS
 	RelayURL           string
 	PLCURL             string
 	OTelServiceName    string

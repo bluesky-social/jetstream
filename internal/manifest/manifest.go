@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/gloom"
 	"github.com/jcalabro/gt"
 )
@@ -121,6 +121,10 @@ type Options struct {
 	// SegmentsDir is the directory holding seg_*.jss files. Required.
 	SegmentsDir string
 
+	// FS is the filesystem used for segment I/O. Nil uses the host OS
+	// filesystem.
+	FS vfs.FS
+
 	// BlockIndexCacheSize is retained for flag compatibility. Block
 	// indices are now always loaded into the manifest at startup and on
 	// segment seal.
@@ -204,13 +208,13 @@ func newManifest(opts Options) (*Manifest, error) {
 func (m *Manifest) load(ctx context.Context) error {
 	logger := m.opts.Logger.With(slog.String("component", "manifest"))
 
-	files, err := ingest.SegmentFiles(m.opts.SegmentsDir)
+	files, err := ingest.SegmentFilesFS(m.opts.FS, m.opts.SegmentsDir)
 	if err != nil {
 		return fmt.Errorf("manifest: list segments: %w", err)
 	}
 
 	loadConcurrency := manifestLoadConcurrency()
-	loaded, err := loadSealedMetadata(ctx, files, loadConcurrency, m.opts.Metrics)
+	loaded, err := loadSealedMetadata(ctx, m.opts.FS, files, loadConcurrency, m.opts.Metrics)
 	if err != nil {
 		return err
 	}
@@ -282,10 +286,10 @@ type metadataLoadResult struct {
 	sealed bool
 }
 
-func loadSealedMetadata(ctx context.Context, files []ingest.SegmentFile, concurrency int, metrics *Metrics) ([]SegmentMetadata, error) {
+func loadSealedMetadata(ctx context.Context, fs vfs.FS, files []ingest.SegmentFile, concurrency int, metrics *Metrics) ([]SegmentMetadata, error) {
 	results, err := gt.ConcurrentN(ctx, files, concurrency, func(f ingest.SegmentFile) (metadataLoadResult, error) {
 		start := time.Now()
-		meta, ok, err := readSealedMetadata(f.Idx, f.Path, false)
+		meta, ok, err := readSealedMetadata(fs, f.Idx, f.Path, false)
 		if err != nil {
 			return metadataLoadResult{}, fmt.Errorf("manifest: read segment %s: %w", f.Path, err)
 		}
@@ -503,15 +507,19 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 
 // readSealedMetadata opens path with the segment Reader. The bool is
 // false (with nil error) iff the file is an active (unsealed) segment.
-func readSealedMetadata(idx uint64, path string, verifyChecksum bool) (SegmentMetadata, bool, error) {
-	info, err := os.Stat(path)
+func readSealedMetadata(fs vfs.FS, idx uint64, path string, verifyChecksum bool) (SegmentMetadata, bool, error) {
+	sfs := fs
+	if sfs == nil {
+		sfs = vfs.Default
+	}
+	info, err := sfs.Stat(path)
 	if err != nil {
 		return SegmentMetadata{}, false, fmt.Errorf("stat: %w", err)
 	}
 	// SkipChecksum=true on the startup/seal paths keeps cost bounded;
 	// the compacted-refresh path verifies (OnSegmentCompacted) and
 	// operators who want full integrity checks run inspect-segment.
-	r, err := segment.Open(segment.ReaderConfig{Path: path, SkipChecksum: !verifyChecksum})
+	r, err := segment.Open(segment.ReaderConfig{Path: path, FS: fs, SkipChecksum: !verifyChecksum})
 	if err != nil {
 		if isActiveSegmentSentinel(err) {
 			return SegmentMetadata{}, false, nil
@@ -698,7 +706,7 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 		return err
 	}
 	start := time.Now()
-	meta, ok, err := readSealedMetadata(idx, path, verifyChecksum)
+	meta, ok, err := readSealedMetadata(m.opts.FS, idx, path, verifyChecksum)
 	if err != nil {
 		return fmt.Errorf("manifest: refresh segment: %w", err)
 	}
@@ -916,7 +924,7 @@ func (m *Manifest) ActiveSegmentPaths() ([]string, error) {
 	if err := m.waitReady(); err != nil {
 		return nil, err
 	}
-	files, err := ingest.SegmentFiles(m.opts.SegmentsDir)
+	files, err := ingest.SegmentFilesFS(m.opts.FS, m.opts.SegmentsDir)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: list active segments: %w", err)
 	}

@@ -5,7 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
+
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 type RowDecision uint8
@@ -16,6 +17,9 @@ const (
 )
 
 type RewriteOptions struct {
+	// FS is the filesystem used for segment I/O. Nil uses the host OS
+	// filesystem.
+	FS            vfs.FS
 	CrashInjector CrashInjector
 	// IOFaultInjector is a test-only seam consulted before every tmp-file
 	// write, fsync, and the commit rename. Nil in production.
@@ -39,7 +43,7 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 		return RewriteResult{}, fmt.Errorf("%w: Rewrite decide is required", ErrInvalidConfig)
 	}
 
-	r, err := Open(ReaderConfig{Path: path})
+	r, err := Open(ReaderConfig{Path: path, FS: opts.FS})
 	if err != nil {
 		return RewriteResult{}, err
 	}
@@ -133,10 +137,10 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	}
 
 	tmp := path + ".tmp"
-	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+	if err := removeSegmentFile(opts.FS, tmp); err != nil && !isSegmentNotExist(err) {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite remove stale tmp: %w", err)
 	}
-	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := createSegmentFileExclusive(opts.FS, tmp)
 	if err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite create tmp: %w", err)
 	}
@@ -144,28 +148,31 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	defer func() {
 		_ = f.Close()
 		if !success {
-			_ = os.Remove(tmp)
+			_ = removeSegmentFile(opts.FS, tmp)
 		}
 	}()
 
-	if err := initializeNewSegment(f, Config{Path: tmp, IOFaultInjector: opts.IOFaultInjector}); err != nil {
+	if err := initializeNewSegment(f, Config{Path: tmp, FS: opts.FS, IOFaultInjector: opts.IOFaultInjector}); err != nil {
 		return RewriteResult{}, err
 	}
+	writeOffset := int64(ReservedHeaderBytes)
 	for _, b := range outBlocks {
 		var lenBuf [8]byte
 		binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(b.frame)))
 		if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
 			return RewriteResult{}, fmt.Errorf("segment: rewrite write frame len: %w", err)
 		}
-		if _, err := f.Write(lenBuf[:]); err != nil {
+		if _, err := f.WriteAt(lenBuf[:], writeOffset); err != nil {
 			return RewriteResult{}, fmt.Errorf("segment: rewrite write frame len: %w", err)
 		}
+		writeOffset += int64(len(lenBuf))
 		if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
 			return RewriteResult{}, fmt.Errorf("segment: rewrite write frame: %w", err)
 		}
-		if _, err := f.Write(b.frame); err != nil {
+		if _, err := f.WriteAt(b.frame, writeOffset); err != nil {
 			return RewriteResult{}, fmt.Errorf("segment: rewrite write frame: %w", err)
 		}
+		writeOffset += int64(len(b.frame))
 	}
 
 	footerOffset := int64(nextOffset)
@@ -201,7 +208,7 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpSync); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite fsync tmp: %w", err)
 	}
-	if err := syncFile(f); err != nil {
+	if err := syncSegmentFile(opts.FS, f); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite fsync tmp: %w", err)
 	}
 	if err := simulateRewriteCrash(opts, CrashPointRewriteTempSynced); err != nil {
@@ -213,13 +220,13 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if err := beforeSegmentIO(opts.IOFaultInjector, path, IOOpRename); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite rename: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := renameSegmentFile(opts.FS, tmp, path); err != nil {
 		return RewriteResult{}, fmt.Errorf("segment: rewrite rename: %w", err)
 	}
 	if err := simulateRewriteCrash(opts, CrashPointRewriteRenamed); err != nil {
 		return RewriteResult{}, err
 	}
-	if err := syncParentDir(path, opts.IOFaultInjector); err != nil {
+	if err := syncParentDirFS(opts.FS, path, opts.IOFaultInjector); err != nil {
 		return RewriteResult{}, err
 	}
 	if err := simulateRewriteCrash(opts, CrashPointRewriteDirSynced); err != nil {
