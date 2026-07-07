@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"os"
 
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/zeebo/xxh3"
 )
 
@@ -14,6 +14,9 @@ import (
 // non-empty CandidateDIDs lets Patch skip a segment whose DID bloom proves
 // none of the targeted repos are present.
 type PatchOptions struct {
+	// FS is the filesystem used for segment I/O. Nil uses the host OS
+	// filesystem.
+	FS            vfs.FS
 	CrashInjector CrashInjector
 	// IOFaultInjector is a test-only seam consulted before every tmp-file
 	// write, fsync, and the commit rename. Nil in production.
@@ -86,7 +89,7 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 		return PatchResult{}, fmt.Errorf("%w: Patch mutate is required", ErrInvalidConfig)
 	}
 
-	r, err := Open(ReaderConfig{Path: path})
+	r, err := Open(ReaderConfig{Path: path, FS: opts.FS})
 	if err != nil {
 		return PatchResult{}, err
 	}
@@ -275,39 +278,44 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 	binary.LittleEndian.PutUint64(headerBytes[4:12], checksum)
 
 	tmp := path + ".tmp"
-	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+	if err := removeSegmentFile(opts.FS, tmp); err != nil && !isSegmentNotExist(err) {
 		return PatchResult{}, fmt.Errorf("segment: patch remove stale tmp: %w", err)
 	}
-	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := createSegmentFileExclusive(opts.FS, tmp)
 	if err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch create tmp: %w", err)
 	}
 	success := false
 	defer func() {
-		_ = f.Close()
+		if f != nil {
+			_ = f.Close()
+		}
 		if !success {
-			_ = os.Remove(tmp)
+			_ = removeSegmentFile(opts.FS, tmp)
 		}
 	}()
 
-	if err := initializeNewSegment(f, Config{Path: tmp, IOFaultInjector: opts.IOFaultInjector}); err != nil {
+	if err := initializeNewSegment(f, Config{Path: tmp, FS: opts.FS, IOFaultInjector: opts.IOFaultInjector}); err != nil {
 		return PatchResult{}, err
 	}
+	writeOffset := int64(ReservedHeaderBytes)
 	for _, b := range outBlocks {
 		var lenBuf [8]byte
 		binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(b.frame)))
 		if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
 			return PatchResult{}, fmt.Errorf("segment: patch write frame len: %w", err)
 		}
-		if _, err := f.Write(lenBuf[:]); err != nil {
+		if _, err := f.WriteAt(lenBuf[:], writeOffset); err != nil {
 			return PatchResult{}, fmt.Errorf("segment: patch write frame len: %w", err)
 		}
+		writeOffset += int64(len(lenBuf))
 		if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
 			return PatchResult{}, fmt.Errorf("segment: patch write frame: %w", err)
 		}
-		if _, err := f.Write(b.frame); err != nil {
+		if _, err := f.WriteAt(b.frame, writeOffset); err != nil {
 			return PatchResult{}, fmt.Errorf("segment: patch write frame: %w", err)
 		}
+		writeOffset += int64(len(b.frame))
 	}
 
 	if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpWrite); err != nil {
@@ -328,7 +336,7 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 	if err := beforeSegmentIO(opts.IOFaultInjector, tmp, IOOpSync); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch fsync tmp: %w", err)
 	}
-	if err := syncFile(f); err != nil {
+	if err := syncSegmentFile(opts.FS, f); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch fsync tmp: %w", err)
 	}
 	if err := simulatePatchCrash(opts, CrashPointPatchTempSynced); err != nil {
@@ -337,16 +345,17 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 	if err := f.Close(); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch close tmp: %w", err)
 	}
+	f = nil
 	if err := beforeSegmentIO(opts.IOFaultInjector, path, IOOpRename); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch rename: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := renameSegmentFile(opts.FS, tmp, path); err != nil {
 		return PatchResult{}, fmt.Errorf("segment: patch rename: %w", err)
 	}
 	if err := simulatePatchCrash(opts, CrashPointPatchRenamed); err != nil {
 		return PatchResult{}, err
 	}
-	if err := syncParentDir(path, opts.IOFaultInjector); err != nil {
+	if err := syncParentDirFS(opts.FS, path, opts.IOFaultInjector); err != nil {
 		return PatchResult{}, err
 	}
 	if err := simulatePatchCrash(opts, CrashPointPatchDirSynced); err != nil {

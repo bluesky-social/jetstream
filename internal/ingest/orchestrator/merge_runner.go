@@ -15,12 +15,14 @@ import (
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 type mergeRunner struct {
 	dst           *ingest.Writer
 	store         *store.Store
 	sourceDir     string
+	fs            vfs.FS
 	logger        *slog.Logger
 	metrics       *Metrics
 	crashInjector crashpoint.Injector
@@ -32,11 +34,12 @@ type mergeRunner struct {
 // simulator (crashpoint.Injector); production callers thread
 // o.cfg.CrashInjector, which is nil in production, making every
 // simulateCrash checkpoint a no-op. Pass nil to disable injection.
-func newMergeRunner(dst *ingest.Writer, st *store.Store, sourceDir string, logger *slog.Logger, m *Metrics, injector crashpoint.Injector) *mergeRunner {
+func newMergeRunner(dst *ingest.Writer, st *store.Store, sourceDir string, fs vfs.FS, logger *slog.Logger, m *Metrics, injector crashpoint.Injector) *mergeRunner {
 	r := &mergeRunner{
 		dst:           dst,
 		store:         st,
 		sourceDir:     sourceDir,
+		fs:            fs,
 		logger:        logger.With(slog.String("component", "orchestrator/merge")),
 		metrics:       m,
 		crashInjector: injector,
@@ -57,7 +60,7 @@ func (r *mergeRunner) run(ctx context.Context) error {
 			return err
 		}
 
-		all, err := ingest.SegmentFiles(r.sourceDir)
+		all, err := ingest.SegmentFilesFS(r.fs, r.sourceDir)
 		if err != nil {
 			return fmt.Errorf("orchestrator: merge: list source segments: %w", err)
 		}
@@ -111,7 +114,7 @@ func (r *mergeRunner) simulateCrash(ctx context.Context, point crashpoint.Point)
 // ordered after a fsync (§5.2).
 func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.SegmentFile) (map[string]string, error) {
 	return obs.Span2(ctx, func(ctx context.Context) (map[string]string, error) {
-		rd, err := segment.Open(segment.ReaderConfig{Path: sf.Path})
+		rd, err := segment.Open(segment.ReaderConfig{Path: sf.Path, FS: r.fs})
 		if err != nil {
 			return nil, fmt.Errorf("orchestrator: merge: open %s: %w", sf.Path, err)
 		}

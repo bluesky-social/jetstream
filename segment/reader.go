@@ -2,9 +2,9 @@ package segment
 
 import (
 	"fmt"
-	"os"
 	"sync/atomic"
 
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/gloom"
 )
 
@@ -12,6 +12,10 @@ import (
 type ReaderConfig struct {
 	// Path is the sealed segment file. Required.
 	Path string
+
+	// FS is the filesystem used for segment I/O. Nil uses the host OS
+	// filesystem.
+	FS vfs.FS
 
 	// SkipChecksum disables the xxh3 verification performed by Open.
 	// The default (false) computes xxh3 over (version..end-of-footer)
@@ -52,7 +56,7 @@ const maxCollectionCountLimit = 1 << 20
 // Close releases the file handle. It is idempotent.
 type Reader struct {
 	path string
-	file *os.File
+	file vfs.File
 
 	header            Header
 	blocks            []BlockInfo
@@ -77,7 +81,7 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 		return nil, fmt.Errorf("%w: ReaderConfig.Path is required", ErrInvalidConfig)
 	}
 
-	f, err := os.OpenFile(cfg.Path, os.O_RDONLY, 0)
+	f, err := openSegmentReadOnly(cfg.FS, cfg.Path)
 	if err != nil {
 		return nil, fmt.Errorf("segment: open %s: %w", cfg.Path, err)
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"time"
 
 	"github.com/jcalabro/gloom"
@@ -142,7 +141,7 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 		w.stickyErr = fmt.Errorf("segment: fsync footer: %w", err)
 		return SealResult{}, w.stickyErr
 	}
-	if err := syncFile(w.file); err != nil {
+	if err := syncSegmentFile(w.cfg.FS, w.file); err != nil {
 		w.stickyErr = fmt.Errorf("segment: fsync footer: %w", err)
 		return SealResult{}, w.stickyErr
 	}
@@ -174,7 +173,7 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 		w.stickyErr = fmt.Errorf("segment: fsync sealed file: %w", err)
 		return SealResult{}, w.stickyErr
 	}
-	if err := syncFile(w.file); err != nil {
+	if err := syncSegmentFile(w.cfg.FS, w.file); err != nil {
 		// Both writes happened but we couldn't confirm durability of
 		// the header. Don't truncate: the bytes may already be durable
 		// and truncating could destroy a valid sealed file. The Reader
@@ -207,7 +206,7 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 // report FileSize. It's "best-effort": a stat error is silently
 // reported as 0 because the seal itself already succeeded.
 func (w *Writer) fileStatAfterClose() (int64, error) {
-	info, err := os.Stat(w.cfg.Path)
+	info, err := statSegmentFile(w.cfg.FS, w.cfg.Path)
 	if err != nil {
 		return 0, err
 	}
@@ -535,10 +534,10 @@ func (w *Writer) activeFileSize() (int64, error) {
 // the parent directory: only the file's contents and size are
 // changing, both inode-attached.
 func (w *Writer) truncateFooterTail(footerOffset int64) error {
-	if err := w.file.Truncate(footerOffset); err != nil {
+	if err := truncateSegmentFile(w.cfg.FS, w.file, footerOffset); err != nil {
 		return fmt.Errorf("segment: truncate footer: %w", err)
 	}
-	if err := syncFile(w.file); err != nil {
+	if err := syncSegmentFile(w.cfg.FS, w.file); err != nil {
 		return fmt.Errorf("segment: fsync truncated file: %w", err)
 	}
 	return nil

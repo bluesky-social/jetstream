@@ -11,6 +11,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 // WalkInput is the parameter bundle for WalkFromCursor.
@@ -31,6 +32,10 @@ type WalkInput struct {
 	// Writer is the ingest writer; the walker reads its active segment's
 	// flushed blocks to extend past the sealed-segment region. Required.
 	Writer *ingest.Writer
+
+	// FS is the filesystem used for segment I/O. Nil uses the host OS
+	// filesystem.
+	FS vfs.FS
 
 	// BlockCache, when non-nil, serves sealed-block decodes through the shared
 	// cache instead of decoding directly. Optional; nil preserves direct decode.
@@ -178,7 +183,7 @@ func walkSealedRegion(ctx context.Context, input WalkInput, start uint64, emit f
 		if !ok {
 			return current, nil
 		}
-		next, err := walkSealedSegment(input.Manifest, bounds, current, input.StopSeq, input.BlockCache, emit)
+		next, err := walkSealedSegment(input.Manifest, input.FS, bounds, current, input.StopSeq, input.BlockCache, emit)
 		if err != nil {
 			return current, err
 		}
@@ -248,7 +253,7 @@ func walkActiveRegion(input WalkInput, start uint64, emit func(*segment.Event) e
 
 	activeIdx := input.Writer.ActiveIndex()
 	activePath := filepath.Join(input.Writer.SegmentsDir(), ingest.SegmentFilename(activeIdx))
-	walkErr := segment.WalkActive(activePath, func(events []segment.Event) error {
+	walkErr := segment.WalkActiveFS(input.FS, activePath, func(events []segment.Event) error {
 		for i := range events {
 			if emitOne(&events[i]) {
 				return errStopWalk
@@ -290,13 +295,13 @@ func decodeSealedBlock(cache *blockCache, segIdx uint64, blockIdx int, r *segmen
 // stable, manifest bounds valid supersets). Block repacking — merging
 // thinned blocks — must migrate this call site (or generation-check
 // the manifest entry) first.
-func walkSealedSegment(m *manifest.Manifest, bounds manifest.SegmentBounds, current uint64, stopSeq uint64, cache *blockCache, emit func(*segment.Event) error) (uint64, error) {
+func walkSealedSegment(m *manifest.Manifest, fs vfs.FS, bounds manifest.SegmentBounds, current uint64, stopSeq uint64, cache *blockCache, emit func(*segment.Event) error) (uint64, error) {
 	blocks, err := m.BlockIndex(bounds.Idx)
 	if err != nil {
 		return current, fmt.Errorf("block index for seg %d: %w", bounds.Idx, err)
 	}
 
-	r, err := segment.Open(segment.ReaderConfig{Path: bounds.Path, SkipChecksum: true})
+	r, err := segment.Open(segment.ReaderConfig{Path: bounds.Path, FS: fs, SkipChecksum: true})
 	if err != nil {
 		return current, fmt.Errorf("open seg %d: %w", bounds.Idx, err)
 	}
@@ -340,6 +345,7 @@ const DefaultBlockCacheBytes = 64 << 20
 type ColdReaderConfig struct {
 	Manifest        *manifest.Manifest
 	WriterRef       *atomic.Pointer[ingest.Writer]
+	FS              vfs.FS
 	BlockCacheBytes int // 0 -> DefaultBlockCacheBytes
 }
 
@@ -353,6 +359,7 @@ type ColdReader struct {
 	manifest  *manifest.Manifest
 	writerRef *atomic.Pointer[ingest.Writer]
 	cache     *blockCache
+	fs        vfs.FS
 }
 
 // NewColdReader returns a ColdReader that serves bounded batches from disk
@@ -368,6 +375,7 @@ func NewColdReader(cfg ColdReaderConfig) *ColdReader {
 		manifest:  cfg.Manifest,
 		writerRef: cfg.WriterRef,
 		cache:     newBlockCache(bytes),
+		fs:        cfg.FS,
 	}
 }
 
@@ -397,6 +405,7 @@ func (r *ColdReader) Read(ctx context.Context, cursor uint64, max int) ([]*Entry
 		StopSeq:    floor,
 		Manifest:   r.manifest,
 		Writer:     w,
+		FS:         r.fs,
 		BlockCache: r.cache,
 	}, func(ev *segment.Event) error {
 		if floor > 0 && ev.Seq >= floor {

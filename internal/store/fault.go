@@ -40,17 +40,12 @@ type FaultInjector interface {
 	BeforeWrite(op WriteOp, keys [][]byte) error
 }
 
-// Option configures a Store at Open time. Kept as a functional option so
-// production (store.Open(dir, metrics)) stays a clean two-argument call and
-// no post-construction setter can race a concurrent writer.
-type Option func(*Store)
-
 // WithFaultInjector installs a test-only write-fault seam. Passing nil is a
 // no-op, so a test can thread an optional injector unconditionally.
 func WithFaultInjector(f FaultInjector) Option {
-	return func(s *Store) {
+	return func(o *openOptions) {
 		if f != nil {
-			s.faults = f
+			o.faults = f
 		}
 	}
 }

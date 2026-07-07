@@ -121,6 +121,7 @@ func Open(cfg Config) (*Consumer, error) {
 
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:           cfg.SegmentsDir,
+		FS:                    cfg.FS,
 		DataDir:               cfg.DataDir,
 		Store:                 cfg.Store,
 		SeqKey:                cfg.SeqKey,

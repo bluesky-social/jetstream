@@ -10,6 +10,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/atmos/streaming"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
@@ -47,6 +48,10 @@ type Config struct {
 	// Once the merge step lands, steady-state callers point this at
 	// "<data-dir>/segments".
 	SegmentsDir string
+
+	// FS is the filesystem used for segment I/O. Nil uses the host OS
+	// filesystem.
+	FS vfs.FS
 
 	// Store is the shared metadata pebble db.
 	Store *store.Store

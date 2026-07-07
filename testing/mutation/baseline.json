@@ -37,6 +37,12 @@
     {"id":"m042_missing_block_arm_discards_siblings","disposition":"KILLED","result":"KILLED@frames","note":"see log"},
     {"id":"m043_account_status_exactness","disposition":"KILLED","result":"KILLED@default","note":"oracle: missing did:plc:jqwkem7rbggmxanbfb7e6gbl app.bsky.feed.like/22an2gcxc6rbz rev="},
     {"id":"m044_flush_write_fault_check_dropped","disposition":"KILLED","result":"KILLED@segmentfault","note":"see log"},
-    {"id":"m045_compaction_rewrite_error_swallowed","disposition":"KILLED","result":"KILLED@segmentfault","note":"see log"}
+    {"id":"m045_compaction_rewrite_error_swallowed","disposition":"KILLED","result":"KILLED@segmentfault","note":"see log"},
+    {"id":"m046_segment_block_fsync_deleted","disposition":"KILLED","result":"KILLED@powerloss","note":"see log"},
+    {"id":"m047_rewrite_parent_dir_fsync_deleted","disposition":"KILLED","result":"KILLED@segmentfault","note":"see log"},
+    {"id":"m048_patch_parent_dir_fsync_deleted","disposition":"KILLED","result":"KILLED@segmentfault","note":"see log"},
+    {"id":"m049_ingest_flush_order_inverted","disposition":"KILLED","result":"KILLED@powerloss","note":"see log"},
+    {"id":"m050_store_syncwrites_linux_nosync","disposition":"KILLED","result":"KILLED@powerloss","note":"see log"},
+    {"id":"m051_merge_cleanup_dir_fsync_deleted","disposition":"KILLED","result":"KILLED@powerloss","note":"see log"}
   ]
 }

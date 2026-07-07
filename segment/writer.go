@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
+
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 const (
@@ -34,6 +34,11 @@ var segmentMagic = []byte("jss0")
 type Config struct {
 	// Path is the segment file to write. Required.
 	Path string
+
+	// FS is the filesystem used for segment I/O. Nil uses the host OS
+	// filesystem. Tests may pass a strict in-memory vfs.FS to model
+	// written-vs-synced state.
+	FS vfs.FS
 
 	// MaxEventsPerBlock triggers a "block full" signal from Append.
 	// Default DefaultMaxEventsPerBlock. Must be >= 1.
@@ -68,7 +73,7 @@ func (c Config) validate() error {
 // safe for concurrent use; the caller serializes access.
 type Writer struct {
 	cfg     Config
-	file    *os.File
+	file    vfs.File
 	pending pendingBlock
 	closed  bool
 
@@ -145,7 +150,7 @@ func New(cfg Config) (*Writer, error) {
 	// Open-or-create. We want O_RDWR because we both read the magic
 	// from offset 0 (when the file pre-existed) and append new
 	// blocks at end-of-file.
-	f, err := os.OpenFile(cfg.Path, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := openSegmentReadWrite(cfg.FS, cfg.Path)
 	if err != nil {
 		return nil, fmt.Errorf("segment: open %s: %w", cfg.Path, err)
 	}
@@ -168,7 +173,7 @@ func New(cfg Config) (*Writer, error) {
 			// permanent recovery wedge (resume and the manifest loader both
 			// reject it as corrupt on every subsequent boot). Nothing durable
 			// is lost — the file never held a byte of data.
-			_ = os.Remove(cfg.Path)
+			_ = removeSegmentFile(cfg.FS, cfg.Path)
 			return nil, err
 		}
 		// On POSIX filesystems, the directory entry that names a freshly
@@ -177,11 +182,11 @@ func New(cfg Config) (*Writer, error) {
 		// can drop the entire segment file even though we fsynced its
 		// contents — violating the "no data loss" invariant in §2 of
 		// the spec.
-		if err := syncParentDir(cfg.Path, cfg.IOFaultInjector); err != nil {
+		if err := syncParentDirFS(cfg.FS, cfg.Path, cfg.IOFaultInjector); err != nil {
 			return nil, err
 		}
 	} else {
-		if err := resumeExistingSegment(f, info.Size(), cfg.Path); err != nil {
+		if err := resumeExistingSegment(cfg.FS, f, info.Size(), cfg.Path); err != nil {
 			return nil, err
 		}
 	}
@@ -208,48 +213,27 @@ func New(cfg Config) (*Writer, error) {
 	return w, nil
 }
 
-// syncParentDir opens and fsyncs the parent directory of path so
-// the dirent for a freshly-created or truncated file is durable.
-// On filesystems where this is a no-op (e.g. some Windows configs)
-// the call is still cheap.
-func syncParentDir(path string, faults IOFaultInjector) error {
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return fmt.Errorf("segment: open parent dir: %w", err)
-	}
-	defer func() { _ = dir.Close() }()
-	if faults != nil {
-		if err := faults.BeforeSegmentIO(path, IOOpSync); err != nil {
-			return fmt.Errorf("segment: fsync parent dir: %w", err)
-		}
-	}
-	if err := syncFile(dir); err != nil {
-		return fmt.Errorf("segment: fsync parent dir: %w", err)
-	}
-	return nil
-}
-
 // initializeNewSegment writes the fixed reserved header to a
 // brand-new (zero-length) segment file and fsyncs it. The header
 // is segmentMagic followed by enough zero-filled padding to reach
 // ReservedHeaderBytes total. The returned error is already wrapped
 // for the caller; the caller is responsible for closing f on
 // failure.
-func initializeNewSegment(f *os.File, cfg Config) error {
+func initializeNewSegment(f vfs.File, cfg Config) error {
 	header := make([]byte, ReservedHeaderBytes)
 	copy(header, segmentMagic)
 
 	if err := cfg.beforeIO(IOOpWrite); err != nil {
 		return fmt.Errorf("segment: write header: %w", err)
 	}
-	if _, err := f.Write(header); err != nil {
+	if _, err := f.WriteAt(header, 0); err != nil {
 		return fmt.Errorf("segment: write header: %w", err)
 	}
 
 	if err := cfg.beforeIO(IOOpSync); err != nil {
 		return fmt.Errorf("segment: fsync header: %w", err)
 	}
-	if err := syncFile(f); err != nil {
+	if err := syncSegmentFile(cfg.FS, f); err != nil {
 		return fmt.Errorf("segment: fsync header: %w", err)
 	}
 
@@ -268,7 +252,7 @@ func (c Config) beforeIO(op IOOp) error {
 // recovery walker would interpret as a malformed block, masking
 // everything after it. The caller is responsible for closing f on
 // failure.
-func resumeExistingSegment(f *os.File, size int64, path string) error {
+func resumeExistingSegment(fs vfs.FS, f vfs.File, size int64, path string) error {
 	if size < ReservedHeaderBytes {
 		return fmt.Errorf("%w: %s is %d bytes",
 			ErrCorruptSegment, path, size)
@@ -300,7 +284,7 @@ func resumeExistingSegment(f *os.File, size int64, path string) error {
 		return err
 	}
 	if end < size {
-		if err := f.Truncate(end); err != nil {
+		if err := truncateSegmentFile(fs, f, end); err != nil {
 			return fmt.Errorf("segment: truncate torn tail: %w", err)
 		}
 		// fsync the truncate so a second crash before any further
@@ -308,12 +292,9 @@ func resumeExistingSegment(f *os.File, size int64, path string) error {
 		// (size) lives in the inode, so file Sync is the right scope
 		// here; we don't need a directory fsync because the dirent
 		// already exists.
-		if err := syncFile(f); err != nil {
+		if err := syncSegmentFile(fs, f); err != nil {
 			return fmt.Errorf("segment: fsync truncate: %w", err)
 		}
-	}
-	if _, err := f.Seek(end, io.SeekStart); err != nil {
-		return fmt.Errorf("segment: seek end: %w", err)
 	}
 	return nil
 }
@@ -332,7 +313,7 @@ func resumeExistingSegment(f *os.File, size int64, path string) error {
 // zstd payload was corrupted in flight is left in place — the
 // reader path is responsible for surfacing that as decode errors.
 // This keeps recovery O(blocks) rather than O(uncompressed bytes).
-func lastGoodOffset(f *os.File, size int64) (int64, error) {
+func lastGoodOffset(f io.ReaderAt, size int64) (int64, error) {
 	off := int64(ReservedHeaderBytes)
 	var lenBuf [8]byte
 	for off < size {
@@ -556,7 +537,7 @@ func (w *Writer) flushLocked() error {
 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 		return w.stickyErr
 	}
-	if _, err := w.file.Write(w.wireScratch); err != nil {
+	if _, err := w.file.WriteAt(w.wireScratch, int64(w.nextBlockOffset)); err != nil {
 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 		return w.stickyErr
 	}
@@ -584,7 +565,7 @@ func (w *Writer) flushLocked() error {
 		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
 		return w.stickyErr
 	}
-	if err := syncFile(w.file); err != nil {
+	if err := syncSegmentFile(w.cfg.FS, w.file); err != nil {
 		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
 		return w.stickyErr
 	}
@@ -674,7 +655,7 @@ func (w *Writer) commitPreparedFlushLocked(prepared *PreparedBlock, wire []byte)
 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 		return w.stickyErr
 	}
-	if _, err := w.file.Write(wire); err != nil {
+	if _, err := w.file.WriteAt(wire, int64(w.nextBlockOffset)); err != nil {
 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 		return w.stickyErr
 	}
@@ -688,7 +669,7 @@ func (w *Writer) commitPreparedFlushLocked(prepared *PreparedBlock, wire []byte)
 		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
 		return w.stickyErr
 	}
-	if err := syncFile(w.file); err != nil {
+	if err := syncSegmentFile(w.cfg.FS, w.file); err != nil {
 		w.stickyErr = fmt.Errorf("segment: fsync block: %w", err)
 		return w.stickyErr
 	}

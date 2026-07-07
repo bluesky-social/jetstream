@@ -1,0 +1,30 @@
+mutant: m047_rewrite_parent_dir_fsync_deleted
+target: segment/rewrite.go
+failure-mode: |
+  segment.Rewrite fsyncs the temporary replacement file and renames it over the
+  sealed segment, but skips the parent directory fsync that makes the rename
+  durable. A power loss after the caller advances compaction/seq can recover
+  the old segment while metadata claims the rewrite is complete.
+expected-detection: |
+  Killed by the segmentfault tier's TestRewriteIOFaultSweep, whose fault-free
+  reference run asserts Rewrite consults exactly three sync seams: new-segment
+  initialization, temporary-file fsync, and parent-directory fsync. The oracle
+  durable-order checker is a second backstop when default lifecycle compaction
+  rewrites a segment and later commits compaction/seq.
+expected-tier: segmentfault
+tiers: segmentfault,default
+
+diff --git a/segment/rewrite.go b/segment/rewrite.go
+index 610d7d4..a0ff2fe 100644
+--- a/segment/rewrite.go
++++ b/segment/rewrite.go
+@@ -226,9 +226,6 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions)
+ 	if err := simulateRewriteCrash(opts, CrashPointRewriteRenamed); err != nil {
+ 		return RewriteResult{}, err
+ 	}
+-	if err := syncParentDirFS(opts.FS, path, opts.IOFaultInjector); err != nil {
+-		return RewriteResult{}, err
+-	}
+ 	if err := simulateRewriteCrash(opts, CrashPointRewriteDirSynced); err != nil {
+ 		return RewriteResult{}, err
+ 	}

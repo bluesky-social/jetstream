@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -70,6 +72,229 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 	return w
+}
+
+type durableOrderRecorder struct {
+	mu  sync.Mutex
+	ops []string
+}
+
+func (r *durableOrderRecorder) add(op string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ops = append(r.ops, op)
+}
+
+func (r *durableOrderRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.ops...)
+}
+
+type seqCommitRecorder struct {
+	rec *durableOrderRecorder
+}
+
+func (r seqCommitRecorder) BeforeWrite(op store.WriteOp, keys [][]byte) error {
+	if op != store.WriteOpBatchCommit {
+		return nil
+	}
+	for _, key := range keys {
+		if string(key) == seqNextKey {
+			r.rec.add("store-seq-commit")
+			break
+		}
+	}
+	return nil
+}
+
+// TestMkdirAllFSSyncsParentDir guards the durability fsync in mkdirAllFS:
+// after creating a directory it must fsync the parent so the new dirent
+// survives power loss. The regression this pins is a guard that fsynced only
+// under an injected FS and skipped it on the production (nil FS → vfs.Default)
+// path — nothing else ever syncs SegmentsDir's parent, so a fresh segments
+// dir could be orphaned by a crash. We assert the sync happens on the resolved
+// filesystem for every caller, injected or not.
+func TestMkdirAllFSSyncsParentDir(t *testing.T) {
+	t.Parallel()
+
+	baseFS := vfs.NewStrictMem()
+	require.NoError(t, baseFS.MkdirAll("/data", 0o755))
+	syncStrictTestDir(t, baseFS, "/")
+
+	synced := recordSyncedDirs(t, baseFS, func(fs vfs.FS) {
+		require.NoError(t, mkdirAllFS(fs, "/data/segments", 0o755))
+	})
+	require.Contains(t, synced, "/data", "mkdirAllFS must fsync the parent of the created dir")
+}
+
+// TestMkdirAllSyncedFSSyncsEveryNewParent pins the multi-level durability
+// contract: MkdirAll creating several nested dirents needs a parent fsync per
+// new dirent, not just the leaf's. Syncing only the leaf's parent leaves the
+// intermediate entries vulnerable to power-loss rollback, orphaning the synced
+// deeper tree. Here /data pre-exists and /data/a/b/c is created fresh, so the
+// parents of a, b, and c (/data, /data/a, /data/a/b) must all be fsynced.
+func TestMkdirAllSyncedFSSyncsEveryNewParent(t *testing.T) {
+	t.Parallel()
+
+	baseFS := vfs.NewStrictMem()
+	require.NoError(t, baseFS.MkdirAll("/data", 0o755))
+	syncStrictTestDir(t, baseFS, "/")
+
+	synced := recordSyncedDirs(t, baseFS, func(fs vfs.FS) {
+		require.NoError(t, MkdirAllSyncedFS(fs, "/data/a/b/c", 0o755, "test"))
+	})
+	for _, parent := range []string{"/data", "/data/a", "/data/a/b"} {
+		require.Contains(t, synced, parent,
+			"MkdirAllSyncedFS must fsync the parent of every newly-created dir")
+	}
+}
+
+// recordSyncedDirs runs fn against a logging wrapper over baseFS and returns
+// the paths of every directory sync it observed.
+func recordSyncedDirs(t *testing.T, baseFS *vfs.MemFS, fn func(vfs.FS)) []string {
+	t.Helper()
+	var synced []string
+	fs := vfs.WithLogging(baseFS, func(format string, args ...any) {
+		if format == "sync: %s" {
+			if path, ok := args[0].(string); ok {
+				synced = append(synced, path)
+			}
+		}
+	})
+	fn(fs)
+	return synced
+}
+
+func TestWriterFlushOrdersSegmentSyncBeforeStoreCommit(t *testing.T) {
+	t.Parallel()
+
+	baseFS := vfs.NewStrictMem()
+	dataDir := "/data"
+	segmentsDir := "/data/segments"
+	require.NoError(t, baseFS.MkdirAll(dataDir, 0o755))
+	syncStrictTestDir(t, baseFS, "/")
+
+	rec := &durableOrderRecorder{}
+	fs := vfs.WithLogging(baseFS, func(format string, args ...any) {
+		switch format {
+		case "write-at(%d, %d): %s":
+			offset, ok := args[0].(int64)
+			if ok && offset >= int64(segment.ReservedHeaderBytes) {
+				if path, ok := args[2].(string); ok && strings.Contains(path, ".jss") {
+					rec.add("segment-data-write")
+				}
+			}
+		case "sync: %s":
+			if path, ok := args[0].(string); ok && strings.Contains(path, ".jss") {
+				rec.add("segment-sync")
+			}
+		}
+	})
+
+	st, err := store.Open(dataDir, nil,
+		store.WithFS(fs),
+		store.WithFaultInjector(seqCommitRecorder{rec: rec}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	w, err := Open(Config{
+		DataDir:           dataDir,
+		SegmentsDir:       segmentsDir,
+		FS:                fs,
+		Store:             st,
+		MaxEventsPerBlock: 1,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	ev := segment.Event{Kind: segment.KindCreate, DID: "did:plc:order"}
+	require.NoError(t, w.Append(t.Context(), &ev))
+
+	ops := rec.snapshot()
+	storeCommit := slices.Index(ops, "store-seq-commit")
+	require.NotEqual(t, -1, storeCommit, "expected seq/next commit in op stream: %v", ops)
+	dataWrite := slices.Index(ops, "segment-data-write")
+	require.NotEqual(t, -1, dataWrite, "expected segment data write in op stream: %v", ops)
+	syncAfterWrite := slices.Index(ops[dataWrite:storeCommit], "segment-sync")
+	require.NotEqual(t, -1, syncAfterWrite, "segment data fsync must happen after block write and before seq/next commit: %v", ops)
+}
+
+func TestWriterStrictMemPowerLossDropsUnsyncedSegmentAndStoreState(t *testing.T) {
+	t.Parallel()
+
+	fs := vfs.NewStrictMem()
+	dataDir := "/data"
+	segmentsDir := "/data/segments"
+	require.NoError(t, fs.MkdirAll(dataDir, 0o755))
+	syncStrictTestDir(t, fs, "/")
+
+	st, err := store.Open(dataDir, nil, store.WithFS(fs))
+	require.NoError(t, err)
+	w, err := Open(Config{
+		DataDir:           dataDir,
+		SegmentsDir:       segmentsDir,
+		FS:                fs,
+		Store:             st,
+		MaxEventsPerBlock: 1,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	first := segment.Event{Kind: segment.KindCreate, DID: "did:plc:first"}
+	require.NoError(t, w.Append(t.Context(), &first))
+	require.Equal(t, uint64(1), first.Seq)
+	require.Equal(t, []uint64{1}, collectActiveSeqs(t, fs, filepath.Join(segmentsDir, SegmentFilename(0))))
+
+	fs.SetIgnoreSyncs(true)
+	second := segment.Event{Kind: segment.KindCreate, DID: "did:plc:second"}
+	require.NoError(t, w.Append(t.Context(), &second))
+	require.Equal(t, uint64(2), second.Seq)
+	require.NoError(t, w.Close())
+	require.NoError(t, st.Close())
+
+	fs.ResetToSyncedState()
+	fs.SetIgnoreSyncs(false)
+	require.Equal(t, []uint64{1}, collectActiveSeqs(t, fs, filepath.Join(segmentsDir, SegmentFilename(0))))
+
+	st, err = store.Open(dataDir, nil, store.WithFS(fs))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	w, err = Open(Config{
+		DataDir:           dataDir,
+		SegmentsDir:       segmentsDir,
+		FS:                fs,
+		Store:             st,
+		MaxEventsPerBlock: 1,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, w.Close()) })
+	require.Equal(t, uint64(2), w.NextSeq())
+
+	require.Equal(t, []uint64{1}, collectActiveSeqs(t, fs, filepath.Join(segmentsDir, SegmentFilename(0))))
+}
+
+func collectActiveSeqs(t *testing.T, fs vfs.FS, path string) []uint64 {
+	t.Helper()
+	var got []uint64
+	require.NoError(t, segment.WalkActiveFS(fs, path, func(events []segment.Event) error {
+		for i := range events {
+			got = append(got, events[i].Seq)
+		}
+		return nil
+	}))
+	return got
+}
+
+func syncStrictTestDir(t *testing.T, fs *vfs.MemFS, dir string) {
+	t.Helper()
+	f, err := fs.OpenDir(dir)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
 }
 
 type segmentIOFault struct {

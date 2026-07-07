@@ -4,7 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"os"
+
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 // ScanMaxSeq returns the maximum Seq value across all fully-durable
@@ -25,7 +26,12 @@ import (
 // ErrSegmentSealed if the file is sealed; sealed-file readers should
 // use Reader instead.
 func ScanMaxSeq(path string) (maxSeq uint64, found bool, err error) {
-	f, err := os.Open(path)
+	return ScanMaxSeqFS(nil, path)
+}
+
+// ScanMaxSeqFS is ScanMaxSeq against fs. Nil fs uses the host OS filesystem.
+func ScanMaxSeqFS(fs vfs.FS, path string) (maxSeq uint64, found bool, err error) {
+	f, err := openSegmentReadOnly(fs, path)
 	if err != nil {
 		return 0, false, fmt.Errorf("segment: scan open %s: %w", path, err)
 	}
@@ -103,7 +109,12 @@ func ScanMaxSeq(path string) (maxSeq uint64, found bool, err error) {
 // Halts on the first error returned from fn. Returns os.PathError
 // (so os.IsNotExist works) if path does not exist.
 func WalkActive(path string, fn func([]Event) error) error {
-	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	return WalkActiveFS(nil, path, fn)
+}
+
+// WalkActiveFS is WalkActive against fs. Nil fs uses the host OS filesystem.
+func WalkActiveFS(fs vfs.FS, path string, fn func([]Event) error) error {
+	f, err := openSegmentReadOnly(fs, path)
 	if err != nil {
 		return err // pass through os.PathError; caller may errors.Is
 	}

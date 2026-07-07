@@ -4,17 +4,24 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/errors/oserror"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 // ObserveSegments reads every event from the primary segment directory under
 // dataDir in physical order.
 func ObserveSegments(dataDir string) ([]ObservedEvent, error) {
-	return observeSegmentDir(filepath.Join(dataDir, "segments"), false)
+	return ObserveSegmentsFS(nil, dataDir)
+}
+
+// ObserveSegmentsFS is ObserveSegments against fs. Nil uses the host OS
+// filesystem.
+func ObserveSegmentsFS(fs vfs.FS, dataDir string) ([]ObservedEvent, error) {
+	return observeSegmentDirFS(fs, oracleFS(fs).PathJoin(dataDir, "segments"), false)
 }
 
 // ObserveSealedSegments reads every event from the primary segment directory
@@ -24,14 +31,27 @@ func ObserveSegments(dataDir string) ([]ObservedEvent, error) {
 // segment only holds rows above the latest sealed watermark, which such callers
 // filter out anyway.
 func ObserveSealedSegments(dataDir string) ([]ObservedEvent, error) {
-	return observeSegmentDir(filepath.Join(dataDir, "segments"), true)
+	return ObserveSealedSegmentsFS(nil, dataDir)
+}
+
+// ObserveSealedSegmentsFS is ObserveSealedSegments against fs. Nil uses the
+// host OS filesystem.
+func ObserveSealedSegmentsFS(fs vfs.FS, dataDir string) ([]ObservedEvent, error) {
+	return observeSegmentDirFS(fs, oracleFS(fs).PathJoin(dataDir, "segments"), true)
 }
 
 // ObserveBootstrapSegments reads the primary segments followed by the bootstrap
 // live segments, checking invariants on each source before returning them
 // sorted by seq. A missing live-segments directory yields just the primary events.
 func ObserveBootstrapSegments(dataDir string) ([]ObservedEvent, error) {
-	primary, err := observeSegmentDir(filepath.Join(dataDir, "segments"), false)
+	return ObserveBootstrapSegmentsFS(nil, dataDir)
+}
+
+// ObserveBootstrapSegmentsFS is ObserveBootstrapSegments against fs. Nil uses
+// the host OS filesystem.
+func ObserveBootstrapSegmentsFS(fs vfs.FS, dataDir string) ([]ObservedEvent, error) {
+	sfs := oracleFS(fs)
+	primary, err := observeSegmentDirFS(fs, sfs.PathJoin(dataDir, "segments"), false)
 	if err != nil {
 		return nil, err
 	}
@@ -39,9 +59,9 @@ func ObserveBootstrapSegments(dataDir string) ([]ObservedEvent, error) {
 		return nil, fmt.Errorf("primary segments: %w", err)
 	}
 
-	live, err := observeSegmentDir(filepath.Join(dataDir, "backfill", "live_segments"), false)
+	live, err := observeSegmentDirFS(fs, sfs.PathJoin(dataDir, "backfill", "live_segments"), false)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if isOracleNotExist(err) {
 			return EventsSortedBySeq(primary), nil
 		}
 		return nil, err
@@ -56,15 +76,15 @@ func ObserveBootstrapSegments(dataDir string) ([]ObservedEvent, error) {
 	return out, nil
 }
 
-func observeSegmentDir(dir string, sealedOnly bool) ([]ObservedEvent, error) {
-	files, err := ingest.SegmentFiles(dir)
+func observeSegmentDirFS(fs vfs.FS, dir string, sealedOnly bool) ([]ObservedEvent, error) {
+	files, err := ingest.SegmentFilesFS(fs, dir)
 	if err != nil {
 		return nil, err
 	}
 
 	var out []ObservedEvent
 	for _, file := range files {
-		events, err := observeSealedSegment(file.Path)
+		events, err := observeSealedSegmentFS(fs, file.Path)
 		if err == nil {
 			out = append(out, events...)
 			continue
@@ -76,7 +96,7 @@ func observeSegmentDir(dir string, sealedOnly bool) ([]ObservedEvent, error) {
 			continue
 		}
 
-		events, err = observeActiveSegment(file.Path)
+		events, err = observeActiveSegmentFS(fs, file.Path)
 		if err != nil {
 			return nil, err
 		}
@@ -108,7 +128,11 @@ func sortObservedEventsBySeq(events []ObservedEvent) {
 }
 
 func observeSealedSegment(path string) ([]ObservedEvent, error) {
-	rd, err := segment.Open(segment.ReaderConfig{Path: path})
+	return observeSealedSegmentFS(nil, path)
+}
+
+func observeSealedSegmentFS(fs vfs.FS, path string) ([]ObservedEvent, error) {
+	rd, err := segment.Open(segment.ReaderConfig{Path: path, FS: fs})
 	if err != nil {
 		return nil, err
 	}
@@ -179,9 +203,9 @@ func checkSegmentStructure(path string, header segment.Header, blocks []segment.
 	return nil
 }
 
-func observeActiveSegment(path string) ([]ObservedEvent, error) {
+func observeActiveSegmentFS(fs vfs.FS, path string) ([]ObservedEvent, error) {
 	var out []ObservedEvent
-	err := segment.WalkActive(path, func(block []segment.Event) error {
+	err := segment.WalkActiveFS(fs, path, func(block []segment.Event) error {
 		for _, ev := range block {
 			out = append(out, observedEventFromSegment(ev))
 		}
@@ -191,6 +215,17 @@ func observeActiveSegment(path string) ([]ObservedEvent, error) {
 		return nil, fmt.Errorf("oracle: walk active segment %s: %w", path, err)
 	}
 	return out, nil
+}
+
+func oracleFS(fs vfs.FS) vfs.FS {
+	if fs == nil {
+		return vfs.Default
+	}
+	return fs
+}
+
+func isOracleNotExist(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || oserror.IsNotExist(err)
 }
 
 func observedEventFromSegment(ev segment.Event) ObservedEvent {

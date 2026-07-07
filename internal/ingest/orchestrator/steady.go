@@ -56,6 +56,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 		c, err := live.Open(live.Config{
 			DataDir:     o.cfg.DataDir,
 			SegmentsDir: segmentsDir,
+			FS:          o.cfg.FS,
 			Store:       o.cfg.Store,
 			SeqKey:      live.SteadySeqKey,
 			CursorKey:   live.CursorKey,

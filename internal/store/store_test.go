@@ -2,10 +2,12 @@ package store_test
 
 import (
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
@@ -50,6 +52,48 @@ func TestStore_RoundTripViaEmbeddedDB(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = closer.Close() })
 	require.Equal(t, "world", string(val))
+}
+
+func TestOpen_StrictMemDropsUnsyncedWrites(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "darwin" {
+		t.Skip("store.SyncWrites intentionally maps to pebble.NoSync on darwin")
+	}
+
+	fs := vfs.NewStrictMem()
+	dataDir := "/data"
+	require.NoError(t, fs.MkdirAll(dataDir, 0o755))
+	syncStrictTestDir(t, fs, "/")
+
+	s, err := store.Open(dataDir, nil, store.WithFS(fs))
+	require.NoError(t, err)
+	require.NoError(t, s.Set([]byte("synced"), []byte("yes"), store.SyncWrites))
+	require.NoError(t, s.Set([]byte("unsynced"), []byte("no"), pebble.NoSync))
+
+	fs.SetIgnoreSyncs(true)
+	require.NoError(t, s.Close())
+	fs.ResetToSyncedState()
+	fs.SetIgnoreSyncs(false)
+
+	s, err = store.Open(dataDir, nil, store.WithFS(fs))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	val, closer, err := s.Get([]byte("synced"))
+	require.NoError(t, err)
+	require.Equal(t, "yes", string(val))
+	require.NoError(t, closer.Close())
+
+	_, _, err = s.Get([]byte("unsynced"))
+	require.ErrorIs(t, err, store.ErrNotFound)
+}
+
+func syncStrictTestDir(t *testing.T, fs *vfs.MemFS, dir string) {
+	t.Helper()
+	f, err := fs.OpenDir(dir)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
 }
 
 // TestStore_CloseIsIdempotent guards the documented contract; the

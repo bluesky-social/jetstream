@@ -9,6 +9,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 // CursorSeqMaxThreshold splits the v2 seq cursor namespace from the
@@ -70,6 +71,10 @@ type CursorEnv struct {
 	// equivalent to "no sealed segments yet": floor is 0; timestamp
 	// mode falls through to the active segment.
 	Manifest *manifest.Manifest
+
+	// FS is the filesystem used for segment I/O. Nil uses the host OS
+	// filesystem.
+	FS vfs.FS
 
 	// NextSeq is the writer's next-to-be-allocated seq value. A
 	// requested cursor >= NextSeq drops into ModeLive (future cursor).
@@ -295,7 +300,7 @@ func translateTimeUSToSeq(env CursorEnv, timeUS int64) (uint64, bool, error) {
 		return candidate.MinSeq, false, nil
 	}
 
-	r, err := segment.Open(segment.ReaderConfig{Path: candidate.Path, SkipChecksum: true})
+	r, err := segment.Open(segment.ReaderConfig{Path: candidate.Path, FS: env.FS, SkipChecksum: true})
 	if err != nil {
 		return 0, false, fmt.Errorf("open seg %d: %w", candidate.Idx, err)
 	}
