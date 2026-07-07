@@ -207,7 +207,9 @@ The default lifecycle also installs a durable-operation recorder: segment operat
 
 Mutation coverage for this tier is catalogued as m046-m050: block fsync deletion, Rewrite parent-dir fsync deletion, Patch parent-dir fsync deletion, inverted ingest flush ordering, and Linux `store.SyncWrites` downgraded to `pebble.NoSync`. The `powerloss` mutation tier runs the strict-mem and operation-order tests; Rewrite/Patch parent-dir fsync omissions are also covered by the existing `segmentfault` seam-count sweeps.
 
-Future extensions should drive the full runtime in-process with `jetstreamd.Options.StorageFS`, reset the shared strict FS at enumerated crashpoints, and then reuse the FS-aware segment observers. Keep the real filesystem restart tier in place; the strict tier models power loss, not process isolation, OS locks, or syscall-boundary behavior.
+`TestOracle_PowerLossCrashPointsStrictMem` drives the full runtime in-process with `jetstreamd.Options.StorageFS`, resets the shared strict FS at the first set of enumerated lifecycle crashpoints, reopens the runtime, and reuses the FS-aware segment observers to prove convergence. Current runtime-level coverage spans repo completion, bootstrap-live close before seal, merge destination flush before source cursor commit, merge destination seal before discovery, and merge discovery before cleanup.
+
+Future extensions should cover the remaining steady-state, compaction-rewrite, patch/import, and seeded random power-loss points through the same harness. Keep the real filesystem restart tier in place; the strict tier models power loss, not process isolation, OS locks, or syscall-boundary behavior.
 
 ### Store-Fault Tier
 
