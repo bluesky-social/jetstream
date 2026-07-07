@@ -138,9 +138,9 @@ endpoints, then drives lifecycle phases:
 - shutdown and restart scenarios.
 
 The driver uses phase gates, durable append callbacks, sequence acknowledgers,
-and subprocess crash harnesses. These are not decorations: they are how the
-oracle avoids relying on sleeps as success criteria and how it proves that
-data reached durable surfaces before assertions run.
+and subprocess crash harnesses. These matter: they are how the oracle avoids
+relying on sleeps as success criteria, and how it proves data reached durable
+surfaces before assertions run.
 
 ### Observers
 
@@ -341,7 +341,7 @@ while final state still converges. `m025` was retired when its
 no longer reach the above-watermark over-drop it modelled). #183's re-derivation
 analysis concluded that NO single-edit mutant can uniquely trip the recorder
 under the windowed-fold architecture: the pass folds its tombstones from the
-exact on-disk window it compacts (so every genuinely-folded drop is also
+exact on-disk window it compacts (so every legitimately-folded drop is also
 approved by the recorder's identically-bounded filter — invisible to it), and
 the only edits that manufacture a filter-illegal drop (seq-comparison or
 seq-value corruption, whose sole new victim is the self-superseding update row)
@@ -373,31 +373,33 @@ log bounded diagnostics, and continue running.
 
 The adversarial ingest-gate modes (#204) set the tier's conventions:
 
-- **The world lies through the honest pipeline, not around it.** Op-path lies
-  enter via raw `mst.Tree.Insert` (bypassing `repo.Create` validation) inside
-  otherwise-real signed commits, so atmos's verifier — which checks MST
-  consistency, not spec validity — passes them through to the ingest gate.
-  Rev lies are signed into the inner commit. A lie the verifier would reject
-  structurally proves nothing about the gate.
-- **Layer ownership is explicit.** Each case is asserted at the layer that
-  owns it: gate-owned cases assert the labeled reason on
-  `jetstream_ingest_dropped_events_total`; verifier-owned cases (non-TID /
-  future / regressing #commit revs) assert rejection or resync repair with no
-  bad archive. `internal/simulator/world/adversarial.go` documents which lies
-  land where; the wire itself blocks one class (invalid UTF-8 cannot ride a
-  live op.Path — CBOR text strings reject it — so it is backfill-only).
-- **Every lie is ledgered.** `world.AdversarialLedger` records each lie at
-  generation time; the oracle filters expected event logs, final-state ground
-  truth, and cursor-gap accounting through it (one-directional-safe: a
-  wrongly-archived lie still fails compares as an extra). Anti-vacuity is
-  per-layer: gate-owned lies assert per-(source, reason) drop-counter floors
-  (`ExpectedDropFloors` skips verifier-layer entries — they never reach the
-  gate counter); verifier-owned lies prove they fired through their own
-  observable (the awaited resync-repair tombstone).
-- **Honest traffic must not touch lie records** (`pickUntouchedRecord` skips
-  ledgered keys): an honest mutation of an unrepresentable-but-spec-valid
-  record would be gate-dropped as an unledgered event and corrupt the
-  cursor accounting.
+- **Bad records go through the real pipeline, not around it.** A malformed op
+  path enters via raw `mst.Tree.Insert` (bypassing `repo.Create` validation)
+  inside an otherwise-real signed commit, so atmos's verifier — which checks
+  MST consistency, not spec validity — passes it through to the ingest gate. A
+  malformed rev is signed into the inner commit. If the verifier would reject a
+  record on structure alone, feeding it in proves nothing about the gate, so we
+  don't.
+- **Each case is asserted at the layer that owns it.** Gate-owned cases assert
+  the labeled reason on `jetstream_ingest_dropped_events_total`; verifier-owned
+  cases (non-TID, future, or regressing #commit revs) assert rejection or
+  resync repair with no bad data reaching the archive.
+  `internal/simulator/world/adversarial.go` documents which cases land where.
+  One class is blocked by the wire itself: invalid UTF-8 can't ride a live
+  op.Path because CBOR text strings reject it, so that case is backfill-only.
+- **Every injected record is tracked in a ledger.**
+  `world.AdversarialLedger` records each one at generation time, and the oracle
+  filters expected event logs, final-state ground truth, and cursor-gap
+  accounting through it. This is safe in one direction: a record that was
+  wrongly archived still shows up as an extra and fails the compare. Anti-vacuity
+  is per-layer — gate-owned cases assert per-(source, reason) drop-counter
+  floors (`ExpectedDropFloors` skips verifier-layer entries, since those never
+  reach the gate counter), and verifier-owned cases prove they fired through
+  their own observable (the awaited resync-repair tombstone).
+- **Normal traffic must not touch the injected records** (`pickUntouchedRecord`
+  skips keys already in the ledger): a normal mutation of an
+  unrepresentable-but-spec-valid record would be gate-dropped as an untracked
+  event and throw off the cursor accounting.
 
 ### Real-Data Corpus Tier
 
