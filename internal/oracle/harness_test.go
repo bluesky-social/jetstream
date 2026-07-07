@@ -4,14 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"os"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -182,11 +179,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	bootstrapEventLog := newEventLogRecorder()
 	steadyEventLog := newEventLogRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
-	netNewOracle := cfg.Mode == "fast"
 	failedRepoRetryInterval := time.Hour
-	if netNewOracle {
-		failedRepoRetryInterval = time.Millisecond
-	}
 	emittedBootstrapAccountDelete := false
 	emittedBootstrapIdentity := false
 	bootstrapTraffic := newBootstrapTrafficGenerator(cfg.Accounts, cfg.LiveEventsBootstrap, bootstrapAck, oracleWaitTimeout(cfg), func(ctx context.Context) (int64, error) {
@@ -229,8 +222,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	// The runtime's public surface is served over a pipe-backed listener; the
 	// observer tier (client backfill, typed backfill) reaches it through this
 	// listener's in-process client. Debug listener likewise — its client is
-	// how the harness scrapes /metrics (first metric-based oracle assert,
-	// #202's enqueuer gate).
+	// how the harness scrapes /metrics.
 	runtimePublicLn := newPipeListener()
 	runtimeDebugLn := newPipeListener()
 	obsClient := runtimePublicLn.httpClient()
@@ -259,14 +251,9 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		// per-seed timeout budget even at stress scale.
 		BackfillRetryBaseDelay: time.Millisecond,
 		LiveReconnectBackoff:   liveReconnectBackoff,
-		// Activate the net-new DID enqueuer (issue #188 wiring) inside the
-		// bubble so the malformed-DID #identity injection exercises the
-		// LiveEnqueuer's validation gate end-to-end (#202). Fast-mode oracle
-		// lowers the retry cadence so issue #207's hidden-account injection
-		// also proves a valid net-new DID reaches pending state and is
-		// backfilled inside the same synctest bubble; stress keeps the
-		// production-like hour cadence so ordinary failed/adversarial repos are
-		// not retried during the observer window.
+		// Keep failed-repo retry on a production-like cadence. A live first
+		// sighting is not a retry signal; repos that need repair should arrive
+		// through listRepos failure handling or an explicit #sync.
 		FailedRepoRetryInterval:        failedRepoRetryInterval,
 		CursorLookback:                 36 * time.Hour,
 		SegmentCacheMaxAge:             0,
@@ -402,13 +389,6 @@ func testOracleDefaultLifecycle(t *testing.T) {
 
 	publicURL := waitForRuntimePublicURL(t, cfg, rt, run)
 	passesBeforeSteady := compaction.Count()
-	var netNewBaseline map[string]float64
-	if netNewOracle {
-		netNewBaseline = scrapeDebugMetrics(t, cfg, debugClient,
-			"jetstream_backfill_net_new_enqueued_total",
-			"jetstream_backfill_failed_repo_retry_succeeded_total",
-		)
-	}
 
 	// Adversarial ingest-gate phase (#204): the world tells verifier-
 	// consistent lies the #197 gate must drop with the right reason
@@ -436,9 +416,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	// Deterministic #202 identity injections, independent of the random
 	// mix: a handle-change payload (the optional-field shape) and a
 	// malformed-DID frame (#identity bodies are not signature-verified
-	// upstream, so this reaches ingest as-is; it must archive
-	// byte-faithfully AND be rejected by the net-new enqueuer's DID
-	// validation — asserted after shutdown below).
+	// upstream, so this reaches ingest as-is and must archive byte-faithfully).
 	identityIdx := pickActiveOracleAccount(t, w, cfg)
 	_, err = w.GenerateIdentityForTest(t.Context(), identityIdx, true)
 	require.NoError(t, err)
@@ -453,30 +431,9 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	_, err = w.GenerateAdversarialSyncForTest(t.Context(), acctSyncLie, "not-a-tid")
 	require.NoErrorf(t, err, "adversarial sync lie: mode=%s seed=%d", cfg.Mode, cfg.Seed)
 	exemptWholeEventSeqs(steadyAck, w.AdversarialLedger().Entries())
-	var hiddenAcct world.Account
-	if netNewOracle {
-		// Seed ONE backfill-only record: it exists in the hidden repo before
-		// the live commit, so the firehose never carries it and the ONLY path
-		// that can archive it is the LiveEnqueuer -> pending -> retry-getRepo
-		// resync. That makes the final-state Compare (and the client-stream
-		// compare, which caught #244) fail unless the net-new backfill truly
-		// ran and its rows reached both the archive and /subscribe — a
-		// zero-record hidden repo would converge from the live commit alone,
-		// leaving this scenario vacuous.
-		hiddenIdx, acct, err := w.AddHiddenAccountForTest(t.Context(), 1)
-		require.NoErrorf(t, err, "create hidden net-new account: mode=%s seed=%d", cfg.Mode, cfg.Seed)
-		hiddenAcct = acct
-		_, _, err = w.GenerateRecordOpForTest(t.Context(), hiddenIdx, "create", "app.bsky.feed.post", "net-new-oracle-probe")
-		require.NoErrorf(t, err, "emit hidden net-new commit: mode=%s seed=%d did=%s",
-			cfg.Mode, cfg.Seed, hiddenAcct.DID)
-	}
-
 	targetSeq := w.CurrentSeq()
 	recordTraceOrError(t, trace, "steady_target", map[string]any{"target_seq": targetSeq})
 	steadyAck.Wait(t, cfg, targetSeq, run, oracleWaitTimeout(cfg))
-	if netNewOracle {
-		assertNetNewDIDBackfilled(t, cfg, debugClient, run, string(hiddenAcct.DID), netNewBaseline)
-	}
 	assertFirehoseEventLogMatches(t, trace, w, steadyEventLog, steadyStartSeq, targetSeq, "steady-state")
 	// Ledger-aware variant of the plain cursor-gap guard: #204's
 	// whole-event drops advance the cursor without an archived row and
@@ -486,13 +443,6 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		newAdversarialFilter(w.AdversarialLedger().Entries()))
 	assertIdentityArchived(t, cfg, bootstrapEventLog, steadyEventLog, identityDID(t, w, identityIdx))
 	accountStatusMaxSeq := assertAccountStatusLifecycleArchived(t, cfg, steadyEventLog, accountStatusDID)
-	// The malformed-DID identity must be rejected by the net-new
-	// enqueuer's validation gate (metric via the debug /metrics surface,
-	// scraped while the runtime is still serving), and at least one VALID
-	// DID must have been enqueued net-new — proving the gate rejects
-	// selectively rather than rejecting everything (the two-sided
-	// anti-vacuity pair).
-	assertEnqueueInvalidDIDFired(t, cfg, debugClient)
 	// Quiesce the bubble before scraping: the whole-event sync lie
 	// produces no ack-visible row, so only drain() guarantees the
 	// consumer has processed it and settled the counters.
@@ -641,10 +591,9 @@ func identityDID(t *testing.T, w *world.World, idx int) string {
 //     injection at minimum);
 //   - the steady handle-change injection for wantDID archived with a
 //     non-empty payload;
-//   - the malformed-DID injection archived byte-faithfully (the archive
-//     is faithful; the enqueuer — asserted separately — is the
-//     validation boundary, per docs/README.md §4.4's drop contract
-//     applying to spec-invalid REPO PATHS, not identity DIDs).
+//   - the malformed-DID injection archived byte-faithfully. #identity DIDs are
+//     not repo paths, and first-sighting repo backfill is not a validation
+//     boundary.
 func assertIdentityArchived(t *testing.T, cfg Config, bootstrap, steady *eventLogRecorder, wantDID string) {
 	t.Helper()
 
@@ -669,104 +618,10 @@ func assertIdentityArchived(t *testing.T, cfg Config, bootstrap, steady *eventLo
 		"steady handle-change identity injection for %s never archived: mode=%s seed=%d",
 		wantDID, cfg.Mode, cfg.Seed)
 	require.GreaterOrEqualf(t, steadyByDID[world.MalformedIdentityDID], 1,
-		"malformed-DID identity injection never archived: mode=%s seed=%d (the archive must stay byte-faithful; validation happens at the enqueuer)",
+		"malformed-DID identity injection never archived: mode=%s seed=%d (the archive must stay byte-faithful)",
 		cfg.Mode, cfg.Seed)
 	require.GreaterOrEqualf(t, steadyTotal, 2,
 		"steady tier archived fewer KindIdentity rows than injected: mode=%s seed=%d", cfg.Mode, cfg.Seed)
-}
-
-// assertEnqueueInvalidDIDFired scrapes the runtime's debug /metrics
-// through the in-bubble pipe listener and asserts the two-sided
-// net-new enqueuer contract (#202): the malformed-DID identity tripped
-// the validation gate (invalid ≥ 1), and valid DIDs passed it to the
-// durable boundary (already-known ≥ 1 — every world DID has a repo row
-// from bootstrap backfill, so a passing valid DID surfaces there, and
-// a gate that rejected everything could never reach it).
-func assertEnqueueInvalidDIDFired(t *testing.T, cfg Config, debugClient *http.Client) {
-	t.Helper()
-
-	metrics := scrapeDebugMetrics(t, cfg, debugClient,
-		"jetstream_backfill_net_new_invalid_did_total",
-		"jetstream_backfill_net_new_already_known_total",
-	)
-	require.GreaterOrEqualf(t, metrics["jetstream_backfill_net_new_invalid_did_total"], 1.0,
-		"net-new enqueuer never rejected the malformed identity DID: mode=%s seed=%d (gate is dead or the malformed injection never reached Observe)",
-		cfg.Mode, cfg.Seed)
-	require.GreaterOrEqualf(t, metrics["jetstream_backfill_net_new_already_known_total"], 1.0,
-		"net-new enqueuer never passed a valid DID to the durable boundary: mode=%s seed=%d (a gate rejecting everything would make the invalid-DID assert vacuous)",
-		cfg.Mode, cfg.Seed)
-}
-
-func assertNetNewDIDBackfilled(t *testing.T, cfg Config, debugClient *http.Client, run *runtimeRun, did string, baseline map[string]float64) {
-	t.Helper()
-
-	const (
-		enqueuedMetric = "jetstream_backfill_net_new_enqueued_total"
-		retriedMetric  = "jetstream_backfill_failed_repo_retry_succeeded_total"
-	)
-	deadline := time.NewTimer(oracleWaitTimeout(cfg))
-	defer deadline.Stop()
-	tick := time.NewTicker(time.Millisecond)
-	defer tick.Stop()
-
-	var last map[string]float64
-	for {
-		drain()
-		last = scrapeDebugMetrics(t, cfg, debugClient, enqueuedMetric, retriedMetric)
-		if last[enqueuedMetric] > baseline[enqueuedMetric] && last[retriedMetric] > baseline[retriedMetric] {
-			return
-		}
-		select {
-		case <-run.exited:
-			t.Fatalf("steady-state ingestion stopped before net-new DID backfill completed: did=%s mode=%s seed=%d metrics=%v baseline=%v err=%v",
-				did, cfg.Mode, cfg.Seed, last, baseline, run.err)
-		case <-deadline.C:
-			t.Fatalf("timeout waiting for net-new DID backfill: did=%s mode=%s seed=%d metrics=%v baseline=%v",
-				did, cfg.Mode, cfg.Seed, last, baseline)
-		case <-tick.C:
-		}
-	}
-}
-
-// scrapeDebugMetrics fetches /metrics from the debug listener and
-// returns the values of the requested un-labeled series. Metrics the
-// scrape does not contain report as 0 (prometheus counters are only
-// exposed after registration, which these are at Build time).
-func scrapeDebugMetrics(t *testing.T, cfg Config, client *http.Client, names ...string) map[string]float64 {
-	t.Helper()
-
-	// Host is synthetic: the pipe transport routes by connection.
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://debug.invalid/metrics", nil)
-	require.NoError(t, err)
-	resp, err := client.Do(req)
-	require.NoErrorf(t, err, "scrape debug /metrics: mode=%s seed=%d", cfg.Mode, cfg.Seed)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equalf(t, http.StatusOK, resp.StatusCode, "debug /metrics status: mode=%s seed=%d", cfg.Mode, cfg.Seed)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-
-	want := make(map[string]struct{}, len(names))
-	for _, n := range names {
-		want[n] = struct{}{}
-	}
-	out := make(map[string]float64, len(names))
-	for line := range strings.Lines(string(body)) {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		name, valStr, ok := strings.Cut(line, " ")
-		if !ok {
-			continue
-		}
-		if _, wanted := want[name]; !wanted {
-			continue
-		}
-		val, err := strconv.ParseFloat(valStr, 64)
-		require.NoErrorf(t, err, "parse metric %s value %q", name, valStr)
-		out[name] = val
-	}
-	return out
 }
 
 // assertFaultPlanFired verifies the fault injection actually happened.

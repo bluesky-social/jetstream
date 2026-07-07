@@ -46,9 +46,7 @@ type RetryConfig struct {
 
 	// BackfillStore, when non-nil, is the shared *Store the runner uses for
 	// all metadata reads/writes instead of constructing its own over Store.
-	// The steady-state path injects the same instance the LiveEnqueuer holds
-	// so their counts/host-aggregate read-modify-writes serialize on one
-	// countsMu; two Stores over the same pebble db would race those RMWs.
+	// Tests use this to inspect the same helper instance they seeded.
 	BackfillStore *Store
 
 	Interval    time.Duration
@@ -232,11 +230,6 @@ func (r *retryRunner) scanDue(ctx context.Context, now time.Time, yield func(ret
 		if err != nil {
 			return err
 		}
-		// Both failed repos (exhausted bootstrap retry) and pending repos
-		// (net-new DIDs first seen on the steady-state firehose, issue #188)
-		// are retry-eligible: a pending row is a repo we have never attempted
-		// to download, so the same getRepo→verify→complete pass that retries a
-		// failure performs its initial backfill.
 		if !isRetryEligibleStatus(rs.Backfill.Status) || !rs.Active {
 			continue
 		}
@@ -409,11 +402,12 @@ func retryFailureHost(candidateHost, responseHost string) string {
 }
 
 // isRetryEligibleStatus reports whether a repo row should be picked up by a
-// steady-state retry pass. StatusFailed covers repos that exhausted their
-// bootstrap retry budget; StatusPending covers net-new DIDs first observed on
-// the steady-state firehose that have never been downloaded (issue #188).
+// steady-state retry pass. Only failed rows are eligible: they represent repos
+// that were discovered by listRepos but failed their original download. A live
+// first-sighting is not enough evidence to issue getRepo; that recovery belongs
+// to an explicit #sync from the PDS operator.
 func isRetryEligibleStatus(st Status) bool {
-	return st == StatusFailed || st == StatusPending
+	return st == StatusFailed
 }
 
 func isLocalRetryError(err error) bool {
