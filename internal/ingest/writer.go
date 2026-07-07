@@ -240,7 +240,7 @@ func Open(cfg Config) (*Writer, error) {
 // closes the active writer file. Idempotent. Does NOT seal — that's
 // a rotation-time concern.
 //
-// Durability ordering matches DESIGN.md §3.1.1: segment.Writer.Close
+// Durability ordering matches docs/README.md §3.1.1: segment.Writer.Close
 // fsyncs any buffered block before we commit the pebble batch. If
 // the pebble write fails after a successful flush, Open's
 // ScanMaxSeq reconciliation will recover the correct nextSeq on
@@ -299,7 +299,7 @@ func (w *Writer) SealActiveAndClose() error {
 	// failure paths leave the file open with stickyErr latched, so we
 	// release the fd ourselves below.
 	//
-	// Durability ordering matches Close (DESIGN.md §3.1.1): the segment
+	// Durability ordering matches Close (docs/README.md §3.1.1): the segment
 	// fsyncs first, then we pebble.Sync nextSeq. A crash between the
 	// two leaves nextSeq lagging at most one block, which Open's
 	// ScanMaxSeq reconciles on next start.
@@ -438,7 +438,7 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 
 // Flush forces any pending block to fsync. Goroutine-safe. Used by
 // the merge phase to order destination-segment durability before
-// its cursor commit (DESIGN.md §3.1.1 / merge spec §5.2). Steady-
+// its cursor commit (docs/README.md §3.1.1 / merge spec §5.2). Steady-
 // state callers do not need to call this — the per-block-fill path
 // inside Append handles ordinary flush + rotation.
 //
@@ -557,7 +557,7 @@ func (w *Writer) commitTerminalDurableBatchLocked() error {
 // flushAndRotateLocked is the post-Append durability commit. The
 // caller MUST hold w.mu.
 //
-// Order matters per DESIGN.md §3.1.1:
+// Order matters per docs/README.md §3.1.1:
 //  1. segment.Writer.Flush fsyncs the block.
 //  2. We pebble.Sync the new seq/next.
 //  3. If activeBytes >= MaxSegmentBytes, seal the current segment

@@ -236,7 +236,7 @@ func (w *Writer) rotateIfFull(ctx context.Context) error {
 
 		// Flush any trailing sub-block remainder durably first. flushBlockLocked
 		// fsyncs the block, then commits seq/next — the same fsync-before-seq
-		// ordering the sync rotation path uses (DESIGN.md §3.1.1). At full
+		// ordering the sync rotation path uses (docs/README.md §3.1.1). At full
 		// drain w.nextSeq equals this block's max seq + 1, so the committed
 		// seq never leads durable data.
 		if w.active.Pending() > 0 {

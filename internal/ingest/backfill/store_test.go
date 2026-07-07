@@ -195,7 +195,7 @@ func TestStore_OnUpdate_MissingRow(t *testing.T) {
 // TestStore_OnComplete_WritesComplete is the success path: a
 // successful download lands the row at Complete with the commit rev
 // recorded both at top-level Rev and in Backfill.Rev (per
-// DESIGN.md §3.5 — both fields exist; Rev is the latest, Backfill.Rev
+// docs/README.md §3.5 — both fields exist; Rev is the latest, Backfill.Rev
 // is the rev at end of initial download).
 func TestStore_OnComplete_WritesComplete(t *testing.T) {
 	t.Parallel()
@@ -347,7 +347,7 @@ func TestStore_OnComplete_PreservesExtraFields(t *testing.T) {
 // TestStore_OnFail_RecordsFailure pins the failure path. attempts is
 // the count for the current Run only — atmos passes initial+retries
 // from processRepo, and we overwrite rather than accumulate across
-// Runs (per DESIGN.md §6.3, this cosmetic regression is intentional).
+// Runs (this cosmetic regression is intentional).
 func TestStore_OnFail_RecordsFailure(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)

@@ -1,7 +1,8 @@
-// Package backfill: handler.go provides SegmentHandler, the atmos
+// handler.go provides SegmentHandler, the atmos
 // backfill.Handler that walks each downloaded repo's MST and emits
 // one segment.KindCreate event per record into the shared
 // ingest.Writer.
+
 package backfill
 
 import (

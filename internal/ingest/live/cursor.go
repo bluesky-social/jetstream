@@ -1,6 +1,6 @@
 // package live: cursor.go persists the upstream relay firehose
 // cursor in pebble so a process restart resumes from the last
-// durably-flushed block. DESIGN.md §3.1.1: persisted cursor must be
+// durably-flushed block. docs/README.md §3.1.1: persisted cursor must be
 // less than or equal to the latest durable event in the segment file.
 //
 // The on-disk encoding is [1B version][8B LE uint64], delegated to

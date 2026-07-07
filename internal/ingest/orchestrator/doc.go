@@ -1,6 +1,6 @@
 // Package orchestrator owns the ingestion-lifecycle state machine
 // for jetstream. It drives the bootstrap → merging → steady-state
-// transition described in DESIGN.md §4.2 and §4.3.
+// transition described in docs/README.md §4.2 and §4.3.
 //
 // cmd/jetstream constructs cross-cutting primitives (verifier,
 // identity directory, store, HTTP client) and calls Orchestrator.Run.

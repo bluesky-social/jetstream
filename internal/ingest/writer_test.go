@@ -522,7 +522,7 @@ func TestClose_PersistsNextSeq(t *testing.T) {
 }
 
 // TestBlockFlush_AdvancesPebbleSeq confirms the durability ordering
-// from DESIGN.md §3.1.1: after a block flush, seq/next in pebble
+// from docs/README.md §3.1.1: after a block flush, seq/next in pebble
 // equals the in-memory nextSeq.
 func TestBlockFlush_AdvancesPebbleSeq(t *testing.T) {
 	t.Parallel()
@@ -707,7 +707,7 @@ func TestResume_SealedSkipsToNext(t *testing.T) {
 }
 
 // TestOpen_ReconcilesDriftedPebble simulates the crash mode from
-// DESIGN.md §3.1.1: block fsynced, pebble batch lost. Open must read
+// docs/README.md §3.1.1: block fsynced, pebble batch lost. Open must read
 // max(seq) from the segment, advance nextSeq to max+1, and rewrite
 // pebble. Otherwise the next Append would reuse a seq.
 func TestOpen_ReconcilesDriftedPebble(t *testing.T) {

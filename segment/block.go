@@ -74,7 +74,7 @@ type columns interface {
 }
 
 // encodeBlockInto writes the uncompressed columnar body per
-// DESIGN.md §3.2 by appending to dst, returning the grown buffer.
+// docs/README.md §3.2 by appending to dst, returning the grown buffer.
 // Reusing a scratch dst across flushes is the writer's allocation
 // avoidance strategy.
 func encodeBlockInto(dst []byte, c columns) []byte {

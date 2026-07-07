@@ -111,7 +111,7 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 	//     The public surface will serve large segment-file downloads (~256 MB
 	//     each) and long-lived websocket streams; a global WriteTimeout would
 	//     kill both. ReadTimeout would similarly cap legitimate streaming
-	//     uploads (e.g. the bulk-timestamp import CSV in DESIGN.md §8).
+	//     uploads (e.g. the bulk-timestamp import CSV in docs/README.md §8).
 	//     Per-handler deadlines via r.Context() are the right tool when an
 	//     individual route needs a bound.
 	//

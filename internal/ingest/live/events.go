@@ -6,7 +6,7 @@
 //
 // All segment.Events derived from a single upstream event share the
 // same witnessedAt timestamp. Per-record timestamps would imply false
-// ordering (DESIGN.md §3.4 requires per-DID ingest order is preserved).
+// ordering (docs/README.md §3.4 requires per-DID ingest order is preserved).
 //
 // Seq is left zero on the returned events — ingest.Writer.Append
 // allocates the value at write time.

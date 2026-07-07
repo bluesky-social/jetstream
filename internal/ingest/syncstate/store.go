@@ -25,7 +25,7 @@ const (
 // underlying pebble db is concurrency-safe.
 //
 // Durability is two-phase so verifier state can never run ahead of the
-// archive (DESIGN.md invariant 1 / compaction spec §2.2):
+// archive (docs/README.md invariant 1 / compaction spec §2.2):
 //
 //  1. SaveChain/SaveHosting land in PENDING maps. atmos calls them at
 //     verification time, from its worker goroutines, before the event's
