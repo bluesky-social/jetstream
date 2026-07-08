@@ -60,16 +60,32 @@ Any overlay that only fixes the websocket path fails for archive downloaders.
 
 ### 2.1 Import time (new flow)
 
-Phases A/B/C run exactly as today (parse+bucket, then patch sealed segments
-under the rewrite lock). One addition: during the parse pass, every rule is
-**also written durably into pebble**. The map — not the CSV — becomes the
-permanent memory of the operator's intent; the CSV is deletable after the job.
+Timestamp import is **steady-state only**. Before steady state there is no
+stable public archive contract to repair, and supporting imports across the
+bootstrap backfill writer, bootstrap-live `live_segments` writer, and merge
+destination writer would add correctness surface with no operational need. The
+XRPC submit path should reject non-steady-state imports with a clear operator
+error.
+
+Phases A/B/C mostly run as today (parse+bucket, then patch sealed segments under
+the rewrite lock), but the ordering changes to make the rule map load-bearing:
+build and durably ingest the rule map first, refresh/activate the in-process
+stamper, force-rotate the steady writer so every pre-activation active row is
+sealed, then run the sealed-segment patch pass against the refreshed manifest.
+Rows appended after activation are stamped at birth by `Writer.Append`; rows
+that were active before activation are now sealed and patchable by Phase C. The
+map — not the CSV — becomes the permanent memory of the operator's intent; the
+CSV is deletable after the job.
 
 - Built offline as **sorted SST files and bulk-ingested**
-  (`IngestExternalFiles`), not point-Sets through the memtable/WAL — 5B writes
-  through the memtable would be a write-amp storm against a live store.
-  Pre-sorted SSTs land in the bottom level with essentially zero compaction
-  debt.
+  (`DB.Ingest` / `DB.IngestWithStats` for local files in the pinned Pebble
+  version), not point-Sets through the memtable/WAL — 5B writes through the
+  memtable would be a write-amp storm against a live store. Pre-sorted SSTs land
+  in the bottom level with essentially zero compaction debt. Do **not** use
+  Pebble `IngestExternalFiles` for this local import path unless the design is
+  deliberately changed to configure `Experimental.RemoteStorage`: in Pebble
+  v1.1.5 that API is for remote/external objects and errors without shared
+  storage configured.
 - **Separate pebble instance** at `<data-dir>/import-rules`, NOT the existing
   metadata store. Today's store is a small, hot db with cursor commits on the
   ingest path and tight fsync latency expectations; dropping a 100+ GB cold
@@ -211,6 +227,7 @@ All estimates are inspection-bounded hypotheses, not measurements — see §6.
 
 - Import writes rules durably (separate pebble instance, SST bulk ingestion)
   in addition to today's Phase C segment patching.
+- Import is steady-state-only; non-steady submissions fail explicitly.
 - `Writer.Append` stamps `IndexedAt` on materialization rows via the
   two-stage funnel, before buffering.
 - Compaction/resync code untouched; the two §1 scenarios pass as oracle
@@ -218,9 +235,9 @@ All estimates are inspection-bounded hypotheses, not measurements — see §6.
   all** (why this went unnoticed) — add import → update/resync → compaction →
   restart tiers asserting the imported display value survives in both the
   archive bytes and the live wire.
-- Active-segment gap (§1) closed: ingest-time stamping covers rows appended
-  after the import; decide force-rotate-at-import-start vs. letting the next
-  pass cover pre-import active rows.
+- Active-segment gap (§1) closed: rules are activated before a forced steady
+  writer rotation, then the sealed patch pass covers the pre-activation active
+  rows while append-time stamping covers every later row.
 - Observability: per-collection counters for funnel stage hit rates and stamp
   counts; rule-map size and filter-cache hit-rate gauges.
 - **Synthetic 100M-row load test** validates the two numbers the design leans
