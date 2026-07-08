@@ -338,10 +338,21 @@ func collectAccount(ctx context.Context, s *store.Store, resolver identity.Resol
 	acct.Found = true
 	acct.DID = string(did)
 	acct.Handle = rs.Handle
-	if acct.Handle == "" {
-		acct.Handle = fallbackDeclaredHandle(ctx, resolver, acct.QueryKind, acct.Query, did)
-	}
 	acct.PDS = rs.PDS
+	var resolved identityMetadata
+	if acct.Handle == "" || acct.PDS == "" {
+		resolved = fallbackIdentityMetadata(ctx, resolver, did)
+	}
+	if acct.Handle == "" {
+		if resolved.Handle != "" {
+			acct.Handle = resolved.Handle
+		} else if acct.QueryKind == "handle" && acct.Query != "" {
+			acct.Handle = acct.Query
+		}
+	}
+	if acct.PDS == "" && resolved.PDS != "" {
+		acct.PDS = resolved.PDS
+	}
 	acct.Host = rs.Host
 	acct.Active = rs.Active
 	acct.Backfill = string(rs.Backfill.Status)
@@ -357,22 +368,28 @@ func collectAccount(ctx context.Context, s *store.Store, resolver identity.Resol
 	return acct
 }
 
-func fallbackDeclaredHandle(ctx context.Context, resolver identity.Resolver, queryKind, query string, did atmos.DID) string {
-	if queryKind == "handle" && query != "" {
-		return query
-	}
+type identityMetadata struct {
+	Handle string
+	PDS    string
+}
+
+func fallbackIdentityMetadata(ctx context.Context, resolver identity.Resolver, did atmos.DID) identityMetadata {
 	if resolver == nil {
-		return ""
+		return identityMetadata{}
 	}
 	doc, err := resolver.ResolveDID(ctx, did)
 	if err != nil || doc == nil {
-		return ""
+		return identityMetadata{}
 	}
 	ident, err := identity.IdentityFromDocument(doc)
-	if err != nil || ident.Handle == "" || ident.Handle == atmos.HandleInvalid {
-		return ""
+	if err != nil {
+		return identityMetadata{}
 	}
-	return string(ident.Handle)
+	meta := identityMetadata{PDS: ident.PDSEndpoint()}
+	if ident.Handle != "" && ident.Handle != atmos.HandleInvalid {
+		meta.Handle = string(ident.Handle)
+	}
+	return meta
 }
 
 func treeFromManifest(ms manifest.SegmentTreeStats) TreeAggregate {
