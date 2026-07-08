@@ -222,6 +222,29 @@ func TestSubmit_ConcurrentJobRejected(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestSubmit_NotReadyRejectedWithoutJob(t *testing.T) {
+	t.Parallel()
+
+	env := newTestEnv(t)
+	writeCSV(t, env.importDir, "a.csv")
+	runner := &fakeRunner{}
+	m, err := importer.New(importer.Config{
+		Store:      env.store,
+		Runner:     runner,
+		ImportDir:  env.importDir,
+		ScratchDir: env.scratchDir,
+		Ready:      func() error { return importer.ErrNotReady },
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	_, err = m.Submit(context.Background(), "a.csv")
+	require.ErrorIs(t, err, importer.ErrNotReady)
+	_, ok := m.Current()
+	require.False(t, ok, "not-ready submit must not create a job record")
+	require.Empty(t, runner.calls, "not-ready submit must not launch RunImport")
+}
+
 func TestSubmit_PathConfinement(t *testing.T) {
 	t.Parallel()
 	runner := &fakeRunner{}

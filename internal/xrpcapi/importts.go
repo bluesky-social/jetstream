@@ -75,6 +75,8 @@ func importSubmitError(err error) error {
 	switch {
 	case errors.Is(err, importer.ErrJobInProgress):
 		return &xrpc.Error{StatusCode: http.StatusConflict, Name: "ImportInProgress", Message: err.Error()}
+	case errors.Is(err, importer.ErrNotReady):
+		return &xrpc.Error{StatusCode: http.StatusServiceUnavailable, Name: "ImportNotReady", Message: err.Error()}
 	case errors.Is(err, importer.ErrPathRequired),
 		errors.Is(err, importer.ErrPathEscape),
 		errors.Is(err, importer.ErrPathNotFound),

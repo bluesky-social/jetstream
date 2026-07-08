@@ -33,6 +33,7 @@
       },
       "errors": [
         { "name": "ImportInProgress", "description": "Another import job is already running; only one runs at a time." },
+        { "name": "ImportNotReady", "description": "Timestamp import requires the server to be in steady state with the live writer running." },
         { "name": "InvalidPath", "description": "The path is empty, escapes the import directory, does not exist, or is not a regular file." }
       ]
     }

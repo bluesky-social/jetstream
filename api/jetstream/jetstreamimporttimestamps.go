@@ -11,6 +11,7 @@ import (
 // Error name constants for JetstreamImportTimestamps.
 const (
 	ErrJetstreamImportTimestamps_ImportInProgress = "ImportInProgress" // Another import job is already running; only one runs at a time.
+	ErrJetstreamImportTimestamps_ImportNotReady   = "ImportNotReady"   // Timestamp import requires the server to be in steady state with the live writer running.
 	ErrJetstreamImportTimestamps_InvalidPath      = "InvalidPath"      // The path is empty, escapes the import directory, does not exist, or is not a regular file.
 )
 

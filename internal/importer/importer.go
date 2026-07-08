@@ -83,6 +83,9 @@ var (
 	// ErrNotAFile is returned when the resolved path is not a regular file
 	// (a directory, FIFO, device, or socket).
 	ErrNotAFile = errors.New("importer: csv path is not a regular file")
+	// ErrNotReady is returned when the runtime has not yet published the
+	// steady-state writer. Timestamp import is steady-state-only.
+	ErrNotReady = errors.New("importer: timestamp import requires steady state")
 	// ErrJobNotFound is returned by Status for an unknown job id.
 	ErrJobNotFound = errors.New("importer: job not found")
 )
@@ -149,6 +152,10 @@ type Config struct {
 	// (ScratchDir/<jobID>). Created on demand; distinct from ImportDir so job
 	// scratch never mingles with the operator's staged CSVs.
 	ScratchDir string
+	// Ready, when non-nil, is called during Submit after path confinement and
+	// single-job checks but before a job record is persisted. Returning an
+	// error rejects the submit without creating a failed job.
+	Ready func() error
 	// Logger is optional; nil uses slog.Default().
 	Logger *slog.Logger
 	// Now is the clock; nil uses time.Now. Injected for tests.
@@ -164,6 +171,7 @@ type Manager struct {
 	runner     Runner
 	importDir  string
 	scratchDir string
+	ready      func() error
 	logger     *slog.Logger
 	now        func() time.Time
 	newJobID   func() string
@@ -225,6 +233,7 @@ func New(cfg Config) (*Manager, error) {
 		runner:     cfg.Runner,
 		importDir:  cfg.ImportDir,
 		scratchDir: cfg.ScratchDir,
+		ready:      cfg.Ready,
 		logger:     logger.With(slog.String("component", "importer")),
 		now:        now,
 		newJobID:   newJobID,
@@ -278,6 +287,11 @@ func (m *Manager) beginJob(csvPath string) (Record, error) {
 		}
 		if found && !current.State.Terminal() {
 			return Record{}, ErrJobInProgress
+		}
+	}
+	if m.ready != nil {
+		if err := m.ready(); err != nil {
+			return Record{}, err
 		}
 	}
 	rec := &Record{
@@ -482,13 +496,14 @@ func (m *Manager) run(ctx context.Context, rec Record, resume bool) {
 // done-set still makes the resume itself correct.
 func foldResult(rec *Record, result orchestrator.ImportResult, parsed bool) {
 	if parsed {
-		rec.RowsTotal = result.Parse.RowsTotal
-		rec.RowsValid = result.Parse.RowsValid
-		rec.RowsRejected = result.Parse.RowsRejected
+		parse := result.ParseStats()
+		rec.RowsTotal = parse.RowsTotal
+		rec.RowsValid = parse.RowsValid
+		rec.RowsRejected = parse.RowsRejected
 		rec.RejectsByReason = nil
-		if len(result.Parse.RejectsByReason) > 0 {
-			rec.RejectsByReason = make(map[string]uint64, len(result.Parse.RejectsByReason))
-			for reason, n := range result.Parse.RejectsByReason {
+		if len(parse.RejectsByReason) > 0 {
+			rec.RejectsByReason = make(map[string]uint64, len(parse.RejectsByReason))
+			for reason, n := range parse.RejectsByReason {
 				rec.RejectsByReason[string(reason)] = n
 			}
 		}

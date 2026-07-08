@@ -230,6 +230,22 @@ func TestImportTimestamps_PathEscapeReturns400(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+func TestImportTimestamps_NotReadyReturns503(t *testing.T) {
+	t.Parallel()
+	mgr := &fakeImportManager{submitErr: importer.ErrNotReady}
+	ts := importTestServer(t, mgr, "s3cret")
+
+	resp := postJSON(t, ts.URL+importNSID, "s3cret", `{"path":"a.csv"}`)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+
+	var out struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.Equal(t, "ImportNotReady", out.Error)
+}
+
 func TestGetImportStatus_ReportsRecord(t *testing.T) {
 	t.Parallel()
 	mgr := &fakeImportManager{statusRec: importer.Record{
