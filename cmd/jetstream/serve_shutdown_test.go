@@ -174,3 +174,18 @@ func waitRuntimePublicAddr(t *testing.T, rt *jetstreamd.Runtime, done <-chan err
 	t.Fatal("serve never bound public listener")
 	return ""
 }
+
+func waitRuntimeSteadyState(t *testing.T, rt *jetstreamd.Runtime, done <-chan error) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	ready := make(chan error, 1)
+	go func() { ready <- rt.WaitSteadyState(ctx) }()
+	select {
+	case err := <-ready:
+		require.NoError(t, err, "runtime did not publish steady-state writer")
+	case err := <-done:
+		t.Fatalf("serve exited before steady-state writer was published: %v", err)
+	}
+}
