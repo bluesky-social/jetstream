@@ -59,6 +59,19 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ──────────────────────────────────────────────────────────────────────────────
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG DATE=unknown
+ARG SOURCE=https://github.com/bluesky-social/jetstream
+
+LABEL org.opencontainers.image.title="jetstream" \
+      org.opencontainers.image.description="Full-network archive and live-streaming service for atproto" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${DATE}" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
 # Bring the binary across. /usr/local/bin is on $PATH and is the conventional
 # location even though distroless has no PATH-based shell to care.
 COPY --from=build /out/jetstream /usr/local/bin/jetstream
