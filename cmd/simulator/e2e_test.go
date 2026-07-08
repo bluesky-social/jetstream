@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -148,23 +147,35 @@ func TestEndToEnd_JetstreamConsumesSimulator(t *testing.T) {
 	// commit / atmos's verifier resync emits a synthetic event with
 	// no public envelope).
 	//
-	// Caveat: a drop in atmos's per-DID FIFO scheduler ("event dropped")
-	// is *expected* to surface a downstream chain break on the next event
-	// for that DID — the previous rev's data hash no longer matches the
-	// new event's prev_data because the linking event was dropped. The
-	// verifier's PolicyResync recovers asynchronously, but it logs a
-	// "verification failure" for visibility. That's not a regression in
-	// jetstream; it's atmos doing exactly what it's designed to do under
-	// upstream loss. We tune the simulator above to avoid drops, but
-	// under heavy CI contention they can still happen, so we relax the
-	// chain-break sentinel iff a drop preceded it. The unknown-event
-	// sentinel stays strict — no upstream condition causes it.
+	// Caveat: a drop in atmos's per-DID FIFO scheduler is *expected* to
+	// surface a downstream chain break on the next event for that DID —
+	// the previous rev's data hash no longer matches the new event's
+	// prev_data because the linking event was dropped. The verifier's
+	// PolicyResync recovers asynchronously, but it logs a "verification
+	// failure" for visibility. That's not a regression in jetstream;
+	// it's atmos doing exactly what it's designed to do under upstream
+	// loss. We tune the simulator above to avoid drops, but under heavy
+	// CI contention they can still happen, so we relax the chain-break
+	// sentinel iff a drop preceded it. The unknown-event sentinel stays
+	// strict — no upstream condition causes it.
+	//
+	// The drop signal is jetstream's own log message, NOT atmos's raw
+	// DropError text ("event dropped: ..."): the live consumer catches
+	// the *streaming.DropError and re-logs it under its own message with
+	// structured fields (see internal/ingest/live/consumer.go's
+	// "verify queue overflow dropped event"). atmos's string never
+	// reaches this buffer. Keying off the structured slog `msg` field
+	// keeps this explicit — issue #283 was a silent false pass caused by
+	// substring-matching a message text that jetstream never emits.
 	logs := stderr.String()
-	dropOccurred := strings.Contains(logs, `"event dropped`)
+	msgs := logMsgSet(logs)
+	_, dropOccurred := msgs["verify queue overflow dropped event"]
 	if !dropOccurred {
-		require.Falsef(t, strings.Contains(logs, `"verification failure"`),
+		_, verificationFailed := msgs["verification failure"]
+		require.Falsef(t, verificationFailed,
 			"jetstream emitted verification failure during E2E run; logs:\n%s", logs)
 	}
-	require.Falsef(t, strings.Contains(logs, `"unknown event kind"`),
+	_, unknownEventKind := msgs["unknown event kind"]
+	require.Falsef(t, unknownEventKind,
 		"jetstream emitted unknown event kind during E2E run; logs:\n%s", logs)
 }
