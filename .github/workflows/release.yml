@@ -81,10 +81,9 @@ jobs:
                 echo "release tag ${GITHUB_REF_NAME@Q} is not a valid Docker tag" >&2
                 exit 1
               fi
+              # This package also contains Jetstream legacy history. Do not
+              # move `latest`; exact tags keep existing consumers stable.
               tags+=("${image}:${GITHUB_REF_NAME}")
-              if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
-                tags+=("${image}:latest")
-              fi
               ;;
             *)
               echo "unexpected ref ${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}" >&2
@@ -107,6 +106,20 @@ jobs:
         run: |
           set -euo pipefail
           echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Refuse to overwrite existing image tags
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t tags <<< "${TAGS}"
+          for tag in "${tags[@]}"; do
+            if docker buildx imagetools inspect "${tag}" >/dev/null 2>&1; then
+              echo "refusing to overwrite existing image tag ${tag}" >&2
+              exit 1
+            fi
+          done
 
       - name: Create buildx builder
         run: |
