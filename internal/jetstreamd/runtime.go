@@ -24,6 +24,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
+	"github.com/bluesky-social/jetstream/internal/timestamp"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/bluesky-social/jetstream/internal/web"
@@ -45,17 +46,20 @@ type Runtime struct {
 	processLogger *slog.Logger
 	logger        *slog.Logger
 
-	tracerShutdown obs.TracerShutdown
-	cancelManifest context.CancelFunc
-	metaStore      *store.Store
-	manifest       *manifest.Manifest
-	tail           *subscribe.Tail
-	verifier       *atmossync.Verifier
-	orchestrator   *orchestrator.Orchestrator
-	importer       *importer.Manager
-	importRunCtx   context.Context
-	cancelImport   context.CancelFunc
-	server         *server.Server
+	tracerShutdown  obs.TracerShutdown
+	cancelManifest  context.CancelFunc
+	metaStore       *store.Store
+	importRules     *timestamp.RuleStore
+	manifest        *manifest.Manifest
+	tail            *subscribe.Tail
+	verifier        *atmossync.Verifier
+	orchestrator    *orchestrator.Orchestrator
+	importer        *importer.Manager
+	importRunCtx    context.Context
+	cancelImport    context.CancelFunc
+	steadyReady     chan struct{}
+	steadyReadyOnce sync.Once
+	server          *server.Server
 
 	closeMu sync.Mutex
 }
@@ -139,6 +143,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		opts:          opts,
 		processLogger: processLogger,
 		logger:        logger,
+		steadyReady:   make(chan struct{}),
 	}
 	cleanupTimeout := opts.ShutdownTimeout
 	if cleanupTimeout <= 0 {
@@ -184,6 +189,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(err)
 	}
 	rt.metaStore = metaStore
+
+	importRules, err := timestamp.OpenRuleStore(timestamp.RuleStoreConfig{
+		DataDir: opts.DataDir,
+		FS:      opts.StorageFS,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: open timestamp import rule store: %w", err))
+	}
+	rt.importRules = importRules
 
 	manifestCtx, cancelManifest := context.WithCancel(ctx)
 	rt.cancelManifest = cancelManifest
@@ -365,6 +379,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		SegmentManifestChecksums:       mft.SegmentChecksums,
 		ImportSelector:                 mft,
 		ImportMetrics:                  orchestrator.NewImportMetrics(metrics.Registry),
+		ImportRules:                    importRules,
+		TimestampStamper:               importRules,
 		CompactionInterval:             opts.CompactionInterval,
 		CompactionTombstoneCap:         opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers:       opts.CompactionRewriteWorkers,
@@ -382,6 +398,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			// read the writer-owned log from its first event.
 			tail.SetReadLogSource(func() *ingest.ReadableLog { return w.ReadLog() })
 			writerPtr.Store(w)
+			rt.steadyReadyOnce.Do(func() { close(rt.steadyReady) })
 		},
 	})
 	if err != nil {
@@ -410,7 +427,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Runner:     orch,
 		ImportDir:  importDir,
 		ScratchDir: filepath.Join(opts.DataDir, "import-scratch"),
-		Logger:     processLogger,
+		Ready: func() error {
+			if !lifecycle.IsSteadyState(metaStore) || writerPtr.Load() == nil {
+				return importer.ErrNotReady
+			}
+			return nil
+		},
+		Logger: processLogger,
 	})
 	if err != nil {
 		return fail(fmt.Errorf("serve: build import manager: %w", err))
@@ -552,13 +575,24 @@ func (r *Runtime) Run(ctx context.Context) error {
 	})
 
 	// Auto-resume a timestamp-import job that a prior process left incomplete
-	// (design Q-RESUME). Best-effort: a resume failure is logged, not fatal —
-	// the archive still serves, and the operator can re-submit. The job's
-	// background run is rooted at importRunCtx (cancelled in Close), not gctx.
+	// (design Q-RESUME), but only after the steady-state writer is published:
+	// imports are steady-state-only and the resume path should not turn a boot
+	// ordering race into a terminal failed job. Best-effort: a resume failure is
+	// logged, not fatal — the archive still serves, and the operator can
+	// re-submit. The job's background run is rooted at importRunCtx (cancelled
+	// in Close), not gctx.
 	if r.importer != nil {
-		if err := r.importer.ResumeIncomplete(r.importRunCtx); err != nil {
-			r.logger.Warn("resume incomplete import failed", "err", err)
-		}
+		g.Go(func() error {
+			select {
+			case <-r.steadyReady:
+			case <-gctx.Done():
+				return nil
+			}
+			if err := r.importer.ResumeIncomplete(r.importRunCtx); err != nil {
+				r.logger.Warn("resume incomplete import failed", "err", err)
+			}
+			return nil
+		})
 	}
 
 	// Graceful client drain. Live websocket subscribers are hijacked
@@ -655,6 +689,13 @@ func (r *Runtime) Close(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("verifier close: %w", err))
 		}
 		r.verifier = nil
+	}
+	if r.importRules != nil && importDrained {
+		if err := r.importRules.Close(); err != nil {
+			r.logger.Error("close timestamp import rule store", "err", err)
+			errs = append(errs, fmt.Errorf("close timestamp import rule store: %w", err))
+		}
+		r.importRules = nil
 	}
 	// Note: promoted sync state is NOT flushed here. The consumer's own
 	// Close flushes it after its writer has durably fsynced every

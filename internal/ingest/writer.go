@@ -412,12 +412,19 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 
 	candidate := *ev
 	candidate.Seq = w.nextSeq
+	if w.cfg.TimestampStamper != nil {
+		if err := w.cfg.TimestampStamper.Stamp(ctx, &candidate); err != nil {
+			w.cfg.Metrics.incAppendErrors()
+			return nil, fmt.Errorf("ingest: timestamp stamp: %w", err)
+		}
+	}
 	full, err := w.active.Append(candidate)
 	if err != nil {
 		w.cfg.Metrics.incAppendErrors()
 		return nil, fmt.Errorf("ingest: append: %w", err)
 	}
 	ev.Seq = candidate.Seq
+	ev.IndexedAt = candidate.IndexedAt
 	w.nextSeq++
 	w.cfg.Metrics.incEventsAppended()
 	w.cfg.Metrics.setNextSeq(w.nextSeq)

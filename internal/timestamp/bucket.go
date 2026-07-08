@@ -26,11 +26,12 @@ package timestamp
 // only ever makes the entry look stale (a safe recompute), never falsely fresh
 // (which could drop a newly-sealed segment). See selectFor for the proof.
 //
-// Point-in-time limitation (documented, not a bug): a single streaming pass
-// routes each row against the manifest as it stood when the row was processed.
-// A segment sealed AFTER a row is bucketed cannot retroactively receive that
-// row. Import is idempotent and re-runnable (design §3.4), so a re-run catches
-// it; this is a property of single-pass streaming, not of the cache.
+// Point-in-time shape: a single streaming pass routes each row against the
+// manifest as it stood when the row was processed. The orchestrator closes the
+// active-segment gap before bucketing by activating append-time rules and then
+// force-rotating the steady writer; rows appended after that are stamped at
+// birth, so a later segment seal during this pass does not need retroactive
+// patch coverage.
 
 import (
 	"container/list"

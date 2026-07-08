@@ -75,6 +75,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			ReadLogRetentionBytes: o.cfg.ReadLogRetentionBytes,
 			OnEvent:               o.cfg.OnEvent,
 			OnAfterSeal:           o.cfg.IngestOnAfterSeal,
+			TimestampStamper:      o.cfg.TimestampStamper,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,
 			Dial:                  o.cfg.LiveDial,
 
@@ -87,8 +88,10 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			if cerr := c.Close(); cerr != nil {
 				o.logger.ErrorContext(ctx, "close steady-state live consumer", "err", cerr)
 			}
+			o.steadyWriter.Store(nil)
 		}()
 
+		o.steadyWriter.Store(c.Writer())
 		if o.cfg.OnSteadyStateWriter != nil {
 			o.cfg.OnSteadyStateWriter(c.Writer())
 		}

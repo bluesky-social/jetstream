@@ -17,6 +17,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/timestamp"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/errors/oserror"
@@ -142,11 +143,13 @@ func TestRunImport_StrictMemPowerLossPatchCrashpoints(t *testing.T) {
 			})
 			require.ErrorIsf(t, err, errStrictFSPowerLoss, "first import must fail at %s", point)
 			require.Truef(t, inj.fired.Load(), "crashpoint %s did not fire", point)
+			require.NoError(t, rig.close())
 
 			fs.ResetToSyncedState()
 			fs.SetIgnoreSyncs(false)
 
 			rig = newStrictMemImportRig(t, fs, dataDir, nil)
+			defer func() { require.NoError(t, rig.close()) }()
 			res, err := rig.o.RunImport(context.Background(), ImportJob{
 				CSVPath: csv,
 				JobDir:  filepath.Join(t.TempDir(), "job2"),
@@ -389,7 +392,10 @@ func newStrictMemCompactionOrchestrator(
 }
 
 type strictMemImportRig struct {
-	o *Orchestrator
+	o      *Orchestrator
+	store  *store.Store
+	rules  *timestamp.RuleStore
+	writer *ingest.Writer
 }
 
 func newStrictMemImportRig(t *testing.T, fs *vfs.MemFS, dataDir string, inj crashpoint.Injector) *strictMemImportRig {
@@ -404,14 +410,35 @@ func newStrictMemImportRig(t *testing.T, fs *vfs.MemFS, dataDir string, inj cras
 	})
 	require.NoError(t, err)
 
+	st := openStrictMemStore(t, fs, dataDir)
+	rules, err := timestamp.OpenRuleStore(timestamp.RuleStoreConfig{DataDir: dataDir, FS: fs})
+	require.NoError(t, err)
+	w, err := ingest.Open(ingest.Config{
+		DataDir:           dataDir,
+		SegmentsDir:       segmentsDir,
+		FS:                fs,
+		Store:             st,
+		Logger:            logger,
+		MaxEventsPerBlock: 64,
+		OnAfterSeal:       mft.OnSegmentSealed,
+		TimestampStamper:  rules,
+	})
+	require.NoError(t, err)
+
 	rig := &strictMemImportRig{}
+	rig.store = st
+	rig.rules = rules
+	rig.writer = w
 	rig.o = &Orchestrator{
 		logger: logger,
 		cfg: Config{
-			DataDir:        dataDir,
-			FS:             fs,
-			Logger:         logger,
-			ImportSelector: mft,
+			DataDir:          dataDir,
+			FS:               fs,
+			Store:            st,
+			Logger:           logger,
+			ImportSelector:   mft,
+			ImportRules:      rules,
+			TimestampStamper: rules,
 			OnSegmentCompacted: func(idx uint64, path string) error {
 				return mft.OnSegmentCompacted(idx, path)
 			},
@@ -419,7 +446,28 @@ func newStrictMemImportRig(t *testing.T, fs *vfs.MemFS, dataDir string, inj cras
 			CrashInjector:            inj,
 		},
 	}
+	rig.o.steadyWriter.Store(w)
 	return rig
+}
+
+func (r *strictMemImportRig) close() error {
+	if r == nil {
+		return nil
+	}
+	var errs []error
+	if r.writer != nil {
+		errs = append(errs, r.writer.Close())
+		r.writer = nil
+	}
+	if r.rules != nil {
+		errs = append(errs, r.rules.Close())
+		r.rules = nil
+	}
+	if r.store != nil {
+		errs = append(errs, r.store.Close())
+		r.store = nil
+	}
+	return errors.Join(errs...)
 }
 
 func openStrictMemStore(t *testing.T, fs *vfs.MemFS, dataDir string) *store.Store {
