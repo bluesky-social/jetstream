@@ -1307,7 +1307,17 @@ func generateN(t *testing.T, w *world.World, n int) {
 		// and skips the gap. Periodically yield so the consumer keeps pace,
 		// mirroring the real-time interleaving a socket run gets for free. A
 		// no-op outside a bubble (restart tier), so it stays correct there.
-		if (i+1)%128 == 0 {
+		//
+		// The interval is load-bearing (#266): atmos's per-DID FIFO scheduler
+		// drops the oldest queued event when a single DID accumulates more
+		// than keyQueueCap = Parallelism*2 = 64 in-flight events, and a drop
+		// permanently breaks the seqAck contiguity wait. drain() returns only
+		// once every bubble goroutine is durably blocked, i.e. the scheduler
+		// queues have fully flushed, so an interval strictly below the cap
+		// makes same-DID overflow impossible (worst case: every event in the
+		// interval targets one DID) — even under host CPU starvation. 32
+		// rather than 64 leaves headroom in case atmos halves the cap.
+		if (i+1)%32 == 0 {
 			drain()
 		}
 	}
