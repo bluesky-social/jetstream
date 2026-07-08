@@ -5,15 +5,19 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/importer"
 	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
+	"github.com/jcalabro/atmos/streaming"
 	"github.com/stretchr/testify/require"
 )
 
@@ -270,6 +274,58 @@ func TestClose_FailedImportDrainLeavesStoreOpen(t *testing.T) {
 	close(gate)
 	require.NoError(t, rt.Close(context.Background()))
 	require.Nil(t, rt.metaStore, "second Close must close the store once drained")
+}
+
+func TestClose_CancelsAndDrainsRunBeforeClosingStores(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, st.Close())
+
+	dialEntered := make(chan struct{})
+	var dialOnce sync.Once
+	opts := testOptions(t)
+	opts.DataDir = dataDir
+	opts.Headless = true
+	opts.LiveDial = streaming.DialFunc(func(ctx context.Context, _ string) (streaming.Conn, *http.Response, error) {
+		dialOnce.Do(func() { close(dialEntered) })
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	})
+
+	rt, err := Build(t.Context(), opts)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = rt.Close(closeCtx)
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- rt.Run(t.Context()) }()
+
+	select {
+	case <-dialEntered:
+	case err := <-done:
+		t.Fatalf("runtime exited before live dial blocked: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime never reached live dial")
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, rt.Close(closeCtx))
+
+	select {
+	case err := <-done:
+		require.NoError(t, err, "Close should drive Run through a graceful shutdown")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Runtime.Close returned before Runtime.Run drained")
+	}
+	require.Nil(t, rt.metaStore, "Close must close the store only after Run drains")
 }
 
 func testOptions(t *testing.T) Options {

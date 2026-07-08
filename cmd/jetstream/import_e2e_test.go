@@ -84,6 +84,7 @@ func TestImport_EndToEnd(t *testing.T) {
 	addr := waitRuntimePublicAddr(t, rt, done)
 	base := "http://" + addr
 	client := &http.Client{Timeout: 3 * time.Second}
+	waitRuntimeSteadyState(t, rt, done)
 
 	// --- Sad path: disabled/wrong-token before the happy path proves auth is
 	// enforced regardless of state. ---

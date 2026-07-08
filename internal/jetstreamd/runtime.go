@@ -63,6 +63,10 @@ type Runtime struct {
 	steadyReadyOnce sync.Once
 	server          *server.Server
 
+	runMu     sync.Mutex
+	runCancel context.CancelFunc
+	runDone   chan struct{}
+
 	closeMu sync.Mutex
 }
 
@@ -547,10 +551,42 @@ func (r *Runtime) PublicAddr() string {
 	return r.server.PublicAddr()
 }
 
+// WaitSteadyState blocks until the steady-state writer has been published.
+func (r *Runtime) WaitSteadyState(ctx context.Context) error {
+	if r == nil || r.steadyReady == nil {
+		return errors.New("runtime: not built")
+	}
+	select {
+	case <-r.steadyReady:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Run starts the constructed service graph and blocks until shutdown or a
 // fatal subsystem error.
-func (r *Runtime) Run(ctx context.Context) error {
-	g, gctx := errgroup.WithContext(ctx)
+func (r *Runtime) Run(ctx context.Context) (runErr error) {
+	runCtx, cancelRun := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	r.runMu.Lock()
+	if r.runDone != nil {
+		r.runMu.Unlock()
+		cancelRun()
+		return errors.New("runtime: Run called more than once")
+	}
+	r.runCancel = cancelRun
+	r.runDone = runDone
+	r.runMu.Unlock()
+	defer func() {
+		cancelRun()
+		r.runMu.Lock()
+		r.runCancel = nil
+		close(runDone)
+		r.runMu.Unlock()
+	}()
+
+	g, gctx := errgroup.WithContext(runCtx)
 
 	g.Go(r.goroutineRoot("manifest_cancel", func() error {
 		<-gctx.Done()
@@ -639,13 +675,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 		}
 	}))
 
-	// A caller-driven shutdown surfaces as context.Canceled from
-	// the errgroup: the orchestrator's steady-state consumer and the HTTP
-	// server both return ctx.Err() on graceful shutdown. The caller owns
-	// process signal handling, so we suppress cancellation only when it came
-	// from the caller's context.
-	runErr := g.Wait()
-	if errors.Is(runErr, context.Canceled) && ctx.Err() != nil {
+	// Graceful shutdown surfaces as context.Canceled from the errgroup: the
+	// orchestrator's steady-state consumer and the HTTP server both return
+	// ctx.Err(). Suppress cancellation only when it came from the runtime's run
+	// context, either caller cancellation or Runtime.Close.
+	runErr = g.Wait()
+	if errors.Is(runErr, context.Canceled) && runCtx.Err() != nil {
 		runErr = nil
 	}
 	return runErr
@@ -677,25 +712,30 @@ func (r *Runtime) goroutineRoot(name string, fn func() error) func() error {
 	}
 }
 
-// Close tears down resources owned by the runtime. It is safe to call once
-// after Run returns, and repeated calls are ignored for already-closed fields.
+// Close tears down resources owned by the runtime. It cancels and drains Run
+// before closing shared stores; repeated calls are ignored for already-closed
+// fields.
 func (r *Runtime) Close(ctx context.Context) error {
 	r.cancelManifestLoad()
+	r.cancelImportRun()
+
+	var errs []error
+
+	runDrained := true
+	if err := r.stopRun(ctx); err != nil {
+		runDrained = false
+		r.logger.Error("runtime run did not drain within budget; leaving shared stores open", "err", err)
+		errs = append(errs, fmt.Errorf("runtime run drain: %w", err))
+	}
 
 	r.closeMu.Lock()
 	defer r.closeMu.Unlock()
 
-	var errs []error
-
-	// Stop any in-flight timestamp-import job and drain its goroutine BEFORE
+	// Drain any in-flight timestamp-import job BEFORE
 	// closing the metadata store: the manager writes job records + checkpoints
 	// to the store from its background run, and a write after Close would panic
 	// (pebble: closed). A cancelled run pauses (stays resumable), so the next
 	// boot picks it up.
-	if r.cancelImport != nil {
-		r.cancelImport()
-		r.cancelImport = nil
-	}
 	importDrained := true
 	if r.importer != nil {
 		if err := r.importer.Wait(ctx); err != nil {
@@ -713,14 +753,14 @@ func (r *Runtime) Close(ctx context.Context) error {
 		}
 	}
 
-	if r.verifier != nil {
+	if r.verifier != nil && runDrained {
 		if err := r.verifier.Close(); err != nil {
 			r.logger.Error("verifier close", "err", err)
 			errs = append(errs, fmt.Errorf("verifier close: %w", err))
 		}
 		r.verifier = nil
 	}
-	if r.importRules != nil && importDrained {
+	if r.importRules != nil && runDrained && importDrained {
 		if err := r.importRules.Close(); err != nil {
 			r.logger.Error("close timestamp import rule store", "err", err)
 			errs = append(errs, fmt.Errorf("close timestamp import rule store: %w", err))
@@ -734,14 +774,14 @@ func (r *Runtime) Close(ctx context.Context) error {
 	// verifier state run ahead of the archive. Pending (unpromoted)
 	// entries are deliberately dropped — their events' rows were never
 	// archived and redelivery re-verifies them.
-	if r.metaStore != nil && importDrained {
+	if r.metaStore != nil && runDrained && importDrained {
 		if err := r.metaStore.Close(); err != nil {
 			r.logger.Error("close metadata store", "err", err)
 			errs = append(errs, fmt.Errorf("close metadata store: %w", err))
 		}
 		r.metaStore = nil
 	}
-	if r.tracerShutdown != nil {
+	if r.tracerShutdown != nil && runDrained && importDrained {
 		if err := r.tracerShutdown(ctx); err != nil {
 			r.logger.Error("tracer shutdown failed", "err", err)
 			errs = append(errs, fmt.Errorf("tracer shutdown: %w", err))
@@ -749,6 +789,35 @@ func (r *Runtime) Close(ctx context.Context) error {
 		r.tracerShutdown = nil
 	}
 	return errors.Join(errs...)
+}
+
+func (r *Runtime) stopRun(ctx context.Context) error {
+	r.runMu.Lock()
+	cancel := r.runCancel
+	done := r.runDone
+	r.runMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *Runtime) cancelImportRun() {
+	r.closeMu.Lock()
+	cancel := r.cancelImport
+	r.cancelImport = nil
+	r.closeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (r *Runtime) closeWithLogging(ctx context.Context) {
