@@ -632,10 +632,17 @@ This is of course an implementation detail of the Bluesky-hosted instance. Other
 
 ### 7.1 Operational Freshness and Crash Diagnostics
 
-The debug listener exposes `/healthz`, `/readyz`, `/metrics`, and pprof.
-`/readyz` only means both HTTP listeners are bound and serving; it is not an
-ingest-health or steady-state signal. Use `/status` and Prometheus metrics for
-the ingestion view.
+The debug listener exposes `/healthz`, `/readyz`, `/metrics`, and pprof. It is
+off by default; set `JETSTREAM_DEBUG_ADDR` (for example `:6060`) to bind it.
+This means fresh production deploys have no metrics, health, readiness, or
+pprof endpoint until the operator explicitly enables the operator port.
+
+When the debug listener is enabled, `/readyz` only means the public listener
+and debug listener are bound and serving; it is not an ingest-health or
+steady-state signal. Use `/status` and Prometheus metrics for the ingestion
+view. If you raise `JETSTREAM_SHUTDOWN_TIMEOUT`, configure the container or
+orchestrator stop grace to be at least that long so Jetstream is not hard-killed
+mid-shutdown.
 
 Normal steady-state relay freshness is exported as two gauges:
 

@@ -4,9 +4,9 @@
 //
 //   - Public (default :8080): the protocol surface.
 //
-//   - Debug (default :6060): operations endpoints — /metrics, /healthz,
-//     /debug/pprof, etc. Should not be exposed to the public internet
-//     when the system is deployed.
+//   - Debug (disabled by default): operations endpoints — /metrics,
+//     /healthz, /debug/pprof, etc. Should not be exposed to the public
+//     internet when the system is deployed.
 package server
 
 import (
@@ -26,13 +26,15 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Config controls the listeners. Zero values are not valid; callers should
-// populate explicitly from CLI flags.
+// Config controls the listeners. PublicAddr and ShutdownTimeout should be
+// populated explicitly from CLI flags. Empty DebugAddr disables the debug
+// listener unless DebugListener is supplied.
 type Config struct {
 	// PublicAddr is the bind address for the public listener (e.g. ":8080").
 	PublicAddr string
 
 	// DebugAddr is the bind address for the metrics/pprof listener (e.g. ":6060").
+	// Empty disables the listener unless DebugListener is supplied.
 	DebugAddr string
 
 	// ShutdownTimeout bounds how long graceful shutdown is allowed to take.
@@ -76,8 +78,9 @@ type Server struct {
 	publicAddr atomic.Pointer[string]
 	debugAddr  atomic.Pointer[string]
 
-	// ready is flipped to true once both listeners are bound and serving.
-	// /readyz reads it atomically.
+	// ready is flipped to true once the public listener and optional debug
+	// listener are bound and serving. /readyz reads it atomically when the
+	// debug listener is enabled.
 	ready atomic.Bool
 
 	// extraPublicRoutes is appended-to by RegisterPublicRoute. It's
@@ -133,15 +136,21 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 		ErrorLog:          stdErrLog,
 	}
 
-	s.dbgSrv = &http.Server{
-		Addr:              cfg.DebugAddr,
-		Handler:           s.debugMux(),
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		ErrorLog:          stdErrLog,
+	if s.debugEnabled() {
+		s.dbgSrv = &http.Server{
+			Addr:              cfg.DebugAddr,
+			Handler:           s.debugMux(),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+			ErrorLog:          stdErrLog,
+		}
 	}
 
 	return s
+}
+
+func (s *Server) debugEnabled() bool {
+	return s.cfg.DebugAddr != "" || s.cfg.DebugListener != nil
 }
 
 // RegisterPublicRoute attaches an additional handler to the public mux.
@@ -158,9 +167,10 @@ func (s *Server) RegisterPublicRoute(pattern string, h http.Handler) {
 // it triggers graceful shutdown bounded by ShutdownTimeout. Run returns nil
 // if shutdown completed cleanly, or the first error encountered.
 //
-// Both listeners are bound synchronously before serve goroutines start, so
-// callers can rely on PublicAddr/DebugAddr having concrete addresses (if
-// they used :0) by the time Run is observable to be running.
+// The public listener and optional debug listener are bound synchronously
+// before serve goroutines start, so callers can rely on PublicAddr/DebugAddr
+// having concrete addresses (if they used :0) by the time Run is observable
+// to be running. DebugAddr remains empty when the debug listener is disabled.
 func (s *Server) Run(ctx context.Context) error {
 	// Build the public mux now so RegisterPublicRoute calls between
 	// New and Run are observed.
@@ -181,15 +191,18 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 
-	debugLn := s.cfg.DebugListener
-	if debugLn == nil {
-		var err error
-		debugLn, err = lc.Listen(ctx, "tcp", s.cfg.DebugAddr)
-		if err != nil {
-			if s.cfg.PublicListener == nil {
-				_ = publicLn.Close()
+	var debugLn net.Listener
+	if s.debugEnabled() {
+		debugLn = s.cfg.DebugListener
+		if debugLn == nil {
+			var err error
+			debugLn, err = lc.Listen(ctx, "tcp", s.cfg.DebugAddr)
+			if err != nil {
+				if s.cfg.PublicListener == nil {
+					_ = publicLn.Close()
+				}
+				return fmt.Errorf("bind debug listener %q: %w", s.cfg.DebugAddr, err)
 			}
-			return fmt.Errorf("bind debug listener %q: %w", s.cfg.DebugAddr, err)
 		}
 	}
 
@@ -197,8 +210,11 @@ func (s *Server) Run(ctx context.Context) error {
 	// observers) see the resolved port — relevant when binding to :0.
 	publicAddr := publicLn.Addr().String()
 	s.publicAddr.Store(&publicAddr)
-	debugAddr := debugLn.Addr().String()
-	s.debugAddr.Store(&debugAddr)
+	debugAddr := ""
+	if debugLn != nil {
+		debugAddr = debugLn.Addr().String()
+		s.debugAddr.Store(&debugAddr)
+	}
 
 	s.logger.Info("listening",
 		"public", publicAddr,
@@ -207,9 +223,15 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// Buffered so a fast-failing Serve doesn't block the goroutine forever
 	// if the parent has already moved on.
-	errs := make(chan error, 2)
+	serveCount := 1
+	if debugLn != nil {
+		serveCount++
+	}
+	errs := make(chan error, serveCount)
 	go func() { errs <- serveOrIgnoreClosed(s.srv, publicLn) }()
-	go func() { errs <- serveOrIgnoreClosed(s.dbgSrv, debugLn) }()
+	if debugLn != nil {
+		go func() { errs <- serveOrIgnoreClosed(s.dbgSrv, debugLn) }()
+	}
 
 	// Best-effort: if either Serve has already failed by the time we
 	// reach this line, don't claim readiness even for the brief
@@ -220,8 +242,9 @@ func (s *Server) Run(ctx context.Context) error {
 	case err := <-errs:
 		s.logger.Error("failed during startup", "err", err)
 		_ = s.shutdown()
-		// Drain the second goroutine.
-		<-errs
+		for i := 1; i < serveCount; i++ {
+			<-errs
+		}
 		return err
 	default:
 	}
@@ -247,11 +270,10 @@ func (s *Server) Run(ctx context.Context) error {
 		firstErr = shutdownErr
 	}
 
-	// Drain the remaining serve goroutine results. Both goroutines
-	// always send exactly one value, so we always read exactly two
-	// total — otherwise a second concurrent failure during shutdown
-	// would be silently dropped on the floor.
-	for receivedFromErrs < 2 {
+	// Drain the remaining serve goroutine results. Every started serve
+	// goroutine sends exactly one value; otherwise a second concurrent failure
+	// during shutdown would be silently dropped on the floor.
+	for receivedFromErrs < serveCount {
 		if err := <-errs; err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -267,11 +289,13 @@ func (s *Server) shutdown() error {
 	defer cancel()
 
 	s.srv.SetKeepAlivesEnabled(false)
-	s.dbgSrv.SetKeepAlivesEnabled(false)
 
 	errs := errgroup.Group{}
 	errs.Go(func() error { return s.srv.Shutdown(ctx) })
-	errs.Go(func() error { return s.dbgSrv.Shutdown(ctx) })
+	if s.dbgSrv != nil {
+		s.dbgSrv.SetKeepAlivesEnabled(false)
+		errs.Go(func() error { return s.dbgSrv.Shutdown(ctx) })
+	}
 
 	if err := errs.Wait(); err != nil {
 		return fmt.Errorf("failed to shutdown server: %w", err)

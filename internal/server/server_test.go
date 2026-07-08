@@ -221,6 +221,43 @@ func TestServer_LifecycleAndGracefulShutdown(t *testing.T) {
 	}
 }
 
+func TestServer_DebugListenerDisabledWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(Config{
+		PublicAddr:      "127.0.0.1:0",
+		ShutdownTimeout: 5 * time.Second,
+	}, logger, obs.NewMetrics())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		addr := srv.PublicAddr()
+		if addr == "" {
+			return false
+		}
+		resp, err := doGet(t.Context(), "http://"+addr+"/")
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, 2*time.Second, 10*time.Millisecond, "public listener never became ready")
+
+	require.Empty(t, srv.DebugAddr(), "empty DebugAddr must not bind the debug listener")
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not shut down within deadline")
+	}
+}
+
 // memListener is a minimal in-memory net.Listener used to prove Config's
 // injected-listener path: Run serves it instead of binding TCP.
 type memListener struct {

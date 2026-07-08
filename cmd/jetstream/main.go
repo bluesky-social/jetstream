@@ -176,9 +176,9 @@ func serveCommand() *cli.Command {
 			},
 			&cli.StringFlag{
 				Name:    "debug-addr",
-				Usage:   "Bind address for the debug HTTP listener (metrics, pprof, health)",
+				Usage:   "Bind address for the debug HTTP listener (metrics, pprof, health). Empty disables it.",
 				Sources: cli.EnvVars("JETSTREAM_DEBUG_ADDR"),
-				Value:   ":6060",
+				Value:   "",
 			},
 			&cli.StringFlag{
 				Name:    "otel-service-name",
@@ -190,7 +190,7 @@ func serveCommand() *cli.Command {
 				Name:    "shutdown-timeout",
 				Usage:   "Maximum time allowed for graceful shutdown after a signal is received",
 				Sources: cli.EnvVars("JETSTREAM_SHUTDOWN_TIMEOUT"),
-				Value:   30 * time.Second,
+				Value:   5 * time.Second,
 			},
 			&cli.DurationFlag{
 				Name:    "client-drain-timeout",

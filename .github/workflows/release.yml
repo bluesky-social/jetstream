@@ -1,0 +1,136 @@
+# Publish the Jetstream container image to GHCR.
+#
+# Security posture matches ci.yml: push-only triggers, no default token
+# permissions, pinned third-party actions, checkout without persisted
+# credentials, and a harden-runner egress allowlist. The package write token is
+# scoped to this one job and is only used for `docker login ghcr.io`.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish image
+    if: github.repository == 'bluesky-social/jetstream'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            auth.docker.io:443
+            codeload.github.com:443
+            gcr.io:443
+            ghcr.io:443
+            github.com:443
+            objects.githubusercontent.com:443
+            pkg-containers.githubusercontent.com:443
+            production.cloudflare.docker.com:443
+            proxy.golang.org:443
+            registry-1.docker.io:443
+            storage.googleapis.com:443
+            sum.golang.org:443
+            *.blob.core.windows.net:443
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Prepare image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/bluesky-social/jetstream"
+          short_sha="${GITHUB_SHA::12}"
+          version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          if ! git diff --quiet HEAD 2>/dev/null; then
+            commit="${commit}-dirty"
+          fi
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          tags=()
+          case "${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}" in
+            branch:main)
+              tags+=("${image}:sha-${short_sha}")
+              ;;
+            tag:v*)
+              if [[ ! "${GITHUB_REF_NAME}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+                echo "release tag ${GITHUB_REF_NAME@Q} is not a valid Docker tag" >&2
+                exit 1
+              fi
+              tags+=("${image}:${GITHUB_REF_NAME}")
+              if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
+                tags+=("${image}:latest")
+              fi
+              ;;
+            *)
+              echo "unexpected ref ${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "version=${version}"
+            echo "commit=${commit}"
+            echo "date=${date}"
+            echo "tags<<EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Create buildx builder
+        run: |
+          set -euo pipefail
+          docker buildx create --name jetstream-release --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+      - name: Build and push image
+        env:
+          DATE: ${{ steps.meta.outputs.date }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          tag_args=()
+          mapfile -t tags <<< "${TAGS}"
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "${tag}")
+          done
+
+          docker buildx build \
+            --push \
+            --provenance=false \
+            --platform linux/amd64 \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "COMMIT=${COMMIT}" \
+            --build-arg "DATE=${DATE}" \
+            "${tag_args[@]}" \
+            .

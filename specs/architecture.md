@@ -40,7 +40,7 @@ The durability ordering between these two is the invariant that keeps a crash sa
 
 - **`/subscribe` websocket** (`internal/subscribe`): pull-based fan-out. Every subscriber runs the same loop and is served from wherever its cursor points — the writer's readable log (the hot tail) for recent events, or the cold reader (a bounded disk walk over sealed segments through a shared block cache) for older cursors. There's no per-client outbound queue, so a slow reader can't blow up server memory. This package carries a lot of deliberate v1 wire-compatibility quirks; `internal/subscribe/doc.go` lists them. This maintains backwards compatibility with the original https://github.com/bluesky-social/jetstream-legacy system.
 - **Archive download over HTTP/XRPC** (`internal/xrpcapi`): the paginated `planBackfill` → `getSegment`/`getBlock` path clients use to pull sealed history before cutover.
-- **HTTP plumbing** (`internal/server`): the public (:8080) and debug (:6060) listeners and middleware. Status, health, and metrics live off these (`internal/status`, `internal/obs`).
+- **HTTP plumbing** (`internal/server`): the public listener (default :8080) and opt-in debug listener (commonly :6060) and middleware. Status, health, and metrics live off these (`internal/status`, `internal/obs`).
 - **Client library** (`internal/client` and the module root): the "thick" Go client that negotiates the archive, folds the stream, dedupes by seq, and cuts over to live. `docs/README.md` §5.
 
 ### Testing rig — the oracle and simulator
