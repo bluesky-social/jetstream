@@ -204,6 +204,13 @@ func (o *Orchestrator) RunImport(ctx context.Context, job ImportJob) (ImportResu
 			if err != nil {
 				return err
 			}
+			// ACCEPTED LIMITATION (Jim, 2026-07-08; see specs/gotchas.md): if a
+			// graceful shutdown closes the steady writer before the import ctx
+			// cancellation is observed here, this returns ingest.ErrClosed,
+			// which IsCancellationOnly does NOT treat as a pause — the job is
+			// marked terminally failed instead of resuming next boot. The
+			// operator remediates by re-submitting the same CSV; the whole
+			// pipeline (rule re-ingest, bucket, patch) is idempotent.
 			if err := liveWriter.ForceRotate(ctx); err != nil {
 				return fmt.Errorf("orchestrator: import: force rotate active segment after rule activation: %w", err)
 			}

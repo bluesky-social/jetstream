@@ -673,6 +673,8 @@ Sorting the CSV by DID is *recommended, not required*: it keeps the bucketer's p
 
 **Crash safety.** Progress is checkpointed in the metadata store per segment, so a process restart auto-resumes the same job without re-submission and skips segments it already patched. Even if the checkpoint is lost the job is safe to re-run: an already-applied segment produces zero mutations and is skipped. There is no dry-run mode — a real run is safe to start and watch via `getImportStatus`.
 
+**When a job fails: re-submit the same CSV.** A job that hits a real error (disk full, a shutdown that raced the job's setup) lands in `failed` state on `getImportStatus` and the `/status` page, and deliberately does *not* auto-resume — re-running a deterministically failing job would loop. A failed run may have installed part of its rule map, so new events can be stamped from an incomplete rule set until the import is completed. The remedy is simple: fix the cause and re-submit the exact same CSV. Jetstream never modifies or deletes the staged file (only per-job scratch under `<data-dir>/import-scratch` is cleaned up), and every phase is idempotent — rule ingestion is last-write-wins over the full file and already-patched segments produce zero mutations — so the re-run converges to the same end state as an uninterrupted import.
+
 ## 9. FAQ
 
 1. **Why store data by indexed timestamp rather than collection?**

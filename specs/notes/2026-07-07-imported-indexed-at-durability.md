@@ -244,3 +244,20 @@ All estimates are inspection-bounded hypotheses, not measurements — see §6.
   on before full implementation is committed: real on-disk bytes/entry after
   compression, and SST build+ingest wall time; plus filter-cache residency
   under load.
+
+## 7. Accepted limitations (post-implementation roast, 2026-07-08)
+
+Two findings from the branch roast were accepted rather than fixed; the
+operator re-submission contract is the remedy for both. Authoritative
+write-ups live in `specs/gotchas.md` ("A failed timestamp import can leave a
+partial rule set active" and "A shutdown racing the import preamble can
+terminally fail the job"):
+
+- Chunked rule-SST ingestion is not atomic across chunks: a crash mid-ingest
+  self-heals via auto-resume, but a terminal failure leaves a partial rule
+  set active until the operator re-submits the same CSV (last-write-wins
+  re-ingest heals it, including the stale cross-chunk duplicate-path edge).
+- A graceful shutdown that closes the steady writer before the import ctx
+  cancellation is observed makes the preamble's ForceRotate return
+  ingest.ErrClosed, terminally failing the job instead of pausing it; same
+  remedy.

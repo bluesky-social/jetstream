@@ -365,6 +365,16 @@ func (b *ruleSSTBuilder) Flush() (uint64, error) {
 	return uint64(info.Size()), nil
 }
 
+// Ingest installs the chunk SSTs one pebble ingest at a time. Each call is
+// individually atomic and durable, so a crash or error mid-loop leaves a
+// committed PREFIX of the CSV resident — including its collection markers, so
+// Stamp activates against an incomplete rule set on the next boot. This is an
+// ACCEPTED LIMITATION (Jim, 2026-07-08; see specs/gotchas.md): a crashed job
+// auto-resumes and re-ingests, a terminally failed job is remediated by the
+// operator re-submitting the same CSV (last-write-wins re-ingest heals the
+// partial set, including a stale cross-chunk duplicate-path value). Do not
+// bolt on a commit-marker or single-atomic-ingest scheme without revisiting
+// that decision.
 func (b *ruleSSTBuilder) Ingest() error {
 	for _, path := range b.paths {
 		if err := b.store.db.Ingest([]string{path}); err != nil {
