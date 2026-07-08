@@ -1,6 +1,8 @@
 package obs
 
 import (
+	"time"
+
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -38,6 +40,15 @@ func NewMetrics() *Metrics {
 	}, []string{"version", "commit", "date"})
 	buildInfo.WithLabelValues(info.Version, info.Commit, info.Date).Set(1)
 	reg.MustRegister(buildInfo)
+
+	currentTimestamp := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name:      "current_timestamp_seconds",
+		Namespace: namespace,
+		Help:      "Current Unix timestamp in seconds at scrape time.",
+	}, func() float64 {
+		return float64(time.Now().Unix())
+	})
+	reg.MustRegister(currentTimestamp)
 
 	// Labels are deliberately minimal. `commit` is intentionally not
 	// a label here even though every request runs under one commit:

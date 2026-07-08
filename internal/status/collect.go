@@ -66,7 +66,7 @@ func collectPhase(s *store.Store) (PhaseInfo, error) {
 	return PhaseInfo{Phase: p, PhaseEnteredAt: at}, nil
 }
 
-func collectLive(s *store.Store) (LiveStats, error) {
+func collectLive(s *store.Store, now time.Time, lastSeen func() time.Time) (LiveStats, error) {
 	cur, err := live.LoadUpstreamCursor(s, live.CursorKey)
 	if err != nil {
 		return LiveStats{}, err
@@ -79,11 +79,18 @@ func collectLive(s *store.Store) (LiveStats, error) {
 	if err != nil {
 		return LiveStats{}, err
 	}
-	return LiveStats{
+	stats := LiveStats{
 		UpstreamCursor: cur,
 		NextSeq:        nextSeq,
 		BootstrapSeq:   bootSeq,
-	}, nil
+	}
+	if lastSeen != nil {
+		stats.LastSeenUpstreamEventAt = lastSeen()
+		if !stats.LastSeenUpstreamEventAt.IsZero() && now.After(stats.LastSeenUpstreamEventAt) {
+			stats.LastSeenUpstreamEventAge = now.Sub(stats.LastSeenUpstreamEventAt)
+		}
+	}
+	return stats, nil
 }
 
 func collectBackfill(s *store.Store) (BackfillStats, error) {
@@ -613,7 +620,7 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		return nil, err
 	}
 
-	liveStats, err := collectLive(opts.Store)
+	liveStats, err := collectLive(opts.Store, now, opts.LastSeenUpstreamEvent)
 	if err != nil {
 		return nil, err
 	}

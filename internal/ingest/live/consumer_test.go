@@ -162,6 +162,72 @@ func TestProcessBatch_UnknownEventDoesNotAdvanceCursor(t *testing.T) {
 		"unknown trailing event must not advance the cursor past it")
 }
 
+func TestProcessBatch_ObservesOrdinaryUpstreamEvents(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	seenAt := time.Date(2026, 7, 8, 13, 0, 0, 0, time.UTC)
+	var observed atomic.Int64
+
+	c, err := Open(Config{
+		SegmentsDir: filepath.Join(t.TempDir(), "live_segments"),
+		Store:       st,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		now:         func() time.Time { return seenAt },
+		OnUpstreamEventSeen: func(t time.Time) {
+			observed.Store(t.Unix())
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		{Seq: 5, Identity: &comatproto.SyncSubscribeRepos_Identity{
+			DID: "did:plc:aaa", Time: "2026-05-21T00:00:00Z",
+		}},
+	}))
+	require.Equal(t, seenAt.Unix(), observed.Load())
+}
+
+func TestProcessBatch_DoesNotObserveDataResyncs(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	seenAt := time.Date(2026, 7, 8, 13, 0, 0, 0, time.UTC)
+	var observed atomic.Int64
+
+	c, err := Open(Config{
+		SegmentsDir: filepath.Join(t.TempDir(), "live_segments"),
+		Store:       st,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		now:         func() time.Time { return seenAt },
+		OnUpstreamEventSeen: func(t time.Time) {
+			observed.Store(t.Unix())
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		{
+			Seq:    11,
+			Resync: streaming.ResyncSyncEvent,
+			Sync: &comatproto.SyncSubscribeRepos_Sync{
+				DID: "did:plc:aaa", Rev: "3mmoojp7vgo2g", Time: "2026-05-21T00:00:00Z",
+			},
+		},
+	}))
+	require.Zero(t, observed.Load())
+}
+
 func TestMaybeTriggerCompactionReportsCoalescedTriggers(t *testing.T) {
 	t.Parallel()
 

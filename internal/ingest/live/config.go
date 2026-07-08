@@ -156,6 +156,15 @@ type Config struct {
 	// longer-lived consumer.
 	OnEvent func(*segment.Event)
 
+	// OnUpstreamEventSeen is called when this consumer observes a normal
+	// upstream subscribeRepos event. The orchestrator wires this only for the
+	// steady-state live consumer; bootstrap-live capture deliberately leaves it
+	// nil so freshness metrics reflect normal relay interaction only.
+	//
+	// Synthetic verifier resync events and upstream #sync resync deliveries do
+	// not trigger this hook.
+	OnUpstreamEventSeen func(time.Time)
+
 	// OnAfterSeal is forwarded to the inner ingest.Writer's
 	// Config.OnAfterSeal. See internal/ingest.Config.OnAfterSeal for
 	// the full contract. Optional.

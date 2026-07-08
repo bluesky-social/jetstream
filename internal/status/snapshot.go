@@ -153,9 +153,11 @@ type AccountLookup struct {
 
 // LiveStats summarizes the upstream cursor and seq counters.
 type LiveStats struct {
-	UpstreamCursor int64
-	NextSeq        uint64
-	BootstrapSeq   uint64
+	UpstreamCursor           int64
+	NextSeq                  uint64
+	BootstrapSeq             uint64
+	LastSeenUpstreamEventAt  time.Time
+	LastSeenUpstreamEventAge time.Duration
 }
 
 // SegmentSummary mirrors segment.Inspection's user-facing fields,
