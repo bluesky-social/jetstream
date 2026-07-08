@@ -320,6 +320,49 @@ func TestProcessBatch_MalformedCommitDoesNotShutDownConsumer(t *testing.T) {
 		"the skipped malformed event must be visible in decode_errors_total")
 }
 
+// TestNoteStreamError_DropErrorClassifiedAsVerifyQueueLoss pins the
+// stream-error taxonomy for atmos's *DropError (#266 side finding): a
+// per-DID verify-queue overflow is permanent local archival loss and
+// must land on its own counter — folding in the coalesced-drop count
+// for exact loss accounting — not on decode_errors_total, whose
+// remediation story (malformed frames, upgrade/ignore) is unrelated.
+func TestNoteStreamError_DropErrorClassifiedAsVerifyQueueLoss(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	metrics := NewMetrics(prometheus.NewRegistry())
+
+	c, err := Open(Config{
+		SegmentsDir: dir,
+		Store:       st,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		Metrics:     metrics,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	c.noteStreamError(t.Context(), &streaming.DropError{
+		DID: "did:plc:hot", Seq: 42, QueueLen: 64,
+	})
+	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.VerifyQueueDrops), 0,
+		"a lone DropError must count exactly one lost event")
+
+	c.noteStreamError(t.Context(), &streaming.DropError{
+		DID: "did:plc:hot", Seq: 99, QueueLen: 64,
+		AdditionalDropsSuppressed: 4,
+	})
+	require.InDelta(t, 6.0, testutil.ToFloat64(metrics.VerifyQueueDrops), 0,
+		"coalesced drops must fold into the counter (1 + 4 more on the second error)")
+
+	require.InDelta(t, 0.0, testutil.ToFloat64(metrics.DecodeErrors), 0,
+		"verify-queue loss must NOT be miscounted as a decode error")
+}
+
 func TestProcessBatch_OverwideRecordKeyDoesNotShutDownConsumer(t *testing.T) {
 	t.Parallel()
 
