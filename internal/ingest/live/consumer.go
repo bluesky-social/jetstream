@@ -521,6 +521,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 //     ahead of the relay (cursor corruption or a relay restored from an
 //     older backup) and never self-resolves — the labeled counter is the
 //     operator's signal to intervene.
+//   - DropError: atmos's parallel verifier shed an event because one DID
+//     overflowed its per-DID verify queue. PERMANENT local archival loss —
+//     the event was received but never stored, and the watermark advances
+//     past it — so it must not be miscounted as a decode error (#266's
+//     side finding). The count folds in coalesced drops so the metric is
+//     exact loss accounting.
 //   - anything else: a garbage frame we chose to skip (decode error).
 func (c *Consumer) noteStreamError(ctx context.Context, err error) {
 	if gap, ok := errors.AsType[*streaming.GapError](err); ok {
@@ -546,6 +552,16 @@ func (c *Consumer) noteStreamError(ctx context.Context, err error) {
 		c.logger.WarnContext(ctx, "error frame from relay",
 			"code", se.Code,
 			"message", se.Message,
+		)
+		return
+	}
+	if de, ok := errors.AsType[*streaming.DropError](err); ok {
+		c.cfg.Metrics.noteVerifyQueueDrops(de.AdditionalDropsSuppressed + 1)
+		c.logger.WarnContext(ctx, "verify queue overflow dropped event",
+			"did", de.DID,
+			"seq", de.Seq,
+			"queue_len", de.QueueLen,
+			"additional_drops_suppressed", de.AdditionalDropsSuppressed,
 		)
 		return
 	}

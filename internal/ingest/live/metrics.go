@@ -17,6 +17,7 @@ type Metrics struct {
 	SequenceGaps          prometheus.Counter
 	SequenceGapMissedSeqs prometheus.Counter
 	UnknownEvents         prometheus.Counter
+	VerifyQueueDrops      prometheus.Counter
 	StreamErrorFrames     *prometheus.CounterVec
 	StaleResyncsDropped   prometheus.Counter
 	ReplayedAccountsDrop  prometheus.Counter
@@ -69,6 +70,19 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 				"advances past them once later events flush, so they are NOT re-delivered " +
 				"to a future build unless it re-backfills the range.",
 		}),
+		VerifyQueueDrops: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "verify_queue_dropped_events_total",
+			Help: "Number of upstream events atmos's parallel verifier discarded because " +
+				"a single DID overflowed its per-DID verify queue (drop-oldest, cap = " +
+				"Parallelism*2). Each one is PERMANENT archival loss for that DID: the " +
+				"event was received but never verified or stored, and the watermark " +
+				"cursor advances past it, so no reconnect re-delivers it. Includes " +
+				"coalesced drops (DropError.AdditionalDropsSuppressed). A sustained " +
+				"rate means one hot account is outrunning verification — distinct from " +
+				"decode_errors_total (malformed frames) and sequence_gaps_total " +
+				"(relay-side loss).",
+		}),
 		StreamErrorFrames: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "stream_error_frames_total",
@@ -115,7 +129,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	reg.MustRegister(
 		m.EventsReceived, m.Reconnects,
 		m.DecodeErrors, m.SequenceGaps, m.SequenceGapMissedSeqs,
-		m.UnknownEvents, m.StreamErrorFrames, m.StaleResyncsDropped,
+		m.UnknownEvents, m.VerifyQueueDrops, m.StreamErrorFrames, m.StaleResyncsDropped,
 		m.ReplayedAccountsDrop, m.ReplayedIdentityDrop, m.UpstreamCursor,
 	)
 	return m
@@ -151,6 +165,12 @@ func (m *Metrics) noteSequenceGap(missed int64) {
 func (m *Metrics) incUnknownEvents() {
 	if m != nil {
 		m.UnknownEvents.Inc()
+	}
+}
+
+func (m *Metrics) noteVerifyQueueDrops(n uint64) {
+	if m != nil && n > 0 {
+		m.VerifyQueueDrops.Add(float64(n))
 	}
 }
 
