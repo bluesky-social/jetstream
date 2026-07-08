@@ -430,6 +430,11 @@ func TestCollect_AccountLookupDIDHydratesMissingHandleFromResolver(t *testing.T)
 			did: {
 				ID:          string(did),
 				AlsoKnownAs: []string{"at://resolved.test"},
+				Service: []identity.Service{{
+					ID:              "#atproto_pds",
+					Type:            "AtprotoPersonalDataServer",
+					ServiceEndpoint: "https://pds.example.com",
+				}},
 			},
 		}},
 	})
@@ -440,6 +445,7 @@ func TestCollect_AccountLookupDIDHydratesMissingHandleFromResolver(t *testing.T)
 	require.True(t, snap.Account.Found)
 	require.Equal(t, string(did), snap.Account.DID)
 	require.Equal(t, "resolved.test", snap.Account.Handle)
+	require.Equal(t, "https://pds.example.com", snap.Account.PDS)
 }
 
 func TestCollect_AccountLookupByHandlePrefersResolverOverLocalIndex(t *testing.T) {
