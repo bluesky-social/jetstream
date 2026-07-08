@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/prometheus/client_golang/prometheus"
@@ -44,6 +45,7 @@ func TestNewMetrics_RegistersAllSeries(t *testing.T) {
 		"jetstream_livestream_stale_resyncs_dropped_total",
 		"jetstream_livestream_replayed_account_events_dropped_total",
 		"jetstream_livestream_upstream_cursor",
+		"jetstream_livestream_last_seen_upstream_event_timestamp_seconds",
 	} {
 		_, ok := names[want]
 		require.True(t, ok, "missing metric %s", want)
@@ -110,4 +112,17 @@ func TestNoteStreamError_ClassifiesStreamErrors(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("missing")), 0)
 	require.Zero(t, testutil.ToFloat64(metrics.StreamErrorFrames.WithLabelValues("TotallyMadeUp-1")),
 		"raw upstream code must never become a label value")
+}
+
+func TestMetrics_LastSeenUpstreamEvent(t *testing.T) {
+	t.Parallel()
+
+	metrics := NewMetrics(prometheus.NewRegistry())
+	require.True(t, metrics.LastSeenUpstreamEvent().IsZero())
+
+	seen := time.Date(2026, 7, 8, 12, 34, 56, 789, time.UTC)
+	metrics.NoteLastSeenUpstreamEvent(seen)
+
+	require.True(t, metrics.LastSeenUpstreamEvent().Equal(time.Unix(seen.Unix(), 0).UTC()))
+	require.InDelta(t, float64(seen.Unix()), testutil.ToFloat64(metrics.LastSeenUpstreamEventTimestamp), 0)
 }

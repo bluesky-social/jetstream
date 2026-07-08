@@ -74,6 +74,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			SegmentMetrics:        o.cfg.SegmentMetrics,
 			ReadLogRetentionBytes: o.cfg.ReadLogRetentionBytes,
 			OnEvent:               o.cfg.OnEvent,
+			OnUpstreamEventSeen:   o.cfg.LiveMetrics.NoteLastSeenUpstreamEvent,
 			OnAfterSeal:           o.cfg.IngestOnAfterSeal,
 			TimestampStamper:      o.cfg.TimestampStamper,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,

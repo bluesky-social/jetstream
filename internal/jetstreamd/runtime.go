@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -170,6 +172,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
 	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
 	manifestMetrics := manifest.NewMetrics(metrics.Registry)
+	liveMetrics := live.NewMetrics(metrics.Registry)
 
 	if err := mkdirAllRuntimeFS(opts.StorageFS, opts.DataDir, 0o755); err != nil {
 		return fail(fmt.Errorf("serve: create data dir %s: %w", opts.DataDir, err))
@@ -352,7 +355,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Logger:                         processLogger,
 		Metrics:                        orchestrator.NewMetrics(metrics.Registry, tombstones),
 		IngestMetrics:                  ingest.NewMetrics(metrics.Registry),
-		LiveMetrics:                    live.NewMetrics(metrics.Registry),
+		LiveMetrics:                    liveMetrics,
 		DropMetrics:                    ingest.NewDropMetrics(metrics.Registry),
 		BackfillMetrics:                backfillMetrics,
 		SegmentMetrics:                 segmentMetrics,
@@ -443,12 +446,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// Status collector + handler are built here (after the import manager) so
 	// the status page can surface the current import job.
 	statusCollector, err := status.New(status.Options{
-		Store:            metaStore,
-		DataDir:          opts.DataDir,
-		Manifest:         mft,
-		CursorLookback:   opts.CursorLookback,
-		IdentityResolver: resolver,
-		ImportReporter:   importReporter{mgr: importMgr},
+		Store:                 metaStore,
+		DataDir:               opts.DataDir,
+		Manifest:              mft,
+		CursorLookback:        opts.CursorLookback,
+		IdentityResolver:      resolver,
+		ImportReporter:        importReporter{mgr: importMgr},
+		LastSeenUpstreamEvent: liveMetrics.LastSeenUpstreamEvent,
 	})
 	if err != nil {
 		return fail(fmt.Errorf("serve: build status collector: %w", err))
@@ -548,13 +552,13 @@ func (r *Runtime) PublicAddr() string {
 func (r *Runtime) Run(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error {
+	g.Go(r.goroutineRoot("manifest_cancel", func() error {
 		<-gctx.Done()
 		r.cancelManifestLoad()
 		return nil
-	})
+	}))
 
-	g.Go(func() error {
+	g.Go(r.goroutineRoot("manifest_wait", func() error {
 		if err := r.manifest.Wait(gctx); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return nil
@@ -562,17 +566,17 @@ func (r *Runtime) Run(ctx context.Context) error {
 			return fmt.Errorf("manifest load: %w", err)
 		}
 		return nil
-	})
+	}))
 
 	if !r.opts.Headless {
-		g.Go(func() error {
+		g.Go(r.goroutineRoot("http_server", func() error {
 			return r.server.Run(gctx)
-		})
+		}))
 	}
 
-	g.Go(func() error {
+	g.Go(r.goroutineRoot("orchestrator", func() error {
 		return r.orchestrator.Run(gctx)
-	})
+	}))
 
 	// Auto-resume a timestamp-import job that a prior process left incomplete
 	// (design Q-RESUME), but only after the steady-state writer is published:
@@ -582,7 +586,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	// re-submit. The job's background run is rooted at importRunCtx (cancelled
 	// in Close), not gctx.
 	if r.importer != nil {
-		g.Go(func() error {
+		g.Go(r.goroutineRoot("import_resume", func() error {
 			select {
 			case <-r.steadyReady:
 			case <-gctx.Done():
@@ -592,7 +596,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 				r.logger.Warn("resume incomplete import failed", "err", err)
 			}
 			return nil
-		})
+		}))
 	}
 
 	// Graceful client drain. Live websocket subscribers are hijacked
@@ -605,7 +609,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	// handshake. The drain context is rooted at Background (not gctx,
 	// which is already cancelled by the time we drain) and bounded by the
 	// option, so a wedged client can't delay exit past the budget.
-	g.Go(func() error {
+	g.Go(r.goroutineRoot("client_drain", func() error {
 		<-gctx.Done()
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), r.opts.ClientDrainTimeout)
 		defer drainCancel()
@@ -613,7 +617,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 			r.logger.Warn("client drain did not complete within budget; severing remaining subscribers", "err", err)
 		}
 		return nil
-	})
+	}))
 
 	verifierLogger := r.processLogger.With(slog.String("component", "verifier"))
 	// Verifier async-error drain. Verification failures are
@@ -621,7 +625,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	// malformed PDS input, which is invalid user data, not a
 	// jetstream bug. We warn-log and the OnVerificationFailure hook
 	// fires for operator visibility, but never crash.
-	g.Go(func() error {
+	g.Go(r.goroutineRoot("verifier_async_errors", func() error {
 		for {
 			select {
 			case <-gctx.Done():
@@ -633,7 +637,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 				verifierLogger.Warn("async error", "err", err)
 			}
 		}
-	})
+	}))
 
 	// A caller-driven shutdown surfaces as context.Canceled from
 	// the errgroup: the orchestrator's steady-state consumer and the HTTP
@@ -645,6 +649,32 @@ func (r *Runtime) Run(ctx context.Context) error {
 		runErr = nil
 	}
 	return runErr
+}
+
+func (r *Runtime) goroutineRoot(name string, fn func() error) func() error {
+	return func() error {
+		defer func() {
+			if rec := recover(); rec != nil {
+				info := version.Get()
+				logger := slog.Default()
+				if r != nil && r.logger != nil {
+					logger = r.logger
+				}
+				logger.Error("panic in runtime goroutine",
+					"goroutine", name,
+					"panic", fmt.Sprint(rec),
+					"panic_type", fmt.Sprintf("%T", rec),
+					"stack", string(debug.Stack()),
+					"go_version", runtime.Version(),
+					"version", info.Version,
+					"commit", info.Commit,
+					"built", info.Date,
+				)
+				panic(rec)
+			}
+		}()
+		return fn()
+	}
 }
 
 // Close tears down resources owned by the runtime. It is safe to call once

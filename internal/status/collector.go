@@ -37,6 +37,10 @@ type Options struct {
 	// ImportReporter yields the current/most-recent timestamp-import job for
 	// the status page. Optional; nil means the import panel is omitted.
 	ImportReporter ImportReporter
+
+	// LastSeenUpstreamEvent returns the last steady-state subscribeRepos event
+	// observation time. Optional; nil means the live freshness fields are empty.
+	LastSeenUpstreamEvent func() time.Time
 }
 
 // Collector builds Snapshots on demand. Concurrent callers share one

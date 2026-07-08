@@ -1,6 +1,11 @@
 package live
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"sync/atomic"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 const (
 	metricsNamespace = "jetstream"
@@ -11,18 +16,21 @@ const (
 // consumer. A nil *Metrics is a valid zero-value: every method is a
 // no-op, so tests can skip metric registration entirely.
 type Metrics struct {
-	EventsReceived        prometheus.Counter
-	Reconnects            prometheus.Counter
-	DecodeErrors          prometheus.Counter
-	SequenceGaps          prometheus.Counter
-	SequenceGapMissedSeqs prometheus.Counter
-	UnknownEvents         prometheus.Counter
-	VerifyQueueDrops      prometheus.Counter
-	StreamErrorFrames     *prometheus.CounterVec
-	StaleResyncsDropped   prometheus.Counter
-	ReplayedAccountsDrop  prometheus.Counter
-	ReplayedIdentityDrop  prometheus.Counter
-	UpstreamCursor        prometheus.Gauge
+	EventsReceived                 prometheus.Counter
+	Reconnects                     prometheus.Counter
+	DecodeErrors                   prometheus.Counter
+	SequenceGaps                   prometheus.Counter
+	SequenceGapMissedSeqs          prometheus.Counter
+	UnknownEvents                  prometheus.Counter
+	VerifyQueueDrops               prometheus.Counter
+	StreamErrorFrames              *prometheus.CounterVec
+	StaleResyncsDropped            prometheus.Counter
+	ReplayedAccountsDrop           prometheus.Counter
+	ReplayedIdentityDrop           prometheus.Counter
+	UpstreamCursor                 prometheus.Gauge
+	LastSeenUpstreamEventTimestamp prometheus.Gauge
+
+	lastSeenUpstreamEventUnix atomic.Int64
 }
 
 // NewMetrics registers the livestream counters/gauges against reg.
@@ -125,12 +133,17 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "upstream_cursor",
 			Help: "Last persisted upstream relay cursor.",
 		}),
+		LastSeenUpstreamEventTimestamp: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "last_seen_upstream_event_timestamp_seconds",
+			Help: "Unix timestamp in seconds when steady-state live ingest last observed an upstream subscribeRepos event.",
+		}),
 	}
 	reg.MustRegister(
 		m.EventsReceived, m.Reconnects,
 		m.DecodeErrors, m.SequenceGaps, m.SequenceGapMissedSeqs,
 		m.UnknownEvents, m.VerifyQueueDrops, m.StreamErrorFrames, m.StaleResyncsDropped,
-		m.ReplayedAccountsDrop, m.ReplayedIdentityDrop, m.UpstreamCursor,
+		m.ReplayedAccountsDrop, m.ReplayedIdentityDrop, m.UpstreamCursor, m.LastSeenUpstreamEventTimestamp,
 	)
 	return m
 }
@@ -219,4 +232,28 @@ func (m *Metrics) setUpstreamCursor(v int64) {
 	if m != nil {
 		m.UpstreamCursor.Set(float64(v))
 	}
+}
+
+// NoteLastSeenUpstreamEvent records the wall-clock time at which the
+// steady-state firehose consumer observed a real upstream relay event.
+func (m *Metrics) NoteLastSeenUpstreamEvent(t time.Time) {
+	if m == nil || t.IsZero() {
+		return
+	}
+	sec := t.Unix()
+	m.lastSeenUpstreamEventUnix.Store(sec)
+	m.LastSeenUpstreamEventTimestamp.Set(float64(sec))
+}
+
+// LastSeenUpstreamEvent returns the last timestamp recorded by
+// NoteLastSeenUpstreamEvent. A zero time means no event has been observed.
+func (m *Metrics) LastSeenUpstreamEvent() time.Time {
+	if m == nil {
+		return time.Time{}
+	}
+	sec := m.lastSeenUpstreamEventUnix.Load()
+	if sec == 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0).UTC()
 }

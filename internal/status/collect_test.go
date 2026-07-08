@@ -116,6 +116,31 @@ func TestCollect_BuildsFreshSnapshotEachCall(t *testing.T) {
 	require.NotEqual(t, a.GeneratedAt, b.GeneratedAt)
 }
 
+func TestCollect_LiveLastSeenUpstreamEvent(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Date(2026, 7, 8, 12, 0, 30, 0, time.UTC)
+	seen := now.Add(-17 * time.Second)
+	c, err := status.New(status.Options{
+		Store:   st,
+		DataDir: dataDir,
+		Now:     func() time.Time { return now },
+		LastSeenUpstreamEvent: func() time.Time {
+			return seen
+		},
+	})
+	require.NoError(t, err)
+
+	snap, err := c.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.True(t, snap.Live.LastSeenUpstreamEventAt.Equal(seen))
+	require.Equal(t, 17*time.Second, snap.Live.LastSeenUpstreamEventAge)
+}
+
 func TestCollect_PhaseAndEnteredAt(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()

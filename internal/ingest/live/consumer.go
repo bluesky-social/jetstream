@@ -573,7 +573,8 @@ func (c *Consumer) noteStreamError(ctx context.Context, err error) {
 // processBatch writes one batch of decoded events into the writer.
 func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
-		witnessedAt := c.cfg.now().UnixMicro()
+		witnessed := c.cfg.now()
+		witnessedAt := witnessed.UnixMicro()
 
 		for _, evt := range batch {
 			c.cfg.Metrics.incEventsReceived()
@@ -671,6 +672,10 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				return err
 			} else if stale {
 				continue
+			}
+
+			if c.cfg.OnUpstreamEventSeen != nil && evt.Resync == streaming.ResyncNone && len(segEvts) > 0 {
+				c.cfg.OnUpstreamEventSeen(witnessed)
 			}
 
 			if replayed, err := c.dropReplayedAccountEvent(ctx, segEvts); err != nil {

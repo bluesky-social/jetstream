@@ -61,7 +61,13 @@ func newFixtureSnap() *status.Snapshot {
 			CompletedAt:     time.Date(2026, 5, 23, 7, 5, 0, 0, time.UTC),
 			Duration:        3*24*time.Hour + 7*time.Hour + 5*time.Minute,
 		},
-		Live: status.LiveStats{UpstreamCursor: 1234567, NextSeq: 999, BootstrapSeq: 0},
+		Live: status.LiveStats{
+			UpstreamCursor:           1234567,
+			NextSeq:                  999,
+			BootstrapSeq:             0,
+			LastSeenUpstreamEventAt:  time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+			LastSeenUpstreamEventAge: 5 * time.Second,
+		},
 		SegmentAggregate: &status.SegmentAggregate{
 			Trees: []status.TreeAggregate{
 				{
@@ -198,6 +204,8 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "5,000")        // OldestRetainedSeq formatted
 	require.Contains(t, body, "12,345")       // Network event count via humanInt
 	require.Contains(t, body, "[100, 1,233]") // Seq range
+	require.Contains(t, body, "Last upstream event")
+	require.Contains(t, body, "5s ago")
 	require.Contains(t, body, "2026-05-24")
 	require.Contains(t, body, "Witnessed range")
 	require.Contains(t, body, "overflow-wrap: anywhere")
