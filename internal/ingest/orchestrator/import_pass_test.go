@@ -13,7 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/timestamp"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/prometheus/client_golang/prometheus"
@@ -28,6 +31,9 @@ type importTestRig struct {
 	segmentsDir string
 	dataDir     string
 	mft         *manifest.Manifest
+	store       *store.Store
+	rules       *timestamp.RuleStore
+	writer      *ingest.Writer
 	refreshed   []uint64
 }
 
@@ -53,11 +59,36 @@ func newImportTestRigSegs(t *testing.T, segs ...[]segment.Event) *importTestRig 
 	require.NoError(t, err)
 
 	rig := &importTestRig{segmentsDir: segmentsDir, dataDir: dataDir, mft: mft}
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	rig.store = st
+
+	rules, err := timestamp.OpenRuleStore(timestamp.RuleStoreConfig{DataDir: dataDir})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rules.Close() })
+	rig.rules = rules
+
+	w, err := ingest.Open(ingest.Config{
+		DataDir:           dataDir,
+		SegmentsDir:       segmentsDir,
+		Store:             st,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxEventsPerBlock: 64,
+		OnAfterSeal:       mft.OnSegmentSealed,
+		TimestampStamper:  rules,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	rig.writer = w
+
 	rig.o = &Orchestrator{
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		cfg: Config{
-			DataDir:        dataDir,
-			ImportSelector: mft,
+			DataDir:          dataDir,
+			ImportSelector:   mft,
+			ImportRules:      rules,
+			TimestampStamper: rules,
 			OnSegmentCompacted: func(idx uint64, path string) error {
 				rig.refreshed = append(rig.refreshed, idx)
 				return mft.OnSegmentCompacted(idx, path)
@@ -65,6 +96,7 @@ func newImportTestRigSegs(t *testing.T, segs ...[]segment.Event) *importTestRig 
 			SegmentManifestChecksums: mft.SegmentChecksums,
 		},
 	}
+	rig.o.steadyWriter.Store(w)
 	return rig
 }
 
@@ -188,6 +220,70 @@ func TestRunImport_DisabledWithoutSelector(t *testing.T) {
 	o := &Orchestrator{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	_, err := o.RunImport(context.Background(), ImportJob{CSVPath: "x", JobDir: "y"})
 	require.ErrorIs(t, err, ErrImportUnavailable)
+}
+
+func TestRunImport_RequiresSteadyWriter(t *testing.T) {
+	t.Parallel()
+	rig := newImportTestRig(t, []segment.Event{
+		{Seq: 1, WitnessedAt: 1_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "1", Payload: []byte("v1")},
+	})
+	rig.o.steadyWriter.Store(nil)
+
+	csv := writeImportCSVFile(t, "uri,timestamp,scope,cid",
+		"at://did:plc:alice/app.bsky.feed.post/r1,2021-12-20T11:33:20Z,all_versions,")
+	_, err := rig.o.RunImport(context.Background(), ImportJob{CSVPath: csv, JobDir: filepath.Join(t.TempDir(), "job")})
+	require.ErrorIs(t, err, ErrImportNotSteadyState)
+}
+
+// TestRunImport_ActiveSegmentBoundary proves the #269 hand-off: rules become
+// active first, then the steady writer is force-rotated, then Phase A+B sees
+// and patches the just-sealed active segment. Appends after activation are
+// stamped at birth and do not wait for a later import rerun.
+func TestRunImport_ActiveSegmentBoundary(t *testing.T) {
+	t.Parallel()
+	rig := newImportTestRigSegs(t)
+
+	activeBeforeImport := segment.Event{
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindCreate,
+		DID:         "did:plc:alice",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "r1",
+		Rev:         "1",
+		Payload:     []byte("pre-import"),
+	}
+	require.NoError(t, rig.writer.Append(context.Background(), &activeBeforeImport))
+	require.Equal(t, uint64(1), activeBeforeImport.Seq)
+	require.Equal(t, uint64(0), rig.writer.ActiveIndex())
+
+	csv := writeImportCSVFile(t, "uri,timestamp,scope,cid",
+		"at://did:plc:alice/app.bsky.feed.post/r1,2021-12-20T11:33:20Z,all_versions,")
+	res, err := rig.o.RunImport(context.Background(), ImportJob{CSVPath: csv, JobDir: filepath.Join(t.TempDir(), "job")})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, res.SegmentsExamined)
+	require.EqualValues(t, 1, res.SegmentsPatched)
+	require.EqualValues(t, 1, res.RowsMutated)
+
+	sealed := readCompactionSegment(t, filepath.Join(rig.segmentsDir, ingest.SegmentFilename(0)))
+	require.Len(t, sealed, 1)
+	require.Equal(t, activeBeforeImport.Seq, sealed[0].Seq)
+	require.EqualValues(t, 1_640_000_000_000_000, sealed[0].IndexedAt,
+		"pre-import active row must be patched after the forced rotation")
+	require.Equal(t, uint64(1), rig.writer.ActiveIndex(), "writer must continue on the next active segment")
+
+	afterRules := segment.Event{
+		WitnessedAt: 1_700_000_001_000_000,
+		Kind:        segment.KindUpdate,
+		DID:         "did:plc:alice",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "r1",
+		Rev:         "2",
+		Payload:     []byte("post-import"),
+	}
+	require.NoError(t, rig.writer.Append(context.Background(), &afterRules))
+	require.Equal(t, activeBeforeImport.Seq+1, afterRules.Seq)
+	require.EqualValues(t, 1_640_000_000_000_000, afterRules.IndexedAt,
+		"post-import rows must be stamped before append")
 }
 
 // TestRunImport_NoCandidateSegmentIsNoop: a row whose DID is in no sealed

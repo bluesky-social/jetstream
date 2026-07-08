@@ -172,10 +172,11 @@ func (m *ImportMetrics) observeJob(start time.Time, result ImportResult, err err
 		m.JobDuration.Observe(time.Since(start).Seconds())
 	}
 
-	if result.Parse.RowsTotal > 0 {
-		m.RowsParsed.Add(float64(result.Parse.RowsTotal))
+	parse := result.ParseStats()
+	if parse.RowsTotal > 0 {
+		m.RowsParsed.Add(float64(parse.RowsTotal))
 	}
-	for reason, n := range result.Parse.RejectsByReason {
+	for reason, n := range parse.RejectsByReason {
 		m.RowsRejected.WithLabelValues(string(reason)).Add(float64(n))
 	}
 	if result.Bucket.RowsRouted > 0 {

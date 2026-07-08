@@ -130,6 +130,10 @@ type Config struct {
 	// to every segment.New it makes. Optional.
 	SegmentMetrics segment.SealObserver
 
+	// TimestampStamper flows through to the consumer's internal ingest.Writer.
+	// Optional; nil means no imported indexed_at rules are active.
+	TimestampStamper ingest.TimestampStamper
+
 	// SegmentIOFaultInjector is a test-only seam forwarded to segment.Writer.
 	// Nil in production.
 	SegmentIOFaultInjector segment.IOFaultInjector

@@ -221,6 +221,14 @@ type Config struct {
 	// (design §6 J). Optional; nil means no import counters increment.
 	ImportMetrics *ImportMetrics
 
+	// ImportRules is the durable imported indexed_at rule store. Required for
+	// timestamp import under #269; nil leaves import unavailable.
+	ImportRules *timestamp.RuleStore
+
+	// TimestampStamper applies durable imported indexed_at rules at append
+	// time. Optional; nil means no imported rules are active.
+	TimestampStamper ingest.TimestampStamper
+
 	// CompactionBloomNarrowMaxDIDs bounds the candidate-DID set handed to the
 	// segment-level bloom prefilter; larger tombstone sets skip narrowing
 	// (probing would cost more than it saves — spec §5). Zero selects the

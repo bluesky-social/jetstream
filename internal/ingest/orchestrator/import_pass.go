@@ -40,6 +40,11 @@ import (
 // configured with an ImportSelector (import disabled).
 var ErrImportUnavailable = errors.New("orchestrator: timestamp import not configured")
 
+// ErrImportNotSteadyState is returned when an operator submits an import before
+// the steady-state writer exists. Timestamp import is intentionally steady-state
+// only; before that there is no stable archive surface to repair.
+var ErrImportNotSteadyState = errors.New("orchestrator: timestamp import requires steady state")
+
 // ImportPhase identifies which phase of a running import a progress callback
 // refers to (design §3.2). The string values are stable: they surface on the
 // operator status page and in persisted job records, so alerting/dashboards
@@ -114,6 +119,7 @@ type ImportJob struct {
 type ImportResult struct {
 	Parse  timestamp.Stats
 	Bucket timestamp.BucketStats
+	Rules  timestamp.RuleIngestResult
 
 	// SegmentsExamined is the number of segments with an offset file that
 	// Phase C opened. SegmentsPatched is those that actually changed (a
@@ -136,13 +142,28 @@ type ImportResult struct {
 	BytesRewritten uint64
 }
 
+// ParseStats returns the operator-visible CSV parse counters for a run. Normal
+// runs report Phase A+B's bucketing parse. If the run failed or paused during
+// the #269 rule-ingest preamble before bucketing began, the rule-ingest parser
+// is the only parser that observed rows, so surface its partial counters.
+func (r ImportResult) ParseStats() timestamp.Stats {
+	if r.Parse.RowsTotal > 0 || len(r.Parse.RejectsByReason) > 0 || len(r.Parse.RejectSample) > 0 {
+		return r.Parse
+	}
+	return r.Rules.Parse
+}
+
 // RunImport executes a full timestamp-import job: Phase A+B (parse + bucket,
 // unlocked) then Phase C (apply, under the rewrite lock). It is safe to call
 // from a request-handler goroutine concurrently with steady-state compaction;
 // the rewrite lock serializes the two passes.
 func (o *Orchestrator) RunImport(ctx context.Context, job ImportJob) (ImportResult, error) {
-	if o.cfg.ImportSelector == nil {
+	if o.cfg.ImportSelector == nil || o.cfg.ImportRules == nil {
 		return ImportResult{}, ErrImportUnavailable
+	}
+	liveWriter := o.steadyWriter.Load()
+	if liveWriter == nil {
+		return ImportResult{}, ErrImportNotSteadyState
 	}
 	if job.CSVPath == "" {
 		return ImportResult{}, fmt.Errorf("orchestrator: import: CSVPath is required")
@@ -158,17 +179,33 @@ func (o *Orchestrator) RunImport(ctx context.Context, job ImportJob) (ImportResu
 			return fmt.Errorf("orchestrator: import: create job dir: %w", err)
 		}
 
-		// Phase A+B: parse + bucket. No segment is touched, so this runs
-		// outside the rewrite lock. The offset files it writes are the
-		// hand-off to Phase C. A resuming job that already durably bucketed
-		// skips this: re-running it would O_APPEND a second copy of every
-		// offset onto the existing files.
+		// Rule ingestion and Phase A+B run only before the durable bucketed
+		// checkpoint. Rule ingestion comes first and activates the append-time
+		// stamper before we rotate the steady writer. The subsequent bucket pass
+		// then sees the just-sealed active segment and Phase C patches rows that
+		// were active before activation; later appends are stamped at birth.
+		//
+		// A resuming job that already durably bucketed skips this whole preamble:
+		// the rules were ingested and the active segment was rotated before the
+		// bucketed checkpoint was written, so the existing offset files are a
+		// complete hand-off to Phase C.
 		if !job.SkipBucket {
 			o.cfg.ImportMetrics.setPhase(ImportPhaseGaugeParseBucket)
 			if job.OnPhase != nil {
 				if err := job.OnPhase(ImportPhaseParseBucket, 0); err != nil {
 					return err
 				}
+			}
+			ruleResult, err := o.cfg.ImportRules.ImportRulesFromCSV(ctx, timestamp.RuleIngestConfig{
+				CSVPath:    job.CSVPath,
+				ScratchDir: filepath.Join(job.JobDir, "rules"),
+			})
+			result.Rules = ruleResult
+			if err != nil {
+				return err
+			}
+			if err := liveWriter.ForceRotate(ctx); err != nil {
+				return fmt.Errorf("orchestrator: import: force rotate active segment after rule activation: %w", err)
 			}
 			// Fold the stats in BEFORE the error check: a cancelled or failed
 			// parse still counted rows, and observeJob's partial-counter fold

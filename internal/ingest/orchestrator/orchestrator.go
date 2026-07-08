@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/obs"
 )
@@ -40,6 +42,11 @@ type Orchestrator struct {
 	// delete-compaction pass are therefore mutually exclusive, and the loser
 	// waits (design §6 H).
 	rewriteMu sync.Mutex
+
+	// steadyWriter is non-nil only while the steady-state writer is open.
+	// Timestamp import is steady-state-only and uses this pointer to force
+	// rotate the active segment after activating new rules.
+	steadyWriter atomic.Pointer[ingest.Writer]
 }
 
 // New validates cfg and returns an Orchestrator ready to Run.

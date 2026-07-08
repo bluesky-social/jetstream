@@ -67,11 +67,28 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	if overrides.SegmentIOFaultInjector != nil {
 		cfg.SegmentIOFaultInjector = overrides.SegmentIOFaultInjector
 	}
+	if overrides.TimestampStamper != nil {
+		cfg.TimestampStamper = overrides.TimestampStamper
+	}
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 	return w
+}
+
+type fakeTimestampStamper struct {
+	indexedAt int64
+	err       error
+	seenSeq   uint64
+}
+
+func (s *fakeTimestampStamper) Stamp(_ context.Context, ev *segment.Event) error {
+	s.seenSeq = ev.Seq
+	if s.indexedAt != 0 {
+		ev.IndexedAt = s.indexedAt
+	}
+	return s.err
 }
 
 type durableOrderRecorder struct {
@@ -724,6 +741,65 @@ func TestAppend_LeavesSeqUntouchedOnError(t *testing.T) {
 	require.ErrorIs(t, err, ErrClosed)
 	require.Equal(t, uint64(0xDEAD), ev.Seq,
 		"failed Append must not mutate ev.Seq")
+}
+
+func TestAppend_TimestampStamperRunsBeforeAdmission(t *testing.T) {
+	t.Parallel()
+
+	stamper := &fakeTimestampStamper{indexedAt: 1_640_000_000_000_000}
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 64,
+		TimestampStamper:  stamper,
+	})
+
+	ev := segment.Event{
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindCreate,
+		DID:         "did:plc:a",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "r1",
+		Payload:     []byte{0xa0},
+	}
+	require.NoError(t, w.Append(t.Context(), &ev))
+	require.Equal(t, uint64(1), stamper.seenSeq, "stamper sees the assigned seq")
+	require.EqualValues(t, 1_640_000_000_000_000, ev.IndexedAt, "caller sees the stamped display time")
+
+	entries, _, ok, atTip := w.ReadLog().ReadFrom(ev.Seq, 1)
+	require.True(t, ok)
+	require.False(t, atTip)
+	require.Len(t, entries, 1)
+	require.EqualValues(t, 1_640_000_000_000_000, entries[0].Event().IndexedAt,
+		"read log must contain the stamped event, not the pre-stamp input")
+}
+
+func TestAppend_TimestampStamperErrorLeavesEventUnadmitted(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("rule store unavailable")
+	stamper := &fakeTimestampStamper{indexedAt: 1_640_000_000_000_000, err: sentinel}
+	w := newTestWriter(t, Config{
+		MaxEventsPerBlock: 64,
+		TimestampStamper:  stamper,
+	})
+
+	ev := segment.Event{
+		Seq:         0xCAFE,
+		WitnessedAt: 1_700_000_000_000_000,
+		Kind:        segment.KindCreate,
+		DID:         "did:plc:a",
+		Collection:  "app.bsky.feed.post",
+		Rkey:        "r1",
+		Payload:     []byte{0xa0},
+	}
+	err := w.Append(t.Context(), &ev)
+	require.ErrorIs(t, err, sentinel)
+	require.Equal(t, uint64(0xCAFE), ev.Seq, "failed stamp must not publish a phantom seq")
+	require.Zero(t, ev.IndexedAt, "candidate stamp must not leak back to caller on error")
+	require.Equal(t, uint64(1), w.NextSeq(), "failed stamp must not consume a seq")
+
+	_, _, ok, atTip := w.ReadLog().ReadFrom(1, 1)
+	require.False(t, ok)
+	require.True(t, atTip, "failed stamp must not append to the read log")
 }
 
 // TestClose_PersistsNextSeq pins the contract that Close commits
