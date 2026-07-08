@@ -72,9 +72,17 @@ type ReadableLog struct {
 	tipSeq   uint64
 	durable  uint64
 	curBytes int64
-	maxBytes int64
-	notify   chan struct{}
-	metrics  *Metrics
+	// pinnedBytes is the running sum of entry bytes for entries at or
+	// above durable (Seq >= durable) — the events retained because they
+	// are not yet durably flushed. Maintained incrementally so
+	// publishMetricsLocked stays O(1): a prior per-append linear scan of
+	// every resident entry made append O(n) and, as the resident set grew
+	// to the byte cap (~500k entries), throttled live ingest into an
+	// O(n^2) collapse that could not keep pace with the firehose.
+	pinnedBytes int64
+	maxBytes    int64
+	notify      chan struct{}
+	metrics     *Metrics
 }
 
 func newReadableLog(nextSeq uint64, maxBytes int64, metrics *Metrics) *ReadableLog {
@@ -107,6 +115,9 @@ func (l *ReadableLog) append(ev *segment.Event) {
 	l.entries = append(l.entries, entry)
 	l.tipSeq++
 	l.curBytes += entry.bytes
+	// A freshly appended entry has Seq == old tipSeq >= durable, so it is
+	// pinned until a later advanceDurable moves past it.
+	l.pinnedBytes += entry.bytes
 	l.evictLocked()
 	old := l.notify
 	l.notify = make(chan struct{})
@@ -132,6 +143,18 @@ func (l *ReadableLog) advanceDurable(nextSeq uint64) {
 	}
 	if nextSeq > l.tipSeq {
 		panic(fmt.Sprintf("ingest: readable log durable %d beyond tip %d", nextSeq, l.tipSeq))
+	}
+	// Entries with Seq in [old durable, nextSeq) transition from pinned to
+	// durable; drop their bytes from the pinned accumulator. They remain
+	// resident (subject to eviction) but no longer count as pinned.
+	for seq := l.durable; seq < nextSeq; seq++ {
+		if seq < l.baseSeq {
+			continue // already evicted; never counted
+		}
+		idx := seq - l.baseSeq
+		if idx < uint64(len(l.entries)) {
+			l.pinnedBytes -= l.entries[idx].bytes
+		}
 	}
 	l.durable = nextSeq
 	l.evictLocked()
@@ -236,12 +259,7 @@ func (l *ReadableLog) publishMetricsLocked() {
 	if l.metrics == nil {
 		return
 	}
-	pinned := int64(0)
-	for _, entry := range l.entries {
-		if entry.event.Seq >= l.durable {
-			pinned += entry.bytes
-		}
-	}
+	pinned := l.pinnedBytes
 	l.metrics.setReadLogBytes(l.curBytes)
 	l.metrics.setReadLogPinnedBytes(pinned)
 	l.metrics.setReadLogPinnedOverrunBytes(maxInt64(0, pinned-l.maxBytes))
