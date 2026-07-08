@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,4 +87,40 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// logMsgSet parses jetstream's JSON slog stream (the subprocess default
+// format, see obs.ParseLogFormat) and returns the set of distinct slog
+// `msg` values it emitted.
+//
+// The E2E warning sentinels key off this set rather than substring-
+// matching the raw JSON. Substring matching is brittle: it silently
+// matches structured field *values* as well as messages, and — as
+// issue #283 showed — it breaks the moment a producer's message text
+// drifts from what the test hard-codes. Matching whole `msg` values
+// keeps the sentinels explicit: a rename in the producer surfaces as a
+// sentinel miss (a maintainer must update the constant) instead of a
+// silent false pass.
+//
+// Non-JSON lines (e.g. an early panic or Go runtime output before the
+// logger is wired) are ignored here; callers that need to fail loudly
+// on those inspect the raw buffer separately.
+func logMsgSet(logs string) map[string]struct{} {
+	msgs := make(map[string]struct{})
+	for line := range strings.Lines(logs) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Msg string `json:"msg"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec.Msg != "" {
+			msgs[rec.Msg] = struct{}{}
+		}
+	}
+	return msgs
 }
