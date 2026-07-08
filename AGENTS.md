@@ -38,7 +38,7 @@ internal/
   subscribe/      websocket /subscribe endpoint (v1 protocol parity) + cold reader
   xrpcapi/        archive download over HTTP/XRPC (planBackfill, getSegment, getBlock)
   client/         thick Go client: archive negotiation, fold, cutover to live
-  server/         HTTP listeners (public :8080, debug :6060) and middleware
+  server/         HTTP listeners (public :8080, opt-in debug :6060) and middleware
   store/          pebble-backed cursor + metadata store
   manifest/       segment manifest (directory scan + self-describing headers)
   tombstone/      delete/update/account tombstone set for compaction

@@ -59,7 +59,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 
 	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
 	require.Equal(t, ":8080", opts.PublicAddr)
-	require.Equal(t, ":6060", opts.DebugAddr)
+	require.Equal(t, "", opts.DebugAddr)
 	require.Equal(t, "./data", opts.DataDir)
 	require.Equal(t, "https://bsky.network", opts.RelayURL)
 	require.Equal(t, "", opts.PLCURL)
@@ -67,7 +67,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, "info", opts.LogLevel)
 	require.Equal(t, "json", opts.LogFormat)
 	require.Same(t, os.Stderr, opts.LogOutput)
-	require.Equal(t, 30*time.Second, opts.ShutdownTimeout)
+	require.Equal(t, 5*time.Second, opts.ShutdownTimeout)
 	require.Equal(t, 10*time.Second, opts.ClientDrainTimeout)
 	require.Equal(t, 0, opts.MaxBackfillRepos)
 	require.Equal(t, 100, opts.BackfillWorkers)
