@@ -32,6 +32,9 @@ jobs:
         uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
         with:
           egress-policy: block
+          # Docker Hub redirects image layer/config downloads through
+          # production.cloudfront.docker.com; buildx cannot bootstrap BuildKit
+          # without that CDN host in the allowlist.
           allowed-endpoints: >
             api.github.com:443
             auth.docker.io:443
@@ -41,6 +44,7 @@ jobs:
             github.com:443
             objects.githubusercontent.com:443
             pkg-containers.githubusercontent.com:443
+            production.cloudfront.docker.com:443
             production.cloudflare.docker.com:443
             proxy.golang.org:443
             registry-1.docker.io:443
