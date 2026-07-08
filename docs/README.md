@@ -630,6 +630,36 @@ These will be configurable over time as we scale.
 
 This is of course an implementation detail of the Bluesky-hosted instance. Others can do what they please.
 
+### 7.1 Operational Freshness and Crash Diagnostics
+
+The debug listener exposes `/healthz`, `/readyz`, `/metrics`, and pprof.
+`/readyz` only means both HTTP listeners are bound and serving; it is not an
+ingest-health or steady-state signal. Use `/status` and Prometheus metrics for
+the ingestion view.
+
+Normal steady-state relay freshness is exported as two gauges:
+
+- `jetstream_current_timestamp_seconds` — current Unix timestamp at scrape time.
+- `jetstream_livestream_last_seen_upstream_event_timestamp_seconds` — the last
+  local time the steady-state live consumer observed a normal upstream
+  `subscribeRepos` event. Bootstrap, backfill, merge replay, failed-repo retry,
+  sync-triggered or synthetic data resyncs, and import/compaction work do not
+  update it.
+
+A typical alert is:
+
+```promql
+jetstream_livestream_last_seen_upstream_event_timestamp_seconds > 0
+and
+jetstream_current_timestamp_seconds
+  - jetstream_livestream_last_seen_upstream_event_timestamp_seconds > 30
+```
+
+Jetstream preserves crash-loud behavior for internal corruption and persistence
+failures. Set `GOTRACEBACK=all` in production service units so a crash includes
+all goroutines; the runtime also logs panics from long-lived goroutine roots in
+structured logs with build metadata before re-panicking.
+
 ## 8. Timestamp Import
 
 Any new firehose indexer has the same problem: it stamps every record with roughly the time it backfilled, so a post from 2022 looks like it was made today. `createdAt` doesn't save us — it's client-supplied and spoofable, which is both a bad product experience and a trust-and-safety hole. To build a real AppView you have to carry over the original indexer's timestamps. Bluesky's dataplane has been running since 2022 and has them; a fresh jetstream does not.

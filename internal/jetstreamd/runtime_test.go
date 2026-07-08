@@ -44,6 +44,34 @@ func TestRuntimePublicAddrBeforeRunIsEmpty(t *testing.T) {
 	})
 }
 
+func TestGoroutineRoot_LogsPanicThenRethrows(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	rt := &Runtime{
+		logger: slog.New(slog.NewJSONHandler(&buf, nil)),
+	}
+
+	var rec any
+	func() {
+		defer func() { rec = recover() }()
+		_ = rt.goroutineRoot("test_root", func() error {
+			panic("boom")
+		})()
+	}()
+
+	require.Equal(t, "boom", rec)
+	body := buf.String()
+	require.Contains(t, body, `"msg":"panic in runtime goroutine"`)
+	require.Contains(t, body, `"goroutine":"test_root"`)
+	require.Contains(t, body, `"panic":"boom"`)
+	require.Contains(t, body, `"panic_type":"string"`)
+	require.Contains(t, body, `"stack":`)
+	require.Contains(t, body, `"go_version":`)
+	require.Contains(t, body, `"version":`)
+	require.Contains(t, body, `"commit":`)
+}
+
 func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
 	t.Parallel()
 

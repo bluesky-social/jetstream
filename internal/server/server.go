@@ -352,6 +352,9 @@ func (s *Server) debugMux() http.Handler {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
+	// /readyz means both listeners have bound and their Serve loops are
+	// running. It is not an ingest-health or steady-state signal; operators
+	// should use /status and /metrics for ingestion health.
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if !s.ready.Load() {
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
