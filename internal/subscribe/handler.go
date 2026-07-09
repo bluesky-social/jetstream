@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -104,18 +105,53 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		return
 	}
 
-	// v1 custom-zstd-dictionary opt-in. NOT PREFERRED — kept only for
-	// backwards compatibility with v1 clients. New consumers should use
-	// RFC 7692 permessage-deflate (negotiated automatically below). A
-	// client must pick ONE scheme: opting into custom zstd while ALSO
-	// offering permessage-deflate would double-compress (zstd output is
-	// already entropy-coded), so we reject that combination loudly rather
-	// than silently disabling one.
-	wantZstd := values.Get("compress") == "true" ||
-		strings.Contains(r.Header.Get("Socket-Encoding"), "zstd")
-	if wantZstd && strings.Contains(r.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate") {
-		http.Error(w, "choose one compression scheme: custom zstd (compress=true / Socket-Encoding: zstd) or RFC 7692 permessage-deflate, not both", http.StatusBadRequest)
-		return
+	// Compression negotiation. The two endpoints have deliberately
+	// different contracts (#294):
+	//
+	//   - /subscribe (v1, wire-frozen): the legacy custom-zstd-dictionary
+	//     opt-in (compress=true / Socket-Encoding: zstd) and auto-negotiated
+	//     RFC 7692 permessage-deflate, exactly as v1 shipped them. A client
+	//     must pick ONE: zstd output is already entropy-coded, so double-
+	//     compressing under deflate is rejected loudly rather than silently
+	//     disabling one.
+	//
+	//   - /subscribe-v2: dict-zstd is the ONLY compression scheme, opted
+	//     into with zstdDictionary=<id> where <id> names the dictionary the
+	//     client fetched via getZstdDictionary. permessage-deflate is never
+	//     negotiated (per-connection deflate is the dominant server cost at
+	//     fanout scale — measured 2.3x the CPU of shared dict-zstd at 200
+	//     subscribers) and the v1 opt-ins are rejected: we never serve
+	//     frames a client can't decode, and there are no legacy v2 clients
+	//     to stay compatible with.
+	var wantZstd bool
+	if deps.V2 {
+		rawDict := values.Get("zstdDictionary")
+		if values.Get("compress") == "true" || strings.Contains(r.Header.Get("Socket-Encoding"), "zstd") {
+			http.Error(w, "compress=true / Socket-Encoding: zstd is the /subscribe (v1) opt-in; /subscribe-v2 uses zstdDictionary=<id> with the dictionary from getZstdDictionary", http.StatusBadRequest)
+			return
+		}
+		if rawDict != "" {
+			id, perr := strconv.ParseUint(rawDict, 10, 32)
+			if perr != nil || id == 0 {
+				http.Error(w, "zstdDictionary must be a positive integer zstd dictionary ID", http.StatusBadRequest)
+				return
+			}
+			if uint32(id) != DictionaryV2ID {
+				// Never serve frames the client can't decode: an unknown or
+				// retired dictionary ID is a hard 400 carrying the current
+				// ID, so the client re-fetches and reconnects.
+				http.Error(w, fmt.Sprintf("unknown zstd dictionary id %d; current dictionary id is %d (fetch it via getZstdDictionary and reconnect)", id, DictionaryV2ID), http.StatusBadRequest)
+				return
+			}
+			wantZstd = true
+		}
+	} else {
+		wantZstd = values.Get("compress") == "true" ||
+			strings.Contains(r.Header.Get("Socket-Encoding"), "zstd")
+		if wantZstd && strings.Contains(r.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate") {
+			http.Error(w, "choose one compression scheme: custom zstd (compress=true / Socket-Encoding: zstd) or RFC 7692 permessage-deflate, not both", http.StatusBadRequest)
+			return
+		}
 	}
 
 	initialFilter, perr := ParseQuery(values)
@@ -221,21 +257,25 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	}
 	deps.Metrics.incCursorRequests(mode)
 
-	// Negotiate RFC 7692 permessage-deflate when the client offers it.
-	// coder/websocket reads the client's Sec-WebSocket-Extensions during
-	// Accept and only enables compression if the peer advertises support,
-	// falling back to uncompressed otherwise — so non-offering clients
-	// (Safari, bare consumers) are unaffected. ContextTakeover reuses a
-	// 32 KB sliding window across messages for the best ratio on this
-	// repetitive JSON firehose; its ~1.2 MB flate.Writer per connection is
-	// affordable at our connection scale. This is orthogonal to the v1
-	// zstd-with-custom-dictionary scheme rejected above.
-	// zstd clients do their own framing; permessage-deflate must NOT also
-	// run (the mutual-exclusion 400 above guarantees they didn't offer it,
-	// but disable explicitly so an Accept default can't re-enable it).
-	// Non-zstd clients keep the default: deflate negotiated when offered.
+	// Compression at the websocket layer:
+	//
+	//   - /subscribe (v1): negotiate RFC 7692 permessage-deflate when the
+	//     client offers it, exactly as v1 shipped. coder/websocket only
+	//     enables it if the peer advertises support, so non-offering
+	//     clients are unaffected. ContextTakeover reuses a 32 KB sliding
+	//     window across messages; its ~1.2 MB flate.Writer per connection
+	//     is tolerated on the legacy endpoint for wire parity.
+	//   - /subscribe-v2: NEVER negotiated. Per-connection deflate is the
+	//     dominant server cost at fanout scale and is client-triggerable;
+	//     v2's only compression is the shared dict-zstd scheme (#294). A
+	//     deflate offer from a v2 client is silently not accepted (that is
+	//     the RFC 7692 fallback: the extension is simply absent from the
+	//     handshake response, and the client proceeds uncompressed).
+	//   - zstd clients (either endpoint) do their own framing, so deflate
+	//     must not also run; disable explicitly so an Accept default can't
+	//     re-enable it.
 	compressionMode := websocket.CompressionContextTakeover
-	if wantZstd {
+	if wantZstd || deps.V2 {
 		compressionMode = websocket.CompressionDisabled
 	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
