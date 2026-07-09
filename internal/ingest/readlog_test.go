@@ -35,6 +35,61 @@ func TestReadLog_AppendedEventVisibleBeforeDurabilityAndEvictedAfterFlush(t *tes
 	require.Equal(t, w.NextSeq(), w.ReadLog().FloorSeq(), "zero retention evicts once durable")
 }
 
+// brutePinned recomputes pinned bytes the old O(n) way: every resident
+// entry with Seq >= durable. Used to assert the incremental pinnedBytes
+// accumulator never drifts.
+func brutePinned(l *ReadableLog) int64 {
+	var sum int64
+	for _, e := range l.entries {
+		if e.event.Seq >= l.durable {
+			sum += e.bytes
+		}
+	}
+	return sum
+}
+
+// TestReadLog_PinnedBytesAccumulatorMatchesScan drives interleaved
+// append / advanceDurable / evict cycles and asserts the incremental
+// pinnedBytes accumulator equals a full rescan at every step. This is the
+// invariant behind replacing publishMetricsLocked's per-append O(n) scan
+// (which throttled live ingest into an O(n^2) collapse) with an O(1) read.
+func TestReadLog_PinnedBytesAccumulatorMatchesScan(t *testing.T) {
+	t.Parallel()
+
+	// Small byte cap so eviction actually fires while entries stay pinned
+	// above durable — the exact regime where the old scan blew up.
+	l := newReadableLog(1, 512, nil)
+
+	seq := uint64(1)
+	appendN := func(n int) {
+		for range n {
+			ev := &segment.Event{
+				Kind: segment.KindCreate, DID: "did:plc:a", Collection: "c",
+				Rkey: "r", Rev: "1", Payload: []byte{byte(seq)}, Seq: seq,
+			}
+			l.append(ev)
+			seq++
+			require.Equal(t, brutePinned(l), l.pinnedBytes, "pinned drift after append")
+		}
+	}
+
+	appendN(20)
+	require.Equal(t, brutePinned(l), l.pinnedBytes)
+
+	// Advance durability in uneven chunks; each advance moves entries from
+	// pinned to durable and lets eviction reclaim below-durable bytes.
+	for _, d := range []uint64{5, 5, 12, 21} { // 21 == tipSeq after 20 appends
+		l.advanceDurable(d)
+		require.Equal(t, brutePinned(l), l.pinnedBytes, "pinned drift after advanceDurable(%d)", d)
+	}
+
+	// Interleave more appends after eviction has moved baseSeq forward.
+	appendN(15)
+	l.advanceDurable(l.tipSeq)
+	require.Equal(t, brutePinned(l), l.pinnedBytes, "pinned drift after tail drain")
+	require.GreaterOrEqual(t, l.pinnedBytes, int64(0), "pinned must never go negative")
+}
+
 func TestReadLog_DeepCopiesPayload(t *testing.T) {
 	t.Parallel()
 
