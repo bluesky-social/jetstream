@@ -48,5 +48,6 @@ oracle-artifacts/
 # defaults to the repo root. The committed source of truth is
 # testing/mutation/baseline.json, not this run artifact.
 /mutation-result.json
-dicttrain
-client
+# Local binaries built at the repo root (`go build ./cmd/...`, testing/dicttrain)
+/client
+/dicttrain
