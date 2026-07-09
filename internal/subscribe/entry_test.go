@@ -164,12 +164,20 @@ func TestEntry_CompressedV2_SyncEmitsDecodableFrame(t *testing.T) {
 	require.ErrorIs(t, compressedErr, errSkipEvent, "v1 Compressed must return errSkipEvent for KindSync")
 	require.Nil(t, compressedBody)
 
-	// v2 path must emit a decodable frame.
+	// v2 path must emit a frame decodable with the V2 dictionary (and,
+	// deliberately, NOT with the legacy v1 dictionary — the v2 endpoint's
+	// compression contract is independent of v1's frozen scheme).
 	v2Body, v2Err := e.CompressedV2()
 	require.NoError(t, v2Err, "CompressedV2 must not return an error for KindSync")
 	require.NotNil(t, v2Body, "CompressedV2 must return a non-nil frame for KindSync")
 
-	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionary))
+	v1Dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionary))
+	require.NoError(t, err)
+	defer v1Dec.Close()
+	_, err = v1Dec.DecodeAll(v2Body, nil)
+	require.Error(t, err, "v2 frames must NOT decode with the legacy v1 dictionary")
+
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionaryV2))
 	require.NoError(t, err)
 	defer dec.Close()
 	decoded, err := dec.DecodeAll(v2Body, nil)
