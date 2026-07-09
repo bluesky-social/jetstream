@@ -9,8 +9,11 @@ public API at the module root; `internal/client`'s code comments are
 authoritative for implementation details — when this file disagrees with
 them, fix this file.
 
-Design references of the form "§N" cite `docs/README.md` unless otherwise
-noted.
+Design references: low-numbered "§N" (§2, §5) cite `docs/README.md`;
+§11–§14 and §R-numbered rules cite
+`specs/notes/2026-06-28-drop-client-tombstones-design.md` (the
+backfill/cutover design); the original client design is
+`specs/notes/2026-06-18-go-client-design.md`.
 
 ## The shape of the problem
 
@@ -92,12 +95,12 @@ row selector below the floor (see the re-backfill subtlety in Phase 4).
 `Engine.sweepSealedArchive` (`internal/client/engine.go:444`) pages the plan
 and hands work units to the `Downloader` (`internal/client/downloader.go`):
 
-- **Parallelism**: `concurrency` download workers (default auto-sized from
-  `GOMAXPROCS`, override `WithDownloadConcurrency`) fetch segment files or
-  block frames; a decode-worker pool decompresses (zstd block frames, via
-  `segment.DecodeBlockFrame`) and CBOR-decodes in parallel. Whole-segment
-  prefetch is bounded (`prefetchDepth = 2`, ~280 MB resident buffers each)
-  so memory stays flat.
+- **Parallelism**: `concurrency` decode workers (default `GOMAXPROCS`
+  clamped to [4, 32]; override `WithDownloadConcurrency`) decompress and
+  CBOR-decode block frames in parallel. Block fetches run on their own
+  FIFO pool (`min(2*concurrency, 64)` workers) so RTTs overlap across
+  plan entries; whole-segment prefetch is bounded (`prefetchDepth = 2`,
+  ~280 MB resident compressed buffers each) so memory stays flat.
 - **Ordering**: decode is parallel but **emission is in seq order** — the
   downloader sequences completed units back into plan order before emit.
 - **Filtering**: the exact row selector (the client's matcher) runs per row
@@ -108,8 +111,14 @@ and hands work units to the `Downloader` (`internal/client/downloader.go`):
   `Emit` in seq order, bypassing the per-event batcher (the #142
   throughput path). `Run` without a sink uses the legacy batcher.
 
-`--backfill-only` (`WithBackfillOnly`) stops here: a bounded dump of the
-matched sealed range, no cutover.
+**Error contract**: per-block download/decode failures stream as in-order
+recoverable errors — the good prefix of an entry's blocks is emitted, then
+the error, then the next entry continues. Malformed rows are surfaced
+alongside the block's valid rows, never silently dropped.
+
+`--backfill-only` (`WithBackfillOnly`) stops here: a point-in-time dump of
+the matched *sealed* range, no cutover — rows still in the active
+(unsealed) segment are deliberately not included.
 
 ## Phase 3: cutover to live
 
@@ -155,10 +164,12 @@ the engine re-enters the backfill loop from the last durably-processed seq,
 sweeps the now-sealed gap, and cuts over again. Cycles are bounded by
 `maxRebackfillStalls = 5` *non-advancing* cycles (engine.go:24); a resume
 cursor that fails to advance is a pathological loop and surfaces as
-`ErrFatal`. Two subtleties handled at this seam: the batcher is flushed
-before the next sweep (buffered live rows must not be overtaken by newer
-archive rows), and the matcher's seq floor advances to the resume point so
-the one plan unit that straddles it doesn't re-emit already-delivered rows.
+`ErrFatal`. On a **pure-live** stream (no backfill configured) too-old is
+immediately fatal — there is no archive loop to re-enter. Two subtleties
+handled at the re-backfill seam: the batcher is flushed before the next
+sweep (buffered live rows must not be overtaken by newer archive rows),
+and the matcher's seq floor advances to the resume point so the one plan
+unit that straddles it doesn't re-emit already-delivered rows.
 
 **v1/v2 cursor namespace**: the server splits seq cursors from v1
 unix-microsecond cursors at `CursorSeqMaxThreshold = 1e15`
@@ -214,10 +225,12 @@ embedded dictionary).
 - `Batch.Events()` + `Batch.LastCursor()` — batches amortize cursor
   persistence: process the batch, persist `LastCursor` once (default batch
   size 64, `WithBatchSize`; live partial batches flush on
-  `MaxBatchDelay`).
-- Backfill window: `WithAfterSeq`/`WithBeforeSeq` (setting either enables
-  backfill; `WithBeforeSeq` requires `WithBackfillOnly`), pure live:
-  `WithLiveCursor`.
+  `MaxBatchDelay`, default 20ms).
+- Backfill window: `WithAfterSeq` (exclusive; `WithAfterSeq(0)` = the
+  whole archive) / `WithBeforeSeq` (inclusive; requires
+  `WithBackfillOnly` — a live tail with an upper bound would silently
+  drop every later live event). Pure live: `WithLiveCursor` (0 = from
+  the current tip).
 - Filters: `WithCollections` (exact or `ns.*`), `WithDIDs`.
 - Performance: `WithDownloadConcurrency`, `WithRawRecords` (+`Copied`,
   `+CIDs`) to skip the generic record-map build, `TypedEvents[T]` for the
