@@ -73,7 +73,7 @@ func loadtestCommand() *cli.Command {
 			},
 			&cli.BoolFlag{
 				Name:  "zstd",
-				Usage: "Opt into dictionary zstd and decode frames: fetches the dictionary via getZstdDictionary and sends zstdDictionary=<id> on /subscribe-v2 paths, or compress=true on /subscribe",
+				Usage: "Opt into /subscribe-v2 dictionary zstd: fetches the dictionary via getZstdDictionary, sends zstdDictionary=<id>, and decodes every frame (v2 URLs only; the v1 endpoint uses a different, legacy dictionary this tool does not embed)",
 			},
 			&cli.StringFlag{
 				Name:  "cursor",
@@ -264,14 +264,16 @@ func subscribeURL(c config) (string, error) {
 
 	q := u.Query()
 	if c.zstd {
-		if strings.HasSuffix(u.Path, "/subscribe-v2") {
-			if c.zstdDictID == 0 {
-				return "", fmt.Errorf("internal: zstd dictionary ID not resolved before URL build")
-			}
-			q.Set("zstdDictionary", strconv.FormatUint(uint64(c.zstdDictID), 10))
-		} else {
-			q.Set("compress", "true") // legacy /subscribe opt-in
+		// v2-only: the v1 endpoint compresses with the legacy embedded
+		// dictionary, which getZstdDictionary does not serve, so frames
+		// would be undecodable here.
+		if !strings.HasSuffix(u.Path, "/subscribe-v2") {
+			return "", fmt.Errorf("--zstd requires a /subscribe-v2 URL (the v1 endpoint uses the legacy dictionary this tool does not embed)")
 		}
+		if c.zstdDictID == 0 {
+			return "", fmt.Errorf("internal: zstd dictionary ID not resolved before URL build")
+		}
+		q.Set("zstdDictionary", strconv.FormatUint(uint64(c.zstdDictID), 10))
 	}
 	if c.cursor != "" {
 		q.Set("cursor", c.cursor)
