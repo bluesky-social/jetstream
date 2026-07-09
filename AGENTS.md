@@ -17,6 +17,7 @@ Agent-facing living docs, in a good reading order for getting oriented:
 - `specs/invariants.md` — the short list of rules that must never break. Read before changing anything on the ingest, storage, or serve paths.
 - `specs/glossary.md` — one-line definitions of the terms that show up everywhere.
 - `specs/gotchas.md` — accepted limitations and hard-won lessons: things that look like bugs but are deliberate, and mistakes not worth making twice.
+- `specs/client.md` — the client protocol end to end: archive negotiation, download/decode, cutover, live tail, wire compression, and the failure modes at each seam. Read before changing `internal/client`, the module-root API, or anything on the /subscribe-v2 wire contract.
 - `specs/oracle.md` — the source of truth for the oracle/simulator testing rig.
 - `specs/mutation.md` — how the mutation campaign measures the oracle's bug-detection power.
 

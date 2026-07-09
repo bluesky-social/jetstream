@@ -67,6 +67,10 @@ type Config struct {
 	Metrics     *Metrics
 	Tracer      trace.Tracer
 	Import      ImportConfig
+
+	// Dictionary is the /subscribe-v2 compression dictionary served by
+	// getZstdDictionary. Empty Bytes leaves the endpoint unregistered.
+	Dictionary DictionaryConfig
 }
 
 // New constructs the XRPC server and registers all jetstream NSIDs.
@@ -85,6 +89,14 @@ func New(cfg Config) *Server {
 	}))
 	s.xrpc.HandleQuery("network.bsky.jetstream.listSegments", withReady(cfg.Ready, newListSegmentsHandler(cfg.Src)))
 	s.xrpc.HandleProcedure("network.bsky.jetstream.planBackfill", withReady(cfg.Ready, newPlanBackfillHandler(cfg.Src, cfg.Plan)))
+
+	// The /subscribe-v2 compression dictionary. Deliberately NOT behind the
+	// readiness gate: the artifact is compiled in and immutable, and a
+	// client warming up during bootstrap should be able to prefetch it.
+	if len(cfg.Dictionary.Bytes) > 0 {
+		s.xrpc.HandleQuery("network.bsky.jetstream.getZstdDictionary",
+			newGetZstdDictionaryHandler(cfg.Dictionary))
+	}
 
 	// Timestamp-import endpoints (design §8 M6). Registered only when a manager
 	// is wired; bearer-gated (401-by-default when no token) and NOT behind the

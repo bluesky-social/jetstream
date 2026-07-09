@@ -127,23 +127,43 @@
 // accepted but resolves to the live tip rather than 400-ing, so v1 clients
 // that always send a cursor still connect.
 //
-// Two compression schemes are offered, and a client may use at most one:
+// Compression is endpoint-specific (#294; measured basis in
+// specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md):
 //
-//   - RFC 7692 permessage-deflate (PREFERRED) is negotiated transparently
-//     when the client offers it via Sec-WebSocket-Extensions (handler.go).
-//     This is the recommended path: no out-of-band dictionary, standard
-//     browser support, transparent on the read path.
+// /subscribe (v1, wire-frozen) offers two schemes, at most one per client:
+//
+//   - RFC 7692 permessage-deflate, negotiated transparently when the
+//     client offers it via Sec-WebSocket-Extensions (handler.go). Kept
+//     solely for v1 wire parity: per-connection deflate is the dominant
+//     server CPU cost at fanout scale (~2.3x the shared-zstd path at 200
+//     subscribers, scaling linearly with subscriber count).
 //
 //   - The v1 custom-zstd-dictionary scheme (?compress=true or
-//     Socket-Encoding: zstd) is supported only for backwards compatibility
-//     with v1 clients and is NOT preferred. Opted-in connections receive
-//     binary websocket frames, each a zstd frame compressed with the v1
+//     Socket-Encoding: zstd). Opted-in connections receive binary
+//     websocket frames, each a zstd frame compressed with the v1
 //     custom dictionary (dict ID 1612007021, embedded in compress.go). A
 //     client decodes with zstd.NewReader(nil, WithDecoderDicts(dict)).
 //
-// Offering BOTH at once (zstd opt-in plus a permessage-deflate extension
-// offer) is rejected with a 400: the two would double-compress, so the
-// client must pick one. zstd clients have permessage-deflate disabled on
-// the connection; the maxMessageSizeBytes cap is enforced on the
-// uncompressed JSON length for all clients.
+//   - Offering BOTH at once is rejected with a 400: the two would
+//     double-compress, so the client must pick one.
+//
+// /subscribe-v2 serves uncompressed text frames by default and offers
+// exactly ONE compression scheme, chosen deliberately for server
+// cheapness at high fanout (the compressed frame is memoized per event
+// and shared by every subscriber — near-zero marginal compression cost):
+//
+//   - dict-zstd, opted into with ?zstdDictionary=<id>, where <id> is the
+//     zstd dictionary ID of the v2 dictionary (zstd_dictionary_v2,
+//     retrained via `just train-subscribe-dict`) the client downloaded
+//     through the getZstdDictionary XRPC endpoint. An unknown or retired
+//     ID is a pre-upgrade 400 carrying the current ID — the server never
+//     sends frames a client can't decode. The legacy v1 opt-ins are 400s
+//     on v2, and permessage-deflate is NEVER negotiated (a deflate offer
+//     silently falls back to uncompressed per RFC 7692). This is a
+//     deliberate "no zero-setup compression on v2" decision: v2's
+//     audience is thick clients; browsers consume uncompressed frames or
+//     bring a wasm zstd decoder.
+//
+// The maxMessageSizeBytes cap is enforced on the uncompressed JSON length
+// for all clients on both endpoints.
 package subscribe

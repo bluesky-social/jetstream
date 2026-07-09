@@ -103,7 +103,10 @@ func (e *Entry) Compressed() ([]byte, error) {
 	return e.compressedBody, e.compressedErr
 }
 
-// CompressedV2 is Compressed for the /subscribe-v2 wire shape.
+// CompressedV2 is Compressed for the /subscribe-v2 wire shape. It uses
+// the v2 dictionary (zstd_dictionary_v2), not the legacy v1 dictionary:
+// the v2 endpoint's compression contract is dict-ID-negotiated and
+// independent of v1's frozen scheme.
 func (e *Entry) CompressedV2() ([]byte, error) {
 	e.compressedV2Once.Do(func() {
 		body, err := e.EncodedV2()
@@ -111,7 +114,7 @@ func (e *Entry) CompressedV2() ([]byte, error) {
 			e.compressedV2Err = err
 			return
 		}
-		e.compressedV2Body = compressFrame(body)
+		e.compressedV2Body = compressFrameV2(body)
 	})
 	return e.compressedV2Body, e.compressedV2Err
 }

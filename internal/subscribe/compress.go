@@ -1,9 +1,11 @@
 package subscribe
 
 import (
-	_ "embed"
 	"fmt"
 
+	_ "embed"
+
+	"github.com/bluesky-social/jetstream/internal/zstddict"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -50,6 +52,71 @@ func compressFrame(src []byte) []byte {
 	return zstdEncoder.EncodeAll(src, nil)
 }
 
+// zstdDictionaryV2 is the /subscribe-v2 dictionary, trained on live
+// firehose traffic in the v2 wire shape (which the v1 dictionary predates:
+// it has never seen record_cbor, seq, or current lexicons and manages only
+// ~1.67x on v2 frames vs this dictionary's ~2.5x). Retrain with
+// `just train-subscribe-dict`; the embedded dictionary ID (the trainer
+// defaults it to the training date, YYYYMMDD) versions the artifact, and
+// clients fetch the bytes by that ID via the getZstdDictionary XRPC
+// endpoint rather than compiling them in. See
+// specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md.
+//
+//go:embed zstd_dictionary_v2
+var zstdDictionaryV2 []byte
+
+// DictionaryV2 exposes the current /subscribe-v2 dictionary bytes for the
+// download endpoint. Treat as read-only.
+func DictionaryV2() []byte { return zstdDictionaryV2 }
+
+// ZstdDictRejectedMarker is the stable substring every /subscribe-v2
+// dictionary-ID rejection carries in its pre-upgrade HTTP 400 body. The
+// thick client substring-matches it (it cannot import this package; see
+// CursorTooOldMarker for the precedent and the contract test that pins the
+// duplicate) to distinguish "the server rotated its dictionary — refetch
+// and reconnect" from an unrelated 400. Do not reword without updating the
+// client's duplicated literal.
+const ZstdDictRejectedMarker = "unknown zstd dictionary id"
+
+// DictionaryV2ID is the dictionary ID embedded in the v2 dictionary,
+// parsed from its header at init. The negotiation query param and the
+// download endpoint both key on this value.
+var DictionaryV2ID = mustParseDictID(zstdDictionaryV2)
+
+func mustParseDictID(d []byte) uint32 {
+	id, err := zstddict.ParseID(d)
+	if err != nil {
+		// The dictionary is embedded at build time; failure is a
+		// build/programmer error, not runtime input. Fail loud.
+		panic(fmt.Sprintf("subscribe: zstd_dictionary_v2: %v", err))
+	}
+	return id
+}
+
+// zstdEncoderV2 is the process-wide encoder for /subscribe-v2 zstd frames.
+// Unlike the v1 encoder it uses SpeedFastest: measured on live traffic the
+// level costs ~1% ratio for ~3x less CPU per message (the per-message cost
+// of dictionary encoding is dominated by match-table Reset, not the
+// compression itself). Same concurrency contract as zstdEncoder.
+var zstdEncoderV2 = mustNewZstdEncoderV2()
+
+func mustNewZstdEncoderV2() *zstd.Encoder {
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderDict(zstdDictionaryV2),
+		zstd.WithWindowSize(1<<17),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithEncoderLevel(zstd.SpeedFastest))
+	if err != nil {
+		panic(fmt.Sprintf("subscribe: build v2 zstd encoder: %v", err))
+	}
+	return enc
+}
+
+// compressFrameV2 is compressFrame for the /subscribe-v2 dictionary.
+func compressFrameV2(src []byte) []byte {
+	return zstdEncoderV2.EncodeAll(src, nil)
+}
+
 // WarmEncoder forces the package-global v1 zstd encoder to create its internal
 // worker-pool channel now, outside any testing/synctest bubble. See
 // segment.WarmEncoder for the full rationale: klauspost/compress builds that
@@ -59,4 +126,5 @@ func compressFrame(src []byte) []byte {
 // outside bubble". Test-support only; cheap and idempotent.
 func WarmEncoder() {
 	_ = compressFrame(nil)
+	_ = compressFrameV2(nil)
 }

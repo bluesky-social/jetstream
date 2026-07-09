@@ -12,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/zstddict"
 	"github.com/coder/websocket"
+	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -76,6 +78,19 @@ type liveConfig struct {
 	// mode selects raw vs. map record materialization for live commits. Zero
 	// value = the default map build.
 	mode recordDecodeMode
+	// zstdDict, when non-nil, opts the connection into the /subscribe-v2
+	// dict-zstd compression scheme: the dictionary ID (parsed from the
+	// blob's header) is sent as ?zstdDictionary=<id> and incoming BINARY
+	// frames are decompressed with it. The caller obtains the blob via
+	// getZstdDictionary before constructing the consumer. nil = plain
+	// uncompressed text frames (v2 never negotiates permessage-deflate).
+	zstdDict []byte
+	// refetchDict, when non-nil, re-fetches the server's CURRENT dictionary
+	// after the server rejects the pinned ID (a dictionary rotation: retrain
+	// + redeploy changes DictionaryV2ID while this consumer holds the old
+	// blob). nil disables in-place recovery; the consumer then degrades to
+	// an uncompressed tail on rejection. See refreshDict.
+	refetchDict func(ctx context.Context) []byte
 }
 
 func (c liveConfig) minBackoff() time.Duration {
@@ -107,6 +122,10 @@ type liveConsumer struct {
 	// replay-from-0 start.
 	lastSeq uint64
 	seenAny bool
+
+	// zstd decompression state, set only when cfg.zstdDict is non-nil.
+	zstdDictID  uint32
+	zstdDecoder *zstd.Decoder
 }
 
 // LastSeq returns the highest seq the consumer has delivered, or its seeded
@@ -128,6 +147,27 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 	if cfg.logger == nil {
 		cfg.logger = slog.New(slog.NewTextHandler(discardWriter{}, nil))
 	}
+	var dictID uint32
+	var dec *zstd.Decoder
+	if cfg.zstdDict != nil {
+		id, err := zstddict.ParseID(cfg.zstdDict)
+		if err != nil {
+			// The blob came from getZstdDictionary moments ago; a parse
+			// failure is a server/transport fault, not a reason to crash.
+			// Fall back to uncompressed (a documented degradation, logged).
+			cfg.logger.Warn("invalid zstd dictionary; falling back to uncompressed live tail", "err", err)
+			cfg.zstdDict = nil
+		} else {
+			d, derr := newZstdDecoder(cfg.zstdDict, cfg.readLimit)
+			if derr != nil {
+				cfg.logger.Warn("zstd decoder construction failed; falling back to uncompressed live tail", "err", derr)
+				cfg.zstdDict = nil
+			} else {
+				dictID = id
+				dec = d
+			}
+		}
+	}
 	// Seed lastSeq (the dedup floor) from dedupFloor, NOT from the wire cursor:
 	// the two diverge in the empty-archive cutover, where the wire cursor is 0
 	// (replay from the start) but dedupFloor is 0 meaning "nothing delivered yet"
@@ -136,7 +176,7 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 	// through seq) drops the at-least-once re-delivery of seq itself. seenAny
 	// stays false until the first delivery so reconnect knows whether to omit the
 	// wire cursor (from-tip) or resume. See liveConfig.dedupFloor.
-	return &liveConsumer{cfg: cfg, lastSeq: cfg.dedupFloor}
+	return &liveConsumer{cfg: cfg, lastSeq: cfg.dedupFloor, zstdDictID: dictID, zstdDecoder: dec}
 }
 
 // Run tails the live stream until ctx is cancelled, invoking emit for each
@@ -145,6 +185,15 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 // emit as a non-nil error with a nil event so the caller can observe churn);
 // a context cancellation is a clean stop and returns nil.
 func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) error {
+	// The decoder holds worker goroutines/buffers the zstd package requires
+	// Close to release; Run is the consumer's lifetime boundary, and the
+	// decoder may be swapped mid-run by refreshDict, so close whatever is
+	// current at exit.
+	defer func() {
+		if c.zstdDecoder != nil {
+			c.zstdDecoder.Close()
+		}
+	}()
 	minB, maxB := c.cfg.minBackoff(), c.cfg.maxBackoff()
 	backoff := minB
 	for {
@@ -167,6 +216,14 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) e
 		// both the terminal handoff connect and a mid-stream fell-off-live drop.
 		if errors.Is(err, errLiveCursorTooOld) {
 			return err
+		}
+		// A dict-rejected pre-upgrade 400 means the server rotated its
+		// /subscribe-v2 dictionary out from under us. Unlike a too-old
+		// cursor this is recoverable in-place: refresh (or shed) the
+		// dictionary before the reconnect below, rather than 400-looping
+		// on an ID the server will keep refusing.
+		if errors.Is(err, errLiveDictRejected) {
+			c.refreshDict(ctx)
 		}
 		// A session that made progress (delivered new events) is healthy; reset
 		// backoff so a long-lived connection that finally drops reconnects
@@ -205,7 +262,20 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
-		if typ != websocket.MessageText {
+		switch {
+		case c.zstdDecoder != nil && typ == websocket.MessageBinary:
+			// dict-zstd connection: every event frame is a BINARY zstd
+			// frame; decompress before decode. DecodeAll enforces the
+			// decoder's memory limit, bounding a hostile frame.
+			data, err = c.zstdDecoder.DecodeAll(data, nil)
+			if err != nil {
+				// Upstream input, never crash: surface and keep the tail.
+				if !emit(nil, fmt.Errorf("jetstream: zstd frame decode: %w", err)) {
+					return errEmitStop
+				}
+				continue
+			}
+		case typ != websocket.MessageText:
 			continue // jetstream frames are text JSON; ignore stray binary
 		}
 		ev, derr := decodeLiveFrame(data, c.cfg.mode)
@@ -234,6 +304,52 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 			return errEmitStop
 		}
 	}
+}
+
+// newZstdDecoder builds a dictionary-seeded decoder for live frames. The
+// decoded-size cap mirrors the connection's read limit: on an uncompressed
+// connection a frame's JSON must fit readLimit on the wire, so bounding the
+// decompressed output to the same value preserves that contract and stops a
+// hostile frame from expanding toward the library's 64 GiB default
+// (DecodeAll rejects larger output with an error, surfaced per-frame).
+func newZstdDecoder(dict []byte, readLimit int64) (*zstd.Decoder, error) {
+	return zstd.NewReader(nil,
+		zstd.WithDecoderDicts(dict),
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderMaxMemory(uint64(readLimit)))
+}
+
+// refreshDict recovers from a server-side dictionary rotation after a
+// dict-rejected reconnect refusal: re-fetch the current dictionary and swap
+// the decoder so the next dial negotiates the new ID. When the refetch is
+// unavailable, fails, or returns the very ID the server just rejected (e.g.
+// a mixed-version fleet behind a load balancer), degrade to an uncompressed
+// tail for this consumer's lifetime — compression is an optimization; the
+// tail must keep flowing.
+func (c *liveConsumer) refreshDict(ctx context.Context) {
+	if c.zstdDecoder == nil {
+		return // not a zstd connection; nothing to refresh
+	}
+	rejected := c.zstdDictID
+	if c.cfg.refetchDict != nil {
+		if blob := c.cfg.refetchDict(ctx); blob != nil {
+			if id, perr := zstddict.ParseID(blob); perr == nil && id != rejected {
+				if d, derr := newZstdDecoder(blob, c.cfg.readLimit); derr == nil {
+					c.zstdDecoder.Close()
+					c.zstdDecoder = d
+					c.zstdDictID = id
+					c.cfg.logger.Info("live zstd dictionary rotated; refetched",
+						"rejected_id", rejected, "new_id", id)
+					return
+				}
+			}
+		}
+	}
+	c.zstdDecoder.Close()
+	c.zstdDecoder = nil
+	c.zstdDictID = 0
+	c.cfg.logger.Warn("live zstd dictionary rejected and refetch unavailable; continuing uncompressed",
+		"rejected_id", rejected)
 }
 
 func (c *liveConsumer) subscribeURL() string {
@@ -269,18 +385,22 @@ func (c *liveConsumer) subscribeURL() string {
 	for _, d := range c.cfg.dids {
 		q.Add("wantedDids", d)
 	}
+	if c.zstdDecoder != nil {
+		q.Set("zstdDictionary", strconv.FormatUint(uint64(c.zstdDictID), 10))
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
 }
 
-// liveDialOptions builds the websocket DialOptions for the live tail. It
-// offers RFC 7692 permessage-deflate with context takeover: the server
-// auto-negotiates deflate when the client advertises it, which cuts bandwidth
-// substantially on this repetitive JSON firehose. A server that does not
-// negotiate it falls back to an uncompressed stream transparently.
+// liveDialOptions builds the websocket DialOptions for the live tail.
+// permessage-deflate is deliberately NOT offered: /subscribe-v2 never
+// negotiates it (#294 removed it server-side — per-connection deflate is
+// the dominant server cost at fanout scale), so offering it is dead
+// weight on the handshake. Compression on v2 is the dict-zstd scheme,
+// negotiated at the application layer via ?zstdDictionary=<id>.
 func liveDialOptions(hc *http.Client) *websocket.DialOptions {
 	return &websocket.DialOptions{
-		CompressionMode: websocket.CompressionContextTakeover,
+		CompressionMode: websocket.CompressionDisabled,
 		HTTPClient:      hc, // nil is fine: websocket.Dial falls back to its default
 	}
 }
@@ -303,6 +423,21 @@ var errLiveCursorTooOld = errors.New("jetstream: live cursor too old")
 // (live_subscribe_contract_test.go), which fails CI if either side drifts.
 const cursorTooOldMarker = "cursor too old"
 
+// errLiveDictRejected marks a pre-upgrade HTTP 400 refusing the client's
+// ?zstdDictionary ID: the server rotated its /subscribe-v2 dictionary
+// (retrain + redeploy) and no longer serves the ID this consumer pinned at
+// construction. Unlike errLiveCursorTooOld it is recoverable in-place — the
+// consumer refetches the current dictionary (or degrades to uncompressed)
+// and reconnects; see refreshDict.
+var errLiveDictRejected = errors.New("jetstream: live zstd dictionary rejected")
+
+// zstdDictRejectedMarker is the substring the server embeds in its
+// dictionary-rejection HTTP 400 body. It MUST equal
+// internal/subscribe.ZstdDictRejectedMarker; like cursorTooOldMarker the
+// literal is duplicated (the client cannot import the server package) and
+// pinned equal by TestDialWebsocketMatchesServerDictRejected.
+const zstdDictRejectedMarker = "unknown zstd dictionary id"
+
 // dialWebsocket is the production dialer. hc, when non-nil, routes the HTTP/1.1
 // upgrade through a custom transport (e.g. an in-process pipe); nil uses the
 // websocket default.
@@ -319,6 +454,9 @@ func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn,
 			_ = resp.Body.Close()
 			if strings.Contains(string(body), cursorTooOldMarker) {
 				return nil, fmt.Errorf("%w: %s", errLiveCursorTooOld, strings.TrimSpace(string(body)))
+			}
+			if strings.Contains(string(body), zstdDictRejectedMarker) {
+				return nil, fmt.Errorf("%w: %s", errLiveDictRejected, strings.TrimSpace(string(body)))
 			}
 		} else if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()

@@ -12,12 +12,19 @@ const (
 // skip metric registration entirely. Mirrors the convention in
 // internal/ingest/live/metrics.go.
 type Metrics struct {
-	Subscribers         prometheus.Gauge
+	Subscribers         *prometheus.GaugeVec
 	CleanDisconnects    prometheus.Counter
-	EventsSent          prometheus.Counter
+	EventsSent          *prometheus.CounterVec
 	EventsSkippedSync   prometheus.Counter
 	EventsSkippedResync prometheus.Counter
 	EncodeErrors        prometheus.Counter
+
+	// Compression observability (2026-07-09, #294): payload bytes written
+	// and pre-compression JSON bytes, labeled by negotiated scheme, so the
+	// scheme population mix, per-scheme egress, and the zstd compression
+	// ratio are all visible in production.
+	BytesSent    *prometheus.CounterVec
+	BytesEncoded *prometheus.CounterVec
 
 	// Added in 2026-05-27 v1-filtering port:
 	EventsFiltered      prometheus.Counter
@@ -40,21 +47,31 @@ type Metrics struct {
 // Construct exactly once per process.
 func NewMetrics(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
-		Subscribers: prometheus.NewGauge(prometheus.GaugeOpts{
+		Subscribers: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "subscribers",
-			Help: "Current number of connected /subscribe websocket clients.",
-		}),
+			Help: "Current number of connected /subscribe websocket clients, by negotiated compression scheme (none, deflate, zstd).",
+		}, []string{"compression"}),
 		CleanDisconnects: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "clean_disconnects_total",
 			Help: "Number of /subscribe connections closed by the client or normal shutdown.",
 		}),
-		EventsSent: prometheus.NewCounter(prometheus.CounterOpts{
+		EventsSent: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "events_sent_total",
-			Help: "Number of JSON frames the handler has written to its websocket clients.",
-		}),
+			Help: "Number of JSON frames the handler has written to its websocket clients, by negotiated compression scheme.",
+		}, []string{"compression"}),
+		BytesSent: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "bytes_sent_total",
+			Help: "Websocket payload bytes written to /subscribe clients, by negotiated compression scheme. For scheme=zstd this is the post-compression frame size; deflate compresses inside the websocket library, so scheme=deflate counts pre-compression bytes (kernel-level egress is the authoritative wire measure there).",
+		}, []string{"compression"}),
+		BytesEncoded: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "bytes_encoded_total",
+			Help: "Pre-compression JSON bytes of frames written to /subscribe clients, by negotiated compression scheme. bytes_sent_total/bytes_encoded_total is the delivered compression ratio for scheme=zstd.",
+		}, []string{"compression"}),
 		EventsSkippedSync: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name:        "events_skipped_total",
@@ -124,7 +141,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.Subscribers, m.CleanDisconnects,
-		m.EventsSent, m.EventsSkippedSync, m.EventsSkippedResync, m.EncodeErrors,
+		m.EventsSent, m.BytesSent, m.BytesEncoded,
+		m.EventsSkippedSync, m.EventsSkippedResync, m.EncodeErrors,
 		m.EventsFiltered, m.EventsOversize,
 		m.OptionsUpdates, m.OptionsUpdateErrors,
 		m.CursorRequests, m.CursorResolveSeconds,
@@ -133,14 +151,22 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	return m
 }
 
-func (m *Metrics) incSubscribers() {
+// Compression scheme labels. Pinned as constants so callers can't drift
+// the label cardinality (mirrors the optionsUpdateErrorReason convention).
+const (
+	compressionSchemeNone    = "none"
+	compressionSchemeDeflate = "deflate"
+	compressionSchemeZstd    = "zstd"
+)
+
+func (m *Metrics) incSubscribers(scheme string) {
 	if m != nil {
-		m.Subscribers.Inc()
+		m.Subscribers.WithLabelValues(scheme).Inc()
 	}
 }
-func (m *Metrics) decSubscribers() {
+func (m *Metrics) decSubscribers(scheme string) {
 	if m != nil {
-		m.Subscribers.Dec()
+		m.Subscribers.WithLabelValues(scheme).Dec()
 	}
 }
 func (m *Metrics) incCleanDisconnects() {
@@ -148,9 +174,15 @@ func (m *Metrics) incCleanDisconnects() {
 		m.CleanDisconnects.Inc()
 	}
 }
-func (m *Metrics) incEventsSent() {
+
+// incEventsSent records one delivered frame: the frame count, the payload
+// bytes actually handed to the websocket write (post-zstd for scheme=zstd),
+// and the pre-compression JSON size, all under the connection's scheme label.
+func (m *Metrics) incEventsSent(scheme string, payloadBytes, encodedBytes int) {
 	if m != nil {
-		m.EventsSent.Inc()
+		m.EventsSent.WithLabelValues(scheme).Inc()
+		m.BytesSent.WithLabelValues(scheme).Add(float64(payloadBytes))
+		m.BytesEncoded.WithLabelValues(scheme).Add(float64(encodedBytes))
 	}
 }
 func (m *Metrics) incEventsSkippedSync() {
