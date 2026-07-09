@@ -38,10 +38,11 @@ The durability ordering between these two is the invariant that keeps a crash sa
 
 ### Serve — getting data out
 
-- **`/subscribe` websocket** (`internal/subscribe`): pull-based fan-out. Every subscriber runs the same loop and is served from wherever its cursor points — the writer's readable log (the hot tail) for recent events, or the cold reader (a bounded disk walk over sealed segments through a shared block cache) for older cursors. There's no per-client outbound queue, so a slow reader can't blow up server memory. This package carries a lot of deliberate v1 wire-compatibility quirks; `internal/subscribe/doc.go` lists them. This maintains backwards compatibility with the original https://github.com/bluesky-social/jetstream-legacy system. Compression is endpoint-specific: v1 keeps its frozen contract (legacy zstd dictionary + permessage-deflate), while `/subscribe-v2`'s only scheme is dict-zstd negotiated by dictionary ID (`?zstdDictionary=<id>`, dictionary fetched via the `getZstdDictionary` XRPC endpoint, retrained with `just train-subscribe-dict`) — deflate is never negotiated on v2 (`internal/subscribe/doc.go` has the contract, `specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md` the measured rationale).
+- **`/subscribe` websocket** (`internal/subscribe`): pull-based fan-out. Every subscriber runs the same loop and is served from wherever its cursor points — the writer's readable log (the hot tail) for recent events, or the cold reader (a bounded disk walk over sealed segments through a shared block cache) for older cursors. There's no per-client outbound queue, so a slow reader can't blow up server memory. This package carries a lot of deliberate v1 wire-compatibility quirks; `internal/subscribe/doc.go` lists them. This maintains backwards compatibility with the original https://github.com/bluesky-social/jetstream-legacy system. Compression is endpoint-specific: v1 keeps its frozen contract (legacy zstd dictionary + permessage-deflate), while `/subscribe-v2`'s only scheme is dict-zstd negotiated by dictionary ID — deflate is never negotiated on v2. `internal/subscribe/doc.go` has the server-side contract; `specs/client.md` the client side; `specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md` the measured rationale.
+- **Compression dictionary endpoint** (`internal/xrpcapi/getzstddictionary.go`): serves the `/subscribe-v2` dictionary as an immutable, CDN-cacheable blob keyed by its embedded zstd dictionary ID. Retrained against live traffic with `just train-subscribe-dict` (`testing/dicttrain`); each retrain embeds a fresh ID and clients recover from rotation in-place (see `specs/client.md`).
 - **Archive download over HTTP/XRPC** (`internal/xrpcapi`): the paginated `planBackfill` → `getSegment`/`getBlock` path clients use to pull sealed history before cutover.
 - **HTTP plumbing** (`internal/server`): the public listener (default :8080) and opt-in debug listener (commonly :6060) and middleware. Status, health, and metrics live off these (`internal/status`, `internal/obs`).
-- **Client library** (`internal/client` and the module root): the "thick" Go client that negotiates the archive, folds the stream, dedupes by seq, and cuts over to live. `docs/README.md` §5.
+- **Client library** (`internal/client` and the module root): the "thick" Go client that negotiates the archive, downloads and decodes it in parallel, dedupes by seq, cuts over to live, and recovers from too-old cursors and dictionary rotations. `specs/client.md` is the end-to-end protocol description; `docs/README.md` §5 owns the wire formats.
 
 ### Testing rig — the oracle and simulator
 
@@ -67,7 +68,9 @@ This is unusually central to the project, so it's worth knowing even if you're n
 | The segment writer (append/flush/seal) | `internal/ingest/doc.go` |
 | The `/subscribe` websocket + v1 quirks | `internal/subscribe/doc.go`, `docs/README.md` §5 |
 | Archive download (planBackfill/getSegment) | `internal/xrpcapi`, `docs/README.md` §5 |
-| The Go client | `internal/client`, module root, `docs/README.md` §5 |
+| The client protocol, end to end (negotiate → download → cutover → live, compression, failure modes) | `specs/client.md` |
+| The Go client implementation | `internal/client`, module root, `specs/client.md` |
+| Wire compression (dict-zstd, dictionary rotation, retraining) | `specs/client.md`, `internal/subscribe/doc.go` |
 | Compaction / tombstones | `internal/tombstone`, `docs/README.md` §3.3 |
 | Timestamp import | `internal/timestamp`, `docs/README.md` §8 |
 | The oracle / simulator | `specs/oracle.md`, `internal/oracle/doc.go`, `internal/simulator/doc.go` |
