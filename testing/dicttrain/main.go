@@ -61,7 +61,7 @@ func run() error {
 		return fmt.Errorf("capture: %w", err)
 	}
 
-	dict, err := trainDict(train, *maxDict, uint32(*dictID))
+	dict, err := trainDict(ctx, train, *maxDict, uint32(*dictID))
 	if err != nil {
 		return fmt.Errorf("train: %w", err)
 	}
@@ -120,7 +120,7 @@ func capture(ctx context.Context, host string, train, holdout int) (trainMsgs, e
 // trainDict shells out to the zstd CLI's fastCOVER trainer. Samples are
 // written one file per event (the trainer treats each file as one sample);
 // -r keeps the argv short.
-func trainDict(samples [][]byte, maxDict int, dictID uint32) ([]byte, error) {
+func trainDict(ctx context.Context, samples [][]byte, maxDict int, dictID uint32) ([]byte, error) {
 	if _, err := exec.LookPath("zstd"); err != nil {
 		return nil, fmt.Errorf("the zstd CLI is required on PATH: %w", err)
 	}
@@ -142,7 +142,7 @@ func trainDict(samples [][]byte, maxDict int, dictID uint32) ([]byte, error) {
 	}
 
 	outPath := filepath.Join(dir, "dict.bin")
-	cmd := exec.Command("zstd", "--train-fastcover", "-r", sampleDir,
+	cmd := exec.CommandContext(ctx, "zstd", "--train-fastcover", "-r", sampleDir,
 		"--maxdict="+strconv.Itoa(maxDict),
 		"--dictID="+strconv.FormatUint(uint64(dictID), 10),
 		"-o", outPath, "-f")
