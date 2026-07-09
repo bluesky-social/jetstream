@@ -1812,3 +1812,111 @@ func TestHandler_RequireHello_MultipleUpdatesDoNotPanic(t *testing.T) {
 	frame := readOneFrame(t, ctx, conn)
 	require.Contains(t, string(frame), "did:plc:still-flowing")
 }
+
+// TestHandler_CompressionSchemeMetrics pins the scheme-labeled
+// observability added for #294: subscribers gauge, events_sent counter,
+// and the bytes_sent/bytes_encoded pair are all recorded under the
+// connection's negotiated compression scheme, and the zstd byte counters
+// show a genuine compression ratio (sent < encoded).
+func TestHandler_CompressionSchemeMetrics(t *testing.T) {
+	t.Parallel()
+
+	st := newSteadyStateStore(t)
+	b, _ := newReadLogTail(t, 1<<20, noCold)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	h := NewHandler(Subscription{
+		Tail:    b,
+		Store:   st,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics: metrics,
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	waitFrames := func(scheme string, want float64) {
+		t.Helper()
+		deadline := time.After(2 * time.Second)
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for {
+			if testutil.ToFloat64(metrics.EventsSent.WithLabelValues(scheme)) >= want {
+				return
+			}
+			select {
+			case <-tick.C:
+			case <-deadline:
+				t.Fatalf("timed out waiting for events_sent_total{compression=%q} >= %v", scheme, want)
+			}
+		}
+	}
+
+	baseURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	// scheme=none: explicitly do not offer permessage-deflate.
+	connNone, respNone, err := websocket.Dial(ctx, baseURL, &websocket.DialOptions{
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	require.NoError(t, err)
+	if respNone != nil && respNone.Body != nil {
+		defer func() { _ = respNone.Body.Close() }()
+	}
+	defer func() { _ = connNone.Close(websocket.StatusNormalClosure, "test done") }()
+
+	// scheme=deflate: offer RFC 7692.
+	connDeflate, respDeflate, err := websocket.Dial(ctx, baseURL, &websocket.DialOptions{
+		CompressionMode: websocket.CompressionContextTakeover,
+	})
+	require.NoError(t, err)
+	if respDeflate != nil && respDeflate.Body != nil {
+		defer func() { _ = respDeflate.Body.Close() }()
+	}
+	defer func() { _ = connDeflate.Close(websocket.StatusNormalClosure, "test done") }()
+
+	// scheme=zstd: v1 custom-dictionary opt-in.
+	connZstd, respZstd, err := websocket.Dial(ctx, baseURL+"?compress=true", &websocket.DialOptions{
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	require.NoError(t, err)
+	if respZstd != nil && respZstd.Body != nil {
+		defer func() { _ = respZstd.Body.Close() }()
+	}
+	defer func() { _ = connZstd.Close(websocket.StatusNormalClosure, "test done") }()
+
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(metrics.Subscribers.WithLabelValues("none")) == 1 &&
+			testutil.ToFloat64(metrics.Subscribers.WithLabelValues("deflate")) == 1 &&
+			testutil.ToFloat64(metrics.Subscribers.WithLabelValues("zstd")) == 1
+	}, 2*time.Second, time.Millisecond, "each scheme should have exactly one subscriber")
+
+	waitForTailBlocked(t, b)
+	var seq uint64
+	publishIdentity(t, b, &seq, "did:plc:schememetrics", 1)
+
+	for _, scheme := range []string{"none", "deflate", "zstd"} {
+		waitFrames(scheme, 1)
+		require.Equal(t, float64(1),
+			testutil.ToFloat64(metrics.EventsSent.WithLabelValues(scheme)), "events for %s", scheme)
+		sent := testutil.ToFloat64(metrics.BytesSent.WithLabelValues(scheme))
+		encoded := testutil.ToFloat64(metrics.BytesEncoded.WithLabelValues(scheme))
+		require.Positive(t, sent, "bytes_sent for %s", scheme)
+		require.Positive(t, encoded, "bytes_encoded for %s", scheme)
+		switch scheme {
+		case "zstd":
+			require.Less(t, sent, encoded,
+				"zstd payload bytes must be smaller than the encoded JSON")
+		default:
+			// none and deflate hand the uncompressed body to the websocket
+			// write (deflate compresses inside the library), so payload ==
+			// encoded on both.
+			require.Equal(t, encoded, sent, "payload==encoded for %s", scheme)
+		}
+	}
+
+	// Drain the frames so the close below is clean.
+	_ = readOneFrame(t, ctx, connNone)
+	_ = readOneFrame(t, ctx, connDeflate)
+	_ = readOneZstdFrame(t, ctx, connZstd)
+}

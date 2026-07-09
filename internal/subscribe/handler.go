@@ -245,6 +245,23 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	if err != nil {
 		return
 	}
+
+	// Classify the connection's negotiated compression scheme for metrics.
+	// zstd is an explicit opt-in; deflate is negotiated iff we allowed it
+	// AND the client offered the extension (mirrors coder/websocket's
+	// selectDeflate accept condition). The library does not export the
+	// negotiated state, so this echoes its decision rather than observing
+	// it; exotic extension params a client could send that make the
+	// library refuse deflate would be mislabeled, which is acceptable for
+	// a metrics label.
+	scheme := compressionSchemeNone
+	switch {
+	case wantZstd:
+		scheme = compressionSchemeZstd
+	case compressionMode != websocket.CompressionDisabled &&
+		strings.Contains(r.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate"):
+		scheme = compressionSchemeDeflate
+	}
 	defer func() { _ = conn.CloseNow() }()
 	conn.SetReadLimit(int64(MaxSubscriberMessageBytes))
 
@@ -300,7 +317,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		startSeq = deps.Tail.Tip()
 	}
 
-	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, wantZstd, logger)
+	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, scheme, logger)
 }
 
 func runReader(
@@ -368,11 +385,12 @@ func runSubscriberLoop(
 	deps Subscription,
 	filterPtr *atomic.Pointer[Filter],
 	startSeq uint64,
-	compress bool,
+	scheme string,
 	logger *slog.Logger,
 ) {
-	deps.Metrics.incSubscribers()
-	defer deps.Metrics.decSubscribers()
+	compress := scheme == compressionSchemeZstd
+	deps.Metrics.incSubscribers(scheme)
+	defer deps.Metrics.decSubscribers(scheme)
 
 	slowDetector := newSlowDetector(deps.Tail.SlowConfig())
 	batchMax := deps.Tail.ReadBatch()
@@ -495,7 +513,7 @@ func runSubscriberLoop(
 				return
 			}
 
-			deps.Metrics.incEventsSent()
+			deps.Metrics.incEventsSent(scheme, len(payload), len(body))
 		}
 
 		cursor = next
