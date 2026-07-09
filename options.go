@@ -293,7 +293,10 @@ func WithRawRecordCIDs() Option {
 // This is the only compression /subscribe-v2 offers; it substantially cuts
 // live-tail bandwidth (~2.5x on typical firehose traffic) at ~3µs/event of
 // client-side decode. A dictionary fetch failure degrades to an
-// uncompressed tail (logged) rather than failing the stream.
+// uncompressed tail (logged) rather than failing the stream. If the server
+// rotates its dictionary mid-stream (retrain + redeploy), the client
+// refetches the current dictionary and reconnects compressed; if the
+// refetch fails it likewise degrades to uncompressed.
 func WithZstdCompression() Option {
 	return func(c *config) {
 		c.zstdCompression = true

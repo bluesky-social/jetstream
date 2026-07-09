@@ -63,6 +63,35 @@ func TestDialWebsocketMatchesServerTooOld(t *testing.T) {
 		"an unrelated 400 must not be classified as a too-old cursor")
 }
 
+// TestDialWebsocketMatchesServerDictRejected locks the wire contract for the
+// /subscribe-v2 dictionary-rotation signal, mirroring the too-old test above:
+// the client recognizes the server's dict-rejection HTTP 400 by substring
+// (it cannot import internal/subscribe in production code), so message drift
+// would silently turn a recoverable rotation into a permanent 400 reconnect
+// loop. This test fails CI the moment either side drifts.
+func TestDialWebsocketMatchesServerDictRejected(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, subscribe.ZstdDictRejectedMarker, zstdDictRejectedMarker,
+		"client and server dict-rejected markers drifted")
+
+	// Mirror handler.go's rejection body exactly.
+	realServerBody := fmt.Sprintf("%s %d; current dictionary id is %d (fetch it via getZstdDictionary and reconnect)",
+		subscribe.ZstdDictRejectedMarker, 20260101, 20260709)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, realServerBody, http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	_, err := dialWebsocket(context.Background(), toWS(t, srv.URL), nil)
+	require.Error(t, err)
+	require.ErrorIs(t, err, errLiveDictRejected,
+		"a real pre-upgrade 400 carrying the server's dict-rejection body must map to errLiveDictRejected")
+	require.NotErrorIs(t, err, errLiveCursorTooOld)
+	// The current-ID hint must survive into the wrapped error for operability.
+	require.Contains(t, err.Error(), "20260709")
+}
+
 // toWS rewrites an httptest http:// URL to the ws:// scheme dialWebsocket
 // expects, preserving host/port, and points at /subscribe-v2.
 func toWS(t *testing.T, httpURL string) string {

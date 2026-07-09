@@ -21,6 +21,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -47,6 +48,20 @@ func run() error {
 	dictID := flag.Uint("dict-id", 0, "dictionary ID to embed (default: today's UTC date as YYYYMMDD)")
 	out := flag.String("out", "internal/subscribe/zstd_dictionary_v2", "output path for the trained dictionary")
 	flag.Parse()
+
+	// Validate operator input at the CLI boundary: negative counts panic
+	// make() downstream, a zero holdout yields a meaningless NaN ratio, and
+	// a dict ID above 32 bits would silently truncate in the uint32
+	// conversion below — the printed ID and the embedded ID would diverge.
+	// The ceiling is far above any useful capture (each event is a file on
+	// disk for the trainer) and keeps the counts' sum from overflowing int.
+	const maxEvents = 100_000_000
+	if *samples <= 0 || *holdout <= 0 || *samples > maxEvents || *holdout > maxEvents {
+		return fmt.Errorf("--samples and --holdout must be in [1, %d] (got %d and %d)", maxEvents, *samples, *holdout)
+	}
+	if *dictID > math.MaxUint32 {
+		return fmt.Errorf("--dict-id %d exceeds the 32-bit zstd dictionary ID range", *dictID)
+	}
 
 	if *dictID == 0 {
 		*dictID = uint(mustAtoi(time.Now().UTC().Format("20060102")))

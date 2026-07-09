@@ -69,6 +69,15 @@ var zstdDictionaryV2 []byte
 // download endpoint. Treat as read-only.
 func DictionaryV2() []byte { return zstdDictionaryV2 }
 
+// ZstdDictRejectedMarker is the stable substring every /subscribe-v2
+// dictionary-ID rejection carries in its pre-upgrade HTTP 400 body. The
+// thick client substring-matches it (it cannot import this package; see
+// CursorTooOldMarker for the precedent and the contract test that pins the
+// duplicate) to distinguish "the server rotated its dictionary — refetch
+// and reconnect" from an unrelated 400. Do not reword without updating the
+// client's duplicated literal.
+const ZstdDictRejectedMarker = "unknown zstd dictionary id"
+
 // DictionaryV2ID is the dictionary ID embedded in the v2 dictionary,
 // parsed from its header at init. The negotiation query param and the
 // download endpoint both key on this value.

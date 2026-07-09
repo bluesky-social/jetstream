@@ -399,7 +399,12 @@ func consume(ctx context.Context, cfg config, stats *counters, id int) error {
 	// decoders keep the loadtest measuring the server, not the client.
 	var dec *zstd.Decoder
 	if cfg.zstd {
-		d, err := zstd.NewReader(nil, zstd.WithDecoderDicts(cfg.zstdDict), zstd.WithDecoderConcurrency(1))
+		// Cap decoded output at the read limit: SetReadLimit bounds only the
+		// COMPRESSED frame, and the library's default max decoded size is
+		// 64 GiB — a hostile/buggy server could otherwise expand a small
+		// frame far past --read-limit and OOM the tool.
+		d, err := zstd.NewReader(nil, zstd.WithDecoderDicts(cfg.zstdDict), zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxMemory(uint64(cfg.readLimit)))
 		if err != nil {
 			return fmt.Errorf("subscriber %d: build zstd decoder: %w", id, err)
 		}

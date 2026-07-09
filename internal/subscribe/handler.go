@@ -140,7 +140,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 				// Never serve frames the client can't decode: an unknown or
 				// retired dictionary ID is a hard 400 carrying the current
 				// ID, so the client re-fetches and reconnects.
-				http.Error(w, fmt.Sprintf("unknown zstd dictionary id %d; current dictionary id is %d (fetch it via getZstdDictionary and reconnect)", id, DictionaryV2ID), http.StatusBadRequest)
+				http.Error(w, fmt.Sprintf("%s %d; current dictionary id is %d (fetch it via getZstdDictionary and reconnect)", ZstdDictRejectedMarker, id, DictionaryV2ID), http.StatusBadRequest)
 				return
 			}
 			wantZstd = true

@@ -277,10 +277,11 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	// tip" (the documented WithLiveCursor contract): 0 -> fromTip (omit the wire
 	// cursor), a non-zero cursor -> resume from it.
 	consumer := newLiveConsumer(liveConfig{
-		host:     e.cfg.Host,
-		zstdDict: e.fetchZstdDict(liveCtx),
-		cursor:   e.cfg.LiveCursor,
-		fromTip:  e.cfg.LiveCursor == 0,
+		host:        e.cfg.Host,
+		zstdDict:    e.fetchZstdDict(liveCtx),
+		refetchDict: e.fetchZstdDict,
+		cursor:      e.cfg.LiveCursor,
+		fromTip:     e.cfg.LiveCursor == 0,
 		// Pure-live resume: a saved LiveCursor means the caller already holds
 		// events through it, so it is also the dedup floor. From-tip (0) leaves
 		// the floor 0 so the first event delivered passes.
@@ -701,6 +702,7 @@ func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover ui
 	consumer := newLiveConsumer(liveConfig{
 		host:        e.cfg.Host,
 		zstdDict:    e.fetchZstdDict(ctx),
+		refetchDict: e.fetchZstdDict,
 		cursor:      cutover,
 		dedupFloor:  cutover,
 		collections: e.cfg.Request.Collections,
