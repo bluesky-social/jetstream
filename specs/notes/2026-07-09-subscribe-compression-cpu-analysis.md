@@ -261,7 +261,92 @@ Ranked by measured impact:
    comparisons include decode cost, and events/eps aren't reported as 0 for
    zstd runs.
 
-## 7. Method notes / caveats
+## 7. Addendum (same day): retraining the dictionary
+
+Follow-up question: the embedded dictionary is inherited from Jetstream v1
+(trained years ago on a much smaller network). Is a fresh one worth it, and
+what should `/subscribe-v2` do, given `/subscribe` must stay wire-frozen?
+
+**What "training" means.** A zstd dictionary is a byte blob both sides
+preload as virtual "already-seen history" before (de)compressing, plus
+pre-fitted Huffman/FSE entropy tables. The trainer (`zstd --train`,
+COVER/fastCOVER) takes thousands of sample messages, finds the byte
+segments that recur most across samples (JSON keys, `did:plc:`, lexicon
+type strings, CID prefixes...), packs the highest-value ones at the tail of
+the dictionary (nearest = cheapest match offsets), and fits entropy tables
+to the sample statistics. It only matters for small inputs — exactly our
+~570 B (v1) / ~947 B (v2) frames.
+
+**Method.** Training corpora: 120k consecutive events per wire shape,
+captured via cursor replay from ~3h before capture time (v1 and v2 shapes
+from :8080). Eval corpora: 20k live events per shape, disjoint in time
+from training. Cross-instance generalization checked against the earlier
+jetstream-2 (100k-repo subset) corpus. Trained with zstd v1.5.7 fastCOVER
+and full COVER at 4–256 KiB. Evaluated with klauspost (the production
+codec), round-trip verified.
+
+| eval corpus | scheme | ratio | enc µs/msg |
+|---|---|---|---|
+| v1 (570 B avg) | legacy dict, prod level | 1.99x | 26.2 |
+| v1 | legacy dict, SpeedFastest | 1.97x | 9.0 |
+| v1 | **new 16 KiB dict, SpeedFastest** | **2.38x** | **7.5** |
+| v1 | new 112 KiB dict, SpeedFastest | 2.42x | 8.3 |
+| v1 | deflate-ct L1 (today's preferred path) | 2.16x | 9.7 |
+| v1 | deflate-ct L6 | 2.92x | 9.9 |
+| v2 (947 B avg) | legacy dict, SpeedFastest | 1.67x | 10.6 |
+| v2 | **new 16 KiB dict, SpeedFastest** | **2.40x** | **9.7** |
+| v2 | new 112 KiB dict, SpeedFastest | 2.45x | 10.3 |
+| v2 | deflate-ct L1 | 1.94x | 15.2 |
+| v2 | deflate-ct L6 | 2.73x | 15.0 |
+
+Key findings:
+
+1. **The legacy dictionary has aged badly**: 1.99x on today's v1 traffic,
+   and only **1.67x on the v2 shape** (it has never seen `record_cbor`
+   base64, `seq`, or current lexicon strings). A freshly trained dict gets
+   **2.4–2.5x on both shapes** — beating deflate-L1 (the current PREFERRED
+   scheme) on ratio while costing less CPU per message than deflate and
+   being fanout-shareable.
+2. **The size knee is tiny**: 4 KiB → 2.36–2.38x, 16 KiB → 2.38–2.40x,
+   112 KiB → 2.42–2.45x, 256 KiB → plateau (2.44–2.46x). Full COVER ≈
+   fastCOVER (±0.01x). Level: SpeedFastest gives up only ~0.01–0.03x vs
+   default/better at 2.5–3x less CPU. **Smaller dict = smaller Reset tax**,
+   which is why new-16k at SpeedFastest is *faster* than no-consideration
+   legacy (7.5 vs 26 µs) while compressing much better.
+3. **Generalization holds**: the dict trained on today's :8080 firehose
+   scores 2.35–2.39x on the hours-older jetstream-2 (different repo subset)
+   corpus vs legacy's 1.98x — the win is from current protocol/lexicon
+   shape, not overfitting to a traffic window.
+4. **The cold-path ceiling fix compounds**: 10 workers sharing today's
+   prod encoder: 37k msgs/s. Same sharing, new-16k @ SpeedFastest: 123k.
+   Per-goroutine encoders (pool), new-16k @ SpeedFastest: **963k msgs/s** —
+   26x today's ceiling.
+5. **Batching remains the global maximum if a protocol change is on the
+   table** (v2 corpus, SpeedFastest): batch=16 events/frame with no dict =
+   2.69x @ 2.2 µs/event; with the new dict = **3.14x @ 2.9 µs/event**;
+   batch=64+dict = 3.24x. Batching also slashes frame/syscall count.
+
+**Recommendation for /subscribe-v2** (legacy `/subscribe` untouched):
+adopt a freshly trained ~16–64 KiB dictionary at `SpeedFastest`,
+versioned by its embedded dict ID and served at an HTTP endpoint (e.g.
+`GET /zstd-dictionary/<id>`) so clients fetch it at connect instead of
+compiling it in; negotiate via query param (`compressDict=<id>` or
+similar), keeping deflate as the no-setup fallback. This dominates
+deflate-L1 on every axis at once — ratio (2.40x vs 1.94x on v2), server
+CPU (shared fanout ~0 marginal vs per-connection), and client CPU
+(~2.7 µs decode vs ~5 µs inflate). Retrain periodically (quarterly, or on
+ratio-drift alarms per the §6.3 metrics) — a new dict is just a new ID,
+old clients keep their pinned version. If/when a batched framing mode is
+added, dict + batch=16 reaches 3.1x at a tenth of today's per-event CPU.
+
+Artifacts: corpora + trained dicts under `/tmp/compcorpus/` on the
+workstation (`train-{v1,v2}.jsonl`, `eval-{v1,v2}.jsonl`,
+`dict-{v1,v2}-<size>.bin`), eval harness in `/tmp/compcorpus/bench/`
+(`dicteval_test.go`, `extra_test.go`, `knee_test.go`). Re-capture and
+retrain is ~10 minutes end-to-end; worth checking a 24h-spanning corpus
+before shipping to wash out diurnal collection mix.
+
+## 8. Method notes / caveats
 
 - Live-fanout numbers come from a real firehose (~320–350 ev/s appended),
   so all subscribers were caught-up hot readers; frames/s scales with
