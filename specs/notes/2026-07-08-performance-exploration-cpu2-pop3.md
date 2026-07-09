@@ -477,6 +477,13 @@ out-of-order completion; the plan gives every block's identity up front).
 multiplicatively with block count. This is the highest leverage change in
 the client for real-world use.
 
+**Done (#292, 2026-07-09):** block fetches now run on a shared pool
+(2×download-concurrency, capped 64) with per-entry ordered futures.
+Re-measured, same 3-DID scenario: 15.4 s → **1.6 s** over the WAN, and the
++100 ms-added-RTT case 54.3 s → **2.6 s** (~21× at elevated RTT). Ordering,
+per-entry error, and early-stop contracts unchanged; whole-segment path
+untouched (A6.2 still open).
+
 ### A6.2 P0 — Stripe whole-segment downloads across ranges/streams
 
 The single-flight prefetcher caps every WAN backfill at one TCP stream's

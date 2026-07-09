@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
@@ -134,7 +135,9 @@ type decodeResult struct {
 // 1's, …) regardless of decode-completion order. It runs a three-stage pipeline:
 //
 //  1. a single PREFETCHER fetches whole-segment files a little ahead (bounded),
-//     overlapping the next segment's download with the current one's decode;
+//     overlapping the next segment's download with the current one's decode,
+//     while a BLOCK-FETCH COORDINATOR runs block-mode getBlock round trips on
+//     its own parallel pool across blocks and entries (#292);
 //  2. a POOL of d.concurrency DECODE workers decompresses + CBOR-decodes block
 //     frames in parallel — the CPU-heavy work, fanned out across cores;
 //  3. a single REASSEMBLER emits decoded blocks in global-seq order, so output
@@ -225,13 +228,18 @@ func inFlightWindow(concurrency int) int {
 }
 
 // runFramer is stages 1+2: walk entries in plan order, fetch each (whole-segment
-// files prefetched a little ahead; block-mode ranges fetched inline), slice
-// block frames, and dispatch them to the decode pool with a dense ascending
-// global seq. It closes jobs on return. A per-entry fetch/read error is
-// dispatched as an in-order error job and that entry stops (the next continues).
+// files prefetched a little ahead; block-mode frames via the parallel
+// block-fetch coordinator), slice block frames, and dispatch them to the decode
+// pool with a dense ascending global seq. It closes jobs on return. A per-entry
+// fetch/read error is dispatched as an in-order error job and that entry stops
+// (the next continues).
 func (d *Downloader) runFramer(ctx context.Context, entries []PlanEntry, jobs chan<- decodeJob, sem chan struct{}) {
 	defer close(jobs)
 
+	// The block-fetch coordinator (nil when the plan has no block-mode entries)
+	// runs getBlock round trips on a parallel pool, across blocks AND entries,
+	// handing the framer per-entry ordered future streams (#292).
+	bc := d.startBlockFetches(ctx, entries)
 	prefetch := d.startPrefetch(ctx, entries)
 	var seq uint64
 
@@ -269,7 +277,7 @@ func (d *Downloader) runFramer(ctx context.Context, entries []PlanEntry, jobs ch
 				return
 			}
 		case f.entry.Mode == ModeBlocks:
-			if !d.frameBlocks(ctx, f.idx, f.entry, dispatch) {
+			if !frameBlocks(ctx, f.idx, bc.futuresByEntry[f.idx], bc.inflight, dispatch) {
 				return
 			}
 		default:
@@ -301,21 +309,184 @@ func (d *Downloader) frameWholeSegment(entryIdx int, entry PlanEntry, raw []byte
 	return true
 }
 
-// frameBlocks fetches the entry's listed block ranges via getBlock and dispatches
-// each frame in ascending block index. getBlock failure is dispatched in order
-// and stops this entry. Returns false if the pipeline was cancelled.
-func (d *Downloader) frameBlocks(ctx context.Context, entryIdx int, entry PlanEntry, dispatch func(entryIdx, blockIdx int, frame []byte, ferr error) bool) bool {
+// frameBlocks consumes one entry's block-fetch futures in ascending block index
+// and dispatches each frame. The fetches themselves run in parallel on the
+// coordinator's pool (#292); consuming strictly in order HERE is what preserves
+// the framer's ordered-dispatch contract — head-of-line waiting on the next
+// future is fine because the round trips behind it are already overlapped. A
+// fetch error is dispatched in order and stops this entry: the remaining
+// futures are drained without dispatching. The drain still awaits each fetch
+// (the coordinator keeps enqueueing the entry's tail as tokens free), so an
+// entry error wastes that entry's remaining getBlocks — acceptable because
+// errors survive 3 xrpc retries first, and the serial alternative would
+// reintroduce the head-of-line stall this pool exists to remove. One in-flight
+// token is released per future consumed, drained or not, so the coordinator
+// keeps looking ahead. Returns false if the pipeline was cancelled.
+func frameBlocks(ctx context.Context, entryIdx int, futures <-chan blockFuture, inflight <-chan struct{}, dispatch func(entryIdx, blockIdx int, frame []byte, ferr error) bool) bool {
+	failed := false
+	for fut := range futures {
+		var res blockFetch
+		select {
+		case res = <-fut.result:
+		case <-ctx.Done():
+			return false
+		}
+		<-inflight
+		if failed {
+			continue
+		}
+		// int narrowing is safe: blockIdx <= math.MaxUint32 by the planner's
+		// validation (the widened-uint64 loop in the coordinator).
+		switch {
+		case res.err != nil:
+			failed = true
+			if !dispatch(entryIdx, int(fut.blockIdx), nil, res.err) {
+				return false
+			}
+		default:
+			if !dispatch(entryIdx, int(fut.blockIdx), res.frame, nil) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// maxBlockFetchConc caps the parallel getBlock fetch pool. 64 stays comfortably
+// under the transport's MaxConnsPerHost (100) while collapsing a sparse WAN
+// backfill's block-per-RTT serialization (#292); getBlock is nearly free
+// server-side (one stored frame read), so the client optimizes its own
+// end-to-end latency rather than protecting the server here.
+const maxBlockFetchConc = 64
+
+// blockFetchPoolSize sizes the getBlock fetch pool from the decode concurrency:
+// fetches are IO-bound round trips, not CPU work, so they deserve more
+// parallelism than the decode pool itself.
+func blockFetchPoolSize(concurrency int) int {
+	return min(2*concurrency, maxBlockFetchConc)
+}
+
+// blockFetch is the outcome of one getBlock fetch.
+type blockFetch struct {
+	frame []byte
+	err   error
+}
+
+// blockFuture is the framer's in-order handle to one parallel getBlock fetch.
+// result has capacity 1 and is written exactly once by a fetch worker, so
+// workers never block on delivery and an abandoned result is simply GC'd.
+type blockFuture struct {
+	blockIdx uint64
+	result   chan blockFetch
+}
+
+// blockJob pairs one getBlock fetch with the future its result resolves.
+type blockJob struct {
+	segmentName string
+	future      blockFuture
+}
+
+// blockFetchCoordinator runs the plan's getBlock fetches on a parallel worker
+// pool, ahead of and independently from the framer, while preserving the
+// framer's in-order consumption: futuresByEntry[i] streams entry i's futures in
+// ascending block index, and the coordinator fills entries in plan order. Jobs
+// are FIFO across entries, so plan-order blocks fetch first and later entries'
+// blocks fill idle workers — cross-entry parallelism, which is what collapses a
+// sparse (DID-filtered) plan of many few-block entries from one RTT per block
+// to one RTT per pool-width (#292).
+type blockFetchCoordinator struct {
+	futuresByEntry []<-chan blockFuture // nil for non-block-mode entries
+	// inflight bounds fetched-or-fetching frames: acquired before a job is
+	// enqueued, released by the framer as it consumes each future. Without it
+	// the coordinator could race arbitrarily far ahead of the framer, holding
+	// one fetched frame per future across unboundedly many entries.
+	inflight chan struct{}
+}
+
+// startBlockFetches launches the block-fetch coordinator, or returns nil when
+// the plan has no block-mode entries. Workers exit when the coordinator has
+// enqueued every block (or on cancellation, when in-flight requests fail fast
+// via ctx and the per-entry channels are closed so the framer never hangs).
+func (d *Downloader) startBlockFetches(ctx context.Context, entries []PlanEntry) *blockFetchCoordinator {
+	if !slices.ContainsFunc(entries, func(e PlanEntry) bool { return e.Mode == ModeBlocks }) {
+		return nil
+	}
+	size := blockFetchPoolSize(d.concurrency)
+	bc := &blockFetchCoordinator{
+		futuresByEntry: make([]<-chan blockFuture, len(entries)),
+		inflight:       make(chan struct{}, 2*size),
+	}
+	chans := make([]chan blockFuture, len(entries))
+	for i := range entries {
+		if entries[i].Mode == ModeBlocks {
+			chans[i] = make(chan blockFuture, size)
+			bc.futuresByEntry[i] = chans[i]
+		}
+	}
+
+	jobs := make(chan blockJob, size)
+	for range size {
+		go func() {
+			for j := range jobs {
+				frame, err := jetstream.JetstreamGetBlock(ctx, d.xc, int64(j.future.blockIdx), j.segmentName)
+				if err != nil {
+					err = fmt.Errorf("jetstream: getBlock %d of %q: %w", j.future.blockIdx, j.segmentName, err)
+				}
+				j.future.result <- blockFetch{frame: frame, err: err}
+			}
+		}()
+	}
+
+	// The coordinator: walk block-mode entries in plan order, enqueue one job
+	// per block in ascending index, stream the future to that entry's channel.
+	go func() {
+		defer close(jobs)
+		for i := range entries {
+			if chans[i] == nil {
+				continue
+			}
+			if !enqueueEntryBlocks(ctx, entries[i], jobs, chans[i], bc.inflight) {
+				// Cancelled: close every remaining channel so a framer mid-range
+				// never hangs (it will exit via ctx anyway, but never wedge).
+				for j := i; j < len(entries); j++ {
+					if chans[j] != nil {
+						close(chans[j])
+						chans[j] = nil
+					}
+				}
+				return
+			}
+			close(chans[i])
+			chans[i] = nil
+		}
+	}()
+	return bc
+}
+
+// enqueueEntryBlocks submits one fetch job per listed block of one entry, in
+// ascending index order, streaming each future to the framer's channel as it
+// is issued. Returns false on cancellation (the caller closes the channel).
+func enqueueEntryBlocks(ctx context.Context, entry PlanEntry, jobs chan<- blockJob, futures chan<- blockFuture, inflight chan<- struct{}) bool {
 	for _, br := range entry.Blocks {
 		// idx is widened to uint64 so a range ending at the uint32 max
 		// (math.MaxUint32 passes the planner's `> MaxUint32` validation) does not
 		// wrap back to 0 on the final increment and loop forever. The body only
 		// runs for idx <= br.Last <= MaxUint32, so int64/int narrowing is safe.
 		for idx := uint64(br.First); idx <= uint64(br.Last); idx++ {
-			frame, err := jetstream.JetstreamGetBlock(ctx, d.xc, int64(idx), entry.SegmentName)
-			if err != nil {
-				return dispatch(entryIdx, int(idx), nil, fmt.Errorf("jetstream: getBlock %d of %q: %w", idx, entry.SegmentName, err))
+			select {
+			case inflight <- struct{}{}:
+			case <-ctx.Done():
+				return false
 			}
-			if !dispatch(entryIdx, int(idx), frame, nil) {
+			fut := blockFuture{blockIdx: idx, result: make(chan blockFetch, 1)}
+			select {
+			case jobs <- blockJob{segmentName: entry.SegmentName, future: fut}:
+			case <-ctx.Done():
+				return false
+			}
+			select {
+			case futures <- fut:
+			case <-ctx.Done():
 				return false
 			}
 		}
@@ -324,7 +495,8 @@ func (d *Downloader) frameBlocks(ctx context.Context, entryIdx int, entry PlanEn
 }
 
 // fetchedEntry is one whole-segment file fetched ahead of framing (raw nil for
-// non-whole-segment entries, which the framer fetches itself), or a fetch error.
+// non-whole-segment entries, whose blocks arrive via the block-fetch
+// coordinator), or a fetch error.
 type fetchedEntry struct {
 	idx   int
 	entry PlanEntry
@@ -336,8 +508,9 @@ type fetchedEntry struct {
 // plan order, a little ahead of the framer, so the next segment's download
 // overlaps the current one's decode. The depth-bounded channel caps how far
 // ahead it runs (and thus how many ~280 MB buffers are resident). Block-mode
-// entries pass through without fetching (the framer getBlocks them inline — the
-// sparse path). It closes the channel on completion or cancellation.
+// entries pass through without fetching — their getBlock fetches run on the
+// block-fetch coordinator's pool, which looks ahead independently of this
+// depth bound (#292). It closes the channel on completion or cancellation.
 func (d *Downloader) startPrefetch(ctx context.Context, entries []PlanEntry) <-chan fetchedEntry {
 	out := make(chan fetchedEntry, prefetchDepth)
 	go func() {
