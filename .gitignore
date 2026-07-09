@@ -49,3 +49,4 @@ oracle-artifacts/
 # testing/mutation/baseline.json, not this run artifact.
 /mutation-result.json
 dicttrain
+client
