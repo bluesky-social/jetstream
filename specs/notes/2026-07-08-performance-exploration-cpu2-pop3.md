@@ -330,3 +330,232 @@ on :8081/:6061), archives intact and ingesting. Raw measurement artifacts in
 `/data/jcalabro/perf/` (scripts `livetest.sh`/`bftest.sh`/`split.sh`, counter
 snapshots, loadtest logs, `profiles/*.pb.gz`); local profile copies in
 `/tmp/jsperf/` on the workstation.
+
+---
+
+# Addendum: WAN client analysis, Boston → cpu2-pop3 (2026-07-09)
+
+Status: **measurement report for Jim's review. No issues filed yet.**
+
+Purpose: yesterday's session measured the client on the same box as the
+server (localhost, effectively infinite bandwidth, ~0 RTT). This session
+measures the same client binary from Jim's Boston workstation (32 threads,
+123 GiB RAM, 10 GbE local link) against cpu2-pop3 in Seattle over the real
+internet, characterizes behavior under degraded conditions, and identifies
+which client design choices are LAN-invisible but WAN-dominant.
+
+Method: identical client build (current `main`, `GOAMD64=v4`) run (a) on
+cpu2-pop3 against `localhost:8081` (best case) and (b) from Boston over the
+Tailscale WireGuard tunnel (direct path, not DERP-relayed; `tailscale0` MTU
+1280). Degraded-network runs used a purpose-built local TCP impairment proxy
+(`/tmp/wanproxy` on the workstation — rate caps, added delay, mid-stream
+RST, mid-stream stalls) between the client and the server, so **no server- or
+network-side configuration was touched**. All backfill runs used the same
+96.04M-event window on jetstream-2 (28 segments, ~7.7 GiB compressed, seqs
+341,698,006 → 437,849,218) unless noted. Live firehose rate during the
+session was ~1k ev/s on js2.
+
+## A1. Path characterization
+
+- RTT Boston → cpu2-pop3: **69.4–71.4 ms** (avg 70.5 ms), 0/10 loss, via
+  direct WireGuard (`155.204.43.106:44172`).
+- Single TCP stream (curl of one 276 MB segment): **67–73 MB/s** across 6
+  samples — ~560 Mbit/s. BDP at 70 ms ≈ 5 MB of window; both kernels allow
+  32 MB `tcp_rmem`/`tcp_wmem` max, so the ceiling is congestion/tunnel, not
+  window. Both ends run cubic.
+- Aggregate path capacity: 4 parallel streams ≈ 62–98 MB/s total; 8 parallel
+  ≈ **105 MB/s total** (~850 Mbit/s). So one stream captures only ~65–70% of
+  what the path can carry — the rest is reachable only with parallelism.
+- TTFB for a small request (planBackfill): ~0.23 s; the full-archive plan
+  (3,074 entries, 399 KB JSON) completes in 0.58 s. Negotiation is not a
+  WAN problem.
+
+## A2. Best case vs. real world: the same workload, both ends
+
+Bounded backfill dump (`--backfill-only`, default map decode) of the
+96.04M-event window:
+
+| where | dc | wall | events/s | effective wire rate |
+|---|---|---|---|---|
+| on cpu2-pop3 (localhost) | 32 | **12.1 s** | 7.9M | ~640 MB/s |
+| Boston WAN | 8 | 129.9 s | 739k | ~59 MB/s |
+| Boston WAN | 16 | 108.6 s | 884k | ~71 MB/s |
+| Boston WAN | 32 | 148.6 s | 646k | ~52 MB/s |
+| Boston WAN | 64 | 111.8 s | 859k | ~69 MB/s |
+
+- **WAN is 9–12× slower than localhost, and `--download-concurrency` has no
+  effect on it.** The dc=8→64 spread (646k–884k ev/s) is path variance, not
+  scaling — dc=32 was the *slowest* run. This is by design: `dc` sizes the
+  *decode* pool only; the network fetch path is a **single prefetch
+  goroutine downloading one whole segment at a time, at most 2 ahead**
+  (`internal/client/downloader.go:33,341-364`). Backfill throughput over any
+  WAN is therefore exactly one TCP stream's throughput — the 71 MB/s
+  best-run effective rate matches the single-stream curl ceiling to within
+  noise. The measured 105 MB/s aggregate capacity means ~1.5× is being left
+  on the table on *this* (clean) path; on a lossy path the gap widens
+  arbitrarily, since one stream's cwnd collapse gates everything.
+- Client-side CPU during WAN backfill: ~1.2–3 cores (vs 24 at localhost) —
+  the decode pool is starved. A Boston consumer pays ~110 s wall for what
+  the network could deliver in ~74 s and the client could decode in ~12 s.
+- **Time-to-first-event: 4.1–4.4 s WAN vs 0.13 s localhost.** The breakdown
+  is ~0.6 s plan + ~3.9 s for the *entire first segment*: `xrpc.QueryRaw`
+  buffers the full 276 MB body in memory before the framer may slice block
+  one (276 MB ÷ 71 MB/s ≈ 3.9 s). First-event latency over a WAN is
+  `segment_size / single_stream_bandwidth`, which on a 10 MB/s consumer link
+  is ~28 s of silence before any output.
+
+## A3. DID-filtered (block-mode) backfill: the RTT disaster
+
+The §5 "spectacular" DID-plan result inverts completely over a WAN, because
+block-mode entries are fetched **serially, one `getBlock` GET per block,
+inline on the framer goroutine** (`downloader.go:307-324`) — one block per
+RTT, no pipelining, despite `MaxConnsPerHost=100` sitting idle:
+
+| where | wall | notes |
+|---|---|---|
+| localhost | **0.11 s** | 217 events, 27 entries / ~200 blocks |
+| Boston WAN (70 ms RTT) | **15.4 s** | ≈ 200 sequential round trips, as predicted |
+| Boston WAN + 100 ms added delay | 54.3 s | scales linearly with RTT (proxy adds per-chunk delay, so slightly super-linear) |
+
+139× slower over the real internet, ~0% bandwidth utilization — the whole
+run moved a few MB. This is the single worst WAN behavior found: exactly the
+"give me these 3 DIDs' history" use case that the bloom infrastructure makes
+nearly free server-side is RTT-bound client-side at ~14 blocks/s.
+
+## A4. Live tail and cutover over the WAN
+
+- **Live tail is a non-issue**, as expected at ~1k ev/s: delivery lag from
+  `time_us` to arrival in Boston measured ~40 ms (cross-machine clocks make
+  the absolute number soft; the same measurement run *on* the server read
+  ~56 ms, so treat both as ≈ batcher 20 ms flush + one-way delay ± clock
+  skew). No reconnects, no errors over all live runs.
+- **Backfill→live cutover from ~8M events behind**: 4 s silent startup
+  (§A2), backfill at ~730k ev/s, clean single cutover to live at t≈15 s, no
+  re-backfill stalls, steady live tail thereafter. The §14 re-backfill path
+  was not triggered even at WAN speeds for this gap size. (A full-archive
+  WAN sweep — days at 71 MB/s for js1's 1.6 TiB — would be a more honest
+  lookback-window stress; not run.)
+- **Cold websocket replay (2 h cursor) is server-paced, not WAN-paced**:
+  16.1k ev/s / 9.1 MiB/s from Boston vs 15.9k ev/s / 8.9 MiB/s on
+  localhost — statistically identical, and far below both the path (70 MB/s)
+  and yesterday's js1 cold-replay figure (79k ev/s). js2's sparse
+  live-written blocks (~919 ev/block, §1) make replay decode/pacing-bound at
+  ~9 MiB/s per connection; the WAN adds nothing. Worth knowing: a Boston
+  consumer catching up 2 h of js2 replay is *not* helped by a fatter pipe.
+- **permessage-deflate over the WAN *reduced* replay throughput 23%**
+  (12.4k ev/s vs 16.1k): at 9 MiB/s the link isn't the constraint, so
+  compression only added the §3 server-side flate cost. Compression helps
+  only when the consumer's link is genuinely thinner than the event stream.
+
+## A5. Degraded-network behavior (impairment proxy)
+
+| scenario | result |
+|---|---|
+| 10 MB/s rate cap, 4-segment window (1.08 GB) | 111 s ≈ ideal network-bound time; graceful, zero errors, no spurious timeouts. The jttp guards (30 s body-idle, 64 KiB/s-over-60s floor) have huge margin at consumer-broadband rates. |
+| mid-stream TCP RST at 200 MB of a 276 MB segment | **Transparent recovery**: xrpc retry re-issued the GET on a fresh connection, window completed with zero surfaced errors — but the retry restarted from **byte 0**, discarding 200 MB. Invisible at 70 MB/s; on a 10 MB/s link that's 20 s of re-download per event, and it compounds with loss rate. |
+| 50 s mid-stream stall (every connection, same byte offset) | 30 s body-idle timeout killed the transfer, retried ×3 (each retry re-pulled the first 150 MB then stalled), then delivered `getSegment ...: jttp: body idle timeout` as a recoverable `EntryResult.Err` after ~99 s and ended the stream with 0 events. Correct crash-loud-ish behavior (no hang, bounded time), but: the error is only visible if the consumer checks per-entry errors, and every retry paid the full prefix again. |
+
+Also observed: a bare `--host cpu2-pop3:8081` defaults to **https** (only
+loopback defaults to http, `client.go:204-240`) and fails immediately and
+loudly against the TLS-less dev server (exit 1). Right default for
+production, but the error lands on stderr after `final ... events=0` — an
+easy thing to misread in scripts that only capture the stats line.
+
+## A6. Improvement opportunities, ranked (WAN lens)
+
+None change wire formats or the server's on-disk contract; the server side
+already does the right things (Range/If-Range, strong per-generation ETags,
+no server-side write timeout on downloads).
+
+### A6.1 P0 — Parallelize block-mode fetches (fixes the 139× DID cliff)
+
+`downloader.go:307-324`: fan `getBlock` requests out over the existing
+connection pool with bounded concurrency (the reassembler already handles
+out-of-order completion; the plan gives every block's identity up front).
+16-way parallelism turns 200 RTT-serialized fetches into ~13 round trips —
+~1 s instead of 15 s at 70 ms, and it degrades linearly with RTT instead of
+multiplicatively with block count. This is the highest leverage change in
+the client for real-world use.
+
+### A6.2 P0 — Stripe whole-segment downloads across ranges/streams
+
+The single-flight prefetcher caps every WAN backfill at one TCP stream's
+bandwidth (§A2). The server already supports Range. Fetching each segment as
+N concurrent range parts (e.g. 8×32 MB), or 2–3 segments concurrently,
+recovers the measured ~1.5× on this clean path and much more on lossy paths
+(one stream's loss event no longer stalls the pipeline). Range-parts compose
+with A6.3 and A6.4: parts are natural resume/streaming units. Memory stays
+bounded — today's budget is already ~2×280 MB of prefetched buffer.
+
+### A6.3 P1 — Resume interrupted segment downloads with Range + If-Range
+
+Retries restart 276 MB transfers from byte 0 (§A5). The plan already carries
+the per-generation checksum (`planner.go:53-57` says it's *for* this) and
+the server serves strong ETags + If-Range precisely so a resume can't splice
+generations. Keep the buffered prefix, re-request `bytes=N-` with
+`If-Range: "<etag>"`, fall back to full restart on 200. Turns loss-induced
+resets and stall-timeouts from O(segment) re-download into O(gap).
+
+### A6.4 P1 — Stream the segment body into the framer
+
+Full-body buffering costs 4 s of time-to-first-event at 70 MB/s and ~28 s at
+consumer broadband (§A2), plus two 280 MB resident buffers. Block frames are
+self-delimiting; the framer could consume from the response body as bytes
+arrive (or, simpler, consume A6.2's range parts as they land) and emit the
+first events after the first few MB. Also shrinks the client's baseline
+memory for embedders.
+
+### A6.5 P2 — Document/tune for constrained consumers
+
+- Compression guidance inverts by link: permessage-deflate costs 23%
+  throughput on a fat link (§A4) and only pays when the link is thinner than
+  the stream. Worth one line in client docs.
+- `--download-concurrency` currently does nothing for WAN wall-clock (§A2);
+  once A6.1/A6.2 land it should size network parallelism too, and until then
+  its help text ("bounded concurrency for sealed segment/block downloads")
+  overpromises.
+- Server-side, cubic's loss recovery on high-BDP paths is the eventual
+  ceiling for single-stream consumers; if operators ever chase last-mile
+  throughput, a BBR experiment on the serving host is the standard lever —
+  ops-level, no code change, unverified here.
+
+### A6.6 Non-findings (measured, fine)
+
+- planBackfill negotiation over WAN: 0.6 s for the full 3,074-entry plan;
+  one round trip per 100k-entry page. Irrelevant.
+- Live tail over WAN: lag ≈ one-way delay + 20 ms batcher; zero reconnects.
+- Rate-capped (10 MB/s) backfill: exactly network-bound, zero overhead, no
+  guard-rail misfires. The jttp bulk-transfer guards are well tuned.
+- Client resilience to a clean mid-transfer RST: transparent, zero surfaced
+  errors (modulo the re-download cost, A6.3).
+- Kernel window sizing on both ends is already adequate for this BDP; no
+  sysctl changes needed for the measured path.
+
+## A7. Methodology notes
+
+- The impairment proxy lives at `/tmp/wanproxy/` on the workstation
+  (throwaway; rebuild from this note's description if needed: TCP forwarder
+  with `-rate-mbps`, `-delay`, `-reset-after-bytes [-reset-once]`,
+  `-stall-after-bytes -stall-for`). Local-only — nothing on cpu2-pop3 was
+  modified. `tc netem` was not used (needs root on the workstation).
+- Cross-machine latency numbers via `time_us` carry unknown clock skew
+  (tens of ms); same-machine measurements or an NTP-audited pair are needed
+  for defensible absolute lag numbers.
+- The Tailscale tunnel (MTU 1280, WireGuard encap) is itself part of the
+  measured path; a raw-internet consumer would see slightly different
+  per-stream ceilings, but every *architectural* finding (serial block
+  fetches, single-stream segment fetch, no resume, full-body buffering) is
+  path-independent.
+- js2's cold-replay pacing (~16k ev/s/conn vs js1's 79k) deserves its own
+  look — likely the sparse-block effect from §1/§7.2, not networking.
+
+## A8. State left behind
+
+Both servers still **running** and healthy on cpu2-pop3 (js1 :8080/:6060,
+js2 :8081/:6061), archives intact, ingest current. No configuration,
+binaries, or data on the server were changed this session; the only files
+created there were transient client-process outputs already present from
+yesterday. Workstation-side: impairment proxy source/binary in
+`/tmp/wanproxy/`, plan snapshots in `/tmp/jsplan.json`/`/tmp/didplan.json`.
+All impairment proxies were killed; no stray client processes remain on
+either machine.
