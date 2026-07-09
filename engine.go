@@ -38,6 +38,7 @@ func newEngine(host string, cfg config) (engine, error) {
 		RawRecords:       cfg.rawRecords,
 		RawRecordsCopied: cfg.rawRecordsCopied,
 		RawRecordCIDs:    cfg.rawRecordCIDs,
+		ZstdCompression:  cfg.zstdCompression,
 	}
 	return &realEngine{eng: iclient.NewEngine(ec), batchSize: cfg.batchSize}, nil
 }

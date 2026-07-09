@@ -12,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/zstddict"
 	"github.com/coder/websocket"
+	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -76,6 +78,13 @@ type liveConfig struct {
 	// mode selects raw vs. map record materialization for live commits. Zero
 	// value = the default map build.
 	mode recordDecodeMode
+	// zstdDict, when non-nil, opts the connection into the /subscribe-v2
+	// dict-zstd compression scheme: the dictionary ID (parsed from the
+	// blob's header) is sent as ?zstdDictionary=<id> and incoming BINARY
+	// frames are decompressed with it. The caller obtains the blob via
+	// getZstdDictionary before constructing the consumer. nil = plain
+	// uncompressed text frames (v2 never negotiates permessage-deflate).
+	zstdDict []byte
 }
 
 func (c liveConfig) minBackoff() time.Duration {
@@ -107,6 +116,10 @@ type liveConsumer struct {
 	// replay-from-0 start.
 	lastSeq uint64
 	seenAny bool
+
+	// zstd decompression state, set only when cfg.zstdDict is non-nil.
+	zstdDictID  uint32
+	zstdDecoder *zstd.Decoder
 }
 
 // LastSeq returns the highest seq the consumer has delivered, or its seeded
@@ -128,6 +141,27 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 	if cfg.logger == nil {
 		cfg.logger = slog.New(slog.NewTextHandler(discardWriter{}, nil))
 	}
+	var dictID uint32
+	var dec *zstd.Decoder
+	if cfg.zstdDict != nil {
+		id, err := zstddict.ParseID(cfg.zstdDict)
+		if err != nil {
+			// The blob came from getZstdDictionary moments ago; a parse
+			// failure is a server/transport fault, not a reason to crash.
+			// Fall back to uncompressed (a documented degradation, logged).
+			cfg.logger.Warn("invalid zstd dictionary; falling back to uncompressed live tail", "err", err)
+			cfg.zstdDict = nil
+		} else {
+			d, derr := zstd.NewReader(nil, zstd.WithDecoderDicts(cfg.zstdDict))
+			if derr != nil {
+				cfg.logger.Warn("zstd decoder construction failed; falling back to uncompressed live tail", "err", derr)
+				cfg.zstdDict = nil
+			} else {
+				dictID = id
+				dec = d
+			}
+		}
+	}
 	// Seed lastSeq (the dedup floor) from dedupFloor, NOT from the wire cursor:
 	// the two diverge in the empty-archive cutover, where the wire cursor is 0
 	// (replay from the start) but dedupFloor is 0 meaning "nothing delivered yet"
@@ -136,7 +170,7 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 	// through seq) drops the at-least-once re-delivery of seq itself. seenAny
 	// stays false until the first delivery so reconnect knows whether to omit the
 	// wire cursor (from-tip) or resume. See liveConfig.dedupFloor.
-	return &liveConsumer{cfg: cfg, lastSeq: cfg.dedupFloor}
+	return &liveConsumer{cfg: cfg, lastSeq: cfg.dedupFloor, zstdDictID: dictID, zstdDecoder: dec}
 }
 
 // Run tails the live stream until ctx is cancelled, invoking emit for each
@@ -205,7 +239,20 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
-		if typ != websocket.MessageText {
+		switch {
+		case c.zstdDecoder != nil && typ == websocket.MessageBinary:
+			// dict-zstd connection: every event frame is a BINARY zstd
+			// frame; decompress before decode. DecodeAll enforces the
+			// decoder's memory limit, bounding a hostile frame.
+			data, err = c.zstdDecoder.DecodeAll(data, nil)
+			if err != nil {
+				// Upstream input, never crash: surface and keep the tail.
+				if !emit(nil, fmt.Errorf("jetstream: zstd frame decode: %w", err)) {
+					return errEmitStop
+				}
+				continue
+			}
+		case typ != websocket.MessageText:
 			continue // jetstream frames are text JSON; ignore stray binary
 		}
 		ev, derr := decodeLiveFrame(data, c.cfg.mode)
@@ -269,18 +316,22 @@ func (c *liveConsumer) subscribeURL() string {
 	for _, d := range c.cfg.dids {
 		q.Add("wantedDids", d)
 	}
+	if c.zstdDecoder != nil {
+		q.Set("zstdDictionary", strconv.FormatUint(uint64(c.zstdDictID), 10))
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
 }
 
-// liveDialOptions builds the websocket DialOptions for the live tail. It
-// offers RFC 7692 permessage-deflate with context takeover: the server
-// auto-negotiates deflate when the client advertises it, which cuts bandwidth
-// substantially on this repetitive JSON firehose. A server that does not
-// negotiate it falls back to an uncompressed stream transparently.
+// liveDialOptions builds the websocket DialOptions for the live tail.
+// permessage-deflate is deliberately NOT offered: /subscribe-v2 never
+// negotiates it (#294 removed it server-side — per-connection deflate is
+// the dominant server cost at fanout scale), so offering it is dead
+// weight on the handshake. Compression on v2 is the dict-zstd scheme,
+// negotiated at the application layer via ?zstdDictionary=<id>.
 func liveDialOptions(hc *http.Client) *websocket.DialOptions {
 	return &websocket.DialOptions{
-		CompressionMode: websocket.CompressionContextTakeover,
+		CompressionMode: websocket.CompressionDisabled,
 		HTTPClient:      hc, // nil is fine: websocket.Dial falls back to its default
 	}
 }

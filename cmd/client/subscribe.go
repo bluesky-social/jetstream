@@ -67,6 +67,10 @@ func subscribeCommand() *cli.Command {
 				Usage: "Print each event as JSON instead of throughput stats",
 			},
 			&cli.BoolFlag{
+				Name:  "zstd",
+				Usage: "Compress the live tail with the server's zstd dictionary (fetched automatically); cuts bandwidth ~2.5x",
+			},
+			&cli.BoolFlag{
 				Name:  "typed-likes-client",
 				Usage: "Decode records via the typed fast path (skips the generic map). Requires exactly --collection=app.bsky.feed.like; reports typed-decode throughput.",
 			},
@@ -121,6 +125,9 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 
 	opts := []jetstream.Option{
 		jetstream.WithBatchSize(cmd.Int("batch-size")),
+	}
+	if cmd.Bool("zstd") {
+		opts = append(opts, jetstream.WithZstdCompression())
 	}
 	// --download-concurrency=0 (the default) means "let the library auto-size
 	// from the CPU count"; only forward an explicit positive override so the

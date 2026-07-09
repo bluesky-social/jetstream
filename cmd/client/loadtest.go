@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/format"
+	"github.com/bluesky-social/jetstream/internal/zstddict"
 	"github.com/coder/websocket"
+	"github.com/klauspost/compress/zstd"
 	"github.com/urfave/cli/v3"
 )
 
@@ -67,7 +69,11 @@ func loadtestCommand() *cli.Command {
 			},
 			&cli.BoolFlag{
 				Name:  "compression",
-				Usage: "Negotiate RFC 7692 permessage-deflate with the server",
+				Usage: "Offer RFC 7692 permessage-deflate (honored on /subscribe only; /subscribe-v2 never negotiates it)",
+			},
+			&cli.BoolFlag{
+				Name:  "zstd",
+				Usage: "Opt into dictionary zstd and decode frames: fetches the dictionary via getZstdDictionary and sends zstdDictionary=<id> on /subscribe-v2 paths, or compress=true on /subscribe",
 			},
 			&cli.StringFlag{
 				Name:  "cursor",
@@ -105,6 +111,7 @@ func loadtestCommand() *cli.Command {
 				dialTimeout:       cmd.Duration("dial-timeout"),
 				reconnectDelay:    cmd.Duration("reconnect-delay"),
 				compression:       cmd.Bool("compression"),
+				zstd:              cmd.Bool("zstd"),
 				cursor:            cmd.String("cursor"),
 				wantedCollections: cmd.StringSlice("wanted-collection"),
 				wantedDIDs:        cmd.StringSlice("wanted-did"),
@@ -118,6 +125,12 @@ func loadtestCommand() *cli.Command {
 			}
 			if err := cfg.validate(); err != nil {
 				return err
+			}
+
+			if cfg.zstd {
+				if err := resolveZstdDict(ctx, &cfg); err != nil {
+					return err
+				}
 			}
 
 			wsURL, err := subscribeURL(cfg)
@@ -150,6 +163,9 @@ type config struct {
 	dialTimeout       time.Duration
 	reconnectDelay    time.Duration
 	compression       bool
+	zstd              bool
+	zstdDictID        uint32
+	zstdDict          []byte
 	cursor            string
 	wantedCollections []string
 	wantedDIDs        []string
@@ -193,7 +209,28 @@ func (c config) validate() error {
 	if c.readLimit <= 0 {
 		return fmt.Errorf("read-limit must be > 0")
 	}
+	if c.zstd && c.compression {
+		return fmt.Errorf("--zstd and --compression are mutually exclusive (the server rejects both at once)")
+	}
 	return nil
+}
+
+// dictionaryURL derives the getZstdDictionary HTTP URL from the websocket
+// subscribe URL (ws->http scheme, XRPC path).
+func dictionaryURL(wsURL string) (string, error) {
+	u, err := url.Parse(wsURL)
+	if err != nil {
+		return "", err
+	}
+	switch u.Scheme {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	}
+	u.Path = "/xrpc/network.bsky.jetstream.getZstdDictionary"
+	u.RawQuery = ""
+	return u.String(), nil
 }
 
 func subscribeURL(c config) (string, error) {
@@ -226,6 +263,16 @@ func subscribeURL(c config) (string, error) {
 	}
 
 	q := u.Query()
+	if c.zstd {
+		if strings.HasSuffix(u.Path, "/subscribe-v2") {
+			if c.zstdDictID == 0 {
+				return "", fmt.Errorf("internal: zstd dictionary ID not resolved before URL build")
+			}
+			q.Set("zstdDictionary", strconv.FormatUint(uint64(c.zstdDictID), 10))
+		} else {
+			q.Set("compress", "true") // legacy /subscribe opt-in
+		}
+	}
 	if c.cursor != "" {
 		q.Set("cursor", c.cursor)
 	}
@@ -260,6 +307,8 @@ type counters struct {
 	readErrors    atomic.Uint64
 	cleanCloses   atomic.Uint64
 	nonTextFrames atomic.Uint64
+	zstdErrors    atomic.Uint64
+	rawBytes      atomic.Uint64
 	reconnects    atomic.Uint64
 	lastErrMu     sync.Mutex
 	lastErr       string
@@ -343,6 +392,18 @@ wait:
 }
 
 func consume(ctx context.Context, cfg config, stats *counters, id int) error {
+	// One decoder per subscriber goroutine: DecodeAll on a shared decoder is
+	// safe but serializes on internal state under heavy fanout; per-goroutine
+	// decoders keep the loadtest measuring the server, not the client.
+	var dec *zstd.Decoder
+	if cfg.zstd {
+		d, err := zstd.NewReader(nil, zstd.WithDecoderDicts(cfg.zstdDict), zstd.WithDecoderConcurrency(1))
+		if err != nil {
+			return fmt.Errorf("subscriber %d: build zstd decoder: %w", id, err)
+		}
+		defer d.Close()
+		dec = d
+	}
 	firstAttempt := true
 	for {
 		if err := ctx.Err(); err != nil {
@@ -388,7 +449,7 @@ func consume(ctx context.Context, cfg config, stats *counters, id int) error {
 			}
 		}
 
-		readLoop(ctx, conn, stats)
+		readLoop(ctx, conn, cfg, stats, dec)
 		stats.connected.Add(-1)
 		_ = conn.CloseNow()
 	}
@@ -431,7 +492,7 @@ type optionsUpdatePayload struct {
 	MaxMessageSizeBytes int      `json:"maxMessageSizeBytes"`
 }
 
-func readLoop(ctx context.Context, conn *websocket.Conn, stats *counters) {
+func readLoop(ctx context.Context, conn *websocket.Conn, cfg config, stats *counters, dec *zstd.Decoder) {
 	for {
 		msgType, payload, err := conn.Read(ctx)
 		if err != nil {
@@ -448,9 +509,22 @@ func readLoop(ctx context.Context, conn *websocket.Conn, stats *counters) {
 			return
 		}
 		stats.bytes.Add(uint64(len(payload)))
-		if msgType == websocket.MessageText {
+		switch {
+		case dec != nil && msgType == websocket.MessageBinary:
+			// dict-zstd frame: decode so the client pays (and the run
+			// measures) the real decompression cost, and events count.
+			raw, derr := dec.DecodeAll(payload, nil)
+			if derr != nil {
+				stats.zstdErrors.Add(1)
+				stats.setLastError("zstd decode: %v", derr)
+				continue
+			}
+			stats.rawBytes.Add(uint64(len(raw)))
 			stats.events.Add(1)
-		} else {
+		case msgType == websocket.MessageText:
+			stats.rawBytes.Add(uint64(len(payload)))
+			stats.events.Add(1)
+		default:
 			stats.nonTextFrames.Add(1)
 		}
 	}
@@ -531,8 +605,13 @@ func printReport(
 		lastErr = "none"
 	}
 
+	zstdSuffix := ""
+	if raw := stats.rawBytes.Load(); raw > 0 && raw != bytes {
+		zstdSuffix = fmt.Sprintf(" raw_bytes=%s ratio=%.2fx zstd_err=%s",
+			format.Bytes(int64(raw)), float64(raw)/float64(bytes), formatCount(stats.zstdErrors.Load()))
+	}
 	_, _ = fmt.Fprintf(w,
-		"%s elapsed=%s conns=%d/%d started=%d events=%s eps=%.0f bytes=%s throughput=%s/s avg_event=%s dials=%s dial_err=%s reconnects=%s read_err=%s hello_err=%s clean_close=%s non_text=%s last_err=%s\n",
+		"%s elapsed=%s conns=%d/%d started=%d events=%s eps=%.0f bytes=%s throughput=%s/s avg_event=%s dials=%s dial_err=%s reconnects=%s read_err=%s hello_err=%s clean_close=%s non_text=%s last_err=%s%s\n",
 		label,
 		roundDuration(elapsed),
 		stats.connected.Load(),
@@ -551,6 +630,7 @@ func printReport(
 		formatCount(stats.cleanCloses.Load()),
 		formatCount(stats.nonTextFrames.Load()),
 		lastErr,
+		zstdSuffix,
 	)
 
 	return reportSnapshot{events: events, bytes: bytes}
@@ -579,4 +659,51 @@ func formatCount[T ~int64 | ~uint64](n T) string {
 		b.WriteString(s[i : i+3])
 	}
 	return b.String()
+}
+
+// resolveZstdDict fetches the server's current compression dictionary over
+// HTTP (getZstdDictionary) and stores the blob + parsed ID on cfg. Loadtest
+// is a measurement tool, so unlike the library client a fetch failure is a
+// hard error — silently falling back would measure the wrong scheme.
+func resolveZstdDict(ctx context.Context, cfg *config) error {
+	wsURL, err := subscribeURLForDict(*cfg)
+	if err != nil {
+		return err
+	}
+	dictURL, err := dictionaryURL(wsURL)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dictURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch zstd dictionary: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("fetch zstd dictionary: http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	dict, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return fmt.Errorf("read zstd dictionary: %w", err)
+	}
+	id, err := zstddict.ParseID(dict)
+	if err != nil {
+		return fmt.Errorf("parse zstd dictionary: %w", err)
+	}
+	cfg.zstdDict = dict
+	cfg.zstdDictID = id
+	_, _ = fmt.Fprintf(cfg.out, "fetched zstd dictionary id=%d (%d bytes)\n", id, len(dict))
+	return nil
+}
+
+// subscribeURLForDict normalizes the raw URL exactly as subscribeURL does,
+// without requiring the dictionary to be resolved yet.
+func subscribeURLForDict(c config) (string, error) {
+	c.zstd = false // avoid the dict-ID requirement during normalization
+	return subscribeURL(c)
 }

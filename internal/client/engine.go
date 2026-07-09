@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jcalabro/atmos/xrpc"
+
+	"github.com/bluesky-social/jetstream/api/jetstream"
 )
 
 // maxRebackfillStalls bounds consecutive re-backfill cycles that make no
@@ -73,6 +75,12 @@ type Config struct {
 	// (sha256+base32 of the payload) on the backfill path. Default false in raw
 	// mode: CID is real per-record work the typed fast path avoids by default.
 	RawRecordCIDs bool
+	// ZstdCompression, when true, opts the live tail into the /subscribe-v2
+	// dict-zstd scheme: the engine fetches the server's current dictionary
+	// via getZstdDictionary before the first live dial and negotiates it
+	// with ?zstdDictionary=<id>. Fetch failure degrades to an uncompressed
+	// tail (logged), never a startup failure.
+	ZstdCompression bool
 }
 
 // recordDecodeMode captures how commit records are materialized, derived from
@@ -269,9 +277,10 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	// tip" (the documented WithLiveCursor contract): 0 -> fromTip (omit the wire
 	// cursor), a non-zero cursor -> resume from it.
 	consumer := newLiveConsumer(liveConfig{
-		host:    e.cfg.Host,
-		cursor:  e.cfg.LiveCursor,
-		fromTip: e.cfg.LiveCursor == 0,
+		host:     e.cfg.Host,
+		zstdDict: e.fetchZstdDict(liveCtx),
+		cursor:   e.cfg.LiveCursor,
+		fromTip:  e.cfg.LiveCursor == 0,
 		// Pure-live resume: a saved LiveCursor means the caller already holds
 		// events through it, so it is also the dedup floor. From-tip (0) leaves
 		// the floor 0 so the first event delivered passes.
@@ -691,6 +700,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover uint64) (resume uint64, tooOld bool) {
 	consumer := newLiveConsumer(liveConfig{
 		host:        e.cfg.Host,
+		zstdDict:    e.fetchZstdDict(ctx),
 		cursor:      cutover,
 		dedupFloor:  cutover,
 		collections: e.cfg.Request.Collections,
@@ -713,4 +723,21 @@ func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover ui
 		return b.add(*ev)
 	})
 	return consumer.LastSeq(), errors.Is(err, errLiveCursorTooOld)
+}
+
+// fetchZstdDict fetches the server's current /subscribe-v2 compression
+// dictionary when the caller opted in (Config.ZstdCompression). Returns nil
+// when the opt-in is off or the fetch fails: compression is an optimization,
+// so a fetch failure degrades to an uncompressed tail (logged) rather than
+// failing the stream.
+func (e *Engine) fetchZstdDict(ctx context.Context) []byte {
+	if !e.cfg.ZstdCompression {
+		return nil
+	}
+	dict, err := jetstream.JetstreamGetZstdDictionary(ctx, e.cfg.XRPC, 0)
+	if err != nil {
+		e.logger.Warn("getZstdDictionary failed; live tail will be uncompressed", "err", err)
+		return nil
+	}
+	return dict
 }

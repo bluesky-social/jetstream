@@ -40,6 +40,9 @@ type config struct {
 	rawRecords       bool
 	rawRecordsCopied bool
 	rawRecordCIDs    bool
+	// zstdCompression opts the live tail into the /subscribe-v2 dict-zstd
+	// scheme (see WithZstdCompression).
+	zstdCompression bool
 }
 
 // Defaults applied when an option is not supplied.
@@ -281,4 +284,18 @@ func WithRawRecordsCopied() Option {
 // effect unless WithRawRecords or WithRawRecordsCopied is also set.
 func WithRawRecordCIDs() Option {
 	return func(c *config) { c.rawRecordCIDs = true }
+}
+
+// WithZstdCompression opts the live tail into the server's dict-zstd
+// compression scheme: the client fetches the server's current dictionary
+// (getZstdDictionary) before the first live dial, negotiates it with
+// zstdDictionary=<id>, and transparently decompresses the binary frames.
+// This is the only compression /subscribe-v2 offers; it substantially cuts
+// live-tail bandwidth (~2.5x on typical firehose traffic) at ~3µs/event of
+// client-side decode. A dictionary fetch failure degrades to an
+// uncompressed tail (logged) rather than failing the stream.
+func WithZstdCompression() Option {
+	return func(c *config) {
+		c.zstdCompression = true
+	}
 }

@@ -1,11 +1,11 @@
 package subscribe
 
 import (
-	"encoding/binary"
 	"fmt"
 
 	_ "embed"
 
+	"github.com/bluesky-social/jetstream/internal/zstddict"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -70,19 +70,16 @@ var zstdDictionaryV2 []byte
 func DictionaryV2() []byte { return zstdDictionaryV2 }
 
 // DictionaryV2ID is the dictionary ID embedded in the v2 dictionary,
-// parsed from its header at init (RFC 8878 §5: magic 0xEC30A437 then a
-// little-endian uint32 ID). The negotiation query param and the download
-// endpoint both key on this value.
+// parsed from its header at init. The negotiation query param and the
+// download endpoint both key on this value.
 var DictionaryV2ID = mustParseDictID(zstdDictionaryV2)
 
 func mustParseDictID(d []byte) uint32 {
-	const dictMagic = 0xEC30A437
-	if len(d) < 8 || binary.LittleEndian.Uint32(d[:4]) != dictMagic {
-		panic("subscribe: zstd_dictionary_v2 is not a structured zstd dictionary")
-	}
-	id := binary.LittleEndian.Uint32(d[4:8])
-	if id == 0 {
-		panic("subscribe: zstd_dictionary_v2 has dictionary ID 0")
+	id, err := zstddict.ParseID(d)
+	if err != nil {
+		// The dictionary is embedded at build time; failure is a
+		// build/programmer error, not runtime input. Fail loud.
+		panic(fmt.Sprintf("subscribe: zstd_dictionary_v2: %v", err))
 	}
 	return id
 }
