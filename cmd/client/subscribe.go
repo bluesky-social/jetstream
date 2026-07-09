@@ -62,6 +62,11 @@ func subscribeCommand() *cli.Command {
 				Usage: "Bounded concurrency for sealed segment/block downloads (0 = auto-size from CPU count)",
 				Value: 0,
 			},
+			&cli.IntFlag{
+				Name:  "segment-stripes",
+				Usage: "Parallel HTTP range requests per whole-segment download (1 = single resumable stream). >1 helps only when per-TCP-stream congestion control binds (public internet); hurts on single-flow tunnels like WireGuard/Tailscale.",
+				Value: 0,
+			},
 			&cli.BoolFlag{
 				Name:  "print",
 				Usage: "Print each event as JSON instead of throughput stats",
@@ -127,6 +132,9 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 	// library default applies otherwise.
 	if dc := cmd.Int("download-concurrency"); dc > 0 {
 		opts = append(opts, jetstream.WithDownloadConcurrency(dc))
+	}
+	if ss := cmd.Int("segment-stripes"); ss > 0 {
+		opts = append(opts, jetstream.WithSegmentStripes(ss))
 	}
 	if c := cmd.StringSlice("collection"); len(c) > 0 {
 		opts = append(opts, jetstream.WithCollections(c))

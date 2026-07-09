@@ -23,13 +23,14 @@ func newEngine(host string, cfg config) (engine, error) {
 			HasBeforeSeq: cfg.hasBeforeSeq,
 			BeforeSeq:    cfg.beforeSeq,
 		},
-		Backfill:     cfg.backfillRequested(),
-		BackfillOnly: cfg.backfillOnly,
-		LiveCursor:   cfg.liveCursor,
-		BatchSize:    cfg.batchSize,
-		Concurrency:  cfg.downloadConc,
-		XRPC:         newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second)),
-		BulkXRPC:     newXRPCClient(host, cfg, xrpc.BulkDownloadOpts()),
+		Backfill:       cfg.backfillRequested(),
+		BackfillOnly:   cfg.backfillOnly,
+		LiveCursor:     cfg.liveCursor,
+		BatchSize:      cfg.batchSize,
+		Concurrency:    cfg.downloadConc,
+		SegmentStripes: cfg.segmentStripes,
+		XRPC:           newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second)),
+		BulkXRPC:       newXRPCClient(host, cfg, xrpc.BulkDownloadOpts()),
 		// Route the live-tail websocket upgrade through the caller's HTTP
 		// client too (WithHTTPClient), so an in-process transport reaches the
 		// live cutover, not just the unary XRPC downloads.

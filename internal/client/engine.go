@@ -42,6 +42,10 @@ type Config struct {
 	// the steady-state live tail. Zero uses defaultMaxBatchDelay.
 	MaxBatchDelay time.Duration
 	Concurrency   int
+	// SegmentStripes, when > 1, fetches each whole segment as that many
+	// parallel HTTP range requests. 0/1 = one resumable stream (the default;
+	// see the segmentfetch.go doc comment for why).
+	SegmentStripes int
 	// XRPC drives the short XRPC negotiation calls (planBackfill).
 	// BulkXRPC drives the large getSegment/getBlock downloads;
 	// it gets bulk-transfer HTTP tuning (no short wall-clock timeout). When
@@ -519,6 +523,7 @@ func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bo
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
 	dl.SetRecordMode(e.cfg.recordMode())
+	dl.SetSegmentStripes(e.cfg.SegmentStripes)
 	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
 
 	_, _, err := e.sweepSealedArchive(ctx, dl, emit, backfillStopped, e.cfg.Request.AfterSeq)
@@ -558,6 +563,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
 	dl.SetRecordMode(e.cfg.recordMode())
+	dl.SetSegmentStripes(e.cfg.SegmentStripes)
 	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
 
 	// loopCtx unwinds the whole engine when the consumer breaks the iterator. The

@@ -12,16 +12,17 @@ type Option func(*config)
 // config is the resolved, validated client configuration. It is private:
 // callers build it exclusively through Option values.
 type config struct {
-	collections  []string
-	dids         []string
-	hasAfterSeq  bool
-	afterSeq     uint64
-	hasBeforeSeq bool
-	beforeSeq    uint64
-	backfillOnly bool
-	liveCursor   uint64
-	batchSize    int
-	downloadConc int
+	collections    []string
+	dids           []string
+	hasAfterSeq    bool
+	afterSeq       uint64
+	hasBeforeSeq   bool
+	beforeSeq      uint64
+	backfillOnly   bool
+	liveCursor     uint64
+	batchSize      int
+	downloadConc   int
+	segmentStripes int
 	// httpClient is a caller override. nil is the sentinel for "unset":
 	// the engine then builds its own per-workload jttp clients
 	// (xrpc.ATProtoOpts for XRPC, xrpc.BulkDownloadOpts for bulk
@@ -177,9 +178,9 @@ func WithBatchSize(n int) Option {
 // network round trips instead of paying one RTT per block. Must be > 0;
 // ignored otherwise.
 //
-// Whole-segment downloads are prefetched ahead of decode but currently run one
-// at a time, so over a WAN this knob governs decode and sparse-fetch
-// parallelism, not whole-segment wire throughput.
+// Whole-segment downloads are prefetched ahead of decode one segment at a
+// time as a single resumable stream by default; WithSegmentStripes (a separate,
+// network-bound knob) controls per-segment range-request parallelism.
 //
 // The default is auto-sized from the CPU count (GOMAXPROCS, clamped to
 // [4, 32]), so a many-core host uses more of its cores without configuration
@@ -190,6 +191,26 @@ func WithDownloadConcurrency(n int) Option {
 	return func(c *config) {
 		if n > 0 {
 			c.downloadConc = n
+		}
+	}
+}
+
+// WithSegmentStripes fetches each whole sealed segment as n parallel HTTP
+// range requests instead of one stream. Must be > 1 to take effect; the
+// default (1) downloads each segment as a single resumable stream.
+//
+// When to use it: on paths where per-TCP-stream congestion control is the
+// throughput bound (typically the public internet at high RTT), striping lets
+// a segment download claim multiple streams' worth of bandwidth. When NOT to
+// use it: on tunneled paths that encapsulate all TCP into one flow (e.g.
+// WireGuard/Tailscale), parallel parts only fragment the tunnel's fixed
+// capacity — measured 20-40% slower than the single stream. Measure on your
+// path before enabling. Failed parts retry at part granularity either way;
+// the single-stream default already resumes mid-segment on transient failure.
+func WithSegmentStripes(n int) Option {
+	return func(c *config) {
+		if n > 0 {
+			c.segmentStripes = n
 		}
 	}
 }
