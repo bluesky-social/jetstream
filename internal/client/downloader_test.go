@@ -723,7 +723,17 @@ func TestDownloadNoGoroutineLeak(t *testing.T) {
 			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
 		}
 		as.addSegment(t, segName(s), events)
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		// Alternate modes so every run also exercises the block-fetch pool's
+		// spin-up/teardown (#292) — its workers/coordinator must unwind on both
+		// clean completion and early stop just like the rest of the pipeline.
+		if s%2 == 0 {
+			entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		} else {
+			entries = append(entries, PlanEntry{
+				SegmentName: segName(s), Index: uint32(s), Mode: ModeBlocks,
+				Blocks: []BlockRange{{First: 0, Last: 2}},
+			})
+		}
 	}
 
 	settle := func() int {
@@ -941,6 +951,255 @@ func TestDownloadBlocksMaxUint32NoWraparound(t *testing.T) {
 	require.Equal(t, []uint64{1}, seqs(got))
 	require.Equal(t, int64(1), calls.Load(), "exactly one getBlock call for a single-index range at MaxUint32; >1 means the counter wrapped")
 	require.Equal(t, strconv.FormatUint(math.MaxUint32, 10), firstIdx.Load(), "the single call must be for the MaxUint32 index")
+}
+
+// blockGate instruments getBlock with an in-flight counter and an optional
+// hold: while holding, requests park until released, so a test can observe the
+// true fetch parallelism deterministically (no wall-clock races).
+type blockGate struct {
+	inflight    atomic.Int64
+	maxInflight atomic.Int64
+	release     chan struct{} // closed to release parked requests; nil = no hold
+}
+
+func (g *blockGate) enter(r *http.Request) {
+	cur := g.inflight.Add(1)
+	for {
+		prev := g.maxInflight.Load()
+		if cur <= prev || g.maxInflight.CompareAndSwap(prev, cur) {
+			break
+		}
+	}
+	if g.release != nil {
+		select {
+		case <-g.release:
+		case <-r.Context().Done():
+		}
+	}
+}
+
+func (g *blockGate) exit() { g.inflight.Add(-1) }
+
+// gatedBlockServer wraps an archiveServer's getBlock handler with a blockGate.
+func gatedBlockServer(t *testing.T, as *archiveServer, gate *blockGate) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/xrpc/network.bsky.jetstream.getBlock", func(w http.ResponseWriter, r *http.Request) {
+		gate.enter(r)
+		defer gate.exit()
+		as.mux.ServeHTTP(w, r)
+	})
+	mux.HandleFunc("/", as.mux.ServeHTTP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestDownloadBlocksFetchInParallel is the core guard for #292: block-mode
+// getBlock fetches must overlap instead of running one round trip at a time.
+// The gate parks every getBlock until the expected parallelism is observed, so
+// a serial regression hangs at maxInflight=1 and fails via the watchdog rather
+// than passing slowly.
+func TestDownloadBlocksFetchInParallel(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	// One segment, 16 blocks of 2 events.
+	var events []segment.Event
+	for i := uint64(1); i <= 32; i++ {
+		events = append(events, makeCreate(t, i, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(i, 10)))
+	}
+	as.addSegment(t, segName(0), events)
+	entries := []PlanEntry{{
+		SegmentName: segName(0), Index: 0, Mode: ModeBlocks,
+		Blocks: []BlockRange{{First: 0, Last: 15}},
+	}}
+
+	const conc = 4
+	wantParallel := int64(blockFetchPoolSize(conc)) // 8
+	gate := &blockGate{release: make(chan struct{})}
+	srv := gatedBlockServer(t, as, gate)
+
+	// Release the gate once the pool has ramped to full width.
+	go func() {
+		for gate.inflight.Load() < wantParallel {
+			time.Sleep(time.Millisecond)
+		}
+		close(gate.release)
+	}()
+
+	d := NewDownloader(&xrpc.Client{Host: srv.URL}, conc, nil)
+	done := make(chan []Event, 1)
+	go func() { done <- collectOrdered(t, d, entries) }()
+	select {
+	case got := <-done:
+		want := make([]uint64, 32)
+		for i := range want {
+			want[i] = uint64(i + 1)
+		}
+		require.Equal(t, want, seqs(got), "parallel fetch must not perturb block order")
+	case <-time.After(15 * time.Second):
+		t.Fatalf("block fetches never reached parallelism %d (max observed %d) — serial regression",
+			wantParallel, gate.maxInflight.Load())
+	}
+	require.GreaterOrEqual(t, gate.maxInflight.Load(), wantParallel,
+		"getBlock fetches must overlap up to the pool width")
+}
+
+// TestDownloadBlocksParallelAcrossEntries pins the cross-entry property that
+// makes #292 matter: a sparse plan is MANY entries of FEW blocks, so fetch
+// parallelism must span entries, not just blocks within one entry. 8 entries ×
+// 1 block with a gate requiring 8 concurrent fetches can only pass if later
+// entries' fetches start before entry 0's future is consumed.
+func TestDownloadBlocksParallelAcrossEntries(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	const nSeg = 8
+	var entries []PlanEntry
+	for s := range nSeg {
+		as.addSegment(t, segName(s), []segment.Event{
+			makeCreate(t, uint64(s*10+1), "did:plc:a", "app.bsky.feed.post", "r1"),
+			makeCreate(t, uint64(s*10+2), "did:plc:a", "app.bsky.feed.post", "r2"),
+		})
+		entries = append(entries, PlanEntry{
+			SegmentName: segName(s), Index: uint32(s), Mode: ModeBlocks,
+			Blocks: []BlockRange{{First: 0, Last: 0}},
+		})
+	}
+
+	gate := &blockGate{release: make(chan struct{})}
+	srv := gatedBlockServer(t, as, gate)
+	go func() {
+		for gate.inflight.Load() < nSeg {
+			time.Sleep(time.Millisecond)
+		}
+		close(gate.release)
+	}()
+
+	d := NewDownloader(&xrpc.Client{Host: srv.URL}, 8, nil)
+	done := make(chan []Event, 1)
+	go func() { done <- collectOrdered(t, d, entries) }()
+	select {
+	case got := <-done:
+		want := []uint64{1, 2, 11, 12, 21, 22, 31, 32, 41, 42, 51, 52, 61, 62, 71, 72}
+		require.Equal(t, want, seqs(got), "cross-entry parallel fetch must preserve plan order")
+	case <-time.After(15 * time.Second):
+		t.Fatalf("fetches never spanned %d entries concurrently (max observed %d)",
+			nSeg, gate.maxInflight.Load())
+	}
+}
+
+// TestDownloadBlocksErrorStopsEntryNotPlan mirrors the whole-segment error
+// contract on the parallel block path: a failing getBlock surfaces as an
+// in-order per-entry error after the good prefix, that entry stops, and the
+// NEXT entry still completes — even though its fetches were already in flight
+// on the shared pool when the error hit.
+func TestDownloadBlocksErrorStopsEntryNotPlan(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	for s := range 2 {
+		var events []segment.Event
+		for i := range 6 { // 3 blocks of 2
+			seq := uint64(s*100 + i + 1)
+			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
+		}
+		as.addSegment(t, segName(s), events)
+	}
+
+	// Fail entry 0's block 1 (getBlock 500s it); everything else serves normally.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/xrpc/network.bsky.jetstream.getBlock", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("segment") == segName(0) && r.URL.Query().Get("blockIndex") == "1" {
+			writeXRPCError(w, http.StatusInternalServerError, "InternalError")
+			return
+		}
+		as.mux.ServeHTTP(w, r)
+	})
+	mux.HandleFunc("/", as.mux.ServeHTTP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	entries := []PlanEntry{
+		{SegmentName: segName(0), Index: 0, Mode: ModeBlocks, Blocks: []BlockRange{{First: 0, Last: 2}}},
+		{SegmentName: segName(1), Index: 1, Mode: ModeBlocks, Blocks: []BlockRange{{First: 0, Last: 2}}},
+	}
+	d := NewDownloader(&xrpc.Client{Host: srv.URL}, 8, nil)
+
+	var perEntry [2][]uint64
+	var entry0Err error
+	err := d.Download(context.Background(), entries, func(res EntryResult) bool {
+		if res.Err != nil {
+			require.Equal(t, 0, res.Index, "only entry 0 may error")
+			require.Nil(t, res.Events)
+			entry0Err = res.Err
+			return true
+		}
+		perEntry[res.Index] = append(perEntry[res.Index], seqs(res.Events)...)
+		return true
+	})
+	require.NoError(t, err, "a per-block fetch failure is a per-entry error, not a Download failure")
+	require.Error(t, entry0Err, "entry 0's failing block must surface in order")
+	require.ErrorContains(t, entry0Err, "getBlock 1")
+	require.Equal(t, []uint64{1, 2}, perEntry[0], "entry 0 delivers only the good prefix before the error")
+	require.Equal(t, []uint64{101, 102, 103, 104, 105, 106}, perEntry[1], "entry 1 must complete despite entry 0's error")
+}
+
+// TestDownloadBlocksConcurrencyEquivalence extends the equivalence guard to
+// block mode: the emitted stream must be identical at any pool width.
+func TestDownloadBlocksConcurrencyEquivalence(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	const nSeg = 6
+	var entries []PlanEntry
+	for s := range nSeg {
+		var events []segment.Event
+		for i := range 8 { // 4 blocks
+			seq := uint64(s*1000 + i + 1)
+			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
+		}
+		as.addSegment(t, segName(s), events)
+		// Skip block 2 of each segment to exercise sparse ranges.
+		entries = append(entries, PlanEntry{
+			SegmentName: segName(s), Index: uint32(s), Mode: ModeBlocks,
+			Blocks: []BlockRange{{First: 0, Last: 1}, {First: 3, Last: 3}},
+		})
+	}
+
+	base := seqs(collectOrdered(t, as.downloader(1), entries))
+	for _, c := range []int{4, 16, 32} {
+		got := seqs(collectOrdered(t, as.downloader(c), entries))
+		require.Equal(t, base, got, "block-mode output must be independent of concurrency=%d", c)
+	}
+}
+
+// TestDownloadBlocksEarlyStopNoLeak exercises the pool teardown path: an
+// emit-driven early stop mid-plan (with many block fetches in flight) must
+// unwind cleanly. Combined with the serial goroutine-leak tests above, and run
+// under -race, this pins the coordinator's cancellation paths.
+func TestDownloadBlocksEarlyStopNoLeak(t *testing.T) {
+	t.Parallel()
+	as := newArchiveServer(t)
+	const nSeg = 20
+	var entries []PlanEntry
+	for s := range nSeg {
+		var events []segment.Event
+		for i := range 6 {
+			seq := uint64(s*100 + i + 1)
+			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
+		}
+		as.addSegment(t, segName(s), events)
+		entries = append(entries, PlanEntry{
+			SegmentName: segName(s), Index: uint32(s), Mode: ModeBlocks,
+			Blocks: []BlockRange{{First: 0, Last: 2}},
+		})
+	}
+
+	emitted := 0
+	err := as.downloader(4).Download(context.Background(), entries, func(EntryResult) bool {
+		emitted++
+		return false
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, emitted)
 }
 
 func seqs(events []Event) []uint64 {

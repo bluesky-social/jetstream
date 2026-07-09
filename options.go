@@ -171,9 +171,15 @@ func WithBatchSize(n int) Option {
 	}
 }
 
-// WithDownloadConcurrency bounds how many sealed segment/block downloads (and
-// their decode work) run in parallel during backfill. Must be > 0; ignored
-// otherwise.
+// WithDownloadConcurrency sizes the backfill parallelism: n bounds the block
+// decode pool directly, and the block-mode getBlock fetch pool is derived from
+// it (2n, capped at 64) so sparse (DID/collection-filtered) backfills overlap
+// network round trips instead of paying one RTT per block. Must be > 0;
+// ignored otherwise.
+//
+// Whole-segment downloads are prefetched ahead of decode but currently run one
+// at a time, so over a WAN this knob governs decode and sparse-fetch
+// parallelism, not whole-segment wire throughput.
 //
 // The default is auto-sized from the CPU count (GOMAXPROCS, clamped to
 // [4, 32]), so a many-core host uses more of its cores without configuration
