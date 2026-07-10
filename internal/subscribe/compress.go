@@ -2,6 +2,7 @@ package subscribe
 
 import (
 	"fmt"
+	"runtime"
 
 	_ "embed"
 
@@ -24,13 +25,22 @@ import (
 //go:embed zstd_dictionary
 var zstdDictionary []byte
 
-// zstdEncoder is the process-wide encoder for the v1 compatibility
-// scheme. klauspost/compress's EncodeAll is safe for concurrent use on a
-// shared *zstd.Encoder, so one instance serves every subscriber. The
-// configuration mirrors v1 exactly (WithEncoderDict + 128 KiB window +
-// single-goroutine concurrency) so frames are byte-compatible with v1
-// decoders.
-var zstdEncoder = mustNewZstdEncoder()
+// encoderPoolLimit bounds each endpoint's encoder free list. One lane per
+// core covers the worst realistic demand (every subscriber goroutine
+// compressing simultaneously); the cap keeps worst-case encoder-state
+// memory bounded (~2 MB per encoder) on very-many-core machines.
+var encoderPoolLimit = min(runtime.GOMAXPROCS(0), 32)
+
+// zstdEncoders is the encoder free list for the v1 compatibility scheme.
+// Each pooled encoder is configured EXACTLY as jetstream-legacy's
+// (pkg/consumer/consumer.go: WithEncoderDict + 128 KiB window +
+// single-goroutine concurrency, default level) so frames are
+// byte-compatible with v1 decoders — pooling changes how many encoder
+// instances exist, never the bytes any one of them produces (pinned by
+// TestCompressFrame_PooledOutputMatchesReferenceEncoder). Pooling replaced
+// a process-wide WithEncoderConcurrency(1) singleton that serialized every
+// subscriber's compression behind one encoder state (#295).
+var zstdEncoders = newEncoderPool(encoderPoolLimit, mustNewZstdEncoder)
 
 func mustNewZstdEncoder() *zstd.Encoder {
 	enc, err := zstd.NewWriter(nil,
@@ -49,7 +59,7 @@ func mustNewZstdEncoder() *zstd.Encoder {
 // v1 custom dictionary. The result is a fresh slice (EncodeAll appends to
 // a nil dst), safe to hand to a websocket write without aliasing src.
 func compressFrame(src []byte) []byte {
-	return zstdEncoder.EncodeAll(src, nil)
+	return zstdEncoders.encodeAll(src)
 }
 
 // zstdDictionaryV2 is the /subscribe-v2 dictionary, trained on live
@@ -93,12 +103,12 @@ func mustParseDictID(d []byte) uint32 {
 	return id
 }
 
-// zstdEncoderV2 is the process-wide encoder for /subscribe-v2 zstd frames.
-// Unlike the v1 encoder it uses SpeedFastest: measured on live traffic the
-// level costs ~1% ratio for ~3x less CPU per message (the per-message cost
-// of dictionary encoding is dominated by match-table Reset, not the
-// compression itself). Same concurrency contract as zstdEncoder.
-var zstdEncoderV2 = mustNewZstdEncoderV2()
+// zstdEncodersV2 is the encoder free list for /subscribe-v2 zstd frames.
+// Unlike the v1 encoders these use SpeedFastest: measured on live traffic
+// the level costs ~1% ratio for ~3x less CPU per message (the per-message
+// cost of dictionary encoding is dominated by match-table Reset, not the
+// compression itself). Same pooling rationale as zstdEncoders.
+var zstdEncodersV2 = newEncoderPool(encoderPoolLimit, mustNewZstdEncoderV2)
 
 func mustNewZstdEncoderV2() *zstd.Encoder {
 	enc, err := zstd.NewWriter(nil,
@@ -114,17 +124,18 @@ func mustNewZstdEncoderV2() *zstd.Encoder {
 
 // compressFrameV2 is compressFrame for the /subscribe-v2 dictionary.
 func compressFrameV2(src []byte) []byte {
-	return zstdEncoderV2.EncodeAll(src, nil)
+	return zstdEncodersV2.encodeAll(src)
 }
 
-// WarmEncoder forces the package-global v1 zstd encoder to create its internal
-// worker-pool channel now, outside any testing/synctest bubble. See
-// segment.WarmEncoder for the full rationale: klauspost/compress builds that
-// channel lazily on the first EncodeAll, so the first in-bubble compressFrame
-// would otherwise bind the global channel to the bubble and a later
-// out-of-bubble EncodeAll would fatal "receive on synctest channel from
-// outside bubble". Test-support only; cheap and idempotent.
+// WarmEncoder pre-creates (and first-uses) every pooled zstd encoder now,
+// outside any testing/synctest bubble. See segment.WarmEncoder for the
+// full rationale: klauspost/compress builds an encoder-internal channel
+// lazily on the first EncodeAll, so an encoder first used inside a bubble
+// binds that channel to the bubble and a later out-of-bubble EncodeAll
+// fatals "receive on synctest channel from outside bubble". Filling the
+// free lists to capacity here means in-bubble compressions only ever draw
+// bubble-safe encoders. Test-support only; idempotent.
 func WarmEncoder() {
-	_ = compressFrame(nil)
-	_ = compressFrameV2(nil)
+	zstdEncoders.warm()
+	zstdEncodersV2.warm()
 }
