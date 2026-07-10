@@ -416,12 +416,10 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 // buildFooter assembles the four footer sections in the layout
 // specified in docs/README.md §3.1.2 and spec §5.6 and returns them
 // concatenated, plus the partially-populated Header (Checksum left
-// zero; the caller fills it in after computing xxh3).
+// zero; the caller fills it in after computing xxh3). Shared by the
+// seal and compaction-rewrite paths; both derive per-block bloom
+// sizing from the walk itself.
 func buildFooter(walk blockWalkResult, footerOffset int64) ([]byte, Header, error) {
-	return buildFooterWithBloomParams(walk, footerOffset, nil)
-}
-
-func buildFooterWithBloomParams(walk blockWalkResult, footerOffset int64, perBlockParams *bloomParams) ([]byte, Header, error) {
 	// 1. Block index.
 	blockIndexBytes := encodeBlockIndex(walk.infos)
 
@@ -451,12 +449,7 @@ func buildFooterWithBloomParams(walk blockWalkResult, footerOffset int64, perBlo
 	}
 	perBlockFilters := make([]*gloom.Filter, len(walk.perBlockDIDs))
 	for i, dids := range walk.perBlockDIDs {
-		var f *gloom.Filter
-		if perBlockParams != nil {
-			f = gloom.NewWithParams(perBlockParams.numBlocks, perBlockParams.k)
-		} else {
-			f = gloom.New(perBlockCapacity, perBlockBloomFPRate)
-		}
+		f := gloom.New(perBlockCapacity, perBlockBloomFPRate)
 		for did := range dids {
 			f.AddString(did)
 		}

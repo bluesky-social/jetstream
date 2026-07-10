@@ -28,7 +28,10 @@ import (
 // with no offset table — while blocks below the max simply realize a
 // better-than-target FP rate. The region header is self-describing
 // (bloom_size_bytes), so right-sized and legacy fixed-size segments
-// coexist with no format change.
+// coexist with no format change. Compaction rewrites recompute sizing
+// from the surviving rows rather than inheriting the source segment's
+// params (issue #303), so legacy oversized segments shed their bloat
+// incrementally as compaction touches them.
 const (
 	perBlockBloomFPRate = 0.001
 
@@ -86,18 +89,6 @@ func encodeBlockBloomsRegion(filters []*gloom.Filter) ([]byte, uint32, error) {
 	le.PutUint32(header[4:8], sizeBytes)
 
 	return append(header, body...), sizeBytes, nil
-}
-
-type bloomParams struct {
-	numBlocks uint64
-	k         uint32
-}
-
-func bloomParamsFromFilter(f *gloom.Filter) bloomParams {
-	return bloomParams{
-		k:         f.K(),
-		numBlocks: f.NumBlocks(),
-	}
 }
 
 // decodeBlockBloomsRegionHeader reads the 8-byte region header and

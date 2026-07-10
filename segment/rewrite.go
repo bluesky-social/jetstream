@@ -55,15 +55,6 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	if len(opts.CandidateDIDs) > 0 && !segmentBloomMayContainAny(r, opts.CandidateDIDs) {
 		return RewriteResult{Header: header}, nil
 	}
-	var perBlockParams *bloomParams
-	if len(blocks) > 0 {
-		firstBloom, err := r.BlockBloom(0)
-		if err != nil {
-			return RewriteResult{}, err
-		}
-		params := bloomParamsFromFilter(firstBloom)
-		perBlockParams = &params
-	}
 
 	type outBlock struct {
 		frame []byte
@@ -178,7 +169,11 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	}
 
 	footerOffset := int64(nextOffset)
-	footerBytes, newHeader, err := buildFooterWithBloomParams(walk, footerOffset, perBlockParams)
+	// The footer is rebuilt from the surviving rows, which right-sizes
+	// the per-block blooms (issue #303): a rewrite of a legacy segment
+	// sheds its oversized pre-#302 blooms, and dropped rows can lower
+	// the surviving cardinality below the source's in any case.
+	footerBytes, newHeader, err := buildFooter(walk, footerOffset)
 	if err != nil {
 		return RewriteResult{}, err
 	}
