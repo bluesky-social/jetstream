@@ -236,7 +236,7 @@ The variable-length footer has two structures that work together to enable fast 
 
 We use gloom for both and persist its current `MarshalBinary` representation directly. A backwards-incompatible gloom serialization change is therefore a Jetstream segment format change; readers are only expected to support the format produced by the pinned gloom version. We serialize the segment-level bloom to disk upon segment seal, and also keep all segment's blooms in Jetstream server's memory since it's small.
 
-The per-block blooms are kept on disk (one bloom per block, all sized for the configured max events per block so we can index them by multiplication with no offset table). Today the manifest holds every segment's per-block blooms resident in memory; if that footprint becomes a problem, a future change may swap them for an LRU cache of the hot set.
+The per-block blooms are kept on disk (one bloom per block, all sized identically — for the segment's max per-block unique-DID count, computed at seal time — so we can index them by multiplication with no offset table; blocks below the max realize a better-than-target false-positive rate). The region header is self-describing (`bloom_size_bytes`), so segments sealed under different sizing rules coexist. Today the manifest holds every segment's per-block blooms resident in memory; right-sizing keeps that footprint to a few GiB even at full-network scale (see `specs/notes/2026-07-10-bloom-memory-exploration.md`).
 
 The lookup flow for "give me all events for DID X in this segment" is:
 

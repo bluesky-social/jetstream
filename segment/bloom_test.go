@@ -14,7 +14,7 @@ func fixedSizeBlooms(t *testing.T, n int) []*gloom.Filter {
 	t.Helper()
 	out := make([]*gloom.Filter, n)
 	for i := range out {
-		out[i] = gloom.New(perBlockBloomCapacity, perBlockBloomFPRate)
+		out[i] = gloom.New(64, perBlockBloomFPRate)
 	}
 	return out
 }

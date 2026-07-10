@@ -118,7 +118,7 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 		return SealResult{}, err
 	}
 
-	footerBytes, header, err := buildFooter(walk, w.cfg.MaxEventsPerBlock, footerOffset)
+	footerBytes, header, err := buildFooter(walk, footerOffset)
 	if err != nil {
 		return SealResult{}, err
 	}
@@ -417,11 +417,11 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 // specified in docs/README.md §3.1.2 and spec §5.6 and returns them
 // concatenated, plus the partially-populated Header (Checksum left
 // zero; the caller fills it in after computing xxh3).
-func buildFooter(walk blockWalkResult, maxEventsPerBlock int, footerOffset int64) ([]byte, Header, error) {
-	return buildFooterWithBloomParams(walk, maxEventsPerBlock, footerOffset, nil)
+func buildFooter(walk blockWalkResult, footerOffset int64) ([]byte, Header, error) {
+	return buildFooterWithBloomParams(walk, footerOffset, nil)
 }
 
-func buildFooterWithBloomParams(walk blockWalkResult, maxEventsPerBlock int, footerOffset int64, perBlockParams *bloomParams) ([]byte, Header, error) {
+func buildFooterWithBloomParams(walk blockWalkResult, footerOffset int64, perBlockParams *bloomParams) ([]byte, Header, error) {
 	// 1. Block index.
 	blockIndexBytes := encodeBlockIndex(walk.infos)
 
@@ -435,14 +435,27 @@ func buildFooterWithBloomParams(walk blockWalkResult, maxEventsPerBlock int, foo
 		return nil, Header{}, fmt.Errorf("segment: marshal segment bloom: %w", err)
 	}
 
-	// 3. Per-block DID blooms.
+	// 3. Per-block DID blooms, right-sized to the segment's actual max
+	// per-block unique-DID cardinality (see the sizing rationale in
+	// bloom.go). Sizing every filter for the max — rather than each
+	// block's own count — is what preserves the equal-size region
+	// invariant; the FP target is realized exactly on the max block
+	// and beaten on the rest. Capacity clamps to >= 1 so a segment of
+	// DID-less events (identity/account markers) still produces a
+	// valid minimal filter.
+	perBlockCapacity := uint64(1)
+	for _, dids := range walk.perBlockDIDs {
+		if n := uint64(len(dids)); n > perBlockCapacity {
+			perBlockCapacity = n
+		}
+	}
 	perBlockFilters := make([]*gloom.Filter, len(walk.perBlockDIDs))
 	for i, dids := range walk.perBlockDIDs {
 		var f *gloom.Filter
 		if perBlockParams != nil {
 			f = gloom.NewWithParams(perBlockParams.numBlocks, perBlockParams.k)
 		} else {
-			f = gloom.New(uint64(maxEventsPerBlock), perBlockBloomFPRate)
+			f = gloom.New(perBlockCapacity, perBlockBloomFPRate)
 		}
 		for did := range dids {
 			f.AddString(did)
