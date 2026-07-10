@@ -14,8 +14,21 @@ import (
 // The 0.001 (0.1%) false-positive rate balances on-disk size
 // (negligible relative to a ~256 MB segment) against scan-time false
 // positives (each FP costs a full block decompress + column scan,
-// which is meaningfully expensive). AGENTS.md and docs/README.md
-// document RAM as cheap on these servers, so we don't penny-pinch.
+// which is meaningfully expensive).
+//
+// Per-block bloom CAPACITY is not a constant: filters are sized for the
+// segment's actual max per-block unique-DID cardinality at seal time
+// (issue #302). Real blocks hold runs of a few repos — the measured
+// median is 1-3 unique DIDs against the old fixed capacity of 4096
+// (MaxEventsPerBlock), which made the blooms ~1000x oversized at the
+// median and >90% of server heap (44-88 GiB resident; see
+// specs/notes/2026-07-10-bloom-memory-exploration.md). Sizing to the
+// segment-wide max keeps every bloom in a segment identical in size —
+// the invariant that lets the reader index the region by multiplication
+// with no offset table — while blocks below the max simply realize a
+// better-than-target FP rate. The region header is self-describing
+// (bloom_size_bytes), so right-sized and legacy fixed-size segments
+// coexist with no format change.
 const (
 	perBlockBloomFPRate = 0.001
 
@@ -23,25 +36,7 @@ const (
 	// across all segments is bounded; FP cost is one extra pread to
 	// load per-block-blooms, which is also small but measurable. Same
 	// rate keeps the trade-off symmetric.
-	//
-	// Defined here for consistency; used by segment-level bloom
-	// construction in a future task.
 	segmentBloomFPRate = 0.001
-
-	// perBlockBloomCapacity is the expected-items count we feed gloom
-	// when constructing per-block filters. Per the spec §5.4, all
-	// per-block filters are sized identically so the region is
-	// indexable by multiplication; we use the writer's configured
-	// MaxEventsPerBlock as the upper bound. The actual cardinality of
-	// unique DIDs in a block is always ≤ MaxEventsPerBlock, so the
-	// configured FP rate is an upper bound on the realized rate.
-	//
-	// Callers that need a different cap (e.g., compaction with a
-	// rebuilt block) should pass an explicit capacity; for now this
-	// constant is what Seal uses. We tie it to DefaultMaxEventsPerBlock
-	// because that's the writer default; the seal-time call is
-	// parameterized so an alternate cap is supported.
-	perBlockBloomCapacity = uint64(DefaultMaxEventsPerBlock)
 )
 
 // blockBloomsRegionHeaderSize is the 8-byte uncompressed header that

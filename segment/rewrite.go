@@ -178,7 +178,7 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 	}
 
 	footerOffset := int64(nextOffset)
-	footerBytes, newHeader, err := buildFooterWithBloomParams(walk, DefaultMaxEventsPerBlock, footerOffset, perBlockParams)
+	footerBytes, newHeader, err := buildFooterWithBloomParams(walk, footerOffset, perBlockParams)
 	if err != nil {
 		return RewriteResult{}, err
 	}
