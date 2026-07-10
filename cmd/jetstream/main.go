@@ -72,7 +72,10 @@ import (
 const jetstreamEnvPrefix = "JETSTREAM_"
 
 var knownForeignJetstreamEnvPrefixes = []string{
+	// auto-injected by kubernetes
 	"JETSTREAM_APP_",
+
+	// cmd/simulator binary
 	"JETSTREAM_SIM_",
 }
 
