@@ -175,6 +175,8 @@ jobs:
             sum.golang.org:443
             storage.googleapis.com:443
             dl.google.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -189,7 +191,31 @@ jobs:
           github-token: ""
 
       - name: Test (race detector)
-        run: ./dev.sh --command just test-race
+        env:
+          JETSTREAM_RACE_ARTIFACT_DIR: ${{ github.workspace }}/race-artifacts
+        run: ./dev.sh --command just test-race-ci
+
+      - name: Upload race diagnostics
+        # The race detector report is the actionable evidence for #308. Capture
+        # the raw test2json stream and console log only on failure so normal CI
+        # stays quiet, but the next intermittent race keeps its access stacks.
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: race-diagnostics
+          path: ${{ github.workspace }}/race-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Failure summary
+        if: failure()
+        run: |
+          {
+            echo "## Race test failed"
+            echo
+            echo 'Download the `race-diagnostics` artifact for `gotestsum.jsonl` and `test-output.log`.'
+            echo 'If this was a data race, search those files for `WARNING: DATA RACE`; the report includes the racing access stacks.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   docker-build:
     name: docker build

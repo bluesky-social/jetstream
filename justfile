@@ -115,6 +115,24 @@ test *ARGS="./...":
 test-race *ARGS="./...":
     just test-long -race {{ARGS}}
 
+# Runs the CI race lane with raw diagnostics preserved for flaky race reports.
+test-race-ci *ARGS="./...":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    artifact_dir="${JETSTREAM_RACE_ARTIFACT_DIR:-race-artifacts}"
+    mkdir -p "${artifact_dir}"
+
+    echo "test-race-ci: writing diagnostics to ${artifact_dir}"
+    if ! GOTRACEBACK=all gotestsum \
+        --format standard-verbose \
+        --jsonfile "${artifact_dir}/gotestsum.jsonl" \
+        -- -count=1 -race {{ARGS}} \
+        2>&1 | tee "${artifact_dir}/test-output.log"; then
+        echo "test-race-ci: failed; diagnostics are in ${artifact_dir}" >&2
+        exit 1
+    fi
+
 # Runs the heavier simulator oracle mode. Deterministic transient getRepo and
 # steady-state subscribeRepos disconnect fault injection is ON by default
 # (JETSTREAM_ORACLE_FAULT_MODE=swarm, see internal/oracle/config.go); set
