@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/xxh3"
 )
@@ -131,6 +133,84 @@ func TestFetchSegmentFallsBackWithoutRangeSupport(t *testing.T) {
 	require.Equal(t, body, got, "a 200-to-the-probe server degrades to the whole-body path")
 }
 
+// TestFetchSegmentRangeIgnoring200MidBodyCutIsRetried: when the server ignores
+// Range entirely (200 to the probe) and that stream dies mid-body, the retry
+// budget must still apply — the 200 path must not be the one read without
+// retry protection.
+func TestFetchSegmentRangeIgnoring200MidBodyCutIsRetried(t *testing.T) {
+	t.Parallel()
+	body := patternBody(300 << 10)
+	var reqs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if reqs.Add(1) == 1 { // the probe's 200: die mid-body
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			_, _ = w.Write(body[:100<<10])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := stripedDownloader(srv.URL, 4, 64<<10)
+	got, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.NoError(t, err, "a mid-body cut on the 200 path must be retried")
+	require.Equal(t, body, got)
+	require.GreaterOrEqual(t, reqs.Load(), int64(2), "cut probe + full-body retry")
+}
+
+// TestFetchSegmentRangeIgnoring200DebitsAttemptBudget: on the 200 path the
+// failed probe read consumes one attempt, so attempts=2 against a
+// persistently-cutting server means exactly 2 requests total.
+func TestFetchSegmentRangeIgnoring200DebitsAttemptBudget(t *testing.T) {
+	t.Parallel()
+	body := patternBody(300 << 10)
+	var reqs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = w.Write(body[:100<<10])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := stripedDownloader(srv.URL, 4, 64<<10)
+	d.xc.Retry = gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(2)})
+	_, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.Error(t, err)
+	require.Equal(t, int64(2), reqs.Load(),
+		"attempts=2 means probe + one fallback, the probe attempt is debited")
+}
+
+// TestFetchSegmentRangeIgnoring200SingleAttemptFailsFast: with attempts=1 the
+// failed probe body read IS the one attempt — no second full-file request.
+func TestFetchSegmentRangeIgnoring200SingleAttemptFailsFast(t *testing.T) {
+	t.Parallel()
+	body := patternBody(300 << 10)
+	var reqs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = w.Write(body[:100<<10])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := stripedDownloader(srv.URL, 4, 64<<10)
+	d.xc.Retry = gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})
+	_, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.Error(t, err, "attempts=1 must fail fast on the 200 path")
+	require.Equal(t, int64(1), reqs.Load(), "exactly one request with attempts=1")
+}
+
 func TestFetchSegmentFallsBackWithoutETag(t *testing.T) {
 	t.Parallel()
 	body := patternBody(300 << 10)
@@ -142,6 +222,92 @@ func TestFetchSegmentFallsBackWithoutETag(t *testing.T) {
 	got, err := d.fetchSegment(context.Background(), "seg.jss")
 	require.NoError(t, err)
 	require.Equal(t, body, got, "no ETag -> no splice protection -> single-stream fallback")
+}
+
+// TestFetchSegmentFallbackRetriesTransientFailure guards the no-ETag/no-Range
+// fallback path's retry budget: the bulk transport is WithNoRetries, so a
+// transient 500 mid-download must be retried by fetchWholeFallback itself,
+// matching the pre-#296 QueryRaw behavior.
+func TestFetchSegmentFallbackRetriesTransientFailure(t *testing.T) {
+	t.Parallel()
+	body := patternBody(300 << 10)
+	s := &segServer{body: body} // no ETag → probe 206 routes to the fallback
+	var fallbackReqs atomic.Int64
+	s.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+		// First full-body (Range-less) request 500s; the retry succeeds.
+		if r.Header.Get("Range") == "" && fallbackReqs.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}
+	srv := httptest.NewServer(s.handler())
+	t.Cleanup(srv.Close)
+
+	d := stripedDownloader(srv.URL, 4, 64<<10)
+	got, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.NoError(t, err, "a transient fallback failure must be retried")
+	require.Equal(t, body, got)
+	require.Equal(t, int64(2), fallbackReqs.Load(), "failed attempt + successful retry")
+}
+
+// TestFetchSegmentFallback4xxIsPermanent: a 4xx on the fallback path (e.g. a
+// SegmentNotFound XRPC envelope) is not retryable and must surface after one
+// attempt, not burn the whole retry budget.
+func TestFetchSegmentFallback4xxIsPermanent(t *testing.T) {
+	t.Parallel()
+	body := patternBody(300 << 10)
+	s := &segServer{body: body} // no ETag → probe 206 routes to the fallback
+	var fallbackReqs atomic.Int64
+	s.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("Range") == "" { // the fallback's full-body request
+			fallbackReqs.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"SegmentNotFound"}`))
+			return true
+		}
+		return false
+	}
+	srv := httptest.NewServer(s.handler())
+	t.Cleanup(srv.Close)
+
+	d := stripedDownloader(srv.URL, 4, 64<<10)
+	_, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "SegmentNotFound")
+	require.Equal(t, int64(1), fallbackReqs.Load(), "a 4xx must not be retried")
+	// Parity with the pre-#296 JetstreamGetSegment error surface: consumers
+	// match on *xrpc.Error to classify failures.
+	var xerr *xrpc.Error
+	require.True(t, errors.As(err, &xerr), "segment errors must expose *xrpc.Error")
+	require.Equal(t, http.StatusNotFound, xerr.StatusCode)
+	require.Equal(t, "SegmentNotFound", xerr.Name)
+	require.NotEmpty(t, xerr.Host, "host attribution must survive, matching xrpc.parseError")
+}
+
+// TestFetchSegmentProbe429IsRetried: 429 throttling is retryable (matching
+// the xrpc retry policy the pre-#296 path used); a transient rate-limit blip
+// on the probe must not fail the segment.
+func TestFetchSegmentProbe429IsRetried(t *testing.T) {
+	t.Parallel()
+	body := patternBody(300 << 10)
+	s, url := newSegServer(t, body)
+	var throttled atomic.Bool
+	s.mu.Lock()
+	s.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+		if throttled.CompareAndSwap(false, true) { // 429 the first (probe) request
+			w.WriteHeader(http.StatusTooManyRequests)
+			return true
+		}
+		return false
+	}
+	s.mu.Unlock()
+
+	d := stripedDownloader(url, 4, 64<<10)
+	got, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.NoError(t, err, "a transient 429 on the probe must be retried")
+	require.Equal(t, body, got)
+	require.True(t, throttled.Load())
 }
 
 func TestFetchSegmentPartRetryIsPartScoped(t *testing.T) {
@@ -301,6 +467,297 @@ func TestFetchSegmentSingleStreamResumesMidBody(t *testing.T) {
 	require.Equal(t, body, got, "resumed download must be byte-identical")
 	require.Equal(t, int64(cutAt), resumedFrom.Load(),
 		"the retry must resume from the exact cut offset, not restart the remainder")
+}
+
+// TestFetchSegmentResumeDribbleIsBounded guards the retry budget against a
+// hostile server that delivers a trickle of bytes then cuts every connection:
+// tiny progress must NOT refund the attempt budget, so the fetch fails after
+// the configured attempts instead of issuing O(total) range requests.
+func TestFetchSegmentResumeDribbleIsBounded(t *testing.T) {
+	t.Parallel()
+	body := patternBody(1 << 20)
+	etag := `"` + segETag(body) + `"`
+	const partSize = 64 << 10
+	var reqs atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		var off, last int64
+		_, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &off, &last)
+		require.NoError(t, err)
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, last, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		if off == 0 { // let the probe complete so we reach the remainder stream
+			_, _ = w.Write(body[:partSize])
+			return
+		}
+		_, _ = w.Write(body[off : off+1]) // dribble one byte, then die
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := singleStreamDownloader(srv.URL, 2, partSize)
+	_, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.Error(t, err, "a dribbling server must exhaust the budget, not be resumed forever")
+	require.ErrorContains(t, err, "resume stalled")
+	require.LessOrEqual(t, reqs.Load(), int64(1+d.partAttempts()),
+		"1-byte progress must not refund the attempt budget")
+}
+
+// TestFetchSegmentSingleAttemptDoesNotResume: WithMaxDownloadAttempts(1) is
+// documented as "disables retries entirely" — one request, and a mid-body cut
+// fails rather than resuming.
+func TestFetchSegmentSingleAttemptDoesNotResume(t *testing.T) {
+	t.Parallel()
+	body := patternBody(1 << 20)
+	etag := `"` + segETag(body) + `"`
+	const partSize = 64 << 10
+	var remainderReqs atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var off, last int64
+		_, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &off, &last)
+		require.NoError(t, err)
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, last, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		if off == 0 {
+			_, _ = w.Write(body[:partSize])
+			return
+		}
+		remainderReqs.Add(1)
+		_, _ = w.Write(body[off : 300<<10]) // substantial progress, then die
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := singleStreamDownloader(srv.URL, 2, partSize)
+	d.xc.Retry = gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})
+	_, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.Error(t, err, "attempts=1 must fail fast, not resume")
+	require.Equal(t, int64(1), remainderReqs.Load(),
+		"attempts=1 means exactly one remainder request, even after progress")
+}
+
+// TestFetchSegmentContinuationWithoutETagIsRejected guards the splice-safety
+// invariant: once range mode is chosen (probe carried an ETag), a continuation
+// 206 that arrives WITHOUT an ETag cannot prove it's the same generation and
+// must be treated as a generation change — never spliced into the buffer.
+func TestFetchSegmentContinuationWithoutETagIsRejected(t *testing.T) {
+	t.Parallel()
+	body := patternBody(1 << 20)
+	s, url := newSegServer(t, body)
+
+	// Strip the ETag from every non-probe (If-Range-carrying) response while
+	// still honoring the range — a misbehaving proxy that ignores If-Range.
+	s.mu.Lock()
+	s.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("If-Range") != "" {
+			var off, last int64
+			_, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &off, &last)
+			require.NoError(t, err)
+			last = min(last, int64(len(body)-1))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, last, len(body)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[off : last+1])
+			return true
+		}
+		return false
+	}
+	s.mu.Unlock()
+
+	d := stripedDownloader(url, 4, 64<<10)
+	_, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.Error(t, err, "ETag-less continuations must not be spliced")
+	require.ErrorIs(t, err, errSegmentGenerationChanged)
+}
+
+// TestFetchSegmentProbeBodyCutDebitsAttemptBudget: the failed probe body read
+// consumes one attempt, so with attempts=2 a persistently-cutting server gets
+// exactly 2 requests total (probe + one gap-fill), not 1 + a fresh budget.
+func TestFetchSegmentProbeBodyCutDebitsAttemptBudget(t *testing.T) {
+	t.Parallel()
+	body := patternBody(48 << 10)
+	etag := `"` + segETag(body) + `"`
+	var reqs atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		var off, last int64
+		_, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &off, &last)
+		require.NoError(t, err)
+		last = min(last, int64(len(body)-1))
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, last, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[off : off+(10<<10)]) // always cut mid-body
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := singleStreamDownloader(srv.URL, 2, 64<<10)
+	d.xc.Retry = gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(2)})
+	_, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.Error(t, err)
+	require.Equal(t, int64(2), reqs.Load(),
+		"attempts=2 means probe + one gap-fill, the probe attempt is debited")
+}
+
+// TestFetchSegmentProbeBodyCutSingleAttemptFailsFast: with attempts=1 a probe
+// body cut on the 206 path must not trigger a gap-fill request.
+func TestFetchSegmentProbeBodyCutSingleAttemptFailsFast(t *testing.T) {
+	t.Parallel()
+	body := patternBody(48 << 10)
+	etag := `"` + segETag(body) + `"`
+	var reqs atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		var off, last int64
+		_, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &off, &last)
+		require.NoError(t, err)
+		last = min(last, int64(len(body)-1))
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, last, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[:20<<10])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := singleStreamDownloader(srv.URL, 2, 64<<10)
+	d.xc.Retry = gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})
+	_, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.Error(t, err, "attempts=1 must fail fast on a probe body cut")
+	require.Equal(t, int64(1), reqs.Load(), "exactly one request with attempts=1")
+}
+
+// TestFetchSegmentProbeBodyCutIsRetried guards the probe's body read: when the
+// first range response's body dies mid-read, the missing suffix must be
+// re-fetched with bounded retries rather than failing the segment. Small
+// segments complete entirely in the probe, so without this the "resumable"
+// path never gets a chance to help them.
+func TestFetchSegmentProbeBodyCutIsRetried(t *testing.T) {
+	t.Parallel()
+	body := patternBody(48 << 10) // fits in one 64 KiB probe part
+	etag := `"` + segETag(body) + `"`
+	const cutAt = 20 << 10
+	var cut atomic.Bool
+	var refetched atomic.Int64
+	refetched.Store(-1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var off, last int64
+		_, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &off, &last)
+		require.NoError(t, err)
+		last = min(last, int64(len(body)-1))
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, last, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		if off == 0 && cut.CompareAndSwap(false, true) {
+			_, _ = w.Write(body[:cutAt]) // die mid-probe-body
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		}
+		if off > 0 {
+			refetched.CompareAndSwap(-1, off)
+		}
+		_, _ = w.Write(body[off : last+1])
+	}))
+	t.Cleanup(srv.Close)
+
+	d := singleStreamDownloader(srv.URL, 2, 64<<10)
+	got, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.NoError(t, err, "a probe body cut must be retried, not fail the segment")
+	require.Equal(t, body, got, "retried download must be byte-identical")
+	require.Equal(t, int64(cutAt), refetched.Load(),
+		"the gap-fill must resume from the exact cut offset")
+}
+
+// TestFetchSegmentCarriesAuthHeaders: the raw range path must send the same
+// identity headers as the xrpc QueryRaw path (Authorization, User-Agent),
+// or authenticated archives break for whole segments while getBlock works.
+func TestFetchSegmentCarriesAuthHeaders(t *testing.T) {
+	t.Parallel()
+	body := patternBody(300 << 10)
+	s, url := newSegServer(t, body)
+	var missing atomic.Int64
+	s.mu.Lock()
+	s.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("Authorization") != "Bearer test-jwt" || r.Header.Get("User-Agent") == "" {
+			missing.Add(1)
+		}
+		return false
+	}
+	s.mu.Unlock()
+
+	d := stripedDownloader(url, 4, 64<<10)
+	d.xc.SetAuth(&xrpc.AuthInfo{AccessJwt: "test-jwt"})
+	got, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.NoError(t, err)
+	require.Equal(t, body, got)
+	require.Equal(t, int64(0), missing.Load(), "every segment request must carry auth + UA headers")
+	require.Greater(t, s.reqs.Load(), int64(1), "multi-request fetch expected")
+}
+
+// TestPartAttemptsClampsToOne: xrpc treats MaxAttempts=0 as one attempt; the
+// segment path must too, or a valid retry policy disables downloads entirely.
+func TestPartAttemptsClampsToOne(t *testing.T) {
+	t.Parallel()
+	body := patternBody(300 << 10)
+	_, url := newSegServer(t, body)
+	d := stripedDownloader(url, 4, 64<<10)
+	d.xc.Retry = gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(0)})
+	require.Equal(t, 1, d.partAttempts())
+	got, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.NoError(t, err, "MaxAttempts=0 must mean one attempt, not zero")
+	require.Equal(t, body, got)
+}
+
+// TestParseRetryAfterAndBackoff: server-supplied retry deferrals must be
+// honored (clamped), preferred over exponential backoff only when longer, and
+// malformed/hostile values must never stall the client.
+func TestParseRetryAfterAndBackoff(t *testing.T) {
+	t.Parallel()
+	h := func(k, v string) http.Header {
+		hdr := http.Header{}
+		hdr.Set(k, v)
+		return hdr
+	}
+	require.Equal(t, 5*time.Second, parseRetryAfter(h("Retry-After", "5")))
+	require.Equal(t, maxRetryAfterWait, parseRetryAfter(h("Retry-After", "3600")), "clamped to the cap")
+	require.Equal(t, time.Duration(0), parseRetryAfter(h("Retry-After", "-10")), "negative → 0")
+	require.Equal(t, time.Duration(0), parseRetryAfter(h("Retry-After", "garbage")))
+	require.Equal(t, time.Duration(0), parseRetryAfter(http.Header{}))
+	reset := strconv.FormatInt(time.Now().Add(4*time.Second).Unix(), 10)
+	got := parseRetryAfter(h("RateLimit-Reset", reset))
+	require.InDelta(t, float64(4*time.Second), float64(got), float64(time.Second))
+
+	// Backoff: the server hint wins only when longer than the schedule.
+	long := &statusError{err: &xrpc.Error{StatusCode: 429}, retryAfter: 5 * time.Second}
+	require.Equal(t, 5*time.Second, retryBackoff(time.Second, 1, long))
+	require.Equal(t, 8*time.Second, retryBackoff(time.Second, 4, long), "exponential wins when longer")
+	require.Equal(t, 2*time.Second, retryBackoff(time.Second, 2, errors.New("plain")), "no hint → schedule")
+	// permanentError wrapping must not hide the hint.
+	require.Equal(t, 5*time.Second, retryBackoff(time.Second, 1, &permanentError{err: long}))
+	// Large attempt counts clamp to the cap instead of overflowing.
+	require.Equal(t, maxRetryAfterWait, retryBackoff(time.Second, 80, errors.New("plain")))
+	require.Equal(t, maxRetryAfterWait, retryBackoff(500*time.Millisecond, 40, nil))
 }
 
 func TestParseContentRange(t *testing.T) {

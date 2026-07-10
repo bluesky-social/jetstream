@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -52,6 +53,11 @@ const (
 	// Compactions are rare; two swaps during one segment download means
 	// something is deeply wrong, so surface it as the entry's error.
 	maxGenerationAttempts = 2
+	// maxRetryAfterWait caps how long a server-supplied Retry-After /
+	// RateLimit-Reset can defer a retry, matching xrpc's MaxDelay. Longer
+	// requests fall back to exponential backoff rather than stalling the
+	// download pipeline for minutes on one throttled part.
+	maxRetryAfterWait = 30 * time.Second
 )
 
 // errSegmentGenerationChanged signals that the segment's ETag changed between
@@ -82,8 +88,10 @@ func (d *Downloader) httpClient() *http.Client {
 // WithMaxDownloadAttempts (plumbed onto the xrpc client's retry policy);
 // the bulk transport itself is WithNoRetries, so this loop owns all retry
 // behavior on the segment path — at part granularity, which is the point.
+// Clamped to ≥1 to match xrpc's own MaxAttempts semantics (0 means "one
+// attempt, no retries", never "zero attempts").
 func (d *Downloader) partAttempts() int {
-	return d.xc.Retry.ValOr(xrpc.DefaultRetryPolicy).MaxAttempts.ValOr(3)
+	return max(d.xc.Retry.ValOr(xrpc.DefaultRetryPolicy).MaxAttempts.ValOr(3), 1)
 }
 
 func (d *Downloader) segmentURL(name string) string {
@@ -128,7 +136,25 @@ func (d *Downloader) fetchSegmentGeneration(ctx context.Context, name string) ([
 
 	switch probe.StatusCode {
 	case http.StatusOK:
-		return readFullBody(probe, maxSegmentBytes)
+		// Range ignored; the server is already streaming the whole file.
+		// Consume it, but a mid-body failure must get the fallback's retry
+		// budget like every other read path here (there is no validator, so
+		// each retry restarts from byte 0, matching pre-#296 behavior).
+		buf, err := readFullBody(probe, maxSegmentBytes)
+		if err == nil {
+			return buf, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// The failed probe read consumed one attempt; the fallback gets the
+		// remainder of the budget (attempts==1 → none: fail fast).
+		remaining := d.partAttempts() - 1
+		if remaining <= 0 {
+			return nil, fmt.Errorf("probe %q: %w", name, err)
+		}
+		_ = probe.Body.Close()
+		return d.fetchWholeFallbackAttempts(ctx, u, remaining)
 	case http.StatusPartialContent:
 	default:
 		return nil, httpStatusError(probe)
@@ -154,8 +180,22 @@ func (d *Downloader) fetchSegmentGeneration(ctx context.Context, name string) ([
 	}
 
 	buf := make([]byte, total)
-	if _, err := io.ReadFull(probe.Body, buf[:end-start+1]); err != nil {
-		return nil, fmt.Errorf("probe %q: read body: %w", name, err)
+	if n, err := io.ReadFull(probe.Body, buf[:end-start+1]); err != nil {
+		// The probe body died mid-read. Keep the bytes that arrived and let
+		// fetchPart (bounded retries, If-Range validation) fill the gap — the
+		// probe body must not be a single point of transient failure any more
+		// than the probe request is. Matters most for segments that complete
+		// entirely in the probe: they never reach the resumable paths below.
+		// The failed probe read consumed one attempt; the gap-fill gets the
+		// remainder of the budget (attempts==1 → none: fail fast).
+		_ = probe.Body.Close()
+		remaining := d.partAttempts() - 1
+		if remaining <= 0 {
+			return nil, fmt.Errorf("probe %q: read body: %w", name, err)
+		}
+		if perr := d.fetchPartAttempts(ctx, u, name, buf[n:end+1], int64(n), end, etag, remaining); perr != nil {
+			return nil, fmt.Errorf("probe %q: read body: %w", name, perr)
+		}
 	}
 	if end+1 >= total {
 		return buf, nil
@@ -192,9 +232,15 @@ func (d *Downloader) fetchSegmentGeneration(ctx context.Context, name string) ([
 // fetchRemainderResumable downloads buf[from:] as a single ranged stream,
 // resuming from wherever the previous attempt died. Progress made by a failed
 // attempt is kept — the retry requests only the missing suffix, so N transient
-// failures cost N gap-refetches, never N whole-segment restarts (#296). The
-// attempt budget applies per resume attempt; an attempt that made progress
-// resets it, so a long transfer with occasional hiccups always completes.
+// failures cost N gap-refetches, never N whole-segment restarts (#296).
+//
+// Budget semantics: attempts==1 (WithMaxDownloadAttempts(1), documented as
+// "disables retries entirely") means exactly one request — a mid-body failure
+// is not resumed. For attempts>1, a failed attempt only refunds the budget
+// when it delivered meaningful progress (≥ min(segPartSize, what was left)),
+// so a long transfer with occasional hiccups completes, but a hostile server
+// dribbling a byte per connection cannot force unbounded requests: worst case
+// is attempts requests per partSize of the segment.
 func (d *Downloader) fetchRemainderResumable(ctx context.Context, u, name string, buf []byte, from int64, etag string) error {
 	total := int64(len(buf))
 	attempts := d.partAttempts()
@@ -202,20 +248,22 @@ func (d *Downloader) fetchRemainderResumable(ctx context.Context, u, name string
 	var lastErr error
 	for off := from; off < total; {
 		if remaining <= 0 {
-			return fmt.Errorf("segment %q: resume stalled at byte %d/%d: %w (after %d attempts without progress)",
+			return fmt.Errorf("segment %q: resume stalled at byte %d/%d: %w (after %d attempts without meaningful progress)",
 				name, off, total, lastErr, attempts)
 		}
 		if lastErr != nil {
-			// Backoff grows with consecutive no-progress failures (shift 0 after
-			// the first; max() guards the progress-reset case where remaining was
-			// just restored to the full budget).
-			delay := d.partRetryDelay << max(attempts-remaining-1, 0)
+			// Backoff grows with consecutive unrefunded failures (attempt 1 after
+			// the first; max() guards the progress-refund case where remaining
+			// was just restored to the full budget). A server-supplied
+			// Retry-After on the previous error extends the wait.
+			delay := retryBackoff(d.partRetryDelay, max(attempts-remaining, 1), lastErr)
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 		}
+		want := total - off
 		n, err := d.readRangeInto(ctx, u, buf[off:], off, total-1, etag)
 		off += n
 		if err == nil {
@@ -225,8 +273,8 @@ func (d *Downloader) fetchRemainderResumable(ctx context.Context, u, name string
 			return err
 		}
 		lastErr = err
-		if n > 0 {
-			remaining = attempts // progress: reset the budget
+		if attempts > 1 && n >= min(d.segPartSize, want) {
+			remaining = attempts // meaningful progress: refund the budget
 		} else {
 			remaining--
 		}
@@ -246,7 +294,11 @@ func (d *Downloader) readRangeInto(ctx context.Context, u string, dst []byte, of
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
-		if got := resp.Header.Get("ETag"); got != "" && got != etag {
+		// A missing ETag is treated the same as a mismatch: range mode was
+		// chosen because the probe carried one, so a continuation without it
+		// cannot prove it's the same generation — and unverifiable bytes must
+		// never be spliced into the buffer.
+		if got := resp.Header.Get("ETag"); got != etag {
 			return 0, errSegmentGenerationChanged
 		}
 		start, end, _, err := parseContentRange(resp.Header.Get("Content-Range"))
@@ -272,11 +324,16 @@ func (d *Downloader) readRangeInto(ctx context.Context, u string, dst []byte, of
 // (network errors, 5xx, short reads) retry with backoff; a generation change
 // or context cancellation aborts immediately.
 func (d *Downloader) fetchPart(ctx context.Context, u, name string, dst []byte, off, last int64, etag string) error {
-	attempts := d.partAttempts()
+	return d.fetchPartAttempts(ctx, u, name, dst, off, last, etag, d.partAttempts())
+}
+
+// fetchPartAttempts is fetchPart with an explicit attempt budget, for callers
+// that already spent part of theirs (the probe body gap-fill).
+func (d *Downloader) fetchPartAttempts(ctx context.Context, u, name string, dst []byte, off, last int64, etag string, attempts int) error {
 	var lastErr error
 	for attempt := range attempts {
 		if attempt > 0 {
-			delay := d.partRetryDelay << (attempt - 1)
+			delay := retryBackoff(d.partRetryDelay, attempt, lastErr)
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -304,7 +361,8 @@ func (d *Downloader) tryPart(ctx context.Context, u string, dst []byte, off, las
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
-		if got := resp.Header.Get("ETag"); got != "" && got != etag {
+		// Missing ETag == mismatch; see readRangeInto.
+		if got := resp.Header.Get("ETag"); got != etag {
 			return errSegmentGenerationChanged
 		}
 		start, end, _, err := parseContentRange(resp.Header.Get("Content-Range"))
@@ -327,10 +385,45 @@ func (d *Downloader) tryPart(ctx context.Context, u string, dst []byte, off, las
 	}
 }
 
-// fetchWholeFallback is the plain single-request download (no Range),
-// byte-equivalent to the pre-striping behavior.
+// fetchWholeFallback is the plain full-body download (no Range),
+// byte-equivalent to the pre-striping behavior — including its retries: the
+// bulk transport is WithNoRetries, so this loop is the only retry mechanism
+// on the path taken when the server ignores Range or omits an ETag. Transient
+// transport errors, 5xx, and short body reads retry with the same budget and
+// backoff as every other path here; there is no resume (no validator), so
+// each attempt restarts from byte 0 like the pre-#296 client did.
 func (d *Downloader) fetchWholeFallback(ctx context.Context, u string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	return d.fetchWholeFallbackAttempts(ctx, u, d.partAttempts())
+}
+
+// fetchWholeFallbackAttempts is fetchWholeFallback with an explicit attempt
+// budget, for callers that already spent part of theirs (a failed 200 probe).
+func (d *Downloader) fetchWholeFallbackAttempts(ctx context.Context, u string, attempts int) ([]byte, error) {
+	var lastErr error
+	for attempt := range attempts {
+		if attempt > 0 {
+			delay := retryBackoff(d.partRetryDelay, attempt, lastErr)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		buf, err := d.tryWhole(ctx, u)
+		if err == nil {
+			return buf, nil
+		}
+		var permanent *permanentError
+		if errors.As(err, &permanent) || ctx.Err() != nil {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("%w (after %d attempts)", lastErr, attempts)
+}
+
+func (d *Downloader) tryWhole(ctx context.Context, u string) ([]byte, error) {
+	req, err := d.newSegmentRequest(ctx, u)
 	if err != nil {
 		return nil, err
 	}
@@ -340,20 +433,38 @@ func (d *Downloader) fetchWholeFallback(ctx context.Context, u string) ([]byte, 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, httpStatusError(resp)
+		err := httpStatusError(resp)
+		if !retryableStatus(resp.StatusCode) {
+			return nil, &permanentError{err: err}
+		}
+		return nil, err
 	}
 	return readFullBody(resp, maxSegmentBytes)
 }
 
+// permanentError marks a failure that retrying cannot fix (e.g. a 4xx XRPC
+// error envelope); fetchWholeFallback surfaces it immediately.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+// retryableStatus mirrors the xrpc retry policy's status classification
+// (isRetryable): 5xx server faults plus 429 throttling, which the pre-#296
+// QueryRaw path retried and which getBlock requests still retry.
+func retryableStatus(code int) bool {
+	return code >= 500 || code == http.StatusTooManyRequests
+}
+
 // probeWithRetry issues the opening range request with the same attempt budget
-// as a part. Responses with retryable statuses (5xx) are drained and retried;
-// any 2xx/3xx/4xx response is returned to the caller for interpretation.
+// as a part. Responses with retryable statuses (5xx, 429) are drained and
+// retried; any other 2xx/3xx/4xx response is returned for interpretation.
 func (d *Downloader) probeWithRetry(ctx context.Context, u string, lastByte int64) (*http.Response, error) {
 	attempts := d.partAttempts()
 	var lastErr error
 	for attempt := range attempts {
 		if attempt > 0 {
-			delay := d.partRetryDelay << (attempt - 1)
+			delay := retryBackoff(d.partRetryDelay, attempt, lastErr)
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -361,7 +472,7 @@ func (d *Downloader) probeWithRetry(ctx context.Context, u string, lastByte int6
 			}
 		}
 		resp, err := d.doRangeRequest(ctx, u, 0, lastByte, "")
-		if err == nil && resp.StatusCode < 500 {
+		if err == nil && !retryableStatus(resp.StatusCode) {
 			return resp, nil
 		}
 		if err != nil {
@@ -378,7 +489,7 @@ func (d *Downloader) probeWithRetry(ctx context.Context, u string, lastByte int6
 }
 
 func (d *Downloader) doRangeRequest(ctx context.Context, u string, off, last int64, etag string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := d.newSegmentRequest(ctx, u)
 	if err != nil {
 		return nil, err
 	}
@@ -387,6 +498,23 @@ func (d *Downloader) doRangeRequest(ctx context.Context, u string, off, last int
 		req.Header.Set("If-Range", etag)
 	}
 	return d.httpClient().Do(req)
+}
+
+// newSegmentRequest builds a segment GET with the same identity headers the
+// xrpc QueryRaw path sets (User-Agent, Accept, Authorization when the client
+// has a session) — the raw range path must not silently drop auth that
+// getBlock requests still carry.
+func (d *Downloader) newSegmentRequest(ctx context.Context, u string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", d.xc.UserAgent.ValOr("go/atmos"))
+	req.Header.Set("Accept", "*/*")
+	if auth := d.xc.Auth(); auth != nil && auth.AccessJwt != "" {
+		req.Header.Set("Authorization", "Bearer "+auth.AccessJwt)
+	}
+	return req, nil
 }
 
 // readFullBody reads a non-range response body, pre-sizing from Content-Length
@@ -412,11 +540,88 @@ func readFullBody(resp *http.Response, limit int64) ([]byte, error) {
 	return buf, nil
 }
 
+// statusError is a non-2xx response, carrying any server-supplied retry
+// deferral (Retry-After / RateLimit-Reset) so the retry loops can honor it —
+// the old xrpc.QueryRaw path did, and a throttling CDN's 429 with
+// "Retry-After: 5" must not be retried after 500ms and fail the segment.
+// It wraps a *xrpc.Error so errors.As keeps working on the public error
+// surface, matching the pre-#296 JetstreamGetSegment behavior.
+type statusError struct {
+	err        *xrpc.Error
+	retryAfter time.Duration // 0 = none supplied
+}
+
+func (e *statusError) Error() string { return e.err.Error() }
+func (e *statusError) Unwrap() error { return e.err }
+
 // httpStatusError drains a bounded error-body excerpt so XRPC error envelopes
 // (e.g. SegmentNotFound) stay diagnosable without trusting the body length.
 func httpStatusError(resp *http.Response) error {
 	excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(excerpt)))
+	xerr := &xrpc.Error{StatusCode: resp.StatusCode}
+	var envelope struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(excerpt, &envelope) == nil && envelope.Error != "" {
+		// XRPC envelope: mirror xrpc.parseError exactly (Message may be empty).
+		xerr.Name = envelope.Error
+		xerr.Message = envelope.Message
+	} else {
+		xerr.Message = strings.TrimSpace(string(excerpt))
+	}
+	retryAfter := parseRetryAfter(resp.Header)
+	// Parity with xrpc.parseError's metadata: rate-limit info (so callers'
+	// IsRateLimited/backoff logic keeps working) and post-redirect host
+	// attribution.
+	if retryAfter > 0 {
+		xerr.RateLimit = &xrpc.RateLimit{Reset: time.Now().Add(retryAfter)}
+	}
+	if resp.Request != nil && resp.Request.URL != nil {
+		xerr.Host = resp.Request.URL.Host
+	}
+	return &statusError{err: xerr, retryAfter: retryAfter}
+}
+
+// parseRetryAfter extracts a retry deferral from RateLimit-Reset (unix
+// seconds, per the atproto convention) or the standard Retry-After header
+// (delta-seconds or IMF-fixdate), clamped to [0, maxRetryAfterWait]. Returns 0
+// when absent or malformed — untrusted input must not stall the client.
+func parseRetryAfter(h http.Header) time.Duration {
+	var until time.Duration
+	if reset := h.Get("RateLimit-Reset"); reset != "" {
+		if unix, err := strconv.ParseInt(reset, 10, 64); err == nil {
+			until = time.Until(time.Unix(unix, 0))
+		}
+	}
+	if until == 0 {
+		if ra := strings.TrimSpace(h.Get("Retry-After")); ra != "" {
+			if secs, err := strconv.Atoi(ra); err == nil {
+				until = time.Duration(secs) * time.Second
+			} else if t, err := http.ParseTime(ra); err == nil {
+				until = time.Until(t)
+			}
+		}
+	}
+	return min(max(until, 0), maxRetryAfterWait)
+}
+
+// retryBackoff computes the delay before retry `attempt` (1-based): a
+// server-supplied deferral on the previous error wins over the fixed
+// exponential schedule when it asks for a longer wait. The schedule is
+// capped at maxRetryAfterWait (mirroring xrpc's MaxDelay), which also keeps
+// the shift from overflowing under large WithMaxDownloadAttempts values.
+func retryBackoff(base time.Duration, attempt int, lastErr error) time.Duration {
+	delay := maxRetryAfterWait
+	// Overflow-safe: base<<shift < cap  ⇔  base < cap>>shift (both positive).
+	if shift := attempt - 1; shift < 63 && base < maxRetryAfterWait>>shift {
+		delay = base << shift
+	}
+	var se *statusError
+	if errors.As(lastErr, &se) && se.retryAfter > delay {
+		return se.retryAfter
+	}
+	return delay
 }
 
 // parseContentRange parses a "bytes start-end/total" header. "*" totals (or
