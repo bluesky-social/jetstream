@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/bluesky-social/jetstream/segment"
@@ -59,6 +60,12 @@ type Downloader struct {
 	// Zero value = the default map-building path, so existing callers/tests are
 	// unaffected. Set via SetRecordMode.
 	mode recordDecodeMode
+	// Striped whole-segment fetch tuning (#296). Set to the segment* defaults
+	// by NewDownloader; tests shrink them to exercise multi-part behavior on
+	// small fixtures without megabyte inputs.
+	segPartSize    int64
+	segStripes     int
+	partRetryDelay time.Duration
 }
 
 // SetTransform installs the per-block worker-side transform (see Downloader.transform).
@@ -78,7 +85,23 @@ func NewDownloader(xc *xrpc.Client, concurrency int, selector RowSelector) *Down
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	return &Downloader{xc: xc, concurrency: concurrency, selector: selector}
+	return &Downloader{
+		xc:             xc,
+		concurrency:    concurrency,
+		selector:       selector,
+		segPartSize:    segmentPartSize,
+		segStripes:     defaultSegmentStripes,
+		partRetryDelay: 500 * time.Millisecond,
+	}
+}
+
+// SetSegmentStripes overrides how many parallel range requests fetch each
+// whole segment (default 8). 1 selects the single resumable stream; see the
+// segmentfetch.go doc comment for when that is the better choice.
+func (d *Downloader) SetSegmentStripes(n int) {
+	if n > 0 {
+		d.segStripes = n
+	}
 }
 
 // EntryResult is one unit of decoded output, tagged with its plan position so
@@ -521,7 +544,7 @@ func (d *Downloader) startPrefetch(ctx context.Context, entries []PlanEntry) <-c
 			}
 			f := fetchedEntry{idx: i, entry: entries[i]}
 			if entries[i].Mode == ModeWholeSegment {
-				f.raw, f.err = jetstream.JetstreamGetSegment(ctx, d.xc, entries[i].SegmentName)
+				f.raw, f.err = d.fetchSegment(ctx, entries[i].SegmentName)
 				if f.err != nil {
 					f.err = fmt.Errorf("jetstream: getSegment %q: %w", entries[i].SegmentName, f.err)
 				}

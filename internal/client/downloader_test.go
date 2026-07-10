@@ -63,8 +63,12 @@ func newArchiveServer(t *testing.T) *archiveServer {
 			writeXRPCError(w, http.StatusNotFound, "SegmentNotFound")
 			return
 		}
+		// Mirror production (internal/xrpcapi/getsegment.go): ServeContent +
+		// strong ETag, so Range/If-Range and the striped fetch path (#296) are
+		// exercised by every whole-segment test.
 		w.Header().Set("Content-Type", "application/octet-stream")
-		_, _ = w.Write(raw)
+		w.Header().Set("ETag", `"`+segETag(raw)+`"`)
+		http.ServeContent(w, r, name, time.Unix(1_730_000_000, 0), bytes.NewReader(raw))
 	})
 	mux.HandleFunc("/xrpc/network.bsky.jetstream.getBlock", func(w http.ResponseWriter, r *http.Request) {
 		as.blockReqs.Add(1)

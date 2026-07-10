@@ -494,6 +494,29 @@ recovers the measured ~1.5× on this clean path and much more on lossy paths
 with A6.3 and A6.4: parts are natural resume/streaming units. Memory stays
 bounded — today's budget is already ~2×280 MB of prefetched buffer.
 
+**Done (#296, 2026-07-09):** implemented — 16 MB range parts, errgroup
+fan-out, If-Range generation safety — **default 8 stripes**, tunable via
+`WithSegmentStripes` / `--segment-stripes` (1 = single resumable stream).
+
+Lab caveat worth recording: our only WAN vantage is the Tailscale/WireGuard
+tunnel, and *on that path* striping measured 20–40% slower than the single
+stream (interleaved rounds: main 38.7–41.0 s vs striped 48.1–57.0 s on a
+2.5 GB window; raw-curl isolation, no client code: 1 stream 3.7 s vs 8 parts
+7.0 s per segment). Plausible mechanism: WireGuard encapsulates all tunneled
+TCP into one UDP flow, so parallel parts fragment a fixed ~75 MB/s tunnel
+capacity, re-pay slow-start per connection, and burst-induce loss. Also
+noted: multi-stream capacity probes over the tunnel varied wildly run-to-run
+(39–98 MB/s aggregate) while single-stream was stable at 70–80 — one probe
+is not a design premise. On a 200 Gbps LAN (cpu1→cpu2), all modes are
+indistinguishable (~22 s, decode-bound).
+
+We shipped striping as the default anyway: typical consumers pull over the
+public internet, where per-TCP-flow congestion control is the expected
+bottleneck and striping is the standard remedy; tunneled deployments can set
+stripes=1. Public-internet validation pending (Jim); if it lands
+contradicting the expectation, revisit the default and consider promoting
+the tunnel observation to specs/gotchas.md.
+
 ### A6.3 P1 — Resume interrupted segment downloads with Range + If-Range
 
 Retries restart 276 MB transfers from byte 0 (§A5). The plan already carries
@@ -502,6 +525,13 @@ the server serves strong ETags + If-Range precisely so a resume can't splice
 generations. Keep the buffered prefix, re-request `bytes=N-` with
 `If-Range: "<etag>"`, fall back to full restart on 200. Turns loss-induced
 resets and stall-timeouts from O(segment) re-download into O(gap).
+
+**Done (#296, same PR):** the default stripes=1 path now resumes mid-body
+with Range+If-Range from the exact failure byte (attempt budget resets on
+progress, so long transfers with occasional hiccups always complete); part
+retries in striped mode are O(part) for the same reason. Verified by test
+(`TestFetchSegmentSingleStreamResumesMidBody` pins resume-from-exact-offset)
+plus the generation-swap, no-Range-support, and no-ETag fallback paths.
 
 ### A6.4 P1 — Stream the segment body into the framer
 

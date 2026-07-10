@@ -12,16 +12,17 @@ type Option func(*config)
 // config is the resolved, validated client configuration. It is private:
 // callers build it exclusively through Option values.
 type config struct {
-	collections  []string
-	dids         []string
-	hasAfterSeq  bool
-	afterSeq     uint64
-	hasBeforeSeq bool
-	beforeSeq    uint64
-	backfillOnly bool
-	liveCursor   uint64
-	batchSize    int
-	downloadConc int
+	collections    []string
+	dids           []string
+	hasAfterSeq    bool
+	afterSeq       uint64
+	hasBeforeSeq   bool
+	beforeSeq      uint64
+	backfillOnly   bool
+	liveCursor     uint64
+	batchSize      int
+	downloadConc   int
+	segmentStripes int
 	// httpClient is a caller override. nil is the sentinel for "unset":
 	// the engine then builds its own per-workload jttp clients
 	// (xrpc.ATProtoOpts for XRPC, xrpc.BulkDownloadOpts for bulk
@@ -180,9 +181,9 @@ func WithBatchSize(n int) Option {
 // network round trips instead of paying one RTT per block. Must be > 0;
 // ignored otherwise.
 //
-// Whole-segment downloads are prefetched ahead of decode but currently run one
-// at a time, so over a WAN this knob governs decode and sparse-fetch
-// parallelism, not whole-segment wire throughput.
+// Whole-segment downloads are prefetched ahead of decode one segment at a
+// time, striped across parallel range requests; WithSegmentStripes (a
+// separate, network-bound knob) controls that per-segment fan-out.
 //
 // The default is auto-sized from the CPU count (GOMAXPROCS, clamped to
 // [4, 32]), so a many-core host uses more of its cores without configuration
@@ -193,6 +194,26 @@ func WithDownloadConcurrency(n int) Option {
 	return func(c *config) {
 		if n > 0 {
 			c.downloadConc = n
+		}
+	}
+}
+
+// WithSegmentStripes sets how many parallel HTTP range requests fetch each
+// whole sealed segment. Default 8: on typical internet paths, per-TCP-stream
+// congestion control is the throughput bound, and striping lets a segment
+// download claim multiple streams' worth of bandwidth. Must be > 0; ignored
+// otherwise.
+//
+// Set 1 for a single resumable stream. That can be the better choice on paths
+// where parallel streams cannot claim additional bandwidth — in our lab
+// measurements, a WireGuard tunnel (which encapsulates all TCP into one UDP
+// flow) ran 20-40% faster single-stream, and on a fast LAN the modes were
+// indistinguishable. Failed parts retry at part granularity either way, and
+// the single-stream mode resumes mid-segment on transient failure.
+func WithSegmentStripes(n int) Option {
+	return func(c *config) {
+		if n > 0 {
+			c.segmentStripes = n
 		}
 	}
 }
