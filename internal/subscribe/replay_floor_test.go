@@ -135,8 +135,8 @@ func TestWalkFromCursor_ReadLogFloorConcurrentRotation(t *testing.T) {
 			StopSeq:  floor,
 			Manifest: m,
 			Writer:   w,
-		}, func(ev *segment.Event) error {
-			emitted = append(emitted, ev.Seq)
+		}, func(e *subscribe.Entry) error {
+			emitted = append(emitted, e.Event.Seq)
 			return nil
 		})
 		if err != nil {
@@ -237,8 +237,8 @@ func TestWalkFromCursor_GapBelowReadLogFloorFailsLoud(t *testing.T) {
 		StopSeq:  w.ReadLog().FloorSeq(),
 		Manifest: m,
 		Writer:   w,
-	}, func(ev *segment.Event) error {
-		emitted = append(emitted, ev.Seq)
+	}, func(e *subscribe.Entry) error {
+		emitted = append(emitted, e.Event.Seq)
 		return nil
 	})
 	require.Error(t, err, "missing data below the readable-log floor must not be skipped")
@@ -312,8 +312,8 @@ func TestWalkFromCursor_SeamConvergesWhenSegmentPublishedLate(t *testing.T) {
 			}
 			retries++
 		},
-	}, func(ev *segment.Event) error {
-		emitted = append(emitted, ev.Seq)
+	}, func(e *subscribe.Entry) error {
+		emitted = append(emitted, e.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)
@@ -340,8 +340,8 @@ func TestWalkFromCursor_DoesNotReplayPendingMemory(t *testing.T) {
 		StopSeq:  w.ReadLog().FloorSeq(),
 		Manifest: m,
 		Writer:   w,
-	}, func(ev *segment.Event) error {
-		before = append(before, ev.Seq)
+	}, func(e *subscribe.Entry) error {
+		before = append(before, e.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)
@@ -357,8 +357,8 @@ func TestWalkFromCursor_DoesNotReplayPendingMemory(t *testing.T) {
 		StopSeq:  floor,
 		Manifest: m,
 		Writer:   w,
-	}, func(ev *segment.Event) error {
-		after = append(after, ev.Seq)
+	}, func(e *subscribe.Entry) error {
+		after = append(after, e.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)

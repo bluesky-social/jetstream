@@ -33,8 +33,8 @@ func TestWalkFromCursor_SingleSealedSegment(t *testing.T) {
 		StartSeq: 5,
 		Manifest: m,
 		Writer:   w,
-	}, func(ev *segment.Event) error {
-		got = append(got, ev.Seq)
+	}, func(e *subscribe.Entry) error {
+		got = append(got, e.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)
@@ -68,8 +68,8 @@ func TestWalkFromCursor_SealedThenActive(t *testing.T) {
 		StartSeq: 8,
 		Manifest: m,
 		Writer:   w,
-	}, func(ev *segment.Event) error {
-		got = append(got, ev.Seq)
+	}, func(e *subscribe.Entry) error {
+		got = append(got, e.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)
@@ -93,7 +93,7 @@ func TestWalkFromCursor_HaltsOnCallbackError(t *testing.T) {
 		StartSeq: 0,
 		Manifest: m,
 		Writer:   w,
-	}, func(ev *segment.Event) error {
+	}, func(e *subscribe.Entry) error {
 		count++
 		if count == 3 {
 			return stop
@@ -169,8 +169,8 @@ func TestWalkFromCursor_CompactedTrailingGapTerminates(t *testing.T) {
 	var got []uint64
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 0, Manifest: m, Writer: w,
-	}, func(ev *segment.Event) error {
-		got = append(got, ev.Seq)
+	}, func(e *subscribe.Entry) error {
+		got = append(got, e.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)
@@ -180,8 +180,8 @@ func TestWalkFromCursor_CompactedTrailingGapTerminates(t *testing.T) {
 	got = got[:0]
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 9, Manifest: m, Writer: w,
-	}, func(ev *segment.Event) error {
-		got = append(got, ev.Seq)
+	}, func(e *subscribe.Entry) error {
+		got = append(got, e.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)
@@ -210,8 +210,8 @@ func TestWalkFromCursor_FullyEmptiedSegmentTerminates(t *testing.T) {
 	var got []uint64
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 0, Manifest: m, Writer: w,
-	}, func(ev *segment.Event) error {
-		got = append(got, ev.Seq)
+	}, func(e *subscribe.Entry) error {
+		got = append(got, e.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)

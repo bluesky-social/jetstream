@@ -74,7 +74,7 @@ func TestBlockCache_InvalidateSegmentForcesRedecode(t *testing.T) {
 		return decodedFixture(1), nil
 	})
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), evs[0].Seq)
+	require.Equal(t, uint64(1), evs[0].Event.Seq)
 
 	c.invalidateSegment(7)
 
@@ -84,7 +84,7 @@ func TestBlockCache_InvalidateSegmentForcesRedecode(t *testing.T) {
 		return decodedFixture(2), nil
 	})
 	require.NoError(t, err)
-	require.Equal(t, uint64(2), evs[0].Seq)
+	require.Equal(t, uint64(2), evs[0].Event.Seq)
 	require.Equal(t, int64(2), calls.Load(), "invalidated segment must re-decode")
 }
 
@@ -126,7 +126,7 @@ func TestBlockCache_InvalidateSegmentPreventsInflightInsert(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.True(t, fresh.Load(), "old in-flight decode must not populate the new generation")
-	require.Equal(t, uint64(2), evs[0].Seq)
+	require.Equal(t, uint64(2), evs[0].Event.Seq)
 }
 
 func TestBlockCache_DecodeErrorNotCached(t *testing.T) {
