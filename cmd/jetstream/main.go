@@ -72,6 +72,7 @@ import (
 const jetstreamEnvPrefix = "JETSTREAM_"
 
 var knownForeignJetstreamEnvPrefixes = []string{
+	"JETSTREAM_APP_",
 	"JETSTREAM_SIM_",
 }
 

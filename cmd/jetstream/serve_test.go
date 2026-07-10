@@ -161,6 +161,7 @@ func TestUnknownJetstreamEnvVars_SortedAndDedupesKnownFlags(t *testing.T) {
 	got := unknownJetstreamEnvVars(newTestApp(), []string{
 		"JETSTREAM_ZZZ=1",
 		"JETSTREAM_ADDR=127.0.0.1:0",
+		"JETSTREAM_APP_INSTANCE=jetstream-0",
 		"JETSTREAM_SIM_DATA_DIR=./data-sim",
 		"OTEL_SERVICE_NAME=jetstream-test",
 		"JETSTREAM_AAA=value=with=equals",
