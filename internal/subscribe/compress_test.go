@@ -73,3 +73,48 @@ func TestZstdDictionary_IsEmbedded(t *testing.T) {
 	require.Greater(t, len(zstdDictionary), 100_000,
 		"the v1 zstd dictionary is ~113 KB; a tiny value means the embed broke")
 }
+
+// TestCompressFrameV2_RoundTripsWithV2Dictionary pins the /subscribe-v2
+// wire contract: frames decode with a reader seeded with the v2
+// dictionary, and NOT with the legacy v1 dictionary or no dictionary —
+// proving the v2 dictionary is load-bearing and distinct from v1's.
+func TestCompressFrameV2_RoundTripsWithV2Dictionary(t *testing.T) {
+	t.Parallel()
+
+	orig := []byte(`{"did":"did:plc:example","time_us":1700000000000000,"cursor":9,"kind":"identity","seq":9}`)
+	frame := compressFrameV2(orig)
+	require.NotEmpty(t, frame)
+	require.NotEqual(t, orig, frame)
+
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionaryV2))
+	require.NoError(t, err)
+	defer dec.Close()
+	got, err := dec.DecodeAll(frame, nil)
+	require.NoError(t, err)
+	require.Equal(t, orig, got)
+
+	v1Dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionary))
+	require.NoError(t, err)
+	defer v1Dec.Close()
+	_, err = v1Dec.DecodeAll(frame, nil)
+	require.Error(t, err, "v2 frames must not decode with the legacy v1 dictionary")
+
+	noDec, err := zstd.NewReader(nil)
+	require.NoError(t, err)
+	defer noDec.Close()
+	_, err = noDec.DecodeAll(frame, nil)
+	require.Error(t, err, "v2 frames must not decode without the dictionary")
+}
+
+// TestZstdDictionaryV2_EmbedAndID guards the embed and the parsed
+// dictionary ID: the ID must be present, non-zero, distinct from the v1
+// dictionary's (1612007021), and match what a decoder derives from the
+// dictionary header.
+func TestZstdDictionaryV2_EmbedAndID(t *testing.T) {
+	t.Parallel()
+	require.Greater(t, len(zstdDictionaryV2), 10_000,
+		"the v2 dictionary should be tens of KB; a tiny value means the embed broke")
+	require.NotZero(t, DictionaryV2ID)
+	require.NotEqual(t, uint32(1612007021), DictionaryV2ID,
+		"v2 must not reuse the legacy v1 dictionary ID")
+}

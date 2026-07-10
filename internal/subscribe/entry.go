@@ -35,6 +35,15 @@ type Entry struct {
 
 	// encodeV2Fn defaults to EncodeV2; overridable in tests.
 	encodeV2Fn func(*segment.Event) ([]byte, error)
+
+	// grow, when non-nil, is invoked with the byte size of each memoized
+	// body the moment it materializes. The block cache wires it so entries
+	// it shares across cold subscribers charge their lazily-computed JSON
+	// and compressed bodies back to the cache's byte budget — without it a
+	// cold replay storm would inflate the cache several times past its
+	// configured bound while the accounting still reported the raw block
+	// sizes. Hot-path (read-log) and per-walk entries leave it nil.
+	grow func(delta int)
 }
 
 // newEntry wraps ev. The event's Payload is treated as read-only (it may
@@ -69,8 +78,16 @@ func (e *Entry) Encoded() ([]byte, error) {
 			fn = Encode
 		}
 		e.body, e.err = fn(e.Event)
+		e.grew(len(e.body))
 	})
 	return e.body, e.err
+}
+
+// grew reports delta freshly-memoized bytes to the owning cache, if any.
+func (e *Entry) grew(delta int) {
+	if e.grow != nil && delta > 0 {
+		e.grow(delta)
+	}
 }
 
 // EncodedV2 returns the memoized /subscribe-v2 wire encoding for this entry.
@@ -81,6 +98,7 @@ func (e *Entry) EncodedV2() ([]byte, error) {
 			fn = EncodeV2
 		}
 		e.v2Body, e.v2Err = fn(e.Event)
+		e.grew(len(e.v2Body))
 	})
 	return e.v2Body, e.v2Err
 }
@@ -99,11 +117,15 @@ func (e *Entry) Compressed() ([]byte, error) {
 			return
 		}
 		e.compressedBody = compressFrame(body)
+		e.grew(len(e.compressedBody))
 	})
 	return e.compressedBody, e.compressedErr
 }
 
-// CompressedV2 is Compressed for the /subscribe-v2 wire shape.
+// CompressedV2 is Compressed for the /subscribe-v2 wire shape. It uses
+// the v2 dictionary (zstd_dictionary_v2), not the legacy v1 dictionary:
+// the v2 endpoint's compression contract is dict-ID-negotiated and
+// independent of v1's frozen scheme.
 func (e *Entry) CompressedV2() ([]byte, error) {
 	e.compressedV2Once.Do(func() {
 		body, err := e.EncodedV2()
@@ -111,7 +133,8 @@ func (e *Entry) CompressedV2() ([]byte, error) {
 			e.compressedV2Err = err
 			return
 		}
-		e.compressedV2Body = compressFrame(body)
+		e.compressedV2Body = compressFrameV2(body)
+		e.grew(len(e.compressedV2Body))
 	})
 	return e.compressedV2Body, e.compressedV2Err
 }

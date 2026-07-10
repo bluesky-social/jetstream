@@ -536,6 +536,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			Token:   opts.TimestampImportToken,
 			RunCtx:  importRunCtx,
 		},
+		Dictionary: xrpcapi.DictionaryConfig{
+			ID:    subscribe.DictionaryV2ID,
+			Bytes: subscribe.DictionaryV2(),
+		},
 	})
 	srv.RegisterPublicRoute("/xrpc/", xrpcSrv.Handler())
 	rt.server = srv

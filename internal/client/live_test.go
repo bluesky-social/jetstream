@@ -20,6 +20,8 @@ import (
 type readStep struct {
 	data []byte
 	err  error
+	// msgType overrides the frame type; zero value means MessageText.
+	msgType websocket.MessageType
 }
 
 var errScriptEOF = errors.New("script eof")
@@ -45,7 +47,11 @@ func (c *scriptedConn) Read(ctx context.Context) (websocket.MessageType, []byte,
 	if step.err != nil {
 		return 0, nil, step.err
 	}
-	return websocket.MessageText, step.data, nil
+	mt := step.msgType
+	if mt == 0 {
+		mt = websocket.MessageText
+	}
+	return mt, step.data, nil
 }
 
 func (c *scriptedConn) Close(websocket.StatusCode, string) error { return nil }
@@ -300,17 +306,17 @@ func TestLiveConsumerSubscribeURLCursorZero(t *testing.T) {
 	require.NotContains(t, c2.subscribeURL(), "cursor=", "fromTip must remain live-from-tip")
 }
 
-// TestLiveDialOptionsOffersCompression verifies the production dialer offers
-// RFC 7692 permessage-deflate. The server auto-negotiates deflate when the
-// client advertises it (subscribe handler), so offering it on dial cuts
-// bandwidth on the repetitive JSON firehose; a non-offering client gets an
-// uncompressed stream.
-func TestLiveDialOptionsOffersCompression(t *testing.T) {
+// TestLiveDialOptionsDoNotOfferDeflate pins the #294 contract: the v2
+// dialer must NOT offer RFC 7692 permessage-deflate — the server never
+// negotiates it on /subscribe-v2 (per-connection deflate is the dominant
+// server cost at fanout scale). Compression on v2 is the dict-zstd
+// scheme, negotiated via ?zstdDictionary=<id>, not a websocket extension.
+func TestLiveDialOptionsDoNotOfferDeflate(t *testing.T) {
 	t.Parallel()
 	opts := liveDialOptions(nil)
 	require.NotNil(t, opts)
-	require.Equal(t, websocket.CompressionContextTakeover, opts.CompressionMode,
-		"live dial must offer permessage-deflate with context takeover")
+	require.Equal(t, websocket.CompressionDisabled, opts.CompressionMode,
+		"v2 live dial must not offer permessage-deflate")
 }
 
 // capturingDialer wraps scriptedDialer to record the URL requested on each
