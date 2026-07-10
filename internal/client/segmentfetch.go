@@ -269,7 +269,8 @@ func (d *Downloader) fetchRemainderResumable(ctx context.Context, u, name string
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, errSegmentGenerationChanged) || ctx.Err() != nil {
+		var permanent *permanentError
+		if errors.Is(err, errSegmentGenerationChanged) || errors.As(err, &permanent) || ctx.Err() != nil {
 			return err
 		}
 		lastErr = err
@@ -316,7 +317,7 @@ func (d *Downloader) readRangeInto(ctx context.Context, u string, dst []byte, of
 	case http.StatusOK, http.StatusRequestedRangeNotSatisfiable:
 		return 0, errSegmentGenerationChanged
 	default:
-		return 0, httpStatusError(resp)
+		return 0, classifyStatusError(resp)
 	}
 }
 
@@ -344,7 +345,8 @@ func (d *Downloader) fetchPartAttempts(ctx context.Context, u, name string, dst 
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, errSegmentGenerationChanged) || ctx.Err() != nil {
+		var permanent *permanentError
+		if errors.Is(err, errSegmentGenerationChanged) || errors.As(err, &permanent) || ctx.Err() != nil {
 			return err
 		}
 		lastErr = err
@@ -381,7 +383,7 @@ func (d *Downloader) tryPart(ctx context.Context, u string, dst []byte, off, las
 		// ranges); 416: the file shrank. Either way this generation is gone.
 		return errSegmentGenerationChanged
 	default:
-		return httpStatusError(resp)
+		return classifyStatusError(resp)
 	}
 }
 
@@ -553,6 +555,18 @@ type statusError struct {
 
 func (e *statusError) Error() string { return e.err.Error() }
 func (e *statusError) Unwrap() error { return e.err }
+
+// classifyStatusError converts a non-2xx response into an error, marking
+// non-retryable statuses (4xx other than 429) permanent so the part/remainder
+// retry loops fail fast on them — a SegmentNotFound must not burn the whole
+// attempt budget on any path, not just the whole-body fallback.
+func classifyStatusError(resp *http.Response) error {
+	err := httpStatusError(resp)
+	if !retryableStatus(resp.StatusCode) {
+		return &permanentError{err: err}
+	}
+	return err
+}
 
 // httpStatusError drains a bounded error-body excerpt so XRPC error envelopes
 // (e.g. SegmentNotFound) stay diagnosable without trusting the body length.

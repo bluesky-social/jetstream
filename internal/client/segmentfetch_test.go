@@ -367,6 +367,37 @@ func TestFetchSegmentGenerationSwapRestartsCleanly(t *testing.T) {
 	require.Equal(t, genB, got, "after a generation swap the client must deliver the NEW generation intact")
 }
 
+// TestFetchSegmentPart4xxIsPermanent extends the fallback path's 4xx
+// classification to the part/remainder paths: a part answered with a 4xx XRPC
+// envelope (not 429) must fail after exactly one attempt on that part, not
+// burn the retry budget re-asking a question with a permanent answer.
+func TestFetchSegmentPart4xxIsPermanent(t *testing.T) {
+	t.Parallel()
+	body := patternBody(1 << 20)
+	s, url := newSegServer(t, body)
+	var partReqs atomic.Int64
+	s.mu.Lock()
+	s.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("Range") == "bytes=131072-196607" {
+			partReqs.Add(1)
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"Forbidden"}`))
+			return true
+		}
+		return false
+	}
+	s.mu.Unlock()
+
+	d := stripedDownloader(url, 4, 64<<10)
+	_, err := d.fetchSegment(context.Background(), "seg.jss")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "Forbidden")
+	require.Equal(t, int64(1), partReqs.Load(), "a 4xx part response must not be retried")
+	var xerr *xrpc.Error
+	require.True(t, errors.As(err, &xerr), "part errors must expose *xrpc.Error")
+	require.Equal(t, http.StatusForbidden, xerr.StatusCode)
+}
+
 func TestFetchSegmentPersistentPartFailureSurfacesError(t *testing.T) {
 	t.Parallel()
 	body := patternBody(1 << 20)
