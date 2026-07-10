@@ -120,7 +120,9 @@ test-race-ci *ARGS="./...":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    artifact_dir="${JETSTREAM_RACE_ARTIFACT_DIR:-race-artifacts}"
+    # Do not use the JETSTREAM_ prefix here. The jetstream binary reserves that
+    # namespace for runtime config and intentionally rejects unknown keys.
+    artifact_dir="${RACE_ARTIFACT_DIR:-race-artifacts}"
     mkdir -p "${artifact_dir}"
 
     echo "test-race-ci: writing diagnostics to ${artifact_dir}"
