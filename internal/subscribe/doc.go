@@ -25,7 +25,13 @@
 //     read falls through to a bounded disk walk over sealed segments +
 //     the active segment's flushed region, routed through a shared byte-bounded decoded-
 //     block LRU cache (blockcache.go) so concurrent cold readers don't
-//     each re-decode the same block.
+//     each re-decode the same block. The cache also carries one shared
+//     Entry per cached event (#295), so cold subscribers reuse each
+//     other's memoized JSON encodes and compressed frames the way hot
+//     ones do; the entries charge their lazily-memoized bodies back to
+//     the cache's byte budget as they materialize. zstd compression
+//     itself runs on a bounded free list of encoders (encoderpool.go)
+//     rather than one process-wide serialized encoder.
 //
 // Tail (tail.go) owns the readable-log adapter, the cold reader, and the graceful-close
 // connection registry. The hot/cold boundary is transparent to ReadFrom

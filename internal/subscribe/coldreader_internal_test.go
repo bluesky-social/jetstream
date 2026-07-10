@@ -88,7 +88,7 @@ func mustOpenColdReaderManifest(tb testing.TB, dir string) *manifest.Manifest {
 	return m
 }
 
-func openColdReaderWriterAtTip(t *testing.T, dir string, nextSeq uint64) (*store.Store, *ingest.Writer) {
+func openColdReaderWriterAtTip(t testing.TB, dir string, nextSeq uint64) (*store.Store, *ingest.Writer) {
 	t.Helper()
 	st, err := store.Open(dir, store.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
