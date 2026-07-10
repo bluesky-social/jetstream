@@ -56,6 +56,13 @@ type WalkInput struct {
 //  1. the sealed-segment region from the manifest,
 //  2. the active segment's flushed blocks.
 //
+// Events are delivered as *Entry so sealed-region events served through the
+// shared block cache carry the block's SHARED entries: concurrent cold
+// subscribers replaying the same blocks reuse one memoized JSON encode and
+// one compressed frame per event, exactly like hot (read-log) subscribers
+// (#295). Shared entries (and their events) are read-only. Active-region
+// events and cache-less sealed reads get fresh per-walk entries.
+//
 // Halts when emit returns a non-nil error and surfaces the error
 // (errors.Is is honored).
 //
@@ -97,7 +104,7 @@ type WalkInput struct {
 //     fillable. A retry that fails to advance is an invariant violation
 //     (e.g. publish-before-bump broke, or a genuine hole below the floor):
 //     we surface it loudly rather than spin or silently skip.
-func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Event) error) error {
+func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*Entry) error) error {
 	current := input.StartSeq
 
 	if input.Manifest == nil {
@@ -170,7 +177,7 @@ func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*segment.Eve
 // walkSealedRegion emits every event with Seq >= start that resides in the
 // manifest's sealed segments, in seq order, and returns the next unemitted
 // seq. Only invoked when input.Manifest != nil.
-func walkSealedRegion(ctx context.Context, input WalkInput, start uint64, emit func(*segment.Event) error) (uint64, error) {
+func walkSealedRegion(ctx context.Context, input WalkInput, start uint64, emit func(*Entry) error) (uint64, error) {
 	current := start
 	for {
 		if err := ctx.Err(); err != nil {
@@ -210,7 +217,7 @@ func walkSealedRegion(ctx context.Context, input WalkInput, start uint64, emit f
 // zstd frame) and emits nothing partial; that error propagates here and the
 // subscriber reconnects, by which point the file is a normal sealed segment
 // the sealed sweep will serve. See segment/walkactive_seal_test.go.
-func walkActiveRegion(input WalkInput, start uint64, emit func(*segment.Event) error) (next uint64, err error) {
+func walkActiveRegion(input WalkInput, start uint64, emit func(*Entry) error) (next uint64, err error) {
 	current := start
 
 	// emitErr captures an error returned by the CALLER's emit (including the
@@ -241,8 +248,11 @@ func walkActiveRegion(input WalkInput, start uint64, emit func(*segment.Event) e
 			// no-progress guard.
 			return true
 		default:
+			// Active-region entries are per-walk: the active tail is thin
+			// relative to a deep replay and its events are only immutable per
+			// flushed block, so sharing machinery isn't worth the bookkeeping.
 			cp := *ev
-			if e := emit(&cp); e != nil {
+			if e := emit(newEntry(&cp)); e != nil {
 				emitErr = e
 				return true
 			}
@@ -278,9 +288,21 @@ func walkActiveRegion(input WalkInput, start uint64, emit func(*segment.Event) e
 // escapes walkActiveRegion.
 var errStopWalk = errors.New("subscribe: stop active walk")
 
-func decodeSealedBlock(cache *blockCache, segIdx uint64, blockIdx int, r *segment.Reader) ([]segment.Event, error) {
+// decodeSealedBlock returns the block's events wrapped as entries. With a
+// cache the entries are the block's SHARED entries (memoized encodes and
+// compressed frames are reused across every cold subscriber); without one
+// they are fresh per-call wrappers over a private decode.
+func decodeSealedBlock(cache *blockCache, segIdx uint64, blockIdx int, r *segment.Reader) ([]*Entry, error) {
 	if cache == nil {
-		return r.DecodeBlock(blockIdx)
+		events, err := r.DecodeBlock(blockIdx)
+		if err != nil {
+			return nil, err
+		}
+		entries := make([]*Entry, len(events))
+		for i := range events {
+			entries[i] = newEntry(&events[i])
+		}
+		return entries, nil
 	}
 	return cache.getOrDecode(
 		cache.keyForBlock(segIdx, r.Header().Checksum, blockIdx),
@@ -295,7 +317,7 @@ func decodeSealedBlock(cache *blockCache, segIdx uint64, blockIdx int, r *segmen
 // stable, manifest bounds valid supersets). Block repacking — merging
 // thinned blocks — must migrate this call site (or generation-check
 // the manifest entry) first.
-func walkSealedSegment(m *manifest.Manifest, fs vfs.FS, bounds manifest.SegmentBounds, current uint64, stopSeq uint64, cache *blockCache, emit func(*segment.Event) error) (uint64, error) {
+func walkSealedSegment(m *manifest.Manifest, fs vfs.FS, bounds manifest.SegmentBounds, current uint64, stopSeq uint64, cache *blockCache, emit func(*Entry) error) (uint64, error) {
 	blocks, err := m.BlockIndex(bounds.Idx)
 	if err != nil {
 		return current, fmt.Errorf("block index for seg %d: %w", bounds.Idx, err)
@@ -314,22 +336,22 @@ func walkSealedSegment(m *manifest.Manifest, fs vfs.FS, bounds manifest.SegmentB
 		if block.MaxSeq < current {
 			continue
 		}
-		events, err := decodeSealedBlock(cache, bounds.Idx, i, r)
+		entries, err := decodeSealedBlock(cache, bounds.Idx, i, r)
 		if err != nil {
 			return current, fmt.Errorf("decode seg %d block %d: %w", bounds.Idx, i, err)
 		}
-		for j := range events {
-			if events[j].Seq < current {
+		for _, e := range entries {
+			seq := e.Event.Seq
+			if seq < current {
 				continue
 			}
-			if stopSeq != 0 && events[j].Seq >= stopSeq {
+			if stopSeq != 0 && seq >= stopSeq {
 				return current, nil
 			}
-			ev := events[j]
-			if err := emit(&ev); err != nil {
+			if err := emit(e); err != nil {
 				return current, err
 			}
-			current = events[j].Seq + 1
+			current = seq + 1
 		}
 	}
 	return current, nil
@@ -407,13 +429,16 @@ func (r *ColdReader) Read(ctx context.Context, cursor uint64, max int) ([]*Entry
 		Writer:     w,
 		FS:         r.fs,
 		BlockCache: r.cache,
-	}, func(ev *segment.Event) error {
-		if floor > 0 && ev.Seq >= floor {
+	}, func(e *Entry) error {
+		// Sealed-region entries arrive SHARED from the block cache (the #295
+		// fix: concurrent cold subscribers reuse one memoized encode and one
+		// compressed frame per event, like the hot path); active-region
+		// entries are per-walk. Either way they are appended as-is.
+		if floor > 0 && e.Event.Seq >= floor {
 			return errBatchFull
 		}
-		cp := *ev
-		batch = append(batch, newEntry(&cp))
-		next = ev.Seq + 1
+		batch = append(batch, e)
+		next = e.Event.Seq + 1
 		if len(batch) >= max {
 			return errBatchFull
 		}
