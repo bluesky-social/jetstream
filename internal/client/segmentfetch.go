@@ -18,18 +18,20 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Whole-segment downloads use HTTP ranges two ways (#296). Always on: a
+// Whole-segment downloads use HTTP ranges two ways (#296): each segment is
+// fetched as parallel range parts (WithSegmentStripes, default 8), and a
 // mid-stream failure resumes with Range+If-Range from the last byte received —
-// O(gap) recovery instead of the old O(segment) restart-from-zero. Opt-in
-// (WithSegmentStripes > 1): the segment is fetched as parallel range parts,
-// for paths where per-stream congestion control is the throughput bound.
+// O(gap) recovery instead of the old O(segment) restart-from-zero.
 //
-// Striping is OFF by default on measured evidence: across a WireGuard tunnel
-// (Boston→Seattle, 70 ms) all streams share one encapsulated UDP flow, so
-// parallel parts fragment the tunnel's capacity instead of adding any —
-// 8-part striping measured 20-40% SLOWER than the single warm stream. On the
-// raw internet, where routers/limiters see per-TCP-flow state, striping is
-// expected to win; flip it on once that is measured, not before.
+// Striping targets paths where per-TCP-stream congestion control is the
+// throughput bound — the common case for consumers pulling an archive over
+// the public internet at meaningful RTT. Note for tunneled paths: in our lab
+// measurements across a WireGuard tunnel (where all TCP shares one
+// encapsulated UDP flow), parallel parts fragmented the tunnel's fixed
+// capacity and ran 20-40% slower than a single stream; on a fast LAN the
+// modes were indistinguishable (decode-bound). If your deployment runs
+// through such a tunnel, set WithSegmentStripes(1) — which also selects the
+// resumable single-stream path.
 //
 // The server's getSegment serves via http.ServeContent, so Range, If-Range,
 // and a strong per-generation ETag are already part of the contract; the
@@ -40,9 +42,10 @@ const (
 	// tail), large enough that per-request overhead (RTT + TTFB) stays <1% of
 	// a part's transfer time on measured WAN paths.
 	segmentPartSize = 16 << 20
-	// defaultSegmentStripes keeps whole-segment fetches single-stream (see the
-	// package comment above for the measurement that set this).
-	defaultSegmentStripes = 1
+	// defaultSegmentStripes is the per-segment range-request fan-out. 8
+	// reached path capacity in our WAN probes without meaningfully raising
+	// server cost (getSegment range serving is sendfile-cheap).
+	defaultSegmentStripes = 8
 	// maxSegmentBytes bounds a single segment allocation, mirroring the old
 	// xrpc.QueryRaw cap's role: a corrupt/hostile Content-Range or
 	// Content-Length must not make the client allocate unbounded memory.

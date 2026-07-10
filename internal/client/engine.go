@@ -42,9 +42,9 @@ type Config struct {
 	// the steady-state live tail. Zero uses defaultMaxBatchDelay.
 	MaxBatchDelay time.Duration
 	Concurrency   int
-	// SegmentStripes, when > 1, fetches each whole segment as that many
-	// parallel HTTP range requests. 0/1 = one resumable stream (the default;
-	// see the segmentfetch.go doc comment for why).
+	// SegmentStripes sets the per-segment range-request fan-out; 0 uses the
+	// library default (8). 1 = one resumable stream (see segmentfetch.go for
+	// when that is preferable).
 	SegmentStripes int
 	// XRPC drives the short XRPC negotiation calls (planBackfill).
 	// BulkXRPC drives the large getSegment/getBlock downloads;

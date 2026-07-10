@@ -96,8 +96,8 @@ func NewDownloader(xc *xrpc.Client, concurrency int, selector RowSelector) *Down
 }
 
 // SetSegmentStripes overrides how many parallel range requests fetch each
-// whole segment. 1 (the default) is a single resumable stream; see the
-// segmentfetch.go doc comment for when >1 helps and when it actively hurts.
+// whole segment (default 8). 1 selects the single resumable stream; see the
+// segmentfetch.go doc comment for when that is the better choice.
 func (d *Downloader) SetSegmentStripes(n int) {
 	if n > 0 {
 		d.segStripes = n

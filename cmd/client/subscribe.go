@@ -64,7 +64,7 @@ func subscribeCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:  "segment-stripes",
-				Usage: "Parallel HTTP range requests per whole-segment download (1 = single resumable stream). >1 helps only when per-TCP-stream congestion control binds (public internet); hurts on single-flow tunnels like WireGuard/Tailscale.",
+				Usage: "Parallel HTTP range requests per whole-segment download (0 = library default of 8). Set 1 for a single resumable stream, e.g. on single-flow tunnels like WireGuard where parallel streams can be slower.",
 				Value: 0,
 			},
 			&cli.BoolFlag{

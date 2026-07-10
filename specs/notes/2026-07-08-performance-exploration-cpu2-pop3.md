@@ -494,23 +494,28 @@ recovers the measured ~1.5× on this clean path and much more on lossy paths
 with A6.3 and A6.4: parts are natural resume/streaming units. Memory stays
 bounded — today's budget is already ~2×280 MB of prefetched buffer.
 
-**Done with a twist (#296, 2026-07-09):** implemented (16 MB range parts,
-errgroup fan-out, If-Range generation safety) but **striping defaults OFF**
-(`WithSegmentStripes` / `--segment-stripes` to opt in), because A/B
-measurement refuted the premise *on this path*: over the Tailscale/WireGuard
-tunnel, 8-part striping was **20–40% slower** than the single stream
-(interleaved rounds: main 38.7–41.0 s vs striped 48.1–57.0 s on a 2.5 GB
-window; raw-curl isolation confirmed 1 stream 3.7 s vs 8 parts 7.0 s for one
-segment). Contributing factors: all tunneled TCP shares ONE encapsulated UDP
-flow, so parallel streams fragment a fixed ~75 MB/s tunnel capacity instead
-of claiming per-flow bandwidth, each part re-pays slow-start at 70 ms, and
-the 8-stream burst self-induces loss. Yesterday's "105 MB/s with 8 streams"
-capacity probe did not reproduce reliably today (high variance:
-39–98 MB/s); single-stream is stable at 70–80. On a 200 Gbps LAN
-(cpu1→cpu2), main / stripes-1 / 4 / 8 are indistinguishable (~22 s,
-decode-bound). Striping should win on raw-internet paths where per-TCP-flow
-congestion control binds — flip the default only after measuring there.
-Jim is testing over the public internet soon.
+**Done (#296, 2026-07-09):** implemented — 16 MB range parts, errgroup
+fan-out, If-Range generation safety — **default 8 stripes**, tunable via
+`WithSegmentStripes` / `--segment-stripes` (1 = single resumable stream).
+
+Lab caveat worth recording: our only WAN vantage is the Tailscale/WireGuard
+tunnel, and *on that path* striping measured 20–40% slower than the single
+stream (interleaved rounds: main 38.7–41.0 s vs striped 48.1–57.0 s on a
+2.5 GB window; raw-curl isolation, no client code: 1 stream 3.7 s vs 8 parts
+7.0 s per segment). Plausible mechanism: WireGuard encapsulates all tunneled
+TCP into one UDP flow, so parallel parts fragment a fixed ~75 MB/s tunnel
+capacity, re-pay slow-start per connection, and burst-induce loss. Also
+noted: multi-stream capacity probes over the tunnel varied wildly run-to-run
+(39–98 MB/s aggregate) while single-stream was stable at 70–80 — one probe
+is not a design premise. On a 200 Gbps LAN (cpu1→cpu2), all modes are
+indistinguishable (~22 s, decode-bound).
+
+We shipped striping as the default anyway: typical consumers pull over the
+public internet, where per-TCP-flow congestion control is the expected
+bottleneck and striping is the standard remedy; tunneled deployments can set
+stripes=1. Public-internet validation pending (Jim); if it lands
+contradicting the expectation, revisit the default and consider promoting
+the tunnel observation to specs/gotchas.md.
 
 ### A6.3 P1 — Resume interrupted segment downloads with Range + If-Range
 
