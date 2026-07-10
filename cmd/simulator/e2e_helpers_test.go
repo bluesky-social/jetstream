@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,6 +49,102 @@ func buildJetstreamForTest(t *testing.T) string {
 
 func newJetstreamCmd(ctx context.Context, bin string, args []string) *exec.Cmd {
 	return exec.CommandContext(ctx, bin, args...)
+}
+
+type jetstreamProcess struct {
+	cmd  *exec.Cmd
+	done chan error
+
+	mu      sync.Mutex
+	waited  bool
+	waitErr error
+}
+
+func startJetstreamForTest(t *testing.T, ctx context.Context, bin string, args []string, output *lockedBuffer) *jetstreamProcess {
+	t.Helper()
+
+	cmd := newJetstreamCmd(ctx, bin, args)
+	cmd.Stdout = output
+	cmd.Stderr = output
+	require.NoError(t, cmd.Start())
+
+	proc := &jetstreamProcess{
+		cmd:  cmd,
+		done: make(chan error, 1),
+	}
+	go func() {
+		proc.done <- cmd.Wait()
+	}()
+	return proc
+}
+
+func (p *jetstreamProcess) pollExit() (error, bool) {
+	p.mu.Lock()
+	if p.waited {
+		err := p.waitErr
+		p.mu.Unlock()
+		return err, true
+	}
+	p.mu.Unlock()
+
+	select {
+	case err := <-p.done:
+		p.mu.Lock()
+		p.waited = true
+		p.waitErr = err
+		p.mu.Unlock()
+		return err, true
+	default:
+		return nil, false
+	}
+}
+
+func (p *jetstreamProcess) stop() {
+	if _, exited := p.pollExit(); exited {
+		return
+	}
+	_ = p.cmd.Process.Kill()
+	err := <-p.done
+	p.mu.Lock()
+	p.waited = true
+	p.waitErr = err
+	p.mu.Unlock()
+}
+
+func waitForJetstreamSubscribeReady(t *testing.T, proc *jetstreamProcess, addr string, logs *lockedBuffer, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if err, exited := proc.pollExit(); exited {
+			require.NoErrorf(t, err, "jetstream exited before /subscribe became ready; logs:\n%s", logs.String())
+			t.Fatalf("jetstream exited before /subscribe became ready; logs:\n%s", logs.String())
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		conn, resp, err := websocket.Dial(ctx, "ws://"+addr+"/subscribe", nil)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		cancel()
+		if err == nil {
+			_ = conn.Close(websocket.StatusNormalClosure, "probe")
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("jetstream did not become ready; logs:\n%s", logs.String())
+		}
+
+		select {
+		case <-ticker.C:
+		case <-t.Context().Done():
+			t.Fatalf("test context ended before jetstream became ready: %v; logs:\n%s", t.Context().Err(), logs.String())
+		}
+	}
 }
 
 func freePortAddr(t *testing.T) string {

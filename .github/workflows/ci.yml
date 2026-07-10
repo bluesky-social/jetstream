@@ -192,7 +192,7 @@ jobs:
 
       - name: Test (race detector)
         env:
-          JETSTREAM_RACE_ARTIFACT_DIR: ${{ github.workspace }}/race-artifacts
+          RACE_ARTIFACT_DIR: ${{ github.workspace }}/race-artifacts
         run: ./dev.sh --command just test-race-ci
 
       - name: Upload race diagnostics

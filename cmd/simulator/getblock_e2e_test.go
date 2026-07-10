@@ -19,7 +19,6 @@ import (
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
 
@@ -108,7 +107,8 @@ func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 	jetAddr := freePortAddr(t)
 	jetDebug := freePortAddr(t)
 
-	cmd := newJetstreamCmd(jetCtx, binPath, []string{
+	stderr := &lockedBuffer{}
+	proc := startJetstreamForTest(t, jetCtx, binPath, []string{
 		"serve",
 		"--addr", jetAddr,
 		"--debug-addr", jetDebug,
@@ -116,33 +116,13 @@ func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 		"--relay-url", simSrv.URL,
 		"--plc-url", simSrv.URL,
 		"--shutdown-timeout=5s",
-	})
-	stderr := &lockedBuffer{}
-	cmd.Stdout = stderr
-	cmd.Stderr = stderr
-	require.NoError(t, cmd.Start())
-	defer func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	}()
+	}, stderr)
+	defer proc.stop()
 
 	// Wait for jetstream's /subscribe to start serving (backfill drained →
 	// steady-state). The getBlock/listSegments routes share the same readiness
 	// gate, so a successful websocket dial also means those routes are live.
-	require.Eventually(t, func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		conn, resp, err := websocket.Dial(ctx, "ws://"+jetAddr+"/subscribe", nil)
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-		if err != nil {
-			return false
-		}
-		_ = conn.Close(websocket.StatusNormalClosure, "probe")
-		return true
-	}, 45*time.Second, 250*time.Millisecond,
-		"jetstream did not become ready; logs:\n%s", stderr.String())
+	waitForJetstreamSubscribeReady(t, proc, jetAddr, stderr, 45*time.Second)
 
 	segDir := filepath.Join(jetDir, "segments")
 	listURL := "http://" + jetAddr + "/xrpc/network.bsky.jetstream.listSegments?limit=1000"
