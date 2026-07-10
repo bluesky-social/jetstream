@@ -24,10 +24,16 @@ expected-tier: powerloss
 tiers: powerloss
 
 diff --git a/internal/ingest/orchestrator/merge.go b/internal/ingest/orchestrator/merge.go
-index e325856..a558005 100644
+index 75c1dfe..294168c 100644
 --- a/internal/ingest/orchestrator/merge.go
 +++ b/internal/ingest/orchestrator/merge.go
-@@ -152,3 +151,0 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
+@@ -172,9 +172,6 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
+ 		// restart-after-cleanup guard would be skipped, and the drain would
+ 		// re-run from cursor 0 — appending already-merged events into
+ 		// data/segments and corrupting the archive.
 -		if err := syncStorageDirFS(o.cfg.FS, o.cfg.DataDir); err != nil {
 -			return fmt.Errorf("orchestrator: merge: sync data dir after backfill removal: %w", err)
 -		}
+ 		if err := deleteMergeCursor(o.cfg.Store); err != nil {
+ 			return err
+ 		}
