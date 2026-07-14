@@ -383,3 +383,67 @@ func mustURLHost(t *testing.T, raw string) string {
 	require.NoError(t, err)
 	return u.Host
 }
+
+// TestRetryRunner_DownloadTimeoutBoundsStalledFetch: a getRepo whose
+// body stalls mid-transfer must be cut off by the per-attempt download
+// budget and recorded as a normal retry failure (backoff scheduled),
+// not hang the retry worker until the transport's 30-minute backstop.
+// Mirrors atmos backfill.Engine's DownloadTimeout posture
+// (bluesky-social/jetstream#299 follow-up: the retry runner bypasses
+// the engine, so it needs its own bound).
+func TestRetryRunner_DownloadTimeoutBoundsStalledFetch(t *testing.T) {
+	t.Parallel()
+	st, w, _ := newRetryTestWriter(t)
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:retrystall")
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+
+	stalled := make(chan struct{})
+	t.Cleanup(func() { close(stalled) })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/xrpc/com.atproto.sync.getRepo", r.URL.Path)
+		w.Header().Set("Content-Type", "application/vnd.ipld.car")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-stalled:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+	host := mustURLHost(t, srv.URL)
+
+	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, bs.OnFail(ctx, did, host, errors.New("xrpc: HTTP 503: bootstrap unavailable"), 1))
+	require.NoError(t, bs.RecordRetryFailure(ctx, did, host, errors.New("xrpc 503 unavailable"), now.Add(-time.Hour)))
+
+	r, err := newRetryRunner(RetryConfig{
+		Store:           st,
+		Writer:          w,
+		HTTPClient:      srv.Client(),
+		RelayURL:        srv.URL,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Interval:        time.Hour,
+		Workers:         1,
+		HostWorkers:     1,
+		MaxDelay:        24 * time.Hour,
+		DownloadTimeout: 200 * time.Millisecond,
+		now:             func() time.Time { return now },
+	})
+	require.NoError(t, err)
+
+	start := time.Now()
+	require.NoError(t, r.processCandidate(ctx, retryCandidate{DID: did, Host: host, Retry: 1}),
+		"a timed-out download is a recordable failure, not a pass-fatal error")
+	require.Less(t, time.Since(start), 10*time.Second,
+		"attempt must be bounded by DownloadTimeout, not the transport backstop")
+
+	rs, err := bs.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusFailed, rs.Backfill.Status)
+	require.Equal(t, 2, rs.Backfill.RetryCount, "timeout must be recorded as a failed attempt")
+	require.True(t, rs.Backfill.NextAttemptAt.After(now), "backoff must be scheduled")
+}
