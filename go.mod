@@ -1,12 +1,12 @@
 module github.com/bluesky-social/jetstream
 
-go 1.26.4
+go 1.26.5
 
 require (
-	github.com/cockroachdb/errors v1.11.3
+	github.com/cockroachdb/errors v1.14.0
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/coder/websocket v1.8.15
-	github.com/jcalabro/atmos v0.2.13
+	github.com/jcalabro/atmos v0.2.14
 	github.com/jcalabro/gloom v0.1.0
 	github.com/jcalabro/gt v0.0.14
 	github.com/jcalabro/jttp v0.0.6
@@ -24,7 +24,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
 	golang.org/x/sync v0.21.0
-	golang.org/x/sys v0.46.0
+	golang.org/x/sys v0.47.0
 )
 
 require (
@@ -38,7 +38,7 @@ require (
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/getsentry/sentry-go v0.27.0 // indirect
+	github.com/getsentry/sentry-go v0.46.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect

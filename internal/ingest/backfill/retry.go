@@ -16,6 +16,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
+	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	atmosrepo "github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
@@ -53,6 +54,17 @@ type RetryConfig struct {
 	Workers     int
 	HostWorkers int
 	MaxDelay    time.Duration
+
+	// DownloadTimeout bounds one retry attempt's network phase (getRepo
+	// + CAR read). Zero → atmos backfill.DefaultDownloadTimeout (5m).
+	// Negative disables the bound, leaving only the transport's own
+	// guards (jttp's 30m wall-clock backstop). Without this, a giant or
+	// slow-serving repo occupies a host-limited retry slot for up to
+	// the transport backstop on every pass, forever — the retry runner
+	// bypasses atmos's backfill.Engine and so does not inherit its
+	// DownloadTimeout (observed with pds1.podping.at during the #299
+	// incident).
+	DownloadTimeout time.Duration
 
 	now            func() time.Time
 	jitter         jitterFunc
@@ -143,6 +155,9 @@ func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
 	}
 	if cfg.MaxDelay <= 0 {
 		cfg.MaxDelay = DefaultFailedRepoRetryMaxDelay
+	}
+	if cfg.DownloadTimeout == 0 {
+		cfg.DownloadTimeout = atmosbackfill.DefaultDownloadTimeout
 	}
 	if cfg.now == nil {
 		cfg.now = time.Now
@@ -317,18 +332,7 @@ func (r *retryRunner) processCandidate(ctx context.Context, cand retryCandidate)
 }
 
 func (r *retryRunner) tryRepo(ctx context.Context, did atmos.DID) (string, error) {
-	body, host, err := r.syncClient.GetRepoStreamHost(ctx, did, "")
-	if err != nil {
-		return host, err
-	}
-	defer func() { _ = body.Close() }()
-
-	// LoadCompleteFromCAR (not LoadFromCAR) verifies the downloaded full repo
-	// is structurally complete. A getRepo CAR truncated exactly on a block
-	// boundary parses cleanly but omits referenced blocks; LoadCompleteFromCAR
-	// surfaces that as a transient (io.ErrUnexpectedEOF) error so this retry
-	// pass re-defers the DID rather than completing it on a partial repo.
-	rp, commit, err := atmosrepo.LoadCompleteFromCAR(bufio.NewReader(body))
+	rp, commit, host, err := r.download(ctx, did)
 	if err != nil {
 		return host, err
 	}
@@ -342,6 +346,54 @@ func (r *retryRunner) tryRepo(ctx context.Context, did atmos.DID) (string, error
 		return host, fmt.Errorf("backfill: retry: complete repo: %w", err)
 	}
 	return host, nil
+}
+
+// download fetches and parses one repo under the per-attempt
+// DownloadTimeout. Only the network phase (getRepo + CAR read) runs
+// under the deadline; the caller's handler/durability work runs under
+// the parent ctx — it must not be killed by a network budget.
+//
+// A timeout that is ours (parent ctx still healthy) surfaces as the
+// deadline error wrapped in a distinguishing message; processCandidate
+// records it as an ordinary retry failure with backoff, same as any
+// transport error. Mirrors atmos backfill.Engine.download, which the
+// retry runner bypasses.
+func (r *retryRunner) download(ctx context.Context, did atmos.DID) (*atmosrepo.Repo, *atmosrepo.Commit, string, error) {
+	dlCtx := ctx
+	if r.cfg.DownloadTimeout > 0 {
+		var cancel context.CancelFunc
+		dlCtx, cancel = context.WithTimeout(ctx, r.cfg.DownloadTimeout)
+		defer cancel()
+	}
+
+	body, host, err := r.syncClient.GetRepoStreamHost(dlCtx, did, "")
+	if err != nil {
+		return nil, nil, host, r.classifyDownloadErr(dlCtx, ctx, err)
+	}
+	defer func() { _ = body.Close() }()
+
+	// LoadCompleteFromCAR (not LoadFromCAR) verifies the downloaded full repo
+	// is structurally complete. A getRepo CAR truncated exactly on a block
+	// boundary parses cleanly but omits referenced blocks; LoadCompleteFromCAR
+	// surfaces that as a transient (io.ErrUnexpectedEOF) error so this retry
+	// pass re-defers the DID rather than completing it on a partial repo.
+	rp, commit, err := atmosrepo.LoadCompleteFromCAR(bufio.NewReader(body))
+	if err != nil {
+		return nil, nil, host, r.classifyDownloadErr(dlCtx, ctx, err)
+	}
+	return rp, commit, host, nil
+}
+
+// classifyDownloadErr annotates a download failure caused by OUR
+// per-attempt budget (dlCtx expired, parent ctx healthy) so the log
+// line and stored LastError identify the slow download rather than a
+// generic "context deadline exceeded". Other errors pass through.
+func (r *retryRunner) classifyDownloadErr(dlCtx, parent context.Context, err error) error {
+	if dlCtx.Err() != nil && parent.Err() == nil {
+		return fmt.Errorf("backfill: retry: repo download exceeded DownloadTimeout (%s): %w",
+			r.cfg.DownloadTimeout, err)
+	}
+	return err
 }
 
 func (r *retryRunner) acquireHost(ctx context.Context, host string) (func(), error) {

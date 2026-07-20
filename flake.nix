@@ -3,10 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs-go.url = "github:NixOS/nixpkgs/nixos-26.05";
     systems.url = "github:nix-systems/default";
   };
 
-  outputs = { self, nixpkgs, systems }:
+  outputs = { self, nixpkgs, nixpkgs-go, systems }:
     let
       eachSystem = nixpkgs.lib.genAttrs (import systems);
     in
@@ -14,7 +15,11 @@
       devShells = eachSystem (system:
         let
           pkgs = import nixpkgs { inherit system; };
-          go = pkgs.go_1_26;
+          goPkgs = import nixpkgs-go { inherit system; };
+          goVersion = "1.26.5";
+          go = assert pkgs.lib.assertMsg (goPkgs.go_1_26.version == goVersion)
+            "nixpkgs-go must provide Go ${goVersion}, got ${goPkgs.go_1_26.version}";
+            goPkgs.go_1_26;
           golangci-lint = pkgs.buildGoModule {
             pname = "golangci-lint";
             version = "2.10.1";
@@ -63,7 +68,7 @@
 
             shellHook = ''
               export GOTOOLCHAIN=local
-              echo "jetstream dev shell: Go 1.26.4 ($(go version))"
+              echo "jetstream dev shell: Go ${goVersion} ($(go version))"
               echo "tools: just $(just --version | awk '{print $2}'), golangci-lint 2.10.1, gotestsum 1.13.0, govulncheck 1.5.0, modernize 0.20.0"
             '';
           };
