@@ -134,7 +134,12 @@ type Config struct {
 	// whole-network bootstrap backfill. Zero leaves the backfill package on
 	// its default; cmd/jetstream normally resolves zero to its production
 	// default before constructing the orchestrator.
-	BackfillWorkers int
+	BackfillGlobalDownloads int
+	BackfillHostWorkers     int
+	BackfillMaxActiveHosts  int
+	BackfillMaxHosts        int
+	BackfillWorkers         int // retired compatibility input
+	BackfillNewHostClient   func(string) (*atmossync.Client, error)
 
 	// BackfillBatchSize controls how many listRepos entries are accumulated
 	// before atmos shuffles and dispatches a bootstrap backfill batch. Zero
@@ -319,8 +324,10 @@ func (c *Config) validate() error {
 	if c.RelayURL == "" {
 		return fmt.Errorf("%w: RelayURL is required", ErrInvalidConfig)
 	}
-	if c.BackfillWorkers < 0 {
-		return fmt.Errorf("%w: BackfillWorkers must be >= 0", ErrInvalidConfig)
+	for name, value := range map[string]int{"BackfillGlobalDownloads": c.BackfillGlobalDownloads, "BackfillHostWorkers": c.BackfillHostWorkers, "BackfillMaxActiveHosts": c.BackfillMaxActiveHosts, "BackfillMaxHosts": c.BackfillMaxHosts} {
+		if value < 0 {
+			return fmt.Errorf("%w: %s must be >= 0", ErrInvalidConfig, name)
+		}
 	}
 	if c.BackfillBatchSize < 0 {
 		return fmt.Errorf("%w: BackfillBatchSize must be >= 0", ErrInvalidConfig)

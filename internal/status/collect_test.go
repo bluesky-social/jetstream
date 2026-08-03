@@ -566,6 +566,7 @@ func TestCollect_PebbleKeyspaces(t *testing.T) {
 
 	require.NoError(t, st.Set([]byte("repo/a"), []byte("x"), store.SyncWrites))
 	require.NoError(t, st.Set([]byte("repo/b"), []byte("x"), store.SyncWrites))
+	require.NoError(t, st.Set([]byte("pdshost/pds.example.com"), []byte(`{"hostname":"pds.example.com","enumerated":false}`), store.SyncWrites))
 	require.NoError(t, st.Set([]byte("sync/chain/a"), []byte("x"), store.SyncWrites))
 	require.NoError(t, st.Set([]byte("sync/host/a"), []byte("x"), store.SyncWrites))
 	require.NoError(t, st.Set([]byte("relay/other"), []byte("x"), store.SyncWrites))
@@ -577,6 +578,7 @@ func TestCollect_PebbleKeyspaces(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, uint64(2), snap.Pebble.KeyspaceCounts["repo/"])
+	require.Equal(t, uint64(1), snap.Pebble.KeyspaceCounts["pdshost/"])
 	require.Equal(t, uint64(1), snap.Pebble.KeyspaceCounts["sync/chain/"])
 	require.Equal(t, uint64(1), snap.Pebble.KeyspaceCounts["sync/host/"])
 	require.Equal(t, uint64(1), snap.Pebble.KeyspaceCounts["relay/"])

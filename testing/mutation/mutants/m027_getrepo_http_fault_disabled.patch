@@ -22,6 +22,6 @@ tiers: default,stress
 diff --git a/internal/simulator/http/faults.go b/internal/simulator/http/faults.go
 --- a/internal/simulator/http/faults.go
 +++ b/internal/simulator/http/faults.go
-@@ -148 +148 @@ func (p *FaultPlan) maybeGetRepoHTTPFault(did string) (int, bool) {
+@@ -501 +501 @@ func (p *FaultPlan) maybeGetRepoHTTPFault(did string) (int, bool) {
 -	if !ok || st.remaining <= 0 {
 +	if !ok || st.remaining >= 0 {

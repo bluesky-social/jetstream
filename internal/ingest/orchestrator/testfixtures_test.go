@@ -82,6 +82,11 @@ func (f *fakeRelay) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(listReposPage{Repos: f.repos})
+	case strings.HasSuffix(r.URL.Path, "/com.atproto.sync.listHosts"):
+		_ = json.NewEncoder(w).Encode(map[string]any{"hosts": []map[string]any{{
+			"hostname": strings.TrimPrefix(f.srv.URL, "http://"),
+			"status":   "active", "accountCount": len(f.repos),
+		}}})
 	default:
 		// Surface unexpected paths in test output so a future
 		// consumer-side test bug doesn't silently 404 forever.
@@ -213,11 +218,4 @@ func newMergeFixture(t *testing.T, sources [][]segment.Event, repoRevs map[strin
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return &mergeFixture{dataDir: dataDir, store: st, cfg: cfg, relay: relay}
-}
-
-// seedBootstrapLastCursor pre-populates bootstrap/last_listrepos_cursor.
-// Used by tests that exercise the post-merge discovery step.
-func (f *mergeFixture) seedBootstrapLastCursor(t *testing.T, cursor string) {
-	t.Helper()
-	require.NoError(t, backfill.MaybeSaveBootstrapLastListReposCursor(f.store, cursor))
 }

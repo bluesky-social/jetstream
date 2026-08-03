@@ -75,7 +75,7 @@ We enforce some invariants that are required for building correctly on atproto:
     - A correct consumer reaches network truth by **folding** the stream it receives: creates/updates apply; deletes, account-deletes, and syncs remove. Completeness is a joint property of the server (preserves every marker, delivers every in-scope event), the client (folds idempotently), and the user (subscribes to the markers their data model needs). The bundled clients fold for you; third-party clients must too.
     - Bounded incompleteness: below the compaction watermark, superseded create/update rows are physically gone, so a backfill never emits them — nothing to reconcile. The only already-dead records a consumer transiently holds live in the uncompacted tail `(W, tip]` (≈ one compaction interval); those converge as their markers arrive.
 
-Jetstream goes through a bootstrap phase where it seeds a user list from a relay's `com.atproto.sync.listRepos` endpoint, saving all DIDs to a file. During the iteration through the `listRepos` call, it also downloads DID docs to find the user's PDS, calling `com.atproto.sync.getRepo` to backfill the repo to disk. We lay out each event's data on disk in a custom file format called `segment files` as described in Section 3. Once a repo has been downloaded and saved to disk, we mark it as complete in our per-DID tracking file.
+Jetstream bootstraps from the relay's `com.atproto.sync.listHosts` roster, then enumerates `com.atproto.sync.listRepos` directly on every eligible PDS. This discovers accounts absent from the relay's own rebuilt `listRepos` index and provides the DID→PDS mapping before download. Repositories are fetched directly from their roster PDS with fleet-wide and per-host concurrency bounds, written to segment files, and marked complete in the metadata store.
 
 During bootstrap, the process does not accept user requests and instead returns a 503 so clients cannot get in to inconsistent states.
 
@@ -412,6 +412,8 @@ backfill/timing/started_at   -> RFC3339Nano timestamp when initial bootstrap bac
 backfill/timing/completed_at -> RFC3339Nano timestamp when initial bootstrap backfill drained
 compaction/seq          -> the highest-watermark sequence number of the most recent compaction; owned by the compactor
 repo/<did>              -> JSON<RepoStatus> per-DID backfill and steady-state bookkeeping
+pdshost/<hostname>      -> JSON<PDSHost> direct-backfill roster, per-host cursor, and lifecycle state
+backfill/counts         -> JSON<Counts> maintained repo and terminal-host aggregates
 account/<did>           -> JSON<AccountStatus> hosting status, only present when non-active
 sync/<did>              -> JSON<SyncState> present while a resync is in progress
 ```
@@ -462,11 +464,25 @@ type RepoBackfillStatus struct {
 }
 ```
 
+`PDSHost` is the durable control-plane row for one `listHosts` entry. It
+records the relay-observed status and account-count floor, the host-local
+`listRepos` cursor and last non-empty cursor, whether enumeration drained,
+the number of newly attributed accounts, and terminal diagnostics. The relay
+count is not authoritative: a PDS may contain substantially more accounts,
+or fewer after migrations.
+
+Per-host cursor commits obey the same crash-safety rule as repo completions.
+The engine hands a cursor to the store only after every covered repo reached a
+terminal callback; Jetstream then stages that cursor into the writer's synced
+Pebble batch only when all covered completion rows are eligible for the same
+durable batch. A crash can therefore make a cursor lag and repeat work, but it
+cannot make a cursor lead segment durability and silently skip data.
+
 The per-block durability ordering is: append and fsync the block into the active segment first, then commit a single pebble batch with `sync=true` that advances `relay/cursor` and updates `repo/<did>.Rev` and other fields for every DID present in the block. Only after both steps complete do we treat the block as durable. Because the pebble batch always follows the segment fsync, a crash between the two leaves `relay/cursor` pointing at or before the last durable event, so if we do crash, we'll just replay some relatively small number of events.
 
 Segment persistence failures are crash-loud, uniformly. Any write, fsync, or rename error on a segment path — the active writer's block flush and seal, the pebble durable-batch commit, a compaction rewrite, or a timestamp-import patch — aborts the process rather than continuing past unarchived data; there is no read-only degraded mode. Disk-full (`ENOSPC`) errors additionally carry an actionable operator message on every one of those paths ("fatal persistence error: disk full while ... free space or move the data directory, then restart jetstream"), and the `jetstream_data_dir_free_bytes` gauge exists to alert before it comes to that. Recovery after any such crash is the normal restart path: the torn-tail walk truncates at the last fully-durable frame and the persisted cursor replays the small un-committed window. Compaction rewrites and import patches write a sibling `.tmp`, fsync, then rename, so a failure at or before the rename always leaves the original segment untouched. All of this is enforced by a deterministic segment I/O fault-injection seam (`segment.IOFaultInjector`, nil in production) that the oracle's segment-fault tier drives end-to-end through a real runtime.
 
-Everything else is deliberately kept out of the metadata store. The segment manifest is just a directory scan plus each file's self-describing 256-byte header, so we don't duplicate it. DID-to-PDS caches and handle resolutions come back from the PLC directory when we need them. Per-DID hosting status flows in as `#account` events; we keep the current value in pebble so we can answer quickly, but it's always reconstructible by replaying segments.
+Everything else is deliberately kept out of the metadata store. The segment manifest is just a directory scan plus each file's self-describing 256-byte header, so we don't duplicate it. Discovery-time DID→PDS attribution is retained in `repo/<did>` for direct retries; handle resolution still comes from the PLC directory. Per-DID hosting status flows in as `#account` events; we keep the current value in pebble so we can answer quickly, but it is reconstructible by replaying segments.
 
 ## 4. Ingestion Pipeline
 
@@ -482,9 +498,12 @@ On first startup, we kick off two things in parallel:
     3. Events are written in segment files to the temporary `./data/backfill/live_segments` folder
     4. We treat these as temporary events and will compact them in to the long-term `segments` folder in the merge phase
 2. The backfill engine
-    1. Downloads all results from `com.atproto.sync.listRepos` on the relay, writing each DID to `repo/<did>` in the metadata store with `StatusNotStarted`
-    2. Downloads each repo via `com.atproto.sync.getRepo` and writes the events directly to the active segment file
-    3. On successful completion, sets `repo/<did>.Status = StatusComplete` and records the `BackfillRev` in Pebble.
+    1. Paginates `com.atproto.sync.listHosts` on the relay, validates each untrusted hostname, caps the roster, and upserts `pdshost/<hostname>`
+    2. Runs bounded per-host `listRepos` crawls, including `offline` and `idle` hosts but excluding `banned` hosts by default; the relay's `accountCount` is only a scheduling floor
+    3. Writes each newly discovered DID to `repo/<did>` with `StatusNotStarted` and its validated roster PDS, then downloads it directly from that PDS
+    4. Bounds aggregate download attempts, workers per host, and active host loops independently; a rate-limited or unavailable PDS parks without consuming another host's capacity
+    5. Marks each host drained after its final cursor is durable, or exhausted after bounded producer retries. Exhausted hosts are visible and do not prevent bootstrap from terminating
+    6. Re-lists `listHosts` once all known hosts are terminal; bootstrap returns only when that proof pass finds no new eligible host
 
 This phase takes a while. At time of writing with current rate limits on the mushroom PDSes on the new relay, it takes ~16 hours.
 
@@ -510,7 +529,11 @@ After the last surviving event has been durably written:
 - Only after these steps do we durably write `phase=steady_state`
     - Each step is durable on its own (segment seal fsyncs, RemoveAll is observable on next directory scan, pebble delete is Sync=true), so a crash at any point during merge is recoverable on restart
 
-Additionally, since the merge phase takes some time, at the end, we also scan the relay with `listRepos` to find accounts that were newly created during the merge phase. We treat these repos the same as repos that failed to download during the initial backfill, and we will do a full `getRepo` call on them during the steady-state phase.
+Additionally, since merge takes time, its final discovery sweep reuses the
+same fleet engine in discover-only mode. Drained and exhausted PDSes reopen at
+their last non-empty host-local cursor, newly listed hosts start at the
+beginning, and each host receives one attempt. Unknown DIDs become
+`StatusFailed` retry markers; the discovery sweep never downloads repos.
 
 ### 4.3 Steady State Phase
 
@@ -518,7 +541,14 @@ The steady-state phase simply consumes from the upstream firehose and writes eve
 
 Every block seal commits a single pebble batch that advances `relay/cursor` and refreshes `repo/<did>.LatestRev` for every DID in the block. We always fsync the segment block first and then commit the pebble batch with `sync=true`, so the persisted cursor can never get ahead of the durable event data. A crash between the two steps is handled by the active-segment recovery path described in Section 3.1, and the upstream resumes from whatever cursor pebble last saw.
 
-If there were any accounts that failed to download during the initial backfill phase or the post-merge `listRepos` discovery pass (i.e. `repo/<did>.Status == StatusFailed`), we periodically retry downloading them with exponential backoff in the background until they succeed. Retry eligibility and backoff are stored on `repo/<did>` via `RetryCount` and `NextAttemptAt` so process restarts do not create retry storms. When we do successfully download a repo that previously failed, we treat it similar to a whole-repo `#sync` event: mark all previous events for that DID as deleted, and recreate from the downloaded CAR file.
+If there were any accounts that failed during bootstrap or were added by the
+post-merge discovery sweep (`repo/<did>.Status == StatusFailed`), we retry them
+with durable exponential backoff. A row with discovery-time `PDS` routes
+directly through a cached per-PDS client and uses the roster hostname for
+concurrency and parking; an older row with no `PDS` deliberately falls back to
+the relay redirect path. On success the retry behaves like a whole-repo
+`#sync`: previous rows for the DID are deleted and the downloaded CAR becomes
+the replacement state.
 
 Bootstrap crash recovery can promote a pre-existing `StatusNotStarted` row to `StatusPending` ([#262](https://github.com/bluesky-social/jetstream/issues/262)) instead of re-downloading it at low seqs. Merge runs one immediate pending retry pass after draining the captured live tail, so the synthetic sync and replacement rows land above the live tail. If that pending attempt fails transiently, the row becomes `StatusFailed` with normal backoff metadata and the periodic failed-repo loop handles later retries.
 

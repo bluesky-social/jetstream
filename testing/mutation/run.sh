@@ -302,6 +302,16 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          ./segment ./internal/store ./internal/ingest ./internal/ingest/orchestrator ./internal/oracle
                          -run 'TestStrictMem|TestOpen_StrictMemDropsUnsyncedWrites|TestWriterStrictMem|TestWriterFlushOrdersSegmentSyncBeforeStoreCommit|TestDurableOrderRecorder|TestOracle_PowerLossStrictMemDropsUnsyncedState|TestRunMerge_StrictMemPowerLoss'
                          -count=1 -short -timeout "$default_timeout") ;;
+                pdsbackfill)
+                    # PDS-direct fleet tier (#direct-backfill): fast contract
+                    # tests for cursor/completion durability ordering, durable
+                    # exhausted-vs-drained semantics, direct routing and relay
+                    # gaps, and discovery-time DID->PDS attribution. The full
+                    # default oracle remains the end-to-end backstop.
+                    cmd=(go test "${RACE_FLAG[@]}"
+                         ./internal/ingest/backfill ./internal/oracle
+                         -run 'TestCompletionBatcherHostCursorNeverLeadsCoveredCompletion|TestStore_OnDiscoverAttributesValidatedRosterHostOnce|TestRun_MultiPDSFaultIsolationAndExhaustion|TestOracle_DefaultLifecycle$'
+                         -count=1 -short -timeout "$default_timeout") ;;
                 partb)
                     # Part-B tier (#182): kills paginated-cutover mutants
                     # (continuation-cursor off-by-one, mid-segment cut reporting

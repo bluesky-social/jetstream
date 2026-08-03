@@ -6,7 +6,7 @@ require (
 	github.com/cockroachdb/errors v1.14.0
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/coder/websocket v1.8.15
-	github.com/jcalabro/atmos v0.2.14
+	github.com/jcalabro/atmos v0.3.0
 	github.com/jcalabro/gloom v0.1.0
 	github.com/jcalabro/gt v0.0.14
 	github.com/jcalabro/jttp v0.0.6
@@ -26,6 +26,8 @@ require (
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 )
+
+replace github.com/jcalabro/atmos => /home/jcalabro/go/src/github.com/jcalabro/atmos
 
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect

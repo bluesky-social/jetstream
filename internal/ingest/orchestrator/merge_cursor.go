@@ -79,10 +79,10 @@ func commitSourceComplete(
 			// Status enum) — corrupting the row's contract with
 			// backfill.Store.Lookup.
 			//
-			// The post-merge discovery step (§4.7) writes a proper
-			// StatusFailed row for these DIDs via maybeWriteDiscoveredRow.
-			// Steady-state retry then re-downloads the repo and
-			// OnComplete writes the authoritative Rev.
+			// The post-merge PDS-direct discovery step (§4.7) writes a
+			// proper StatusFailed row for these DIDs. Steady-state retry
+			// then re-downloads the repo and OnComplete writes the
+			// authoritative Rev.
 			//
 			// Skip the Rev refresh; the cursor still advances.
 			continue

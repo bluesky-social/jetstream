@@ -1,0 +1,28 @@
+mutant: m054_relay_only_backfill_routing
+target: internal/ingest/backfill/run.go
+failure-mode: |
+  Bootstrap silently ignores the direct-PDS client builder and uses the relay
+  client for every host. Each nominal host loop enumerates the same incomplete
+  relay listRepos roster, restoring the exact relay-gap data loss the fleet
+  redesign is meant to remove.
+expected-detection: |
+  The pdsbackfill tier's TestRun_MultiPDSFaultIsolationAndExhaustion requires
+  host-specific listRepos faults to fire, distinct host lifecycle outcomes,
+  and a complete relay-gap DID on a healthy PDS. Relay-only routing violates
+  all three assertions. The default oracle's explicit relay-gap anti-vacuity
+  check is the end-to-end backstop.
+expected-tier: pdsbackfill
+tiers: pdsbackfill,default
+
+diff --git a/internal/ingest/backfill/run.go b/internal/ingest/backfill/run.go
+--- a/internal/ingest/backfill/run.go
++++ b/internal/ingest/backfill/run.go
+@@ -150,5 +150,3 @@ func Run(ctx context.Context, cfg Config) error {
+-		newHostClient := cfg.NewHostClient
+-		if newHostClient == nil {
+-			newHostClient = NewHostClientBuilder(cfg.RelayURL, cfg.HTTPClient)
+-		}
+-
++		newHostClient := func(string) (*atmossync.Client, error) {
++			return relay, nil
++		}

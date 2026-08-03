@@ -11,6 +11,27 @@ Each entry says what the thing is, why it's the way it is, and roughly where in 
 
 ## Accepted limitations
 
+### Relay listHosts accountCount is a floor, not PDS truth
+
+The relay roster's `accountCount` is useful for starting the largest PDSes
+first and sizing worker pools, but it is not an authoritative count. A direct
+PDS `listRepos` crawl can return substantially more accounts because the relay
+was rebuilt, or fewer after migrations. Do not use the relay count as a drain
+condition, completeness proof, or exact status denominator. A host is complete
+only when its direct pagination drains; status presents relay count as a floor
+and direct enumeration separately. Area: Atmos `backfill`,
+`internal/ingest/backfill/status.go`, `internal/status/collect.go`.
+
+### Relay-global bootstrap cursors cannot migrate to per-PDS cursors
+
+`relay/list_repos_cursor` and `bootstrap/last_listrepos_cursor` belong to the
+retired relay-global enumeration scheme. Their opaque values have no safe
+translation into host-local PDS cursor spaces. Startup therefore fails loudly
+when either key is non-empty: finish that bootstrap with the old binary or use
+a fresh data directory. Do not silently ignore, clear, or reinterpret these
+keys; doing so would turn an operator-visible incompatibility into possible
+data loss. Area: `internal/ingest/backfill/cursor.go`.
+
 ### Live first sighting is not a getRepo trigger
 
 This one repeatedly tempts agents into "repairing" a perceived missing-history gap. Do not reintroduce first-sighting backfill.

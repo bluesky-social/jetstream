@@ -6,7 +6,7 @@ If you're here to make a change, the useful reading order is usually: this file 
 
 ## What jetstream is
 
-Jetstream is a full-network archive and live-streaming service for atproto. It ingests every record from every repo on a relay, stores it all in a custom columnar file format on a single machine, and lets clients replay that history and then seamlessly follow the live firehose. It runs as one static binary on one server. High availability is a future goal, not something the current design does.
+Jetstream is a full-network archive and live-streaming service for atproto. It enumerates every repo directly from every PDS in a relay's host roster, stores the retrievable records in a custom columnar file format on a single machine, and lets clients replay that history and then seamlessly follow the relay's live firehose. It runs as one static binary on one server. High availability is a future goal, not something the current design does.
 
 Two things clients can do:
 
@@ -21,9 +21,9 @@ Everything falls into ingest (data in), storage (data on disk), or serve (data o
 
 Ingest is a lifecycle state machine that walks through three phases. The orchestrator (`internal/ingest/orchestrator`) owns that machine and the durable commit points between phases; a crash mid-cutover recovers by re-entering the machine at the right spot.
 
-- **Bootstrap** (`internal/ingest/backfill` + `internal/ingest/live`): on first start, two things run in parallel — a live consumer captures the firehose into a temporary `backfill/live_segments/` tree so nothing is missed, while the backfill engine paginates listRepos and downloads every repo via getRepo straight into the archive.
+- **Bootstrap** (`internal/ingest/backfill` + `internal/ingest/live`): on first start, two things run in parallel — a live consumer captures the firehose into a temporary `backfill/live_segments/` tree, while the backfill engine reads the relay's listHosts roster, paginates listRepos directly on each PDS, and downloads every repo directly from its PDS. Per-host cursors and terminal state live in `pdshost/<hostname>`.
 - **Merge** (`internal/ingest/orchestrator`): once backfill drains, the captured live segments are drained into the permanent `segments/` tree, dropping events already covered by each repo's backfilled head, then a tombstone compaction runs so the archive is delete/update-correct before cutover.
-- **Steady state** (`internal/ingest/live` again): one live consumer pumps the firehose into `segments/`. On the side, a retry loop re-downloads repos that failed during bootstrap or post-merge listRepos discovery. Live first sighting is not a getRepo trigger; repo-wide repair comes from explicit `#sync`. Compaction runs periodically to clean up deleted and updated records.
+- **Steady state** (`internal/ingest/live` again): one live consumer pumps the firehose into `segments/`. On the side, a retry loop re-downloads repos that failed during bootstrap or post-merge fleet discovery, routing directly by the persisted roster PDS when available. Live first sighting is not a getRepo trigger; repo-wide repair comes from explicit `#sync`. Compaction runs periodically to clean up deleted and updated records.
 
 The live consumer and backfill both write through a shared `ingest.Writer` (`internal/ingest`), which owns segment append/flush/fsync, seq assignment, and the in-memory readable log the live tail reads from. All upstream data is untrusted: a validation gate at each conversion point drops bad revs, bad op paths, and unrepresentable fields with a labeled metric rather than crashing or corrupting (`docs/README.md` §4.4).
 
@@ -32,7 +32,7 @@ The live consumer and backfill both write through a shared `ingest.Writer` (`int
 Two places hold state:
 
 - **Segment files** (`segment/`): the columnar, zstd-compressed, append-only logs. An active segment is a file state machine (append → flush → fsync → seal); sealing finalizes it into an immutable file with a footer full of indexes. The `segment` package is pure format code — no goroutines, no timers, no lifecycle — and is intentionally public API. Read `segment/doc.go` and `docs/README.md` §3.1–§3.2.
-- **The metadata store** (`internal/store`, pebble at `data/meta.pebble/`): everything that isn't cheaply re-derivable from segments — the upstream cursor, lifecycle phase, per-DID backfill status, account/sync state, compaction watermark. The manifest is deliberately *not* here; it's just a directory scan plus self-describing file headers. Read `docs/README.md` §3.5.
+- **The metadata store** (`internal/store`, pebble at `data/meta.pebble/`): everything that isn't cheaply re-derivable from segments — the upstream cursor, lifecycle phase, per-DID backfill/PDS status, durable PDS roster and host-local cursors, account/sync state, compaction watermark. The manifest is deliberately *not* here; it's just a directory scan plus self-describing file headers. Read `docs/README.md` §3.5.
 
 The durability ordering between these two is the invariant that keeps a crash safe: segment fsync first, pebble commit second. See `specs/invariants.md`.
 
@@ -48,7 +48,7 @@ The durability ordering between these two is the invariant that keeps a crash sa
 
 This is unusually central to the project, so it's worth knowing even if you're not touching tests.
 
-- **Simulator** (`internal/simulator`): a fake atproto network — PLC, PDS, relay — that generates *real* atproto-shaped bytes (signed commits, CAR blocks, CBOR frames), not mocked structs. Includes adversarial-traffic modes that feed bad-but-bounded input through the honest pipeline.
+- **Simulator** (`internal/simulator`): a fake atproto network — PLC, a skewed fleet of virtual PDSes, and an incomplete-roster relay — that generates *real* atproto-shaped bytes (signed commits, CAR blocks, CBOR frames), not mocked structs. Includes per-PDS lifecycle faults and adversarial-traffic modes that feed bad-but-bounded input through the honest pipeline.
 - **Oracle** (`internal/oracle`): boots a real server against the simulator, drives it through its whole lifecycle, and compares durable output against an independently derived model. It's a high-value bug detector organized into tiers (storage, event-log, replay, crash/restart, and more). A green run proves strong contracts held for one scenario, not universal correctness.
 - **Mutation campaign** (`testing/mutation`): curated single-edit bugs that measure the oracle's bug-detection power. `specs/oracle.md` is the source of truth for this whole rig — read it before touching any of it.
 

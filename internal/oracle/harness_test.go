@@ -942,9 +942,36 @@ func assertBootstrapOracleMatches(t *testing.T, dataDir string, w *world.World, 
 	require.NoErrorf(t, err, "after-bootstrap mode=%s seed=%d: observe bootstrap segments", cfg.Mode, cfg.Seed)
 	got, err := Reconstruct(events)
 	require.NoErrorf(t, err, "after-bootstrap mode=%s seed=%d: reconstruct observed events", cfg.Mode, cfg.Seed)
+	assertRelayGapReposArchived(t, w, want, got, cfg)
 	require.NoErrorf(t, Compare(want, got), "after-bootstrap mode=%s seed=%d: compare oracle model", cfg.Mode, cfg.Seed)
 
 	t.Logf("after-bootstrap: oracle matched %d observed events in mode=%s seed=%d", len(events), cfg.Mode, cfg.Seed)
+}
+
+func assertRelayGapReposArchived(t *testing.T, w *world.World, want, got *Model, cfg Config) {
+	t.Helper()
+	gapDIDs := make([]string, 0)
+	for idx := range w.AccountCount() {
+		if w.RelayKnowsAccount(idx) {
+			continue
+		}
+		acct, err := w.LoadAccount(idx)
+		require.NoError(t, err)
+		if _, expected := want.Accounts[string(acct.DID)]; expected {
+			gapDIDs = append(gapDIDs, string(acct.DID))
+		}
+	}
+	require.NotEmptyf(t, gapDIDs,
+		"oracle world has no fetchable relay-gap repo: mode=%s seed=%d", cfg.Mode, cfg.Seed)
+	archived := 0
+	for _, did := range gapDIDs {
+		if _, ok := got.Accounts[did]; ok {
+			archived++
+		}
+	}
+	require.Positivef(t, archived,
+		"bootstrap archived no relay-gap repo; direct per-PDS discovery is not exercised: mode=%s seed=%d gap_dids=%v",
+		cfg.Mode, cfg.Seed, gapDIDs)
 }
 
 func recordTraceOrError(t *testing.T, trace *Trace, kind string, data map[string]any) {

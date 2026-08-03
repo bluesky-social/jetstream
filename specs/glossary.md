@@ -20,11 +20,15 @@ Words that show up all over the code and docs, with a one-line meaning and where
 
 **Manifest** — the list of segments jetstream serves. It's deliberately not stored in pebble: it's just a directory scan plus each file's self-describing header, so it can't drift from what's on disk. Source: `docs/README.md` §3.5.
 
-**Metadata store** — the single pebble db at `data/meta.pebble/` holding everything that isn't cheaply re-derivable from segments: `relay/cursor`, lifecycle `phase`, `repo/<did>`, `account/<did>`, `sync/<did>`, `compaction/seq`. Source: `docs/README.md` §3.5, `internal/store`.
+**Metadata store** — the single pebble db at `data/meta.pebble/` holding everything that isn't cheaply re-derivable from segments: `relay/cursor`, lifecycle `phase`, `repo/<did>`, the `pdshost/<hostname>` fleet roster/cursors, `account/<did>`, `sync/<did>`, and `compaction/seq`. Source: `docs/README.md` §3.5, `internal/store`.
 
 ## Ingestion lifecycle
 
-**Bootstrap phase** — the initial full-network backfill: paginate the relay's listRepos, download every repo via getRepo, and write it to disk, while a live consumer simultaneously captures the firehose into `backfill/live_segments/`. Source: `docs/README.md` §4.1, `internal/ingest/backfill/doc.go`.
+**Host roster** — the durable `pdshost/<hostname>` control-plane set obtained from relay listHosts: relay metadata, host-local listRepos cursor, terminal state, and diagnostics. The relay account count is a floor, not authoritative. Source: `docs/README.md` §3.5 and §4.1.
+
+**Mushroom** — one of Bluesky's large shared PDS hosts under `*.host.bsky.network`; these dominate bootstrap's long pole because getRepo limits are per host. Source: `specs/notes/2026-08-03-pds-direct-backfill-design.md`.
+
+**Bootstrap phase** — the initial full-network backfill: read the relay's host roster, paginate listRepos directly on each PDS, download repos directly from their PDS, and write them to disk, while a live consumer simultaneously captures the firehose into `backfill/live_segments/`. Source: `docs/README.md` §4.1, `internal/ingest/backfill/doc.go`.
 
 **Merge phase** — the cutover step that drains the captured live segments into the steady-state `segments/` tree, filtering out events already covered by the backfilled repo head. Source: `docs/README.md` §4.2, `internal/ingest/orchestrator/doc.go`.
 

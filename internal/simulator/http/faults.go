@@ -2,6 +2,7 @@ package http
 
 import (
 	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -16,8 +17,17 @@ import (
 type FaultPlan struct {
 	getRepo        *getRepoFaults
 	listRepos      *listReposFaults
+	pdsFleet       *pdsFleetFaults
 	plc            *plcFaults
 	subscribeRepos *subscribeReposFaults
+}
+
+type pdsFleetFaults struct {
+	mu sync.Mutex
+
+	listHostsByCursor map[string]httpFaultState
+	listReposByHost   map[string]map[string]httpFaultState
+	hostStatus        map[string]string
 }
 
 // SubscribeReposReplayFault schedules one seq-replay fault on a
@@ -185,10 +195,91 @@ func NewFaultPlan() *FaultPlan {
 			responseByDID: make(map[string]getRepoResponseFaultState),
 			truncateByDID: make(map[string]countFaultState),
 		},
-		listRepos:      &listReposFaults{byCursor: make(map[string]listReposFaultState)},
+		listRepos: &listReposFaults{byCursor: make(map[string]listReposFaultState)},
+		pdsFleet: &pdsFleetFaults{
+			listHostsByCursor: make(map[string]httpFaultState),
+			listReposByHost:   make(map[string]map[string]httpFaultState),
+			hostStatus:        make(map[string]string),
+		},
 		plc:            &plcFaults{byDID: make(map[string]plcFaultState)},
 		subscribeRepos: &subscribeReposFaults{},
 	}
+}
+
+// AddListHostsHTTPFailures schedules count HTTP failures for one listHosts
+// cursor. Use cursor "" for the initial roster request.
+func (p *FaultPlan) AddListHostsHTTPFailures(cursor string, status, count int) {
+	if p == nil || p.pdsFleet == nil || count <= 0 {
+		return
+	}
+	if status == 0 {
+		status = http.StatusServiceUnavailable
+	}
+	p.pdsFleet.mu.Lock()
+	defer p.pdsFleet.mu.Unlock()
+	st := p.pdsFleet.listHostsByCursor[cursor]
+	st.status = status
+	st.remaining += count
+	p.pdsFleet.listHostsByCursor[cursor] = st
+}
+
+// AddPDSListReposHTTPFailures schedules count failures for a direct PDS
+// listRepos request at one host-local cursor. It can model a transient failure,
+// mid-enumeration death, or permanent death by varying cursor and count.
+func (p *FaultPlan) AddPDSListReposHTTPFailures(hostname, cursor string, status, count int) {
+	if p == nil || p.pdsFleet == nil || hostname == "" || count <= 0 {
+		return
+	}
+	if status == 0 {
+		status = http.StatusServiceUnavailable
+	}
+	p.pdsFleet.mu.Lock()
+	defer p.pdsFleet.mu.Unlock()
+	hostname = strings.ToLower(hostname)
+	byCursor := p.pdsFleet.listReposByHost[hostname]
+	if byCursor == nil {
+		byCursor = make(map[string]httpFaultState)
+		p.pdsFleet.listReposByHost[hostname] = byCursor
+	}
+	st := byCursor[cursor]
+	st.status = status
+	st.remaining += count
+	byCursor[cursor] = st
+}
+
+// SetListHostsStatus overrides one host's advertised relay status. The PDS
+// remains independently reachable, allowing offline-but-alive and
+// active-but-dead scenarios.
+func (p *FaultPlan) SetListHostsStatus(hostname, status string) {
+	if p == nil || p.pdsFleet == nil || hostname == "" {
+		return
+	}
+	p.pdsFleet.mu.Lock()
+	defer p.pdsFleet.mu.Unlock()
+	hostname = strings.ToLower(hostname)
+	if status == "" {
+		delete(p.pdsFleet.hostStatus, hostname)
+		return
+	}
+	p.pdsFleet.hostStatus[hostname] = status
+}
+
+func (p *FaultPlan) ListHostsHTTPFailuresFired(cursor string) int {
+	if p == nil || p.pdsFleet == nil {
+		return 0
+	}
+	p.pdsFleet.mu.Lock()
+	defer p.pdsFleet.mu.Unlock()
+	return p.pdsFleet.listHostsByCursor[cursor].fired
+}
+
+func (p *FaultPlan) PDSListReposHTTPFailuresFired(hostname, cursor string) int {
+	if p == nil || p.pdsFleet == nil {
+		return 0
+	}
+	p.pdsFleet.mu.Lock()
+	defer p.pdsFleet.mu.Unlock()
+	return p.pdsFleet.listReposByHost[strings.ToLower(hostname)][cursor].fired
 }
 
 // AddGetRepoHTTPFailures schedules count HTTP failures for did before
@@ -352,6 +443,52 @@ func (p *FaultPlan) SubscribeReposDisconnects() int {
 	p.subscribeRepos.mu.Lock()
 	defer p.subscribeRepos.mu.Unlock()
 	return p.subscribeRepos.disconnects
+}
+
+func (p *FaultPlan) maybeListHostsHTTPFault(cursor string) (int, bool) {
+	if p == nil || p.pdsFleet == nil {
+		return 0, false
+	}
+	p.pdsFleet.mu.Lock()
+	defer p.pdsFleet.mu.Unlock()
+	st, ok := p.pdsFleet.listHostsByCursor[cursor]
+	if !ok || st.remaining <= 0 {
+		return 0, false
+	}
+	st.remaining--
+	st.fired++
+	p.pdsFleet.listHostsByCursor[cursor] = st
+	return st.status, true
+}
+
+func (p *FaultPlan) maybePDSListReposHTTPFault(hostname, cursor string) (int, bool) {
+	if p == nil || p.pdsFleet == nil {
+		return 0, false
+	}
+	p.pdsFleet.mu.Lock()
+	defer p.pdsFleet.mu.Unlock()
+	hostname = strings.ToLower(hostname)
+	byCursor := p.pdsFleet.listReposByHost[hostname]
+	st, ok := byCursor[cursor]
+	if !ok || st.remaining <= 0 {
+		return 0, false
+	}
+	st.remaining--
+	st.fired++
+	byCursor[cursor] = st
+	return st.status, true
+}
+
+func (p *FaultPlan) listHostsStatus(hostname, fallback string) string {
+	if p == nil || p.pdsFleet == nil {
+		return fallback
+	}
+	p.pdsFleet.mu.Lock()
+	defer p.pdsFleet.mu.Unlock()
+	if status := p.pdsFleet.hostStatus[strings.ToLower(hostname)]; status != "" {
+		return status
+	}
+	return fallback
 }
 
 func (p *FaultPlan) maybeGetRepoHTTPFault(did string) (int, bool) {

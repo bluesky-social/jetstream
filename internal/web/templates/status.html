@@ -255,18 +255,8 @@ document.addEventListener("input", function (event) {
 
     <section>
       <h2>Backfill</h2>
-      {{if eq .Backfill.TotalDIDs 0}}
+      {{if and (eq .Backfill.TotalDIDs 0) (eq .Backfill.HostsTotal 0)}}
         <p class="sub">Backfill has not started.</p>
-      {{else if .Backfill.ListReposCursor}}
-        <dl>
-          <dt>State</dt><dd>enumerating repos</dd>
-          <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
-          <dt>Downloaded</dt><dd>{{humanInt .Backfill.Complete}} repos</dd>
-          <dt>Errored</dt><dd>{{humanInt .Backfill.Failed}} repos</dd>
-          <dt>Unavailable</dt><dd>{{humanInt .Backfill.Unavailable}} repos</dd>
-          {{template "backfillDuration" .}}
-          <dt>listRepos cursor</dt><dd class="cursor">{{.Backfill.ListReposCursor}}</dd>
-        </dl>
       {{else}}
         <dl>
           <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
@@ -274,11 +264,25 @@ document.addEventListener("input", function (event) {
           <dt>Pending</dt><dd>{{humanInt .Backfill.Pending}} repos</dd>
           <dt>Errored</dt><dd>{{humanInt .Backfill.Failed}} repos</dd>
           <dt>Unavailable</dt><dd>{{humanInt .Backfill.Unavailable}} repos</dd>
+          {{if gt .Backfill.HostsTotal 0}}
+          <dt>PDS hosts</dt><dd>{{humanInt .Backfill.HostsDrained}} drained, {{humanInt .Backfill.HostsExhausted}} exhausted, {{humanInt .Backfill.HostsInFlight}} in flight</dd>
+          <dt>Roster accounts</dt><dd>{{humanInt .Backfill.EnumeratedAccounts}} enumerated (relay floor {{humanInt .Backfill.RelayAccountFloor}})</dd>
+          {{end}}
           {{template "backfillDuration" .}}
         </dl>
       {{end}}
     </section>
   </div>
+
+  {{if .Backfill.TopRemainingHosts}}
+  <section>
+    <h2>Backfill PDS roster</h2>
+    <table>
+      <thead><tr><th>Host</th><th>State</th><th>Relay floor</th><th>Enumerated</th><th>Remaining estimate</th></tr></thead>
+      <tbody>{{range .Backfill.TopRemainingHosts}}<tr><td><code>{{.Hostname}}</code></td><td>{{.State}}</td><td>{{humanInt .RelayAccounts}}</td><td>{{humanInt .EnumeratedAccounts}}</td><td>{{humanInt .RemainingEstimate}}</td></tr>{{end}}</tbody>
+    </table>
+  </section>
+  {{end}}
 
   <section>
     <h2>Live ingest</h2>

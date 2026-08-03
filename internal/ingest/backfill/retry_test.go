@@ -21,8 +21,10 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
+	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -96,6 +98,52 @@ func TestRetryRunner_ScanDueFiltersCandidates(t *testing.T) {
 		{DID: "did:plc:due", Host: "pds-a.example.com", Retry: 2},
 		{DID: "did:plc:unset", Host: "pds-b.example.com", Retry: 0},
 	}, got)
+}
+
+func TestRetryRunner_RoutesStampedReposDirectAndCachesClient(t *testing.T) {
+	t.Parallel()
+	st, writer, _ := newRetryTestWriter(t)
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	pdsHostname := "pds.direct.example"
+	dids := []atmos.DID{"did:plc:direct-one", "did:plc:direct-two"}
+	fixtures := make(map[atmos.DID]repoFixture, len(dids))
+	for _, did := range dids {
+		fixtures[did] = buildRepoFixture(t, did)
+		require.NoError(t, bs.onDiscover(ctx, pdsHostname, atmossync.ListReposEntry{DID: did, Active: true}))
+		require.NoError(t, bs.OnFail(ctx, did, pdsHostname, errors.New("bootstrap failed"), 1))
+	}
+	pds := newStubServer(t, fixtures)
+	var relayHits atomic.Int64
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		relayHits.Add(1)
+		http.Error(w, "direct retry must not use relay", http.StatusInternalServerError)
+	}))
+	t.Cleanup(relay.Close)
+	var builds atomic.Int64
+	runner, err := newRetryRunner(RetryConfig{
+		Store: st, Writer: writer, HTTPClient: relay.Client(), RelayURL: relay.URL,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Interval: time.Hour,
+		Workers: 2, HostWorkers: 2, MaxDelay: time.Hour,
+		NewHostClient: func(hostname string) (*atmossync.Client, error) {
+			require.Equal(t, pdsHostname, hostname)
+			builds.Add(1)
+			return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{
+				Host: pds.srv.URL, HTTPClient: gt.Some(pds.srv.Client()), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+			}}), nil
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, runner.runPass(ctx))
+	require.Zero(t, relayHits.Load())
+	require.Equal(t, int64(2), pds.getRepoHit.Load())
+	require.Equal(t, int64(1), builds.Load(), "one sync client must be cached per roster hostname")
+	for _, did := range dids {
+		rs, err := bs.readRepoStatus(did)
+		require.NoError(t, err)
+		require.Equal(t, StatusComplete, rs.Backfill.Status)
+		require.Equal(t, pdsHostname, rs.PDS)
+	}
 }
 
 func TestRetryRunner_ScanDueRejectsCorruptRows(t *testing.T) {
@@ -346,6 +394,48 @@ func TestRetryRunner_RateLimitParksHost(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, reset, rs.Backfill.NextAttemptAt)
 	require.Equal(t, 1, rs.Backfill.RetryCount, "a parked skip is not a failed attempt")
+}
+
+func TestRetryRunner_DirectRateLimitParksRosterHostname(t *testing.T) {
+	t.Parallel()
+	st, writer, _ := newRetryTestWriter(t)
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(time.Hour)
+	const rosterHost = "pds-roster.example.com"
+	did := atmos.DID("did:plc:direct-rate-limit")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("RateLimit-Remaining", "0")
+		w.Header().Set("RateLimit-Reset", fmt.Sprintf("%d", reset.Unix()))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"RateLimitExceeded"}`))
+	}))
+	t.Cleanup(srv.Close)
+	responseHost := mustURLHost(t, srv.URL)
+	require.NotEqual(t, rosterHost, responseHost)
+	require.NoError(t, bs.OnHost(ctx, atmosbackfill.HostInfo{Hostname: rosterHost, RelayStatus: "active"}))
+	require.NoError(t, bs.onDiscover(ctx, rosterHost, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, bs.OnFail(ctx, did, rosterHost, errors.New("bootstrap unavailable"), 1))
+
+	runner, err := newRetryRunner(RetryConfig{
+		Store: st, Writer: writer, HTTPClient: srv.Client(), RelayURL: srv.URL,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Interval: time.Hour,
+		Workers: 1, HostWorkers: 1, MaxDelay: 24 * time.Hour, now: func() time.Time { return now },
+		NewHostClient: func(hostname string) (*atmossync.Client, error) {
+			require.Equal(t, rosterHost, hostname)
+			return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{Host: srv.URL, HTTPClient: gt.Some(srv.Client()), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}}), nil
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, runner.processCandidate(ctx, retryCandidate{DID: did, Host: rosterHost, PDS: rosterHost, Retry: 0}))
+	require.True(t, runner.isHostParked(rosterHost, now))
+	require.False(t, runner.isHostParked(responseHost, now))
+	rs, err := bs.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, rosterHost, rs.PDS)
+	require.Equal(t, rosterHost, rs.Host)
 }
 
 func TestRetryRunner_NextAttemptAtClampsRetryAfter(t *testing.T) {

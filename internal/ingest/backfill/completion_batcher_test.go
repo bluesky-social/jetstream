@@ -54,6 +54,49 @@ func TestCompletionBatcherStagesCompletionAtDurableSeq(t *testing.T) {
 	require.Empty(t, cb.queued)
 }
 
+func TestCompletionBatcherHostCursorNeverLeadsCoveredCompletion(t *testing.T) {
+	t.Parallel()
+	st, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	bs := NewStore(st, nil)
+	hostname := "pds.cursor.test"
+	require.NoError(t, bs.OnHost(t.Context(), atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
+	did := atmos.DID("did:plc:cursor-order")
+	require.NoError(t, bs.onDiscover(t.Context(), hostname, testListReposEntry(did)))
+	cb := NewCompletionBatcher(bs, nil)
+	cb.RecordWatermark(did, 10, true)
+	require.NoError(t, cb.QueueComplete(t.Context(), did, hostname, &repo.Commit{DID: string(did), Rev: "rev1"}))
+	require.NoError(t, cb.QueueHostCursor(t.Context(), hostname, "cursor-after-repo"))
+
+	batch := st.NewBatch()
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), batch, 10, false, nil)
+	require.NoError(t, err)
+	require.Nil(t, afterCommit)
+	require.Nil(t, afterDone)
+	require.NoError(t, batch.Close())
+	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
+	host, _, err := bs.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.Empty(t, host.ListReposCursor)
+
+	batch = st.NewBatch()
+	afterCommit, afterDone, err = cb.StageDurable(t.Context(), batch, 11, false, nil)
+	require.NoError(t, err)
+	require.NotNil(t, afterCommit)
+	require.NotNil(t, afterDone)
+	commitErr := st.Commit(batch, store.SyncWrites)
+	afterDone(commitErr)
+	require.NoError(t, commitErr)
+	afterCommit()
+	require.NoError(t, batch.Close())
+	requireLookupState(t, bs, did, atmosbackfill.StateComplete)
+	host, _, err = bs.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.Equal(t, "cursor-after-repo", host.ListReposCursor)
+}
+
 func TestCompletionBatcherDoesNotStageCompletionAtEqualDurableSeq(t *testing.T) {
 	t.Parallel()
 
@@ -514,6 +557,44 @@ func TestCompletionBatcherCommitFailureKeepsStagedCompletionQueued(t *testing.T)
 	afterDone(nil)
 	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
+}
+
+func TestCompletionBatcherCommitFailureKeepsHostCursorQueued(t *testing.T) {
+	t.Parallel()
+	st, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	bs := NewStore(st, nil)
+	const hostname = "pds-cursor-retry.example.com"
+	require.NoError(t, bs.OnHost(t.Context(), atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
+	cb := NewCompletionBatcher(bs, nil)
+	require.NoError(t, cb.QueueHostCursor(t.Context(), hostname, "cursor-retry"))
+
+	b := st.NewBatch()
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 0, false, nil)
+	require.NoError(t, err)
+	require.NotNil(t, afterCommit)
+	require.NotNil(t, afterDone)
+	afterDone(errors.New("synthetic commit failure"))
+	require.NoError(t, b.Close())
+	require.Contains(t, cb.cursors, hostname)
+	host, _, err := bs.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.Empty(t, host.ListReposCursor)
+
+	b = st.NewBatch()
+	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 0, false, nil)
+	require.NoError(t, err)
+	commitErr := st.Commit(b, store.SyncWrites)
+	afterDone(commitErr)
+	require.NoError(t, commitErr)
+	afterCommit()
+	require.NoError(t, b.Close())
+	require.NotContains(t, cb.cursors, hostname)
+	host, _, err = bs.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.Equal(t, "cursor-retry", host.ListReposCursor)
 }
 
 func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *testing.T) {

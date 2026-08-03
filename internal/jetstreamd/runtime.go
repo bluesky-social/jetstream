@@ -82,8 +82,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.CompactionTombstoneCap < 0 {
 		return nil, fmt.Errorf("serve: --compaction-tombstone-cap must be >= 0 (CompactionTombstoneCap must be >= 0), got %d", opts.CompactionTombstoneCap)
 	}
-	if opts.BackfillWorkers < 0 {
-		return nil, fmt.Errorf("serve: --backfill-workers must be >= 0 (BackfillWorkers must be >= 0), got %d", opts.BackfillWorkers)
+	for name, value := range map[string]int{"backfill-global-downloads": opts.BackfillGlobalDownloads, "backfill-host-workers-max": opts.BackfillHostWorkers, "backfill-max-active-hosts": opts.BackfillMaxActiveHosts, "backfill-max-hosts": opts.BackfillMaxHosts} {
+		if value < 0 {
+			return nil, fmt.Errorf("serve: --%s must be >= 0, got %d", name, value)
+		}
 	}
 	if opts.BackfillBatchSize < 0 {
 		return nil, fmt.Errorf("serve: --backfill-batch-size must be >= 0 (BackfillBatchSize must be >= 0), got %d", opts.BackfillBatchSize)
@@ -343,6 +345,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
 		}
 	}
+	var backfillNewHostClient func(string) (*atmossync.Client, error)
+	if opts.HTTPTransport != nil {
+		backfillNewHostClient = func(hostname string) (*atmossync.Client, error) {
+			xc := &xrpc.Client{Host: "http://" + hostname, HTTPClient: xrpcClient.HTTPClient, Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}
+			return atmossync.NewClient(atmossync.Options{Client: xc}), nil
+		}
+	}
 	orch, err := orchestrator.New(orchestrator.Config{
 		DataDir:        opts.DataDir,
 		FS:             opts.StorageFS,
@@ -366,7 +375,12 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		OnEvent:                        onSteadyStateEvent,
 		OnBootstrapLiveEvent:           opts.OnBootstrapLiveEvent,
 		MaxBackfillRepos:               opts.MaxBackfillRepos,
-		BackfillWorkers:                opts.effectiveBackfillWorkers(),
+		BackfillGlobalDownloads:        opts.effectiveBackfillGlobalDownloads(),
+		BackfillHostWorkers:            opts.effectiveBackfillHostWorkers(),
+		BackfillMaxActiveHosts:         opts.effectiveBackfillMaxActiveHosts(),
+		BackfillMaxHosts:               opts.effectiveBackfillMaxHosts(),
+		BackfillWorkers:                opts.BackfillWorkers,
+		BackfillNewHostClient:          backfillNewHostClient,
 		BackfillBatchSize:              opts.effectiveBackfillBatchSize(),
 		BackfillAsyncFlushWorkers:      opts.BackfillAsyncFlushWorkers,
 		ReadLogRetentionBytes:          int64(opts.effectiveSubscribeReadLogRetentionBytes()),

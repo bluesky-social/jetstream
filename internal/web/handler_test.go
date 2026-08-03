@@ -56,10 +56,14 @@ func newFixtureSnap() *status.Snapshot {
 		Backfill: status.BackfillStats{
 			TotalDIDs: 100, Discovered: 10, Complete: 80, Failed: 10, Unavailable: 5,
 			PercentComplete: 80.0,
-			ListReposCursor: "<script>alert('xss')</script>",
-			StartedAt:       time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC),
-			CompletedAt:     time.Date(2026, 5, 23, 7, 5, 0, 0, time.UTC),
-			Duration:        3*24*time.Hour + 7*time.Hour + 5*time.Minute,
+			HostsTotal:      1, HostsInFlight: 1, RelayAccountFloor: 120, EnumeratedAccounts: 100,
+			TopRemainingHosts: []status.BackfillHostRow{{
+				Hostname: "<script>alert('xss')</script>", State: "running",
+				RelayAccounts: 120, EnumeratedAccounts: 100, RemainingEstimate: 20,
+			}},
+			StartedAt:   time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC),
+			CompletedAt: time.Date(2026, 5, 23, 7, 5, 0, 0, time.UTC),
+			Duration:    3*24*time.Hour + 7*time.Hour + 5*time.Minute,
 		},
 		Live: status.LiveStats{
 			UpstreamCursor:           1234567,
@@ -154,7 +158,6 @@ func newFixtureSnap() *status.Snapshot {
 
 func newFixtureSnapBackfilling() *status.Snapshot {
 	s := newFixtureSnap()
-	s.Backfill.ListReposCursor = ""
 	return s
 }
 
@@ -182,7 +185,7 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "v1.2.3 (commit abcdef0)")
 	require.Contains(t, body, "steady_state")
 	require.Contains(t, body, "Backfill")
-	require.Contains(t, body, "enumerating repos")
+	require.Contains(t, body, "Backfill PDS roster")
 	require.NotContains(t, body, `class="bar"`)
 	require.NotContains(t, body, "Progress so far")
 	require.NotContains(t, body, "Progress")

@@ -5,11 +5,11 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 43 active mutants on disk
-(m001–m051; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
-union baseline after #206 frame-tier coverage, #208 footer-index/bloom
+**Current catalog (keep this line current): 47 active mutants on disk
+(m001–m055; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+union baseline after PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **43 killed, 0 survived,
+coverage: **47 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
@@ -17,6 +17,8 @@ m046-m050 cover fsync omission/reordering and Linux SyncWrites downgrades.
 m051 covers the merge-cleanup data-dir fsync ordering (the powerloss tier now
 also runs `./internal/ingest/orchestrator`'s `TestRunMerge_StrictMemPowerLoss*`
 to catch it and the restart-after-cleanup guard sibling).
+m052–m055 cover per-PDS cursor durability, exhausted-host recovery,
+relay-gap/direct routing, and discovery-time PDS attribution.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -67,6 +69,28 @@ The baseline's `disposition` field is the coarse verdict
 tier/seed detail the gate ignores. A seed-sensitive mutant (e.g. m002) is
 recorded by its full-campaign fixed-seed disposition; the gate does not re-run
 seed sweeps.
+
+## Campaign 2026-08-03 (PDS-direct fleet backfill)
+
+Targeted campaign in disposable clean copy `d10b582`; the shared development
+worktree remained untouched. The new `pdsbackfill` tier runs the cursor-order,
+host-state recovery, multi-PDS relay-gap/fault-isolation, PDS-attribution, and
+short default-oracle checks together.
+
+The subsequent full-catalog run exposed m027's old zero-context hunk landing on
+the newly added listHosts fault guard instead of `maybeGetRepoHTTPFault` — the
+exact revert/offset hazard documented in `specs/gotchas.md`. m027 was refreshed
+to the exact current line; no production behavior was changed to accommodate
+it. A final full-catalog run in disposable clean copy `97164fa` killed all 47
+active mutants with zero stale or build-broken patches, including m027 at the
+default tier and m052–m055 at `pdsbackfill`.
+
+| mutant | result | note |
+|---|---|---|
+| m052_pds_cursor_leads_completion | KILLED@pdsbackfill | cursor-order test observed a cursor staged while its covered completion remained below the durable seq |
+| m053_exhausted_pds_treated_drained | KILLED@pdsbackfill | mixed-state second run skipped the recovered host and remained short of the world roster |
+| m054_relay_only_backfill_routing | KILLED@pdsbackfill | host-specific faults and direct relay-gap enumeration were bypassed |
+| m055_discovery_pds_attribution_dropped | KILLED@pdsbackfill | store attribution test observed an empty RepoStatus.PDS |
 
 ## Retired mutants
 

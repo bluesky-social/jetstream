@@ -1,0 +1,22 @@
+mutant: m052_pds_cursor_leads_completion
+target: internal/ingest/backfill/completion_batcher.go
+failure-mode: |
+  A per-PDS listRepos cursor treats a still-queued completion as though it were
+  already absent/durable. The cursor can therefore commit in an earlier synced
+  Pebble batch than the repo completion and its segment rows. A crash in that
+  window resumes after the DID and silently loses its archive data.
+expected-detection: |
+  The pdsbackfill tier's
+  TestCompletionBatcherHostCursorNeverLeadsCoveredCompletion holds a covered
+  completion below the writer durability boundary and requires both the
+  completion and cursor to remain unstaged. The mutant stages the cursor and
+  fails immediately. The default oracle remains the end-to-end backstop.
+expected-tier: pdsbackfill
+tiers: pdsbackfill
+
+diff --git a/internal/ingest/backfill/completion_batcher.go b/internal/ingest/backfill/completion_batcher.go
+--- a/internal/ingest/backfill/completion_batcher.go
++++ b/internal/ingest/backfill/completion_batcher.go
+@@ -178 +178 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batch) error {
+-			if !stillQueued {
++			if stillQueued {

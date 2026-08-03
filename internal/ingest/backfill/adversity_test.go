@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -15,13 +16,30 @@ import (
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	metastore "github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
+	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	atmosidentity "github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
+
+type simulatorHostTransport struct {
+	base   http.RoundTripper
+	target *url.URL
+}
+
+func (t simulatorHostTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.URL = new(url.URL)
+	*clone.URL = *req.URL
+	clone.Host = req.URL.Host
+	clone.URL.Scheme = t.target.Scheme
+	clone.URL.Host = t.target.Host
+	return t.base.RoundTrip(clone)
+}
 
 func newBackfillAdversitySimulator(t *testing.T, accounts, initialRecords int, faults *simhttp.FaultPlan) (*world.World, *httptest.Server) {
 	t.Helper()
@@ -53,17 +71,148 @@ func runBackfillAgainstSimulator(t *testing.T, st *metastore.Store, w *ingest.Wr
 	client := srv.Client()
 	client.Timeout = 5 * time.Second
 	return Run(t.Context(), Config{
-		Store:             st,
-		Writer:            w,
-		HTTPClient:        client,
-		RelayURL:          srv.URL,
+		Store:      st,
+		Writer:     w,
+		HTTPClient: client,
+		RelayURL:   srv.URL,
+		NewHostClient: func(hostname string) (*atmossync.Client, error) {
+			if hostname != "example.test" {
+				return nil, fmt.Errorf("unexpected simulator host %q", hostname)
+			}
+			return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{
+				Host: srv.URL, HTTPClient: gt.Some(client), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+			}}), nil
+		},
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           metrics,
-		BackfillWorkers:   1,
+		GlobalDownloads:   1,
+		HostWorkers:       1,
 		BackfillBatchSize: 2,
 		RetryBaseDelay:    time.Millisecond,
 		RetryMaxDelay:     5 * time.Millisecond,
 	})
+}
+
+func TestRun_MultiPDSFaultIsolationAndExhaustion(t *testing.T) {
+	t.Parallel()
+	cfg := world.DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Accounts = 40
+	cfg.PDSHosts = 4
+	cfg.InitialRecords = 1
+	cfg.InitialRecordsMin = 1
+	cfg.InitialRecordsMax = 1
+	simWorld, err := world.New(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = simWorld.Close() })
+	_, err = simWorld.EnsureSeed()
+	require.NoError(t, err)
+	require.NoError(t, simWorld.Bootstrap(t.Context(), slog.New(slog.NewTextHandler(io.Discard, nil))))
+
+	faults := simhttp.NewFaultPlan()
+	host0 := world.VirtualPDSHostname(0)
+	host1 := world.VirtualPDSHostname(1)
+	host2 := world.VirtualPDSHostname(2)
+	host3 := world.VirtualPDSHostname(3)
+	faults.AddListHostsHTTPFailures("", http.StatusServiceUnavailable, 1)
+	faults.SetListHostsStatus(host0, "offline")
+	faults.AddPDSListReposHTTPFailures(host1, "2", http.StatusServiceUnavailable, 1)
+	faults.AddPDSListReposHTTPFailures(host2, "", http.StatusServiceUnavailable, 8)
+	faults.AddPDSListReposHTTPFailures(host3, "", http.StatusTooManyRequests, 1)
+
+	srv := httptest.NewServer(simhttp.NewHandlerWithOptions(simWorld, "http://sim.invalid", simhttp.HandlerOptions{
+		Faults: faults, ListReposPageLimit: 2,
+	}))
+	t.Cleanup(srv.Close)
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: simulatorHostTransport{base: srv.Client().Transport, target: target}, Timeout: 5 * time.Second}
+
+	st, writer, _ := newRetryTestWriter(t)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	runCfg := Config{
+		Store: st, Writer: writer, HTTPClient: client, RelayURL: "http://sim.invalid",
+		NewHostClient: func(hostname string) (*atmossync.Client, error) {
+			return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{
+				Host: "http://" + hostname, HTTPClient: gt.Some(client), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+			}}), nil
+		},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: metrics,
+		GlobalDownloads: 4, HostWorkers: 2, MaxActiveHosts: 4, BackfillBatchSize: 2,
+		RetryBaseDelay: time.Millisecond, RetryMaxDelay: 2 * time.Millisecond,
+	}
+	err = Run(t.Context(), runCfg)
+	require.NoError(t, err)
+	require.Equal(t, 1, faults.ListHostsHTTPFailuresFired(""))
+	require.Equal(t, 1, faults.PDSListReposHTTPFailuresFired(host1, "2"))
+	require.Equal(t, 8, faults.PDSListReposHTTPFailuresFired(host2, ""))
+	require.Equal(t, 1, faults.PDSListReposHTTPFailuresFired(host3, ""))
+
+	hosts, err := ListPDSHosts(st)
+	require.NoError(t, err)
+	byName := make(map[string]PDSHost, len(hosts))
+	for _, host := range hosts {
+		byName[host.Hostname] = host
+	}
+	require.Equal(t, "offline", byName[host0].RelayStatus, "offline-but-alive host must still drain")
+	for _, hostname := range []string{host0, host1, host3} {
+		require.Equal(t, string(atmosbackfill.HostStateDrained), byName[hostname].State)
+		require.True(t, byName[hostname].Enumerated)
+	}
+	require.Equal(t, string(atmosbackfill.HostStateExhausted), byName[host2].State)
+	require.False(t, byName[host2].Enumerated)
+	require.Equal(t, 8, byName[host2].Attempts)
+
+	counts, err := CountStatuses(st)
+	require.NoError(t, err)
+	require.Equal(t, uint64(cfg.Accounts-simWorld.PDSAccountCount(2)), counts.Total)
+	require.Equal(t, counts.Total, counts.Complete)
+	durableCounts, ok, err := LoadCounts(st)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(3), durableCounts.HostsDrained)
+	require.Equal(t, uint64(1), durableCounts.HostsExhausted)
+
+	relayGapArchived := false
+	bs := NewStore(st, nil)
+	for idx := range cfg.Accounts {
+		if simWorld.PDSIndexForAccount(idx) == 2 || simWorld.RelayKnowsAccount(idx) {
+			continue
+		}
+		acct, err := simWorld.LoadAccount(idx)
+		require.NoError(t, err)
+		rec, err := bs.Lookup(t.Context(), acct.DID)
+		require.NoError(t, err)
+		if rec.State == atmosbackfill.StateComplete {
+			relayGapArchived = true
+			break
+		}
+	}
+	require.True(t, relayGapArchived, "healthy PDSes must archive a DID absent from relay listRepos")
+
+	// A subsequent process run sees three durably drained hosts and one
+	// exhausted host. It must skip the drained hosts, retry the exhausted host,
+	// and converge the mixed roster without re-downloading completed repos.
+	require.NoError(t, Run(t.Context(), runCfg))
+	hosts, err = ListPDSHosts(st)
+	require.NoError(t, err)
+	byName = make(map[string]PDSHost, len(hosts))
+	for _, host := range hosts {
+		byName[host.Hostname] = host
+	}
+	for _, hostname := range []string{host0, host1, host2, host3} {
+		require.Equal(t, string(atmosbackfill.HostStateDrained), byName[hostname].State)
+		require.True(t, byName[hostname].Enumerated)
+	}
+	counts, err = CountStatuses(st)
+	require.NoError(t, err)
+	require.Equal(t, uint64(cfg.Accounts), counts.Total)
+	require.Equal(t, counts.Total, counts.Complete)
+	durableCounts, ok, err = LoadCounts(st)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(4), durableCounts.HostsDrained)
+	require.Zero(t, durableCounts.HostsExhausted)
 }
 
 func TestRun_GetRepoRepoNotFoundCompletesTerminalFromSimulator(t *testing.T) {
@@ -114,9 +263,9 @@ func TestRun_GetRepoRepoNotFoundCompletesTerminalFromSimulator(t *testing.T) {
 			require.Equal(t, 0, rs.Backfill.RetryCount)
 			require.True(t, rs.Backfill.NextAttemptAt.IsZero())
 			require.False(t, rs.Backfill.CompletedAt.IsZero())
-			require.Equal(t, mustURLHost(t, srv.URL), rs.Host)
+			require.Equal(t, "example.test", rs.Host)
 
-			hs, ok, err := loadHostStatus(st, mustURLHost(t, srv.URL))
+			hs, ok, err := loadHostStatus(st, "example.test")
 			require.NoError(t, err)
 			require.True(t, ok)
 			require.Equal(t, uint64(2), hs.Total)
@@ -320,11 +469,11 @@ func TestRun_GetRepoRedirectRecordsFinalHostFromSimulator(t *testing.T) {
 	rs, err := bs.readRepoStatus(acct.DID)
 	require.NoError(t, err)
 	require.Equal(t, StatusComplete, rs.Backfill.Status)
-	require.Equal(t, mustURLHost(t, target.URL), rs.Host)
-	require.NotEqual(t, mustURLHost(t, source.URL), rs.Host)
+	require.Equal(t, "example.test", rs.Host)
+	require.Equal(t, "example.test", rs.PDS)
 	require.Equal(t, 1, faults.GetRepoResponseFaultsFired(string(acct.DID)))
 
-	targetHS, ok, err := loadHostStatus(st, mustURLHost(t, target.URL))
+	targetHS, ok, err := loadHostStatus(st, "example.test")
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, uint64(1), targetHS.Complete)

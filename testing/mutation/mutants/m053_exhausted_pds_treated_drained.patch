@@ -1,0 +1,21 @@
+mutant: m053_exhausted_pds_treated_drained
+target: internal/ingest/backfill/store.go
+failure-mode: |
+  HostCursor projects an exhausted PDS as drained. Future process runs then
+  skip that host permanently instead of retrying it after external recovery,
+  leaving every repo on the host absent while the fleet reports completion.
+expected-detection: |
+  The pdsbackfill tier's TestRun_MultiPDSFaultIsolationAndExhaustion creates a
+  mixed durable roster, consumes the permanent-failure schedule, and runs the
+  fleet again. It requires the formerly exhausted host to drain and all repos
+  to converge; this mutant leaves the host skipped and the repo count short.
+expected-tier: pdsbackfill
+tiers: pdsbackfill
+
+diff --git a/internal/ingest/backfill/store.go b/internal/ingest/backfill/store.go
+--- a/internal/ingest/backfill/store.go
++++ b/internal/ingest/backfill/store.go
+@@ -990 +990,2 @@ func (s *Store) HostCursor(ctx context.Context, hostname string) (string, bool, error) {
+-	return host.ListReposCursor, host.Enumerated, nil
++	drained := host.Enumerated || host.State == string(atmosbackfill.HostStateExhausted)
++	return host.ListReposCursor, drained, nil

@@ -30,6 +30,7 @@ import (
 // excluded from the public surface.
 var keyspacePrefixes = []string{
 	"repo/",
+	"pdshost/",
 	"sync/chain/",
 	"sync/host/",
 	"relay/",
@@ -98,7 +99,7 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 	if err != nil {
 		return BackfillStats{}, err
 	}
-	cursor, err := backfill.LoadListReposCursor(s)
+	fleet, err := collectBackfillFleet(s)
 	if err != nil {
 		return BackfillStats{}, err
 	}
@@ -118,15 +119,18 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 		Failed:          counts.Failed,
 		Unavailable:     counts.Unavailable,
 		PercentComplete: pct,
-		ListReposCursor: cursor,
 		StartedAt:       timing.StartedAt,
 		CompletedAt:     timing.CompletedAt,
 		Duration:        timing.Duration(),
+		HostsTotal:      fleet.HostsTotal, HostsDrained: fleet.HostsDrained,
+		HostsExhausted: fleet.HostsExhausted, HostsInFlight: fleet.HostsInFlight,
+		RelayAccountFloor: fleet.RelayAccountFloor, EnumeratedAccounts: fleet.EnumeratedAccounts,
+		TopRemainingHosts: fleet.TopRemainingHosts,
 	}, nil
 }
 
 func collectBackfillFast(s *store.Store) (BackfillStats, error) {
-	cursor, err := backfill.LoadListReposCursor(s)
+	fleet, err := collectBackfillFleet(s)
 	if err != nil {
 		return BackfillStats{}, err
 	}
@@ -153,11 +157,60 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 		Failed:          counts.Failed,
 		Unavailable:     counts.Unavailable,
 		PercentComplete: pct,
-		ListReposCursor: cursor,
 		StartedAt:       timing.StartedAt,
 		CompletedAt:     timing.CompletedAt,
 		Duration:        timing.Duration(),
+		HostsTotal:      fleet.HostsTotal, HostsDrained: fleet.HostsDrained,
+		HostsExhausted: fleet.HostsExhausted, HostsInFlight: fleet.HostsInFlight,
+		RelayAccountFloor: fleet.RelayAccountFloor, EnumeratedAccounts: fleet.EnumeratedAccounts,
+		TopRemainingHosts: fleet.TopRemainingHosts,
 	}, nil
+}
+
+const backfillTopRemainingHosts = 10
+
+func collectBackfillFleet(s *store.Store) (BackfillStats, error) {
+	hosts, err := backfill.ListPDSHosts(s)
+	if err != nil {
+		return BackfillStats{}, err
+	}
+	stats := BackfillStats{HostsTotal: uint64(len(hosts))}
+	rows := make([]BackfillHostRow, 0, len(hosts))
+	for _, host := range hosts {
+		stats.RelayAccountFloor += uint64(max(host.RelayAccounts, 0))
+		stats.EnumeratedAccounts += host.ActualAccounts
+		switch host.State {
+		case "drained":
+			stats.HostsDrained++
+		case "exhausted":
+			stats.HostsExhausted++
+		default:
+			stats.HostsInFlight++
+		}
+		remaining := uint64(0)
+		relayAccounts := uint64(max(host.RelayAccounts, 0))
+		if !host.Enumerated && relayAccounts > host.ActualAccounts {
+			remaining = relayAccounts - host.ActualAccounts
+		}
+		rows = append(rows, BackfillHostRow{
+			Hostname: host.Hostname, State: host.State, RelayAccounts: relayAccounts,
+			EnumeratedAccounts: host.ActualAccounts, RemainingEstimate: remaining,
+			Attempts: host.Attempts, LastError: host.LastError,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].RemainingEstimate != rows[j].RemainingEstimate {
+			return rows[i].RemainingEstimate > rows[j].RemainingEstimate
+		}
+		if rows[i].RelayAccounts != rows[j].RelayAccounts {
+			return rows[i].RelayAccounts > rows[j].RelayAccounts
+		}
+		return rows[i].Hostname < rows[j].Hostname
+	})
+	if len(rows) > 0 {
+		stats.TopRemainingHosts = rows[:min(len(rows), backfillTopRemainingHosts)]
+	}
+	return stats, nil
 }
 
 func normalizeRequest(req Request) Request {

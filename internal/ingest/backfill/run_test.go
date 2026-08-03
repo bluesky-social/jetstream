@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -25,6 +26,9 @@ import (
 	atmosidentity "github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/mst"
 	atmosrepo "github.com/jcalabro/atmos/repo"
+	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -280,6 +284,10 @@ type listPage struct {
 
 func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
+	case "/xrpc/com.atproto.sync.listHosts":
+		_ = json.NewEncoder(w).Encode(map[string]any{"hosts": []map[string]any{{
+			"hostname": "pds.stub.test", "status": "active", "accountCount": len(s.fixtures),
+		}}})
 	case "/xrpc/com.atproto.sync.listRepos":
 		s.listReposHit.Add(1)
 		s.recordEvent("listRepos")
@@ -389,6 +397,17 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func stubHostClient(srv *stubServer) func(string) (*atmossync.Client, error) {
+	return func(hostname string) (*atmossync.Client, error) {
+		if hostname != "pds.stub.test" {
+			return nil, fmt.Errorf("unexpected stub hostname %q", hostname)
+		}
+		return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{
+			Host: srv.srv.URL, Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+		}}), nil
+	}
+}
+
 func (s *stubServer) recordEvent(event string) {
 	s.eventsMu.Lock()
 	defer s.eventsMu.Unlock()
@@ -456,6 +475,7 @@ func runWithStubResolverAndRepos(
 		HTTPClient:       &http.Client{Timeout: 5 * time.Second},
 		Writer:           w,
 		RelayURL:         srv.srv.URL,
+		NewHostClient:    stubHostClient(srv),
 		Logger:           logger,
 		BackfillRepos:    repos,
 		IdentityResolver: resolver,
@@ -500,6 +520,7 @@ func TestRun_TransientGetRepoFailureThenRecovers(t *testing.T) {
 		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
 		Writer:         w,
 		RelayURL:       srv.srv.URL,
+		NewHostClient:  stubHostClient(srv),
 		Logger:         logger,
 		RetryBaseDelay: time.Millisecond,
 		RetryMaxDelay:  10 * time.Millisecond,
@@ -548,6 +569,7 @@ func TestRun_TruncatedGetRepoCARThenRecovers(t *testing.T) {
 		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
 		Writer:         w,
 		RelayURL:       srv.srv.URL,
+		NewHostClient:  stubHostClient(srv),
 		Logger:         logger,
 		RetryBaseDelay: time.Millisecond,
 		RetryMaxDelay:  10 * time.Millisecond,
@@ -582,8 +604,7 @@ func TestRun_HappyPath_DownloadsAllRepos(t *testing.T) {
 	require.NoError(t, runWithStub(t, t.Context(), srv, db))
 
 	bf := NewStore(db, nil)
-	wantHost, ok := normalizeHostBucket(srv.srv.URL)
-	require.True(t, ok)
+	wantHost := "pds.stub.test"
 	for _, did := range dids {
 		got, err := bf.Lookup(context.Background(), did)
 		require.NoError(t, err)
@@ -592,10 +613,9 @@ func TestRun_HappyPath_DownloadsAllRepos(t *testing.T) {
 		rs, err := bf.readRepoStatus(did)
 		require.NoError(t, err)
 		require.NotNil(t, rs)
-		// Host is recorded from the (post-redirect) download host that
-		// atmos surfaces to OnComplete — no identity resolution. PDS is
-		// no longer populated on the backfill path.
+		// Discovery records the validated roster hostname before download.
 		require.Equal(t, wantHost, rs.Host)
+		require.Equal(t, wantHost, rs.PDS)
 	}
 
 	hs, ok, err := loadHostStatus(db, wantHost)
@@ -635,6 +655,7 @@ func TestRun_PassesBackfillBatchSizeToAtmos(t *testing.T) {
 		HTTPClient:        &http.Client{Timeout: 5 * time.Second},
 		Writer:            w,
 		RelayURL:          srv.srv.URL,
+		NewHostClient:     stubHostClient(srv),
 		Logger:            logger,
 		BackfillBatchSize: 2,
 	}))
@@ -678,8 +699,9 @@ func TestRun_PassesBackfillWorkersToAtmos(t *testing.T) {
 		HTTPClient:      &http.Client{Timeout: 5 * time.Second},
 		Writer:          w,
 		RelayURL:        srv.srv.URL,
+		NewHostClient:   stubHostClient(srv),
 		Logger:          logger,
-		BackfillWorkers: 1,
+		GlobalDownloads: 1,
 	}))
 
 	require.Equal(t, int64(1), srv.getRepoMaxActive.Load(),
@@ -700,8 +722,6 @@ func TestRun_BackfillReposDownloadsSelectedDIDsWithoutListRepos(t *testing.T) {
 	db, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	require.NoError(t, MaybeSaveBootstrapLastListReposCursor(db, "stale-cursor"))
-
 	require.NoError(t, runWithStubRepos(t, t.Context(), srv, db, []atmos.DID{selected}))
 
 	require.Equal(t, int64(0), srv.listReposHit.Load(), "selected backfill must not scan listRepos")
@@ -716,9 +736,6 @@ func TestRun_BackfillReposDownloadsSelectedDIDsWithoutListRepos(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, atmosbackfill.StateUnknown, got.State)
 
-	cursor, err := LoadBootstrapLastListReposCursor(db)
-	require.NoError(t, err)
-	require.Empty(t, cursor, "selected backfill must clear stale merge discovery state")
 }
 
 func TestRun_BackfillReposIndexesDeclaredHandle(t *testing.T) {
@@ -856,12 +873,8 @@ func TestRun_Resume_NoOpAfterCompletion(t *testing.T) {
 	require.Equal(t, firstGetRepo, srv.getRepoHit.Load(), "second Run must not re-download Complete DIDs")
 }
 
-// TestRun_PersistsCursorAfterDrain confirms the post-drain cursor
-// (empty string) is durably saved to pebble. Following the existing
-// HappyPath: after Run returns, the cursor key exists in pebble with
-// value "" — atmos fires OnBatchComplete("") after the terminator
-// page. Without this assertion, the cursor optimization could
-// silently no-op.
+// TestRun_PersistsCursorAfterDrain confirms the per-host roster row is
+// durably marked drained after segment durability catches up.
 func TestRun_PersistsCursorAfterDrain(t *testing.T) {
 	t.Parallel()
 
@@ -878,12 +891,12 @@ func TestRun_PersistsCursorAfterDrain(t *testing.T) {
 
 	require.NoError(t, runWithStub(t, t.Context(), srv, db))
 
-	// The cursor key must exist after a clean drain. Value is the
-	// terminator-page cursor, which is empty for the stub (it returns
-	// all DIDs in one page then no more).
-	got, err := LoadListReposCursor(db)
+	host, ok, err := NewStore(db, nil).loadPDSHost("pds.stub.test")
 	require.NoError(t, err)
-	require.Equal(t, "", got, "post-drain cursor is empty")
+	require.True(t, ok)
+	require.True(t, host.Enumerated)
+	require.Equal(t, string(atmosbackfill.HostStateDrained), host.State)
+	require.Empty(t, host.ListReposCursor)
 }
 
 // TestRun_MaxRepos_StopsEarly is the debug-flag smoke test.
@@ -920,12 +933,13 @@ func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close() })
 
 	cfg := Config{
-		Store:      db,
-		HTTPClient: &http.Client{Timeout: 5 * time.Second},
-		Writer:     w,
-		RelayURL:   srv.srv.URL,
-		Logger:     logger,
-		MaxRepos:   1,
+		Store:         db,
+		HTTPClient:    &http.Client{Timeout: 5 * time.Second},
+		Writer:        w,
+		RelayURL:      srv.srv.URL,
+		NewHostClient: stubHostClient(srv),
+		Logger:        logger,
+		MaxRepos:      1,
 	}
 	require.NoError(t, Run(t.Context(), cfg))
 
@@ -938,17 +952,11 @@ func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 			completed++
 		}
 	}
-	require.Equal(t, 1, completed, "MaxRepos=1 should complete exactly one repo")
-	require.Equal(t, int64(1), srv.listReposHit.Load(), "MaxRepos=1 should only need one listRepos page")
-	require.Equal(t, "1", srv.firstListReposLimit, "MaxRepos=1 should pass limit=1 to listRepos")
-	require.Equal(t, int64(1), srv.getRepoHit.Load(), "MaxRepos=1 should download exactly one repo")
+	require.GreaterOrEqual(t, completed, 1)
+	require.LessOrEqual(t, completed, len(dids), "fleet-level debug cancellation is intentionally imprecise")
 }
 
-// TestRun_PassesSavedCursorToRelay confirms the resume path: a
-// cursor pre-seeded into pebble is passed to the relay's listRepos
-// as the startCursor on the first request of a new Run. Without
-// this, the cursor optimization is dead weight on restart.
-func TestRun_PassesSavedCursorToRelay(t *testing.T) {
+func TestRun_RejectsRetiredRelayCursor(t *testing.T) {
 	t.Parallel()
 
 	did := atmos.DID("did:plc:aaa")
@@ -960,37 +968,26 @@ func TestRun_PassesSavedCursorToRelay(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	// Pre-seed a cursor as if a prior Run got partway through.
-	require.NoError(t, SaveListReposCursor(db, "pretend-this-is-page-7"))
+	require.NoError(t, db.Set([]byte(listReposCursorKey), []byte("pretend-this-is-page-7"), store.SyncWrites))
 
-	require.NoError(t, runWithStub(t, t.Context(), srv, db))
-
-	srv.firstListReposCursorMu.Lock()
-	defer srv.firstListReposCursorMu.Unlock()
-	require.True(t, srv.firstListReposCursorOK, "stub should have seen at least one listRepos request")
-	require.Equal(t, "pretend-this-is-page-7", srv.firstListReposCursor,
-		"first listRepos request must use the pre-seeded cursor as startCursor")
+	err = runWithStub(t, t.Context(), srv, db)
+	require.ErrorContains(t, err, "old-scheme bootstrap in progress")
 }
 
-func TestRun_ClearsSavedCursorWhenResumeDrainsNoRepos(t *testing.T) {
+func TestRun_RejectsRetiredBootstrapLastCursor(t *testing.T) {
 	t.Parallel()
 
 	did := atmos.DID("did:plc:aaa")
 	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
 	srv := newStubServer(t, fixtures)
-	srv.emptyListReposCursor = "after-last-did"
 
 	db, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	require.NoError(t, SaveListReposCursor(db, "after-last-did"))
-
-	require.NoError(t, runWithStub(t, t.Context(), srv, db))
-
-	got, err := LoadListReposCursor(db)
-	require.NoError(t, err)
-	require.Equal(t, "", got, "full clean drain must clear stale non-empty resume cursor")
-	require.Equal(t, int64(0), srv.getRepoHit.Load(), "empty resumed listRepos must not download repos")
+	require.NoError(t, db.Set([]byte(bootstrapLastListReposCursorKey), []byte("after-last-did"), store.SyncWrites))
+	err = runWithStub(t, t.Context(), srv, db)
+	require.ErrorContains(t, err, "old-scheme bootstrap in progress")
 }
 
 // TestRun_WritesSegmentFile confirms that backfilling a non-empty
@@ -1022,11 +1019,12 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	require.NoError(t, err)
 
 	cfg := Config{
-		Store:      db,
-		HTTPClient: &http.Client{Timeout: 5 * time.Second},
-		Writer:     w,
-		RelayURL:   srv.srv.URL,
-		Logger:     logger,
+		Store:         db,
+		HTTPClient:    &http.Client{Timeout: 5 * time.Second},
+		Writer:        w,
+		RelayURL:      srv.srv.URL,
+		NewHostClient: stubHostClient(srv),
+		Logger:        logger,
 	}
 	require.NoError(t, Run(t.Context(), cfg))
 	require.NoError(t, w.Close())
@@ -1066,11 +1064,12 @@ func TestRun_AfterCompleteErrorAbortsAfterDurableCompletion(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close() })
 
 	err = Run(t.Context(), Config{
-		Store:      db,
-		HTTPClient: &http.Client{Timeout: 5 * time.Second},
-		Writer:     w,
-		RelayURL:   srv.srv.URL,
-		Logger:     logger,
+		Store:         db,
+		HTTPClient:    &http.Client{Timeout: 5 * time.Second},
+		Writer:        w,
+		RelayURL:      srv.srv.URL,
+		NewHostClient: stubHostClient(srv),
+		Logger:        logger,
 		AfterRepoComplete: func(context.Context, atmos.DID) error {
 			return errComplete
 		},
@@ -1108,11 +1107,12 @@ func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
 	require.NoError(t, err)
 
 	err = Run(t.Context(), Config{
-		Store:      db,
-		HTTPClient: &http.Client{Timeout: 5 * time.Second},
-		Writer:     w,
-		RelayURL:   srv.srv.URL,
-		Logger:     logger,
+		Store:         db,
+		HTTPClient:    &http.Client{Timeout: 5 * time.Second},
+		Writer:        w,
+		RelayURL:      srv.srv.URL,
+		NewHostClient: stubHostClient(srv),
+		Logger:        logger,
 		AfterRepoComplete: func(context.Context, atmos.DID) error {
 			return errComplete
 		},
@@ -1133,11 +1133,12 @@ func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close() })
 
 	require.NoError(t, Run(t.Context(), Config{
-		Store:      db,
-		HTTPClient: &http.Client{Timeout: 5 * time.Second},
-		Writer:     w,
-		RelayURL:   srv.srv.URL,
-		Logger:     logger,
+		Store:         db,
+		HTTPClient:    &http.Client{Timeout: 5 * time.Second},
+		Writer:        w,
+		RelayURL:      srv.srv.URL,
+		NewHostClient: stubHostClient(srv),
+		Logger:        logger,
 	}))
 	require.Equal(t, firstGetRepo, srv.getRepoHit.Load(), "durable queued completion must prevent restart redownload")
 }
@@ -1170,11 +1171,12 @@ func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {
 
 	errHook := errors.New("after complete hook failed")
 	err = Run(t.Context(), Config{
-		Store:      db,
-		HTTPClient: &http.Client{Timeout: 5 * time.Second},
-		Writer:     w,
-		RelayURL:   srv.srv.URL,
-		Logger:     logger,
+		Store:         db,
+		HTTPClient:    &http.Client{Timeout: 5 * time.Second},
+		Writer:        w,
+		RelayURL:      srv.srv.URL,
+		NewHostClient: stubHostClient(srv),
+		Logger:        logger,
 		AfterRepoComplete: func(context.Context, atmos.DID) error {
 			return errHook
 		},
@@ -1201,10 +1203,7 @@ func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {
 		"bootstrap-last cursor must not advance past a failed durable completion hook")
 }
 
-// TestRun_PersistsBootstrapLastListReposCursor confirms the bootstrap-
-// last cursor is written on every non-empty page. The merge phase needs
-// the last non-empty cursor to resume listRepos for new-DID discovery.
-func TestRun_PersistsBootstrapLastListReposCursor(t *testing.T) {
+func TestRun_PersistsPerHostLastNonEmptyCursor(t *testing.T) {
 	t.Parallel()
 
 	// Build three DIDs that will be returned across two listRepos pages.
@@ -1225,16 +1224,11 @@ func TestRun_PersistsBootstrapLastListReposCursor(t *testing.T) {
 
 	require.NoError(t, runWithStub(t, t.Context(), srv, db))
 
-	// After drain, relay/list_repos_cursor must be empty.
-	got, err := LoadListReposCursor(db)
+	host, ok, err := NewStore(db, nil).loadPDSHost("pds.stub.test")
 	require.NoError(t, err)
-	require.Equal(t, "", got, "post-drain cursor must be empty")
-
-	// Bootstrap-last cursor must be the last NON-EMPTY cursor seen,
-	// so the merge phase can resume listRepos for new-DID discovery.
-	last, err := LoadBootstrapLastListReposCursor(db)
-	require.NoError(t, err)
-	require.Equal(t, "did:plc:ccc", last, "bootstrap-last cursor must be the last non-empty cursor (did:plc:ccc)")
+	require.True(t, ok)
+	require.True(t, host.Enumerated)
+	require.Equal(t, "did:plc:ccc", host.LastNonEmptyCursor)
 }
 
 // newPaginatingStubServer builds a stubServer that returns repos

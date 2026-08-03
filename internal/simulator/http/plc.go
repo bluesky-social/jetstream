@@ -35,7 +35,7 @@ type service struct {
 
 // newPLCHandler returns a handler matching atmos's PLC resolution
 // pattern: GET <plcURL>/<did> → JSON DID document.
-func newPLCHandler(w *world.World, pdsEndpoint string, faults *FaultPlan) http.Handler {
+func newPLCHandler(w *world.World, topology pdsTopology, pdsEndpoint string, faults *FaultPlan) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		didStr := strings.TrimPrefix(r.URL.Path, "/")
 		did, err := atmos.ParseDID(didStr)
@@ -59,6 +59,9 @@ func newPLCHandler(w *world.World, pdsEndpoint string, faults *FaultPlan) http.H
 		}
 		handle := "at://user-" + acct.HandleSuffix() + ".test"
 		serviceEndpoint := pdsEndpoint
+		if topology.virtual {
+			serviceEndpoint = topology.endpointForAccount(w, acct.Index)
+		}
 		if faulted {
 			switch mode {
 			case PLCFaultMalformedHandle:

@@ -2,7 +2,7 @@
 
 **Author:** jcalabro + claude
 **Date:** 2026-08-03
-**Status:** Draft — awaiting review
+**Status:** Implemented 2026-08-03 (production-scale tuning remains operational validation)
 **Tracks:** docs/README.md §4.1, §4.2 (merge discovery), §4.3 (steady-state retry)
 **Repos touched:** atmos (`~/go/src/github.com/jcalabro/atmos`, branch `jc/backfill`) — the strategy lives here; jetstream (this repo, branch `jc/backfill`) — persistence + handler + lifecycle integration.
 

@@ -14,7 +14,7 @@ import (
 // bytes straight to the response. Ignores `since` in v1 — always
 // returns the full repo (which is valid behavior; consumers can
 // request diffs but aren't required to).
-func newPDSGetRepoHandler(w *world.World, faults *FaultPlan, onServed func(did string)) http.Handler {
+func newPDSGetRepoHandler(w *world.World, topology pdsTopology, faults *FaultPlan, onServed func(did string)) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		didStr := r.URL.Query().Get("did")
 		did, err := atmos.ParseDID(didStr)
@@ -58,6 +58,10 @@ func newPDSGetRepoHandler(w *world.World, faults *FaultPlan, onServed func(did s
 			return
 		}
 		if !ok {
+			http.NotFound(rw, r)
+			return
+		}
+		if pdsIndex, direct := topology.pdsIndex(r.Host); direct && topology.virtual && w.PDSIndexForAccount(acct.Index) != pdsIndex {
 			http.NotFound(rw, r)
 			return
 		}

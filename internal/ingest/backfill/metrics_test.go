@@ -98,7 +98,7 @@ func requireNoDebugMetrics(t *testing.T, reg *prometheus.Registry) {
 
 func requireNoDebugMetricFields(t *testing.T, m *Metrics) {
 	t.Helper()
-	typ := reflect.TypeOf(*m)
+	typ := reflect.TypeOf(m).Elem()
 	for i := range typ.NumField() {
 		require.NotContains(t, typ.Field(i).Name, "Debug")
 	}

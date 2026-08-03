@@ -1,9 +1,12 @@
 package backfill
 
 import (
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/obs"
+	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -14,6 +17,9 @@ const metricsSubsystem = "backfill"
 // A nil *Metrics is a valid zero-value: every method is a no-op,
 // which lets tests skip metric registration entirely.
 type Metrics struct {
+	mu                       sync.Mutex
+	hostStates               map[string]string
+	lastEnumerated           int64
 	Discovered               prometheus.Counter
 	Completed                prometheus.Counter
 	Failed                   prometheus.Counter
@@ -34,6 +40,13 @@ type Metrics struct {
 	RetrySucceeded           prometheus.Counter
 	RetryFailed              prometheus.Counter
 	RetrySkippedHostParked   prometheus.Counter
+	HostsTotal               *prometheus.GaugeVec
+	HostEnumeratedRepos      prometheus.Counter
+	HostAttempts             prometheus.Counter
+	HostnameRejected         prometheus.Counter
+	RosterCapHits            prometheus.Counter
+	DownloadSlotWait         prometheus.Histogram
+	EngineActiveHosts        prometheus.Gauge
 }
 
 // NewMetrics registers the backfill counters against reg. Pass the
@@ -46,6 +59,7 @@ type Metrics struct {
 // rather than building a separate registry.
 func NewMetrics(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
+		hostStates: make(map[string]string),
 		Discovered: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "discovered_total",
@@ -148,6 +162,35 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "failed_repo_retry_skipped_host_parked_total",
 			Help: "Number of eligible failed repo retries skipped because their host was parked by a rate-limit response.",
 		}),
+		HostsTotal: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "hosts_total", Help: "Current PDS roster hosts by engine lifecycle state and coarse host class.",
+		}, []string{"state", "host_class"}),
+		HostEnumeratedRepos: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "host_enumerated_repos_total", Help: "Valid repositories enumerated directly from PDS listRepos endpoints.",
+		}),
+		HostAttempts: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "host_attempts_total", Help: "Direct PDS listRepos producer attempts.",
+		}),
+		HostnameRejected: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "hostname_rejected_total", Help: "Untrusted listHosts hostnames rejected before client construction.",
+		}),
+		RosterCapHits: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "roster_cap_hits_total", Help: "listHosts crawls that exceeded the configured roster bound.",
+		}),
+		DownloadSlotWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "download_slot_wait_seconds", Help: "Time direct-PDS workers wait for a fleet-wide download slot.",
+			Buckets: obs.LatencyBucketsFast,
+		}),
+		EngineActiveHosts: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "engine_active_hosts", Help: "PDS host producer loops currently active.",
+		}),
 	}
 	reg.MustRegister(
 		m.Discovered, m.Completed, m.Failed, m.ActiveFlips, m.OnFailErrors,
@@ -157,8 +200,76 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.CompletionQueueWait, m.ForcedCheckpointFlushes,
 		m.RetryPasses, m.RetryCandidates, m.RetryAttempts,
 		m.RetrySucceeded, m.RetryFailed, m.RetrySkippedHostParked,
+		m.HostsTotal, m.HostEnumeratedRepos, m.HostAttempts,
+		m.HostnameRejected, m.RosterCapHits, m.DownloadSlotWait, m.EngineActiveHosts,
 	)
 	return m
+}
+
+func hostClass(host string) string {
+	if strings.HasSuffix(strings.ToLower(host), ".host.bsky.network") {
+		return "mushroom"
+	}
+	return "third_party"
+}
+
+func (m *Metrics) observeHostState(host atmosbackfill.HostInfo, state atmosbackfill.HostState, _ int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	class := hostClass(host.Hostname)
+	if previous := m.hostStates[host.Hostname]; previous != "" && previous != string(state) {
+		m.HostsTotal.WithLabelValues(previous, class).Dec()
+		if previous == string(atmosbackfill.HostStateRunning) {
+			m.EngineActiveHosts.Dec()
+		}
+	}
+	if m.hostStates[host.Hostname] != string(state) {
+		m.HostsTotal.WithLabelValues(string(state), class).Inc()
+		if state == atmosbackfill.HostStateRunning {
+			m.EngineActiveHosts.Inc()
+		}
+		m.hostStates[host.Hostname] = string(state)
+	}
+	if state == atmosbackfill.HostStatePending {
+		m.HostAttempts.Inc()
+	}
+}
+
+func (m *Metrics) observeProgress(stats atmosbackfill.Stats) {
+	if m == nil {
+		return
+	}
+	m.setProgressCompleted(stats.Completed)
+	m.mu.Lock()
+	if stats.ReposEnumerated < m.lastEnumerated {
+		// Each atmos Engine is single-shot and its Stats counters start at zero.
+		// Bootstrap and merge discovery reuse this process-wide Metrics value.
+		m.lastEnumerated = 0
+	}
+	if delta := stats.ReposEnumerated - m.lastEnumerated; delta > 0 {
+		m.HostEnumeratedRepos.Add(float64(delta))
+		m.lastEnumerated = stats.ReposEnumerated
+	}
+	m.mu.Unlock()
+}
+
+func (m *Metrics) incHostnameRejected() {
+	if m != nil {
+		m.HostnameRejected.Inc()
+	}
+}
+func (m *Metrics) incRosterCapHit() {
+	if m != nil {
+		m.RosterCapHits.Inc()
+	}
+}
+func (m *Metrics) observeDownloadSlotWait(wait time.Duration) {
+	if m != nil && wait >= 0 {
+		m.DownloadSlotWait.Observe(wait.Seconds())
+	}
 }
 
 // Nil-safe inc* helpers centralize the nil-Metrics check so callers

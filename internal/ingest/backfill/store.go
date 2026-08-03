@@ -38,13 +38,25 @@ type Store struct {
 	afterCompleteError func(error)
 	crashInjector      crashpoint.Injector
 	countsMu           sync.Mutex
+	rosterMu           sync.Mutex
 	completions        *completionBatcher
 	runMu              sync.Mutex
 	discoveredThisRun  map[atmos.DID]struct{}
 }
 
-// Compile-time guarantee that Store satisfies the atmos contract.
-var _ atmosbackfill.Store = (*Store)(nil)
+type atmosStoreAdapter struct{ *Store }
+
+func (a atmosStoreAdapter) OnDiscover(ctx context.Context, host string, entry atmossync.ListReposEntry) error {
+	return a.onDiscover(ctx, host, entry)
+}
+
+func (a atmosStoreAdapter) OnUpdate(ctx context.Context, host string, entry atmossync.ListReposEntry) error {
+	return a.onUpdate(ctx, host, entry)
+}
+
+var _ atmosbackfill.Store = atmosStoreAdapter{}
+
+func (s *Store) AtmosStore() atmosbackfill.Store { return atmosStoreAdapter{s} }
 
 // NewStore constructs a Store backed by the shared metadata pebble db.
 // metrics may be nil; callbacks are no-ops in that case.
@@ -173,10 +185,13 @@ func (s *Store) putRepoStatusAndCounts(
 	hadRow bool,
 	old Status,
 	updateHost func(*HostStatus),
+	rosterHostname string,
 ) error {
 	s.countsMu.Lock()
 	defer s.countsMu.Unlock()
-	return s.putRepoStatusAndCountsLocked(did, rs, hadRow, old, updateHost)
+	s.rosterMu.Lock()
+	defer s.rosterMu.Unlock()
+	return s.putRepoStatusAndCountsLocked(did, rs, hadRow, old, updateHost, rosterHostname)
 }
 
 // putRepoStatusAndCountsLocked is putRepoStatusAndCounts's body with the
@@ -187,6 +202,7 @@ func (s *Store) putRepoStatusAndCountsLocked(
 	hadRow bool,
 	old Status,
 	updateHost func(*HostStatus),
+	rosterHostname string,
 ) error {
 	enc, err := encodeRepoStatus(rs)
 	if err != nil {
@@ -231,6 +247,21 @@ func (s *Store) putRepoStatusAndCountsLocked(
 		}
 		if err := stageHostStatus(batch, hs); err != nil {
 			return err
+		}
+	}
+	if rosterHostname != "" {
+		roster, _, err := s.loadPDSHost(rosterHostname)
+		if err != nil {
+			return err
+		}
+		roster.ActualAccounts++
+		roster.UpdatedAt = timeNow()
+		rosterEnc, err := encodePDSHost(roster)
+		if err != nil {
+			return err
+		}
+		if err := batch.Set(pdsHostKey(rosterHostname), rosterEnc, nil); err != nil {
+			return fmt.Errorf("backfill: stage pdshost/%s: %w", rosterHostname, err)
 		}
 	}
 	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
@@ -336,12 +367,14 @@ func (s *Store) updateRepoStatusAndCounts(
 	return nil
 }
 
-func (s *Store) stageCompleteBatch(ctx context.Context, batch *pebble.Batch, completions []queuedCompletion) (func(error), error) {
+func (s *Store) stageDurableBatch(ctx context.Context, batch *pebble.Batch, completions []queuedCompletion, cursors []queuedHostCursor) (func(error), error) {
 	s.countsMu.Lock()
+	s.rosterMu.Lock()
 	locked := true
 	unlock := func(error) {
 		if locked {
 			locked = false
+			s.rosterMu.Unlock()
 			s.countsMu.Unlock()
 		}
 	}
@@ -353,7 +386,7 @@ func (s *Store) stageCompleteBatch(ctx context.Context, batch *pebble.Batch, com
 	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
-	if len(completions) == 0 {
+	if len(completions) == 0 && len(cursors) == 0 {
 		unlock(nil)
 		return nil, nil
 	}
@@ -442,17 +475,51 @@ func (s *Store) stageCompleteBatch(ctx context.Context, batch *pebble.Batch, com
 			hs.LastAttemptedAt = c.completed
 		}
 	}
+	for _, hs := range hostCache {
+		if err := stageHostStatus(batch, hs); err != nil {
+			return fail(err)
+		}
+	}
+	for _, cursor := range cursors {
+		host, _, err := s.loadPDSHost(cursor.host)
+		if err != nil {
+			return fail(err)
+		}
+		oldState := atmosbackfill.HostState(host.State)
+		host.ListReposCursor = cursor.cursor
+		if cursor.cursor != "" {
+			host.LastNonEmptyCursor = cursor.cursor
+		}
+		host.State = string(cursor.state)
+		switch cursor.state {
+		case atmosbackfill.HostStateDrained:
+			host.Enumerated = true
+			host.ListReposCursor = ""
+			host.LastNonEmptyCursor = cursor.lastNonEmpty
+			host.Attempts = 0
+			host.LastError = ""
+			host.NextAttemptAt = time.Time{}
+		case atmosbackfill.HostStateExhausted:
+			host.Enumerated = false
+			host.Attempts = cursor.attempts
+			host.LastError = cursor.lastError
+		}
+		host.UpdatedAt = timeNow()
+		applyHostCountTransition(&counts, oldState, cursor.state)
+		enc, err := encodePDSHost(host)
+		if err != nil {
+			return fail(err)
+		}
+		if err := batch.Set(pdsHostKey(cursor.host), enc, nil); err != nil {
+			return fail(fmt.Errorf("backfill: stage pdshost/%s cursor: %w", cursor.host, err))
+		}
+	}
 	countsEnc, err := encodeCounts(counts)
 	if err != nil {
 		return fail(err)
 	}
 	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
 		return fail(fmt.Errorf("backfill: stage counts: %w", err))
-	}
-	for _, hs := range hostCache {
-		if err := stageHostStatus(batch, hs); err != nil {
-			return fail(err)
-		}
 	}
 	return func(commitErr error) {
 		unlock(commitErr)
@@ -476,6 +543,28 @@ func (s *Store) stageCompleteBatch(ctx context.Context, batch *pebble.Batch, com
 			}
 		}
 	}, nil
+}
+
+func applyHostCountTransition(counts *Counts, old, next atmosbackfill.HostState) {
+	if old == next {
+		return
+	}
+	switch old {
+	case atmosbackfill.HostStateDrained:
+		if counts.HostsDrained > 0 {
+			counts.HostsDrained--
+		}
+	case atmosbackfill.HostStateExhausted:
+		if counts.HostsExhausted > 0 {
+			counts.HostsExhausted--
+		}
+	}
+	switch next {
+	case atmosbackfill.HostStateDrained:
+		counts.HostsDrained++
+	case atmosbackfill.HostStateExhausted:
+		counts.HostsExhausted++
+	}
 }
 
 func applyCountTransition(c *Counts, hadRow bool, old, next Status) {
@@ -575,7 +664,7 @@ func (s *Store) readRepoStatus(did atmos.DID) (*RepoStatus, error) {
 	return decodeRepoStatus(val)
 }
 
-func (s *Store) updateRepoActive(did atmos.DID, active bool) error {
+func (s *Store) updateRepoHostActive(did atmos.DID, pds string, active bool) error {
 	s.countsMu.Lock()
 	defer s.countsMu.Unlock()
 
@@ -587,7 +676,13 @@ func (s *Store) updateRepoActive(did atmos.DID, active bool) error {
 		return fmt.Errorf("backfill: on_update %s: missing row (atmos invariant violation)", did)
 	}
 	oldActive := rs.Active
+	oldHost := rs.Host
+	newHost, _ := hostBucketFromAuthority(pds)
 	rs.Active = active
+	rs.PDS = pds
+	if newHost != "" {
+		rs.Host = newHost
+	}
 
 	enc, err := encodeRepoStatus(rs)
 	if err != nil {
@@ -599,12 +694,36 @@ func (s *Store) updateRepoActive(did atmos.DID, active bool) error {
 	if err := batch.Set(repoKey(did), enc, nil); err != nil {
 		return fmt.Errorf("backfill: stage repo/%s: %w", did, err)
 	}
-	if rs.Host != "" && oldActive != rs.Active {
+	if oldHost != "" && oldHost != rs.Host {
+		hs, _, err := loadHostStatus(s.db, oldHost)
+		if err != nil {
+			return err
+		}
+		if hs.Total > 0 {
+			hs.Total--
+		}
+		if oldActive && hs.Active > 0 {
+			hs.Active--
+		}
+		decrementStatus(hs, rs.Backfill.Status)
+		if err := stageHostStatus(batch, hs); err != nil {
+			return err
+		}
+	}
+	if rs.Host != "" {
 		hs, _, err := loadHostStatus(s.db, rs.Host)
 		if err != nil {
 			return err
 		}
-		applyHostActiveTransition(hs, oldActive, rs.Active)
+		if oldHost != rs.Host {
+			hs.Total++
+			if rs.Active {
+				hs.Active++
+			}
+			incrementStatus(hs, rs.Backfill.Status)
+		} else {
+			applyHostActiveTransition(hs, oldActive, rs.Active)
+		}
 		if err := stageHostStatus(batch, hs); err != nil {
 			return err
 		}
@@ -613,6 +732,10 @@ func (s *Store) updateRepoActive(did atmos.DID, active bool) error {
 		return fmt.Errorf("backfill: write repo/%s and host active: %w", did, err)
 	}
 	return nil
+}
+
+func (s *Store) updateRepoActive(did atmos.DID, active bool) error {
+	return s.updateRepoHostActive(did, "", active)
 }
 
 func (s *Store) recordIdentityResolution(_ context.Context, did atmos.DID, resolution IdentityResolution) error {
@@ -743,15 +866,16 @@ func handleIndexChanged(a, b string) bool {
 // OnDiscover writes a fresh RepoStatus at status=not_started for a
 // DID the engine has never seen. atmos guarantees this fires at most
 // once per DID per Lookup-StateUnknown path.
-func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) error {
+func (s *Store) onDiscover(_ context.Context, host string, entry atmossync.ListReposEntry) error {
+	bucket, _ := hostBucketFromAuthority(host)
 	rs := &RepoStatus{
 		Backfill: RepoBackfillStatus{
 			Status:    StatusNotStarted,
 			StartedAt: timeNow(),
 		},
-		Active: entry.Active,
+		PDS: host, Host: bucket, Active: entry.Active,
 	}
-	if err := s.putRepoStatusAndCounts(entry.DID, rs, false, "", nil); err != nil {
+	if err := s.putRepoStatusAndCounts(entry.DID, rs, false, "", nil, host); err != nil {
 		return err
 	}
 	s.markDiscoveredThisRun(entry.DID)
@@ -759,15 +883,210 @@ func (s *Store) OnDiscover(_ context.Context, entry atmossync.ListReposEntry) er
 	return nil
 }
 
+// OnDiscover is retained for Jetstream's selected-repo and focused store
+// paths, which do not have a listHosts mapping. Fleet callers use AtmosStore.
+func (s *Store) OnDiscover(ctx context.Context, entry atmossync.ListReposEntry) error {
+	return s.onDiscover(ctx, "", entry)
+}
+
+// OnDiscoverForRetry records a merge-discovery-only marker for an unknown DID.
+// Steady-state retry owns the eventual direct-PDS download.
+func (s *Store) OnDiscoverForRetry(_ context.Context, host string, entry atmossync.ListReposEntry) error {
+	bucket, _ := hostBucketFromAuthority(host)
+	rs := &RepoStatus{
+		Backfill: RepoBackfillStatus{Status: StatusFailed, LastError: "discovered post-bootstrap; queued for retry"},
+		PDS:      host, Host: bucket, Active: entry.Active,
+	}
+	return s.putRepoStatusAndCounts(entry.DID, rs, false, "", nil, host)
+}
+
+// HostDiscoveryCursor reopens a drained/exhausted host at its last non-empty
+// bootstrap cursor so merge discovery scans only tail pages.
+func (s *Store) HostDiscoveryCursor(ctx context.Context, hostname string) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	s.rosterMu.Lock()
+	defer s.rosterMu.Unlock()
+	host, _, err := s.loadPDSHost(hostname)
+	if err != nil {
+		return "", false, err
+	}
+	return host.LastNonEmptyCursor, false, nil
+}
+
 // OnUpdate flips the Active flag on an existing row. The lifecycle
 // Status is preserved — atmos fires OnUpdate only when the
 // listRepos.Active value differs from what the Store last saw, and
 // it never changes the Status as a side effect.
-func (s *Store) OnUpdate(_ context.Context, entry atmossync.ListReposEntry) error {
-	if err := s.updateRepoActive(entry.DID, entry.Active); err != nil {
+func (s *Store) onUpdate(_ context.Context, host string, entry atmossync.ListReposEntry) error {
+	if err := s.updateRepoHostActive(entry.DID, host, entry.Active); err != nil {
 		return err
 	}
 	s.metrics.incActiveFlips()
+	return nil
+}
+
+func (s *Store) OnUpdate(ctx context.Context, entry atmossync.ListReposEntry) error {
+	return s.onUpdate(ctx, "", entry)
+}
+
+func (s *Store) loadPDSHost(hostname string) (*PDSHost, bool, error) {
+	val, closer, err := s.db.Get(pdsHostKey(hostname))
+	if errors.Is(err, store.ErrNotFound) {
+		return &PDSHost{Hostname: hostname}, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("backfill: load pdshost/%s: %w", hostname, err)
+	}
+	defer func() { _ = closer.Close() }()
+	host, err := decodePDSHost(val)
+	if err != nil {
+		return nil, false, fmt.Errorf("backfill: load pdshost/%s: %w", hostname, err)
+	}
+	return host, true, nil
+}
+
+func (s *Store) savePDSHost(host *PDSHost) error {
+	enc, err := encodePDSHost(host)
+	if err != nil {
+		return err
+	}
+	if err := s.db.Set(pdsHostKey(host.Hostname), enc, store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: write pdshost/%s: %w", host.Hostname, err)
+	}
+	return nil
+}
+
+func (s *Store) OnHost(ctx context.Context, info atmosbackfill.HostInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.rosterMu.Lock()
+	defer s.rosterMu.Unlock()
+	host, exists, err := s.loadPDSHost(info.Hostname)
+	if err != nil {
+		return err
+	}
+	now := timeNow()
+	if !exists {
+		host.FirstSeenAt = now
+		host.State = string(atmosbackfill.HostStatePending)
+	}
+	host.RelayStatus = info.RelayStatus
+	host.RelayAccounts = info.RelayAccounts
+	host.Seq = info.Seq
+	host.UpdatedAt = now
+	return s.savePDSHost(host)
+}
+
+func (s *Store) HostCursor(ctx context.Context, hostname string) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	s.rosterMu.Lock()
+	defer s.rosterMu.Unlock()
+	host, _, err := s.loadPDSHost(hostname)
+	if err != nil {
+		return "", false, err
+	}
+	return host.ListReposCursor, host.Enumerated, nil
+}
+
+func (s *Store) SaveHostCursor(ctx context.Context, hostname, cursor string) error {
+	if s.completions != nil {
+		return s.completions.QueueHostCursor(ctx, hostname, cursor)
+	}
+	return s.saveHostCursorDirect(ctx, hostname, cursor)
+}
+
+func (s *Store) saveHostCursorDirect(ctx context.Context, hostname, cursor string) error {
+	return s.updateHostStateDirect(ctx, hostname, func(host *PDSHost) atmosbackfill.HostState {
+		host.ListReposCursor = cursor
+		if cursor != "" {
+			host.LastNonEmptyCursor = cursor
+		}
+		return atmosbackfill.HostStateRunning
+	})
+}
+
+func (s *Store) OnHostDrained(ctx context.Context, hostname, lastNonEmptyCursor string) error {
+	if s.completions != nil {
+		return s.completions.QueueHostDrained(ctx, hostname, lastNonEmptyCursor)
+	}
+	return s.updateHostStateDirect(ctx, hostname, func(host *PDSHost) atmosbackfill.HostState {
+		host.Enumerated = true
+		host.ListReposCursor = ""
+		host.LastNonEmptyCursor = lastNonEmptyCursor
+		host.Attempts = 0
+		host.LastError = ""
+		host.NextAttemptAt = time.Time{}
+		return atmosbackfill.HostStateDrained
+	})
+}
+
+func (s *Store) OnHostExhausted(ctx context.Context, hostname string, cause error, attempts int) error {
+	if s.completions != nil {
+		return s.completions.QueueHostExhausted(ctx, hostname, cause, attempts)
+	}
+	return s.updateHostStateDirect(ctx, hostname, func(host *PDSHost) atmosbackfill.HostState {
+		host.Enumerated = false
+		host.Attempts = attempts
+		if cause != nil {
+			host.LastError = truncateErrorString(cause.Error())
+		}
+		return atmosbackfill.HostStateExhausted
+	})
+}
+
+func (s *Store) updateHostStateDirect(ctx context.Context, hostname string, mutate func(*PDSHost) atmosbackfill.HostState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+	s.rosterMu.Lock()
+	defer s.rosterMu.Unlock()
+
+	host, _, err := s.loadPDSHost(hostname)
+	if err != nil {
+		return err
+	}
+	oldState := atmosbackfill.HostState(host.State)
+	nextState := mutate(host)
+	host.State = string(nextState)
+	host.UpdatedAt = timeNow()
+
+	counts, ok, err := LoadCounts(s.db)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		counts, err = CountStatuses(s.db)
+		if err != nil {
+			return err
+		}
+	}
+	applyHostCountTransition(&counts, oldState, nextState)
+	hostEnc, err := encodePDSHost(host)
+	if err != nil {
+		return err
+	}
+	countsEnc, err := encodeCounts(counts)
+	if err != nil {
+		return err
+	}
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.Set(pdsHostKey(hostname), hostEnc, nil); err != nil {
+		return fmt.Errorf("backfill: stage pdshost/%s state: %w", hostname, err)
+	}
+	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
+		return fmt.Errorf("backfill: stage counts: %w", err)
+	}
+	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+		return fmt.Errorf("backfill: commit pdshost/%s state: %w", hostname, err)
+	}
 	return nil
 }
 

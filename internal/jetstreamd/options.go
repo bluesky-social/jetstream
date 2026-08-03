@@ -20,8 +20,11 @@ import (
 )
 
 const (
-	DefaultBackfillWorkers            = 100
-	DefaultBackfillBatchSize          = 100_000
+	DefaultBackfillGlobalDownloads    = 256
+	DefaultBackfillHostWorkers        = 32
+	DefaultBackfillMaxActiveHosts     = 512
+	DefaultBackfillMaxHosts           = 50_000
+	DefaultBackfillBatchSize          = 5_000
 	DefaultBackfillAsyncFlushWorkers  = 4
 	DefaultFailedRepoRetryInterval    = backfill.DefaultFailedRepoRetryInterval
 	DefaultFailedRepoRetryWorkers     = backfill.DefaultFailedRepoRetryWorkers
@@ -57,8 +60,12 @@ type Options struct {
 	ClientDrainTimeout time.Duration
 
 	MaxBackfillRepos               int
-	BackfillWorkers                int
+	BackfillGlobalDownloads        int
+	BackfillHostWorkers            int
+	BackfillMaxActiveHosts         int
+	BackfillMaxHosts               int
 	BackfillBatchSize              int
+	BackfillWorkers                int // retired; non-zero is warned and ignored
 	BackfillAsyncFlushWorkers      int
 	BootstrapLiveMaxSegmentBytes   int64
 	BootstrapLiveMaxEventsPerBlock int
@@ -156,11 +163,29 @@ type Options struct {
 	OnSteadyStateEvent     func(*segment.Event)
 }
 
-func (o Options) effectiveBackfillWorkers() int {
-	if o.BackfillWorkers > 0 {
-		return o.BackfillWorkers
+func (o Options) effectiveBackfillGlobalDownloads() int {
+	if o.BackfillGlobalDownloads > 0 {
+		return o.BackfillGlobalDownloads
 	}
-	return DefaultBackfillWorkers
+	return DefaultBackfillGlobalDownloads
+}
+func (o Options) effectiveBackfillHostWorkers() int {
+	if o.BackfillHostWorkers > 0 {
+		return o.BackfillHostWorkers
+	}
+	return DefaultBackfillHostWorkers
+}
+func (o Options) effectiveBackfillMaxActiveHosts() int {
+	if o.BackfillMaxActiveHosts > 0 {
+		return o.BackfillMaxActiveHosts
+	}
+	return DefaultBackfillMaxActiveHosts
+}
+func (o Options) effectiveBackfillMaxHosts() int {
+	if o.BackfillMaxHosts > 0 {
+		return o.BackfillMaxHosts
+	}
+	return DefaultBackfillMaxHosts
 }
 
 func (o Options) effectiveBackfillBatchSize() int {

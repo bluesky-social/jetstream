@@ -1,17 +1,16 @@
-// run.go is the entrypoint cmd/jetstream calls
-// from its errgroup. Run constructs the atmos engine and drives it
-// to completion. Returns nil on clean drain (every DID either skipped
-// at Complete or downloaded + recorded), the engine's error
-// otherwise.
-
 package backfill
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
@@ -24,116 +23,66 @@ import (
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// Config carries everything Run needs. The fields are required unless
-// noted otherwise.
 type Config struct {
-	// Store is the shared metadata pebble db.
-	Store *store.Store
-
-	// Writer is the active-segment writer used by SegmentHandler. Required.
-	Writer *ingest.Writer
-
-	// The HTTP client to use while fetching repos, talking to the relay, etc.
-	// Should be tuned for bulk repo downloads.
-	HTTPClient *http.Client
-
-	// RelayURL is the upstream relay base URL (e.g. https://bsky.network).
-	RelayURL string
-
-	// Logger is the structured logger; required (no sensible default
-	// for an ingestion service that needs failure-mode visibility).
-	Logger *slog.Logger
-
-	// Metrics is optional; nil means we still run, just without
-	// /metrics counters incrementing.
-	Metrics *Metrics
-
-	// DropMetrics is the shared ingest validation-drop counter family,
-	// forwarded to the SegmentHandler. Optional.
+	Store       *store.Store
+	Writer      *ingest.Writer
+	HTTPClient  *http.Client
+	RelayURL    string
+	Logger      *slog.Logger
+	Metrics     *Metrics
 	DropMetrics *ingest.DropMetrics
 
-	// AfterRepoComplete is a test-only restart hook invoked after a
-	// repo completion row is durably written. Leave nil in production.
 	AfterRepoComplete func(context.Context, atmos.DID) error
+	CrashInjector     crashpoint.Injector
 
-	// CrashInjector is a test-only deterministic crash simulator. Leave nil in
-	// production.
-	CrashInjector crashpoint.Injector
-
-	// MaxRepos, when > 0, is a debug-only ceiling on the number of
-	// active, not-yet-complete listRepos entries this Run will select
-	// and download before returning nil so the orchestrator can advance
-	// to the merge phase. Pre-Complete repos from a prior Run are skipped
-	// before they reach the counter and do not count.
-	//
-	// Intended for fast local-dev iteration against the production
-	// relay (millions of users); leave 0 in production. This mode does
-	// not advance the durable listRepos cursor because it is an intentional
-	// debug-scoped partial crawl, not resumable whole-network bootstrap.
-	MaxRepos int
-
-	// BackfillWorkers, when > 0, overrides atmos's repo download worker count.
-	// Zero leaves atmos on its default.
-	BackfillWorkers int
-
-	// BackfillBatchSize, when > 0, overrides atmos's listRepos-entry batch size.
-	// Zero leaves atmos on its default.
+	MaxRepos          int
+	GlobalDownloads   int
+	HostWorkers       int
+	MaxActiveHosts    int
+	MaxHosts          int
 	BackfillBatchSize int
 
-	// BackfillRepos, when non-empty, is a debug-only explicit DID list
-	// to download during bootstrap instead of walking listRepos. This is
-	// intended for targeted production smoke tests against a known repo.
-	// The normal Store, Handler, retry, verification, and completion
-	// paths are still used; only discovery is replaced.
-	BackfillRepos []atmos.DID
+	// BackfillWorkers is the retired relay-global worker knob. It is kept in
+	// the internal struct for one release so startup can reject it loudly.
+	BackfillWorkers int
 
-	// IdentityResolver resolves selected BackfillRepos DIDs so status
-	// diagnostics can persist declared handle and PDS metadata without
-	// walking listRepos. Required when BackfillRepos is non-empty; normal
-	// whole-network backfill does not use it.
+	BackfillRepos    []atmos.DID
 	IdentityResolver atmosidentity.Resolver
 
-	// MaxRetries, RetryBaseDelay, and RetryMaxDelay tune the engine's
-	// per-DID retry/backoff loop for transient getRepo failures. A zero
-	// value means "use atmos's default" (3 retries, 1s base, 30s cap),
-	// so production leaves all three at their zero value. The oracle
-	// fault-injection harness sets RetryBaseDelay to a sub-millisecond
-	// value so injected transient 503s recover without paying atmos's
-	// 1s production backoff per fault. MaxRetries is intentionally NOT
-	// lowered there: the fault budget per DID stays well inside the
-	// default retry count, and shrinking it would risk turning a
-	// transient fault into a spurious permanent failure.
 	MaxRetries     int
 	RetryBaseDelay time.Duration
 	RetryMaxDelay  time.Duration
+
+	// NewHostClient is injected by the simulator/oracle. Production leaves it
+	// nil and uses validated HTTPS hostnames over HTTPClient's shared pool.
+	NewHostClient func(hostname string) (*atmossync.Client, error)
 }
 
-// Run drives the atmos backfill engine to completion. It blocks until
-// the engine drains or ctx is cancelled. Safe to call multiple times
-// across process restarts: each call constructs a fresh Engine
-// (atmos engines are single-shot) and resumes by skipping rows
-// already at StatusComplete via Store.Lookup.
+// Run drives a complete listHosts -> direct per-PDS bootstrap. Per-host
+// cursors and terminal host state are staged into the writer's durable Pebble
+// batch behind the segment fsync they describe.
 func Run(ctx context.Context, cfg Config) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
 		if err := cfg.validate(); err != nil {
 			return err
 		}
-
-		// Per atmos Options.SyncClient docs: disable xrpc retries because
-		// the engine's retry/backoff loop is the only retry source we
-		// want. Otherwise xrpc and the engine compound retries on
-		// transient 503s, multiplying load against PDSes.
-		xc := &xrpc.Client{
-			Host:       cfg.RelayURL,
-			HTTPClient: gt.Some(cfg.HTTPClient),
-			Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+		if err := RejectRetiredCursors(cfg.Store); err != nil {
+			return err
 		}
+
+		relayXRPC := &xrpc.Client{
+			Host: cfg.RelayURL, HTTPClient: gt.Some(cfg.HTTPClient),
+			Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+		}
+		relay := atmossync.NewClient(atmossync.Options{Client: relayXRPC})
 
 		runCtx, cancelRun := context.WithCancel(ctx)
 		defer cancelRun()
-
 		var fatalMu sync.Mutex
 		var fatalErr error
 		recordFatal := func(err error) {
@@ -149,55 +98,6 @@ func Run(ctx context.Context, cfg Config) error {
 			defer fatalMu.Unlock()
 			return fatalErr
 		}
-		drainDurability := func() error {
-			cfg.Metrics.incForcedCheckpointFlushes()
-			if err := cfg.Writer.DrainDurability(ctx); err != nil {
-				return fmt.Errorf("backfill: drain durable completions: %w", err)
-			}
-			if fatal := loadFatal(); fatal != nil {
-				logger := cfg.Logger.With(slog.String("component", "backfill/run"))
-				logger.ErrorContext(ctx, "backfill aborted during durable completion drain", "err", fatal)
-				return fmt.Errorf("backfill: %w", fatal)
-			}
-			return nil
-		}
-		var lastNonEmptyListReposCursor string
-		var batchCursorSaved bool
-		rememberPageCursor := func(cursor string) error {
-			if cursor != "" {
-				lastNonEmptyListReposCursor = cursor
-			}
-			return nil
-		}
-		saveBatchCursor := func(cursor string) error {
-			if err := drainDurability(); err != nil {
-				return err
-			}
-			// Persist the last non-empty cursor under a sibling key so the
-			// merge phase can resume listRepos to discover DIDs born during
-			// bootstrap. OnBatchComplete's final cursor can be empty even
-			// when its completed batch covered earlier non-empty pages, so
-			// OnPageComplete only records the latest candidate in memory;
-			// this callback is still the only durable persistence point.
-			bootstrapCursor := cursor
-			if bootstrapCursor == "" {
-				bootstrapCursor = lastNonEmptyListReposCursor
-			}
-			if err := SaveListReposCheckpoint(cfg.Store, cursor, bootstrapCursor); err != nil {
-				return err
-			}
-			batchCursorSaved = true
-			return nil
-		}
-		finishCleanEngineDrain := func() error {
-			if err := drainDurability(); err != nil {
-				return err
-			}
-			if batchCursorSaved {
-				return nil
-			}
-			return SaveListReposCheckpoint(cfg.Store, "", "")
-		}
 
 		st := NewStore(cfg.Store, cfg.Metrics)
 		st.afterComplete = cfg.AfterRepoComplete
@@ -207,209 +107,162 @@ func Run(ctx context.Context, cfg Config) error {
 		st.SetCompletionBatcher(completions)
 		cfg.Writer.SetDurableBatchHook(completions.StageDurable)
 
-		// Backfill downloads via the relay (SyncClient), which 302-redirects
-		// to each account's PDS; the engine does not resolve DID→PDS and does
-		// not verify commit signatures (VerifyCommits stays off). The host the
-		// CAR came from is surfaced to Store.OnComplete/OnFail for per-host
-		// attribution, so no identity resolution is needed on this path.
-		sc := atmossync.NewClient(atmossync.Options{Client: xc})
-
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 		handler.onWriterError = recordFatal
 		handler.SetCompletionBatcher(completions)
 		handler.SetDropMetrics(cfg.DropMetrics)
 		logger := cfg.Logger.With(slog.String("component", "backfill/run"))
+		if cfg.BackfillWorkers != 0 {
+			logger.WarnContext(ctx, "JETSTREAM_BACKFILL_WORKERS is retired and ignored; use JETSTREAM_BACKFILL_GLOBAL_DOWNLOADS and JETSTREAM_BACKFILL_HOST_WORKERS_MAX")
+		}
+
+		drain := func() error {
+			if err := cfg.Writer.DrainDurability(ctx); err != nil {
+				return fmt.Errorf("backfill: drain durability: %w", err)
+			}
+			if fatal := loadFatal(); fatal != nil {
+				return fmt.Errorf("backfill: %w", fatal)
+			}
+			return nil
+		}
 
 		if len(cfg.BackfillRepos) > 0 {
-			if err := DeleteBootstrapLastListReposCursor(cfg.Store); err != nil {
-				return fmt.Errorf("backfill: selected repo mode: %w", err)
-			}
-			logger.InfoContext(ctx, "starting selected repo backfill",
-				"relay", cfg.RelayURL,
-				"repos", len(cfg.BackfillRepos),
-			)
+			logger.InfoContext(ctx, "starting selected repo backfill", "repos", len(cfg.BackfillRepos))
 			err := runSelectedRepos(runCtx, selectedReposConfig{
-				Repos:            cfg.BackfillRepos,
-				Store:            st,
-				Handler:          handler,
-				SyncClient:       sc,
-				IdentityResolver: cfg.IdentityResolver,
-				Metrics:          cfg.Metrics,
-				MaxRetries:       cfg.MaxRetries,
-				RetryBaseDelay:   cfg.RetryBaseDelay,
-				RetryMaxDelay:    cfg.RetryMaxDelay,
+				Repos: cfg.BackfillRepos, Store: st, Handler: handler,
+				SyncClient: relay, IdentityResolver: cfg.IdentityResolver, Metrics: cfg.Metrics,
+				MaxRetries: cfg.MaxRetries, RetryBaseDelay: cfg.RetryBaseDelay, RetryMaxDelay: cfg.RetryMaxDelay,
 				OnError: func(did atmos.DID, err error) {
-					if !shouldLogBackfillError(err) {
-						return
+					if shouldLogBackfillError(err) {
+						logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
 					}
-					logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
 				},
 			})
 			if err != nil {
 				if fatal := loadFatal(); fatal != nil {
-					logger.ErrorContext(ctx, "selected repo backfill aborted after local writer error", "err", fatal)
 					return fmt.Errorf("backfill: %w", fatal)
 				}
-				logger.ErrorContext(ctx, "selected repo backfill returned error", "err", err)
 				return fmt.Errorf("backfill: %w", err)
 			}
-			if fatal := loadFatal(); fatal != nil {
-				logger.ErrorContext(ctx, "selected repo backfill aborted after local writer error", "err", fatal)
-				return fmt.Errorf("backfill: %w", fatal)
-			}
-			return drainDurability()
+			return drain()
 		}
 
-		startCursor, err := LoadListReposCursor(cfg.Store)
-		if err != nil {
-			return fmt.Errorf("backfill: %w", err)
-		}
-		if startCursor != "" {
-			logger.InfoContext(ctx, "resuming from saved cursor", "cursor", startCursor)
+		newHostClient := cfg.NewHostClient
+		if newHostClient == nil {
+			newHostClient = NewHostClientBuilder(cfg.RelayURL, cfg.HTTPClient)
 		}
 
-		if cfg.MaxRepos > 0 {
-			if err := DeleteBootstrapLastListReposCursor(cfg.Store); err != nil {
-				return fmt.Errorf("backfill: limited repo mode: %w", err)
-			}
-			logger.InfoContext(ctx, "starting limited listRepos backfill",
-				"relay", cfg.RelayURL,
-				"max_repos", cfg.MaxRepos,
-			)
-			repos, err := collectLimitedListRepos(runCtx, sc, st, startCursor, cfg.MaxRepos)
-			if err != nil {
-				if fatal := loadFatal(); fatal != nil {
-					logger.ErrorContext(ctx, "limited listRepos backfill aborted after local writer error", "err", fatal)
-					return fmt.Errorf("backfill: %w", fatal)
-				}
-				logger.ErrorContext(ctx, "limited listRepos backfill discovery returned error", "err", err)
-				return fmt.Errorf("backfill: %w", err)
-			}
-			logger.InfoContext(ctx, "collected limited listRepos backfill repos",
-				"requested", cfg.MaxRepos,
-				"repos", len(repos),
-			)
-			err = runSelectedRepos(runCtx, selectedReposConfig{
-				Repos:          repos,
-				Store:          st,
-				Handler:        handler,
-				SyncClient:     sc,
-				Metrics:        cfg.Metrics,
-				MaxRetries:     cfg.MaxRetries,
-				RetryBaseDelay: cfg.RetryBaseDelay,
-				RetryMaxDelay:  cfg.RetryMaxDelay,
-				OnError: func(did atmos.DID, err error) {
-					if !shouldLogBackfillError(err) {
-						return
-					}
-					logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
-				},
-			})
-			if err != nil {
-				if fatal := loadFatal(); fatal != nil {
-					logger.ErrorContext(ctx, "limited listRepos backfill aborted after local writer error", "err", fatal)
-					return fmt.Errorf("backfill: %w", fatal)
-				}
-				logger.ErrorContext(ctx, "limited listRepos backfill returned error", "err", err)
-				return fmt.Errorf("backfill: %w", err)
-			}
-			if fatal := loadFatal(); fatal != nil {
-				logger.ErrorContext(ctx, "limited listRepos backfill aborted after local writer error", "err", fatal)
-				return fmt.Errorf("backfill: %w", fatal)
-			}
-			return drainDurability()
-		}
-
+		var limited atomic.Bool
 		engineOpts := atmosbackfill.Options{
-			SyncClient:      sc,
-			Store:           st,
-			Handler:         handler,
-			StartCursor:     gt.Some(startCursor),
-			OnBatchComplete: gt.Some(saveBatchCursor),
-			OnPageComplete:  gt.Some(rememberPageCursor),
+			Relay: relay, NewHostClient: gt.Some(newHostClient), Store: st.AtmosStore(), Handler: handler,
 			OnError: gt.Some(func(did atmos.DID, err error) {
-				if !shouldLogBackfillError(err) {
-					return
+				if shouldLogBackfillError(err) {
+					logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
 				}
-				logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
 			}),
 			OnProgress: gt.Some(func(stats atmosbackfill.Stats) {
-				cfg.Metrics.setProgressCompleted(stats.Completed)
+				cfg.Metrics.observeProgress(stats)
+				if cfg.MaxRepos > 0 && stats.Completed+stats.Failed >= int64(cfg.MaxRepos) && limited.CompareAndSwap(false, true) {
+					cancelRun()
+				}
 			}),
+			OnHostState: gt.Some(func(host atmosbackfill.HostInfo, state atmosbackfill.HostState, attempts int, err error) {
+				cfg.Metrics.observeHostState(host, state, attempts)
+				traceHostState(ctx, host, state, attempts, err)
+				if state == atmosbackfill.HostStateExhausted {
+					logger.WarnContext(ctx, "PDS host exhausted", "host", host.Hostname, "attempts", attempts, "err", err)
+				}
+			}),
+			OnHostnameRejected: gt.Some(func(host string, err error) {
+				cfg.Metrics.incHostnameRejected()
+				logger.WarnContext(ctx, "rejected listHosts hostname", "host", host, "err", err)
+			}),
+			OnRosterCapped:     gt.Some(func(limit int) { cfg.Metrics.incRosterCapHit() }),
+			OnDownloadSlotWait: gt.Some(func(wait time.Duration) { cfg.Metrics.observeDownloadSlotWait(wait) }),
 		}
-
-		// Only override atmos's retry defaults when explicitly configured;
-		// a zero value leaves the engine on its production defaults (3
-		// transient retries, 1s base, 30s cap, plus the separate 429
-		// rate-limit budget). The oracle harness sets a tiny RetryBaseDelay
-		// so injected transient faults recover quickly.
-		if cfg.MaxRetries > 0 {
-			engineOpts.MaxRetries = gt.Some(cfg.MaxRetries)
+		if cfg.GlobalDownloads > 0 {
+			engineOpts.GlobalDownloads = gt.Some(cfg.GlobalDownloads)
 		}
-		if cfg.BackfillWorkers > 0 {
-			engineOpts.Workers = gt.Some(cfg.BackfillWorkers)
+		if cfg.HostWorkers > 0 {
+			engineOpts.HostWorkers = gt.Some(cfg.HostWorkers)
+		}
+		if cfg.MaxActiveHosts > 0 {
+			engineOpts.MaxActiveHosts = gt.Some(cfg.MaxActiveHosts)
+		}
+		if cfg.MaxHosts > 0 {
+			engineOpts.MaxHosts = gt.Some(cfg.MaxHosts)
 		}
 		if cfg.BackfillBatchSize > 0 {
 			engineOpts.BatchSize = gt.Some(cfg.BackfillBatchSize)
 		}
+		if cfg.MaxRetries > 0 {
+			engineOpts.MaxRetries = gt.Some(cfg.MaxRetries)
+		}
 		if cfg.RetryBaseDelay > 0 {
 			engineOpts.RetryBaseDelay = gt.Some(cfg.RetryBaseDelay)
+			engineOpts.HostBackoffBase = gt.Some(cfg.RetryBaseDelay)
 		}
 		if cfg.RetryMaxDelay > 0 {
 			engineOpts.RetryMaxDelay = gt.Some(cfg.RetryMaxDelay)
+			engineOpts.HostBackoffMax = gt.Some(cfg.RetryMaxDelay)
 		}
-		engine := atmosbackfill.NewEngine(engineOpts)
 
-		logger.InfoContext(ctx, "starting", "relay", cfg.RelayURL, "max_repos", cfg.MaxRepos, "workers", cfg.BackfillWorkers, "batch_size", cfg.BackfillBatchSize)
-		if err := engine.Run(runCtx); err != nil {
+		logger.InfoContext(ctx, "starting PDS-direct backfill", "relay", cfg.RelayURL,
+			"global_downloads", cfg.GlobalDownloads, "host_workers", cfg.HostWorkers,
+			"max_active_hosts", cfg.MaxActiveHosts, "batch_size", cfg.BackfillBatchSize)
+		err := atmosbackfill.NewEngine(engineOpts).Run(runCtx)
+		if err != nil && (!limited.Load() || !errors.Is(err, context.Canceled)) {
 			if fatal := loadFatal(); fatal != nil {
-				logger.ErrorContext(ctx, "engine aborted after local writer error", "err", fatal)
 				return fmt.Errorf("backfill: %w", fatal)
 			}
-			logger.ErrorContext(ctx, "engine returned error", "err", err)
 			return fmt.Errorf("backfill: %w", err)
 		}
-		if fatal := loadFatal(); fatal != nil {
-			logger.ErrorContext(ctx, "engine aborted after local writer error", "err", fatal)
-			return fmt.Errorf("backfill: %w", fatal)
+		if err := drain(); err != nil {
+			return err
 		}
-
-		logger.InfoContext(ctx, "engine drained")
-		return finishCleanEngineDrain()
+		logger.InfoContext(ctx, "PDS-direct backfill drained", "limited", limited.Load())
+		return nil
 	})
 }
 
-func collectLimitedListRepos(ctx context.Context, sc *atmossync.Client, st *Store, startCursor string, maxRepos int) ([]atmos.DID, error) {
-	if maxRepos <= 0 {
-		return nil, nil
+func traceHostState(ctx context.Context, host atmosbackfill.HostInfo, state atmosbackfill.HostState, attempts int, cause error) {
+	_, span := obs.Tracer("ingest/backfill").Start(ctx, "host.lifecycle",
+		trace.WithAttributes(
+			attribute.String("hostname", host.Hostname),
+			attribute.String("state", string(state)),
+			attribute.Int("attempts", attempts),
+			attribute.String("relay_status", host.RelayStatus),
+		))
+	if cause != nil {
+		span.RecordError(cause)
+		span.SetStatus(codes.Error, cause.Error())
 	}
+	span.End()
+}
 
-	repos := make([]atmos.DID, 0, maxRepos)
-	for page, err := range sc.ListRepos(ctx, int64(maxRepos), startCursor) {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+func NewHostClientBuilder(relayURL string, httpClient *http.Client) func(string) (*atmossync.Client, error) {
+	relayParsed, _ := url.Parse(relayURL)
+	return func(hostname string) (*atmossync.Client, error) {
+		var hostURL string
+		if relayParsed != nil && relayParsed.Scheme == "http" && hostname == relayParsed.Host && isLoopbackHost(relayParsed.Hostname()) {
+			hostURL = "http://" + hostname
+		} else {
+			if err := atmosbackfill.ValidateHostname(hostname); err != nil {
+				return nil, err
+			}
+			hostURL = "https://" + strings.ToLower(hostname)
 		}
-		if err != nil {
-			return nil, fmt.Errorf("limited listRepos: %w", err)
-		}
-		for _, entry := range page.Entries {
-			if !entry.Active {
-				continue
-			}
-			rec, err := st.Lookup(ctx, entry.DID)
-			if err != nil {
-				return nil, fmt.Errorf("limited listRepos lookup %s: %w", entry.DID, err)
-			}
-			if rec.State == atmosbackfill.StateComplete {
-				continue
-			}
-			repos = append(repos, entry.DID)
-			if len(repos) >= maxRepos {
-				return repos, nil
-			}
-		}
+		xc := &xrpc.Client{Host: hostURL, HTTPClient: gt.Some(httpClient), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}
+		return atmossync.NewClient(atmossync.Options{Client: xc}), nil
 	}
-	return repos, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (cfg Config) validate() error {
@@ -425,17 +278,16 @@ func (cfg Config) validate() error {
 	if cfg.RelayURL == "" {
 		return fmt.Errorf("backfill: Config.RelayURL is required")
 	}
-	if cfg.BackfillWorkers < 0 {
-		return fmt.Errorf("backfill: Config.BackfillWorkers must be >= 0")
+	if cfg.Logger == nil {
+		return fmt.Errorf("backfill: Config.Logger is required")
 	}
-	if cfg.BackfillBatchSize < 0 {
-		return fmt.Errorf("backfill: Config.BackfillBatchSize must be >= 0")
+	for name, value := range map[string]int{"GlobalDownloads": cfg.GlobalDownloads, "HostWorkers": cfg.HostWorkers, "MaxActiveHosts": cfg.MaxActiveHosts, "MaxHosts": cfg.MaxHosts, "BackfillBatchSize": cfg.BackfillBatchSize} {
+		if value < 0 {
+			return fmt.Errorf("backfill: Config.%s must be >= 0", name)
+		}
 	}
 	if len(cfg.BackfillRepos) > 0 && cfg.IdentityResolver == nil {
 		return fmt.Errorf("backfill: Config.IdentityResolver is required when Config.BackfillRepos is set")
-	}
-	if cfg.Logger == nil {
-		return fmt.Errorf("backfill: Config.Logger is required")
 	}
 	return nil
 }
