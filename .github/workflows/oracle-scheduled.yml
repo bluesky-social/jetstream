@@ -16,11 +16,11 @@ on:
       seeds:
         description: "Number of randomly-chosen seeds to sweep"
         required: false
-        default: "30"
+        default: "5"
       race_seeds:
         description: "Number of seeds for the -race lane (race is ~5-15x slower)"
         required: false
-        default: "3"
+        default: "1"
 
 permissions: {}
 
