@@ -963,15 +963,20 @@ func assertRelayGapReposArchived(t *testing.T, w *world.World, want, got *Model,
 	}
 	require.NotEmptyf(t, gapDIDs,
 		"oracle world has no fetchable relay-gap repo: mode=%s seed=%d", cfg.Mode, cfg.Seed)
-	archived := 0
+	// Every fetchable gap DID must be archived, not just one: live-phase
+	// traffic can incidentally register an account in the model, but only
+	// direct per-PDS enumeration reaches all of them (and the full record
+	// contents are separately enforced by the Compare that follows this
+	// diagnostic — this assertion exists to fail with a clearer message).
+	missing := make([]string, 0)
 	for _, did := range gapDIDs {
-		if _, ok := got.Accounts[did]; ok {
-			archived++
+		if _, ok := got.Accounts[did]; !ok {
+			missing = append(missing, did)
 		}
 	}
-	require.Positivef(t, archived,
-		"bootstrap archived no relay-gap repo; direct per-PDS discovery is not exercised: mode=%s seed=%d gap_dids=%v",
-		cfg.Mode, cfg.Seed, gapDIDs)
+	require.Emptyf(t, missing,
+		"bootstrap failed to archive relay-gap repos; direct per-PDS discovery is not exercised: mode=%s seed=%d missing=%v",
+		cfg.Mode, cfg.Seed, missing)
 }
 
 func recordTraceOrError(t *testing.T, trace *Trace, kind string, data map[string]any) {

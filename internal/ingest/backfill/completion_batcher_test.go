@@ -597,6 +597,41 @@ func TestCompletionBatcherCommitFailureKeepsHostCursorQueued(t *testing.T) {
 	require.Equal(t, "cursor-retry", host.ListReposCursor)
 }
 
+// TestCompletionBatcherExhaustedPreservesPendingCheckpoint pins the
+// same-batch transition: a Running checkpoint queued for a host and then an
+// Exhausted record before either staged must not lose the checkpoint — the
+// exhausted host resumes from it on the next run.
+func TestCompletionBatcherExhaustedPreservesPendingCheckpoint(t *testing.T) {
+	t.Parallel()
+	st, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	bs := NewStore(st, nil)
+	const hostname = "pds-exhaust-mid-batch.example.com"
+	require.NoError(t, bs.OnHost(t.Context(), atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
+	cb := NewCompletionBatcher(bs, nil)
+	require.NoError(t, cb.QueueHostCursor(t.Context(), hostname, "cursor-4000"))
+	require.NoError(t, cb.QueueHostExhausted(t.Context(), hostname, errors.New("listRepos 503"), 8))
+
+	b := st.NewBatch()
+	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 0, false, nil)
+	require.NoError(t, err)
+	commitErr := st.Commit(b, store.SyncWrites)
+	afterDone(commitErr)
+	require.NoError(t, commitErr)
+	afterCommit()
+	require.NoError(t, b.Close())
+
+	host, _, err := bs.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.Equal(t, string(atmosbackfill.HostStateExhausted), host.State)
+	require.Equal(t, "cursor-4000", host.ListReposCursor,
+		"an exhausted transition must not discard the same-batch checkpoint it superseded")
+	require.False(t, host.Enumerated)
+	require.Equal(t, 8, host.Attempts)
+}
+
 func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *testing.T) {
 	t.Parallel()
 

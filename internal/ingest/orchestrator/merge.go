@@ -151,7 +151,8 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		}
 
 		if !o.cfg.SkipMergeDiscovery {
-			if err := runner.runDiscoveryWithClient(ctx, o.cfg.RelayURL, o.cfg.HTTPClient, o.cfg.BackfillNewHostClient); err != nil {
+			limits := discoveryLimits{maxHosts: o.cfg.BackfillMaxHosts, maxActiveHosts: o.cfg.BackfillMaxActiveHosts}
+			if err := runner.runDiscoveryWithClient(ctx, o.cfg.RelayURL, o.cfg.HTTPClient, o.cfg.BackfillNewHostClient, limits); err != nil {
 				return err
 			}
 		}

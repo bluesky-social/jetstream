@@ -87,6 +87,16 @@ func (b *completionBatcher) queueHostState(ctx context.Context, next queuedHostC
 			deps[completion.did] = completion
 		}
 	}
+	// An exhausted record replaces any not-yet-staged checkpoint for the
+	// host (the map is keyed by host). Carry that pending cursor forward so
+	// the checkpoint isn't silently dropped — its covered completions are
+	// still in b.queued and therefore in the deps recomputed above, so the
+	// cursor-never-leads invariant is preserved.
+	if next.state == atmosbackfill.HostStateExhausted && next.cursor == "" {
+		if prev, ok := b.cursors[next.host]; ok && prev.state == atmosbackfill.HostStateRunning {
+			next.cursor = prev.cursor
+		}
+	}
 	next.id = b.nextCursorID
 	next.deps = deps
 	b.cursors[next.host] = next

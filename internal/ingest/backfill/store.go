@@ -448,7 +448,29 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch *pebble.Batch, comp
 		// Record the host the CAR was downloaded from (post-redirect),
 		// replacing the identity-resolution side effect. Preserve any
 		// existing bucket when the transport surfaced no host.
+		//
+		// With discovery-time PDS stamping, oldHost can differ from the
+		// completing host (cross-host dedup during a migration window):
+		// decrement the stale bucket so the DID is not counted twice.
+		// Mirrors updateRepoStatusAndCounts' host-move handling.
 		if bucket, ok := hostBucketFromAuthority(c.host); ok {
+			if oldHost != "" && oldHost != bucket {
+				oldHS := hostCache[oldHost]
+				if oldHS == nil {
+					oldHS, _, err = loadHostStatus(s.db, oldHost)
+					if err != nil {
+						return fail(err)
+					}
+					hostCache[oldHost] = oldHS
+				}
+				if oldHS.Total > 0 {
+					oldHS.Total--
+				}
+				if rs.Active && oldHS.Active > 0 {
+					oldHS.Active--
+				}
+				decrementStatus(oldHS, old)
+			}
 			rs.Host = bucket
 		}
 		applyCountTransition(&counts, hadRow, old, StatusComplete)
@@ -486,12 +508,13 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch *pebble.Batch, comp
 			return fail(err)
 		}
 		oldState := atmosbackfill.HostState(host.State)
-		host.ListReposCursor = cursor.cursor
-		if cursor.cursor != "" {
-			host.LastNonEmptyCursor = cursor.cursor
-		}
 		host.State = string(cursor.state)
 		switch cursor.state {
+		case atmosbackfill.HostStateRunning:
+			host.ListReposCursor = cursor.cursor
+			if cursor.cursor != "" {
+				host.LastNonEmptyCursor = cursor.cursor
+			}
 		case atmosbackfill.HostStateDrained:
 			host.Enumerated = true
 			host.ListReposCursor = ""
@@ -500,6 +523,15 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch *pebble.Batch, comp
 			host.LastError = ""
 			host.NextAttemptAt = time.Time{}
 		case atmosbackfill.HostStateExhausted:
+			// An exhausted host resumes its partial crawl from the last
+			// durable checkpoint on the next run (matches
+			// updateHostStateDirect). cursor.cursor is non-empty only when
+			// the batcher folded a still-pending Running checkpoint into
+			// this record (queueHostState); otherwise preserve the on-disk
+			// value rather than erasing the resume point.
+			if cursor.cursor != "" {
+				host.ListReposCursor = cursor.cursor
+			}
 			host.Enumerated = false
 			host.Attempts = cursor.attempts
 			host.LastError = cursor.lastError
@@ -677,11 +709,15 @@ func (s *Store) updateRepoHostActive(did atmos.DID, pds string, active bool) err
 	}
 	oldActive := rs.Active
 	oldHost := rs.Host
-	newHost, _ := hostBucketFromAuthority(pds)
 	rs.Active = active
-	rs.PDS = pds
-	if newHost != "" {
-		rs.Host = newHost
+	// A hostless update (legacy selected-repo path) flips Active only; it
+	// must not erase a discovery- or identity-derived PDS stamp — losing it
+	// silently downgrades future retries to the relay fallback.
+	if pds != "" {
+		rs.PDS = pds
+		if newHost, ok := hostBucketFromAuthority(pds); ok {
+			rs.Host = newHost
+		}
 	}
 
 	enc, err := encodeRepoStatus(rs)
@@ -1121,7 +1157,10 @@ func (s *Store) OnComplete(ctx context.Context, did atmos.DID, host string, comm
 		// Record the host the CAR was downloaded from (post-redirect),
 		// replacing the identity-resolution side effect that used to
 		// populate this. Preserve any existing bucket if the transport
-		// did not surface a host.
+		// did not surface a host. rs.PDS is deliberately untouched: the
+		// selected path stamps an identity-derived endpoint URL there, and
+		// the retry runner repairs stale stamps explicitly (restampPDS)
+		// only when a relay fallback proved the old route dead.
 		if hasBucket {
 			rs.Host = bucket
 		}

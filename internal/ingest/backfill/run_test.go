@@ -943,17 +943,24 @@ func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 	}
 	require.NoError(t, Run(t.Context(), cfg))
 
+	// Count on-disk StatusComplete rows, not Lookup projections: Lookup
+	// deliberately reports interrupted not_started rows as StateComplete
+	// (#262 crash-recovery), which would count never-downloaded repos here.
 	bf := NewStore(db, nil)
 	completed := 0
 	for _, did := range dids {
-		got, err := bf.Lookup(context.Background(), did)
+		rs, err := bf.readRepoStatus(did)
 		require.NoError(t, err)
-		if got.State == atmosbackfill.StateComplete {
+		if rs != nil && rs.Backfill.Status == StatusComplete {
 			completed++
 		}
 	}
 	require.GreaterOrEqual(t, completed, 1)
-	require.LessOrEqual(t, completed, len(dids), "fleet-level debug cancellation is intentionally imprecise")
+	// Fleet-level cancellation is intentionally imprecise (in-flight repos
+	// finish), but it must observably stop early: with MaxRepos=1 and five
+	// fixtures, completing the whole roster means the knob was ignored.
+	require.Less(t, completed, len(dids), "MaxRepos must stop the fleet before the full roster completes")
+	require.Less(t, srv.getRepoHit.Load(), int64(len(dids)), "MaxRepos must suppress at least one download")
 }
 
 func TestRun_RejectsRetiredRelayCursor(t *testing.T) {

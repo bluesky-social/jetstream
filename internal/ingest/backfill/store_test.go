@@ -1017,6 +1017,39 @@ func TestStore_ExhaustedHostDiscoveryResumesFromDurableCursor(t *testing.T) {
 	require.Equal(t, "cursor-5000", cursor)
 }
 
+// TestStore_HostCursorsAreIsolatedPerHost pins per-host cursor key isolation:
+// saving one host's cursor must not touch another's, under both the direct
+// path and re-reads through HostCursor/HostDiscoveryCursor.
+func TestStore_HostCursorsAreIsolatedPerHost(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := t.Context()
+
+	want := map[string]string{
+		"pds-a.example.com": "cursor-a-5000",
+		"pds-b.example.com": "cursor-b-17",
+	}
+	for host, cursor := range want {
+		require.NoError(t, s.OnHost(ctx, atmosbackfill.HostInfo{Hostname: host, RelayStatus: "active"}))
+		require.NoError(t, s.SaveHostCursor(ctx, host, cursor))
+	}
+	for host, cursor := range want {
+		got, drained, err := s.HostCursor(ctx, host)
+		require.NoError(t, err)
+		require.False(t, drained)
+		require.Equal(t, cursor, got)
+	}
+
+	require.NoError(t, s.SaveHostCursor(ctx, "pds-a.example.com", "cursor-a-6000"))
+	got, _, err := s.HostCursor(ctx, "pds-b.example.com")
+	require.NoError(t, err)
+	require.Equal(t, "cursor-b-17", got, "saving host A's cursor must not disturb host B's")
+	got, drained, err := s.HostDiscoveryCursor(ctx, "pds-b.example.com")
+	require.NoError(t, err)
+	require.False(t, drained)
+	require.Equal(t, "cursor-b-17", got)
+}
+
 func TestStore_OnDiscoverAttributesValidatedRosterHostOnce(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync/atomic"
@@ -334,6 +335,106 @@ func TestRetryRunner_SuccessAppendsResyncAndCompletes(t *testing.T) {
 	require.Equal(t, 0, rs.Backfill.RetryCount)
 	require.True(t, rs.Backfill.NextAttemptAt.IsZero())
 	require.Empty(t, rs.Backfill.LastError)
+}
+
+// TestRetryRunner_StalePDSFallsBackToRelayAndRestamps covers the migration
+// window: the stamped PDS authoritatively returns RepoNotFound, the retry
+// falls back to the relay path, completes, and repairs the PDS stamp so the
+// next pass routes directly to the serving host.
+func TestRetryRunner_StalePDSFallsBackToRelayAndRestamps(t *testing.T) {
+	t.Parallel()
+	st, w, _ := newRetryTestWriter(t)
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	did := atmos.DID("did:plc:migrated")
+	fixture := buildRepoFixture(t, did)
+	staleHost := "stale-pds.example.com"
+
+	// The relay serves the repo (production: 302 to the new PDS; the stub
+	// serves directly — the routing decision is what's under test).
+	relaySrv := newStubServer(t, map[atmos.DID]repoFixture{did: fixture})
+	relayHost := mustURLHost(t, relaySrv.srv.URL)
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+
+	require.NoError(t, bs.onDiscover(ctx, staleHost, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, bs.OnFail(ctx, did, staleHost, errors.New("xrpc: HTTP 503: bootstrap unavailable"), 1))
+	require.NoError(t, bs.RecordRetryFailure(ctx, did, staleHost, errors.New("xrpc 503 unavailable"), now.Add(-time.Hour)))
+
+	// The stale PDS knows nothing about the DID: authoritative RepoNotFound.
+	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"RepoNotFound","message":"repo not found"}`))
+	}))
+	t.Cleanup(stale.Close)
+
+	r, err := newRetryRunner(RetryConfig{
+		Store: st, Writer: w, HTTPClient: relaySrv.srv.Client(), RelayURL: relaySrv.srv.URL,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Interval: time.Hour,
+		Workers: 1, HostWorkers: 1, MaxDelay: 24 * time.Hour,
+		NewHostClient: func(hostname string) (*atmossync.Client, error) {
+			require.Equal(t, staleHost, hostname)
+			return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{
+				Host: stale.URL, HTTPClient: gt.Some(stale.Client()), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+			}}), nil
+		},
+		now: func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.runPass(ctx))
+
+	rs, err := bs.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, StatusComplete, rs.Backfill.Status,
+		"a stale-PDS RepoNotFound must fall back to the relay, not complete-without-download")
+	require.Equal(t, int64(1), relaySrv.getRepoHit.Load(), "the relay fallback must serve the download")
+	require.NotEqual(t, staleHost, rs.PDS, "the stale stamp must be repaired after fallback success")
+	require.Equal(t, relayHost, rs.PDS)
+}
+
+// TestRetryRunner_DIDMismatchedCARFailsRetry verifies the retry path (which
+// bypasses the atmos engine and its identical check) rejects a CAR whose
+// commit identifies a different DID: no resync events land, the row stays
+// failed with backoff.
+func TestRetryRunner_DIDMismatchedCARFailsRetry(t *testing.T) {
+	t.Parallel()
+	st, w, segmentsDir := newRetryTestWriter(t)
+	bs := NewStore(st, nil)
+	ctx := context.Background()
+	victim := atmos.DID("did:plc:retryvictim")
+	imposter := buildRepoFixture(t, atmos.DID("did:plc:retryimposter"))
+	srv := newStubServer(t, map[atmos.DID]repoFixture{victim: imposter})
+	host := mustURLHost(t, srv.srv.URL)
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+
+	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: victim, Active: true}))
+	require.NoError(t, bs.OnFail(ctx, victim, host, errors.New("xrpc: HTTP 503: bootstrap unavailable"), 1))
+	require.NoError(t, bs.RecordRetryFailure(ctx, victim, host, errors.New("xrpc 503 unavailable"), now.Add(-time.Hour)))
+
+	r, err := newRetryRunner(RetryConfig{
+		Store:       st,
+		Writer:      w,
+		HTTPClient:  srv.srv.Client(),
+		RelayURL:    srv.srv.URL,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Interval:    time.Hour,
+		Workers:     1,
+		HostWorkers: 1,
+		MaxDelay:    24 * time.Hour,
+		now:         func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.runPass(ctx))
+
+	segPath := filepath.Join(segmentsDir, ingest.SegmentFilename(0))
+	if _, statErr := os.Stat(segPath); statErr == nil {
+		require.Empty(t, collectActiveEvents(t, segPath), "a DID-mismatched CAR must not produce resync events")
+	}
+	rs, err := bs.readRepoStatus(victim)
+	require.NoError(t, err)
+	require.Equal(t, StatusFailed, rs.Backfill.Status)
+	require.Contains(t, rs.Backfill.LastError, "DID mismatch")
+	require.True(t, rs.Backfill.NextAttemptAt.After(now))
 }
 
 func TestRetryRunner_RateLimitParksHost(t *testing.T) {

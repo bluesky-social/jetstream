@@ -254,6 +254,12 @@ func (r *selectedRunner) tryRepo(ctx context.Context, did atmos.DID) (string, er
 	if err != nil {
 		return host, err
 	}
+	// Post-redirect PDS is untrusted; never archive a CAR whose commit
+	// identifies a different DID under the requested DID. Mirrors the atmos
+	// engine's check, which this debug path bypasses.
+	if rp.DID != did {
+		return host, fmt.Errorf("backfill: selected: getRepo DID mismatch: requested %s, CAR commit is %s", did, rp.DID)
+	}
 	if err := r.cfg.Handler.HandleRepo(ctx, did, rp, commit); err != nil {
 		return host, err
 	}

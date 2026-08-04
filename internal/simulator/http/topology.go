@@ -60,5 +60,5 @@ func (t pdsTopology) endpointForAccount(w *world.World, accountIdx int) string {
 	if !t.virtual {
 		return t.publicScheme + "://" + t.relayAuthority
 	}
-	return "http://" + t.hosts[w.PDSIndexForAccount(accountIdx)]
+	return t.publicScheme + "://" + t.hosts[w.PDSIndexForAccount(accountIdx)]
 }

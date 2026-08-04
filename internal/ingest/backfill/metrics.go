@@ -238,6 +238,28 @@ func (m *Metrics) observeHostState(host atmosbackfill.HostInfo, state atmosbackf
 	}
 }
 
+// finishEngine reconciles host-state gauges after the engine returns. A
+// cancellation (MaxRepos, shutdown, fatal) ends host managers without a
+// final OnHostState transition, which would otherwise leave running/backoff
+// hosts counted forever in hosts_total and engine_active_hosts.
+func (m *Metrics) finishEngine() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for host, state := range m.hostStates {
+		if state != string(atmosbackfill.HostStateRunning) && state != string(atmosbackfill.HostStateBackoff) {
+			continue
+		}
+		class := hostClass(host)
+		m.HostsTotal.WithLabelValues(state, class).Dec()
+		m.HostsTotal.WithLabelValues(string(atmosbackfill.HostStatePending), class).Inc()
+		m.hostStates[host] = string(atmosbackfill.HostStatePending)
+	}
+	m.EngineActiveHosts.Set(0)
+}
+
 func (m *Metrics) observeProgress(stats atmosbackfill.Stats) {
 	if m == nil {
 		return

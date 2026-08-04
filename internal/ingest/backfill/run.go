@@ -211,6 +211,7 @@ func Run(ctx context.Context, cfg Config) error {
 			"global_downloads", cfg.GlobalDownloads, "host_workers", cfg.HostWorkers,
 			"max_active_hosts", cfg.MaxActiveHosts, "batch_size", cfg.BackfillBatchSize)
 		err := atmosbackfill.NewEngine(engineOpts).Run(runCtx)
+		cfg.Metrics.finishEngine()
 		if err != nil && (!limited.Load() || !errors.Is(err, context.Canceled)) {
 			if fatal := loadFatal(); fatal != nil {
 				return fmt.Errorf("backfill: %w", fatal)
@@ -242,18 +243,18 @@ func traceHostState(ctx context.Context, host atmosbackfill.HostInfo, state atmo
 
 func NewHostClientBuilder(relayURL string, httpClient *http.Client) func(string) (*atmossync.Client, error) {
 	relayParsed, _ := url.Parse(relayURL)
+	// Everything except the loopback dev relay goes through atmos's default
+	// builder, which carries the SSRF hardening (strict initial-request
+	// protection + pinned-address guarded dialer). Building clients over
+	// httpClient here instead would silently discard those protections —
+	// injecting NewHostClient bypasses the engine's default entirely.
+	hardened := atmosbackfill.NewDefaultHostClientBuilder()
 	return func(hostname string) (*atmossync.Client, error) {
-		var hostURL string
 		if relayParsed != nil && relayParsed.Scheme == "http" && hostname == relayParsed.Host && isLoopbackHost(relayParsed.Hostname()) {
-			hostURL = "http://" + hostname
-		} else {
-			if err := atmosbackfill.ValidateHostname(hostname); err != nil {
-				return nil, err
-			}
-			hostURL = "https://" + strings.ToLower(hostname)
+			xc := &xrpc.Client{Host: "http://" + hostname, HTTPClient: gt.Some(httpClient), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}
+			return atmossync.NewClient(atmossync.Options{Client: xc}), nil
 		}
-		xc := &xrpc.Client{Host: hostURL, HTTPClient: gt.Some(httpClient), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}
-		return atmossync.NewClient(atmossync.Options{Client: xc}), nil
+		return hardened(hostname)
 	}
 }
 
