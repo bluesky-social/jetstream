@@ -74,12 +74,14 @@ point-in-time but structurally stable.
   (jellybaby, 1.14M relay-known) pinned at exactly its 20 rps getRepo cap
   (1.14M / 16h ≈ 19.8 rps). Wall-clock is bounded below by
   `max over hosts (true accountCount / 20 rps)` — scheduling cannot beat
-  per-host limits, it can only avoid wasting them. With true counts on old
-  mushrooms ~2-4x relay-known, expect the new full backfill to take roughly
-  the same to ~2x the wall clock while downloading ~2.4x the repos.
-  (Hypothesis to verify during the first run; the win is completeness, and
-  efficiency-per-hour improves because small hosts no longer finish early and
-  strand capacity behind the shuffle.)
+  per-host limits, it can only avoid wasting them. If the sampled 2-4x
+  relay-to-true ratio holds for jellybaby itself, the same arithmetic gives
+  **2-4x the current wall clock** (32-64h) while downloading ~2.4x the
+  repos; the long pole could also move to a different host whose true count
+  is unknown until the census runs. No tighter estimate is defensible before
+  step 15 measures the largest true host. (The win is completeness either
+  way, and efficiency-per-hour improves because small hosts no longer finish
+  early and strand capacity behind the shuffle.)
 - Some third-party hosts redirect (`atproto.brid.gy` → 301 → `bsky.brid.gy`);
   the client must follow redirects and attribute rate-limit state to the
   post-redirect host (atmos xrpc already does both).
@@ -198,8 +200,12 @@ type Options struct {
     // MaxActiveHosts bounds concurrently-running host loops (mostly the
     // producer-side listRepos sockets). None = 512.
     MaxActiveHosts gt.Option[int]
-    // MaxHosts caps the roster (untrusted input bound). Hosts beyond
-    // the cap are dropped with OnRosterCapped. None = 50_000.
+    // MaxHosts caps the roster (untrusted input bound). Hitting the cap
+    // stops listHosts pagination entirely (bounding work, not just
+    // memory) and fires OnRosterCapped. The cap is ~9x the observed
+    // network (5,772 hosts); consumers must treat OnRosterCapped /
+    // roster_cap_hits_total as an alert — a capped crawl is not a
+    // complete crawl. None = 50_000.
     MaxHosts gt.Option[int]
 
     // HostBackoffBase/Max and HostMaxAttempts govern host-level
@@ -249,6 +255,16 @@ type Store interface {
 }
 ```
 
+Deliberate scope note: the engine restores only `(cursor, drained)` across
+restarts. Attempt counts and backoff timers are *per-Run* state — a process
+restart intentionally resets a host's retry budget (a restart is an
+operator action; re-probing an exhausted host is desired, and §6.3 gives
+exhausted hosts another attempt anyway). The richer `PDSHost` fields
+(§6.1: Attempts, LastError, NextAttemptAt, State) are jetstream
+*diagnostics* fed by OnHostState/OnHostExhausted callbacks, not durable
+engine inputs. If cross-restart backoff continuity ever matters, that is a
+deliberate interface extension, not an oversight.
+
 Contract, mirroring today's cursor invariant: the engine calls
 `SaveHostCursor` only after every repo covered by that cursor reached a
 terminal state via `OnComplete`/`OnFail`. Durability semantics belong to the
@@ -272,11 +288,25 @@ relay accountCount, and seq.
 - **Terminal condition**: all hosts drained or exhausted, and one final
   listHosts re-list discovers no new eligible host. `Run` then returns nil:
   "the network as discoverable right now has been enumerated, and every
-  discovered repo reached a terminal state."
+  discovered repo reached a terminal state." **Caveat consumers must own:**
+  an exhausted host's repos were possibly never enumerated at all, so a nil
+  return with `Stats.HostsExhausted > 0` is a *degraded* completion. The
+  engine deliberately does not block or error on it (a permanently dead
+  host must not wedge bootstrap forever — Appendix B.6); the consumer
+  decides the policy. jetstream: alert on `hosts_total{state="exhausted"}`,
+  surface exhausted hosts on the status page, and re-attempt them in
+  merge-phase discovery (§6.3) and subsequent sweeps.
 - **Dedup across hosts**: a DID appearing on two hosts (migration windows)
-  downloads at most once — the second host's reconcile sees
-  `StateComplete` and skips. First-complete-wins is the accepted copy
-  policy (§3 non-goal 3).
+  downloads at most once per Run. Store-level `StateComplete` alone is
+  check-then-act and cannot carry this under concurrency, so the engine
+  keeps an in-process claims map: the first host's reconcile claims the
+  DID and dispatches; a concurrent second host gets a wait-only barrier
+  job whose batch (and therefore cursor) cannot complete until the owning
+  download reaches a terminal Store transition. A claim that resolves
+  non-terminally (owner aborted) fails the waiter's host attempt
+  retryably rather than letting its cursor skip the DID. Across Runs,
+  `Lookup`/`StateComplete` dedups as before. First-complete-wins is the
+  accepted copy policy (§3 non-goal 3).
 - The old 100k shuffle disappears: within a single host it has no
   load-spreading value, and cross-host spreading is now explicit.
 
@@ -296,9 +326,20 @@ each as adversarial, in the library so every consumer inherits it:
    relay.
 5. Response bounds: existing xrpc response caps + per-entry drop-don't-abort
    on malformed listRepos/listHosts entries, mirroring `ListRepos` today.
+   Honest consequence: a dropped listRepos entry is skipped and the page
+   cursor advances past it — if the malformation was transient corruption
+   rather than genuinely bad data, that repo is lost until a future
+   re-enumeration (fresh bootstrap, or a sweep from cursor ""). This is the
+   deliberate crash-loud vs drop-quiet split (Appendix B.2): aborting a
+   750-host crawl on one bad entry is worse. The engine surfaces every drop
+   via OnEntryError; jetstream must meter it (`list_entry_errors_total`)
+   and alert on non-trivial rates rather than treating drops as free.
 
-Open sub-question (§12): dial-time private-range guarding (resolve-then-
-check) in the default builder now, or syntax-level only in this change.
+Resolved during implementation: the default builder enables jttp's strict
+SSRF protection (`WithStrictSSRFProtection`), which resolves each initial
+hostname at dispatch and refuses loopback/private/link-local/metadata
+targets; jttp applies the same IP policy to every redirect hop by default.
+Syntax validation is the first gate, not the only one.
 
 ## 5. atmos work items (branch `jc/backfill` there)
 
@@ -374,13 +415,29 @@ for unknown DIDs (downloaded later by steady-state retry — preserving the
 resume from `LastNonEmptyCursor`, so the sweep is a few tail pages per host;
 new hosts enumerate from "". Exhausted hosts get one more attempt.
 
+Cursor-stability caveat: tail-resume assumes the PDS's creation-time
+ordering means new accounts appear after the stored cursor. That matches
+observed reference-PDS behavior but is not a lexicon guarantee (the cursor
+is formally opaque). Two mitigations: (a) accounts that migrated *onto* a
+host (created earlier elsewhere, so potentially inserted before the
+watermark) are also announced via live #sync/#identity events, which
+jetstream consumes independently; (b) if a host rejects a stored cursor
+(4xx), the sweep falls back to a full re-list from "" for that host —
+`Lookup` dedup makes that cheap in writes, just not in reads. A periodic
+from-"" deep sweep remains available as an operator action if drift is
+ever suspected.
+
 ### 6.4 Steady-state failed-repo retry (`retry.go`)
 
 Keeps its structure (global pool + per-host semaphores + parking). Changes:
 route each download via the DID's recorded `RepoStatus.PDS` using the atmos
 host-client builder (shared client cache), falling back to the relay
-redirect path when `PDS` is empty (rows from older dirs). Park/bucket on
-the roster hostname when present.
+redirect path when `PDS` is empty (rows from older dirs) **or when the
+recorded PDS authoritatively lacks the repo** (RepoNotFound / connection
+refused after host-level retries) — the relay 302 tracks migrations the
+stamp predates, and a success via the fallback re-stamps `PDS`. `#identity`
+events that carry a new PDS endpoint also update the stamp in steady state.
+Park/bucket on the roster hostname when present.
 
 ### 6.5 Configuration
 
@@ -520,6 +577,18 @@ listed extras).
 - **~1,800 concurrent hosts on day one**: MaxActiveHosts=512 + slots keep
   sockets/memory bounded; the shared Transport needs
   `MaxConnsPerHost`/idle tuning verified under load.
+- **Slots bound downloads, not end-to-end repo memory.** A worker releases
+  its global slot after download+parse but *before* Handler/OnComplete, so
+  the number of decoded repos held in memory is bounded by total workers,
+  not GlobalDownloads. With the realistic fleet (88 mushrooms at the
+  32-worker cap, ~1,700 small hosts at 1 worker) that's ~4,500 workers —
+  but a worker only holds a decoded repo while the Handler/Store call is
+  in flight, so sustained memory tracks Handler throughput, not worker
+  count. This is deliberate: scoping the slot around Handler would let a
+  stalled writer idle all download bandwidth. Step 15 must measure RSS and
+  goroutine count at defaults; if decoded-repo retention is a problem in
+  practice, the fix is a second (cheap) semaphore around parse→OnComplete,
+  not re-scoping the download slot.
 
 ## 12. Decisions log & remaining open questions
 
@@ -536,8 +605,10 @@ Decided (Jim, 2026-08-03):
 Remaining (implementing agent: use the stated default unless Jim says
 otherwise in review; none of these block starting):
 
-1. **Dial-time SSRF guard** (§4.4): default = syntax-level checks in this
-   change; resolve-then-check dial guard as a fast-follow in atmos.
+1. **Dial-time SSRF guard** (§4.4): resolved — shipped in this change via
+   jttp `WithStrictSSRFProtection` on the default host-client builder
+   (resolve-then-check on initial requests; redirect IP policy was already
+   on by default). No fast-follow needed.
 2. **GlobalDownloads default** (256): ship 256, tune from
    `download_slot_wait_seconds` on real hardware during step 15.
 3. **Banned hosts**: default-skip with `IncludeBannedHosts` opt-in.
