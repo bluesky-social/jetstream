@@ -27,8 +27,6 @@ require (
 	golang.org/x/sys v0.47.0
 )
 
-replace github.com/jcalabro/atmos => /home/jcalabro/go/src/github.com/jcalabro/atmos
-
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
