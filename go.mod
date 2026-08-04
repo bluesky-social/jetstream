@@ -10,7 +10,7 @@ require (
 	github.com/jcalabro/gloom v0.1.0
 	github.com/jcalabro/gt v0.0.14
 	github.com/jcalabro/jttp v0.0.6
-	github.com/klauspost/compress v1.19.0
+	github.com/klauspost/compress v1.19.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.70.0
