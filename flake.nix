@@ -57,6 +57,7 @@
               go
               pkgs.git
               pkgs.just
+              pkgs.file
               pkgs.docker-client
               golangci-lint
               pkgs.gotestsum

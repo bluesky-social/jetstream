@@ -20,10 +20,9 @@ vuln *ARGS="./...":
 modernize *ARGS="./...":
     modernize -fix -test {{ARGS}}
 
-# Build the jetstream binary into ./bin/jetstream, stamping build info
-# (version/commit/date) into internal/version via -ldflags, mirroring the
-# Dockerfile. VERSION comes from `git describe`; a dirty tree gets a -dirty
-# suffix on the commit.
+# Build static command binaries into ./bin, stamping build info
+# (version/commit/date) into internal/version via -ldflags. VERSION comes from
+# `git describe`; a dirty tree gets a -dirty suffix on the commit.
 build:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -34,11 +33,23 @@ build:
         commit="${commit}-dirty"
     fi
     date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    ldflags="-X ${pkg}.Version=${version} -X ${pkg}.Commit=${commit} -X ${pkg}.Date=${date}"
+    ldflags="-extldflags=-static -X ${pkg}.Version=${version} -X ${pkg}.Commit=${commit} -X ${pkg}.Date=${date}"
+    export CGO_ENABLED=0
     for cmd in ./cmd/*/; do
         name="$(basename "${cmd}")"
         go build -trimpath -ldflags "${ldflags}" -o "bin/${name}" "${cmd}"
     done
+
+    if [[ "$(go env GOOS)" == "linux" ]]; then
+        for cmd in ./cmd/*/; do
+            name="$(basename "${cmd}")"
+            description="$(LC_ALL=C file -b "bin/${name}")"
+            if [[ "${description}" != *"statically linked"* ]]; then
+                echo "build: bin/${name} is not statically linked: ${description}" >&2
+                exit 1
+            fi
+        done
+    fi
 
 # Build the Docker image locally, stamping the same build info as `just build`.
 # `--load` intentionally keeps this to one platform so the image can be run
