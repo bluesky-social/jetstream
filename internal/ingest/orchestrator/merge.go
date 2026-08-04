@@ -63,9 +63,6 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			if err := deleteMergeCursor(o.cfg.Store); err != nil {
 				return err
 			}
-			if err := backfill.DeleteBootstrapLastListReposCursor(o.cfg.Store); err != nil {
-				return err
-			}
 			return nil
 		} else if err != nil {
 			return fmt.Errorf("orchestrator: merge: stat live_segments: %w", err)
@@ -115,17 +112,18 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		// the synthetic sync + replacement rows land above any stale account
 		// tombstones that were replayed from live_segments.
 		if err := backfill.RunPendingRepoRetryPass(ctx, backfill.RetryConfig{
-			Store:       o.cfg.Store,
-			Writer:      dst,
-			HTTPClient:  o.cfg.HTTPClient,
-			RelayURL:    o.cfg.RelayURL,
-			Logger:      o.cfg.Logger,
-			Metrics:     o.cfg.BackfillMetrics,
-			DropMetrics: o.cfg.DropMetrics,
-			Interval:    o.cfg.FailedRepoRetryInterval,
-			Workers:     o.cfg.FailedRepoRetryWorkers,
-			HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
-			MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
+			Store:         o.cfg.Store,
+			Writer:        dst,
+			HTTPClient:    o.cfg.HTTPClient,
+			RelayURL:      o.cfg.RelayURL,
+			Logger:        o.cfg.Logger,
+			Metrics:       o.cfg.BackfillMetrics,
+			DropMetrics:   o.cfg.DropMetrics,
+			NewHostClient: o.cfg.BackfillNewHostClient,
+			Interval:      o.cfg.FailedRepoRetryInterval,
+			Workers:       o.cfg.FailedRepoRetryWorkers,
+			HostWorkers:   o.cfg.FailedRepoRetryHostWorkers,
+			MaxDelay:      o.cfg.FailedRepoRetryMaxDelay,
 		}); err != nil {
 			if cerr := dst.Close(); cerr != nil {
 				o.logger.WarnContext(ctx, "dst writer close after pending retry error", "err", cerr)
@@ -153,7 +151,8 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		}
 
 		if !o.cfg.SkipMergeDiscovery {
-			if err := runner.runDiscovery(ctx, o.cfg.RelayURL, o.cfg.HTTPClient); err != nil {
+			limits := discoveryLimits{maxHosts: o.cfg.BackfillMaxHosts, maxActiveHosts: o.cfg.BackfillMaxActiveHosts}
+			if err := runner.runDiscoveryWithClient(ctx, o.cfg.RelayURL, o.cfg.HTTPClient, o.cfg.BackfillNewHostClient, limits); err != nil {
 				return err
 			}
 		}
@@ -176,9 +175,6 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return fmt.Errorf("orchestrator: merge: sync data dir after backfill removal: %w", err)
 		}
 		if err := deleteMergeCursor(o.cfg.Store); err != nil {
-			return err
-		}
-		if err := backfill.DeleteBootstrapLastListReposCursor(o.cfg.Store); err != nil {
 			return err
 		}
 		if err := o.simulateCrash(ctx, crashpoint.AfterMergeCleanupComplete); err != nil {

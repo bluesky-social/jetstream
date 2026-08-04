@@ -8,15 +8,29 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
+	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/repo"
 )
 
 type completionBatcher struct {
-	mu         sync.Mutex
-	store      *Store
-	metrics    *Metrics
-	watermarks map[atmos.DID]completionWatermark
-	queued     []queuedCompletion
+	mu           sync.Mutex
+	store        *Store
+	metrics      *Metrics
+	watermarks   map[atmos.DID]completionWatermark
+	queued       []queuedCompletion
+	cursors      map[string]queuedHostCursor
+	nextCursorID uint64
+}
+
+type queuedHostCursor struct {
+	id           uint64
+	host         string
+	cursor       string
+	deps         map[atmos.DID]queuedCompletion
+	state        atmosbackfill.HostState
+	lastNonEmpty string
+	attempts     int
+	lastError    string
 }
 
 type completionWatermark struct {
@@ -37,7 +51,56 @@ func NewCompletionBatcher(st *Store, m *Metrics) *completionBatcher {
 		store:      st,
 		metrics:    m,
 		watermarks: make(map[atmos.DID]completionWatermark),
+		cursors:    make(map[string]queuedHostCursor),
 	}
+}
+
+// QueueHostCursor records a per-host checkpoint and the not-yet-durable repo
+// completions it covers. StageDurable only writes the cursor in a Pebble batch
+// that also makes every remaining dependency durable.
+func (b *completionBatcher) QueueHostCursor(ctx context.Context, host, cursor string) error {
+	return b.queueHostState(ctx, queuedHostCursor{host: host, cursor: cursor, state: atmosbackfill.HostStateRunning})
+}
+
+func (b *completionBatcher) QueueHostDrained(ctx context.Context, host, lastNonEmpty string) error {
+	return b.queueHostState(ctx, queuedHostCursor{host: host, state: atmosbackfill.HostStateDrained, lastNonEmpty: lastNonEmpty})
+}
+
+func (b *completionBatcher) QueueHostExhausted(ctx context.Context, host string, cause error, attempts int) error {
+	lastError := ""
+	if cause != nil {
+		lastError = truncateErrorString(cause.Error())
+	}
+	return b.queueHostState(ctx, queuedHostCursor{host: host, state: atmosbackfill.HostStateExhausted, attempts: attempts, lastError: lastError})
+}
+
+func (b *completionBatcher) queueHostState(ctx context.Context, next queuedHostCursor) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.nextCursorID++
+	deps := make(map[atmos.DID]queuedCompletion)
+	for _, completion := range b.queued {
+		if completion.host == next.host {
+			deps[completion.did] = completion
+		}
+	}
+	// An exhausted record replaces any not-yet-staged checkpoint for the
+	// host (the map is keyed by host). Carry that pending cursor forward so
+	// the checkpoint isn't silently dropped — its covered completions are
+	// still in b.queued and therefore in the deps recomputed above, so the
+	// cursor-never-leads invariant is preserved.
+	if next.state == atmosbackfill.HostStateExhausted && next.cursor == "" {
+		if prev, ok := b.cursors[next.host]; ok && prev.state == atmosbackfill.HostStateRunning {
+			next.cursor = prev.cursor
+		}
+	}
+	next.id = b.nextCursorID
+	next.deps = deps
+	b.cursors[next.host] = next
+	return nil
 }
 
 func (b *completionBatcher) RecordWatermark(did atmos.DID, lastSeq uint64, appended bool) {
@@ -113,12 +176,40 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batc
 				nextSeq, completion.did, completion.watermark.lastSeq)
 		}
 	}
+	stagedByDID := make(map[atmos.DID]queuedCompletion, len(staged))
+	for _, completion := range staged {
+		stagedByDID[completion.did] = completion
+	}
+	stagedCursors := make([]queuedHostCursor, 0, len(b.cursors))
+	for _, cursor := range b.cursors {
+		ready := true
+		for did, dep := range cursor.deps {
+			current, stillQueued := queuedCompletionForDID(b.queued, did)
+			if !stillQueued {
+				continue
+			}
+			stagedDep, included := stagedByDID[did]
+			if !included || !queuedCompletionEqual(dep, current) || !queuedCompletionEqual(dep, stagedDep) {
+				ready = false
+				break
+			}
+		}
+		if ready {
+			stagedCursors = append(stagedCursors, cursor)
+			continue
+		}
+		if force {
+			b.mu.Unlock()
+			b.metrics.incCompletionStageErrors()
+			return nil, nil, fmt.Errorf("backfill: forced durable batch cannot stage host cursor %s: covered completions are not durable", cursor.host)
+		}
+	}
 	b.mu.Unlock()
 
-	if len(staged) == 0 {
+	if len(staged) == 0 && len(stagedCursors) == 0 {
 		return nil, nil, nil
 	}
-	afterDone, err := b.store.stageCompleteBatch(ctx, batch, staged)
+	durableDone, err := b.store.stageDurableBatch(ctx, batch, staged, stagedCursors)
 	if err != nil {
 		b.metrics.incCompletionStageErrors()
 		return nil, nil, err
@@ -126,20 +217,38 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch *pebble.Batc
 
 	var once sync.Once
 	return func() {
-		once.Do(func() {
-			b.mu.Lock()
-			b.queued = removeQueuedCompletions(b.queued, staged)
-			b.metrics.setCompletionQueueDepth(len(b.queued))
-			b.mu.Unlock()
+			once.Do(func() {
+				b.mu.Lock()
+				b.queued = removeQueuedCompletions(b.queued, staged)
+				for _, cursor := range stagedCursors {
+					if current, ok := b.cursors[cursor.host]; ok && current.id == cursor.id {
+						delete(b.cursors, cursor.host)
+					}
+				}
+				b.metrics.setCompletionQueueDepth(len(b.queued))
+				b.mu.Unlock()
 
-			b.metrics.observeCompletionDurableBatch(len(staged))
-			now := timeNow()
-			for _, c := range staged {
-				b.metrics.observeCompletionQueueWait(now.Sub(c.completed))
-				b.metrics.incCompleted()
+				b.metrics.observeCompletionDurableBatch(len(staged))
+				now := timeNow()
+				for _, c := range staged {
+					b.metrics.observeCompletionQueueWait(now.Sub(c.completed))
+					b.metrics.incCompleted()
+				}
+			})
+		}, func(err error) {
+			if durableDone != nil {
+				durableDone(err)
 			}
-		})
-	}, afterDone, nil
+		}, nil
+}
+
+func queuedCompletionForDID(queued []queuedCompletion, did atmos.DID) (queuedCompletion, bool) {
+	for _, completion := range queued {
+		if completion.did == did {
+			return completion, true
+		}
+	}
+	return queuedCompletion{}, false
 }
 
 // removeQueuedCompletions drops from queued exactly the entries that were

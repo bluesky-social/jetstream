@@ -228,13 +228,29 @@ func serveCommand() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:    "backfill-workers",
-				Usage:   "Concurrent repo download workers for whole-network bootstrap backfill. 0 uses the production default.",
+				Usage:   "Deprecated and ignored; use the fleet concurrency flags.",
 				Sources: cli.EnvVars("JETSTREAM_BACKFILL_WORKERS"),
-				Value:   jetstreamd.DefaultBackfillWorkers,
+				Hidden:  true,
+			},
+			&cli.IntFlag{
+				Name: "backfill-global-downloads", Usage: "Fleet-wide in-flight direct-PDS getRepo limit.",
+				Sources: cli.EnvVars("JETSTREAM_BACKFILL_GLOBAL_DOWNLOADS"), Value: jetstreamd.DefaultBackfillGlobalDownloads,
+			},
+			&cli.IntFlag{
+				Name: "backfill-host-workers-max", Usage: "Maximum direct-PDS download workers per host.",
+				Sources: cli.EnvVars("JETSTREAM_BACKFILL_HOST_WORKERS_MAX"), Value: jetstreamd.DefaultBackfillHostWorkers,
+			},
+			&cli.IntFlag{
+				Name: "backfill-max-active-hosts", Usage: "Maximum concurrently active PDS listRepos loops.",
+				Sources: cli.EnvVars("JETSTREAM_BACKFILL_MAX_ACTIVE_HOSTS"), Value: jetstreamd.DefaultBackfillMaxActiveHosts,
+			},
+			&cli.IntFlag{
+				Name: "backfill-max-hosts", Usage: "Maximum accepted listHosts roster entries.",
+				Sources: cli.EnvVars("JETSTREAM_BACKFILL_MAX_HOSTS"), Value: jetstreamd.DefaultBackfillMaxHosts,
 			},
 			&cli.IntFlag{
 				Name:    "backfill-batch-size",
-				Usage:   "Number of listRepos entries accumulated before shuffling and dispatching a bootstrap backfill batch. 0 uses the production default.",
+				Usage:   "Per-host listRepos checkpoint granularity. 0 uses the production default.",
 				Sources: cli.EnvVars("JETSTREAM_BACKFILL_BATCH_SIZE"),
 				Value:   jetstreamd.DefaultBackfillBatchSize,
 			},
@@ -424,6 +440,10 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		ClientDrainTimeout:             cmd.Duration("client-drain-timeout"),
 		MaxBackfillRepos:               maxBackfillRepos,
 		BackfillWorkers:                cmd.Int("backfill-workers"),
+		BackfillGlobalDownloads:        cmd.Int("backfill-global-downloads"),
+		BackfillHostWorkers:            cmd.Int("backfill-host-workers-max"),
+		BackfillMaxActiveHosts:         cmd.Int("backfill-max-active-hosts"),
+		BackfillMaxHosts:               cmd.Int("backfill-max-hosts"),
 		BackfillBatchSize:              cmd.Int("backfill-batch-size"),
 		BackfillAsyncFlushWorkers:      cmd.Int("backfill-async-flush-workers"),
 		BackfillRepos:                  backfillRepos,

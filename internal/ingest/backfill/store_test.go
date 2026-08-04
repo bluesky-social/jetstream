@@ -960,3 +960,111 @@ func TestStore_HostAggregates_LatestFiveFailureSamples(t *testing.T) {
 	require.Contains(t, hs.RecentErrors[0].Error, "sample 6")
 	require.Contains(t, hs.RecentErrors[4].Error, "sample 2")
 }
+
+func TestStore_PDSHostTerminalCountsAreIdempotent(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hostname = "pds-state.example.com"
+	require.NoError(t, s.OnHost(ctx, atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active", RelayAccounts: 10}))
+
+	require.NoError(t, s.OnHostDrained(ctx, hostname, "cursor-9"))
+	require.NoError(t, s.OnHostDrained(ctx, hostname, "cursor-9"))
+	counts, ok, err := LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), counts.HostsDrained)
+	require.Zero(t, counts.HostsExhausted)
+
+	cause := errors.New("host remained unavailable")
+	require.NoError(t, s.OnHostExhausted(ctx, hostname, cause, 8))
+	require.NoError(t, s.OnHostExhausted(ctx, hostname, cause, 8))
+	counts, ok, err = LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Zero(t, counts.HostsDrained)
+	require.Equal(t, uint64(1), counts.HostsExhausted)
+
+	require.NoError(t, s.OnHostDrained(ctx, hostname, "cursor-10"))
+	counts, ok, err = LoadCounts(s.db)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), counts.HostsDrained)
+	require.Zero(t, counts.HostsExhausted)
+
+	host, exists, err := s.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.True(t, host.Enumerated)
+	require.Equal(t, string(atmosbackfill.HostStateDrained), host.State)
+	require.Equal(t, "cursor-10", host.LastNonEmptyCursor)
+	require.Empty(t, host.LastError)
+	require.Zero(t, host.Attempts)
+}
+
+func TestStore_ExhaustedHostDiscoveryResumesFromDurableCursor(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := t.Context()
+	const hostname = "pds-exhausted.example.com"
+	require.NoError(t, s.OnHost(ctx, atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
+	require.NoError(t, s.SaveHostCursor(ctx, hostname, "cursor-5000"))
+	require.NoError(t, s.OnHostExhausted(ctx, hostname, errors.New("host unavailable"), 8))
+
+	cursor, drained, err := s.HostDiscoveryCursor(ctx, hostname)
+	require.NoError(t, err)
+	require.False(t, drained)
+	require.Equal(t, "cursor-5000", cursor)
+}
+
+// TestStore_HostCursorsAreIsolatedPerHost pins per-host cursor key isolation:
+// saving one host's cursor must not touch another's, under both the direct
+// path and re-reads through HostCursor/HostDiscoveryCursor.
+func TestStore_HostCursorsAreIsolatedPerHost(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := t.Context()
+
+	want := map[string]string{
+		"pds-a.example.com": "cursor-a-5000",
+		"pds-b.example.com": "cursor-b-17",
+	}
+	for host, cursor := range want {
+		require.NoError(t, s.OnHost(ctx, atmosbackfill.HostInfo{Hostname: host, RelayStatus: "active"}))
+		require.NoError(t, s.SaveHostCursor(ctx, host, cursor))
+	}
+	for host, cursor := range want {
+		got, drained, err := s.HostCursor(ctx, host)
+		require.NoError(t, err)
+		require.False(t, drained)
+		require.Equal(t, cursor, got)
+	}
+
+	require.NoError(t, s.SaveHostCursor(ctx, "pds-a.example.com", "cursor-a-6000"))
+	got, _, err := s.HostCursor(ctx, "pds-b.example.com")
+	require.NoError(t, err)
+	require.Equal(t, "cursor-b-17", got, "saving host A's cursor must not disturb host B's")
+	got, drained, err := s.HostDiscoveryCursor(ctx, "pds-b.example.com")
+	require.NoError(t, err)
+	require.False(t, drained)
+	require.Equal(t, "cursor-b-17", got)
+}
+
+func TestStore_OnDiscoverAttributesValidatedRosterHostOnce(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hostname = "pds-discovery.example.com"
+	did := atmos.DID("did:plc:pds-attribution")
+	require.NoError(t, s.OnHost(ctx, atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "offline", RelayAccounts: 1}))
+	require.NoError(t, s.onDiscover(ctx, hostname, atmossync.ListReposEntry{DID: did, Active: true}))
+
+	rs, err := s.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, hostname, rs.PDS)
+	require.Equal(t, hostname, rs.Host)
+	host, exists, err := s.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(1), host.ActualAccounts)
+}

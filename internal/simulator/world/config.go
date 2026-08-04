@@ -15,10 +15,13 @@ var ErrDataDirReserved = errors.New("world: --data-dir cannot be ./data; use ./d
 
 // Config drives *World construction.
 type Config struct {
-	DataDir           string
-	Reset             bool
-	Seed              uint64
-	Accounts          int
+	DataDir  string
+	Reset    bool
+	Seed     uint64
+	Accounts int
+	// PDSHosts is the number of virtual PDSes that own Accounts. Zero uses
+	// the default four-host skewed topology.
+	PDSHosts          int
 	InitialRecords    int
 	InitialRecordsMin int
 	InitialRecordsMax int
@@ -61,6 +64,7 @@ func DefaultConfig() Config {
 		Reset:             false,
 		Seed:              42,
 		Accounts:          10000,
+		PDSHosts:          4,
 		InitialRecords:    0,
 		InitialRecordsMin: 0,
 		InitialRecordsMax: 1000,
@@ -93,6 +97,9 @@ func (c Config) validate() error {
 	}
 	if c.Accounts <= 0 {
 		return fmt.Errorf("world: Accounts must be > 0 (got %d)", c.Accounts)
+	}
+	if c.PDSHosts <= 0 {
+		return fmt.Errorf("world: PDSHosts must be > 0 (got %d)", c.PDSHosts)
 	}
 	if c.CommitsPerSec <= 0 {
 		return fmt.Errorf("world: CommitsPerSec must be > 0 (got %v)", c.CommitsPerSec)

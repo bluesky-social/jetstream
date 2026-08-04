@@ -1,8 +1,11 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -86,14 +89,9 @@ func TestMergeRunner_SourceIndexGap(t *testing.T) {
 	require.ErrorContains(t, err, "source index gap")
 }
 
-// TestMergeRunner_DiscoverySkipsWhenNoBootstrapCursor verifies the
-// no-op short-circuit in runDiscovery: when bootstrap_last_listrepos_cursor
-// is absent, runDiscovery returns nil without consulting the relay.
-//
-// This is the path a debug short-circuit run hits (MaxBackfillRepos
-// trips before listRepos pages past page 1, so MaybeSave never fires).
-// It must be a clean no-op or merge cannot complete on debug runs.
-func TestMergeRunner_DiscoverySkipsWhenNoBootstrapCursor(t *testing.T) {
+// TestMergeRunner_DiscoveryEmptyRoster verifies a relay with no known hosts
+// is a clean, fully-enumerated discover-only pass.
+func TestMergeRunner_DiscoveryEmptyRoster(t *testing.T) {
 	t.Parallel()
 	st := newOrchestratorTestStore(t)
 
@@ -113,10 +111,10 @@ func TestMergeRunner_DiscoverySkipsWhenNoBootstrapCursor(t *testing.T) {
 
 	r := newMergeRunner(dst, st, srcDir, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 
-	// If runDiscovery were to actually call out (via the xrpc client it
-	// would build internally), it would dereference the nil HTTPClient
-	// or fail to dial 127.0.0.1:1 immediately. The assertion that it
-	// returns nil proves the cursor-absent short-circuit fired before
-	// any network construction.
-	require.NoError(t, r.runDiscovery(t.Context(), "http://127.0.0.1:1", nil))
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		require.Equal(t, "/xrpc/com.atproto.sync.listHosts", req.URL.Path)
+		_ = json.NewEncoder(w).Encode(map[string]any{"hosts": []any{}})
+	}))
+	t.Cleanup(relay.Close)
+	require.NoError(t, r.runDiscovery(t.Context(), relay.URL, relay.Client()))
 }

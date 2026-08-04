@@ -53,6 +53,7 @@ type Metrics struct {
 	MergeDIDLookups                  prometheus.Counter
 	MergeRepoRevsUpdated             prometheus.Counter
 	MergeDIDsDiscoveredPostBootstrap prometheus.Counter
+	MergeDiscoveryHostsExhausted     prometheus.Counter
 
 	CompactionPasses            *prometheus.CounterVec
 	CompactionPassDuration      prometheus.Histogram
@@ -124,6 +125,11 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 		Name: "merge_dids_discovered_post_bootstrap_total",
 		Help: "DIDs first observed via the merge-phase listRepos resume and queued for steady-state retry.",
+	})
+	m.MergeDiscoveryHostsExhausted = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+		Name: "merge_discovery_hosts_exhausted_total",
+		Help: "PDS hosts the cutover discovery sweep could not enumerate; their unlisted DIDs are not marked for retry. Alert on nonzero.",
 	})
 	m.CompactionPasses = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
@@ -216,6 +222,7 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		m.MergeDIDLookups,
 		m.MergeRepoRevsUpdated,
 		m.MergeDIDsDiscoveredPostBootstrap,
+		m.MergeDiscoveryHostsExhausted,
 		m.CompactionPasses,
 		m.CompactionPassDuration,
 		m.CompactionEarlyPasses,
@@ -285,6 +292,12 @@ func (m *Metrics) addMergeRepoRevsUpdated(n int) {
 func (m *Metrics) incMergeDIDsDiscoveredPostBootstrap() {
 	if m != nil {
 		m.MergeDIDsDiscoveredPostBootstrap.Inc()
+	}
+}
+
+func (m *Metrics) incMergeDiscoveryHostsExhausted() {
+	if m != nil {
+		m.MergeDiscoveryHostsExhausted.Inc()
 	}
 }
 

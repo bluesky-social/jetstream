@@ -942,9 +942,41 @@ func assertBootstrapOracleMatches(t *testing.T, dataDir string, w *world.World, 
 	require.NoErrorf(t, err, "after-bootstrap mode=%s seed=%d: observe bootstrap segments", cfg.Mode, cfg.Seed)
 	got, err := Reconstruct(events)
 	require.NoErrorf(t, err, "after-bootstrap mode=%s seed=%d: reconstruct observed events", cfg.Mode, cfg.Seed)
+	assertRelayGapReposArchived(t, w, want, got, cfg)
 	require.NoErrorf(t, Compare(want, got), "after-bootstrap mode=%s seed=%d: compare oracle model", cfg.Mode, cfg.Seed)
 
 	t.Logf("after-bootstrap: oracle matched %d observed events in mode=%s seed=%d", len(events), cfg.Mode, cfg.Seed)
+}
+
+func assertRelayGapReposArchived(t *testing.T, w *world.World, want, got *Model, cfg Config) {
+	t.Helper()
+	gapDIDs := make([]string, 0)
+	for idx := range w.AccountCount() {
+		if w.RelayKnowsAccount(idx) {
+			continue
+		}
+		acct, err := w.LoadAccount(idx)
+		require.NoError(t, err)
+		if _, expected := want.Accounts[string(acct.DID)]; expected {
+			gapDIDs = append(gapDIDs, string(acct.DID))
+		}
+	}
+	require.NotEmptyf(t, gapDIDs,
+		"oracle world has no fetchable relay-gap repo: mode=%s seed=%d", cfg.Mode, cfg.Seed)
+	// Every fetchable gap DID must be archived, not just one: live-phase
+	// traffic can incidentally register an account in the model, but only
+	// direct per-PDS enumeration reaches all of them (and the full record
+	// contents are separately enforced by the Compare that follows this
+	// diagnostic — this assertion exists to fail with a clearer message).
+	missing := make([]string, 0)
+	for _, did := range gapDIDs {
+		if _, ok := got.Accounts[did]; !ok {
+			missing = append(missing, did)
+		}
+	}
+	require.Emptyf(t, missing,
+		"bootstrap failed to archive relay-gap repos; direct per-PDS discovery is not exercised: mode=%s seed=%d missing=%v",
+		cfg.Mode, cfg.Seed, missing)
 }
 
 func recordTraceOrError(t *testing.T, trace *Trace, kind string, data map[string]any) {

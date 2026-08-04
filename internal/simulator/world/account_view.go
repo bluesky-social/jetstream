@@ -148,6 +148,61 @@ func (w *World) LoadRepo(idx int) (*repo.Repo, *crypto.K256PrivateKey, error) {
 // AccountCount returns the total accounts in the world.
 func (w *World) AccountCount() int { return w.cfg.Accounts }
 
+// PDSHostCount returns the number of virtual PDSes in this world.
+func (w *World) PDSHostCount() int { return w.cfg.PDSHosts }
+
+// PDSIndexForAccount deterministically assigns an account to a virtual PDS.
+// Host zero receives roughly 60% of accounts (the "big mushroom"); the tail
+// is spread uniformly across the remaining hosts. The first host-count
+// accounts pin one account to each host so small oracle worlds still exercise
+// the full topology.
+func (w *World) PDSIndexForAccount(accountIdx int) int {
+	if w.cfg.PDSHosts == 1 {
+		return 0
+	}
+	if accountIdx >= 0 && accountIdx < w.cfg.PDSHosts {
+		return accountIdx
+	}
+	x := uint64(accountIdx) + w.cfg.Seed + 0x9e3779b97f4a7c15
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	x ^= x >> 31
+	if x%100 < 60 {
+		return 0
+	}
+	return 1 + int((x/100)%uint64(w.cfg.PDSHosts-1))
+}
+
+// VirtualPDSHostname is the stable hostname used by the in-process simulator.
+func VirtualPDSHostname(index int) string { return fmt.Sprintf("pds%d.sim.invalid", index) }
+
+// RelayKnowsAccount models the recreated relay's incomplete roster. Every
+// third account is absent, guaranteeing a relay gap while preserving a large
+// realistic subset for legacy relay-listRepos adversity tests.
+func (w *World) RelayKnowsAccount(accountIdx int) bool { return accountIdx%3 != 0 }
+
+// PDSAccountCount returns the authoritative direct-listRepos count for a host.
+func (w *World) PDSAccountCount(pdsIndex int) int {
+	count := 0
+	for i := range w.cfg.Accounts {
+		if w.PDSIndexForAccount(i) == pdsIndex {
+			count++
+		}
+	}
+	return count
+}
+
+// RelayAccountFloor returns the incomplete count advertised by listHosts.
+func (w *World) RelayAccountFloor(pdsIndex int) int {
+	count := 0
+	for i := range w.cfg.Accounts {
+		if w.PDSIndexForAccount(i) == pdsIndex && w.RelayKnowsAccount(i) {
+			count++
+		}
+	}
+	return count
+}
+
 // ListReposEntry is one row of a listRepos response.
 type ListReposEntry struct {
 	DID    atmos.DID
@@ -160,6 +215,40 @@ type ListReposEntry struct {
 // nextStart is start + len(entries); when nextStart == AccountCount(),
 // the caller has paged through everything.
 func (w *World) ListReposPage(start, limit int) (entries []ListReposEntry, nextStart int, err error) {
+	indices := make([]int, w.cfg.Accounts)
+	for i := range indices {
+		indices[i] = i
+	}
+	return w.listReposPageFromIndices(indices, start, limit)
+}
+
+// ListReposPageForPDS pages one host's authoritative roster. start and the
+// returned nextStart are ordinals in that host's own cursor space.
+func (w *World) ListReposPageForPDS(pdsIndex, start, limit int) ([]ListReposEntry, int, error) {
+	if pdsIndex < 0 || pdsIndex >= w.cfg.PDSHosts {
+		return nil, 0, fmt.Errorf("world: PDS index %d out of range", pdsIndex)
+	}
+	indices := make([]int, 0, w.PDSAccountCount(pdsIndex))
+	for i := range w.cfg.Accounts {
+		if w.PDSIndexForAccount(i) == pdsIndex {
+			indices = append(indices, i)
+		}
+	}
+	return w.listReposPageFromIndices(indices, start, limit)
+}
+
+// RelayListReposPage pages only the relay-known subset.
+func (w *World) RelayListReposPage(start, limit int) ([]ListReposEntry, int, error) {
+	indices := make([]int, 0, w.cfg.Accounts*2/3)
+	for i := range w.cfg.Accounts {
+		if w.RelayKnowsAccount(i) {
+			indices = append(indices, i)
+		}
+	}
+	return w.listReposPageFromIndices(indices, start, limit)
+}
+
+func (w *World) listReposPageFromIndices(indices []int, start, limit int) (entries []ListReposEntry, nextStart int, err error) {
 	if start < 0 {
 		start = 0
 	}
@@ -169,18 +258,19 @@ func (w *World) ListReposPage(start, limit int) (entries []ListReposEntry, nextS
 	if limit <= 0 {
 		limit = 50
 	}
-	end := min(start+limit, w.cfg.Accounts)
+	start = min(start, len(indices))
+	end := min(start+limit, len(indices))
 	out := make([]ListReposEntry, 0, end-start)
-	for i := start; i < end; i++ {
-		a, err := w.LoadAccount(i)
+	for _, accountIdx := range indices[start:end] {
+		a, err := w.LoadAccount(accountIdx)
 		if err != nil {
 			return nil, 0, err
 		}
-		state, err := w.loadState(i)
+		state, err := w.loadState(accountIdx)
 		if err != nil {
 			return nil, 0, err
 		}
-		deleted, err := w.isAccountDeleted(i)
+		deleted, err := w.isAccountDeleted(accountIdx)
 		if err != nil {
 			return nil, 0, err
 		}

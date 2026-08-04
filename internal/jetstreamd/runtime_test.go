@@ -85,13 +85,22 @@ func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
 	require.ErrorContains(t, err, "SegmentCacheMaxAge must be >= 0")
 }
 
-func TestOptionsValidateRejectsNegativeBackfillWorkers(t *testing.T) {
+func TestOptionsValidateRejectsNegativeBackfillFleetLimits(t *testing.T) {
 	t.Parallel()
 
-	opts := testOptions(t)
-	opts.BackfillWorkers = -1
-	_, err := Build(t.Context(), opts)
-	require.ErrorContains(t, err, "BackfillWorkers must be >= 0")
+	for name, mutate := range map[string]func(*Options){
+		"global downloads": func(o *Options) { o.BackfillGlobalDownloads = -1 },
+		"host workers":     func(o *Options) { o.BackfillHostWorkers = -1 },
+		"active hosts":     func(o *Options) { o.BackfillMaxActiveHosts = -1 },
+		"roster cap":       func(o *Options) { o.BackfillMaxHosts = -1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := testOptions(t)
+			mutate(&opts)
+			_, err := Build(t.Context(), opts)
+			require.ErrorContains(t, err, "must be >= 0")
+		})
+	}
 }
 
 func TestOptionsValidateRejectsNegativeBackfillBatchSize(t *testing.T) {

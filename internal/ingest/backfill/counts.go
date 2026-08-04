@@ -11,12 +11,14 @@ import (
 
 // Counts is the per-status row count produced by CountStatuses.
 type Counts struct {
-	Total       uint64 `json:"total"`
-	Discovered  uint64 `json:"discovered"`
-	Pending     uint64 `json:"pending"`
-	Complete    uint64 `json:"complete"`
-	Failed      uint64 `json:"failed"`
-	Unavailable uint64 `json:"unavailable"`
+	Total          uint64 `json:"total"`
+	Discovered     uint64 `json:"discovered"`
+	Pending        uint64 `json:"pending"`
+	Complete       uint64 `json:"complete"`
+	Failed         uint64 `json:"failed"`
+	Unavailable    uint64 `json:"unavailable"`
+	HostsDrained   uint64 `json:"hosts_drained,omitempty"`
+	HostsExhausted uint64 `json:"hosts_exhausted,omitempty"`
 }
 
 const countsKey = "backfill/counts"

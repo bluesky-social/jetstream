@@ -70,8 +70,12 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 5*time.Second, opts.ShutdownTimeout)
 	require.Equal(t, 10*time.Second, opts.ClientDrainTimeout)
 	require.Equal(t, 0, opts.MaxBackfillRepos)
-	require.Equal(t, 100, opts.BackfillWorkers)
-	require.Equal(t, 100_000, opts.BackfillBatchSize)
+	require.Zero(t, opts.BackfillWorkers)
+	require.Equal(t, jetstreamd.DefaultBackfillGlobalDownloads, opts.BackfillGlobalDownloads)
+	require.Equal(t, jetstreamd.DefaultBackfillHostWorkers, opts.BackfillHostWorkers)
+	require.Equal(t, jetstreamd.DefaultBackfillMaxActiveHosts, opts.BackfillMaxActiveHosts)
+	require.Equal(t, jetstreamd.DefaultBackfillMaxHosts, opts.BackfillMaxHosts)
+	require.Equal(t, jetstreamd.DefaultBackfillBatchSize, opts.BackfillBatchSize)
 	require.Equal(t, 4, opts.BackfillAsyncFlushWorkers)
 	require.Empty(t, opts.BackfillRepos)
 	require.False(t, opts.SkipMergeDiscovery)
@@ -200,6 +204,10 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--shutdown-timeout=45s",
 		"--client-drain-timeout=11s",
 		"--backfill-workers=17",
+		"--backfill-global-downloads=19",
+		"--backfill-host-workers-max=7",
+		"--backfill-max-active-hosts=23",
+		"--backfill-max-hosts=456",
 		"--backfill-batch-size=12345",
 		"--backfill-async-flush-workers=4",
 		"--backfill-repos=did:plc:aaa, did:plc:bbb",
@@ -240,6 +248,10 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 11*time.Second, opts.ClientDrainTimeout)
 	require.Equal(t, 0, opts.MaxBackfillRepos)
 	require.Equal(t, 17, opts.BackfillWorkers)
+	require.Equal(t, 19, opts.BackfillGlobalDownloads)
+	require.Equal(t, 7, opts.BackfillHostWorkers)
+	require.Equal(t, 23, opts.BackfillMaxActiveHosts)
+	require.Equal(t, 456, opts.BackfillMaxHosts)
 	require.Equal(t, 12345, opts.BackfillBatchSize)
 	require.Equal(t, 4, opts.BackfillAsyncFlushWorkers)
 	require.Equal(t, []atmos.DID{"did:plc:aaa", "did:plc:bbb"}, opts.BackfillRepos)
@@ -289,6 +301,10 @@ func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
 	}
 
 	t.Setenv("JETSTREAM_BACKFILL_WORKERS", "33")
+	t.Setenv("JETSTREAM_BACKFILL_GLOBAL_DOWNLOADS", "44")
+	t.Setenv("JETSTREAM_BACKFILL_HOST_WORKERS_MAX", "6")
+	t.Setenv("JETSTREAM_BACKFILL_MAX_ACTIVE_HOSTS", "55")
+	t.Setenv("JETSTREAM_BACKFILL_MAX_HOSTS", "999")
 	t.Setenv("JETSTREAM_BACKFILL_BATCH_SIZE", "76543")
 	t.Setenv("JETSTREAM_BACKFILL_ASYNC_FLUSH_WORKERS", "5")
 	t.Setenv("JETSTREAM_FAILED_REPO_RETRY_INTERVAL", "3h")
@@ -298,6 +314,10 @@ func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
 
 	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
 	require.Equal(t, 33, opts.BackfillWorkers)
+	require.Equal(t, 44, opts.BackfillGlobalDownloads)
+	require.Equal(t, 6, opts.BackfillHostWorkers)
+	require.Equal(t, 55, opts.BackfillMaxActiveHosts)
+	require.Equal(t, 999, opts.BackfillMaxHosts)
 	require.Equal(t, 76543, opts.BackfillBatchSize)
 	require.Equal(t, 5, opts.BackfillAsyncFlushWorkers)
 	require.Equal(t, 3*time.Hour, opts.FailedRepoRetryInterval)
@@ -449,6 +469,12 @@ func TestServe_BootstrapsAndShutsDownCleanly(t *testing.T) {
 			}
 			defer func() { _ = conn.CloseNow() }()
 			<-r.Context().Done()
+			return
+		}
+		if r.URL.Path == "/xrpc/com.atproto.sync.listHosts" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"hosts": []map[string]any{{
+				"hostname": r.Host, "status": "active", "accountCount": len(dids),
+			}}})
 			return
 		}
 		require.Equal(t, "/xrpc/com.atproto.sync.listRepos", r.URL.Path)

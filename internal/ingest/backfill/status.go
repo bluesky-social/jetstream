@@ -2,9 +2,12 @@ package backfill
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 )
 
@@ -12,10 +15,80 @@ import (
 // §3.5 pins this layout so the on-disk format is stable across
 // replicas.
 const repoKeyPrefix = "repo/"
+const pdsHostKeyPrefix = "pdshost/"
 
 // repoKey returns the pebble key for a DID's RepoStatus row.
 func repoKey(did atmos.DID) []byte {
 	return []byte(repoKeyPrefix + string(did))
+}
+
+func pdsHostKey(hostname string) []byte { return []byte(pdsHostKeyPrefix + hostname) }
+
+// PDSHost is the durable control-plane roster row for one listHosts entry.
+// RelayAccounts is only a relay-observed floor. ActualAccounts counts DIDs
+// first discovered on this host during a crawl; migration-window duplicates
+// already attributed to another host are deliberately not double-counted.
+type PDSHost struct {
+	Hostname           string    `json:"hostname"`
+	RelayStatus        string    `json:"relay_status,omitempty"`
+	RelayAccounts      int64     `json:"relay_accounts,omitempty"`
+	Seq                int64     `json:"seq,omitempty"`
+	ListReposCursor    string    `json:"list_repos_cursor,omitempty"`
+	LastNonEmptyCursor string    `json:"last_non_empty_cursor,omitempty"`
+	Enumerated         bool      `json:"enumerated"`
+	ActualAccounts     uint64    `json:"actual_accounts,omitempty"`
+	Attempts           int       `json:"attempts,omitempty"`
+	LastError          string    `json:"last_error,omitempty"`
+	NextAttemptAt      time.Time `json:"next_attempt_at,omitzero"`
+	State              string    `json:"state,omitempty"`
+	FirstSeenAt        time.Time `json:"first_seen_at,omitzero"`
+	UpdatedAt          time.Time `json:"updated_at,omitzero"`
+}
+
+func encodePDSHost(host *PDSHost) ([]byte, error) {
+	b, err := json.Marshal(host)
+	if err != nil {
+		return nil, fmt.Errorf("backfill: encode PDSHost: %w", err)
+	}
+	return b, nil
+}
+
+func decodePDSHost(b []byte) (*PDSHost, error) {
+	var host PDSHost
+	if err := json.Unmarshal(b, &host); err != nil {
+		return nil, fmt.Errorf("backfill: decode PDSHost: %w", err)
+	}
+	return &host, nil
+}
+
+// ListPDSHosts returns the durable control-plane roster ordered by hostname.
+// A malformed row is Jetstream-owned metadata corruption and aborts the scan.
+func ListPDSHosts(db *store.Store) ([]PDSHost, error) {
+	prefix := []byte(pdsHostKeyPrefix)
+	it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	if err != nil {
+		return nil, fmt.Errorf("backfill: open PDS roster: %w", err)
+	}
+	defer func() { _ = it.Close() }()
+	var hosts []PDSHost
+	for it.First(); it.Valid(); it.Next() {
+		value, err := it.ValueAndErr()
+		if err != nil {
+			return nil, fmt.Errorf("backfill: read PDS roster: %w", err)
+		}
+		host, err := decodePDSHost(value)
+		if err != nil {
+			return nil, err
+		}
+		if host.Hostname == "" {
+			host.Hostname = string(it.Key()[len(prefix):])
+		}
+		hosts = append(hosts, *host)
+	}
+	if err := it.Error(); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, fmt.Errorf("backfill: iterate PDS roster: %w", err)
+	}
+	return hosts, nil
 }
 
 // Status is the lifecycle state of a single DID's initial backfill.

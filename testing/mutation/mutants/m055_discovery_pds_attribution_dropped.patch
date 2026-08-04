@@ -1,0 +1,21 @@
+mutant: m055_discovery_pds_attribution_dropped
+target: internal/ingest/backfill/store.go
+failure-mode: |
+  OnDiscover drops the validated roster hostname from RepoStatus.PDS. Initial
+  download still succeeds, but post-bootstrap retries lose direct routing and
+  fall back to the relay, reintroducing an avoidable dependency and incorrect
+  per-host parking attribution.
+expected-detection: |
+  The pdsbackfill tier's TestStore_OnDiscoverAttributesValidatedRosterHostOnce
+  requires the exact roster hostname in RepoStatus.PDS and its control-plane
+  account attribution. The multi-PDS integration also checks direct routing and
+  persisted roster identity.
+expected-tier: pdsbackfill
+tiers: pdsbackfill
+
+diff --git a/internal/ingest/backfill/store.go b/internal/ingest/backfill/store.go
+--- a/internal/ingest/backfill/store.go
++++ b/internal/ingest/backfill/store.go
+@@ -873 +873 @@ func (s *Store) onDiscover(_ context.Context, host string, entry atmossync.ListReposEntry) error {
+-		PDS: host, Host: bucket, Active: entry.Active,
++		PDS: "", Host: bucket, Active: entry.Active,

@@ -34,12 +34,13 @@ const (
 )
 
 type RetryConfig struct {
-	Store      *store.Store
-	Writer     *ingest.Writer
-	HTTPClient *http.Client
-	RelayURL   string
-	Logger     *slog.Logger
-	Metrics    *Metrics
+	Store         *store.Store
+	Writer        *ingest.Writer
+	HTTPClient    *http.Client
+	RelayURL      string
+	Logger        *slog.Logger
+	Metrics       *Metrics
+	NewHostClient func(string) (*atmossync.Client, error)
 
 	// DropMetrics is the shared ingest validation-drop counter family,
 	// forwarded to the SegmentHandler. Optional.
@@ -72,8 +73,12 @@ type RetryConfig struct {
 }
 
 type retryCandidate struct {
-	DID   atmos.DID
+	DID atmos.DID
+	// Host is the concurrency/parking attribution key. PDS is the validated
+	// direct-routing hostname; empty PDS deliberately falls back to RelayURL
+	// for rows written before discovery-time PDS stamping existed.
 	Host  string
+	PDS   string
 	Retry int
 }
 
@@ -83,9 +88,11 @@ type retryRunner struct {
 	handler    *SegmentHandler
 	store      *Store
 
-	hostMu     sync.Mutex
-	hostLimit  map[string]chan struct{}
-	hostParked map[string]time.Time
+	hostMu      sync.Mutex
+	hostLimit   map[string]chan struct{}
+	hostParked  map[string]time.Time
+	clientMu    sync.Mutex
+	hostClients map[string]*atmossync.Client
 }
 
 func RunFailedRepoRetry(ctx context.Context, cfg RetryConfig) error {
@@ -165,6 +172,9 @@ func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
 	if cfg.jitter == nil {
 		cfg.jitter = rand.Int64N
 	}
+	if cfg.NewHostClient == nil {
+		cfg.NewHostClient = NewHostClientBuilder(cfg.RelayURL, cfg.HTTPClient)
+	}
 
 	xc := &xrpc.Client{
 		Host:       cfg.RelayURL,
@@ -178,12 +188,13 @@ func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
 	handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
 	handler.SetDropMetrics(cfg.DropMetrics)
 	return &retryRunner{
-		cfg:        cfg,
-		syncClient: atmossync.NewClient(atmossync.Options{Client: xc}),
-		handler:    handler,
-		store:      st,
-		hostLimit:  make(map[string]chan struct{}),
-		hostParked: make(map[string]time.Time),
+		cfg:         cfg,
+		syncClient:  atmossync.NewClient(atmossync.Options{Client: xc}),
+		handler:     handler,
+		store:       st,
+		hostLimit:   make(map[string]chan struct{}),
+		hostParked:  make(map[string]time.Time),
+		hostClients: make(map[string]*atmossync.Client),
 	}, nil
 }
 
@@ -272,11 +283,18 @@ func (r *retryRunner) scanDue(ctx context.Context, now time.Time, yield func(ret
 		if err != nil {
 			return fmt.Errorf("backfill: retry: invalid repo key %q: %w", string(it.Key()), err)
 		}
+		// Routing uses PDS; parking/concurrency attribution prefers rs.Host,
+		// which a fallback failure updates to the actually-responding host
+		// (for direct rows they are the same bucket, so this is a no-op).
+		pds := rs.PDS
 		host := rs.Host
+		if host == "" {
+			host = pds
+		}
 		if host == "" {
 			host = failedRepoRetryUnknownHost
 		}
-		if err := yield(retryCandidate{DID: did, Host: host, Retry: rs.Backfill.RetryCount}); err != nil {
+		if err := yield(retryCandidate{DID: did, Host: host, PDS: pds, Retry: rs.Backfill.RetryCount}); err != nil {
 			return err
 		}
 	}
@@ -302,7 +320,7 @@ func (r *retryRunner) processCandidate(ctx context.Context, cand retryCandidate)
 	}
 
 	r.cfg.Metrics.incRetryAttempts()
-	host, err := r.tryRepo(ctx, cand.DID)
+	host, viaFallback, err := r.tryRepo(ctx, cand)
 	if err == nil {
 		r.cfg.Metrics.incRetrySucceeded()
 		return nil
@@ -315,9 +333,25 @@ func (r *retryRunner) processCandidate(ctx context.Context, cand retryCandidate)
 	}
 
 	next := r.nextAttemptAt(err, cand.Retry)
-	failHost := retryFailureHost(cand.Host, host)
+	// Direct attempts park/record under the roster hostname — that is the
+	// key candidates are scanned and parked by, so parking anything else
+	// would not suppress same-host work. A failure after a relay fallback,
+	// though, came from a different host than the (stale) stamp: attribute
+	// it to the responding host so the genuinely rate-limited PDS parks
+	// instead of the stamp.
+	failHost := cand.PDS
+	if failHost == "" || viaFallback {
+		failHost = retryFailureHost(cand.Host, host)
+	}
 	if xrpc.IsRateLimited(err) {
 		r.parkHost(failHost, next)
+		// cand.Host is the key candidates were scanned and gated under; when
+		// it differs from the failure bucket (stale stamp vs responding host,
+		// in either direction), park it too so queued same-set candidates
+		// defer instead of continuing into the rate-limited upstream.
+		if cand.Host != "" && cand.Host != failHost {
+			r.parkHost(cand.Host, next)
+		}
 	}
 	if storeErr := r.store.RecordRetryFailure(ctx, cand.DID, failHost, err, next); storeErr != nil {
 		return storeErr
@@ -331,21 +365,39 @@ func (r *retryRunner) processCandidate(ctx context.Context, cand retryCandidate)
 	return nil
 }
 
-func (r *retryRunner) tryRepo(ctx context.Context, did atmos.DID) (string, error) {
-	rp, commit, host, err := r.download(ctx, did)
+func (r *retryRunner) tryRepo(ctx context.Context, cand retryCandidate) (string, bool, error) {
+	rp, commit, host, viaFallback, err := r.download(ctx, cand)
 	if err != nil {
-		return host, err
+		return host, viaFallback, err
 	}
-	if err := r.handler.HandleRepoResync(ctx, did, rp, commit); err != nil {
-		return host, err
+	if err := r.handler.HandleRepoResync(ctx, cand.DID, rp, commit); err != nil {
+		return host, viaFallback, err
 	}
 	if err := r.cfg.Writer.DrainDurability(ctx); err != nil {
-		return host, fmt.Errorf("backfill: retry: drain durable repo rows: %w", err)
+		return host, viaFallback, fmt.Errorf("backfill: retry: drain durable repo rows: %w", err)
 	}
-	if err := r.store.OnComplete(ctx, did, host, commit); err != nil {
-		return host, fmt.Errorf("backfill: retry: complete repo: %w", err)
+	completionHost := cand.PDS
+	if completionHost == "" || viaFallback {
+		// Fallback success means the recorded PDS was stale (migration):
+		// attribute completion to the host that actually served the CAR.
+		completionHost = host
 	}
-	return host, nil
+	if viaFallback && completionHost != "" && completionHost != cand.PDS {
+		// Repair the routing stamp so future passes go direct to the host
+		// that actually serves this repo instead of re-walking the fallback.
+		if bucket, ok := hostBucketFromAuthority(completionHost); ok {
+			// "complete repo" keeps this inside isLocalRetryError: a local
+			// metadata-write failure after durable ingestion must abort the
+			// pass, not be recorded as an upstream failure and re-ingested.
+			if err := r.store.updateRepoHostActive(cand.DID, bucket, true); err != nil {
+				return host, viaFallback, fmt.Errorf("backfill: retry: complete repo: restamp PDS: %w", err)
+			}
+		}
+	}
+	if err := r.store.OnComplete(ctx, cand.DID, completionHost, commit); err != nil {
+		return host, viaFallback, fmt.Errorf("backfill: retry: complete repo: %w", err)
+	}
+	return host, viaFallback, nil
 }
 
 // download fetches and parses one repo under the per-attempt
@@ -358,7 +410,7 @@ func (r *retryRunner) tryRepo(ctx context.Context, did atmos.DID) (string, error
 // records it as an ordinary retry failure with backoff, same as any
 // transport error. Mirrors atmos backfill.Engine.download, which the
 // retry runner bypasses.
-func (r *retryRunner) download(ctx context.Context, did atmos.DID) (*atmosrepo.Repo, *atmosrepo.Commit, string, error) {
+func (r *retryRunner) download(ctx context.Context, cand retryCandidate) (*atmosrepo.Repo, *atmosrepo.Commit, string, bool, error) {
 	dlCtx := ctx
 	if r.cfg.DownloadTimeout > 0 {
 		var cancel context.CancelFunc
@@ -366,9 +418,27 @@ func (r *retryRunner) download(ctx context.Context, did atmos.DID) (*atmosrepo.R
 		defer cancel()
 	}
 
-	body, host, err := r.syncClient.GetRepoStreamHost(dlCtx, did, "")
+	viaFallback := cand.PDS == ""
+	client, err := r.clientForHost(cand.PDS)
 	if err != nil {
-		return nil, nil, host, r.classifyDownloadErr(dlCtx, ctx, err)
+		// An unroutable stamp (validation failure, builder error) must not
+		// permanently strand the DID: fall back to the relay's 302, which
+		// tracks the current PDS.
+		viaFallback = true
+		client = r.syncClient
+	}
+	body, host, err := client.GetRepoStreamHost(dlCtx, cand.DID, "")
+	if err != nil && !viaFallback && isRepoNotFoundError(err) {
+		// The stamped PDS authoritatively lacks the repo — a stale stamp
+		// from a pre-migration discovery. The relay redirect tracks the
+		// account's current PDS; on success tryRepo re-stamps. Without
+		// this, RecordRetryFailure would treat the direct RepoNotFound as
+		// terminal and mark an undownloaded migrated repo complete.
+		viaFallback = true
+		body, host, err = r.syncClient.GetRepoStreamHost(dlCtx, cand.DID, "")
+	}
+	if err != nil {
+		return nil, nil, host, viaFallback, r.classifyDownloadErr(dlCtx, ctx, err)
 	}
 	defer func() { _ = body.Close() }()
 
@@ -379,9 +449,35 @@ func (r *retryRunner) download(ctx context.Context, did atmos.DID) (*atmosrepo.R
 	// pass re-defers the DID rather than completing it on a partial repo.
 	rp, commit, err := atmosrepo.LoadCompleteFromCAR(bufio.NewReader(body))
 	if err != nil {
-		return nil, nil, host, r.classifyDownloadErr(dlCtx, ctx, err)
+		return nil, nil, host, viaFallback, r.classifyDownloadErr(dlCtx, ctx, err)
 	}
-	return rp, commit, host, nil
+	// The retry path routes directly to untrusted PDSes and bypasses the
+	// atmos engine (which performs this same check): a CAR whose commit
+	// identifies a different DID must not be resynced under cand.DID.
+	if rp.DID != cand.DID {
+		return nil, nil, host, viaFallback, fmt.Errorf("backfill: retry: getRepo DID mismatch: requested %s, CAR commit is %s", cand.DID, rp.DID)
+	}
+	return rp, commit, host, viaFallback, nil
+}
+
+func (r *retryRunner) clientForHost(host string) (*atmossync.Client, error) {
+	if host == "" || host == failedRepoRetryUnknownHost {
+		return r.syncClient, nil
+	}
+	r.clientMu.Lock()
+	defer r.clientMu.Unlock()
+	if client := r.hostClients[host]; client != nil {
+		return client, nil
+	}
+	client, err := r.cfg.NewHostClient(host)
+	if err != nil {
+		return nil, fmt.Errorf("backfill: retry: build PDS client %s: %w", host, err)
+	}
+	if client == nil {
+		return nil, fmt.Errorf("backfill: retry: build PDS client %s: returned nil client", host)
+	}
+	r.hostClients[host] = client
+	return client, nil
 }
 
 // classifyDownloadErr annotates a download failure caused by OUR

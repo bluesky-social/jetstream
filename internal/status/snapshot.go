@@ -85,17 +85,36 @@ type PhaseInfo struct {
 
 // BackfillStats summarizes the repo/ keyspace.
 type BackfillStats struct {
-	TotalDIDs       uint64
-	Discovered      uint64
-	Pending         uint64
-	Complete        uint64
-	Failed          uint64
-	Unavailable     uint64
-	PercentComplete float64
-	ListReposCursor string
-	StartedAt       time.Time
-	CompletedAt     time.Time
-	Duration        time.Duration
+	TotalDIDs          uint64
+	Discovered         uint64
+	Pending            uint64
+	Complete           uint64
+	Failed             uint64
+	Unavailable        uint64
+	PercentComplete    float64
+	StartedAt          time.Time
+	CompletedAt        time.Time
+	Duration           time.Duration
+	HostsTotal         uint64
+	HostsDrained       uint64
+	HostsExhausted     uint64
+	HostsInFlight      uint64
+	RelayAccountFloor  uint64
+	EnumeratedAccounts uint64
+	TopRemainingHosts  []BackfillHostRow
+}
+
+// BackfillHostRow is one control-plane roster row selected for the backfill
+// summary. RemainingEstimate is floor-based and may be zero before drain when
+// the PDS contains more repos than the relay knew about.
+type BackfillHostRow struct {
+	Hostname           string
+	State              string
+	RelayAccounts      uint64
+	EnumeratedAccounts uint64
+	RemainingEstimate  uint64
+	Attempts           int
+	LastError          string
 }
 
 // HostDiagnostics is the host/PDS aggregate table.

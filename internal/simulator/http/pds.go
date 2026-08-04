@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/jcalabro/atmos"
@@ -14,13 +15,23 @@ import (
 // bytes straight to the response. Ignores `since` in v1 — always
 // returns the full repo (which is valid behavior; consumers can
 // request diffs but aren't required to).
-func newPDSGetRepoHandler(w *world.World, faults *FaultPlan, onServed func(did string)) http.Handler {
+func newPDSGetRepoHandler(w *world.World, topology pdsTopology, faults *FaultPlan, onServed func(did string)) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		didStr := r.URL.Query().Get("did")
 		did, err := atmos.ParseDID(didStr)
 		if err != nil {
 			http.Error(rw, "bad did", http.StatusBadRequest)
 			return
+		}
+		// Reject unrecognized authorities before anything else — including
+		// fault injection. A misrouted client must see the topology's 404,
+		// not consume another DID's fault budget or receive a simulated
+		// response that masks the routing bug.
+		if topology.virtual {
+			if _, direct := topology.pdsIndex(r.Host); !direct && !strings.EqualFold(r.Host, topology.relayAuthority) {
+				http.NotFound(rw, r)
+				return
+			}
 		}
 		// Inject a scheduled fault before touching the real repo. This is
 		// a clean early exit: nothing has been written to rw yet, so
@@ -58,6 +69,14 @@ func newPDSGetRepoHandler(w *world.World, faults *FaultPlan, onServed func(did s
 			return
 		}
 		if !ok {
+			http.NotFound(rw, r)
+			return
+		}
+		// Unknown authorities were rejected before fault injection above;
+		// here a recognized virtual PDS serves only its own accounts (the
+		// relay authority keeps legacy getRepo behavior — the retry path's
+		// relay fallback depends on it).
+		if pdsIndex, direct := topology.pdsIndex(r.Host); topology.virtual && direct && w.PDSIndexForAccount(acct.Index) != pdsIndex {
 			http.NotFound(rw, r)
 			return
 		}

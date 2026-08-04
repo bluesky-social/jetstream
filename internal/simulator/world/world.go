@@ -47,6 +47,9 @@ func New(_ context.Context, cfg Config) (*World, error) {
 	if cfg.TrafficMix.isZero() {
 		cfg.TrafficMix = DefaultTrafficMix()
 	}
+	if cfg.PDSHosts == 0 {
+		cfg.PDSHosts = DefaultConfig().PDSHosts
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}

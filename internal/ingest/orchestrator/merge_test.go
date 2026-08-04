@@ -321,13 +321,10 @@ func TestMerge_CrashAfterSealBeforeDiscovery_RestartCleansUp(t *testing.T) {
 	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill"))
 	require.True(t, os.IsNotExist(err), "backfill dir should be removed after restart")
 
-	// Both cursor keys should be gone.
+	// The merge cursor should be gone.
 	cur, err := loadMergeCursor(fix.store)
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), cur)
-	bcur, err := backfill.LoadBootstrapLastListReposCursor(fix.store)
-	require.NoError(t, err)
-	require.Equal(t, "", bcur)
 }
 
 func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T) {
@@ -335,15 +332,7 @@ func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T
 
 	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
-	fix.seedBootstrapLastCursor(t, "page2")
-	fix.relay.pages = map[string]listReposPage{
-		"page2": {
-			Cursor: "",
-			Repos: []listReposEntry{
-				{DID: "did:plc:new", Active: true},
-			},
-		},
-	}
+	fix.relay.repos = []listReposEntry{{DID: "did:plc:new", Active: true}}
 
 	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	sentinel := errors.New("kill point: discovery-before-cleanup")
@@ -382,9 +371,6 @@ func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T
 
 	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill"))
 	require.True(t, os.IsNotExist(err), "backfill dir should be removed after restart")
-	bcur, err := backfill.LoadBootstrapLastListReposCursor(fix.store)
-	require.NoError(t, err)
-	require.Equal(t, "", bcur)
 }
 
 // TestMerge_SealsActiveSourceSegmentBeforeDrain exercises
@@ -456,20 +442,11 @@ func TestMerge_DiscoversNewDIDsViaListReposResume(t *testing.T) {
 	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	// Pre-seed the bootstrap-last cursor so runDiscovery is exercised.
-	fix.seedBootstrapLastCursor(t, "page2")
-
-	// Wire the fake relay to return a page when queried at cursor=page2.
 	// Two entries: did:plc:a is already known (idempotency check); did:plc:new
 	// is novel (discovery should write a StatusFailed row for it).
-	fix.relay.pages = map[string]listReposPage{
-		"page2": {
-			Cursor: "", // signal end-of-pagination
-			Repos: []listReposEntry{
-				{DID: "did:plc:a", Active: true},
-				{DID: "did:plc:new", Active: true},
-			},
-		},
+	fix.relay.repos = []listReposEntry{
+		{DID: "did:plc:a", Active: true},
+		{DID: "did:plc:new", Active: true},
 	}
 
 	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
@@ -499,10 +476,6 @@ func TestMerge_DiscoversNewDIDsViaListReposResume(t *testing.T) {
 	require.Equal(t, "discovered post-bootstrap; queued for retry", rsNew.Backfill.LastError)
 	require.True(t, rsNew.Active)
 
-	// Bootstrap-last cursor is gone (terminal cleanup ran).
-	got, err := backfill.LoadBootstrapLastListReposCursor(fix.store)
-	require.NoError(t, err)
-	require.Equal(t, "", got)
 }
 
 // TestMerge_DiscoveryWalksMultiplePages exercises the page-loop in
@@ -514,10 +487,8 @@ func TestMerge_DiscoveryWalksMultiplePages(t *testing.T) {
 
 	fix := newMergeFixture(t, nil, nil)
 
-	fix.seedBootstrapLastCursor(t, "pageA")
-
 	fix.relay.pages = map[string]listReposPage{
-		"pageA": {
+		"": {
 			Cursor: "pageB",
 			Repos: []listReposEntry{
 				{DID: "did:plc:new1", Active: true},
@@ -565,10 +536,8 @@ func TestMerge_DiscoveryToleratesDuplicateEntriesAndDetectsCursorLoop(t *testing
 	t.Parallel()
 
 	fix := newMergeFixture(t, nil, nil)
-	fix.seedBootstrapLastCursor(t, "pageA")
-
 	fix.relay.pages = map[string]listReposPage{
-		"pageA": {
+		"": {
 			Cursor: "pageB",
 			Repos: []listReposEntry{
 				{DID: "did:plc:duplicate", Active: true},
@@ -586,9 +555,7 @@ func TestMerge_DiscoveryToleratesDuplicateEntriesAndDetectsCursorLoop(t *testing
 	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
-	err = o.runMerge(t.Context())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "cursor loop")
+	require.NoError(t, o.runMerge(t.Context()), "an exhausted discovery host must not block cutover")
 
 	for _, did := range []string{"did:plc:duplicate", "did:plc:beforeloop"} {
 		val, closer, err := fix.store.Get(backfill.RepoKey(did))
@@ -599,25 +566,16 @@ func TestMerge_DiscoveryToleratesDuplicateEntriesAndDetectsCursorLoop(t *testing
 		require.Equal(t, backfill.StatusFailed, rs.Backfill.Status)
 	}
 
-	bcur, err := backfill.LoadBootstrapLastListReposCursor(fix.store)
-	require.NoError(t, err)
-	require.Equal(t, "pageA", bcur, "failed discovery must leave bootstrap resume cursor intact")
 }
 
-// TestMerge_DiscoveryRelayErrorAborts confirms that a relay-side
-// failure during the discovery walk is surfaced as a runMerge error
-// rather than silently swallowed. The drained source data is durable
-// (live_segments is still on disk and merge cursor reflects what
-// drained), so a restart re-runs the empty source loop and retries
-// discovery.
-func TestMerge_DiscoveryRelayErrorAborts(t *testing.T) {
+// TestMerge_DiscoveryHostErrorExhaustsAndCutoverContinues confirms a PDS
+// unavailable during the one-attempt merge sweep is recorded as exhausted
+// without holding serving cutover hostage.
+func TestMerge_DiscoveryHostErrorExhaustsAndCutoverContinues(t *testing.T) {
 	t.Parallel()
 
 	fix := newMergeFixture(t, nil, nil)
-	fix.seedBootstrapLastCursor(t, "discovery-fails")
-
-	// Override the relay handler to 500 on listRepos so atmos surfaces a
-	// transport error from the iterator.
+	// Override the direct-PDS listRepos response while retaining listHosts.
 	fix.relay.srv.Close()
 	fix.relay.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/com.atproto.sync.listRepos") {
@@ -633,15 +591,10 @@ func TestMerge_DiscoveryRelayErrorAborts(t *testing.T) {
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	err = o.runMerge(t.Context())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "discovery")
+	require.NoError(t, err)
 
-	// live_segments must still exist (RemoveAll never ran), and the
-	// bootstrap-last cursor must still be set so a future restart can
-	// retry the discovery walk from the same point.
+	// Cutover cleanup still completes; a later bootstrap/discovery run can
+	// retry the durable exhausted roster row.
 	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill", "live_segments"))
-	require.NoError(t, err)
-	bcur, err := backfill.LoadBootstrapLastListReposCursor(fix.store)
-	require.NoError(t, err)
-	require.Equal(t, "discovery-fails", bcur)
+	require.True(t, os.IsNotExist(err))
 }
