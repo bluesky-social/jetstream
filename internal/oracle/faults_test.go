@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
+	"github.com/jcalabro/atmos/backfill"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,9 +45,9 @@ func TestBuildSwarmFaultPlanIsDeterministicAndBounded(t *testing.T) {
 	require.Equal(t, first.GetRepoResponseFailures, second.GetRepoResponseFailures)
 	require.Equal(t, first.GetRepoCARTruncations, second.GetRepoCARTruncations)
 
-	// Exact swarm contract for a multi-DID world: precisely two distinct
-	// DIDs, one "hot" with a raw failure + typed response failure and one
-	// secondary with a raw failure. Asserting
+	// Exact swarm contract for a multi-DID world: four distinct DIDs each
+	// consume one retry, covering two raw failures, one typed response failure,
+	// and one truncated CAR. Asserting
 	// the exact shape (not just ">= 2 DIDs" / "max > 1") pins the planner
 	// so a regression that, say, faulted every DID once or collapsed both
 	// onto a single DID would fail here.
@@ -56,6 +57,17 @@ func TestBuildSwarmFaultPlanIsDeterministicAndBounded(t *testing.T) {
 	require.Equal(t, 1, first.TotalGetRepoResponseFailures())
 	require.Len(t, first.GetRepoCARTruncations, 1, "swarm faults one DID with a truncated CAR")
 	require.Equal(t, 1, first.TotalGetRepoCARTruncations())
+	faulted := make(map[string]struct{}, 4)
+	for did := range first.GetRepoHTTPFailures {
+		faulted[did] = struct{}{}
+	}
+	for did := range first.GetRepoResponseFailures {
+		faulted[did] = struct{}{}
+	}
+	for did := range first.GetRepoCARTruncations {
+		faulted[did] = struct{}{}
+	}
+	require.Len(t, faulted, 4, "each DID may consume at most the one configured retry")
 
 	counts := make([]int, 0, 2)
 	for _, c := range first.GetRepoHTTPFailures {
@@ -66,10 +78,9 @@ func TestBuildSwarmFaultPlanIsDeterministicAndBounded(t *testing.T) {
 }
 
 // TestSwarmFaultPlanWithinRetryBudget pins the #109 invariant: the swarm
-// plan leaves every faulted DID at least one clean getRepo attempt, keyed
-// off the real backfill retry budget. The hot DID's 3 faults (1 HTTP + 1
-// typed response + 1 CAR) sit one below the 4-attempt ceiling; the guard must
-// accept that and reject a plan that reaches/exceeds the ceiling.
+// plan leaves every faulted DID at least one clean getRepo attempt, keyed off
+// the real backfill retry budget. Each DID's one fault consumes the one retry;
+// the guard must reject a second fault on that DID.
 func TestSwarmFaultPlanWithinRetryBudget(t *testing.T) {
 	t.Parallel()
 
@@ -87,26 +98,24 @@ func TestSwarmFaultPlanWithinRetryBudget(t *testing.T) {
 	plan, err := BuildSwarmFaultPlan(w, cfg)
 	require.NoError(t, err)
 
-	// The real plan is within budget (hot DID = 3 faults < 4 attempts).
+	// The real plan is within budget (one fault < two attempts per DID).
 	require.NoError(t, plan.CheckWithinRetryBudget())
 
 	// A nil plan and the no-fault plan are trivially within budget.
 	require.NoError(t, (*SwarmFaultPlan)(nil).CheckWithinRetryBudget())
 
 	// Pushing a DID's combined faults to the attempt ceiling must trip the
-	// guard. Find the hot DID (the one with the typed response failure) and
-	// add CAR truncations until consumed == DefaultMaxRetries+1.
+	// guard. Add a second fault to one of the raw-HTTP DIDs.
 	var hot string
-	for did := range plan.GetRepoResponseFailures {
+	for did := range plan.GetRepoHTTPFailures {
 		hot = did
 		break
 	}
-	require.NotEmpty(t, hot, "expected a hot DID with a typed response failure")
-	// hot already has 1 HTTP + 1 typed response + 1 CAR = 3; one more CAR
-	// truncation -> 4 == ceiling.
-	plan.GetRepoCARTruncations[hot]++
+	require.NotEmpty(t, hot, "expected a DID with an HTTP failure")
+	consumed := plan.GetRepoHTTPFailures[hot] + plan.GetRepoResponseFailures[hot] + plan.GetRepoCARTruncations[hot]
+	plan.GetRepoCARTruncations[hot] += backfill.DefaultMaxRetries + 1 - consumed
 	require.Error(t, plan.CheckWithinRetryBudget(),
-		"a plan that consumes all 4 attempts for a DID must be rejected")
+		"a plan that consumes every configured attempt for a DID must be rejected")
 }
 
 // TestSkewedIndexBiasesTowardLowIndices pins skewedIndex's low-index bias so a
@@ -227,10 +236,10 @@ func TestBuildSwarmFaultPlanSingleDIDWorld(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, plan.GetRepoHTTPFailures, 1, "single-DID world raw-HTTP faults only the hot DID")
 	require.Equal(t, 1, plan.TotalGetRepoHTTPFailures())
-	require.Len(t, plan.GetRepoResponseFailures, 1, "single-DID world typed-response faults only the hot DID")
-	require.Equal(t, 1, plan.TotalGetRepoResponseFailures())
-	require.Len(t, plan.GetRepoCARTruncations, 1, "single-DID world truncates only the hot DID")
-	require.Equal(t, 1, plan.TotalGetRepoCARTruncations())
+	require.Empty(t, plan.GetRepoResponseFailures)
+	require.Zero(t, plan.TotalGetRepoResponseFailures())
+	require.Empty(t, plan.GetRepoCARTruncations)
+	require.Zero(t, plan.TotalGetRepoCARTruncations())
 }
 
 func TestBuildSwarmFaultPlanSkipsRepoUnavailableDIDs(t *testing.T) {
@@ -252,8 +261,8 @@ func TestBuildSwarmFaultPlanSkipsRepoUnavailableDIDs(t *testing.T) {
 	plan, err := BuildSwarmFaultPlan(w, cfg)
 	require.NoError(t, err)
 	require.Equal(t, map[string]int{string(acct.DID): 1}, plan.GetRepoHTTPFailures)
-	require.Equal(t, map[string]int{string(acct.DID): 1}, plan.GetRepoResponseFailures)
-	require.Equal(t, map[string]int{string(acct.DID): 1}, plan.GetRepoCARTruncations)
+	require.Empty(t, plan.GetRepoResponseFailures)
+	require.Empty(t, plan.GetRepoCARTruncations)
 }
 
 func TestBuildSwarmFaultPlanNoopsWhenFaultModeNone(t *testing.T) {

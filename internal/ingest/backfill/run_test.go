@@ -497,7 +497,7 @@ func TestRun_TransientGetRepoFailureThenRecovers(t *testing.T) {
 	did := atmos.DID("did:plc:transient")
 	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
 	srv := newStubServer(t, fixtures)
-	srv.transientFailGetRepo = map[atmos.DID]int{did: 2}
+	srv.transientFailGetRepo = map[atmos.DID]int{did: 1}
 	srv.transientFailGetRepoCode = http.StatusServiceUnavailable
 
 	db, err := store.Open(t.TempDir(), nil)
@@ -526,7 +526,7 @@ func TestRun_TransientGetRepoFailureThenRecovers(t *testing.T) {
 		RetryMaxDelay:  10 * time.Millisecond,
 	}))
 
-	// The DID must have completed despite the two transient 503s, and
+	// The DID must have completed despite the transient 503, and
 	// the budget must be fully consumed (the engine actually retried).
 	got, err := NewStore(db, nil).Lookup(t.Context(), did)
 	require.NoError(t, err)
@@ -809,7 +809,7 @@ func TestRun_BackfillReposRetriesTransientGetRepoFailure(t *testing.T) {
 	did := atmos.DID("did:plc:selectedtransient")
 	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
 	srv := newStubServer(t, fixtures)
-	srv.transientFailGetRepo = map[atmos.DID]int{did: 2}
+	srv.transientFailGetRepo = map[atmos.DID]int{did: 1}
 	srv.transientFailGetRepoCode = http.StatusServiceUnavailable
 
 	db, err := store.Open(t.TempDir(), nil)

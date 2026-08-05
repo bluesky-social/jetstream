@@ -49,12 +49,11 @@ type SwarmFaultPlan struct {
 
 // BuildSwarmFaultPlan builds the deterministic fault schedule for an
 // oracle run. FaultModeNone returns an empty plan (no DIDs scheduled).
-// FaultModeSwarm schedules a small, bounded set of transient getRepo failures:
-// one raw 503, one typed XRPC 503 response, and one truncated CAR body on a
-// hot DID, plus one raw 503 on a distinct secondary DID when the world has
-// more than one account. The budget is deliberately inside atmos's default
-// retry count so every faulted repo still completes, leaving the durable model
-// identical to the simulator world. An unknown mode is an error.
+// FaultModeSwarm schedules a small, bounded set of transient getRepo failures
+// on distinct DIDs: two raw 503s, one typed XRPC 503 response, and one
+// truncated CAR body when enough repos are available. Each DID consumes at
+// most Atmos's single default retry, leaving one clean attempt. An unknown
+// mode is an error.
 func BuildSwarmFaultPlan(w *world.World, cfg Config) (*SwarmFaultPlan, error) {
 	plan := &SwarmFaultPlan{
 		SimulatorFaults:         simhttp.NewFaultPlan(),
@@ -84,17 +83,27 @@ func BuildSwarmFaultPlan(w *world.World, cfg Config) (*SwarmFaultPlan, error) {
 	}
 
 	rng := rand.New(rand.NewPCG(cfg.Seed^oracleFaultSeedSalt, cfg.Seed+oracleFaultSeedSalt))
-	hot := dids[skewedIndex(rng, len(dids))]
-	plan.addGetRepoHTTPFailures(hot, 1)
-	plan.addGetRepoResponseFailure(hot, 1)
-	plan.addGetRepoCARTruncations(hot, 1)
-
-	if len(dids) > 1 {
-		secondary := hot
-		for secondary == hot {
-			secondary = dids[skewedIndex(rng, len(dids))]
+	available := append([]string(nil), dids...)
+	take := func() (string, bool) {
+		if len(available) == 0 {
+			return "", false
 		}
-		plan.addGetRepoHTTPFailures(secondary, 1)
+		i := skewedIndex(rng, len(available))
+		did := available[i]
+		available = append(available[:i], available[i+1:]...)
+		return did, true
+	}
+	if did, ok := take(); ok {
+		plan.addGetRepoHTTPFailures(did, 1)
+	}
+	if did, ok := take(); ok {
+		plan.addGetRepoResponseFailure(did, 1)
+	}
+	if did, ok := take(); ok {
+		plan.addGetRepoCARTruncations(did, 1)
+	}
+	if did, ok := take(); ok {
+		plan.addGetRepoHTTPFailures(did, 1)
 	}
 
 	return plan, nil
@@ -206,10 +215,9 @@ func (p *SwarmFaultPlan) TotalGetRepoCARTruncations() int {
 // retries + the initial attempt).
 //
 // This guards a zero-margin invariant the swarm relies on but nothing else
-// pins: the hot DID schedules 1 raw HTTP failure + 1 typed response failure
-// + 1 CAR truncation = 3 faults against 4 available attempts, leaving exactly
-// one clean attempt. If atmos ever lowers DefaultMaxRetries, or the planner
-// ever schedules more faults per DID, a faulted repo would exhaust its budget
+// pins: each faulted DID schedules one fault against two available attempts,
+// leaving exactly one clean attempt. If Atmos lowers DefaultMaxRetries, or the
+// planner schedules more faults per DID, a faulted repo would exhaust its budget
 // and the run would degrade into a confusing backfill timeout instead of a
 // clear, attributable failure — and the durable model would diverge from the
 // simulator world because that repo never completes. Keyed off the imported

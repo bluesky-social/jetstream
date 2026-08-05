@@ -9,6 +9,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSelectedRetryDefaultsAreBounded(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, 1, selectedDefaultMaxRetries)
+	assert.Equal(t, 1, selectedDefaultRetryRateLimitMax)
+	assert.Equal(t, 30*time.Second, selectedRetryRateLimitCeiling)
+}
+
 // TestSelectedBackoffDelay_Deterministic shows an injected jitter makes the
 // delay fully reproducible: same seed -> identical sequence.
 func TestSelectedBackoffDelay_Deterministic(t *testing.T) {

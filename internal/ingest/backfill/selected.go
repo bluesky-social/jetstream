@@ -35,11 +35,11 @@ type selectedReposConfig struct {
 }
 
 const (
-	selectedDefaultMaxRetries        = 3
-	selectedDefaultRetryRateLimitMax = atmosbackfill.DefaultRetryRateLimitMaxAttempts
+	selectedDefaultMaxRetries        = 1
+	selectedDefaultRetryRateLimitMax = 1
 	selectedDefaultRetryBaseDelay    = time.Second
 	selectedDefaultRetryMaxDelay     = 30 * time.Second
-	selectedRetryRateLimitCeiling    = 330 * time.Second
+	selectedRetryRateLimitCeiling    = 30 * time.Second
 )
 
 var errSelectedOnCompleteRecorded = errors.New("selected repo backfill: OnComplete recording failed; handler already ran")
@@ -134,10 +134,10 @@ func (r *selectedRunner) reportIdentityMetadataError(did atmos.DID, err error) {
 
 // processRepo mirrors the atmos engine's two-budget retry loop (see
 // atmos backfill/engine.go): ordinary transient errors draw on
-// maxRetries with capped backoff, while a 429 is treated as
-// backpressure — it sleeps for the server-directed reset (clamped to
-// selectedRetryRateLimitCeiling) and draws on a separate, larger
-// rate-limit budget, never failing for "the reset exceeds the cap."
+// maxRetries with capped backoff, while a 429 is treated as backpressure — it
+// sleeps for the server-directed reset (clamped to
+// selectedRetryRateLimitCeiling). Both classes share one total retry budget,
+// so switching failure classes cannot create extra attempts.
 func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 	maxRetries := selectedDefaultMaxRetries
 	if r.cfg.MaxRetries > 0 {
@@ -152,9 +152,11 @@ func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 		maxDelay = r.cfg.RetryMaxDelay
 	}
 	rlMaxAttempts := selectedDefaultRetryRateLimitMax
+	totalRetryLimit := max(maxRetries, rlMaxAttempts)
 
 	transientAttempt := 0
 	rlAttempt := 0
+	retries := 0
 	attempts := 0
 
 	for {
@@ -172,20 +174,21 @@ func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 
 		var delay time.Duration
 		if xrpc.IsRateLimited(err) {
-			if rlAttempt >= rlMaxAttempts {
+			if rlAttempt >= rlMaxAttempts || retries >= totalRetryLimit {
 				r.recordFail(ctx, did, host, fmt.Errorf("backfill: still rate limited after %d attempts: %w", rlAttempt+1, err), attempts)
 				return
 			}
 			rlAttempt++
 			delay = selectedRateLimitDelay(err, baseDelay, rlAttempt, r.cfg.jitter)
 		} else {
-			if !xrpc.IsTransient(err) || transientAttempt >= maxRetries {
+			if !xrpc.IsTransient(err) || transientAttempt >= maxRetries || retries >= totalRetryLimit {
 				r.recordFail(ctx, did, host, err, attempts)
 				return
 			}
 			delay = selectedBackoffDelay(baseDelay, maxDelay, transientAttempt, r.cfg.jitter)
 			transientAttempt++
 		}
+		retries++
 
 		t := time.NewTimer(delay)
 		select {
