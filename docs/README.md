@@ -501,9 +501,10 @@ On first startup, we kick off two things in parallel:
     1. Paginates `com.atproto.sync.listHosts` on the relay, validates each untrusted hostname, caps the roster, and upserts `pdshost/<hostname>`
     2. Runs bounded per-host `listRepos` crawls, including `offline` and `idle` hosts but excluding `banned` hosts by default; the relay's `accountCount` is only a scheduling floor
     3. Writes each newly discovered DID to `repo/<did>` with `StatusNotStarted` and its validated roster PDS, then downloads it directly from that PDS
-    4. Bounds aggregate download attempts, workers per host, and active host loops independently; a rate-limited or unavailable PDS parks without consuming another host's capacity
-    5. Marks each host drained after its final cursor is durable, or exhausted after bounded producer retries. Exhausted hosts are visible and do not prevent bootstrap from terminating
-    6. Re-lists `listHosts` once all known hosts are terminal; bootstrap returns only when that proof pass finds no new eligible host
+    4. Bounds aggregate download attempts, workers per host, and active host loops independently; each repo and each host gets at most one retry, and a rate-limited or unavailable PDS parks without consuming another host's capacity
+    5. Every 30 seconds, when repo completions or host cursors are staged, forces the partial segment block durable and commits the covered metadata in the following synced Pebble batch. This bounds status/checkpoint lag without allowing metadata to lead segment fsync
+    6. Marks each host drained after its final cursor is durable, or exhausted after its second producer attempt. Exhausted hosts are visible and do not prevent bootstrap from terminating
+    7. Re-lists `listHosts` once all known hosts are terminal; bootstrap returns only when that proof pass finds no new eligible host
 
 This phase takes a while. At time of writing with current rate limits on the mushroom PDSes on the new relay, it takes ~16 hours.
 

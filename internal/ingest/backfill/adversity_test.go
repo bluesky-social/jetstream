@@ -117,7 +117,7 @@ func TestRun_MultiPDSFaultIsolationAndExhaustion(t *testing.T) {
 	faults.AddListHostsHTTPFailures("", http.StatusServiceUnavailable, 1)
 	faults.SetListHostsStatus(host0, "offline")
 	faults.AddPDSListReposHTTPFailures(host1, "2", http.StatusServiceUnavailable, 1)
-	faults.AddPDSListReposHTTPFailures(host2, "", http.StatusServiceUnavailable, 8)
+	faults.AddPDSListReposHTTPFailures(host2, "", http.StatusServiceUnavailable, hostMaxAttempts)
 	faults.AddPDSListReposHTTPFailures(host3, "", http.StatusTooManyRequests, 1)
 
 	srv := httptest.NewServer(simhttp.NewHandlerWithOptions(simWorld, "http://sim.invalid", simhttp.HandlerOptions{
@@ -145,7 +145,7 @@ func TestRun_MultiPDSFaultIsolationAndExhaustion(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, faults.ListHostsHTTPFailuresFired(""))
 	require.Equal(t, 1, faults.PDSListReposHTTPFailuresFired(host1, "2"))
-	require.Equal(t, 8, faults.PDSListReposHTTPFailuresFired(host2, ""))
+	require.Equal(t, hostMaxAttempts, faults.PDSListReposHTTPFailuresFired(host2, ""))
 	require.Equal(t, 1, faults.PDSListReposHTTPFailuresFired(host3, ""))
 
 	hosts, err := ListPDSHosts(st)
@@ -161,7 +161,7 @@ func TestRun_MultiPDSFaultIsolationAndExhaustion(t *testing.T) {
 	}
 	require.Equal(t, string(atmosbackfill.HostStateExhausted), byName[host2].State)
 	require.False(t, byName[host2].Enumerated)
-	require.Equal(t, 8, byName[host2].Attempts)
+	require.Equal(t, hostMaxAttempts, byName[host2].Attempts)
 
 	counts, err := CountStatuses(st)
 	require.NoError(t, err)

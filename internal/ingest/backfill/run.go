@@ -28,6 +28,11 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+const (
+	defaultDurabilityDrainInterval = 30 * time.Second
+	hostMaxAttempts                = 2
+)
+
 type Config struct {
 	Store       *store.Store
 	Writer      *ingest.Writer
@@ -57,6 +62,10 @@ type Config struct {
 	MaxRetries     int
 	RetryBaseDelay time.Duration
 	RetryMaxDelay  time.Duration
+
+	// durabilityDrainInterval is overridden by tests. Production uses the
+	// documented bounded partial-block durability interval.
+	durabilityDrainInterval time.Duration
 
 	// NewHostClient is injected by the simulator/oracle. Production leaves it
 	// nil and uses validated HTTPS hostnames over HTTPClient's shared pool.
@@ -120,11 +129,39 @@ func Run(ctx context.Context, cfg Config) error {
 			if err := cfg.Writer.DrainDurability(ctx); err != nil {
 				return fmt.Errorf("backfill: drain durability: %w", err)
 			}
+			cfg.Metrics.incForcedCheckpointFlushes()
 			if fatal := loadFatal(); fatal != nil {
 				return fmt.Errorf("backfill: %w", fatal)
 			}
 			return nil
 		}
+		drainInterval := cfg.durabilityDrainInterval
+		if drainInterval <= 0 {
+			drainInterval = defaultDurabilityDrainInterval
+		}
+		drainerCtx, cancelDrainer := context.WithCancel(runCtx)
+		drainerDone := make(chan struct{})
+		go func() {
+			defer close(drainerDone)
+			err := runPeriodicDurabilityDrain(drainerCtx, drainInterval, completions.hasPendingDurability, func(ctx context.Context) error {
+				if err := cfg.Writer.DrainDurability(ctx); err != nil {
+					return err
+				}
+				cfg.Metrics.incForcedCheckpointFlushes()
+				return nil
+			})
+			if err != nil && drainerCtx.Err() == nil {
+				recordFatal(fmt.Errorf("periodic durability drain: %w", err))
+			}
+		}()
+		var stopDrainerOnce sync.Once
+		stopDrainer := func() {
+			stopDrainerOnce.Do(func() {
+				cancelDrainer()
+				<-drainerDone
+			})
+		}
+		defer stopDrainer()
 
 		if len(cfg.BackfillRepos) > 0 {
 			logger.InfoContext(ctx, "starting selected repo backfill", "repos", len(cfg.BackfillRepos))
@@ -144,6 +181,7 @@ func Run(ctx context.Context, cfg Config) error {
 				}
 				return fmt.Errorf("backfill: %w", err)
 			}
+			stopDrainer()
 			return drain()
 		}
 
@@ -179,6 +217,7 @@ func Run(ctx context.Context, cfg Config) error {
 			}),
 			OnRosterCapped:     gt.Some(func(limit int) { cfg.Metrics.incRosterCapHit() }),
 			OnDownloadSlotWait: gt.Some(func(wait time.Duration) { cfg.Metrics.observeDownloadSlotWait(wait) }),
+			HostMaxAttempts:    gt.Some(hostMaxAttempts),
 		}
 		if cfg.GlobalDownloads > 0 {
 			engineOpts.GlobalDownloads = gt.Some(cfg.GlobalDownloads)
@@ -211,6 +250,7 @@ func Run(ctx context.Context, cfg Config) error {
 			"global_downloads", cfg.GlobalDownloads, "host_workers", cfg.HostWorkers,
 			"max_active_hosts", cfg.MaxActiveHosts, "batch_size", cfg.BackfillBatchSize)
 		err := atmosbackfill.NewEngine(engineOpts).Run(runCtx)
+		stopDrainer()
 		cfg.Metrics.finishEngine()
 		if err != nil && (!limited.Load() || !errors.Is(err, context.Canceled)) {
 			if fatal := loadFatal(); fatal != nil {
@@ -224,6 +264,29 @@ func Run(ctx context.Context, cfg Config) error {
 		logger.InfoContext(ctx, "PDS-direct backfill drained", "limited", limited.Load())
 		return nil
 	})
+}
+
+func runPeriodicDurabilityDrain(
+	ctx context.Context,
+	interval time.Duration,
+	hasPending func() bool,
+	drain func(context.Context) error,
+) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if !hasPending() {
+				continue
+			}
+			if err := drain(ctx); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func traceHostState(ctx context.Context, host atmosbackfill.HostInfo, state atmosbackfill.HostState, attempts int, cause error) {

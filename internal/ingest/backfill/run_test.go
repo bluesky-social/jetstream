@@ -261,6 +261,17 @@ type stubServer struct {
 	// emptyListReposCursor, when non-empty, makes listRepos return an empty
 	// terminal page for that cursor. This models resuming after the final DID.
 	emptyListReposCursor string
+
+	// transientFailListRepos is the number of listRepos requests that return
+	// 503 before normal pagination resumes.
+	transientFailListRepos int
+
+	// blockListReposCursor pauses a page request until listReposRelease closes.
+	// Tests use this to hold the host manager open after a completed batch.
+	blockListReposCursor string
+	listReposBlocked     chan struct{}
+	listReposRelease     chan struct{}
+	listReposBlockOnce   sync.Once
 }
 
 func newStubServer(t *testing.T, fixtures map[atmos.DID]repoFixture) *stubServer {
@@ -292,6 +303,23 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 		s.listReposHit.Add(1)
 		s.recordEvent("listRepos")
 		cursor := r.URL.Query().Get("cursor")
+		s.transientMu.Lock()
+		if s.transientFailListRepos > 0 {
+			s.transientFailListRepos--
+			s.transientMu.Unlock()
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "TransientError"})
+			return
+		}
+		s.transientMu.Unlock()
+		if s.blockListReposCursor != "" && cursor == s.blockListReposCursor {
+			s.listReposBlockOnce.Do(func() { close(s.listReposBlocked) })
+			select {
+			case <-r.Context().Done():
+				return
+			case <-s.listReposRelease:
+			}
+		}
 		s.firstListReposCursorMu.Lock()
 		if !s.firstListReposCursorOK {
 			s.firstListReposCursor = cursor
@@ -582,6 +610,122 @@ func TestRun_TruncatedGetRepoCARThenRecovers(t *testing.T) {
 	srv.transientMu.Lock()
 	defer srv.transientMu.Unlock()
 	require.Equal(t, 0, srv.transientTruncateGetRepo[did], "all scheduled truncated CAR faults must have fired")
+}
+
+func TestRun_PeriodicallyDrainsQueuedCompletions(t *testing.T) {
+	t.Parallel()
+
+	firstDID := atmos.DID("did:plc:periodic-drain-a")
+	secondDID := atmos.DID("did:plc:periodic-drain-b")
+	fixtures := map[atmos.DID]repoFixture{
+		firstDID:  buildRepoFixture(t, firstDID),
+		secondDID: buildRepoFixture(t, secondDID),
+	}
+	srv := newStubServer(t, fixtures)
+	srv.listReposPageSize = 1
+	srv.blockListReposCursor = string(secondDID)
+	srv.listReposBlocked = make(chan struct{})
+	srv.listReposRelease = make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(srv.listReposRelease) }) }
+	t.Cleanup(release)
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4096,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			Store:                   db,
+			HTTPClient:              &http.Client{Timeout: 5 * time.Second},
+			Writer:                  w,
+			RelayURL:                srv.srv.URL,
+			NewHostClient:           stubHostClient(srv),
+			Logger:                  logger,
+			BackfillBatchSize:       1,
+			durabilityDrainInterval: 5 * time.Millisecond,
+		})
+	}()
+
+	select {
+	case <-srv.listReposBlocked:
+	case err := <-done:
+		require.FailNow(t, "Run returned before the second page blocked", "err=%v", err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "second listRepos page did not block")
+	}
+
+	statusStore := NewStore(db, nil)
+	require.Eventually(t, func() bool {
+		rs, err := statusStore.readRepoStatus(firstDID)
+		return err == nil && rs != nil && rs.Backfill.Status == StatusComplete
+	}, time.Second, 5*time.Millisecond,
+		"a sub-block completion must become durable while the host manager is still running")
+
+	select {
+	case err := <-done:
+		require.FailNow(t, "Run returned before the blocked host was released", "err=%v", err)
+	default:
+	}
+
+	release()
+	require.NoError(t, <-done)
+}
+
+func TestRun_HostEnumerationAllowsOnlyOneRetry(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:host-retry-budget")
+	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
+	srv := newStubServer(t, fixtures)
+	srv.transientFailListRepos = 10
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := ingest.Open(ingest.Config{
+		SegmentsDir:       filepath.Join(t.TempDir(), "segments"),
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.NoError(t, Run(t.Context(), Config{
+		Store:          db,
+		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
+		Writer:         w,
+		RelayURL:       srv.srv.URL,
+		NewHostClient:  stubHostClient(srv),
+		Logger:         logger,
+		RetryBaseDelay: time.Millisecond,
+		RetryMaxDelay:  time.Millisecond,
+	}))
+
+	require.EqualValues(t, 2, srv.listReposHit.Load(), "one host retry means two total attempts")
+	hosts, err := ListPDSHosts(db)
+	require.NoError(t, err)
+	require.Len(t, hosts, 1)
+	require.Equal(t, string(atmosbackfill.HostStateExhausted), hosts[0].State)
+	require.Equal(t, 2, hosts[0].Attempts)
 }
 
 // TestRun_HappyPath_DownloadsAllRepos is the wiring smoke test: three

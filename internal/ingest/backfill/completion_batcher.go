@@ -55,6 +55,12 @@ func NewCompletionBatcher(st *Store, m *Metrics) *completionBatcher {
 	}
 }
 
+func (b *completionBatcher) hasPendingDurability() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.queued) > 0 || len(b.cursors) > 0
+}
+
 // QueueHostCursor records a per-host checkpoint and the not-yet-durable repo
 // completions it covers. StageDurable only writes the cursor in a Pebble batch
 // that also makes every remaining dependency durable.
