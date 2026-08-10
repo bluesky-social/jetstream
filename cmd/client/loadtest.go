@@ -23,7 +23,8 @@ import (
 )
 
 // loadtestCommand is the legacy direct-websocket load tester: it opens many
-// raw /subscribe (or /subscribe-v2) connections and prints throughput stats.
+// raw /subscribe (v1) or /xrpc/network.bsky.jetstream.subscribe (v2)
+// connections and prints throughput stats.
 // It does NOT use the jetstream client library; it exists to stress the server
 // websocket path directly.
 func loadtestCommand() *cli.Command {
@@ -69,11 +70,11 @@ func loadtestCommand() *cli.Command {
 			},
 			&cli.BoolFlag{
 				Name:  "compression",
-				Usage: "Offer RFC 7692 permessage-deflate (honored on /subscribe only; /subscribe-v2 never negotiates it)",
+				Usage: "Offer RFC 7692 permessage-deflate (honored on /subscribe only; the v2 endpoint never negotiates it)",
 			},
 			&cli.BoolFlag{
 				Name:  "zstd",
-				Usage: "Opt into /subscribe-v2 dictionary zstd: fetches the dictionary via getZstdDictionary, sends zstdDictionary=<id>, and decodes every frame (v2 URLs only; the v1 endpoint uses a different, legacy dictionary this tool does not embed)",
+				Usage: "Opt into the v2 dictionary zstd: fetches the dictionary via getZstdDictionary, sends zstdDictionary=<id>, and decodes every frame (v2 URLs only; the v1 endpoint uses a different, legacy dictionary this tool does not embed)",
 			},
 			&cli.StringFlag{
 				Name:  "cursor",
@@ -267,8 +268,8 @@ func subscribeURL(c config) (string, error) {
 		// v2-only: the v1 endpoint compresses with the legacy embedded
 		// dictionary, which getZstdDictionary does not serve, so frames
 		// would be undecodable here.
-		if !strings.HasSuffix(u.Path, "/subscribe-v2") {
-			return "", fmt.Errorf("--zstd requires a /subscribe-v2 URL (the v1 endpoint uses the legacy dictionary this tool does not embed)")
+		if !strings.HasSuffix(u.Path, "/xrpc/network.bsky.jetstream.subscribe") {
+			return "", fmt.Errorf("--zstd requires a /xrpc/network.bsky.jetstream.subscribe URL (the v1 endpoint uses the legacy dictionary this tool does not embed)")
 		}
 		if c.zstdDictID == 0 {
 			return "", fmt.Errorf("internal: zstd dictionary ID not resolved before URL build")
@@ -278,24 +279,41 @@ func subscribeURL(c config) (string, error) {
 	if c.cursor != "" {
 		q.Set("cursor", c.cursor)
 	}
+	// The two endpoints use different filter parameter dialects: v1 keeps
+	// the legacy wanted* names, the v2 lexicon dropped the prefix (and
+	// rejects the legacy names with a 400 rather than silently ignoring
+	// them).
+	colParam, didParam := "wantedCollections", "wantedDids"
+	if isV2Path(u.Path) {
+		colParam, didParam = "collections", "dids"
+	}
 	for _, v := range c.wantedCollections {
 		if v != "" {
-			q.Add("wantedCollections", v)
+			q.Add(colParam, v)
 		}
 	}
 	for _, v := range c.wantedDIDs {
 		if v != "" {
-			q.Add("wantedDids", v)
+			q.Add(didParam, v)
 		}
 	}
 	if c.maxMessageSize > 0 {
 		q.Set("maxMessageSizeBytes", strconv.Itoa(c.maxMessageSize))
 	}
 	if c.requireHello {
+		if isV2Path(u.Path) {
+			return "", fmt.Errorf("--require-hello is a /subscribe (v1) feature; the v2 endpoint is server-push only")
+		}
 		q.Set("requireHello", "true")
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// isV2Path reports whether the URL path targets the proposal-0015 v2
+// stream endpoint.
+func isV2Path(path string) bool {
+	return strings.HasSuffix(path, "/xrpc/network.bsky.jetstream.subscribe")
 }
 
 type counters struct {

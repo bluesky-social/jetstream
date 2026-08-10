@@ -30,7 +30,7 @@ import (
 // partb_harness_test.go builds the hermetic, real-socket fixture the §16 Part-B
 // oracle scenarios drive: a single httptest server that serves BOTH the
 // paginated archive XRPC (planBackfill/getSegment/getBlock, mounted at /xrpc/)
-// and the live /subscribe-v2 websocket (with the v2 reject-below-floor
+// and the live v2 websocket (with the v2 reject-below-floor
 // too-old policy), backed by one sealed-segment archive + manifest + writer +
 // writer-readable-log Tail. It deliberately avoids the synctest bubble — the oracle package
 // allows exactly one bubble per process (owned by TestOracle_DefaultLifecycle),
@@ -48,7 +48,7 @@ import (
 
 // pagedCutoverServer is a running hermetic archive+live server. Construct it
 // with newPagedCutoverServer; URL is the base the public jetstream client dials
-// (both /xrpc/ and /subscribe-v2 hang off it).
+// (the XRPC archive routes and the v2 subscribe NSID hang off it).
 type pagedCutoverServer struct {
 	t        *testing.T
 	URL      string
@@ -95,7 +95,7 @@ func recentMicros(ago time.Duration) int64 {
 
 // newPagedCutoverServer stands up the harness. It seals InitialSegments, opens
 // the manifest/store/writer/tail, seeds the writer tip past the highest sealed
-// seq, marks steady-state, and serves /xrpc/ + /subscribe-v2 on one mux.
+// seq, marks steady-state, and serves the XRPC archive + v2 subscribe on one mux.
 func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverServer {
 	t.Helper()
 	if cfg.Lookback <= 0 {
@@ -191,7 +191,7 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 			}
 		}
 	}))
-	mux.Handle("GET /subscribe-v2", subscribe.NewHandler(subscribe.Subscription{
+	mux.Handle("GET /xrpc/network.bsky.jetstream.subscribe", subscribe.NewHandler(subscribe.Subscription{
 		Tail:     tail,
 		Store:    st,
 		Manifest: m,
@@ -239,14 +239,15 @@ func (s *pagedCutoverServer) AppendLive(evs ...segment.Event) {
 	}
 }
 
-// dialSubscribeV2 performs a raw /subscribe-v2 websocket handshake at the given
-// cursor and reports the HTTP status the server returned pre-upgrade, plus the
-// response body. A successful upgrade returns 101 (and the connection is closed
-// immediately); a too-old cursor returns 400 with the floor in the body. This
-// is the raw §14 signal the client's re-backfill keys on.
+// dialSubscribeV2 performs a raw websocket handshake against the v2 NSID
+// path at the given cursor and reports the HTTP status the server returned
+// pre-upgrade, plus the response body. A successful upgrade returns 101 (and
+// the connection is closed immediately); a too-old cursor returns 400 whose
+// XRPC envelope names CursorTooOld with the floor in the message. This is
+// the raw §14 signal the client's re-backfill keys on.
 func dialSubscribeV2(t *testing.T, baseURL string, cursor uint64) (status int, body string) {
 	t.Helper()
-	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/subscribe-v2?cursor=" + strconv.FormatUint(cursor, 10)
+	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/xrpc/network.bsky.jetstream.subscribe?cursor=" + strconv.FormatUint(cursor, 10)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	conn, resp, err := websocket.Dial(ctx, wsURL, nil)

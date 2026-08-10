@@ -1,10 +1,11 @@
-// Command dicttrain retrains the /subscribe-v2 zstd dictionary from live
+// Command dicttrain retrains the v2 subscribe zstd dictionary from live
 // firehose traffic. It is a dev/operator-time tool, not part of the server:
 //
 //	just train-subscribe-dict            # against localhost:8080
 //	just train-subscribe-dict host=...   # against another instance
 //
-// It captures --samples uncompressed frames from ws://<host>/subscribe-v2,
+// It captures --samples uncompressed frames from the live
+// /xrpc/network.bsky.jetstream.subscribe websocket,
 // trains a fastCOVER dictionary via the zstd CLI (which measurably
 // outperforms pure-Go builders on this corpus; see
 // specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md §7), embeds
@@ -41,7 +42,7 @@ func main() {
 }
 
 func run() error {
-	host := flag.String("host", "localhost:8080", "jetstream host serving /subscribe-v2")
+	host := flag.String("host", "localhost:8080", "jetstream host serving the v2 subscribe endpoint")
 	samples := flag.Int("samples", 100_000, "number of events to capture for training")
 	holdout := flag.Int("holdout", 20_000, "additional events captured to evaluate the trained dictionary")
 	maxDict := flag.Int("max-dict", 65536, "maximum dictionary size in bytes")
@@ -70,7 +71,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	fmt.Printf("capturing %d training + %d holdout events from %s/subscribe-v2...\n", *samples, *holdout, *host)
+	fmt.Printf("capturing %d training + %d holdout events from %s...\n", *samples, *holdout, *host)
 	train, eval, err := capture(ctx, *host, *samples, *holdout)
 	if err != nil {
 		return fmt.Errorf("capture: %w", err)
@@ -104,9 +105,9 @@ func mustAtoi(s string) int {
 }
 
 // capture reads train+holdout consecutive uncompressed frames from the
-// /subscribe-v2 websocket.
+// live v2 websocket.
 func capture(ctx context.Context, host string, train, holdout int) (trainMsgs, evalMsgs [][]byte, err error) {
-	conn, _, err := websocket.Dial(ctx, "ws://"+host+"/subscribe-v2", &websocket.DialOptions{
+	conn, _, err := websocket.Dial(ctx, "ws://"+host+"/xrpc/network.bsky.jetstream.subscribe", &websocket.DialOptions{
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {

@@ -208,7 +208,7 @@ func TestPartB_MultiPageBackfillCutover(t *testing.T) {
 	all = append(all, live...)
 	go func() {
 		// Feed the live events shortly after the drain starts so the client has
-		// cut over to /subscribe-v2 by the time they arrive.
+		// cut over to the live tail by the time they arrive.
 		time.Sleep(50 * time.Millisecond)
 		srv.AppendLive(live...)
 	}()
@@ -332,7 +332,7 @@ func TestPartB_MidDownloadSeal(t *testing.T) {
 }
 
 // TestPartB_StaleCursorSignal (§16 stale-cursor signal / §10.1 regression): with
-// a tiny lookback, a /subscribe-v2 seq cursor below the floor must get an
+// a tiny lookback, a v2 seq cursor below the floor must get an
 // explicit "too old" HTTP 400 (not a silently truncated stream). Driven at the
 // handler level so the assertion is on the raw signal the client's re-backfill
 // keys on.
@@ -353,11 +353,12 @@ func TestPartB_StaleCursorSignal(t *testing.T) {
 	floor, _ := srv.manifest.LookbackFloor(time.Hour)
 	require.EqualValues(t, 100, floor, "the lookback floor must be the fresh segment's MinSeq")
 
-	// A cursor below the floor must get a pre-upgrade 400 carrying the floor seq.
+	// A cursor below the floor must get a pre-upgrade 400 whose XRPC
+	// envelope names CursorTooOld and carries the floor seq.
 	status, body := dialSubscribeV2(t, srv.URL, 5)
 	require.Equal(t, 400, status, "a below-floor v2 cursor must return HTTP 400, not a truncated stream")
-	require.Contains(t, body, "too old")
-	require.Contains(t, body, "100", "the 400 body must carry the lookback floor seq")
+	require.Contains(t, body, `"error":"CursorTooOld"`)
+	require.Contains(t, body, "100", "the 400 message must carry the lookback floor seq")
 
 	// A cursor at/above the floor upgrades cleanly (101 then live-tail).
 	status2, _ := dialSubscribeV2(t, srv.URL, 100)
