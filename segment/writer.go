@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sort"
 
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -822,4 +823,21 @@ func (w *Writer) Blocks() []BlockInfo {
 	out := make([]BlockInfo, len(w.flushedBlocks))
 	copy(out, w.flushedBlocks)
 	return out
+}
+
+// FlushedRangeFromSeq returns the frame-aligned byte range covering flushed
+// blocks from the first block whose MaxSeq is at least seq through the current
+// flushed end. Pending in-memory rows are excluded. Like every Writer method,
+// the caller must serialize this query against append, flush, seal, and close.
+func (w *Writer) FlushedRangeFromSeq(seq uint64) (startOffset, endOffset uint64, ok bool) {
+	if w.closed || len(w.flushedBlocks) == 0 {
+		return 0, 0, false
+	}
+	i := sort.Search(len(w.flushedBlocks), func(i int) bool {
+		return w.flushedBlocks[i].MaxSeq >= seq
+	})
+	if i == len(w.flushedBlocks) {
+		return 0, 0, false
+	}
+	return w.flushedBlocks[i].Offset, w.nextBlockOffset, true
 }

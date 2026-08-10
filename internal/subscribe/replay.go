@@ -210,13 +210,10 @@ func walkSealedRegion(ctx context.Context, input WalkInput, start uint64, emit f
 // walkActiveRegion emits events with Seq >= start from the active segment's
 // flushed blocks, in seq order, and returns the next unemitted seq.
 //
-// A concurrent seal of the active file is benign: segment.Seal only appends
-// the footer and patches the fixed header, never rewriting the frame region,
-// so the flushed frames stay byte-intact. If WalkActive runs past them into
-// footer bytes it fails loud (the footer's leading bytes don't decode as a
-// zstd frame) and emits nothing partial; that error propagates here and the
-// subscriber reconnects, by which point the file is a normal sealed segment
-// the sealed sweep will serve. See segment/walkactive_seal_test.go.
+// A concurrent seal of the active file is benign: the writer snapshot provides
+// an exact end offset before any footer, and Seal never rewrites frame bytes.
+// If the range opens after the header is finalized it returns ErrSegmentSealed;
+// the outer convergence loop re-enters the freshly published sealed region.
 func walkActiveRegion(input WalkInput, start uint64, emit func(*Entry) error) (next uint64, err error) {
 	current := start
 
@@ -261,9 +258,12 @@ func walkActiveRegion(input WalkInput, start uint64, emit func(*Entry) error) (n
 		}
 	}
 
-	activeIdx := input.Writer.ActiveIndex()
-	activePath := filepath.Join(input.Writer.SegmentsDir(), ingest.SegmentFilename(activeIdx))
-	walkErr := segment.WalkActiveFS(input.FS, activePath, func(events []segment.Event) error {
+	rng, ok := input.Writer.ActiveFlushedRange(current)
+	if !ok {
+		return current, nil
+	}
+	activePath := filepath.Join(input.Writer.SegmentsDir(), ingest.SegmentFilename(rng.Index))
+	walkErr := segment.WalkActiveRangeFS(input.FS, activePath, rng.StartOffset, rng.EndOffset, func(events []segment.Event) error {
 		for i := range events {
 			if emitOne(&events[i]) {
 				return errStopWalk
@@ -277,7 +277,7 @@ func walkActiveRegion(input WalkInput, start uint64, emit func(*Entry) error) (n
 		return current, emitErr
 	case errors.Is(walkErr, errStopWalk):
 		return current, nil
-	case walkErr != nil && !errors.Is(walkErr, os.ErrNotExist):
+	case walkErr != nil && !errors.Is(walkErr, os.ErrNotExist) && !errors.Is(walkErr, segment.ErrSegmentSealed):
 		return current, fmt.Errorf("walk active: %w", walkErr)
 	}
 

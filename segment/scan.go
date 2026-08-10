@@ -147,3 +147,60 @@ func WalkActiveFS(fs vfs.FS, path string, fn func([]Event) error) error {
 	}
 	return nil
 }
+
+// WalkActiveRange opens path as an active segment and decodes the exact
+// frame-aligned byte range [startOffset, endOffset). Unlike WalkActive it does
+// not scan the prefix before startOffset or observe bytes appended after the
+// caller's end snapshot.
+func WalkActiveRange(path string, startOffset, endOffset uint64, fn func([]Event) error) error {
+	return WalkActiveRangeFS(nil, path, startOffset, endOffset, fn)
+}
+
+// WalkActiveRangeFS is WalkActiveRange against fs. Nil fs uses the host OS
+// filesystem. The range must begin and end on frame boundaries and fit in int64.
+// A file that was already sealed when opened returns ErrSegmentSealed; a seal
+// racing after open is harmless because its footer lies beyond endOffset.
+func WalkActiveRangeFS(fs vfs.FS, path string, startOffset, endOffset uint64, fn func([]Event) error) error {
+	if startOffset < ReservedHeaderBytes || startOffset > endOffset || endOffset > math.MaxInt64 {
+		return fmt.Errorf("%w: invalid active range [%d,%d)", ErrCorruptSegment, startOffset, endOffset)
+	}
+	f, err := openSegmentReadOnly(fs, path)
+	if err != nil {
+		return err // pass through os.PathError; caller may errors.Is
+	}
+	defer func() { _ = f.Close() }()
+
+	var checksumBuf [8]byte
+	if _, err := f.ReadAt(checksumBuf[:], 4); err != nil {
+		return fmt.Errorf("segment: read active checksum: %w", err)
+	}
+	if binary.LittleEndian.Uint64(checksumBuf[:]) != 0 {
+		return fmt.Errorf("%w: %s", ErrSegmentSealed, path)
+	}
+
+	off, end := int64(startOffset), int64(endOffset)
+	for block := 0; off < end; block++ {
+		if end-off < 8 {
+			return fmt.Errorf("%w: active range has %d trailing bytes at offset %d", ErrCorruptSegment, end-off, off)
+		}
+		frame, frameLen, err := readFrameAt(f, off, end)
+		if err != nil {
+			return fmt.Errorf("segment: read active range block %d: %w", block, err)
+		}
+		events, _, err := decodeBlockCompressedSized(frame)
+		if err != nil {
+			return fmt.Errorf("segment: decode active range block %d: %w", block, err)
+		}
+		if len(events) == 0 {
+			return fmt.Errorf("%w: empty active block at offset %d", ErrCorruptSegment, off)
+		}
+		if err := fn(events); err != nil {
+			return err
+		}
+		off += int64(frameLen)
+	}
+	if off != end {
+		return fmt.Errorf("%w: active range ended at %d, want %d", ErrCorruptSegment, off, end)
+	}
+	return nil
+}
