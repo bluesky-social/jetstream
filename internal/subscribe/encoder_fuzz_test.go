@@ -94,9 +94,20 @@ func FuzzEncodeV2(f *testing.F) {
 			return
 		}
 
-		var v any
-		if err := json.Unmarshal(out, &v); err != nil {
+		// Every successful encode must be a well-formed proposal-0015
+		// message frame: one JSON object, $type "message", object payload.
+		var frame struct {
+			Type    string         `json:"$type"`
+			Payload map[string]any `json:"payload"`
+		}
+		if err := json.Unmarshal(out, &frame); err != nil {
 			t.Fatalf("EncodeV2 produced invalid JSON: %v\nbytes: %s", err, out)
+		}
+		if frame.Type != "message" {
+			t.Fatalf("EncodeV2 frame $type = %q, want message\nbytes: %s", frame.Type, out)
+		}
+		if frame.Payload == nil {
+			t.Fatalf("EncodeV2 frame has no payload object\nbytes: %s", out)
 		}
 	})
 }

@@ -362,7 +362,7 @@ func (s *JetstreamSubscribe_Commit) AppendCBOR(buf []byte) ([]byte, error) {
 	if s.LexiconTypeID != "" {
 		n++
 	}
-	if true {
+	if s.Record != nil {
 		n++
 	}
 	if s.RecordCbor != nil {
@@ -397,7 +397,7 @@ func (s *JetstreamSubscribe_Commit) AppendCBOR(buf []byte) ([]byte, error) {
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "record", buf)
-		if true {
+		if s.Record != nil {
 			buf = append(buf, cborKey_JetstreamSubscribe_Commit_record...)
 			buf = cbor.AppendNull(buf)
 		}
@@ -432,7 +432,7 @@ func (s *JetstreamSubscribe_Commit) AppendCBOR(buf []byte) ([]byte, error) {
 			buf = append(buf, cborKey_JetstreamSubscribe_Commit_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
-		if true {
+		if s.Record != nil {
 			buf = append(buf, cborKey_JetstreamSubscribe_Commit_record...)
 			buf = cbor.AppendNull(buf)
 		}
@@ -649,7 +649,7 @@ func (s *JetstreamSubscribe_Commit) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, jsonKey_JetstreamSubscribe_Commit_operation...)
 	buf = cbor.AppendJSONString(buf, s.Operation)
 	first = false
-	if true {
+	if s.Record != nil {
 		if !first {
 			buf = append(buf, ',')
 		}
