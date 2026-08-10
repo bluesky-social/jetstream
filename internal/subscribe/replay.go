@@ -213,7 +213,10 @@ func walkSealedRegion(ctx context.Context, input WalkInput, start uint64, emit f
 // A concurrent seal of the active file is benign: the writer snapshot provides
 // an exact end offset before any footer, and Seal never rewrites frame bytes.
 // If the range opens after the header is finalized it returns ErrSegmentSealed;
-// the outer convergence loop re-enters the freshly published sealed region.
+// with a manifest the outer convergence loop re-enters the freshly published
+// sealed region. Without a manifest there is no second source to converge on,
+// so a sealed-or-missing active file propagates loud — swallowing it would let
+// the cold reader silently jump its cursor past the sealed events.
 func walkActiveRegion(input WalkInput, start uint64, emit func(*Entry) error) (next uint64, err error) {
 	current := start
 
@@ -277,11 +280,18 @@ func walkActiveRegion(input WalkInput, start uint64, emit func(*Entry) error) (n
 		return current, emitErr
 	case errors.Is(walkErr, errStopWalk):
 		return current, nil
-	case walkErr != nil && !errors.Is(walkErr, os.ErrNotExist) && !errors.Is(walkErr, segment.ErrSegmentSealed):
+	case walkErr == nil:
+		return current, nil
+	case input.Manifest != nil &&
+		(errors.Is(walkErr, os.ErrNotExist) || errors.Is(walkErr, segment.ErrSegmentSealed)):
+		// Rotation seam: the snapshotted generation was sealed (or renamed
+		// away) between the range snapshot and the open. The sealed sweep's
+		// fresh manifest read serves it next pass; the no-progress guard in
+		// WalkFromCursor fails loud if it never appears.
+		return current, nil
+	default:
 		return current, fmt.Errorf("walk active: %w", walkErr)
 	}
-
-	return current, nil
 }
 
 // errStopWalk is an internal sentinel used to halt segment.WalkActive. It never
