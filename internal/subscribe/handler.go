@@ -179,7 +179,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	//     compressing under deflate is rejected loudly rather than silently
 	//     disabling one.
 	//
-	//   - /subscribe-v2: dict-zstd is the ONLY compression scheme, opted
+	//   - v2: dict-zstd is the ONLY compression scheme, opted
 	//     into with zstdDictionary=<id> where <id> names the dictionary the
 	//     client fetched via getZstdDictionary. permessage-deflate is never
 	//     negotiated (per-connection deflate is the dominant server cost at
@@ -349,7 +349,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	//     clients are unaffected. ContextTakeover reuses a 32 KB sliding
 	//     window across messages; its ~1.2 MB flate.Writer per connection
 	//     is tolerated on the legacy endpoint for wire parity.
-	//   - /subscribe-v2: NEVER negotiated. Per-connection deflate is the
+	//   - v2: NEVER negotiated. Per-connection deflate is the
 	//     dominant server cost at fanout scale and is client-triggerable;
 	//     v2's only compression is the shared dict-zstd scheme (#294). A
 	//     deflate offer from a v2 client is silently not accepted (that is

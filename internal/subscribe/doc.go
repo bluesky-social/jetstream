@@ -1,6 +1,8 @@
 // Package subscribe owns the websocket fan-out behind the public
-// /subscribe endpoint, plus the v1-compatible filtering, cursor replay,
-// and subscriber-sourced-message protocol that clients depend on.
+// /subscribe (legacy v1) and /xrpc/network.bsky.jetstream.subscribe
+// (v2, atproto proposal 0015) endpoints: the shared pull loop and
+// cursor replay, plus each endpoint's wire framing, filtering dialect,
+// and error contract.
 //
 // # Pull-based fan-out
 //
@@ -42,21 +44,34 @@
 //
 // Other concerns, each in its own file:
 //
-//   - encoder.go: a pure function family that turns a segment.Event into
-//     the Jetstream v1-compatible JSON wire format.
+//   - encoder.go: pure function families that turn a segment.Event into
+//     each endpoint's wire format — Encode (v1-compatible bare JSON
+//     objects) and EncodeV2 (proposal-0015 xrpc.v1.json message frames
+//     built through the lexgen-generated union, plus EncodeV2Error /
+//     EncodeV2Info for the error and advisory frames).
 //
-//   - cursor.go: resolves the ?cursor= query parameter (seq or time_us)
-//     against the manifest, clamped to the configured lookback floor.
+//   - cursor.go: resolves the ?cursor= query parameter (seq or unix-µs
+//     timestamp) against the manifest, clamped to the configured
+//     lookback floor.
 //
-//   - filter.go: the per-connection Filter — wantedCollections,
-//     wantedDids, maxMessageSizeBytes — plus parsers for the query-string
-//     and options_update wire formats.
+//   - filter.go: the v1 per-connection Filter — wantedCollections,
+//     wantedDids, maxMessageSizeBytes — plus parsers for the
+//     query-string and options_update wire formats. Frozen with the v1
+//     wire.
+//
+//   - filterv2.go: the v2 FilterV2 — the three orthogonal AND-composed
+//     axes (kinds, dids, collections) from the
+//     network.bsky.jetstream.subscribe lexicon, with crash-loud 400s
+//     for unknown kinds, provably-inert combinations, and the legacy
+//     wanted* parameter names.
 //
 //   - handler.go: an http.Handler that upgrades to a websocket, resolves
 //     the cursor, and runs the pull loop, pumping filtered+encoded events
-//     to the client. The reader goroutine accepts SubscriberSourcedMessage
-//     frames and applies options_update by swapping a per-connection
-//     atomic.Pointer[Filter].
+//     to the client. On v1 a reader goroutine accepts
+//     SubscriberSourcedMessage frames and applies options_update by
+//     swapping a per-connection atomic.Pointer[Filter]; on v2 the read
+//     side is CloseRead — server-push only, any client data frame closes
+//     the connection.
 //
 // V1 wire compatibility is the explicit design point. Where v2's house
 // style ("crash loud, no silent fallbacks" — CLAUDE.md) would diverge
@@ -76,9 +91,8 @@
 //
 //   - #sync events are deliberately not emitted on the v1 /subscribe wire —
 //     v1 didn't emit them either (encoder.go Encode → errSkipEvent). The
-//     /subscribe-v2 wire DOES emit #sync (EncodeV2), which is what the
-//     bundled Go client consumes. #account and #identity are emitted on
-//     both wires.
+//     v2 wire DOES emit #sync (EncodeV2), which is what the bundled Go
+//     client consumes. #account and #identity are emitted on both wires.
 //
 //   - Unknown SubscriberSourcedMessage.Type values are logged and
 //     ignored, not fatal. v1 has the same policy. Locked down by
@@ -111,23 +125,47 @@
 //     first event a hello-mode client sees is one read from its start
 //     cursor after the hello — there is no pre-hello buffering.
 //
+// # The v2 endpoint (proposal 0015)
+//
+// /xrpc/network.bsky.jetstream.subscribe serves the wire contract
+// declared in lexicons/network/bsky/jetstream/subscribe.json:
+//
+//   - xrpc.v1.json framing — one self-describing JSON object per text
+//     frame ({"$type":"message","payload":{...}} with the full
+//     "<nsid>#<kind>" $type on the payload, or {"$type":"error",...}
+//     terminal error frames). xrpc.v1.json is both the only supported
+//     Sec-WebSocket-Protocol token and the lexicon default, so
+//     negotiation is a header echo and every connection gets identical
+//     framing.
+//   - Server-push only: any client data frame closes the connection
+//     (StatusPolicyViolation). No options_update, no requireHello.
+//   - Three orthogonal AND-composed filter axes — kinds, dids,
+//     collections (filterv2.go) — each match-all when unset.
+//     collections constrains only commit events; use kinds to exclude
+//     other kinds. Legacy wanted* params are named 400s.
+//   - Pre-upgrade errors are XRPC JSON envelopes with structured names
+//     (InvalidRequest, CursorTooOld, UnknownZstdDictionary,
+//     ServiceUnavailable); clients match names, not body text.
+//
 // # Cursor replay and compression
 //
 // ?cursor= replay IS supported (cursor.go + the cold reader), resolving a
-// seq or time_us cursor against the manifest, clamped to the configured
-// --cursor-lookback floor. The too-old-cursor policy is endpoint-specific
-// (Subscription.V2, set true only on /subscribe-v2):
+// seq or unix-µs timestamp cursor against the manifest, clamped to the
+// configured --cursor-lookback floor. The too-old-cursor policy is
+// endpoint-specific (Subscription.V2):
 //
 //   - /subscribe (v1): a seq cursor below the floor is silently CLAMPED up
 //     to the floor (legacy v1 wire parity), made observable via the
 //     "clamped" cursorRequests metric label.
-//   - /subscribe-v2: a seq cursor below the floor is REJECTED with a
-//     pre-upgrade HTTP 400 carrying the floor seq (ErrCursorTooOld), so a
-//     backfilling client detects a slow handoff and re-backfills from its
-//     last seq instead of silently skipping (requestedSeq, floor].
-//   - The time_us cursor path always clamps under BOTH endpoints: a legacy
-//     timestamp cursor's documented contract is to start at the oldest
-//     retained event, and the v2 reject policy governs only the seq path.
+//   - v2: a seq cursor below the floor is REJECTED with a pre-upgrade
+//     HTTP 400 CursorTooOld carrying the floor seq, so a backfilling
+//     client detects a slow handoff and re-backfills from its last seq
+//     instead of silently skipping (requestedSeq, floor].
+//   - The timestamp cursor path always clamps under BOTH endpoints: a
+//     legacy timestamp cursor's documented contract is to start at the
+//     oldest retained event, and the v2 reject policy governs only the
+//     seq path. On v2 the clamp is announced: the first frame is an
+//     #info OutdatedCursor naming the seq actually resumed from.
 //
 // Setting --cursor-lookback=0 disables replay: a cursor param is then
 // accepted but resolves to the live tip rather than 400-ing, so v1 clients
@@ -153,7 +191,7 @@
 //   - Offering BOTH at once is rejected with a 400: the two would
 //     double-compress, so the client must pick one.
 //
-// /subscribe-v2 serves uncompressed text frames by default and offers
+// The v2 endpoint serves uncompressed text frames by default and offers
 // exactly ONE compression scheme, chosen deliberately for server
 // cheapness at high fanout (the compressed frame is memoized per event
 // and shared by every subscriber — near-zero marginal compression cost):
@@ -163,13 +201,16 @@
 //     retrained via `just train-subscribe-dict`) the client downloaded
 //     through the getZstdDictionary XRPC endpoint. An unknown or retired
 //     ID is a pre-upgrade 400 carrying the current ID — the server never
-//     sends frames a client can't decode. The legacy v1 opt-ins are 400s
-//     on v2, and permessage-deflate is NEVER negotiated (a deflate offer
-//     silently falls back to uncompressed per RFC 7692). This is a
-//     deliberate "no zero-setup compression on v2" decision: v2's
-//     audience is thick clients; browsers consume uncompressed frames or
-//     bring a wasm zstd decoder.
+//     sends frames a client can't decode. A compressed connection carries
+//     binary frames, each one zstd frame whose decompressed bytes are
+//     exactly the xrpc.v1.json text frame (message, info, and error
+//     frames alike). The legacy v1 opt-ins are 400s on v2, and
+//     permessage-deflate is NEVER negotiated (a deflate offer silently
+//     falls back to uncompressed per RFC 7692). This is a deliberate "no
+//     zero-setup compression on v2" decision: v2's audience is thick
+//     clients; browsers consume uncompressed frames or bring a wasm zstd
+//     decoder.
 //
-// The maxMessageSizeBytes cap is enforced on the uncompressed JSON length
-// for all clients on both endpoints.
+// The maxMessageSizeBytes cap is enforced on the whole uncompressed frame
+// (envelope included on v2) for all clients on both endpoints.
 package subscribe

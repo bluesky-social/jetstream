@@ -68,7 +68,7 @@ type Config struct {
 	Tracer      trace.Tracer
 	Import      ImportConfig
 
-	// Dictionary is the /subscribe-v2 compression dictionary served by
+	// Dictionary is the v2 subscribe compression dictionary served by
 	// getZstdDictionary. Empty Bytes leaves the endpoint unregistered.
 	Dictionary DictionaryConfig
 }
@@ -90,7 +90,7 @@ func New(cfg Config) *Server {
 	s.xrpc.HandleQuery("network.bsky.jetstream.listSegments", withReady(cfg.Ready, newListSegmentsHandler(cfg.Src)))
 	s.xrpc.HandleProcedure("network.bsky.jetstream.planBackfill", withReady(cfg.Ready, newPlanBackfillHandler(cfg.Src, cfg.Plan)))
 
-	// The /subscribe-v2 compression dictionary. Deliberately NOT behind the
+	// The v2 subscribe compression dictionary. Deliberately NOT behind the
 	// readiness gate: the artifact is compiled in and immutable, and a
 	// client warming up during bootstrap should be able to prefetch it.
 	if len(cfg.Dictionary.Bytes) > 0 {

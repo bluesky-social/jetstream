@@ -78,7 +78,7 @@ type liveConfig struct {
 	// mode selects raw vs. map record materialization for live commits. Zero
 	// value = the default map build.
 	mode recordDecodeMode
-	// zstdDict, when non-nil, opts the connection into the /subscribe-v2
+	// zstdDict, when non-nil, opts the connection into the
 	// dict-zstd compression scheme: the dictionary ID (parsed from the
 	// blob's header) is sent as ?zstdDictionary=<id> and incoming BINARY
 	// frames are decompressed with it. The caller obtains the blob via
@@ -107,7 +107,7 @@ func (c liveConfig) maxBackoff() time.Duration {
 	return liveBackoffMax
 }
 
-// liveConsumer tails /subscribe-v2, decoding frames into
+// liveConsumer tails the live v2 websocket, decoding frames into
 // engine events, deduplicating the at-least-once overlap by seq, and
 // reconnecting with bounded exponential backoff. It is the live half of the
 // stream: the engine consumes its output during cutover (buffered) and in
@@ -218,7 +218,7 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) e
 			return err
 		}
 		// A dict-rejected pre-upgrade 400 means the server rotated its
-		// /subscribe-v2 dictionary out from under us. Unlike a too-old
+		// dictionary out from under us. Unlike a too-old
 		// cursor this is recoverable in-place: refresh (or shed) the
 		// dictionary before the reconnect below, rather than 400-looping
 		// on an ID the server will keep refusing.

@@ -90,7 +90,7 @@ func (e *Entry) grew(delta int) {
 	}
 }
 
-// EncodedV2 returns the memoized /subscribe-v2 wire encoding for this entry.
+// EncodedV2 returns the memoized v2 (xrpc.v1.json) wire frame for this entry.
 func (e *Entry) EncodedV2() ([]byte, error) {
 	e.v2Once.Do(func() {
 		fn := e.encodeV2Fn
@@ -122,7 +122,7 @@ func (e *Entry) Compressed() ([]byte, error) {
 	return e.compressedBody, e.compressedErr
 }
 
-// CompressedV2 is Compressed for the /subscribe-v2 wire shape. It uses
+// CompressedV2 is Compressed for the v2 wire shape. It uses
 // the v2 dictionary (zstd_dictionary_v2), not the legacy v1 dictionary:
 // the v2 endpoint's compression contract is dict-ID-negotiated and
 // independent of v1's frozen scheme.

@@ -577,7 +577,7 @@ Internally, Jetstream doesn't care about handles, identity updates, or hosting s
 
 The legacy `/subscribe` (v1) endpoint preserves the original Jetstream contract: regardless of `wantedCollections`, all subscribers receive `#account` and `#identity` events (they are still gated by `wantedDids`). This is intentional backwards compatibility and must not change.
 
-`#account` and `#identity` are delivered **unconditionally** — regardless of `wantedCollections`, on **both** `/subscribe` (v1) and `/subscribe-v2`, and by the Go client (still gated by `wantedDids`). `#sync` is also unconditional with respect to `wantedCollections`, but it is only emitted on **`/subscribe-v2`**: the v1-compatible JSON wire skips `#sync` for v1 parity (v1 never emitted it — `encoder.go` returns `errSkipEvent` for the v1 `Encode`, while `EncodeV2` emits it). The bundled Go client connects to `/subscribe-v2`, so it receives `#sync`; a v1 `/subscribe` consumer does not. Earlier drafts dropped `#identity` (and hid `#account`) under a collection filter; that policy is gone (see [#142](https://github.com/bluesky-social/jetstream/issues/142), [#171](https://github.com/bluesky-social/jetstream/issues/171)). The reason is correctness, not just intuitiveness: a DID-level marker (an account delete `active=false, status=deleted`, or a `#sync` divergence) is what a folding consumer uses to purge a dead account's records, so it must reach every subscriber — including a collection-scoped one. There is no client-side suppression and no "fold before the delivery filter" step; the markers are delivered as ordinary events and the consumer folds them. (For the *backfill* path, the same coverage is provided in the archive by the DID-marker sentinel index described in Section 3.3, so a collection-filtered backfill selects those marker blocks too.)
+On v1, `#account` and `#identity` are delivered **unconditionally** — regardless of `wantedCollections` (still gated by `wantedDids`). On the v2 endpoint the same outcome is reachable but *explicit*: the `collections` filter constrains only commit events and never drops other kinds, so a `collections=X` subscriber still receives everyone's `#account`/`#identity`/`#sync` — and a consumer that genuinely wants only commits says so with `kinds=commit` (Section 5.2). `#sync` is only emitted on the v2 wire: the v1-compatible JSON wire skips `#sync` for v1 parity (v1 never emitted it — `encoder.go` returns `errSkipEvent` for the v1 `Encode`, while `EncodeV2` emits it). The bundled Go client consumes the v2 wire, so it receives `#sync`; a v1 `/subscribe` consumer does not. Earlier drafts dropped `#identity` (and hid `#account`) under a collection filter; that policy is gone (see [#142](https://github.com/bluesky-social/jetstream/issues/142), [#171](https://github.com/bluesky-social/jetstream/issues/171)). The reason is correctness, not just intuitiveness: a DID-level marker (an account delete `active=false, status=deleted`, or a `#sync` divergence) is what a folding consumer uses to purge a dead account's records, so it must reach every subscriber that hasn't explicitly filtered those kinds out — a v1 collection-scoped subscriber can't, and a v2 one has to opt out via `kinds`. There is no client-side suppression and no "fold before the delivery filter" step; the markers are delivered as ordinary events and the consumer folds them. (For the *backfill* path, the same coverage is provided in the archive by the DID-marker sentinel index described in Section 3.3, so a collection-filtered backfill selects those marker blocks too.)
 
 Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we store the `KindSync` row followed by the authoritative replacement records returned by the verifier. The `KindSync` row is a DID tombstone for compaction (see Section 3.3), so older pre-divergence record rows are physically removed once the relevant sealed segment is compacted.
 
@@ -628,26 +628,62 @@ For backwards compatibility with jetstream v1, the server also accepts a v1-styl
 Cursor lookback is bounded to the most recent 36 hours by default (matching jetstream v1), tunable via `--cursor-lookback`. The two endpoints handle a too-old cursor differently, on purpose:
 
 - `/subscribe` (v1) clamps a below-floor cursor **silently** and starts at the oldest event in the window, preserving wire parity with jetstream-legacy (real legacy consumers depend on this; a v1 `/subscribe` never rejects an old cursor). The clamp is made operator-visible via a distinct metric label.
-- `/subscribe-v2` **rejects** a below-floor seq cursor with a pre-upgrade HTTP 400 whose body carries the floor seq ("cursor … below lookback floor …"), rather than silently dropping the `(cursor, floor]` gap. This is what lets a backfilling client detect a slow handoff and re-backfill from its last seq (Section 2.1). The v2 timestamp-cursor path still clamps (legacy timestamp translation).
+- The v2 endpoint **rejects** a below-floor seq cursor with a pre-upgrade HTTP 400 whose XRPC error envelope names `CursorTooOld` and carries the floor seq in the message, rather than silently dropping the `(cursor, floor]` gap. This is what lets a backfilling client detect a slow handoff and re-backfill from its last seq (Section 2.1). The v2 timestamp-cursor path still clamps (legacy timestamp translation), and announces the clamp in-band: the first frame is an `#info OutdatedCursor` message naming the seq actually resumed from.
 
 Cursors in the future drop into live-tip mode (no replay) on both endpoints.
 
-### 5.2 The /subscribe-v2 JSON Payload
+### 5.2 The v2 Stream: network.bsky.jetstream.subscribe
 
-The `/subscribe-v2` endpoint delivers a strict superset of the v1 shape: all the same fields are present (including the decoded `commit.record` JSON), plus:
+The v2 stream serves at its lexicon-canonical XRPC path, `/xrpc/network.bsky.jetstream.subscribe`, and conforms to [atproto proposal 0015](https://github.com/bluesky-social/proposals/tree/main/0015-json-subscriptions): the `xrpc.v1.json` subprotocol, negotiated via `Sec-WebSocket-Protocol` and also the lexicon-declared default, so unnegotiated connections receive identical framing. The wire contract is declared in `lexicons/network/bsky/jetstream/subscribe.json` — the lexicon is authoritative; this section summarizes it.
 
-- `seq`: Jetstream's own monotonic 64-bit cursor assigned to this event at ingestion time (the same value as `cursor`; v1 only carries `cursor`).
-- `commit.record_cbor`: the raw DAG-CBOR payload of the record, base64-encoded. Only populated for `kind: "commit"`. This is the byte-exact form written to the segment file, suitable for verifying against a PDS or reconstructing the MST.
-- `sync`: the archived `#sync` event, which v1 never emits. `sync.blocks` is the raw CAR payload, base64-encoded. Only populated for `kind: "sync"`.
-- TODO: `prevRev`  on all events (Fig suggestion)
+Every frame is exactly one self-describing JSON object. A **message** frame wraps one lexicon message, dispatched by its `$type`:
+
+```json
+{
+  "$type": "message",
+  "payload": {
+    "$type": "network.bsky.jetstream.subscribe#commit",
+    "seq": 12345,
+    "did": "did:plc:eygmaihciaxprqvxpfvl6flk",
+    "time": "2024-09-09T19:46:02.329308Z",
+    "rev": "3l3qo2vutsw2b",
+    "operation": "create",
+    "collection": "app.bsky.feed.like",
+    "rkey": "3l3qo2vuowo2b",
+    "cid": "bafyreidwaivazkwu67xztlmuobx35hs2lnfh3kolmgfmucldvhd3sgzcqi",
+    "record": { "$type": "app.bsky.feed.like", "...": "..." },
+    "recordCbor": { "$bytes": "omdwYXlsb2Fk..." }
+  }
+}
+```
+
+The message union has five variants:
+
+- `#commit` — a record mutation. `record` is the decoded JSON; `recordCbor` is the raw DAG-CBOR in the atproto data-model `{"$bytes": "<base64>"}` form, byte-exact as archived — suitable for CID verification, MST reconstruction, or typed decoding with lexicon codegen. Both are absent on deletes.
+- `#identity`, `#account`, `#sync` — wrap the upstream `com.atproto.sync.subscribeRepos` events verbatim (the wrapped event's `seq` and `time` are the upstream relay's, distinct from jetstream's envelope fields). `#sync` is never emitted on the legacy v1 wire.
+- `#info` — a seq-less advisory (`OutdatedCursor` after a clamped timestamp-cursor resume).
+
+An **error** frame (`{"$type":"error","error":"ConsumerTooSlow","message":"..."}`) is terminal: the connection closes immediately after. Pre-upgrade rejections are standard XRPC JSON error envelopes (`{"error": "CursorTooOld", "message": "..."}`); clients match the structured error name.
+
+Every message carries jetstream's `seq` (the stream cursor) and `time` — the display timestamp as an RFC 3339 datetime with exactly six fractional digits (microsecond precision, UTC). Its unix-microseconds value is what a timestamp cursor compares against; it is the `indexed_at` value if a timestamp import set one, otherwise the `witnessed_at` time jetstream first saw the event (Section 8).
+
+Filtering is three orthogonal, AND-composed query parameters — each match-all when omitted, so no parameters means the full stream:
+
+- `kinds` (repeated) — event kinds (`commit`, `identity`, `account`, `sync`; the `$type` fragment names). Unknown values are rejected with HTTP 400 rather than silently never matching.
+- `dids` (repeated) — repo DIDs; applies to every event kind.
+- `collections` (repeated) — collection NSIDs or `<prefix>.*` patterns; constrains **only** commit events and never drops other kinds — excluding those is `kinds`' job. `collections=X` alone is "X's commits plus everyone's account/identity/sync"; `kinds=commit&collections=X` is the commits-only stream. Setting `collections` while `kinds` excludes `commit` is a 400 (the filter could never apply).
+
+The legacy v1 parameter names (`wantedCollections`, `wantedDids`) are rejected with a 400 naming the replacement — never silently ignored. The endpoint is server-push only: any client data frame closes the connection, and v1's `options_update`/`requireHello` mechanism does not exist here.
+
+The v2 endpoint also diverges from v1 in presentation policy (deliberate, per-endpoint contracts): it emits Sync 1.1 resync replacement rows (v1 advances over them silently for wire parity), and it rejects a below-floor seq cursor with a pre-upgrade 400 as described in Section 5.1 (v1 silently clamps).
+
+Compression is the dict-zstd scheme only: fetch the dictionary via `network.bsky.jetstream.getZstdDictionary`, connect with `?zstdDictionary=<id>`, and frames arrive as binary websocket messages — each one zstd frame whose decompressed bytes are exactly the `xrpc.v1.json` text frame. An unknown or retired ID is a pre-upgrade 400 (`UnknownZstdDictionary`) carrying the current ID. permessage-deflate is never negotiated (the proposal recommends it; our measurements say per-connection deflate is the dominant server cost at fanout scale — see `specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md`).
 
 The bundled Go client consumes this wire on its live tail; the raw DAG-CBOR is what lets a typed consumer decode records with its own lexicon codegen, byte-exactly.
 
-`/subscribe-v2` also diverges from v1 in presentation policy (both are deliberate, per-endpoint contracts): it emits Sync 1.1 resync replacement rows (v1 advances over them silently for wire parity), and it rejects a below-floor seq cursor with a pre-upgrade HTTP 400 as described in Section 5.1 (v1 silently clamps).
+The v2 stream is not authenticated, but it is more expensive to produce (embedded CBOR, heavier per-event payload) so we may more strictly rate limit it compared to the v1 firehose on the Bluesky-hosted instance.
 
-`/subscribe-v2` subscriptions are not authenticated, but they're more expensive to produce (base64-encoded CBOR, heavier per-event payload) so we may more strictly rate limit them compared to the v1 firehose on the Bluesky-hosted instance.
-
-> Historical note: earlier drafts specified an `?extended=true` opt-in carrying `upstream_relay_cursor` and interleaved control events (`segment_sealed`, `segment_compacted`, `heartbeat`) to serve the Section 6 replication protocol. That replication design was dropped before shipping and the extended mode was removed with it; `/subscribe-v2` always carries the superset payload described above.
+> Historical notes: earlier drafts specified an `?extended=true` opt-in carrying `upstream_relay_cursor` and interleaved control events to serve a since-dropped replication protocol, and an earlier pre-launch wire (served at `/subscribe-v2`) used bare v1-superset JSON objects with `time_us`/`cursor`/`kind`/`record_cbor` fields; both were replaced before launch — the proposal-0015 lexicon contract above is the only v2 wire that ever shipped.
 
 ## 6. Replication
 

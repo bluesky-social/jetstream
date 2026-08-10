@@ -62,7 +62,7 @@ func compressFrame(src []byte) []byte {
 	return zstdEncoders.encodeAll(src)
 }
 
-// zstdDictionaryV2 is the /subscribe-v2 dictionary, trained on live
+// zstdDictionaryV2 is the v2 subscribe dictionary, trained on live
 // firehose traffic in the v2 wire shape (which the v1 dictionary predates:
 // it has never seen record_cbor, seq, or current lexicons and manages only
 // ~1.67x on v2 frames vs this dictionary's ~2.5x). Retrain with
@@ -75,7 +75,7 @@ func compressFrame(src []byte) []byte {
 //go:embed zstd_dictionary_v2
 var zstdDictionaryV2 []byte
 
-// DictionaryV2 exposes the current /subscribe-v2 dictionary bytes for the
+// DictionaryV2 exposes the current v2 subscribe dictionary bytes for the
 // download endpoint. Treat as read-only.
 func DictionaryV2() []byte { return zstdDictionaryV2 }
 
@@ -94,7 +94,7 @@ func mustParseDictID(d []byte) uint32 {
 	return id
 }
 
-// zstdEncodersV2 is the encoder free list for /subscribe-v2 zstd frames.
+// zstdEncodersV2 is the encoder free list for v2 subscribe zstd frames.
 // Unlike the v1 encoders these use SpeedFastest: measured on live traffic
 // the level costs ~1% ratio for ~3x less CPU per message (the per-message
 // cost of dictionary encoding is dominated by match-table Reset, not the
@@ -113,7 +113,7 @@ func mustNewZstdEncoderV2() *zstd.Encoder {
 	return enc
 }
 
-// compressFrameV2 is compressFrame for the /subscribe-v2 dictionary.
+// compressFrameV2 is compressFrame for the v2 subscribe dictionary.
 func compressFrameV2(src []byte) []byte {
 	return zstdEncodersV2.encodeAll(src)
 }

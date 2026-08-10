@@ -292,7 +292,7 @@ func actionKind(a streaming.Action) (segment.Kind, error) {
 		// record currently in the repo as ActionResync with the live
 		// record bytes. Persist a distinct create-shaped kind so the
 		// v1 /subscribe presentation can hide these replacement rows
-		// while /subscribe-v2 and archive readers still see the full
+		// while v2 subscribers and archive readers still see the full
 		// Sync 1.1 state-repair stream.
 		return segment.KindCreateResync, nil
 	default:
