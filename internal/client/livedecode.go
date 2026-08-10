@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
 )
@@ -41,6 +42,29 @@ type liveStreamError struct {
 	Message string
 }
 
+// Bounds on untrusted server-supplied diagnostic strings (error codes,
+// #info names/messages) before they enter error strings and logs: a
+// hostile frame can be as large as the read limit (32 MiB), and one
+// advisory must not be able to push that into an operator's log pipeline
+// (AGENTS.md: log bounded diagnostic fields).
+const (
+	maxLiveDiagNameBytes    = 128
+	maxLiveDiagMessageBytes = 1024
+)
+
+// boundLiveString truncates an untrusted string to limit bytes,
+// rune-aligned, marking any cut with an ellipsis.
+func boundLiveString(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
 func (e *liveStreamError) Error() string {
 	if e.Message == "" {
 		return fmt.Sprintf("jetstream: live stream error: %s", e.Code)
@@ -74,7 +98,17 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		if env.Error == "" {
 			return Event{}, nil, errors.New("jetstream: live error frame missing error code")
 		}
-		return Event{}, nil, &liveStreamError{Code: env.Error, Message: env.Message}
+		return Event{}, nil, &liveStreamError{
+			Code:    boundLiveString(env.Error, maxLiveDiagNameBytes),
+			Message: boundLiveString(env.Message, maxLiveDiagMessageBytes),
+		}
+	case "":
+		// No $type at all is not a newer protocol revision — it is a
+		// malformed frame (e.g. a pre-lexicon /subscribe-v2 server, or v1
+		// JSON). Skipping it would make a wrong endpoint look healthy
+		// while delivering nothing; surface it so the consumer sees the
+		// decode errors.
+		return Event{}, nil, errors.New("jetstream: live frame missing envelope $type; is the server a network.bsky.jetstream.subscribe endpoint?")
 	default:
 		// A well-formed frame with an unknown envelope $type is a newer
 		// protocol revision; skip rather than break.
@@ -95,6 +129,24 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		return liveCommitToEvent(msg.JetstreamSubscribe_Commit.Val(), mode)
 	case msg.JetstreamSubscribe_Identity.HasVal():
 		v := msg.JetstreamSubscribe_Identity.Val()
+		// The generated decoder does not enforce lexicon `required`; a
+		// frame missing the wrapped upstream event would otherwise emit a
+		// zero-valued Identity (with orDID papering over the missing DID)
+		// and advance the dedup cursor. The check is presence-of-payload
+		// (did is set by every producer), NOT full required-field
+		// validation: jetstream archives synthetic envelopes that
+		// legitimately omit other upstream-required fields (e.g. an atmos
+		// async-resync #sync carries no time/seq), and scalar requireds
+		// like account's `active` bool are indistinguishable from their
+		// zero value anyway — enforcing those belongs in lexgen.
+		// The outer DID is checked too: it is lexicon-required and is the
+		// Event.DID every filter and fold keys on. (No equality check
+		// against the payload DID — orDID's payload-preference is the
+		// documented contract, and the two always match on a conforming
+		// server.)
+		if v.DID == "" || v.Identity.DID == "" {
+			return Event{}, nil, errors.New("jetstream: live identity frame missing required DID or identity payload")
+		}
 		seq, timeUS, err := liveEnvelopeFields(v.Seq, v.Time)
 		if err != nil {
 			return Event{}, nil, err
@@ -110,6 +162,10 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		}, nil, nil
 	case msg.JetstreamSubscribe_Account.HasVal():
 		v := msg.JetstreamSubscribe_Account.Val()
+		// See the identity branch: outer-DID + payload-presence check.
+		if v.DID == "" || v.Account.DID == "" {
+			return Event{}, nil, errors.New("jetstream: live account frame missing required DID or account payload")
+		}
 		seq, timeUS, err := liveEnvelopeFields(v.Seq, v.Time)
 		if err != nil {
 			return Event{}, nil, err
@@ -126,6 +182,13 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		}, nil, nil
 	case msg.JetstreamSubscribe_Sync.HasVal():
 		v := msg.JetstreamSubscribe_Sync.Val()
+		// See the identity branch: outer-DID + payload-presence check.
+		// Archived #sync payloads from an atmos async resync legitimately
+		// carry an empty time/seq, so did is the only reliable presence
+		// marker.
+		if v.DID == "" || v.Sync.DID == "" {
+			return Event{}, nil, errors.New("jetstream: live sync frame missing required DID or sync payload")
+		}
 		seq, timeUS, err := liveEnvelopeFields(v.Seq, v.Time)
 		if err != nil {
 			return Event{}, nil, err
@@ -141,10 +204,21 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		}, nil, nil
 	case msg.JetstreamSubscribe_Info.HasVal():
 		v := msg.JetstreamSubscribe_Info.Val()
-		return Event{}, &liveInfo{Name: v.Name, Message: v.Message.ValOr("")}, errSkipFrame
+		// Bounded at decode so every consumer of liveInfo (currently the
+		// session-loop logger) inherits the bound.
+		return Event{}, &liveInfo{
+			Name:    boundLiveString(v.Name, maxLiveDiagNameBytes),
+			Message: boundLiveString(v.Message.ValOr(""), maxLiveDiagMessageBytes),
+		}, errSkipFrame
 	default:
-		// Unknown payload $type (including the union's Unknown variant): a
-		// future server addition must not break an old client.
+		// A payload with NO $type is malformed, not a future addition: the
+		// generated union parks it in Unknown with an empty Type (the
+		// PeekJSONType not-found sentinel), and skipping it would be silent
+		// event loss. A NONEMPTY unknown $type is a newer server's message
+		// kind and skips for forward compat.
+		if msg.Unknown.HasVal() && msg.Unknown.Val().Type == "" {
+			return Event{}, nil, errors.New("jetstream: live message payload missing $type")
+		}
 		return Event{}, nil, errSkipFrame
 	}
 }
@@ -154,8 +228,13 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 // canonical datetime, parsed back to unix-µs (the engine's clock domain
 // and the timestamp-cursor unit).
 func liveEnvelopeFields(seq int64, timeStr string) (uint64, int64, error) {
-	if seq < 0 {
-		return 0, 0, fmt.Errorf("jetstream: live frame with negative seq %d", seq)
+	// Seqs are 1-based on the wire (seq 0 is the server's never-allocated
+	// sentinel), so 0 here means the required field was absent — the
+	// generated decoder does not enforce lexicon `required`. Accepting it
+	// would hand session() an event the `ev.Seq <= lastSeq` dedup silently
+	// swallows; error instead so the malformed frame is surfaced.
+	if seq <= 0 {
+		return 0, 0, fmt.Errorf("jetstream: live frame with invalid seq %d", seq)
 	}
 	ts, err := time.Parse(time.RFC3339Nano, timeStr)
 	if err != nil {
@@ -168,6 +247,13 @@ func liveCommitToEvent(c *jetstream.JetstreamSubscribe_Commit, mode recordDecode
 	seq, timeUS, err := liveEnvelopeFields(c.Seq, c.Time)
 	if err != nil {
 		return Event{}, nil, err
+	}
+	// All four identifiers are lexicon-required, and a folding consumer
+	// cannot key a mutation without them; the generated decoder doesn't
+	// enforce `required`, so a frame omitting one must error rather than
+	// emit an unfoldable event that advances the dedup cursor.
+	if c.DID == "" || c.Rev == "" || c.Collection == "" || c.Rkey == "" {
+		return Event{}, nil, errors.New("jetstream: live commit frame missing required did, rev, collection, or rkey")
 	}
 	commit := &Commit{
 		Operation:  Operation(c.Operation),

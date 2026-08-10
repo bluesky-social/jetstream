@@ -1,7 +1,6 @@
 package subscribe
 
 import (
-	"fmt"
 	"net/url"
 	"testing"
 
@@ -236,24 +235,66 @@ func TestFilterV2_NilAndEdgeSemantics(t *testing.T) {
 
 func TestParseKinds_TooManyValues(t *testing.T) {
 	t.Parallel()
-	values := make([]string, 101)
-	for i := range values {
-		values[i] = "commit"
-	}
+	// The lexicon declares maxLength: 4 on kinds; the 5th raw value is a
+	// 400 even when every value is a duplicate the mask would dedupe.
+	values := []string{"commit", "commit", "commit", "commit", "commit"}
 	_, _, err := parseKinds(values)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "too many kinds")
 }
 
-func TestParseQueryV2_CapsMatchV1(t *testing.T) {
+func TestParseQueryV2_LexiconMaxLengths(t *testing.T) {
 	t.Parallel()
 
-	// dids and collections share v1's dedupe-then-cap machinery.
+	// dids: the raw repeated-param count is capped at the lexicon's
+	// maxLength (10000) BEFORE the shared v1 dedupe-then-cap parser runs —
+	// duplicates don't buy a v2 client any slack.
 	q := url.Values{}
-	for i := range MaxWantedDIDs + 1 {
-		q.Add("dids", fmt.Sprintf("did:web:host%d.example.com", i))
+	for range MaxWantedDIDs + 1 {
+		q.Add("dids", "did:web:same.example.com")
 	}
 	_, err := ParseQueryV2(q)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "too many wanted DIDs")
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.Contains(t, err.Error(), "too many dids")
+
+	// collections: same raw-count rule at maxLength 100.
+	q = url.Values{}
+	for range MaxWantedCollections + 1 {
+		q.Add("collections", "app.bsky.feed.like")
+	}
+	_, err = ParseQueryV2(q)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.Contains(t, err.Error(), "too many collections")
+
+	// At exactly the cap, duplicates still parse fine.
+	q = url.Values{}
+	for range MaxWantedCollections {
+		q.Add("collections", "app.bsky.feed.like")
+	}
+	_, err = ParseQueryV2(q)
+	require.NoError(t, err)
+}
+
+func TestParseQueryV2_WildcardHeadValidation(t *testing.T) {
+	t.Parallel()
+
+	// v2 rejects a wildcard whose head is not a valid NSID prefix (v1
+	// deliberately accepts these for wire parity and silently never
+	// matches; the v2 lexicon promises a 400 instead).
+	for _, bad := range []string{"not_an_nsid.*", "single.*", "-bad.example.*"} {
+		q, err := url.ParseQuery("collections=" + bad)
+		require.NoError(t, err)
+		_, perr := ParseQueryV2(q)
+		require.Error(t, perr, "wildcard %q must be rejected", bad)
+		require.ErrorIs(t, perr, ErrInvalidOptions)
+		require.Contains(t, perr.Error(), "invalid collection wildcard")
+	}
+
+	// Valid two-segment authority heads keep working (the documented
+	// "app.bsky.*" shape).
+	f := mustParseV2(t, "collections=app.bsky.*")
+	require.True(t, f.Wants(v2Evt(segment.KindCreate, "did:plc:x", "app.bsky.feed.like")))
+	require.False(t, f.Wants(v2Evt(segment.KindCreate, "did:plc:x", "com.example.thing")))
 }

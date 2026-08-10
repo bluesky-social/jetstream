@@ -3,7 +3,9 @@ package client
 import (
 	"encoding/base64"
 	"strconv"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/stretchr/testify/require"
@@ -164,6 +166,26 @@ func TestDecodeLiveFrameMalformed(t *testing.T) {
 		"missing payload": `{"$type":"message"}`,
 		"bad time":        `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#sync","seq":1,"did":"did:plc:a","time":"not-a-time","sync":{"did":"did:plc:a","rev":"r","seq":1,"time":"t","blocks":{"$bytes":"AQI"}}}}`,
 		"negative seq":    `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#sync","seq":-1,"did":"did:plc:a","time":"` + testWireTime + `","sync":{"did":"did:plc:a","rev":"r","seq":1,"time":"t","blocks":{"$bytes":"AQI"}}}}`,
+		// A frame with NO envelope $type is malformed (e.g. a pre-lexicon
+		// /subscribe-v2 or v1 server), not a newer protocol revision — it
+		// must error so a wrong endpoint doesn't look healthy while
+		// silently delivering nothing.
+		"missing envelope type": `{"did":"did:plc:a","time_us":1,"cursor":1,"kind":"commit"}`,
+		// Missing REQUIRED wrapped upstream payloads: the generated union
+		// decoder does not enforce lexicon `required`, so the decode layer
+		// must — otherwise a zero-valued wrapped event is emitted and
+		// advances the dedup cursor.
+		"identity missing payload": `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#identity","seq":1,"did":"did:plc:a","time":"` + testWireTime + `"}}`,
+		"account missing payload":  `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#account","seq":1,"did":"did:plc:a","time":"` + testWireTime + `"}}`,
+		"sync missing payload":     `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#sync","seq":1,"did":"did:plc:a","time":"` + testWireTime + `"}}`,
+		// A payload with no $type discriminator is malformed, not a future
+		// message kind (which would carry a nonempty unknown $type).
+		"payload missing type": `{"$type":"message","payload":{"seq":1,"did":"did:plc:a"}}`,
+		// A commit missing its required record identifiers cannot be keyed
+		// by a folding consumer.
+		"commit missing collection": `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit","seq":1,"did":"did:plc:a","time":"` + testWireTime + `","rev":"r","operation":"delete","rkey":"k"}}`,
+		// seq 0 means the required seq field was absent (the wire is 1-based).
+		"commit zero seq": `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit","did":"did:plc:a","time":"` + testWireTime + `","rev":"r","operation":"delete","collection":"c","rkey":"k"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -172,4 +194,30 @@ func TestDecodeLiveFrameMalformed(t *testing.T) {
 			require.NotErrorIs(t, err, errSkipFrame)
 		})
 	}
+}
+
+// TestDecodeLiveFrameBoundsUntrustedDiagnostics pins the byte bounds on
+// server-supplied diagnostic strings: an error frame's code/message and an
+// #info's name/message can be as large as the read limit, and must be
+// truncated (rune-aligned) before they reach error strings or logs.
+func TestDecodeLiveFrameBoundsUntrustedDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	huge := strings.Repeat("é", 4096) // multibyte to exercise rune alignment
+
+	_, _, err := decodeLiveFrame([]byte(`{"$type":"error","error":"`+huge+`","message":"`+huge+`"}`), recordDecodeMode{})
+	var streamErr *liveStreamError
+	require.ErrorAs(t, err, &streamErr)
+	require.LessOrEqual(t, len(streamErr.Code), maxLiveDiagNameBytes+len("…"))
+	require.LessOrEqual(t, len(streamErr.Message), maxLiveDiagMessageBytes+len("…"))
+	require.True(t, utf8.ValidString(streamErr.Code), "truncation must be rune-aligned")
+	require.True(t, utf8.ValidString(streamErr.Message), "truncation must be rune-aligned")
+
+	_, info, err := decodeLiveFrame([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#info","name":"`+huge+`","message":"`+huge+`"}}`), recordDecodeMode{})
+	require.ErrorIs(t, err, errSkipFrame)
+	require.NotNil(t, info)
+	require.LessOrEqual(t, len(info.Name), maxLiveDiagNameBytes+len("…"))
+	require.LessOrEqual(t, len(info.Message), maxLiveDiagMessageBytes+len("…"))
+	require.True(t, utf8.ValidString(info.Name), "truncation must be rune-aligned")
+	require.True(t, utf8.ValidString(info.Message), "truncation must be rune-aligned")
 }

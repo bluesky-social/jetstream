@@ -330,7 +330,8 @@ lexgen:
     go run github.com/jcalabro/atmos/cmd/lexgen -lexdir lexicons -config lexgen.json
     rm -rf .lexgen-scratch
 
-# Retrain the /subscribe-v2 zstd dictionary from live firehose traffic on a
-# running jetstream instance (a few minutes of capture; needs the zstd CLI)
+# Retrain the v2 subscribe zstd dictionary from live firehose traffic on a
+# running jetstream instance's /xrpc/network.bsky.jetstream.subscribe endpoint
+# (a few minutes of capture; needs the zstd CLI)
 train-subscribe-dict host="localhost:8080":
     go run ./testing/dicttrain --host {{host}}

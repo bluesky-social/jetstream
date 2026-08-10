@@ -19,7 +19,7 @@ type JetstreamSubscribe_Account struct {
 	Account       comatproto.SyncSubscribeRepos_Account `json:"account"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
 	DID           string                                `json:"did"`
 	Seq           int64                                 `json:"seq"`
-	Time          string                                `json:"time"` // Timestamp of when Jetstream witnessed this event, microsecond precision.
+	Time          string                                `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -329,7 +329,7 @@ type JetstreamSubscribe_Commit struct {
 	Rev           string            `json:"rev"`                  // The repo rev of the commit that produced this op.
 	Rkey          string            `json:"rkey"`                 // Record key.
 	Seq           int64             `json:"seq"`                  // Jetstream's monotonic per-event sequence number; the stream cursor.
-	Time          string            `json:"time"`                 // Timestamp of when Jetstream witnessed this event, microsecond precision. Its unix-microseconds va...
+	Time          string            `json:"time"`                 // The event's display timestamp, microsecond precision: when Jetstream witnessed the event, unless ...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -817,7 +817,7 @@ type JetstreamSubscribe_Identity struct {
 	DID           string                                 `json:"did"`
 	Identity      comatproto.SyncSubscribeRepos_Identity `json:"identity"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
 	Seq           int64                                  `json:"seq"`
-	Time          string                                 `json:"time"` // Timestamp of when Jetstream witnessed this event, microsecond precision.
+	Time          string                                 `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -1585,7 +1585,7 @@ type JetstreamSubscribe_Sync struct {
 	DID           string                             `json:"did"`
 	Seq           int64                              `json:"seq"`
 	Sync          comatproto.SyncSubscribeRepos_Sync `json:"sync"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
-	Time          string                             `json:"time"` // Timestamp of when Jetstream witnessed this event, microsecond precision.
+	Time          string                             `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField

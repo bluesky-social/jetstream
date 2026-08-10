@@ -11,7 +11,7 @@
         "properties": {
           "cursor": {
             "type": "integer",
-            "description": "Resume position, inclusive: the server replays events with seq >= cursor and the client dedups the overlap. Values >= 1e15 are interpreted as a unix-microseconds timestamp instead of a seq and always clamp to the retention floor (an #info OutdatedCursor frame is sent when clamped). Omitted: start at the live tip."
+            "description": "Resume position, inclusive: the server replays events with seq >= cursor and the client dedups the overlap. Values >= 1e15 are interpreted as a unix-microseconds timestamp instead of a seq and translated to the first seq witnessed at or after that instant; a timestamp below the retention floor clamps up to the floor and an #info OutdatedCursor frame is sent. Omitted: start at the live tip."
           },
           "kinds": {
             "type": "array",
@@ -35,7 +35,7 @@
             "type": "integer",
             "minimum": 0,
             "default": 0,
-            "description": "Skip events whose uncompressed frame exceeds this many bytes. 0 (default) means no limit; malformed or negative values are treated as 0."
+            "description": "Skip events whose uncompressed frame (envelope included) exceeds this many bytes. 0 (default) means no limit."
           },
           "zstdDictionary": {
             "type": "integer",
@@ -78,7 +78,7 @@
         "time": {
           "type": "string",
           "format": "datetime",
-          "description": "Timestamp of when Jetstream witnessed this event, microsecond precision. Its unix-microseconds value is what a timestamp cursor compares against."
+          "description": "The event's display timestamp, microsecond precision: when Jetstream witnessed the event, unless an operator timestamp import overrode it. Timestamp cursors translate against the witnessed time, so after an import this value may not be a faithful resume position."
         },
         "rev": {
           "type": "string",
@@ -117,7 +117,7 @@
         "time": {
           "type": "string",
           "format": "datetime",
-          "description": "Timestamp of when Jetstream witnessed this event, microsecond precision."
+          "description": "The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to record (commit) events, so this is always the witnessed time."
         },
         "identity": {
           "type": "ref",
@@ -136,7 +136,7 @@
         "time": {
           "type": "string",
           "format": "datetime",
-          "description": "Timestamp of when Jetstream witnessed this event, microsecond precision."
+          "description": "The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to record (commit) events, so this is always the witnessed time."
         },
         "account": {
           "type": "ref",
@@ -155,7 +155,7 @@
         "time": {
           "type": "string",
           "format": "datetime",
-          "description": "Timestamp of when Jetstream witnessed this event, microsecond precision."
+          "description": "The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to record (commit) events, so this is always the witnessed time."
         },
         "sync": {
           "type": "ref",

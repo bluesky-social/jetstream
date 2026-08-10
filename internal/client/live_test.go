@@ -229,7 +229,7 @@ func TestLiveConsumerDedupsReconnectOverlap(t *testing.T) {
 func TestLiveConsumerSkipsControlAndMalformed(t *testing.T) {
 	t.Parallel()
 	conn := &scriptedConn{steps: []readStep{
-		{data: []byte(`{"kind":"heartbeat","seq":0}`)},                        // skipped
+		{data: []byte(`{"kind":"heartbeat","seq":0}`)},                        // no $type: surfaced as an error, not emitted
 		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)}, // emit
 		{data: []byte(`{not valid json`)},                                     // malformed -> error, keep going
 		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "c", "r2", true)}, // emit

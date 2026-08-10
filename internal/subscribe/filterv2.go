@@ -29,8 +29,10 @@ package subscribe
 import (
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/jcalabro/atmos"
 )
 
 // kindMask is a bitmask over the four subscriber-selectable event-kind
@@ -163,11 +165,39 @@ func ParseQueryV2(q url.Values) (*FilterV2, error) {
 		return nil, err
 	}
 
+	// The lexicon declares maxLength on the dids and collections arrays
+	// (10000 and 100); enforce it on the RAW repeated-param count, before
+	// the shared v1 parsers' dedupe-then-cap leniency. A client generated
+	// from the lexicon never sends more, and v2 has no legacy consumers
+	// whose sloppy duplicate lists need forgiving.
+	if n := len(q["dids"]); n > MaxWantedDIDs {
+		return nil, fmt.Errorf("%w: too many dids values: %d > %d", ErrInvalidOptions, n, MaxWantedDIDs)
+	}
+	if n := len(q["collections"]); n > MaxWantedCollections {
+		return nil, fmt.Errorf("%w: too many collections values: %d > %d", ErrInvalidOptions, n, MaxWantedCollections)
+	}
+
 	dids, err := parseWantedDIDs(q["dids"])
 	if err != nil {
 		return nil, err
 	}
 
+	// Unlike v1 (which is deliberately lax for wire parity), a wildcard's
+	// head must be a valid NSID prefix — the same probe idea as
+	// planBackfill's classifyCollectionPattern: appending a known-valid
+	// name label reuses atmos.ParseNSID as the single source of truth for
+	// NSID grammar. A malformed head like "not_an_nsid.*" would otherwise
+	// upgrade fine and silently match nothing — the lexicon promises a 400
+	// instead. The probe label is the shortest valid one ("x") so a long
+	// head near the 317-byte NSID cap isn't falsely rejected by the probe's
+	// own added length.
+	for _, raw := range q["collections"] {
+		if head, ok := strings.CutSuffix(raw, ".*"); ok {
+			if _, perr := atmos.ParseNSID(head + ".x"); perr != nil {
+				return nil, fmt.Errorf("%w: invalid collection wildcard: %s", ErrInvalidOptions, raw)
+			}
+		}
+	}
 	collections, err := parseWantedCollections(q["collections"])
 	if err != nil {
 		return nil, err
@@ -196,9 +226,10 @@ func parseKinds(values []string) (mask kindMask, set bool, err error) {
 	if len(values) == 0 {
 		return kindMaskAll, false, nil
 	}
-	// The enum has 4 values and the mask dedupes; a long list is abuse.
-	if len(values) > 100 {
-		return 0, false, fmt.Errorf("%w: too many kinds values: %d", ErrInvalidOptions, len(values))
+	// The lexicon declares maxLength: 4 (the enum has exactly 4 values);
+	// enforce it on the raw repeated-param count like dids/collections.
+	if len(values) > 4 {
+		return 0, false, fmt.Errorf("%w: too many kinds values: %d > 4", ErrInvalidOptions, len(values))
 	}
 	for _, v := range values {
 		switch v {
