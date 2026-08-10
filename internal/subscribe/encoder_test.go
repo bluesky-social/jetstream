@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/cbor"
@@ -341,7 +343,37 @@ func TestEncode_CursorFieldOnAccount(t *testing.T) {
 	require.Contains(t, string(body), `"cursor":12345`)
 }
 
-func TestEncodeV2_CommitSupersetWithRecordCBOR(t *testing.T) {
+// unwrapV2Frame asserts body is a proposal-0015 message frame
+// ({"$type":"message","payload":{...}}) and returns the payload object.
+func unwrapV2Frame(t *testing.T, body []byte) map[string]any {
+	t.Helper()
+	var frame map[string]any
+	require.NoError(t, json.Unmarshal(body, &frame))
+	require.Equal(t, "message", frame["$type"], "frame envelope $type")
+	require.Len(t, frame, 2, "message frame must be exactly {$type, payload}")
+	payload, ok := frame["payload"].(map[string]any)
+	require.True(t, ok, "payload not an object in %s", body)
+	return payload
+}
+
+// decodeV2Union decodes the frame's payload through the lexgen-generated
+// message union — the exact path a standard-lexicon-tooling consumer
+// takes. This is the cross-stack conformance check: the wire our encoder
+// produces must be consumable without any jetstream-specific decode code.
+func decodeV2Union(t *testing.T, body []byte) *jetstream.JetstreamSubscribe_Message {
+	t.Helper()
+	var frame struct {
+		Type    string          `json:"$type"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(body, &frame))
+	require.Equal(t, "message", frame.Type)
+	var msg jetstream.JetstreamSubscribe_Message
+	require.NoError(t, msg.UnmarshalJSON(frame.Payload))
+	return &msg
+}
+
+func TestEncodeV2_CommitFrameCarriesRecordCBOR(t *testing.T) {
 	t.Parallel()
 	payload := []byte{0xa0}
 	evt := &segment.Event{
@@ -356,29 +388,33 @@ func TestEncodeV2_CommitSupersetWithRecordCBOR(t *testing.T) {
 		Payload:             payload,
 	}
 
-	v1Body, err := Encode(evt)
-	require.NoError(t, err)
-	v2Body, err := EncodeV2(evt)
+	body, err := EncodeV2(evt)
 	require.NoError(t, err)
 
-	var v1, v2 map[string]any
-	require.NoError(t, json.Unmarshal(v1Body, &v1))
-	require.NoError(t, json.Unmarshal(v2Body, &v2))
+	got := unwrapV2Frame(t, body)
+	require.Equal(t, "network.bsky.jetstream.subscribe#commit", got["$type"])
+	require.Equal(t, float64(12345), got["seq"])
+	require.Equal(t, "did:plc:test", got["did"])
+	require.Equal(t, "2023-11-14T22:13:20.000000Z", got["time"],
+		"time must be the canonical six-fractional-digit UTC rendering of WitnessedAt")
+	require.Equal(t, "create", got["operation"])
+	require.Equal(t, "app.bsky.feed.post", got["collection"])
+	require.Equal(t, "abc", got["rkey"])
+	require.Equal(t, "rev1", got["rev"])
+	require.NotContains(t, got, "upstream_relay_cursor", "internal relay cursor must not leak onto the wire")
+	require.NotContains(t, got, "kind", "the kind discriminator is the $type; no kind field on the new wire")
+	require.NotContains(t, got, "cursor", "the duplicated cursor field died with the old wire; seq is the cursor")
 
-	for _, key := range []string{"did", "time_us", "cursor", "kind"} {
-		require.Equal(t, v1[key], v2[key], "v2 must preserve v1 top-level field %q", key)
-	}
-	require.Equal(t, float64(12345), v2["seq"])
-	require.NotContains(t, v2, "upstream_relay_cursor", "internal relay cursor must not leak onto the wire")
+	recordCbor, ok := got["recordCbor"].(map[string]any)
+	require.True(t, ok, "recordCbor must be the atproto data-model $bytes object")
+	require.Equal(t, base64.RawStdEncoding.EncodeToString(payload), recordCbor["$bytes"])
 
-	v1Commit, ok := v1["commit"].(map[string]any)
-	require.True(t, ok, "v1 commit not a map")
-	v2Commit, ok := v2["commit"].(map[string]any)
-	require.True(t, ok, "v2 commit not a map")
-	for _, key := range []string{"rev", "operation", "collection", "rkey", "cid", "record"} {
-		require.Equal(t, v1Commit[key], v2Commit[key], "v2 must preserve v1 commit field %q", key)
-	}
-	require.Equal(t, base64.StdEncoding.EncodeToString(payload), v2Commit["record_cbor"])
+	// Cross-stack: the payload decodes through the generated union.
+	msg := decodeV2Union(t, body)
+	commit := msg.JetstreamSubscribe_Commit.Val()
+	require.Equal(t, int64(12345), commit.Seq)
+	require.Equal(t, payload, commit.RecordCbor)
+	require.Equal(t, "app.bsky.feed.post", commit.Collection)
 }
 
 func TestEncodeV2_CommitDeleteOmitsRecordPayloads(t *testing.T) {
@@ -395,20 +431,16 @@ func TestEncodeV2_CommitDeleteOmitsRecordPayloads(t *testing.T) {
 
 	body, err := EncodeV2(evt)
 	require.NoError(t, err)
-	var got map[string]any
-	require.NoError(t, json.Unmarshal(body, &got))
-	require.Equal(t, "commit", got["kind"])
+	got := unwrapV2Frame(t, body)
+	require.Equal(t, "network.bsky.jetstream.subscribe#commit", got["$type"])
+	require.Equal(t, "delete", got["operation"])
 	require.Equal(t, float64(9), got["seq"])
-
-	commit, ok := got["commit"].(map[string]any)
-	require.True(t, ok, "commit not a map")
-	require.Equal(t, "delete", commit["operation"])
-	require.NotContains(t, commit, "record")
-	require.NotContains(t, commit, "cid")
-	require.NotContains(t, commit, "record_cbor")
+	require.NotContains(t, got, "record")
+	require.NotContains(t, got, "cid")
+	require.NotContains(t, got, "recordCbor")
 }
 
-func TestEncodeV2_IdentityAndAccountCarryCursors(t *testing.T) {
+func TestEncodeV2_IdentityAndAccountWrapUpstreamEvents(t *testing.T) {
 	t.Parallel()
 	ident := &comatproto.SyncSubscribeRepos_Identity{
 		DID: "did:plc:test", Seq: 99, Time: "2026-05-25T00:00:00Z",
@@ -422,13 +454,13 @@ func TestEncodeV2_IdentityAndAccountCarryCursors(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, tc := range []struct {
-		name    string
-		kind    segment.Kind
-		payload []byte
-		wantKey string
+		name        string
+		kind        segment.Kind
+		payload     []byte
+		upstreamSeq float64
 	}{
-		{"identity", segment.KindIdentity, identPayload, "identity"},
-		{"account", segment.KindAccount, acctPayload, "account"},
+		{"identity", segment.KindIdentity, identPayload, 99},
+		{"account", segment.KindAccount, acctPayload, 100},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -440,12 +472,15 @@ func TestEncodeV2_IdentityAndAccountCarryCursors(t *testing.T) {
 				Payload:     tc.payload,
 			})
 			require.NoError(t, err)
-			var got map[string]any
-			require.NoError(t, json.Unmarshal(body, &got))
-			require.Equal(t, tc.name, got["kind"])
-			require.Equal(t, float64(123), got["cursor"])
-			require.Equal(t, float64(123), got["seq"])
-			require.Contains(t, got, tc.wantKey)
+			got := unwrapV2Frame(t, body)
+			require.Equal(t, "network.bsky.jetstream.subscribe#"+tc.name, got["$type"])
+			require.Equal(t, float64(123), got["seq"], "envelope seq is jetstream's")
+			require.Equal(t, "did:plc:test", got["did"])
+
+			upstream, ok := got[tc.name].(map[string]any)
+			require.True(t, ok, "wrapped upstream event not a map")
+			require.Equal(t, tc.upstreamSeq, upstream["seq"],
+				"wrapped event keeps the upstream relay's seq, distinct from jetstream's")
 		})
 	}
 }
@@ -471,17 +506,53 @@ func TestEncodeV2_SyncEmitsArchivedEvent(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	var got map[string]any
-	require.NoError(t, json.Unmarshal(body, &got))
-	require.Equal(t, "sync", got["kind"])
+	got := unwrapV2Frame(t, body)
+	require.Equal(t, "network.bsky.jetstream.subscribe#sync", got["$type"])
 	require.Equal(t, float64(77), got["seq"])
-	require.Contains(t, got, "sync")
 
 	syncJSON, ok := got["sync"].(map[string]any)
 	require.True(t, ok, "sync not a map")
 	require.Equal(t, "did:plc:test", syncJSON["did"])
 	require.Equal(t, "rev-sync", syncJSON["rev"])
-	require.Equal(t, base64.StdEncoding.EncodeToString(sync.Blocks), syncJSON["blocks"])
+	blocks, ok := syncJSON["blocks"].(map[string]any)
+	require.True(t, ok, "blocks must be the $bytes object")
+	require.Equal(t, base64.RawStdEncoding.EncodeToString(sync.Blocks), blocks["$bytes"])
+
+	msg := decodeV2Union(t, body)
+	require.Equal(t, sync.Blocks, msg.JetstreamSubscribe_Sync.Val().Sync.Blocks)
+}
+
+func TestEncodeV2Error_FrameShape(t *testing.T) {
+	t.Parallel()
+	frame := EncodeV2Error("ConsumerTooSlow", "reader below floor rate")
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, map[string]any{
+		"$type":   "error",
+		"error":   "ConsumerTooSlow",
+		"message": "reader below floor rate",
+	}, got)
+
+	// message is optional and omitted when empty, per the proposal.
+	frame = EncodeV2Error("ConsumerTooSlow", "")
+	got = map[string]any{}
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, map[string]any{"$type": "error", "error": "ConsumerTooSlow"}, got)
+}
+
+func TestEncodeV2Info_FrameShape(t *testing.T) {
+	t.Parallel()
+	body, err := EncodeV2Info("OutdatedCursor", "starting at seq 42")
+	require.NoError(t, err)
+	got := unwrapV2Frame(t, body)
+	require.Equal(t, "network.bsky.jetstream.subscribe#info", got["$type"])
+	require.Equal(t, "OutdatedCursor", got["name"])
+	require.Equal(t, "starting at seq 42", got["message"])
+	require.NotContains(t, got, "seq", "info frames carry no seq")
+
+	msg := decodeV2Union(t, body)
+	require.True(t, msg.JetstreamSubscribe_Info.HasVal())
+	require.Equal(t, "OutdatedCursor", msg.JetstreamSubscribe_Info.Val().Name)
 }
 
 func TestEncodeV2_UnknownKindReturnsError(t *testing.T) {
@@ -548,6 +619,18 @@ func TestEncode_TimeUSResolvesDisplayValue(t *testing.T) {
 		return int64(f)
 	}
 
+	// v2 frames carry the display time as the canonical datetime string;
+	// recover the µs value to assert the same display-resolution rule.
+	v2TimeUSOf := func(t *testing.T, body []byte) int64 {
+		t.Helper()
+		payload := unwrapV2Frame(t, body)
+		s, ok := payload["time"].(string)
+		require.True(t, ok, "time not a string in %s", body)
+		ts, err := time.Parse(wireTimeLayout, s)
+		require.NoError(t, err)
+		return ts.UnixMicro()
+	}
+
 	// v1 Encode: commit, identity, account (sync has no v1 form).
 	for _, kind := range []segment.Kind{segment.KindCreate, segment.KindIdentity, segment.KindAccount} {
 		t.Run("v1_unimported_"+string(rune('0'+int(kind))), func(t *testing.T) {
@@ -570,14 +653,37 @@ func TestEncode_TimeUSResolvesDisplayValue(t *testing.T) {
 			t.Parallel()
 			body, err := EncodeV2(event(kind, witnessed, 0))
 			require.NoError(t, err)
-			require.Equal(t, witnessed, timeUSOf(t, body), "unimported must fall back to witnessed")
+			require.Equal(t, witnessed, v2TimeUSOf(t, body), "unimported must fall back to witnessed")
 		})
 		t.Run("v2_imported_"+string(rune('0'+int(kind))), func(t *testing.T) {
 			t.Parallel()
 			body, err := EncodeV2(event(kind, witnessed, imported))
 			require.NoError(t, err)
-			require.Equal(t, imported, timeUSOf(t, body), "imported display value must win")
+			require.Equal(t, imported, v2TimeUSOf(t, body), "imported display value must win")
 		})
+	}
+}
+
+// TestWireTime_MicrosecondRoundTrip pins the canonical rendering: every
+// unix-µs value formats to exactly six fractional digits UTC and parses
+// back to the identical µs value (goldens, the zstd dictionary, and
+// client-side µs recovery rely on one byte-stable rendering per instant).
+func TestWireTime_MicrosecondRoundTrip(t *testing.T) {
+	t.Parallel()
+	for _, us := range []int64{
+		0,
+		1,
+		999_999,
+		1_700_000_000_000_000,
+		1_700_000_000_123_456,
+		1_700_000_000_120_000,
+	} {
+		s := wireTime(us)
+		require.Regexp(t, `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$`, s,
+			"wire time must always carry exactly six fractional digits")
+		ts, err := time.Parse(wireTimeLayout, s)
+		require.NoError(t, err)
+		require.Equal(t, us, ts.UnixMicro(), "µs must round-trip losslessly through %q", s)
 	}
 }
 

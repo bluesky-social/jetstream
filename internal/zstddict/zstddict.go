@@ -1,6 +1,6 @@
 // Package zstddict parses the header of a structured zstd dictionary
 // (RFC 8878 §5). Shared by the server (which embeds and serves the
-// /subscribe-v2 dictionary) and the client (which fetches it and needs
+// v2 subscribe dictionary) and the client (which fetches it and needs
 // the ID for the zstdDictionary negotiation param).
 package zstddict
 

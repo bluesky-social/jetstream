@@ -79,7 +79,7 @@ type Config struct {
 	// (sha256+base32 of the payload) on the backfill path. Default false in raw
 	// mode: CID is real per-record work the typed fast path avoids by default.
 	RawRecordCIDs bool
-	// ZstdCompression, when true, opts the live tail into the /subscribe-v2
+	// ZstdCompression, when true, opts the live tail into the
 	// dict-zstd scheme: the engine fetches the server's current dictionary
 	// via getZstdDictionary before the first live dial and negotiates it
 	// with ?zstdDictionary=<id>. Fetch failure degrades to an uncompressed
@@ -307,7 +307,7 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 	//
 	// Apply the caller's exact DID/collection filter here via wantsLive (shared
 	// with the cutover tail): the server streams ALL collections to
-	// /subscribe-v2 (the client does not forward wantedCollections as a hard
+	// the live tail (the client does not treat forwarded collections as a hard
 	// filter), so the engine must drop non-matching events itself. A nil/empty
 	// matcher matches everything, so an unfiltered tail is unaffected.
 	runErr := consumer.Run(liveCtx, func(ev *Event, err error) bool {
@@ -335,7 +335,7 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 }
 
 // wantsLive reports whether a live event passes the caller's exact
-// DID/collection filter, applied client-side because /subscribe-v2 streams all
+// DID/collection filter, applied client-side because the live tail streams all
 // collections (the client does not forward wantedCollections as a hard filter).
 // There is no client-side tombstone suppression (design §5.1): every matching
 // row is delivered and a folding consumer converges. Shared by the live-only
@@ -733,7 +733,7 @@ func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover ui
 	return consumer.LastSeq(), errors.Is(err, errLiveCursorTooOld)
 }
 
-// fetchZstdDict fetches the server's current /subscribe-v2 compression
+// fetchZstdDict fetches the server's current live-tail compression
 // dictionary when the caller opted in (Config.ZstdCompression). Returns nil
 // when the opt-in is off or the fetch fails: compression is an optimization,
 // so a fetch failure degrades to an uncompressed tail (logged) rather than

@@ -507,7 +507,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Metrics:   subscribeMetrics,
 		Lookback:  opts.CursorLookback,
 	}))
-	srv.RegisterPublicRoute("GET /subscribe-v2", subscribe.NewHandler(subscribe.Subscription{
+	// The v2 stream serves at its lexicon-canonical XRPC path (proposal
+	// 0015; #318). The Go 1.22 mux prefers this exact pattern over the
+	// "/xrpc/" xrpcserver subtree registered below, so the bespoke
+	// handler owns this one NSID while atmos xrpcserver keeps the rest.
+	srv.RegisterPublicRoute("GET /xrpc/network.bsky.jetstream.subscribe", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
 		Store:     metaStore,
 		Manifest:  mft,

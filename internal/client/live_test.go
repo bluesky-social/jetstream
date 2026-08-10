@@ -136,11 +136,11 @@ func TestLiveAccountDeleteDeliveredDespiteCollectionFilter(t *testing.T) {
 
 	e := &Engine{matcher: NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})}
 
-	acctDel, err := decodeLiveFrame(liveAccountFrame(100, "did:plc:a", false, "deleted"), recordDecodeMode{})
+	acctDel, _, err := decodeLiveFrame(liveAccountFrame(100, "did:plc:a", false, "deleted"), recordDecodeMode{})
 	require.NoError(t, err)
 	require.True(t, e.wantsLive(&acctDel), "account-delete must be delivered under a collection filter")
 
-	likeCreate, err := decodeLiveFrame(liveCommitFrame(t, 101, "did:plc:a", "create", "app.bsky.feed.like", "r1", true), recordDecodeMode{})
+	likeCreate, _, err := decodeLiveFrame(liveCommitFrame(t, 101, "did:plc:a", "create", "app.bsky.feed.like", "r1", true), recordDecodeMode{})
 	require.NoError(t, err)
 	require.False(t, e.wantsLive(&likeCreate), "non-matching commit must be dropped")
 }
@@ -229,7 +229,7 @@ func TestLiveConsumerDedupsReconnectOverlap(t *testing.T) {
 func TestLiveConsumerSkipsControlAndMalformed(t *testing.T) {
 	t.Parallel()
 	conn := &scriptedConn{steps: []readStep{
-		{data: []byte(`{"kind":"heartbeat","seq":0}`)},                        // skipped
+		{data: []byte(`{"kind":"heartbeat","seq":0}`)},                        // no $type: surfaced as an error, not emitted
 		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "c", "r1", true)}, // emit
 		{data: []byte(`{not valid json`)},                                     // malformed -> error, keep going
 		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "c", "r2", true)}, // emit
@@ -248,19 +248,19 @@ func TestLiveConsumerSubscribeURL(t *testing.T) {
 	t.Parallel()
 	c := newLiveConsumer(liveConfig{host: "https://jetstream.example", cursor: 123})
 	u := c.subscribeURL()
-	require.True(t, strings.HasPrefix(u, "wss://jetstream.example/subscribe-v2?"), "got %s", u)
+	require.True(t, strings.HasPrefix(u, "wss://jetstream.example/xrpc/network.bsky.jetstream.subscribe?"), "got %s", u)
 	require.NotContains(t, u, "extended=", "the removed extended param must not be sent")
 	require.Contains(t, u, "cursor=123")
 
 	c2 := newLiveConsumer(liveConfig{host: "http://localhost:8080", fromTip: true})
 	u2 := c2.subscribeURL()
-	require.True(t, strings.HasPrefix(u2, "ws://localhost:8080/subscribe-v2"), "got %s", u2)
+	require.True(t, strings.HasPrefix(u2, "ws://localhost:8080/xrpc/network.bsky.jetstream.subscribe"), "got %s", u2)
 	require.NotContains(t, u2, "cursor=", "no cursor when fromTip (live from tip)")
 }
 
 // TestLiveConsumerSubscribeURLForwardsFilters verifies the live tail forwards
-// the caller's collection/DID filters on the wire as wantedCollections/
-// wantedDids. The server filters server-side (v1 ParseQuery), so forwarding
+// the caller's collection/DID filters on the wire as repeated collections/
+// dids params. The server filters server-side (ParseQueryV2), so forwarding
 // them avoids pulling the full firehose over the socket and discarding most of
 // it client-side. Each value is sent as its own repeated query param (the v1
 // wire shape ParseQuery expects). The client-side matcher remains a backstop.
@@ -275,16 +275,16 @@ func TestLiveConsumerSubscribeURLForwardsFilters(t *testing.T) {
 	parsed, err := url.Parse(u)
 	require.NoError(t, err)
 	q := parsed.Query()
-	require.Equal(t, []string{"app.bsky.feed.post", "app.bsky.feed.like"}, q["wantedCollections"],
-		"each collection must be a repeated wantedCollections param; got %s", u)
-	require.Equal(t, []string{"did:plc:a", "did:plc:b"}, q["wantedDids"],
-		"each DID must be a repeated wantedDids param; got %s", u)
+	require.Equal(t, []string{"app.bsky.feed.post", "app.bsky.feed.like"}, q["collections"],
+		"each collection must be a repeated collections param; got %s", u)
+	require.Equal(t, []string{"did:plc:a", "did:plc:b"}, q["dids"],
+		"each DID must be a repeated dids param; got %s", u)
 
 	// No filters -> no params (unfiltered tail unaffected).
 	c2 := newLiveConsumer(liveConfig{host: "https://h"})
 	u2 := c2.subscribeURL()
-	require.NotContains(t, u2, "wantedCollections", "no collection filter -> no param")
-	require.NotContains(t, u2, "wantedDids", "no DID filter -> no param")
+	require.NotContains(t, u2, "collections", "no collection filter -> no param")
+	require.NotContains(t, u2, "dids", "no DID filter -> no param")
 }
 
 // TestLiveConsumerSubscribeURLCursorZero guards the bufferless cutover's

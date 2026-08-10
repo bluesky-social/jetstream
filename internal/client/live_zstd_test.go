@@ -126,7 +126,7 @@ func TestLiveConsumerZstd_DictRotationRefetches(t *testing.T) {
 		urls = append(urls, rawURL)
 		if len(urls) == 1 {
 			// Mirror the server's rotation refusal, as mapped by dialWebsocket.
-			return nil, fmt.Errorf("%w: %s 424244; current dictionary id is 424245", errLiveDictRejected, zstdDictRejectedMarker)
+			return nil, fmt.Errorf("%w: unknown zstd dictionary id 424244; current dictionary id is 424245", errLiveDictRejected)
 		}
 		return conn, nil
 	}
@@ -166,7 +166,7 @@ func TestLiveConsumerZstd_DictRejectedFallsBackUncompressed(t *testing.T) {
 		defer mu.Unlock()
 		urls = append(urls, rawURL)
 		if len(urls) == 1 {
-			return nil, fmt.Errorf("%w: %s 424246", errLiveDictRejected, zstdDictRejectedMarker)
+			return nil, fmt.Errorf("%w: unknown zstd dictionary id 424246", errLiveDictRejected)
 		}
 		return conn, nil
 	}

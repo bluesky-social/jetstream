@@ -72,7 +72,9 @@ func TestHandlerV2_ZstdDictionaryParam_DeliversV2DictFrames(t *testing.T) {
 	got, err := dec.DecodeAll(frame, nil)
 	require.NoError(t, err, "frame must decode with the v2 dictionary")
 	require.Contains(t, string(got), "did:plc:v2dictparam")
-	require.Contains(t, string(got), `"kind":"identity"`)
+	require.Contains(t, string(got), `"$type":"network.bsky.jetstream.subscribe#identity"`,
+		"decompressed bytes must be exactly the xrpc.v1.json text frame")
+	require.True(t, strings.HasPrefix(string(got), `{"$type":"message","payload":`))
 
 	// The legacy v1 dictionary must NOT decode v2 frames.
 	v1Dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionary))

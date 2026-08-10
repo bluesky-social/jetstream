@@ -37,11 +37,11 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// liveServer serves a fixed set of /subscribe-v2 commit frames.
+// liveServer serves a fixed set of live commit frames at the v2 NSID path.
 func liveServer(t *testing.T, frames []string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/subscribe-v2" {
+		if r.URL.Path != "/xrpc/network.bsky.jetstream.subscribe" {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -68,9 +68,10 @@ func commitFrame(t *testing.T, seq uint64, did, coll, rkey string) string {
 		t.Fatal(err)
 	}
 	s := strconv.FormatUint(seq, 10)
-	return `{"did":"` + did + `","time_us":1,"cursor":` + s + `,"seq":` + s +
-		`,"kind":"commit","commit":{"rev":"r","operation":"create","collection":"` + coll +
-		`","rkey":"` + rkey + `","cid":"bafytest","record_cbor":"` + base64.StdEncoding.EncodeToString(rec) + `"}}`
+	return `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit"` +
+		`,"seq":` + s + `,"did":"` + did + `","time":"1970-01-01T00:00:00.000001Z"` +
+		`,"rev":"r","operation":"create","collection":"` + coll +
+		`","rkey":"` + rkey + `","cid":"bafytest","recordCbor":{"$bytes":"` + base64.RawStdEncoding.EncodeToString(rec) + `"}}}`
 }
 
 // TestSubscribeFatalBackfillReturnsError is the E1/E2 regression guard: a

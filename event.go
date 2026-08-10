@@ -12,7 +12,7 @@ const (
 	// KindAccount is a #account event (hosting-status change). Account is non-nil.
 	KindAccount Kind = "account"
 	// KindSync is a #sync event (repo divergence / resync). Sync is non-nil.
-	// Sync events are delivered on backfill and on the /subscribe-v2 live tail.
+	// Sync events are delivered on backfill and on the live tail.
 	KindSync Kind = "sync"
 )
 
@@ -82,7 +82,8 @@ type Commit struct {
 	// RecordCBOR is the raw, byte-exact DAG-CBOR encoding of the record,
 	// suitable for verifying against a PDS or reconstructing the MST. nil for
 	// deletes. It is populated on both the backfill and live paths. Marshals
-	// to base64 (matching the /subscribe-v2 wire's record_cbor).
+	// to base64 in JSON output (the live wire itself carries the atproto
+	// data-model {"$bytes": ...} form).
 	RecordCBOR []byte `json:"record_cbor,omitempty"`
 }
 

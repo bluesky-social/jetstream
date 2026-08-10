@@ -321,11 +321,17 @@ fuzz DURATION="10s" *ARGS="./...":
         done
     done
 
-# Generate Go XRPC types from the lexicons in ./lexicons
+# Generate Go XRPC types from the lexicons in ./lexicons.
+# The com.atproto package mapping exists only so lexgen can resolve
+# cross-NSID refs (subscribe.json wraps subscribeRepos events); its
+# generated output is a throwaway duplicate of atmos's own api/comatproto,
+# so it lands in a scratch dir that is deleted afterwards.
 lexgen:
     go run github.com/jcalabro/atmos/cmd/lexgen -lexdir lexicons -config lexgen.json
+    rm -rf .lexgen-scratch
 
-# Retrain the /subscribe-v2 zstd dictionary from live firehose traffic on a
-# running jetstream instance (a few minutes of capture; needs the zstd CLI)
+# Retrain the v2 subscribe zstd dictionary from live firehose traffic on a
+# running jetstream instance's /xrpc/network.bsky.jetstream.subscribe endpoint
+# (a few minutes of capture; needs the zstd CLI)
 train-subscribe-dict host="localhost:8080":
     go run ./testing/dicttrain --host {{host}}

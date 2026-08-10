@@ -286,8 +286,8 @@ func clampMaxMsgSize(n int) uint32 {
 //   - wantedCollections applies ONLY to commit events
 //     (KindCreate / KindUpdate / KindDelete / KindCreateResync). #account,
 //     #identity, and #sync — the DID-level events, which carry no collection —
-//     always bypass the collection filter on BOTH /subscribe (v1) and
-//     /subscribe-v2 (v1 README: "Regardless of desired collections, all
+//     always bypass the collection filter on /subscribe (v1 README:
+//     "Regardless of desired collections, all
 //     subscribers receive Account and Identity events"). They are the only
 //     signal a collection-scoped consumer has to purge a dead account's
 //     records, so hiding them would create a permanently stale view. They still
@@ -321,15 +321,7 @@ func (f *Filter) Wants(evt *segment.Event) bool {
 	if evt.Collection == "" {
 		return true
 	}
-	if _, ok := f.wantedCollections.fullPaths[evt.Collection]; ok {
-		return true
-	}
-	for _, prefix := range f.wantedCollections.prefixes {
-		if strings.HasPrefix(evt.Collection, prefix) {
-			return true
-		}
-	}
-	return false
+	return f.wantedCollections.matches(evt.Collection)
 }
 
 func isCommitKind(k segment.Kind) bool {

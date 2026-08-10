@@ -2,14 +2,16 @@ package subscribe
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"time"
 
+	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/streaming"
+	"github.com/jcalabro/gt"
 )
 
 // Encode renders evt as the Jetstream v1 JSON wire format.
@@ -36,23 +38,147 @@ func Encode(evt *segment.Event) ([]byte, error) {
 	}
 }
 
-// EncodeV2 renders evt as the Jetstream /subscribe-v2 JSON wire format.
-// It is a superset of the v1-compatible shape for v1-visible events
-// (adding seq and commit.record_cbor), and additionally emits archived
-// #sync events.
+// wireTimeLayout is the canonical rendering of an event's witnessed
+// timestamp on the network.bsky.jetstream.subscribe wire: RFC 3339 UTC
+// with exactly six fractional digits, so the unix-microseconds value a
+// timestamp cursor compares against round-trips byte-stably (goldens,
+// the shared zstd dictionary, and client-side µs recovery all rely on
+// one rendering per instant).
+const wireTimeLayout = "2006-01-02T15:04:05.000000Z"
+
+// wireTime renders a unix-microseconds timestamp in wireTimeLayout.
+func wireTime(us int64) string {
+	return time.UnixMicro(us).UTC().Format(wireTimeLayout)
+}
+
+// messageFramePrefix opens an xrpc.v1.json message frame; the payload's
+// JSON follows, then messageFrameSuffix.
+const (
+	messageFramePrefix = `{"$type":"message","payload":`
+	messageFrameSuffix = `}`
+)
+
+// EncodeV2 renders evt as one xrpc.v1.json message frame for the
+// network.bsky.jetstream.subscribe wire (atproto proposal 0015):
+//
+//	{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#<kind>", ...}}
+//
+// The payload is built through the lexgen-generated message union so the
+// wire can never drift from the published lexicon. Unlike the v1 wire it
+// emits archived #sync events.
 func EncodeV2(evt *segment.Event) ([]byte, error) {
+	var msg jetstream.JetstreamSubscribe_Message
 	switch evt.Kind {
 	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
-		return encodeV2Commit(evt)
+		commit, err := v2Commit(evt)
+		if err != nil {
+			return nil, err
+		}
+		msg.JetstreamSubscribe_Commit = gt.SomeRef(commit)
 	case segment.KindIdentity:
-		return encodeV2Identity(evt)
+		var id comatproto.SyncSubscribeRepos_Identity
+		if err := id.UnmarshalCBOR(evt.Payload); err != nil {
+			return nil, fmt.Errorf("subscribe: decode identity: %w", err)
+		}
+		msg.JetstreamSubscribe_Identity = gt.SomeRef(jetstream.JetstreamSubscribe_Identity{
+			Seq:      int64(evt.Seq),
+			DID:      evt.DID,
+			Time:     wireTime(evt.DisplayTimeUS()),
+			Identity: id,
+		})
 	case segment.KindAccount:
-		return encodeV2Account(evt)
+		var acct comatproto.SyncSubscribeRepos_Account
+		if err := acct.UnmarshalCBOR(evt.Payload); err != nil {
+			return nil, fmt.Errorf("subscribe: decode account: %w", err)
+		}
+		msg.JetstreamSubscribe_Account = gt.SomeRef(jetstream.JetstreamSubscribe_Account{
+			Seq:     int64(evt.Seq),
+			DID:     evt.DID,
+			Time:    wireTime(evt.DisplayTimeUS()),
+			Account: acct,
+		})
 	case segment.KindSync:
-		return encodeV2Sync(evt)
+		var sync comatproto.SyncSubscribeRepos_Sync
+		if err := sync.UnmarshalCBOR(evt.Payload); err != nil {
+			return nil, fmt.Errorf("subscribe: decode sync: %w", err)
+		}
+		msg.JetstreamSubscribe_Sync = gt.SomeRef(jetstream.JetstreamSubscribe_Sync{
+			Seq:  int64(evt.Seq),
+			DID:  evt.DID,
+			Time: wireTime(evt.DisplayTimeUS()),
+			Sync: sync,
+		})
 	default:
 		return nil, fmt.Errorf("subscribe: unknown event kind %d", evt.Kind)
 	}
+
+	buf := make([]byte, 0, 256+len(evt.Payload))
+	buf = append(buf, messageFramePrefix...)
+	buf, err := msg.AppendJSON(buf)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe: encode v2 frame: %w", err)
+	}
+	return append(buf, messageFrameSuffix...), nil
+}
+
+// v2Commit builds the generated #commit payload from a commit-kind event.
+func v2Commit(evt *segment.Event) (jetstream.JetstreamSubscribe_Commit, error) {
+	commit := jetstream.JetstreamSubscribe_Commit{
+		Seq:        int64(evt.Seq),
+		DID:        evt.DID,
+		Time:       wireTime(evt.DisplayTimeUS()),
+		Rev:        evt.Rev,
+		Operation:  commitOpString(evt.Kind),
+		Collection: evt.Collection,
+		Rkey:       evt.Rkey,
+	}
+
+	if evt.Kind != segment.KindDelete {
+		recordVal, err := cbor.NewDecoder(bytes.NewReader(evt.Payload)).ReadValue()
+		if err != nil {
+			return commit, fmt.Errorf("subscribe: decode record cbor: %w", err)
+		}
+		recordJSON, err := cbor.ToJSON(recordVal)
+		if err != nil {
+			return commit, fmt.Errorf("subscribe: marshal record json: %w", err)
+		}
+		commit.Record = recordJSON
+		commit.CID = gt.Some(cbor.ComputeCID(cbor.CodecDagCBOR, evt.Payload).String())
+		commit.RecordCbor = evt.Payload
+	}
+	return commit, nil
+}
+
+// EncodeV2Error renders an xrpc.v1.json error frame:
+// {"$type":"error","error":code,"message":message}. Per the event-stream
+// spec the connection closes immediately after one is sent. message may
+// be empty.
+func EncodeV2Error(code, message string) []byte {
+	buf := append([]byte(nil), `{"$type":"error","error":`...)
+	buf = cbor.AppendJSONString(buf, code)
+	if message != "" {
+		buf = append(buf, `,"message":`...)
+		buf = cbor.AppendJSONString(buf, message)
+	}
+	return append(buf, '}')
+}
+
+// EncodeV2Info renders an #info advisory as an xrpc.v1.json message
+// frame. Info frames carry no seq and do not advance the cursor.
+func EncodeV2Info(name, message string) ([]byte, error) {
+	info := jetstream.JetstreamSubscribe_Info{Name: name}
+	if message != "" {
+		info.Message = gt.Some(message)
+	}
+	msg := jetstream.JetstreamSubscribe_Message{
+		JetstreamSubscribe_Info: gt.SomeRef(info),
+	}
+	buf := append([]byte(nil), messageFramePrefix...)
+	buf, err := msg.AppendJSON(buf)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe: encode info frame: %w", err)
+	}
+	return append(buf, messageFrameSuffix...), nil
 }
 
 func encodeCommit(evt *segment.Event) ([]byte, error) {
@@ -86,76 +212,6 @@ func encodeCommit(evt *segment.Event) ([]byte, error) {
 	return json.Marshal(env)
 }
 
-type v2Event struct {
-	DID      string                                  `json:"did"`
-	TimeUS   int64                                   `json:"time_us"`
-	Cursor   uint64                                  `json:"cursor"`
-	Kind     string                                  `json:"kind"`
-	Seq      uint64                                  `json:"seq"`
-	Commit   *v2Commit                               `json:"commit,omitempty"`
-	Account  *comatproto.SyncSubscribeRepos_Account  `json:"account,omitempty"`
-	Identity *comatproto.SyncSubscribeRepos_Identity `json:"identity,omitempty"`
-	Sync     *v2Sync                                 `json:"sync,omitempty"`
-}
-
-type v2Commit struct {
-	Rev        string          `json:"rev"`
-	Operation  string          `json:"operation"`
-	Collection string          `json:"collection"`
-	RKey       string          `json:"rkey"`
-	Record     json.RawMessage `json:"record,omitempty"`
-	CID        string          `json:"cid,omitempty"`
-	RecordCBOR string          `json:"record_cbor,omitempty"`
-}
-
-// Keep Jetstream's v2 wire shape independent from atmos's generated
-// atproto JSON encoding for bytes, which uses DAG-JSON {"$bytes": "..."}.
-type v2Sync struct {
-	LexiconTypeID string `json:"$type,omitempty"`
-	Blocks        []byte `json:"blocks"`
-	DID           string `json:"did"`
-	Rev           string `json:"rev"`
-	Seq           int64  `json:"seq"`
-	Time          string `json:"time"`
-}
-
-func v2Envelope(evt *segment.Event, kind string) v2Event {
-	return v2Event{
-		DID:    evt.DID,
-		TimeUS: evt.DisplayTimeUS(),
-		Cursor: evt.Seq,
-		Kind:   kind,
-		Seq:    evt.Seq,
-	}
-}
-
-func encodeV2Commit(evt *segment.Event) ([]byte, error) {
-	commit := &v2Commit{
-		Rev:        evt.Rev,
-		Operation:  commitOpString(evt.Kind),
-		Collection: evt.Collection,
-		RKey:       evt.Rkey,
-	}
-
-	if evt.Kind != segment.KindDelete {
-		recordVal, err := cbor.NewDecoder(bytes.NewReader(evt.Payload)).ReadValue()
-		if err != nil {
-			return nil, fmt.Errorf("subscribe: decode record cbor: %w", err)
-		}
-		recordJSON, err := cbor.ToJSON(recordVal)
-		if err != nil {
-			return nil, fmt.Errorf("subscribe: marshal record json: %w", err)
-		}
-		commit.Record = recordJSON
-		commit.CID = cbor.ComputeCID(cbor.CodecDagCBOR, evt.Payload).String()
-		commit.RecordCBOR = base64.StdEncoding.EncodeToString(evt.Payload)
-	}
-
-	env := v2Envelope(evt, streaming.JetstreamKindCommit)
-	env.Commit = commit
-	return json.Marshal(&env)
-}
-
 func commitOpString(k segment.Kind) string {
 	switch k {
 	case segment.KindCreate, segment.KindCreateResync:
@@ -167,43 +223,6 @@ func commitOpString(k segment.Kind) string {
 	default:
 		return ""
 	}
-}
-
-func encodeV2Identity(evt *segment.Event) ([]byte, error) {
-	var id comatproto.SyncSubscribeRepos_Identity
-	if err := id.UnmarshalCBOR(evt.Payload); err != nil {
-		return nil, fmt.Errorf("subscribe: decode identity: %w", err)
-	}
-	env := v2Envelope(evt, streaming.JetstreamKindIdentity)
-	env.Identity = &id
-	return json.Marshal(&env)
-}
-
-func encodeV2Account(evt *segment.Event) ([]byte, error) {
-	var acct comatproto.SyncSubscribeRepos_Account
-	if err := acct.UnmarshalCBOR(evt.Payload); err != nil {
-		return nil, fmt.Errorf("subscribe: decode account: %w", err)
-	}
-	env := v2Envelope(evt, streaming.JetstreamKindAccount)
-	env.Account = &acct
-	return json.Marshal(&env)
-}
-
-func encodeV2Sync(evt *segment.Event) ([]byte, error) {
-	var sync comatproto.SyncSubscribeRepos_Sync
-	if err := sync.UnmarshalCBOR(evt.Payload); err != nil {
-		return nil, fmt.Errorf("subscribe: decode sync: %w", err)
-	}
-	env := v2Envelope(evt, "sync")
-	env.Sync = &v2Sync{
-		LexiconTypeID: sync.LexiconTypeID,
-		Blocks:        sync.Blocks,
-		DID:           sync.DID,
-		Rev:           sync.Rev,
-		Seq:           sync.Seq,
-		Time:          sync.Time,
-	}
-	return json.Marshal(&env)
 }
 
 func encodeIdentity(evt *segment.Event) ([]byte, error) {

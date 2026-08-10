@@ -24,7 +24,8 @@ forever. Jetstream splits that into two transports:
 - **Sealed history** is downloaded over HTTP/XRPC (`planBackfill` →
   `getSegment`/`getBlock`), because bulk history wants parallelism, resume,
   and CDN-cacheable immutable artifacts.
-- **The live tail** is a websocket (`/subscribe-v2`), because the tip wants
+- **The live tail** is a websocket (`/xrpc/network.bsky.jetstream.subscribe`,
+  proposal-0015 xrpc.v1.json framing), because the tip wants
   push latency.
 
 The client's job is to make the seam between the two invisible: one stream,
@@ -45,11 +46,13 @@ below.
    The client library delivers them; *consumers* fold. There is no
    client-side suppression of dead records — a backfill can deliver creates
    for records that are already deleted, followed by their markers.
-3. **DID-level markers bypass collection filters.** `#account`/`#identity`
-   (and `#sync` on v2) are delivered regardless of `wantedCollections`
-   (still gated by `wantedDids`) — they are the only purge signal a folding
-   consumer gets (§5, "unconditional events"). The bundled client's exact
-   matcher (`internal/client/filter.go`) honors this.
+3. **DID-level markers survive collection filters.** The v2 `collections`
+   filter constrains only commit events, so `#account`/`#identity`/`#sync`
+   are delivered regardless of it (still gated by `dids`) — they are the
+   only purge signal a folding consumer gets (§5, "unconditional events").
+   The bundled client's exact matcher (`internal/client/filter.go`) honors
+   this. A consumer that wants a commits-only stream must say so
+   explicitly with `kinds=commit`.
 4. **Cursors are instance-local.** Switching servers means rewinding a
    margin and re-deduping; seq values do not transfer.
 
@@ -123,8 +126,8 @@ the matched *sealed* range, no cutover — rows still in the active
 ## Phase 3: cutover to live
 
 After the sweep consumes the sealed archive (through pinned tip `S`), the
-engine cuts over (`runBackfillThenLive`, engine.go): connect
-`/subscribe-v2` once with `?cursor=max(S, lastProcessedSeq)`.
+engine cuts over (`runBackfillThenLive`, engine.go): connect the live
+websocket once with `?cursor=max(S, lastProcessedSeq)`.
 
 - The cursor is the **dedup floor**: the server replays inclusively
   (seq >= cursor), the consumer's seq dedup (`ev.Seq <= lastSeq` → drop)
@@ -142,24 +145,32 @@ engine cuts over (`runBackfillThenLive`, engine.go): connect
 → emit, reconnecting on error with exponential backoff (250ms → 30s,
 progress resets it).
 
-**Wire params** (`subscribeURL`): `cursor` (omitted on a from-tip start —
-`WithLiveCursor(0)` means "tip", distinct from an explicit cursor 0 meaning
-"everything"), repeated `wantedCollections`/`wantedDids` (server-side
-pruning; the client matcher remains the correctness backstop),
+**Wire and framing** (`subscribeURL`, `dialWebsocket`, `livedecode.go`):
+the dial offers `xrpc.v1.json` via `Sec-WebSocket-Protocol` and verifies
+the echo (RFC 6455 §4.1: a non-offered selection fails the connection; an
+empty echo is the lexicon-default fallback — identical framing). Frames
+decode through the lexgen-generated `JetstreamSubscribe_Message` union —
+the same types the server encodes with. `#info` advisories are logged and
+skipped (no seq); unknown envelope/payload `$type`s skip for forward
+compat; `{"$type":"error",...}` frames surface typed through the
+reconnect path. Params: `cursor` (omitted on a from-tip start —
+`WithLiveCursor(0)` means "tip", distinct from an explicit cursor 0
+meaning "everything"), repeated `collections`/`dids` (server-side pruning;
+the client matcher remains the correctness backstop),
 `zstdDictionary=<id>` when compression is on. Read limit: 32 MiB
-(`defaultLiveReadLimit`) — v2 frames carry base64 record CBOR.
+(`defaultLiveReadLimit`) — v2 frames embed record CBOR.
 
 **Reconnect resume**: after any delivery, reconnects send
 `cursor=lastSeq` (re-anchoring at the tip would gap); `seenAny`
 disambiguates "from-tip, nothing yet" (keep omitting the cursor) from a
 real resume.
 
-**Too-old cursor (§14)**: a seq cursor below the server's lookback floor is
-a pre-upgrade HTTP 400 whose body carries `CursorTooOldMarker`
-(`internal/subscribe/cursor.go:114`). The client substring-matches it
-(`cursorTooOldMarker`, duplicated because the client can't import the
-server package; drift is pinned by a contract test) into the typed
-`errLiveCursorTooOld` — **terminal for the connection, not the stream**:
+**Too-old cursor (§14)**: a seq cursor below the server's lookback floor
+is a pre-upgrade HTTP 400 whose XRPC error envelope names `CursorTooOld`
+(declared in the subscribe lexicon). The client matches the structured
+error name (`dialWebsocket`; the contract tests pin the names) into the
+typed `errLiveCursorTooOld` — **terminal for the connection, not the
+stream**:
 the engine re-enters the backfill loop from the last durably-processed seq,
 sweeps the now-sealed gap, and cuts over again. Cycles are bounded by
 `maxRebackfillStalls = 5` *non-advancing* cycles (engine.go:24); a resume
@@ -176,7 +187,7 @@ unix-microsecond cursors at `CursorSeqMaxThreshold = 1e15`
 (`internal/subscribe/cursor.go`) — a client never needs to disambiguate,
 but must not fabricate cursors near that boundary.
 
-## Compression (dict-zstd on /subscribe-v2)
+## Compression (dict-zstd)
 
 v2's only compression scheme (permessage-deflate is never negotiated; the
 dial deliberately doesn't offer it — see the measured rationale in
@@ -189,8 +200,10 @@ dial deliberately doesn't offer it — see the measured rationale in
    (`internal/zstddict`) and connect with `?zstdDictionary=<id>`. The
    server 400s an unknown/retired ID pre-upgrade rather than ever sending
    undecodable frames.
-3. **Decode**: event frames arrive as BINARY websocket messages, one zstd
-   frame each, decoded with a dictionary-seeded decoder whose max decoded
+3. **Decode**: frames arrive as BINARY websocket messages, one zstd frame
+   each whose decompressed bytes are exactly the xrpc.v1.json text frame
+   (message, info, and error frames alike), decoded with a
+   dictionary-seeded decoder whose max decoded
    size is capped at the connection read limit
    (`WithDecoderMaxMemory`) — `SetReadLimit` bounds only the *compressed*
    bytes, and the library default is 64 GiB, so the cap is the
@@ -198,8 +211,7 @@ dial deliberately doesn't offer it — see the measured rationale in
    error; the tail continues.
 4. **Rotation recovery**: a server retrain+redeploy changes the current
    dictionary ID; the connected client's next reconnect is refused with a
-   400 carrying `subscribe.ZstdDictRejectedMarker` (client duplicate:
-   `zstdDictRejectedMarker`, drift pinned by
+   400 whose envelope names `UnknownZstdDictionary` (drift pinned by
    `TestDialWebsocketMatchesServerDictRejected`). The consumer maps it to
    `errLiveDictRejected` and recovers in-place (`refreshDict`): refetch the
    current dictionary, swap the decoder, reconnect compressed. If the
@@ -246,9 +258,12 @@ One `Event` struct regardless of origin (archive or live): `Seq`, `DID`,
 `TimeUS`, `Kind` (`commit`/`identity`/`account`/`sync`), with the matching
 sub-struct populated. Commits carry `Record` (generic map; nil in raw
 mode), `RecordCBOR` (byte-exact DAG-CBOR), and `CID`. `#sync` events are
-delivered on backfill and the v2 live tail (v1 never emits them). The v2
-wire adds `seq` and `commit.record_cbor` over the v1 shape (§5.2); the
-client decodes both transparently.
+delivered on backfill and the v2 live tail (v1 never emits them). On the
+wire, live events are proposal-0015 message frames dispatched by payload
+`$type` (docs/README.md §5.2), with `recordCbor` as the atproto
+data-model `{"$bytes": ...}` form and `time` as a microsecond-precision
+datetime the client parses back to `TimeUS`; the decode is transparent to
+API consumers.
 
 ## Writing a third-party client: the checklist
 

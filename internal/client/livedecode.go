@@ -1,168 +1,290 @@
 package client
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
+	"unicode/utf8"
+
+	"github.com/bluesky-social/jetstream/api/jetstream"
 )
 
 // errSkipFrame signals a frame that is valid but carries no caller-visible
-// event: a control frame (heartbeat, segment_sealed, ...) or an error frame
-// the consumer handles out of band. The consumer advances past it without
+// event: an #info advisory (logged by the caller), or an unknown message
+// $type from a newer server. The consumer advances past it without
 // emitting.
 var errSkipFrame = errors.New("jetstream: skip live frame")
 
-// liveFrame is the Jetstream /subscribe-v2 JSON wire shape.
-// Only the fields the client consumes are modeled; unknown fields are ignored,
-// and unknown kinds are skipped so future control frames don't break old
-// clients.
-type liveFrame struct {
-	DID      string        `json:"did"`
-	TimeUS   int64         `json:"time_us"`
-	Cursor   uint64        `json:"cursor"`
-	Seq      uint64        `json:"seq"`
-	Kind     string        `json:"kind"`
-	Commit   *liveCommit   `json:"commit"`
-	Account  *liveAccount  `json:"account"`
-	Identity *liveIdentity `json:"identity"`
-	Sync     *liveSync     `json:"sync"`
-	ErrorTyp string        `json:"error"`
-	ErrorMsg string        `json:"message"`
+// liveEnvelope is the xrpc.v1.json frame envelope (atproto proposal 0015):
+// exactly one self-describing object per text frame, discriminated by
+// $type ("message" or "error").
+type liveEnvelope struct {
+	Type    string          `json:"$type"`
+	Payload json.RawMessage `json:"payload"` // message frames
+	Error   string          `json:"error"`   // error frames: bare error type name
+	Message string          `json:"message"` // error frames: optional description
 }
 
-type liveCommit struct {
-	Rev        string `json:"rev"`
-	Operation  string `json:"operation"`
-	Collection string `json:"collection"`
-	Rkey       string `json:"rkey"`
-	CID        string `json:"cid"`
-	RecordCBOR string `json:"record_cbor"`
+// liveInfo is surfaced to the session loop when the server sends an #info
+// advisory (e.g. OutdatedCursor on a clamped timestamp resume). Info
+// frames carry no seq and are not events; the consumer logs and continues.
+type liveInfo struct {
+	Name    string
+	Message string
 }
 
-type liveAccount struct {
-	DID    string  `json:"did"`
-	Active bool    `json:"active"`
-	Status *string `json:"status"`
-	Seq    int64   `json:"seq"`
-	Time   string  `json:"time"`
+// liveStreamError is a terminal xrpc.v1.json error frame ({"$type":
+// "error",...}). Per the event-stream spec the server closes immediately
+// after sending one; the consumer's reconnect loop handles the close.
+type liveStreamError struct {
+	Code    string
+	Message string
 }
 
-type liveIdentity struct {
-	DID    string  `json:"did"`
-	Handle *string `json:"handle"`
-	Seq    int64   `json:"seq"`
-	Time   string  `json:"time"`
-}
+// Bounds on untrusted server-supplied diagnostic strings (error codes,
+// #info names/messages) before they enter error strings and logs: a
+// hostile frame can be as large as the read limit (32 MiB), and one
+// advisory must not be able to push that into an operator's log pipeline
+// (AGENTS.md: log bounded diagnostic fields).
+const (
+	maxLiveDiagNameBytes    = 128
+	maxLiveDiagMessageBytes = 1024
+)
 
-type liveSync struct {
-	DID  string `json:"did"`
-	Rev  string `json:"rev"`
-	Seq  int64  `json:"seq"`
-	Time string `json:"time"`
-}
-
-// decodeLiveFrame parses one /subscribe-v2 JSON frame into an engine Event. It
-// returns errSkipFrame for control frames and unknown kinds, and a wrapped
-// error for malformed data frames or server error frames. mode selects raw vs.
-// map record materialization (see recordDecodeMode), matching the backfill path
-// so a typed consumer sees the same shape across the cutover.
-func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, error) {
-	var f liveFrame
-	if err := json.Unmarshal(data, &f); err != nil {
-		return Event{}, fmt.Errorf("jetstream: decode live frame: %w", err)
+// boundLiveString truncates an untrusted string to limit bytes,
+// rune-aligned, marking any cut with an ellipsis.
+func boundLiveString(s string, limit int) string {
+	if len(s) <= limit {
+		return s
 	}
-	if f.ErrorTyp != "" {
-		return Event{}, fmt.Errorf("jetstream: live error frame: %s: %s", f.ErrorTyp, f.ErrorMsg)
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+func (e *liveStreamError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("jetstream: live stream error: %s", e.Code)
+	}
+	return fmt.Sprintf("jetstream: live stream error: %s: %s", e.Code, e.Message)
+}
+
+// decodeLiveFrame parses one xrpc.v1.json frame into an engine Event.
+//
+//   - message frames decode through the lexgen-generated union — the same
+//     types the server encodes with, so the two sides cannot drift.
+//   - #info advisories return (info, errSkipFrame) so the caller can log.
+//   - unknown payload $types return errSkipFrame (forward compat: a newer
+//     server's new message kind must not break an old client).
+//   - error frames return *liveStreamError.
+//   - malformed frames return a wrapped decode error.
+//
+// mode selects raw vs. map record materialization (see recordDecodeMode),
+// matching the backfill path so a typed consumer sees the same shape
+// across the cutover.
+func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, error) {
+	var env liveEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return Event{}, nil, fmt.Errorf("jetstream: decode live frame: %w", err)
 	}
 
-	out := Event{DID: f.DID, Seq: f.Seq, TimeUS: f.TimeUS}
-	// The v1 wire format omits seq and carries the value only in cursor;
-	// v2 always sets both. Fall back to cursor so a server that only
-	// populates cursor still yields a usable seq.
-	if out.Seq == 0 {
-		out.Seq = f.Cursor
-	}
-
-	switch Kind(f.Kind) {
-	case KindCommit:
-		commit, err := liveCommitToEvent(f.Commit, mode)
-		if err != nil {
-			return Event{}, err
+	switch env.Type {
+	case "message":
+		// fall through below
+	case "error":
+		if env.Error == "" {
+			return Event{}, nil, errors.New("jetstream: live error frame missing error code")
 		}
-		out.Kind = KindCommit
-		out.Commit = commit
-	case KindIdentity:
-		if f.Identity == nil {
-			return Event{}, fmt.Errorf("jetstream: live identity frame missing identity payload (seq=%d)", out.Seq)
+		return Event{}, nil, &liveStreamError{
+			Code:    boundLiveString(env.Error, maxLiveDiagNameBytes),
+			Message: boundLiveString(env.Message, maxLiveDiagMessageBytes),
 		}
-		out.Kind = KindIdentity
-		out.Identity = &Identity{DID: orDID(f.Identity.DID, f.DID), Handle: deref(f.Identity.Handle), Seq: f.Identity.Seq, Time: f.Identity.Time}
-	case KindAccount:
-		if f.Account == nil {
-			return Event{}, fmt.Errorf("jetstream: live account frame missing account payload (seq=%d)", out.Seq)
-		}
-		out.Kind = KindAccount
-		out.Account = &Account{DID: orDID(f.Account.DID, f.DID), Active: f.Account.Active, Status: deref(f.Account.Status), Seq: f.Account.Seq, Time: f.Account.Time}
-	case KindSync:
-		if f.Sync == nil {
-			return Event{}, fmt.Errorf("jetstream: live sync frame missing sync payload (seq=%d)", out.Seq)
-		}
-		out.Kind = KindSync
-		out.Sync = &Sync{DID: orDID(f.Sync.DID, f.DID), Rev: f.Sync.Rev, Seq: f.Sync.Seq, Time: f.Sync.Time}
+	case "":
+		// No $type at all is not a newer protocol revision — it is a
+		// malformed frame (e.g. a pre-lexicon /subscribe-v2 server, or v1
+		// JSON). Skipping it would make a wrong endpoint look healthy
+		// while delivering nothing; surface it so the consumer sees the
+		// decode errors.
+		return Event{}, nil, errors.New("jetstream: live frame missing envelope $type; is the server a network.bsky.jetstream.subscribe endpoint?")
 	default:
-		// Unknown or control kind (heartbeat, segment_sealed, ...): skip so a
-		// future server addition doesn't break an old client.
-		return Event{}, errSkipFrame
+		// A well-formed frame with an unknown envelope $type is a newer
+		// protocol revision; skip rather than break.
+		return Event{}, nil, errSkipFrame
 	}
-	return out, nil
+
+	if env.Payload == nil {
+		return Event{}, nil, errors.New("jetstream: live message frame missing payload")
+	}
+
+	var msg jetstream.JetstreamSubscribe_Message
+	if err := msg.UnmarshalJSON(env.Payload); err != nil {
+		return Event{}, nil, fmt.Errorf("jetstream: decode live payload: %w", err)
+	}
+
+	switch {
+	case msg.JetstreamSubscribe_Commit.HasVal():
+		return liveCommitToEvent(msg.JetstreamSubscribe_Commit.Val(), mode)
+	case msg.JetstreamSubscribe_Identity.HasVal():
+		v := msg.JetstreamSubscribe_Identity.Val()
+		// The generated decoder does not enforce lexicon `required`; a
+		// frame missing the wrapped upstream event would otherwise emit a
+		// zero-valued Identity (with orDID papering over the missing DID)
+		// and advance the dedup cursor. The check is presence-of-payload
+		// (did is set by every producer), NOT full required-field
+		// validation: jetstream archives synthetic envelopes that
+		// legitimately omit other upstream-required fields (e.g. an atmos
+		// async-resync #sync carries no time/seq), and scalar requireds
+		// like account's `active` bool are indistinguishable from their
+		// zero value anyway — enforcing those belongs in lexgen.
+		// The outer DID is checked too: it is lexicon-required and is the
+		// Event.DID every filter and fold keys on. (No equality check
+		// against the payload DID — orDID's payload-preference is the
+		// documented contract, and the two always match on a conforming
+		// server.)
+		if v.DID == "" || v.Identity.DID == "" {
+			return Event{}, nil, errors.New("jetstream: live identity frame missing required DID or identity payload")
+		}
+		seq, timeUS, err := liveEnvelopeFields(v.Seq, v.Time)
+		if err != nil {
+			return Event{}, nil, err
+		}
+		return Event{
+			DID: v.DID, Seq: seq, TimeUS: timeUS, Kind: KindIdentity,
+			Identity: &Identity{
+				DID:    orDID(v.Identity.DID, v.DID),
+				Handle: v.Identity.Handle.ValOr(""),
+				Seq:    v.Identity.Seq,
+				Time:   v.Identity.Time,
+			},
+		}, nil, nil
+	case msg.JetstreamSubscribe_Account.HasVal():
+		v := msg.JetstreamSubscribe_Account.Val()
+		// See the identity branch: outer-DID + payload-presence check.
+		if v.DID == "" || v.Account.DID == "" {
+			return Event{}, nil, errors.New("jetstream: live account frame missing required DID or account payload")
+		}
+		seq, timeUS, err := liveEnvelopeFields(v.Seq, v.Time)
+		if err != nil {
+			return Event{}, nil, err
+		}
+		return Event{
+			DID: v.DID, Seq: seq, TimeUS: timeUS, Kind: KindAccount,
+			Account: &Account{
+				DID:    orDID(v.Account.DID, v.DID),
+				Active: v.Account.Active,
+				Status: v.Account.Status.ValOr(""),
+				Seq:    v.Account.Seq,
+				Time:   v.Account.Time,
+			},
+		}, nil, nil
+	case msg.JetstreamSubscribe_Sync.HasVal():
+		v := msg.JetstreamSubscribe_Sync.Val()
+		// See the identity branch: outer-DID + payload-presence check.
+		// Archived #sync payloads from an atmos async resync legitimately
+		// carry an empty time/seq, so did is the only reliable presence
+		// marker.
+		if v.DID == "" || v.Sync.DID == "" {
+			return Event{}, nil, errors.New("jetstream: live sync frame missing required DID or sync payload")
+		}
+		seq, timeUS, err := liveEnvelopeFields(v.Seq, v.Time)
+		if err != nil {
+			return Event{}, nil, err
+		}
+		return Event{
+			DID: v.DID, Seq: seq, TimeUS: timeUS, Kind: KindSync,
+			Sync: &Sync{
+				DID:  orDID(v.Sync.DID, v.DID),
+				Rev:  v.Sync.Rev,
+				Seq:  v.Sync.Seq,
+				Time: v.Sync.Time,
+			},
+		}, nil, nil
+	case msg.JetstreamSubscribe_Info.HasVal():
+		v := msg.JetstreamSubscribe_Info.Val()
+		// Bounded at decode so every consumer of liveInfo (currently the
+		// session-loop logger) inherits the bound.
+		return Event{}, &liveInfo{
+			Name:    boundLiveString(v.Name, maxLiveDiagNameBytes),
+			Message: boundLiveString(v.Message.ValOr(""), maxLiveDiagMessageBytes),
+		}, errSkipFrame
+	default:
+		// A payload with NO $type is malformed, not a future addition: the
+		// generated union parks it in Unknown with an empty Type (the
+		// PeekJSONType not-found sentinel), and skipping it would be silent
+		// event loss. A NONEMPTY unknown $type is a newer server's message
+		// kind and skips for forward compat.
+		if msg.Unknown.HasVal() && msg.Unknown.Val().Type == "" {
+			return Event{}, nil, errors.New("jetstream: live message payload missing $type")
+		}
+		return Event{}, nil, errSkipFrame
+	}
 }
 
-func liveCommitToEvent(c *liveCommit, mode recordDecodeMode) (*Commit, error) {
-	if c == nil {
-		return nil, fmt.Errorf("jetstream: live commit frame missing commit payload")
+// liveEnvelopeFields validates the jetstream envelope fields shared by
+// every message kind: seq (int64 on the wire, uint64 internally) and the
+// canonical datetime, parsed back to unix-µs (the engine's clock domain
+// and the timestamp-cursor unit).
+func liveEnvelopeFields(seq int64, timeStr string) (uint64, int64, error) {
+	// Seqs are 1-based on the wire (seq 0 is the server's never-allocated
+	// sentinel), so 0 here means the required field was absent — the
+	// generated decoder does not enforce lexicon `required`. Accepting it
+	// would hand session() an event the `ev.Seq <= lastSeq` dedup silently
+	// swallows; error instead so the malformed frame is surfaced.
+	if seq <= 0 {
+		return 0, 0, fmt.Errorf("jetstream: live frame with invalid seq %d", seq)
+	}
+	ts, err := time.Parse(time.RFC3339Nano, timeStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("jetstream: live frame time %q: %w", timeStr, err)
+	}
+	return uint64(seq), ts.UnixMicro(), nil
+}
+
+func liveCommitToEvent(c *jetstream.JetstreamSubscribe_Commit, mode recordDecodeMode) (Event, *liveInfo, error) {
+	seq, timeUS, err := liveEnvelopeFields(c.Seq, c.Time)
+	if err != nil {
+		return Event{}, nil, err
+	}
+	// All four identifiers are lexicon-required, and a folding consumer
+	// cannot key a mutation without them; the generated decoder doesn't
+	// enforce `required`, so a frame omitting one must error rather than
+	// emit an unfoldable event that advances the dedup cursor.
+	if c.DID == "" || c.Rev == "" || c.Collection == "" || c.Rkey == "" {
+		return Event{}, nil, errors.New("jetstream: live commit frame missing required did, rev, collection, or rkey")
 	}
 	commit := &Commit{
 		Operation:  Operation(c.Operation),
 		Collection: c.Collection,
 		Rkey:       c.Rkey,
 		Rev:        c.Rev,
-		CID:        c.CID,
+		CID:        c.CID.ValOr(""),
 	}
 	switch commit.Operation {
 	case OpCreate, OpUpdate:
-		if c.RecordCBOR == "" {
-			return nil, fmt.Errorf("jetstream: live %s commit missing record_cbor (collection=%s rkey=%s); is the server a /subscribe-v2 endpoint?", c.Operation, c.Collection, c.Rkey)
+		if len(c.RecordCbor) == 0 {
+			return Event{}, nil, fmt.Errorf("jetstream: live %s commit missing recordCbor (collection=%s rkey=%s); is the server a network.bsky.jetstream.subscribe endpoint?", c.Operation, c.Collection, c.Rkey)
 		}
-		raw, err := base64.StdEncoding.DecodeString(c.RecordCBOR)
-		if err != nil {
-			return nil, fmt.Errorf("jetstream: decode live record_cbor (collection=%s rkey=%s): %w", c.Collection, c.Rkey, err)
-		}
-		// raw is a fresh base64-decoded buffer (already owned), so it is safe to
-		// retain regardless of mode. In raw mode we skip the map build and leave
-		// Record nil; the consumer decodes RecordCBOR into a typed struct. CID is
-		// already on the wire here, so raw mode keeps it (no extra work).
-		commit.RecordCBOR = raw
+		// The generated decode already unwrapped {"$bytes": ...} into a
+		// fresh owned buffer, so it is safe to retain regardless of mode.
+		// In raw mode we skip the map build and leave Record nil; the
+		// consumer decodes RecordCBOR into a typed struct.
+		commit.RecordCBOR = c.RecordCbor
 		if !mode.raw {
-			record, err := decodeRecordMap(raw)
+			record, err := decodeRecordMap(c.RecordCbor)
 			if err != nil {
-				return nil, fmt.Errorf("jetstream: decode live record (collection=%s rkey=%s): %w", c.Collection, c.Rkey, err)
+				return Event{}, nil, fmt.Errorf("jetstream: decode live record (collection=%s rkey=%s): %w", c.Collection, c.Rkey, err)
 			}
 			commit.Record = record
 		}
 	case OpDelete:
 		// No record payload on deletes.
 	default:
-		return nil, fmt.Errorf("jetstream: unknown live commit operation %q", c.Operation)
+		return Event{}, nil, fmt.Errorf("jetstream: unknown live commit operation %q", c.Operation)
 	}
-	return commit, nil
-}
-
-func deref(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
+	return Event{DID: c.DID, Seq: seq, TimeUS: timeUS, Kind: KindCommit, Commit: commit}, nil, nil
 }
 
 // orDID prefers the payload-level DID, falling back to the envelope DID.

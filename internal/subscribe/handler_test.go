@@ -289,13 +289,10 @@ func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
 	})
 
 	frame := readOneFrame(t, ctx, conn)
-	var got map[string]any
-	require.NoError(t, json.Unmarshal(frame, &got))
-	require.Equal(t, "commit", got["kind"])
+	got := unwrapV2Frame(t, frame)
+	require.Equal(t, "network.bsky.jetstream.subscribe#commit", got["$type"])
 	require.Equal(t, "did:plc:resync", got["did"])
-	commit, ok := got["commit"].(map[string]any)
-	require.True(t, ok, "commit payload should be present")
-	require.Equal(t, "create", commit["operation"])
+	require.Equal(t, "create", got["operation"])
 }
 
 // A subscriber with a collection filter receives #identity AND #account events
@@ -319,7 +316,7 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?wantedCollections=app.bsky.feed.post"
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?collections=app.bsky.feed.post"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -349,24 +346,20 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	publishCommit(t, b, &seq, "did:plc:acct", "app.bsky.feed.post", 3)
 
 	// First frame must be the identity.
-	identFrame := readOneFrame(t, ctx, conn)
-	var gotIdent map[string]any
-	require.NoError(t, json.Unmarshal(identFrame, &gotIdent))
-	require.Equal(t, "identity", gotIdent["kind"], "identity must pass the collection filter")
+	gotIdent := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
+	require.Equal(t, "network.bsky.jetstream.subscribe#identity", gotIdent["$type"],
+		"identity must pass the collection filter")
 	require.Equal(t, "did:plc:ident", gotIdent["did"])
 
 	// Second frame must be the account.
-	acctFrame := readOneFrame(t, ctx, conn)
-	var gotAcct map[string]any
-	require.NoError(t, json.Unmarshal(acctFrame, &gotAcct))
-	require.Equal(t, "account", gotAcct["kind"], "account must pass the collection filter")
+	gotAcct := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
+	require.Equal(t, "network.bsky.jetstream.subscribe#account", gotAcct["$type"],
+		"account must pass the collection filter")
 	require.Equal(t, "did:plc:acct", gotAcct["did"])
 
 	// Third frame must be the matching commit.
-	commitFrame := readOneFrame(t, ctx, conn)
-	var gotCommit map[string]any
-	require.NoError(t, json.Unmarshal(commitFrame, &gotCommit))
-	require.Equal(t, "commit", gotCommit["kind"])
+	gotCommit := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
+	require.Equal(t, "network.bsky.jetstream.subscribe#commit", gotCommit["$type"])
 }
 
 func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
@@ -411,16 +404,13 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 		Payload:             payload,
 	})
 
-	commitFrame := readOneFrame(t, ctx, conn)
-	var commit map[string]any
-	require.NoError(t, json.Unmarshal(commitFrame, &commit))
-	require.Equal(t, "commit", commit["kind"])
-	require.Equal(t, float64(1), commit["cursor"])
+	commit := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
+	require.Equal(t, "network.bsky.jetstream.subscribe#commit", commit["$type"])
 	require.Equal(t, float64(1), commit["seq"])
 	require.NotContains(t, commit, "upstream_relay_cursor")
-	commitPayload, ok := commit["commit"].(map[string]any)
-	require.True(t, ok, "commit payload not a map")
-	require.Equal(t, base64.StdEncoding.EncodeToString(payload), commitPayload["record_cbor"])
+	recordCbor, ok := commit["recordCbor"].(map[string]any)
+	require.True(t, ok, "recordCbor not a $bytes object")
+	require.Equal(t, base64.RawStdEncoding.EncodeToString(payload), recordCbor["$bytes"])
 
 	syncEvt := &comatproto.SyncSubscribeRepos_Sync{
 		DID: "did:plc:v2", Rev: "rev-sync", Seq: 222, Time: "2026-05-25T00:00:00Z",
@@ -437,11 +427,9 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 		Payload:             syncPayload,
 	})
 
-	syncFrame := readOneFrame(t, ctx, conn)
-	var syncGot map[string]any
-	require.NoError(t, json.Unmarshal(syncFrame, &syncGot))
-	require.Equal(t, "sync", syncGot["kind"])
-	require.Equal(t, float64(2), syncGot["cursor"])
+	syncGot := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
+	require.Equal(t, "network.bsky.jetstream.subscribe#sync", syncGot["$type"])
+	require.Equal(t, float64(2), syncGot["seq"])
 	require.Contains(t, syncGot, "sync")
 }
 

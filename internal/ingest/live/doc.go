@@ -25,7 +25,7 @@
 // segment.KindSync tombstone row first. Any ActionResync ops yielded by
 // Event.Operations archive after it as segment.KindCreateResync rows carrying
 // the live record bytes (see events.go). These replacement rows are hidden
-// from the v1 /subscribe presentation but visible on /subscribe-v2 and to
+// from the v1 /subscribe presentation but visible on the v2 wire and to
 // archive readers; downstream consumers can dedupe on
 // (DID, Collection, Rkey, Rev).
 package live

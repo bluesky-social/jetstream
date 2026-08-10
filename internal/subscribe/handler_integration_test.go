@@ -2,6 +2,7 @@ package subscribe_test
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -191,9 +192,55 @@ func TestHandler_V2TooOldCursorReturns400(t *testing.T) {
 	t.Cleanup(func() { _ = resp.Body.Close() })
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 	body, _ := io.ReadAll(resp.Body)
-	require.Contains(t, string(body), "too old")
-	require.Contains(t, string(body), "200", "the 400 body must carry the lookback floor seq")
+	var envelope struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(body, &envelope), "v2 pre-upgrade errors are XRPC envelopes, got %q", body)
+	require.Equal(t, "CursorTooOld", envelope.Error, "clients match the structured error name")
+	require.Contains(t, envelope.Message, "200", "the message must carry the lookback floor seq")
+}
+
+// TestHandler_V2ClampedTimestampCursorEmitsOutdatedCursorInfo pins design
+// decision 6: a unix-µs timestamp cursor below the retention floor is
+// clamped (the legacy v1 translation contract), and on v2 the clamp is
+// announced in-band — the FIRST frame is an #info OutdatedCursor naming
+// the seq actually resumed from, replacing the silent clamp.
+func TestHandler_V2ClampedTimestampCursorEmitsOutdatedCursorInfo(t *testing.T) {
+	t.Parallel()
+	srv := newCursorReplaySubscription(t, 200, 299, true)
+
+	// A timestamp (>= 1e15 ⇒ unix-µs mode) older than every archived
+	// event: translates to the first segment's MinSeq with clamped=true.
+	tooOld := time.Now().Add(-20 * time.Hour).UnixMicro()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/?cursor=" + strconv.FormatInt(tooOld, 10)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, dialResp, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err, "a clamped timestamp cursor must upgrade, not 400")
+	if dialResp != nil && dialResp.Body != nil {
+		_ = dialResp.Body.Close()
+	}
+	defer func() { _ = conn.CloseNow() }()
+
+	_, frame, err := conn.Read(ctx)
+	require.NoError(t, err)
+	var envelope struct {
+		Type    string `json:"$type"`
+		Payload struct {
+			Type    string `json:"$type"`
+			Name    string `json:"name"`
+			Message string `json:"message"`
+		} `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(frame, &envelope))
+	require.Equal(t, "message", envelope.Type)
+	require.Equal(t, "network.bsky.jetstream.subscribe#info", envelope.Payload.Type)
+	require.Equal(t, "OutdatedCursor", envelope.Payload.Name)
+	require.Contains(t, envelope.Payload.Message, "starting at seq 200",
+		"the info message names the seq actually resumed from")
 }
 
 // TestHandler_V1TooOldCursorClampsAndUpgrades pins v1 parity: with the reject

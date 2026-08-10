@@ -40,6 +40,12 @@ type Metrics struct {
 	HotReads         prometheus.Counter
 	ColdReads        prometheus.Counter
 	AdversarialDrops prometheus.Counter
+
+	// Proposal-0015 negotiation observability (#318): whether v2
+	// connections explicitly offered xrpc.v1.json or fell back to the
+	// lexicon default. Both get identical framing; the label shows
+	// client-ecosystem adoption of explicit negotiation.
+	SubprotocolNegotiations *prometheus.CounterVec
 }
 
 // NewMetrics registers the subscribe series against reg. Calls
@@ -138,6 +144,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "adversarial_drops_total",
 			Help: "Number of /subscribe connections dropped by the adversarially-slow detector.",
 		}),
+		SubprotocolNegotiations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "subprotocol_negotiations_total",
+			Help: "network.bsky.jetstream.subscribe connections by Sec-WebSocket-Protocol outcome: negotiated (client offered xrpc.v1.json, server echoed it) or default (no recognized offer; lexicon-declared default applies). Framing is identical either way.",
+		}, []string{"outcome"}),
 	}
 	reg.MustRegister(
 		m.Subscribers, m.CleanDisconnects,
@@ -147,8 +158,16 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.OptionsUpdates, m.OptionsUpdateErrors,
 		m.CursorRequests, m.CursorResolveSeconds,
 		m.HotReads, m.ColdReads, m.AdversarialDrops,
+		m.SubprotocolNegotiations,
 	)
 	return m
+}
+
+func (m *Metrics) incSubprotocolNegotiation(outcome string) {
+	if m == nil {
+		return
+	}
+	m.SubprotocolNegotiations.WithLabelValues(outcome).Inc()
 }
 
 // Compression scheme labels. Pinned as constants so callers can't drift

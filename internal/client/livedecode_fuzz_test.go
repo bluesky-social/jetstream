@@ -14,13 +14,17 @@ import (
 func FuzzDecodeLiveFrame(f *testing.F) {
 	// Seed with valid and adversarial shapes.
 	rec, _ := cbor.Marshal(map[string]any{"$type": "app.bsky.feed.post", "text": "hi"})
-	b64 := base64.StdEncoding.EncodeToString(rec)
-	f.Add([]byte(`{"did":"did:plc:a","seq":1,"kind":"commit","commit":{"operation":"create","collection":"c","rkey":"r","record_cbor":"` + b64 + `"}}`))
-	f.Add([]byte(`{"kind":"heartbeat"}`))
-	f.Add([]byte(`{"kind":"commit","commit":{"operation":"create","record_cbor":"not-base64!!"}}`))
-	f.Add([]byte(`{"kind":"commit","commit":{"operation":"create","record_cbor":""}}`))
-	f.Add([]byte(`{"error":"FutureCursor","message":"x"}`))
-	f.Add([]byte(`{"kind":"account"}`))
+	b64 := base64.RawStdEncoding.EncodeToString(rec)
+	const t0 = "1970-01-01T00:00:00.000001Z"
+	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit","seq":1,"did":"did:plc:a","time":"` + t0 + `","rev":"r","operation":"create","collection":"c","rkey":"r","recordCbor":{"$bytes":"` + b64 + `"}}}`))
+	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#info","name":"OutdatedCursor"}}`))
+	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#futureKind","seq":9}}`))
+	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit","operation":"create","recordCbor":{"$bytes":"!!"}}}`))
+	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#sync","seq":-1,"did":"d","time":"` + t0 + `"}}`))
+	f.Add([]byte(`{"$type":"error","error":"FutureCursor","message":"x"}`))
+	f.Add([]byte(`{"$type":"error"}`))
+	f.Add([]byte(`{"$type":"message"}`))
+	f.Add([]byte(`{"$type":"snapshot"}`))
 	f.Add([]byte(`{}`))
 	f.Add([]byte(`not json`))
 	f.Add([]byte(``))
@@ -28,8 +32,12 @@ func FuzzDecodeLiveFrame(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic. The return values are all acceptable; we only assert
 		// the absence of a crash and basic invariants on success.
-		ev, err := decodeLiveFrame(data, recordDecodeMode{})
+		ev, info, err := decodeLiveFrame(data, recordDecodeMode{})
 		if err != nil {
+			// An info advisory only rides on errSkipFrame.
+			if info != nil && err != errSkipFrame { //nolint:errorlint // identity check is the contract
+				t.Fatalf("info returned with non-skip error %v: %q", err, data)
+			}
 			return
 		}
 		// On success, Kind must be one of the known kinds and the matching

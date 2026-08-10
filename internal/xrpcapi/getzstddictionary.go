@@ -12,7 +12,7 @@ import (
 	"github.com/jcalabro/atmos/xrpcserver"
 )
 
-// DictionaryConfig wires the /subscribe-v2 zstd dictionary into the
+// DictionaryConfig wires the v2 subscribe zstd dictionary into the
 // download endpoint. The server currently publishes exactly one dictionary
 // (the compiled-in current one); retired IDs 404 and the client re-fetches
 // without an id parameter to discover the current dictionary.
@@ -25,7 +25,7 @@ type DictionaryConfig struct {
 	Bytes []byte
 }
 
-// getZstdDictionaryHandler serves the /subscribe-v2 compression dictionary.
+// getZstdDictionaryHandler serves the v2 subscribe compression dictionary.
 // The artifact is a small in-memory blob, immutable for a given ID, so the
 // handler is a straight conditional-GET-capable byte serve: ETag on the ID,
 // long-lived public caching (the ID names the content, so a stale cache
