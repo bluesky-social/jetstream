@@ -5,6 +5,12 @@
       "package": "jetstream",
       "outDir": "api/jetstream",
       "import": "github.com/bluesky-social/jetstream/api/jetstream"
+    },
+    {
+      "prefix": "com.atproto",
+      "package": "comatproto",
+      "outDir": ".lexgen-scratch/comatproto",
+      "import": "github.com/jcalabro/atmos/api/comatproto"
     }
   ],
   "sharedTypesDir": "api/lextypes",
