@@ -50,6 +50,7 @@ func (c *memConn) Read(ctx context.Context) (websocket.MessageType, []byte, erro
 func (c *memConn) Close(websocket.StatusCode, string) error { c.closeOnce(); return nil }
 func (c *memConn) CloseNow() error                          { c.closeOnce(); return nil }
 func (c *memConn) SetReadLimit(int64)                       {}
+func (c *memConn) Subprotocol() string                      { return "" }
 func (c *memConn) closeOnce()                               { c.once.Do(func() { close(c.closed) }) }
 
 // TestConsumer_Run_InMemoryDial drives the consumer over an injected
@@ -65,7 +66,10 @@ func TestConsumer_Run_InMemoryDial(t *testing.T) {
 	}
 	conn := newMemConn(frames...)
 
-	var dialedURL string
+	var (
+		dialedURL    string
+		dialedConfig streaming.DialConfig
+	)
 	st := newTestStore(t)
 	dir := filepath.Join(t.TempDir(), "live_segments")
 
@@ -80,8 +84,9 @@ func TestConsumer_Run_InMemoryDial(t *testing.T) {
 		Verifier:          newTestVerifier(t),
 		MaxEventsPerBlock: 2,
 		OnEvent:           func(*segment.Event) { delivered.Add(1) },
-		Dial: func(_ context.Context, url string) (streaming.Conn, *http.Response, error) {
+		Dial: func(_ context.Context, url string, cfg streaming.DialConfig) (streaming.Conn, *http.Response, error) {
 			dialedURL = url
+			dialedConfig = cfg
 			return conn, nil, nil
 		},
 	})
@@ -108,6 +113,10 @@ func TestConsumer_Run_InMemoryDial(t *testing.T) {
 
 	require.Equal(t, "wss://relay.invalid/xrpc/com.atproto.sync.subscribeRepos", dialedURL,
 		"the injected dialer must receive the derived subscribeRepos URL")
+	require.Empty(t, dialedConfig.Subprotocols,
+		"the live consumer must preserve the subscribeRepos legacy CBOR default")
+	require.Equal(t, websocket.CompressionDisabled, dialedConfig.Compression,
+		"the live consumer must not enable websocket compression implicitly")
 
 	got := readAllSegmentEvents(t, dir)
 	require.Len(t, got, len(frames), "every event fed over the in-memory dial must be archived")
@@ -144,7 +153,7 @@ func TestConsumer_Run_SequenceGapCountsGapMetricNotDecodeErrors(t *testing.T) {
 		Metrics:           metrics,
 		MaxEventsPerBlock: 2,
 		OnEvent:           func(*segment.Event) { delivered.Add(1) },
-		Dial: func(context.Context, string) (streaming.Conn, *http.Response, error) {
+		Dial: func(context.Context, string, streaming.DialConfig) (streaming.Conn, *http.Response, error) {
 			return conn, nil, nil
 		},
 	})
@@ -234,7 +243,7 @@ func TestConsumer_Run_UnknownAndErrorFramesClassified(t *testing.T) {
 		Metrics:           metrics,
 		MaxEventsPerBlock: 2,
 		OnEvent:           func(*segment.Event) { delivered.Add(1) },
-		Dial: func(context.Context, string) (streaming.Conn, *http.Response, error) {
+		Dial: func(context.Context, string, streaming.DialConfig) (streaming.Conn, *http.Response, error) {
 			return conn, nil, nil
 		},
 	})

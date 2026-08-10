@@ -62,6 +62,7 @@ func (c *memConn) Read(ctx context.Context) (websocket.MessageType, []byte, erro
 func (c *memConn) Close(websocket.StatusCode, string) error { c.closeOnce(); return nil }
 func (c *memConn) CloseNow() error                          { c.closeOnce(); return nil }
 func (c *memConn) SetReadLimit(int64)                       {}
+func (c *memConn) Subprotocol() string                      { return "" }
 func (c *memConn) closeOnce()                               { c.once.Do(func() { close(c.closed) }) }
 
 // cannedResolver resolves DIDs from the DID documents captured with
@@ -152,7 +153,7 @@ func runCorpusConsumer(t *testing.T, frames [][]byte, docs map[string][]byte, wa
 			mu.Unlock()
 			delivered.Add(1)
 		},
-		Dial: func(context.Context, string) (streaming.Conn, *http.Response, error) {
+		Dial: func(context.Context, string, streaming.DialConfig) (streaming.Conn, *http.Response, error) {
 			return conn, nil, nil
 		},
 	})

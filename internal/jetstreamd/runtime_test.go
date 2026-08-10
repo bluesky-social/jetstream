@@ -299,7 +299,7 @@ func TestClose_CancelsAndDrainsRunBeforeClosingStores(t *testing.T) {
 	opts := testOptions(t)
 	opts.DataDir = dataDir
 	opts.Headless = true
-	opts.LiveDial = streaming.DialFunc(func(ctx context.Context, _ string) (streaming.Conn, *http.Response, error) {
+	opts.LiveDial = streaming.DialFunc(func(ctx context.Context, _ string, _ streaming.DialConfig) (streaming.Conn, *http.Response, error) {
 		dialOnce.Do(func() { close(dialEntered) })
 		<-ctx.Done()
 		return nil, nil, ctx.Err()
