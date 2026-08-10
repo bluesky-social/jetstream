@@ -77,6 +77,31 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	return w
 }
 
+func TestActiveFlushedRangeExcludesPendingAndAdvancesByBlock(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{MaxEventsPerBlock: 2, MaxSegmentBytes: 1 << 30})
+
+	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
+	_, ok := w.ActiveFlushedRange(1)
+	require.False(t, ok, "pending memory must not be cold-readable")
+
+	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
+	r1, ok := w.ActiveFlushedRange(1)
+	require.True(t, ok)
+	require.Equal(t, uint64(0), r1.Index)
+	require.Equal(t, uint64(segment.ReservedHeaderBytes), r1.StartOffset)
+	require.Greater(t, r1.EndOffset, r1.StartOffset)
+
+	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
+	_, ok = w.ActiveFlushedRange(3)
+	require.False(t, ok, "the next pending block must remain excluded")
+	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
+	r2, ok := w.ActiveFlushedRange(3)
+	require.True(t, ok)
+	require.Equal(t, r1.EndOffset, r2.StartOffset)
+	require.Greater(t, r2.EndOffset, r2.StartOffset)
+}
+
 type fakeTimestampStamper struct {
 	indexedAt int64
 	err       error

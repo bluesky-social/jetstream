@@ -31,6 +31,63 @@ func (f *opOrdinalIOFault) BeforeSegmentIO(_ string, op IOOp) error {
 	return nil
 }
 
+func TestFlushedRangeFromSeq(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	_, _, ok := w.FlushedRangeFromSeq(1)
+	require.False(t, ok)
+
+	for seq := uint64(1); seq <= 6; seq++ {
+		full, err := w.Append(Event{Seq: seq, Kind: KindCreate, DID: "did:plc:range"})
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	blocks := w.Blocks()
+	require.Len(t, blocks, 3)
+	for _, tc := range []struct {
+		seq   uint64
+		block int
+	}{
+		{0, 0}, {1, 0}, {2, 0}, {3, 1}, {4, 1}, {5, 2}, {6, 2},
+	} {
+		start, end, ok := w.FlushedRangeFromSeq(tc.seq)
+		require.True(t, ok, "seq=%d", tc.seq)
+		require.Equal(t, blocks[tc.block].Offset, start, "seq=%d", tc.seq)
+		require.Equal(t, w.nextBlockOffset, end, "seq=%d", tc.seq)
+	}
+	_, _, ok = w.FlushedRangeFromSeq(7)
+	require.False(t, ok)
+	require.NoError(t, w.Close())
+}
+
+func TestFlushedRangeFromSeq_RebuiltOnResume(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	for seq := uint64(1); seq <= 4; seq++ {
+		full, err := w.Append(Event{Seq: seq, Kind: KindCreate, DID: "did:plc:resume"})
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	wantBlocks := w.Blocks()
+	require.NoError(t, w.Close())
+
+	resumed, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	start, end, ok := resumed.FlushedRangeFromSeq(3)
+	require.True(t, ok)
+	require.Equal(t, wantBlocks[1].Offset, start)
+	require.Equal(t, wantBlocks[1].Offset+8+uint64(wantBlocks[1].CompressedSize), end)
+	require.NoError(t, resumed.Close())
+}
+
 func TestNewCreatesEmpty256ByteFile(t *testing.T) {
 	t.Parallel()
 

@@ -99,6 +99,84 @@ func TestScanMaxSeq_MultipleBlocks(t *testing.T) {
 // TestScanMaxSeq_IgnoresTornTail confirms that bytes past the last
 // fully-written frame are skipped — same recovery semantics as
 // lastGoodOffset/resumeExistingSegment.
+func TestWalkActiveRange_MiddleSuffixAndExactEnd(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	for seq := uint64(1); seq <= 6; seq++ {
+		full, err := w.Append(Event{Seq: seq, Kind: KindCreate, DID: "did:plc:range"})
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	blocks := w.Blocks()
+	require.Len(t, blocks, 3)
+
+	var got []uint64
+	err = WalkActiveRange(path, blocks[1].Offset, blocks[2].Offset, func(events []Event) error {
+		for i := range events {
+			got = append(got, events[i].Seq)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{3, 4}, got)
+	require.NoError(t, w.Close())
+}
+
+func TestWalkActiveRange_ConcurrentSealAfterOpenUsesSnapshottedEnd(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	for seq := uint64(1); seq <= 6; seq++ {
+		full, err := w.Append(Event{Seq: seq, Kind: KindCreate, DID: "did:plc:sealrange"})
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	blocks := w.Blocks()
+	end := w.nextBlockOffset
+	var got []uint64
+	calls := 0
+	err = WalkActiveRange(path, blocks[0].Offset, end, func(events []Event) error {
+		calls++
+		for i := range events {
+			got = append(got, events[i].Seq)
+		}
+		if calls == 1 {
+			_, sealErr := w.Seal()
+			require.NoError(t, sealErr)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, got)
+}
+
+func TestWalkActiveRange_RejectsMisalignedAndSealed(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+	_, err = w.Append(Event{Seq: 1, Kind: KindCreate, DID: "did:plc:range"})
+	require.NoError(t, err)
+	require.NoError(t, w.Flush())
+	blocks := w.Blocks()
+	require.Len(t, blocks, 1)
+
+	err = WalkActiveRange(path, blocks[0].Offset+1, w.nextBlockOffset, func([]Event) error { return nil })
+	require.ErrorIs(t, err, ErrCorruptSegment)
+
+	_, err = w.Seal()
+	require.NoError(t, err)
+	err = WalkActiveRange(path, blocks[0].Offset, blocks[0].Offset+8+uint64(blocks[0].CompressedSize), func([]Event) error { return nil })
+	require.ErrorIs(t, err, ErrSegmentSealed)
+}
+
 func TestScanMaxSeq_IgnoresTornTail(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

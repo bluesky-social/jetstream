@@ -726,6 +726,31 @@ func (w *Writer) ActiveIndex() uint64 {
 	return w.activeIdx
 }
 
+// ActiveFlushedRange is a coherent snapshot of one active segment generation's
+// frame-aligned flushed byte range. It excludes the pending in-memory block.
+type ActiveFlushedRange struct {
+	Index       uint64
+	StartOffset uint64
+	EndOffset   uint64
+}
+
+// ActiveFlushedRange returns the active flushed range containing startSeq and
+// every later flushed block in the same active generation. Segment index and
+// offsets are captured together under the writer lock; disk I/O must happen
+// after this method returns.
+func (w *Writer) ActiveFlushedRange(startSeq uint64) (ActiveFlushedRange, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.active == nil {
+		return ActiveFlushedRange{}, false
+	}
+	start, end, ok := w.active.FlushedRangeFromSeq(startSeq)
+	if !ok {
+		return ActiveFlushedRange{}, false
+	}
+	return ActiveFlushedRange{Index: w.activeIdx, StartOffset: start, EndOffset: end}, true
+}
+
 // SegmentsDir returns the configured segments directory. The cfg is
 // read-only after Open, so no mutex is needed.
 func (w *Writer) SegmentsDir() string {
