@@ -316,7 +316,7 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?wantedCollections=app.bsky.feed.post"
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "?collections=app.bsky.feed.post"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

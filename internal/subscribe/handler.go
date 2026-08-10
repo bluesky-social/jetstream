@@ -15,10 +15,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/coder/websocket"
 )
@@ -55,19 +57,36 @@ type Subscription struct {
 	// cursor replay entirely (cursors are silently dropped to live).
 	Lookback time.Duration
 
-	// V2 selects the /subscribe-v2 presentation policy as a bundle:
+	// V2 selects the network.bsky.jetstream.subscribe endpoint contract
+	// (atproto proposal 0015) as a bundle:
 	//
-	//   - the v2 wire shape (seq + commit.record_cbor on every event, and
-	//     archived #sync events emitted rather than skipped),
-	//   - Sync 1.1 resync replacement rows are emitted (v1 advances over
-	//     them silently for wire parity),
+	//   - the xrpc.v1.json wire framing (one self-describing message or
+	//     error frame per event, built from the published lexicon), with
+	//     archived #sync events emitted rather than skipped,
+	//   - Sec-WebSocket-Protocol negotiation (xrpc.v1.json is both the
+	//     only supported token and the lexicon default),
+	//   - server-push only: any client data frame closes the connection
+	//     (no options_update / requireHello — those are v1-only),
+	//   - the three-axis kinds/dids/collections filter (ParseQueryV2),
+	//   - pre-upgrade errors as XRPC JSON envelopes ({"error","message"}),
 	//   - a seq cursor below the lookback floor is REJECTED with a
-	//     pre-upgrade HTTP 400 carrying the floor seq (v1 silently clamps).
+	//     pre-upgrade 400 CursorTooOld carrying the floor seq (v1
+	//     silently clamps); a clamped timestamp cursor emits an #info
+	//     OutdatedCursor frame before the first event,
+	//   - Sync 1.1 resync replacement rows are emitted (v1 advances over
+	//     them silently for wire parity).
 	//
 	// The default false preserves Jetstream v1 behavior on /subscribe.
 	// These are deliberately one flag: the policies describe one endpoint
 	// contract and must not be mixed and matched.
 	V2 bool
+}
+
+// eventFilter is the per-delivery predicate surface shared by the v1
+// Filter (mutable via options_update) and the v2 FilterV2 (immutable).
+type eventFilter interface {
+	Wants(*segment.Event) bool
+	MaxMessageSizeBytes() uint32
 }
 
 func (d Subscription) writer() *ingest.Writer {
@@ -93,15 +112,60 @@ func NewHandler(deps Subscription) http.Handler {
 	})
 }
 
+// httpError writes a pre-upgrade error in the endpoint's contract shape:
+// plain text on /subscribe (v1 wire parity), the standard XRPC JSON error
+// envelope ({"error": name, "message": msg}) on the v2 endpoint, where
+// clients match the structured error name instead of substring-scraping
+// the body.
+func httpError(w http.ResponseWriter, deps Subscription, status int, name, msg string) {
+	if !deps.V2 {
+		http.Error(w, msg, status)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	body, _ := json.Marshal(struct {
+		Error   string `json:"error"`
+		Message string `json:"message,omitempty"`
+	}{Error: name, Message: msg})
+	_, _ = w.Write(body)
+}
+
+// v2Subprotocol is the one wire subprotocol the v2 endpoint speaks; it is
+// also the lexicon-declared default, so negotiation degenerates to a
+// header echo — every connection receives identical framing. The constant
+// comes from the generated lexicon code so the wire, the schema, and the
+// handler cannot drift.
+const v2Subprotocol = jetstream.JetstreamSubscribe_Subprotocol
+
+// negotiateSubprotocol intersects the client's Sec-WebSocket-Protocol
+// offer with the supported set {xrpc.v1.json}, matching case-sensitively
+// (RFC 7936: tokens are case-sensitive). websocket.Accept matches with
+// EqualFold and echoes the CLIENT's casing, so handing it the raw
+// supported set could put a non-canonical token (e.g. "XRPC.V1.JSON") on
+// the wire; with the exact-match intersection Accept can only echo the
+// canonical token, and a case-variant offer falls back to the lexicon
+// default like any other unrecognized token (proposal 0015).
+func negotiateSubprotocol(r *http.Request) []string {
+	for _, header := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for token := range strings.SplitSeq(header, ",") {
+			if strings.TrimSpace(token) == v2Subprotocol {
+				return []string{v2Subprotocol}
+			}
+		}
+	}
+	return nil
+}
+
 func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *slog.Logger) {
 	if !lifecycle.IsSteadyState(deps.Store) {
-		http.Error(w, "service not ready: bootstrap in progress", http.StatusServiceUnavailable)
+		httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: bootstrap in progress")
 		return
 	}
 
 	values, qerr := url.ParseQuery(r.URL.RawQuery)
 	if qerr != nil {
-		http.Error(w, fmt.Sprintf("%s: %s", ErrInvalidOptions.Error(), qerr.Error()), http.StatusBadRequest)
+		httpError(w, deps, http.StatusBadRequest, "InvalidRequest", fmt.Sprintf("%s: %s", ErrInvalidOptions.Error(), qerr.Error()))
 		return
 	}
 
@@ -127,20 +191,23 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	if deps.V2 {
 		rawDict := values.Get("zstdDictionary")
 		if values.Get("compress") == "true" || strings.Contains(r.Header.Get("Socket-Encoding"), "zstd") {
-			http.Error(w, "compress=true / Socket-Encoding: zstd is the /subscribe (v1) opt-in; /subscribe-v2 uses zstdDictionary=<id> with the dictionary from getZstdDictionary", http.StatusBadRequest)
+			httpError(w, deps, http.StatusBadRequest, "InvalidRequest",
+				"compress=true / Socket-Encoding: zstd is the /subscribe (v1) opt-in; this endpoint uses zstdDictionary=<id> with the dictionary from getZstdDictionary")
 			return
 		}
 		if rawDict != "" {
 			id, perr := strconv.ParseUint(rawDict, 10, 32)
 			if perr != nil || id == 0 {
-				http.Error(w, "zstdDictionary must be a positive integer zstd dictionary ID", http.StatusBadRequest)
+				httpError(w, deps, http.StatusBadRequest, "InvalidRequest",
+					"zstdDictionary must be a positive integer zstd dictionary ID")
 				return
 			}
 			if uint32(id) != DictionaryV2ID {
 				// Never serve frames the client can't decode: an unknown or
 				// retired dictionary ID is a hard 400 carrying the current
 				// ID, so the client re-fetches and reconnects.
-				http.Error(w, fmt.Sprintf("%s %d; current dictionary id is %d (fetch it via getZstdDictionary and reconnect)", ZstdDictRejectedMarker, id, DictionaryV2ID), http.StatusBadRequest)
+				httpError(w, deps, http.StatusBadRequest, "UnknownZstdDictionary",
+					fmt.Sprintf("unknown zstd dictionary id %d; current dictionary id is %d (fetch it via getZstdDictionary and reconnect)", id, DictionaryV2ID))
 				return
 			}
 			wantZstd = true
@@ -154,13 +221,28 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		}
 	}
 
-	initialFilter, perr := ParseQuery(values)
-	if perr != nil {
-		http.Error(w, perr.Error(), http.StatusBadRequest)
-		return
+	// Parse the endpoint's filter dialect: three orthogonal axes
+	// (kinds/dids/collections) on v2, the legacy wantedDids/
+	// wantedCollections pair on v1.
+	var initialV2Filter *FilterV2
+	var filterPtr atomic.Pointer[Filter] // v1 only; swapped by options_update
+	if deps.V2 {
+		f, perr := ParseQueryV2(values)
+		if perr != nil {
+			httpError(w, deps, http.StatusBadRequest, "InvalidRequest", perr.Error())
+			return
+		}
+		initialV2Filter = f
+	} else {
+		f, perr := ParseQuery(values)
+		if perr != nil {
+			http.Error(w, perr.Error(), http.StatusBadRequest)
+			return
+		}
+		filterPtr.Store(f)
 	}
 
-	requireHello := parseRequireHello(values)
+	requireHello := !deps.V2 && parseRequireHello(values)
 
 	// Resolve cursor BEFORE upgrade so a bad cursor returns HTTP 400.
 	rawCursor := values.Get("cursor")
@@ -197,14 +279,14 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		if rawCursor != "" {
 			deps.Metrics.incCursorRequests("unavailable")
 		}
-		http.Error(w, "service not ready: cursor replay warming up", http.StatusServiceUnavailable)
+		httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: cursor replay warming up")
 		return
 	default:
 		if err := deps.Manifest.Wait(r.Context()); err != nil {
 			if rawCursor != "" {
 				deps.Metrics.incCursorRequests("unavailable")
 			}
-			http.Error(w, fmt.Sprintf("service not ready: manifest warming up: %s", err.Error()), http.StatusServiceUnavailable)
+			httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", fmt.Sprintf("service not ready: manifest warming up: %s", err.Error()))
 			return
 		}
 		resolveStart := time.Now()
@@ -227,15 +309,17 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 				// client. Log the detail server-side; return a generic 503.
 				logger.Error("cursor resolution failed", "err", err, "raw_cursor", rawCursor)
 				deps.Metrics.incCursorRequests("resolve_failed")
-				http.Error(w, "service not ready: cursor resolution failed", http.StatusServiceUnavailable)
+				httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: cursor resolution failed")
 				return
 			case errors.Is(err, ErrCursorTooOld):
 				// A too-old v2 seq cursor is a distinct, expected signal (the
 				// client re-backfills), not a malformed request; label it
 				// separately so it stays visible apart from parse-error 400s.
 				deps.Metrics.incCursorRequests("too_old")
+				httpError(w, deps, http.StatusBadRequest, "CursorTooOld", err.Error())
+				return
 			}
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			httpError(w, deps, http.StatusBadRequest, "InvalidRequest", err.Error())
 			return
 		}
 		cursorPlan = plan
@@ -278,12 +362,31 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	if wantZstd || deps.V2 {
 		compressionMode = websocket.CompressionDisabled
 	}
+
+	// Sec-WebSocket-Protocol negotiation (proposal 0015), v2 only. The
+	// supported set is exactly {xrpc.v1.json}, which is also the lexicon
+	// default, so negotiation is a header echo: an offering client gets
+	// the token echoed, everyone else falls back to the default — the
+	// framing is identical either way. v1 predates the proposal and never
+	// negotiates.
+	var acceptSubprotocols []string
+	if deps.V2 {
+		acceptSubprotocols = negotiateSubprotocol(r)
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns:  []string{"*"},
 		CompressionMode: compressionMode,
+		Subprotocols:    acceptSubprotocols,
 	})
 	if err != nil {
 		return
+	}
+	if deps.V2 {
+		outcome := "default"
+		if conn.Subprotocol() != "" {
+			outcome = "negotiated"
+		}
+		deps.Metrics.incSubprotocolNegotiation(outcome)
 	}
 
 	// Classify the connection's negotiated compression scheme for metrics.
@@ -304,9 +407,6 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	}
 	defer func() { _ = conn.CloseNow() }()
 	conn.SetReadLimit(int64(MaxSubscriberMessageBytes))
-
-	var filterPtr atomic.Pointer[Filter]
-	filterPtr.Store(initialFilter)
 
 	helloCh := make(chan struct{})
 	var helloOnce sync.Once
@@ -342,7 +442,18 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	}
 	defer deps.Tail.DeregisterConn(connID)
 
-	go runReader(ctx, cancel, conn, deps, &filterPtr, signalHello, logger)
+	// The read side splits by contract: v1 accepts subscriber-sourced
+	// options_update frames; v2 is server-push only — CloseRead keeps
+	// control-frame handling (ping/pong, close) alive and closes the
+	// connection with StatusPolicyViolation on ANY client data frame,
+	// matching the atmos xrpcserver subscription contract.
+	loadFilter := func() eventFilter { return filterPtr.Load() }
+	if deps.V2 {
+		ctx = conn.CloseRead(ctx)
+		loadFilter = func() eventFilter { return initialV2Filter }
+	} else {
+		go runReader(ctx, cancel, conn, deps, &filterPtr, signalHello, logger)
+	}
 
 	if requireHello {
 		select {
@@ -357,7 +468,39 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		startSeq = deps.Tail.Tip()
 	}
 
-	runSubscriberLoop(ctx, conn, deps, &filterPtr, startSeq, scheme, logger)
+	// A clamped v2 timestamp cursor starts at the retention floor, not
+	// where the client asked; say so in-band before the first event
+	// (subscribeRepos's OutdatedCursor precedent) instead of silently
+	// clamping. Seq-mode below-floor was already rejected pre-upgrade,
+	// and a future cursor clamping to the live tip is the defined
+	// semantics of "start at tip", not a degradation — Mode filters both
+	// out here.
+	if deps.V2 && cursorPlan.Clamped && cursorPlan.Mode == ModeReplayTimeUS {
+		info, ierr := EncodeV2Info("OutdatedCursor",
+			fmt.Sprintf("requested timestamp cursor below retention floor; starting at seq %d", startSeq))
+		if ierr != nil {
+			logger.Error("encode info frame", "err", ierr)
+		} else if !writeFrame(ctx, conn, wantZstd, info) {
+			return
+		}
+	}
+
+	runSubscriberLoop(ctx, conn, deps, loadFilter, startSeq, scheme, logger)
+}
+
+// writeFrame writes one already-encoded v2 frame, compressing it for
+// zstd-negotiated connections (every frame on a zstd conn is one zstd
+// frame — message, info, and error frames alike). Returns false when the
+// write failed and the connection should unwind.
+func writeFrame(ctx context.Context, conn *websocket.Conn, compress bool, frame []byte) bool {
+	msgType := websocket.MessageText
+	if compress {
+		frame = compressFrameV2(frame)
+		msgType = websocket.MessageBinary
+	}
+	writeCtx, wcancel := context.WithTimeout(ctx, frameWriteTimeout)
+	defer wcancel()
+	return conn.Write(writeCtx, msgType, frame) == nil
 }
 
 func runReader(
@@ -423,7 +566,7 @@ func runSubscriberLoop(
 	ctx context.Context,
 	conn *websocket.Conn,
 	deps Subscription,
-	filterPtr *atomic.Pointer[Filter],
+	loadFilter func() eventFilter,
 	startSeq uint64,
 	scheme string,
 	logger *slog.Logger,
@@ -435,6 +578,19 @@ func runSubscriberLoop(
 	slowDetector := newSlowDetector(deps.Tail.SlowConfig())
 	batchMax := deps.Tail.ReadBatch()
 	cursor := startSeq
+
+	// sendError emits a terminal xrpc.v1.json error frame on v2
+	// connections; the caller returns (closing the connection)
+	// immediately after, per the event-stream spec's close-after-error
+	// rule. v1 predates error frames — its clients see only the close
+	// code — so this is a no-op there. Best-effort: a failed write means
+	// the connection is already gone.
+	sendError := func(code, msg string) {
+		if !deps.V2 {
+			return
+		}
+		writeFrame(ctx, conn, compress, EncodeV2Error(code, msg))
+	}
 
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
@@ -468,9 +624,11 @@ func runSubscriberLoop(
 				continue // idle at tip: loop to send a keepalive ping
 			}
 			if errors.Is(err, errColdUnavailable) {
+				sendError("InternalError", "archive replay unavailable; reconnect")
 				return
 			}
 			logger.Warn("read error", "err", err)
+			sendError("InternalError", "stream read failed; reconnect")
 			return
 		}
 
@@ -483,11 +641,12 @@ func runSubscriberLoop(
 		if next <= cursor {
 			logger.Error("tail ReadFrom returned non-advancing cursor",
 				"cursor", cursor, "next", next, "batch", len(batch))
+			sendError("InternalError", "stream read failed; reconnect")
 			return
 		}
 
 		for _, e := range batch {
-			f := filterPtr.Load()
+			f := loadFilter()
 			if e.Event.Kind.IsResyncReplacement() && !deps.V2 {
 				deps.Metrics.incEventsSkippedResync()
 				continue
@@ -568,6 +727,8 @@ func runSubscriberLoop(
 		if slowDetector.observe(cursor, lag) {
 			deps.Metrics.incAdversarialDrops()
 			logger.Warn("dropped adversarially slow subscriber", "cursor", cursor, "lag", lag)
+			sendError("ConsumerTooSlow",
+				fmt.Sprintf("reading below the floor rate %d events behind the tip; reconnect with cursor=%d", lag, cursor))
 			return
 		}
 	}

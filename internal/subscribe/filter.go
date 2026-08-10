@@ -321,15 +321,7 @@ func (f *Filter) Wants(evt *segment.Event) bool {
 	if evt.Collection == "" {
 		return true
 	}
-	if _, ok := f.wantedCollections.fullPaths[evt.Collection]; ok {
-		return true
-	}
-	for _, prefix := range f.wantedCollections.prefixes {
-		if strings.HasPrefix(evt.Collection, prefix) {
-			return true
-		}
-	}
-	return false
+	return f.wantedCollections.matches(evt.Collection)
 }
 
 func isCommitKind(k segment.Kind) bool {
