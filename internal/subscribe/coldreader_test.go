@@ -55,7 +55,10 @@ func TestColdReadBatch_BoundedAndResumes(t *testing.T) {
 
 func TestColdReadActiveMultiBatchAdvancesRangeWithoutPrefixRescan(t *testing.T) {
 	t.Parallel()
-	const blocks, perBlock = 12, 4
+	// Production's default read batch is 1,024 events. Use the same total here,
+	// split across enough flushed blocks to exercise many resume boundaries
+	// without relying on a wall-clock performance threshold.
+	const blocks, perBlock = 32, 32
 	_, w, rd, rec := openActiveColdReader(t, blocks, perBlock)
 
 	cursor := uint64(1)
