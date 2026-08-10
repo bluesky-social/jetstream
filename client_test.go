@@ -385,13 +385,13 @@ func TestCloseRacesEvents(t *testing.T) {
 }
 
 // TestSubscribeLiveTailEndToEnd exercises the full public API against a real
-// /subscribe-v2 websocket server: Subscribe (live-only) -> Events -> decoded
+// live websocket server: Subscribe (live-only) -> Events -> decoded
 // Event, including record decode and cursor extraction.
 func TestSubscribeLiveTailEndToEnd(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/subscribe-v2", r.URL.Path)
+		require.Equal(t, "/xrpc/network.bsky.jetstream.subscribe", r.URL.Path)
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -496,13 +496,14 @@ func TestCloseStopsRunningEventsWithoutCtxCancel(t *testing.T) {
 	}
 }
 
-// liveCommitFrameJSON builds a commit frame with a minimal CBOR
-// record, base64-encoded, matching the /subscribe-v2 wire shape.
+// liveCommitFrameJSON builds an xrpc.v1.json #commit message frame with a
+// minimal CBOR record, matching the network.bsky.jetstream.subscribe wire.
 func liveCommitFrameJSON(seq uint64, did, coll, rkey string) string {
 	rec, _ := cbor.Marshal(map[string]any{"$type": coll, "text": "hi " + rkey})
-	b64 := base64.StdEncoding.EncodeToString(rec)
-	return `{"did":"` + did + `","time_us":1,"cursor":` + strconv.FormatUint(seq, 10) +
-		`,"seq":` + strconv.FormatUint(seq, 10) +
-		`,"kind":"commit","commit":{"rev":"r","operation":"create","collection":"` + coll +
-		`","rkey":"` + rkey + `","cid":"bafytest","record_cbor":"` + b64 + `"}}`
+	b64 := base64.RawStdEncoding.EncodeToString(rec)
+	s := strconv.FormatUint(seq, 10)
+	return `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit"` +
+		`,"seq":` + s + `,"did":"` + did + `","time":"1970-01-01T00:00:00.000001Z"` +
+		`,"rev":"r","operation":"create","collection":"` + coll +
+		`","rkey":"` + rkey + `","cid":"bafytest","recordCbor":{"$bytes":"` + b64 + `"}}}`
 }

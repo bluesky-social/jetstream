@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/zstddict"
@@ -278,9 +278,23 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 		case typ != websocket.MessageText:
 			continue // jetstream frames are text JSON; ignore stray binary
 		}
-		ev, derr := decodeLiveFrame(data, c.cfg.mode)
+		ev, info, derr := decodeLiveFrame(data, c.cfg.mode)
 		if errors.Is(derr, errSkipFrame) {
+			if info != nil {
+				// An #info advisory (OutdatedCursor on a clamped timestamp
+				// resume, or a future advisory). Not an event: no seq, no
+				// cursor advance. Operator-relevant, so log it.
+				c.cfg.logger.Info("live stream info frame", "name", info.Name, "message", info.Message)
+			}
 			continue
+		}
+		var streamErr *liveStreamError
+		if errors.As(derr, &streamErr) {
+			// A terminal error frame: the server closes right after sending
+			// it. Return it so the reconnect loop backs off and resumes —
+			// the same flow as the abrupt close it replaces, but with the
+			// typed reason attached for the caller's error slot.
+			return streamErr
 		}
 		if derr != nil {
 			// A malformed data frame is upstream input; surface it but keep the
@@ -360,7 +374,7 @@ func (c *liveConsumer) subscribeURL() string {
 	case "https":
 		u.Scheme = "wss"
 	}
-	u.Path = "/subscribe-v2"
+	u.Path = "/xrpc/" + subscribeNSID
 	q := url.Values{}
 	// Wire cursor: once any event has been delivered, resume each new session at
 	// lastSeq (the highest seq delivered). subscribeURL is rebuilt on every
@@ -375,15 +389,16 @@ func (c *liveConsumer) subscribeURL() string {
 	case !c.cfg.fromTip:
 		q.Set("cursor", strconv.FormatUint(c.cfg.cursor, 10))
 	}
-	// Forward the caller's filters server-side. v1's ParseQuery reads each
-	// collection/DID as its own repeated param, so append (not Set) one entry
-	// per value. Empty slices add nothing, leaving an unfiltered tail's URL
-	// unchanged.
+	// Forward the caller's filters server-side. The server reads each
+	// collection/DID as its own repeated param, so append (not Set) one
+	// entry per value. Empty slices add nothing, leaving an unfiltered
+	// tail's URL unchanged. The client-side matcher (wantsLive) remains
+	// the correctness backstop.
 	for _, c := range c.cfg.collections {
-		q.Add("wantedCollections", c)
+		q.Add("collections", c)
 	}
 	for _, d := range c.cfg.dids {
-		q.Add("wantedDids", d)
+		q.Add("dids", d)
 	}
 	if c.zstdDecoder != nil {
 		q.Set("zstdDictionary", strconv.FormatUint(uint64(c.zstdDictID), 10))
@@ -392,71 +407,93 @@ func (c *liveConsumer) subscribeURL() string {
 	return u.String()
 }
 
+// subscribeNSID is the lexicon NSID the live tail dials at /xrpc/<nsid>.
+const subscribeNSID = "network.bsky.jetstream.subscribe"
+
+// subscribeSubprotocol is the xrpc.v1.json wire subprotocol (proposal
+// 0015) offered via Sec-WebSocket-Protocol. It is also the stream's
+// lexicon-declared default, so an empty server echo means identical
+// framing; the offer exists so negotiation-aware servers and middleboxes
+// see an explicit token. MUST equal
+// api/jetstream.JetstreamSubscribe_Subprotocol (the client module can't
+// depend on which side generated it; the contract test pins them equal).
+const subscribeSubprotocol = "xrpc.v1.json"
+
 // liveDialOptions builds the websocket DialOptions for the live tail.
-// permessage-deflate is deliberately NOT offered: /subscribe-v2 never
+// permessage-deflate is deliberately NOT offered: the v2 endpoint never
 // negotiates it (#294 removed it server-side — per-connection deflate is
 // the dominant server cost at fanout scale), so offering it is dead
-// weight on the handshake. Compression on v2 is the dict-zstd scheme,
+// weight on the handshake. Compression is the dict-zstd scheme,
 // negotiated at the application layer via ?zstdDictionary=<id>.
 func liveDialOptions(hc *http.Client) *websocket.DialOptions {
 	return &websocket.DialOptions{
 		CompressionMode: websocket.CompressionDisabled,
 		HTTPClient:      hc, // nil is fine: websocket.Dial falls back to its default
+		Subprotocols:    []string{subscribeSubprotocol},
 	}
 }
 
-// errLiveCursorTooOld marks a terminal /subscribe-v2 connect refusal: the seq
-// cursor resolved below the server's lookback floor and the server returned a
-// pre-upgrade HTTP 400 (subscribe §14 / design §14). It is NOT a transient dial
-// failure to reconnect-loop on — the cursor will not become valid by retrying.
-// The cutover engine catches it and re-enters the backfill pagination loop from
-// the last durably-processed seq (design §14 client side). The wrapped message
-// carries the server's floor-seq body for observability.
+// errLiveCursorTooOld marks a terminal connect refusal: the seq cursor
+// resolved below the server's lookback floor and the server returned a
+// pre-upgrade HTTP 400 CursorTooOld (subscribe §14 / design §14). It is NOT a
+// transient dial failure to reconnect-loop on — the cursor will not become
+// valid by retrying. The cutover engine catches it and re-enters the backfill
+// pagination loop from the last durably-processed seq (design §14 client
+// side). The wrapped message carries the server's floor-seq message for
+// observability.
 var errLiveCursorTooOld = errors.New("jetstream: live cursor too old")
 
-// cursorTooOldMarker is the substring the server embeds in its pre-upgrade
-// "cursor too old" HTTP 400 body, which dialWebsocket matches to recognize a
-// too-old refusal. It MUST equal internal/subscribe.CursorTooOldMarker (the
-// server's source of truth); the client cannot import that package without
-// pulling the server's storage deps into the public module, so the literal is
-// duplicated here and pinned equal by TestDialWebsocketMatchesServerTooOld
-// (live_subscribe_contract_test.go), which fails CI if either side drifts.
-const cursorTooOldMarker = "cursor too old"
-
-// errLiveDictRejected marks a pre-upgrade HTTP 400 refusing the client's
-// ?zstdDictionary ID: the server rotated its /subscribe-v2 dictionary
-// (retrain + redeploy) and no longer serves the ID this consumer pinned at
-// construction. Unlike errLiveCursorTooOld it is recoverable in-place — the
-// consumer refetches the current dictionary (or degrades to uncompressed)
-// and reconnects; see refreshDict.
+// errLiveDictRejected marks a pre-upgrade HTTP 400 UnknownZstdDictionary
+// refusing the client's ?zstdDictionary ID: the server rotated its
+// dictionary (retrain + redeploy) and no longer serves the ID this consumer
+// pinned at construction. Unlike errLiveCursorTooOld it is recoverable
+// in-place — the consumer refetches the current dictionary (or degrades to
+// uncompressed) and reconnects; see refreshDict.
 var errLiveDictRejected = errors.New("jetstream: live zstd dictionary rejected")
 
-// zstdDictRejectedMarker is the substring the server embeds in its
-// dictionary-rejection HTTP 400 body. It MUST equal
-// internal/subscribe.ZstdDictRejectedMarker; like cursorTooOldMarker the
-// literal is duplicated (the client cannot import the server package) and
-// pinned equal by TestDialWebsocketMatchesServerDictRejected.
-const zstdDictRejectedMarker = "unknown zstd dictionary id"
+// XRPC error names the server uses on pre-upgrade rejections. They are the
+// wire contract (declared in the network.bsky.jetstream.subscribe lexicon);
+// the client matches the structured envelope's error name, never body
+// substrings. The internal/subscribe handler is the emitting side; the
+// cross-package contract test (live_subscribe_contract_test.go) pins the
+// two ends against the real handler so a drift fails CI.
+const (
+	errNameCursorTooOld    = "CursorTooOld"
+	errNameUnknownZstdDict = "UnknownZstdDictionary"
+)
 
 // dialWebsocket is the production dialer. hc, when non-nil, routes the HTTP/1.1
 // upgrade through a custom transport (e.g. an in-process pipe); nil uses the
 // websocket default.
 //
-// A pre-upgrade HTTP 400 "cursor too old" from /subscribe-v2 is mapped to the
-// typed errLiveCursorTooOld so the consumer surfaces it terminally rather than
-// reconnect-looping. coder/websocket leaves the first 1024 bytes of the
-// response body readable on a non-101 handshake, which carries the floor seq.
+// Pre-upgrade rejections arrive as XRPC JSON error envelopes
+// ({"error": name, "message": ...}); CursorTooOld maps to the typed
+// errLiveCursorTooOld (terminal) and UnknownZstdDictionary to
+// errLiveDictRejected (recoverable). coder/websocket leaves the first 1024
+// bytes of the response body readable on a non-101 handshake, which carries
+// the envelope.
+//
+// On a successful handshake the server's subprotocol echo is verified:
+// RFC 6455 §4.1 requires the client to fail the connection when the server
+// selects a token that was not offered. An empty echo is the proposal-0015
+// lexicon-default fallback and means identical framing.
 func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn, error) {
 	conn, resp, err := websocket.Dial(ctx, rawURL, liveDialOptions(hc))
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusBadRequest && resp.Body != nil {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 			_ = resp.Body.Close()
-			if strings.Contains(string(body), cursorTooOldMarker) {
-				return nil, fmt.Errorf("%w: %s", errLiveCursorTooOld, strings.TrimSpace(string(body)))
+			var envelope struct {
+				Error   string `json:"error"`
+				Message string `json:"message"`
 			}
-			if strings.Contains(string(body), zstdDictRejectedMarker) {
-				return nil, fmt.Errorf("%w: %s", errLiveDictRejected, strings.TrimSpace(string(body)))
+			if jerr := json.Unmarshal(body, &envelope); jerr == nil {
+				switch envelope.Error {
+				case errNameCursorTooOld:
+					return nil, fmt.Errorf("%w: %s", errLiveCursorTooOld, envelope.Message)
+				case errNameUnknownZstdDict:
+					return nil, fmt.Errorf("%w: %s", errLiveDictRejected, envelope.Message)
+				}
 			}
 		} else if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
@@ -465,6 +502,10 @@ func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn,
 	}
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
+	}
+	if echoed := conn.Subprotocol(); echoed != "" && echoed != subscribeSubprotocol {
+		_ = conn.Close(websocket.StatusProtocolError, "unoffered subprotocol")
+		return nil, fmt.Errorf("jetstream: server selected unoffered subprotocol %q", echoed)
 	}
 	return conn, nil
 }

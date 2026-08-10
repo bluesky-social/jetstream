@@ -102,24 +102,14 @@ type CursorEnv struct {
 // ?cursor= query parameter. The handler converts this into HTTP 400.
 var ErrInvalidCursor = errors.New("subscribe: invalid cursor")
 
-// CursorTooOldMarker is the stable substring every "cursor too old" rejection
-// message contains. It is the WIRE CONTRACT the Go client keys on: the
-// pre-upgrade HTTP 400 body is returned verbatim to the client, which maps it
-// to a terminal "re-backfill" signal by matching this substring (see
-// internal/client live.go dialWebsocket and the cross-package contract test
-// that asserts the two literals stay equal). The client cannot import this
-// package (it would pull the server's pebble/manifest deps into the public
-// client module), so the literal is duplicated there and locked by that test.
-// Changing this string is a wire-contract change — update both sides together.
-const CursorTooOldMarker = "cursor too old"
-
 // ErrCursorTooOld is returned (only when CursorEnv.RejectBelowFloor is set —
 // the v2 policy) when a seq cursor resolves below the lookback floor. The
-// handler converts it into HTTP 400; its message carries both the requested
-// seq and the floor seq so the client can re-backfill from its last seq. v1
-// never returns this (it clamps instead). Its message embeds CursorTooOldMarker
-// so the client's substring match has a single source of truth.
-var ErrCursorTooOld = errors.New("subscribe: " + CursorTooOldMarker)
+// handler converts it into a pre-upgrade HTTP 400 XRPC envelope with error
+// name "CursorTooOld" (the wire contract clients match on — declared in the
+// network.bsky.jetstream.subscribe lexicon); the message carries both the
+// requested seq and the floor seq so the client can re-backfill from its
+// last seq. v1 never returns this (it clamps instead).
+var ErrCursorTooOld = errors.New("subscribe: cursor too old")
 
 // ErrCursorResolveFailed marks a SERVER-side failure while resolving a
 // well-formed cursor — a segment read/decode/index-load fault during
