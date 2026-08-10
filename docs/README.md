@@ -663,6 +663,8 @@ The message union has five variants:
 - `#identity`, `#account`, `#sync` — wrap the upstream `com.atproto.sync.subscribeRepos` events verbatim (the wrapped event's `seq` and `time` are the upstream relay's, distinct from jetstream's envelope fields). `#sync` is never emitted on the legacy v1 wire.
 - `#info` — a seq-less advisory (`OutdatedCursor` after a clamped timestamp-cursor resume).
 
+> TODO: `prevRev` on all events (Fig suggestion) — carried over from the pre-lexicon draft; would be an additive lexicon change.
+
 An **error** frame (`{"$type":"error","error":"ConsumerTooSlow","message":"..."}`) is terminal: the connection closes immediately after. Pre-upgrade rejections are standard XRPC JSON error envelopes (`{"error": "CursorTooOld", "message": "..."}`); clients match the structured error name.
 
 Every message carries jetstream's `seq` (the stream cursor) and `time` — the display timestamp as an RFC 3339 datetime with exactly six fractional digits (microsecond precision, UTC). Its unix-microseconds value is what a timestamp cursor compares against; it is the `indexed_at` value if a timestamp import set one, otherwise the `witnessed_at` time jetstream first saw the event (Section 8).
