@@ -1,4 +1,4 @@
-// Command dicttrain retrains the v2 subscribe zstd dictionary from live
+// Command dicttrain retrains the subscribeEvents zstd dictionary from live
 // firehose traffic. It is a dev/operator-time tool, not part of the server:
 //
 //	just train-subscribe-dict            # against localhost:8080
@@ -47,7 +47,7 @@ func run() error {
 	holdout := flag.Int("holdout", 20_000, "additional events captured to evaluate the trained dictionary")
 	maxDict := flag.Int("max-dict", 65536, "maximum dictionary size in bytes")
 	dictID := flag.Uint("dict-id", 0, "dictionary ID to embed (default: today's UTC date as YYYYMMDD)")
-	out := flag.String("out", "internal/subscribe/zstd_dictionary_v2", "output path for the trained dictionary")
+	out := flag.String("out", "internal/subscribe/dictionaries/subscribe_events_20260811.zdict", "output path for the trained dictionary")
 	flag.Parse()
 
 	// Validate operator input at the CLI boundary: negative counts panic

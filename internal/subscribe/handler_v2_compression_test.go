@@ -66,7 +66,7 @@ func TestHandlerV2_ZstdDictionaryParam_DeliversV2DictFrames(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, websocket.MessageBinary, mt, "v2 zstd clients must receive binary frames")
 
-	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionaryV2))
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(subscribeEventsDictionary))
 	require.NoError(t, err)
 	defer dec.Close()
 	got, err := dec.DecodeAll(frame, nil)

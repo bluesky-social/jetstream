@@ -22,7 +22,7 @@ import (
 // permessage-deflate, which v2 negotiates automatically and which needs
 // no out-of-band dictionary.
 //
-//go:embed zstd_dictionary
+//go:embed dictionaries/legacy_subscribe.zdict
 var zstdDictionary []byte
 
 // encoderPoolLimit bounds each endpoint's encoder free list. One lane per
@@ -62,33 +62,30 @@ func compressFrame(src []byte) []byte {
 	return zstdEncoders.encodeAll(src)
 }
 
-// zstdDictionaryV2 is the v2 subscribe dictionary, trained on live
-// firehose traffic in the v2 wire shape. Retrain it after material wire-shape
-// changes with
-// `just train-subscribe-dict`; the embedded dictionary ID (the trainer
-// defaults it to the training date, YYYYMMDD) versions the artifact, and
-// clients fetch the bytes by that ID via the getZstdDictionary XRPC
-// endpoint rather than compiling them in. See
-// specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md.
+// subscribeEventsDictionary is the current dictionary for
+// network.bsky.jetstream.subscribeEvents, trained on live traffic in that
+// wire shape. Add a freshly trained ID-named artifact after material wire
+// changes with `just train-subscribe-dict`; this build embeds the selected
+// current artifact. See specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md.
 //
-//go:embed zstd_dictionary_v2
-var zstdDictionaryV2 []byte
+//go:embed dictionaries/subscribe_events_20260811.zdict
+var subscribeEventsDictionary []byte
 
 // DictionaryV2 exposes the current v2 subscribe dictionary bytes for the
 // download endpoint. Treat as read-only.
-func DictionaryV2() []byte { return zstdDictionaryV2 }
+func DictionaryV2() []byte { return subscribeEventsDictionary }
 
 // DictionaryV2ID is the dictionary ID embedded in the v2 dictionary,
 // parsed from its header at init. The negotiation query param and the
 // download endpoint both key on this value.
-var DictionaryV2ID = mustParseDictID(zstdDictionaryV2)
+var DictionaryV2ID = mustParseDictID(subscribeEventsDictionary)
 
 func mustParseDictID(d []byte) uint32 {
 	id, err := zstddict.ParseID(d)
 	if err != nil {
 		// The dictionary is embedded at build time; failure is a
 		// build/programmer error, not runtime input. Fail loud.
-		panic(fmt.Sprintf("subscribe: zstd_dictionary_v2: %v", err))
+		panic(fmt.Sprintf("subscribe: subscribeEvents dictionary: %v", err))
 	}
 	return id
 }
@@ -102,7 +99,7 @@ var zstdEncodersV2 = newEncoderPool(encoderPoolLimit, mustNewZstdEncoderV2)
 
 func mustNewZstdEncoderV2() *zstd.Encoder {
 	enc, err := zstd.NewWriter(nil,
-		zstd.WithEncoderDict(zstdDictionaryV2),
+		zstd.WithEncoderDict(subscribeEventsDictionary),
 		zstd.WithWindowSize(1<<17),
 		zstd.WithEncoderConcurrency(1),
 		zstd.WithEncoderLevel(zstd.SpeedFastest))
