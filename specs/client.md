@@ -21,7 +21,7 @@ A consumer wants some slice of the network — "all likes since 2024", "these
 five DIDs", or everything — delivered once, in order, and then kept current
 forever. Jetstream splits that into two transports:
 
-- **Sealed history** is downloaded over HTTP/XRPC (`planBackfill` →
+- **Sealed history** is downloaded over HTTP/XRPC (`planSnapshot` →
   `getSegment`/`getBlock`), because bulk history wants parallelism, resume,
   and CDN-cacheable immutable artifacts.
 - **The live tail** is a websocket (`/xrpc/network.bsky.jetstream.subscribeEvents`,
@@ -56,11 +56,11 @@ below.
 4. **Cursors are instance-local.** Switching servers means rewinding a
    margin and re-deduping; seq values do not transfer.
 
-## Phase 1: archive negotiation (planBackfill)
+## Phase 1: archive negotiation (planSnapshot)
 
-`network.bsky.jetstream.planBackfill` (lexicon:
-`lexicons/network/bsky/jetstream/planBackfill.json`; client:
-`internal/client/planner.go`; server: `internal/xrpcapi/planbackfill.go`) is
+`network.bsky.jetstream.planSnapshot` (lexicon:
+`lexicons/network/bsky/jetstream/planSnapshot.json`; client:
+`internal/client/planner.go`; server: `internal/xrpcapi/plansnapshot.go`) is
 a **transport planner only**: it names which immutable artifacts might
 contain matching rows. Exact filtering, decoding, and folding stay
 client-side.
@@ -267,7 +267,7 @@ and `time` as a microsecond-precision datetime the client parses back to
 
 ## Writing a third-party client: the checklist
 
-1. Page `planBackfill` with pinned `sealedTipSeq`; download by `mode`;
+1. Page `planSnapshot` with pinned `sealedTipSeq`; download by `mode`;
    verify checksums; decode blocks; run your exact filter per row.
 2. Emit in seq order; treat every boundary as at-least-once and dedup by
    seq (or make your consumer idempotent).

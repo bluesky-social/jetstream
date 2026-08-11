@@ -255,9 +255,9 @@ If you want to understand the change by reading tests, go in this order:
    real collections, and that sealing/rewriting tags blocks correctly.
 
 3. **`internal/manifest/plan_test.go`** — the pagination logic:
-   - `TestPlanBackfill_MidSegmentCutCursorIsBlockMaxSeq` — proves we don't skip the tail
+   - `TestPlanSnapshot_MidSegmentCutCursorIsBlockMaxSeq` — proves we don't skip the tail
      of a partly-included segment.
-   - `TestPlanBackfill_OneUnitOverCapStillAdvances` — proves the loop can't get stuck.
+   - `TestPlanSnapshot_OneUnitOverCapStillAdvances` — proves the loop can't get stuck.
 
 4. **`internal/client/engine_test.go`** — the client loop:
    - `TestEngineMultiPageBackfillCutover` — three pages add up to the right answer.

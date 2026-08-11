@@ -11,7 +11,7 @@ Author: jcalabro (with Claude)
 >   eventually-consistent; the client emits every row and converges under fold;
 >   the `getTombstones` overlay endpoint is removed.
 > - **Part B — Paginated, bufferless cutover** (§10–§16): a client completes a
->   backfill via *repeated* `planBackfill` calls (pagination), then connects
+>   backfill via *repeated* `planSnapshot` calls (pagination), then connects
 >   `/subscribe` only once it has caught up to the sealed tip. This removes the
 >   client-side cutover buffer entirely ("jetstream is your buffer") and makes the
 >   websocket lookback window no longer load-bearing for correctness.
@@ -84,7 +84,7 @@ tail `(W, tip]` (≈ one compaction interval). Those converge as their markers a
 > # ⚠ REVISION 2026-06-29 — §R4 mechanism REPLACED (READ FIRST)
 > #
 > # §R3 (the gap) stands exactly as written. §R4's **mechanism** does not: the
-> # `wantDidTombstones` / `didTombstones` planBackfill start-snapshot (shipped as
+> # `wantDidTombstones` / `didTombstones` planSnapshot start-snapshot (shipped as
 > # step 3, commit 154eee3) has been **reverted and replaced** by an in-archive
 > # **reserved DID-marker sentinel collection** index (issue #175, decided with
 > # Jim). The gap is now closed where it originates — the segment index — instead
@@ -95,7 +95,7 @@ tail `(W, tip]` (≈ one compaction interval). Those converge as their markers a
 > # marker-bearing block with a reserved sentinel collection name (`$account`,
 > # `$identity`, `$sync`; see `segment/sentinel.go`). These names are invalid
 > # NSIDs (`atmos.ParseNSID` rejects a `$`-leading, <3-segment string) and the
-> # planBackfill request validator only admits real NSIDs / NSID-authority
+> # planSnapshot request validator only admits real NSIDs / NSID-authority
 > # wildcard prefixes, so a client can never name or prefix-match a sentinel — it
 > # cannot collide with real traffic. The planner
 > # (`manifest.collectionIDsForSegment`) unconditionally admits a segment's
@@ -107,7 +107,7 @@ tail `(W, tip]` (≈ one compaction interval). Those converge as their markers a
 > #
 > # **Why this is better.** It deletes the entire snapshot surface — the
 > # `wantDidTombstones` input, the `didTombstones`/`didTombstonesIncluded` output,
-> # the client `snapshotSelector`/suppression fold, `planBackfillStart`, the
+> # the client `snapshotSelector`/suppression fold, `planSnapshotStart`, the
 > # fail-closed `errSnapshotMissing` gate, the server `attachDIDTombstones` +
 > # `Tombstones` wiring, and the whole snapshot-before-first-fetch ordering
 > # invariant and its race-freedom proof. The DID-level case collapses into the
@@ -227,7 +227,7 @@ No segment-format change. No pebble persistence. We **reuse the in-memory
 exactly the DID-level tombstones in `(W, tip]`, keyed by DID, and already has a
 seq-ranged extractor, `SnapshotRange`). The mechanism:
 
-1. **Pin the backfill upper bound to `S`, acquired on page 1.** The first `planBackfill`
+1. **Pin the backfill upper bound to `S`, acquired on page 1.** The first `planSnapshot`
    call returns `sealedTipSeq` (§12.2); the client sets `S = that value` and then uses
    `beforeSeq = S` for **every** page **including page 1** — i.e. page 1's emitted rows must
    be re-clamped to `seq <= S` even though `S` was learned *from* page 1 (page 1 is planned
@@ -237,7 +237,7 @@ seq-ranged extractor, `SnapshotRange`). The mechanism:
    floating upper bound reopens the moving-tip leak (R4 proof) and lets rows above the
    snapshot's coverage enter the download.
 2. **Snapshot the DID-level tombstones once, co-atomically with `S`, on page 1.** The same
-   page-1 `planBackfill` response that carries `sealedTipSeq = S` **also carries the
+   page-1 `planSnapshot` response that carries `sealedTipSeq = S` **also carries the
    DID-level tombstone snapshot over `(afterSeq, S]`** (the wire surface is R4.1 below). One
    server-side read produces both `S` and the snapshot under the planner's view, so they are
    co-atomic by construction and **strictly precede the client's first `getBlock`.** The
@@ -284,27 +284,27 @@ the live tail above `S`. This matches the oracle's `groundTruthLive` (a record s
 iff `kill_seq <= record_seq`). The danger exists **only** if a client wrongly treats a
 snapshot DID entry as "this account is dead now, purge it" — it must not.
 
-### R4.1 Wire surface: piggyback the DID-tombstone snapshot on planBackfill page 1
+### R4.1 Wire surface: piggyback the DID-tombstone snapshot on planSnapshot page 1
 
 > ⚠ VOID — SUPERSEDED BY §R4 (REVISED). There is no wire surface: `wantDidTombstones`,
 > `didTombstones`, and `didTombstonesIncluded` were added then reverted. The sentinel
 > index needs **no new lexicon field, no generated-binding change, and no
 > `tombstone.Set` on the read path.** Post-revert, `SnapshotRange` is overlay-only again
-> (planBackfill no longer calls it), so §8 step 5 can remove it after the overlay is
+> (planSnapshot no longer calls it), so §8 step 5 can remove it after the overlay is
 > deleted. Text below is void.
 
 The snapshot must cross a process boundary — the client reaches the server only over XRPC,
 `SnapshotRange` is an in-memory server method (`tombstone.go:73`) with no caller once the
 overlay/`getTombstones` bridge is deleted (§8 step 4). **Decision: piggyback it on the
-`planBackfill` response, populated on the first page only.** No new endpoint; reuses the call
+`planSnapshot` response, populated on the first page only.** No new endpoint; reuses the call
 the client already makes to learn `S`, which is what makes `S` and the snapshot co-atomic.
 
 - **Lexicon:** add an optional output field `didTombstones` to
-  `lexicons/network/bsky/jetstream/planBackfill.json` — an array of `{ did, seq }` (the
+  `lexicons/network/bsky/jetstream/planSnapshot.json` — an array of `{ did, seq }` (the
   account/sync DID-level tombstones with `seq` in `(afterSeq, sealedTipSeq]`). Regenerate
   `api/jetstream/*`. DID-level only; record-level tombstones are never sent (they ride inline).
 - **Server:** wire the `*tombstone.Set` (constructed at `runtime.go:273`) into
-  `newPlanBackfillHandler` (`planbackfill.go:62`). Populate `didTombstones` from
+  `newPlanSnapshotHandler` (`plansnapshot.go:62`). Populate `didTombstones` from
   `Set.SnapshotRange(afterSeq, sealedTipSeq).DIDs` **only when the request is page 1** — i.e.
   when the client signals it is starting a fresh backfill. Page 1 is "the client has no prior
   cursor for this backfill"; encode it explicitly (e.g. a request flag `wantDidTombstones`, set
@@ -312,7 +312,7 @@ the client already makes to learn `S`, which is what makes `S` and the snapshot 
   resume-from-cursor backfill also needs the snapshot over its own `(afterSeq, S]`. Capturing
   `sealedTipSeq` and the snapshot in the same handler invocation, under the planner's manifest
   view, is what gives the co-atomic `S`+snapshot guarantee R4 step 2 relies on.
-- **Client:** on the first `planBackfill` call set `wantDidTombstones=true`, read both
+- **Client:** on the first `planSnapshot` call set `wantDidTombstones=true`, read both
   `sealedTipSeq` (→ `S`, pinned as `beforeSeq` thereafter) and `didTombstones` (→ the held
   suppression snapshot) from that one response. Subsequent pages omit the flag and ignore the
   field.
@@ -322,10 +322,10 @@ the client already makes to learn `S`, which is what makes `S` and the snapshot 
   with the request's DID filter when one is set — small (deletes are sparse). For a DID-filtered
   request, filter `didTombstones` to the requested DIDs server-side.
 
-## R5. How this rides the paginated `planBackfill` (Part B) — it makes it easier
+## R5. How this rides the paginated `planSnapshot` (Part B) — it makes it easier
 
 Part B already turns backfill into a paginated limit/offset loop: repeated
-`planBackfill(afterSeq=cursor, beforeSeq=…)` calls advancing `cursor` until the sealed
+`planSnapshot(afterSeq=cursor, beforeSeq=…)` calls advancing `cursor` until the sealed
 range is consumed, then one `/subscribe` connect. This revision slots in cleanly:
 
 - `beforeSeq = S` (R4 step 1) is **exactly the "end sequence number"** of the paginated
@@ -533,7 +533,7 @@ for physically reclaiming superseded rows in sealed segments. What goes away is 
   right concurrency- and correctness-sensitive code. None of it is needed for a correct
   (eventually-consistent) client.
 - **Every future client library gets simpler.** A third-party client in any language
-  now only needs: `planBackfill` → download segments/blocks → emit rows → tail
+  now only needs: `planSnapshot` → download segments/blocks → emit rows → tail
   `/subscribe`. No overlay decode, no half-open seq-window suppression logic, no
   combined-set reasoning. This is the single biggest lever on "how hard is it to write a
   correct Jetstream client."
@@ -874,7 +874,7 @@ STALE scorecard is expected until the mutants are re-reviewed.
 7. **`seqs: start at 1`** (§R8). Initialize `nextSeq=1` on a fresh archive; delete the
    `backfillCoveredNothing` flag and collapse the `gt.Option[uint64]` seq machinery. Best done
    early — it simplifies steps 8–9. Update docs' 0-based statements.
-8. **`manifest: paginate planBackfill`** (§12, §12.1-rewritten). Replace `ErrPlanTooLarge`
+8. **`manifest: paginate planSnapshot`** (§12, §12.1-rewritten). Replace `ErrPlanTooLarge`
    with the per-unit truncation rule (continuation cursor = last-included-unit `MaxSeq`; always
    admit ≥1 unit); add `sealedTipSeq` (required field) to result+lexicon+bindings.
 9. **`subscribe: v2 too-old cursor → HTTP 400`** (§14-rewritten, D5). Add
@@ -980,7 +980,7 @@ sealed range `(afterSeq, S]`, and the terminal `/subscribe` cold replay (§14.1)
 segment sealed *during* the download (its seqs are `> S`, so they fall to the cutover, not to a
 later page) — no client buffer needed.
 
-## 11. Target model: pagination over planBackfill
+## 11. Target model: pagination over planSnapshot
 
 > ⚠ TWO CORRECTIONS to the pseudocode below (read with §R4-revised + §14-rewritten):
 > (1) `beforeSeq` must be **pinned to `S`** (the sealed tip read on the first page), NOT
@@ -997,7 +997,7 @@ limit, the returned continuation seq ≈ the "next page" token):
 ```
 cursor := request.AfterSeq            // 0 for a full backfill
 for {
-    p := planBackfill(afterSeq=cursor, beforeSeq=request.BeforeSeq, filters…)
+    p := planSnapshot(afterSeq=cursor, beforeSeq=request.BeforeSeq, filters…)
     download + emit p.Segments         // every matching row, in seq order, no suppression
     cursor = p.PlannedThroughSeq       // continuation cursor (see §12)
     if cursor >= p.SealedTipSeq {      // ALL sealed segments consumed (see §14.1)
@@ -1017,7 +1017,7 @@ tunable threshold. See §14.1 for why this is both correct and the right efficie
 Why each step is correct (grounded in code read this session):
 
 - **Sealed-segment downloads never expire.** The lookback clamp lives *only* in `/subscribe`
-  cursor resolution. `planBackfill` (`internal/manifest/plan.go`) and `getSegment`/`getBlock`
+  cursor resolution. `planSnapshot` (`internal/manifest/plan.go`) and `getSegment`/`getBlock`
   read durable files with no time bound. A 100-hour backfill is fine; segments don't age out
   (compaction only rewrites in place, preserving seq ranges).
 - **The terminal `/subscribe` cold replay absorbs mid-download seals.** Because `beforeSeq` is
@@ -1047,14 +1047,14 @@ all become the same loop: re-enter pagination from the last seq the consumer dur
 processed. This is the deep simplification — we delete `liveSink`, `Buffer`, `flipAndDrain`,
 and the concurrent-download-tail entirely (§13).
 
-## 12. Required server change: planBackfill paginates instead of refusing
+## 12. Required server change: planSnapshot paginates instead of refusing
 
 Today the planner **refuses** an oversized plan — the opposite of pagination
 (`internal/manifest/plan.go:159-160`):
 
 ```go
 if req.MaxEntries > 0 && result.Stats.Entries > req.MaxEntries {
-    return PlanBackfillResult{}, ErrPlanTooLarge
+    return PlanSnapshotResult{}, ErrPlanTooLarge
 }
 ```
 
@@ -1123,8 +1123,8 @@ The loop terminates when the client has consumed every sealed segment and only t
 termination rule and why it converges.
 
 Lexicon + generated bindings: add `sealedTipSeq` to
-`lexicons/network/bsky/jetstream/planBackfill.json` output and regenerate
-`api/jetstream/*`. Update `internal/xrpcapi/planbackfill.go` to populate it and to stop
+`lexicons/network/bsky/jetstream/planSnapshot.json` output and regenerate
+`api/jetstream/*`. Update `internal/xrpcapi/plansnapshot.go` to populate it and to stop
 mapping `ErrPlanTooLarge` to an error response.
 
 ## 13. Client changes: delete the buffer, loop the plan
@@ -1145,7 +1145,7 @@ mapping `ErrPlanTooLarge` to an error response.
   root-package `LiveBuffer` adapter, the `liveRewindMargin` cutover overlap, the
   `backfillCoveredNothing` / dedup-floor special-casing, and the concurrent live-tail
   goroutine started before download (`engine.go:477-480`).
-- **Rewrite** `runBackfillThenLive`: page through `planBackfill` (download + emit each page
+- **Rewrite** `runBackfillThenLive`: page through `planSnapshot` (download + emit each page
   in seq order via the existing `Downloader`), advancing `cursor = plannedThroughSeq` until
   `plannedThroughSeq >= sealedTipSeq`, then start the steady-state live consumer at `cursor`.
   No buffering phase, no flip.
@@ -1208,7 +1208,7 @@ close-frame: it arrives synchronously at connect, before any events flow, so it 
 distinguishable from live-tail disconnects (`internal/client/live.go:154-182` reconnect path).
 This closes the §11 loop's third case (fell-off-live) and the terminal-hop case with the **same**
 recovery path — re-backfill from the last seq — so it adds no new client state machine beyond
-"recognize the 400, loop back to planBackfill." Bound the re-backfill cycles and assert the
+"recognize the 400, loop back to planSnapshot." Bound the re-backfill cycles and assert the
 cursor advances monotonically across them (defense against a pathological ping-pong).
 
 ### 14.1 Termination rule: exhaust the sealed archive, then hand off (no tunable threshold)

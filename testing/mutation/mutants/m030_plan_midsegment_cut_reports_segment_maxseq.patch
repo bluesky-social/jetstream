@@ -13,7 +13,7 @@ expected-detection: |
   client paginates inside a single segment whose matched blocks are
   non-contiguous; reporting the segment MaxSeq skips the tail blocks, so the
   emitted seqs are missing the later matched blocks and diverge from ground
-  truth. The manifest unit test TestPlanBackfill_MidSegmentCutCursorIsBlockMaxSeq
+  truth. The manifest unit test TestPlanSnapshot_MidSegmentCutCursorIsBlockMaxSeq
   also covers this directly, but the partb tier proves the end-to-end loss.
 expected-tier: partb
 tiers: partb
@@ -21,7 +21,7 @@ tiers: partb
 diff --git a/internal/manifest/plan.go b/internal/manifest/plan.go
 --- a/internal/manifest/plan.go
 +++ b/internal/manifest/plan.go
-@@ -222,7 +222,7 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+@@ -222,7 +222,7 @@ func (m *Manifest) PlanSnapshot(req PlanSnapshotRequest) (PlanSnapshotResult, er
  			planned.Blocks = append(planned.Blocks, br)
  			result.Stats.Entries++
  			result.Stats.BlocksMatched += br.Last - br.First + 1

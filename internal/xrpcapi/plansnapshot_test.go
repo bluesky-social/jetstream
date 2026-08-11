@@ -19,7 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const planURLPath = "/xrpc/network.bsky.jetstream.planBackfill"
+const planURLPath = "/xrpc/network.bsky.jetstream.planSnapshot"
 
 type planResp struct {
 	PlannedThroughSeq int64 `json:"plannedThroughSeq"`
@@ -261,7 +261,7 @@ func TestValidatePlanCollections(t *testing.T) {
 	})
 }
 
-func TestPlanBackfill_ReturnsBlockPlan(t *testing.T) {
+func TestPlanSnapshot_ReturnsBlockPlan(t *testing.T) {
 	t.Parallel()
 
 	ts := newPlanTestServer(t, defaultPlanTestConfig(),
@@ -295,7 +295,7 @@ func TestPlanBackfill_ReturnsBlockPlan(t *testing.T) {
 	require.EqualValues(t, 1, out.Stats.Entries)
 }
 
-func TestPlanBackfill_WildcardOnly(t *testing.T) {
+func TestPlanSnapshot_WildcardOnly(t *testing.T) {
 	t.Parallel()
 
 	ts := newPlanTestServer(t, defaultPlanTestConfig(),
@@ -317,7 +317,7 @@ func TestPlanBackfill_WildcardOnly(t *testing.T) {
 	require.EqualValues(t, 2, out.Stats.BlocksMatched)
 }
 
-func TestPlanBackfill_WildcardMixedWithExact(t *testing.T) {
+func TestPlanSnapshot_WildcardMixedWithExact(t *testing.T) {
 	t.Parallel()
 
 	ts := newPlanTestServer(t, defaultPlanTestConfig(),
@@ -336,7 +336,7 @@ func TestPlanBackfill_WildcardMixedWithExact(t *testing.T) {
 	require.EqualValues(t, 3, out.Stats.BlocksMatched)
 }
 
-func TestPlanBackfill_WildcardMatchesNothing(t *testing.T) {
+func TestPlanSnapshot_WildcardMatchesNothing(t *testing.T) {
 	t.Parallel()
 
 	ts := newPlanTestServer(t, defaultPlanTestConfig(),
@@ -355,7 +355,7 @@ func TestPlanBackfill_WildcardMatchesNothing(t *testing.T) {
 	require.EqualValues(t, 0, out.Stats.SegmentsMatched)
 }
 
-func TestPlanBackfill_WildcardWithDIDFilter(t *testing.T) {
+func TestPlanSnapshot_WildcardWithDIDFilter(t *testing.T) {
 	t.Parallel()
 
 	ts := newPlanTestServer(t, defaultPlanTestConfig(),
@@ -376,7 +376,7 @@ func TestPlanBackfill_WildcardWithDIDFilter(t *testing.T) {
 	require.EqualValues(t, 2, out.Stats.BlocksMatched)
 }
 
-func TestPlanBackfill_WildcardWithSeqWindow(t *testing.T) {
+func TestPlanSnapshot_WildcardWithSeqWindow(t *testing.T) {
 	t.Parallel()
 
 	ts := newPlanTestServer(t, defaultPlanTestConfig(),
@@ -398,7 +398,7 @@ func TestPlanBackfill_WildcardWithSeqWindow(t *testing.T) {
 	require.EqualValues(t, 2, out.Stats.BlocksMatched)
 }
 
-func TestPlanBackfill_InvalidWildcardReturns400(t *testing.T) {
+func TestPlanSnapshot_InvalidWildcardReturns400(t *testing.T) {
 	t.Parallel()
 
 	for _, bad := range []string{"app.*", ".*", "app.bsky..*", "app.bsky.feed.*.*"} {
@@ -413,7 +413,7 @@ func TestPlanBackfill_InvalidWildcardReturns400(t *testing.T) {
 	}
 }
 
-func TestPlanBackfill_WholeSegmentWireShape(t *testing.T) {
+func TestPlanSnapshot_WholeSegmentWireShape(t *testing.T) {
 	t.Parallel()
 
 	// A DID present in 3 of 4 blocks at the default 0.75 threshold yields a
@@ -454,7 +454,7 @@ func TestPlanBackfill_WholeSegmentWireShape(t *testing.T) {
 	require.False(t, hasBlocks, "mode=segment must omit the blocks field on the wire, got: %s", body)
 }
 
-func TestPlanBackfill_IsPOSTProcedure(t *testing.T) {
+func TestPlanSnapshot_IsPOSTProcedure(t *testing.T) {
 	t.Parallel()
 
 	ts := newPlanTestServer(t, defaultPlanTestConfig())
@@ -468,7 +468,7 @@ func TestPlanBackfill_IsPOSTProcedure(t *testing.T) {
 	require.Empty(t, out.Segments)
 }
 
-func TestPlanBackfill_ReadinessGate(t *testing.T) {
+func TestPlanSnapshot_ReadinessGate(t *testing.T) {
 	t.Parallel()
 
 	s, _ := newTestServer(t, 1)
@@ -489,7 +489,7 @@ func TestPlanBackfill_ReadinessGate(t *testing.T) {
 	require.Equal(t, "ServiceUnavailable", readXRPCError(t, resp))
 }
 
-func TestPlanBackfill_InvalidRequests(t *testing.T) {
+func TestPlanSnapshot_InvalidRequests(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -551,7 +551,7 @@ func TestPlanBackfill_InvalidRequests(t *testing.T) {
 	}
 }
 
-func TestPlanBackfill_MisconfiguredServerReturnsInternalError(t *testing.T) {
+func TestPlanSnapshot_MisconfiguredServerReturnsInternalError(t *testing.T) {
 	t.Parallel()
 
 	// A bad operator config is a server fault, not the client's: it must
@@ -564,7 +564,7 @@ func TestPlanBackfill_MisconfiguredServerReturnsInternalError(t *testing.T) {
 	require.Equal(t, "InternalServerError", readXRPCError(t, resp))
 }
 
-func TestPlanBackfill_InvalidJSON(t *testing.T) {
+func TestPlanSnapshot_InvalidJSON(t *testing.T) {
 	t.Parallel()
 
 	ts := newPlanTestServer(t, defaultPlanTestConfig())
@@ -578,7 +578,7 @@ func TestPlanBackfill_InvalidJSON(t *testing.T) {
 	require.Equal(t, "InvalidRequest", readXRPCError(t, resp))
 }
 
-func TestPlanBackfill_TruncatesAndPaginatesOverWire(t *testing.T) {
+func TestPlanSnapshot_TruncatesAndPaginatesOverWire(t *testing.T) {
 	t.Parallel()
 
 	// target on odd seqs → sparse non-adjacent blocks → three coalesced
@@ -612,7 +612,7 @@ func TestPlanBackfill_TruncatesAndPaginatesOverWire(t *testing.T) {
 	require.NotEmpty(t, page2.Segments, "the un-included tail block is delivered on page 2")
 }
 
-func TestPlanBackfill_ZeroMaxEntriesDisablesPagination(t *testing.T) {
+func TestPlanSnapshot_ZeroMaxEntriesDisablesPagination(t *testing.T) {
 	t.Parallel()
 
 	// MaxEntries == 0 disables the per-page cap: the same workload that

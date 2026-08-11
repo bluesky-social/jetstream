@@ -1,5 +1,5 @@
 // Package client implements the Jetstream Go client's orchestration:
-// backfill-plan negotiation, sealed-segment/block download, the
+// snapshot-plan negotiation, sealed-segment/block download, the
 // backfill-to-live cutover, and the live tail. It is internal: third parties
 // consume only the root jetstream package, which wires this engine behind its
 // public Client.
@@ -97,7 +97,7 @@ type PlanStats struct {
 	Entries          uint64
 }
 
-// PlanRequest is the resolved filter set for a backfill plan. Empty DID and
+// PlanRequest is the resolved filter set for a snapshot plan. Empty DID and
 // collection slices mean "match all". AfterSeq is an exclusive lower bound;
 // BeforeSeq (when set) is an inclusive upper bound.
 type PlanRequest struct {
@@ -108,22 +108,22 @@ type PlanRequest struct {
 	BeforeSeq    uint64
 }
 
-// Planner negotiates backfill plans with a Jetstream server over XRPC.
+// Planner negotiates snapshot plans with a Jetstream server over XRPC.
 type Planner struct {
 	xc *xrpc.Client
 }
 
-// NewPlanner returns a Planner that issues planBackfill calls on xc.
+// NewPlanner returns a Planner that issues planSnapshot calls on xc.
 func NewPlanner(xc *xrpc.Client) *Planner {
 	return &Planner{xc: xc}
 }
 
-// Plan calls network.bsky.jetstream.planBackfill and converts the response
+// Plan calls network.bsky.jetstream.planSnapshot and converts the response
 // into an ordered Plan. The plan may be a truncated page when the server's
 // per-page entry limit is exceeded; the caller pages by re-issuing Plan with
 // AfterSeq=Plan.PlannedThroughSeq until PlannedThroughSeq reaches SealedTipSeq.
 func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
-	// The planBackfill lexicon fields are int64; reject a uint64 cursor that
+	// The planSnapshot lexicon fields are int64; reject a uint64 cursor that
 	// would wrap negative rather than silently plan from the wrong range
 	// (symmetric with the negative-seq guards on the response side below).
 	if req.AfterSeq > math.MaxInt64 {
@@ -133,15 +133,15 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 		return nil, fmt.Errorf("jetstream: beforeSeq %d exceeds int64 max", req.BeforeSeq)
 	}
 	in := planInput(req)
-	out, err := jetstream.JetstreamPlanBackfill(ctx, p.xc, in)
+	out, err := jetstream.JetstreamPlanSnapshot(ctx, p.xc, in)
 	if err != nil {
-		return nil, fmt.Errorf("jetstream: planBackfill: %w", err)
+		return nil, fmt.Errorf("jetstream: planSnapshot: %w", err)
 	}
 	return planFromOutput(out)
 }
 
-func planInput(req PlanRequest) *jetstream.JetstreamPlanBackfill_Input {
-	in := &jetstream.JetstreamPlanBackfill_Input{}
+func planInput(req PlanRequest) *jetstream.JetstreamPlanSnapshot_Input {
+	in := &jetstream.JetstreamPlanSnapshot_Input{}
 	if len(req.DIDs) > 0 {
 		in.Dids = req.DIDs
 	}
@@ -160,15 +160,15 @@ func planInput(req PlanRequest) *jetstream.JetstreamPlanBackfill_Input {
 	return in
 }
 
-func planFromOutput(out *jetstream.JetstreamPlanBackfill_Output) (*Plan, error) {
+func planFromOutput(out *jetstream.JetstreamPlanSnapshot_Output) (*Plan, error) {
 	if out.PlannedThroughSeq < 0 {
-		return nil, fmt.Errorf("jetstream: planBackfill returned negative plannedThroughSeq %d", out.PlannedThroughSeq)
+		return nil, fmt.Errorf("jetstream: planSnapshot returned negative plannedThroughSeq %d", out.PlannedThroughSeq)
 	}
 	if out.SealedTipSeq < 0 {
-		return nil, fmt.Errorf("jetstream: planBackfill returned negative sealedTipSeq %d", out.SealedTipSeq)
+		return nil, fmt.Errorf("jetstream: planSnapshot returned negative sealedTipSeq %d", out.SealedTipSeq)
 	}
 	if out.PlannedThroughSeq > out.SealedTipSeq {
-		return nil, fmt.Errorf("jetstream: planBackfill plannedThroughSeq %d exceeds sealedTipSeq %d", out.PlannedThroughSeq, out.SealedTipSeq)
+		return nil, fmt.Errorf("jetstream: planSnapshot plannedThroughSeq %d exceeds sealedTipSeq %d", out.PlannedThroughSeq, out.SealedTipSeq)
 	}
 	plan := &Plan{
 		PlannedThroughSeq: uint64(out.PlannedThroughSeq),
@@ -191,21 +191,21 @@ func planFromOutput(out *jetstream.JetstreamPlanBackfill_Output) (*Plan, error) 
 	return plan, nil
 }
 
-func planEntryFromSegment(seg *jetstream.JetstreamPlanBackfill_Segment) (PlanEntry, error) {
+func planEntryFromSegment(seg *jetstream.JetstreamPlanSnapshot_Segment) (PlanEntry, error) {
 	if seg.Name == "" {
-		return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment missing name (index %d)", seg.Index)
+		return PlanEntry{}, fmt.Errorf("jetstream: planSnapshot segment missing name (index %d)", seg.Index)
 	}
 	if seg.Index < 0 || seg.MinSeq < 0 || seg.MaxSeq < 0 {
-		return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q has negative index/seq", seg.Name)
+		return PlanEntry{}, fmt.Errorf("jetstream: planSnapshot segment %q has negative index/seq", seg.Name)
 	}
 	if seg.MaxSeq < seg.MinSeq {
-		return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q has inverted seq range [%d,%d]", seg.Name, seg.MinSeq, seg.MaxSeq)
+		return PlanEntry{}, fmt.Errorf("jetstream: planSnapshot segment %q has inverted seq range [%d,%d]", seg.Name, seg.MinSeq, seg.MaxSeq)
 	}
 	// Index is narrowed to uint32 below; reject values that would wrap silently
 	// rather than key a download under the wrong index. MinSeq/MaxSeq widen to
 	// uint64 and cannot overflow after the negative check above.
 	if seg.Index > math.MaxUint32 {
-		return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q index %d exceeds uint32 max", seg.Name, seg.Index)
+		return PlanEntry{}, fmt.Errorf("jetstream: planSnapshot segment %q index %d exceeds uint32 max", seg.Name, seg.Index)
 	}
 	entry := PlanEntry{
 		SegmentName: seg.Name,
@@ -222,18 +222,18 @@ func planEntryFromSegment(seg *jetstream.JetstreamPlanBackfill_Segment) (PlanEnt
 		entry.Blocks = make([]BlockRange, 0, len(seg.Blocks))
 		for _, br := range seg.Blocks {
 			if br.First < 0 || br.Last < 0 || br.Last < br.First {
-				return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q has invalid block range [%d,%d]", seg.Name, br.First, br.Last)
+				return PlanEntry{}, fmt.Errorf("jetstream: planSnapshot segment %q has invalid block range [%d,%d]", seg.Name, br.First, br.Last)
 			}
 			if br.Last > math.MaxUint32 {
-				return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q block range [%d,%d] exceeds uint32 max", seg.Name, br.First, br.Last)
+				return PlanEntry{}, fmt.Errorf("jetstream: planSnapshot segment %q block range [%d,%d] exceeds uint32 max", seg.Name, br.First, br.Last)
 			}
 			entry.Blocks = append(entry.Blocks, BlockRange{First: uint32(br.First), Last: uint32(br.Last)})
 		}
 		if len(entry.Blocks) == 0 {
-			return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q has mode=blocks but no block ranges", seg.Name)
+			return PlanEntry{}, fmt.Errorf("jetstream: planSnapshot segment %q has mode=blocks but no block ranges", seg.Name)
 		}
 	default:
-		return PlanEntry{}, fmt.Errorf("jetstream: planBackfill segment %q has unknown mode %q", seg.Name, seg.Mode)
+		return PlanEntry{}, fmt.Errorf("jetstream: planSnapshot segment %q has unknown mode %q", seg.Name, seg.Mode)
 	}
 	return entry, nil
 }

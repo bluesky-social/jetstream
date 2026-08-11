@@ -116,7 +116,7 @@ with **no record gap and no missing suppression**:
 
 Two numbers that are easy to conflate and **must not be**:
 
-- `plannedThroughSeq` (from `planBackfill`) = the **sealed-archive tip**. This
+- `plannedThroughSeq` (from `planSnapshot`) = the **sealed-archive tip**. This
   is the highest seq whose *record bytes* are downloadable as immutable files.
   (`internal/manifest/plan.go:103` — sealed tip capped by `beforeSeq`.)
 - `M` (from `getTombstones`) = the **highest seq folded into the tombstone
@@ -174,7 +174,7 @@ arbitrary snapshot line because the live tail produces deletes forever.
 
 ### 3.3 Filtering
 
-`planBackfill` is a transport hint with a one-sided contract (no false
+`planSnapshot` is a transport hint with a one-sided contract (no false
 negatives, possible false positives: DID blooms and block collection summaries
 over-select). The client MUST apply exact DID + collection filtering after
 decode, and exact `(afterSeq, beforeSeq]` seq bounds, before emitting. Wildcard
@@ -202,7 +202,7 @@ client.go                         root pkg `jetstream`: Subscribe, Client,
                                   LiveBuffer interface
 client_test.go                    public-contract tests (fixture-driven)
 internal/client/                  orchestration (unimportable by 3rd parties)
-  planner.go                      planBackfill negotiation + plan model
+  planner.go                      planSnapshot negotiation + plan model
   downloader.go                   bounded-concurrency getSegment/getBlock fetch
   decode.go                       segment.Event/live frame -> jetstream.Event
   suppress.go                     combined overlay+live tombstone application
@@ -227,7 +227,7 @@ tombstone decode are reused directly — nothing is promoted to public.
 The two HTTP workloads want opposite jttp tuning, so the engine builds **two**
 clients (not one), matching the existing codebase pattern:
 
-- **XRPC negotiation** (`getTombstones`/`planBackfill`): short fan-out calls →
+- **XRPC negotiation** (`getTombstones`/`planSnapshot`): short fan-out calls →
   `jttp.New(xrpc.ATProtoOpts(timeout)...)` (short overall `WithTimeout`, 5s
   dial/TLS, 15s response-header).
 - **Bulk segment/block download** (`getSegment`/`getBlock`): large streaming
@@ -327,7 +327,7 @@ on resume) from v1 scope; `PlanTooLarge` is still handled at initial plan time
 
 - Add a **client-driven historical observation tier**: the oracle constructs a
   real `jetstream.Client` pointed at the simulator-backed server and drives the
-  full negotiation (`getTombstones` -> `planBackfill` ->
+  full negotiation (`getTombstones` -> `planSnapshot` ->
   `getSegment`/`getBlock` -> cutover at `plannedThroughSeq` -> overlay+filter+
   dedup). The client is used as an **observation surface only**; expected state
   is still derived independently from simulator world + firehose history
@@ -381,7 +381,7 @@ Filed under epic #80:
 
 1. (#81) `segment: drop internal/obs+crashpoint from decode core` (enabler)
 2. (#82) `client: root package skeleton — Subscribe, Options, Event, Batch, iter.Seq2`
-3. (#83) `client: backfill planner negotiation (planBackfill) + plan model`
+3. (#83) `client: snapshot planner negotiation (planSnapshot) + plan model`
 4. (#84) `client: bounded-concurrency segment/block downloader + decode`
 5. (#85) `client: combined overlay+live tombstone suppression + exact filtering`
 6. (#86) `client: /subscribe-v2 extended live tail consumer + buffering`

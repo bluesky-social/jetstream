@@ -133,7 +133,7 @@ func TestOptionsValidateRejectsNegativeCompactionRewriteWorkers(t *testing.T) {
 func TestOptionsValidateAcceptsZeroPlanMaxEntries(t *testing.T) {
 	t.Parallel()
 
-	// 0 disables the planBackfill entry cap (unbounded plan size). It must
+	// 0 disables the planSnapshot entry cap (unbounded plan size). It must
 	// build successfully rather than being rejected as a misconfiguration.
 	opts := testOptions(t)
 	opts.PlanMaxEntries = 0

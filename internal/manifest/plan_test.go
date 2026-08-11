@@ -29,25 +29,25 @@ func writePlanSegment(t *testing.T, dir string, idx uint64, maxPerBlock int, eve
 	mustWriteSealedSegmentWithEvents(t, filepath.Join(dir, ingest.SegmentFilename(idx)), maxPerBlock, events)
 }
 
-func planReq() manifest.PlanBackfillRequest {
-	return manifest.PlanBackfillRequest{
+func planReq() manifest.PlanSnapshotRequest {
+	return manifest.PlanSnapshotRequest{
 		MaxEntries:            100,
 		WholeSegmentThreshold: 1,
 	}
 }
 
-func TestPlanBackfill_EmptyArchive(t *testing.T) {
+func TestPlanSnapshot_EmptyArchive(t *testing.T) {
 	t.Parallel()
 
 	m := openManifestDir(t, t.TempDir())
-	got, err := m.PlanBackfill(planReq())
+	got, err := m.PlanSnapshot(planReq())
 	require.NoError(t, err)
 	require.Zero(t, got.PlannedThroughSeq)
 	require.Empty(t, got.Segments)
 	require.Zero(t, got.Stats)
 }
 
-func TestPlanBackfill_EmptyFiltersMatchAllSealedBlocks(t *testing.T) {
+func TestPlanSnapshot_EmptyFiltersMatchAllSealedBlocks(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -58,13 +58,13 @@ func TestPlanBackfill_EmptyFiltersMatchAllSealedBlocks(t *testing.T) {
 	)
 	m := openManifestDir(t, dir)
 
-	got, err := m.PlanBackfill(planReq())
+	got, err := m.PlanSnapshot(planReq())
 	require.NoError(t, err)
 	require.EqualValues(t, 3, got.PlannedThroughSeq)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, manifest.PlanModeSegment, got.Segments[0].Mode)
 	require.Empty(t, got.Segments[0].Blocks)
-	require.Equal(t, manifest.PlanBackfillStats{
+	require.Equal(t, manifest.PlanSnapshotStats{
 		SegmentsExamined: 1,
 		SegmentsMatched:  1,
 		BlocksMatched:    3,
@@ -72,7 +72,7 @@ func TestPlanBackfill_EmptyFiltersMatchAllSealedBlocks(t *testing.T) {
 	}, got.Stats)
 }
 
-func TestPlanBackfill_DIDFilterCoalescesSparseBlocks(t *testing.T) {
+func TestPlanSnapshot_DIDFilterCoalescesSparseBlocks(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -86,7 +86,7 @@ func TestPlanBackfill_DIDFilterCoalescesSparseBlocks(t *testing.T) {
 	req := planReq()
 	req.DIDs = []string{planDID}
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, manifest.PlanModeBlocks, got.Segments[0].Mode)
@@ -101,14 +101,14 @@ func markerEvent(seq uint64, did string, kind segment.Kind) segment.Event {
 	return segment.Event{Seq: seq, Kind: kind, DID: did, Payload: []byte{0xa0}}
 }
 
-// TestPlanBackfill_CollectionFilterSelectsDIDMarkerBlocks is the planner-level
+// TestPlanSnapshot_CollectionFilterSelectsDIDMarkerBlocks is the planner-level
 // guard for the §R3 gap fix: a collection-filtered plan must select the blocks
 // holding DID-level markers (#account/#identity/#sync) even though those markers
 // carry no real collection, because the seal index tags their blocks with a
 // reserved sentinel collection that the planner always admits. Without the
 // sentinel union the marker block (seq 2) would be dropped and the killer never
 // downloaded.
-func TestPlanBackfill_CollectionFilterSelectsDIDMarkerBlocks(t *testing.T) {
+func TestPlanSnapshot_CollectionFilterSelectsDIDMarkerBlocks(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -123,7 +123,7 @@ func TestPlanBackfill_CollectionFilterSelectsDIDMarkerBlocks(t *testing.T) {
 	req := planReq()
 	req.Collections = []string{postNSID}
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, manifest.PlanModeBlocks, got.Segments[0].Mode)
@@ -134,11 +134,11 @@ func TestPlanBackfill_CollectionFilterSelectsDIDMarkerBlocks(t *testing.T) {
 	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 1}, {First: 3, Last: 4}}, got.Segments[0].Blocks)
 }
 
-// TestPlanBackfill_CollectionAndDIDFilterNarrowsMarkerBlocks proves the DID
+// TestPlanSnapshot_CollectionAndDIDFilterNarrowsMarkerBlocks proves the DID
 // bloom still narrows sentinel-selected blocks: a collection+DID-filtered plan
 // pulls only marker blocks whose block bloom may contain the requested DID, not
 // every marker block in the segment.
-func TestPlanBackfill_CollectionAndDIDFilterNarrowsMarkerBlocks(t *testing.T) {
+func TestPlanSnapshot_CollectionAndDIDFilterNarrowsMarkerBlocks(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -152,7 +152,7 @@ func TestPlanBackfill_CollectionAndDIDFilterNarrowsMarkerBlocks(t *testing.T) {
 	req.Collections = []string{postNSID}
 	req.DIDs = []string{planDID}
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	// Block 2 (otherDID's marker) is pruned by the DID bloom; blocks 0 and 1
@@ -160,7 +160,7 @@ func TestPlanBackfill_CollectionAndDIDFilterNarrowsMarkerBlocks(t *testing.T) {
 	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 1}}, got.Segments[0].Blocks)
 }
 
-func TestPlanBackfill_CollectionFilterUsesResidentCollectionIndex(t *testing.T) {
+func TestPlanSnapshot_CollectionFilterUsesResidentCollectionIndex(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -174,7 +174,7 @@ func TestPlanBackfill_CollectionFilterUsesResidentCollectionIndex(t *testing.T) 
 	req := planReq()
 	req.Collections = []string{likeNSID}
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, manifest.PlanModeBlocks, got.Segments[0].Mode)
@@ -183,7 +183,7 @@ func TestPlanBackfill_CollectionFilterUsesResidentCollectionIndex(t *testing.T) 
 	require.Equal(t, 2, got.Stats.Entries)
 }
 
-func TestPlanBackfill_CollectionPrefixMatchesNamespace(t *testing.T) {
+func TestPlanSnapshot_CollectionPrefixMatchesNamespace(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -197,7 +197,7 @@ func TestPlanBackfill_CollectionPrefixMatchesNamespace(t *testing.T) {
 	req := planReq()
 	req.CollectionPrefixes = []string{"app.bsky.feed."}
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, manifest.PlanModeBlocks, got.Segments[0].Mode)
@@ -206,7 +206,7 @@ func TestPlanBackfill_CollectionPrefixMatchesNamespace(t *testing.T) {
 	require.Equal(t, 2, got.Stats.BlocksMatched)
 }
 
-func TestPlanBackfill_CollectionPrefixAndExactUnion(t *testing.T) {
+func TestPlanSnapshot_CollectionPrefixAndExactUnion(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -221,14 +221,14 @@ func TestPlanBackfill_CollectionPrefixAndExactUnion(t *testing.T) {
 	req.Collections = []string{postNSID}
 	req.CollectionPrefixes = []string{"app.bsky.graph."}
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 1}, {First: 3, Last: 3}}, got.Segments[0].Blocks)
 	require.Equal(t, 3, got.Stats.BlocksMatched)
 }
 
-func TestPlanBackfill_CollectionPrefixMatchesNothing(t *testing.T) {
+func TestPlanSnapshot_CollectionPrefixMatchesNothing(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -240,7 +240,7 @@ func TestPlanBackfill_CollectionPrefixMatchesNothing(t *testing.T) {
 	req := planReq()
 	req.CollectionPrefixes = []string{"com.example."}
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	// Coverage horizon still reported even though nothing matched: both the
 	// continuation cursor and the tip jump straight to the sealed tip, so a
@@ -252,7 +252,7 @@ func TestPlanBackfill_CollectionPrefixMatchesNothing(t *testing.T) {
 	require.Zero(t, got.Stats.SegmentsMatched)
 }
 
-func TestPlanBackfill_DIDAndCollectionFiltersIntersect(t *testing.T) {
+func TestPlanSnapshot_DIDAndCollectionFiltersIntersect(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -267,14 +267,14 @@ func TestPlanBackfill_DIDAndCollectionFiltersIntersect(t *testing.T) {
 	req.DIDs = []string{planDID}
 	req.Collections = []string{likeNSID}
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, []manifest.BlockRange{{First: 2, Last: 2}}, got.Segments[0].Blocks)
 	require.Equal(t, 1, got.Stats.BlocksMatched)
 }
 
-func TestPlanBackfill_SeqWindowPrunesBlocksAndCapsPlannedThrough(t *testing.T) {
+func TestPlanSnapshot_SeqWindowPrunesBlocksAndCapsPlannedThrough(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -293,7 +293,7 @@ func TestPlanBackfill_SeqWindowPrunesBlocksAndCapsPlannedThrough(t *testing.T) {
 	req.BeforeSeq = 5
 	req.HasBeforeSeq = true
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.EqualValues(t, 5, got.PlannedThroughSeq)
 	require.EqualValues(t, 5, got.SealedTipSeq, "tip capped by beforeSeq=5")
@@ -302,7 +302,7 @@ func TestPlanBackfill_SeqWindowPrunesBlocksAndCapsPlannedThrough(t *testing.T) {
 	require.Equal(t, 3, got.Stats.BlocksMatched)
 }
 
-func TestPlanBackfill_DenseSelectionUsesWholeSegment(t *testing.T) {
+func TestPlanSnapshot_DenseSelectionUsesWholeSegment(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -317,7 +317,7 @@ func TestPlanBackfill_DenseSelectionUsesWholeSegment(t *testing.T) {
 	req.DIDs = []string{planDID}
 	req.WholeSegmentThreshold = 0.75
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, manifest.PlanModeSegment, got.Segments[0].Mode)
@@ -326,13 +326,13 @@ func TestPlanBackfill_DenseSelectionUsesWholeSegment(t *testing.T) {
 	require.Equal(t, 1, got.Stats.Entries)
 }
 
-// TestPlanBackfill_TruncatesAtUnitBoundary is the core pagination property: a
+// TestPlanSnapshot_TruncatesAtUnitBoundary is the core pagination property: a
 // plan whose matched work exceeds MaxEntries truncates at a work-unit boundary
 // (here: coalesced block ranges) rather than erroring, advancing the
 // continuation cursor (PlannedThroughSeq) to the MaxSeq of the last included
 // unit. SealedTipSeq stays pinned at the true sealed tip so the client knows
 // the pagination goal.
-func TestPlanBackfill_TruncatesAtUnitBoundary(t *testing.T) {
+func TestPlanSnapshot_TruncatesAtUnitBoundary(t *testing.T) {
 	t.Parallel()
 
 	// One block per event, planDID on odd seqs only. The DID filter yields
@@ -351,7 +351,7 @@ func TestPlanBackfill_TruncatesAtUnitBoundary(t *testing.T) {
 	req.DIDs = []string{planDID}
 	req.MaxEntries = 2
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, manifest.PlanModeBlocks, got.Segments[0].Mode)
@@ -369,7 +369,7 @@ func TestPlanBackfill_TruncatesAtUnitBoundary(t *testing.T) {
 	// re-planned and the union of both pages covers every matching block.
 	req.AfterSeq = got.PlannedThroughSeq
 	req.HasAfterSeq = true
-	got2, err := m.PlanBackfill(req)
+	got2, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got2.Segments, 1)
 	require.Equal(t, []manifest.BlockRange{{First: 4, Last: 4}}, got2.Segments[0].Blocks)
@@ -379,12 +379,12 @@ func TestPlanBackfill_TruncatesAtUnitBoundary(t *testing.T) {
 	// cover blocks {0,2} ∪ {4} = all three matching blocks.
 }
 
-// TestPlanBackfill_MidSegmentCutCursorIsBlockMaxSeq guards the §12.1 hazard:
+// TestPlanSnapshot_MidSegmentCutCursorIsBlockMaxSeq guards the §12.1 hazard:
 // when truncation happens partway through a single segment, the continuation
 // cursor must be the last included BLOCK range's MaxSeq (strictly inside the
 // segment), never the enclosing segment's MaxSeq, or the next page's
 // exclusive afterSeq would skip the segment's un-included tail blocks forever.
-func TestPlanBackfill_MidSegmentCutCursorIsBlockMaxSeq(t *testing.T) {
+func TestPlanSnapshot_MidSegmentCutCursorIsBlockMaxSeq(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -401,7 +401,7 @@ func TestPlanBackfill_MidSegmentCutCursorIsBlockMaxSeq(t *testing.T) {
 	req.DIDs = []string{planDID}
 	req.MaxEntries = 1
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 0}}, got.Segments[0].Blocks)
@@ -416,7 +416,7 @@ func TestPlanBackfill_MidSegmentCutCursorIsBlockMaxSeq(t *testing.T) {
 	for cursor < got.SealedTipSeq {
 		req.AfterSeq = cursor
 		req.HasAfterSeq = true
-		page, err := m.PlanBackfill(req)
+		page, err := m.PlanSnapshot(req)
 		require.NoError(t, err)
 		require.Greater(t, page.PlannedThroughSeq, cursor, "cursor must strictly advance")
 		if len(page.Segments) > 0 {
@@ -427,11 +427,11 @@ func TestPlanBackfill_MidSegmentCutCursorIsBlockMaxSeq(t *testing.T) {
 	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 0}, {First: 2, Last: 2}, {First: 4, Last: 5}}, seen)
 }
 
-// TestPlanBackfill_OneUnitOverCapStillAdvances proves the always-admit-≥1-unit
+// TestPlanSnapshot_OneUnitOverCapStillAdvances proves the always-admit-≥1-unit
 // rule: when a single work unit alone exceeds MaxEntries, the planner includes
 // it anyway and advances the cursor, rather than returning zero units with the
 // cursor unmoved (which would livelock the client's pagination loop).
-func TestPlanBackfill_OneUnitOverCapStillAdvances(t *testing.T) {
+func TestPlanSnapshot_OneUnitOverCapStillAdvances(t *testing.T) {
 	t.Parallel()
 
 	// A contiguous run of planDID blocks coalesces into ONE range (one entry).
@@ -449,7 +449,7 @@ func TestPlanBackfill_OneUnitOverCapStillAdvances(t *testing.T) {
 	req.WholeSegmentThreshold = 1
 	req.MaxEntries = 1
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1, "the single over-cap unit is admitted anyway")
 	require.Equal(t, manifest.PlanModeSegment, got.Segments[0].Mode)
@@ -457,10 +457,10 @@ func TestPlanBackfill_OneUnitOverCapStillAdvances(t *testing.T) {
 	require.EqualValues(t, 3, got.SealedTipSeq)
 }
 
-// TestPlanBackfill_TruncatesAtSegmentBoundary covers multi-segment truncation:
+// TestPlanSnapshot_TruncatesAtSegmentBoundary covers multi-segment truncation:
 // each whole segment is one unit, so MaxEntries=1 truncates after the first
 // segment and the cursor = that segment's MaxSeq.
-func TestPlanBackfill_TruncatesAtSegmentBoundary(t *testing.T) {
+func TestPlanSnapshot_TruncatesAtSegmentBoundary(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -478,7 +478,7 @@ func TestPlanBackfill_TruncatesAtSegmentBoundary(t *testing.T) {
 	req.WholeSegmentThreshold = 1
 	req.MaxEntries = 1
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1, "truncated after the first whole-segment unit")
 	require.EqualValues(t, 0, got.Segments[0].Idx)
@@ -487,14 +487,14 @@ func TestPlanBackfill_TruncatesAtSegmentBoundary(t *testing.T) {
 
 	req.AfterSeq = got.PlannedThroughSeq
 	req.HasAfterSeq = true
-	got2, err := m.PlanBackfill(req)
+	got2, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got2.Segments, 1)
 	require.EqualValues(t, 1, got2.Segments[0].Idx)
 	require.EqualValues(t, 4, got2.PlannedThroughSeq)
 }
 
-func TestPlanBackfill_InvalidRequest(t *testing.T) {
+func TestPlanSnapshot_InvalidRequest(t *testing.T) {
 	t.Parallel()
 
 	m := openManifestDir(t, t.TempDir())
@@ -504,21 +504,21 @@ func TestPlanBackfill_InvalidRequest(t *testing.T) {
 	req.HasAfterSeq = true
 	req.BeforeSeq = 10
 	req.HasBeforeSeq = true
-	_, err := m.PlanBackfill(req)
+	_, err := m.PlanSnapshot(req)
 	require.ErrorIs(t, err, manifest.ErrInvalidPlanRequest)
 
 	req = planReq()
 	req.WholeSegmentThreshold = 0
-	_, err = m.PlanBackfill(req)
+	_, err = m.PlanSnapshot(req)
 	require.ErrorIs(t, err, manifest.ErrInvalidPlanRequest)
 
 	req = planReq()
 	req.MaxEntries = -1
-	_, err = m.PlanBackfill(req)
+	_, err = m.PlanSnapshot(req)
 	require.ErrorIs(t, err, manifest.ErrInvalidPlanRequest)
 }
 
-func TestPlanBackfill_ZeroMaxEntriesIsUnlimited(t *testing.T) {
+func TestPlanSnapshot_ZeroMaxEntriesIsUnlimited(t *testing.T) {
 	t.Parallel()
 
 	// MaxEntries == 0 disables the cap: a plan that would exceed any positive
@@ -536,7 +536,7 @@ func TestPlanBackfill_ZeroMaxEntriesIsUnlimited(t *testing.T) {
 	req.DIDs = []string{planDID}
 	req.MaxEntries = 0
 
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.NotEmpty(t, got.Segments)
 	require.Equal(t, 3, got.Stats.Entries)

@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// planServer spins an httptest server that answers the planBackfill XRPC
+// planServer spins an httptest server that answers the planSnapshot XRPC
 // procedure with the given raw JSON body (status 200) or an XRPC error. It
 // captures the decoded request input for assertion.
 type planServer struct {
@@ -26,7 +26,7 @@ func newPlanServer(t *testing.T, status int, respBody string) *planServer {
 	t.Helper()
 	ps := &planServer{}
 	ps.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/xrpc/network.bsky.jetstream.planBackfill", r.URL.Path)
+		require.Equal(t, "/xrpc/network.bsky.jetstream.planSnapshot", r.URL.Path)
 		require.Equal(t, http.MethodPost, r.Method)
 		body, _ := io.ReadAll(r.Body)
 		ps.lastBody = body
@@ -229,7 +229,7 @@ func TestPlanXRPCErrorIsWrapped(t *testing.T) {
 
 	_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "planBackfill")
+	require.Contains(t, err.Error(), "planSnapshot")
 }
 
 func TestPlanRejectsMalformedSegments(t *testing.T) {

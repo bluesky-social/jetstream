@@ -482,7 +482,7 @@ func TestReaderOpenRejectsOverlappingBlockIndex(t *testing.T) {
 }
 
 // TestValidateBlockOffsetsCrossBlockSeqMonotonicity exercises the load-bearing
-// cross-block seq-disjointness invariant the backfill planner's continuation
+// cross-block seq-disjointness invariant the snapshot planner's continuation
 // cursor depends on (internal/manifest/plan.go): a later non-empty block must
 // never carry a MinSeq <= a prior non-empty block's MaxSeq, or the planner would
 // silently skip it. Empty (compacted-to-empty) blocks keep stale seq bounds and

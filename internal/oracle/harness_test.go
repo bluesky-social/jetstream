@@ -841,7 +841,7 @@ func totalIntMap(values map[string]int) int {
 }
 
 // bisectServedCompactedFailure classifies a client-backfill CheckCompacted
-// failure (the paginated planBackfill -> getSegment/getBlock -> /subscribe-v2
+// failure (the paginated planSnapshot -> getSegment/getBlock -> /subscribe-v2
 // cutover path real clients use) by re-running the identical check against the
 // on-disk segments at the SAME watermark, then fails with a self-classifying
 // verdict (DURABLE_DEFECT vs SERVING_DEFECT vs INCONCLUSIVE). It snapshots the

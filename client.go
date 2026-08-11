@@ -16,7 +16,7 @@ import (
 )
 
 // ErrFatal marks a terminal error yielded by Events: the stream has aborted and
-// will deliver no further events (e.g. the backfill plan was rejected or a
+// will deliver no further events (e.g. the snapshot plan was rejected or a
 // cutover guarantee could not be met). Test for it with errors.Is(err,
 // ErrFatal). Errors that are NOT ErrFatal are recoverable — a single bad
 // segment or a transient live-tail read — and iteration continues past them.
@@ -69,7 +69,7 @@ func (b *Batch) LastCursor() uint64 {
 // accessor is how a caller observes how far a backfill has progressed and the
 // residual gap a sustained-ingest stream is still closing before cutover.
 type Stats struct {
-	// Pages is the number of planBackfill pages downloaded across all sweeps
+	// Pages is the number of planSnapshot pages downloaded across all sweeps
 	// (including §14 re-backfill cycles). Monotonically non-decreasing.
 	Pages uint64
 	// SealedTip is the most recently learned sealed-archive tip S — the pinned

@@ -9,7 +9,7 @@ import "fmt"
 // The served (client-backfill) stream and the on-disk segments are two
 // independent observation surfaces of the same compaction contract
 // (docs/README.md §3.3). The served surface is the paginated client backfill —
-// planBackfill -> getSegment/getBlock -> live-subscribe cutover — that real
+// planSnapshot -> getSegment/getBlock -> live-subscribe cutover — that real
 // clients use (this replaced the bespoke whole-archive /subscribe?cursor=0
 // replay; see specs/oracle.md "Client-Driven Historical Tier"). When that
 // surface reports a superseded survivor, the on-disk surface tells us which
@@ -121,7 +121,7 @@ func (v CompactedFailureVerdict) Err() error {
 		return fmt.Errorf("compaction bisection: %s at watermark=%d: on-disk segments ALSO violate the compaction contract -> Jetstream persisted a superseded row (storage/compaction defect, NOT a serving artifact). served=[%w] disk=[%w]",
 			v.Verdict, v.Watermark, v.ServedErr, v.DiskErr)
 	case VerdictServingDefect:
-		return fmt.Errorf("compaction bisection: %s at watermark=%d: on-disk segments are clean but the client backfill (planBackfill -> getSegment/getBlock -> live-subscribe cutover) surfaced a superseded row -> serving/transport inconsistency (e.g. a cold-batch handoff across the paginated download mixing a pre- and post-compaction generation), NOT a storage defect. served=[%w]",
+		return fmt.Errorf("compaction bisection: %s at watermark=%d: on-disk segments are clean but the client backfill (planSnapshot -> getSegment/getBlock -> live-subscribe cutover) surfaced a superseded row -> serving/transport inconsistency (e.g. a cold-batch handoff across the paginated download mixing a pre- and post-compaction generation), NOT a storage defect. served=[%w]",
 			v.Verdict, v.Watermark, v.ServedErr)
 	case VerdictInconclusive:
 		return fmt.Errorf("compaction bisection: %s at watermark=%d: the client backfill surfaced a superseded row and on-disk segments are clean, BUT a compaction pass raced the on-disk scan so the clean result cannot rule out a durable defect. Re-run with the compaction trigger quiesced around the scan, or capture the on-disk segments under a paused compactor. served=[%w]",

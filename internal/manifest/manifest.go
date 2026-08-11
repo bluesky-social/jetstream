@@ -743,7 +743,7 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 		next[i] = meta
 	}
 
-	// Enforce the cross-segment seq-monotonicity invariant the backfill planner
+	// Enforce the cross-segment seq-monotonicity invariant the snapshot planner
 	// (and SegmentForSeq/LookbackFloor) rely on. A refresh that introduces an
 	// out-of-order seq envelope is corrupt internal state; refuse it loudly
 	// rather than serve a manifest the planner would silently mis-paginate.
@@ -792,7 +792,7 @@ var ErrSegmentSeqOverlap = errors.New("manifest: cross-segment seq ranges out of
 // prev.MaxSeq < next.MinSeq.
 //
 // This is the cross-segment analog of segment.validateBlockOffsets's per-block
-// check, and it is just as load-bearing: PlanBackfill reads the pagination goal
+// check, and it is just as load-bearing: PlanSnapshot reads the pagination goal
 // as the LAST segment's MaxSeq and walks segments in Idx order trusting that to
 // be global seq order (its continuation cursor and lastUnitMaxSeq monotonicity
 // depend on it); SegmentForSeq and LookbackFloor binary-search by MaxSeq over

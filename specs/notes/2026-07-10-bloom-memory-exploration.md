@@ -94,7 +94,7 @@ Notes:
 ## 3. Strategy 2 — non-resident blooms (pread on demand)
 
 The query tool compares three residency models over the *whole archive per
-DID*, mirroring `manifest.SelectBlocksForDID` (the planBackfill/repoexport
+DID*, mirroring `manifest.SelectBlocksForDID` (the planSnapshot/repoexport
 path — serve/replay never touches per-block blooms):
 
 - `resident`: today's model — everything in heap.
@@ -143,7 +143,7 @@ For context, gloom unmarshal micro-costs (workstation, single-thread): 8,409 B
 bloom ≈ 1.7 µs, 153 B ≈ 0.12 µs — the pread path is bandwidth/unmarshal-bound
 on big regions, not syscall-bound.
 
-Is 35 ms p50 / 2.3 s max acceptable? The consumers are planBackfill (one call
+Is 35 ms p50 / 2.3 s max acceptable? The consumers are planSnapshot (one call
 per client backfill negotiation) and repoexport — both already dominated by
 block download/decode downstream. §5 of the 07-08 note measured the *whole*
 3-DID filtered backfill at 0.59 s; adding tens of ms of selection is invisible.

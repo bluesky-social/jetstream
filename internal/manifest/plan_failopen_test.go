@@ -77,7 +77,7 @@ func TestSelectPlanBlocks_DegradedMetadataNeverDropsBlocks(t *testing.T) {
 		BlockBlooms: []*gloom.Filter{nil},
 	}
 
-	got := selectPlanBlocks(seg, PlanBackfillRequest{DIDs: []string{"did:plc:needle"}}, nil)
+	got := selectPlanBlocks(seg, PlanSnapshotRequest{DIDs: []string{"did:plc:needle"}}, nil)
 	require.Equal(t, []int{0, 1, 2}, got,
 		"degraded DID metadata must fail open and select every in-window block")
 }
@@ -124,7 +124,7 @@ func TestSelectPlanBlocks_BloomFalsePositiveStillIncludesRealBlock(t *testing.T)
 		BlockBlooms:  []*gloom.Filter{b0, b1},
 	}
 
-	got := selectPlanBlocks(seg, PlanBackfillRequest{DIDs: []string{want}}, nil)
+	got := selectPlanBlocks(seg, PlanSnapshotRequest{DIDs: []string{want}}, nil)
 	require.Contains(t, got, 0, "the block that truly contains the DID must never be dropped")
 	require.Contains(t, got, 1, "a false-positive block is over-included, which is allowed")
 }

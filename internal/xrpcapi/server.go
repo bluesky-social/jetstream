@@ -38,7 +38,7 @@ type ImportConfig struct {
 type SegmentSource interface {
 	SegmentByIdx(idx uint64) (manifest.SegmentFileRef, bool)
 	ListFrom(startIdx uint64, limit int) ([]manifest.SegmentListEntry, uint64, bool)
-	PlanBackfill(manifest.PlanBackfillRequest) (manifest.PlanBackfillResult, error)
+	PlanSnapshot(manifest.PlanSnapshotRequest) (manifest.PlanSnapshotResult, error)
 }
 
 // ReadyFunc is called at the start of every XRPC request. Return an error
@@ -56,7 +56,7 @@ type Server struct {
 // Config holds the dependencies for the XRPC server. Zero values are valid:
 // a nil Logger defaults to slog.Default(); a nil Ready disables the readiness
 // gate; a zero CacheMaxAge disables segment/block caching; nil Metrics/Tracer
-// make getBlock observability no-ops. Plan must be populated for planBackfill
+// make getBlock observability no-ops. Plan must be populated for planSnapshot
 // to accept non-empty filters.
 type Config struct {
 	Src         SegmentSource
@@ -88,7 +88,7 @@ func New(cfg Config) *Server {
 		metrics: cfg.Metrics, tracer: cfg.Tracer,
 	}))
 	s.xrpc.HandleQuery("network.bsky.jetstream.listSegments", withReady(cfg.Ready, newListSegmentsHandler(cfg.Src)))
-	s.xrpc.HandleProcedure("network.bsky.jetstream.planBackfill", withReady(cfg.Ready, newPlanBackfillHandler(cfg.Src, cfg.Plan)))
+	s.xrpc.HandleProcedure("network.bsky.jetstream.planSnapshot", withReady(cfg.Ready, newPlanSnapshotHandler(cfg.Src, cfg.Plan)))
 
 	// The v2 subscribe compression dictionary. Deliberately NOT behind the
 	// readiness gate: the artifact is compiled in and immutable, and a

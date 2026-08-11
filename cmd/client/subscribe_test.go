@@ -69,18 +69,18 @@ func commitFrame(t *testing.T, seq uint64, did, coll, rkey string) string {
 }
 
 // TestSubscribeFatalBackfillReturnsError is the E1/E2 regression guard: a
-// doomed backfill (here, the server rejects planBackfill) must make the CLI
+// doomed backfill (here, the server rejects planSnapshot) must make the CLI
 // return a non-zero error in BOTH --print and throughput modes, rather than log
 // (or silently drop) the error and exit 0 — which would mask a failed backfill
 // from any orchestrator checking the exit status.
 func TestSubscribeFatalBackfillReturnsError(t *testing.T) {
 	t.Parallel()
 
-	// Server: planBackfill fails, so the engine aborts the backfill fatally
+	// Server: planSnapshot fails, so the engine aborts the backfill fatally
 	// before any event is delivered.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/xrpc/network.bsky.jetstream.planBackfill":
+		case "/xrpc/network.bsky.jetstream.planSnapshot":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, `{"error":"InternalError","message":"boom"}`)

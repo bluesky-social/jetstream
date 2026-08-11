@@ -8,8 +8,8 @@ failure-mode: |
   invariant is broken — the client's pagination loop re-requests afterSeq=0
   forever (zero-progress livelock) and never reaches the sealed tip.
 expected-detection: |
-  Killed by TestPlanBackfill_OneUnitOverCapStillAdvances (#179) and
-  TestPlanBackfill_TruncatesAtUnitBoundary in the manifest planner, run in the
+  Killed by TestPlanSnapshot_OneUnitOverCapStillAdvances (#179) and
+  TestPlanSnapshot_TruncatesAtUnitBoundary in the manifest planner, run in the
   partb tier (#182): a page that admits zero units / does not advance the cursor
   fails the "always returns ≥1 unit and advances" assertion directly and fast,
   rather than only surfacing as a client-loop hang.
@@ -19,7 +19,7 @@ tiers: partb
 diff --git a/internal/manifest/plan.go b/internal/manifest/plan.go
 --- a/internal/manifest/plan.go
 +++ b/internal/manifest/plan.go
-@@ -164,7 +164,7 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
+@@ -164,7 +164,7 @@ func (m *Manifest) PlanSnapshot(req PlanSnapshotRequest) (PlanSnapshotResult, er
  	// paginating client). Once at least one unit is in, reaching the cap
  	// truncates before the next unit.
  	atCap := func() bool {

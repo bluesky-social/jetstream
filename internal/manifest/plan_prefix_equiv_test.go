@@ -51,14 +51,14 @@ func archivedNSIDsUnderPrefix(prefix string) []string {
 	return out
 }
 
-// TestPlanBackfill_PrefixEquivalentToEnumeratedExact is the core correctness
+// TestPlanSnapshot_PrefixEquivalentToEnumeratedExact is the core correctness
 // property for wildcard support: for any archive and any namespace prefix P,
 // planning with CollectionPrefixes=[P] must produce a byte-identical plan
 // (segments, block ranges, modes, and stats) to planning with the explicit set
 // of every archived NSID under P. This directly proves that in-planner prefix
 // matching is equivalent to expanding the wildcard against the global
 // collection union and exact-matching.
-func TestPlanBackfill_PrefixEquivalentToEnumeratedExact(t *testing.T) {
+func TestPlanSnapshot_PrefixEquivalentToEnumeratedExact(t *testing.T) {
 	t.Parallel()
 
 	// Multiple fixed seeds give a small deterministic swarm: each builds a
@@ -74,7 +74,7 @@ func TestPlanBackfill_PrefixEquivalentToEnumeratedExact(t *testing.T) {
 
 				prefixReq := planReq()
 				prefixReq.CollectionPrefixes = []string{prefix}
-				prefixPlan, err := m.PlanBackfill(prefixReq)
+				prefixPlan, err := m.PlanSnapshot(prefixReq)
 				require.NoError(t, err)
 
 				if len(exact) == 0 {
@@ -95,7 +95,7 @@ func TestPlanBackfill_PrefixEquivalentToEnumeratedExact(t *testing.T) {
 
 				exactReq := planReq()
 				exactReq.Collections = exact
-				exactPlan, err := m.PlanBackfill(exactReq)
+				exactPlan, err := m.PlanSnapshot(exactReq)
 				require.NoError(t, err)
 
 				require.Equal(t, exactPlan, prefixPlan,

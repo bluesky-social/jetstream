@@ -53,7 +53,7 @@ type clientBackfillResult struct {
 }
 
 // collectClientBackfill drives the REAL public jetstream client through the
-// full archive-negotiation path (planBackfill -> getSegment/getBlock -> cutover
+// full archive-negotiation path (planSnapshot -> getSegment/getBlock -> cutover
 // to the live v2 websocket), the transport real clients actually use (issue #77). The
 // client is an OBSERVATION SURFACE ONLY — expected state is still derived
 // independently from simulator world + firehose history, never from the client

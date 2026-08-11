@@ -194,7 +194,7 @@ baseline`).
 (default `MaxEntries`) nor ages a cursor below the lookback floor, so the
 paginated-cutover paths had no mutation coverage. The new tier runs the §16
 hermetic end-to-end scenarios (`TestPartB*`, `internal/oracle`) plus the manifest
-planner's per-page truncation unit tests (`TestPlanBackfill*`, so the planner
+planner's per-page truncation unit tests (`TestPlanSnapshot*`, so the planner
 mutants kill fast rather than via a client-loop livelock timeout). All five new
 mutants kill there.
 
@@ -215,7 +215,7 @@ hidden m015 (STALE) and m025 (BUILD-BROKEN) since #175/#178 landed.
 | m015_collection_count_double | SURVIVED | refreshed to internCollection (seal.go:244); still a documented footer-index blind spot the row-by-row oracle cannot see (predicted survival). |
 | m029_plan_continuation_cursor_off_by_one | KILLED@partb | `PlannedThroughSeq = lastUnitMaxSeq + 1` skips a page boundary; union of pages no longer folds to ground truth (TestPartB_MultiPageBackfillCutover / _MidSegmentTruncation). |
 | m030_plan_midsegment_cut_reports_segment_maxseq | KILLED@partb | mid-segment cut reports the enclosing segment MaxSeq; the un-included tail blocks are skipped forever (TestPartB_MidSegmentTruncation). |
-| m031_plan_truncation_zero_units_unadvanced | KILLED@partb | `Entries+1 >= MaxEntries` trips the cap before the first unit is admitted → zero units, cursor unadvanced (TestPlanBackfill_OneUnitOverCapStillAdvances). |
+| m031_plan_truncation_zero_units_unadvanced | KILLED@partb | `Entries+1 >= MaxEntries` trips the cap before the first unit is admitted → zero units, cursor unadvanced (TestPlanSnapshot_OneUnitOverCapStillAdvances). |
 | m032_v2_below_floor_silent_clamp | KILLED@partb | `if false` on the RejectBelowFloor branch re-introduces the v1 silent clamp; a below-floor v2 cursor no longer 400s (TestPartB_StaleCursorSignal / _CaughtUpHandoffBelowFloorReBackfills). |
 | m033_client_too_old_400_not_rebackfilled | KILLED@partb | cutover never reports the §14 too-old 400, so the client stops at the seam instead of re-backfilling (TestPartB_CaughtUpHandoffBelowFloorReBackfills). |
 

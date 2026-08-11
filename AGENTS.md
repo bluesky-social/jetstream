@@ -37,7 +37,7 @@ internal/
     orchestrator/ ingestion lifecycle state machine + merge/cutover
     syncstate/    sync 1.1 resync bookkeeping
   subscribe/      websocket /subscribe endpoint (v1 protocol parity) + cold reader
-  xrpcapi/        archive download over HTTP/XRPC (planBackfill, getSegment, getBlock)
+  xrpcapi/        archive download over HTTP/XRPC (planSnapshot, getSegment, getBlock)
   client/         thick Go client: archive negotiation, fold, cutover to live
   server/         HTTP listeners (public :8080, opt-in debug :6060) and middleware
   store/          pebble-backed cursor + metadata store
