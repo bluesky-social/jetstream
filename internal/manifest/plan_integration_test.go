@@ -16,7 +16,7 @@ import (
 // applies after decoding. The planner is allowed to over-include (false
 // positives) but must never drop a row this predicate accepts (no false
 // negatives).
-func matchesFilter(ev segment.Event, req manifest.PlanBackfillRequest, dids, collections map[string]struct{}) bool {
+func matchesFilter(ev segment.Event, req manifest.PlanSnapshotRequest, dids, collections map[string]struct{}) bool {
 	if len(dids) > 0 {
 		if _, ok := dids[ev.DID]; !ok {
 			return false
@@ -51,7 +51,7 @@ func toSet(vals []string) map[string]struct{} {
 // for mode=segment, every block in the segment; for mode=blocks, only the
 // listed inclusive ranges. It returns the set of seqs the plan's transport
 // footprint actually delivers to the client.
-func coveredSeqs(t *testing.T, dir string, plan manifest.PlanBackfillResult) map[uint64]struct{} {
+func coveredSeqs(t *testing.T, dir string, plan manifest.PlanSnapshotResult) map[uint64]struct{} {
 	t.Helper()
 	covered := make(map[uint64]struct{})
 	for _, seg := range plan.Segments {
@@ -93,13 +93,13 @@ func coveredSeqs(t *testing.T, dir string, plan manifest.PlanBackfillResult) map
 	return covered
 }
 
-// TestPlanBackfill_Integration_NoFalseNegatives is the DoD integration test
+// TestPlanSnapshot_Integration_NoFalseNegatives is the DoD integration test
 // (issue #71): build representative multi-DID/multi-collection sealed segments,
 // plan, then prove the planned transport footprint is a SUPERSET of every row
 // the exact filter accepts. This catches any false negative regardless of the
 // planner's internal block-selection implementation, because the expected set
 // is derived from ground-truth row membership rather than hand-pinned indices.
-func TestPlanBackfill_Integration_NoFalseNegatives(t *testing.T) {
+func TestPlanSnapshot_Integration_NoFalseNegatives(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -137,7 +137,7 @@ func TestPlanBackfill_Integration_NoFalseNegatives(t *testing.T) {
 	// covers all of them.
 	type tc struct {
 		name string
-		req  manifest.PlanBackfillRequest
+		req  manifest.PlanSnapshotRequest
 	}
 	cases := []tc{
 		{"match-all", planReq()},
@@ -158,7 +158,7 @@ func TestPlanBackfill_Integration_NoFalseNegatives(t *testing.T) {
 			req := c.req
 			req.WholeSegmentThreshold = 0.75
 
-			plan, err := m.PlanBackfill(req)
+			plan, err := m.PlanSnapshot(req)
 			require.NoError(t, err)
 
 			didSet := toSet(req.DIDs)
@@ -184,10 +184,10 @@ func TestPlanBackfill_Integration_NoFalseNegatives(t *testing.T) {
 	}
 }
 
-// TestPlanBackfill_MultiSegment_OrderingAndPruning exercises the multi-segment
+// TestPlanSnapshot_MultiSegment_OrderingAndPruning exercises the multi-segment
 // loop: ascending result order, whole-segment skip via seq window, and
 // plannedThroughSeq taken from the last segment's tip (capped by beforeSeq).
-func TestPlanBackfill_MultiSegment_OrderingAndPruning(t *testing.T) {
+func TestPlanSnapshot_MultiSegment_OrderingAndPruning(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -209,7 +209,7 @@ func TestPlanBackfill_MultiSegment_OrderingAndPruning(t *testing.T) {
 	// Window (4, 8] selects only segment 1; segments 0 and 2 are pruned at the
 	// segment-envelope check.
 	req := withWindow(planReq(), 4, 8)
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.EqualValues(t, 1, got.Segments[0].Idx)
@@ -220,7 +220,7 @@ func TestPlanBackfill_MultiSegment_OrderingAndPruning(t *testing.T) {
 	// No window, DID filter present in segments 0(no),1(yes),2(no): result is a
 	// single segment, and result.Segments is ascending by Idx.
 	req2 := withDIDs(planReq(), planDID)
-	got2, err := m.PlanBackfill(req2)
+	got2, err := m.PlanSnapshot(req2)
 	require.NoError(t, err)
 	require.NotEmpty(t, got2.Segments)
 	idxs := make([]uint64, len(got2.Segments))
@@ -232,10 +232,10 @@ func TestPlanBackfill_MultiSegment_OrderingAndPruning(t *testing.T) {
 	require.EqualValues(t, 12, got2.PlannedThroughSeq, "uncapped tip is the last segment's maxSeq")
 }
 
-// TestPlanBackfill_MultiSegment_PerSegmentModeDiffers proves two segments in
+// TestPlanSnapshot_MultiSegment_PerSegmentModeDiffers proves two segments in
 // the same response can independently choose mode=segment vs mode=blocks based
 // on their own density.
-func TestPlanBackfill_MultiSegment_PerSegmentModeDiffers(t *testing.T) {
+func TestPlanSnapshot_MultiSegment_PerSegmentModeDiffers(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -253,7 +253,7 @@ func TestPlanBackfill_MultiSegment_PerSegmentModeDiffers(t *testing.T) {
 
 	req := withDIDs(planReq(), planDID)
 	req.WholeSegmentThreshold = 0.75
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 2)
 
@@ -267,9 +267,9 @@ func TestPlanBackfill_MultiSegment_PerSegmentModeDiffers(t *testing.T) {
 	require.Equal(t, []manifest.BlockRange{{First: 2, Last: 2}}, byIdx[1].Blocks)
 }
 
-// TestPlanBackfill_SeqWindowBoundaries pins the exclusive-lower / inclusive-upper
+// TestPlanSnapshot_SeqWindowBoundaries pins the exclusive-lower / inclusive-upper
 // semantics of (afterSeq, beforeSeq] at the exact block boundaries.
-func TestPlanBackfill_SeqWindowBoundaries(t *testing.T) {
+func TestPlanSnapshot_SeqWindowBoundaries(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -284,7 +284,7 @@ func TestPlanBackfill_SeqWindowBoundaries(t *testing.T) {
 	t.Run("after-only excludes the boundary block", func(t *testing.T) {
 		t.Parallel()
 		req := withAfter(planReq(), 2) // exclude seq<=2; blocks 0,1 dropped.
-		got, err := m.PlanBackfill(req)
+		got, err := m.PlanSnapshot(req)
 		require.NoError(t, err)
 		require.Len(t, got.Segments, 1)
 		require.Equal(t, []manifest.BlockRange{{First: 2, Last: 4}}, got.Segments[0].Blocks)
@@ -294,7 +294,7 @@ func TestPlanBackfill_SeqWindowBoundaries(t *testing.T) {
 	t.Run("before-only includes the boundary block", func(t *testing.T) {
 		t.Parallel()
 		req := withBefore(planReq(), 3) // keep seq<=3; blocks 0,1,2.
-		got, err := m.PlanBackfill(req)
+		got, err := m.PlanSnapshot(req)
 		require.NoError(t, err)
 		require.Len(t, got.Segments, 1)
 		require.Equal(t, []manifest.BlockRange{{First: 0, Last: 2}}, got.Segments[0].Blocks)
@@ -304,7 +304,7 @@ func TestPlanBackfill_SeqWindowBoundaries(t *testing.T) {
 	t.Run("window excludes everything", func(t *testing.T) {
 		t.Parallel()
 		req := withWindow(planReq(), 100, 200) // wholly above the archive.
-		got, err := m.PlanBackfill(req)
+		got, err := m.PlanSnapshot(req)
 		require.NoError(t, err)
 		require.Empty(t, got.Segments)
 		require.Zero(t, got.Stats.SegmentsMatched)
@@ -312,9 +312,9 @@ func TestPlanBackfill_SeqWindowBoundaries(t *testing.T) {
 	})
 }
 
-// TestPlanBackfill_ThresholdFlip isolates the density decision: the same sparse
+// TestPlanSnapshot_ThresholdFlip isolates the density decision: the same sparse
 // selection is mode=blocks below the threshold and mode=segment at/above it.
-func TestPlanBackfill_ThresholdFlip(t *testing.T) {
+func TestPlanSnapshot_ThresholdFlip(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -328,7 +328,7 @@ func TestPlanBackfill_ThresholdFlip(t *testing.T) {
 
 	sparse := withDIDs(planReq(), planDID)
 	sparse.WholeSegmentThreshold = 0.75
-	got, err := m.PlanBackfill(sparse)
+	got, err := m.PlanSnapshot(sparse)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, manifest.PlanModeBlocks, got.Segments[0].Mode, "1/3 < 0.75 -> blocks")
@@ -338,16 +338,16 @@ func TestPlanBackfill_ThresholdFlip(t *testing.T) {
 	// whole-segment entry.
 	dense := withDIDs(planReq(), planDID)
 	dense.WholeSegmentThreshold = 0.3
-	got2, err := m.PlanBackfill(dense)
+	got2, err := m.PlanSnapshot(dense)
 	require.NoError(t, err)
 	require.Len(t, got2.Segments, 1)
 	require.Equal(t, manifest.PlanModeSegment, got2.Segments[0].Mode, "1/3 >= 0.3 -> segment")
 	require.Empty(t, got2.Segments[0].Blocks)
 }
 
-// TestPlanBackfill_PlannedThroughSeqWhenNothingMatches pins that a non-empty
+// TestPlanSnapshot_PlannedThroughSeqWhenNothingMatches pins that a non-empty
 // archive reports the sealed tip even when the filter matches nothing.
-func TestPlanBackfill_PlannedThroughSeqWhenNothingMatches(t *testing.T) {
+func TestPlanSnapshot_PlannedThroughSeqWhenNothingMatches(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -359,7 +359,7 @@ func TestPlanBackfill_PlannedThroughSeqWhenNothingMatches(t *testing.T) {
 	m := openManifestDir(t, dir)
 
 	req := withDIDs(planReq(), "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz") // absent.
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Empty(t, got.Segments)
 	require.Zero(t, got.Stats.SegmentsMatched)
@@ -367,15 +367,15 @@ func TestPlanBackfill_PlannedThroughSeqWhenNothingMatches(t *testing.T) {
 
 	// Same, but capped by a smaller beforeSeq.
 	req2 := withBefore(withDIDs(planReq(), "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz"), 2)
-	got2, err := m.PlanBackfill(req2)
+	got2, err := m.PlanSnapshot(req2)
 	require.NoError(t, err)
 	require.Empty(t, got2.Segments)
 	require.EqualValues(t, 2, got2.PlannedThroughSeq)
 }
 
-// TestPlanBackfill_CoalesceManyDisjointRanges covers the N-range fold including
+// TestPlanSnapshot_CoalesceManyDisjointRanges covers the N-range fold including
 // a range that starts at block index 0.
-func TestPlanBackfill_CoalesceManyDisjointRanges(t *testing.T) {
+func TestPlanSnapshot_CoalesceManyDisjointRanges(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -391,7 +391,7 @@ func TestPlanBackfill_CoalesceManyDisjointRanges(t *testing.T) {
 
 	req := withDIDs(planReq(), planDID)
 	req.WholeSegmentThreshold = 1 // keep it in blocks mode (3/5 < 1).
-	got, err := m.PlanBackfill(req)
+	got, err := m.PlanSnapshot(req)
 	require.NoError(t, err)
 	require.Len(t, got.Segments, 1)
 	require.Equal(t, manifest.PlanModeBlocks, got.Segments[0].Mode)
@@ -401,11 +401,11 @@ func TestPlanBackfill_CoalesceManyDisjointRanges(t *testing.T) {
 	require.Equal(t, 3, got.Stats.Entries)
 }
 
-// TestPlanBackfill_ConcurrentWithCompactionSwap runs the planner under -race
+// TestPlanSnapshot_ConcurrentWithCompactionSwap runs the planner under -race
 // while a compaction rewrite re-publishes a segment, pinning the lock/copy
-// invariant: PlanBackfill must never observe a torn segment, and
+// invariant: PlanSnapshot must never observe a torn segment, and
 // plannedThroughSeq must stay within bounds.
-func TestPlanBackfill_ConcurrentWithCompactionSwap(t *testing.T) {
+func TestPlanSnapshot_ConcurrentWithCompactionSwap(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -436,7 +436,7 @@ func TestPlanBackfill_ConcurrentWithCompactionSwap(t *testing.T) {
 
 	req := withDIDs(planReq(), planDID)
 	for range 500 {
-		got, err := m.PlanBackfill(req)
+		got, err := m.PlanSnapshot(req)
 		require.NoError(t, err)
 		require.LessOrEqual(t, got.PlannedThroughSeq, uint64(6))
 		for _, s := range got.Segments {
@@ -449,28 +449,28 @@ func TestPlanBackfill_ConcurrentWithCompactionSwap(t *testing.T) {
 
 // --- small request builders to keep the table cases readable ---
 
-func withDIDs(req manifest.PlanBackfillRequest, dids ...string) manifest.PlanBackfillRequest {
+func withDIDs(req manifest.PlanSnapshotRequest, dids ...string) manifest.PlanSnapshotRequest {
 	req.DIDs = dids
 	return req
 }
 
-func withCollections(req manifest.PlanBackfillRequest, collections ...string) manifest.PlanBackfillRequest {
+func withCollections(req manifest.PlanSnapshotRequest, collections ...string) manifest.PlanSnapshotRequest {
 	req.Collections = collections
 	return req
 }
 
-func withAfter(req manifest.PlanBackfillRequest, after uint64) manifest.PlanBackfillRequest {
+func withAfter(req manifest.PlanSnapshotRequest, after uint64) manifest.PlanSnapshotRequest {
 	req.AfterSeq = after
 	req.HasAfterSeq = true
 	return req
 }
 
-func withBefore(req manifest.PlanBackfillRequest, before uint64) manifest.PlanBackfillRequest {
+func withBefore(req manifest.PlanSnapshotRequest, before uint64) manifest.PlanSnapshotRequest {
 	req.BeforeSeq = before
 	req.HasBeforeSeq = true
 	return req
 }
 
-func withWindow(req manifest.PlanBackfillRequest, after, before uint64) manifest.PlanBackfillRequest {
+func withWindow(req manifest.PlanSnapshotRequest, after, before uint64) manifest.PlanSnapshotRequest {
 	return withBefore(withAfter(req, after), before)
 }

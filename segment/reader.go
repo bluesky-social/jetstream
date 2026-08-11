@@ -457,8 +457,8 @@ func (r *Reader) BlocksContainingDID(did string) ([]int, error) {
 // bounds checks but is internally inconsistent could otherwise surface
 // as confusing decode errors at DecodeBlock time.
 //
-// The cross-block seq-monotonicity check is load-bearing for the backfill
-// planner: PlanBackfill's truncation continuation cursor is the last
+// The cross-block seq-monotonicity check is load-bearing for the snapshot
+// planner: PlanSnapshot's truncation continuation cursor is the last
 // included block's MaxSeq, and the next page's exclusive afterSeq drops
 // every block with MaxSeq <= that cursor (internal/manifest/plan.go). That
 // is gap-free ONLY if a later block never carries a smaller MaxSeq; a
@@ -515,7 +515,7 @@ func validateBlockOffsets(blocks []BlockInfo, footerOffset uint64) error {
 		if b.EventCount > 0 {
 			if hasPrevSeq && b.MinSeq <= prevMaxSeq {
 				return fmt.Errorf(
-					"%w: block %d min_seq %d not greater than prior non-empty block max_seq %d (blocks must be seq-disjoint and index-monotonic; the backfill planner cursor depends on it)",
+					"%w: block %d min_seq %d not greater than prior non-empty block max_seq %d (blocks must be seq-disjoint and index-monotonic; the snapshot planner cursor depends on it)",
 					ErrInvalidBlockIndex, i, b.MinSeq, prevMaxSeq)
 			}
 			prevMaxSeq = b.MaxSeq

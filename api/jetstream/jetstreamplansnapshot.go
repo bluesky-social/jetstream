@@ -9,8 +9,8 @@ import (
 	"github.com/jcalabro/gt"
 )
 
-// JetstreamPlanBackfill_BlockRange is a "blockRange" in the network.bsky.jetstream.planBackfill schema.
-type JetstreamPlanBackfill_BlockRange struct {
+// JetstreamPlanSnapshot_BlockRange is a "blockRange" in the network.bsky.jetstream.planSnapshot schema.
+type JetstreamPlanSnapshot_BlockRange struct {
 	LexiconTypeID string `json:"$type,omitempty"`
 	First         int64  `json:"first"` // First block index in this inclusive range.
 	Last          int64  `json:"last"`  // Last block index in this inclusive range.
@@ -19,18 +19,18 @@ type JetstreamPlanBackfill_BlockRange struct {
 	extra []extraField
 }
 
-// Precomputed CBOR key tokens for JetstreamPlanBackfill_BlockRange.
+// Precomputed CBOR key tokens for JetstreamPlanSnapshot_BlockRange.
 var (
-	cborKey_JetstreamPlanBackfill_BlockRange_last        = cbor.AppendTextKey(nil, "last")
-	cborKey_JetstreamPlanBackfill_BlockRange_dollar_type = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamPlanBackfill_BlockRange_first       = cbor.AppendTextKey(nil, "first")
+	cborKey_JetstreamPlanSnapshot_BlockRange_last        = cbor.AppendTextKey(nil, "last")
+	cborKey_JetstreamPlanSnapshot_BlockRange_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamPlanSnapshot_BlockRange_first       = cbor.AppendTextKey(nil, "first")
 )
 
-func (s *JetstreamPlanBackfill_BlockRange) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_BlockRange) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_BlockRange) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_BlockRange) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 2 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
@@ -39,36 +39,36 @@ func (s *JetstreamPlanBackfill_BlockRange) AppendCBOR(buf []byte) ([]byte, error
 	if len(s.extra) > 0 {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "last", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_BlockRange_last...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_BlockRange_last...)
 		buf = cbor.AppendInt(buf, s.Last)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_BlockRange_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_BlockRange_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "first", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_BlockRange_first...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_BlockRange_first...)
 		buf = cbor.AppendInt(buf, s.First)
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
-		buf = append(buf, cborKey_JetstreamPlanBackfill_BlockRange_last...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_BlockRange_last...)
 		buf = cbor.AppendInt(buf, s.Last)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_BlockRange_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_BlockRange_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
-		buf = append(buf, cborKey_JetstreamPlanBackfill_BlockRange_first...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_BlockRange_first...)
 		buf = cbor.AppendInt(buf, s.First)
 	}
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_BlockRange) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamPlanSnapshot_BlockRange) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_BlockRange) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_BlockRange) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -126,38 +126,38 @@ func (s *JetstreamPlanBackfill_BlockRange) UnmarshalCBORAt(data []byte, pos int)
 	return pos, nil
 }
 
-// Precomputed JSON key tokens for JetstreamPlanBackfill_BlockRange.
+// Precomputed JSON key tokens for JetstreamPlanSnapshot_BlockRange.
 var (
-	jsonKey_JetstreamPlanBackfill_BlockRange_dollar_type = []byte("\"$type\":")
-	jsonKey_JetstreamPlanBackfill_BlockRange_first       = []byte("\"first\":")
-	jsonKey_JetstreamPlanBackfill_BlockRange_last        = []byte("\"last\":")
+	jsonKey_JetstreamPlanSnapshot_BlockRange_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamPlanSnapshot_BlockRange_first       = []byte("\"first\":")
+	jsonKey_JetstreamPlanSnapshot_BlockRange_last        = []byte("\"last\":")
 )
 
-func (s *JetstreamPlanBackfill_BlockRange) MarshalJSON() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_BlockRange) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_BlockRange) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_BlockRange) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_BlockRange_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_BlockRange_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_BlockRange_first...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_BlockRange_first...)
 	buf = cbor.AppendJSONInt(buf, s.First)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_BlockRange_last...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_BlockRange_last...)
 	buf = cbor.AppendJSONInt(buf, s.Last)
 	first = false
 	for _, ef := range s.extra {
@@ -176,12 +176,12 @@ func (s *JetstreamPlanBackfill_BlockRange) AppendJSON(buf []byte) ([]byte, error
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_BlockRange) UnmarshalJSON(data []byte) error {
+func (s *JetstreamPlanSnapshot_BlockRange) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_BlockRange) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_BlockRange) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)
@@ -227,46 +227,46 @@ func (s *JetstreamPlanBackfill_BlockRange) UnmarshalJSONAt(data []byte, pos int)
 	}
 }
 
-// Precomputed JSON key tokens for JetstreamPlanBackfill_Output.
+// Precomputed JSON key tokens for JetstreamPlanSnapshot_Output.
 var (
-	jsonKey_JetstreamPlanBackfill_Output_dollar_type       = []byte("\"$type\":")
-	jsonKey_JetstreamPlanBackfill_Output_plannedThroughSeq = []byte("\"plannedThroughSeq\":")
-	jsonKey_JetstreamPlanBackfill_Output_sealedTipSeq      = []byte("\"sealedTipSeq\":")
-	jsonKey_JetstreamPlanBackfill_Output_segments          = []byte("\"segments\":")
-	jsonKey_JetstreamPlanBackfill_Output_stats             = []byte("\"stats\":")
+	jsonKey_JetstreamPlanSnapshot_Output_dollar_type       = []byte("\"$type\":")
+	jsonKey_JetstreamPlanSnapshot_Output_plannedThroughSeq = []byte("\"plannedThroughSeq\":")
+	jsonKey_JetstreamPlanSnapshot_Output_sealedTipSeq      = []byte("\"sealedTipSeq\":")
+	jsonKey_JetstreamPlanSnapshot_Output_segments          = []byte("\"segments\":")
+	jsonKey_JetstreamPlanSnapshot_Output_stats             = []byte("\"stats\":")
 )
 
-func (s *JetstreamPlanBackfill_Output) MarshalJSON() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Output) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_Output) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Output) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Output_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_plannedThroughSeq...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Output_plannedThroughSeq...)
 	buf = cbor.AppendJSONInt(buf, s.PlannedThroughSeq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_sealedTipSeq...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Output_sealedTipSeq...)
 	buf = cbor.AppendJSONInt(buf, s.SealedTipSeq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_segments...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Output_segments...)
 	buf = append(buf, '[')
 	for i, item := range s.Segments {
 		if i > 0 {
@@ -283,7 +283,7 @@ func (s *JetstreamPlanBackfill_Output) AppendJSON(buf []byte) ([]byte, error) {
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Output_stats...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Output_stats...)
 	{
 		var err error
 		buf, err = s.Stats.AppendJSON(buf)
@@ -308,12 +308,12 @@ func (s *JetstreamPlanBackfill_Output) AppendJSON(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_Output) UnmarshalJSON(data []byte) error {
+func (s *JetstreamPlanSnapshot_Output) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_Output) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_Output) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)
@@ -360,7 +360,7 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalJSONAt(data []byte, pos int) (in
 					if done {
 						break
 					}
-					var elem JetstreamPlanBackfill_Segment
+					var elem JetstreamPlanSnapshot_Segment
 					pos, err = elem.UnmarshalJSONAt(data, pos)
 					if err != nil {
 						return 0, err
@@ -391,20 +391,20 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalJSONAt(data []byte, pos int) (in
 	}
 }
 
-// Precomputed CBOR key tokens for JetstreamPlanBackfill_Output.
+// Precomputed CBOR key tokens for JetstreamPlanSnapshot_Output.
 var (
-	cborKey_JetstreamPlanBackfill_Output_dollar_type       = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamPlanBackfill_Output_stats             = cbor.AppendTextKey(nil, "stats")
-	cborKey_JetstreamPlanBackfill_Output_segments          = cbor.AppendTextKey(nil, "segments")
-	cborKey_JetstreamPlanBackfill_Output_sealedTipSeq      = cbor.AppendTextKey(nil, "sealedTipSeq")
-	cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq = cbor.AppendTextKey(nil, "plannedThroughSeq")
+	cborKey_JetstreamPlanSnapshot_Output_dollar_type       = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamPlanSnapshot_Output_stats             = cbor.AppendTextKey(nil, "stats")
+	cborKey_JetstreamPlanSnapshot_Output_segments          = cbor.AppendTextKey(nil, "segments")
+	cborKey_JetstreamPlanSnapshot_Output_sealedTipSeq      = cbor.AppendTextKey(nil, "sealedTipSeq")
+	cborKey_JetstreamPlanSnapshot_Output_plannedThroughSeq = cbor.AppendTextKey(nil, "plannedThroughSeq")
 )
 
-func (s *JetstreamPlanBackfill_Output) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Output) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Output) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
@@ -414,11 +414,11 @@ func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Output_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "stats", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_stats...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_stats...)
 		{
 			var err error
 			buf, err = s.Stats.AppendCBOR(buf)
@@ -427,7 +427,7 @@ func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 			}
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "segments", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_segments...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_segments...)
 		buf = cbor.AppendArrayHeader(buf, uint64(len(s.Segments)))
 		for _, item := range s.Segments {
 			var err error
@@ -437,18 +437,18 @@ func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 			}
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "sealedTipSeq", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_sealedTipSeq...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_sealedTipSeq...)
 		buf = cbor.AppendInt(buf, s.SealedTipSeq)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "plannedThroughSeq", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_plannedThroughSeq...)
 		buf = cbor.AppendInt(buf, s.PlannedThroughSeq)
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Output_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_stats...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_stats...)
 		{
 			var err error
 			buf, err = s.Stats.AppendCBOR(buf)
@@ -456,7 +456,7 @@ func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_segments...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_segments...)
 		buf = cbor.AppendArrayHeader(buf, uint64(len(s.Segments)))
 		for _, item := range s.Segments {
 			var err error
@@ -465,20 +465,20 @@ func (s *JetstreamPlanBackfill_Output) AppendCBOR(buf []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_sealedTipSeq...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_sealedTipSeq...)
 		buf = cbor.AppendInt(buf, s.SealedTipSeq)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Output_plannedThroughSeq...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Output_plannedThroughSeq...)
 		buf = cbor.AppendInt(buf, s.PlannedThroughSeq)
 	}
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_Output) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamPlanSnapshot_Output) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_Output) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_Output) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -521,7 +521,7 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalCBORAt(data []byte, pos int) (in
 						return 0, err
 					}
 					pos = newPos
-					s.Segments = make([]JetstreamPlanBackfill_Segment, arrLen)
+					s.Segments = make([]JetstreamPlanSnapshot_Segment, arrLen)
 					for idx := range arrLen {
 						pos, err = s.Segments[idx].UnmarshalCBORAt(data, pos)
 						if err != nil {
@@ -577,38 +577,38 @@ func (s *JetstreamPlanBackfill_Output) UnmarshalCBORAt(data []byte, pos int) (in
 	return pos, nil
 }
 
-type JetstreamPlanBackfill_Output struct {
+type JetstreamPlanSnapshot_Output struct {
 	LexiconTypeID     string                          `json:"$type,omitempty"`
 	PlannedThroughSeq int64                           `json:"plannedThroughSeq"` // Continuation cursor: the highest sealed seq this page accounts for. When the page is truncated to...
 	SealedTipSeq      int64                           `json:"sealedTipSeq"`      // Pagination goal: the sealed-archive tip, capped by beforeSeq when provided. Stable across pages o...
-	Segments          []JetstreamPlanBackfill_Segment `json:"segments"`
-	Stats             JetstreamPlanBackfill_Stats     `json:"stats"`
+	Segments          []JetstreamPlanSnapshot_Segment `json:"segments"`
+	Stats             JetstreamPlanSnapshot_Stats     `json:"stats"`
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
 }
 
-// Precomputed JSON key tokens for JetstreamPlanBackfill_Input.
+// Precomputed JSON key tokens for JetstreamPlanSnapshot_Input.
 var (
-	jsonKey_JetstreamPlanBackfill_Input_dollar_type = []byte("\"$type\":")
-	jsonKey_JetstreamPlanBackfill_Input_afterSeq    = []byte("\"afterSeq\":")
-	jsonKey_JetstreamPlanBackfill_Input_beforeSeq   = []byte("\"beforeSeq\":")
-	jsonKey_JetstreamPlanBackfill_Input_collections = []byte("\"collections\":")
-	jsonKey_JetstreamPlanBackfill_Input_dids        = []byte("\"dids\":")
+	jsonKey_JetstreamPlanSnapshot_Input_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamPlanSnapshot_Input_afterSeq    = []byte("\"afterSeq\":")
+	jsonKey_JetstreamPlanSnapshot_Input_beforeSeq   = []byte("\"beforeSeq\":")
+	jsonKey_JetstreamPlanSnapshot_Input_collections = []byte("\"collections\":")
+	jsonKey_JetstreamPlanSnapshot_Input_dids        = []byte("\"dids\":")
 )
 
-func (s *JetstreamPlanBackfill_Input) MarshalJSON() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Input) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_Input) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Input) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Input_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Input_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
@@ -616,7 +616,7 @@ func (s *JetstreamPlanBackfill_Input) AppendJSON(buf []byte) ([]byte, error) {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Input_afterSeq...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Input_afterSeq...)
 		buf = cbor.AppendJSONInt(buf, s.AfterSeq.Val())
 		first = false
 	}
@@ -624,7 +624,7 @@ func (s *JetstreamPlanBackfill_Input) AppendJSON(buf []byte) ([]byte, error) {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Input_beforeSeq...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Input_beforeSeq...)
 		buf = cbor.AppendJSONInt(buf, s.BeforeSeq.Val())
 		first = false
 	}
@@ -632,7 +632,7 @@ func (s *JetstreamPlanBackfill_Input) AppendJSON(buf []byte) ([]byte, error) {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Input_collections...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Input_collections...)
 		buf = append(buf, '[')
 		for i, item := range s.Collections {
 			if i > 0 {
@@ -647,7 +647,7 @@ func (s *JetstreamPlanBackfill_Input) AppendJSON(buf []byte) ([]byte, error) {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Input_dids...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Input_dids...)
 		buf = append(buf, '[')
 		for i, item := range s.Dids {
 			if i > 0 {
@@ -674,12 +674,12 @@ func (s *JetstreamPlanBackfill_Input) AppendJSON(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_Input) UnmarshalJSON(data []byte) error {
+func (s *JetstreamPlanSnapshot_Input) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_Input) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_Input) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)
@@ -797,20 +797,20 @@ func (s *JetstreamPlanBackfill_Input) UnmarshalJSONAt(data []byte, pos int) (int
 	}
 }
 
-// Precomputed CBOR key tokens for JetstreamPlanBackfill_Input.
+// Precomputed CBOR key tokens for JetstreamPlanSnapshot_Input.
 var (
-	cborKey_JetstreamPlanBackfill_Input_dids        = cbor.AppendTextKey(nil, "dids")
-	cborKey_JetstreamPlanBackfill_Input_dollar_type = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamPlanBackfill_Input_afterSeq    = cbor.AppendTextKey(nil, "afterSeq")
-	cborKey_JetstreamPlanBackfill_Input_beforeSeq   = cbor.AppendTextKey(nil, "beforeSeq")
-	cborKey_JetstreamPlanBackfill_Input_collections = cbor.AppendTextKey(nil, "collections")
+	cborKey_JetstreamPlanSnapshot_Input_dids        = cbor.AppendTextKey(nil, "dids")
+	cborKey_JetstreamPlanSnapshot_Input_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamPlanSnapshot_Input_afterSeq    = cbor.AppendTextKey(nil, "afterSeq")
+	cborKey_JetstreamPlanSnapshot_Input_beforeSeq   = cbor.AppendTextKey(nil, "beforeSeq")
+	cborKey_JetstreamPlanSnapshot_Input_collections = cbor.AppendTextKey(nil, "collections")
 )
 
-func (s *JetstreamPlanBackfill_Input) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Input) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_Input) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Input) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 0 + countExtra(s.extra, extraEncodingCBOR)
 	if len(s.Dids) > 0 {
 		n++
@@ -832,7 +832,7 @@ func (s *JetstreamPlanBackfill_Input) AppendCBOR(buf []byte) ([]byte, error) {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "dids", buf)
 		if len(s.Dids) > 0 {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_dids...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_dids...)
 			buf = cbor.AppendArrayHeader(buf, uint64(len(s.Dids)))
 			for _, item := range s.Dids {
 				buf = cbor.AppendText(buf, item)
@@ -840,22 +840,22 @@ func (s *JetstreamPlanBackfill_Input) AppendCBOR(buf []byte) ([]byte, error) {
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "afterSeq", buf)
 		if s.AfterSeq.HasVal() {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_afterSeq...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_afterSeq...)
 			buf = cbor.AppendInt(buf, s.AfterSeq.Val())
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "beforeSeq", buf)
 		if s.BeforeSeq.HasVal() {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_beforeSeq...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_beforeSeq...)
 			buf = cbor.AppendInt(buf, s.BeforeSeq.Val())
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "collections", buf)
 		if len(s.Collections) > 0 {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_collections...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_collections...)
 			buf = cbor.AppendArrayHeader(buf, uint64(len(s.Collections)))
 			for _, item := range s.Collections {
 				buf = cbor.AppendText(buf, item)
@@ -864,26 +864,26 @@ func (s *JetstreamPlanBackfill_Input) AppendCBOR(buf []byte) ([]byte, error) {
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		if len(s.Dids) > 0 {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_dids...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_dids...)
 			buf = cbor.AppendArrayHeader(buf, uint64(len(s.Dids)))
 			for _, item := range s.Dids {
 				buf = cbor.AppendText(buf, item)
 			}
 		}
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		if s.AfterSeq.HasVal() {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_afterSeq...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_afterSeq...)
 			buf = cbor.AppendInt(buf, s.AfterSeq.Val())
 		}
 		if s.BeforeSeq.HasVal() {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_beforeSeq...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_beforeSeq...)
 			buf = cbor.AppendInt(buf, s.BeforeSeq.Val())
 		}
 		if len(s.Collections) > 0 {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Input_collections...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_collections...)
 			buf = cbor.AppendArrayHeader(buf, uint64(len(s.Collections)))
 			for _, item := range s.Collections {
 				buf = cbor.AppendText(buf, item)
@@ -893,12 +893,12 @@ func (s *JetstreamPlanBackfill_Input) AppendCBOR(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_Input) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamPlanSnapshot_Input) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_Input) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_Input) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -1031,7 +1031,7 @@ func (s *JetstreamPlanBackfill_Input) UnmarshalCBORAt(data []byte, pos int) (int
 	return pos, nil
 }
 
-type JetstreamPlanBackfill_Input struct {
+type JetstreamPlanSnapshot_Input struct {
 	LexiconTypeID string           `json:"$type,omitempty"`
 	AfterSeq      gt.Option[int64] `json:"afterSeq,omitzero"`     // Lower exclusive sequence bound. Rows with seq <= afterSeq are outside the requested window.
 	BeforeSeq     gt.Option[int64] `json:"beforeSeq,omitzero"`    // Upper inclusive sequence bound. Rows with seq > beforeSeq are outside the requested window.
@@ -1042,18 +1042,18 @@ type JetstreamPlanBackfill_Input struct {
 	extra []extraField
 }
 
-// JetstreamPlanBackfill calls the XRPC procedure "network.bsky.jetstream.planBackfill".
+// JetstreamPlanSnapshot calls the XRPC procedure "network.bsky.jetstream.planSnapshot".
 //
-// Plan sealed-archive downloads for a historical backfill. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested DID and collection filters, and is paginated: pin sealedTipSeq and page with afterSeq=plannedThroughSeq until plannedThroughSeq reaches it. This is a transport planner only: clients must still decode rows, apply exact filtering, fold deletes/updates, and coordinate live-tail subscription independently. Deletion markers (record-level and DID-level) ride inline in the planned blocks; there is no separate tombstone fetch.
-func JetstreamPlanBackfill(ctx context.Context, c *xrpc.Client, input *JetstreamPlanBackfill_Input) (*JetstreamPlanBackfill_Output, error) {
-	var out JetstreamPlanBackfill_Output
-	return &out, c.Procedure(ctx, "network.bsky.jetstream.planBackfill", input, &out)
+// Plan a sealed-archive snapshot. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested DID and collection filters, and is paginated: pin sealedTipSeq and page with afterSeq=plannedThroughSeq until plannedThroughSeq reaches it. This is a transport planner only: clients must still decode rows, apply exact filtering, fold deletes/updates, and coordinate live-tail subscription independently. Deletion markers (record-level and DID-level) ride inline in the planned blocks; there is no separate tombstone fetch.
+func JetstreamPlanSnapshot(ctx context.Context, c *xrpc.Client, input *JetstreamPlanSnapshot_Input) (*JetstreamPlanSnapshot_Output, error) {
+	var out JetstreamPlanSnapshot_Output
+	return &out, c.Procedure(ctx, "network.bsky.jetstream.planSnapshot", input, &out)
 }
 
-// JetstreamPlanBackfill_Segment is a "segment" in the network.bsky.jetstream.planBackfill schema.
-type JetstreamPlanBackfill_Segment struct {
+// JetstreamPlanSnapshot_Segment is a "segment" in the network.bsky.jetstream.planSnapshot schema.
+type JetstreamPlanSnapshot_Segment struct {
 	LexiconTypeID string                             `json:"$type,omitempty"`
-	Blocks        []JetstreamPlanBackfill_BlockRange `json:"blocks,omitempty"` // Inclusive block ranges. Present only when mode is blocks.
+	Blocks        []JetstreamPlanSnapshot_BlockRange `json:"blocks,omitempty"` // Inclusive block ranges. Present only when mode is blocks.
 	Checksum      string                             `json:"checksum"`         // Segment-format xxh3 metadata checksum as 16-char hex.
 	Index         int64                              `json:"index"`            // Zero-based segment index.
 	MaxSeq        int64                              `json:"maxSeq"`
@@ -1065,23 +1065,23 @@ type JetstreamPlanBackfill_Segment struct {
 	extra []extraField
 }
 
-// Precomputed CBOR key tokens for JetstreamPlanBackfill_Segment.
+// Precomputed CBOR key tokens for JetstreamPlanSnapshot_Segment.
 var (
-	cborKey_JetstreamPlanBackfill_Segment_mode        = cbor.AppendTextKey(nil, "mode")
-	cborKey_JetstreamPlanBackfill_Segment_name        = cbor.AppendTextKey(nil, "name")
-	cborKey_JetstreamPlanBackfill_Segment_dollar_type = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamPlanBackfill_Segment_index       = cbor.AppendTextKey(nil, "index")
-	cborKey_JetstreamPlanBackfill_Segment_blocks      = cbor.AppendTextKey(nil, "blocks")
-	cborKey_JetstreamPlanBackfill_Segment_maxSeq      = cbor.AppendTextKey(nil, "maxSeq")
-	cborKey_JetstreamPlanBackfill_Segment_minSeq      = cbor.AppendTextKey(nil, "minSeq")
-	cborKey_JetstreamPlanBackfill_Segment_checksum    = cbor.AppendTextKey(nil, "checksum")
+	cborKey_JetstreamPlanSnapshot_Segment_mode        = cbor.AppendTextKey(nil, "mode")
+	cborKey_JetstreamPlanSnapshot_Segment_name        = cbor.AppendTextKey(nil, "name")
+	cborKey_JetstreamPlanSnapshot_Segment_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamPlanSnapshot_Segment_index       = cbor.AppendTextKey(nil, "index")
+	cborKey_JetstreamPlanSnapshot_Segment_blocks      = cbor.AppendTextKey(nil, "blocks")
+	cborKey_JetstreamPlanSnapshot_Segment_maxSeq      = cbor.AppendTextKey(nil, "maxSeq")
+	cborKey_JetstreamPlanSnapshot_Segment_minSeq      = cbor.AppendTextKey(nil, "minSeq")
+	cborKey_JetstreamPlanSnapshot_Segment_checksum    = cbor.AppendTextKey(nil, "checksum")
 )
 
-func (s *JetstreamPlanBackfill_Segment) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Segment) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_Segment) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Segment) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 6 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
@@ -1093,22 +1093,22 @@ func (s *JetstreamPlanBackfill_Segment) AppendCBOR(buf []byte) ([]byte, error) {
 	if len(s.extra) > 0 {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "mode", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_mode...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_mode...)
 		buf = cbor.AppendText(buf, s.Mode)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "name", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_name...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_name...)
 		buf = cbor.AppendText(buf, s.Name)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "index", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_index...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_index...)
 		buf = cbor.AppendInt(buf, s.Index)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "blocks", buf)
 		if len(s.Blocks) > 0 {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_blocks...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_blocks...)
 			buf = cbor.AppendArrayHeader(buf, uint64(len(s.Blocks)))
 			for _, item := range s.Blocks {
 				var err error
@@ -1119,28 +1119,28 @@ func (s *JetstreamPlanBackfill_Segment) AppendCBOR(buf []byte) ([]byte, error) {
 			}
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "maxSeq", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_maxSeq...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_maxSeq...)
 		buf = cbor.AppendInt(buf, s.MaxSeq)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "minSeq", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_minSeq...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_minSeq...)
 		buf = cbor.AppendInt(buf, s.MinSeq)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "checksum", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_checksum...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_checksum...)
 		buf = cbor.AppendText(buf, s.Checksum)
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_mode...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_mode...)
 		buf = cbor.AppendText(buf, s.Mode)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_name...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_name...)
 		buf = cbor.AppendText(buf, s.Name)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_index...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_index...)
 		buf = cbor.AppendInt(buf, s.Index)
 		if len(s.Blocks) > 0 {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_blocks...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_blocks...)
 			buf = cbor.AppendArrayHeader(buf, uint64(len(s.Blocks)))
 			for _, item := range s.Blocks {
 				var err error
@@ -1150,22 +1150,22 @@ func (s *JetstreamPlanBackfill_Segment) AppendCBOR(buf []byte) ([]byte, error) {
 				}
 			}
 		}
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_maxSeq...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_maxSeq...)
 		buf = cbor.AppendInt(buf, s.MaxSeq)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_minSeq...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_minSeq...)
 		buf = cbor.AppendInt(buf, s.MinSeq)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Segment_checksum...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Segment_checksum...)
 		buf = cbor.AppendText(buf, s.Checksum)
 	}
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_Segment) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamPlanSnapshot_Segment) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_Segment) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_Segment) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -1227,7 +1227,7 @@ func (s *JetstreamPlanBackfill_Segment) UnmarshalCBORAt(data []byte, pos int) (i
 						return 0, err
 					}
 					pos = newPos
-					s.Blocks = make([]JetstreamPlanBackfill_BlockRange, arrLen)
+					s.Blocks = make([]JetstreamPlanSnapshot_BlockRange, arrLen)
 					for idx := range arrLen {
 						pos, err = s.Blocks[idx].UnmarshalCBORAt(data, pos)
 						if err != nil {
@@ -1279,30 +1279,30 @@ func (s *JetstreamPlanBackfill_Segment) UnmarshalCBORAt(data []byte, pos int) (i
 	return pos, nil
 }
 
-// Precomputed JSON key tokens for JetstreamPlanBackfill_Segment.
+// Precomputed JSON key tokens for JetstreamPlanSnapshot_Segment.
 var (
-	jsonKey_JetstreamPlanBackfill_Segment_dollar_type = []byte("\"$type\":")
-	jsonKey_JetstreamPlanBackfill_Segment_blocks      = []byte("\"blocks\":")
-	jsonKey_JetstreamPlanBackfill_Segment_checksum    = []byte("\"checksum\":")
-	jsonKey_JetstreamPlanBackfill_Segment_index       = []byte("\"index\":")
-	jsonKey_JetstreamPlanBackfill_Segment_maxSeq      = []byte("\"maxSeq\":")
-	jsonKey_JetstreamPlanBackfill_Segment_minSeq      = []byte("\"minSeq\":")
-	jsonKey_JetstreamPlanBackfill_Segment_mode        = []byte("\"mode\":")
-	jsonKey_JetstreamPlanBackfill_Segment_name        = []byte("\"name\":")
+	jsonKey_JetstreamPlanSnapshot_Segment_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamPlanSnapshot_Segment_blocks      = []byte("\"blocks\":")
+	jsonKey_JetstreamPlanSnapshot_Segment_checksum    = []byte("\"checksum\":")
+	jsonKey_JetstreamPlanSnapshot_Segment_index       = []byte("\"index\":")
+	jsonKey_JetstreamPlanSnapshot_Segment_maxSeq      = []byte("\"maxSeq\":")
+	jsonKey_JetstreamPlanSnapshot_Segment_minSeq      = []byte("\"minSeq\":")
+	jsonKey_JetstreamPlanSnapshot_Segment_mode        = []byte("\"mode\":")
+	jsonKey_JetstreamPlanSnapshot_Segment_name        = []byte("\"name\":")
 )
 
-func (s *JetstreamPlanBackfill_Segment) MarshalJSON() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Segment) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_Segment) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Segment) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Segment_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Segment_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
@@ -1310,7 +1310,7 @@ func (s *JetstreamPlanBackfill_Segment) AppendJSON(buf []byte) ([]byte, error) {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Segment_blocks...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Segment_blocks...)
 		buf = append(buf, '[')
 		for i, item := range s.Blocks {
 			if i > 0 {
@@ -1328,37 +1328,37 @@ func (s *JetstreamPlanBackfill_Segment) AppendJSON(buf []byte) ([]byte, error) {
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Segment_checksum...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Segment_checksum...)
 	buf = cbor.AppendJSONString(buf, s.Checksum)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Segment_index...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Segment_index...)
 	buf = cbor.AppendJSONInt(buf, s.Index)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Segment_maxSeq...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Segment_maxSeq...)
 	buf = cbor.AppendJSONInt(buf, s.MaxSeq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Segment_minSeq...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Segment_minSeq...)
 	buf = cbor.AppendJSONInt(buf, s.MinSeq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Segment_mode...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Segment_mode...)
 	buf = cbor.AppendJSONString(buf, s.Mode)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Segment_name...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Segment_name...)
 	buf = cbor.AppendJSONString(buf, s.Name)
 	first = false
 	for _, ef := range s.extra {
@@ -1377,12 +1377,12 @@ func (s *JetstreamPlanBackfill_Segment) AppendJSON(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_Segment) UnmarshalJSON(data []byte) error {
+func (s *JetstreamPlanSnapshot_Segment) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_Segment) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_Segment) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)
@@ -1419,7 +1419,7 @@ func (s *JetstreamPlanBackfill_Segment) UnmarshalJSONAt(data []byte, pos int) (i
 					if done {
 						break
 					}
-					var elem JetstreamPlanBackfill_BlockRange
+					var elem JetstreamPlanSnapshot_BlockRange
 					pos, err = elem.UnmarshalJSONAt(data, pos)
 					if err != nil {
 						return 0, err
@@ -1475,8 +1475,8 @@ func (s *JetstreamPlanBackfill_Segment) UnmarshalJSONAt(data []byte, pos int) (i
 	}
 }
 
-// JetstreamPlanBackfill_Stats is a "stats" in the network.bsky.jetstream.planBackfill schema.
-type JetstreamPlanBackfill_Stats struct {
+// JetstreamPlanSnapshot_Stats is a "stats" in the network.bsky.jetstream.planSnapshot schema.
+type JetstreamPlanSnapshot_Stats struct {
 	LexiconTypeID    string `json:"$type,omitempty"`
 	BlocksMatched    int64  `json:"blocksMatched"`
 	Entries          int64  `json:"entries"` // Number of response work entries counted against the server plan limit.
@@ -1487,20 +1487,20 @@ type JetstreamPlanBackfill_Stats struct {
 	extra []extraField
 }
 
-// Precomputed CBOR key tokens for JetstreamPlanBackfill_Stats.
+// Precomputed CBOR key tokens for JetstreamPlanSnapshot_Stats.
 var (
-	cborKey_JetstreamPlanBackfill_Stats_dollar_type      = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamPlanBackfill_Stats_entries          = cbor.AppendTextKey(nil, "entries")
-	cborKey_JetstreamPlanBackfill_Stats_blocksMatched    = cbor.AppendTextKey(nil, "blocksMatched")
-	cborKey_JetstreamPlanBackfill_Stats_segmentsMatched  = cbor.AppendTextKey(nil, "segmentsMatched")
-	cborKey_JetstreamPlanBackfill_Stats_segmentsExamined = cbor.AppendTextKey(nil, "segmentsExamined")
+	cborKey_JetstreamPlanSnapshot_Stats_dollar_type      = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamPlanSnapshot_Stats_entries          = cbor.AppendTextKey(nil, "entries")
+	cborKey_JetstreamPlanSnapshot_Stats_blocksMatched    = cbor.AppendTextKey(nil, "blocksMatched")
+	cborKey_JetstreamPlanSnapshot_Stats_segmentsMatched  = cbor.AppendTextKey(nil, "segmentsMatched")
+	cborKey_JetstreamPlanSnapshot_Stats_segmentsExamined = cbor.AppendTextKey(nil, "segmentsExamined")
 )
 
-func (s *JetstreamPlanBackfill_Stats) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Stats) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_Stats) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Stats) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
@@ -1510,45 +1510,45 @@ func (s *JetstreamPlanBackfill_Stats) AppendCBOR(buf []byte) ([]byte, error) {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "entries", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_entries...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_entries...)
 		buf = cbor.AppendInt(buf, s.Entries)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "blocksMatched", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_blocksMatched...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_blocksMatched...)
 		buf = cbor.AppendInt(buf, s.BlocksMatched)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "segmentsMatched", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_segmentsMatched...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_segmentsMatched...)
 		buf = cbor.AppendInt(buf, s.SegmentsMatched)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "segmentsExamined", buf)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_segmentsExamined...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_segmentsExamined...)
 		buf = cbor.AppendInt(buf, s.SegmentsExamined)
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_dollar_type...)
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_entries...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_entries...)
 		buf = cbor.AppendInt(buf, s.Entries)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_blocksMatched...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_blocksMatched...)
 		buf = cbor.AppendInt(buf, s.BlocksMatched)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_segmentsMatched...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_segmentsMatched...)
 		buf = cbor.AppendInt(buf, s.SegmentsMatched)
-		buf = append(buf, cborKey_JetstreamPlanBackfill_Stats_segmentsExamined...)
+		buf = append(buf, cborKey_JetstreamPlanSnapshot_Stats_segmentsExamined...)
 		buf = cbor.AppendInt(buf, s.SegmentsExamined)
 	}
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_Stats) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamPlanSnapshot_Stats) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_Stats) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_Stats) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -1643,52 +1643,52 @@ func (s *JetstreamPlanBackfill_Stats) UnmarshalCBORAt(data []byte, pos int) (int
 	return pos, nil
 }
 
-// Precomputed JSON key tokens for JetstreamPlanBackfill_Stats.
+// Precomputed JSON key tokens for JetstreamPlanSnapshot_Stats.
 var (
-	jsonKey_JetstreamPlanBackfill_Stats_dollar_type      = []byte("\"$type\":")
-	jsonKey_JetstreamPlanBackfill_Stats_blocksMatched    = []byte("\"blocksMatched\":")
-	jsonKey_JetstreamPlanBackfill_Stats_entries          = []byte("\"entries\":")
-	jsonKey_JetstreamPlanBackfill_Stats_segmentsExamined = []byte("\"segmentsExamined\":")
-	jsonKey_JetstreamPlanBackfill_Stats_segmentsMatched  = []byte("\"segmentsMatched\":")
+	jsonKey_JetstreamPlanSnapshot_Stats_dollar_type      = []byte("\"$type\":")
+	jsonKey_JetstreamPlanSnapshot_Stats_blocksMatched    = []byte("\"blocksMatched\":")
+	jsonKey_JetstreamPlanSnapshot_Stats_entries          = []byte("\"entries\":")
+	jsonKey_JetstreamPlanSnapshot_Stats_segmentsExamined = []byte("\"segmentsExamined\":")
+	jsonKey_JetstreamPlanSnapshot_Stats_segmentsMatched  = []byte("\"segmentsMatched\":")
 )
 
-func (s *JetstreamPlanBackfill_Stats) MarshalJSON() ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Stats) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamPlanBackfill_Stats) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamPlanSnapshot_Stats) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamPlanBackfill_Stats_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Stats_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Stats_blocksMatched...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Stats_blocksMatched...)
 	buf = cbor.AppendJSONInt(buf, s.BlocksMatched)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Stats_entries...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Stats_entries...)
 	buf = cbor.AppendJSONInt(buf, s.Entries)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Stats_segmentsExamined...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Stats_segmentsExamined...)
 	buf = cbor.AppendJSONInt(buf, s.SegmentsExamined)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamPlanBackfill_Stats_segmentsMatched...)
+	buf = append(buf, jsonKey_JetstreamPlanSnapshot_Stats_segmentsMatched...)
 	buf = cbor.AppendJSONInt(buf, s.SegmentsMatched)
 	first = false
 	for _, ef := range s.extra {
@@ -1707,12 +1707,12 @@ func (s *JetstreamPlanBackfill_Stats) AppendJSON(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamPlanBackfill_Stats) UnmarshalJSON(data []byte) error {
+func (s *JetstreamPlanSnapshot_Stats) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamPlanBackfill_Stats) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamPlanSnapshot_Stats) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)

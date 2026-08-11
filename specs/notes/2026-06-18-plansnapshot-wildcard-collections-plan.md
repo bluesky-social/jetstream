@@ -1,15 +1,15 @@
-# Implementation plan: planBackfill wildcard collection filters
+# Implementation plan: planSnapshot wildcard collection filters
 
-Tracks issue #73. Design: `2026-06-18-planbackfill-wildcard-collections-design.md`.
+Tracks issue #73. Design: `2026-06-18-plansnapshot-wildcard-collections-design.md`.
 
 Work proceeds test-first. Each task lands its tests (red) then code (green) and
-keeps the touched package's suite < ~1s. Branch: `73-planbackfill-wildcards`.
+keeps the touched package's suite < ~1s. Branch: `73-plansnapshot-wildcards`.
 
 ## Task 1 — manifest: prefix matching in the planner
 
 **Files:** `internal/manifest/plan.go`, `internal/manifest/plan_test.go`
 
-1. Add `CollectionPrefixes []string` to `PlanBackfillRequest` (each entry ends in `.`).
+1. Add `CollectionPrefixes []string` to `PlanSnapshotRequest` (each entry ends in `.`).
 2. `collectionMatchAll` becomes `len(Collections)==0 && len(CollectionPrefixes)==0`.
 3. `collectionIDsForSegment(seg, want, prefixes)` keeps an index if its NSID is in
    `want` OR `strings.HasPrefix(nsid, p)` for some `p` in `prefixes`.
@@ -25,7 +25,7 @@ keeps the touched package's suite < ~1s. Branch: `73-planbackfill-wildcards`.
 
 Seeded/randomized archive over a known NSID universe with overlapping namespaces.
 For each present (and some absent) prefix `P`, assert
-`PlanBackfill({CollectionPrefixes:[P]})` == `PlanBackfill({Collections: <all
+`PlanSnapshot({CollectionPrefixes:[P]})` == `PlanSnapshot({Collections: <all
 archived NSIDs under P>})` for segments, block ranges, modes, and stats. Swarm
 over several fixed seeds (no `Math.random`; iterate seed values).
 
@@ -33,7 +33,7 @@ over several fixed seeds (no `Math.random`; iterate seed values).
 
 ## Task 3 — xrpcapi: wildcard parser + validation
 
-**Files:** `internal/xrpcapi/planbackfill.go`, `internal/xrpcapi/planbackfill_test.go`
+**Files:** `internal/xrpcapi/plansnapshot.go`, `internal/xrpcapi/plansnapshot_test.go`
 
 1. Add pure helper `classifyCollectionPattern(raw) (exact, prefix string, err error)`:
    - ends in `.*` → wildcard; `head = TrimSuffix(raw, ".*")`; accept iff
@@ -47,11 +47,11 @@ over several fixed seeds (no `Math.random`; iterate seed values).
    parsed exact/prefix sets; dedup; ordering independence; cap-at-limit vs
    over-by-one; disabled; stored prefix ends in exactly one `.`.
 
-**Done when:** parser unit tests pass; existing planbackfill tests green.
+**Done when:** parser unit tests pass; existing plansnapshot tests green.
 
 ## Task 4 — xrpcapi: integration + fuzz
 
-**Files:** `internal/xrpcapi/planbackfill_test.go`, `internal/xrpcapi/planbackfill_fuzz_test.go` (new)
+**Files:** `internal/xrpcapi/plansnapshot_test.go`, `internal/xrpcapi/plansnapshot_fuzz_test.go` (new)
 
 - Integration POSTs: wildcard-only, mixed, matches-nothing (still returns
   `plannedThroughSeq`), wildcard+DID, wildcard+seq window, invalid wildcard → 400.
@@ -63,7 +63,7 @@ over several fixed seeds (no `Math.random`; iterate seed values).
 
 ## Task 5 — lexicon + regenerate binding
 
-**Files:** `lexicons/network/bsky/jetstream/planBackfill.json`, regenerated `api/jetstream/jetstreamplanbackfill.go`
+**Files:** `lexicons/network/bsky/jetstream/planSnapshot.json`, regenerated `api/jetstream/jetstreamplansnapshot.go`
 
 Relax `collections.items` to `{type: string}`; update description to document the
 two shapes. Regenerate via the repo's codegen recipe; verify only the intended

@@ -188,7 +188,7 @@ cold replay load. This is the single most production-relevant finding.
   getBlock traffic in these runs was modest (~1.1k requests/run, block-mode
   plan entries at range edges).
 - **DID-filtered plans are spectacular**: 3 DIDs over the full js2 archive —
-  planBackfill + bloom block selection + download + decode = **214.8k events
+  planSnapshot + bloom block selection + download + decode = **214.8k events
   in 0.59 s wall**. The resident block blooms earn their RAM here; the open
   question is whether they must be *resident* (see §7.2).
 - Client live tail via the library: 4% CPU, 16 MiB RSS at ~370 ev/s. A
@@ -234,7 +234,7 @@ compatible levers:
 1. **Size blooms to actual block fill** at seal time — a ~900-event block does
    not need an 8,409-byte bloom sized for 4096 (false-positive target can be
    held constant); worst case ~4× reduction on live segments.
-2. **Make per-block blooms non-resident**: only the planBackfill DID path uses
+2. **Make per-block blooms non-resident**: only the planSnapshot DID path uses
    them (`manifest.go:897`); serve/replay never does. Loading them on demand
    (or mmap-ing the footer bloom region) trades the 0.6 s DID-plan latency for
    tens of GiB. Segment-level blooms (665 B–47 KiB each) stay resident to
@@ -366,7 +366,7 @@ session was ~1k ev/s on js2.
 - Aggregate path capacity: 4 parallel streams ≈ 62–98 MB/s total; 8 parallel
   ≈ **105 MB/s total** (~850 Mbit/s). So one stream captures only ~65–70% of
   what the path can carry — the rest is reachable only with parallelism.
-- TTFB for a small request (planBackfill): ~0.23 s; the full-archive plan
+- TTFB for a small request (planSnapshot): ~0.23 s; the full-archive plan
   (3,074 entries, 399 KB JSON) completes in 0.58 s. Negotiation is not a
   WAN problem.
 
@@ -558,7 +558,7 @@ memory for embedders.
 
 ### A6.6 Non-findings (measured, fine)
 
-- planBackfill negotiation over WAN: 0.6 s for the full 3,074-entry plan;
+- planSnapshot negotiation over WAN: 0.6 s for the full 3,074-entry plan;
   one round trip per 100k-entry page. Irrelevant.
 - Live tail over WAN: lag ≈ one-way delay + 20 ms batcher; zero reconnects.
 - Rate-capped (10 MB/s) backfill: exactly network-bound, zero overhead, no

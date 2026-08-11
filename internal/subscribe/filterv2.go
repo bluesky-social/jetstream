@@ -184,7 +184,7 @@ func ParseQueryV2(q url.Values) (*FilterV2, error) {
 
 	// Unlike v1 (which is deliberately lax for wire parity), a wildcard's
 	// head must be a valid NSID prefix — the same probe idea as
-	// planBackfill's classifyCollectionPattern: appending a known-valid
+	// planSnapshot's classifyCollectionPattern: appending a known-valid
 	// name label reuses atmos.ParseNSID as the single source of truth for
 	// NSID grammar. A malformed head like "not_an_nsid.*" would otherwise
 	// upgrade fine and silently match nothing — the lexicon promises a 400

@@ -18,7 +18,7 @@ const (
 	PlanModeBlocks  PlanMode = "blocks"
 )
 
-type PlanBackfillRequest struct {
+type PlanSnapshotRequest struct {
 	DIDs        []string
 	Collections []string
 	// CollectionPrefixes are namespace prefixes from wildcard filters
@@ -45,7 +45,7 @@ type PlanBackfillRequest struct {
 	WholeSegmentThreshold float64
 }
 
-type PlanBackfillResult struct {
+type PlanSnapshotResult struct {
 	// PlannedThroughSeq is the continuation cursor: the highest sealed seq this
 	// page authoritatively accounts for. When the page is truncated by
 	// MaxEntries it is the MaxSeq of the last included work unit (so the next
@@ -60,7 +60,7 @@ type PlanBackfillResult struct {
 	// PlannedThroughSeq reaches it.
 	SealedTipSeq uint64
 	Segments     []PlannedSegment
-	Stats        PlanBackfillStats
+	Stats        PlanSnapshotStats
 }
 
 type PlannedSegment struct {
@@ -77,31 +77,31 @@ type BlockRange struct {
 	Last  int
 }
 
-type PlanBackfillStats struct {
+type PlanSnapshotStats struct {
 	SegmentsExamined int
 	SegmentsMatched  int
 	BlocksMatched    int
 	Entries          int
 }
 
-// PlanBackfill selects sealed archive segment work using manifest-resident
+// PlanSnapshot selects sealed archive segment work using manifest-resident
 // metadata only. It has a one-sided contract: no false negatives, possible
 // false positives. Callers must exact-filter decoded rows.
-func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, error) {
+func (m *Manifest) PlanSnapshot(req PlanSnapshotRequest) (PlanSnapshotResult, error) {
 	if err := m.waitReady(); err != nil {
-		return PlanBackfillResult{}, err
+		return PlanSnapshotResult{}, err
 	}
 	if req.HasAfterSeq && req.HasBeforeSeq && req.BeforeSeq <= req.AfterSeq {
-		return PlanBackfillResult{}, ErrInvalidPlanRequest
+		return PlanSnapshotResult{}, ErrInvalidPlanRequest
 	}
 	// MaxEntries == 0 disables per-page truncation; a negative value is a
 	// malformed limit (a misconfigured caller), rejected here rather than
 	// silently treated as unlimited.
 	if req.MaxEntries < 0 {
-		return PlanBackfillResult{}, ErrInvalidPlanRequest
+		return PlanSnapshotResult{}, ErrInvalidPlanRequest
 	}
 	if req.WholeSegmentThreshold <= 0 || req.WholeSegmentThreshold > 1 {
-		return PlanBackfillResult{}, ErrInvalidPlanRequest
+		return PlanSnapshotResult{}, ErrInvalidPlanRequest
 	}
 
 	// The requested collection set is request-invariant; resolve it to a lookup
@@ -123,7 +123,7 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
 	// archive still reports the tip, because the planner has confirmed there is
 	// no matching sealed data at or below it. Clients pin it and page until the
 	// continuation cursor reaches it.
-	var result PlanBackfillResult
+	var result PlanSnapshotResult
 	if len(m.segments) > 0 {
 		// The sealed tip is the highest MaxSeq across all segments. With the
 		// Idx-order==seq-order invariant (enforced at load/refresh by
@@ -240,7 +240,7 @@ func (m *Manifest) PlanBackfill(req PlanBackfillRequest) (PlanBackfillResult, er
 	return result, nil
 }
 
-func segmentOverlapsSeq(seg *SegmentMetadata, req PlanBackfillRequest) bool {
+func segmentOverlapsSeq(seg *SegmentMetadata, req PlanSnapshotRequest) bool {
 	if len(seg.Blocks) == 0 || seg.Header.EventCount == 0 {
 		return false
 	}
@@ -253,7 +253,7 @@ func segmentOverlapsSeq(seg *SegmentMetadata, req PlanBackfillRequest) bool {
 	return true
 }
 
-func blockOverlapsSeq(block segment.BlockInfo, req PlanBackfillRequest) bool {
+func blockOverlapsSeq(block segment.BlockInfo, req PlanSnapshotRequest) bool {
 	if block.EventCount == 0 {
 		return false
 	}
@@ -266,7 +266,7 @@ func blockOverlapsSeq(block segment.BlockInfo, req PlanBackfillRequest) bool {
 	return true
 }
 
-func selectPlanBlocks(seg *SegmentMetadata, req PlanBackfillRequest, wantCollections map[string]struct{}) []int {
+func selectPlanBlocks(seg *SegmentMetadata, req PlanSnapshotRequest, wantCollections map[string]struct{}) []int {
 	collectionMatchAll := len(req.Collections) == 0 && len(req.CollectionPrefixes) == 0
 	didMatchAll := len(req.DIDs) == 0
 

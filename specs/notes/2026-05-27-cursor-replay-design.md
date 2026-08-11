@@ -115,7 +115,7 @@ clamps). This is the explicit signal a paginated backfill client
 keys on to re-backfill from its last seq rather than silently
 dropping the gap — see the 2026-06-28 drop-client-tombstones
 design §14. (Replaying the sealed archive itself goes through
-paginated `planBackfill` + segment downloads, not the live
+paginated `planSnapshot` + segment downloads, not the live
 websocket, so "from the beginning" is not bounded by the floor.)
 
 ## Configuration

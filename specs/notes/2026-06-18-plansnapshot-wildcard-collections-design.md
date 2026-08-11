@@ -1,4 +1,4 @@
-# planBackfill: wildcard collection filters
+# planSnapshot: wildcard collection filters
 
 **Date:** 2026-06-18
 **Status:** Approved design, pre-implementation
@@ -6,7 +6,7 @@
 
 ## Context
 
-`network.bsky.jetstream.planBackfill` (`internal/xrpcapi/planbackfill.go`) plans
+`network.bsky.jetstream.planSnapshot` (`internal/xrpcapi/plansnapshot.go`) plans
 sealed-archive downloads. Its `collections` input currently accepts only exact
 NSIDs. The `/subscribe` websocket endpoint already lets clients pass collection
 *wildcards* of the shape `app.bsky.feed.*` (see `internal/subscribe/filter.go`),
@@ -19,16 +19,16 @@ namespace prefix, matching the one shape `/subscribe` allows.
 
 ### How the relevant pieces work today
 
-- **Wire decode** — `JetstreamPlanBackfill_Input.UnmarshalJSON`
-  (`api/jetstream/jetstreamplanbackfill.go`) reads `collections` as plain
+- **Wire decode** — `JetstreamPlanSnapshot_Input.UnmarshalJSON`
+  (`api/jetstream/jetstreamplansnapshot.go`) reads `collections` as plain
   strings. Despite the lexicon declaring `items: {format: nsid}`, the generated
   binding performs **no** NSID-format check on input. A value like
   `app.bsky.feed.*` therefore flows untouched to the handler. This is the
   single interception point — no decoder change is needed.
-- **Validation** — `validatePlanCollections` (`planbackfill.go:177`) dedupes and
+- **Validation** — `validatePlanCollections` (`plansnapshot.go:177`) dedupes and
   `atmos.ParseNSID`-validates each entry, capped at `cfg.MaxCollections`
   distinct entries.
-- **Matching** — `Manifest.PlanBackfill` (`internal/manifest/plan.go:65`) builds
+- **Matching** — `Manifest.PlanSnapshot` (`internal/manifest/plan.go:65`) builds
   a `map[string]struct{}` of wanted NSIDs once, then per segment calls
   `collectionIDsForSegment` (`plan.go:242`), which walks that segment's resident
   `Collections []string` table and keeps the indices whose NSID is in the want
@@ -89,7 +89,7 @@ mixed freely. This mirrors `/subscribe`'s `wantedCollections`.
 ### Validation rules (stricter than `/subscribe`)
 
 `/subscribe` deliberately mirrors v1's lax behavior (no validation of the prefix
-head). `planBackfill` is a new endpoint with no v1 wire contract, so we validate
+head). `planSnapshot` is a new endpoint with no v1 wire contract, so we validate
 strictly, reusing `atmos` as the single source of truth for NSID grammar rather
 than re-deriving label rules.
 
@@ -142,7 +142,7 @@ yields the existing "collection filters are disabled" `InvalidRequest`.
 
 ### Lexicon
 
-Relax `collections.items` in `lexicons/network/bsky/jetstream/planBackfill.json`
+Relax `collections.items` in `lexicons/network/bsky/jetstream/planSnapshot.json`
 from `{type: string, format: nsid}` to `{type: string}` and update the field
 description to document the two accepted shapes (exact NSID, or
 `<namespace>.*` wildcard). The generated binding already reads plain strings, so
@@ -154,7 +154,7 @@ code that accepts non-NSID wildcards is latent tech debt).
 
 ### `internal/manifest/plan.go`
 
-- `PlanBackfillRequest` gains `CollectionPrefixes []string` (each entry ends in
+- `PlanSnapshotRequest` gains `CollectionPrefixes []string` (each entry ends in
   `.`). Existing `Collections []string` (exact) is unchanged.
 - `collectionMatchAll` becomes
   `len(req.Collections) == 0 && len(req.CollectionPrefixes) == 0`.
@@ -164,7 +164,7 @@ code that accepts non-NSID wildcards is latent tech debt).
 - One-sided contract (no false negatives, possible false positives) is preserved
   — prefixes only ever widen the matched set, never narrow it.
 
-### `internal/xrpcapi/planbackfill.go`
+### `internal/xrpcapi/plansnapshot.go`
 
 - `validatePlanCollections` returns `(exact []string, prefixes []string, err error)`.
   It splits entries per the rules above, dedupes each kind, and enforces
@@ -174,9 +174,9 @@ code that accepts non-NSID wildcards is latent tech debt).
   tested directly without HTTP plumbing. This helper is the "wildcard parser"
   that gets exhaustive unit coverage.
 - `planRequestFromInput` threads the prefixes into
-  `manifest.PlanBackfillRequest.CollectionPrefixes`.
+  `manifest.PlanSnapshotRequest.CollectionPrefixes`.
 
-### `lexicons/.../planBackfill.json` + regenerated `api/jetstream/...`
+### `lexicons/.../planSnapshot.json` + regenerated `api/jetstream/...`
 
 Doc/format relaxation as above; regenerate the binding via the repo's codegen.
 
@@ -227,8 +227,8 @@ accept/reject, so a regression that mis-buckets an entry is caught.
 Seeded/randomized: build an archive of several segments over a known NSID
 universe with overlapping namespaces (e.g. `app.bsky.feed.*`, `app.bsky.graph.*`,
 `com.example.*`). For each namespace prefix `P` present (and some absent), assert
-`PlanBackfill({CollectionPrefixes: [P]})` produces byte-identical segments,
-block ranges, modes, and stats to `PlanBackfill({Collections: <all archived
+`PlanSnapshot({CollectionPrefixes: [P]})` produces byte-identical segments,
+block ranges, modes, and stats to `PlanSnapshot({Collections: <all archived
 NSIDs under P>})`. Run as a small swarm over multiple seeds. This directly
 proves the prefix-match ≡ expansion claim.
 

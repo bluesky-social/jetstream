@@ -24,7 +24,7 @@ type engineHarness struct {
 	planned   uint64
 	planEntry []planSeg // segments to name in the plan, in order
 	liveSteps []readStep
-	// planResponder, when set, computes the planBackfill JSON response for a
+	// planResponder, when set, computes the planSnapshot JSON response for a
 	// given request, enabling multi-page pagination tests. When nil the harness
 	// serves a single-shot plan (all planEntry; plannedThroughSeq == sealedTipSeq
 	// == planned), which the bufferless engine consumes in exactly one page.
@@ -38,7 +38,7 @@ type planSeg struct {
 	minSeq, maxSeq uint64
 }
 
-// planReqWire is the decoded planBackfill input the responder branches on.
+// planReqWire is the decoded planSnapshot input the responder branches on.
 type planReqWire struct {
 	AfterSeq  int64 `json:"afterSeq"`
 	BeforeSeq int64 `json:"beforeSeq"`
@@ -49,7 +49,7 @@ func newEngineHarness(t *testing.T) *engineHarness {
 }
 
 func (h *engineHarness) installHandlers() {
-	h.as.mux.HandleFunc("/xrpc/network.bsky.jetstream.planBackfill", func(w http.ResponseWriter, r *http.Request) {
+	h.as.mux.HandleFunc("/xrpc/network.bsky.jetstream.planSnapshot", func(w http.ResponseWriter, r *http.Request) {
 		h.planCalls.Add(1)
 		var req planReqWire
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -68,7 +68,7 @@ func (h *engineHarness) planJSON() string {
 	return planPageJSON(h.planEntry, h.planned, h.planned)
 }
 
-// planPageJSON renders one planBackfill page: the given segments, with the
+// planPageJSON renders one planSnapshot page: the given segments, with the
 // continuation cursor plannedThroughSeq and the pinned goal sealedTipSeq.
 func planPageJSON(entries []planSeg, plannedThrough, sealedTip uint64) string {
 	var segs []string
@@ -221,7 +221,7 @@ func TestEngineActiveSegmentGap(t *testing.T) {
 
 // TestEngineEmptyArchiveCutoverDeliversFirstEvent is a regression guard for the
 // empty-archive first-event drop. A freshly bootstrapped server has NO sealed
-// segments: planBackfill returns an empty plan with plannedThroughSeq=0, so the
+// segments: planSnapshot returns an empty plan with plannedThroughSeq=0, so the
 // backfill downloads nothing and the live tail covers the WHOLE stream from the
 // first-ever event (seq 1). It must be delivered exactly once — not swallowed by
 // a dedup floor seeded as if the (empty) backfill had already covered it.
@@ -382,7 +382,7 @@ func TestEngineSweepNonAdvancingPlanIsFatal(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.ErrorIs(t, gotErr, ErrFatal, "a non-advancing planBackfill must be fatal, not infinite")
+	require.ErrorIs(t, gotErr, ErrFatal, "a non-advancing planSnapshot must be fatal, not infinite")
 	require.Contains(t, gotErr.Error(), "made no progress")
 }
 

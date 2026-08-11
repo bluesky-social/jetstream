@@ -110,7 +110,7 @@ literally no coverage change:
 - `internal/subscribe/cursor_test.go:53-421` — 20 Test funcs for one
   `ResolveCursor` function; ~8 boundary cases carry all the signal (and
   `cursor_fuzz_test.go` + the partb tier / m032 guard the floor semantics).
-- `internal/xrpcapi/planbackfill_test.go:298-401` — 6 wildcard permutations → 2-3.
+- `internal/xrpcapi/plansnapshot_test.go:298-401` — 6 wildcard permutations → 2-3.
 - `internal/timestamp/parse_test.go:33-323` — 17 malformed-CSV variants → table
   (FuzzParseRoundTrip + the hostile round-trip test carry the load).
 - `segment/writer_test.go:39-111` — 5 rejects-invalid-X tests → 1 table.

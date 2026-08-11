@@ -113,7 +113,7 @@ re-opens a correctness hole):
 Part A:  [6 oracle tests] ──gates──> [3 sentinel-index fix] ──> [4 remove overlay] ──> [5 prune tombstone API]
          [1 deliver acct/id/sync] ──> [3]
 Part B:  [7 seqs@1]  (do early; simplifies 8,9,10)
-         [8 paginate planBackfill] ─┐
+         [8 paginate planSnapshot] ─┐
          [9 v2 too-old 400] ────────┼──> [10 client paginate + delete buffer] ──> [11 Part B oracle]
          [2 remove suppression] ────┘
          [12 docs] (last)
@@ -447,7 +447,7 @@ explicit `TestOracle_DefaultLifecycle` (synctest, fast + swarm), `TestOracle_Sam
 ### ✅ Step 3 — `segment+manifest: DID-marker sentinel collections` (§R4 REVISED, #175) — finding-#1 fix
 
 > **2026-06-29: approach changed.** The original step 3 (a `wantDidTombstones`
-> start-snapshot piggybacked on `planBackfill`) was implemented (commit 154eee3) and then
+> start-snapshot piggybacked on `planSnapshot`) was implemented (commit 154eee3) and then
 > **reverted** in favor of an in-archive **reserved DID-marker sentinel collection** index.
 > The snapshot text that was here is preserved in the design doc's "§R4 (ORIGINAL,
 > SUPERSEDED)" as the reasoning trail. This entry records the mechanism that shipped.
@@ -462,7 +462,7 @@ fail-closed gate, no snapshot-before-first-fetch ordering invariant, no race pro
 - **Reserved sentinels (`segment/sentinel.go`).** `SentinelCollectionAccount = "$account"`,
   `…Identity = "$identity"`, `…Sync = "$sync"`. `didMarkerSentinel(Kind)` maps the three
   DID-level marker kinds to their name (others → `""`); `IsDIDMarkerSentinelCollection(name)`
-  is the planner's predicate. The `$` prefix makes them invalid NSIDs, and planBackfill only
+  is the planner's predicate. The `$` prefix makes them invalid NSIDs, and planSnapshot only
   admits real NSIDs / NSID-authority wildcard prefixes, so **no client request can name or
   prefix-match a sentinel** — locked by `TestSentinelCollectionsAreInvalidNSIDs`. These strings
   are written into sealed footers and are therefore on-disk format (load-bearing once sealed).
@@ -611,7 +611,7 @@ from the speculative bullets above — recorded here as the reasoning trail:
 
 ---
 
-### ☐ Step 8 — `manifest: paginate planBackfill` (design §12, §12.1) — before step 10
+### ☐ Step 8 — `manifest: paginate planSnapshot` (design §12, §12.1) — before step 10
 
 **Goal.** Replace `ErrPlanTooLarge` (normal path) with truncate-and-continue at a clean **work
 unit** boundary, and add `sealedTipSeq` as the pagination goal. (`ErrInvalidPlanRequest` stays
@@ -635,7 +635,7 @@ for malformed input.)
 - **Always admit ≥1 unit per page.** If the first matched unit alone exceeds `MaxEntries`,
   include it anyway and set the cursor to its `MaxSeq`. Never return zero units with the cursor
   unadvanced (livelock).
-- **Two result fields (§12.2).** `PlanBackfillResult` gains `SealedTipSeq` (the current sealed
+- **Two result fields (§12.2).** `PlanSnapshotResult` gains `SealedTipSeq` (the current sealed
   tip, capped by `beforeSeq`) alongside `PlannedThroughSeq` (now the **continuation cursor** =
   truncation boundary when truncated, else the tip). When *not* truncated, the two are equal.
 - **Gap-free + progressing proof (state in the issue, §12.1):** blocks within a segment are
@@ -646,13 +646,13 @@ for malformed input.)
   ≥1 unit was admitted, so the loop advances. Exclusive-`afterSeq` aligns exactly — no
   off-by-one.
 
-**XRPC + lexicon (`internal/xrpcapi/planbackfill.go`, lexicon, codegen).**
-- Add required output field `sealedTipSeq` to `planBackfill.json` output; `just lexgen`.
+**XRPC + lexicon (`internal/xrpcapi/plansnapshot.go`, lexicon, codegen).**
+- Add required output field `sealedTipSeq` to `planSnapshot.json` output; `just lexgen`.
 - `planOutput`: populate `sealedTipSeq`; populate `plannedThroughSeq` as the continuation
   cursor.
-- `newPlanBackfillHandler`: stop mapping `manifest.ErrPlanTooLarge` to a 400 — it no longer
+- `newPlanSnapshotHandler`: stop mapping `manifest.ErrPlanTooLarge` to a 400 — it no longer
   arises on the normal path. (Keep the `ErrInvalidPlanRequest → InvalidRequest` mapping.) The
-  `PlanTooLarge` lexicon error and `ErrJetstreamPlanBackfill_PlanTooLarge` can be removed
+  `PlanTooLarge` lexicon error and `ErrJetstreamPlanSnapshot_PlanTooLarge` can be removed
   (nothing returns it); confirm `isPlanTooLarge` in the client planner is deleted in step 10.
 - Keep `MaxEntries` config plumbing; it now bounds per-page entry count (operational win) not a
   hard refusal.
@@ -662,7 +662,7 @@ loop that consumes it lands in step 10). Remove `ErrPlanTooLarge` + `isPlanTooLa
 will rely on pagination, not the sentinel) — coordinate the exact removal with step 10 so the
 tree compiles between steps.
 
-**Tests (`internal/manifest/plan_test.go`, `internal/xrpcapi/planbackfill_test.go`).**
+**Tests (`internal/manifest/plan_test.go`, `internal/xrpcapi/plansnapshot_test.go`).**
 - Multi-page truncation: small `MaxEntries`, assert continuation cursor = prior page's last
   unit `MaxSeq`, union of pages folds to ground truth, no skipped block.
 - **Mid-segment block-mode cut**: a single block-mode segment whose matched coalesced ranges
@@ -695,13 +695,13 @@ tree compiles between steps.
   prior cursor whenever ≥1 unit was admitted.
 - **`ErrPlanTooLarge` removed end-to-end** (zero-tech-debt, nothing returns it post-change): the
   `manifest` error var, the lexicon `PlanTooLarge` error + regenerated
-  `ErrJetstreamPlanBackfill_PlanTooLarge` const, the xrpcapi 400 mapping, and the client
+  `ErrJetstreamPlanSnapshot_PlanTooLarge` const, the xrpcapi 400 mapping, and the client
   `ErrPlanTooLarge` var + `isPlanTooLarge` helper + the wrapping branch. `ErrInvalidPlanRequest`
   stays for malformed input (negative `MaxEntries`, inverted window, bad threshold). The lexgen
   deletion *forced* the client cleanup to compile — confirming no live consumer remained.
-- **Lexicon + codegen.** `planBackfill.json` output gained required `sealedTipSeq`;
+- **Lexicon + codegen.** `planSnapshot.json` output gained required `sealedTipSeq`;
   `plannedThroughSeq` re-described as the continuation cursor; `PlanTooLarge` error removed.
-  `just lexgen` regenerated `api/jetstream/jetstreamplanbackfill.go`.
+  `just lexgen` regenerated `api/jetstream/jetstreamplansnapshot.go`.
 - **Wire/client.** `planOutput` populates `sealedTipSeq` (overflow-guarded via `int64FromUint64`);
   client `Plan` surfaces `SealedTipSeq`, and `planFromOutput` rejects an incoherent
   `plannedThroughSeq > sealedTipSeq` (and negative `sealedTipSeq`) so a buggy server can't make
@@ -711,7 +711,7 @@ tree compiles between steps.
   keeps using `PlannedThroughSeq`; with the default `MaxEntries=100000` nothing truncates, so
   `PlannedThroughSeq == SealedTipSeq` and the oracle/engine stay correct until step 10 adds the
   pagination loop. Tree compiles and all tests pass throughout.
-- **Tests.** manifest: `TestPlanBackfill_TruncatesAtUnitBoundary` (block-range pagination, union
+- **Tests.** manifest: `TestPlanSnapshot_TruncatesAtUnitBoundary` (block-range pagination, union
   covers all, no skip/dup), `…_MidSegmentCutCursorIsBlockMaxSeq` (cursor strictly inside the
   segment; full page-walk delivers every matching block once and strictly advances),
   `…_OneUnitOverCapStillAdvances`, `…_TruncatesAtSegmentBoundary`, plus `SealedTipSeq` assertions
@@ -880,7 +880,7 @@ the pinned-`beforeSeq` range, and the 400-driven re-backfill (bounded, monotonic
 ✅ **Done** (#181).
 
 - **Engine (`internal/client/engine.go`).** Both archive paths now share
-  `sweepSealedArchive(ctx, dl, emit, backfillStopped, startCursor)`: it pages `planBackfill` from
+  `sweepSealedArchive(ctx, dl, emit, backfillStopped, startCursor)`: it pages `planSnapshot` from
   `startCursor`, **pins `beforeSeq = S`** (the page-1 `sealedTipSeq`) for every subsequent page,
   downloads + emits each page in seq order, advances `cursor = plannedThroughSeq`, and returns when
   `cursor >= S` (the unambiguous done predicate — works for a sparse filter that matched zero
@@ -985,7 +985,7 @@ returning zero units with the cursor unadvanced. Wire each to the killing test a
   tests: `TestEngineStatsReportsResidualGap` (internal), `TestStatsDelegatesToEngine` (root, incl.
   the nil/zero-Client contract).
 - **Hermetic Part-B harness (`internal/oracle/partb_harness_test.go`).** `pagedCutoverServer`
-  serves BOTH the archive XRPC (planBackfill/getSegment/getBlock at `/xrpc/`) and the live
+  serves BOTH the archive XRPC (planSnapshot/getSegment/getBlock at `/xrpc/`) and the live
   `/subscribe-v2` (RejectCursorBelowFloor=true) on ONE httptest socket, backed by one
   sealed-segment archive + manifest + store + writer + hot-ring Tail + ColdReader. Real sockets,
   NOT the synctest bubble (one bubble per process, owned by `TestOracle_DefaultLifecycle`).
@@ -1009,7 +1009,7 @@ returning zero units with the cursor unadvanced. Wire each to the killing test a
   zero-units-unadvanced livelock (`Entries+1 >= MaxEntries`), v2 below-floor silent clamp
   (`if false` on the RejectBelowFloor branch), and client treating the §14 400 as fatal
   (`false && …` so the cutover never reports tooOld). New **`partb` runner tier** runs `TestPartB*`
-  + the manifest `TestPlanBackfill*` unit tests (the planner mutants kill fast there rather than
+  + the manifest `TestPlanSnapshot*` unit tests (the planner mutants kill fast there rather than
   via a client-loop livelock timeout). Each new mutant verified KILLED@partb individually.
 - **Mutation campaign (full, baseline regenerated).** `b9543d9`: **27 mutants, 20 KILLED, 7
   SURVIVED, zero STALE/BUILD-BROKEN**; `baseline.json` regenerated + gate-verified
@@ -1037,7 +1037,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
 - `docs/README.md`: rewrite §3.3 to drop the `getTombstones` overlay subsection (`:352-394`)
   while keeping the compaction narrative — the in-memory tombstone set is now
   compaction-internal with no read-time exposure. Rewrite the "putting it all together" client
-  flow (`:406-417`) to the loop model: `planBackfill (page 1: learn S)
+  flow (`:406-417`) to the loop model: `planSnapshot (page 1: learn S)
   → page until plannedThroughSeq ≥ sealedTipSeq → connect /subscribe at S`. No overlay download,
   no record suppression, no DID-tombstone snapshot; DID-level markers are delivered inline
   because the segment index tags marker blocks with reserved sentinel collections that the
@@ -1055,7 +1055,7 @@ bounded incompleteness; the paginated loop; 1-based seqs; overlay removed.
   resumability via `Batch.LastCursor()`.
 - Correct the stale `specs/notes/2026-05-27-cursor-replay-design.md:94-95` "v2 seq cursors have
   no window cap" claim (v2 now rejects too-old with a 400; v1 still clamps).
-- Lexicon docs / generated index: ensure `getTombstones` is gone; `planBackfill` description
+- Lexicon docs / generated index: ensure `getTombstones` is gone; `planSnapshot` description
   updated (it now paginates and returns `sealedTipSeq`; there is no `didTombstones` field —
   DID-level markers are covered by the §R4-revised sentinel index, not a plan response field).
 
@@ -1072,9 +1072,9 @@ collection-filtered DID-marker gap in the archive; rewrote the planner section f
 `#account`/`#identity`/`#sync` are delivered unconditionally on v1 AND v2 (dropped the
 fold-before-filter / client-hides-`#account` narrative); §5 documents the v2 too-old → HTTP 400
 (v1 still silently clamps). `specs/oracle.md`: client tier folds-to-converge over paginated
-`planBackfill` (no `getTombstones`/overlay/`(W,M]` snapshot), restart tier uses fold-convergence,
+`planSnapshot` (no `getTombstones`/overlay/`(W,M]` snapshot), restart tier uses fold-convergence,
 `m025` noted retired (#178, #183 tracks the replacement). `specs/notes/2026-05-27-cursor-replay-
-design.md:94-95` corrected (v2 live subscribe rejects below-floor with a 400). `planBackfill.json`
+design.md:94-95` corrected (v2 live subscribe rejects below-floor with a 400). `planSnapshot.json`
 description updated (pagination + inline markers, no tombstone fetch) + `just lexgen` regenerated
 bindings; `go build ./...` clean. `README.md` and root `doc.go` were already correct (verified).
 All `getTombstones`/overlay/0-based/point-in-time/v2-silent-clamp grep hits outside the dated
@@ -1126,7 +1126,7 @@ reasoning-trail notes are gone.
 - [x] 3. DID-marker sentinel collections close the §R3 gap inline (#175; replaced the reverted start-snapshot)
 - [x] 4. remove getTombstones overlay endpoint (#177)
 - [x] 5. prune overlay-only tombstone API (#178)
-- [x] 8. paginate planBackfill (+ sealedTipSeq, per-unit truncation) (#179)
+- [x] 8. paginate planSnapshot (+ sealedTipSeq, per-unit truncation) (#179)
 - [x] 9. /subscribe-v2 too-old cursor → HTTP 400 (v1 unchanged) (#180; oracle known-red until step 10)
 - [x] 10. client pagination loop + delete cutover buffer + 400 re-backfill (#181; oracle green again)
 - [x] 11. Part B oracle scenarios + mutants (#182)

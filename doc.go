@@ -30,7 +30,7 @@
 //
 // A bare Subscribe(host) with no backfill options is a pure live tail from the
 // current tip. Supplying WithAfterSeq or WithBeforeSeq triggers the full
-// archive-negotiation path: the client pages planBackfill over the sealed
+// archive-negotiation path: the client pages planSnapshot over the sealed
 // archive (downloading every matching sealed segment), then connects /subscribe
 // once at the sealed tip to pick up the active segment and the live tail. There
 // is no client-side buffer and no record suppression.

@@ -29,7 +29,7 @@ import (
 
 // partb_harness_test.go builds the hermetic, real-socket fixture the §16 Part-B
 // oracle scenarios drive: a single httptest server that serves BOTH the
-// paginated archive XRPC (planBackfill/getSegment/getBlock, mounted at /xrpc/)
+// paginated archive XRPC (planSnapshot/getSegment/getBlock, mounted at /xrpc/)
 // and the live v2 websocket (with the v2 reject-below-floor
 // too-old policy), backed by one sealed-segment archive + manifest + writer +
 // writer-readable-log Tail. It deliberately avoids the synctest bubble — the oracle package
@@ -62,7 +62,7 @@ type pagedCutoverServer struct {
 	mu        sync.Mutex
 	planCalls atomic.Int64
 
-	// onPlanServed, when set, is invoked AFTER each planBackfill response is
+	// onPlanServed, when set, is invoked AFTER each planSnapshot response is
 	// written, with the running call count. It lets a test seal a segment at a
 	// deterministic point in the pagination loop (e.g. after page 1 pins S) so a
 	// mid-download seal is reproducible rather than timing-dependent.
@@ -178,11 +178,11 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 	})
 
 	mux := http.NewServeMux()
-	// Count planBackfill calls and fire onPlanServed after each, so a test can
+	// Count planSnapshot calls and fire onPlanServed after each, so a test can
 	// seal a segment at a deterministic point in the pagination loop.
 	archive := xs.Handler()
 	mux.Handle("/xrpc/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		isPlan := strings.HasSuffix(r.URL.Path, "network.bsky.jetstream.planBackfill")
+		isPlan := strings.HasSuffix(r.URL.Path, "network.bsky.jetstream.planSnapshot")
 		archive.ServeHTTP(w, r)
 		if isPlan {
 			n := s.planCalls.Add(1)

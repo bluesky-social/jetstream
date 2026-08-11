@@ -57,22 +57,22 @@ func (c PlanConfig) validate() error {
 	return nil
 }
 
-func newPlanBackfillHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handler {
+func newPlanSnapshotHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handler {
 	cfg = cfg.withDefaults()
 	// Validate once at construction rather than per request. runtime.Build
 	// already validates these limits at startup, so a non-nil cfgErr only
 	// arises from direct construction with a bad config; it is a server fault,
 	// surfaced as InternalError below.
 	cfgErr := cfg.validate()
-	return xrpcserver.Procedure(func(ctx context.Context, _ xrpcserver.Params, input *jetstream.JetstreamPlanBackfill_Input) (*jetstream.JetstreamPlanBackfill_Output, error) {
+	return xrpcserver.Procedure(func(ctx context.Context, _ xrpcserver.Params, input *jetstream.JetstreamPlanSnapshot_Input) (*jetstream.JetstreamPlanSnapshot_Output, error) {
 		if cfgErr != nil {
-			return nil, xrpcserver.InternalError("planBackfill is misconfigured")
+			return nil, xrpcserver.InternalError("planSnapshot is misconfigured")
 		}
 		req, err := planRequestFromInput(input, cfg)
 		if err != nil {
 			return nil, err
 		}
-		plan, err := src.PlanBackfill(req)
+		plan, err := src.PlanSnapshot(req)
 		if err != nil {
 			if errors.Is(err, manifest.ErrInvalidPlanRequest) {
 				// Defense in depth: planRequestFromInput already rejects the
@@ -82,7 +82,7 @@ func newPlanBackfillHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handle
 				// reachable.
 				return nil, xrpcserver.InvalidRequest("invalid plan request")
 			}
-			return nil, xrpcserver.InternalError("failed to plan backfill")
+			return nil, xrpcserver.InternalError("failed to plan snapshot")
 		}
 		out, err := planOutput(plan)
 		if err != nil {
@@ -92,20 +92,20 @@ func newPlanBackfillHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handle
 	})
 }
 
-func planRequestFromInput(input *jetstream.JetstreamPlanBackfill_Input, cfg PlanConfig) (manifest.PlanBackfillRequest, error) {
+func planRequestFromInput(input *jetstream.JetstreamPlanSnapshot_Input, cfg PlanConfig) (manifest.PlanSnapshotRequest, error) {
 	if input == nil {
-		input = &jetstream.JetstreamPlanBackfill_Input{}
+		input = &jetstream.JetstreamPlanSnapshot_Input{}
 	}
 	dids, err := validatePlanDIDs(input.Dids, cfg.MaxDIDs)
 	if err != nil {
-		return manifest.PlanBackfillRequest{}, err
+		return manifest.PlanSnapshotRequest{}, err
 	}
 	collections, collectionPrefixes, err := validatePlanCollections(input.Collections, cfg.MaxCollections)
 	if err != nil {
-		return manifest.PlanBackfillRequest{}, err
+		return manifest.PlanSnapshotRequest{}, err
 	}
 
-	req := manifest.PlanBackfillRequest{
+	req := manifest.PlanSnapshotRequest{
 		DIDs:                  dids,
 		Collections:           collections,
 		CollectionPrefixes:    collectionPrefixes,
@@ -115,7 +115,7 @@ func planRequestFromInput(input *jetstream.JetstreamPlanBackfill_Input, cfg Plan
 	if input.AfterSeq.HasVal() {
 		seq := input.AfterSeq.Val()
 		if seq < 0 {
-			return manifest.PlanBackfillRequest{}, xrpcserver.InvalidRequest("afterSeq must be >= 0")
+			return manifest.PlanSnapshotRequest{}, xrpcserver.InvalidRequest("afterSeq must be >= 0")
 		}
 		req.AfterSeq = uint64(seq)
 		req.HasAfterSeq = true
@@ -123,13 +123,13 @@ func planRequestFromInput(input *jetstream.JetstreamPlanBackfill_Input, cfg Plan
 	if input.BeforeSeq.HasVal() {
 		seq := input.BeforeSeq.Val()
 		if seq < 0 {
-			return manifest.PlanBackfillRequest{}, xrpcserver.InvalidRequest("beforeSeq must be >= 0")
+			return manifest.PlanSnapshotRequest{}, xrpcserver.InvalidRequest("beforeSeq must be >= 0")
 		}
 		req.BeforeSeq = uint64(seq)
 		req.HasBeforeSeq = true
 	}
 	if req.HasAfterSeq && req.HasBeforeSeq && req.BeforeSeq <= req.AfterSeq {
-		return manifest.PlanBackfillRequest{}, xrpcserver.InvalidRequest("beforeSeq must be greater than afterSeq")
+		return manifest.PlanSnapshotRequest{}, xrpcserver.InvalidRequest("beforeSeq must be greater than afterSeq")
 	}
 	return req, nil
 }
@@ -166,7 +166,7 @@ func validatePlanDIDs(raw []string, maxDIDs int) ([]string, error) {
 	return out, nil
 }
 
-// wildcardSuffix is the only glob shape planBackfill accepts: a trailing ".*"
+// wildcardSuffix is the only glob shape planSnapshot accepts: a trailing ".*"
 // on a namespace prefix (e.g. "app.bsky.feed.*"). This mirrors the one shape
 // /subscribe allows.
 const wildcardSuffix = ".*"
@@ -181,7 +181,7 @@ const wildcardSuffix = ".*"
 // "app.bsky.feed."), matched elsewhere with strings.HasPrefix.
 //
 // Validation here is intentionally stricter than /subscribe (which is
-// deliberately v1-lax and skips head validation): planBackfill is a new
+// deliberately v1-lax and skips head validation): planSnapshot is a new
 // endpoint with no v1 wire contract.
 func classifyCollectionPattern(raw string) (exact string, prefix string, err error) {
 	if head, ok := strings.CutSuffix(raw, wildcardSuffix); ok {
@@ -244,7 +244,7 @@ func validatePlanCollections(raw []string, maxCollections int) (exact []string, 
 	return exact, prefixes, nil
 }
 
-func planOutput(plan manifest.PlanBackfillResult) (*jetstream.JetstreamPlanBackfill_Output, error) {
+func planOutput(plan manifest.PlanSnapshotResult) (*jetstream.JetstreamPlanSnapshot_Output, error) {
 	plannedThrough, err := int64FromUint64(plan.PlannedThroughSeq)
 	if err != nil {
 		return nil, err
@@ -253,11 +253,11 @@ func planOutput(plan manifest.PlanBackfillResult) (*jetstream.JetstreamPlanBackf
 	if err != nil {
 		return nil, err
 	}
-	out := &jetstream.JetstreamPlanBackfill_Output{
+	out := &jetstream.JetstreamPlanSnapshot_Output{
 		PlannedThroughSeq: plannedThrough,
 		SealedTipSeq:      sealedTip,
-		Segments:          make([]jetstream.JetstreamPlanBackfill_Segment, 0, len(plan.Segments)),
-		Stats: jetstream.JetstreamPlanBackfill_Stats{
+		Segments:          make([]jetstream.JetstreamPlanSnapshot_Segment, 0, len(plan.Segments)),
+		Stats: jetstream.JetstreamPlanSnapshot_Stats{
 			SegmentsExamined: int64(plan.Stats.SegmentsExamined),
 			SegmentsMatched:  int64(plan.Stats.SegmentsMatched),
 			BlocksMatched:    int64(plan.Stats.BlocksMatched),
@@ -277,7 +277,7 @@ func planOutput(plan manifest.PlanBackfillResult) (*jetstream.JetstreamPlanBackf
 		if err != nil {
 			return nil, err
 		}
-		row := jetstream.JetstreamPlanBackfill_Segment{
+		row := jetstream.JetstreamPlanSnapshot_Segment{
 			Name:     ingest.SegmentFilename(seg.Idx),
 			Index:    index,
 			Checksum: checksumHex(seg.Checksum),
@@ -286,13 +286,13 @@ func planOutput(plan manifest.PlanBackfillResult) (*jetstream.JetstreamPlanBackf
 			Mode:     string(seg.Mode),
 		}
 		if seg.Mode == manifest.PlanModeBlocks {
-			row.Blocks = make([]jetstream.JetstreamPlanBackfill_BlockRange, 0, len(seg.Blocks))
+			row.Blocks = make([]jetstream.JetstreamPlanSnapshot_BlockRange, 0, len(seg.Blocks))
 			for _, block := range seg.Blocks {
 				// First/Last are small non-negative block indices (bounded by a
 				// segment's block_count), so the int->int64 widening is always
 				// lossless and needs no overflow guard, unlike the uint64 seq
 				// fields routed through int64FromUint64.
-				row.Blocks = append(row.Blocks, jetstream.JetstreamPlanBackfill_BlockRange{
+				row.Blocks = append(row.Blocks, jetstream.JetstreamPlanSnapshot_BlockRange{
 					First: int64(block.First),
 					Last:  int64(block.Last),
 				})

@@ -132,15 +132,15 @@ seq order* using fewer bytes.
   sub-block serving. The client decompresses and filters *after* download
   (`internal/client/downloader.go:490`), so any block with ≥1 matching event is
   fetched and decompressed in full.
-- The planner (`internal/manifest/plan.go`, `PlanBackfill`) prunes at block
+- The planner (`internal/manifest/plan.go`, `PlanSnapshot`) prunes at block
   granularity using per-block DID blooms + a per-block collection index. It has
   a one-sided contract: no false negatives, possible false positives. It is
   already effective at dropping *zero-match* blocks (only ~1% of fetched blocks
   had zero matches in the DID case). It cannot help when nearly every block has
   exactly one match — that is the intrinsic scatter.
-- `PlanBackfill` upgrades a segment to **whole-segment mode** when selected
+- `PlanSnapshot` upgrades a segment to **whole-segment mode** when selected
   blocks / total blocks ≥ `WholeSegmentThreshold` (default **0.75**,
-  `internal/xrpcapi/planbackfill.go:21`). See finding #1 — this metric is wrong
+  `internal/xrpcapi/plansnapshot.go:21`). See finding #1 — this metric is wrong
   for scattered collections.
 
 ## Measurements (live archive `http://cpu2-pop3:8080`, 2026-06-30)
@@ -149,7 +149,7 @@ Archive totals: **6,355 segments, 22,285,032,455 events, 1,727,752,463,791 bytes
 (1.73 TB)**, ~3.5M events / ~272 MB per segment, ~4096 events/block.
 
 Method: throwaway tool (`cmd/bwanalysis`, since removed) ran the real
-`planBackfill` over HTTP, fetched planned block frames via `getBlock`, decoded
+`planSnapshot` over HTTP, fetched planned block frames via `getBlock`, decoded
 them with the real `segment.DecodeBlockFrame`, and counted matching-vs-total
 events. "Repack floor" = matched events re-encoded into their own block(s) and
 compressed with the real codec, i.e. the achievable transport size if the data

@@ -11,7 +11,7 @@ import (
 
 // TestSentinelCollectionsAreInvalidNSIDs locks the collision-proof
 // guarantee the whole DID-marker-sentinel scheme rests on: a sentinel
-// collection name must never be a parseable NSID. planBackfill validates
+// collection name must never be a parseable NSID. planSnapshot validates
 // every requested collection (exact) and every wildcard authority through
 // atmos.ParseNSID, so if a sentinel cannot parse as an NSID, no client
 // request can name it or prefix-match it, and the sentinel can never

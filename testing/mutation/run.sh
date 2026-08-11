@@ -323,12 +323,12 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     # plan or ages a cursor below the floor). Two layers run in one
                     # `go test`: the oracle's hermetic §16 end-to-end scenarios
                     # (TestPartB*) and the manifest planner's per-page truncation
-                    # unit tests (TestPlanBackfill*), which kill the planner
+                    # unit tests (TestPlanSnapshot*), which kill the planner
                     # mutants fast and directly without waiting on a client-loop
                     # livelock timeout. Fast (~1s).
                     cmd=(go test "${RACE_FLAG[@]}"
                          ./internal/oracle ./internal/manifest
-                         -run 'TestPartB|TestPlanBackfill'
+                         -run 'TestPartB|TestPlanSnapshot'
                          -count=1 -short -timeout "$default_timeout") ;;
                 tombstone)
                     # Tombstone tier (#184): kills live compaction-suppression

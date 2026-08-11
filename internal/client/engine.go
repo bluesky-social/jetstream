@@ -48,7 +48,7 @@ type Config struct {
 	// library default (8). 1 = one resumable stream (see segmentfetch.go for
 	// when that is preferable).
 	SegmentStripes int
-	// XRPC drives the short XRPC negotiation calls (planBackfill).
+	// XRPC drives the short XRPC negotiation calls (planSnapshot).
 	// BulkXRPC drives the large getSegment/getBlock downloads;
 	// it gets bulk-transfer HTTP tuning (no short wall-clock timeout). When
 	// BulkXRPC is nil the engine reuses XRPC. See design note §5.1.
@@ -109,7 +109,7 @@ func (c Config) bulkClient() *xrpc.Client {
 	return c.XRPC
 }
 
-// Engine orchestrates the whole stream: backfill plan + download, the
+// Engine orchestrates the whole stream: snapshot plan + download, the
 // backfill-to-live cutover, and the steady-state live tail. It emits batches
 // through Run.
 type Engine struct {
@@ -136,7 +136,7 @@ type Engine struct {
 // has no Prometheus registry, so this accessor is how a caller observes the
 // residual gap a sustained-ingest backfill is closing.
 type Stats struct {
-	// Pages is the number of planBackfill pages downloaded across all sweeps
+	// Pages is the number of planSnapshot pages downloaded across all sweeps
 	// (including re-backfill cycles). Monotonically non-decreasing.
 	Pages uint64
 	// SealedTip is the most recently learned sealed-archive tip S (the pinned
@@ -445,7 +445,7 @@ func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (
 		}
 }
 
-// sweepSealedArchive pages planBackfill from startCursor, downloading and
+// sweepSealedArchive pages planSnapshot from startCursor, downloading and
 // emitting every matching row in seq order until the whole sealed archive has
 // been consumed (design §11/§12). It returns the pinned sealed tip S (the
 // cutover cursor), whether the consumer asked to stop mid-sweep, and a terminal
@@ -516,13 +516,13 @@ func (e *Engine) sweepSealedArchive(ctx context.Context, dl *Downloader, emit fu
 		// identical request forever. Fail fatally instead of spinning — the §14
 		// re-backfill loop guards the same way (maxRebackfillStalls).
 		if cursor <= prevCursor {
-			return sealedTip, false, fmt.Errorf("jetstream: planBackfill made no progress: afterSeq=%d plannedThroughSeq=%d sealedTipSeq=%d", prevCursor, cursor, sealedTip)
+			return sealedTip, false, fmt.Errorf("jetstream: planSnapshot made no progress: afterSeq=%d plannedThroughSeq=%d sealedTipSeq=%d", prevCursor, cursor, sealedTip)
 		}
 	}
 }
 
 // runBackfillOnly executes a one-time dump of the sealed archive: page
-// planBackfill until the sealed tip is reached, downloading + emitting the
+// planSnapshot until the sealed tip is reached, downloading + emitting the
 // matched range, then return. No websocket is ever dialed.
 //
 // Records in the active (unsealed) segment, seq in (sealedTip, M], are only
@@ -553,7 +553,7 @@ func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bo
 // runBackfillThenLive executes the paginated archive download and the bufferless
 // cutover to live (design §11/§13/§14):
 //
-//  1. page planBackfill (pinning beforeSeq = S, the page-1 sealed tip) and
+//  1. page planSnapshot (pinning beforeSeq = S, the page-1 sealed tip) and
 //     download + emit the whole sealed range (startCursor, S] in seq order;
 //  2. connect /subscribe ONCE at cursor = S — no rewind margin, no client buffer.
 //     The consumer dedups its own at-least-once overlap by seq; segments sealed

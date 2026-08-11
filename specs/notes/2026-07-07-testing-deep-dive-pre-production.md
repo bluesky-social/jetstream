@@ -285,7 +285,7 @@ Concrete relations, each a new checker over existing observer streams
    fold(S) == fold(compact(S)).
 4. **Restart no-op**: restarting a converged idle server changes no durable
    output (event log, XRPC plan, segment bytes modulo active tail).
-5. **Plan stability**: planBackfill twice with no ingest in between returns
+5. **Plan stability**: planSnapshot twice with no ingest in between returns
    equal plans.
 
 CockroachDB runs exactly this shape as a first-class suite for Pebble;
@@ -299,8 +299,8 @@ The 22 targets are well-aimed, but four untrusted-input parse paths have none
 1. **`api/jetstream` generated decoders — the highest-risk zero-coverage spot
    in the repo.** ~130KB of hand-rolled `UnmarshalJSONAt`/`UnmarshalCBORAt`
    parser code with zero tests of any kind, parsing untrusted input on both
-   sides: planBackfill POST bodies server-side (`internal/xrpcapi/
-   planbackfill.go:67`) and archive-server responses client-side
+   sides: planSnapshot POST bodies server-side (`internal/xrpcapi/
+   plansnapshot.go:67`) and archive-server responses client-side
    (`internal/client/planner.go:163`). A table-driven fuzz over each
    Unmarshal entry point covers regenerated code automatically. (Worth asking
    whether lexgen should also emit fuzz targets — fix upstream in atmos's

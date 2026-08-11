@@ -7,7 +7,7 @@ import (
 )
 
 // Matcher applies the caller's exact DID/collection/seq filters to decoded
-// segment rows. The backfill planner is a one-sided transport hint (no false
+// segment rows. The snapshot planner is a one-sided transport hint (no false
 // negatives, possible false positives via DID blooms and per-block collection
 // summaries), so the client MUST re-apply exact filtering after decode.
 //
@@ -117,7 +117,7 @@ func (m *Matcher) Keep(ev *segment.Event) (bool, string) {
 }
 
 // setAfterSeq raises the matcher's exclusive lower bound to afterSeq. It is used
-// on a §14 re-backfill: the sweep re-runs planBackfill from the last
+// on a §14 re-backfill: the sweep re-runs planSnapshot from the last
 // durably-processed seq (the live tail's highest delivered seq), and the matcher
 // must track that resume point so the one work unit that STRADDLES it (admitted
 // whole under the planner's one-sided contract) has its already-delivered rows

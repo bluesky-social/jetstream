@@ -47,7 +47,7 @@ func writeSealedSegment(t *testing.T, segDir string, idx uint64, events ...segme
 	require.NoError(t, err)
 }
 
-// serveArchive stands up the real read-side archive XRPC server (planBackfill +
+// serveArchive stands up the real read-side archive XRPC server (planSnapshot +
 // getSegment + getBlock) over a pre-built segments dir, on a real httptest
 // socket. It deliberately does NOT use a synctest bubble: the oracle package
 // allows exactly one bubble per process (owned by TestOracle_DefaultLifecycle),
