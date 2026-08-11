@@ -26,7 +26,7 @@ func TestCompressFrame_PooledOutputMatchesReferenceEncoder(t *testing.T) {
 	defer func() { _ = ref.Close() }()
 
 	refV2, err := zstd.NewWriter(nil,
-		zstd.WithEncoderDict(zstdDictionaryV2),
+		zstd.WithEncoderDict(subscribeEventsDictionary),
 		zstd.WithWindowSize(1<<17),
 		zstd.WithEncoderConcurrency(1),
 		zstd.WithEncoderLevel(zstd.SpeedFastest))

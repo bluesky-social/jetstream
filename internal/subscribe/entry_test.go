@@ -177,7 +177,7 @@ func TestEntry_CompressedV2_SyncEmitsDecodableFrame(t *testing.T) {
 	_, err = v1Dec.DecodeAll(v2Body, nil)
 	require.Error(t, err, "v2 frames must NOT decode with the legacy v1 dictionary")
 
-	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionaryV2))
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(subscribeEventsDictionary))
 	require.NoError(t, err)
 	defer dec.Close()
 	decoded, err := dec.DecodeAll(v2Body, nil)

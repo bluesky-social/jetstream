@@ -86,7 +86,7 @@ func TestCompressFrameV2_RoundTripsWithV2Dictionary(t *testing.T) {
 	require.NotEmpty(t, frame)
 	require.NotEqual(t, orig, frame)
 
-	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(zstdDictionaryV2))
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(subscribeEventsDictionary))
 	require.NoError(t, err)
 	defer dec.Close()
 	got, err := dec.DecodeAll(frame, nil)
@@ -112,7 +112,7 @@ func TestCompressFrameV2_RoundTripsWithV2Dictionary(t *testing.T) {
 // dictionary header.
 func TestZstdDictionaryV2_EmbedAndID(t *testing.T) {
 	t.Parallel()
-	require.Greater(t, len(zstdDictionaryV2), 10_000,
+	require.Greater(t, len(subscribeEventsDictionary), 10_000,
 		"the v2 dictionary should be tens of KB; a tiny value means the embed broke")
 	require.NotZero(t, DictionaryV2ID)
 	require.NotEqual(t, uint32(1612007021), DictionaryV2ID,
