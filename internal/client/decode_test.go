@@ -51,7 +51,6 @@ func TestDecodeRecordMapMatchesJSONRoundTrip(t *testing.T) {
 			"$type":  "x.test",
 			"int":    int64(42),
 			"negint": int64(-7),
-			"float":  3.5,
 			"bool":   true,
 			"nil":    nil,
 			"str":    "héllo \"world\"\n\t/slash",

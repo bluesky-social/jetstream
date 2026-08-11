@@ -2,7 +2,6 @@ package jetstream
 
 import (
 	"context"
-	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -14,7 +13,6 @@ import (
 
 	iclient "github.com/bluesky-social/jetstream/internal/client"
 	"github.com/coder/websocket"
-	"github.com/jcalabro/atmos/cbor"
 	"github.com/stretchr/testify/require"
 )
 
@@ -496,14 +494,12 @@ func TestCloseStopsRunningEventsWithoutCtxCancel(t *testing.T) {
 	}
 }
 
-// liveCommitFrameJSON builds an xrpc.v1.json #commit message frame with a
-// minimal CBOR record, matching the network.bsky.jetstream.subscribeEvents wire.
+// liveCommitFrameJSON builds an xrpc.v1.json #commit message frame matching
+// the network.bsky.jetstream.subscribeEvents wire.
 func liveCommitFrameJSON(seq uint64, did, coll, rkey string) string {
-	rec, _ := cbor.Marshal(map[string]any{"$type": coll, "text": "hi " + rkey})
-	b64 := base64.RawStdEncoding.EncodeToString(rec)
 	s := strconv.FormatUint(seq, 10)
 	return `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit"` +
 		`,"seq":` + s + `,"did":"` + did + `","time":"1970-01-01T00:00:00.000001Z"` +
 		`,"rev":"r","operation":"create","collection":"` + coll +
-		`","rkey":"` + rkey + `","cid":"bafytest","recordCbor":{"$bytes":"` + b64 + `"}}}`
+		`","rkey":"` + rkey + `","cid":"bafytest","record":{"$type":"` + coll + `","text":"hi ` + rkey + `"}}}`
 }

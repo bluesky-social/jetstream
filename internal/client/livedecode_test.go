@@ -1,7 +1,6 @@
 package client
 
 import (
-	"encoding/base64"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,10 +22,7 @@ func liveCommitFrame(t *testing.T, seq uint64, did, op, coll, rkey string, withR
 		`,"seq":` + s + `,"did":"` + did + `","time":"` + testWireTime + `"` +
 		`,"rev":"r","operation":"` + op + `","collection":"` + coll + `","rkey":"` + rkey + `"`
 	if withRecord {
-		rec := map[string]any{"$type": coll, "text": "hi"}
-		payload, err := cbor.Marshal(rec)
-		require.NoError(t, err)
-		frame += `,"cid":"bafytest","recordCbor":{"$bytes":"` + base64.RawStdEncoding.EncodeToString(payload) + `"}`
+		frame += `,"cid":"bafytest","record":{"$type":"` + coll + `","text":"hi"}`
 	}
 	frame += `}}`
 	return []byte(frame)
@@ -77,12 +73,44 @@ func TestDecodeLiveFrameDelete(t *testing.T) {
 	require.Nil(t, ev.Commit.RecordCBOR)
 }
 
-func TestDecodeLiveFrameCreateMissingCBOR(t *testing.T) {
+func TestDecodeLiveFrameCreateMissingRecord(t *testing.T) {
 	t.Parallel()
-	// A create without recordCbor must error: the field is the typed-decode
-	// contract of this stream.
 	_, _, err := decodeLiveFrame(liveCommitFrame(t, 1, "did:plc:a", "create", "app.bsky.feed.post", "r", false), recordDecodeMode{})
-	require.ErrorContains(t, err, "recordCbor")
+	require.ErrorContains(t, err, "missing record")
+}
+
+func TestDecodeLiveFrameCanonicalizesRecordJSON(t *testing.T) {
+	t.Parallel()
+	const link = "bafyreidykglsf47zgclpbxyaqaextkc4pw4hoyqx7kod6orhhixr5q5j2i"
+	frame := []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":1,"did":"did:plc:a","time":"` + testWireTime + `","rev":"r","operation":"create","collection":"app.bsky.feed.post","rkey":"r","record":{"z":{"$bytes":"AQI="},"max":9223372036854775807,"a":{"$link":"` + link + `"},"min":-9223372036854775808,"items":[0,true,null]}}}`)
+	ev, _, err := decodeLiveFrame(frame, recordDecodeMode{raw: true})
+	require.NoError(t, err)
+	require.Nil(t, ev.Commit.Record, "raw mode must still skip retaining the generic map")
+	require.NotEmpty(t, ev.Commit.RecordCBOR)
+
+	cid, err := cbor.ParseCIDString(link)
+	require.NoError(t, err)
+	expected, err := cbor.Marshal(map[string]any{
+		"a": cid, "items": []any{int64(0), true, nil},
+		"max": int64(9223372036854775807), "min": int64(-9223372036854775808),
+		"z": []byte{1, 2},
+	})
+	require.NoError(t, err)
+	require.Equal(t, expected, ev.Commit.RecordCBOR)
+}
+
+func TestDecodeLiveRecordRejectsInvalidAtprotoJSON(t *testing.T) {
+	t.Parallel()
+	for _, input := range []string{
+		`{"n":1.5}`,
+		`{"n":9223372036854775808}`,
+		`{"n":-9223372036854775809}`,
+		`{"n":1,"n":2}`,
+		`{} {}`,
+	} {
+		_, _, err := decodeLiveRecord([]byte(input))
+		require.Error(t, err, input)
+	}
 }
 
 func TestDecodeLiveFrameAccountIdentitySync(t *testing.T) {

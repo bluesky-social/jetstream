@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/jcalabro/atmos/cbor"
 )
 
 // errSkipFrame signals a frame that is valid but carries no caller-visible
@@ -264,19 +266,20 @@ func liveCommitToEvent(c *jetstream.JetstreamSubscribeEvents_Commit, mode record
 	}
 	switch commit.Operation {
 	case OpCreate, OpUpdate:
-		if len(c.RecordCbor) == 0 {
-			return Event{}, nil, fmt.Errorf("jetstream: live %s commit missing recordCbor (collection=%s rkey=%s); is the server a network.bsky.jetstream.subscribeEvents endpoint?", c.Operation, c.Collection, c.Rkey)
+		if len(c.Record) == 0 {
+			return Event{}, nil, fmt.Errorf("jetstream: live %s commit missing record (collection=%s rkey=%s)", c.Operation, c.Collection, c.Rkey)
 		}
-		// The generated decode already unwrapped {"$bytes": ...} into a
-		// fresh owned buffer, so it is safe to retain regardless of mode.
-		// In raw mode we skip the map build and leave Record nil; the
-		// consumer decodes RecordCBOR into a typed struct.
-		commit.RecordCBOR = c.RecordCbor
+		// The live wire carries the atproto JSON representation only. DRISL
+		// defines its canonical DAG-CBOR encoding, so reconstruct the bytes once
+		// here for the unified Event API and TypedEvents. This is deliberately not
+		// a backfill optimization: archive workers still consume segment CBOR
+		// directly without a JSON round trip.
+		recordCBOR, record, err := decodeLiveRecord(c.Record)
+		if err != nil {
+			return Event{}, nil, fmt.Errorf("jetstream: decode live record (collection=%s rkey=%s): %w", c.Collection, c.Rkey, err)
+		}
+		commit.RecordCBOR = recordCBOR
 		if !mode.raw {
-			record, err := decodeRecordMap(c.RecordCbor)
-			if err != nil {
-				return Event{}, nil, fmt.Errorf("jetstream: decode live record (collection=%s rkey=%s): %w", c.Collection, c.Rkey, err)
-			}
 			commit.Record = record
 		}
 	case OpDelete:
@@ -285,6 +288,28 @@ func liveCommitToEvent(c *jetstream.JetstreamSubscribeEvents_Commit, mode record
 		return Event{}, nil, fmt.Errorf("jetstream: unknown live commit operation %q", c.Operation)
 	}
 	return Event{DID: c.DID, Seq: seq, TimeUS: timeUS, Kind: KindCommit, Commit: commit}, nil, nil
+}
+
+// decodeLiveRecord validates an atproto JSON record and produces both client
+// representations. DRISL makes the DAG-CBOR encoding deterministic, so callers
+// can verify the declared CID from these bytes without a duplicate byte string
+// on the wire.
+func decodeLiveRecord(data []byte) ([]byte, map[string]any, error) {
+	val, err := cbor.FromJSON(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("atproto JSON: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := cbor.NewEncoder(&buf).WriteValue(val); err != nil {
+		return nil, nil, fmt.Errorf("canonical DAG-CBOR: %w", err)
+	}
+	recordCBOR := buf.Bytes()
+	record, err := decodeRecordMap(recordCBOR)
+	if err != nil {
+		return nil, nil, err
+	}
+	return recordCBOR, record, nil
 }
 
 // orDID prefers the payload-level DID, falling back to the envelope DID.

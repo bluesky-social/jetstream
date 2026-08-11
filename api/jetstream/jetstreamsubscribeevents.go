@@ -324,12 +324,11 @@ type JetstreamSubscribeEvents_Commit struct {
 	Collection    string            `json:"collection"`   // Collection NSID of the record.
 	DID           string            `json:"did"`
 	Operation     string            `json:"operation"`
-	Record        json.RawMessage   `json:"record,omitempty"`     // The record decoded to JSON. Absent for deletes.
-	RecordCbor    []byte            `json:"recordCbor,omitempty"` // The record's raw DAG-CBOR, byte-exact as archived — suitable for CID verification, MST reconstr...
-	Rev           string            `json:"rev"`                  // The repo rev of the commit that produced this op.
-	Rkey          string            `json:"rkey"`                 // Record key.
-	Seq           int64             `json:"seq"`                  // Jetstream's monotonic per-event sequence number; the stream cursor.
-	Time          string            `json:"time"`                 // The event's display timestamp, microsecond precision: when Jetstream witnessed the event, unless ...
+	Record        json.RawMessage   `json:"record,omitempty"` // The record decoded to JSON. Absent for deletes.
+	Rev           string            `json:"rev"`              // The repo rev of the commit that produced this op.
+	Rkey          string            `json:"rkey"`             // Record key.
+	Seq           int64             `json:"seq"`              // Jetstream's monotonic per-event sequence number; the stream cursor.
+	Time          string            `json:"time"`             // The event's display timestamp, microsecond precision: when Jetstream witnessed the event, unless ...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -347,7 +346,6 @@ var (
 	cborKey_JetstreamSubscribeEvents_Commit_record      = cbor.AppendTextKey(nil, "record")
 	cborKey_JetstreamSubscribeEvents_Commit_operation   = cbor.AppendTextKey(nil, "operation")
 	cborKey_JetstreamSubscribeEvents_Commit_collection  = cbor.AppendTextKey(nil, "collection")
-	cborKey_JetstreamSubscribeEvents_Commit_recordCbor  = cbor.AppendTextKey(nil, "recordCbor")
 )
 
 func (s *JetstreamSubscribeEvents_Commit) MarshalCBOR() ([]byte, error) {
@@ -363,9 +361,6 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 		n++
 	}
 	if s.Record != nil {
-		n++
-	}
-	if s.RecordCbor != nil {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -407,11 +402,6 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "collection", buf)
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_collection...)
 		buf = cbor.AppendText(buf, s.Collection)
-		ei, buf = appendCBORExtrasBefore(s.extra, ei, "recordCbor", buf)
-		if s.RecordCbor != nil {
-			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_recordCbor...)
-			buf = cbor.AppendBytes(buf, s.RecordCbor)
-		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		if s.CID.HasVal() {
@@ -440,10 +430,6 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 		buf = cbor.AppendText(buf, s.Operation)
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_collection...)
 		buf = cbor.AppendText(buf, s.Collection)
-		if s.RecordCbor != nil {
-			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_recordCbor...)
-			buf = cbor.AppendBytes(buf, s.RecordCbor)
-		}
 	}
 	return buf, nil
 }
@@ -568,11 +554,6 @@ func (s *JetstreamSubscribeEvents_Commit) UnmarshalCBORAt(data []byte, pos int) 
 				if err != nil {
 					return 0, err
 				}
-			} else if string(data[keyStart:keyEnd]) == "recordCbor" {
-				s.RecordCbor, pos, err = cbor.ReadBytes(data, pos)
-				if err != nil {
-					return 0, err
-				}
 			} else {
 				valueStart := pos
 				pos, err = cbor.SkipValue(data, pos)
@@ -601,7 +582,6 @@ var (
 	jsonKey_JetstreamSubscribeEvents_Commit_did         = []byte("\"did\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_operation   = []byte("\"operation\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_record      = []byte("\"record\":")
-	jsonKey_JetstreamSubscribeEvents_Commit_recordCbor  = []byte("\"recordCbor\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_rev         = []byte("\"rev\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_rkey        = []byte("\"rkey\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_seq         = []byte("\"seq\":")
@@ -655,14 +635,6 @@ func (s *JetstreamSubscribeEvents_Commit) AppendJSON(buf []byte) ([]byte, error)
 		}
 		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_record...)
 		buf = append(buf, s.Record...)
-		first = false
-	}
-	if s.RecordCbor != nil {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_recordCbor...)
-		buf = cbor.AppendJSONBytes(buf, s.RecordCbor)
 		first = false
 	}
 	if !first {
@@ -771,11 +743,6 @@ func (s *JetstreamSubscribeEvents_Commit) UnmarshalJSONAt(data []byte, pos int) 
 					return 0, err
 				}
 				s.Record = json.RawMessage(data[start:pos])
-			}
-		case "recordCbor":
-			s.RecordCbor, pos, err = cbor.ReadJSONBytesObject(data, pos)
-			if err != nil {
-				return 0, err
 			}
 		case "rev":
 			s.Rev, pos, err = cbor.ReadJSONString(data, pos)

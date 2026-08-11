@@ -3,7 +3,6 @@ package subscribe
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -362,7 +361,7 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 	require.Equal(t, "network.bsky.jetstream.subscribeEvents#commit", gotCommit["$type"])
 }
 
-func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
+func TestHandler_V2DeliversReadableRecordAndSync(t *testing.T) {
 	t.Parallel()
 
 	st := newSteadyStateStore(t)
@@ -408,9 +407,8 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 	require.Equal(t, "network.bsky.jetstream.subscribeEvents#commit", commit["$type"])
 	require.Equal(t, float64(1), commit["seq"])
 	require.NotContains(t, commit, "upstream_relay_cursor")
-	recordCbor, ok := commit["recordCbor"].(map[string]any)
-	require.True(t, ok, "recordCbor not a $bytes object")
-	require.Equal(t, base64.RawStdEncoding.EncodeToString(payload), recordCbor["$bytes"])
+	require.Equal(t, map[string]any{}, commit["record"])
+	require.NotContains(t, commit, "recordCbor")
 
 	syncEvt := &comatproto.SyncSubscribeRepos_Sync{
 		DID: "did:plc:v2", Rev: "rev-sync", Seq: 222, Time: "2026-05-25T00:00:00Z",

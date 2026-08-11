@@ -261,13 +261,15 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// WithRawRecords makes commit decoding SKIP building the generic
+// WithRawRecords makes archive commit decoding SKIP building the generic
 // Commit.Record map[string]any. Instead, Commit.Record is left nil and
-// Commit.RecordCBOR is populated with the record's raw DAG-CBOR bytes, which the
-// caller decodes itself — typically into a typed struct via the generic
-// TypedEvents helper. Building the generic map dominates decode CPU and
-// allocations at scale (#142), so skipping it is the main lever for high-volume
-// backfills of a single record type (e.g. app.bsky.feed.like).
+// Commit.RecordCBOR is populated directly from the segment payload, which the
+// caller decodes itself — typically through TypedEvents. Building the generic
+// map dominates archive decode CPU and allocations at scale (#142), so skipping
+// it is the main lever for high-volume backfills of one record type. Live records
+// arrive as atproto JSON and are canonicalized to DAG-CBOR before delivery; the
+// live tail is low-volume relative to archive backfill, so it does not need the
+// same zero-copy optimization.
 //
 // Deletes (no record), identity/account/sync events, and the default Commit
 // fields (Operation/Collection/Rkey/Rev) are unaffected. Commit.CID is left

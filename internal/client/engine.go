@@ -65,11 +65,11 @@ type Config struct {
 	// the package default; tests set a tiny value to avoid real-time waits.
 	LiveBackoffMin time.Duration
 	Logger         *slog.Logger
-	// RawRecords, when true, makes commit decode SKIP building the generic
+	// RawRecords, when true, makes archive commit decode SKIP building the generic
 	// Record map[string]any (decodeRecordMap — the dominant decode allocation at
 	// scale). Commit.Record is left nil and Commit.RecordCBOR is populated so a
-	// caller can decode it into a typed struct itself. See the root WithRawRecords
-	// option and TypedEvents.
+	// caller can decode it into a typed struct itself. Live records arrive as JSON
+	// and are canonicalized to DAG-CBOR. See WithRawRecords and TypedEvents.
 	RawRecords bool
 	// RawRecordsCopied, alongside RawRecords, clones RecordCBOR (backfill path)
 	// instead of aliasing the internal buffer, so it is safe to retain past the

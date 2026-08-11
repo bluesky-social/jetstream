@@ -63,9 +63,8 @@ func compressFrame(src []byte) []byte {
 }
 
 // zstdDictionaryV2 is the v2 subscribe dictionary, trained on live
-// firehose traffic in the v2 wire shape (which the v1 dictionary predates:
-// it has never seen record_cbor, seq, or current lexicons and manages only
-// ~1.67x on v2 frames vs this dictionary's ~2.5x). Retrain with
+// firehose traffic in the v2 wire shape. Retrain it after material wire-shape
+// changes with
 // `just train-subscribe-dict`; the embedded dictionary ID (the trainer
 // defaults it to the training date, YYYYMMDD) versions the artifact, and
 // clients fetch the bytes by that ID via the getZstdDictionary XRPC
