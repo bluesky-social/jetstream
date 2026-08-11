@@ -41,8 +41,8 @@ type config struct {
 	rawRecords       bool
 	rawRecordsCopied bool
 	rawRecordCIDs    bool
-	// zstdCompression opts the live tail into the dict-zstd
-	// scheme (see WithZstdCompression).
+	// zstdCompression controls the live tail's default dict-zstd scheme
+	// (see WithZstdCompression).
 	zstdCompression bool
 }
 
@@ -81,8 +81,9 @@ func defaultDownloadConc() int {
 
 func defaultConfig() config {
 	return config{
-		batchSize:    defaultBatchSize,
-		downloadConc: defaultDownloadConc(),
+		batchSize:       defaultBatchSize,
+		downloadConc:    defaultDownloadConc(),
+		zstdCompression: true,
 	}
 }
 
@@ -309,19 +310,12 @@ func WithRawRecordCIDs() Option {
 	return func(c *config) { c.rawRecordCIDs = true }
 }
 
-// WithZstdCompression opts the live tail into the server's dict-zstd
-// compression scheme: the client fetches the server's current dictionary
-// (getZstdDictionary) before the first live dial, negotiates it with
-// zstdDictionary=<id>, and transparently decompresses the binary frames.
-// This is the only compression the live endpoint offers; it substantially cuts
-// live-tail bandwidth (~2.5x on typical firehose traffic) at ~3µs/event of
-// client-side decode. A dictionary fetch failure degrades to an
-// uncompressed tail (logged) rather than failing the stream. If the server
-// rotates its dictionary mid-stream (retrain + redeploy), the client
-// refetches the current dictionary and reconnects compressed; if the
-// refetch fails it likewise degrades to uncompressed.
-func WithZstdCompression() Option {
-	return func(c *config) {
-		c.zstdCompression = true
-	}
+// WithZstdCompression controls live-tail dictionary-zstd compression, which is
+// enabled by default. The client fetches the server's current dictionary before
+// the first live dial, negotiates zstdDictionary=<id>, and transparently
+// decompresses binary frames. Fetch or rotation recovery failure degrades to an
+// uncompressed tail rather than failing the stream. Pass false to opt out;
+// archive segment compression is unaffected.
+func WithZstdCompression(enabled bool) Option {
+	return func(c *config) { c.zstdCompression = enabled }
 }

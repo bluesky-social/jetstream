@@ -223,9 +223,11 @@ dial deliberately doesn't offer it — see the measured rationale in
    uncompressed tail with a logged warning. Compression is an optimization;
    the tail must keep flowing.
 
-Opt-in: `WithZstdCompression()` (Go client), `--zstd` (CLI subscribe and
-loadtest; loadtest is v2-URL-only since the v1 endpoint uses the legacy
-embedded dictionary).
+Compression is enabled by default in the Go client and normal CLI subscribe
+command. Opt out with `WithZstdCompression(false)` or `--zstd=false`;
+`WithZstdCompression(true)` explicitly selects the default.
+The raw `loadtest` command remains opt-in with `--zstd` because its default URL
+is the legacy `/subscribe` endpoint, which uses a different dictionary.
 
 ## Public Go API (module root)
 

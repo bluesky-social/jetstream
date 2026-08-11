@@ -55,6 +55,19 @@ func TestNormalizeHost(t *testing.T) {
 	}
 }
 
+func TestZstdCompressionDefaultsOnAndCanBeDisabled(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	require.True(t, cfg.zstdCompression, "live dictionary compression should be enabled by default")
+
+	WithZstdCompression(false)(&cfg)
+	require.False(t, cfg.zstdCompression)
+
+	WithZstdCompression(true)(&cfg)
+	require.True(t, cfg.zstdCompression, "options are applied in order; explicit enable should restore the default")
+}
+
 func TestOptionsRejectNonPositive(t *testing.T) {
 	t.Parallel()
 	cfg := defaultConfig()
@@ -407,7 +420,7 @@ func TestSubscribeLiveTailEndToEnd(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := Subscribe(srv.URL)
+	c, err := Subscribe(srv.URL, WithZstdCompression(false))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 
@@ -459,7 +472,7 @@ func TestCloseStopsRunningEventsWithoutCtxCancel(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := Subscribe(srv.URL)
+	c, err := Subscribe(srv.URL, WithZstdCompression(false))
 	require.NoError(t, err)
 
 	first := make(chan struct{})
