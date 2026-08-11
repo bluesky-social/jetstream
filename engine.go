@@ -24,7 +24,12 @@ func newEngine(host string, cfg config) (engine, error) {
 	}
 	// Public dictionary fetches share the negotiation transport and retry policy
 	// without sharing its bearer-auth state.
-	publicXRPC := cloneXRPCWithoutAuth(negotiationXRPC)
+	publicXRPC := &xrpc.Client{
+		Host:       negotiationXRPC.Host,
+		HTTPClient: negotiationXRPC.HTTPClient,
+		UserAgent:  negotiationXRPC.UserAgent,
+		Retry:      negotiationXRPC.Retry,
+	}
 
 	ec := iclient.Config{
 		Host: host,
@@ -74,18 +79,6 @@ func newXRPCClient(host string, cfg config, opts []jttp.Option) *xrpc.Client {
 	}
 	c.HTTPClient = gt.Some(jttp.New(opts...))
 	return c
-}
-
-// cloneXRPCWithoutAuth copies only public request plumbing. It deliberately
-// does not copy atmos's private session state, so requests made through the
-// clone cannot inherit the archive bearer credential.
-func cloneXRPCWithoutAuth(c *xrpc.Client) *xrpc.Client {
-	return &xrpc.Client{
-		Host:       c.Host,
-		HTTPClient: c.HTTPClient,
-		UserAgent:  c.UserAgent,
-		Retry:      c.Retry,
-	}
 }
 
 // realEngine adapts internal/client.Engine to the root engine interface,
