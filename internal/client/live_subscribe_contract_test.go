@@ -16,7 +16,7 @@ import (
 // These tests lock the cross-package wire contract between the client's
 // dialer and the server's pre-upgrade rejections. The client matches the
 // XRPC error envelope's structured error name (never body substrings); the
-// names are declared in the network.bsky.jetstream.subscribe lexicon and
+// names are declared in the network.bsky.jetstream.subscribeEvents lexicon and
 // emitted by internal/subscribe. The client cannot import internal/subscribe
 // in production code (it would pull the server's storage deps into the
 // public module), so the error-name literals are duplicated here and these
@@ -103,10 +103,10 @@ func TestDialWebsocketMatchesServerDictRejected(t *testing.T) {
 
 // TestSubprotocolMatchesGeneratedLexicon pins the client's duplicated
 // subprotocol token to the lexgen-generated constant (the single source of
-// truth derived from lexicons/network/bsky/jetstream/subscribe.json).
+// truth derived from lexicons/network/bsky/jetstream/subscribeEvents.json).
 func TestSubprotocolMatchesGeneratedLexicon(t *testing.T) {
 	t.Parallel()
-	require.Equal(t, jetstream.JetstreamSubscribe_Subprotocol, subscribeSubprotocol,
+	require.Equal(t, jetstream.JetstreamSubscribeEvents_Subprotocol, subscribeSubprotocol,
 		"client subprotocol token drifted from the lexicon-generated constant")
 }
 

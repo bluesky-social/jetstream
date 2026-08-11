@@ -19,7 +19,7 @@ const testWireTime = "1970-01-01T00:00:00.000001Z"
 func liveCommitFrame(t *testing.T, seq uint64, did, op, coll, rkey string, withRecord bool) []byte {
 	t.Helper()
 	s := strconv.FormatUint(seq, 10)
-	frame := `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit"` +
+	frame := `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit"` +
 		`,"seq":` + s + `,"did":"` + did + `","time":"` + testWireTime + `"` +
 		`,"rev":"r","operation":"` + op + `","collection":"` + coll + `","rkey":"` + rkey + `"`
 	if withRecord {
@@ -35,7 +35,7 @@ func liveCommitFrame(t *testing.T, seq uint64, did, op, coll, rkey string, withR
 // liveIdentityFrame builds an xrpc.v1.json #identity message frame.
 func liveIdentityFrame(seq uint64, did, handle string) []byte {
 	s := strconv.FormatUint(seq, 10)
-	return []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#identity"` +
+	return []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#identity"` +
 		`,"seq":` + s + `,"did":"` + did + `","time":"` + testWireTime + `"` +
 		`,"identity":{"did":"` + did + `","handle":"` + handle + `","seq":` + s + `,"time":"2026-05-25T00:00:00Z"}}}`)
 }
@@ -48,7 +48,7 @@ func liveAccountFrame(seq uint64, did string, active bool, status string) []byte
 	if !active {
 		act = "false"
 	}
-	return []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#account"` +
+	return []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#account"` +
 		`,"seq":` + s + `,"did":"` + did + `","time":"` + testWireTime + `"` +
 		`,"account":{"did":"` + did + `","active":` + act + `,"status":"` + status + `","seq":` + s + `,"time":"2026-05-25T00:00:00Z"}}}`)
 }
@@ -99,7 +99,7 @@ func TestDecodeLiveFrameAccountIdentitySync(t *testing.T) {
 	require.Equal(t, KindIdentity, ev.Kind)
 	require.Equal(t, "alice.test", ev.Identity.Handle)
 
-	sync := []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#sync"` +
+	sync := []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#sync"` +
 		`,"seq":8,"did":"did:plc:a","time":"` + testWireTime + `"` +
 		`,"sync":{"did":"did:plc:a","rev":"rev1","seq":800,"time":"2026-05-25T00:00:00Z","blocks":{"$bytes":"AQI"}}}}`)
 	ev, _, err = decodeLiveFrame(sync, recordDecodeMode{})
@@ -115,7 +115,7 @@ func TestDecodeLiveFrameUnknownPayloadTypeSkips(t *testing.T) {
 	// A well-formed message frame whose payload $type this build does not
 	// know is a newer server's addition: skip, never error.
 	for _, typ := range []string{
-		"network.bsky.jetstream.subscribe#futureKind",
+		"network.bsky.jetstream.subscribeEvents#futureKind",
 		"com.example.other#thing",
 	} {
 		_, info, err := decodeLiveFrame([]byte(`{"$type":"message","payload":{"$type":"`+typ+`","seq":1}}`), recordDecodeMode{})
@@ -134,7 +134,7 @@ func TestDecodeLiveFrameUnknownEnvelopeTypeSkips(t *testing.T) {
 
 func TestDecodeLiveFrameInfoFrame(t *testing.T) {
 	t.Parallel()
-	frame := []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#info"` +
+	frame := []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#info"` +
 		`,"name":"OutdatedCursor","message":"starting at seq 200"}}`)
 	_, info, err := decodeLiveFrame(frame, recordDecodeMode{})
 	require.ErrorIs(t, err, errSkipFrame, "info frames are advisories, not events")
@@ -164,8 +164,8 @@ func TestDecodeLiveFrameMalformed(t *testing.T) {
 	for name, frame := range map[string]string{
 		"not json":        `{`,
 		"missing payload": `{"$type":"message"}`,
-		"bad time":        `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#sync","seq":1,"did":"did:plc:a","time":"not-a-time","sync":{"did":"did:plc:a","rev":"r","seq":1,"time":"t","blocks":{"$bytes":"AQI"}}}}`,
-		"negative seq":    `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#sync","seq":-1,"did":"did:plc:a","time":"` + testWireTime + `","sync":{"did":"did:plc:a","rev":"r","seq":1,"time":"t","blocks":{"$bytes":"AQI"}}}}`,
+		"bad time":        `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#sync","seq":1,"did":"did:plc:a","time":"not-a-time","sync":{"did":"did:plc:a","rev":"r","seq":1,"time":"t","blocks":{"$bytes":"AQI"}}}}`,
+		"negative seq":    `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#sync","seq":-1,"did":"did:plc:a","time":"` + testWireTime + `","sync":{"did":"did:plc:a","rev":"r","seq":1,"time":"t","blocks":{"$bytes":"AQI"}}}}`,
 		// A frame with NO envelope $type is malformed (e.g. a pre-lexicon
 		// /subscribe-v2 or v1 server), not a newer protocol revision — it
 		// must error so a wrong endpoint doesn't look healthy while
@@ -175,17 +175,17 @@ func TestDecodeLiveFrameMalformed(t *testing.T) {
 		// decoder does not enforce lexicon `required`, so the decode layer
 		// must — otherwise a zero-valued wrapped event is emitted and
 		// advances the dedup cursor.
-		"identity missing payload": `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#identity","seq":1,"did":"did:plc:a","time":"` + testWireTime + `"}}`,
-		"account missing payload":  `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#account","seq":1,"did":"did:plc:a","time":"` + testWireTime + `"}}`,
-		"sync missing payload":     `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#sync","seq":1,"did":"did:plc:a","time":"` + testWireTime + `"}}`,
+		"identity missing payload": `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#identity","seq":1,"did":"did:plc:a","time":"` + testWireTime + `"}}`,
+		"account missing payload":  `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#account","seq":1,"did":"did:plc:a","time":"` + testWireTime + `"}}`,
+		"sync missing payload":     `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#sync","seq":1,"did":"did:plc:a","time":"` + testWireTime + `"}}`,
 		// A payload with no $type discriminator is malformed, not a future
 		// message kind (which would carry a nonempty unknown $type).
 		"payload missing type": `{"$type":"message","payload":{"seq":1,"did":"did:plc:a"}}`,
 		// A commit missing its required record identifiers cannot be keyed
 		// by a folding consumer.
-		"commit missing collection": `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit","seq":1,"did":"did:plc:a","time":"` + testWireTime + `","rev":"r","operation":"delete","rkey":"k"}}`,
+		"commit missing collection": `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":1,"did":"did:plc:a","time":"` + testWireTime + `","rev":"r","operation":"delete","rkey":"k"}}`,
 		// seq 0 means the required seq field was absent (the wire is 1-based).
-		"commit zero seq": `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit","did":"did:plc:a","time":"` + testWireTime + `","rev":"r","operation":"delete","collection":"c","rkey":"k"}}`,
+		"commit zero seq": `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","did":"did:plc:a","time":"` + testWireTime + `","rev":"r","operation":"delete","collection":"c","rkey":"k"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -213,7 +213,7 @@ func TestDecodeLiveFrameBoundsUntrustedDiagnostics(t *testing.T) {
 	require.True(t, utf8.ValidString(streamErr.Code), "truncation must be rune-aligned")
 	require.True(t, utf8.ValidString(streamErr.Message), "truncation must be rune-aligned")
 
-	_, info, err := decodeLiveFrame([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#info","name":"`+huge+`","message":"`+huge+`"}}`), recordDecodeMode{})
+	_, info, err := decodeLiveFrame([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#info","name":"`+huge+`","message":"`+huge+`"}}`), recordDecodeMode{})
 	require.ErrorIs(t, err, errSkipFrame)
 	require.NotNil(t, info)
 	require.LessOrEqual(t, len(info.Name), maxLiveDiagNameBytes+len("…"))

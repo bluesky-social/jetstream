@@ -237,7 +237,7 @@ func TestHandler_V2ClampedTimestampCursorEmitsOutdatedCursorInfo(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(frame, &envelope))
 	require.Equal(t, "message", envelope.Type)
-	require.Equal(t, "network.bsky.jetstream.subscribe#info", envelope.Payload.Type)
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#info", envelope.Payload.Type)
 	require.Equal(t, "OutdatedCursor", envelope.Payload.Name)
 	require.Contains(t, envelope.Payload.Message, "starting at seq 200",
 		"the info message names the seq actually resumed from")

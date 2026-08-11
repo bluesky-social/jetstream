@@ -133,7 +133,7 @@ For instance, if a user requests all `standard.site` documents since two weeks a
 
 Just like the firehose, the way the data is laid out on disk naturally ensures events within a single DID are delivered in order (though multiple DIDs may be interleaved together).
 
-The client paginates `planBackfill` over the sealed archive — each page names the segments/blocks to download and reports a `sealedTipSeq` (the archive tip, pinned for the whole backfill) and a `plannedThroughSeq` continuation cursor. The client downloads and emits each page, advancing the cursor, until `plannedThroughSeq >= sealedTipSeq`. Only then does it connect `/xrpc/network.bsky.jetstream.subscribe` once, at `cursor = max(sealedTipSeq, lastProcessedSeq)`, to pick up the active segment and the live tail. There is no client-side cutover buffer ("jetstream is your buffer"); the websocket lookback window is no longer load-bearing for correctness. Segments sealed *during* the backfill are picked up by the cold-replay path when the subscription re-reads the manifest at connect, and the live tail is deduped by seq, so the seam is at-least-once with no gap.
+The client paginates `planBackfill` over the sealed archive — each page names the segments/blocks to download and reports a `sealedTipSeq` (the archive tip, pinned for the whole backfill) and a `plannedThroughSeq` continuation cursor. The client downloads and emits each page, advancing the cursor, until `plannedThroughSeq >= sealedTipSeq`. Only then does it connect `/xrpc/network.bsky.jetstream.subscribeEvents` once, at `cursor = max(sealedTipSeq, lastProcessedSeq)`, to pick up the active segment and the live tail. There is no client-side cutover buffer ("jetstream is your buffer"); the websocket lookback window is no longer load-bearing for correctness. Segments sealed *during* the backfill are picked up by the cold-replay path when the subscription re-reads the manifest at connect, and the live tail is deduped by seq, so the seam is at-least-once with no gap.
 
 The consumer folds the stream as it goes (creates/updates apply; deletes/account-deletes/syncs remove) — the client library delivers every marker event inline rather than suppressing rows, and nobody needs to download a tombstone overlay (more on this later).
 
@@ -375,10 +375,10 @@ Putting it all together, the client's backfill→live loop looks like:
 1. The client calls `planBackfill(afterSeq=cursor)` (page 1) to learn which sealed segments/blocks may satisfy its query (i.e. "give me all `standard.site` documents") and pins `S = sealedTipSeq` as the upper bound for the whole backfill.
 2. The client downloads the planned segments/blocks, decodes them, applies exact DID/collection filtering, and emits matching rows. DID-level markers (`#account`/`#identity`/`#sync`) ride inline via the sentinel index (Section 3.3), so a collection-filtered backfill receives the deletions it needs to fold.
 3. The client advances `cursor = plannedThroughSeq` and, while `cursor < S`, calls `planBackfill(afterSeq=cursor, beforeSeq=S)` again (pinning `beforeSeq = S` so the range never floats) and repeats step 2.
-4. Once `plannedThroughSeq >= S`, the sealed range is fully consumed. The client connects `/xrpc/network.bsky.jetstream.subscribe` exactly once at `cursor = max(S, lastProcessedSeq)` to pick up the active segment and the live tail (the `max` keeps repeated backfill/cutover cycles monotonic — on the first cutover it is just `S`). Inclusive replay plus client-side seq dedup makes the seam at-least-once with no rewind margin; segments sealed during the backfill arrive via cold replay (the server re-reads the manifest at connect).
+4. Once `plannedThroughSeq >= S`, the sealed range is fully consumed. The client connects `/xrpc/network.bsky.jetstream.subscribeEvents` exactly once at `cursor = max(S, lastProcessedSeq)` to pick up the active segment and the live tail (the `max` keeps repeated backfill/cutover cycles monotonic — on the first cutover it is just `S`). Inclusive replay plus client-side seq dedup makes the seam at-least-once with no rewind margin; segments sealed during the backfill arrive via cold replay (the server re-reads the manifest at connect).
 5. The client delivers every row it receives — creates, updates, deletes, account-deletes, and syncs — applying no overlay and suppressing nothing; the consumer folds them idempotently (creates/updates apply; the markers remove).
 
-There is no overlay download and no separate tombstone-negotiation step. The client owns the orchestration among paginated planning, historical block/segment downloads, exact filtering, folding, and the single live-tail cutover. A crashed backfill resumes from its last continuation cursor rather than restarting. If the handoff cursor `S` ages below the server's lookback floor during a slow backfill, the terminal `/xrpc/network.bsky.jetstream.subscribe` connect returns a pre-upgrade HTTP 400 XRPC error envelope named `CursorTooOld` (Section 5) and the client transparently re-enters the pagination loop from its last processed seq rather than silently skipping the `(S, floor]` gap.
+There is no overlay download and no separate tombstone-negotiation step. The client owns the orchestration among paginated planning, historical block/segment downloads, exact filtering, folding, and the single live-tail cutover. A crashed backfill resumes from its last continuation cursor rather than restarting. If the handoff cursor `S` ages below the server's lookback floor during a slow backfill, the terminal `/xrpc/network.bsky.jetstream.subscribeEvents` connect returns a pre-upgrade HTTP 400 XRPC error envelope named `CursorTooOld` (Section 5) and the client transparently re-enters the pagination loop from its last processed seq rather than silently skipping the `(S, floor]` gap.
 
 ### 3.4 File Organization
 
@@ -585,7 +585,7 @@ Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo 
 
 We ship client libraries in TypeScript and Go. They are relatively "thick" in the sense that clients require substantial amounts of logic in order to use the system. All the code is public and well-documented, so community members can maintain client libraries in other languages.
 
-For the live-tail use-case, clients are simple. The legacy `/subscribe` endpoint stays compatible with the existing Jetstream v1 WebSocket JSON payload and query parameters, so existing v1 consumers continue to work as-is (no client wrapper library is even needed for those simple use-cases). New clients — including the bundled libraries — speak the canonical v2 stream at `/xrpc/network.bsky.jetstream.subscribe` (Section 5.2), which uses proposal-0015 framing and renamed filter parameters; the v1 parameter names are deliberately rejected there.
+For the live-tail use-case, clients are simple. The legacy `/subscribe` endpoint stays compatible with the existing Jetstream v1 WebSocket JSON payload and query parameters, so existing v1 consumers continue to work as-is (no client wrapper library is even needed for those simple use-cases). New clients — including the bundled libraries — speak the canonical v2 stream at `/xrpc/network.bsky.jetstream.subscribeEvents` (Section 5.2), which uses proposal-0015 framing and renamed filter parameters; the v1 parameter names are deliberately rejected there.
 
 It gets more complicated when the caller requests data that is older than the current active segment. The client asks the server something like "I want all likes since 2024", pages `planBackfill` over the sealed segment files (downloading and emitting each page's blocks in order, including the inline deletion/update markers), and once it has consumed the sealed range it seamlessly cuts over to the v2 live websocket. That cutover is transparent to callers, who use a Go `iter.Seq2` or a TypeScript async iterable to provide an excellent devex.
 
@@ -632,9 +632,9 @@ Cursor lookback is bounded to the most recent 36 hours by default (matching jets
 
 Cursors in the future drop into live-tip mode (no replay) on both endpoints.
 
-### 5.2 The v2 Stream: network.bsky.jetstream.subscribe
+### 5.2 The v2 Stream: network.bsky.jetstream.subscribeEvents
 
-The v2 stream serves at its lexicon-canonical XRPC path, `/xrpc/network.bsky.jetstream.subscribe`, and conforms to [atproto proposal 0015](https://github.com/bluesky-social/proposals/tree/main/0015-json-subscriptions): the `xrpc.v1.json` subprotocol, negotiated via `Sec-WebSocket-Protocol` and also the lexicon-declared default, so unnegotiated connections receive identical framing. The wire contract is declared in `lexicons/network/bsky/jetstream/subscribe.json` — the lexicon is authoritative; this section summarizes it.
+The v2 stream serves at its lexicon-canonical XRPC path, `/xrpc/network.bsky.jetstream.subscribeEvents`, and conforms to [atproto proposal 0015](https://github.com/bluesky-social/proposals/tree/main/0015-json-subscriptions): the `xrpc.v1.json` subprotocol, negotiated via `Sec-WebSocket-Protocol` and also the lexicon-declared default, so unnegotiated connections receive identical framing. The wire contract is declared in `lexicons/network/bsky/jetstream/subscribeEvents.json` — the lexicon is authoritative; this section summarizes it.
 
 Every frame is exactly one self-describing JSON object. A **message** frame wraps one lexicon message, dispatched by its `$type`:
 
@@ -642,7 +642,7 @@ Every frame is exactly one self-describing JSON object. A **message** frame wrap
 {
   "$type": "message",
   "payload": {
-    "$type": "network.bsky.jetstream.subscribe#commit",
+    "$type": "network.bsky.jetstream.subscribeEvents#commit",
     "seq": 12345,
     "did": "did:plc:eygmaihciaxprqvxpfvl6flk",
     "time": "2024-09-09T19:46:02.329308Z",

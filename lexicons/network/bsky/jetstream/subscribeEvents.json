@@ -1,6 +1,6 @@
 {
   "lexicon": 1,
-  "id": "network.bsky.jetstream.subscribe",
+  "id": "network.bsky.jetstream.subscribeEvents",
   "defs": {
     "main": {
       "type": "subscription",

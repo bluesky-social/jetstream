@@ -1,4 +1,4 @@
-// Package subscribe — filterv2.go owns the network.bsky.jetstream.subscribe
+// Package subscribe — filterv2.go owns the network.bsky.jetstream.subscribeEvents
 // (v2) subscriber filter: the kinds/dids/collections query parameters and
 // the Wants(evt) predicate.
 //
@@ -140,7 +140,7 @@ func (wc *wantedCollections) matches(collection string) bool {
 	return false
 }
 
-// ParseQueryV2 turns a network.bsky.jetstream.subscribe query string into
+// ParseQueryV2 turns a network.bsky.jetstream.subscribeEvents query string into
 // a validated *FilterV2. Any validation failure returns an
 // ErrInvalidOptions-wrapped error, which the handler maps to a
 // pre-upgrade HTTP 400 InvalidRequest envelope.

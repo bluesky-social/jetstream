@@ -1,5 +1,5 @@
 // Package subscribe owns the websocket fan-out behind the public
-// /subscribe (legacy v1) and /xrpc/network.bsky.jetstream.subscribe
+// /subscribe (legacy v1) and /xrpc/network.bsky.jetstream.subscribeEvents
 // (v2, atproto proposal 0015) endpoints: the shared pull loop and
 // cursor replay, plus each endpoint's wire framing, filtering dialect,
 // and error contract.
@@ -61,7 +61,7 @@
 //
 //   - filterv2.go: the v2 FilterV2 — the three orthogonal AND-composed
 //     axes (kinds, dids, collections) from the
-//     network.bsky.jetstream.subscribe lexicon, with crash-loud 400s
+//     network.bsky.jetstream.subscribeEvents lexicon, with crash-loud 400s
 //     for unknown kinds, provably-inert combinations, and the legacy
 //     wanted* parameter names.
 //
@@ -127,8 +127,8 @@
 //
 // # The v2 endpoint (proposal 0015)
 //
-// /xrpc/network.bsky.jetstream.subscribe serves the wire contract
-// declared in lexicons/network/bsky/jetstream/subscribe.json:
+// /xrpc/network.bsky.jetstream.subscribeEvents serves the wire contract
+// declared in lexicons/network/bsky/jetstream/subscribeEvents.json:
 //
 //   - xrpc.v1.json framing — one self-describing JSON object per text
 //     frame ({"$type":"message","payload":{...}} with the full

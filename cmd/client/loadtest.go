@@ -23,7 +23,7 @@ import (
 )
 
 // loadtestCommand is the legacy direct-websocket load tester: it opens many
-// raw /subscribe (v1) or /xrpc/network.bsky.jetstream.subscribe (v2)
+// raw /subscribe (v1) or /xrpc/network.bsky.jetstream.subscribeEvents (v2)
 // connections and prints throughput stats.
 // It does NOT use the jetstream client library; it exists to stress the server
 // websocket path directly.
@@ -268,8 +268,8 @@ func subscribeURL(c config) (string, error) {
 		// v2-only: the v1 endpoint compresses with the legacy embedded
 		// dictionary, which getZstdDictionary does not serve, so frames
 		// would be undecodable here.
-		if !strings.HasSuffix(u.Path, "/xrpc/network.bsky.jetstream.subscribe") {
-			return "", fmt.Errorf("--zstd requires a /xrpc/network.bsky.jetstream.subscribe URL (the v1 endpoint uses the legacy dictionary this tool does not embed)")
+		if !strings.HasSuffix(u.Path, "/xrpc/network.bsky.jetstream.subscribeEvents") {
+			return "", fmt.Errorf("--zstd requires a /xrpc/network.bsky.jetstream.subscribeEvents URL (the v1 endpoint uses the legacy dictionary this tool does not embed)")
 		}
 		if c.zstdDictID == 0 {
 			return "", fmt.Errorf("internal: zstd dictionary ID not resolved before URL build")
@@ -313,7 +313,7 @@ func subscribeURL(c config) (string, error) {
 // isV2Path reports whether the URL path targets the proposal-0015 v2
 // stream endpoint.
 func isV2Path(path string) bool {
-	return strings.HasSuffix(path, "/xrpc/network.bsky.jetstream.subscribe")
+	return strings.HasSuffix(path, "/xrpc/network.bsky.jetstream.subscribeEvents")
 }
 
 type counters struct {

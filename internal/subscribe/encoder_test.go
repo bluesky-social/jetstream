@@ -360,7 +360,7 @@ func unwrapV2Frame(t *testing.T, body []byte) map[string]any {
 // message union — the exact path a standard-lexicon-tooling consumer
 // takes. This is the cross-stack conformance check: the wire our encoder
 // produces must be consumable without any jetstream-specific decode code.
-func decodeV2Union(t *testing.T, body []byte) *jetstream.JetstreamSubscribe_Message {
+func decodeV2Union(t *testing.T, body []byte) *jetstream.JetstreamSubscribeEvents_Message {
 	t.Helper()
 	var frame struct {
 		Type    string          `json:"$type"`
@@ -368,7 +368,7 @@ func decodeV2Union(t *testing.T, body []byte) *jetstream.JetstreamSubscribe_Mess
 	}
 	require.NoError(t, json.Unmarshal(body, &frame))
 	require.Equal(t, "message", frame.Type)
-	var msg jetstream.JetstreamSubscribe_Message
+	var msg jetstream.JetstreamSubscribeEvents_Message
 	require.NoError(t, msg.UnmarshalJSON(frame.Payload))
 	return &msg
 }
@@ -392,7 +392,7 @@ func TestEncodeV2_CommitFrameCarriesRecordCBOR(t *testing.T) {
 	require.NoError(t, err)
 
 	got := unwrapV2Frame(t, body)
-	require.Equal(t, "network.bsky.jetstream.subscribe#commit", got["$type"])
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#commit", got["$type"])
 	require.Equal(t, float64(12345), got["seq"])
 	require.Equal(t, "did:plc:test", got["did"])
 	require.Equal(t, "2023-11-14T22:13:20.000000Z", got["time"],
@@ -411,7 +411,7 @@ func TestEncodeV2_CommitFrameCarriesRecordCBOR(t *testing.T) {
 
 	// Cross-stack: the payload decodes through the generated union.
 	msg := decodeV2Union(t, body)
-	commit := msg.JetstreamSubscribe_Commit.Val()
+	commit := msg.JetstreamSubscribeEvents_Commit.Val()
 	require.Equal(t, int64(12345), commit.Seq)
 	require.Equal(t, payload, commit.RecordCbor)
 	require.Equal(t, "app.bsky.feed.post", commit.Collection)
@@ -432,7 +432,7 @@ func TestEncodeV2_CommitDeleteOmitsRecordPayloads(t *testing.T) {
 	body, err := EncodeV2(evt)
 	require.NoError(t, err)
 	got := unwrapV2Frame(t, body)
-	require.Equal(t, "network.bsky.jetstream.subscribe#commit", got["$type"])
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#commit", got["$type"])
 	require.Equal(t, "delete", got["operation"])
 	require.Equal(t, float64(9), got["seq"])
 	require.NotContains(t, got, "record")
@@ -473,7 +473,7 @@ func TestEncodeV2_IdentityAndAccountWrapUpstreamEvents(t *testing.T) {
 			})
 			require.NoError(t, err)
 			got := unwrapV2Frame(t, body)
-			require.Equal(t, "network.bsky.jetstream.subscribe#"+tc.name, got["$type"])
+			require.Equal(t, "network.bsky.jetstream.subscribeEvents#"+tc.name, got["$type"])
 			require.Equal(t, float64(123), got["seq"], "envelope seq is jetstream's")
 			require.Equal(t, "did:plc:test", got["did"])
 
@@ -507,7 +507,7 @@ func TestEncodeV2_SyncEmitsArchivedEvent(t *testing.T) {
 	require.NoError(t, err)
 
 	got := unwrapV2Frame(t, body)
-	require.Equal(t, "network.bsky.jetstream.subscribe#sync", got["$type"])
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#sync", got["$type"])
 	require.Equal(t, float64(77), got["seq"])
 
 	syncJSON, ok := got["sync"].(map[string]any)
@@ -519,7 +519,7 @@ func TestEncodeV2_SyncEmitsArchivedEvent(t *testing.T) {
 	require.Equal(t, base64.RawStdEncoding.EncodeToString(sync.Blocks), blocks["$bytes"])
 
 	msg := decodeV2Union(t, body)
-	require.Equal(t, sync.Blocks, msg.JetstreamSubscribe_Sync.Val().Sync.Blocks)
+	require.Equal(t, sync.Blocks, msg.JetstreamSubscribeEvents_Sync.Val().Sync.Blocks)
 }
 
 func TestEncodeV2Error_FrameShape(t *testing.T) {
@@ -545,14 +545,14 @@ func TestEncodeV2Info_FrameShape(t *testing.T) {
 	body, err := EncodeV2Info("OutdatedCursor", "starting at seq 42")
 	require.NoError(t, err)
 	got := unwrapV2Frame(t, body)
-	require.Equal(t, "network.bsky.jetstream.subscribe#info", got["$type"])
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#info", got["$type"])
 	require.Equal(t, "OutdatedCursor", got["name"])
 	require.Equal(t, "starting at seq 42", got["message"])
 	require.NotContains(t, got, "seq", "info frames carry no seq")
 
 	msg := decodeV2Union(t, body)
-	require.True(t, msg.JetstreamSubscribe_Info.HasVal())
-	require.Equal(t, "OutdatedCursor", msg.JetstreamSubscribe_Info.Val().Name)
+	require.True(t, msg.JetstreamSubscribeEvents_Info.HasVal())
+	require.Equal(t, "OutdatedCursor", msg.JetstreamSubscribeEvents_Info.Val().Name)
 }
 
 func TestEncodeV2_UnknownKindReturnsError(t *testing.T) {

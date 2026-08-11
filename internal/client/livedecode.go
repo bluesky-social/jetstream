@@ -108,7 +108,7 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		// JSON). Skipping it would make a wrong endpoint look healthy
 		// while delivering nothing; surface it so the consumer sees the
 		// decode errors.
-		return Event{}, nil, errors.New("jetstream: live frame missing envelope $type; is the server a network.bsky.jetstream.subscribe endpoint?")
+		return Event{}, nil, errors.New("jetstream: live frame missing envelope $type; is the server a network.bsky.jetstream.subscribeEvents endpoint?")
 	default:
 		// A well-formed frame with an unknown envelope $type is a newer
 		// protocol revision; skip rather than break.
@@ -119,16 +119,16 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		return Event{}, nil, errors.New("jetstream: live message frame missing payload")
 	}
 
-	var msg jetstream.JetstreamSubscribe_Message
+	var msg jetstream.JetstreamSubscribeEvents_Message
 	if err := msg.UnmarshalJSON(env.Payload); err != nil {
 		return Event{}, nil, fmt.Errorf("jetstream: decode live payload: %w", err)
 	}
 
 	switch {
-	case msg.JetstreamSubscribe_Commit.HasVal():
-		return liveCommitToEvent(msg.JetstreamSubscribe_Commit.Val(), mode)
-	case msg.JetstreamSubscribe_Identity.HasVal():
-		v := msg.JetstreamSubscribe_Identity.Val()
+	case msg.JetstreamSubscribeEvents_Commit.HasVal():
+		return liveCommitToEvent(msg.JetstreamSubscribeEvents_Commit.Val(), mode)
+	case msg.JetstreamSubscribeEvents_Identity.HasVal():
+		v := msg.JetstreamSubscribeEvents_Identity.Val()
 		// The generated decoder does not enforce lexicon `required`; a
 		// frame missing the wrapped upstream event would otherwise emit a
 		// zero-valued Identity (with orDID papering over the missing DID)
@@ -160,8 +160,8 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 				Time:   v.Identity.Time,
 			},
 		}, nil, nil
-	case msg.JetstreamSubscribe_Account.HasVal():
-		v := msg.JetstreamSubscribe_Account.Val()
+	case msg.JetstreamSubscribeEvents_Account.HasVal():
+		v := msg.JetstreamSubscribeEvents_Account.Val()
 		// See the identity branch: outer-DID + payload-presence check.
 		if v.DID == "" || v.Account.DID == "" {
 			return Event{}, nil, errors.New("jetstream: live account frame missing required DID or account payload")
@@ -180,8 +180,8 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 				Time:   v.Account.Time,
 			},
 		}, nil, nil
-	case msg.JetstreamSubscribe_Sync.HasVal():
-		v := msg.JetstreamSubscribe_Sync.Val()
+	case msg.JetstreamSubscribeEvents_Sync.HasVal():
+		v := msg.JetstreamSubscribeEvents_Sync.Val()
 		// See the identity branch: outer-DID + payload-presence check.
 		// Archived #sync payloads from an atmos async resync legitimately
 		// carry an empty time/seq, so did is the only reliable presence
@@ -202,8 +202,8 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 				Time: v.Sync.Time,
 			},
 		}, nil, nil
-	case msg.JetstreamSubscribe_Info.HasVal():
-		v := msg.JetstreamSubscribe_Info.Val()
+	case msg.JetstreamSubscribeEvents_Info.HasVal():
+		v := msg.JetstreamSubscribeEvents_Info.Val()
 		// Bounded at decode so every consumer of liveInfo (currently the
 		// session-loop logger) inherits the bound.
 		return Event{}, &liveInfo{
@@ -243,7 +243,7 @@ func liveEnvelopeFields(seq int64, timeStr string) (uint64, int64, error) {
 	return uint64(seq), ts.UnixMicro(), nil
 }
 
-func liveCommitToEvent(c *jetstream.JetstreamSubscribe_Commit, mode recordDecodeMode) (Event, *liveInfo, error) {
+func liveCommitToEvent(c *jetstream.JetstreamSubscribeEvents_Commit, mode recordDecodeMode) (Event, *liveInfo, error) {
 	seq, timeUS, err := liveEnvelopeFields(c.Seq, c.Time)
 	if err != nil {
 		return Event{}, nil, err
@@ -265,7 +265,7 @@ func liveCommitToEvent(c *jetstream.JetstreamSubscribe_Commit, mode recordDecode
 	switch commit.Operation {
 	case OpCreate, OpUpdate:
 		if len(c.RecordCbor) == 0 {
-			return Event{}, nil, fmt.Errorf("jetstream: live %s commit missing recordCbor (collection=%s rkey=%s); is the server a network.bsky.jetstream.subscribe endpoint?", c.Operation, c.Collection, c.Rkey)
+			return Event{}, nil, fmt.Errorf("jetstream: live %s commit missing recordCbor (collection=%s rkey=%s); is the server a network.bsky.jetstream.subscribeEvents endpoint?", c.Operation, c.Collection, c.Rkey)
 		}
 		// The generated decode already unwrapped {"$bytes": ...} into a
 		// fresh owned buffer, so it is safe to retain regardless of mode.

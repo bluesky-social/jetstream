@@ -11,10 +11,10 @@ import (
 	"github.com/jcalabro/gt"
 )
 
-// JetstreamSubscribe_Account is a "account" in the network.bsky.jetstream.subscribe schema.
+// JetstreamSubscribeEvents_Account is a "account" in the network.bsky.jetstream.subscribeEvents schema.
 //
 // An account status change (active/deactivated/deleted/...), wrapping the upstream firehose event verbatim.
-type JetstreamSubscribe_Account struct {
+type JetstreamSubscribeEvents_Account struct {
 	LexiconTypeID string                                `json:"$type,omitempty"`
 	Account       comatproto.SyncSubscribeRepos_Account `json:"account"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
 	DID           string                                `json:"did"`
@@ -25,20 +25,20 @@ type JetstreamSubscribe_Account struct {
 	extra []extraField
 }
 
-// Precomputed CBOR key tokens for JetstreamSubscribe_Account.
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_Account.
 var (
-	cborKey_JetstreamSubscribe_Account_did         = cbor.AppendTextKey(nil, "did")
-	cborKey_JetstreamSubscribe_Account_seq         = cbor.AppendTextKey(nil, "seq")
-	cborKey_JetstreamSubscribe_Account_time        = cbor.AppendTextKey(nil, "time")
-	cborKey_JetstreamSubscribe_Account_dollar_type = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamSubscribe_Account_account     = cbor.AppendTextKey(nil, "account")
+	cborKey_JetstreamSubscribeEvents_Account_did         = cbor.AppendTextKey(nil, "did")
+	cborKey_JetstreamSubscribeEvents_Account_seq         = cbor.AppendTextKey(nil, "seq")
+	cborKey_JetstreamSubscribeEvents_Account_time        = cbor.AppendTextKey(nil, "time")
+	cborKey_JetstreamSubscribeEvents_Account_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_Account_account     = cbor.AppendTextKey(nil, "account")
 )
 
-func (s *JetstreamSubscribe_Account) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Account) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Account) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Account) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
@@ -47,21 +47,21 @@ func (s *JetstreamSubscribe_Account) AppendCBOR(buf []byte) ([]byte, error) {
 	if len(s.extra) > 0 {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "did", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Account_did...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_did...)
 		buf = cbor.AppendText(buf, s.DID)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "seq", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Account_seq...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_seq...)
 		buf = cbor.AppendInt(buf, s.Seq)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "time", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Account_time...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_time...)
 		buf = cbor.AppendText(buf, s.Time)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Account_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "account", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Account_account...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_account...)
 		{
 			var err error
 			buf, err = s.Account.AppendCBOR(buf)
@@ -71,17 +71,17 @@ func (s *JetstreamSubscribe_Account) AppendCBOR(buf []byte) ([]byte, error) {
 		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
-		buf = append(buf, cborKey_JetstreamSubscribe_Account_did...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_did...)
 		buf = cbor.AppendText(buf, s.DID)
-		buf = append(buf, cborKey_JetstreamSubscribe_Account_seq...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_seq...)
 		buf = cbor.AppendInt(buf, s.Seq)
-		buf = append(buf, cborKey_JetstreamSubscribe_Account_time...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_time...)
 		buf = cbor.AppendText(buf, s.Time)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Account_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
-		buf = append(buf, cborKey_JetstreamSubscribe_Account_account...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_account...)
 		{
 			var err error
 			buf, err = s.Account.AppendCBOR(buf)
@@ -93,12 +93,12 @@ func (s *JetstreamSubscribe_Account) AppendCBOR(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Account) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamSubscribeEvents_Account) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Account) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Account) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -184,34 +184,34 @@ func (s *JetstreamSubscribe_Account) UnmarshalCBORAt(data []byte, pos int) (int,
 	return pos, nil
 }
 
-// Precomputed JSON key tokens for JetstreamSubscribe_Account.
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_Account.
 var (
-	jsonKey_JetstreamSubscribe_Account_dollar_type = []byte("\"$type\":")
-	jsonKey_JetstreamSubscribe_Account_account     = []byte("\"account\":")
-	jsonKey_JetstreamSubscribe_Account_did         = []byte("\"did\":")
-	jsonKey_JetstreamSubscribe_Account_seq         = []byte("\"seq\":")
-	jsonKey_JetstreamSubscribe_Account_time        = []byte("\"time\":")
+	jsonKey_JetstreamSubscribeEvents_Account_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_Account_account     = []byte("\"account\":")
+	jsonKey_JetstreamSubscribeEvents_Account_did         = []byte("\"did\":")
+	jsonKey_JetstreamSubscribeEvents_Account_seq         = []byte("\"seq\":")
+	jsonKey_JetstreamSubscribeEvents_Account_time        = []byte("\"time\":")
 )
 
-func (s *JetstreamSubscribe_Account) MarshalJSON() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Account) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Account) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Account) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamSubscribe_Account_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Account_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Account_account...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Account_account...)
 	{
 		var err error
 		buf, err = s.Account.AppendJSON(buf)
@@ -223,19 +223,19 @@ func (s *JetstreamSubscribe_Account) AppendJSON(buf []byte) ([]byte, error) {
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Account_did...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Account_did...)
 	buf = cbor.AppendJSONString(buf, s.DID)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Account_seq...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Account_seq...)
 	buf = cbor.AppendJSONInt(buf, s.Seq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Account_time...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Account_time...)
 	buf = cbor.AppendJSONString(buf, s.Time)
 	first = false
 	for _, ef := range s.extra {
@@ -254,12 +254,12 @@ func (s *JetstreamSubscribe_Account) AppendJSON(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Account) UnmarshalJSON(data []byte) error {
+func (s *JetstreamSubscribeEvents_Account) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Account) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Account) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)
@@ -315,10 +315,10 @@ func (s *JetstreamSubscribe_Account) UnmarshalJSONAt(data []byte, pos int) (int,
 	}
 }
 
-// JetstreamSubscribe_Commit is a "commit" in the network.bsky.jetstream.subscribe schema.
+// JetstreamSubscribeEvents_Commit is a "commit" in the network.bsky.jetstream.subscribeEvents schema.
 //
 // A single record mutation (create, update, or delete).
-type JetstreamSubscribe_Commit struct {
+type JetstreamSubscribeEvents_Commit struct {
 	LexiconTypeID string            `json:"$type,omitempty"`
 	CID           gt.Option[string] `json:"cid,omitzero"` // CID of the record. Absent for deletes.
 	Collection    string            `json:"collection"`   // Collection NSID of the record.
@@ -335,26 +335,26 @@ type JetstreamSubscribe_Commit struct {
 	extra []extraField
 }
 
-// Precomputed CBOR key tokens for JetstreamSubscribe_Commit.
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_Commit.
 var (
-	cborKey_JetstreamSubscribe_Commit_cid         = cbor.AppendTextKey(nil, "cid")
-	cborKey_JetstreamSubscribe_Commit_did         = cbor.AppendTextKey(nil, "did")
-	cborKey_JetstreamSubscribe_Commit_rev         = cbor.AppendTextKey(nil, "rev")
-	cborKey_JetstreamSubscribe_Commit_seq         = cbor.AppendTextKey(nil, "seq")
-	cborKey_JetstreamSubscribe_Commit_rkey        = cbor.AppendTextKey(nil, "rkey")
-	cborKey_JetstreamSubscribe_Commit_time        = cbor.AppendTextKey(nil, "time")
-	cborKey_JetstreamSubscribe_Commit_dollar_type = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamSubscribe_Commit_record      = cbor.AppendTextKey(nil, "record")
-	cborKey_JetstreamSubscribe_Commit_operation   = cbor.AppendTextKey(nil, "operation")
-	cborKey_JetstreamSubscribe_Commit_collection  = cbor.AppendTextKey(nil, "collection")
-	cborKey_JetstreamSubscribe_Commit_recordCbor  = cbor.AppendTextKey(nil, "recordCbor")
+	cborKey_JetstreamSubscribeEvents_Commit_cid         = cbor.AppendTextKey(nil, "cid")
+	cborKey_JetstreamSubscribeEvents_Commit_did         = cbor.AppendTextKey(nil, "did")
+	cborKey_JetstreamSubscribeEvents_Commit_rev         = cbor.AppendTextKey(nil, "rev")
+	cborKey_JetstreamSubscribeEvents_Commit_seq         = cbor.AppendTextKey(nil, "seq")
+	cborKey_JetstreamSubscribeEvents_Commit_rkey        = cbor.AppendTextKey(nil, "rkey")
+	cborKey_JetstreamSubscribeEvents_Commit_time        = cbor.AppendTextKey(nil, "time")
+	cborKey_JetstreamSubscribeEvents_Commit_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_Commit_record      = cbor.AppendTextKey(nil, "record")
+	cborKey_JetstreamSubscribeEvents_Commit_operation   = cbor.AppendTextKey(nil, "operation")
+	cborKey_JetstreamSubscribeEvents_Commit_collection  = cbor.AppendTextKey(nil, "collection")
+	cborKey_JetstreamSubscribeEvents_Commit_recordCbor  = cbor.AppendTextKey(nil, "recordCbor")
 )
 
-func (s *JetstreamSubscribe_Commit) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Commit) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Commit) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 7 + countExtra(s.extra, extraEncodingCBOR)
 	if s.CID.HasVal() {
 		n++
@@ -373,87 +373,87 @@ func (s *JetstreamSubscribe_Commit) AppendCBOR(buf []byte) ([]byte, error) {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "cid", buf)
 		if s.CID.HasVal() {
-			buf = append(buf, cborKey_JetstreamSubscribe_Commit_cid...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_cid...)
 			buf = cbor.AppendText(buf, s.CID.Val())
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "did", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_did...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_did...)
 		buf = cbor.AppendText(buf, s.DID)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "rev", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_rev...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_rev...)
 		buf = cbor.AppendText(buf, s.Rev)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "seq", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_seq...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_seq...)
 		buf = cbor.AppendInt(buf, s.Seq)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "rkey", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_rkey...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_rkey...)
 		buf = cbor.AppendText(buf, s.Rkey)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "time", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_time...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_time...)
 		buf = cbor.AppendText(buf, s.Time)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Commit_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "record", buf)
 		if s.Record != nil {
-			buf = append(buf, cborKey_JetstreamSubscribe_Commit_record...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_record...)
 			buf = cbor.AppendNull(buf)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "operation", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_operation...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_operation...)
 		buf = cbor.AppendText(buf, s.Operation)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "collection", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_collection...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_collection...)
 		buf = cbor.AppendText(buf, s.Collection)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "recordCbor", buf)
 		if s.RecordCbor != nil {
-			buf = append(buf, cborKey_JetstreamSubscribe_Commit_recordCbor...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_recordCbor...)
 			buf = cbor.AppendBytes(buf, s.RecordCbor)
 		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		if s.CID.HasVal() {
-			buf = append(buf, cborKey_JetstreamSubscribe_Commit_cid...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_cid...)
 			buf = cbor.AppendText(buf, s.CID.Val())
 		}
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_did...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_did...)
 		buf = cbor.AppendText(buf, s.DID)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_rev...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_rev...)
 		buf = cbor.AppendText(buf, s.Rev)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_seq...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_seq...)
 		buf = cbor.AppendInt(buf, s.Seq)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_rkey...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_rkey...)
 		buf = cbor.AppendText(buf, s.Rkey)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_time...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_time...)
 		buf = cbor.AppendText(buf, s.Time)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Commit_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		if s.Record != nil {
-			buf = append(buf, cborKey_JetstreamSubscribe_Commit_record...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_record...)
 			buf = cbor.AppendNull(buf)
 		}
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_operation...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_operation...)
 		buf = cbor.AppendText(buf, s.Operation)
-		buf = append(buf, cborKey_JetstreamSubscribe_Commit_collection...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_collection...)
 		buf = cbor.AppendText(buf, s.Collection)
 		if s.RecordCbor != nil {
-			buf = append(buf, cborKey_JetstreamSubscribe_Commit_recordCbor...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_recordCbor...)
 			buf = cbor.AppendBytes(buf, s.RecordCbor)
 		}
 	}
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Commit) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamSubscribeEvents_Commit) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Commit) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Commit) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -593,33 +593,33 @@ func (s *JetstreamSubscribe_Commit) UnmarshalCBORAt(data []byte, pos int) (int, 
 	return pos, nil
 }
 
-// Precomputed JSON key tokens for JetstreamSubscribe_Commit.
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_Commit.
 var (
-	jsonKey_JetstreamSubscribe_Commit_dollar_type = []byte("\"$type\":")
-	jsonKey_JetstreamSubscribe_Commit_cid         = []byte("\"cid\":")
-	jsonKey_JetstreamSubscribe_Commit_collection  = []byte("\"collection\":")
-	jsonKey_JetstreamSubscribe_Commit_did         = []byte("\"did\":")
-	jsonKey_JetstreamSubscribe_Commit_operation   = []byte("\"operation\":")
-	jsonKey_JetstreamSubscribe_Commit_record      = []byte("\"record\":")
-	jsonKey_JetstreamSubscribe_Commit_recordCbor  = []byte("\"recordCbor\":")
-	jsonKey_JetstreamSubscribe_Commit_rev         = []byte("\"rev\":")
-	jsonKey_JetstreamSubscribe_Commit_rkey        = []byte("\"rkey\":")
-	jsonKey_JetstreamSubscribe_Commit_seq         = []byte("\"seq\":")
-	jsonKey_JetstreamSubscribe_Commit_time        = []byte("\"time\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_cid         = []byte("\"cid\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_collection  = []byte("\"collection\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_did         = []byte("\"did\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_operation   = []byte("\"operation\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_record      = []byte("\"record\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_recordCbor  = []byte("\"recordCbor\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_rev         = []byte("\"rev\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_rkey        = []byte("\"rkey\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_seq         = []byte("\"seq\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_time        = []byte("\"time\":")
 )
 
-func (s *JetstreamSubscribe_Commit) MarshalJSON() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Commit) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Commit) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Commit) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamSubscribe_Commit_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
@@ -627,33 +627,33 @@ func (s *JetstreamSubscribe_Commit) AppendJSON(buf []byte) ([]byte, error) {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamSubscribe_Commit_cid...)
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_cid...)
 		buf = cbor.AppendJSONString(buf, s.CID.Val())
 		first = false
 	}
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Commit_collection...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_collection...)
 	buf = cbor.AppendJSONString(buf, s.Collection)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Commit_did...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_did...)
 	buf = cbor.AppendJSONString(buf, s.DID)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Commit_operation...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_operation...)
 	buf = cbor.AppendJSONString(buf, s.Operation)
 	first = false
 	if s.Record != nil {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamSubscribe_Commit_record...)
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_record...)
 		buf = append(buf, s.Record...)
 		first = false
 	}
@@ -661,32 +661,32 @@ func (s *JetstreamSubscribe_Commit) AppendJSON(buf []byte) ([]byte, error) {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamSubscribe_Commit_recordCbor...)
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_recordCbor...)
 		buf = cbor.AppendJSONBytes(buf, s.RecordCbor)
 		first = false
 	}
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Commit_rev...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_rev...)
 	buf = cbor.AppendJSONString(buf, s.Rev)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Commit_rkey...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_rkey...)
 	buf = cbor.AppendJSONString(buf, s.Rkey)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Commit_seq...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_seq...)
 	buf = cbor.AppendJSONInt(buf, s.Seq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Commit_time...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_time...)
 	buf = cbor.AppendJSONString(buf, s.Time)
 	first = false
 	for _, ef := range s.extra {
@@ -705,12 +705,12 @@ func (s *JetstreamSubscribe_Commit) AppendJSON(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Commit) UnmarshalJSON(data []byte) error {
+func (s *JetstreamSubscribeEvents_Commit) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Commit) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Commit) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)
@@ -809,10 +809,10 @@ func (s *JetstreamSubscribe_Commit) UnmarshalJSONAt(data []byte, pos int) (int, 
 	}
 }
 
-// JetstreamSubscribe_Identity is a "identity" in the network.bsky.jetstream.subscribe schema.
+// JetstreamSubscribeEvents_Identity is a "identity" in the network.bsky.jetstream.subscribeEvents schema.
 //
 // An identity change (handle or DID document update), wrapping the upstream firehose event verbatim.
-type JetstreamSubscribe_Identity struct {
+type JetstreamSubscribeEvents_Identity struct {
 	LexiconTypeID string                                 `json:"$type,omitempty"`
 	DID           string                                 `json:"did"`
 	Identity      comatproto.SyncSubscribeRepos_Identity `json:"identity"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
@@ -823,20 +823,20 @@ type JetstreamSubscribe_Identity struct {
 	extra []extraField
 }
 
-// Precomputed CBOR key tokens for JetstreamSubscribe_Identity.
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_Identity.
 var (
-	cborKey_JetstreamSubscribe_Identity_did         = cbor.AppendTextKey(nil, "did")
-	cborKey_JetstreamSubscribe_Identity_seq         = cbor.AppendTextKey(nil, "seq")
-	cborKey_JetstreamSubscribe_Identity_time        = cbor.AppendTextKey(nil, "time")
-	cborKey_JetstreamSubscribe_Identity_dollar_type = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamSubscribe_Identity_identity    = cbor.AppendTextKey(nil, "identity")
+	cborKey_JetstreamSubscribeEvents_Identity_did         = cbor.AppendTextKey(nil, "did")
+	cborKey_JetstreamSubscribeEvents_Identity_seq         = cbor.AppendTextKey(nil, "seq")
+	cborKey_JetstreamSubscribeEvents_Identity_time        = cbor.AppendTextKey(nil, "time")
+	cborKey_JetstreamSubscribeEvents_Identity_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_Identity_identity    = cbor.AppendTextKey(nil, "identity")
 )
 
-func (s *JetstreamSubscribe_Identity) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Identity) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Identity) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Identity) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
@@ -845,21 +845,21 @@ func (s *JetstreamSubscribe_Identity) AppendCBOR(buf []byte) ([]byte, error) {
 	if len(s.extra) > 0 {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "did", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Identity_did...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_did...)
 		buf = cbor.AppendText(buf, s.DID)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "seq", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Identity_seq...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_seq...)
 		buf = cbor.AppendInt(buf, s.Seq)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "time", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Identity_time...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_time...)
 		buf = cbor.AppendText(buf, s.Time)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Identity_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "identity", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Identity_identity...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_identity...)
 		{
 			var err error
 			buf, err = s.Identity.AppendCBOR(buf)
@@ -869,17 +869,17 @@ func (s *JetstreamSubscribe_Identity) AppendCBOR(buf []byte) ([]byte, error) {
 		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
-		buf = append(buf, cborKey_JetstreamSubscribe_Identity_did...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_did...)
 		buf = cbor.AppendText(buf, s.DID)
-		buf = append(buf, cborKey_JetstreamSubscribe_Identity_seq...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_seq...)
 		buf = cbor.AppendInt(buf, s.Seq)
-		buf = append(buf, cborKey_JetstreamSubscribe_Identity_time...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_time...)
 		buf = cbor.AppendText(buf, s.Time)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Identity_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
-		buf = append(buf, cborKey_JetstreamSubscribe_Identity_identity...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_identity...)
 		{
 			var err error
 			buf, err = s.Identity.AppendCBOR(buf)
@@ -891,12 +891,12 @@ func (s *JetstreamSubscribe_Identity) AppendCBOR(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Identity) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamSubscribeEvents_Identity) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Identity) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Identity) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -982,40 +982,40 @@ func (s *JetstreamSubscribe_Identity) UnmarshalCBORAt(data []byte, pos int) (int
 	return pos, nil
 }
 
-// Precomputed JSON key tokens for JetstreamSubscribe_Identity.
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_Identity.
 var (
-	jsonKey_JetstreamSubscribe_Identity_dollar_type = []byte("\"$type\":")
-	jsonKey_JetstreamSubscribe_Identity_did         = []byte("\"did\":")
-	jsonKey_JetstreamSubscribe_Identity_identity    = []byte("\"identity\":")
-	jsonKey_JetstreamSubscribe_Identity_seq         = []byte("\"seq\":")
-	jsonKey_JetstreamSubscribe_Identity_time        = []byte("\"time\":")
+	jsonKey_JetstreamSubscribeEvents_Identity_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_Identity_did         = []byte("\"did\":")
+	jsonKey_JetstreamSubscribeEvents_Identity_identity    = []byte("\"identity\":")
+	jsonKey_JetstreamSubscribeEvents_Identity_seq         = []byte("\"seq\":")
+	jsonKey_JetstreamSubscribeEvents_Identity_time        = []byte("\"time\":")
 )
 
-func (s *JetstreamSubscribe_Identity) MarshalJSON() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Identity) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Identity) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Identity) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamSubscribe_Identity_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Identity_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Identity_did...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Identity_did...)
 	buf = cbor.AppendJSONString(buf, s.DID)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Identity_identity...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Identity_identity...)
 	{
 		var err error
 		buf, err = s.Identity.AppendJSON(buf)
@@ -1027,13 +1027,13 @@ func (s *JetstreamSubscribe_Identity) AppendJSON(buf []byte) ([]byte, error) {
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Identity_seq...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Identity_seq...)
 	buf = cbor.AppendJSONInt(buf, s.Seq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Identity_time...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Identity_time...)
 	buf = cbor.AppendJSONString(buf, s.Time)
 	first = false
 	for _, ef := range s.extra {
@@ -1052,12 +1052,12 @@ func (s *JetstreamSubscribe_Identity) AppendJSON(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Identity) UnmarshalJSON(data []byte) error {
+func (s *JetstreamSubscribeEvents_Identity) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Identity) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Identity) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)
@@ -1113,10 +1113,10 @@ func (s *JetstreamSubscribe_Identity) UnmarshalJSONAt(data []byte, pos int) (int
 	}
 }
 
-// JetstreamSubscribe_Info is a "info" in the network.bsky.jetstream.subscribe schema.
+// JetstreamSubscribeEvents_Info is a "info" in the network.bsky.jetstream.subscribeEvents schema.
 //
 // An advisory, non-fatal notice about the stream (mirrors com.atproto.sync.subscribeRepos#info). Carries no seq and does not advance the cursor. OutdatedCursor is sent as the first frame when a unix-microseconds timestamp cursor below the retention floor was clamped up to the floor; the message names the seq actually resumed from.
-type JetstreamSubscribe_Info struct {
+type JetstreamSubscribeEvents_Info struct {
 	LexiconTypeID string            `json:"$type,omitempty"`
 	Message       gt.Option[string] `json:"message,omitzero"`
 	Name          string            `json:"name"`
@@ -1125,18 +1125,18 @@ type JetstreamSubscribe_Info struct {
 	extra []extraField
 }
 
-// Precomputed CBOR key tokens for JetstreamSubscribe_Info.
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_Info.
 var (
-	cborKey_JetstreamSubscribe_Info_name        = cbor.AppendTextKey(nil, "name")
-	cborKey_JetstreamSubscribe_Info_dollar_type = cbor.AppendTextKey(nil, "$type")
-	cborKey_JetstreamSubscribe_Info_message     = cbor.AppendTextKey(nil, "message")
+	cborKey_JetstreamSubscribeEvents_Info_name        = cbor.AppendTextKey(nil, "name")
+	cborKey_JetstreamSubscribeEvents_Info_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_Info_message     = cbor.AppendTextKey(nil, "message")
 )
 
-func (s *JetstreamSubscribe_Info) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Info) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Info) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Info) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 1 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
@@ -1148,40 +1148,40 @@ func (s *JetstreamSubscribe_Info) AppendCBOR(buf []byte) ([]byte, error) {
 	if len(s.extra) > 0 {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "name", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Info_name...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_name...)
 		buf = cbor.AppendText(buf, s.Name)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Info_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "message", buf)
 		if s.Message.HasVal() {
-			buf = append(buf, cborKey_JetstreamSubscribe_Info_message...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_message...)
 			buf = cbor.AppendText(buf, s.Message.Val())
 		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
-		buf = append(buf, cborKey_JetstreamSubscribe_Info_name...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_name...)
 		buf = cbor.AppendText(buf, s.Name)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Info_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		if s.Message.HasVal() {
-			buf = append(buf, cborKey_JetstreamSubscribe_Info_message...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_message...)
 			buf = cbor.AppendText(buf, s.Message.Val())
 		}
 	}
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Info) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamSubscribeEvents_Info) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Info) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Info) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -1254,25 +1254,25 @@ func (s *JetstreamSubscribe_Info) UnmarshalCBORAt(data []byte, pos int) (int, er
 	return pos, nil
 }
 
-// Precomputed JSON key tokens for JetstreamSubscribe_Info.
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_Info.
 var (
-	jsonKey_JetstreamSubscribe_Info_dollar_type = []byte("\"$type\":")
-	jsonKey_JetstreamSubscribe_Info_message     = []byte("\"message\":")
-	jsonKey_JetstreamSubscribe_Info_name        = []byte("\"name\":")
+	jsonKey_JetstreamSubscribeEvents_Info_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_Info_message     = []byte("\"message\":")
+	jsonKey_JetstreamSubscribeEvents_Info_name        = []byte("\"name\":")
 )
 
-func (s *JetstreamSubscribe_Info) MarshalJSON() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Info) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Info) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Info) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamSubscribe_Info_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Info_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
@@ -1280,14 +1280,14 @@ func (s *JetstreamSubscribe_Info) AppendJSON(buf []byte) ([]byte, error) {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamSubscribe_Info_message...)
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Info_message...)
 		buf = cbor.AppendJSONString(buf, s.Message.Val())
 		first = false
 	}
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Info_name...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Info_name...)
 	buf = cbor.AppendJSONString(buf, s.Name)
 	first = false
 	for _, ef := range s.extra {
@@ -1306,12 +1306,12 @@ func (s *JetstreamSubscribe_Info) AppendJSON(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Info) UnmarshalJSON(data []byte) error {
+func (s *JetstreamSubscribeEvents_Info) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Info) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Info) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)
@@ -1366,62 +1366,62 @@ func (s *JetstreamSubscribe_Info) UnmarshalJSONAt(data []byte, pos int) (int, er
 	}
 }
 
-// JetstreamSubscribe_Subprotocol is the stream's default wire subprotocol when a
+// JetstreamSubscribeEvents_Subprotocol is the stream's default wire subprotocol when a
 // client does not negotiate one via Sec-WebSocket-Protocol.
-const JetstreamSubscribe_Subprotocol = "xrpc.v1.json"
+const JetstreamSubscribeEvents_Subprotocol = "xrpc.v1.json"
 
-// JetstreamSubscribe_Message is a union type.
-type JetstreamSubscribe_Message struct {
-	JetstreamSubscribe_Commit   gt.Ref[JetstreamSubscribe_Commit]
-	JetstreamSubscribe_Identity gt.Ref[JetstreamSubscribe_Identity]
-	JetstreamSubscribe_Account  gt.Ref[JetstreamSubscribe_Account]
-	JetstreamSubscribe_Sync     gt.Ref[JetstreamSubscribe_Sync]
-	JetstreamSubscribe_Info     gt.Ref[JetstreamSubscribe_Info]
-	Unknown                     gt.Ref[lextypes.UnknownUnionVariant]
+// JetstreamSubscribeEvents_Message is a union type.
+type JetstreamSubscribeEvents_Message struct {
+	JetstreamSubscribeEvents_Commit   gt.Ref[JetstreamSubscribeEvents_Commit]
+	JetstreamSubscribeEvents_Identity gt.Ref[JetstreamSubscribeEvents_Identity]
+	JetstreamSubscribeEvents_Account  gt.Ref[JetstreamSubscribeEvents_Account]
+	JetstreamSubscribeEvents_Sync     gt.Ref[JetstreamSubscribeEvents_Sync]
+	JetstreamSubscribeEvents_Info     gt.Ref[JetstreamSubscribeEvents_Info]
+	Unknown                           gt.Ref[lextypes.UnknownUnionVariant]
 }
 
-func (u JetstreamSubscribe_Message) MarshalJSON() ([]byte, error) {
+func (u JetstreamSubscribeEvents_Message) MarshalJSON() ([]byte, error) {
 	return u.AppendJSON(make([]byte, 0, 256))
 }
 
-func (u JetstreamSubscribe_Message) AppendJSON(buf []byte) ([]byte, error) {
-	if u.JetstreamSubscribe_Commit.HasVal() {
-		v := *u.JetstreamSubscribe_Commit.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#commit"
+func (u JetstreamSubscribeEvents_Message) AppendJSON(buf []byte) ([]byte, error) {
+	if u.JetstreamSubscribeEvents_Commit.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Commit.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#commit"
 		return v.AppendJSON(buf)
 	}
-	if u.JetstreamSubscribe_Identity.HasVal() {
-		v := *u.JetstreamSubscribe_Identity.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#identity"
+	if u.JetstreamSubscribeEvents_Identity.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Identity.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#identity"
 		return v.AppendJSON(buf)
 	}
-	if u.JetstreamSubscribe_Account.HasVal() {
-		v := *u.JetstreamSubscribe_Account.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#account"
+	if u.JetstreamSubscribeEvents_Account.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Account.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#account"
 		return v.AppendJSON(buf)
 	}
-	if u.JetstreamSubscribe_Sync.HasVal() {
-		v := *u.JetstreamSubscribe_Sync.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#sync"
+	if u.JetstreamSubscribeEvents_Sync.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Sync.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#sync"
 		return v.AppendJSON(buf)
 	}
-	if u.JetstreamSubscribe_Info.HasVal() {
-		v := *u.JetstreamSubscribe_Info.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#info"
+	if u.JetstreamSubscribeEvents_Info.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Info.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#info"
 		return v.AppendJSON(buf)
 	}
 	if u.Unknown.HasVal() {
 		return append(buf, u.Unknown.Val().Raw...), nil
 	}
-	return nil, fmt.Errorf("cannot marshal empty union JetstreamSubscribe_Message")
+	return nil, fmt.Errorf("cannot marshal empty union JetstreamSubscribeEvents_Message")
 }
 
-func (u *JetstreamSubscribe_Message) UnmarshalJSON(data []byte) error {
+func (u *JetstreamSubscribeEvents_Message) UnmarshalJSON(data []byte) error {
 	_, err := u.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (u *JetstreamSubscribe_Message) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (u *JetstreamSubscribeEvents_Message) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	endPos, err := cbor.SkipJSONValue(data, pos)
 	if err != nil {
 		return 0, err
@@ -1431,45 +1431,45 @@ func (u *JetstreamSubscribe_Message) UnmarshalJSONAt(data []byte, pos int) (int,
 		return 0, err
 	}
 	switch typ {
-	case "network.bsky.jetstream.subscribe#commit":
-		var v JetstreamSubscribe_Commit
+	case "network.bsky.jetstream.subscribeEvents#commit":
+		var v JetstreamSubscribeEvents_Commit
 		endPos, err = v.UnmarshalJSONAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Commit = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Commit = gt.SomeRef(v)
 		return endPos, nil
-	case "network.bsky.jetstream.subscribe#identity":
-		var v JetstreamSubscribe_Identity
+	case "network.bsky.jetstream.subscribeEvents#identity":
+		var v JetstreamSubscribeEvents_Identity
 		endPos, err = v.UnmarshalJSONAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Identity = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Identity = gt.SomeRef(v)
 		return endPos, nil
-	case "network.bsky.jetstream.subscribe#account":
-		var v JetstreamSubscribe_Account
+	case "network.bsky.jetstream.subscribeEvents#account":
+		var v JetstreamSubscribeEvents_Account
 		endPos, err = v.UnmarshalJSONAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Account = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Account = gt.SomeRef(v)
 		return endPos, nil
-	case "network.bsky.jetstream.subscribe#sync":
-		var v JetstreamSubscribe_Sync
+	case "network.bsky.jetstream.subscribeEvents#sync":
+		var v JetstreamSubscribeEvents_Sync
 		endPos, err = v.UnmarshalJSONAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Sync = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Sync = gt.SomeRef(v)
 		return endPos, nil
-	case "network.bsky.jetstream.subscribe#info":
-		var v JetstreamSubscribe_Info
+	case "network.bsky.jetstream.subscribeEvents#info":
+		var v JetstreamSubscribeEvents_Info
 		endPos, err = v.UnmarshalJSONAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Info = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Info = gt.SomeRef(v)
 		return endPos, nil
 	default:
 		u.Unknown = gt.SomeRef(lextypes.UnknownUnionVariant{Type: typ, Raw: json.RawMessage(data[pos:endPos])})
@@ -1477,92 +1477,92 @@ func (u *JetstreamSubscribe_Message) UnmarshalJSONAt(data []byte, pos int) (int,
 	}
 }
 
-func (u JetstreamSubscribe_Message) MarshalCBOR() ([]byte, error) {
+func (u JetstreamSubscribeEvents_Message) MarshalCBOR() ([]byte, error) {
 	return u.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (u JetstreamSubscribe_Message) AppendCBOR(buf []byte) ([]byte, error) {
-	if u.JetstreamSubscribe_Commit.HasVal() {
-		v := *u.JetstreamSubscribe_Commit.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#commit"
+func (u JetstreamSubscribeEvents_Message) AppendCBOR(buf []byte) ([]byte, error) {
+	if u.JetstreamSubscribeEvents_Commit.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Commit.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#commit"
 		return v.AppendCBOR(buf)
 	}
-	if u.JetstreamSubscribe_Identity.HasVal() {
-		v := *u.JetstreamSubscribe_Identity.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#identity"
+	if u.JetstreamSubscribeEvents_Identity.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Identity.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#identity"
 		return v.AppendCBOR(buf)
 	}
-	if u.JetstreamSubscribe_Account.HasVal() {
-		v := *u.JetstreamSubscribe_Account.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#account"
+	if u.JetstreamSubscribeEvents_Account.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Account.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#account"
 		return v.AppendCBOR(buf)
 	}
-	if u.JetstreamSubscribe_Sync.HasVal() {
-		v := *u.JetstreamSubscribe_Sync.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#sync"
+	if u.JetstreamSubscribeEvents_Sync.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Sync.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#sync"
 		return v.AppendCBOR(buf)
 	}
-	if u.JetstreamSubscribe_Info.HasVal() {
-		v := *u.JetstreamSubscribe_Info.Val()
-		v.LexiconTypeID = "network.bsky.jetstream.subscribe#info"
+	if u.JetstreamSubscribeEvents_Info.HasVal() {
+		v := *u.JetstreamSubscribeEvents_Info.Val()
+		v.LexiconTypeID = "network.bsky.jetstream.subscribeEvents#info"
 		return v.AppendCBOR(buf)
 	}
 	if u.Unknown.HasVal() {
 		return append(buf, u.Unknown.Val().RawCBOR...), nil
 	}
-	return nil, fmt.Errorf("cannot marshal empty union JetstreamSubscribe_Message")
+	return nil, fmt.Errorf("cannot marshal empty union JetstreamSubscribeEvents_Message")
 }
 
-func (u *JetstreamSubscribe_Message) UnmarshalCBOR(data []byte) error {
+func (u *JetstreamSubscribeEvents_Message) UnmarshalCBOR(data []byte) error {
 	_, err := u.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (u *JetstreamSubscribe_Message) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (u *JetstreamSubscribeEvents_Message) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	typ, err := cbor.PeekTypeAt(data, pos)
 	if err != nil {
 		return 0, err
 	}
 	switch typ {
-	case "network.bsky.jetstream.subscribe#commit":
-		var v JetstreamSubscribe_Commit
+	case "network.bsky.jetstream.subscribeEvents#commit":
+		var v JetstreamSubscribeEvents_Commit
 		pos, err = v.UnmarshalCBORAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Commit = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Commit = gt.SomeRef(v)
 		return pos, nil
-	case "network.bsky.jetstream.subscribe#identity":
-		var v JetstreamSubscribe_Identity
+	case "network.bsky.jetstream.subscribeEvents#identity":
+		var v JetstreamSubscribeEvents_Identity
 		pos, err = v.UnmarshalCBORAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Identity = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Identity = gt.SomeRef(v)
 		return pos, nil
-	case "network.bsky.jetstream.subscribe#account":
-		var v JetstreamSubscribe_Account
+	case "network.bsky.jetstream.subscribeEvents#account":
+		var v JetstreamSubscribeEvents_Account
 		pos, err = v.UnmarshalCBORAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Account = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Account = gt.SomeRef(v)
 		return pos, nil
-	case "network.bsky.jetstream.subscribe#sync":
-		var v JetstreamSubscribe_Sync
+	case "network.bsky.jetstream.subscribeEvents#sync":
+		var v JetstreamSubscribeEvents_Sync
 		pos, err = v.UnmarshalCBORAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Sync = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Sync = gt.SomeRef(v)
 		return pos, nil
-	case "network.bsky.jetstream.subscribe#info":
-		var v JetstreamSubscribe_Info
+	case "network.bsky.jetstream.subscribeEvents#info":
+		var v JetstreamSubscribeEvents_Info
 		pos, err = v.UnmarshalCBORAt(data, pos)
 		if err != nil {
 			return 0, err
 		}
-		u.JetstreamSubscribe_Info = gt.SomeRef(v)
+		u.JetstreamSubscribeEvents_Info = gt.SomeRef(v)
 		return pos, nil
 	default:
 		startPos := pos
@@ -1577,10 +1577,10 @@ func (u *JetstreamSubscribe_Message) UnmarshalCBORAt(data []byte, pos int) (int,
 	}
 }
 
-// JetstreamSubscribe_Sync is a "sync" in the network.bsky.jetstream.subscribe schema.
+// JetstreamSubscribeEvents_Sync is a "sync" in the network.bsky.jetstream.subscribeEvents schema.
 //
 // An archived #sync event (broken commit chain; consumers should resync the repo), wrapping the upstream firehose event verbatim. Never emitted on the legacy v1 /subscribe wire.
-type JetstreamSubscribe_Sync struct {
+type JetstreamSubscribeEvents_Sync struct {
 	LexiconTypeID string                             `json:"$type,omitempty"`
 	DID           string                             `json:"did"`
 	Seq           int64                              `json:"seq"`
@@ -1591,20 +1591,20 @@ type JetstreamSubscribe_Sync struct {
 	extra []extraField
 }
 
-// Precomputed CBOR key tokens for JetstreamSubscribe_Sync.
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_Sync.
 var (
-	cborKey_JetstreamSubscribe_Sync_did         = cbor.AppendTextKey(nil, "did")
-	cborKey_JetstreamSubscribe_Sync_seq         = cbor.AppendTextKey(nil, "seq")
-	cborKey_JetstreamSubscribe_Sync_sync        = cbor.AppendTextKey(nil, "sync")
-	cborKey_JetstreamSubscribe_Sync_time        = cbor.AppendTextKey(nil, "time")
-	cborKey_JetstreamSubscribe_Sync_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_Sync_did         = cbor.AppendTextKey(nil, "did")
+	cborKey_JetstreamSubscribeEvents_Sync_seq         = cbor.AppendTextKey(nil, "seq")
+	cborKey_JetstreamSubscribeEvents_Sync_sync        = cbor.AppendTextKey(nil, "sync")
+	cborKey_JetstreamSubscribeEvents_Sync_time        = cbor.AppendTextKey(nil, "time")
+	cborKey_JetstreamSubscribeEvents_Sync_dollar_type = cbor.AppendTextKey(nil, "$type")
 )
 
-func (s *JetstreamSubscribe_Sync) MarshalCBOR() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Sync) MarshalCBOR() ([]byte, error) {
 	return s.AppendCBOR(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Sync) AppendCBOR(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
@@ -1613,13 +1613,13 @@ func (s *JetstreamSubscribe_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 	if len(s.extra) > 0 {
 		ei := 0
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "did", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Sync_did...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_did...)
 		buf = cbor.AppendText(buf, s.DID)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "seq", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Sync_seq...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_seq...)
 		buf = cbor.AppendInt(buf, s.Seq)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "sync", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Sync_sync...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_sync...)
 		{
 			var err error
 			buf, err = s.Sync.AppendCBOR(buf)
@@ -1628,20 +1628,20 @@ func (s *JetstreamSubscribe_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 			}
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "time", buf)
-		buf = append(buf, cborKey_JetstreamSubscribe_Sync_time...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_time...)
 		buf = cbor.AppendText(buf, s.Time)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Sync_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
-		buf = append(buf, cborKey_JetstreamSubscribe_Sync_did...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_did...)
 		buf = cbor.AppendText(buf, s.DID)
-		buf = append(buf, cborKey_JetstreamSubscribe_Sync_seq...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_seq...)
 		buf = cbor.AppendInt(buf, s.Seq)
-		buf = append(buf, cborKey_JetstreamSubscribe_Sync_sync...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_sync...)
 		{
 			var err error
 			buf, err = s.Sync.AppendCBOR(buf)
@@ -1649,22 +1649,22 @@ func (s *JetstreamSubscribe_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
-		buf = append(buf, cborKey_JetstreamSubscribe_Sync_time...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_time...)
 		buf = cbor.AppendText(buf, s.Time)
 		if s.LexiconTypeID != "" {
-			buf = append(buf, cborKey_JetstreamSubscribe_Sync_dollar_type...)
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 	}
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Sync) UnmarshalCBOR(data []byte) error {
+func (s *JetstreamSubscribeEvents_Sync) UnmarshalCBOR(data []byte) error {
 	_, err := s.UnmarshalCBORAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Sync) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Sync) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingCBOR)
 	count, pos, err := cbor.ReadMapHeader(data, pos)
 	if err != nil {
@@ -1741,46 +1741,46 @@ func (s *JetstreamSubscribe_Sync) UnmarshalCBORAt(data []byte, pos int) (int, er
 	return pos, nil
 }
 
-// Precomputed JSON key tokens for JetstreamSubscribe_Sync.
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_Sync.
 var (
-	jsonKey_JetstreamSubscribe_Sync_dollar_type = []byte("\"$type\":")
-	jsonKey_JetstreamSubscribe_Sync_did         = []byte("\"did\":")
-	jsonKey_JetstreamSubscribe_Sync_seq         = []byte("\"seq\":")
-	jsonKey_JetstreamSubscribe_Sync_sync        = []byte("\"sync\":")
-	jsonKey_JetstreamSubscribe_Sync_time        = []byte("\"time\":")
+	jsonKey_JetstreamSubscribeEvents_Sync_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_Sync_did         = []byte("\"did\":")
+	jsonKey_JetstreamSubscribeEvents_Sync_seq         = []byte("\"seq\":")
+	jsonKey_JetstreamSubscribeEvents_Sync_sync        = []byte("\"sync\":")
+	jsonKey_JetstreamSubscribeEvents_Sync_time        = []byte("\"time\":")
 )
 
-func (s *JetstreamSubscribe_Sync) MarshalJSON() ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Sync) MarshalJSON() ([]byte, error) {
 	return s.AppendJSON(make([]byte, 0, 256))
 }
 
-func (s *JetstreamSubscribe_Sync) AppendJSON(buf []byte) ([]byte, error) {
+func (s *JetstreamSubscribeEvents_Sync) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, '{')
 	first := true
 	if s.LexiconTypeID != "" {
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, jsonKey_JetstreamSubscribe_Sync_dollar_type...)
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Sync_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Sync_did...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Sync_did...)
 	buf = cbor.AppendJSONString(buf, s.DID)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Sync_seq...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Sync_seq...)
 	buf = cbor.AppendJSONInt(buf, s.Seq)
 	first = false
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Sync_sync...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Sync_sync...)
 	{
 		var err error
 		buf, err = s.Sync.AppendJSON(buf)
@@ -1792,7 +1792,7 @@ func (s *JetstreamSubscribe_Sync) AppendJSON(buf []byte) ([]byte, error) {
 	if !first {
 		buf = append(buf, ',')
 	}
-	buf = append(buf, jsonKey_JetstreamSubscribe_Sync_time...)
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Sync_time...)
 	buf = cbor.AppendJSONString(buf, s.Time)
 	first = false
 	for _, ef := range s.extra {
@@ -1811,12 +1811,12 @@ func (s *JetstreamSubscribe_Sync) AppendJSON(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *JetstreamSubscribe_Sync) UnmarshalJSON(data []byte) error {
+func (s *JetstreamSubscribeEvents_Sync) UnmarshalJSON(data []byte) error {
 	_, err := s.UnmarshalJSONAt(data, 0)
 	return err
 }
 
-func (s *JetstreamSubscribe_Sync) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+func (s *JetstreamSubscribeEvents_Sync) UnmarshalJSONAt(data []byte, pos int) (int, error) {
 	s.extra = clearExtra(s.extra, extraEncodingJSON)
 	var err error
 	pos, err = cbor.ReadJSONObjectStart(data, pos)

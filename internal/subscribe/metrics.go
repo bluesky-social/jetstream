@@ -147,7 +147,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		SubprotocolNegotiations: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "subprotocol_negotiations_total",
-			Help: "network.bsky.jetstream.subscribe connections by Sec-WebSocket-Protocol outcome: negotiated (client offered xrpc.v1.json, server echoed it) or default (no recognized offer; lexicon-declared default applies). Framing is identical either way.",
+			Help: "network.bsky.jetstream.subscribeEvents connections by Sec-WebSocket-Protocol outcome: negotiated (client offered xrpc.v1.json, server echoed it) or default (no recognized offer; lexicon-declared default applies). Framing is identical either way.",
 		}, []string{"outcome"}),
 	}
 	reg.MustRegister(

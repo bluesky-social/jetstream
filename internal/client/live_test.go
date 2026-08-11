@@ -248,13 +248,13 @@ func TestLiveConsumerSubscribeURL(t *testing.T) {
 	t.Parallel()
 	c := newLiveConsumer(liveConfig{host: "https://jetstream.example", cursor: 123})
 	u := c.subscribeURL()
-	require.True(t, strings.HasPrefix(u, "wss://jetstream.example/xrpc/network.bsky.jetstream.subscribe?"), "got %s", u)
+	require.True(t, strings.HasPrefix(u, "wss://jetstream.example/xrpc/network.bsky.jetstream.subscribeEvents?"), "got %s", u)
 	require.NotContains(t, u, "extended=", "the removed extended param must not be sent")
 	require.Contains(t, u, "cursor=123")
 
 	c2 := newLiveConsumer(liveConfig{host: "http://localhost:8080", fromTip: true})
 	u2 := c2.subscribeURL()
-	require.True(t, strings.HasPrefix(u2, "ws://localhost:8080/xrpc/network.bsky.jetstream.subscribe"), "got %s", u2)
+	require.True(t, strings.HasPrefix(u2, "ws://localhost:8080/xrpc/network.bsky.jetstream.subscribeEvents"), "got %s", u2)
 	require.NotContains(t, u2, "cursor=", "no cursor when fromTip (live from tip)")
 }
 

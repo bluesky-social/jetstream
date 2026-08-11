@@ -62,7 +62,7 @@ func TestHandlerV2_SubprotocolNegotiation(t *testing.T) {
 			var seq uint64
 			publishIdentity(t, b, &seq, "did:plc:negotiate", 1)
 			payload := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
-			require.Equal(t, "network.bsky.jetstream.subscribe#identity", payload["$type"])
+			require.Equal(t, "network.bsky.jetstream.subscribeEvents#identity", payload["$type"])
 		})
 	}
 }

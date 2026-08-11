@@ -183,7 +183,7 @@ func TestEntry_CompressedV2_SyncEmitsDecodableFrame(t *testing.T) {
 	decoded, err := dec.DecodeAll(v2Body, nil)
 	require.NoError(t, err)
 
-	require.Contains(t, string(decoded), `"$type":"network.bsky.jetstream.subscribe#sync"`,
+	require.Contains(t, string(decoded), `"$type":"network.bsky.jetstream.subscribeEvents#sync"`,
 		"decoded frame must be a #sync message frame")
 	require.Contains(t, string(decoded), "did:plc:testsync", "decoded frame must contain the DID")
 }

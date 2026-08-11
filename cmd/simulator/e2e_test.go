@@ -97,7 +97,7 @@ func TestEndToEnd_JetstreamConsumesSimulator(t *testing.T) {
 	// Wait for jetstream's /subscribe to start serving (backfill
 	// drained → steady-state). The handler returns 503 while not
 	// in steady-state; a successful websocket dial means we're in.
-	waitForJetstreamSubscribeReady(t, proc, jetAddr, stderr, 45*time.Second)
+	waitForJetstreamSubscribeEventsReady(t, proc, jetAddr, stderr, 45*time.Second)
 
 	// Now consume one live event.
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 15*time.Second)

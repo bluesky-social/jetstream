@@ -191,7 +191,7 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 			}
 		}
 	}))
-	mux.Handle("GET /xrpc/network.bsky.jetstream.subscribe", subscribe.NewHandler(subscribe.Subscription{
+	mux.Handle("GET /xrpc/network.bsky.jetstream.subscribeEvents", subscribe.NewHandler(subscribe.Subscription{
 		Tail:     tail,
 		Store:    st,
 		Manifest: m,
@@ -247,7 +247,7 @@ func (s *pagedCutoverServer) AppendLive(evs ...segment.Event) {
 // the raw §14 signal the client's re-backfill keys on.
 func dialSubscribeV2(t *testing.T, baseURL string, cursor uint64) (status int, body string) {
 	t.Helper()
-	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/xrpc/network.bsky.jetstream.subscribe?cursor=" + strconv.FormatUint(cursor, 10)
+	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/xrpc/network.bsky.jetstream.subscribeEvents?cursor=" + strconv.FormatUint(cursor, 10)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	conn, resp, err := websocket.Dial(ctx, wsURL, nil)

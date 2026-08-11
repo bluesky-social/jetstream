@@ -111,7 +111,7 @@ func (p *jetstreamProcess) stop() {
 	p.mu.Unlock()
 }
 
-func waitForJetstreamSubscribeReady(t *testing.T, proc *jetstreamProcess, addr string, logs *lockedBuffer, timeout time.Duration) {
+func waitForJetstreamSubscribeEventsReady(t *testing.T, proc *jetstreamProcess, addr string, logs *lockedBuffer, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
