@@ -335,8 +335,9 @@ func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, obsClien
 }
 
 // observedEventFromClient adapts a decoded public jetstream.Event into the
-// oracle's ObservedEvent. Commit payloads use the byte-exact RecordCBOR the
-// client preserves; account/sync rows are re-marshaled so Reconstruct and
+// oracle's ObservedEvent. Commit payloads use RecordCBOR: segment bytes on
+// backfill and the canonical DRISL encoding reconstructed from JSON on live.
+// Account/sync rows are re-marshaled so Reconstruct and
 // CheckCompacted (which decode the account payload / treat sync as a DID
 // tombstone) see the same shape as a direct segment scan.
 func observedEventFromClient(t *testing.T, ev jetstream.Event) ObservedEvent {

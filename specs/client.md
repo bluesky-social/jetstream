@@ -257,13 +257,13 @@ embedded dictionary).
 One `Event` struct regardless of origin (archive or live): `Seq`, `DID`,
 `TimeUS`, `Kind` (`commit`/`identity`/`account`/`sync`), with the matching
 sub-struct populated. Commits carry `Record` (generic map; nil in raw
-mode), `RecordCBOR` (byte-exact DAG-CBOR), and `CID`. `#sync` events are
-delivered on backfill and the v2 live tail (v1 never emits them). On the
-wire, live events are proposal-0015 message frames dispatched by payload
-`$type` (docs/README.md §5.2), with `recordCbor` as the atproto
-data-model `{"$bytes": ...}` form and `time` as a microsecond-precision
-datetime the client parses back to `TimeUS`; the decode is transparent to
-API consumers.
+mode), `RecordCBOR` (segment bytes on backfill; canonical DRISL encoding
+reconstructed from JSON on live), and `CID`. `#sync` events are delivered
+on backfill and the v2 live tail (v1 never emits them). On the wire, live
+events are proposal-0015 message frames dispatched by payload `$type`
+(docs/README.md §5.2), with the atproto JSON data-model value in `record`
+and `time` as a microsecond-precision datetime the client parses back to
+`TimeUS`; the decode is transparent to API consumers.
 
 ## Writing a third-party client: the checklist
 

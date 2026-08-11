@@ -144,7 +144,6 @@ func v2Commit(evt *segment.Event) (jetstream.JetstreamSubscribeEvents_Commit, er
 		}
 		commit.Record = recordJSON
 		commit.CID = gt.Some(cbor.ComputeCID(cbor.CodecDagCBOR, evt.Payload).String())
-		commit.RecordCbor = evt.Payload
 	}
 	return commit, nil
 }

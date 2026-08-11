@@ -373,7 +373,7 @@ func decodeV2Union(t *testing.T, body []byte) *jetstream.JetstreamSubscribeEvent
 	return &msg
 }
 
-func TestEncodeV2_CommitFrameCarriesRecordCBOR(t *testing.T) {
+func TestEncodeV2_CommitFrameCarriesReadableRecordOnly(t *testing.T) {
 	t.Parallel()
 	payload := []byte{0xa0}
 	evt := &segment.Event{
@@ -405,15 +405,14 @@ func TestEncodeV2_CommitFrameCarriesRecordCBOR(t *testing.T) {
 	require.NotContains(t, got, "kind", "the kind discriminator is the $type; no kind field on the new wire")
 	require.NotContains(t, got, "cursor", "the duplicated cursor field died with the old wire; seq is the cursor")
 
-	recordCbor, ok := got["recordCbor"].(map[string]any)
-	require.True(t, ok, "recordCbor must be the atproto data-model $bytes object")
-	require.Equal(t, base64.RawStdEncoding.EncodeToString(payload), recordCbor["$bytes"])
+	require.Equal(t, map[string]any{}, got["record"])
+	require.NotContains(t, got, "recordCbor", "record JSON has a canonical DRISL encoding; duplicate CBOR wastes wire bytes")
 
 	// Cross-stack: the payload decodes through the generated union.
 	msg := decodeV2Union(t, body)
 	commit := msg.JetstreamSubscribeEvents_Commit.Val()
 	require.Equal(t, int64(12345), commit.Seq)
-	require.Equal(t, payload, commit.RecordCbor)
+	require.JSONEq(t, `{}`, string(commit.Record))
 	require.Equal(t, "app.bsky.feed.post", commit.Collection)
 }
 

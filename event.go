@@ -79,11 +79,10 @@ type Commit struct {
 	// their own lexicon codegen.
 	Record map[string]any `json:"record,omitempty"`
 
-	// RecordCBOR is the raw, byte-exact DAG-CBOR encoding of the record,
-	// suitable for verifying against a PDS or reconstructing the MST. nil for
-	// deletes. It is populated on both the backfill and live paths. Marshals
-	// to base64 in JSON output (the live wire itself carries the atproto
-	// data-model {"$bytes": ...} form).
+	// RecordCBOR is the record's canonical DAG-CBOR encoding. On the archive
+	// path it is the segment payload; on the live path the client reconstructs
+	// it from the atproto JSON record according to DRISL. nil for deletes.
+	// Marshals to base64 in JSON output.
 	RecordCBOR []byte `json:"record_cbor,omitempty"`
 }
 

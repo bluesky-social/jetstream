@@ -1,5 +1,11 @@
 # /subscribe-v2: adopt XRPC JSON subscription framing (proposal 0015) — design (2026-08-10)
 
+> **Historical design:** the implemented `network.bsky.jetstream.subscribeEvents`
+> contract no longer carries the draft's `recordCbor` field. `record` is the
+> atproto JSON data-model value; DRISL defines its canonical DAG-CBOR encoding,
+> so transmitting both representations was redundant. See the authoritative
+> lexicon and `docs/README.md` §5.2 for the current wire.
+
 Issue: bluesky-social/jetstream#318. Prereq landed: atmos v0.3.2
 (jcalabro/atmos#6) implements the 0015 subprotocols for both the streaming
 client and `xrpcserver.HandleSubscription`; jetstream is pinned to it as of

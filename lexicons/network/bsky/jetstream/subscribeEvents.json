@@ -100,10 +100,6 @@
           "type": "string",
           "format": "cid",
           "description": "CID of the record. Absent for deletes."
-        },
-        "recordCbor": {
-          "type": "bytes",
-          "description": "The record's raw DAG-CBOR, byte-exact as archived — suitable for CID verification, MST reconstruction, or typed decoding via lexicon codegen. Absent for deletes."
         }
       }
     },

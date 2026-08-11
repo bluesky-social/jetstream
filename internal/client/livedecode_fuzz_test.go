@@ -1,11 +1,6 @@
 package client
 
-import (
-	"encoding/base64"
-	"testing"
-
-	"github.com/jcalabro/atmos/cbor"
-)
+import "testing"
 
 // FuzzDecodeLiveFrame asserts the live-frame decoder never panics on arbitrary
 // bytes: live frames are untrusted server input (AGENTS.md treats all upstream
@@ -13,13 +8,11 @@ import (
 // never a crash.
 func FuzzDecodeLiveFrame(f *testing.F) {
 	// Seed with valid and adversarial shapes.
-	rec, _ := cbor.Marshal(map[string]any{"$type": "app.bsky.feed.post", "text": "hi"})
-	b64 := base64.RawStdEncoding.EncodeToString(rec)
 	const t0 = "1970-01-01T00:00:00.000001Z"
-	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":1,"did":"did:plc:a","time":"` + t0 + `","rev":"r","operation":"create","collection":"c","rkey":"r","recordCbor":{"$bytes":"` + b64 + `"}}}`))
+	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":1,"did":"did:plc:a","time":"` + t0 + `","rev":"r","operation":"create","collection":"c","rkey":"r","record":{"$type":"app.bsky.feed.post","text":"hi"}}}`))
 	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#info","name":"OutdatedCursor"}}`))
 	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#futureKind","seq":9}}`))
-	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","operation":"create","recordCbor":{"$bytes":"!!"}}}`))
+	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","operation":"create","record":{"bad":{"$bytes":"!!"}}}}`))
 	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#sync","seq":-1,"did":"d","time":"` + t0 + `"}}`))
 	f.Add([]byte(`{"$type":"error","error":"FutureCursor","message":"x"}`))
 	f.Add([]byte(`{"$type":"error"}`))

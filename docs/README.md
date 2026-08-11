@@ -651,15 +651,14 @@ Every frame is exactly one self-describing JSON object. A **message** frame wrap
     "collection": "app.bsky.feed.like",
     "rkey": "3l3qo2vuowo2b",
     "cid": "bafyreidwaivazkwu67xztlmuobx35hs2lnfh3kolmgfmucldvhd3sgzcqi",
-    "record": { "$type": "app.bsky.feed.like", "...": "..." },
-    "recordCbor": { "$bytes": "omdwYXlsb2Fk..." }
+    "record": { "$type": "app.bsky.feed.like", "...": "..." }
   }
 }
 ```
 
 The message union has five variants:
 
-- `#commit` — a record mutation. `record` is the decoded JSON; `recordCbor` is the raw DAG-CBOR in the atproto data-model `{"$bytes": "<base64>"}` form, byte-exact as archived — suitable for CID verification, MST reconstruction, or typed decoding with lexicon codegen. Both are absent on deletes.
+- `#commit` — a record mutation. `record` is its [atproto JSON data-model](https://atproto.com/specs/data-model) value and is absent on deletes. Per [DRISL](https://dasl.ing/drisl.html), consumers can encode this value as canonical DAG-CBOR for CID verification, MST reconstruction, or typed decoding; the stream does not duplicate it as base64 CBOR.
 - `#identity`, `#account`, `#sync` — wrap the upstream `com.atproto.sync.subscribeRepos` events verbatim (the wrapped event's `seq` and `time` are the upstream relay's, distinct from jetstream's envelope fields). `#sync` is never emitted on the legacy v1 wire.
 - `#info` — a seq-less advisory (`OutdatedCursor` after a clamped timestamp-cursor resume).
 
@@ -681,9 +680,9 @@ The v2 endpoint also diverges from v1 in presentation policy (deliberate, per-en
 
 Compression is the dict-zstd scheme only: fetch the dictionary via `network.bsky.jetstream.getZstdDictionary`, connect with `?zstdDictionary=<id>`, and frames arrive as binary websocket messages — each one zstd frame whose decompressed bytes are exactly the `xrpc.v1.json` text frame. An unknown or retired ID is a pre-upgrade 400 (`UnknownZstdDictionary`) carrying the current ID. permessage-deflate is never negotiated (the proposal recommends it; our measurements say per-connection deflate is the dominant server cost at fanout scale — see `specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md`).
 
-The bundled Go client consumes this wire on its live tail; the raw DAG-CBOR is what lets a typed consumer decode records with its own lexicon codegen, byte-exactly.
+The bundled Go client consumes this wire on its live tail. It canonicalizes `record` to DAG-CBOR according to DRISL when a caller requests typed or CBOR records; archive backfills continue to decode segment CBOR directly for throughput.
 
-The v2 stream is not authenticated, but it is more expensive to produce (embedded CBOR, heavier per-event payload) so we may more strictly rate limit it compared to the v1 firehose on the Bluesky-hosted instance.
+The v2 stream is not authenticated, so we may more strictly rate limit it compared to the v1 firehose on the Bluesky-hosted instance.
 
 > Historical notes: earlier drafts specified an `?extended=true` opt-in carrying `upstream_relay_cursor` and interleaved control events to serve a since-dropped replication protocol, and an earlier pre-launch wire (served at `/subscribe-v2`) used bare v1-superset JSON objects with `time_us`/`cursor`/`kind`/`record_cbor` fields; both were replaced before launch — the proposal-0015 lexicon contract above is the only v2 wire that ever shipped.
 

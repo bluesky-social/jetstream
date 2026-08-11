@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/jcalabro/atmos/cbor"
 )
 
 // syncBuffer is a concurrency-safe bytes.Buffer for capturing CLI output while
@@ -63,15 +61,11 @@ func liveServer(t *testing.T, frames []string) *httptest.Server {
 
 func commitFrame(t *testing.T, seq uint64, did, coll, rkey string) string {
 	t.Helper()
-	rec, err := cbor.Marshal(map[string]any{"$type": coll, "text": "hi " + rkey})
-	if err != nil {
-		t.Fatal(err)
-	}
 	s := strconv.FormatUint(seq, 10)
 	return `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit"` +
 		`,"seq":` + s + `,"did":"` + did + `","time":"1970-01-01T00:00:00.000001Z"` +
 		`,"rev":"r","operation":"create","collection":"` + coll +
-		`","rkey":"` + rkey + `","cid":"bafytest","recordCbor":{"$bytes":"` + base64.RawStdEncoding.EncodeToString(rec) + `"}}}`
+		`","rkey":"` + rkey + `","cid":"bafytest","record":{"$type":"` + coll + `","text":"hi ` + rkey + `"}}}`
 }
 
 // TestSubscribeFatalBackfillReturnsError is the E1/E2 regression guard: a
