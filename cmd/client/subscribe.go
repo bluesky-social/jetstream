@@ -73,7 +73,8 @@ func subscribeCommand() *cli.Command {
 			},
 			&cli.BoolFlag{
 				Name:  "zstd",
-				Usage: "Compress the live tail with the server's zstd dictionary (fetched automatically); cuts bandwidth ~2.5x",
+				Usage: "Compress the live tail with the server's zstd dictionary (default true; use --zstd=false to disable)",
+				Value: true,
 			},
 			&cli.BoolFlag{
 				Name:  "typed-likes-client",
@@ -131,9 +132,7 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 	opts := []jetstream.Option{
 		jetstream.WithBatchSize(cmd.Int("batch-size")),
 	}
-	if cmd.Bool("zstd") {
-		opts = append(opts, jetstream.WithZstdCompression())
-	}
+	opts = append(opts, jetstream.WithZstdCompression(cmd.Bool("zstd")))
 	// --download-concurrency=0 (the default) means "let the library auto-size
 	// from the CPU count"; only forward an explicit positive override so the
 	// library default applies otherwise.
