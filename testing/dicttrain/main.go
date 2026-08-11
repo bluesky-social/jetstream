@@ -5,7 +5,7 @@
 //	just train-subscribe-dict host=...   # against another instance
 //
 // It captures --samples uncompressed frames from the live
-// /xrpc/network.bsky.jetstream.subscribe websocket,
+// /xrpc/network.bsky.jetstream.subscribeEvents websocket,
 // trains a fastCOVER dictionary via the zstd CLI (which measurably
 // outperforms pure-Go builders on this corpus; see
 // specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md §7), embeds
@@ -107,7 +107,7 @@ func mustAtoi(s string) int {
 // capture reads train+holdout consecutive uncompressed frames from the
 // live v2 websocket.
 func capture(ctx context.Context, host string, train, holdout int) (trainMsgs, evalMsgs [][]byte, err error) {
-	conn, _, err := websocket.Dial(ctx, "ws://"+host+"/xrpc/network.bsky.jetstream.subscribe", &websocket.DialOptions{
+	conn, _, err := websocket.Dial(ctx, "ws://"+host+"/xrpc/network.bsky.jetstream.subscribeEvents", &websocket.DialOptions{
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {

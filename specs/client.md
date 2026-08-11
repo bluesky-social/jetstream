@@ -24,7 +24,7 @@ forever. Jetstream splits that into two transports:
 - **Sealed history** is downloaded over HTTP/XRPC (`planBackfill` →
   `getSegment`/`getBlock`), because bulk history wants parallelism, resume,
   and CDN-cacheable immutable artifacts.
-- **The live tail** is a websocket (`/xrpc/network.bsky.jetstream.subscribe`,
+- **The live tail** is a websocket (`/xrpc/network.bsky.jetstream.subscribeEvents`,
   proposal-0015 xrpc.v1.json framing), because the tip wants
   push latency.
 
@@ -149,7 +149,7 @@ progress resets it).
 the dial offers `xrpc.v1.json` via `Sec-WebSocket-Protocol` and verifies
 the echo (RFC 6455 §4.1: a non-offered selection fails the connection; an
 empty echo is the lexicon-default fallback — identical framing). Frames
-decode through the lexgen-generated `JetstreamSubscribe_Message` union —
+decode through the lexgen-generated `JetstreamSubscribeEvents_Message` union —
 the same types the server encodes with. `#info` advisories are logged and
 skipped (no seq); unknown envelope/payload `$type`s skip for forward
 compat; `{"$type":"error",...}` frames surface typed through the

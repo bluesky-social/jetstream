@@ -39,7 +39,7 @@ func Encode(evt *segment.Event) ([]byte, error) {
 }
 
 // wireTimeLayout is the canonical rendering of an event's witnessed
-// timestamp on the network.bsky.jetstream.subscribe wire: RFC 3339 UTC
+// timestamp on the network.bsky.jetstream.subscribeEvents wire: RFC 3339 UTC
 // with exactly six fractional digits, so the unix-microseconds value a
 // timestamp cursor compares against round-trips byte-stably (goldens,
 // the shared zstd dictionary, and client-side µs recovery all rely on
@@ -59,28 +59,28 @@ const (
 )
 
 // EncodeV2 renders evt as one xrpc.v1.json message frame for the
-// network.bsky.jetstream.subscribe wire (atproto proposal 0015):
+// network.bsky.jetstream.subscribeEvents wire (atproto proposal 0015):
 //
-//	{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#<kind>", ...}}
+//	{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#<kind>", ...}}
 //
 // The payload is built through the lexgen-generated message union so the
 // wire can never drift from the published lexicon. Unlike the v1 wire it
 // emits archived #sync events.
 func EncodeV2(evt *segment.Event) ([]byte, error) {
-	var msg jetstream.JetstreamSubscribe_Message
+	var msg jetstream.JetstreamSubscribeEvents_Message
 	switch evt.Kind {
 	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:
 		commit, err := v2Commit(evt)
 		if err != nil {
 			return nil, err
 		}
-		msg.JetstreamSubscribe_Commit = gt.SomeRef(commit)
+		msg.JetstreamSubscribeEvents_Commit = gt.SomeRef(commit)
 	case segment.KindIdentity:
 		var id comatproto.SyncSubscribeRepos_Identity
 		if err := id.UnmarshalCBOR(evt.Payload); err != nil {
 			return nil, fmt.Errorf("subscribe: decode identity: %w", err)
 		}
-		msg.JetstreamSubscribe_Identity = gt.SomeRef(jetstream.JetstreamSubscribe_Identity{
+		msg.JetstreamSubscribeEvents_Identity = gt.SomeRef(jetstream.JetstreamSubscribeEvents_Identity{
 			Seq:      int64(evt.Seq),
 			DID:      evt.DID,
 			Time:     wireTime(evt.DisplayTimeUS()),
@@ -91,7 +91,7 @@ func EncodeV2(evt *segment.Event) ([]byte, error) {
 		if err := acct.UnmarshalCBOR(evt.Payload); err != nil {
 			return nil, fmt.Errorf("subscribe: decode account: %w", err)
 		}
-		msg.JetstreamSubscribe_Account = gt.SomeRef(jetstream.JetstreamSubscribe_Account{
+		msg.JetstreamSubscribeEvents_Account = gt.SomeRef(jetstream.JetstreamSubscribeEvents_Account{
 			Seq:     int64(evt.Seq),
 			DID:     evt.DID,
 			Time:    wireTime(evt.DisplayTimeUS()),
@@ -102,7 +102,7 @@ func EncodeV2(evt *segment.Event) ([]byte, error) {
 		if err := sync.UnmarshalCBOR(evt.Payload); err != nil {
 			return nil, fmt.Errorf("subscribe: decode sync: %w", err)
 		}
-		msg.JetstreamSubscribe_Sync = gt.SomeRef(jetstream.JetstreamSubscribe_Sync{
+		msg.JetstreamSubscribeEvents_Sync = gt.SomeRef(jetstream.JetstreamSubscribeEvents_Sync{
 			Seq:  int64(evt.Seq),
 			DID:  evt.DID,
 			Time: wireTime(evt.DisplayTimeUS()),
@@ -122,8 +122,8 @@ func EncodeV2(evt *segment.Event) ([]byte, error) {
 }
 
 // v2Commit builds the generated #commit payload from a commit-kind event.
-func v2Commit(evt *segment.Event) (jetstream.JetstreamSubscribe_Commit, error) {
-	commit := jetstream.JetstreamSubscribe_Commit{
+func v2Commit(evt *segment.Event) (jetstream.JetstreamSubscribeEvents_Commit, error) {
+	commit := jetstream.JetstreamSubscribeEvents_Commit{
 		Seq:        int64(evt.Seq),
 		DID:        evt.DID,
 		Time:       wireTime(evt.DisplayTimeUS()),
@@ -166,12 +166,12 @@ func EncodeV2Error(code, message string) []byte {
 // EncodeV2Info renders an #info advisory as an xrpc.v1.json message
 // frame. Info frames carry no seq and do not advance the cursor.
 func EncodeV2Info(name, message string) ([]byte, error) {
-	info := jetstream.JetstreamSubscribe_Info{Name: name}
+	info := jetstream.JetstreamSubscribeEvents_Info{Name: name}
 	if message != "" {
 		info.Message = gt.Some(message)
 	}
-	msg := jetstream.JetstreamSubscribe_Message{
-		JetstreamSubscribe_Info: gt.SomeRef(info),
+	msg := jetstream.JetstreamSubscribeEvents_Message{
+		JetstreamSubscribeEvents_Info: gt.SomeRef(info),
 	}
 	buf := append([]byte(nil), messageFramePrefix...)
 	buf, err := msg.AppendJSON(buf)

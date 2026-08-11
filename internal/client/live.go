@@ -408,14 +408,14 @@ func (c *liveConsumer) subscribeURL() string {
 }
 
 // subscribeNSID is the lexicon NSID the live tail dials at /xrpc/<nsid>.
-const subscribeNSID = "network.bsky.jetstream.subscribe"
+const subscribeNSID = "network.bsky.jetstream.subscribeEvents"
 
 // subscribeSubprotocol is the xrpc.v1.json wire subprotocol (proposal
 // 0015) offered via Sec-WebSocket-Protocol. It is also the stream's
 // lexicon-declared default, so an empty server echo means identical
 // framing; the offer exists so negotiation-aware servers and middleboxes
 // see an explicit token. MUST equal
-// api/jetstream.JetstreamSubscribe_Subprotocol (the client module can't
+// api/jetstream.JetstreamSubscribeEvents_Subprotocol (the client module can't
 // depend on which side generated it; the contract test pins them equal).
 const subscribeSubprotocol = "xrpc.v1.json"
 
@@ -452,7 +452,7 @@ var errLiveCursorTooOld = errors.New("jetstream: live cursor too old")
 var errLiveDictRejected = errors.New("jetstream: live zstd dictionary rejected")
 
 // XRPC error names the server uses on pre-upgrade rejections. They are the
-// wire contract (declared in the network.bsky.jetstream.subscribe lexicon);
+// wire contract (declared in the network.bsky.jetstream.subscribeEvents lexicon);
 // the client matches the structured envelope's error name, never body
 // substrings. The internal/subscribe handler is the emitting side; the
 // cross-package contract test (live_subscribe_contract_test.go) pins the

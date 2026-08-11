@@ -106,7 +106,7 @@ var ErrInvalidCursor = errors.New("subscribe: invalid cursor")
 // the v2 policy) when a seq cursor resolves below the lookback floor. The
 // handler converts it into a pre-upgrade HTTP 400 XRPC envelope with error
 // name "CursorTooOld" (the wire contract clients match on — declared in the
-// network.bsky.jetstream.subscribe lexicon); the message carries both the
+// network.bsky.jetstream.subscribeEvents lexicon); the message carries both the
 // requested seq and the floor seq so the client can re-backfill from its
 // last seq. v1 never returns this (it clamps instead).
 var ErrCursorTooOld = errors.New("subscribe: cursor too old")

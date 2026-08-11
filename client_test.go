@@ -391,7 +391,7 @@ func TestSubscribeLiveTailEndToEnd(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/xrpc/network.bsky.jetstream.subscribe", r.URL.Path)
+		require.Equal(t, "/xrpc/network.bsky.jetstream.subscribeEvents", r.URL.Path)
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -497,12 +497,12 @@ func TestCloseStopsRunningEventsWithoutCtxCancel(t *testing.T) {
 }
 
 // liveCommitFrameJSON builds an xrpc.v1.json #commit message frame with a
-// minimal CBOR record, matching the network.bsky.jetstream.subscribe wire.
+// minimal CBOR record, matching the network.bsky.jetstream.subscribeEvents wire.
 func liveCommitFrameJSON(seq uint64, did, coll, rkey string) string {
 	rec, _ := cbor.Marshal(map[string]any{"$type": coll, "text": "hi " + rkey})
 	b64 := base64.RawStdEncoding.EncodeToString(rec)
 	s := strconv.FormatUint(seq, 10)
-	return `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit"` +
+	return `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit"` +
 		`,"seq":` + s + `,"did":"` + did + `","time":"1970-01-01T00:00:00.000001Z"` +
 		`,"rev":"r","operation":"create","collection":"` + coll +
 		`","rkey":"` + rkey + `","cid":"bafytest","recordCbor":{"$bytes":"` + b64 + `"}}}`

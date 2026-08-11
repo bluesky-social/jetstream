@@ -122,7 +122,7 @@ func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 	// Wait for jetstream's /subscribe to start serving (backfill drained →
 	// steady-state). The getBlock/listSegments routes share the same readiness
 	// gate, so a successful websocket dial also means those routes are live.
-	waitForJetstreamSubscribeReady(t, proc, jetAddr, stderr, 45*time.Second)
+	waitForJetstreamSubscribeEventsReady(t, proc, jetAddr, stderr, 45*time.Second)
 
 	segDir := filepath.Join(jetDir, "segments")
 	listURL := "http://" + jetAddr + "/xrpc/network.bsky.jetstream.listSegments?limit=1000"

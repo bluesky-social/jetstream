@@ -511,7 +511,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// 0015; #318). The Go 1.22 mux prefers this exact pattern over the
 	// "/xrpc/" xrpcserver subtree registered below, so the bespoke
 	// handler owns this one NSID while atmos xrpcserver keeps the rest.
-	srv.RegisterPublicRoute("GET /xrpc/network.bsky.jetstream.subscribe", subscribe.NewHandler(subscribe.Subscription{
+	srv.RegisterPublicRoute("GET /xrpc/network.bsky.jetstream.subscribeEvents", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
 		Store:     metaStore,
 		Manifest:  mft,

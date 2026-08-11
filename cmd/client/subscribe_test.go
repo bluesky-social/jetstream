@@ -41,7 +41,7 @@ func (b *syncBuffer) String() string {
 func liveServer(t *testing.T, frames []string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/xrpc/network.bsky.jetstream.subscribe" {
+		if r.URL.Path != "/xrpc/network.bsky.jetstream.subscribeEvents" {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -68,7 +68,7 @@ func commitFrame(t *testing.T, seq uint64, did, coll, rkey string) string {
 		t.Fatal(err)
 	}
 	s := strconv.FormatUint(seq, 10)
-	return `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribe#commit"` +
+	return `{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit"` +
 		`,"seq":` + s + `,"did":"` + did + `","time":"1970-01-01T00:00:00.000001Z"` +
 		`,"rev":"r","operation":"create","collection":"` + coll +
 		`","rkey":"` + rkey + `","cid":"bafytest","recordCbor":{"$bytes":"` + base64.RawStdEncoding.EncodeToString(rec) + `"}}}`

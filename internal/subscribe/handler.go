@@ -57,7 +57,7 @@ type Subscription struct {
 	// cursor replay entirely (cursors are silently dropped to live).
 	Lookback time.Duration
 
-	// V2 selects the network.bsky.jetstream.subscribe endpoint contract
+	// V2 selects the network.bsky.jetstream.subscribeEvents endpoint contract
 	// (atproto proposal 0015) as a bundle:
 	//
 	//   - the xrpc.v1.json wire framing (one self-describing message or
@@ -136,7 +136,7 @@ func httpError(w http.ResponseWriter, deps Subscription, status int, name, msg s
 // header echo — every connection receives identical framing. The constant
 // comes from the generated lexicon code so the wire, the schema, and the
 // handler cannot drift.
-const v2Subprotocol = jetstream.JetstreamSubscribe_Subprotocol
+const v2Subprotocol = jetstream.JetstreamSubscribeEvents_Subprotocol
 
 // negotiateSubprotocol intersects the client's Sec-WebSocket-Protocol
 // offer with the supported set {xrpc.v1.json}, matching case-sensitively

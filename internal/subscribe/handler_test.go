@@ -290,7 +290,7 @@ func TestHandler_ResyncModeEmitsResyncReplacementRows(t *testing.T) {
 
 	frame := readOneFrame(t, ctx, conn)
 	got := unwrapV2Frame(t, frame)
-	require.Equal(t, "network.bsky.jetstream.subscribe#commit", got["$type"])
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#commit", got["$type"])
 	require.Equal(t, "did:plc:resync", got["did"])
 	require.Equal(t, "create", got["operation"])
 }
@@ -347,19 +347,19 @@ func TestHandler_DIDLevelEventsBypassCollectionFilter(t *testing.T) {
 
 	// First frame must be the identity.
 	gotIdent := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
-	require.Equal(t, "network.bsky.jetstream.subscribe#identity", gotIdent["$type"],
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#identity", gotIdent["$type"],
 		"identity must pass the collection filter")
 	require.Equal(t, "did:plc:ident", gotIdent["did"])
 
 	// Second frame must be the account.
 	gotAcct := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
-	require.Equal(t, "network.bsky.jetstream.subscribe#account", gotAcct["$type"],
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#account", gotAcct["$type"],
 		"account must pass the collection filter")
 	require.Equal(t, "did:plc:acct", gotAcct["did"])
 
 	// Third frame must be the matching commit.
 	gotCommit := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
-	require.Equal(t, "network.bsky.jetstream.subscribe#commit", gotCommit["$type"])
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#commit", gotCommit["$type"])
 }
 
 func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
@@ -405,7 +405,7 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 	})
 
 	commit := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
-	require.Equal(t, "network.bsky.jetstream.subscribe#commit", commit["$type"])
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#commit", commit["$type"])
 	require.Equal(t, float64(1), commit["seq"])
 	require.NotContains(t, commit, "upstream_relay_cursor")
 	recordCbor, ok := commit["recordCbor"].(map[string]any)
@@ -428,7 +428,7 @@ func TestHandler_V2DeliversRecordCBORAndSync(t *testing.T) {
 	})
 
 	syncGot := unwrapV2Frame(t, readOneFrame(t, ctx, conn))
-	require.Equal(t, "network.bsky.jetstream.subscribe#sync", syncGot["$type"])
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#sync", syncGot["$type"])
 	require.Equal(t, float64(2), syncGot["seq"])
 	require.Contains(t, syncGot, "sync")
 }
