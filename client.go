@@ -28,7 +28,6 @@ var ErrFatal = iclient.ErrFatal
 // concurrently with a running Events (the natural way to stop a live tail) and
 // to call more than once.
 type Client struct {
-	cfg    config
 	host   string // normalized base URL, e.g. "https://host"
 	engine engine
 
@@ -129,7 +128,27 @@ func Subscribe(host string, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{cfg: cfg, host: base, engine: eng}, nil
+	return &Client{host: base, engine: eng}, nil
+}
+
+// Format renders a bounded public summary without recursively formatting the
+// engine, whose authenticated XRPC clients may retain bearer credentials.
+// Client intentionally implements fmt.Formatter so debugging verbs such as
+// %v, %+v, and %#v cannot expose constructor secrets.
+func (c *Client) Format(s fmt.State, verb rune) {
+	if c == nil {
+		_, _ = io.WriteString(s, "<nil>")
+		return
+	}
+	if verb != 'v' {
+		_, _ = fmt.Fprintf(s, "%%!%c(*jetstream.Client)", verb)
+		return
+	}
+	if s.Flag('#') {
+		_, _ = fmt.Fprintf(s, "jetstream.Client{Host:%q, Closed:%t}", c.host, c.closed.Load())
+		return
+	}
+	_, _ = fmt.Fprintf(s, "jetstream.Client{host:%q closed:%t}", c.host, c.closed.Load())
 }
 
 // Events streams event batches in delivery order until ctx is cancelled or a
@@ -258,6 +277,9 @@ func isLoopbackHost(host string) bool {
 
 // validateConfig rejects internally inconsistent option combinations.
 func validateConfig(c *config) error {
+	if c.hasAPIToken && c.apiToken == "" {
+		return fmt.Errorf("jetstream: API token cannot be empty")
+	}
 	if c.hasAfterSeq && c.hasBeforeSeq && c.beforeSeq <= c.afterSeq {
 		return fmt.Errorf("jetstream: beforeSeq (%d) must be greater than afterSeq (%d)", c.beforeSeq, c.afterSeq)
 	}

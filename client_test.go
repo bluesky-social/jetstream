@@ -1,18 +1,25 @@
 package jetstream
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	iclient "github.com/bluesky-social/jetstream/internal/client"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/stretchr/testify/require"
 )
 
@@ -138,6 +145,45 @@ func TestOptionsCopySlices(t *testing.T) {
 	WithCollections(src)(&cfg)
 	src[0] = "mutated"
 	require.Equal(t, []string{"a", "b"}, cfg.collections, "options must defensively copy slices")
+}
+
+func TestWithAPITokenValidation(t *testing.T) {
+	t.Parallel()
+
+	for _, token := range []string{"opaque-token", "Bearer included-by-caller", " padded ", "snowman-☃", "base64=="} {
+		t.Run(token, func(t *testing.T) {
+			t.Parallel()
+			cfg := defaultConfig()
+			WithAPIToken(token)(&cfg)
+			require.True(t, cfg.hasAPIToken)
+			require.Equal(t, token, cfg.apiToken, "nonempty tokens are opaque transport values")
+			require.NoError(t, validateConfig(&cfg))
+		})
+	}
+
+	cfg := defaultConfig()
+	require.NoError(t, validateConfig(&cfg), "omitting WithAPIToken preserves unauthenticated behavior")
+	WithAPIToken("")(&cfg)
+	err := validateConfig(&cfg)
+	require.ErrorContains(t, err, "API token cannot be empty")
+	require.NotContains(t, err.Error(), "Bearer")
+}
+
+func TestClientFormattingRedactsAPIToken(t *testing.T) {
+	t.Parallel()
+
+	const token = "distinctive-formatting-secret-9fd0"
+	c, err := Subscribe("https://host", WithAPIToken(token))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	for _, formatted := range []string{fmt.Sprintf("%v", c), fmt.Sprintf("%+v", c), fmt.Sprintf("%#v", c)} {
+		require.NotContains(t, formatted, token)
+		require.Less(t, len(formatted), 256, "formatted client summary must stay bounded")
+		require.Contains(t, strings.ToLower(formatted), "host")
+	}
+	require.Equal(t, "<nil>", fmt.Sprintf("%v", (*Client)(nil)))
+	require.NotPanics(t, func() { _ = fmt.Sprintf("%#v", &Client{}) })
 }
 
 func TestSubscribeValidation(t *testing.T) {
@@ -393,6 +439,187 @@ func TestCloseRacesEvents(t *testing.T) {
 	cancel()
 	<-done
 	require.EqualValues(t, 1, eng.closes.Load())
+}
+
+type countingRoundTripper struct {
+	base http.RoundTripper
+	mu   sync.Mutex
+	seen map[string]int64
+}
+
+func (rt *countingRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	rt.mu.Lock()
+	if rt.seen == nil {
+		rt.seen = make(map[string]int64)
+	}
+	rt.seen[r.URL.Path]++
+	rt.mu.Unlock()
+	return rt.base.RoundTrip(r)
+}
+
+func (rt *countingRoundTripper) count(path string) int64 {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.seen[path]
+}
+
+func sealedSegmentFixture(t *testing.T, name string, seqs ...uint64) []byte {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: 1})
+	require.NoError(t, err)
+	for _, seq := range seqs {
+		payload, merr := cbor.Marshal(map[string]any{"$type": "app.bsky.feed.post", "text": fmt.Sprintf("event-%d", seq)})
+		require.NoError(t, merr)
+		_, err = w.Append(segment.Event{
+			Seq: seq, WitnessedAt: int64(1_730_000_000_000_000 + seq), Kind: segment.KindCreate,
+			DID: "did:plc:auth", Collection: "app.bsky.feed.post", Rkey: fmt.Sprintf("r%d", seq), Rev: fmt.Sprintf("rev%d", seq), Payload: payload,
+		})
+		require.NoError(t, err)
+	}
+	_, err = w.Seal()
+	require.NoError(t, err)
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return raw
+}
+
+func requireExactBearer(t *testing.T, w http.ResponseWriter, r *http.Request, token string) bool {
+	t.Helper()
+	if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+token {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+func serveSegmentFixture(t *testing.T, w http.ResponseWriter, r *http.Request, raw []byte, name string) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("ETag", `"fixture-etag"`)
+	http.ServeContent(w, r, name, time.Unix(1_730_000_000, 0), bytes.NewReader(raw))
+}
+
+func TestSubscribeAPITokenAuthenticatesAllArchiveRequests(t *testing.T) {
+	t.Parallel()
+	const token = "opaque-root-archive-token"
+	wholeName, blockName := "seg_0000000000.jss", "seg_0000000001.jss"
+	whole := sealedSegmentFixture(t, wholeName, 1)
+	blocks := sealedSegmentFixture(t, blockName, 2)
+	var planCalls, segmentCalls, blockCalls atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !requireExactBearer(t, w, r, token) {
+			return
+		}
+		switch r.URL.Path {
+		case "/xrpc/network.bsky.jetstream.planSnapshot":
+			planCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"plannedThroughSeq":2,"sealedTipSeq":2,"segments":[{"name":%q,"index":0,"checksum":"aaaaaaaaaaaaaaaa","minSeq":1,"maxSeq":1,"mode":"segment"},{"name":%q,"index":1,"checksum":"bbbbbbbbbbbbbbbb","minSeq":2,"maxSeq":2,"mode":"blocks","blocks":[{"first":0,"last":0}]}],"stats":{"segmentsExamined":2,"segmentsMatched":2,"blocksMatched":1,"entries":2}}`, wholeName, blockName)
+		case "/xrpc/network.bsky.jetstream.getSegment":
+			segmentCalls.Add(1)
+			require.Equal(t, wholeName, r.URL.Query().Get("name"))
+			serveSegmentFixture(t, w, r, whole, wholeName)
+		case "/xrpc/network.bsky.jetstream.getBlock":
+			blockCalls.Add(1)
+			require.Equal(t, blockName, r.URL.Query().Get("segment"))
+			hdr, err := segment.ReadSealedHeader(bytes.NewReader(blocks))
+			require.NoError(t, err)
+			frame, err := segment.ReadBlockFrame(bytes.NewReader(blocks), hdr, 0)
+			require.NoError(t, err)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(frame)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := Subscribe(srv.URL, WithAPIToken(token), WithAfterSeq(0), WithBackfillOnly(), WithSegmentStripes(1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var seqs []uint64
+	for batch, eventErr := range c.Events(ctx) {
+		require.NoError(t, eventErr)
+		for _, event := range batch.Events() {
+			seqs = append(seqs, event.Seq)
+		}
+	}
+	require.Equal(t, []uint64{1, 2}, seqs)
+	require.Equal(t, int64(1), planCalls.Load())
+	require.GreaterOrEqual(t, segmentCalls.Load(), int64(1), "whole-segment probe must execute")
+	require.Equal(t, int64(1), blockCalls.Load(), "generated getBlock request must execute")
+}
+
+func TestSubscribeAPITokenDoesNotAuthenticatePublicResources(t *testing.T) {
+	t.Parallel()
+	const token = "opaque-cutover-token"
+	name := "seg_0000000000.jss"
+	raw := sealedSegmentFixture(t, name, 1)
+	var dictionaryCalls, liveCalls atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/network.bsky.jetstream.planSnapshot":
+			require.True(t, requireExactBearer(t, w, r, token))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"plannedThroughSeq":1,"sealedTipSeq":1,"segments":[{"name":%q,"index":0,"checksum":"aaaaaaaaaaaaaaaa","minSeq":1,"maxSeq":1,"mode":"segment"}],"stats":{"segmentsExamined":1,"segmentsMatched":1,"blocksMatched":0,"entries":1}}`, name)
+		case "/xrpc/network.bsky.jetstream.getSegment":
+			require.True(t, requireExactBearer(t, w, r, token))
+			serveSegmentFixture(t, w, r, raw, name)
+		case "/xrpc/network.bsky.jetstream.getZstdDictionary":
+			dictionaryCalls.Add(1)
+			require.Empty(t, r.Header.Values("Authorization"))
+			_, _ = w.Write([]byte("invalid dictionary"))
+		case "/xrpc/network.bsky.jetstream.subscribeEvents":
+			liveCalls.Add(1)
+			require.Empty(t, r.Header.Values("Authorization"))
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close(websocket.StatusNormalClosure, "done") }()
+			_ = conn.Write(r.Context(), websocket.MessageText, []byte(liveCommitFrameJSON(2, "did:plc:auth", "app.bsky.feed.post", "r2")))
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	transport := &countingRoundTripper{base: srv.Client().Transport}
+	hc := &http.Client{Transport: transport}
+	c, err := Subscribe(srv.URL, WithAPIToken(token), WithAfterSeq(0), WithSegmentStripes(1), WithHTTPClient(hc))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var seqs []uint64
+	for batch, eventErr := range c.Events(ctx) {
+		if eventErr != nil {
+			continue
+		}
+		for _, event := range batch.Events() {
+			seqs = append(seqs, event.Seq)
+		}
+		if len(seqs) >= 2 {
+			cancel()
+			break
+		}
+	}
+	require.Equal(t, []uint64{1, 2}, seqs, "archive event must precede live event across cutover")
+	require.GreaterOrEqual(t, dictionaryCalls.Load(), int64(1))
+	require.GreaterOrEqual(t, liveCalls.Load(), int64(1))
+	for _, path := range []string{
+		"/xrpc/network.bsky.jetstream.planSnapshot",
+		"/xrpc/network.bsky.jetstream.getSegment",
+		"/xrpc/network.bsky.jetstream.getZstdDictionary",
+		"/xrpc/network.bsky.jetstream.subscribeEvents",
+	} {
+		require.GreaterOrEqual(t, transport.count(path), int64(1), "custom WithHTTPClient transport must handle %s", path)
+	}
 }
 
 // TestSubscribeLiveTailEndToEnd exercises the full public API against a real

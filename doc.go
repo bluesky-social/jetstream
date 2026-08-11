@@ -31,12 +31,16 @@
 // A bare Subscribe(host) with no backfill options is a pure live tail from the
 // current tip. Supplying WithAfterSeq or WithBeforeSeq triggers the full
 // archive-negotiation path: the client pages planSnapshot over the sealed
-// archive (downloading every matching sealed segment), then connects /subscribe
-// once at the sealed tip to pick up the active segment and the live tail. There
-// is no client-side buffer and no record suppression. The live tail uses the
-// server's dictionary-zstd compression by default; use
-// WithZstdCompression(false) to opt out. Dictionary fetch or rotation failure
-// degrades to an uncompressed tail rather than failing delivery.
+// archive (downloading every matching sealed segment), then connects
+// /xrpc/network.bsky.jetstream.subscribeEvents once at the sealed tip to pick up
+// the active segment and the live tail. There is no client-side buffer and no
+// record suppression. Archives that require Headwind authentication can use
+// WithAPIToken with the raw bearer token; it authenticates planSnapshot,
+// getSegment, and getBlock only. The public dictionary request and live
+// WebSocket remain unauthenticated. The live tail uses the server's
+// dictionary-zstd compression by default; use WithZstdCompression(false) to opt
+// out. Dictionary fetch or rotation failure degrades to an uncompressed tail
+// rather than failing delivery.
 //
 // Delivery is at-least-once and the contract is eventually-consistent: the
 // caller must process events idempotently and FOLD the stream (creates/updates

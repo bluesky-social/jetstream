@@ -728,11 +728,36 @@ func TestFetchSegmentCarriesAuthHeaders(t *testing.T) {
 	t.Parallel()
 	body := patternBody(300 << 10)
 	s, url := newSegServer(t, body)
-	var missing atomic.Int64
+	var (
+		invalidHeaders atomic.Int64
+		failedPart     atomic.Bool
+		rangeMu        sync.Mutex
+		failedRange    string
+		retriedRange   atomic.Bool
+	)
 	s.mu.Lock()
 	s.intercept = func(w http.ResponseWriter, r *http.Request) bool {
-		if r.Header.Get("Authorization") != "Bearer test-jwt" || r.Header.Get("User-Agent") == "" {
-			missing.Add(1)
+		if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer test-jwt" || r.Header.Get("User-Agent") == "" {
+			invalidHeaders.Add(1)
+		}
+		rng := r.Header.Get("Range")
+		if rng != "" && rng != "bytes=0-65535" {
+			if r.Header.Get("If-Range") == "" {
+				invalidHeaders.Add(1)
+			}
+			if failedPart.CompareAndSwap(false, true) {
+				rangeMu.Lock()
+				failedRange = rng
+				rangeMu.Unlock()
+				w.WriteHeader(http.StatusInternalServerError)
+				return true
+			}
+			rangeMu.Lock()
+			isRetry := rng == failedRange
+			rangeMu.Unlock()
+			if isRetry {
+				retriedRange.Store(true)
+			}
 		}
 		return false
 	}
@@ -743,8 +768,10 @@ func TestFetchSegmentCarriesAuthHeaders(t *testing.T) {
 	got, err := d.fetchSegment(context.Background(), "seg.jss")
 	require.NoError(t, err)
 	require.Equal(t, body, got)
-	require.Equal(t, int64(0), missing.Load(), "every segment request must carry auth + UA headers")
-	require.Greater(t, s.reqs.Load(), int64(1), "multi-request fetch expected")
+	require.Equal(t, int64(0), invalidHeaders.Load(), "every probe, part, and retry must carry exactly one auth header plus required identity/range headers")
+	require.True(t, failedPart.Load(), "test must inject a non-probe part failure")
+	require.True(t, retriedRange.Load(), "the failed Range must be retried with the same bearer credential")
+	require.Greater(t, s.reqs.Load(), int64(2), "multi-request fetch plus retry expected")
 }
 
 // TestPartAttemptsClampsToOne: xrpc treats MaxAttempts=0 as one attempt; the

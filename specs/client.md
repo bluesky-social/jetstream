@@ -249,8 +249,16 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
 - Performance: `WithDownloadConcurrency`, `WithRawRecords` (+`Copied`,
   `+CIDs`) to skip the generic record-map build, `TypedEvents[T]` for the
   typed decode fast path, `WithZstdCompression` for the live tail.
-- Plumbing: `WithHTTPClient` (replaces both the negotiation and bulk
-  download transports), `WithMaxDownloadAttempts`.
+- Archive authentication: `WithAPIToken(rawToken)` sends exactly one
+  `Authorization: Bearer <rawToken>` header on `planSnapshot`, `getSegment`,
+  and `getBlock`. The raw value is opaque and must not include client-side
+  parsing or logging. `getZstdDictionary` and the live WebSocket remain public
+  and do not receive this option-owned credential. The bundled CLI exposes the
+  same value as `--api-token` or the preferred
+  `JETSTREAM_CLIENT_API_TOKEN` environment source.
+- Plumbing: `WithHTTPClient` (replaces negotiation, public dictionary, bulk
+  download, and live WebSocket transports without changing the API-token
+  scope), `WithMaxDownloadAttempts`.
 - `Client.Stats()` — backfill progress (pages, pinned sealed tip, planned
   through, residual gap) for sustained-ingest observability.
 
@@ -270,7 +278,12 @@ and `time` as a microsecond-precision datetime the client parses back to
 ## Writing a third-party client: the checklist
 
 1. Page `planSnapshot` with pinned `sealedTipSeq`; download by `mode`;
-   verify checksums; decode blocks; run your exact filter per row.
+   verify checksums; decode blocks; run your exact filter per row. When the
+   archive boundary requires a token, send one RFC 6750-style
+   `Authorization: Bearer <token>` header on `planSnapshot`, `getSegment`, and
+   `getBlock`; treat the raw token as opaque and require TLS at the public
+   boundary. Do not send that archive credential on `getZstdDictionary` or
+   `/xrpc/network.bsky.jetstream.subscribeEvents`.
 2. Emit in seq order; treat every boundary as at-least-once and dedup by
    seq (or make your consumer idempotent).
 3. Deliver DID-level markers to your fold even under collection filters.

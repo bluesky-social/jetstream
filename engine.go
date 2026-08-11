@@ -14,6 +14,18 @@ import (
 // newEngine builds the real orchestration engine in internal/client and adapts
 // it to the root Client's engine interface.
 func newEngine(host string, cfg config) (engine, error) {
+	negotiationXRPC := newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second))
+	bulkXRPC := newXRPCClient(host, cfg, xrpc.BulkDownloadOpts())
+	if cfg.hasAPIToken {
+		// AccessJwt is atmos's opaque bearer-header transport seam. Headwind API
+		// tokens are not parsed as JWTs and have no refresh/session semantics.
+		negotiationXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiToken})
+		bulkXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiToken})
+	}
+	// Public dictionary fetches share the negotiation transport and retry policy
+	// without sharing its bearer-auth state.
+	publicXRPC := cloneXRPCWithoutAuth(negotiationXRPC)
+
 	ec := iclient.Config{
 		Host: host,
 		Request: iclient.PlanRequest{
@@ -29,8 +41,9 @@ func newEngine(host string, cfg config) (engine, error) {
 		BatchSize:      cfg.batchSize,
 		Concurrency:    cfg.downloadConc,
 		SegmentStripes: cfg.segmentStripes,
-		XRPC:           newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second)),
-		BulkXRPC:       newXRPCClient(host, cfg, xrpc.BulkDownloadOpts()),
+		XRPC:           negotiationXRPC,
+		BulkXRPC:       bulkXRPC,
+		PublicXRPC:     publicXRPC,
 		// Route the live-tail websocket upgrade through the caller's HTTP
 		// client too (WithHTTPClient), so an in-process transport reaches the
 		// live cutover, not just the unary XRPC downloads.
@@ -61,6 +74,18 @@ func newXRPCClient(host string, cfg config, opts []jttp.Option) *xrpc.Client {
 	}
 	c.HTTPClient = gt.Some(jttp.New(opts...))
 	return c
+}
+
+// cloneXRPCWithoutAuth copies only public request plumbing. It deliberately
+// does not copy atmos's private session state, so requests made through the
+// clone cannot inherit the archive bearer credential.
+func cloneXRPCWithoutAuth(c *xrpc.Client) *xrpc.Client {
+	return &xrpc.Client{
+		Host:       c.Host,
+		HTTPClient: c.HTTPClient,
+		UserAgent:  c.UserAgent,
+		Retry:      c.Retry,
+	}
 }
 
 // realEngine adapts internal/client.Engine to the root engine interface,
