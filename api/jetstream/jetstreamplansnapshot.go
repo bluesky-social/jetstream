@@ -12,8 +12,8 @@ import (
 // JetstreamPlanSnapshot_BlockRange is a "blockRange" in the network.bsky.jetstream.planSnapshot schema.
 type JetstreamPlanSnapshot_BlockRange struct {
 	LexiconTypeID string `json:"$type,omitempty"`
-	First         int64  `json:"first"` // First block index in this inclusive range.
-	Last          int64  `json:"last"`  // Last block index in this inclusive range.
+	First         int64  `json:"first"` // Index of the first block in the range.
+	Last          int64  `json:"last"`  // Index of the last block in the range.
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -579,8 +579,8 @@ func (s *JetstreamPlanSnapshot_Output) UnmarshalCBORAt(data []byte, pos int) (in
 
 type JetstreamPlanSnapshot_Output struct {
 	LexiconTypeID     string                          `json:"$type,omitempty"`
-	PlannedThroughSeq int64                           `json:"plannedThroughSeq"` // Continuation cursor: the highest sealed seq this page accounts for. When the page is truncated to...
-	SealedTipSeq      int64                           `json:"sealedTipSeq"`      // Pagination goal: the sealed-archive tip, capped by beforeSeq when provided. Stable across pages o...
+	PlannedThroughSeq int64                           `json:"plannedThroughSeq"` // The last sealed sequence covered by this page. Use this value as afterSeq for the next page. If t...
+	SealedTipSeq      int64                           `json:"sealedTipSeq"`      // The end of the sealed archive for this snapshot, capped by beforeSeq when provided. Use this valu...
 	Segments          []JetstreamPlanSnapshot_Segment `json:"segments"`
 	Stats             JetstreamPlanSnapshot_Stats     `json:"stats"`
 
@@ -1033,10 +1033,10 @@ func (s *JetstreamPlanSnapshot_Input) UnmarshalCBORAt(data []byte, pos int) (int
 
 type JetstreamPlanSnapshot_Input struct {
 	LexiconTypeID string           `json:"$type,omitempty"`
-	AfterSeq      gt.Option[int64] `json:"afterSeq,omitzero"`     // Lower exclusive sequence bound. Rows with seq <= afterSeq are outside the requested window.
-	BeforeSeq     gt.Option[int64] `json:"beforeSeq,omitzero"`    // Upper inclusive sequence bound. Rows with seq > beforeSeq are outside the requested window.
-	Collections   []string         `json:"collections,omitempty"` // Collection filters to match. Each entry is either an exact NSID (e.g. app.bsky.feed.post) or a na...
-	Dids          []string         `json:"dids,omitempty"`        // Exact DIDs to match. Missing or empty means all DIDs.
+	AfterSeq      gt.Option[int64] `json:"afterSeq,omitzero"`     // Start after this sequence number. Events at or below it are not included.
+	BeforeSeq     gt.Option[int64] `json:"beforeSeq,omitzero"`    // Stop at this sequence number. Events above it are not included.
+	Collections   []string         `json:"collections,omitempty"` // Only include data from these collections. Each value may be an exact NSID, such as app.bsky.feed....
+	Dids          []string         `json:"dids,omitempty"`        // Only include data for these DIDs. Omit this field or pass an empty array to include all DIDs.
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -1044,7 +1044,7 @@ type JetstreamPlanSnapshot_Input struct {
 
 // JetstreamPlanSnapshot calls the XRPC procedure "network.bsky.jetstream.planSnapshot".
 //
-// Plan a sealed-archive snapshot. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested DID and collection filters, and is paginated: pin sealedTipSeq and page with afterSeq=plannedThroughSeq until plannedThroughSeq reaches it. This is a transport planner only: clients must still decode rows, apply exact filtering, fold deletes/updates, and coordinate live-tail subscription independently. Deletion markers (record-level and DID-level) ride inline in the planned blocks; there is no separate tombstone fetch.
+// Build a download plan for the desired data pattern. The plan lists whole segments or block ranges that might contain events for the requested DIDs and collections.
 func JetstreamPlanSnapshot(ctx context.Context, c *xrpc.Client, input *JetstreamPlanSnapshot_Input) (*JetstreamPlanSnapshot_Output, error) {
 	var out JetstreamPlanSnapshot_Output
 	return &out, c.Procedure(ctx, "network.bsky.jetstream.planSnapshot", input, &out)
@@ -1053,13 +1053,13 @@ func JetstreamPlanSnapshot(ctx context.Context, c *xrpc.Client, input *Jetstream
 // JetstreamPlanSnapshot_Segment is a "segment" in the network.bsky.jetstream.planSnapshot schema.
 type JetstreamPlanSnapshot_Segment struct {
 	LexiconTypeID string                             `json:"$type,omitempty"`
-	Blocks        []JetstreamPlanSnapshot_BlockRange `json:"blocks,omitempty"` // Inclusive block ranges. Present only when mode is blocks.
-	Checksum      string                             `json:"checksum"`         // Segment-format xxh3 metadata checksum as 16-char hex.
+	Blocks        []JetstreamPlanSnapshot_BlockRange `json:"blocks,omitempty"` // Block ranges to download, including both endpoints. This field is present only when mode is blocks.
+	Checksum      string                             `json:"checksum"`         // The segment's xxh3 metadata checksum, encoded as 16 hexadecimal characters.
 	Index         int64                              `json:"index"`            // Zero-based segment index.
 	MaxSeq        int64                              `json:"maxSeq"`
 	MinSeq        int64                              `json:"minSeq"`
-	Mode          string                             `json:"mode"` // segment means download the whole segment with getSegment; blocks means download the listed block ...
-	Name          string                             `json:"name"` // Segment filename accepted by getSegment and getBlock.
+	Mode          string                             `json:"mode"` // How to download this segment. For segment, download the whole file with getSegment. For blocks, d...
+	Name          string                             `json:"name"` // Segment filename to pass to getSegment or getBlock.
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -1479,7 +1479,7 @@ func (s *JetstreamPlanSnapshot_Segment) UnmarshalJSONAt(data []byte, pos int) (i
 type JetstreamPlanSnapshot_Stats struct {
 	LexiconTypeID    string `json:"$type,omitempty"`
 	BlocksMatched    int64  `json:"blocksMatched"`
-	Entries          int64  `json:"entries"` // Number of response work entries counted against the server plan limit.
+	Entries          int64  `json:"entries"` // Number of items counted toward the server's per-page plan limit.
 	SegmentsExamined int64  `json:"segmentsExamined"`
 	SegmentsMatched  int64  `json:"segmentsMatched"`
 

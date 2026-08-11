@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "subscription",
-      "description": "Stream every archived and live Jetstream event in seq order, framed per the xrpc.v1.json subprotocol. Server-push only. The kinds, dids, and collections filters are independent predicates ANDed together; each is match-all when omitted. See the parameter and error descriptions for cursor, filtering, and compression semantics.",
+      "description": "Stream every archived and live Jetstream event in seq order, framed per the xrpc.v1.json subprotocol. The kinds, dids, and collections filters are independent predicates ANDed together; each is match-all when omitted. See the parameter and error descriptions for cursor, filtering, and compression semantics.",
       "subprotocol": "xrpc.v1.json",
       "parameters": {
         "type": "params",
@@ -16,7 +16,6 @@
           "kinds": {
             "type": "array",
             "items": { "type": "string", "enum": ["commit", "identity", "account", "sync"] },
-            "maxLength": 4,
             "description": "Event kinds to receive; values are the message $type fragment names. Omitted or empty: all kinds. A value outside the enum is rejected pre-upgrade with HTTP 400 (InvalidRequest) rather than silently never matching."
           },
           "dids": {

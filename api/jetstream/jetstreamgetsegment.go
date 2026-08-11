@@ -14,7 +14,7 @@ const (
 
 // JetstreamGetSegment calls the XRPC query "network.bsky.jetstream.getSegment".
 //
-// Download a sealed segment file by name. Cache behavior is controlled by the server's Cache-Control header; operators can enable a bounded max-age, and clients should revalidate with ETag after it expires because compaction can rewrite sealed segments.
+// Download a sealed segment file by name.
 func JetstreamGetSegment(ctx context.Context, c *xrpc.Client, name string) ([]byte, error) {
 	params := map[string]any{}
 	params["name"] = name

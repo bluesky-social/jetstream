@@ -15,7 +15,7 @@ const (
 
 // JetstreamGetBlock calls the XRPC query "network.bsky.jetstream.getBlock".
 //
-// Download a single sealed-segment block by index. Returns the raw zstd-compressed block frame exactly as stored on disk (no 8-byte length prefix; Content-Length carries the length). The response is immutable for a given ETag and is CDN-cacheable. Clients fetch the blocks named by a query plan and decode each frame with the standard block decoder.
+// Download a single block within a sealed segment file by index. Returns the raw zstd-compressed block frame exactly as stored on disk.
 func JetstreamGetBlock(ctx context.Context, c *xrpc.Client, blockIndex int64, segment string) ([]byte, error) {
 	params := map[string]any{}
 	params["blockIndex"] = blockIndex
