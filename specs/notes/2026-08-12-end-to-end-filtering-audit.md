@@ -1,6 +1,6 @@
 # End-to-end kind, DID, and collection filtering audit
 
-**Status: implementation complete; mutation gate pending on issue [#335](https://github.com/bluesky-social/jetstream/issues/335).** This note records the
+**Status: implementation and verification complete on issue [#335](https://github.com/bluesky-social/jetstream/issues/335).** This note records the
 filtering contract implemented after [PR #324](https://github.com/bluesky-social/jetstream/pull/324),
 the gaps found while testing the refactored module-root Go client, and the
 recommended implementation direction. The governing performance choice is that
@@ -40,13 +40,15 @@ client canonicalization and matching, archive-to-live predicate continuity,
 filter preservation through re-backfill, terminal one-dial rejection, and
 strict v2 size parsing.
 
-Verification completed before the mutation gate:
+Verification completed:
 
 - `just` — lint clean; 2,383 short tests passed;
 - `just test-race . ./internal/manifest ./internal/xrpcapi ./internal/subscribe ./cmd/client` — 829 tests passed under the race detector;
 - `just test-long ./internal/oracle` — 211 tests passed;
-- `just oracle-sweep` — all ten deterministic lifecycle and restart seeds passed; and
-- `just fuzz 30s ./segment` — all seven segment fuzz targets passed.
+- `just oracle-sweep` — all ten deterministic lifecycle and restart seeds passed;
+- `just fuzz 30s ./segment` — all seven segment fuzz targets passed; and
+- `just mutation-gate` — all 47 curated mutants were killed at their expected
+  tiers and matched the mutation baseline.
 
 ## Executive finding
 
