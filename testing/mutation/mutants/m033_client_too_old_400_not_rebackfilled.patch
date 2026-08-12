@@ -1,8 +1,8 @@
 mutant: m033_client_too_old_400_not_rebackfilled
-target: internal/client/engine.go
+target: client_core.go
 failure-mode: |
   The cutover tail never reports the §14 too-old 400 to the pagination loop
-  (tooOld is forced false), so runBackfillThenLive treats a below-floor connect
+  (the terminal error is replaced with nil), so runBackfillThenLive treats a below-floor connect
   as a clean stop and ENDS instead of re-entering the backfill loop. A client
   whose handoff cursor aged below the lookback floor silently stops at the seam
   rather than re-backfilling and converging — the fell-off-live / slow-handoff
@@ -16,13 +16,16 @@ expected-detection: |
 expected-tier: partb
 tiers: partb
 
-diff --git a/internal/client/engine.go b/internal/client/engine.go
---- a/internal/client/engine.go
-+++ b/internal/client/engine.go
-@@ -712,5 +712,5 @@ func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover ui
+diff --git a/client_core.go b/client_core.go
+--- a/client_core.go
++++ b/client_core.go
+@@ -741,8 +741,8 @@ func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cuto
+ 			return true
  		}
  		return b.add(*ev)
  	})
--	return consumer.LastSeq(), errors.Is(err, errLiveCursorTooOld)
-+	return consumer.LastSeq(), false && errors.Is(err, errLiveCursorTooOld)
+-	return consumer.LastSeq(), err
++	return consumer.LastSeq(), nil
  }
+ 
+ // fetchZstdDict fetches the server's current live-tail compression

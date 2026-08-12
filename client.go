@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/jcalabro/atmos"
 )
 
 // Client is a Jetstream replay consumer. Construct one with Subscribe. A Client
@@ -236,6 +238,9 @@ func isLoopbackHost(host string) bool {
 
 // validateConfig rejects internally inconsistent option combinations.
 func validateConfig(c *config) error {
+	if err := canonicalizeFilters(c); err != nil {
+		return err
+	}
 	if c.hasAfterSeq && c.hasBeforeSeq && c.beforeSeq <= c.afterSeq {
 		return fmt.Errorf("jetstream: beforeSeq (%d) must be greater than afterSeq (%d)", c.beforeSeq, c.afterSeq)
 	}
@@ -252,5 +257,82 @@ func validateConfig(c *config) error {
 	if c.hasBeforeSeq && !c.backfillOnly {
 		return fmt.Errorf("jetstream: WithBeforeSeq requires WithBackfillOnly (a beforeSeq is a bounded-archive-dump upper bound; on a backfill-then-live subscription it would silently drop every live event past beforeSeq)")
 	}
+	return nil
+}
+
+const (
+	maxClientKinds       = 4
+	maxClientDIDs        = 10000
+	maxClientCollections = 100
+)
+
+func canonicalizeFilters(c *config) error {
+	kinds := make([]Kind, 0, len(c.kinds))
+	seenKinds := make(map[Kind]struct{}, min(len(c.kinds), maxClientKinds))
+	for _, kind := range c.kinds {
+		switch kind {
+		case KindCommit, KindIdentity, KindAccount, KindSync:
+		default:
+			return fmt.Errorf("jetstream: invalid kind %q", kind)
+		}
+		if _, ok := seenKinds[kind]; ok {
+			continue
+		}
+		seenKinds[kind] = struct{}{}
+		kinds = append(kinds, kind)
+	}
+	if len(kinds) > maxClientKinds {
+		return fmt.Errorf("jetstream: too many kinds: %d > %d", len(kinds), maxClientKinds)
+	}
+
+	dids := make([]string, 0, min(len(c.dids), maxClientDIDs))
+	seenDIDs := make(map[string]struct{}, min(len(c.dids), maxClientDIDs))
+	for _, raw := range c.dids {
+		if _, ok := seenDIDs[raw]; ok {
+			continue
+		}
+		did, err := atmos.ParseDID(raw)
+		if err != nil {
+			return fmt.Errorf("jetstream: invalid DID %q: %w", raw, err)
+		}
+		seenDIDs[raw] = struct{}{}
+		dids = append(dids, string(did))
+		if len(dids) > maxClientDIDs {
+			return fmt.Errorf("jetstream: too many DIDs: %d > %d", len(dids), maxClientDIDs)
+		}
+	}
+
+	collections := make([]string, 0, min(len(c.collections), maxClientCollections))
+	seenCollections := make(map[string]struct{}, min(len(c.collections), maxClientCollections))
+	for _, raw := range c.collections {
+		if _, ok := seenCollections[raw]; ok {
+			continue
+		}
+		if head, ok := strings.CutSuffix(raw, ".*"); ok {
+			if _, err := atmos.ParseNSID(head + ".x"); err != nil {
+				return fmt.Errorf("jetstream: invalid collection wildcard %q: %w", raw, err)
+			}
+		} else if _, err := atmos.ParseNSID(raw); err != nil {
+			return fmt.Errorf("jetstream: invalid collection %q: %w", raw, err)
+		}
+		seenCollections[raw] = struct{}{}
+		collections = append(collections, raw)
+		if len(collections) > maxClientCollections {
+			return fmt.Errorf("jetstream: too many collections: %d > %d", len(collections), maxClientCollections)
+		}
+	}
+
+	if len(collections) > 0 && len(kinds) > 0 {
+		hasCommit := false
+		for _, kind := range kinds {
+			hasCommit = hasCommit || kind == KindCommit
+		}
+		if !hasCommit {
+			return fmt.Errorf("jetstream: collections filter can never apply: kinds excludes commit")
+		}
+	}
+	c.kinds = kinds
+	c.dids = dids
+	c.collections = collections
 	return nil
 }

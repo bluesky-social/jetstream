@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	DefaultPlanMaxDIDs               = 1000
-	DefaultPlanMaxCollections        = 25
+	DefaultPlanMaxDIDs               = 10000
+	DefaultPlanMaxCollections        = 100
 	DefaultPlanMaxEntries            = 100000
 	DefaultPlanWholeSegmentThreshold = 0.75
+	maxPlanKinds                     = 4
 )
 
 type PlanConfig struct {
@@ -45,8 +46,14 @@ func (c PlanConfig) validate() error {
 	if c.MaxDIDs < 0 {
 		return fmt.Errorf("plan max DIDs must be >= 0, got %d", c.MaxDIDs)
 	}
+	if c.MaxDIDs > DefaultPlanMaxDIDs {
+		return fmt.Errorf("plan max DIDs must be <= %d, got %d", DefaultPlanMaxDIDs, c.MaxDIDs)
+	}
 	if c.MaxCollections < 0 {
 		return fmt.Errorf("plan max collections must be >= 0, got %d", c.MaxCollections)
+	}
+	if c.MaxCollections > DefaultPlanMaxCollections {
+		return fmt.Errorf("plan max collections must be <= %d, got %d", DefaultPlanMaxCollections, c.MaxCollections)
 	}
 	if c.MaxEntries < 0 {
 		return fmt.Errorf("plan max entries must be >= 0, got %d", c.MaxEntries)
@@ -96,6 +103,10 @@ func planRequestFromInput(input *jetstream.JetstreamPlanSnapshot_Input, cfg Plan
 	if input == nil {
 		input = &jetstream.JetstreamPlanSnapshot_Input{}
 	}
+	kinds, err := validatePlanKinds(input.Kinds)
+	if err != nil {
+		return manifest.PlanSnapshotRequest{}, err
+	}
 	dids, err := validatePlanDIDs(input.Dids, cfg.MaxDIDs)
 	if err != nil {
 		return manifest.PlanSnapshotRequest{}, err
@@ -106,11 +117,15 @@ func planRequestFromInput(input *jetstream.JetstreamPlanSnapshot_Input, cfg Plan
 	}
 
 	req := manifest.PlanSnapshotRequest{
+		Kinds:                 kinds,
 		DIDs:                  dids,
 		Collections:           collections,
 		CollectionPrefixes:    collectionPrefixes,
 		MaxEntries:            cfg.MaxEntries,
 		WholeSegmentThreshold: cfg.WholeSegmentThreshold,
+	}
+	if (len(collections) > 0 || len(collectionPrefixes) > 0) && kinds != 0 && kinds&manifest.KindCommit == 0 {
+		return manifest.PlanSnapshotRequest{}, xrpcserver.InvalidRequest("collections filter can never apply: kinds excludes commit")
 	}
 	if input.AfterSeq.HasVal() {
 		seq := input.AfterSeq.Val()
@@ -134,12 +149,31 @@ func planRequestFromInput(input *jetstream.JetstreamPlanSnapshot_Input, cfg Plan
 	return req, nil
 }
 
+func validatePlanKinds(raw []string) (manifest.KindMask, error) {
+	if len(raw) > maxPlanKinds {
+		return 0, xrpcserver.InvalidRequest("too many kinds")
+	}
+	var out manifest.KindMask
+	for _, value := range raw {
+		switch value {
+		case "commit":
+			out |= manifest.KindCommit
+		case "identity":
+			out |= manifest.KindIdentity
+		case "account":
+			out |= manifest.KindAccount
+		case "sync":
+			out |= manifest.KindSync
+		default:
+			return 0, xrpcserver.InvalidRequest("invalid kind: " + value)
+		}
+	}
+	return out, nil
+}
+
 // validatePlanDIDs returns the distinct, syntactically-valid DIDs from raw.
-// The limit is on the DISTINCT count. Deduplication happens before parsing
-// (ParseDID returns its input verbatim, so the distinct set is identical
-// either way), and the loop stops once the limit is reached. This bounds parse
-// work and map growth to maxDIDs even when an adversary submits a body full of
-// duplicate DIDs.
+// The raw array is capped before dedupe, matching subscribeEvents and the
+// lexicon's maxLength contract.
 func validatePlanDIDs(raw []string, maxDIDs int) ([]string, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -147,14 +181,14 @@ func validatePlanDIDs(raw []string, maxDIDs int) ([]string, error) {
 	if maxDIDs == 0 {
 		return nil, xrpcserver.InvalidRequest("DID filters are disabled")
 	}
+	if len(raw) > maxDIDs {
+		return nil, xrpcserver.InvalidRequest("too many DIDs")
+	}
 	seen := make(map[string]struct{}, min(len(raw), maxDIDs))
 	out := make([]string, 0, min(len(raw), maxDIDs))
 	for _, value := range raw {
 		if _, ok := seen[value]; ok {
 			continue
-		}
-		if len(out) == maxDIDs {
-			return nil, xrpcserver.InvalidRequest("too many DIDs")
 		}
 		seen[value] = struct{}{}
 		did, err := atmos.ParseDID(value)
@@ -175,17 +209,12 @@ const wildcardSuffix = ".*"
 // wildcard, returning exactly one of (exact, prefix). A wildcard "<head>.*" is
 // accepted iff head is a valid NSID authority, which we check by appending a
 // synthetic, known-valid name label and reusing atmos.ParseNSID as the single
-// source of truth for NSID grammar. atmos requires the name segment to start
-// with a letter and be alphanumeric, so "wildcard" is always a valid probe
-// label and is never stored. The returned prefix is "<head>." (e.g.
+// source of truth for NSID grammar. "x" is a valid probe label and keeps
+// near-maximum-length wildcard heads valid. It is never stored. The returned prefix is "<head>." (e.g.
 // "app.bsky.feed."), matched elsewhere with strings.HasPrefix.
-//
-// Validation here is intentionally stricter than /subscribe (which is
-// deliberately v1-lax and skips head validation): planSnapshot is a new
-// endpoint with no v1 wire contract.
 func classifyCollectionPattern(raw string) (exact string, prefix string, err error) {
 	if head, ok := strings.CutSuffix(raw, wildcardSuffix); ok {
-		if _, perr := atmos.ParseNSID(head + ".wildcard"); perr != nil {
+		if _, perr := atmos.ParseNSID(head + ".x"); perr != nil {
 			return "", "", xrpcserver.InvalidRequest("invalid collection wildcard: " + raw)
 		}
 		return "", head + ".", nil
@@ -198,10 +227,10 @@ func classifyCollectionPattern(raw string) (exact string, prefix string, err err
 }
 
 // validatePlanCollections splits raw collection filters into distinct exact
-// NSIDs and distinct namespace prefixes (from wildcards). The cap counts
-// distinct PATTERNS (exact + prefix), not expanded collections, so one wildcard
-// counts as one regardless of how many collections it covers — matching
-// /subscribe's cap semantics. Both returned slices are nil when raw is empty,
+// NSIDs and distinct namespace prefixes (from wildcards). The raw array is
+// capped before dedupe, matching subscribeEvents and the lexicon maxLength;
+// one wildcard still expands only against resident segment metadata. Both
+// returned slices are nil when raw is empty,
 // which the planner treats as match-all; a non-empty prefix set that matches no
 // archived collection correctly yields an empty plan (see design doc,
 // "match-nothing boundary").
@@ -212,23 +241,16 @@ func validatePlanCollections(raw []string, maxCollections int) (exact []string, 
 	if maxCollections == 0 {
 		return nil, nil, xrpcserver.InvalidRequest("collection filters are disabled")
 	}
+	if len(raw) > maxCollections {
+		return nil, nil, xrpcserver.InvalidRequest("too many collections")
+	}
 	// Dedup on the raw string BEFORE classifying. classifyCollectionPattern is
 	// deterministic, so identical raw values classify identically; deduping
-	// first bounds parse work (each value runs up to two atmos.ParseNSID scans)
-	// and map growth to maxCollections distinct patterns even when a hostile
-	// caller submits a body full of duplicates. This mirrors validatePlanDIDs
-	// above; the collections array has no maxLength on the wire, so this bound
-	// is the only thing standing between a duplicate-stuffed body and O(N) parse
-	// work. The cap counts distinct PATTERNS (exact + prefix), not expanded
-	// collections, so one wildcard counts as one regardless of coverage —
-	// matching /subscribe's cap semantics.
+	// first bounds repeated parse work after the raw maxLength check above.
 	seen := make(map[string]struct{}, min(len(raw), maxCollections))
 	for _, value := range raw {
 		if _, dup := seen[value]; dup {
 			continue
-		}
-		if len(exact)+len(prefixes) == maxCollections {
-			return nil, nil, xrpcserver.InvalidRequest("too many collections")
 		}
 		ex, pre, cerr := classifyCollectionPattern(value)
 		if cerr != nil {

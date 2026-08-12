@@ -117,8 +117,14 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.PlanMaxDIDs < 0 {
 		return nil, fmt.Errorf("serve: --plan-max-dids must be >= 0 (PlanMaxDIDs must be >= 0), got %d", opts.PlanMaxDIDs)
 	}
+	if opts.PlanMaxDIDs > xrpcapi.DefaultPlanMaxDIDs {
+		return nil, fmt.Errorf("serve: --plan-max-dids must be <= %d (PlanMaxDIDs must be <= %d), got %d", xrpcapi.DefaultPlanMaxDIDs, xrpcapi.DefaultPlanMaxDIDs, opts.PlanMaxDIDs)
+	}
 	if opts.PlanMaxCollections < 0 {
 		return nil, fmt.Errorf("serve: --plan-max-collections must be >= 0 (PlanMaxCollections must be >= 0), got %d", opts.PlanMaxCollections)
+	}
+	if opts.PlanMaxCollections > xrpcapi.DefaultPlanMaxCollections {
+		return nil, fmt.Errorf("serve: --plan-max-collections must be <= %d (PlanMaxCollections must be <= %d), got %d", xrpcapi.DefaultPlanMaxCollections, xrpcapi.DefaultPlanMaxCollections, opts.PlanMaxCollections)
 	}
 	if opts.PlanMaxEntries < 0 {
 		return nil, fmt.Errorf("serve: --plan-max-entries must be >= 0 (PlanMaxEntries must be >= 0), got %d", opts.PlanMaxEntries)

@@ -163,6 +163,16 @@ func TestOptionsValidateRejectsInvalidPlanLimits(t *testing.T) {
 			want: "PlanMaxCollections must be >= 0",
 		},
 		{
+			name: "DIDs above wire limit",
+			edit: func(opts *Options) { opts.PlanMaxDIDs = xrpcapi.DefaultPlanMaxDIDs + 1 },
+			want: "PlanMaxDIDs must be <= 10000",
+		},
+		{
+			name: "collections above wire limit",
+			edit: func(opts *Options) { opts.PlanMaxCollections = xrpcapi.DefaultPlanMaxCollections + 1 },
+			want: "PlanMaxCollections must be <= 100",
+		},
+		{
 			name: "negative entries",
 			edit: func(opts *Options) { opts.PlanMaxEntries = -1 },
 			want: "PlanMaxEntries must be >= 0",

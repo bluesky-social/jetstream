@@ -82,6 +82,45 @@ func TestMatcherDIDFilterAllKinds(t *testing.T) {
 	require.True(t, m.wantsSegment(&acctKeep))
 }
 
+func TestMatcherKindFilterSegmentAndLive(t *testing.T) {
+	t.Parallel()
+	m := newMatcher(planRequest{Kinds: []Kind{KindCommit, KindSync}})
+
+	segmentCases := []struct {
+		kind segment.Kind
+		want bool
+	}{
+		{segment.KindCreate, true},
+		{segment.KindUpdate, true},
+		{segment.KindDelete, true},
+		{segment.KindCreateResync, true},
+		{segment.KindIdentity, false},
+		{segment.KindAccount, false},
+		{segment.KindSync, true},
+	}
+	for _, tc := range segmentCases {
+		ev := segment.Event{Seq: 1, Kind: tc.kind, DID: "did:plc:a", Collection: "app.bsky.feed.post"}
+		require.Equalf(t, tc.want, m.wantsSegment(&ev), "segment kind %d", tc.kind)
+	}
+
+	liveCases := []struct {
+		kind Kind
+		want bool
+	}{
+		{KindCommit, true},
+		{KindIdentity, false},
+		{KindAccount, false},
+		{KindSync, true},
+	}
+	for _, tc := range liveCases {
+		ev := Event{Seq: 1, Kind: tc.kind, DID: "did:plc:a"}
+		if tc.kind == KindCommit {
+			ev.Commit = &Commit{Collection: "app.bsky.feed.post"}
+		}
+		require.Equalf(t, tc.want, m.wantsEvent(&ev), "live kind %q", tc.kind)
+	}
+}
+
 func TestMatcherCollectionExactAndWildcard(t *testing.T) {
 	t.Parallel()
 	m := newMatcher(planRequest{Collections: []string{"app.bsky.feed.post", "app.bsky.graph.*"}})

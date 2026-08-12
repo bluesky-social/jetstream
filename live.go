@@ -55,11 +55,11 @@ type liveConfig struct {
 	// user-API contract — distinct from cursor=0 ("replay everything"). Only the
 	// pure live-only path sets it; the cutover always sends an explicit cursor.
 	fromTip bool
-	// collections and dids are the caller's filters, forwarded on the wire as
-	// repeated wantedCollections/wantedDids query params so the server filters
-	// server-side (v1 ParseQuery) rather than streaming the full firehose for
-	// the client to discard. Empty means "no filter" (the param is omitted).
+	// kinds, collections, and dids are the caller's canonical filters, forwarded
+	// as repeated v2 query params so the server can prune before encoding and
+	// transmission. Empty means "no filter" (the param is omitted).
 	// The client-side matcher remains a correctness backstop.
+	kinds       []Kind
 	collections []string
 	dids        []string
 	// dedupFloor seeds lastSeq: the highest seq the caller already holds, so the
@@ -214,7 +214,7 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) e
 		// durably-processed seq (design §14 client side) instead of churning
 		// reconnects against a cursor the server will keep rejecting. This covers
 		// both the terminal handoff connect and a mid-stream fell-off-live drop.
-		if errors.Is(err, errLiveCursorTooOld) {
+		if errors.Is(err, errLiveCursorTooOld) || errors.Is(err, errLiveInvalidRequest) {
 			return err
 		}
 		// A dict-rejected pre-upgrade 400 means the server rotated its
@@ -394,6 +394,9 @@ func (c *liveConsumer) subscribeURL() string {
 	// entry per value. Empty slices add nothing, leaving an unfiltered
 	// tail's URL unchanged. The client-side matcher (wantsLive) remains
 	// the correctness backstop.
+	for _, kind := range c.cfg.kinds {
+		q.Add("kinds", string(kind))
+	}
 	for _, c := range c.cfg.collections {
 		q.Add("collections", c)
 	}
@@ -443,6 +446,11 @@ func liveDialOptions(hc *http.Client) *websocket.DialOptions {
 // observability.
 var errLiveCursorTooOld = errors.New("jetstream: live cursor too old")
 
+// errLiveInvalidRequest marks a permanent pre-upgrade configuration rejection.
+// Reconnecting with the same immutable filter cannot succeed, so it terminates
+// the consumer and is surfaced as ErrFatal by the engine.
+var errLiveInvalidRequest = errors.New("jetstream: live request rejected")
+
 // errLiveDictRejected marks a pre-upgrade HTTP 400 UnknownZstdDictionary
 // refusing the client's ?zstdDictionary ID: the server rotated its
 // dictionary (retrain + redeploy) and no longer serves the ID this consumer
@@ -460,6 +468,7 @@ var errLiveDictRejected = errors.New("jetstream: live zstd dictionary rejected")
 const (
 	errNameCursorTooOld    = "CursorTooOld"
 	errNameUnknownZstdDict = "UnknownZstdDictionary"
+	errNameInvalidRequest  = "InvalidRequest"
 )
 
 // dialWebsocket is the production dialer. hc, when non-nil, routes the HTTP/1.1
@@ -493,6 +502,8 @@ func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn,
 					return nil, fmt.Errorf("%w: %s", errLiveCursorTooOld, envelope.Message)
 				case errNameUnknownZstdDict:
 					return nil, fmt.Errorf("%w: %s", errLiveDictRejected, envelope.Message)
+				case errNameInvalidRequest:
+					return nil, fmt.Errorf("%w: %s", errLiveInvalidRequest, envelope.Message)
 				}
 			}
 		} else if resp != nil && resp.Body != nil {

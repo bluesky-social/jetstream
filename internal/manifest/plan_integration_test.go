@@ -17,12 +17,15 @@ import (
 // positives) but must never drop a row this predicate accepts (no false
 // negatives).
 func matchesFilter(ev segment.Event, req manifest.PlanSnapshotRequest, dids, collections map[string]struct{}) bool {
+	if req.Kinds != 0 && req.Kinds&planKind(ev.Kind) == 0 {
+		return false
+	}
 	if len(dids) > 0 {
 		if _, ok := dids[ev.DID]; !ok {
 			return false
 		}
 	}
-	if len(collections) > 0 {
+	if ev.Kind.IsCommit() && len(collections) > 0 {
 		if _, ok := collections[ev.Collection]; !ok {
 			return false
 		}
@@ -34,6 +37,22 @@ func matchesFilter(ev segment.Event, req manifest.PlanSnapshotRequest, dids, col
 		return false
 	}
 	return true
+}
+
+func planKind(kind segment.Kind) manifest.KindMask {
+	if kind.IsCommit() {
+		return manifest.KindCommit
+	}
+	switch kind {
+	case segment.KindIdentity:
+		return manifest.KindIdentity
+	case segment.KindAccount:
+		return manifest.KindAccount
+	case segment.KindSync:
+		return manifest.KindSync
+	default:
+		return 0
+	}
 }
 
 func toSet(vals []string) map[string]struct{} {
@@ -111,16 +130,27 @@ func TestPlanSnapshot_Integration_NoFalseNegatives(t *testing.T) {
 	collections := []string{postNSID, likeNSID, repostNSID}
 	dids := []string{didA, didB, didC, didD}
 
-	// Two segments, deterministic interleave of DIDs and collections, one
-	// event per block so block boundaries align with rows and the planner has
-	// to make real per-block selection decisions.
+	// Two segments, deterministic interleave of all kinds, DIDs, and
+	// collections, one event per block so block boundaries align with rows and
+	// the planner has to make real per-block selection decisions.
 	dir := t.TempDir()
 	var allEvents []segment.Event
 	seq := uint64(1)
 	mk := func(idx uint64, n int) {
 		evs := make([]segment.Event, 0, n)
 		for range n {
-			ev := planEvent(seq, dids[int(seq)%len(dids)], collections[int(seq)%len(collections)])
+			did := dids[int(seq)%len(dids)]
+			var ev segment.Event
+			switch seq % 6 {
+			case 0:
+				ev = markerEvent(seq, did, segment.KindAccount)
+			case 1:
+				ev = markerEvent(seq, did, segment.KindIdentity)
+			case 2:
+				ev = markerEvent(seq, did, segment.KindSync)
+			default:
+				ev = planEvent(seq, did, collections[int(seq)%len(collections)])
+			}
 			evs = append(evs, ev)
 			allEvents = append(allEvents, ev)
 			seq++
@@ -141,9 +171,14 @@ func TestPlanSnapshot_Integration_NoFalseNegatives(t *testing.T) {
 	}
 	cases := []tc{
 		{"match-all", planReq()},
+		{"commit-only", withKinds(planReq(), manifest.KindCommit)},
+		{"account-only", withKinds(planReq(), manifest.KindAccount)},
+		{"identity+sync", withKinds(planReq(), manifest.KindIdentity|manifest.KindSync)},
 		{"did-only", withDIDs(planReq(), didA)},
 		{"two-dids", withDIDs(planReq(), didA, didC)},
 		{"collection-only", withCollections(planReq(), likeNSID)},
+		{"commit+collection", withCollections(withKinds(planReq(), manifest.KindCommit), likeNSID)},
+		{"commit+account+collection", withCollections(withKinds(planReq(), manifest.KindCommit|manifest.KindAccount), likeNSID)},
 		{"did+collection", withCollections(withDIDs(planReq(), didB), postNSID, repostNSID)},
 		{"window-mid", withWindow(planReq(), 6, 18)},
 		{"did+window", withWindow(withDIDs(planReq(), didD), 3, 20)},
@@ -456,6 +491,11 @@ func withDIDs(req manifest.PlanSnapshotRequest, dids ...string) manifest.PlanSna
 
 func withCollections(req manifest.PlanSnapshotRequest, collections ...string) manifest.PlanSnapshotRequest {
 	req.Collections = collections
+	return req
+}
+
+func withKinds(req manifest.PlanSnapshotRequest, kinds manifest.KindMask) manifest.PlanSnapshotRequest {
+	req.Kinds = kinds
 	return req
 }
 

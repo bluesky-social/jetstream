@@ -595,6 +595,7 @@ var (
 	jsonKey_JetstreamPlanSnapshot_Input_beforeSeq   = []byte("\"beforeSeq\":")
 	jsonKey_JetstreamPlanSnapshot_Input_collections = []byte("\"collections\":")
 	jsonKey_JetstreamPlanSnapshot_Input_dids        = []byte("\"dids\":")
+	jsonKey_JetstreamPlanSnapshot_Input_kinds       = []byte("\"kinds\":")
 )
 
 func (s *JetstreamPlanSnapshot_Input) MarshalJSON() ([]byte, error) {
@@ -650,6 +651,21 @@ func (s *JetstreamPlanSnapshot_Input) AppendJSON(buf []byte) ([]byte, error) {
 		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Input_dids...)
 		buf = append(buf, '[')
 		for i, item := range s.Dids {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = cbor.AppendJSONString(buf, item)
+		}
+		buf = append(buf, ']')
+		first = false
+	}
+	if len(s.Kinds) > 0 {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamPlanSnapshot_Input_kinds...)
+		buf = append(buf, '[')
+		for i, item := range s.Kinds {
 			if i > 0 {
 				buf = append(buf, ',')
 			}
@@ -785,6 +801,33 @@ func (s *JetstreamPlanSnapshot_Input) UnmarshalJSONAt(data []byte, pos int) (int
 					return 0, err
 				}
 			}
+		case "kinds":
+			if !cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.ReadJSONArrayStart(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Kinds = nil
+				for {
+					var done bool
+					pos, done = cbor.ReadJSONArrayEnd(data, pos)
+					if done {
+						break
+					}
+					var elem string
+					elem, pos, err = cbor.ReadJSONString(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Kinds = append(s.Kinds, elem)
+					pos = cbor.SkipJSONComma(data, pos)
+				}
+			} else {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipJSONValue(data, pos)
@@ -801,6 +844,7 @@ func (s *JetstreamPlanSnapshot_Input) UnmarshalJSONAt(data []byte, pos int) (int
 var (
 	cborKey_JetstreamPlanSnapshot_Input_dids        = cbor.AppendTextKey(nil, "dids")
 	cborKey_JetstreamPlanSnapshot_Input_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamPlanSnapshot_Input_kinds       = cbor.AppendTextKey(nil, "kinds")
 	cborKey_JetstreamPlanSnapshot_Input_afterSeq    = cbor.AppendTextKey(nil, "afterSeq")
 	cborKey_JetstreamPlanSnapshot_Input_beforeSeq   = cbor.AppendTextKey(nil, "beforeSeq")
 	cborKey_JetstreamPlanSnapshot_Input_collections = cbor.AppendTextKey(nil, "collections")
@@ -816,6 +860,9 @@ func (s *JetstreamPlanSnapshot_Input) AppendCBOR(buf []byte) ([]byte, error) {
 		n++
 	}
 	if s.LexiconTypeID != "" {
+		n++
+	}
+	if len(s.Kinds) > 0 {
 		n++
 	}
 	if s.AfterSeq.HasVal() {
@@ -842,6 +889,14 @@ func (s *JetstreamPlanSnapshot_Input) AppendCBOR(buf []byte) ([]byte, error) {
 		if s.LexiconTypeID != "" {
 			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "kinds", buf)
+		if len(s.Kinds) > 0 {
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_kinds...)
+			buf = cbor.AppendArrayHeader(buf, uint64(len(s.Kinds)))
+			for _, item := range s.Kinds {
+				buf = cbor.AppendText(buf, item)
+			}
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "afterSeq", buf)
 		if s.AfterSeq.HasVal() {
@@ -873,6 +928,13 @@ func (s *JetstreamPlanSnapshot_Input) AppendCBOR(buf []byte) ([]byte, error) {
 		if s.LexiconTypeID != "" {
 			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		if len(s.Kinds) > 0 {
+			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_kinds...)
+			buf = cbor.AppendArrayHeader(buf, uint64(len(s.Kinds)))
+			for _, item := range s.Kinds {
+				buf = cbor.AppendText(buf, item)
+			}
 		}
 		if s.AfterSeq.HasVal() {
 			buf = append(buf, cborKey_JetstreamPlanSnapshot_Input_afterSeq...)
@@ -943,6 +1005,24 @@ func (s *JetstreamPlanSnapshot_Input) UnmarshalCBORAt(data []byte, pos int) (int
 				s.LexiconTypeID, pos, err = cbor.ReadText(data, pos)
 				if err != nil {
 					return 0, err
+				}
+			} else if string(data[keyStart:keyEnd]) == "kinds" {
+				{
+					arrLen, newPos, err := cbor.ReadArrayHeader(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					if err := cbor.CheckArrayLen(arrLen, data, newPos); err != nil {
+						return 0, err
+					}
+					pos = newPos
+					s.Kinds = make([]string, arrLen)
+					for idx := range arrLen {
+						s.Kinds[idx], pos, err = cbor.ReadText(data, pos)
+						if err != nil {
+							return 0, err
+						}
+					}
 				}
 			} else {
 				valueStart := pos
@@ -1035,8 +1115,9 @@ type JetstreamPlanSnapshot_Input struct {
 	LexiconTypeID string           `json:"$type,omitempty"`
 	AfterSeq      gt.Option[int64] `json:"afterSeq,omitzero"`     // Start after this sequence number. Events at or below it are not included.
 	BeforeSeq     gt.Option[int64] `json:"beforeSeq,omitzero"`    // Stop at this sequence number. Events above it are not included.
-	Collections   []string         `json:"collections,omitempty"` // Only include data from these collections. Each value may be an exact NSID, such as app.bsky.feed....
+	Collections   []string         `json:"collections,omitempty"` // Collection NSIDs or namespace wildcards such as app.bsky.feed.*; constrains commit events only. N...
 	Dids          []string         `json:"dids,omitempty"`        // Only include data for these DIDs. Omit this field or pass an empty array to include all DIDs.
+	Kinds         []string         `json:"kinds,omitempty"`       // Event kinds to include. Omit this field or pass an empty array to include all kinds.
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -1044,7 +1125,7 @@ type JetstreamPlanSnapshot_Input struct {
 
 // JetstreamPlanSnapshot calls the XRPC procedure "network.bsky.jetstream.planSnapshot".
 //
-// Build a download plan for the desired data pattern. The plan lists whole segments or block ranges that might contain events for the requested DIDs and collections.
+// Build a download plan for the desired data pattern. The plan lists whole segments or block ranges that might contain events for the requested kinds, DIDs, and collections.
 func JetstreamPlanSnapshot(ctx context.Context, c *xrpc.Client, input *JetstreamPlanSnapshot_Input) (*JetstreamPlanSnapshot_Output, error) {
 	var out JetstreamPlanSnapshot_Output
 	return &out, c.Procedure(ctx, "network.bsky.jetstream.planSnapshot", input, &out)

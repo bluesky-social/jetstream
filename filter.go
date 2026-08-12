@@ -6,14 +6,14 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 )
 
-// matcher applies the caller's exact DID/collection/seq filters to decoded
+// matcher applies the caller's exact kind/DID/collection/seq filters to decoded
 // segment rows. The snapshot planner is a one-sided transport hint (no false
 // negatives, possible false positives via DID blooms and per-block collection
 // summaries), so the client MUST re-apply exact filtering after decode.
 //
 // The presentation contract matches the server's /subscribe wire policy:
 //
-//   - DID filter applies to all event kinds.
+//   - Kind and DID filters apply independently to all events.
 //   - With a collection filter set: only commit events whose collection matches
 //     are delivered. A commit with an empty collection still bypasses the
 //     filter. #account, #identity, and #sync — the DID-level events, which carry
@@ -26,6 +26,7 @@ import (
 // The seq window is the client's exact (afterSeq, beforeSeq] bound, applied on
 // top of the planner's coarse per-segment/block seq pruning.
 type matcher struct {
+	kinds        map[Kind]struct{}   // nil = match all kinds
 	dids         map[string]struct{} // nil = match all DIDs
 	fullPaths    map[string]struct{} // exact collection NSIDs
 	prefixes     []string            // wildcard collection prefixes ("app.bsky.feed.")
@@ -34,14 +35,20 @@ type matcher struct {
 	beforeSeq    uint64 // inclusive upper bound
 }
 
-// newMatcher builds a matcher from resolved filters. Empty dids/collections
-// mean match-all for that dimension. Collection entries are either exact NSIDs
+// newMatcher builds a matcher from resolved filters. Empty kinds/dids/
+// collections mean match-all for that dimension. Collection entries are exact NSIDs
 // or namespace wildcards ending in ".*" (e.g. "app.bsky.feed.*").
 func newMatcher(req planRequest) *matcher {
 	m := &matcher{
 		afterSeq:     req.AfterSeq,
 		hasBeforeSeq: req.HasBeforeSeq,
 		beforeSeq:    req.BeforeSeq,
+	}
+	if len(req.Kinds) > 0 {
+		m.kinds = make(map[Kind]struct{}, len(req.Kinds))
+		for _, kind := range req.Kinds {
+			m.kinds[kind] = struct{}{}
+		}
 	}
 	if len(req.DIDs) > 0 {
 		m.dids = make(map[string]struct{}, len(req.DIDs))
@@ -66,7 +73,7 @@ func newMatcher(req planRequest) *matcher {
 
 // wantsSegment reports whether a stored row passes the exact filters.
 func (m *matcher) wantsSegment(ev *segment.Event) bool {
-	return m.wants(ev.Seq, ev.DID, ev.Kind.IsCommit(), ev.Collection)
+	return m.wants(ev.Seq, ev.DID, publicKind(ev.Kind), ev.Collection)
 }
 
 // wantsEvent reports whether a decoded live event passes the exact filters.
@@ -76,15 +83,20 @@ func (m *matcher) wantsEvent(ev *Event) bool {
 	if isCommit && ev.Commit != nil {
 		collection = ev.Commit.Collection
 	}
-	return m.wants(ev.Seq, ev.DID, isCommit, collection)
+	return m.wants(ev.Seq, ev.DID, ev.Kind, collection)
 }
 
-func (m *matcher) wants(seq uint64, did string, isCommit bool, collection string) bool {
+func (m *matcher) wants(seq uint64, did string, kind Kind, collection string) bool {
 	if m == nil {
 		return true
 	}
 	if !m.wantsSeq(seq) {
 		return false
+	}
+	if m.kinds != nil {
+		if _, ok := m.kinds[kind]; !ok {
+			return false
+		}
 	}
 	if m.dids != nil {
 		if _, ok := m.dids[did]; !ok {
@@ -99,7 +111,7 @@ func (m *matcher) wants(seq uint64, did string, isCommit bool, collection string
 	// above. They are the consumer's only signal to purge a dead account's
 	// records, so hiding them under a collection filter would create a
 	// permanently stale view (see the type doc).
-	if !isCommit {
+	if kind != KindCommit {
 		return true
 	}
 	// A commit lacking a collection bypasses the filter (v1 parity).
@@ -117,13 +129,29 @@ func (m *matcher) wants(seq uint64, did string, isCommit bool, collection string
 	return false
 }
 
+func publicKind(kind segment.Kind) Kind {
+	if kind.IsCommit() {
+		return KindCommit
+	}
+	switch kind {
+	case segment.KindIdentity:
+		return KindIdentity
+	case segment.KindAccount:
+		return KindAccount
+	case segment.KindSync:
+		return KindSync
+	default:
+		return ""
+	}
+}
+
 // setAfterSeq raises the matcher's exclusive lower bound to afterSeq. It is used
 // on a §14 re-backfill: the sweep re-runs planSnapshot from the last
 // durably-processed seq (the live tail's highest delivered seq), and the matcher
 // must track that resume point so the one work unit that STRADDLES it (admitted
 // whole under the planner's one-sided contract) has its already-delivered rows
 // dropped before decode rather than re-emitted out of order. Only the seq floor
-// moves; the DID/collection filters and the (user-supplied) beforeSeq bound are
+// moves; the kind/DID/collection filters and the (user-supplied) beforeSeq bound are
 // untouched. The bound only ever moves FORWARD across a backfill loop's life
 // (resume >= cutover >= the prior floor), so this never widens the window. See
 // the call site in runBackfillThenLive for the full scope/safety argument.

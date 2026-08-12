@@ -13,9 +13,10 @@ package segment
 // To make those blocks selectable without a side channel, the seal and
 // rewrite index paths add a reserved sentinel collection name to a
 // block's collection set for each DID-level marker kind the block
-// contains. The planner unions these sentinels into every
-// collection-filtered query (see manifest.collectionIDsForSegment), so
-// marker-bearing blocks are always selected; the per-block DID bloom
+// contains. The planner admits these sentinels for every kind not explicitly
+// excluded by a collection-filtered query (see
+// manifest.collectionCandidatesForSegment), so the marker-safe default selects them
+// while kinds=commit does not; the per-block DID bloom
 // still narrows the selection by DID. The markers then ride inline
 // through the normal segment/block download and a folding consumer
 // converges — the same path record-level deletes already take.
@@ -58,8 +59,7 @@ func didMarkerSentinel(k Kind) string {
 
 // IsDIDMarkerSentinelCollection reports whether name is one of the
 // reserved DID-level marker sentinel collection names. The planner uses
-// it to union sentinel collection ids into every collection-filtered
-// query so marker-bearing blocks are always selected.
+// it to recognize marker-kind IDs in footer metadata.
 func IsDIDMarkerSentinelCollection(name string) bool {
 	switch name {
 	case SentinelCollectionAccount, SentinelCollectionIdentity, SentinelCollectionSync:

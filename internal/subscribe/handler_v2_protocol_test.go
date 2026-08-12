@@ -127,6 +127,7 @@ func TestHandlerV2_PreUpgradeErrorsAreXRPCEnvelopes(t *testing.T) {
 		wantInMsg  string
 	}{
 		{"unknown kind", "?kinds=likes", 400, "InvalidRequest", `unknown kind "likes"`},
+		{"too many kinds", "?kinds=commit&kinds=commit&kinds=commit&kinds=commit&kinds=commit", 400, "InvalidRequest", "too many kinds"},
 		{"inert collections", "?kinds=identity&collections=app.bsky.feed.like", 400, "InvalidRequest", "can never apply"},
 		{"legacy wantedDids", "?wantedDids=did:plc:x", 400, "InvalidRequest", "use dids"},
 		{"legacy wantedCollections", "?wantedCollections=app.bsky.feed.like", 400, "InvalidRequest", "use collections"},
@@ -134,6 +135,8 @@ func TestHandlerV2_PreUpgradeErrorsAreXRPCEnvelopes(t *testing.T) {
 		{"legacy compress opt-in", "?compress=true", 400, "InvalidRequest", "zstdDictionary"},
 		{"unknown dictionary", "?zstdDictionary=12345", 400, "UnknownZstdDictionary", "current dictionary id is"},
 		{"malformed dictionary", "?zstdDictionary=banana", 400, "InvalidRequest", "positive integer"},
+		{"malformed max message size", "?maxMessageSizeBytes=banana", 400, "InvalidRequest", "maxMessageSizeBytes"},
+		{"negative max message size", "?maxMessageSizeBytes=-1", 400, "InvalidRequest", "maxMessageSizeBytes"},
 		// Cursor-shaped 400s (invalid cursor, CursorTooOld) need a replay-
 		// enabled server config; they are covered with envelope assertions
 		// in handler_integration_test.go.

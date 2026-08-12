@@ -268,6 +268,7 @@ func TestLiveConsumerSubscribeURLForwardsFilters(t *testing.T) {
 	t.Parallel()
 	c := newLiveConsumer(liveConfig{
 		host:        "https://h",
+		kinds:       []Kind{KindCommit, KindAccount},
 		collections: []string{"app.bsky.feed.post", "app.bsky.feed.like"},
 		dids:        []string{"did:plc:a", "did:plc:b"},
 	})
@@ -275,6 +276,8 @@ func TestLiveConsumerSubscribeURLForwardsFilters(t *testing.T) {
 	parsed, err := url.Parse(u)
 	require.NoError(t, err)
 	q := parsed.Query()
+	require.Equal(t, []string{"commit", "account"}, q["kinds"],
+		"each kind must be a repeated kinds param; got %s", u)
 	require.Equal(t, []string{"app.bsky.feed.post", "app.bsky.feed.like"}, q["collections"],
 		"each collection must be a repeated collections param; got %s", u)
 	require.Equal(t, []string{"did:plc:a", "did:plc:b"}, q["dids"],
@@ -285,6 +288,7 @@ func TestLiveConsumerSubscribeURLForwardsFilters(t *testing.T) {
 	u2 := c2.subscribeURL()
 	require.NotContains(t, u2, "collections", "no collection filter -> no param")
 	require.NotContains(t, u2, "dids", "no DID filter -> no param")
+	require.NotContains(t, u2, "kinds", "no kind filter -> no param")
 }
 
 // TestLiveConsumerSubscribeURLCursorZero guards the bufferless cutover's
@@ -394,6 +398,20 @@ func TestLiveConsumerCursorTooOldIsTerminal(t *testing.T) {
 		t.Fatal("Run did not return on a too-old dial (reconnect-looping?)")
 	}
 	require.LessOrEqual(t, dials.Load(), int64(2), "must not reconnect-loop on a terminal too-old cursor")
+}
+
+func TestLiveConsumerInvalidRequestIsTerminal(t *testing.T) {
+	t.Parallel()
+	var dials atomic.Int64
+	dial := func(context.Context, string) (wsConn, error) {
+		dials.Add(1)
+		return nil, errLiveInvalidRequest
+	}
+	c := newLiveConsumer(liveConfig{host: "https://h", dial: dial, backoffMin: time.Millisecond})
+
+	err := c.Run(context.Background(), func(*Event, error) bool { return true })
+	require.ErrorIs(t, err, errLiveInvalidRequest)
+	require.Equal(t, int64(1), dials.Load(), "a permanent invalid request must dial exactly once")
 }
 
 func TestLiveConsumerContextCancelCleanStop(t *testing.T) {

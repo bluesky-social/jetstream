@@ -170,6 +170,12 @@ func TestParseQueryV2_Validation(t *testing.T) {
 		{"requireHello tombstone", "requireHello=true", "server-push only"},
 		{"invalid DID", "dids=not-a-did", "invalid DID"},
 		{"invalid collection", "collections=not_an_nsid", "invalid collection"},
+		{"too many kinds", "kinds=commit&kinds=commit&kinds=commit&kinds=commit&kinds=commit", "too many kinds"},
+		{"empty max message size", "maxMessageSizeBytes=", "maxMessageSizeBytes"},
+		{"malformed max message size", "maxMessageSizeBytes=garbage", "maxMessageSizeBytes"},
+		{"negative max message size", "maxMessageSizeBytes=-1", "maxMessageSizeBytes"},
+		{"overflowing max message size", "maxMessageSizeBytes=4294967296", "maxMessageSizeBytes"},
+		{"repeated max message size", "maxMessageSizeBytes=1&maxMessageSizeBytes=2", "maxMessageSizeBytes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -200,10 +206,7 @@ func TestParseQueryV2_ValidCombinations(t *testing.T) {
 	require.True(t, f.Wants(v2Evt(segment.KindCreate, "did:plc:x", "app.bsky.feed.like")))
 	require.False(t, f.Wants(v2Evt(segment.KindIdentity, "did:plc:x", "")))
 
-	// maxMessageSizeBytes keeps its v1 forgiveness (size gate, not a
-	// semantic axis).
-	f = mustParseV2(t, "maxMessageSizeBytes=garbage")
-	require.Equal(t, uint32(0), f.MaxMessageSizeBytes())
+	// V2 rejects malformed values rather than silently disabling the cap.
 	f = mustParseV2(t, "maxMessageSizeBytes=1024")
 	require.Equal(t, uint32(1024), f.MaxMessageSizeBytes())
 }
