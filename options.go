@@ -224,13 +224,12 @@ func WithSegmentStripes(n int) Option {
 }
 
 // WithAPIToken authenticates archive negotiation and downloads with a bearer
-// token. Pass the raw Gatekeeper/Headwind token, without a "Bearer " prefix.
-// The token is sent on planSnapshot, getSegment, and getBlock requests; it is
-// not sent when fetching the public zstd dictionary or upgrading the public
-// live WebSocket.
+// token. Pass the raw token, without a "Bearer " prefix. The token is sent on
+// planSnapshot, getSegment, and getBlock requests; it is not sent when fetching
+// the public zstd dictionary or upgrading the public live WebSocket.
 //
-// The value is a bearer secret. Use TLS when crossing a public Headwind
-// boundary, and avoid putting the token in logs or process arguments.
+// The value is a bearer secret. Use TLS when crossing an untrusted network,
+// and avoid putting the token in logs or process arguments.
 func WithAPIToken(token string) Option {
 	return func(c *config) {
 		c.apiToken = token

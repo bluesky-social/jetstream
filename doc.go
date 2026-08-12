@@ -34,8 +34,8 @@
 // archive (downloading every matching sealed segment), then connects
 // /xrpc/network.bsky.jetstream.subscribeEvents once at the sealed tip to pick up
 // the active segment and the live tail. There is no client-side buffer and no
-// record suppression. Archives that require Headwind authentication can use
-// WithAPIToken with the raw bearer token; it authenticates planSnapshot,
+// record suppression. Archives that require bearer authentication can use
+// WithAPIToken with the raw token; it authenticates planSnapshot,
 // getSegment, and getBlock only. The public dictionary request and live
 // WebSocket remain unauthenticated. The live tail uses the server's
 // dictionary-zstd compression by default; use WithZstdCompression(false) to opt

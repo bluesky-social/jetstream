@@ -17,8 +17,8 @@ func newEngine(host string, cfg config) (engine, error) {
 	negotiationXRPC := newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second))
 	bulkXRPC := newXRPCClient(host, cfg, xrpc.BulkDownloadOpts())
 	if cfg.hasAPIToken {
-		// AccessJwt is atmos's opaque bearer-header transport seam. Headwind API
-		// tokens are not parsed as JWTs and have no refresh/session semantics.
+		// AccessJwt is atmos's opaque bearer-header transport seam. API tokens
+		// are not parsed as JWTs and have no refresh/session semantics.
 		negotiationXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiToken})
 		bulkXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiToken})
 	}
