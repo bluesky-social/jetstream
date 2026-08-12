@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import "sync"
 
@@ -26,7 +26,10 @@ func newBatcher(size int, emit func(batch []Event) bool, emitErr func(error) boo
 	if size < 1 {
 		size = 1
 	}
-	return &batcher{size: size, emit: emit, emitErr: emitErr, buf: make([]Event, 0, size)}
+	// The preallocation is an optimization, not the logical batch bound: buf
+	// grows by append past it. Clamp it so an absurd WithBatchSize (e.g.
+	// MaxInt) cannot panic make with an out-of-range cap.
+	return &batcher{size: size, emit: emit, emitErr: emitErr, buf: make([]Event, 0, min(size, 4096))}
 }
 
 // setOnStop registers a callback fired exactly once when the consumer first
@@ -112,7 +115,9 @@ func (b *batcher) flushLocked() bool {
 		return true
 	}
 	batch := b.buf
-	b.buf = make([]Event, 0, b.size)
+	// Same clamped preallocation as newBatcher: b.size may be absurdly large
+	// (any positive WithBatchSize is accepted) and buf grows by append anyway.
+	b.buf = make([]Event, 0, min(b.size, 4096))
 	if !b.emit(batch) {
 		b.stop = true
 		b.fireStopLocked()

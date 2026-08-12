@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"context"
@@ -134,7 +134,7 @@ func runConsumer(t *testing.T, cfg liveConfig, wantEvents int) ([]Event, []error
 func TestLiveAccountDeleteDeliveredDespiteCollectionFilter(t *testing.T) {
 	t.Parallel()
 
-	e := &Engine{matcher: NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})}
+	e := &replayEngine{matcher: newMatcher(planRequest{Collections: []string{"app.bsky.feed.post"}})}
 
 	acctDel, _, err := decodeLiveFrame(liveAccountFrame(100, "did:plc:a", false, "deleted"), recordDecodeMode{})
 	require.NoError(t, err)

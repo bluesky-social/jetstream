@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"context"
@@ -38,10 +38,10 @@ func newPlanServer(t *testing.T, status int, respBody string) *planServer {
 	return ps
 }
 
-func (ps *planServer) planner() *Planner {
+func (ps *planServer) planner() *planner {
 	// Disable retry backoff so the error-path tests don't wait real seconds on
 	// 5xx responses; one attempt is enough to assert mapping behavior.
-	return NewPlanner(&xrpc.Client{
+	return newPlanner(&xrpc.Client{
 		Host:  ps.srv.URL,
 		Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
 	})
@@ -67,7 +67,7 @@ func TestPlanWholeSegmentAndBlocks(t *testing.T) {
 	}`
 	ps := newPlanServer(t, http.StatusOK, resp)
 
-	plan, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+	plan, err := ps.planner().archivePlan(context.Background(), planRequest{AfterSeq: 0})
 	require.NoError(t, err)
 
 	require.EqualValues(t, 500, plan.PlannedThroughSeq)
@@ -75,16 +75,15 @@ func TestPlanWholeSegmentAndBlocks(t *testing.T) {
 	require.Len(t, plan.Entries, 2)
 
 	require.Equal(t, "seg_0000000000.jss", plan.Entries[0].SegmentName)
-	require.Equal(t, ModeWholeSegment, plan.Entries[0].Mode)
+	require.Equal(t, modeWholeSegment, plan.Entries[0].Mode)
 	require.Equal(t, "00112233aabbccdd", plan.Entries[0].Checksum)
 	require.EqualValues(t, 1, plan.Entries[0].MinSeq)
 	require.EqualValues(t, 200, plan.Entries[0].MaxSeq)
 	require.Empty(t, plan.Entries[0].Blocks)
 
-	require.Equal(t, ModeBlocks, plan.Entries[1].Mode)
-	require.Equal(t, []BlockRange{{First: 2, Last: 4}, {First: 7, Last: 7}}, plan.Entries[1].Blocks)
+	require.Equal(t, modeBlocks, plan.Entries[1].Mode)
+	require.Equal(t, []blockRange{{First: 2, Last: 4}, {First: 7, Last: 7}}, plan.Entries[1].Blocks)
 
-	require.Equal(t, PlanStats{SegmentsExamined: 2, SegmentsMatched: 2, BlocksMatched: 3, Entries: 3}, plan.Stats)
 }
 
 func TestPlanEmptyArchive(t *testing.T) {
@@ -92,7 +91,7 @@ func TestPlanEmptyArchive(t *testing.T) {
 	resp := `{"plannedThroughSeq":0,"segments":[],"stats":{"segmentsExamined":0,"segmentsMatched":0,"blocksMatched":0,"entries":0}}`
 	ps := newPlanServer(t, http.StatusOK, resp)
 
-	plan, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+	plan, err := ps.planner().archivePlan(context.Background(), planRequest{AfterSeq: 0})
 	require.NoError(t, err)
 	require.EqualValues(t, 0, plan.PlannedThroughSeq)
 	require.Empty(t, plan.Entries)
@@ -105,7 +104,7 @@ func TestPlanFilterMatchesNothingButReportsTip(t *testing.T) {
 	resp := `{"plannedThroughSeq":900,"sealedTipSeq":900,"segments":[],"stats":{"segmentsExamined":3,"segmentsMatched":0,"blocksMatched":0,"entries":0}}`
 	ps := newPlanServer(t, http.StatusOK, resp)
 
-	plan, err := ps.planner().Plan(context.Background(), PlanRequest{Collections: []string{"app.example.absent"}})
+	plan, err := ps.planner().archivePlan(context.Background(), planRequest{Collections: []string{"app.example.absent"}})
 	require.NoError(t, err)
 	require.EqualValues(t, 900, plan.PlannedThroughSeq)
 	require.EqualValues(t, 900, plan.SealedTipSeq)
@@ -117,7 +116,7 @@ func TestPlanInputMapping(t *testing.T) {
 	resp := `{"plannedThroughSeq":0,"segments":[],"stats":{"segmentsExamined":0,"segmentsMatched":0,"blocksMatched":0,"entries":0}}`
 	ps := newPlanServer(t, http.StatusOK, resp)
 
-	_, err := ps.planner().Plan(context.Background(), PlanRequest{
+	_, err := ps.planner().archivePlan(context.Background(), planRequest{
 		DIDs:         []string{"did:plc:abc", "did:plc:def"},
 		Collections:  []string{"app.bsky.feed.post", "app.bsky.feed.*"},
 		AfterSeq:     42,
@@ -136,17 +135,17 @@ func TestPlanInputMapping(t *testing.T) {
 // TestPlanRejectsCursorOverflow guards the int64 boundary: WithAfterSeq /
 // WithBeforeSeq accept arbitrary uint64 from the public API, but the lexicon
 // fields are int64. A value > MaxInt64 would wrap negative and silently make
-// the server plan from the wrong range. Plan must reject it before any request
+// the server plan from the wrong range. archivePlan must reject it before any request
 // rather than corrupt the query.
 func TestPlanRejectsCursorOverflow(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name string
-		req  PlanRequest
+		req  planRequest
 	}{
-		{name: "afterSeq overflow", req: PlanRequest{AfterSeq: math.MaxInt64 + 1}},
-		{name: "afterSeq max uint64", req: PlanRequest{AfterSeq: math.MaxUint64}},
-		{name: "beforeSeq overflow", req: PlanRequest{HasBeforeSeq: true, BeforeSeq: math.MaxInt64 + 1}},
+		{name: "afterSeq overflow", req: planRequest{AfterSeq: math.MaxInt64 + 1}},
+		{name: "afterSeq max uint64", req: planRequest{AfterSeq: math.MaxUint64}},
+		{name: "beforeSeq overflow", req: planRequest{HasBeforeSeq: true, BeforeSeq: math.MaxInt64 + 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -154,7 +153,7 @@ func TestPlanRejectsCursorOverflow(t *testing.T) {
 			// before the request leaves the client.
 			ps := newPlanServer(t, http.StatusOK, `{"plannedThroughSeq":0,"segments":[],"stats":{}}`)
 			before := len(ps.lastBody)
-			_, err := ps.planner().Plan(context.Background(), tc.req)
+			_, err := ps.planner().archivePlan(context.Background(), tc.req)
 			require.Error(t, err)
 			require.Equal(t, before, len(ps.lastBody), "no request should be sent for an out-of-range cursor")
 		})
@@ -164,7 +163,7 @@ func TestPlanRejectsCursorOverflow(t *testing.T) {
 	t.Run("afterSeq at int64 max is allowed", func(t *testing.T) {
 		t.Parallel()
 		ps := newPlanServer(t, http.StatusOK, `{"plannedThroughSeq":0,"segments":[],"stats":{}}`)
-		_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: math.MaxInt64})
+		_, err := ps.planner().archivePlan(context.Background(), planRequest{AfterSeq: math.MaxInt64})
 		require.NoError(t, err)
 	})
 }
@@ -174,7 +173,7 @@ func TestPlanInputOmitsEmptyFilters(t *testing.T) {
 	resp := `{"plannedThroughSeq":0,"segments":[],"stats":{"segmentsExamined":0,"segmentsMatched":0,"blocksMatched":0,"entries":0}}`
 	ps := newPlanServer(t, http.StatusOK, resp)
 
-	_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+	_, err := ps.planner().archivePlan(context.Background(), planRequest{AfterSeq: 0})
 	require.NoError(t, err)
 
 	in := ps.decodeInput(t)
@@ -191,7 +190,7 @@ func TestPlanInputOmitsEmptyFilters(t *testing.T) {
 func TestPlanSurfacesContinuationCursorAndTip(t *testing.T) {
 	t.Parallel()
 	// A truncated page: the continuation cursor is below the sealed tip, so the
-	// caller knows to page again. Both horizons must surface on the Plan.
+	// caller knows to page again. Both horizons must surface on the archivePlan.
 	resp := `{
 		"plannedThroughSeq": 300,
 		"sealedTipSeq": 500,
@@ -202,7 +201,7 @@ func TestPlanSurfacesContinuationCursorAndTip(t *testing.T) {
 	}`
 	ps := newPlanServer(t, http.StatusOK, resp)
 
-	plan, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+	plan, err := ps.planner().archivePlan(context.Background(), planRequest{AfterSeq: 0})
 	require.NoError(t, err)
 	require.EqualValues(t, 300, plan.PlannedThroughSeq)
 	require.EqualValues(t, 500, plan.SealedTipSeq)
@@ -217,7 +216,7 @@ func TestPlanRejectsCursorAboveTip(t *testing.T) {
 	resp := `{"plannedThroughSeq":600,"sealedTipSeq":500,"segments":[],"stats":{}}`
 	ps := newPlanServer(t, http.StatusOK, resp)
 
-	_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+	_, err := ps.planner().archivePlan(context.Background(), planRequest{AfterSeq: 0})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "exceeds sealedTipSeq")
 }
@@ -227,7 +226,7 @@ func TestPlanXRPCErrorIsWrapped(t *testing.T) {
 	resp := `{"error":"InternalError","message":"boom"}`
 	ps := newPlanServer(t, http.StatusInternalServerError, resp)
 
-	_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+	_, err := ps.planner().archivePlan(context.Background(), planRequest{AfterSeq: 0})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "planSnapshot")
 }
@@ -249,7 +248,7 @@ func TestPlanRejectsMalformedSegments(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ps := newPlanServer(t, http.StatusOK, tc.resp)
-			_, err := ps.planner().Plan(context.Background(), PlanRequest{AfterSeq: 0})
+			_, err := ps.planner().archivePlan(context.Background(), planRequest{AfterSeq: 0})
 			require.Error(t, err)
 		})
 	}

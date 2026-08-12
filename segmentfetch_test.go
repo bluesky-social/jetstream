@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"bytes"
@@ -28,17 +28,17 @@ func segETag(raw []byte) string {
 // stripedDownloader shrinks the part size so small test fixtures exercise
 // multi-part striping (probe + parts) instead of completing in the probe,
 // pinned to 4-way striping so the assertions don't drift with the default.
-func stripedDownloader(host string, concurrency int, partSize int64) *Downloader {
+func stripedDownloader(host string, concurrency int, partSize int64) *downloader {
 	d := singleStreamDownloader(host, concurrency, partSize)
-	d.SetSegmentStripes(4)
+	d.setSegmentStripes(4)
 	return d
 }
 
 // singleStreamDownloader selects the stripes=1 resumable-stream mode, with a
 // small part size so the probe/remainder split is exercised.
-func singleStreamDownloader(host string, concurrency int, partSize int64) *Downloader {
-	d := NewDownloader(&xrpc.Client{Host: host}, concurrency, nil)
-	d.SetSegmentStripes(1)
+func singleStreamDownloader(host string, concurrency int, partSize int64) *downloader {
+	d := newDownloader(&xrpc.Client{Host: host}, concurrency, nil)
+	d.setSegmentStripes(1)
 	d.segPartSize = partSize
 	d.partRetryDelay = time.Millisecond
 	return d

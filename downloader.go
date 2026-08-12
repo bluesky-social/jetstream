@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"bytes"
@@ -14,16 +14,10 @@ import (
 	"github.com/jcalabro/atmos/xrpc"
 )
 
-// RowSelector decides whether a decoded segment row should be kept (emitted)
-// or skipped. The downloader consults it before the expensive CBOR decode so
-// filtered-out and suppressed rows are never materialized. A nil RowSelector
-// keeps every row.
-//
-// Keep is called concurrently across entries and must be safe for concurrent
-// use. The bool is keep; the string is a drop reason for diagnostics.
-type RowSelector interface {
-	Keep(ev *segment.Event) (bool, string)
-}
+// rowSelector decides whether a decoded segment row should be emitted. It runs
+// before the expensive CBOR decode and may be called concurrently. nil keeps
+// every row.
+type rowSelector func(*segment.Event) bool
 
 // prefetchDepth is how many whole-segment files the prefetcher may fetch ahead
 // of the framer. It overlaps the next segment's network download with the
@@ -34,58 +28,55 @@ type RowSelector interface {
 // footprint further (streaming the body) is tracked separately as #143.
 const prefetchDepth = 2
 
-// Downloader fetches sealed-archive plan entries over XRPC and decodes them into
+// downloader fetches sealed-archive plan entries over XRPC and decodes them into
 // events. Block decode runs in parallel across a worker pool while a single
 // reassembler emits results in strict plan order, so decode scales across cores
 // without violating the archive's per-DID ordering invariant.
-type Downloader struct {
+type downloader struct {
 	xc          *xrpc.Client
 	concurrency int
-	selector    RowSelector
+	selector    rowSelector
 	// transform, when non-nil, runs ON the decode-pool workers (in parallel)
 	// immediately after a block is decoded, turning that block's []Event into an
 	// opaque, ready-to-deliver payload that the reassembler forwards in seq order
-	// as EntryResult.Payload. It exists to move expensive per-event work (notably
-	// the internal→public event conversion + batch assembly, ~⅔ of the old serial
-	// reassembler's CPU) OFF the single ordered goroutine and onto the parallel
-	// pool, lifting the scaling ceiling (#142). The return type is `any` — not a
-	// concrete type — precisely so this internal package never names the root
-	// jetstream.Event/Batch types (root imports internal/client; the reverse would
-	// be an import cycle). The root package supplies the closure and type-asserts
-	// the payload back on the way out. When nil, the legacy []Event path is used
-	// unchanged (direct Download callers / unit tests). A nil return for a block
-	// means "nothing to emit" (empty/filtered), matching the len(events)>0 skip.
+	// as entryResult.Payload. It exists to move expensive per-event work (notably
+	// batch assembly and typed record decoding) off the single ordered goroutine
+	// and onto the parallel pool, lifting the scaling ceiling (#142). The payload
+	// is opaque because the untyped and generic typed paths produce different
+	// batch types. The caller supplies the closure and asserts its own payload on
+	// delivery. When nil, decoded []Event values are emitted directly. A nil
+	// return means the block has nothing to emit.
 	transform func(entryIdx int, evs []Event) any
 	// mode controls how commit records are materialized (raw vs. map[string]any).
 	// Zero value = the default map-building path, so existing callers/tests are
-	// unaffected. Set via SetRecordMode.
+	// unaffected. Set via setRecordMode.
 	mode recordDecodeMode
 	// Striped whole-segment fetch tuning (#296). Set to the segment* defaults
-	// by NewDownloader; tests shrink them to exercise multi-part behavior on
+	// by newDownloader; tests shrink them to exercise multi-part behavior on
 	// small fixtures without megabyte inputs.
 	segPartSize    int64
 	segStripes     int
 	partRetryDelay time.Duration
 }
 
-// SetTransform installs the per-block worker-side transform (see Downloader.transform).
-// It is set separately from NewDownloader so the constructor signature stays
+// setTransform installs the per-block worker-side transform (see downloader.transform).
+// It is set separately from newDownloader so the constructor signature stays
 // stable for the many direct callers/tests that do not need it.
-func (d *Downloader) SetTransform(fn func(entryIdx int, evs []Event) any) { d.transform = fn }
+func (d *downloader) setTransform(fn func(entryIdx int, evs []Event) any) { d.transform = fn }
 
-// SetRecordMode selects raw vs. map record decode (see recordDecodeMode). The
+// setRecordMode selects raw vs. map record decode (see recordDecodeMode). The
 // zero value (default map build) applies when unset, keeping existing callers
 // unchanged.
-func (d *Downloader) SetRecordMode(m recordDecodeMode) { d.mode = m }
+func (d *downloader) setRecordMode(m recordDecodeMode) { d.mode = m }
 
-// NewDownloader returns a Downloader using xc for getSegment/getBlock calls.
+// newDownloader returns a downloader using xc for getSegment/getBlock calls.
 // concurrency bounds in-flight downloads; values < 1 are clamped to 1.
-// selector (may be nil) filters/suppresses rows before decode.
-func NewDownloader(xc *xrpc.Client, concurrency int, selector RowSelector) *Downloader {
+// selector (may be nil) filters rows before decode.
+func newDownloader(xc *xrpc.Client, concurrency int, selector rowSelector) *downloader {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	return &Downloader{
+	return &downloader{
 		xc:             xc,
 		concurrency:    concurrency,
 		selector:       selector,
@@ -95,16 +86,16 @@ func NewDownloader(xc *xrpc.Client, concurrency int, selector RowSelector) *Down
 	}
 }
 
-// SetSegmentStripes overrides how many parallel range requests fetch each
+// setSegmentStripes overrides how many parallel range requests fetch each
 // whole segment (default 8). 1 selects the single resumable stream; see the
 // segmentfetch.go doc comment for when that is the better choice.
-func (d *Downloader) SetSegmentStripes(n int) {
+func (d *downloader) setSegmentStripes(n int) {
 	if n > 0 {
 		d.segStripes = n
 	}
 }
 
-// EntryResult is one unit of decoded output, tagged with its plan position so
+// entryResult is one unit of decoded output, tagged with its plan position so
 // the consumer can emit in order. A single plan entry streams as MULTIPLE
 // EntryResults — one per decoded block — all carrying the same Index/Entry, so
 // the downloader never holds a whole segment's decoded events in memory at
@@ -113,12 +104,12 @@ func (d *Downloader) SetSegmentStripes(n int) {
 // stops streaming after the error. If only individual selected rows were
 // semantically malformed, Err is non-nil alongside the valid decoded rows, so
 // consumers can surface the warning without dropping the rest of the block.
-type EntryResult struct {
+type entryResult struct {
 	Index  int // position in the plan's Entries slice
-	Entry  PlanEntry
+	Entry  planEntry
 	Events []Event
 	Err    error
-	// Payload is the opaque output of the Downloader's transform (when one is
+	// Payload is the opaque output of the downloader's transform (when one is
 	// set), already computed in parallel on the decode workers and forwarded here
 	// in seq order. nil when no transform is set (legacy []Event path) or for an
 	// error result with no valid decoded rows. The caller that supplied the
@@ -128,7 +119,7 @@ type EntryResult struct {
 
 // decodeJob is one raw block frame queued for the decode pool, tagged with the
 // dense global sequence the framer assigned (for in-order reassembly) and its
-// plan entry index (to build the EntryResult). err != nil is a fetch/read
+// plan entry index (to build the entryResult). err != nil is a fetch/read
 // failure the framer surfaces in order without decoding (frame is then nil).
 type decodeJob struct {
 	seq      uint64
@@ -173,7 +164,7 @@ type decodeResult struct {
 // If emit returns false, Download stops early: it cancels in-flight and pending
 // work and returns nil (a clean stop, not an error). It returns the first
 // context error encountered; per-block download/decode failures are reported
-// through EntryResult.Err in order (not returned), so one bad block does not
+// through entryResult.Err in order (not returned), so one bad block does not
 // abort the backfill — the good prefix of that entry's blocks is emitted, then
 // the error, then the entry stops and the next entry continues.
 //
@@ -190,7 +181,7 @@ type decodeResult struct {
 // O(archive). Compressed whole-segment buffers are bounded to ~prefetchDepth
 // resident files (a separate, larger term tracked by #143), independent of plan
 // size. This is what keeps the full-archive backfill from the OOM in #142.
-func (d *Downloader) Download(ctx context.Context, entries []PlanEntry, emit func(EntryResult) bool) error {
+func (d *downloader) Download(ctx context.Context, entries []planEntry, emit func(entryResult) bool) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -256,7 +247,7 @@ func inFlightWindow(concurrency int) int {
 // pool with a dense ascending global seq. It closes jobs on return. A per-entry
 // fetch/read error is dispatched as an in-order error job and that entry stops
 // (the next continues).
-func (d *Downloader) runFramer(ctx context.Context, entries []PlanEntry, jobs chan<- decodeJob, sem chan struct{}) {
+func (d *downloader) runFramer(ctx context.Context, entries []planEntry, jobs chan<- decodeJob, sem chan struct{}) {
 	defer close(jobs)
 
 	// The block-fetch coordinator (nil when the plan has no block-mode entries)
@@ -295,11 +286,11 @@ func (d *Downloader) runFramer(ctx context.Context, entries []PlanEntry, jobs ch
 			if !dispatch(f.idx, 0, nil, f.err) {
 				return
 			}
-		case f.entry.Mode == ModeWholeSegment:
+		case f.entry.Mode == modeWholeSegment:
 			if !d.frameWholeSegment(f.idx, f.entry, f.raw, dispatch) {
 				return
 			}
-		case f.entry.Mode == ModeBlocks:
+		case f.entry.Mode == modeBlocks:
 			if !frameBlocks(ctx, f.idx, bc.futuresByEntry[f.idx], bc.inflight, dispatch) {
 				return
 			}
@@ -314,7 +305,7 @@ func (d *Downloader) runFramer(ctx context.Context, entries []PlanEntry, jobs ch
 // frameWholeSegment slices the prefetched sealed file into block frames and
 // dispatches them in ascending index. A header/read error is dispatched in order
 // and stops this entry. Returns false if the pipeline was cancelled.
-func (d *Downloader) frameWholeSegment(entryIdx int, entry PlanEntry, raw []byte, dispatch func(entryIdx, blockIdx int, frame []byte, ferr error) bool) bool {
+func (d *downloader) frameWholeSegment(entryIdx int, entry planEntry, raw []byte, dispatch func(entryIdx, blockIdx int, frame []byte, ferr error) bool) bool {
 	r := bytes.NewReader(raw)
 	hdr, err := segment.ReadSealedHeader(r)
 	if err != nil {
@@ -430,8 +421,8 @@ type blockFetchCoordinator struct {
 // the plan has no block-mode entries. Workers exit when the coordinator has
 // enqueued every block (or on cancellation, when in-flight requests fail fast
 // via ctx and the per-entry channels are closed so the framer never hangs).
-func (d *Downloader) startBlockFetches(ctx context.Context, entries []PlanEntry) *blockFetchCoordinator {
-	if !slices.ContainsFunc(entries, func(e PlanEntry) bool { return e.Mode == ModeBlocks }) {
+func (d *downloader) startBlockFetches(ctx context.Context, entries []planEntry) *blockFetchCoordinator {
+	if !slices.ContainsFunc(entries, func(e planEntry) bool { return e.Mode == modeBlocks }) {
 		return nil
 	}
 	size := blockFetchPoolSize(d.concurrency)
@@ -441,7 +432,7 @@ func (d *Downloader) startBlockFetches(ctx context.Context, entries []PlanEntry)
 	}
 	chans := make([]chan blockFuture, len(entries))
 	for i := range entries {
-		if entries[i].Mode == ModeBlocks {
+		if entries[i].Mode == modeBlocks {
 			chans[i] = make(chan blockFuture, size)
 			bc.futuresByEntry[i] = chans[i]
 		}
@@ -489,7 +480,7 @@ func (d *Downloader) startBlockFetches(ctx context.Context, entries []PlanEntry)
 // enqueueEntryBlocks submits one fetch job per listed block of one entry, in
 // ascending index order, streaming each future to the framer's channel as it
 // is issued. Returns false on cancellation (the caller closes the channel).
-func enqueueEntryBlocks(ctx context.Context, entry PlanEntry, jobs chan<- blockJob, futures chan<- blockFuture, inflight chan<- struct{}) bool {
+func enqueueEntryBlocks(ctx context.Context, entry planEntry, jobs chan<- blockJob, futures chan<- blockFuture, inflight chan<- struct{}) bool {
 	for _, br := range entry.Blocks {
 		// idx is widened to uint64 so a range ending at the uint32 max
 		// (math.MaxUint32 passes the planner's `> MaxUint32` validation) does not
@@ -522,7 +513,7 @@ func enqueueEntryBlocks(ctx context.Context, entry PlanEntry, jobs chan<- blockJ
 // coordinator), or a fetch error.
 type fetchedEntry struct {
 	idx   int
-	entry PlanEntry
+	entry planEntry
 	raw   []byte
 	err   error
 }
@@ -534,7 +525,7 @@ type fetchedEntry struct {
 // entries pass through without fetching — their getBlock fetches run on the
 // block-fetch coordinator's pool, which looks ahead independently of this
 // depth bound (#292). It closes the channel on completion or cancellation.
-func (d *Downloader) startPrefetch(ctx context.Context, entries []PlanEntry) <-chan fetchedEntry {
+func (d *downloader) startPrefetch(ctx context.Context, entries []planEntry) <-chan fetchedEntry {
 	out := make(chan fetchedEntry, prefetchDepth)
 	go func() {
 		defer close(out)
@@ -543,7 +534,7 @@ func (d *Downloader) startPrefetch(ctx context.Context, entries []PlanEntry) <-c
 				return
 			}
 			f := fetchedEntry{idx: i, entry: entries[i]}
-			if entries[i].Mode == ModeWholeSegment {
+			if entries[i].Mode == modeWholeSegment {
 				f.raw, f.err = d.fetchSegment(ctx, entries[i].SegmentName)
 				if f.err != nil {
 					f.err = fmt.Errorf("jetstream: getSegment %q: %w", entries[i].SegmentName, f.err)
@@ -564,7 +555,7 @@ func (d *Downloader) startPrefetch(ctx context.Context, entries []PlanEntry) <-c
 // forwarded without decoding so the reassembler can surface it in order. On
 // cancellation the worker stops pulling; it does not need to free window tokens
 // because the framer has also stopped acquiring them (no one is waiting).
-func (d *Downloader) runDecodeWorker(ctx context.Context, entries []PlanEntry, jobs <-chan decodeJob, results chan<- decodeResult, sem chan struct{}) {
+func (d *downloader) runDecodeWorker(ctx context.Context, entries []planEntry, jobs <-chan decodeJob, results chan<- decodeResult, sem chan struct{}) {
 	_ = sem // window tokens are freed by the reassembler, in seq order
 	for j := range jobs {
 		res := decodeResult{seq: j.seq, entryIdx: j.entryIdx}
@@ -605,7 +596,7 @@ func (d *Downloader) runDecodeWorker(ctx context.Context, entries []PlanEntry, j
 // and wedge Download forever. Converting it to an in-order recoverable error keeps
 // the pipeline draining and surfaces the failure to the consumer (crash-loud, not
 // a silent hang). payload is nil for an empty/filtered block (nothing to emit).
-func (d *Downloader) runTransform(entryIdx int, evs []Event) (payload any, err error) {
+func (d *downloader) runTransform(entryIdx int, evs []Event) (payload any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			payload = nil
@@ -621,7 +612,7 @@ func (d *Downloader) runTransform(entryIdx int, evs []Event) (payload any, err e
 // serialized and ordered. When emit returns false it cancels the pipeline and
 // switches to drain mode: it keeps reading results until close (so decode workers
 // never block on a full results channel) but emits nothing further.
-func reassemble(entries []PlanEntry, results <-chan decodeResult, sem chan struct{}, emit func(EntryResult) bool, cancel context.CancelFunc) {
+func reassemble(entries []planEntry, results <-chan decodeResult, sem chan struct{}, emit func(entryResult) bool, cancel context.CancelFunc) {
 	pending := make(map[uint64]decodeResult)
 	var next uint64
 	stopped := false
@@ -642,7 +633,7 @@ func reassemble(entries []PlanEntry, results <-chan decodeResult, sem chan struc
 			if !nr.emit {
 				continue // wholly filtered/suppressed block: consume seq, emit nothing
 			}
-			res := EntryResult{Index: nr.entryIdx, Entry: entries[nr.entryIdx], Events: nr.events, Err: nr.err, Payload: nr.payload}
+			res := entryResult{Index: nr.entryIdx, Entry: entries[nr.entryIdx], Events: nr.events, Err: nr.err, Payload: nr.payload}
 			if !emit(res) {
 				stopped = true
 				cancel() // stop the framer + prefetch + decode workers
@@ -666,7 +657,7 @@ func reassemble(entries []PlanEntry, results <-chan decodeResult, sem chan struc
 // &slab[i] pointers stay valid (a realloc would dangle them). It is a fresh
 // allocation per block, dropped to GC with the batch; it is never pooled/reused,
 // so a consumer still holding an earlier batch can never observe a mutation.
-func (d *Downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]Event, error) {
+func (d *downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]Event, error) {
 	rows, err := segment.DecodeBlockFrame(frame)
 	if err != nil {
 		return nil, fmt.Errorf("jetstream: decode block %d of %q: %w", blockIdx, segName, err)
@@ -690,10 +681,8 @@ func (d *Downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]
 	var decodeErrs []error
 	ci := 0
 	for i := range rows {
-		if d.selector != nil {
-			if keep, _ := d.selector.Keep(&rows[i]); !keep {
-				continue
-			}
+		if d.selector != nil && !d.selector(&rows[i]) {
+			continue
 		}
 		var commit *Commit
 		if isCommitKind(rows[i].Kind) {

@@ -2,21 +2,20 @@ package jetstream
 
 import (
 	"context"
-	"sync"
+	"errors"
+	"fmt"
 	"time"
 
-	iclient "github.com/bluesky-social/jetstream/internal/client"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
 	"github.com/jcalabro/jttp"
 )
 
-// newEngine builds the real orchestration engine in internal/client and adapts
-// it to the root Client's engine interface.
-func newEngine(host string, cfg config) (engine, error) {
-	ec := iclient.Config{
+// newEngine resolves the transport dependencies and builds the replay engine.
+func newEngine(host string, cfg config) engine {
+	ec := engineConfig{
 		Host: host,
-		Request: iclient.PlanRequest{
+		Request: planRequest{
 			DIDs:         cfg.dids,
 			Collections:  cfg.collections,
 			AfterSeq:     cfg.afterSeq,
@@ -41,7 +40,7 @@ func newEngine(host string, cfg config) (engine, error) {
 		RawRecordCIDs:    cfg.rawRecordCIDs,
 		ZstdCompression:  cfg.zstdCompression,
 	}
-	return &realEngine{eng: iclient.NewEngine(ec), batchSize: cfg.batchSize}, nil
+	return newReplayEngine(ec)
 }
 
 // newXRPCClient builds an xrpc.Client for host. When the caller supplied an
@@ -63,64 +62,52 @@ func newXRPCClient(host string, cfg config, opts []jttp.Option) *xrpc.Client {
 	return c
 }
 
-// realEngine adapts internal/client.Engine to the root engine interface,
-// translating the engine's events into public jetstream.Event/Batch values.
-type realEngine struct {
-	eng *iclient.Engine
-	// batchSize is the consumer's BatchSize, used by the backfill fast path to
-	// chunk a decoded block's events into public batches ON the decode workers
-	// (see run). The live path uses the internal batcher's own size.
-	batchSize int
-
-	// mu guards runCancel and closed so a concurrent Close (the documented way
-	// to stop a live tail) can cancel an in-flight run without a data race.
-	mu        sync.Mutex
-	runCancel context.CancelFunc // cancels the active run's ctx; nil when idle
-	closed    bool               // Close was called; a later run starts cancelled
-}
-
 // driveRun runs the engine with the caller's emit/error closures and backfill
 // sink, wrapping it in the Close cancellation handshake: it derives a cancelable
 // ctx, publishes the cancel so a concurrent Close can unwind the run, and clears
-// it on return. Both the default (*Batch) run and the generic typed run share
-// this; the only difference between them is the closures + sink they build.
-func (e *realEngine) driveRun(ctx context.Context, emitBatch func([]iclient.Event) bool, emitErr func(error) bool, bf iclient.BackfillSink) {
+// it on return. It also rejects concurrent runs, which the public contract has
+// always forbidden, rather than allowing them to race through shared matcher
+// and progress state.
+func (e *replayEngine) driveRun(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf backfillSink) {
 	runCtx, cancel := context.WithCancel(ctx)
-	e.mu.Lock()
+	e.runMu.Lock()
 	if e.closed {
-		e.mu.Unlock()
+		e.runMu.Unlock()
 		cancel()
 		return
 	}
+	if e.runCancel != nil {
+		e.runMu.Unlock()
+		cancel()
+		emitErr(fatal(errors.New("jetstream: Events is already running on this Client")))
+		return
+	}
 	e.runCancel = cancel
-	e.mu.Unlock()
+	e.runMu.Unlock()
 	defer func() {
-		e.mu.Lock()
+		e.runMu.Lock()
 		e.runCancel = nil
-		e.mu.Unlock()
+		e.runMu.Unlock()
 		cancel()
 	}()
-	e.eng.RunWithBackfill(runCtx, emitBatch, emitErr, bf)
+	e.runWithBackfill(runCtx, emitBatch, emitErr, bf)
 }
 
-func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
+func (e *replayEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	stopped := false
 
-	// Backfill fast path: convert + batch each decoded block ON the parallel
-	// decode workers (Transform), then deliver the ready batches in seq order
-	// (Emit). This moves the per-event internal→public conversion off the single
-	// serial reassembler goroutine, which was the backfill scaling ceiling (#142).
+	// Build batches on the parallel decode workers, then deliver them in sequence
+	// order. Keeping this work off the serial reassembler is load-bearing for
+	// archive throughput (#142).
 	//
 	// Transform runs on N worker goroutines concurrently. It is safe there: it
-	// reads only its own block's events and calls toPublicEvents (pure per-event
-	// field copies, no shared state). It returns []*Batch boxed as `any` (one box
-	// per ~4096-event block, negligible) so internal/client never names the public
-	// types. A nil return means an empty/filtered block (nothing to emit).
+	// reads only its own block's events and slices them into immutable batches.
+	// A nil return means an empty/filtered block (nothing to emit).
 	//
 	// Concurrency of the shared `stopped` flag (subtle — read before refactoring):
 	// the backfill fast-path Emit closure runs on the engine's single run
 	// goroutine, but the live emitBatch/emitErr closures can ALSO be driven by the
-	// internal batcher's periodic flusher goroutine (internal/client startFlusher
+	// internal batcher's periodic flusher goroutine (startFlusher
 	// → b.flush()), not only the run goroutine. The flag is nonetheless race-free,
 	// for two reasons the older comment omitted:
 	//   1. The batcher serializes every emit under its own mutex, so a
@@ -128,15 +115,15 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	//   2. Emit (fast-path backfill) and the live emitBatch/emitErr are never
 	//      BOTH live at once on the production path: backfill rows bypass the
 	//      batcher entirely (Emit), and the live tail's batcher buffer is flushed
-	//      before each re-sweep (internal/client runBackfillThenLive), so the
+	//      before each re-sweep (runBackfillThenLive), so the
 	//      flusher's b.flush() finds an empty buffer and never calls emitBatch
 	//      while a sweep's Emit is running.
 	// Transform runs on the decode workers and never touches `stopped`. If a future
 	// refactor breaks invariant (2) (e.g. live rows left buffered across a sweep),
 	// promote `stopped` to an atomic.Bool rather than relying on this argument.
-	size := max(e.batchSize, 1)
-	bf := iclient.BackfillSink{
-		Transform: func(_ int, evs []iclient.Event) any {
+	size := max(e.cfg.BatchSize, 1)
+	bf := backfillSink{
+		transform: func(_ int, evs []Event) any {
 			if len(evs) == 0 {
 				return nil // empty/filtered block: emit nothing
 			}
@@ -144,21 +131,32 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 			// block-aligned: the final chunk of a block may be smaller than
 			// BatchSize (see Batch / WithBatchSize docs). LastCursor stays correct
 			// (max seq within each chunk).
-			batches := make([]*Batch, 0, (len(evs)+size-1)/size)
+			// Ceiling division written overflow-safe: len(evs) >= 1 here, and
+			// (len(evs)+size-1) would wrap negative for a huge WithBatchSize,
+			// panicking make (recovered into a dropped block).
+			batches := make([]*Batch, 0, 1+(len(evs)-1)/size)
 			for i := 0; i < len(evs); i += size {
 				end := min(i+size, len(evs))
-				batches = append(batches, &Batch{events: toPublicEvents(evs[i:end])})
+				// Three-index slice: batches share the block's backing array, and
+				// Events() hands the slice to the consumer, so cap must not extend
+				// into the next batch's events (an append would overwrite them).
+				batches = append(batches, &Batch{events: evs[i:end:end]})
 			}
 			return batches
 		},
-		Emit: func(res iclient.EntryResult) bool {
+		emit: func(res entryResult) bool {
 			if stopped {
 				return false
 			}
 			// res.Payload is always a []*Batch here: the engine routes error
 			// results through emitErr before calling Emit, so a non-error block
 			// always carries the Transform output (or nil for an empty block).
-			batches, _ := res.Payload.([]*Batch)
+			batches, ok := res.Payload.([]*Batch)
+			if !ok {
+				stopped = true
+				yield(nil, fatal(fmt.Errorf("jetstream: internal backfill payload has type %T, want []*Batch", res.Payload)))
+				return false
+			}
 			for _, b := range batches {
 				if !yield(b, nil) {
 					stopped = true
@@ -170,11 +168,11 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	}
 
 	e.driveRun(ctx,
-		func(batch []iclient.Event) bool {
+		func(batch []Event) bool {
 			if stopped {
 				return false
 			}
-			b := &Batch{events: toPublicEvents(batch)}
+			b := &Batch{events: batch}
 			if !yield(b, nil) {
 				stopped = true
 				return false
@@ -195,89 +193,17 @@ func (e *realEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	)
 }
 
-func (e *realEngine) stats() Stats {
-	return Stats(e.eng.Stats())
-}
-
-func (e *realEngine) close() error {
+func (e *replayEngine) close() error {
 	// Cancel any in-flight run so a live tail actually stops (the documented
 	// "natural way to stop a live tail"). We do NOT wait for the run to finish: a
 	// consumer may call Close from inside its own Events loop, and blocking here
 	// would deadlock. The bufferless cutover holds no resources to release.
-	e.mu.Lock()
+	e.runMu.Lock()
 	e.closed = true
 	cancel := e.runCancel
-	e.mu.Unlock()
+	e.runMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	return nil
-}
-
-// toPublicEvents converts a block (or batch) of internal events to public
-// events. Commit rows dominate, and each public *Commit was one heap allocation
-// on top of the internal one; here the whole input's commits draw from a single
-// []Commit slab and each public event references &slab[i], collapsing N
-// allocations to one. The slab is sized to len(evs) and never grown, so the
-// &slab[i] pointers stay valid; it is a fresh per-call allocation dropped to GC
-// with the batch and never pooled, so a consumer holding an earlier batch is
-// unaffected. Non-commit kinds (identity/account/sync) are comparatively rare
-// and keep their individual allocations.
-func toPublicEvents(evs []iclient.Event) []Event {
-	if len(evs) == 0 {
-		return nil
-	}
-	commits := make([]Commit, len(evs))
-	out := make([]Event, len(evs))
-	ci := 0
-	for i := range evs {
-		var commit *Commit
-		if evs[i].Kind == iclient.KindCommit && evs[i].Commit != nil {
-			commit = &commits[ci]
-			ci++
-		}
-		out[i] = toPublicEventInto(evs[i], commit)
-	}
-	return out
-}
-
-// toPublicEventInto converts one internal event to a public event. For a commit
-// row it fills the caller-provided *commit (a slab slot; see toPublicEvents)
-// rather than allocating; commit must be non-nil exactly when ev is a commit
-// with a non-nil internal Commit. Other kinds allocate their own shape.
-func toPublicEventInto(ev iclient.Event, commit *Commit) Event {
-	out := Event{
-		DID:    ev.DID,
-		Seq:    ev.Seq,
-		TimeUS: ev.TimeUS,
-		Kind:   Kind(ev.Kind),
-	}
-	switch ev.Kind {
-	case iclient.KindCommit:
-		if ev.Commit != nil {
-			*commit = Commit{
-				Operation:  Operation(ev.Commit.Operation),
-				Collection: ev.Commit.Collection,
-				Rkey:       ev.Commit.Rkey,
-				Rev:        ev.Commit.Rev,
-				CID:        ev.Commit.CID,
-				Record:     ev.Commit.Record,
-				RecordCBOR: ev.Commit.RecordCBOR,
-			}
-			out.Commit = commit
-		}
-	case iclient.KindIdentity:
-		if ev.Identity != nil {
-			out.Identity = &Identity{DID: ev.Identity.DID, Handle: ev.Identity.Handle, Seq: ev.Identity.Seq, Time: ev.Identity.Time}
-		}
-	case iclient.KindAccount:
-		if ev.Account != nil {
-			out.Account = &Account{DID: ev.Account.DID, Active: ev.Account.Active, Status: ev.Account.Status, Seq: ev.Account.Seq, Time: ev.Account.Time}
-		}
-	case iclient.KindSync:
-		if ev.Sync != nil {
-			out.Sync = &Sync{DID: ev.Sync.DID, Rev: ev.Sync.Rev, Seq: ev.Sync.Seq, Time: ev.Sync.Time}
-		}
-	}
-	return out
 }

@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"bytes"
@@ -37,7 +37,7 @@ func oldDecodeRecordMap(t *testing.T, payload []byte) (map[string]any, bool) {
 // lever 1: the direct CBOR->map converter must produce a result deep-equal to
 // the old cbor.ToJSON + json.Unmarshal round-trip across representative and
 // edge-case record shapes (nested maps, arrays, CID links, byte strings,
-// integers, floats, bools, null, empty containers, unicode/escaped strings).
+// integers, bools, null, empty containers, unicode/escaped strings).
 func TestDecodeRecordMapMatchesJSONRoundTrip(t *testing.T) {
 	t.Parallel()
 	cidA := mustCID(t)
@@ -91,6 +91,18 @@ func TestDecodeRecordMapMatchesJSONRoundTrip(t *testing.T) {
 			require.JSONEq(t, string(wantJSON), string(gotJSON))
 		})
 	}
+}
+
+func TestDecodeRecordMapRejectsFloat(t *testing.T) {
+	t.Parallel()
+	payload, err := cbor.Marshal(map[string]any{
+		"$type":  "x.test",
+		"nested": []any{map[string]any{"float": 1.5}},
+	})
+	require.NoError(t, err)
+
+	_, err = decodeRecordMap(payload)
+	require.ErrorContains(t, err, "outside the atproto data model")
 }
 
 // FuzzDecodeRecordMapEquivalence drives arbitrary bytes through the direct

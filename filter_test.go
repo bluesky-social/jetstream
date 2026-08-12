@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"testing"
@@ -13,15 +13,15 @@ func commitRow(seq uint64, did, collection string) segment.Event {
 
 func TestMatcherNilMatchesAll(t *testing.T) {
 	t.Parallel()
-	var m *Matcher
+	var m *matcher
 	ev := commitRow(5, "did:plc:a", "app.bsky.feed.post")
-	keep := m.Wants(&ev)
+	keep := m.wantsSegment(&ev)
 	require.True(t, keep)
 }
 
 func TestMatcherSeqWindow(t *testing.T) {
 	t.Parallel()
-	m := NewMatcher(PlanRequest{AfterSeq: 10, HasBeforeSeq: true, BeforeSeq: 20})
+	m := newMatcher(planRequest{AfterSeq: 10, HasBeforeSeq: true, BeforeSeq: 20})
 	for _, tc := range []struct {
 		seq  uint64
 		want bool
@@ -32,7 +32,7 @@ func TestMatcherSeqWindow(t *testing.T) {
 		{21, false},
 	} {
 		ev := commitRow(tc.seq, "did:plc:a", "c")
-		require.Equalf(t, tc.want, m.Wants(&ev), "seq %d", tc.seq)
+		require.Equalf(t, tc.want, m.wantsSegment(&ev), "seq %d", tc.seq)
 	}
 }
 
@@ -42,13 +42,13 @@ func TestMatcherSeqWindow(t *testing.T) {
 // server (which omits the wire field entirely when afterSeq is 0).
 func TestMatcherAfterSeqZeroIncludesFirstEvent(t *testing.T) {
 	t.Parallel()
-	m := NewMatcher(PlanRequest{AfterSeq: 0})
+	m := newMatcher(planRequest{AfterSeq: 0})
 	// Seqs start at 1; afterSeq=0 imposes no lower bound, so the first-ever
 	// event (seq 1) is included.
 	ev1 := commitRow(1, "did:plc:a", "app.bsky.feed.post")
-	require.True(t, m.Wants(&ev1), "afterSeq=0 must include the first event at seq 1")
+	require.True(t, m.wantsSegment(&ev1), "afterSeq=0 must include the first event at seq 1")
 	ev2 := commitRow(2, "did:plc:a", "app.bsky.feed.post")
-	require.True(t, m.Wants(&ev2), "afterSeq=0 must include seq 2")
+	require.True(t, m.wantsSegment(&ev2), "afterSeq=0 must include seq 2")
 }
 
 // TestMatcherAfterSeqPositiveStaysExclusive guards that a non-zero afterSeq
@@ -56,35 +56,35 @@ func TestMatcherAfterSeqZeroIncludesFirstEvent(t *testing.T) {
 // a saved cursor never re-receives the event it last saw.
 func TestMatcherAfterSeqPositiveStaysExclusive(t *testing.T) {
 	t.Parallel()
-	m := NewMatcher(PlanRequest{AfterSeq: 1})
+	m := newMatcher(planRequest{AfterSeq: 1})
 	ev0 := commitRow(0, "did:plc:a", "c")
-	require.False(t, m.Wants(&ev0), "afterSeq=1 excludes seq 0")
+	require.False(t, m.wantsSegment(&ev0), "afterSeq=1 excludes seq 0")
 	ev1 := commitRow(1, "did:plc:a", "c")
-	require.False(t, m.Wants(&ev1), "afterSeq=1 excludes seq 1 (exclusive)")
+	require.False(t, m.wantsSegment(&ev1), "afterSeq=1 excludes seq 1 (exclusive)")
 	ev2 := commitRow(2, "did:plc:a", "c")
-	require.True(t, m.Wants(&ev2), "afterSeq=1 includes seq 2")
+	require.True(t, m.wantsSegment(&ev2), "afterSeq=1 includes seq 2")
 }
 
 func TestMatcherDIDFilterAllKinds(t *testing.T) {
 	t.Parallel()
-	m := NewMatcher(PlanRequest{DIDs: []string{"did:plc:keep"}})
+	m := newMatcher(planRequest{DIDs: []string{"did:plc:keep"}})
 
 	keep := commitRow(1, "did:plc:keep", "app.bsky.feed.post")
-	require.True(t, m.Wants(&keep))
+	require.True(t, m.wantsSegment(&keep))
 
 	drop := commitRow(2, "did:plc:other", "app.bsky.feed.post")
-	require.False(t, m.Wants(&drop))
+	require.False(t, m.wantsSegment(&drop))
 
 	// DID filter applies to non-commit kinds too.
 	acct := segment.Event{Seq: 3, Kind: segment.KindAccount, DID: "did:plc:other"}
-	require.False(t, m.Wants(&acct))
+	require.False(t, m.wantsSegment(&acct))
 	acctKeep := segment.Event{Seq: 4, Kind: segment.KindAccount, DID: "did:plc:keep"}
-	require.True(t, m.Wants(&acctKeep))
+	require.True(t, m.wantsSegment(&acctKeep))
 }
 
 func TestMatcherCollectionExactAndWildcard(t *testing.T) {
 	t.Parallel()
-	m := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post", "app.bsky.graph.*"}})
+	m := newMatcher(planRequest{Collections: []string{"app.bsky.feed.post", "app.bsky.graph.*"}})
 
 	for _, tc := range []struct {
 		coll string
@@ -98,7 +98,7 @@ func TestMatcherCollectionExactAndWildcard(t *testing.T) {
 		{"app.bsky.feed", false},        // partial
 	} {
 		ev := commitRow(1, "did:plc:a", tc.coll)
-		require.Equalf(t, tc.want, m.Wants(&ev), "collection %q", tc.coll)
+		require.Equalf(t, tc.want, m.wantsSegment(&ev), "collection %q", tc.coll)
 	}
 }
 
@@ -111,22 +111,22 @@ func TestMatcherCollectionExactAndWildcard(t *testing.T) {
 // does not weaken record suppression.
 func TestMatcherCollectionFilterDeliversDIDLevelEvents(t *testing.T) {
 	t.Parallel()
-	m := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
+	m := newMatcher(planRequest{Collections: []string{"app.bsky.feed.post"}})
 
 	// #account, #identity, #sync carry no collection and always bypass the
 	// collection filter — the consumer's only signal to purge a dead account.
 	for _, k := range []segment.Kind{segment.KindIdentity, segment.KindAccount, segment.KindSync} {
 		ev := segment.Event{Seq: 1, Kind: k, DID: "did:plc:a"}
-		require.Truef(t, m.Wants(&ev), "kind %d must bypass the collection filter", k)
+		require.Truef(t, m.wantsSegment(&ev), "kind %d must bypass the collection filter", k)
 	}
 
 	// A commit whose collection does not match is still dropped.
 	miss := commitRow(2, "did:plc:a", "app.bsky.feed.like")
-	require.False(t, m.Wants(&miss), "non-matching commit must be dropped")
+	require.False(t, m.wantsSegment(&miss), "non-matching commit must be dropped")
 
 	// A commit with an empty collection bypasses the filter (v1 parity).
 	emptyColl := segment.Event{Seq: 3, Kind: segment.KindCreate, DID: "did:plc:a", Collection: ""}
-	require.True(t, m.Wants(&emptyColl))
+	require.True(t, m.wantsSegment(&emptyColl))
 }
 
 // TestMatcherNoCollectionFilterDeliversIdentityAccount guards the other side of
@@ -134,28 +134,28 @@ func TestMatcherCollectionFilterDeliversDIDLevelEvents(t *testing.T) {
 // delivered (subject to any DID filter) — "give me the whole stream".
 func TestMatcherNoCollectionFilterDeliversIdentityAccount(t *testing.T) {
 	t.Parallel()
-	m := NewMatcher(PlanRequest{}) // no filters at all
+	m := newMatcher(planRequest{}) // no filters at all
 
 	for _, k := range []segment.Kind{segment.KindIdentity, segment.KindAccount, segment.KindSync} {
 		ev := segment.Event{Seq: 1, Kind: k, DID: "did:plc:a"}
-		require.Truef(t, m.Wants(&ev), "kind %d must be delivered with no collection filter", k)
+		require.Truef(t, m.wantsSegment(&ev), "kind %d must be delivered with no collection filter", k)
 	}
 
 	// A DID-only filter still delivers identity/account for the matching DID.
-	md := NewMatcher(PlanRequest{DIDs: []string{"did:plc:keep"}})
+	md := newMatcher(planRequest{DIDs: []string{"did:plc:keep"}})
 	keep := segment.Event{Seq: 1, Kind: segment.KindIdentity, DID: "did:plc:keep"}
-	require.True(t, md.Wants(&keep), "identity for a matching DID must be delivered")
+	require.True(t, md.wantsSegment(&keep), "identity for a matching DID must be delivered")
 	drop := segment.Event{Seq: 2, Kind: segment.KindAccount, DID: "did:plc:other"}
-	require.False(t, md.Wants(&drop), "account for a non-matching DID must be dropped")
+	require.False(t, md.wantsSegment(&drop), "account for a non-matching DID must be dropped")
 }
 
 func TestMatcherWildcardBoundary(t *testing.T) {
 	t.Parallel()
 	// "app.bsky.graph.*" trims to prefix "app.bsky.graph." (keeps the dot),
 	// so a sibling namespace sharing the textual prefix must not match.
-	m := NewMatcher(PlanRequest{Collections: []string{"app.bsky.graph.*"}})
+	m := newMatcher(planRequest{Collections: []string{"app.bsky.graph.*"}})
 	hit := commitRow(1, "did:plc:a", "app.bsky.graph.follow")
 	miss := commitRow(2, "did:plc:a", "app.bsky.graphient.thing")
-	require.True(t, m.Wants(&hit))
-	require.False(t, m.Wants(&miss))
+	require.True(t, m.wantsSegment(&hit))
+	require.False(t, m.wantsSegment(&miss))
 }

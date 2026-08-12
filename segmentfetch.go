@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"context"
@@ -69,7 +69,7 @@ const (
 var errSegmentGenerationChanged = errors.New("segment generation changed mid-download")
 
 // defaultBulkHTTP is the fallback transport when the xrpc client was built
-// without an explicit HTTP client (direct Downloader construction in tests);
+// without an explicit HTTP client (direct downloader construction in tests);
 // the engine always injects one. Built lazily with the same bulk tuning the
 // engine uses so behavior matches either way.
 var (
@@ -77,7 +77,7 @@ var (
 	defaultBulkHTTP     *http.Client
 )
 
-func (d *Downloader) httpClient() *http.Client {
+func (d *downloader) httpClient() *http.Client {
 	if d.xc.HTTPClient.HasVal() {
 		return d.xc.HTTPClient.Val()
 	}
@@ -93,11 +93,11 @@ func (d *Downloader) httpClient() *http.Client {
 // behavior on the segment path — at part granularity, which is the point.
 // Clamped to ≥1 to match xrpc's own MaxAttempts semantics (0 means "one
 // attempt, no retries", never "zero attempts").
-func (d *Downloader) partAttempts() int {
+func (d *downloader) partAttempts() int {
 	return max(d.xc.Retry.ValOr(xrpc.DefaultRetryPolicy).MaxAttempts.ValOr(3), 1)
 }
 
-func (d *Downloader) segmentURL(name string) string {
+func (d *downloader) segmentURL(name string) string {
 	return strings.TrimSuffix(d.xc.Host, "/") +
 		"/xrpc/network.bsky.jetstream.getSegment?name=" + url.QueryEscape(name)
 }
@@ -106,7 +106,7 @@ func (d *Downloader) segmentURL(name string) string {
 // range requests when the server supports them, with a transparent
 // single-stream fallback when it does not (or sends no ETag, without which
 // parts from different generations could be spliced).
-func (d *Downloader) fetchSegment(ctx context.Context, name string) ([]byte, error) {
+func (d *downloader) fetchSegment(ctx context.Context, name string) ([]byte, error) {
 	var lastErr error
 	for range maxGenerationAttempts {
 		buf, err := d.fetchSegmentGeneration(ctx, name)
@@ -122,7 +122,7 @@ func (d *Downloader) fetchSegment(ctx context.Context, name string) ([]byte, err
 }
 
 // fetchSegmentGeneration performs one consistent-generation download attempt.
-func (d *Downloader) fetchSegmentGeneration(ctx context.Context, name string) ([]byte, error) {
+func (d *downloader) fetchSegmentGeneration(ctx context.Context, name string) ([]byte, error) {
 	u := d.segmentURL(name)
 	partSize := d.segPartSize
 
@@ -244,7 +244,7 @@ func (d *Downloader) fetchSegmentGeneration(ctx context.Context, name string) ([
 // so a long transfer with occasional hiccups completes, but a hostile server
 // dribbling a byte per connection cannot force unbounded requests: worst case
 // is attempts requests per partSize of the segment.
-func (d *Downloader) fetchRemainderResumable(ctx context.Context, u, name string, buf []byte, from int64, etag string) error {
+func (d *downloader) fetchRemainderResumable(ctx context.Context, u, name string, buf []byte, from int64, etag string) error {
 	total := int64(len(buf))
 	attempts := d.partAttempts()
 	remaining := attempts
@@ -289,7 +289,7 @@ func (d *Downloader) fetchRemainderResumable(ctx context.Context, u, name string
 // readRangeInto issues one ranged request for buf-window [off, last] and reads
 // as many bytes as arrive before an error, returning the byte count so the
 // caller can resume from the exact failure point.
-func (d *Downloader) readRangeInto(ctx context.Context, u string, dst []byte, off, last int64, etag string) (int64, error) {
+func (d *downloader) readRangeInto(ctx context.Context, u string, dst []byte, off, last int64, etag string) (int64, error) {
 	resp, err := d.doRangeRequest(ctx, u, off, last, etag)
 	if err != nil {
 		return 0, err
@@ -327,13 +327,13 @@ func (d *Downloader) readRangeInto(ctx context.Context, u string, dst []byte, of
 // fetchPart downloads one range part with bounded retries. Transient failures
 // (network errors, 5xx, short reads) retry with backoff; a generation change
 // or context cancellation aborts immediately.
-func (d *Downloader) fetchPart(ctx context.Context, u, name string, dst []byte, off, last int64, etag string) error {
+func (d *downloader) fetchPart(ctx context.Context, u, name string, dst []byte, off, last int64, etag string) error {
 	return d.fetchPartAttempts(ctx, u, name, dst, off, last, etag, d.partAttempts())
 }
 
 // fetchPartAttempts is fetchPart with an explicit attempt budget, for callers
 // that already spent part of theirs (the probe body gap-fill).
-func (d *Downloader) fetchPartAttempts(ctx context.Context, u, name string, dst []byte, off, last int64, etag string, attempts int) error {
+func (d *downloader) fetchPartAttempts(ctx context.Context, u, name string, dst []byte, off, last int64, etag string, attempts int) error {
 	var lastErr error
 	for attempt := range attempts {
 		if attempt > 0 {
@@ -357,7 +357,7 @@ func (d *Downloader) fetchPartAttempts(ctx context.Context, u, name string, dst 
 	return fmt.Errorf("segment %q part %d-%d: %w (after %d attempts)", name, off, last, lastErr, attempts)
 }
 
-func (d *Downloader) tryPart(ctx context.Context, u string, dst []byte, off, last int64, etag string) error {
+func (d *downloader) tryPart(ctx context.Context, u string, dst []byte, off, last int64, etag string) error {
 	resp, err := d.doRangeRequest(ctx, u, off, last, etag)
 	if err != nil {
 		return err
@@ -397,13 +397,13 @@ func (d *Downloader) tryPart(ctx context.Context, u string, dst []byte, off, las
 // transport errors, 5xx, and short body reads retry with the same budget and
 // backoff as every other path here; there is no resume (no validator), so
 // each attempt restarts from byte 0 like the pre-#296 client did.
-func (d *Downloader) fetchWholeFallback(ctx context.Context, u string) ([]byte, error) {
+func (d *downloader) fetchWholeFallback(ctx context.Context, u string) ([]byte, error) {
 	return d.fetchWholeFallbackAttempts(ctx, u, d.partAttempts())
 }
 
 // fetchWholeFallbackAttempts is fetchWholeFallback with an explicit attempt
 // budget, for callers that already spent part of theirs (a failed 200 probe).
-func (d *Downloader) fetchWholeFallbackAttempts(ctx context.Context, u string, attempts int) ([]byte, error) {
+func (d *downloader) fetchWholeFallbackAttempts(ctx context.Context, u string, attempts int) ([]byte, error) {
 	var lastErr error
 	for attempt := range attempts {
 		if attempt > 0 {
@@ -427,7 +427,7 @@ func (d *Downloader) fetchWholeFallbackAttempts(ctx context.Context, u string, a
 	return nil, fmt.Errorf("%w (after %d attempts)", lastErr, attempts)
 }
 
-func (d *Downloader) tryWhole(ctx context.Context, u string) ([]byte, error) {
+func (d *downloader) tryWhole(ctx context.Context, u string) ([]byte, error) {
 	req, err := d.newSegmentRequest(ctx, u)
 	if err != nil {
 		return nil, err
@@ -464,7 +464,7 @@ func retryableStatus(code int) bool {
 // probeWithRetry issues the opening range request with the same attempt budget
 // as a part. Responses with retryable statuses (5xx, 429) are drained and
 // retried; any other 2xx/3xx/4xx response is returned for interpretation.
-func (d *Downloader) probeWithRetry(ctx context.Context, u string, lastByte int64) (*http.Response, error) {
+func (d *downloader) probeWithRetry(ctx context.Context, u string, lastByte int64) (*http.Response, error) {
 	attempts := d.partAttempts()
 	var lastErr error
 	for attempt := range attempts {
@@ -493,7 +493,7 @@ func (d *Downloader) probeWithRetry(ctx context.Context, u string, lastByte int6
 	return nil, fmt.Errorf("%w (after %d attempts)", lastErr, attempts)
 }
 
-func (d *Downloader) doRangeRequest(ctx context.Context, u string, off, last int64, etag string) (*http.Response, error) {
+func (d *downloader) doRangeRequest(ctx context.Context, u string, off, last int64, etag string) (*http.Response, error) {
 	req, err := d.newSegmentRequest(ctx, u)
 	if err != nil {
 		return nil, err
@@ -509,7 +509,7 @@ func (d *Downloader) doRangeRequest(ctx context.Context, u string, off, last int
 // xrpc QueryRaw path sets (User-Agent, Accept, Authorization when the client
 // has a session) — the raw range path must not silently drop auth that
 // getBlock requests still carry.
-func (d *Downloader) newSegmentRequest(ctx context.Context, u string) (*http.Request, error) {
+func (d *downloader) newSegmentRequest(ctx context.Context, u string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err

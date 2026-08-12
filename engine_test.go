@@ -1,9 +1,10 @@
-package client
+package jetstream
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -18,7 +19,7 @@ import (
 )
 
 // engineHarness wires an archive XRPC server (plan + segment/block) and a
-// scripted live websocket transport into a configured Engine.
+// scripted live websocket transport into a configured replayEngine.
 type engineHarness struct {
 	as        *archiveServer
 	planned   uint64
@@ -81,12 +82,12 @@ func planPageJSON(entries []planSeg, plannedThrough, sealedTip uint64) string {
 		plannedThrough, sealedTip, strings.Join(segs, ","), len(entries), len(entries), len(entries))
 }
 
-func (h *engineHarness) cfg() Config {
+func (h *engineHarness) cfg() engineConfig {
 	conn := &scriptedConn{steps: h.liveSteps}
 	dial, _ := scriptedDialer(conn)
-	return Config{
+	return engineConfig{
 		Host:        h.as.srv.URL,
-		Request:     PlanRequest{AfterSeq: 0},
+		Request:     planRequest{AfterSeq: 0},
 		Backfill:    true,
 		BatchSize:   1,
 		Concurrency: 4,
@@ -102,7 +103,7 @@ func (h *engineHarness) cfg() Config {
 // runUntilDone drives the engine until done(seenSeqs) is true, then cancels and
 // returns all emitted events. A 5s safety net fails the test rather than
 // hanging.
-func (h *engineHarness) runUntilDone(t *testing.T, cfg Config, what string, done func(seen map[uint64]bool) bool) []Event {
+func (h *engineHarness) runUntilDone(t *testing.T, cfg engineConfig, what string, done func(seen map[uint64]bool) bool) []Event {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -112,7 +113,7 @@ func (h *engineHarness) runUntilDone(t *testing.T, cfg Config, what string, done
 		events []Event
 		seen   = map[uint64]bool{}
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	emitBatch := func(batch []Event) bool {
 		mu.Lock()
@@ -130,22 +131,22 @@ func (h *engineHarness) runUntilDone(t *testing.T, cfg Config, what string, done
 	}
 	go func() {
 		defer close(finished)
-		// Drive the BACKFILL FAST PATH (RunWithBackfill) so the existing
+		// Drive the BACKFILL FAST PATH (runWithBackfill) so the existing
 		// backfill/cutover/ordering/suppression tests exercise the same code path
 		// production uses: a per-block transform that boxes the block's []Event,
 		// and an Emit that unboxes and feeds the same emitBatch. The live path is
 		// unchanged. Without this the fast path would ship with only root-level
 		// coverage; routing the engine tests through it closes that gap.
-		eng.RunWithBackfill(ctx, emitBatch,
+		eng.runWithBackfill(ctx, emitBatch,
 			func(error) bool { return true },
-			BackfillSink{
-				Transform: func(_ int, evs []Event) any {
+			backfillSink{
+				transform: func(_ int, evs []Event) any {
 					if len(evs) == 0 {
 						return nil
 					}
 					return append([]Event(nil), evs...)
 				},
-				Emit: func(res EntryResult) bool {
+				emit: func(res entryResult) bool {
 					batch, _ := res.Payload.([]Event)
 					return emitBatch(batch)
 				},
@@ -165,14 +166,14 @@ func (h *engineHarness) runUntilDone(t *testing.T, cfg Config, what string, done
 }
 
 // runUntil drives the engine until it has emitted wantSeqs distinct seqs.
-func (h *engineHarness) runUntil(t *testing.T, cfg Config, wantSeqs int) []Event {
+func (h *engineHarness) runUntil(t *testing.T, cfg engineConfig, wantSeqs int) []Event {
 	t.Helper()
 	return h.runUntilDone(t, cfg, fmt.Sprintf("%d distinct seqs", wantSeqs),
 		func(seen map[uint64]bool) bool { return len(seen) >= wantSeqs })
 }
 
 // runUntilSeq drives the engine until the given seq has been emitted.
-func (h *engineHarness) runUntilSeq(t *testing.T, cfg Config, seq uint64) []Event {
+func (h *engineHarness) runUntilSeq(t *testing.T, cfg engineConfig, seq uint64) []Event {
 	t.Helper()
 	return h.runUntilDone(t, cfg, fmt.Sprintf("seq %d", seq),
 		func(seen map[uint64]bool) bool { return seen[seq] })
@@ -290,7 +291,7 @@ func TestEngineBackfillOnly(t *testing.T) {
 		mu     sync.Mutex
 		events []Event
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -356,7 +357,7 @@ func TestEngineSweepNonAdvancingPlanIsFatal(t *testing.T) {
 		mu     sync.Mutex
 		gotErr error
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -416,7 +417,7 @@ func TestEngineBackfillThenLiveOrdering(t *testing.T) {
 // by BatchSize, batches are block-aligned — every batch is non-empty and
 // <= BatchSize, at most one undersized batch per block, and the per-batch
 // LastCursor (max seq) is monotonic non-decreasing across the backfill. This
-// mirrors what realEngine.run does, asserted at the batch boundary (the engine
+// mirrors what replayEngine.run does, asserted at the batch boundary (the engine
 // harness flattens batches and would not catch a shape regression).
 func TestEngineFastPathBlockAlignedBatches(t *testing.T) {
 	t.Parallel()
@@ -440,7 +441,7 @@ func TestEngineFastPathBlockAlignedBatches(t *testing.T) {
 	cfg.BatchSize = batchSize
 	cfg.BackfillOnly = true // pure backfill: just exercise the batch shaping
 
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	var batchSizes []int
 	var lastCursors []uint64
 	var lastCursor uint64
@@ -449,11 +450,11 @@ func TestEngineFastPathBlockAlignedBatches(t *testing.T) {
 
 	// Production-style transform: chunk each block's events by BatchSize into
 	// "batches", carried as [][]Event so the test sees batch boundaries.
-	eng.RunWithBackfill(ctx,
+	eng.runWithBackfill(ctx,
 		func([]Event) bool { return true }, // legacy emitBatch unused on the fast path
 		func(error) bool { return true },
-		BackfillSink{
-			Transform: func(_ int, evs []Event) any {
+		backfillSink{
+			transform: func(_ int, evs []Event) any {
 				if len(evs) == 0 {
 					return nil
 				}
@@ -464,7 +465,7 @@ func TestEngineFastPathBlockAlignedBatches(t *testing.T) {
 				}
 				return batches
 			},
-			Emit: func(res EntryResult) bool {
+			emit: func(res entryResult) bool {
 				batches, _ := res.Payload.([][]Event)
 				for _, b := range batches {
 					require.NotEmpty(t, b, "no empty batch may be emitted")
@@ -567,7 +568,7 @@ func TestEngineLiveOnly(t *testing.T) {
 		{data: liveCommitFrame(t, 2, "did:plc:a", "create", "app.bsky.feed.post", "r2", true)},
 	}}
 	dial, _ := scriptedDialer(conn)
-	cfg := Config{
+	cfg := engineConfig{
 		Host:           "https://h",
 		Backfill:       false,
 		BatchSize:      64, // larger than the stream: only the flusher delivers
@@ -582,7 +583,7 @@ func TestEngineLiveOnly(t *testing.T) {
 		mu     sync.Mutex
 		events []Event
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -630,9 +631,9 @@ func TestEngineLiveOnlyAppliesCollectionFilter(t *testing.T) {
 		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
 	}}
 	dial, _ := scriptedDialer(conn)
-	cfg := Config{
+	cfg := engineConfig{
 		Host:           "https://h",
-		Request:        PlanRequest{Collections: []string{"app.bsky.feed.post"}},
+		Request:        planRequest{Collections: []string{"app.bsky.feed.post"}},
 		Backfill:       false,
 		BatchSize:      1,
 		MaxBatchDelay:  time.Millisecond,
@@ -646,7 +647,7 @@ func TestEngineLiveOnlyAppliesCollectionFilter(t *testing.T) {
 		mu     sync.Mutex
 		events []Event
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -706,9 +707,9 @@ func TestEngineLiveOnlyCollectionFilterDeliversAccountIdentity(t *testing.T) {
 		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
 	}}
 	dial, _ := scriptedDialer(conn)
-	cfg := Config{
+	cfg := engineConfig{
 		Host:           "https://h",
-		Request:        PlanRequest{Collections: []string{"app.bsky.feed.post"}},
+		Request:        planRequest{Collections: []string{"app.bsky.feed.post"}},
 		Backfill:       false,
 		BatchSize:      1,
 		MaxBatchDelay:  time.Millisecond,
@@ -722,7 +723,7 @@ func TestEngineLiveOnlyCollectionFilterDeliversAccountIdentity(t *testing.T) {
 		mu     sync.Mutex
 		events []Event
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -778,9 +779,9 @@ func TestEngineLiveOnlyNoFilterDeliversAccountIdentity(t *testing.T) {
 		{data: liveAccountFrame(3, "did:plc:a", true, "")},
 	}}
 	dial, _ := scriptedDialer(conn)
-	cfg := Config{
+	cfg := engineConfig{
 		Host:           "https://h",
-		Request:        PlanRequest{}, // no filters
+		Request:        planRequest{}, // no filters
 		Backfill:       false,
 		BatchSize:      1,
 		MaxBatchDelay:  time.Millisecond,
@@ -795,7 +796,7 @@ func TestEngineLiveOnlyNoFilterDeliversAccountIdentity(t *testing.T) {
 		kinds  []Kind
 		events []Event
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -851,7 +852,7 @@ func TestEngineLiveOnlyBreakOnQuietTail(t *testing.T) {
 		{data: liveCommitFrame(t, 1, "did:plc:a", "create", "app.bsky.feed.post", "r1", true)},
 	}}
 	dial, _ := scriptedDialer(conn)
-	cfg := Config{
+	cfg := engineConfig{
 		Host:           "https://h",
 		Backfill:       false,
 		BatchSize:      1,
@@ -860,7 +861,7 @@ func TestEngineLiveOnlyBreakOnQuietTail(t *testing.T) {
 		Dial:           dial,
 	}
 
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -893,7 +894,7 @@ func TestEngineLiveOnlyErrorRejectStopsBatching(t *testing.T) {
 		{data: []byte(`{"seq":2,"kind":"commit","commit":{"operation":"create","collection":"c","rkey":"r2"}}`)}, // malformed: missing record_cbor -> error frame
 	}}
 	dial, _ := scriptedDialer(conn)
-	cfg := Config{
+	cfg := engineConfig{
 		Host:           "https://h",
 		Backfill:       false,
 		BatchSize:      64, // large: events stay buffered until flush/stop
@@ -907,7 +908,7 @@ func TestEngineLiveOnlyErrorRejectStopsBatching(t *testing.T) {
 		batchAfter  bool
 		errRejected bool
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -984,7 +985,7 @@ func TestEngineStatsReportsResidualGap(t *testing.T) {
 		mu     sync.Mutex
 		events []Event
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -1011,11 +1012,157 @@ func TestEngineStatsReportsResidualGap(t *testing.T) {
 		t.Fatal("engine did not reach seq 9 within 5s")
 	}
 
-	st := eng.Stats()
+	st := eng.stats()
 	require.GreaterOrEqual(t, st.Pages, uint64(3), "the loop must record at least one page per segment")
 	require.EqualValues(t, 6, st.SealedTip, "Stats must report the pinned sealed tip S")
 	require.EqualValues(t, 6, st.PlannedThrough, "the continuation cursor must reach the sealed tip")
 	require.Zero(t, st.ResidualGap, "the residual gap must converge to zero once the sealed archive is consumed")
+}
+
+// TestEngineStatsPublishesTipBeforeDownload verifies that monitoring can see
+// the work horizon while the first page is still downloading. Otherwise a
+// large first page misleadingly reports a zero tip and zero residual gap for
+// most of a long replay.
+func TestEngineStatsPublishesTipBeforeDownload(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	var sealed []segment.Event
+	for seq := uint64(1); seq <= 6; seq++ {
+		sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+	}
+	h.as.addSegment(t, "seg_0000000000.jss", sealed)
+	h.planned = 6
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 6}}
+	h.installHandlers()
+
+	gate := make(chan struct{})
+	h.as.mu.Lock()
+	h.as.segGate = gate
+	h.as.mu.Unlock()
+
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	eng := newReplayEngine(cfg)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		eng.run(context.Background(), func(*Batch, error) bool { return true })
+	}()
+
+	require.Eventually(t, func() bool { return h.as.segReqs.Load() > 0 }, 5*time.Second, time.Millisecond,
+		"the first segment download never started")
+	require.Equal(t, Stats{SealedTip: 6, PlannedThrough: 0, ResidualGap: 6}, eng.stats(),
+		"the planned horizon must be visible before page 1 finishes")
+
+	close(gate)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("backfill did not finish after releasing the segment download")
+	}
+}
+
+// TestEngineStatsDoesNotCompleteStoppedPage verifies that a consumer break in
+// the middle of a page does not claim that page's continuation cursor. The
+// downloader cancels the remaining blocks, so counting it would understate the
+// residual gap and make Stats report work that was never delivered.
+func TestEngineStatsDoesNotCompleteStoppedPage(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	var sealed []segment.Event
+	for seq := uint64(1); seq <= 6; seq++ {
+		sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+	}
+	h.as.addSegment(t, "seg_0000000000.jss", sealed)
+	h.planned = 6
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 6}}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	cfg.BatchSize = 1
+	eng := newReplayEngine(cfg)
+	var batches int
+	eng.run(context.Background(), func(batch *Batch, err error) bool {
+		require.NoError(t, err)
+		batches++
+		return false
+	})
+
+	require.Equal(t, 1, batches)
+	require.Equal(t, Stats{SealedTip: 6, PlannedThrough: 0, ResidualGap: 6}, eng.stats(),
+		"a partially delivered page must not advance Pages or PlannedThrough")
+}
+
+// TestEngineRunBatchAppendDoesNotCorruptLaterBatches guards the fast-path
+// chunking's three-index slices: a block's batches are views over one shared
+// slab, and Events() hands the slice to the consumer ("owned by the caller for
+// the lifetime of the loop iteration"), so an append during that iteration must
+// reallocate rather than overwrite the first event of the next, not-yet-yielded
+// batch.
+func TestEngineRunBatchAppendDoesNotCorruptLaterBatches(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	var sealed []segment.Event
+	for seq := uint64(1); seq <= 6; seq++ {
+		sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+	}
+	// One block holding all six events, so BatchSize=1 splits it into six
+	// slab-sharing batch views.
+	h.as.addSegmentWithBlockSize(t, "seg_0000000000.jss", sealed, 10)
+	h.planned = 6
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 6}}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	cfg.BatchSize = 1
+	eng := newReplayEngine(cfg)
+	var seqs []uint64
+	eng.run(context.Background(), func(batch *Batch, err error) bool {
+		require.NoError(t, err)
+		for _, ev := range batch.Events() {
+			seqs = append(seqs, ev.Seq)
+		}
+		// The consumer owns the slice for this iteration; appending must not
+		// clobber events in batches not yet delivered.
+		_ = append(batch.Events(), Event{})
+		return true
+	})
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, seqs,
+		"a consumer append must never overwrite a later batch's events")
+}
+
+// TestEngineRunHugeBatchSizeDeliversAllEvents guards the fast-path chunk-count
+// ceiling division against int overflow: WithBatchSize accepts any positive
+// int, and a naive (len+size-1)/size wraps negative for size near MaxInt,
+// panicking make on the decode worker — recovered into a dropped block, i.e.
+// silent data loss. All events must arrive in one batch instead.
+func TestEngineRunHugeBatchSizeDeliversAllEvents(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	var sealed []segment.Event
+	for seq := uint64(1); seq <= 6; seq++ {
+		sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+	}
+	h.as.addSegmentWithBlockSize(t, "seg_0000000000.jss", sealed, 10)
+	h.planned = 6
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 6}}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	cfg.BatchSize = math.MaxInt
+	eng := newReplayEngine(cfg)
+	var seqs []uint64
+	eng.run(context.Background(), func(batch *Batch, err error) bool {
+		require.NoError(t, err, "a huge batch size must not surface a decode-worker panic")
+		for _, ev := range batch.Events() {
+			seqs = append(seqs, ev.Seq)
+		}
+		return true
+	})
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, seqs)
 }
 
 func uniqueSeqs(events []Event) []uint64 {
@@ -1282,7 +1429,7 @@ func TestEngineReBackfillDropsAlreadyDeliveredStraddlingRows(t *testing.T) {
 	require.GreaterOrEqual(t, dialN.Load(), int64(3), "must have re-dialed live after the too-old re-backfill")
 }
 
-// TestEngineRunResetsAdvancedMatcherFloor pins that RunWithBackfill resets the
+// TestEngineRunResetsAdvancedMatcherFloor pins that runWithBackfill resets the
 // row matcher's seq floor at the start of every run. The §14 re-backfill mutates
 // the long-lived engine matcher (setAfterSeq), and the public Client permits
 // SEQUENTIAL Events() re-iterations on the same engine. Without a per-run reset,
@@ -1304,9 +1451,9 @@ func TestEngineRunResetsAdvancedMatcherFloor(t *testing.T) {
 	}
 	h.installHandlers()
 
-	cfg := Config{
+	cfg := engineConfig{
 		Host:         as.srv.URL,
-		Request:      PlanRequest{AfterSeq: 0},
+		Request:      planRequest{AfterSeq: 0},
 		Backfill:     true,
 		BackfillOnly: true, // no live tail needed to exercise the matcher reset
 		BatchSize:    1,
@@ -1314,7 +1461,7 @@ func TestEngineRunResetsAdvancedMatcherFloor(t *testing.T) {
 		XRPC:         &xrpc.Client{Host: as.srv.URL},
 	}
 
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	// Simulate the residue of a prior run's §14 re-backfill: the matcher floor
 	// was advanced to 3. A correct run must reset it before planning.
 	eng.matcher.setAfterSeq(3)
@@ -1325,7 +1472,7 @@ func TestEngineRunResetsAdvancedMatcherFloor(t *testing.T) {
 		mu     sync.Mutex
 		events []Event
 	)
-	eng.RunWithBackfill(ctx,
+	eng.runWithBackfill(ctx,
 		func(batch []Event) bool {
 			mu.Lock()
 			events = append(events, batch...)
@@ -1333,7 +1480,7 @@ func TestEngineRunResetsAdvancedMatcherFloor(t *testing.T) {
 			return true
 		},
 		func(error) bool { return true },
-		BackfillSink{},
+		backfillSink{},
 	)
 
 	mu.Lock()
@@ -1420,7 +1567,7 @@ func TestEngineReBackfillCutoverDoesNotRewindBelowDelivered(t *testing.T) {
 		"the re-backfill cutover must not rewind below the last delivered seq; a rewound floor re-delivers 3,4,5")
 }
 
-// TestEngineRunResetsRebackfillStalls pins that RunWithBackfill resets the
+// TestEngineRunResetsRebackfillStalls pins that runWithBackfill resets the
 // anti-ping-pong stall counter per run. rebackfillStalls is long-lived engine
 // state (like the matcher); a prior run that stopped mid-stall (e.g. cancelled
 // after a few non-advancing §14 cycles) must not make the NEXT run trip the
@@ -1439,35 +1586,35 @@ func TestEngineRunResetsRebackfillStalls(t *testing.T) {
 	}
 	h.installHandlers()
 
-	cfg := Config{
+	cfg := engineConfig{
 		Host:         as.srv.URL,
-		Request:      PlanRequest{AfterSeq: 0},
+		Request:      planRequest{AfterSeq: 0},
 		Backfill:     true,
 		BackfillOnly: true,
 		BatchSize:    1,
 		Concurrency:  4,
 		XRPC:         &xrpc.Client{Host: as.srv.URL},
 	}
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	// Residue of a prior run that stalled but did not trip the fatal guard.
 	eng.rebackfillStalls = maxRebackfillStalls - 1
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	eng.RunWithBackfill(ctx,
+	eng.runWithBackfill(ctx,
 		func([]Event) bool { return true },
 		func(error) bool { return true },
-		BackfillSink{},
+		backfillSink{},
 	)
 
 	require.Equal(t, 0, eng.rebackfillStalls,
-		"RunWithBackfill must reset the stall counter at run start so a prior run's partial count cannot trip the guard early")
+		"runWithBackfill must reset the stall counter at run start so a prior run's partial count cannot trip the guard early")
 }
 
 // TestEngineReBackfillFlushesBufferedLiveRowsBeforeSweep pins the fast-path seam
-// ordering at a §14 re-backfill. On the fast path (bf.Transform set, which the
+// ordering at a §14 re-backfill. On the fast path (bf.transform set, which the
 // public/typed clients use), live cutover rows flow through the serial batcher
-// while re-backfill archive rows are emitted directly via bf.Emit, bypassing it.
+// while re-backfill archive rows are emitted directly via bf.emit, bypassing it.
 // If the live tail leaves a partially-filled batch when the too-old 400 fires,
 // the next sweep's newer archive rows (seq > resume) must NOT reach the consumer
 // before those buffered older live rows. The engine flushes the batcher before
@@ -1486,7 +1633,7 @@ func TestEngineReBackfillFlushesBufferedLiveRowsBeforeSweep(t *testing.T) {
 		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
 	})
 	// seg1 straddles resume=6: blocks {5,6},{7,8}. The re-backfill emits its
-	// new rows (7,8) via bf.Emit; the buffered live rows (5,6) must precede them.
+	// new rows (7,8) via bf.emit; the buffered live rows (5,6) must precede them.
 	h.as.addSegment(t, segName(1), []segment.Event{
 		makeCreate(t, 5, "did:plc:a", "app.bsky.feed.post", "r5"),
 		makeCreate(t, 6, "did:plc:a", "app.bsky.feed.post", "r6"),
@@ -1586,7 +1733,7 @@ func TestEngineTooOldPingPongIsFatal(t *testing.T) {
 		mu     sync.Mutex
 		gotErr error
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -1638,7 +1785,7 @@ func TestEngineLiveOnlyCursorTooOldIsFatal(t *testing.T) {
 		dials.Add(1)
 		return nil, errLiveCursorTooOld
 	}
-	cfg := Config{
+	cfg := engineConfig{
 		Host:           "https://h",
 		Backfill:       false,
 		LiveCursor:     42, // a non-zero saved resume cursor (not from-tip)
@@ -1656,7 +1803,7 @@ func TestEngineLiveOnlyCursorTooOldIsFatal(t *testing.T) {
 		gotErr  error
 		batches int
 	)
-	eng := NewEngine(cfg)
+	eng := newReplayEngine(cfg)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
