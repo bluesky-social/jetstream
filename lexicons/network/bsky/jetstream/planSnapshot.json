@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Plan a sealed-archive snapshot. The response names whole sealed segments or sealed-segment block ranges that may contain rows matching the requested DID and collection filters, and is paginated: pin sealedTipSeq and page with afterSeq=plannedThroughSeq until plannedThroughSeq reaches it. This is a transport planner only: clients must still decode rows, apply exact filtering, fold deletes/updates, and coordinate live-tail subscription independently. Deletion markers (record-level and DID-level) ride inline in the planned blocks; there is no separate tombstone fetch.",
+      "description": "Build a download plan for the desired data pattern. The plan lists whole segments or block ranges that might contain events for the requested DIDs and collections.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -12,23 +12,23 @@
           "properties": {
             "dids": {
               "type": "array",
-              "description": "Exact DIDs to match. Missing or empty means all DIDs.",
+              "description": "Only include data for these DIDs. Omit this field or pass an empty array to include all DIDs.",
               "items": { "type": "string", "format": "did" }
             },
             "collections": {
               "type": "array",
-              "description": "Collection filters to match. Each entry is either an exact NSID (e.g. app.bsky.feed.post) or a namespace wildcard ending in '.*' (e.g. app.bsky.feed.*), which matches every collection under that namespace prefix. Missing or empty means all collections. A wildcard that matches no archived collection yields an empty plan (it is not treated as match-all).",
+              "description": "Only include data from these collections. Each value may be an exact NSID, such as app.bsky.feed.post, or a namespace wildcard, such as app.bsky.feed.*. Omit this field or pass an empty array to include all collections.",
               "items": { "type": "string" }
             },
             "afterSeq": {
               "type": "integer",
               "minimum": 0,
-              "description": "Lower exclusive sequence bound. Rows with seq <= afterSeq are outside the requested window."
+              "description": "Start after this sequence number. Events at or below it are not included."
             },
             "beforeSeq": {
               "type": "integer",
               "minimum": 0,
-              "description": "Upper inclusive sequence bound. Rows with seq > beforeSeq are outside the requested window."
+              "description": "Stop at this sequence number. Events above it are not included."
             }
           }
         }
@@ -42,12 +42,12 @@
             "plannedThroughSeq": {
               "type": "integer",
               "minimum": 0,
-              "description": "Continuation cursor: the highest sealed seq this page accounts for. When the page is truncated to fit the server's per-page entry limit it is the MaxSeq of the last included work unit; otherwise it equals sealedTipSeq. Fetch the next page with afterSeq=plannedThroughSeq (exclusive). The whole sealed archive has been consumed once plannedThroughSeq >= sealedTipSeq."
+              "description": "The last sealed sequence covered by this page. Use this value as afterSeq for the next page. If the response hits the server's page limit, this is the maxSeq of the last item returned; otherwise it equals sealedTipSeq. Planning is complete when plannedThroughSeq reaches sealedTipSeq."
             },
             "sealedTipSeq": {
               "type": "integer",
               "minimum": 0,
-              "description": "Pagination goal: the sealed-archive tip, capped by beforeSeq when provided. Stable across pages of the same archive snapshot; pin it once and page until plannedThroughSeq reaches it."
+              "description": "The end of the sealed archive for this snapshot, capped by beforeSeq when provided. Use this value as beforeSeq on later pages so the snapshot does not move while it is being downloaded."
             },
             "segments": {
               "type": "array",
@@ -62,19 +62,19 @@
       "type": "object",
       "required": ["name", "index", "checksum", "minSeq", "maxSeq", "mode"],
       "properties": {
-        "name": { "type": "string", "description": "Segment filename accepted by getSegment and getBlock." },
+        "name": { "type": "string", "description": "Segment filename to pass to getSegment or getBlock." },
         "index": { "type": "integer", "minimum": 0, "description": "Zero-based segment index." },
-        "checksum": { "type": "string", "minLength": 16, "maxLength": 16, "description": "Segment-format xxh3 metadata checksum as 16-char hex." },
+        "checksum": { "type": "string", "minLength": 16, "maxLength": 16, "description": "The segment's xxh3 metadata checksum, encoded as 16 hexadecimal characters." },
         "minSeq": { "type": "integer", "minimum": 0 },
         "maxSeq": { "type": "integer", "minimum": 0 },
         "mode": {
           "type": "string",
           "knownValues": ["segment", "blocks"],
-          "description": "segment means download the whole segment with getSegment; blocks means download the listed block ranges with getBlock."
+          "description": "How to download this segment. For segment, download the whole file with getSegment. For blocks, download the ranges listed in blocks with getBlock."
         },
         "blocks": {
           "type": "array",
-          "description": "Inclusive block ranges. Present only when mode is blocks.",
+          "description": "Block ranges to download, including both endpoints. This field is present only when mode is blocks.",
           "items": { "type": "ref", "ref": "#blockRange" }
         }
       }
@@ -83,8 +83,8 @@
       "type": "object",
       "required": ["first", "last"],
       "properties": {
-        "first": { "type": "integer", "minimum": 0, "description": "First block index in this inclusive range." },
-        "last": { "type": "integer", "minimum": 0, "description": "Last block index in this inclusive range." }
+        "first": { "type": "integer", "minimum": 0, "description": "Index of the first block in the range." },
+        "last": { "type": "integer", "minimum": 0, "description": "Index of the last block in the range." }
       }
     },
     "stats": {
@@ -97,7 +97,7 @@
         "entries": {
           "type": "integer",
           "minimum": 0,
-          "description": "Number of response work entries counted against the server plan limit."
+          "description": "Number of items counted toward the server's per-page plan limit."
         }
       }
     }

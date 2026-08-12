@@ -13,7 +13,7 @@
             "minimum": 1,
             "maximum": 1000,
             "default": 100,
-            "description": "Maximum number of segments to return."
+            "description": "Maximum number of segment file names to return."
           },
           "cursor": {
             "type": "string",
