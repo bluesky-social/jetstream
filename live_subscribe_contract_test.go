@@ -101,6 +101,14 @@ func TestDialWebsocketMatchesServerDictRejected(t *testing.T) {
 	require.Contains(t, err.Error(), "20260709")
 }
 
+func TestDialWebsocketMatchesServerInvalidRequest(t *testing.T) {
+	t.Parallel()
+	srv := serve400(t, xrpcErrorBody("InvalidRequest", "collections filter can never apply: kinds excludes commit"))
+	_, err := dialWebsocket(context.Background(), toWS(t, srv.URL), nil)
+	require.ErrorIs(t, err, errLiveInvalidRequest)
+	require.Contains(t, err.Error(), "kinds excludes commit")
+}
+
 // TestSubprotocolMatchesGeneratedLexicon pins the client's duplicated
 // subprotocol token to the lexgen-generated constant (the single source of
 // truth derived from lexicons/network/bsky/jetstream/subscribeEvents.json).

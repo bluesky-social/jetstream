@@ -29,6 +29,7 @@ package subscribe
 import (
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/bluesky-social/jetstream/segment"
@@ -160,6 +161,9 @@ func ParseQueryV2(q url.Values) (*FilterV2, error) {
 		return nil, fmt.Errorf("%w: requireHello is not supported on this endpoint; it is server-push only (subscriber-sourced messages were removed)", ErrInvalidOptions)
 	}
 
+	if n := len(q["kinds"]); n > 4 {
+		return nil, fmt.Errorf("%w: too many kinds values: %d > 4", ErrInvalidOptions, n)
+	}
 	kinds, kindsSet, err := parseKinds(q["kinds"])
 	if err != nil {
 		return nil, err
@@ -209,14 +213,33 @@ func ParseQueryV2(q url.Values) (*FilterV2, error) {
 	if collections != nil && kindsSet && kinds&kindMaskCommit == 0 {
 		return nil, fmt.Errorf("%w: collections filter can never apply: kinds excludes commit", ErrInvalidOptions)
 	}
+	maxMessageSizeBytes, err := parseMaxMessageSizeV2(q)
+	if err != nil {
+		return nil, err
+	}
 
 	return &FilterV2{
 		kindsSet:            kindsSet,
 		kinds:               kinds,
 		dids:                dids,
 		collections:         collections,
-		maxMessageSizeBytes: parseMaxMsgSizeQuery(q.Get("maxMessageSizeBytes")),
+		maxMessageSizeBytes: maxMessageSizeBytes,
 	}, nil
+}
+
+func parseMaxMessageSizeV2(q url.Values) (uint32, error) {
+	values, ok := q["maxMessageSizeBytes"]
+	if !ok {
+		return 0, nil
+	}
+	if len(values) != 1 || values[0] == "" {
+		return 0, fmt.Errorf("%w: maxMessageSizeBytes must be one unsigned 32-bit integer", ErrInvalidOptions)
+	}
+	n, err := strconv.ParseUint(values[0], 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%w: invalid maxMessageSizeBytes %q", ErrInvalidOptions, values[0])
+	}
+	return uint32(n), nil
 }
 
 // parseKinds parses repeated kinds values into a mask. No values means

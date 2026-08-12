@@ -78,9 +78,9 @@
 // from the v1 README's stated contract, this package deliberately
 // matches v1. The places we do that are:
 //
-//   - maxMessageSizeBytes silently coerces empty/malformed/negative
-//     values to 0 ("no cap"). v1 README: "Zero means no limit, negative
-//     values are treated as zero." Locked down by
+//   - On v1 only, maxMessageSizeBytes silently coerces
+//     empty/malformed/negative values to 0 ("no cap"). v2 rejects malformed
+//     syntax and overflow. v1 behavior is locked down by
 //     TestParseMaxMsgSize_V1Compat.
 //
 //   - Identity and Account events bypass wantedCollections — they are

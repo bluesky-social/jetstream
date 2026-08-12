@@ -1,6 +1,7 @@
 package manifest_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -158,6 +159,136 @@ func TestPlanSnapshot_CollectionAndDIDFilterNarrowsMarkerBlocks(t *testing.T) {
 	// Block 2 (otherDID's marker) is pruned by the DID bloom; blocks 0 and 1
 	// (planDID) survive.
 	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 1}}, got.Segments[0].Blocks)
+}
+
+func TestPlanSnapshot_CommitKindAndCollectionExcludesMarkerOnlyBlocks(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, planDID, postNSID),
+		markerEvent(2, planDID, segment.KindAccount),
+		planEvent(3, planDID, likeNSID),
+		markerEvent(4, planDID, segment.KindIdentity),
+		markerEvent(5, planDID, segment.KindSync),
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.Kinds = manifest.KindCommit
+	req.Collections = []string{postNSID}
+
+	got, err := m.PlanSnapshot(req)
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 0}}, got.Segments[0].Blocks)
+}
+
+func TestPlanSnapshot_CommitKindWithoutCollectionSelectsRealCollections(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, planDID, postNSID),
+		markerEvent(2, planDID, segment.KindAccount),
+		planEvent(3, planDID, likeNSID),
+		markerEvent(4, planDID, segment.KindSync),
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.Kinds = manifest.KindCommit
+
+	got, err := m.PlanSnapshot(req)
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	require.Equal(t, []manifest.BlockRange{{First: 0, Last: 0}, {First: 2, Last: 2}}, got.Segments[0].Blocks)
+}
+
+func TestPlanSnapshot_MarkerKindsSelectOnlyRequestedSentinels(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, planDID, postNSID),
+		markerEvent(2, planDID, segment.KindAccount),
+		markerEvent(3, planDID, segment.KindIdentity),
+		markerEvent(4, planDID, segment.KindSync),
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.Kinds = manifest.KindAccount | manifest.KindSync
+
+	got, err := m.PlanSnapshot(req)
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	require.Equal(t, []manifest.BlockRange{{First: 1, Last: 1}, {First: 3, Last: 3}}, got.Segments[0].Blocks)
+}
+
+func TestPlanSnapshot_KindSelectionMayOverSendMixedBlock(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writePlanSegment(t, dir, 0, 10,
+		planEvent(1, planDID, postNSID),
+		markerEvent(2, planDID, segment.KindAccount),
+	)
+	m := openManifestDir(t, dir)
+	req := planReq()
+	req.Kinds = manifest.KindCommit
+	req.Collections = []string{postNSID}
+
+	got, err := m.PlanSnapshot(req)
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	require.Equal(t, manifest.PlanModeSegment, got.Segments[0].Mode)
+	require.Equal(t, 1, got.Stats.BlocksMatched)
+}
+
+func TestPlanSnapshot_CommitCollectionAvoidsGlobalMarkerBaseline(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	events := make([]segment.Event, 0, 101)
+	for seq := uint64(1); seq <= 100; seq++ {
+		events = append(events, markerEvent(seq, "did:plc:marker", segment.KindAccount))
+	}
+	events = append(events, planEvent(101, planDID, "im.flushing.right.now"))
+	writePlanSegment(t, dir, 0, 1, events...)
+	m := openManifestDir(t, dir)
+
+	defaultReq := planReq()
+	defaultReq.Collections = []string{"im.flushing.right.now"}
+	defaultPlan, err := m.PlanSnapshot(defaultReq)
+	require.NoError(t, err)
+	require.Equal(t, 101, defaultPlan.Stats.BlocksMatched, "collection-only keeps the marker-safe default")
+
+	commitReq := defaultReq
+	commitReq.Kinds = manifest.KindCommit
+	commitPlan, err := m.PlanSnapshot(commitReq)
+	require.NoError(t, err)
+	require.Equal(t, 1, commitPlan.Stats.BlocksMatched, "commit-only must avoid the global marker-block baseline")
+}
+
+func TestPlanSnapshot_KindPlanningUsesManifestMetadataOnly(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ingest.SegmentFilename(0))
+	writePlanSegment(t, dir, 0, 1,
+		planEvent(1, planDID, postNSID),
+		markerEvent(2, planDID, segment.KindAccount),
+	)
+	m := openManifestDir(t, dir)
+
+	// Manifest.Open has already loaded footer summaries. Move the segment away:
+	// planning must still succeed because PlanSnapshot is forbidden from opening
+	// segment files or decoding blocks on the request path.
+	require.NoError(t, os.Rename(path, path+".moved"))
+	req := planReq()
+	req.Kinds = manifest.KindCommit
+	req.Collections = []string{postNSID}
+	got, err := m.PlanSnapshot(req)
+	require.NoError(t, err)
+	require.Equal(t, 1, got.Stats.BlocksMatched)
 }
 
 func TestPlanSnapshot_CollectionFilterUsesResidentCollectionIndex(t *testing.T) {
@@ -514,6 +645,17 @@ func TestPlanSnapshot_InvalidRequest(t *testing.T) {
 
 	req = planReq()
 	req.MaxEntries = -1
+	_, err = m.PlanSnapshot(req)
+	require.ErrorIs(t, err, manifest.ErrInvalidPlanRequest)
+
+	req = planReq()
+	req.Kinds = manifest.KindMask(1 << 7)
+	_, err = m.PlanSnapshot(req)
+	require.ErrorIs(t, err, manifest.ErrInvalidPlanRequest)
+
+	req = planReq()
+	req.Kinds = manifest.KindAccount
+	req.Collections = []string{postNSID}
 	_, err = m.PlanSnapshot(req)
 	require.ErrorIs(t, err, manifest.ErrInvalidPlanRequest)
 }

@@ -66,9 +66,15 @@ a **transport planner only**: it names which immutable artifacts might
 contain matching rows. Exact filtering, decoding, and folding stay
 client-side.
 
-Request: `dids` (exact), `collections` (exact NSIDs or `ns.*` namespace
+Request: `kinds` (`commit`, `identity`, `account`, `sync`), `dids` (exact), `collections` (exact NSIDs or `ns.*` namespace
 wildcards; a wildcard matching nothing yields an empty plan, not match-all),
 `afterSeq` (exclusive lower bound), `beforeSeq` (inclusive upper bound).
+
+Planning remains manifest-only. Real footer collection ids are coarse commit
+candidates; `$account`/`$identity`/`$sync` sentinel ids are coarse marker-kind
+candidates. Mixed blocks and whole segments may over-send, and the client exact
+matcher is authoritative. Omitted kinds preserves marker-safe collection
+semantics; explicit `kinds=commit` removes the marker-block baseline.
 
 Response, per page:
 
@@ -247,7 +253,10 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
   `WithBackfillOnly` — a live tail with an upper bound would silently
   drop every later live event). Pure live: `WithLiveCursor` (0 = from
   the current tip).
-- Filters: `WithCollections` (exact or `ns.*`), `WithDIDs`.
+- Filters: `WithKinds`, `WithCollections` (exact or `ns.*`), `WithDIDs`.
+  Subscribe validates, deduplicates, and canonicalizes all three axes once,
+  then forwards the same immutable predicate to every plan page and live
+  reconnect. Permanent live `InvalidRequest` responses are fatal, not retried.
 - Performance: `WithDownloadConcurrency`, `WithRawRecords` (+`Copied`,
   `+CIDs`) to skip the generic record-map build, `TypedEvents[T]` for the
   typed decode fast path, `WithZstdCompression` for the live tail.

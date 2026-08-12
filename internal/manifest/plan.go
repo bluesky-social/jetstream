@@ -18,7 +18,25 @@ const (
 	PlanModeBlocks  PlanMode = "blocks"
 )
 
+// KindMask is the set of public Jetstream event kinds a plan may contain.
+// Zero means omitted/match all, preserving the pre-kind-filter contract.
+type KindMask uint8
+
+const (
+	KindCommit KindMask = 1 << iota
+	KindIdentity
+	KindAccount
+	KindSync
+
+	allKinds = KindCommit | KindIdentity | KindAccount | KindSync
+)
+
+func (m KindMask) admits(kind KindMask) bool {
+	return m == 0 || m&kind != 0
+}
+
 type PlanSnapshotRequest struct {
+	Kinds       KindMask
 	DIDs        []string
 	Collections []string
 	// CollectionPrefixes are namespace prefixes from wildcard filters
@@ -101,6 +119,13 @@ func (m *Manifest) PlanSnapshot(req PlanSnapshotRequest) (PlanSnapshotResult, er
 		return PlanSnapshotResult{}, ErrInvalidPlanRequest
 	}
 	if req.WholeSegmentThreshold <= 0 || req.WholeSegmentThreshold > 1 {
+		return PlanSnapshotResult{}, ErrInvalidPlanRequest
+	}
+	if req.Kinds&^allKinds != 0 {
+		return PlanSnapshotResult{}, ErrInvalidPlanRequest
+	}
+	if (len(req.Collections) > 0 || len(req.CollectionPrefixes) > 0) &&
+		req.Kinds != 0 && !req.Kinds.admits(KindCommit) {
 		return PlanSnapshotResult{}, ErrInvalidPlanRequest
 	}
 
@@ -268,16 +293,17 @@ func blockOverlapsSeq(block segment.BlockInfo, req PlanSnapshotRequest) bool {
 
 func selectPlanBlocks(seg *SegmentMetadata, req PlanSnapshotRequest, wantCollections map[string]struct{}) []int {
 	collectionMatchAll := len(req.Collections) == 0 && len(req.CollectionPrefixes) == 0
+	candidateMatchAll := req.Kinds == 0 && collectionMatchAll
 	didMatchAll := len(req.DIDs) == 0
 
 	if !didMatchAll && !segmentBloomMayContainAny(seg, req.DIDs) {
 		return nil
 	}
 
-	var collectionIDs map[uint32]struct{}
-	if !collectionMatchAll {
-		collectionIDs = collectionIDsForSegment(seg, wantCollections, req.CollectionPrefixes)
-		if len(collectionIDs) == 0 {
+	var candidates collectionCandidates
+	if !candidateMatchAll {
+		candidates = collectionCandidatesForSegment(seg, req.Kinds, collectionMatchAll, wantCollections, req.CollectionPrefixes)
+		if candidates.empty() {
 			return nil
 		}
 	}
@@ -287,7 +313,7 @@ func selectPlanBlocks(seg *SegmentMetadata, req PlanSnapshotRequest, wantCollect
 		if !blockOverlapsSeq(block, req) {
 			continue
 		}
-		if !collectionMatchAll && !blockHasAnyCollection(seg, i, collectionIDs) {
+		if !candidateMatchAll && !blockHasAnyCandidate(seg, i, candidates) {
 			continue
 		}
 		if !didMatchAll && !blockBloomMayContainAny(seg, i, req.DIDs) {
@@ -316,18 +342,18 @@ func blockBloomMayContainAny(seg *SegmentMetadata, blockIdx int, dids []string) 
 	return slices.ContainsFunc(dids, bloom.TestString)
 }
 
-// collectionIDsForSegment returns the segment-local collection indices whose
-// NSID is exact-matched by want OR is covered by one of prefixes, PLUS the
-// segment's reserved DID-level marker sentinel ids (segment.IsDIDMarkerSentinelCollection).
-// Both the request match and the sentinel union only widen the matched set,
-// preserving the planner's one-sided contract (no false negatives).
+// collectionCandidatesForSegment returns the segment-local collection indices that
+// may contain a requested kind. Real collection IDs represent commit events;
+// reserved sentinel IDs represent account, identity, and sync events. A
+// collection predicate narrows only real IDs. KindMask zero admits every kind.
 //
 // The sentinel union is what closes the collection-filtered DID-tombstone gap:
 // #account/#identity/#sync markers carry no real collection, so the seal/rewrite
 // index tags their blocks with a reserved sentinel collection instead. Always
-// admitting those sentinels under a collection filter makes the marker-bearing
-// blocks selectable; the per-block DID bloom still narrows by DID. A client can
-// never request a sentinel itself — the names are invalid NSIDs and the request
+// admitting the requested sentinels under a collection filter makes the
+// marker-bearing blocks selectable; omitted kinds admits all three, while an
+// explicit kind mask can exclude them. The per-block DID bloom still narrows
+// by DID. A client can never request a sentinel itself — the names are invalid NSIDs and the request
 // validator only accepts NSIDs/NSID-authority prefixes — so the sentinels enter
 // the matched set only here, never via want/prefixes.
 //
@@ -336,8 +362,25 @@ func blockBloomMayContainAny(seg *SegmentMetadata, blockIdx int, dids []string) 
 // exact-matching, because a segment can only contain collections that exist in
 // that union — but it needs no global cache and stays current under the manifest
 // read lock.
-func collectionIDsForSegment(seg *SegmentMetadata, want map[string]struct{}, prefixes []string) map[uint32]struct{} {
-	out := make(map[uint32]struct{}, min(len(want)+len(prefixes), len(seg.Collections)))
+type collectionCandidates struct {
+	// included contains exact real IDs and selected marker IDs.
+	included map[uint32]struct{}
+	// sentinels contains every marker ID resident in the segment. When allReal
+	// is set, any block collection ID not in this set is a commit candidate.
+	sentinels map[uint32]struct{}
+	allReal   bool
+	hasReal   bool
+}
+
+func (c collectionCandidates) empty() bool {
+	return len(c.included) == 0 && (!c.allReal || !c.hasReal)
+}
+
+func collectionCandidatesForSegment(seg *SegmentMetadata, kinds KindMask, collectionMatchAll bool, want map[string]struct{}, prefixes []string) collectionCandidates {
+	out := collectionCandidates{
+		included: make(map[uint32]struct{}, min(len(want)+len(prefixes)+3, len(seg.Collections))),
+		allReal:  collectionMatchAll && kinds.admits(KindCommit),
+	}
 	for id, collection := range seg.Collections {
 		// BlockCollections references collections by uint32 index, so an index
 		// past MaxUint32 can never appear in a block and matching it would be
@@ -346,25 +389,53 @@ func collectionIDsForSegment(seg *SegmentMetadata, want map[string]struct{}, pre
 		if id > math.MaxUint32 {
 			continue
 		}
-		// DID-level marker sentinels are always admitted under a collection
-		// filter so the markers (which carry no real collection) stay
-		// selectable; see the doc comment.
-		if segment.IsDIDMarkerSentinelCollection(collection) {
-			out[uint32(id)] = struct{}{}
+		if kind := sentinelKind(collection); kind != 0 {
+			out.sentinels = addID(out.sentinels, uint32(id))
+			if kinds.admits(kind) {
+				out.included[uint32(id)] = struct{}{}
+			}
+			continue
+		}
+		if !kinds.admits(KindCommit) {
+			continue
+		}
+		out.hasReal = true
+		if collectionMatchAll {
 			continue
 		}
 		if _, ok := want[collection]; ok {
-			out[uint32(id)] = struct{}{}
+			out.included[uint32(id)] = struct{}{}
 			continue
 		}
 		for _, prefix := range prefixes {
 			if strings.HasPrefix(collection, prefix) {
-				out[uint32(id)] = struct{}{}
+				out.included[uint32(id)] = struct{}{}
 				break
 			}
 		}
 	}
 	return out
+}
+
+func addID(ids map[uint32]struct{}, id uint32) map[uint32]struct{} {
+	if ids == nil {
+		ids = make(map[uint32]struct{}, 3)
+	}
+	ids[id] = struct{}{}
+	return ids
+}
+
+func sentinelKind(collection string) KindMask {
+	switch collection {
+	case segment.SentinelCollectionAccount:
+		return KindAccount
+	case segment.SentinelCollectionIdentity:
+		return KindIdentity
+	case segment.SentinelCollectionSync:
+		return KindSync
+	default:
+		return 0
+	}
 }
 
 func blockHasAnyCollection(seg *SegmentMetadata, blockIdx int, ids map[uint32]struct{}) bool {
@@ -374,6 +445,23 @@ func blockHasAnyCollection(seg *SegmentMetadata, blockIdx int, ids map[uint32]st
 	for _, id := range seg.BlockCollections[blockIdx] {
 		if _, ok := ids[id]; ok {
 			return true
+		}
+	}
+	return false
+}
+
+func blockHasAnyCandidate(seg *SegmentMetadata, blockIdx int, candidates collectionCandidates) bool {
+	if blockIdx < 0 || blockIdx >= len(seg.BlockCollections) {
+		return true
+	}
+	for _, id := range seg.BlockCollections[blockIdx] {
+		if _, ok := candidates.included[id]; ok {
+			return true
+		}
+		if candidates.allReal {
+			if _, sentinel := candidates.sentinels[id]; !sentinel {
+				return true
+			}
 		}
 	}
 	return false

@@ -49,6 +49,26 @@ func TestSubscribeURLRejectsUnsupportedScheme(t *testing.T) {
 	}
 }
 
+func TestSubscribeURLKindsAreV2Only(t *testing.T) {
+	t.Parallel()
+
+	_, err := subscribeURL(config{rawURL: "ws://example.com/subscribe", kinds: []string{"commit"}})
+	if err == nil || !strings.Contains(err.Error(), "v1 /subscribe") {
+		t.Fatalf("expected explicit v1 kind-filter rejection, got %v", err)
+	}
+
+	got, err := subscribeURL(config{
+		rawURL: "ws://example.com/xrpc/network.bsky.jetstream.subscribeEvents",
+		kinds:  []string{"commit", "account"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "kinds=commit") || !strings.Contains(got, "kinds=account") {
+		t.Fatalf("v2 URL missing repeated kind filters: %s", got)
+	}
+}
+
 func TestRunExitsWhenDialFails(t *testing.T) {
 	t.Parallel()
 

@@ -16,6 +16,7 @@ func newEngine(host string, cfg config) engine {
 	ec := engineConfig{
 		Host: host,
 		Request: planRequest{
+			Kinds:        cfg.kinds,
 			DIDs:         cfg.dids,
 			Collections:  cfg.collections,
 			AfterSeq:     cfg.afterSeq,

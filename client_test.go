@@ -138,6 +138,34 @@ func TestOptionsCopySlices(t *testing.T) {
 	WithCollections(src)(&cfg)
 	src[0] = "mutated"
 	require.Equal(t, []string{"a", "b"}, cfg.collections, "options must defensively copy slices")
+
+	kinds := []Kind{KindCommit, KindAccount}
+	WithKinds(kinds)(&cfg)
+	kinds[0] = KindSync
+	require.Equal(t, []Kind{KindCommit, KindAccount}, cfg.kinds, "WithKinds must defensively copy its slice")
+
+	dids := []string{"did:plc:a", "did:plc:b"}
+	WithDIDs(dids)(&cfg)
+	dids[0] = "did:plc:mutated"
+	require.Equal(t, []string{"did:plc:a", "did:plc:b"}, cfg.dids, "WithDIDs must defensively copy its slice")
+}
+
+func TestSubscribeCanonicalizesFiltersOnce(t *testing.T) {
+	t.Parallel()
+
+	c, err := Subscribe("host",
+		WithKinds([]Kind{KindCommit, KindAccount, KindCommit}),
+		WithDIDs([]string{"did:plc:a", "did:plc:b", "did:plc:a"}),
+		WithCollections([]string{"app.bsky.feed.post", "app.bsky.feed.*", "app.bsky.feed.post"}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+
+	e, ok := c.engine.(*replayEngine)
+	require.True(t, ok)
+	require.Equal(t, []Kind{KindCommit, KindAccount}, e.cfg.Request.Kinds)
+	require.Equal(t, []string{"did:plc:a", "did:plc:b"}, e.cfg.Request.DIDs)
+	require.Equal(t, []string{"app.bsky.feed.post", "app.bsky.feed.*"}, e.cfg.Request.Collections)
 }
 
 func TestSubscribeValidation(t *testing.T) {
@@ -145,6 +173,28 @@ func TestSubscribeValidation(t *testing.T) {
 
 	_, err := Subscribe("")
 	require.Error(t, err, "empty host must error")
+
+	_, err = Subscribe("host", WithKinds([]Kind{"wat"}))
+	require.ErrorContains(t, err, "invalid kind")
+
+	_, err = Subscribe("host", WithDIDs([]string{"not-a-did"}))
+	require.ErrorContains(t, err, "invalid DID")
+
+	_, err = Subscribe("host", WithCollections([]string{"not a collection"}))
+	require.ErrorContains(t, err, "invalid collection")
+
+	_, err = Subscribe("host", WithCollections([]string{"app.*"}))
+	require.ErrorContains(t, err, "invalid collection wildcard")
+
+	tooManyCollections := make([]string, maxClientCollections+1)
+	for i := range tooManyCollections {
+		tooManyCollections[i] = "com.example.c" + strconv.Itoa(i)
+	}
+	_, err = Subscribe("host", WithCollections(tooManyCollections))
+	require.ErrorContains(t, err, "too many collections")
+
+	_, err = Subscribe("host", WithKinds([]Kind{KindAccount}), WithCollections([]string{"app.bsky.feed.post"}))
+	require.ErrorContains(t, err, "kinds excludes commit")
 
 	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(100), WithBackfillOnly())
 	require.Error(t, err, "beforeSeq must be strictly greater than afterSeq")

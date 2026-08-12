@@ -301,6 +301,7 @@ func (e *replayEngine) runLiveOnly(ctx context.Context, emitBatch func([]Event) 
 		// Forward the filters so the server prunes server-side; the inline
 		// wantsLive matcher above remains the correctness backstop.
 		collections: e.cfg.Request.Collections,
+		kinds:       e.cfg.Request.Kinds,
 		dids:        e.cfg.Request.DIDs,
 		dial:        e.cfg.Dial,
 		httpClient:  e.cfg.LiveHTTPClient,
@@ -313,11 +314,9 @@ func (e *replayEngine) runLiveOnly(ctx context.Context, emitBatch func([]Event) 
 	// rejects stops batching (and fires onStop -> stopLive) instead of being
 	// emitted concurrently and then ignored.
 	//
-	// Apply the caller's exact DID/collection filter here via wantsLive (shared
-	// with the cutover tail): the server streams ALL collections to
-	// the live tail (the client does not treat forwarded collections as a hard
-	// filter), so the engine must drop non-matching events itself. A nil/empty
-	// matcher matches everything, so an unfiltered tail is unaffected.
+	// Apply the caller's exact predicate here via wantsLive (shared with the
+	// cutover tail). Server filtering is intentionally coarse/defensive; this
+	// matcher is the delivery authority.
 	runErr := consumer.Run(liveCtx, func(ev *Event, err error) bool {
 		if err != nil {
 			return b.emitError(err)
@@ -343,8 +342,8 @@ func (e *replayEngine) runLiveOnly(ctx context.Context, emitBatch func([]Event) 
 }
 
 // wantsLive reports whether a live event passes the caller's exact
-// DID/collection filter, applied client-side because the live tail streams all
-// collections (the client does not forward wantedCollections as a hard filter).
+// kind/DID/collection filter. The client-side matcher is authoritative even
+// though the same filters are forwarded for server-side pruning.
 // There is no client-side tombstone suppression (design §5.1): every matching
 // row is delivered and a folding consumer converges. Shared by the live-only
 // path and the backfill cutover tail. A nil matcher matches everything.
@@ -622,9 +621,15 @@ func (e *replayEngine) runBackfillThenLive(ctx context.Context, emitBatch func([
 		// the dedup floor and resume) monotonic non-decreasing, so the matcher-floor
 		// invariant below (resume >= cutover >= prior floor) actually holds.
 		cutover := max(sealedTip, cursor)
-		resume, tooOld := e.tailLiveFromCutover(loopCtx, b, cutover)
-		if !tooOld {
+		resume, tailErr := e.tailLiveFromCutover(loopCtx, b, cutover)
+		if tailErr == nil {
 			// Clean stop: ctx cancelled or the consumer broke the iterator.
+			break
+		}
+		if !errors.Is(tailErr, errLiveCursorTooOld) {
+			if loopCtx.Err() == nil && !b.stopped() {
+				b.emitError(fatal(tailErr))
+			}
 			break
 		}
 
@@ -710,7 +715,7 @@ func (e *replayEngine) runBackfillThenLive(ctx context.Context, emitBatch func([
 // so the server's inclusive replay of cutover itself is deduped, and the first
 // genuinely-new live event (seq > cutover) passes. No rewind margin is needed —
 // the consumer's seq dedup makes the seam at-least-once with no gap (design §13).
-func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover uint64) (resume uint64, tooOld bool) {
+func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover uint64) (resume uint64, err error) {
 	consumer := newLiveConsumer(liveConfig{
 		host:        e.cfg.Host,
 		zstdDict:    e.fetchZstdDict(ctx),
@@ -718,6 +723,7 @@ func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cuto
 		cursor:      cutover,
 		dedupFloor:  cutover,
 		collections: e.cfg.Request.Collections,
+		kinds:       e.cfg.Request.Kinds,
 		dids:        e.cfg.Request.DIDs,
 		dial:        e.cfg.Dial,
 		httpClient:  e.cfg.LiveHTTPClient,
@@ -725,7 +731,7 @@ func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cuto
 		backoffMin:  e.cfg.LiveBackoffMin,
 		mode:        e.cfg.recordMode(),
 	})
-	err := consumer.Run(ctx, func(ev *Event, cerr error) bool {
+	err = consumer.Run(ctx, func(ev *Event, cerr error) bool {
 		if cerr != nil {
 			// A recoverable live read/reconnect error: surface it (do not swallow —
 			// CLAUDE.md) but keep tailing. The consumer rejecting it stops batching.
@@ -736,7 +742,7 @@ func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cuto
 		}
 		return b.add(*ev)
 	})
-	return consumer.LastSeq(), errors.Is(err, errLiveCursorTooOld)
+	return consumer.LastSeq(), err
 }
 
 // fetchZstdDict fetches the server's current live-tail compression

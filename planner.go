@@ -81,10 +81,11 @@ type archivePlan struct {
 	SealedTipSeq uint64
 }
 
-// planRequest is the resolved filter set for a snapshot plan. Empty DID and
-// collection slices mean "match all". AfterSeq is an exclusive lower bound;
+// planRequest is the resolved filter set for a snapshot plan. Empty kind, DID,
+// and collection slices mean "match all". AfterSeq is an exclusive lower bound;
 // BeforeSeq (when set) is an inclusive upper bound.
 type planRequest struct {
+	Kinds        []Kind
 	DIDs         []string
 	Collections  []string
 	AfterSeq     uint64
@@ -126,6 +127,12 @@ func (p *planner) archivePlan(ctx context.Context, req planRequest) (*archivePla
 
 func planInput(req planRequest) *jetstream.JetstreamPlanSnapshot_Input {
 	in := &jetstream.JetstreamPlanSnapshot_Input{}
+	if len(req.Kinds) > 0 {
+		in.Kinds = make([]string, len(req.Kinds))
+		for i, kind := range req.Kinds {
+			in.Kinds[i] = string(kind)
+		}
+	}
 	if len(req.DIDs) > 0 {
 		in.Dids = req.DIDs
 	}

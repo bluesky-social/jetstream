@@ -94,35 +94,36 @@ We provide a seamless user experience similar to the following example Go code.
 
 ```go
 func main() {
-    client := jetstream.Subscribe(
+    client, err := jetstream.Subscribe(
         "jetstream.us-west.bsky.network",
+        jetstream.WithKinds([]jetstream.Kind{jetstream.KindCommit}), // optional; omit to retain markers
         jetstream.WithCollections([]string{"app.bsky.feed.post"}), // optional
         jetstream.WithDIDs([]string{"did:plc:4uz2445cjiw7w4nobfgnu35f"}), // optional
         jetstream.WithBatchSize(64), // optional
     })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
 
-    for events, err := client.Events(ctx) {
+    for batch, err := range client.Events(ctx) {
         if err != nil {
             continue // handle error
         }
-        
-        if err := db.WriteBatch(events); err != nil {
-	          continue // handle error
-	      }
 
-				// Or, handle events individually
-        // for event := range events {
+        if err := db.WriteBatch(batch.Events()); err != nil {
+			continue // handle error
+		}
+
+		// Or, handle events individually:
+        // for _, event := range batch.Events() {
             // handle each event
         // }
 
-        lastCursor := events.LastCursor()
+        lastCursor := batch.LastCursor()
         if err := db.SaveCursor(lastCursor); err != nil {
             continue // handle error
         }
-    }
-
-    if err := client.Close(); err != nil {
-        // handle err
     }
 }
 ```
@@ -358,22 +359,22 @@ Segment rewrites preserve block topology and historical seq/witnessed-at envelop
 
 We also store tombstones since the most recent compaction in memory in the server. This is purely a compaction-internal structure — it powers steady-state compaction and early cap-triggered passes (it gates when a pass runs and feeds the size gauge). There is **no read-time overlay endpoint**: the server never exposes the tombstone set to clients and never suppresses rows at delivery time. Backfill clients converge by folding the markers they receive inline (Section 4.5), not by downloading a separate suppression set.
 
-The one case folding-inline does not cover on its own is a **collection-filtered** backfill that needs DID-level markers (account-delete, `#sync`). Those markers carry an empty collection, so a naïve collection-filtered plan would never select their blocks, and a deleted account's records would survive forever in that consumer's fold — a silent loss. We close this in the segment index rather than with an overlay: when a block contains a DID-level marker, the seal/rewrite indexer tags it with a reserved sentinel collection (`$account`, `$identity`, `$sync` — see `segment/sentinel.go`). These names begin with `$`, which makes them invalid NSIDs, and the planner only admits real NSIDs / NSID-authority wildcard prefixes, so no client request can name or prefix-match a sentinel. The planner unconditionally admits a segment's sentinel ids under any collection filter, so marker blocks are always selected (the per-block DID bloom still narrows by DID). The markers then ride inline through `getBlock` in seq order, exactly as record-level deletes do, and a folding consumer converges with zero client-side special-casing.
+The one case folding-inline does not cover on its own is a **collection-filtered** backfill that needs DID-level markers (account-delete, `#sync`). Those markers carry an empty collection, so a naïve collection-filtered plan would never select their blocks, and a deleted account's records would survive forever in that consumer's fold — a silent loss. We close this in the segment index rather than with an overlay: when a block contains a DID-level marker, the seal/rewrite indexer tags it with a reserved sentinel collection (`$account`, `$identity`, `$sync` — see `segment/sentinel.go`). These names begin with `$`, which makes them invalid NSIDs, and the planner only admits real NSIDs / NSID-authority wildcard prefixes, so no client request can name or prefix-match a sentinel. With `kinds` omitted, the planner admits all three sentinel ids under a collection filter, preserving the marker-safe default; an explicit `kinds=commit` excludes them and selects only matching real collection ids. The per-block DID bloom still narrows either shape. Selected markers ride inline through `getBlock` in seq order, exactly as record-level deletes do.
 
 #### Historical snapshot planner endpoint (`network.bsky.jetstream.planSnapshot`)
 
-The server exposes sealed-archive transport planning as an XRPC procedure, `network.bsky.jetstream.planSnapshot`. It accepts exact DID filters, collection filters (exact NSIDs or `.*` namespace wildcards), and an optional seq window with `(afterSeq, beforeSeq]` semantics. Missing or empty DID/collection filters mean match all.
+The server exposes sealed-archive transport planning as an XRPC procedure, `network.bsky.jetstream.planSnapshot`. It accepts event kinds (`commit`, `identity`, `account`, `sync`), exact DID filters, collection filters (exact NSIDs or `.*` namespace wildcards), and an optional seq window with `(afterSeq, beforeSeq]` semantics. Missing or empty filters mean match all. Collections constrain commits only; `collections` with explicit `kinds` that excludes `commit` is rejected.
 
 The planner runs over manifest-resident sealed-segment metadata: segment seq bounds, block seq bounds, segment DID blooms, per-block DID blooms, and per-block collection summaries. It never opens segment files on the normal path. It returns an ordered list of whole segments or inclusive block ranges that may contain matching rows, plus two seq fields: `sealedTipSeq`, the sealed-archive tip (capped by `beforeSeq` when present), stable across pages of the same archive; and `plannedThroughSeq`, the continuation cursor — the highest sealed seq this page accounts for.
 
-The planner has a one-sided correctness contract: no false negatives, possible false positives. DID bloom filters may include blocks that do not contain the requested DID, and block-level collection summaries are still only transport hints. Clients must decode rows, apply exact DID/collection filtering, fold deletes/updates, and de-duplicate/idempotently process events.
+The planner has a one-sided correctness contract: no false negatives, possible false positives. It derives coarse kind candidates from existing footer collection ids (real ids are commits; `$account`/`$identity`/`$sync` are marker kinds), so it does not open segments or add another index. DID bloom filters, mixed-kind blocks, whole-segment mode, and block summaries may over-select. Clients must decode rows, apply the exact kind/DID/collection predicate, fold deletes/updates, and de-duplicate/idempotently process events.
 
-**Pagination.** Servers bound per-page cost with configurable limits: maximum distinct DIDs, maximum distinct collections, maximum response/work entries, and a whole-segment density threshold. When a plan would exceed the per-page entry limit, the server **truncates at a work-unit boundary** (a whole segment, or one coalesced block range) and reports `plannedThroughSeq` as the `MaxSeq` of the last included unit — never the enclosing segment's `MaxSeq` after a mid-segment cut, which would skip the un-included tail blocks. The server never silently truncates or refuses: there is no `PlanTooLarge`. At least one unit is always admitted per page, so a single oversized unit still makes progress (no zero-progress livelock). When a page is not truncated, `plannedThroughSeq == sealedTipSeq`.
+**Pagination.** Servers bound per-page cost with limits aligned to the live endpoint: at most 4 raw kind values, 10,000 raw DIDs, and 100 raw collection patterns by default, plus a configurable maximum response/work-entry count and whole-segment density threshold. When a plan would exceed the per-page entry limit, the server **truncates at a work-unit boundary** (a whole segment, or one coalesced block range) and reports `plannedThroughSeq` as the `MaxSeq` of the last included unit — never the enclosing segment's `MaxSeq` after a mid-segment cut, which would skip the un-included tail blocks. The server never silently truncates or refuses: there is no `PlanTooLarge`. At least one unit is always admitted per page, so a single oversized unit still makes progress (no zero-progress livelock). When a page is not truncated, `plannedThroughSeq == sealedTipSeq`.
 
 Putting it all together, the client's backfill→live loop looks like:
 
 1. The client calls `planSnapshot(afterSeq=cursor)` (page 1) to learn which sealed segments/blocks may satisfy its query (i.e. "give me all `standard.site` documents") and pins `S = sealedTipSeq` as the upper bound for the whole backfill.
-2. The client downloads the planned segments/blocks, decodes them, applies exact DID/collection filtering, and emits matching rows. DID-level markers (`#account`/`#identity`/`#sync`) ride inline via the sentinel index (Section 3.3), so a collection-filtered backfill receives the deletions it needs to fold.
+2. The client downloads the planned segments/blocks, decodes them, applies exact kind/DID/collection filtering, and emits matching rows. DID-level markers (`#account`/`#identity`/`#sync`) ride inline via the sentinel index unless explicitly excluded by `kinds`.
 3. The client advances `cursor = plannedThroughSeq` and, while `cursor < S`, calls `planSnapshot(afterSeq=cursor, beforeSeq=S)` again (pinning `beforeSeq = S` so the range never floats) and repeats step 2.
 4. Once `plannedThroughSeq >= S`, the sealed range is fully consumed. The client connects `/xrpc/network.bsky.jetstream.subscribeEvents` exactly once at `cursor = max(S, lastProcessedSeq)` to pick up the active segment and the live tail (the `max` keeps repeated backfill/cutover cycles monotonic — on the first cutover it is just `S`). Inclusive replay plus client-side seq dedup makes the seam at-least-once with no rewind margin; segments sealed during the backfill arrive via cold replay (the server re-reads the manifest at connect).
 5. The client delivers every row it receives — creates, updates, deletes, account-deletes, and syncs — applying no overlay and suppressing nothing; the consumer folds them idempotently (creates/updates apply; the markers remove).

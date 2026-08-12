@@ -4,20 +4,28 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Build a download plan for the desired data pattern. The plan lists whole segments or block ranges that might contain events for the requested DIDs and collections.",
+      "description": "Build a download plan for the desired data pattern. The plan lists whole segments or block ranges that might contain events for the requested kinds, DIDs, and collections.",
       "input": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
           "properties": {
+            "kinds": {
+              "type": "array",
+              "maxLength": 4,
+              "description": "Event kinds to include. Omit this field or pass an empty array to include all kinds.",
+              "items": { "type": "string", "enum": ["commit", "identity", "account", "sync"] }
+            },
             "dids": {
               "type": "array",
+              "maxLength": 10000,
               "description": "Only include data for these DIDs. Omit this field or pass an empty array to include all DIDs.",
               "items": { "type": "string", "format": "did" }
             },
             "collections": {
               "type": "array",
-              "description": "Only include data from these collections. Each value may be an exact NSID, such as app.bsky.feed.post, or a namespace wildcard, such as app.bsky.feed.*. Omit this field or pass an empty array to include all collections.",
+              "maxLength": 100,
+              "description": "Collection NSIDs or namespace wildcards such as app.bsky.feed.*; constrains commit events only. Non-commit kinds are unaffected, so combine with kinds=commit for a commits-only collection plan. Rejected when kinds is set and excludes commit. Omit or pass an empty array to include all collections.",
               "items": { "type": "string" }
             },
             "afterSeq": {

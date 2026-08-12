@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,8 +42,11 @@ type planSeg struct {
 
 // planReqWire is the decoded planSnapshot input the responder branches on.
 type planReqWire struct {
-	AfterSeq  int64 `json:"afterSeq"`
-	BeforeSeq int64 `json:"beforeSeq"`
+	Kinds       []string `json:"kinds"`
+	DIDs        []string `json:"dids"`
+	Collections []string `json:"collections"`
+	AfterSeq    int64    `json:"afterSeq"`
+	BeforeSeq   int64    `json:"beforeSeq"`
 }
 
 func newEngineHarness(t *testing.T) *engineHarness {
@@ -610,6 +614,51 @@ func TestEngineLiveOnly(t *testing.T) {
 		t.Fatal("live-only engine did not deliver within 5s")
 	}
 	require.Equal(t, []uint64{1, 2}, uniqueSeqs(events))
+}
+
+func TestEngineFilterContractAcrossArchiveAndLive(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		req  planRequest
+		want []uint64
+	}{
+		{
+			name: "collection default keeps markers",
+			req:  planRequest{Collections: []string{"app.bsky.feed.post"}},
+			want: []uint64{1, 2, 4, 5, 7, 8},
+		},
+		{
+			name: "explicit commit kind excludes markers",
+			req:  planRequest{Kinds: []Kind{KindCommit}, Collections: []string{"app.bsky.feed.post"}},
+			want: []uint64{1, 8},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newEngineHarness(t)
+			h.as.addSegment(t, segName(0), []segment.Event{
+				makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+				accountRow(t, 2, "did:plc:a"),
+				makeCreate(t, 3, "did:plc:a", "app.bsky.feed.like", "r3"),
+				identityRow(t, 4, "did:plc:a"),
+			})
+			h.planned = 4
+			h.planEntry = []planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 4}}
+			h.liveSteps = []readStep{
+				{data: liveAccountFrame(5, "did:plc:a", true, "")},
+				{data: liveCommitFrame(t, 6, "did:plc:a", "create", "app.bsky.feed.like", "r6", true)},
+				{data: liveIdentityFrame(7, "did:plc:a", "alice.test")},
+				{data: liveCommitFrame(t, 8, "did:plc:a", "create", "app.bsky.feed.post", "r8", true)},
+			}
+			h.installHandlers()
+			cfg := h.cfg()
+			cfg.Request = tc.req
+			events := h.runUntilSeq(t, cfg, 8)
+			require.Equal(t, tc.want, uniqueSeqs(events))
+		})
+	}
 }
 
 // TestEngineLiveOnlyAppliesCollectionFilter is a regression guard: in the
@@ -1327,6 +1376,9 @@ func TestEngineTooOldHandoffReBackfills(t *testing.T) {
 		2: planPageJSON([]planSeg{{name: segName(1), index: 1, minSeq: 3, maxSeq: 4}}, 4, 4),
 	}
 	h.planResponder = func(req planReqWire) string {
+		require.Equal(t, []string{"commit"}, req.Kinds, "every re-plan must preserve kinds")
+		require.Equal(t, []string{"did:plc:a"}, req.DIDs, "every re-plan must preserve DIDs")
+		require.Equal(t, []string{"app.bsky.feed.post"}, req.Collections, "every re-plan must preserve collections")
 		page, ok := pages[req.AfterSeq]
 		require.Truef(t, ok, "unexpected afterSeq %d", req.AfterSeq)
 		return page
@@ -1337,10 +1389,25 @@ func TestEngineTooOldHandoffReBackfills(t *testing.T) {
 		{data: liveCommitFrame(t, 5, "did:plc:a", "create", "app.bsky.feed.post", "r5", true)},
 		{data: liveCommitFrame(t, 6, "did:plc:a", "create", "app.bsky.feed.post", "r6", true)},
 	}}
-	dial, dials := rebackfillDialer(1, conn) // first connect 400s, second succeeds
+	baseDial, dials := rebackfillDialer(1, conn) // first connect 400s, second succeeds
+	var (
+		urlMu    sync.Mutex
+		liveURLs []string
+	)
+	dial := func(ctx context.Context, rawURL string) (wsConn, error) {
+		urlMu.Lock()
+		liveURLs = append(liveURLs, rawURL)
+		urlMu.Unlock()
+		return baseDial(ctx, rawURL)
+	}
 	h.installHandlers()
 
 	cfg := h.cfg()
+	cfg.Request = planRequest{
+		Kinds:       []Kind{KindCommit},
+		DIDs:        []string{"did:plc:a"},
+		Collections: []string{"app.bsky.feed.post"},
+	}
 	cfg.Dial = dial
 
 	events := h.runUntilSeq(t, cfg, 6)
@@ -1348,6 +1415,16 @@ func TestEngineTooOldHandoffReBackfills(t *testing.T) {
 	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, seqs(events),
 		"re-backfill must download the handoff-sealed segment and converge, no skip/dup")
 	require.GreaterOrEqual(t, dials.Load(), int64(2), "must have re-dialed after the too-old 400")
+	urlMu.Lock()
+	defer urlMu.Unlock()
+	require.GreaterOrEqual(t, len(liveURLs), 2)
+	for _, rawURL := range liveURLs {
+		u, err := url.Parse(rawURL)
+		require.NoError(t, err)
+		require.Equal(t, []string{"commit"}, u.Query()["kinds"], "every live reconnect must preserve kinds")
+		require.Equal(t, []string{"did:plc:a"}, u.Query()["dids"], "every live reconnect must preserve DIDs")
+		require.Equal(t, []string{"app.bsky.feed.post"}, u.Query()["collections"], "every live reconnect must preserve collections")
+	}
 }
 
 // TestEngineReBackfillDropsAlreadyDeliveredStraddlingRows pins the §14 seam
@@ -1838,4 +1915,38 @@ func TestEngineLiveOnlyCursorTooOldIsFatal(t *testing.T) {
 		"a too-old saved cursor on the pure-live path must be surfaced as fatal, not ended silently")
 	require.ErrorIs(t, gotErr, errLiveCursorTooOld, "the fatal error must wrap the too-old cause")
 	require.Zero(t, batches, "no events should be delivered on a doomed-cursor live tail")
+}
+
+func TestEngineCutoverInvalidRequestIsFatal(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	h.installHandlers()
+	cfg := h.cfg()
+	var dials atomic.Int64
+	cfg.Dial = func(context.Context, string) (wsConn, error) {
+		dials.Add(1)
+		return nil, errLiveInvalidRequest
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var gotErr error
+	eng := newReplayEngine(cfg)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		eng.Run(ctx, func([]Event) bool { return true }, func(err error) bool {
+			gotErr = err
+			return true
+		})
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("cutover invalid request did not terminate")
+	}
+	require.ErrorIs(t, gotErr, ErrFatal)
+	require.ErrorIs(t, gotErr, errLiveInvalidRequest)
+	require.Equal(t, int64(1), dials.Load(), "permanent cutover rejection must not reconnect or re-backfill")
+	require.Equal(t, int64(1), h.planCalls.Load(), "permanent cutover rejection must not re-plan")
 }

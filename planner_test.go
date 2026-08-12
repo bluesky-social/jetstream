@@ -117,6 +117,7 @@ func TestPlanInputMapping(t *testing.T) {
 	ps := newPlanServer(t, http.StatusOK, resp)
 
 	_, err := ps.planner().archivePlan(context.Background(), planRequest{
+		Kinds:        []Kind{KindCommit, KindAccount},
 		DIDs:         []string{"did:plc:abc", "did:plc:def"},
 		Collections:  []string{"app.bsky.feed.post", "app.bsky.feed.*"},
 		AfterSeq:     42,
@@ -126,6 +127,7 @@ func TestPlanInputMapping(t *testing.T) {
 	require.NoError(t, err)
 
 	in := ps.decodeInput(t)
+	require.ElementsMatch(t, []any{"commit", "account"}, in["kinds"])
 	require.ElementsMatch(t, []any{"did:plc:abc", "did:plc:def"}, in["dids"])
 	require.ElementsMatch(t, []any{"app.bsky.feed.post", "app.bsky.feed.*"}, in["collections"])
 	require.EqualValues(t, 42, in["afterSeq"])
@@ -179,10 +181,12 @@ func TestPlanInputOmitsEmptyFilters(t *testing.T) {
 	in := ps.decodeInput(t)
 	_, hasDIDs := in["dids"]
 	_, hasColls := in["collections"]
+	_, hasKinds := in["kinds"]
 	_, hasAfter := in["afterSeq"]
 	_, hasBefore := in["beforeSeq"]
 	require.False(t, hasDIDs, "empty dids must be omitted")
 	require.False(t, hasColls, "empty collections must be omitted")
+	require.False(t, hasKinds, "empty kinds must be omitted")
 	require.False(t, hasAfter, "afterSeq=0 must be omitted")
 	require.False(t, hasBefore, "unset beforeSeq must be omitted")
 }
