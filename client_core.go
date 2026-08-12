@@ -48,13 +48,16 @@ type engineConfig struct {
 	// library default (8). 1 = one resumable stream (see segmentfetch.go for
 	// when that is preferable).
 	SegmentStripes int
-	// XRPC drives the short XRPC negotiation calls (planSnapshot).
-	// BulkXRPC drives the large getSegment/getBlock downloads;
-	// it gets bulk-transfer HTTP tuning (no short wall-clock timeout). When
-	// BulkXRPC is nil the engine reuses XRPC. See design note §5.1.
-	XRPC     *xrpc.Client
-	BulkXRPC *xrpc.Client
-	Dial     dialFunc // optional; nil uses the production websocket dialer
+	// XRPC drives the short archive negotiation calls (planSnapshot).
+	// BulkXRPC drives the large getSegment/getBlock downloads; it gets
+	// bulk-transfer HTTP tuning (no short wall-clock timeout). When BulkXRPC is
+	// nil the engine reuses XRPC. PublicXRPC drives unauthenticated public calls
+	// such as getZstdDictionary; when nil it falls back to XRPC for compatibility
+	// with internal callers that do not split access roles. See design note §5.1.
+	XRPC       *xrpc.Client
+	BulkXRPC   *xrpc.Client
+	PublicXRPC *xrpc.Client
+	Dial       dialFunc // optional; nil uses the production websocket dialer
 	// LiveHTTPClient, when non-nil, is the *http.Client the live-tail
 	// websocket dial uses for its HTTP/1.1 upgrade. nil uses the default
 	// dialer. Lets a caller route the live tail through a custom transport
@@ -105,6 +108,15 @@ func (c engineConfig) recordMode() recordDecodeMode {
 func (c engineConfig) bulkClient() *xrpc.Client {
 	if c.BulkXRPC != nil {
 		return c.BulkXRPC
+	}
+	return c.XRPC
+}
+
+// publicClient returns the auth-free client for public resources, falling back
+// to the negotiation client for existing internal callers and tests.
+func (c engineConfig) publicClient() *xrpc.Client {
+	if c.PublicXRPC != nil {
+		return c.PublicXRPC
 	}
 	return c.XRPC
 }
@@ -754,7 +766,7 @@ func (e *replayEngine) fetchZstdDict(ctx context.Context) []byte {
 	if !e.cfg.ZstdCompression {
 		return nil
 	}
-	dict, err := jetstream.JetstreamGetZstdDictionary(ctx, e.cfg.XRPC, 0)
+	dict, err := jetstream.JetstreamGetZstdDictionary(ctx, e.cfg.publicClient(), 0)
 	if err != nil {
 		e.logger.Warn("getZstdDictionary failed; live tail will be uncompressed", "err", err)
 		return nil

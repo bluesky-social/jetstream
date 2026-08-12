@@ -4,16 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
+	"github.com/jcalabro/atmos/cbor"
 )
 
 // syncBuffer is a concurrency-safe bytes.Buffer for capturing CLI output while
@@ -199,5 +205,205 @@ func TestSubscribePrintsEvents(t *testing.T) {
 	}
 	if ev.Cursor != 1 || ev.Kind != "commit" || ev.Commit.Rkey != "r1" {
 		t.Fatalf("unexpected first event: %+v", ev)
+	}
+}
+
+func protectedBackfillServer(t *testing.T, token string) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	dir := t.TempDir()
+	name := "seg_0000000000.jss"
+	path := filepath.Join(dir, name)
+	writer, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := cbor.Marshal(map[string]any{"$type": "app.bsky.feed.post", "text": "from archive"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = writer.Append(segment.Event{
+		Seq: 1, WitnessedAt: 1_730_000_000_000_000, Kind: segment.KindCreate,
+		DID: "did:plc:cli", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "rev1", Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = writer.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/xrpc/network.bsky.jetstream.planSnapshot":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"plannedThroughSeq":1,"sealedTipSeq":1,"segments":[{"name":%q,"index":0,"checksum":"deadbeefdeadbeef","minSeq":1,"maxSeq":1,"mode":"segment"}],"stats":{"segmentsExamined":1,"segmentsMatched":1,"blocksMatched":0,"entries":1}}`, name)
+		case "/xrpc/network.bsky.jetstream.getSegment":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("ETag", `"cli-segment"`)
+			http.ServeContent(w, r, name, time.Unix(1_730_000_000, 0), bytes.NewReader(raw))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &requests
+}
+
+// Not parallel: the environment-source subtest mutates process state.
+//
+//nolint:paralleltest // JETSTREAM_CLIENT_API_TOKEN is process-global
+func TestSubscribeAPITokenSources(t *testing.T) {
+	const token = "cli-opaque-token"
+	old, hadOld := os.LookupEnv("JETSTREAM_CLIENT_API_TOKEN")
+	t.Cleanup(func() {
+		if hadOld {
+			_ = os.Setenv("JETSTREAM_CLIENT_API_TOKEN", old)
+		} else {
+			_ = os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN")
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		useEnv bool
+	}{
+		{name: "flag", args: []string{"--api-token", token}},
+		{name: "environment", useEnv: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.useEnv {
+				if err := os.Setenv("JETSTREAM_CLIENT_API_TOKEN", token); err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN") }()
+			} else if err := os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN"); err != nil {
+				t.Fatal(err)
+			}
+			srv, requests := protectedBackfillServer(t, token)
+			out := &syncBuffer{}
+			app := newApp()
+			app.Writer = out
+			args := []string{"jetstream-client", "--host", srv.URL, "--after-seq", "0", "--backfill-only", "--segment-stripes", "1", "--print"}
+			args = append(args, tc.args...)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := app.Run(ctx, args); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if requests.Load() < 2 {
+				t.Fatalf("expected protected plan and segment requests, got %d", requests.Load())
+			}
+			if !strings.Contains(out.String(), `"cursor":1`) {
+				t.Fatalf("expected archived event output, got %q", out.String())
+			}
+			if strings.Contains(out.String(), token) {
+				t.Fatal("CLI output disclosed API token")
+			}
+		})
+	}
+}
+
+// Not parallel: the environment subtest mutates process state.
+//
+//nolint:paralleltest // JETSTREAM_CLIENT_API_TOKEN is process-global
+func TestSubscribeRejectsInvalidAPITokenWithoutDisclosure(t *testing.T) {
+	old, hadOld := os.LookupEnv("JETSTREAM_CLIENT_API_TOKEN")
+	t.Cleanup(func() {
+		if hadOld {
+			_ = os.Setenv("JETSTREAM_CLIENT_API_TOKEN", old)
+		} else {
+			_ = os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN")
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  bool
+	}{
+		{name: "explicit empty flag", args: []string{"--api-token", ""}},
+		{name: "present empty environment", env: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env {
+				if err := os.Setenv("JETSTREAM_CLIENT_API_TOKEN", ""); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN"); err != nil {
+				t.Fatal(err)
+			}
+			var requests atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+			t.Cleanup(srv.Close)
+			out := &syncBuffer{}
+			app := newApp()
+			app.Writer = out
+			args := []string{"jetstream-client", "--host", srv.URL, "--after-seq", "0", "--backfill-only"}
+			args = append(args, tc.args...)
+			err := app.Run(context.Background(), args)
+			if err == nil || !strings.Contains(err.Error(), "API token cannot be empty") {
+				t.Fatalf("expected empty-token validation error, got %v", err)
+			}
+			if requests.Load() != 0 {
+				t.Fatalf("empty token must fail before network I/O; requests=%d", requests.Load())
+			}
+			if strings.Contains(err.Error()+out.String(), "Bearer ") {
+				t.Fatal("validation output disclosed credential material")
+			}
+		})
+	}
+
+	t.Run("nonempty token omitted from terminal error", func(t *testing.T) {
+		const token = "distinctive-cli-error-secret"
+		if err := os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN"); err != nil {
+			t.Fatal(err)
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+token {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"InternalError","message":"archive unavailable"}`)
+		}))
+		t.Cleanup(srv.Close)
+		out := &syncBuffer{}
+		app := newApp()
+		app.Writer = out
+		err := app.Run(context.Background(), []string{"jetstream-client", "--host", srv.URL, "--after-seq", "0", "--backfill-only", "--api-token", token, "--print"})
+		if err == nil {
+			t.Fatal("expected terminal archive error")
+		}
+		if strings.Contains(err.Error()+out.String(), token) {
+			t.Fatal("terminal error or output disclosed API token")
+		}
+	})
+}
+
+func TestSubscribeAPITokenHelp(t *testing.T) {
+	t.Parallel()
+	out := &syncBuffer{}
+	app := newApp()
+	app.Writer = out
+	if err := app.Run(context.Background(), []string{"jetstream-client", "--help"}); err != nil {
+		t.Fatalf("help: %v", err)
+	}
+	help := out.String()
+	for _, want := range []string{"--api-token", "JETSTREAM_CLIENT_API_TOKEN", "Raw token", "no Bearer prefix", "archive authentication", "process-visible", "Prefer JETSTREAM_CLIENT_API_TOKEN"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
 	}
 }

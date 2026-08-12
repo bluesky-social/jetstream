@@ -13,6 +13,23 @@ import (
 
 // newEngine resolves the transport dependencies and builds the replay engine.
 func newEngine(host string, cfg config) engine {
+	negotiationXRPC := newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second))
+	bulkXRPC := newXRPCClient(host, cfg, xrpc.BulkDownloadOpts())
+	if cfg.hasAPIToken {
+		// AccessJwt is atmos's opaque bearer-header transport seam. API tokens
+		// are not parsed as JWTs and have no refresh/session semantics.
+		negotiationXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiToken})
+		bulkXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiToken})
+	}
+	// Public dictionary fetches share the negotiation transport and retry policy
+	// without sharing its bearer-auth state.
+	publicXRPC := &xrpc.Client{
+		Host:       negotiationXRPC.Host,
+		HTTPClient: negotiationXRPC.HTTPClient,
+		UserAgent:  negotiationXRPC.UserAgent,
+		Retry:      negotiationXRPC.Retry,
+	}
+
 	ec := engineConfig{
 		Host: host,
 		Request: planRequest{
@@ -29,8 +46,9 @@ func newEngine(host string, cfg config) engine {
 		BatchSize:      cfg.batchSize,
 		Concurrency:    cfg.downloadConc,
 		SegmentStripes: cfg.segmentStripes,
-		XRPC:           newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second)),
-		BulkXRPC:       newXRPCClient(host, cfg, xrpc.BulkDownloadOpts()),
+		XRPC:           negotiationXRPC,
+		BulkXRPC:       bulkXRPC,
+		PublicXRPC:     publicXRPC,
 		// Route the live-tail websocket upgrade through the caller's HTTP
 		// client too (WithHTTPClient), so an in-process transport reaches the
 		// live cutover, not just the unary XRPC downloads.
