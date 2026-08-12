@@ -127,7 +127,7 @@ the matched *sealed* range, no cutover — rows still in the active
 ## Phase 3: cutover to live
 
 After the sweep consumes the sealed archive (through pinned tip `S`), the
-engine cuts over (`runBackfillThenLive`, engine.go): connect the live
+engine cuts over (`runBackfillThenLive`, client_core.go): connect the live
 websocket once with `?cursor=max(S, lastProcessedSeq)`.
 
 - The cursor is the **dedup floor**: the server replays inclusively
@@ -174,7 +174,7 @@ typed `errLiveCursorTooOld` — **terminal for the connection, not the
 stream**:
 the engine re-enters the backfill loop from the last durably-processed seq,
 sweeps the now-sealed gap, and cuts over again. Cycles are bounded by
-`maxRebackfillStalls = 5` *non-advancing* cycles (engine.go:24); a resume
+`maxRebackfillStalls = 5` *non-advancing* cycles (client_core.go); a resume
 cursor that fails to advance is a pathological loop and surfaces as
 `ErrFatal`. On a **pure-live** stream (no backfill configured) too-old is
 immediately fatal — there is no archive loop to re-enter. Two subtleties
@@ -235,8 +235,9 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
 - `Subscribe(host, opts...)` → `*Client`; `Client.Events(ctx)` is an
   `iter.Seq2[*Batch, error]` range-over-func iterator. Recoverable errors
   are yielded with iteration continuing; terminal failures satisfy
-  `errors.Is(err, ErrFatal)` and end the stream. Not safe for concurrent
-  `Events` calls on one client.
+  `errors.Is(err, ErrFatal)` and end the stream. A second concurrent
+  `Events` call on the same client is rejected deterministically with an
+  `ErrFatal` "already running" error.
 - `Batch.Events()` + `Batch.LastCursor()` — batches amortize cursor
   persistence: process the batch, persist `LastCursor` once (default batch
   size 64, `WithBatchSize`; live partial batches flush on

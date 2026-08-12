@@ -48,6 +48,44 @@ func TestTypedEventsFastPathRespectsBatchSize(t *testing.T) {
 	require.Equal(t, []uint64{1, 2, 3, 4, 5}, seqs)
 }
 
+// TestTypedEventsFastPathBatchAppendSafe mirrors the untyped
+// TestEngineRunBatchAppendDoesNotCorruptLaterBatches guard for the typed
+// transform: a block's TypedBatches are views over one shared slab, so a
+// consumer appending to Events() during its iteration must reallocate rather
+// than overwrite the next, not-yet-yielded batch.
+func TestTypedEventsFastPathBatchAppendSafe(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	const collection = "app.bsky.feed.like"
+	var rows []segment.Event
+	for seq := uint64(1); seq <= 5; seq++ {
+		rows = append(rows, makeCreateWithPayload(seq, "did:plc:a", collection, "r"+itoaU(seq),
+			likeCBOR(t, "at://did:plc:x/app.bsky.feed.post/p"+itoaU(seq), "bafy"+itoaU(seq))))
+	}
+	h.as.addSegmentWithBlockSize(t, "seg_0000000000.jss", rows, 10)
+	h.planned = 5
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 5}}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	cfg.BatchSize = 1
+	cfg.RawRecords = true
+	cfg.Request.Collections = []string{collection}
+	c := &Client{engine: newReplayEngine(cfg)}
+
+	var seqs []uint64
+	for batch, err := range TypedEvents[bsky.FeedLike](context.Background(), c, collection) {
+		require.NoError(t, err)
+		for _, event := range batch.Events() {
+			seqs = append(seqs, event.Event.Seq)
+		}
+		_ = append(batch.Events(), TypedEvent[bsky.FeedLike]{})
+	}
+	require.Equal(t, []uint64{1, 2, 3, 4, 5}, seqs,
+		"a consumer append must never overwrite a later typed batch's events")
+}
+
 // scriptEngine is a fake engine that yields a fixed sequence of batches (then
 // ends), for exercising the public typed/iterator layer without a real server.
 type scriptEngine struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1091,6 +1092,77 @@ func TestEngineStatsDoesNotCompleteStoppedPage(t *testing.T) {
 	require.Equal(t, 1, batches)
 	require.Equal(t, Stats{SealedTip: 6, PlannedThrough: 0, ResidualGap: 6}, eng.stats(),
 		"a partially delivered page must not advance Pages or PlannedThrough")
+}
+
+// TestEngineRunBatchAppendDoesNotCorruptLaterBatches guards the fast-path
+// chunking's three-index slices: a block's batches are views over one shared
+// slab, and Events() hands the slice to the consumer ("owned by the caller for
+// the lifetime of the loop iteration"), so an append during that iteration must
+// reallocate rather than overwrite the first event of the next, not-yet-yielded
+// batch.
+func TestEngineRunBatchAppendDoesNotCorruptLaterBatches(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	var sealed []segment.Event
+	for seq := uint64(1); seq <= 6; seq++ {
+		sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+	}
+	// One block holding all six events, so BatchSize=1 splits it into six
+	// slab-sharing batch views.
+	h.as.addSegmentWithBlockSize(t, "seg_0000000000.jss", sealed, 10)
+	h.planned = 6
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 6}}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	cfg.BatchSize = 1
+	eng := newReplayEngine(cfg)
+	var seqs []uint64
+	eng.run(context.Background(), func(batch *Batch, err error) bool {
+		require.NoError(t, err)
+		for _, ev := range batch.Events() {
+			seqs = append(seqs, ev.Seq)
+		}
+		// The consumer owns the slice for this iteration; appending must not
+		// clobber events in batches not yet delivered.
+		_ = append(batch.Events(), Event{})
+		return true
+	})
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, seqs,
+		"a consumer append must never overwrite a later batch's events")
+}
+
+// TestEngineRunHugeBatchSizeDeliversAllEvents guards the fast-path chunk-count
+// ceiling division against int overflow: WithBatchSize accepts any positive
+// int, and a naive (len+size-1)/size wraps negative for size near MaxInt,
+// panicking make on the decode worker — recovered into a dropped block, i.e.
+// silent data loss. All events must arrive in one batch instead.
+func TestEngineRunHugeBatchSizeDeliversAllEvents(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	var sealed []segment.Event
+	for seq := uint64(1); seq <= 6; seq++ {
+		sealed = append(sealed, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+itoaU(seq)))
+	}
+	h.as.addSegmentWithBlockSize(t, "seg_0000000000.jss", sealed, 10)
+	h.planned = 6
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 6}}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	cfg.BatchSize = math.MaxInt
+	eng := newReplayEngine(cfg)
+	var seqs []uint64
+	eng.run(context.Background(), func(batch *Batch, err error) bool {
+		require.NoError(t, err, "a huge batch size must not surface a decode-worker panic")
+		for _, ev := range batch.Events() {
+			seqs = append(seqs, ev.Seq)
+		}
+		return true
+	})
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6}, seqs)
 }
 
 func uniqueSeqs(events []Event) []uint64 {

@@ -131,10 +131,16 @@ func (e *replayEngine) run(ctx context.Context, yield func(*Batch, error) bool) 
 			// block-aligned: the final chunk of a block may be smaller than
 			// BatchSize (see Batch / WithBatchSize docs). LastCursor stays correct
 			// (max seq within each chunk).
-			batches := make([]*Batch, 0, (len(evs)+size-1)/size)
+			// Ceiling division written overflow-safe: len(evs) >= 1 here, and
+			// (len(evs)+size-1) would wrap negative for a huge WithBatchSize,
+			// panicking make (recovered into a dropped block).
+			batches := make([]*Batch, 0, 1+(len(evs)-1)/size)
 			for i := 0; i < len(evs); i += size {
 				end := min(i+size, len(evs))
-				batches = append(batches, &Batch{events: evs[i:end]})
+				// Three-index slice: batches share the block's backing array, and
+				// Events() hands the slice to the consumer, so cap must not extend
+				// into the next batch's events (an append would overwrite them).
+				batches = append(batches, &Batch{events: evs[i:end:end]})
 			}
 			return batches
 		},

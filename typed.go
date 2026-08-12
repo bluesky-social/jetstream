@@ -158,10 +158,16 @@ func typedRun[T any, PT interface {
 			// chunk independently would allocate two slabs per chunk (commonly 64
 			// times per block), which is visible in GC and throughput at archive scale.
 			block := assembleTyped[T, PT](evs, collection)
-			batches := make([]TypedBatch[T], 0, (len(evs)+size-1)/size)
+			// Ceiling division written overflow-safe: len(evs) >= 1 here, and
+			// (len(evs)+size-1) would wrap negative for a huge WithBatchSize,
+			// panicking make (recovered into a dropped block).
+			batches := make([]TypedBatch[T], 0, 1+(len(evs)-1)/size)
 			for i := 0; i < len(block.events); i += size {
-				end := min(i+size, len(evs))
-				batches = append(batches, TypedBatch[T]{events: block.events[i:end]})
+				end := min(i+size, len(block.events))
+				// Three-index slice: chunks share the block slab and Events() hands
+				// the slice to the consumer, so cap must not extend into the next
+				// batch's events (an append would overwrite them).
+				batches = append(batches, TypedBatch[T]{events: block.events[i:end:end]})
 			}
 			return batches
 		},
