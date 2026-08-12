@@ -81,6 +81,10 @@ func loadtestCommand() *cli.Command {
 				Usage: "Optional cursor query parameter",
 			},
 			&cli.StringSliceFlag{
+				Name:  "kind",
+				Usage: "V2 event kind filter (commit, identity, account, or sync); may be repeated",
+			},
+			&cli.StringSliceFlag{
 				Name:  "wanted-collection",
 				Usage: "Collection filter to add as wantedCollections; may be repeated",
 			},
@@ -114,6 +118,7 @@ func loadtestCommand() *cli.Command {
 				compression:       cmd.Bool("compression"),
 				zstd:              cmd.Bool("zstd"),
 				cursor:            cmd.String("cursor"),
+				kinds:             cmd.StringSlice("kind"),
 				wantedCollections: cmd.StringSlice("wanted-collection"),
 				wantedDIDs:        cmd.StringSlice("wanted-did"),
 				maxMessageSize:    cmd.Int("max-message-size"),
@@ -168,6 +173,7 @@ type config struct {
 	zstdDictID        uint32
 	zstdDict          []byte
 	cursor            string
+	kinds             []string
 	wantedCollections []string
 	wantedDIDs        []string
 	maxMessageSize    int
@@ -262,6 +268,9 @@ func subscribeURL(c config) (string, error) {
 	if u.Path == "" || u.Path == "/" {
 		u.Path = "/subscribe"
 	}
+	if len(c.kinds) > 0 && !isV2Path(u.Path) {
+		return "", fmt.Errorf("--kind requires a /xrpc/network.bsky.jetstream.subscribeEvents URL; v1 /subscribe has no kind filter")
+	}
 
 	q := u.Query()
 	if c.zstd {
@@ -286,6 +295,11 @@ func subscribeURL(c config) (string, error) {
 	colParam, didParam := "wantedCollections", "wantedDids"
 	if isV2Path(u.Path) {
 		colParam, didParam = "collections", "dids"
+		for _, kind := range c.kinds {
+			if kind != "" {
+				q.Add("kinds", kind)
+			}
+		}
 	}
 	for _, v := range c.wantedCollections {
 		if v != "" {

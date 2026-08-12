@@ -31,6 +31,10 @@ func subscribeCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_CLIENT_API_TOKEN"),
 			},
 			&cli.StringSliceFlag{
+				Name:  "kind",
+				Usage: "Event kind filter (commit, identity, account, or sync); may be repeated",
+			},
+			&cli.StringSliceFlag{
 				Name:  "collection",
 				Usage: "Collection filter (exact NSID or 'ns.*' wildcard); may be repeated",
 			},
@@ -149,6 +153,13 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 	}
 	if ss := cmd.Int("segment-stripes"); ss > 0 {
 		opts = append(opts, jetstream.WithSegmentStripes(ss))
+	}
+	if raw := cmd.StringSlice("kind"); len(raw) > 0 {
+		kinds := make([]jetstream.Kind, len(raw))
+		for i, kind := range raw {
+			kinds[i] = jetstream.Kind(kind)
+		}
+		opts = append(opts, jetstream.WithKinds(kinds))
 	}
 	if c := cmd.StringSlice("collection"); len(c) > 0 {
 		opts = append(opts, jetstream.WithCollections(c))

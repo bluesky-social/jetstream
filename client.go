@@ -12,17 +12,10 @@ import (
 	"sync"
 	"sync/atomic"
 
-	iclient "github.com/bluesky-social/jetstream/internal/client"
+	"github.com/jcalabro/atmos"
 )
 
-// ErrFatal marks a terminal error yielded by Events: the stream has aborted and
-// will deliver no further events (e.g. the snapshot plan was rejected or a
-// cutover guarantee could not be met). Test for it with errors.Is(err,
-// ErrFatal). Errors that are NOT ErrFatal are recoverable — a single bad
-// segment or a transient live-tail read — and iteration continues past them.
-var ErrFatal = iclient.ErrFatal
-
-// Client is a Jetstream v2 consumer. Construct one with Subscribe. A Client
+// Client is a Jetstream replay consumer. Construct one with Subscribe. A Client
 // drives at most one Events iteration at a time; create separate Clients for
 // concurrent streams. Close releases its resources and is safe to call
 // concurrently with a running Events (the natural way to stop a live tail) and
@@ -31,9 +24,6 @@ type Client struct {
 	host   string // normalized base URL, e.g. "https://host"
 	engine engine
 
-	// closed reports whether Close has been called. atomic so a concurrent
-	// Close can interrupt a running Events without a data race; closeOnce
-	// makes Close idempotent and engine.close() run exactly once.
 	closed    atomic.Bool
 	closeOnce sync.Once
 	closeErr  error
@@ -41,7 +31,7 @@ type Client struct {
 
 // Batch is a group of events delivered together by the Events iterator. It
 // amortizes per-event overhead (notably cursor persistence): handle the whole
-// batch, then save LastCursor once.
+// batch, then save LastCursor to your database of choice once.
 type Batch struct {
 	events []Event
 }
@@ -63,16 +53,15 @@ func (b *Batch) LastCursor() uint64 {
 	return max
 }
 
-// Stats is a point-in-time snapshot of backfill-loop progress, returned by
+// Stats is a point-in-time snapshot of replay-loop progress, returned by
 // Client.Stats. The Jetstream client library has no metrics registry, so this
-// accessor is how a caller observes how far a backfill has progressed and the
+// accessor is how a caller observes how far a replay has progressed and the
 // residual gap a sustained-ingest stream is still closing before cutover.
 type Stats struct {
-	// Pages is the number of planSnapshot pages downloaded across all sweeps
-	// (including §14 re-backfill cycles). Monotonically non-decreasing.
+	// Pages is the number of planSnapshot pages downloaded across the replay thus far.
 	Pages uint64
-	// SealedTip is the most recently learned sealed-archive tip S — the pinned
-	// pagination goal of the current sweep.
+	// SealedTip is the most recently learned sealed-archive (the pinned
+	// pagination goal of the current sweep).
 	SealedTip uint64
 	// PlannedThrough is the continuation cursor reached so far: the highest
 	// sealed seq accounted for. Equals SealedTip once a sweep completes.
@@ -123,12 +112,7 @@ func Subscribe(host string, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
-	eng, err := newEngine(base, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Client{host: base, engine: eng}, nil
+	return &Client{host: base, engine: newEngine(base, cfg)}, nil
 }
 
 // Format renders a bounded public summary without recursively formatting the
@@ -200,10 +184,8 @@ func (c *Client) Close() error {
 // API misuse from surfacing as a nil-pointer panic during cleanup or iteration.
 var errClientNotInitialized = fmt.Errorf("jetstream: client not initialized (use Subscribe)")
 
-// engine is the internal seam between the public Client and the orchestration
-// implementation (planning, paginated download, cutover, live tail). The
-// concrete engine is wired in subsequent work; this interface keeps the public
-// surface stable while that lands.
+// engine is the narrow seam between the public iterator and the replay
+// implementation. Tests substitute small scripted engines through it.
 type engine interface {
 	// run drives the stream, invoking yield for each batch or recoverable
 	// error. It returns when ctx is done, the stream ends, or yield returns
@@ -280,6 +262,9 @@ func validateConfig(c *config) error {
 	if c.hasAPIToken && c.apiToken == "" {
 		return fmt.Errorf("jetstream: API token cannot be empty")
 	}
+	if err := canonicalizeFilters(c); err != nil {
+		return err
+	}
 	if c.hasAfterSeq && c.hasBeforeSeq && c.beforeSeq <= c.afterSeq {
 		return fmt.Errorf("jetstream: beforeSeq (%d) must be greater than afterSeq (%d)", c.beforeSeq, c.afterSeq)
 	}
@@ -296,5 +281,82 @@ func validateConfig(c *config) error {
 	if c.hasBeforeSeq && !c.backfillOnly {
 		return fmt.Errorf("jetstream: WithBeforeSeq requires WithBackfillOnly (a beforeSeq is a bounded-archive-dump upper bound; on a backfill-then-live subscription it would silently drop every live event past beforeSeq)")
 	}
+	return nil
+}
+
+const (
+	maxClientKinds       = 4
+	maxClientDIDs        = 10000
+	maxClientCollections = 100
+)
+
+func canonicalizeFilters(c *config) error {
+	kinds := make([]Kind, 0, len(c.kinds))
+	seenKinds := make(map[Kind]struct{}, min(len(c.kinds), maxClientKinds))
+	for _, kind := range c.kinds {
+		switch kind {
+		case KindCommit, KindIdentity, KindAccount, KindSync:
+		default:
+			return fmt.Errorf("jetstream: invalid kind %q", kind)
+		}
+		if _, ok := seenKinds[kind]; ok {
+			continue
+		}
+		seenKinds[kind] = struct{}{}
+		kinds = append(kinds, kind)
+	}
+	if len(kinds) > maxClientKinds {
+		return fmt.Errorf("jetstream: too many kinds: %d > %d", len(kinds), maxClientKinds)
+	}
+
+	dids := make([]string, 0, min(len(c.dids), maxClientDIDs))
+	seenDIDs := make(map[string]struct{}, min(len(c.dids), maxClientDIDs))
+	for _, raw := range c.dids {
+		if _, ok := seenDIDs[raw]; ok {
+			continue
+		}
+		did, err := atmos.ParseDID(raw)
+		if err != nil {
+			return fmt.Errorf("jetstream: invalid DID %q: %w", raw, err)
+		}
+		seenDIDs[raw] = struct{}{}
+		dids = append(dids, string(did))
+		if len(dids) > maxClientDIDs {
+			return fmt.Errorf("jetstream: too many DIDs: %d > %d", len(dids), maxClientDIDs)
+		}
+	}
+
+	collections := make([]string, 0, min(len(c.collections), maxClientCollections))
+	seenCollections := make(map[string]struct{}, min(len(c.collections), maxClientCollections))
+	for _, raw := range c.collections {
+		if _, ok := seenCollections[raw]; ok {
+			continue
+		}
+		if head, ok := strings.CutSuffix(raw, ".*"); ok {
+			if _, err := atmos.ParseNSID(head + ".x"); err != nil {
+				return fmt.Errorf("jetstream: invalid collection wildcard %q: %w", raw, err)
+			}
+		} else if _, err := atmos.ParseNSID(raw); err != nil {
+			return fmt.Errorf("jetstream: invalid collection %q: %w", raw, err)
+		}
+		seenCollections[raw] = struct{}{}
+		collections = append(collections, raw)
+		if len(collections) > maxClientCollections {
+			return fmt.Errorf("jetstream: too many collections: %d > %d", len(collections), maxClientCollections)
+		}
+	}
+
+	if len(collections) > 0 && len(kinds) > 0 {
+		hasCommit := false
+		for _, kind := range kinds {
+			hasCommit = hasCommit || kind == KindCommit
+		}
+		if !hasCommit {
+			return fmt.Errorf("jetstream: collections filter can never apply: kinds excludes commit")
+		}
+	}
+	c.kinds = kinds
+	c.dids = dids
+	c.collections = collections
 	return nil
 }

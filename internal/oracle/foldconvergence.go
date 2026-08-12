@@ -99,7 +99,7 @@ func restrictByCollection(live map[RecordKey]uint64, collections []string) map[R
 // collectionSelected reports whether collection matches any filter entry. An
 // entry ending in ".*" is a namespace wildcard ("app.bsky.feed.*" matches
 // "app.bsky.feed."-prefixed NSIDs); otherwise it is an exact match. This mirrors
-// the client Matcher's collection semantics (internal/client/filter.go) so the
+// the client matcher's collection semantics (root filter.go) so the
 // oracle restriction lines up exactly with what the client delivers.
 func collectionSelected(collection string, collections []string) bool {
 	for _, c := range collections {

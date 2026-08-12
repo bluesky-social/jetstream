@@ -5,7 +5,8 @@ package jetstream
 type Kind string
 
 const (
-	// KindCommit is a record create, update, or delete. Commit is non-nil.
+	// KindCommit is a record create, update, delete, or resync replacement.
+	// Commit is non-nil.
 	KindCommit Kind = "commit"
 	// KindIdentity is a #identity event (handle/DID-doc change). Identity is non-nil.
 	KindIdentity Kind = "identity"

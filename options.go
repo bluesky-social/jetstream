@@ -12,6 +12,7 @@ type Option func(*config)
 // config is the resolved, validated client configuration. It is private:
 // callers build it exclusively through Option values.
 type config struct {
+	kinds          []Kind
 	collections    []string
 	dids           []string
 	hasAfterSeq    bool
@@ -95,6 +96,14 @@ func defaultConfig() config {
 // replay (any seq bound) versus a pure live tail.
 func (c *config) backfillRequested() bool {
 	return c.hasAfterSeq || c.hasBeforeSeq
+}
+
+// WithKinds restricts delivery to the selected event kinds. Empty or unset
+// means all kinds. KindCommit includes create, update, delete, and resync
+// replacement records. Combine WithKinds([]Kind{KindCommit}) with
+// WithCollections for a commits-only collection stream.
+func WithKinds(kinds []Kind) Option {
+	return func(c *config) { c.kinds = append([]Kind(nil), kinds...) }
 }
 
 // WithCollections restricts delivery to the given collections. Each entry is

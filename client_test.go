@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	iclient "github.com/bluesky-social/jetstream/internal/client"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/cbor"
@@ -145,6 +144,34 @@ func TestOptionsCopySlices(t *testing.T) {
 	WithCollections(src)(&cfg)
 	src[0] = "mutated"
 	require.Equal(t, []string{"a", "b"}, cfg.collections, "options must defensively copy slices")
+
+	kinds := []Kind{KindCommit, KindAccount}
+	WithKinds(kinds)(&cfg)
+	kinds[0] = KindSync
+	require.Equal(t, []Kind{KindCommit, KindAccount}, cfg.kinds, "WithKinds must defensively copy its slice")
+
+	dids := []string{"did:plc:a", "did:plc:b"}
+	WithDIDs(dids)(&cfg)
+	dids[0] = "did:plc:mutated"
+	require.Equal(t, []string{"did:plc:a", "did:plc:b"}, cfg.dids, "WithDIDs must defensively copy its slice")
+}
+
+func TestSubscribeCanonicalizesFiltersOnce(t *testing.T) {
+	t.Parallel()
+
+	c, err := Subscribe("host",
+		WithKinds([]Kind{KindCommit, KindAccount, KindCommit}),
+		WithDIDs([]string{"did:plc:a", "did:plc:b", "did:plc:a"}),
+		WithCollections([]string{"app.bsky.feed.post", "app.bsky.feed.*", "app.bsky.feed.post"}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+
+	e, ok := c.engine.(*replayEngine)
+	require.True(t, ok)
+	require.Equal(t, []Kind{KindCommit, KindAccount}, e.cfg.Request.Kinds)
+	require.Equal(t, []string{"did:plc:a", "did:plc:b"}, e.cfg.Request.DIDs)
+	require.Equal(t, []string{"app.bsky.feed.post", "app.bsky.feed.*"}, e.cfg.Request.Collections)
 }
 
 func TestWithAPITokenValidation(t *testing.T) {
@@ -191,6 +218,28 @@ func TestSubscribeValidation(t *testing.T) {
 
 	_, err := Subscribe("")
 	require.Error(t, err, "empty host must error")
+
+	_, err = Subscribe("host", WithKinds([]Kind{"wat"}))
+	require.ErrorContains(t, err, "invalid kind")
+
+	_, err = Subscribe("host", WithDIDs([]string{"not-a-did"}))
+	require.ErrorContains(t, err, "invalid DID")
+
+	_, err = Subscribe("host", WithCollections([]string{"not a collection"}))
+	require.ErrorContains(t, err, "invalid collection")
+
+	_, err = Subscribe("host", WithCollections([]string{"app.*"}))
+	require.ErrorContains(t, err, "invalid collection wildcard")
+
+	tooManyCollections := make([]string, maxClientCollections+1)
+	for i := range tooManyCollections {
+		tooManyCollections[i] = "com.example.c" + strconv.Itoa(i)
+	}
+	_, err = Subscribe("host", WithCollections(tooManyCollections))
+	require.ErrorContains(t, err, "too many collections")
+
+	_, err = Subscribe("host", WithKinds([]Kind{KindAccount}), WithCollections([]string{"app.bsky.feed.post"}))
+	require.ErrorContains(t, err, "kinds excludes commit")
 
 	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(100), WithBackfillOnly())
 	require.Error(t, err, "beforeSeq must be strictly greater than afterSeq")
@@ -243,68 +292,6 @@ func TestBatchLastCursor(t *testing.T) {
 	require.Len(t, b.Events(), 3)
 }
 
-// TestToPublicEventsSlab guards the public-side per-block Commit slab: converting
-// a batch of internal events must give each commit event a DISTINCT *Commit with
-// its own correct fields (a slab indexing bug would alias slots), with field
-// values identical to a per-event conversion, and with correct slot accounting
-// when non-commit kinds are interleaved (they take no slot).
-func TestToPublicEventsSlab(t *testing.T) {
-	t.Parallel()
-	in := []iclient.Event{
-		{DID: "did:plc:a", Seq: 1, Kind: iclient.KindCommit, Commit: &iclient.Commit{Operation: iclient.OpCreate, Collection: "c", Rkey: "r1", Rev: "v1", CID: "cid1"}},
-		{DID: "did:plc:a", Seq: 2, Kind: iclient.KindIdentity, Identity: &iclient.Identity{DID: "did:plc:a", Handle: "h", Seq: 2, Time: "t"}},
-		{DID: "did:plc:a", Seq: 3, Kind: iclient.KindCommit, Commit: &iclient.Commit{Operation: iclient.OpUpdate, Collection: "c", Rkey: "r3", Rev: "v3", CID: "cid3"}},
-		{DID: "did:plc:a", Seq: 4, Kind: iclient.KindAccount, Account: &iclient.Account{DID: "did:plc:a", Active: true, Seq: 4, Time: "t"}},
-		{DID: "did:plc:a", Seq: 5, Kind: iclient.KindCommit, Commit: &iclient.Commit{Operation: iclient.OpDelete, Collection: "c", Rkey: "r5", Rev: "v5"}},
-	}
-	out := toPublicEvents(in)
-	require.Len(t, out, len(in))
-
-	seen := map[*Commit]bool{}
-	for i := range out {
-		require.EqualValues(t, in[i].Seq, out[i].Seq)
-		switch in[i].Kind {
-		case iclient.KindCommit:
-			require.NotNil(t, out[i].Commit, "event %d should have a Commit", i)
-			require.False(t, seen[out[i].Commit], "event %d aliases an already-used *Commit slot", i)
-			seen[out[i].Commit] = true
-			require.Equal(t, in[i].Commit.Rkey, out[i].Commit.Rkey, "commit %d carries the wrong rkey (slab misaligned)", i)
-			require.Equal(t, in[i].Commit.CID, out[i].Commit.CID)
-			require.Equal(t, Operation(in[i].Commit.Operation), out[i].Commit.Operation)
-		case iclient.KindIdentity:
-			require.NotNil(t, out[i].Identity)
-			require.Nil(t, out[i].Commit)
-		case iclient.KindAccount:
-			require.NotNil(t, out[i].Account)
-			require.Nil(t, out[i].Commit)
-		}
-	}
-	require.Len(t, seen, 3, "exactly the three commit events get distinct slots")
-}
-
-// TestToPublicEventsSlabAllocations pins that converting a batch of N commits
-// allocates O(1) Commit-struct backing (the slab), not O(N) *Commit. Doubling N
-// must not add ~N allocations.
-//
-//nolint:paralleltest // AllocsPerRun cannot run under t.Parallel
-func TestToPublicEventsSlabAllocations(t *testing.T) {
-	mk := func(n int) []iclient.Event {
-		evs := make([]iclient.Event, n)
-		for i := range evs {
-			evs[i] = iclient.Event{Seq: uint64(i), Kind: iclient.KindCommit, Commit: &iclient.Commit{Collection: "c", Rkey: "r"}}
-		}
-		return evs
-	}
-	in100, in200 := mk(100), mk(200)
-	a100 := testing.AllocsPerRun(100, func() { _ = toPublicEvents(in100) })
-	a200 := testing.AllocsPerRun(100, func() { _ = toPublicEvents(in200) })
-	t.Logf("toPublicEvents: 100=%.0f allocs, 200=%.0f allocs (delta=%.0f)", a100, a200, a200-a100)
-	// Per-*Commit allocation would make this delta ~100; the slab keeps it ~0
-	// (the []Commit and []Event slabs are 2 allocations regardless of N).
-	require.Less(t, a200-a100, float64(5),
-		"doubling commit count must not add ~N allocations; the Commit slab keeps it constant")
-}
-
 func TestClosedClientEventsErrors(t *testing.T) {
 	t.Parallel()
 	c, err := Subscribe("host")
@@ -318,6 +305,49 @@ func TestClosedClientEventsErrors(t *testing.T) {
 		break
 	}
 	require.Error(t, gotErr, "Events on a closed client must yield an error")
+}
+
+func TestConcurrentEventsIsRejected(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	h.as.addSegment(t, "seg_0000000000.jss", []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+	})
+	h.planned = 1
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 1}}
+	h.installHandlers()
+
+	gate := make(chan struct{})
+	h.as.mu.Lock()
+	h.as.segGate = gate
+	h.as.mu.Unlock()
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	c := &Client{engine: newReplayEngine(cfg)}
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		for range c.Events(context.Background()) {
+		}
+	}()
+	require.Eventually(t, func() bool { return h.as.segReqs.Load() > 0 }, 5*time.Second, time.Millisecond,
+		"the first Events iteration never reached the blocked download")
+
+	var gotErr error
+	for _, err := range c.Events(context.Background()) {
+		gotErr = err
+		break
+	}
+	require.ErrorIs(t, gotErr, ErrFatal)
+	require.ErrorContains(t, gotErr, "already running")
+
+	close(gate)
+	select {
+	case <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first Events iteration did not finish")
+	}
 }
 
 // TestZeroValueClientFailsClosed asserts that calling methods on a Client that
@@ -677,7 +707,7 @@ func TestSubscribeLiveTailEndToEnd(t *testing.T) {
 
 // TestCloseStopsRunningEventsWithoutCtxCancel is the A2 regression guard: the
 // documented contract is that Close is "the natural way to stop a live tail"
-// concurrently with a running Events. Before the fix, realEngine.close() only
+// concurrently with a running Events. Before the fix, replayEngine.close() only
 // closed the buffer and cancelled nothing, so a live tail kept its goroutine
 // and network reads alive until the Events ctx was cancelled. Here the ctx is
 // deliberately a plain Background (never cancelled by the test): Close alone

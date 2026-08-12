@@ -211,6 +211,13 @@ func TestValidatePlanCollections(t *testing.T) {
 		require.Equal(t, []string{"app.bsky.feed."}, prefixes)
 	})
 
+	t.Run("raw duplicate count is capped before dedupe", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := validatePlanCollections(
+			[]string{"app.bsky.feed.post", "app.bsky.feed.post"}, 1)
+		require.Error(t, err)
+	})
+
 	t.Run("order independence", func(t *testing.T) {
 		t.Parallel()
 		e1, p1, err := validatePlanCollections([]string{"app.bsky.graph.*", "app.bsky.feed.post"}, 10)
@@ -259,6 +266,62 @@ func TestValidatePlanCollections(t *testing.T) {
 		_, _, err := validatePlanCollections([]string{"app.*"}, 10)
 		require.Error(t, err)
 	})
+}
+
+func TestValidatePlanKinds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		raw     []string
+		want    manifest.KindMask
+		wantErr bool
+	}{
+		{name: "omitted matches all"},
+		{name: "commit", raw: []string{"commit"}, want: manifest.KindCommit},
+		{name: "all", raw: []string{"commit", "identity", "account", "sync"}, want: manifest.KindCommit | manifest.KindIdentity | manifest.KindAccount | manifest.KindSync},
+		{name: "duplicates dedupe", raw: []string{"commit", "commit"}, want: manifest.KindCommit},
+		{name: "unknown", raw: []string{"wat"}, wantErr: true},
+		{name: "raw count capped", raw: []string{"commit", "commit", "commit", "commit", "commit"}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := validatePlanKinds(tt.raw)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestValidatePlanDIDsRawCountIsCappedBeforeDedupe(t *testing.T) {
+	t.Parallel()
+	_, err := validatePlanDIDs([]string{"did:plc:a", "did:plc:a"}, 1)
+	require.Error(t, err)
+}
+
+func TestPlanSnapshot_KindFilterReachesPlanner(t *testing.T) {
+	t.Parallel()
+
+	account := planEvent(2, "did:plc:target", "")
+	account.Kind = segment.KindAccount
+	ts := newPlanTestServer(t, defaultPlanTestConfig(),
+		planEvent(1, "did:plc:target", "app.bsky.feed.post"),
+		account,
+	)
+
+	status, out := postPlan(t, ts, map[string]any{
+		"kinds":       []string{"commit"},
+		"collections": []string{"app.bsky.feed.post"},
+	})
+	require.Equal(t, http.StatusOK, status)
+	require.Len(t, out.Segments, 1)
+	require.EqualValues(t, 1, out.Stats.BlocksMatched)
 }
 
 func TestPlanSnapshot_ReturnsBlockPlan(t *testing.T) {
@@ -516,6 +579,16 @@ func TestPlanSnapshot_InvalidRequests(t *testing.T) {
 			name: "invalid collection",
 			cfg:  defaultPlanTestConfig(),
 			body: map[string]any{"collections": []string{"not a collection"}},
+		},
+		{
+			name: "invalid kind",
+			cfg:  defaultPlanTestConfig(),
+			body: map[string]any{"kinds": []string{"wat"}},
+		},
+		{
+			name: "collections with kinds excluding commit",
+			cfg:  defaultPlanTestConfig(),
+			body: map[string]any{"kinds": []string{"account"}, "collections": []string{"app.bsky.feed.post"}},
 		},
 		{
 			name: "too many collections",

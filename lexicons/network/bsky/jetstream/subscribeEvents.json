@@ -15,6 +15,7 @@
           },
           "kinds": {
             "type": "array",
+            "maxLength": 4,
             "items": { "type": "string", "enum": ["commit", "identity", "account", "sync"] },
             "description": "Event kinds to receive; values are the message $type fragment names. Omitted or empty: all kinds. A value outside the enum is rejected pre-upgrade with HTTP 400 (InvalidRequest) rather than silently never matching."
           },
@@ -33,6 +34,7 @@
           "maxMessageSizeBytes": {
             "type": "integer",
             "minimum": 0,
+            "maximum": 4294967295,
             "default": 0,
             "description": "Skip events whose uncompressed frame (envelope included) exceeds this many bytes. 0 (default) means no limit."
           },
