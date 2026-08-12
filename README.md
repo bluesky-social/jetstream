@@ -47,24 +47,6 @@ just run serve
 
 Simulator and prod data are always isolated, so you can swap between them without worry (they each get a unique data directory).
 
-## Bundled client
-
-The bundled client can live-tail a Jetstream server or backfill its sealed
-archive. Live-only use is public and needs no token. When an archive is behind
-Headwind, pass the raw API token (without a `Bearer ` prefix) through an
-invocation-scoped environment variable so it does not appear in process
-arguments:
-
-```sh
-JETSTREAM_CLIENT_API_TOKEN="$HEADWIND_API_TOKEN" \
-  go run ./cmd/client --host https://jetstream.example \
-  --after-seq 0 --backfill-only
-```
-
-The optional `--api-token` flag provides the same archive authentication, but
-the environment source is preferred because command-line arguments may be
-visible to other local users.
-
 To fully reset your local environment (warning: destructive action!):
 
 ```sh
