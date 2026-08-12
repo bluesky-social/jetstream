@@ -159,7 +159,7 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 		// Seq 0 is the pure "nothing yet" sentinel (design §R8): it is never
 		// allocated to an event, so the lowest real event is seq 1. The
 		// bufferless cutover sends cursor=0 to mean "replay from the first
-		// event" on an empty archive (see internal/client live consumer). With
+		// event" on an empty archive (see the root client live consumer). With
 		// the writer now flooring NextSeq to 1, cursor 0 falls through here as a
 		// replay; floor it to 1 so the cold reader walks from the first real
 		// event instead of returning a non-advancing next==0 that disconnects

@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"bytes"
@@ -63,7 +63,7 @@ func buildLikeBlockFrame(tb testing.TB, n int) []byte {
 // ceiling on single-core decode throughput.
 func BenchmarkDecodeFrameBlock(b *testing.B) {
 	frame := buildLikeBlockFrame(b, 4096)
-	d := NewDownloader(nil, 1, nil)
+	d := newDownloader(nil, 1, nil)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(frame)))
 	for b.Loop() {

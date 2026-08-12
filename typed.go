@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"iter"
-
-	iclient "github.com/bluesky-social/jetstream/internal/client"
 )
 
 // TypedEvent pairs a delivered Event with its record decoded into the caller's
@@ -104,12 +102,12 @@ func TypedEvents[T any, PT interface {
 			yield(nil, fmt.Errorf("jetstream: client is closed"))
 			return
 		}
-		// Fast path: when the client is backed by the real engine, run the typed
+		// Fast path: when the client is backed by the replay engine, run the typed
 		// record decode ON the parallel decode workers (via the engine's backfill
 		// transform seam) instead of in this single consumer goroutine. Decoding
 		// the whole archive's records into T on one goroutine is the bottleneck at
 		// high core counts (#146); fanning it across the worker pool is the point.
-		if re, ok := c.engine.(*realEngine); ok {
+		if re, ok := c.engine.(*replayEngine); ok {
 			typedRun[T, PT](ctx, re, collection, yield)
 			return
 		}
@@ -130,55 +128,67 @@ func TypedEvents[T any, PT interface {
 	}
 }
 
-// typedRun drives the real engine with a TYPED backfill sink: the per-block
+// typedRun drives the replay engine with a typed backfill sink: the per-block
 // transform runs on the decode-worker pool, converting each block's events to
-// public events and decoding matching records into *T (so the expensive typed
-// UnmarshalCBOR is parallel, not serial in the consumer). The reassembler then
-// hands the ready *TypedBatch[T] to Emit in seq order. The live-tail/error
+// records of T (so the expensive typed UnmarshalCBOR is parallel, not serial in
+// the consumer). The reassembler then hands the ready batches to Emit in seq
+// order. The live-tail/error
 // closures assemble typed batches in the (single) emit goroutine — fine because
 // the live path is low-volume — so the consumer sees one uniform typed stream
 // across the backfill→live cutover.
 func typedRun[T any, PT interface {
 	*T
 	UnmarshalCBOR([]byte) error
-}](ctx context.Context, re *realEngine, collection string, yield func(*TypedBatch[T], error) bool) {
+}](ctx context.Context, re *replayEngine, collection string, yield func(*TypedBatch[T], error) bool) {
 	// `stopped` is shared between the fast-path Emit closure and the live
 	// emitBatch/emitErr closures, which can be driven by the batcher's periodic
 	// flusher goroutine — not just this run goroutine. It is race-free for the
-	// same two reasons documented at realEngine.run (batcher mutex serialization +
+	// same two reasons documented at replayEngine.run (batcher mutex serialization +
 	// the live buffer being empty during any backfill sweep); see that comment
 	// before refactoring.
 	stopped := false
-	bf := iclient.BackfillSink{
-		Transform: func(_ int, evs []iclient.Event) any {
+	size := max(re.cfg.BatchSize, 1)
+	bf := backfillSink{
+		transform: func(_ int, evs []Event) any {
 			if len(evs) == 0 {
 				return nil
 			}
-			// Convert to public events (slab-allocated) then decode records into T,
-			// all on this worker goroutine. One *TypedBatch[T] per block, boxed as
-			// any so internal/client never names T.
-			return assembleTyped[T, PT](toPublicEvents(evs), collection)
+			// Decode the entire block into one event slab and one record slab, then
+			// expose BatchSize-bounded views over that backing storage. Building each
+			// chunk independently would allocate two slabs per chunk (commonly 64
+			// times per block), which is visible in GC and throughput at archive scale.
+			block := assembleTyped[T, PT](evs, collection)
+			batches := make([]TypedBatch[T], 0, (len(evs)+size-1)/size)
+			for i := 0; i < len(block.events); i += size {
+				end := min(i+size, len(evs))
+				batches = append(batches, TypedBatch[T]{events: block.events[i:end]})
+			}
+			return batches
 		},
-		Emit: func(res iclient.EntryResult) bool {
+		emit: func(res entryResult) bool {
 			if stopped {
 				return false
 			}
-			tb, _ := res.Payload.(*TypedBatch[T])
-			if tb == nil {
-				return true // empty/filtered block
-			}
-			if !yield(tb, nil) {
+			batches, ok := res.Payload.([]TypedBatch[T])
+			if !ok {
 				stopped = true
+				yield(nil, fatal(fmt.Errorf("jetstream: internal typed backfill payload has type %T, want []TypedBatch", res.Payload)))
 				return false
+			}
+			for i := range batches {
+				if !yield(&batches[i], nil) {
+					stopped = true
+					return false
+				}
 			}
 			return true
 		},
 	}
-	emitBatch := func(batch []iclient.Event) bool {
+	emitBatch := func(batch []Event) bool {
 		if stopped {
 			return false
 		}
-		if !yield(assembleTyped[T, PT](toPublicEvents(batch), collection), nil) {
+		if !yield(assembleTyped[T, PT](batch, collection), nil) {
 			stopped = true
 			return false
 		}

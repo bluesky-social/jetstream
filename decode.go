@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"bytes"
@@ -182,64 +182,80 @@ func decodeRecordMap(payload []byte) (map[string]any, error) {
 	if !ok {
 		return nil, fmt.Errorf("cbor decode: record is not an object")
 	}
-	return jsonShapedMap(m), nil
+	if !jsonShapeMap(m) {
+		return nil, fmt.Errorf("cbor decode: record contains a value outside the atproto data model")
+	}
+	return m, nil
 }
 
-// jsonShapedValue converts one decoded CBOR value into its ATProto JSON-shaped
-// form, recursively. The mapping mirrors cbor.ToJSON followed by encoding/json
-// round-tripping exactly:
+// jsonShapeValue converts one decoded CBOR value into its ATProto JSON-shaped
+// form, recursively. The bool is false for values outside the atproto data
+// model. The mapping mirrors cbor.ToJSON followed by encoding/json
+// round-tripping:
 //   - int64 -> float64 (encoding/json represents all JSON numbers as float64
 //     when decoding into any; the old path went through JSON text, so a CBOR
 //     integer surfaced as a float64 — preserved for byte-for-byte compatibility).
 //   - []byte        -> {"$bytes": base64.RawStdEncoding}
 //   - cbor.CID      -> {"$link": cid.String()}
 //   - []any / map   -> converted element-wise, in place.
-//   - string/bool/float64/nil -> passed through unchanged (original box reused).
+//   - string/bool/nil -> passed through unchanged (original box reused).
+//   - float64 and unknown values -> rejected (atproto has integers, not floats).
 //
 // It mutates maps and slices in place and reuses the decoder's existing any
 // boxes for unchanged scalars, so it allocates only where the value's JSON shape
 // actually differs from its CBOR form (integers, byte strings, CID links).
-func jsonShapedValue(v any) any {
+func jsonShapeValue(v any) (any, bool) {
 	switch val := v.(type) {
 	case int64:
 		// CBOR integers surface as JSON float64 (the canonical cbor.ToJSON +
 		// encoding/json contract). This is the one pass-through-shaped arm that
 		// MUST re-box: the stored kind genuinely changes (int64 box -> float64).
-		return float64(val)
+		return float64(val), true
 	case []byte:
-		return map[string]any{"$bytes": base64.RawStdEncoding.EncodeToString(val)}
+		return map[string]any{"$bytes": base64.RawStdEncoding.EncodeToString(val)}, true
 	case cbor.CID:
-		return map[string]any{"$link": val.String()}
+		return map[string]any{"$link": val.String()}, true
 	case []any:
 		// Rewrite in place rather than allocating a second slice: the slice came
 		// from the decoder and is not retained elsewhere. Only elements that
 		// actually change kind re-box, via the recursion.
 		for i := range val {
-			val[i] = jsonShapedValue(val[i])
+			shaped, ok := jsonShapeValue(val[i])
+			if !ok {
+				return nil, false
+			}
+			val[i] = shaped
 		}
-		return val
+		return val, true
 	case map[string]any:
-		return jsonShapedMap(val)
-	default:
-		// string, bool, float64, nil, and any other already-JSON-shaped scalar
+		return val, jsonShapeMap(val)
+	case string, bool, nil:
+		// Already-JSON-shaped scalar:
 		// pass through UNCHANGED — and we return the ORIGINAL box v, not a
 		// re-asserted value. Writing `case string: return val` would unbox to a
 		// concrete string and then heap-allocate a FRESH any box on return
 		// (runtime.convTstring), once per scalar leaf — ~22% of decode allocations
 		// (#142). Returning v reuses the box the decoder already produced; output
 		// is byte-identical (same kind, same value).
-		return v
+		return v, true
+	default:
+		return nil, false
 	}
 }
 
-// jsonShapedMap converts a CBOR map in place into its JSON-shaped form. The map
+// jsonShapeMap converts a CBOR map in place into its JSON-shaped form. The map
 // from ReadValue is freshly allocated and not retained elsewhere, so rewriting
-// its values avoids a second map allocation per object.
-func jsonShapedMap(m map[string]any) map[string]any {
+// its values avoids a second map allocation per object. It returns false if a
+// nested value is outside the atproto data model.
+func jsonShapeMap(m map[string]any) bool {
 	for k, v := range m {
-		m[k] = jsonShapedValue(v)
+		shaped, ok := jsonShapeValue(v)
+		if !ok {
+			return false
+		}
+		m[k] = shaped
 	}
-	return m
+	return true
 }
 
 func commitOperation(k segment.Kind) Operation {

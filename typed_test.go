@@ -4,11 +4,49 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/bsky"
 	comatproto "github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/stretchr/testify/require"
 )
+
+func TestTypedEventsFastPathRespectsBatchSize(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	const collection = "app.bsky.feed.like"
+	var rows []segment.Event
+	for seq := uint64(1); seq <= 5; seq++ {
+		rows = append(rows, makeCreateWithPayload(seq, "did:plc:a", collection, "r"+itoaU(seq),
+			likeCBOR(t, "at://did:plc:x/app.bsky.feed.post/p"+itoaU(seq), "bafy"+itoaU(seq))))
+	}
+	// Keep all five records in one block so this specifically verifies that the
+	// worker-side typed transform chunks a block by WithBatchSize.
+	h.as.addSegmentWithBlockSize(t, "seg_0000000000.jss", rows, 10)
+	h.planned = 5
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 5}}
+	h.installHandlers()
+
+	cfg := h.cfg()
+	cfg.BackfillOnly = true
+	cfg.BatchSize = 2
+	cfg.RawRecords = true
+	cfg.Request.Collections = []string{collection}
+	c := &Client{engine: newReplayEngine(cfg)}
+
+	var sizes []int
+	var seqs []uint64
+	for batch, err := range TypedEvents[bsky.FeedLike](context.Background(), c, collection) {
+		require.NoError(t, err)
+		sizes = append(sizes, len(batch.Events()))
+		for _, event := range batch.Events() {
+			require.NotNil(t, event.Record)
+			seqs = append(seqs, event.Event.Seq)
+		}
+	}
+	require.Equal(t, []int{2, 2, 1}, sizes)
+	require.Equal(t, []uint64{1, 2, 3, 4, 5}, seqs)
+}
 
 // scriptEngine is a fake engine that yields a fixed sequence of batches (then
 // ends), for exercising the public typed/iterator layer without a real server.

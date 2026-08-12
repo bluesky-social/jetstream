@@ -42,7 +42,7 @@ The durability ordering between these two is the invariant that keeps a crash sa
 - **Compression dictionary endpoint** (`internal/xrpcapi/getzstddictionary.go`): serves the v2 subscribe dictionary as an immutable, CDN-cacheable blob keyed by its embedded zstd dictionary ID. Retrained against live traffic with `just train-subscribe-dict` (`testing/dicttrain`); each retrain embeds a fresh ID and clients recover from rotation in-place (see `specs/client.md`).
 - **Archive download over HTTP/XRPC** (`internal/xrpcapi`): the paginated `planSnapshot` → `getSegment`/`getBlock` path clients use to pull sealed history before cutover.
 - **HTTP plumbing** (`internal/server`): the public listener (default :8080) and opt-in debug listener (commonly :6060) and middleware. Status, health, and metrics live off these (`internal/status`, `internal/obs`).
-- **Client library** (`internal/client` and the module root): the "thick" Go client that negotiates the archive, downloads and decodes it in parallel, dedupes by seq, cuts over to live, and recovers from too-old cursors and dictionary rotations. `specs/client.md` is the end-to-end protocol description; `docs/README.md` §5 owns the wire formats.
+- **Client library** (module-root `jetstream` package): the "thick" Go client that negotiates the archive, downloads and decodes it in parallel, dedupes by seq, cuts over to live, and recovers from too-old cursors and dictionary rotations. `specs/client.md` is the end-to-end protocol description; `docs/README.md` §5 owns the wire formats.
 
 ### Testing rig — the oracle and simulator
 
@@ -69,7 +69,7 @@ This is unusually central to the project, so it's worth knowing even if you're n
 | The `/subscribe` websocket + v1 quirks | `internal/subscribe/doc.go`, `docs/README.md` §5 |
 | Archive download (planSnapshot/getSegment) | `internal/xrpcapi`, `docs/README.md` §5 |
 | The client protocol, end to end (negotiate → download → cutover → live, compression, failure modes) | `specs/client.md` |
-| The Go client implementation | `internal/client`, module root, `specs/client.md` |
+| The Go client implementation | module root, `specs/client.md` |
 | Wire compression (dict-zstd, dictionary rotation, retraining) | `specs/client.md`, `internal/subscribe/doc.go` |
 | Compaction / tombstones | `internal/tombstone`, `docs/README.md` §3.3 |
 | Timestamp import | `internal/timestamp`, `docs/README.md` §8 |

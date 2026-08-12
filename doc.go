@@ -49,6 +49,6 @@
 // re-backfills from its last processed seq rather than silently skipping the gap.
 //
 // The client deliberately exposes a minimal public surface: the Client, its
-// options, and the decoded Event shape. All transport, planning, download, and
-// cutover machinery lives in internal packages.
+// options, and the decoded Event shape. Transport, planning, download, and
+// cutover machinery is unexported within this package.
 package jetstream

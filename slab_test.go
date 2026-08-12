@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"bytes"
@@ -15,7 +15,7 @@ import (
 // decodeOneFrameForTest builds a single sealed block frame from rows and runs it
 // through the production decodeFrame (the per-block Commit-slab path), returning
 // the decoded events. MaxEventsPerBlock is set high so all rows land in one block.
-func decodeOneFrameForTest(t *testing.T, sel RowSelector, rows []segment.Event) []Event {
+func decodeOneFrameForTest(t *testing.T, sel rowSelector, rows []segment.Event) []Event {
 	t.Helper()
 	dir := t.TempDir()
 	path := dir + "/seg_slab.jss"
@@ -35,7 +35,7 @@ func decodeOneFrameForTest(t *testing.T, sel RowSelector, rows []segment.Event) 
 	frame, err := segment.ReadBlockFrame(bytes.NewReader(raw), hdr, 0)
 	require.NoError(t, err)
 
-	d := NewDownloader(nil, 1, sel)
+	d := newDownloader(nil, 1, sel)
 	out, err := d.decodeFrame(frame, "seg_slab.jss", 0)
 	require.NoError(t, err)
 	return out
@@ -85,10 +85,10 @@ func TestDecodeFrameSlabMixedKindsAndFilter(t *testing.T) {
 		makeCreate(t, 6, "did:plc:a", "app.bsky.feed.like", "drop2"), // filtered out
 		makeCreate(t, 7, "did:plc:a", "app.bsky.feed.post", "keep3"),
 	}
-	// Matcher keeps only app.bsky.feed.post commits; non-commits (identity/
+	// matcher keeps only app.bsky.feed.post commits; non-commits (identity/
 	// account/sync) carry no collection and always bypass the collection filter.
-	sel := NewMatcher(PlanRequest{Collections: []string{"app.bsky.feed.post"}})
-	out := decodeOneFrameForTest(t, sel, rows)
+	sel := newMatcher(planRequest{Collections: []string{"app.bsky.feed.post"}})
+	out := decodeOneFrameForTest(t, sel.wantsSegment, rows)
 
 	// Expect the 3 kept posts; the likes are filtered out. (Identity/account also
 	// survive but carry no Commit, so they don't contribute rkeys below.)
@@ -144,7 +144,7 @@ func TestDecodeFrameSlabAllocations(t *testing.T) {
 		require.NoError(t, err)
 		return frame
 	}
-	d := NewDownloader(nil, 1, nil)
+	d := newDownloader(nil, 1, nil)
 
 	frame100 := build(100)
 	frame200 := build(200)

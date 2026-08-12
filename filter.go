@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"strings"
@@ -6,7 +6,7 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 )
 
-// Matcher applies the caller's exact DID/collection/seq filters to decoded
+// matcher applies the caller's exact DID/collection/seq filters to decoded
 // segment rows. The snapshot planner is a one-sided transport hint (no false
 // negatives, possible false positives via DID blooms and per-block collection
 // summaries), so the client MUST re-apply exact filtering after decode.
@@ -25,7 +25,7 @@ import (
 //
 // The seq window is the client's exact (afterSeq, beforeSeq] bound, applied on
 // top of the planner's coarse per-segment/block seq pruning.
-type Matcher struct {
+type matcher struct {
 	dids         map[string]struct{} // nil = match all DIDs
 	fullPaths    map[string]struct{} // exact collection NSIDs
 	prefixes     []string            // wildcard collection prefixes ("app.bsky.feed.")
@@ -34,11 +34,11 @@ type Matcher struct {
 	beforeSeq    uint64 // inclusive upper bound
 }
 
-// NewMatcher builds a Matcher from resolved filters. Empty dids/collections
+// newMatcher builds a matcher from resolved filters. Empty dids/collections
 // mean match-all for that dimension. Collection entries are either exact NSIDs
 // or namespace wildcards ending in ".*" (e.g. "app.bsky.feed.*").
-func NewMatcher(req PlanRequest) *Matcher {
-	m := &Matcher{
+func newMatcher(req planRequest) *matcher {
+	m := &matcher{
 		afterSeq:     req.AfterSeq,
 		hasBeforeSeq: req.HasBeforeSeq,
 		beforeSeq:    req.BeforeSeq,
@@ -64,17 +64,30 @@ func NewMatcher(req PlanRequest) *Matcher {
 	return m
 }
 
-// Wants reports whether ev passes the exact filters. A nil Matcher matches
-// everything.
-func (m *Matcher) Wants(ev *segment.Event) bool {
+// wantsSegment reports whether a stored row passes the exact filters.
+func (m *matcher) wantsSegment(ev *segment.Event) bool {
+	return m.wants(ev.Seq, ev.DID, ev.Kind.IsCommit(), ev.Collection)
+}
+
+// wantsEvent reports whether a decoded live event passes the exact filters.
+func (m *matcher) wantsEvent(ev *Event) bool {
+	isCommit := ev.Kind == KindCommit
+	collection := ""
+	if isCommit && ev.Commit != nil {
+		collection = ev.Commit.Collection
+	}
+	return m.wants(ev.Seq, ev.DID, isCommit, collection)
+}
+
+func (m *matcher) wants(seq uint64, did string, isCommit bool, collection string) bool {
 	if m == nil {
 		return true
 	}
-	if !m.wantsSeq(ev.Seq) {
+	if !m.wantsSeq(seq) {
 		return false
 	}
 	if m.dids != nil {
-		if _, ok := m.dids[ev.DID]; !ok {
+		if _, ok := m.dids[did]; !ok {
 			return false
 		}
 	}
@@ -86,34 +99,22 @@ func (m *Matcher) Wants(ev *segment.Event) bool {
 	// above. They are the consumer's only signal to purge a dead account's
 	// records, so hiding them under a collection filter would create a
 	// permanently stale view (see the type doc).
-	if !ev.Kind.IsCommit() {
+	if !isCommit {
 		return true
 	}
 	// A commit lacking a collection bypasses the filter (v1 parity).
-	if ev.Collection == "" {
+	if collection == "" {
 		return true
 	}
-	if _, ok := m.fullPaths[ev.Collection]; ok {
+	if _, ok := m.fullPaths[collection]; ok {
 		return true
 	}
 	for _, prefix := range m.prefixes {
-		if strings.HasPrefix(ev.Collection, prefix) {
+		if strings.HasPrefix(collection, prefix) {
 			return true
 		}
 	}
 	return false
-}
-
-// Keep makes *Matcher satisfy the downloader's RowSelector: a row is kept iff it
-// passes the exact filters. The drop reason is "filtered" for a filter miss.
-// Backfill no longer suppresses tombstoned rows — every matching row is emitted
-// and a folding consumer converges (design §5.1) — so the matcher is the whole
-// keep/drop decision.
-func (m *Matcher) Keep(ev *segment.Event) (bool, string) {
-	if m.Wants(ev) {
-		return true, ""
-	}
-	return false, "filtered"
 }
 
 // setAfterSeq raises the matcher's exclusive lower bound to afterSeq. It is used
@@ -126,11 +127,11 @@ func (m *Matcher) Keep(ev *segment.Event) (bool, string) {
 // untouched. The bound only ever moves FORWARD across a backfill loop's life
 // (resume >= cutover >= the prior floor), so this never widens the window. See
 // the call site in runBackfillThenLive for the full scope/safety argument.
-func (m *Matcher) setAfterSeq(afterSeq uint64) {
+func (m *matcher) setAfterSeq(afterSeq uint64) {
 	m.afterSeq = afterSeq
 }
 
-func (m *Matcher) wantsSeq(seq uint64) bool {
+func (m *matcher) wantsSeq(seq uint64) bool {
 	// afterSeq is a RESUME-AFTER bound (seq > afterSeq), but only when one was
 	// actually requested. afterSeq==0 means "from the start of the archive"
 	// (WithAfterSeq(0)). Seqs start at 1, so afterSeq==0 imposes no lower bound
@@ -146,6 +147,6 @@ func (m *Matcher) wantsSeq(seq uint64) bool {
 	return true
 }
 
-func (m *Matcher) hasCollectionFilter() bool {
+func (m *matcher) hasCollectionFilter() bool {
 	return len(m.fullPaths) > 0 || len(m.prefixes) > 0
 }

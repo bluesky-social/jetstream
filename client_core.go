@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"context"
@@ -29,10 +29,10 @@ const maxRebackfillStalls = 5
 // almost immediately, so this only governs the steady-state tail.
 const defaultMaxBatchDelay = 20 * time.Millisecond
 
-// Config is the resolved engine configuration the root package passes in.
-type Config struct {
+// engineConfig is the resolved engine configuration the root package passes in.
+type engineConfig struct {
 	Host     string // normalized base URL
-	Request  PlanRequest
+	Request  planRequest
 	Backfill bool // run the historical backfill path before live
 	// BackfillOnly downloads and emits the sealed archive, then returns without
 	// starting the live tail or cutover. A one-time dump of the matched range.
@@ -88,7 +88,7 @@ type Config struct {
 }
 
 // recordDecodeMode captures how commit records are materialized, derived from
-// Config. It is passed down the decode paths (backfill + live) so the gating is
+// engineConfig. It is passed down the decode paths (backfill + live) so the gating is
 // one value rather than scattered bools.
 type recordDecodeMode struct {
 	raw      bool // skip decodeRecordMap; leave Record nil, set RecordCBOR
@@ -96,27 +96,33 @@ type recordDecodeMode struct {
 	wantCIDs bool // in raw mode, still compute Commit.CID
 }
 
-func (c Config) recordMode() recordDecodeMode {
+func (c engineConfig) recordMode() recordDecodeMode {
 	return recordDecodeMode{raw: c.RawRecords, copyCBOR: c.RawRecordsCopied, wantCIDs: c.RawRecordCIDs}
 }
 
 // bulkClient returns the client for segment/block downloads, falling back to
 // the negotiation client.
-func (c Config) bulkClient() *xrpc.Client {
+func (c engineConfig) bulkClient() *xrpc.Client {
 	if c.BulkXRPC != nil {
 		return c.BulkXRPC
 	}
 	return c.XRPC
 }
 
-// Engine orchestrates the whole stream: snapshot plan + download, the
+// replayEngine orchestrates the whole stream: snapshot plan + download, the
 // backfill-to-live cutover, and the steady-state live tail. It emits batches
 // through Run.
-type Engine struct {
-	cfg     Config
-	planner *Planner
-	matcher *Matcher
+type replayEngine struct {
+	cfg     engineConfig
+	planner *planner
+	matcher *matcher
 	logger  *slog.Logger
+
+	// runMu owns the active-run cancellation handshake. Close does not wait for
+	// the run because callers may invoke it from inside their Events loop.
+	runMu     sync.Mutex
+	runCancel context.CancelFunc
+	closed    bool
 
 	// rebackfillStalls counts consecutive §14 too-old re-backfill cycles whose
 	// resume cursor failed to advance, bounded by maxRebackfillStalls. Touched
@@ -127,113 +133,115 @@ type Engine struct {
 	// on the single run goroutine (sweepSealedArchive / the re-backfill loop) and
 	// read by Stats(); the mutex makes a concurrent read by a monitoring caller
 	// race-free.
-	statsMu sync.Mutex
-	stats   Stats
+	statsMu  sync.Mutex
+	progress Stats
 }
 
-// Stats is a point-in-time snapshot of backfill-loop progress, exposed via
-// Engine.Stats for operational visibility (design §8/§10). The client library
-// has no Prometheus registry, so this accessor is how a caller observes the
-// residual gap a sustained-ingest backfill is closing.
-type Stats struct {
-	// Pages is the number of planSnapshot pages downloaded across all sweeps
-	// (including re-backfill cycles). Monotonically non-decreasing.
-	Pages uint64
-	// SealedTip is the most recently learned sealed-archive tip S (the pinned
-	// pagination goal of the current sweep).
-	SealedTip uint64
-	// PlannedThrough is the continuation cursor the loop has reached: the highest
-	// sealed seq accounted for so far. Equals SealedTip once a sweep completes.
-	PlannedThrough uint64
-	// ResidualGap is SealedTip - PlannedThrough: the sealed seqs still to be
-	// downloaded before cutover. Zero once the sweep has consumed the archive.
-	ResidualGap uint64
-	// RebackfillCycles is the number of §14 too-old re-backfill cycles triggered
-	// (a fell-behind/slow-handoff signal). Zero on the common path.
-	RebackfillCycles uint64
-}
-
-// Stats returns a snapshot of backfill-loop progress. Safe to call from another
-// goroutine while Run is in flight (e.g. a monitoring ticker).
-func (e *Engine) Stats() Stats {
+// stats returns a snapshot of backfill-loop progress. Safe to call from another
+// goroutine while a replay is in flight.
+func (e *replayEngine) stats() Stats {
 	e.statsMu.Lock()
 	defer e.statsMu.Unlock()
-	return e.stats
+	return e.progress
 }
 
-// recordPage updates the progress snapshot after a page is planned. tip is the
-// pinned sealed tip; through is the continuation cursor reached.
-func (e *Engine) recordPage(tip, through uint64) {
+// resetStats starts a fresh progress snapshot for each Events iteration.
+func (e *replayEngine) resetStats() {
+	e.statsMu.Lock()
+	e.progress = Stats{}
+	e.statsMu.Unlock()
+}
+
+// recordSweepStart publishes the sealed tip as soon as the first page is
+// planned, before its download begins. Through is the cursor already held by
+// the caller at the start of this sweep.
+func (e *replayEngine) recordSweepStart(tip, through uint64) {
 	e.statsMu.Lock()
 	defer e.statsMu.Unlock()
-	e.stats.Pages++
-	e.stats.SealedTip = tip
-	e.stats.PlannedThrough = through
+	e.progress.SealedTip = tip
+	e.progress.PlannedThrough = through
 	if tip > through {
-		e.stats.ResidualGap = tip - through
+		e.progress.ResidualGap = tip - through
 	} else {
-		e.stats.ResidualGap = 0
+		e.progress.ResidualGap = 0
+	}
+}
+
+// recordPage updates the progress snapshot after a page has been completely
+// downloaded and delivered. tip is the pinned sealed tip; through is the
+// continuation cursor reached.
+func (e *replayEngine) recordPage(tip, through uint64) {
+	e.statsMu.Lock()
+	defer e.statsMu.Unlock()
+	e.progress.Pages++
+	e.progress.SealedTip = tip
+	e.progress.PlannedThrough = through
+	if tip > through {
+		e.progress.ResidualGap = tip - through
+	} else {
+		e.progress.ResidualGap = 0
 	}
 }
 
 // recordRebackfill bumps the re-backfill cycle counter (a §14 too-old handoff).
-func (e *Engine) recordRebackfill() {
+func (e *replayEngine) recordRebackfill() {
 	e.statsMu.Lock()
 	defer e.statsMu.Unlock()
-	e.stats.RebackfillCycles++
+	e.progress.RebackfillCycles++
 }
 
-// NewEngine builds an Engine from cfg.
-func NewEngine(cfg Config) *Engine {
+// newReplayEngine builds an replayEngine from cfg.
+func newReplayEngine(cfg engineConfig) *replayEngine {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(discardWriter{}, nil))
 	}
-	return &Engine{
+	return &replayEngine{
 		cfg:     cfg,
-		planner: NewPlanner(cfg.XRPC),
-		matcher: NewMatcher(cfg.Request),
+		planner: newPlanner(cfg.XRPC),
+		matcher: newMatcher(cfg.Request),
 		logger:  logger,
 	}
 }
 
-// BackfillSink is the optional fast path for the backfill download phase. When
-// its Transform is non-nil, the downloader runs Transform on the parallel decode
+// backfillSink is the optional fast path for the backfill download phase. When
+// its transform is non-nil, the downloader runs it on the parallel decode
 // workers (turning each block's []Event into an opaque payload) and the engine
-// delivers that payload via Emit — moving the per-event conversion + batching off
+// delivers that payload via emit — moving batch assembly and typed decoding off
 // the single serial reassembler goroutine, which is the backfill scaling ceiling
-// (#142). When Transform is nil the engine uses the legacy per-event batcher path
+// (#142). When transform is nil the engine uses the per-event batcher path
 // unchanged.
 //
-// Emit receives the whole EntryResult (not just the payload) so the engine can
+// emit receives the whole entryResult (not just the payload) so the engine can
 // route an error result through the error path before ever asserting the payload
 // type. The live-tail phase always uses the serial batcher regardless — only the
 // high-volume backfill phase takes the fast path.
-type BackfillSink struct {
-	// Transform converts one decoded block's events into a ready-to-deliver
+type backfillSink struct {
+	// transform converts one decoded block's events into a ready-to-deliver
 	// payload, on the decode workers. nil disables the fast path.
-	Transform func(entryIdx int, evs []Event) any
-	// Emit delivers one non-error block payload (EntryResult.Payload) in seq
+	transform func(entryIdx int, evs []Event) any
+	// emit delivers one non-error block payload (entryResult.Payload) in seq
 	// order; returns false to stop. Only called for non-error results.
-	Emit func(EntryResult) bool
+	emit func(entryResult) bool
 }
 
 // Run drives the stream until ctx is cancelled or the consumer stops. It emits
 // batches via emitBatch (returns false to stop) and recoverable errors via
 // emitErr (returns false to stop). Run blocks until the stream ends.
 //
-// Run uses the legacy per-event batcher for backfill. To take the parallel
-// backfill fast path, use RunWithBackfill with a non-nil BackfillSink.
-func (e *Engine) Run(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
-	e.RunWithBackfill(ctx, emitBatch, emitErr, BackfillSink{})
+// Run uses the per-event batcher for backfill. To take the parallel
+// backfill fast path, use runWithBackfill with a non-nil backfillSink.
+func (e *replayEngine) Run(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
+	e.runWithBackfill(ctx, emitBatch, emitErr, backfillSink{})
 }
 
-// RunWithBackfill is Run with an optional backfill fast path (see BackfillSink).
-// A zero BackfillSink (nil Transform) is exactly equivalent to Run.
-func (e *Engine) RunWithBackfill(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
+// runWithBackfill is Run with an optional backfill fast path (see backfillSink).
+// A zero backfillSink (nil transform) is exactly equivalent to Run.
+func (e *replayEngine) runWithBackfill(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf backfillSink) {
+	e.resetStats()
 	// Reset the row matcher to the configured request at the START of every run.
 	// A §14 re-backfill mutates the matcher's seq floor (setAfterSeq below), and
-	// the matcher is long-lived engine state (built once in NewEngine, reused for
+	// the matcher is long-lived engine state (built once in newReplayEngine, reused for
 	// the Client's lifetime). The public Client permits sequential — not
 	// concurrent — Events() re-iterations, so without this reset a later run
 	// would inherit the prior run's elevated floor and silently drop every row in
@@ -241,7 +249,7 @@ func (e *Engine) RunWithBackfill(ctx context.Context, emitBatch func([]Event) bo
 	// single-goroutine), so this races nothing. A nil matcher (match-all) stays
 	// nil.
 	if e.matcher != nil {
-		e.matcher = NewMatcher(e.cfg.Request)
+		e.matcher = newMatcher(e.cfg.Request)
 	}
 	// rebackfillStalls counts CONSECUTIVE non-advancing §14 cycles within the
 	// current run (the anti-ping-pong guard). It is long-lived engine state like
@@ -263,7 +271,7 @@ func (e *Engine) RunWithBackfill(ctx context.Context, emitBatch func([]Event) bo
 
 // runLiveOnly is the pure live-tail path (no backfill options): tail from the
 // caller's saved cursor (or the current tip) with no archive negotiation.
-func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
+func (e *replayEngine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool) {
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 	liveCtx, stopLive := context.WithCancel(ctx)
 	defer stopLive()
@@ -340,19 +348,15 @@ func (e *Engine) runLiveOnly(ctx context.Context, emitBatch func([]Event) bool, 
 // There is no client-side tombstone suppression (design §5.1): every matching
 // row is delivered and a folding consumer converges. Shared by the live-only
 // path and the backfill cutover tail. A nil matcher matches everything.
-func (e *Engine) wantsLive(ev *Event) bool {
-	if e.matcher == nil {
-		return true
-	}
-	se := segmentViewOf(ev)
-	return e.matcher.Wants(&se)
+func (e *replayEngine) wantsLive(ev *Event) bool {
+	return e.matcher.wantsEvent(ev)
 }
 
 // startFlusher runs a background ticker that flushes the batcher's partial tail
 // at most every MaxBatchDelay, so a low-volume live tail delivers promptly. It
 // returns a stop function (idempotent) that halts the ticker and waits for it
 // to exit.
-func (e *Engine) startFlusher(ctx context.Context, b *batcher) func() {
+func (e *replayEngine) startFlusher(ctx context.Context, b *batcher) func() {
 	delay := e.cfg.MaxBatchDelay
 	if delay <= 0 {
 		delay = defaultMaxBatchDelay
@@ -394,7 +398,7 @@ func (e *Engine) startFlusher(ctx context.Context, b *batcher) func() {
 // Results may carry both decoded rows and a recoverable row-level error: the
 // valid rows are emitted first, then the error is surfaced. Whole-block failures
 // carry no rows and therefore route only through emitError. On the legacy path
-// (bf.Transform == nil) events flow through the per-event batcher exactly as
+// (bf.transform == nil) events flow through the per-event batcher exactly as
 // before.
 //
 // The returned stopped() reports whether the consumer asked to stop during the
@@ -402,10 +406,10 @@ func (e *Engine) startFlusher(ctx context.Context, b *batcher) func() {
 // batcher never sees the backfill events, so a stop is observed only via Emit
 // returning false and recorded here (FIX: the live phase must check THIS, not
 // only b.stopped()).
-func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (emit func(EntryResult) bool, stopped func() bool) {
-	if bf.Transform == nil {
+func (e *replayEngine) backfillEmitFunc(b *batcher, bf backfillSink, dl *downloader) (emit func(entryResult) bool, stopped func() bool) {
+	if bf.transform == nil {
 		// Legacy path: per-event batching on the serial reassembler goroutine.
-		return func(res EntryResult) bool {
+		return func(res entryResult) bool {
 			for _, ev := range res.Events {
 				if !b.add(ev) {
 					return false
@@ -419,12 +423,12 @@ func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (
 	}
 
 	// Fast path: workers run the transform in parallel; the reassembler hands us
-	// the ready payload, which we deliver via bf.Emit with no per-event work.
-	dl.SetTransform(bf.Transform)
+	// the ready payload, which we deliver via bf.emit with no per-event work.
+	dl.setTransform(bf.transform)
 	var consumerStopped bool
-	return func(res EntryResult) bool {
+	return func(res entryResult) bool {
 			if res.Payload != nil {
-				if !bf.Emit(res) {
+				if !bf.emit(res) {
 					consumerStopped = true
 					return false
 				}
@@ -467,7 +471,7 @@ func (e *Engine) backfillEmitFunc(b *batcher, bf BackfillSink, dl *Downloader) (
 // DID-level markers (#account/#identity/#sync) ride inline through every page
 // whose plan touches their blocks, via the §R4-revised sentinel index — no
 // snapshot, no client-side suppression. The folding consumer converges.
-func (e *Engine) sweepSealedArchive(ctx context.Context, dl *Downloader, emit func(EntryResult) bool, backfillStopped func() bool, startCursor uint64) (sealedTip uint64, stopped bool, err error) {
+func (e *replayEngine) sweepSealedArchive(ctx context.Context, dl *downloader, emit func(entryResult) bool, backfillStopped func() bool, startCursor uint64) (sealedTip uint64, stopped bool, err error) {
 	cursor := startCursor
 	pinned := false
 	for {
@@ -478,16 +482,23 @@ func (e *Engine) sweepSealedArchive(ctx context.Context, dl *Downloader, emit fu
 			req.HasBeforeSeq = true
 			req.BeforeSeq = sealedTip
 		}
-		plan, perr := e.planner.Plan(ctx, req)
+		plan, perr := e.planner.archivePlan(ctx, req)
 		if perr != nil {
 			return sealedTip, false, perr
 		}
 		if !pinned {
 			sealedTip = plan.SealedTipSeq
 			pinned = true
+			e.recordSweepStart(sealedTip, cursor)
 		}
 		if derr := dl.Download(ctx, plan.Entries, emit); derr != nil {
 			return sealedTip, false, derr // ctx cancelled
+		}
+		// Download returns nil for a consumer-driven stop. Check that outcome
+		// before counting the page: its remaining blocks were cancelled and the
+		// continuation cursor has not been fully delivered.
+		if backfillStopped() {
+			return sealedTip, true, nil
 		}
 		// Record the page only AFTER it is downloaded + emitted: Stats.Pages is
 		// documented as pages "downloaded" and ResidualGap as seqs "still to be
@@ -496,11 +507,6 @@ func (e *Engine) sweepSealedArchive(ctx context.Context, dl *Downloader, emit fu
 		// would falsely report convergence on the final page before the sweep's
 		// last download completes).
 		e.recordPage(sealedTip, plan.PlannedThroughSeq)
-		// backfillStopped() (not just b.stopped()): on the fast path the consumer
-		// stop is observed via bf.Emit returning false, NOT through the batcher.
-		if backfillStopped() {
-			return sealedTip, true, nil
-		}
 
 		prevCursor := cursor
 		cursor = plan.PlannedThroughSeq
@@ -529,11 +535,11 @@ func (e *Engine) sweepSealedArchive(ctx context.Context, dl *Downloader, emit fu
 // reachable via the live tail and are therefore NOT delivered by a dump. That is
 // the defining trade-off of BackfillOnly: a clean point-in-time slice of the
 // sealed archive, not the full up-to-the-instant stream.
-func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
+func (e *replayEngine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf backfillSink) {
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
-	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
-	dl.SetRecordMode(e.cfg.recordMode())
-	dl.SetSegmentStripes(e.cfg.SegmentStripes)
+	dl := newDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher.wantsSegment)
+	dl.setRecordMode(e.cfg.recordMode())
+	dl.setSegmentStripes(e.cfg.SegmentStripes)
 	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
 
 	_, _, err := e.sweepSealedArchive(ctx, dl, emit, backfillStopped, e.cfg.Request.AfterSeq)
@@ -544,7 +550,7 @@ func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bo
 	}
 
 	// Flush the partial tail. On the fast path b carries no backfill events (they
-	// went straight through bf.Emit), so this is a no-op there.
+	// went straight through bf.emit), so this is a no-op there.
 	if !b.stopped() {
 		b.flush()
 	}
@@ -569,11 +575,11 @@ func (e *Engine) runBackfillOnly(ctx context.Context, emitBatch func([]Event) bo
 // The archive download alone is the historical record; backfill emits every
 // matching row with no tombstone suppression — a folding consumer converges
 // (design §5.1, §R1). DID-level markers ride inline via the sentinel index.
-func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf BackfillSink) {
+func (e *replayEngine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf backfillSink) {
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
-	dl := NewDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher)
-	dl.SetRecordMode(e.cfg.recordMode())
-	dl.SetSegmentStripes(e.cfg.SegmentStripes)
+	dl := newDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher.wantsSegment)
+	dl.setRecordMode(e.cfg.recordMode())
+	dl.setSegmentStripes(e.cfg.SegmentStripes)
 	emit, backfillStopped := e.backfillEmitFunc(b, bf, dl)
 
 	// loopCtx unwinds the whole engine when the consumer breaks the iterator. The
@@ -623,12 +629,12 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		}
 
 		// Flush the live tail's partially-filled batch BEFORE the next sweep. On
-		// the fast path (bf.Transform set, which production uses) live cutover rows
+		// the fast path (bf.transform set, which production uses) live cutover rows
 		// go through the serial batcher b while re-backfill archive rows are
-		// emitted directly via bf.Emit, bypassing b. The live rows that advanced
+		// emitted directly via bf.emit, bypassing b. The live rows that advanced
 		// resume (seq in (cutover, resume]) may still sit in b.buf — add() only
 		// auto-flushes at batch size. The next sweep emits archive rows with
-		// seq > resume via bf.Emit; without this flush those newer rows reach the
+		// seq > resume via bf.emit; without this flush those newer rows reach the
 		// consumer BEFORE the buffered older live rows (which would otherwise
 		// flush only on the periodic flusher tick or the final flush), inverting
 		// delivery order at the seam. A folding consumer still converges, but the
@@ -670,7 +676,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 		// covered (origAfter, cutover]; the live tail covered (cutover, resume]),
 		// and a genuinely-new event has seq > resume, so raising the floor to
 		// resume can never drop an undelivered row. dl.selector IS e.matcher (same
-		// pointer, NewDownloader above), and the live consumer that read e.matcher
+		// pointer, newDownloader above), and the live consumer that read e.matcher
 		// has already returned, so this between-sweeps write races nothing.
 		e.matcher.setAfterSeq(resume)
 
@@ -704,7 +710,7 @@ func (e *Engine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event
 // so the server's inclusive replay of cutover itself is deduped, and the first
 // genuinely-new live event (seq > cutover) passes. No rewind margin is needed —
 // the consumer's seq dedup makes the seam at-least-once with no gap (design §13).
-func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover uint64) (resume uint64, tooOld bool) {
+func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover uint64) (resume uint64, tooOld bool) {
 	consumer := newLiveConsumer(liveConfig{
 		host:        e.cfg.Host,
 		zstdDict:    e.fetchZstdDict(ctx),
@@ -734,11 +740,11 @@ func (e *Engine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover ui
 }
 
 // fetchZstdDict fetches the server's current live-tail compression
-// dictionary when the caller opted in (Config.ZstdCompression). Returns nil
+// dictionary when the caller opted in (engineConfig.ZstdCompression). Returns nil
 // when the opt-in is off or the fetch fails: compression is an optimization,
 // so a fetch failure degrades to an uncompressed tail (logged) rather than
 // failing the stream.
-func (e *Engine) fetchZstdDict(ctx context.Context) []byte {
+func (e *replayEngine) fetchZstdDict(ctx context.Context) []byte {
 	if !e.cfg.ZstdCompression {
 		return nil
 	}

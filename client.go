@@ -11,30 +11,16 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	iclient "github.com/bluesky-social/jetstream/internal/client"
 )
 
-// ErrFatal marks a terminal error yielded by Events: the stream has aborted and
-// will deliver no further events (e.g. the snapshot plan was rejected or a
-// cutover guarantee could not be met). Test for it with errors.Is(err,
-// ErrFatal). Errors that are NOT ErrFatal are recoverable — a single bad
-// segment or a transient live-tail read — and iteration continues past them.
-var ErrFatal = iclient.ErrFatal
-
-// Client is a Jetstream v2 consumer. Construct one with Subscribe. A Client
+// Client is a Jetstream replay consumer. Construct one with Subscribe. A Client
 // drives at most one Events iteration at a time; create separate Clients for
 // concurrent streams. Close releases its resources and is safe to call
 // concurrently with a running Events (the natural way to stop a live tail) and
 // to call more than once.
 type Client struct {
-	cfg    config
-	host   string // normalized base URL, e.g. "https://host"
 	engine engine
 
-	// closed reports whether Close has been called. atomic so a concurrent
-	// Close can interrupt a running Events without a data race; closeOnce
-	// makes Close idempotent and engine.close() run exactly once.
 	closed    atomic.Bool
 	closeOnce sync.Once
 	closeErr  error
@@ -42,7 +28,7 @@ type Client struct {
 
 // Batch is a group of events delivered together by the Events iterator. It
 // amortizes per-event overhead (notably cursor persistence): handle the whole
-// batch, then save LastCursor once.
+// batch, then save LastCursor to your database of choice once.
 type Batch struct {
 	events []Event
 }
@@ -64,16 +50,15 @@ func (b *Batch) LastCursor() uint64 {
 	return max
 }
 
-// Stats is a point-in-time snapshot of backfill-loop progress, returned by
+// Stats is a point-in-time snapshot of replay-loop progress, returned by
 // Client.Stats. The Jetstream client library has no metrics registry, so this
-// accessor is how a caller observes how far a backfill has progressed and the
+// accessor is how a caller observes how far a replay has progressed and the
 // residual gap a sustained-ingest stream is still closing before cutover.
 type Stats struct {
-	// Pages is the number of planSnapshot pages downloaded across all sweeps
-	// (including §14 re-backfill cycles). Monotonically non-decreasing.
+	// Pages is the number of planSnapshot pages downloaded across the replay thus far.
 	Pages uint64
-	// SealedTip is the most recently learned sealed-archive tip S — the pinned
-	// pagination goal of the current sweep.
+	// SealedTip is the most recently learned sealed-archive (the pinned
+	// pagination goal of the current sweep).
 	SealedTip uint64
 	// PlannedThrough is the continuation cursor reached so far: the highest
 	// sealed seq accounted for. Equals SealedTip once a sweep completes.
@@ -124,12 +109,7 @@ func Subscribe(host string, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
-	eng, err := newEngine(base, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Client{cfg: cfg, host: base, engine: eng}, nil
+	return &Client{engine: newEngine(base, cfg)}, nil
 }
 
 // Events streams event batches in delivery order until ctx is cancelled or a
@@ -181,10 +161,8 @@ func (c *Client) Close() error {
 // API misuse from surfacing as a nil-pointer panic during cleanup or iteration.
 var errClientNotInitialized = fmt.Errorf("jetstream: client not initialized (use Subscribe)")
 
-// engine is the internal seam between the public Client and the orchestration
-// implementation (planning, paginated download, cutover, live tail). The
-// concrete engine is wired in subsequent work; this interface keeps the public
-// surface stable while that lands.
+// engine is the narrow seam between the public iterator and the replay
+// implementation. Tests substitute small scripted engines through it.
 type engine interface {
 	// run drives the stream, invoking yield for each batch or recoverable
 	// error. It returns when ctx is done, the stream ends, or yield returns

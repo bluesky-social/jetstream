@@ -17,7 +17,7 @@ Agent-facing living docs, in a good reading order for getting oriented:
 - `specs/invariants.md` — the short list of rules that must never break. Read before changing anything on the ingest, storage, or serve paths.
 - `specs/glossary.md` — one-line definitions of the terms that show up everywhere.
 - `specs/gotchas.md` — accepted limitations and hard-won lessons: things that look like bugs but are deliberate, and mistakes not worth making twice.
-- `specs/client.md` — the client protocol end to end: archive negotiation, download/decode, cutover, live tail, wire compression, and the failure modes at each seam. Read before changing `internal/client`, the module-root API, or anything on the network.bsky.jetstream.subscribeEvents (v2) wire contract.
+- `specs/client.md` — the client protocol end to end: archive negotiation, download/decode, cutover, live tail, wire compression, and the failure modes at each seam. Read before changing the module-root client or anything on the network.bsky.jetstream.subscribeEvents (v2) wire contract.
 - `specs/oracle.md` — the source of truth for the oracle/simulator testing rig.
 - `specs/mutation.md` — how the mutation campaign measures the oracle's bug-detection power.
 
@@ -26,6 +26,7 @@ These summarize and route; `docs/README.md` and each package's `doc.go` remain a
 ## Repo layout
 
 ```
+*.go              public Go client API
 cmd/
   jetstream/      main binary: serve, inspect-segment, timestamp import, version
   simulator/      local PLC + PDS + Relay on :7777
@@ -38,7 +39,6 @@ internal/
     syncstate/    sync 1.1 resync bookkeeping
   subscribe/      websocket /subscribe endpoint (v1 protocol parity) + cold reader
   xrpcapi/        archive download over HTTP/XRPC (planSnapshot, getSegment, getBlock)
-  client/         thick Go client: archive negotiation, fold, cutover to live
   server/         HTTP listeners (public :8080, opt-in debug :6060) and middleware
   store/          pebble-backed cursor + metadata store
   manifest/       segment manifest (directory scan + self-describing headers)
@@ -144,4 +144,3 @@ Use the package-level metrics/tracer rather than rolling your own. `obs.Tracer("
 | hot-path code (segment writer/sealer) | `just bench ./segment` and compare against the baseline |
 
 When in doubt, `specs/oracle.md` explains which tier catches which class of bug.
-

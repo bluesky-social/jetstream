@@ -1,4 +1,4 @@
-package client
+package jetstream
 
 import (
 	"bytes"
@@ -139,8 +139,8 @@ func (as *archiveServer) addSegmentWithBlockSize(t *testing.T, name string, even
 	as.mu.Unlock()
 }
 
-func (as *archiveServer) downloader(concurrency int) *Downloader {
-	return NewDownloader(&xrpc.Client{Host: as.srv.URL}, concurrency, nil)
+func (as *archiveServer) downloader(concurrency int) *downloader {
+	return newDownloader(&xrpc.Client{Host: as.srv.URL}, concurrency, nil)
 }
 
 // noKeepAliveDownloader builds a downloader whose HTTP transport disables
@@ -149,10 +149,10 @@ func (as *archiveServer) downloader(concurrency int) *Downloader {
 // MaxIdleConns) otherwise accumulate independently of the pipeline and swamp the
 // signal. Disabling keep-alives makes every connection tear down promptly so the
 // count reflects only pipeline goroutines.
-func (as *archiveServer) noKeepAliveDownloader(concurrency int) *Downloader {
+func (as *archiveServer) noKeepAliveDownloader(concurrency int) *downloader {
 	hc := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 	xc := &xrpc.Client{Host: as.srv.URL, HTTPClient: gt.Some(hc)}
-	return NewDownloader(xc, concurrency, nil)
+	return newDownloader(xc, concurrency, nil)
 }
 
 // makeCreate builds a create-commit segment row carrying a minimal CBOR record.
@@ -192,11 +192,11 @@ func makeCreateWithPayload(seq uint64, did, collection, rkey string, payload []b
 // Index, so indices must be NON-DECREASING (not strictly +1 per call) and must
 // still cover every entry's index contiguously from 0 (no entry skipped, no
 // out-of-order interleaving across entries).
-func collectOrdered(t *testing.T, d *Downloader, entries []PlanEntry) []Event {
+func collectOrdered(t *testing.T, d *downloader, entries []planEntry) []Event {
 	t.Helper()
 	var all []Event
 	lastIdx := -1
-	err := d.Download(context.Background(), entries, func(res EntryResult) bool {
+	err := d.Download(context.Background(), entries, func(res entryResult) bool {
 		require.NoError(t, res.Err, "entry %d (%s)", res.Index, res.Entry.SegmentName)
 		require.GreaterOrEqual(t, res.Index, lastIdx,
 			"block emission must be in non-decreasing plan order")
@@ -224,7 +224,7 @@ func TestDownloadTransformOrdering(t *testing.T) {
 	as := newArchiveServer(t)
 	const nSeg = 30
 	const perSeg = 10 // 5 blocks/segment at MaxEventsPerBlock=2
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range nSeg {
 		var events []segment.Event
 		for i := range perSeg {
@@ -232,14 +232,14 @@ func TestDownloadTransformOrdering(t *testing.T) {
 			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
 		}
 		as.addSegment(t, segName(s), events)
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 	}
 
 	d := as.downloader(16)
 	// Transform boxes the block's first-event seq. Because the framer assigns
 	// dense ascending seq in plan order and blocks ascend within a segment, the
 	// per-block first-seqs are themselves strictly increasing in emit order.
-	d.SetTransform(func(_ int, evs []Event) any {
+	d.setTransform(func(_ int, evs []Event) any {
 		if len(evs) == 0 {
 			return nil
 		}
@@ -248,7 +248,7 @@ func TestDownloadTransformOrdering(t *testing.T) {
 
 	var last int64 = -1
 	var count int
-	err := d.Download(context.Background(), entries, func(res EntryResult) bool {
+	err := d.Download(context.Background(), entries, func(res entryResult) bool {
 		require.NoError(t, res.Err)
 		require.Nil(t, res.Events, "fast path carries Payload, not Events")
 		first, ok := res.Payload.(uint64)
@@ -276,12 +276,12 @@ func TestDownloadDropsMalformedRecordNotWholeBlock(t *testing.T) {
 		makeCreate(t, 3, "did:plc:a", "app.bsky.feed.post", "good2"),
 	}, 4)
 
-	var results []EntryResult
-	err := as.downloader(1).Download(context.Background(), []PlanEntry{{
+	var results []entryResult
+	err := as.downloader(1).Download(context.Background(), []planEntry{{
 		SegmentName: segName(0),
 		Index:       0,
-		Mode:        ModeWholeSegment,
-	}}, func(res EntryResult) bool {
+		Mode:        modeWholeSegment,
+	}}, func(res entryResult) bool {
 		results = append(results, res)
 		return true
 	})
@@ -308,15 +308,15 @@ func TestDownloadTransformKeepsPayloadWithMalformedRecordError(t *testing.T) {
 	}, 4)
 
 	d := as.downloader(1)
-	d.SetTransform(func(_ int, evs []Event) any {
+	d.setTransform(func(_ int, evs []Event) any {
 		return seqs(evs)
 	})
-	var results []EntryResult
-	err := d.Download(context.Background(), []PlanEntry{{
+	var results []entryResult
+	err := d.Download(context.Background(), []planEntry{{
 		SegmentName: segName(0),
 		Index:       0,
-		Mode:        ModeWholeSegment,
-	}}, func(res EntryResult) bool {
+		Mode:        modeWholeSegment,
+	}}, func(res entryResult) bool {
 		results = append(results, res)
 		return true
 	})
@@ -328,14 +328,14 @@ func TestDownloadTransformKeepsPayloadWithMalformedRecordError(t *testing.T) {
 
 // TestDownloadTransformPanicNoHang guards FIX #1: a transform that panics on one
 // block must NOT wedge Download (a dead worker would hang pool.Wait→close(results)).
-// The panic must surface as an in-order recoverable EntryResult.Err, after the
+// The panic must surface as an in-order recoverable entryResult.Err, after the
 // good prefix, and Download must return. The test's own timeout converts a
 // regression (hang) into a failure rather than a stuck run.
 func TestDownloadTransformPanicNoHang(t *testing.T) {
 	t.Parallel()
 	as := newArchiveServer(t)
 	const nSeg = 8
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range nSeg {
 		var events []segment.Event
 		for i := range 4 { // 2 blocks/segment
@@ -343,13 +343,13 @@ func TestDownloadTransformPanicNoHang(t *testing.T) {
 			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
 		}
 		as.addSegment(t, segName(s), events)
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 	}
 
 	d := as.downloader(8)
 	// Panic on the block whose first event seq is in the 3rd segment.
 	panicSeq := uint64(2*1000 + 1)
-	d.SetTransform(func(_ int, evs []Event) any {
+	d.setTransform(func(_ int, evs []Event) any {
 		if len(evs) > 0 && evs[0].Seq == panicSeq {
 			panic("boom in transform")
 		}
@@ -364,7 +364,7 @@ func TestDownloadTransformPanicNoHang(t *testing.T) {
 	var goodBefore int
 	go func() {
 		defer close(done)
-		_ = d.Download(context.Background(), entries, func(res EntryResult) bool {
+		_ = d.Download(context.Background(), entries, func(res entryResult) bool {
 			if res.Err != nil {
 				sawErr = res.Err
 				return false // stop after the surfaced panic-error
@@ -378,13 +378,13 @@ func TestDownloadTransformPanicNoHang(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Download hung after a transform panic (FIX #1 regression)")
 	}
-	require.Error(t, sawErr, "transform panic must surface as a recoverable EntryResult.Err")
+	require.Error(t, sawErr, "transform panic must surface as a recoverable entryResult.Err")
 	require.Contains(t, sawErr.Error(), "panicked")
 	require.Positive(t, goodBefore, "blocks before the panicking one must be delivered first")
 }
 
 // TestDownloadTransformErrorRouting guards FIX #3: on the fast path a per-block
-// decode error must still surface in order as EntryResult.Err with a nil Payload
+// decode error must still surface in order as entryResult.Err with a nil Payload
 // (so the caller routes it through the error path, never asserting the payload).
 // We corrupt one block's frame so its decode fails; the transform is never
 // reached for that block.
@@ -416,7 +416,7 @@ func TestDownloadTransformErrorRouting(t *testing.T) {
 
 	d := as.downloader(1)
 	transformCalls := 0
-	d.SetTransform(func(_ int, evs []Event) any {
+	d.setTransform(func(_ int, evs []Event) any {
 		transformCalls++
 		if len(evs) == 0 {
 			return nil
@@ -426,8 +426,8 @@ func TestDownloadTransformErrorRouting(t *testing.T) {
 
 	var payloads []uint64
 	var sawErr error
-	err = d.Download(context.Background(), []PlanEntry{{SegmentName: segName(0), Index: 0, Mode: ModeWholeSegment}},
-		func(res EntryResult) bool {
+	err = d.Download(context.Background(), []planEntry{{SegmentName: segName(0), Index: 0, Mode: modeWholeSegment}},
+		func(res entryResult) bool {
 			if res.Err != nil {
 				sawErr = res.Err
 				require.Nil(t, res.Payload, "an error result must carry no payload")
@@ -452,7 +452,7 @@ func TestDownloadTransformErrorRouting(t *testing.T) {
 func TestDownloadTransformNoGoroutineLeak(t *testing.T) {
 	as := newArchiveServer(t)
 	const nSeg = 20
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range nSeg {
 		var events []segment.Event
 		for i := range 6 {
@@ -460,7 +460,7 @@ func TestDownloadTransformNoGoroutineLeak(t *testing.T) {
 			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
 		}
 		as.addSegment(t, segName(s), events)
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 	}
 	settle := func() int {
 		for range 40 {
@@ -470,26 +470,26 @@ func TestDownloadTransformNoGoroutineLeak(t *testing.T) {
 		return runtime.NumGoroutine()
 	}
 	dl := as.noKeepAliveDownloader(8)
-	dl.SetTransform(func(_ int, evs []Event) any {
+	dl.setTransform(func(_ int, evs []Event) any {
 		if len(evs) == 0 {
 			return nil
 		}
 		return len(evs)
 	})
-	_ = collectViaTransform(dl, entries, func(EntryResult) bool { return true })
-	_ = collectViaTransform(dl, entries, func(EntryResult) bool { return false })
+	_ = collectViaTransform(dl, entries, func(entryResult) bool { return true })
+	_ = collectViaTransform(dl, entries, func(entryResult) bool { return false })
 	before := settle()
 	const runs = 15
 	for range runs {
-		_ = collectViaTransform(dl, entries, func(EntryResult) bool { return true })
-		_ = collectViaTransform(dl, entries, func(EntryResult) bool { return false })
+		_ = collectViaTransform(dl, entries, func(entryResult) bool { return true })
+		_ = collectViaTransform(dl, entries, func(entryResult) bool { return false })
 	}
 	after := settle()
 	require.LessOrEqual(t, after, before+5,
 		"goroutines must not grow across %d fast-path Download runs; before=%d after=%d", 2*runs, before, after)
 }
 
-func collectViaTransform(d *Downloader, entries []PlanEntry, emit func(EntryResult) bool) error {
+func collectViaTransform(d *downloader, entries []planEntry, emit func(entryResult) bool) error {
 	return d.Download(context.Background(), entries, emit)
 }
 
@@ -507,19 +507,19 @@ func TestDownloadStreamsPerBlock(t *testing.T) {
 		events = append(events, makeCreate(t, i, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(i, 10)))
 	}
 	as.addSegment(t, segName(0), events)
-	entries := []PlanEntry{{SegmentName: segName(0), Index: 0, Mode: ModeWholeSegment}}
+	entries := []planEntry{{SegmentName: segName(0), Index: 0, Mode: modeWholeSegment}}
 
 	var batches [][]uint64
-	err := as.downloader(4).Download(context.Background(), entries, func(res EntryResult) bool {
+	err := as.downloader(4).Download(context.Background(), entries, func(res entryResult) bool {
 		require.NoError(t, res.Err)
 		require.Equal(t, 0, res.Index)
 		batches = append(batches, seqs(res.Events))
 		return true
 	})
 	require.NoError(t, err)
-	// 3 blocks of 2, each emitted as its own EntryResult, in order.
+	// 3 blocks of 2, each emitted as its own entryResult, in order.
 	require.Equal(t, [][]uint64{{1, 2}, {3, 4}, {5, 6}}, batches,
-		"each block must be emitted as a separate EntryResult in ascending block order")
+		"each block must be emitted as a separate entryResult in ascending block order")
 }
 
 // TestDownloadLiveSetBoundedAcrossEntries is the regression guard for the #142
@@ -543,13 +543,13 @@ func TestDownloadLiveSetBoundedAcrossEntries(t *testing.T) {
 		}
 		as.addSegment(t, segName(s), events)
 	}
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range nSeg {
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 	}
 
 	var maxBlock, total int
-	err := as.downloader(4).Download(context.Background(), entries, func(res EntryResult) bool {
+	err := as.downloader(4).Download(context.Background(), entries, func(res entryResult) bool {
 		require.NoError(t, res.Err)
 		if len(res.Events) > maxBlock {
 			maxBlock = len(res.Events)
@@ -602,11 +602,11 @@ func TestDownloadEmitsBlockPrefixThenErrorMidSegment(t *testing.T) {
 	as.segments[segName(0)] = raw
 	as.mu.Unlock()
 
-	entries := []PlanEntry{{SegmentName: segName(0), Index: 0, Mode: ModeWholeSegment}}
+	entries := []planEntry{{SegmentName: segName(0), Index: 0, Mode: modeWholeSegment}}
 	var goodSeqs []uint64
 	var sawErr error
 	emitCalls := 0
-	err = as.downloader(1).Download(context.Background(), entries, func(res EntryResult) bool {
+	err = as.downloader(1).Download(context.Background(), entries, func(res entryResult) bool {
 		emitCalls++
 		if res.Err != nil {
 			sawErr = res.Err
@@ -617,7 +617,7 @@ func TestDownloadEmitsBlockPrefixThenErrorMidSegment(t *testing.T) {
 	})
 	require.NoError(t, err, "a mid-segment decode error is a per-entry error, not a Download failure")
 	require.Equal(t, []uint64{1, 2}, goodSeqs, "the good block prefix must be emitted before the error")
-	require.Error(t, sawErr, "the failing block must surface as an EntryResult error")
+	require.Error(t, sawErr, "the failing block must surface as an entryResult error")
 	require.Equal(t, 2, emitCalls, "exactly one good block then one error; no further blocks after the error")
 }
 
@@ -629,7 +629,7 @@ func TestDownloadEarlyStopMidSegmentCancels(t *testing.T) {
 	t.Parallel()
 	as := newArchiveServer(t)
 	const n = 30
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range n {
 		var events []segment.Event
 		for i := range 6 { // 3 blocks each
@@ -637,11 +637,11 @@ func TestDownloadEarlyStopMidSegmentCancels(t *testing.T) {
 			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
 		}
 		as.addSegment(t, segName(s), events)
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 	}
 
 	emitted := 0
-	err := as.downloader(1).Download(context.Background(), entries, func(EntryResult) bool {
+	err := as.downloader(1).Download(context.Background(), entries, func(entryResult) bool {
 		emitted++
 		return false // stop on the very first block
 	})
@@ -662,7 +662,7 @@ func TestDownloadParallelOrderingUnderShuffledCompletion(t *testing.T) {
 	as := newArchiveServer(t)
 	const nSeg = 40
 	const perSeg = 10 // 5 blocks/segment at MaxEventsPerBlock=2
-	var entries []PlanEntry
+	var entries []planEntry
 	var want []uint64
 	for s := range nSeg {
 		var events []segment.Event
@@ -672,7 +672,7 @@ func TestDownloadParallelOrderingUnderShuffledCompletion(t *testing.T) {
 			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
 		}
 		as.addSegment(t, segName(s), events)
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 	}
 
 	// High concurrency: decode order is effectively shuffled across the pool.
@@ -689,7 +689,7 @@ func TestDownloadConcurrencyEquivalence(t *testing.T) {
 	t.Parallel()
 	as := newArchiveServer(t)
 	const nSeg = 12
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range nSeg {
 		var events []segment.Event
 		for i := range 8 { // 4 blocks/segment
@@ -697,7 +697,7 @@ func TestDownloadConcurrencyEquivalence(t *testing.T) {
 			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
 		}
 		as.addSegment(t, segName(s), events)
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 	}
 
 	base := seqs(collectOrdered(t, as.downloader(1), entries))
@@ -719,7 +719,7 @@ func TestDownloadConcurrencyEquivalence(t *testing.T) {
 func TestDownloadNoGoroutineLeak(t *testing.T) {
 	as := newArchiveServer(t)
 	const nSeg = 20
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range nSeg {
 		var events []segment.Event
 		for i := range 6 {
@@ -731,11 +731,11 @@ func TestDownloadNoGoroutineLeak(t *testing.T) {
 		// spin-up/teardown (#292) — its workers/coordinator must unwind on both
 		// clean completion and early stop just like the rest of the pipeline.
 		if s%2 == 0 {
-			entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+			entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 		} else {
-			entries = append(entries, PlanEntry{
-				SegmentName: segName(s), Index: uint32(s), Mode: ModeBlocks,
-				Blocks: []BlockRange{{First: 0, Last: 2}},
+			entries = append(entries, planEntry{
+				SegmentName: segName(s), Index: uint32(s), Mode: modeBlocks,
+				Blocks: []blockRange{{First: 0, Last: 2}},
 			})
 		}
 	}
@@ -753,13 +753,13 @@ func TestDownloadNoGoroutineLeak(t *testing.T) {
 	// connection goroutines do not accumulate and the count reflects the pipeline.
 	dl := as.noKeepAliveDownloader(8)
 	_ = collectOrdered(t, dl, entries)
-	_ = dl.Download(context.Background(), entries, func(EntryResult) bool { return false })
+	_ = dl.Download(context.Background(), entries, func(entryResult) bool { return false })
 
 	before := settle()
 	const runs = 15
 	for range runs {
 		_ = collectOrdered(t, dl, entries)
-		_ = dl.Download(context.Background(), entries, func(EntryResult) bool { return false })
+		_ = dl.Download(context.Background(), entries, func(entryResult) bool { return false })
 	}
 	after := settle()
 	// The pipeline spawns ~concurrency+4 goroutines per Download; a per-run leak
@@ -779,7 +779,7 @@ func TestDownloadWholeSegment(t *testing.T) {
 	}
 	as.addSegment(t, "seg_0000000000.jss", events)
 
-	entries := []PlanEntry{{SegmentName: "seg_0000000000.jss", Index: 0, Mode: ModeWholeSegment, MinSeq: 1, MaxSeq: 3}}
+	entries := []planEntry{{SegmentName: "seg_0000000000.jss", Index: 0, Mode: modeWholeSegment, MinSeq: 1, MaxSeq: 3}}
 	got := collectOrdered(t, as.downloader(4), entries)
 
 	require.Len(t, got, 3)
@@ -805,9 +805,9 @@ func TestDownloadBlocksMode(t *testing.T) {
 	as.addSegment(t, "seg_0000000000.jss", events)
 
 	// Request only blocks 0 and 2 (seqs 1-2 and 5-6); skip block 1.
-	entries := []PlanEntry{{
-		SegmentName: "seg_0000000000.jss", Index: 0, Mode: ModeBlocks,
-		Blocks: []BlockRange{{First: 0, Last: 0}, {First: 2, Last: 2}},
+	entries := []planEntry{{
+		SegmentName: "seg_0000000000.jss", Index: 0, Mode: modeBlocks,
+		Blocks: []blockRange{{First: 0, Last: 0}, {First: 2, Last: 2}},
 	}}
 	got := collectOrdered(t, as.downloader(4), entries)
 
@@ -826,9 +826,9 @@ func TestDownloadOrderedAcrossEntries(t *testing.T) {
 			makeCreate(t, base+1, "did:plc:a", "app.bsky.feed.post", "r2"),
 		})
 	}
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range 5 {
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 	}
 
 	// High concurrency must not reorder emission.
@@ -842,13 +842,13 @@ func TestDownloadMissingSegmentReportsEntryError(t *testing.T) {
 	as := newArchiveServer(t)
 	as.addSegment(t, segName(0), []segment.Event{makeCreate(t, 1, "did:plc:a", "c", "r1")})
 
-	entries := []PlanEntry{
-		{SegmentName: segName(0), Index: 0, Mode: ModeWholeSegment},
-		{SegmentName: "seg_does_not_exist.jss", Index: 1, Mode: ModeWholeSegment},
+	entries := []planEntry{
+		{SegmentName: segName(0), Index: 0, Mode: modeWholeSegment},
+		{SegmentName: "seg_does_not_exist.jss", Index: 1, Mode: modeWholeSegment},
 	}
 
-	var results []EntryResult
-	err := as.downloader(2).Download(context.Background(), entries, func(res EntryResult) bool {
+	var results []entryResult
+	err := as.downloader(2).Download(context.Background(), entries, func(res entryResult) bool {
 		results = append(results, res)
 		return true
 	})
@@ -862,11 +862,11 @@ func TestDownloadContextCancel(t *testing.T) {
 	t.Parallel()
 	as := newArchiveServer(t)
 	as.addSegment(t, segName(0), []segment.Event{makeCreate(t, 1, "did:plc:a", "c", "r1")})
-	entries := []PlanEntry{{SegmentName: segName(0), Index: 0, Mode: ModeWholeSegment}}
+	entries := []planEntry{{SegmentName: segName(0), Index: 0, Mode: modeWholeSegment}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := as.downloader(2).Download(ctx, entries, func(EntryResult) bool { return true })
+	err := as.downloader(2).Download(ctx, entries, func(entryResult) bool { return true })
 	require.ErrorIs(t, err, context.Canceled)
 }
 
@@ -879,19 +879,19 @@ func TestDownloadEmitStopCancelsDownloads(t *testing.T) {
 	t.Parallel()
 	as := newArchiveServer(t)
 	const n = 50
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range n {
 		as.addSegment(t, segName(s), []segment.Event{
 			makeCreate(t, uint64(s*10+1), "did:plc:a", "app.bsky.feed.post", "r1"),
 		})
-		entries = append(entries, PlanEntry{SegmentName: segName(s), Index: uint32(s), Mode: ModeWholeSegment})
+		entries = append(entries, planEntry{SegmentName: segName(s), Index: uint32(s), Mode: modeWholeSegment})
 	}
 
 	// concurrency=1 makes the bound tight: with early cancel, the producer must
 	// stop launching after the consumer bails, so the server sees far fewer
 	// than n getSegment calls.
 	var emitted int
-	err := as.downloader(1).Download(context.Background(), entries, func(EntryResult) bool {
+	err := as.downloader(1).Download(context.Background(), entries, func(entryResult) bool {
 		emitted++
 		return false // stop immediately after the first entry
 	})
@@ -945,10 +945,10 @@ func TestDownloadBlocksMaxUint32NoWraparound(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	d := NewDownloader(&xrpc.Client{Host: srv.URL}, 1, nil)
-	entries := []PlanEntry{{
-		SegmentName: "seg_max.jss", Index: 0, Mode: ModeBlocks,
-		Blocks: []BlockRange{{First: math.MaxUint32, Last: math.MaxUint32}},
+	d := newDownloader(&xrpc.Client{Host: srv.URL}, 1, nil)
+	entries := []planEntry{{
+		SegmentName: "seg_max.jss", Index: 0, Mode: modeBlocks,
+		Blocks: []blockRange{{First: math.MaxUint32, Last: math.MaxUint32}},
 	}}
 
 	got := collectOrdered(t, d, entries)
@@ -1013,9 +1013,9 @@ func TestDownloadBlocksFetchInParallel(t *testing.T) {
 		events = append(events, makeCreate(t, i, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(i, 10)))
 	}
 	as.addSegment(t, segName(0), events)
-	entries := []PlanEntry{{
-		SegmentName: segName(0), Index: 0, Mode: ModeBlocks,
-		Blocks: []BlockRange{{First: 0, Last: 15}},
+	entries := []planEntry{{
+		SegmentName: segName(0), Index: 0, Mode: modeBlocks,
+		Blocks: []blockRange{{First: 0, Last: 15}},
 	}}
 
 	const conc = 4
@@ -1031,7 +1031,7 @@ func TestDownloadBlocksFetchInParallel(t *testing.T) {
 		close(gate.release)
 	}()
 
-	d := NewDownloader(&xrpc.Client{Host: srv.URL}, conc, nil)
+	d := newDownloader(&xrpc.Client{Host: srv.URL}, conc, nil)
 	done := make(chan []Event, 1)
 	go func() { done <- collectOrdered(t, d, entries) }()
 	select {
@@ -1058,15 +1058,15 @@ func TestDownloadBlocksParallelAcrossEntries(t *testing.T) {
 	t.Parallel()
 	as := newArchiveServer(t)
 	const nSeg = 8
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range nSeg {
 		as.addSegment(t, segName(s), []segment.Event{
 			makeCreate(t, uint64(s*10+1), "did:plc:a", "app.bsky.feed.post", "r1"),
 			makeCreate(t, uint64(s*10+2), "did:plc:a", "app.bsky.feed.post", "r2"),
 		})
-		entries = append(entries, PlanEntry{
-			SegmentName: segName(s), Index: uint32(s), Mode: ModeBlocks,
-			Blocks: []BlockRange{{First: 0, Last: 0}},
+		entries = append(entries, planEntry{
+			SegmentName: segName(s), Index: uint32(s), Mode: modeBlocks,
+			Blocks: []blockRange{{First: 0, Last: 0}},
 		})
 	}
 
@@ -1079,7 +1079,7 @@ func TestDownloadBlocksParallelAcrossEntries(t *testing.T) {
 		close(gate.release)
 	}()
 
-	d := NewDownloader(&xrpc.Client{Host: srv.URL}, 8, nil)
+	d := newDownloader(&xrpc.Client{Host: srv.URL}, 8, nil)
 	done := make(chan []Event, 1)
 	go func() { done <- collectOrdered(t, d, entries) }()
 	select {
@@ -1122,15 +1122,15 @@ func TestDownloadBlocksErrorStopsEntryNotPlan(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	entries := []PlanEntry{
-		{SegmentName: segName(0), Index: 0, Mode: ModeBlocks, Blocks: []BlockRange{{First: 0, Last: 2}}},
-		{SegmentName: segName(1), Index: 1, Mode: ModeBlocks, Blocks: []BlockRange{{First: 0, Last: 2}}},
+	entries := []planEntry{
+		{SegmentName: segName(0), Index: 0, Mode: modeBlocks, Blocks: []blockRange{{First: 0, Last: 2}}},
+		{SegmentName: segName(1), Index: 1, Mode: modeBlocks, Blocks: []blockRange{{First: 0, Last: 2}}},
 	}
-	d := NewDownloader(&xrpc.Client{Host: srv.URL}, 8, nil)
+	d := newDownloader(&xrpc.Client{Host: srv.URL}, 8, nil)
 
 	var perEntry [2][]uint64
 	var entry0Err error
-	err := d.Download(context.Background(), entries, func(res EntryResult) bool {
+	err := d.Download(context.Background(), entries, func(res entryResult) bool {
 		if res.Err != nil {
 			require.Equal(t, 0, res.Index, "only entry 0 may error")
 			require.Nil(t, res.Events)
@@ -1153,7 +1153,7 @@ func TestDownloadBlocksConcurrencyEquivalence(t *testing.T) {
 	t.Parallel()
 	as := newArchiveServer(t)
 	const nSeg = 6
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range nSeg {
 		var events []segment.Event
 		for i := range 8 { // 4 blocks
@@ -1162,9 +1162,9 @@ func TestDownloadBlocksConcurrencyEquivalence(t *testing.T) {
 		}
 		as.addSegment(t, segName(s), events)
 		// Skip block 2 of each segment to exercise sparse ranges.
-		entries = append(entries, PlanEntry{
-			SegmentName: segName(s), Index: uint32(s), Mode: ModeBlocks,
-			Blocks: []BlockRange{{First: 0, Last: 1}, {First: 3, Last: 3}},
+		entries = append(entries, planEntry{
+			SegmentName: segName(s), Index: uint32(s), Mode: modeBlocks,
+			Blocks: []blockRange{{First: 0, Last: 1}, {First: 3, Last: 3}},
 		})
 	}
 
@@ -1183,7 +1183,7 @@ func TestDownloadBlocksEarlyStopNoLeak(t *testing.T) {
 	t.Parallel()
 	as := newArchiveServer(t)
 	const nSeg = 20
-	var entries []PlanEntry
+	var entries []planEntry
 	for s := range nSeg {
 		var events []segment.Event
 		for i := range 6 {
@@ -1191,14 +1191,14 @@ func TestDownloadBlocksEarlyStopNoLeak(t *testing.T) {
 			events = append(events, makeCreate(t, seq, "did:plc:a", "app.bsky.feed.post", "r"+strconv.FormatUint(seq, 10)))
 		}
 		as.addSegment(t, segName(s), events)
-		entries = append(entries, PlanEntry{
-			SegmentName: segName(s), Index: uint32(s), Mode: ModeBlocks,
-			Blocks: []BlockRange{{First: 0, Last: 2}},
+		entries = append(entries, planEntry{
+			SegmentName: segName(s), Index: uint32(s), Mode: modeBlocks,
+			Blocks: []blockRange{{First: 0, Last: 2}},
 		})
 	}
 
 	emitted := 0
-	err := as.downloader(4).Download(context.Background(), entries, func(EntryResult) bool {
+	err := as.downloader(4).Download(context.Background(), entries, func(entryResult) bool {
 		emitted++
 		return false
 	})

@@ -4,9 +4,10 @@ How a Jetstream client — the bundled Go client or any third-party
 implementation — negotiates the archive, downloads history, tails live, and
 survives the failure modes in between. This is the client-side counterpart to
 `docs/README.md` §5 (which owns the wire formats) and `specs/architecture.md`
-(the system map). The bundled Go client lives in `internal/client` with its
-public API at the module root; `internal/client`'s code comments are
-authoritative for implementation details — when this file disagrees with
+(the system map). The bundled Go client lives at the module root: its public
+API is concentrated in `client.go`, `event.go`, `options.go`, and `typed.go`;
+the remaining root client files are unexported implementation. Code comments
+are authoritative for implementation details — when this file disagrees with
 them, fix this file.
 
 Design references: low-numbered "§N" (§2, §5) cite `docs/README.md`;
@@ -50,7 +51,7 @@ below.
    filter constrains only commit events, so `#account`/`#identity`/`#sync`
    are delivered regardless of it (still gated by `dids`) — they are the
    only purge signal a folding consumer gets (§5, "unconditional events").
-   The bundled client's exact matcher (`internal/client/filter.go`) honors
+   The bundled client's exact matcher (`filter.go`) honors
    this. A consumer that wants a commits-only stream must say so
    explicitly with `kinds=commit`.
 4. **Cursors are instance-local.** Switching servers means rewinding a
@@ -59,8 +60,8 @@ below.
 ## Phase 1: archive negotiation (planSnapshot)
 
 `network.bsky.jetstream.planSnapshot` (lexicon:
-`lexicons/network/bsky/jetstream/planSnapshot.json`; client:
-`internal/client/planner.go`; server: `internal/xrpcapi/plansnapshot.go`) is
+`lexicons/network/bsky/jetstream/planSnapshot.json`; client: `planner.go`;
+server: `internal/xrpcapi/plansnapshot.go`) is
 a **transport planner only**: it names which immutable artifacts might
 contain matching rows. Exact filtering, decoding, and folding stay
 client-side.
@@ -95,8 +96,8 @@ row selector below the floor (see the re-backfill subtlety in Phase 4).
 
 ## Phase 2: download + decode (the sweep)
 
-`Engine.sweepSealedArchive` (`internal/client/engine.go:444`) pages the plan
-and hands work units to the `Downloader` (`internal/client/downloader.go`):
+`replayEngine.sweepSealedArchive` (`client_core.go`) pages the plan and hands
+work units to the downloader (`downloader.go`):
 
 - **Parallelism**: `concurrency` decode workers (default `GOMAXPROCS`
   clamped to [4, 32]; override `WithDownloadConcurrency`) decompress and
@@ -109,10 +110,10 @@ and hands work units to the `Downloader` (`internal/client/downloader.go`):
 - **Filtering**: the exact row selector (the client's matcher) runs per row
   before decode surfaces it; the plan's over-approximation (whole blocks)
   is trimmed here.
-- **Fast path**: `BackfillSink.Transform` (engine.go:197) moves per-event
-  conversion onto the decode workers and delivers block-sized payloads via
-  `Emit` in seq order, bypassing the per-event batcher (the #142
-  throughput path). `Run` without a sink uses the legacy batcher.
+- **Fast path**: worker transforms construct block-aligned `Batch` or
+  `TypedBatch[T]` values directly from the decoded public `Event` slice and
+  deliver them in seq order, bypassing the serial per-event batcher (the #142
+  throughput path). Typed CBOR decoding therefore stays parallel too.
 
 **Error contract**: per-block download/decode failures stream as in-order
 recoverable errors — the good prefix of an entry's blocks is emitted, then
@@ -141,7 +142,7 @@ websocket once with `?cursor=max(S, lastProcessedSeq)`.
 
 ## Phase 4: the live tail and its failure modes
 
-`liveConsumer` (`internal/client/live.go`) runs dial → read → decode → dedup
+`liveConsumer` (`live.go`) runs dial → read → decode → dedup
 → emit, reconnecting on error with exponential backoff (250ms → 30s,
 progress resets it).
 
