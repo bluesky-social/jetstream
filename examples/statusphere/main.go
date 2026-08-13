@@ -66,6 +66,8 @@ func run(ctx context.Context, args *CLIArgs) error {
 	}
 	defer client.Close() // Don't forget to clean up!
 
+	count := uint64(0)
+
 	// Start our client loop
 	for batch, err := range jetstream.TypedEvents[statusphere.StatusphereStatus](ctx, client, collection) {
 		if err != nil {
@@ -87,7 +89,8 @@ func run(ctx context.Context, args *CLIArgs) error {
 			}
 
 			// `event` now represents a strongly typed instance of xyz.statusphere.status
-			fmt.Printf("%s had the status %s\n", event.Event.DID, event.Record.Status)
+			count += 1
+			fmt.Printf("%s had the status %s, seen %d so far\n", event.Event.DID, event.Record.Status, count)
 		}
 
 		// You should persist this cursor to your database of choice
