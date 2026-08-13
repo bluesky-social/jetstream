@@ -3,6 +3,8 @@
 // Be sure to set the JETSTREAM_API_KEY environment variable if your server requires auth.
 //
 // See the documentation for more information https://pkg.go.dev/github.com/bluesky-social/jetstream
+//
+// See also the statusphere example repo https://github.com/bluesky-social/statusphere-example-app/
 package main
 
 import (
@@ -44,7 +46,9 @@ func run(ctx context.Context, args *CLIArgs) error {
 		// Using TypedEvents can result in MUCH faster client decode performance,
 		// if you know the single collection you care about ahead of time. To do so,
 		// set `WithRawRecords` and use the alternate `TypedEvents` implementation
-		// like we do below.
+		// like we do below. This is a super specialized implementation and is pretty
+		// inflexible. If you are unsure what to use, don't use `TypedEvents`; just go
+		// with the basic `jetstream.Subscribe` implemenation.
 		jetstream.WithRawRecords(),
 	}
 
@@ -52,13 +56,7 @@ func run(ctx context.Context, args *CLIArgs) error {
 		opts = append(opts, jetstream.WithAPIToken(args.APIKey))
 	}
 
-	// Create a client connection pool
-	client, err := jetstream.Subscribe(args.Host, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to subscribe: %w", err)
-	}
-	defer client.Close() // Don't forget to clean up!
-
+	// Start our client loop
 	for batch, err := range jetstream.TypedEvents[statusphere.StatusphereStatus](ctx, client, "xyz.statusphere.status") {
 		if err != nil {
 			if errors.Is(err, jetstream.ErrFatal) {
