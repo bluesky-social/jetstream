@@ -38,6 +38,8 @@ func main() {
 }
 
 func run(ctx context.Context, args *CLIArgs) error {
+	const collection = "xyz.statusphere.status"
+
 	// Declare our client connection options (see the docs for more)
 	opts := []jetstream.Option{
 		// start from the beginning of time
@@ -50,6 +52,7 @@ func run(ctx context.Context, args *CLIArgs) error {
 		// inflexible. If you are unsure what to use, don't use `TypedEvents`; just go
 		// with the basic `jetstream.Subscribe` implemenation.
 		jetstream.WithRawRecords(),
+		jetstream.WithCollections([]string{collection}),
 	}
 
 	if args.APIKey != "" {
@@ -64,7 +67,7 @@ func run(ctx context.Context, args *CLIArgs) error {
 	defer client.Close() // Don't forget to clean up!
 
 	// Start our client loop
-	for batch, err := range jetstream.TypedEvents[statusphere.StatusphereStatus](ctx, client, "xyz.statusphere.status") {
+	for batch, err := range jetstream.TypedEvents[statusphere.StatusphereStatus](ctx, client, collection) {
 		if err != nil {
 			if errors.Is(err, jetstream.ErrFatal) {
 				return fmt.Errorf("received fatal error: %w", err)
