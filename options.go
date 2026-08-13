@@ -123,12 +123,22 @@ func WithCollections(collections []string) Option {
 	return func(c *config) { c.collections = append([]string(nil), collections...) }
 }
 
+// Same as WithCollections, but for a single NSID
+func WithCollection(collection string) Option {
+	return WithCollections([]string{collection})
+}
+
 // WithDIDs restricts delivery to the given DIDs. Empty or unset means all DIDs.
 // The DID filter applies to every event kind, including Account and Identity:
 // with a DID filter and no collection filter, you receive Account and Identity
 // events for the matching DIDs only.
 func WithDIDs(dids []string) Option {
 	return func(c *config) { c.dids = append([]string(nil), dids...) }
+}
+
+// Same as WithDID, but for a single DID
+func WithDID(did string) Option {
+	return WithDIDs([]string{did})
 }
 
 // WithAfterSeq sets the exclusive lower sequence bound for backfill: only

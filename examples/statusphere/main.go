@@ -52,7 +52,7 @@ func run(ctx context.Context, args *CLIArgs) error {
 		// inflexible. If you are unsure what to use, don't use `TypedEvents`; just go
 		// with the basic `jetstream.Subscribe` implemenation.
 		jetstream.WithRawRecords(),
-		jetstream.WithCollections([]string{collection}),
+		jetstream.WithCollection(collection),
 	}
 
 	if args.APIKey != "" {
