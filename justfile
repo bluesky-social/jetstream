@@ -104,6 +104,9 @@ run-prod-race *ARGS:
 run-client *ARGS:
     go run ./cmd/client {{ARGS}}
 
+run-example PROGRAM *ARGS:
+    go run ./examples/{{PROGRAM}} {{ARGS}}
+
 # Run the local simulator (PLC + PDS + relay + firehose).
 simulator *ARGS:
     go run ./cmd/simulator {{ARGS}}

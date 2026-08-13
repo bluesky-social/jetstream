@@ -5,6 +5,9 @@ issues:
   max-same-issues: 0
 
 linters:
+  exclusions:
+    paths:
+      - ^examples/
   enable:
     - bodyclose
     - durationcheck
@@ -27,6 +30,9 @@ linters:
       ignore-missing-subtests: true
 
 formatters:
+  exclusions:
+    paths:
+      - ^examples/
   enable:
     - gofmt
   settings:
