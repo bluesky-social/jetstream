@@ -49,12 +49,12 @@ func (b *TypedBatch[T]) LastCursor() uint64 {
 }
 
 // TypedEvents adapts a Client's event stream into records decoded as type T.
-// On archive backfills it avoids the generic map[string]any decode that dominates
+// During archive replay it avoids the generic map[string]any decode that dominates
 // client CPU and allocations at scale (#142). The client MUST have been built
 // with WithRawRecords or WithRawRecordsCopied so parallel archive workers pass
 // segment CBOR straight to PT.UnmarshalCBOR. Live records are canonicalized from
 // their atproto JSON representation before the same typed decode; live volume is
-// low relative to archive backfill, so that conversion is not the bottleneck.
+// low relative to archive replay, so that conversion is not the bottleneck.
 //
 // T is a lexicon record type and PT its pointer, constrained to implement
 // UnmarshalCBOR — exactly the shape atmos's generated record types satisfy, so

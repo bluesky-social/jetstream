@@ -9,10 +9,9 @@ failure-mode: |
   recovery path is dead.
 expected-detection: |
   Killed by TestPartB_CaughtUpHandoffBelowFloorReBackfills (#182, partb tier):
-  the below-floor handoff no longer triggers a re-backfill cycle
-  (RebackfillCycles stays 0) and the fresh in-window segment is never
-  downloaded, so the folded stream never converges to ground truth and the
-  drain times out / diverges.
+  the below-floor handoff no longer triggers another snapshot-planning cycle,
+  and the fresh in-window segment is never downloaded, so the folded stream
+  never converges to ground truth and the drain times out / diverges.
 expected-tier: partb
 tiers: partb
 

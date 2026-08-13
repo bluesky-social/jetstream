@@ -269,7 +269,7 @@ func TestPartB_MidSegmentTruncation(t *testing.T) {
 	res := drainClientToConvergence(t, srv,
 		[]jetstream.Option{
 			jetstream.WithDIDs([]string{pbDID}),
-			jetstream.WithAfterSeq(0), jetstream.WithBeforeSeq(6), jetstream.WithBackfillOnly(),
+			jetstream.WithAfterSeq(0), jetstream.WithBeforeSeq(6), jetstream.WithSnapshotOnly(),
 		},
 		want, nil)
 
@@ -427,8 +427,8 @@ func TestPartB_CaughtUpHandoffBelowFloorReBackfills(t *testing.T) {
 	require.Equal(t, []uint64{1, 2, 100, 101}, emittedSeqs(res.emitted),
 		"a below-floor handoff must re-backfill and converge, not lose the fresh segment")
 	require.Zero(t, res.downloadErrs)
-	require.GreaterOrEqual(t, res.stats.RebackfillCycles, uint64(1),
-		"the below-floor handoff must trigger at least one §14 re-backfill cycle")
+	require.GreaterOrEqual(t, srv.planCalls.Load(), int64(2),
+		"the below-floor handoff must re-enter snapshot planning")
 }
 
 // TestPartB_ExhaustSealedThenColdReplay (§16 exhaust-sealed termination): with
@@ -472,8 +472,8 @@ func TestPartB_ExhaustSealedThenColdReplay(t *testing.T) {
 	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6, 7}, emittedSeqs(res.emitted),
 		"segments sealed after exhaustion must arrive via cold replay, losslessly")
 	require.Zero(t, res.downloadErrs)
-	require.Zero(t, res.stats.RebackfillCycles,
-		"an in-window exhaust-sealed handoff must NOT re-backfill")
+	require.Equal(t, int64(1), srv.planCalls.Load(),
+		"an in-window handoff must use cold replay without replanning the snapshot")
 }
 
 // TestPartB_SustainedIngestConvergence (§16 sustained-ingest convergence): with

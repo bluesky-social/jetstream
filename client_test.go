@@ -241,31 +241,31 @@ func TestSubscribeValidation(t *testing.T) {
 	_, err = Subscribe("host", WithKinds([]Kind{KindAccount}), WithCollections([]string{"app.bsky.feed.post"}))
 	require.ErrorContains(t, err, "kinds excludes commit")
 
-	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(100), WithBackfillOnly())
+	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(100), WithSnapshotOnly())
 	require.Error(t, err, "beforeSeq must be strictly greater than afterSeq")
 
-	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(50), WithBackfillOnly())
+	_, err = Subscribe("host", WithAfterSeq(100), WithBeforeSeq(50), WithSnapshotOnly())
 	require.Error(t, err)
 
-	// WithBeforeSeq requires WithBackfillOnly: on a backfill-then-live
-	// subscription the archive upper bound would also gate the live tail and
-	// silently drop every event past beforeSeq (F1).
+	// WithBeforeSeq requires WithSnapshotOnly: on a replay that continues live,
+	// the archive upper bound would also gate the live tail and silently drop
+	// every event past beforeSeq (F1).
 	_, err = Subscribe("host", WithAfterSeq(10), WithBeforeSeq(100))
-	require.ErrorContains(t, err, "WithBeforeSeq requires WithBackfillOnly")
+	require.ErrorContains(t, err, "WithBeforeSeq requires WithSnapshotOnly")
 
-	// With WithBackfillOnly it is a coherent bounded dump.
-	c, err := Subscribe("host", WithAfterSeq(10), WithBeforeSeq(100), WithBackfillOnly())
+	// With WithSnapshotOnly it is a coherent bounded snapshot.
+	c, err := Subscribe("host", WithAfterSeq(10), WithBeforeSeq(100), WithSnapshotOnly())
 	require.NoError(t, err)
 	require.NoError(t, c.Close())
 
-	// WithBackfillOnly requires a backfill bound: without one there is no
-	// archive to dump.
-	_, err = Subscribe("host", WithBackfillOnly())
-	require.ErrorContains(t, err, "WithBackfillOnly requires a backfill bound")
+	// WithSnapshotOnly requires a replay bound: without one there is no
+	// archive snapshot to deliver.
+	_, err = Subscribe("host", WithSnapshotOnly())
+	require.ErrorContains(t, err, "WithSnapshotOnly requires a replay bound")
 
 	// With a bound it is accepted, and Close must not panic despite the engine
 	// having no live buffer allocated in dump mode.
-	c, err = Subscribe("host", WithAfterSeq(0), WithBackfillOnly())
+	c, err = Subscribe("host", WithAfterSeq(0), WithSnapshotOnly())
 	require.NoError(t, err)
 	require.NoError(t, c.Close())
 }
@@ -416,7 +416,7 @@ func (e *countingEngine) close() error {
 // rather than panicking — the same defensive contract as the other methods.
 func TestStatsDelegatesToEngine(t *testing.T) {
 	t.Parallel()
-	want := Stats{Pages: 3, SealedTip: 60, PlannedThrough: 60, ResidualGap: 0, RebackfillCycles: 1}
+	want := Stats{Pages: 3, SealedTip: 60, PlannedThrough: 60, ResidualGap: 0}
 	c := &Client{engine: &countingEngine{statsValue: want}}
 	require.Equal(t, want, c.Stats(), "Stats must forward the engine snapshot")
 
@@ -566,7 +566,7 @@ func TestSubscribeAPITokenAuthenticatesAllArchiveRequests(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := Subscribe(srv.URL, WithAPIToken(token), WithAfterSeq(0), WithBackfillOnly(), WithSegmentStripes(1))
+	c, err := Subscribe(srv.URL, WithAPIToken(token), WithAfterSeq(0), WithSnapshotOnly(), WithSegmentStripes(1))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

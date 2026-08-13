@@ -13,7 +13,7 @@ const (
 	// KindAccount is a #account event (hosting-status change). Account is non-nil.
 	KindAccount Kind = "account"
 	// KindSync is a #sync event (repo divergence / resync). Sync is non-nil.
-	// Sync events are delivered on backfill and on the live tail.
+	// Sync events are delivered during archive replay and on the live tail.
 	KindSync Kind = "sync"
 )
 
@@ -27,9 +27,9 @@ const (
 )
 
 // Event is a single, decoded firehose event delivered to the caller. It is
-// identical in shape regardless of whether it originated from the sealed
-// archive (backfill) or the live tail, so callers never need to know which
-// region produced it.
+// identical in shape regardless of whether it was replayed from the sealed
+// archive or received from the live tail, so callers need not distinguish the
+// transport that produced it.
 //
 // Exactly one of Commit, Identity, Account, or Sync is non-nil, selected by
 // Kind.

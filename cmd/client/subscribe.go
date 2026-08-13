@@ -208,7 +208,7 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 		if !hasBound {
 			return fmt.Errorf("--backfill-only requires --after-seq and/or --before-seq")
 		}
-		opts = append(opts, jetstream.WithBackfillOnly())
+		opts = append(opts, jetstream.WithSnapshotOnly())
 	}
 
 	// --typed-likes-client decodes records straight into bsky.FeedLike via the

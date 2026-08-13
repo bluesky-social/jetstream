@@ -248,7 +248,7 @@ func assertClientBackfillCompacted(t *testing.T, cfg Config, run *runtimeRun, tr
 // subject strongref the simulator generated, and — the correctness crux — that
 // the SET of (DID,rkey) likes the typed path surfaces equals what the map path
 // observes from the same server over the same (0, beforeSeq] range. It is run
-// as a bounded backfill-only dump (WithBeforeSeq+WithBackfillOnly) so it
+// as a bounded snapshot (WithBeforeSeq+WithSnapshotOnly) so it
 // terminates. This helper does NOT assert full watermark coverage: maxSeq
 // tracks only like-collection events, which need not reach the global
 // beforeSeq watermark; archive-tail completeness against an independent ground
@@ -264,7 +264,7 @@ func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, obsClien
 		jetstream.WithCollections([]string{"app.bsky.feed.like"}),
 		jetstream.WithAfterSeq(0),
 		jetstream.WithBeforeSeq(beforeSeq),
-		jetstream.WithBackfillOnly(),
+		jetstream.WithSnapshotOnly(),
 		jetstream.WithRawRecords(),
 	)
 	require.NoErrorf(t, err, "typed subscribe: mode=%s seed=%d", cfg.Mode, cfg.Seed)
@@ -312,7 +312,7 @@ func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, obsClien
 		jetstream.WithCollections([]string{"app.bsky.feed.like"}),
 		jetstream.WithAfterSeq(0),
 		jetstream.WithBeforeSeq(beforeSeq),
-		jetstream.WithBackfillOnly(),
+		jetstream.WithSnapshotOnly(),
 	)
 	require.NoError(t, err)
 	defer func() { _ = mapClient.Close() }()

@@ -195,13 +195,6 @@ func (e *replayEngine) recordPage(tip, through uint64) {
 	}
 }
 
-// recordRebackfill bumps the re-backfill cycle counter (a §14 too-old handoff).
-func (e *replayEngine) recordRebackfill() {
-	e.statsMu.Lock()
-	defer e.statsMu.Unlock()
-	e.progress.RebackfillCycles++
-}
-
 // newReplayEngine builds an replayEngine from cfg.
 func newReplayEngine(cfg engineConfig) *replayEngine {
 	logger := cfg.Logger
@@ -664,8 +657,6 @@ func (e *replayEngine) runBackfillThenLive(ctx context.Context, emitBatch func([
 		// the cycles and require the resume cursor to strictly advance past the
 		// cursor this sweep started from — a non-advancing re-backfill is a
 		// pathological loop, not a real fall-behind, and is surfaced as fatal.
-		e.recordRebackfill()
-
 		// Advance the row matcher's seq floor to the resume point BEFORE the next
 		// sweep, so the matcher's exact filter lines up with where re-backfill
 		// actually resumes.

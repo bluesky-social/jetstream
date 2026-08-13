@@ -150,7 +150,7 @@ func TestFoldConvergence_CollectionFilteredDIDTombstoneGap(t *testing.T) {
 		jetstream.WithCollections([]string{gateCollection}),
 		jetstream.WithAfterSeq(0),
 		jetstream.WithBeforeSeq(2),
-		jetstream.WithBackfillOnly(),
+		jetstream.WithSnapshotOnly(),
 	)
 	require.NoError(t, err)
 	defer func() { _ = client.Close() }()

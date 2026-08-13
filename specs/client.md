@@ -126,7 +126,7 @@ recoverable errors — the good prefix of an entry's blocks is emitted, then
 the error, then the next entry continues. Malformed rows are surfaced
 alongside the block's valid rows, never silently dropped.
 
-`--backfill-only` (`WithBackfillOnly`) stops here: a point-in-time dump of
+`--backfill-only` (`WithSnapshotOnly`) stops here: a point-in-time snapshot of
 the matched *sealed* range, no cutover — rows still in the active
 (unsealed) segment are deliberately not included.
 
@@ -248,9 +248,9 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
   persistence: process the batch, persist `LastCursor` once (default batch
   size 64, `WithBatchSize`; live partial batches flush on
   `MaxBatchDelay`, default 20ms).
-- Backfill window: `WithAfterSeq` (exclusive; `WithAfterSeq(0)` = the
+- Replay window: `WithAfterSeq` (exclusive; `WithAfterSeq(0)` = the
   whole archive) / `WithBeforeSeq` (inclusive; requires
-  `WithBackfillOnly` — a live tail with an upper bound would silently
+  `WithSnapshotOnly` — a live tail with an upper bound would silently
   drop every later live event). Pure live: `WithLiveCursor` (0 = from
   the current tip).
 - Filters: `WithKinds`, `WithCollections` (exact or `ns.*`), `WithDIDs`.
@@ -270,7 +270,7 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
 - Plumbing: `WithHTTPClient` (replaces negotiation, public dictionary, bulk
   download, and live WebSocket transports without changing the API-token
   scope), `WithMaxDownloadAttempts`.
-- `Client.Stats()` — backfill progress (pages, pinned sealed tip, planned
+- `Client.Stats()` — replay progress (pages, pinned sealed tip, planned
   through, residual gap) for sustained-ingest observability.
 
 ## Event shape

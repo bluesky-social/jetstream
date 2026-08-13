@@ -19,7 +19,7 @@ type config struct {
 	afterSeq       uint64
 	hasBeforeSeq   bool
 	beforeSeq      uint64
-	backfillOnly   bool
+	snapshotOnly   bool
 	liveCursor     uint64
 	batchSize      int
 	downloadConc   int
@@ -115,15 +115,15 @@ func WithKinds(kinds []Kind) Option {
 // and Sync carry no collection but always bypass the collection filter
 // (subject to WithDIDs), because they are a folding consumer's only signal to
 // purge a deleted account's records — hiding them would create a permanently
-// stale view. The client no longer suppresses deleted-account records during
-// backfill; consumers fold those markers themselves. With no collection
+// stale view. The client does not suppress deleted-account records during an
+// archive replay; consumers fold those markers themselves. With no collection
 // filter, Account and Identity events are likewise delivered, subject to
 // WithDIDs. See issue #142.
 func WithCollections(collections []string) Option {
 	return func(c *config) { c.collections = append([]string(nil), collections...) }
 }
 
-// Same as WithCollections, but for a single NSID
+// WithCollection is shorthand for WithCollections with a single NSID.
 func WithCollection(collection string) Option {
 	return WithCollections([]string{collection})
 }
@@ -136,15 +136,15 @@ func WithDIDs(dids []string) Option {
 	return func(c *config) { c.dids = append([]string(nil), dids...) }
 }
 
-// Same as WithDID, but for a single DID
+// WithDID is shorthand for WithDIDs with a single DID.
 func WithDID(did string) Option {
 	return WithDIDs([]string{did})
 }
 
-// WithAfterSeq sets the exclusive lower sequence bound for backfill: only
-// events with seq > afterSeq are delivered. Supplying it (including
-// WithAfterSeq(0) to mean "from the start of the archive") enables the
-// historical backfill path.
+// WithAfterSeq sets the exclusive lower sequence bound for a replay: only
+// events with seq > afterSeq are delivered. Supplying it, including
+// WithAfterSeq(0) for the whole archive, starts with sealed-history replay
+// before the client cuts over to the live tail.
 func WithAfterSeq(seq uint64) Option {
 	return func(c *config) {
 		c.hasAfterSeq = true
@@ -152,14 +152,12 @@ func WithAfterSeq(seq uint64) Option {
 	}
 }
 
-// WithBeforeSeq sets the inclusive upper sequence bound for backfill: only
-// events with seq <= beforeSeq are delivered from the archive. Enables the
-// historical backfill path.
+// WithBeforeSeq sets the inclusive upper sequence bound for an archive
+// snapshot: only events with seq <= beforeSeq are delivered.
 //
-// It requires WithBackfillOnly: a beforeSeq is meaningful only as a bounded
-// archive dump. On a backfill-then-live subscription the same upper bound would
-// gate the live tail and silently drop every event past beforeSeq, so Subscribe
-// rejects WithBeforeSeq unless WithBackfillOnly is also set.
+// It requires WithSnapshotOnly. On a replay that continues into the live tail,
+// the same upper bound would silently drop every later live event, so Subscribe
+// rejects WithBeforeSeq unless WithSnapshotOnly is also set.
 func WithBeforeSeq(seq uint64) Option {
 	return func(c *config) {
 		c.hasBeforeSeq = true
@@ -167,22 +165,23 @@ func WithBeforeSeq(seq uint64) Option {
 	}
 }
 
-// WithBackfillOnly turns the client into a one-time archive dump: it downloads
-// and delivers the matched sealed range (bounded by WithAfterSeq/WithBeforeSeq)
-// and then ends the stream, without ever starting the live tail or cutover.
+// WithSnapshotOnly turns a replay into a point-in-time archive snapshot: it
+// downloads and delivers the matched sealed range, bounded by WithAfterSeq
+// and/or WithBeforeSeq, and then ends without starting the live tail.
 //
-// It requires a backfill bound (WithAfterSeq and/or WithBeforeSeq); without one
-// there is no archive to dump and Subscribe returns an error. Records in the
+// It requires a replay bound (WithAfterSeq and/or WithBeforeSeq); without one,
+// Subscribe returns an error. Records in the
 // active, unsealed segment (above the sealed tip) are only reachable via the
-// live tail and are therefore not delivered by a dump.
-func WithBackfillOnly() Option {
-	return func(c *config) { c.backfillOnly = true }
+// live tail and are therefore not included in the snapshot.
+func WithSnapshotOnly() Option {
+	return func(c *config) { c.snapshotOnly = true }
 }
 
 // WithLiveCursor resumes a pure live tail from a previously saved cursor
-// (typically Batch.LastCursor from a prior run). The server delivers events
-// with seq > cursor. Ignored when a backfill bound is also set, since the
-// backfill path computes its own live cutover cursor.
+// (typically Batch.LastCursor from a prior run). Delivery resumes after cursor;
+// the server's inclusive replay of cursor itself is deduplicated by the client.
+// Ignored when an archive replay is requested, since that workflow computes its
+// own live cutover cursor.
 func WithLiveCursor(seq uint64) Option {
 	return func(c *config) {
 		c.liveCursor = seq
@@ -199,9 +198,9 @@ func WithBatchSize(n int) Option {
 	}
 }
 
-// WithDownloadConcurrency sizes the backfill parallelism: n bounds the block
+// WithDownloadConcurrency sizes archive-replay parallelism: n bounds the block
 // decode pool directly, and the block-mode getBlock fetch pool is derived from
-// it (2n, capped at 64) so sparse (DID/collection-filtered) backfills overlap
+// it (2n, capped at 64) so sparse (DID/collection-filtered) replays overlap
 // network round trips instead of paying one RTT per block. Must be > 0;
 // ignored otherwise.
 //
@@ -306,9 +305,9 @@ func WithLogger(l *slog.Logger) Option {
 // Commit.RecordCBOR is populated directly from the segment payload, which the
 // caller decodes itself — typically through TypedEvents. Building the generic
 // map dominates archive decode CPU and allocations at scale (#142), so skipping
-// it is the main lever for high-volume backfills of one record type. Live records
+// it is the main lever for high-volume replays of one record type. Live records
 // arrive as atproto JSON and are canonicalized to DAG-CBOR before delivery; the
-// live tail is low-volume relative to archive backfill, so it does not need the
+// live tail is low-volume relative to archive replay, so it does not need the
 // same zero-copy optimization.
 //
 // Deletes (no record), identity/account/sync events, and the default Commit
@@ -317,7 +316,7 @@ func WithLogger(l *slog.Logger) Option {
 // per-record work this fast path avoids by default).
 //
 // Aliasing/lifetime contract: in raw mode Commit.RecordCBOR aliases the
-// client's internal decompressed buffer on the backfill path (zero-copy), valid
+// client's internal decompressed buffer on the replay path (zero-copy), valid
 // only for the lifetime of the Batch that delivered it — the same contract the
 // default Record already carries. Anything decoded from it that retains slices
 // or strings (typed structs whose string fields alias the input) is likewise

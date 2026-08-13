@@ -41,7 +41,7 @@ func newEngine(host string, cfg config) engine {
 			BeforeSeq:    cfg.beforeSeq,
 		},
 		Backfill:       cfg.backfillRequested(),
-		BackfillOnly:   cfg.backfillOnly,
+		BackfillOnly:   cfg.snapshotOnly,
 		LiveCursor:     cfg.liveCursor,
 		BatchSize:      cfg.batchSize,
 		Concurrency:    cfg.downloadConc,

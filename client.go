@@ -60,7 +60,7 @@ func (b *Batch) LastCursor() uint64 {
 type Stats struct {
 	// Pages is the number of planSnapshot pages downloaded across the replay thus far.
 	Pages uint64
-	// SealedTip is the most recently learned sealed-archive (the pinned
+	// SealedTip is the most recently learned sealed-archive tip (the pinned
 	// pagination goal of the current sweep).
 	SealedTip uint64
 	// PlannedThrough is the continuation cursor reached so far: the highest
@@ -69,12 +69,9 @@ type Stats struct {
 	// ResidualGap is SealedTip - PlannedThrough: the sealed seqs still to
 	// download before cutover. Zero once the sweep has consumed the archive.
 	ResidualGap uint64
-	// RebackfillCycles counts §14 too-old re-backfill cycles (a slow-handoff or
-	// fell-behind signal). Zero on the common path.
-	RebackfillCycles uint64
 }
 
-// Stats returns a snapshot of backfill-loop progress. It is safe to call from
+// Stats returns a snapshot of replay progress. It is safe to call from
 // another goroutine while Events is running (e.g. a monitoring ticker), and
 // after it returns. A zero-value Client (not built by Subscribe) reports a zero
 // snapshot.
@@ -89,9 +86,10 @@ func (c *Client) Stats() Stats {
 // hostname ("jetstream.us-west.bsky.network"), a host:port, or a full
 // http(s):// URL; the scheme defaults to https.
 //
-// With no backfill option, the Client live-tails from the current tip (or
-// from WithLiveCursor). With WithAfterSeq/WithBeforeSeq it backfills the
-// sealed archive and then cuts over to live.
+// With no replay bound, the Client live-tails from the current tip or resumes
+// from WithLiveCursor. WithAfterSeq starts by replaying sealed history and then
+// cuts over to live. WithSnapshotOnly stops after the sealed range;
+// WithBeforeSeq bounds that snapshot and requires WithSnapshotOnly.
 func Subscribe(host string, opts ...Option) (*Client, error) {
 	cfg := defaultConfig()
 	for i, opt := range opts {
@@ -268,8 +266,8 @@ func validateConfig(c *config) error {
 	if c.hasAfterSeq && c.hasBeforeSeq && c.beforeSeq <= c.afterSeq {
 		return fmt.Errorf("jetstream: beforeSeq (%d) must be greater than afterSeq (%d)", c.beforeSeq, c.afterSeq)
 	}
-	if c.backfillOnly && !c.backfillRequested() {
-		return fmt.Errorf("jetstream: WithBackfillOnly requires a backfill bound (WithAfterSeq and/or WithBeforeSeq)")
+	if c.snapshotOnly && !c.backfillRequested() {
+		return fmt.Errorf("jetstream: WithSnapshotOnly requires a replay bound (WithAfterSeq and/or WithBeforeSeq)")
 	}
 	// WithBeforeSeq is an ARCHIVE upper bound, enforced by the row matcher's
 	// inclusive beforeSeq. The live cutover tail reuses that same matcher, so a
@@ -277,9 +275,10 @@ func validateConfig(c *config) error {
 	// live event with seq > beforeSeq — after the brief (S, beforeSeq] window the
 	// tail runs forever delivering nothing, a silent loss of in-scope data the
 	// server is actively serving (CLAUDE.md: crash over silent corruption). A
-	// beforeSeq is only coherent as a bounded dump, so require WithBackfillOnly.
-	if c.hasBeforeSeq && !c.backfillOnly {
-		return fmt.Errorf("jetstream: WithBeforeSeq requires WithBackfillOnly (a beforeSeq is a bounded-archive-dump upper bound; on a backfill-then-live subscription it would silently drop every live event past beforeSeq)")
+	// beforeSeq is only coherent as a bounded snapshot, so require
+	// WithSnapshotOnly.
+	if c.hasBeforeSeq && !c.snapshotOnly {
+		return fmt.Errorf("jetstream: WithBeforeSeq requires WithSnapshotOnly (beforeSeq is an archive-snapshot upper bound; on a replay that continues live it would silently drop every later event)")
 	}
 	return nil
 }
