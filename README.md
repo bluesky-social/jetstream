@@ -24,7 +24,7 @@ See the [examples](https://github.com/bluesky-social/jetstream/tree/main/example
 
 You can run them like so:
 
-```
+```sh
 # start the nix environment (see below)
 just dev
 
