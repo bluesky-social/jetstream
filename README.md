@@ -22,6 +22,16 @@ Coming soon!
 
 See the [examples](https://github.com/bluesky-social/jetstream/tree/main/examples) directory of this repo for several minimal usage examples.
 
+You can run them like so:
+
+```
+# start the nix environment (see below)
+just dev
+
+# run any of the examples by name
+just run-example live-tail
+```
+
 ## Developing Locally
 
 Jetstream development uses Nix for a pinned Go and toolchain environment. Install Nix, then enter the dev shell with either:
