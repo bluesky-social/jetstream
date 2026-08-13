@@ -14,9 +14,9 @@ The original jetstream codebase is available [here](https://github.com/bluesky-s
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-## Documentation
+## User Documentation
 
-Coming soon!
+See the [jetstream documentation website](https://bsky.network/docs/jetstream/).
 
 ## Examples
 
