@@ -36,7 +36,7 @@
 // WithSnapshotOnly to stop after the sealed range; WithBeforeSeq can bound that
 // snapshot. There is no client-side cutover buffer or record suppression.
 // Archives that require bearer authentication can use
-// WithAPIToken with the raw token; it authenticates planSnapshot,
+// WithAPIKey with the raw key; it authenticates planSnapshot,
 // getSegment, and getBlock only. The public dictionary request and live
 // WebSocket remain unauthenticated. The live tail uses the server's
 // dictionary-zstd compression by default; use WithZstdCompression(false) to opt

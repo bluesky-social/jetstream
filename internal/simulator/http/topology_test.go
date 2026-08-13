@@ -28,7 +28,7 @@ type topologyListReposOutput struct {
 
 func topologyRequest(t *testing.T, handler http.Handler, authority, path string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "http://"+authority+path, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+authority+path, nil)
 	req.Host = authority
 	rw := httptest.NewRecorder()
 	handler.ServeHTTP(rw, req)

@@ -260,15 +260,15 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
 - Performance: `WithDownloadConcurrency`, `WithRawRecords` (+`Copied`,
   `+CIDs`) to skip the generic record-map build, `TypedEvents[T]` for the
   typed decode fast path, `WithZstdCompression` for the live tail.
-- Archive authentication: `WithAPIToken(rawToken)` sends exactly one
-  `Authorization: Bearer <rawToken>` header on `planSnapshot`, `getSegment`,
+- Archive authentication: `WithAPIKey(rawKey)` sends exactly one
+  `Authorization: Bearer <rawKey>` header on `planSnapshot`, `getSegment`,
   and `getBlock`. The raw value is opaque and must not include client-side
   parsing or logging. `getZstdDictionary` and the live WebSocket remain public
   and do not receive this option-owned credential. The bundled CLI exposes the
-  same value as `--api-token` or the preferred
-  `JETSTREAM_CLIENT_API_TOKEN` environment source.
+  same value as `--api-key` or the preferred
+  `JETSTREAM_CLIENT_API_KEY` environment source.
 - Plumbing: `WithHTTPClient` (replaces negotiation, public dictionary, bulk
-  download, and live WebSocket transports without changing the API-token
+  download, and live WebSocket transports without changing the API-key
   scope), `WithMaxDownloadAttempts`.
 - `Client.Stats()` — replay progress (pages, pinned sealed tip, planned
   through, residual gap) for sustained-ingest observability.
@@ -290,9 +290,9 @@ and `time` as a microsecond-precision datetime the client parses back to
 
 1. Page `planSnapshot` with pinned `sealedTipSeq`; download by `mode`;
    verify checksums; decode blocks; run your exact filter per row. When the
-   archive boundary requires a token, send one RFC 6750-style
-   `Authorization: Bearer <token>` header on `planSnapshot`, `getSegment`, and
-   `getBlock`; treat the raw token as opaque and require TLS at the public
+   archive boundary requires an API key, send one RFC 6750-style
+   `Authorization: Bearer <api-key>` header on `planSnapshot`, `getSegment`, and
+   `getBlock`; treat the raw key as opaque and require TLS at the public
    boundary. Do not send that archive credential on `getZstdDictionary` or
    `/xrpc/network.bsky.jetstream.subscribeEvents`.
 2. Emit in seq order; treat every boundary as at-least-once and dedup by

@@ -208,7 +208,7 @@ func TestSubscribePrintsEvents(t *testing.T) {
 	}
 }
 
-func protectedBackfillServer(t *testing.T, token string) (*httptest.Server, *atomic.Int64) {
+func protectedBackfillServer(t *testing.T, apiKey string) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 	dir := t.TempDir()
 	name := "seg_0000000000.jss"
@@ -239,7 +239,7 @@ func protectedBackfillServer(t *testing.T, token string) (*httptest.Server, *ato
 	var requests atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+token {
+		if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+apiKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -261,15 +261,15 @@ func protectedBackfillServer(t *testing.T, token string) (*httptest.Server, *ato
 
 // Not parallel: the environment-source subtest mutates process state.
 //
-//nolint:paralleltest // JETSTREAM_CLIENT_API_TOKEN is process-global
-func TestSubscribeAPITokenSources(t *testing.T) {
-	const token = "cli-opaque-token"
-	old, hadOld := os.LookupEnv("JETSTREAM_CLIENT_API_TOKEN")
+//nolint:paralleltest // JETSTREAM_CLIENT_API_KEY is process-global
+func TestSubscribeAPIKeySources(t *testing.T) {
+	const apiKey = "cli-opaque-key"
+	old, hadOld := os.LookupEnv("JETSTREAM_CLIENT_API_KEY")
 	t.Cleanup(func() {
 		if hadOld {
-			_ = os.Setenv("JETSTREAM_CLIENT_API_TOKEN", old)
+			_ = os.Setenv("JETSTREAM_CLIENT_API_KEY", old)
 		} else {
-			_ = os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN")
+			_ = os.Unsetenv("JETSTREAM_CLIENT_API_KEY")
 		}
 	})
 
@@ -278,19 +278,19 @@ func TestSubscribeAPITokenSources(t *testing.T) {
 		args   []string
 		useEnv bool
 	}{
-		{name: "flag", args: []string{"--api-token", token}},
+		{name: "flag", args: []string{"--api-key", apiKey}},
 		{name: "environment", useEnv: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.useEnv {
-				if err := os.Setenv("JETSTREAM_CLIENT_API_TOKEN", token); err != nil {
+				if err := os.Setenv("JETSTREAM_CLIENT_API_KEY", apiKey); err != nil {
 					t.Fatal(err)
 				}
-				defer func() { _ = os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN") }()
-			} else if err := os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN"); err != nil {
+				defer func() { _ = os.Unsetenv("JETSTREAM_CLIENT_API_KEY") }()
+			} else if err := os.Unsetenv("JETSTREAM_CLIENT_API_KEY"); err != nil {
 				t.Fatal(err)
 			}
-			srv, requests := protectedBackfillServer(t, token)
+			srv, requests := protectedBackfillServer(t, apiKey)
 			out := &syncBuffer{}
 			app := newApp()
 			app.Writer = out
@@ -307,8 +307,8 @@ func TestSubscribeAPITokenSources(t *testing.T) {
 			if !strings.Contains(out.String(), `"cursor":1`) {
 				t.Fatalf("expected archived event output, got %q", out.String())
 			}
-			if strings.Contains(out.String(), token) {
-				t.Fatal("CLI output disclosed API token")
+			if strings.Contains(out.String(), apiKey) {
+				t.Fatal("CLI output disclosed API key")
 			}
 		})
 	}
@@ -316,14 +316,14 @@ func TestSubscribeAPITokenSources(t *testing.T) {
 
 // Not parallel: the environment subtest mutates process state.
 //
-//nolint:paralleltest // JETSTREAM_CLIENT_API_TOKEN is process-global
-func TestSubscribeRejectsInvalidAPITokenWithoutDisclosure(t *testing.T) {
-	old, hadOld := os.LookupEnv("JETSTREAM_CLIENT_API_TOKEN")
+//nolint:paralleltest // JETSTREAM_CLIENT_API_KEY is process-global
+func TestSubscribeRejectsInvalidAPIKeyWithoutDisclosure(t *testing.T) {
+	old, hadOld := os.LookupEnv("JETSTREAM_CLIENT_API_KEY")
 	t.Cleanup(func() {
 		if hadOld {
-			_ = os.Setenv("JETSTREAM_CLIENT_API_TOKEN", old)
+			_ = os.Setenv("JETSTREAM_CLIENT_API_KEY", old)
 		} else {
-			_ = os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN")
+			_ = os.Unsetenv("JETSTREAM_CLIENT_API_KEY")
 		}
 	})
 
@@ -332,15 +332,15 @@ func TestSubscribeRejectsInvalidAPITokenWithoutDisclosure(t *testing.T) {
 		args []string
 		env  bool
 	}{
-		{name: "explicit empty flag", args: []string{"--api-token", ""}},
+		{name: "explicit empty flag", args: []string{"--api-key", ""}},
 		{name: "present empty environment", env: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.env {
-				if err := os.Setenv("JETSTREAM_CLIENT_API_TOKEN", ""); err != nil {
+				if err := os.Setenv("JETSTREAM_CLIENT_API_KEY", ""); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN"); err != nil {
+			} else if err := os.Unsetenv("JETSTREAM_CLIENT_API_KEY"); err != nil {
 				t.Fatal(err)
 			}
 			var requests atomic.Int64
@@ -352,11 +352,11 @@ func TestSubscribeRejectsInvalidAPITokenWithoutDisclosure(t *testing.T) {
 			args := []string{"jetstream-client", "--host", srv.URL, "--after-seq", "0", "--backfill-only"}
 			args = append(args, tc.args...)
 			err := app.Run(context.Background(), args)
-			if err == nil || !strings.Contains(err.Error(), "API token cannot be empty") {
-				t.Fatalf("expected empty-token validation error, got %v", err)
+			if err == nil || !strings.Contains(err.Error(), "API key cannot be empty") {
+				t.Fatalf("expected empty-key validation error, got %v", err)
 			}
 			if requests.Load() != 0 {
-				t.Fatalf("empty token must fail before network I/O; requests=%d", requests.Load())
+				t.Fatalf("empty API key must fail before network I/O; requests=%d", requests.Load())
 			}
 			if strings.Contains(err.Error()+out.String(), "Bearer ") {
 				t.Fatal("validation output disclosed credential material")
@@ -364,13 +364,13 @@ func TestSubscribeRejectsInvalidAPITokenWithoutDisclosure(t *testing.T) {
 		})
 	}
 
-	t.Run("nonempty token omitted from terminal error", func(t *testing.T) {
-		const token = "distinctive-cli-error-secret"
-		if err := os.Unsetenv("JETSTREAM_CLIENT_API_TOKEN"); err != nil {
+	t.Run("nonempty API key omitted from terminal error", func(t *testing.T) {
+		const apiKey = "distinctive-cli-error-secret"
+		if err := os.Unsetenv("JETSTREAM_CLIENT_API_KEY"); err != nil {
 			t.Fatal(err)
 		}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+token {
+			if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+apiKey {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -382,17 +382,17 @@ func TestSubscribeRejectsInvalidAPITokenWithoutDisclosure(t *testing.T) {
 		out := &syncBuffer{}
 		app := newApp()
 		app.Writer = out
-		err := app.Run(context.Background(), []string{"jetstream-client", "--host", srv.URL, "--after-seq", "0", "--backfill-only", "--api-token", token, "--print"})
+		err := app.Run(context.Background(), []string{"jetstream-client", "--host", srv.URL, "--after-seq", "0", "--backfill-only", "--api-key", apiKey, "--print"})
 		if err == nil {
 			t.Fatal("expected terminal archive error")
 		}
-		if strings.Contains(err.Error()+out.String(), token) {
-			t.Fatal("terminal error or output disclosed API token")
+		if strings.Contains(err.Error()+out.String(), apiKey) {
+			t.Fatal("terminal error or output disclosed API key")
 		}
 	})
 }
 
-func TestSubscribeAPITokenHelp(t *testing.T) {
+func TestSubscribeAPIKeyHelp(t *testing.T) {
 	t.Parallel()
 	out := &syncBuffer{}
 	app := newApp()
@@ -401,7 +401,7 @@ func TestSubscribeAPITokenHelp(t *testing.T) {
 		t.Fatalf("help: %v", err)
 	}
 	help := out.String()
-	for _, want := range []string{"--api-token", "JETSTREAM_CLIENT_API_TOKEN", "Raw token", "no Bearer prefix", "archive authentication", "process-visible", "Prefer JETSTREAM_CLIENT_API_TOKEN"} {
+	for _, want := range []string{"--api-key", "JETSTREAM_CLIENT_API_KEY", "Raw API key", "no Bearer prefix", "archive authentication", "process-visible", "Prefer JETSTREAM_CLIENT_API_KEY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}

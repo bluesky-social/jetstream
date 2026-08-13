@@ -15,11 +15,11 @@ import (
 func newEngine(host string, cfg config) engine {
 	negotiationXRPC := newXRPCClient(host, cfg, xrpc.ATProtoOpts(30*time.Second))
 	bulkXRPC := newXRPCClient(host, cfg, xrpc.BulkDownloadOpts())
-	if cfg.hasAPIToken {
-		// AccessJwt is atmos's opaque bearer-header transport seam. API tokens
+	if cfg.hasAPIKey {
+		// AccessJwt is atmos's opaque bearer-header transport seam. API keys
 		// are not parsed as JWTs and have no refresh/session semantics.
-		negotiationXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiToken})
-		bulkXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiToken})
+		negotiationXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiKey})
+		bulkXRPC.SetAuth(&xrpc.AuthInfo{AccessJwt: cfg.apiKey})
 	}
 	// Public dictionary fetches share the negotiation transport and retry policy
 	// without sharing its bearer-auth state.

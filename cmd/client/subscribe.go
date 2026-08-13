@@ -26,9 +26,9 @@ func subscribeCommand() *cli.Command {
 				Value: "localhost:8080",
 			},
 			&cli.StringFlag{
-				Name:    "api-token",
-				Usage:   "Raw token (no Bearer prefix) for archive authentication. Prefer JETSTREAM_CLIENT_API_TOKEN because command-line arguments may be process-visible.",
-				Sources: cli.EnvVars("JETSTREAM_CLIENT_API_TOKEN"),
+				Name:    "api-key",
+				Usage:   "Raw API key (no Bearer prefix) for archive authentication. Prefer JETSTREAM_CLIENT_API_KEY because command-line arguments may be process-visible.",
+				Sources: cli.EnvVars("JETSTREAM_CLIENT_API_KEY"),
 			},
 			&cli.StringSliceFlag{
 				Name:  "kind",
@@ -142,8 +142,8 @@ func runSubscribe(ctx context.Context, cmd *cli.Command) error {
 		jetstream.WithBatchSize(cmd.Int("batch-size")),
 	}
 	opts = append(opts, jetstream.WithZstdCompression(cmd.Bool("zstd")))
-	if cmd.IsSet("api-token") {
-		opts = append(opts, jetstream.WithAPIToken(cmd.String("api-token")))
+	if cmd.IsSet("api-key") {
+		opts = append(opts, jetstream.WithAPIKey(cmd.String("api-key")))
 	}
 	// --download-concurrency=0 (the default) means "let the library auto-size
 	// from the CPU count"; only forward an explicit positive override so the

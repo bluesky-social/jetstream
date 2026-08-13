@@ -56,7 +56,7 @@ func run(ctx context.Context, args *CLIArgs) error {
 	}
 
 	if args.APIKey != "" {
-		opts = append(opts, jetstream.WithAPIToken(args.APIKey))
+		opts = append(opts, jetstream.WithAPIKey(args.APIKey))
 	}
 
 	// Create a client connection pool

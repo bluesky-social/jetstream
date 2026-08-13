@@ -24,10 +24,10 @@ type config struct {
 	batchSize      int
 	downloadConc   int
 	segmentStripes int
-	// apiToken and hasAPIToken are constructor-only bearer-secret material. The
-	// explicit bit distinguishes an omitted token from WithAPIToken("").
-	apiToken    string
-	hasAPIToken bool
+	// apiKey and hasAPIKey are constructor-only bearer-secret material. The
+	// explicit bit distinguishes an omitted key from WithAPIKey("").
+	apiKey    string
+	hasAPIKey bool
 	// httpClient is a caller override. nil is the sentinel for "unset":
 	// the engine then builds its own per-workload jttp clients
 	// (xrpc.ATProtoOpts for XRPC, xrpc.BulkDownloadOpts for bulk
@@ -241,17 +241,17 @@ func WithSegmentStripes(n int) Option {
 	}
 }
 
-// WithAPIToken authenticates archive negotiation and downloads with a bearer
-// token. Pass the raw token, without a "Bearer " prefix. The token is sent on
+// WithAPIKey authenticates archive negotiation and downloads with a bearer
+// API key. Pass the raw key, without a "Bearer " prefix. The key is sent on
 // planSnapshot, getSegment, and getBlock requests; it is not sent when fetching
 // the public zstd dictionary or upgrading the public live WebSocket.
 //
 // The value is a bearer secret. Use TLS when crossing an untrusted network,
-// and avoid putting the token in logs or process arguments.
-func WithAPIToken(token string) Option {
+// and avoid putting the API key in logs or process arguments.
+func WithAPIKey(apiKey string) Option {
 	return func(c *config) {
-		c.apiToken = token
-		c.hasAPIToken = true
+		c.apiKey = apiKey
+		c.hasAPIKey = true
 	}
 }
 
@@ -262,7 +262,7 @@ func WithAPIToken(token string) Option {
 // (planSnapshot and getZstdDictionary) and xrpc.BulkDownloadOpts for streaming
 // segment/block downloads, whose large transfers a short wall-clock timeout
 // would prematurely kill. Supplying a client here replaces both tuned clients
-// with the single client given; WithAPIToken still scopes authentication to
+// with the single client given; WithAPIKey still scopes authentication to
 // archive requests and never mutates the supplied client.
 func WithHTTPClient(h *http.Client) Option {
 	return func(c *config) {
