@@ -56,6 +56,13 @@ func run(ctx context.Context, args *CLIArgs) error {
 		opts = append(opts, jetstream.WithAPIToken(args.APIKey))
 	}
 
+	// Create a client connection pool
+	client, err := jetstream.Subscribe(args.Host, opts...)
+	if err != nil {
+		return fmt.Errorf("failed to subscribe: %w", err)
+	}
+	defer client.Close() // Don't forget to clean up!
+
 	// Start our client loop
 	for batch, err := range jetstream.TypedEvents[statusphere.StatusphereStatus](ctx, client, "xyz.statusphere.status") {
 		if err != nil {
