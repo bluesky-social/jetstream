@@ -257,8 +257,8 @@ func isLoopbackHost(host string) bool {
 
 // validateConfig rejects internally inconsistent option combinations.
 func validateConfig(c *config) error {
-	if c.hasAPIToken && c.apiToken == "" {
-		return fmt.Errorf("jetstream: API token cannot be empty")
+	if c.hasAPIKey && c.apiKey == "" {
+		return fmt.Errorf("jetstream: API key cannot be empty")
 	}
 	if err := canonicalizeFilters(c); err != nil {
 		return err

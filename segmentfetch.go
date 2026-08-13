@@ -507,7 +507,7 @@ func (d *downloader) doRangeRequest(ctx context.Context, u string, off, last int
 
 // newSegmentRequest builds a segment GET with the same identity headers the
 // xrpc QueryRaw path sets (User-Agent, Accept, and Authorization when the
-// client has bearer auth). The credential may be an opaque API token, not an
+// client has bearer auth). The credential may be an opaque API key, not an
 // ATProto session JWT; the raw range path must not silently drop auth
 // that getBlock requests still carry.
 func (d *downloader) newSegmentRequest(ctx context.Context, u string) (*http.Request, error) {

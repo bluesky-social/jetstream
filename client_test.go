@@ -174,38 +174,38 @@ func TestSubscribeCanonicalizesFiltersOnce(t *testing.T) {
 	require.Equal(t, []string{"app.bsky.feed.post", "app.bsky.feed.*"}, e.cfg.Request.Collections)
 }
 
-func TestWithAPITokenValidation(t *testing.T) {
+func TestWithAPIKeyValidation(t *testing.T) {
 	t.Parallel()
 
-	for _, token := range []string{"opaque-token", "Bearer included-by-caller", " padded ", "snowman-☃", "base64=="} {
-		t.Run(token, func(t *testing.T) {
+	for _, apiKey := range []string{"opaque-key", "Bearer included-by-caller", " padded ", "snowman-☃", "base64=="} {
+		t.Run(apiKey, func(t *testing.T) {
 			t.Parallel()
 			cfg := defaultConfig()
-			WithAPIToken(token)(&cfg)
-			require.True(t, cfg.hasAPIToken)
-			require.Equal(t, token, cfg.apiToken, "nonempty tokens are opaque transport values")
+			WithAPIKey(apiKey)(&cfg)
+			require.True(t, cfg.hasAPIKey)
+			require.Equal(t, apiKey, cfg.apiKey, "nonempty API keys are opaque transport values")
 			require.NoError(t, validateConfig(&cfg))
 		})
 	}
 
 	cfg := defaultConfig()
-	require.NoError(t, validateConfig(&cfg), "omitting WithAPIToken preserves unauthenticated behavior")
-	WithAPIToken("")(&cfg)
+	require.NoError(t, validateConfig(&cfg), "omitting WithAPIKey preserves unauthenticated behavior")
+	WithAPIKey("")(&cfg)
 	err := validateConfig(&cfg)
-	require.ErrorContains(t, err, "API token cannot be empty")
+	require.ErrorContains(t, err, "API key cannot be empty")
 	require.NotContains(t, err.Error(), "Bearer")
 }
 
-func TestClientFormattingRedactsAPIToken(t *testing.T) {
+func TestClientFormattingRedactsAPIKey(t *testing.T) {
 	t.Parallel()
 
-	const token = "distinctive-formatting-secret-9fd0"
-	c, err := Subscribe("https://host", WithAPIToken(token))
+	const apiKey = "distinctive-formatting-secret-9fd0"
+	c, err := Subscribe("https://host", WithAPIKey(apiKey))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 
 	for _, formatted := range []string{fmt.Sprintf("%v", c), fmt.Sprintf("%+v", c), fmt.Sprintf("%#v", c)} {
-		require.NotContains(t, formatted, token)
+		require.NotContains(t, formatted, apiKey)
 		require.Less(t, len(formatted), 256, "formatted client summary must stay bounded")
 		require.Contains(t, strings.ToLower(formatted), "host")
 	}
@@ -514,9 +514,9 @@ func sealedSegmentFixture(t *testing.T, name string, seqs ...uint64) []byte {
 	return raw
 }
 
-func requireExactBearer(t *testing.T, w http.ResponseWriter, r *http.Request, token string) bool {
+func requireExactBearer(t *testing.T, w http.ResponseWriter, r *http.Request, apiKey string) bool {
 	t.Helper()
-	if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+token {
+	if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+apiKey {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
@@ -530,16 +530,16 @@ func serveSegmentFixture(t *testing.T, w http.ResponseWriter, r *http.Request, r
 	http.ServeContent(w, r, name, time.Unix(1_730_000_000, 0), bytes.NewReader(raw))
 }
 
-func TestSubscribeAPITokenAuthenticatesAllArchiveRequests(t *testing.T) {
+func TestSubscribeAPIKeyAuthenticatesAllArchiveRequests(t *testing.T) {
 	t.Parallel()
-	const token = "opaque-root-archive-token"
+	const apiKey = "opaque-root-archive-key"
 	wholeName, blockName := "seg_0000000000.jss", "seg_0000000001.jss"
 	whole := sealedSegmentFixture(t, wholeName, 1)
 	blocks := sealedSegmentFixture(t, blockName, 2)
 	var planCalls, segmentCalls, blockCalls atomic.Int64
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !requireExactBearer(t, w, r, token) {
+		if !requireExactBearer(t, w, r, apiKey) {
 			return
 		}
 		switch r.URL.Path {
@@ -566,7 +566,7 @@ func TestSubscribeAPITokenAuthenticatesAllArchiveRequests(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := Subscribe(srv.URL, WithAPIToken(token), WithAfterSeq(0), WithSnapshotOnly(), WithSegmentStripes(1))
+	c, err := Subscribe(srv.URL, WithAPIKey(apiKey), WithAfterSeq(0), WithSnapshotOnly(), WithSegmentStripes(1))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -584,9 +584,9 @@ func TestSubscribeAPITokenAuthenticatesAllArchiveRequests(t *testing.T) {
 	require.Equal(t, int64(1), blockCalls.Load(), "generated getBlock request must execute")
 }
 
-func TestSubscribeAPITokenDoesNotAuthenticatePublicResources(t *testing.T) {
+func TestSubscribeAPIKeyDoesNotAuthenticatePublicResources(t *testing.T) {
 	t.Parallel()
-	const token = "opaque-cutover-token"
+	const apiKey = "opaque-cutover-key"
 	name := "seg_0000000000.jss"
 	raw := sealedSegmentFixture(t, name, 1)
 	var dictionaryCalls, liveCalls atomic.Int64
@@ -594,11 +594,11 @@ func TestSubscribeAPITokenDoesNotAuthenticatePublicResources(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/xrpc/network.bsky.jetstream.planSnapshot":
-			require.True(t, requireExactBearer(t, w, r, token))
+			require.True(t, requireExactBearer(t, w, r, apiKey))
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `{"plannedThroughSeq":1,"sealedTipSeq":1,"segments":[{"name":%q,"index":0,"checksum":"aaaaaaaaaaaaaaaa","minSeq":1,"maxSeq":1,"mode":"segment"}],"stats":{"segmentsExamined":1,"segmentsMatched":1,"blocksMatched":0,"entries":1}}`, name)
 		case "/xrpc/network.bsky.jetstream.getSegment":
-			require.True(t, requireExactBearer(t, w, r, token))
+			require.True(t, requireExactBearer(t, w, r, apiKey))
 			serveSegmentFixture(t, w, r, raw, name)
 		case "/xrpc/network.bsky.jetstream.getZstdDictionary":
 			dictionaryCalls.Add(1)
@@ -621,7 +621,7 @@ func TestSubscribeAPITokenDoesNotAuthenticatePublicResources(t *testing.T) {
 	t.Cleanup(srv.Close)
 	transport := &countingRoundTripper{base: srv.Client().Transport}
 	hc := &http.Client{Transport: transport}
-	c, err := Subscribe(srv.URL, WithAPIToken(token), WithAfterSeq(0), WithSegmentStripes(1), WithHTTPClient(hc))
+	c, err := Subscribe(srv.URL, WithAPIKey(apiKey), WithAfterSeq(0), WithSegmentStripes(1), WithHTTPClient(hc))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
