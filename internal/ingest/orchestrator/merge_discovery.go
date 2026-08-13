@@ -50,6 +50,7 @@ func (s discoveryStore) OnHostExhausted(ctx context.Context, hostname string, ca
 type discoveryLimits struct {
 	maxHosts       int
 	maxActiveHosts int
+	retryDelay     time.Duration
 }
 
 func (r *mergeRunner) runDiscovery(ctx context.Context, relayURL string, httpClient *http.Client) error {
@@ -85,6 +86,9 @@ func (r *mergeRunner) runDiscoveryWithClient(ctx context.Context, relayURL strin
 		}
 		if limits.maxActiveHosts > 0 {
 			opts.MaxActiveHosts = gt.Some(limits.maxActiveHosts)
+		}
+		if limits.retryDelay > 0 {
+			opts.HostBackoffBase = gt.Some(limits.retryDelay)
 		}
 		if err := atmosbackfill.NewEngine(opts).Run(ctx); err != nil {
 			return fmt.Errorf("orchestrator: merge: PDS discovery: %w", err)

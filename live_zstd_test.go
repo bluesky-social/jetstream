@@ -214,21 +214,33 @@ func TestLiveConsumerZstd_DecodeBoundedByReadLimit(t *testing.T) {
 	require.Contains(t, errs[0].Error(), "zstd frame decode")
 }
 
-// buildKPDict makes a small but valid structured zstd dictionary with the
-// given ID using klauspost's builder over synthetic JSON-ish samples.
+var kpDictTemplate struct {
+	once sync.Once
+	dict []byte
+	err  error
+}
+
+// buildKPDict returns a small valid structured zstd dictionary with the given
+// ID. Training is deliberately shared: the ID is an independent header field,
+// while every test uses the same corpus and dictionary body.
 func buildKPDict(t *testing.T, id uint32) []byte {
 	t.Helper()
-	samples := make([][]byte, 0, 128)
-	for i := range 128 {
-		frame := liveCommitFrame(t, uint64(i+1), "did:plc:traindata", "create", "app.bsky.feed.post", strings.Repeat("r", i%7+1), true)
-		samples = append(samples, frame)
-	}
-	d, err := kpdict.BuildZstdDict(samples, kpdict.Options{
-		MaxDictSize: 8 << 10,
-		HashBytes:   6,
-		ZstdDictID:  id,
+	kpDictTemplate.once.Do(func() {
+		samples := make([][]byte, 0, 128)
+		for i := range 128 {
+			frame := liveCommitFrameJSON(uint64(i+1), "did:plc:traindata", "app.bsky.feed.post", strings.Repeat("r", i%7+1))
+			samples = append(samples, []byte(frame))
+		}
+		kpDictTemplate.dict, kpDictTemplate.err = kpdict.BuildZstdDict(samples, kpdict.Options{
+			MaxDictSize: 8 << 10,
+			HashBytes:   6,
+			ZstdDictID:  1,
+		})
 	})
-	require.NoError(t, err)
+	require.NoError(t, kpDictTemplate.err)
+	require.GreaterOrEqual(t, len(kpDictTemplate.dict), 8)
+	d := append([]byte(nil), kpDictTemplate.dict...)
+	binary.LittleEndian.PutUint32(d[4:8], id)
 	gotID := binary.LittleEndian.Uint32(d[4:8])
 	require.Equal(t, id, gotID)
 	return d

@@ -89,13 +89,14 @@ func TestRunBootstrap_BackfillErrorPropagates(t *testing.T) {
 	verifier := newTestVerifier(t, unreachable)
 
 	o, err := New(Config{
-		DataDir:    dataDir,
-		Store:      st,
-		RelayURL:   unreachable,
-		HTTPClient: &http.Client{Timeout: 500 * time.Millisecond},
-		Directory:  testIdentityDirectory(),
-		Verifier:   verifier,
-		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DataDir:                dataDir,
+		Store:                  st,
+		RelayURL:               unreachable,
+		HTTPClient:             &http.Client{Timeout: 500 * time.Millisecond},
+		Directory:              testIdentityDirectory(),
+		Verifier:               verifier,
+		Logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		BackfillRetryBaseDelay: time.Millisecond,
 	})
 	require.NoError(t, err)
 
@@ -104,6 +105,8 @@ func TestRunBootstrap_BackfillErrorPropagates(t *testing.T) {
 
 	err = o.runBootstrap(ctx)
 	require.Error(t, err, "unreachable relay should surface as runBootstrap error")
+	require.NotErrorIs(t, err, context.DeadlineExceeded,
+		"the engine error, not the test safety deadline, must stop bootstrap")
 
 	// Phase must still be PhaseBootstrap — no cutover happened.
 	got, err := lifecycle.ReadPhase(st)
