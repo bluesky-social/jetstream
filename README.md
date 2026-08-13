@@ -1,18 +1,28 @@
-# Jetstream
+# Jetstream 🛩️
 
-[![ci](https://github.com/bluesky-social/jetstream/actions/workflows/ci.yml/badge.svg)](https://github.com/bluesky-social/jetstream/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/bluesky-social/jetstream.svg)](https://pkg.go.dev/github.com/bluesky-social/jetstream)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/bluesky-social/jetstream)](https://github.com/bluesky-social/jetstream/blob/main/go.mod)
+[![Latest Release](https://img.shields.io/github/v/release/bluesky-social/jetstream)](https://github.com/bluesky-social/jetstream/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](https://github.com/bluesky-social/jetstream/blob/main/LICENSE-DUAL)
+[![CI](https://github.com/bluesky-social/jetstream/actions/workflows/ci.yml/badge.svg)](https://github.com/bluesky-social/jetstream/actions/workflows/ci.yml)
 
-Full-network archive and streaming service for atproto.
-
-The original jetstream codebase is available [here](https://github.com/bluesky-social/jetstream-legacy).
+Full-network archive, replay, and streaming service for atproto.
 
 Docker images are available [here](https://github.com/bluesky-social/jetstream/pkgs/container/jetstream).
 
-**NOTE:** This project is not yet deployed to production, and there will be backwards-incompatible changes to the on-disk format in the next few days. Do not run this yourself and expect it to remain stable until we tag a 1.0 release (coming soon!).
+The original jetstream codebase is available [here](https://github.com/bluesky-social/jetstream-legacy).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-## Getting started
+## Documentation
+
+Coming soon!
+
+## Examples
+
+See the [examples](https://github.com/bluesky-social/jetstream/tree/main/examples) directory of this repo for several minimal usage examples.
+
+## Developing Locally
 
 Jetstream development uses Nix for a pinned Go and toolchain environment. Install Nix, then enter the dev shell with either:
 
@@ -21,8 +31,6 @@ Jetstream development uses Nix for a pinned Go and toolchain environment. Instal
 # or
 just dev
 ```
-
-## Running Locally
 
 For development purposes, to run against the real production network in a setup that doesn't require a whole-network backfill:
 
@@ -53,8 +61,6 @@ To fully reset your local environment (warning: destructive action!):
 just clean  # removes all built binaries and all data directories
 ```
 
-## Testing and Linting
-
 To run the linter and tests, you can do things like:
 
 ```sh
@@ -68,21 +74,3 @@ just test-long                # full suite without -short
 
 just oracle                   # heavier simulator oracle (stress mode)
 ```
-
-## Inspecting segment files
-
-```sh
-# inspect all segment files
-just run inspect-all
-
-# inspect a single file
-just run inspect-segment ./data-prod/segments/seg_0000000000.jss
-```
-
-Dumps the header, footer, per-block stats, and collection event counts for a sealed segment.
-
-## Web Dashboard
-
-The jetstream server also offers a web dashboard with some basic read-only features.
-
-Start the server locally in your desired configuration, then open `http://localhost:8080/status` in your browser.
