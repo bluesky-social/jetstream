@@ -25,7 +25,7 @@ func main() {
 	flag.Parse()
 
 	if err := run(context.Background(), &args); err != nil {
-		slog.Error("an error occurred while running the jetstream example", "err", err)
+		slog.Error("an error occurred while running the jetstream live-tail example", "err", err)
 		os.Exit(1)
 	}
 }
