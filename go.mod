@@ -6,7 +6,7 @@ require (
 	github.com/cockroachdb/errors v1.14.0
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/coder/websocket v1.8.15
-	github.com/jcalabro/atmos v0.3.4
+	github.com/jcalabro/atmos v0.3.6
 	github.com/jcalabro/gloom v0.1.0
 	github.com/jcalabro/gt v0.0.14
 	github.com/jcalabro/jttp v0.0.6

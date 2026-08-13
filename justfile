@@ -51,6 +51,8 @@ build:
         done
     fi
 
+    go build -o bin/ ./examples/...
+
 # Build the Docker image locally, stamping the same build info as `just build`.
 # `--load` intentionally keeps this to one platform so the image can be run
 # immediately for smoke checks (`docker run --rm jetstream:local version`).
@@ -103,6 +105,9 @@ run-prod-race *ARGS:
 # Run the websocket load-test client against a running jetstream server.
 run-client *ARGS:
     go run ./cmd/client {{ARGS}}
+
+run-example PROGRAM *ARGS:
+    go run ./examples/{{PROGRAM}} {{ARGS}}
 
 # Run the local simulator (PLC + PDS + relay + firehose).
 simulator *ARGS:
