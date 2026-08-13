@@ -1,11 +1,14 @@
 // Performs a full network replay with basic options, printing some sample events as it goes. This may take a while!
 //
+// Be sure to set the JETSTREAM_API_KEY environment variable if your server requires auth.
+//
 // See the documentation for more information https://pkg.go.dev/github.com/bluesky-social/jetstream
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -22,9 +25,10 @@ type CLIArgs struct {
 
 func main() {
 	args := CLIArgs{}
-	args.Host = *flag.String("host", "https://jetstream.us-east.bsky.network", "Jetstream host to which the process will connect")
-	args.APIKey = os.Getenv("JETSTREAM_API_KEY")
+	flag.StringVar(&args.Host, "host", "https://jetstream.us-east.bsky.network", "Jetstream host to which the process will connect")
 	flag.Parse()
+
+	args.APIKey = os.Getenv("JETSTREAM_API_KEY")
 
 	if err := run(context.Background(), &args); err != nil {
 		slog.Error("an error occurred while running the jetstream example", "err", err)
@@ -35,8 +39,11 @@ func main() {
 func run(ctx context.Context, args *CLIArgs) error {
 	// Declare our client connection options (see the docs for more)
 	opts := []jetstream.Option{
-		jetstream.WithAPIToken(args.APIKey), // pass our credential
-		jetstream.WithAfterSeq(0),           // start from the beginning of time
+		jetstream.WithAfterSeq(0), // start from the beginning of time
+	}
+
+	if args.APIKey != "" {
+		opts = append(opts, jetstream.WithAPIToken(args.APIKey))
 	}
 
 	client, err := jetstream.Subscribe(args.Host, opts...)
@@ -52,12 +59,18 @@ func run(ctx context.Context, args *CLIArgs) error {
 	var lastEvent jetstream.Event
 	for batch, err := range client.Events(ctx) {
 		if err != nil {
-			return fmt.Errorf("failed to receive batch: %w", err)
+			if errors.Is(err, jetstream.ErrFatal) {
+				return fmt.Errorf("received fatal error: %w", err)
+			}
+
+			// You should handle other errors gracefully
+			fmt.Printf("got an error: %v\n", err)
+			continue
 		}
 
+		// These are all the events that are downloaded throughout the course of the replay.
+		// Do with them what you wish!
 		for _, event := range batch.Events() {
-			// These are all the events that are downloaded throughout the course of the replay.
-			// Do with them what you wish!
 			lastEvent = event
 		}
 
