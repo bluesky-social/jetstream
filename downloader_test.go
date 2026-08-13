@@ -1110,9 +1110,11 @@ func TestDownloadBlocksErrorStopsEntryNotPlan(t *testing.T) {
 	}
 
 	// Fail entry 0's block 1 (getBlock 500s it); everything else serves normally.
+	var failedReqs atomic.Int64
 	mux := http.NewServeMux()
 	mux.HandleFunc("/xrpc/network.bsky.jetstream.getBlock", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("segment") == segName(0) && r.URL.Query().Get("blockIndex") == "1" {
+			failedReqs.Add(1)
 			writeXRPCError(w, http.StatusInternalServerError, "InternalError")
 			return
 		}
@@ -1126,7 +1128,15 @@ func TestDownloadBlocksErrorStopsEntryNotPlan(t *testing.T) {
 		{SegmentName: segName(0), Index: 0, Mode: modeBlocks, Blocks: []blockRange{{First: 0, Last: 2}}},
 		{SegmentName: segName(1), Index: 1, Mode: modeBlocks, Blocks: []blockRange{{First: 0, Last: 2}}},
 	}
-	d := newDownloader(&xrpc.Client{Host: srv.URL}, 8, nil)
+	d := newDownloader(&xrpc.Client{
+		Host: srv.URL,
+		Retry: gt.Some(xrpc.RetryPolicy{
+			MaxAttempts: gt.Some(3),
+			BaseDelay:   gt.Some(time.Millisecond),
+			MaxDelay:    gt.Some(10 * time.Millisecond),
+			Jitter:      gt.Some(0.0),
+		}),
+	}, 8, nil)
 
 	var perEntry [2][]uint64
 	var entry0Err error
@@ -1143,6 +1153,7 @@ func TestDownloadBlocksErrorStopsEntryNotPlan(t *testing.T) {
 	require.NoError(t, err, "a per-block fetch failure is a per-entry error, not a Download failure")
 	require.Error(t, entry0Err, "entry 0's failing block must surface in order")
 	require.ErrorContains(t, entry0Err, "getBlock 1")
+	require.EqualValues(t, 3, failedReqs.Load(), "the failing block must exhaust its retry budget")
 	require.Equal(t, []uint64{1, 2}, perEntry[0], "entry 0 delivers only the good prefix before the error")
 	require.Equal(t, []uint64{101, 102, 103, 104, 105, 106}, perEntry[1], "entry 1 must complete despite entry 0's error")
 }

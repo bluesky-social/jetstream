@@ -209,13 +209,14 @@ func newMergeFixture(t *testing.T, sources [][]segment.Event, repoRevs map[strin
 
 	relay := newFakeRelay(t, nil)
 	cfg := Config{
-		DataDir:    dataDir,
-		Store:      st,
-		RelayURL:   relay.URL(),
-		HTTPClient: &http.Client{Timeout: 5 * time.Second},
-		Directory:  testIdentityDirectory(),
-		Verifier:   newTestVerifier(t, relay.URL()),
-		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DataDir:                      dataDir,
+		Store:                        st,
+		RelayURL:                     relay.URL(),
+		HTTPClient:                   &http.Client{Timeout: 5 * time.Second},
+		Directory:                    testIdentityDirectory(),
+		Verifier:                     newTestVerifier(t, relay.URL()),
+		Logger:                       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MergeDiscoveryRetryBaseDelay: time.Millisecond,
 	}
 	return &mergeFixture{dataDir: dataDir, store: st, cfg: cfg, relay: relay}
 }

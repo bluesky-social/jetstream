@@ -179,6 +179,11 @@ type Config struct {
 	// production backoff per fault. Production leaves it 0.
 	BackfillRetryBaseDelay time.Duration
 
+	// MergeDiscoveryRetryBaseDelay, when > 0, overrides the merge discovery
+	// host-retry backoff base. Production leaves this zero for the 2s base;
+	// integration tests set it small while retaining all three attempts.
+	MergeDiscoveryRetryBaseDelay time.Duration
+
 	// FailedRepoRetryInterval controls steady-state retry scans for repos that
 	// exhausted bootstrap retry and remain StatusFailed. Zero disables the
 	// background retry loop; merge still runs its one-shot pending pass for
@@ -352,6 +357,9 @@ func (c *Config) validate() error {
 	}
 	if c.FailedRepoRetryMaxDelay < 0 {
 		return fmt.Errorf("%w: FailedRepoRetryMaxDelay must be >= 0", ErrInvalidConfig)
+	}
+	if c.MergeDiscoveryRetryBaseDelay < 0 {
+		return fmt.Errorf("%w: MergeDiscoveryRetryBaseDelay must be >= 0", ErrInvalidConfig)
 	}
 	if c.HTTPClient == nil {
 		return fmt.Errorf("%w: HTTPClient is required", ErrInvalidConfig)

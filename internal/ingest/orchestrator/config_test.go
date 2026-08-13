@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos/identity"
@@ -31,6 +32,16 @@ func validBaseConfig(t *testing.T) Config {
 		Verifier:   &atmossync.Verifier{},
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
+}
+
+func TestConfig_Validate_NegativeMergeDiscoveryRetryBaseDelay(t *testing.T) {
+	t.Parallel()
+
+	cfg := validBaseConfig(t)
+	cfg.MergeDiscoveryRetryBaseDelay = -time.Nanosecond
+	err := cfg.validate()
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.Contains(t, err.Error(), "MergeDiscoveryRetryBaseDelay")
 }
 
 func TestConfig_Validate_OK(t *testing.T) {
