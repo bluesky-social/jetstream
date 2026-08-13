@@ -51,6 +51,8 @@ build:
         done
     fi
 
+    go build -o bin/ ./examples/...
+
 # Build the Docker image locally, stamping the same build info as `just build`.
 # `--load` intentionally keeps this to one platform so the image can be run
 # immediately for smoke checks (`docker run --rm jetstream:local version`).
