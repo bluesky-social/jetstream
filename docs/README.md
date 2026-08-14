@@ -29,7 +29,8 @@ We also have the following non-goals, which are explicitly not included in this 
 1. Exactly once delivery
     1. We do at-least-once delivery and require clients to be idempotent (they already should be if they're subscribing to the existing firehose!)
 2. Cryptographic proof storage
-    1. Since we lay out records in order per-DID, we actually should be able to reconstruct the MST on the fly for a user
+    1. Since we lay out records in order per-DID, we actually should be able to reconstruct the latest rev and repo root on the fly for a user
+    2. However, we won't store prevData
 3. Query engine with arbitrary queries or point lookups
     1. This is a replay cache, not a general purpose database. We only support large range scans
 4. Distributed consensus
