@@ -16,10 +16,20 @@
         let
           pkgs = import nixpkgs { inherit system; };
           goPkgs = import nixpkgs-go { inherit system; };
-          goVersion = "1.26.5";
-          go = assert pkgs.lib.assertMsg (goPkgs.go_1_26.version == goVersion)
-            "nixpkgs-go must provide Go ${goVersion}, got ${goPkgs.go_1_26.version}";
-            goPkgs.go_1_26;
+          goVersion = "1.26.6";
+          # The pinned Nix channel can lag Go security patch releases.
+          go = let
+            patchedGo = goPkgs.go_1_26.overrideAttrs {
+              version = goVersion;
+              src = goPkgs.fetchurl {
+                url = "https://dl.google.com/go/go${goVersion}.src.tar.gz";
+                hash = "sha256-oHIcVMaIkBRI13rZs+x+p8R0cwdV/4kTgukuy5P/LLE=";
+              };
+            };
+          in
+          assert pkgs.lib.assertMsg (patchedGo.version == goVersion)
+            "nixpkgs-go must provide Go ${goVersion}, got ${patchedGo.version}";
+          patchedGo;
           golangci-lint = pkgs.buildGoModule {
             pname = "golangci-lint";
             version = "2.10.1";
