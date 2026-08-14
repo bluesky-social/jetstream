@@ -62,11 +62,38 @@ jobs:
         run: ./dev.sh --command just vuln
 
   fuzz:
-    name: fuzz
+    name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 20
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - { package: ".", target: FuzzDecodeLiveFrame }
+          - { package: ".", target: FuzzDecodeRecordMapEquivalence }
+          - { package: "./internal/ingest/live", target: FuzzLoadUpstreamCursor }
+          - { package: "./internal/ingest/live", target: FuzzUpstreamCursorRoundTrip }
+          - { package: "./internal/ingest/syncstate", target: FuzzChainStateRoundTrip }
+          - { package: "./internal/ingest/syncstate", target: FuzzDecodeChainState }
+          - { package: "./internal/ingest/syncstate", target: FuzzDecodeHostingState }
+          - { package: "./internal/ingest/syncstate", target: FuzzHostingStateRoundTrip }
+          - { package: "./internal/subscribe", target: FuzzEncode }
+          - { package: "./internal/subscribe", target: FuzzEncodeV2 }
+          - { package: "./internal/subscribe", target: FuzzParseQuery }
+          - { package: "./internal/subscribe", target: FuzzParseUpdatePayload }
+          - { package: "./internal/subscribe", target: FuzzResolveCursor }
+          - { package: "./internal/timestamp", target: FuzzParseRoundTrip }
+          - { package: "./internal/xrpcapi", target: FuzzValidatePlanCollections }
+          - { package: "./segment", target: FuzzDecodeBlock }
+          - { package: "./segment", target: FuzzDecodeBlockFromCompressed }
+          - { package: "./segment", target: FuzzPatch }
+          - { package: "./segment", target: FuzzReadBlockIndex }
+          - { package: "./segment", target: FuzzReadCollectionIndex }
+          - { package: "./segment", target: FuzzReadHeader }
+          - { package: "./segment", target: FuzzRewrite }
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
@@ -102,14 +129,16 @@ jobs:
           github-token: ""
 
       - name: Fuzz
-        run: ./dev.sh --command just fuzz 300s
+        env:
+          FUZZ_PACKAGE: ${{ matrix.package }}
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: ./dev.sh --command just fuzz-target 300s "$FUZZ_PACKAGE" "$FUZZ_TARGET"
 
       - name: Upload fuzz artifacts
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: fuzz-failure-corpus
-          path: |
-            **/testdata/fuzz/**
+          name: fuzz-failure-${{ matrix.target }}
+          path: ${{ matrix.package }}/testdata/fuzz/${{ matrix.target }}/**
           if-no-files-found: warn
           retention-days: 14

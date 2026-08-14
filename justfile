@@ -159,8 +159,8 @@ oracle:
     JETSTREAM_ORACLE_MODE=stress gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 ./internal/oracle -run TestOracle_DefaultLifecycle
 
 # Sweeps oracle stress mode across randomly-chosen seeds. Intended for the
-# scheduled CI job, which runs several smaller sweeps each day to reduce the
-# blast radius of ARC runner failures. The per-seed workload is governed
+# scheduled CI job, which runs one seed per matrix job to reduce the blast
+# radius of hosted-runner failures. The per-seed workload is governed
 # entirely by JETSTREAM_ORACLE_MODE=stress (see internal/oracle/config.go) so
 # there is a single source of truth: do not reintroduce account/record/event
 # overrides here. Pass SEEDS explicitly to grow or shrink a local run.
@@ -169,7 +169,7 @@ oracle:
 # fault injection is on by default (JETSTREAM_ORACLE_FAULT_MODE=swarm); the
 # sweep relies on it to exercise backfill retry/recovery and live reconnect/
 # resume recovery on every seed.
-oracle-sweep SEEDS="10" RACE="":
+oracle-sweep SEEDS="10" RACE="" FIXED_SEED="":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -181,13 +181,29 @@ oracle-sweep SEEDS="10" RACE="":
     artifact_root="${ORACLE_ARTIFACT_DIR:-oracle-artifacts}"
     mkdir -p "${artifact_root}"
 
+    # CI supplies a fixed seed for each matrix shard so an infrastructure-only
+    # rerun repeats the interrupted workload rather than silently substituting
+    # a different random scenario. Local multi-seed sweeps continue to draw
+    # fresh seeds by default.
+    fixed_seed="{{FIXED_SEED}}"
+    if [[ -n "${fixed_seed}" ]]; then
+        if [[ "{{SEEDS}}" != "1" ]]; then
+            echo "oracle-sweep: FIXED_SEED requires SEEDS=1" >&2
+            exit 2
+        fi
+        if [[ ! "${fixed_seed}" =~ ^[0-9]+$ ]]; then
+            echo "oracle-sweep: FIXED_SEED must be an unsigned decimal integer" >&2
+            exit 2
+        fi
+    fi
+
     # RACE="" (default): no race detector, 30m per-seed timeout. Any non-empty
     # RACE arg enables `-race` and raises the timeout to 90m, because the race
     # detector slows execution ~5-15x and inflates memory; the #107 race lane
-    # runs FEW seeds within this larger budget rather than the full nightly
-    # count. The restart tier re-execs the SAME test binary as its child
-    # (os.Args[0]), so -race instruments both the parent harness and the killed
-    # child — the data-race coverage is real on both tiers, not just the parent.
+    # runs at a low seed count. The restart tier re-execs the SAME test binary
+    # as its child (os.Args[0]), so -race instruments both the parent harness and
+    # the killed child — the data-race coverage is real on both tiers, not just
+    # the parent.
     race_flag=()
     per_seed_timeout="30m"
     if [[ -n "{{RACE}}" ]]; then
@@ -201,7 +217,11 @@ oracle-sweep SEEDS="10" RACE="":
         # runs explore different points in the state space instead of replaying
         # a fixed 1..N. /dev/urandom is portable across the Linux CI runner and
         # macOS dev machines; the failing seed is printed below for exact repro.
-        seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+        if [[ -n "${fixed_seed}" ]]; then
+            seed="${fixed_seed}"
+        else
+            seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+        fi
         seed_dir="${artifact_root}/seed-${i}-${seed}"
         mkdir -p "${seed_dir}"
         echo "::group::oracle ${i}/{{SEEDS}} seed=${seed}"
@@ -209,7 +229,7 @@ oracle-sweep SEEDS="10" RACE="":
         # GOTRACEBACK=all makes the runtime print every goroutine's stack when
         # the test -timeout fires, so a hang is diagnosable instead of a bare
         # job kill. The per-seed -timeout (30m, matching the mutation campaign)
-        # is deliberately far below the job budget (timeout-minutes: 360) so the
+        # is deliberately below the corresponding 45m/110m CI job budget so the
         # dump prints and the artifact upload runs before the job is killed; a
         # healthy stress seed completes in minutes. JETSTREAM_ORACLE_TRACE_DIR
         # redirects the harness trace from an ephemeral t.ArtifactDir() into the
@@ -325,6 +345,25 @@ fuzz DURATION="10s" *ARGS="./...":
             go test "$pkg" -run='^$' -fuzz="^${t}$" -fuzztime={{DURATION}}
         done
     done
+
+# Runs exactly one fuzz target. Scheduled CI uses this entry point for matrix
+# shards so one runner loss cannot discard the other targets' completed work.
+fuzz-target DURATION PACKAGE TARGET:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pkg="{{PACKAGE}}"
+    target="{{TARGET}}"
+    if [[ ! "${target}" =~ ^Fuzz[[:alnum:]_]+$ ]]; then
+        echo "fuzz-target: invalid target ${target}" >&2
+        exit 2
+    fi
+    listed="$(go test "${pkg}" -list "^${target}$" -run '^$' -count=1)"
+    if ! grep -Fxq -- "${target}" <<< "${listed}"; then
+        echo "fuzz-target: ${target} does not exist in ${pkg}" >&2
+        exit 2
+    fi
+    echo "=== FUZZ ${target} (${pkg}) ==="
+    go test "${pkg}" -run='^$' -fuzz="^${target}$" -fuzztime={{DURATION}}
 
 # Generate Go XRPC types from the lexicons in ./lexicons.
 # The com.atproto package mapping exists only so lexgen can resolve
