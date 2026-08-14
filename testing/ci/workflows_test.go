@@ -42,6 +42,7 @@ func TestOracleWorkflowUsesStableSingleSeedShards(t *testing.T) {
 
 	require.Contains(t, workflow, "fail-fast: false")
 	require.Contains(t, workflow, "matrix.seed")
+	require.Regexp(t, `(?s)oracle-sweep-race:.*?strategy:.*?max-parallel: 1`, workflow)
 	require.Contains(t, workflow, `just oracle-sweep 1 "" "$ORACLE_SEED"`)
 	require.Contains(t, workflow, `just oracle-sweep 1 race "$ORACLE_SEED"`)
 	require.Contains(t, workflow, `github.event.inputs.seeds || '5'`)

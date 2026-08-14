@@ -151,7 +151,7 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 1
       matrix: ${{ fromJSON(needs.plan.outputs.race) }}
     env:
       ORACLE_SEED: ${{ matrix.seed }}
