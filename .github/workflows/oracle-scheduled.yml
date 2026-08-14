@@ -1,9 +1,8 @@
 # Scheduled simulator oracle seed sweep.
 #
-# This workflow is intentionally separate from push CI. It is expensive enough
-# to be a bug-hunting job, not a per-commit gate. GitHub's built-in Actions
-# notifications handle failure emails for users who have Actions email
-# notifications enabled.
+# Each matrix job owns one pre-generated seed. A failed-job rerun therefore
+# repeats exactly the interrupted scenario instead of discarding completed work
+# or silently drawing a replacement seed.
 
 name: oracle-scheduled
 
@@ -28,29 +27,65 @@ concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
-env:
-  # The per-seed workload is fixed by JETSTREAM_ORACLE_MODE=stress inside the
-  # oracle-sweep recipe (see internal/oracle/config.go). Only the seed count is
-  # tunable here; do not reintroduce account/record/event overrides.
-  ORACLE_SWEEP_SEEDS: ${{ github.event.inputs.seeds || '10' }}
-  # The -race lane (#107) is far slower per seed (~5.5 min for one stress
-  # DefaultLifecycle + restart seed under the detector, vs. minutes without), so
-  # it sweeps a handful of seeds within the same 360m job budget rather than the
-  # full nightly count. The non-race lane stays at ORACLE_SWEEP_SEEDS.
-  ORACLE_RACE_SWEEP_SEEDS: ${{ github.event.inputs.race_seeds || '3' }}
-  # Per-seed diagnostic artifacts (JSONL trace + captured test output carrying
-  # the goroutine dump) are written here by the oracle-sweep recipe and uploaded
-  # on failure. Without this the trace lands in an ephemeral temp dir and every
-  # scheduled failure is diagnostically blind.
-  ORACLE_ARTIFACT_DIR: ${{ github.workspace }}/oracle-artifacts
-
 jobs:
-  oracle-sweep:
-    name: oracle seed sweep
+  plan:
+    name: plan oracle shards
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 5
+    outputs:
+      oracle: ${{ steps.seeds.outputs.oracle }}
+      race: ${{ steps.seeds.outputs.race }}
+    steps:
+      - name: Generate stable seeds
+        id: seeds
+        env:
+          ORACLE_SWEEP_SEEDS: ${{ github.event.inputs.seeds || '5' }}
+          ORACLE_RACE_SWEEP_SEEDS: ${{ github.event.inputs.race_seeds || '1' }}
+        run: |
+          set -euo pipefail
+
+          validate_count() {
+            local name="$1"
+            local count="$2"
+            local maximum="$3"
+            if [[ ! "$count" =~ ^[1-9][0-9]*$ ]] || (( count > maximum )); then
+              echo "${name} must be an integer from 1 through ${maximum}; got ${count}" >&2
+              exit 2
+            fi
+          }
+
+          matrix() {
+            local count="$1"
+            local output='{"include":['
+            local separator=''
+            local seed
+            for ((i = 0; i < count; i++)); do
+              seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+              output+="${separator}{\"seed\":\"${seed}\"}"
+              separator=','
+            done
+            printf '%s]}' "$output"
+          }
+
+          validate_count seeds "$ORACLE_SWEEP_SEEDS" 100
+          validate_count race_seeds "$ORACLE_RACE_SWEEP_SEEDS" 25
+          echo "oracle=$(matrix "$ORACLE_SWEEP_SEEDS")" >> "$GITHUB_OUTPUT"
+          echo "race=$(matrix "$ORACLE_RACE_SWEEP_SEEDS")" >> "$GITHUB_OUTPUT"
+
+  oracle-sweep:
+    name: oracle seed (${{ matrix.seed }})
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJSON(needs.plan.outputs.oracle) }}
+    env:
+      ORACLE_SEED: ${{ matrix.seed }}
+      ORACLE_ARTIFACT_DIR: ${{ github.workspace }}/oracle-artifacts/${{ matrix.seed }}
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
@@ -85,17 +120,14 @@ jobs:
           diagnostic-endpoint: ""
           github-token: ""
 
-      - name: Oracle seed sweep
-        run: ./dev.sh --command just oracle-sweep "$ORACLE_SWEEP_SEEDS"
+      - name: Oracle seed
+        run: ./dev.sh --command just oracle-sweep 1 "" "$ORACLE_SEED"
 
       - name: Upload diagnostic artifacts
-        # The JSONL trace is the design's substitute for bit-reproducible
-        # scheduling; capturing it (plus the goroutine-dump-bearing test output)
-        # only matters when a seed fails, so this runs on failure only.
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: oracle-failure-traces
+          name: oracle-failure-${{ matrix.seed }}
           path: ${{ env.ORACLE_ARTIFACT_DIR }}
           if-no-files-found: warn
           retention-days: 14
@@ -106,27 +138,24 @@ jobs:
           {
             echo "## Scheduled oracle test failed"
             echo
-            echo 'The failing seed and exact local repro command are printed in the `Oracle seed sweep` step logs.'
-            echo
-            echo "Workload: JETSTREAM_ORACLE_MODE=stress (see internal/oracle/config.go)"
-            echo
-            echo "- seeds swept: ${ORACLE_SWEEP_SEEDS}"
+            echo "Seed: ${ORACLE_SEED}"
+            echo "Repro: just oracle-sweep 1 \"\" ${ORACLE_SEED}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # The #107 race lane: the same stress/swarm + restart sweep under the data-race
-  # detector, at a low seed count. The repo's only other race coverage is
-  # ci.yml's `test (race)` job, which runs DEFAULT mode (25 accounts/1000
-  # records) and never the stress/swarm or restart interleavings where observed
-  # sweep failures actually reproduce. This closes that gap. It is a separate job
-  # (not extra seeds on the sweep above) so a race-detector data-race report is
-  # attributable on its own and the slower per-seed budget doesn't dilute the
-  # non-race seed count.
   oracle-sweep-race:
-    name: oracle seed sweep (race)
+    name: oracle race seed (${{ matrix.seed }})
+    needs: plan
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 110
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.race) }}
+    env:
+      ORACLE_SEED: ${{ matrix.seed }}
+      ORACLE_ARTIFACT_DIR: ${{ github.workspace }}/oracle-race-artifacts/${{ matrix.seed }}
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
@@ -161,17 +190,14 @@ jobs:
           diagnostic-endpoint: ""
           github-token: ""
 
-      - name: Oracle seed sweep (race detector)
-        # A non-empty RACE arg turns on -race and widens the per-seed timeout to
-        # 90m inside the recipe; the restart tier re-execs the same test binary
-        # as its killed child, so the detector instruments both processes.
-        run: ./dev.sh --command just oracle-sweep "$ORACLE_RACE_SWEEP_SEEDS" race
+      - name: Oracle seed (race detector)
+        run: ./dev.sh --command just oracle-sweep 1 race "$ORACLE_SEED"
 
       - name: Upload diagnostic artifacts
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: oracle-race-failure-traces
+          name: oracle-race-failure-${{ matrix.seed }}
           path: ${{ env.ORACLE_ARTIFACT_DIR }}
           if-no-files-found: warn
           retention-days: 14
@@ -180,12 +206,8 @@ jobs:
         if: failure()
         run: |
           {
-            echo "## Scheduled oracle race lane failed"
+            echo "## Scheduled oracle race test failed"
             echo
-            echo 'A failure here is either a data race (the detector prints a `DATA RACE` report in the step logs) or an oracle assertion under -race.'
-            echo
-            echo "Workload: JETSTREAM_ORACLE_MODE=stress under -race (see internal/oracle/config.go)"
-            echo
-            echo "- seeds swept: ${ORACLE_RACE_SWEEP_SEEDS}"
-            echo "- the failing seed and exact local repro command are printed in the sweep step logs (add -race to the printed command)."
+            echo "Seed: ${ORACLE_SEED}"
+            echo "Repro: just oracle-sweep 1 race ${ORACLE_SEED}"
           } >> "$GITHUB_STEP_SUMMARY"

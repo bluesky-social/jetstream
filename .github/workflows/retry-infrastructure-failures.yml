@@ -1,0 +1,113 @@
+# Retry failed scheduled jobs once, but only when every failure carries narrow,
+# positive evidence that a GitHub-hosted runner was lost. This privileged
+# workflow never checks out or executes repository code.
+
+name: retry-infrastructure-failures
+
+on:
+  workflow_run:
+    workflows:
+      - ci-scheduled
+      - oracle-scheduled
+    types:
+      - completed
+
+permissions:
+  actions: write
+  checks: read
+
+concurrency:
+  group: retry-infrastructure-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    name: classify and retry hosted-runner failures
+    if: >-
+      github.event.workflow_run.run_attempt == 1 &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      (github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'workflow_dispatch') &&
+      github.event.workflow_run.repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            pipelines.actions.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      - name: Classify failed jobs and retry once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          job_pages="$(gh api --paginate --slurp "repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs?filter=all&per_page=100")"
+          failures="$(jq -c '[.[].jobs[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")]' <<< "$job_pages")"
+          failure_count="$(jq 'length' <<< "$failures")"
+          if (( failure_count == 0 )); then
+            echo "The workflow failed without a failed job; refusing to retry." >&2
+            exit 1
+          fi
+
+          eligible=true
+          while IFS= read -r job; do
+            job_id="$(jq -r '.id' <<< "$job")"
+            job_name="$(jq -r '.name' <<< "$job")"
+            conclusion="$(jq -r '.conclusion // "missing"' <<< "$job")"
+            if [[ "$conclusion" != failure && "$conclusion" != startup_failure ]]; then
+              echo "Not retrying ${job_name}: unsupported conclusion ${conclusion}."
+              eligible=false
+              continue
+            fi
+
+            check_url="$(jq -r '.check_run_url' <<< "$job")"
+            check_endpoint="${check_url#https://api.github.com/}"
+            evidence_file="${RUNNER_TEMP}/job-${job_id}-evidence.txt"
+            gh api "$check_endpoint" \
+              --jq '[.output.title, .output.summary, .output.text] | map(select(. != null)) | .[]' \
+              > "$evidence_file"
+            gh api --paginate "${check_endpoint}/annotations?per_page=100" \
+              --jq '.[] | [.title, .message, .raw_details] | map(select(. != null)) | .[]' \
+              >> "$evidence_file"
+
+            # Job logs contain runner-control messages that are not guaranteed
+            # to appear in check annotations. Failure to download them is not a
+            # fallback: the remaining evidence must still independently match.
+            log_archive="${RUNNER_TEMP}/job-${job_id}-logs"
+            if gh api "repos/${REPOSITORY}/actions/jobs/${job_id}/logs" > "$log_archive" 2>/dev/null; then
+              if ! unzip -p "$log_archive" >> "$evidence_file" 2>/dev/null; then
+                cat "$log_archive" >> "$evidence_file"
+              fi
+            fi
+
+            if grep -Fqi 'has exceeded the maximum execution time' "$evidence_file"; then
+              echo "Not retrying ${job_name}: GitHub reports a job timeout."
+              eligible=false
+            elif grep -Fq 'The hosted runner lost communication with the server' "$evidence_file"; then
+              echo "Retrying ${job_name}: GitHub reports hosted-runner communication loss."
+            elif grep -Fq 'The job was not acquired by Runner of type hosted even after multiple attempts' "$evidence_file"; then
+              echo "Retrying ${job_name}: GitHub reports that no hosted runner acquired the job."
+            elif grep -Fq 'The runner has received a shutdown signal' "$evidence_file" && \
+                 grep -Eiq '(exit (code|status) 143|exited with (exit )?code 143)' "$evidence_file"; then
+              echo "Retrying ${job_name}: hosted-runner shutdown is corroborated by exit 143."
+            else
+              echo "Not retrying ${job_name}: no recognized hosted-runner failure evidence."
+              eligible=false
+            fi
+          done < <(jq -c '.[]' <<< "$failures")
+
+          if [[ "$eligible" != true ]]; then
+            echo "At least one failure was not infrastructure-only; leaving the workflow red."
+            exit 0
+          fi
+
+          gh api --method POST "repos/${REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs"
+          echo "All ${failure_count} failed jobs were infrastructure-only; requested one failed-job rerun."
