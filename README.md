@@ -16,7 +16,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## User Documentation
 
-See the [jetstream documentation website](https://bsky.network/docs/jetstream/).
+See the [jetstream documentation website](https://bsky.network/docs/jetstream/) for end-user facing documentation.
+
+See the original [RFD](https://github.com/bluesky-social/jetstream/blob/main/docs/README.md) for a detailed overview for the project goals and design of the system.
 
 ## Examples
 
