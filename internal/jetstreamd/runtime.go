@@ -257,23 +257,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		HTTPClient: gt.Some(jttp.New(append(xrpc.BulkDownloadOpts(), transportOpt...)...)),
 	}
 
-	resolver := &identity.DefaultResolver{}
-	if opts.PLCURL != "" {
-		resolver.PLCURL = gt.Some(opts.PLCURL)
-	}
-	if opts.PLCURL != "" || opts.HTTPTransport != nil {
-		// atmos's default resolver client enables jttp.WithStrictSSRFProtection,
-		// which refuses loopback even on the initial request. When the
-		// operator points us at a local PLC (e.g. the dev simulator at
-		// http://localhost:7777), use a non-strict client so the dial
-		// succeeds. We also install this client whenever an in-process
-		// HTTPTransport is injected (even with the default PLC URL): the
-		// transport is the RoundTripper for every outbound client per
-		// Options.HTTPTransport, so identity/PLC resolution must route
-		// through it too -- otherwise a "socket-free" runtime silently
-		// dials the real network for resolution.
-		resolver.HTTPClient = gt.Some(jttp.New(append(xrpc.ATProtoOpts(10*time.Second), transportOpt...)...))
-	}
+	resolver := newIdentityResolver(opts)
 	directory := &identity.Directory{
 		Resolver:               resolver,
 		Cache:                  identcache.New(metaStore, identcache.DefaultTTL),
@@ -569,6 +553,30 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.server = srv
 
 	return rt, nil
+}
+
+func newIdentityResolver(opts Options) *identity.DefaultResolver {
+	plcOpts := append(xrpc.ATProtoOpts(10*time.Second), jttp.WithNoRedirects())
+	webOpts := xrpc.ATProtoOpts(10 * time.Second)
+	if opts.HTTPTransport != nil {
+		// HTTPTransport is a deterministic, socket-free test seam. DNS
+		// preflight would escape that seam and make simulator-only hostnames
+		// depend on the machine resolver, so the injected transport owns policy
+		// enforcement in this mode.
+		plcOpts = append(plcOpts, jttp.WithTransport(opts.HTTPTransport))
+		webOpts = append(webOpts, jttp.WithTransport(opts.HTTPTransport))
+	} else {
+		webOpts = append(webOpts, jttp.WithStrictSSRFProtection(), jttp.WithNoProxy())
+	}
+
+	resolver := &identity.DefaultResolver{
+		HTTPClient:    gt.Some(jttp.New(webOpts...)),
+		PLCHTTPClient: gt.Some(jttp.New(plcOpts...)),
+	}
+	if opts.PLCURL != "" {
+		resolver.PLCURL = gt.Some(opts.PLCURL)
+	}
+	return resolver
 }
 
 // PublicAddr returns the bound public listener address, or "" before Run binds.
