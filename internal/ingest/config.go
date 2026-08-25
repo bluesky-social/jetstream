@@ -84,6 +84,15 @@ type Config struct {
 	// when a single pebble store is shared between multiple writers.
 	SeqKey string
 
+	// ReserveClientVisibleSeqs enables a durable write-ahead sequence lease.
+	// Set it for writers whose assigned seqs can be observed by clients.
+	ReserveClientVisibleSeqs bool
+
+	// UnreservedSeqsUnobservable allows a lease-enabled writer to trust an
+	// absent reservation key. Only the pre-serving merge transition may set it:
+	// lifecycle gating proves bootstrap seqs were never client-visible.
+	UnreservedSeqsUnobservable bool
+
 	// OnDurableBatch, if non-nil, stages extra metadata into the same synced
 	// Pebble batch that persists SeqKey after a segment block has been fsynced.
 	// The hook may return an afterCommit callback, which runs only after the
@@ -182,6 +191,15 @@ func (c *Config) validate() error {
 	if c.AsyncFlushWorkers < 0 {
 		return fmt.Errorf("%w: AsyncFlushWorkers must be >= 0 (got %d)",
 			ErrInvalidConfig, c.AsyncFlushWorkers)
+	}
+	if c.ReserveClientVisibleSeqs && c.AsyncFlushWorkers > 0 {
+		return fmt.Errorf("%w: ReserveClientVisibleSeqs requires AsyncFlushWorkers=0", ErrInvalidConfig)
+	}
+	if c.ReserveClientVisibleSeqs && c.SeqKey != "" && c.SeqKey != seqNextKey {
+		return fmt.Errorf("%w: ReserveClientVisibleSeqs is only valid for the canonical %q sequence namespace", ErrInvalidConfig, seqNextKey)
+	}
+	if c.UnreservedSeqsUnobservable && !c.ReserveClientVisibleSeqs {
+		return fmt.Errorf("%w: UnreservedSeqsUnobservable requires ReserveClientVisibleSeqs", ErrInvalidConfig)
 	}
 	if c.ReadLogRetentionBytes < 0 {
 		return fmt.Errorf("%w: ReadLogRetentionBytes must be >= 0 (got %d)",

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos/identity"
@@ -41,6 +42,10 @@ type Options struct {
 	// LastSeenUpstreamEvent returns the last steady-state subscribeRepos event
 	// observation time. Optional; nil means the live freshness fields are empty.
 	LastSeenUpstreamEvent func() time.Time
+
+	// Writer returns the current steady-state writer. Optional; when absent or
+	// nil, sequence-lease status fields remain zero.
+	Writer func() *ingest.Writer
 }
 
 // Collector builds Snapshots on demand. Concurrent callers share one

@@ -1,6 +1,6 @@
 # Seq reuse after crash: delivered seqs can be reassigned to different events
 
-Date: 2026-08-25. Status: problem spec + proposed design, ready for handoff.
+Date: 2026-08-25. Status: implemented on `jc/issue-345`.
 Scope: this one defect only. (A future backup/restore feature will reuse the
 same mechanism with a larger window, but nothing here depends on it.)
 
@@ -74,82 +74,81 @@ distinguish "seq 500 is the event I saw" from "seq 500 is now a different
 event" without comparing payloads, which defeats the point of a cursor. The
 server is the only place the invariant can live.
 
-## Proposed design
+## Implemented design
 
-Three cooperating pieces. The theme: make post-crash seq vacancies **explicit
-and durable**, so cursors resolve across them losslessly and genuine holes
-stay crash-loud.
+The implementation uses a one-block **write-ahead seq lease**, not a fixed
+epoch bump or clean-shutdown marker. This tightens the bound to the actual
+configured block size and proves safety directly at the publication point.
 
-### 1. Epoch bump on unclean boot
+### 1. One-block write-ahead lease
 
-- On graceful shutdown, the writer's terminal durable batch additionally
-  writes a clean-shutdown marker (e.g. `seq/clean_shutdown`) recording the
-  final `nextSeq`. `ingest.Open` deletes the marker as soon as it reads it
-  (before any append), so the marker's presence proves the previous exit was
-  clean *and* nothing has run since.
-- On boot, after the existing reconcile: if the marker is present and matches
-  the reconciled seq, no bump — the common deploy/restart path stays gap-free.
-  If the marker is absent or mismatched (crash, kill -9, torn state), bump:
-  `nextSeq += gapSlack`, and durably record the vacancy (see §2) in the same
-  pebble write as the bumped `seq/next`, before the first append.
-- `gapSlack` must exceed the maximum possible delivered-minus-durable window.
-  Derive the bound from code (pending block + async pipeline depth, i.e.
-  roughly `(AsyncFlushWorkers + 1) × MaxEventsPerBlock`), then use a flat
-  constant with a wide margin — 1<<20 is suggested — plus a startup assertion
-  that the constant exceeds the derived bound for the configured writer. Do
-  not make it clever; make it obviously sufficient.
-- Seq-space budget: v1 cursor disambiguation caps usable seqs at 1e15
-  (`CursorSeqMaxThreshold`, `internal/subscribe/cursor.go:15-31`, with the
-  non-overlap argument in `specs/notes/2026-05-27-cursor-replay-design.md`).
-  At 1<<20 per crash that allows ~10^9 crashes; update the comment's
-  arithmetic to account for bumps.
-- Scope note: only the steady writer's counter (`seq/next`) needs this.
-  Bootstrap-phase seqs (`live_segments/seq/next`) are never client-visible —
-  serving ungates at steady state — but the implementer should confirm that
-  and document it where the decision lands.
+- `seq/next` is the exact durable coverage frontier: every lower value is
+  represented by a durable event or a registered vacancy.
+- `seq/max_reserved` is the exclusive end of the client-visible allocation
+  lease. Before `Open` returns, it synchronously reserves
+  `[nextSeq, nextSeq + MaxEventsPerBlock)`. Before readable-log publication,
+  `Append` requires `candidate.Seq < maxReserved`.
+- A block flush fsyncs segment bytes first, then advances exact `seq/next` and
+  renews the lease to `nextSeq + MaxEventsPerBlock` in the existing synced
+  pebble metadata batch. The relay cursor and other event-backed metadata stay
+  atomic with that commit. A renewal failure is fatal to the append and no
+  allocation can pass the old lease end.
+- `DrainDurability` is non-terminal and renews the full lease. Terminal
+  `Close` flushes pending data and collapses `seq/max_reserved` to exact
+  `nextSeq`, so a graceful restart creates no vacancy.
+- Lease-enabled writers reject async block flushing. The configured block is
+  therefore the exact maximum visible-minus-durable window. The steady server
+  currently uses the internal 4096-event default; `MaxEventsPerBlock` is known
+  by `ingest.Config` at startup but is not currently a server-admin CLI/env
+  option.
+- Only the canonical steady namespace (`seq/next`) may enable leasing.
+  Bootstrap writers remain unleased because serving is lifecycle-gated. The
+  pre-serving merge transition explicitly attests that legacy bootstrap seqs
+  were unobservable when it first adopts the canonical writer.
 
-### 2. Durable gap registry
+### 2. Recovery and durable vacancy registry
 
-- New pebble keyspace, e.g. `seq/gap/<start>` → `{end, reason, boot_time}`
-  (or one `seq/gaps` record; implementer's choice — entries are tiny and
-  count one-per-crash). Loaded once at startup into an immutable in-memory
-  set; gaps are only ever created at boot, so no synchronization story.
-- The registry is the source of truth for "this vacancy is legitimate."
-  Anything that encounters a seq hole NOT covered by the registry keeps
-  today's crash-loud behavior.
+On startup, the writer reconciles exact durable state from `seq/next` and
+segment blocks. If the prior reservation leads that tip, it atomically:
 
-### 3. Lossless cursor resolution and replay across registered gaps
+1. registers `[durableNext, priorReserved)`;
+2. resumes allocation at `priorReserved`; and
+3. reserves one new configured block.
 
-Two consumers need the registry:
+Registry records use `seq/gap/<big-endian start>` with a versioned value
+containing reason (`crash`) and exclusive end. Startup loads, validates, sorts,
+coalesces, and canonicalizes these half-open intervals. Every interval is
+checked against each non-empty durable block range; overlap is internal
+corruption and fails `Open`. Segment envelopes are deliberately not used for
+this validation because a legitimate vacancy can lie between two blocks in
+the same segment.
 
-- **`ResolveCursor`** (`internal/subscribe/cursor.go`): a requested seq cursor
-  that lands inside a registered gap is clamped forward to the gap end, with
-  `Clamped = true` and a dedicated metric label. This clamp is semantically
-  lossless — vacant seqs name no events — so it applies silently on **both**
-  endpoints; it is not a too-old condition and must not trip v2's
-  `RejectBelowFloor`. The timestamp path needs the same post-translation
-  check: `translateTimeUSToSeq` can return `last.MaxSeq + 1`
-  (`cursor.go:256-263`), which can sit inside a gap after a crash.
-- **The cold walker** (`internal/subscribe/replay.go`): resolving is not
-  enough — a deep replay that *starts below* a gap must cross it.
-  `walkSealedRegion` currently returns at a coverage miss and
-  `WalkFromCursor`'s no-progress guard then fails loud ("rotation seam
-  invariant violated", `replay.go:164-170`). Thread the gap set through
-  `WalkInput`; when the walk's `current` enters a registered gap, jump it to
-  the gap end (metric), and leave the no-progress guard exactly as it is for
-  unregistered holes. Take care at the boundaries: a gap ending at the
-  readable-log floor, a gap covering `StartSeq`, and the interaction with the
-  rotation-seam retry (a seam retry that lands in a registered gap must not
-  count as progress-by-gap-jump masking a real seam violation — keep the two
-  signals separable).
+A direct upgrade from a legacy data dir with no reservation key conservatively
+burns one configured block. Absence of the key cannot prove the old process
+exited cleanly: its final pending block could have been client-visible. This is
+a one-time compatibility cost. Repeated crashes without progress consume one
+lease each and adjacent vacancies coalesce.
 
-Also confirm the hot path: after a bump, the readable log is constructed at
-the bumped seq (`writer.go:226-228`), so `FloorSeq` sits at/above the gap end
-and hot reads never see the vacancy. The manifest already tolerates
-non-contiguous seq ranges (`validateSegmentSeqMonotonicity` rejects overlap,
-not gaps), and `SegmentForSeq` deliberately reports gaps as not-found
-(`internal/manifest/manifest.go:583-605`) — that contract can stand; the gap
-knowledge belongs to the callers above, not the manifest.
+The cursor namespace ceiling is still 1e15. At the default 4096 values per
+abandoned lease, exhausting it without event traffic would require more than
+244 billion unclean startups.
+
+### 3. Lossless cursor resolution and replay
+
+`ResolveCursor` losslessly advances a seq cursor inside a registered vacancy
+to its exclusive end before applying v2's too-old decision. A vacancy ending
+at the lookback floor is therefore not stale; one ending below the floor still
+is. Timestamp translation applies the same normalization, including after a
+lookback-floor clamp. Gap clamps have a dedicated metric label.
+
+The cold walker uses the same immutable registry. It jumps only when `current`
+is contained by a registered interval and records jump count/width metrics.
+The jump is tracked separately from rotation-seam progress, so an adjacent
+unpublished segment still retries normally and an unexplained hole still
+trips the existing no-progress invariant. The manifest remains gap-agnostic.
+
+The readable log starts at recovered `nextSeq`, so hot reads begin at or after
+the vacancy end and never need special handling.
 
 ### Client-visible contract
 
@@ -157,20 +156,22 @@ knowledge belongs to the callers above, not the manifest.
   the existing at-least-once contract. The vacancy itself is invisible except
   as a seq jump, which clients must already tolerate (compaction thins seqs
   today).
-- The module-root client dedupes by seq and cuts over archive→live; verify
-  its cutover handles an archive tip followed by a gap to the live tip
-  (it should — the server replays from the requested cursor and the gap jump
-  is server-side — but test it).
-- Document in `docs/README.md` §2 and `specs/invariants.md`: strengthen the
-  seq invariant to "a seq observable by a client is never reused for a
-  different event, across crash and restart," and describe registered
-  vacancies.
+- The module-root client's archive→live test covers an archive tip followed by
+  a registered server vacancy and confirms the forward jump causes neither a
+  reconnect nor a re-backfill loop.
+- `docs/README.md` §2/§3.1.1 and `specs/invariants.md` carry the strengthened
+  client-observable seq invariant and registered-vacancy contract.
 
 ## Alternatives considered
 
-- **Unconditional bump every boot** (no clean marker): simpler, but litters
-  gaps on every deploy and makes the gap path the common path. Rejected —
-  the marker is one key in a batch that already exists.
+- **Fixed epoch bump plus clean-shutdown marker:** the original proposal used
+  `1<<20`. Rejected in favor of the write-ahead lease: the configured block
+  size is the exact synchronous-window bound, the lease itself distinguishes
+  clean from unclean shutdown, and there is no second marker protocol.
+- **Async lease sized by `(workers+1)*blockSize`:** possible, but broadens the
+  exposed window and complicates proof across ordered in-flight commits.
+  Client-visible writers instead reject async flush; bootstrap-only writers
+  may continue using it because their seqs are not served.
 - **Generic clamp-forward on any coverage gap** (no registry): simplest for
   the walker, but destroys the crash-loud property — a missing/corrupt
   segment file would silently skip events. Rejected outright; the loud
@@ -183,46 +184,46 @@ knowledge belongs to the callers above, not the manifest.
   block-worth of delivered events on the hot path, to shave slack we can get
   for free with a constant. Rejected (mechanical sympathy).
 
-## Test plan (red-first where possible)
+## Implemented verification
 
-- **Unit, ingest:** Open-after-crash bumps and records a gap; Open-after-clean
-  does not; marker is deleted on read (a crash immediately after boot still
-  bumps on the next boot); slack assertion trips when misconfigured.
+- **Ingest:** fresh/open/crash/clean-close, repeated crash coalescing, partial
+  flush, non-terminal drain, legacy migration, pre-serving merge attestation,
+  configured block-size change, startup/renewal commit faults, malformed and
+  overlapping records, lease ceiling, and a deterministic 64-crash model.
 - **Unit, subscribe:** `ResolveCursor` matrix — cursor inside gap (both
   endpoints, seq + timestamp modes), at gap boundaries, gap + lookback-floor
   interaction (floor above/below/inside the gap), v2 `RejectBelowFloor`
   not tripped by gap clamps.
 - **Unit, walker:** replay starting below, inside, and above a registered
-  gap; multiple gaps in one walk; unregistered hole still fails loud (this
-  test guards the guard).
-- **Oracle:** the crash/restart tier is the natural home and this is the
-  red-first vehicle: have a subscriber record (seq → event identity) for
-  delivered events pre-crash, crash inside the delivered-not-durable window
-  (crashpoint seams exist), restart, re-subscribe with the pre-crash cursor,
-  and assert no seq ever maps to a different event identity than first
-  observed. This test MUST fail against today's code (that failure is the
-  proof the defect is real) and pass with the fix. Note `specs/oracle.md`
-  discipline and add a diary entry if the work uncovers adjacent flakes.
-- **Mutation campaign:** after landing, add mutants for (a) dropping the bump
-  on unclean boot, (b) skipping the gap-registry write, (c) clamping
-  unregistered holes — predict which tier kills each, run
-  `just mutation-campaign` on a clean tree, update `testing/mutation/RESULTS.md`.
+  gap; multiple gaps in one walk; unregistered holes across segments, between
+  blocks in one segment, and in the active-only path still fail loud. Sparse
+  rows inside a compaction-preserved block envelope remain valid without a
+  crash-gap record.
+- **Oracle:** a real websocket subscriber records `(seq,event identity)` from
+  a pending sub-block event in a child process. The parent SIGKILLs the child,
+  reopens the same data dir, and proves a different event starts at the lease
+  end rather than reusing the observed seq. The old implementation reuses 1.
+- **Mutation campaign:** the dedicated `seqlease` tier kills six mutants:
+  resuming at the durable tip, omitting renewal, skipping registry persistence,
+  silently accepting cross-segment or same-segment unregistered replay holes,
+  and terminally collapsing a non-terminal drain.
+  `testing/mutation/RESULTS.md` records the targeted run.
 - **Determinism:** `TestOracle_SameSeedTraceDeterminism` must stay green (the
-  bump is deterministic given a deterministic crash point).
+  lease transition is deterministic given durable state and block size).
 
 Per `AGENTS.md`, this touches ingest/cursor/restart-recovery: run `just`,
 `just test-long ./internal/oracle`, `just oracle-sweep`, and
 `just fuzz 30s ./segment` at minimum.
 
-## Open questions for the implementer (decide and document, don't stall)
+## Decisions recorded
 
-1. Registry shape: one key per gap vs one record; pick the one that keeps the
-   boot path simplest.
-2. Whether `getConfig`/status should surface gap count/last-gap for operator
-   visibility (`/status` already aggregates similar counters) — recommended.
-3. Exact slack constant and where the derived-bound assertion lives.
-4. Whether the resolver clamp and walker jump share one helper (they should
-   if it doesn't contort the signatures).
+1. One versioned pebble key per normalized gap, keyed by big-endian start.
+2. `/status` surfaces lease end/headroom, gap count/width, and latest range;
+   Prometheus exposes reservation, registration, clamp, and replay-jump data.
+3. The lease width is exactly the configured `MaxEventsPerBlock`; no slack
+   constant remains.
+4. Resolver and walker share the immutable `seqspace.Gaps.EndContaining`
+   primitive while retaining their own control flow and observability.
 
 ## Related, explicitly out of scope
 

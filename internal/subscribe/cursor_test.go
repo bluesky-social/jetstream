@@ -7,9 +7,50 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/stretchr/testify/require"
 )
+
+func mustSeqGaps(t *testing.T, ranges ...seqspace.Gap) *seqspace.Gaps {
+	t.Helper()
+	gaps, err := seqspace.NewGaps(ranges)
+	require.NoError(t, err)
+	return gaps
+}
+
+func TestResolveCursor_SeqGapClampMatrix(t *testing.T) {
+	t.Parallel()
+	gaps := mustSeqGaps(t, seqspace.Gap{Start: 100, End: 200})
+
+	for _, tc := range []struct {
+		name      string
+		cursor    string
+		wantStart uint64
+		clamped   bool
+	}{
+		{name: "before", cursor: "99", wantStart: 99},
+		{name: "at start", cursor: "100", wantStart: 200, clamped: true},
+		{name: "inside", cursor: "150", wantStart: 200, clamped: true},
+		{name: "at end", cursor: "200", wantStart: 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := subscribe.ResolveCursor(tc.cursor, subscribe.CursorEnv{
+				NextSeq: 300,
+				Gaps:    gaps,
+			})
+			require.NoError(t, err)
+			require.Equal(t, subscribe.ModeReplaySeq, p.Mode)
+			require.Equal(t, tc.wantStart, p.StartSeq)
+			require.Equal(t, tc.clamped, p.Clamped)
+			if tc.clamped {
+				require.Equal(t, "gap", p.ClampReason)
+			} else {
+				require.Empty(t, p.ClampReason)
+			}
+		})
+	}
+}
 
 // TestResolveCursor_TranslateIOFaultIsResolveFailed verifies that a server-side
 // segment read failure during timestamp-to-seq translation is classified as
@@ -95,6 +136,20 @@ func TestResolveCursor_TimestampEmptyArchiveFloorsToOne(t *testing.T) {
 	require.Equal(t, uint64(1), p.StartSeq,
 		"a timestamp cursor on an empty archive must floor to seq 1, not the seq-0 sentinel")
 	require.True(t, p.Clamped)
+}
+
+func TestResolveCursor_TimestampEmptyArchiveClampsAcrossInitialGap(t *testing.T) {
+	t.Parallel()
+	pastMicros := time.Now().Add(-time.Hour).UnixMicro()
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(pastMicros, 10), subscribe.CursorEnv{
+		NextSeq: 5,
+		Gaps:    mustSeqGaps(t, seqspace.Gap{Start: 1, End: 5}),
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
+	require.Equal(t, uint64(5), p.StartSeq)
+	require.True(t, p.Clamped)
+	require.Equal(t, "gap", p.ClampReason)
 }
 
 func TestResolveCursor_NonNumericRejected(t *testing.T) {
@@ -221,6 +276,53 @@ func TestResolveCursor_SeqBelowFloorRejectedWhenRejectBelowFloor(t *testing.T) {
 	// client can log how far behind it was and re-backfill from its last seq.
 	require.Contains(t, err.Error(), "50")
 	require.Contains(t, err.Error(), "200")
+}
+
+func TestResolveCursor_SeqGapEndingAtFloorIsNotTooOld(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
+		minSeq: 200, maxSeq: 299,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(time.Hour/time.Microsecond),
+		eventCount:     10,
+	})
+	m := mustOpenManifest(t, dir)
+
+	p, err := subscribe.ResolveCursor("150", subscribe.CursorEnv{
+		Manifest:         m,
+		NextSeq:          300,
+		Lookback:         36 * time.Hour,
+		RejectBelowFloor: true,
+		Gaps:             mustSeqGaps(t, seqspace.Gap{Start: 100, End: 200}),
+	})
+	require.NoError(t, err, "a cursor whose entire path to the floor is a registered vacancy is not stale")
+	require.Equal(t, uint64(200), p.StartSeq)
+	require.True(t, p.Clamped)
+	require.Equal(t, "gap", p.ClampReason)
+}
+
+func TestResolveCursor_SeqGapEndingBelowFloorIsTooOld(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
+		minSeq: 200, maxSeq: 299,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(time.Hour/time.Microsecond),
+		eventCount:     10,
+	})
+	m := mustOpenManifest(t, dir)
+
+	_, err := subscribe.ResolveCursor("120", subscribe.CursorEnv{
+		Manifest:         m,
+		NextSeq:          300,
+		Lookback:         36 * time.Hour,
+		RejectBelowFloor: true,
+		Gaps:             mustSeqGaps(t, seqspace.Gap{Start: 100, End: 150}),
+	})
+	require.ErrorIs(t, err, subscribe.ErrCursorTooOld)
 }
 
 // TestResolveCursor_SeqBelowFloorClampsWhenV1 pins the v1 parity guarantee:
@@ -392,6 +494,32 @@ func TestResolveCursor_TimeUSNewerThanAllSegments(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
 	require.Equal(t, uint64(10), p.StartSeq, "starts at first non-sealed seq")
+}
+
+func TestResolveCursor_TimeUSTranslationLandingInGapClampsToEnd(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
+		minSeq: 1, maxSeq: 99,
+		minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+		maxWitnessedAt: now - int64(5*time.Hour/time.Microsecond),
+		eventCount:     10,
+	})
+	m := mustOpenManifest(t, dir)
+
+	cursor := now - int64(time.Hour/time.Microsecond)
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(cursor, 10), subscribe.CursorEnv{
+		Manifest: m,
+		NextSeq:  300,
+		Lookback: 36 * time.Hour,
+		Gaps:     mustSeqGaps(t, seqspace.Gap{Start: 100, End: 200}),
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
+	require.Equal(t, uint64(200), p.StartSeq)
+	require.True(t, p.Clamped)
+	require.Equal(t, "gap", p.ClampReason)
 }
 
 func TestResolveCursor_TimeUSOlderThanAllSegmentsClampsToFloor(t *testing.T) {

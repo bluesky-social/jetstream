@@ -54,13 +54,14 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 		}
 
 		c, err := live.Open(live.Config{
-			DataDir:     o.cfg.DataDir,
-			SegmentsDir: segmentsDir,
-			FS:          o.cfg.FS,
-			Store:       o.cfg.Store,
-			SeqKey:      live.SteadySeqKey,
-			CursorKey:   live.CursorKey,
-			RelayURL:    o.cfg.RelayURL,
+			DataDir:                  o.cfg.DataDir,
+			SegmentsDir:              segmentsDir,
+			FS:                       o.cfg.FS,
+			Store:                    o.cfg.Store,
+			SeqKey:                   live.SteadySeqKey,
+			ReserveClientVisibleSeqs: true,
+			CursorKey:                live.CursorKey,
+			RelayURL:                 o.cfg.RelayURL,
 			// Bare cfg.Logger; live.Open sets its own component.
 			Logger:                o.cfg.Logger,
 			Metrics:               o.cfg.LiveMetrics,

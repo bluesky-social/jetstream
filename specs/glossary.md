@@ -20,7 +20,7 @@ Words that show up all over the code and docs, with a one-line meaning and where
 
 **Manifest** — the list of segments jetstream serves. It's deliberately not stored in pebble: it's just a directory scan plus each file's self-describing header, so it can't drift from what's on disk. Source: `docs/README.md` §3.5.
 
-**Metadata store** — the single pebble db at `data/meta.pebble/` holding everything that isn't cheaply re-derivable from segments: `relay/cursor`, lifecycle `phase`, `repo/<did>`, the `pdshost/<hostname>` fleet roster/cursors, `account/<did>`, `sync/<did>`, and `compaction/seq`. Source: `docs/README.md` §3.5, `internal/store`.
+**Metadata store** — the single pebble db at `data/meta.pebble/` holding everything that isn't cheaply re-derivable from segments: `relay/cursor`, lifecycle `phase`, seq tip/lease/registered vacancies, `repo/<did>`, the `pdshost/<hostname>` fleet roster/cursors, `account/<did>`, `sync/<did>`, and `compaction/seq`. Source: `docs/README.md` §3.5, `internal/store`.
 
 ## Ingestion lifecycle
 
@@ -36,7 +36,9 @@ Words that show up all over the code and docs, with a one-line meaning and where
 
 **Steady state** — normal operation after cutover: one live consumer pumps the firehose into `segments/`, failed backfills retry on the side, and compaction runs periodically. Source: `docs/README.md` §4.3.
 
-**Cursor (seq, sequence number)** — the monotonic 64-bit id jetstream assigns each event at ingestion. Also the value clients pass as `?cursor=`. Inclusive, starts at 1, instance-local. Source: `docs/README.md` §2. See also `specs/invariants.md`.
+**Cursor (seq, sequence number)** — the monotonic 64-bit id jetstream assigns each event at ingestion. Also the value clients pass as `?cursor=`. Inclusive, starts at 1, instance-local, and may jump across a durable registered vacancy after an unclean restart. Source: `docs/README.md` §2. See also `specs/invariants.md`.
+
+**Sequence lease / registered vacancy** — the steady writer durably reserves one block of seqs ahead of client visibility. An unclean restart permanently records the abandoned half-open interval as vacant before allocating beyond it, preventing an observed seq from being reused. Source: `docs/README.md` §2, `internal/ingest/seqlease.go`.
 
 ## Serving the stream
 

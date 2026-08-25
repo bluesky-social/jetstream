@@ -3,6 +3,7 @@ package status
 import (
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 )
 
@@ -177,6 +178,7 @@ type LiveStats struct {
 	BootstrapSeq             uint64
 	LastSeenUpstreamEventAt  time.Time
 	LastSeenUpstreamEventAge time.Duration
+	SeqLease                 ingest.SeqLeaseStats
 }
 
 // SegmentSummary mirrors segment.Inspection's user-facing fields,

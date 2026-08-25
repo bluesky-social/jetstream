@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -24,11 +25,13 @@ import (
 //     above the threshold.
 //   - v2 seq is a monotonic counter starting at 1. At sustained 100K
 //     events/sec (10x current network throughput), reaching 1e15 takes
-//     >300 years.
+//     >300 years. Unclean restarts additionally consume at most one configured
+//     block lease (4096 seqs by default); even with no events, exhausting 1e15
+//     would require more than 244 billion such abandoned leases.
 //
 // See specs/notes/2026-05-27-cursor-replay-design.md (the non-overlap argument)
 // and docs/README.md §5.1, which carry the authoritative 1e15 value.
-const CursorSeqMaxThreshold uint64 = 1_000_000_000_000_000
+const CursorSeqMaxThreshold = seqspace.CursorSeqMaxThreshold
 
 // CursorMode discriminates the resolved cursor's intended replay
 // behavior. ModeLive means "subscribe to the live tip; no replay."
@@ -60,6 +63,10 @@ type CursorPlan struct {
 	// Clamped is true when the resolved StartSeq differs from the
 	// requested cursor (because of lookback floor or future cursor).
 	Clamped bool
+
+	// ClampReason distinguishes lossless registered-gap clamps from legacy
+	// floor/future/sentinel clamps for observability.
+	ClampReason string
 }
 
 // CursorEnv bundles the runtime dependencies the resolver consults.
@@ -96,6 +103,9 @@ type CursorEnv struct {
 	// timestamp path always clamps (legacy v1 timestamp translation), under
 	// both endpoints.
 	RejectBelowFloor bool
+
+	// Gaps is the immutable set of durable, explicitly-authorized vacancies.
+	Gaps *seqspace.Gaps
 }
 
 // ErrInvalidCursor wraps any user-visible parse failure of the
@@ -168,6 +178,11 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 			startSeq = 1
 			plan.Clamped = true
 		}
+		if end, ok := env.Gaps.EndContaining(startSeq); ok {
+			startSeq = end
+			plan.Clamped = true
+			plan.ClampReason = "gap"
+		}
 		// Clamp to the lookback floor when the manifest knows the floor
 		// and lookback clamping is enabled. A zero or negative Lookback
 		// disables clamping (replays as far back as the manifest can).
@@ -184,6 +199,15 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 				}
 				startSeq = floorSeq
 				plan.Clamped = true
+			}
+			// A segment envelope may span a registered gap, so its MinSeq can
+			// place the lookback floor at the gap boundary. Normalize once more
+			// after applying the floor; only an explicitly registered vacancy
+			// may be skipped here.
+			if end, ok := env.Gaps.EndContaining(startSeq); ok {
+				startSeq = end
+				plan.Clamped = true
+				plan.ClampReason = "gap"
 			}
 		}
 		plan.StartSeq = startSeq
@@ -206,6 +230,19 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 	if clamped {
 		plan.Clamped = true
 	}
+	// Floor the replay start to seq 1 before gap normalization: seq 0 is the
+	// pure "nothing yet" sentinel and is never allocated. Translation returns
+	// 0 when there are no sealed segments, including after an unclean empty-
+	// archive restart whose first registered vacancy begins at seq 1.
+	if plan.StartSeq == 0 {
+		plan.StartSeq = 1
+		plan.Clamped = true
+	}
+	if end, ok := env.Gaps.EndContaining(plan.StartSeq); ok {
+		plan.StartSeq = end
+		plan.Clamped = true
+		plan.ClampReason = "gap"
+	}
 	// Apply lookback floor on top of translation. The floor is in
 	// seq units; if the translated seq is below it, we clamp.
 	//
@@ -223,15 +260,10 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 			plan.Clamped = true
 		}
 	}
-	// Floor the replay start to seq 1: seq 0 is the pure "nothing yet" sentinel
-	// (design §R8) and is never allocated to an event. translateTimeUSToSeq
-	// returns 0 when there are no sealed segments; without this floor a v1
-	// timestamp cursor on an empty archive would start the cold reader at 0 and
-	// get a non-advancing next==0 that disconnects the subscriber — the same
-	// trap the seq-cursor path floors away above.
-	if plan.StartSeq == 0 {
-		plan.StartSeq = 1
+	if end, ok := env.Gaps.EndContaining(plan.StartSeq); ok {
+		plan.StartSeq = end
 		plan.Clamped = true
+		plan.ClampReason = "gap"
 	}
 	return plan, nil
 }

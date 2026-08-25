@@ -40,6 +40,8 @@ type Metrics struct {
 	HotReads         prometheus.Counter
 	ColdReads        prometheus.Counter
 	AdversarialDrops prometheus.Counter
+	GapJumps         prometheus.Counter
+	GapValuesSkipped prometheus.Counter
 
 	// Proposal-0015 negotiation observability (#318): whether v2
 	// connections explicitly offered xrpc.v1.json or fell back to the
@@ -121,7 +123,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		CursorRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "cursor_requests_total",
-			Help: "Number of /subscribe connections by cursor resolution mode. Mode is one of: live, seq, time_us, clamped, disabled, unavailable, too_old (v2 seq cursor below the lookback floor, rejected with HTTP 400), resolve_failed (server-side segment read/decode fault during timestamp translation, returned as HTTP 503).",
+			Help: "Number of /subscribe connections by cursor resolution mode. Mode is one of: live, seq, time_us, clamped, gap_clamped, disabled, unavailable, too_old (v2 seq cursor below the lookback floor, rejected with HTTP 400), resolve_failed (server-side segment read/decode fault during timestamp translation, returned as HTTP 503).",
 		}, []string{"mode"}),
 		CursorResolveSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -144,6 +146,16 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "adversarial_drops_total",
 			Help: "Number of /subscribe connections dropped by the adversarially-slow detector.",
 		}),
+		GapJumps: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "seq_gap_jumps_total",
+			Help: "Number of cold-replay jumps across durable registered sequence vacancies.",
+		}),
+		GapValuesSkipped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "seq_gap_values_skipped_total",
+			Help: "Number of vacant sequence values crossed by cold replay.",
+		}),
 		SubprotocolNegotiations: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "subprotocol_negotiations_total",
@@ -158,6 +170,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.OptionsUpdates, m.OptionsUpdateErrors,
 		m.CursorRequests, m.CursorResolveSeconds,
 		m.HotReads, m.ColdReads, m.AdversarialDrops,
+		m.GapJumps, m.GapValuesSkipped,
 		m.SubprotocolNegotiations,
 	)
 	return m
@@ -280,4 +293,12 @@ func (m *Metrics) incAdversarialDrops() {
 		return
 	}
 	m.AdversarialDrops.Inc()
+}
+
+func (m *Metrics) incGapJump(start, end uint64) {
+	if m == nil {
+		return
+	}
+	m.GapJumps.Inc()
+	m.GapValuesSkipped.Add(float64(end - start))
 }

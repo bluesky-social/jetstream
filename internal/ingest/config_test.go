@@ -95,3 +95,32 @@ func TestConfigValidate_AllowsAsyncFlushWithDurableBatchHook(t *testing.T) {
 	err := cfg.validate()
 	require.NoError(t, err)
 }
+
+func TestConfigValidate_SeqLeaseConstraints(t *testing.T) {
+	t.Parallel()
+	base := Config{
+		SegmentsDir: "/tmp/x",
+		Store:       &store.Store{},
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	async := base
+	async.ReserveClientVisibleSeqs = true
+	async.AsyncFlushWorkers = 1
+	err := async.validate()
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorContains(t, err, "AsyncFlushWorkers=0")
+
+	wrongNamespace := base
+	wrongNamespace.ReserveClientVisibleSeqs = true
+	wrongNamespace.SeqKey = "bootstrap/seq/next"
+	err = wrongNamespace.validate()
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorContains(t, err, "canonical")
+
+	untrusted := base
+	untrusted.UnreservedSeqsUnobservable = true
+	err = untrusted.validate()
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorContains(t, err, "requires ReserveClientVisibleSeqs")
+}

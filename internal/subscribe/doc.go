@@ -166,6 +166,12 @@
 //     oldest retained event, and the v2 reject policy governs only the
 //     seq path. On v2 the clamp is announced: the first frame is an
 //     #info OutdatedCursor naming the seq actually resumed from.
+//   - A cursor inside a durable registered seq vacancy is losslessly advanced
+//     to the vacancy's exclusive end before the endpoint-specific lookback
+//     policy runs. Cold replay performs the same jump when it reaches a vacancy
+//     below the readable-log floor. Only the writer's validated registry
+//     authorizes this; an unexplained coverage hole still trips the rotation-
+//     seam no-progress invariant and fails loud.
 //
 // Setting --cursor-lookback=0 disables replay: a cursor param is then
 // accepted but resolves to the live tip rather than 400-ing, so v1 clients

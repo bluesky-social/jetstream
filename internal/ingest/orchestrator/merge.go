@@ -77,16 +77,18 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		}
 
 		dst, err := ingest.Open(ingest.Config{
-			SegmentsDir:            segmentsDir,
-			DataDir:                o.cfg.DataDir,
-			FS:                     o.cfg.FS,
-			Store:                  o.cfg.Store,
-			SeqKey:                 live.SteadySeqKey,
-			Logger:                 o.cfg.Logger,
-			Metrics:                o.cfg.IngestMetrics,
-			SegmentMetrics:         o.cfg.SegmentMetrics,
-			OnAfterSeal:            o.cfg.IngestOnAfterSeal,
-			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
+			SegmentsDir:                segmentsDir,
+			DataDir:                    o.cfg.DataDir,
+			FS:                         o.cfg.FS,
+			Store:                      o.cfg.Store,
+			SeqKey:                     live.SteadySeqKey,
+			ReserveClientVisibleSeqs:   true,
+			UnreservedSeqsUnobservable: true,
+			Logger:                     o.cfg.Logger,
+			Metrics:                    o.cfg.IngestMetrics,
+			SegmentMetrics:             o.cfg.SegmentMetrics,
+			OnAfterSeal:                o.cfg.IngestOnAfterSeal,
+			SegmentIOFaultInjector:     o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)

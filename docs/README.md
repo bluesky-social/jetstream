@@ -60,6 +60,8 @@ It tracks each event via its own `sequence number`, a monotonic 64-bit integer a
 
 Same as the normal firehose, cursors are instance-local. Each jetstream instance assigns its own seq values independently, so when switching between instances, clients should rewind their cursor by a small margin and rely on at-least-once delivery to cover the overlap.
 
+A seq that has been observable by a client is never reused for a different event, including across an unclean restart. The steady-state writer durably reserves one configured block of seq space ahead of allocation. A graceful close collapses that lease to the exact durable coverage frontier (segment events plus registered vacancies); after a crash, restart registers the abandoned half-open interval as a durable vacancy and resumes at its end. Seqs are therefore monotonic but not necessarily contiguous. Cursor resolution and cold replay cross only these explicitly registered vacancies; an unexplained coverage hole remains an invariant violation and fails loud. The vacancy is lossless because no durable event owns any seq in it, and the wire representation remains an ordinary forward seq jump (which clients must already tolerate after compaction).
+
 We enforce some invariants that are required for building correctly on atproto:
 
 1. No data loss, even in the face of crashes, network weather, etc.
@@ -160,7 +162,7 @@ Each block contains some number of events (4096 by default, but operator-configu
 
 As we subscribe to the upstream firehose, we assign each event a sequence number, store them in an in-memory buffer, and forward it to downstream subscribers. Once we've accumulated a full block in-memory, we write it to the active segment file on disk and fsync, then update our latest seen cursor in the metadata db (see section 3.5). The persisted cursor is always less than or equal to the the latest durable event in the segment file.
 
-On crash/restart, we seek to the active segment back to the last complete block (walking the 8-byte length prefixes from offset 256 forward), resume the upstream firehose from the persisted cursor, and rely on at-least-once semantics to cover the overlap. Worst-case, re-fetched and re-delivered traffic is one block. All downstream subscribers must be idempotent to duplicate event delivery (they already should be!). Note that sequence numbers will never go backwards or be duplicated; they only go forward (even on crash and restart).
+On crash/restart, we seek the active segment back to the last complete block (walking the 8-byte length prefixes from offset 256 forward), resume the upstream firehose from the persisted cursor, and rely on at-least-once semantics to cover the overlap. Worst-case, re-fetched and re-delivered traffic is one block. All downstream subscribers must be idempotent to duplicate event delivery (they already should be!). The steady-state writer's write-ahead seq lease prevents the pending client-visible block from reusing seqs: startup records the abandoned portion as a registered vacancy and starts after it. Thus seqs never go backward or get reassigned, although an unclean exit can leave a forward gap of at most one configured block per startup attempt. `MaxEventsPerBlock` is known in `ingest.Config` at startup (4096 by default); the steady server currently uses that internal default rather than exposing a dedicated CLI/env setting.
 
 After a segment file accumulates enough blocks (~256MB of compressed data), we seal it by writing the variable-length footer at the end of the file, seeking to offset 0 and overwriting the reserved 256 bytes with the finalized fixed header, fsync, and rotate to a new active file. The process continues until the heat death of the universe.
 
@@ -408,6 +410,9 @@ Keys are namespaced by prefix:
 
 ```
 relay/cursor            -> uint64 upstream firehose seq we've durably persisted
+seq/next                -> uint64 exact durable coverage frontier (events plus registered vacancies)
+seq/max_reserved        -> uint64 exclusive end of the steady writer's durable seq lease
+seq/gap/<start-be>      -> versioned {reason,end} registered half-open vacancy [start,end)
 phase                   -> string current lifecycle phase: bootstrap, merging, or steady_state
 phase/entered_at        -> RFC3339Nano timestamp when the current lifecycle phase was entered
 backfill/timing/started_at   -> RFC3339Nano timestamp when initial bootstrap backfill started
@@ -557,7 +562,7 @@ Bootstrap crash recovery can promote a pre-existing `StatusNotStarted` row to `S
 
 A live first sighting is **not** a `getRepo` trigger. If a repo was behind a firewall or otherwise hidden from the relay during bootstrap and later starts emitting live traffic, Jetstream archives the live events it receives and does not create a `repo/<did>` row or enqueue a background download for that DID. That condition is a PDS/operator repair case: the PDS should emit a new `#sync` event when the repo needs an authoritative full re-download. `StatusPending` rows from the removed first-sighting enqueue path remain decodable, but new live first sightings must not create them and the steady-state failed-repo retry scan does not treat them as eligible.
 
-The `/subscribe` live tail reads the steady writer's readable log ([#248](https://github.com/bluesky-social/jetstream/issues/248)). The steady writer is shared by multiple producers — the live consumer plus the failed-repo retry runner above — so visibility hangs off the seq allocator itself: every event appended through the writer is copied into an ordered in-memory log as soon as it receives a seq, before any flush, async compression, or rotation can move it between durability stages. The writer advances the log's durable watermark only after the segment block is fsynced and the `seq/next` Pebble batch commits. Entries at or above that watermark are pinned; durable entries below it are retained under the configured byte budget. `/subscribe` reads the log for resident seqs and uses the cold reader only for cursors below the log floor, which are durable by construction.
+The `/subscribe` live tail reads the steady writer's readable log ([#248](https://github.com/bluesky-social/jetstream/issues/248)). The steady writer is shared by multiple producers — the live consumer plus the failed-repo retry runner above — so visibility hangs off the seq allocator itself: every event appended through the writer is copied into an ordered in-memory log as soon as it receives a seq, before its block becomes durable. Before that copy, the allocator verifies the seq lies inside the durable one-block write-ahead lease; this is what prevents a pending event observed by a subscriber from having its seq reused after a crash. The writer advances the log's durable watermark only after the segment block is fsynced and the `seq/next` plus renewed `seq/max_reserved` Pebble batch commits. Entries at or above that watermark are pinned; durable entries below it are retained under the configured byte budget. `/subscribe` reads the log for resident seqs and uses the cold reader only for cursors below the log floor, which are durable by construction. Lease-enabled client-visible writers use synchronous block flushing; async compression remains available only to writers whose seqs cannot be served.
 
 ### 4.4 Upstream Input Validation
 

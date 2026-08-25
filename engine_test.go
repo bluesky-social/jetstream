@@ -32,6 +32,7 @@ type engineHarness struct {
 	// == planned), which the bufferless engine consumes in exactly one page.
 	planResponder func(req planReqWire) string
 	planCalls     atomic.Int64
+	liveDials     *int
 }
 
 type planSeg struct {
@@ -88,7 +89,8 @@ func planPageJSON(entries []planSeg, plannedThrough, sealedTip uint64) string {
 
 func (h *engineHarness) cfg() engineConfig {
 	conn := &scriptedConn{steps: h.liveSteps}
-	dial, _ := scriptedDialer(conn)
+	dial, dials := scriptedDialer(conn)
+	h.liveDials = dials
 	return engineConfig{
 		Host:        h.as.srv.URL,
 		Request:     planRequest{AfterSeq: 0},
@@ -255,6 +257,35 @@ func TestEngineEmptyArchiveCutoverDeliversFirstEvent(t *testing.T) {
 	// must deliver every event exactly once, in order.
 	require.Equal(t, []uint64{1, 2, 3, 4}, seqs(events),
 		"empty-archive cutover must deliver the first-ever live event (seq 1) exactly once")
+}
+
+// TestEngineCutoverAcrossRegisteredServerVacancy pins the module-root client
+// side of issue #345. The wire does not encode gap records: the archive ends at
+// seq 2 and the server's lossless gap jump makes the first live event seq 5.
+// The client must accept that monotonic jump, neither inventing 3/4 nor
+// treating their absence as a reason to re-plan or reconnect.
+func TestEngineCutoverAcrossRegisteredServerVacancy(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+
+	sealed := []segment.Event{
+		makeCreate(t, 1, "did:plc:gap", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:gap", "app.bsky.feed.post", "r2"),
+	}
+	h.as.addSegment(t, "seg_0000000000.jss", sealed)
+	h.planned = 2
+	h.planEntry = []planSeg{{name: "seg_0000000000.jss", index: 0, minSeq: 1, maxSeq: 2}}
+	for _, seq := range []uint64{5, 6} {
+		h.liveSteps = append(h.liveSteps, readStep{
+			data: liveCommitFrame(t, seq, "did:plc:gap", "create", "app.bsky.feed.post", "r"+itoaU(seq), true),
+		})
+	}
+	h.installHandlers()
+
+	events := h.runUntilSeq(t, h.cfg(), 6)
+	require.Equal(t, []uint64{1, 2, 5, 6}, seqs(events))
+	require.Equal(t, int64(1), h.planCalls.Load(), "a monotonic seq jump must not trigger re-backfill")
+	require.Equal(t, 1, *h.liveDials, "a monotonic seq jump must not trigger a reconnect")
 }
 
 // TestEngineBackfillOnly covers the one-time-dump path: with BackfillOnly the

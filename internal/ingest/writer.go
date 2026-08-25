@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
@@ -39,6 +40,8 @@ type Writer struct {
 	activeIdx      uint64
 	nextSeq        uint64
 	durableNextSeq uint64
+	reservedEnd    uint64
+	gaps           *seqspace.Gaps
 	readLog        *ReadableLog
 	closed         bool
 
@@ -194,17 +197,34 @@ func Open(cfg Config) (*Writer, error) {
 		}
 	}
 
-	pebbleSeq, err := loadNextSeq(cfg.Store, cfg.SeqKey)
+	pebbleSeq, pebbleSeqFound, err := loadNextSeqFound(cfg.Store, cfg.SeqKey)
 	if err != nil {
 		_ = w.active.Close()
 		return nil, err
 	}
 
 	reconciled := pebbleSeq
-	if foundEvents && maxSeq+1 > reconciled {
-		reconciled = maxSeq + 1
+	if foundEvents {
+		recoveredNext := maxSeq + 1
+		if cfg.ReserveClientVisibleSeqs {
+			// Canonical event seqs share a numeric namespace with legacy
+			// microsecond cursors. Validate the recovered maximum before doing
+			// maxSeq+1 so a checksum-valid but impossible MaxUint64 envelope
+			// cannot wrap to zero and reopen the allocator near the beginning.
+			recoveredNext, err = seqspace.ReserveEnd(maxSeq, 1)
+			if err != nil {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: invalid recovered max seq %d: %w", maxSeq, err)
+			}
+		} else if recoveredNext == 0 {
+			_ = w.active.Close()
+			return nil, fmt.Errorf("ingest: recovered max seq %d overflows sequence counter", maxSeq)
+		}
+		if recoveredNext > reconciled {
+			reconciled = recoveredNext
+		}
 	}
-	if reconciled > pebbleSeq {
+	if reconciled > pebbleSeq && !cfg.ReserveClientVisibleSeqs {
 		if err := saveNextSeq(cfg.Store, cfg.SeqKey, reconciled); err != nil {
 			_ = w.active.Close()
 			return nil, cfg.wrapSegmentPersistenceError("reconciling durable seq metadata", err)
@@ -223,12 +243,26 @@ func Open(cfg Config) (*Writer, error) {
 	if reconciled < 1 {
 		reconciled = 1
 	}
-	w.nextSeq = reconciled
-	w.durableNextSeq = reconciled
-	w.readLog = newReadableLog(reconciled, cfg.ReadLogRetentionBytes, cfg.Metrics)
+	nextSeq := reconciled
+	if cfg.ReserveClientVisibleSeqs {
+		lease, leaseErr := initializeSeqLease(cfg, w, reconciled, pebbleSeqFound, hasExisting)
+		if leaseErr != nil {
+			_ = w.active.Close()
+			return nil, leaseErr
+		}
+		nextSeq = lease.nextSeq
+		w.reservedEnd = lease.reservedEnd
+		w.gaps = lease.gaps
+	} else {
+		w.gaps, _ = seqspace.NewGaps(nil)
+	}
+	w.nextSeq = nextSeq
+	w.durableNextSeq = nextSeq
+	w.readLog = newReadableLog(nextSeq, cfg.ReadLogRetentionBytes, cfg.Metrics)
 
 	w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
+	w.cfg.Metrics.setSeqLease(w.reservedEnd, w.nextSeq, w.gaps.Count(), w.gaps.Width())
 
 	if cfg.AsyncFlushWorkers > 0 {
 		w.async = newAsyncFlushPipeline(w, cfg.AsyncFlushWorkers)
@@ -239,6 +273,8 @@ func Open(cfg Config) (*Writer, error) {
 		"active_index", w.activeIdx,
 		"active_bytes", w.activeBytes,
 		"next_seq", w.nextSeq,
+		"reserved_end", w.reservedEnd,
+		"seq_gap_count", len(w.gaps.Ranges()),
 	)
 
 	return w, nil
@@ -412,6 +448,10 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 
 	candidate := *ev
 	candidate.Seq = w.nextSeq
+	if w.cfg.ReserveClientVisibleSeqs && candidate.Seq >= w.reservedEnd {
+		w.cfg.Metrics.incAppendErrors()
+		return nil, fmt.Errorf("ingest: sequence lease exhausted at seq %d (reserved end %d)", candidate.Seq, w.reservedEnd)
+	}
 	if w.cfg.TimestampStamper != nil {
 		if err := w.cfg.TimestampStamper.Stamp(ctx, &candidate); err != nil {
 			w.cfg.Metrics.incAppendErrors()
@@ -428,6 +468,7 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 	w.nextSeq++
 	w.cfg.Metrics.incEventsAppended()
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
+	w.cfg.Metrics.setSeqReservationHeadroom(w.reservedEnd, w.nextSeq)
 	w.readLog.append(&candidate)
 
 	if w.cfg.OnAppend != nil {
@@ -523,7 +564,7 @@ func (w *Writer) drainAsync(ctx context.Context) error {
 	if w.closed {
 		return ErrClosed
 	}
-	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, w.sampleDurableBatchPrepareValueLocked())
+	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, false, w.sampleDurableBatchPrepareValueLocked())
 }
 
 func (w *Writer) drainSync(ctx context.Context) error {
@@ -540,7 +581,7 @@ func (w *Writer) drainSync(ctx context.Context) error {
 			return err
 		}
 	}
-	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, w.sampleDurableBatchPrepareValueLocked())
+	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, false, w.sampleDurableBatchPrepareValueLocked())
 }
 
 // DrainDurability forces pending event-backed metadata to its block durability
@@ -566,7 +607,7 @@ func (w *Writer) SetDurableBatchHook(h DurableBatchHook) {
 }
 
 func (w *Writer) commitTerminalDurableBatchLocked() error {
-	return w.commitDurableBatchLocked(context.Background(), w.nextSeq, true, w.sampleDurableBatchPrepareValueLocked())
+	return w.commitDurableBatchLocked(context.Background(), w.nextSeq, true, true, w.sampleDurableBatchPrepareValueLocked())
 }
 
 // flushAndRotateLocked is the post-Append durability commit. The
@@ -618,7 +659,7 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
 	}
 	w.cfg.Metrics.incBlocksFlushed()
 
-	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, prepareValue); err != nil {
+	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, false, prepareValue); err != nil {
 		return err
 	}
 	return nil
@@ -712,6 +753,40 @@ func (w *Writer) NextSeq() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.nextSeq
+}
+
+// SeqGaps returns the immutable set of durable, authorized seq vacancies.
+func (w *Writer) SeqGaps() *seqspace.Gaps { return w.gaps }
+
+// SeqLeaseStats is a coherent operational snapshot of the client-visible
+// sequence lease and its durable vacancy registry.
+type SeqLeaseStats struct {
+	Enabled     bool
+	ReservedEnd uint64
+	Headroom    uint64
+	GapCount    int
+	GapWidth    uint64
+	LatestGap   seqspace.Gap
+}
+
+// SequenceLeaseStats returns a coherent lease snapshot for status surfaces.
+func (w *Writer) SequenceLeaseStats() SeqLeaseStats {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	stats := SeqLeaseStats{
+		Enabled:     w.cfg.ReserveClientVisibleSeqs,
+		ReservedEnd: w.reservedEnd,
+		GapCount:    w.gaps.Count(),
+		GapWidth:    w.gaps.Width(),
+	}
+	if w.reservedEnd > w.nextSeq {
+		stats.Headroom = w.reservedEnd - w.nextSeq
+	}
+	ranges := w.gaps.Ranges()
+	if len(ranges) > 0 {
+		stats.LatestGap = ranges[len(ranges)-1]
+	}
+	return stats
 }
 
 // ReadLog returns the writer-owned readable log.
@@ -865,8 +940,23 @@ func scanSegmentsDir(fs vfs.FS, dir string) (idx uint64, has bool, err error) {
 // first-ever event is seq 1 and seq 0 stays a pure "nothing yet" sentinel
 // (design §R8); the absent-vs-zero distinction is therefore irrelevant here.
 func loadNextSeq(st *store.Store, key string) (val uint64, err error) {
-	v, _, err := st.GetUint64LE(key)
+	v, _, err := loadNextSeqFound(st, key)
 	return v, err
+}
+
+func loadNextSeqFound(st *store.Store, key string) (val uint64, found bool, err error) {
+	v, closer, err := st.Get([]byte(key))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("ingest: load %s: %w", key, err)
+	}
+	defer func() { _ = closer.Close() }()
+	if len(v) != 8 {
+		return 0, false, fmt.Errorf("ingest: load %s: expected 8 bytes, got %d", key, len(v))
+	}
+	return binary.LittleEndian.Uint64(v), true, nil
 }
 
 // saveNextSeq durably persists the seq counter for key via pebble.Sync.
@@ -895,7 +985,7 @@ func (w *Writer) sampleDurableBatchPrepareValueLocked() any {
 	return w.cfg.DurableBatchPrepareValue()
 }
 
-func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force bool, prepareValue any) error {
+func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force, terminal bool, prepareValue any) error {
 	// The block this commit describes is already fsynced by the time we get
 	// here (flushBlockLocked / commitAsyncFlush / the drain paths all flush
 	// first). The durable metadata commit must therefore run to completion
@@ -912,6 +1002,23 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 
 	if err := stageNextSeq(b, w.cfg.SeqKey, nextSeq); err != nil {
 		return err
+	}
+	reservedEnd := w.reservedEnd
+	if w.cfg.ReserveClientVisibleSeqs {
+		// Renew allocation from the writer's current frontier. This remains the
+		// right source for metadata-only drains, which do not themselves advance
+		// the event-backed durable-batch argument.
+		reservedEnd = w.nextSeq
+		if !terminal {
+			var err error
+			reservedEnd, err = seqspace.ReserveEnd(w.nextSeq, w.cfg.MaxEventsPerBlock)
+			if err != nil {
+				return err
+			}
+		}
+		if err := stageNextSeq(b, seqReservedKey, reservedEnd); err != nil {
+			return err
+		}
 	}
 	var afterCommit func()
 	var afterDone func(error)
@@ -935,6 +1042,8 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 		return w.wrapSegmentPersistenceError("committing durable metadata batch", fmt.Errorf("ingest: commit durable batch: %w", commitErr))
 	}
 	w.durableNextSeq = nextSeq
+	w.reservedEnd = reservedEnd
+	w.cfg.Metrics.setSeqLease(w.reservedEnd, w.nextSeq, w.gaps.Count(), w.gaps.Width())
 	w.readLog.advanceDurable(nextSeq)
 	if afterCommit != nil {
 		afterCommit()

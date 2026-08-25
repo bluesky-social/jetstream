@@ -1,5 +1,5 @@
 {
-  "commit": "ad356292a1c0cf49502f50e8c612bdcafa927038",
+  "commit": "c61b7ef5fe5d33d88651d2eb71452727512656dd",
   "mutants": [
     {"id":"m001_delete_mapped_to_update","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m002_watermark_floor_off_by_one","disposition":"KILLED","result":"KILLED@compaction","note":"oracle: superseded record row survived at/below the first-init watermark: seq=1 watermark=2 (m002 boundary miss is permanent: later fold win"},
@@ -47,6 +47,12 @@
     {"id":"m052_pds_cursor_leads_completion","disposition":"KILLED","result":"KILLED@pdsbackfill","note":"see log"},
     {"id":"m053_exhausted_pds_treated_drained","disposition":"KILLED","result":"KILLED@pdsbackfill","note":"see log"},
     {"id":"m054_relay_only_backfill_routing","disposition":"KILLED","result":"KILLED@pdsbackfill","note":"see log"},
-    {"id":"m055_discovery_pds_attribution_dropped","disposition":"KILLED","result":"KILLED@pdsbackfill","note":"see log"}
+    {"id":"m055_discovery_pds_attribution_dropped","disposition":"KILLED","result":"KILLED@pdsbackfill","note":"see log"},
+    {"id":"m056_seq_lease_recovery_reuses_tip","disposition":"KILLED","result":"KILLED@seqlease","note":"real websocket/SIGKILL and ingest recovery tests observed seq reuse"},
+    {"id":"m057_seq_lease_renewal_omitted","disposition":"KILLED","result":"KILLED@seqlease","note":"partial-flush and non-terminal drain tests observed missing lease headroom"},
+    {"id":"m058_seq_gap_registry_write_skipped","disposition":"KILLED","result":"KILLED@seqlease","note":"clean-restart persistence test observed the registered vacancy disappear"},
+    {"id":"m059_unregistered_replay_hole_skipped","disposition":"KILLED","result":"KILLED@seqlease","note":"cold replay unregistered-hole guard required the fail-loud seam error"},
+    {"id":"m060_drain_collapses_seq_lease","disposition":"KILLED","result":"KILLED@seqlease","note":"DrainDurability test could not append through the still-live writer"},
+    {"id":"m061_same_segment_gap_silently_crossed","disposition":"KILLED","result":"KILLED@seqlease","note":"bounded replay accepted an unregistered vacancy between durable blocks in one segment"}
   ]
 }
