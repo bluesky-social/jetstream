@@ -1,0 +1,21 @@
+mutant: m056_seq_lease_recovery_reuses_tip
+target: internal/ingest/seqlease.go
+failure-mode: |
+  Startup recognizes and registers the abandoned reservation but resumes the
+  allocator at the durable tip instead of the old exclusive reservation end.
+  The first post-crash event can therefore reuse a seq already observed from
+  the predecessor's pending block, mapping one cursor to two event identities.
+expected-detection: |
+  The seqlease tier's real websocket/SIGKILL oracle observes seq 1 before
+  killing the child and requires the replacement event to begin at seq 5.
+  Ingest recovery and deterministic crash-model tests independently require
+  NextSeq to move to the prior lease end and reject every reuse.
+expected-tier: seqlease
+tiers: seqlease
+
+diff --git a/internal/ingest/seqlease.go b/internal/ingest/seqlease.go
+--- a/internal/ingest/seqlease.go
++++ b/internal/ingest/seqlease.go
+@@ -49 +49 @@ func initializeSeqLease(cfg Config, w *Writer, durableNext uint64, seqFound, hadSegments bool) (initializedSeqLease, error) {
+-			nextSeq = priorReserved
++			nextSeq = durableNext

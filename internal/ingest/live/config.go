@@ -61,6 +61,10 @@ type Config struct {
 	// steady state uses "seq/next".
 	SeqKey string
 
+	// ReserveClientVisibleSeqs enables the canonical writer's write-ahead seq
+	// lease. Bootstrap live_segments leaves it false because serving is gated.
+	ReserveClientVisibleSeqs bool
+
 	// CursorKey is the pebble key for the upstream relay cursor.
 	// Both phases use "relay/cursor" (the merge step will hand
 	// cursor ownership over without renaming the key).

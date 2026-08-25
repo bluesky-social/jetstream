@@ -273,6 +273,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		WriterRef:       &writerPtr,
 		FS:              opts.StorageFS,
 		BlockCacheBytes: opts.SubscribeBlockCacheBytes,
+		Metrics:         subscribeMetrics,
 	})
 	tail, err := subscribe.New(subscribe.Config{
 		Logger:      processLogger,
@@ -461,6 +462,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		IdentityResolver:      resolver,
 		ImportReporter:        importReporter{mgr: importMgr},
 		LastSeenUpstreamEvent: liveMetrics.LastSeenUpstreamEvent,
+		Writer: func() *ingest.Writer {
+			return writerPtr.Load()
+		},
 	})
 	if err != nil {
 		return fail(fmt.Errorf("serve: build status collector: %w", err))

@@ -24,6 +24,12 @@ type Metrics struct {
 	ReadLogPinnedOverrunBytes prometheus.Gauge
 	ReadLogFloorSeq           prometheus.Gauge
 	ReadLogDurableSeq         prometheus.Gauge
+	SeqReservedEnd            prometheus.Gauge
+	SeqReservationHeadroom    prometheus.Gauge
+	SeqGapCount               prometheus.Gauge
+	SeqGapWidth               prometheus.Gauge
+	SeqGapsRegistered         prometheus.Counter
+	SeqGapValuesRegistered    prometheus.Counter
 }
 
 // NewMetrics registers the ingest counters/gauges against reg.
@@ -86,14 +92,80 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "readable_log_durable_seq",
 			Help: "One-past-newest durable seq known to the writer readable log.",
 		}),
+		SeqReservedEnd: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "seq_reserved_end",
+			Help: "Exclusive end of the durable write-ahead sequence lease; zero for writers that do not expose seqs to clients.",
+		}),
+		SeqReservationHeadroom: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "seq_reservation_headroom",
+			Help: "Number of client-visible sequence values remaining in the current durable lease.",
+		}),
+		SeqGapCount: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "seq_gap_count",
+			Help: "Number of normalized durable sequence-vacancy intervals registered after unclean exits.",
+		}),
+		SeqGapWidth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "seq_gap_values",
+			Help: "Total number of sequence values covered by durable registered vacancies.",
+		}),
+		SeqGapsRegistered: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "seq_gaps_registered_total",
+			Help: "Number of abandoned sequence leases registered by this process at startup.",
+		}),
+		SeqGapValuesRegistered: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "seq_gap_values_registered_total",
+			Help: "Number of sequence values newly registered as vacant by this process at startup.",
+		}),
 	}
 	reg.MustRegister(
 		m.EventsAppended, m.BlocksFlushed, m.SegmentsRotated,
 		m.AppendErrors, m.ActiveSegBytes, m.NextSeq,
 		m.ReadLogBytes, m.ReadLogPinnedBytes, m.ReadLogPinnedOverrunBytes,
 		m.ReadLogFloorSeq, m.ReadLogDurableSeq,
+		m.SeqReservedEnd, m.SeqReservationHeadroom,
+		m.SeqGapCount, m.SeqGapWidth,
+		m.SeqGapsRegistered, m.SeqGapValuesRegistered,
 	)
 	return m
+}
+
+func (m *Metrics) setSeqLease(reservedEnd, nextSeq uint64, gapCount int, gapWidth uint64) {
+	if m == nil {
+		return
+	}
+	m.SeqReservedEnd.Set(float64(reservedEnd))
+	headroom := uint64(0)
+	if reservedEnd > nextSeq {
+		headroom = reservedEnd - nextSeq
+	}
+	m.SeqReservationHeadroom.Set(float64(headroom))
+	m.SeqGapCount.Set(float64(gapCount))
+	m.SeqGapWidth.Set(float64(gapWidth))
+}
+
+func (m *Metrics) setSeqReservationHeadroom(reservedEnd, nextSeq uint64) {
+	if m == nil {
+		return
+	}
+	headroom := uint64(0)
+	if reservedEnd > nextSeq {
+		headroom = reservedEnd - nextSeq
+	}
+	m.SeqReservationHeadroom.Set(float64(headroom))
+}
+
+func (m *Metrics) incSeqGapRegistered(width uint64) {
+	if m == nil {
+		return
+	}
+	m.SeqGapsRegistered.Inc()
+	m.SeqGapValuesRegistered.Add(float64(width))
 }
 
 // Nil-safe inc/set helpers. callers in writer.go don't have to repeat

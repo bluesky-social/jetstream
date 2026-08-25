@@ -294,6 +294,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 			Manifest:         deps.Manifest,
 			FS:               deps.FS,
 			NextSeq:          deps.writer().NextSeq(),
+			Gaps:             deps.writer().SeqGaps(),
 			Lookback:         deps.Lookback,
 			RejectBelowFloor: deps.V2,
 		})
@@ -335,6 +336,9 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	}
 	if cursorPlan.Clamped {
 		mode = "clamped"
+	}
+	if cursorPlan.ClampReason == "gap" {
+		mode = "gap_clamped"
 	}
 	if deps.Lookback == 0 && rawCursor != "" {
 		mode = "disabled"

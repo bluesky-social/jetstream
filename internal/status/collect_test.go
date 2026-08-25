@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
@@ -555,6 +556,43 @@ func TestCollect_LiveCursors(t *testing.T) {
 	require.Equal(t, int64(1234567), snap.Live.UpstreamCursor)
 	require.Equal(t, uint64(4242), snap.Live.NextSeq)
 	require.Equal(t, uint64(1111), snap.Live.BootstrapSeq)
+}
+
+func TestCollect_SequenceLeaseStatus(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	cfg := ingest.Config{
+		SegmentsDir:              filepath.Join(dataDir, "segments"),
+		Store:                    st,
+		Logger:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxEventsPerBlock:        4,
+		ReserveClientVisibleSeqs: true,
+	}
+	w1, err := ingest.Open(cfg)
+	require.NoError(t, err)
+	lost := segment.Event{Kind: segment.KindCreate, DID: "did:plc:status-gap"}
+	require.NoError(t, w1.Append(t.Context(), &lost))
+	w2, err := ingest.Open(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w2.Close() })
+
+	c, err := status.New(status.Options{
+		Store: st, DataDir: dataDir,
+		Writer: func() *ingest.Writer { return w2 },
+	})
+	require.NoError(t, err)
+	snap, err := c.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.True(t, snap.Live.SeqLease.Enabled)
+	require.Equal(t, uint64(9), snap.Live.SeqLease.ReservedEnd)
+	require.Equal(t, uint64(4), snap.Live.SeqLease.Headroom)
+	require.Equal(t, 1, snap.Live.SeqLease.GapCount)
+	require.Equal(t, uint64(4), snap.Live.SeqLease.GapWidth)
+	require.Equal(t, uint64(1), snap.Live.SeqLease.LatestGap.Start)
+	require.Equal(t, uint64(5), snap.Live.SeqLease.LatestGap.End)
 }
 
 func TestCollect_PebbleKeyspaces(t *testing.T) {

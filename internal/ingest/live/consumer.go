@@ -120,15 +120,16 @@ func Open(cfg Config) (*Consumer, error) {
 	}
 
 	w, err := ingest.Open(ingest.Config{
-		SegmentsDir:           cfg.SegmentsDir,
-		FS:                    cfg.FS,
-		DataDir:               cfg.DataDir,
-		Store:                 cfg.Store,
-		SeqKey:                cfg.SeqKey,
-		MaxSegmentBytes:       cfg.MaxSegmentBytes,
-		MaxEventsPerBlock:     cfg.MaxEventsPerBlock,
-		ReadLogRetentionBytes: cfg.ReadLogRetentionBytes,
-		OnAppend:              onAppend,
+		SegmentsDir:              cfg.SegmentsDir,
+		FS:                       cfg.FS,
+		DataDir:                  cfg.DataDir,
+		Store:                    cfg.Store,
+		SeqKey:                   cfg.SeqKey,
+		ReserveClientVisibleSeqs: cfg.ReserveClientVisibleSeqs,
+		MaxSegmentBytes:          cfg.MaxSegmentBytes,
+		MaxEventsPerBlock:        cfg.MaxEventsPerBlock,
+		ReadLogRetentionBytes:    cfg.ReadLogRetentionBytes,
+		OnAppend:                 onAppend,
 
 		// Bare cfg.Logger; ingest.Open sets its own
 		// component=ingest/writer attribute.

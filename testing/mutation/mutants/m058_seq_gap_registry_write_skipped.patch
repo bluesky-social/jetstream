@@ -1,0 +1,23 @@
+mutant: m058_seq_gap_registry_write_skipped
+target: internal/ingest/seqlease.go
+failure-mode: |
+  Startup advances beyond an abandoned lease only in memory and commits the
+  new reservation without persisting the registered vacancy. A later clean
+  restart forgets why the archive has a hole, so replay fails loud at a
+  legitimate crash gap (or a future generic fallback might silently skip it).
+expected-detection: |
+  The seqlease tier's clean-restart persistence assertion requires the exact
+  normalized [1,5) registry entry after the recovery writer closes and opens
+  again. Cursor/walker tests then prove only such persisted ranges authorize a
+  replay jump.
+expected-tier: seqlease
+tiers: seqlease
+
+diff --git a/internal/ingest/seqlease.go b/internal/ingest/seqlease.go
+--- a/internal/ingest/seqlease.go
++++ b/internal/ingest/seqlease.go
+@@ -85,3 +85 @@ func initializeSeqLease(cfg Config, w *Writer, durableNext uint64, seqFound, hadSegments bool) (initializedSeqLease, error) {
+-	if err := stageSeqGaps(b, gaps); err != nil {
+-		return initializedSeqLease{}, err
+-	}
++	// BUG: vacancy registry write omitted.

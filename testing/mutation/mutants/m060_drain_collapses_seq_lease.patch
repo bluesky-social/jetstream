@@ -1,0 +1,19 @@
+mutant: m060_drain_collapses_seq_lease
+target: internal/ingest/writer.go
+failure-mode: |
+  DrainDurability uses terminal-close semantics and collapses max_reserved to
+  exact nextSeq even though the writer remains open. Subsequent client-visible
+  allocation has no durable lease and wedges or escapes the publication guard.
+expected-detection: |
+  The seqlease tier's DrainDurability test verifies the reservation renews to
+  nextSeq+MaxEventsPerBlock and immediately appends another event through the
+  still-live writer.
+expected-tier: seqlease
+tiers: seqlease
+
+diff --git a/internal/ingest/writer.go b/internal/ingest/writer.go
+--- a/internal/ingest/writer.go
++++ b/internal/ingest/writer.go
+@@ -584 +584 @@ func (w *Writer) drainSync(ctx context.Context) error {
+-	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, false, w.sampleDurableBatchPrepareValueLocked())
++	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, true, w.sampleDurableBatchPrepareValueLocked())

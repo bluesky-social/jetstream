@@ -1,0 +1,20 @@
+mutant: m057_seq_lease_renewal_omitted
+target: internal/ingest/writer.go
+failure-mode: |
+  Ordinary block durability collapses max_reserved to exact nextSeq instead
+  of renewing one block ahead. The next append either allocates outside its
+  durable authority or the writer wedges at the old lease boundary.
+expected-detection: |
+  The seqlease tier's partial-flush and DrainDurability tests require one full
+  configured block of headroom after every non-terminal commit and append
+  immediately afterward. The deterministic crash model exercises repeated
+  renewals as a second backstop.
+expected-tier: seqlease
+tiers: seqlease
+
+diff --git a/internal/ingest/writer.go b/internal/ingest/writer.go
+--- a/internal/ingest/writer.go
++++ b/internal/ingest/writer.go
+@@ -992 +992 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force, terminal bool, prepareValue any) error {
+-		if !terminal {
++		if terminal {

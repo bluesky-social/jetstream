@@ -145,6 +145,12 @@ websocket once with `?cursor=max(S, lastProcessedSeq)`.
   can be *below* the cursor already delivered (live delivered from the
   unsealed active segment), and cutting at the lower value would regress the
   floor and re-deliver out of order. Cutover is monotonic non-decreasing.
+- Seqs are monotonic but not contiguous. If the server restarted uncleanly
+  between `S` and the live tip, its registered vacancy is crossed server-side
+  and the first delivered live seq can jump forward by up to a block (or more
+  after repeated crashes). The client accepts this as ordinary forward
+  progress; it neither reconnects nor re-enters backfill solely because values
+  are absent.
 
 ## Phase 4: the live tail and its failure modes
 

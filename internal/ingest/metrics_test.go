@@ -24,6 +24,9 @@ func TestNewMetrics_RegistersCounters(t *testing.T) {
 	m.incAppendErrors()
 	m.setActiveSegBytes(123)
 	m.setNextSeq(456)
+	m.setSeqLease(500, 456, 2, 40)
+	m.setSeqReservationHeadroom(510, 456)
+	m.incSeqGapRegistered(12)
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.EventsAppended), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.BlocksFlushed), 0)
@@ -31,6 +34,12 @@ func TestNewMetrics_RegistersCounters(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.AppendErrors), 0)
 	require.InDelta(t, 123.0, testutil.ToFloat64(m.ActiveSegBytes), 0)
 	require.InDelta(t, 456.0, testutil.ToFloat64(m.NextSeq), 0)
+	require.InDelta(t, 500.0, testutil.ToFloat64(m.SeqReservedEnd), 0)
+	require.InDelta(t, 54.0, testutil.ToFloat64(m.SeqReservationHeadroom), 0)
+	require.InDelta(t, 2.0, testutil.ToFloat64(m.SeqGapCount), 0)
+	require.InDelta(t, 40.0, testutil.ToFloat64(m.SeqGapWidth), 0)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.SeqGapsRegistered), 0)
+	require.InDelta(t, 12.0, testutil.ToFloat64(m.SeqGapValuesRegistered), 0)
 	requireNoDebugMetricFields(t, m)
 	requireNoDebugMetrics(t, reg)
 }
@@ -48,6 +57,9 @@ func TestNewMetrics_NilSafe(t *testing.T) {
 		m.incAppendErrors()
 		m.setActiveSegBytes(1)
 		m.setNextSeq(1)
+		m.setSeqLease(5, 1, 1, 4)
+		m.setSeqReservationHeadroom(5, 1)
+		m.incSeqGapRegistered(4)
 	})
 }
 

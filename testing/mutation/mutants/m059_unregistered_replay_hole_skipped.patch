@@ -1,0 +1,23 @@
+mutant: m059_unregistered_replay_hole_skipped
+target: internal/subscribe/replay.go
+failure-mode: |
+  Cold replay treats a persistent no-progress hole below the readable-log
+  floor as successful completion even when no durable registry entry
+  authorizes it. A missing/corrupt segment can then become silent client data
+  loss, regressing the issue #190 crash-loud seam guard.
+expected-detection: |
+  The seqlease tier's unregistered-gap test withholds a segment below the
+  floor and requires the second no-progress pass to return the rotation-seam
+  invariant error. Registered-gap and adjacent-seam tests ensure the fix is
+  selective rather than rejecting valid vacancies.
+expected-tier: seqlease
+tiers: seqlease
+
+diff --git a/internal/subscribe/replay.go b/internal/subscribe/replay.go
+--- a/internal/subscribe/replay.go
++++ b/internal/subscribe/replay.go
+@@ -213,3 +213 @@ func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*Entry) error) error {
+-				return fmt.Errorf("subscribe: cold replay made no progress at seq %d "+
+-					"before readable-log floor %d (rotation seam invariant violated)",
+-					current, input.StopSeq)
++				return nil

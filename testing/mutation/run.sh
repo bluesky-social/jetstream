@@ -287,7 +287,7 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          ./internal/oracle ./internal/ingest/orchestrator ./segment
                          -run 'TestOracle_RestartSegmentFault|TestOracle_RestartTornActiveSegmentTail|TestRunDeleteCompaction_ENOSPC|TestRunImport_ENOSPC|TestRunImport_SegmentIOFaultSweep|TestFlushReturnsENOSPC|TestPatchIOFaultSweep|TestRewriteIOFaultSweep|TestNewRemovesEmptyFileWhenInitFails'
                          -count=1 -timeout "$segmentfault_timeout") ;;
-                powerloss)
+				powerloss)
                     # Power-loss tier (#264): strict in-memory storage and
                     # ordering checks for fsync omission/reordering mutants.
                     # This is deliberately narrow and fast: segment/store/ingest
@@ -301,8 +301,16 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     cmd=(go test "${RACE_FLAG[@]}"
                          ./segment ./internal/store ./internal/ingest ./internal/ingest/orchestrator ./internal/oracle
                          -run 'TestStrictMem|TestOpen_StrictMemDropsUnsyncedWrites|TestWriterStrictMem|TestWriterFlushOrdersSegmentSyncBeforeStoreCommit|TestDurableOrderRecorder|TestOracle_PowerLossStrictMemDropsUnsyncedState|TestRunMerge_StrictMemPowerLoss'
-                         -count=1 -short -timeout "$default_timeout") ;;
-                pdsbackfill)
+						 -count=1 -short -timeout "$default_timeout") ;;
+				seqlease)
+					# Issue #345 seq-lease tier: persistence/recovery model tests,
+					# cursor and cold-walker gap boundaries, the real websocket +
+					# SIGKILL process proof, and the module-root archive->live cutover.
+					cmd=(go test "${RACE_FLAG[@]}"
+						 ./internal/ingest ./internal/subscribe ./internal/oracle .
+						 -run 'TestSeqLease|TestWalkFromCursor_.*Gap|TestResolveCursor_.*Gap|TestOracle_ObservedSeqIsNotReusedAfterSIGKILL|TestEngineCutoverAcrossRegisteredServerVacancy'
+						 -count=1 -timeout "$default_timeout") ;;
+				pdsbackfill)
                     # PDS-direct fleet tier (#direct-backfill): fast contract
                     # tests for cursor/completion durability ordering, durable
                     # exhausted-vs-drained semantics, direct routing and relay

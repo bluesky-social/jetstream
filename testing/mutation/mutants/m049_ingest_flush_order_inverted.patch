@@ -18,10 +18,10 @@ diff --git a/internal/ingest/writer.go b/internal/ingest/writer.go
 index 83c6e76..804e9f5 100644
 --- a/internal/ingest/writer.go
 +++ b/internal/ingest/writer.go
-@@ -607,12 +607,12 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
+@@ -638,12 +638,12 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
  func (w *Writer) flushBlockLocked(ctx context.Context) error {
  	prepareValue := w.sampleDurableBatchPrepareValueLocked()
-+	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, prepareValue); err != nil {
++	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, false, prepareValue); err != nil {
 +		return err
 +	}
  	if err := w.active.Flush(); err != nil {
@@ -29,7 +29,7 @@ index 83c6e76..804e9f5 100644
  	}
  	w.cfg.Metrics.incBlocksFlushed()
  
--	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, prepareValue); err != nil {
+-	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, false, prepareValue); err != nil {
 -		return err
 -	}
  	return nil

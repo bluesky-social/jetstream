@@ -54,6 +54,11 @@
 // replays the missing archive range from its last processed seq rather than
 // silently skipping the gap.
 //
+// Sequence values are monotonic but need not be contiguous: an unclean server
+// restart can leave a durable registered vacancy so a seq observed before the
+// crash is never reused. The client accepts that ordinary forward jump and
+// continues deduplicating by seq.
+//
 // The client deliberately exposes a minimal public surface: the Client, its
 // options, and the decoded Event shape. Transport, planning, download, and
 // cutover machinery is unexported within this package.

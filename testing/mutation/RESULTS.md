@@ -5,11 +5,11 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 47 active mutants on disk
-(m001–m055; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
-union baseline after PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
+**Current catalog (keep this line current): 53 active mutants on disk
+(m001–m061; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+union baseline after issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **47 killed, 0 survived,
+coverage: **53 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
@@ -19,6 +19,9 @@ also runs `./internal/ingest/orchestrator`'s `TestRunMerge_StrictMemPowerLoss*`
 to catch it and the restart-after-cleanup guard sibling).
 m052–m055 cover per-PDS cursor durability, exhausted-host recovery,
 relay-gap/direct routing, and discovery-time PDS attribution.
+m056–m061 cover abandoned-lease recovery, renewal, durable gap registration,
+cross-segment and same-segment unregistered replay holes, and non-terminal
+drain semantics.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -69,6 +72,33 @@ The baseline's `disposition` field is the coarse verdict
 tier/seed detail the gate ignores. A seed-sensitive mutant (e.g. m002) is
 recorded by its full-campaign fixed-seed disposition; the gate does not re-run
 seed sweeps.
+
+## Campaign 2026-08-25 (issue #345 client-visible seq leases)
+
+Targeted campaign in disposable clean copy `b866c98`. The new `seqlease` tier
+runs ingest persistence/recovery models, cursor and cold-walker gap boundaries,
+the real websocket + SIGKILL process oracle, and the module-root archive→live
+cutover. The initial five predicted bugs were killed with zero
+stale/build-broken patches. A follow-up bounded-replay audit added m061 for an
+unregistered vacancy between two blocks in one segment; it was killed at the
+same tier in disposable clean copy `2ffa575`.
+The changed durable-batch signature made m049 stale; its hunk was refreshed
+without changing the modeled ordering bug and re-killed at `powerloss` in
+disposable commit `f0d2dd8`. The final recovery guards shifted m060's
+zero-context hunk onto the intentionally unsupported async lease path; it was
+retargeted to `drainSync` and re-killed at `seqlease` in `bfd932a`.
+A final full-catalog gate in disposable clean copy `c61b7ef` killed all 53
+active mutants and matched the enforced baseline with zero survivors, stale
+patches, or build-broken mutants.
+
+| mutant | result | note |
+|---|---|---|
+| m056_seq_lease_recovery_reuses_tip | KILLED@seqlease | real subscriber observed seq 1, then restart reused it instead of advancing to the old reservation end |
+| m057_seq_lease_renewal_omitted | KILLED@seqlease | partial flush / drain lost the required configured-block headroom |
+| m058_seq_gap_registry_write_skipped | KILLED@seqlease | a clean restart forgot the previously registered `[1,5)` vacancy |
+| m059_unregistered_replay_hole_skipped | KILLED@seqlease | withheld segment returned success instead of the rotation-seam invariant error |
+| m060_drain_collapses_seq_lease | KILLED@seqlease | the still-open writer could not append after `DrainDurability` |
+| m061_same_segment_gap_silently_crossed | KILLED@seqlease | bounded replay accepted an unregistered vacancy between durable blocks in one segment |
 
 ## Campaign 2026-08-03 (PDS-direct fleet backfill)
 
