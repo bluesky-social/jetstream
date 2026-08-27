@@ -26,11 +26,13 @@ import (
 // count, and ETag are all derived from a single freshly-opened fd — never the
 // manifest — so a concurrent compaction rewrite cannot splice generations.
 type getBlockHandler struct {
-	src         SegmentSource
-	logger      *slog.Logger
-	cacheMaxAge time.Duration
-	metrics     *Metrics
-	tracer      trace.Tracer
+	src                  SegmentSource
+	logger               *slog.Logger
+	cacheMaxAge          time.Duration
+	compactionCacheGrace time.Duration
+	compactionSchedule   CompactionSchedule
+	metrics              *Metrics
+	tracer               trace.Tracer
 }
 
 func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, r *xrpcserver.Request) error {
@@ -116,7 +118,9 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(hdr.Checksum)+":"+fmt.Sprint(blockIdx)))
-	w.Header().Set("Cache-Control", cacheControlHeader(h.cacheMaxAge))
+	w.Header().Set("Cache-Control", cacheControlHeader(dynamicCacheMaxAge(
+		time.Now(), h.cacheMaxAge, h.compactionCacheGrace, h.compactionSchedule,
+	)))
 
 	if span != nil {
 		span.SetAttributes(attribute.Int("block.compressed_size", len(frame)))

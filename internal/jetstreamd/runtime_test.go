@@ -85,6 +85,15 @@ func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
 	require.ErrorContains(t, err, "SegmentCacheMaxAge must be >= 0")
 }
 
+func TestOptionsValidateRejectsNegativeCompactionCacheGrace(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions(t)
+	opts.CompactionCacheGrace = -time.Second
+	_, err := Build(t.Context(), opts)
+	require.ErrorContains(t, err, "CompactionCacheGrace must be >= 0")
+}
+
 func TestOptionsValidateRejectsNegativeBackfillFleetLimits(t *testing.T) {
 	t.Parallel()
 

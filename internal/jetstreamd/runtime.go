@@ -79,6 +79,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.CompactionInterval < 0 {
 		return nil, fmt.Errorf("serve: --compaction-interval must be >= 0 (CompactionInterval must be >= 0), got %s", opts.CompactionInterval)
 	}
+	if opts.CompactionCacheGrace < 0 {
+		return nil, fmt.Errorf("serve: --compaction-cache-grace must be >= 0 (CompactionCacheGrace must be >= 0), got %s", opts.CompactionCacheGrace)
+	}
 	if opts.CompactionTombstoneCap < 0 {
 		return nil, fmt.Errorf("serve: --compaction-tombstone-cap must be >= 0 (CompactionTombstoneCap must be >= 0), got %d", opts.CompactionTombstoneCap)
 	}
@@ -266,6 +269,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	stateStore := syncstate.New(metaStore)
 	tombstones := tombstone.New()
+	// This state is owned and updated by the orchestrator, but xrpcapi sees
+	// only its read-only schedule interface. It starts unknown, so archive
+	// responses remain no-cache until steady-state scheduling is live.
+	compactionSchedule := orchestrator.NewCompactionScheduleState()
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
@@ -394,6 +401,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		ImportRules:                    importRules,
 		TimestampStamper:               importRules,
 		CompactionInterval:             opts.CompactionInterval,
+		CompactionSchedule:             compactionSchedule,
 		CompactionTombstoneCap:         opts.CompactionTombstoneCap,
 		CompactionRewriteWorkers:       opts.CompactionRewriteWorkers,
 		OnCompactionPass:               onCompactionPass,
@@ -534,7 +542,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			}
 			return nil
 		},
-		CacheMaxAge: opts.SegmentCacheMaxAge,
+		CacheMaxAge:          opts.SegmentCacheMaxAge,
+		CompactionCacheGrace: opts.CompactionCacheGrace,
+		CompactionSchedule:   compactionSchedule,
 		Plan: xrpcapi.PlanConfig{
 			MaxDIDs:               opts.PlanMaxDIDs,
 			MaxCollections:        opts.PlanMaxCollections,

@@ -313,11 +313,17 @@ func serveCommand() *cli.Command {
 			},
 			&cli.DurationFlag{
 				Name: "segment-cache-max-age",
-				Usage: "Cache-Control max-age for XRPC segment downloads. 0 requires caches to revalidate every request. " +
-					"End-to-end deletion-compliance latency is the compaction watermark lag plus this value, so keep it " +
-					"well under --compaction-interval (or wire a CDN purge into the post-rewrite hook).",
+				Usage: "Upper bound for Cache-Control max-age on XRPC segment downloads. 0 requires caches to revalidate every request. " +
+					"When positive, the effective lifetime ends at the next compaction deadline plus --compaction-cache-grace; " +
+					"keep it below the interval or wire a CDN purge for stricter deletion freshness.",
 				Sources: cli.EnvVars("JETSTREAM_SEGMENT_CACHE_MAX_AGE"),
 				Value:   0,
+			},
+			&cli.DurationFlag{
+				Name:    "compaction-cache-grace",
+				Usage:   "Grace period added to the next compaction start for dynamic XRPC archive cache lifetimes. Unknown, disabled, or failed scheduling remains no-cache.",
+				Sources: cli.EnvVars("JETSTREAM_COMPACTION_CACHE_GRACE"),
+				Value:   jetstreamd.DefaultCompactionCacheGrace,
 			},
 			&cli.IntFlag{
 				Name:    "plan-max-dids",
@@ -458,6 +464,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		DisableRepoActionRateLimits:    cmd.Bool("disable-repo-action-rate-limits"),
 		CursorLookback:                 cmd.Duration("cursor-lookback"),
 		SegmentCacheMaxAge:             cmd.Duration("segment-cache-max-age"),
+		CompactionCacheGrace:           cmd.Duration("compaction-cache-grace"),
 		PlanMaxDIDs:                    cmd.Int("plan-max-dids"),
 		PlanMaxCollections:             cmd.Int("plan-max-collections"),
 		PlanMaxEntries:                 cmd.Int("plan-max-entries"),

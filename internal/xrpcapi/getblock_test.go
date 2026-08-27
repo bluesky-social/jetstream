@@ -161,13 +161,17 @@ func TestGetBlock_CacheControl(t *testing.T) {
 	_ = writeSealedSegmentBlocks(t, dir, 0, 1, 2, 1)
 	m, err := manifest.Open(manifest.Options{SegmentsDir: dir, Logger: slog.Default()})
 	require.NoError(t, err)
-	srv := New(Config{Src: m, Logger: slog.Default(), CacheMaxAge: 1500 * time.Millisecond})
+	srv := New(Config{
+		Src: m, Logger: slog.Default(), CacheMaxAge: 1500 * time.Millisecond,
+		CompactionCacheGrace: time.Minute,
+		CompactionSchedule:   fixedCompactionSchedule{next: time.Now().Add(time.Hour), ok: true},
+	})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
 	resp := doGet(t, blockURL(ts.URL, ingest.SegmentFilename(0), 0))
 	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, "public, max-age=2", resp.Header.Get("Cache-Control"))
+	require.Equal(t, "public, max-age=1", resp.Header.Get("Cache-Control"))
 }
 
 func TestGetBlock_MetricsCountOnlyBytesWrittenOnOK200(t *testing.T) {

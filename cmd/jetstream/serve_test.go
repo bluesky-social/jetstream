@@ -86,6 +86,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.False(t, opts.DisableRepoActionRateLimits)
 	require.Equal(t, 36*time.Hour, opts.CursorLookback)
 	require.Equal(t, 0*time.Second, opts.SegmentCacheMaxAge)
+	require.Equal(t, jetstreamd.DefaultCompactionCacheGrace, opts.CompactionCacheGrace)
 	require.Equal(t, xrpcapi.DefaultPlanMaxDIDs, opts.PlanMaxDIDs)
 	require.Equal(t, xrpcapi.DefaultPlanMaxCollections, opts.PlanMaxCollections)
 	require.Equal(t, xrpcapi.DefaultPlanMaxEntries, opts.PlanMaxEntries)
@@ -219,6 +220,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--disable-repo-action-rate-limits",
 		"--cursor-lookback=7h",
 		"--segment-cache-max-age=13s",
+		"--compaction-cache-grace=17m",
 		"--plan-max-dids=8",
 		"--plan-max-collections=4",
 		"--plan-max-entries=123",
@@ -263,6 +265,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.True(t, opts.DisableRepoActionRateLimits)
 	require.Equal(t, 7*time.Hour, opts.CursorLookback)
 	require.Equal(t, 13*time.Second, opts.SegmentCacheMaxAge)
+	require.Equal(t, 17*time.Minute, opts.CompactionCacheGrace)
 	require.Equal(t, 8, opts.PlanMaxDIDs)
 	require.Equal(t, 4, opts.PlanMaxCollections)
 	require.Equal(t, 123, opts.PlanMaxEntries)
@@ -324,6 +327,28 @@ func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
 	require.Equal(t, 11, opts.FailedRepoRetryWorkers)
 	require.Equal(t, 2, opts.FailedRepoRetryHostWorkers)
 	require.Equal(t, 72*time.Hour, opts.FailedRepoRetryMaxDelay)
+}
+
+func TestServeOptionsFromCLI_CompactionCacheGraceEnv(t *testing.T) {
+	withClearedEnv(t)
+
+	app := newTestApp()
+	var opts jetstreamd.Options
+	for _, cmd := range app.Commands {
+		if cmd.Name != "serve" {
+			continue
+		}
+		cmd.Action = func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			opts, err = serveOptionsFromCommand(cmd)
+			return err
+		}
+		break
+	}
+
+	t.Setenv("JETSTREAM_COMPACTION_CACHE_GRACE", "23m")
+	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve"}))
+	require.Equal(t, 23*time.Minute, opts.CompactionCacheGrace)
 }
 
 func TestServeOptionsFromCLI_DisableRepoActionRateLimitsEnv(t *testing.T) {
