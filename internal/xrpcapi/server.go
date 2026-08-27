@@ -80,10 +80,10 @@ func New(cfg Config) *Server {
 		logger = slog.Default()
 	}
 	s := &Server{src: cfg.Src, logger: logger, xrpc: &xrpcserver.Server{}}
-	s.xrpc.HandleQuery("network.bsky.jetstream.getSegment", withReady(cfg.Ready, &getSegmentHandler{
+	s.xrpc.HandleQuery(getSegmentNSID, withReady(cfg.Ready, &getSegmentHandler{
 		src: cfg.Src, logger: logger, cacheMaxAge: cfg.CacheMaxAge,
 	}))
-	s.xrpc.HandleQuery("network.bsky.jetstream.getBlock", withReady(cfg.Ready, &getBlockHandler{
+	s.xrpc.HandleQuery(getBlockNSID, withReady(cfg.Ready, &getBlockHandler{
 		src: cfg.Src, logger: logger, cacheMaxAge: cfg.CacheMaxAge,
 		metrics: cfg.Metrics, tracer: cfg.Tracer,
 	}))

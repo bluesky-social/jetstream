@@ -86,7 +86,7 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 	// statusRecorder.ReadFrom delegation. Per the xrpcserver.Handler contract
 	// we MUST return nil after this point: the response may already be
 	// partially written, so an error envelope is no longer possible.
-	http.ServeContent(w, r.HTTPReq, name, info.ModTime(), f)
+	http.ServeContent(w, contentRequest(r.HTTPReq), name, info.ModTime(), f)
 	return nil
 }
 

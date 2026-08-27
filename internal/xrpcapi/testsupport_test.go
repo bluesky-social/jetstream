@@ -36,6 +36,23 @@ func doGetWith(t *testing.T, url string, customize func(*http.Request)) *http.Re
 	return resp
 }
 
+func doHead(t *testing.T, url string) *http.Response {
+	t.Helper()
+	return doHeadWith(t, url, nil)
+}
+
+func doHeadWith(t *testing.T, url string, customize func(*http.Request)) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodHead, url, nil)
+	require.NoError(t, err)
+	if customize != nil {
+		customize(req)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
 func doPostJSON(t *testing.T, url string, body any) *http.Response {
 	t.Helper()
 	b, err := json.Marshal(body)
@@ -88,7 +105,7 @@ func newTestServer(t *testing.T, n int) (*Server, string) {
 
 // writeSealedSegmentBlocks writes a sealed segment at index idx with blockCount
 // blocks of perBlock events each (seq starting at seqStart) and returns its path.
-func writeSealedSegmentBlocks(t *testing.T, dir string, idx, seqStart uint64, perBlock, blockCount int) string {
+func writeSealedSegmentBlocks(t testing.TB, dir string, idx, seqStart uint64, perBlock, blockCount int) string {
 	t.Helper()
 	path := filepath.Join(dir, ingest.SegmentFilename(idx))
 	w, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: perBlock})
