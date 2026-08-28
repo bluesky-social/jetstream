@@ -73,9 +73,6 @@ type Runtime struct {
 // Build constructs the production service graph without starting listeners or
 // ingestion. Call Run to drive the graph, then Close during shutdown.
 func Build(ctx context.Context, opts Options) (*Runtime, error) {
-	if opts.SegmentCacheMaxAge < 0 {
-		return nil, fmt.Errorf("serve: --segment-cache-max-age must be >= 0 (SegmentCacheMaxAge must be >= 0), got %s", opts.SegmentCacheMaxAge)
-	}
 	if opts.CompactionInterval < 0 {
 		return nil, fmt.Errorf("serve: --compaction-interval must be >= 0 (CompactionInterval must be >= 0), got %s", opts.CompactionInterval)
 	}
@@ -270,7 +267,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	stateStore := syncstate.New(metaStore)
 	tombstones := tombstone.New()
 	// This state is owned and updated by the orchestrator, but xrpcapi sees
-	// only its read-only schedule interface. It starts unknown, so archive
+	// only its read-only deadline surface. It starts unknown, so archive
 	// responses remain no-cache until steady-state scheduling is live.
 	compactionSchedule := orchestrator.NewCompactionScheduleState()
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
@@ -542,9 +539,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			}
 			return nil
 		},
-		CacheMaxAge:          opts.SegmentCacheMaxAge,
 		CompactionCacheGrace: opts.CompactionCacheGrace,
-		CompactionSchedule:   compactionSchedule,
+		CompactionDeadline:   compactionSchedule,
 		Plan: xrpcapi.PlanConfig{
 			MaxDIDs:               opts.PlanMaxDIDs,
 			MaxCollections:        opts.PlanMaxCollections,

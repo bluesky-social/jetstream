@@ -22,9 +22,8 @@ import (
 type getSegmentHandler struct {
 	src                  SegmentSource
 	logger               *slog.Logger
-	cacheMaxAge          time.Duration
 	compactionCacheGrace time.Duration
-	compactionSchedule   CompactionSchedule
+	compactionDeadline   CompactionDeadline
 }
 
 func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, r *xrpcserver.Request) error {
@@ -81,8 +80,8 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// A strong ETag is the value wrapped in double quotes per RFC 9110.
 	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(hdr.Checksum)))
-	w.Header().Set("Cache-Control", cacheControlHeader(dynamicCacheMaxAge(
-		time.Now(), h.cacheMaxAge, h.compactionCacheGrace, h.compactionSchedule,
+	w.Header().Set("Cache-Control", cacheControlHeader(cacheLifetime(
+		time.Now(), h.compactionCacheGrace, h.compactionDeadline,
 	)))
 
 	// ServeContent handles Range, Accept-Ranges, Content-Length,
@@ -95,12 +94,9 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 }
 
 func cacheControlHeader(maxAge time.Duration) string {
-	if maxAge <= 0 {
-		return "public, no-cache"
-	}
 	seconds := int64(maxAge / time.Second)
-	if maxAge%time.Second != 0 {
-		seconds++
+	if seconds <= 0 {
+		return "public, no-cache"
 	}
 	return "public, max-age=" + strconv.FormatInt(seconds, 10)
 }

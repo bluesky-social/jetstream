@@ -55,17 +55,15 @@ type Server struct {
 
 // Config holds the dependencies for the XRPC server. Zero values are valid:
 // a nil Logger defaults to slog.Default(); a nil Ready disables the readiness
-// gate; a zero CacheMaxAge disables segment/block caching; an unknown or
-// disabled CompactionSchedule also disables caching; nil Metrics/Tracer make
-// getBlock observability no-ops. Plan must be populated for planSnapshot to
-// accept non-empty filters.
+// gate; an unknown or disabled CompactionDeadline disables caching; nil
+// Metrics/Tracer make getBlock observability no-ops. Plan must be populated for
+// planSnapshot to accept non-empty filters.
 type Config struct {
 	Src                  SegmentSource
 	Logger               *slog.Logger
 	Ready                ReadyFunc
-	CacheMaxAge          time.Duration
 	CompactionCacheGrace time.Duration
-	CompactionSchedule   CompactionSchedule
+	CompactionDeadline   CompactionDeadline
 	Plan                 PlanConfig
 	Metrics              *Metrics
 	Tracer               trace.Tracer
@@ -84,12 +82,12 @@ func New(cfg Config) *Server {
 	}
 	s := &Server{src: cfg.Src, logger: logger, xrpc: &xrpcserver.Server{}}
 	s.xrpc.HandleQuery("network.bsky.jetstream.getSegment", withReady(cfg.Ready, &getSegmentHandler{
-		src: cfg.Src, logger: logger, cacheMaxAge: cfg.CacheMaxAge,
-		compactionCacheGrace: cfg.CompactionCacheGrace, compactionSchedule: cfg.CompactionSchedule,
+		src: cfg.Src, logger: logger,
+		compactionCacheGrace: cfg.CompactionCacheGrace, compactionDeadline: cfg.CompactionDeadline,
 	}))
 	s.xrpc.HandleQuery("network.bsky.jetstream.getBlock", withReady(cfg.Ready, &getBlockHandler{
-		src: cfg.Src, logger: logger, cacheMaxAge: cfg.CacheMaxAge,
-		compactionCacheGrace: cfg.CompactionCacheGrace, compactionSchedule: cfg.CompactionSchedule,
+		src: cfg.Src, logger: logger,
+		compactionCacheGrace: cfg.CompactionCacheGrace, compactionDeadline: cfg.CompactionDeadline,
 		metrics: cfg.Metrics, tracer: cfg.Tracer,
 	}))
 	s.xrpc.HandleQuery("network.bsky.jetstream.listSegments", withReady(cfg.Ready, newListSegmentsHandler(cfg.Src)))

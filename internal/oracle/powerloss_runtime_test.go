@@ -276,7 +276,6 @@ func runStrictPowerLossRuntime(t *testing.T, opts strictPowerLossRunOptions) str
 		ShutdownTimeout:                5 * time.Second,
 		ClientDrainTimeout:             time.Second,
 		CursorLookback:                 36 * time.Hour,
-		SegmentCacheMaxAge:             0,
 		PlanMaxDIDs:                    xrpcapi.DefaultPlanMaxDIDs,
 		PlanMaxCollections:             xrpcapi.DefaultPlanMaxCollections,
 		PlanMaxEntries:                 xrpcapi.DefaultPlanMaxEntries,

@@ -85,7 +85,6 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, backfill.DefaultFailedRepoRetryMaxDelay, opts.FailedRepoRetryMaxDelay)
 	require.False(t, opts.DisableRepoActionRateLimits)
 	require.Equal(t, 36*time.Hour, opts.CursorLookback)
-	require.Equal(t, 0*time.Second, opts.SegmentCacheMaxAge)
 	require.Equal(t, jetstreamd.DefaultCompactionCacheGrace, opts.CompactionCacheGrace)
 	require.Equal(t, xrpcapi.DefaultPlanMaxDIDs, opts.PlanMaxDIDs)
 	require.Equal(t, xrpcapi.DefaultPlanMaxCollections, opts.PlanMaxCollections)
@@ -219,7 +218,6 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--failed-repo-retry-max-delay=48h",
 		"--disable-repo-action-rate-limits",
 		"--cursor-lookback=7h",
-		"--segment-cache-max-age=13s",
 		"--compaction-cache-grace=17m",
 		"--plan-max-dids=8",
 		"--plan-max-collections=4",
@@ -264,7 +262,6 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 48*time.Hour, opts.FailedRepoRetryMaxDelay)
 	require.True(t, opts.DisableRepoActionRateLimits)
 	require.Equal(t, 7*time.Hour, opts.CursorLookback)
-	require.Equal(t, 13*time.Second, opts.SegmentCacheMaxAge)
 	require.Equal(t, 17*time.Minute, opts.CompactionCacheGrace)
 	require.Equal(t, 8, opts.PlanMaxDIDs)
 	require.Equal(t, 4, opts.PlanMaxCollections)

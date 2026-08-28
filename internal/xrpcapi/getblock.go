@@ -28,9 +28,8 @@ import (
 type getBlockHandler struct {
 	src                  SegmentSource
 	logger               *slog.Logger
-	cacheMaxAge          time.Duration
 	compactionCacheGrace time.Duration
-	compactionSchedule   CompactionSchedule
+	compactionDeadline   CompactionDeadline
 	metrics              *Metrics
 	tracer               trace.Tracer
 }
@@ -118,8 +117,8 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(hdr.Checksum)+":"+fmt.Sprint(blockIdx)))
-	w.Header().Set("Cache-Control", cacheControlHeader(dynamicCacheMaxAge(
-		time.Now(), h.cacheMaxAge, h.compactionCacheGrace, h.compactionSchedule,
+	w.Header().Set("Cache-Control", cacheControlHeader(cacheLifetime(
+		time.Now(), h.compactionCacheGrace, h.compactionDeadline,
 	)))
 
 	if span != nil {
