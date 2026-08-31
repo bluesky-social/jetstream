@@ -76,13 +76,13 @@ func TestGoroutineRoot_LogsPanicThenRethrows(t *testing.T) {
 	require.Contains(t, body, `"commit":`)
 }
 
-func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
+func TestOptionsValidateRejectsNegativeCompactionCacheGrace(t *testing.T) {
 	t.Parallel()
 
 	opts := testOptions(t)
-	opts.SegmentCacheMaxAge = -time.Second
+	opts.CompactionCacheGrace = -time.Second
 	_, err := Build(t.Context(), opts)
-	require.ErrorContains(t, err, "SegmentCacheMaxAge must be >= 0")
+	require.ErrorContains(t, err, "CompactionCacheGrace must be >= 0")
 }
 
 func TestOptionsValidateRejectsNegativeBackfillFleetLimits(t *testing.T) {

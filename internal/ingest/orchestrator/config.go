@@ -249,6 +249,11 @@ type Config struct {
 	// compaction. Zero disables compaction scheduling and the merge-tail pass.
 	CompactionInterval time.Duration
 
+	// CompactionSchedule publishes the next steady-state compaction timestamp
+	// to the archive serving layer. It is optional for callers that do not
+	// expose archive downloads.
+	CompactionSchedule *CompactionScheduleState
+
 	// CompactionTombstoneCap is the operator cap for tombstone entries. The
 	// first implementation exposes the knob and uses it for trigger accounting;
 	// chunking lands with the live tombstone set integration.
