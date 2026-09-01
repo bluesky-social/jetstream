@@ -93,7 +93,7 @@ func newLiveTailHarness(t *testing.T, ctx context.Context) *liveTailHarness {
 	directory := &identity.Directory{
 		Resolver: &identity.DefaultResolver{
 			PLCURL: gt.Some(srv.URL),
-			// Plain client: jttp's SSRF protection blocks the loopback
+			// Plain client: gttp's SSRF protection blocks the loopback
 			// httptest server by design.
 			HTTPClient: gt.Some(http.DefaultClient),
 		},

@@ -112,7 +112,7 @@ Use the package-level metrics/tracer rather than rolling your own. `obs.Tracer("
 - **Observability over logging.** Minimal stdout/stderr. Instrument with Prometheus metrics and OTEL traces liberally.
 - **Local dev simplicity.** The justfile is the UX. CI mirrors it as closely as possible.
 - **Few dependencies.** Only the whitelist below; question additions:
-    - `github.com/jcalabro/atmos`, `gloom`, `gt`, `jttp`
+    - `github.com/jcalabro/atmos`, `github.com/bluesky-social/gttp`, `gloom`, `gt`
     - `github.com/urfave/cli` v3
     - `github.com/zeebo/xxh3`
     - `github.com/coder/websocket`

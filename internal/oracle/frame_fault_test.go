@@ -53,10 +53,10 @@ func oracleWireFrame(typ string, body []byte) []byte {
 // protocol.
 func oracleUnknownFrame(seq int64) []byte {
 	body := cbor.AppendMapHeader(nil, 2)
-	body = append(body, cbor.AppendTextKey(nil, "seq")...)
-	body = cbor.AppendInt(body, seq)
 	body = append(body, cbor.AppendTextKey(nil, "did")...)
 	body = cbor.AppendText(body, "did:plc:futureproto")
+	body = append(body, cbor.AppendTextKey(nil, "seq")...)
+	body = cbor.AppendInt(body, seq)
 	return oracleWireFrame("#futureThing", body)
 }
 

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/gttp"
 	identcache "github.com/bluesky-social/jetstream/internal/identity"
 	"github.com/bluesky-social/jetstream/internal/importer"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -37,7 +38,6 @@ import (
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
-	"github.com/jcalabro/jttp"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -245,16 +245,16 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 
 	// transportOpt, when an in-process transport is injected, routes every
-	// jttp client through it instead of a real socket (deterministic harness).
-	var transportOpt []jttp.Option
+	// gttp client through it instead of a real socket (deterministic harness).
+	var transportOpt []gttp.Option
 	if opts.HTTPTransport != nil {
-		transportOpt = []jttp.Option{jttp.WithTransport(opts.HTTPTransport)}
+		transportOpt = []gttp.Option{gttp.WithTransport(opts.HTTPTransport)}
 	}
 
 	backfillMetrics := backfill.NewMetrics(metrics.Registry)
 	xrpcClient := &xrpc.Client{
 		Host:       relayHTTPURL,
-		HTTPClient: gt.Some(jttp.New(append(xrpc.BulkDownloadOpts(), transportOpt...)...)),
+		HTTPClient: gt.Some(gttp.New(append(xrpc.BulkDownloadOpts(), transportOpt...)...)),
 	}
 
 	resolver := newIdentityResolver(opts)
@@ -566,22 +566,22 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 }
 
 func newIdentityResolver(opts Options) *identity.DefaultResolver {
-	plcOpts := append(xrpc.ATProtoOpts(10*time.Second), jttp.WithNoRedirects())
+	plcOpts := append(xrpc.ATProtoOpts(10*time.Second), gttp.WithNoRedirects())
 	webOpts := xrpc.ATProtoOpts(10 * time.Second)
 	if opts.HTTPTransport != nil {
 		// HTTPTransport is a deterministic, socket-free test seam. DNS
 		// preflight would escape that seam and make simulator-only hostnames
 		// depend on the machine resolver, so the injected transport owns policy
 		// enforcement in this mode.
-		plcOpts = append(plcOpts, jttp.WithTransport(opts.HTTPTransport))
-		webOpts = append(webOpts, jttp.WithTransport(opts.HTTPTransport))
+		plcOpts = append(plcOpts, gttp.WithTransport(opts.HTTPTransport))
+		webOpts = append(webOpts, gttp.WithTransport(opts.HTTPTransport))
 	} else {
-		webOpts = append(webOpts, jttp.WithStrictSSRFProtection(), jttp.WithNoProxy())
+		webOpts = append(webOpts, gttp.WithStrictSSRFProtection(), gttp.WithNoProxy())
 	}
 
 	resolver := &identity.DefaultResolver{
-		HTTPClient:    gt.Some(jttp.New(webOpts...)),
-		PLCHTTPClient: gt.Some(jttp.New(plcOpts...)),
+		HTTPClient:    gt.Some(gttp.New(webOpts...)),
+		PLCHTTPClient: gt.Some(gttp.New(plcOpts...)),
 	}
 	if opts.PLCURL != "" {
 		resolver.PLCURL = gt.Some(opts.PLCURL)

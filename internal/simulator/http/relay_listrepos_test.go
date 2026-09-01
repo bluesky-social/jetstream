@@ -9,13 +9,13 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/bluesky-social/gttp"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
-	"github.com/jcalabro/jttp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,7 +26,7 @@ func TestListRepos_PagesAcrossAllAccounts(t *testing.T) {
 	srv := httptest.NewServer(simhttp.NewHandler(w, "")) // pds endpoint not needed here
 	defer srv.Close()
 
-	xc := &xrpc.Client{Host: srv.URL, HTTPClient: gt.Some(jttp.New())}
+	xc := &xrpc.Client{Host: srv.URL, HTTPClient: gt.Some(gttp.New())}
 	sc := sync.NewClient(sync.Options{Client: xc})
 
 	seen := make(map[atmos.DID]bool)

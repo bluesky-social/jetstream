@@ -23,7 +23,7 @@ func TestPLC_ResolvesAccount(t *testing.T) {
 	a, err := w.LoadAccount(0)
 	require.NoError(t, err)
 
-	// Use a plain http.Client for tests; jttp's SSRF protection
+	// Use a plain http.Client for tests; gttp's SSRF protection
 	// blocks localhost by design.
 	resolver := &identity.DefaultResolver{
 		PLCURL:     gt.Some(srv.URL),

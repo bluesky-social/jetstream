@@ -59,7 +59,7 @@ type RetryConfig struct {
 	// DownloadTimeout bounds one retry attempt's network phase (getRepo
 	// + CAR read). Zero → atmos backfill.DefaultDownloadTimeout (5m).
 	// Negative disables the bound, leaving only the transport's own
-	// guards (jttp's 30m wall-clock backstop). Without this, a giant or
+	// guards (gttp's 30m wall-clock backstop). Without this, a giant or
 	// slow-serving repo occupies a host-limited retry slot for up to
 	// the transport backstop on every pass, forever — the retry runner
 	// bypasses atmos's backfill.Engine and so does not inherit its

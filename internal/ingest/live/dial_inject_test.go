@@ -204,10 +204,10 @@ func TestConsumer_Run_UnknownAndErrorFramesClassified(t *testing.T) {
 	t.Parallel()
 
 	unknownBody := cbor.AppendMapHeader(nil, 2)
-	unknownBody = append(unknownBody, cbor.AppendTextKey(nil, "seq")...)
-	unknownBody = cbor.AppendInt(unknownBody, 2)
 	unknownBody = append(unknownBody, cbor.AppendTextKey(nil, "did")...)
 	unknownBody = cbor.AppendText(unknownBody, "did:plc:future")
+	unknownBody = append(unknownBody, cbor.AppendTextKey(nil, "seq")...)
+	unknownBody = cbor.AppendInt(unknownBody, 2)
 
 	errHdr := cbor.AppendMapHeader(nil, 1)
 	errHdr = append(errHdr, cbor.AppendTextKey(nil, "op")...)

@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/bluesky-social/gttp"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
-	"github.com/jcalabro/jttp"
 )
 
 // newEngine resolves the transport dependencies and builds the replay engine.
@@ -64,9 +64,9 @@ func newEngine(host string, cfg config) engine {
 
 // newXRPCClient builds an xrpc.Client for host. When the caller supplied an
 // HTTP client (WithHTTPClient) it overrides both workloads; otherwise each
-// workload gets its own jttp client tuned by opts (short timeouts for XRPC
+// workload gets its own gttp client tuned by opts (short timeouts for XRPC
 // negotiation, bulk-transfer tuning for downloads — design note §5.1).
-func newXRPCClient(host string, cfg config, opts []jttp.Option) *xrpc.Client {
+func newXRPCClient(host string, cfg config, opts []gttp.Option) *xrpc.Client {
 	c := &xrpc.Client{Host: host}
 	// Retry policy is orthogonal to transport: apply the caller's attempt
 	// cap whether or not they also supplied a custom HTTP client.
@@ -77,7 +77,7 @@ func newXRPCClient(host string, cfg config, opts []jttp.Option) *xrpc.Client {
 		c.HTTPClient = gt.Some(cfg.httpClient)
 		return c
 	}
-	c.HTTPClient = gt.Some(jttp.New(opts...))
+	c.HTTPClient = gt.Some(gttp.New(opts...))
 	return c
 }
 

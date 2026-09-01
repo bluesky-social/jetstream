@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/bluesky-social/gttp"
 	"github.com/jcalabro/atmos"
-	"github.com/jcalabro/jttp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,21 +26,21 @@ func TestNewIdentityResolver_ProductionClientsSeparateTrustDomains(t *testing.T)
 	var requests atomic.Int32
 	plc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
-		_, _ = fmt.Fprint(w, `{"id":"did:plc:alice","alsoKnownAs":[],"verificationMethod":[],"service":[]}`)
+		_, _ = fmt.Fprint(w, `{"id":"did:plc:test234test234test234tes","alsoKnownAs":[],"verificationMethod":[],"service":[]}`)
 	}))
 	defer plc.Close()
 
 	resolver := newIdentityResolver(Options{PLCURL: plc.URL})
 	require.NotSame(t, resolver.HTTPClient.Val(), resolver.PLCHTTPClient.Val())
 
-	doc, err := resolver.ResolveDID(t.Context(), "did:plc:alice")
+	doc, err := resolver.ResolveDID(t.Context(), "did:plc:test234test234test234tes")
 	require.NoError(t, err)
-	require.Equal(t, "did:plc:alice", doc.ID)
+	require.Equal(t, "did:plc:test234test234test234tes", doc.ID)
 
 	authority := strings.TrimPrefix(plc.URL, "http://")
 	webDID := atmos.DID("did:web:" + strings.ReplaceAll(authority, ":", "%3A"))
 	_, err = resolver.ResolveDID(t.Context(), webDID)
-	require.ErrorIs(t, err, jttp.ErrBlockedByIPPolicy)
+	require.ErrorIs(t, err, gttp.ErrBlockedByIPPolicy)
 	require.EqualValues(t, 1, requests.Load(), "blocked did:web request reached the trusted PLC server")
 }
 
@@ -54,7 +54,7 @@ func TestNewIdentityResolver_InjectedTransportRoutesBothClients(t *testing.T) {
 		switch req.URL.Host {
 		case "plc.directory":
 			plcRequests.Add(1)
-			body = `{"id":"did:plc:alice","alsoKnownAs":[],"verificationMethod":[],"service":[]}`
+			body = `{"id":"did:plc:test234test234test234tes","alsoKnownAs":[],"verificationMethod":[],"service":[]}`
 		case "alice.test":
 			webRequests.Add(1)
 			body = `{"id":"did:web:alice.test","alsoKnownAs":[],"verificationMethod":[],"service":[]}`
@@ -72,7 +72,7 @@ func TestNewIdentityResolver_InjectedTransportRoutesBothClients(t *testing.T) {
 	resolver := newIdentityResolver(Options{HTTPTransport: transport})
 	require.NotSame(t, resolver.HTTPClient.Val(), resolver.PLCHTTPClient.Val())
 
-	_, err := resolver.ResolveDID(t.Context(), "did:plc:alice")
+	_, err := resolver.ResolveDID(t.Context(), "did:plc:test234test234test234tes")
 	require.NoError(t, err)
 	_, err = resolver.ResolveDID(t.Context(), "did:web:alice.test")
 	require.NoError(t, err)

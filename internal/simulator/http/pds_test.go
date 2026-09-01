@@ -14,12 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/gttp"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
-	"github.com/jcalabro/jttp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,7 +34,7 @@ func TestPDS_GetRepoRoundTrips(t *testing.T) {
 
 	xc := &xrpc.Client{
 		Host:       srv.URL,
-		HTTPClient: gt.Some(jttp.New()),
+		HTTPClient: gt.Some(gttp.New()),
 	}
 	sc := sync.NewClient(sync.Options{Client: xc})
 
@@ -74,7 +74,7 @@ func TestPDS_GetRepoServedHookFiresOncePerServe(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	xc := &xrpc.Client{Host: srv.URL, HTTPClient: gt.Some(jttp.New())}
+	xc := &xrpc.Client{Host: srv.URL, HTTPClient: gt.Some(gttp.New())}
 	sc := sync.NewClient(sync.Options{Client: xc})
 
 	for _, did := range []atmos.DID{a0.DID, a1.DID, a0.DID} {

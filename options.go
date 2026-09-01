@@ -29,7 +29,7 @@ type config struct {
 	apiKey    string
 	hasAPIKey bool
 	// httpClient is a caller override. nil is the sentinel for "unset":
-	// the engine then builds its own per-workload jttp clients
+	// the engine then builds its own per-workload gttp clients
 	// (xrpc.ATProtoOpts for XRPC, xrpc.BulkDownloadOpts for bulk
 	// downloads). Do not install a default here — that would collapse the
 	// two-client tuning into one shared client. See WithHTTPClient.
@@ -257,7 +257,7 @@ func WithAPIKey(apiKey string) Option {
 
 // WithHTTPClient overrides the HTTP client used for XRPC negotiation, public
 // dictionary fetches, bulk segment/block downloads, and live WebSocket
-// upgrades. It is an override: when unset, the client builds its own jttp
+// upgrades. It is an override: when unset, the client builds its own gttp
 // clients tuned per workload — xrpc.ATProtoOpts for the short XRPC calls
 // (planSnapshot and getZstdDictionary) and xrpc.BulkDownloadOpts for streaming
 // segment/block downloads, whose large transfers a short wall-clock timeout

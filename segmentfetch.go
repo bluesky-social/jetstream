@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bluesky-social/gttp"
 	"github.com/jcalabro/atmos/xrpc"
-	"github.com/jcalabro/jttp"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -82,7 +82,7 @@ func (d *downloader) httpClient() *http.Client {
 		return d.xc.HTTPClient.Val()
 	}
 	defaultBulkHTTPOnce.Do(func() {
-		defaultBulkHTTP = jttp.New(xrpc.BulkDownloadOpts()...)
+		defaultBulkHTTP = gttp.New(xrpc.BulkDownloadOpts()...)
 	})
 	return defaultBulkHTTP
 }

@@ -10,6 +10,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/bluesky-social/gttp"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/car"
@@ -19,7 +20,6 @@ import (
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
-	"github.com/jcalabro/jttp"
 )
 
 const (
@@ -116,7 +116,7 @@ func loadAuthoritativeRoot(ctx context.Context, did string, resolver identity.Re
 	}
 	xrpcClient := &xrpc.Client{
 		Host:       pdsURL,
-		HTTPClient: gt.Some(jttp.New(xrpc.BulkDownloadOpts()...)),
+		HTTPClient: gt.Some(gttp.New(xrpc.BulkDownloadOpts()...)),
 	}
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
