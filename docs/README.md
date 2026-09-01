@@ -172,6 +172,8 @@ Every so often, we compact updates/deletions into the sealed segments. Compactio
 
 The net of this is that segment files are immutable between compaction passes and only rewrite on the merge-tail pass or the steady-state compaction cadence. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy seeding of another instance from a given jetstream instance's archive.
 
+The existing archive query URLs also support HTTP `HEAD`: `/xrpc/network.bsky.jetstream.getSegment?name=...` and `/xrpc/network.bsky.jetstream.getBlock?segment=...&blockIndex=...`. HEAD is deliberately limited to these two URLs; it does not enable framework-wide HEAD handling or add query parameters. Segment HEAD opens and validates the same sealed-file descriptor as GET, so `ETag`, `Content-Length`, `Last-Modified`, ranges, and conditionals describe one immutable generation. Block HEAD exposes the virtual raw compressed frame (without its 8-byte on-disk length prefix), validates the selected 52-byte block-index entry from that descriptor, and uses a section reader so it does not allocate the compressed frame. GET retains its existing frame-buffer path. Both methods remain behind the normal readiness gate and return the same XRPC errors for malformed, missing, deleted, or corrupt archive data.
+
 ### 3.1.2 File Format
 
 The binary format of the segment file is as follows:

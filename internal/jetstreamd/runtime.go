@@ -559,6 +559,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			Bytes: subscribe.DictionaryV2(),
 		},
 	})
+	// Atmos v0.3.7 registers queries as GET-only. Keep HEAD narrowly scoped to
+	// the two existing archive query URLs; the exact public-mux routes win over
+	// the generic XRPC subtree without changing websocket or other XRPC methods.
+	srv.RegisterPublicRoute("HEAD /xrpc/network.bsky.jetstream.getSegment", xrpcSrv.HeadHandler("network.bsky.jetstream.getSegment"))
+	srv.RegisterPublicRoute("HEAD /xrpc/network.bsky.jetstream.getBlock", xrpcSrv.HeadHandler("network.bsky.jetstream.getBlock"))
 	srv.RegisterPublicRoute("/xrpc/", xrpcSrv.Handler())
 	rt.server = srv
 

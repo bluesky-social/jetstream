@@ -2,6 +2,7 @@ package segment
 
 import (
 	"encoding/binary"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -80,6 +81,28 @@ func TestReadBlockFrame_MatchesOnDiskAndDecodes(t *testing.T) {
 		wantEvents, err := r.DecodeBlock(idx)
 		require.NoError(t, err)
 		require.Equal(t, wantEvents, gotEvents, "block %d events", idx)
+	}
+}
+
+func TestBlockFrameSection_MatchesFrameWithoutMaterializingIt(t *testing.T) {
+	t.Parallel()
+
+	path := buildMultiBlockSegment(t, 2, 3)
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+	hdr, err := ReadSealedHeader(f)
+	require.NoError(t, err)
+
+	for idx := range int(hdr.BlockCount) {
+		section, err := BlockFrameSection(f, hdr, idx)
+		require.NoError(t, err)
+		frame, err := ReadBlockFrame(f, hdr, idx)
+		require.NoError(t, err)
+		require.Equal(t, int64(len(frame)), section.Size())
+		got, err := io.ReadAll(section)
+		require.NoError(t, err)
+		require.Equal(t, frame, got, "block %d", idx)
 	}
 }
 
