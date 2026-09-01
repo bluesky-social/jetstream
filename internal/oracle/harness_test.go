@@ -260,7 +260,6 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		// through listRepos failure handling or an explicit #sync.
 		FailedRepoRetryInterval:        failedRepoRetryInterval,
 		CursorLookback:                 36 * time.Hour,
-		SegmentCacheMaxAge:             0,
 		PlanMaxDIDs:                    xrpcapi.DefaultPlanMaxDIDs,
 		PlanMaxCollections:             xrpcapi.DefaultPlanMaxCollections,
 		PlanMaxEntries:                 xrpcapi.DefaultPlanMaxEntries,

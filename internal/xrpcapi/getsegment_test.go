@@ -42,10 +42,15 @@ func TestGetSegment_WholeFile(t *testing.T) {
 	require.Equal(t, int64(len(want)), resp.ContentLength)
 }
 
-func TestGetSegment_CacheMaxAge(t *testing.T) {
+func TestGetSegment_CacheControlFromCompactionDeadline(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestServer(t, 1)
-	cached := New(Config{Src: s.src, Logger: s.logger, CacheMaxAge: time.Hour})
+	deadline := time.Now().Add(2 * time.Hour)
+	cached := New(Config{
+		Src: s.src, Logger: s.logger,
+		CompactionCacheGrace: 10 * time.Minute,
+		CompactionDeadline:   fixedCompactionDeadline{next: deadline, ok: true},
+	})
 	ts := httptest.NewServer(cached.Handler())
 	defer ts.Close()
 
@@ -53,15 +58,26 @@ func TestGetSegment_CacheMaxAge(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "public, max-age=3600", resp.Header.Get("Cache-Control"))
+	assertCacheAgeRange(t, resp.Header.Get("Cache-Control"), int64((2*time.Hour+9*time.Minute)/time.Second), int64((2*time.Hour+10*time.Minute)/time.Second))
 }
 
 func TestCacheControlHeader(t *testing.T) {
 	t.Parallel()
 	require.Equal(t, "public, no-cache", cacheControlHeader(0))
 	require.Equal(t, "public, no-cache", cacheControlHeader(-time.Second))
-	require.Equal(t, "public, max-age=1", cacheControlHeader(500*time.Millisecond))
+	require.Equal(t, "public, no-cache", cacheControlHeader(500*time.Millisecond))
 	require.Equal(t, "public, max-age=3600", cacheControlHeader(time.Hour))
+}
+
+func assertCacheAgeRange(t *testing.T, header string, min, max int64) {
+	t.Helper()
+	const prefix = "public, max-age="
+	require.True(t, len(header) > len(prefix) && header[:len(prefix)] == prefix, "unexpected Cache-Control: %q", header)
+	var got int64
+	_, err := fmt.Sscanf(header[len(prefix):], "%d", &got)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, got, min)
+	require.LessOrEqual(t, got, max)
 }
 
 func TestGetSegment_RangeRequest(t *testing.T) {

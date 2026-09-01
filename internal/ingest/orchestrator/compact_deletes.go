@@ -65,6 +65,11 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 	}
 
 	start := time.Now()
+	if mode == compactionSteady && o.cfg.CompactionSchedule != nil {
+		// The active pass replaces the scheduled timestamp so newly issued
+		// responses receive only the configured grace period while rewrites run.
+		o.cfg.CompactionSchedule.beginPass(start)
+	}
 	var finalWatermark uint64
 	defer func() {
 		o.cfg.Metrics.observeCompactionPass(start, retErr)
@@ -479,8 +484,15 @@ func defaultCompactionRewriteWorkers() int {
 
 func (o *Orchestrator) runSteadyCompactor(ctx context.Context, liveWriter *ingest.Writer) error {
 	if o.cfg.CompactionInterval == 0 {
+		if o.cfg.CompactionSchedule != nil {
+			o.cfg.CompactionSchedule.disable()
+		}
 		<-ctx.Done()
 		return ctx.Err()
+	}
+
+	if o.cfg.CompactionSchedule != nil {
+		o.cfg.CompactionSchedule.completePass(time.Now().Add(o.cfg.CompactionInterval))
 	}
 
 	// Spec §5 failure policy: a failed pass aborts without advancing
@@ -490,10 +502,22 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context, liveWriter *inges
 	// transient IO error into an ingestion outage / crash loop).
 	var lastPass time.Time
 	runPass := func() {
-		if err := o.runDeleteCompaction(ctx, compactionSteady, liveWriter); err != nil && ctx.Err() == nil {
+		err := o.runDeleteCompaction(ctx, compactionSteady, liveWriter)
+		completed := time.Now()
+		if o.cfg.CompactionSchedule != nil {
+			if err != nil {
+				// A failed pass may have rewritten some files before the
+				// durable watermark failed. Keep the schedule unknown until
+				// the next pass starts rather than advertise freshness.
+				o.cfg.CompactionSchedule.failPass()
+			} else {
+				o.cfg.CompactionSchedule.completePass(completed.Add(o.cfg.CompactionInterval))
+			}
+		}
+		if err != nil && ctx.Err() == nil {
 			o.logger.ErrorContext(ctx, "steady compaction pass failed; will retry", "err", err)
 		}
-		lastPass = time.Now()
+		lastPass = completed
 	}
 
 	timer := time.NewTimer(o.cfg.CompactionInterval)

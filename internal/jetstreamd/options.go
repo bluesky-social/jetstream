@@ -30,6 +30,9 @@ const (
 	DefaultFailedRepoRetryWorkers     = backfill.DefaultFailedRepoRetryWorkers
 	DefaultFailedRepoRetryHostWorkers = backfill.DefaultFailedRepoRetryHostWorkers
 	DefaultFailedRepoRetryMaxDelay    = backfill.DefaultFailedRepoRetryMaxDelay
+	// DefaultCompactionCacheGrace is a bounded freshness cushion for archive
+	// responses already in a CDN while a scheduled rewrite pass runs.
+	DefaultCompactionCacheGrace = 5 * time.Minute
 )
 
 // PhaseBarrier is a test hook that can pause execution after a major
@@ -116,7 +119,7 @@ type Options struct {
 	DebugListener  net.Listener
 
 	CursorLookback                 time.Duration
-	SegmentCacheMaxAge             time.Duration
+	CompactionCacheGrace           time.Duration
 	PlanMaxDIDs                    int
 	PlanMaxCollections             int
 	PlanMaxEntries                 int
