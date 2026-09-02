@@ -11,6 +11,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 )
@@ -327,6 +329,7 @@ func (s *Server) DebugAddr() string {
 func (s *Server) publicMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /{$}", s.metrics.Middleware("root", http.HandlerFunc(s.handleRoot)))
+	mux.Handle("GET /xrpc/_health", s.metrics.Middleware("xrpc_health", http.HandlerFunc(s.handleXRPCHealth)))
 	if s.statusHandler != nil {
 		instrumented := s.metrics.Middleware("status", s.statusHandler)
 		mux.Handle("GET /status", instrumented)
@@ -339,6 +342,15 @@ func (s *Server) publicMux() http.Handler {
 		mux.Handle(r.pattern, s.metrics.Middleware(routeLabel(r.pattern), r.handler))
 	}
 	return mux
+}
+
+func (s *Server) handleXRPCHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(struct {
+		Version string `json:"version"`
+	}{Version: version.Get().Version}); err != nil {
+		s.logger.Debug("write xrpc health response", "err", err)
+	}
 }
 
 // routeLabel derives a stable, low-cardinality metric label from a

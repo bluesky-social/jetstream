@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/stretchr/testify/require"
 )
 
@@ -152,6 +154,25 @@ func TestPublicHandler_IndexRendersHTML(t *testing.T) {
 	require.Contains(t, bodyStr, `class="jet"`)
 	require.Contains(t, bodyStr, "████")
 	require.NotContains(t, bodyStr, "overflow-x: auto")
+}
+
+func TestPublicHandler_XRPCHealth(t *testing.T) {
+	t.Parallel()
+
+	srv := newServer(t)
+	srv.RegisterPublicRoute("/xrpc/", http.NotFoundHandler())
+	base := mountPublic(t, srv)
+
+	resp, err := doGet(t.Context(), base+"/xrpc/_health")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var body map[string]string
+	err = json.NewDecoder(resp.Body).Decode(&body)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"version": version.Get().Version}, body)
 }
 
 // TestServer_MetricsCaptureNon200StatusCodes verifies that
