@@ -88,8 +88,11 @@ func (b *LexBlob) AppendCBOR(buf []byte) ([]byte, error) {
 
 // UnmarshalCBOR decodes a LexBlob from DAG-CBOR.
 func (b *LexBlob) UnmarshalCBOR(data []byte) error {
-	_, err := b.UnmarshalCBORAt(data, 0)
-	return err
+	pos, err := b.UnmarshalCBORAt(data, 0)
+	if err != nil {
+		return err
+	}
+	return cbor.CheckTrailingData(pos, len(data))
 }
 
 // UnmarshalCBORAt decodes a LexBlob from DAG-CBOR starting at pos.
@@ -99,11 +102,22 @@ func (b *LexBlob) UnmarshalCBORAt(data []byte, pos int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	var prevKeyStart, prevKeyEnd int
+	keyOrderValid := false
 	for i := uint64(0); i < count; i++ {
 		key, newPos, err := cbor.ReadText(data, pos)
 		if err != nil {
 			return 0, err
 		}
+		keyStart := newPos - len(key)
+		keyEnd := newPos
+		if keyOrderValid {
+			if err := cbor.CheckMapKeyOrder(data, prevKeyStart, prevKeyEnd, keyStart, keyEnd); err != nil {
+				return 0, err
+			}
+		}
+		prevKeyStart, prevKeyEnd = keyStart, keyEnd
+		keyOrderValid = true
 		pos = newPos
 		switch key {
 		case "$type":
@@ -150,8 +164,11 @@ func (c *LexCIDLink) AppendCBOR(buf []byte) ([]byte, error) {
 
 // UnmarshalCBOR decodes a LexCIDLink from a DAG-CBOR CID link (tag 42).
 func (c *LexCIDLink) UnmarshalCBOR(data []byte) error {
-	_, err := c.UnmarshalCBORAt(data, 0)
-	return err
+	pos, err := c.UnmarshalCBORAt(data, 0)
+	if err != nil {
+		return err
+	}
+	return cbor.CheckTrailingData(pos, len(data))
 }
 
 // UnmarshalCBORAt decodes a LexCIDLink from a DAG-CBOR CID link at pos.

@@ -94,8 +94,11 @@ func (s *JetstreamSubscribeEvents_Account) AppendCBOR(buf []byte) ([]byte, error
 }
 
 func (s *JetstreamSubscribeEvents_Account) UnmarshalCBOR(data []byte) error {
-	_, err := s.UnmarshalCBORAt(data, 0)
-	return err
+	pos, err := s.UnmarshalCBORAt(data, 0)
+	if err != nil {
+		return err
+	}
+	return cbor.CheckTrailingData(pos, len(data))
 }
 
 func (s *JetstreamSubscribeEvents_Account) UnmarshalCBORAt(data []byte, pos int) (int, error) {
@@ -104,11 +107,20 @@ func (s *JetstreamSubscribeEvents_Account) UnmarshalCBORAt(data []byte, pos int)
 	if err != nil {
 		return 0, err
 	}
+	var prevKeyStart, prevKeyEnd int
+	keyOrderValid := false
 	for i := uint64(0); i < count; i++ {
 		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
 		if err != nil {
 			return 0, err
 		}
+		if keyOrderValid {
+			if err := cbor.CheckMapKeyOrder(data, prevKeyStart, prevKeyEnd, keyStart, keyEnd); err != nil {
+				return 0, err
+			}
+		}
+		prevKeyStart, prevKeyEnd = keyStart, keyEnd
+		keyOrderValid = true
 		pos = newPos
 		switch keyEnd - keyStart {
 		case 3:
@@ -435,8 +447,11 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 }
 
 func (s *JetstreamSubscribeEvents_Commit) UnmarshalCBOR(data []byte) error {
-	_, err := s.UnmarshalCBORAt(data, 0)
-	return err
+	pos, err := s.UnmarshalCBORAt(data, 0)
+	if err != nil {
+		return err
+	}
+	return cbor.CheckTrailingData(pos, len(data))
 }
 
 func (s *JetstreamSubscribeEvents_Commit) UnmarshalCBORAt(data []byte, pos int) (int, error) {
@@ -445,11 +460,20 @@ func (s *JetstreamSubscribeEvents_Commit) UnmarshalCBORAt(data []byte, pos int) 
 	if err != nil {
 		return 0, err
 	}
+	var prevKeyStart, prevKeyEnd int
+	keyOrderValid := false
 	for i := uint64(0); i < count; i++ {
 		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
 		if err != nil {
 			return 0, err
 		}
+		if keyOrderValid {
+			if err := cbor.CheckMapKeyOrder(data, prevKeyStart, prevKeyEnd, keyStart, keyEnd); err != nil {
+				return 0, err
+			}
+		}
+		prevKeyStart, prevKeyEnd = keyStart, keyEnd
+		keyOrderValid = true
 		pos = newPos
 		switch keyEnd - keyStart {
 		case 3:
@@ -859,8 +883,11 @@ func (s *JetstreamSubscribeEvents_Identity) AppendCBOR(buf []byte) ([]byte, erro
 }
 
 func (s *JetstreamSubscribeEvents_Identity) UnmarshalCBOR(data []byte) error {
-	_, err := s.UnmarshalCBORAt(data, 0)
-	return err
+	pos, err := s.UnmarshalCBORAt(data, 0)
+	if err != nil {
+		return err
+	}
+	return cbor.CheckTrailingData(pos, len(data))
 }
 
 func (s *JetstreamSubscribeEvents_Identity) UnmarshalCBORAt(data []byte, pos int) (int, error) {
@@ -869,11 +896,20 @@ func (s *JetstreamSubscribeEvents_Identity) UnmarshalCBORAt(data []byte, pos int
 	if err != nil {
 		return 0, err
 	}
+	var prevKeyStart, prevKeyEnd int
+	keyOrderValid := false
 	for i := uint64(0); i < count; i++ {
 		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
 		if err != nil {
 			return 0, err
 		}
+		if keyOrderValid {
+			if err := cbor.CheckMapKeyOrder(data, prevKeyStart, prevKeyEnd, keyStart, keyEnd); err != nil {
+				return 0, err
+			}
+		}
+		prevKeyStart, prevKeyEnd = keyStart, keyEnd
+		keyOrderValid = true
 		pos = newPos
 		switch keyEnd - keyStart {
 		case 3:
@@ -1144,8 +1180,11 @@ func (s *JetstreamSubscribeEvents_Info) AppendCBOR(buf []byte) ([]byte, error) {
 }
 
 func (s *JetstreamSubscribeEvents_Info) UnmarshalCBOR(data []byte) error {
-	_, err := s.UnmarshalCBORAt(data, 0)
-	return err
+	pos, err := s.UnmarshalCBORAt(data, 0)
+	if err != nil {
+		return err
+	}
+	return cbor.CheckTrailingData(pos, len(data))
 }
 
 func (s *JetstreamSubscribeEvents_Info) UnmarshalCBORAt(data []byte, pos int) (int, error) {
@@ -1154,11 +1193,20 @@ func (s *JetstreamSubscribeEvents_Info) UnmarshalCBORAt(data []byte, pos int) (i
 	if err != nil {
 		return 0, err
 	}
+	var prevKeyStart, prevKeyEnd int
+	keyOrderValid := false
 	for i := uint64(0); i < count; i++ {
 		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
 		if err != nil {
 			return 0, err
 		}
+		if keyOrderValid {
+			if err := cbor.CheckMapKeyOrder(data, prevKeyStart, prevKeyEnd, keyStart, keyEnd); err != nil {
+				return 0, err
+			}
+		}
+		prevKeyStart, prevKeyEnd = keyStart, keyEnd
+		keyOrderValid = true
 		pos = newPos
 		switch keyEnd - keyStart {
 		case 4:
@@ -1481,8 +1529,11 @@ func (u JetstreamSubscribeEvents_Message) AppendCBOR(buf []byte) ([]byte, error)
 }
 
 func (u *JetstreamSubscribeEvents_Message) UnmarshalCBOR(data []byte) error {
-	_, err := u.UnmarshalCBORAt(data, 0)
-	return err
+	pos, err := u.UnmarshalCBORAt(data, 0)
+	if err != nil {
+		return err
+	}
+	return cbor.CheckTrailingData(pos, len(data))
 }
 
 func (u *JetstreamSubscribeEvents_Message) UnmarshalCBORAt(data []byte, pos int) (int, error) {
@@ -1627,8 +1678,11 @@ func (s *JetstreamSubscribeEvents_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 }
 
 func (s *JetstreamSubscribeEvents_Sync) UnmarshalCBOR(data []byte) error {
-	_, err := s.UnmarshalCBORAt(data, 0)
-	return err
+	pos, err := s.UnmarshalCBORAt(data, 0)
+	if err != nil {
+		return err
+	}
+	return cbor.CheckTrailingData(pos, len(data))
 }
 
 func (s *JetstreamSubscribeEvents_Sync) UnmarshalCBORAt(data []byte, pos int) (int, error) {
@@ -1637,11 +1691,20 @@ func (s *JetstreamSubscribeEvents_Sync) UnmarshalCBORAt(data []byte, pos int) (i
 	if err != nil {
 		return 0, err
 	}
+	var prevKeyStart, prevKeyEnd int
+	keyOrderValid := false
 	for i := uint64(0); i < count; i++ {
 		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
 		if err != nil {
 			return 0, err
 		}
+		if keyOrderValid {
+			if err := cbor.CheckMapKeyOrder(data, prevKeyStart, prevKeyEnd, keyStart, keyEnd); err != nil {
+				return 0, err
+			}
+		}
+		prevKeyStart, prevKeyEnd = keyStart, keyEnd
+		keyOrderValid = true
 		pos = newPos
 		switch keyEnd - keyStart {
 		case 3:
