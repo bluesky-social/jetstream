@@ -4,107 +4,125 @@ Date: 2026-09-20. Status: accepted design direction; not implemented.
 
 ## Decision
 
-Add a second, operator-selected storage backend for production deployments:
+Add an optional `disaggregated` storage mode for production deployments:
 
-- S3 holds immutable, SHA-256-addressed compressed segment block frames and
-  the immutable header/footer objects needed to reproduce a `.jss` file.
-- A highly available PostgreSQL service is the authoritative metadata store,
-  segment catalog, and transaction/commit point.
-- Local disk is a disposable bounded cache and staging area. It is not needed
-  to recover authoritative state.
-- One fenced writer owns an archive at a time. Readers may scale out against
-  PostgreSQL and S3.
+- S3 stores the large data: compressed segment blocks, headers, and footers.
+  Each object is immutable and named by its SHA-256 hash.
+- A highly available PostgreSQL service stores the small, mutable data: relay
+  cursors, sequence state, repo state, and the catalog that says which blocks
+  make up each segment.
+- Local disk is only a bounded cache and temporary workspace. Losing it does
+  not lose archive data.
+- One writer is active at a time. Any number of readers can use PostgreSQL and
+  S3.
 
 Keep the existing `.jss` + Pebble implementation as the default `local`
-backend. It remains the simplest deployment, the fastest development loop,
-and the reference implementation for the segment format. The new backend is
-`disaggregated`; it does not emulate S3 as a filesystem and it does not make
-Pebble snapshots part of normal production durability.
+mode. It remains the simplest way to deploy and test Jetstream. The new mode
+does not mount S3 as a filesystem and does not use Pebble snapshots for normal
+durability.
 
-The disaggregated commit rule is the analogue of today's “fsync segment,
-then commit Pebble” rule:
+The central write rule mirrors today's “fsync the segment, then commit
+Pebble” rule:
 
-> Successfully create and verify every required immutable S3 object first;
-> then commit its references and all event-dependent metadata in one fenced
-> PostgreSQL transaction. PostgreSQL commit is the point at which the block is
-> part of the durable archive.
+> First upload and verify the S3 object. Then, in one PostgreSQL transaction,
+> add the block to the segment and advance all metadata that depends on that
+> block. The block is durable only after the database transaction commits.
 
-An S3 object without a PostgreSQL reference is garbage. A PostgreSQL reference
-without its S3 object is corruption. S3 listing is never authoritative.
+This ordering makes failures simple:
+
+- An uploaded object that is not referenced by PostgreSQL is harmless garbage
+  and can be deleted later.
+- A PostgreSQL reference to a missing object is corruption and stops serving
+  that data.
+- Bucket listing is never used to decide what belongs in the archive.
 
 This supersedes the primary direction of the earlier
 [native S3 backup/restore exploration](https://github.com/bluesky-social/jetstream/blob/jc/s3-backups/specs/notes/2026-09-20-native-s3-backup-restore-plan.md).
-That note remains useful for its format analysis, restore hazards, and
-sequence-reuse analysis, but this design makes remote storage primary instead
-of periodically coordinating local segment and Pebble snapshots.
+That note is still useful for its format, restore, and sequence-reuse analysis.
+The important change here is that S3 and PostgreSQL are the primary storage,
+not a backup of local files and Pebble.
 
-## Why this design
+## The design in one minute
 
 Jetstream's large state is already mostly immutable compressed blocks. The
-expensive operation is repeatedly moving whole segment files even when a
-rewrite changes only a few blocks. Object storage is a natural home for those
-blocks, but not for an appendable file or a mutable database. PostgreSQL gives
-us the missing transactional authority: it can atomically publish a block,
-advance the safe relay cursor, update verifier/repo state, renew the local
-sequence lease, and expose a new segment generation.
+expensive part of compaction is rewriting whole files when only a few blocks
+changed. Storing each compressed block by hash means unchanged blocks are
+shared by old and new versions of a segment.
 
-This division also makes the failure boundary legible:
+S3 is good at storing immutable bytes, but it cannot append to a file or update
+several pieces of metadata in one transaction. PostgreSQL fills that role. It
+publishes a new block and advances the relay cursor, sequence state, and repo
+state together.
+
+The write path is:
 
 ```text
-                          authoritative commit
-                                  |
-relay/PDS -> encode -> S3 immutable objects -> PostgreSQL catalog + metadata
-                         |                   |
-                         |                   +-> plans, generations, cursors
-                         +-> local cache          and writer fencing
-
-Readers -> PostgreSQL recipe/snapshot -> cache or S3 -> unchanged segment decoder
+relay or PDS
+    |
+    v
+encode one block -> upload block to S3 -> commit its reference in PostgreSQL
+                           |                         |
+                           v                         v
+                    disposable cache       cursors, sequence state,
+                                           repo state, segment catalog
 ```
 
-The segment encoding remains the unit of interoperability. A generation
-recipe can recreate the exact bytes of a sealed `.jss` file, so existing
-decoders and archive APIs do not need a second event format.
+The read path is:
+
+```text
+read segment recipe from PostgreSQL -> fetch blocks from cache or S3
+                                    -> use the existing segment decoder
+```
+
+An active segment is an ordered list of block hashes in PostgreSQL. When it is
+sealed, Jetstream publishes an immutable **generation**: the exact header,
+ordered block list, and footer for that version of the segment. Compaction and
+timestamp import create a new generation and reuse every unchanged block.
+
+A **recipe** is the information needed to reconstruct one generation. It can
+recreate the exact bytes of a sealed `.jss` file, so the segment format and
+public archive APIs do not need a second event encoding.
+
+A **fence** is a database-issued writer number. Every write must present the
+current number. When a new writer takes over, it gets a higher number, so an
+old writer can no longer commit even if it is still running.
 
 ## Goals
 
-1. Preserve Jetstream's existing correctness guarantees: client-observable
-   sequence numbers are never reused, event-dependent metadata never leads
-   durable event data, per-DID order is stable, and unexplained holes fail
-   loud.
-2. Remove local disk and a single process's Pebble database from the recovery
-   path in production-grade deployments.
-3. Keep ingest and archive serving fast at current production scale, including
-   during compaction and timestamp import.
-4. Let stateless or near-stateless readers scale independently and let a new
-   writer take over without copying a multi-terabyte archive.
-5. Reuse unchanged compressed frames across compaction/import generations.
-6. Preserve the current local backend with no S3 or PostgreSQL requirement.
-7. Make every partial failure resolve to either unpublished garbage or a
-   complete database transaction, with deterministic recovery.
-8. Retain the current public protocol and exact `.jss` representation unless
-   a separately versioned protocol change is justified.
+1. Keep all current correctness guarantees. In particular, never reuse a
+   sequence number seen by a client, never advance metadata ahead of its data,
+   keep per-DID ordering, and stop on unexplained archive holes.
+2. Allow a production writer to recover on another machine without copying a
+   multi-terabyte local archive or restoring Pebble.
+3. Keep ingest, replay, compaction, and timestamp import fast at current scale.
+4. Let readers scale independently from the single writer.
+5. Reuse unchanged compressed blocks across segment rewrites.
+6. Keep local mode simple and free of S3 and PostgreSQL dependencies.
+7. Make partial failures leave either a complete database commit or harmless
+   unreferenced objects.
+8. Keep the current public protocol and exact `.jss` representation unless a
+   later, versioned design changes them.
 
 ## Non-goals
 
-- Active-active ingest. The initial design has one writer and active-passive
-  failover. Running two sequence allocators or lifecycle orchestrators for one
-  archive is explicitly unsupported.
-- Treating S3 as POSIX, implementing append with multipart uploads, or putting
-  Pebble on an object-store `vfs.FS`.
+- Active-active ingest. One writer is active; another may take over after it
+  fences the old writer.
+- Treating S3 like a local filesystem, implementing append with multipart
+  uploads, or putting Pebble on an S3-backed `vfs.FS`.
 - Eliminating all local storage. Bounded cache, temporary rewrite space, and
   multipart staging may use ephemeral SSD.
 - Making S3 the transaction coordinator. It stores bytes and an independent
   sequence ceiling; PostgreSQL publishes archive state.
 - Exactly-once delivery. Existing at-least-once behavior and inclusive cursors
   remain the contract.
-- Serving correctness-sensitive state from an asynchronously lagging database
-  replica without an explicit freshness bound.
-- Transparent multi-region active-active service. Regional disaster recovery
-  needs a reachable monotonic sequence authority or a new archive identity.
-- Replacing PostgreSQL backups. Database PITR and object retention are both
-  required; neither substitutes for the other.
-- A general storage abstraction usable by arbitrary applications. Interfaces
-  should express Jetstream operations and invariants.
+- Serving mutable state from a lagging database replica without a clear lag
+  limit.
+- Transparent multi-region writes. Regional recovery needs access to the
+  original sequence-control object or a new archive identity.
+- Replacing PostgreSQL backups. Database point-in-time recovery (PITR) and S3
+  object retention are both required; neither replaces the other.
+- A general storage library. The interfaces should describe Jetstream's own
+  operations and safety rules.
 
 ## Production workload and design implications
 
@@ -119,16 +137,15 @@ Read-only Grafana measurements for pop1 over
 | Segment rotations | 3, about 17.5/day | Seal transactions and footer objects are infrequent. |
 | Synced metadata batches | Exactly 2,035 | The existing block boundary already defines a useful remote transaction cadence. |
 | Metadata point reads | 6.12 million, about 415/s | Remote SQL is feasible, but multi-get, prepared statements, and safe caching matter. |
-| Mean Pebble batch commit | 1.44ms | PostgreSQL commit latency is a benchmark gate, not assumed free. |
-| Seven-day whole-file compaction writes | 6.57TB/day | Uploading rewritten whole files would be gross write amplification. |
+| Mean Pebble batch commit | 1.44ms | PostgreSQL commit latency must be measured against this baseline. |
+| Seven-day whole-file compaction writes | 6.57TB/day | Uploading whole rewritten files would waste large amounts of bandwidth. |
 | Mean compaction pass | 77.4 minutes | Publication cannot require pausing or serializing the full pass. |
 | `getBlock` requests | 88,649; 1.21MB/s | A block cache and bounded concurrent S3 reads should handle the observed load. |
-| Current archive | 1.82TiB, 7,651 sealed segments, 6.40M blocks, 25.7B events | Initial migration and catalog size are first-class work. |
+| Current archive | 1.82TiB, 7,651 sealed segments, 6.40M blocks, 25.7B events | Migration time and catalog size must be tested before rollout. |
 
 The earlier backup investigation found that about 87% of rewritten files
-touched at most ten blocks. Content addressing therefore attacks the dominant
-compaction amplification directly: unchanged frames retain the same identity
-and need neither upload nor another physical copy.
+changed at most ten blocks. With content-addressed storage, every unchanged
+block keeps the same hash. It does not need to be uploaded or stored again.
 
 These numbers are observations, not capacity limits. Before production
 cutover, benchmark peak backfill, import, compaction, cache-cold replay, S3
@@ -142,27 +159,26 @@ forms are:
 1. **Published generations are immutable.** A generation's header, ordered
    block references, and footer never change. Rewrites publish another
    generation and atomically change a pointer.
-2. **Objects lead metadata.** Every S3 object needed by a database transaction
-   is durably readable and verified before the transaction may reference it.
-   Metadata must never lead object data.
+2. **Upload before commit.** Every S3 object must be readable and verified
+   before PostgreSQL may reference it.
 3. **PostgreSQL is authoritative.** Readers discover segments, blocks,
    generations, vacancies, and current pointers through the catalog. Bucket
    listing can audit or find garbage but cannot repair catalog state.
 4. **Hashes name exact bytes.** The SHA-256 is over the stored bytes, not
    decoded events, an ETag, or a logical block. Reads verify length and hash
    before decoded data becomes observable.
-5. **One fenced writer.** Every writer transaction proves the current fencing
-   epoch. Losing leadership or the database session immediately makes the old
-   process unable to publish.
-6. **Event and metadata effects are atomic.** The block reference, exact
+5. **Only the current writer can commit.** Every write includes the current
+   fence number. Losing the leadership database connection invalidates that
+   number.
+6. **A block and its metadata commit together.** The block reference, exact
    `seq/next`, sequence lease, safe `relay/cursor`, and all eligible repo,
    verifier, sync, and lifecycle mutations commit together.
 7. **Client-observable seqs are never reused.** The existing one-block local
    lease protects process crashes. An independent S3 ceiling protects the same
    cursor namespace across database rollback or loss.
-8. **Unregistered coverage holes fail loud.** Recipes and explicit
+8. **Unexplained gaps stop the process.** Recipes and explicit
    `seq/gap/*` vacancies explain all durable coverage. Missing objects, missing
-   ordinals, or unexplained sequence holes are corruption, not an invitation
+   block numbers, or unexplained sequence holes are corruption, not an invitation
    to skip forward.
 9. **Published segment order is stable.** Logical segment indices retain the
    same creation/time order as lexically sorted local filenames. Generation
@@ -171,12 +187,11 @@ forms are:
     invalid relay record remains an input error. A hash mismatch, impossible
     recipe, lost fence, or referenced missing object is internal corruption.
 
-The operator configuration is part of the durability contract. PostgreSQL
-must use synchronous commit, durable storage, and a failover configuration
-that will not promote a replica missing acknowledged transactions. S3 must
-provide atomic whole-object writes, strong reads after successful writes, and
-working conditional requests. Startup refuses a deployment that explicitly
-configures weaker database commit behavior.
+These guarantees also depend on the managed services. PostgreSQL must use
+synchronous commit and must not promote a replica that is missing acknowledged
+transactions. S3 must provide atomic whole-object writes, immediate reads of
+successful writes, and working conditional updates. Jetstream refuses to
+start when it can detect weaker settings.
 
 ## Object representation
 
@@ -206,10 +221,10 @@ The initial implementation stores three object kinds:
 | `segment-header` | Exact reserved header bytes | Small but content addressed for one uniform integrity model. |
 | `segment-footer` | Exact sealed footer bytes | Includes the indexes and historical envelopes belonging to that generation. |
 
-The hash is over raw stored bytes. The object catalog records length, SHA-256,
-creation time, and optional provider checksum/version; each recipe reference
-declares its expected kind. Kind is not folded into the key, so identical raw
-bytes may safely satisfy references in more than one role.
+The hash covers the bytes exactly as stored. The object table records the
+length, hash, creation time, and optional S3 checksum/version. Each recipe says
+whether it expects a block, header, or footer. Object type is not part of the
+key, so identical bytes can safely be reused in more than one role.
 
 Do not use S3 ETags as content hashes. Multipart upload, encryption, and
 provider differences make that invalid. Send or validate the provider's
@@ -238,7 +253,7 @@ An active segment has a header plus an ordered list in
 generation. The database list, rather than an appendable S3 object, is the
 active segment.
 
-### S3 semantics relied upon
+### Required S3 behavior
 
 AWS S3 currently provides strong read-after-write and list consistency, but
 this design needs only strong reads of known keys. It assumes:
@@ -255,16 +270,22 @@ tests for these behaviors, ambiguous timeouts, checksum headers, and concurrent
 conditional requests. The service never depends on rename, append, directory
 fsync, or LIST for correctness.
 
-Enable bucket versioning. Object Lock/governance retention is recommended for
-the control object and as a safety net for archive objects, but it is not a
-substitute for application-level GC. Cross-region replication is asynchronous
-and does not make two regions one linearizable sequence authority.
+Enable bucket versioning. Object Lock or governance retention is recommended
+for the sequence-control object and as protection against accidental deletion.
+Jetstream must still manage garbage collection itself. Cross-region S3
+replication is asynchronous; it cannot coordinate writers in two regions.
 
 ## PostgreSQL data model
 
-The schema below is logical. Names and column widths may change after query
-benchmarks, but the transaction boundaries and identities are part of the
-design.
+The database has four main groups of tables:
+
+1. One archive row records writer ownership and global control state.
+2. A key/value table initially preserves the existing Pebble metadata format.
+3. An object table tracks uploads and garbage collection.
+4. Segment tables describe active segments and immutable generations.
+
+The proposed columns follow. Names, widths, and indexes may change after
+benchmarks. The identities and transaction boundaries should not.
 
 ### Archive and writer control
 
@@ -283,30 +304,29 @@ archives(
 )
 ```
 
-`catalog_commit` is a monotonically increasing logical revision allocated
-inside publishing transactions. `writer_epoch` is the fencing token. Remote
-ceiling fields record the S3 control state observed by the current writer;
-they cannot lower the S3 value.
+`catalog_commit` is a revision number increased by every catalog publication.
+`writer_epoch` is the writer's fence number. The remote ceiling columns record
+the last S3 sequence-control value seen by this writer; they may never reduce
+the value in S3.
 
-Leadership uses a session-level PostgreSQL advisory lock derived from
-`archive_id`. After taking it, a candidate locks the archive row, reconciles
-the remote sequence ceiling, increments `writer_epoch`, and records its unique
-process identity. Every mutating transaction locks or conditionally updates
-the row with that epoch. A database reconnect is a new leadership attempt, not
-permission to keep using an old token.
+To become writer, a process takes a PostgreSQL advisory lock for `archive_id`.
+It then checks the S3 sequence ceiling, increases `writer_epoch`, and records
+its process identity. Every later write checks that epoch. If the database
+connection drops, the advisory lock is released. Reconnecting requires taking
+leadership again and getting a new epoch.
 
-The advisory lock gives prompt mutual exclusion; the durable epoch gives
-fencing and auditability. Wall-clock lease expiry is not the correctness
-mechanism and clock skew cannot create two valid writers.
+The advisory lock prevents two healthy writers. The epoch prevents an old
+writer from committing after failover. This does not use a clock or timeout,
+so clock skew cannot create two valid writers.
 
-This fencing domain is one logical PostgreSQL cluster. A restored/forked second
-cluster has an independent advisory-lock namespace, so an operator must revoke
-or otherwise fence the old cluster's writer before promoting the fork. The S3
-ceiling prevents sequence reuse between such sessions; it does not reconcile
-two divergent catalogs. Automatic cross-cluster writer election would require
-a separate consensus control plane and is outside this design.
+The lock protects one PostgreSQL cluster. A restored copy of that cluster has
+its own locks. Before promoting a restored copy, the operator must revoke the
+old writer's access or otherwise prove it has stopped. The S3 sequence ceiling
+prevents sequence reuse, but it cannot merge two databases that were allowed
+to diverge. Automatic election across separate database clusters is outside
+this design.
 
-### Compatibility metadata KV
+### Existing metadata keys and values
 
 ```text
 metadata_kv(
@@ -319,17 +339,17 @@ metadata_kv(
 )
 ```
 
-The first implementation preserves current Pebble key/value encodings. This
-reduces semantic migration risk for `relay/cursor`, `seq/*`, `repo/*`,
+The first implementation stores current Pebble keys and values unchanged. This
+reduces migration risk for `relay/cursor`, `seq/*`, `repo/*`,
 `pdshost/*`, `sync/*`, lifecycle, retry, import, and compaction state. The SQL
 store supports atomic put/delete, ordered prefix/range scans, compare-and-set,
 and multi-get. PostgreSQL `bytea` ordering must be covered by compatibility
 tests against Pebble iteration.
 
-Typed tables should replace opaque keys where they materially improve queries
-or constraints, but not as part of the minimum storage cutover. Segment
-catalog rows are typed from the beginning because recipes, snapshot visibility,
-and referential integrity are new semantics.
+Individual key families can move to normal SQL columns later when that makes
+queries or validation better. That conversion is not required for the first
+release. Segment catalog rows use normal columns from the start because they
+are new and benefit from database constraints.
 
 ### Objects and upload state
 
@@ -347,16 +367,13 @@ objects(
 )
 ```
 
-Register an upload attempt before PUT and mark it `available` only after
-verification. A stale `uploading` row is recoverable staging, not a reference.
-All recipe/reference insertions require `available`. This registration avoids
-making a full bucket listing the normal way to discover orphan uploads; S3
-Inventory remains useful for audit.
+Before uploading, create an `uploading` row. After the PUT has been verified,
+change it to `available`. Recipes may reference only available objects. If a
+process dies during upload, another process can inspect or clean up the stale
+row without listing the whole bucket. S3 Inventory is still useful for audits.
 
-Object kind belongs to the reference, not this row. The object table describes
-opaque bytes; in the fantastically unlikely but valid case that two roles have
-identical bytes, one hash can satisfy both references without a contradictory
-single-kind column.
+The object row describes bytes, not their use. If two roles happen to have the
+same bytes, the same hash can satisfy both references.
 
 ### Segments, generations, and blocks
 
@@ -396,7 +413,7 @@ segment_generations(
 
 generation_blocks(
   generation_id uuid,
-  ordinal integer,
+  ordinal integer,              -- zero-based block number
   block_sha256 bytea,
   compressed_length bigint,
   event_count integer,
@@ -412,7 +429,7 @@ active_segment_blocks(
   archive_id uuid,
   namespace text,
   segment_index bigint,
-  ordinal integer,
+  ordinal integer,              -- zero-based block number
   block_sha256 bytea,
   compressed_length bigint,
   event_count integer,
@@ -426,55 +443,50 @@ active_segment_blocks(
 )
 ```
 
-Foreign keys bind object references to `available` object identities through
-transactional checks/triggers where a plain foreign key cannot express state.
-Generation block ordinals are dense from zero. Constraints reject inverted
-envelopes, overlapping active ordinals, invalid sequence bounds, and a sealed
-segment without a current generation.
+References must point to available object rows. A foreign key plus a
+transactional check or trigger enforces that rule. Block numbers start at zero
+and have no gaps. Constraints reject invalid time/sequence ranges, duplicate
+active block numbers, and sealed segments without a current generation.
 
-`visible_from_commit`/`visible_until_commit` provide catalog history for
-auditing, database recovery, and a possible future generation-bound API. Old
-generation rows and objects remain available for the existing HTTP cache grace
-and recovery window after `segments.current_generation_id` changes.
+`visible_from_commit`/`visible_until_commit` preserve catalog history for
+auditing and database recovery. Old generation rows and objects remain
+available for the existing HTTP cache grace and recovery window after
+`segments.current_generation_id` changes.
 
-Additional typed tables will likely cover import jobs, catalog snapshot pins,
-and GC claims. Avoid denormalizing a second mutable manifest that can disagree
-with these rows.
+Import jobs, temporary references held by reads or rewrites, and
+garbage-collection claims will probably need their own tables. Do not build a
+second mutable manifest that can disagree with this catalog.
 
 ## Core protocols
 
 ### New block commit
 
-The block commit path is deliberately small and ordered:
+One block is committed as follows:
 
-1. Under the ingest writer's existing ordering rules, prepare and compress a
-   complete block. Compute its descriptors and SHA-256 over the compressed
-   frame.
-2. Ensure the current process has enough local and remote sequence lease for
-   every seq already made client-observable. This happens before readable-log
-   publication, as today.
-3. Register/claim the object row, PUT the frame by hash if necessary, and
-   verify known-key HEAD/GET metadata. Deduplication may turn this into no
-   network write.
-4. Begin a PostgreSQL transaction and lock/assert the current writer epoch,
-   archive row, and active segment tail.
-5. Insert exactly the next active block ordinal and object reference. Apply in
-   the same transaction all metadata mutations eligible through this block:
-   exact `seq/next`, `seq/max_reserved`, relay cursor, repo ratchets, verifier
-   state, sync/account state, and any lifecycle progress.
-6. Increment `catalog_commit` and commit with synchronous commit enabled.
-7. Only after success, acknowledge remote durability to the ingest pipeline
-   and advance the durable readable-log boundary. Cache population and
-   notifications happen after commit and are disposable.
+1. Prepare and compress a complete block in ingest order. Calculate its
+   SHA-256 and its planning metadata, such as event count and sequence/time
+   ranges.
+2. Before any event is visible in the live readable log, confirm that its
+   sequence number is inside both the local and remote reserved ranges.
+3. Create or claim the object row. If S3 does not already have this hash,
+   upload it. Verify the known key with HEAD or GET.
+4. Start a PostgreSQL transaction. Check the writer fence and lock the active
+   segment tail.
+5. Insert the next block number. In the same transaction, update `seq/next`,
+   `seq/max_reserved`, the safe relay cursor, durable repo/version checks,
+   verifier and sync/account state, and related lifecycle progress.
+6. Increase `catalog_commit` and commit with synchronous commit enabled.
+7. Report the block as durable. Cache writes and reader notifications happen
+   afterward because they can safely be lost.
 
-If steps 1–3 fail, there is no catalog change. If the process dies after the
-PUT but before step 6, the object is unreferenced garbage. If the transaction
-outcome is ambiguous, reconnect and query the unique active ordinal plus
-commit identity; never append another ordinal based on an assumption.
+If upload fails, PostgreSQL does not change. If the process dies after upload
+but before database commit, it leaves an unreferenced object. If the process
+does not know whether the database commit succeeded, it reconnects and checks
+the expected segment/block row before doing anything else.
 
-The unique segment/ordinal key, expected prior tail, block hash, and fencing
-epoch make retries idempotent. Repeating a successful transaction must either
-observe the identical result or fail loud on different bytes/state.
+The unique segment and block number, previous tail, hash, and writer fence make
+retries safe. Repeating a successful commit must find the same result. Finding
+different bytes or state is corruption.
 
 The current live readable log may still expose a prepared event before this
 remote commit. The existing durable sequence lease bounds that window. An
@@ -483,43 +495,41 @@ are not reassigned.
 
 ### Metadata-only transactions
 
-Not every current Pebble batch accompanies a block. Metadata-only progress may
-commit directly to PostgreSQL when it has no dependency on uncommitted event
-bytes. Code must declare the dependency class; it may not infer safety from an
-empty block. Pending verifier, cursor, merge, compaction, and import state keep
-their current event-dependency rules.
+Some current Pebble batches do not accompany a block. They may commit directly
+to PostgreSQL only when they do not depend on uncommitted events. Callers must
+say which class a change belongs to; an empty block is not proof that a change
+is independent. Existing dependency rules for verifier, cursor, merge,
+compaction, and import state still apply.
 
-Batch low-value point mutations and use multi-row SQL rather than translating
-one Pebble batch into hundreds of round trips. Import-sized changes should use
-COPY into a temporary/staging table followed by one constrained merge
-transaction.
+Combine small updates into multi-row SQL instead of making hundreds of network
+round trips. Large imports should COPY into a staging table and then merge the
+staged rows in one checked transaction.
 
 ### Sealing and rotation
 
 Sealing converts the active database list into an immutable generation:
 
-1. Pin the active segment's committed block list at a catalog revision.
+1. Read the active segment's committed block list at one catalog revision and
+   keep that exact list for the rest of the operation.
 2. Generate the exact final header/footer and recipe using the existing
    segment format code. Upload and verify the header and footer objects.
-3. In one fenced transaction, assert that the active tail has not changed;
-   insert a generation and its ordered block rows; mark it visible; point the
-   logical segment at it; mark the segment sealed; and create the next active
-   logical segment with the next stable index.
+3. In one transaction, check the writer fence and confirm the active tail did
+   not change. Insert the generation and ordered block rows, make it current,
+   mark the segment sealed, and create the next active segment.
 4. Commit, then publish cache/reader notifications.
 
 No S3 rename or copy is involved. A crash before the transaction leaves
 unreferenced header/footer objects and the old active list. A crash after it
 leaves one complete sealed generation and one new active segment.
 
-The transaction may copy hundreds or a few thousand active block rows, which
-is infrequent at the measured rotation rate. If that is too costly, an
-immutable list object can optimize representation later, but it must not give
-up SQL-level validation or snapshot semantics without measurement.
+This transaction may copy hundreds or a few thousand block rows, but segment
+rotation happens only about 17 times per day in the measured deployment. If
+the transaction is too expensive, an immutable block-list object can be tested
+later. Do not trade away validation merely to predict an optimization.
 
 ### Compaction
 
-Compaction is copy-on-write at generation granularity and content-addressed at
-block granularity:
+Compaction never edits a published generation:
 
 1. Capture the source generation IDs and compaction input watermark in a
    short database snapshot. They remain immutable.
@@ -527,39 +537,40 @@ block granularity:
    tombstones, and build replacement frames and the exact new footer. Reuse
    old hashes for byte-identical unchanged frames; do not recompress them.
 3. Upload and verify every new block/header/footer object.
-4. In one fenced publication transaction, compare each segment's current
-   generation with the captured source. Insert complete new generations,
-   close old visibility intervals, CAS current pointers, and advance the
-   compaction watermark only through work represented by those generations.
-5. On a CAS conflict, discard or rebase the candidate. Never publish a recipe
-   computed from one generation over another generation's pointer.
+4. In one transaction, check the writer fence and verify that each current
+   generation is still the source read in step 1. Insert the new generations,
+   close the old generations' visibility ranges, change the current pointers,
+   and advance the compaction watermark.
+5. If a source pointer changed, discard the candidate or rebuild it from the
+   new source. Never publish a recipe built from an outdated generation.
 
-A chunk that updates several segments and one watermark publishes them in one
-transaction. Keep chunks small enough for bounded lock and WAL pressure. Heavy
-decode/rewrite/upload work never holds writer or catalog locks.
+A chunk that updates several segments and one watermark publishes all of them
+in one transaction. Keep chunks small enough to limit lock time and PostgreSQL
+write-ahead log (WAL) growth. Decoding, rewriting, and uploading happen outside
+database locks.
 
-An in-flight response that pinned the older recipe completes from that
-immutable generation; HTTP caches may retain it through the configured grace
-period. A later name lookup resolves the new generation and exposes its new
-ETag. Compaction no longer needs filesystem rename or a manifest rescan.
+An in-flight response keeps using the exact older recipe it started with; HTTP
+caches may retain it through the configured grace period. A later name lookup
+finds the new generation and its new ETag. Compaction no longer needs a
+filesystem rename or manifest rescan.
 
 ### Timestamp import and other rewrites
 
-Timestamp import uses the same generation CAS protocol as compaction. Its job
-progress, rules state, and generation pointer changes commit together at each
-declared job boundary. A rule database must not claim a segment was patched
-unless the corresponding generation is visible.
+Timestamp import uses the same “verify source, then replace pointer” protocol
+as compaction. Job progress, rule state, and generation changes commit together
+at each job boundary. Import state cannot say a segment was patched unless the
+new generation is visible.
 
-Long-running jobs pin source generation IDs, not filenames. Conflicts retry
-from the new current generation. Original import inputs remain operator-owned
-recovery inputs until the job reaches its terminal durable state; storing
-segment blocks remotely does not make a partially consumed CSV reproducible.
+Long jobs remember exact generation IDs, not filenames. If one is replaced,
+the job retries from the new generation. Operators must retain the original
+import input until the job finishes; remote segment storage cannot recreate a
+partially consumed CSV.
 
-Bootstrap live trees and merge namespaces are represented by the same
-`namespace` dimension. Lifecycle transitions atomically change typed/control
-metadata and retain all source generations required to resume. A first release
-may support steady-state migration only, but it must explicitly refuse an
-unsupported bootstrap/merge state rather than publish an incomplete archive.
+The `namespace` column distinguishes the main archive from bootstrap live data
+and merge data. A lifecycle transition updates its control metadata in the
+same transaction and retains every source generation needed after restart. A
+first release may migrate only steady-state archives, but it must reject other
+states instead of silently omitting their data.
 
 ### Archive planning and reads
 
@@ -571,67 +582,61 @@ continues to hold `sealedTipSeq` fixed with `beforeSeq`; it does not introduce
 a new token.
 
 Today `getSegment` and `getBlock` accept only the stable segment name (and a
-block ordinal), not a generation ID. They therefore resolve the current
-generation at the start of the request and pin that immutable recipe for the
-life of the response. Their ETags retain current semantics: the exact segment
-format checksum for `getSegment`, and that checksum plus ordinal for
+block number), not a generation ID. They therefore resolve the current
+generation at the start of the request and keep that exact recipe for the
+life of the response. Their ETags retain current behavior: the exact segment
+format checksum for `getSegment`, and that checksum plus block number for
 `getBlock`. A client whose planned checksum no longer matches the response
 has raced compaction/import and re-plans, just as it does when a local file was
 atomically replaced. Never splice references from two generations in one
 response.
 
-After resolving that pinned recipe, `getBlock`:
+After choosing that recipe, `getBlock`:
 
 1. checks the local content-addressed cache;
 2. otherwise GETs the known S3 key with bounded retries;
 3. verifies length and SHA-256 before decoding or returning it;
 4. populates the cache atomically.
 
-`getSegment` initially streams a virtual `.jss`: header, synthesized length
-prefixes, frames fetched with bounded parallel prefetch but emitted in order,
-and footer. Backpressure bounds memory. The response has the same bytes,
-content length, ETag semantics, and corruption checks as a materialized file.
-Range and conditional requests must operate on this virtual byte address space;
-a range may fetch only the intersecting immutable objects plus the necessary
-length prefixes. Materializing the generation in cache is an optimization, not
-a requirement for `http.ServeContent` compatibility.
+`getSegment` initially streams a `.jss` without first writing the whole file to
+disk. It sends the header, generated length prefixes, blocks, and footer in
+order. Blocks can be fetched in parallel, but memory stays bounded and output
+remains ordered. Content length, ETag, corruption checks, Range, and conditional
+requests keep their current behavior. A Range request fetches only the objects
+that overlap the requested bytes. Caching a complete `.jss` is optional.
 
-Do not issue one serial cross-region GET per block for dense downloads. The
+Do not issue one S3 GET at a time for a full-segment download. The
 cache, prefetch window, and S3 connection pool are required parts of the first
 implementation. An optional derived representation can later improve dense
 reads:
 
 - a fully materialized sealed `.jss` object per hot generation; or
-- immutable pack/extents containing several adjacent frames plus an index.
+- immutable packs containing several adjacent frames plus an index.
 
-These are caches. The canonical recipe remains per-block and every packed
-entry maps back to its expected block hash. A missing or stale pack falls back
-to canonical objects. Measure request cost and latency before adding this
-complexity.
+These are only caches. The per-block recipe remains the source of truth, and
+every packed entry keeps its expected block hash. If a pack is missing or
+stale, read the individual objects. Add packing only if measurements justify
+the extra code.
 
-Cold subscribe replay reads the same immutable generation recipes. The hot
-tail should be routed to the writer in the initial HA topology so it retains
-today's sub-block latency. Read replicas can serve sealed history and may
-follow committed active blocks with block-scale lag, but must not pretend they
-have the writer's in-memory readable log.
+Cold subscribe replay uses the same generation recipes. Initially, route the
+hot tail to the writer so clients keep today's sub-block latency. Other readers
+can serve sealed history and committed active blocks, but they do not have the
+writer's in-memory readable log.
 
-### Catalog snapshots and database replicas
+### Consistent plans and database replicas
 
-PostgreSQL `REPEATABLE READ` (or an equivalent explicitly tested query shape)
-makes each plan call internally consistent. The existing checksum/ETag retry
-contract handles generation changes between plan pages or later downloads;
+PostgreSQL `REPEATABLE READ`, or an equivalent tested query, makes each plan
+call internally consistent. The existing checksum/ETag retry
+rule handles generation changes between plan pages or later downloads;
 `sealedTipSeq` prevents newly sealed tail data from moving the requested
-sequence snapshot. A future additive API may carry an authenticated archive
-ID + catalog commit/generation token to bind downloads directly to retained
-generations, but this design does not require a wire change.
+sequence snapshot. No wire change is required.
 
-An asynchronous read replica may serve archive plans only with a measured lag
-bound no larger than the accepted compaction/cache grace, and only while all
-generations it can expose remain physically retained. Otherwise use the
-primary. Writer leadership, cursor resolution, sequence allocation, lifecycle
-changes, and compaction publication always use the authoritative writer
-endpoint. Never combine a recipe from one database snapshot with block
-descriptors from another.
+A read replica may serve archive plans only when its measured lag is within
+the accepted cache grace and all generations it can return are still stored.
+Otherwise, use the primary. Leadership, cursor resolution, sequence
+allocation, lifecycle changes, and compaction publication always use the
+primary. A response must get its recipe and block descriptions from the same
+database snapshot.
 
 ### Failover and fencing
 
@@ -639,35 +644,37 @@ A candidate writer performs this startup sequence:
 
 1. Open PostgreSQL and validate archive identity/schema/configuration.
 2. Acquire the archive advisory lock on one dedicated session.
-3. Reconcile and advance the S3 sequence ceiling as described below.
+3. Read and advance the S3 sequence ceiling as described below.
 4. In a transaction, register any abandoned local/remote sequence space,
-   increment `writer_epoch`, and record the new identity and ceiling token.
+   increment the `writer_epoch` fence, and record the new identity, ceiling
+   ETag, and reservation ID.
 5. Rebuild active writer state, block descriptors, gaps, and the readable-log
    start from PostgreSQL. Verify the active tail's referenced objects before
    accepting input.
 6. Start producers and only then advertise write/live readiness.
 
-Loss of the lock session, failure to assert the epoch, or inability to commit
-causes immediate write-readiness loss and producer shutdown. The process must
-also stop publishing new in-memory live events; continuing to serve cold
-immutable history is a separate readiness decision.
+If the lock connection is lost, a fence check fails, or commits stop working,
+the process becomes write-unready and stops its producers. It must also stop
+publishing new in-memory live events. It may continue serving immutable
+history if that separate read path is healthy.
 
 An old writer can have uploaded objects and can have exposed events within its
-reserved seq lease, but cannot publish database references after fencing. Its
-uploaded objects become garbage and its possibly observed seqs become an
+reserved sequence lease, but cannot publish database references after a new
+writer takes over. Its uploaded objects become garbage and its possibly
+observed sequence numbers become an
 explicit vacancy. New leadership does not scan S3 to infer what happened.
 
-PostgreSQL HA is configured outside Jetstream, but Jetstream must test its
-promises. An infrastructure failover that loses an acknowledged synchronous
-transaction is database corruption from Jetstream's point of view and invokes
-the remote sequence rollback protocol; it is not normal at-least-once replay.
+The operator configures PostgreSQL high availability, but Jetstream must test
+the result. If
+database failover loses an acknowledged synchronous transaction, Jetstream
+treats it as rollback and uses the remote sequence recovery protocol below.
 
 ## Sequence safety across PostgreSQL rollback
 
-The existing `seq/max_reserved` and `seq/gap/*` protocol prevents reuse after
-a process crash against intact local state. It cannot by itself survive
-restoring PostgreSQL to an earlier point, because both the used frontier and
-lease would rewind.
+The existing `seq/max_reserved` and `seq/gap/*` records prevent reuse after a
+normal process crash. They are stored in the database, so restoring an older
+database would also restore an older sequence reservation. A separate value in
+S3 prevents reuse in that case.
 
 Maintain a small, independently conditional S3 object:
 
@@ -681,55 +688,65 @@ Maintain a small, independently conditional S3 object:
 }
 ```
 
-The exclusive ceiling is monotonically increased with `If-Match` against the
-last ETag. It is never part of PostgreSQL backup restoration and never expires.
-The safe protocol is based on writer sessions, not on detecting rollback:
+The ceiling is the first sequence number not reserved for a writer. It
+only increases. Jetstream updates it with `If-Match` against the last ETag. It
+is not stored in PostgreSQL backups and never expires.
+
+Let `R` be the ceiling read from S3 and `G` be the configured range size:
 
 1. Before a new writer session exposes any event, it reads the remote ceiling
-   `R`, conditionally replaces it with `R + grant`, and verifies the outcome.
-2. The session starts allocation no lower than old `R`. If PostgreSQL's exact
-   coverage frontier is below `R`, it atomically registers the entire interval
-   `[frontier, R)` as a vacancy with reason `writer_failover` or
+   `R`, conditionally replaces it with `R + G`, and verifies the outcome.
+2. The session starts allocation no lower than old `R`. If PostgreSQL's next
+   durable sequence is below `R`, it atomically registers the entire interval
+   `[next_seq, R)` as a vacancy with reason `writer_failover` or
    `database_restore`.
-3. It durably records the new exclusive ceiling and local one-block lease in
-   PostgreSQL before publication. It may allocate within `[R, R+grant)`.
-4. Before exhausting that grant, the same fenced session conditionally extends
-   the remote ceiling and records the new grant locally. Failure stops intake
+3. It records the new ceiling and local one-block lease in PostgreSQL before
+   publishing events. It may allocate within `[R, R+G)`.
+4. Before exhausting that range, the same writer conditionally extends the
+   remote ceiling and records the new range locally. Failure stops intake
    before the boundary.
 5. Every leadership acquisition or database reconnect burns the unused tail
    up to the previously published remote ceiling. It never resumes halfway
    through an old remote grant, even if PostgreSQL appears current.
 
-Burning on every writer session is essential. A PITR snapshot can contain the
-same remote grant end but an earlier `seq/next`; trying to infer “no rollback”
-from equality would reuse seqs consumed later in that grant.
+Every new writer must discard the unused part of the previous writer's range.
+An old database backup may remember the correct range end but forget some
+sequence numbers already used inside the range. Reusing that range would give
+those sequence numbers to different events.
 
-Choose grant size from peak event rate, acceptable S3-control outage, and
-acceptable gap consumption. It should make control PUTs rare without burning
-an alarming fraction of the `1e15` cursor namespace during failover tests.
-Prefetch the next grant before it is needed. The steady block upload path does
+For example, suppose S3 says all numbers below 1,000,000 were reserved, while
+the restored database says the next number is 990,000. The new writer records
+`[990000, 1000000)` as an intentional gap. It then raises the S3 ceiling and
+starts at 1,000,000. This can create duplicates after relay replay, which the
+protocol already allows, but it cannot reuse an observed sequence number.
+
+Choose the range size from peak event rate, desired operation during an S3
+control outage, and the acceptable gap after failover. It should avoid frequent
+control writes without wasting a large part of the `1e15` sequence space.
+Reserve the next range before it is needed. The steady block upload path does
 not update the control object.
 
-An ambiguous conditional PUT is reconciled by GET and matching
-`reservation_id`. If another value won, abandon the attempted range and retry
-from the observed ceiling. Never decrement or overwrite unconditionally.
+If a PUT times out and its result is unknown, GET the control object and compare
+`reservation_id`. If another writer's value won, abandon the attempted range
+and retry from the new ceiling. Never decrease the ceiling or overwrite it
+without a condition.
 
-The control object must live in a bucket/region that remains reachable during
-writer promotion. If it is irretrievably lost, Jetstream cannot prove that the
-old cursor namespace is safe. Recovery then requires restoring that authority
-or deliberately creating a new archive identity with an explicit client-visible
-discontinuity; guessing a high number is not a protocol.
+The control object must remain reachable during writer promotion. If it is
+lost, Jetstream cannot prove that old sequence numbers are safe. Recovery must
+restore the object or create a new archive identity and explicitly tell clients
+that the cursor namespace changed. Choosing an arbitrary high number is unsafe.
 
 ## Garbage collection and retention
 
-Content addressing makes leaks safe and premature deletion dangerous. GC is
-therefore conservative, catalog-driven, and delayed.
+Leaking an object wastes money but loses no data. Deleting one too early can
+make the archive unreadable. Garbage collection (GC) is therefore conservative
+and delayed.
 
 An object is live if referenced by any of:
 
 - an active segment block/header;
-- a generation whose visibility interval is current or within plan/cache grace;
-- an in-flight response, rewrite, migration, export, or repair pin;
+- a generation that is current or still within the HTTP cache grace period;
+- an in-flight response or active rewrite, migration, export, or repair job;
 - a database recovery point within the supported PITR window;
 - an explicit legal/operational hold.
 
@@ -758,7 +775,8 @@ Deletion protocol:
    `available` after the claim resolves.
 4. Delete the known S3 key/version. With versioning, retain noncurrent versions
    according to the disaster-recovery policy.
-5. Mark the row deleted. Retries reconcile HEAD/version state idempotently.
+5. Mark the row deleted. A retry checks HEAD/version state and safely continues
+   from the last completed step.
 
 Never attach a blanket S3 lifecycle expiration rule to `objects/`. Lifecycle
 rules may clean incomplete multipart uploads and, after a deliberately longer
@@ -766,9 +784,9 @@ period, old versions/delete markers. S3 Inventory compares physical objects
 with catalog rows and finds unexpected orphans; discrepancies produce reports,
 not automatic catalog reconstruction.
 
-Old catalog generation rows can be pruned only after their object/PITR window
-ends. Retaining their small recipes longer than their objects is useful for
-auditing but must clearly mark the physical availability interval.
+Old generation rows can be removed only after the object-retention and PITR
+window ends. Recipes may be kept longer for audit, but they must clearly show
+when their objects are no longer available.
 
 ## Caching and local resource behavior
 
@@ -779,11 +797,11 @@ The disaggregated backend may use local SSD for:
 - optional materialized `.jss` generation cache;
 - multipart upload buffers when streaming is unavailable.
 
-The cache is never authoritative. Entries are named by SHA-256, written to a
-temporary file, verified, fsynced when reuse across process crash matters, and
-atomically renamed. Eviction cannot affect correctness. Cache corruption is a
-miss followed by re-fetch; repeated hash disagreement is an internal/provider
-error and removes readiness.
+The cache is never a source of truth. Cache files are named by SHA-256. Write
+them to temporary files, verify them, fsync them when they should survive a
+process crash, and then rename them atomically. Eviction cannot lose archive
+data. A corrupt cache entry is deleted and fetched again. Repeated hash
+mismatches make the service unready and trigger an alert.
 
 Use request coalescing so concurrent misses for one hash cause one S3 GET.
 Separate concurrency and bandwidth limits for foreground block reads,
@@ -798,10 +816,10 @@ loss. Local mode retains its existing crash-loud disk semantics.
 
 ### PostgreSQL (selected)
 
-PostgreSQL matches the required shape:
+PostgreSQL provides the features this design needs:
 
-- atomic transactions across opaque KV mutations, catalog rows, writer state,
-  and generation publication;
+- atomic transactions across existing key/value metadata, catalog rows,
+  writer state, and generation publication;
 - conditional updates, constraints, advisory locks, and fencing rows;
 - ordered `bytea` keys and efficient point/range access;
 - COPY/bulk operations for migration/import;
@@ -809,11 +827,10 @@ PostgreSQL matches the required shape:
 - enough throughput for the measured hundreds of metadata reads per second
   and block-scale write transactions, subject to benchmark.
 
-Use a direct PostgreSQL-compatible service with well-defined synchronous
-durability and failover. RDS PostgreSQL is the conservative baseline. Aurora
-PostgreSQL is plausible, but its failover, replica visibility, storage
-semantics, and latency must pass the same chaos suite; “PostgreSQL compatible”
-does not waive validation.
+Use a service with clearly documented synchronous durability and failover. RDS
+PostgreSQL is the conservative baseline. Aurora PostgreSQL may also work, but
+its failover, replica lag, storage behavior, and latency must pass the same
+failure tests. API compatibility alone is not enough.
 
 The implementation likely needs a dependency-whitelist exception for
 `github.com/jackc/pgx/v5` and its narrow transitive set. The AWS SDK v2 S3 and
@@ -823,28 +840,27 @@ credential/config modules likewise need explicit approval. Avoid an ORM.
 
 | Database | Strength | Why it is not the initial choice |
 | --- | --- | --- |
-| DynamoDB | Managed, highly available, natural KV | Cross-item transactions have size/count limits; ordered scans, generation recipes, import publication, and local testing become more specialized. It also couples the design more tightly to AWS. |
-| CockroachDB | Serializable distributed SQL and multi-region options | Higher operational/query complexity and a less conservative dependency/behavior surface than needed for one writer. Worth revisiting for multi-region requirements. |
+| DynamoDB | Managed, highly available, natural key/value model | Cross-item transactions have size/count limits; ordered scans, generation recipes, import publication, and local testing become more specialized. It also couples the design more tightly to AWS. |
+| CockroachDB | Serializable distributed SQL and multi-region options | More operational and query complexity than one writer needs. Revisit it if multi-region writes become a requirement. |
 | Google Cloud Spanner | Strong transactions and excellent HA | Vendor-specific, expensive at this scale, and a poor fit for AWS/S3-first operators. |
-| FoundationDB | Excellent ordered transactional KV primitive | Operational specialization, C client/runtime dependency, and no benefit sufficient to outweigh PostgreSQL familiarity. |
-| etcd/Consul | Strong small control-state stores | The archive catalog and migration/import workload are well beyond their intended database shape. |
-| Redis-compatible stores | Low latency | Persistence/failover and multi-row archival correctness are not a comfortable authority for this data. |
+| FoundationDB | Excellent ordered transactional key/value store | Operational specialization, a C client/runtime dependency, and no benefit sufficient to outweigh PostgreSQL familiarity. |
+| etcd/Consul | Strong small control-state stores | The archive catalog and migration/import workload are much larger and more complex than their intended use. |
+| Redis-compatible stores | Low latency | Their persistence, failover, and multi-row transaction model is a poor fit for archive authority. |
 | Cassandra/ScyllaDB | High write availability | Lacks the straightforward cross-entity transaction boundary this design relies on. |
 | Object-store manifests only | Simple physical architecture | Requires conditional replacement of large mutable manifests, makes metadata queries/scans awkward, and cannot atomically bind cursor/verifier/lifecycle state to blocks. |
 | Pebble on network/block storage | Minimal code change | Retains single-node filesystem semantics and slow/fragile failover; mounting S3 as a filesystem is especially unsafe. |
 
-If PostgreSQL benchmarks fail, first reduce chatty reads with multi-get and
-safe caches. Do not weaken the block/metadata transaction boundary to chase
-latency. A different authoritative database must demonstrate the same atomic
-and ordered semantics through the oracle and fault suite.
+If PostgreSQL is too slow, first combine reads and add safe caches. Do not split
+the block and metadata transaction to save latency. Any replacement database
+must pass the same ordering, oracle, and failure tests.
 
 ## Backend boundaries and code organization
 
 Do not hide the difference behind `vfs.FS`. Local append/fsync/rename and
-remote upload/transaction/generation-CAS are different protocols. Model the
-operations Jetstream actually needs.
+remote upload/database/generation replacement are different protocols. Model
+the operations Jetstream actually needs.
 
-A likely internal shape is:
+The internal interfaces may look like this:
 
 ```go
 type DurableWriter interface {
@@ -865,15 +881,15 @@ type ObjectStore interface {
 }
 ```
 
-The real API should make it impossible to commit an event-dependent metadata
-batch separately after a remote block. `ObjectStore` is lower-level and cannot
-publish catalog references. Generation publication and rewrite CAS belong to
-the database-backed catalog, not to general object methods.
+The real API must prevent event-dependent metadata from being committed
+separately from its block. `ObjectStore` can upload and read bytes, but it
+cannot publish them in the catalog. The database-backed catalog owns generation
+publication and checked pointer replacement.
 
 Suggested packages:
 
 ```text
-internal/storage/                 invariant-level backend contracts
+internal/storage/                 backend contracts that enforce storage rules
 internal/storage/local/           adapters around segment + Pebble + manifest
 internal/storage/disaggregated/   PostgreSQL protocols and recipes
 internal/objectstore/s3/          narrow S3 implementation, checksums, retries
@@ -895,10 +911,10 @@ Expected touchpoints:
   exact prepared frames and deterministic header/footer assembly without
   requiring an appendable file.
 - `internal/subscribe/replay.go`: recipe-backed cold reader and cache.
-- `internal/xrpcapi/getsegment.go`, `getblock.go`, `plansnapshot.go`: generation
-  tokens and virtual materialization.
-- compaction/timestamp/orchestrator: source-generation pins and transactional
-  CAS publication.
+- `internal/xrpcapi/getsegment.go`, `getblock.go`, `plansnapshot.go`: checksums,
+  generation-consistent reads, and streaming `.jss` reconstruction.
+- compaction/timestamp/orchestrator: exact source-generation references and
+  transactional pointer replacement.
 - `internal/jetstreamd`: backend selection, role/readiness, connection
   lifecycle, graceful fencing, and startup validation.
 - status/diskspace/metrics: remote protection and cache capacity replace local
@@ -910,9 +926,9 @@ includes stable archive ID, PostgreSQL DSN/secret reference, S3 bucket/prefix,
 region/endpoint, cache directory/size, and writer versus reader role. Validate
 the entire set at startup. Never place credentials in the committed `.env`.
 
-Schema migrations are explicit, versioned, forward-compatible, and normally
-run by one operator job or the fenced writer before readiness. Reader binaries
-must reject a schema newer than they understand.
+Database schema migrations are explicit and versioned. One operator job or the
+current writer runs them before the service becomes ready. A reader must reject
+a schema version newer than it understands.
 
 ## Availability and disaster recovery
 
@@ -920,42 +936,43 @@ must reject a schema newer than they understand.
 
 | Failure | Behavior |
 | --- | --- |
-| S3 PUT unavailable | Retry within a bounded policy; block cannot commit. Intake applies backpressure and eventually becomes unready before sequence grants are violated. |
+| S3 PUT unavailable | Retry for a limited time. The block cannot commit. Slow and then stop intake before reserved sequence space runs out. |
 | PostgreSQL unavailable before transaction | Uploaded object may be orphaned; no durable block is claimed. Stop metadata-dependent intake. |
-| Ambiguous PostgreSQL commit | Query by fence/segment/ordinal/idempotency identity before retrying. |
-| S3 GET unavailable | Cached reads continue; misses return retryable errors/unready rather than fabricated gaps. Writes also stop when objects cannot be verified. |
-| Object hash mismatch/missing referenced key | Internal corruption: quarantine cache entry, retry a bounded independent read, alert and remove affected readiness. Never skip the block. |
-| Writer process/pod loss | New process fences, advances remote ceiling, registers abandoned seq space, verifies active tail, and resumes without archive download. |
+| PostgreSQL commit result is unknown | Look up the writer fence, segment, and block number before retrying. |
+| S3 GET unavailable | Cached reads continue. Cache misses return a retryable error instead of skipping data. Writes stop when newly uploaded objects cannot be verified. |
+| Object hash mismatch or referenced object missing | Delete any cache copy and retry the known S3 key a limited number of times. Alert and become unready. Never skip the block. |
+| Writer process/pod loss | A new process takes leadership, advances the remote ceiling, records abandoned sequence space, verifies the active tail, and resumes without downloading the archive. |
 | Cache disk loss | Performance degradation only. Recreate from catalog + S3. |
-| PostgreSQL primary failover | Reconnect through new leadership protocol; never continue an old writer epoch. |
+| PostgreSQL primary failover | Reconnect through the leadership protocol; never continue using the old fence number. |
 
-Backpressure must be bounded. Do not retain unbounded encoded blocks or events
-in memory through a long S3/database outage. Stop upstream consumers at a safe
-point and rely on relay replay within its retention window, while exposing the
-safe cursor age as an urgent metric.
+Memory use must stay bounded during an outage. Do not keep accumulating encoded
+blocks or events while S3 or PostgreSQL is unavailable. Stop upstream consumers
+at a safe point and rely on relay replay, while prominently reporting the age
+of the saved relay cursor.
 
 ### Backup and regional DR
 
-PostgreSQL PITR captures catalog and metadata. S3 versioning/replication or an
-independent object backup protects objects. Their retention windows are
-coordinated as described under GC; a database backup alone is not a complete
-archive backup.
+PostgreSQL PITR captures the catalog and metadata. S3 versioning, replication,
+or an independent object backup protects objects. Their retention windows are
+coordinated as described under garbage collection. A database backup alone is
+not a complete archive backup.
 
-Regularly create a recovery attestation containing archive ID, PostgreSQL
-backup/LSN range, catalog commit, object-retention lower bound, remote sequence
-ceiling, and sampled/full recipe verification. This is an audit record, not a
-second catalog.
+Regularly create a recovery report containing the archive ID, PostgreSQL backup
+and log position, catalog revision, oldest retained object, remote sequence
+ceiling, and recipe verification results. This is an audit record, not another
+catalog.
 
 Recovery procedure:
 
 1. Fence or prove the old writer is gone.
 2. Restore PostgreSQL to the chosen supported point.
-3. Point at the retained/replicated immutable object set and audit all active
-   plus sampled sealed recipes (full audit may run in background only if the
-   operator explicitly accepts that availability tradeoff).
-4. Contact the original monotonic sequence-control authority, advance it, and
-   register the restoration vacancy.
-5. Reconcile the saved safe relay cursor with actual upstream retention.
+3. Use the retained or replicated S3 objects. Verify every active recipe and a
+   sample of sealed recipes. A full check may run in the background only if the
+   operator accepts the risk of opening sooner.
+4. Read and advance the original sequence-control object, then record the gap
+   created by the restore.
+5. Confirm that upstream still retains the saved relay cursor needed for
+   catch-up.
 6. Catch up, verify invariants, then open write and live readiness.
 
 If S3 replication lags the restored database, choose an older database point
@@ -963,43 +980,45 @@ whose objects are known present; never advance a relay cursor past missing
 objects. If the original control authority is unreachable after a regional
 loss, stay read-only or start a deliberately new archive/cursor namespace.
 
-Run restoration drills. RPO/RTO remain benchmark- and infrastructure-gated;
-the architecture removes the multi-terabyte local restore from ordinary
-writer failover but not from every regional catastrophe.
+Run restoration drills. Recovery point and recovery time goals depend on the
+chosen database and S3 setup. Ordinary writer failover no longer requires a
+multi-terabyte download, but regional recovery may still take substantial
+time.
 
 ## Migration and rollout
 
 ### Existing archive migration
 
-Migration must preserve exact bytes and never create two authorities. A safe
-steady-state path is:
+Migration must preserve exact bytes and must never run two active writers. A
+safe path for an archive already in steady state is:
 
 1. Provision the PostgreSQL schema, bucket, archive identity, retention, cache,
    credentials, dashboards, and sequence control object.
 2. While local Jetstream remains authoritative, scan immutable sealed `.jss`
    generations. Parse exact headers/frames/footers, hash and upload them, and
-   stage catalog rows as not-yet-visible migration data. Verify reconstruction
-   hashes. This bulk phase may be restarted and deduplicates naturally.
-3. Continuously pre-stage newly sealed local segments. Do not call this a
-   mirrored commit or use it for serving.
-4. Enter a planned maintenance barrier: stop producers, drain the writer,
+   stage catalog rows without making them visible. Reconstruct files and verify
+   their hashes. This bulk phase is restartable and automatically reuses
+   objects already uploaded.
+3. Continue staging newly sealed local segments. They are not committed remote
+   archive data and must not be served yet.
+4. Start a planned maintenance window: stop producers, drain the writer,
    finish active segment sealing or capture it through a defined conversion,
    stop compaction/import publication, and take an exact logical export of all
    Pebble metadata plus current segment generations.
 5. Upload the remaining objects. In one migration publication transaction,
-   import compatible KV state, validate sequence/relay/lifecycle/compaction
-   frontiers against the recipes, publish all current generations, and create
-   writer control state.
-6. Initialize/advance the independent remote sequence ceiling beyond every
-   possibly client-observed local seq and record the required vacancy/grant.
+   import compatible key/value state, compare sequence, relay, lifecycle, and
+   compaction positions with the recipes, publish all current generations,
+   and create writer control state.
+6. Move the remote sequence ceiling past every sequence number that a client
+   might have seen. Record the resulting gap and the new reserved range.
 7. Start a disaggregated reader, run full coverage and sampled byte/event
    comparisons, then start the fenced writer and reopen traffic.
 8. Retain the stopped local data directory read-only through a rollback safety
    period. It is evidence, not a concurrently writable replica.
 
-Migrating during bootstrap, merge, or an active timestamp import requires a
-phase-specific proof. The first migration tool should refuse those states and
-require completion/quiescence.
+The first migration tool should refuse to run during bootstrap, merge, or an
+active timestamp import. Supporting those states later requires a separate
+correctness design.
 
 Returning to local mode after disaggregated writes is an export operation with
 an outage: materialize every current generation and export compatible metadata
@@ -1007,25 +1026,25 @@ at one catalog commit. Changing the environment variable alone is not rollback.
 
 ### Delivery stages
 
-1. **Format seams:** exact frame/header/footer extraction and reconstruction,
-   generation recipe validation, no behavioral change.
+1. **Format support:** extract and reconstruct exact frames, headers, and
+   footers; validate recipes; make no behavior change.
 2. **Storage contracts:** adapt local mode through invariant-level interfaces;
    oracle output must remain identical.
-3. **PostgreSQL metadata compatibility:** KV encoding/iteration suite, schema,
-   migrations, fencing, and transaction fault tests.
+3. **PostgreSQL metadata compatibility:** key/value encoding and iteration
+   tests, schema, migrations, fencing, and transaction failure tests.
 4. **S3 object layer:** conditional creates, checksum verification, retries,
-   cache, inventory audit, and provider conformance tests.
+   cache, inventory audit, and real-provider behavior tests.
 5. **Disaggregated ingest:** block commit, seal/rotation, seq ceiling, failover,
    and active cold replay.
-6. **Read APIs:** checksum-consistent plans, pinned virtual segment streaming,
-   reader replicas, and load tests.
+6. **Read APIs:** checksum-consistent plans, generation-consistent segment
+   streaming, reader replicas, and load tests.
 7. **Rewriters:** compaction, timestamp import, bootstrap/merge, and GC.
 8. **Shadow production:** local remains authoritative; asynchronously upload
    and compare recipes/reads without serving or publishing remote commits.
 9. **Canary archive:** disaggregated authority on a disposable/rebuildable
    deployment, followed by failover and restore drills.
 10. **Existing production migration:** only after correctness, performance,
-    cost, and operational gates pass.
+    cost, and operational requirements pass.
 
 Feature flags must not permit local and disaggregated writers for the same
 archive. Prefer one explicit backend choice over a long-lived dual-write mode;
@@ -1033,44 +1052,45 @@ cross-system dual writes cannot be made atomic and create an ambiguous owner.
 
 ## Observability and operations
 
-Every metric is labeled by backend and archive identity where cardinality is
-bounded. At minimum expose:
+Keep metric labels bounded. At minimum, dashboards should answer these
+questions:
 
-- block prepare/upload/verify/database-commit latency histograms and bytes;
-- object dedup hit, upload retry, ambiguous result, checksum failure, and
-  orphan/staging counts;
-- PostgreSQL pool saturation, query/transaction latency, rollback/deadlock,
-  primary/replica replay position, catalog commit, and schema version;
-- writer leadership state, epoch, advisory-lock loss, fence rejection, and
-  time since last successful durable block;
-- exact seq frontier, local lease end/headroom, remote ceiling/headroom,
-  reservation attempts, burned vacancies, and namespace remaining;
-- safe relay cursor age/lag using a meaningful upstream timestamp, not numeric
-  subtraction of opaque relay cursors;
-- active segment block count/age, seal latency, generation publish conflicts,
-  old generation/pin counts;
-- cache hit bytes/requests, miss coalescing, eviction, corruption, disk usage,
-  foreground/background queue depth, and S3 GET latency;
-- virtual segment time-to-first-byte, throughput, per-response object count,
-  and client cancellation;
-- compaction/import blocks reused, changed, uploaded, bytes avoided, source
-  conflicts, and publish transaction time;
-- GC candidates by state/age, protected bytes by reason, deletes, inventory
-  discrepancies, and minimum retained recovery timestamp;
-- database PITR horizon versus object delete horizon as one explicit safety
-  gauge;
-- recovery audit age, last verified catalog commit, missing object count, and
-  restore/failover drill results.
+- **Are writes healthy?** Show block preparation, upload, verification, and
+  database commit latency and bytes. Also show upload retries, unknown results,
+  checksum failures, deduplication hits, and unreferenced uploads.
+- **Does the current writer still own the archive?** Show writer identity,
+  fence number, lock loss, rejected stale writes, and time since the last
+  durable block.
+- **Can sequence allocation continue safely?** Show `seq/next`, the local lease
+  end, remaining remote range, reservation attempts, discarded ranges, and
+  remaining sequence namespace.
+- **Can upstream replay recover an outage?** Show the age of the safe relay
+  cursor using an upstream timestamp. Relay cursor numbers are opaque and must
+  not be subtracted to estimate lag.
+- **Is PostgreSQL healthy?** Show pool use, query and transaction latency,
+  rollbacks, deadlocks, primary/replica lag, catalog revision, and schema
+  version.
+- **Are reads healthy?** Show cache hit rate and bytes, coalesced misses,
+  eviction, corruption, disk use, S3 GET latency, queue depths, segment
+  time-to-first-byte, throughput, objects per response, and cancellations.
+- **Are rewrites efficient?** Show reused, changed, and uploaded blocks; bytes
+  avoided; source-generation conflicts; sealing time; and publication time.
+- **Is deletion safe?** Show GC objects by state and age, protected bytes by
+  reason, inventory differences, the oldest recoverable timestamp, and one
+  alertable comparison between the database PITR window and S3 deletion time.
+- **Can we recover?** Show the age and catalog revision of the last recovery
+  audit, missing objects, and results from failover and restore drills.
 
-Trace one block from preparation through object ensure and SQL commit, but do
-not create one span per archived event. Logs use bounded archive, generation,
-segment, ordinal, hash prefix, epoch, and commit identifiers; never log DSNs,
-credentials, event bodies, or unbounded provider responses.
+Trace one block from preparation through S3 verification and database commit.
+Do not create one trace span per event. Logs may include bounded archive,
+generation, segment, block number, hash prefix, fence, and commit identifiers.
+Never log database connection strings, credentials, event bodies, or large S3
+responses.
 
 Readiness is component-specific:
 
-- writer readiness requires current fence, usable PostgreSQL primary, remote
-  sequence headroom, and successful object writes/verifications;
+- writer readiness requires the current fence, a usable PostgreSQL primary,
+  remaining remote sequence range, and successful S3 writes and checks;
 - archive-read readiness requires catalog access plus S3 or sufficient cache;
 - live readiness requires the writer's readable log and lifecycle cutover;
 - a replica beyond the configured safe-lag/cache-grace bound is not ready for
@@ -1081,24 +1101,24 @@ exposing secrets.
 
 ## Verification strategy
 
-### Deterministic protocol tests
+### Crash tests for each protocol step
 
-Build model/fake object and transaction layers with crashpoints before and
-after every externally visible phase:
+Build fake S3 and database implementations. Add crashpoints before and after
+every step that changes persistent state:
 
 - object registration, PUT, timeout, verification, and availability mark;
 - SQL begin, fence assertion, block row, each metadata class, commit send,
   ambiguous response, and commit acknowledgement;
-- active-tail assertion, header/footer upload, generation insert, pointer CAS,
+- active-tail check, header/footer upload, generation insert, pointer change,
   old visibility close, watermark/job progress, and notification;
 - advisory lock loss, PostgreSQL disconnect, S3 ceiling conditional update,
   ambiguous reservation, vacancy registration, and new epoch;
-- GC mark, claim, last-reference recheck, physical delete, and row completion.
+- GC mark, claim, final reference check, S3 delete, and row completion.
 
-After every injected crash, reopening must produce exactly one of: old state
-plus garbage, or fully committed new state. It must never produce a referenced
-missing object, metadata ahead of data, duplicate ordinal, reused seq, advanced
-watermark without generations, or two accepted writer epochs.
+After every injected crash, restart must find either the old state plus harmless
+objects or the complete new state. It must never find a missing referenced
+object, metadata ahead of data, a duplicate block number, a reused sequence,
+an advanced watermark without its generations, or two valid writers.
 
 ### Format/property/fuzz tests
 
@@ -1106,10 +1126,10 @@ watermark without generations, or two accepted writer epochs.
   byte-for-byte identical `.jss` files.
 - Decode local and virtual readers and compare events, block descriptors,
   footer indexes, selection plans, and corruption errors.
-- Fuzz malformed recipes, lengths, ordinals, hashes, headers, footers, plan
-  tokens, cache files, and provider responses with strict allocation bounds.
-- Property-test local Pebble and PostgreSQL KV ordering, prefix bounds, deletes,
-  batches, and integer encodings over randomized byte keys.
+- Fuzz malformed recipes, lengths, block numbers, hashes, headers, footers,
+  cache files, and S3 responses. Keep strict memory allocation limits.
+- Compare local Pebble and PostgreSQL key ordering, prefix bounds, deletes,
+  batches, and integer encodings over randomly generated byte keys.
 - Prove generation visibility at catalog-commit boundaries under randomized
   compaction/import publication.
 
@@ -1121,21 +1141,21 @@ Run the full oracle against both backends. Add seeded scenarios for:
 - database failover and stale replica reads;
 - S3 delay, throttling, lost responses, corrupt cache/provider bytes, and
   missing referenced objects;
-- writer split-brain attempts and fencing;
+- attempts to run two writers and the resulting fencing;
 - database PITR behind client-observed seqs;
 - compaction/import racing plans and long-lived cold replay;
 - bootstrap, merge, repair, and relay replay across failover;
 - GC racing dedup/republication and PITR-window retention.
 
-Curated mutants should remove/reorder upload verification, fence checks,
-block+cursor atomicity, remote ceiling advance, vacancy registration,
-generation CAS, visibility pinning, and GC last-reference checks. The campaign
-must demonstrate that the relevant oracle tier kills each one.
+Add deliberate test mutations that remove or reorder upload checks, writer
+fences, atomic block-and-cursor commit, remote ceiling updates, gap
+registration, source-generation checks, response pinning, and GC's final
+reference check. The mutation campaign must catch every one.
 
-### Real-service conformance and chaos
+### Real service and failure tests
 
-Fakes cannot establish cloud semantics. Test supported S3 providers and the
-chosen managed PostgreSQL topology for:
+Fakes cannot prove how a managed service behaves. Test every supported S3
+provider and PostgreSQL setup for:
 
 - concurrent `If-None-Match`/`If-Match`, multipart completion, timeout
   ambiguity, checksum headers, versioning, and immediate known-key reads;
@@ -1148,9 +1168,9 @@ chosen managed PostgreSQL topology for:
 Run periodic production restore drills into an isolated archive identity until
 the audit completes; never let a drill contend for the real writer fence.
 
-### Performance and cost gates
+### Performance and cost requirements
 
-Measure, rather than assume:
+Measure all of the following before production use:
 
 - sustained and burst ingest with PUT + synchronous SQL commit;
 - p50/p95/p99 block commit and live-delivery lag;
@@ -1184,8 +1204,6 @@ but virtual read fan-out or database round trips could be.
   part of readiness and must be tested.
 - Bucket policy should deny public access, unencrypted transport, and
   unconditional overwrite of protected control data where expressible.
-- Authenticate any future generation-bound download token and bind it to the
-  archive/configuration so it cannot select another tenant's generation.
 - Treat object bytes and database values as untrusted on read despite access
   controls: enforce size limits before allocation and verify hashes/formats.
 - Record administrative generation deletion, migration, schema change,
@@ -1193,9 +1211,10 @@ but virtual read fan-out or database round trips could be.
 
 ## Rejected shortcuts
 
-- **Periodic Pebble snapshots as primary durability:** leaves an RPO window,
-  makes failover a restore workflow, and requires coordinating arbitrary
-  segment/database points. Useful as backup, not the production commit path.
+- **Periodic Pebble snapshots as primary durability:** leaves a data-loss
+  window, turns failover into a restore, and requires matching a database
+  snapshot to the correct segment files. It is useful for backup, not as the
+  production commit path.
 - **One S3 object per complete segment:** simple reads, but compaction reuploads
   terabytes per day and active append remains awkward.
 - **Mutable object per active segment:** S3 has no atomic append. Repeated copy
@@ -1203,15 +1222,15 @@ but virtual read fan-out or database round trips could be.
   database block list.
 - **S3 LIST as manifest:** listings contain physical garbage and cannot
   atomically bind relay cursor, verifier state, or generations.
-- **Store blocks directly in PostgreSQL:** transactions become simple but
-  pushes multi-terabyte blob capacity, I/O, backup, and egress through the
-  expensive database tier.
+- **Store blocks directly in PostgreSQL:** transactions become simple, but this
+  pushes multi-terabyte storage, I/O, backup, and egress through the expensive
+  database tier.
 - **Database first, upload eventually:** creates acknowledged catalog state
   whose bytes can be permanently absent after a crash.
 - **Dual-write local and remote as co-authorities:** no atomic commit spans
   Pebble/filesystem/PostgreSQL/S3, so a failure cannot determine which archive
   owns the relay cursor.
-- **Resume inside a remote sequence grant after restart:** unsafe after PITR;
+- **Resume inside an old reserved sequence range after restart:** unsafe after PITR;
   the restored database can look consistent while forgetting later observed
   seqs in that same grant.
 - **Delete objects as soon as the current generation changes:** breaks
@@ -1220,7 +1239,7 @@ but virtual read fan-out or database round trips could be.
   does not serialize relay cursor, per-DID order, lifecycle, verifier state, or
   active segment topology.
 
-## Open, benchmark-gated decisions
+## Decisions that still require measurement
 
 The architecture is decided; these parameters and optimizations are not:
 
@@ -1231,21 +1250,23 @@ The architecture is decided; these parameters and optimizations are not:
    compatible providers.
 4. Cache size policy and whether active block frames should be synchronously
    retained locally after remote commit.
-5. When dense-read request economics justify full-generation or extent packs.
-6. Plan-token lifetime, old-generation grace, and the resulting minimum object
-   retention beyond database PITR.
+5. Whether S3 request count and download latency justify whole-generation or
+   multi-block cache objects.
+6. HTTP cache and old-generation grace periods, and the resulting
+   object-retention time beyond database PITR.
 7. Whether footer/header bytes should also be mirrored inline in PostgreSQL
    for small-read latency; S3 objects remain canonical if so.
 8. Catalog partitioning for tens or hundreds of millions of generation-block
    rows and how much descriptor data remains normalized versus encoded.
 9. Migration maintenance-window target and whether a local change journal is
    worth building to shorten it.
-10. Numerical RPO/RTO/SLOs for managed database failover, S3 outage headroom,
-    relay retention, regional recovery, and full integrity audit.
+10. Recovery point, recovery time, and availability targets for database
+    failover, S3 outages, relay retention, regional recovery, and full archive
+    verification.
 
-None of these may weaken upload-before-reference, atomic block+metadata commit,
-writer fencing, immutable generations, remote rollback protection, or
-PITR-aware garbage collection.
+No measurement or optimization may weaken upload-before-reference, atomic
+block-and-metadata commit, writer fencing, immutable generations, rollback
+protection, or PITR-aware garbage collection.
 
 ## Implementation exit criteria
 
@@ -1254,15 +1275,17 @@ The backend is production-ready only when:
 - local mode remains green and within its performance baseline;
 - the same oracle expectations pass on disaggregated mode, including restart,
   failover, compaction, import, bootstrap/merge, and archive-to-live cutover;
-- mutation tests prove the new ordering/fencing/GC invariants are observed;
-- a supported real S3 service and PostgreSQL HA topology pass conformance and
-  destructive failover tests;
+- mutation tests catch violations of the new write-order, fencing, and GC
+  rules;
+- a supported S3 service and PostgreSQL HA setup pass behavior and forced
+  failover tests;
 - an existing production-sized archive migrates and reconstructs with exact
   recipe/file/event comparisons;
 - database PITR is restored against retained objects and no seq is reused;
 - S3, database, KMS, and cache outage behavior is bounded and observable;
 - GC completes a full retention cycle without deleting anything reachable by
-  the oldest supported database recovery point, HTTP cache, or active pin;
+  the oldest supported database recovery point, HTTP cache, active read, or
+  active job;
 - dashboards, alerts, runbooks, capacity model, restore drill, credential
   rotation, and explicit operator configuration validation are complete;
 - measured throughput, tail latency, request cost, and recovery objectives are
