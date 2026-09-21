@@ -3,6 +3,7 @@ package jetstream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/stretchr/testify/require"
@@ -645,6 +647,123 @@ func TestEngineLiveOnly(t *testing.T) {
 		t.Fatal("live-only engine did not deliver within 5s")
 	}
 	require.Equal(t, []uint64{1, 2}, uniqueSeqs(events))
+}
+
+// TestEngineLiveOnlyTimestampCursorTransitionsToSeqResume is the end-to-end
+// regression for #349. The overloaded wire cursor accepts a legacy unix-
+// microsecond timestamp, but that timestamp is not a seq the caller already
+// consumed and must never seed the seq dedup floor. Until the first event is
+// delivered, reconnects retain the timestamp seek position; afterward they
+// resume from the highest real seq and deduplicate the inclusive overlap.
+func TestEngineLiveOnlyTimestampCursorTransitionsToSeqResume(t *testing.T) {
+	t.Parallel()
+
+	timestampCursor := seqspace.CursorSeqMaxThreshold + 123_456
+	beforeDelivery := &scriptedConn{steps: []readStep{
+		{err: errors.New("connection reset before first event")},
+	}}
+	translatedReplay := &scriptedConn{steps: []readStep{
+		// A clamped timestamp resume may announce its translated start before
+		// the first event. The advisory has no seq and must not alter reconnect
+		// state or establish a dedup floor.
+		{data: []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#info","name":"OutdatedCursor","message":"starting at seq 41"}}`)},
+		{data: liveCommitFrame(t, 41, "did:plc:a", "create", "app.bsky.feed.post", "r41", true)},
+		{err: errors.New("connection reset after first event")},
+	}}
+	seqResume := &scriptedConn{steps: []readStep{
+		{data: liveCommitFrame(t, 41, "did:plc:a", "create", "app.bsky.feed.post", "r41", true)},
+		{data: liveCommitFrame(t, 42, "did:plc:a", "create", "app.bsky.feed.post", "r42", true)},
+	}}
+
+	var (
+		urlMu sync.Mutex
+		urls  []string
+	)
+	dial := capturingDialer(&urls, &urlMu, beforeDelivery, translatedReplay, seqResume)
+	cfg := engineConfig{
+		Host:           "https://h",
+		Backfill:       false,
+		LiveCursor:     timestampCursor,
+		BatchSize:      1,
+		MaxBatchDelay:  time.Millisecond,
+		LiveBackoffMin: time.Millisecond,
+		Dial:           dial,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		eventMu sync.Mutex
+		events  []Event
+	)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		newReplayEngine(cfg).Run(ctx,
+			func(batch []Event) bool {
+				eventMu.Lock()
+				events = append(events, batch...)
+				done := len(events) == 2
+				eventMu.Unlock()
+				if done {
+					cancel()
+					return false
+				}
+				return true
+			},
+			func(error) bool { return true },
+		)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-finished
+		t.Fatal("timestamp-resumed live tail did not deliver translated seqs")
+	}
+
+	eventMu.Lock()
+	gotSeqs := seqs(events)
+	eventMu.Unlock()
+	require.Equal(t, []uint64{41, 42}, gotSeqs,
+		"timestamp must not suppress translated seqs, and seq overlap must still deduplicate")
+
+	urlMu.Lock()
+	gotURLs := append([]string(nil), urls...)
+	urlMu.Unlock()
+	require.GreaterOrEqual(t, len(gotURLs), 3, "test must exercise both reconnect states")
+	for i, want := range []string{
+		strconv.FormatUint(timestampCursor, 10),
+		strconv.FormatUint(timestampCursor, 10),
+		"41",
+	} {
+		u, err := url.Parse(gotURLs[i])
+		require.NoError(t, err)
+		require.Equalf(t, want, u.Query().Get("cursor"), "dial %d used the wrong cursor namespace", i+1)
+	}
+}
+
+// TestLiveCursorDedupFloorNamespaces pins both sides and the exact boundary of
+// the protocol's overloaded cursor namespace. It prevents a future cleanup
+// from either restoring the timestamp bug or weakening ordinary seq dedup.
+func TestLiveCursorDedupFloorNamespaces(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		cursor uint64
+		want   uint64
+	}{
+		{name: "from tip", cursor: 0, want: 0},
+		{name: "ordinary seq", cursor: 41, want: 41},
+		{name: "largest seq cursor", cursor: seqspace.CursorSeqMaxThreshold - 1, want: seqspace.CursorSeqMaxThreshold - 1},
+		{name: "threshold timestamp", cursor: seqspace.CursorSeqMaxThreshold, want: 0},
+		{name: "later timestamp", cursor: seqspace.CursorSeqMaxThreshold + 1, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, liveCursorDedupFloor(tc.cursor))
+		})
+	}
 }
 
 func TestEngineFilterContractAcrossArchiveAndLive(t *testing.T) {
