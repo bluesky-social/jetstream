@@ -277,6 +277,25 @@ Do not move public serving or crash durability checks into fake I/O modes.
 
 ## Requirements For Future Changes
 
+### Preserve Local Coverage When Adding Storage Backends
+
+The local-storage oracle remains a first-class correctness suite. Adding a
+disaggregated backend must preserve its existing properties: independent
+expected state and event history, physical storage and public replay checks,
+real-process restart coverage, strict-filesystem power-loss checks, Pebble and
+segment fault injection, proof that injected faults fired, and mutation-backed
+detection of applicable failure modes. Shared-code refactors must not weaken
+those assertions, skip local tiers, or make local tests require PostgreSQL,
+S3, or cloud credentials.
+
+Disaggregated coverage is additional. Reuse simulator scenarios, independent
+models, checkers, and public observers where practical, and follow the same
+principles where the harness must differ. Use real database/object-store
+observations and failure tests for remote durability; a local fsync test cannot
+establish remote commit safety. Backend-specific tests can remain separate
+when that keeps them clearer and stronger. Sharing a harness is useful only
+when it preserves the assertions each backend needs.
+
 ### Adding Oracle Coverage
 
 When adding a new oracle capability:

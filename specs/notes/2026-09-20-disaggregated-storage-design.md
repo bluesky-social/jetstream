@@ -2,17 +2,24 @@
 
 Date: 2026-09-20. Status: accepted design direction; not implemented.
 
+Updated 2026-09-21 after design review. Timestamp input retention, transaction
+fencing, version-specific deletion, and compaction publication rules below
+incorporate that review. Rule lookup storage and checksum-format compatibility
+still need the specific decisions described in their sections.
+
 ## Decision
 
 Add an optional `disaggregated` storage mode for production deployments:
 
 - S3 stores the large data: compressed segment blocks, headers, and footers.
-  Each object is immutable and named by its SHA-256 hash.
+  These objects are immutable and named by their SHA-256 hashes. A separate
+  keyspace permanently retains timestamp import inputs.
 - A highly available PostgreSQL service stores the small, mutable data: relay
   cursors, sequence state, repo state, and the catalog that says which blocks
   make up each segment.
-- Local disk is only a bounded cache and temporary workspace. Losing it does
-  not lose archive data.
+- Local disk holds bounded caches, temporary workspace, and any derived rule
+  index. Losing it does not lose durable data, but rebuilding required rule
+  state can delay writer readiness.
 - One writer is active at a time. Any number of readers can use PostgreSQL and
   S3.
 
@@ -30,8 +37,9 @@ Pebble” rule:
 
 This ordering makes failures simple:
 
-- An uploaded object that is not referenced by PostgreSQL is harmless garbage
-  and can be deleted later.
+- An unreferenced archive object under `objects/` is harmless garbage and can
+  be deleted after the retention checks below. Import inputs and the sequence
+  control object are not garbage-collected.
 - A PostgreSQL reference to a missing object is corruption and stops serving
   that data.
 - Bucket listing is never used to decide what belongs in the archive.
@@ -83,9 +91,11 @@ A **recipe** is the information needed to reconstruct one generation. It can
 recreate the exact bytes of a sealed `.jss` file, so the segment format and
 public archive APIs do not need a second event encoding.
 
-A **fence** is a database-issued writer number. Every write must present the
-current number. When a new writer takes over, it gets a higher number, so an
-old writer can no longer commit even if it is still running.
+A **fence** is a database-issued writer number. Every authoritative writer
+transaction must present the current number. When a new writer takes over, it
+gets a higher number, so an old writer can no longer commit even if it is still
+running. GC uses the separate, restricted claim protocol below; it cannot
+publish archive data or advance ingest metadata.
 
 ## Goals
 
@@ -100,8 +110,9 @@ old writer can no longer commit even if it is still running.
 6. Keep local mode simple and free of S3 and PostgreSQL dependencies.
 7. Make partial failures leave either a complete database commit or harmless
    unreferenced objects.
-8. Keep the current public protocol and exact `.jss` representation unless a
-   later, versioned design changes them.
+8. Preserve the public protocol and reconstruct each supported `.jss`
+   generation byte-for-byte. The shared checksum correction below requires
+   its own explicit format/client compatibility decision before implementation.
 
 ## Non-goals
 
@@ -109,8 +120,8 @@ old writer can no longer commit even if it is still running.
   fences the old writer.
 - Treating S3 like a local filesystem, implementing append with multipart
   uploads, or putting Pebble on an S3-backed `vfs.FS`.
-- Eliminating all local storage. Bounded cache, temporary rewrite space, and
-  multipart staging may use ephemeral SSD.
+- Eliminating all local storage. Bounded cache, temporary rewrite space,
+  multipart staging, and derived timestamp rule state may use ephemeral SSD.
 - Making S3 the transaction coordinator. It stores bytes and an independent
   sequence ceiling; PostgreSQL publishes archive state.
 - Exactly-once delivery. Existing at-least-once behavior and inclusive cursors
@@ -160,22 +171,26 @@ forms are:
    block references, and footer never change. Rewrites publish another
    generation and atomically change a pointer.
 2. **Upload before commit.** Every S3 object must be readable and verified
-   before PostgreSQL may reference it.
+   before PostgreSQL may publish a reference treating it as durable. Upload
+   registration is bookkeeping, not archive publication.
 3. **PostgreSQL is authoritative.** Readers discover segments, blocks,
    generations, vacancies, and current pointers through the catalog. Bucket
    listing can audit or find garbage but cannot repair catalog state.
 4. **Hashes name exact bytes.** The SHA-256 is over the stored bytes, not
    decoded events, an ETag, or a logical block. Reads verify length and hash
    before decoded data becomes observable.
-5. **Only the current writer can commit.** Every write includes the current
-   fence number. Losing the leadership database connection invalidates that
-   number.
+5. **Only the current writer can publish archive state.** Every authoritative
+   writer transaction includes the current fence number and validates it while
+   holding the archive control row lock through commit. Leadership acquisition
+   takes the same row lock. Losing the leadership connection stops new work and
+   requires a new epoch before reuse; an already-running transaction must
+   finish before takeover or be rejected.
 6. **A block and its metadata commit together.** The block reference, exact
    `seq/next`, sequence lease, safe `relay/cursor`, and all eligible repo,
    verifier, sync, and lifecycle mutations commit together.
-7. **Client-observable seqs are never reused.** The existing one-block local
-   lease protects process crashes. An independent S3 ceiling protects the same
-   cursor namespace across database rollback or loss.
+7. **Client-observable seqs are never reused.** The one-block lease in
+   PostgreSQL protects process crashes. An independent S3 ceiling protects the
+   same cursor namespace across database rollback or loss.
 8. **Unexplained gaps stop the process.** Recipes and explicit
    `seq/gap/*` vacancies explain all durable coverage. Missing objects, missing
    block numbers, or unexplained sequence holes are corruption, not an invitation
@@ -184,8 +199,10 @@ forms are:
    same creation/time order as lexically sorted local filenames. Generation
    changes never reorder logical segments.
 10. **Bad upstream input is dropped; bad owned state stops the process.** An
-    invalid relay record remains an input error. A hash mismatch, impossible
-    recipe, lost fence, or referenced missing object is internal corruption.
+    invalid relay record remains an input error. A confirmed authoritative
+    hash mismatch, impossible recipe, or referenced missing object is internal
+    corruption. Losing writer authority instead stops writes and live
+    publication; it need not stop a healthy immutable-history read path.
 
 These guarantees also depend on the managed services. PostgreSQL must use
 synchronous commit and must not promote a replica that is missing acknowledged
@@ -204,16 +221,17 @@ from accidentally sharing sequence control state. An illustrative layout is:
 ```text
 <prefix>/<archive-id>/
   objects/sha256/ab/cd/<64-lowercase-hex-digits>
+  imports/<import-id>/input.csv
   control/sequence-ceiling
   probes/<deployment-id>/...
 ```
 
 Objects under `objects/` are immutable and content addressed. Use
-`If-None-Match: *` when the provider supports it. If an object already exists,
-verify its recorded size and checksum rather than overwriting it. A conflicting
-object under the same SHA-256 key is corruption.
+`If-None-Match: *`, as required of supported providers. If an object already
+exists, verify its recorded size and checksum rather than overwriting it. A
+conflicting object under the same SHA-256 key is corruption.
 
-The initial implementation stores three object kinds:
+The initial implementation stores three content-addressed object kinds:
 
 | Kind | Stored bytes | Notes |
 | --- | --- | --- |
@@ -222,9 +240,12 @@ The initial implementation stores three object kinds:
 | `segment-footer` | Exact sealed footer bytes | Includes the indexes and historical envelopes belonging to that generation. |
 
 The hash covers the bytes exactly as stored. The object table records the
-length, hash, creation time, and optional S3 checksum/version. Each recipe says
-whether it expects a block, header, or footer. Object type is not part of the
-key, so identical bytes can safely be reused in more than one role.
+length, hash, creation time, mandatory S3 version ID once available, and
+optional provider checksum. Each recipe says whether it expects a block,
+header, or footer. Object type is not part of the key, so identical bytes can
+safely be reused in more than one role. Import inputs have their own job
+references and permanent-retention rules; the mutable sequence-control object
+has its own conditional-update protocol.
 
 Do not use S3 ETags as content hashes. Multipart upload, encryption, and
 provider differences make that invalid. Send or validate the provider's
@@ -253,6 +274,29 @@ An active segment has a header plus an ordered list in
 generation. The database list, rather than an appendable S3 object, is the
 active segment.
 
+### Segment checksum correction is a prerequisite
+
+Timestamp import must recompute and write a segment checksum that covers the
+changed event data before publishing the replacement. The current code already
+recomputes its checksum, but hashes only the header and footer. If a timestamp
+change leaves compressed frame lengths unchanged, the file bytes can change
+without changing that checksum. Repeating the existing hash calculation does
+not fix this bug.
+
+Correct the checksum coverage in the shared segment format code for both
+backends, including seal, compaction, timestamp patching, and readers. Compute
+the checksum from the finalized representation before publishing the new file
+or recipe; never edit a published generation in place. Preserve the exact
+bytes when reconstructing an existing generation.
+
+This requires a coordinated format-compatibility decision: existing readers
+verify the metadata-only checksum, so changing only the import writer would
+make newly patched files fail validation. The checksum change must specify
+version handling, existing-file treatment, and client compatibility before
+implementation. An old metadata-only checksum cannot be used as a strong
+byte-identity validator for timestamp-rewritten content. Benchmark checksum
+generation and verification, including sparse reads, as part of that change.
+
 ### Required S3 behavior
 
 AWS S3 currently provides strong read-after-write and list consistency, but
@@ -263,6 +307,8 @@ this design needs only strong reads of known keys. It assumes:
 - GET/HEAD of its known key can confirm the newly written object;
 - conditional create and conditional replacement work for immutable objects
   and the sequence control record;
+- version IDs identify exact stored versions, and repeated deletion of one
+  version cannot affect a later upload under the same key;
 - an aborted multipart upload is not a visible object.
 
 “S3 compatible” is not sufficient evidence. A provider must pass integration
@@ -310,10 +356,19 @@ the last S3 sequence-control value seen by this writer; they may never reduce
 the value in S3.
 
 To become writer, a process takes a PostgreSQL advisory lock for `archive_id`.
-It then checks the S3 sequence ceiling, increases `writer_epoch`, and records
-its process identity. Every later write checks that epoch. If the database
-connection drops, the advisory lock is released. Reconnecting requires taking
-leadership again and getting a new epoch.
+It then checks the S3 sequence ceiling and, in a transaction, locks the archive
+control row with `SELECT ... FOR UPDATE`, increases `writer_epoch`, and records
+its process identity. Every later authoritative writer transaction takes that
+same row lock, checks the epoch after obtaining it, and holds it until commit
+or rollback. This includes metadata-only writes and sequence reservations as
+well as block and generation publication. Take the archive lock before segment
+or object locks in these transactions to keep lock ordering consistent.
+
+An ordinary epoch read followed by later writes is insufficient: a transaction
+on a pooled connection can outlive the dedicated advisory-lock connection.
+The row lock ensures it either commits before the new epoch takes effect or
+observes the new epoch and fails. If the leadership connection drops,
+reconnecting requires taking leadership again and getting a new epoch.
 
 The advisory lock prevents two healthy writers. The epoch prevents an old
 writer from committing after failover. This does not use a clock or timeout,
@@ -321,7 +376,8 @@ so clock skew cannot create two valid writers.
 
 The lock protects one PostgreSQL cluster. A restored copy of that cluster has
 its own locks. Before promoting a restored copy, the operator must revoke the
-old writer's access or otherwise prove it has stopped. The S3 sequence ceiling
+old writer's and old garbage collector's access or otherwise prove they have
+stopped, including outstanding deletion work. The S3 sequence ceiling
 prevents sequence reuse, but it cannot merge two databases that were allowed
 to diverge. Automatic election across separate database clusters is outside
 this design.
@@ -351,6 +407,11 @@ queries or validation better. That conversion is not required for the first
 release. Segment catalog rows use normal columns from the start because they
 are new and benefit from database constraints.
 
+The separate `import-rules` Pebble database is not part of `meta.pebble` and
+must not disappear during migration. Its per-record lookup representation is
+discussed under timestamp import; retaining the existing metadata encodings
+does not imply moving all timestamp rules into PostgreSQL.
+
 ### Objects and upload state
 
 ```text
@@ -359,7 +420,7 @@ objects(
   sha256 bytea,
   byte_length bigint,
   state smallint,              -- uploading, available, gc_claimed, deleted
-  provider_version text,
+  provider_version text,       -- required in available/gc_claimed states
   created_at timestamptz,
   unreferenced_at timestamptz,
   delete_after timestamptz,
@@ -367,10 +428,12 @@ objects(
 )
 ```
 
-Before uploading, create an `uploading` row. After the PUT has been verified,
-change it to `available`. Recipes may reference only available objects. If a
-process dies during upload, another process can inspect or clean up the stale
-row without listing the whole bucket. S3 Inventory is still useful for audits.
+Before uploading, register or reuse the object row under the publication/GC
+locking rules below. A new hash starts in `uploading`; after the PUT has been
+verified, change it to `available`. Recipes may reference only available
+objects. If a process dies during upload, another process can inspect or clean
+up the stale row without listing the whole bucket. S3 Inventory is still useful
+for audits.
 
 The object row describes bytes, not their use. If two roles happen to have the
 same bytes, the same hash can satisfy both references.
@@ -454,39 +517,51 @@ available for the existing HTTP cache grace and recovery window after
 `segments.current_generation_id` changes.
 
 Import jobs, temporary references held by reads or rewrites, and
-garbage-collection claims will probably need their own tables. Do not build a
-second mutable manifest that can disagree with this catalog.
+garbage-collection claims need catalog representation; their exact table
+layout remains open. Do not build a second mutable manifest that can disagree
+with this catalog.
 
 ## Core protocols
 
 ### New block commit
 
-One block is committed as follows:
+At append time, before any event becomes visible in the live readable log,
+confirm that its sequence number is inside both the PostgreSQL one-block lease
+and the independently reserved S3 range. This guard cannot wait until flush.
+
+One block is then committed as follows:
 
 1. Prepare and compress a complete block in ingest order. Calculate its
    SHA-256 and its planning metadata, such as event count and sequence/time
    ranges.
-2. Before any event is visible in the live readable log, confirm that its
-   sequence number is inside both the local and remote reserved ranges.
-3. Create or claim the object row. If S3 does not already have this hash,
+2. Create or claim the object row. If S3 does not already have this hash,
    upload it. Verify the known key with HEAD or GET.
-4. Start a PostgreSQL transaction. Check the writer fence and lock the active
-   segment tail.
-5. Insert the next block number. In the same transaction, update `seq/next`,
+3. Start a PostgreSQL transaction. Lock the archive control row and check the
+   writer fence as specified above, then lock the active segment tail. Hold
+   those locks through commit.
+4. Insert the next block number. In the same transaction, update `seq/next`,
    `seq/max_reserved`, the safe relay cursor, durable repo/version checks,
    verifier and sync/account state, and related lifecycle progress.
-6. Increase `catalog_commit` and commit with synchronous commit enabled.
-7. Report the block as durable. Cache writes and reader notifications happen
+5. Increase `catalog_commit` and commit with synchronous commit enabled.
+6. Report the block as durable. Cache writes and reader notifications happen
    afterward because they can safely be lost.
 
-If upload fails, PostgreSQL does not change. If the process dies after upload
-but before database commit, it leaves an unreferenced object. If the process
-does not know whether the database commit succeeded, it reconnects and checks
-the expected segment/block row before doing anything else.
+If upload fails, archive references and dependent metadata do not advance;
+upload bookkeeping may remain. If the process dies after upload but before
+publication, it leaves an unreferenced object. If the database commit result
+is unknown, stop new writer work and reconcile the expected segment/block,
+hash, metadata, and epoch against the primary before retrying. A missing row
+alone does not prove an unresolved transaction cannot still commit. Read-only
+reconciliation does not restore writer authority: recovery after a writer
+database disconnect must follow the leadership protocol and rebuild state
+before any further writes.
 
 The unique segment and block number, previous tail, hash, and writer fence make
 retries safe. Repeating a successful commit must find the same result. Finding
-different bytes or state is corruption.
+conflicting bytes for the same operation within the same epoch is corruption.
+After takeover, a new writer may legitimately have used a previously
+uncommitted block number; discard the old prepared operation rather than
+retrying it under the new epoch.
 
 The current live readable log may still expose a prepared event before this
 remote commit. The existing durable sequence lease bounds that window. An
@@ -501,9 +576,11 @@ say which class a change belongs to; an empty block is not proof that a change
 is independent. Existing dependency rules for verifier, cursor, merge,
 compaction, and import state still apply.
 
-Combine small updates into multi-row SQL instead of making hundreds of network
-round trips. Large imports should COPY into a staging table and then merge the
-staged rows in one checked transaction.
+These transactions use the same archive-row lock and fence check as block
+commits. Combine small updates into multi-row SQL instead of making hundreds
+of network round trips. Large metadata transfers may COPY into staging tables
+and publish in checked transactions. This is not a requirement to put the
+per-record timestamp rule map in PostgreSQL.
 
 ### Sealing and rotation
 
@@ -512,10 +589,13 @@ Sealing converts the active database list into an immutable generation:
 1. Read the active segment's committed block list at one catalog revision and
    keep that exact list for the rest of the operation.
 2. Generate the exact final header/footer and recipe using the existing
-   segment format code. Upload and verify the header and footer objects.
+   segment format code. Upload and verify the header and footer objects,
+   including the header needed for the next active segment.
 3. In one transaction, check the writer fence and confirm the active tail did
    not change. Insert the generation and ordered block rows, make it current,
-   mark the segment sealed, and create the next active segment.
+   mark the segment sealed, retire its active block/header references, and
+   create the next active segment. The new generation now owns the sealed
+   segment's references; retiring active references does not delete objects.
 4. Commit, then publish cache/reader notifications.
 
 No S3 rename or copy is involved. A crash before the transaction leaves
@@ -531,23 +611,33 @@ later. Do not trade away validation merely to predict an optimization.
 
 Compaction never edits a published generation:
 
-1. Capture the source generation IDs and compaction input watermark in a
-   short database snapshot. They remain immutable.
+1. Capture the source generation IDs, the prior compaction watermark, and a
+   fixed tombstone input window in a short database snapshot. Retain its inputs
+   and identify every segment that must be checked for those tombstones.
 2. Outside a database transaction, fetch/decode only needed blocks, apply
    tombstones, and build replacement frames and the exact new footer. Reuse
    old hashes for byte-identical unchanged frames; do not recompress them.
 3. Upload and verify every new block/header/footer object.
-4. In one transaction, check the writer fence and verify that each current
-   generation is still the source read in step 1. Insert the new generations,
-   close the old generations' visibility ranges, change the current pointers,
-   and advance the compaction watermark.
+4. Publish replacement generations in small transactions. Each transaction
+   takes the archive-row lock, checks the writer fence, and verifies that each
+   current generation is still its expected source. Insert the replacements,
+   close the old visibility ranges, and change the current pointers. Do not
+   advance the global compaction watermark for a partial batch of segments.
 5. If a source pointer changed, discard the candidate or rebuild it from the
-   new source. Never publish a recipe built from an outdated generation.
+   new source. Never publish a recipe built from an outdated generation or
+   count a conflicted replacement as completed work.
+6. Only after every segment affected by the fixed tombstone window has been
+   processed, advance the global watermark in a fenced transaction that checks
+   the expected prior watermark. A new writer reconstructs or repeats
+   unfinished work from the unchanged watermark.
 
-A chunk that updates several segments and one watermark publishes all of them
-in one transaction. Keep chunks small enough to limit lock time and PostgreSQL
+A tombstone window and a SQL publication batch are different units. One
+account deletion may affect thousands of segments; completing the first batch
+does not complete that tombstone. Replacements may safely become visible ahead
+of the watermark because applying the same tombstones again is idempotent.
+Keep publication batches small enough to limit lock time and PostgreSQL
 write-ahead log (WAL) growth. Decoding, rewriting, and uploading happen outside
-database locks.
+database locks. The watermark must never claim unfinished work.
 
 An in-flight response keeps using the exact older recipe it started with; HTTP
 caches may retain it through the configured grace period. A later name lookup
@@ -557,14 +647,43 @@ filesystem rename or manifest rescan.
 ### Timestamp import and other rewrites
 
 Timestamp import uses the same “verify source, then replace pointer” protocol
-as compaction. Job progress, rule state, and generation changes commit together
-at each job boundary. Import state cannot say a segment was patched unless the
-new generation is visible.
+as compaction. Per-segment job progress and generation changes commit together.
+Import state cannot say a segment was patched unless the new generation is
+visible. Finalize the corrected segment checksum before publication, as
+described under the checksum prerequisite.
 
 Long jobs remember exact generation IDs, not filenames. If one is replaced,
-the job retries from the new generation. Operators must retain the original
-import input until the job finishes; remote segment storage cannot recreate a
-partially consumed CSV.
+the job retries from the new generation.
+
+Timestamp CSV inputs are immutable S3 objects in the separate `imports/`
+keyspace. Upload and verify the exact input before accepting the durable job
+or activating any rules. The job records its key, version, length, and digest.
+Inputs are retained permanently, including after job completion or failure;
+neither Jetstream GC nor bucket lifecycle rules may delete them. Local copies
+are disposable staging files. This also keeps inputs available when PITR
+restores a job to an earlier phase.
+
+PostgreSQL records the small control state: import order, input references,
+rule activation/progress, and patch completion. Bucket listing cannot decide
+which inputs are active: after PITR, S3 may contain inputs newer than the
+restored catalog. Rule reconstruction must preserve import order,
+last-write-wins behavior, and the committed progress of interrupted imports.
+
+The per-record rule lookup representation remains a design choice. The first
+option to measure is the existing Pebble rule index rebuilt locally from the
+retained S3 inputs, with bounded memory use. This avoids per-event remote SQL
+lookups. An all-in-memory map is suitable only if actual retained rule counts,
+key sizes, and allocation overhead fit the writer's memory budget. Do not
+assume a full-network rule map is small. A local index needs explicit disk
+capacity and rebuild-time budgets; it is not an independently durable store.
+Before writer readiness, the chosen implementation must have reconstructed
+the catalog's rule state. Its cold rebuild time counts toward failover time.
+
+Import bucket/offset files are also derived workspace. A persisted `Bucketed`
+flag alone is not proof that they exist on a new machine. Missing, incomplete,
+or mismatched workspace must be rebuilt from the exact retained input before
+resuming patch work; an empty directory must not turn into successful job
+completion. Test recovery after deleting all local import files.
 
 The `namespace` column distinguishes the main archive from bootstrap live data
 and merge data. A lifecycle transition updates its control metadata in the
@@ -584,12 +703,23 @@ a new token.
 Today `getSegment` and `getBlock` accept only the stable segment name (and a
 block number), not a generation ID. They therefore resolve the current
 generation at the start of the request and keep that exact recipe for the
-life of the response. Their ETags retain current behavior: the exact segment
-format checksum for `getSegment`, and that checksum plus block number for
-`getBlock`. A client whose planned checksum no longer matches the response
-has raced compaction/import and re-plans, just as it does when a local file was
-atomically replaced. Never splice references from two generations in one
-response.
+life of the response. The intended ETag shape remains the segment-format
+checksum for `getSegment`, and that checksum plus block number for `getBlock`,
+subject to the checksum correction and compatibility work above. Never splice
+references from two generations in one response.
+
+There is no new client replanning requirement. Compaction preserves block
+numbers and historical envelopes, removes superseded rows, and retains
+markers; timestamp import changes display timestamps without moving rows.
+An earlier plan therefore remains usable against the current generation for
+retrievable matching data. The current client can restart a whole-segment
+download when a Range validator changes; the backend must not assume it checks
+every response against a planned checksum or replans the archive.
+
+The client's existing bounded retries and surfaced download errors remain its
+contract. Test those behaviors against remote outages, but do not describe
+exhausted retries as automatic recovery of a failed page. Any change to client
+error continuation is separate from this storage design.
 
 After choosing that recipe, `getBlock`:
 
@@ -626,10 +756,11 @@ writer's in-memory readable log.
 ### Consistent plans and database replicas
 
 PostgreSQL `REPEATABLE READ`, or an equivalent tested query, makes each plan
-call internally consistent. The existing checksum/ETag retry
-rule handles generation changes between plan pages or later downloads;
-`sealedTipSeq` prevents newly sealed tail data from moving the requested
-sequence snapshot. No wire change is required.
+call internally consistent. Stable block topology and historical envelopes
+keep plans usable across compaction/import; fixed `sealedTipSeq` prevents
+newly sealed tail data from moving the requested sequence window. Range
+validators protect downloads split across requests. This does not require a
+new planning token or automatic replanning.
 
 A read replica may serve archive plans only when its measured lag is within
 the accepted cache grace and all generations it can return are still stored.
@@ -645,12 +776,14 @@ A candidate writer performs this startup sequence:
 1. Open PostgreSQL and validate archive identity/schema/configuration.
 2. Acquire the archive advisory lock on one dedicated session.
 3. Read and advance the S3 sequence ceiling as described below.
-4. In a transaction, register any abandoned local/remote sequence space,
-   increment the `writer_epoch` fence, and record the new identity, ceiling
-   ETag, and reservation ID.
+4. In a transaction, acquire the archive control row lock before reading the
+   durable sequence frontier. Register abandoned local/remote sequence space,
+   increment `writer_epoch`, and record the new identity, ceiling ETag, and
+   reservation ID. Hold the row lock through commit.
 5. Rebuild active writer state, block descriptors, gaps, and the readable-log
    start from PostgreSQL. Verify the active tail's referenced objects before
-   accepting input.
+   accepting input. Restore the timestamp rule lookup state required by the
+   catalog before accepting events that need stamping.
 6. Start producers and only then advertise write/live readiness.
 
 If the lock connection is lost, a fence check fails, or commits stop working,
@@ -660,14 +793,16 @@ history if that separate read path is healthy.
 
 An old writer can have uploaded objects and can have exposed events within its
 reserved sequence lease, but cannot publish database references after a new
-writer takes over. Its uploaded objects become garbage and its possibly
-observed sequence numbers become an
-explicit vacancy. New leadership does not scan S3 to infer what happened.
+writer takes over. Any objects it uploaded but did not publish become garbage,
+and its possibly observed but uncommitted sequence numbers become an explicit
+vacancy. New leadership does not scan S3 to infer what happened.
 
 The operator configures PostgreSQL high availability, but Jetstream must test
-the result. If
-database failover loses an acknowledged synchronous transaction, Jetstream
-treats it as rollback and uses the remote sequence recovery protocol below.
+the result. Losing an acknowledged synchronous transaction violates the
+supported HA contract; it is not an ordinary failover. If detected, stop
+automatic write recovery and use the database-rollback recovery procedure,
+including GC suspension and remote sequence reconciliation. The S3 ceiling
+prevents sequence reuse; it cannot recover lost catalog transactions.
 
 ## Sequence safety across PostgreSQL rollback
 
@@ -689,8 +824,9 @@ Maintain a small, independently conditional S3 object:
 ```
 
 The ceiling is the first sequence number not reserved for a writer. It
-only increases. Jetstream updates it with `If-Match` against the last ETag. It
-is not stored in PostgreSQL backups and never expires.
+only increases. Jetstream updates it with `If-Match` against the last ETag.
+The authoritative record lives independently of PostgreSQL backups and never
+expires; the database ceiling columns are only cached observations.
 
 Let `R` be the ceiling read from S3 and `G` be the configured range size:
 
@@ -700,14 +836,16 @@ Let `R` be the ceiling read from S3 and `G` be the configured range size:
    durable sequence is below `R`, it atomically registers the entire interval
    `[next_seq, R)` as a vacancy with reason `writer_failover` or
    `database_restore`.
-3. It records the new ceiling and local one-block lease in PostgreSQL before
+3. It records the new ceiling and one-block lease in PostgreSQL before
    publishing events. It may allocate within `[R, R+G)`.
 4. Before exhausting that range, the same writer conditionally extends the
-   remote ceiling and records the new range locally. Failure stops intake
+   remote ceiling and records the new range in PostgreSQL. Failure stops intake
    before the boundary.
-5. Every leadership acquisition or database reconnect burns the unused tail
-   up to the previously published remote ceiling. It never resumes halfway
-   through an old remote grant, even if PostgreSQL appears current.
+5. Every leadership acquisition or writer recovery after a database disconnect
+   burns the unused tail up to the previously published remote ceiling. It
+   never resumes halfway through an old remote grant, even if PostgreSQL
+   appears current. Replacing an idle pooled connection alone is not a new
+   writer session.
 
 Every new writer must discard the unused part of the previous writer's range.
 An old database backup may remember the correct range end but forget some
@@ -715,10 +853,11 @@ sequence numbers already used inside the range. Reusing that range would give
 those sequence numbers to different events.
 
 For example, suppose S3 says all numbers below 1,000,000 were reserved, while
-the restored database says the next number is 990,000. The new writer records
-`[990000, 1000000)` as an intentional gap. It then raises the S3 ceiling and
-starts at 1,000,000. This can create duplicates after relay replay, which the
-protocol already allows, but it cannot reuse an observed sequence number.
+the restored database says the next number is 990,000. The new writer first
+raises and verifies the S3 ceiling, then records `[990000, 1000000)` as an
+intentional gap and starts at 1,000,000. This can create duplicates after relay
+replay, which the protocol already allows, but it cannot reuse an observed
+sequence number.
 
 Choose the range size from peak event rate, desired operation during an S3
 control outage, and the acceptable gap after failover. It should avoid frequent
@@ -733,8 +872,9 @@ without a condition.
 
 The control object must remain reachable during writer promotion. If it is
 lost, Jetstream cannot prove that old sequence numbers are safe. Recovery must
-restore the object or create a new archive identity and explicitly tell clients
-that the cursor namespace changed. Choosing an arbitrary high number is unsafe.
+recover the latest ceiling without rollback, or create a new archive identity
+and explicitly tell clients that the cursor namespace changed. An older object
+version or an arbitrary high number is not evidence that reuse is safe.
 
 ## Garbage collection and retention
 
@@ -769,20 +909,31 @@ Deletion protocol:
 
 1. Select expired candidates in small batches.
 2. In a transaction, lock each object row, recompute that no retained
-   reference exists, and move it to `gc_claimed` with a unique claim.
+   reference exists, and move it to `gc_claimed` with a unique claim recording
+   the exact provider version ID. Reference publication must lock that same
+   object row while checking availability and attaching a reference, so the
+   availability check cannot race a deletion claim.
 3. Publishers encountering `gc_claimed` must not create a reference; they
    either wait or re-upload/verify and transactionally return it to
    `available` after the claim resolves.
-4. Delete the known S3 key/version. With versioning, retain noncurrent versions
-   according to the disaster-recovery policy.
-5. Mark the row deleted. A retry checks HEAD/version state and safely continues
-   from the last completed step.
+4. Delete only the claimed version ID. Key-only DELETE is forbidden: a request
+   that times out may finish after a retry and a later reupload of the same
+   hash. Every retry must still target the original version. Other retained
+   versions follow the disaster-recovery policy.
+5. Mark the row deleted only if its claim ID and provider version still match.
+   A retry checks the exact version's state and continues from the last
+   completed step; it cannot mark a later upload deleted.
 
 Never attach a blanket S3 lifecycle expiration rule to `objects/`. Lifecycle
 rules may clean incomplete multipart uploads and, after a deliberately longer
 period, old versions/delete markers. S3 Inventory compares physical objects
 with catalog rows and finds unexpected orphans; discrepancies produce reports,
 not automatic catalog reconstruction.
+
+The separate `imports/` keyspace is permanently retained. The GC identity has
+no delete permission there, and no lifecycle expiration applies to those
+inputs. Restoring an older PostgreSQL catalog also requires suspending GC and
+retiring old workers, as described under disaster recovery.
 
 Old generation rows can be removed only after the object-retention and PITR
 window ends. Recipes may be kept longer for audit, but they must clearly show
@@ -794,14 +945,17 @@ The disaggregated backend may use local SSD for:
 
 - a size-bounded content-addressed block/header/footer cache;
 - bounded temporary rewrite/import files;
+- a derived timestamp rule index, if selected, with its own provisioned size
+  budget and rebuild requirement;
 - optional materialized `.jss` generation cache;
 - multipart upload buffers when streaming is unavailable.
 
 The cache is never a source of truth. Cache files are named by SHA-256. Write
 them to temporary files, verify them, fsync them when they should survive a
 process crash, and then rename them atomically. Eviction cannot lose archive
-data. A corrupt cache entry is deleted and fetched again. Repeated hash
-mismatches make the service unready and trigger an alert.
+data. A corrupt cache entry is deleted and fetched again. Repeated cache
+corruption makes the service unready and triggers an alert; confirmed
+corruption in authoritative S3 data follows the fail-loud policy above.
 
 Use request coalescing so concurrent misses for one hash cause one S3 GET.
 Separate concurrency and bandwidth limits for foreground block reads,
@@ -810,7 +964,9 @@ large rewrite from starving subscribe or XRPC. Expose each queue and throttle.
 
 Disk-full behavior should shed cache/staging work and remain able to serve via
 streaming where possible. It must not be confused with authoritative archive
-loss. Local mode retains its existing crash-loud disk semantics.
+loss. Losing a required timestamp rule index delays writer readiness until it
+can be rebuilt; do not ingest unstamped events as a fallback. Local mode
+retains its existing crash-loud disk semantics.
 
 ## Database choice
 
@@ -938,11 +1094,12 @@ a schema version newer than it understands.
 | --- | --- |
 | S3 PUT unavailable | Retry for a limited time. The block cannot commit. Slow and then stop intake before reserved sequence space runs out. |
 | PostgreSQL unavailable before transaction | Uploaded object may be orphaned; no durable block is claimed. Stop metadata-dependent intake. |
-| PostgreSQL commit result is unknown | Look up the writer fence, segment, and block number before retrying. |
+| PostgreSQL commit result is unknown | Stop new writer work and reconcile against the primary. Recovery after a writer database disconnect follows the leadership protocol; never blindly retry under a new epoch. |
 | S3 GET unavailable | Cached reads continue. Cache misses return a retryable error instead of skipping data. Writes stop when newly uploaded objects cannot be verified. |
-| Object hash mismatch or referenced object missing | Delete any cache copy and retry the known S3 key a limited number of times. Alert and become unready. Never skip the block. |
+| Object hash mismatch or referenced object missing | Delete any cache copy and retry the known S3 key a limited number of times. Confirmed authoritative corruption alerts and fails loud. Never skip the block. |
 | Writer process/pod loss | A new process takes leadership, advances the remote ceiling, records abandoned sequence space, verifies the active tail, and resumes without downloading the archive. |
-| Cache disk loss | Performance degradation only. Recreate from catalog + S3. |
+| Archive cache loss | Cache misses fall back to S3; performance may degrade. No archive data is lost. |
+| All local workspace lost, including required rule state | Rebuild from the catalog and retained S3 inputs before writer readiness. Reads may continue without the rule index. |
 | PostgreSQL primary failover | Reconnect through the leadership protocol; never continue using the old fence number. |
 
 Memory use must stay bounded during an outage. Do not keep accumulating encoded
@@ -962,9 +1119,18 @@ and log position, catalog revision, oldest retained object, remote sequence
 ceiling, and recipe verification results. This is an audit record, not another
 catalog.
 
+This procedure is for restoring an older database backup or recovery point,
+not an ordinary writer restart against the same current catalog. The restored
+catalog can make an old generation current again. A GC worker using the
+abandoned catalog must not remain able to delete that generation later, even
+if the retention window protects it at the moment restoration begins.
+
 Recovery procedure:
 
-1. Fence or prove the old writer is gone.
+1. Suspend object deletion and protect the selected recovery point for the
+   entire recovery operation. Fence or prove the old writer and all old GC
+   workers are gone. Account for outstanding deletion requests; changing
+   PostgreSQL ownership does not cancel an S3 request already in flight.
 2. Restore PostgreSQL to the chosen supported point.
 3. Use the retained or replicated S3 objects. Verify every active recipe and a
    sample of sealed recipes. A full check may run in the background only if the
@@ -973,7 +1139,12 @@ Recovery procedure:
    created by the restore.
 5. Confirm that upstream still retains the saved relay cursor needed for
    catch-up.
-6. Catch up, verify invariants, then open write and live readiness.
+6. Reconstruct timestamp rule state and any needed import workspace from the
+   retained inputs and restored catalog. Catch up, verify invariants, then
+   open write and live readiness.
+7. Resume GC only against the newly authoritative catalog after recovery holds
+   and outstanding deletion work have been reconciled. Old-cluster workers
+   must remain unable to delete objects in the shared bucket.
 
 If S3 replication lags the restored database, choose an older database point
 whose objects are known present; never advance a relay cursor past missing
@@ -1004,15 +1175,22 @@ safe path for an archive already in steady state is:
 4. Start a planned maintenance window: stop producers, drain the writer,
    finish active segment sealing or capture it through a defined conversion,
    stop compaction/import publication, and take an exact logical export of all
-   Pebble metadata plus current segment generations.
+   Pebble metadata plus current segment generations. Include the separate
+   `import-rules` database in the inventory and preserve its effective rule
+   state; it is not part of `meta.pebble`.
 5. Upload the remaining objects. In one migration publication transaction,
    import compatible key/value state, compare sequence, relay, lifecycle, and
    compaction positions with the recipes, publish all current generations,
-   and create writer control state.
+   and create writer control state. Retain timestamp inputs in `imports/` and
+   publish their ordering and reconstruction metadata. If original CSVs for
+   an existing rule map are unavailable, migration needs an exact, verified
+   export of that map as an immutable initial reconstruction source; never
+   infer the rules from timestamps already written to segments or drop them.
 6. Move the remote sequence ceiling past every sequence number that a client
    might have seen. Record the resulting gap and the new reserved range.
 7. Start a disaggregated reader, run full coverage and sampled byte/event
-   comparisons, then start the fenced writer and reopen traffic.
+   comparisons, and verify rule-state reconstruction and stamping of later
+   events. Then start the fenced writer and reopen traffic.
 8. Retain the stopped local data directory read-only through a rollback safety
    period. It is evidence, not a concurrently writable replica.
 
@@ -1023,13 +1201,17 @@ correctness design.
 Returning to local mode after disaggregated writes is an export operation with
 an outage: materialize every current generation and export compatible metadata
 at one catalog commit. Changing the environment variable alone is not rollback.
+The export must also reproduce the separate timestamp rule database required
+by the local writer.
 
 ### Delivery stages
 
-1. **Format support:** extract and reconstruct exact frames, headers, and
-   footers; validate recipes; make no behavior change.
+1. **Format support:** resolve and test the checksum coverage/compatibility
+   correction in the shared format code. Extract and reconstruct exact frames,
+   headers, and footers for each supported version; validate recipes.
 2. **Storage contracts:** adapt local mode through invariant-level interfaces;
-   oracle output must remain identical.
+   preserve its behavioral expectations, oracle assertion strength, and
+   applicable coverage.
 3. **PostgreSQL metadata compatibility:** key/value encoding and iteration
    tests, schema, migrations, fencing, and transaction failure tests.
 4. **S3 object layer:** conditional creates, checksum verification, retries,
@@ -1061,8 +1243,8 @@ questions:
 - **Does the current writer still own the archive?** Show writer identity,
   fence number, lock loss, rejected stale writes, and time since the last
   durable block.
-- **Can sequence allocation continue safely?** Show `seq/next`, the local lease
-  end, remaining remote range, reservation attempts, discarded ranges, and
+- **Can sequence allocation continue safely?** Show `seq/next`, the one-block
+  lease end, remaining remote range, reservation attempts, discarded ranges, and
   remaining sequence namespace.
 - **Can upstream replay recover an outage?** Show the age of the safe relay
   cursor using an upstream timestamp. Relay cursor numbers are opaque and must
@@ -1090,9 +1272,11 @@ responses.
 Readiness is component-specific:
 
 - writer readiness requires the current fence, a usable PostgreSQL primary,
-  remaining remote sequence range, and successful S3 writes and checks;
+  remaining remote sequence range, successful S3 writes and checks, a verified
+  active tail, and reconstructed timestamp rule state required by the catalog;
 - archive-read readiness requires catalog access plus S3 or sufficient cache;
-- live readiness requires the writer's readable log and lifecycle cutover;
+- live readiness requires writer readiness, its readable log, and lifecycle
+  cutover;
 - a replica beyond the configured safe-lag/cache-grace bound is not ready for
   archive plans.
 
@@ -1101,7 +1285,7 @@ exposing secrets.
 
 ## Verification strategy
 
-### Crash tests for each protocol step
+### Crash and delayed-operation tests for each protocol step
 
 Build fake S3 and database implementations. Add crashpoints before and after
 every step that changes persistent state:
@@ -1115,10 +1299,31 @@ every step that changes persistent state:
   ambiguous reservation, vacancy registration, and new epoch;
 - GC mark, claim, final reference check, S3 delete, and row completion.
 
-After every injected crash, restart must find either the old state plus harmless
-objects or the complete new state. It must never find a missing referenced
-object, metadata ahead of data, a duplicate block number, a reused sequence,
-an advanced watermark without its generations, or two valid writers.
+After every injected crash, each atomic catalog transaction must be either
+absent or complete; verified but unpublished objects may remain. Multi-step
+jobs may retain completed batches, and sequence reservations may be burned.
+Restart must never find a missing referenced object, metadata ahead of data,
+a duplicate block number, a reused sequence, an advanced watermark without
+its generations, or two valid writers.
+
+Timeouts also need tests in which the original operation remains alive and
+finishes later. Use barriers to exercise at least:
+
+- a pooled transaction paused around its fence check while the dedicated
+  leadership session drops and another writer attempts promotion;
+- a timed-out DELETE completing after a successful retry, reupload of the
+  same hash, and publication of a new reference;
+- one account tombstone affecting more segments than a publication batch,
+  with crashes between batches and before the global watermark advances;
+- a replacement writer with all local rule and bucket files removed, including
+  a persisted `Bucketed` job and a completed import that must stamp new events;
+- an older database restore while an old GC worker still tries to delete
+  generations that are current in the restored catalog.
+
+For compaction, a valid intermediate crash state includes some published
+replacements and the old watermark. The next pass must finish the window.
+Every configured fault or pause must be observed, so an unexercised fault path
+cannot make a scenario pass.
 
 ### Format/property/fuzz tests
 
@@ -1132,10 +1337,42 @@ an advanced watermark without its generations, or two valid writers.
   batches, and integer encodings over randomly generated byte keys.
 - Prove generation visibility at catalog-commit boundaries under randomized
   compaction/import publication.
+- Change an imported timestamp without changing the compressed frame length;
+  prove the corrected checksum and HTTP validators change, and Range requests
+  cannot combine generations unnoticed. Cover legacy-format compatibility.
+- Compare reconstructed rule lookup results with the source rule database,
+  including import order, duplicate paths, version-specific rules, and
+  interrupted imports restored to an earlier catalog point.
 
 ### Oracle and mutation campaign
 
-Run the full oracle against both backends. Add seeded scenarios for:
+The existing local-storage oracle remains fully supported with its current
+correctness properties and coverage. Adding disaggregated mode must not weaken
+local assertions, skip local fault/restart/power-loss tiers, reduce detection
+of applicable mutants, or introduce cloud-service requirements into local
+tests. This applies especially to refactors of shared ingest, segment, and
+storage interfaces. See `specs/oracle.md` for the preservation requirement.
+
+Reuse the simulator's independent world model, expected event history,
+fold-convergence checks, and public client observers for both backends. The
+existing filesystem observer, strict-memory-filesystem power-loss tests, and
+Pebble fault hooks cannot simply be run against PostgreSQL/S3. Keep those local
+tiers and add remote equivalents for their applicable guarantees. Remote
+coverage should follow the local oracle's independent-model, fault-accounting,
+and mutation-testing principles even where the harness differs. Share code
+where useful; separate backend-specific harnesses are acceptable and must not
+force either backend down to a weaker common set of assertions.
+
+Remote durability tests should run the real runtime and SQL/object adapters
+against disposable services, kill and replace writer processes, and inspect
+catalog plus object bytes independently of the production read path. Use
+controllable proxies or service fault seams for delayed responses and
+partitions. Fakes exercise protocol state transitions cheaply; real-service
+tests establish transaction, session-lock, and object-version behavior. Heavy
+failover, retention, and restore drills belong in explicit test recipes rather
+than making every short test depend on cloud services.
+
+Add seeded scenarios for:
 
 - crash in every block/seal/publication stage;
 - database failover and stale replica reads;
@@ -1146,6 +1383,11 @@ Run the full oracle against both backends. Add seeded scenarios for:
 - compaction/import racing plans and long-lived cold replay;
 - bootstrap, merge, repair, and relay replay across failover;
 - GC racing dedup/republication and PITR-window retention.
+
+Exercise the current client under transient and exhausted download retries,
+generation changes, and archive-to-live cutover. Assert its documented error
+behavior as well as successful delivery; do not invent automatic replanning
+or silently weaken the independent server data-preservation checks.
 
 Add deliberate test mutations that remove or reorder upload checks, writer
 fences, atomic block-and-cursor commit, remote ceiling updates, gap
@@ -1183,6 +1425,12 @@ Measure all of the following before production use:
   publication conflict rate;
 - initial 6.4M-block migration time, SQL index size, upload/list/inventory cost,
   and verification throughput;
+- retained generation-block rows, descriptor bytes, indexes, WAL, and cleanup
+  throughput over a full retention window of rewrites. A generation with
+  1,000 blocks currently adds 1,000 new reference rows even if just one block
+  changes in S3; object reuse does not imply catalog-row reuse;
+- retained timestamp rule count and key bytes, in-memory representation cost,
+  local-index disk requirements, and cold reconstruction time from S3 inputs;
 - writer and database failover time, burned seq range, relay catch-up, and
   connection storm behavior;
 - GC scan/delete rate and database/object retention cost.
@@ -1239,12 +1487,17 @@ but virtual read fan-out or database round trips could be.
   does not serialize relay cursor, per-DID order, lifecycle, verifier state, or
   active segment topology.
 
-## Decisions that still require measurement
+## Remaining decisions and measurements
 
-The architecture is decided; these parameters and optimizations are not:
+The storage direction is decided. The shared checksum correction still needs
+an explicit compatibility decision covering format versions, existing files,
+and clients before implementation; performance measurements alone cannot
+settle it. These implementation choices and parameters also remain open:
 
 1. PostgreSQL service/topology (RDS PostgreSQL versus Aurora PostgreSQL), pool
-   sizes, transaction isolation, and exact schema indexes/partitioning.
+   sizes, query tuning, and exact schema indexes/partitioning. The archive-row
+   lock through commit and consistent planning snapshot are correctness
+   requirements, not optional isolation-level optimizations.
 2. Remote sequence grant size and renewal threshold.
 3. S3 multipart threshold, upload concurrency, retry budget, and supported
    compatible providers.
@@ -1263,6 +1516,9 @@ The architecture is decided; these parameters and optimizations are not:
 10. Recovery point, recovery time, and availability targets for database
     failover, S3 outages, relay retention, regional recovery, and full archive
     verification.
+11. Timestamp rule lookup representation and its memory, disk, and startup
+    budgets. Permanent S3 input retention is decided; loading the whole rule
+    map in memory or rebuilding a local index must be measured.
 
 No measurement or optimization may weaken upload-before-reference, atomic
 block-and-metadata commit, writer fencing, immutable generations, rollback
@@ -1272,9 +1528,14 @@ protection, or PITR-aware garbage collection.
 
 The backend is production-ready only when:
 
-- local mode remains green and within its performance baseline;
-- the same oracle expectations pass on disaggregated mode, including restart,
-  failover, compaction, import, bootstrap/merge, and archive-to-live cutover;
+- local mode retains the existing oracle's assertion strength, applicable
+  tiers, and mutation-backed detection, remains green, and stays within its
+  performance baseline; passing after weakening or skipping checks does not
+  satisfy this criterion;
+- the applicable independent oracle expectations pass through remote storage
+  and real-service tests, including restart, failover, compaction, import,
+  bootstrap/merge, and archive-to-live cutover; local-only test mechanisms have
+  explicit remote coverage rather than being silently dropped;
 - mutation tests catch violations of the new write-order, fencing, and GC
   rules;
 - a supported S3 service and PostgreSQL HA setup pass behavior and forced
@@ -1282,6 +1543,11 @@ The backend is production-ready only when:
 - an existing production-sized archive migrates and reconstructs with exact
   recipe/file/event comparisons;
 - database PITR is restored against retained objects and no seq is reused;
+- timestamp inputs remain available permanently, rule state survives migration
+  and total local-disk loss, and missing import workspace cannot report false
+  completion;
+- corrected segment checksums cover timestamp changes and pass existing-format
+  and client compatibility checks;
 - S3, database, KMS, and cache outage behavior is bounded and observable;
 - GC completes a full retention cycle without deleting anything reachable by
   the oldest supported database recovery point, HTTP cache, active read, or
