@@ -44,11 +44,11 @@ type dialFunc func(ctx context.Context, url string) (wsConn, error)
 type liveConfig struct {
 	host string // normalized base URL, e.g. "https://host"
 	// cursor is the initial WIRE resume point sent as ?cursor= on the first
-	// connection. cursor=0 means "replay from the beginning" (everything, since
-	// the first real event is seq 1); a positive value resumes from that seq. The
-	// server replays inclusively (it delivers seq >= cursor; see
-	// internal/subscribe/replay.go); the consumer's own seq dedup turns that into
-	// the effective "> last delivered" on resume. Ignored when fromTip is set.
+	// connection: either a seq or a legacy unix-microsecond timestamp. cursor=0
+	// means "replay from the beginning" (everything, since the first real event
+	// is seq 1). A seq resume is inclusive; the consumer's own seq dedup turns it
+	// into the effective "> last delivered". A timestamp is only a server-side
+	// seek position and therefore has dedupFloor 0. Ignored when fromTip is set.
 	cursor uint64
 	// fromTip, when true, omits the ?cursor= param so the server starts at the
 	// live tip with no replay. This is the WithLiveCursor(0) "live from tip"

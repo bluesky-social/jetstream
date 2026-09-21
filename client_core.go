@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/jcalabro/atmos/xrpc"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
@@ -28,6 +29,16 @@ const maxRebackfillStalls = 5
 // holding events until BatchSize accumulates. Backfill fills batches by count
 // almost immediately, so this only governs the steady-state tail.
 const defaultMaxBatchDelay = 20 * time.Millisecond
+
+// liveCursorDedupFloor maps the overloaded initial wire cursor to the seq
+// coordinate used by the live consumer's duplicate suppression. Legacy time
+// cursors are seek positions, not evidence of a previously delivered seq.
+func liveCursorDedupFloor(cursor uint64) uint64 {
+	if cursor >= seqspace.CursorSeqMaxThreshold {
+		return 0
+	}
+	return cursor
+}
 
 // engineConfig is the resolved engine configuration the root package passes in.
 type engineConfig struct {
@@ -293,16 +304,21 @@ func (e *replayEngine) runLiveOnly(ctx context.Context, emitBatch func([]Event) 
 	// LiveCursor is a pure-live resume point with 0 meaning "from the current
 	// tip" (the documented WithLiveCursor contract): 0 -> fromTip (omit the wire
 	// cursor), a non-zero cursor -> resume from it.
+	// The wire cursor has two namespaces. A seq cursor is also the highest seq
+	// the caller already holds, so it seeds live dedup. A legacy unix-microsecond
+	// timestamp is only a server-side seek position: it says nothing about which
+	// instance-local seqs the caller has delivered. Start its dedup floor at zero
+	// and let the first translated event establish the seq resume point.
+	dedupFloor := liveCursorDedupFloor(e.cfg.LiveCursor)
 	consumer := newLiveConsumer(liveConfig{
 		host:        e.cfg.Host,
 		zstdDict:    e.fetchZstdDict(liveCtx),
 		refetchDict: e.fetchZstdDict,
 		cursor:      e.cfg.LiveCursor,
 		fromTip:     e.cfg.LiveCursor == 0,
-		// Pure-live resume: a saved LiveCursor means the caller already holds
-		// events through it, so it is also the dedup floor. From-tip (0) leaves
-		// the floor 0 so the first event delivered passes.
-		dedupFloor: e.cfg.LiveCursor,
+		// Pure-live seq resume: a saved seq means the caller already holds events
+		// through it. Timestamp resumes use the zero floor computed above.
+		dedupFloor: dedupFloor,
 		// Forward the filters so the server prunes server-side; the inline
 		// wantsLive matcher above remains the correctness backstop.
 		collections: e.cfg.Request.Collections,

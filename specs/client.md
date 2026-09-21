@@ -197,8 +197,11 @@ unit that straddles it doesn't re-emit already-delivered rows.
 
 **v1/v2 cursor namespace**: the server splits seq cursors from v1
 unix-microsecond cursors at `CursorSeqMaxThreshold = 1e15`
-(`internal/subscribe/cursor.go`) — a client never needs to disambiguate,
-but must not fabricate cursors near that boundary.
+(`internal/subscribe/cursor.go`). The bundled client's pure-live path mirrors
+that split for one reason: a seq cursor is also the initial dedup floor, while a
+timestamp is only a server-side seek position and starts with no seq dedup
+floor. Once the first timestamp-resumed event arrives, reconnects use its real
+seq. Clients must not fabricate cursors near the namespace boundary.
 
 ## Compression (dict-zstd)
 
@@ -258,7 +261,8 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
   whole archive) / `WithBeforeSeq` (inclusive; requires
   `WithSnapshotOnly` — a live tail with an upper bound would silently
   drop every later live event). Pure live: `WithLiveCursor` (0 = from
-  the current tip).
+  the current tip; values below `1e15` are saved seqs; values at or above it
+  are legacy unix-microsecond timestamp seek positions).
 - Filters: `WithKinds`, `WithCollections` (exact or `ns.*`), `WithDIDs`.
   Subscribe validates, deduplicates, and canonicalizes all three axes once,
   then forwards the same immutable predicate to every plan page and live

@@ -177,9 +177,17 @@ func WithSnapshotOnly() Option {
 	return func(c *config) { c.snapshotOnly = true }
 }
 
-// WithLiveCursor resumes a pure live tail from a previously saved cursor
-// (typically Batch.LastCursor from a prior run). Delivery resumes after cursor;
-// the server's inclusive replay of cursor itself is deduplicated by the client.
+// WithLiveCursor resumes a pure live tail from a cursor. A value below 1e15 is
+// a previously saved sequence cursor (typically Batch.LastCursor from a prior
+// run); delivery resumes after it because the client deduplicates the server's
+// inclusive replay. For compatibility with Jetstream v1, a value at or above
+// 1e15 is a unix-microsecond timestamp: the server seeks to the first retained
+// event witnessed at or after that time, and the client establishes its seq
+// deduplication floor from the first event delivered.
+//
+// Timestamp resumes are at-least-once. They may re-deliver an event at the
+// boundary and must not be deduplicated by Event.TimeUS, which can be an
+// imported display timestamp rather than the witnessed time used for seeking.
 // Ignored when an archive replay is requested, since that workflow computes its
 // own live cutover cursor.
 func WithLiveCursor(seq uint64) Option {
