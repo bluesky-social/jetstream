@@ -164,7 +164,7 @@ same time. Selectors are `job="jetstream",instance=~"pop[12]"`, excluding
 review used `4accd6a`. Counter increases account for resets, and series are
 aggregated by instance after applying rate/increase.
 
-| Observation | pop1 | pop2 |
+| Observation | pop1 (typical steady state) | pop2 (large-PDS recovery) |
 | --- | ---: | ---: |
 | Archived events/s, six-hour mean | 305 | 127,616 |
 | Block flushes/s, six-hour mean | 0.0745 | 173.0 |
@@ -182,15 +182,25 @@ aggregated by instance after applying rate/increase.
 | Successful `getBlock` requests/s, six-hour mean | 9.49 | No request series |
 | `getBlock` response bytes/s, six-hour mean | 1.95MB | 0 |
 
-Both instances reported steady state throughout the sampled six-hour window.
-The retry counter shows why steady state is not synonymous with a quiet live
-firehose: pop2 was repairing repos at substantial scale. Its last 30 minutes
-still averaged 104 blocks/s and 364 metadata batches/s. The current metric does
-not distinguish synchronous from non-synchronous batch commits or identify
-all callers; do not describe every batch as a block durability transaction.
-Likewise, `getBlock` traffic is not all read traffic: pop1 also reported about
-1,877 cold subscribe reads/s, which may share cached decoded blocks and are
-**not** an S3 GET-rate estimate.
+Both instances reported the steady-state lifecycle phase throughout the
+sampled six-hour window. Operator context supplied after this review explains
+the difference: **pop2 was recovering one very large PDS; pop1 is representative
+of typical steady-state operations.** The lifecycle gauge does not distinguish
+that exceptional recovery from ordinary live ingest. Pop2's last 30 minutes
+still averaged 104 blocks/s and 364 metadata batches/s, but those numbers are
+an exceptional-workload benchmark, not the baseline or a minimum normal-service
+throughput requirement.
+
+Here, repo repair/recovery means retrying previously failed repository fetches
+from a PDS and ingesting the recovered repo state through the normal sync-marker
+and record write path. Recovering a large PDS can produce far more archive
+writes than its ordinary live traffic.
+
+The current batch metric does not distinguish synchronous from non-synchronous
+commits or identify all callers; do not describe every batch as a block
+durability transaction. Likewise, `getBlock` traffic is not all read traffic:
+pop1 also reported about 1,877 cold subscribe reads/s, which may share cached
+decoded blocks and are **not** an S3 GET-rate estimate.
 
 Representative reproducible queries (run with the datasource above and
 `--time 2026-09-22T12:00:00Z -o json`):
@@ -203,18 +213,28 @@ sum by(instance) (increase(jetstream_compaction_bytes_rewritten_total{job="jetst
 sum by(instance) (increase(jetstream_backfill_failed_repo_retry_succeeded_total{job="jetstream",instance=~"pop[12]"}[6h]))
 ```
 
-These observations change the implementation requirements:
+Use pop1 to size the initial steady-state path and pop2 to test bounded
+behavior and recovery time under exceptional load:
 
-- **Bounded concurrent uploads and ordered commit are required.** A serial
-  PUT-plus-SQL path would need less than 4.1ms per block just to match pop2's
-  sampled peak. The pipeline must hide object-store latency while preserving
-  append order and metadata dependency boundaries. Grouping consecutive ready
-  blocks into one transaction is permitted; increasing the on-disk block size
-  is not a substitute for this work.
-- **Do not translate each Pebble call into its own SQL round trip.** Batch
-  dependency-compatible mutations, use multi-get and prepared SQL, and measure
-  retry/bootstrap producers as well as live input. The archive-row lock
-  serializes publication, so transaction size and lock duration both matter.
+- **Start with one block upload and commit at a time per writer namespace.**
+  Pop1 averaged one flush every 13.4s, with a sampled five-minute peak of
+  0.173 blocks/s. These measurements do not justify a concurrent upload
+  pipeline or multiple client-visible pending blocks as first-release
+  requirements. Benchmark PUT/verification/SQL latency and its effect on live
+  delivery before adding those mechanisms.
+- **Recovery may take longer, but must stay correct and bounded.** Pop2's
+  sampled peak would require less than 4.1ms per block on a serial path to
+  match its existing local throughput. Matching that exceptional rate is not
+  a correctness requirement. Limit repair/backfill producer pressure, preserve
+  live ingest and safe-cursor progress, and measure recovery completion time
+  against an explicit operational target and upstream replay retention. Add
+  bounded concurrent uploads/ordered publication only if those targets cannot
+  be met by the simpler path. Never accept unbounded backlog or silent loss.
+- **Preserve existing metadata batching first.** Keep block-dependent mutations
+  in their existing durability batch and use prepared SQL. Measure point-read
+  latency and producer throughput; add multi-get or coalescing of independent
+  metadata updates where measurements justify it. Do not split a batch's
+  durability boundary to reduce latency.
 - **Keep unchanged block bytes.** Whole-segment uploads would inherit the
   measured multi-terabyte rewrite traffic. A changed block still needs an
   upload; deduplication does not eliminate compaction reads or footer work.
@@ -229,8 +249,10 @@ These observations change the implementation requirements:
   objects remain deferred.
 
 These are observed workloads, not capacity limits or remote-backend benchmarks.
-Test peak backfill/repair, import, cache-cold replay, throttling, failover, and
-larger archives before production cutover.
+Test typical steady state and exceptional backfill/PDS recovery separately,
+along with import, cache-cold replay, throttling, failover, and larger archives.
+Accept bounded throttling during exceptional work only when live-service and
+recovery-time targets still pass.
 
 ## Preserved and new invariants
 
@@ -255,8 +277,8 @@ forms are:
    takes the same row lock. Losing the leadership connection stops new work and
    requires a new epoch before reuse; an already-running transaction must
    finish before takeover or be rejected.
-6. **A block and its metadata commit together.** References for a contiguous
-   prepared block prefix, exact `seq/next`, safe `relay/cursor`, and all eligible
+6. **A block and its metadata commit together.** The prepared block's reference,
+   exact `seq/next`, safe `relay/cursor`, and all eligible
    repo, verifier, sync, and lifecycle mutations commit together. A later
    prepared block cannot make its metadata eligible early.
 7. **Client-observable seqs are never reused.** A monotonically increasing S3
@@ -681,20 +703,19 @@ considering persistent block-list trees or recipe packs.
 
 Before assigning a seq or publishing to the readable log, confirm it is inside
 the current session's S3 grant, recorded in a fenced PostgreSQL transaction.
-The grant protects all pending blocks; the remote mode does not use local
-mode's one-block lease or its synchronous-flush restriction. Local behavior is
-unchanged.
+The grant protects pending events without a second PostgreSQL lease. Start
+with the current synchronous flush shape: one pending/prepared block per writer
+namespace, upload/verify it, then publish it and its dependent metadata before
+accepting the next block. Local behavior is unchanged. Bound encoded bytes and
+flush age, including readable-log entries pinned until durability. The much
+larger S3 grant is never a memory or pending-event budget.
 
-Use one bounded pipeline: prepare in ingest order, compress/upload concurrently,
-and publish in original order. Limits cover total pending bytes as well as
-block count, including readable-log entries pinned until durability. No new
-unbounded queue is allowed. The existing `PreparedBlock`/ordered-commit shape
-is a useful starting point; its current callbacks and ownership rules need an
-audit before they can support multiple client-visible pending blocks.
-Remote mode's uncommitted exposure window can therefore exceed local mode's
-one block, but is bounded by the configured pipeline and flush-age limits.
-The grant size is never the memory or pending-event budget. Lost pending work
-is recovered from the safe upstream cursor, with fresh seqs after restart.
+A bounded concurrent pipeline is a possible later optimization if measured
+backfill/recovery or live-latency targets require it. It would prepare in ingest
+order, upload concurrently, and publish only contiguous ready blocks in order.
+That requires an explicit audit of callback ownership and metadata eligibility,
+plus tests for multiple client-visible pending blocks; removing the small SQL
+lease alone does not make today's callbacks safe for pipelining.
 
 For each block:
 
@@ -703,12 +724,11 @@ For each block:
    descriptors needed for recovery/sealing. Preserve per-DID ingest order.
 2. Register or reuse the object row, upload if needed, and verify length/hash
    and the exact provider version. Do this outside catalog publication locks.
-3. Once a contiguous prefix of prepared blocks is ready, start a short SQL
-   transaction. Lock the archive control row, check the writer epoch, then
-   check the expected active tail and lock referenced object rows in a stable
-   order. Attach only available objects. A batch may contain one or several
-   consecutive blocks; it may never jump over an unfinished block.
-4. Insert those block references and update the exact `seq/next`, safe relay
+3. Once the block is verified, start a short SQL transaction. Lock the archive
+   control row, check the writer epoch, then check the expected active tail
+   and lock referenced object rows in a stable order. Attach only available
+   objects; publication never jumps over an unfinished block.
+4. Insert the block reference and update the exact `seq/next`, safe relay
    cursor, eligible repo/host completion, verifier/sync/account state, and
    lifecycle progress in the same transaction. Capture eligibility at prepare
    time; sampling the producer's latest mutable state at commit time can put
@@ -768,9 +788,9 @@ an unreferenced footer object and the old active list. A crash after it
 leaves one complete sealed generation and one new active segment.
 
 Drain pending blocks before sealing; no append can race the frozen tail.
-The transaction may copy hundreds or a few thousand reference rows. Test it
-at the measured repair rotation rate as well as quiet live traffic. If copying
-rows is expensive, measure staging the immutable generation before the small
+The transaction may copy hundreds or a few thousand reference rows. Measure
+its lock duration under typical live traffic and rate-limited PDS recovery. If
+copying rows is expensive, measure staging the immutable generation before the small
 pointer-swap transaction; staged rows must be unservable and protected from GC.
 Do not introduce that extra state until the straightforward transaction fails
 the measured lock-duration budget.
@@ -899,7 +919,7 @@ database ceases to be durable in remote mode.
 
 After successful rule activation, drain/force-rotate the writer before taking
 the bucket/patch target inventory, as the current import preamble does. This
-must include all prepared pre-activation blocks in the remote pipeline. Those
+must include all pending/prepared work from before activation. Those
 rows may have entered the readable log before activation and still need the
 historical patch; later appends are stamped under the active rule revision.
 
@@ -1148,9 +1168,9 @@ different event. S3's ceiling does not reconstruct lost catalog transactions
 or prove the upstream still retains the lost interval: PITR is explicit
 recovery, not a zero-data-loss failover guarantee.
 
-Choose `G` and its renewal threshold from measured **repair/backfill** rates,
-not only the live firehose. Check arithmetic and stop before the shared
-`1e15` cursor namespace limit. Alert on burned ranges and remaining space.
+Choose `G` and its renewal threshold for typical live traffic and the supported,
+possibly rate-limited backfill/PDS-recovery rate. Check arithmetic and stop before
+the shared `1e15` cursor namespace limit. Alert on burned ranges and remaining space.
 A large grant reduces control PUTs but increases restart gaps; it does not
 permit unbounded buffering or continued ingest when block uploads fail.
 
@@ -1355,7 +1375,7 @@ The required contracts are:
 
 | Operation | Responsibility |
 | --- | --- |
-| Publish a prepared block prefix | Ordered block references and exactly eligible metadata in one durability boundary; epoch/grant guards belong here. |
+| Publish a prepared block | Its reference and exactly eligible metadata in one durability boundary; epoch/grant guards belong here. |
 | Commit independent metadata | Reject dependent mutations; preserve ordered range/prefix scans and atomic batches. |
 | Seal or replace a generation | Expected source/tail check, immutable recipe, reference retention, and progress in one transaction. |
 | Capture a read view | Consistent sealed/active coverage and vacancies; release SQL before remote I/O. |
@@ -1540,8 +1560,9 @@ environment variable or restarting the old local directory is not rollback.
    tests, schema, migrations, fencing, and transaction failure tests.
 4. **S3 object layer:** conditional creates, checksum verification, retries,
    cache, inventory audit, and real-provider behavior tests.
-5. **Disaggregated ingest:** bounded upload/ordered commit, batching, rotation,
-   remote grants, failover, and active cold replay.
+5. **Disaggregated ingest:** serial block upload/commit, existing metadata
+   batching, rotation, remote grants, failover, and active cold replay. Add a
+   concurrent pipeline only if measured service/recovery targets require it.
 6. **Read APIs:** checksum-consistent plans, generation-consistent segment
    streaming, primary-backed reader processes, and load tests.
 7. **Rewriters:** compaction, timestamp import, bootstrap/merge, and GC.
@@ -1641,8 +1662,9 @@ finishes later. Use barriers to exercise at least:
   with crashes between batches and before the global watermark advances;
 - a replacement writer with all local rule and bucket files removed, including
   a persisted `Bucketed` job and a completed import that must stamp new events;
-- out-of-order upload completion with a stalled first block, multiple pending
-  client-visible blocks, and metadata for a later block that must not commit
+- a stalled block upload with bounded producer backpressure and safe metadata;
+  if a concurrent pipeline is added, also test out-of-order uploads, multiple
+  pending client-visible blocks, and rejection of later-block metadata committed
   early; crash/restore afterward and prove every observed seq remains unique;
 - a timed-out ceiling CAS finishing after a later GET, renewal racing takeover,
   and repeated empty/clean restarts; no path may resume an old grant;
@@ -1754,9 +1776,13 @@ the real writer's ownership.
 
 Measure all of the following before production use:
 
-- sustained and burst ingest with concurrent PUTs and ordered synchronous SQL
-  publication, including at least the measured repair envelope and headroom;
-  report pending-byte caps, batch size, and oldest-pending-block age;
+- typical steady-state ingest using pop1 as the baseline, with headroom and
+  serial PUT/verification/synchronous SQL publication; report pending-byte caps,
+  oldest-pending-block age, and live-delivery latency at flush boundaries;
+- exceptional large-PDS recovery using pop2 as the stress input: report producer
+  throttling, live-ingest fairness, saved-cursor age, and completion time. Matching
+  pop2's local peak is not required unless the agreed recovery target demands it;
+  benchmark a bounded pipeline only if the serial path misses those targets;
 - p50/p95/p99 block commit and live-delivery lag;
 - PostgreSQL QPS/CPU/WAL/storage under backfill, steady ingest, compaction,
   import, status collection, and many readers;
@@ -1838,9 +1864,11 @@ to validate compatibility and choose deployment budgets:
    transaction timeouts, and catalog indexes/cleanup over a full retention
    window. Aurora or other S3-compatible providers are later validation work,
    not a requirement to build a portable provider framework up front.
-2. Remote grant size/renewal threshold, pending block/byte caps, upload/read
-   concurrency, retry deadlines, and failover targets under measured repair
-   load. Do not hide insufficient throughput by adding an unbounded queue.
+2. Remote grant size/renewal threshold, byte caps, read concurrency, retry
+   deadlines, and typical steady-state latency targets. Separately set an
+   acceptable completion time and producer rate limit for exceptional PDS
+   recovery/backfill. Add upload concurrency only if the serial path fails those
+   targets; never hide insufficient throughput behind an unbounded queue.
 3. Cache and derived rule-index disk budgets, rule activation pause/rebuild
    time, and maximum read-view age `D`. Whole-file/pack caches, SQL replicas,
    and remote rule-index checkpoints require measurements before being added.
