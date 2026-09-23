@@ -403,12 +403,8 @@ func TestWants_DoesNotEnforceMaxMessageSize(t *testing.T) {
 	require.True(t, f.Wants(huge))
 }
 
-// TestParseMaxMsgSize_V1Compat locks down the silent-coercion behavior.
-// V1 PARITY (deliberate divergence from CLAUDE.md's "no silent fallbacks"
-// rule): the v1 README states "Zero means no limit, negative values are
-// treated as zero." Existing v1 clients send "0", "" and (occasionally)
-// garbage and rely on this exact coercion. See the design doc for the
-// full rationale.
+// TestParseMaxMsgSize_V1Compat preserves v1 coercion: empty, malformed, and
+// negative limits mean no cap.
 func TestParseMaxMsgSize_V1Compat(t *testing.T) {
 	t.Parallel()
 

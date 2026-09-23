@@ -15,86 +15,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ============================================================================
-// Same-seed trace determinism guard (issue #27 — "stabilize deterministic
-// inputs"). READ THIS BEFORE DEBUGGING A FAILURE.
-// ============================================================================
+// Same-seed trace check (#27). Run the lifecycle in two child processes
+// because it permits one synctest bubble per process. Compare only
+// deterministicTraceKinds: scheduler-dependent completion order is excluded.
+// Measure repeatability before adding a kind.
 //
-// WHAT THIS TEST DOES
+// For payload differences, check unsorted map iteration and unseeded
+// randomness first. Fix the source; remove a kind only if its concurrency
+// dependence is established and documented. Fake time alone does not trigger
+// this check.
 //
-// It runs the full oracle lifecycle (TestOracle_DefaultLifecycle) TWICE at the
-// SAME seed, in two separate child processes, and asserts that the
-// DETERMINISTIC-INPUT sections of the two run traces are byte-identical. It is
-// the DoD item "a small same-seed oracle run can compare deterministic-input
-// trace sections across repeated runs."
-//
-// WHY TWO CHILD PROCESSES (not a loop)
-//
-// The lifecycle runs inside a testing/synctest bubble, and the harness enforces
-// ONE bubble per process (the synctestBubbleUsed guard defined in
-// synctest_test.go, checked at the top of the harness). So we cannot
-// run it twice in-process; instead we re-exec THIS test binary twice with
-// `-test.run=^TestOracle_DefaultLifecycle$`, each child pinned to the same seed
-// and writing its trace to a temp dir we then read back. This mirrors the
-// restart tier's subprocess pattern (runRestartChild).
-//
-// WHY ONLY *SECTIONS*, NOT THE WHOLE TRACE
-//
-// The lifecycle does heavy concurrent work (≈100 backfill workers; the live
-// consumer racing compaction at shutdown). The ORDER in which those goroutines
-// finish is decided by the Go scheduler, NOT by our seed, so trace kinds like
-// backfill_repo_complete / bootstrap_live_event / steady_state_event /
-// compaction_pass / client_backfill_* legitimately differ run-to-run. Forcing
-// them to match would mean serializing the concurrency the oracle exists to
-// exercise — the wrong fix. So we compare only the kinds whose content is a
-// pure function of the seed (config, fault schedule, phase progression,
-// event-log equivalence counts): see
-// deterministicTraceKinds below. This empirical split was measured (run twice,
-// diff) before the allowlist was written; do not widen it without re-measuring.
-//
-// ----------------------------------------------------------------------------
-// IF THIS TEST FAILS, HERE IS HOW TO DIAGNOSE IT (in likelihood order):
-//
-//  1. "deterministic section <kind>#<i> diverged" with a 1:/2: payload diff.
-//     A trace field that USED to be a pure function of the seed is now
-//     nondeterministic. By far the most likely cause is UNSORTED MAP ITERATION:
-//     someone added a map-derived value to that kind's payload and ranged a Go
-//     map without sorting first. Go randomizes map iteration order PER PROCESS,
-//     and the two runs are separate processes, so the field differs.
-//     (Note: wall-clock time is NOT a likely cause here — the lifecycle runs in
-//     a synctest bubble with a deterministic fake clock, so time.Now() is
-//     identical across same-seed runs. Verified: a time.Now() probe does NOT
-//     trip this test; an unsorted-map probe DOES. The realistic culprits are
-//     unsorted map iteration or unseeded RNG, which is exactly the #27
-//     "sort map-derived output / seed jitter" surface this test polices.)
-//     FIX: make that field deterministic at its source (sort the map keys, seed
-//     the RNG, drop the nondeterministic field, or hash it stably). Do NOT
-//     "fix" it by removing the kind from the allowlist unless you have proven
-//     the field is genuinely concurrency-dependent and cannot be made stable —
-//     and if so, say why in a comment next to the allowlist entry you remove.
-//
-//  2. "deterministic section line counts differ" (one run has more/fewer
-//     allowlisted lines). A control-flow path now depends on scheduling: e.g. a
-//     phase or a compaction pass fires a different NUMBER of times depending on
-//     a race. Inspect which kind changed count (the failure logs both traces'
-//     paths). If it's a genuinely racy count (like compaction_pass), that kind
-//     should not be on the allowlist — but verify that's really the cause and
-//     not a regression that made a deterministic step conditional on timing.
-//
-//  3. A child failed to produce a trace / exited non-zero. This is usually NOT
-//     a determinism problem — it's the lifecycle itself failing at this seed
-//     (look at the child's captured output in the failure log). If the default
-//     seed started failing, that's a lifecycle regression to chase first;
-//     determinism is unprovable until the run is green. (Seed 42 in fast+swarm
-//     mode was chosen because it passes reliably; some other seeds hit known
-//     seed-specific lifecycle failures unrelated to determinism.)
-//
-//  4. Flake / environment. The two children inherit this process's env. If you
-//     set JETSTREAM_ORACLE_* in your shell, both children pick it up; that's
-//     fine as long as BOTH get the same values (we force seed/mode/fault-mode
-//     explicitly below, so a stray seed override is neutralized). go_version
-//     and gomaxprocs are normalized out, so a different machine won't flake it.
-// ----------------------------------------------------------------------------
+// For count differences, check whether a previously deterministic step became
+// scheduling-dependent. If a child exits without a trace, diagnose the
+// lifecycle failure from its output first. Both children inherit the
+// environment but override seed, mode, and fault mode; Go version and
+// GOMAXPROCS are normalized out.
 
 const (
 	// envTraceDeterminismChild marks a re-exec'd child of this harness so the

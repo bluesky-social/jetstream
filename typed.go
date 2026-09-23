@@ -48,43 +48,22 @@ func (b *TypedBatch[T]) LastCursor() uint64 {
 	return maxSeq
 }
 
-// TypedEvents adapts a Client's event stream into records decoded as type T.
-// During archive replay it avoids the generic map[string]any decode that dominates
-// client CPU and allocations at scale (#142). The client MUST have been built
-// with WithRawRecords or WithRawRecordsCopied so parallel archive workers pass
-// segment CBOR straight to PT.UnmarshalCBOR. Live records are canonicalized from
-// their atproto JSON representation before the same typed decode; live volume is
-// low relative to archive replay, so that conversion is not the bottleneck.
+// TypedEvents decodes a Client's records as T through PT.UnmarshalCBOR. T is
+// a lexicon record type and PT its pointer. The client must use
+// WithRawRecords or WithRawRecordsCopied so archive workers decode CBOR
+// directly. Live JSON records are canonicalized before typed decoding.
 //
-// T is a lexicon record type and PT its pointer, constrained to implement
-// UnmarshalCBOR — exactly the shape atmos's generated record types satisfy, so
-// the call site is just:
+// collection must be a non-empty NSID matching T. Only its create/update
+// records are decoded; all other events pass through with nil Record. A
+// mismatched type can silently decode incorrect fields. Pair with
+// WithCollections to limit server delivery.
 //
-//	for tb, err := range jetstream.TypedEvents[bsky.FeedLike](ctx, c, "app.bsky.feed.like") {
-//		for _, te := range tb.Events() {
-//			if te.Record != nil { /* te.Record is *bsky.FeedLike */ }
-//		}
-//	}
+// Stream errors retain the ErrFatal contract and yield a nil batch.
+// Per-record failures set TypedEvent.DecodeErr and do not stop iteration.
 //
-// collection is the NSID whose commits are decoded into T; it MUST be non-empty
-// and MUST match the type T. Only create/update commits of that collection are
-// decoded — every other event (deletes, other collections, identity/account/
-// sync) passes through with a nil Record (see TypedEvent). Requiring the
-// collection is a safety measure: feeding one record type's bytes to another's
-// UnmarshalCBOR can silently produce a garbage struct rather than an error, so
-// TypedEvents never guesses. Pair it with WithCollections([]string{collection})
-// on the Client so the server/engine only deliver that collection.
-//
-// Errors from the underlying stream are forwarded verbatim (with a nil batch),
-// preserving the ErrFatal contract. Per-record decode failures are surfaced as
-// TypedEvent.DecodeErr, not as stream errors, so one bad record does not abort
-// iteration.
-//
-// Aliasing/lifetime: with WithRawRecords (the zero-copy default), a decoded *T
-// may alias the client's internal buffer through Event.Commit.RecordCBOR — its
-// string/byte fields are valid only for the current loop iteration. Copy what
-// you need to retain, or build the Client with WithRawRecordsCopied for records
-// that are safe to keep.
+// WithRawRecords may produce strings or bytes that alias the batch buffer and
+// are valid only for the current iteration. Copy retained values or use
+// WithRawRecordsCopied.
 func TypedEvents[T any, PT interface {
 	*T
 	UnmarshalCBOR([]byte) error

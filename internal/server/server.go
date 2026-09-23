@@ -101,34 +101,14 @@ func New(cfg Config, logger *slog.Logger, metrics *obs.Metrics) *Server {
 
 	s := &Server{cfg: cfg, logger: logger, metrics: metrics, statusHandler: cfg.StatusHandler}
 
-	// Timeout policy:
+	// ReadHeaderTimeout bounds slow header uploads; IdleTimeout closes
+	// unused keep-alive connections without limiting active requests.
+	// Global read/write deadlines are unset to allow large transfers and
+	// websocket streams. Handlers can set their own deadlines. The debug
+	// server also leaves these unset so pprof can run for the requested
+	// duration.
 	//
-	//   ReadHeaderTimeout: 10s. Bounds slowloris-style attacks where a
-	//     malicious client trickles request headers byte-by-byte. Cheap and
-	//     universally safe — well-behaved clients send headers in one packet.
-	//
-	//   IdleTimeout: 2m. Bounds keep-alive connections that are sitting open
-	//     between requests. Does NOT affect in-flight requests, so it's safe
-	//     to apply globally. Closes leaked fds from clients that forgot to
-	//     hang up.
-	//
-	//   ReadTimeout / WriteTimeout: deliberately UNSET on the public server.
-	//     The public surface will serve large segment-file downloads (~256 MB
-	//     each) and long-lived websocket streams; a global WriteTimeout would
-	//     kill both. ReadTimeout would similarly cap legitimate streaming
-	//     uploads (e.g. the bulk-timestamp import CSV in docs/README.md §8).
-	//     Per-handler deadlines via r.Context() are the right tool when an
-	//     individual route needs a bound.
-	//
-	//     The debug server inherits the same omissions for symmetry: pprof's
-	//     /debug/pprof/profile and /trace endpoints accept a `seconds` query
-	//     param and intentionally hold the response open for that long, so
-	//     a WriteTimeout here would silently truncate profiles.
-	// Route http.Server's internal error log through slog so panic
-	// recovery, TLS handshake failures, and other server-internal
-	// messages share the same JSON-friendly pipeline as everything
-	// else. Without this they go through the standard log package
-	// to stderr as unstructured text and bypass log shipping.
+	// Route net/http errors through slog for structured logging.
 	stdErrLog := slog.NewLogLogger(logger.Handler(), slog.LevelError)
 
 	s.srv = &http.Server{

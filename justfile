@@ -121,9 +121,7 @@ simulator-reset:
 test-long *ARGS="./...":
     gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 {{ARGS}}
 
-# Runs the tests in -short mode. Hides the skipped-test summary because
-# heavy tests (e.g. the simulator E2E) are deliberately skipped here and
-# the listing is just noise.
+# Run short tests; omit the expected skipped-test summary.
 test *ARGS="./...":
     gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 -short {{ARGS}}
 
@@ -158,33 +156,21 @@ test-race-ci *ARGS="./...":
 oracle:
     JETSTREAM_ORACLE_MODE=stress gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 ./internal/oracle -run TestOracle_DefaultLifecycle
 
-# Sweeps oracle stress mode across randomly-chosen seeds. Intended for the
-# scheduled CI job, which runs one seed per matrix job to reduce the blast
-# radius of hosted-runner failures. The per-seed workload is governed
-# entirely by JETSTREAM_ORACLE_MODE=stress (see internal/oracle/config.go) so
-# there is a single source of truth: do not reintroduce account/record/event
-# overrides here. Pass SEEDS explicitly to grow or shrink a local run.
-#
-# Deterministic transient getRepo and steady-state subscribeRepos disconnect
-# fault injection is on by default (JETSTREAM_ORACLE_FAULT_MODE=swarm); the
-# sweep relies on it to exercise backfill retry/recovery and live reconnect/
-# resume recovery on every seed.
+# Run stress and restart checks across random seeds. CI supplies one fixed
+# seed per matrix job. Workload sizing comes from stress mode in
+# internal/oracle/config.go; change SEEDS to control local coverage. Swarm
+# faults exercise retry and reconnect recovery by default.
 oracle-sweep SEEDS="10" RACE="" FIXED_SEED="":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # Root for per-seed diagnostic artifacts (the JSONL trace and the captured
-    # test output that carries the goroutine dump on a hang). CI sets
-    # ORACLE_ARTIFACT_DIR to a path it uploads on failure; locally it defaults
-    # to a repo-relative dir. The trace is the design's substitute for
-    # bit-reproducible scheduling, so it must outlive the test process.
+    # Keep traces and test output outside temporary test directories so
+    # failures remain diagnosable. CI uploads this directory.
     artifact_root="${ORACLE_ARTIFACT_DIR:-oracle-artifacts}"
     mkdir -p "${artifact_root}"
 
-    # CI supplies a fixed seed for each matrix shard so an infrastructure-only
-    # rerun repeats the interrupted workload rather than silently substituting
-    # a different random scenario. Local multi-seed sweeps continue to draw
-    # fresh seeds by default.
+    # A fixed CI seed repeats the interrupted workload on retry. Local sweeps
+    # use fresh seeds by default.
     fixed_seed="{{FIXED_SEED}}"
     if [[ -n "${fixed_seed}" ]]; then
         if [[ "{{SEEDS}}" != "1" ]]; then
@@ -197,13 +183,9 @@ oracle-sweep SEEDS="10" RACE="" FIXED_SEED="":
         fi
     fi
 
-    # RACE="" (default): no race detector, 30m per-seed timeout. Any non-empty
-    # RACE arg enables `-race` and raises the timeout to 90m, because the race
-    # detector slows execution ~5-15x and inflates memory; the #107 race lane
-    # runs at a low seed count. The restart tier re-execs the SAME test binary
-    # as its child (os.Args[0]), so -race instruments both the parent harness and
-    # the killed child — the data-race coverage is real on both tiers, not just
-    # the parent.
+    # RACE enables the detector and raises the per-seed timeout from 30m to
+    # 90m. Restart children re-execute the same binary, so they inherit race
+    # instrumentation.
     race_flag=()
     per_seed_timeout="30m"
     if [[ -n "{{RACE}}" ]]; then
@@ -213,10 +195,8 @@ oracle-sweep SEEDS="10" RACE="" FIXED_SEED="":
     fi
 
     for i in $(seq 1 "{{SEEDS}}"); do
-        # Draw a fresh random uint64 seed each iteration so successive nightly
-        # runs explore different points in the state space instead of replaying
-        # a fixed 1..N. /dev/urandom is portable across the Linux CI runner and
-        # macOS dev machines; the failing seed is printed below for exact repro.
+        # Use a fresh uint64 seed unless CI supplied one. /dev/urandom works
+        # on Linux and macOS; print the seed for reproduction.
         if [[ -n "${fixed_seed}" ]]; then
             seed="${fixed_seed}"
         else
@@ -226,17 +206,9 @@ oracle-sweep SEEDS="10" RACE="" FIXED_SEED="":
         mkdir -p "${seed_dir}"
         echo "::group::oracle ${i}/{{SEEDS}} seed=${seed}"
         echo "oracle run ${i}/{{SEEDS}} seed=${seed} artifacts=${seed_dir}"
-        # GOTRACEBACK=all makes the runtime print every goroutine's stack when
-        # the test -timeout fires, so a hang is diagnosable instead of a bare
-        # job kill. The per-seed -timeout (30m, matching the mutation campaign)
-        # is deliberately below the corresponding 45m/110m CI job budget so the
-        # dump prints and the artifact upload runs before the job is killed; a
-        # healthy stress seed completes in minutes. JETSTREAM_ORACLE_TRACE_DIR
-        # redirects the harness trace from an ephemeral t.ArtifactDir() into the
-        # uploaded per-seed dir. --jsonfile records the raw test2json stream
-        # (the timeout traceback arrives as package output events), so the dump
-        # is captured regardless of how gotestsum renders its console output;
-        # tee additionally mirrors the console stream for human-readable triage.
+        # Keep the test timeout below CI’s 45m/110m job limit so goroutine
+        # dumps and artifacts survive a hang. Persist the harness trace, raw
+        # test2json output, and console output in the per-seed directory.
         if ! GOTRACEBACK=all \
             JETSTREAM_ORACLE_MODE=stress \
             JETSTREAM_ORACLE_SEED="${seed}" \
@@ -263,16 +235,10 @@ oracle-sweep SEEDS="10" RACE="" FIXED_SEED="":
         fi
         echo "::endgroup::"
 
-        # Restart/crash tier: same per-seed budget. This tier SIGKILLs a real
-        # child subprocess at enumerated crashpoints and asserts recovery does
-        # not lose records; the chain shapes (#113) additionally land durable
-        # create/update/delete intermediates + sync/account tombstones through
-        # the merge, so a nightly random seed here exercises the lost-
-        # intermediate / no-permanent-tombstone / over-drop surface that
-        # DefaultLifecycle does not. It reads JETSTREAM_ORACLE_SEED (default
-        # 101+i) so the sweep varies the chain specifics per run. Cheap vs.
-        # stress DefaultLifecycle (each crash case SIGKILLs in ~0.1s), so it
-        # runs at full per-seed frequency. Not -short (that skips the tier).
+        # Run crash/restart coverage for every seed. The durable chains
+        # include updates, deletes, syncs, and account tombstones that
+        # final-state lifecycle comparison alone cannot check. This tier must
+        # run without -short.
         echo "::group::oracle-restart ${i}/{{SEEDS}} seed=${seed}"
         echo "oracle-restart run ${i}/{{SEEDS}} seed=${seed} artifacts=${seed_dir}"
         if ! GOTRACEBACK=all \
@@ -300,13 +266,9 @@ oracle-sweep SEEDS="10" RACE="" FIXED_SEED="":
 mutation-campaign *ARGS="":
     testing/mutation/run.sh {{ARGS}}
 
-# Runs the full mutation campaign and enforces the committed baseline (#108).
-# Emits a machine-readable result and fails if any mutant regressed
-# (KILLED->SURVIVED), went STALE/BUILD-BROKEN, or drifted from
-# testing/mutation/baseline.json. This is the scheduled CI gate; a
-# SURVIVED->KILLED improvement is reported but does not fail (refresh the
-# baseline to bank it). CI sets MUTATION_RESULT_JSON to a path it uploads as an
-# artifact; locally it defaults to a repo-relative file.
+# Run the mutation campaign and compare with the committed baseline. Fail on
+# lost detection, stale or broken patches, or catalog drift. Improvements are
+# reported for baseline refresh. CI uploads MUTATION_RESULT_JSON.
 mutation-gate:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -317,10 +279,8 @@ mutation-gate:
     go run ./testing/mutation/gate -baseline testing/mutation/baseline.json -result "${result_json}"
     echo "::endgroup::"
 
-# Regenerates testing/mutation/baseline.json from a fresh full campaign at HEAD.
-# Run this (and review the diff) after intentionally adding/retiring a mutant or
-# banking a SURVIVED->KILLED improvement, so the #108 gate has a current
-# source of truth. Requires a clean tree.
+# Regenerate the mutation baseline after reviewing improvements or catalog
+# changes. Requires a clean tree; review and commit the result.
 mutation-baseline:
     testing/mutation/run.sh --json testing/mutation/baseline.json
     @echo "baseline written to testing/mutation/baseline.json — review the diff and commit"
@@ -365,11 +325,8 @@ fuzz-target DURATION PACKAGE TARGET:
     echo "=== FUZZ ${target} (${pkg}) ==="
     go test "${pkg}" -run='^$' -fuzz="^${target}$" -fuzztime={{DURATION}}
 
-# Generate Go XRPC types from the lexicons in ./lexicons.
-# The com.atproto package mapping exists only so lexgen can resolve
-# cross-NSID refs (subscribe.json wraps subscribeRepos events); its
-# generated output is a throwaway duplicate of atmos's own api/comatproto,
-# so it lands in a scratch dir that is deleted afterwards.
+# Generate XRPC types from lexicons/. Resolve com.atproto references through a
+# scratch package; atmos supplies the actual types.
 lexgen:
     go run github.com/jcalabro/atmos/cmd/lexgen -lexdir lexicons -config lexgen.json
     rm -rf .lexgen-scratch

@@ -105,22 +105,11 @@ func Open(cfg Config) (*Writer, error) {
 				return nil, fmt.Errorf("ingest: scan_max_seq %s: %w", path, err)
 			}
 		case errors.Is(segErr, segment.ErrSegmentSealed):
-			// The highest-index segment is already sealed (e.g. the
-			// orchestrator sealed it at cutover). Read its header MaxSeq so
-			// the reconcile below can floor nextSeq past it — symmetric with
-			// the active-branch ScanMaxSeq above. Normally seq/next was
-			// persisted before the seal (rotateLocked flushes the counter,
-			// then seals), so this is a no-op; but if the counter is missing
-			// or an illegal 0, this is what stops the next append from reusing
-			// a seq the sealed segment already contains.
-			//
-			// Open via the checksum-verifying Reader, NOT ReadSealedHeader:
-			// this floor IS a corruption safety net, so it must not itself
-			// trust an unverified header. ReadSealedHeader only validates
-			// magic/version; it does not verify the xxh3 over header+footer,
-			// which covers MaxSeq/EventCount. A corrupt MaxSeq read blindly
-			// would floor nextSeq off garbage (silent seq reuse or a seq gap).
-			// segment.Open fails loud on a bad checksum — crash > corruption.
+			// A sealed tail may hold seqs beyond missing or zero
+			// seq/next metadata. Verify its checksum before using
+			// MaxSeq as the recovery floor; ReadSealedHeader
+			// alone does not verify the checksum covering MaxSeq
+			// and EventCount.
 			r, openErr := segment.Open(segment.ReaderConfig{Path: path, FS: cfg.FS})
 			if openErr != nil {
 				return nil, fmt.Errorf("ingest: open sealed %s: %w", path, openErr)
@@ -877,22 +866,14 @@ func SegmentFilesFS(fs vfs.FS, dir string) ([]SegmentFile, error) {
 	return out, nil
 }
 
-// recoverSealedTailMaxSeq finds the highest seq envelope among the sealed
-// segments STRICTLY BELOW highestIdx, scanning newest-first and returning the
-// first non-empty one (segments are seq-monotonic in creation order, so the
-// highest-index non-empty segment holds the global max). It is the fallback for
-// Open's recovery floor when the highest segment carries no envelope of its own
-// (a truly empty active segment, or an empty/compacted-empty sealed segment):
-// without it a missing/illegal-0 seq/next would reuse seqs a lower segment owns.
+// recoverSealedTailMaxSeq scans sealed segments below highestIdx newest-first
+// for a non-empty seq envelope. It provides a recovery floor when the highest
+// segment is empty, preventing missing or zero seq/next metadata from reusing
+// earlier seqs.
 //
-// Each candidate is opened with the checksum-verifying segment.Open (not
-// ReadSealedHeader): like the highest-segment branch, this is a corruption
-// safety net and must not floor nextSeq off an unverified header. A still-active
-// (unsealed) lower segment is impossible here — only the highest index is ever
-// the active file — but ErrActiveSegment is treated as "no usable envelope" and
-// skipped rather than failing the open, so a partially-rotated dir still
-// recovers. Any other open error is returned: a corrupt lower segment must
-// crash Open, not silently lower the floor.
+// Use checksum-verifying segment.Open, not ReadSealedHeader. Active files are
+// skipped to tolerate partial rotation; other errors abort recovery rather
+// than lower the floor.
 func recoverSealedTailMaxSeq(fs vfs.FS, dir string, highestIdx uint64) (maxSeq uint64, found bool, err error) {
 	files, err := SegmentFilesFS(fs, dir)
 	if err != nil {

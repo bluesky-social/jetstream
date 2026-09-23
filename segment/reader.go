@@ -448,25 +448,13 @@ func (r *Reader) BlocksContainingDID(did string) ([]int, error) {
 	return SelectBlocksForDID(nil, blooms, did), nil
 }
 
-// validateBlockOffsets verifies every block's [offset, offset+8+size]
-// range fits before the footer, that ranges are strictly ascending and
-// non-overlapping (since that's how Seal writes them), that
-// MaxSeq >= MinSeq within each entry, and that consecutive non-empty
-// blocks are seq-disjoint and index-monotonic (block[i].MaxSeq <
-// block[i+1].MinSeq). A malformed block index that passes per-entry
-// bounds checks but is internally inconsistent could otherwise surface
-// as confusing decode errors at DecodeBlock time.
+// validateBlockOffsets checks that blocks fit before the footer with
+// ascending, non-overlapping byte ranges and valid seq bounds. Non-empty
+// blocks must also have disjoint ascending seq ranges.
 //
-// The cross-block seq-monotonicity check is load-bearing for the snapshot
-// planner: PlanSnapshot's truncation continuation cursor is the last
-// included block's MaxSeq, and the next page's exclusive afterSeq drops
-// every block with MaxSeq <= that cursor (internal/manifest/plan.go). That
-// is gap-free ONLY if a later block never carries a smaller MaxSeq; a
-// segment that reached disk with out-of-order per-block seq bounds would
-// otherwise make the planner silently skip a block (silent data loss). The
-// single-writer ingest path holds this invariant (seqs assigned under one
-// lock, seal walks frames in ascending offset), so this check fails loud
-// on a corrupt/foreign/regressed segment rather than letting it serve.
+// PlanSnapshot resumes after the last included block's MaxSeq. Out-of-order
+// ranges could make pagination skip later blocks, so reject them before
+// serving.
 func validateBlockOffsets(blocks []BlockInfo, footerOffset uint64) error {
 	var prevEnd uint64 = ReservedHeaderBytes
 	// prevMaxSeq tracks the MaxSeq of the most recent NON-EMPTY block.

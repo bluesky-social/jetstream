@@ -18,24 +18,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Whole-segment downloads use HTTP ranges two ways (#296): each segment is
-// fetched as parallel range parts (WithSegmentStripes, default 8), and a
-// mid-stream failure resumes with Range+If-Range from the last byte received —
-// O(gap) recovery instead of the old O(segment) restart-from-zero.
+// Whole-segment downloads use parallel HTTP ranges (WithSegmentStripes,
+// default 8) and resume interrupted transfers with Range and If-Range. The
+// plan's checksum pins the generation through the server's strong ETag.
 //
-// Striping targets paths where per-TCP-stream congestion control is the
-// throughput bound — the common case for consumers pulling an archive over
-// the public internet at meaningful RTT. Note for tunneled paths: in our lab
-// measurements across a WireGuard tunnel (where all TCP shares one
-// encapsulated UDP flow), parallel parts fragmented the tunnel's fixed
-// capacity and ran 20-40% slower than a single stream; on a fast LAN the
-// modes were indistinguishable (decode-bound). If your deployment runs
-// through such a tunnel, set WithSegmentStripes(1) — which also selects the
-// resumable single-stream path.
-//
-// The server's getSegment serves via http.ServeContent, so Range, If-Range,
-// and a strong per-generation ETag are already part of the contract; the
-// plan's Checksum field was reserved for exactly this.
+// Stripes help when individual TCP streams limit throughput. WireGuard
+// measurements were 20–40% slower with stripes because the streams shared one
+// tunnel; use WithSegmentStripes(1) there. Fast LAN measurements were
+// decode-bound in either mode.
 const (
 	// segmentPartSize is the striped-mode range granularity. Small enough that
 	// a ~280 MB segment yields ~18 parts (keeping all stripes busy through the

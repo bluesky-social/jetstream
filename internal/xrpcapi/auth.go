@@ -10,21 +10,12 @@ import (
 	"github.com/jcalabro/atmos/xrpcserver"
 )
 
-// withBearer wraps h so it only runs when the request carries the exact
-// configured bearer token. It is jetstream's first authenticated surface
-// (design Q-JOB): the timestamp-import endpoints modify the archive, so they
-// are admin-only.
+// withBearer requires the configured timestamp-import bearer token. An empty
+// token disables access; disabled, missing, and incorrect credentials all
+// return the same 401 response. Token digests are compared in constant time.
 //
-// Secure by default: when token is empty (no --timestamp-import-token
-// configured) EVERY request is rejected with 401, and the response does not
-// distinguish "disabled" from "wrong token" so a probe cannot learn whether
-// import is enabled. The comparison is constant-time (crypto/subtle) so a
-// timing side channel cannot recover the token byte by byte.
-//
-// TLS is intentionally NOT enforced in-process: jetstream serves plain HTTP on
-// a bare listener with TLS terminated at an upstream proxy, so an r.TLS check
-// would be theater. The operator is responsible for fronting the endpoint with
-// TLS (documented in the operator notes).
+// The operator must terminate TLS at the upstream proxy. Jetstream's listener
+// receives plain HTTP and does not enforce TLS here.
 func withBearer(token string, h xrpcserver.Handler) xrpcserver.Handler {
 	// Compare sha256 digests, not the raw bytes: ConstantTimeCompare returns
 	// immediately on a length mismatch, so a raw compare would leak the

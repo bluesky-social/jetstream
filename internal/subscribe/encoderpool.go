@@ -6,29 +6,19 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// encoderPool is a bounded free list of identically-configured zstd
-// encoders. It exists because a single shared *zstd.Encoder built with
-// WithEncoderConcurrency(1) serializes every EncodeAll in the process
-// behind one encoder state — a measured ~37k msgs/s ceiling regardless of
-// cores (#295). A pool of independent encoders gives compression one lane
-// per concurrent caller, bounded by limit, while each individual encoder
-// keeps the exact per-instance configuration (dictionary, window,
-// concurrency 1, level) so the frames it produces are byte-identical to
-// the single-encoder era.
+// encoderPool bounds a free list of identically configured zstd encoders. A
+// single encoder with concurrency 1 serializes EncodeAll calls (~37k
+// messages/s in #295). Separate encoders permit concurrent compression
+// without changing frame encoding.
 //
-// Deliberately NOT a sync.Pool: klauspost encoders create an internal
-// channel lazily on first EncodeAll, and a channel created inside a
-// testing/synctest bubble fatals the process when used from outside it
-// (see WarmEncoder). A free list lets WarmEncoder pre-create every
-// encoder outside any bubble, so in-bubble compressions only ever reuse
-// bubble-safe encoders; sync.Pool's GC-driven eviction would defeat that
-// guarantee by dropping warmed encoders and lazily rebuilding them
-// in-bubble.
+// The pool cannot use sync.Pool: encoders lazily create channels that bind to
+// a testing/synctest bubble. WarmEncoder creates every encoder outside the
+// bubble; GC eviction would recreate them inside it and cause cross-bubble
+// channel failures.
 //
-// Memory: each encoder state (dictionary match tables + window) is on the
-// order of ~2 MB, allocated lazily at its first EncodeAll. Production
-// creates encoders on demand up to limit; only WarmEncoder (test support)
-// eagerly materializes all of them.
+// Each encoder allocates roughly 2 MB on its first EncodeAll. Production
+// creates them on demand up to limit; WarmEncoder eagerly creates them for
+// tests.
 type encoderPool struct {
 	free    chan *zstd.Encoder
 	created atomic.Int64

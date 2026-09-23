@@ -11,28 +11,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// replay_fault_test.go is the #205 oracle tier: relay seq duplicates and
-// regressions. atmos's gap check is forward-only (seq > last+1), so a
-// relay that re-delivers frames — a duplicate burst, or a whole window
-// replayed by a relay restored from backup — sails through undetected.
-// The archive contract under replay is:
+// These tests inject relay seq duplicates and regressions (#205), which
+// atmos's forward-only gap check does not detect. Commit and sync replay must
+// be rejected by rev; account replay must be rejected by applied hosting seq,
+// or an old deletion could erase later recreated records (#231).
 //
-//   - #commit/#sync replays are silently dropped by the verifier's
-//     rev-replay protection (rev <= persisted chain rev);
-//   - #account replays are dropped by the consumer's applied-hosting-seq
-//     guard (#231) — without it a stale account-delete re-archives ABOVE
-//     a later reactivate+recreate and every fold erases live records;
-//   - therefore the durable stream is EXACTLY the once-per-frame
-//     expansion of the world's firehose: zero storage bloat, structural
-//     invariants hold, final state converges.
-//
-// Each scenario drives the shared live-tail harness (see
-// live_tail_harness_test.go) with a replay fault armed, over a traffic
-// shape that puts an account-delete + reactivate + recreate inside the
-// replayed window — the shape that corrupts state if any protection
-// regresses. Anti-vacuity: the fault must fire, frames must actually be
-// re-delivered, and the #231 guard must report drops (proving the
-// account replay reached it).
+// Each replay window includes deletion, reactivation, and recreation. Tests
+// require the fault, redelivery, and account replay guard to fire, then check
+// exact event multiplicity, storage invariants, and final state.
 
 // replayScenarioTraffic drives the world through the corrupting shape:
 // two commits, then account-0 delete + reactivate + recreate.

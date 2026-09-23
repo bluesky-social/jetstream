@@ -42,15 +42,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Under --race the data-race detector instruments every tier's `go test`, so a
-# race-only regression in the stress/restart interleavings (the #107 gap: the
-# only existing race coverage is ci.yml's default-mode lane) becomes a kill. The
-# detector slows execution ~5-15x, so each tier's timeout is widened to keep a
-# healthy run from racing its own bound and reading as a false liveness kill.
-# A genuine hang still kills via the (larger) timeout. The default-tier -short
-# run is ~1s clean, so even 10x under race stays well inside 15m; that timeout
-# only fires on a real hang. RACE_FLAG expands to nothing when disabled (safe
-# under set -u in bash >=4.4).
+# Race detection applies to every tier, including restart children. Allow
+# longer timeouts for its roughly 5–15x overhead. RACE_FLAG expands to nothing
+# when disabled (bash >=4.4 supports this under set -u).
 RACE_FLAG=()
 default_timeout="5m"
 stress_timeout="30m"
@@ -90,11 +84,9 @@ LOG_ROOT="$(mktemp -d -t mutation-campaign-XXXXXX)"
 # invariant holds at every loop boundary; the EXIT trap is the backstop.
 CURRENT_PATCH=""
 
-# revert_current undoes the applied mutant and clears CURRENT_PATCH. A failed
-# reverse means the tree is dirty and we cannot trust any further result, so we
-# crash loud rather than silently continuing on corrupted state (project
-# directive: fail loud over corrupt). Callers run this OUTSIDE `if !` guards so
-# `set -e`/the explicit exit aborts the campaign.
+# revert_current removes the active mutant. A failed revert aborts the
+# campaign because later results would be unreliable. Call outside conditional
+# guards so set -e remains effective.
 revert_current() {
     if [[ -z "$CURRENT_PATCH" ]]; then
         return 0
@@ -107,16 +99,10 @@ revert_current() {
     CURRENT_PATCH=""
 }
 
-# log_is_build_failure reports whether a `go test` log failed because the TEST
-# package did not compile, rather than because an oracle assertion fired. The
-# preceding `go build ./...` gate only compiles non-test code, so a mutant that
-# edits a symbol used by _test.go files compiles for the build but breaks `go
-# test`'s package build. Without this, that compile error is recorded as a
-# KILLED — a false "the oracle detected the bug" when the oracle never ran. We
-# match `go test`'s own compile-failure framing (`[build failed]` / the `FAIL
-# pkg [build failed]` line / the leading `# pkg` diagnostic header) rather than
-# substrings like "undefined:" that could legitimately appear inside an oracle
-# assertion message.
+# Distinguish test-package compilation failures from oracle failures. go build
+# omits _test.go files, so it cannot detect every broken mutant. Match Go’s
+# build-failure framing rather than diagnostic substrings that could also
+# appear in assertions.
 log_is_build_failure() {
     grep -qE '\[build failed\]|^# [^ ]' "$1"
 }
@@ -129,15 +115,10 @@ trap revert_current EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# json_escape emits a JSON-safe rendering of its argument (sans surrounding
-# quotes). Notes originate from grepped 'oracle: ...' lines, so backslashes and
-# double-quotes are the realistic hazards and are backslash-escaped. Every C0
-# control byte (U+0000–U+001F: tabs, newlines, carriage returns, and ANSI/
-# terminal bytes that can leak in from `go test` output) is then flattened to a
-# space: encoding/json in the #108 gate rejects ANY raw control byte inside a
-# string, so leaving even a lone \r in a note would make the whole result
-# document undecodable and silently break the gate. tr is coreutils, so this
-# keeps the JSON contract free of a jq dependency on the runner.
+# json_escape escapes backslashes and quotes, then replaces C0 control bytes
+# with spaces. Test diagnostics can contain tabs, newlines, or terminal
+# controls that would invalidate the result JSON. Uses coreutils rather than
+# adding jq.
 json_escape() {
     local s=$1
     s=${s//\\/\\\\}

@@ -2,15 +2,10 @@ package segment
 
 import "context"
 
-// CrashInjector simulates a crash at a named segment-rewrite durability seam.
-// It is the segment package's only test-seam dependency: defining it here
-// (rather than importing internal/crashpoint) keeps the decode/seal core free
-// of internal deps so the public client can import segment cheaply.
-//
-// Production passes a nil CrashInjector and every seam is a no-op. The point
-// strings below are the contract with the test harness; internal/crashpoint
-// derives its corresponding Point constants from them, so the values cannot
-// drift between the firing site and the injection site.
+// CrashInjector simulates a crash at segment rewrite checkpoints. It is
+// defined here to keep this public package independent of
+// internal/crashpoint. Production passes nil. The constants below are shared
+// with the harness to keep checkpoint names consistent.
 type CrashInjector interface {
 	SimulateCrash(ctx context.Context, point string) error
 }

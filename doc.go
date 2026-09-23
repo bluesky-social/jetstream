@@ -28,38 +28,26 @@
 //		}
 //	}
 //
-// A bare Subscribe(host) starts a pure live tail from the current tip.
-// Supplying WithAfterSeq starts a replay: the client pages planSnapshot over
-// the sealed archive, downloads matching data with getSegment or getBlock, and
-// then connects /xrpc/network.bsky.jetstream.subscribeEvents at the cutover
-// cursor to consume the active segment and follow the live tail. Use
-// WithSnapshotOnly to stop after the sealed range; WithBeforeSeq can bound that
-// snapshot. There is no client-side cutover buffer or record suppression.
-// Archives that require bearer authentication can use
-// WithAPIKey with the raw key; it authenticates planSnapshot,
-// getSegment, and getBlock only. The public dictionary request and live
-// WebSocket remain unauthenticated. The live tail uses the server's
-// dictionary-zstd compression by default; use WithZstdCompression(false) to opt
-// out. Dictionary fetch or rotation failure degrades to an uncompressed tail
-// rather than failing delivery.
+// Subscribe(host) follows the current live tip. WithAfterSeq enables archive
+// replay before v2 cutover; WithSnapshotOnly stops after sealed history, and
+// WithBeforeSeq bounds that snapshot. Both sources yield the same Event type.
 //
-// Delivery is at-least-once and the contract is eventually-consistent: the
-// caller must process events idempotently and FOLD the stream (creates/updates
-// apply; deletes, account-deletes, and syncs remove). A record deleted or
-// updated after it was first delivered arrives as its own later event, exactly
-// as on the upstream firehose; deleted-account markers (#account/#identity/
-// #sync) are always delivered (even under a collection filter) so a folding
-// consumer can purge the dead account's records. If the live cursor ages below
-// the server's lookback window during a slow handoff, the client transparently
-// replays the missing archive range from its last processed seq rather than
-// silently skipping the gap.
+// WithAPIKey authenticates planSnapshot, getSegment, and getBlock only.
+// Dictionary requests and the live websocket remain public. Live compression
+// defaults to dictionary-zstd; use WithZstdCompression(false) to opt out.
+// Dictionary failures fall back to uncompressed streaming.
 //
-// Sequence values are monotonic but need not be contiguous: an unclean server
-// restart can leave a durable registered vacancy so a seq observed before the
-// crash is never reused. The client accepts that ordinary forward jump and
-// continues deduplicating by seq.
+// Delivery is at-least-once. Consumers must fold events idempotently: creates
+// and updates apply; deletes, account deletions, and syncs remove records.
+// Collection filters preserve DID-level markers unless kinds excludes them.
+// The library delivers markers without folding or suppressing records.
 //
-// The client deliberately exposes a minimal public surface: the Client, its
-// options, and the decoded Event shape. Transport, planning, download, and
-// cutover machinery is unexported within this package.
+// If cutover falls behind the server's lookback window, the client replays
+// from the last processed seq. Seqs increase but need not be contiguous:
+// crash recovery may leave registered vacancies to prevent reuse of
+// previously observed seqs. The client accepts these jumps and deduplicates
+// by seq.
+//
+// Transport, planning, download, and cutover implementations are private to
+// this package.
 package jetstream

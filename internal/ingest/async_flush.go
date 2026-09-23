@@ -181,30 +181,16 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 	})
 }
 
-// rotateIfFull seals the active segment and opens the next one when the
-// active segment has grown to MaxSegmentBytes. It is the async writer's
-// size-driven rotation lever, called by Append / AppendBatch after their
-// flush jobs have been submitted.
+// rotateIfFull seals and rotates the async writer after MaxSegmentBytes.
+// Append and AppendBatch call it after submitting flush jobs. The size check
+// uses bytes refreshed by commitAsyncFlush; overshoot is bounded by one
+// append or batch. Below the threshold it returns without draining.
 //
-// The check is keyed on accumulated bytes (the value commitAsyncFlush
-// freshly re-stats after every block), not on transient pipeline depth,
-// so segments rotate at ~MaxSegmentBytes regardless of backfill batch
-// shape. Overshoot is bounded to one append/batch worth of events past
-// the threshold.
-//
-// Crash-safety mirrors the sync flushAndRotateLocked path exactly. We
-// acquire drainMu (the admission barrier every Append/AppendBatch holds
-// while submitting jobs) and then asyncJobs.Wait(), which together
-// guarantee the flush pipeline has drained to depth zero:
-// segment.preparedOutstanding == 0, so Seal's precondition holds, and
-// w.nextSeq is the trailing pending block's max seq + 1 with no
-// higher-seq block in flight. We then flush the trailing pending block
-// (fsync) and commit seq/next BEFORE sealing, so a crash between any two
-// steps leaves seq/next lagging at most one block, which Open's
-// ScanMaxSeq reconciliation recovers.
-//
-// Async-only: the sync path rotates inline in flushAndRotateLocked. A
-// no-op (cheap, no drain) when the active segment is below threshold.
+// Holding drainMu stops new submissions while asyncJobs.Wait drains prepared
+// blocks. The remaining pending block is then fsynced and seq/next committed
+// before seal. This satisfies Seal's no-outstanding-blocks requirement and
+// leaves at most one block for Open's ScanMaxSeq recovery. The synchronous
+// path rotates in flushAndRotateLocked.
 func (w *Writer) rotateIfFull(ctx context.Context) error {
 	if w.async == nil {
 		return nil

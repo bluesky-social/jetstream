@@ -343,22 +343,10 @@ func TestOracleRestartChild(t *testing.T) {
 		}
 	}
 
-	// Cross-process cutover gate (#114 flake fix). The parent injects the
-	// durable-intermediate chain on the live firehose during this child's
-	// backfill (chainCoordinator.onGetRepoServed). Those frames must be
-	// durably archived into live_segments BEFORE cutover cancels the
-	// bootstrap-live consumer — otherwise an undrained tail is lost and a
-	// chain record vanishes from disk while staying in ground truth
-	// ("oracle: missing ..."). Production re-fetches such in-flight events
-	// from the persisted cursor in steady-state, but the restart child
-	// exits at the after-merge barrier and never runs steady-state, so the
-	// in-process BarrierBeforeCutover the main harness uses
-	// (bootstrapTraffic.WaitDelivered) has no cross-process analogue here
-	// today. This gate is that analogue: at cutover it samples the relay's
-	// firehose tip and blocks until the bootstrap-live consumer has
-	// contiguously archived every frame up to it. The plan authorized this
-	// escalation once the no-crash baseline proved flaky (specs/notes/
-	// 2026-06-20-restart-tier-intermediates-plan.md §3.1 Q2(b)).
+	// Wait for the child's bootstrap-live consumer to archive the
+	// injected chain before cutover. Unlike production, this child exits
+	// after merge and cannot recover an undrained tail through
+	// steady-state replay. See cutoverDeliveryGate.
 	cutoverGate := newCutoverDeliveryGate(relayURL, 30*time.Second)
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
@@ -640,30 +628,19 @@ func (i *oracleCrashInjector) SimulateCrash(ctx context.Context, point crashpoin
 	return ctx.Err()
 }
 
-// cutoverDeliveryGate is the cross-process analogue of the main harness's
-// bootstrapTraffic.WaitDelivered (#114 flake fix). The parent injects the
-// durable-intermediate chain on the live firehose during the child's
-// backfill; those frames must be durably archived into live_segments
-// before cutover cancels the bootstrap-live consumer, or an undrained tail
-// is lost (production re-fetches such in-flight events from the persisted
-// cursor in steady-state, but the restart child exits at the after-merge
-// barrier and never runs steady-state).
+// cutoverDeliveryGate waits for the child's bootstrap-live consumer to
+// archive the parent's injected traffic before cutover. The restart child
+// exits after merge, so steady-state replay cannot recover an undrained live
+// tail.
 //
-// waitDelivered (wired to BarrierBeforeCutover) samples the relay's
-// firehose tip once at cutover and blocks until the bootstrap-live consumer
-// has contiguously archived every frame up to it. observe (wired to
-// OnBootstrapLiveEvent) records each archived frame's upstream seq.
+// BarrierBeforeCutover snapshots the relay tip and waits for contiguous
+// observations through it. OnBootstrapLiveEvent records upstream seqs after
+// durable append (BatchSize=1). Each generated seq has one frame producing at
+// least one archived event; silent mutations consume no seq.
 //
-// Why contiguity-from-lowest-observed is sound: every world seq.Add stages
-// exactly one firehose frame (shape G's silent mutation bumps no seq, so
-// there are no gaps), and every generated frame yields at least one archived
-// event carrying UpstreamRelayCursor == seq. bootstrap-live runs BatchSize=1
-// and fires OnEvent after each durable Append, so observed seqs arrive in
-// archive order. A fresh child resumes at cursor 0 and observes 1..tip; a
-// child recovering in PhaseBootstrap (e.g. an AfterRepoComplete crash before
-// the merging-phase write) resumes at its persisted cursor C and observes
-// C+1..tip — frames 1..C are already durable from the first child, so
-// flooring contiguity at the lowest observed seq is correct in both cases.
+// A fresh child observes 1..tip. A recovering child starts after persisted
+// cursor C; earlier frames are already durable. Checking contiguity from the
+// lowest observed seq therefore works for both.
 type cutoverDeliveryGate struct {
 	relayURL string
 	timeout  time.Duration

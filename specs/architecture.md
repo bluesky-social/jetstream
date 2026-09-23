@@ -1,25 +1,25 @@
 # Architecture overview (for agents)
 
-This is a fast orientation map for an agent dropping into the codebase: what the big pieces are, how they fit together, and where to read more. It is deliberately high-level and light on detail so it doesn't rot every time a function moves. `docs/README.md` is the authoritative spec — when this file and that one disagree, that one is right, and you should fix this one. Package `doc.go` files are authoritative for their own package's internals.
+This file maps the subsystems and their documentation. `docs/README.md` is the authoritative system spec; package `doc.go` files define package contracts. Fix this summary when it disagrees with either.
 
-If you're here to make a change, the useful reading order is usually: this file (get oriented) → `specs/invariants.md` (the rules you can't break) → the relevant `docs/README.md` section → the package `doc.go`.
+Before changing code, read this file, `specs/invariants.md`, the relevant section of `docs/README.md`, and the package `doc.go`.
 
 ## What jetstream is
 
-Jetstream is a full-network archive and live-streaming service for atproto. It enumerates every repo directly from every PDS in a relay's host roster, stores the retrievable records in a custom columnar file format on a single machine, and lets clients replay that history and then seamlessly follow the relay's live firehose. It runs as one static binary on one server. High availability is a future goal, not something the current design does.
+Jetstream archives retrievable records from every PDS in a relay’s host roster, then follows the live firehose. Clients can replay the archive and continue streaming. It runs as one static binary on one server; high availability is future work.
 
 Two things clients can do:
 
 - **Live tail** — connect to the `/subscribe` websocket and get the same filterable JSON payload as Jetstream v1. Existing v1 consumers work unchanged.
-- **Backfill then cutover** — ask for historical data (e.g. "all likes since 2024"), page through the sealed archive over HTTP, and cut over to the live websocket when caught up. The client libraries hide the seam.
+- **Backfill then cutover** — ask for historical data (e.g. "all likes since 2024"), page through the sealed archive over HTTP, and cut over to the live websocket when caught up. Client libraries handle the transition.
 
 ## The three big subsystems
 
-Everything falls into ingest (data in), storage (data on disk), or serve (data out), with a testing rig that wraps the whole thing.
+The three subsystems are ingest, storage, and serving. The simulator and oracle test them together.
 
 ### Ingest — getting data onto disk
 
-Ingest is a lifecycle state machine that walks through three phases. The orchestrator (`internal/ingest/orchestrator`) owns that machine and the durable commit points between phases; a crash mid-cutover recovers by re-entering the machine at the right spot.
+The orchestrator (`internal/ingest/orchestrator`) manages three phases and their durable checkpoints. After a crash, it resumes from the last checkpoint.
 
 - **Bootstrap** (`internal/ingest/backfill` + `internal/ingest/live`): on first start, two things run in parallel — a live consumer captures the firehose into a temporary `backfill/live_segments/` tree, while the backfill engine reads the relay's listHosts roster, paginates listRepos directly on each PDS, and downloads every repo directly from its PDS. Per-host cursors and terminal state live in `pdshost/<hostname>`.
 - **Merge** (`internal/ingest/orchestrator`): once backfill drains, the captured live segments are drained into the permanent `segments/` tree, dropping events already covered by each repo's backfilled head, then a tombstone compaction runs so the archive is delete/update-correct before cutover.
@@ -42,14 +42,14 @@ The durability ordering between these two is the invariant that keeps a crash sa
 - **Compression dictionary endpoint** (`internal/xrpcapi/getzstddictionary.go`): serves the v2 subscribe dictionary as an immutable, CDN-cacheable blob keyed by its embedded zstd dictionary ID. Retrained against live traffic with `just train-subscribe-dict` (`testing/dicttrain`); each retrain embeds a fresh ID and clients recover from rotation in-place (see `specs/client.md`).
 - **Archive download over HTTP/XRPC** (`internal/xrpcapi`): the paginated `planSnapshot` → `getSegment`/`getBlock` path clients use to pull sealed history before cutover.
 - **HTTP plumbing** (`internal/server`): the public listener (default :8080) and opt-in debug listener (commonly :6060) and middleware. Status, health, and metrics live off these (`internal/status`, `internal/obs`).
-- **Client library** (module-root `jetstream` package): the "thick" Go client that negotiates the archive, downloads and decodes it in parallel, dedupes by seq, cuts over to live, and recovers from too-old cursors and dictionary rotations. `specs/client.md` is the end-to-end protocol description; `docs/README.md` §5 owns the wire formats.
+- **Client library** (module-root `jetstream` package): the Go client that negotiates the archive, downloads and decodes it in parallel, dedupes by seq, cuts over to live, and recovers from too-old cursors and dictionary rotations. `specs/client.md` is the end-to-end protocol description; `docs/README.md` §5 owns the wire formats.
 
 ### Testing rig — the oracle and simulator
 
-This is unusually central to the project, so it's worth knowing even if you're not touching tests.
+The test rig checks storage and delivery across the full lifecycle.
 
-- **Simulator** (`internal/simulator`): a fake atproto network — PLC, a skewed fleet of virtual PDSes, and an incomplete-roster relay — that generates *real* atproto-shaped bytes (signed commits, CAR blocks, CBOR frames), not mocked structs. Includes per-PDS lifecycle faults and adversarial-traffic modes that feed bad-but-bounded input through the honest pipeline.
-- **Oracle** (`internal/oracle`): boots a real server against the simulator, drives it through its whole lifecycle, and compares durable output against an independently derived model. It's a high-value bug detector organized into tiers (storage, event-log, replay, crash/restart, and more). A green run proves strong contracts held for one scenario, not universal correctness.
+- **Simulator** (`internal/simulator`): a fake atproto network — PLC, a skewed fleet of virtual PDSes, and an incomplete-roster relay — that generates *real* atproto-shaped bytes (signed commits, CAR blocks, CBOR frames), not mocked structs. Includes per-PDS lifecycle faults and adversarial-traffic modes that feed bounded malformed input through the production pipeline.
+- **Oracle** (`internal/oracle`): boots a real server against the simulator, drives it through its whole lifecycle, and compares durable output against an independently derived model. Its checks are organized into tiers (storage, event-log, replay, crash/restart, and more). A green run proves strong contracts held for one scenario, not universal correctness.
 - **Mutation campaign** (`testing/mutation`): curated single-edit bugs that measure the oracle's bug-detection power. `specs/oracle.md` is the source of truth for this whole rig — read it before touching any of it.
 
 ## Where to look
@@ -78,4 +78,4 @@ This is unusually central to the project, so it's worth knowing even if you're n
 | Coding conventions, workflow, task tracking | `AGENTS.md` |
 | Design history / why a thing is the way it is | `specs/notes/` (dated design + implementation notes) |
 
-`specs/notes/` is a write-once archive of design and implementation notes, one topic per file, dated. It's the record of how we got here — useful for "why did we do it this way," less so for "what does it do now" (some notes predate later rewrites). The living docs above are the current truth.
+`specs/notes/` records past designs and implementation decisions. Use the living docs above for current behavior.

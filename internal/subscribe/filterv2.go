@@ -1,29 +1,12 @@
-// Package subscribe — filterv2.go owns the network.bsky.jetstream.subscribeEvents
-// (v2) subscriber filter: the kinds/dids/collections query parameters and
-// the Wants(evt) predicate.
+// The v2 filter combines kinds, dids, and collections with AND. Each omitted
+// filter matches all. Collections constrain commits only; kinds controls
+// whether account, identity, and sync events are delivered. Use kinds=commit
+// with collections for a commits-only stream.
 //
-// The three axes are independent predicates ANDed together (design note
-// specs/notes/2026-08-10-subscribe-v2-proposal-0015-design.md §5):
-//
-//	deliver(evt) =
-//	      (kinds unset       OR evt.kind ∈ kinds)
-//	  AND (dids unset        OR evt.did ∈ dids)
-//	  AND (evt.kind ≠ commit OR collections unset
-//	                         OR matches(evt.collection, collections))
-//
-// Unset means match-all on that axis, so no parameters is "one big
-// stream". The collections axis constrains only commit events — the only
-// kind that has a collection — and never drops other kinds: excluding
-// account/identity/sync is the kinds axis's job. This replaces v1's
-// implicit "collections ⇒ plus everyone's account/identity events"
-// coupling with explicit composition (kinds=commit&collections=X for a
-// commits-only collection stream).
-//
-// Unlike the v1 filter, validation here is crash-loud (pre-upgrade HTTP
-// 400): unknown kinds values, a collections filter that could never apply
-// (kinds set and excluding commit), and the legacy wanted* parameter
-// names are all rejected with messages naming the fix. There is no
-// mid-stream filter update — v2 is server-push only.
+// Unknown kinds, collections combined with kinds that excludes commit, and
+// legacy wanted* parameters return HTTP 400 before upgrade. V2 has no
+// mid-stream filter updates. See
+// specs/notes/2026-08-10-subscribe-v2-proposal-0015-design.md §5.
 package subscribe
 
 import (

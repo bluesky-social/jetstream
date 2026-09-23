@@ -351,7 +351,7 @@ func (e *replayEngine) runLiveOnly(ctx context.Context, emitBatch func([]Event) 
 	// routed through the batcher's error path (live.go returns it before the
 	// emit-on-error report). On the pure-live path there is no archive to
 	// re-enter, so the stale cursor is fatal: surface it rather than letting the
-	// iterator end silently (CLAUDE.md: no silent fallbacks). A ctx cancellation
+	// iterator end silently. A ctx cancellation
 	// or an already-stopped consumer is a clean shutdown, not an error.
 	if runErr != nil && liveCtx.Err() == nil && !b.stopped() {
 		b.emitError(fatal(runErr))
@@ -407,25 +407,14 @@ func (e *replayEngine) startFlusher(ctx context.Context, b *batcher) func() {
 	}
 }
 
-// runBackfillOnly executes a one-time dump of the sealed archive: plan, then
-// download + emit the matched range and return. It is a strict subset of
-// runBackfillThenLive with the live tail, cutover, and steady-state phases
-// removed — no websocket is ever dialed.
+// backfillEmitFunc builds the shared download callback and installs bf's
+// block transform when present. Valid rows precede any recoverable row error;
+// whole-block failures emit only an error. Without a transform, rows use the
+// per-event batcher.
 //
-// backfillEmitFunc builds the Download emit callback shared by both backfill
-// paths, and installs the fast-path transform on dl when bf provides one.
-//
-// Results may carry both decoded rows and a recoverable row-level error: the
-// valid rows are emitted first, then the error is surfaced. Whole-block failures
-// carry no rows and therefore route only through emitError. On the legacy path
-// (bf.transform == nil) events flow through the per-event batcher exactly as
-// before.
-//
-// The returned stopped() reports whether the consumer asked to stop during the
-// backfill. On the legacy path that is just b.stopped(); on the fast path the
-// batcher never sees the backfill events, so a stop is observed only via Emit
-// returning false and recorded here (FIX: the live phase must check THIS, not
-// only b.stopped()).
+// stopped reports consumer cancellation for either path. The fast path
+// bypasses the batcher, so callers must check this result rather than
+// b.stopped alone.
 func (e *replayEngine) backfillEmitFunc(b *batcher, bf backfillSink, dl *downloader) (emit func(entryResult) bool, stopped func() bool) {
 	if bf.transform == nil {
 		// Legacy path: per-event batching on the serial reassembler goroutine.
@@ -469,28 +458,17 @@ func (e *replayEngine) backfillEmitFunc(b *batcher, bf backfillSink, dl *downloa
 		}
 }
 
-// sweepSealedArchive pages planSnapshot from startCursor, downloading and
-// emitting every matching row in seq order until the whole sealed archive has
-// been consumed (design §11/§12). It returns the pinned sealed tip S (the
-// cutover cursor), whether the consumer asked to stop mid-sweep, and a terminal
-// plan/context error.
+// sweepSealedArchive downloads and emits matching rows in seq order through a
+// pinned sealed tip S. It returns S, whether the consumer stopped early, and
+// any terminal planning or context error.
 //
-// The mechanics that make this gap-free and progressing (design §12.1, verified
-// by the manifest planner tests):
+// The first page fixes beforeSeq=S. Later seals are handled by cold replay at
+// cutover. Each next page starts after plannedThroughSeq: the last included
+// unit's MaxSeq on truncated pages, otherwise S. Completion is
+// plannedThroughSeq >= S, including pages with no matching blocks.
 //
-//   - beforeSeq is PINNED to S, the sealedTipSeq read on the FIRST page, so the
-//     loop scans exactly (startCursor, S]. Segments sealed during the sweep carry
-//     seqs > S and are deliberately left to the terminal /subscribe cold replay
-//     (§14.1) rather than chased by a moving tip.
-//   - The continuation cursor is plannedThroughSeq (exclusive lower bound for the
-//     next page). A truncated page reports the MaxSeq of its last included work
-//     unit (which strictly advances); a non-truncated page reports S. So
-//     plannedThroughSeq >= S is the unambiguous done predicate even for a sparse
-//     filter that matched zero segments in a sub-range (design §12.2).
-//
-// DID-level markers (#account/#identity/#sync) ride inline through every page
-// whose plan touches their blocks, via the §R4-revised sentinel index — no
-// snapshot, no client-side suppression. The folding consumer converges.
+// DID markers arrive inline through sentinel-indexed blocks. Consumers fold
+// them; the client does not suppress records.
 func (e *replayEngine) sweepSealedArchive(ctx context.Context, dl *downloader, emit func(entryResult) bool, backfillStopped func() bool, startCursor uint64) (sealedTip uint64, stopped bool, err error) {
 	cursor := startCursor
 	pinned := false
@@ -576,25 +554,13 @@ func (e *replayEngine) runBackfillOnly(ctx context.Context, emitBatch func([]Eve
 	}
 }
 
-// runBackfillThenLive executes the paginated archive download and the bufferless
-// cutover to live (design §11/§13/§14):
+// runBackfillThenLive downloads the archive through a pinned tip S, then
+// connects subscribeEvents at max(S, lastProcessedSeq). Inclusive replay is
+// deduplicated by seq; cold replay covers segments sealed during download.
 //
-//  1. page planSnapshot (pinning beforeSeq = S, the page-1 sealed tip) and
-//     download + emit the whole sealed range (startCursor, S] in seq order;
-//  2. connect /subscribe ONCE at cursor = S — no rewind margin, no client buffer.
-//     The consumer dedups its own at-least-once overlap by seq; segments sealed
-//     during the download are picked up by /subscribe's cold replay (§14.1).
-//
-// A pre-upgrade HTTP 400 "cursor too old" at connect (the slow-handoff or
-// fell-off-live case, §14) is NOT fatal: the loop re-enters pagination from the
-// last durably-processed seq (the live consumer's highest delivered seq, or S if
-// it delivered nothing). Re-backfill cycles are bounded and must advance the
-// cursor (anti-ping-pong); a fresh sweep re-learns the CURRENT sealed tip, which
-// is >= the lookback floor, so the realistic case converges in one extra cycle.
-//
-// The archive download alone is the historical record; backfill emits every
-// matching row with no tombstone suppression — a folding consumer converges
-// (design §5.1, §R1). DID-level markers ride inline via the sentinel index.
+// CursorTooOld restarts archive pagination from the last processed seq.
+// Non-advancing cycles are bounded to prevent endless retries. All matching
+// rows and markers are delivered for the consumer to fold.
 func (e *replayEngine) runBackfillThenLive(ctx context.Context, emitBatch func([]Event) bool, emitErr func(error) bool, bf backfillSink) {
 	b := newBatcher(e.cfg.BatchSize, emitBatch, emitErr)
 	dl := newDownloader(e.cfg.bulkClient(), e.cfg.Concurrency, e.matcher.wantsSegment)
@@ -669,39 +635,17 @@ func (e *replayEngine) runBackfillThenLive(ctx context.Context, emitBatch func([
 			break
 		}
 
-		// §14 too-old 400: re-backfill from the last durably-processed seq. Bound
-		// the cycles and require the resume cursor to strictly advance past the
-		// cursor this sweep started from — a non-advancing re-backfill is a
-		// pathological loop, not a real fall-behind, and is surfaced as fatal.
-		// Advance the row matcher's seq floor to the resume point BEFORE the next
-		// sweep, so the matcher's exact filter lines up with where re-backfill
-		// actually resumes.
+		// Re-backfill from the last processed seq, bounding
+		// non-advancing cycles. Raise the row filter's floor before
+		// the next sweep: the planner excludes blocks wholly below
+		// resume but includes a block that straddles it. A stale
+		// filter would decode and re-emit that block's delivered
+		// prefix after newer live events.
 		//
-		// Scope of this fix (measured against the planner, not assumed): the
-		// re-backfill plan request carries afterSeq=resume, and the server planner
-		// already prunes whole segments/blocks with MaxSeq <= afterSeq
-		// (manifest/plan.go segmentOverlapsSeq/blockOverlapsSeq). cursor advances
-		// monotonically (resume = the live tail's highest delivered seq >= cutover
-		// >= this sweep's sealed tip), so the archive at or below resume is NOT
-		// re-planned or re-downloaded — there is no whole-history re-fetch to guard
-		// against, and this saves zero network bytes. What it does fix is the ONE
-		// work unit that STRADDLES resume: the planner's one-sided contract admits
-		// the whole straddling segment/block (MaxSeq > resume but containing rows
-		// <= resume), and the downloader runs the selector per row before decode
-		// (downloader.go decodeFrame). Without this update the stale matcher
-		// (afterSeq = the ORIGINAL request floor, e.g. 0) keeps those already-
-		// delivered rows: they are re-decoded and re-emitted out of order, after
-		// newer live seqs. A folding / seq-dedup consumer still converges
-		// (design §13/§R7), so this is not a correctness fix; it is a bounded
-		// cleanup that drops the straddling unit's redundant prefix before decode
-		// and keeps the cutover seam in per-DID seq order.
-		//
-		// Safety: every row in (origAfter, resume] was already delivered (backfill
-		// covered (origAfter, cutover]; the live tail covered (cutover, resume]),
-		// and a genuinely-new event has seq > resume, so raising the floor to
-		// resume can never drop an undelivered row. dl.selector IS e.matcher (same
-		// pointer, newDownloader above), and the live consumer that read e.matcher
-		// has already returned, so this between-sweeps write races nothing.
+		// All rows through resume were already delivered. The
+		// downloader shares e.matcher, and the live consumer has
+		// returned, so this update neither drops new rows nor races a
+		// reader.
 		e.matcher.setAfterSeq(resume)
 
 		if resume <= cursor {
@@ -752,8 +696,8 @@ func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cuto
 	})
 	err = consumer.Run(ctx, func(ev *Event, cerr error) bool {
 		if cerr != nil {
-			// A recoverable live read/reconnect error: surface it (do not swallow —
-			// CLAUDE.md) but keep tailing. The consumer rejecting it stops batching.
+			// Report recoverable errors and keep tailing unless
+			// the consumer stops.
 			return b.emitError(cerr)
 		}
 		if !e.wantsLive(ev) {

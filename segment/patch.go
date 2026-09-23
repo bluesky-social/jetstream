@@ -48,39 +48,24 @@ type PatchResult struct {
 	Header Header
 }
 
-// Patch rewrites a sealed segment in place, applying mutate to every event
-// to update the display (indexed_at) column only. It is the mutate-mode
-// sibling of Rewrite (which is drop-only): Patch never adds, drops, or
-// reorders rows and never changes any column other than IndexedAt.
+// Patch atomically replaces a sealed segment after applying mutate to each
+// event in stored order. Only IndexedAt may change; rows cannot be added,
+// dropped, or reordered. mutate reports whether it changed a value. Other
+// field changes return an error and leave the source untouched.
 //
-// mutate is called once per event, in stored order, with a pointer to a
-// decoded Event. It must set only ev.IndexedAt (the operator-imported
-// display timestamp) and return true iff it changed the event. Mutating any
-// other field is a contract violation: Patch snapshots the immutable fields
-// before the call and returns an error (leaving the source file untouched)
-// rather than persist a file whose verbatim-copied blooms, collection index,
-// or witnessed/seq envelope no longer describe its contents. Crashing beats
-// corruption.
+// IndexedAt is fixed-width and absent from blooms and collection indexes, so
+// those footer sections are copied unchanged. Recompression can change frame
+// sizes; block offsets, compressed sizes, header offsets, and checksum are
+// rebuilt.
 //
-// Why the footer is mostly copyable: IndexedAt is a fixed-width 8-byte
-// column, so mutating it changes neither the block count/order nor any
-// block's uncompressed size, and it never touches DID or Collection. The
-// segment DID bloom, per-block DID blooms, and collection block index are
-// keyed only on DID/Collection/counts and embed no absolute file offsets, so
-// they are byte-identical after a patch and are copied verbatim from the
-// source. Only the block index (whose per-block Offset and CompressedSize
-// shift when a re-compressed block's frame size changes), the header's
-// section offsets, and the checksum are rebuilt.
+// Like Rewrite, Patch writes a sibling temporary file, fsyncs it, renames it,
+// and fsyncs the parent directory. Before rename, failures leave the source
+// intact. After directory sync, the replacement is durable. See
+// CrashPointPatch constants.
 //
-// Durability matches Rewrite: write a sibling .tmp, fsync it, rename over the
-// original, fsync the parent dir. A crash at or before the rename leaves the
-// original intact; a crash after it means the patched file is already the
-// durable one (see the CrashPointPatch* seams).
-//
-// A zero-mutation Patch (every mutate returns false / leaves IndexedAt
-// unchanged) skips the rename entirely and leaves the file byte-for-byte
-// untouched, so a re-run over already-imported data is a genuine no-op —
-// Patch is idempotent for a fixed mutate.
+// If no timestamp changes, Patch skips replacement entirely. A fixed
+// timestamp rule can therefore be reapplied without rewriting completed
+// files.
 func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResult, error) {
 	if path == "" {
 		return PatchResult{}, fmt.Errorf("%w: Patch path is required", ErrInvalidConfig)

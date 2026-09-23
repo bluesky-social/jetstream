@@ -1,34 +1,18 @@
 package world
 
-// Adversarial traffic generators for the ingest-validation oracle tier
-// (issue #204). Everything here is test-targeted — RunTraffic never
-// calls into this file, so default simulator traffic stays polite (see
-// specs/oracle.md "Adding Simulator Behavior"). Each generator commits
-// a REAL, signed, verifier-consistent lie:
+// These test-only generators create malformed input for the ingest oracle
+// (#204); RunTraffic does not call them. Invalid paths enter through raw
+// mst.Tree.Insert so they pass verifier consistency checks and reach the
+// ingest validators. Invalid revs are signed into the commit to match the
+// envelope, with time taken from the logical clock.
 //
-//   - op-path lies bypass repo.Create's validation via raw
-//     mst.Tree.Insert (the MST layer accepts any byte key), so atmos's
-//     Sync-1.1 verifier — which checks op paths only for MST
-//     consistency, never spec validity — passes them through to
-//     jetstream's #197 ingest gate;
-//   - rev lies are signed into the inner commit (the verifier requires
-//     envelope.Rev == signed commit.Rev), with the envelope Time
-//     stamped from the logical clock because the honest path derives
-//     Time by parsing the rev.
+// AdversarialLedger records expected drops, whole-event cursor gaps, and
+// required drop-counter increments. This lets the oracle distinguish injected
+// invalid input from unexpected loss.
 //
-// Every lie is recorded in the world's AdversarialLedger at generation
-// time. The oracle uses the ledger to (a) exclude intentionally-dropped
-// rows from expected output, (b) exempt whole-event-dropped seqs from
-// cursor-gap checks, and (c) assert per-(source, reason) drop-counter
-// deltas — the anti-vacuity proof that each lie actually fired.
-//
-// One wire-reachability limit, spike-verified 2026-07-04: invalid UTF-8
-// cannot ride a live #commit op.Path (the wire envelope encodes Path as
-// a CBOR text string, and atmos's decoder rejects invalid UTF-8), but
-// CAN sit in a getRepo CAR's MST node (KeySuffix is a CBOR byte
-// string). Invalid-UTF-8 lies are therefore backfill-only:
-// InjectAdversarialRecordForBackfill commits them silently so they are
-// served by getRepo without ever appearing on the firehose.
+// Invalid UTF-8 cannot appear in a live op.Path because CBOR text decoding
+// rejects it. CAR MST keys use byte strings, so
+// InjectAdversarialRecordForBackfill can test this case through getRepo.
 
 import (
 	"context"
@@ -269,34 +253,18 @@ func (w *World) InjectAdversarialRecordForBackfill(ctx context.Context, idx int,
 	return nil
 }
 
-// GenerateAdversarialSyncForTest silently mutates account idx (no
-// #commit frame), then emits a #sync frame whose ENVELOPE rev is the
-// caller-supplied lie. The silent mutation is load-bearing: it makes
-// the sync's data CID diverge from the consumer's chain state, which
-// is the only route to the gate —
+// GenerateAdversarialSyncForTest silently mutates a repo, then emits sync
+// with an invalid envelope rev. The mutation makes the data CID differ from
+// verifier state. A rev at or below verifier state is replay-dropped;
+// matching data triggers an envelope/commit mismatch. Divergent data with a
+// higher rev instead resyncs and reaches convertSync, which drops the event
+// as invalid_rev.
 //
-//   - rev lexically <= chain state's rev → the verifier's rev-replay
-//     check silently drops the frame (empty rev always lands here);
-//   - rev above state but data MATCHING → the verifier's no-op fast
-//     path cross-checks envelope vs inner rev → FieldMismatchError,
-//     verifier-owned;
-//   - rev above state and data DIVERGENT → the verifier resyncs
-//     (fetches the authoritative repo) and yields ops; the event —
-//     still carrying the lying envelope rev — reaches jetstream's
-//     convertSync where validateRev drops the WHOLE event
-//     ({live, invalid_rev}).
-//
-// badRev must be unparseable as a TID and lexically greater than
-// every TID (start it with a byte above 'j', e.g. "not-a-tid") so the
-// replay check cannot eat it.
-//
-// PERMANENT ARCHIVAL LOSS, by design: the verifier's resync repairs
-// its own chain state to the post-mutation head, so a later honest
-// #sync at the same rev is replay-dropped — the silently-created
-// record's only carrier was the dropped event. The record is ledgered
-// (dropped-op coordinates + whole-event seq) so the oracle excludes
-// it from ground truth and cursor-gap accounting; this is exactly the
-// documented loss semantics of refusing spec-invalid input.
+// badRev must be invalid as a TID and sort above all TIDs, such as
+// "not-a-tid". The resync advances verifier state, so a later valid sync at
+// the same rev cannot recover the silently created record. The ledger
+// excludes that record and event seq from expected output and cursor
+// coverage.
 func (w *World) GenerateAdversarialSyncForTest(ctx context.Context, idx int, badRev string) ([]byte, error) {
 	w.mutationMu.Lock()
 	defer w.mutationMu.Unlock()
@@ -391,39 +359,20 @@ func (w *World) commitAndBroadcastWithRev(author account, rp *repo.Repo, store *
 	return frame, err
 }
 
-// GenerateVerifierRejectedCommitForTest emits a #commit frame whose rev
-// is signed-in but invalid at the VERIFIER layer: reason selects the
-// lie shape. These frames never reach the ingest gate — atmos rejects
-// them pre-conversion — so the oracle asserts verifier-failure
-// classification + no archive + cursor advance instead of a gate
-// counter. Supported reasons:
+// GenerateVerifierRejectedCommitForTest signs an invalid rev into an
+// otherwise valid commit. Supported reasons are non_tid_rev (InvalidRevError)
+// and future_rev (FutureRevError, more than five minutes ahead of the
+// consumer). Callers supply the future TID to match the test clock. The
+// verifier rejects these before the ingest gate, so tests check verifier
+// classification, archive absence, and cursor advancement rather than gate
+// counters.
 //
-//   - "non_tid_rev": rev fails ParseTID (VerifyCommit InvalidRevError)
-//   - "future_rev": rev is a valid TID > 5m ahead of the consumer's
-//     clock (checkFutureRev FutureRevError). The caller supplies the
-//     TID via rev since only the test knows the consumer's fake clock.
-//
-// The commit is otherwise honest: a real create op, real signed MST.
-// The world's persisted head DOES advance to the lying rev, which has
-// two consequences callers must manage:
-//
-//  1. While the head rev is invalid, a getRepo fetch of this account
-//     fails at atmos's repo loader (non-empty invalid rev) or produces
-//     gate-dropped rows (empty rev), so a verifier-triggered resync
-//     cannot repair the DID yet.
-//  2. The next HONEST commit on the account restores a valid head; its
-//     PrevData points at the lie's MST root, which jetstream never
-//     accepted, so the verifier chain-breaks and repairs via resync
-//     from the now-honest head. Self-healing, and the repair itself is
-//     useful coverage.
-//
-// Oracle scenarios should therefore follow this call with at least one
-// honest commit on the same account before final-state comparison.
-// The lie's record stays in the world MST (ground truth); the ledger
-// entry lets the oracle exclude it until the follow-up honest commit's
-// resync materializes it. Because the record IS eventually repaired,
-// the entry is recorded with Layer=verifier for cursor-gap exemption
-// only — final-state exclusion must check whether repair happened.
+// The world head advances to the invalid rev. Follow with a valid commit on
+// the same account before final-state comparison: it restores a fetchable
+// head and causes a chain break against Jetstream's earlier state, triggering
+// resync. The injected record remains in the world MST and can then be
+// repaired. Layer=verifier ledger entries exempt cursor gaps; final-state
+// exclusion must account for completed repair.
 func (w *World) GenerateVerifierRejectedCommitForTest(ctx context.Context, idx int, badRev, reason string) ([]byte, error) {
 	w.mutationMu.Lock()
 	defer w.mutationMu.Unlock()

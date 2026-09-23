@@ -1,14 +1,6 @@
-# The client protocol (for agents)
+# Client protocol
 
-How a Jetstream client — the bundled Go client or any third-party
-implementation — negotiates the archive, downloads history, tails live, and
-survives the failure modes in between. This is the client-side counterpart to
-`docs/README.md` §5 (which owns the wire formats) and `specs/architecture.md`
-(the system map). The bundled Go client lives at the module root: its public
-API is concentrated in `client.go`, `event.go`, `options.go`, and `typed.go`;
-the remaining root client files are unexported implementation. Code comments
-are authoritative for implementation details — when this file disagrees with
-them, fix this file.
+This describes archive negotiation, downloads, live streaming, and recovery. `docs/README.md` §5 defines wire formats; `specs/architecture.md` maps the system. The Go client lives at the module root, with its public API in `client.go`, `event.go`, `options.go`, and `typed.go`. Code comments define implementation details; fix this summary when it disagrees.
 
 Design references: low-numbered "§N" (§2, §5) cite `docs/README.md`;
 §11–§14 and §R-numbered rules cite
@@ -16,11 +8,9 @@ Design references: low-numbered "§N" (§2, §5) cite `docs/README.md`;
 backfill/cutover design); the original client design is
 `specs/notes/2026-06-18-go-client-design.md`.
 
-## The shape of the problem
+## Transports
 
-A consumer wants some slice of the network — "all likes since 2024", "these
-five DIDs", or everything — delivered once, in order, and then kept current
-forever. Jetstream splits that into two transports:
+Jetstream delivers filtered historical and live events through two transports:
 
 - **Sealed history** is downloaded over HTTP/XRPC (`planSnapshot` →
   `getSegment`/`getBlock`), because bulk history wants parallelism, resume,
@@ -29,11 +19,7 @@ forever. Jetstream splits that into two transports:
   proposal-0015 xrpc.v1.json framing), because the tip wants
   push latency.
 
-The client's job is to make the seam between the two invisible: one stream,
-in seq order at the seam, at-least-once, with no gap. The server-assigned
-**seq** (a monotonic 64-bit cursor; `?cursor=N` replays inclusively, seqs
-are 1-based, 0 means "everything") is the coordinate system for everything
-below.
+The client joins these into an ordered, at-least-once stream without gaps. Server-assigned seqs are monotonic 64-bit cursors. Websocket `?cursor=N` replays inclusively; seqs start at 1. Archive cursor 0 requests all history, while websocket replay remains limited by lookback.
 
 ## Protocol invariants a client must honor
 
@@ -96,9 +82,9 @@ Response, per page:
 - `stats` — `segmentsExamined/segmentsMatched/blocksMatched/entries`
   (entries counts against the server's per-page plan limit).
 
-The planner prunes by seq overlap one-sidedly: a segment/block whose range
+The planner prunes by seq overlap conservatively: a segment/block whose range
 *straddles* `afterSeq` is included whole, so the client must still run its
-row selector below the floor (see the re-backfill subtlety in Phase 4).
+row selector below the floor (see Phase 4).
 
 ## Phase 2: download + decode (the sweep)
 
@@ -138,9 +124,8 @@ websocket once with `?cursor=max(S, lastProcessedSeq)`.
 
 - The cursor is the **dedup floor**: the server replays inclusively
   (seq >= cursor), the consumer's seq dedup (`ev.Seq <= lastSeq` → drop)
-  turns that into effectively-once at the seam. No client-side buffer —
-  "jetstream is your buffer" (§ 2.1): events between the sealed tip and the
-  live tip are served by the server's cold-replay path on connect.
+  deduplicates cutover. The server’s cold-replay path serves events between
+  the sealed tip and live tip on connect, without a client-side buffer.
 - The `max()` matters: on a re-backfill cycle the freshly learned sealed tip
   can be *below* the cursor already delivered (live delivered from the
   unsealed active segment), and cutting at the lower value would regress the
@@ -216,7 +201,7 @@ dial deliberately doesn't offer it — see the measured rationale in
    (`internal/zstddict`) and connect with `?zstdDictionary=<id>`. The
    server 400s an unknown/retired ID pre-upgrade rather than ever sending
    undecodable frames.
-3. **Decode**: frames arrive as BINARY websocket messages, one zstd frame
+3. **Decode**: frames arrive as binary websocket messages, one zstd frame
    each whose decompressed bytes are exactly the xrpc.v1.json text frame
    (message, info, and error frames alike), decoded with a
    dictionary-seeded decoder whose max decoded
@@ -236,8 +221,7 @@ dial deliberately doesn't offer it — see the measured rationale in
    uncompressed for the consumer's lifetime.
 5. **Degradation is never fatal**: dictionary fetch failure at startup,
    parse failure, or rotation-refetch failure all degrade to an
-   uncompressed tail with a logged warning. Compression is an optimization;
-   the tail must keep flowing.
+   uncompressed tail with a logged warning. Streaming continues without compression.
 
 Compression is enabled by default in the Go client and normal CLI subscribe
 command. Opt out with `WithZstdCompression(false)` or `--zstd=false`;
@@ -277,13 +261,13 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
   and do not receive this option-owned credential. The bundled CLI exposes the
   same value as `--api-key` or the preferred
   `JETSTREAM_CLIENT_API_KEY` environment source.
-- Plumbing: `WithHTTPClient` (replaces negotiation, public dictionary, bulk
+- Transports: `WithHTTPClient` (replaces negotiation, public dictionary, bulk
   download, and live WebSocket transports without changing the API-key
   scope), `WithMaxDownloadAttempts`.
 - `Client.Stats()` — replay progress (pages, pinned sealed tip, planned
   through, residual gap) for sustained-ingest observability.
 
-## Event shape
+## Events
 
 One `Event` struct regardless of origin (archive or live): `Seq`, `DID`,
 `TimeUS`, `Kind` (`commit`/`identity`/`account`/`sync`), with the matching

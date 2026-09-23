@@ -80,30 +80,12 @@ func serveArchive(t *testing.T, segDir string) string {
 	return ts.URL
 }
 
-// TestFoldConvergence_CollectionFilteredDIDTombstoneGap guards the one real gap
-// the drop-client-tombstones revision must close (design §R3, issue #174): a
-// collection-filtered backfill downloads an in-scope create C and must also
-// receive C's DID-level killer D (an account-delete carrying an empty
-// collection, sealed below the tip), or a folding consumer keeps C forever — a
-// silent violation of the no-data-loss contract (§R1).
-//
-// Layout (both segments sealed, both below the tip):
-//
-//	seg 0: create C  (seq 1, did:plc:victim, app.bsky.feed.post) — IN the filter
-//	seg 1: account-delete D (seq 2, did:plc:victim, EMPTY collection) — the killer
-//
-// The gap is closed in the archive itself: seal indexes D's block under the
-// reserved $account sentinel collection (segment/sentinel.go), and the planner
-// always admits that sentinel under a collection filter. So a client filtered to
-// app.bsky.feed.post plans BOTH seg 0 (the real collection) and seg 1 (the
-// sentinel), downloads C and D inline, and folds to C-dead — converging with
-// ground truth (which matches the killer by DID). No snapshot, no suppression,
-// no tombstone.Set on the read path: D rides the same inline download as a
-// record-level delete.
-//
-// A planner that fails to admit the sentinel (or a seal that fails to index it)
-// regresses this to the original gap: seg 1 is never selected, the client folds
-// to C-live, and CheckFoldConvergence diverges.
+// TestFoldConvergence_CollectionFilteredDIDTombstoneGap checks that a
+// collection-filtered plan includes a later account deletion stored in a
+// separate sealed segment. The deletion has no collection; its $account
+// sentinel must select the block. Missing the marker leaves the created
+// record in the consumer's folded state and fails CheckFoldConvergence
+// (#174).
 func TestFoldConvergence_CollectionFilteredDIDTombstoneGap(t *testing.T) {
 	t.Parallel()
 

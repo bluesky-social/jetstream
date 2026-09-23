@@ -16,33 +16,15 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// runBootstrap is the orchestrator's State 0. It builds:
+// runBootstrap starts the backfill writer in segments/ and a live consumer in
+// backfill/live_segments/. The live consumer uses live_segments/seq/next and
+// the shared relay/cursor. Both run under an errgroup; the live context can
+// be cancelled separately.
 //
-//   - a shared ingest.Writer pointed at <DataDir>/segments (used by
-//     the backfill engine; closed in State 4 of the cutover),
-//   - the backfill engine itself,
-//   - a live.Consumer pointed at <DataDir>/backfill/live_segments
-//     with the throwaway "live_segments/seq/next" seq counter and
-//     the shared "relay/cursor" upstream cursor.
-//
-// It runs the backfill engine and the live consumer as siblings
-// under an internal errgroup, with the live consumer attached to a
-// derived context the orchestrator can cancel independently. When
-// backfill drains (returns nil), runBootstrap walks the cutover:
-//
-//  1. State 1: WritePhase(merging) inside the backfill goroutine.
-//  2. State 2: cancel the live consumer's derived context, await
-//     its Run return via g.Wait().
-//  3. State 3: Close the live consumer (persists cursor + flushes),
-//     then re-open the live_segments dir and SealActiveAndClose its
-//     trailing active segment so the tree is fully sealed.
-//  4. State 4: Close the backfill writer (flush only — steady-state
-//     will reopen the same directory).
-//
-// On success, runBootstrap returns nil and the caller falls through
-// to the merge case. On any subsystem error before backfill drains,
-// the errgroup cancels both and the error is returned without
-// touching the phase.
+// After backfill drains, it commits phase=merging, cancels and joins the live
+// consumer, closes it to flush data and cursor, seals its trailing active
+// segment, then closes the backfill writer. Success lets Run enter merge. An
+// earlier subsystem error cancels both without advancing the phase.
 func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")

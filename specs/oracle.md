@@ -4,9 +4,9 @@
 
 Jetstream v2 is a durable archive and replay service. The oracle simulator exists to catch bugs that ordinary unit tests and happy-path integration tests will miss: data loss, replay holes, compaction mistakes, restart corruption, cursor drift, and failure handling that silently advances past unarchived data.
 
-The oracle is not a proof of correctness. It is a high-value bug detector. Its job is to create realistic enough atproto traffic, drive Jetstream through the same public and persistence paths clients rely on, and compare the result against an independently derived model. A green oracle means one set of strong contracts held for one scenario. It does not mean every interleaving, transport failure, protocol edge case, or production data shape has been covered.
+The oracle generates atproto traffic, drives Jetstream through public and persistence APIs, and compares results with an independent model. A passing run validates only the exercised scenario and interleavings.
 
-This document is the durable design guide for that testing system. It explains why the oracle and simulator are structured the way they are, what requirements future changes must preserve, and how to extend the system without weakening its bug-finding value. Active work is tracked in GitHub issues under the testing epic, not in this document.
+This document defines the testing architecture and extension rules. Active work is tracked in GitHub issues.
 
 ## Design Goals
 
@@ -21,7 +21,7 @@ Direct segment observation remains valuable because it distinguishes storage bug
 
 ### Prefer Independent Checks
 
-The strongest oracle checks do not ask Jetstream what it thinks happened. They derive expectations from separate state:
+Derive expectations independently from:
 
 - simulator world state and MST data for final materialized repo state;
 - simulator firehose history for expected event-log rows;
@@ -46,13 +46,13 @@ Real crash/restart and public-serving tests must keep real process, socket, file
 
 ### Fail Loud Over Corrupt
 
-The production daemon must not crash on invalid upstream input, but the oracle should crash loud on invalid internal state, persistence corruption, fsync failures, impossible segment structure, and test harness anti-vacuity failures. Silent fallbacks create false confidence and are worse than a noisy test.
+Invalid upstream input must not crash production. Internal corruption, persistence failures, and scenarios that never exercised their intended path must fail the oracle.
 
 Every injected fault must be accounted for. If a fault plan is configured, the oracle should prove the expected faults fired; otherwise a disabled fault path can make a test pass vacuously.
 
 ### Keep Tiers Separate
 
-One giant oracle test would be hard to understand and hard to debug. The testing system should keep related tiers that share helpers but fail with different explanations:
+Keep checks grouped by what they observe and diagnose:
 
 - storage and final-state correctness;
 - event-log equivalence;
@@ -164,11 +164,11 @@ Compaction-aware comparison may allow a missing row only when a committed waterm
 
 ### Client-Driven Historical Tier
 
-This tier drives the real Go client (`github.com/bluesky-social/jetstream`) through the full archive-negotiation path — paginated `planSnapshot` → `getSegment`/`getBlock` → cutover to the live `/xrpc/network.bsky.jetstream.subscribeEvents` websocket — and asserts the documented **fold-convergence** contract on what the client replayed. This is the historical product-path surface: it validates what real clients replay through the public APIs, exercising the paginated bufferless cutover (pin `sealedTipSeq`, page until `plannedThroughSeq` reaches it, connect once) that a bespoke whole-archive `/subscribe?cursor=0` replay lacks.
+The historical tier drives the public Go client through paginated `planSnapshot`, archive downloads, and v2 websocket cutover. It checks fold convergence on the stream real clients receive, including pinning `sealedTipSeq` and advancing through `plannedThroughSeq`.
 
-The client is an **observation surface only**, and the check is eventually-consistent, not point-in-time: the oracle folds the full emitted stream (creates/updates apply; deletes/account-deletes/syncs remove) and compares the converged result against ground truth derived independently from simulator world state and the firehose history — matching a dead record's killer to a DID-level marker by DID, never comparing the client against itself. The contract is at-least-once with no silent loss of in-scope retrievable data; transient stale rows that a later marker kills are expected, not a violation. Because the client and Jetstream share `atmos` (and the client shares the segment decoders with the server), the direct segment and event-log tiers remain the independent storage check that distinguishes a server bug from a client bug — the client tier runs alongside them, not instead.
+Expected state comes from simulator world state and firehose history, independently of client output. Fold creates and updates, then apply delete, account-delete, and sync markers by DID where appropriate. Temporary stale rows are allowed if their later markers remove them. Direct segment and event-log checks remain necessary because client and server share atmos and segment decoders.
 
-The client emits jetstream's own seq, so the drain stops at a jetstream-seq watermark (e.g. the steady compaction watermark), not the simulator's upstream relay cursor — the two spaces do not map.
+Client cursors use Jetstream seqs, which do not map to simulator relay seqs. Use the appropriate seq space for watermark checks; drain until folded state converges or the deadline expires.
 
 ### Live-Tail Replay Tier
 
@@ -195,7 +195,7 @@ Beyond "no records lost across a crash," this tier lands **durable intermediate 
 
 Three post-restart checks run over the recovered segments: final-state `Compare` (existing); at-least-once event-log **coverage** (every model-derived durable row is present at least once, tolerant of the contract-permitted re-merge duplicate, sensitive to loss); and the compaction contract via fold-convergence (fold the recovered stream and compare the converged result to ground truth). The expected side is model-derived from the chain the test issued (oracle independence), using on-disk seqs only to position the watermark-compaction filter.
 
-The convergence-hiding compaction over-drop (#100) is NOT reachable here: the merge-tail compaction snapshot always spans the whole sealed stream, so every drop decision is complete. That check's end-to-end proof lived in the steady-state tier (mutation `m025`), where a delete arriving after the pass's force-rotate sits above the watermark and a survivor can be wrongly dropped while final state still converges. `m025` was retired when its `Set.SnapshotRange` mechanism was deleted in #178 (the on-disk windowed fold can no longer reach the above-watermark over-drop it modelled). #183's re-derivation analysis concluded that NO single-edit mutant can uniquely trip the recorder under the windowed-fold architecture: the pass folds its tombstones from the exact on-disk window it compacts (so every legitimately-folded drop is also approved by the recorder's identically-bounded filter — invisible to it), and the only edits that manufacture a filter-illegal drop (seq-comparison or seq-value corruption, whose sole new victim is the self-superseding update row) are maximal and die at after-merge final-state Compare on every seed. The recorder is therefore a **regression assertion without a gated mutant**: it still runs on every lifecycle run, and its unique power reactivates only if a future change reintroduces an out-of-window tombstone source (an in-memory readout, a cross-window cache) — whoever makes such a change must re-derive a mutant for it then. Full argument: the 2026-07-04 section of `testing/mutation/RESULTS.md`.
+An above-watermark tombstone cannot affect merge-tail compaction because the pass covers the complete sealed stream. The former steady-state mutant `m025` tested this class of over-drop but was retired in #178 when the in-memory `Set.SnapshotRange` path was replaced by disk-window folding. The #183 analysis found no replacement single-edit mutant unique to the over-drop recorder: correctly windowed drops satisfy both filters, while seq corruption is already caught by after-merge final-state comparison. The recorder remains a regression assertion without a gated mutant. Re-derive one if compaction gains an out-of-window tombstone source, such as a cache. See the 2026-07-04 analysis in `testing/mutation/RESULTS.md`.
 
 ### Power-Loss Tier
 

@@ -107,24 +107,12 @@ func newPDSGetRepoHandler(w *world.World, topology pdsTopology, faults *FaultPla
 			// metric would surface the rate of these.
 			return
 		}
-		// The snapshot for this DID is now fully served; its head rev is
-		// pinned. Fire the timing signal AFTER the body is written so a
-		// caller can safely generate a post-backfill mutation (see
-		// HandlerOptions.OnGetRepoServed).
-		//
-		// LOAD-BEARING ORDERING (restart oracle): onServed runs before this
-		// handler returns, and ExportRepoCAR above neither sets Content-Length
-		// nor flushes, so the response stays chunked — the client's CAR reader
-		// sees io.EOF only when the terminating chunk is emitted as the handler
-		// returns, i.e. strictly AFTER onServed. The restart-tier chain
-		// coordinator relies on exactly this: it generates the live op for a DID
-		// inside onServed, and that op must be committed to the world (ground
-		// truth) before the child observes getRepo EOF -> marks backfill
-		// complete -> cuts over. Adding a Content-Length header or an explicit
-		// Flush before onServed would let the child see EOF first, dropping the
-		// live op from the child's pre-cutover window while it stays in ground
-		// truth -> a "compare oracle model" divergence. Keep the body unflushed
-		// and onServed last.
+		// Signal after writing the snapshot but before returning.
+		// With no Content-Length or Flush, the chunked response
+		// reaches EOF only after onServed. The restart oracle relies
+		// on its live mutation being committed before the child sees
+		// EOF and can finish backfill. Earlier flushing or a
+		// Content-Length could let cutover omit that mutation.
 		if onServed != nil {
 			onServed(string(did))
 		}

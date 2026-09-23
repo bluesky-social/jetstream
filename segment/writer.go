@@ -435,9 +435,7 @@ func (w *Writer) Close() error {
 		return fmt.Errorf("segment: close with %d uncommitted prepared block(s)", w.preparedOutstanding)
 	}
 	w.closed = true
-	// Flush is a no-op while pending is empty; the unconditional call
-	// keeps the implementation honest about durability when Close is
-	// called with buffered events.
+	// Flush buffered events before closing; an empty buffer is a no-op.
 	flushErr := w.flushLocked()
 	closeErr := w.file.Close()
 	if flushErr != nil {
@@ -492,23 +490,13 @@ func (w *Writer) Flush() error {
 	return w.flushLocked()
 }
 
-// flushLocked is the flush body shared by Flush and Close.
+// flushLocked serves Flush and Close. Reset pending after Write succeeds,
+// before Sync: the frame is already in the page cache, so retrying after a
+// sync failure would duplicate it. Latch sync errors to prevent later
+// appends.
 //
-// Durability contract: once Write returns success, the bytes are
-// in the kernel's page cache and a subsequent recovery walker will
-// see the frame on the file (per lastGoodOffset). It is therefore
-// not safe to "retry" the same pending buffer on a Sync failure —
-// doing so would write the frame twice. We instead reset pending
-// immediately after Write succeeds, then attempt Sync; if Sync
-// fails we latch stickyErr so the caller cannot Append further
-// without observing the failure.
-//
-// We must also refuse to do anything once stickyErr is set: a
-// previous Write failure may have partially written a torn frame
-// to disk, in which case re-encoding the (still-buffered) events
-// here would append duplicate bytes after the torn tail. Close
-// reaches us via flushLocked too, so without this guard a
-// Close-after-Flush-failure would silently corrupt the file.
+// A prior write failure may leave a torn frame. Once stickyErr is set, even
+// Close must not append the still-buffered events after that tail.
 func (w *Writer) flushLocked() error {
 	if w.stickyErr != nil {
 		return w.stickyErr

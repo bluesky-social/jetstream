@@ -71,10 +71,9 @@ type Config struct {
 	// values are rejected.
 	ReadLogRetentionBytes int64
 
-	// TimestampStamper, if non-nil, is consulted for materialization rows before
-	// the event is appended to the active segment or readable log. This is the
-	// durability seam for imported indexed_at rules: the display value must be
-	// born into the segment bytes, not overlaid on read.
+	// TimestampStamper applies imported display timestamps before
+	// materialization rows enter the segment or readable log. Timestamps
+	// must be persisted with the event, not overlaid during reads.
 	TimestampStamper TimestampStamper
 
 	// SeqKey is the pebble key holding the writer's seq counter.
@@ -93,24 +92,14 @@ type Config struct {
 	// lifecycle gating proves bootstrap seqs were never client-visible.
 	UnreservedSeqsUnobservable bool
 
-	// OnDurableBatch, if non-nil, stages extra metadata into the same synced
-	// Pebble batch that persists SeqKey after a segment block has been fsynced.
-	// The hook may return an afterCommit callback, which runs only after the
-	// batch commit succeeds, and an afterDone callback, which runs after the
-	// batch commit attempt on both success and failure.
+	// OnDurableBatch stages metadata in the synced SeqKey batch after
+	// segment fsync. afterCommit runs only on success; afterDone runs
+	// after either outcome. All three run under the writer mutex: do not
+	// call Writer methods or perform unbounded I/O.
 	//
-	// The hook, afterCommit callback, and afterDone callback run under the
-	// writer mutex. Hooks must not call back into the Writer (that would
-	// deadlock) or perform unbounded I/O (that would stall every Append in the
-	// active worker pool).
-	//
-	// force is true only on the drain/terminal commit paths (DrainDurability,
-	// Close, SealActiveAndClose) and means "commit the seq/next checkpoint even
-	// though no new block was just flushed." It does NOT license the hook to
-	// stage metadata whose backing events are not yet durable: a hook that ties
-	// metadata to event durability (e.g. backfill repo completion) must still
-	// gate every staged row on nextSeq, never on force, or it would mark data
-	// durable ahead of its segment fsync (violating docs/README.md §3.1.1 ordering).
+	// force requests a checkpoint without a new block on DrainDurability,
+	// Close, or SealActiveAndClose. It does not make pending events
+	// durable. Metadata tied to events must still be gated by nextSeq.
 	OnDurableBatch DurableBatchHook
 
 	// DurableBatchPrepareValue, if non-nil, is sampled while the writer mutex is
@@ -123,17 +112,11 @@ type Config struct {
 	// The sampler must not call back into the Writer and must be cheap.
 	DurableBatchPrepareValue func() any
 
-	// OnAppend, if non-nil, runs synchronously inside Append after
-	// the event's Seq is assigned and BEFORE the block can flush or
-	// the segment can seal, under the writer mutex. This ordering is
-	// load-bearing for the compaction tombstone set: any seq visible
-	// in a sealed on-disk header has already passed through OnAppend,
-	// so a concurrently-running compaction pass that discovers the
-	// sealed file can never compute a watermark covering an event the
-	// hook has not yet observed. An error fails the Append.
-	//
-	// Hooks must not call back into the Writer (deadlock on w.mu) and
-	// must be cheap — they run on the hot ingest path for every event.
+	// OnAppend runs under the writer mutex after seq assignment and
+	// before any flush or seal. Observers therefore see every event
+	// before a sealed header can expose its seq. An error fails Append.
+	// The hook runs per event: keep it cheap and do not call Writer
+	// methods.
 	OnAppend func(ev *segment.Event) error
 
 	// OnAfterSeal, if non-nil, runs after a successful segment seal

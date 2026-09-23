@@ -1,25 +1,9 @@
-// Package store owns the lifecycle of the metadata pebble database
-// at <data-dir>/meta.pebble (docs/README.md §3.4 / §3.5).
+// Package store manages the pebble database at <data-dir>/meta.pebble
+// (docs/README.md §3.5). Each consumer owns its keyspace and uses the
+// embedded *pebble.DB for batches, iterators, and snapshots.
 //
-// The package is deliberately keyspace-agnostic. It knows how to
-// open and close the database, picks pebble configuration that fits
-// jetstream's access patterns (point lookups for per-DID rows, range
-// scans for the eventual segment manifest), and exposes the
-// underlying *pebble.DB so consumers can compose batches, iterators,
-// and snapshots without a sea of passthrough wrappers.
-//
-// Per-keyspace operations (e.g. repo/<did>, account/<did>,
-// bootstrap/state) live in the package that owns that keyspace —
-// they take a *Store and assemble keys themselves. That keeps this
-// package small enough to reuse from compaction, replica state,
-// timestamp import, etc., without each consumer growing a peer
-// abstraction.
-//
-// Observability: *Store shadows pebble's hot-path Get/Set/Delete and
-// adds an instrumented Commit(b, opts) so duration histograms cover
-// every metadata-store touch. NewBatch / NewIter / Snapshot stay
-// promoted from the embedded *pebble.DB unchanged — they're cheap
-// and don't need per-call timing.
+// Store instruments Get, Set, Delete, and Commit with duration metrics.
+// NewBatch, NewIter, and Snapshot use the embedded methods directly.
 package store
 
 import (
@@ -38,22 +22,9 @@ import (
 // so the on-disk format is stable across replicas.
 const PebbleSubdir = "meta.pebble"
 
-// Store is the typed handle to the metadata pebble database. It is
-// safe for concurrent use; pebble itself is.
-//
-// The embedded *pebble.DB is exposed deliberately rather than
-// hidden behind passthrough methods. Consumers (backfill, future
-// compaction code, etc.) typically need NewBatch / NewIter /
-// Snapshot directly, and re-exporting every method we'd need would
-// be both unprincipled (which slice of pebble do we expose?) and a
-// constant maintenance tax.
-//
-// The instrumented Get/Set/Delete/Commit methods on *Store shadow
-// the equivalent embedded pebble methods so callers picking up
-// *Store automatically observe the histogram. Operations off the
-// hot path (NewBatch, NewIter, Snapshot) come through as plain
-// promoted methods. metrics may be nil; in that case the observe
-// calls are no-ops (see Metrics).
+// Store is a concurrency-safe handle to pebble. Get, Set, Delete, and Commit
+// record duration metrics when configured. The embedded DB exposes batches,
+// iterators, and snapshots directly.
 type Store struct {
 	*pebble.DB
 	metrics *Metrics

@@ -6,11 +6,7 @@ same mechanism with a larger window, but nothing here depends on it.)
 
 ## Problem statement
 
-Jetstream delivers events to live subscribers *before* they are durable, and
-after a crash it resumes the seq counter from durable state. The seqs in
-between get handed out a second time — usually to the same events, but not
-provably, and sometimes not actually. A client that saved a cursor from that
-window can silently miss or misattribute events forever after.
+Before this fix, live delivery preceded durability, but crash recovery resumed seq allocation from durable state. Reused seqs could identify different events, causing clients with saved cursors to miss or misidentify records.
 
 The current invariant (`docs/README.md` §3.1.1, `specs/invariants.md`) says
 "sequence numbers will never go backwards or be duplicated; they only go
@@ -68,11 +64,7 @@ exits create the window.
 
 ## Why not "clients should tolerate rewinds"?
 
-Cursor *rewinds* (re-delivery) are already the contract — at-least-once,
-clients dedupe. No client-side rule can fix *reuse*: a client cannot
-distinguish "seq 500 is the event I saw" from "seq 500 is now a different
-event" without comparing payloads, which defeats the point of a cursor. The
-server is the only place the invariant can live.
+At-least-once consumers can deduplicate replay, but cannot detect a seq reassigned to a different event without comparing payloads. The server must prevent reuse.
 
 ## Implemented design
 
@@ -182,7 +174,7 @@ the vacancy end and never need special handling.
   defect; not pursued.
 - **Persist a delivered high-water mark**: a synchronous pebble write per
   block-worth of delivered events on the hot path, to shave slack we can get
-  for free with a constant. Rejected (mechanical sympathy).
+  with a constant. Rejected because it adds writes to the delivery path.
 
 ## Implemented verification
 

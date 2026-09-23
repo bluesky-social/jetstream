@@ -1,7 +1,5 @@
-// Package version exposes build metadata that is injected at link time via
-// -ldflags. Defaults are sentinel values so an unstamped binary still works
-// (e.g. `go run ./cmd/jetstream`) and is obviously distinguishable from a
-// proper release build.
+// Package version exposes link-time build metadata. Defaults identify
+// unstamped development builds.
 package version
 
 // These variables are set via:

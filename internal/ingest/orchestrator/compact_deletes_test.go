@@ -121,24 +121,12 @@ func TestRunDeleteCompaction_SealsActiveSegmentBeforeSteadyPass(t *testing.T) {
 	require.Equal(t, uint64(2), w.ActiveIndex(), "empty active must not rotate")
 }
 
-// TestRunDeleteCompaction_DropsSupersededRowWhenKeyUpdatedAboveWatermark is the
-// regression for the "superseded record row survived" bug (R6). When live
-// ingestion runs ahead of the compaction watermark, a key can be superseded by
-// an update at-or-below the pass's target watermark AND receive a newer update
-// ABOVE it (still in the active, not-yet-sealed segment). The in-memory
-// tombstone Set collapses the key to its GLOBAL-max seq (the above-watermark
-// update); a snapshot bounded by the target watermark then EXCLUDES the key
-// (its stored seq exceeds the window), so the earlier superseded row is never
-// dropped and the pass commits a watermark it did not actually achieve. The
-// pass must instead fold the on-disk window (max superseding seq <= target),
-// which can only see seqs <= target and so yields the window-correct tombstone.
-//
-// Setup: seg_0 (sealed) holds create(0) + update1(1) for the key, so the pass's
-// target watermark is 1. The in-memory Set additionally observes a synthetic
-// update2 at seq 2 — modelling a live event already ingested above the
-// watermark — which collapses the key's in-memory tombstone to 2. The original
-// bug read the in-memory Set with an upper bound of 1, which dropped the key
-// (2 > 1) so create(0) survived; the fix folds seg_0 from disk and drops it.
+// TestRunDeleteCompaction_DropsSupersededRowWhenKeyUpdatedAboveWatermark
+// covers a tombstone replaced in memory by a newer update above the
+// compaction window. The sealed file holds create(0) and update(1); the
+// in-memory Set holds update(2). An upper-bounded Set snapshot would omit the
+// key and retain create(0). Folding the sealed window must find update(1) and
+// remove the create.
 func TestRunDeleteCompaction_DropsSupersededRowWhenKeyUpdatedAboveWatermark(t *testing.T) {
 	t.Parallel()
 

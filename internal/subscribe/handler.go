@@ -57,28 +57,12 @@ type Subscription struct {
 	// cursor replay entirely (cursors are silently dropped to live).
 	Lookback time.Duration
 
-	// V2 selects the network.bsky.jetstream.subscribeEvents endpoint contract
-	// (atproto proposal 0015) as a bundle:
-	//
-	//   - the xrpc.v1.json wire framing (one self-describing message or
-	//     error frame per event, built from the published lexicon), with
-	//     archived #sync events emitted rather than skipped,
-	//   - Sec-WebSocket-Protocol negotiation (xrpc.v1.json is both the
-	//     only supported token and the lexicon default),
-	//   - server-push only: any client data frame closes the connection
-	//     (no options_update / requireHello — those are v1-only),
-	//   - the three-axis kinds/dids/collections filter (ParseQueryV2),
-	//   - pre-upgrade errors as XRPC JSON envelopes ({"error","message"}),
-	//   - a seq cursor below the lookback floor is REJECTED with a
-	//     pre-upgrade 400 CursorTooOld carrying the floor seq (v1
-	//     silently clamps); a clamped timestamp cursor emits an #info
-	//     OutdatedCursor frame before the first event,
-	//   - Sync 1.1 resync replacement rows are emitted (v1 advances over
-	//     them silently for wire parity).
-	//
-	// The default false preserves Jetstream v1 behavior on /subscribe.
-	// These are deliberately one flag: the policies describe one endpoint
-	// contract and must not be mixed and matched.
+	// V2 selects the subscribeEvents contract: xrpc.v1.json framing and
+	// subprotocol, kinds/dids/collections filters, XRPC errors, and
+	// server-push only. It emits sync and resync replacement rows,
+	// rejects below-floor seqs with CursorTooOld, and announces timestamp
+	// clamping with OutdatedCursor. These policies must stay together.
+	// False preserves the legacy /subscribe contract. See doc.go.
 	V2 bool
 }
 
@@ -169,24 +153,10 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		return
 	}
 
-	// Compression negotiation. The two endpoints have deliberately
-	// different contracts (#294):
-	//
-	//   - /subscribe (v1, wire-frozen): the legacy custom-zstd-dictionary
-	//     opt-in (compress=true / Socket-Encoding: zstd) and auto-negotiated
-	//     RFC 7692 permessage-deflate, exactly as v1 shipped them. A client
-	//     must pick ONE: zstd output is already entropy-coded, so double-
-	//     compressing under deflate is rejected loudly rather than silently
-	//     disabling one.
-	//
-	//   - v2: dict-zstd is the ONLY compression scheme, opted
-	//     into with zstdDictionary=<id> where <id> names the dictionary the
-	//     client fetched via getZstdDictionary. permessage-deflate is never
-	//     negotiated (per-connection deflate is the dominant server cost at
-	//     fanout scale — measured 2.3x the CPU of shared dict-zstd at 200
-	//     subscribers) and the v1 opt-ins are rejected: we never serve
-	//     frames a client can't decode, and there are no legacy v2 clients
-	//     to stay compatible with.
+	// V1 supports its legacy zstd opt-in or permessage-deflate, but
+	// rejects both together. V2 accepts only zstdDictionary=<id>; it
+	// rejects v1 parameters and never negotiates deflate. See doc.go for
+	// the contracts and measured cost.
 	var wantZstd bool
 	if deps.V2 {
 		rawDict := values.Get("zstdDictionary")
@@ -345,23 +315,9 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	}
 	deps.Metrics.incCursorRequests(mode)
 
-	// Compression at the websocket layer:
-	//
-	//   - /subscribe (v1): negotiate RFC 7692 permessage-deflate when the
-	//     client offers it, exactly as v1 shipped. coder/websocket only
-	//     enables it if the peer advertises support, so non-offering
-	//     clients are unaffected. ContextTakeover reuses a 32 KB sliding
-	//     window across messages; its ~1.2 MB flate.Writer per connection
-	//     is tolerated on the legacy endpoint for wire parity.
-	//   - v2: NEVER negotiated. Per-connection deflate is the
-	//     dominant server cost at fanout scale and is client-triggerable;
-	//     v2's only compression is the shared dict-zstd scheme (#294). A
-	//     deflate offer from a v2 client is silently not accepted (that is
-	//     the RFC 7692 fallback: the extension is simply absent from the
-	//     handshake response, and the client proceeds uncompressed).
-	//   - zstd clients (either endpoint) do their own framing, so deflate
-	//     must not also run; disable explicitly so an Accept default can't
-	//     re-enable it.
+	// Enable permessage-deflate only for v1 clients that offer it and are
+	// not using zstd. Context takeover preserves v1 behavior. V2 ignores
+	// deflate offers; zstd clients must not be compressed twice.
 	compressionMode := websocket.CompressionContextTakeover
 	if wantZstd || deps.V2 {
 		compressionMode = websocket.CompressionDisabled

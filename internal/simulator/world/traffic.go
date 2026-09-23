@@ -867,17 +867,10 @@ func (w *World) pickActiveAuthor() (int, error) {
 	return 0, errors.New("simulator: no active author accounts")
 }
 
-// pickUntouchedRecord chooses one (collection, rkey) at random from
-// the account's current MST, excluding any path already in `touched`
-// and any adversarial lie key (adversarial.go). The lie exclusion is
-// load-bearing two ways: a spec-INVALID pick would fail
-// repo.Update/Delete's validation loudly, and a spec-valid-but-
-// unrepresentable pick (300-byte rkey) would ride an honest commit
-// that the gate then drops — an unledgered drop that starves the
-// oracle's gap-free cursor accounting. No honest PDS actor mutates
-// records that could never have been honestly created. ok=false when
-// the repo is empty or every record was already touched by an earlier
-// op in the same commit; callers fall back to create in that case.
+// pickUntouchedRecord chooses a random MST path absent from touched and the
+// adversarial ledger. Mutating an adversarial path could fail repo validation
+// or produce an untracked ingest drop, breaking oracle cursor accounting. If
+// none is eligible, ok is false and callers create a record instead.
 func (w *World) pickUntouchedRecord(rp *repo.Repo, touched map[string]struct{}) (collection, rkey string, ok bool) {
 	type entry struct{ coll, rkey string }
 	var entries []entry

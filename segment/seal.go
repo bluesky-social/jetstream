@@ -25,33 +25,16 @@ type SealResult struct {
 	FileSize       int64
 }
 
-// Seal finalizes the active segment file: flushes any pending events,
-// walks the on-disk frames to gather per-block stats, writes the
-// variable-length footer at end-of-file, patches the finalized
-// 256-byte fixed header at offset 0, fsyncs, and closes the file.
+// Seal flushes pending events, indexes on-disk blocks, writes the footer and
+// finalized header, fsyncs, and closes the file. After success, Append,
+// Flush, and Seal return ErrClosed; Close remains idempotent.
 //
-// Seal consumes the Writer. After a successful Seal, the writer is
-// closed and any subsequent Append/Flush/Seal/Close call returns
-// ErrClosed (Close is idempotent and returns nil).
+// On failure, reopen a Writer at the same path for recovery. sealAfterFlush
+// documents cleanup for partial footer and header writes. Callers must
+// serialize access.
 //
-// On failure, the file is left in a state from which the caller can
-// recover by opening a fresh Writer at the same path:
-//   - Failure before the footer is durable: the file is untouched.
-//   - Failure after the footer is durable but before the header is
-//     patched: Seal explicitly truncates the partial footer back off
-//     before returning, restoring the active-state "last byte is the
-//     last good frame" invariant. The detail is documented in
-//     sealAfterFlush.
-//
-// Seal performs no goroutine work. It is safe to call from any
-// goroutine that already serializes access to this Writer.
-//
-// Seal does not open its own tracing span — it has no ctx parameter
-// to attach to a parent, and a context.Background() span would
-// orphan and lie about parentage. Callers that want a span around
-// the seal (ingest.Writer.rotateLocked, orchestrator.finishBootstrap)
-// already wrap with obs.Span one frame up. Seal's contribution
-// to observability is the seal_duration_seconds histogram below.
+// Callers own tracing spans because Seal has no context. Seal records
+// seal_duration_seconds.
 func (w *Writer) Seal() (SealResult, error) {
 	if w.closed {
 		return SealResult{}, ErrClosed

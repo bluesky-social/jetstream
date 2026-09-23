@@ -2,22 +2,13 @@ package oracle
 
 import "fmt"
 
-// CheckInvariants validates the full structural guarantees of an observed
-// event stream: seqs are unique and strictly increasing, commit events carry a
-// rev, and per-DID revs never regress. It assumes a NON-replayed stream — one
-// where seq order tracks rev order per DID. Use it for clean (no-crash)
-// observations.
+// CheckInvariants requires unique increasing seqs, non-empty commit revs, and
+// non-regressing per-DID revs. Use it for clean streams.
 //
-// For a stream recovered across a crash boundary, the per-DID
-// rev-monotonicity-by-seq guarantee does NOT hold: an idempotent at-least-once
-// replay re-emits already-merged survivors at fresh higher seqs carrying their
-// original (lower) revs, so a later seq can legitimately carry an earlier rev
-// (the AfterMergeDstFlushBeforeSourceCommit contract: "recovery may replay
-// duplicates, but must not lose survivors"). Use CheckStructuralInvariants
-// there — final-state Compare + at-least-once coverage own correctness once
-// replay is in play. Splitting the check keeps the strong per-DID rev-monotonic
-// signal (which kills m005 / backstops m018) intact for every clean-stream
-// caller while not flagging benign replay as corruption.
+// Crash recovery can re-merge rows at new seqs with their original lower
+// revs. Use CheckStructuralInvariants for those streams, plus final-state and
+// at-least-once coverage checks. Keeping the stricter clean-stream check
+// detects rev regressions without rejecting permitted replay.
 func CheckInvariants(events []ObservedEvent) error {
 	if err := CheckStructuralInvariants(events); err != nil {
 		return err

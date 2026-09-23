@@ -30,26 +30,13 @@ func openSegmentReadWrite(fs vfs.FS, path string) (vfs.File, error) {
 	return segmentFS(fs).OpenReadWrite(path)
 }
 
-// createSegmentFileExclusive creates path, failing loudly if it already
-// exists. This backs the tmp-file step of Patch/Rewrite. Both callers
-// unlink any leftover tmp immediately before calling this (a crashed
-// prior run's tmp is expected debris the rename never consumed, so it is
-// safe to reclaim); the exclusive create is then the loud backstop for a
-// tmp that reappears between the unlink and the create — which, given the
-// orchestrator's rewrite lock serializes all Patch/Rewrite on a path,
-// should be impossible, so ErrExist here means our concurrency assumption
-// was violated and we must not silently overwrite.
+// createSegmentFileExclusive fails if path exists. Patch and Rewrite remove
+// abandoned temporary files first; a file reappearing before creation
+// violates their rewrite-lock assumption and must not be overwritten.
 //
-// Production (fs == nil) uses a real O_CREATE|O_EXCL open so the
-// exclusivity is atomic at the syscall boundary — a concurrent creator
-// loses the race and one caller gets ErrExist. The strict in-memory
-// vfs.FS used by the power-loss oracle tier has no exclusive-create
-// primitive (vfs.FS exposes only Create, which truncates, and
-// OpenReadWrite, which creates-if-missing), so that path emulates
-// exclusivity with Stat-then-Create. That emulation is non-atomic, but
-// the tier is single-threaded and deterministic, so no racer exists to
-// exploit the gap; the explicit Stat still fails loud on an unexpected
-// pre-existing tmp.
+// Production uses atomic O_CREATE|O_EXCL. The strict test VFS has no
+// exclusive-create operation, so it uses Stat followed by Create. That
+// emulation relies on the power-loss tier's single-threaded execution.
 func createSegmentFileExclusive(fs vfs.FS, path string) (vfs.File, error) {
 	if fs == nil {
 		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)

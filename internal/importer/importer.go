@@ -1,24 +1,14 @@
-// Package importer is the operator-facing job manager for timestamp import
-// (design §8, milestone M6). It wraps the orchestrator's idempotent RunImport
-// core (Phases A/B/C) with the durable, single-at-a-time job lifecycle the
-// bearer-gated XRPC surface needs:
+// Package importer manages timestamp-import jobs around
+// orchestrator.RunImport. Submit validates the CSV path, rejects concurrent
+// jobs with 409, and returns a job ID while work runs asynchronously.
 //
-//   - Submit validates + confines the operator-supplied CSV path, refuses a
-//     second concurrent job (design Q-JOBMODEL: one import at a time, 409), and
-//     launches the run asynchronously, returning a job id immediately (200).
-//   - Progress is checkpointed in pebble under import/job/<id>/ so a process
-//     restart auto-resumes the in-flight job (design Q-RESUME): per-segment
-//     done markers let a resumed run skip already-patched segments, and a
-//     "bucketed" flag lets it skip re-parsing the CSV. The full-idempotency of
-//     RunImport is the backstop — a lost checkpoint degrades to a cheap re-scan,
-//     never corruption.
-//   - Status is served from the live in-memory record for the running job and
-//     from pebble for finished jobs, feeding both getImportStatus and the
-//     operator status page.
+// Pebble checkpoints under import/job/<id>/ support restart: segment markers
+// skip completed patches and the bucketed flag skips parsing. RunImport is
+// idempotent if a checkpoint is lost. Status uses the running job's in-memory
+// record or the completed record in pebble.
 //
-// Path confinement (design Q-TRANSPORT guard rail): the CSV path is resolved
-// through EvalSymlinks and must live within the configured import directory, so
-// the endpoint cannot be used to read arbitrary host files via .. or a symlink.
+// CSV paths are resolved with EvalSymlinks and confined to the import
+// directory, rejecting traversal and escaping symlinks.
 package importer
 
 import (

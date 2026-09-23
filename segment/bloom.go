@@ -7,31 +7,18 @@ import (
 	"github.com/jcalabro/gloom"
 )
 
-// Bloom-filter sizing knobs. Both apply to DID blooms (segment-level
-// and per-block) per docs/README.md §3.1.3 and the project FP-rate guidance
-// in AGENTS.md/docs/README.md.
+// DID blooms target a 0.1% false-positive rate: each false positive costs a
+// block decode and scan.
 //
-// The 0.001 (0.1%) false-positive rate balances on-disk size
-// (negligible relative to a ~256 MB segment) against scan-time false
-// positives (each FP costs a full block decompress + column scan,
-// which is meaningfully expensive).
+// Per-block capacity is the segment's maximum unique-DID count in any block.
+// Equal sizes allow direct indexing without an offset table; smaller blocks
+// get a lower false-positive rate. bloom_size_bytes in the region header
+// supports both this sizing and legacy fixed-capacity blooms.
 //
-// Per-block bloom CAPACITY is not a constant: filters are sized for the
-// segment's actual max per-block unique-DID cardinality at seal time
-// (issue #302). Real blocks hold runs of a few repos — the measured
-// median is 1-3 unique DIDs against the old fixed capacity of 4096
-// (MaxEventsPerBlock), which made the blooms ~1000x oversized at the
-// median and >90% of server heap (44-88 GiB resident; see
-// specs/notes/2026-07-10-bloom-memory-exploration.md). Sizing to the
-// segment-wide max keeps every bloom in a segment identical in size —
-// the invariant that lets the reader index the region by multiplication
-// with no offset table — while blocks below the max simply realize a
-// better-than-target FP rate. The region header is self-describing
-// (bloom_size_bytes), so right-sized and legacy fixed-size segments
-// coexist with no format change. Compaction rewrites recompute sizing
-// from the surviving rows rather than inheriting the source segment's
-// params (issue #303), so legacy oversized segments shed their bloat
-// incrementally as compaction touches them.
+// Real blocks typically contain 1–3 DIDs. Sizing every bloom for 4096 wasted
+// most server heap; see specs/notes/2026-07-10-bloom-memory-exploration.md.
+// Compaction recalculates capacity from surviving rows, reducing legacy
+// allocations as files are rewritten.
 const (
 	perBlockBloomFPRate = 0.001
 

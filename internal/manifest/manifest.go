@@ -783,32 +783,17 @@ func (m *Manifest) Generation() uint64 {
 
 // ErrSegmentSeqOverlap reports that two sealed segments carry overlapping or
 // out-of-order seq ranges when ordered by Idx — corrupt internal state that
-// breaks the manifest's load-bearing Idx-order==seq-order assumption.
+// breaks the manifest's required Idx-order==seq-order relationship.
 var ErrSegmentSeqOverlap = errors.New("manifest: cross-segment seq ranges out of order")
 
-// validateSegmentSeqMonotonicity enforces that sealed segments, ordered by Idx
-// (the order segs must already be in), have strictly ascending, disjoint seq
-// ranges: for every adjacent pair of NON-EMPTY segments,
-// prev.MaxSeq < next.MinSeq.
+// validateSegmentSeqMonotonicity requires non-empty segments in Idx order to
+// have disjoint ascending ranges: prev.MaxSeq < next.MinSeq. PlanSnapshot
+// uses the last MaxSeq as its goal, and cursor lookups binary-search this
+// ordering. Violations could skip data and must prevent serving.
 //
-// This is the cross-segment analog of segment.validateBlockOffsets's per-block
-// check, and it is just as load-bearing: PlanSnapshot reads the pagination goal
-// as the LAST segment's MaxSeq and walks segments in Idx order trusting that to
-// be global seq order (its continuation cursor and lastUnitMaxSeq monotonicity
-// depend on it); SegmentForSeq and LookbackFloor binary-search by MaxSeq over
-// the same Idx-sorted slice. The single-writer ingest path and the bootstrap
-// merge (which re-seeds the steady seq counter) hold this by construction, and
-// compaction rewrites preserve the seq envelope — so a violation means a
-// reordered/foreign/seq-reset/corrupt segment reached disk. Per CLAUDE.md we
-// refuse to serve it (crash > silently mis-paginating and dropping the tail of
-// the higher-seq segment) rather than letting the planner compute a too-low
-// SealedTipSeq and silently skip in-scope data.
-//
-// EMPTY (EventCount==0) segments are skipped: a compacted-to-empty segment
-// retains its original (now stale) MinSeq/MaxSeq envelope while owning no rows,
-// exactly as the per-block check skips empty blocks. The comparison threads
-// through only non-empty segments, so an empty segment between two non-empty
-// ones does not break the chain. Callers must hold m.mu.
+// Empty segments retain historical envelopes but own no rows, so comparison
+// skips them without breaking the chain between non-empty segments. Callers
+// must hold m.mu.
 func validateSegmentSeqMonotonicity(segs []SegmentMetadata) error {
 	var prevMaxSeq uint64
 	hasPrev := false

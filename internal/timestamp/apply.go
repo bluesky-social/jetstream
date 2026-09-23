@@ -1,25 +1,14 @@
 package timestamp
 
-// apply.go is Phase C: turn a segment's offset file (produced by Phase B) into
-// a segment.Patch mutate closure that stamps the imported display timestamp
-// (indexed_at) onto the matching rows, applying the per-row scope rules from
-// design §3.6 / §4a.
+// Phase C builds a segment.Patch callback from Phase B's CSV offsets.
+// PatchPlan seeks, revalidates, and groups rows by (DID, collection, rkey).
 //
-// The offset file holds byte offsets into the plain (seekable) import CSV.
-// PatchPlan seeks each offset, re-reads and re-validates that single row, and
-// folds it into a per-segment lookup keyed by (did, collection, rkey). Two
-// target shapes hang off each key:
+// An all_versions rule uses the last timestamp for that path. A specific rule
+// maps CID to timestamp and patches every materialization with matching
+// DAG-CBOR content, including duplicate CIDs.
 //
-//   - allVersionsTS: the last-write-wins all_versions timestamp for the path
-//     (patches every materialization row sharing the path).
-//   - specific:      a CID->timestamp map; a materialization row is patched
-//     only if ComputeCID(dag-cbor, payload) matches, and ALL rows with a
-//     matching CID are patched (duplicate-CID rule, §4a).
-//
-// The mutate closure sets ONLY ev.IndexedAt and returns true iff it changed the
-// value, so segment.Patch's guard (which rejects any other field change) and
-// its zero-mutation skip both hold. Re-running an already-applied import is a
-// no-op: the row already carries the target value, so mutate returns false.
+// The callback changes only IndexedAt and reports whether it changed,
+// allowing Patch to skip already-applied imports.
 
 import (
 	"encoding/binary"
@@ -33,17 +22,9 @@ import (
 	"github.com/jcalabro/atmos/cbor"
 )
 
-// RowReader re-reads individual rows from the plain import CSV by byte offset.
-// It is safe for concurrent use: each ReadRow issues a positioned read through
-// an io.SectionReader over a shared *os.File, so the orchestrator's per-segment
-// workers can each hold their own reader without seeking a shared cursor.
-// Construct with OpenRowReader; Close when the job's apply phase ends.
-//
-// The header column mapping is parsed once at open time and reused for every
-// positioned read. This is load-bearing: a data-row offset carries no header,
-// and the operator may have written columns in a non-canonical order, so
-// column meaning must come from the file's own header rather than a positional
-// assumption.
+// RowReader reads validated CSV rows by byte offset using the header mapping
+// parsed at open. Row offsets contain no schema information, so columns must
+// be interpreted through that mapping rather than assumed positions.
 type RowReader struct {
 	f    *os.File
 	size int64
@@ -98,22 +79,14 @@ func (rr *RowReader) ReadRow(off int64) (Row, error) {
 	if off < 0 || off >= rr.size {
 		return Row{}, fmt.Errorf("%w: offset %d out of range [0,%d)", ErrCorruptOffset, off, rr.size)
 	}
-	// A genuine Phase B offset is always a record start: the byte before it is
-	// the previous row's terminating newline (offset 0 is the header, never a
-	// data row, so it is rejected too). Without this check a stale offset into
-	// a swapped file could land mid-record and still parse: a suffix that
-	// happens to decode as a valid row would be applied even though Phase A
-	// never accepted it. Field-level re-validation cannot catch that case;
-	// only the boundary can.
+	// A row offset must follow a newline; zero points to the header and
+	// is rejected. This prevents most stale offsets into a replaced CSV
+	// from parsing a mid-record suffix.
 	//
-	// Known limitation (accepted): a newline embedded in a quoted field also
-	// satisfies this check, so an offset into such a multi-line record could
-	// still parse as a suffix row. Closing it needs global quote parity (a
-	// full re-scan or a size+hash binding of CSV to job) — deliberately not
-	// done: the only actor who can swap the CSV is the operator, who can
-	// already import arbitrary timestamps honestly, and an accidental desync
-	// producing a valid-parsing suffix behind a quoted newline is vanishingly
-	// unlikely.
+	// Accepted limitation: a quoted newline also passes. Detecting that
+	// requires a full scan or size/hash binding. Only the operator can
+	// replace the CSV and already controls imported timestamps; see
+	// specs/gotchas.md.
 	if off == 0 {
 		return Row{}, fmt.Errorf("%w: offset 0 points at the header, not a data row", ErrCorruptOffset)
 	}

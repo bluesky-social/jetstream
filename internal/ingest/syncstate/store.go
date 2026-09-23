@@ -20,38 +20,23 @@ const (
 	acctPrefix  = "sync/acct/"
 )
 
-// PebbleStateStore implements sync.StateStore against a *store.Store.
-// Construction is cheap; one instance per process is enough — the
-// underlying pebble db is concurrency-safe.
+// PebbleStateStore implements sync.StateStore over the concurrency-safe
+// metadata store. One instance can serve the process.
 //
-// Durability is two-phase so verifier state can never run ahead of the
-// archive (docs/README.md invariant 1 / compaction spec §2.2):
+// SaveChain and SaveHosting first update pending maps. The verifier can read
+// these writes, but they cannot reach pebble before the corresponding event
+// rows are appended and fsynced.
 //
-//  1. SaveChain/SaveHosting land in PENDING maps. atmos calls them at
-//     verification time, from its worker goroutines, before the event's
-//     rows have been appended to a segment — let alone fsynced. Pending
-//     entries are visible to LoadChain/LoadHosting (the verifier must
-//     observe its own writes) but are never written to pebble; if the
-//     process dies, they die with it, the relay redelivers from the
-//     cursor, and re-verification regenerates them.
+// The live consumer promotes state after appending every row of its event.
+// StageFlush adds promoted entries to the synced relay/cursor batch after
+// segment fsync. A crash during resync therefore leaves the old verifier
+// state, allowing redelivery or a chain break to archive the full replacement
+// set.
 //
-//  2. The live consumer PROMOTES an entry once every row of the upstream
-//     event that produced it has been appended to the segment writer.
-//     Promoted entries are flushed to pebble by StageFlush in the same
-//     batch that advances relay/cursor, which the consumer commits only
-//     after the segment fsync — so a durable chain/hosting entry always
-//     has its event rows durable too. A crash mid-resync therefore
-//     leaves chain state at the pre-resync rev: the #sync redelivers (or
-//     the next commit chain-breaks) and a fresh resync re-archives the
-//     full replacement set, instead of a durable KindSync tombstone
-//     silently orphaning a partial one.
-//
-// Chain promotion is rev-keyed (TIDs sort lexicographically) and
-// hosting promotion is seq-keyed (HostingState.Seq is the source
-// #account event's upstream seq): a pending entry staged by a LATER
-// pipelined event for the same DID stays pending until that event's
-// own rows land, and a redelivered (verifier-replay-dropped) account
-// row can never promote a newer event's state.
+// Chain promotion is keyed by rev (lexicographically ordered TIDs); hosting
+// promotion uses the source account event's upstream seq. A later pipelined
+// event stays pending until its own rows are appended, and a replayed account
+// row cannot promote newer state.
 type PebbleStateStore struct {
 	s  *store.Store
 	mu sync.Mutex
