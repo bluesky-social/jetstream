@@ -1,14 +1,14 @@
 # 1. Executive Summary
 
-Jetstream v2 is an open-source full-network archive and live-streaming service for atproto. It supports AppViews, network analysis, and other consumers of network data.
+Jetstream v2 is full network archive and live streaming service for atproto. It is an open-source product that allows us and other atproto builders to quickly and easily gather all data on the network in order to build novel products, perform network analysis, etc.
 
-It backfills known repositories, then follows the live firehose. Records are stored in compressed columnar files that clients can download before switching to the live stream.
+It ingests every record from all known repos on a relay, then cuts over to the live firehose. It stores data in a custom, highly optimized columnar file format. Users then connect to the server jetstream v2 to seamlessly stream through backfilled data as well as live.
 
-The legacy endpoint preserves Jetstream v1’s filtered JSON interface. The archive adds full-network backfill and stores raw CBOR for record verification.
+Jetstream v2 is the next evolution of Jetstream v1, with expanded capabilities and better aligned with the atproto ethos. It provides the same user-friendly JSON interface that allows for data filtering in a backwards-compatible manner, but also enables fast and easy full network backfill. It also stores the raw CBOR so each record and account is interrogatable if desired.
 
-Jetstream is self-hostable. Bluesky will also provide a free service at the existing Jetstream v1 URLs with compatible websocket payloads.
+It is self-hostable and cheap to run. We will also provide it as a free service, transparently replacing our existing Jetstream v1 instances (i.e. same URLs, same websocket payload).
 
-This document calls the new service “Jetstream” and the original implementation “Jetstream v1.”
+From here on out, I call Jetstream v2 simply "jetstream", and the old jetstream implementation will be called "jetstream v1".
 
 ### 1.1 Goals and Non-Goals
 
@@ -16,17 +16,18 @@ Jetstream v2 is designed with the following use-cases in mind:
 
 1. Archive the whole network locally to disk in a highly compressed format
 2. Use that local cache to backfill all data (or a subset) and cut over to live seamlessly
+    1. This enables building AppViews quickly and in a robust manner
 3. Transparently replace Jetstream v1 while providing the ability for independent parties to interrogate the validity of its data
 4. Provide a CDN-friendly downloadable archive for all known accounts and events
 5. Maintain a database of witness timestamps on records
-6. Operate on a single server at low cost
+6. Dead-simple and cheap for us and others to operate on a single server
     1. The machine doesn't need much CPU, but it would benefit from a fair bit of ram for initial backfill, and a reasonably large disk (a few TB)
     2. High availability is a future goal; the earlier replication design was dropped (see Section 6)
 
-Non-goals:
+We also have the following non-goals, which are explicitly not included in this design:
 
 1. Exactly once delivery
-    1. We do at-least-once delivery and require clients to be idempotent
+    1. We do at-least-once delivery and require clients to be idempotent (they already should be if they're subscribing to the existing firehose!)
 2. Cryptographic proof storage
     1. Since we lay out records in order per-DID, we actually should be able to reconstruct the latest rev and repo root on the fly for a user
     2. However, we won't store prevData
@@ -34,6 +35,8 @@ Non-goals:
     1. This is a replay cache, not a general purpose database. We only support large range scans
 4. Distributed consensus
     1. High availability will be addressed by a separate design later (see Section 6)
+    2. Doing distributed consensus is quite challenging, and I want to ship a robust system quickly
+    3. This isn’t a one-way door; we can add raft on segment blocks eventually. But I want to avoid ballooning the complexity of the original design so we can ship on reasonably short timelines
 
 ### 1.2 Why Build This Now?
 
@@ -90,7 +93,7 @@ It's at this transition point that Jetstream starts to field user requests. It h
 - HTTPS file downloads of the large segment files
 - Live websocket tail in the same JSON format as Jetstream v1 for live events
 
-The Go client exposes archive and live events through one iterator:
+We provide a seamless user experience similar to the following example Go code.
 
 ```go
 func main() {
@@ -128,9 +131,9 @@ func main() {
 }
 ```
 
-The client plans archive downloads, downloads and decodes them with bounded concurrency, then switches to the live websocket. Both sources yield the same event type. Client libraries must implement this coordination.
+Under the hood, the client library and server come up with a plan that details which segment files to download, and when to transition to the live websocket. It begins downloading data from either source, but presents events to the user in a single format so they don't even need to be aware of whether or not they're completing a backfill or tailing live. This means that we need to have relatively "thick" client libraries (TypeScript and Go to start) that understand the semantics of Jetstream.
 
-For example, a request for `standard.site` documents since a saved cursor downloads matching archive blocks and emits their events through `client.Events(ctx)`.
+For instance, if a user requests all `standard.site` documents since two weeks ago according to some cursor value, the client library asks the server for the HTTP segments since that time period. It downloads them with some amount of bounded concurrency, and emits them in the `client.Events(ctx)` for loop iterator.
 
 Just like the firehose, the way the data is laid out on disk naturally ensures events within a single DID are delivered in order (though multiple DIDs may be interleaved together).
 
@@ -144,7 +147,7 @@ The consumer folds the stream as it goes (creates/updates apply; deletes/account
 
 ### 3.1.1 Overview
 
-Segment files optimize compressed storage and range scans. They do not support arbitrary queries or point lookups.
+`Segment files` store events in a format optimized for fast range scans and high compression ratios. No other access patterns are prioritized (i.e. we don't support point lookups). This is not a general purpose database; it's highly specific to being a full network cache that's optimized for fast replay on as small a disk as possible.
 
 Events in segment files are sorted by the order they were ingested by Jetstream. That means we also naturally sort events in order per-DID (though there is no global ordering).
 
@@ -157,17 +160,17 @@ We detect state at read time by checking the checksum bytes at offset 4: zeroes 
 
 Each block contains some number of events (4096 by default, but operator-configurable). Each event has some metadata fields and its full raw CBOR, all stored in a columnar format as described in Section 3.2. Storing CBOR is important so Jetstream is interrogatable and can be audited/spot checked for correctness (i.e. comparable to a `getRecord` call on the user's PDS for consistency checks). A block is flushed to disk whenever it reaches 4096 events or 30 seconds have elapsed since the block started filling, whichever comes first. Once a block is ready, we zstd compress it and append it to the active segment file, prefixed with an 8-byte uint64 length. The length prefix makes crash recovery and sequential scans straightforward without needing a zstd-aware frame walker.
 
-As we subscribe to the upstream firehose, we assign each event a sequence number, store them in an in-memory buffer, and forward it to downstream subscribers. Once we've accumulated a full block in-memory, we write it to the active segment file on disk and fsync, then update our latest seen cursor in the metadata db (see section 3.5). The persisted cursor is always less than or equal to the latest durable event in the segment file.
+As we subscribe to the upstream firehose, we assign each event a sequence number, store them in an in-memory buffer, and forward it to downstream subscribers. Once we've accumulated a full block in-memory, we write it to the active segment file on disk and fsync, then update our latest seen cursor in the metadata db (see section 3.5). The persisted cursor is always less than or equal to the the latest durable event in the segment file.
 
-On crash/restart, we seek the active segment back to the last complete block (walking the 8-byte length prefixes from offset 256 forward), resume the upstream firehose from the persisted cursor, and rely on at-least-once semantics to cover the overlap. Worst-case, re-fetched and re-delivered traffic is one block. All downstream subscribers must be idempotent to duplicate event delivery. The steady-state writer's write-ahead seq lease prevents the pending client-visible block from reusing seqs: startup records the abandoned portion as a registered vacancy and starts after it. Thus seqs never go backward or get reassigned, although an unclean exit can leave a forward gap of at most one configured block per startup attempt. `MaxEventsPerBlock` is known in `ingest.Config` at startup (4096 by default); the steady server currently uses that internal default rather than exposing a dedicated CLI/env setting.
+On crash/restart, we seek the active segment back to the last complete block (walking the 8-byte length prefixes from offset 256 forward), resume the upstream firehose from the persisted cursor, and rely on at-least-once semantics to cover the overlap. Worst-case, re-fetched and re-delivered traffic is one block. All downstream subscribers must be idempotent to duplicate event delivery (they already should be!). The steady-state writer's write-ahead seq lease prevents the pending client-visible block from reusing seqs: startup records the abandoned portion as a registered vacancy and starts after it. Thus seqs never go backward or get reassigned, although an unclean exit can leave a forward gap of at most one configured block per startup attempt. `MaxEventsPerBlock` is known in `ingest.Config` at startup (4096 by default); the steady server currently uses that internal default rather than exposing a dedicated CLI/env setting.
 
-After a segment file accumulates enough blocks (~256MB of compressed data), we seal it by writing the variable-length footer at the end of the file, seeking to offset 0 and overwriting the reserved 256 bytes with the finalized fixed header, fsync, and rotate to a new active file.
+After a segment file accumulates enough blocks (~256MB of compressed data), we seal it by writing the variable-length footer at the end of the file, seeking to offset 0 and overwriting the reserved 256 bytes with the finalized fixed header, fsync, and rotate to a new active file. The process continues until the heat death of the universe.
 
 Deletions and updates do not modify segment files synchronously. Every delete and update is recorded as a tombstone, keyed by its AT URI (Section 3.3), and applied physically during compaction — the server rewrites sealed segments to drop superseded creates/updates below the compaction watermark. There is no read-time overlay: the server does not suppress rows at delivery time, and clients fold the stream they receive (creates/updates apply; deletes/account-deletes/syncs remove) rather than consulting a separate tombstone set.
 
 Every so often, we compact updates/deletions into the sealed segments. Compaction snapshots tombstones above `compaction/seq`, rewrites sealed segments atomically, and refreshes serving metadata for changed files. See Section 3.3 for more details.
 
-Merge and compaction replace sealed files atomically. ETags identify each immutable generation, allowing CDN caching, parallel backfill, and seeding another instance from an archive.
+The net of this is that segment files are immutable between compaction passes and only rewrite on the merge-tail pass or the steady-state compaction cadence. These files are CDN-friendly with etags, enabling parallel backfill for clients and easy seeding of another instance from a given jetstream instance's archive.
 
 The existing archive query URLs also support HTTP `HEAD`: `/xrpc/network.bsky.jetstream.getSegment?name=...` and `/xrpc/network.bsky.jetstream.getBlock?segment=...&blockIndex=...`. HEAD is deliberately limited to these two URLs; it does not enable framework-wide HEAD handling or add query parameters. Segment HEAD opens and validates the same sealed-file descriptor as GET, so `ETag`, `Content-Length`, `Last-Modified`, ranges, and conditionals describe one immutable generation. Block HEAD exposes the virtual raw compressed frame (without its 8-byte on-disk length prefix), validates the selected 52-byte block-index entry from that descriptor, and uses a section reader so it does not allocate the compressed frame. GET retains its existing frame-buffer path. Both methods remain behind the normal readiness gate and return the same XRPC errors for malformed, missing, deleted, or corrupt archive data.
 
@@ -299,7 +302,7 @@ Collection Block Index:
 
 Each block contains 4096 events (configurable by the server operator). Events within a block are stored in a columnar layout. All columns are concatenated and compressed as a single zstd frame with content checksums enabled so that bit flips or partial writes are detected on decompression.
 
-The default block size (4096 events) and segment size (~256 MB) need measurement against real data: larger blocks may compress better but require more decoding for filtered scans.
+Note that this default size of 4096 was chosen somewhat arbitrarily and we should run experiments on real-world data to measure compression ratios of larger blocks, and try to square that against scans filtering by did or collection needing to examine too much data. More experimentation is required to pick a good default size. Similarly, is 256mb a good size for the overall file?
 
 Each block is composed of the following data:
 
@@ -347,9 +350,9 @@ kind values:
 
 ### 3.3 Record Updates/Deletions, Account Deletions, and Compaction
 
-Compaction removes deleted records and superseded versions. Full record history will remain out of scope until the protocol supports it.
+Jetstream supports record updates, record deletion, and account deletion. When an account is deleted, all its records will also be deleted. We will only store data on the latest version of a record; we will not store full record history until that is also kept on-protocol (perhaps some day?). We treat an update similar to a delete, blowing away the original record and replacing it with the newly updated version.
 
-Updates and deletions are appended to the active segment. Compaction later rewrites older sealed segments to remove the affected data.
+As updates and deletions come over the firehose, and we store them in the active segment file as normal. However, we do eventually need to alter the original source data in older, sealed segment files to ensure we’re not storing data that the user requested be deleted. The process of cleaning up the older data is known as compaction.
 
 Compaction runs once at the tail of the merge phase, after the destination segments are sealed and before the server enters `phase=steady_state`. This makes the first served archive view delete/update compliant. In steady state, compaction runs every `--compaction-interval` (`JETSTREAM_COMPACTION_INTERVAL`, default `4h`; `0` disables compaction) and can also run early when the in-memory tombstone set reaches `--compaction-tombstone-cap` (`JETSTREAM_COMPACTION_TOMBSTONE_CAP`, default `32000000`).
 
@@ -375,7 +378,7 @@ The planner has a one-sided correctness contract: no false negatives, possible f
 
 **Pagination.** Servers bound per-page cost with limits aligned to the live endpoint: at most 4 raw kind values, 10,000 raw DIDs, and 100 raw collection patterns by default, plus a configurable maximum response/work-entry count and whole-segment density threshold. When a plan would exceed the per-page entry limit, the server **truncates at a work-unit boundary** (a whole segment, or one coalesced block range) and reports `plannedThroughSeq` as the `MaxSeq` of the last included unit — never the enclosing segment's `MaxSeq` after a mid-segment cut, which would skip the un-included tail blocks. The server never silently truncates or refuses: there is no `PlanTooLarge`. At least one unit is always admitted per page, so a single oversized unit still makes progress (no zero-progress livelock). When a page is not truncated, `plannedThroughSeq == sealedTipSeq`.
 
-The backfill-to-live protocol is:
+Putting it all together, the client's backfill→live loop looks like:
 
 1. The client calls `planSnapshot(afterSeq=cursor)` (page 1) to learn which sealed segments/blocks may satisfy its query (i.e. "give me all `standard.site` documents") and pins `S = sealedTipSeq` as the upper bound for the whole backfill.
 2. The client downloads the planned segments/blocks, decodes them, applies exact kind/DID/collection filtering, and emits matching rows. DID-level markers (`#account`/`#identity`/`#sync`) ride inline via the sentinel index unless explicitly excluded by `kinds`.
@@ -405,7 +408,7 @@ Segments are named with a counter as a 10-digit zero-padded base-36 string. Segm
 
 ### 3.5 Metadata Store
 
-Metadata that cannot be cheaply rebuilt from segment files lives in pebble at `data/meta.pebble/`. Pebble is pure Go, supports tens of millions of keys, and provides the atomic batches required by the durability ordering below.
+All structured metadata that isn't derivable by cheaply rescanning segment files lives in a single pebble database at `data/meta.pebble/`. We picked pebble because it's pure Go, handles tens of millions of keys comfortably, and gives us atomic multi-key batch writes for free, which matters for the durability ordering described below.
 
 Keys are namespaced by prefix:
 
@@ -486,11 +489,11 @@ Pebble batch only when all covered completion rows are eligible for the same
 durable batch. A crash can therefore make a cursor lag and repeat work, but it
 cannot make a cursor lead segment durability and silently skip data.
 
-For each block, append and fsync the segment, then commit one synced pebble batch containing `relay/cursor` and the affected `repo/<did>` fields. A block is durable only after both complete. A crash between them leaves the cursor behind the data, causing replay rather than loss.
+The per-block durability ordering is: append and fsync the block into the active segment first, then commit a single pebble batch with `sync=true` that advances `relay/cursor` and updates `repo/<did>.Rev` and other fields for every DID present in the block. Only after both steps complete do we treat the block as durable. Because the pebble batch always follows the segment fsync, a crash between the two leaves `relay/cursor` pointing at or before the last durable event, so if we do crash, we'll just replay some relatively small number of events.
 
-Segment persistence failures stop the process. Any write, fsync, or rename error on a segment path — the active writer's block flush and seal, the pebble durable-batch commit, a compaction rewrite, or a timestamp-import patch — aborts the process rather than continuing past unarchived data; there is no read-only degraded mode. Disk-full (`ENOSPC`) errors additionally carry an actionable operator message on every one of those paths ("fatal persistence error: disk full while ... free space or move the data directory, then restart jetstream"), and the `jetstream_data_dir_free_bytes` gauge exists to alert before it comes to that. Recovery after any such crash is the normal restart path: the torn-tail walk truncates at the last fully-durable frame and the persisted cursor replays the small un-committed window. Compaction rewrites and import patches write a sibling `.tmp`, fsync, then rename, so a failure at or before the rename always leaves the original segment untouched. The oracle’s segment-fault tier tests these paths through a real runtime using `segment.IOFaultInjector` (nil in production).
+Segment persistence failures are crash-loud, uniformly. Any write, fsync, or rename error on a segment path — the active writer's block flush and seal, the pebble durable-batch commit, a compaction rewrite, or a timestamp-import patch — aborts the process rather than continuing past unarchived data; there is no read-only degraded mode. Disk-full (`ENOSPC`) errors additionally carry an actionable operator message on every one of those paths ("fatal persistence error: disk full while ... free space or move the data directory, then restart jetstream"), and the `jetstream_data_dir_free_bytes` gauge exists to alert before it comes to that. Recovery after any such crash is the normal restart path: the torn-tail walk truncates at the last fully-durable frame and the persisted cursor replays the small un-committed window. Compaction rewrites and import patches write a sibling `.tmp`, fsync, then rename, so a failure at or before the rename always leaves the original segment untouched. All of this is enforced by a deterministic segment I/O fault-injection seam (`segment.IOFaultInjector`, nil in production) that the oracle's segment-fault tier drives end-to-end through a real runtime.
 
-Reconstructible metadata is generally kept out of pebble. The segment manifest is just a directory scan plus each file's self-describing 256-byte header, so we don't duplicate it. Discovery-time DID→PDS attribution is retained in `repo/<did>` for direct retries; handle resolution still comes from the PLC directory. Per-DID hosting status flows in as `#account` events; we keep the current value in pebble so we can answer quickly, but it is reconstructible by replaying segments.
+Everything else is deliberately kept out of the metadata store. The segment manifest is just a directory scan plus each file's self-describing 256-byte header, so we don't duplicate it. Discovery-time DID→PDS attribution is retained in `repo/<did>` for direct retries; handle resolution still comes from the PLC directory. Per-DID hosting status flows in as `#account` events; we keep the current value in pebble so we can answer quickly, but it is reconstructible by replaying segments.
 
 ## 4. Ingestion Pipeline
 
@@ -514,7 +517,7 @@ On first startup, we kick off two things in parallel:
     6. Marks each host drained after its final cursor is durable, or exhausted after its second producer attempt. Exhausted hosts are visible and do not prevent bootstrap from terminating
     7. Re-lists `listHosts` once all known hosts are terminal; bootstrap returns only when that proof pass finds no new eligible host
 
-A full backfill currently takes about 16 hours under the mushroom PDS rate limits.
+This phase takes a while. At time of writing with current rate limits on the mushroom PDSes on the new relay, it takes ~16 hours.
 
 Once we complete the backfill phase, we seal the active segment so when we resume the live consumer during the steady state phase, it starts with a fresh file.
 
@@ -524,9 +527,9 @@ Once the backfill of all repos is complete, we need to merge the segment files a
 
 The bootstrap-live consumer has been continuously persisting the upstream firehose cursor to `relay/cursor` on every block flush, so by the time we enter the merge phase the cursor already reflects the latest durable bootstrap-live event. We stop the live consumer before merge runs; when we transition to the steady-state phase, the new live consumer reads `relay/cursor` and resumes from that watermark. At-least-once delivery covers the at-most-one-block overlap. The merge phase itself is a relatively small amount of data and should only take a few minutes.
 
-Merge replays sealed and active files from `./data/backfill/live_segments/` into new files under `./data/segments/`, starting at the next segment number and rotating at the size limit.
+We take the events from the sealed and active segment files in `./data/backfill/live_segments/` and replay those events in to the main `./data/segments/` directory. We do that simply by opening a new segment file in `./data/segments` with the next contiguous file name, and writing events from `./data/backfill/live_segments` to the new file(s). We seal and roll over to the next segment file once the active one reaches its size limit.
 
-Merge drops events whose rev is at or below the DID’s `BackfillRev` in `repo/<did>`. This preserves per-DID order and avoids replaying events already covered by backfill.
+We ensure that we don't store any events out of order by checking the DID's `BackfillRev` from `repo/<did>` in the metadata store against the revs of the events we're compacting. We drop the events whose rev is less than or equal to `BackfillRev`. This also should ensure we don’t store duplicate events (though because of at-least-once semantics, this is not a strict requirement).
 
 After sealing the destination segment, we run the merge-tail tombstone compaction described in Section 3.3 so the archive is delete/update-compliant before `phase=steady_state` is written.
 
@@ -546,7 +549,7 @@ beginning, and each host receives one attempt. Unknown DIDs become
 
 ### 4.3 Steady State Phase
 
-Steady state consumes the upstream firehose into `./data/segments/` and periodically compacts updates and deletions as described in Section 3.3.
+The steady-state phase simply consumes from the upstream firehose and writes events to the active segment file in the `./data/segments` directory as normal. Every so often, it compacts updates and deltions in to the sealed segments as described in Section 3.3.
 
 Every block seal commits a single pebble batch that advances `relay/cursor` and refreshes `repo/<did>.LatestRev` for every DID in the block. We always fsync the segment block first and then commit the pebble batch with `sync=true`, so the persisted cursor can never get ahead of the durable event data. A crash between the two steps is handled by the active-segment recovery path described in Section 3.1, and the upstream resumes from whatever cursor pebble last saw.
 
@@ -583,21 +586,21 @@ Internally, Jetstream doesn't care about handles, identity updates, or hosting s
 
 #### Identity/Account delivery and the collection filter
 
-On legacy `/subscribe`, `wantedCollections` never filters `#account` or `#identity`; `wantedDids` still applies. The endpoint omits `#sync` for v1 compatibility.
+The legacy `/subscribe` (v1) endpoint preserves the original Jetstream contract: regardless of `wantedCollections`, all subscribers receive `#account` and `#identity` events (they are still gated by `wantedDids`). This is intentional backwards compatibility and must not change.
 
-On v2, `collections` constrains commits only. A collection-filtered subscriber also receives `#account`, `#identity`, and `#sync`, subject to `dids` and `kinds`. Use `kinds=commit` for commits only. DID-level markers let consumers remove an account’s records after deletion or divergence; client libraries deliver these markers as ordinary events for the consumer to fold. The bundled Go client uses v2 and receives `#sync`. Archive backfill preserves the same marker coverage through the sentinel index in Section 3.3.
+On v1, `#account` and `#identity` are delivered **unconditionally** — regardless of `wantedCollections` (still gated by `wantedDids`). On the v2 endpoint the same outcome is reachable but *explicit*: the `collections` filter constrains only commit events and never drops other kinds, so a `collections=X` subscriber still receives everyone's `#account`/`#identity`/`#sync` — and a consumer that genuinely wants only commits says so with `kinds=commit` (Section 5.2). `#sync` is only emitted on the v2 wire: the v1-compatible JSON wire skips `#sync` for v1 parity (v1 never emitted it — `encoder.go` returns `errSkipEvent` for the v1 `Encode`, while `EncodeV2` emits it). The bundled Go client consumes the v2 wire, so it receives `#sync`; a v1 `/subscribe` consumer does not. Earlier drafts dropped `#identity` (and hid `#account`) under a collection filter; that policy is gone (see [#142](https://github.com/bluesky-social/jetstream/issues/142), [#171](https://github.com/bluesky-social/jetstream/issues/171)). The reason is correctness, not just intuitiveness: a DID-level marker (an account delete `active=false, status=deleted`, or a `#sync` divergence) is what a folding consumer uses to purge a dead account's records, so it must reach every subscriber that hasn't explicitly filtered those kinds out — a v1 collection-scoped subscriber can't, and a v2 one has to opt out via `kinds`. There is no client-side suppression and no "fold before the delivery filter" step; the markers are delivered as ordinary events and the consumer folds them. (For the *backfill* path, the same coverage is provided in the archive by the DID-marker sentinel index described in Section 3.3, so a collection-filtered backfill selects those marker blocks too.)
 
 Jetstream respects sync 1.1. In the case where a `#sync` event indicates a repo has diverged and requires a full resync, we store the `KindSync` row followed by the authoritative replacement records returned by the verifier. The `KindSync` row is a DID tombstone for compaction (see Section 3.3), so older pre-divergence record rows are physically removed once the relevant sealed segment is compacted.
 
 ## 5. Client Protocol and Libraries
 
-Go and TypeScript client libraries coordinate archive downloads and live streaming. The public protocol also supports implementations in other languages.
+We ship client libraries in TypeScript and Go. They are relatively "thick" in the sense that clients require substantial amounts of logic in order to use the system. All the code is public and well-documented, so community members can maintain client libraries in other languages.
 
 For the live-tail use-case, clients are simple. The legacy `/subscribe` endpoint stays compatible with the existing Jetstream v1 WebSocket JSON payload and query parameters, so existing v1 consumers continue to work as-is (no client wrapper library is even needed for those simple use-cases). New clients — including the bundled libraries — speak the canonical v2 stream at `/xrpc/network.bsky.jetstream.subscribeEvents` (Section 5.2), which uses proposal-0015 framing and renamed filter parameters; the v1 parameter names are deliberately rejected there.
 
-For historical reads, the client pages `planSnapshot`, downloads and emits blocks in order, then switches to the v2 live websocket. Callers consume one iterator across both phases.
+It gets more complicated when the caller requests data that is older than the current active segment. The client asks the server something like "I want all likes since 2024", pages `planSnapshot` over the sealed segment files (downloading and emitting each page's blocks in order, including the inline deletion/update markers), and once it has consumed the sealed range it seamlessly cuts over to the v2 live websocket. That cutover is transparent to callers, who use a Go `iter.Seq2` or a TypeScript async iterable to provide an excellent devex.
 
-The client wrapper also handles websocket reconnects for live-only callers.
+Most callers will want to use the client wrapper (even for the trivial use case) so they don't need to repeatedly implement the same websocket logic, and may seamlessly handle the case where they want to perform backfill some day.
 
 ### 5.1 Legacy v1 JSON Payload (`/subscribe`)
 
@@ -696,13 +699,15 @@ The v2 stream is not authenticated, so we may more strictly rate limit it compar
 
 ## 6. Replication
 
-> **Dropped; pending redesign.** The unimplemented active-passive replication design and its extended websocket mode were removed. Jetstream runs on one node. See `specs/notes/2026-06-27-high-availability-clustering.md` for high-availability options.
+> **STATUS: DROPPED — to be redesigned.** An earlier draft of this section specified an asynchronous active-passive replication protocol built on an `?extended=true` websocket payload (carrying `upstream_relay_cursor` and `segment_sealed`/`segment_compacted`/`heartbeat` control events). That design — and the extended wire mode it required — has been removed; nothing of it was ever implemented. High availability will be addressed by a different mechanism designed later; see `specs/notes/2026-06-27-high-availability-clustering.md` for the current exploration. Jetstream today runs single-node.
 
 ## 7. Rate Limits
 
-The Bluesky-hosted service will apply per-IP limits at the CDN and origin for archive downloads, subscriber counts, and live events. Limits will be configurable.
+For production readiness, we ensure that we have reasonable rate limits for requests that make it to the system. We'll put in place per-IP limits on the CDN as well as the origin to ensure that HTTP segment file downloads are limited as well as the number of subscribers and events to the live tail.
 
-Other operators choose their own limits.
+These will be configurable over time as we scale.
+
+This is of course an implementation detail of the Bluesky-hosted instance. Others can do what they please.
 
 ### 7.1 Operational Freshness and Crash Diagnostics
 
@@ -743,24 +748,24 @@ structured logs with build metadata before re-panicking.
 
 ## 8. Timestamp Import
 
-Backfill timestamps reflect when Jetstream fetched a record, not when it was first indexed. Client-supplied `createdAt` is not trustworthy. Timestamp import preserves timestamps from an existing indexer, such as Bluesky’s dataplane, for display in AppViews.
+Any new firehose indexer has the same problem: it stamps every record with roughly the time it backfilled, so a post from 2022 looks like it was made today. `createdAt` doesn't save us — it's client-supplied and spoofable, which is both a bad product experience and a trust-and-safety hole. To build a real AppView you have to carry over the original indexer's timestamps. Bluesky's dataplane has been running since 2022 and has them; a fresh jetstream does not.
 
 So we keep two timestamps per event:
 
 - `witnessed_at` — when *this* jetstream first saw the event. We assign it at ingestion time and never change it. It's what our range scans and the `?cursor=<timestamp>` lookback are built on, so it has to stay honest and monotonic with the sequence number.
 - `indexed_at` — the timestamp we hand to clients as `time_us`, i.e. the one they should actually display. By default it's just `witnessed_at`, but an operator can overwrite it with the value the old indexer recorded. This is the "display" timestamp.
 
-Only the operator can import `indexed_at` values. Without a configured bearer token, import endpoints return 401.
+Only the operator can change `indexed_at`, and it's off by default: the import endpoint is disabled and returns 401 unless a bearer token was configured at startup. We're not letting random callers rewrite timestamps.
 
-Imports run only in steady state, against a live server. The operator stages an uncompressed CSV of AT URIs and timestamps and submits its path. Validation records byte offsets so the patch pass can seek directly to each row; compressed input would require rescanning or a plaintext copy. Rules apply to all versions of a record by default, or to one CID. AT URIs include the DID, allowing segment and block DID blooms to prune scans; CID-only sources must resolve URIs first.
+Imports run against a steady-state live server with no downtime. They are deliberately not a bootstrap or merge-phase operation: before steady state there is no stable serving archive to repair. The operator stages a plain (uncompressed) CSV of AT URIs and timestamps somewhere on the box, then kicks off an import job pointing at that path. Uncompressed on purpose: the import records a byte offset for each valid row during its single streaming validation pass and seeks straight back to that row when it's time to patch, which a compressed stream can't do without re-scanning or spilling a plaintext copy — and the box already holds the multi-terabyte segment archive, so the extra disk is a cheap trade. Each row can say whether the timestamp applies to every version of the record (the default) or one specific version by CID. We key on AT URI rather than CID because the URI contains the DID, which lets the segment-level DID bloom do almost all the filtering for free; operators who only have CIDs can resolve them to URIs first.
 
 The job first ingests the CSV into a durable imported-timestamp rule map and reloads that map into the steady writer's append path. Once the rules are active, it force-rotates the current active segment so rows that were already buffered become sealed and visible to the patch pass. It then buckets the URIs by DID, uses the segment and per-block DID blooms to find candidate blocks, decompresses each one, and patches the `indexed_at` column for the matching rows. Rows appended after rule activation are stamped with their imported `indexed_at` before they enter the segment or live read log, so they do not depend on a later patch. Bad rows are skipped and reported rather than failing the whole import, and re-running is safe: an already-applied file just produces no changes.
 
-After each rewrite, the manifest publishes the replacement file for subsequent archive downloads. A future replication design must also propagate these replacements.
+Once the import has rewritten the affected segments, the manifest lists the new files and backfilling clients pick them up on their next segment listing. (The dropped Section 6 replication design would have pushed `segment_compacted` notifications to replicas; whatever HA mechanism replaces it must account for compacted-segment propagation.)
 
 ### 8.1 Operating an import
 
-**Enable it.** Set a bearer token at startup: `--timestamp-import-token` (or `JETSTREAM_TIMESTAMP_IMPORT_TOKEN`). With no token the two endpoints always return 401 and are indistinguishable from "disabled". Stage the CSV under the confinement directory, which defaults to `<data-dir>/imports` and is overridable with `--timestamp-import-dir` (`JETSTREAM_TIMESTAMP_IMPORT_DIR`). The submitted path is resolved and confined to that directory; `..` traversal and symlinks that escape it are rejected.
+**Enable it.** Set a bearer token at startup: `--timestamp-import-token` (or `JETSTREAM_TIMESTAMP_IMPORT_TOKEN`). With no token the two endpoints always return 401 and are indistinguishable from "disabled" — that's the secure default. Stage the CSV under the confinement directory, which defaults to `<data-dir>/imports` and is overridable with `--timestamp-import-dir` (`JETSTREAM_TIMESTAMP_IMPORT_DIR`). The submitted path is resolved and confined to that directory; `..` traversal and symlinks that escape it are rejected.
 
 **Front it with TLS.** The token is a bearer secret. Jetstream serves plain HTTP and expects TLS to be terminated by your proxy, so terminate TLS in front of the import endpoint — jetstream does not enforce it in-process (an in-process check would inspect a connection that is already plaintext).
 
@@ -769,7 +774,7 @@ After each rewrite, the manifest publishes the replacement file for subsequent a
 - `network.bsky.jetstream.importTimestamps` (procedure) — body `{ "path": "<file>" }`, where `<file>` is relative to the import directory (or an absolute path inside it). Returns `{ "job": "<id>" }`. Only one import runs at a time; a concurrent submit gets `409 ImportInProgress`. A valid submit before the steady-state writer is running gets `503 ImportNotReady`. A bad path gets `400 InvalidPath`.
 - `network.bsky.jetstream.getImportStatus` (query) — `?job=<id>` (or omit it for the current/most-recent job) reports lifecycle state, phase, per-phase progress, and, on completion, the parse/mutation totals. The same summary appears on the operator `/status` page.
 
-**CSV schema.** Header row `uri,timestamp,scope,cid`. Column order is read from the header, so it need not be canonical, and the optional `scope`/`cid` columns can be omitted entirely. The header is strict: an unrecognized or duplicate column name fails the whole file up front.
+**CSV schema.** Header row `uri,timestamp,scope,cid`. Column order is read from the header, so it need not be canonical, and the optional `scope`/`cid` columns can be omitted entirely. The header is strict: an unrecognized or duplicate column name fails the whole file up front (it's almost always a typo of a real column, and mis-mapping every row is worse than a loud error).
 
 - `uri` — `at://<did>/<collection>/<rkey>`. Required.
 - `timestamp` — RFC3339 (e.g. `2022-01-02T03:04:05Z`), parsed to microseconds. Required.
@@ -784,7 +789,7 @@ Sorting the CSV by DID is *recommended, not required*: it keeps the bucketer's p
 
 **Crash safety.** Progress is checkpointed in the metadata store per segment, so a process restart auto-resumes the same job without re-submission and skips segments it already patched. Even if the checkpoint is lost the job is safe to re-run: an already-applied segment produces zero mutations and is skipped. There is no dry-run mode — a real run is safe to start and watch via `getImportStatus`.
 
-**When a job fails: re-submit the same CSV.** A job that hits a real error (disk full, a shutdown that raced the job's setup) lands in `failed` state on `getImportStatus` and the `/status` page, and deliberately does *not* auto-resume — re-running a deterministically failing job would loop. A failed run may have installed part of its rule map, so new events can be stamped from an incomplete rule set until the import is completed. Fix the cause and re-submit the exact same CSV. Jetstream never modifies or deletes the staged file (only per-job scratch under `<data-dir>/import-scratch` is cleaned up), and every phase is idempotent — rule ingestion is last-write-wins over the full file and already-patched segments produce zero mutations — so the re-run converges to the same end state as an uninterrupted import.
+**When a job fails: re-submit the same CSV.** A job that hits a real error (disk full, a shutdown that raced the job's setup) lands in `failed` state on `getImportStatus` and the `/status` page, and deliberately does *not* auto-resume — re-running a deterministically failing job would loop. A failed run may have installed part of its rule map, so new events can be stamped from an incomplete rule set until the import is completed. The remedy is simple: fix the cause and re-submit the exact same CSV. Jetstream never modifies or deletes the staged file (only per-job scratch under `<data-dir>/import-scratch` is cleaned up), and every phase is idempotent — rule ingestion is last-write-wins over the full file and already-patched segments produce zero mutations — so the re-run converges to the same end state as an uninterrupted import.
 
 ## 9. FAQ
 
