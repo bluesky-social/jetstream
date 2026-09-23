@@ -813,6 +813,31 @@ func (w *Writer) Blocks() []BlockInfo {
 	return out
 }
 
+// TimeFloorSeq returns the first seq worth scanning for the earliest event
+// whose witnessed_at is at least timeUS. For flushed data this is the MinSeq
+// of the first candidate block; for the pending block it is that block's
+// MinSeq. The caller must still inspect rows within the candidate block to
+// find the exact boundary.
+//
+// The bool is false when no event currently buffered by this writer reaches
+// timeUS. Like every Writer method, the caller must serialize this query
+// against append, flush, seal, and close.
+func (w *Writer) TimeFloorSeq(timeUS int64) (uint64, bool) {
+	if w.closed {
+		return 0, false
+	}
+	i := sort.Search(len(w.flushedBlocks), func(i int) bool {
+		return w.flushedBlocks[i].MaxWitnessedAt >= timeUS
+	})
+	if i < len(w.flushedBlocks) {
+		return w.flushedBlocks[i].MinSeq, true
+	}
+	if w.pending.sawAny && w.pending.pendingBounds.maxWitnessedAt >= timeUS {
+		return w.pending.pendingBounds.minSeq, true
+	}
+	return 0, false
+}
+
 // FlushedRangeFromSeq returns the frame-aligned byte range covering flushed
 // blocks from the first block whose MaxSeq is at least seq through the current
 // flushed end. Pending in-memory rows are excluded. Like every Writer method,

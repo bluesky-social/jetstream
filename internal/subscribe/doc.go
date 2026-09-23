@@ -84,6 +84,10 @@
 //     seq, allowing clients to backfill the missing range.
 //   - Both endpoints clamp timestamp cursors. V2 first sends an info
 //     OutdatedCursor naming the resumed seq.
+//   - Timestamp resolution uses sealed indexes or the active writer's block
+//     bounds, then suppresses rows before the exact witnessed_at boundary in
+//     the one candidate block. It does not replay from the active segment's
+//     beginning or force a flush.
 //   - A cursor inside a registered seq vacancy advances to its exclusive end
 //     before lookback policy applies. Cold replay makes the same jump below
 //     the readable-log floor. Unregistered coverage holes remain errors.

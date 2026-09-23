@@ -56,8 +56,9 @@ type CursorPlan struct {
 	// only for replay modes.
 	StartSeq uint64
 
-	// Requested is the raw integer parsed from the query string.
-	// Diagnostic only; never on the wire.
+	// Requested is the raw integer parsed from the query string. Timestamp
+	// replay also uses it to discard rows before the exact in-block boundary.
+	// It is never sent on the wire.
 	Requested int64
 
 	// Clamped is true when the resolved StartSeq differs from the
@@ -106,6 +107,12 @@ type CursorEnv struct {
 
 	// Gaps is the immutable set of durable, explicitly-authorized vacancies.
 	Gaps *seqspace.Gaps
+
+	// ActiveTimeFloor returns the first active-segment seq worth scanning for
+	// timeUS, or the snapshotted live edge when no active event reaches it.
+	// The resolver rechecks the manifest afterward to cover an active-to-sealed
+	// rotation racing timestamp resolution.
+	ActiveTimeFloor func(timeUS int64) uint64
 }
 
 // ErrInvalidCursor wraps any user-visible parse failure of the
@@ -275,24 +282,41 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 //
 // Returns (seq, clamped, error). clamped is true iff timeUS is older
 // than every sealed segment (caller resolves to the first segment's
-// MinSeq). When timeUS is newer than every sealed segment, returns
-// the first non-sealed seq so the replay walks straight into the
-// active segment.
+// MinSeq). When timeUS is newer than every sealed segment, consults
+// the active writer's block bounds and returns the first candidate
+// block's MinSeq.
 func translateTimeUSToSeq(env CursorEnv, timeUS int64) (uint64, bool, error) {
-	if env.Manifest == nil || env.Manifest.SegmentCount() == 0 {
-		// No sealed segments. The replay engine will scan the active
-		// segment from its first event; we report seq=0 as the floor.
-		return 0, false, nil
+	var candidate manifest.SegmentBounds
+	var found bool
+	if env.Manifest != nil && env.Manifest.SegmentCount() > 0 {
+		candidate, found = env.Manifest.SegmentForTimeUS(timeUS)
 	}
-
-	candidate, found := env.Manifest.SegmentForTimeUS(timeUS)
 	if !found {
-		// Newer than every sealed segment. Start at the first non-
-		// sealed seq so the replay walks straight into the active
-		// segment.
-		all := env.Manifest.AllBounds()
-		last := all[len(all)-1]
-		return last.MaxSeq + 1, false, nil
+		// No sealed candidate: use active block bounds to avoid replaying
+		// from the active segment's beginning. A miss returns the live edge.
+		// Then recheck the manifest: the generation inspected by
+		// ActiveTimeFloor may have rotated after our first manifest lookup.
+		// This is necessary even when the current active generation has a
+		// candidate, because the just-sealed generation is earlier.
+		if env.ActiveTimeFloor != nil {
+			activeSeq := env.ActiveTimeFloor(timeUS)
+			if env.Manifest != nil && env.Manifest.SegmentCount() > 0 {
+				candidate, found = env.Manifest.SegmentForTimeUS(timeUS)
+			}
+			if !found {
+				return activeSeq, false, nil
+			}
+			// Continue below and resolve the earlier sealed candidate.
+		} else {
+			// Preserve the resolver's standalone fallback for tests and tools
+			// that do not have a live writer.
+			if env.Manifest == nil || env.Manifest.SegmentCount() == 0 {
+				return 0, false, nil
+			}
+			all := env.Manifest.AllBounds()
+			last := all[len(all)-1]
+			return last.MaxSeq + 1, false, nil
+		}
 	}
 
 	// timeUS may be older than every sealed segment, in which case

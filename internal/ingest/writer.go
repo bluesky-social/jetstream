@@ -744,6 +744,27 @@ func (w *Writer) NextSeq() uint64 {
 	return w.nextSeq
 }
 
+// ActiveTimeFloorSeq returns the first seq worth scanning in the active
+// segment for an event whose witnessed_at is at least timeUS. When the
+// requested time is newer than every active event, it returns the current
+// live edge so a caller can wait there for a future match.
+//
+// The active generation and live edge are sampled together under the writer
+// lock. Callers resolving across the sealed manifest must recheck that
+// manifest after this snapshot, because an earlier active generation may have
+// become sealed immediately before it.
+func (w *Writer) ActiveTimeFloorSeq(timeUS int64) uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.active == nil {
+		return w.nextSeq
+	}
+	if seq, found := w.active.TimeFloorSeq(timeUS); found {
+		return seq
+	}
+	return w.nextSeq
+}
+
 // SeqGaps returns the immutable set of durable, authorized seq vacancies.
 func (w *Writer) SeqGaps() *seqspace.Gaps { return w.gaps }
 
