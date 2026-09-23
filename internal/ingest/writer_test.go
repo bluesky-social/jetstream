@@ -102,6 +102,25 @@ func TestActiveFlushedRangeExcludesPendingAndAdvancesByBlock(t *testing.T) {
 	require.Greater(t, r2.EndOffset, r2.StartOffset)
 }
 
+func TestActiveTimeFloorSeq_FlushedPendingAndLiveEdge(t *testing.T) {
+	t.Parallel()
+	w := newTestWriter(t, Config{MaxEventsPerBlock: 2, MaxSegmentBytes: 1 << 30})
+
+	for _, ts := range []int64{100, 200, 300} {
+		ev := &segment.Event{WitnessedAt: ts, Kind: segment.KindCreate, DID: "did:plc:time-floor"}
+		require.NoError(t, w.Append(t.Context(), ev))
+	}
+
+	seq := w.ActiveTimeFloorSeq(150)
+	require.Equal(t, uint64(1), seq, "flushed candidate starts at its block boundary")
+
+	seq = w.ActiveTimeFloorSeq(250)
+	require.Equal(t, uint64(3), seq, "pending candidate starts at the pending block boundary")
+
+	seq = w.ActiveTimeFloorSeq(301)
+	require.Equal(t, uint64(4), seq, "a miss parks at the live edge")
+}
+
 type fakeTimestampStamper struct {
 	indexedAt int64
 	err       error

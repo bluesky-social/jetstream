@@ -88,6 +88,84 @@ func TestFlushedRangeFromSeq_RebuiltOnResume(t *testing.T) {
 	require.NoError(t, resumed.Close())
 }
 
+func TestTimeFloorSeq_FlushedPendingAndTip(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	_, ok := w.TimeFloorSeq(1)
+	require.False(t, ok)
+
+	for _, ev := range []Event{
+		{Seq: 1, WitnessedAt: 300, Kind: KindCreate, DID: "did:plc:a"},
+		{Seq: 2, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:b"},
+	} {
+		_, err := w.Append(ev)
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Flush())
+	for _, ev := range []Event{
+		{Seq: 3, WitnessedAt: 400, Kind: KindCreate, DID: "did:plc:c"},
+		{Seq: 4, WitnessedAt: 500, Kind: KindCreate, DID: "did:plc:d"},
+	} {
+		_, err := w.Append(ev)
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Flush())
+	for _, ev := range []Event{
+		{Seq: 5, WitnessedAt: 600, Kind: KindCreate, DID: "did:plc:e"},
+		{Seq: 6, WitnessedAt: 800, Kind: KindCreate, DID: "did:plc:f"},
+	} {
+		_, err := w.Append(ev)
+		require.NoError(t, err)
+	}
+
+	for _, tc := range []struct {
+		timeUS int64
+		seq    uint64
+		found  bool
+	}{
+		{timeUS: 50, seq: 1, found: true},
+		{timeUS: 250, seq: 1, found: true},
+		{timeUS: 301, seq: 3, found: true},
+		{timeUS: 450, seq: 3, found: true},
+		{timeUS: 501, seq: 5, found: true},
+		{timeUS: 700, seq: 5, found: true},
+		{timeUS: 801, found: false},
+	} {
+		seq, found := w.TimeFloorSeq(tc.timeUS)
+		require.Equal(t, tc.found, found, "time_us=%d", tc.timeUS)
+		require.Equal(t, tc.seq, seq, "time_us=%d", tc.timeUS)
+	}
+}
+
+func TestTimeFloorSeq_RebuiltOnResume(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	for seq, ts := range []int64{100, 200, 300, 400} {
+		full, appendErr := w.Append(Event{
+			Seq: uint64(seq + 1), WitnessedAt: ts,
+			Kind: KindCreate, DID: "did:plc:resume-time",
+		})
+		require.NoError(t, appendErr)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	require.NoError(t, w.Close())
+
+	resumed, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resumed.Close() })
+	seq, found := resumed.TimeFloorSeq(250)
+	require.True(t, found)
+	require.Equal(t, uint64(3), seq)
+}
+
 func TestNewCreatesEmpty256ByteFile(t *testing.T) {
 	t.Parallel()
 

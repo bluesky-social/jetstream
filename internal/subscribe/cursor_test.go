@@ -490,10 +490,77 @@ func TestResolveCursor_TimeUSNewerThanAllSegments(t *testing.T) {
 		Manifest: m,
 		NextSeq:  20,
 		Lookback: 36 * time.Hour,
+		ActiveTimeFloor: func(got int64) uint64 {
+			require.Equal(t, cursor, got)
+			return 15
+		},
 	})
 	require.NoError(t, err)
 	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
-	require.Equal(t, uint64(10), p.StartSeq, "starts at first non-sealed seq")
+	require.Equal(t, uint64(15), p.StartSeq, "starts at the active candidate block, not the active segment floor")
+}
+
+func TestResolveCursor_TimeUSActiveOnly(t *testing.T) {
+	t.Parallel()
+	cursor := time.Now().Add(-time.Hour).UnixMicro()
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(cursor, 10), subscribe.CursorEnv{
+		NextSeq: 50,
+		ActiveTimeFloor: func(got int64) uint64 {
+			require.Equal(t, cursor, got)
+			return 42
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
+	require.Equal(t, uint64(42), p.StartSeq)
+	require.False(t, p.Clamped)
+}
+
+func TestResolveCursor_TimeUSAfterActiveTipParksAtLiveEdge(t *testing.T) {
+	t.Parallel()
+	cursor := time.Now().Add(-time.Hour).UnixMicro()
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(cursor, 10), subscribe.CursorEnv{
+		NextSeq: 20,
+		ActiveTimeFloor: func(int64) uint64 {
+			return 20
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
+	require.Equal(t, uint64(20), p.StartSeq)
+}
+
+func TestResolveCursor_TimeUSRotationRaceRechecksManifest(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	m := mustOpenManifest(t, dir)
+	now := time.Now().UnixMicro()
+	cursor := now - int64(5*time.Hour/time.Microsecond)
+	called := false
+
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(cursor, 10), subscribe.CursorEnv{
+		Manifest: m,
+		NextSeq:  10,
+		Lookback: 36 * time.Hour,
+		ActiveTimeFloor: func(int64) uint64 {
+			called = true
+			path := filepath.Join(dir, "seg_0000000000.jss")
+			mustWriteSealedSegment(t, path, sealedFixture{
+				minSeq: 1, maxSeq: 9,
+				minWitnessedAt: now - int64(10*time.Hour/time.Microsecond),
+				maxWitnessedAt: now - int64(time.Hour/time.Microsecond),
+				eventCount:     9,
+			})
+			require.NoError(t, m.OnSegmentSealed(0, path))
+			// The new active generation also has a candidate, but the
+			// just-sealed generation is earlier and must win.
+			return 10
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, called)
+	require.GreaterOrEqual(t, p.StartSeq, uint64(1))
+	require.LessOrEqual(t, p.StartSeq, uint64(9), "the just-sealed generation must be searched instead of skipped")
 }
 
 func TestResolveCursor_TimeUSTranslationLandingInGapClampsToEnd(t *testing.T) {

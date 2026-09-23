@@ -259,14 +259,16 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 			httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", fmt.Sprintf("service not ready: manifest warming up: %s", err.Error()))
 			return
 		}
+		writer := deps.writer()
 		resolveStart := time.Now()
 		plan, err := ResolveCursor(rawCursor, CursorEnv{
 			Manifest:         deps.Manifest,
 			FS:               deps.FS,
-			NextSeq:          deps.writer().NextSeq(),
-			Gaps:             deps.writer().SeqGaps(),
+			NextSeq:          writer.NextSeq(),
+			Gaps:             writer.SeqGaps(),
 			Lookback:         deps.Lookback,
 			RejectBelowFloor: deps.V2,
+			ActiveTimeFloor:  writer.ActiveTimeFloorSeq,
 		})
 		deps.Metrics.observeCursorResolveSeconds(time.Since(resolveStart).Seconds())
 		if err != nil {
@@ -445,7 +447,11 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		}
 	}
 
-	runSubscriberLoop(ctx, conn, deps, loadFilter, startSeq, scheme, logger)
+	timeFloorUS := int64(0)
+	if cursorPlan.Mode == ModeReplayTimeUS {
+		timeFloorUS = cursorPlan.Requested
+	}
+	runSubscriberLoop(ctx, conn, deps, loadFilter, startSeq, timeFloorUS, scheme, logger)
 }
 
 // writeFrame writes one already-encoded v2 frame, compressing it for
@@ -528,6 +534,7 @@ func runSubscriberLoop(
 	deps Subscription,
 	loadFilter func() eventFilter,
 	startSeq uint64,
+	timeFloorUS int64,
 	scheme string,
 	logger *slog.Logger,
 ) {
@@ -538,6 +545,7 @@ func runSubscriberLoop(
 	slowDetector := newSlowDetector(deps.Tail.SlowConfig())
 	batchMax := deps.Tail.ReadBatch()
 	cursor := startSeq
+	timestampReached := timeFloorUS == 0
 
 	// sendError emits a terminal xrpc.v1.json error frame on v2
 	// connections; the caller returns (closing the connection)
@@ -606,6 +614,16 @@ func runSubscriberLoop(
 		}
 
 		for _, e := range batch {
+			// Active timestamp resolution lands at a candidate block boundary.
+			// Find the exact row before applying client filters: a qualifying
+			// event that the filter hides still establishes the cursor boundary,
+			// and later seqs must stream even if their timestamps regress.
+			if !timestampReached {
+				if e.Event.WitnessedAt < timeFloorUS {
+					continue
+				}
+				timestampReached = true
+			}
 			f := loadFilter()
 			if e.Event.Kind.IsResyncReplacement() && !deps.V2 {
 				deps.Metrics.incEventsSkippedResync()
