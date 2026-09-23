@@ -18,24 +18,13 @@ const (
 	WriteOpBatchCommit WriteOp = "batch_commit"
 )
 
-// FaultInjector is the test-only seam that lets a scenario fail selected
-// metadata-store writes deterministically, modeling a Pebble persistence
-// failure that production code must surface rather than swallow.
+// FaultInjector deterministically fails metadata writes in tests. Production
+// Open installs none.
 //
-// Production never installs one: Open takes zero options, so the field is
-// nil and BeforeWrite is never consulted (mirrors the nil *Metrics and the
-// nil crashpoint.Injector idioms — the fault path adds no production cost
-// and cannot be armed by accident).
-//
-// BeforeWrite is consulted BEFORE the underlying Pebble write. A non-nil
-// return aborts the write entirely (the bytes never reach Pebble) and the
-// store returns that error to the caller. This is the faithful model of a
-// failed persistence op: a failed batch commit leaves the keyspace
-// untouched, so a correct caller must not advance any cursor past it.
-//
-// keys is every key the op will touch: one for Set/Delete, all staged keys
-// for a batch Commit (decoded from the batch's own repr). Implementations
-// must be safe for concurrent use; *Store is.
+// BeforeWrite runs before the pebble operation. An error prevents the write
+// and is returned unchanged, leaving the keyspace intact. keys contains the
+// Set/Delete key or all staged batch keys. Implementations must be
+// concurrency-safe.
 type FaultInjector interface {
 	BeforeWrite(op WriteOp, keys [][]byte) error
 }

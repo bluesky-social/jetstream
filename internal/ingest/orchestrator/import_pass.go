@@ -1,22 +1,12 @@
 package orchestrator
 
-// import_pass.go wires the timestamp-import pipeline (design §8, milestones
-// M4/M5) into the orchestrator so it shares the segment-rewrite lock and the
-// manifest-refresh path with delete-compaction (design §3.3, §6 H).
+// Timestamp import shares the rewrite lock and manifest refresh path with
+// delete compaction. Parsing and bucketing run outside the lock because they
+// touch only CSV offsets and manifest metadata. Applying patches runs under
+// the lock with a worker pool.
 //
-// Phases (design §3.2):
-//   - A+B (parse + bucket): stream the plain import CSV, validate each row, and
-//     append its byte offset to the per-segment offset file its DID's blooms
-//     select. Reads the manifest and writes offset files only -- it touches no
-//     segment, so it runs OUTSIDE the rewrite lock.
-//   - C (apply): for each segment with an offset file, build the per-path patch
-//     plan and run one segment.Patch, in a worker pool, UNDER the rewrite lock
-//     (mutually exclusive with delete-compaction; the loser waits).
-//
-// The whole operation is idempotent and re-runnable (design §3.4): a re-run
-// produces zero mutations on already-applied segments, so segment.Patch skips
-// the rename. That is the crash-resume backstop -- a job interrupted in Phase C
-// resumes by re-running rather than restarting.
+// Patching is idempotent: already-applied segments produce no mutations and
+// skip rename, allowing interrupted jobs to resume.
 
 import (
 	"context"

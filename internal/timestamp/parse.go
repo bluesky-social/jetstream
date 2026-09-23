@@ -1,20 +1,13 @@
-// Package timestamp implements the operator timestamp-import pipeline
-// (docs/README.md §8, design specs/notes/2026-07-01-timestamp-import-design.md).
+// Package timestamp implements operator timestamp import (docs/README.md §8).
 //
-// This file is Phase A: streaming parse + validation of the operator's import
-// file. The input is a plain (uncompressed) RFC4180 CSV with a header row and
-// columns uri,timestamp,scope,cid. Plain rather than zstd so it is randomly
-// seekable: Phase B records each valid row's byte offset, and Phase C reopens
-// the file and reads a single row back by Seek+decode, with no decompression
-// subsystem and no scratch copy (Q-FORMAT, revised — see the design doc).
+// Phase A parses and validates an uncompressed RFC4180 CSV with
+// uri,timestamp,scope,cid columns. Plain CSV permits later phases to seek to
+// recorded row offsets without decompression or a scratch copy.
 //
-// Validation happens at this durable boundary and follows the #188 lesson:
-// reject malformed input at the edge so it cannot wedge a later pass. Bad rows
-// are skipped and reported (counts by reason + a bounded sample), never
-// aborting the whole file (Q-REJECT); a billion-row file must not die on one
-// typo. Structural header problems (a missing required column, a duplicate or
-// unrecognized column) are different: they make every row ambiguous, so they
-// fail the whole file loudly rather than silently mis-mapping columns.
+// Invalid data rows are skipped and counted with bounded diagnostic samples.
+// Missing, duplicate, or unknown header columns fail the file because row
+// interpretation would be ambiguous. Unrecoverable CSV syntax errors also
+// stop parsing.
 package timestamp
 
 import (

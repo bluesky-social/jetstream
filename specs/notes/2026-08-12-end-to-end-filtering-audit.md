@@ -299,9 +299,8 @@ requested kinds and collections:
 
 Selection remains block-coarse. A block containing one selected marker and many
 unselected commits is downloaded whole, then exact-filtered by the client. A
-high selected-block density may still choose whole-segment mode. This is
-intentional mechanical sympathy: use the compact metadata already resident in
-memory and avoid server-side row work during large backfills.
+high selected-block density may still choose whole-segment mode. Using resident
+metadata avoids server-side row scans during large backfills.
 
 The ingest gate requires persisted commits to have representable collection
 NSIDs, so using real collection IDs as the coarse `commit` class is safe for

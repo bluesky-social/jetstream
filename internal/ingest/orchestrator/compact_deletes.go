@@ -143,27 +143,16 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 
 		current := watermark
 		for current < targetWatermark {
-			// Build the pass's tombstone snapshot by folding the sealed rows in
-			// the window (current, targetWatermark] from disk, for BOTH steady
-			// and merge-tail modes.
+			// Fold tombstones from sealed rows in (current,
+			// targetWatermark]. The in-memory Set keeps each
+			// key's global maximum seq, which may be above this
+			// window. Filtering that value out would lose the
+			// earlier in-window tombstone and leave a superseded
+			// row behind (#100).
 			//
-			// We deliberately do NOT use the in-memory tombstone Set here. That
-			// set collapses each key to the GLOBAL-max superseding seq, but a
-			// compaction window needs the max superseding seq *at or below
-			// targetWatermark*. When live ingestion runs ahead of the watermark
-			// (the steady force-rotate seals up to targetWatermark while newer
-			// events land in the fresh active segment), a key updated again above
-			// the watermark has its in-memory seq pushed above the window;
-			// an upper-bounded readout would then drop the key entirely and an
-			// older superseded row in a prior segment is never evicted, so the
-			// pass commits a watermark it did not actually achieve (a superseded
-			// row survives at/below W — issue #100 dual). Folding the on-disk
-			// window can only see seqs <= targetWatermark, so it yields the
-			// window-correct tombstone (matching the oracle's CheckCompacted /
-			// filterCompactedExpectedRows) and cannot be fooled by an above-W
-			// update. The in-memory Set is used only for the compaction-cap
-			// trigger (Len) and the size gauge (ApproxBytes); it is still
-			// Evict-bounded below.
+			// Use the Set only for cap triggering and size
+			// metrics; disk folding preserves the window's actual
+			// tombstones.
 			snap, chunkEnd, err := o.collectCompactionTombstones(ctx, sealed, current, targetWatermark)
 			if err != nil {
 				return err

@@ -11,16 +11,9 @@ type Stats struct {
 	UncompressedBytes int64
 }
 
-// QuickStats reads enough of the file at path to populate a
-// Stats: the 256-byte header (to decide sealed/active and find
-// the block index), and the block index (sealed) or framed-block
-// walk (active). No decompression.
-//
-// Implementation note: this is a thin wrapper over Inspect. Inspect
-// already does exactly the right work — sealed-file path is just a
-// header parse + block-index decode, no decompression — and it's
-// well-tested. If profiling later shows this is hot, replace with a
-// minimal direct reader that skips per-block-collections decoding.
+// QuickStats uses Inspect to total compressed and uncompressed block sizes
+// without decompressing data. Sealed files use their block index; active
+// files require a frame walk.
 func QuickStats(path string) (Stats, error) {
 	ins, err := Inspect(path)
 	if err != nil {

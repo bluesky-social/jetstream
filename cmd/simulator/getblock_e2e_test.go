@@ -29,31 +29,11 @@ func getForTest(t *testing.T, ctx context.Context, url string) (*http.Response, 
 	return http.DefaultClient.Do(req)
 }
 
-// TestEndToEnd_GetBlockMatchesOracle is the headline correctness test for the
-// getBlock endpoint. It boots the simulator, spawns jetstream as a subprocess
-// pointed at it, lets ingest drain to steady-state and seal at least one
-// segment, then for every sealed segment (enumerated via listSegments) and
-// every block index in it, verifies the served getBlock response against an
-// independent ("oracle") decode of the on-disk segment file.
-//
-// For each block it asserts:
-//  1. getBlock returns 200 with Content-Type application/octet-stream.
-//  2. The served body is byte-identical to segment.ReadBlockFrame on an
-//     independently-opened fd + segment.ReadSealedHeader.
-//  3. The ETag equals "%q" of fmt.Sprintf("%016x:%d", hdr.Checksum, idx).
-//  4. A second request carrying If-None-Match: <ETag> returns 304.
-//
-// Plus negatives: blockIndex == blockCount -> 404; an unknown but well-formed
-// segment name -> 404.
-//
-// Decode-equivalence (brief sub-check (d)) is intentionally NOT duplicated
-// here: the segment package's frame decoder (decodeBlockCompressedSized) is
-// unexported and there is no exported frame-decode entrypoint usable from an
-// external test, so per the brief we rely on assertion (2)'s byte-identity plus
-// Task 1's blockframe_test.go, which already proves a ReadBlockFrame frame
-// decodes identically to Reader.DecodeBlock.
-//
-// Heavy test (subprocess + backfill drain + seal): skipped under -short.
+// TestEndToEnd_GetBlockMatchesOracle runs a simulator and Jetstream
+// subprocess, then compares every served block with an independent on-disk
+// ReadBlockFrame. It checks content type, ETag, conditional 304 responses,
+// and 404s for missing segments or blocks. blockframe_test.go separately
+// checks decode equivalence. Skipped under -short.
 func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 	if testing.Short() {
 		t.Skip("heavy e2e test: spawns jetstream subprocess and waits for a sealed segment")

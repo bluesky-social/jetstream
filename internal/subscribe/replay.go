@@ -57,60 +57,31 @@ type WalkInput struct {
 	OnSeamRetry func(holeSeq uint64)
 }
 
-// WalkFromCursor invokes emit for every durable event with
-// Seq >= input.StartSeq, in seq order, across:
+// WalkFromCursor emits durable events with Seq >= input.StartSeq in seq
+// order, first from sealed segments and then from the active segment's
+// flushed blocks. It stops on an emit error and preserves errors.Is.
 //
-//  1. the sealed-segment region from the manifest,
-//  2. the active segment's flushed blocks.
+// Cached sealed events share read-only Entry values and memoized encodings
+// across subscribers. Active and uncached events get per-walk entries.
+// NewColdReader adds a batch limit and shared cache; WalkFromCursor holds no
+// subscriber state.
 //
-// Events are delivered as *Entry so sealed-region events served through the
-// shared block cache carry the block's SHARED entries: concurrent cold
-// subscribers replaying the same blocks reuse one memoized JSON encode and
-// one compressed frame per event, exactly like hot (read-log) subscribers
-// (#295). Shared entries (and their events) are read-only. Active-region
-// events and cache-less sealed reads get fresh per-walk entries.
+// StopSeq is the readable-log floor: all seqs below it must be durable and
+// file-visible. The walk must cover [StartSeq, StopSeq), crossing only
+// registered vacancies.
 //
-// Halts when emit returns a non-nil error and surfaces the error
-// (errors.Is is honored).
+// # Rotation recovery
 //
-// Pure-function design: WalkFromCursor holds no subscriber state. The
-// bounded cold reader (NewColdReader) composes it with a batch limit and
-// the shared block cache to serve Tail's cold-path reads.
+// Manifest and active-index reads are not atomic. Rotation seals N, publishes
+// it to the manifest, then advances the active index under the writer lock. A
+// walk can read the manifest before publication and the active index after
+// advancement, missing N in both sources (#190).
 //
-// Cold replay is bounded by StopSeq, the writer readable-log floor. Every seq
-// below StopSeq is durable and file-visible by the readable-log invariant, so
-// the walk must serve the whole [StartSeq, StopSeq) range gap-free.
-//
-// # Rotation-seam convergence
-//
-// The sealed region (manifest) and the active region (writer's active file)
-// are read non-atomically: the walk snapshots the manifest, then reads
-// ActiveIndex. A segment rotation completing BETWEEN the two reads is the
-// hazard. ingest.Writer.rotateLocked does, all under the writer lock:
-//
-//	seal(N) -> publish N to the manifest -> activeIdx = N+1
-//
-// A walker can snapshot the manifest BEFORE N is published (its sealed sweep
-// stops below N's range), then read the active region AFTER activeIdx is
-// bumped to N+1 (an empty or higher-seq successor). N is then reachable via
-// neither source in that pass. A single-pass walk would let the cold reader
-// jump its cursor to StopSeq and silently drop N's events (issue #190).
-//
-// Two properties close the seam:
-//
-//   - No silent loss: walkActiveRegion emits only contiguous seqs from
-//     `current` and stops the instant it sees an event above `current` (a
-//     hole), leaving `current` exactly at the hole. It never jumps past a gap.
-//
-//   - Convergence (no spurious disconnect): a pass that ends below StopSeq
-//     means the floor's data is not yet all served — a seam gap. We re-enter
-//     the sealed sweep, which by the publish-before-bump happens-before now
-//     sees the freshly-published segment(s), so `current` strictly advances.
-//     Events are only ever MOVED active->sealed (compaction preserves each
-//     segment's historical seq envelope), so a below-StopSeq gap is always
-//     fillable. A retry that fails to advance is an invariant violation
-//     (e.g. publish-before-bump broke, or a genuine hole below the floor):
-//     we surface it loudly rather than spin or silently skip.
+// walkActiveRegion stops at the first unregistered hole without advancing
+// current past it. A pass ending below StopSeq repeats the sealed sweep,
+// which now sees the published segment. Compaction preserves historical seq
+// envelopes. A retry that makes no progress returns an invariant error rather
+// than skipping events or looping.
 func WalkFromCursor(ctx context.Context, input WalkInput, emit func(*Entry) error) error {
 	current := input.StartSeq
 	jumpGap := func() bool {

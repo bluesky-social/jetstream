@@ -1992,16 +1992,10 @@ func TestEngineTooOldPingPongIsFatal(t *testing.T) {
 	require.LessOrEqual(t, dials.Load(), int64(maxRebackfillStalls+2), "re-backfill cycles must be bounded")
 }
 
-// TestEngineLiveOnlyCursorTooOldIsFatal pins the pure-live (no-backfill) §14
-// contract: when a saved WithLiveCursor resolves below the server's lookback
-// floor, the terminal /subscribe-v2 400 maps to errLiveCursorTooOld, which
-// liveConsumer.Run returns WITHOUT routing through the batcher (it returns
-// before the reconnect-report emit). The pure-live path has no archive to
-// re-enter, so it must surface that error as fatal rather than letting the
-// iterator end silently (CLAUDE.md: no silent fallbacks) — a stale-cursor tail
-// that yields neither events nor an error leaves the caller unable to tell its
-// cursor must be reset/re-backfilled. Before the fix runLiveOnly discarded the
-// Run return with `_ =`, so the stream just ended clean.
+// TestEngineLiveOnlyCursorTooOldIsFatal checks that a below-floor cursor ends
+// a live-only stream with ErrFatal. liveConsumer returns CursorTooOld before
+// reporting through the batcher, and runLiveOnly must forward it: this mode
+// has no archive replay to recover the gap.
 func TestEngineLiveOnlyCursorTooOldIsFatal(t *testing.T) {
 	t.Parallel()
 

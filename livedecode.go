@@ -133,7 +133,7 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		v := msg.JetstreamSubscribeEvents_Identity.Val()
 		// The generated decoder does not enforce lexicon `required`; a
 		// frame missing the wrapped upstream event would otherwise emit a
-		// zero-valued Identity (with orDID papering over the missing DID)
+		// zero-valued Identity (with orDID replacing the missing DID)
 		// and advance the dedup cursor. The check is presence-of-payload
 		// (did is set by every producer), NOT full required-field
 		// validation: jetstream archives synthetic envelopes that

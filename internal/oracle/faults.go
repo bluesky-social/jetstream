@@ -207,23 +207,11 @@ func (p *SwarmFaultPlan) TotalGetRepoCARTruncations() int {
 	return total
 }
 
-// CheckWithinRetryBudget verifies that the swarm plan leaves every faulted
-// DID at least one clean getRepo attempt: the retry-consuming faults
-// scheduled for a DID (raw HTTP failures + typed response failures + CAR
-// truncations, each of which burns one attempt) must be strictly fewer than
-// the backfill engine's total attempts (backfill.DefaultMaxRetries + 1 =
-// retries + the initial attempt).
-//
-// This guards a zero-margin invariant the swarm relies on but nothing else
-// pins: each faulted DID schedules one fault against two available attempts,
-// leaving exactly one clean attempt. If Atmos lowers DefaultMaxRetries, or the
-// planner schedules more faults per DID, a faulted repo would exhaust its budget
-// and the run would degrade into a confusing backfill timeout instead of a
-// clear, attributable failure — and the durable model would diverge from the
-// simulator world because that repo never completes. Keyed off the imported
-// backfill.DefaultMaxRetries (not a hard-coded literal) so an atmos budget
-// change is caught here at plan construction rather than as a mysterious
-// hang. Returns nil for a nil plan (no faults scheduled).
+// CheckWithinRetryBudget requires fewer retry-consuming faults per DID than
+// backfill.DefaultMaxRetries+1 attempts. HTTP errors, typed failures, and CAR
+// truncations each consume an attempt; at least one clean attempt must
+// remain. Using the imported retry limit catches dependency changes before a
+// scenario hangs or diverges. A nil plan passes.
 func (p *SwarmFaultPlan) CheckWithinRetryBudget() error {
 	if p == nil {
 		return nil

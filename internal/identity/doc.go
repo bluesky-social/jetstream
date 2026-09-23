@@ -1,20 +1,10 @@
-// package identity persists atmos identity.Cache resolutions in
-// pebble. It owns the key prefix "sync/identity/<did>" and stores
-// the JSON-encoded *identity.Identity preceded by an 8-byte big-endian
-// unix-nano expiry. Get treats expired or undecodable entries as
-// cache misses so the next resolution overwrites the bad row.
+// Package identity caches atmos identity resolutions in pebble under
+// sync/identity/<did>. Each entry stores an 8-byte big-endian Unix-nanosecond
+// expiry followed by JSON. Expired or undecodable entries are misses and are
+// replaced on resolution.
 //
-// The pebble cache backstops atmos's in-memory LRU on the firehose
-// hot path: a process restart loses LRU state and would otherwise
-// replay millions of plc.directory lookups. Disk-resident cache
-// hits stay sub-millisecond and survive restart, so the only cold
-// path is "DID never seen before, by anyone, on this jetstream
-// instance."
-//
-// We intentionally do NOT implement an LRU cap. The atproto network
-// has tens of millions of DIDs, but the active set on a single
-// jetstream instance is bounded by the firehose's per-second event
-// rate. Pebble's natural compaction keeps the working set on disk
-// modest, and a count-bound LRU would force read-modify-write cycles
-// on the hot path that the identity.Cache contract explicitly avoids.
+// The persistent cache avoids repeating millions of PLC lookups when the
+// in-memory LRU is lost on restart. It has no count-based LRU: maintaining
+// one would add read-modify-write operations to the hot path, contrary to the
+// identity.Cache contract.
 package identity

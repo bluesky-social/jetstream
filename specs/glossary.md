@@ -1,10 +1,10 @@
 # Glossary
 
-Words that show up all over the code and docs, with a one-line meaning and where to read more. If a term here drifts from the code, the code and the linked source win — fix this file.
+Definitions and references for terms used in the code and docs. The code and linked sources take precedence over this glossary.
 
 ## Storage and data format
 
-**Segment (segment file, `.jss`)** — the on-disk unit of storage: a columnar, zstd-compressed, length-prefixed log of firehose events. Files are named with a zero-padded base-36 counter so they sort in creation (and time) order. Source of truth: `docs/README.md` §3.1, `segment/doc.go`.
+**Segment (segment file, `.jss`)** — the on-disk unit of storage: a columnar, zstd-compressed, length-prefixed log of firehose events. Files are named with a zero-padded base-36 counter so they sort in creation (and time) order. Source: `docs/README.md` §3.1, `segment/doc.go`.
 
 **Block** — a compressed batch of events inside a segment. Blocks are the unit of decode and the unit the cold reader and block cache work with; each sealed segment's footer indexes its blocks. Source: `docs/README.md` §3.2, `segment/doc.go`.
 
@@ -18,7 +18,7 @@ Words that show up all over the code and docs, with a one-line meaning and where
 
 **Watermark (compaction watermark, `compaction/seq`)** — the highest seq that physical compaction has covered. Below it, superseded create/update rows are physically gone; the uncompacted tail `(watermark, tip]` may still carry rows a later marker will kill. Owned by the compactor. Source: `docs/README.md` §3.3, §3.5.
 
-**Manifest** — the list of segments jetstream serves. It's deliberately not stored in pebble: it's just a directory scan plus each file's self-describing header, so it can't drift from what's on disk. Source: `docs/README.md` §3.5.
+**Manifest** — the list of segments jetstream serves. It is rebuilt from a directory scan and file headers, rather than stored in pebble. Source: `docs/README.md` §3.5.
 
 **Metadata store** — the single pebble db at `data/meta.pebble/` holding everything that isn't cheaply re-derivable from segments: `relay/cursor`, lifecycle `phase`, seq tip/lease/registered vacancies, `repo/<did>`, the `pdshost/<hostname>` fleet roster/cursors, `account/<did>`, `sync/<did>`, and `compaction/seq`. Source: `docs/README.md` §3.5, `internal/store`.
 
@@ -26,7 +26,7 @@ Words that show up all over the code and docs, with a one-line meaning and where
 
 **Host roster** — the durable `pdshost/<hostname>` control-plane set obtained from relay listHosts: relay metadata, host-local listRepos cursor, terminal state, and diagnostics. The relay account count is a floor, not authoritative. Source: `docs/README.md` §3.5 and §4.1.
 
-**Mushroom** — one of Bluesky's large shared PDS hosts under `*.host.bsky.network`; these dominate bootstrap's long pole because getRepo limits are per host. Source: `specs/notes/2026-08-03-pds-direct-backfill-design.md`.
+**Mushroom** — one of Bluesky's large shared PDS hosts under `*.host.bsky.network`; their per-host getRepo limits dominate bootstrap time. Source: `specs/notes/2026-08-03-pds-direct-backfill-design.md`.
 
 **Bootstrap phase** — the initial full-network backfill: read the relay's host roster, paginate listRepos directly on each PDS, download repos directly from their PDS, and write them to disk, while a live consumer simultaneously captures the firehose into `backfill/live_segments/`. Source: `docs/README.md` §4.1, `internal/ingest/backfill/doc.go`.
 
@@ -42,11 +42,11 @@ Words that show up all over the code and docs, with a one-line meaning and where
 
 ## Serving the stream
 
-**Readable log (hot tail)** — the byte-bounded, seq-indexed FIFO the ingest writer keeps of recently appended events, so caught-up subscribers get served from memory and wake on the next append. (This replaced the older push-broadcaster "hot ring" model — a slow reader no longer overflows a per-client channel.) Source: `internal/subscribe/doc.go`, `internal/ingest` writer.
+**Readable log (hot tail)** — the byte-bounded, seq-indexed FIFO the ingest writer keeps of recently appended events, so caught-up subscribers get served from memory and wake on the next append. Source: `internal/subscribe/doc.go`, `internal/ingest` writer.
 
 **Cold reader** — the fallback path when a subscriber's cursor is older than what the readable log still holds in memory: a bounded disk walk over sealed segments plus the active segment's flushed region, routed through a shared decoded-block LRU cache. Source: `internal/subscribe/doc.go`, `internal/subscribe/replay.go`.
 
-**Bucketed** — a timestamp-import status flag (`getImportStatus`) meaning the import's rows have been grouped/bucketed for processing. Narrow term, only in the import API — not a general storage concept. Source: `internal/timestamp`, `docs/README.md` §8.
+**Bucketed** — a timestamp-import status flag (`getImportStatus`) meaning the import's rows have been grouped/bucketed for processing. Used only by the import API. Source: `internal/timestamp`, `docs/README.md` §8.
 
 ## Testing
 

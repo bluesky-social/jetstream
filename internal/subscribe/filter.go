@@ -1,10 +1,6 @@
-// Package subscribe — filter.go owns the v1-compatible subscriber filter:
-// query-string and options_update parsing, plus the Wants(evt) predicate.
-//
-// V1 wire compatibility is the point. Where v2's house style ("crash loud,
-// no silent fallbacks" — CLAUDE.md) would diverge from the v1 README's
-// stated contract, this file deliberately matches v1 and documents the
-// rationale inline. Search for "V1 PARITY" to find every such spot.
+// The v1 filter parses query parameters and options_update messages.
+// Compatibility exceptions are documented at their implementation sites and
+// summarized in doc.go.
 package subscribe
 
 import (
@@ -174,22 +170,9 @@ func parseWantedDIDs(values []string) (map[string]struct{}, error) {
 	return out, nil
 }
 
-// parseMaxMsgSizeQuery parses the maxMessageSizeBytes query value.
-//
-// V1 PARITY (deliberate): empty, malformed, negative, and overflowing
-// values silently resolve to 0 ("no cap"). This matches jetstream v1's
-// ParseMaxMessageSizeBytes behavior. The v1 README documents this as
-// the contract:
-//
-//	"Zero means no limit, negative values are treated as zero.
-//	 (Default '0' or empty = no maximum size)"
-//
-// CLAUDE.md prefers crashing loud over silent fallbacks, but the v1
-// wire contract IS the contract: existing clients send "0", "" and
-// (occasionally) garbage and rely on this exact coercion. Changing it
-// would silently break clients that depend on the v1 README's stated
-// behavior. TestParseMaxMsgSize_V1Compat locks this down — touch with
-// care.
+// parseMaxMsgSizeQuery preserves v1 behavior: empty, malformed, negative, and
+// overflowing values mean no cap (0). TestParseMaxMsgSize_V1Compat checks
+// this compatibility rule.
 func parseMaxMsgSizeQuery(s string) uint32 {
 	if s == "" {
 		return 0
@@ -260,15 +243,8 @@ func ParseUpdatePayload(p UpdatePayload) (*Filter, error) {
 	}, nil
 }
 
-// clampMaxMsgSize coerces a JSON-decoded MaxMessageSizeBytes value to uint32.
-//
-// V1 PARITY (deliberate): negative values silently resolve to 0 ("no cap").
-// This matches jetstream v1's documented behavior. The v1 README states:
-// "Zero means no limit, negative values are treated as zero."
-//
-// CLAUDE.md prefers crashing loud over silent fallbacks, but the v1
-// wire contract IS the contract. TestParseMaxMsgSize_V1Compat locks this
-// down — touch with care.
+// clampMaxMsgSize preserves v1’s rule that negative limits mean no cap. See
+// TestParseMaxMsgSize_V1Compat.
 func clampMaxMsgSize(n int) uint32 {
 	if n < 0 {
 		return 0
@@ -276,26 +252,12 @@ func clampMaxMsgSize(n int) uint32 {
 	return uint32(n)
 }
 
-// Wants reports whether the subscriber should receive evt. The rules
-// (V1 PARITY):
+// Wants applies the v1 event filter. Nil or empty filters match all.
+// wantedDIDs applies to every kind; wantedCollections applies only to
+// commits, including resync replacements. Account, identity, and sync bypass
+// collections, though the v1 encoder separately omits sync.
 //
-//   - A nil *Filter or an empty Filter ("match-all" from ParseQuery on
-//     no query params) matches every event.
-//   - wantedDIDs applies to all event kinds. If non-empty and evt.DID
-//     is not in the set, drop.
-//   - wantedCollections applies ONLY to commit events
-//     (KindCreate / KindUpdate / KindDelete / KindCreateResync). #account,
-//     #identity, and #sync — the DID-level events, which carry no collection —
-//     always bypass the collection filter on /subscribe (v1 README:
-//     "Regardless of desired collections, all
-//     subscribers receive Account and Identity events"). They are the only
-//     signal a collection-scoped consumer has to purge a dead account's
-//     records, so hiding them would create a permanently stale view. They still
-//     respect wantedDids. Sync events are additionally filtered upstream by
-//     encoder.go (errSkipEvent) on the v1 wire and pass through here.
-//
-// Wants does NOT enforce maxMessageSizeBytes; the handler enforces
-// against the encoded byte length post-Encode.
+// The handler enforces maxMessageSizeBytes after encoding.
 func (f *Filter) Wants(evt *segment.Event) bool {
 	if f == nil {
 		return true

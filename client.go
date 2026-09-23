@@ -271,12 +271,8 @@ func validateConfig(c *config) error {
 	}
 	// WithBeforeSeq is an ARCHIVE upper bound, enforced by the row matcher's
 	// inclusive beforeSeq. The live cutover tail reuses that same matcher, so a
-	// backfill-then-live subscription with a beforeSeq would silently drop every
-	// live event with seq > beforeSeq — after the brief (S, beforeSeq] window the
-	// tail runs forever delivering nothing, a silent loss of in-scope data the
-	// server is actively serving (CLAUDE.md: crash over silent corruption). A
-	// beforeSeq is only coherent as a bounded snapshot, so require
-	// WithSnapshotOnly.
+	// A live tail with beforeSeq would keep running while filtering every
+	// newer event. Require a bounded snapshot instead.
 	if c.hasBeforeSeq && !c.snapshotOnly {
 		return fmt.Errorf("jetstream: WithBeforeSeq requires WithSnapshotOnly (beforeSeq is an archive-snapshot upper bound; on a replay that continues live it would silently drop every later event)")
 	}

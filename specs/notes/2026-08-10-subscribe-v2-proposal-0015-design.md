@@ -36,13 +36,7 @@ Re-read from source (`bluesky-social/proposals/0015-json-subscriptions`):
   JSON-native stream declares `subprotocol: "xrpc.v1.json"` so even
   unnegotiated connections receive JSON.
 
-Consequence for jetstream: we declare `xrpc.v1.json` as the lexicon default
-and support **only** that token. Negotiation then degenerates to a header
-echo — every connection, negotiated or not, receives identical framing.
-There is no per-connection codec switch, ever. (We do not offer
-`xrpc.v0.cbor`: jetstream's payloads are JSON-native and a CBOR encoding of
-them is a new wire contract nobody asked for; the spec's "must support the
-lexicon default" is satisfied by v1.json itself.)
+Declare `xrpc.v1.json` as the default and only supported subprotocol. Negotiated and unnegotiated connections receive the same framing; no per-connection codec selection is needed.
 
 ## 2. What we serve today (delta inventory)
 
@@ -62,7 +56,7 @@ Current `/subscribe-v2` wire (authoritative: `internal/subscribe/encoder.go`,
 - Compression: dict-zstd only (`?zstdDictionary=<id>` → binary frames, one
   zstd frame per event, shared per-event memoized compression);
   permessage-deflate deliberately never negotiated (#294, measured 2.3x
-  server CPU vs shared zstd at 200 subscribers).
+  server CPU compared with shared zstd at 200 subscribers).
 - Client→server frames: `SubscriberSourcedMessage` (`options_update`) +
   `?requireHello=true`, served by a reader goroutine
   (`handler.go` `runReader`). This exists on BOTH endpoints today.
@@ -76,7 +70,7 @@ Current `/subscribe-v2` wire (authoritative: `internal/subscribe/encoder.go`,
 
 ## 3. Architecture decision: where the 0015 logic lives
 
-Two credible options. This is the biggest fork in the design.
+Two handler options were considered.
 
 ### Option A — keep the bespoke handler, conform to the wire spec (recommended)
 
@@ -111,9 +105,7 @@ can decode our frames with atmos's generated union types.
 
 ### Option B — adopt `xrpcserver.HandleSubscription`
 
-This was the stated intent in the atmos PR ("jetstream as the first
-consumer"). Having now read both sides closely, the impedance mismatches
-are substantial:
+The atmos PR proposed Jetstream as a consumer, but the handlers have different requirements:
 
 | jetstream needs | xrpcserver today |
 |---|---|
@@ -124,23 +116,9 @@ are substantial:
 | `OriginPatterns: ["*"]` (public data, browser consumers) | `websocket.Accept` default rejects cross-origin browser requests; not configurable |
 | pre-upgrade 400s with specific bodies | `Validate` hook exists and works (writes XRPC error envelope) ✓ |
 
-Making B work means extending atmos with: `Stream.SendRaw` (pre-framed,
-possibly pre-compressed bytes, bypassing the $type agreement check),
-`Stream.Ping`, an `AcceptOptions`/origin passthrough, and a "keep the read
-side open, hand me client messages" mode. That's four API extensions whose
-only consumer pierces the abstraction precisely where it adds value —
-negotiation and framing — which for a single-subprotocol endpoint is a
-header echo and a string constant. The remaining value (terminal-ordering
-writeGate) solves a concurrency problem jetstream doesn't have (one writer
-goroutine per conn).
+Option B requires four atmos extensions: `Stream.SendRaw`, `Stream.Ping`, configurable accept/origin options, and client-message handling. Raw sends bypass the framing abstraction, and the single writer per Jetstream connection does not need atmos’s write gate.
 
-**Recommendation: A.** The fanout architecture is the measured crown jewel
-of this endpoint; wrapping it in an abstraction we must pierce four ways is
-worse engineering than 50 lines of well-tested duplication. atmos
-`HandleSubscription` remains the right tool for its intended shape
-(server-push lexicon streams with modest fanout) and jetstream still
-consumes atmos for the lexicon `subprotocol` field, lexgen types, and — in
-tests — as an independent conformance decoder.
+**Recommendation: A.** Keep shared event encoding and compression, with about 50 lines of tested protocol handling. Use atmos for lexicon support, generated types, and independent conformance decoding. `HandleSubscription` remains suitable for server-push streams with modest fanout.
 
 If we later want more services on one implementation, the extension list
 above is the concrete backlog for atmos.
@@ -195,17 +173,9 @@ deliver(evt) =
                          OR matches(evt.collection, collections))
 ```
 
-Note the third clause: `collections` never *drops* a non-commit event —
-excluding account/identity/sync is `kinds`' job. This is what makes the
-axes orthogonal, and it is deliberately NOT "setting collections implies
-commits-only": one parameter silently rewriting another's default is the
-kind of coupling that made v1 confusing, and the v1 use case
-"collection-scoped consumer still sees account deletions so it can purge
-dead accounts' records" (load-bearing per v1's own docs) must stay
-expressible — it is now `collections=X` with `kinds` unset, and the
-consumer who wants only the commits says `kinds=commit&collections=X`.
+`collections` leaves non-commit events unchanged. `collections=X` therefore retains account deletion markers, while `kinds=commit&collections=X` selects commits only.
 
-Composition examples (the consumer-facing story):
+Examples:
 
 | Parameters | Stream |
 |---|---|
@@ -217,8 +187,7 @@ Composition examples (the consumer-facing story):
 | `dids=did:plc:X&kinds=account,identity` | X's account/identity events only |
 | `dids=did:plc:X&collections=app.bsky.graph.follow` | X's follows + X's account/identity/sync |
 
-Validation (pre-upgrade HTTP 400 `InvalidRequest`, crash-loud at the API
-boundary):
+Validation (pre-upgrade HTTP 400 `InvalidRequest`):
 
 - Unknown `kinds` value → 400. Deterministic and explicit when a newer
   client names a kind this server predates; silently-never-matching
@@ -235,11 +204,7 @@ empty collection bypasses the collections filter (never silently drop
 data the filter can't classify), and `maxMessageSizeBytes` stays as a
 size gate — it is not a semantic filter axis.
 
-Naming: **the `wanted` prefix is dropped everywhere** (`dids`,
-`collections`) — clean, minimal, simple. The event-type axis is `kinds`,
-matching jetstream's historical vocabulary; on the wire the kind is
-carried by the payload `$type` fragment, and the `kinds` values are
-exactly those fragment names.
+Drop `wanted` from parameter names. Use `dids`, `collections`, and `kinds`; kind values match the payload `$type` fragments.
 
 Operational note (consequence of dropping `options_update`): filters are
 URL-only now. A max-size `dids` set (10,000 DIDs ≈ 420 KB of query
@@ -417,7 +382,7 @@ Fixed to match corpus/spec:
   precedent). Our ingest gate (`internal/ingest/live/events.go`
   `validateOpPath`/`validateOp`) already drops ops whose
   collection/rkey/rev fail exactly these spec validators, so the wire
-  can honestly declare them. Note the `collections` *filter param*
+  can declare them. Note the `collections` *filter param*
   items stay plain `string` deliberately — `<prefix>.*` patterns are
   not valid NSIDs (ozone's `collections` params use format nsid but
   don't support prefixes; ours does, and the description says so).
@@ -447,7 +412,7 @@ Fixed to match corpus/spec:
   errors are what query/procedure lexicons declare. But these two ARE
   this endpoint's contract, the names appear in the XRPC error envelope
   body, and leaving them undeclared would hide the endpoint's most
-  load-bearing failure mode from the schema. The descriptions carry the
+  recovery behavior from the schema. The descriptions carry the
   distinction. (atmos lexgen note: subscription error constants aren't
   generated today — genErrorConstants runs only for query/procedure —
   so this is documentation-only until lexgen learns otherwise.)
@@ -575,22 +540,14 @@ the draft lexicon above generates, compiles, and round-trips. Findings:
   HTTP and `FutureCursor` never happens (we clamp to tip, documented in
   the cursor param). If the draft proposal later wants future-cursor to be
   an in-stream error we can revisit; clamping is the v1-compatible
-  behavior and is load-bearing for `WithLiveCursor` semantics.
+  behavior required by `WithLiveCursor`.
 - `maxMessageSizeBytes` now measures the **whole uncompressed frame**
   (envelope included) rather than the bare event JSON — that's what the
-  client actually has to buffer. ~35-byte behavioral delta, worth the
-  honesty; document in the param description (done above).
+  client actually has to buffer. This adds about 35 bytes to size accounting; document it in the parameter description.
 
 ### Shape 2 — single `#event` message (minimal delta, not recommended)
 
-Wrap today's `v2Event` as-is: one `#event` def with `kind` discriminator
-and `commit|account|identity|sync` sub-objects, snake_case field names
-preserved. Wire delta shrinks to "add envelope + $type", client decode
-barely changes. But it imports v1's naming debt into a brand-new NSID,
-keeps the redundant `kind`/`cursor`/`seq` triplet, and squanders the
-stated point of #318 — standard lexicon tooling dispatching on typed
-messages. Only worth it if we valued wire stability for a wire with zero
-users.
+A single `#event` wrapper would minimize decoder changes but retain redundant `kind`/`cursor`/`seq` fields and v1 naming. Separate message types support standard lexicon dispatch. With no deployed v2 clients, preserving the old layout offers little benefit.
 
 ## 6. Compression × subprotocol (the issue's open question)
 

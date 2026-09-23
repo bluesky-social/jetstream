@@ -1,37 +1,20 @@
 package timestamp
 
-// bucket.go is Phase B: route each validated Row to the sealed segments whose
-// resident DID bloom says the row's repo may live there, and append the row's
-// source-CSV byte offset to a per-segment offset file. Phase C (M5) reopens
-// each segment, replays its offset file against the plain CSV, and applies one
-// segment.Patch per touched segment.
+// Phase B routes validated CSV rows through resident DID blooms and writes
+// source byte offsets to per-segment files. Phase C reads those offsets and
+// applies one segment.Patch per affected segment.
 //
-// Two mechanical-sympathy structures keep this streaming and bounded:
+// A bounded DID-to-segment LRU cache reduces bloom lookups for DID-grouped
+// input; unsorted input remains correct. A bounded descriptor pool reopens
+// evicted offset files with O_APPEND.
 //
-//  1. A bounded LRU DID->candidate-segments cache absorbs the recommended
-//     DID-grouped input to ~one bloom selection per distinct DID. Unsorted
-//     input stays correct, just with more cache misses (each a cheap resident
-//     bloom test, no disk I/O).
-//  2. A bounded LRU file-descriptor pool caps open offset files; an evicted
-//     segment's file is reopened O_APPEND on its next hit.
+// Cache entries carry the manifest generation read before selection.
+// Concurrent seal or compaction can make an entry stale, but cannot label an
+// old selection as current. See selectFor.
 //
-// Cache coherence with the manifest (the correctness core). SelectBlocksForDID
-// is one-sided against the manifest's CURRENT resident set, but the manifest
-// can seal/compact segments concurrently. A cached selection could therefore
-// name a stale segment set. We gate every cache entry on the manifest's
-// Generation() counter: an entry is trusted only while the generation it was
-// computed under still matches. Crucially we read the generation BEFORE calling
-// SelectBlocksForDID and cache that pre-read value, so the cached selection is
-// never from an OLDER manifest than its tag -- a refresh racing the selection
-// only ever makes the entry look stale (a safe recompute), never falsely fresh
-// (which could drop a newly-sealed segment). See selectFor for the proof.
-//
-// Point-in-time shape: a single streaming pass routes each row against the
-// manifest as it stood when the row was processed. The orchestrator closes the
-// active-segment gap before bucketing by activating append-time rules and then
-// force-rotating the steady writer; rows appended after that are stamped at
-// birth, so a later segment seal during this pass does not need retroactive
-// patch coverage.
+// Before bucketing, the orchestrator activates append-time timestamp rules
+// and force-rotates the writer. Existing rows are therefore sealed for
+// patching, and later appends receive timestamps before publication.
 
 import (
 	"container/list"
@@ -241,10 +224,9 @@ func (b *Bucketer) Route(row Row) error {
 	return nil
 }
 
-// selectFor returns row.DID's candidate segments, using the generation-gated
-// cache. See the file header for the coherence argument; the load-bearing line
-// is that gen is sampled BEFORE SelectBlocksForDID so the cached selection is
-// never from an older manifest than its tag.
+// selectFor returns candidate segments from a cache keyed by DID and manifest
+// generation. Read the generation before selection so a concurrent refresh
+// can make an entry stale, never falsely current.
 func (b *Bucketer) selectFor(did string) ([]segmentRef, error) {
 	curGen := b.sel.Generation()
 	if el, ok := b.didCache[did]; ok {
@@ -400,18 +382,14 @@ func (b *Bucketer) offsetPath(idx uint64) string {
 	return filepath.Join(b.jobDir, OffsetFileName(idx))
 }
 
-// Close fsyncs and closes every open offset file, then fsyncs the job dir so
-// the files' directory entries are durable. It must be called after the parse
-// completes (and before Phase C reads the files). Returns the first error, if
-// any, after attempting to sync+close all files.
+// Close syncs and closes all open offset files, then syncs the job directory.
+// Call after parsing and before Phase C. It attempts every file and returns
+// the first error.
 //
-// The fsyncs are load-bearing for resume (design Q-RESUME): the import manager
-// persists Bucketed=true — the "skip re-parsing on resume" checkpoint — right
-// after Close returns, with a synced pebble write. Without syncing the offset
-// files first, a power loss could persist the checkpoint while losing the
-// files it vouches for, and the resumed run would skip Phase A/B against a
-// missing or truncated offset set: a silently incomplete import. Files evicted
-// from the FD pool were synced at eviction (and re-synced here if reopened).
+// The importer commits Bucketed=true only after Close succeeds. Offset data
+// and directory entries must be durable first, or restart could skip parsing
+// with missing files. Evicted files are synced at eviction and again here if
+// reopened.
 func (b *Bucketer) Close() error {
 	var firstErr error
 	for el := b.fileLRU.Front(); el != nil; el = el.Next() {

@@ -45,7 +45,7 @@ func ValidateEvent(ev Event) error {
 //
 // The interface separates length accessors (O(1) for both
 // implementations) from blob-append methods (O(total_bytes) for both,
-// and crucially O(1) overhead per event for pendingBlock since its
+// and O(1) overhead per event for pendingBlock since its
 // blobs are already contiguous []byte buffers — no prefix-sum walk).
 type columns interface {
 	Len() int
@@ -259,22 +259,12 @@ var errTruncatedBlock = errors.New("segment: truncated or malformed block")
 // allocation a hostile header can force.
 const maxBlockEventsLimit = 1 << 18 // 262,144
 
-// decodeBlock is the inverse of encodeBlock. It validates input
-// length at every step so a malicious header cannot provoke an
-// unbounded allocation.
+// decodeBlock reverses encodeBlock and validates lengths before allocating.
 //
-// Buffer-aliasing contract (callers MUST honor):
-// the returned events alias buf for their string columns (DID,
-// Collection, Rkey, Rev) and for Payload. Strings are immutable in
-// Go; Payload is []byte by API necessity but is documented (event.go)
-// as read-only DAG-CBOR record bytes — callers that need to mutate
-// must clone first. If a caller later writes through buf they will
-// observe the same write through the events. Both production call
-// sites pass a freshly-allocated zstd output buffer that they never
-// touch again, which makes the aliasing safe and saves five
-// allocations plus a full copy of the variable region per block.
-// On a 4096-event production block this is ~3 MB of garbage avoided
-// per decoded block, which is meaningful at firehose throughput.
+// Returned strings (DID, Collection, Rkey, Rev) and Payload alias buf.
+// Callers must treat both buf and event fields as read-only or clone before
+// mutation. Production callers supply a fresh decompressed buffer and do not
+// reuse it, avoiding variable-column copies.
 func decodeBlock(buf []byte) ([]Event, error) {
 	const fixedPerEvent = 8 + 8 + 8 + 1 + 1 + 2 + 1 + 1 + 4
 

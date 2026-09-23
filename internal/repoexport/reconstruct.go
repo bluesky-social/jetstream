@@ -29,15 +29,9 @@ type BlockSelection struct {
 	Blocks []int
 }
 
-// Selector is the bloom-pruning front door reconstruction uses instead of
-// scanning every segment file. The production implementation is backed by
-// the in-memory manifest, which already holds every sealed segment's DID
-// blooms resident -- so pruning happens entirely in memory and only the
-// segments an account actually touches are opened.
-//
-// Keeping this an interface (rather than depending on *manifest.Manifest
-// directly) keeps repoexport decoupled from the manifest package and makes
-// the selection trivially fakeable in tests.
+// Selector prunes sealed segments using resident DID blooms and identifies
+// active files needing a scan. The interface keeps reconstruction independent
+// of the manifest implementation.
 type Selector interface {
 	// SelectBlocksForDID returns, for every sealed segment that may hold
 	// did, the candidate blocks within it. One-sided contract: no false

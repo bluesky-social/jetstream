@@ -9,19 +9,11 @@ type slowConfig struct {
 	now          func() time.Time
 }
 
-// slowDetector decides whether a subscriber is adversarially slow. It is
-// driven once per ReadFrom batch via observe. A drop requires BOTH far-behind
-// AND below-floor-rate, sustained continuously for the full window. Any batch
-// where the client is caught up (lag <= lagThreshold) OR advancing at/above
-// minRate resets the bad-streak anchor. One detector per subscriber goroutine;
-// not concurrency-safe (the loop is single-threaded).
-//
-// The rate is measured on LOG-SCAN PROGRESS (how far the subscriber's cursor
-// has advanced through the seq-ordered log), not on frames delivered to the
-// wire. A client with a highly selective filter scans the log quickly but
-// delivers few frames; measuring delivered frames would wrongly flag it as
-// slow. Progress-rate is the honest "is this client keeping up with the
-// stream" signal.
+// slowDetector disconnects a subscriber only when it remains far behind and
+// advances below minRate for a full window. It measures cursor progress, not
+// delivered frames, so selective filters do not count as slow readers. Each
+// subscriber's single goroutine owns its detector; it is not
+// concurrency-safe.
 type slowDetector struct {
 	cfg slowConfig
 

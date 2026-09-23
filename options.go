@@ -308,28 +308,15 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// WithRawRecords makes archive commit decoding SKIP building the generic
-// Commit.Record map[string]any. Instead, Commit.Record is left nil and
-// Commit.RecordCBOR is populated directly from the segment payload, which the
-// caller decodes itself — typically through TypedEvents. Building the generic
-// map dominates archive decode CPU and allocations at scale (#142), so skipping
-// it is the main lever for high-volume replays of one record type. Live records
-// arrive as atproto JSON and are canonicalized to DAG-CBOR before delivery; the
-// live tail is low-volume relative to archive replay, so it does not need the
-// same zero-copy optimization.
+// WithRawRecords skips the generic Commit.Record map and exposes archive
+// RecordCBOR directly from segment bytes, reducing decode CPU and
+// allocations. Live JSON records are converted to canonical DAG-CBOR. Deletes
+// and non-commit events are unchanged, as are Operation, Collection, Rkey,
+// and Rev. CID stays empty unless WithRawRecordCIDs is set.
 //
-// Deletes (no record), identity/account/sync events, and the default Commit
-// fields (Operation/Collection/Rkey/Rev) are unaffected. Commit.CID is left
-// empty in raw mode unless WithRawRecordCIDs is also set (computing it is real
-// per-record work this fast path avoids by default).
-//
-// Aliasing/lifetime contract: in raw mode Commit.RecordCBOR aliases the
-// client's internal decompressed buffer on the replay path (zero-copy), valid
-// only for the lifetime of the Batch that delivered it — the same contract the
-// default Record already carries. Anything decoded from it that retains slices
-// or strings (typed structs whose string fields alias the input) is likewise
-// valid only for the batch; copy it to retain longer. Use WithRawRecordsCopied
-// for a safe (cloned) variant that still skips the map build.
+// Archive RecordCBOR aliases the decompressed buffer and is valid only for
+// the delivering Batch's lifetime. Decoded strings or slices that alias it
+// share this limit. Copy retained values or use WithRawRecordsCopied.
 func WithRawRecords() Option {
 	return func(c *config) { c.rawRecords = true }
 }

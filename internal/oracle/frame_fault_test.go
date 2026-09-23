@@ -14,27 +14,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// frame_fault_test.go is the #206 oracle tier: frame-level wire adversity
-// on the subscribeRepos connection. The relay is treated as untrusted
-// input; each scenario injects one class of poison frame through the
-// simulator's SubscribeReposInjectFault and asserts the full archive
-// contract end-to-end through the REAL consumer:
+// These tests inject subscribeRepos wire faults through the real consumer
+// (#206): malformed CBOR must count a decode error and continue; unknown
+// frames must be counted and recovered through resync where needed; op=-1
+// errors must retain their code; swallowed frames must produce a gap and
+// resync; oversized frames must reconnect without duplicate archive rows;
+// missing leaf blocks must drop only the affected op and count missing_block.
 //
-//   - garbage CBOR       → decode_errors, same-conn continue, zero loss;
-//   - unknown frame type → unknown_events, seq-carrying unknowns suppress
-//     the spurious gap, loss self-heals via chain-break resync;
-//   - op=-1 error frame  → stream_error_frames_total{code}, zero loss;
-//   - swallowed frame    → a REAL sequence gap end-to-end, loss bounded
-//     to exactly the swallowed frame and self-healed by resync;
-//   - oversized frame    → client read-limit trips, reconnect, the #205
-//     replay guards keep redelivery at zero loss AND zero bloat;
-//   - stripped leaf block → a partial-CAR commit (op CID on the wire,
-//     record block absent) drops exactly that op onto
-//     dropped_events_total{missing_block} while siblings archive and
-//     the commit chain stays intact.
-//
-// Every scenario ends with the final-state convergence fold, so a poison
-// frame can never silently corrupt the archive.
+// Every scenario checks final-state convergence.
 
 // oracleWireFrame builds the CBOR frame format atmos expects on the
 // wire: header {op:1, t:<typ>} concatenated with the body CBOR.

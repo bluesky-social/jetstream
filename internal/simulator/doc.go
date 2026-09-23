@@ -1,23 +1,14 @@
-// Package simulator is the parent of jetstream's local atproto network
-// simulator. It has no code of its own; it exists to group and document the
-// three subpackages that together stand in for the upstream network during
-// local runs and oracle tests:
+// Package simulator documents the local atproto network used by development
+// runs and oracle tests.
 //
-//   - world: the deterministic, seeded source of truth. It owns the pebble db,
-//     the account roster, repo/MST state, and the traffic generator that
-//     produces real atproto-shaped bytes — signed commits, CAR blocks, CBOR
-//     firehose frames, account and sync events — rather than mocked structs.
-//     It also serves as the independent expected-state model the oracle checks
-//     jetstream against, and includes the adversarial-traffic modes that feed
-//     bad-but-bounded input through the honest pipeline.
-//   - http: the network surface in front of the world — a fake PLC, PDS, and
-//     relay (listRepos, getRepo, the subscribeRepos firehose websocket) plus
-//     the fault-injection knobs (HTTP status, CAR truncation, disconnects).
-//   - fanout: the in-memory pub/sub that delivers the world's generated
-//     firehose events to connected relay-subscribe websocket clients.
+// world generates seeded accounts, repos, signed commits, CARs, and firehose
+// frames, and supplies independent expected state to the oracle. Adversarial
+// modes produce bounded malformed input through the same encoding paths.
 //
-// cmd/simulator wires these together into the standalone dev simulator on
-// :7777; the oracle wires them into an in-process harness. See specs/oracle.md
-// for how the simulator and oracle fit together and why the world is a real
-// byte generator rather than a set of fakes.
+// http serves PLC, PDS, and relay endpoints with configurable HTTP, CAR, and
+// websocket faults. fanout distributes generated firehose events to relay
+// subscribers.
+//
+// cmd/simulator serves the standalone network on :7777. The oracle runs it
+// in-process; see specs/oracle.md.
 package simulator

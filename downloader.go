@@ -144,43 +144,22 @@ type decodeResult struct {
 	payload  any // transform output (worker-computed); nil on the legacy path
 }
 
-// Download fetches and decodes every entry in plan order, invoking emit once per
-// decoded block in strict plan order (entry 0's blocks ascending, then entry
-// 1's, …) regardless of decode-completion order. It runs a three-stage pipeline:
+// Download fetches and decodes entries concurrently, then calls emit in plan
+// order: entries in order, blocks ascending within each entry. A bounded
+// segment prefetcher overlaps downloads with decoding; a separate block-fetch
+// pool overlaps getBlock requests. d.concurrency workers decode frames, and
+// one reassembler restores emission order, preserving per-DID ingestion
+// order.
 //
-//  1. a single PREFETCHER fetches whole-segment files a little ahead (bounded),
-//     overlapping the next segment's download with the current one's decode,
-//     while a BLOCK-FETCH COORDINATOR runs block-mode getBlock round trips on
-//     its own parallel pool across blocks and entries (#292);
-//  2. a POOL of d.concurrency DECODE workers decompresses + CBOR-decodes block
-//     frames in parallel — the CPU-heavy work, fanned out across cores;
-//  3. a single REASSEMBLER emits decoded blocks in global-seq order, so output
-//     order is independent of which worker finished first.
+// If emit returns false, Download cancels outstanding work and returns nil.
+// Context errors are returned. Per-block failures are emitted as
+// entryResult.Err after that entry's valid prefix; processing continues with
+// the next entry. Completion order never changes emission order.
 //
-// Parallel decode is the throughput lever (#142): a likes backfill is decode-
-// bound, and serial decode pinned it to ~1 core. d.concurrency now sizes the
-// decode pool — the parallelism knob.
-//
-// If emit returns false, Download stops early: it cancels in-flight and pending
-// work and returns nil (a clean stop, not an error). It returns the first
-// context error encountered; per-block download/decode failures are reported
-// through entryResult.Err in order (not returned), so one bad block does not
-// abort the backfill — the good prefix of that entry's blocks is emitted, then
-// the error, then the entry stops and the next entry continues.
-//
-// Ordering invariant: the framer assigns a dense, monotonically increasing seq
-// while walking entries in plan order and blocks in ascending index, and the
-// reassembler emits strictly in that seq order; rows within a block keep their
-// stored order. Per the segment format this yields per-DID ingestion order
-// (docs/README.md §2 invariant #2, §3.1.1), the contract the client rests on.
-// Parallel decode only reorders completion, never emission.
-//
-// Memory bound: at most inFlightWindow(d.concurrency) block frames are live
-// between dispatch and emission (a global semaphore the reassembler drains in
-// order), so decoded events held at once are O(window × block-size), not
-// O(archive). Compressed whole-segment buffers are bounded to ~prefetchDepth
-// resident files (a separate, larger term tracked by #143), independent of plan
-// size. This is what keeps the full-archive backfill from the OOM in #142.
+// At most inFlightWindow(d.concurrency) block frames are between dispatch and
+// emission, bounding decoded memory by window × block size. Whole-segment
+// compressed buffers have a separate prefetchDepth bound, independent of
+// archive size.
 func (d *downloader) Download(ctx context.Context, entries []planEntry, emit func(entryResult) bool) error {
 	if len(entries) == 0 {
 		return nil

@@ -18,9 +18,8 @@ type IOFaultInjector interface {
 	BeforeSegmentIO(path string, op IOOp) error
 }
 
-// beforeSegmentIO consults faults ahead of a segment I/O operation. Patch and
-// Rewrite hold a bare injector (not a Config), so this free helper is the
-// single seam; Config.beforeIO delegates here to keep one code path.
+// beforeSegmentIO checks for an injected failure before I/O. Config, Patch,
+// and Rewrite share this helper.
 func beforeSegmentIO(faults IOFaultInjector, path string, op IOOp) error {
 	if faults == nil {
 		return nil

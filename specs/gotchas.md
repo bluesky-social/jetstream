@@ -1,13 +1,6 @@
 # Gotchas: accepted limitations and hard-won lessons
 
-This file is the shared home for two kinds of knowledge that otherwise live only in one person's head:
-
-- **Accepted limitations** — things that look like bugs but are deliberate. We considered them and decided to live with them. Don't "fix" one without checking here first and reopening the decision on purpose.
-- **Lessons** — mistakes that were expensive to learn, and traps that are easy to fall into twice.
-
-Each entry says what the thing is, why it's the way it is, and roughly where in the code it lives (by area, not line number, so it doesn't rot). If you hit something surprising and figure out why, add an entry. If you find yourself about to change something an entry describes, that's your cue to talk to Jim first.
-
----
+Known limitations and lessons from previous failures. Check these before changing the behavior they describe, and discuss changes to accepted tradeoffs with Jim. Add an entry when a surprising behavior needs a lasting explanation.
 
 ## Accepted limitations
 
@@ -34,7 +27,7 @@ data loss. Area: `internal/ingest/backfill/cursor.go`.
 
 ### Live first sighting is not a getRepo trigger
 
-This one repeatedly tempts agents into "repairing" a perceived missing-history gap. Do not reintroduce first-sighting backfill.
+Do not add backfill on a DID’s first live event.
 
 A repo can appear live that we never backfilled — say its PDS was firewalled during the bootstrap `listRepos` sweep, so the first event we ever see for it is well past its start. Jetstream archives the live event it actually received and does **not** create a `repo/<did>` row, mark it pending, or call `getRepo` merely because this is the first time we saw the DID.
 
@@ -46,7 +39,7 @@ Area: `internal/ingest/backfill/retry.go`, `internal/ingest/orchestrator/steady.
 
 ### Timestamp-import ReadRow can accept a suffix behind a quoted newline
 
-(Sourced from the in-code comment, which marks this a known, accepted limitation.) Phase C of the timestamp import re-reads one CSV row by byte offset and re-validates it, checking that the byte before the offset is a newline so a stale offset can't land mid-record. A newline embedded inside a quoted CSV field also satisfies that check, so an offset into such a multi-line record could parse as a suffix row. Closing it would need global quote-parity tracking (a full re-scan, or binding the CSV to the job by size+hash). The code comment records the decision not to: the only actor who can swap the CSV under a resumed job is the operator, who can already import arbitrary timestamps honestly, and an accidental desync that happens to produce a valid-parsing suffix behind a quoted newline is vanishingly unlikely. Area: `internal/timestamp/apply.go` (`ReadRow`) — read the comment there before touching it.
+Phase C of timestamp import re-reads and validates CSV rows by byte offset. `ReadRow` checks that the preceding byte is a newline, but cannot distinguish a record boundary from a newline inside a quoted field. A stale offset could therefore parse a valid suffix row. Detecting this would require a full quote-aware scan or binding the CSV to the job by size and hash. This limitation is accepted: only the operator can replace the CSV, and the operator already controls imported timestamps. See `internal/timestamp/apply.go` (`ReadRow`).
 
 ### A spec-valid rkey longer than 255 bytes is dropped by design
 
@@ -56,9 +49,9 @@ atproto record keys can be up to ~1023 bytes, but our segment format caps the rk
 
 Rule-map ingestion (`ruleSSTBuilder.Ingest` in `internal/timestamp/rules.go`) installs the sorted chunk SSTs one `pebble.Ingest` at a time; each call is individually atomic and immediately durable. A crash or error partway through the loop therefore leaves a committed *prefix* of the CSV resident, with no marker distinguishing it from a complete import — and since every chunk carries its collections' activation markers, `Stamp` runs against that partial keyspace after the next boot. Consequences in the window: events whose rules landed are stamped, later ones are not, and a path whose CSV last-write-wins winner lives in a not-yet-ingested chunk can carry a *stale* stamp into segment bytes and the live wire.
 
-This is deliberate (Jim, 2026-07-08). The remediation contract, not a marker/atomic-ingest scheme, closes the gap:
+Accepted by Jim on 2026-07-08. Recovery depends on completing the import:
 
-- A **crash** mid-ingest leaves the job non-terminal; the next boot auto-resumes (`ResumeIncomplete`) and re-runs rule ingestion from the CSV. Self-healing.
+- A **crash** mid-ingest leaves the job non-terminal; the next boot auto-resumes (`ResumeIncomplete`) and re-runs rule ingestion from the CSV.
 - A **terminal failure** (e.g. ENOSPC) does not auto-resume — by design, since re-running a deterministically-failing job would loop. The operator re-submits the same CSV via the import XRPC once the cause is fixed. The importer never modifies or deletes the staged CSV (it opens it read-only; terminal cleanup removes the *scratch* dir under `import-scratch/<job>`, not the import dir), so the exact same file is re-submittable. Re-ingest is last-write-wins over the full CSV, which heals both missing entries and the stale cross-chunk duplicate edge; the bucket+patch phases were already idempotent.
 
 Alternatives considered and rejected as not worth the cost against this remediation story: k-way-merging chunks into one atomic multi-file `db.Ingest` (~2x scratch write amp on a ~200GB entry stream), and deferring collection markers to a post-ingest commit batch (still leaves the window for re-imports into an already-active collection). Area: `internal/timestamp/rules.go` (`Ingest` — comment there), `internal/importer/importer.go`, `docs/README.md` §8.
@@ -71,7 +64,7 @@ Accepted (Jim, 2026-07-08): the operator re-submits the same CSV, exactly as for
 
 ### `just run-prod` inherits the dev-speed flags from `.env`
 
-`set dotenv-load` in the justfile loads the committed `.env` for every recipe, and `run-prod` only overrides the relay/PLC/data-dir vars. So dev-speed flags like `JETSTREAM_SKIP_MERGE_DISCOVERY`, `JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS`, and the 1s status-cache TTL still apply when `run-prod` points at real upstream services. This is intentional: `run-prod` is a local dev loop aimed at real upstream for fast iteration, not a production-config rehearsal. A faithful production-config recipe is deferred to pre-1.0 vetting (nothing runs the exact config production will use yet). If you're doing a maintainability/config audit, this is expected — don't file it as a bug. Area: `justfile` (`run-prod`).
+`set dotenv-load` loads `.env` for every recipe. `run-prod` overrides only relay, PLC, and data-directory settings, so `JETSTREAM_SKIP_MERGE_DISCOVERY`, `JETSTREAM_DISABLE_REPO_ACTION_RATE_LIMITS`, and the 1s status-cache TTL still apply. It is a local development recipe against real services; a recipe matching production configuration is deferred to pre-1.0 review. Area: `justfile` (`run-prod`).
 
 ---
 
@@ -79,7 +72,7 @@ Accepted (Jim, 2026-07-08): the operator re-submits the same CSV, exactly as for
 
 ### There are several copies of the "is this just cancellation?" classifier — grep them all
 
-Deciding whether an error is a clean shutdown (context cancellation) versus a real failure shows up in more than one place, and they are NOT all the same predicate. The subtle one is `IsCancellationOnly` in the import path: a plain `errors.Is(err, context.Canceled)` is wrong there because `RunImport` can return `errors.Join(context.Canceled, realFailure)`, and `errors.Is` matches *any* leaf — which would launder a real failure into a resumable pause. It reports cancellation only when *every* leaf is cancellation. Other spots (`orchestrator/steady.go`, `backfill/retry.go`, `jetstreamd/runtime.go`, the simulator) do a plain `errors.Is` because they only care whether the top-level context was cancelled. Lesson: if you touch cancellation-vs-failure logic, grep for every copy and understand which semantics each one needs — they are not interchangeable. Area: `internal/ingest/orchestrator/import_metrics.go` (`IsCancellationOnly`) and the call sites above.
+`IsCancellationOnly` in the import path requires every error leaf to be cancellation. `errors.Is(err, context.Canceled)` would also match `errors.Join(context.Canceled, realFailure)` and incorrectly make a failed import resumable. Other callers in `orchestrator/steady.go`, `backfill/retry.go`, `jetstreamd/runtime.go`, and the simulator only need to know whether cancellation occurred. Search all callers before changing this logic; their predicates serve different purposes. Area: `internal/ingest/orchestrator/import_metrics.go`.
 
 ### A restart-tier recovery child hangs if the relay is quiet — generate traffic between children
 

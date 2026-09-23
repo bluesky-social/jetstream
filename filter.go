@@ -6,25 +6,11 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 )
 
-// matcher applies the caller's exact kind/DID/collection/seq filters to decoded
-// segment rows. The snapshot planner is a one-sided transport hint (no false
-// negatives, possible false positives via DID blooms and per-block collection
-// summaries), so the client MUST re-apply exact filtering after decode.
-//
-// The presentation contract matches the server's /subscribe wire policy:
-//
-//   - Kind and DID filters apply independently to all events.
-//   - With a collection filter set: only commit events whose collection matches
-//     are delivered. A commit with an empty collection still bypasses the
-//     filter. #account, #identity, and #sync — the DID-level events, which carry
-//     no collection — always bypass the collection filter (subject to the DID
-//     filter), because they are the consumer's only signal to purge a dead
-//     account's records; hiding them would create a permanently stale view.
-//   - With no collection filter: every kind is delivered (subject to the DID
-//     filter), matching "give me the whole stream".
-//
-// The seq window is the client's exact (afterSeq, beforeSeq] bound, applied on
-// top of the planner's coarse per-segment/block seq pruning.
+// matcher applies exact kind, DID, collection, and seq filters after the
+// planner's conservative block selection. Kind and DID filters apply to all
+// events. Collections constrain commits, except commits with an empty
+// collection; DID-level markers bypass collections. The seq window is
+// (afterSeq, beforeSeq].
 type matcher struct {
 	kinds        map[Kind]struct{}   // nil = match all kinds
 	dids         map[string]struct{} // nil = match all DIDs

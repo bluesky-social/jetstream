@@ -16,15 +16,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## User Documentation
 
-See the [jetstream documentation website](https://bsky.network/docs/jetstream/) for end-user facing documentation.
+See the [jetstream documentation website](https://bsky.network/docs/jetstream/) for usage documentation.
 
-See the original [RFD](https://github.com/bluesky-social/jetstream/blob/main/docs/README.md) for a detailed overview for the project goals and design of the system.
+See the original [RFD](https://github.com/bluesky-social/jetstream/blob/main/docs/README.md) for the project goals and design.
 
 ## Examples
 
-See the [examples](https://github.com/bluesky-social/jetstream/tree/main/examples) directory of this repo for several minimal usage examples.
+See [examples](https://github.com/bluesky-social/jetstream/tree/main/examples) for minimal clients.
 
-You can run them like so:
+Run an example:
 
 ```sh
 # start the nix environment (see below)
@@ -44,7 +44,7 @@ Jetstream development uses Nix for a pinned Go and toolchain environment. Instal
 just dev
 ```
 
-For development purposes, to run against the real production network in a setup that doesn't require a whole-network backfill:
+To develop against the production network with a limited backfill:
 
 ```sh
 # backfill 20 random repos, then cut over to the live tail
@@ -54,7 +54,7 @@ just run-prod serve --max-backfill-repos=20
 just run-prod serve --backfill-repos=did:plc:4uz2445cjiw7w4nobfgnu35f
 ```
 
-This repo also ships with an extremely minimal atproto simulator (PLC, PDS, and the Relay). To run the local environment against it, use two terminals like:
+To run against the included atproto simulator (PLC, PDS, and relay), use two terminals:
 
 ```sh
 # terminal 1: starts the simulator on :7777 with 10,000 mock accounts
@@ -65,7 +65,7 @@ just simulator serve
 just run serve
 ```
 
-Simulator and prod data are always isolated, so you can swap between them without worry (they each get a unique data directory).
+The simulator and production recipes use separate data directories.
 
 To fully reset your local environment (warning: destructive action!):
 
@@ -73,7 +73,7 @@ To fully reset your local environment (warning: destructive action!):
 just clean  # removes all built binaries and all data directories
 ```
 
-To run the linter and tests, you can do things like:
+Run checks:
 
 ```sh
 just       # run the linter and all -short tests
@@ -98,6 +98,6 @@ This project is dual-licensed under MIT and Apache 2.0 terms:
 - MIT license ([LICENSE-MIT.txt](https://github.com/bluesky-social/jetstream/blob/main/LICENSE-MIT.txt) or http://opensource.org/licenses/MIT)
 - Apache License, Version 2.0, ([LICENSE-APACHE.txt](https://github.com/bluesky-social/jetstream/blob/main/LICENSE-APACHE.txt) or http://www.apache.org/licenses/LICENSE-2.0)
 
-Downstream projects and end users may chose either license individually, or both together, at their discretion. The motivation for this dual-licensing is the additional software patent assurance provided by Apache 2.0.
+Downstream projects and end users may choose either license individually, or both together, at their discretion. The motivation for this dual-licensing is the additional software patent assurance provided by Apache 2.0.
 
 Bluesky Social PBC has committed to a software patent non-aggression pledge. For details see [the original announcement](https://bsky.social/about/blog/10-01-2025-patent-pledge).

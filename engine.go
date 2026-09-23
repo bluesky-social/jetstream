@@ -115,31 +115,16 @@ func (e *replayEngine) driveRun(ctx context.Context, emitBatch func([]Event) boo
 func (e *replayEngine) run(ctx context.Context, yield func(*Batch, error) bool) {
 	stopped := false
 
-	// Build batches on the parallel decode workers, then deliver them in sequence
-	// order. Keeping this work off the serial reassembler is load-bearing for
-	// archive throughput (#142).
+	// Build batches on parallel decode workers to keep the serial
+	// reassembler cheap. Transform reads only its block and returns
+	// immutable batches, or nil for an empty result.
 	//
-	// Transform runs on N worker goroutines concurrently. It is safe there: it
-	// reads only its own block's events and slices them into immutable batches.
-	// A nil return means an empty/filtered block (nothing to emit).
-	//
-	// Concurrency of the shared `stopped` flag (subtle — read before refactoring):
-	// the backfill fast-path Emit closure runs on the engine's single run
-	// goroutine, but the live emitBatch/emitErr closures can ALSO be driven by the
-	// internal batcher's periodic flusher goroutine (startFlusher
-	// → b.flush()), not only the run goroutine. The flag is nonetheless race-free,
-	// for two reasons the older comment omitted:
-	//   1. The batcher serializes every emit under its own mutex, so a
-	//      flusher-driven emitBatch and a run-goroutine emit never overlap; and
-	//   2. Emit (fast-path backfill) and the live emitBatch/emitErr are never
-	//      BOTH live at once on the production path: backfill rows bypass the
-	//      batcher entirely (Emit), and the live tail's batcher buffer is flushed
-	//      before each re-sweep (runBackfillThenLive), so the
-	//      flusher's b.flush() finds an empty buffer and never calls emitBatch
-	//      while a sweep's Emit is running.
-	// Transform runs on the decode workers and never touches `stopped`. If a future
-	// refactor breaks invariant (2) (e.g. live rows left buffered across a sweep),
-	// promote `stopped` to an atomic.Bool rather than relying on this argument.
+	// stopped is shared by backfill Emit and live emitBatch/emitErr. Live
+	// callbacks can run on the periodic flusher, but the batcher's mutex
+	// serializes them. Backfill bypasses the batcher, and live buffers
+	// are flushed before each sweep, so live callbacks cannot overlap
+	// backfill Emit. Transform never touches stopped. If these phases
+	// overlap in future, stopped must become atomic.
 	size := max(e.cfg.BatchSize, 1)
 	bf := backfillSink{
 		transform: func(_ int, evs []Event) any {

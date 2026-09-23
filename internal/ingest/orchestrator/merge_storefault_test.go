@@ -13,24 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestMerge_StoreFaultOnCursorCommit_FailsLoudNoSilentAdvance is the
-// store-fault tier's primary kill for mutation m006
-// (merge_commit_error_swallowed). The mutant inverts the error check on
-// the source-cursor commit in merge_runner.go so a FAILED commit is
-// silently swallowed and the merge proceeds — the classic swallowed-
-// persistence-error that can advance past unarchived data.
-//
-// We force commitSourceComplete's batch commit to fail by injecting a
-// fault on the merge/next_source_idx batch (the only batch that key rides)
-// and assert the phase-specific contract: runMerge fails LOUD, and the
-// durable state is left untouched for a clean restart — the cursor is not
-// advanced and the backfill source tree is NOT cleaned up. Under the
-// mutant the commit error is swallowed, so runMerge runs to completion:
-// it returns nil and removes data/backfill. Either divergence fails this
-// test, killing the mutant.
-//
-// Contract reference: issue #30 — "fail loud where continuing risks
-// corruption ... never silently advance cursors past unarchived data."
+// TestMerge_StoreFaultOnCursorCommit_FailsLoudNoSilentAdvance injects a
+// failure into the merge/next_source_idx batch. runMerge must return the
+// error, preserve the cursor, and retain the source tree for restart. Mutant
+// m006 swallows this error and completes cleanup, which this test rejects
+// (#30).
 func TestMerge_StoreFaultOnCursorCommit_FailsLoudNoSilentAdvance(t *testing.T) {
 	t.Parallel()
 	injected := errors.New("injected: merge cursor commit failed")

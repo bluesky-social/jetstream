@@ -9,21 +9,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestRecoveryFromCrashAfterFooterFsyncBeforeHeaderPwrite simulates a
-// crash where the footer is durable but the header is still zero-
-// filled. New() rebuilds its in-memory flushed-block index by walking
-// every frame in the file, which forces decompression. The first 8
-// bytes of the orphaned footer (a block-index file offset) parse as
-// a plausible-but-bogus frame length, but the bytes that follow are
-// not a valid zstd frame, so decompression fails loudly. CLAUDE.md
-// prefers crashing over silent data corruption: the alternative is
-// to silently truncate, which would discard real data on any subtle
-// corruption with the same shape.
+// TestRecoveryFromCrashAfterFooterFsyncBeforeHeaderPwrite places a durable
+// footer behind an unsealed header. Recovery reads the footer as a frame and
+// rejects its invalid zstd content. Silently truncating could discard real
+// data with similar corruption.
 //
-// In practice, this state isn't reachable via the normal seal code
-// path: Seal explicitly truncates the footer back off when the
-// header pwrite fails (see truncateFooterTail). This test fabricates
-// the state by hand to pin the behavior under deliberate corruption.
+// Normal Seal truncates the footer if header writing fails; this test
+// constructs the damaged state directly.
 func TestRecoveryFromCrashAfterFooterFsyncBeforeHeaderPwrite(t *testing.T) {
 	t.Parallel()
 

@@ -280,30 +280,15 @@ func (c *Consumer) dropReplayedAccountEvent(ctx context.Context, segEvts []segme
 	return true, nil
 }
 
-// dropReplayedIdentityEvent is the #identity analogue of the #account
-// guard above (#234). #identity events have no replay protection at any
-// other layer: atmos does not process them (no rev, no verifier state,
-// no OnAccountEvent path), so a relay seq replay after a reconnect
-// re-archives the row at a fresh jetstream seq — a permanent duplicate
-// in the immutable archive. Identity rows never fold, so unlike #231
-// this is bloat rather than erasure, but it breaks the zero-bloat
-// exact-multiset contract all the same. The applied seq is jetstream's
-// own ratchet, recorded in the writer's OnAppend hook (before any
-// full-block flush can commit the cursor batch) and flushed with the
-// cursor batch (after the segment fsync).
+// dropReplayedIdentityEvent prevents duplicate identity rows on relay replay
+// (#234). Atmos does not track identity revs or verifier state. The writer's
+// OnAppend hook records the per-DID applied upstream seq before a block can
+// flush; the cursor batch persists it after segment fsync.
 //
-// The check is a MAX ratchet (seq <= applied drops), the same
-// semantics as the #231 account guard: an exact-seq membership set
-// would be unbounded state. The deliberate tradeoff: if an identity
-// seq was lost in a tolerated relay gap and a later one archived, a
-// subsequent relay regression that re-serves the gapped seq gets
-// dropped here even though it never archived — we prefer that over
-// the alternative (an equality-only check), which would re-archive a
-// duplicate for every below-ratchet replay of a row we DID archive.
-// Gapped events are already counted/logged at gap time.
-//
-// A ratchet of 0 means no identity row has ever been applied for the
-// DID; real relay seqs start at 1 so 0 is never a valid applied value.
+// The check drops seq <= applied rather than maintaining an unbounded
+// membership set. This also drops a previously missing event if it reappears
+// below a newer applied seq; relay gaps are counted and logged when observed.
+// Zero means no identity row has been applied.
 func (c *Consumer) dropReplayedIdentityEvent(ctx context.Context, segEvts []segment.Event) (bool, error) {
 	if c.cfg.SyncStateStore == nil || len(segEvts) != 1 || segEvts[0].Kind != segment.KindIdentity {
 		return false, nil
@@ -509,27 +494,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// noteStreamError records one stream-level (nil, err) yield from the
-// atmos iterator. The classes carry different operator remediations, so
-// each lands on its own counter:
-//
-//   - GapError: the relay skipped seqs — upstream data loss, nothing we
-//     can do locally.
-//   - UnknownFrameError: a well-formed frame this build can't represent —
-//     a relay speaking a newer protocol; the fix is upgrading jetstream.
-//   - StreamError: an op=-1 server error frame (e.g. FutureCursor,
-//     ConsumerTooSlow), normally followed by a server-side close and an
-//     atmos reconnect. A persistent FutureCursor loop means our cursor is
-//     ahead of the relay (cursor corruption or a relay restored from an
-//     older backup) and never self-resolves — the labeled counter is the
-//     operator's signal to intervene.
-//   - DropError: atmos's parallel verifier shed an event because one DID
-//     overflowed its per-DID verify queue. PERMANENT local archival loss —
-//     the event was received but never stored, and the watermark advances
-//     past it — so it must not be miscounted as a decode error (#266's
-//     side finding). The count folds in coalesced drops so the metric is
-//     exact loss accounting.
-//   - anything else: a garbage frame we chose to skip (decode error).
+// noteStreamError counts stream errors by operator response: GapError reports
+// upstream loss; UnknownFrameError may require an upgrade; StreamError
+// records the relay's code (persistent FutureCursor requires intervention);
+// DropError counts verifier queue losses, including coalesced drops. Other
+// errors count as decode failures. Queue drops are permanent local archive
+// loss because the cursor advances past the unarchived event.
 func (c *Consumer) noteStreamError(ctx context.Context, err error) {
 	if gap, ok := errors.AsType[*streaming.GapError](err); ok {
 		c.cfg.Metrics.noteSequenceGap(gap.Got - gap.Expected)

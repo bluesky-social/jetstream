@@ -1,31 +1,18 @@
-// package live owns the consumer that pumps the upstream
-// relay's com.atproto.sync.subscribeRepos firehose into a
-// directory of segment files. The package is deliberately generic:
-// it is used during the bootstrap phase to populate
-// data/backfill/live_segments (docs/README.md §4.1 step 1), and the
-// same Consumer type will be reused after the merge step lands
-// to populate data/segments in steady state (docs/README.md §4.3).
+// Package live consumes com.atproto.sync.subscribeRepos into segment files:
+// data/backfill/live_segments during bootstrap and data/segments in steady
+// state.
 //
-// The Consumer wraps a dedicated *ingest.Writer. The mapping from
-// upstream firehose events to segment.Events lives in events.go
-// as a pure function so it is straightforward to unit-test
-// against arbitrary input. Cursor durability is delegated to the
-// writer's durable batch hook so persisted cursor ≤ durable events
-// holds in the same synced Pebble commit as seq/next, as docs/README.md §3.1.1
-// requires.
+// Consumer uses ingest.Writer for persistence. events.go converts upstream
+// events to segment.Events. The writer's durable batch hook commits the relay
+// cursor with seq/next after segment fsync, keeping the cursor at or behind
+// durable data.
 //
-// Sync 1.1 verification is required: Config.Verifier must be a
-// non-nil *sync.Verifier or Open returns ErrInvalidConfig. The
-// verifier itself is not owned by this package — its resync worker
-// pool is a process-wide resource that cmd/jetstream constructs
-// (with a pebble-backed StateStore + identity cache) and shares
-// with any future steady-state consumer.
+// Config.Verifier must be a non-nil Sync 1.1 verifier or Open returns
+// ErrInvalidConfig. Runtime wiring owns the process-wide verifier and its
+// resync worker pool, pebble state store, and identity cache.
 //
-// #sync frames and async verifier resync events are archived as a
-// segment.KindSync tombstone row first. Any ActionResync ops yielded by
-// Event.Operations archive after it as segment.KindCreateResync rows carrying
-// the live record bytes (see events.go). These replacement rows are hidden
-// from the v1 /subscribe presentation but visible on the v2 wire and to
-// archive readers; downstream consumers can dedupe on
-// (DID, Collection, Rkey, Rev).
+// Sync frames and asynchronous resyncs archive a KindSync tombstone followed
+// by ActionResync replacement records as KindCreateResync. V1 hides
+// replacement rows; v2 and archive readers expose them. Consumers can
+// deduplicate by (DID, Collection, Rkey, Rev).
 package live

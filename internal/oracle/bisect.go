@@ -2,33 +2,14 @@ package oracle
 
 import "fmt"
 
-// CompactedFailureVerdict classifies WHY the client-backfill serving path
-// tripped CheckCompacted, by re-running the identical contract check against
-// the on-disk segments at the same watermark.
+// CompactedFailureVerdict classifies a client-backfill CheckCompacted failure
+// by checking disk segments at the same watermark.
 //
-// The served (client-backfill) stream and the on-disk segments are two
-// independent observation surfaces of the same compaction contract
-// (docs/README.md §3.3). The served surface is the paginated client backfill —
-// planSnapshot -> getSegment/getBlock -> live-subscribe cutover — that real
-// clients use (this replaced the bespoke whole-archive /subscribe?cursor=0
-// replay; see specs/oracle.md "Client-Driven Historical Tier"). When that
-// surface reports a superseded survivor, the on-disk surface tells us which
-// side is actually wrong:
-//
-//   - on-disk ALSO violates  -> Jetstream physically persisted a superseded
-//     row: a durable storage/compaction defect (highest severity).
-//   - on-disk is CLEAN       -> the bytes are correct; the violation is a
-//     serving-path artifact, e.g. a cold-batch handoff across the paginated
-//     getSegment/getBlock download mixing a pre-compaction prefix with a
-//     post-compaction suffix. This points at the serving/transport path, not a
-//     storage bug.
-//
-// A clean on-disk result is only trustworthy when no compaction pass mutated
-// the segment directory during the scan: a rename mid-scan can hide or
-// fabricate rows, so a clean-but-raced scan is reported INCONCLUSIVE rather
-// than SERVING. A disk VIOLATION, by contrast, is durable regardless of a
-// racing pass, because a pass can only remove rows (segment.Rewrite is
-// strictly subtractive), so a surviving superseded row is real.
+// A disk violation identifies a storage or compaction defect. Clean disk data
+// identifies a serving defect, such as mixing segment generations during
+// download. If compaction raced the scan, a clean result is inconclusive. A
+// violation remains evidence even during a race because Rewrite only removes
+// rows.
 type CompactedFailureVerdict struct {
 	// Verdict is the classification.
 	Verdict Verdict
@@ -63,28 +44,15 @@ const (
 	VerdictInconclusive Verdict = "INCONCLUSIVE"
 )
 
-// ClassifyCompactedFailure bisects a client-backfill CheckCompacted failure.
-// servedErr MUST be the non-nil error returned by CheckCompacted over the
-// client-backfill serving stream; disk is the on-disk segment stream observed
-// at the same watermark; passesDuringScan is the number of compaction passes
-// that completed while the on-disk scan ran (0 means the scan was not raced).
+// ClassifyCompactedFailure compares a failed client CheckCompacted result
+// with disk observations at the same watermark. servedErr must be non-nil or
+// it panics. passesDuringScan counts compaction passes completed during the
+// scan.
 //
-// PRECONDITION on watermark capture: watermark MUST be captured no later than
-// the scan's first segment read. The DURABLE verdict's soundness under a race
-// rests on it. The compactor commits a chunk's rewrites to disk before it
-// advances the committed watermark (orchestrator applyCompactionChunk then
-// saveCompactionWatermark), so "watermark >= S" implies the rewrite that drops
-// S already renamed into place. With watermark captured first, a survivor at
-// seq S <= watermark seen on disk therefore provably persisted past its
-// compaction deadline -> a real durable defect, and a later racing pass can
-// only drop more rows, never resurrect S. If a caller instead captured the
-// watermark AFTER the scan, a row legitimately present at the read-time
-// watermark but dropped by a pass that then advanced the watermark past S
-// could be mislabeled DURABLE_DEFECT -- so don't.
-//
-// It panics if servedErr is nil: the bisection is only meaningful after the
-// served check has already failed, and a nil error would yield a misleadingly
-// clean verdict.
+// Capture watermark before the first segment read. Compaction renames
+// replacements before advancing the watermark, so a superseded survivor at or
+// below that captured value is a durable defect. Capturing it after the scan
+// could wrongly condemn a row read before a legitimate concurrent rewrite.
 func ClassifyCompactedFailure(servedErr error, disk []ObservedEvent, watermark uint64, passesDuringScan int) CompactedFailureVerdict {
 	if servedErr == nil {
 		panic("oracle: ClassifyCompactedFailure called with nil servedErr; bisection only runs after the served check fails")

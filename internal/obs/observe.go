@@ -1,22 +1,10 @@
-// Package obs: observe.go provides the canonical tracing helpers used
-// throughout jetstream. Span (and Span1 for one-value-plus-error
-// returns) opens a span named after the calling function (via
-// gt.Caller), runs the supplied body, and finalizes the span based on
-// the body's returned error. Span attributes can be set from inside
-// the body via trace.SpanFromContext(ctx).
+// Span and Span2 name traces after their caller using gt.Caller. Call them
+// directly from the function being traced; wrappers change the name.
+// Attributes can be set with trace.SpanFromContext(ctx). Histograms remain
+// the subsystem's responsibility.
 //
-// Discipline: Span must be called directly from the function it
-// represents. Wrapping it in another helper changes the caller depth
-// and produces wrong span names. The helpers are intentionally trace-
-// only — latency histograms remain explicit, deliberate, per-
-// subsystem decisions.
-//
-// Hot-path rule: Span must NOT be used from per-record / per-event
-// code paths (e.g. ingest.Writer.Append, live.ConvertEvent's inner op
-// loop). Per-event spans would balloon to billions/day at full
-// network scale and overwhelm any trace exporter. Use it at per-
-// batch, per-block, per-repo, per-seal, per-phase-transition
-// granularity.
+// Trace batches, blocks, repos, seals, and phase transitions. Per-event spans
+// would overwhelm exporters at network scale.
 package obs
 
 import (
@@ -27,24 +15,12 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Span starts a span named after the calling function, runs fn with
-// the span-derived context, and finalizes the span based on fn's
-// returned error. The returned error is fn's error, unmodified.
+// Span names a span after the caller, runs fn with its context, and returns
+// fn's error unchanged. Use trace.SpanFromContext(ctx) to attach attributes.
 //
-// To attach span attributes from inside fn, use
-// trace.SpanFromContext(ctx).
-//
-// HOT PATH: do not call from per-record/per-event code paths; use at
-// per-batch / per-block / per-phase granularity. See package doc.
-//
-// Status mapping:
-//   - fn returns nil → codes.Ok
-//   - fn returns any other err (including context.Canceled) →
-//     codes.Error + span.RecordError(err)
-//
-// Panics propagate. The span will be left un-Ended in that case;
-// the process is dying anyway and crashing is preferred over
-// papering over the failure.
+// Use at batch, block, or phase granularity, never per record. A nil error
+// sets codes.Ok; any error, including cancellation, sets codes.Error and
+// records it. Panics propagate without ending the span.
 func Span(ctx context.Context, fn func(context.Context) error, opts ...trace.SpanStartOption) error {
 	ctx, span := startCallerSpan(ctx, opts)
 	err := fn(ctx)
@@ -64,8 +40,8 @@ func Span2[T any](ctx context.Context, fn func(context.Context) (T, error), opts
 }
 
 // startCallerSpan opens a span named after the function that called
-// Span / Span1. skip=3: gt.Caller(0)=Caller, (1)=startCallerSpan,
-// (2)=Span/Span1, (3)=user code.
+// Span / Span2. skip=3: gt.Caller(0)=Caller, (1)=startCallerSpan,
+// (2)=Span/Span2, (3)=user code.
 func startCallerSpan(ctx context.Context, opts []trace.SpanStartOption) (context.Context, trace.Span) {
 	info := gt.Caller(3)
 	return tracerForCallerInfo(info).Start(ctx, info.Func, opts...)

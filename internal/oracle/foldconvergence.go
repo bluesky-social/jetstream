@@ -6,51 +6,20 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 )
 
-// CheckFoldConvergence is the §R7 eventually-consistent correctness invariant
-// that replaced the point-in-time CheckOverlayReconstruction (which encoded the
-// client-side suppression behavior deleted in steps 2/4 of the
-// drop-client-tombstones refactor).
+// CheckFoldConvergence verifies eventual consistency (§R7). It folds the
+// complete emitted stream in seq order, then filters the resulting records by
+// collection and compares them with independently observed ground truth.
+// Temporary stale rows are allowed if later markers remove them.
 //
-// The contract under test is no longer "the client emits exactly the live set."
-// Backfill is now AT-LEAST-ONCE: the client may emit transient stale rows (a
-// create it downloaded that a later delete supersedes), and a FOLDING consumer
-// converges to network truth. So we assert convergence, not point-in-time
-// equality:
+// Account-delete and sync markers match records by DID, not collection.
+// Filtering after folding preserves those effects. A collection-filtered
+// archive that omits a DID marker therefore fails this check; the sentinel
+// index in segment/sentinel.go prevents that omission.
 //
-//	Fold the FULL emitted stream (create/update apply; delete/account-delete/
-//	sync remove) in seq order with the same rules as groundTruthLive, then
-//	restrict the OUTPUT record set by the query's collection filter. The result
-//	must equal an INDEPENDENT ground truth (groundTruthLive over the full
-//	observed stream) restricted by the same collection filter.
-//
-// Two properties this encodes precisely (both are §R7 requirements):
-//
-//   - Killers match by DID, not collection. A DID-level tombstone
-//     (account-delete / sync) carries an EMPTY collection, so it can never be
-//     matched to a victim record by collection. groundTruthLive already folds
-//     them by DID; the OUTPUT restriction is applied AFTER the fold, so a
-//     DID-level killer in the stream still purges a collection-filtered record.
-//
-//   - It is sensitive to the §R3 gap. A collection-filtered backfill that
-//     downloads an in-scope create C but never receives C's DID-level killer D
-//     (because D carries an empty collection and rides in no collection block,
-//     and sits below the live tip) folds to C-PRESENT while ground truth has C
-//     PURGED — so this check DIVERGES. That divergence is exactly what the
-//     shipped fix closes: the DID-marker sentinel index (segment/sentinel.go;
-//     the planner unions sentinel collection ids in
-//     manifest.collectionIDsForSegment) tags marker-bearing blocks with
-//     $account/$identity/$sync so a collection-filtered plan selects them and D
-//     rides inline. (An earlier design used a client-side DID-tombstone
-//     start-snapshot here; that was reverted in favor of the sentinel index —
-//     see foldconvergence_gate_test.go and design §R4 REVISED.)
-//
-// emitted is the client's complete emitted stream for the query (the OBSERVED
-// side). full is the complete, independently-observed event stream for the
-// whole server (the GROUND-TRUTH side — e.g. a direct segment scan), used to
-// derive network truth WITHOUT consulting the filtered output. collections is
-// the query's collection filter (nil/empty = no collection restriction, i.e.
-// the whole stream). DO NOT pass the filtered stream as `full`: cross-checking
-// filtered-vs-filtered on the same server is blind to the gap (§R7).
+// emitted is the client's output. full must be an independent complete server
+// stream, such as a direct segment scan. Passing filtered output as full
+// would hide missing markers. Empty collections means no collection
+// restriction.
 func CheckFoldConvergence(emitted, full []ObservedEvent, collections []string) error {
 	fullLive, err := groundTruthLive(full)
 	if err != nil {

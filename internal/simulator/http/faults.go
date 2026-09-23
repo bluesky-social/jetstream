@@ -50,31 +50,15 @@ type SubscribeReposReplayFault struct {
 	RegressToSeq  int64
 }
 
-// SubscribeReposInjectFault schedules one wire-level frame fault on a
-// subscribeRepos connection: after AfterFrames counted frames have been
-// written, the relay injects Frame verbatim onto the wire (if non-empty)
-// and then swallows the next real frame (if SwallowNext). The
-// combinations model the frame-level adversity catalog:
+// SubscribeReposInjectFault injects Frame after AfterFrames counted writes
+// and optionally swallows the next real frame. Frame alone adds a spurious
+// frame; Frame with SwallowNext replaces one; SwallowNext alone creates a
+// gap.
 //
-//   - Frame only: a spurious extra frame between real ones — garbage
-//     CBOR, an unknown frame type, an op=-1 error frame, or an
-//     oversized frame, depending on the bytes.
-//   - Frame + SwallowNext: in-place corruption — the next real frame
-//     is replaced positionally by the injected bytes.
-//   - SwallowNext only: a pure drop — the relay consumed a seq the
-//     subscriber never receives, i.e. a genuine wire-level gap.
-//
-// Injected bytes bypass the write accounting entirely: they do not
-// count toward AfterFrames, the disconnect schedule's thresholds, or a
-// replay fault's duplicate ring. A swallowed frame is likewise not
-// counted (it never reaches the wire). The world's pebble-backed
-// firehose history keeps the true frames either way — the fault is
-// wire-only, so a reconnecting client can still recover the real
-// stream.
-//
-// The fault fires after the AfterFrames-th counted frame is written;
-// AfterFrames <= 1 therefore fires after the connection's first frame,
-// never before it (mirroring SubscribeReposReplayFault).
+// Injected and swallowed frames do not count toward frame thresholds or
+// replay duplicate rings. The world's persisted history is unchanged, so
+// reconnect can recover the original stream. AfterFrames <= 1 fires after the
+// first frame, never before it.
 type SubscribeReposInjectFault struct {
 	AfterFrames int
 	Frame       []byte
