@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/memstore"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/bluesky-social/jetstream/internal/metastore/storetest"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -116,4 +118,34 @@ func TestWithFaults_NilIsIdentity(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	require.Same(t, s, metastore.WithFaults(s, nil))
+}
+
+// TestKeyPrefixFault_FailedCommitConsumesBatch pins the single-use contract
+// through the wrapper: retrying a batch the injector rejected must not apply
+// it, or a fault test could pass on a retry the real stores would refuse.
+func TestKeyPrefixFault_FailedCommitConsumesBatch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openFaulty(t, &metastore.KeyPrefixFault{Prefix: []byte("merge/"), Ordinal: 1, Err: errInjected})
+
+	b := s.NewBatch()
+	b.Set([]byte("merge/a"), []byte("v"))
+	require.ErrorIs(t, b.Commit(ctx), errInjected)
+	require.ErrorIs(t, b.Commit(ctx), metastore.ErrBatchCommitted)
+
+	_, err := s.Get(ctx, []byte("merge/a"))
+	require.ErrorIs(t, err, metastore.ErrNotFound)
+}
+
+// neverFault is an installed injector that never fires, so the contract
+// suite exercises the wrapper's own code paths rather than the nil identity.
+type neverFault struct{}
+
+func (neverFault) BeforeWrite(metastore.WriteOp, [][]byte) error { return nil }
+
+func TestWithFaults_Contract(t *testing.T) {
+	t.Parallel()
+	storetest.Run(t, func(*testing.T) metastore.Store {
+		return metastore.WithFaults(memstore.New(), neverFault{})
+	})
 }

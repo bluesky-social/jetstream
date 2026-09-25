@@ -36,6 +36,16 @@ type Local struct {
 // Epoch implements Locker.
 func (Local) Epoch() uint64 { return 1 }
 
+// isLocal accepts both forms because *Local satisfies Locker too, and missing
+// it would renew a lease that does not exist.
+func isLocal(l Locker) bool {
+	switch l.(type) {
+	case Local, *Local:
+		return true
+	}
+	return false
+}
+
 // ErrRestartSession marks a session error that a fresh session can recover
 // from by rebuilding from durable state: lease loss, a fence failure, or a
 // write whose commit result is unknown. The default Fatal treats every
@@ -151,7 +161,7 @@ func runOnce(ctx context.Context, cfg Config, session SessionFunc, acquiredAt ti
 	sessionCtx, cancel := context.WithCancel(ctx)
 	lost := make(chan struct{})
 	renewDone := make(chan struct{})
-	if _, local := cfg.Locker.(Local); local {
+	if isLocal(cfg.Locker) {
 		// Nothing to renew. Skipping the ticker also keeps a synctest bubble
 		// free of a timer that fires forever.
 		close(renewDone)

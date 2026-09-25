@@ -82,6 +82,7 @@ type faultBatch struct {
 	inner  Batch
 	faults FaultInjector
 	keys   [][]byte
+	done   bool
 }
 
 func (b *faultBatch) Set(key, value []byte) {
@@ -101,7 +102,13 @@ func (b *faultBatch) DeleteRange(start, end []byte) {
 
 func (b *faultBatch) Len() int { return b.inner.Len() }
 
+// Commit consumes the batch even when the injector fails it, matching the
+// concrete impls: a retried commit must not apply what the fault rejected.
 func (b *faultBatch) Commit(ctx context.Context) error {
+	if b.done {
+		return ErrBatchCommitted
+	}
+	b.done = true
 	if err := b.faults.BeforeWrite(WriteOpBatchCommit, b.keys); err != nil {
 		return err
 	}

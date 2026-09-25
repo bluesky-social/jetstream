@@ -486,3 +486,12 @@ func TestRun_RejectsNilInputs(t *testing.T) {
 func bubbleCtx(t *testing.T) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(t.Context(), time.Hour)
 }
+
+// TestIsLocal pins the no-renew fast path to both forms of Local: a *Local
+// satisfies Locker, and missing it would start a ticker renewing nothing.
+func TestIsLocal(t *testing.T) {
+	t.Parallel()
+	require.True(t, isLocal(Local{}))
+	require.True(t, isLocal(&Local{}))
+	require.False(t, isLocal(&fakeLocker{}))
+}
