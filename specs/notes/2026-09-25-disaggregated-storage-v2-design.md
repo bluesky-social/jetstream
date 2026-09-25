@@ -1592,7 +1592,51 @@ this document.
 | Tombstone rebuild time on session start | failover time | 4 |
 | Retry-scan cost against `metadata_kv` | 9GB-per-pass estimate | 3 |
 | PostgreSQL WAL volume per day | sizing | 2 |
-| `next_seq - readable_log_durable_seq` in local mode (pop1 shows 7) | looks wrong; explain before relying on the readable log | 1 |
+| `next_seq - readable_log_durable_seq` in local mode (pop1 shows 7) | looks wrong; explain before relying on the readable log | 1 (done, below) |
+
+### 22.1 Stage 1 result: `next_seq - readable_log_durable_seq`
+
+The gauge is correct. The 7 was one instant sample taken just after a block
+commit.
+
+Both series come from the steady-state live writer. It is the only writer that
+gets the canonical `ingest.Metrics` in steady state. `next_seq` is set on every
+append. `readable_log_durable_seq` is republished on every append too, but it
+only changes when `commitDurableBatchLocked` finishes, after the block fsync
+and the Pebble commit. So the difference is the number of events in the
+unflushed partial block. It climbs by one per append, reads
+`MaxEventsPerBlock` (4096) while a full block is being fsynced and committed,
+and drops to 0 when the commit lands. The scrape is not atomic across the two
+series, so a sample can be off by one.
+
+There is no age-based cut. The steady-state writer cuts a block at 4096 events.
+It also drains on three rare, event-driven paths: after each repo that the
+failed-repo retry pass resyncs (`DrainDurability`), at the start of each
+compaction pass (`ForceRotate`), and on `Close`. None of these is a timer. The
+plan's finding 3 is right about the timer and slightly too strong about "count
+only".
+
+pop1 over 6h at 15s resolution (2026-09-25, build `3de2d5d`): min 5, p10 460,
+p50 2,141, mean 2,132, p90 3,739, max 4,096. That is the uniform sawtooth on
+`[0, 4096]` you would expect (mean 2,048). Over the same window, 9,892,604
+events went into 2,417 blocks, which is 4,093 events per block. Nearly every
+block is a full count cut.
+
+`TestPendingGaugeIsPartialBlockSawtooth` (`internal/ingest/metrics_test.go`)
+pins this. It checks the value after each append, checks that the value is a
+full block inside the durable-batch hook, and checks that the gauges agree with
+`ReadLog().DurableSeq()`.
+
+What this means for the design:
+
+- At pop1's rate (about 330 events/s), an event waits up to about 12.5s to
+  become durable in local mode, and the readable log serves it to subscribers
+  before then. Hot mode makes the hot batch the visibility point instead
+  (§10.3–10.4), so this wait no longer delays or precedes visibility.
+- At low rates nothing bounds the local wait. Hot mode bounds it with the 30s
+  block age cut (§10.3). Stage 1 leaves local mode as it is.
+- A single instant sample of this gauge means nothing. Read it with
+  `max_over_time` or `avg_over_time`.
 
 ## 23. Metrics
 

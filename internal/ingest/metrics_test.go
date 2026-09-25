@@ -1,9 +1,15 @@
 package ingest
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"path/filepath"
 	"reflect"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -78,4 +84,48 @@ func requireNoDebugMetricFields(t *testing.T, m *Metrics) {
 	for i := range typ.NumField() {
 		require.NotContains(t, typ.Field(i).Name, "Debug")
 	}
+}
+
+// TestPendingGaugeIsPartialBlockSawtooth pins what the dashboard expression
+// next_seq - readable_log_durable_seq measures for the steady-state writer: the
+// number of events in the unflushed partial block. It climbs by one per append,
+// reads MaxEventsPerBlock while the full block is being fsynced and committed,
+// and drops to zero once that commit lands. Nothing else moves the durable
+// watermark in steady state, so a low reading is a scrape that landed just
+// after a block cut, not a second flush path (design §22, S1.14).
+func TestPendingGaugeIsPartialBlockSawtooth(t *testing.T) {
+	t.Parallel()
+	const perBlock = 8
+	m := NewMetrics(prometheus.NewRegistry())
+	pending := func() uint64 {
+		return uint64(testutil.ToFloat64(m.NextSeq) - testutil.ToFloat64(m.ReadLogDurableSeq))
+	}
+
+	var atCommit []uint64
+	w, err := Open(Config{
+		SegmentsDir:              filepath.Join(t.TempDir(), "segments"),
+		Store:                    newTestStore(t),
+		SeqKey:                   seqNextKey,
+		ReserveClientVisibleSeqs: true,
+		MaxEventsPerBlock:        perBlock,
+		MaxSegmentBytes:          1 << 30,
+		Logger:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:                  m,
+		OnDurableBatch: func(_ context.Context, _ *pebble.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
+			atCommit = append(atCommit, pending())
+			return nil, nil, nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	require.Zero(t, pending())
+
+	for i := range 3*perBlock + 3 {
+		require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:pending"}))
+		want := uint64((i + 1) % perBlock)
+		require.Equal(t, want, pending(), "append %d", i)
+		require.Equal(t, w.NextSeq()-w.ReadLog().DurableSeq(), pending(), "gauges must track the readable log")
+	}
+	require.Equal(t, []uint64{perBlock, perBlock, perBlock}, atCommit,
+		"the metadata commit sees a full block pending; durable advances only after it")
 }
