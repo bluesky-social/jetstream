@@ -141,6 +141,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return nil, fmt.Errorf("serve: --plan-whole-segment-threshold must be > 0 and <= 1 (PlanWholeSegmentThreshold must be > 0 and <= 1), got %g", opts.PlanWholeSegmentThreshold)
 	}
 
+	if err := opts.Storage.Validate(opts); err != nil {
+		return nil, err
+	}
+
 	processLogger, err := obs.BuildLoggerFromStrings(opts.LogOutput, opts.LogLevel, opts.LogFormat)
 	if err != nil {
 		return nil, err
@@ -159,7 +163,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		"version", info.Version,
 		"commit", info.Commit,
 		"built", info.Date,
+		"storage_mode", opts.Storage.EffectiveMode(),
 	)
+	if opts.Storage.Disaggregated() {
+		logger.Info("storage config", "storage", opts.Storage)
+		return nil, errDisaggregatedUnavailable
+	}
+	if opts.Storage.storageSettingsSet() {
+		logger.Warn("disaggregated storage settings are ignored because JETSTREAM_STORAGE is local", "storage", opts.Storage)
+	}
 
 	rt := &Runtime{
 		opts:          opts,

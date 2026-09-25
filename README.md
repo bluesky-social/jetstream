@@ -66,6 +66,22 @@ just down up  # reset to empty
 
 The environment keeps no state. All data lives in tmpfs, so `just down` discards every table and object. Ports bind to `127.0.0.1` only (Postgres 15432, SeaweedFS 18333, MinIO 19000, MinIO console 19001). To remap them, use a gitignored `compose.override.yaml`. The app credentials only have PutObject, GetObject, and DeleteObject on the `jetstream` bucket, which is all production grants. `just up` verifies this on every run.
 
+To point `serve` at `just up`, select disaggregated storage and pass the connection settings in the environment. The PostgreSQL URL and the S3 keys are secrets, so they never go in `.env`. Jetstream reads the S3 keys from the standard AWS SDK chain, not from a `JETSTREAM_` variable. Disaggregated mode keeps nothing on local disk, so `JETSTREAM_DATA_DIR` must be unset. `.env` sets it, so run the binary directly rather than through `just run`. Compaction must also be off (`JETSTREAM_COMPACTION_INTERVAL=0`) until it supports disaggregated mode:
+
+```sh
+go build -o bin/jetstream ./cmd/jetstream
+env -u JETSTREAM_DATA_DIR \
+  JETSTREAM_STORAGE=disaggregated \
+  JETSTREAM_PG_URL='postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable' \
+  JETSTREAM_S3_ENDPOINT=http://127.0.0.1:18333 JETSTREAM_S3_PATH_STYLE=true \
+  JETSTREAM_S3_REGION=us-east-1 JETSTREAM_S3_BUCKET=jetstream \
+  AWS_ACCESS_KEY_ID=jetstream AWS_SECRET_ACCESS_KEY=jetstream-dev-secret \
+  JETSTREAM_COMPACTION_INTERVAL=0 \
+  ./bin/jetstream serve
+```
+
+For MinIO, use `JETSTREAM_S3_ENDPOINT=http://127.0.0.1:19000`. `jetstream serve --help` lists every storage setting under "Disaggregated storage". Until the disaggregated runtime lands, this configuration is validated and then refused at startup.
+
 To fully reset your local environment (warning: destructive action!):
 
 ```sh

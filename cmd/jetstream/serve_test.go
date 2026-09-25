@@ -61,6 +61,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, ":8080", opts.PublicAddr)
 	require.Equal(t, "", opts.DebugAddr)
 	require.Equal(t, "./data", opts.DataDir)
+	require.Equal(t, jetstreamd.DefaultStorageConfig(), opts.Storage)
 	require.Equal(t, "https://bsky.network", opts.RelayURL)
 	require.Equal(t, "", opts.PLCURL)
 	require.Equal(t, "jetstream", opts.OTelServiceName)

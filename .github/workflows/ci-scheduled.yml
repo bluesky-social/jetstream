@@ -81,6 +81,7 @@ jobs:
           - { package: "./internal/ingest/syncstate", target: FuzzDecodeHostingState }
           - { package: "./internal/ingest/syncstate", target: FuzzHostingStateRoundTrip }
           - { package: "./internal/metastore/pebblestore", target: FuzzBatchSemanticsAgree }
+          - { package: "./internal/pgstore", target: FuzzRedactURL }
           - { package: "./internal/subscribe", target: FuzzEncode }
           - { package: "./internal/subscribe", target: FuzzEncodeV2 }
           - { package: "./internal/subscribe", target: FuzzParseQuery }

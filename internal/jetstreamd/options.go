@@ -50,6 +50,9 @@ type Options struct {
 	PublicAddr string
 	DebugAddr  string
 	DataDir    string
+	// Storage selects local or disaggregated storage. The zero value is
+	// local mode.
+	Storage StorageConfig
 	// StorageFS is the filesystem for Jetstream-owned durable storage under
 	// DataDir (segments + Pebble). Nil uses the host OS filesystem.
 	StorageFS          vfs.FS

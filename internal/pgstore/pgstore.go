@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
@@ -47,6 +48,17 @@ type Config struct {
 	// Metrics may be nil.
 	Metrics *Metrics
 }
+
+// String describes the config with the password redacted.
+func (c Config) String() string {
+	return fmt.Sprintf("pgstore.Config{URL:%q MaxConns:%d}", RedactURL(c.URL), c.MaxConns)
+}
+
+// GoString redacts %#v the same way.
+func (c Config) GoString() string { return c.String() }
+
+// LogValue implements slog.LogValuer with the password redacted.
+func (c Config) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
 // Store is a connection pool to one archive's database.
 type Store struct {
