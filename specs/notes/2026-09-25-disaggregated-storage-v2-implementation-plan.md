@@ -637,7 +637,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
   - Add `JETSTREAM_TEST_` to `knownForeignJetstreamEnvPrefixes`
     (`cmd/jetstream/main.go:74-83`) and update its tests.
   - `just vuln` is clean.
-- [ ] **S2.2 `internal/pgstore`: pool, migrations, schema checks, tx helpers**
+- [x] **S2.2 `internal/pgstore`: pool, migrations, schema checks, tx helpers**
   (M). Deps: S2.1.
   - `migrations/0001_init.sql`: the schema from design §8, exactly. An embedded
     migration runner: apply to an empty DB only, record `schema_version`.
@@ -1223,6 +1223,73 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.2 (2026-09-25): pgstore.**
+  - `migrations/0001_init.sql` is §8 byte for byte, behind a two-line comment
+    header. `TestMigrationMatchesDesign` extracts the design's `sql` block and
+    compares, so the schema cannot drift from the doc.
+  - `Store.Initialize` runs the migrations and inserts the archive row in one
+    transaction under an advisory lock, and refuses a database that already has
+    `archive` (`ErrInitialized`). It creates no segment rows: `storage init`
+    (S2.15) creates segment 0 through a catalog script fenced at epoch 0, which
+    works before any lease exists. This matches `storagefake.New`.
+  - `catalog.FormatVersion` (new) and `pgstore.SchemaVersion` are the compiled
+    constants. `SchemaVersion` must equal the embedded migration count;
+    `storagefake` reuses `catalog.FormatVersion`, and a pgstore test pins its
+    `SchemaVersion` to pgstore's. `CheckVersions` returns
+    `ErrNotInitialized`/`ErrVersionMismatch`.
+  - The plan's `pgstore.ErrSessionEnded` is `catalog.ErrSessionEnded`: every
+    error from a leader `Tx` method, `Begin`, or `Commit` wraps it (and so
+    `leader.ErrRestartSession`), labelled `pgstore <kind>/<statement>`. No
+    retries anywhere. `Rollback` returns nil when the connection is already
+    dead, since the server has rolled back.
+  - Session settings (`statement_timeout` 10s, `lock_timeout` 5s,
+    `idle_in_transaction_session_timeout` 30s, `application_name`) ride in the
+    startup packet via `RuntimeParams`, so they cost no round trip.
+  - `ApplyMeta` sends the §14.2 statements as one `pgx.Batch` (one round
+    trip). A Set run dedupes keys, last write wins, because one `INSERT ... ON
+    CONFLICT` cannot touch a row twice. Nil keys and values become empty
+    `bytea`, never NULL. A `DeleteRange` with a nil end is unbounded.
+  - Other primitives: `InsertObjects` is one unnest insert that maps
+    `RETURNING` rows back by key, since RETURNING order is not guaranteed.
+    `RefCheck` is the §7.4 statement batched with `= ANY`. `DeleteNamespace` is
+    one statement with data-modifying CTEs, and `generation_blocks` go by
+    cascade. Reads order namespaces `COLLATE "C"` so the order is bytewise,
+    matching storagefake, whatever the database collation.
+  - The writer lease (§6.2 SQL, `holder_id` random per process) lives in
+    `pgstore` as `Store.NewLease`, not in `internal/leader`: pgstore imports
+    catalog, which imports leader, so a PG lock in leader would cycle. Design
+    §19.2 was updated. S2.3 adds its contract suite and metrics.
+  - `Listen` uses a dedicated connection outside the pool. The first LISTEN
+    must succeed. After that it reconnects with 100ms→5s backoff, counts
+    `jetstream_pg_listen_reconnects_total`, and drops notifications a slow
+    reader has not taken, as storagefake does.
+  - Metrics: `jetstream_pg_txn_duration_seconds{kind}` (reader transactions
+    use `kind="read"`) and `jetstream_pg_txn_errors_total{kind}`. The spans
+    are `pg.txn`, carrying kind, epoch, and revision (or `fenced`), and
+    `pg.read`, carrying revision.
+  - `pgtest`:
+    - `URL` skips, or fails under `JETSTREAM_TEST_STORAGE_REQUIRED=1`.
+    - `NewDatabase` creates `jst_<random>`, grants `jetstream_reader` CONNECT,
+      USAGE, and default SELECT when that role exists, and drops the database
+      `WITH (FORCE)` in cleanup.
+    - `Open` returns an initialized, version-checked store.
+    - `Proxy` parses just enough of the wire protocol to find message
+      boundaries. `KillAll` kills connections mid-transaction.
+      `DropCommitResponse` forwards the next simple-protocol `COMMIT` (pgx's
+      `Tx.Commit`), swallows the reply through ReadyForQuery, and closes the
+      connection.
+  - Results against `just up` (PostgreSQL 18):
+    - `catalogtest.Run` passes all 19 contract tests on PostgreSQL unchanged,
+      the first real evidence that storagefake's semantics match.
+    - Also covered: result-unknown commits (the data is durable and the error
+      ends the session), a killed transaction releasing the row lock, listener
+      reconnect, session settings, version checks, atomic init, and URL
+      redaction in parse errors.
+    - The package runs in about 1.3s under race. Without the env var it skips
+      and runs only the pure tests.
+  - `github.com/jackc/puddle/v2` is new in go.mod as pgxpool's own
+    dependency, not a new direct dependency.
 
 - **S2.7 (2026-09-25): storagefake.**
   - Each committed state is a set of copy-on-write tables (`layer`), frozen

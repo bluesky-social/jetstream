@@ -7,6 +7,11 @@ import (
 	"github.com/bluesky-social/jetstream/internal/metastore"
 )
 
+// FormatVersion is archive.format_version, the storage layout version this
+// binary reads and writes. A pod refuses an archive with any other value
+// (design §8).
+const FormatVersion = 1
+
 // DB opens catalog transactions (plan D1). Implementations: pgstore (SQL
 // against PostgreSQL) and storagefake (in-memory tables with PostgreSQL's
 // locking and visibility). The transaction scripts in this package run over

@@ -1546,8 +1546,10 @@ exercising the same writer, sealer, compaction, and reader code.
 ### 19.2 New packages
 
 ```
-internal/leader/      election loop, PG lease (streaming.DistributedLocker)
-internal/pgstore/     pgx pool, migrations, fence helper, schema checks
+internal/leader/      election loop, Locker interface
+internal/pgstore/     pgx pool, migrations, schema checks, catalog.DB in SQL,
+                      PG lease (leader.Locker; here, not in leader, because
+                      pgstore -> catalog -> leader would otherwise cycle)
 internal/objstore/    ObjectStore interface, S3 impl, in-memory fake, fault injection
 internal/metastore/   Store interface, pebble and pg impls, in-memory fake
 internal/catalog/     Catalog interface, local impl, pg impl, follower, mirror

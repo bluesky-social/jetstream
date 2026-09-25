@@ -33,9 +33,10 @@ import (
 	"github.com/bluesky-social/jetstream/internal/catalog"
 )
 
-// Compiled schema constants, as pgstore records them.
+// Compiled schema constants, as pgstore records them. pgstore's tests check
+// SchemaVersion against pgstore.SchemaVersion.
 const (
-	FormatVersion = 1
+	FormatVersion = catalog.FormatVersion
 	SchemaVersion = 1
 )
 
