@@ -74,6 +74,7 @@ jobs:
         include:
           - { package: ".", target: FuzzDecodeLiveFrame }
           - { package: ".", target: FuzzDecodeRecordMapEquivalence }
+          - { package: "./internal/catalog", target: FuzzDecodeHotBatch }
           - { package: "./internal/ingest/live", target: FuzzLoadUpstreamCursor }
           - { package: "./internal/ingest/live", target: FuzzUpstreamCursorRoundTrip }
           - { package: "./internal/ingest/syncstate", target: FuzzChainStateRoundTrip }
@@ -91,6 +92,7 @@ jobs:
           - { package: "./segment", target: FuzzBuildSealed }
           - { package: "./segment", target: FuzzDecodeBlock }
           - { package: "./segment", target: FuzzDecodeBlockFromCompressed }
+          - { package: "./segment", target: FuzzOpenReaderParts }
           - { package: "./segment", target: FuzzReadBlockIndex }
           - { package: "./segment", target: FuzzReadCollectionIndex }
           - { package: "./segment", target: FuzzReadHeader }

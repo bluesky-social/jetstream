@@ -161,19 +161,9 @@ func (m *Maintainer) decodeHot(ctx context.Context, rows []catalog.HotBatchRow) 
 						row.FirstSeq, row.LastSeq, row.ObjectID, err)
 				}
 			}
-			evs, err := segment.DecodeBlockFrame(frame)
+			evs, err := catalog.DecodeHotBatch(row, frame)
 			if err != nil {
-				return catalog.Corruptf(catalog.SourceHotBatch, "hot batch [%d,%d]: %v", row.FirstSeq, row.LastSeq, err)
-			}
-			if uint64(len(evs)) != row.LastSeq-row.FirstSeq+1 || len(evs) != int(row.EventCount) {
-				return catalog.Corruptf(catalog.SourceHotBatch, "hot batch [%d,%d] (%d events) decodes to %d events",
-					row.FirstSeq, row.LastSeq, row.EventCount, len(evs))
-			}
-			for j := range evs {
-				if want := row.FirstSeq + uint64(j); evs[j].Seq != want {
-					return catalog.Corruptf(catalog.SourceHotBatch, "hot batch [%d,%d] holds seq %d where %d belongs",
-						row.FirstSeq, row.LastSeq, evs[j].Seq, want)
-				}
+				return err
 			}
 			out[i] = hotBatch{row: row, events: evs}
 			return nil
