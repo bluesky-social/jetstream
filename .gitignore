@@ -51,3 +51,6 @@ oracle-artifacts/
 # Local binaries built at the repo root (`go build ./cmd/...`, testing/dicttrain)
 /client
 /dicttrain
+
+# direnv
+.direnv

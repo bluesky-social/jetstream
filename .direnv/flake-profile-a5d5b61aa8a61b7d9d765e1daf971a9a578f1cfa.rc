@@ -43,7 +43,7 @@ NIX_ENFORCE_NO_NATIVE='1'
 export NIX_ENFORCE_NO_NATIVE
 NIX_HARDENING_ENABLE='bindnow format fortify fortify3 libcxxhardeningfast pic relro stackclashprotection stackprotector strictflexarrays1 strictoverflow zerocallusedregs'
 export NIX_HARDENING_ENABLE
-NIX_LDFLAGS='-rpath /home/jcalabro/go/src/github.com/bluesky-social/jetstream/outputs/out/lib  -L/nix/store/fp44fypr19g4fb8g56yml16n3rb2wa3h-file-5.47/lib -L/nix/store/fp44fypr19g4fb8g56yml16n3rb2wa3h-file-5.47/lib'
+NIX_LDFLAGS='-rpath /home/jcalabro/go/src/github.com/bluesky-social/jetstream-2/outputs/out/lib  -L/nix/store/fp44fypr19g4fb8g56yml16n3rb2wa3h-file-5.47/lib -L/nix/store/fp44fypr19g4fb8g56yml16n3rb2wa3h-file-5.47/lib'
 export NIX_LDFLAGS
 NIX_NO_SELF_RPATH='1'
 NIX_STORE='/nix/store'
@@ -138,7 +138,7 @@ name='nix-shell-env'
 export name
 nativeBuildInputs='/nix/store/sygirccm5jjxdck4pqdvck6142qrcjr6-go-1.26.6 /nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0 /nix/store/4q0ksvaggh0zb50jmff9vr929b0z3r6f-just-1.55.1 /nix/store/m603r58ddjs3xbj71bicbxxdhj672v0r-file-5.47-dev /nix/store/72jdrx1l452qdp5d2zxj79r3czcaxrav-docker-29.6.0 /nix/store/shzwfwjnxjpyyz3nvz22fg4gqw4xbyr4-golangci-lint-2.10.1 /nix/store/yzvkikk5dvly5gz5ianjz0j2gpr156f7-gotestsum-1.13.0 /nix/store/2r583m9ngrisf9nx6i12fwvpr5g3as0i-govulncheck-1.5.0 /nix/store/hb7xp1znl2lj2q8p3kn2h9qgkr2kn4p1-modernize-0.20.0'
 export nativeBuildInputs
-out='/home/jcalabro/go/src/github.com/bluesky-social/jetstream/outputs/out'
+out='/home/jcalabro/go/src/github.com/bluesky-social/jetstream-2/outputs/out'
 export out
 outputBin='out'
 outputDev='out'
@@ -169,7 +169,7 @@ preConfigurePhases=' updateAutotoolsGnuConfigScriptsPhase'
 declare -a preFixupHooks=('_moveToShare' '_multioutDocs' '_multioutDevs' )
 preferLocalBuild='1'
 export preferLocalBuild
-prefix='/home/jcalabro/go/src/github.com/bluesky-social/jetstream/outputs/out'
+prefix='/home/jcalabro/go/src/github.com/bluesky-social/jetstream-2/outputs/out'
 declare -a propagatedBuildDepFiles=('propagated-build-build-deps' 'propagated-native-build-inputs' 'propagated-build-target-deps' )
 propagatedBuildInputs=''
 export propagatedBuildInputs
