@@ -26,6 +26,32 @@ type SegmentSource interface {
 	PlanSnapshot(manifest.PlanSnapshotRequest) (manifest.PlanSnapshotResult, error)
 }
 
+// SeqSyncer brings a pod's view of the archive up to seq before a request
+// is answered from it. The disaggregated catalog follower implements it with
+// a synchronous tick when seq is past its mirror (design §11.6), so a client
+// that learned of seq on a fresher pod is not planned short of it.
+type SeqSyncer interface {
+	SyncSeq(ctx context.Context, seq uint64) error
+}
+
+// DefaultMaxArchiveResponseDuration bounds one getSegment or getBlock
+// response in disaggregated mode (JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION).
+const DefaultMaxArchiveResponseDuration = time.Hour
+
+// CheckGCDelay reports whether GC_DELAY outlives every reader of a replaced
+// generation's objects (design §11.5): a pod may serve a view up to
+// maxViewAge old, and an open response may read from it for up to
+// maxResponse more, so objects must survive both plus a margin for clock
+// skew and scheduling.
+func CheckGCDelay(gcDelay, maxViewAge, maxResponse time.Duration) error {
+	const margin = 10 * time.Minute
+	if need := maxViewAge + maxResponse + margin; gcDelay <= need {
+		return fmt.Errorf("GC delay %s must exceed max view age %s + max archive response duration %s + %s",
+			gcDelay, maxViewAge, maxResponse, margin)
+	}
+	return nil
+}
+
 // Server builds the XRPC handler tree for the jetstream lexicons.
 type Server struct {
 	src    SegmentSource
@@ -42,6 +68,10 @@ type Server struct {
 //
 // Ready runs at the start of every archive request and turns an error into a
 // 503, for example during bootstrap or manifest startup.
+//
+// MaxResponseDuration, when positive, cuts off a getSegment or getBlock
+// response that runs longer; zero leaves responses unbounded. Sync, when set,
+// runs before planSnapshot plans against a seq the request names.
 type Config struct {
 	Src                  SegmentSource
 	Opener               SegmentOpener
@@ -52,6 +82,8 @@ type Config struct {
 	Plan                 PlanConfig
 	Metrics              *Metrics
 	Tracer               trace.Tracer
+	MaxResponseDuration  time.Duration
+	Sync                 SeqSyncer
 
 	// Dictionary is the v2 subscribe compression dictionary served by
 	// getZstdDictionary. Empty Bytes leaves the endpoint unregistered.
@@ -70,16 +102,16 @@ func New(cfg Config) *Server {
 	}
 	s := &Server{src: cfg.Src, logger: logger, xrpc: &xrpcserver.Server{}}
 	s.xrpc.HandleQuery(getSegmentNSID, withReady(cfg.Ready, &getSegmentHandler{
-		opener: opener, logger: logger,
+		opener: opener, logger: logger, maxDuration: cfg.MaxResponseDuration,
 		compactionCacheGrace: cfg.CompactionCacheGrace, compactionDeadline: cfg.CompactionDeadline,
 	}))
 	s.xrpc.HandleQuery(getBlockNSID, withReady(cfg.Ready, &getBlockHandler{
-		opener: opener, logger: logger,
+		opener: opener, logger: logger, maxDuration: cfg.MaxResponseDuration,
 		compactionCacheGrace: cfg.CompactionCacheGrace, compactionDeadline: cfg.CompactionDeadline,
 		metrics: cfg.Metrics, tracer: cfg.Tracer,
 	}))
 	s.xrpc.HandleQuery("network.bsky.jetstream.listSegments", withReady(cfg.Ready, newListSegmentsHandler(cfg.Src)))
-	s.xrpc.HandleProcedure("network.bsky.jetstream.planSnapshot", withReady(cfg.Ready, newPlanSnapshotHandler(cfg.Src, cfg.Plan)))
+	s.xrpc.HandleProcedure("network.bsky.jetstream.planSnapshot", withReady(cfg.Ready, newPlanSnapshotHandler(cfg.Src, cfg.Plan, cfg.Sync)))
 
 	// The v2 subscribe compression dictionary. Deliberately NOT behind the
 	// readiness gate: the artifact is compiled in and immutable, and a
@@ -96,6 +128,20 @@ func New(cfg Config) *Server {
 // Mount it at "/xrpc/" on the public mux.
 func (s *Server) Handler() http.Handler {
 	return s.xrpc
+}
+
+// responseDeadline bounds a response to d when d is positive: ctx ends, so
+// object reads stop, and the connection's write deadline is set, so a
+// stalled client cannot hold the response open either. Pinning a generation
+// is only safe for GC_DELAY, so no response may outlive it (design §11.5).
+// The write deadline is best-effort: a wrapping ResponseWriter that cannot
+// reach the connection leaves only the ctx cutoff.
+func responseDeadline(ctx context.Context, w http.ResponseWriter, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return ctx, func() {}
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d))
+	return context.WithTimeout(ctx, d)
 }
 
 func withReady(ready lifecycle.Readiness, h xrpcserver.Handler) xrpcserver.Handler {

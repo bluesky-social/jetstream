@@ -20,8 +20,16 @@ import (
 // ref is the same atomic.Pointer the orchestrator publishes its steady-state
 // writer into. Before steady-state it holds nil and we return no pending
 // events; the verification path tolerates that (it reflects on-disk state).
+//
+// A disaggregated pod passes a nil ref and never has pending events: it
+// reads only committed batches, which its catalog follower already serves
+// to repo export (design §11), and it holds no writer whose uncommitted
+// events it could add.
 func pendingEventsForDID(ref *atomic.Pointer[ingest.Writer]) func(did string) []segment.Event {
 	return func(did string) []segment.Event {
+		if ref == nil {
+			return nil
+		}
 		w := ref.Load()
 		if w == nil {
 			return nil

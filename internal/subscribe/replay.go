@@ -199,28 +199,30 @@ func (w *walker) pass(ctx context.Context, view catalog.CatalogView, emit func(*
 	return nil
 }
 
-// decodeRef returns the block's events wrapped as entries. Sealed blocks go
-// through the cache when there is one, and come back as the block's SHARED
-// entries (memoized encodes and compressed frames are reused across every
-// cold subscriber). Active blocks, and every block without a cache, get
-// fresh per-call wrappers over a private decode: the active tail is thin
-// relative to a deep replay, and it is only immutable until its segment is
-// sealed.
+// decodeRef returns the block's events wrapped as entries. Cacheable blocks
+// (see blockCache.key) go through the cache when there is one, and come back
+// as the block's SHARED entries (memoized encodes and compressed frames are
+// reused across every cold subscriber). Other blocks, and every block
+// without a cache, get fresh per-call wrappers over a private decode: in
+// local mode that is the active tail, which is thin relative to a deep
+// replay and only immutable until its segment is sealed.
 func decodeRef(ctx context.Context, cache *blockCache, f catalog.Fetcher, ref catalog.BlockRef) ([]*Entry, error) {
-	if cache == nil || ref.Generation == 0 {
-		events, err := catalog.DecodeRef(ctx, f, ref)
-		if err != nil {
-			return nil, err
+	if cache != nil {
+		if key, ok := cache.key(ref); ok {
+			return cache.getOrDecode(key, func() ([]segment.Event, error) {
+				return catalog.DecodeRef(ctx, f, ref)
+			})
 		}
-		entries := make([]*Entry, len(events))
-		for i := range events {
-			entries[i] = newEntry(&events[i])
-		}
-		return entries, nil
 	}
-	return cache.getOrDecode(cache.keyForRef(ref), func() ([]segment.Event, error) {
-		return catalog.DecodeRef(ctx, f, ref)
-	})
+	events, err := catalog.DecodeRef(ctx, f, ref)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]*Entry, len(events))
+	for i := range events {
+		entries[i] = newEntry(&events[i])
+	}
+	return entries, nil
 }
 
 // DefaultBlockCacheBytes bounds the shared decoded-block cache for the cold
@@ -232,13 +234,21 @@ const DefaultBlockCacheBytes = 64 << 20
 // steady-state begins; before then a cold read returns errColdUnavailable.
 // The writer supplies the readable-log floor and the durable gap registry;
 // the catalog and fetcher supply the blocks.
+//
+// A disaggregated pod has no writer: it sets Floor instead of WriterRef,
+// and Keyer to cache blocks by content (design §11.4). Its seqs have no
+// registered gaps.
 type ColdReaderConfig struct {
 	Catalog catalog.Catalog
 	Fetcher catalog.Fetcher
 	// Ready, when non-nil, gates reads on the catalog's initial load: a view
 	// taken before it would be missing sealed segments. Read blocks on it.
-	Ready           func(context.Context) error
-	WriterRef       *atomic.Pointer[ingest.Writer]
+	Ready     func(context.Context) error
+	WriterRef *atomic.Pointer[ingest.Writer]
+	// Floor, used when WriterRef is nil, returns the readable log's floor,
+	// or ok=false while there is no log yet.
+	Floor           func() (floor uint64, ok bool)
+	Keyer           BlockKeyer
 	BlockCacheBytes int // 0 -> DefaultBlockCacheBytes
 	Metrics         *Metrics
 }
@@ -254,6 +264,7 @@ type ColdReader struct {
 	fetcher   catalog.Fetcher
 	ready     func(context.Context) error
 	writerRef *atomic.Pointer[ingest.Writer]
+	floor     func() (uint64, bool)
 	cache     *blockCache
 	metrics   *Metrics
 }
@@ -267,12 +278,15 @@ func NewColdReader(cfg ColdReaderConfig) *ColdReader {
 	if bytes <= 0 {
 		bytes = DefaultBlockCacheBytes
 	}
+	cache := newBlockCache(bytes)
+	cache.keyer = cfg.Keyer
 	return &ColdReader{
 		catalog:   cfg.Catalog,
 		fetcher:   cfg.Fetcher,
 		ready:     cfg.Ready,
 		writerRef: cfg.WriterRef,
-		cache:     newBlockCache(bytes),
+		floor:     cfg.Floor,
+		cache:     cache,
 		metrics:   cfg.Metrics,
 	}
 }
@@ -287,14 +301,27 @@ func (r *ColdReader) InvalidateSegment(idx uint64) {
 	r.cache.invalidateSegment(idx)
 }
 
+// floorAndGaps returns the readable log's floor and the durable gap
+// registry, or ok=false before there is a log to hand off to.
+func (r *ColdReader) floorAndGaps() (uint64, *seqspace.Gaps, bool) {
+	if r.writerRef != nil {
+		w := r.writerRef.Load()
+		if w == nil {
+			return 0, nil, false
+		}
+		return w.ReadLog().FloorSeq(), w.SeqGaps(), true
+	}
+	if r.floor != nil {
+		floor, ok := r.floor()
+		return floor, nil, ok
+	}
+	return 0, nil, false
+}
+
 // Read serves a bounded batch from the archive, stopping after max entries
 // and returning the next cursor so the subscriber loop resumes contiguously.
 func (r *ColdReader) Read(ctx context.Context, cursor uint64, max int) ([]*Entry, uint64, error) {
-	if r == nil || r.writerRef == nil || r.catalog == nil {
-		return nil, cursor, errColdUnavailable
-	}
-	w := r.writerRef.Load()
-	if w == nil {
+	if r == nil || r.catalog == nil {
 		return nil, cursor, errColdUnavailable
 	}
 	if r.ready != nil {
@@ -302,11 +329,14 @@ func (r *ColdReader) Read(ctx context.Context, cursor uint64, max int) ([]*Entry
 			return nil, cursor, fmt.Errorf("subscribe: catalog load: %w", err)
 		}
 	}
-	batch := make([]*Entry, 0, max)
-	next := cursor
 	// The floor is read before WalkFromCursor takes its view, so every seq
 	// below it is in that view.
-	floor := w.ReadLog().FloorSeq()
+	floor, gaps, ok := r.floorAndGaps()
+	if !ok {
+		return nil, cursor, errColdUnavailable
+	}
+	batch := make([]*Entry, 0, max)
+	next := cursor
 	var onGapJump func(start, end uint64)
 	if r.metrics != nil {
 		onGapJump = r.metrics.incGapJump
@@ -317,7 +347,7 @@ func (r *ColdReader) Read(ctx context.Context, cursor uint64, max int) ([]*Entry
 		Catalog:    r.catalog,
 		Fetcher:    r.fetcher,
 		BlockCache: r.cache,
-		Gaps:       w.SeqGaps(),
+		Gaps:       gaps,
 		OnGapJump:  onGapJump,
 	}, func(e *Entry) error {
 		// Sealed-region entries arrive SHARED from the block cache (the #295

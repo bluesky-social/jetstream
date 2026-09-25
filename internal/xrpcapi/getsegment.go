@@ -21,6 +21,7 @@ import (
 type getSegmentHandler struct {
 	opener               SegmentOpener
 	logger               *slog.Logger
+	maxDuration          time.Duration
 	compactionCacheGrace time.Duration
 	compactionDeadline   CompactionDeadline
 }
@@ -35,6 +36,9 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 	if !ok {
 		return xrpcserver.InvalidRequest("malformed segment name")
 	}
+
+	ctx, cancel := responseDeadline(ctx, w, h.maxDuration)
+	defer cancel()
 
 	// Open BEFORE writing anything, so failures become XRPC error envelopes
 	// rather than a corrupt partial 200 response. Download validators come

@@ -10,8 +10,9 @@ import (
 
 // blockKey identifies one immutable decoded block. id is opaque: any
 // comparable value that names the block's bytes exactly. Local mode uses
-// localBlockID; disaggregated mode will use the object's SHA-256 (S2.14).
-// seg and epoch serve invalidateSegment, which is local-only.
+// localBlockID; disaggregated mode uses the BlockKeyer's content key (the
+// object's SHA-256, or an inline frame's first seq and SHA-256). seg and
+// epoch serve invalidateSegment, which is local-only.
 type blockKey struct {
 	id    any
 	seg   uint64
@@ -38,6 +39,10 @@ type localBlockID struct {
 // lazily-memoized bodies back to the cache budget via Entry.grow, so a cold
 // zstd replay storm cannot silently inflate the cache past maxBytes.
 type blockCache struct {
+	// keyer, when set, replaces keyForRef's positional keys. Set before
+	// first use.
+	keyer BlockKeyer
+
 	mu       sync.Mutex
 	maxBytes int
 	curBytes int
@@ -84,6 +89,32 @@ func newBlockCache(maxBytes int) *blockCache {
 
 		epochBySegment: make(map[uint64]uint64),
 	}
+}
+
+// BlockKeyer names blocks by content for the decoded block cache. ok=false
+// means the block's bytes can change under its ref, so it is decoded
+// directly and never cached. The disaggregated catalog follower implements
+// it.
+type BlockKeyer interface {
+	BlockCacheKey(ref catalog.BlockRef) (key any, ok bool)
+}
+
+// key returns ref's cache key, or ok=false if ref must not be cached.
+// Without a keyer, a block is cacheable once sealed (Generation != 0).
+func (c *blockCache) key(ref catalog.BlockRef) (blockKey, bool) {
+	if c.keyer == nil {
+		if ref.Generation == 0 {
+			return blockKey{}, false
+		}
+		return c.keyForRef(ref), true
+	}
+	id, ok := c.keyer.BlockCacheKey(ref)
+	if !ok {
+		return blockKey{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return blockKey{id: id, seg: ref.Segment, epoch: c.epochBySegment[ref.Segment]}, true
 }
 
 func (c *blockCache) keyForRef(ref catalog.BlockRef) blockKey {

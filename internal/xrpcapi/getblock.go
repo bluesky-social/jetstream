@@ -28,6 +28,7 @@ import (
 type getBlockHandler struct {
 	opener               SegmentOpener
 	logger               *slog.Logger
+	maxDuration          time.Duration
 	compactionCacheGrace time.Duration
 	compactionDeadline   CompactionDeadline
 	metrics              *Metrics
@@ -76,6 +77,9 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 			attribute.Int("block.index", blockIdx))
 	}
 
+	ctx, cancel := responseDeadline(ctx, w, h.maxDuration)
+	defer cancel()
+
 	// The block bytes, block count, and ETag MUST all come from this single
 	// SegmentFile. Never take the offset or checksum from the in-memory
 	// manifest: during a compaction rename→refresh window it can be stale, and
@@ -109,7 +113,22 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 
 	var content io.ReadSeeker
 	var contentSize int64
-	if isHeadRequest(r.HTTPReq) {
+	if bf, ok := f.(blockFramer); ok {
+		// Each block is its own object: HEAD reads nothing, and GET reads
+		// the whole verified object rather than a footer entry and a range.
+		if isHeadRequest(r.HTTPReq) {
+			section := bf.BlockFrameSection(blockIdx)
+			content, contentSize = section, section.Size()
+		} else {
+			frame, err := bf.BlockFrame(blockIdx)
+			if err != nil {
+				h.logger.Error("getBlock: read block object failed",
+					slog.String("name", name), slog.Int("block", blockIdx), slog.Any("err", err))
+				return fail(resultError, xrpcserver.InternalError("failed to read block"))
+			}
+			content, contentSize = bytes.NewReader(frame), int64(len(frame))
+		}
+	} else if isHeadRequest(r.HTTPReq) {
 		// HEAD needs only the validated footer entry and virtual frame range;
 		// do not allocate a buffer proportional to the compressed frame.
 		section, err := segment.BlockFrameSection(f, hdr, blockIdx)

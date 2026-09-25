@@ -108,4 +108,9 @@ func (r *statusRecorder) ReadFrom(src io.Reader) (int64, error) {
 	return io.Copy(r.ResponseWriter, src)
 }
 
+// Unwrap exposes the underlying writer to http.ResponseController, so a
+// handler can set per-response deadlines (the archive response cutoff)
+// through the middleware.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 var errHijackUnsupported = errors.New("underlying ResponseWriter does not implement http.Hijacker")

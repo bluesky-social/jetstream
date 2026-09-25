@@ -20,6 +20,12 @@ func TestPendingEventsForDID_NilWriterReturnsNil(t *testing.T) {
 	require.Nil(t, get("did:plc:anything"))
 }
 
+func TestPendingEventsForDID_DisaggregatedReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, pendingEventsForDID(nil)("did:plc:anything"))
+}
+
 func TestPendingEventsForDID_ReturnsUnflushedEventsFilteredByDID(t *testing.T) {
 	t.Parallel()
 

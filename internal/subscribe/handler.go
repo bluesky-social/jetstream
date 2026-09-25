@@ -21,6 +21,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 )
@@ -58,8 +59,13 @@ type Subscription struct {
 	// pattern where the orchestrator publishes the writer pointer
 	// after steady-state begins.
 	WriterRef *atomic.Pointer[ingest.Writer]
-	Logger    *slog.Logger
-	Metrics   *Metrics
+	// Seqs, when non-nil, supersedes Writer and WriterRef as the seq state
+	// cursor resolution reads. A disaggregated pod sets it to its catalog
+	// follower, which has no writer; if Seqs is also a SeqSyncer, a seq
+	// cursor past its view syncs before it is resolved (design §11.6).
+	Seqs    SeqSource
+	Logger  *slog.Logger
+	Metrics *Metrics
 
 	// Lookback is the cursor-replay clamp duration. Zero disables
 	// cursor replay entirely (cursors are silently dropped to live).
@@ -81,11 +87,36 @@ type eventFilter interface {
 	MaxMessageSizeBytes() uint32
 }
 
+// SeqSource is the seq state cursor resolution reads. *ingest.Writer
+// implements it in local mode, the catalog follower in disaggregated mode.
+type SeqSource interface {
+	NextSeq() uint64
+	SeqGaps() *seqspace.Gaps
+	ActiveTimeFloorSeq(timeUS int64) uint64
+}
+
+// SeqSyncer brings a SeqSource's view up to seq, so a client that saw seq
+// on a fresher pod is not told its cursor is in the future.
+type SeqSyncer interface {
+	SyncSeq(ctx context.Context, seq uint64) error
+}
+
 func (d Subscription) writer() *ingest.Writer {
 	if d.WriterRef != nil {
 		return d.WriterRef.Load()
 	}
 	return d.Writer
+}
+
+// seqs returns the request's SeqSource, or nil before one is available.
+func (d Subscription) seqs() SeqSource {
+	if d.Seqs != nil {
+		return d.Seqs
+	}
+	if w := d.writer(); w != nil {
+		return w
+	}
+	return nil
 }
 
 func NewHandler(deps Subscription) http.Handler {
@@ -237,7 +268,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		// cursor parameter and serve live tip; a documented operator
 		// choice, not a silent gap.
 		cursorPlan = CursorPlan{Mode: ModeLive}
-	case deps.Manifest == nil || deps.writer() == nil:
+	case deps.Manifest == nil || deps.seqs() == nil:
 		// Cursor lookback is enabled but the replay dependencies aren't
 		// available. The dominant case is the steady-state warmup window:
 		// the phase marker is durable (we passed the Ready gate above) but
@@ -270,17 +301,26 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 			httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", fmt.Sprintf("service not ready: manifest warming up: %s", err.Error()))
 			return
 		}
-		writer := deps.writer()
+		seqs := deps.seqs()
+		if syncer, ok := seqs.(SeqSyncer); ok {
+			if n, err := strconv.ParseUint(rawCursor, 10, 64); err == nil && n < CursorSeqMaxThreshold {
+				if err := syncer.SyncSeq(r.Context(), n); err != nil {
+					deps.Metrics.incCursorRequests("unavailable")
+					httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: archive view is behind the cursor")
+					return
+				}
+			}
+		}
 		resolveStart := time.Now()
 		plan, err := ResolveCursor(rawCursor, CursorEnv{
 			Manifest:         deps.Manifest,
 			Catalog:          deps.Catalog,
 			Fetcher:          deps.Fetcher,
-			NextSeq:          writer.NextSeq(),
-			Gaps:             writer.SeqGaps(),
+			NextSeq:          seqs.NextSeq(),
+			Gaps:             seqs.SeqGaps(),
 			Lookback:         deps.Lookback,
 			RejectBelowFloor: deps.V2,
-			ActiveTimeFloor:  writer.ActiveTimeFloorSeq,
+			ActiveTimeFloor:  seqs.ActiveTimeFloorSeq,
 		})
 		deps.Metrics.observeCursorResolveSeconds(time.Since(resolveStart).Seconds())
 		if err != nil {

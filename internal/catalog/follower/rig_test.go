@@ -119,7 +119,7 @@ func (r *rig) commitHot(n int, pointer bool) {
 		r.events = append(r.events, segment.Event{
 			Seq: seq, WitnessedAt: now, Kind: segment.KindCreate,
 			DID: fmt.Sprintf("did:plc:%d", seq%7), Collection: "app.bsky.feed.post",
-			Rkey: fmt.Sprint(seq), Rev: "r", Payload: []byte{0xa1, 0x61, byte(seq)},
+			Rkey: fmt.Sprint(seq), Rev: "r", Payload: []byte{0xa1, 0x61, 0x61, byte(seq % 24)},
 		})
 	}
 	hi := uint64(len(r.events))
