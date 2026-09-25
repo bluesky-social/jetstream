@@ -950,7 +950,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
   - Determinism test (D4): the same seed produces the same trace.
   - `specs/oracle.md`: add the tier, what it proves and does not prove (it
     cannot prove real PG/S3 semantics; layer 4 does).
-- [ ] **S2.19 Stage 2 mutants** (M). Deps: S2.18.
+- [x] **S2.19 Stage 2 mutants** (M). Deps: S2.18.
   - Add, each with header fields (`expected-tier: disagg`) written before the
     first run:
     - skip the fence (in the `catalog` script, D1);
@@ -1223,6 +1223,25 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.19 (2026-09-25): stage 2 mutants and the `disagg` tier.**
+  - Eight mutants, m062–m069: the five the plan names, the two recommended
+    ones, and m069 for the verifier-state durability bug that S2.18 fixed
+    (specs/oracle/2026-09-25-disagg-syncstate-batch-boundary.md). m068
+    removes the reference check in the shared `resolve`, so it covers every
+    script, not only `CommitHotBatch`.
+  - `run.sh` tier `disagg`: the layer 3 oracle on seeds 1–8 plus the
+    catalog script, follower, hot-writer, and syncstate unit suites. About
+    2s, no containers.
+  - The oracle killed six of eight. m067 and m068 are unit-only by design:
+    correct leaders never send a wrong seq or a missing reference.
+  - m065 survived the oracle's first run: the `BlockMaxAge` fold revealed the
+    hidden batch inside the 2-minute converge wait. The oracle now requires
+    pods to serve a complete catalog that has stopped changing within
+    `disaggServeTimeout` (10s of fake time). No production change.
+  - The full baseline (`just mutation-baseline`, disposable worktree at
+    `87b0384`) killed all 60 active mutants. RESULTS.md has the dated section
+    and the catalog line.
 
 - **S2.18 (2026-09-25): layer 3 oracle, steady state with failover.**
   - `internal/oracle/disagg_oracle_test.go`:

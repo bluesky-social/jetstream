@@ -5,11 +5,12 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 52 active mutants on disk
-(m001–m061; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
-union baseline after issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
+**Current catalog (keep this line current): 60 active mutants on disk
+(m001–m069; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
+union baseline after disaggregated-storage coverage (Stage 2 S2.19, m062–m069),
+issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **52 killed, 0 survived,
+coverage: **60 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
@@ -22,6 +23,9 @@ relay-gap/direct routing, and discovery-time PDS attribution.
 m056–m061 cover abandoned-lease recovery, renewal, durable gap registration,
 cross-segment and same-segment unregistered replay holes, and non-terminal
 drain semantics.
+m062–m069 cover disaggregated storage: fencing, fold, the hot-batch relay
+cursor, follower serving, seal order, the commit scripts' seq and reference
+checks, and verifier state durability (the `disagg` tier).
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -72,6 +76,48 @@ The baseline's `disposition` field is the coarse verdict
 tier/seed detail the gate ignores. A seed-sensitive mutant (e.g. m002) is
 recorded by its full-campaign fixed-seed disposition; the gate does not re-run
 seed sweeps.
+
+## Campaign 2026-09-25 — `disagg` tier; m062–m069 (Stage 2 S2.19)
+
+Targeted campaign, then a full-catalog baseline, both in the disposable clean
+worktree at `87b0384`. The new `disagg` tier runs the layer 3 disaggregated
+oracle (`TestDisagg_Oracle`, full mode, seeds 1–8, every scheduled fault) and
+the catalog, follower, hot-writer and syncstate unit suites that pin the same
+contracts. It takes about 2s. Each `expected-tier` was written before the
+first run. The full baseline killed all 60 active mutants, with zero
+survivors, stale patches, or build-broken mutants.
+
+| mutant | result | what killed it |
+|---|---|---|
+| m062_stale_leader_fence_ignored | KILLED@disagg | oracle 8/8 seeds: per-revision catalog invariants and seq corruption from the deposed leader's interleaved writes; `TestScripts_FenceLost` |
+| m063_fold_leaves_first_hot_batch | KILLED@disagg | oracle 8/8: a folded batch left in `hot_batches` overlaps its block, and the fold fails loud; `TestScripts_HappyPath` and others |
+| m064_relay_cursor_per_block | KILLED@disagg | oracle 8/8: events archived twice after failover (relay/cursor lagged the committed rows); `TestConsumer_Hot_ChainStateCommitsWithLastRow`, `TestConsumer_Hot_SplitCommitRelayCursor` |
+| m065_follower_hides_newest_hot_batch | KILLED@disagg | oracle 8/8 after the serve bound below; `TestFollower_*` |
+| m066_seal_reverses_block_order | KILLED@disagg | oracle 8/8: the follower reports corruption at first catalog load; `TestServe_*` |
+| m067_hot_batch_seq_check_skipped | KILLED@disagg | unit only: `TestScripts_SeqMismatch`, `TestScripts_SeqKeyCorrupt` |
+| m068_reference_check_skipped | KILLED@disagg | unit only: `TestScripts_MissingReference` |
+| m069_sync_state_promoted_after_append | KILLED@disagg | oracle 8/8: a whole event archived twice after a leader crash; `TestConsumer_Hot_ChainStateCommitsWithLastRow` |
+
+Notes:
+
+- **m065 prediction miss.** It was predicted as an oracle kill, but the first
+  run survived the oracle: the hidden newest hot batch reappeared when the 30s
+  `BlockMaxAge` fold turned it into a block, well inside the 2-minute converge
+  wait. The oracle now bounds serving (`disaggServeTimeout`, 10s of fake
+  time). Once the catalog holds every model row and stops changing, pods must
+  serve them within the bound, or the run fails. That kills m065 on every
+  seed. Production code was not changed.
+- **m067 and m068 are unit-only by design.** The oracle's leaders never send
+  a hot batch at the wrong seq or reference a missing object, so the checks
+  those mutants remove never fire there. The script tests drive those inputs
+  directly.
+- **m062** was predicted as a `staleWrites` `ErrFenced` kill. The oracle
+  kills it earlier: the deposed leader's writes break the per-revision catalog
+  invariants and the seq chain before the stale-write check runs.
+- The auto-extracted notes for m062–m069 quoted the first `oracle:` line,
+  which is a fault-injection log line, not the failure. They were rewritten
+  by hand in `baseline.json`, and so were the curated m011 and m056–m061
+  notes, which the regeneration had reset to "see log".
 
 ## Campaign 2026-08-25 (issue #345 client-visible seq leases)
 

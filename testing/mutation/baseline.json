@@ -1,17 +1,17 @@
 {
-  "commit": "c61b7ef5fe5d33d88651d2eb71452727512656dd",
+  "commit": "87b0384cde7b9cff80f636a661a3bec3754e449f",
   "mutants": [
     {"id":"m001_delete_mapped_to_update","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m002_watermark_floor_off_by_one","disposition":"KILLED","result":"KILLED@compaction","note":"oracle: superseded record row survived at/below the first-init watermark: seq=1 watermark=2 (m002 boundary miss is permanent: later fold win"},
     {"id":"m003_merge_cursor_no_advance","disposition":"KILLED","result":"KILLED@restart-multisource","note":"see log"},
     {"id":"m004_rev_filter_inverted","disposition":"KILLED","result":"KILLED@default","note":"oracle: missing did:plc:iv2erqbe5k4ltaawmik4tfeo app.bsky.actor.profile/22bgjqcoc57xt rev="},
-    {"id":"m005_backfill_status_check_inverted","disposition":"KILLED","result":"KILLED@restart","note":"oracle: rev regression for DID did:plc:c6r55vuzviwkyk275qu6x7zp at event 12: seq=15 app.bsky.feed.like/22b7c4ezkohs6 rev="},
+    {"id":"m005_backfill_status_check_inverted","disposition":"KILLED","result":"KILLED@restart","note":"oracle: rev regression for DID did:plc:c6r55vuzviwkyk275qu6x7zp at event 13: seq=16 app.bsky.feed.like/22b7c4ezkohs6 rev="},
     {"id":"m006_merge_commit_error_swallowed","disposition":"KILLED","result":"KILLED@storefault","note":"see log"},
     {"id":"m008_header_offset_byteslice","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m009_checksum_range_off_by_one","disposition":"KILLED","result":"KILLED@corpus","note":"see log"},
     {"id":"m011_wire_frame_length","disposition":"KILLED","result":"KILLED@default","note":"oracle: walk active segment /tmp/TestOracle_DefaultLifecycle1955716562/003/segments/seg_0000000000.jss: segment: walk active frames: segment"},
     {"id":"m012_block_event_count_off_by_one","disposition":"KILLED","result":"KILLED@default","note":"see log"},
-    {"id":"m015_collection_count_double","disposition":"KILLED","result":"KILLED@default","note":"oracle: verify sealed segment /tmp/TestOracle_DefaultLifecycle3650834255/003/backfill/live_segments/seg_0000000000.jss footer metadata: segm"},
+    {"id":"m015_collection_count_double","disposition":"KILLED","result":"KILLED@default","note":"oracle: verify sealed segment /tmp/TestOracle_DefaultLifecycle3946724258/003/backfill/live_segments/seg_0000000000.jss footer metadata: segm"},
     {"id":"m016_bloom_size_off_by_one","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m017_commit_collection_rkey_swap","disposition":"KILLED","result":"KILLED@default","note":"oracle: event mismatch at index 2: want seq=3 kind=create did=did:plc:iv2erqbe5k4ltaawmik4tfeo key=app.bsky.actor.profile/22bgjqcoc57xt rev="},
     {"id":"m018_commit_rev_dropped","disposition":"KILLED","result":"KILLED@default","note":"oracle: event mismatch at index 2: want seq=3 kind=create did=did:plc:iv2erqbe5k4ltaawmik4tfeo key=app.bsky.actor.profile/22bgjqcoc57xt rev="},
@@ -52,6 +52,14 @@
     {"id":"m058_seq_gap_registry_write_skipped","disposition":"KILLED","result":"KILLED@seqlease","note":"clean-restart persistence test observed the registered vacancy disappear"},
     {"id":"m059_unregistered_replay_hole_skipped","disposition":"KILLED","result":"KILLED@seqlease","note":"cold replay unregistered-hole guard required the fail-loud seam error"},
     {"id":"m060_drain_collapses_seq_lease","disposition":"KILLED","result":"KILLED@seqlease","note":"DrainDurability test could not append through the still-live writer"},
-    {"id":"m061_same_segment_gap_silently_crossed","disposition":"KILLED","result":"KILLED@seqlease","note":"bounded replay accepted an unregistered vacancy between durable blocks in one segment"}
+    {"id":"m061_same_segment_gap_silently_crossed","disposition":"KILLED","result":"KILLED@seqlease","note":"bounded replay accepted an unregistered vacancy between durable blocks in one segment"},
+    {"id":"m062_stale_leader_fence_ignored","disposition":"KILLED","result":"KILLED@disagg","note":"per-revision catalog invariants and seq corruption from the deposed leader's interleaved writes"},
+    {"id":"m063_fold_leaves_first_hot_batch","disposition":"KILLED","result":"KILLED@disagg","note":"checkCoverage: a folded batch still in hot_batches overlaps its block; fold fails loud"},
+    {"id":"m064_relay_cursor_per_block","disposition":"KILLED","result":"KILLED@disagg","note":"events archived twice after failover: relay/cursor lagged the committed rows"},
+    {"id":"m065_follower_hides_newest_hot_batch","disposition":"KILLED","result":"KILLED@disagg","note":"serve bound: the catalog held every row for 10s but the pod's v2 stream lagged"},
+    {"id":"m066_seal_reverses_block_order","disposition":"KILLED","result":"KILLED@disagg","note":"follower corruption at first catalog load: generation_blocks out of seq order"},
+    {"id":"m067_hot_batch_seq_check_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"TestScripts_SeqMismatch/SeqKeyCorrupt (unit tier by design)"},
+    {"id":"m068_reference_check_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"TestScripts_MissingReference (unit tier by design)"},
+    {"id":"m069_sync_state_promoted_after_append","disposition":"KILLED","result":"KILLED@disagg","note":"whole event archived twice after a leader crash; TestConsumer_Hot_ChainStateCommitsWithLastRow"}
   ]
 }
