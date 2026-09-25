@@ -15,6 +15,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/pgstore"
 	"github.com/bluesky-social/jetstream/internal/pgstore/pgtest"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -322,4 +323,73 @@ func TestTxnMetrics(t *testing.T) {
 	require.Equal(t, 2, testutil.CollectAndCount(m.TxnDuration))
 	require.InDelta(t, 1, testutil.ToFloat64(m.TxnErrors.WithLabelValues(string(catalog.TxMetadata))), 0)
 	require.InDelta(t, 0, testutil.ToFloat64(m.TxnErrors.WithLabelValues("read")), 0)
+}
+
+// A follower connects as the read-only role (design §24). It can LISTEN,
+// check versions, and load the whole catalog in one read snapshot, and it
+// cannot write anything: reader pods need no write privilege.
+func TestReaderRole(t *testing.T) {
+	t.Parallel()
+	leaderDB, u := pgtest.Open(t, nil)
+	reader := pgtest.OpenURL(t, pgtest.ReaderURL(t, u), nil)
+	ctx := t.Context()
+
+	notes, err := reader.Listen(ctx)
+	require.NoError(t, err)
+
+	lock := leaderDB.NewLease()
+	require.NoError(t, lock.Acquire(ctx, time.Minute))
+	s := catalog.NewSession(catalog.SessionConfig{DB: leaderDB, Epoch: lock.Epoch()})
+	_, err = s.InitNamespace(ctx, catalog.Main, nil)
+	require.NoError(t, err)
+	c, err := s.CommitHotBatch(ctx, catalog.HotBatch{
+		FirstSeq: 1, LastSeq: 2, Frame: []byte("frame"),
+		Meta: []metastore.Op{{Kind: metastore.OpSet, Key: []byte(catalog.RelayCursorKey), Value: []byte("7")}},
+	})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		select {
+		case rev := <-notes:
+			return rev == c.Revision
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond, "the reader hears the commit")
+
+	a, err := reader.CheckVersions(ctx)
+	require.NoError(t, err)
+	require.Equal(t, c.Revision, a.CatalogRevision)
+	r, err := reader.BeginRead(ctx)
+	require.NoError(t, err)
+	snap, err := catalog.LoadSnapshot(ctx, r)
+	require.NoError(t, err)
+	require.NoError(t, catalog.CheckInvariants(snap, catalog.InvariantOptions{}))
+	require.Equal(t, "7", string(snap.Meta[catalog.RelayCursorKey]))
+	hot, err := r.HotBatches(ctx, 0)
+	require.NoError(t, err)
+	require.Len(t, hot, 1)
+	require.Equal(t, []byte("frame"), hot[0].Frame)
+	require.NoError(t, r.Close(ctx))
+
+	// No write path works: not the leader transaction, not the lease, and
+	// not raw SQL against any table.
+	tx, err := reader.Begin(ctx, catalog.TxMetadata)
+	if err == nil {
+		_, _, err = tx.FenceBump(ctx, lock.Epoch())
+		require.NoError(t, tx.Rollback(ctx))
+	}
+	require.Error(t, err, "the fence needs UPDATE on archive")
+	require.Error(t, reader.NewLease().Acquire(ctx, time.Minute))
+	for _, stmt := range []string{
+		`UPDATE archive SET catalog_revision = catalog_revision + 1`,
+		`INSERT INTO metadata_kv (key, value) VALUES ('\x00', '\x00')`,
+		`DELETE FROM hot_batches`,
+		`DELETE FROM objects`,
+		`TRUNCATE segments`,
+	} {
+		_, err := reader.Pool().Exec(ctx, stmt)
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr, stmt)
+		require.Equal(t, "42501", pgErr.Code, "insufficient_privilege: %s", stmt)
+	}
 }

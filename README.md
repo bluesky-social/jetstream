@@ -66,6 +66,13 @@ just down up  # reset to empty
 
 The environment keeps no state. All data lives in tmpfs, so `just down` discards every table and object. Ports bind to `127.0.0.1` only (Postgres 15432, SeaweedFS 18333, MinIO 19000, MinIO console 19001). To remap them, use a gitignored `compose.override.yaml`. The app credentials only have PutObject, GetObject, and DeleteObject on the `jetstream` bucket, which is all production grants. `just up` verifies this on every run.
 
+`just test-storage` runs the storage contract and fault suites against this environment. It runs every package whose tests use PostgreSQL or S3, with SeaweedFS as the object store, then runs the object-store packages again against MinIO. Storage is required, so a missing backend fails rather than skips. The recipe needs `just up` running and fails fast when it is not. It never starts or stops the environment itself, so after a failure the data is still there to inspect (`just psql`). Plain `just` never needs PostgreSQL or S3: those tests skip.
+
+```sh
+just up && just test-storage
+just test-storage -run TestReaderRole  # arguments pass through to go test
+```
+
 To point `serve` at `just up`, select disaggregated storage and pass the connection settings in the environment. The PostgreSQL URL and the S3 keys are secrets, so they never go in `.env`. Jetstream reads the S3 keys from the standard AWS SDK chain, not from a `JETSTREAM_` variable. Disaggregated mode keeps nothing on local disk, so `JETSTREAM_DATA_DIR` must be unset. `.env` sets it, so run the binary directly rather than through `just run`. Compaction must also be off (`JETSTREAM_COMPACTION_INTERVAL=0`) until it supports disaggregated mode:
 
 ```sh

@@ -13,7 +13,7 @@ import (
 // validSnapshot builds a catalog with a sealed segment, an active segment
 // with a block, and hot batches above it.
 func validSnapshot(t *testing.T) *catalog.Snapshot {
-	h := newHarness(t)
+	h := newHarness(t, fakeBackend)
 	h.hot(1, 2)
 	h.hot(3, 5)
 	b1 := h.fold(1, 2)
@@ -24,7 +24,7 @@ func validSnapshot(t *testing.T) *catalog.Snapshot {
 	h.fold(6, 7)
 	h.hot(8, 8)
 	h.hot(9, 12)
-	s, err := h.db.Snapshot()
+	s, err := h.snapshot()
 	require.NoError(t, err)
 	require.NoError(t, catalog.CheckInvariants(s, catalog.InvariantOptions{}))
 	return s

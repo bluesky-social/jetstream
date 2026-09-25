@@ -213,6 +213,71 @@ jobs:
             echo 'If this was a data race, search those files for `WARNING: DATA RACE`; the report includes the racing access stacks.'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  test-storage:
+    name: test (storage)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: block
+          # The standard Nix and Go endpoints, plus Docker Hub for the
+          # digest-pinned compose.yaml images (the release.yml precedent:
+          # layers redirect through the two production.* CDN hosts).
+          allowed-endpoints: >
+            api.github.com:443
+            cache.nixos.org:443
+            codeload.github.com:443
+            github.com:443
+            install.determinate.systems:443
+            releases.nixos.org:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            dl.google.com:443
+            registry-1.docker.io:443
+            auth.docker.io:443
+            production.cloudflare.docker.com:443
+            production.cloudfront.docker.com:443
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          determinate: false
+          diagnostic-endpoint: ""
+          github-token: ""
+
+      # The flake ships only the Docker CLI; compose is the runner image's
+      # system CLI plugin, which the Nix CLI finds the same way the
+      # docker-build job finds buildx. Fail here, clearly, if it stops.
+      - name: Check docker compose
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command docker compose version
+
+      - name: Start storage (just up)
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just up
+
+      - name: Test storage
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just test-storage
+
+      - name: Storage logs
+        if: failure()
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command docker compose logs --no-color
+
+      - name: Stop storage (just down)
+        if: always()
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just down
+
   docker-build:
     name: docker build
     runs-on: ubuntu-24.04

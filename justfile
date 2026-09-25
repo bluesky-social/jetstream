@@ -112,6 +112,43 @@ down:
 psql *ARGS:
     docker compose exec postgres psql -U jetstream -d jetstream "$@"
 
+# Run the storage contract and fault suites (design §20 layer 4) against the
+# `just up` environment: every package whose tests use pgtest or s3test, with
+# SeaweedFS as the object store, then the object-store packages again with
+# MinIO. It needs `just up` running and does not start or stop it, so a
+# failed run leaves the environment up to inspect. Arguments pass through
+# to go test, e.g. `just test-storage -run TestReaderRole`.
+test-storage *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    running="$(docker compose ps --status running --services)"
+    for svc in postgres seaweedfs minio; do
+        if ! grep -qx "${svc}" <<<"${running}"; then
+            echo "test-storage: ${svc} is not running; run \`just up\` first" >&2
+            exit 1
+        fi
+    done
+    # Discovered, not listed, so a new storage suite cannot be left out.
+    storage_pkgs() {
+        go list -f '{{{{.ImportPath}} {{{{join .TestImports " "}} {{{{join .XTestImports " "}}' ./... \
+            | grep -E "$1" | cut -d' ' -f1
+    }
+    mapfile -t all < <(storage_pkgs '/internal/(pgstore/pgtest|objstore/s3/s3test)( |$)')
+    mapfile -t s3 < <(storage_pkgs '/internal/objstore/s3/s3test( |$)')
+    # Dev credentials from compose.yaml, never real secrets.
+    export JETSTREAM_TEST_STORAGE_REQUIRED=1
+    export JETSTREAM_TEST_PG_URL='postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable'
+    export JETSTREAM_TEST_S3_REGION=us-east-1
+    export JETSTREAM_TEST_S3_BUCKET=jetstream
+    export JETSTREAM_TEST_S3_ACCESS_KEY_ID=jetstream
+    export JETSTREAM_TEST_S3_SECRET_ACCESS_KEY=jetstream-dev-secret
+    echo "test-storage: PostgreSQL + SeaweedFS"
+    JETSTREAM_TEST_S3_ENDPOINT=http://127.0.0.1:18333 \
+        gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 {{ARGS}} "${all[@]}"
+    echo "test-storage: PostgreSQL + MinIO"
+    JETSTREAM_TEST_S3_ENDPOINT=http://127.0.0.1:19000 \
+        gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 {{ARGS}} "${s3[@]}"
+
 # Run jetstream against the local simulator (default).
 # Picks up JETSTREAM_RELAY_URL and JETSTREAM_PLC_URL from .env.
 run *ARGS:
