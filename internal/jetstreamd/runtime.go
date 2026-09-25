@@ -26,6 +26,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/repoexport"
 	"github.com/bluesky-social/jetstream/internal/server"
 	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
@@ -423,9 +424,16 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.orchestrator = orch
 
+	// Status and repo verification read segments through the catalog, which
+	// only hears about seals made by this process; the first reader loads
+	// what was already on disk.
+	loadCatalog := sync.OnceValue(func() error { return segCatalog.Refresh(manifestCtx) })
+	catalogReady := func(context.Context) error { return loadCatalog() }
 	statusCollector, err := status.New(status.Options{
 		Store:                 metaKV,
 		DataDir:               opts.DataDir,
+		Archive:               segCatalog,
+		ArchiveReady:          catalogReady,
 		Manifest:              mft,
 		CursorLookback:        opts.CursorLookback,
 		IdentityResolver:      resolver,
@@ -437,9 +445,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if err != nil {
 		return fail(fmt.Errorf("serve: build status collector: %w", err))
 	}
+	repoArchive := repoexport.Archive{
+		Catalog:  segCatalog,
+		Fetcher:  segCatalog.Fetcher(),
+		Selector: repoexport.FooterSelector{Source: segCatalog, Primary: newManifestSelector(mft)},
+		Ready:    catalogReady,
+	}
 	statusHandler, err := web.New(web.Options{
 		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(opts.DataDir, resolver, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
+		RepoActions:                web.NewRepoActions(repoArchive, resolver, pendingEventsForDID(&writerPtr)),
 		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
 		Logger:                     processLogger,
 	})

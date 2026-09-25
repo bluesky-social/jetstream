@@ -9,7 +9,13 @@ import (
 
 // RegisterDataDirFreeBytes registers the operator-only free-space gauge for
 // dataDir. Collection calls statfs directly so the value is scrape-time fresh.
+// An empty dataDir registers nothing: a process with no local data dir
+// (disaggregated storage) has no disk to report, and a gauge that always
+// failed to collect would only break scrapes.
 func RegisterDataDirFreeBytes(reg prometheus.Registerer, dataDir string) {
+	if dataDir == "" {
+		return
+	}
 	reg.MustRegister(dataDirFreeBytesCollector{
 		desc: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "data_dir_free_bytes"),

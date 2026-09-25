@@ -2,16 +2,14 @@ package status
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
@@ -19,7 +17,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/version"
-	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 )
@@ -502,82 +499,48 @@ func collectionsFromManifest(ms manifest.SegmentTreeStats) map[string]*Collectio
 	return out
 }
 
-func collectManifestSegmentAggregate(ms manifest.SegmentTreeStats, roots []string) (*SegmentAggregate, error) {
-	tree := treeFromManifest(ms)
-	collections := collectionsFromManifest(ms)
-
-	activeTail, tailWarnings, err := scanActiveTail(roots[0], collections)
-	if err != nil {
-		return nil, err
+// collectSegmentAggregate builds the two segment trees, main then
+// bootstrap_live. Main's sealed segments come from the manifest when there
+// is one, which keeps their stats resident; everything else is read
+// through the archive's catalog view.
+func collectSegmentAggregate(ctx context.Context, opts Options) (*SegmentAggregate, error) {
+	mainDir, liveDir := string(catalog.Main), string(catalog.BootstrapLive)
+	if opts.DataDir != "" {
+		mainDir = filepath.Join(opts.DataDir, "segments")
+		liveDir = filepath.Join(opts.DataDir, "backfill", "live_segments")
 	}
-	mergeTree(&tree, activeTail)
+	mainTree := TreeAggregate{Dir: mainDir}
+	liveTree := TreeAggregate{Dir: liveDir}
+	collections := make(map[string]*CollectionAggregate)
+	if opts.Manifest != nil {
+		ms := opts.Manifest.SegmentStats()
+		mainTree = treeFromManifest(ms)
+		collections = collectionsFromManifest(ms)
+	}
 
-	liveTree, liveWarnings, err := scanTree(roots[1], InspectAllOptions{}, collections)
-	if err != nil {
-		return nil, err
+	var warnings []string
+	if opts.Archive != nil {
+		view := opts.Archive.Snapshot()
+		tail, mainWarnings, err := treeFromView(ctx, opts.Archive, view, catalog.Main, mainDir, opts.Manifest != nil, collections)
+		if err != nil {
+			return nil, err
+		}
+		mergeTree(&mainTree, tail)
+		live, liveWarnings, err := treeFromView(ctx, opts.Archive, view, catalog.BootstrapLive, liveDir, false, collections)
+		if err != nil {
+			return nil, err
+		}
+		liveTree = live
+		warnings = append(mainWarnings, liveWarnings...)
 	}
 
 	agg := &SegmentAggregate{
-		Trees: []TreeAggregate{
-			tree,
-			liveTree,
-		},
-		Warnings: append(tailWarnings, liveWarnings...),
+		Trees:    []TreeAggregate{mainTree, liveTree},
+		Warnings: warnings,
 	}
 	agg.Collections = materializeCollections(collections)
 	agg.Network = computeNetworkTotals(agg.Trees, len(agg.Collections))
 	return agg, nil
-}
-
-func scanActiveTail(root string, collections map[string]*CollectionAggregate) (TreeAggregate, []string, error) {
-	tree := TreeAggregate{Dir: root}
-	files, err := ingest.SegmentFiles(root)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return tree, nil, nil
-		}
-		return TreeAggregate{}, nil, err
-	}
-	if len(files) == 0 {
-		return tree, nil, nil
-	}
-
-	tail := files[len(files)-1]
-	info, err := os.Stat(tail.Path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return tree, nil, nil
-		}
-		return TreeAggregate{}, nil, fmt.Errorf("status: stat %s: %w", tail.Path, err)
-	}
-	ins, inspectErr := segment.Inspect(tail.Path)
-	if inspectErr != nil {
-		// Same tolerance as InspectAll: the tail can be mid-rotation.
-		return tree, nil, nil //nolint:nilerr
-	}
-	if ins.Sealed {
-		return tree, nil, nil
-	}
-
-	tree.OldestMTime = info.ModTime()
-	tree.NewestMTime = info.ModTime()
-	tree.ActiveCount = 1
-	tree.DiskBytes = ins.FileSize
-	tree.LatestSegment = &SegmentSummary{
-		Index:           tail.Idx,
-		Sealed:          false,
-		EventCount:      ins.TotalEvents,
-		UniqueDIDCount:  ins.UniqueDIDCount,
-		BlockCount:      uint32(len(ins.Blocks)),
-		CollectionCount: len(ins.Collections),
-		MinSeq:          ins.MinSeq,
-		MaxSeq:          ins.MaxSeq,
-		MinWitnessedAt:  microsToTime(ins.MinWitnessedAt),
-		MaxWitnessedAt:  microsToTime(ins.MaxWitnessedAt),
-		SizeBytes:       ins.FileSize,
-	}
-	foldInspection(&tree, ins, collections)
-	return tree, nil, nil
 }
 
 func mergeTree(dst *TreeAggregate, src TreeAggregate) {
@@ -687,19 +650,11 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		pdb PebbleStats
 	)
 
-	roots := []string{
-		filepath.Join(opts.DataDir, "segments"),
-		filepath.Join(opts.DataDir, "backfill", "live_segments"),
-	}
 	if opts.Manifest != nil {
 		if err := opts.Manifest.Wait(ctx); err != nil {
 			return nil, err
 		}
 		bf, err = collectBackfillFast(opts.Store)
-		if err != nil {
-			return nil, err
-		}
-		agg, err = collectManifestSegmentAggregate(opts.Manifest.SegmentStats(), roots)
 		if err != nil {
 			return nil, err
 		}
@@ -709,14 +664,19 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		if err != nil {
 			return nil, err
 		}
-		agg, err = InspectAll(roots, InspectAllOptions{})
-		if err != nil {
-			return nil, err
-		}
 		pdb, err = collectPebble(opts.Store)
 		if err != nil {
 			return nil, err
 		}
+	}
+	if opts.ArchiveReady != nil {
+		if err := opts.ArchiveReady(ctx); err != nil {
+			return nil, err
+		}
+	}
+	agg, err = collectSegmentAggregate(ctx, opts)
+	if err != nil {
+		return nil, err
 	}
 	if len(agg.Trees) != 2 {
 		return nil, fmt.Errorf("status: segment aggregate has %d trees, expected 2 (segments + backfill/live_segments); the /status template assumes this shape", len(agg.Trees))
