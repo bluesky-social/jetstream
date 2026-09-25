@@ -520,7 +520,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Metrics:   subscribeMetrics,
 		Lookback:  opts.CursorLookback,
 		V2:        true,
-		BootID:    subscribe.NewBootID(),
 	}))
 
 	// XRPC surface: whole-file segment download + listing. The atmos

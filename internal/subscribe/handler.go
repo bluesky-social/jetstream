@@ -2,8 +2,6 @@ package subscribe
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -66,28 +64,6 @@ type Subscription struct {
 	// clamping with OutdatedCursor. These policies must stay together.
 	// False preserves the legacy /subscribe contract. See doc.go.
 	V2 bool
-
-	// BootID, when non-empty on the V2 endpoint, is sent as the BootIDHeader
-	// response header on every response (the 101 upgrade and pre-upgrade
-	// errors alike). It identifies this process's seq namespace: a client that
-	// sees the same value it last resumed from knows its seq cursor is valid
-	// here, and falls back to a witnessed-time cursor otherwise. Generate it
-	// once per process with NewBootID.
-	BootID string
-}
-
-// BootIDHeader carries Subscription.BootID on v2 responses.
-const BootIDHeader = "Jetstream-Boot-Id"
-
-// NewBootID returns a random per-process boot identifier. It is deliberately
-// not persisted: instances restored from the same backup share a seq history
-// but diverge immediately after, so a durable ID could claim a shared seq
-// namespace that no longer exists. A restart only costs a reconnecting client
-// one witnessed-time resume.
-func NewBootID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:]) // crypto/rand.Read never returns an error
-	return hex.EncodeToString(b[:])
 }
 
 // eventFilter is the per-delivery predicate surface shared by the v1
@@ -166,9 +142,6 @@ func negotiateSubprotocol(r *http.Request) []string {
 }
 
 func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *slog.Logger) {
-	if deps.V2 && deps.BootID != "" {
-		w.Header().Set(BootIDHeader, deps.BootID)
-	}
 	if !lifecycle.IsSteadyState(deps.Store) {
 		httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: bootstrap in progress")
 		return

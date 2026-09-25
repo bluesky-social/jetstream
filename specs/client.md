@@ -161,8 +161,8 @@ the client matcher remains the correctness backstop),
 **Reconnect resume**: after any delivery, reconnects send
 `cursor=lastSeq` (re-anchoring at the tip would gap); `seenAny`
 disambiguates "from-tip, nothing yet" (keep omitting the cursor) from a
-real resume. Under `CursorTime` the seq resume is verified by boot ID and
-may be replaced by a witnessed-time resume; see "Cursor modes & failover".
+real resume. Under `CursorTime` a reconnect to a different host replaces
+the seq resume with a witnessed-time resume; see "Cursor modes & failover".
 
 **Too-old cursor (§14)**: a seq cursor below the server's lookback floor
 is a pre-upgrade HTTP 400 whose XRPC error envelope names `CursorTooOld`
@@ -199,33 +199,36 @@ instead of the max seq, and `WithFailoverHosts` becomes legal (it is
 rejected under `CursorSeq`). Backfill (`planSnapshot`/`getSegment`) stays
 seq-only and primary-only; the mode only changes the live tail.
 
-The consumer (`live.go`) tracks which seq namespace `lastSeq` belongs to
-(`nsHost`, `nsBoot` from the `Jetstream-Boot-Id` header) and the latest
-delivered `lastWitnessed` (seeded from the backfill's max witnessed_at at
-cutover):
+A seq namespace is identified by the configured hostname that assigned it.
+The consumer (`live.go`) tracks which host `lastSeq` came from (`nsHost`)
+and the latest delivered `lastWitnessed` (seeded from the backfill's max
+witnessed_at at cutover):
 
-- **Same host, same boot**: resume by `cursor=lastSeq`, exact, seq-deduped.
-- **Boot changed** (restart, or a different instance behind one name): the
-  session is closed before reading any frame (`errBootMismatch`, an
-  immediate redial with no backoff or error) and the next one resumes at
-  `lastWitnessed - WithFailoverRewind` (default 5s). `lastSeq` resets to 0
-  because the new namespace's seqs may be lower; the rewind overlap is
-  re-delivered (at-least-once, no dedup is possible across namespaces).
+- **Same host**: resume by `cursor=lastSeq`, exact, seq-deduped.
+- **Different host** (only reached by failover): resume at
+  `lastWitnessed - WithFailoverRewind` (default 5s), and that host becomes
+  the namespace (`adoptNamespace`). `lastSeq` resets to 0 because the new
+  namespace's seqs may be lower; the rewind overlap is re-delivered
+  (at-least-once, no dedup is possible across namespaces). Failing back to
+  the primary is also a time resume.
 - **Dial failure** (transport/5xx, not a classified 400): rotate round-robin
-  to the next host, which is always a witnessed-time resume. A read error
-  after a connected session retries the same host.
+  to the next host. A read error after a connected session retries the same
+  host.
 - **No witnessed time** (nothing delivered carried `witnessedAt`, e.g. an
   old server, and the start was a seq): leaving is impossible, so the
   consumer stays on its seq namespace and warns once.
 - **CursorTooOld** re-enters backfill only while `lastSeq` is provably in the
-  archive's namespace (`archiveNS`, and the 400's boot ID matches or is
-  unknown); otherwise it resumes by witnessed time. A foreign seq must never
+  archive's namespace (`archiveNS`: the seq came from the primary's archive
+  and the consumer has never failed away); otherwise it resumes by witnessed
+  time. A foreign seq must never
   drive an archive sweep.
 - A time resume that the server clamps (`#info OutdatedCursor`) surfaces as
   the recoverable `ErrCursorClamped`: the caller may have a gap.
 
 Failover by time is approximate: instances witness the same event at
 slightly different times, so the rewind must cover the skew between them.
+Hostname matching assumes each configured host is one instance; a name that
+load-balances across instances breaks seq resume (see `specs/gotchas.md`).
 
 ## Compression (dict-zstd)
 

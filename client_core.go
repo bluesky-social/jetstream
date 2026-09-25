@@ -100,7 +100,7 @@ type engineConfig struct {
 	// tail (logged), never a startup failure.
 	ZstdCompression bool
 	// CursorMode selects Batch.LastCursor semantics and, under CursorTime,
-	// the live tail's boot-ID-verified resume and host failover (live.go).
+	// the live tail's host failover by witnessed time (live.go).
 	CursorMode CursorMode
 	// FailoverHosts are normalized live-tail fallbacks tried after Host
 	// (CursorTime only). Archive replay never uses them.

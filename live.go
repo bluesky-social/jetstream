@@ -48,9 +48,10 @@ type liveConfig struct {
 	// a dial fails. Honored only under timeMode: a seq cursor means nothing on
 	// another instance.
 	failoverHosts []string
-	// timeMode enables witnessed-time resume across seq namespaces: a
-	// reconnect that cannot prove it reached the same process (boot ID) or
-	// that fails over resumes at lastWitnessed-rewind instead of lastSeq.
+	// timeMode enables witnessed-time resume across seq namespaces: a seq
+	// cursor is only valid on the host that assigned it, so a reconnect that
+	// fails over to another host resumes at lastWitnessed-rewind instead of
+	// lastSeq.
 	timeMode bool
 	rewind   time.Duration
 	// witnessedFloor seeds lastWitnessed: the highest witnessed_at the caller
@@ -146,14 +147,13 @@ type liveConsumer struct {
 
 	// Failover state, used only under cfg.timeMode. hosts[0] is cfg.host.
 	// hasSeqPos means lastSeq (or the configured seq start) is a usable
-	// position in the namespace of hosts[nsHost], served by the process
-	// nsBoot ("" = not yet learned). lastWitnessed is the witnessed_at of the
-	// latest delivery, the resume point once the namespace is abandoned.
+	// position in the namespace of hosts[nsHost]. lastWitnessed is the
+	// witnessed_at of the latest delivery, the resume point once the
+	// namespace is abandoned.
 	hosts         []string
 	hostIdx       int
 	hasSeqPos     bool
 	nsHost        int
-	nsBoot        string
 	archiveNS     bool
 	lastWitnessed int64
 	warnedStuck   bool
@@ -252,13 +252,6 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) e
 		if errors.Is(err, errEmitStop) {
 			return nil
 		}
-		// A boot mismatch is a planned switch to the witnessed-time path, not a
-		// failure: redial at once rather than reporting churn and backing off.
-		if errors.Is(err, errBootMismatch) {
-			c.cfg.logger.Info("live tail reached a different jetstream process; resuming by witnessed time",
-				"host", c.hosts[c.hostIdx])
-			continue
-		}
 		// A too-old cursor is terminal, not transient: the seq will not become
 		// valid by reconnecting (the lookback floor only advances). Return it so
 		// the cutover engine re-enters the backfill pagination loop from the last
@@ -270,7 +263,7 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) e
 		// foreign seq, so leaveTooOldNamespace switches to a witnessed-time
 		// resume instead and the loop reconnects.
 		tooOld := errors.Is(err, errLiveCursorTooOld)
-		if tooOld && c.leaveTooOldNamespace(err) {
+		if tooOld && c.leaveTooOldNamespace() {
 			err = fmt.Errorf("%w; resuming by witnessed time", err)
 		} else if tooOld || errors.Is(err, errLiveInvalidRequest) {
 			return err
@@ -317,12 +310,8 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 	}
 	conn.SetReadLimit(c.cfg.readLimit)
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "client closing") }()
-	if c.cfg.timeMode {
-		// Checked before the first read, so no frame from an unverified
-		// namespace is ever deduped against (or delivered after) lastSeq.
-		if err := c.adoptSession(connBootID(conn), seqResume); err != nil {
-			return err
-		}
+	if c.cfg.timeMode && !seqResume {
+		c.adoptNamespace()
 	}
 
 	for {
@@ -447,7 +436,7 @@ func (c *liveConsumer) refreshDict(ctx context.Context) {
 }
 
 // planSession picks the URL for the next session. seqResume reports that it
-// resumes the current seq namespace, which adoptSession must then verify.
+// resumes the current seq namespace (the host that assigned lastSeq).
 func (c *liveConsumer) planSession() (rawURL string, seqResume bool) {
 	if !c.cfg.timeMode {
 		return c.subscribeURL(), false
@@ -481,39 +470,21 @@ func (c *liveConsumer) resumeTS() (cursor uint64, omit, ok bool) {
 	return 0, false, false
 }
 
-// adoptSession applies a connected session's boot ID. A seq resume that
-// landed on a different process is abandoned (errBootMismatch) when a time
-// resume is possible; a time resume starts a fresh seq namespace.
-func (c *liveConsumer) adoptSession(boot string, seqResume bool) error {
-	if seqResume {
-		if c.nsBoot != "" && boot != c.nsBoot {
-			if _, _, ok := c.resumeTS(); ok {
-				c.hasSeqPos = false
-				return errBootMismatch
-			}
-			c.warnStuck("live tail reached a different jetstream process but cannot resume by witnessed time; continuing by seq")
-		}
-		c.nsBoot = boot
-		return nil
-	}
-	// The overlap from the rewind is re-delivered (at-least-once): the old
-	// lastSeq is meaningless here and would drop events if this host's seqs
-	// are lower.
+// adoptNamespace makes the current host's seq namespace the consumer's after
+// a witnessed-time resume. The overlap from the rewind is re-delivered
+// (at-least-once): the old lastSeq is meaningless here and would drop events
+// if this host's seqs are lower.
+func (c *liveConsumer) adoptNamespace() {
 	c.nsHost = c.hostIdx
-	c.nsBoot = boot
 	c.archiveNS = false
 	c.lastSeq = 0
-	return nil
 }
 
 // leaveTooOldNamespace reports whether a CursorTooOld should be answered by a
 // witnessed-time resume rather than returned for a re-backfill. Re-backfill
 // is only valid when the rejected seq is in the archive's namespace.
-func (c *liveConsumer) leaveTooOldNamespace(err error) bool {
-	if !c.cfg.timeMode {
-		return false
-	}
-	if c.archiveNS && (c.nsBoot == "" || c.nsBoot == errBootID(err)) {
+func (c *liveConsumer) leaveTooOldNamespace() bool {
+	if !c.cfg.timeMode || c.archiveNS {
 		return false
 	}
 	if _, _, ok := c.resumeTS(); !ok {
@@ -659,54 +630,12 @@ const (
 	errNameInvalidRequest  = "InvalidRequest"
 )
 
-// bootIDHeader names the per-process ID the server sends on every
-// subscribeEvents response. It MUST equal internal/subscribe.BootIDHeader
-// (the contract test pins them equal).
-const bootIDHeader = "Jetstream-Boot-Id"
-
-// errBootMismatch ends a session that resumed by seq but reached a different
-// server process than the one that assigned the seq.
-var errBootMismatch = errors.New("jetstream: live tail boot id changed")
-
 // liveDialError marks a session that failed before a connection existed, the
 // only failure that moves the consumer to the next failover host.
 type liveDialError struct{ err error }
 
 func (e *liveDialError) Error() string { return "dial: " + e.err.Error() }
 func (e *liveDialError) Unwrap() error { return e.err }
-
-// bootConn carries the handshake's boot ID alongside the connection, so the
-// dialFunc signature (and the test fakes) stay unchanged.
-type bootConn struct {
-	*websocket.Conn
-	boot string
-}
-
-func (b bootConn) bootID() string { return b.boot }
-
-// bootIDError carries the boot ID of a pre-upgrade rejection.
-type bootIDError struct {
-	boot string
-	err  error
-}
-
-func (e *bootIDError) Error() string { return e.err.Error() }
-func (e *bootIDError) Unwrap() error { return e.err }
-
-func connBootID(conn wsConn) string {
-	if b, ok := conn.(interface{ bootID() string }); ok {
-		return b.bootID()
-	}
-	return ""
-}
-
-func errBootID(err error) string {
-	var be *bootIDError
-	if errors.As(err, &be) {
-		return be.boot
-	}
-	return ""
-}
 
 // dialWebsocket is the production dialer. hc, when non-nil, routes the HTTP/1.1
 // upgrade through a custom transport (e.g. an in-process pipe); nil uses the
@@ -734,20 +663,13 @@ func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn,
 				Message string `json:"message"`
 			}
 			if jerr := json.Unmarshal(body, &envelope); jerr == nil {
-				var typed error
 				switch envelope.Error {
 				case errNameCursorTooOld:
-					typed = errLiveCursorTooOld
+					return nil, fmt.Errorf("%w: %s", errLiveCursorTooOld, envelope.Message)
 				case errNameUnknownZstdDict:
-					typed = errLiveDictRejected
+					return nil, fmt.Errorf("%w: %s", errLiveDictRejected, envelope.Message)
 				case errNameInvalidRequest:
-					typed = errLiveInvalidRequest
-				}
-				if typed != nil {
-					return nil, &bootIDError{
-						boot: resp.Header.Get(bootIDHeader),
-						err:  fmt.Errorf("%w: %s", typed, envelope.Message),
-					}
+					return nil, fmt.Errorf("%w: %s", errLiveInvalidRequest, envelope.Message)
 				}
 			}
 		} else if resp != nil && resp.Body != nil {
@@ -755,18 +677,14 @@ func dialWebsocket(ctx context.Context, rawURL string, hc *http.Client) (wsConn,
 		}
 		return nil, err
 	}
-	var boot string
-	if resp != nil {
-		boot = resp.Header.Get(bootIDHeader)
-		if resp.Body != nil {
-			_ = resp.Body.Close()
-		}
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
 	}
 	if echoed := conn.Subprotocol(); echoed != "" && echoed != subscribeSubprotocol {
 		_ = conn.Close(websocket.StatusProtocolError, "unoffered subprotocol")
 		return nil, fmt.Errorf("jetstream: server selected unoffered subprotocol %q", echoed)
 	}
-	return bootConn{Conn: conn, boot: boot}, nil
+	return conn, nil
 }
 
 func nextBackoff(d, maxB time.Duration) time.Duration {

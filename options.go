@@ -390,9 +390,9 @@ const (
 // Under CursorTime, Batch.LastCursor returns the highest Event.WitnessedAtUS
 // in the batch instead of the highest Seq; feed it back through
 // WithLiveCursor to resume on any instance. The live tail keeps resuming by
-// seq while it can prove (via the server's boot ID) that it reconnected to the
-// same instance, and otherwise resumes from the last witnessed time minus
-// WithFailoverRewind, re-delivering the overlap. Delivery is therefore
+// seq while it reconnects to the host that assigned that seq, and on any
+// other host resumes from the last witnessed time minus WithFailoverRewind,
+// re-delivering the overlap. Delivery is therefore
 // at-least-once across a host change; consumers must be idempotent. It also
 // enables WithFailoverHosts.
 //

@@ -17,21 +17,11 @@ import (
 const failoverT0 = int64(1_779_667_200_000_000)
 
 // fakeSession is one scripted dial outcome: a dial error, or a connection
-// that reports boot and replays steps.
+// that replays steps.
 type fakeSession struct {
-	boot  string
 	err   error
 	steps []readStep
 }
-
-// bootedConn is a scriptedConn that exposes a handshake boot ID the way the
-// production bootConn does.
-type bootedConn struct {
-	*scriptedConn
-	boot string
-}
-
-func (b bootedConn) bootID() string { return b.boot }
 
 // fakeFleet routes dials by URL host to per-host session scripts, consumed in
 // order (the last repeats), and records each dial as "host cursor" with "-"
@@ -65,7 +55,7 @@ func (f *fakeFleet) dial(_ context.Context, raw string) (wsConn, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	return bootedConn{scriptedConn: &scriptedConn{steps: s.steps}, boot: s.boot}, nil
+	return &scriptedConn{steps: s.steps}, nil
 }
 
 func (f *fakeFleet) dialLog() []string {
@@ -97,55 +87,19 @@ func timeModeConfig(f *fakeFleet, failover ...string) liveConfig {
 	}
 }
 
-// A reconnect that lands on the same process keeps exact seq resume.
-func TestLiveFailoverSameBootResumesBySeq(t *testing.T) {
+// A reconnect to the same host keeps exact seq resume.
+func TestLiveFailoverSameHostResumesBySeq(t *testing.T) {
 	t.Parallel()
 	f := &fakeFleet{sessions: map[string][]fakeSession{"a": {
-		{boot: "x", steps: []readStep{witnessedFrame(100, failoverT0), witnessedFrame(101, failoverT0+1)}},
-		{boot: "x", steps: []readStep{witnessedFrame(101, failoverT0+1), witnessedFrame(102, failoverT0+2)}},
-		{boot: "x"},
+		{steps: []readStep{witnessedFrame(100, failoverT0), witnessedFrame(101, failoverT0+1)}},
+		{steps: []readStep{witnessedFrame(101, failoverT0+1), witnessedFrame(102, failoverT0+2)}},
+		{},
 	}}}
 	cfg := timeModeConfig(f)
 	cfg.cursor, cfg.dedupFloor, cfg.archiveNS = 99, 99, true
 	events, _ := runConsumer(t, cfg, 3)
 	require.Equal(t, []uint64{100, 101, 102}, seqs(events), "seq dedup still drops the inclusive overlap")
 	require.Equal(t, []string{"a 99", "a 101"}, f.dialLog()[:2])
-}
-
-// A restarted (or swapped) process has an unrelated seq namespace: the
-// consumer must abandon the seq resume before reading, resume by witnessed
-// time minus the rewind, and deliver the new namespace even though its seqs
-// are lower than the old lastSeq.
-func TestLiveFailoverBootMismatchResumesByTime(t *testing.T) {
-	t.Parallel()
-	f := &fakeFleet{sessions: map[string][]fakeSession{"a": {
-		{boot: "x", steps: []readStep{witnessedFrame(100, failoverT0), witnessedFrame(101, failoverT0+1_000_000)}},
-		{boot: "y", steps: []readStep{witnessedFrame(102, failoverT0+2_000_000)}}, // must never be read
-		{boot: "y", steps: []readStep{witnessedFrame(5, failoverT0-3_000_000), witnessedFrame(6, failoverT0+2_000_000)}},
-		{boot: "y"},
-	}}}
-	cfg := timeModeConfig(f)
-	cfg.cursor, cfg.dedupFloor, cfg.archiveNS = 99, 99, true
-	events, errs := runConsumer(t, cfg, 4)
-	require.Equal(t, []uint64{100, 101, 5, 6}, seqs(events))
-	require.Equal(t, []string{"a 99", "a 101", "a " + tsCursor(failoverT0+1_000_000, 5*time.Second)}, f.dialLog()[:3])
-	require.Len(t, errs, 1, "only the first session's EOF is reported; the boot switch is silent: %v", errs)
-}
-
-// Losing the header after having one is also a process change.
-func TestLiveFailoverBootDisappearsResumesByTime(t *testing.T) {
-	t.Parallel()
-	f := &fakeFleet{sessions: map[string][]fakeSession{"a": {
-		{boot: "x", steps: []readStep{witnessedFrame(100, failoverT0)}},
-		{boot: ""},
-		{boot: "", steps: []readStep{witnessedFrame(1, failoverT0)}},
-		{boot: ""},
-	}}}
-	cfg := timeModeConfig(f)
-	cfg.cursor, cfg.dedupFloor = 99, 99
-	events, _ := runConsumer(t, cfg, 2)
-	require.Equal(t, []uint64{100, 1}, seqs(events))
-	require.Equal(t, "a "+tsCursor(failoverT0, 5*time.Second), f.dialLog()[2])
 }
 
 func TestLiveFailoverDialFailureRotatesHosts(t *testing.T) {
@@ -156,7 +110,7 @@ func TestLiveFailoverDialFailureRotatesHosts(t *testing.T) {
 		t.Parallel()
 		f := &fakeFleet{sessions: map[string][]fakeSession{
 			"a": {{err: down}},
-			"b": {{boot: "y", steps: []readStep{witnessedFrame(1, failoverT0)}}, {boot: "y"}},
+			"b": {{steps: []readStep{witnessedFrame(1, failoverT0)}}, {}},
 		}}
 		cfg := timeModeConfig(f, "https://b")
 		cfg.fromTip = true
@@ -168,8 +122,8 @@ func TestLiveFailoverDialFailureRotatesHosts(t *testing.T) {
 	t.Run("after delivery", func(t *testing.T) {
 		t.Parallel()
 		f := &fakeFleet{sessions: map[string][]fakeSession{
-			"a": {{boot: "x", steps: []readStep{witnessedFrame(10, failoverT0)}}, {err: down}},
-			"b": {{boot: "y", steps: []readStep{witnessedFrame(3, failoverT0)}}, {boot: "y"}},
+			"a": {{steps: []readStep{witnessedFrame(10, failoverT0)}}, {err: down}},
+			"b": {{steps: []readStep{witnessedFrame(3, failoverT0)}}, {}},
 		}}
 		cfg := timeModeConfig(f, "https://b")
 		cfg.cursor, cfg.dedupFloor = 9, 9
@@ -178,11 +132,27 @@ func TestLiveFailoverDialFailureRotatesHosts(t *testing.T) {
 		require.Equal(t, []string{"a 9", "a 10", "b " + tsCursor(failoverT0, 5*time.Second)}, f.dialLog()[:3])
 	})
 
+	t.Run("failing back resumes by time", func(t *testing.T) {
+		t.Parallel()
+		f := &fakeFleet{sessions: map[string][]fakeSession{
+			"a": {{steps: []readStep{witnessedFrame(10, failoverT0)}}, {err: down}, {steps: []readStep{witnessedFrame(11, failoverT0+2)}}, {}},
+			"b": {{steps: []readStep{witnessedFrame(3, failoverT0+1)}}, {err: down}},
+		}}
+		cfg := timeModeConfig(f, "https://b")
+		cfg.cursor, cfg.dedupFloor = 9, 9
+		events, _ := runConsumer(t, cfg, 3)
+		require.Equal(t, []uint64{10, 3, 11}, seqs(events))
+		require.Equal(t, []string{
+			"a 9", "a 10", "b " + tsCursor(failoverT0, 5*time.Second),
+			"b 3", "a " + tsCursor(failoverT0+1, 5*time.Second),
+		}, f.dialLog()[:5], "a seq from b is never sent to a")
+	})
+
 	t.Run("cutover uses the backfill's witnessed floor", func(t *testing.T) {
 		t.Parallel()
 		f := &fakeFleet{sessions: map[string][]fakeSession{
 			"a": {{err: down}},
-			"b": {{boot: "y", steps: []readStep{witnessedFrame(3, failoverT0)}}, {boot: "y"}},
+			"b": {{steps: []readStep{witnessedFrame(3, failoverT0)}}, {}},
 		}}
 		cfg := timeModeConfig(f, "https://b")
 		cfg.cursor, cfg.dedupFloor, cfg.archiveNS, cfg.witnessedFloor = 50, 50, true, failoverT0
@@ -197,11 +167,11 @@ func TestLiveFailoverReadErrorRetriesSameHost(t *testing.T) {
 	t.Parallel()
 	f := &fakeFleet{sessions: map[string][]fakeSession{
 		"a": {
-			{boot: "x", steps: []readStep{witnessedFrame(10, failoverT0), {err: errors.New("reset")}}},
-			{boot: "x", steps: []readStep{witnessedFrame(11, failoverT0+1)}},
-			{boot: "x"},
+			{steps: []readStep{witnessedFrame(10, failoverT0), {err: errors.New("reset")}}},
+			{steps: []readStep{witnessedFrame(11, failoverT0+1)}},
+			{},
 		},
-		"b": {{boot: "y"}},
+		"b": {{}},
 	}}
 	cfg := timeModeConfig(f, "https://b")
 	cfg.cursor, cfg.dedupFloor = 9, 9
@@ -223,7 +193,7 @@ func TestLiveFailoverWithoutWitnessedStaysPut(t *testing.T) {
 			{steps: []readStep{{data: liveCommitFrame(t, 11, "did:plc:a", "delete", "c", "r", false)}}},
 			{},
 		},
-		"b": {{boot: "y"}},
+		"b": {{}},
 	}}
 	cfg := timeModeConfig(f, "https://b")
 	cfg.cursor, cfg.dedupFloor = 9, 9
@@ -234,31 +204,31 @@ func TestLiveFailoverWithoutWitnessedStaysPut(t *testing.T) {
 	}
 }
 
-// CursorTooOld may only drive a re-backfill when the rejected seq is provably
-// in the archive's namespace; otherwise the consumer resumes by time.
+// CursorTooOld may only drive a re-backfill when the rejected seq is in the
+// archive's namespace (the primary host, never failed away from); otherwise the consumer resumes by time.
 func TestLiveFailoverCursorTooOld(t *testing.T) {
 	t.Parallel()
 
-	t.Run("different boot resumes by time", func(t *testing.T) {
+	t.Run("non-archive seq resumes by time", func(t *testing.T) {
 		t.Parallel()
 		f := &fakeFleet{sessions: map[string][]fakeSession{"a": {
-			{boot: "x", steps: []readStep{witnessedFrame(100, failoverT0)}},
-			{err: &bootIDError{boot: "y", err: errLiveCursorTooOld}},
-			{boot: "y", steps: []readStep{witnessedFrame(7, failoverT0)}},
-			{boot: "y"},
+			{steps: []readStep{witnessedFrame(100, failoverT0)}},
+			{err: errLiveCursorTooOld},
+			{steps: []readStep{witnessedFrame(7, failoverT0)}},
+			{},
 		}}}
 		cfg := timeModeConfig(f)
-		cfg.cursor, cfg.dedupFloor, cfg.archiveNS = 99, 99, true
+		cfg.cursor, cfg.dedupFloor = 99, 99
 		events, _ := runConsumer(t, cfg, 2)
 		require.Equal(t, []uint64{100, 7}, seqs(events))
 		require.Equal(t, "a "+tsCursor(failoverT0, 5*time.Second), f.dialLog()[2])
 	})
 
-	t.Run("same boot re-backfills", func(t *testing.T) {
+	t.Run("archive seq re-backfills", func(t *testing.T) {
 		t.Parallel()
 		f := &fakeFleet{sessions: map[string][]fakeSession{"a": {
-			{boot: "x", steps: []readStep{witnessedFrame(100, failoverT0)}},
-			{err: &bootIDError{boot: "x", err: errLiveCursorTooOld}},
+			{steps: []readStep{witnessedFrame(100, failoverT0)}},
+			{err: errLiveCursorTooOld},
 		}}}
 		cfg := timeModeConfig(f)
 		cfg.cursor, cfg.dedupFloor, cfg.archiveNS, cfg.backoffMin = 99, 99, true, time.Millisecond
@@ -273,10 +243,10 @@ func TestLiveFailoverCursorTooOld(t *testing.T) {
 		f := &fakeFleet{sessions: map[string][]fakeSession{
 			"a": {{err: errors.New("down")}},
 			"b": {
-				{boot: "y", steps: []readStep{witnessedFrame(7, failoverT0)}},
-				{err: &bootIDError{boot: "y", err: errLiveCursorTooOld}},
-				{boot: "y", steps: []readStep{witnessedFrame(8, failoverT0+1)}},
-				{boot: "y"},
+				{steps: []readStep{witnessedFrame(7, failoverT0)}},
+				{err: errLiveCursorTooOld},
+				{steps: []readStep{witnessedFrame(8, failoverT0+1)}},
+				{},
 			},
 		}}
 		cfg := timeModeConfig(f, "https://b")
@@ -293,8 +263,8 @@ func TestLiveFailoverOutdatedCursorSurfacesClamp(t *testing.T) {
 		`,"name":"OutdatedCursor","message":"starting at seq 200"}}`)}
 	for _, timeMode := range []bool{true, false} {
 		f := &fakeFleet{sessions: map[string][]fakeSession{"a": {
-			{boot: "x", steps: []readStep{info, witnessedFrame(200, failoverT0)}},
-			{boot: "x"},
+			{steps: []readStep{info, witnessedFrame(200, failoverT0)}},
+			{},
 		}}}
 		cfg := timeModeConfig(f)
 		cfg.timeMode = timeMode
