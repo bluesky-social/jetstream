@@ -24,12 +24,18 @@ expected-tier: segmentfault
 tiers: segmentfault
 
 diff --git a/segment/writer.go b/segment/writer.go
-index d783e9f..abc7e6c 100644
+index 123c818..5e145e6 100644
 --- a/segment/writer.go
 +++ b/segment/writer.go
-@@ -555,4 +555 @@ func (w *Writer) flushLocked() error {
+@@ -395,10 +395,7 @@ func (w *Writer) flushLocked() error {
+ 	w.wireScratch, info = w.pending.appendFrame(w.wireScratch)
+ 	binary.LittleEndian.PutUint64(w.wireScratch[:8], uint64(len(w.wireScratch)-8))
+ 
 -	if err := w.cfg.beforeIO(IOOpWrite); err != nil {
 -		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 -		return w.stickyErr
 -	}
 +	_ = w.cfg.beforeIO(IOOpWrite)
+ 	if _, err := w.file.WriteAt(w.wireScratch, int64(w.nextBlockOffset)); err != nil {
+ 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
+ 		return w.stickyErr
