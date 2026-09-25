@@ -85,6 +85,13 @@ const (
 	// disaggConvergeTimeout bounds each wait on the fake clock. The slowest
 	// recovery is a killed leader's lease running out (3s) plus a slow read.
 	disaggConvergeTimeout = 2 * time.Minute
+	// disaggServeTimeout bounds, on the fake clock, how long pods may take
+	// to serve a catalog that holds every model row and has stopped
+	// changing. A committed batch is due within a catalog poll; the bound
+	// allows a slow read (2s) and retries, and sits well under
+	// BlockMaxAge, whose fold would otherwise reveal a batch the follower
+	// failed to serve.
+	disaggServeTimeout = 10 * time.Second
 	// disaggMaxExtraChunks bounds the extra events a wave generates while
 	// its fault has not fired yet.
 	disaggMaxExtraChunks = 8
@@ -586,11 +593,19 @@ func (h *disaggHarness) generate() {
 func (h *disaggHarness) converge(what string) {
 	want, groups := h.model()
 	deadline := time.Now().Add(disaggConvergeTimeout)
+	var lastNext uint64
+	var heldAt time.Time // when the catalog last changed while holding every row
 	for {
 		h.reap()
 		h.checkPods()
 		next := h.mainNext()
 		done := next > uint64(len(want))
+		if next != lastNext {
+			lastNext, heldAt = next, time.Time{}
+			if done {
+				heldAt = time.Now()
+			}
+		}
 		o0 := h.observers[0] // the first reader's v2 observer
 		o0.mu.Lock()
 		keys := make([]disaggKey, len(o0.v2))
@@ -614,6 +629,10 @@ func (h *disaggHarness) converge(what string) {
 		}
 		if done {
 			return
+		}
+		if !heldAt.IsZero() && time.Since(heldAt) > disaggServeTimeout {
+			h.failf("%s: the catalog has held every row at seq/next %d for %s, but %s v2 has %d (covered=%v)",
+				what, next, disaggServeTimeout, o0.pod.name, len(keys), covered)
 		}
 		if time.Now().After(deadline) {
 			h.failf("%s: not converged after %s: seq/next %d, %d model rows, %s v2 has %d (covered=%v)",

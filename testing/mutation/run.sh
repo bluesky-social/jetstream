@@ -386,6 +386,20 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          ./internal/oracle ./internal/ingest/live
                          -run 'TestOracle_RelaySeq|TestProcessBatch_ReplayedAccountEvent'
                          -count=1 -timeout "$default_timeout") ;;
+                disagg)
+                    # Disaggregated-storage tier (Stage 2 S2.19): kills
+                    # mutants in the catalog scripts, the hot writer, the
+                    # follower, and live ingest's durable batch state
+                    # (m062-m069). Layers in one `go test`: the layer 3
+                    # oracle (leader failover over the fault mix, eight full
+                    # seeds, fake time, one child process per seed, no
+                    # containers), the catalog script and follower contract
+                    # tests, and the live/syncstate batch-boundary
+                    # regressions. Fast (~2s).
+                    cmd=(env JETSTREAM_ORACLE_DISAGG_SEEDS=1,2,3,4,5,6,7,8 go test "${RACE_FLAG[@]}"
+                         ./internal/oracle ./internal/catalog ./internal/catalog/follower ./internal/ingest/live ./internal/ingest/syncstate
+                         -run '^TestDisagg_Oracle$|^TestScripts_|^TestFollower_|^TestServe_|^TestConsumer_Hot_|^TestStateStore_StageSnapshot'
+                         -count=1 -timeout "$default_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2
                     exit 1 ;;

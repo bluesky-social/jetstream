@@ -1,0 +1,27 @@
+mutant: m068_reference_check_skipped
+target: internal/catalog/scripts.go
+failure-mode: |
+  resolve skips the design §7.4 reference check, so a hot batch, fold, or
+  seal can point at an object row that is not available (GC claimed it, or
+  its upload never finished). Readers then fetch a missing object.
+expected-detection: |
+  Stage 2 has no GC, and pending uploads are marked available in the same
+  transaction, so the layer 3 oracle never commits a missing reference.
+  TestScripts_MissingReference requires SourceRef corruption for each
+  script.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
+--- a/internal/catalog/scripts.go
++++ b/internal/catalog/scripts.go
+@@ -212,9 +212,6 @@ func resolve(ctx context.Context, tx Tx, ref ObjectRef) (uint64, error) {
+ 			return 0, err
+ 		}
+ 	}
+-	if err := refCheck(ctx, tx, id); err != nil {
+-		return 0, err
+-	}
+ 	return id, nil
+ }
+ 

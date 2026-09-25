@@ -1,0 +1,27 @@
+mutant: m067_hot_batch_seq_check_skipped
+target: internal/catalog/scripts.go
+failure-mode: |
+  CommitHotBatch no longer locks and checks the seq key against the batch's
+  first seq (design §10.2). A leader whose in-memory seq diverged from the
+  catalog would commit a batch that overlaps or skips the committed range,
+  and the script overwrites the seq key anyway.
+expected-detection: |
+  Correct leaders never diverge, so the layer 3 oracle has no path that
+  reaches this check. TestScripts_SeqMismatch commits a batch at the wrong
+  first seq and requires SourceSeq corruption.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
+--- a/internal/catalog/scripts.go
++++ b/internal/catalog/scripts.go
+@@ -267,9 +267,6 @@ func (s *Session) CommitHotBatch(ctx context.Context, b HotBatch) (HotBatchCommi
+ 	}
+ 	var out HotBatchCommit
+ 	rev, err := s.run(ctx, TxHotBatch, func(tx Tx, rev uint64) error {
+-		if err := checkSeq(ctx, tx, Main, b.FirstSeq); err != nil {
+-			return err
+-		}
+ 		row := HotBatchRow{
+ 			FirstSeq:       b.FirstSeq,
+ 			LastSeq:        b.LastSeq,
