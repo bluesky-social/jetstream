@@ -773,7 +773,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
       batches tile `[1, seq/next)` with no gaps (§9.3 inv. 1, 5, 6);
     - producer acks never precede commit;
     - a batch never crosses a block boundary.
-- [ ] **S2.9 Admission control** (M). Deps: S2.8.
+- [x] **S2.9 Admission control** (M). Deps: S2.8.
   - Live and bulk classes. Append-lock live priority, with bulk yielding
     between chunks when the "live waiting" counter is non-zero. Class change
     cuts the batch. Live batches are inline, paid from a token bucket over
@@ -1223,6 +1223,55 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.9 (2026-09-25): hot mode admission control.**
+  - The token bucket charges a live batch its raw bytes at freeze and settles
+    to the frame's size after `prepare` encodes it off the lock. The rate
+    holds over frame bytes, and the bucket can dip below zero. It applies only
+    with an uploader. A negative `InlineBytesPerSec` disables it.
+  - Live cuts: an ordinary cut (events, bytes, age) that the bucket cannot pay
+    for turns the batch into an overflow batch. Overflow batches are always
+    pointers. A forced cut (class change, block close, Flush, drain, Close) of
+    an unpaid live batch makes a pointer batch at once, even a tiny one. S2.22
+    should measure how often that happens.
+  - A bulk batch stays open across `AppendBatch` calls up to
+    `BulkChunkMaxEvents`. The chunk size is capped by the open bulk batch's
+    room and the block's room, so a chunk never spans batches and live appends
+    land only on bulk batch boundaries. The batch holding a chunk collects its
+    permits and releases them at commit. A chunk that fails before landing any
+    event returns them at once.
+  - Rule 7: the process-wide PUT bound is `s3.Blob`'s upload concurrency. The
+    writer's `UploadConcurrency` bounds its own in-flight `Upload` calls. S2.16
+    sets both.
+  - Unfolded events are counted as the commit watermark minus the fold
+    watermark. At open, the fold watermark comes from the first `hot_batches`
+    row. `ClosedBlock.Folded`, which is idempotent and callable from any
+    goroutine, moves it forward. S2.10's maintainer calls it after each fold
+    commits. With a nil Sink, a block folds as soon as it commits.
+    `MaxUnfoldedEvents` must be at least one block (the effective block size
+    when `MaxEventsPerBlock` is 0).
+  - The live admission-wait histogram leaves out the mutex wait: it measures
+    cap waits only.
+  - Overflow sizes and the bulk chunk size are `HotConfig` fields for tests.
+    Their defaults are code constants, with no env vars (design §18).
+  - Producer survey: the live consumer is tagged live. `RunFailedRepoRetry`
+    is tagged bulk; it also carries sync 1.1 resync replacements. There is no
+    separate PDS-recovery producer yet. Bootstrap backfill and merge run in
+    direct mode, and the steady compactor does not append.
+  - Tests: `admission_test.go` holds synctest tests for:
+    - live priority on batch and block boundaries;
+    - bucket overflow by size and by age, forced-cut pointers, and bucket
+      settlement;
+    - each cap blocking and releasing at once;
+    - permit return on a failed chunk;
+    - the unfolded cap with and without a sink;
+    - live latency under a 100-chunk bulk flood. The bound is batch age plus
+      one upload; without permits the worst latency is 645ms against a 70ms
+      bound.
+    The swarm also randomizes every new limit. 23 hand-made mutants against
+    `admission.go` and the cut logic are all killed.
+  - Fixed along the way: `MaxUnfoldedEvents` validation now uses the default
+    block size when `MaxEventsPerBlock` is 0.
 
 - **S2.20 (2026-09-25): layer 4 storage suites and `just test-storage`.**
   - `test-storage` requires a running `just up`. It exits early with a clear

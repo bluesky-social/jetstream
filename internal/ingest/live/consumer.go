@@ -400,6 +400,7 @@ func (c *Consumer) saveCursorAndSyncState(cur int64) error {
 // atmos's streaming.Client; Run does not see transient network
 // errors as terminal.
 func (c *Consumer) Run(ctx context.Context) error {
+	ctx = ingest.WithClass(ctx, ingest.ClassLive)
 	c.closeMu.Lock()
 	closed := c.closed
 	c.closeMu.Unlock()

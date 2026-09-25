@@ -95,6 +95,9 @@ type retryRunner struct {
 }
 
 func RunFailedRepoRetry(ctx context.Context, cfg RetryConfig) error {
+	// Retries and sync 1.1 resyncs append whole repos: in hot mode they are
+	// bulk and yield to the firehose (design §10.5).
+	ctx = ingest.WithClass(ctx, ingest.ClassBulk)
 	r, err := newRetryRunner(cfg)
 	if err != nil {
 		return err

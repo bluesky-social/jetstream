@@ -124,6 +124,10 @@ func requireTiles(t *testing.T, rows []catalog.HotBatchRow, next uint64) {
 }
 
 type recSink struct {
+	// fold, if set, stands in for the maintainer: it gets each block as it
+	// closes and calls Folded when it likes.
+	fold func(ClosedBlock)
+
 	mu      sync.Mutex
 	blocks  []ClosedBlock
 	rotates int
@@ -131,8 +135,11 @@ type recSink struct {
 
 func (s *recSink) BlockClosed(b ClosedBlock) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.blocks = append(s.blocks, b)
+	s.mu.Unlock()
+	if s.fold != nil {
+		s.fold(b)
+	}
 }
 
 func (s *recSink) Rotate(context.Context) error {
@@ -258,7 +265,20 @@ func TestHot_Swarm(t *testing.T) {
 
 func runHotSwarm(t *testing.T, rng *rand.Rand) {
 	env := newHotEnv(t)
-	sink := &recSink{}
+	// The maintainer folds each block after a random delay, so the
+	// unfolded cap both blocks and releases.
+	var folds sync.WaitGroup
+	foldDelay := rand.New(rand.NewPCG(rng.Uint64(), 1))
+	var foldMu sync.Mutex
+	sink := &recSink{fold: func(b ClosedBlock) {
+		foldMu.Lock()
+		d := time.Duration(foldDelay.IntN(30)) * time.Millisecond
+		foldMu.Unlock()
+		folds.Go(func() {
+			time.Sleep(d)
+			b.Folded()
+		})
+	}}
 	rec := &hookRec{t: t, env: env}
 	maxBlock := 1 + rng.IntN(48)
 	hc := &HotConfig{
@@ -267,6 +287,16 @@ func runHotSwarm(t *testing.T, rng *rand.Rand) {
 		BatchMaxBytes:  int64(200 + rng.IntN(4000)),
 		BatchMaxAge:    time.Duration(1+rng.IntN(40)) * time.Millisecond,
 		BlockMaxAge:    time.Duration(20+rng.IntN(400)) * time.Millisecond,
+		// Admission (design §10.5): a bucket from starved to ample, and
+		// caps from a few events to effectively unbounded.
+		InlineBytesPerSec:  []int64{1, 2000, 20000, -1, 0}[rng.IntN(5)],
+		OverflowMaxEvents:  1 + rng.IntN(64),
+		OverflowMaxBytes:   int64(500 + rng.IntN(20000)),
+		OverflowMaxAge:     time.Duration(1+rng.IntN(200)) * time.Millisecond,
+		BulkChunkMaxEvents: 1 + rng.IntN(16),
+		BulkPendingBytes:   int64(1 + rng.IntN(8000)),
+		PendingBytes:       int64(1 + rng.IntN(16000)),
+		MaxUnfoldedEvents:  int64(maxBlock + rng.IntN(3*maxBlock)),
 	}
 	pointers := rng.IntN(2) == 0
 	if pointers {
@@ -343,6 +373,7 @@ func runHotSwarm(t *testing.T, rng *rand.Rand) {
 		require.NoError(t, w.ForceRotate(t.Context()))
 	}
 	require.NoError(t, w.Close())
+	folds.Wait()
 
 	// Close commits everything appended.
 	require.Equal(t, next, env.committedNext())
@@ -361,7 +392,17 @@ func runHotSwarm(t *testing.T, rng *rand.Rand) {
 		for s := r.FirstSeq; s <= r.LastSeq; s++ {
 			require.Equal(t, c, classes[s], "a batch holds one class")
 		}
-		require.Equal(t, pointers && c == ClassBulk, !r.Inline, "bulk batches are pointers when an uploader is set")
+		switch {
+		case !pointers:
+			require.True(t, r.Inline, "without an uploader every batch is inline")
+		case c == ClassBulk:
+			require.False(t, r.Inline, "bulk batches are pointers")
+			require.LessOrEqual(t, int(r.EventCount), hc.BulkChunkMaxEvents, "a bulk batch is at most one chunk")
+		case r.Inline:
+			require.LessOrEqual(t, int(r.EventCount), hc.BatchMaxEvents)
+		default:
+			require.LessOrEqual(t, int(r.EventCount), max(hc.BatchMaxEvents, hc.OverflowMaxEvents), "a live pointer batch is at most an overflow batch")
+		}
 		evs := env.frameEvents(r)
 		require.Len(t, evs, int(r.EventCount))
 		for _, ev := range evs {
@@ -568,6 +609,12 @@ func TestHot_ConfigValidation(t *testing.T) {
 		"async":       {Hot: &HotConfig{Session: s}, AsyncFlushWorkers: 2},
 		"negative":    {Hot: &HotConfig{Session: s, BatchMaxAge: -1}},
 		"block limit": {Hot: &HotConfig{Session: s}, MaxEventsPerBlock: 1 << 30},
+		"overflow":    {Hot: &HotConfig{Session: s, OverflowMaxEvents: -1}},
+		"bulk chunk":  {Hot: &HotConfig{Session: s, BulkChunkMaxEvents: -1}},
+		"permits":     {Hot: &HotConfig{Session: s, BulkPendingBytes: -1}},
+		"pending":     {Hot: &HotConfig{Session: s, PendingBytes: -1}},
+		"unfolded":    {Hot: &HotConfig{Session: s, MaxUnfoldedEvents: 3}, MaxEventsPerBlock: 4},
+		"default blk": {Hot: &HotConfig{Session: s, MaxUnfoldedEvents: defaultMaxEventsPerBlock - 1}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

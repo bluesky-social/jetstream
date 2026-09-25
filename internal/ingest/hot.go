@@ -1,11 +1,14 @@
 package ingest
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
@@ -17,13 +20,21 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Hot mode defaults (design §10.3, §18).
+// Hot mode defaults (design §10.3, §10.5, §18).
 const (
-	DefaultHotBatchMaxEvents = 256
-	DefaultHotBatchMaxBytes  = 256 << 10
-	DefaultHotBatchMaxAge    = 15 * time.Millisecond
-	DefaultBlockMaxAge       = 30 * time.Second
-	DefaultUploadConcurrency = 8
+	DefaultHotBatchMaxEvents     = 256
+	DefaultHotBatchMaxBytes      = 256 << 10
+	DefaultHotBatchMaxAge        = 15 * time.Millisecond
+	DefaultBlockMaxAge           = 30 * time.Second
+	DefaultUploadConcurrency     = 8
+	DefaultInlineBytesPerSec     = 4 << 20
+	DefaultOverflowBatchMaxEvent = 1024
+	DefaultOverflowBatchMaxBytes = 1 << 20
+	DefaultOverflowBatchMaxAge   = time.Second
+	DefaultBulkChunkMaxEvents    = 4096
+	DefaultBulkPendingBytes      = 64 << 20
+	DefaultHotPendingBytes       = 256 << 20
+	DefaultMaxUnfoldedEvents     = 65536
 )
 
 // Class is an append's admission class (design §10.5). Every hot batch holds
@@ -86,6 +97,10 @@ type ClosedBlock struct {
 	Batches []HotBatchInfo
 	// OpenedAt is when the block's first event was appended.
 	OpenedAt time.Time
+	// Folded must be called once the block's fold commits. It releases the
+	// block's events from the unfolded cap (design §10.5 rule 9). It is safe
+	// to call from any goroutine, and more than once.
+	Folded func()
 }
 
 // BlockSink is the maintainer side of hot mode.
@@ -114,7 +129,28 @@ type HotConfig struct {
 	BatchMaxAge    time.Duration
 	BlockMaxAge    time.Duration
 	// UploadConcurrency bounds the writer's pointer batch uploads in flight.
+	// The process-wide PUT bound (design §10.5 rule 7) is the blob store's.
 	UploadConcurrency int
+
+	// Admission control (design §10.5). InlineBytesPerSec is the live
+	// inline token bucket's rate over encoded frame bytes; the burst is one
+	// second's worth. A negative rate disables the bucket: every live batch
+	// commits inline. The token bucket and overflow apply only with an
+	// Uploader.
+	InlineBytesPerSec int64
+	// OverflowMaxEvents, OverflowMaxBytes, and OverflowMaxAge cut a live
+	// overflow batch (rule 4).
+	OverflowMaxEvents int
+	OverflowMaxBytes  int64
+	OverflowMaxAge    time.Duration
+	// BulkChunkMaxEvents caps a bulk chunk and a bulk batch (rules 1, 5).
+	BulkChunkMaxEvents int
+	// BulkPendingBytes is the bulk permit pool (rule 6), PendingBytes the
+	// total frozen-uncommitted cap (rule 8), and MaxUnfoldedEvents the
+	// committed-but-unfolded cap (rule 9).
+	BulkPendingBytes  int64
+	PendingBytes      int64
+	MaxUnfoldedEvents int64
 
 	// OnCommit runs in the committer goroutine after each commit and after
 	// the acks it releases: the local follower's doorbell. It must not
@@ -145,8 +181,13 @@ func (c *Config) validateHot() error {
 		return fmt.Errorf("%w: hot mode takes neither AsyncFlushWorkers nor Catalog", ErrInvalidConfig)
 	case c.MaxEventsPerBlock < 0 || c.ReadLogRetentionBytes < 0:
 		return fmt.Errorf("%w: MaxEventsPerBlock and ReadLogRetentionBytes must be >= 0", ErrInvalidConfig)
-	case h.BatchMaxEvents < 0 || h.BatchMaxBytes < 0 || h.BatchMaxAge < 0 || h.BlockMaxAge < 0 || h.UploadConcurrency < 0:
+	case h.BatchMaxEvents < 0 || h.BatchMaxBytes < 0 || h.BatchMaxAge < 0 || h.BlockMaxAge < 0 || h.UploadConcurrency < 0,
+		h.OverflowMaxEvents < 0 || h.OverflowMaxBytes < 0 || h.OverflowMaxAge < 0 || h.BulkChunkMaxEvents < 0,
+		h.BulkPendingBytes < 0 || h.PendingBytes < 0 || h.MaxUnfoldedEvents < 0:
 		return fmt.Errorf("%w: Hot limits must be >= 0", ErrInvalidConfig)
+	case h.MaxUnfoldedEvents != 0 && h.MaxUnfoldedEvents < int64(cmp.Or(c.MaxEventsPerBlock, defaultMaxEventsPerBlock)):
+		// Below one block, appends would stall until every block's age cut.
+		return fmt.Errorf("%w: Hot.MaxUnfoldedEvents must hold at least one block", ErrInvalidConfig)
 	}
 	if _, err := segment.NewBlockBuilder(c.MaxEventsPerBlock); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
@@ -169,6 +210,30 @@ func (h *HotConfig) applyDefaults() {
 	}
 	if h.UploadConcurrency == 0 {
 		h.UploadConcurrency = DefaultUploadConcurrency
+	}
+	if h.InlineBytesPerSec == 0 {
+		h.InlineBytesPerSec = DefaultInlineBytesPerSec
+	}
+	if h.OverflowMaxEvents == 0 {
+		h.OverflowMaxEvents = DefaultOverflowBatchMaxEvent
+	}
+	if h.OverflowMaxBytes == 0 {
+		h.OverflowMaxBytes = DefaultOverflowBatchMaxBytes
+	}
+	if h.OverflowMaxAge == 0 {
+		h.OverflowMaxAge = DefaultOverflowBatchMaxAge
+	}
+	if h.BulkChunkMaxEvents == 0 {
+		h.BulkChunkMaxEvents = DefaultBulkChunkMaxEvents
+	}
+	if h.BulkPendingBytes == 0 {
+		h.BulkPendingBytes = DefaultBulkPendingBytes
+	}
+	if h.PendingBytes == 0 {
+		h.PendingBytes = DefaultHotPendingBytes
+	}
+	if h.MaxUnfoldedEvents == 0 {
+		h.MaxUnfoldedEvents = DefaultMaxUnfoldedEvents
 	}
 }
 
@@ -200,6 +265,11 @@ type hotWriter struct {
 	done     chan struct{} // committer exited
 	agerDone chan struct{}
 
+	// liveWaiting counts live appenders waiting for mu. Bulk appenders
+	// yield to them between chunks (design §10.5 rule 1).
+	liveWaiting atomic.Int64
+	bucket      *tokenBucket // nil: every live batch commits inline
+
 	mu      sync.Mutex
 	nextSeq uint64
 	block   *hotBlock
@@ -207,6 +277,18 @@ type hotWriter struct {
 	queue   []hotItem
 	closed  bool
 	err     error // sticky failure
+
+	// Admission state (admission.go), all under mu.
+	waiters int
+	changed chan struct{} // closed and replaced when admission may have changed
+	// pending is frozen-uncommitted raw bytes by class (rule 8).
+	pending [2]int64
+	// bulkPermits is the bulk permits held (rule 6); bulkCredit is the part
+	// of it taken for the chunk being appended, not yet attached to a batch.
+	bulkPermits, bulkCredit int64
+	// committedNext and foldedNext bound the committed-but-unfolded events
+	// (rule 9).
+	committedNext, foldedNext uint64
 }
 
 // hotBlock is the open block. events has capacity for a full block, so the
@@ -226,11 +308,19 @@ type hotBatch struct {
 	class    Class
 	openedAt time.Time
 
+	// overflow marks a live batch the token bucket could not pay for: it
+	// keeps growing to the overflow limits and freezes as a pointer batch.
+	overflow bool
+
 	// Set at freeze.
 	events       []segment.Event
 	pointer      bool
 	prepareValue any
 	ready        chan struct{}
+	// tokens is the inline estimate taken from the bucket, settled against
+	// the frame size once encoded. permit is the bulk permits the batch
+	// holds until it commits.
+	tokens, permit int64
 
 	// Set by prepare before ready closes.
 	frame []byte
@@ -267,7 +357,7 @@ func openHot(cfg Config) (*Writer, error) {
 	cfg.Hot = &hc
 	cfg.Logger = cfg.Logger.With(slog.String("component", "ingest/writer"), slog.String("mode", "hot"))
 
-	next, err := readHotSeq(context.Background(), hc.Session.DB())
+	next, unfoldedFrom, err := readHotState(context.Background(), hc.Session.DB())
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +380,15 @@ func openHot(cfg Config) (*Writer, error) {
 		done:     make(chan struct{}),
 		agerDone: make(chan struct{}),
 		nextSeq:  next,
+
+		changed:       make(chan struct{}),
+		committedNext: next,
+		foldedNext:    unfoldedFrom,
 	}
+	if hc.Uploader != nil && hc.InlineBytesPerSec > 0 {
+		h.bucket = newTokenBucket(hc.InlineBytesPerSec, cfg.Metrics)
+	}
+	cfg.Metrics.setHotUnfolded(next - unfoldedFrom)
 	w.hot = h
 	cfg.Metrics.setNextSeq(next)
 	go h.commitLoop()
@@ -299,21 +397,36 @@ func openHot(cfg Config) (*Writer, error) {
 	return w, nil
 }
 
-// readHotSeq reads seq/next at session start (design §10.2). It is the
-// committed value: whatever an earlier session assigned but never committed
-// is reassigned.
-func readHotSeq(ctx context.Context, db catalog.DB) (uint64, error) {
+// readHotState reads seq/next at session start (design §10.2), and the
+// first seq still in hot_batches, which starts the unfolded count (§10.5
+// rule 9). seq/next is the committed value: whatever an earlier session
+// assigned but never committed is reassigned.
+func readHotState(ctx context.Context, db catalog.DB) (next, unfoldedFrom uint64, err error) {
 	tx, err := db.BeginRead(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
+		return 0, 0, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
 	}
 	defer func() { _ = tx.Close(ctx) }()
 	vals, err := tx.MetaGet(ctx, [][]byte{[]byte(catalog.MainSeqKey)})
 	if err != nil {
-		return 0, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
+		return 0, 0, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
 	}
 	v, found := vals[catalog.MainSeqKey]
-	return catalog.DecodeSeq(catalog.MainSeqKey, v, found)
+	if next, err = catalog.DecodeSeq(catalog.MainSeqKey, v, found); err != nil {
+		return 0, 0, err
+	}
+	rows, err := tx.HotBatches(ctx, math.MaxUint64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("ingest: read hot batches: %w", err)
+	}
+	unfoldedFrom = next
+	if len(rows) > 0 {
+		unfoldedFrom = rows[0].FirstSeq
+	}
+	if unfoldedFrom > next {
+		return 0, 0, catalog.Corruptf(catalog.SourceHotBatch, "hot batch at seq %d is past %s %d", unfoldedFrom, catalog.MainSeqKey, next)
+	}
+	return next, unfoldedFrom, nil
 }
 
 // rawEventBytes is the batch byte cut's measure of an event: its variable
@@ -323,18 +436,35 @@ func rawEventBytes(ev *segment.Event) int64 {
 }
 
 func (h *hotWriter) append(ctx context.Context, ev *segment.Event) error {
-	class := ClassOf(ctx)
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.appendLocked(class, ev)
+	if ClassOf(ctx) == ClassBulk {
+		evs := []segment.Event{*ev}
+		err := h.appendBulk(ctx, evs)
+		ev.Seq = evs[0].Seq
+		return err
+	}
+	return h.appendLive(ctx, 1, func(int) *segment.Event { return ev })
 }
 
 func (h *hotWriter) appendBatch(ctx context.Context, events []segment.Event) error {
-	class := ClassOf(ctx)
+	if ClassOf(ctx) == ClassBulk {
+		return h.appendBulk(ctx, events)
+	}
+	return h.appendLive(ctx, len(events), func(i int) *segment.Event { return &events[i] })
+}
+
+// appendLive appends n events under one admission.
+func (h *hotWriter) appendLive(ctx context.Context, n int, at func(int) *segment.Event) error {
+	h.liveWaiting.Add(1)
 	h.mu.Lock()
+	h.liveWaiting.Add(-1)
 	defer h.mu.Unlock()
-	for i := range events {
-		if err := h.appendLocked(class, &events[i]); err != nil {
+	// A bulk appender may be yielding to this one.
+	defer h.signalLocked()
+	if _, err := h.admitLocked(ctx, ClassLive, nil); err != nil {
+		return err
+	}
+	for i := range n {
+		if err := h.appendLocked(ClassLive, at(i)); err != nil {
 			return err
 		}
 	}
@@ -351,7 +481,7 @@ func (h *hotWriter) appendLocked(class Class, ev *segment.Event) error {
 		return fmt.Errorf("ingest: append: %w", err)
 	}
 	if h.batch != nil && h.batch.class != class {
-		h.freezeLocked()
+		h.cutLocked(true)
 	}
 	now := time.Now()
 	if h.block == nil {
@@ -392,8 +522,16 @@ func (h *hotWriter) appendLocked(class Class, ev *segment.Event) error {
 	switch {
 	case len(blk.events) >= h.cfg.MaxEventsPerBlock:
 		h.closeBlockLocked()
+	case b.class == ClassBulk:
+		if b.n >= h.hot.BulkChunkMaxEvents {
+			h.cutLocked(false)
+		}
+	case b.overflow:
+		if b.n >= h.hot.OverflowMaxEvents || b.raw >= h.hot.OverflowMaxBytes {
+			h.cutLocked(false)
+		}
 	case b.n >= h.hot.BatchMaxEvents || b.raw >= h.hot.BatchMaxBytes:
-		h.freezeLocked()
+		h.cutLocked(false)
 	}
 	return nil
 }
@@ -405,20 +543,51 @@ func (h *hotWriter) usableLocked() error {
 	return h.err
 }
 
-// freezeLocked cuts the open batch (design §10.3). Encoding happens off the
-// lock; the prepare value is sampled here so it is tied to exactly this
-// batch's events.
-func (h *hotWriter) freezeLocked() {
+// cutLocked cuts the open batch and picks its storage (design §10.5 rules
+// 3-5). A bulk batch and a live overflow batch are pointer batches. A live
+// batch commits inline if the token bucket pays for it. Otherwise a batch
+// that reached an ordinary cut (events, bytes, age) enters overflow and keeps
+// growing, and one that must freeze now (class change, block close, a
+// barrier) becomes a pointer batch.
+func (h *hotWriter) cutLocked(forced bool) {
 	b := h.batch
 	if b == nil {
 		return
 	}
+	pointer := false
+	switch {
+	case h.hot.Uploader == nil:
+	case b.class == ClassBulk || b.overflow:
+		pointer = true
+	case h.bucket == nil:
+	case h.bucket.take(b.raw):
+		b.tokens = b.raw
+	case !forced:
+		b.overflow = true
+		h.kickAger()
+		return
+	default:
+		pointer = true
+	}
+	h.freezeLocked(pointer)
+}
+
+// freezeLocked freezes the open batch (design §10.3). Encoding happens off
+// the lock; the prepare value is sampled here so it is tied to exactly this
+// batch's events. Only cutLocked calls it.
+func (h *hotWriter) freezeLocked(pointer bool) {
+	b := h.batch
 	h.batch = nil
 	b.events = h.block.events[b.start : b.start+b.n : b.start+b.n]
-	b.pointer = b.class == ClassBulk && h.hot.Uploader != nil
+	b.pointer = pointer
 	if h.cfg.DurableBatchPrepareValue != nil {
 		b.prepareValue = h.cfg.DurableBatchPrepareValue()
 	}
+	if b.class == ClassBulk {
+		b.permit += h.bulkCredit
+		h.bulkCredit = 0
+	}
+	h.addPendingLocked(b.class, b.raw)
 	b.ready = make(chan struct{})
 	h.enqueueLocked(hotItem{batch: b})
 	h.encoders.Add(1)
@@ -431,7 +600,7 @@ func (h *hotWriter) closeBlockLocked() {
 	if h.block == nil {
 		return
 	}
-	h.freezeLocked()
+	h.cutLocked(true)
 	h.enqueueLocked(hotItem{block: h.block})
 	h.block = nil
 }
@@ -467,6 +636,9 @@ func (h *hotWriter) prepare(b *hotBatch) {
 		}
 	}
 	b.frame, b.info = bb.Encode()
+	if b.tokens > 0 {
+		h.bucket.settle(b.tokens - int64(len(b.frame)))
+	}
 	if !b.pointer {
 		return
 	}
@@ -582,6 +754,7 @@ func (h *hotWriter) commitBatch(b *hotBatch) error {
 		}
 		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("revision", int64(res.Revision)))
 		b.objectID = res.ObjectID
+		h.committed(b)
 		h.readLog.advanceDurable(next)
 		if afterCommit != nil {
 			afterCommit()
@@ -626,7 +799,9 @@ func (h *hotWriter) commitMeta(m *hotMeta) error {
 }
 
 func (h *hotWriter) deliver(blk *hotBlock) {
+	last := blk.first + uint64(len(blk.events)) - 1
 	if h.hot.Sink == nil {
+		h.folded(last)
 		return
 	}
 	cb := ClosedBlock{
@@ -635,6 +810,7 @@ func (h *hotWriter) deliver(blk *hotBlock) {
 		Events:   blk.events,
 		Batches:  make([]HotBatchInfo, len(blk.batches)),
 		OpenedAt: blk.openedAt,
+		Folded:   func() { h.folded(last) },
 	}
 	for i, b := range blk.batches {
 		cb.Batches[i] = HotBatchInfo{FirstSeq: b.first, LastSeq: b.last(), Class: b.class, ObjectID: b.objectID}
@@ -657,6 +833,7 @@ func (h *hotWriter) fail(err error) {
 		return
 	}
 	h.err = err
+	h.signalLocked()
 	h.mu.Unlock()
 	h.cancel()
 	if serr := h.hot.Session.Err(); serr == nil {
@@ -701,8 +878,8 @@ func (h *hotWriter) expireLocked(now time.Time) (time.Time, bool) {
 	if h.block != nil && !now.Before(h.block.openedAt.Add(h.hot.BlockMaxAge)) {
 		h.closeBlockLocked()
 	}
-	if h.batch != nil && !now.Before(h.batch.openedAt.Add(h.hot.BatchMaxAge)) {
-		h.freezeLocked()
+	if h.batch != nil && !now.Before(h.batchDeadlineLocked()) {
+		h.cutLocked(false)
 	}
 	var deadline time.Time
 	ok := false
@@ -710,11 +887,18 @@ func (h *hotWriter) expireLocked(now time.Time) (time.Time, bool) {
 		deadline, ok = h.block.openedAt.Add(h.hot.BlockMaxAge), true
 	}
 	if h.batch != nil {
-		if d := h.batch.openedAt.Add(h.hot.BatchMaxAge); !ok || d.Before(deadline) {
+		if d := h.batchDeadlineLocked(); !ok || d.Before(deadline) {
 			deadline, ok = d, true
 		}
 	}
 	return deadline, ok
+}
+
+func (h *hotWriter) batchDeadlineLocked() time.Time {
+	if h.batch.overflow {
+		return h.batch.openedAt.Add(h.hot.OverflowMaxAge)
+	}
+	return h.batch.openedAt.Add(h.hot.BatchMaxAge)
 }
 
 // barrier queues a marker behind everything already queued and waits for
@@ -739,12 +923,12 @@ func (h *hotWriter) barrier(ctx context.Context, prep func()) error {
 }
 
 func (h *hotWriter) flush(ctx context.Context) error {
-	return h.barrier(ctx, h.freezeLocked)
+	return h.barrier(ctx, func() { h.cutLocked(true) })
 }
 
 func (h *hotWriter) drainDurability(ctx context.Context) error {
 	return h.barrier(ctx, func() {
-		h.freezeLocked()
+		h.cutLocked(true)
 		h.enqueueMetaLocked()
 	})
 }
@@ -780,10 +964,11 @@ func (h *hotWriter) close() error {
 		return nil
 	}
 	if h.err == nil {
-		h.freezeLocked()
+		h.cutLocked(true)
 		h.enqueueMetaLocked()
 	}
 	h.closed = true
+	h.signalLocked()
 	h.enqueueLocked(hotItem{stop: true})
 	h.mu.Unlock()
 

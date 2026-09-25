@@ -1,6 +1,8 @@
 package ingest
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -34,6 +36,11 @@ type Metrics struct {
 	// §23), labelled by admission class and inline or pointer storage.
 	HotBatches     *prometheus.CounterVec
 	HotBatchEvents prometheus.Histogram
+	// Hot mode admission control (design §10.5, §23).
+	HotUnfoldedEvents prometheus.Gauge
+	HotPendingBytes   *prometheus.GaugeVec
+	HotInlineTokens   prometheus.Gauge
+	AdmissionWait     *prometheus.HistogramVec
 }
 
 // NewMetrics registers the ingest counters/gauges against reg.
@@ -137,6 +144,27 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Events per committed hot batch.",
 			Buckets: []float64{1, 4, 16, 64, 128, 256, 512, 1024, 4096},
 		}),
+		HotUnfoldedEvents: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name: "unfolded_events",
+			Help: "Events in committed hot batches not yet folded into an active block.",
+		}),
+		HotPendingBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name: "pending_bytes",
+			Help: "Raw event bytes in frozen hot batches not yet committed, by admission class.",
+		}, []string{"class"}),
+		HotInlineTokens: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name: "inline_tokens",
+			Help: "Frame bytes the live inline token bucket can pay for now. Negative after a frame outgrew its estimate.",
+		}),
+		AdmissionWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "admission_wait_seconds",
+			Help:      "Time a hot mode append (live) or bulk chunk waited on admission caps and permits, by class.",
+			Buckets:   []float64{0, .001, .005, .02, .1, .5, 2, 10, 60},
+		}, []string{"class"}),
 	}
 	reg.MustRegister(
 		m.EventsAppended, m.BlocksFlushed, m.SegmentsRotated,
@@ -147,6 +175,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.SeqGapCount, m.SeqGapWidth,
 		m.SeqGapsRegistered, m.SeqGapValuesRegistered,
 		m.HotBatches, m.HotBatchEvents,
+		m.HotUnfoldedEvents, m.HotPendingBytes, m.HotInlineTokens, m.AdmissionWait,
 	)
 	return m
 }
@@ -262,4 +291,28 @@ func (m *Metrics) observeHotBatch(class Class, pointer bool, events int) {
 	}
 	m.HotBatches.WithLabelValues(class.String(), storage).Inc()
 	m.HotBatchEvents.Observe(float64(events))
+}
+
+func (m *Metrics) setHotUnfolded(v uint64) {
+	if m != nil {
+		m.HotUnfoldedEvents.Set(float64(v))
+	}
+}
+
+func (m *Metrics) setHotPending(c Class, v int64) {
+	if m != nil {
+		m.HotPendingBytes.WithLabelValues(c.String()).Set(float64(v))
+	}
+}
+
+func (m *Metrics) setHotInlineTokens(v float64) {
+	if m != nil {
+		m.HotInlineTokens.Set(v)
+	}
+}
+
+func (m *Metrics) observeAdmissionWait(c Class, d time.Duration) {
+	if m != nil {
+		m.AdmissionWait.WithLabelValues(c.String()).Observe(d.Seconds())
+	}
 }

@@ -658,6 +658,9 @@ The writer keeps one open block and cuts it into batches.
   - the block closes;
   - the append class changes (§10.5).
 
+  Bulk batches and live overflow batches replace the first two limits with
+  their own (§10.5 rules 4 and 5); live overflow also replaces the age.
+
 A batch never crosses a block boundary. Block boundaries therefore fall exactly
 on batch boundaries, and a fold consumes whole batches.
 
@@ -744,29 +747,49 @@ There are two classes of producers:
 Rules:
 
 1. **Append lock priority.** The Writer's append lock prefers live. A bulk
-   appender holds the lock for at most one chunk: `min(4096, remaining block
-   capacity)` events. It checks for waiting live appenders between chunks.
+   appender holds the lock for at most one chunk: `min(4096 minus the open bulk
+   batch's events, remaining block capacity)` events. So a chunk never spans a
+   batch or a block, and a live append lands only on a bulk batch boundary.
+   The bulk appender checks for waiting live appenders between chunks.
    Implement this as a mutex plus a "live waiting" counter. Bulk code yields when
-   the counter is non-zero.
+   the counter is non-zero. A live append's admission wait
+   (`jetstream_admission_wait_seconds`) counts only rule 8 and 9 waits, not the
+   wait for the mutex.
 2. **Class boundary.** Changing class cuts the current batch. Every batch holds
    events of one class only.
 3. **Live batches are inline**, paid for from a token bucket over encoded frame
    bytes. The rate is `JETSTREAM_HOT_INLINE_BYTES_PER_SEC` (default 4MiB/s) and
    the burst is 1s worth. At freeze, if the bucket has at least the frame's size
-   in tokens, take them and commit inline.
-4. **Live overflow.** If the bucket is short, the batch is not committed inline.
-   The writer enters overflow mode: it un-freezes the events and keeps adding
-   live events to the same batch until 1024 events, 1MiB raw, 1s age, or block
-   close. Then it freezes the batch as a pointer batch. Overflow mode ends at the
-   next freeze where the bucket can pay for an inline batch.
-5. **Bulk batches are always pointer batches.** A bulk chunk is one pointer
-   batch (at most 4096 events and never past the block boundary).
+   in tokens, take them and commit inline. The frame is encoded off the lock,
+   after the freeze, so the bucket takes the batch's raw bytes at freeze and
+   settles the difference once the frame exists. A frame larger than its raw
+   bytes can leave the bucket below zero; the rate still holds over frame bytes.
+   A negative rate disables the bucket (every live batch is inline). The bucket
+   only applies when the writer has an uploader.
+4. **Live overflow.** If the bucket is short at an ordinary cut (events,
+   bytes, age), the batch is not frozen. It becomes an overflow batch and keeps
+   taking live events until 1024 events, 1MiB raw, or 1s from its first event.
+   Then it freezes as a pointer batch. Any other cut of an overflow batch also
+   freezes it as a pointer batch. A cut that cannot wait (class change, block
+   close, Flush, DrainDurability, Close) of a normal live batch the bucket cannot
+   pay for also makes a pointer batch, even a small one. Overflow ends with the
+   overflow batch: the next live batch tries the bucket afresh. The overflow
+   limits are code constants (§18).
+5. **Bulk batches are always pointer batches.** A bulk batch holds at most 4096
+   events and never passes the block boundary. It stays open across
+   `AppendBatch` calls, so small bulk appends coalesce, and is cut at 4096
+   events, block close, a class change, 15ms age, or a Flush/drain/Close. It is
+   not cut at 256 events or 256KiB.
 6. **Bulk permit.** Before appending a chunk, a bulk appender takes permits for
-   its raw bytes from a bulk pending-bytes semaphore
-   (`JETSTREAM_HOT_BULK_PENDING_BYTES`, default 64MiB). The permits are released
-   when the batch commits.
+   its raw bytes from a bulk pending-bytes pool
+   (`JETSTREAM_HOT_BULK_PENDING_BYTES`, default 64MiB). The batch holding the
+   chunk collects them, and they are released when it commits. A chunk larger
+   than the whole pool is admitted when no permits are held. A chunk that fails
+   before any of its events lands returns its permits at once.
 7. **Upload concurrency.** At most `JETSTREAM_S3_UPLOAD_CONCURRENCY` (default 8)
-   uploads run at once, across all writer and maintainer work.
+   uploads run at once, across all writer and maintainer work. The process-wide
+   bound is the blob store's PUT limit. The writer separately bounds its
+   in-flight uploads, at the same default.
 8. **Total cap.** If frozen-but-uncommitted raw bytes exceed
    `JETSTREAM_HOT_PENDING_BYTES` (default 256MiB), every append blocks, live
    included. This is the last-resort backstop. Live appenders blocking means the
@@ -774,7 +797,21 @@ Rules:
 9. **Unfolded cap.** If the events in `hot_batches` (committed but not folded)
    exceed `JETSTREAM_HOT_MAX_UNFOLDED_EVENTS` (default 65,536, which is 16
    blocks), every append blocks until folds catch up. This bounds PostgreSQL
-   growth when S3 is slow or down.
+   growth when S3 is slow or down. The writer counts committed-but-unfolded
+   events as its commit watermark minus its fold watermark. At open, the fold
+   watermark is the first `hot_batches` row. The maintainer moves it forward by
+   calling the closed block's `Folded` after the fold commits (§10.7). The cap
+   must be at least one block, or appends would wait for every block's age cut.
+
+Every admission wait also ends with the append's context, a writer failure, or
+Close. Gauges `jetstream_hot_pending_bytes{class}`,
+`jetstream_hot_unfolded_events`, and `jetstream_hot_inline_tokens` show the
+caps' state.
+
+Producers tag their context with the class (`ingest.WithClass`). Untagged
+appends are live. The live firehose consumer is live. The failed-repo retry
+loop is bulk; it also carries sync 1.1 resync replacements. Backfill runs in
+direct mode, so it has no class.
 
 Commits stay strictly in seq order, so a live inline batch that follows a pointer
 batch waits for the pointer's upload and read-back. During bulk recovery, live
@@ -839,7 +876,8 @@ BEGIN
 COMMIT
 ```
 
-4. Drop the block's events from leader memory.
+4. Drop the block's events from leader memory, and call the block's `Folded`
+   so the writer releases its events from the unfolded cap (§10.5 rule 9).
 5. If the rotation rule now fires, seal (§10.8) before the next fold.
 
 Deleting a pointer batch removes that object's hot reference. If the fold reused
