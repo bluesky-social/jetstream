@@ -74,19 +74,12 @@ func Open(dataDir string, m *Metrics, opts ...Option) (*Store, error) {
 	return &Store{st: st, dataDir: dataDir, onDisk: o.fs == nil}, nil
 }
 
-// New wraps an already-open store. The caller keeps ownership: Close on the
-// returned Store closes st. Transitional: jetstreamd opens the raw store once
-// and hands it to both ported and unported packages until S1.6.
-func New(st *store.Store, dataDir string) *Store {
-	return &Store{st: st, dataDir: dataDir, onDisk: true}
-}
-
 // Close releases the database. Idempotent.
 func (s *Store) Close() error { return s.st.Close() }
 
 func (s *Store) Get(_ context.Context, key []byte) ([]byte, error) {
 	val, closer, err := s.st.Get(key)
-	if errors.Is(err, store.ErrNotFound) {
+	if errors.Is(err, pebble.ErrNotFound) {
 		return nil, metastore.ErrNotFound
 	}
 	if err != nil {

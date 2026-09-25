@@ -12,7 +12,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/atmos"
@@ -142,12 +142,12 @@ type Options struct {
 	AfterRepoComplete      func(context.Context, atmos.DID) error
 	CrashInjector          crashpoint.Injector
 	// StoreFaultInjector is a test-only deterministic metadata-store write
-	// fault seam (store.FaultInjector). nil in production, where it is never
-	// installed on the store, so the fault path is unreachable. Used by the
+	// fault seam (metastore.FaultInjector). nil in production, where the
+	// store is never wrapped, so the fault path is unreachable. Used by the
 	// oracle store-fault tier to fail selected persistence ops by name and
 	// ordinal and assert the system fails loud rather than swallowing the
 	// error. Mirrors CrashInjector's nil-in-prod contract.
-	StoreFaultInjector store.FaultInjector
+	StoreFaultInjector metastore.FaultInjector
 	// SegmentIOFaultInjector is a test-only deterministic segment-file I/O
 	// fault seam (segment.IOFaultInjector), forwarded to the orchestrator so
 	// every segment writer plus the compaction-rewrite path consults it

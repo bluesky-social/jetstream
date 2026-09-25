@@ -21,11 +21,11 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/server"
 	"github.com/bluesky-social/jetstream/internal/status"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/internal/version"
@@ -49,7 +49,7 @@ type Runtime struct {
 
 	tracerShutdown obs.TracerShutdown
 	cancelManifest context.CancelFunc
-	metaStore      *store.Store
+	metaStore      *pebblestore.Store
 	manifest       *manifest.Manifest
 	tail           *subscribe.Tail
 	verifier       *atmossync.Verifier
@@ -171,7 +171,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.tracerShutdown = tracerShutdown
 
 	metrics := obs.NewMetrics()
-	storeMetrics := store.NewMetrics(metrics.Registry)
+	storeMetrics := pebblestore.NewMetrics(metrics.Registry)
 	segmentMetrics := obs.NewSegmentMetrics(metrics.Registry)
 	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
 	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
@@ -188,17 +188,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: create segments dir %s: %w", segmentsDir, err))
 	}
 
-	metaStore, err := store.Open(opts.DataDir, storeMetrics,
-		store.WithFS(opts.StorageFS),
-		store.WithFaultInjector(opts.StoreFaultInjector),
-	)
+	metaStore, err := pebblestore.Open(opts.DataDir, storeMetrics, pebblestore.WithFS(opts.StorageFS))
 	if err != nil {
 		return fail(err)
 	}
 	rt.metaStore = metaStore
-	// Transitional until S1.6: packages already on metastore share the one raw
-	// store, so its fault injector still fires exactly once per write.
-	metaKV := pebblestore.New(metaStore, opts.DataDir)
+	var metaKV metastore.Store = metaStore
+	if opts.StoreFaultInjector != nil {
+		metaKV = metastore.WithFaults(metaStore, opts.StoreFaultInjector)
+	}
 
 	manifestCtx, cancelManifest := context.WithCancel(ctx)
 	rt.cancelManifest = cancelManifest
@@ -246,7 +244,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	resolver := newIdentityResolver(opts)
 	directory := &identity.Directory{
 		Resolver:               resolver,
-		Cache:                  identcache.New(identcache.NewPebbleKV(metaKV), identcache.DefaultTTL),
+		Cache:                  identcache.New(identcache.NewPebbleKV(metaStore), identcache.DefaultTTL),
 		SkipHandleVerification: true,
 	}
 

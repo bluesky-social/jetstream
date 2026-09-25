@@ -419,7 +419,7 @@ refreshed STALE mutants.
     `metastore.DiskStats` interface that only the Pebble impl implements.
   - `store/encoding.go` helpers (`GetUint64LE`, `Get/SetVersionedUint64LE`,
     `PrefixUpperBound`) move to `metastore` as backend-neutral functions.
-- [ ] **S1.6 NewIter audit and `internal/store` shrink** (S). Deps: S1.4, S1.5.
+- [x] **S1.6 NewIter audit and `internal/store` shrink** (S). Deps: S1.4, S1.5.
   - Record the audit in the design (§14.2 asks for it). Survey verdicts:
 
     | Site | Verdict |
@@ -1224,6 +1224,24 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S1.6 (2026-09-25): `internal/store` shrink.**
+  - The audit is recorded in design §14.2. Six metadata call sites all
+    tolerate a non-snapshot scan. The rest of the "12" were tests or the
+    simulator's own Pebble.
+  - `internal/store` keeps `Open`/`Close`, `WithFS`, the instrumented
+    `Get`/`Set`/`Delete`/`Commit`, metrics, and `SyncWrites`. The fault
+    seam, encoding helpers, and `ErrNotFound` alias are gone, and so is
+    `pebblestore.New`.
+  - `TestOnlyPebblestoreImportsStore` enforces that only `pebblestore`
+    imports the package. jetstreamd no longer imports it either: it opens
+    `pebblestore` directly, so it is not on the allowlist the plan
+    suggested.
+  - jetstreamd wraps with `metastore.WithFaults` only when
+    `Options.StoreFaultInjector` is set.
+  - The identity cache stays on the unwrapped store. Its writes are best
+    effort and their errors are ignored, so a fault injected there could
+    never be observed. That leaves them outside the store-fault tier, and
+    the durable-order recorder no longer sees them.
 - **S1.2, S1.4, S1.5 (2026-09-25): one commit, not three.** The
   `DurableBatchHook` signature and the `ingest.Config.Store` type reach backfill,
   the orchestrator, status, and jetstreamd, so porting ingest alone would

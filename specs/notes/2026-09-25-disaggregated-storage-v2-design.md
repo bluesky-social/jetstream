@@ -1263,9 +1263,20 @@ interface. `DurableBatchHook` takes `metastore.Batch`.
   transaction, it is applied inside that transaction instead of its own.
 - **Iterator**: keyset paging, `WHERE key >= $lower AND key < $upper AND key >
   $last ORDER BY key LIMIT 10000`. Each page is its own read. An iterator is not
-  a snapshot. Stage 1 must audit all 12 `NewIter` call sites and record, for
-  each, why a non-snapshot scan is safe, or change the caller. The `bytea`
-  comparison is bytewise, which matches Pebble's default comparer.
+  a snapshot. The `bytea` comparison is bytewise, which matches Pebble's
+  default comparer. The Stage 1 audit (S1.6) found six metadata `NewIter`
+  call sites, and all tolerate a non-snapshot scan. The rest of the
+  original 12 were tests or the simulator's own Pebble, which is not
+  metadata.
+
+  | Site | Why a non-snapshot scan is safe |
+  |---|---|
+  | `backfill/counts.go` `CountStatuses` | Display only. The counts seed that relied on it runs once per session before any `repo/` writer starts (S1.4). A missing counts row after that is an internal error, not a re-tally. |
+  | `backfill/retry.go` `scanDue` | A row that changes mid-scan is seen in either state, or is picked up next pass. The failure or completion write re-reads the row under `countsMu` before applying. |
+  | `backfill/status.go` `ListPDSHosts` | Display only. |
+  | `backfill/diagnostics.go` `ListHostStatuses` | Display only. |
+  | `ingest/seqlease.go` `loadSeqGaps` | Runs at writer open, before the single writer produces gaps. Local mode only (§10.1). |
+  | `status/collect.go` `countKeysWithPrefix` | Display only. Costly on PostgreSQL; S2.14 replaces it. |
 - **Reader pods** get a read-only Store. Writes return an error.
 
 ### 14.3 Load

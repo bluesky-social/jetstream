@@ -40,7 +40,9 @@ internal/
   subscribe/      websocket /subscribe endpoint (v1 protocol parity) + cold reader
   xrpcapi/        archive download over HTTP/XRPC (planSnapshot, getSegment, getBlock)
   server/         HTTP listeners (public :8080, opt-in debug :6060) and middleware
-  store/          pebble-backed cursor + metadata store
+  metastore/      metadata store interface (cursors, seq, backfill rows); pebblestore/ (local), memstore/ (tests), storetest/ (contract)
+  store/          instrumented pebble handle; only metastore/pebblestore may import it
+  objstore/       object (blob) store interface; memblob/ (tests), blobtest/ (contract)
   manifest/       segment manifest (directory scan + self-describing headers)
   tombstone/      delete/update/account tombstone set for compaction
   repoexport/     reconstruct a repo CAR/MST from archived events

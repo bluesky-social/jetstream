@@ -32,7 +32,7 @@ The live consumer and backfill both write through a shared `ingest.Writer` (`int
 Two places hold state:
 
 - **Segment files** (`segment/`): the columnar, zstd-compressed, append-only logs. An active segment is a file state machine (append → flush → fsync → seal); sealing finalizes it into an immutable file with a footer full of indexes. The `segment` package is pure format code — no goroutines, no timers, no lifecycle — and is intentionally public API. Read `segment/doc.go` and `docs/README.md` §3.1–§3.2.
-- **The metadata store** (`internal/store`, pebble at `data/meta.pebble/`): everything that isn't cheaply re-derivable from segments — the upstream cursor, lifecycle phase, durable seq coverage frontier, write-ahead seq lease and registered vacancies, per-DID backfill/PDS status, durable PDS roster and host-local cursors, account/sync state, compaction watermark. The manifest is deliberately *not* here; it's just a directory scan plus self-describing file headers. Read `docs/README.md` §3.5.
+- **The metadata store** (the `internal/metastore` interface; local mode is `internal/metastore/pebblestore`, pebble at `data/meta.pebble/`): everything that isn't cheaply re-derivable from segments — the upstream cursor, lifecycle phase, durable seq coverage frontier, write-ahead seq lease and registered vacancies, per-DID backfill/PDS status, durable PDS roster and host-local cursors, account/sync state, compaction watermark. The manifest is deliberately *not* here; it's just a directory scan plus self-describing file headers. Read `docs/README.md` §3.5.
 
 The durability ordering between these two is the invariant that keeps a crash safe: segment fsync first, pebble commit second. See `specs/invariants.md`.
 
@@ -61,7 +61,7 @@ The test rig checks storage and delivery across the full lifecycle.
 | A term I don't recognize | `specs/glossary.md` |
 | Accepted limitations / past mistakes | `specs/gotchas.md` |
 | The on-disk segment format | `segment/doc.go`, `docs/README.md` §3.1–§3.2 |
-| The metadata store keys | `internal/store`, `docs/README.md` §3.5 |
+| The metadata store keys | `internal/metastore`, `docs/README.md` §3.5 |
 | The ingest lifecycle / cutover | `internal/ingest/orchestrator/doc.go`, `docs/README.md` §4 |
 | Initial backfill | `internal/ingest/backfill/doc.go`, `docs/README.md` §4.1 |
 | The live firehose consumer | `internal/ingest/live/doc.go`, `docs/README.md` §4.1, §4.3 |

@@ -9,11 +9,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// ErrNotFound is re-exported for callers that want a stable handle
-// on the "key absent" outcome without importing pebble. It aliases
-// pebble.ErrNotFound so errors.Is keeps working through the wrapper.
-var ErrNotFound = pebble.ErrNotFound
-
 const (
 	statusOK       = "ok"
 	statusNotFound = "notfound"
