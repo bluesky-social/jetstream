@@ -10,19 +10,17 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
-	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble/vfs"
 )
 
 type mergeRunner struct {
 	dst           *ingest.Writer
 	store         metastore.Store
-	sourceDir     string
-	fs            vfs.FS
+	src           SegmentCatalog
 	logger        *slog.Logger
 	metrics       *Metrics
 	crashInjector crashpoint.Injector
@@ -34,12 +32,13 @@ type mergeRunner struct {
 // simulator (crashpoint.Injector); production callers thread
 // o.cfg.CrashInjector, which is nil in production, making every
 // simulateCrash checkpoint a no-op. Pass nil to disable injection.
-func newMergeRunner(dst *ingest.Writer, st metastore.Store, sourceDir string, fs vfs.FS, logger *slog.Logger, m *Metrics, injector crashpoint.Injector) *mergeRunner {
+//
+// Sources are src's catalog.BootstrapLive segments.
+func newMergeRunner(dst *ingest.Writer, st metastore.Store, src SegmentCatalog, logger *slog.Logger, m *Metrics, injector crashpoint.Injector) *mergeRunner {
 	r := &mergeRunner{
 		dst:           dst,
 		store:         st,
-		sourceDir:     sourceDir,
-		fs:            fs,
+		src:           src,
 		logger:        logger.With(slog.String("component", "orchestrator/merge")),
 		metrics:       m,
 		crashInjector: injector,
@@ -60,20 +59,23 @@ func (r *mergeRunner) run(ctx context.Context) error {
 			return err
 		}
 
-		all, err := ingest.SegmentFilesFS(r.fs, r.sourceDir)
-		if err != nil {
-			return fmt.Errorf("orchestrator: merge: list source segments: %w", err)
-		}
+		// Nothing writes the sources during merge, so one view serves the
+		// whole drain.
+		view := r.src.Snapshot()
+		all := view.Segments(catalog.BootstrapLive)
 
 		// Skip already-drained sources; verify contiguity from fromIdx.
-		var todo []ingest.SegmentFile
+		var todo []catalog.SegmentView
 		expectIdx := fromIdx
 		for _, sf := range all {
-			if sf.Idx < fromIdx {
+			if sf.Index < fromIdx {
 				continue
 			}
-			if sf.Idx != expectIdx {
-				return fmt.Errorf("orchestrator: merge: source index gap: expected %d, got %d", expectIdx, sf.Idx)
+			if sf.Index != expectIdx {
+				return fmt.Errorf("orchestrator: merge: source index gap: expected %d, got %d", expectIdx, sf.Index)
+			}
+			if sf.State != catalog.Sealed {
+				return fmt.Errorf("orchestrator: merge: source segment %d is %s", sf.Index, sf.State)
 			}
 			todo = append(todo, sf)
 			expectIdx++
@@ -83,14 +85,14 @@ func (r *mergeRunner) run(ctx context.Context) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			perDID, err := r.processSourceSegment(ctx, sf)
+			perDID, err := r.processSourceSegment(ctx, view, sf)
 			if err != nil {
 				return err
 			}
 			if err := r.simulateCrash(ctx, crashpoint.AfterMergeDstFlushBeforeSourceCommit); err != nil {
 				return err
 			}
-			if err := commitSourceComplete(r.store, r.cache, sf.Idx+1, perDID, r.now()); err != nil {
+			if err := commitSourceComplete(r.store, r.cache, sf.Index+1, perDID, r.now()); err != nil {
 				return err
 			}
 			r.metrics.incMergeSegmentsConsumed()
@@ -107,29 +109,23 @@ func (r *mergeRunner) simulateCrash(ctx context.Context, point crashpoint.Point)
 	return r.crashInjector.SimulateCrash(ctx, point)
 }
 
-// processSourceSegment opens one source seg, iterates its blocks,
+// processSourceSegment reads one source seg's blocks through view,
 // applies the keep/drop predicate, appends survivors with re-stamped
 // WitnessedAt, returns the per-DID last-seen rev map. dst.Flush is
 // called before returning so the cursor commit that follows is
 // ordered after a fsync (§5.2).
-func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.SegmentFile) (map[string]string, error) {
+func (r *mergeRunner) processSourceSegment(ctx context.Context, view catalog.CatalogView, sf catalog.SegmentView) (map[string]string, error) {
 	return obs.Span2(ctx, func(ctx context.Context) (map[string]string, error) {
-		rd, err := segment.Open(segment.ReaderConfig{Path: sf.Path, FS: r.fs})
-		if err != nil {
-			return nil, fmt.Errorf("orchestrator: merge: open %s: %w", sf.Path, err)
-		}
-		defer func() { _ = rd.Close() }()
-
-		blockCount := int(rd.Header().BlockCount)
+		fetcher := r.src.Fetcher()
 		perDID := make(map[string]string)
 
-		for i := range blockCount {
+		for ref := range segmentRefs(view, sf) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			events, err := rd.DecodeBlock(i)
+			events, err := catalog.DecodeRef(ctx, fetcher, ref)
 			if err != nil {
-				return nil, fmt.Errorf("orchestrator: merge: decode %s block %d: %w", sf.Path, i, err)
+				return nil, fmt.Errorf("orchestrator: merge: decode source segment %d block %d: %w", sf.Index, ref.Block, err)
 			}
 			for j := range events {
 				ev := &events[j]

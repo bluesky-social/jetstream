@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/obs"
@@ -25,6 +26,9 @@ type Orchestrator struct {
 	logger *slog.Logger
 
 	compactionTrigger chan struct{}
+
+	segmentsOnce   sync.Once
+	segmentCatalog SegmentCatalog
 }
 
 // New validates cfg and returns an Orchestrator ready to Run.
@@ -63,8 +67,8 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		// A crash mid-rewrite can leave a segment-sized *.jss.tmp
 		// behind; reclaim it at boot even when compaction is disabled
 		// (each pass also cleans at start).
-		if err := removeStaleCompactionTempsFS(o.cfg.FS, filepath.Join(o.cfg.DataDir, "segments")); err != nil {
-			return err
+		if err := o.segments().RemoveStaleTemps(catalog.Main); err != nil {
+			return fmt.Errorf("orchestrator: compaction: %w", err)
 		}
 
 		o.logger.InfoContext(ctx, "starting", "phase", phase)

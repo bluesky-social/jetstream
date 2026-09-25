@@ -35,6 +35,12 @@ tiers: default
 diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
 --- a/internal/ingest/orchestrator/compact_deletes.go
 +++ b/internal/ingest/orchestrator/compact_deletes.go
-@@ -347 +347 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
+@@ -353,7 +353,7 @@
+ 						droppedByReason[reason]++
+ 						return segment.RowDrop
+ 					}
 -					return segment.RowKeep
 +					return segment.RowDrop
+ 				}, segment.RewriteOptions{
+ 					CrashInjector:   crashpoint.ForSegment(o.cfg.CrashInjector),
+ 					IOFaultInjector: o.cfg.SegmentIOFaultInjector,

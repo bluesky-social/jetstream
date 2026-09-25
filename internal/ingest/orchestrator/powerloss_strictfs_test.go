@@ -114,8 +114,8 @@ func runStrictMemCompactionPowerLossCase(t *testing.T, point crashpoint.Point) {
 // still PhaseMerging, live_segments reappears, the restart-after-cleanup guard
 // is skipped, and the drain re-runs from cursor 0 — appending the surviving
 // events a second time into data/segments. The test asserts the survivor lands
-// exactly once after recovery, which fails without the syncStorageDirFS call in
-// runMerge's cleanup.
+// exactly once after recovery, which fails without the parent-directory fsync
+// in the catalog's DeleteNamespace, which runMerge's cleanup calls.
 func TestRunMerge_StrictMemPowerLossCleanupComplete(t *testing.T) {
 	t.Parallel()
 
@@ -211,9 +211,9 @@ func TestRunMerge_StrictMemPowerLossCleanupGuard(t *testing.T) {
 
 	// Prior process removed the backfill tree but its dirent removal never
 	// reached stable storage (no data-dir fsync).
-	require.NoError(t, removeAllStorageFS(fs, fs.PathJoin(dataDir, "backfill")))
+	require.NoError(t, fs.RemoveAll(fs.PathJoin(dataDir, "backfill")))
 
-	// Current process: runMerge observes live_segments gone and takes the
+	// Current process: runMerge finds no bootstrap_live segments and takes the
 	// restart-after-cleanup guard, durably deleting the cursors.
 	o := newStrictMemMergeOrchestrator(dataDir, fs, st, nil)
 	require.NoError(t, o.runMerge(context.Background()))

@@ -387,7 +387,8 @@ func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T
 func TestMerge_SealsActiveSourceSegmentBeforeDrain(t *testing.T) {
 	t.Parallel()
 
-	// No sealed sources from the fixture; we build the unsealed one by hand.
+	// The fixture leaves one empty sealed source; we build the unsealed one
+	// after it by hand.
 	fix := newMergeFixture(t, nil, map[string]string{"did:plc:active": "3l5"})
 	liveDir := filepath.Join(fix.dataDir, "backfill", "live_segments")
 
@@ -408,8 +409,8 @@ func TestMerge_SealsActiveSourceSegmentBeforeDrain(t *testing.T) {
 	// otherwise this test would pass for the wrong reason.
 	srcFiles, err := readSegFiles(liveDir)
 	require.NoError(t, err)
-	require.Len(t, srcFiles, 1)
-	require.False(t, isSealed(t, srcFiles[0]),
+	require.Len(t, srcFiles, 2)
+	require.False(t, isSealed(t, srcFiles[1]),
 		"precondition: trailing source segment must be active/unsealed")
 
 	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
@@ -596,10 +597,7 @@ func TestMerge_DiscoveryHostErrorExhaustsAndCutoverContinues(t *testing.T) {
 // main-namespace seals to onSealed.
 func manifestCatalog(t *testing.T, dataDir string, onSealed func(idx uint64, path string) error) *localcatalog.Catalog {
 	t.Helper()
-	c, err := localcatalog.New(localcatalog.Config{Dirs: map[catalog.Namespace]string{
-		catalog.Main:          filepath.Join(dataDir, "segments"),
-		catalog.BootstrapLive: filepath.Join(dataDir, "backfill", "live_segments"),
-	}})
+	c, err := localcatalog.New(localcatalog.DataDirConfig(nil, dataDir))
 	require.NoError(t, err)
 	c.OnSealed(catalog.Main, func(v catalog.SegmentView, path string) error { return onSealed(v.Index, path) })
 	return c

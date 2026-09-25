@@ -6,7 +6,6 @@ package orchestrator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -17,16 +16,15 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/obs"
-	"github.com/bluesky-social/jetstream/segment"
 )
 
 // runMerge is the cutover state machine's State 5: drain
 // data/backfill/live_segments/ into data/segments/. Per the spec:
 //
-//  1. Restart guard: if data/backfill/live_segments/ is gone, the
-//     prior run finished cleanup; just delete the cursor keys (they
-//     may still be set if the prior run died between RemoveAll and
-//     the deletes) and return.
+//  1. Restart guard: if the bootstrap_live namespace has no segments,
+//     the prior run started cleanup; finish removing the namespace,
+//     delete the cursor keys (they may still be set if the prior run
+//     died between the removal and the deletes), and return.
 //  2. Open the destination ingest.Writer on data/segments/ with
 //     SeqKey=live.SteadySeqKey so survivors continue monotonically
 //     from where backfill left off.
@@ -34,8 +32,8 @@ import (
 //     effort Close the dst writer (NOT seal — partial-merge active
 //     must not be marked terminally sealed).
 //  4. On success: SealActiveAndClose the dst writer, run new-DID
-//     discovery (listRepos resume), RemoveAll the backfill tree,
-//     delete both cursor keys.
+//     discovery (listRepos resume), delete the bootstrap_live
+//     namespace (the backfill tree), delete both cursor keys.
 func (o *Orchestrator) runMerge(ctx context.Context) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
@@ -48,32 +46,39 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		liveSegmentsDir := filepath.Join(o.cfg.DataDir, "backfill", "live_segments")
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 
-		// Restart-after-cleanup guard.
-		if _, err := statStorageFS(o.cfg.FS, liveSegmentsDir); isStorageNotExist(err) {
+		segs := o.segments()
+		if err := segs.Refresh(ctx); err != nil {
+			return fmt.Errorf("orchestrator: merge: refresh segment catalog: %w", err)
+		}
+
+		// Restart-after-cleanup guard. The bootstrap-live writer creates its
+		// first segment when it opens, before phase=merging is written, so
+		// an empty namespace means a prior run reached cleanup, after
+		// discovery.
+		if len(segs.Snapshot().Segments(catalog.BootstrapLive)) == 0 {
 			// The prior process removed the backfill tree but may have died
 			// (e.g. SIGKILL, page cache intact) before that dirent removal was
-			// made durable. Observing live_segments as gone does not prove the
+			// made durable. Observing the namespace as empty does not prove the
 			// removal reached stable storage, and the cursor deletes below are
-			// SyncWrites (durable immediately). Fsync the data dir first so a
-			// power loss here cannot leave the cursors deleted while the backfill
-			// tree reappears — which would skip this guard next boot and re-drain
-			// from cursor 0, duplicating already-merged events.
-			if err := syncStorageDirFS(o.cfg.FS, o.cfg.DataDir); err != nil {
-				return fmt.Errorf("orchestrator: merge: sync data dir in restart-after-cleanup guard: %w", err)
+			// SyncWrites (durable immediately). DeleteNamespace fsyncs the data
+			// dir even when the tree is gone, so a power loss here cannot leave
+			// the cursors deleted while the backfill tree reappears — which
+			// would skip this guard next boot and re-drain from cursor 0,
+			// duplicating already-merged events.
+			if err := segs.DeleteNamespace(catalog.BootstrapLive); err != nil {
+				return fmt.Errorf("orchestrator: merge: remove backfill dir in restart-after-cleanup guard: %w", err)
 			}
 			if err := deleteMergeCursor(o.cfg.Store); err != nil {
 				return err
 			}
 			return nil
-		} else if err != nil {
-			return fmt.Errorf("orchestrator: merge: stat live_segments: %w", err)
 		}
 		// Seal guard: a crash at crashpoint.AfterBootstrapLiveCloseBeforeSeal
 		// (finishBootstrap closed the bootstrap-live consumer but died before
-		// re-opening it to seal) leaves the source tree with an unsealed
-		// trailing segment. The drain loop's segment.Open would reject it
-		// with ErrActiveSegment, so seal it here before draining.
-		if err := o.sealActiveMergeSource(ctx, liveSegmentsDir); err != nil {
+		// re-opening it to seal) leaves the source namespace with an unsealed
+		// trailing segment. The drain loop reads only sealed sources, so seal
+		// it here before draining.
+		if err := o.sealActiveMergeSource(ctx, segs, liveSegmentsDir); err != nil {
 			return err
 		}
 
@@ -88,7 +93,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			Logger:                     o.cfg.Logger,
 			Metrics:                    o.cfg.IngestMetrics,
 			SegmentMetrics:             o.cfg.SegmentMetrics,
-			Catalog:                    o.cfg.Catalog,
+			Catalog:                    o.segments(),
 			Namespace:                  catalog.Main,
 			SegmentIOFaultInjector:     o.cfg.SegmentIOFaultInjector,
 		})
@@ -102,7 +107,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return err
 		}
 
-		runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.FS, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
+		runner := newMergeRunner(dst, o.cfg.Store, segs, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
 
 		if err := runner.run(ctx); err != nil {
 			if cerr := dst.Close(); cerr != nil {
@@ -146,7 +151,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 		// manifest-oblivious, so before serving ungates every manifest
 		// entry must match its on-disk header. Reconcile failure aborts
 		// the transition — internal-state correctness, crash-loud.
-		if err := o.reconcileCompactionManifestFromDisk(segmentsDir); err != nil {
+		if err := o.reconcileCompactionManifestFromDisk(ctx); err != nil {
 			return fmt.Errorf("orchestrator: merge-tail compaction manifest reconcile: %w", err)
 		}
 
@@ -168,19 +173,16 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return err
 		}
 
-		if err := removeAllStorageFS(o.cfg.FS, filepath.Join(o.cfg.DataDir, "backfill")); err != nil {
-			return fmt.Errorf("orchestrator: merge: remove backfill dir: %w", err)
-		}
-		// Make the backfill-subtree removal durable before deleting the merge
-		// cursors. deleteMergeCursor commits durably, so without
-		// this fsync a power loss could leave the cursor deletion durable while
-		// the data/backfill dirent removal is not. On restart the phase is
-		// still PhaseMerging, live_segments would reappear, the
+		// DeleteNamespace makes the backfill-subtree removal durable before
+		// the merge cursors are deleted. deleteMergeCursor commits durably,
+		// so without that a power loss could leave the cursor deletion
+		// durable while the data/backfill dirent removal is not. On restart
+		// the phase is still PhaseMerging, live_segments would reappear, the
 		// restart-after-cleanup guard would be skipped, and the drain would
 		// re-run from cursor 0 — appending already-merged events into
 		// data/segments and corrupting the archive.
-		if err := syncStorageDirFS(o.cfg.FS, o.cfg.DataDir); err != nil {
-			return fmt.Errorf("orchestrator: merge: sync data dir after backfill removal: %w", err)
+		if err := segs.DeleteNamespace(catalog.BootstrapLive); err != nil {
+			return fmt.Errorf("orchestrator: merge: remove backfill dir: %w", err)
 		}
 		if err := deleteMergeCursor(o.cfg.Store); err != nil {
 			return err
@@ -197,25 +199,17 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 // cutover, but a crash at crashpoint.AfterBootstrapLiveCloseBeforeSeal
 // can leave it active. Only the latest segment can be unsealed: the
 // bootstrap-live writer holds exactly one active segment and rotation
-// seals the old file before opening the next, so checking
-// files[len-1] is sufficient. Idempotent — a no-op when the trailing
+// seals the old file before opening the next, so checking the last
+// segment is sufficient. Idempotent — a no-op when the trailing
 // segment is already sealed.
-func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDir string) error {
-	files, err := ingest.SegmentFilesFS(o.cfg.FS, liveSegmentsDir)
-	if err != nil {
-		return fmt.Errorf("orchestrator: merge: list source segments before seal guard: %w", err)
-	}
-	if len(files) == 0 {
+func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, segs SegmentCatalog, liveSegmentsDir string) error {
+	src := segs.Snapshot().Segments(catalog.BootstrapLive)
+	if len(src) == 0 {
 		return nil
 	}
-
-	latest := files[len(files)-1]
-	rd, err := segment.Open(segment.ReaderConfig{Path: latest.Path, FS: o.cfg.FS})
-	if err == nil {
-		return rd.Close()
-	}
-	if !errors.Is(err, segment.ErrActiveSegment) {
-		return fmt.Errorf("orchestrator: merge: inspect source segment %s: %w", latest.Path, err)
+	latest := src[len(src)-1]
+	if latest.State == catalog.Sealed {
+		return nil
 	}
 
 	w, err := ingest.Open(ingest.Config{
@@ -228,6 +222,8 @@ func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDi
 		Metrics:                nil,
 		SegmentMetrics:         o.cfg.SegmentMetrics,
 		MaxSegmentBytes:        0,
+		Catalog:                segs,
+		Namespace:              catalog.BootstrapLive,
 		SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 	})
 	if err != nil {
@@ -236,6 +232,6 @@ func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDi
 	if err := w.SealActiveAndClose(); err != nil {
 		return fmt.Errorf("orchestrator: merge: seal active source: %w", err)
 	}
-	o.logger.InfoContext(ctx, "sealed active bootstrap-live source before merge", "segment", latest.Idx)
+	o.logger.InfoContext(ctx, "sealed active bootstrap-live source before merge", "segment", latest.Index)
 	return nil
 }

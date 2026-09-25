@@ -41,7 +41,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			Metrics:                o.cfg.IngestMetrics,
 			SegmentMetrics:         o.cfg.SegmentMetrics,
 			AsyncFlushWorkers:      o.cfg.BackfillAsyncFlushWorkers,
-			Catalog:                o.cfg.Catalog,
+			Catalog:                o.segments(),
 			Namespace:              catalog.Main,
 			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
@@ -66,7 +66,7 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			MaxSegmentBytes:   o.cfg.BootstrapLiveMaxSegmentBytes,
 			MaxEventsPerBlock: o.cfg.BootstrapLiveMaxEventsPerBlock,
 			SegmentMetrics:    o.cfg.SegmentMetrics,
-			Catalog:           o.cfg.Catalog,
+			Catalog:           o.segments(),
 			Namespace:         catalog.BootstrapLive,
 			OnEvent:           o.cfg.OnBootstrapLiveEvent,
 			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
@@ -257,6 +257,8 @@ func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.
 			// segment.Writer in the process recording into the same
 			// series.
 			SegmentMetrics:         o.cfg.SegmentMetrics,
+			Catalog:                o.segments(),
+			Namespace:              catalog.BootstrapLive,
 			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
