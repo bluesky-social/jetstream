@@ -471,7 +471,7 @@ refreshed STALE mutants.
       Neither may panic; errors are fine.
     - `just bench ./segment` against baseline: no regression on the
       seal/flush hot paths.
-- [ ] **S1.8 `ObjectStore` interfaces and in-memory blob** (S). Deps: S0.
+- [x] **S1.8 `ObjectStore` interfaces and in-memory blob** (S). Deps: S0.
   - `internal/objstore`: `Blob` and `Store` interfaces (D2), `memblob` with a
     fault injector (ops `put`/`get`/`get_range`/`delete`, key-prefix plus
     ordinal, modeled on `segment/iofault.go` and `store/fault.go`). The faults
@@ -598,7 +598,7 @@ refreshed STALE mutants.
     the same observer.
   - `durable_order_test.go` stays local-only by design (fsync ordering). Note
     that in `specs/oracle.md`.
-- [ ] **S1.14 Measurement: `next_seq - readable_log_durable_seq`** (S).
+- [x] **S1.14 Measurement: `next_seq - readable_log_durable_seq`** (S).
   - Explain why pop1 shows 7 (design §22 stage 1). Likely the unflushed
     partial block, since there are no age cuts (finding 3), but confirm with a
     test or trace. Record the explanation in the design.
@@ -1223,6 +1223,40 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S1.14 (2026-09-25): measurement recorded in design §22.1.** The 7 was
+  one instantaneous sample of a 0–4096 sawtooth: the events in the unflushed
+  partial block. A 6h pop1 range query gave a mean of 2,132, a minimum of 5,
+  and a maximum of 4,096. `TestPendingGaugeIsPartialBlockSawtooth` pins the
+  relationship.
+  - Finding 3 is slightly too strong. There is no age cut, but three rare
+    paths flush a partial block besides the count cut: the retry pass's
+    `DrainDurability`, compaction's `ForceRotate`, and `Close`.
+  - No bug. Dashboards should read this gauge with `avg_over_time` or
+    `max_over_time`.
+- **S1.8 (2026-09-25): objstore interfaces.**
+  - Range reads follow S3. A read past the end is truncated. A read that
+    starts at or after the end, a negative offset, or `n <= 0` returns
+    `ErrInvalidRange`. `objstore.RangeLen` holds the rule so every backend
+    agrees.
+  - `objstore.Verify(data, wantLen, wantSHA256)` checks length before hash
+    and returns `ErrCorrupt`. The S2.5 `Store` will use it.
+  - memblob fault kinds:
+    - `error`;
+    - `error_after`, which applies the put or delete and then fails, like
+      a lost response;
+    - `wrong_bytes`, which corrupts the stored object on put and only the
+      returned copy on get;
+    - `drop_put`, which acknowledges the PUT but does not store it.
+
+    A kind that makes no sense for an op makes the op fail rather than
+    being ignored.
+  - `ErrNotFound` is documented as "maybe missing": an S3 blob may map
+    both 404 and 403 to it, and the protocol layer decides from catalog
+    state (finding 14).
+  - The wrong-bytes contract case is in `blobtest`, gated on
+    `Config.NewWrongBytes`, so the S3 blob can run it through its
+    RoundTripper in S2.5.
 
 - **S1.1 (2026-09-25): metastore interface.**
   - The Pebble impl lives at `internal/metastore/pebblestore` (package
