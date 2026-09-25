@@ -64,6 +64,9 @@ type Runtime struct {
 	// pending is the first session, built by Build so invalid options fail
 	// there. Guarded by closeMu.
 	pending *writerSession
+	// disagg is set in disaggregated mode, where it replaces metaStore,
+	// catalogLoad, and the local writer lock.
+	disagg *disaggregated
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
@@ -166,8 +169,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		"storage_mode", opts.Storage.EffectiveMode(),
 	)
 	if opts.Storage.Disaggregated() {
-		logger.Info("storage config", "storage", opts.Storage)
-		return nil, errDisaggregatedUnavailable
+		return buildDisaggregated(ctx, opts, processLogger, logger)
 	}
 	if opts.Storage.storageSettingsSet() {
 		logger.Warn("disaggregated storage settings are ignored because JETSTREAM_STORAGE is local", "storage", opts.Storage)
@@ -603,49 +605,17 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 
 	g, gctx := errgroup.WithContext(runCtx)
 
-	g.Go(r.goroutineRoot("manifest_cancel", func() error {
-		<-gctx.Done()
-		r.cancelManifestLoad()
-		return nil
-	}))
-
-	g.Go(r.goroutineRoot("manifest_wait", func() error {
-		if err := r.manifest.Wait(gctx); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return fmt.Errorf("manifest load: %w", err)
-		}
-		return nil
-	}))
-
-	g.Go(r.goroutineRoot("catalog_wait", func() error {
-		if err := r.catalogLoad.Wait(gctx); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return fmt.Errorf("catalog load: %w", err)
-		}
-		return nil
-	}))
+	if r.disagg != nil {
+		r.runDisaggregated(gctx, g)
+	} else {
+		r.runLocal(gctx, g)
+	}
 
 	if !r.opts.Headless {
 		g.Go(r.goroutineRoot("http_server", func() error {
 			return r.server.Run(gctx)
 		}))
 	}
-
-	// Local mode always holds the lock, so the loop runs one session at a
-	// time until shutdown or a fatal error. A session error wrapping
-	// leader.ErrRestartSession starts a fresh session in-process instead.
-	g.Go(r.goroutineRoot("writer_sessions", func() error {
-		return leader.Run(gctx, leader.Config{
-			Locker:          leader.Local{},
-			AcquireInterval: r.opts.SessionRestartDelay,
-			Logger:          r.processLogger.With(slog.String("component", "leader")),
-			Metrics:         r.leaderMetrics,
-		}, r.runSession)
-	}))
 
 	// Graceful client drain. Live websocket subscribers are hijacked
 	// connections, so http.Server.Shutdown neither tracks nor closes
@@ -675,6 +645,48 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		runErr = nil
 	}
 	return runErr
+}
+
+// runLocal starts local mode's goroutines: the background manifest and
+// catalog loads, and writer sessions under the always-held local lock.
+func (r *Runtime) runLocal(gctx context.Context, g *errgroup.Group) {
+	g.Go(r.goroutineRoot("manifest_cancel", func() error {
+		<-gctx.Done()
+		r.cancelManifestLoad()
+		return nil
+	}))
+
+	g.Go(r.goroutineRoot("manifest_wait", func() error {
+		if err := r.manifest.Wait(gctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return fmt.Errorf("manifest load: %w", err)
+		}
+		return nil
+	}))
+
+	g.Go(r.goroutineRoot("catalog_wait", func() error {
+		if err := r.catalogLoad.Wait(gctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return fmt.Errorf("catalog load: %w", err)
+		}
+		return nil
+	}))
+
+	// Local mode always holds the lock, so the loop runs one session at a
+	// time until shutdown or a fatal error. A session error wrapping
+	// leader.ErrRestartSession starts a fresh session in-process instead.
+	g.Go(r.goroutineRoot("writer_sessions", func() error {
+		return leader.Run(gctx, leader.Config{
+			Locker:          leader.Local{},
+			AcquireInterval: r.opts.SessionRestartDelay,
+			Logger:          r.processLogger.With(slog.String("component", "leader")),
+			Metrics:         r.leaderMetrics,
+		}, r.runSession)
+	}))
 }
 
 func (r *Runtime) goroutineRoot(name string, fn func() error) func() error {
@@ -741,6 +753,9 @@ func (r *Runtime) Close(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("close metadata store: %w", err))
 		}
 		r.metaStore = nil
+	}
+	if runDrained {
+		r.closeDisaggregated()
 	}
 	if r.tracerShutdown != nil && runDrained {
 		if err := r.tracerShutdown(ctx); err != nil {

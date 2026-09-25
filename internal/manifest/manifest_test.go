@@ -497,3 +497,27 @@ func readCounter(t *testing.T, reg *prometheus.Registry, name string) float64 {
 	}
 	return 0
 }
+
+// TestResidentBytes pins that the §17 manifest measurement grows with the
+// resident footers: zero when empty, and more with every applied segment.
+func TestResidentBytes(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	m := mustOpenManifest(t, t.TempDir())
+	require.Zero(t, m.ResidentBytes())
+
+	var prev int64
+	for i := range uint64(3) {
+		path := filepath.Join(dir, fmt.Sprintf("seg_%010d.jss", i))
+		mustWriteSealedSegment(t, path, sealedFixture{
+			minSeq: i * 10, maxSeq: i*10 + 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
+		})
+		p, ok, err := manifest.ReadSegmentParts(nil, path)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.NoError(t, m.ApplySegment(i, p.Generation, p.Header, p.Footer, p.CreatedAt, p.Size))
+		n := m.ResidentBytes()
+		require.Greater(t, n, prev, "segment %d", i)
+		prev = n
+	}
+}

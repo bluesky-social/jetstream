@@ -391,7 +391,9 @@ func openHot(cfg Config) (*Writer, error) {
 
 	w := &Writer{cfg: cfg, nextSeq: next, durableNextSeq: next}
 	w.gaps, _ = seqspace.NewGaps(nil)
-	w.readLog = newReadableLog(next, cfg.ReadLogRetentionBytes, cfg.Metrics)
+	// Subscribers read the catalog follower's log, which owns the read-log
+	// gauges; this one only holds events until they commit.
+	w.readLog = newReadableLog(next, cfg.ReadLogRetentionBytes, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &hotWriter{
 		cfg:      &w.cfg,

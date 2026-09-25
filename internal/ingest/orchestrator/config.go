@@ -216,6 +216,13 @@ type Config struct {
 	// manifest. Nil uses a private local catalog over DataDir.
 	Catalog SegmentCatalog
 
+	// Hot, when set, runs disaggregated mode (design §10.10): the
+	// steady-state writer runs in hot mode against the leader session, and
+	// DataDir, FS, and Catalog are unused. Only phase steady_state can run;
+	// bootstrap and merge in disaggregated mode are stage 3, so any other
+	// phase is a fatal error. Compaction must be off (D5).
+	Hot *ingest.HotConfig
+
 	// OnSegmentCompacted refreshes serving metadata after a sealed segment is
 	// rewritten by compaction. cmd/jetstream wires this to the manifest refresh
 	// path (which verifies the rewritten file's checksum as an integrity gate).
@@ -315,8 +322,11 @@ type Config struct {
 }
 
 func (c *Config) validate() error {
-	if c.DataDir == "" {
+	if c.DataDir == "" && c.Hot == nil {
 		return fmt.Errorf("%w: DataDir is required", ErrInvalidConfig)
+	}
+	if c.Hot != nil && (c.Catalog != nil || c.CompactionInterval != 0) {
+		return fmt.Errorf("%w: Hot takes neither Catalog nor CompactionInterval", ErrInvalidConfig)
 	}
 	if c.Store == nil {
 		return fmt.Errorf("%w: Store is required", ErrInvalidConfig)

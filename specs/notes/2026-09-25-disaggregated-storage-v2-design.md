@@ -420,8 +420,11 @@ corruption it re-reads the row once more, so a concurrent GC claim is not
 misreported. On reads only, S3 404 and 403 `AccessDenied` both mean "maybe
 missing" (real AWS returns 403 for a missing key without ListBucket). A 403 on
 a write is always an error. A read 403 caused by a broken bucket policy
-therefore looks like a missing object; a startup canary PUT/GET/DELETE
-(S2.16/S3.4) catches that case before it is reported as corruption.
+therefore looks like a missing object. To catch that case before it is
+reported as corruption, every pod runs a canary at start (§15.2 step 2):
+`objstore.Probe` PUTs, GETs, compares, and DELETEs
+`<prefix>/<archive_id>/probe/<uuid>`, and any failure refuses startup.
+`storage init` (§15.1) reuses the same probe.
 
 Missing object or hash mismatch:
 
@@ -567,6 +570,10 @@ Notes:
   The next session rebuilds from what actually committed.
 - Reader transactions (the follower and on-demand lookups) use `REPEATABLE READ
   READ ONLY`, so one tick sees one consistent snapshot.
+- A leader session's metadata reads are autocommit queries outside any
+  transaction. A failed read (other than not-found, or the session's own
+  cancellation) also ends the session, so a dropped connection restarts the
+  session instead of reaching the election loop as a fatal error.
 
 ### 9.2 Visibility rule
 
@@ -1526,12 +1533,19 @@ data. This is accepted for now and must be measured.
 
 1. Load config. Check the configurable memory budgets (§17) and the GC-delay
    inequality (§11.7).
-2. Connect to PostgreSQL. Check `schema_version` and `format_version`.
+2. Connect to PostgreSQL. Check `schema_version` and `format_version`. Run
+   the object-store canary (§7.5).
 3. Start the follower and do the first full mirror load. Load footers. Check the
-   memory budgets again, this time including the measured manifest size.
+   memory budgets again, this time including the measured manifest size. If
+   the catalog is not yet in `steady_state` there are no footers to measure;
+   the pod logs a warning and skips the recheck.
 4. Start the HTTP servers. The pod becomes ready once the mirror is fresh,
    `phase = steady_state`, and all footers are loaded.
 5. Start the election loop.
+
+Until stage 3 adds disaggregated bootstrap and merge, a leader session that
+finds any phase other than `steady_state` exits the process. Restarting would
+only find the same phase again.
 
 ### 15.3 Failover
 
@@ -1602,7 +1616,9 @@ Rules:
 - `GOMEMLIMIT` must be set in disaggregated mode. Refuse to start without it.
 - At start, add up the configurable budgets plus the measured manifest size. If
   the total exceeds 75% of `GOMEMLIMIT`, refuse to start with a message listing
-  each budget.
+  each budget. The check runs twice: before connecting, without the manifest,
+  and after the first load, with `Manifest.ResidentBytes()`. That value is an
+  estimate from entry counts and slice lengths, not a heap measurement.
 - The compressed object cache is an LRU keyed by object SHA-256. It holds raw
   object bytes (block frames and pointer-batch frames), not footers. Footers live
   in the manifest.

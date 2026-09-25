@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/bluesky-social/jetstream/internal/objstore"
+	"github.com/bluesky-social/jetstream/internal/objstore/memblob"
 )
 
 func TestVerify(t *testing.T) {
@@ -69,4 +70,33 @@ func TestKey(t *testing.T) {
 	require.Len(t, s, 36)
 	require.Equal(t, byte('4'), s[14], "version nibble")
 	require.Contains(t, "89ab", string(s[19]), "variant nibble")
+}
+
+// The probe succeeds on a working store, leaves nothing behind, and names
+// the operation that failed on a broken one.
+func TestProbe(t *testing.T) {
+	t.Parallel()
+	archive := objstore.NewUUID()
+	prefix := objstore.FormatUUID(archive) + "/probe/"
+
+	b := memblob.New()
+	require.NoError(t, objstore.Probe(t.Context(), b, archive))
+	require.Empty(t, b.Keys(), "the probe object is deleted")
+
+	for _, tc := range []struct {
+		op   memblob.Op
+		kind memblob.FaultKind
+		want string
+	}{
+		{memblob.OpPut, memblob.FaultError, "probe put"},
+		{memblob.OpPut, memblob.FaultDropPut, "probe get"},
+		{memblob.OpGet, memblob.FaultError, "probe get"},
+		{memblob.OpGet, memblob.FaultWrongBytes, "differ"},
+		{memblob.OpDelete, memblob.FaultError, "probe delete"},
+	} {
+		b := memblob.New(memblob.WithFaultInjector(&memblob.KeyPrefixFault{Prefix: prefix, Op: tc.op, Kind: tc.kind, Ordinal: 1}))
+		err := objstore.Probe(t.Context(), b, archive)
+		require.ErrorContains(t, err, tc.want, "%s %s", tc.op, tc.kind)
+		require.Contains(t, err.Error(), prefix, "the error names the key")
+	}
 }

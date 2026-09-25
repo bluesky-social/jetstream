@@ -51,7 +51,14 @@ type sessionFactory struct {
 }
 
 func (f *sessionFactory) build() (*writerSession, error) {
-	stateStore := syncstate.New(f.store)
+	return f.buildWith(f.store, nil)
+}
+
+// buildWith builds a session over store. A non-nil hot runs the
+// orchestrator's writer in hot mode (disaggregated storage), where store is
+// the session's epoch-fenced handle.
+func (f *sessionFactory) buildWith(store metastore.Store, hot *ingest.HotConfig) (*writerSession, error) {
+	stateStore := syncstate.New(store)
 	tombstones := tombstone.New()
 	// A new session's schedule starts unknown, so archive responses are not
 	// cached until its compactor has scheduled a pass.
@@ -75,7 +82,8 @@ func (f *sessionFactory) build() (*writerSession, error) {
 	}
 
 	cfg := f.orch
-	cfg.Store = f.store
+	cfg.Store = store
+	cfg.Hot = hot
 	cfg.Verifier = verifier
 	cfg.SyncStateStore = stateStore
 	cfg.Tombstones = tombstones
@@ -102,6 +110,13 @@ func (r *Runtime) runSession(ctx context.Context, epoch uint64) error {
 	if err != nil {
 		return err
 	}
+	return r.runWriterSession(ctx, epoch, s)
+}
+
+// runWriterSession runs s to completion. It returns only after the
+// orchestrator and every session goroutine have stopped and the verifier is
+// closed.
+func (r *Runtime) runWriterSession(ctx context.Context, epoch uint64, s *writerSession) error {
 	r.orchMetrics.SetTombstones(s.tombstones)
 	r.deadline.set(s.schedule)
 	defer func() {
@@ -137,7 +152,7 @@ func (r *Runtime) runSession(ctx context.Context, epoch uint64) error {
 		})()
 	}()
 
-	err = s.orch.Run(ctx)
+	err := s.orch.Run(ctx)
 
 	close(stopDrain)
 	<-drainDone

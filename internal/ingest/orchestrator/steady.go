@@ -54,7 +54,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			tombstoneCap = 0
 		}
 
-		c, err := live.Open(live.Config{
+		cfg := live.Config{
 			DataDir:                  o.cfg.DataDir,
 			SegmentsDir:              segmentsDir,
 			FS:                       o.cfg.FS,
@@ -78,13 +78,22 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			MaxEventsPerBlock:     o.cfg.SteadyMaxEventsPerBlock,
 			OnEvent:               o.cfg.OnEvent,
 			OnUpstreamEventSeen:   o.cfg.LiveMetrics.NoteLastSeenUpstreamEvent,
-			Catalog:               o.segments(),
 			Namespace:             catalog.Main,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,
 			Dial:                  o.cfg.LiveDial,
 
 			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
-		})
+		}
+		if o.cfg.Hot != nil {
+			// Hot batches commit seq/next with their rows, so there is no
+			// seq lease, local directory, or local catalog.
+			cfg.Hot = o.cfg.Hot
+			cfg.DataDir, cfg.SegmentsDir, cfg.FS = "", "", nil
+			cfg.ReserveClientVisibleSeqs = false
+		} else {
+			cfg.Catalog = o.segments()
+		}
+		c, err := live.Open(cfg)
 		if err != nil {
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)
 		}

@@ -57,6 +57,13 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("orchestrator: read phase: %w", err)
 		}
+		if o.cfg.Hot != nil {
+			if phase != lifecycle.PhaseSteadyState {
+				return fmt.Errorf("orchestrator: disaggregated mode needs phase %q, found %q: bootstrap and merge in disaggregated mode are not available yet", lifecycle.PhaseSteadyState, phase)
+			}
+			o.logger.InfoContext(ctx, "starting", "phase", phase, "mode", "disaggregated")
+			return o.runSteadyState(ctx)
+		}
 		if phase == "" {
 			phase = lifecycle.PhaseBootstrap
 			if err := lifecycle.WritePhase(ctx, o.cfg.Store, phase, time.Now().UTC()); err != nil {

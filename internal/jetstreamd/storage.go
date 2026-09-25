@@ -169,11 +169,6 @@ func (c StorageConfig) EffectiveMode() StorageMode {
 // Disaggregated reports whether c selects disaggregated mode.
 func (c StorageConfig) Disaggregated() bool { return c.Mode == StorageDisaggregated }
 
-// errDisaggregatedUnavailable is returned by Build until the disaggregated
-// runtime is wired (plan S2.16), so a pod configured for it fails loudly
-// instead of quietly running local mode.
-var errDisaggregatedUnavailable = errors.New("serve: JETSTREAM_STORAGE=disaggregated is not available in this build yet")
-
 // Validate checks c on its own and against the rest of opts. Errors name
 // variables, never values, so none can carry the PG password.
 func (c StorageConfig) Validate(opts Options) error {
@@ -192,14 +187,17 @@ func (c StorageConfig) Validate(opts Options) error {
 	if opts.CompactionInterval > 0 {
 		return errors.New("serve: JETSTREAM_STORAGE=disaggregated requires JETSTREAM_COMPACTION_INTERVAL=0 (compaction is not supported in disaggregated mode yet)")
 	}
-	if c.PG.URL == "" {
-		return errors.New("serve: JETSTREAM_PG_URL is required when JETSTREAM_STORAGE=disaggregated")
-	}
-	if c.S3.Region == "" {
-		return errors.New("serve: JETSTREAM_S3_REGION is required when JETSTREAM_STORAGE=disaggregated")
-	}
-	if c.S3.Bucket == "" {
-		return errors.New("serve: JETSTREAM_S3_BUCKET is required when JETSTREAM_STORAGE=disaggregated")
+	// An injected backend replaces the PostgreSQL and S3 these name.
+	if opts.StorageBackend == nil {
+		if c.PG.URL == "" {
+			return errors.New("serve: JETSTREAM_PG_URL is required when JETSTREAM_STORAGE=disaggregated")
+		}
+		if c.S3.Region == "" {
+			return errors.New("serve: JETSTREAM_S3_REGION is required when JETSTREAM_STORAGE=disaggregated")
+		}
+		if c.S3.Bucket == "" {
+			return errors.New("serve: JETSTREAM_S3_BUCKET is required when JETSTREAM_STORAGE=disaggregated")
+		}
 	}
 	for name, v := range map[string]int64{
 		"JETSTREAM_PG_MAX_CONNS":             int64(c.PG.MaxConns),

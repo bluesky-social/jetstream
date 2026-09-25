@@ -6,15 +6,21 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
+	"github.com/bluesky-social/jetstream/internal/jetstreamd/jetstreamdtest"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/storagefake"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
@@ -27,6 +33,14 @@ import (
 const pgSecret = "hunter2-pg-secret"
 
 const secretPGURL = "postgres://jetstream:" + pgSecret + "@127.0.0.1:15432/jetstream?sslmode=disable"
+
+// TestMain clears any GOMEMLIMIT the environment set, so disaggregated
+// serve deterministically refuses at the §17 budget check before it tries
+// to reach the PostgreSQL the test URLs name.
+func TestMain(m *testing.M) {
+	debug.SetMemoryLimit(math.MaxInt64)
+	os.Exit(m.Run())
+}
 
 // lockedBuffer is a log sink shared with the runtime's goroutines.
 type lockedBuffer struct {
@@ -190,7 +204,7 @@ func TestServe_StorageValidation(t *testing.T) {
 		"zero budget":     {args: disaggregatedArgs("--object-cache-bytes=0"), want: "JETSTREAM_OBJECT_CACHE_BYTES must be > 0"},
 		"zero gc delay":   {args: disaggregatedArgs("--gc-delay=0"), want: "JETSTREAM_GC_DELAY must be > 0"},
 		"zero pool":       {args: disaggregatedArgs("--pg-max-conns=0"), want: "JETSTREAM_PG_MAX_CONNS must be > 0"},
-		"not wired yet":   {args: disaggregatedArgs(), want: "not available"},
+		"no GOMEMLIMIT":   {args: disaggregatedArgs(), want: "GOMEMLIMIT must be set"},
 		"negative hot":    {args: disaggregatedArgs("--hot-pending-bytes=-1"), want: "JETSTREAM_HOT_PENDING_BYTES must be > 0"},
 		"zero block age":  {args: disaggregatedArgs("--block-max-age=0"), want: "JETSTREAM_BLOCK_MAX_AGE must be > 0"},
 		"zero view age":   {args: disaggregatedArgs("--max-view-age=0"), want: "JETSTREAM_MAX_VIEW_AGE must be > 0"},
@@ -228,7 +242,9 @@ func TestServe_DisaggregatedStartupLogsRedactPGPassword(t *testing.T) {
 			args := disaggregatedArgs()
 			args = append(args[:1], append([]string{"--log-format=" + format}, args[1:]...)...)
 			err := app.Run(t.Context(), args)
-			require.ErrorContains(t, err, "not available")
+			// The budget check refuses before any connection, and after the
+			// config is logged.
+			require.ErrorContains(t, err, "GOMEMLIMIT must be set")
 			require.NotContains(t, err.Error(), pgSecret)
 
 			out := logs.String()
@@ -260,11 +276,10 @@ func TestServe_HelpOmitsPGPassword(t *testing.T) {
 	}
 }
 
-// Ground rule 7, runtime surfaces: a pod with a PG URL configured never
-// exposes the password on its startup logs, /status, or /metrics. The pod
-// runs local mode here because disaggregated mode is not wired yet (S2.16
-// should switch this test to disaggregated mode); local mode still logs
-// the storage config, in the warning that its settings are ignored.
+// Ground rule 7, runtime surfaces: a disaggregated pod with a PG URL
+// configured never exposes the password on its startup logs, /status, or
+// /metrics. The injected fake backend stands in for the PostgreSQL the URL
+// names.
 func TestServe_PGPasswordAbsentFromStatusAndLogs(t *testing.T) {
 	t.Parallel()
 
@@ -291,14 +306,19 @@ func TestServe_PGPasswordAbsentFromStatusAndLogs(t *testing.T) {
 	require.NoError(t, err)
 
 	storage := jetstreamd.DefaultStorageConfig()
+	storage.Mode = jetstreamd.StorageDisaggregated
 	storage.PG.URL = secretPGURL
+	storage.S3.Region = "us-east-1"
 	storage.S3.Bucket = "jetstream"
+	backend := jetstreamdtest.New(storagefake.Config{})
+	require.NoError(t, backend.SeedPhase(ctx, lifecycle.PhaseSteadyState))
 	var logs lockedBuffer
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
 		PublicAddr:                     "127.0.0.1:0",
 		DebugListener:                  debugLn,
-		DataDir:                        t.TempDir(),
 		Storage:                        storage,
+		StorageBackend:                 backend.Backend,
+		MemoryLimit:                    8 << 30,
 		RelayURL:                       relay.URL,
 		OTelServiceName:                "jetstream-test",
 		LogLevel:                       "debug",
@@ -358,7 +378,7 @@ func TestServe_PGPasswordAbsentFromStatusAndLogs(t *testing.T) {
 	require.NotContains(t, get("http://"+debugLn.Addr().String()+"/metrics"), pgSecret)
 
 	out := logs.String()
-	require.Contains(t, out, "disaggregated storage settings are ignored", "the storage config reached the log")
+	require.Contains(t, out, "storage config", "the storage config reached the log")
 	require.Contains(t, out, "xxxxx")
 	require.NotContains(t, out, pgSecret)
 

@@ -895,7 +895,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
     logs, the status snapshot, or `serve --help`.
   - `.env` gets no new secret values. README documents how to point `serve`
     at `just up`.
-- [ ] **S2.16 Runtime wiring for disaggregated mode** (L). Deps: S1.12,
+- [x] **S2.16 Runtime wiring for disaggregated mode** (L). Deps: S1.12,
   S2.3-S2.5, S2.8-S2.14.
   - Per process: pgx pool, read-only metastore, follower, mirror, manifest fed
     by the follower, object cache, and the identity cache as a pod-local LRU
@@ -1223,6 +1223,79 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.16 (2026-09-25): runtime wiring for disaggregated mode.**
+  - `jetstreamd.Build` branches to `buildDisaggregated` (`disagg.go`) in
+    §15.2 order:
+    1. §17 budget check, then `xrpcapi.CheckGCDelay`;
+    2. `pgstore.Open`, `s3.New`, `CheckVersions`, then the object-store canary;
+    3. objcache, Uploader, Reader, `manifest.NewRemote`, and the follower,
+       with a first `Refresh`;
+    4. the budget recheck with the manifest;
+    5. HTTP;
+    6. `leader.Run`.
+    `errDisaggregatedUnavailable` is gone.
+  - Injectable backend: `Options.StorageBackend` (DB, Listener, Blob,
+    Archive, NewLease, MetaStore factory, clock, Close) replaces the PG and S3
+    settings. When it is set, `StorageConfig.Validate` stops requiring
+    `JETSTREAM_PG_URL`, region, and bucket. `jetstreamdtest.New` builds one
+    from storagefake + memblob, and `SeedPhase` records a phase the way a
+    bootstrap would.
+  - Canary: `objstore.Probe` PUTs, GETs, compares, and DELETEs
+    `<archive_id>/probe/<uuid>`, and any failure refuses startup. It runs at
+    pod start, not leader-session start, because followers read objects too
+    and a denied GET there would also be misreported as corruption.
+    `storage init` (S3.4) reuses it. A leaked probe (failed DELETE) sits
+    outside `objects/`, so GC never considers it.
+  - Memory (§17), implemented here instead of stage 5:
+    - `GOMEMLIMIT` is required. `Options.MemoryLimit` overrides
+      `debug.SetMemoryLimit(-1)` for tests.
+    - The five configurable budgets plus the manifest must fit in 75% of the
+      limit, and the error lists each budget by env var.
+    - The manifest term is `Manifest.ResidentBytes()`, an estimate from
+      entry counts and slice lengths.
+    - The recheck runs only if the follower is `Ready` after the first
+      load. On a catalog not yet in `steady_state` it logs a warning.
+    - Limit gauges are registered per budget.
+    - `cmd/jetstream` tests pin `GOMEMLIMIT` in `TestMain`.
+  - Per session (`hotSession`):
+    1. a `sessionStore` wraps the fenced metastore;
+    2. `ReadPhase` — anything but `steady_state` is fatal until stage 3;
+    3. `maintainer.Open`, then `Rebuild`, then the shared
+       `runWriterSession` body with `HotConfig` (`OnCommit` = follower
+       doorbell, `OnFailure` cancels the session).
+    - The maintainer closes after the orchestrator, so the writer releases
+      first.
+    - There is no pending session: each leader session builds its own.
+  - Session errors: `sessionError` returns corruption as-is. Otherwise it
+    prefers `Session.Err()` (ended or fenced, both restartable) over the
+    error that surfaced, so a writer that failed because the session ended
+    restarts instead of exiting.
+  - `sessionStore`: metastore reads are autocommit queries outside any
+    session transaction. A failed Get, NewIter, or iterator Err (not
+    `ErrNotFound`, not the session's own cancellation) calls `Session.End`.
+    A dropped PG connection mid-read then restarts the session rather than
+    reaching `leader.DefaultFatal` unclassified. Design §9.1 records the rule.
+  - Other wiring:
+    - The hot writer's readable log has retention 0 and nil metrics. The
+      follower's log serves subscribers and owns the gauges.
+    - No `OnLogReady` hook: `tail.SetReadLogSource(f.Log)` is wired once at
+      build.
+    - Identity uses a pod-local LRU (100k entries, 24h TTL, finding 8).
+    - The Uploader's `Concurrency` and the Blob's `UploadConcurrency` both
+      come from `JETSTREAM_S3_UPLOAD_CONCURRENCY`. `GC.Delay` and
+      `GC.OrphanAge` go into `UploaderConfig`.
+  - Tests:
+    - `TestBuildDisaggregated_{MemoryBudgets,ObjectStoreCanary}`;
+    - `TestRunDisaggregated_RefusesNonSteadyPhase`;
+    - `TestSessionStore_ReadFailureEndsSession`;
+    - `TestResidentBytes`;
+    - `TestProbe`;
+    - the S2.15 leak test, which now runs a real disaggregated pod;
+    - `oracle.TestDisagg_RuntimeSteadyState`, the happy path: seeded catalog,
+      lease takeover, 24 live events through hot batches, and the public
+      client reading dense seqs that match ground truth. It takes 53ms and
+      was clean over 20 race-detector runs.
 
 - **S2.17 (2026-09-25): seeded-catalog test fixture.**
   - `oracle.SeedCatalog` builds a `steady_state` main catalog from a

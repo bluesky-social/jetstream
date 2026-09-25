@@ -1,6 +1,7 @@
 package objstore
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -135,6 +136,32 @@ func Verify(data []byte, wantLen int64, wantSHA256 [sha256.Size]byte) error {
 	}
 	if got := sha256.Sum256(data); got != wantSHA256 {
 		return fmt.Errorf("%w: sha256 %x, want %x", ErrCorrupt, got, wantSHA256)
+	}
+	return nil
+}
+
+// Probe PUTs, GETs, and DELETEs a small object under
+// <archive_id>/probe/<uuid> to check that the credentials can do all three
+// and that a read sees the write. It exists because a read 403 caused by a
+// broken bucket policy is indistinguishable from a missing object, so
+// without it the first read of an available object would be reported as
+// corruption rather than as a configuration error (design §7.5, §15).
+func Probe(ctx context.Context, b Blob, archiveID [16]byte) error {
+	id := NewUUID()
+	key := FormatUUID(archiveID) + "/probe/" + FormatUUID(id)
+	data := []byte("jetstream probe " + FormatUUID(id))
+	if err := b.PutKey(ctx, key, data); err != nil {
+		return fmt.Errorf("objstore: probe put %s: %w", key, err)
+	}
+	got, err := b.GetKey(ctx, key)
+	if err != nil {
+		return fmt.Errorf("objstore: probe get %s: %w", key, err)
+	}
+	if !bytes.Equal(got, data) {
+		return fmt.Errorf("objstore: probe get %s: read back %d bytes that differ from the %d written", key, len(got), len(data))
+	}
+	if err := b.DeleteKey(ctx, key); err != nil {
+		return fmt.Errorf("objstore: probe delete %s: %w", key, err)
 	}
 	return nil
 }

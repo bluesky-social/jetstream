@@ -152,6 +152,13 @@ type Options struct {
 	// ordinal and assert the system fails loud rather than swallowing the
 	// error. Mirrors CrashInjector's nil-in-prod contract.
 	StoreFaultInjector metastore.FaultInjector
+	// StorageBackend, when non-nil, is the shared storage a disaggregated
+	// pod runs on instead of the PostgreSQL and S3 that Storage names.
+	// Tests pass storagefake and memblob; production leaves it nil.
+	StorageBackend *StorageBackend
+	// MemoryLimit, when > 0, stands in for GOMEMLIMIT in disaggregated
+	// mode's budget check (design §17). Production leaves it 0.
+	MemoryLimit int64
 	// SegmentIOFaultInjector is a test-only deterministic segment-file I/O
 	// fault seam (segment.IOFaultInjector), forwarded to the orchestrator so
 	// every segment writer plus the compaction-rewrite path consults it

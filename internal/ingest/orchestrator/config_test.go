@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
@@ -63,4 +65,38 @@ func TestConfig_Validate_MissingFields(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	require.Contains(t, err.Error(), "Store")
+}
+
+func TestConfig_Validate_Hot(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig(t)
+	cfg.Hot, cfg.DataDir = &ingest.HotConfig{}, ""
+	require.NoError(t, cfg.validate())
+
+	cfg.CompactionInterval = time.Minute
+	require.ErrorIs(t, cfg.validate(), ErrInvalidConfig)
+}
+
+// TestRun_HotRefusesNonSteadyPhase pins that disaggregated mode never starts
+// bootstrap or merge, and never writes the initial phase itself.
+func TestRun_HotRefusesNonSteadyPhase(t *testing.T) {
+	t.Parallel()
+	for _, phase := range []lifecycle.Phase{"", lifecycle.PhaseBootstrap, lifecycle.PhaseMerging} {
+		t.Run(string(phase), func(t *testing.T) {
+			t.Parallel()
+			cfg := validBaseConfig(t)
+			cfg.Hot = &ingest.HotConfig{}
+			if phase != "" {
+				require.NoError(t, lifecycle.WritePhase(t.Context(), cfg.Store, phase, time.Now()))
+			}
+			o, err := New(cfg)
+			require.NoError(t, err)
+			err = o.Run(t.Context())
+			require.ErrorContains(t, err, "disaggregated mode needs phase")
+
+			got, err := lifecycle.ReadPhase(t.Context(), cfg.Store)
+			require.NoError(t, err)
+			require.Equal(t, phase, got)
+		})
+	}
 }
