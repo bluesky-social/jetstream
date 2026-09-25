@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/stretchr/testify/require"
@@ -192,13 +193,29 @@ func assertNoPermanentCursorGapExcept(t *testing.T, observed *eventLogRecorder, 
 
 const oracleDebugBaseURL = "http://debug.invalid"
 
+// adversarialDropCounterDeadline bounds, in bubble fake time, how long
+// assertAdversarialDropCounters waits for the counters to reach their
+// floors. The live reconnect backoff is 1ms, so this is thousands of
+// reconnects of headroom, and fake time makes a genuine miss cheap.
+const (
+	adversarialDropCounterDeadline = 5 * time.Second
+	adversarialDropCounterPoll     = 10 * time.Millisecond
+)
+
 // assertAdversarialDropCounters proves every scheduled lie fired: for
 // each ledgered gate-owned (source, reason), the absolute counter must
 // be ≥ the ledger floor (the runtime registry is process-fresh, so
 // absolute values ARE this run's deltas), and the full reason matrix
-// must be covered. Callers must reach bubble quiescence (drain) first:
-// a whole-event drop produces no ack-visible row, so without quiescence
-// the scrape can race the consumer processing the lie.
+// must be covered.
+//
+// A whole-event drop produces no ack-visible row, so nothing the harness
+// can wait on says the consumer has processed the lie. drain() alone is
+// not enough: synctest.Wait counts a goroutine asleep in a timer as
+// blocked, so a consumer in reconnect backoff after a scheduled
+// subscribeRepos disconnect looks quiescent with the lie still
+// undelivered (specs/oracle/2026-09-25-adversarial-drop-scrape-races-reconnect.md).
+// The counters are therefore polled until they meet their floors, advancing
+// fake time between scrapes, and fail only at the deadline.
 func assertAdversarialDropCounters(t *testing.T, trace *Trace, w *world.World, cfg Config, client *http.Client, phase string) {
 	t.Helper()
 
@@ -214,8 +231,30 @@ func assertAdversarialDropCounters(t *testing.T, trace *Trace, w *world.World, c
 		}
 	}
 
-	counters, err := ScrapeDropCounters(t.Context(), client, oracleDebugBaseURL)
-	require.NoErrorf(t, err, "%s: scrape drop counters: mode=%s seed=%d", phase, cfg.Mode, cfg.Seed)
+	belowFloor := func(counters map[string]map[string]float64) bool {
+		for source, reasons := range floors {
+			for reason, floor := range reasons {
+				if counters[source][reason] < float64(floor) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	var counters map[string]map[string]float64
+	scrapes := 0
+	deadline := time.Now().Add(adversarialDropCounterDeadline)
+	for {
+		drain()
+		scrapes++
+		var err error
+		counters, err = ScrapeDropCounters(t.Context(), client, oracleDebugBaseURL)
+		require.NoErrorf(t, err, "%s: scrape drop counters: mode=%s seed=%d", phase, cfg.Mode, cfg.Seed)
+		if !belowFloor(counters) || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(adversarialDropCounterPoll)
+	}
 
 	observed := map[string]map[string]float64{}
 	for source, reasons := range floors {
@@ -231,5 +270,6 @@ func assertAdversarialDropCounters(t *testing.T, trace *Trace, w *world.World, c
 	recordTraceOrError(t, trace, "adversarial_drop_counters", map[string]any{
 		"phase":    phase,
 		"counters": observed,
+		"scrapes":  scrapes,
 	})
 }

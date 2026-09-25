@@ -447,10 +447,8 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		newAdversarialFilter(w.AdversarialLedger().Entries()))
 	assertIdentityArchived(t, cfg, bootstrapEventLog, steadyEventLog, identityDID(t, w, identityIdx))
 	accountStatusMaxSeq := assertAccountStatusLifecycleArchived(t, cfg, steadyEventLog, accountStatusDID)
-	// Quiesce the bubble before scraping: the whole-event sync lie
-	// produces no ack-visible row, so only drain() guarantees the
-	// consumer has processed it and settled the counters.
-	drain()
+	// The whole-event sync lie produces no ack-visible row; the assertion
+	// polls the counters under fake time until the consumer has dropped it.
 	assertAdversarialDropCounters(t, trace, w, cfg, debugClient, "steady-state")
 
 	// Verifier-owned rev lie (#204, layered-ownership contract): a

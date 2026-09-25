@@ -37,3 +37,9 @@ naming the failure mode (not the test).
   while holding the tail mutex, wedging ingestion; fixed with a writer-level
   ordered event sink feeding the tail from the shared append path, plus
   ring reset-on-gap hardening (#244).
+- [2026-09-25 — adversarial drop-counter scrape races a reconnect](2026-09-25-adversarial-drop-scrape-races-reconnect.md):
+  a scheduled subscribeRepos disconnect put the consumer in a 1ms reconnect
+  backoff just before the whole-event `#sync` lie. `synctest.Wait` counts a
+  timer-sleeping goroutine as quiescent, so the counters were scraped before
+  the lie was dropped. Fixed by polling the counters under fake time up to a
+  deadline.
