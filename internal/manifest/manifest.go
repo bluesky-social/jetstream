@@ -149,6 +149,12 @@ type Manifest struct {
 	loadErr  error
 	ready    chan struct{}
 
+	// remote marks a NewRemote manifest: no segments directory, fed only
+	// by LoadRemote and ApplySegment.
+	remote bool
+	// remoteLoad guards LoadRemote to one call.
+	remoteLoad sync.Once
+
 	// generation increments (under mu) on every mutation of the resident
 	// segment set that could change which segments or blocks a DID resolves
 	// to: initial load, seal, and compaction refresh. A cache of
@@ -191,6 +197,80 @@ func OpenBackground(ctx context.Context, opts Options) (*Manifest, error) {
 		m.finishLoad(m.load(ctx))
 	}()
 	return m, nil
+}
+
+// NewRemote returns an empty Manifest for disaggregated mode, where the
+// catalog follower feeds every sealed segment from the object store instead
+// of a directory scan (design §11.3). It is not ready, so its queries block,
+// until LoadRemote completes the initial load. opts.SegmentsDir is unused.
+func NewRemote(opts Options) (*Manifest, error) {
+	if opts.Logger == nil {
+		return nil, fmt.Errorf("manifest: Logger is required")
+	}
+	return &Manifest{opts: opts, remote: true, ready: make(chan struct{})}, nil
+}
+
+// RemoteSegment is one sealed segment's metadata for LoadRemote.
+type RemoteSegment struct {
+	Idx   uint64
+	Parts SegmentParts
+}
+
+// LoadRemote is a NewRemote manifest's initial load: every sealed segment
+// of the archive at the follower's first catalog snapshot. It parses and
+// checksum-verifies each segment's metadata at bounded concurrency, then
+// makes the manifest ready. An error also makes it ready, failed, as a
+// failed Open would; LoadRemote runs at most once.
+func (m *Manifest) LoadRemote(ctx context.Context, segs []RemoteSegment, concurrency int) error {
+	if !m.remote {
+		return errors.New("manifest: LoadRemote on a directory manifest")
+	}
+	err := errors.New("manifest: LoadRemote called twice")
+	m.remoteLoad.Do(func() {
+		err = m.loadRemote(ctx, segs, concurrency)
+		m.finishLoad(err)
+	})
+	return err
+}
+
+func (m *Manifest) loadRemote(ctx context.Context, segs []RemoteSegment, concurrency int) error {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	start := time.Now()
+	loaded, err := gt.ConcurrentN(ctx, segs, concurrency, func(s RemoteSegment) (SegmentMetadata, error) {
+		meta, err := parseSealedMetadata(s.Idx, ingest.SegmentFilename(s.Idx), s.Parts, true)
+		if err != nil {
+			return SegmentMetadata{}, fmt.Errorf("manifest: load segment %d: %w", s.Idx, err)
+		}
+		return meta, nil
+	})
+	if err != nil {
+		return err
+	}
+	sort.Slice(loaded, func(i, j int) bool { return loaded[i].Idx < loaded[j].Idx })
+	for i := 1; i < len(loaded); i++ {
+		if loaded[i].Idx == loaded[i-1].Idx {
+			return fmt.Errorf("manifest: segment %d loaded twice", loaded[i].Idx)
+		}
+	}
+	if err := validateSegmentSeqMonotonicity(loaded); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.segments = loaded
+	m.generation++
+	m.mu.Unlock()
+	if m.opts.Metrics != nil {
+		m.opts.Metrics.SegmentsLoaded.Set(float64(len(loaded)))
+	}
+	m.opts.Logger.Info("opened",
+		slog.String("component", "manifest"),
+		slog.Int("sealed_segments", len(loaded)),
+		slog.Int("load_concurrency", concurrency),
+		slog.Duration("elapsed", time.Since(start)),
+	)
+	return nil
 }
 
 func newManifest(opts Options) (*Manifest, error) {
@@ -987,6 +1067,11 @@ func (m *Manifest) SelectBlocksForDID(did string) ([]SegmentBlockSelection, erro
 func (m *Manifest) ActiveSegmentPaths() ([]string, error) {
 	if err := m.waitReady(); err != nil {
 		return nil, err
+	}
+	if m.remote {
+		// Disaggregated mode has no local segment files: active data is
+		// read through the catalog view.
+		return nil, nil
 	}
 	files, err := ingest.SegmentFilesFS(m.opts.FS, m.opts.SegmentsDir)
 	if err != nil {

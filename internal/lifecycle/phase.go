@@ -31,8 +31,12 @@ const (
 	PhaseSteadyState Phase = "steady_state"
 )
 
+// PhaseKey is the metadata key holding the persisted Phase. Disaggregated
+// followers read it from the shared catalog's metadata_kv.
+const PhaseKey = "phase"
+
 const (
-	phaseKey                     = "phase"
+	phaseKey                     = PhaseKey
 	phaseEnteredAtKey            = "phase/entered_at"
 	backfillTimingStartedAtKey   = "backfill/timing/started_at"
 	backfillTimingCompletedAtKey = "backfill/timing/completed_at"
@@ -67,7 +71,12 @@ func ReadPhase(ctx context.Context, s metastore.Store) (Phase, error) {
 	if err != nil {
 		return "", fmt.Errorf("lifecycle: read phase: %w", err)
 	}
+	return ParsePhase(val)
+}
 
+// ParsePhase decodes a stored PhaseKey value. An unknown value is an error,
+// never a default.
+func ParsePhase(val []byte) (Phase, error) {
 	p := Phase(string(val))
 	if !p.valid() {
 		return "", fmt.Errorf("lifecycle: unrecognized phase value %q in metadata store", string(val))
