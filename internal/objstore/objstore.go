@@ -2,7 +2,9 @@ package objstore
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 )
@@ -23,6 +25,13 @@ var (
 	// ErrCorrupt means bytes read back from a Blob do not match the length or
 	// SHA-256 recorded in the catalog.
 	ErrCorrupt = errors.New("objstore: object corrupt")
+
+	// ErrGone means a Store has no available object under the ID, even after
+	// refreshing its catalog view: compaction or GC replaced the reference
+	// the caller resolved. The caller refreshes its own view and retries
+	// with the new reference (design §7.5 step 2). If its reference still
+	// names the object, that is corruption at the caller's level.
+	ErrGone = errors.New("objstore: object no longer available")
 )
 
 // Blob is raw, unverified key/value transport for immutable objects.
@@ -49,28 +58,66 @@ type Blob interface {
 	DeleteKey(ctx context.Context, key string) error
 }
 
-// Store is the object protocol (design §7.3 and §7.5) over a Blob and the
-// catalog. Objects are addressed by catalog object_id, not by key.
+// Store reads objects by catalog object_id with the design §7.5 checks.
+// protocol.Reader implements it. Consumers (the cold reader, getSegment)
+// depend on this interface so their tests can substitute a fake.
 //
-// The implementation lands with the catalog transaction layer (plan S2.5).
+// Writes are not part of Store. An upload needs the leader's catalog session,
+// because the uploading row is a fenced write (§7.3), so uploads go through
+// protocol.Uploader with a *catalog.Session.
+//
+// Both methods return ErrGone when the object is no longer available, and a
+// catalog.CorruptionError with source "read" when an available object's
+// bytes are missing or wrong. Returned slices may be shared with a cache and
+// must not be modified.
 type Store interface {
-	// Put uploads data (or dedups against an existing available object with
-	// the same SHA-256) and returns its object_id.
-	Put(ctx context.Context, data []byte) (objectID uint64, err error)
-
 	// Get returns the whole object after verifying its length and SHA-256.
 	Get(ctx context.Context, objectID uint64) ([]byte, error)
 
 	// GetRange returns a byte range of the object, verifying only the length.
 	// Payload integrity comes from the zstd frame checksum inside each block.
+	// The range follows RangeLen against the catalog length; a range it
+	// rejects returns ErrInvalidRange.
 	GetRange(ctx context.Context, objectID uint64, off, n int64) ([]byte, error)
+}
+
+// Key returns the Blob key for an object (design §7.1):
+// <archive_id>/objects/<uuid>, with both UUIDs in canonical form. The S3 Blob
+// puts JETSTREAM_S3_PREFIX in front, so these keys never start with a slash.
+func Key(archiveID, key [16]byte) string {
+	return FormatUUID(archiveID) + "/objects/" + FormatUUID(key)
+}
+
+// NewUUID returns a random version 4 UUID. Every upload attempt gets a fresh
+// one, so no key is ever written twice.
+func NewUUID() [16]byte {
+	var u [16]byte
+	_, _ = rand.Read(u[:]) // crypto/rand.Read never returns an error
+	u[6] = u[6]&0x0f | 0x40
+	u[8] = u[8]&0x3f | 0x80
+	return u
+}
+
+// FormatUUID formats u as xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
+func FormatUUID(u [16]byte) string {
+	var b [36]byte
+	hex.Encode(b[0:8], u[0:4])
+	b[8] = '-'
+	hex.Encode(b[9:13], u[4:6])
+	b[13] = '-'
+	hex.Encode(b[14:18], u[6:8])
+	b[18] = '-'
+	hex.Encode(b[19:23], u[8:10])
+	b[23] = '-'
+	hex.Encode(b[24:], u[10:])
+	return string(b[:])
 }
 
 // RangeLen returns how many bytes a ranged read of [off, off+n) returns
 // from an object of size bytes. It mirrors S3: a range running past the end
 // is truncated, and a range starting at or past the end is ErrInvalidRange.
-// Blob implementations use it to agree on semantics; Store uses it to check
-// the length of a range read.
+// Blob implementations use it to agree on semantics, and the Store uses it
+// to check the length of a range read.
 func RangeLen(size, off, n int64) (int64, error) {
 	if off < 0 || n <= 0 || off >= size {
 		return 0, fmt.Errorf("%w: off=%d n=%d size=%d", ErrInvalidRange, off, n, size)

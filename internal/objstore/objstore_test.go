@@ -52,3 +52,21 @@ func TestRangeLen(t *testing.T) {
 		require.ErrorIs(t, err, objstore.ErrInvalidRange, "%+v", c)
 	}
 }
+
+// TestKey pins the design §7.1 layout: <archive_id>/objects/<uuid>, both
+// canonical UUIDs, with a fresh v4 UUID per upload attempt.
+func TestKey(t *testing.T) {
+	t.Parallel()
+	archive := [16]byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10}
+	key := [16]byte{15: 0xff}
+	require.Equal(t,
+		"01234567-89ab-cdef-fedc-ba9876543210/objects/00000000-0000-0000-0000-0000000000ff",
+		objstore.Key(archive, key))
+
+	a, b := objstore.NewUUID(), objstore.NewUUID()
+	require.NotEqual(t, a, b)
+	s := objstore.FormatUUID(a)
+	require.Len(t, s, 36)
+	require.Equal(t, byte('4'), s[14], "version nibble")
+	require.Contains(t, "89ab", string(s[19]), "variant nibble")
+}

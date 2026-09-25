@@ -723,3 +723,12 @@ func (s *Session) MarkAvailable(ctx context.Context, ref ObjectRef) (uint64, err
 	})
 	return id, err
 }
+
+// End ends the session for a failure outside any transaction that the design
+// still treats as session-ending, such as an upload that could not complete
+// (§7.3: "every caller in this document ends the session"). It returns the
+// session-ending error; corruption stays fatal. If the session had already
+// ended, the first error is kept.
+func (s *Session) End(op string, err error) error {
+	return s.fail(sessionEnded(op, err))
+}
