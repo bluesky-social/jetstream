@@ -2,6 +2,8 @@ package segment
 
 import (
 	"fmt"
+	"io"
+	"math"
 	"sync/atomic"
 
 	"github.com/cockroachdb/pebble/vfs"
@@ -46,17 +48,51 @@ const maxBlockCountLimit = 1 << 20
 // allocation is driven directly by an on-disk uint32.
 const maxCollectionCountLimit = 1 << 20
 
-// Reader provides goroutine-safe read access to a sealed segment
-// file. After Open, the file's metadata (header, block index,
-// segment bloom, collection index) is parsed and held in memory;
-// per-block decode and per-block-bloom load happen on demand via
-// pread, so multiple goroutines may call DecodeBlock and BlockBloom
-// concurrently with no shared mutable state.
+// ReaderOptions controls the byte-source Reader constructors
+// (OpenReaderAt, OpenReaderParts).
+type ReaderOptions struct {
+	// SkipChecksum disables the xxh3 verification; see
+	// ReaderConfig.SkipChecksum.
+	SkipChecksum bool
+
+	// Name identifies the segment in error messages (a path, object
+	// key, or similar). Optional.
+	Name string
+}
+
+// BlockFetcher returns block i's zstd frame, without the 8-byte length
+// prefix that precedes it in the file layout. The Reader checks the
+// returned length against the block index and treats a mismatch as
+// corruption.
 //
-// Close releases the file handle. It is idempotent.
+// Readers call it concurrently when their callers do, so it must be
+// safe for concurrent use. The Reader does not retain or modify the
+// returned slice after decoding it.
+type BlockFetcher func(i int) ([]byte, error)
+
+// Reader provides goroutine-safe read access to a sealed segment.
+// After construction, the segment's metadata (header, block index,
+// segment bloom, collection index) is parsed and held in memory;
+// per-block decode and per-block-bloom load happen on demand, so
+// multiple goroutines may call DecodeBlock and BlockBloom concurrently
+// with no shared mutable state.
+//
+// A Reader reads from a sealed segment file (Open), from any
+// io.ReaderAt over the segment's bytes (OpenReaderAt), or from the
+// header and footer bytes plus a per-block fetcher (OpenReaderParts).
+// All three expose the same methods with the same results.
+//
+// Close releases the file handle Open acquired. It is idempotent.
 type Reader struct {
+	// path names the segment in error messages: the file path for Open,
+	// ReaderOptions.Name otherwise.
 	path string
-	file vfs.File
+	src  io.ReaderAt
+	// closer is the file Open acquired; nil when the caller owns src.
+	closer io.Closer
+	// fetch, when set, supplies block frames in place of reading them
+	// from src (OpenReaderParts, whose src holds only header+footer).
+	fetch BlockFetcher
 
 	header            Header
 	blocks            []BlockInfo
@@ -85,26 +121,99 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("segment: open %s: %w", cfg.Path, err)
 	}
-	success := false
-	defer func() {
-		if !success {
-			_ = f.Close()
-		}
-	}()
-
 	info, err := f.Stat()
 	if err != nil {
+		_ = f.Close()
 		return nil, fmt.Errorf("segment: stat %s: %w", cfg.Path, err)
 	}
-	fileSize := info.Size()
+	r, err := openReaderAt(f, info.Size(), ReaderOptions{SkipChecksum: cfg.SkipChecksum, Name: cfg.Path})
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	r.closer = f
+	return r, nil
+}
+
+// OpenReaderAt parses a sealed segment whose bytes, exactly as a sealed
+// segment file holds them, are readable through src; size is their
+// total length. The metadata reads match Open's; blocks and per-block
+// blooms are read from src on demand.
+//
+// The caller owns src: Close does not close it, and src must stay
+// readable until the Reader is no longer used.
+func OpenReaderAt(src io.ReaderAt, size int64, opts ReaderOptions) (*Reader, error) {
+	if src == nil {
+		return nil, fmt.Errorf("%w: OpenReaderAt source is nil", ErrInvalidConfig)
+	}
+	return openReaderAt(src, size, opts)
+}
+
+// OpenReaderParts parses a sealed segment from its 256-byte finalized
+// header and its footer, with block frames supplied by fetch. This is
+// the shape of a segment whose blocks are stored apart from its
+// metadata: no byte range of the virtual segment file needs to exist
+// in one place.
+//
+// The virtual file size is header.FooterOffset + len(footer), so the
+// footer must be complete. All metadata, including the per-block
+// blooms, is served from the footer; only DecodeBlock calls fetch.
+// The Reader keeps header and footer; the caller must not modify them
+// afterwards.
+func OpenReaderParts(header, footer []byte, fetch BlockFetcher, opts ReaderOptions) (*Reader, error) {
+	if fetch == nil {
+		return nil, fmt.Errorf("%w: OpenReaderParts fetch is nil", ErrInvalidConfig)
+	}
+	h, err := decodeHeader(header)
+	if err != nil {
+		return nil, err
+	}
+	if h.FooterOffset < uint64(ReservedHeaderBytes) || h.FooterOffset > math.MaxInt64-uint64(len(footer)) {
+		return nil, fmt.Errorf("%w: footer_offset %d", ErrInvalidFooter, h.FooterOffset)
+	}
+	parts := &partsReaderAt{header: header, footer: footer, footerOffset: int64(h.FooterOffset)}
+	r, err := openReaderAt(parts, int64(h.FooterOffset)+int64(len(footer)), opts)
+	if err != nil {
+		return nil, err
+	}
+	r.fetch = fetch
+	return r, nil
+}
+
+// partsReaderAt presents a header and a footer as the virtual segment
+// file they describe. The block region between them is absent: reads
+// that touch it fail, which is why OpenReaderParts pairs it with a
+// BlockFetcher.
+type partsReaderAt struct {
+	header, footer []byte
+	footerOffset   int64
+}
+
+func (p *partsReaderAt) ReadAt(b []byte, off int64) (int, error) {
+	if off >= 0 && off <= math.MaxInt64-int64(len(b)) {
+		end := off + int64(len(b))
+		if end <= int64(len(p.header)) {
+			return copy(b, p.header[off:]), nil
+		}
+		if off >= p.footerOffset && end-p.footerOffset <= int64(len(p.footer)) {
+			return copy(b, p.footer[off-p.footerOffset:]), nil
+		}
+	}
+	return 0, fmt.Errorf("%w: read of %d bytes at %d is outside the header and footer",
+		ErrCorruptSegment, len(b), off)
+}
+
+// openReaderAt parses the sealed-segment metadata readable through src.
+// It performs the same reads, in the same order, for every constructor.
+func openReaderAt(src io.ReaderAt, fileSize int64, opts ReaderOptions) (*Reader, error) {
 	if fileSize < int64(ReservedHeaderBytes) {
 		return nil, fmt.Errorf("%w: %s is %d bytes",
-			ErrCorruptSegment, cfg.Path, fileSize)
+			ErrCorruptSegment, opts.Name, fileSize)
 	}
 
 	// 1. Fixed header.
 	headerBytes := make([]byte, ReservedHeaderBytes)
-	if _, err := f.ReadAt(headerBytes, 0); err != nil {
+	if _, err := src.ReadAt(headerBytes, 0); err != nil {
 		return nil, fmt.Errorf("segment: read header: %w", err)
 	}
 	header, err := decodeHeader(headerBytes)
@@ -123,7 +232,7 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 	blockIndexLen := int64(header.BlockCount) * blockIndexEntrySize
 	blockIndexBytes := make([]byte, blockIndexLen)
 	if blockIndexLen > 0 {
-		if _, err := f.ReadAt(blockIndexBytes, int64(header.BlockIndexOffset)); err != nil {
+		if _, err := src.ReadAt(blockIndexBytes, int64(header.BlockIndexOffset)); err != nil {
 			return nil, fmt.Errorf("segment: read block index: %w", err)
 		}
 	}
@@ -139,7 +248,7 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 	segmentBloomLen := int64(header.BlockDIDBloomOffset - header.DIDBloomOffset)
 	segmentBloomBytes := make([]byte, segmentBloomLen)
 	if segmentBloomLen > 0 {
-		if _, err := f.ReadAt(segmentBloomBytes, int64(header.DIDBloomOffset)); err != nil {
+		if _, err := src.ReadAt(segmentBloomBytes, int64(header.DIDBloomOffset)); err != nil {
 			return nil, fmt.Errorf("segment: read segment bloom: %w", err)
 		}
 	}
@@ -153,7 +262,7 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 
 	// 4. Per-block blooms region header (8 bytes).
 	bloomRegionHeader := make([]byte, blockBloomsRegionHeaderSize)
-	if _, err := f.ReadAt(bloomRegionHeader, int64(header.BlockDIDBloomOffset)); err != nil {
+	if _, err := src.ReadAt(bloomRegionHeader, int64(header.BlockDIDBloomOffset)); err != nil {
 		return nil, fmt.Errorf("segment: read bloom region header: %w", err)
 	}
 	regionCount, perBlockSize, err := decodeBlockBloomsRegionHeader(bloomRegionHeader)
@@ -181,10 +290,10 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 	// 5. Optional checksum verification (before collection index decode).
 	// We verify early so that corruption is detected before attempting to
 	// decompress zstd bodies, which may fail in opaque ways.
-	if !cfg.SkipChecksum {
+	if !opts.SkipChecksum {
 		footerLen := fileSize - int64(header.FooterOffset)
 		footerBytes := make([]byte, footerLen)
-		if _, err := f.ReadAt(footerBytes, int64(header.FooterOffset)); err != nil {
+		if _, err := src.ReadAt(footerBytes, int64(header.FooterOffset)); err != nil {
 			return nil, fmt.Errorf("segment: read footer for checksum: %w", err)
 		}
 		// Header bytes with the checksum field zeroed: that's how it
@@ -207,7 +316,7 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 		return nil, fmt.Errorf("%w: collection index region too small", ErrInvalidFooter)
 	}
 	collectionBytes := make([]byte, collectionLen)
-	if _, err := f.ReadAt(collectionBytes, int64(header.CollectionIndexOffset)); err != nil {
+	if _, err := src.ReadAt(collectionBytes, int64(header.CollectionIndexOffset)); err != nil {
 		return nil, fmt.Errorf("segment: read collection index: %w", err)
 	}
 	colIdx, err := decodeCollectionIndex(collectionBytes)
@@ -220,25 +329,27 @@ func Open(cfg ReaderConfig) (*Reader, error) {
 			ErrInvalidFooter, len(colIdx.blockBitmasks), header.BlockCount)
 	}
 
-	r := &Reader{
-		path:              cfg.Path,
-		file:              f,
+	return &Reader{
+		path:              opts.Name,
+		src:               src,
 		header:            header,
 		blocks:            blocks,
 		segmentBloom:      segmentBloom,
 		parsedCollections: colIdx,
 		perBlockBloomSize: perBlockSize,
-	}
-	success = true
-	return r, nil
+	}, nil
 }
 
-// Close releases the underlying file handle. Idempotent.
+// Close releases the file handle Open acquired; for the byte-source
+// constructors it only marks the Reader closed. Idempotent.
 func (r *Reader) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	return r.file.Close()
+	if r.closer == nil {
+		return nil
+	}
+	return r.closer.Close()
 }
 
 // Header returns a copy of the parsed fixed header.
@@ -307,11 +418,8 @@ func (r *Reader) DecodeBlock(idx int) ([]Event, error) {
 		return nil, fmt.Errorf("%w: idx %d, BlockCount %d",
 			ErrBlockOutOfRange, idx, len(r.blocks))
 	}
-	b := r.blocks[idx]
-	frame := make([]byte, b.CompressedSize)
-	// The block index records the offset of the 8-byte length prefix;
-	// the frame body starts 8 bytes later.
-	if _, err := r.file.ReadAt(frame, int64(b.Offset)+8); err != nil {
+	frame, err := r.readFrame(idx)
+	if err != nil {
 		return nil, fmt.Errorf("segment: read block %d frame: %w", idx, err)
 	}
 	events, _, err := decodeBlockCompressedSized(frame)
@@ -321,9 +429,27 @@ func (r *Reader) DecodeBlock(idx int) ([]Event, error) {
 	return events, nil
 }
 
+// readFrame returns block idx's zstd frame, without its length prefix.
+// idx must be in range.
+func (r *Reader) readFrame(idx int) ([]byte, error) {
+	b := r.blocks[idx]
+	if r.fetch != nil {
+		frame, err := r.fetch(idx)
+		if err != nil {
+			return nil, err
+		}
+		if uint64(len(frame)) != uint64(b.CompressedSize) {
+			return nil, fmt.Errorf("%w: fetched frame is %d bytes, block index says %d",
+				ErrCorruptSegment, len(frame), b.CompressedSize)
+		}
+		return frame, nil
+	}
+	return readSealedFrame(r.src, b)
+}
+
 // validateHeaderOffsets checks that every offset in the parsed header
-// fits within the file and that the section ordering matches the
-// spec. Returns ErrInvalidFooter on any violation.
+// fits within the (possibly virtual) segment file of fileSize bytes
+// and that the section ordering matches the spec. Returns ErrInvalidFooter on any violation.
 func validateHeaderOffsets(h Header, fileSize uint64) error {
 	if h.FooterOffset < uint64(ReservedHeaderBytes) {
 		return fmt.Errorf("%w: footer_offset %d < reserved header",
@@ -368,7 +494,7 @@ func (r *Reader) BlockBloom(idx int) (*gloom.Filter, error) {
 		int64(blockBloomsRegionHeaderSize) +
 		int64(idx)*int64(r.perBlockBloomSize)
 	buf := make([]byte, r.perBlockBloomSize)
-	if _, err := r.file.ReadAt(buf, off); err != nil {
+	if _, err := r.src.ReadAt(buf, off); err != nil {
 		return nil, fmt.Errorf("segment: read block %d bloom: %w", idx, err)
 	}
 	f, err := gloom.UnmarshalBinary(buf)
@@ -398,7 +524,7 @@ func (r *Reader) LoadAllBlockBlooms() ([]*gloom.Filter, error) {
 	}
 	buf := make([]byte, int(bodyLen))
 	off := int64(r.header.BlockDIDBloomOffset) + int64(blockBloomsRegionHeaderSize)
-	if _, err := r.file.ReadAt(buf, off); err != nil {
+	if _, err := r.src.ReadAt(buf, off); err != nil {
 		return nil, fmt.Errorf("segment: read block blooms: %w", err)
 	}
 

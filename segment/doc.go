@@ -7,12 +7,22 @@
 // over the metadata.
 //
 // The package is split by responsibility: event.go, block.go, and
-// zstd.go define the row layout and block wire format; writer.go owns
-// the active-segment file state machine (append, flush, fsync, seal);
+// zstd.go define the row layout and block wire format; builder.go
+// accumulates events into a block and encodes it (BlockBuilder), with
+// no file behind it; writer.go owns the active-segment file state
+// machine (append, flush, fsync, seal) on top of a BlockBuilder;
 // header.go, footer.go, bloom.go, and collection.go are pure
-// encode/decode for footer sub-formats; seal.go orchestrates the
-// seal walk-and-write pass; reader.go ships a goroutine-safe public
-// Reader for sealed files.
+// encode/decode for footer sub-formats; seal.go computes the sealed
+// header and footer from a sequence of block frames (BuildSealed) and
+// writes them to the active file; rewrite.go computes a compacted
+// segment in memory and swaps it in atomically; reader.go ships a
+// goroutine-safe public Reader over a sealed file, any io.ReaderAt
+// holding its bytes, or its header and footer plus a per-block fetcher.
+//
+// The pure pieces (BlockBuilder, BuildSealed, and the byte-source
+// Reader constructors) use virtual file offsets: a sealed segment's
+// offsets are the positions its sections would have in a segment file,
+// whether or not that file ever exists.
 //
 // Writer is not safe for concurrent use; callers serialize access.
 // Reader is safe for concurrent reads.

@@ -87,6 +87,7 @@ jobs:
           - { package: "./internal/subscribe", target: FuzzParseUpdatePayload }
           - { package: "./internal/subscribe", target: FuzzResolveCursor }
           - { package: "./internal/xrpcapi", target: FuzzValidatePlanCollections }
+          - { package: "./segment", target: FuzzBuildSealed }
           - { package: "./segment", target: FuzzDecodeBlock }
           - { package: "./segment", target: FuzzDecodeBlockFromCompressed }
           - { package: "./segment", target: FuzzReadBlockIndex }
