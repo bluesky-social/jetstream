@@ -1573,6 +1573,8 @@ the orchestrator import pass, `JETSTREAM_TIMESTAMP_IMPORT_*`, and
 `TimestampStamper`) is deleted in both modes. That happens in a separate change,
 before this work starts. The `indexed_at` block column stays, and it is always
 `0` (meaning "use `witnessed_at`") until a new import design exists.
+Re-adding import is tracked in
+[#354](https://github.com/bluesky-social/jetstream/issues/354).
 
 ## 22. Measurements
 

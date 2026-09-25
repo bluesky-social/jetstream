@@ -37,30 +37,9 @@ The retained background download path is only for repos discovered by authoritat
 
 Area: `internal/ingest/backfill/retry.go`, `internal/ingest/orchestrator/steady.go`, `docs/README.md` §4.3, issue #247.
 
-### Timestamp-import ReadRow can accept a suffix behind a quoted newline
-
-Phase C of timestamp import re-reads and validates CSV rows by byte offset. `ReadRow` checks that the preceding byte is a newline, but cannot distinguish a record boundary from a newline inside a quoted field. A stale offset could therefore parse a valid suffix row. Detecting this would require a full quote-aware scan or binding the CSV to the job by size and hash. This limitation is accepted: only the operator can replace the CSV, and the operator already controls imported timestamps. See `internal/timestamp/apply.go` (`ReadRow`).
-
 ### A spec-valid rkey longer than 255 bytes is dropped by design
 
 atproto record keys can be up to ~1023 bytes, but our segment format caps the rkey column at 255 bytes. A record with a legal-but-longer rkey is dropped at the ingest gate under `ErrFieldTooLong` with its own metric reason — distinct from "the network sent garbage" — so operators can tell a representation limit from actual bad input. This is a deliberate format trade-off, not a validation bug. Area: `internal/ingest` validation gate, `segment/block.go` column limits, `docs/README.md` §4.4.
-
-### A failed timestamp import can leave a partial rule set active — operator re-submits
-
-Rule-map ingestion (`ruleSSTBuilder.Ingest` in `internal/timestamp/rules.go`) installs the sorted chunk SSTs one `pebble.Ingest` at a time; each call is individually atomic and immediately durable. A crash or error partway through the loop therefore leaves a committed *prefix* of the CSV resident, with no marker distinguishing it from a complete import — and since every chunk carries its collections' activation markers, `Stamp` runs against that partial keyspace after the next boot. Consequences in the window: events whose rules landed are stamped, later ones are not, and a path whose CSV last-write-wins winner lives in a not-yet-ingested chunk can carry a *stale* stamp into segment bytes and the live wire.
-
-Accepted by Jim on 2026-07-08. Recovery depends on completing the import:
-
-- A **crash** mid-ingest leaves the job non-terminal; the next boot auto-resumes (`ResumeIncomplete`) and re-runs rule ingestion from the CSV.
-- A **terminal failure** (e.g. ENOSPC) does not auto-resume — by design, since re-running a deterministically-failing job would loop. The operator re-submits the same CSV via the import XRPC once the cause is fixed. The importer never modifies or deletes the staged CSV (it opens it read-only; terminal cleanup removes the *scratch* dir under `import-scratch/<job>`, not the import dir), so the exact same file is re-submittable. Re-ingest is last-write-wins over the full CSV, which heals both missing entries and the stale cross-chunk duplicate edge; the bucket+patch phases were already idempotent.
-
-Alternatives considered and rejected as not worth the cost against this remediation story: k-way-merging chunks into one atomic multi-file `db.Ingest` (~2x scratch write amp on a ~200GB entry stream), and deferring collection markers to a post-ingest commit batch (still leaves the window for re-imports into an already-active collection). Area: `internal/timestamp/rules.go` (`Ingest` — comment there), `internal/importer/importer.go`, `docs/README.md` §8.
-
-### A shutdown racing the import preamble can terminally fail the job instead of pausing it
-
-`RunImport`'s steady-state preamble calls `Writer.ForceRotate` after rule ingestion (`internal/ingest/orchestrator/import_pass.go`). On graceful shutdown the orchestrator closes the steady writer concurrently with cancelling the import context; if the close wins the race, `ForceRotate` returns `ingest.ErrClosed`, which `IsCancellationOnly` correctly refuses to classify as a pause — so the importer marks the job terminally **failed** rather than leaving it resumable. The window is narrow (cancellation usually surfaces first), and the failure is loud: the job lands in `failed` state on `/status` with the rotate error recorded.
-
-Accepted (Jim, 2026-07-08): the operator re-submits the same CSV, exactly as for any other terminal failure — see the previous entry for why re-submission is safe and complete. Do not teach `IsCancellationOnly` about `ingest.ErrClosed` (it would couple the shared classifier, also used by import metrics, to an ingest sentinel) and do not translate the error at the call site without revisiting this decision. Area: `internal/ingest/orchestrator/import_pass.go` (comment at the `ForceRotate` call), `internal/ingest/orchestrator/import_metrics.go` (`IsCancellationOnly`), `internal/importer/importer.go` (`run`).
 
 ### `just run-prod` inherits the dev-speed flags from `.env`
 
@@ -73,10 +52,6 @@ Accepted (Jim, 2026-07-08): the operator re-submits the same CSV, exactly as for
 Under the client's `CursorTime` mode, a resume on a different host uses `witnessedAt - rewind`. Each instance stamps `witnessed_at` with its own clock when it sees an event, so the same event has slightly different times on different hosts. The rewind (default 5s) is a skew allowance, not a guarantee: skew larger than the rewind can skip events, and everything inside the rewind is re-delivered with no way to dedup across seq namespaces. Callers in this mode must be idempotent. The client identifies a seq namespace by the configured hostname alone: a reconnect to the same name always resumes by seq. So each hostname given to `WithHost`/`WithFailoverHosts` must address exactly one instance; a name that load-balances across instances (or is repointed at a different instance) gets a foreign seq and can skip or replay events. Area: `live.go` (`planSession`, `adoptNamespace`).
 
 ## Lessons
-
-### There are several copies of the "is this just cancellation?" classifier — grep them all
-
-`IsCancellationOnly` in the import path requires every error leaf to be cancellation. `errors.Is(err, context.Canceled)` would also match `errors.Join(context.Canceled, realFailure)` and incorrectly make a failed import resumable. Other callers in `orchestrator/steady.go`, `backfill/retry.go`, `jetstreamd/runtime.go`, and the simulator only need to know whether cancellation occurred. Search all callers before changing this logic; their predicates serve different purposes. Area: `internal/ingest/orchestrator/import_metrics.go`.
 
 ### A restart-tier recovery child hangs if the relay is quiet — generate traffic between children
 

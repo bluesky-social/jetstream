@@ -395,18 +395,6 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_COMPACTION_REWRITE_WORKERS"),
 				Value:   0,
 			},
-			&cli.StringFlag{
-				Name:    "timestamp-import-token",
-				Usage:   "Bearer token gating the timestamp-import XRPC endpoints. Empty (default) disables import: the endpoints always return 401. Front the endpoint with TLS (terminated by your proxy); the token is a bearer secret.",
-				Sources: cli.EnvVars("JETSTREAM_TIMESTAMP_IMPORT_TOKEN"),
-				Value:   "",
-			},
-			&cli.StringFlag{
-				Name:    "timestamp-import-dir",
-				Usage:   "Directory the timestamp-import endpoint may read staged CSVs from. Submitted paths are confined here (.. and symlink escapes rejected). Empty uses <data-dir>/imports.",
-				Sources: cli.EnvVars("JETSTREAM_TIMESTAMP_IMPORT_DIR"),
-				Value:   "",
-			},
 		},
 		Action: runServe,
 	}
@@ -469,8 +457,6 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		CompactionInterval:             cmd.Duration("compaction-interval"),
 		CompactionTombstoneCap:         cmd.Int("compaction-tombstone-cap"),
 		CompactionRewriteWorkers:       cmd.Int("compaction-rewrite-workers"),
-		TimestampImportToken:           cmd.String("timestamp-import-token"),
-		TimestampImportDir:             cmd.String("timestamp-import-dir"),
 	}, nil
 }
 
@@ -515,7 +501,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cmd.Duration("shutdown-timeout"))
 	defer cancel()
 	// Run suppresses caller-driven cancellation to nil, so on a clean signal
-	// shutdown Close's error (e.g. a failed import drain) is the only failure
+	// shutdown Close's error (e.g. a run that did not drain in time) is the only failure
 	// signal left — it must reach the exit status, not be swallowed.
 	closeErr := rt.Close(shutdownCtx)
 	if runErr != nil {

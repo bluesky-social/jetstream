@@ -13,7 +13,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/bluesky-social/jetstream/internal/timestamp"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
@@ -221,24 +220,6 @@ type Config struct {
 	// Optional; nil makes reconcile refresh every sealed segment.
 	SegmentManifestChecksums func() map[uint64]uint64
 
-	// ImportSelector resolves a DID to the sealed segments that may contain it,
-	// from the manifest's resident blooms (no disk I/O). Wired by cmd/jetstream
-	// to the manifest; required only to run a timestamp-import job (M5+). nil
-	// disables import (RunImport returns ErrImportUnavailable).
-	ImportSelector timestamp.Selector
-
-	// ImportMetrics observes timestamp-import job progress and outcomes
-	// (design §6 J). Optional; nil means no import counters increment.
-	ImportMetrics *ImportMetrics
-
-	// ImportRules is the durable imported indexed_at rule store. Required for
-	// timestamp import under #269; nil leaves import unavailable.
-	ImportRules *timestamp.RuleStore
-
-	// TimestampStamper applies durable imported indexed_at rules at append
-	// time. Optional; nil means no imported rules are active.
-	TimestampStamper ingest.TimestampStamper
-
 	// CompactionBloomNarrowMaxDIDs bounds the candidate-DID set handed to the
 	// segment-level bloom prefilter; larger tombstone sets skip narrowing
 	// (probing would cost more than it saves — spec §5). Zero selects the
@@ -319,8 +300,8 @@ type Config struct {
 	// SegmentIOFaultInjector is a test-only deterministic segment-file I/O
 	// fault seam, forwarded to every segment writer the orchestrator opens
 	// (backfill, bootstrap-live, merge, steady-state) and to the
-	// compaction-rewrite and import-patch call sites. Production leaves it
-	// nil, mirroring CrashInjector.
+	// compaction-rewrite call sites. Production leaves it nil, mirroring
+	// CrashInjector.
 	SegmentIOFaultInjector segment.IOFaultInjector
 }
 

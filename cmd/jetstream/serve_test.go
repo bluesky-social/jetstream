@@ -99,8 +99,6 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 4*time.Hour, opts.CompactionInterval)
 	require.Equal(t, 32_000_000, opts.CompactionTombstoneCap)
 	require.Equal(t, 0, opts.CompactionRewriteWorkers)
-	require.Equal(t, "", opts.TimestampImportToken)
-	require.Equal(t, "", opts.TimestampImportDir)
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
@@ -232,8 +230,6 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--compaction-interval=9h",
 		"--compaction-tombstone-cap=123456",
 		"--compaction-rewrite-workers=3",
-		"--timestamp-import-token=test-token",
-		"--timestamp-import-dir=/tmp/jetstream-imports",
 	}))
 	require.Equal(t, "127.0.0.1:18080", opts.PublicAddr)
 	require.Equal(t, "127.0.0.1:16060", opts.DebugAddr)
@@ -276,8 +272,6 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 9*time.Hour, opts.CompactionInterval)
 	require.Equal(t, 123456, opts.CompactionTombstoneCap)
 	require.Equal(t, 3, opts.CompactionRewriteWorkers)
-	require.Equal(t, "test-token", opts.TimestampImportToken)
-	require.Equal(t, "/tmp/jetstream-imports", opts.TimestampImportDir)
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)

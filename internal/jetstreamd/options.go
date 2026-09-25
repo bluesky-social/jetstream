@@ -134,12 +134,6 @@ type Options struct {
 	CompactionTombstoneCap         int
 	CompactionRewriteWorkers       int
 
-	// TimestampImportToken is the bearer token gating the timestamp-import
-	// XRPC endpoints. Empty disables import (endpoints return 401).
-	TimestampImportToken string
-	// TimestampImportDir confines the CSV paths the import endpoint may read.
-	// Empty resolves to <DataDir>/imports.
-	TimestampImportDir     string
 	BarrierBeforeCutover   PhaseBarrier
 	BarrierAfterBootstrap  PhaseBarrier
 	BarrierAfterMerge      PhaseBarrier
@@ -156,11 +150,11 @@ type Options struct {
 	StoreFaultInjector store.FaultInjector
 	// SegmentIOFaultInjector is a test-only deterministic segment-file I/O
 	// fault seam (segment.IOFaultInjector), forwarded to the orchestrator so
-	// every segment writer plus the compaction-rewrite and import-patch paths
-	// consult it before each write/fsync/rename. nil in production. Used by
-	// the oracle segment-fault tier to fail selected segment I/O ops by op
-	// kind and ordinal and assert the system fails loud rather than
-	// swallowing the error. Mirrors CrashInjector's nil-in-prod contract.
+	// every segment writer plus the compaction-rewrite path consults it
+	// before each write/fsync/rename. nil in production. Used by the oracle
+	// segment-fault tier to fail selected segment I/O ops by op kind and
+	// ordinal and assert the system fails loud rather than swallowing the
+	// error. Mirrors CrashInjector's nil-in-prod contract.
 	SegmentIOFaultInjector segment.IOFaultInjector
 	OnBootstrapLiveEvent   func(*segment.Event)
 	OnSteadyStateEvent     func(*segment.Event)

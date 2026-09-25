@@ -258,15 +258,14 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     #     rewrite. TestOracle_RestartTornActiveSegmentTail*
                     #     covers post-crash truncate/corrupt-at-offset recovery.
                     #   - orchestrator unit level: TestRunDeleteCompaction_ENOSPC*
-                    #     and TestRunImport_*SegmentIOFault*/ENOSPC* pin the
-                    #     fail-loud + disk-full operator-message contract
-                    #     directly on runDeleteCompaction / RunImport.
+                    #     pins the fail-loud + disk-full operator-message
+                    #     contract directly on runDeleteCompaction.
                     #   - segment unit level: TestFlushReturnsENOSPC* and the
-                    #     Patch/Rewrite (op, ordinal) fault sweeps pin every seam
+                    #     Rewrite (op, ordinal) fault sweep pin every seam
                     #     consult, so a dropped/reordered consult is a fast kill.
                     cmd=(go test "${RACE_FLAG[@]}"
                          ./internal/oracle ./internal/ingest/orchestrator ./segment
-                         -run 'TestOracle_RestartSegmentFault|TestOracle_RestartTornActiveSegmentTail|TestRunDeleteCompaction_ENOSPC|TestRunImport_ENOSPC|TestRunImport_SegmentIOFaultSweep|TestFlushReturnsENOSPC|TestPatchIOFaultSweep|TestRewriteIOFaultSweep|TestNewRemovesEmptyFileWhenInitFails'
+                         -run 'TestOracle_RestartSegmentFault|TestOracle_RestartTornActiveSegmentTail|TestRunDeleteCompaction_ENOSPC|TestFlushReturnsENOSPC|TestRewriteIOFaultSweep|TestNewRemovesEmptyFileWhenInitFails'
                          -count=1 -timeout "$segmentfault_timeout") ;;
 				powerloss)
                     # Power-loss tier (#264): strict in-memory storage and

@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,9 +14,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/bluesky-social/jetstream/internal/timestamp"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/errors/oserror"
@@ -105,69 +102,6 @@ func runStrictMemCompactionPowerLossCase(t *testing.T, point crashpoint.Point) {
 	require.Len(t, got, 1, "recovered compaction must converge to the compacted segment")
 	require.Equal(t, segment.KindDelete, got[0].Kind)
 	require.Equal(t, uint64(2), got[0].Seq)
-}
-
-func TestRunImport_StrictMemPowerLossPatchCrashpoints(t *testing.T) {
-	t.Parallel()
-
-	for _, point := range []crashpoint.Point{
-		crashpoint.AfterSegmentPatchTempWritten,
-		crashpoint.AfterSegmentPatchTempSynced,
-		crashpoint.AfterSegmentPatchRenamed,
-		crashpoint.AfterSegmentPatchDirSynced,
-	} {
-		t.Run(point.String(), func(t *testing.T) {
-			t.Parallel()
-
-			fs := vfs.NewStrictMem()
-			syncStrictMemDir(t, fs, "/")
-			const dataDir = "/data"
-			segmentsDir := fs.PathJoin(dataDir, "segments")
-			require.NoError(t, ingest.MkdirAllSyncedFS(fs, segmentsDir, 0o755, "orchestrator-test"))
-
-			const importedTS = int64(1_640_000_000_000_000)
-			segPath := writeStrictMemSegment(t, fs, segmentsDir, 0, []segment.Event{
-				{Seq: 1, WitnessedAt: 1_000, Kind: segment.KindCreate, DID: "did:plc:alice", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "1", Payload: []byte("v1")},
-				{Seq: 2, WitnessedAt: 2_000, Kind: segment.KindCreate, DID: "did:plc:bob", Collection: "app.bsky.feed.post", Rkey: "r2", Rev: "1", Payload: []byte("v2")},
-			})
-			fs.ResetToSyncedState()
-			fs.SetIgnoreSyncs(false)
-
-			csv := writeImportCSVFile(t, "uri,timestamp,scope,cid",
-				"at://did:plc:alice/app.bsky.feed.post/r1,2021-12-20T11:33:20Z,all_versions,")
-			inj := &strictFSPowerLossPointInjector{point: point, fs: fs}
-			rig := newStrictMemImportRig(t, fs, dataDir, inj)
-			_, err := rig.o.RunImport(context.Background(), ImportJob{
-				CSVPath: csv,
-				JobDir:  filepath.Join(t.TempDir(), "job1"),
-			})
-			require.ErrorIsf(t, err, errStrictFSPowerLoss, "first import must fail at %s", point)
-			require.Truef(t, inj.fired.Load(), "crashpoint %s did not fire", point)
-			require.NoError(t, rig.close())
-
-			fs.ResetToSyncedState()
-			fs.SetIgnoreSyncs(false)
-
-			rig = newStrictMemImportRig(t, fs, dataDir, nil)
-			defer func() { require.NoError(t, rig.close()) }()
-			res, err := rig.o.RunImport(context.Background(), ImportJob{
-				CSVPath: csv,
-				JobDir:  filepath.Join(t.TempDir(), "job2"),
-			})
-			require.NoError(t, err, "fault-free import re-run must converge")
-			require.EqualValues(t, 1, res.SegmentsExamined)
-			requireNoStrictMemTmp(t, fs, segPath+".tmp")
-
-			for _, ev := range readStrictMemSegment(t, fs, segPath) {
-				switch ev.DID {
-				case "did:plc:alice":
-					require.Equal(t, importedTS, ev.IndexedAt, "re-run import must land the timestamp")
-				case "did:plc:bob":
-					require.EqualValues(t, 0, ev.IndexedAt, "untargeted row must remain unchanged")
-				}
-			}
-		})
-	}
 }
 
 // TestRunMerge_StrictMemPowerLossCleanupComplete pins the durability
@@ -389,85 +323,6 @@ func newStrictMemCompactionOrchestrator(
 		},
 		logger: logger,
 	}
-}
-
-type strictMemImportRig struct {
-	o      *Orchestrator
-	store  *store.Store
-	rules  *timestamp.RuleStore
-	writer *ingest.Writer
-}
-
-func newStrictMemImportRig(t *testing.T, fs *vfs.MemFS, dataDir string, inj crashpoint.Injector) *strictMemImportRig {
-	t.Helper()
-
-	segmentsDir := fs.PathJoin(dataDir, "segments")
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mft, err := manifest.Open(manifest.Options{
-		SegmentsDir: segmentsDir,
-		FS:          fs,
-		Logger:      logger,
-	})
-	require.NoError(t, err)
-
-	st := openStrictMemStore(t, fs, dataDir)
-	rules, err := timestamp.OpenRuleStore(timestamp.RuleStoreConfig{DataDir: dataDir, FS: fs})
-	require.NoError(t, err)
-	w, err := ingest.Open(ingest.Config{
-		DataDir:           dataDir,
-		SegmentsDir:       segmentsDir,
-		FS:                fs,
-		Store:             st,
-		Logger:            logger,
-		MaxEventsPerBlock: 64,
-		OnAfterSeal:       mft.OnSegmentSealed,
-		TimestampStamper:  rules,
-	})
-	require.NoError(t, err)
-
-	rig := &strictMemImportRig{}
-	rig.store = st
-	rig.rules = rules
-	rig.writer = w
-	rig.o = &Orchestrator{
-		logger: logger,
-		cfg: Config{
-			DataDir:          dataDir,
-			FS:               fs,
-			Store:            st,
-			Logger:           logger,
-			ImportSelector:   mft,
-			ImportRules:      rules,
-			TimestampStamper: rules,
-			OnSegmentCompacted: func(idx uint64, path string) error {
-				return mft.OnSegmentCompacted(idx, path)
-			},
-			SegmentManifestChecksums: mft.SegmentChecksums,
-			CrashInjector:            inj,
-		},
-	}
-	rig.o.steadyWriter.Store(w)
-	return rig
-}
-
-func (r *strictMemImportRig) close() error {
-	if r == nil {
-		return nil
-	}
-	var errs []error
-	if r.writer != nil {
-		errs = append(errs, r.writer.Close())
-		r.writer = nil
-	}
-	if r.rules != nil {
-		errs = append(errs, r.rules.Close())
-		r.rules = nil
-	}
-	if r.store != nil {
-		errs = append(errs, r.store.Close())
-		r.store = nil
-	}
-	return errors.Join(errs...)
 }
 
 func openStrictMemStore(t *testing.T, fs *vfs.MemFS, dataDir string) *store.Store {

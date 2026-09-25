@@ -80,14 +80,9 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 
 	return obs.Span(ctx, func(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
-		// Cleanup must hold the rewrite lock: a timestamp-import Phase C in
-		// flight has a live seg_*.jss.tmp open (segment.Patch), and unlinking
-		// it here would make the import's rename fail spuriously. Under the
-		// lock, any *.jss.tmp we see is genuinely stale — no rewrite is in
-		// flight while we hold it.
-		if err := o.withRewriteLock(func() error {
-			return removeStaleCompactionTempsFS(o.cfg.FS, segmentsDir)
-		}); err != nil {
+		// Compaction is the only segment rewriter and passes never overlap,
+		// so any *.jss.tmp seen here is genuinely stale.
+		if err := removeStaleCompactionTempsFS(o.cfg.FS, segmentsDir); err != nil {
 			return err
 		}
 
@@ -162,15 +157,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			}
 
 			if !snap.Empty() {
-				// Hold the rewrite lock for the segment-mutating chunk so a
-				// concurrent timestamp-import pass cannot race this on any
-				// segment's tmp+rename (design §3.3, §6 H). Scoped to the chunk
-				// (not the whole pass) so an import may interleave between
-				// chunks; that is safe because delete-rewrite preserves
-				// IndexedAt and both passes are per-segment atomic + idempotent.
-				if err := o.withRewriteLock(func() error {
-					return o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode)
-				}); err != nil {
+				if err := o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode); err != nil {
 					return err
 				}
 			}

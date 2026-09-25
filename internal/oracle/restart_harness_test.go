@@ -62,7 +62,7 @@ const (
 	// Segment-fault tier (#200): the child installs a deterministic segment
 	// I/O fault (segment.IOFaultInjector) that fails the Ordinal-th
 	// occurrence of one I/O op kind (write/sync/rename) across every segment
-	// writer plus the compaction-rewrite and import-patch paths. Same
+	// writer plus the compaction-rewrite path. Same
 	// fail-loud protocol as the store-fault tier: the child runs to natural
 	// completion, and writes the observed-marker IFF the runtime surfaced
 	// the injected sentinel through rt.Run; marker absence is the kill.
@@ -488,12 +488,12 @@ func newOracleStoreFaultFromEnv(t *testing.T) store.FaultInjector {
 }
 
 // oracleSegmentIOFault fails the ordinal-th occurrence of one segment I/O op
-// kind across the whole child process (every writer plus Patch/Rewrite),
+// kind across the whole child process (every writer plus Rewrite),
 // mirroring opOrdinalIOFault in segment/writer_test.go. The atomic counter
 // makes the ordinal race-safe across backfill worker goroutines; which
 // concrete file operation lands on the ordinal may vary run-to-run for
 // write/sync (concurrent writers), but the fail-loud contract under test is
-// op-agnostic. IOOpRename is deterministic: only Patch/Rewrite rename.
+// op-agnostic. IOOpRename is deterministic: only Rewrite renames.
 type oracleSegmentIOFault struct {
 	op      segment.IOOp
 	ordinal int

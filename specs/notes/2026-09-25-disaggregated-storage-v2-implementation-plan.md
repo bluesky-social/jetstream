@@ -1,6 +1,6 @@
 # Disaggregated storage v2: implementation plan
 
-**Status: not started.** This is the work tracker for
+**Status: Stage 0 done (2026-09-25); Stage 1 not started.** This is the work tracker for
 `specs/notes/2026-09-25-disaggregated-storage-v2-design.md` (the "design"). It
 breaks the design's delivery stages (§26) into PR-sized tasks with file
 references, dependencies, checks, mutants, and exit criteria. The design says
@@ -31,7 +31,7 @@ Prerequisite already landed: the ephemeral dev environment (`just up` /
 
 | Stage | Goal | Status |
 |---|---|---|
-| 0 | Remove timestamp import (design §21) | not started |
+| 0 | Remove timestamp import (design §21) | done |
 | 1 | Storage interfaces; local mode moved onto them with no behavior change | not started |
 | 2 | Steady state in disaggregated mode on fakes and real storage | not started |
 | 3 | Bootstrap, merge, `storage init` | not started |
@@ -265,7 +265,7 @@ PostgreSQL code exists.
 Design §21. This is a pure deletion. The `indexed_at` column stays, always
 `0`. About 12-13k lines go, roughly 60% of them tests and generated code.
 
-- [ ] **S0.1 Delete the import pipeline** (M)
+- [x] **S0.1 Delete the import pipeline** (M)
   - Delete `internal/timestamp/` (including `testdata/fuzz`) and
     `internal/importer/`.
   - Orchestrator: delete `import_pass.go`, `import_pass_test.go`,
@@ -304,7 +304,7 @@ Design §21. This is a pure deletion. The `indexed_at` column stays, always
     drift.
   - cmd: remove the flags and mapping (`main.go:398-409,472-473`) and the
     `serve_test.go` references. Delete `import_e2e_test.go`.
-- [ ] **S0.2 CI, mutation, dashboards** (S). Deps: S0.1.
+- [x] **S0.2 CI, mutation, dashboards** (S). Deps: S0.1.
   - `.github/workflows/ci-scheduled.yml`: drop the `./internal/timestamp
     FuzzParseRoundTrip` and `./segment FuzzPatch` matrix entries. Update
     `testing/ci/workflows_test.go`, which pins the matrix.
@@ -316,7 +316,7 @@ Design §21. This is a pure deletion. The `indexed_at` column stays, always
     segmentfault tier regex. Confirm m044 and m045 are still killed.
   - `contrib/grafana/jetstream.json`: remove the "Timestamp import" row and the
     `jetstream_import_*` expressions.
-- [ ] **S0.3 Docs** (S). Deps: S0.1.
+- [x] **S0.3 Docs** (S). Deps: S0.1.
   - `docs/README.md`: remove §8, and update the mentions at `:337,494,635,683,735`.
     State that `indexed_at` is always 0 until a new import design exists.
   - AGENTS.md repo layout (`timestamp/`, `importer/`, the `cmd/` line).
@@ -1224,4 +1224,42 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
-- (none yet)
+- **S0 (2026-09-25): timestamp import removed.** Re-adding it under a design
+  that fits disaggregated storage is tracked in
+  [#354](https://github.com/bluesky-social/jetstream/issues/354). Notes on
+  what S0 did beyond, or differently from, the task list:
+  - The rewrite lock (`rewriteMu`/`withRewriteLock`) is gone rather than kept
+    as a no-op: compaction is now the only segment rewriter and its passes
+    never overlap. `segment.Rewrite` and `createSegmentFileExclusive` document
+    that single-rewriter assumption. Any second rewriter must bring back
+    mutual exclusion.
+  - `ev.IndexedAt = candidate.IndexedAt` was dropped from the writer. Nothing
+    sets `IndexedAt`, so events carry 0. `segment.Event.DisplayTimeUS`
+    and the wire `time`/`time_us` resolution are kept, so a future import
+    needs no wire or format change.
+  - The `subscribeEvents.json` lexicon descriptions and the public client
+    docs (`event.go`, `options.go`) still say `time` may be an
+    operator-imported timestamp. That is the stable wire contract, and
+    editing it would cause lexgen drift for a feature that is coming back.
+    So the exit `git grep` is read as "no import *implementation*
+    references", not "no mention of timestamps".
+  - `docs/README.md` §8 is a short "removed, to be redesigned" stub rather
+    than being deleted, the same way §6 handles replication. This keeps
+    the section numbers stable.
+  - Removed more dead code the import had left behind:
+    `Runtime.WaitSteadyState` and its `steadyReady` plumbing,
+    `waitRuntimeSteadyState` in `cmd/jetstream`, and the
+    `IsCancellationOnly` lesson in `specs/gotchas.md`.
+    `manifest.Generation()` is kept (its comments are updated) even though
+    its only production consumer was the import bucketer. It is a
+    candidate for deletion if Stage 1 does not reuse it.
+  - The `baseline.json` m048 row was removed by hand, not regenerated with
+    `just mutation-baseline`. The rest of the baseline is unchanged:
+    `just mutation-gate` on a clean snapshot of the S0 tree passed, with
+    52/52 mutants matching the baseline and m044, m045, and m047 still
+    KILLED@segmentfault.
+  - The oracle `TestOracle_DefaultLifecycle` anti-vacuity assertion
+    ("final compaction watermark did not cover the #203 account-status
+    lifecycle rows") flakes under heavy parallel load. It flakes at the
+    same rate on the pre-S0 HEAD (6/60 vs 4/60 runs at 24-way
+    concurrency), so it predates S0. It is not root-caused yet.

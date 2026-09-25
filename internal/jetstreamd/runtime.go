@@ -14,7 +14,6 @@ import (
 
 	"github.com/bluesky-social/gttp"
 	identcache "github.com/bluesky-social/jetstream/internal/identity"
-	"github.com/bluesky-social/jetstream/internal/importer"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
@@ -27,7 +26,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
-	"github.com/bluesky-social/jetstream/internal/timestamp"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/bluesky-social/jetstream/internal/web"
@@ -48,20 +46,14 @@ type Runtime struct {
 	processLogger *slog.Logger
 	logger        *slog.Logger
 
-	tracerShutdown  obs.TracerShutdown
-	cancelManifest  context.CancelFunc
-	metaStore       *store.Store
-	importRules     *timestamp.RuleStore
-	manifest        *manifest.Manifest
-	tail            *subscribe.Tail
-	verifier        *atmossync.Verifier
-	orchestrator    *orchestrator.Orchestrator
-	importer        *importer.Manager
-	importRunCtx    context.Context
-	cancelImport    context.CancelFunc
-	steadyReady     chan struct{}
-	steadyReadyOnce sync.Once
-	server          *server.Server
+	tracerShutdown obs.TracerShutdown
+	cancelManifest context.CancelFunc
+	metaStore      *store.Store
+	manifest       *manifest.Manifest
+	tail           *subscribe.Tail
+	verifier       *atmossync.Verifier
+	orchestrator   *orchestrator.Orchestrator
+	server         *server.Server
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
@@ -157,7 +149,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		opts:          opts,
 		processLogger: processLogger,
 		logger:        logger,
-		steadyReady:   make(chan struct{}),
 	}
 	cleanupTimeout := opts.ShutdownTimeout
 	if cleanupTimeout <= 0 {
@@ -204,15 +195,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(err)
 	}
 	rt.metaStore = metaStore
-
-	importRules, err := timestamp.OpenRuleStore(timestamp.RuleStoreConfig{
-		DataDir: opts.DataDir,
-		FS:      opts.StorageFS,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: open timestamp import rule store: %w", err))
-	}
-	rt.importRules = importRules
 
 	manifestCtx, cancelManifest := context.WithCancel(ctx)
 	rt.cancelManifest = cancelManifest
@@ -393,10 +375,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		IngestOnAfterSeal:              mft.OnSegmentSealed,
 		OnSegmentCompacted:             onSegmentCompacted,
 		SegmentManifestChecksums:       mft.SegmentChecksums,
-		ImportSelector:                 mft,
-		ImportMetrics:                  orchestrator.NewImportMetrics(metrics.Registry),
-		ImportRules:                    importRules,
-		TimestampStamper:               importRules,
 		CompactionInterval:             opts.CompactionInterval,
 		CompactionSchedule:             compactionSchedule,
 		CompactionTombstoneCap:         opts.CompactionTombstoneCap,
@@ -415,7 +393,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			// read the writer-owned log from its first event.
 			tail.SetReadLogSource(func() *ingest.ReadableLog { return w.ReadLog() })
 			writerPtr.Store(w)
-			rt.steadyReadyOnce.Do(func() { close(rt.steadyReady) })
 		},
 	})
 	if err != nil {
@@ -423,49 +400,12 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.orchestrator = orch
 
-	// Timestamp-import job manager (design §8 M6). Always constructed so the
-	// endpoints exist and return a secure-by-default 401 when no token is set;
-	// the manager confines CSV paths to the import dir and shares the
-	// orchestrator's rewrite lock via RunImport. The import dir defaults to
-	// <data-dir>/imports; per-job scratch (offset files) lives under
-	// <data-dir>/import-scratch, kept separate from the operator's staged CSVs.
-	importDir := opts.TimestampImportDir
-	if importDir == "" {
-		importDir = filepath.Join(opts.DataDir, "imports")
-	}
-	if err := mkdirAllRuntimeFS(opts.StorageFS, importDir, 0o755); err != nil {
-		return fail(fmt.Errorf("serve: create import dir %s: %w", importDir, err))
-	}
-	importRunCtx, cancelImport := context.WithCancel(context.Background())
-	rt.importRunCtx = importRunCtx
-	rt.cancelImport = cancelImport
-	importMgr, err := importer.New(importer.Config{
-		Store:      metaStore,
-		Runner:     orch,
-		ImportDir:  importDir,
-		ScratchDir: filepath.Join(opts.DataDir, "import-scratch"),
-		Ready: func() error {
-			if !lifecycle.IsSteadyState(metaStore) || writerPtr.Load() == nil {
-				return importer.ErrNotReady
-			}
-			return nil
-		},
-		Logger: processLogger,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build import manager: %w", err))
-	}
-	rt.importer = importMgr
-
-	// Status collector + handler are built here (after the import manager) so
-	// the status page can surface the current import job.
 	statusCollector, err := status.New(status.Options{
 		Store:                 metaStore,
 		DataDir:               opts.DataDir,
 		Manifest:              mft,
 		CursorLookback:        opts.CursorLookback,
 		IdentityResolver:      resolver,
-		ImportReporter:        importReporter{mgr: importMgr},
 		LastSeenUpstreamEvent: liveMetrics.LastSeenUpstreamEvent,
 		Writer: func() *ingest.Writer {
 			return writerPtr.Load()
@@ -549,11 +489,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		},
 		Metrics: xrpcMetrics,
 		Tracer:  obs.Tracer("xrpcapi"),
-		Import: xrpcapi.ImportConfig{
-			Manager: importMgr,
-			Token:   opts.TimestampImportToken,
-			RunCtx:  importRunCtx,
-		},
 		Dictionary: xrpcapi.DictionaryConfig{
 			ID:    subscribe.DictionaryV2ID,
 			Bytes: subscribe.DictionaryV2(),
@@ -600,19 +535,6 @@ func (r *Runtime) PublicAddr() string {
 		return ""
 	}
 	return r.server.PublicAddr()
-}
-
-// WaitSteadyState blocks until the steady-state writer has been published.
-func (r *Runtime) WaitSteadyState(ctx context.Context) error {
-	if r == nil || r.steadyReady == nil {
-		return errors.New("runtime: not built")
-	}
-	select {
-	case <-r.steadyReady:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // Run starts the constructed service graph and blocks until shutdown or a
@@ -664,27 +586,6 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	g.Go(r.goroutineRoot("orchestrator", func() error {
 		return r.orchestrator.Run(gctx)
 	}))
-
-	// Auto-resume a timestamp-import job that a prior process left incomplete
-	// (design Q-RESUME), but only after the steady-state writer is published:
-	// imports are steady-state-only and the resume path should not turn a boot
-	// ordering race into a terminal failed job. Best-effort: a resume failure is
-	// logged, not fatal — the archive still serves, and the operator can
-	// re-submit. The job's background run is rooted at importRunCtx (cancelled
-	// in Close), not gctx.
-	if r.importer != nil {
-		g.Go(r.goroutineRoot("import_resume", func() error {
-			select {
-			case <-r.steadyReady:
-			case <-gctx.Done():
-				return nil
-			}
-			if err := r.importer.ResumeIncomplete(r.importRunCtx); err != nil {
-				r.logger.Warn("resume incomplete import failed", "err", err)
-			}
-			return nil
-		}))
-	}
 
 	// Graceful client drain. Live websocket subscribers are hijacked
 	// connections, so http.Server.Shutdown neither tracks nor closes
@@ -768,7 +669,6 @@ func (r *Runtime) goroutineRoot(name string, fn func() error) func() error {
 // fields.
 func (r *Runtime) Close(ctx context.Context) error {
 	r.cancelManifestLoad()
-	r.cancelImportRun()
 
 	var errs []error
 
@@ -782,41 +682,12 @@ func (r *Runtime) Close(ctx context.Context) error {
 	r.closeMu.Lock()
 	defer r.closeMu.Unlock()
 
-	// Drain any in-flight timestamp-import job BEFORE
-	// closing the metadata store: the manager writes job records + checkpoints
-	// to the store from its background run, and a write after Close would panic
-	// (pebble: closed). A cancelled run pauses (stays resumable), so the next
-	// boot picks it up.
-	importDrained := true
-	if r.importer != nil {
-		if err := r.importer.Wait(ctx); err != nil {
-			// The import goroutine may still be about to write a checkpoint.
-			// Closing pebble under it converts a slow shutdown into a panic,
-			// so we leave the store open and let process exit tear it down —
-			// pebble's WAL recovers cleanly on the next boot.
-			importDrained = false
-			r.logger.Error("import drain did not complete within budget; leaving metadata store open", "err", err)
-			errs = append(errs, fmt.Errorf("import drain: %w", err))
-		} else {
-			// Only forget the importer once it actually drained: a repeated
-			// Close must re-wait, not skip straight to closing the store.
-			r.importer = nil
-		}
-	}
-
 	if r.verifier != nil && runDrained {
 		if err := r.verifier.Close(); err != nil {
 			r.logger.Error("verifier close", "err", err)
 			errs = append(errs, fmt.Errorf("verifier close: %w", err))
 		}
 		r.verifier = nil
-	}
-	if r.importRules != nil && runDrained && importDrained {
-		if err := r.importRules.Close(); err != nil {
-			r.logger.Error("close timestamp import rule store", "err", err)
-			errs = append(errs, fmt.Errorf("close timestamp import rule store: %w", err))
-		}
-		r.importRules = nil
 	}
 	// Note: promoted sync state is NOT flushed here. The consumer's own
 	// Close flushes it after its writer has durably fsynced every
@@ -825,14 +696,14 @@ func (r *Runtime) Close(ctx context.Context) error {
 	// verifier state run ahead of the archive. Pending (unpromoted)
 	// entries are deliberately dropped — their events' rows were never
 	// archived and redelivery re-verifies them.
-	if r.metaStore != nil && runDrained && importDrained {
+	if r.metaStore != nil && runDrained {
 		if err := r.metaStore.Close(); err != nil {
 			r.logger.Error("close metadata store", "err", err)
 			errs = append(errs, fmt.Errorf("close metadata store: %w", err))
 		}
 		r.metaStore = nil
 	}
-	if r.tracerShutdown != nil && runDrained && importDrained {
+	if r.tracerShutdown != nil && runDrained {
 		if err := r.tracerShutdown(ctx); err != nil {
 			r.logger.Error("tracer shutdown failed", "err", err)
 			errs = append(errs, fmt.Errorf("tracer shutdown: %w", err))
@@ -861,16 +732,6 @@ func (r *Runtime) stopRun(ctx context.Context) error {
 	}
 }
 
-func (r *Runtime) cancelImportRun() {
-	r.closeMu.Lock()
-	cancel := r.cancelImport
-	r.cancelImport = nil
-	r.closeMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-}
-
 func (r *Runtime) closeWithLogging(ctx context.Context) {
 	if err := r.Close(ctx); err != nil {
 		r.logger.Error("runtime cleanup failed", "err", err)
@@ -885,38 +746,6 @@ func (r *Runtime) cancelManifestLoad() {
 	if cancel != nil {
 		cancel()
 	}
-}
-
-// importReporter adapts *importer.Manager to status.ImportReporter, translating
-// the importer's Record into the status package's rendering view so status
-// stays decoupled from the importer's concrete types.
-type importReporter struct{ mgr *importer.Manager }
-
-func (r importReporter) CurrentImport() (status.ImportInfo, bool) {
-	rec, ok := r.mgr.Current()
-	if !ok {
-		return status.ImportInfo{}, false
-	}
-	return status.ImportInfo{
-		JobID:                 rec.ID,
-		State:                 string(rec.State),
-		Phase:                 string(rec.Phase),
-		Error:                 rec.Error,
-		SubmittedAt:           rec.SubmittedAt,
-		FinishedAt:            rec.FinishedAt,
-		Bucketed:              rec.Bucketed,
-		SegmentsToApply:       rec.SegmentsToApply,
-		SegmentsApplied:       rec.SegmentsApplied,
-		RowsTotal:             rec.RowsTotal,
-		RowsValid:             rec.RowsValid,
-		RowsRejected:          rec.RowsRejected,
-		SegmentsExamined:      rec.SegmentsExamined,
-		SegmentsPatched:       rec.SegmentsPatched,
-		RowsMutated:           rec.RowsMutated,
-		RowsMatchedSpecific:   rec.RowsMatchedSpecific,
-		SpecificCIDsUnmatched: rec.SpecificCIDsUnmatched,
-		RowsCorruptOffset:     rec.RowsCorruptOffset,
-	}, true
 }
 
 func phaseBarrier(barrier PhaseBarrier) orchestrator.PhaseBarrier {

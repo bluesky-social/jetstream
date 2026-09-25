@@ -149,13 +149,13 @@ type Manifest struct {
 
 	// generation increments (under mu) on every mutation of the resident
 	// segment set that could change which segments or blocks a DID resolves
-	// to: initial load, seal, and compaction refresh. The Phase B import
-	// bucketer caches DID->candidate-segment selections and tags each entry
-	// with the generation it was computed under; a lookup at a newer
-	// generation is a forced miss that recomputes against the current
-	// manifest. This is what keeps that cache provably consistent with the
-	// manifest at point-of-use, so a segment sealed mid-import cannot cause a
-	// stale cache to silently misroute (drop) a row's patch.
+	// to: initial load, seal, and compaction refresh. A cache of
+	// DID->candidate-segment selections tags each entry with the generation
+	// it was computed under; a lookup at a newer generation is a forced miss
+	// that recomputes against the current manifest. This is what keeps such a
+	// cache provably consistent with the manifest at point-of-use, so a
+	// segment sealed mid-scan cannot cause a stale entry to silently misroute
+	// a lookup.
 	generation uint64
 }
 
@@ -767,11 +767,12 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 // OnSegmentCompacted. Read-only queries never advance it.
 //
 // It exists for consumers that cache a manifest-derived selection and need a
-// cheap staleness check without diffing the segment set. The import Phase B
-// bucketer tags each cached DID->candidate-segment selection with the
-// generation it was computed under and discards (recomputes) any entry whose
-// generation is older than the current one, keeping the cache consistent with
-// the manifest at point-of-use.
+// cheap staleness check without diffing the segment set: tag each cached
+// DID->candidate-segment selection with the generation it was computed under
+// and discard (recompute) any entry whose generation is older than the
+// current one, keeping the cache consistent with the manifest at
+// point-of-use. Its original consumer, the timestamp-import bucketer, was
+// removed with import (#354); nothing in production reads it today.
 func (m *Manifest) Generation() uint64 {
 	if err := m.waitReady(); err != nil {
 		return 0

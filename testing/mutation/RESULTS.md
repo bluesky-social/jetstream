@@ -5,15 +5,15 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 53 active mutants on disk
-(m001–m061; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
+**Current catalog (keep this line current): 52 active mutants on disk
+(m001–m061; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
 union baseline after issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **53 killed, 0 survived,
+coverage: **52 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
-m046-m050 cover fsync omission/reordering and Linux SyncWrites downgrades.
+m046-m050 cover fsync omission/reordering and Linux SyncWrites downgrades (m048 since retired with `segment/patch.go`).
 m051 covers the merge-cleanup data-dir fsync ordering (the powerloss tier now
 also runs `./internal/ingest/orchestrator`'s `TestRunMerge_StrictMemPowerLoss*`
 to catch it and the restart-after-cleanup guard sibling).
@@ -136,6 +136,7 @@ remain below so the reasoning is not lost.
 | m021_overlay_record_seq_base_zero | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m023_overlay_drop_record_tombstones | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178. #183's re-derivation analysis (2026-07-04 section below) concluded no single-edit replacement exists: the recorder is a regression assertion without a gated mutant. |
+| m048_patch_parent_dir_fsync_deleted | 2026-09-25 | Targets `segment/patch.go`, deleted with timestamp import (disaggregated storage v2 S0.1; re-adding import is #354). `segment.Rewrite` is now the only rewriter; its parent-dir fsync stays covered by m047. |
 
 ## Campaign 2026-07-07 (#264 — power-loss durability boundary)
 

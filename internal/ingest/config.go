@@ -17,14 +17,6 @@ import (
 // the block was detached/flushed.
 type DurableBatchHook func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool, prepareValue any) (afterCommit func(), afterDone func(error), err error)
 
-// TimestampStamper applies imported display timestamps to materialization rows
-// before they are buffered into a segment. Implementations must be cheap for
-// collections with no imported rules and must return lookup failures instead
-// of silently falling back to witnessed_at.
-type TimestampStamper interface {
-	Stamp(ctx context.Context, ev *segment.Event) error
-}
-
 // defaultMaxSegmentBytes is the rotation threshold. docs/README.md §3.1.1
 // names ~256MB as the target sealed-segment size. Operator-tunable
 // via Config.MaxSegmentBytes.
@@ -70,11 +62,6 @@ type Config struct {
 	// this budget. Zero is legal and means "retain only pinned events". Negative
 	// values are rejected.
 	ReadLogRetentionBytes int64
-
-	// TimestampStamper applies imported display timestamps before
-	// materialization rows enter the segment or readable log. Timestamps
-	// must be persisted with the event, not overlaid during reads.
-	TimestampStamper TimestampStamper
 
 	// SeqKey is the pebble key holding the writer's seq counter.
 	// Default "seq/next" preserves backfill-writer behavior. The

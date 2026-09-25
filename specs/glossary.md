@@ -46,8 +46,6 @@ Definitions and references for terms used in the code and docs. The code and lin
 
 **Cold reader** — the fallback path when a subscriber's cursor is older than what the readable log still holds in memory: a bounded disk walk over sealed segments plus the active segment's flushed region, routed through a shared decoded-block LRU cache. Source: `internal/subscribe/doc.go`, `internal/subscribe/replay.go`.
 
-**Bucketed** — a timestamp-import status flag (`getImportStatus`) meaning the import's rows have been grouped/bucketed for processing. Used only by the import API. Source: `internal/timestamp`, `docs/README.md` §8.
-
 ## Testing
 
 **Oracle** — the end-to-end correctness harness: boots a real server against the simulated network, drives its whole lifecycle, and compares durable output against an independent model. A bug detector, not a proof. Source: `specs/oracle.md`, `internal/oracle/doc.go`.

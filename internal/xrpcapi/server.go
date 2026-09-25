@@ -17,22 +17,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// ImportConfig wires the bearer-gated timestamp-import endpoints. It is
-// optional: a zero ImportConfig (nil Manager) leaves importTimestamps /
-// getImportStatus unregistered, so a server built without import support
-// returns the framework's default 404 for those NSIDs.
-type ImportConfig struct {
-	// Manager runs and reports import jobs. nil disables the endpoints.
-	Manager ImportManager
-	// Token is the bearer secret. Empty means the endpoints are registered but
-	// every request is rejected 401 (secure-by-default), matching the design's
-	// "disabled -> 401" rule and keeping the wire surface identical whether or
-	// not a token is set.
-	Token string
-	// RunCtx roots submitted jobs' background runs; cancel it on shutdown.
-	RunCtx context.Context
-}
-
 // SegmentSource is the read-only manifest surface xrpcapi needs. The
 // concrete *manifest.Manifest satisfies it; tests can pass a fake.
 type SegmentSource interface {
@@ -67,7 +51,6 @@ type Config struct {
 	Plan                 PlanConfig
 	Metrics              *Metrics
 	Tracer               trace.Tracer
-	Import               ImportConfig
 
 	// Dictionary is the v2 subscribe compression dictionary served by
 	// getZstdDictionary. Empty Bytes leaves the endpoint unregistered.
@@ -101,21 +84,6 @@ func New(cfg Config) *Server {
 			newGetZstdDictionaryHandler(cfg.Dictionary))
 	}
 
-	// Timestamp-import endpoints (design §8 M6). Registered only when a manager
-	// is wired; bearer-gated (401-by-default when no token) and NOT behind the
-	// readiness gate — an operator must be able to submit/monitor an import
-	// during any phase, and the manager itself refuses work the archive can't
-	// take yet.
-	if cfg.Import.Manager != nil {
-		runCtx := cfg.Import.RunCtx
-		if runCtx == nil {
-			runCtx = context.Background()
-		}
-		s.xrpc.HandleProcedure("network.bsky.jetstream.importTimestamps",
-			withBearer(cfg.Import.Token, newImportTimestampsHandler(cfg.Import.Manager, runCtx)))
-		s.xrpc.HandleQuery("network.bsky.jetstream.getImportStatus",
-			withBearer(cfg.Import.Token, newGetImportStatusHandler(cfg.Import.Manager)))
-	}
 	return s
 }
 

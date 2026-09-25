@@ -12,7 +12,7 @@ import (
 )
 
 // recordingIOFault counts every consult per op without ever failing, so a
-// sweep can learn how many seam points a Patch/Rewrite crosses.
+// sweep can learn how many seam points a Rewrite crosses.
 type recordingIOFault struct {
 	counts map[IOOp]int
 }
@@ -25,12 +25,22 @@ func (r *recordingIOFault) BeforeSegmentIO(_ string, op IOOp) error {
 	return nil
 }
 
+func ioFaultSweepFixtureEvents() []Event {
+	return []Event{
+		{Seq: 1, WitnessedAt: 100, Kind: KindCreate, DID: "did:plc:a", Collection: "app.bsky.feed.post", Rkey: "r1", Rev: "v1", Payload: []byte{0xa0}},
+		{Seq: 2, WitnessedAt: 200, Kind: KindCreate, DID: "did:plc:b", Collection: "app.bsky.feed.like", Rkey: "r2", Rev: "v2", Payload: []byte{0xa1}},
+		{Seq: 3, WitnessedAt: 300, Kind: KindIdentity, DID: "did:plc:a"},
+		{Seq: 4, WitnessedAt: 400, Kind: KindUpdate, DID: "did:plc:c", Collection: "app.bsky.feed.post", Rkey: "r4", Rev: "v4", Payload: []byte{0xa2}},
+		{Seq: 5, WitnessedAt: 500, Kind: KindDelete, DID: "did:plc:b", Collection: "app.bsky.feed.post", Rkey: "r5", Rev: "v5"},
+	}
+}
+
 // ioFaultSweepFixture builds one sealed multi-block segment and returns its
-// bytes, so every subtest patches/rewrites byte-identical input.
+// bytes, so every subtest rewrites byte-identical input.
 func ioFaultSweepFixture(t *testing.T) []byte {
 	t.Helper()
 	dir := t.TempDir()
-	path := sealedSegmentForReader(t, dir, patchFixtureEvents(), 2)
+	path := sealedSegmentForReader(t, dir, ioFaultSweepFixtureEvents(), 2)
 	raw, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return raw
@@ -43,16 +53,6 @@ func writeFixtureCopy(t *testing.T, fixture []byte) string {
 	return path
 }
 
-func patchForSweep(path string, faults IOFaultInjector) (PatchResult, error) {
-	return Patch(path, func(ev *Event) bool {
-		if ev.DID == "did:plc:a" {
-			ev.IndexedAt = 1_600_000_000_000_000
-			return true
-		}
-		return false
-	}, PatchOptions{IOFaultInjector: faults})
-}
-
 func rewriteForSweep(path string, faults IOFaultInjector) (RewriteResult, error) {
 	return Rewrite(path, func(ev *Event) RowDecision {
 		if ev.DID == "did:plc:b" {
@@ -62,7 +62,7 @@ func rewriteForSweep(path string, faults IOFaultInjector) (RewriteResult, error)
 	}, RewriteOptions{IOFaultInjector: faults})
 }
 
-// sweepCase runs op (patch or rewrite) against a fresh fixture copy with a
+// runIOFaultSweep runs the target against a fresh fixture copy with a
 // fault armed at (op, ordinal), then asserts the no-silent-corruption
 // contract: the injected error propagates, no tmp file survives, and the
 // on-disk file is EITHER byte-identical to the source (fault at or before the
@@ -161,36 +161,6 @@ func TestNewHealsPreexistingEmptyFile(t *testing.T) {
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	require.EqualValues(t, ReservedHeaderBytes, info.Size())
-}
-
-func TestPatchIOFaultSweep(t *testing.T) {
-	t.Parallel()
-	fixture := ioFaultSweepFixture(t)
-
-	// Learn the committed output and the per-op seam counts from one
-	// fault-free run; zstd encoding is deterministic in-process, so every
-	// subtest's committed bytes match this reference.
-	refPath := writeFixtureCopy(t, fixture)
-	rec := &recordingIOFault{}
-	res, err := patchForSweep(refPath, rec)
-	require.NoError(t, err)
-	require.True(t, res.Patched)
-	committed, err := os.ReadFile(refPath)
-	require.NoError(t, err)
-	require.NotEqual(t, fixture, committed)
-
-	require.Equal(t, 1, rec.counts[IOOpRename], "patch commits via exactly one rename")
-	require.Equal(t, 3, rec.counts[IOOpSync], "init fsync + tmp fsync + parent-dir fsync")
-	require.GreaterOrEqual(t, rec.counts[IOOpWrite], 5,
-		"init header + per-block frames + footer + header")
-
-	runIOFaultSweep(t, ioFaultSweepTarget{
-		name: "patch",
-		run: func(path string, faults IOFaultInjector) error {
-			_, err := patchForSweep(path, faults)
-			return err
-		},
-	}, fixture, committed, rec.counts)
 }
 
 func TestRewriteIOFaultSweep(t *testing.T) {

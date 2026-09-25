@@ -30,9 +30,9 @@ func openSegmentReadWrite(fs vfs.FS, path string) (vfs.File, error) {
 	return segmentFS(fs).OpenReadWrite(path)
 }
 
-// createSegmentFileExclusive fails if path exists. Patch and Rewrite remove
-// abandoned temporary files first; a file reappearing before creation
-// violates their rewrite-lock assumption and must not be overwritten.
+// createSegmentFileExclusive fails if path exists. Rewrite removes abandoned
+// temporary files first; a file reappearing before creation violates its
+// single-rewriter assumption and must not be overwritten.
 //
 // Production uses atomic O_CREATE|O_EXCL. The strict test VFS has no
 // exclusive-create operation, so it uses Stat followed by Create. That

@@ -72,7 +72,6 @@ The test rig checks storage and delivery across the full lifecycle.
 | The Go client implementation | module root, `specs/client.md` |
 | Wire compression (dict-zstd, dictionary rotation, retraining) | `specs/client.md`, `internal/subscribe/doc.go` |
 | Compaction / tombstones | `internal/tombstone`, `docs/README.md` §3.3 |
-| Timestamp import | `internal/timestamp`, `docs/README.md` §8 |
 | The oracle / simulator | `specs/oracle.md`, `internal/oracle/doc.go`, `internal/simulator/doc.go` |
 | The mutation campaign (oracle scorecard) | `specs/mutation.md`, `testing/mutation/RESULTS.md` |
 | Coding conventions, workflow, task tracking | `AGENTS.md` |

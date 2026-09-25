@@ -28,7 +28,7 @@ These summarize and route; `docs/README.md` and each package's `doc.go` remain a
 ```
 *.go              public Go client API
 cmd/
-  jetstream/      main binary: serve, inspect-segment, timestamp import, version
+  jetstream/      main binary: serve, inspect-segment, version
   simulator/      local PLC + PDS + Relay on :7777
 segment/          on-disk segment file format (header, blocks, footer, reader, writer, sealer); public API
 internal/
@@ -43,8 +43,6 @@ internal/
   store/          pebble-backed cursor + metadata store
   manifest/       segment manifest (directory scan + self-describing headers)
   tombstone/      delete/update/account tombstone set for compaction
-  timestamp/      operator timestamp-import pipeline
-  importer/       import job manager
   repoexport/     reconstruct a repo CAR/MST from archived events
   identity/       DID resolution
   status/         /status endpoint collector

@@ -35,10 +35,6 @@ type Options struct {
 	// tab. Optional; nil means handle lookup is limited to the local index.
 	IdentityResolver identity.Resolver
 
-	// ImportReporter yields the current/most-recent timestamp-import job for
-	// the status page. Optional; nil means the import panel is omitted.
-	ImportReporter ImportReporter
-
 	// LastSeenUpstreamEvent returns the last steady-state subscribeRepos event
 	// observation time. Optional; nil means the live freshness fields are empty.
 	LastSeenUpstreamEvent func() time.Time

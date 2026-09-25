@@ -39,17 +39,12 @@ import (
 //     writers are open (backfill or bootstrap-live, whichever flushes first —
 //     the fail-loud contract is path-agnostic).
 //   - rename/eio@1 fires on the first Rewrite commit rename. Only
-//     Patch/Rewrite ever rename, and the child's only rewrite driver is the
+//     Rewrite ever renames, and the child's only rewrite driver is the
 //     merge-tail compaction pass, so this deterministically targets the
 //     compaction-rewrite path e2e (the plan's §9 open question resolves
 //     without new barriers: merge-tail compaction runs before the
 //     after-merge barrier). The chain spec always injects delete shapes, so
 //     the pass genuinely drops rows and must rewrite.
-//
-// Import-patch fault coverage deliberately stays at the orchestrator level
-// (segment_iofault_test.go in internal/ingest/orchestrator): the restart
-// child never runs a timestamp import (operator-submitted via XRPC), and
-// RunImport-level tests exercise the identical Patch seam and error path.
 //
 // nolint:paralleltest
 func TestOracle_RestartSegmentFault_FailsLoudThenRecovers(t *testing.T) {

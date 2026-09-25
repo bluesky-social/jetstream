@@ -205,11 +205,11 @@ The first coverage lives in `TestOracle_PowerLossStrictMemDropsUnsyncedState` pl
 
 The default lifecycle also installs a durable-operation recorder: segment operations are observed through the storage VFS and metadata commits through the store write seam. Its checker requires active-segment data writes to be followed by a sync of the same segment file before the covering `seq/next` / `live_segments/seq/next` Pebble commit, and requires segment rewrites to be followed by a parent-directory sync before `compaction/seq` can claim the rewrite. The focused ingest test uses the same important distinction: an initial empty-header fsync is not evidence that a later block write reached the durability boundary.
 
-Mutation coverage for this tier is catalogued as m046-m050: block fsync deletion, Rewrite parent-dir fsync deletion, Patch parent-dir fsync deletion, inverted ingest flush ordering, and Linux `store.SyncWrites` downgraded to `pebble.NoSync`. The `powerloss` mutation tier runs the strict-mem and operation-order tests; Rewrite/Patch parent-dir fsync omissions are also covered by the existing `segmentfault` seam-count sweeps.
+Mutation coverage for this tier is catalogued as m046-m050: block fsync deletion, Rewrite parent-dir fsync deletion, inverted ingest flush ordering, and Linux `store.SyncWrites` downgraded to `pebble.NoSync` (m048, the Patch parent-dir fsync deletion, was retired when `segment.Patch` was removed with timestamp import). The `powerloss` mutation tier runs the strict-mem and operation-order tests; the Rewrite parent-dir fsync omission is also covered by the existing `segmentfault` seam-count sweep.
 
 `TestOracle_PowerLossCrashPointsStrictMem` drives the full runtime in-process with `jetstreamd.Options.StorageFS`, resets the shared strict FS at enumerated lifecycle crashpoints, reopens the runtime, and reuses the FS-aware segment observers to prove convergence. Runtime-level coverage spans repo completion (including seeded non-first ordinals), bootstrap-live close before seal, merge destination flush before source cursor commit, merge destination seal before discovery, merge discovery before cleanup, and steady-phase commit before the steady-state consumer starts. `TestOracle_PowerLossSeededRandomCrashPointsStrictMem` adds deterministic random selection over that lifecycle matrix so fixed case order is not the only exercised shape.
 
-Compaction and timestamp-import use caller-level strict-FS tests because those crashpoints are owned by orchestrator paths rather than the normal lifecycle runtime. `TestRunDeleteCompaction_StrictMemPowerLossRewriteCrashpoints` covers every `segment.Rewrite` temp-write/temp-fsync/rename/dir-fsync seam through merge-tail delete compaction, while `TestRunDeleteCompaction_StrictMemPowerLossCompactionCrashpoints` covers the compaction watermark checkpoints before and after the durable metadata commit. `TestRunImport_StrictMemPowerLossPatchCrashpoints` covers every `segment.Patch` temp-write/temp-fsync/rename/dir-fsync seam through `RunImport`, the production timestamp-import path. Keep the real filesystem restart tier in place; the strict tier models power loss, not process isolation, OS locks, or syscall-boundary behavior.
+Compaction uses caller-level strict-FS tests because its crashpoints are owned by orchestrator paths rather than the normal lifecycle runtime. `TestRunDeleteCompaction_StrictMemPowerLossRewriteCrashpoints` covers every `segment.Rewrite` temp-write/temp-fsync/rename/dir-fsync seam through merge-tail delete compaction, while `TestRunDeleteCompaction_StrictMemPowerLossCompactionCrashpoints` covers the compaction watermark checkpoints before and after the durable metadata commit. Keep the real filesystem restart tier in place; the strict tier models power loss, not process isolation, OS locks, or syscall-boundary behavior.
 
 ### Store-Fault Tier
 
@@ -224,15 +224,13 @@ into a real restart-child runtime, with the same fail-loud observed-marker
 protocol and recovery-convergence bundle. It proves fail-loud on the active
 writer's open/flush paths, ENOSPC end-to-end including the disk-full operator
 message on `rt.Run`'s error, and the compaction-rewrite path (rename faults
-are deterministic — only Patch/Rewrite rename, and the restart child's only
+are deterministic — only Rewrite renames, and the restart child's only
 rewrite driver is merge-tail compaction). A companion torn-tail sweep
 SIGKILLs a child mid-backfill, mutates the active segment's un-fsynced tail
 (truncated length prefix / torn frame with hostile garbage body), and
 requires strict recovery convergence through the torn-tail walk.
-Import-patch faults are covered at the orchestrator level (RunImport drives
-the identical Patch seam; the restart child never runs an operator-submitted
-XRPC import), and the segment package pins every seam consult with
-exhaustive (op, ordinal) sweeps over Patch and Rewrite. Gated by the
+The segment package pins every seam consult with an exhaustive
+(op, ordinal) sweep over Rewrite. Gated by the
 `segmentfault` mutation tier (m044, m045). The tier's first run flushed out
 the pre-existing #262 data-loss bug; its deterministic repro is the skipped
 `write-shortwrite-first-flush` case.

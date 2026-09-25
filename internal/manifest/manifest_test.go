@@ -323,7 +323,7 @@ func TestGenerationAdvancesOnMutation(t *testing.T) {
 // seq-monotonicity validation must leave BOTH the resident segment set and the
 // generation exactly as they were. If the rejected metadata stayed resident
 // while the generation did not move, serving paths would observe the corrupt
-// set and generation-tagged caches (the import bucketer) would keep treating
+// set and generation-tagged caches would keep treating
 // their entries as fresh against it.
 func TestRefreshSegment_RejectedRefreshLeavesManifestUntouched(t *testing.T) {
 	t.Parallel()
