@@ -338,7 +338,11 @@ events.
 
 ### 7.3 Upload protocol
 
-`ObjectStore.Put(ctx, data)` returns an `object_id`. Steps:
+`protocol.Uploader` implements this with the leader's `*catalog.Session`,
+because the `uploading` row is a fenced write. `Put(ctx, session, data)` runs
+every step and returns the winning `object_id`. The batch form `Upload(ctx,
+session, objs)` stops after step 5 and returns pending references: the
+referencing transaction runs step 6 (see the end of this section). Steps:
 
 1. `sha := sha256(data)`.
 2. If a row exists with `sha256 = sha AND state = 'available' AND
@@ -354,7 +358,10 @@ events.
    leader cannot start new uploads.
 4. PUT the bytes.
 5. GET the object and check its length and SHA-256. On mismatch, retry from
-   step 3 with a new key. The old row is left for GC.
+   step 3 with a new key, at most 3 rounds, then end the session. The old row
+   is left for GC. A mismatch counts as
+   `jetstream_s3_verify_failures_total{path="upload"}`, not as corruption,
+   because nothing durable is wrong.
 6. `UPDATE objects SET state = 'available' WHERE object_id = $id AND state =
    'uploading'` (fenced). If this hits the partial unique index on `sha256`
    because another upload of the same bytes won, use the winning row's
@@ -371,7 +378,8 @@ Accepted leak: if a pod pauses for longer than `JETSTREAM_GC_ORPHAN_AGE` between
 step 3 and its PUT, GC may delete the row first, and the late PUT then creates an
 object no row names. It is never read and never reclaimed. To make this rarer,
 skip the PUT if more than `orphan_age / 2` has passed on the pod's monotonic
-clock since step 3 committed.
+clock since step 3 committed. A skipped PUT fails the upload, which ends the
+session like any other upload failure.
 
 Steps 3 and 6 are extra transactions. The upload pipeline may combine step 6
 with the transaction that first references the object (hot batch, fold, direct
@@ -403,6 +411,17 @@ GETs the object, and verifies length and SHA-256 before returning bytes. Range
 reads (`GetRange`) are used only by `getSegment` for HTTP range requests (§11.8)
 and verify only the length. The zstd frame checksum inside each block still
 protects the payload.
+
+The object Store (`objstore.Store`, implemented by `protocol.Reader`) is
+read-only. It judges "still referenced" as "the object row is still
+`available`". If the row is no longer available it returns `objstore.ErrGone`,
+and the caller re-resolves its reference and applies step 2. Before declaring
+corruption it re-reads the row once more, so a concurrent GC claim is not
+misreported. On reads only, S3 404 and 403 `AccessDenied` both mean "maybe
+missing" (real AWS returns 403 for a missing key without ListBucket). A 403 on
+a write is always an error. A read 403 caused by a broken bucket policy
+therefore looks like a missing object; a startup canary PUT/GET/DELETE
+(S2.16/S3.4) catches that case before it is reported as corruption.
 
 Missing object or hash mismatch:
 
@@ -1745,7 +1764,8 @@ All metrics use the existing `obs` package. Names:
   `jetstream_hot_inline_tokens` (gauge)
 - `jetstream_s3_requests_total{op, result}`,
   `jetstream_s3_request_duration_seconds{op}`,
-  `jetstream_s3_bytes_total{op}`, `jetstream_s3_verify_failures_total`
+  `jetstream_s3_bytes_total{op}`, `jetstream_s3_verify_failures_total{path=upload|read}`
+  (request metrics count every attempt, retries included)
 - `jetstream_objects{state}` (gauge, refreshed by GC),
   `jetstream_gc_deleted_total`, `jetstream_gc_run_duration_seconds`
 - `jetstream_catalog_revision` (gauge), `jetstream_catalog_lag_seconds`
@@ -1756,10 +1776,12 @@ All metrics use the existing `obs` package. Names:
   `witnessed_at`, per pod
 - `jetstream_storage_corruption_total{source}`
 - `jetstream_memory_budget_bytes{budget}` and
-  `jetstream_memory_used_bytes{budget}`
+  `jetstream_memory_used_bytes{budget}` (the object cache reports
+  `budget="object_cache"`)
 
 Add OTEL spans around every PostgreSQL transaction and S3 call, with the
-revision and object ID as attributes.
+revision and object ID as attributes: `objstore.Upload`, `objstore.Get`, and
+`objstore.GetRange` carry object IDs, and `s3.<op>` carries the key.
 
 ## 24. Security
 

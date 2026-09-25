@@ -687,7 +687,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
     `Tx.ApplyMeta`.
   - The `metastore/storetest` contract suite runs against PG under
     `just test-storage`.
-- [ ] **S2.5 `objstore`: S3 blob and object protocol** (L). Deps: S1.8, S2.2,
+- [x] **S2.5 `objstore`: S3 blob and object protocol** (L). Deps: S1.8, S2.2,
   S2.6.
   - `objstore/s3`: `Blob` on aws-sdk-go-v2 with endpoint, region, bucket,
     prefix, path-style, and concurrency. Missing object: treat both 404
@@ -1223,6 +1223,58 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.5 (2026-09-25): objstore S3 blob, upload/read protocol, object cache.**
+  - `objstore.Store` is read-only (`Get`, `GetRange`). Uploads go through
+    `objstore/protocol.Uploader` with a `*catalog.Session`, because the
+    `uploading` row is a fenced write. `Upload(ctx, s, objs)` returns one ref
+    per input (identical inputs share one object): a dedup hit comes back
+    non-pending, a fresh upload comes back `Pending` for the referencing
+    transaction to make available (§7.3 step 6 folded in). `Put` is `Upload`
+    plus `MarkAvailable` and returns the winner's ID.
+  - S3 maps 404 and 403 `AccessDenied` to `ErrNotFound` on GET only. Write
+    403s, `NoSuchBucket`, and credential 403s stay plain errors. An early
+    draft applied the mapping to every op, and because `DeleteKey` treats
+    not-found as success, a denied DELETE looked successful and GC would have
+    leaked the object; `TestWriteDenialIsNotMissing` covers it.
+  - The Reader decides corruption per object row: available after refresh plus
+    missing or bad bytes is corruption (source `read`); a row that is no
+    longer available returns `objstore.ErrGone` and the caller re-resolves. It
+    re-checks the row once more before declaring corruption, so a concurrent
+    GC claim is not misreported. Source `object` means the row's key, SHA, or
+    length changed between lookups.
+  - Read-back mismatch retries with fresh keys for up to 3 rounds, then ends
+    the session. It counts as `jetstream_s3_verify_failures_total{path}`, not
+    as corruption, since nothing durable is wrong.
+  - Any upload failure ends the session through the new `catalog.Session.End`
+    (session-ending failures outside a transaction), including the skip-PUT
+    rule. Skip-PUT is checked per object just before its PUT, on the monotonic
+    clock taken after `BeginUploads` commits.
+  - `objstore/objcache`: an LRU keyed by SHA-256 that caches whole objects only
+    after a verified `Get`, serves range reads from cached whole objects, and
+    skips objects larger than the budget (default 2GiB). Gauges:
+    `jetstream_memory_{budget,used}_bytes{budget="object_cache"}`
+    (`obs.NewMemoryMetrics`).
+  - S3 request metrics count every attempt. Retries use jittered backoff until
+    `RetryTimeout` and never retry cancellation, `ErrNotFound`, or
+    `ErrInvalidRange`. `s3test` provides the env-driven real-store config
+    (`s3test.Env`, for S2.20), an in-memory S3 RoundTripper, and a fault
+    RoundTripper (5xx, timeouts, lost responses, truncated bodies, wrong
+    bytes).
+  - Open items handed forward:
+    - A read 403 from a broken bucket policy looks like a missing object and
+      so like corruption on an available row. S2.16/S3.4 add a startup canary
+      PUT/GET/DELETE.
+    - Non-read 403s are retried until `RetryTimeout` in case credentials are
+      refreshing, so a plainly wrong key fails only after up to 30s.
+    - The Uploader's `Concurrency` and the Blob's `UploadConcurrency` overlap:
+      S2.16 sets both from `JETSTREAM_S3_UPLOAD_CONCURRENCY`.
+    - The SDK's default logger stays on (only the checksum-skip warning is
+      suppressed), because smithy-go's logging package is not on the
+      dependency whitelist.
+  - The work ran in a forked worktree off S2.2 and was cherry-picked after
+    S2.4. `go mod tidy` made no further changes. Design §7.3, §7.5, and §23
+    were updated.
 
 - **S2.4 (2026-09-25): metastore/pg.**
   - `internal/metastore/pg` (package `pg`; import it as `metapg`) mirrors
