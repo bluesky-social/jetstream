@@ -73,24 +73,20 @@ func (c Config) validate() error {
 // Writer encodes events into the active segment file. It is not
 // safe for concurrent use; the caller serializes access.
 type Writer struct {
-	cfg     Config
-	file    vfs.File
-	pending pendingBlock
-	closed  bool
+	cfg    Config
+	file   vfs.File
+	closed bool
 
-	// Reusable per-flush scratch buffers. Sizing them once on the
-	// first flush avoids n-allocations-per-block on the hot path:
-	//
-	//   bodyScratch : uncompressed columnar block body
-	//   wireScratch : the bytes handed to file.Write — laid out as
-	//                 [8-byte LE compressed_len placeholder][zstd frame].
-	//                 We encode zstd directly into wireScratch[8:] and
-	//                 patch the length prefix in place once known,
-	//                 avoiding a second buffer + memcpy of the frame.
-	//
-	// Each is reset to zero-length before reuse; capacity is
-	// retained. They never escape the writer goroutine.
-	bodyScratch []byte
+	// pending builds the active block in memory. It owns the reusable
+	// uncompressed-body scratch buffer.
+	pending BlockBuilder
+
+	// wireScratch is the reusable buffer handed to file.Write, laid out
+	// as [8-byte LE compressed_len placeholder][zstd frame]. We encode
+	// zstd directly into wireScratch[8:] and patch the length prefix in
+	// place once known, avoiding a second buffer + memcpy of the frame.
+	// It is reset to zero-length before reuse; capacity is retained. It
+	// never escapes the writer goroutine.
 	wireScratch []byte
 
 	// stickyErr is latched the first time a flush write or fsync
@@ -193,7 +189,7 @@ func New(cfg Config) (*Writer, error) {
 	}
 
 	w := &Writer{cfg: cfg, file: f}
-	w.pending.preallocate(cfg.MaxEventsPerBlock)
+	w.pending.init(cfg.MaxEventsPerBlock)
 
 	endInfo, err := f.Stat()
 	if err != nil {
@@ -337,92 +333,6 @@ func lastGoodOffset(f io.ReaderAt, size int64) (int64, error) {
 	return off, nil
 }
 
-// pendingBlock is the in-memory accumulator for the active block.
-// Per the spec §3.2 columnar layout: parallel column slices, not a
-// []Event, so steady-state Append has zero allocations once the
-// underlying arrays grow once. Every slice is reset via s = s[:0]
-// on flush to retain capacity.
-type pendingBlock struct {
-	seq         []uint64
-	witnessedAt []int64
-	indexedAt   []int64
-	kind        []uint8
-	collLen     []uint8
-	didLen      []uint16
-	rkeyLen     []uint8
-	revLen      []uint8
-	eventLen    []uint32
-
-	collections []byte
-	dids        []byte
-	rkeys       []byte
-	revs        []byte
-	payloads    []byte
-
-	// pendingBounds is the running min/max of seq and witnessed_at
-	// across the events currently buffered. Reset on flushLocked
-	// after the BlockInfo for this block is finalized.
-	pendingBounds blockBounds
-	sawAny        bool
-}
-
-// blockBounds is the running per-block summary tracked incrementally
-// by Append so flushLocked can finalize a BlockInfo without
-// re-walking the events.
-type blockBounds struct {
-	minSeq, maxSeq                 uint64
-	minWitnessedAt, maxWitnessedAt int64
-}
-
-// count returns the number of events currently buffered. All column
-// slices share this length by construction (Append updates them
-// together).
-func (p *pendingBlock) count() int { return len(p.seq) }
-
-// preallocate sizes every column slice up front so steady-state
-// Append never reallocates a column. Capacity for the variable-
-// length blob buffers is sized from typical atproto event shapes
-// (collection ~24 B, did ~32 B, rkey/rev ~13 B, payload ~512 B);
-// over- or under-shooting only changes the first few Append calls'
-// growth pattern — append still amortizes cleanly.
-func (p *pendingBlock) preallocate(cap int) {
-	p.seq = make([]uint64, 0, cap)
-	p.witnessedAt = make([]int64, 0, cap)
-	p.indexedAt = make([]int64, 0, cap)
-	p.kind = make([]uint8, 0, cap)
-	p.collLen = make([]uint8, 0, cap)
-	p.didLen = make([]uint16, 0, cap)
-	p.rkeyLen = make([]uint8, 0, cap)
-	p.revLen = make([]uint8, 0, cap)
-	p.eventLen = make([]uint32, 0, cap)
-	p.collections = make([]byte, 0, cap*24)
-	p.dids = make([]byte, 0, cap*32)
-	p.rkeys = make([]byte, 0, cap*13)
-	p.revs = make([]byte, 0, cap*13)
-	p.payloads = make([]byte, 0, cap*512)
-}
-
-// reset truncates every column slice to zero length while retaining
-// capacity. Callers use this after a successful flush.
-func (p *pendingBlock) reset() {
-	p.seq = p.seq[:0]
-	p.witnessedAt = p.witnessedAt[:0]
-	p.indexedAt = p.indexedAt[:0]
-	p.kind = p.kind[:0]
-	p.collLen = p.collLen[:0]
-	p.didLen = p.didLen[:0]
-	p.rkeyLen = p.rkeyLen[:0]
-	p.revLen = p.revLen[:0]
-	p.eventLen = p.eventLen[:0]
-	p.collections = p.collections[:0]
-	p.dids = p.dids[:0]
-	p.rkeys = p.rkeys[:0]
-	p.revs = p.revs[:0]
-	p.payloads = p.payloads[:0]
-	p.pendingBounds = blockBounds{}
-	p.sawAny = false
-}
-
 // Close flushes any pending block and closes the file. Idempotent.
 func (w *Writer) Close() error {
 	if w.closed {
@@ -443,39 +353,6 @@ func (w *Writer) Close() error {
 	}
 	return closeErr
 }
-
-// pendingBlock satisfies the columns interface (defined in block.go)
-// so flushLocked can encode without materializing []Event.
-//
-// The variable-length blob accessors are AppendXxx — they copy the
-// writer's contiguous buffer wholesale. Per-event Collection(i)/DID(i)/
-// etc. accessors would have to walk the length column 0..i to compute
-// each row's offset, making a single encode O(n²); appending the entire
-// variable region per column keeps it O(n).
-
-func (p *pendingBlock) Len() int                { return p.count() }
-func (p *pendingBlock) Seq(i int) uint64        { return p.seq[i] }
-func (p *pendingBlock) WitnessedAt(i int) int64 { return p.witnessedAt[i] }
-func (p *pendingBlock) IndexedAt(i int) int64   { return p.indexedAt[i] }
-func (p *pendingBlock) Kind(i int) uint8        { return p.kind[i] }
-
-func (p *pendingBlock) CollectionLen(i int) uint8 { return p.collLen[i] }
-func (p *pendingBlock) DIDLen(i int) uint16       { return p.didLen[i] }
-func (p *pendingBlock) RkeyLen(i int) uint8       { return p.rkeyLen[i] }
-func (p *pendingBlock) RevLen(i int) uint8        { return p.revLen[i] }
-func (p *pendingBlock) PayloadLen(i int) uint32   { return p.eventLen[i] }
-
-func (p *pendingBlock) AppendCollections(dst []byte) []byte { return append(dst, p.collections...) }
-func (p *pendingBlock) AppendDIDs(dst []byte) []byte        { return append(dst, p.dids...) }
-func (p *pendingBlock) AppendRkeys(dst []byte) []byte       { return append(dst, p.rkeys...) }
-func (p *pendingBlock) AppendRevs(dst []byte) []byte        { return append(dst, p.revs...) }
-func (p *pendingBlock) AppendPayloads(dst []byte) []byte    { return append(dst, p.payloads...) }
-
-func (p *pendingBlock) TotalCollectionsLen() int { return len(p.collections) }
-func (p *pendingBlock) TotalDIDsLen() int        { return len(p.dids) }
-func (p *pendingBlock) TotalRkeysLen() int       { return len(p.rkeys) }
-func (p *pendingBlock) TotalRevsLen() int        { return len(p.revs) }
-func (p *pendingBlock) TotalPayloadsLen() int    { return len(p.payloads) }
 
 // Flush encodes the pending block, writes it to the file as
 // [uint64 LE compressed_len][zstd frame], and fsyncs before
@@ -501,14 +378,9 @@ func (w *Writer) flushLocked() error {
 	if w.stickyErr != nil {
 		return w.stickyErr
 	}
-	if w.pending.count() == 0 {
+	if w.pending.Len() == 0 {
 		return nil
 	}
-
-	// Reuse the scratch buffers across flushes. encodeBlockInto and
-	// zstd.EncodeAll both grow their dst slice as needed; we only
-	// need to reset length to zero between calls.
-	w.bodyScratch = encodeBlockInto(w.bodyScratch[:0], &w.pending)
 
 	// Lay out the wire frame as [uint64 LE compressed_len][frame] in
 	// a single buffer so we issue one Write — a partial-write tear
@@ -519,7 +391,8 @@ func (w *Writer) flushLocked() error {
 	// patch the length prefix in place once it's known, which saves
 	// the second-buffer-plus-memcpy the previous design needed.
 	w.wireScratch = append(w.wireScratch[:0], 0, 0, 0, 0, 0, 0, 0, 0)
-	w.wireScratch = blockEncoder.EncodeAll(w.bodyScratch, w.wireScratch)
+	var info BlockInfo
+	w.wireScratch, info = w.pending.appendFrame(w.wireScratch)
 	binary.LittleEndian.PutUint64(w.wireScratch[:8], uint64(len(w.wireScratch)-8))
 
 	if err := w.cfg.beforeIO(IOOpWrite); err != nil {
@@ -530,19 +403,8 @@ func (w *Writer) flushLocked() error {
 		w.stickyErr = fmt.Errorf("segment: write block: %w", err)
 		return w.stickyErr
 	}
-	// Write succeeded: the bytes are owned by the file. Snapshot the
-	// BlockInfo before resetting the pending buffer; reset() zeroes
-	// pendingBounds.
-	info := BlockInfo{
-		Offset:           w.nextBlockOffset,
-		CompressedSize:   uint32(len(w.wireScratch) - 8),
-		UncompressedSize: uint32(len(w.bodyScratch)),
-		EventCount:       uint32(w.pending.count()),
-		MinSeq:           w.pending.pendingBounds.minSeq,
-		MaxSeq:           w.pending.pendingBounds.maxSeq,
-		MinWitnessedAt:   w.pending.pendingBounds.minWitnessedAt,
-		MaxWitnessedAt:   w.pending.pendingBounds.maxWitnessedAt,
-	}
+	// Write succeeded: the bytes are owned by the file.
+	info.Offset = w.nextBlockOffset
 	w.flushedBlocks = append(w.flushedBlocks, info)
 	w.nextBlockOffset += uint64(len(w.wireScratch))
 
@@ -565,20 +427,11 @@ func (w *Writer) prepareFlushLocked(dst []byte) (*PreparedBlock, error) {
 	if w.stickyErr != nil {
 		return nil, w.stickyErr
 	}
-	if w.pending.count() == 0 {
+	if w.pending.Len() == 0 {
 		return nil, nil
 	}
 
-	body := encodeBlockInto(dst, &w.pending)
-	info := BlockInfo{
-		UncompressedSize: uint32(len(body)),
-		EventCount:       uint32(w.pending.count()),
-		MinSeq:           w.pending.pendingBounds.minSeq,
-		MaxSeq:           w.pending.pendingBounds.maxSeq,
-		MinWitnessedAt:   w.pending.pendingBounds.minWitnessedAt,
-		MaxWitnessedAt:   w.pending.pendingBounds.maxWitnessedAt,
-	}
-	w.pending.reset()
+	body, info := w.pending.prepare(dst)
 	prepared := &PreparedBlock{
 		Body:  body,
 		info:  info,
@@ -680,55 +533,11 @@ func (w *Writer) Append(ev Event) (full bool, err error) {
 	if w.stickyErr != nil {
 		return false, w.stickyErr
 	}
-	if w.pending.count() >= w.cfg.MaxEventsPerBlock {
-		return false, ErrBufferFull
-	}
-	if err := ValidateEvent(ev); err != nil {
-		return false, err
-	}
-
-	p := &w.pending
-	p.seq = append(p.seq, ev.Seq)
-	p.witnessedAt = append(p.witnessedAt, ev.WitnessedAt)
-	p.indexedAt = append(p.indexedAt, ev.IndexedAt)
-	p.kind = append(p.kind, uint8(ev.Kind))
-	p.collLen = append(p.collLen, uint8(len(ev.Collection)))
-	p.didLen = append(p.didLen, uint16(len(ev.DID)))
-	p.rkeyLen = append(p.rkeyLen, uint8(len(ev.Rkey)))
-	p.revLen = append(p.revLen, uint8(len(ev.Rev)))
-	p.eventLen = append(p.eventLen, uint32(len(ev.Payload)))
-	p.collections = append(p.collections, ev.Collection...)
-	p.dids = append(p.dids, ev.DID...)
-	p.rkeys = append(p.rkeys, ev.Rkey...)
-	p.revs = append(p.revs, ev.Rev...)
-	p.payloads = append(p.payloads, ev.Payload...)
-
-	if !p.sawAny {
-		p.pendingBounds.minSeq = ev.Seq
-		p.pendingBounds.maxSeq = ev.Seq
-		p.pendingBounds.minWitnessedAt = ev.WitnessedAt
-		p.pendingBounds.maxWitnessedAt = ev.WitnessedAt
-		p.sawAny = true
-	} else {
-		if ev.Seq < p.pendingBounds.minSeq {
-			p.pendingBounds.minSeq = ev.Seq
-		}
-		if ev.Seq > p.pendingBounds.maxSeq {
-			p.pendingBounds.maxSeq = ev.Seq
-		}
-		if ev.WitnessedAt < p.pendingBounds.minWitnessedAt {
-			p.pendingBounds.minWitnessedAt = ev.WitnessedAt
-		}
-		if ev.WitnessedAt > p.pendingBounds.maxWitnessedAt {
-			p.pendingBounds.maxWitnessedAt = ev.WitnessedAt
-		}
-	}
-
-	return p.count() >= w.cfg.MaxEventsPerBlock, nil
+	return w.pending.appendEvent(&ev)
 }
 
 // Pending returns the number of events buffered but not yet flushed.
-func (w *Writer) Pending() int { return w.pending.count() }
+func (w *Writer) Pending() int { return w.pending.Len() }
 
 // SnapshotPending returns a copy of every event currently buffered in
 // the active block (not yet flushed to disk). Used by the lookback
@@ -746,44 +555,7 @@ func (w *Writer) Pending() int { return w.pending.count() }
 // use with Append/Flush/Seal/Close. The caller already serializes
 // access (in production via internal/ingest.Writer.mu).
 func (w *Writer) SnapshotPending() []Event {
-	n := w.pending.count()
-	if n == 0 {
-		return nil
-	}
-	out := make([]Event, n)
-	p := &w.pending
-
-	// Walk the variable-length blob columns alongside the per-event
-	// length columns so we can slice each event's bytes out by running
-	// offset rather than re-summing lengths from 0..i for every event.
-	var collOff, didOff, rkeyOff, revOff int
-	var payloadOff uint64
-	for i := range n {
-		collN := int(p.collLen[i])
-		didN := int(p.didLen[i])
-		rkeyN := int(p.rkeyLen[i])
-		revN := int(p.revLen[i])
-		payloadN := uint64(p.eventLen[i])
-
-		out[i] = Event{
-			Seq:         p.seq[i],
-			WitnessedAt: p.witnessedAt[i],
-			IndexedAt:   p.indexedAt[i],
-			Kind:        Kind(p.kind[i]),
-			DID:         string(p.dids[didOff : didOff+didN]),
-			Collection:  string(p.collections[collOff : collOff+collN]),
-			Rkey:        string(p.rkeys[rkeyOff : rkeyOff+rkeyN]),
-			Rev:         string(p.revs[revOff : revOff+revN]),
-			Payload:     append([]byte(nil), p.payloads[payloadOff:payloadOff+payloadN]...),
-		}
-
-		collOff += collN
-		didOff += didN
-		rkeyOff += rkeyN
-		revOff += revN
-		payloadOff += payloadN
-	}
-	return out
+	return w.pending.Snapshot()
 }
 
 // Cap returns Config.MaxEventsPerBlock.
@@ -832,8 +604,8 @@ func (w *Writer) TimeFloorSeq(timeUS int64) (uint64, bool) {
 	if i < len(w.flushedBlocks) {
 		return w.flushedBlocks[i].MinSeq, true
 	}
-	if w.pending.sawAny && w.pending.pendingBounds.maxWitnessedAt >= timeUS {
-		return w.pending.pendingBounds.minSeq, true
+	if pending, ok := w.pending.PendingBounds(); ok && pending.MaxWitnessedAt >= timeUS {
+		return pending.MinSeq, true
 	}
 	return 0, false
 }

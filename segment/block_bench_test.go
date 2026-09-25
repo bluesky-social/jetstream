@@ -225,7 +225,7 @@ func BenchmarkAppend(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; b.Loop(); i++ {
-		if w.pending.count() >= w.cfg.MaxEventsPerBlock {
+		if w.pending.Len() >= w.pending.Cap() {
 			w.pending.reset()
 		}
 		template.Seq = uint64(i)
