@@ -1,6 +1,6 @@
 # Disaggregated storage v2: implementation plan
 
-**Status: Stage 0 done (2026-09-25); Stage 1 not started.** This is the work tracker for
+**Status: Stage 0 done (2026-09-25); Stage 1 in progress.** This is the work tracker for
 `specs/notes/2026-09-25-disaggregated-storage-v2-design.md` (the "design"). It
 breaks the design's delivery stages (§26) into PR-sized tasks with file
 references, dependencies, checks, mutants, and exit criteria. The design says
@@ -32,7 +32,7 @@ Prerequisite already landed: the ephemeral dev environment (`just up` /
 | Stage | Goal | Status |
 |---|---|---|
 | 0 | Remove timestamp import (design §21) | done |
-| 1 | Storage interfaces; local mode moved onto them with no behavior change | not started |
+| 1 | Storage interfaces; local mode moved onto them with no behavior change | in progress |
 | 2 | Steady state in disaggregated mode on fakes and real storage | not started |
 | 3 | Bootstrap, merge, `storage init` | not started |
 | 4 | Sparse compaction and GC | not started |
@@ -345,7 +345,7 @@ refreshed STALE mutants.
 
 ### Metadata store
 
-- [ ] **S1.1 `internal/metastore` interface, Pebble impl, fault wrapper** (M).
+- [x] **S1.1 `internal/metastore` interface, Pebble impl, fault wrapper** (M).
   Deps: S0.
   - Add `Store`, `Batch`, `Iterator`, `ErrNotFound`, and `Op` (the value type
     that `ApplyMeta` and the PG impl consume), per design §14.1.
@@ -1223,6 +1223,33 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S1.1 (2026-09-25): metastore interface.**
+  - The Pebble impl lives at `internal/metastore/pebblestore` (package
+    `pebblestore`), not `metastore/pebble`. That avoids shadowing the
+    cockroachdb `pebble` import in every file that uses both. Plan and
+    design references to `metastore/pebble` mean this package.
+  - `Batch` has no `Close`. Committing twice returns
+    `ErrBatchCommitted`. An abandoned uncommitted Pebble batch is just
+    garbage. Pebble's staging methods only fail on a closed batch, so the
+    first such error is latched and returned by `Commit`.
+  - `NewIter` treats a nil bound as unbounded (`PrefixUpperBound` returns
+    nil for an all-0xff prefix). The Pebble impl ignores `ctx`, so a
+    cancelled context never turns a formerly successful shutdown commit
+    into a failure. That keeps S1 free of behavior changes.
+  - `metastore.OpBatch` is the recording `Batch` that memstore uses, and
+    that the PG impl and `Tx.ApplyMeta` will consume through `Ops()`.
+  - `WithFaults` exposes `Unwrap()`, so optional capabilities such as
+    `DiskStats` (used in S1.5) and the identity cache's
+    `SetNoSync`/`DeleteNoSync` (used in S1.3) stay reachable through the
+    wrapper.
+  - Fault matching is unchanged: a `DeleteRange` contributes its start
+    key, as the old `batchKeys` walk did.
+  - The encoding helpers (`GetUint64LE`, `Get/SetVersionedUint64LE`,
+    `EncodeVersionedUint64LE`, `PrefixUpperBound`) landed in `metastore`
+    here, ahead of S1.5, so the ports in S1.2 onward use them directly.
+  - The fuzz target `FuzzBatchSemanticsAgree` is in the scheduled CI fuzz
+    matrix.
 
 - **S0 (2026-09-25): timestamp import removed.** Re-adding it under a design
   that fits disaggregated storage is tracked in
