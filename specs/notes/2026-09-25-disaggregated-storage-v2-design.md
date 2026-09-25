@@ -1,0 +1,1672 @@
+# Disaggregated storage v2
+
+Date: 2026-09-25. Status: proposed.
+
+This document replaces `specs/notes/2026-09-20-disaggregated-storage-design.md`.
+That file stays for history and is not the design to build. Where they disagree,
+this document wins.
+
+Read `docs/README.md` §3 (segment format, metadata keys) and §4 (ingest phases)
+first. This document assumes you know them.
+
+## 1. Summary
+
+Jetstream gets a second storage backend. Local mode (segment files and Pebble on
+one machine) stays and stays the default. The new mode stores:
+
+- blocks and segment footers as immutable objects in S3-compatible storage;
+- everything else in PostgreSQL: catalog, metadata keys, recent events, and the
+  leader lease.
+
+No pod keeps anything on local disk. Any number of pods serve reads. One pod at a
+time is the leader. The leader runs ingest, bootstrap, merge, fold, seal,
+compaction, and GC. Pods never talk to each other. They talk only to PostgreSQL
+and S3.
+
+A new event becomes visible when its batch commits to PostgreSQL. Batches are
+small (about 15ms). Every pod polls PostgreSQL for new batches, with
+`LISTEN/NOTIFY` as a hint to poll sooner. Later, the leader groups batches into
+normal segment blocks, uploads them to S3, and removes the batches from
+PostgreSQL.
+
+The segment format does not change. A sealed segment served from S3 is
+byte-for-byte the file local mode would have written from the same events.
+
+## 2. Scope
+
+### 2.1 Goals
+
+- Zero local disk in disaggregated mode. Caches are memory only.
+- All pods serve every read endpoint: `/subscribe`, `subscribeEvents`,
+  `planSnapshot`, `getSegment`, `getBlock`, and `/status`.
+- Hot-path capacity of 3,000 events/s sustained. Pop1 today: 428 events/s 7-day
+  mean, 2,128/s 1-minute peak.
+- Live-event latency regression of at most 20–40ms compared to local mode.
+- Bulk traffic (failed-repo retries, resyncs, large-PDS recovery) must never
+  starve live traffic or overload PostgreSQL.
+- If the leader dies, another pod takes over within a few seconds with no data
+  loss and no seq reuse.
+- The same core code (writer, sealer, compaction, cold reader, manifest,
+  planner) runs in both modes, behind storage interfaces.
+- Works with AWS RDS PostgreSQL and AWS S3, and with self-hosted
+  PostgreSQL and S3-compatible stores such as SeaweedFS and MinIO.
+
+### 2.2 Non-goals
+
+- Migrating an existing local archive. New deployments bootstrap from scratch.
+- Point-in-time restore that keeps the same cursor namespace. A restored
+  database is a new archive (§15).
+- Multi-region or multi-writer ingest.
+- Timestamp import. It is removed (§21) and will get its own design later.
+- Changing the segment or block format.
+- Any local disk cache.
+
+### 2.3 Decisions
+
+| Topic | Decision |
+|---|---|
+| Visibility point | PostgreSQL commit of a hot batch (steady state) or a block (bootstrap/merge) |
+| Wake-up | `NOTIFY` doorbell plus 250ms polling; correctness never depends on `NOTIFY` |
+| Leader election | PostgreSQL lease implementing atmos `streaming.DistributedLocker`, driven by a jetstream-owned election loop |
+| Fencing | `writer_epoch` checked by the first statement of every leader write transaction |
+| Seqs | Gap-free, from `seq/next` in PostgreSQL; no write-ahead seq lease, no vacancies |
+| Objects | Immutable, unique keys, never overwritten; SHA-256 recorded and verified |
+| S3 features used | PUT, GET (with Range), DELETE. Nothing else |
+| Metadata | Existing Pebble key/value encoding in a PostgreSQL table |
+| Compaction | Fetches only affected blocks; no format change |
+| Recovery | HA failover only; a restore is a new archive |
+| New deps | `github.com/jackc/pgx/v5`, `github.com/aws/aws-sdk-go-v2` |
+
+## 3. Terms
+
+- **Leader**: the pod that holds the lease. Exactly one pod writes at a time.
+- **Epoch**: `archive.writer_epoch`. Bumped every time a pod acquires the lease.
+- **Session**: the time between one pod's lease acquire and its lease loss or
+  release. A session has one epoch.
+- **Namespace**: `main` (the served archive) or `bootstrap_live` (live events
+  captured during bootstrap, merged into `main` later). Each namespace has its own
+  segments and its own seq counter, the same as local mode's `segments/` and
+  `backfill/live_segments/`.
+- **Hot batch**: one or more consecutive events committed as one row in
+  `hot_batches`. Either **inline** (the encoded block bytes are in the row) or
+  **pointer** (the row names an S3 object holding the encoded bytes).
+- **Open block**: the block currently collecting hot batches. Its events are
+  visible through hot batches only.
+- **Fold**: encode an open block, upload it, attach it to the active segment,
+  and delete its hot batches, all in one transaction.
+- **Active block**: a folded block attached to the active segment
+  (`active_segment_blocks`).
+- **Generation**: one immutable sealed version of a segment: header, footer
+  object, and an ordered list of block objects. Compaction creates new
+  generations.
+- **Mirror**: a pod's in-memory copy of the catalog.
+- **Follower**: the per-pod loop that keeps the mirror and the readable log in
+  sync with PostgreSQL.
+- **Revision**: `archive.catalog_revision`. Bumped by every leader write
+  transaction. Rows changed by that transaction store the new value.
+
+## 4. Architecture
+
+```
+                 relay / PDSes
+                      │
+          ┌───────────▼────────────┐
+          │ leader pod             │        reader pods (N)
+          │  ingest writer         │        ┌──────────────────┐
+          │  maintainer (fold,seal)│        │ follower         │
+          │  compaction, GC        │        │ mirror           │
+          │  follower + readers    │        │ readable log     │
+          └───┬───────────────┬────┘        │ caches           │
+              │ fenced txns   │ PUT/GET     └───┬──────────┬───┘
+              ▼               ▼                 │ SELECT   │ GET
+        ┌───────────┐   ┌──────────┐            │          │
+        │PostgreSQL │◄──┼──────────┼────────────┘          │
+        │ archive   │   │ S3 bucket│◄──────────────────────┘
+        │ catalog   │   │ objects  │
+        │ hot rows  │   └──────────┘
+        │ metadata  │
+        └───────────┘
+```
+
+The leader pod also runs a follower and serves reads, the same as any other
+pod. Its follower gets an in-process doorbell after each commit and reads back
+from PostgreSQL like everyone else. The leader never feeds its own readable log
+directly. That keeps one visibility rule for every pod: **a pod shows an event
+only after reading it from a committed PostgreSQL transaction.**
+
+## 5. External requirements
+
+### 5.1 PostgreSQL
+
+- Version 15 or newer.
+- One database per archive. Jetstream owns the schema.
+- Synchronous durability. On RDS, Multi-AZ is recommended. `synchronous_commit`
+  must not be `off` for Jetstream's role.
+- Session settings on every connection:
+  - `statement_timeout = 10s`
+  - `lock_timeout = 5s`
+  - `idle_in_transaction_session_timeout = 30s`
+- All timestamps come from the database clock (`now()`). Pod clocks are never
+  compared with database times.
+
+### 5.2 Object store
+
+Only these operations are used:
+
+- `PutObject` of a whole object. It must be atomic: a GET returns either
+  nothing or the complete object.
+- `GetObject`, with and without `Range`. A GET after a successful PUT must return
+  the new object (read-after-write). AWS S3, SeaweedFS, and MinIO provide this.
+- `DeleteObject`.
+
+Not used: conditional writes, versioning, listing, multipart upload, object tags,
+lifecycle rules, and S3-computed checksums. Jetstream verifies integrity itself
+(§7.3).
+
+Configuration: endpoint URL, region, bucket, key prefix, path-style addressing
+on or off, and credentials from the standard AWS SDK chain. Use
+`aws-sdk-go-v2/service/s3`. Do not write a custom client.
+
+## 6. Leadership
+
+### 6.1 Why jetstream owns the loop
+
+The atmos client can gate its firehose consumer behind a `DistributedLocker`.
+That is not enough here. The leader must also own bootstrap backfill, merge,
+fold, seal, compaction, and GC, and the live consumer is stopped during merge.
+So Jetstream runs its own election loop (`internal/leader`), with the same
+Acquire/Renew/Release semantics and timing as atmos. The PostgreSQL lock type
+implements `streaming.DistributedLocker`, so the contract is shared and tested
+the same way.
+
+The atmos client inside a leader session is built with `streaming.NoopLock`. It
+only ever runs inside a session, so it needs no gating of its own. No atmos
+change is needed.
+
+### 6.2 Lease SQL
+
+Each process picks a random `holder_id` (UUID) at startup.
+
+Acquire:
+
+```sql
+UPDATE archive
+SET writer_epoch = writer_epoch + 1,
+    holder_id = $holder,
+    lease_expires_at = now() + $lease
+WHERE id = 1
+  AND (holder_id IS NULL OR lease_expires_at <= now())
+RETURNING writer_epoch;
+```
+
+Zero rows means `streaming.ErrLockHeld`. On success, store the epoch. The lock
+type exposes `Epoch() uint64`, because `Acquire` only returns an error.
+
+Renew:
+
+```sql
+UPDATE archive
+SET lease_expires_at = now() + $lease
+WHERE id = 1 AND writer_epoch = $epoch AND holder_id = $holder
+  AND lease_expires_at > now();
+```
+
+Zero rows means `streaming.ErrNotHolder`.
+
+Release:
+
+```sql
+UPDATE archive SET holder_id = NULL, lease_expires_at = now()
+WHERE id = 1 AND writer_epoch = $epoch AND holder_id = $holder;
+```
+
+Zero rows means `streaming.ErrNotHolder`.
+
+Defaults match atmos: lease 3s, renew every 1s, acquire attempt every 500ms. All
+three are configurable (§18).
+
+### 6.3 Election loop
+
+```
+loop until process shutdown:
+    err := locker.Acquire(ctx, lease)
+    if err == ErrLockHeld or other error: sleep acquireInterval; continue
+    epoch := locker.Epoch()
+    sessionCtx, cancel := context.WithCancel(ctx)
+    start renewer(sessionCtx, cancel):
+        every renewInterval: Renew
+        on ErrNotHolder: cancel()
+        on other error: retry; if no successful renew for `lease`, cancel()
+    err = runSession(sessionCtx, epoch)   // blocks until the session ends
+    cancel(); wait for every session goroutine to exit
+    locker.Release(ctx with 5s timeout)   // best effort
+    if err is a corruption error: exit the process non-zero
+    sleep acquireInterval
+```
+
+Lease timing only affects how fast failover happens. Safety comes only from the
+epoch fence (§6.4). A paused or partitioned old leader can keep running for any
+length of time. Its writes are rejected by the fence. Its S3 PUTs create
+objects that nothing references, and GC removes them (§7.3, §13).
+
+### 6.4 The fence
+
+Every leader write transaction starts with this statement, before it reads or
+writes anything else:
+
+```sql
+UPDATE archive SET catalog_revision = catalog_revision + 1
+WHERE id = 1 AND writer_epoch = $epoch
+RETURNING catalog_revision;
+```
+
+- Zero rows: the pod has been fenced out. Roll back and end the session.
+- Otherwise the returned value is this transaction's `revision`. Every catalog
+  row the transaction inserts or updates stores it in its `revision` column.
+
+The row lock taken by this statement serializes all leader transactions. As a
+result, revisions increase in commit order and there is no race between leader
+transactions. Transactions must stay short (§9.1).
+
+"Leader write transaction" includes every write Jetstream makes during a
+session: object rows, hot batches, direct block commits, folds, seals,
+compaction publishes, every GC step, and every metadata write (MetaStore writes
+from backfill, syncstate, retry runners, the orchestrator, and so on). A reader
+pod never writes to PostgreSQL.
+
+### 6.5 Session
+
+`runSession` builds a full ingest runtime (orchestrator, writer, maintainer,
+compaction scheduler, GC) from the state in PostgreSQL and runs it until an error
+or cancellation. There is no partial restart inside a session. Any of these ends
+the session and tears everything down:
+
+- a fence failure;
+- a transaction that fails, or whose commit result is unknown (connection lost
+  during `COMMIT`);
+- an S3 failure that retries cannot fix;
+- lease loss.
+
+The next session, on this pod or another, rebuilds from PostgreSQL. Rebuild is
+always correct because nothing is visible or durable until it is committed.
+
+These errors are corruption: a referenced object is missing or fails its hash
+check, or a catalog invariant is broken (§9.3). Corruption ends the session and
+exits the process with a non-zero status, the same as local mode's crash-loud
+rule. Another pod will take over. If the corruption is real, every leader will
+exit the same way and an operator must step in. The metric
+`jetstream_storage_corruption_total` counts these events.
+
+## 7. Objects
+
+### 7.1 Keys
+
+```
+<prefix>/<archive_id>/objects/<uuid>
+```
+
+`archive_id` is the UUID in `archive.archive_id`. `<uuid>` is a fresh random
+UUIDv4 for every upload attempt. A key is never written twice and never reused.
+The object store therefore never sees overwrites. That is why no conditional
+PUT or versioning is needed.
+
+### 7.2 Object kinds
+
+| Kind | Bytes |
+|---|---|
+| block | one compressed block frame exactly as in a segment file, without the 8-byte length prefix |
+| footer | a sealed segment's footer: bytes `[footer_offset, EOF)` of the segment file |
+
+A pointer hot batch's object is a block object. It may cover fewer than 4,096
+events.
+
+### 7.3 Upload protocol
+
+`ObjectStore.Put(ctx, data)` returns an `object_id`. Steps:
+
+1. `sha := sha256(data)`.
+2. If a row exists with `sha256 = sha AND state = 'available' AND
+   (unreferenced_at IS NULL OR unreferenced_at > now() - $gc_delay / 2)`, return
+   its `object_id` (dedup). No upload. The age condition means GC cannot claim
+   the object before the caller's referencing transaction runs (that would need
+   more than `gc_delay / 2` between lookup and commit), so a failed reference
+   check on a deduped object is a real bug.
+3. Insert `objects(key = new uuid, sha256, byte_length, state = 'uploading')`.
+   This is a leader write transaction (fenced). One transaction may insert rows
+   for several pending uploads at once. A committed `uploading` row makes an
+   orphaned upload visible to GC. No PUT happens without one, so a fenced-out
+   leader cannot start new uploads.
+4. PUT the bytes.
+5. GET the object and check its length and SHA-256. On mismatch, retry from
+   step 3 with a new key. The old row is left for GC.
+6. `UPDATE objects SET state = 'available' WHERE object_id = $id AND state =
+   'uploading'` (fenced). If this hits the partial unique index on `sha256`
+   because another upload of the same bytes won, use the winning row's
+   `object_id` and leave this row for GC.
+
+Transient S3 errors in steps 4 and 5 are retried with backoff, up to
+`JETSTREAM_S3_RETRY_TIMEOUT` (default 30s). After that the upload fails and the
+caller decides what happens. Every caller in this document ends the session.
+
+Dedup is an optimization. No correctness property depends on two encodings
+matching.
+
+Accepted leak: if a pod pauses for longer than `JETSTREAM_GC_ORPHAN_AGE` between
+step 3 and its PUT, GC may delete the row first, and the late PUT then creates an
+object no row names. It is never read and never reclaimed. To make this rarer,
+skip the PUT if more than `orphan_age / 2` has passed on the pod's monotonic
+clock since step 3 committed.
+
+Steps 3 and 6 are extra transactions. The upload pipeline may combine step 6
+with the transaction that first references the object (hot batch, fold, direct
+commit, seal, compaction publish). In that transaction, set `state =
+'available'` and then reference the object. This saves one transaction per
+object.
+
+### 7.4 Referencing an object
+
+Any transaction that adds a reference to an object (a `hot_batches.object_id`,
+`active_segment_blocks.object_id`, `generation_blocks.object_id`, or
+`segment_generations.footer_object_id`) must, in the same transaction, run:
+
+```sql
+UPDATE objects SET unreferenced_at = NULL
+WHERE object_id = $id AND state = 'available'
+RETURNING object_id;
+```
+
+Zero rows means the object is being deleted or never became available. Treat
+that as an internal error and end the session. This check, together with GC
+claiming deletes in fenced transactions (§13), means GC can never delete an
+object that is still referenced.
+
+### 7.5 Reading an object
+
+`ObjectStore.Get(ctx, objectID)` looks up key, length, and SHA-256 in the mirror,
+GETs the object, and verifies length and SHA-256 before returning bytes. Range
+reads (`GetRange`) are used only by `getSegment` for HTTP range requests (§11.8)
+and verify only the length. The zstd frame checksum inside each block still
+protects the payload.
+
+Missing object or hash mismatch:
+
+1. Refresh the mirror (§11.1) and look the reference up again.
+2. If the reference is gone (compaction or GC replaced it), retry with the new
+   reference.
+3. If it is still referenced, this is corruption. Reader pods fail the request
+   and increment `jetstream_storage_corruption_total{source="read"}`. Leader
+   tasks end the session and exit (§6.5).
+
+## 8. PostgreSQL schema
+
+Migrations live in `internal/pgstore/migrations/NNNN_name.sql`. They are applied
+by `jetstream storage init` (§15.1) and checked at startup. A pod refuses to
+start if the schema version is not the one it expects. There is no automatic
+migration on serve.
+
+```sql
+CREATE TABLE archive (
+    id               smallint PRIMARY KEY CHECK (id = 1),
+    archive_id       uuid NOT NULL,
+    format_version   integer NOT NULL,         -- storage layout version, starts at 1
+    schema_version   integer NOT NULL,
+    writer_epoch     bigint NOT NULL DEFAULT 0,
+    holder_id        uuid,
+    lease_expires_at timestamptz,
+    catalog_revision bigint NOT NULL DEFAULT 0,
+    created_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE metadata_kv (
+    key   bytea PRIMARY KEY,
+    value bytea NOT NULL
+) WITH (fillfactor = 80);
+
+CREATE TABLE objects (
+    object_id       bigserial PRIMARY KEY,
+    key             uuid NOT NULL UNIQUE,
+    sha256          bytea NOT NULL CHECK (length(sha256) = 32),
+    byte_length     bigint NOT NULL CHECK (byte_length > 0),
+    state           text NOT NULL CHECK (state IN ('uploading', 'available', 'deleting')),
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    unreferenced_at timestamptz
+);
+CREATE UNIQUE INDEX objects_sha256_available ON objects (sha256) WHERE state = 'available';
+CREATE INDEX objects_gc ON objects (state, unreferenced_at);
+
+CREATE TABLE segments (
+    namespace             text NOT NULL CHECK (namespace IN ('main', 'bootstrap_live')),
+    segment_index         bigint NOT NULL,
+    state                 text NOT NULL CHECK (state IN ('active', 'sealed')),
+    current_generation_id bigint,                 -- NULL while active
+    revision              bigint NOT NULL,
+    PRIMARY KEY (namespace, segment_index),
+    CHECK ((state = 'active') = (current_generation_id IS NULL))
+);
+CREATE UNIQUE INDEX segments_one_active ON segments (namespace) WHERE state = 'active';
+CREATE INDEX segments_revision ON segments (revision);
+
+CREATE TABLE segment_generations (
+    generation_id    bigserial PRIMARY KEY,
+    namespace        text NOT NULL,
+    segment_index    bigint NOT NULL,
+    header           bytea NOT NULL CHECK (length(header) = 256),
+    footer_object_id bigint NOT NULL REFERENCES objects (object_id),
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    revision         bigint NOT NULL,
+    FOREIGN KEY (namespace, segment_index) REFERENCES segments (namespace, segment_index)
+);
+CREATE INDEX segment_generations_footer ON segment_generations (footer_object_id);
+
+CREATE TABLE generation_blocks (
+    generation_id     bigint NOT NULL REFERENCES segment_generations (generation_id) ON DELETE CASCADE,
+    ordinal           integer NOT NULL,
+    object_id         bigint NOT NULL REFERENCES objects (object_id),
+    compressed_length bigint NOT NULL,
+    PRIMARY KEY (generation_id, ordinal)
+);
+CREATE INDEX generation_blocks_object ON generation_blocks (object_id);
+
+CREATE TABLE active_segment_blocks (
+    namespace           text NOT NULL,
+    segment_index       bigint NOT NULL,
+    ordinal             integer NOT NULL,
+    object_id           bigint NOT NULL REFERENCES objects (object_id),
+    event_count         integer NOT NULL CHECK (event_count > 0),
+    min_seq             bigint NOT NULL,
+    max_seq             bigint NOT NULL,
+    min_witnessed_us    bigint NOT NULL,
+    max_witnessed_us    bigint NOT NULL,
+    compressed_length   bigint NOT NULL,
+    uncompressed_length bigint NOT NULL,
+    revision            bigint NOT NULL,
+    PRIMARY KEY (namespace, segment_index, ordinal),
+    FOREIGN KEY (namespace, segment_index) REFERENCES segments (namespace, segment_index)
+);
+CREATE INDEX active_segment_blocks_object ON active_segment_blocks (object_id);
+CREATE INDEX active_segment_blocks_revision ON active_segment_blocks (revision);
+
+CREATE TABLE hot_batches (
+    first_seq        bigint PRIMARY KEY,
+    last_seq         bigint NOT NULL,
+    event_count      integer NOT NULL CHECK (event_count > 0),
+    min_witnessed_us bigint NOT NULL,
+    max_witnessed_us bigint NOT NULL,
+    epoch            bigint NOT NULL,
+    revision         bigint NOT NULL,
+    committed_at     timestamptz NOT NULL DEFAULT now(),
+    frame            bytea,
+    object_id        bigint REFERENCES objects (object_id),
+    CHECK (last_seq - first_seq + 1 = event_count),
+    CHECK ((frame IS NULL) <> (object_id IS NULL))
+) WITH (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000,
+        autovacuum_vacuum_cost_delay = 0);
+CREATE INDEX hot_batches_object ON hot_batches (object_id) WHERE object_id IS NOT NULL;
+```
+
+Notes:
+
+- `hot_batches` exists only for the `main` namespace. Bootstrap and merge never
+  use it (§10.6).
+- `hot_batches.frame` is a compressed block frame (§7.2), the same as a block
+  object. One decoder serves both.
+- `hot_batches` is small (seconds to tens of seconds of events) and churns fast.
+  The aggressive autovacuum settings stop dead rows from building up.
+- `metadata_kv` uses fillfactor 80 so repo-row updates can be HOT updates.
+- `generation_blocks.compressed_length` is stored so a pod can compute segment
+  offsets without fetching footers.
+- `archive.format_version` must equal the value compiled into the binary.
+  Otherwise refuse to start.
+
+## 9. Transaction rules
+
+### 9.1 General
+
+- Leader write transactions use `READ COMMITTED` isolation. Correctness comes
+  from the fence row lock, not from isolation level.
+- The fence is always the first statement (§6.4).
+- No S3 calls or other network I/O happen inside a transaction. Upload first,
+  then commit.
+- A transaction that returns an error, or whose `COMMIT` result is unknown, ends
+  the session. Never retry a leader write transaction inside the same session.
+  The next session rebuilds from what actually committed.
+- Reader transactions (the follower and on-demand lookups) use `REPEATABLE READ
+  READ ONLY`, so one tick sees one consistent snapshot.
+
+### 9.2 Visibility rule
+
+An event, block, segment, or metadata value is visible and durable if and only
+if the transaction that wrote it has committed. There is no other visibility
+path.
+
+### 9.3 Catalog invariants
+
+These must hold after every commit. The fakes test layer (§20) asserts them after
+every transaction, and the leader checks the ones that are cheap to check at
+session start.
+
+1. In `main`, the committed seqs `[1, seq/next)` are covered exactly once, in
+   order, with no gaps, by:
+   sealed generations, then active blocks, then hot batches.
+   In `bootstrap_live` the same holds against `live_segments/seq/next`, with no
+   hot batches.
+2. Segment indexes in a namespace are contiguous from 0. Exactly one segment is
+   `active` per namespace once the namespace exists, and it has the highest
+   index.
+3. Active block ordinals in a segment are contiguous from 0.
+4. Every referenced object has `state = 'available'`.
+5. Hot batches cover a contiguous seq range. Its start equals
+   `(max seq in active blocks and sealed segments of main) + 1`, and its end
+   equals `seq/next - 1`.
+6. A hot batch never crosses an open-block boundary (§10.3).
+7. `metadata_kv['relay/cursor']` never names an upstream seq whose events are not
+   all committed (§10.4).
+
+## 10. Write path
+
+### 10.1 Writer modes
+
+The existing `internal/ingest` Writer keeps its API (Append, AppendBatch, Flush,
+ForceRotate, SealActiveAndClose, DrainDurability). What changes is what happens
+behind a block flush. In disaggregated mode it has two modes:
+
+| Mode | Used for | Visibility unit |
+|---|---|---|
+| hot | `main` namespace in steady state | hot batch |
+| direct | `main` during bootstrap backfill, `bootstrap_live` during bootstrap, `main` during merge | block |
+
+The orchestrator chooses the mode when it opens a writer. The seq write-ahead
+lease (`ReserveClientVisibleSeqs`, `seq/max_reserved`, `seq/gap/*`) is disabled
+in disaggregated mode, because a seq is never visible before it commits.
+
+### 10.2 Seq allocation
+
+- On session start, the writer reads its seq key (`seq/next` or
+  `live_segments/seq/next`) from `metadata_kv`. That is the next seq to assign.
+- Seqs are assigned in memory at append time, as today.
+- A committing transaction checks that the stored seq key equals the first seq
+  it is committing, then sets the key to one past the last seq. On mismatch,
+  end the session with a corruption error.
+- Events that were assigned seqs but never committed are dropped when a session
+  ends. The next session starts at the committed `seq/next` and assigns those
+  seqs to whatever events arrive next. That is safe because no client could have
+  seen the dropped events. Relay replay and retries re-deliver the underlying
+  data.
+
+As a result, seqs are gap-free in disaggregated mode. The cold reader's
+registered-vacancy support stays for local mode and is simply never used here.
+
+### 10.3 Hot mode: batching
+
+The writer keeps one open block and cuts it into batches.
+
+- A **block** holds up to `MaxEventsPerBlock` events (default 4096). It closes
+  when it reaches 4096 events, or when its first event is 30s old
+  (`JETSTREAM_BLOCK_MAX_AGE`).
+- A **batch** is a run of consecutive seqs inside one block. A batch is cut when
+  any of these happens first:
+  - it has `min(256, remaining capacity in the block)` events;
+  - its raw event bytes reach 256KiB;
+  - its first event is 15ms old (`JETSTREAM_HOT_BATCH_MAX_AGE`);
+  - the block closes;
+  - the append class changes (§10.5).
+
+A batch never crosses a block boundary. Block boundaries therefore fall exactly
+on batch boundaries, and a fold consumes whole batches.
+
+When a batch is cut, it is **frozen**:
+
+1. Encode its events with the existing block encoder into one frame.
+2. Sample `DurableBatchPrepareValue` (for example the live relay cursor
+   watermark). The sample is tied to this batch.
+3. Queue it for commit.
+
+Frozen batches commit strictly in seq order, one transaction at a time, from one
+committer goroutine. Inline batches need no upload, so they commit as soon as
+the previous batch has committed. Pointer batches upload concurrently and commit
+in order when their turn comes.
+
+### 10.4 Hot mode: batch transaction
+
+```
+BEGIN
+  fence                                   -- §6.4, returns rev
+  SELECT value FROM metadata_kv WHERE key = 'seq/next' FOR UPDATE
+      -- must equal batch.first_seq
+  [pointer only] reference check on batch.object_id   -- §7.4
+  INSERT INTO hot_batches (first_seq, last_seq, event_count, min_witnessed_us,
+      max_witnessed_us, epoch, revision, frame | object_id)
+  apply metadata batch:
+      seq/next = last_seq + 1
+      whatever DurableBatchHook staged (relay/cursor, repo/<did>, sync/<did>, ...)
+  SELECT pg_notify('jetstream_catalog', rev::text)
+COMMIT
+```
+
+After the commit succeeds:
+
+- run the hook's `afterCommit` and `afterDone`;
+- release producer acks for events in the batch (whatever `AppendBatch` or
+  `Flush` waits on today);
+- ring the local follower's in-process doorbell.
+
+On failure: run `afterDone(err)` and end the session.
+
+**DurableBatchHook.** It keeps its current two-phase contract. The only change
+is the batch type, which becomes `metastore.Batch` instead of `*pebble.Batch`
+(§12). The hook runs once per committed hot batch, in the committer goroutine.
+`nextSeq` is `last_seq + 1` of that batch. `prepareValue` is the value sampled at
+freeze time. As today, the hook must not call Writer methods or do unbounded
+I/O.
+
+**Relay cursor.** One upstream firehose commit can produce several rows that end
+up in different batches. `relay/cursor` may only advance to an upstream seq whose
+rows all have seqs `< nextSeq`. The live consumer's existing safe-cursor logic
+(the prepare-time watermark carried in `prepareValue`) already enforces this per
+block. It must be driven per batch now. A test must cover a single upstream
+commit split across two batches, with the leader killed between the two
+commits.
+
+**Metadata batch size.** At 3,000 events/s, a batch carries up to about 256
+`repo/<did>` upserts. They are applied as one multi-row upsert (§12.3), not one
+statement per key.
+
+### 10.5 Admission control
+
+There are two classes of producers:
+
+- **live**: the firehose consumer;
+- **bulk**: failed-repo retries, sync 1.1 resync replacements, large-PDS
+  recovery, and any other producer that appends more than one repo's worth of
+  events.
+
+Rules:
+
+1. **Append lock priority.** The Writer's append lock prefers live. A bulk
+   appender holds the lock for at most one chunk: `min(4096, remaining block
+   capacity)` events. It checks for waiting live appenders between chunks.
+   Implement this as a mutex plus a "live waiting" counter. Bulk code yields when
+   the counter is non-zero.
+2. **Class boundary.** Changing class cuts the current batch. Every batch holds
+   events of one class only.
+3. **Live batches are inline**, paid for from a token bucket over encoded frame
+   bytes. The rate is `JETSTREAM_HOT_INLINE_BYTES_PER_SEC` (default 4MiB/s) and
+   the burst is 1s worth. At freeze, if the bucket has at least the frame's size
+   in tokens, take them and commit inline.
+4. **Live overflow.** If the bucket is short, the batch is not committed inline.
+   The writer enters overflow mode: it un-freezes the events and keeps adding
+   live events to the same batch until 1024 events, 1MiB raw, 1s age, or block
+   close. Then it freezes the batch as a pointer batch. Overflow mode ends at the
+   next freeze where the bucket can pay for an inline batch.
+5. **Bulk batches are always pointer batches.** A bulk chunk is one pointer
+   batch (at most 4096 events and never past the block boundary).
+6. **Bulk permit.** Before appending a chunk, a bulk appender takes permits for
+   its raw bytes from a bulk pending-bytes semaphore
+   (`JETSTREAM_HOT_BULK_PENDING_BYTES`, default 64MiB). The permits are released
+   when the batch commits.
+7. **Upload concurrency.** At most `JETSTREAM_S3_UPLOAD_CONCURRENCY` (default 8)
+   uploads run at once, across all writer and maintainer work.
+8. **Total cap.** If frozen-but-uncommitted raw bytes exceed
+   `JETSTREAM_HOT_PENDING_BYTES` (default 256MiB), every append blocks, live
+   included. This is the last-resort backstop. Live appenders blocking means the
+   firehose consumer stops reading and the relay buffers.
+9. **Unfolded cap.** If the events in `hot_batches` (committed but not folded)
+   exceed `JETSTREAM_HOT_MAX_UNFOLDED_EVENTS` (default 65,536, which is 16
+   blocks), every append blocks until folds catch up. This bounds PostgreSQL
+   growth when S3 is slow or down.
+
+Commits stay strictly in seq order, so a live inline batch that follows a pointer
+batch waits for the pointer's upload and read-back. During bulk recovery, live
+latency may rise by about one S3 PUT plus one GET. This is accepted. It must be
+measured (§22).
+
+### 10.6 Direct mode
+
+Direct mode is local mode's block flush, pointed at S3 and PostgreSQL:
+
+1. When a block is full (4096 events), or on Flush/ForceRotate/Seal, freeze it:
+   encode it and sample `DurableBatchPrepareValue`.
+2. Upload it (§7.3). Uploads run concurrently (`JETSTREAM_S3_UPLOAD_CONCURRENCY`),
+   so bootstrap can sustain about 100–200 blocks/s. Pop2 recovery measured 173
+   blocks/s at about 740 events per block.
+3. Commit blocks strictly in order, one transaction each:
+
+```
+BEGIN
+  fence
+  check seq key == block.min_seq (FOR UPDATE)
+  reference check on block.object_id
+  INSERT INTO active_segment_blocks (..., ordinal = next ordinal, revision = rev)
+  apply metadata batch: seq key = block.max_seq + 1, plus DurableBatchHook output
+COMMIT
+```
+
+4. After commit: `afterCommit`, `afterDone`, and producer acks, as today.
+5. Seal when the rotation rule fires (§10.8).
+
+Pods return 503 on every archive and subscribe endpoint until `phase =
+steady_state`, the same as local mode's readiness gate. So direct-mode data is
+never visible to clients until merge finishes.
+
+The existing async-flush pipeline (`AsyncFlushWorkers`) maps onto step 2:
+compress and upload off the writer mutex, commit in order.
+
+### 10.7 Fold
+
+The maintainer is one goroutine in the leader session. It runs fold and seal in
+order, never concurrently.
+
+The writer hands each closed open block to the maintainer, together with the
+in-memory events of all its batches. The maintainer waits until the last batch
+of the block has committed, then:
+
+1. Encode the block from the in-memory events with the existing encoder.
+2. Upload it (§7.3). If the block's bytes equal an existing object (for example
+   a single bulk pointer batch that covered the whole block), dedup returns that
+   object and nothing is uploaded.
+3. Commit:
+
+```
+BEGIN
+  fence
+  reference check on object_id
+  DELETE FROM hot_batches
+    WHERE first_seq BETWEEN $min_seq AND $max_seq
+    RETURNING first_seq, last_seq, event_count
+      -- must cover exactly [min_seq, max_seq], contiguous; else corruption
+  INSERT INTO active_segment_blocks (ordinal = next, revision = rev, ...)
+COMMIT
+```
+
+4. Drop the block's events from leader memory.
+5. If the rotation rule now fires, seal (§10.8) before the next fold.
+
+Deleting a pointer batch removes that object's hot reference. If the fold reused
+it through dedup, it is still referenced by `active_segment_blocks`. Otherwise GC
+eventually removes it.
+
+A reader that was about to read deleted hot batches finds the active block in
+the next mirror refresh. See §11.4 for how readers switch.
+
+### 10.8 Seal
+
+The rotation rule is the existing one: the active segment's virtual file size
+(`256 + Σ(8 + compressed_length)`) reaches `MaxSegmentBytes` (256MiB). Seal also
+runs on `ForceRotate` and `SealActiveAndClose`.
+
+1. Build the footer and header with the existing sealer code (`segment/seal.go`:
+   block walk plus `buildFooter`), driven by a block source instead of a file.
+   The source yields each active block's frame from the object cache or S3.
+   Offsets are computed as if the blocks were laid out in a file: block `i`
+   starts at `256 + Σ_{j<i}(8 + len_j)`.
+2. Upload the footer object.
+3. Commit:
+
+```
+BEGIN
+  fence
+  SELECT ordinal, object_id FROM active_segment_blocks
+    WHERE namespace = $ns AND segment_index = $idx ORDER BY ordinal FOR UPDATE
+    -- must equal the list the footer was built from
+  reference check on footer_object_id
+  INSERT INTO segment_generations (header, footer_object_id, revision = rev) RETURNING generation_id
+  INSERT INTO generation_blocks SELECT (gen, ordinal, object_id, compressed_length) ...
+  DELETE FROM active_segment_blocks WHERE namespace = $ns AND segment_index = $idx
+  UPDATE segments SET state = 'sealed', current_generation_id = gen, revision = rev
+    WHERE namespace = $ns AND segment_index = $idx AND state = 'active'
+  INSERT INTO segments (namespace, segment_index = idx + 1, state = 'active', revision = rev)
+COMMIT
+```
+
+The header's checksum covers header bytes `[12:256)` plus the footer
+(`segment/header.go` `xxh3HeaderFooter`). It does not cover block bytes. Blocks
+carry their own zstd content checksums. `docs/README.md` §3.1.2 says the checksum
+covers the blocks. The code is authoritative, and the README should be fixed.
+
+Seal fetches up to 256MiB of blocks, most of them usually still in the object
+cache. Hot batches keep committing during a seal. Folds wait. The unfolded cap
+(§10.5) bounds how far behind they get.
+
+### 10.9 Session start in hot mode
+
+1. Acquire the lease and read the metadata the orchestrator needs.
+2. Load the `main` active segment and its active blocks.
+3. Load all `hot_batches` in seq order. Decode inline frames. Fetch and verify
+   pointer objects.
+4. Group the batches greedily, in order, into groups of at most 4096 events,
+   never splitting a batch. The rows came from earlier sessions whose block
+   boundaries may differ, so do not assume old boundaries.
+5. Fold every group that is full (4096 events) or whose first event is older than
+   the block max age. Seal whenever the rotation rule fires.
+6. The remaining group, if any, becomes the new open block. Its committed events
+   are kept in memory. New appends continue at `seq/next`, and the batch cap uses
+   the block's remaining capacity.
+7. Rebuild the tombstone set (§12.5).
+8. Start the live consumer at `relay/cursor`.
+
+### 10.10 Lifecycle phases
+
+The orchestrator's phases (`bootstrap`, `merging`, `steady_state`) do not change.
+Each maps onto catalog operations like this:
+
+- **bootstrap**: two direct-mode writers. The backfill writer writes to `main`
+  (`seq/next`). The bootstrap-live writer writes to `bootstrap_live`
+  (`live_segments/seq/next`). Backfill checkpoints (repo completions, host
+  cursors) go through `DurableBatchHook` in block commits, as today.
+- **merging**: the live consumer is stopped. Merge reads `bootstrap_live`
+  blocks from S3 in seq order, applies the existing rev filter, and appends
+  survivors to `main` in direct mode. Then it runs the pending retry pass and
+  merge-tail compaction (§12), as today. One final transaction deletes every
+  `bootstrap_live` catalog row and `live_segments/*` metadata key, and writes
+  `phase = steady_state` and `phase/entered_at`. The objects become unreferenced
+  and GC removes them. A crash at any point before that transaction leaves merge
+  resumable with the existing merge-cursor logic (`merge_cursor.go`), because
+  every step before it commits on its own.
+- **steady_state**: the `main` writer runs in hot mode. The active `main`
+  segment that merge left behind simply continues. Hot batches start at
+  `seq/next`.
+
+## 11. Read path
+
+### 11.1 Follower
+
+Every pod runs one follower. It wakes on:
+
+- a `NOTIFY jetstream_catalog` (a dedicated `LISTEN` connection; reconnect with
+  backoff);
+- a 250ms timer (`JETSTREAM_CATALOG_POLL_INTERVAL`);
+- an in-process doorbell (leader pod only);
+- a synchronous refresh request from a reader (§11.6).
+
+Each tick runs one `REPEATABLE READ READ ONLY` transaction:
+
+1. `SELECT catalog_revision FROM archive`. If it equals the mirror's revision,
+   stop.
+2. Load changes with `revision > $mirror_revision`:
+   - `segments` rows. For a newly sealed or compacted segment, load its current
+     generation and its `generation_blocks`.
+   - `active_segment_blocks` rows.
+   - For every namespace, the set of active block keys, to detect deletes. This
+     is small: at most one segment's blocks.
+3. Load `hot_batches WHERE first_seq >= $follower_next_seq ORDER BY first_seq`,
+   including `frame`. Also load the descriptors of all hot batches (without
+   frames) so the mirror knows every hot batch that still exists.
+4. Load any `objects` rows referenced by new catalog rows (key, sha256, length).
+5. Load `metadata_kv` keys that readers need (`phase`, the compaction deadline
+   key, §12.7).
+6. Commit.
+
+Then, outside the transaction:
+
+- Fetch and verify pointer-batch objects for new hot batches.
+- Append new hot-batch events to the readable log in seq order, then advance its
+  durable watermark to the last appended seq. Everything in PostgreSQL is
+  durable, so the log has no pending tail.
+- Swap in the new mirror atomically (one `atomic.Pointer` store).
+- Publish newly sealed and compacted segments to the manifest. Fetch their
+  footers first (§11.3).
+
+Deletes are implied. A segment whose generation changed drops its old generation.
+Active blocks missing from the active set are gone (sealed). Hot batches below
+the lowest remaining hot batch are gone (folded).
+
+If the lowest loaded hot batch starts above `$follower_next_seq`, or there are
+no hot batches and the tip is above it, the missing seqs were folded (and maybe
+sealed) between two ticks. That is normal. The follower reads them through
+`RefsFrom($follower_next_seq)` (active blocks or sealed blocks, decoded through
+the block cache) and appends them to the readable log before any later hot
+batch. The readable log receives every seq exactly once, in order.
+
+`$follower_next_seq` always sits on a batch boundary, because blocks start on
+batch boundaries. At pod start it is set to the `main` tip plus one, so the
+readable log starts empty. Older seqs are served by the cold reader.
+
+### 11.2 Mirror contents
+
+- Archive: `archive_id`, `catalog_revision`, and the time of the last successful
+  refresh.
+- Per namespace, per segment: state, current generation (header, footer object
+  ID, block object IDs, compressed lengths), and active block descriptors.
+- Hot batch descriptors: `first_seq`, `last_seq`, min/max witnessed, and inline
+  frame or object ID. Inline frames of hot batches still in the mirror stay in
+  memory. They are bounded by the unfolded cap.
+- The object table entries for everything referenced.
+
+**Block ref.** Cold reads, cursor resolution, and repo export all address data
+through one type:
+
+```go
+type BlockRef struct {
+    MinSeq, MaxSeq         uint64
+    MinWitnessedUS, MaxWitnessedUS int64
+    // Exactly one of:
+    ObjectID uint64 // sealed block, active block, or pointer hot batch
+    Frame    []byte // inline hot batch
+}
+```
+
+The mirror exposes `RefsFrom(seq uint64) []BlockRef`: every ref from the one
+containing `seq` up to the tip, in order.
+
+### 11.3 Manifest and footers
+
+The manifest keeps every sealed segment's DID bloom, per-block DID blooms, and
+collection index in memory, as today. In disaggregated mode:
+
+- At pod start, fetch every current generation's footer from S3 (bounded
+  concurrency, `JETSTREAM_S3_READ_CONCURRENCY`, default 32) before becoming
+  ready. Pop1 has about 7,000 segments. Measure start time (§22).
+- `OnSegmentSealed` and `OnSegmentCompacted` are called by the follower, not by
+  the writer.
+- Footers stay in memory, as the manifest already requires. There is no separate
+  footer cache.
+
+### 11.4 Cold reads and the readable log
+
+The subscribe `Tail.ReadFrom` logic does not change. The readable log serves
+seqs it still holds. Below its floor, the cold reader serves. What changes is the
+cold reader's source:
+
+- sealed blocks: `ObjectStore.Get`, through the decoded block cache;
+- active blocks: the same;
+- hot batches: decode the inline frame or fetch the pointer object.
+
+The decoded block cache (`internal/subscribe/blockcache.go`) is keyed by object
+SHA-256 in disaggregated mode, instead of `(segIdx, checksum, blockIdx)`. Hits
+therefore survive compaction for unchanged blocks and survive folds that dedup.
+Inline hot frames are keyed by `first_seq` plus the frame's SHA-256.
+
+When a cold read reaches the tip of its refs, it hands off to the readable log.
+The readable log holds everything above its floor, so there is no gap. If the
+refs the reader held are gone (fold or compaction), it asks the mirror again
+with `RefsFrom(nextSeq)`.
+
+### 11.5 Cursor resolution
+
+Cursor rules do not change (`docs/README.md` §2, §5). v1 time cursors resolve
+through witnessed ranges: sealed segments via the manifest, then active blocks
+and hot batches via the mirror. v2 seq cursors use `RefsFrom`. The lookback
+floor is computed as today.
+
+### 11.6 Freshness
+
+- If the mirror's last successful refresh is older than
+  `JETSTREAM_MAX_VIEW_AGE` (default 30s), the pod reports not ready and returns
+  503 on archive and subscribe endpoints. Existing websocket streams stay open
+  and wait.
+- A request that names a seq, segment name, block, or `beforeSeq` above what
+  the mirror knows triggers one synchronous follower tick before answering. If
+  the value is still unknown after the tick, answer as today (for example,
+  cursor in the future).
+
+### 11.7 Response lifetime
+
+`getSegment` and `getBlock` responses are cut off after
+`JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION` (default 1h). GC must not delete an
+object that a response could still be reading. Startup therefore checks:
+
+```
+JETSTREAM_GC_DELAY > JETSTREAM_MAX_VIEW_AGE + JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION + 10m
+```
+
+and refuses to start if it does not hold. Default `JETSTREAM_GC_DELAY` is 6h.
+
+### 11.8 Archive endpoints
+
+- **planSnapshot**: unchanged. It runs over the manifest. `sealedTipSeq` comes
+  from the mirror.
+- **getSegment**: serves the virtual file: the 256-byte header from
+  `segment_generations.header`, then for each block an 8-byte little-endian
+  length followed by the block object, then the footer object.
+  `Content-Length = footer_offset + footer length`. Range requests map byte
+  ranges onto these parts and use `GetRange`. The ETag is the header checksum,
+  as today. `Last-Modified` is the generation's `created_at`. HEAD returns the
+  same headers without fetching objects. The whole response comes from one
+  generation, pinned from the mirror at request start.
+- **getBlock**: serves one block object from the pinned generation. The ETag is
+  `checksum:blockIndex`, as today.
+- **Cache-Control**: uses the compaction deadline from `metadata_kv` (§12.7).
+
+### 11.9 Repo export and status
+
+`repoexport` reads a DID's events through `BlockRef`s, including hot batches. So
+the "pending events" hook (`internal/jetstreamd/pending.go`) returns nothing in
+disaggregated mode: everything committed is already readable.
+
+The status page must not scan all repo rows. `countKeysWithPrefix` and
+`CountStatuses` switch to the maintained `backfill/counts` aggregate, or to
+`pg_class.reltuples` estimates where no aggregate exists.
+
+## 12. Compaction
+
+Compaction policy, schedule, triggers, tombstone kinds, and the `compaction/seq`
+watermark do not change (`docs/README.md` §3.3). Only the mechanics change: a
+rewrite fetches only affected blocks.
+
+### 12.1 Pass
+
+1. Force-rotate the `main` writer, as today, so every tombstone below the pass
+   watermark is in a sealed segment or a later block.
+2. Snapshot the tombstone set and the watermark `W` (the highest tombstone seq in
+   the pass).
+3. For each sealed segment with `min_seq < W` whose segment DID bloom hits a
+   tombstone DID, run the segment rewrite (§12.2). Run up to
+   `JETSTREAM_COMPACTION_REWRITE_WORKERS` segments at once.
+4. After every segment in the chunk has published, advance `compaction/seq` in a
+   fenced transaction that checks the prior value:
+   `UPDATE metadata_kv SET value = $W WHERE key = 'compaction/seq' AND value = $prior`.
+   Zero rows means corruption.
+
+### 12.2 Segment rewrite
+
+Input: one segment's current generation (header, footer from the manifest, block
+object IDs).
+
+1. **Candidate blocks.** A block is a candidate if its per-block DID bloom hits a
+   tombstoned DID, the block's `min_seq` is below that tombstone's seq, and, for
+   a record tombstone, the block's collection bitmask contains the tombstone's
+   collection.
+2. **Decode and drop.** Fetch and decode each candidate. Apply the existing drop
+   rule (drop `KindCreate` and `KindUpdate` rows superseded by a newer tombstone).
+   Blocks that lose no rows are not changed. If no block changed, stop. The
+   segment is not rewritten.
+3. **Vanished DIDs.** For every DID that lost at least one row, decide whether it
+   still has any row in the segment:
+   - check the remaining rows of all decoded blocks;
+   - for each block not yet decoded whose per-block DID bloom hits the DID,
+     fetch it, decode it, and check.
+
+   A DID vanishes only if no row remains. This is exact. Blooms only decide which
+   blocks to look at.
+4. **Re-encode changed blocks** with the existing encoder. A block with all rows
+   dropped becomes an `event_count = 0` block, as today. Upload each (§7.3).
+5. **New footer.**
+   - Block index: for changed blocks, new `compressed_size`,
+     `uncompressed_size`, and `event_count`. Keep `min_seq`, `max_seq`,
+     `min_witnessed_at`, and `max_witnessed_at` (the envelope). Recompute every
+     block's `offset` from the new sizes.
+   - Segment DID bloom and per-block DID blooms: unchanged. They are now
+     supersets, which is allowed: `segment/verify.go` only rejects false
+     negatives.
+   - Collection index: new count = old count minus rows dropped for that
+     collection. Remove a real collection whose count reaches 0. Sentinel
+     collections (`$account`, `$identity`, `$sync`) are never removed, because
+     their rows are never dropped. Rebuild changed blocks' bitmasks exactly from
+     their remaining rows. Remap unchanged blocks' bitmasks to the new collection
+     IDs.
+6. **New header.** `event_count` = old minus dropped rows. `unique_did_count` =
+   old minus vanished DIDs. Keep `block_count`, the seq bounds, and the
+   witnessed bounds. Recompute the offsets and the checksum.
+7. Upload the footer object.
+8. **Publish:**
+
+```
+BEGIN
+  fence
+  SELECT current_generation_id FROM segments WHERE namespace = 'main' AND segment_index = $idx FOR UPDATE
+    -- must equal the source generation; else corruption (only the leader compacts)
+  reference checks on every new object and every reused object
+  INSERT INTO segment_generations (..., revision = rev) RETURNING generation_id
+  INSERT INTO generation_blocks (new objects for changed blocks, old object IDs for unchanged)
+  UPDATE segments SET current_generation_id = new, revision = rev
+  DELETE FROM segment_generations WHERE generation_id = source   -- cascades to generation_blocks
+COMMIT
+```
+
+Old objects that are no longer referenced become GC candidates. Readers holding
+the old generation keep working until GC deletes them, which is at least
+`JETSTREAM_GC_DELAY` later.
+
+Every rewrite drops at least one row, so `event_count` strictly decreases. The
+header bytes and checksum therefore always differ from the source generation's,
+and so does the ETag. Equal-length rewrites with identical headers cannot
+happen. That was the only reason for the old checksum content-root extension,
+which is not part of this design.
+
+### 12.3 Correctness check
+
+The sparse rewrite must match the existing full rewrite. Required test: for
+generated segments and tombstone sets, the sparse rewrite's output
+
+- passes `segment.VerifySealedMetadata`, and
+- decodes to exactly the same rows as `segment.Rewrite` on the same input.
+
+Blooms may differ (supersets). Everything else in the footer and header must
+match what `VerifySealedMetadata` checks exactly: `unique_did_count`, collection
+table membership and counts, and per-block collection sets.
+
+### 12.4 Merge-tail compaction
+
+The same code runs during merge, before `phase = steady_state`.
+
+### 12.5 Tombstone set on session start
+
+The tombstone set is memory only. On session start, rebuild it by reading every
+`main` event above `compaction/seq` (sealed blocks, active blocks, hot batches)
+through `BlockRef`s. Measure the time this takes (§22).
+
+### 12.6 Compaction working memory
+
+A segment rewrite holds its decoded candidate blocks. With 8 workers and
+256MiB-segment worst cases, budget `JETSTREAM_COMPACTION_MEMORY_BYTES` (default
+2GiB). A worker waits for budget before decoding. Blocks are decoded one at a
+time into a per-worker buffer when possible.
+
+### 12.7 Cache-Control deadline
+
+The compaction scheduler writes its published deadline, and the "pass running
+since" value, to `metadata_kv` under `compaction/deadline`, in a fenced
+transaction. Every pod reads that key through the follower and computes
+Cache-Control exactly as today.
+
+## 13. Garbage collection
+
+A leader task runs every `JETSTREAM_GC_INTERVAL` (default 10m).
+
+1. **Mark.** In a fenced transaction, set `unreferenced_at = now()` on every
+   `available` object with `unreferenced_at IS NULL` that no row references:
+
+```sql
+UPDATE objects o SET unreferenced_at = now()
+WHERE o.state = 'available' AND o.unreferenced_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM hot_batches h WHERE h.object_id = o.object_id)
+  AND NOT EXISTS (SELECT 1 FROM active_segment_blocks a WHERE a.object_id = o.object_id)
+  AND NOT EXISTS (SELECT 1 FROM generation_blocks g WHERE g.object_id = o.object_id)
+  AND NOT EXISTS (SELECT 1 FROM segment_generations s WHERE s.footer_object_id = o.object_id);
+```
+
+   Run it in pages of 10,000 rows by `object_id` so each transaction stays
+   short.
+2. **Claim.** In a fenced transaction, claim up to 1,000 objects:
+
+```sql
+UPDATE objects SET state = 'deleting'
+WHERE object_id IN (
+  SELECT object_id FROM objects
+  WHERE (state = 'available' AND unreferenced_at < now() - $gc_delay)
+     OR (state = 'uploading' AND created_at < now() - $orphan_age)
+  LIMIT 1000)
+RETURNING object_id, key;
+```
+
+   Then re-run the four `NOT EXISTS` checks on the claimed `available` rows in the
+   same transaction. Any row that is referenced again goes back to `available`
+   with `unreferenced_at = NULL`. The reference check in §7.4 already stops this
+   from happening, so treat a hit as corruption.
+3. **Delete.** Outside the transaction, `DeleteObject` each claimed key.
+   "Not found" counts as success.
+4. **Forget.** In a fenced transaction, `DELETE FROM objects WHERE object_id =
+   ANY($ids) AND state = 'deleting'`.
+
+A session that dies between steps 2 and 4 leaves `deleting` rows. The next GC
+run also picks up `state = 'deleting'` rows and repeats steps 3 and 4 for them.
+
+`$orphan_age` is `JETSTREAM_GC_ORPHAN_AGE`, default 1h. It must be larger than
+`JETSTREAM_S3_RETRY_TIMEOUT` plus the longest upload. `uploading` rows are never
+referenced, so no mark step is needed for them.
+
+## 14. Metadata store
+
+### 14.1 Interface
+
+`internal/metastore` defines what the ingest code uses from Pebble today. Pebble
+snapshots and indexed batches are not used, so they are not in the interface.
+
+```go
+type Store interface {
+    Get(ctx context.Context, key []byte) ([]byte, error) // ErrNotFound when absent
+    NewBatch() Batch
+    NewIter(ctx context.Context, lower, upper []byte) (Iterator, error)
+    // Set and Delete are single-op batches.
+    Set(ctx context.Context, key, value []byte) error
+    Delete(ctx context.Context, key []byte) error
+}
+
+type Batch interface {
+    Set(key, value []byte)
+    Delete(key []byte)
+    DeleteRange(start, end []byte) // [start, end)
+    Commit(ctx context.Context) error
+    Len() int
+}
+
+type Iterator interface {
+    Next() bool // ordered by key bytes ascending
+    Key() []byte
+    Value() []byte
+    Err() error
+    Close() error
+}
+```
+
+Implementations:
+
+- `metastore/pebble`: wraps the existing `internal/store`. Commit uses
+  `store.SyncWrites`, as today. The identity cache's `NoSync` writes stay local
+  to local mode.
+- `metastore/pg`: backed by `metadata_kv`.
+
+All 56 `NewBatch`, 12 `NewIter`, and 5 `DeleteRange` call sites move to this
+interface. `DurableBatchHook` takes `metastore.Batch`.
+
+### 14.2 PostgreSQL implementation
+
+- **Get**: `SELECT value FROM metadata_kv WHERE key = $1`.
+- **Commit**: one fenced transaction on the leader. Ops apply in their original
+  order. Consecutive `Set`s are coalesced into one statement (last write per key
+  wins):
+  `INSERT INTO metadata_kv (key, value) SELECT * FROM unnest($1::bytea[], $2::bytea[]) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`.
+  Consecutive `Delete`s become `DELETE FROM metadata_kv WHERE key = ANY($1)`. A
+  `DeleteRange` is `DELETE ... WHERE key >= $1 AND key < $2`, and it ends the
+  current run. This keeps Pebble's ordered-batch semantics.
+- When the batch is part of a hot batch, direct block, or other catalog
+  transaction, it is applied inside that transaction instead of its own.
+- **Iterator**: keyset paging, `WHERE key >= $lower AND key < $upper AND key >
+  $last ORDER BY key LIMIT 10000`. Each page is its own read. An iterator is not
+  a snapshot. Stage 1 must audit all 12 `NewIter` call sites and record, for
+  each, why a non-snapshot scan is safe, or change the caller. The `bytea`
+  comparison is bytewise, which matches Pebble's default comparer.
+- **Reader pods** get a read-only Store. Writes return an error.
+
+### 14.3 Load
+
+In steady state at 3,000 events/s, the main write load on PostgreSQL is repo row
+upserts, not event bytes: up to one `repo/<did>` upsert per event, coalesced per
+batch. At about 67 batches/s (3,000/s at 15ms batches, about 45 events each),
+that is about 67 multi-row upserts/s touching about 3,000 rows/s, plus the inline
+frames (about 0.5MiB/s). Measure p99 commit latency under this load (§22).
+
+The failed-repo retry scan reads all `repo/` rows every 4h
+(`DefaultFailedRepoRetryInterval`). That is about 9GB per pass on pop1-sized
+data. This is accepted for now and must be measured.
+
+## 15. Startup, failover, restore
+
+### 15.1 Initialize
+
+`jetstream storage init` (new subcommand):
+
+1. Connect to PostgreSQL and apply migrations to an empty database. Refuse if
+   the `archive` table already exists.
+2. Insert the `archive` row with a new random `archive_id`. Create segment 0,
+   `state = 'active'`, in both `main` and `bootstrap_live`. Leave `metadata_kv`
+   empty; the orchestrator starts in `bootstrap` when `phase` is absent, as
+   today.
+3. PUT, GET, and DELETE a probe object under
+   `<prefix>/<archive_id>/probe/<uuid>` to check credentials and read-after-write.
+
+### 15.2 Pod start
+
+1. Load config. Check the configurable memory budgets (§17) and the GC-delay
+   inequality (§11.7).
+2. Connect to PostgreSQL. Check `schema_version` and `format_version`.
+3. Start the follower and do the first full mirror load. Load footers. Check the
+   memory budgets again, this time including the measured manifest size.
+4. Start the HTTP servers. The pod becomes ready once the mirror is fresh,
+   `phase = steady_state`, and all footers are loaded.
+5. Start the election loop.
+
+### 15.3 Failover
+
+Nothing special happens. The old leader's lease expires, another pod acquires it
+with a higher epoch, and the old leader's later writes fail the fence. The new
+session rebuilds from PostgreSQL (§10.9). Uncommitted events are re-delivered by
+the relay from `relay/cursor`, and by retry state from `repo/<did>`.
+
+### 15.4 Restore
+
+Only HA failover of PostgreSQL (for example RDS Multi-AZ) is supported without
+operator action. Restoring PostgreSQL to an earlier point in time can re-issue
+seqs that clients have already seen. So a restore always creates a new archive:
+
+1. Stop every pod of the old deployment.
+2. Restore PostgreSQL into a new database.
+3. Run `jetstream storage new-identity`:
+   - assign a new `archive_id`;
+   - bump `writer_epoch`;
+   - clear `holder_id`;
+   - delete `hot_batches` rows whose objects are missing, and check that every
+     other referenced object exists (GET plus hash check). Refuse on any missing
+     sealed or active block;
+   - copying objects to the new `archive_id` prefix is not needed: keys are
+     stored per row, so the rows keep pointing at the old keys.
+4. Deploy at a new public endpoint. Clients must treat it as a new instance,
+   because the cursor namespace is different.
+
+Objects under the old prefix stay until the operator removes the old bucket
+prefix. The old deployment must never run against the restored database.
+
+## 16. Failure handling
+
+| Failure | Behavior |
+|---|---|
+| Leader killed | Lease expires in ≤3s; new leader rebuilds; uncommitted events re-delivered |
+| Leader paused or partitioned, later wakes | First write fails the fence; session ends; S3 PUTs become GC garbage |
+| Commit result unknown | Session ends; next session reads what actually committed |
+| PostgreSQL unreachable | Leader: renew fails, session ends within one lease. Readers: mirror ages; not ready after 30s; open streams wait |
+| PostgreSQL HA failover | As unreachable, then recovery |
+| S3 unreachable | Uploads retry up to 30s, then the session ends. Live inline batches keep committing until the unfolded cap, then appends block. Readers: cold reads fail with 503; hot reads keep working |
+| S3 returns wrong bytes | Read-back check fails; retry with a new key |
+| Referenced object missing or corrupt | Reader: request fails, `jetstream_storage_corruption_total` increments. Leader: session ends, process exits |
+| `NOTIFY` lost | 250ms polling covers it |
+| Follower falls behind | Visible via `jetstream_catalog_lag_seconds`; after 30s the pod is not ready |
+| Bulk flood | Bulk permits and live priority hold; live latency rises by at most about one PUT plus GET |
+| Invalid upstream data | Unchanged: drop, count, continue (`docs/README.md` §4.4) |
+| Catalog invariant broken | Corruption: leader exits; readers fail affected requests |
+| Pod paused between object-row insert and PUT for longer than the orphan age | One object leaks in S3 (§7.3). Accepted |
+
+## 17. Memory
+
+Pop1 today: RSS 36.6GB, 7-day max 67GB, Go heap 21GB, container limit 128GiB,
+`GOMEMLIMIT` unset. In disaggregated mode, memory is the only cache, so every
+large consumer gets an explicit budget.
+
+| Budget | Env var | Default |
+|---|---|---|
+| Readable log | `JETSTREAM_SUBSCRIBE_READ_LOG_RETENTION_BYTES` (existing) | 256MiB |
+| Decoded block cache | `JETSTREAM_SUBSCRIBE_BLOCK_CACHE_BYTES` (existing) | 64MiB (raise in production) |
+| Compressed object cache | `JETSTREAM_OBJECT_CACHE_BYTES` | 2GiB |
+| Writer pending bytes | `JETSTREAM_HOT_PENDING_BYTES` | 256MiB |
+| Compaction working set | `JETSTREAM_COMPACTION_MEMORY_BYTES` | 2GiB |
+| Manifest and footers | not configurable; measured at start | pop1: a few GiB |
+
+Rules:
+
+- `GOMEMLIMIT` must be set in disaggregated mode. Refuse to start without it.
+- At start, add up the configurable budgets plus the measured manifest size. If
+  the total exceeds 75% of `GOMEMLIMIT`, refuse to start with a message listing
+  each budget.
+- The compressed object cache is an LRU keyed by object SHA-256. It holds raw
+  object bytes (block frames and pointer-batch frames), not footers. Footers live
+  in the manifest.
+- Export each budget's current use as a gauge (§19).
+
+## 18. Configuration
+
+Disaggregated mode is on when `JETSTREAM_STORAGE=disaggregated`. The default is
+`local`. In disaggregated mode `JETSTREAM_DATA_DIR` must be unset. Startup
+refuses if it is set, so no code path writes to local disk by accident.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `JETSTREAM_STORAGE` | `local` | `local` or `disaggregated` |
+| `JETSTREAM_PG_URL` | — | PostgreSQL connection string (secret; never in `.env`) |
+| `JETSTREAM_PG_MAX_CONNS` | 16 | pgx pool size |
+| `JETSTREAM_S3_ENDPOINT` | — | endpoint URL; empty means AWS default |
+| `JETSTREAM_S3_REGION` | — | region |
+| `JETSTREAM_S3_BUCKET` | — | bucket |
+| `JETSTREAM_S3_PREFIX` | `""` | key prefix |
+| `JETSTREAM_S3_PATH_STYLE` | `false` | path-style addressing (SeaweedFS, MinIO) |
+| `JETSTREAM_S3_UPLOAD_CONCURRENCY` | 8 | concurrent uploads |
+| `JETSTREAM_S3_READ_CONCURRENCY` | 32 | concurrent GETs for footer load and prefetch |
+| `JETSTREAM_S3_RETRY_TIMEOUT` | 30s | give up on one S3 operation after this |
+| `JETSTREAM_LEADER_LEASE` | 3s | lease duration |
+| `JETSTREAM_LEADER_RENEW_INTERVAL` | 1s | renew period |
+| `JETSTREAM_LEADER_ACQUIRE_INTERVAL` | 500ms | acquire attempt period |
+| `JETSTREAM_HOT_BATCH_MAX_AGE` | 15ms | batch age cut |
+| `JETSTREAM_BLOCK_MAX_AGE` | 30s | open block age cut (hot mode) |
+| `JETSTREAM_HOT_INLINE_BYTES_PER_SEC` | 4MiB | live inline token bucket rate |
+| `JETSTREAM_HOT_BULK_PENDING_BYTES` | 64MiB | bulk permits |
+| `JETSTREAM_HOT_PENDING_BYTES` | 256MiB | total frozen-uncommitted cap |
+| `JETSTREAM_HOT_MAX_UNFOLDED_EVENTS` | 65536 | committed-but-unfolded cap |
+| `JETSTREAM_CATALOG_POLL_INTERVAL` | 250ms | follower poll |
+| `JETSTREAM_MAX_VIEW_AGE` | 30s | not ready when the mirror is older |
+| `JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION` | 1h | archive response cutoff |
+| `JETSTREAM_GC_INTERVAL` | 10m | GC period |
+| `JETSTREAM_GC_DELAY` | 6h | unreferenced age before delete |
+| `JETSTREAM_GC_ORPHAN_AGE` | 1h | `uploading` age before delete |
+| `JETSTREAM_OBJECT_CACHE_BYTES` | 2GiB | compressed object cache |
+| `JETSTREAM_COMPACTION_MEMORY_BYTES` | 2GiB | compaction working set |
+
+The hot-mode constants of 256 events and 256KiB per batch, and 1024 events,
+1MiB, and 1s for overflow pointer batches, are code constants, not config.
+
+Existing variables keep their meaning. `JETSTREAM_TIMESTAMP_IMPORT_*` are
+removed (§21).
+
+## 19. Code organization
+
+### 19.1 Interfaces
+
+Every storage seam is an interface with a local implementation and a
+disaggregated implementation. Core code (writer, sealer, compaction, cold
+reader, manifest, planner, orchestrator) depends only on these interfaces.
+
+| Interface | Package | Local impl | Disaggregated impl |
+|---|---|---|---|
+| `ObjectStore` | `internal/objstore` | not used | S3 (`aws-sdk-go-v2`) |
+| `metastore.Store` | `internal/metastore` | Pebble | `metadata_kv` |
+| `Catalog` | `internal/catalog` | segment files plus directory scan | PostgreSQL tables and mirror |
+| `HotLog` | `internal/catalog` | readable log fed by the writer | readable log fed by the follower |
+| `Locker` | `internal/leader` | `streaming.NoopLock` | PostgreSQL lease |
+
+```go
+// ObjectStore stores immutable byte objects addressed by catalog object_id.
+type ObjectStore interface {
+    Put(ctx context.Context, data []byte) (objectID uint64, err error) // §7.3
+    Get(ctx context.Context, objectID uint64) ([]byte, error)          // verified
+    GetRange(ctx context.Context, objectID uint64, off, n int64) ([]byte, error)
+}
+
+// Catalog is the writer- and reader-facing view of segments and blocks.
+type Catalog interface {
+    // Reader side.
+    Snapshot() CatalogView // immutable; the mirror in disaggregated mode
+    Refresh(ctx context.Context) error
+    // Writer side (leader only). Each call is one fenced transaction.
+    CommitHotBatch(ctx context.Context, b HotBatch, meta metastore.Batch) error
+    CommitBlock(ctx context.Context, ns Namespace, blk BlockCommit, meta metastore.Batch) error
+    Fold(ctx context.Context, blk BlockCommit) error
+    Seal(ctx context.Context, s SealCommit) error
+    PublishGeneration(ctx context.Context, g GenerationCommit) error
+    DeleteNamespace(ctx context.Context, ns Namespace, meta metastore.Batch) error
+}
+
+type CatalogView interface {
+    Revision() uint64
+    Segments(ns Namespace) []SegmentView
+    RefsFrom(ns Namespace, seq uint64) []BlockRef
+    TipSeq(ns Namespace) uint64
+}
+```
+
+These signatures are a starting point. Adjust names to fit the existing code,
+but keep the split: core logic must not import `pgx` or the AWS SDK.
+
+In local mode, `Catalog` wraps today's file-based behavior, so the oracle keeps
+exercising the same writer, sealer, compaction, and reader code.
+
+### 19.2 New packages
+
+```
+internal/leader/      election loop, PG lease (streaming.DistributedLocker)
+internal/pgstore/     pgx pool, migrations, fence helper, schema checks
+internal/objstore/    ObjectStore interface, S3 impl, in-memory fake, fault injection
+internal/metastore/   Store interface, pebble and pg impls, in-memory fake
+internal/catalog/     Catalog interface, local impl, pg impl, follower, mirror
+internal/storagefake/ deterministic fakes of PG catalog semantics for tests
+```
+
+`cmd/jetstream` gains `storage init` and `storage new-identity`.
+
+## 20. Testing
+
+Testing is the most important part of this project. The work is not done
+until every layer below exists and passes.
+
+### Layer 1: interfaces
+
+Every seam in §19.1 has an interface and an in-memory fake. Core code is tested
+against the fakes, so tests stay fast (under 1s per package).
+
+### Layer 2: local oracle
+
+The existing oracle runs against local mode through the new interfaces. The
+mutation campaign must not regress. This proves the refactor preserved local
+behavior.
+
+### Layer 3: deterministic disaggregated oracle
+
+A second oracle configuration runs the full lifecycle against deterministic
+fakes of PostgreSQL catalog semantics (`internal/storagefake`) and the in-memory
+object store. The fakes:
+
+- implement the fence, revisions, `seq/next` checks, reference checks, and
+  object states exactly;
+- run in one process with a seeded scheduler, so runs replay exactly;
+- inject: leader kill at every crashpoint seam (before upload, after upload
+  before commit, commit applied but reported failed, after commit before acks),
+  lease loss, a stale leader writing after its successor, S3 PUT failure, S3
+  returning wrong bytes, a lost `NOTIFY`, and a slow follower;
+- check the catalog invariants (§9.3) after every transaction;
+- run two or more reader pods whose delivered streams the oracle compares to the
+  model: no missing event, no seq reuse, per-DID order kept.
+
+New mutants go into `testing/mutation/mutants/` for disaggregated-specific bugs.
+At minimum:
+
+- skip the fence;
+- fold deletes one batch too few;
+- relay cursor advances per block instead of per batch;
+- GC skips the re-check;
+- the follower drops a hot batch;
+- seal reorders active blocks;
+- sparse compaction miscounts `unique_did_count`.
+
+Each must be killed.
+
+### Layer 4: contract suites
+
+One test suite per interface, run against every implementation:
+
+- fakes and local (always, in `just test`);
+- real PostgreSQL plus SeaweedFS, and real PostgreSQL plus MinIO, through a new
+  `just test-storage` recipe that starts them in containers.
+
+Each suite includes fault injection (connection kill mid-transaction,
+`COMMIT`-result loss, S3 5xx and timeouts) and concurrency tests (two lockers
+racing; a stale holder after expiry).
+
+Also required:
+
+- the sparse-vs-full compaction equivalence test (§12.3), as a property test;
+- a fuzz target for decoding hot-batch rows and footer objects fetched from
+  storage;
+- the split-upstream-commit relay cursor test (§10.4).
+
+### Layer 5: soak
+
+A long-running deployment (real PostgreSQL, real SeaweedFS, three pods, the
+simulator or a real relay) runs for at least 24h with random leader kills,
+PostgreSQL failovers, and S3 outages. At the end:
+
+- run an end-state oracle check: every event the source emitted is in the
+  archive exactly once, and `getSegment` output verifies with
+  `segment.VerifySealedMetadata`;
+- compare what websocket clients connected to different pods received;
+- report the measurements from §22.
+
+## 21. Timestamp import removed
+
+Timestamp import (`docs/README.md` §8, `internal/timestamp`, `internal/importer`,
+the orchestrator import pass, `JETSTREAM_TIMESTAMP_IMPORT_*`, and
+`TimestampStamper`) is deleted in both modes. That happens in a separate change,
+before this work starts. The `indexed_at` block column stays, and it is always
+`0` (meaning "use `witnessed_at`") until a new import design exists.
+
+## 22. Measurements
+
+Measure these before finishing the stage they belong to. Record the results in
+this document.
+
+| What | Why | Stage |
+|---|---|---|
+| PostgreSQL p50/p99 commit latency at 3,000 events/s with repo upserts, on RDS and self-hosted | latency budget; fenced-transaction throughput | 2 |
+| Live event latency, end to end, idle and during bulk recovery | 20–40ms target | 2 |
+| Fenced transactions/s during bootstrap (block commits plus metadata writes) | fence serializes all leader writes | 3 |
+| Seal duration | fold backlog during seal | 2 |
+| Fraction of blocks fetched per compaction pass | selective compaction benefit | 4 |
+| Pod start: footer load time and manifest memory at pop1 size | readiness time; memory budget | 2 |
+| Tombstone rebuild time on session start | failover time | 4 |
+| Retry-scan cost against `metadata_kv` | 9GB-per-pass estimate | 3 |
+| PostgreSQL WAL volume per day | sizing | 2 |
+| `next_seq - readable_log_durable_seq` in local mode (pop1 shows 7) | looks wrong; explain before relying on the readable log | 1 |
+
+## 23. Metrics
+
+All metrics use the existing `obs` package. Names:
+
+- `jetstream_leader_is_leader` (gauge), `jetstream_leader_epoch` (gauge),
+  `jetstream_leader_sessions_total{result}`, `jetstream_leader_fence_failures_total`
+- `jetstream_pg_txn_duration_seconds{kind}` (hot_batch, block, fold, seal,
+  compaction, gc, metadata), `jetstream_pg_txn_errors_total{kind}`
+- `jetstream_hot_batches_total{class, storage=inline|pointer}`,
+  `jetstream_hot_batch_events` (histogram),
+  `jetstream_hot_unfolded_events` (gauge), `jetstream_hot_pending_bytes{class}`
+- `jetstream_admission_wait_seconds{class}`,
+  `jetstream_hot_inline_tokens` (gauge)
+- `jetstream_s3_requests_total{op, result}`,
+  `jetstream_s3_request_duration_seconds{op}`,
+  `jetstream_s3_bytes_total{op}`, `jetstream_s3_verify_failures_total`
+- `jetstream_objects{state}` (gauge, refreshed by GC),
+  `jetstream_gc_deleted_total`, `jetstream_gc_run_duration_seconds`
+- `jetstream_catalog_revision` (gauge), `jetstream_catalog_lag_seconds`
+  (gauge: now minus the last successful refresh),
+  `jetstream_catalog_refresh_duration_seconds`,
+  `jetstream_catalog_notify_received_total`
+- `jetstream_event_visibility_latency_seconds`: follower append time minus
+  `witnessed_at`, per pod
+- `jetstream_storage_corruption_total{source}`
+- `jetstream_memory_budget_bytes{budget}` and
+  `jetstream_memory_used_bytes{budget}`
+
+Add OTEL spans around every PostgreSQL transaction and S3 call, with the
+revision and object ID as attributes.
+
+## 24. Security
+
+- PostgreSQL and S3 credentials come from the environment or the AWS SDK chain.
+  They are never logged, never put in `.env`, and never shown on `/status`.
+- Use TLS for PostgreSQL (`sslmode=verify-full` recommended) and HTTPS for S3
+  unless the operator sets a plain `http://` endpoint for an on-prem store.
+- Object keys are random UUIDs and never contain user data.
+- Reader pods need only `SELECT` on the schema, plus `LISTEN`. Document an
+  optional read-only role. The leader needs full DML on the schema.
+- Bytes read from S3 are treated as untrusted input until their hash verifies.
+
+## 25. Dependencies
+
+Add to the AGENTS.md whitelist:
+
+- `github.com/jackc/pgx/v5`
+- `github.com/aws/aws-sdk-go-v2` (core, `config`, `credentials`,
+  `service/s3`)
+
+No other new dependencies. Container test tooling for `just test-storage` uses
+the host's container runtime from the justfile, not a Go library.
+
+## 26. Delivery stages
+
+Each stage ends with `just` green, the listed extra checks, and the listed
+measurements recorded.
+
+1. **Interfaces.** Add `metastore.Store`, `Catalog`, `HotLog`, and `ObjectStore`.
+   Move all local-mode code onto them with no behavior change. Remove the
+   write-ahead seq lease dependency from the interfaces (local mode keeps it
+   internally). Exit: local oracle and mutation campaign unchanged;
+   `just test-long ./internal/oracle` and `just oracle-sweep` pass.
+2. **Steady state on fakes and real storage.** PG schema, lease, fence, hot
+   mode, admission, fold, seal, follower, mirror, all read endpoints. Bootstrap
+   is skipped in tests by starting from a seeded catalog. Exit: layer 3 oracle
+   for steady state with failover; layer 4 suites pass on SeaweedFS and MinIO;
+   stage-2 measurements recorded.
+3. **Bootstrap and merge.** Direct mode, both namespaces, merge, pending retry
+   pass, `storage init`. Exit: the layer 3 oracle covers the full lifecycle with
+   kills in every phase.
+4. **Compaction and GC.** Sparse rewrite, generation publish, GC. Exit:
+   equivalence property test, compaction mutants killed, stage-4 measurements
+   recorded.
+5. **Soak and operations.** `storage new-identity`, memory budget checks,
+   dashboards, soak run. Exit: 24h soak passes the end-state oracle check.
+
+Only after stage 5: deploy the new pop instance in disaggregated mode.
