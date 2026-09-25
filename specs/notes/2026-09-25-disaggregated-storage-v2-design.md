@@ -1150,6 +1150,17 @@ on any hole a durable gap record does not explain: a hole before the next ref,
 or a view that ends below the floor. (This replaced the local reader's
 rotation-seam retry, which the coherent snapshot made unnecessary.)
 
+The follower owns the readable log (`ingest.NewFollowerLog`). It starts at the
+mirror's tip + 1 when the pod first reaches `steady_state`, and the follower
+appends every newly committed seq exactly once, in order: hot batches as they
+appear, and seqs folded or sealed between two ticks through `RefsFrom` first.
+Before `steady_state` there is no readable log, and cold reads answer
+unavailable. The cold reader takes its floor from the follower (`LogFloor`)
+instead of from a writer. Its block keys are the object SHA-256 for sealed
+blocks and `first_seq` plus SHA-256 for inline frames; active blocks and
+pointer hot batches are not cached. The log requires strictly contiguous
+seqs, which S4 revisits when compaction can remove seqs.
+
 ### 11.5 Cursor resolution
 
 Cursor rules do not change (`docs/README.md` §2, §5). v1 time cursors resolve
@@ -1182,12 +1193,17 @@ object that a response could still be reading. Startup therefore checks:
 JETSTREAM_GC_DELAY > JETSTREAM_MAX_VIEW_AGE + JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION + 10m
 ```
 
-and refuses to start if it does not hold. Default `JETSTREAM_GC_DELAY` is 6h.
+and refuses to start if it does not hold (`xrpcapi.CheckGCDelay`). Default
+`JETSTREAM_GC_DELAY` is 6h. The cutoff is both a context timeout and the
+connection's write deadline, so a stalled client cannot hold a response open
+past it.
 
 ### 11.8 Archive endpoints
 
-- **planSnapshot**: unchanged. It runs over the manifest. `sealedTipSeq` comes
-  from the mirror.
+- **planSnapshot**: unchanged. It runs over the manifest. The follower feeds
+  the manifest every sealed `main` segment, and the request runs a
+  synchronous tick first when needed (§11.6), so `sealedTipSeq` matches the
+  mirror.
 - **getSegment**: serves the virtual file: the 256-byte header from
   `segment_generations.header`, then for each block an 8-byte little-endian
   length followed by the block object, then the footer object.
@@ -1206,9 +1222,11 @@ and refuses to start if it does not hold. Default `JETSTREAM_GC_DELAY` is 6h.
 the "pending events" hook (`internal/jetstreamd/pending.go`) returns nothing in
 disaggregated mode: everything committed is already readable.
 
-The status page must not scan all repo rows. `countKeysWithPrefix` and
-`CountStatuses` switch to the maintained `backfill/counts` aggregate, or to
-`pg_class.reltuples` estimates where no aggregate exists.
+The status page must not scan all repo rows. It takes the existing manifest
+fast path, which reads the maintained `backfill/counts` aggregate. The
+per-prefix keyspace counts are left out in disaggregated mode:
+`pg_class.reltuples` estimates a whole table, not a key prefix. The active
+segment shown on `/status` includes the hot batches.
 
 ## 12. Compaction
 
@@ -1886,7 +1904,9 @@ All metrics use the existing `obs` package. Names:
 - `jetstream_catalog_revision` (gauge), `jetstream_catalog_lag_seconds`
   (gauge: now minus the last successful refresh),
   `jetstream_catalog_refresh_duration_seconds`,
-  `jetstream_catalog_notify_received_total`
+  `jetstream_catalog_refresh_errors_total`,
+  `jetstream_catalog_notify_received_total`,
+  `jetstream_catalog_listen_errors_total`
 - `jetstream_event_visibility_latency_seconds`: follower append time minus
   `witnessed_at`, per pod
 - `jetstream_storage_corruption_total{source}`

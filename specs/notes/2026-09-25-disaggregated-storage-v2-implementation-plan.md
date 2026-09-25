@@ -829,7 +829,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
 
 ### Read path
 
-- [ ] **S2.13 Follower and mirror** (L). Deps: S2.6, S2.7.
+- [x] **S2.13 Follower and mirror** (L). Deps: S2.6, S2.7.
   - One follower per pod. It wakes on NOTIFY, a 250ms timer, the in-process
     doorbell, or a synchronous refresh request.
   - Each tick is one `REPEATABLE READ READ ONLY` transaction running the §11.1
@@ -849,7 +849,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
     - a fold between ticks does not skip or duplicate seqs;
     - a slow follower drops the pod out of readiness after `MAX_VIEW_AGE`;
     - property: the readable log equals the committed stream.
-- [ ] **S2.14 Read endpoints in disaggregated mode** (L). Deps: S2.13, S1.10,
+- [x] **S2.14 Read endpoints in disaggregated mode** (L). Deps: S2.13, S1.10,
   S2.5.
   - Cold reader: a disaggregated `BlockRef` fetcher (object cache, then
     `objstore.Store`; inline frames from the mirror). The block cache is keyed
@@ -1224,6 +1224,72 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S2.14 (2026-09-25): read endpoints in disaggregated mode.**
+  - `xrpcapi.ObjectOpener` serves `getSegment` as a virtual file over one
+    generation pinned from the mirror (`catalog.GenerationParts`): the header
+    row, then an 8-byte LE length and the block object per block, then the
+    footer object. Ranges become `GetRange` calls with a read-ahead that grows
+    from 256KiB to 8MiB. HEAD reads no objects. `getBlock` serves the block
+    object directly, with the same `checksum:blockIndex` ETag.
+  - `MaxResponseDuration` sets a context timeout and the connection's write
+    deadline (which needed `obs.statusRecorder.Unwrap`).
+    `xrpcapi.CheckGCDelay` is the §11.7 inequality; S2.16 calls it at
+    startup.
+  - planSnapshot and seq cursors above the mirror run one synchronous tick
+    (`Sync`). `sealedTipSeq` still comes from the manifest, which the
+    follower feeds, so it matches the mirror after the tick.
+  - The cold reader takes a `Floor` func instead of a writer and a
+    `BlockKeyer`: sealed blocks by object SHA-256, inline frames by first seq
+    plus SHA-256, and no caching of active or pointer blocks. `Read` checks
+    readiness before the floor.
+  - Status takes the existing manifest fast path (`backfill/counts`). The
+    per-prefix keyspace counts are left out rather than estimated from
+    `reltuples`, which cannot count a prefix. The active segment on `/status`
+    includes hot batches. `pendingEventsForDID(nil)` returns nothing.
+  - Tests: the real Go client downloads and verifies the sealed archive from
+    a follower on storagefake + memblob, whole and DID-filtered (which hits
+    getBlock); ranges across every part boundary over 6 seeds; ETag,
+    Last-Modified, and HEAD parity with zero object reads; a generation swap
+    mid-download makes the client restart and return the new file intact; a
+    subscribe that goes cold replay, then a cursor the pod has not seen
+    (forcing a tick), then live tail.
+  - For S2.16: xrpcapi takes `Opener: ObjectOpener{f, f.Objects()}`,
+    `Sync`, `Ready`, `CompactionDeadline` from the follower `f`; the cold
+    reader and subscription take `Catalog`/`Fetcher`/`Seqs`/`Ready`/`Floor`/
+    `Keyer` from it; the tail takes `nextSeq: f.NextSeq` and
+    `SetReadLogSource(f.Log)`, called again when the follower first
+    publishes its log; status takes `Archive: f`; repoexport `Source: f`.
+  - Open: footers are parsed twice (the tick, and `SealedMetadata`).
+    Requests naming huge segment indexes can force ticks, but concurrent
+    ticks coalesce.
+- **S2.13 (2026-09-25): follower and mirror.**
+  - New package `internal/catalog/follower`. One `Follower` per pod wakes on
+    NOTIFY, the 250ms poll, `Doorbell`, or a synchronous `Refresh`. A tick
+    is one read transaction over the changed rows, then bounded-concurrency
+    footer fetches and verification, then a new immutable mirror swapped in
+    atomically. Sealed `main` segments feed a remote manifest
+    (`manifest.NewRemote`).
+  - The follower owns the readable log (`ingest.NewFollowerLog`), which
+    rejects out-of-order appends. Seqs folded or sealed between two ticks are
+    read through `RefsFrom` before any later hot batch, so the log gets every
+    seq exactly once. The log exists only from `steady_state`; before that,
+    cold reads answer unavailable. It requires strictly contiguous seqs,
+    which S4 must revisit once compaction removes seqs.
+  - A foreign `archive_id` is fatal. Metrics are the §23 catalog set plus
+    `jetstream_catalog_refresh_errors_total` and
+    `jetstream_catalog_listen_errors_total`.
+  - `catalog.Encode/DecodeCompactionDeadline` and `lifecycle.ParsePhase`
+    landed here for the mirror's metadata.
+  - Tests on storagefake: a fold between ticks; a 12-seed property test that
+    the log equals the committed stream; a lost NOTIFY covered by the poll; a
+    slow follower losing readiness; bootstrap then steady state; stale
+    fetches and cache keys; the compaction deadline.
+  - Built by a parallel agent against the S2.5 tree and cherry-picked onto
+    S2.11; `just` passed on the combined tree. During its `just test-long`,
+    `TestOracle_ObservedSeqIsNotReusedAfterSIGKILL` timed out once (the child
+    subscriber never saw the event) and then passed twice plus 40 stress
+    runs. That test runs the local writer and live path, which S2.13/S2.14 do
+    not touch; it is not root-caused.
 - **S2.11 (2026-09-25): session start rebuild.**
   - `Maintainer.Rebuild(ctx, RebuildConfig)` runs §10.9 steps 2 to 6 and
     returns an `*ingest.OpenBlock`, which the hot writer takes as
