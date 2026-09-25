@@ -662,7 +662,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
     - an in-process TCP fault proxy (no deps) that can kill a connection
       mid-transaction, and drop the response to `COMMIT` after forwarding it
       ("commit applied, result unknown").
-- [ ] **S2.3 `internal/leader`: PG lease and contract suite** (M). Deps: S2.2,
+- [x] **S2.3 `internal/leader`: PG lease and contract suite** (M). Deps: S2.2,
   S1.12.
   - A PG lock implementing `DistributedLocker` + `Epoch()` with the §6.2 SQL.
     `holder_id` is a random UUID per process.
@@ -1223,6 +1223,30 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.3 (2026-09-25): locker contract suite and leader metrics.**
+  - The PG lease shipped in S2.2 as `pgstore.Lease` (import cycle, see the
+    S2.2 entry). S2.3 adds `internal/leader/lockertest`: a `Backend` gives a
+    `NewLocker` factory (one holder ID per call, as separate processes),
+    an `Advance` clock hook, a lease duration, and an optional `Fence`
+    (`lockertest.CatalogFence(db)` runs `Begin` + `FenceBump` + commit).
+  - Nine tests: lifecycle; acquire while held (and not reentrant); renew
+    extends; renew after expiry; renew after takeover; release when not
+    holder (never acquired, another's lease, stale holder after takeover,
+    not idempotent, frees without waiting for expiry); epoch strictly
+    increases across holders, by release and by expiry; 8 lockers racing →
+    exactly one wins; and the old epoch's fence fails once a new holder
+    acquires, but not on expiry alone (§6.3: the fence, not lease timing,
+    keeps a paused leader out).
+  - `leader.Local` runs the lifecycle subset (`Exclusive: false` skips the
+    rest). storagefake runs everything on a fake clock in `just`. PG runs
+    everything with a 500ms lease and real sleeps (about 1.3s, parallel);
+    margins are a fifth of the lease.
+  - Metrics: `jetstream_leader_sessions_total{result}` now counts *ended*
+    sessions by result (fatal, lease_lost, shutdown, restart), replacing
+    `session_ends_total{reason}`, so the name matches §23. Starts moved to
+    `jetstream_leader_session_starts_total`. `is_leader`, `epoch`, and
+    `fence_failures_total` were already there.
 
 - **S2.2 (2026-09-25): pgstore.**
   - `migrations/0001_init.sql` is §8 byte for byte, behind a two-line comment

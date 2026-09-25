@@ -1729,7 +1729,9 @@ What this means for the design:
 All metrics use the existing `obs` package. Names:
 
 - `jetstream_leader_is_leader` (gauge), `jetstream_leader_epoch` (gauge),
-  `jetstream_leader_sessions_total{result}`, `jetstream_leader_fence_failures_total`
+  `jetstream_leader_sessions_total{result}` (ended sessions; result is fatal,
+  lease_lost, shutdown, or restart), `jetstream_leader_session_starts_total`,
+  `jetstream_leader_fence_failures_total`
 - `jetstream_pg_txn_duration_seconds{kind}` (hot_batch, block, fold, seal,
   compaction, gc, metadata), `jetstream_pg_txn_errors_total{kind}`
 - `jetstream_hot_batches_total{class, storage=inline|pointer}`,

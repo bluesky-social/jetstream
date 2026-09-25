@@ -19,8 +19,8 @@ const (
 type Metrics struct {
 	IsLeader       prometheus.Gauge
 	Epoch          prometheus.Gauge
-	SessionsTotal  prometheus.Counter
-	SessionEnds    *prometheus.CounterVec
+	SessionStarts  prometheus.Counter
+	SessionsTotal  *prometheus.CounterVec
 	LeaseLostTotal prometheus.Counter
 	AcquireErrors  prometheus.Counter
 	RenewErrors    prometheus.Counter
@@ -47,12 +47,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "epoch",
 			Help: "Writer epoch of this process's most recent session.",
 		}),
-		SessionsTotal: counter("sessions_total", "Writer sessions started."),
-		SessionEnds: prometheus.NewCounterVec(prometheus.CounterOpts{
+		SessionStarts: counter("session_starts_total", "Writer sessions started."),
+		SessionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
-			Name: "session_ends_total",
-			Help: "Writer sessions ended, by reason (fatal, lease_lost, shutdown, restart).",
-		}, []string{"reason"}),
+			Name: "sessions_total",
+			Help: "Writer sessions ended, by result (fatal, lease_lost, shutdown, restart).",
+		}, []string{"result"}),
 		LeaseLostTotal: counter("lease_lost_total", "Sessions cancelled because the lease was lost."),
 		AcquireErrors:  counter("acquire_errors_total", "Acquire attempts that failed for a reason other than the lock being held."),
 		RenewErrors:    counter("renew_errors_total", "Renew attempts that failed for a reason other than losing the lock."),
@@ -60,9 +60,9 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		FenceFailures:  counter("fence_failures_total", "Leader write transactions rejected by the epoch fence."),
 	}
 	for _, r := range []string{reasonFatal, reasonLeaseLost, reasonShutdown, reasonRestart} {
-		m.SessionEnds.WithLabelValues(r)
+		m.SessionsTotal.WithLabelValues(r)
 	}
-	reg.MustRegister(m.IsLeader, m.Epoch, m.SessionsTotal, m.SessionEnds,
+	reg.MustRegister(m.IsLeader, m.Epoch, m.SessionStarts, m.SessionsTotal,
 		m.LeaseLostTotal, m.AcquireErrors, m.RenewErrors, m.ReleaseErrors, m.FenceFailures)
 	return m
 }
@@ -71,7 +71,7 @@ func (m *Metrics) sessionStarted(epoch uint64) {
 	if m == nil {
 		return
 	}
-	m.SessionsTotal.Inc()
+	m.SessionStarts.Inc()
 	m.Epoch.Set(float64(epoch))
 	m.IsLeader.Set(1)
 }
@@ -81,7 +81,7 @@ func (m *Metrics) sessionEnded(reason string) {
 		return
 	}
 	m.IsLeader.Set(0)
-	m.SessionEnds.WithLabelValues(reason).Inc()
+	m.SessionsTotal.WithLabelValues(reason).Inc()
 }
 
 func (m *Metrics) leaseLost() {

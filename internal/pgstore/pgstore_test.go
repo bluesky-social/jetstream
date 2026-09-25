@@ -10,6 +10,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/catalog/catalogtest"
 	"github.com/bluesky-social/jetstream/internal/leader"
+	"github.com/bluesky-social/jetstream/internal/leader/lockertest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/pgstore"
 	"github.com/bluesky-social/jetstream/internal/pgstore/pgtest"
@@ -104,6 +105,23 @@ func TestContract(t *testing.T) {
 			DB:        s,
 			NewLocker: func() leader.Locker { return s.NewLease() },
 			Listener:  s,
+		}
+	})
+}
+
+// The lease runs on PostgreSQL's clock, so the suite sleeps. The lease is
+// long enough that a slow statement cannot eat the margins (a fifth of it).
+func TestLockerContract(t *testing.T) {
+	t.Parallel()
+	pgtest.URL(t)
+	lockertest.Run(t, func(t *testing.T) lockertest.Backend {
+		s, _ := pgtest.Open(t, nil)
+		return lockertest.Backend{
+			NewLocker: func() leader.Locker { return s.NewLease() },
+			Exclusive: true,
+			Advance:   time.Sleep,
+			Lease:     500 * time.Millisecond,
+			Fence:     lockertest.CatalogFence(s),
 		}
 	})
 }

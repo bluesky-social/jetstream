@@ -186,8 +186,8 @@ func TestRun_RenewFailureCancelsAfterLease(t *testing.T) {
 		require.Equal(t, []uint64{1, 2}, lk.releasedEpochs())
 		require.InDelta(t, 1, testutil.ToFloat64(m.LeaseLostTotal), 0)
 		require.InDelta(t, 3, testutil.ToFloat64(m.RenewErrors), 0)
-		require.InDelta(t, 1, testutil.ToFloat64(m.SessionEnds.WithLabelValues(reasonLeaseLost)), 0)
-		require.InDelta(t, 1, testutil.ToFloat64(m.SessionEnds.WithLabelValues(reasonShutdown)), 0)
+		require.InDelta(t, 1, testutil.ToFloat64(m.SessionsTotal.WithLabelValues(reasonLeaseLost)), 0)
+		require.InDelta(t, 1, testutil.ToFloat64(m.SessionsTotal.WithLabelValues(reasonShutdown)), 0)
 		require.InDelta(t, 0, testutil.ToFloat64(m.IsLeader), 0)
 	})
 }
@@ -273,7 +273,7 @@ func TestRun_FatalErrorExits(t *testing.T) {
 		require.ErrorIs(t, err, segment.ErrCorruptSegment)
 		require.Len(t, rec.endsCopy(), 1)
 		require.Equal(t, []uint64{1}, lk.releasedEpochs(), "a fatal session still releases the lock")
-		require.InDelta(t, 1, testutil.ToFloat64(m.SessionEnds.WithLabelValues(reasonFatal)), 0)
+		require.InDelta(t, 1, testutil.ToFloat64(m.SessionsTotal.WithLabelValues(reasonFatal)), 0)
 	})
 }
 

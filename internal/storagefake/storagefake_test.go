@@ -13,6 +13,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/catalog/catalogtest"
 	"github.com/bluesky-social/jetstream/internal/leader"
+	"github.com/bluesky-social/jetstream/internal/leader/lockertest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/metastore/storetest"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
@@ -28,6 +29,21 @@ func TestContract(t *testing.T) {
 			DB:        db,
 			NewLocker: func() leader.Locker { return db.NewLease() },
 			Listener:  db,
+		}
+	})
+}
+
+func TestLockerContract(t *testing.T) {
+	t.Parallel()
+	lockertest.Run(t, func(t *testing.T) lockertest.Backend {
+		clk := &clock{now: time.Unix(1_000_000, 0)}
+		db := storagefake.New(storagefake.Config{Now: clk.Now})
+		return lockertest.Backend{
+			NewLocker: func() leader.Locker { return db.NewLease() },
+			Exclusive: true,
+			Advance:   clk.Advance,
+			Lease:     10 * time.Second,
+			Fence:     lockertest.CatalogFence(db),
 		}
 	})
 }
