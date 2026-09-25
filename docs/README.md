@@ -229,9 +229,9 @@ Jetstream Sealed Segment File (.jss):
 └──────────────────────────────────────────────────────────┘
 ```
 
-An active segment has the same layout minus the footer, with the fixed header left as 256 zero bytes until seal.
+An active segment has the same layout minus the footer. Its fixed header holds only the magic, followed by zero bytes until seal; a zero checksum field is what marks a file as active.
 
-The xxhash3 is the hash of all fields after the hash (`version` through the end of the collection block index). The magic number and checksum itself are not included in the checksum.
+The xxhash3 covers header bytes `[12, 256)` (`version` through the reserved padding) followed by the entire footer (block index through the end of the collection block index). It does not cover the block region: each block's ZSTD frame carries its own content checksum. The magic number and the checksum field itself are not included.
 
 ### 3.1.3 DID Filtering
 

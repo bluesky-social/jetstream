@@ -3,7 +3,6 @@ package ingest
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 
@@ -165,7 +164,7 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 		}
 
 		path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))
-		info, statErr := os.Stat(path)
+		info, statErr := statFS(w.cfg.FS, path)
 		if statErr != nil {
 			return fmt.Errorf("ingest: stat active segment: %w", statErr)
 		}
