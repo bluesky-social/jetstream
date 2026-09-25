@@ -36,6 +36,12 @@ var SnapshotMetaKeys = []string{MainSeqKey, BootstrapLiveSeqKey, RelayCursorKey}
 // LoadSnapshot reads the whole catalog through rtx. It loads frames of no
 // hot batch.
 func LoadSnapshot(ctx context.Context, rtx ReadTx) (*Snapshot, error) {
+	return LoadSnapshotFrames(ctx, rtx, ^uint64(0))
+}
+
+// LoadSnapshotFrames is LoadSnapshot, loading the inline frames of the hot
+// batches whose first seq is at least framesFrom.
+func LoadSnapshotFrames(ctx context.Context, rtx ReadTx, framesFrom uint64) (*Snapshot, error) {
 	s := &Snapshot{Generations: map[uint64]GenerationRow{}, GenerationBlocks: map[uint64][]GenerationBlockRow{}}
 	var err error
 	if s.Archive, err = rtx.Archive(ctx); err != nil {
@@ -67,7 +73,7 @@ func LoadSnapshot(ctx context.Context, rtx ReadTx) (*Snapshot, error) {
 	if s.ActiveBlocks, err = rtx.ActiveBlocksSince(ctx, 0); err != nil {
 		return nil, err
 	}
-	if s.HotBatches, err = rtx.HotBatches(ctx, ^uint64(0)); err != nil {
+	if s.HotBatches, err = rtx.HotBatches(ctx, framesFrom); err != nil {
 		return nil, err
 	}
 	objs, err := rtx.Objects(ctx, s.referencedObjects())
@@ -119,8 +125,9 @@ type InvariantOptions struct {
 	MaxEventsPerBlock int
 	// RelayCursor checks invariant 7 against the stored relay/cursor value
 	// (nil when absent). The catalog cannot know which upstream seqs are
-	// fully committed; storagefake's oracle view can. Nil skips it.
-	RelayCursor func(value []byte) error
+	// fully committed, because the segment format does not keep an event's
+	// upstream seq; a test model can (storagefake.RelayWatch). Nil skips it.
+	RelayCursor func(s *Snapshot, value []byte) error
 	// Cheap skips the checks that decode every generation header, for the
 	// leader's session-start check on a large archive.
 	Cheap bool
@@ -141,7 +148,7 @@ func CheckInvariants(s *Snapshot, opts InvariantOptions) error {
 		}
 	}
 	if opts.RelayCursor != nil {
-		if err := opts.RelayCursor(s.Meta[RelayCursorKey]); err != nil {
+		if err := opts.RelayCursor(s, s.Meta[RelayCursorKey]); err != nil {
 			return Corruptf(SourceInvariant, "invariant 7: %v", err)
 		}
 	}

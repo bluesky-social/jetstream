@@ -606,6 +606,16 @@ reads as 1. A present seq key that is not 8 bytes is corruption. In `-short`
 mode or at session start on a large archive, the cheap subset skips decoding
 generation headers.
 
+Invariant 7 is not checkable from the catalog alone: the segment format does
+not keep an event's upstream seq, and the live cursor encoding belongs to the
+live package. `CheckInvariants` calls a caller-supplied
+`InvariantOptions.RelayCursor(snapshot, value)`. Production passes nil (at
+session start a malformed cursor still fails loudly when the consumer loads it
+at `Run`). Tests install `storagefake.RelayWatch` (S2.12): the test's model says
+which rows each upstream seq produces, and the watch finds them by content in
+the committed hot batches, checking after every commit. It covers main's hot
+batches only, which is where a hot-mode live consumer writes.
+
 ## 10. Write path
 
 ### 10.1 Writer modes
@@ -730,6 +740,18 @@ rows all have seqs `< nextSeq`. The live consumer's existing safe-cursor logic
 block. It must be driven per batch now. A test must cover a single upstream
 commit split across two batches, with the leader killed between the two
 commits.
+
+The hot writer samples `DurableBatchPrepareValue` when each batch freezes,
+under the writer lock (S2.8), and atmos advances its cursor only after the
+consumer's `yield` for an event returns. So a batch frozen partway through an
+upstream commit carries a cursor from before that commit, however late the
+batch commits, and the consumer only has to pass `live.Config.Hot` through
+(S2.12). Delivery stays at least once, as in local mode: when the leader dies
+between two batches of one upstream commit, the rows already committed are
+archived again when the next session re-requests that commit. Nothing is lost,
+no seq is reused, and the duplicates are exactly that committed prefix.
+`live/hot_cursor_test.go` pins this for both a failed and an unknown-result
+commit.
 
 **Metadata batch size.** At 3,000 events/s, a batch carries up to about 256
 `repo/<did>` upserts. They are applied as one multi-row upsert (§12.3), not one

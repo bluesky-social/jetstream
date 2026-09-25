@@ -817,7 +817,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
   - Start the live consumer at `relay/cursor`.
   - Tests: hot batch rows left by sessions with different block boundaries
     rebuild correctly (property test over random prior-session shapes).
-- [ ] **S2.12 Live consumer: per-batch relay cursor** (M). Deps: S2.8.
+- [x] **S2.12 Live consumer: per-batch relay cursor** (M). Deps: S2.8.
   - Drive the safe-cursor watermark (`prepareValue`) per batch instead of per
     block (`live/consumer.go:322,342-380`).
   - The required test (§10.4, §20): a single upstream commit split across two
@@ -1223,6 +1223,35 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.12 (2026-09-25): live consumer per-batch relay cursor.**
+  - No sampling change was needed. The hot writer already samples
+    `DurableBatchPrepareValue` per batch at freeze time (S2.8), and atmos
+    advances `Client.Cursor()` only after the consumer's `yield` for an event
+    returns. A batch frozen partway through an upstream commit therefore
+    carries a cursor from before it. `live.Config.Hot` passes `HotConfig`
+    through to `ingest.Open`; in hot mode `SegmentsDir` is unused and `Store`
+    only supplies the committed cursor at `Run`.
+  - Deviation from this plan's "no row is lost or duplicated": delivery stays
+    at least once (`specs/invariants.md`), as in local mode. When the session
+    ends between two batches of one upstream commit, the rows already committed
+    are archived again on replay. `live/hot_cursor_test.go` asserts no loss, no
+    seq reuse, and duplicates equal to exactly that committed prefix. It runs
+    for `FaultCommitFails` and `FaultCommitLost`, holding session 1's commits
+    until the consumer has finished the split commit, so late commits still
+    carry the early cursor. Session 2 runs `maintainer.Rebuild` and resumes.
+    Temporarily sampling the cursor at commit time instead fails the test at
+    the first commit.
+  - Invariant 7: `InvariantOptions.RelayCursor` and
+    `RebuildConfig.RelayCursor` now take `(snapshot, value)`. Production passes
+    nil; `LoadUpstreamCursor` still fails loudly on a malformed cursor at `Run`.
+    `storagefake.RelayWatch` is the test model. `Expect(upstream, rows...)`
+    names each upstream seq's rows. After every commit it decodes new hot
+    batches (inline, or via a `FrameGetter` for pointers) and matches rows by
+    content, because the segment format does not keep the upstream seq. It
+    covers main's hot batches only. `catalog.LoadSnapshotFrames` loads frames
+    only from the first hot batch the watch has not yet decoded, so the
+    per-commit check stays incremental.
 
 - **S2.14 (2026-09-25): read endpoints in disaggregated mode.**
   - `xrpcapi.ObjectOpener` serves `getSegment` as a virtual file over one

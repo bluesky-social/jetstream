@@ -171,6 +171,13 @@ type Config struct {
 	Catalog   ingest.SegmentCatalog
 	Namespace catalog.Namespace
 
+	// Hot, when set, runs the inner writer in hot mode (design §10.1): each
+	// hot batch commits in the leader session with the relay cursor sampled
+	// when that batch froze, so the cursor never covers rows in a later
+	// batch (§10.4). SegmentsDir is unused and SeqKey must be "seq/next";
+	// Store only reads the committed cursor at Run.
+	Hot *ingest.HotConfig
+
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time
 
@@ -187,7 +194,7 @@ type Config struct {
 }
 
 func (c *Config) validate() error {
-	if c.SegmentsDir == "" {
+	if c.SegmentsDir == "" && c.Hot == nil {
 		return fmt.Errorf("%w: SegmentsDir is required", ErrInvalidConfig)
 	}
 	if c.Store == nil {

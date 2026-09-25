@@ -21,11 +21,12 @@ type RebuildConfig struct {
 	// ingest.DefaultBlockMaxAge.
 	BlockMaxAge time.Duration
 	// RelayCursor checks design §9.3 invariant 7 at session start; see
-	// catalog.InvariantOptions. Nil skips it.
-	RelayCursor func(value []byte) error
+	// catalog.InvariantOptions. Only a test model can check it, so
+	// production passes nil.
+	RelayCursor func(s *catalog.Snapshot, value []byte) error
 }
 
-// Rebuild is session start in hot mode (design §10.9 steps 3-6). It checks
+// Rebuild is session start in hot mode (design §10.9 steps 2-6). It checks
 // the cheap catalog invariants, reads every hot batch, and regroups the
 // batches greedily into blocks without splitting one, because the sessions
 // that wrote them may have cut blocks elsewhere. Every group but the last

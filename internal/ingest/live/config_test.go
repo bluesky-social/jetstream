@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/identity"
@@ -57,6 +58,12 @@ func TestConfig_Validate(t *testing.T) {
 	t.Run("happy", func(t *testing.T) {
 		t.Parallel()
 		require.NoError(t, good.validate())
+	})
+	t.Run("hot mode has no SegmentsDir", func(t *testing.T) {
+		t.Parallel()
+		c := good
+		c.SegmentsDir, c.Hot = "", &ingest.HotConfig{}
+		require.NoError(t, c.validate())
 	})
 
 	cases := []struct {

@@ -274,7 +274,7 @@ func TestRebuild_ChecksInvariants(t *testing.T) {
 	e.restart()
 	m = e.maintainer(maintainer.Config{})
 	_, err := m.Rebuild(t.Context(), maintainer.RebuildConfig{
-		RelayCursor: func([]byte) error { return errors.New("cursor ahead of the commits") },
+		RelayCursor: func(*catalog.Snapshot, []byte) error { return errors.New("cursor ahead of the commits") },
 	})
 	var corrupt *catalog.CorruptionError
 	require.ErrorAs(t, err, &corrupt)

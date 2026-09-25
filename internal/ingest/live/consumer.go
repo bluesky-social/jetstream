@@ -141,6 +141,7 @@ func Open(cfg Config) (*Consumer, error) {
 		OnDurableBatch:           c.onDurableBatch,
 		Catalog:                  cfg.Catalog,
 		Namespace:                cfg.Namespace,
+		Hot:                      cfg.Hot,
 		SegmentMetrics:           cfg.SegmentMetrics,
 		SegmentIOFaultInjector:   cfg.SegmentIOFaultInjector,
 	})

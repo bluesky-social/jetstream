@@ -76,6 +76,8 @@ type Config struct {
 	Now func() time.Time
 	// Invariants tunes the CheckInvariants run after every commit.
 	Invariants catalog.InvariantOptions
+	// RelayWatch, when set, is Invariants.RelayCursor (invariant 7).
+	RelayWatch *RelayWatch
 	// OnViolation is called, after the commit is published, with every
 	// invariant violation. The DB also records the first one (Violation).
 	OnViolation func(rev uint64, err error)
@@ -255,9 +257,13 @@ func (db *DB) publish(next *state, notify []uint64, dropNotify bool) {
 }
 
 func (db *DB) checkInvariants(s *state) {
-	snap, err := catalog.LoadSnapshot(context.Background(), &readTx{db: db, s: s})
+	opts, framesFrom := db.cfg.Invariants, ^uint64(0)
+	if w := db.cfg.RelayWatch; w != nil {
+		opts.RelayCursor, framesFrom = w.Check, w.from()
+	}
+	snap, err := catalog.LoadSnapshotFrames(context.Background(), &readTx{db: db, s: s}, framesFrom)
 	if err == nil {
-		err = catalog.CheckInvariants(snap, db.cfg.Invariants)
+		err = catalog.CheckInvariants(snap, opts)
 	}
 	if err == nil {
 		return

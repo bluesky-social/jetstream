@@ -105,7 +105,7 @@ func TestCheckInvariants(t *testing.T) {
 	t.Run("inv7 relay cursor", func(t *testing.T) {
 		t.Parallel()
 		boom := errors.New("cursor past a partial commit")
-		err := catalog.CheckInvariants(base, catalog.InvariantOptions{RelayCursor: func([]byte) error { return boom }})
+		err := catalog.CheckInvariants(base, catalog.InvariantOptions{RelayCursor: func(*catalog.Snapshot, []byte) error { return boom }})
 		require.ErrorContains(t, err, "invariant 7")
 	})
 	t.Run("cheap skips headers", func(t *testing.T) {
