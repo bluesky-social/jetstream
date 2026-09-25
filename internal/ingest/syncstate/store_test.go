@@ -3,18 +3,33 @@ package syncstate
 import (
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/atmos"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
 )
 
-func newTestStore(t *testing.T) *store.Store {
+func newTestStore(t *testing.T, opts ...pebblestore.Option) metastore.Store {
 	t.Helper()
-	s, err := store.Open(t.TempDir(), nil)
+	s, err := pebblestore.Open(t.TempDir(), nil, append([]pebblestore.Option{pebblestore.WithFS(vfs.NewMem())}, opts...)...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+// flush commits promoted state on its own: the consumer's durable batch minus
+// the relay cursor.
+func flush(t *testing.T, s *StateStore) error {
+	t.Helper()
+	b := s.s.NewBatch()
+	s.StageFlush(b)
+	if err := b.Commit(t.Context()); err != nil {
+		return err
+	}
+	s.CommitStaged()
+	return nil
 }
 
 func parseDID(t *testing.T, s string) atmos.DID {
@@ -53,13 +68,13 @@ func TestStateStore_ChainRoundTrip(t *testing.T) {
 	require.Nil(t, absent, "staged chain state must not be durable before promotion+Flush")
 
 	// Pending entries never flush — their event's rows are not durable.
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	stillAbsent, err := fresh.LoadChain(t.Context(), did)
 	require.NoError(t, err)
 	require.Nil(t, stillAbsent, "pending (unpromoted) chain state must not flush")
 
 	s.PromoteChain(did, want.Rev)
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	durable, err := fresh.LoadChain(t.Context(), did)
 	require.NoError(t, err)
 	require.NotNil(t, durable)
@@ -76,7 +91,7 @@ func TestStateStore_PromoteChainRevGate(t *testing.T) {
 	// must not be promoted by an EARLIER event's group completion.
 	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev2", Data: fixedCID(t)}))
 	s.PromoteChain(did, "3lrev1")
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 
 	fresh := New(raw)
 	absent, err := fresh.LoadChain(t.Context(), did)
@@ -84,7 +99,7 @@ func TestStateStore_PromoteChainRevGate(t *testing.T) {
 	require.Nil(t, absent, "newer-rev pending entry must survive an older promotion")
 
 	s.PromoteChain(did, "3lrev2")
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	durable, err := fresh.LoadChain(t.Context(), did)
 	require.NoError(t, err)
 	require.NotNil(t, durable)
@@ -114,13 +129,13 @@ func TestStateStore_HostingRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, absent, "staged hosting state must not be durable before promotion+Flush")
 
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	stillAbsent, err := fresh.LoadHosting(t.Context(), did)
 	require.NoError(t, err)
 	require.Nil(t, stillAbsent, "pending (unpromoted) hosting state must not flush")
 
 	s.PromoteHosting(did, want.Seq)
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	durable, err := fresh.LoadHosting(t.Context(), did)
 	require.NoError(t, err)
 	require.NotNil(t, durable)
@@ -145,7 +160,7 @@ func TestStateStore_HostingPromotionIsSeqGated(t *testing.T) {
 	// it must not promote the newer event's pending state — that
 	// event's row has not been appended yet.
 	s.PromoteHosting(did, 10)
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	fresh := New(raw)
 	durable, err := fresh.LoadHosting(t.Context(), did)
 	require.NoError(t, err)
@@ -153,7 +168,7 @@ func TestStateStore_HostingPromotionIsSeqGated(t *testing.T) {
 
 	// The producing event's own row promotes it.
 	s.PromoteHosting(did, 11)
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	durable, err = fresh.LoadHosting(t.Context(), did)
 	require.NoError(t, err)
 	require.NotNil(t, durable)
@@ -173,18 +188,17 @@ func TestStateStore_CommitStagedKeepsLatePromotions(t *testing.T) {
 	// batch, then — before CommitStaged — a newer promotion lands
 	// (resync worker finished and the consumer appended its group).
 	b := raw.NewBatch()
-	defer func() { _ = b.Close() }()
-	require.NoError(t, s.StageFlush(b))
+	s.StageFlush(b)
 
 	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev2", Data: fixedCID(t)}))
 	s.PromoteChain(did, "3lrev2")
 
-	require.NoError(t, raw.Commit(b, store.SyncWrites))
+	require.NoError(t, b.Commit(t.Context()))
 	s.CommitStaged()
 
 	// The late promotion must NOT have been discarded by CommitStaged:
 	// the next flush persists it.
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	fresh := New(raw)
 	durable, err := fresh.LoadChain(t.Context(), did)
 	require.NoError(t, err)
@@ -269,7 +283,7 @@ func TestStateStore_IdentitySeqRatchet(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(7), got, "ratchet must not regress")
 
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	fresh := New(raw)
 	got, err = fresh.LoadAppliedIdentitySeq(t.Context(), did)
 	require.NoError(t, err)
@@ -304,7 +318,7 @@ func TestStateStore_AccountSeqRatchet(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(7), got, "ratchet must not regress")
 
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	fresh := New(raw)
 	got, err = fresh.LoadAppliedAccountSeq(t.Context(), did)
 	require.NoError(t, err)

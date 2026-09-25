@@ -18,6 +18,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/coder/websocket"
@@ -641,7 +642,7 @@ func TestServe_StartsInSteadyStatePhase(t *testing.T) {
 	{
 		s, err := store.Open(dataDir, nil)
 		require.NoError(t, err)
-		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseSteadyState, time.Now().UTC()))
+		require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(s, dataDir), lifecycle.PhaseSteadyState, time.Now().UTC()))
 		require.NoError(t, s.Close())
 	}
 
@@ -704,7 +705,7 @@ func TestServe_StartsInSteadyStatePhase(t *testing.T) {
 	s, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
-	p, err := lifecycle.ReadPhase(s)
+	p, err := lifecycle.ReadPhase(t.Context(), pebblestore.New(s, dataDir))
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseSteadyState, p)
 }
@@ -720,7 +721,7 @@ func TestServe_AdvancesFromMergingToSteadyState(t *testing.T) {
 	{
 		s, err := store.Open(dataDir, nil)
 		require.NoError(t, err)
-		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseMerging, time.Now().UTC()))
+		require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(s, dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 		require.NoError(t, s.Close())
 	}
 
@@ -779,7 +780,7 @@ func TestServe_AdvancesFromMergingToSteadyState(t *testing.T) {
 	s, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
-	p, err := lifecycle.ReadPhase(s)
+	p, err := lifecycle.ReadPhase(t.Context(), pebblestore.New(s, dataDir))
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseSteadyState, p)
 }

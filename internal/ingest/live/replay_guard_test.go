@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/streaming"
@@ -50,7 +51,7 @@ func TestProcessBatch_ReplayedAccountEventIsDroppedNotReArchived(t *testing.T) {
 	st := newTestStore(t)
 	dir := filepath.Join(t.TempDir(), "live_segments")
 	metrics := NewMetrics(prometheus.NewRegistry())
-	stateStore := syncstate.New(st)
+	stateStore := syncstate.New(pebblestore.New(st, ""))
 
 	const did = "did:plc:replayed"
 
@@ -116,7 +117,7 @@ func TestProcessBatch_ReplayedAccountEventDropsWhenHostingPromotionBlocked(t *te
 	st := newTestStore(t)
 	dir := filepath.Join(t.TempDir(), "live_segments")
 	metrics := NewMetrics(prometheus.NewRegistry())
-	stateStore := syncstate.New(st)
+	stateStore := syncstate.New(pebblestore.New(st, ""))
 
 	const did = "did:plc:blockedpromote"
 	atmosDID := atmos.DID(did)
@@ -164,7 +165,7 @@ func TestProcessBatch_AccountRatchetDurableAtBlockBoundary(t *testing.T) {
 
 	st := newTestStore(t)
 	dir := filepath.Join(t.TempDir(), "live_segments")
-	stateStore := syncstate.New(st)
+	stateStore := syncstate.New(pebblestore.New(st, ""))
 
 	const did = "did:plc:acctblockedge"
 
@@ -186,7 +187,7 @@ func TestProcessBatch_AccountRatchetDurableAtBlockBoundary(t *testing.T) {
 		accountEvent(did, 5, false),
 	}))
 
-	applied, err := syncstate.New(st).LoadAppliedAccountSeq(t.Context(), atmos.DID(did))
+	applied, err := syncstate.New(pebblestore.New(st, "")).LoadAppliedAccountSeq(t.Context(), atmos.DID(did))
 	require.NoError(t, err)
 	require.Equal(t, int64(5), applied,
 		"account ratchet must be durable once the row's block has flushed")
@@ -221,7 +222,7 @@ func TestProcessBatch_ReplayedIdentityEventIsDroppedNotReArchived(t *testing.T) 
 	st := newTestStore(t)
 	dir := filepath.Join(t.TempDir(), "live_segments")
 	metrics := NewMetrics(prometheus.NewRegistry())
-	stateStore := syncstate.New(st)
+	stateStore := syncstate.New(pebblestore.New(st, ""))
 
 	const did = "did:plc:identreplay"
 
@@ -284,7 +285,7 @@ func TestProcessBatch_IdentityRatchetDurableAtBlockBoundary(t *testing.T) {
 
 	st := newTestStore(t)
 	dir := filepath.Join(t.TempDir(), "live_segments")
-	stateStore := syncstate.New(st)
+	stateStore := syncstate.New(pebblestore.New(st, ""))
 
 	const did = "did:plc:identblockedge"
 
@@ -310,7 +311,7 @@ func TestProcessBatch_IdentityRatchetDurableAtBlockBoundary(t *testing.T) {
 
 	// Deliberately no Close: simulate the crash window. A fresh store
 	// over the same pebble db sees only what is durable.
-	applied, err := syncstate.New(st).LoadAppliedIdentitySeq(t.Context(), atmos.DID(did))
+	applied, err := syncstate.New(pebblestore.New(st, "")).LoadAppliedIdentitySeq(t.Context(), atmos.DID(did))
 	require.NoError(t, err)
 	require.Equal(t, int64(5), applied,
 		"identity ratchet must be durable once the row's block has flushed")
@@ -325,7 +326,7 @@ func TestProcessBatch_IdentityReplayGuardSurvivesRestart(t *testing.T) {
 
 	st := newTestStore(t)
 	dir := filepath.Join(t.TempDir(), "live_segments")
-	stateStore := syncstate.New(st)
+	stateStore := syncstate.New(pebblestore.New(st, ""))
 
 	const did = "did:plc:identrestart"
 

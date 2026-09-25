@@ -4,7 +4,8 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/memstore"
 	"github.com/bluesky-social/jetstream/segment"
 	atmoscbor "github.com/jcalabro/atmos/cbor"
 	atmossync "github.com/jcalabro/atmos/sync"
@@ -18,6 +19,16 @@ func fixedCIDForPromote(t *testing.T) atmoscbor.CID {
 	return cid
 }
 
+// flushSyncState commits promoted state on its own: the durable cursor batch
+// minus the cursor.
+func flushSyncState(t *testing.T, s metastore.Store, ss *syncstate.StateStore) {
+	t.Helper()
+	b := s.NewBatch()
+	ss.StageFlush(b)
+	require.NoError(t, b.Commit(t.Context()))
+	ss.CommitStaged()
+}
+
 // TestPromoteSyncState pins the §2.2 two-phase contract at the
 // consumer boundary: chain state staged by the verifier becomes
 // flushable only once the full row group of the event that produced
@@ -25,9 +36,7 @@ func fixedCIDForPromote(t *testing.T) atmoscbor.CID {
 // state stays pending.
 func TestPromoteSyncState(t *testing.T) {
 	t.Parallel()
-	raw, err := store.Open(t.TempDir(), nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = raw.Close() })
+	raw := memstore.New()
 	ss := syncstate.New(raw)
 
 	did := "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
@@ -40,7 +49,7 @@ func TestPromoteSyncState(t *testing.T) {
 	c.promoteSyncState([]segment.Event{
 		{Kind: segment.KindCreate, DID: did, Rev: "3lrev1"},
 	})
-	require.NoError(t, ss.Flush())
+	flushSyncState(t, raw, ss)
 	fresh := syncstate.New(raw)
 	got, err := fresh.LoadChain(t.Context(), atmosDID)
 	require.NoError(t, err)
@@ -52,7 +61,7 @@ func TestPromoteSyncState(t *testing.T) {
 		{Kind: segment.KindSync, DID: did, Rev: "3lrev2"},
 		{Kind: segment.KindCreate, DID: did, Rev: "3lrev2"},
 	})
-	require.NoError(t, ss.Flush())
+	flushSyncState(t, raw, ss)
 	got, err = fresh.LoadChain(t.Context(), atmosDID)
 	require.NoError(t, err)
 	require.NotNil(t, got)
@@ -61,9 +70,7 @@ func TestPromoteSyncState(t *testing.T) {
 
 func TestPromoteSyncStateHostingOnAccountRow(t *testing.T) {
 	t.Parallel()
-	raw, err := store.Open(t.TempDir(), nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = raw.Close() })
+	raw := memstore.New()
 	ss := syncstate.New(raw)
 
 	did := "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
@@ -76,7 +83,7 @@ func TestPromoteSyncStateHostingOnAccountRow(t *testing.T) {
 	// a REDELIVERED account row with an older upstream seq.
 	c.promoteSyncState([]segment.Event{{Kind: segment.KindCreate, DID: did, Rev: "3lrev1"}})
 	c.promoteSyncState([]segment.Event{{Kind: segment.KindAccount, DID: did, UpstreamRelayCursor: 8}})
-	require.NoError(t, ss.Flush())
+	flushSyncState(t, raw, ss)
 	fresh := syncstate.New(raw)
 	got, err := fresh.LoadHosting(t.Context(), atmosDID)
 	require.NoError(t, err)
@@ -84,7 +91,7 @@ func TestPromoteSyncStateHostingOnAccountRow(t *testing.T) {
 
 	// The account event's own row group does.
 	c.promoteSyncState([]segment.Event{{Kind: segment.KindAccount, DID: did, UpstreamRelayCursor: 9}})
-	require.NoError(t, ss.Flush())
+	flushSyncState(t, raw, ss)
 	got, err = fresh.LoadHosting(t.Context(), atmosDID)
 	require.NoError(t, err)
 	require.NotNil(t, got)

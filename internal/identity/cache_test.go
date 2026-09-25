@@ -5,18 +5,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 	"github.com/stretchr/testify/require"
 )
 
-func newTestStore(t *testing.T) *store.Store {
+func newTestStore(t *testing.T) *pebblestore.Store {
 	t.Helper()
-	s, err := store.Open(t.TempDir(), nil)
+	s, err := pebblestore.Open(t.TempDir(), nil, pebblestore.WithFS(vfs.NewMem()))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func newTestCache(t *testing.T, ttl time.Duration) *Cache {
+	t.Helper()
+	return New(NewPebbleKV(newTestStore(t)), ttl)
 }
 
 func sampleIdentity() *identity.Identity {
@@ -37,7 +43,7 @@ func sampleIdentity() *identity.Identity {
 
 func TestCache_GetAbsentReturnsFalse(t *testing.T) {
 	t.Parallel()
-	c := New(newTestStore(t), DefaultTTL)
+	c := newTestCache(t, DefaultTTL)
 
 	got, ok := c.Get(t.Context(), "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz")
 	require.False(t, ok)
@@ -46,7 +52,7 @@ func TestCache_GetAbsentReturnsFalse(t *testing.T) {
 
 func TestCache_RoundTrip(t *testing.T) {
 	t.Parallel()
-	c := New(newTestStore(t), DefaultTTL)
+	c := newTestCache(t, DefaultTTL)
 	in := sampleIdentity()
 
 	c.Set(t.Context(), string(in.DID), in)
@@ -60,7 +66,7 @@ func TestCache_RoundTrip(t *testing.T) {
 
 func TestCache_Delete(t *testing.T) {
 	t.Parallel()
-	c := New(newTestStore(t), DefaultTTL)
+	c := newTestCache(t, DefaultTTL)
 	in := sampleIdentity()
 
 	c.Set(t.Context(), string(in.DID), in)
@@ -75,7 +81,7 @@ func TestCache_Delete(t *testing.T) {
 // directly via the field.
 func TestCache_ExpiryTreatedAsMiss(t *testing.T) {
 	t.Parallel()
-	c := New(newTestStore(t), 1*time.Hour)
+	c := newTestCache(t, 1*time.Hour)
 
 	nowAt := time.Unix(1_700_000_000, 0)
 	c.now = func() time.Time { return nowAt }
@@ -95,9 +101,9 @@ func TestCache_ExpiryTreatedAsMiss(t *testing.T) {
 func TestCache_TruncatedEntryTreatedAsMiss(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
-	c := New(s, DefaultTTL)
+	c := New(NewPebbleKV(s), DefaultTTL)
 
-	require.NoError(t, s.Set([]byte(keyPrefix+"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"), []byte{0xFE, 0xED}, store.SyncWrites))
+	require.NoError(t, s.Set(t.Context(), []byte(keyPrefix+"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"), []byte{0xFE, 0xED}))
 
 	_, ok := c.Get(t.Context(), "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
 	require.False(t, ok)
@@ -110,7 +116,7 @@ func TestCache_TruncatedEntryTreatedAsMiss(t *testing.T) {
 func TestCache_UndecodableJSONTreatedAsMiss(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
-	c := New(s, DefaultTTL)
+	c := New(NewPebbleKV(s), DefaultTTL)
 
 	// Build [8B future expiry][non-JSON garbage] under the cache key
 	// directly. The expiry must be in the future so the TTL check
@@ -122,9 +128,30 @@ func TestCache_UndecodableJSONTreatedAsMiss(t *testing.T) {
 	body := []byte("not json at all, definitely not}{")
 	val := append(hdr[:], body...)
 
-	require.NoError(t, s.Set([]byte(keyPrefix+"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"), val, store.SyncWrites))
+	require.NoError(t, s.Set(t.Context(), []byte(keyPrefix+"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"), val))
 
 	got, ok := c.Get(t.Context(), "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
 	require.False(t, ok, "undecodable JSON must surface as a cache miss")
 	require.Nil(t, got)
+}
+
+// TestCache_SurvivesReopen pins the reason the cache is persistent: entries
+// written without WAL syncs still outlive a clean restart.
+func TestCache_SurvivesReopen(t *testing.T) {
+	t.Parallel()
+	fs := vfs.NewMem()
+	dir := t.TempDir()
+	in := sampleIdentity()
+
+	s, err := pebblestore.Open(dir, nil, pebblestore.WithFS(fs))
+	require.NoError(t, err)
+	New(NewPebbleKV(s), DefaultTTL).Set(t.Context(), string(in.DID), in)
+	require.NoError(t, s.Close())
+
+	s, err = pebblestore.Open(dir, nil, pebblestore.WithFS(fs))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	got, ok := New(NewPebbleKV(s), DefaultTTL).Get(t.Context(), string(in.DID))
+	require.True(t, ok)
+	require.Equal(t, in.Handle, got.Handle)
 }

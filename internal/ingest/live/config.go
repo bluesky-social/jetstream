@@ -104,7 +104,7 @@ type Config struct {
 	// SyncStateStore is the verifier state store when it supports staged
 	// durability. If set, Consumer commits its staged chain/hosting writes in
 	// the same pebble batch as the relay cursor after a segment block fsyncs.
-	SyncStateStore *syncstate.PebbleStateStore
+	SyncStateStore *syncstate.StateStore
 
 	// Tombstones, when set, is updated after each event is durably appended
 	// and assigned a seq. Steady-state passes use it as their live in-memory

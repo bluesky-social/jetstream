@@ -1,12 +1,12 @@
 package lifecycle
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/cockroachdb/pebble"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 )
 
 // Phase names a single jetstream-process lifecycle state.
@@ -59,19 +59,18 @@ func (t BackfillTiming) Duration() time.Duration {
 // ReadPhase returns the persisted phase. Empty on a fresh data dir.
 // An unknown value crashes the read rather than silently mapping to a
 // default.
-func ReadPhase(s *store.Store) (Phase, error) {
-	val, closer, err := s.Get([]byte(phaseKey))
-	if errors.Is(err, store.ErrNotFound) {
+func ReadPhase(ctx context.Context, s metastore.Store) (Phase, error) {
+	val, err := s.Get(ctx, []byte(phaseKey))
+	if errors.Is(err, metastore.ErrNotFound) {
 		return "", nil
 	}
 	if err != nil {
 		return "", fmt.Errorf("lifecycle: read phase: %w", err)
 	}
-	defer func() { _ = closer.Close() }()
 
 	p := Phase(string(val))
 	if !p.valid() {
-		return "", fmt.Errorf("lifecycle: unrecognized phase value %q in pebble", string(val))
+		return "", fmt.Errorf("lifecycle: unrecognized phase value %q in metadata store", string(val))
 	}
 	return p, nil
 }
@@ -79,19 +78,18 @@ func ReadPhase(s *store.Store) (Phase, error) {
 // ReadPhaseEnteredAt returns the timestamp at which the current phase
 // was entered. Zero time + nil error means the key isn't present (fresh
 // data dir, or a process that pre-dates this field).
-func ReadPhaseEnteredAt(s *store.Store) (time.Time, error) {
-	return readTime(s, phaseEnteredAtKey)
+func ReadPhaseEnteredAt(ctx context.Context, s metastore.Store) (time.Time, error) {
+	return readTime(ctx, s, phaseEnteredAtKey)
 }
 
-func readTime(s *store.Store, key string) (time.Time, error) {
-	val, closer, err := s.Get([]byte(key))
-	if errors.Is(err, store.ErrNotFound) {
+func readTime(ctx context.Context, s metastore.Store, key string) (time.Time, error) {
+	val, err := s.Get(ctx, []byte(key))
+	if errors.Is(err, metastore.ErrNotFound) {
 		return time.Time{}, nil
 	}
 	if err != nil {
 		return time.Time{}, fmt.Errorf("lifecycle: read %s: %w", key, err)
 	}
-	defer func() { _ = closer.Close() }()
 
 	t, err := time.Parse(time.RFC3339Nano, string(val))
 	if err != nil {
@@ -100,90 +98,64 @@ func readTime(s *store.Store, key string) (time.Time, error) {
 	return t.UTC(), nil
 }
 
-// WritePhase atomically persists p and enteredAt with pebble.Sync.
-// Both keys land together via a single batch commit so a crash cannot
-// leave a phase value paired with the wrong timestamp.
-func WritePhase(s *store.Store, p Phase, enteredAt time.Time) error {
+// WritePhase atomically and durably persists p and enteredAt. Both keys land
+// together via a single batch commit so a crash cannot leave a phase value
+// paired with the wrong timestamp.
+func WritePhase(ctx context.Context, s metastore.Store, p Phase, enteredAt time.Time) error {
 	if !p.valid() {
 		return fmt.Errorf("lifecycle: refuse to write unrecognized phase %q", string(p))
 	}
 	b := s.NewBatch()
-	defer func() { _ = b.Close() }()
-
-	if err := stagePhase(b, p, enteredAt); err != nil {
-		return err
-	}
-	if err := s.Commit(b, store.SyncWrites); err != nil {
+	stagePhase(b, p, enteredAt)
+	if err := b.Commit(ctx); err != nil {
 		return fmt.Errorf("lifecycle: commit phase write: %w", err)
 	}
 	return nil
 }
 
-func WritePhaseWithBackfillTiming(s *store.Store, p Phase, enteredAt time.Time, backfillStartedAt time.Time, backfillCompletedAt time.Time) error {
+func WritePhaseWithBackfillTiming(ctx context.Context, s metastore.Store, p Phase, enteredAt time.Time, backfillStartedAt time.Time, backfillCompletedAt time.Time) error {
 	if !p.valid() {
 		return fmt.Errorf("lifecycle: refuse to write unrecognized phase %q", string(p))
 	}
 	b := s.NewBatch()
-	defer func() { _ = b.Close() }()
-
-	if err := stagePhase(b, p, enteredAt); err != nil {
-		return err
-	}
-	if err := stageTime(b, backfillTimingStartedAtKey, backfillStartedAt); err != nil {
-		return err
-	}
-	if err := stageTime(b, backfillTimingCompletedAtKey, backfillCompletedAt); err != nil {
-		return err
-	}
-	if err := s.Commit(b, store.SyncWrites); err != nil {
+	stagePhase(b, p, enteredAt)
+	stageTime(b, backfillTimingStartedAtKey, backfillStartedAt)
+	stageTime(b, backfillTimingCompletedAtKey, backfillCompletedAt)
+	if err := b.Commit(ctx); err != nil {
 		return fmt.Errorf("lifecycle: commit phase and backfill timing write: %w", err)
 	}
 	return nil
 }
 
-func ReadBackfillTiming(s *store.Store) (BackfillTiming, error) {
-	startedAt, err := readTime(s, backfillTimingStartedAtKey)
+func ReadBackfillTiming(ctx context.Context, s metastore.Store) (BackfillTiming, error) {
+	startedAt, err := readTime(ctx, s, backfillTimingStartedAtKey)
 	if err != nil {
 		return BackfillTiming{}, err
 	}
-	completedAt, err := readTime(s, backfillTimingCompletedAtKey)
+	completedAt, err := readTime(ctx, s, backfillTimingCompletedAtKey)
 	if err != nil {
 		return BackfillTiming{}, err
 	}
 	return BackfillTiming{StartedAt: startedAt, CompletedAt: completedAt}, nil
 }
 
-func WriteBackfillTiming(s *store.Store, startedAt time.Time, completedAt time.Time) error {
+func WriteBackfillTiming(ctx context.Context, s metastore.Store, startedAt time.Time, completedAt time.Time) error {
 	b := s.NewBatch()
-	defer func() { _ = b.Close() }()
-
-	if err := stageTime(b, backfillTimingStartedAtKey, startedAt); err != nil {
-		return err
-	}
-	if err := stageTime(b, backfillTimingCompletedAtKey, completedAt); err != nil {
-		return err
-	}
-	if err := s.Commit(b, store.SyncWrites); err != nil {
+	stageTime(b, backfillTimingStartedAtKey, startedAt)
+	stageTime(b, backfillTimingCompletedAtKey, completedAt)
+	if err := b.Commit(ctx); err != nil {
 		return fmt.Errorf("lifecycle: commit backfill timing: %w", err)
 	}
 	return nil
 }
 
-func stagePhase(b *pebble.Batch, p Phase, enteredAt time.Time) error {
-	if err := b.Set([]byte(phaseKey), []byte(p), nil); err != nil {
-		return fmt.Errorf("lifecycle: stage phase: %w", err)
-	}
-	if err := stageTime(b, phaseEnteredAtKey, enteredAt); err != nil {
-		return err
-	}
-	return nil
+func stagePhase(b metastore.Batch, p Phase, enteredAt time.Time) {
+	b.Set([]byte(phaseKey), []byte(p))
+	stageTime(b, phaseEnteredAtKey, enteredAt)
 }
 
-func stageTime(b *pebble.Batch, key string, t time.Time) error {
-	if err := b.Set([]byte(key), []byte(t.UTC().Format(time.RFC3339Nano)), nil); err != nil {
-		return fmt.Errorf("lifecycle: stage %s: %w", key, err)
-	}
-	return nil
+func stageTime(b metastore.Batch, key string, t time.Time) {
+	b.Set([]byte(key), []byte(t.UTC().Format(time.RFC3339Nano)))
 }
 
 func (p Phase) valid() bool {
@@ -200,8 +172,8 @@ func (p Phase) valid() bool {
 // /subscribe endpoint uses this as a fail-closed gate: a corrupt phase or
 // missing key should surface as "service not ready" rather than as a
 // crashed handler.
-func IsSteadyState(s *store.Store) bool {
-	p, err := ReadPhase(s)
+func IsSteadyState(ctx context.Context, s metastore.Store) bool {
+	p, err := ReadPhase(ctx, s)
 	if err != nil {
 		return false
 	}

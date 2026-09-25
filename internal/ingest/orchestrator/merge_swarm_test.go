@@ -10,6 +10,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -147,7 +148,7 @@ func runSwarmIteration(t *testing.T, rng *rand.Rand) {
 	s := generateScenario(rng)
 	fix := newMergeFixture(t, s.sourceEvents, s.backfillRevs)
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 
 	// 30% chance of a kill-point injection on the flush-before-commit path.
 	// On crash, restart and run merge to completion.

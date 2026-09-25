@@ -21,6 +21,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/server"
 	"github.com/bluesky-social/jetstream/internal/status"
@@ -195,6 +196,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(err)
 	}
 	rt.metaStore = metaStore
+	// Transitional (S1.3): packages already on metastore share the one raw
+	// store, so its fault injector still fires exactly once per write.
+	metaKV := pebblestore.New(metaStore, opts.DataDir)
 
 	manifestCtx, cancelManifest := context.WithCancel(ctx)
 	rt.cancelManifest = cancelManifest
@@ -242,11 +246,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	resolver := newIdentityResolver(opts)
 	directory := &identity.Directory{
 		Resolver:               resolver,
-		Cache:                  identcache.New(metaStore, identcache.DefaultTTL),
+		Cache:                  identcache.New(identcache.NewPebbleKV(metaKV), identcache.DefaultTTL),
 		SkipHandleVerification: true,
 	}
 
-	stateStore := syncstate.New(metaStore)
+	stateStore := syncstate.New(metaKV)
 	tombstones := tombstone.New()
 	// This state is owned and updated by the orchestrator, but xrpcapi sees
 	// only its read-only deadline surface. It starts unknown, so archive
@@ -471,7 +475,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Src:    mft,
 		Logger: processLogger,
 		Ready: func(ctx context.Context) error {
-			if !lifecycle.IsSteadyState(metaStore) {
+			if !lifecycle.IsSteadyState(ctx, metaKV) {
 				return errors.New("bootstrap in progress")
 			}
 			if err := mft.Wait(ctx); err != nil {

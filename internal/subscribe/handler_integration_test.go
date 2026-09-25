@@ -16,6 +16,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
@@ -28,7 +29,7 @@ import (
 // IsSteadyState gate passes.
 func makeSteadyState(t *testing.T, st *store.Store) {
 	t.Helper()
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, ""), lifecycle.PhaseSteadyState, time.Now().UTC()))
 }
 
 func TestHandler_ReplaysFromCursor(t *testing.T) {

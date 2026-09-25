@@ -68,7 +68,7 @@ type Config struct {
 	// SyncStateStore is the verifier state store when it supports staged
 	// durability. It is forwarded to live consumers so verifier state commits
 	// atomically with the relay cursor after block fsync.
-	SyncStateStore *syncstate.PebbleStateStore
+	SyncStateStore *syncstate.StateStore
 
 	// Tombstones is the steady-state live tombstone set. Bootstrap leaves
 	// live.Config.Tombstones nil because live_segments are re-sequenced at

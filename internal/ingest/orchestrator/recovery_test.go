@@ -13,6 +13,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -46,7 +47,7 @@ func TestRun_ResumeFromMerging_AdvancesToSteadyState(t *testing.T) {
 		{Kind: segment.KindIdentity, DID: "did:plc:resume-test", WitnessedAt: 1000},
 	}}, nil)
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
@@ -58,7 +59,7 @@ func TestRun_ResumeFromMerging_AdvancesToSteadyState(t *testing.T) {
 	go func() { done <- o.Run(ctx) }()
 
 	require.Eventually(t, func() bool {
-		got, err := lifecycle.ReadPhase(fix.store)
+		got, err := lifecycle.ReadPhase(t.Context(), pebblestore.New(fix.store, fix.dataDir))
 		return err == nil && got == lifecycle.PhaseSteadyState
 	}, 5*time.Second, 20*time.Millisecond, "phase did not advance to steady_state")
 
@@ -82,7 +83,7 @@ func TestRun_CrashAfterSteadyPhaseBeforeSteadyRunLeavesSteadyPhase(t *testing.T)
 	fix := newMergeFixture(t, [][]segment.Event{{
 		{Kind: segment.KindIdentity, DID: "did:plc:steady-crash", WitnessedAt: 1000},
 	}}, nil)
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 
 	sentinel := errors.New("kill point: steady phase before steady run")
 	fix.cfg.CrashInjector = pointErrorInjector{
@@ -94,7 +95,7 @@ func TestRun_CrashAfterSteadyPhaseBeforeSteadyRunLeavesSteadyPhase(t *testing.T)
 	require.NoError(t, err)
 	require.ErrorIs(t, o.Run(t.Context()), sentinel)
 
-	got, err := lifecycle.ReadPhase(fix.store)
+	got, err := lifecycle.ReadPhase(t.Context(), pebblestore.New(fix.store, fix.dataDir))
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseSteadyState, got)
 	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill"))
@@ -113,7 +114,7 @@ func TestRun_StartsCleanInSteadyState(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, dataDir), lifecycle.PhaseSteadyState, time.Now().UTC()))
 
 	relay := newFakeRelay(t, nil)
 	verifier := newTestVerifier(t, relay.URL())
@@ -157,7 +158,7 @@ func TestRun_StartsCleanInSteadyState(t *testing.T) {
 	}
 
 	// Phase remains steady_state.
-	got, err := lifecycle.ReadPhase(st)
+	got, err := lifecycle.ReadPhase(t.Context(), pebblestore.New(st, dataDir))
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseSteadyState, got)
 

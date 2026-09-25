@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/jcalabro/atmos/streaming"
@@ -201,7 +202,7 @@ func TestClose_CancelsAndDrainsRunBeforeClosingStores(t *testing.T) {
 	dataDir := t.TempDir()
 	st, err := store.Open(dataDir, nil)
 	require.NoError(t, err)
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, dataDir), lifecycle.PhaseSteadyState, time.Now().UTC()))
 	require.NoError(t, st.Close())
 
 	dialEntered := make(chan struct{})

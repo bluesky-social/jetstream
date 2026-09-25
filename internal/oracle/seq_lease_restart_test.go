@@ -19,6 +19,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
@@ -138,7 +139,7 @@ func runSeqLeaseSubscriberChild() {
 	if err != nil {
 		fail(err)
 	}
-	if err := lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()); err != nil {
+	if err := lifecycle.WritePhase(context.Background(), pebblestore.New(st, dataDir), lifecycle.PhaseSteadyState, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 

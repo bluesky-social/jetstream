@@ -19,6 +19,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
@@ -142,7 +143,7 @@ func negotiateSubprotocol(r *http.Request) []string {
 }
 
 func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *slog.Logger) {
-	if !lifecycle.IsSteadyState(deps.Store) {
+	if !lifecycle.IsSteadyState(r.Context(), pebblestore.New(deps.Store, "")) {
 		httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: bootstrap in progress")
 		return
 	}

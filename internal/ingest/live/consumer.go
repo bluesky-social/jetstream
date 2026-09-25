@@ -355,7 +355,7 @@ func (c *Consumer) onDurableBatch(ctx context.Context, b *pebble.Batch, _ uint64
 		// can already exist. Persist it on its own so a crash here
 		// can't leave a durable identity row unguarded (#234).
 		if c.cfg.SyncStateStore != nil {
-			if err := c.cfg.SyncStateStore.StageFlush(b); err != nil {
+			if err := stageSyncState(c.cfg.SyncStateStore, b); err != nil {
 				return nil, nil, err
 			}
 			return func() { c.cfg.SyncStateStore.CommitStaged() }, nil, nil
@@ -366,7 +366,7 @@ func (c *Consumer) onDurableBatch(ctx context.Context, b *pebble.Batch, _ uint64
 		return nil, nil, fmt.Errorf("livestream: stage %s: %w", c.cfg.CursorKey, err)
 	}
 	if c.cfg.SyncStateStore != nil {
-		if err := c.cfg.SyncStateStore.StageFlush(b); err != nil {
+		if err := stageSyncState(c.cfg.SyncStateStore, b); err != nil {
 			return nil, nil, err
 		}
 	}

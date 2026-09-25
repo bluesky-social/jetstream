@@ -17,6 +17,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/bluesky-social/jetstream/segment"
@@ -56,11 +57,11 @@ func collectProcess(now time.Time, startedAt time.Time) ProcessInfo {
 }
 
 func collectPhase(s *store.Store) (PhaseInfo, error) {
-	p, err := lifecycle.ReadPhase(s)
+	p, err := lifecycle.ReadPhase(context.Background(), pebblestore.New(s, ""))
 	if err != nil {
 		return PhaseInfo{}, err
 	}
-	at, err := lifecycle.ReadPhaseEnteredAt(s)
+	at, err := lifecycle.ReadPhaseEnteredAt(context.Background(), pebblestore.New(s, ""))
 	if err != nil {
 		return PhaseInfo{}, err
 	}
@@ -108,7 +109,7 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 	if err != nil {
 		return BackfillStats{}, err
 	}
-	timing, err := lifecycle.ReadBackfillTiming(s)
+	timing, err := lifecycle.ReadBackfillTiming(context.Background(), pebblestore.New(s, ""))
 	if err != nil {
 		return BackfillStats{}, err
 	}
@@ -139,7 +140,7 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 	if err != nil {
 		return BackfillStats{}, err
 	}
-	timing, err := lifecycle.ReadBackfillTiming(s)
+	timing, err := lifecycle.ReadBackfillTiming(context.Background(), pebblestore.New(s, ""))
 	if err != nil {
 		return BackfillStats{}, err
 	}

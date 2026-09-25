@@ -1,10 +1,12 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 )
 
 // writeMergingPhase is commit point #1. After this call returns nil,
@@ -13,16 +15,16 @@ import (
 func (o *Orchestrator) writeMergingPhase() error {
 	start := time.Now()
 	completedAt := start.UTC()
-	bootstrapStartedAt, err := lifecycle.ReadPhaseEnteredAt(o.cfg.Store)
+	bootstrapStartedAt, err := lifecycle.ReadPhaseEnteredAt(context.Background(), pebblestore.New(o.cfg.Store, o.cfg.DataDir))
 	if err != nil {
 		return fmt.Errorf("orchestrator: read bootstrap phase entered_at: %w", err)
 	}
 	if bootstrapStartedAt.IsZero() {
-		if err := lifecycle.WritePhase(o.cfg.Store, lifecycle.PhaseMerging, completedAt); err != nil {
+		if err := lifecycle.WritePhase(context.Background(), pebblestore.New(o.cfg.Store, o.cfg.DataDir), lifecycle.PhaseMerging, completedAt); err != nil {
 			return fmt.Errorf("orchestrator: write phase=merging: %w", err)
 		}
 	} else {
-		if err := lifecycle.WritePhaseWithBackfillTiming(o.cfg.Store, lifecycle.PhaseMerging, completedAt, bootstrapStartedAt, completedAt); err != nil {
+		if err := lifecycle.WritePhaseWithBackfillTiming(context.Background(), pebblestore.New(o.cfg.Store, o.cfg.DataDir), lifecycle.PhaseMerging, completedAt, bootstrapStartedAt, completedAt); err != nil {
 			return fmt.Errorf("orchestrator: write phase=merging with backfill timing: %w", err)
 		}
 	}
@@ -36,7 +38,7 @@ func (o *Orchestrator) writeMergingPhase() error {
 // nil, the data dir is durably in PhaseSteadyState.
 func (o *Orchestrator) writeSteadyStatePhase() error {
 	start := time.Now()
-	if err := lifecycle.WritePhase(o.cfg.Store, lifecycle.PhaseSteadyState, start.UTC()); err != nil {
+	if err := lifecycle.WritePhase(context.Background(), pebblestore.New(o.cfg.Store, o.cfg.DataDir), lifecycle.PhaseSteadyState, start.UTC()); err != nil {
 		return fmt.Errorf("orchestrator: write phase=steady_state: %w", err)
 	}
 	o.cfg.Metrics.observeState("write_phase_steady", time.Since(start).Seconds())

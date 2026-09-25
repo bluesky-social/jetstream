@@ -13,6 +13,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/coder/websocket"
@@ -32,7 +33,7 @@ func TestServe_GracefulShutdownClosesSubscriber(t *testing.T) {
 	{
 		s, err := store.Open(dataDir, nil)
 		require.NoError(t, err)
-		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseSteadyState, time.Now().UTC()))
+		require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(s, dataDir), lifecycle.PhaseSteadyState, time.Now().UTC()))
 		require.NoError(t, s.Close())
 	}
 

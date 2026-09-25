@@ -17,6 +17,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
@@ -150,7 +151,7 @@ func TestCollect_PhaseAndEnteredAt(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	enteredAt := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, enteredAt))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, dataDir), lifecycle.PhaseSteadyState, enteredAt))
 
 	c, err := status.New(status.Options{
 		Store:   st,
@@ -174,7 +175,7 @@ func TestCollect_BackfillTiming(t *testing.T) {
 
 	startedAt := time.Date(2026, 5, 1, 1, 0, 0, 0, time.UTC)
 	completedAt := startedAt.Add(3*24*time.Hour + 7*time.Hour)
-	require.NoError(t, lifecycle.WriteBackfillTiming(st, startedAt, completedAt))
+	require.NoError(t, lifecycle.WriteBackfillTiming(t.Context(), pebblestore.New(st, dataDir), startedAt, completedAt))
 	require.NoError(t, backfill.SaveCounts(st, backfill.Counts{Total: 10, Discovered: 10, Complete: 10}))
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})

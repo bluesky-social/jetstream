@@ -19,6 +19,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -93,7 +94,7 @@ func TestMerge_DropsCoveredCommits_KeepsOthers(t *testing.T) {
 	}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -123,7 +124,7 @@ func TestMerge_PublishesTerminalSealToManifest(t *testing.T) {
 	require.Equal(t, 0, mft.SegmentCount(), "manifest starts before merge seals any destination segment")
 
 	fix.cfg.IngestOnAfterSeal = mft.OnSegmentSealed
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -147,7 +148,7 @@ func TestMerge_RefreshesRepoRev_PreservesBackfillRev(t *testing.T) {
 	}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -167,7 +168,7 @@ func TestMerge_MultiSourceContiguousCommit(t *testing.T) {
 	src2 := []segment.Event{ev("did:plc:a", "3l7", segment.KindCreate, 1001)}
 	fix := newMergeFixture(t, [][]segment.Event{src1, src2}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -186,7 +187,7 @@ func TestMerge_EmptyLiveSegmentsDir(t *testing.T) {
 	t.Parallel()
 	fix := newMergeFixture(t, nil, nil) // creates empty live_segments dir
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -197,7 +198,7 @@ func TestMerge_RestartAfterCleanup_NoLiveSegmentsDir(t *testing.T) {
 	fix := newMergeFixture(t, nil, nil)
 	require.NoError(t, os.RemoveAll(filepath.Join(fix.dataDir, "backfill")))
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -208,7 +209,7 @@ func TestMerge_TopLevelRunAdvancesPhase(t *testing.T) {
 	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 
@@ -218,7 +219,7 @@ func TestMerge_TopLevelRunAdvancesPhase(t *testing.T) {
 	go func() { done <- o.Run(ctx) }()
 
 	require.Eventually(t, func() bool {
-		p, err := lifecycle.ReadPhase(fix.store)
+		p, err := lifecycle.ReadPhase(t.Context(), pebblestore.New(fix.store, fix.dataDir))
 		return err == nil && p == lifecycle.PhaseSteadyState
 	}, 5*time.Second, 20*time.Millisecond, "phase did not advance to steady_state")
 	cancel()
@@ -250,7 +251,7 @@ func TestMerge_CrashAfterFlushBeforeCommit_ProducesDuplicates(t *testing.T) {
 	}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	sentinel := errors.New("kill point: flush-before-commit")
 	fix.cfg.CrashInjector = pointErrorInjector{
 		point: crashpoint.AfterMergeDstFlushBeforeSourceCommit,
@@ -296,7 +297,7 @@ func TestMerge_CrashAfterSealBeforeDiscovery_RestartCleansUp(t *testing.T) {
 	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	sentinel := errors.New("kill point: seal-before-removeall")
 	fix.cfg.CrashInjector = pointErrorInjector{
 		point: crashpoint.AfterMergeDstSealBeforeDiscovery,
@@ -334,7 +335,7 @@ func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 	fix.relay.repos = []listReposEntry{{DID: "did:plc:new", Active: true}}
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	sentinel := errors.New("kill point: discovery-before-cleanup")
 	fix.cfg.CrashInjector = pointErrorInjector{
 		point: crashpoint.AfterMergeDiscoveryBeforeCleanup,
@@ -413,7 +414,7 @@ func TestMerge_SealsActiveSourceSegmentBeforeDrain(t *testing.T) {
 	require.False(t, isSealed(t, srcFiles[0]),
 		"precondition: trailing source segment must be active/unsealed")
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
@@ -449,7 +450,7 @@ func TestMerge_DiscoversNewDIDsViaListReposResume(t *testing.T) {
 		{DID: "did:plc:new", Active: true},
 	}
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -502,7 +503,7 @@ func TestMerge_DiscoveryWalksMultiplePages(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -552,7 +553,7 @@ func TestMerge_DiscoveryToleratesDuplicateEntriesAndDetectsCursorLoop(t *testing
 		},
 	}
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()), "an exhausted discovery host must not block cutover")
@@ -587,7 +588,7 @@ func TestMerge_DiscoveryHostErrorExhaustsAndCutoverContinues(t *testing.T) {
 	t.Cleanup(fix.relay.srv.Close)
 	fix.cfg.RelayURL = fix.relay.srv.URL
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	err = o.runMerge(t.Context())

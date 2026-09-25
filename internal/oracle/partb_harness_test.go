@@ -18,6 +18,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
@@ -144,7 +145,7 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 	require.NoError(t, err)
 	s.writer = w
 
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, dataDir), lifecycle.PhaseSteadyState, time.Now().UTC()))
 
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
