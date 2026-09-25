@@ -304,6 +304,15 @@ rule. Another pod will take over. If the corruption is real, every leader will
 exit the same way and an operator must step in. The metric
 `jetstream_storage_corruption_total` counts these events.
 
+In code (S2.6), `catalog.CorruptionError` carries a `source` label and
+implements `SessionFatal()`. `leader.DefaultFatal` treats any error that
+reports `SessionFatal()` as fatal, even when it also wraps
+`leader.ErrRestartSession`. A failed reference check (§7.4) is corruption: the
+leader only references objects it made available. The one exception is §7.3
+step 6 finding its `uploading` row gone or already claimed. That is GC
+reclaiming an upload that stalled past the orphan age (the accepted leak), so it
+ends the session without exiting, and the next session uploads again.
+
 ## 7. Objects
 
 ### 7.1 Keys
@@ -568,6 +577,15 @@ session start.
 6. A hot batch never crosses an open-block boundary (§10.3).
 7. `metadata_kv['relay/cursor']` never names an upstream seq whose events are not
    all committed (§10.4).
+
+`catalog.CheckInvariants` (S2.6) checks invariant 6 in a weaker form: no hot
+batch holds more events than a block. The open block's boundary is not stored
+in the catalog, so a snapshot cannot show whether a batch crosses it. Fold's
+exact-coverage check enforces the boundary itself: a fold whose deleted batches
+do not tile the block exactly is rejected as corruption. An absent seq key
+reads as 1. A present seq key that is not 8 bytes is corruption. In `-short`
+mode or at session start on a large archive, the cheap subset skips decoding
+generation headers.
 
 ## 10. Write path
 
@@ -1570,6 +1588,23 @@ object store. The fakes:
 - check the catalog invariants (§9.3) after every transaction;
 - run two or more reader pods whose delivered streams the oracle compares to the
   model: no missing event, no seq reuse, per-DID order kept.
+
+`internal/storagefake` (S2.7) differs from PostgreSQL in these deliberate ways.
+None of them weakens a check:
+
+- Every write statement takes the archive row lock, not just the fence. Leader
+  writes run the fence first, so this matches PostgreSQL for them. It also
+  serializes lease statements against in-flight leader transactions, as the
+  real `UPDATE archive` does.
+- The invariant check runs after every commit, including lease statements. A
+  violation is recorded (`DB.Violation`, `Config.OnViolation`) and the commit
+  still stands, because PostgreSQL would have committed it. The oracle fails
+  on the record.
+- A listener that falls 64 notifications behind loses the excess. PostgreSQL
+  queues them, but the follower's 250ms poll must cover a lost `NOTIFY`
+  regardless, so dropping is the harsher and more useful behavior.
+- Generation ID 0 stands for SQL `NULL`, and sequences are never reused, even
+  after a rollback.
 
 New mutants go into `testing/mutation/mutants/` for disaggregated-specific bugs.
 At minimum:

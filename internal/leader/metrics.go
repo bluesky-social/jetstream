@@ -25,6 +25,7 @@ type Metrics struct {
 	AcquireErrors  prometheus.Counter
 	RenewErrors    prometheus.Counter
 	ReleaseErrors  prometheus.Counter
+	FenceFailures  prometheus.Counter
 }
 
 // NewMetrics registers the series against reg. Construct exactly once per
@@ -56,12 +57,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		AcquireErrors:  counter("acquire_errors_total", "Acquire attempts that failed for a reason other than the lock being held."),
 		RenewErrors:    counter("renew_errors_total", "Renew attempts that failed for a reason other than losing the lock."),
 		ReleaseErrors:  counter("release_errors_total", "Best-effort releases that failed."),
+		FenceFailures:  counter("fence_failures_total", "Leader write transactions rejected by the epoch fence."),
 	}
 	for _, r := range []string{reasonFatal, reasonLeaseLost, reasonShutdown, reasonRestart} {
 		m.SessionEnds.WithLabelValues(r)
 	}
 	reg.MustRegister(m.IsLeader, m.Epoch, m.SessionsTotal, m.SessionEnds,
-		m.LeaseLostTotal, m.AcquireErrors, m.RenewErrors, m.ReleaseErrors)
+		m.LeaseLostTotal, m.AcquireErrors, m.RenewErrors, m.ReleaseErrors, m.FenceFailures)
 	return m
 }
 
@@ -103,5 +105,13 @@ func (m *Metrics) renewError() {
 func (m *Metrics) releaseError() {
 	if m != nil {
 		m.ReleaseErrors.Inc()
+	}
+}
+
+// FenceFailure counts a write transaction the epoch fence rejected (design
+// §6.4). The catalog transaction scripts call it.
+func (m *Metrics) FenceFailure() {
+	if m != nil {
+		m.FenceFailures.Inc()
 	}
 }

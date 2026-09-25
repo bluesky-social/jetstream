@@ -495,3 +495,17 @@ func TestIsLocal(t *testing.T) {
 	require.True(t, isLocal(&Local{}))
 	require.False(t, isLocal(&fakeLocker{}))
 }
+
+type sessionFatalErr struct{}
+
+func (sessionFatalErr) Error() string      { return "corrupt" }
+func (sessionFatalErr) SessionFatal() bool { return true }
+
+func TestDefaultFatal(t *testing.T) {
+	t.Parallel()
+	require.True(t, DefaultFatal(errors.New("unclassified")))
+	require.False(t, DefaultFatal(fmt.Errorf("fenced: %w", ErrRestartSession)))
+	require.True(t, DefaultFatal(sessionFatalErr{}))
+	// A restart marker wrapped around corruption does not downgrade it.
+	require.True(t, DefaultFatal(fmt.Errorf("%w: %w", ErrRestartSession, sessionFatalErr{})))
+}

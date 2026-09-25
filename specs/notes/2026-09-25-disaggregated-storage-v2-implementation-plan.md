@@ -714,7 +714,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
 
 ### Catalog core
 
-- [ ] **S2.6 `internal/catalog` transaction scripts** (L). Deps: S1.9, S2.2.
+- [x] **S2.6 `internal/catalog` transaction scripts** (L). Deps: S1.9, S2.2.
   - Backend-neutral scripts over `catalog.Tx` (D1):
     - `CommitHotBatch` (§10.4)
     - `CommitBlock` (§10.6)
@@ -732,7 +732,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
   - Tests: script-level tests on storagefake covering each rejection path
     (fence lost, seq mismatch, missing reference, fold gap, seal list
     mismatch).
-- [ ] **S2.7 `internal/storagefake`** (L). Deps: S2.6.
+- [x] **S2.7 `internal/storagefake`** (L). Deps: S2.6.
   - In-memory tables for every §8 table, with PostgreSQL semantics:
     - the `archive` row lock that serializes fenced transactions;
     - revisions in commit order;
@@ -1223,6 +1223,75 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.7 (2026-09-25): storagefake.**
+  - Each committed state is a set of copy-on-write tables (`layer`), frozen
+    on commit. A reader snapshot is one pointer. A write transaction builds a
+    child of the latest state once it takes the archive row lock, which is a
+    ctx-aware channel. Layers flatten past depth 16, so lookups stay cheap
+    over long runs.
+  - Deviations, recorded in design §20 layer 3: every write statement takes
+    the row lock, invariants run after every commit (lease statements too),
+    and violations are recorded without failing the commit. A listener more
+    than 64 notifications behind drops the excess. Generation ID 0 stands for
+    `NULL`.
+  - Faults (`InjectFaults`, `Fired`, `Unfired`): `commit_fails`,
+    `commit_lost` (applied, then error), `conn_lost` at statement N or at
+    `COMMIT` (releases locks at once), `notify_lost`, and `slow_read`. Every
+    fault counts every matching event, so ordinals are independent.
+  - `Lease` implements `leader.Locker` with the §6.2 semantics.
+    `MetaStore(commit)` is a `metastore.Store` over `metadata_kv`, and
+    passes `storetest` with commits routed through `Session.CommitMeta`. A
+    nil commit makes a read-only store that returns the new
+    `metastore.ErrReadOnly`. `catalog.Listener` is the NOTIFY interface.
+  - `Seeded` is the D4 scheduler. Storage calls yield at named points and are
+    labelled with an actor (`WithActor`). `Run` owns the bubble's
+    `synctest.Wait`. Once every goroutine is durably blocked, it admits one
+    parked call, chosen by the seed from the list sorted by (actor+point,
+    arrival). `TestSeededDeterminism` checks that one seed gives the same
+    trace and the same final state, and that different seeds differ. S2.18
+    must not call `synctest.Wait` elsewhere in a scheduled bubble.
+  - `internal/catalog/catalogtest` is the layer 4 primitive contract suite:
+    fence, row lock serialization, acquire fencing the old epoch, ordered
+    `ApplyMeta`, object states and both unique indexes, sequences that burn
+    on rollback, every CHECK and FK, `one_active`, cascade on
+    `DeleteNamespace`, reader snapshots, aborted transactions, and NOTIFY on
+    commit only. storagefake runs it now; pgstore runs it in S2.20.
+
+- **S2.6 (2026-09-25): catalog transaction scripts.**
+  - `catalog.Session` holds the scripts (`CommitHotBatch`, `CommitBlock`,
+    `Fold`, `Seal`, `InitNamespace`, `DeleteNamespace`, `CommitMeta`,
+    `BeginUploads`, `MarkAvailable`; `PublishGeneration` returns
+    `ErrNotImplemented`). Each is one `run`: fence, body, NOTIFY, commit. Any
+    error rolls back and ends the Session for good. Every later call
+    returns `ErrSessionEnded`, which wraps `leader.ErrRestartSession`.
+    `ErrFenced` wraps `ErrSessionEnded`, and fence failures increment
+    `leader.Metrics.FenceFailures`.
+  - `CorruptionError{source}` implements `SessionFatal()`, and
+    `leader.DefaultFatal` honors it. That is how the election loop exits
+    the process on corruption. It is counted by
+    `jetstream_storage_corruption_total{source}`, with sources `seq`, `ref`,
+    `fold`, `seal`, `invariant`, `object`, `read`, `meta`, `hot_batch`, and
+    `generation`.
+  - Ref checks cover every referenced object, including the seal's block
+    list. A pending object is made available inside the referencing
+    transaction (the §7.3 step 6 fold-in option). If another upload of the
+    same bytes won first, the script references the winner. `insertActiveBlock`
+    also checks continuity with the segment's last block, which coverage
+    alone cannot see.
+  - Added `InitNamespace`, since a namespace's first active segment needs a
+    transaction too.
+  - `CheckInvariants` implements all seven §9.3 invariants: 7 via a
+    caller-supplied `RelayCursor` function, filled in by S2.12, and 6 in the
+    weaker form recorded in design §9.3. storagefake runs it after every
+    commit. The leader session-start call (cheap subset) lands with the
+    rebuild in S2.11, and the PG run lands in S2.20.
+  - Tests: `scripts_test.go` covers each rejection path on storagefake: fence
+    lost, seq gap and overlap, garbage seq key, missing and uploading
+    references (hot batch, fold, seal footer), fold coverage gaps, block
+    discontinuity, the seal list (missing, reordered, wrong object, header
+    mismatch, wrong segment), and the upload race referencing the winner.
+    `invariants_test.go` breaks each invariant in a valid snapshot.
 
 - **S2.1 (2026-09-25): dependencies and import boundary.**
   - pgx v5.11.0 and aws-sdk-go-v2 (`config` v1.33.6, `credentials` v1.20.6,

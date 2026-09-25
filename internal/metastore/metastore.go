@@ -21,6 +21,10 @@ var ErrNotFound = errors.New("metastore: not found")
 // Batches are single-use.
 var ErrBatchCommitted = errors.New("metastore: batch already committed")
 
+// ErrReadOnly is returned by writes to a read-only Store (a reader pod's
+// view of the PostgreSQL metadata table).
+var ErrReadOnly = errors.New("metastore: store is read-only")
+
 // Store is a durable, ordered, bytewise-keyed metadata store.
 //
 // Every successful write is durable when it returns: the Pebble

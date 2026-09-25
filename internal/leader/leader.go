@@ -53,6 +53,19 @@ func isLocal(l Locker) bool {
 // rule.
 var ErrRestartSession = errors.New("leader: restart session")
 
+// DefaultFatal is the default Config.Fatal. An error is fatal unless it
+// wraps ErrRestartSession, and always fatal when it wraps an error whose
+// SessionFatal method reports true. The second rule keeps storage
+// corruption fatal even if some layer also wrapped it with a restart
+// marker.
+func DefaultFatal(err error) bool {
+	var f interface{ SessionFatal() bool }
+	if errors.As(err, &f) && f.SessionFatal() {
+		return true
+	}
+	return !errors.Is(err, ErrRestartSession)
+}
+
 // SessionFunc runs one writer session. It blocks until the session ends and
 // must not return until every goroutine it started has exited, because the
 // next session may start as soon as it returns. ctx is cancelled on lease
@@ -69,8 +82,7 @@ type Config struct {
 	ReleaseTimeout  time.Duration
 
 	// Fatal reports whether a session error must end the process instead of
-	// starting a new session. Nil means every error not wrapping
-	// ErrRestartSession is fatal.
+	// starting a new session. Nil means DefaultFatal.
 	Fatal func(error) bool
 
 	Logger  *slog.Logger
@@ -91,7 +103,7 @@ func (c Config) withDefaults() Config {
 		c.ReleaseTimeout = DefaultReleaseTimeout
 	}
 	if c.Fatal == nil {
-		c.Fatal = func(err error) bool { return !errors.Is(err, ErrRestartSession) }
+		c.Fatal = DefaultFatal
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
