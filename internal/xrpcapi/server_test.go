@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,9 +37,9 @@ func TestServer_RoutesMounted(t *testing.T) {
 func TestServer_ReadinessGateReturnsXRPC503(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestServer(t, 1)
-	gated := New(Config{Src: s.src, Logger: s.logger, Ready: func(_ context.Context) error {
+	gated := New(Config{Src: s.src, Logger: s.logger, Ready: lifecycle.ReadinessFunc(func(_ context.Context) error {
 		return errors.New("bootstrap in progress")
-	}})
+	})})
 	ts := httptest.NewServer(gated.Handler())
 	defer ts.Close()
 

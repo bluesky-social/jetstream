@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
@@ -308,9 +309,9 @@ func TestGetBlock_ReadinessGate(t *testing.T) {
 	srv := New(Config{
 		Src:    m,
 		Logger: slog.Default(),
-		Ready: func(context.Context) error {
+		Ready: lifecycle.ReadinessFunc(func(context.Context) error {
 			return fmt.Errorf("manifest warming")
-		},
+		}),
 	})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)

@@ -89,7 +89,32 @@ func TestHandler_RejectsWhenNotSteadyState(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
-	require.Contains(t, string(body), "service not ready")
+	require.Contains(t, string(body), "service not ready: bootstrap in progress")
+}
+
+// TestHandler_ReadyOverridesStore checks an explicit Readiness gates the
+// handler instead of the Store's phase, and its error text reaches the client.
+func TestHandler_ReadyOverridesStore(t *testing.T) {
+	t.Parallel()
+
+	b, _ := newReadLogTail(t, 1<<20, noCold)
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  newSteadyStateStore(t),
+		Ready:  lifecycle.ReadinessFunc(func(context.Context) error { return fmt.Errorf("catalog warming") }),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	require.Contains(t, string(body), "service not ready: catalog warming")
 }
 
 func TestHandler_HappyPath_DeliversIdentityEvent(t *testing.T) {

@@ -40,7 +40,11 @@ const (
 // wired exactly once at process startup, so a panic at construction
 // time is the right granularity.
 type Subscription struct {
-	Tail     *Tail
+	Tail *Tail
+	// Ready gates every request with a 503 until the archive is safe to
+	// expose. Nil means lifecycle.SteadyState(Store), so one of the two
+	// is required.
+	Ready    lifecycle.Readiness
 	Store    metastore.Store
 	Manifest *manifest.Manifest // optional; required for cursor replay
 	Writer   *ingest.Writer     // optional; required for cursor replay
@@ -91,8 +95,11 @@ func NewHandler(deps Subscription) http.Handler {
 	if deps.Tail == nil {
 		panic("subscribe: HandlerDeps.Tail is required")
 	}
-	if deps.Store == nil {
-		panic("subscribe: HandlerDeps.Store is required")
+	if deps.Ready == nil {
+		if deps.Store == nil {
+			panic("subscribe: HandlerDeps.Ready or HandlerDeps.Store is required")
+		}
+		deps.Ready = lifecycle.SteadyState(deps.Store)
 	}
 	logger := deps.Logger.With(slog.String("component", "subscribe/handler"))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -146,8 +153,8 @@ func negotiateSubprotocol(r *http.Request) []string {
 }
 
 func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *slog.Logger) {
-	if !lifecycle.IsSteadyState(r.Context(), deps.Store) {
-		httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: bootstrap in progress")
+	if err := deps.Ready.Ready(r.Context()); err != nil {
+		httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: "+err.Error())
 		return
 	}
 
@@ -233,7 +240,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	case deps.Manifest == nil || deps.writer() == nil:
 		// Cursor lookback is enabled but the replay dependencies aren't
 		// available. The dominant case is the steady-state warmup window:
-		// the phase marker is durable (we passed IsSteadyState above) but
+		// the phase marker is durable (we passed the Ready gate above) but
 		// the live consumer hasn't published its writer pointer yet, so
 		// the Tail's live tip is not yet meaningful — Tip() reports 0.
 		// Serving ANY subscriber now is wrong:
