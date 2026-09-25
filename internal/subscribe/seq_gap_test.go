@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
@@ -24,16 +24,15 @@ func openGapReplayFixture(t *testing.T) (*subscribeFixture, *seqspace.Gaps) {
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000001.jss"), sealedFixture{
 		minSeq: 5, maxSeq: 6, minWitnessedAt: 5_000, maxWitnessedAt: 6_000, eventCount: 2,
 	})
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 7)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 	gaps := mustSeqGaps(t, seqspace.Gap{Start: 3, End: 5})
-	return &subscribeFixture{manifest: m, writer: w}, gaps
+	return &subscribeFixture{cat: cat}, gaps
 }
 
 type subscribeFixture struct {
-	manifest *manifest.Manifest
-	writer   *ingest.Writer
+	cat *local.Catalog
 }
 
 func TestWalkFromCursor_RegisteredGapCrossesSegmentBoundary(t *testing.T) {
@@ -44,8 +43,8 @@ func TestWalkFromCursor_RegisteredGapCrossesSegmentBoundary(t *testing.T) {
 	err := subscribe.WalkFromCursor(t.Context(), subscribe.WalkInput{
 		StartSeq: 1,
 		StopSeq:  7,
-		Manifest: fixture.manifest,
-		Writer:   fixture.writer,
+		Catalog:  fixture.cat,
+		Fetcher:  fixture.cat.Fetcher(),
 		Gaps:     gaps,
 		OnGapJump: func(start, end uint64) {
 			jumps = append(jumps, seqspace.Gap{Start: start, End: end})
@@ -65,11 +64,10 @@ func TestWalkFromCursor_UnregisteredGapStillFailsLoud(t *testing.T) {
 	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 1,
 		StopSeq:  7,
-		Manifest: fixture.manifest,
-		Writer:   fixture.writer,
+		Catalog:  fixture.cat,
+		Fetcher:  fixture.cat.Fetcher(),
 	}, func(*subscribe.Entry) error { return nil })
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "rotation seam invariant violated")
+	require.ErrorContains(t, err, "unregistered sequence hole [3,5) before segment 1 block 0")
 }
 
 func TestWalkFromCursor_GapContainingStartAndEndingAtFloor(t *testing.T) {
@@ -90,8 +88,8 @@ func TestWalkFromCursor_GapContainingStartAndEndingAtFloor(t *testing.T) {
 			err := subscribe.WalkFromCursor(t.Context(), subscribe.WalkInput{
 				StartSeq: tc.start,
 				StopSeq:  tc.stop,
-				Manifest: fixture.manifest,
-				Writer:   fixture.writer,
+				Catalog:  fixture.cat,
+				Fetcher:  fixture.cat.Fetcher(),
 				Gaps:     gaps,
 			}, func(entry *subscribe.Entry) error {
 				got = append(got, entry.Event.Seq)
@@ -114,9 +112,9 @@ func TestWalkFromCursor_MultipleRegisteredGaps(t *testing.T) {
 			eventCount: 2,
 		})
 	}
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 11)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 	gaps := mustSeqGaps(t,
 		seqspace.Gap{Start: 3, End: 5},
 		seqspace.Gap{Start: 7, End: 9},
@@ -124,7 +122,7 @@ func TestWalkFromCursor_MultipleRegisteredGaps(t *testing.T) {
 
 	var got []uint64
 	err := subscribe.WalkFromCursor(t.Context(), subscribe.WalkInput{
-		StartSeq: 1, StopSeq: 11, Manifest: m, Writer: w, Gaps: gaps,
+		StartSeq: 1, StopSeq: 11, Catalog: cat, Fetcher: cat.Fetcher(), Gaps: gaps,
 	}, func(entry *subscribe.Entry) error {
 		got = append(got, entry.Event.Seq)
 		return nil
@@ -133,47 +131,53 @@ func TestWalkFromCursor_MultipleRegisteredGaps(t *testing.T) {
 	require.Equal(t, []uint64{1, 2, 5, 6, 9, 10}, got)
 }
 
-func TestWalkFromCursor_RegisteredGapDoesNotMaskAdjacentRotationSeam(t *testing.T) {
+// TestWalkFromCursor_RegisteredGapDoesNotMaskMissingTailSegment pins the
+// end-of-catalog check: crossing a registered vacancy is progress, but a view
+// that then ends below the floor is missing durable data. Segment 1 is on
+// disk but not in the catalog, as if its seal had never been published.
+func TestWalkFromCursor_RegisteredGapDoesNotMaskMissingTailSegment(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
-	firstPath := filepath.Join(segDir, ingest.SegmentFilename(0))
-	mustWriteSealedSegment(t, firstPath, sealedFixture{
+	mustWriteSealedSegment(t, filepath.Join(segDir, ingest.SegmentFilename(0)), sealedFixture{
 		minSeq: 1, maxSeq: 2, minWitnessedAt: 1_000, maxWitnessedAt: 2_000, eventCount: 2,
 	})
-	m := mustOpenManifest(t, segDir)
-
-	// Create the post-gap segment only after the manifest's initial scan. It is
-	// published from OnSeamRetry, exactly modelling a rotation that becomes
-	// visible one pass after the durable registered vacancy is crossed.
-	secondPath := filepath.Join(segDir, ingest.SegmentFilename(1))
-	mustWriteSealedSegment(t, secondPath, sealedFixture{
+	cat := mustCatalog(t, segDir, nil)
+	mustWriteSealedSegment(t, filepath.Join(segDir, ingest.SegmentFilename(1)), sealedFixture{
 		minSeq: 5, maxSeq: 6, minWitnessedAt: 5_000, maxWitnessedAt: 6_000, eventCount: 2,
 	})
-	st, w := openWriterAtTip(t, dir, 7)
-	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
 
-	var retries []uint64
 	var got []uint64
+	var jumps []seqspace.Gap
 	err := subscribe.WalkFromCursor(t.Context(), subscribe.WalkInput{
 		StartSeq: 1,
 		StopSeq:  7,
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 		Gaps:     mustSeqGaps(t, seqspace.Gap{Start: 3, End: 5}),
-		OnSeamRetry: func(seq uint64) {
-			retries = append(retries, seq)
-			if len(retries) == 1 {
-				require.NoError(t, m.OnSegmentSealed(1, secondPath))
-			}
+		OnGapJump: func(start, end uint64) {
+			jumps = append(jumps, seqspace.Gap{Start: start, End: end})
 		},
+	}, func(entry *subscribe.Entry) error {
+		got = append(got, entry.Event.Seq)
+		return nil
+	})
+	require.ErrorContains(t, err, "reached the end of the catalog at seq 5 before readable-log floor 7")
+	require.Equal(t, []uint64{1, 2}, got)
+	require.Equal(t, []seqspace.Gap{{Start: 3, End: 5}}, jumps)
+
+	// Once the segment is in the catalog the same walk completes.
+	require.NoError(t, cat.Refresh(t.Context()))
+	got = got[:0]
+	err = subscribe.WalkFromCursor(t.Context(), subscribe.WalkInput{
+		StartSeq: 1, StopSeq: 7, Catalog: cat, Fetcher: cat.Fetcher(),
+		Gaps: mustSeqGaps(t, seqspace.Gap{Start: 3, End: 5}),
 	}, func(entry *subscribe.Entry) error {
 		got = append(got, entry.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1, 2, 5, 6}, got)
-	require.Equal(t, []uint64{5}, retries, "the registered gap is progress; only the adjacent unpublished segment is a seam")
 }
 
 func TestWalkFromCursor_ObservesRegisteredGapBetweenBlocksInOneSegment(t *testing.T) {
@@ -197,13 +201,13 @@ func TestWalkFromCursor_ObservesRegisteredGapBetweenBlocksInOneSegment(t *testin
 	}
 	_, err = wseg.Seal()
 	require.NoError(t, err)
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 7)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	var jumps []seqspace.Gap
 	err = subscribe.WalkFromCursor(t.Context(), subscribe.WalkInput{
-		StartSeq: 1, StopSeq: 7, Manifest: m, Writer: w,
+		StartSeq: 1, StopSeq: 7, Catalog: cat, Fetcher: cat.Fetcher(),
 		Gaps: mustSeqGaps(t, seqspace.Gap{Start: 3, End: 5}),
 		OnGapJump: func(start, end uint64) {
 			jumps = append(jumps, seqspace.Gap{Start: start, End: end})
@@ -234,14 +238,14 @@ func TestWalkFromCursor_UnregisteredGapBetweenBlocksInOneSegmentFailsLoud(t *tes
 	}
 	_, err = wseg.Seal()
 	require.NoError(t, err)
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 7)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	err = subscribe.WalkFromCursor(t.Context(), subscribe.WalkInput{
-		StartSeq: 1, StopSeq: 7, Manifest: m, Writer: w,
+		StartSeq: 1, StopSeq: 7, Catalog: cat, Fetcher: cat.Fetcher(),
 	}, func(*subscribe.Entry) error { return nil })
-	require.ErrorContains(t, err, "unregistered sequence hole")
+	require.ErrorContains(t, err, "unregistered sequence hole [3,5) before segment 0 block 1")
 }
 
 func TestWalkFromCursor_CompactionSparseBlocksDoNotRequireRegisteredGap(t *testing.T) {
@@ -273,12 +277,12 @@ func TestWalkFromCursor_CompactionSparseBlocksDoNotRequireRegisteredGap(t *testi
 	}, segment.RewriteOptions{})
 	require.NoError(t, err)
 
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 5)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 	var got []uint64
 	err = subscribe.WalkFromCursor(t.Context(), subscribe.WalkInput{
-		StartSeq: 1, StopSeq: 5, Manifest: m, Writer: w,
+		StartSeq: 1, StopSeq: 5, Catalog: cat, Fetcher: cat.Fetcher(),
 	}, func(entry *subscribe.Entry) error {
 		got = append(got, entry.Event.Seq)
 		return nil
@@ -287,7 +291,7 @@ func TestWalkFromCursor_CompactionSparseBlocksDoNotRequireRegisteredGap(t *testi
 	require.Equal(t, []uint64{1, 4}, got)
 }
 
-func TestWalkFromCursor_UnregisteredActiveGapWithoutManifestFailsLoud(t *testing.T) {
+func TestWalkFromCursor_UnregisteredActiveGapFailsLoud(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
@@ -310,9 +314,10 @@ func TestWalkFromCursor_UnregisteredActiveGapWithoutManifestFailsLoud(t *testing
 	require.NoError(t, wseg.Close())
 	st, w := openWriterAtTip(t, dir, 7)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	err = subscribe.WalkFromCursor(t.Context(), subscribe.WalkInput{
-		StartSeq: 1, StopSeq: 7, Writer: w,
+		StartSeq: 1, StopSeq: 7, Catalog: cat, Fetcher: cat.Fetcher(),
 	}, func(*subscribe.Entry) error { return nil })
-	require.ErrorContains(t, err, "unregistered sequence hole")
+	require.ErrorContains(t, err, "unregistered sequence hole [3,5) before segment 0 block 1")
 }

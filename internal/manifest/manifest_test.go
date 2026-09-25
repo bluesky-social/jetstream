@@ -1,6 +1,7 @@
 package manifest_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -209,7 +210,7 @@ func TestLookbackFloor(t *testing.T) {
 	require.Equal(t, int64(0), emptyTime)
 }
 
-func TestOnSegmentSealed(t *testing.T) {
+func TestApplySegment_Seal(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	m := mustOpenManifest(t, dir)
@@ -220,7 +221,7 @@ func TestOnSegmentSealed(t *testing.T) {
 		minSeq: 0, maxSeq: 99, minWitnessedAt: 1_700_000_000_000_000, maxWitnessedAt: 1_700_000_010_000_000, eventCount: 10,
 	})
 
-	require.NoError(t, m.OnSegmentSealed(0, path))
+	require.NoError(t, manifest.ApplySegmentFile(m, nil, 0, path))
 	require.Equal(t, 1, m.SegmentCount())
 
 	b, ok := m.SegmentForSeq(50)
@@ -228,7 +229,7 @@ func TestOnSegmentSealed(t *testing.T) {
 	require.Equal(t, uint64(0), b.Idx)
 }
 
-func TestOnSegmentSealed_ReplacesExistingIdx(t *testing.T) {
+func TestApplySegment_ReplacesExistingIdx(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_0000000000.jss")
@@ -238,11 +239,11 @@ func TestOnSegmentSealed_ReplacesExistingIdx(t *testing.T) {
 	m := mustOpenManifest(t, dir)
 	require.Equal(t, 1, m.SegmentCount())
 
-	require.NoError(t, m.OnSegmentSealed(0, path))
+	require.NoError(t, manifest.ApplySegmentFile(m, nil, 0, path))
 	require.Equal(t, 1, m.SegmentCount())
 }
 
-func TestOnSegmentCompacted_ReplacesResidentMetadata(t *testing.T) {
+func TestApplySegment_CompactionReplacesResidentMetadata(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_0000000000.jss")
@@ -262,7 +263,7 @@ func TestOnSegmentCompacted_ReplacesResidentMetadata(t *testing.T) {
 	}, segment.RewriteOptions{})
 	require.NoError(t, err)
 
-	require.NoError(t, m.OnSegmentCompacted(0, path))
+	require.NoError(t, manifest.ApplySegmentFile(m, nil, 0, path))
 
 	after, _, _ := m.ListFrom(0, 1)
 	require.Len(t, after, 1)
@@ -276,6 +277,48 @@ func TestOnSegmentCompacted_ReplacesResidentMetadata(t *testing.T) {
 		events += b.EventCount
 	}
 	require.EqualValues(t, 5, events)
+}
+
+// TestApplySegment_FromBytes pins the byte seam: ApplySegment builds from
+// header and footer bytes alone the same metadata the directory scan loads,
+// and refuses parts whose generation, size, or checksum disagree, leaving
+// the resident set and generation untouched.
+func TestApplySegment_FromBytes(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg_0000000000.jss")
+	mustWriteSealedSegment(t, path, sealedFixture{
+		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
+	})
+	scanned, _, _ := mustOpenManifest(t, dir).ListFrom(0, 1)
+
+	p, ok, err := manifest.ReadSegmentParts(nil, path)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	m := mustOpenManifest(t, t.TempDir())
+	g0 := m.Generation()
+	corrupt := bytes.Clone(p.Footer)
+	corrupt[len(corrupt)/2] ^= 0xff
+	for name, apply := range map[string]func() error{
+		"wrong generation": func() error {
+			return m.ApplySegment(0, p.Generation+1, p.Header, p.Footer, p.CreatedAt, p.Size)
+		},
+		"wrong size": func() error {
+			return m.ApplySegment(0, p.Generation, p.Header, p.Footer, p.CreatedAt, p.Size+1)
+		},
+		"corrupt footer": func() error {
+			return m.ApplySegment(0, p.Generation, p.Header, corrupt, p.CreatedAt, p.Size)
+		},
+	} {
+		require.Error(t, apply(), name)
+		require.Zero(t, m.SegmentCount(), name)
+		require.Equal(t, g0, m.Generation(), name)
+	}
+
+	require.NoError(t, m.ApplySegment(0, p.Generation, p.Header, p.Footer, p.CreatedAt, p.Size))
+	applied, _, _ := m.ListFrom(0, 1)
+	require.Equal(t, scanned, applied)
 }
 
 // TestGenerationAdvancesOnMutation pins the contract the Phase B import
@@ -302,7 +345,7 @@ func TestGenerationAdvancesOnMutation(t *testing.T) {
 	mustWriteSealedSegment(t, path, sealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	require.NoError(t, m.OnSegmentSealed(0, path))
+	require.NoError(t, manifest.ApplySegmentFile(m, nil, 0, path))
 	g1 := m.Generation()
 	require.Greater(t, g1, g0, "seal must advance the generation")
 
@@ -313,7 +356,7 @@ func TestGenerationAdvancesOnMutation(t *testing.T) {
 		return segment.RowKeep
 	}, segment.RewriteOptions{})
 	require.NoError(t, err)
-	require.NoError(t, m.OnSegmentCompacted(0, path))
+	require.NoError(t, manifest.ApplySegmentFile(m, nil, 0, path))
 	g2 := m.Generation()
 	require.Greater(t, g2, g1, "compaction refresh must advance the generation")
 }
@@ -348,7 +391,7 @@ func TestRefreshSegment_RejectedRefreshLeavesManifestUntouched(t *testing.T) {
 		minSeq: 5, maxSeq: 15, minWitnessedAt: 1_500, maxWitnessedAt: 2_500, eventCount: 10,
 	})
 	require.NoError(t, os.Rename(overlapping, path1))
-	require.ErrorIs(t, m.OnSegmentSealed(1, path1), manifest.ErrSegmentSeqOverlap)
+	require.ErrorIs(t, manifest.ApplySegmentFile(m, nil, 1, path1), manifest.ErrSegmentSeqOverlap)
 
 	require.Equal(t, genBefore, m.Generation(),
 		"rejected refresh must not advance the generation")

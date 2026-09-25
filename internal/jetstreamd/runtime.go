@@ -53,6 +53,7 @@ type Runtime struct {
 	cancelManifest context.CancelFunc
 	metaStore      *pebblestore.Store
 	manifest       *manifest.Manifest
+	catalogLoad    *backgroundLoad
 	tail           *subscribe.Tail
 	verifier       *atmossync.Verifier
 	orchestrator   *orchestrator.Orchestrator
@@ -227,8 +228,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: build segment catalog: %w", err))
 	}
 	segCatalog.OnSealed(catalog.Main, func(v catalog.SegmentView, path string) error {
-		return mft.OnSegmentSealed(v.Index, path)
+		return manifest.ApplySegmentFile(mft, opts.StorageFS, v.Index, path)
 	})
+	// Like the manifest, the catalog loads what is on disk in the
+	// background. Writers may publish seals meanwhile; Refresh keeps them.
+	// Readers wait on catalogLoad before their first view.
+	catalogLoad := startBackgroundLoad(manifestCtx, segCatalog.Refresh)
+	rt.catalogLoad = catalogLoad
 
 	// writerPtr is published by the orchestrator once the steady-state
 	// live consumer opens its ingest.Writer; the cursor handler reads it
@@ -275,9 +281,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        mft,
+		Catalog:         segCatalog,
+		Fetcher:         segCatalog.Fetcher(),
+		Ready:           catalogLoad.Wait,
 		WriterRef:       &writerPtr,
-		FS:              opts.StorageFS,
 		BlockCacheBytes: opts.SubscribeBlockCacheBytes,
 		Metrics:         subscribeMetrics,
 	})
@@ -331,7 +338,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		}
 	}
 	onSegmentCompacted := func(idx uint64, path string) error {
-		if err := mft.OnSegmentCompacted(idx, path); err != nil {
+		if err := manifest.ApplySegmentFile(mft, opts.StorageFS, idx, path); err != nil {
 			return err
 		}
 		if err := segCatalog.Reload(catalog.Main, idx); err != nil {
@@ -463,7 +470,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Tail:      tail,
 		Store:     metaKV,
 		Manifest:  mft,
-		FS:        opts.StorageFS,
+		Catalog:   segCatalog,
+		Fetcher:   segCatalog.Fetcher(),
 		WriterRef: &writerPtr,
 		Logger:    processLogger,
 		Metrics:   subscribeMetrics,
@@ -477,7 +485,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Tail:      tail,
 		Store:     metaKV,
 		Manifest:  mft,
-		FS:        opts.StorageFS,
+		Catalog:   segCatalog,
+		Fetcher:   segCatalog.Fetcher(),
 		WriterRef: &writerPtr,
 		Logger:    processLogger,
 		Metrics:   subscribeMetrics,
@@ -596,6 +605,16 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 				return nil
 			}
 			return fmt.Errorf("manifest load: %w", err)
+		}
+		return nil
+	}))
+
+	g.Go(r.goroutineRoot("catalog_wait", func() error {
+		if err := r.catalogLoad.Wait(gctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return fmt.Errorf("catalog load: %w", err)
 		}
 		return nil
 	}))
@@ -777,5 +796,32 @@ func phaseBarrier(barrier PhaseBarrier) orchestrator.PhaseBarrier {
 	}
 	return func(ctx context.Context) error {
 		return barrier(ctx)
+	}
+}
+
+// backgroundLoad is a startup load run off the critical path, such as the
+// catalog's initial directory scan. Wait is the readiness gate.
+type backgroundLoad struct {
+	done chan struct{}
+	err  error
+}
+
+func startBackgroundLoad(ctx context.Context, load func(context.Context) error) *backgroundLoad {
+	l := &backgroundLoad{done: make(chan struct{})}
+	go func() {
+		defer close(l.done)
+		l.err = load(ctx)
+	}()
+	return l
+}
+
+// Wait blocks until the load finishes and returns its error, or ctx.Err()
+// if the caller stops waiting first.
+func (l *backgroundLoad) Wait(ctx context.Context) error {
+	select {
+	case <-l.done:
+		return l.err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

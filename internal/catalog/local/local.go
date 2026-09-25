@@ -221,6 +221,15 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 	if !ok {
 		return nil
 	}
+	// What the catalog knows is sampled before the directory is listed, so
+	// every change that lands during the scan is newer than this sample.
+	c.mu.Lock()
+	known := make(map[uint64]catalog.SegmentView, c.sealed[ns].Len())
+	for _, v := range c.sealed[ns].Segments() {
+		known[v.Index] = v
+	}
+	c.mu.Unlock()
+
 	files, err := ingest.SegmentFilesFS(c.fs, dir)
 	if err != nil {
 		if _, statErr := c.fs.Stat(dir); oserror.IsNotExist(statErr) {
@@ -229,13 +238,6 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 			return err
 		}
 	}
-
-	c.mu.Lock()
-	known := make(map[uint64]catalog.SegmentView, c.sealed[ns].Len())
-	for _, v := range c.sealed[ns].Segments() {
-		known[v.Index] = v
-	}
-	c.mu.Unlock()
 
 	var (
 		sealed  []catalog.SegmentView
@@ -275,6 +277,20 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A writer may have sealed, or a Reload re-read, a segment while the
+	// directory was being scanned, and the scan may have read that file
+	// before the change. Those views are at least as new as the scan's, so
+	// they survive; only what the catalog already knew when the scan began
+	// is the scan's to replace or drop.
+	for _, v := range c.sealed[ns].Segments() {
+		if k, ok := known[v.Index]; ok && sameGeneration(k, v) {
+			continue
+		}
+		if list, err = list.Put(v); err != nil {
+			return fmt.Errorf("catalog/local: %s: %w", dir, err)
+		}
+		sealed = list.Segments()
+	}
 	if !slices.EqualFunc(sealed, c.sealed[ns].Segments(), sameGeneration) {
 		c.sealed[ns] = list
 		c.rev++

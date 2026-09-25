@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
@@ -128,12 +130,21 @@ func runSeqLeaseSubscriberChild() {
 	if err != nil {
 		fail(err)
 	}
+	segDir := filepath.Join(dataDir, "segments")
+	cat, err := localcatalog.New(localcatalog.Config{Dirs: map[catalog.Namespace]string{catalog.Main: segDir}})
+	if err != nil {
+		fail(err)
+	}
+	if err := cat.Refresh(context.Background()); err != nil {
+		fail(err)
+	}
 	w, err := ingest.Open(ingest.Config{
-		SegmentsDir:              filepath.Join(dataDir, "segments"),
+		SegmentsDir:              segDir,
 		Store:                    st,
 		Logger:                   logger,
 		MaxEventsPerBlock:        4,
 		ReserveClientVisibleSeqs: true,
+		Catalog:                  cat,
 	})
 	if err != nil {
 		fail(err)
@@ -145,7 +156,9 @@ func runSeqLeaseSubscriberChild() {
 	var writerRef atomic.Pointer[ingest.Writer]
 	writerRef.Store(w)
 	metrics := subscribe.NewMetrics(prometheus.NewRegistry())
-	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{WriterRef: &writerRef, Metrics: metrics})
+	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{
+		Catalog: cat, Fetcher: cat.Fetcher(), WriterRef: &writerRef, Metrics: metrics,
+	})
 	tail, err := subscribe.New(subscribe.Config{Logger: logger, Metrics: metrics}, cold.Read, w.NextSeq)
 	if err != nil {
 		fail(err)

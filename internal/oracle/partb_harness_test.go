@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
@@ -129,6 +131,15 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 	require.NoError(t, m.Wait(context.Background()))
 	s.manifest = m
 
+	// Wired like the runtime: the catalog hears every seal first and feeds
+	// main-namespace seals to the manifest.
+	cat, err := localcatalog.New(localcatalog.Config{Dirs: map[catalog.Namespace]string{catalog.Main: segDir}})
+	require.NoError(t, err)
+	require.NoError(t, cat.Refresh(context.Background()))
+	cat.OnSealed(catalog.Main, func(v catalog.SegmentView, path string) error {
+		return manifest.ApplySegmentFile(m, nil, v.Index, path)
+	})
+
 	st, err := pebblestore.Open(dataDir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
 	require.NoError(t, st.Set(context.Background(), []byte("seq/next"), encodeUint64LEOracle(nextSeq)))
@@ -139,7 +150,7 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 		Store:       st,
 		Logger:      logger,
 		Metrics:     ingest.NewMetrics(prometheus.NewRegistry()),
-		Catalog:     ingest.SealedPathFunc(segDir, m.OnSegmentSealed),
+		Catalog:     cat,
 	})
 	require.NoError(t, err)
 	s.writer = w
@@ -149,7 +160,8 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
 	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        m,
+		Catalog:         cat,
+		Fetcher:         cat.Fetcher(),
 		WriterRef:       &writerPtr,
 		BlockCacheBytes: 1 << 20,
 	})
@@ -195,6 +207,8 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 		Tail:     tail,
 		Store:    st,
 		Manifest: m,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 		Writer:   w,
 		Logger:   logger,
 		Metrics:  subscribe.NewMetrics(prometheus.NewRegistry()),

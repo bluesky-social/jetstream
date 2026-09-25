@@ -74,29 +74,32 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	return w
 }
 
-func TestActiveFlushedRangeExcludesPendingAndAdvancesByBlock(t *testing.T) {
+func TestActiveSegmentExcludesPendingAndAdvancesByBlock(t *testing.T) {
 	t.Parallel()
 	w := newTestWriter(t, Config{MaxEventsPerBlock: 2, MaxSegmentBytes: 1 << 30})
+	blocks := func() []segment.BlockInfo {
+		v, ok := w.ActiveSegment()
+		require.True(t, ok)
+		require.Equal(t, uint64(0), v.Index)
+		return v.Blocks
+	}
 
 	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
-	_, ok := w.ActiveFlushedRange(1)
-	require.False(t, ok, "pending memory must not be cold-readable")
+	require.Empty(t, blocks(), "pending memory must not be cold-readable")
 
 	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
-	r1, ok := w.ActiveFlushedRange(1)
-	require.True(t, ok)
-	require.Equal(t, uint64(0), r1.Index)
-	require.Equal(t, uint64(segment.ReservedHeaderBytes), r1.StartOffset)
-	require.Greater(t, r1.EndOffset, r1.StartOffset)
+	b1 := blocks()
+	require.Len(t, b1, 1)
+	require.Equal(t, uint64(segment.ReservedHeaderBytes), b1[0].Offset)
+	require.Equal(t, [2]uint64{1, 2}, [2]uint64{b1[0].MinSeq, b1[0].MaxSeq})
 
 	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
-	_, ok = w.ActiveFlushedRange(3)
-	require.False(t, ok, "the next pending block must remain excluded")
+	require.Len(t, blocks(), 1, "the next pending block must remain excluded")
 	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
-	r2, ok := w.ActiveFlushedRange(3)
-	require.True(t, ok)
-	require.Equal(t, r1.EndOffset, r2.StartOffset)
-	require.Greater(t, r2.EndOffset, r2.StartOffset)
+	b2 := blocks()
+	require.Len(t, b2, 2)
+	require.Equal(t, b1[0].Offset+8+uint64(b1[0].CompressedSize), b2[1].Offset)
+	require.Equal(t, [2]uint64{3, 4}, [2]uint64{b2[1].MinSeq, b2[1].MaxSeq})
 }
 
 func TestActiveTimeFloorSeq_FlushedPendingAndLiveEdge(t *testing.T) {

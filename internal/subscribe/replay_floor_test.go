@@ -2,19 +2,21 @@ package subscribe_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	"github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
@@ -22,7 +24,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func openFloorReplayFixture(t *testing.T, onSeal func(*manifest.Manifest) func(uint64, string) error) (*manifest.Manifest, *ingest.Writer) {
+// withholdingCatalog forwards a writer's seals to the catalog except those
+// withhold picks, which it records instead: the test's way of making a
+// sealed segment missing from the catalog.
+type withholdingCatalog struct {
+	*local.Catalog
+	withhold func(catalog.SegmentView) bool
+	withheld []catalog.SegmentView
+}
+
+func (c *withholdingCatalog) Sealed(v catalog.SegmentView) error {
+	if c.withhold != nil && c.withhold(v) {
+		c.withheld = append(c.withheld, v)
+		return nil
+	}
+	return c.Catalog.Sealed(v)
+}
+
+func openFloorReplayFixture(t *testing.T, withhold func(catalog.SegmentView) bool) (*withholdingCatalog, *ingest.Writer) {
 	t.Helper()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
@@ -32,17 +51,7 @@ func openFloorReplayFixture(t *testing.T, onSeal func(*manifest.Manifest) func(u
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	m, err := manifest.Open(manifest.Options{
-		SegmentsDir: segDir,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
-	require.NoError(t, err)
-	require.NoError(t, m.Wait(context.Background()))
-
-	sealHook := m.OnSegmentSealed
-	if onSeal != nil {
-		sealHook = onSeal(m)
-	}
+	cat := &withholdingCatalog{Catalog: mustCatalog(t, segDir, nil), withhold: withhold}
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:           segDir,
 		Store:                 st,
@@ -50,12 +59,31 @@ func openFloorReplayFixture(t *testing.T, onSeal func(*manifest.Manifest) func(u
 		MaxSegmentBytes:       512,
 		Logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:               ingest.NewMetrics(prometheus.NewRegistry()),
-		Catalog:               ingest.SealedPathFunc(segDir, sealHook),
+		Catalog:               cat,
 		ReadLogRetentionBytes: 0,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
-	return m, w
+	return cat, w
+}
+
+// hookFetcher runs before ahead of each fetch it delegates.
+type hookFetcher struct {
+	catalog.Fetcher
+	before func(catalog.BlockRef)
+}
+
+func (f hookFetcher) Fetch(ctx context.Context, ref catalog.BlockRef) ([]byte, error) {
+	f.before(ref)
+	return f.Fetcher.Fetch(ctx, ref)
+}
+
+func seqRange(start, stop uint64) []uint64 {
+	out := make([]uint64, 0, stop-start)
+	for s := start; s < stop; s++ {
+		out = append(out, s)
+	}
+	return out
 }
 
 func appendReplayEvent(t *testing.T, w *ingest.Writer, did string) uint64 {
@@ -89,7 +117,7 @@ func lastOr(s []uint64, def uint64) uint64 {
 
 func TestWalkFromCursor_ReadLogFloorConcurrentRotation(t *testing.T) {
 	t.Parallel()
-	m, w := openFloorReplayFixture(t, nil)
+	cat, w := openFloorReplayFixture(t, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -133,8 +161,8 @@ func TestWalkFromCursor_ReadLogFloorConcurrentRotation(t *testing.T) {
 		err := subscribe.WalkFromCursor(ctx, subscribe.WalkInput{
 			StartSeq: start,
 			StopSeq:  floor,
-			Manifest: m,
-			Writer:   w,
+			Catalog:  cat,
+			Fetcher:  cat.Fetcher(),
 		}, func(e *subscribe.Entry) error {
 			emitted = append(emitted, e.Event.Seq)
 			return nil
@@ -143,18 +171,17 @@ func TestWalkFromCursor_ReadLogFloorConcurrentRotation(t *testing.T) {
 			if ctx.Err() != nil {
 				return
 			}
-			// A "made no progress / rotation seam invariant violated" error must
-			// NEVER fire in this fixture: every seq below the floor is dense and
-			// durable (no compaction), so the convergence loop must always fill a
-			// seam gap. Any other error is the documented benign concurrent-seal
-			// transient (WalkActive racing a Seal reads footer bytes and fails
-			// loud with a zstd magic mismatch); a real subscriber just reconnects
-			// and retries from the same cursor, so the test does too — it never
-			// advances a cursor, so retrying loses no coverage.
-			if strings.Contains(err.Error(), "rotation seam invariant violated") {
-				holeFound.Store(true)
-				t.Errorf("floor-bounded walk failed to converge below the floor: %v", err)
+			// Every seq below the floor is dense and durable (no compaction),
+			// and every view taken after the floor covers it, so no walk may
+			// fail. The one tolerated error is a walk that lost the seal race
+			// maxStaleRetries times in a row under this fixture's rotation
+			// rate; a real subscriber reconnects from the same cursor, and so
+			// does the test, which never advances one.
+			if errors.Is(err, catalog.ErrStaleRef) {
+				return
 			}
+			holeFound.Store(true)
+			t.Errorf("floor-bounded walk failed below the floor: %v", err)
 			return
 		}
 		walkRuns.Add(1)
@@ -162,10 +189,7 @@ func TestWalkFromCursor_ReadLogFloorConcurrentRotation(t *testing.T) {
 		// no holes, and reaching floor-1. The single-pass seam bug (issue #190
 		// regression) manifests as an early clean stop below floor-1, which a
 		// contiguity-only check cannot see.
-		want := make([]uint64, 0, floor-start)
-		for s := start; s < floor; s++ {
-			want = append(want, s)
-		}
+		want := seqRange(start, floor)
 		if !slices.Equal(emitted, want) {
 			holeFound.Store(true)
 			t.Errorf("floor-bounded walk incomplete: got %d..%d (len %d), want %d..%d (len %d)",
@@ -197,17 +221,7 @@ func TestWalkFromCursor_ReadLogFloorConcurrentRotation(t *testing.T) {
 
 func TestWalkFromCursor_GapBelowReadLogFloorFailsLoud(t *testing.T) {
 	t.Parallel()
-	type sealEvent struct {
-		idx  uint64
-		path string
-	}
-	var seals []sealEvent
-	m, w := openFloorReplayFixture(t, func(*manifest.Manifest) func(uint64, string) error {
-		return func(idx uint64, path string) error {
-			seals = append(seals, sealEvent{idx: idx, path: path})
-			return nil
-		}
-	})
+	cat, w := openFloorReplayFixture(t, func(v catalog.SegmentView) bool { return v.Index == 1 })
 
 	for w.ActiveIndex() < 3 {
 		appendReplayEvent(t, w, "did:plc:gap")
@@ -216,119 +230,98 @@ func TestWalkFromCursor_GapBelowReadLogFloorFailsLoud(t *testing.T) {
 		appendReplayEvent(t, w, "did:plc:gap")
 	}
 	require.NoError(t, w.Flush(context.Background()))
-	require.GreaterOrEqual(t, len(seals), 3)
-
-	withheld := seals[1]
-	for _, s := range seals {
-		if s.idx == withheld.idx {
-			continue
-		}
-		require.NoError(t, m.OnSegmentSealed(s.idx, s.path))
-	}
-
-	r, err := segment.Open(segment.ReaderConfig{Path: withheld.path})
-	require.NoError(t, err)
-	start := r.Header().MinSeq
-	require.NoError(t, r.Close())
+	require.Len(t, cat.withheld, 1)
+	withheld := cat.withheld[0]
 
 	var emitted []uint64
-	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
-		StartSeq: start,
+	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
+		StartSeq: withheld.MinSeq(),
 		StopSeq:  w.ReadLog().FloorSeq(),
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		emitted = append(emitted, e.Event.Seq)
 		return nil
 	})
 	require.Error(t, err, "missing data below the readable-log floor must not be skipped")
-	require.Contains(t, err.Error(), "made no progress")
+	require.ErrorContains(t, err, fmt.Sprintf("unregistered sequence hole [%d,", withheld.MinSeq()))
 	require.Empty(t, emitted, "walk must not emit past the missing segment")
 }
 
-// TestWalkFromCursor_SeamConvergesWhenSegmentPublishedLate deterministically
-// models the rotation seam issue #190 guards: a sealed segment is present on
-// disk and owns seqs below the floor, but the walk's first manifest snapshot
-// predates its publish. Without the convergence loop the single-pass walk would
-// stop below the floor and the cold reader would jump the cursor to the floor,
-// silently dropping the segment. Here we publish the withheld segment on the
-// first seam retry (standing in for rotateLocked's publish-before-bump
-// happens-before) and assert the walk then serves the full range.
-func TestWalkFromCursor_SeamConvergesWhenSegmentPublishedLate(t *testing.T) {
+// TestWalkFromCursor_ActiveSealedMidWalkRetries deterministically lands a
+// seal between a view and the fetch of its active blocks: the fetch sees the
+// sealed generation and fails stale, and the walk resumes on a fresh view,
+// where the segment is sealed, without skipping or repeating a seq.
+func TestWalkFromCursor_ActiveSealedMidWalkRetries(t *testing.T) {
 	t.Parallel()
-	type sealEvent struct {
-		idx  uint64
-		path string
-	}
-	var seals []sealEvent
-	m, w := openFloorReplayFixture(t, func(*manifest.Manifest) func(uint64, string) error {
-		return func(idx uint64, path string) error {
-			seals = append(seals, sealEvent{idx: idx, path: path})
-			return nil
-		}
-	})
+	cat, w := openFloorReplayFixture(t, nil)
 
-	// Fill and seal several segments (MaxEventsPerBlock=4, MaxSegmentBytes=512
-	// rotate quickly), then flush the tail so every seq below the floor is
-	// durable and file-visible.
-	for w.ActiveIndex() < 3 {
-		appendReplayEvent(t, w, "did:plc:seam")
+	for w.ActiveIndex() < 2 {
+		appendReplayEvent(t, w, "did:plc:stale")
 	}
-	for range 4 {
-		appendReplayEvent(t, w, "did:plc:seam")
+	for range 6 {
+		appendReplayEvent(t, w, "did:plc:stale")
 	}
 	require.NoError(t, w.Flush(context.Background()))
-	require.GreaterOrEqual(t, len(seals), 3)
-
-	// Publish every sealed segment EXCEPT the first into the manifest. The
-	// first segment is the one whose publish "races" the walk: it is absent
-	// from the initial snapshot and only becomes visible on the seam retry.
-	withheld := seals[0]
-	for _, s := range seals[1:] {
-		require.NoError(t, m.OnSegmentSealed(s.idx, s.path))
-	}
-
-	r, err := segment.Open(segment.ReaderConfig{Path: withheld.path})
-	require.NoError(t, err)
-	start := r.Header().MinSeq
-	require.NoError(t, r.Close())
-
 	floor := w.ReadLog().FloorSeq()
+	start := cat.Snapshot().Segments(catalog.Main)[0].MinSeq()
 	require.Greater(t, floor, start)
 
-	var retries int
+	sealed := false
+	fetcher := hookFetcher{Fetcher: cat.Fetcher(), before: func(ref catalog.BlockRef) {
+		if ref.Generation == 0 && !sealed {
+			sealed = true
+			require.NoError(t, w.ForceRotate(context.Background()))
+		}
+	}}
+	var retries []uint64
 	var emitted []uint64
-	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
-		StartSeq: start,
-		StopSeq:  floor,
-		Manifest: m,
-		Writer:   w,
-		OnSeamRetry: func(uint64) {
-			// Publish the withheld segment exactly once, on the first retry —
-			// the deterministic analogue of rotateLocked publishing N before
-			// the next manifest read.
-			if retries == 0 {
-				require.NoError(t, m.OnSegmentSealed(withheld.idx, withheld.path))
-			}
-			retries++
-		},
+	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
+		StartSeq:     start,
+		StopSeq:      floor,
+		Catalog:      cat,
+		Fetcher:      fetcher,
+		OnStaleRetry: func(seq uint64) { retries = append(retries, seq) },
 	}, func(e *subscribe.Entry) error {
 		emitted = append(emitted, e.Event.Seq)
 		return nil
 	})
 	require.NoError(t, err)
-	require.Positive(t, retries, "the seam retry path must be exercised")
+	require.True(t, sealed, "the walk must reach the active segment")
+	require.Len(t, retries, 1)
+	require.Equal(t, seqRange(start, floor), emitted)
+}
 
-	want := make([]uint64, 0, floor-start)
-	for s := start; s < floor; s++ {
-		want = append(want, s)
-	}
-	require.Equal(t, want, emitted, "seam convergence must serve the full [start, floor) range gap-free")
+// TestWalkFromCursor_StaleRefsThatNeverConvergeFail bounds the retry loop: a
+// catalog whose refs are always stale is broken, and the walk says so.
+func TestWalkFromCursor_StaleRefsThatNeverConvergeFail(t *testing.T) {
+	t.Parallel()
+	cat, w := openFloorReplayFixture(t, nil)
+	seq := appendReplayEvent(t, w, "did:plc:stale")
+	require.NoError(t, w.Flush(context.Background()))
+
+	retries := 0
+	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
+		StartSeq:     seq,
+		StopSeq:      w.ReadLog().FloorSeq(),
+		Catalog:      cat,
+		Fetcher:      staleFetcher{},
+		OnStaleRetry: func(uint64) { retries++ },
+	}, func(*subscribe.Entry) error { return nil })
+	require.ErrorIs(t, err, catalog.ErrStaleRef)
+	require.ErrorContains(t, err, "stale views in a row")
+	require.Positive(t, retries)
+}
+
+type staleFetcher struct{}
+
+func (staleFetcher) Fetch(context.Context, catalog.BlockRef) ([]byte, error) {
+	return nil, catalog.ErrStaleRef
 }
 
 func TestWalkFromCursor_DoesNotReplayPendingMemory(t *testing.T) {
 	t.Parallel()
-	m, w := openFloorReplayFixture(t, nil)
+	cat, w := openFloorReplayFixture(t, nil)
 
 	pendingSeq := appendReplayEvent(t, w, "did:plc:pending")
 	require.Equal(t, pendingSeq, w.ReadLog().TipSeq()-1)
@@ -338,8 +331,8 @@ func TestWalkFromCursor_DoesNotReplayPendingMemory(t *testing.T) {
 	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: pendingSeq,
 		StopSeq:  w.ReadLog().FloorSeq(),
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		before = append(before, e.Event.Seq)
 		return nil
@@ -355,8 +348,8 @@ func TestWalkFromCursor_DoesNotReplayPendingMemory(t *testing.T) {
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: pendingSeq,
 		StopSeq:  floor,
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		after = append(after, e.Event.Seq)
 		return nil

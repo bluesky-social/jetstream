@@ -9,8 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	"github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,14 +31,14 @@ func TestColdReader_InvalidateSegmentPurgesDecodedBlocks(t *testing.T) {
 	mustWriteColdReaderSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), coldReaderSealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	m := mustOpenColdReaderManifest(t, segDir)
+	cat := mustColdReaderCatalog(t, segDir)
 	st, w := openColdReaderWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
 
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
 	rd := NewColdReader(ColdReaderConfig{
-		Manifest: m, WriterRef: &writerPtr, BlockCacheBytes: 1 << 20,
+		Catalog: cat, Fetcher: cat.Fetcher(), WriterRef: &writerPtr, BlockCacheBytes: 1 << 20,
 	})
 
 	batch, _, err := rd.Read(context.Background(), 0, 10)
@@ -78,14 +79,12 @@ func mustWriteColdReaderSealedSegment(tb testing.TB, path string, f coldReaderSe
 	require.NoError(tb, err)
 }
 
-func mustOpenColdReaderManifest(tb testing.TB, dir string) *manifest.Manifest {
+func mustColdReaderCatalog(tb testing.TB, segDir string) *local.Catalog {
 	tb.Helper()
-	m, err := manifest.Open(manifest.Options{
-		SegmentsDir: dir,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	c, err := local.New(local.Config{Dirs: map[catalog.Namespace]string{catalog.Main: segDir}})
 	require.NoError(tb, err)
-	return m
+	require.NoError(tb, c.Refresh(context.Background()))
+	return c
 }
 
 func openColdReaderWriterAtTip(t testing.TB, dir string, nextSeq uint64) (*pebblestore.Store, *ingest.Writer) {

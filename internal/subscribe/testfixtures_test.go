@@ -1,12 +1,16 @@
 package subscribe_test
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	"github.com/bluesky-social/jetstream/internal/catalog/local"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -54,4 +58,18 @@ func mustOpenManifest(tb testing.TB, dir string) *manifest.Manifest {
 	})
 	require.NoError(tb, err)
 	return m
+}
+
+// mustCatalog returns a local catalog over segDir holding what is on disk,
+// with w, when non-nil, attached as the main namespace's writer. A writer
+// opened without Config.Catalog does not publish its seals to it.
+func mustCatalog(tb testing.TB, segDir string, w *ingest.Writer) *local.Catalog {
+	tb.Helper()
+	c, err := local.New(local.Config{Dirs: map[catalog.Namespace]string{catalog.Main: segDir}})
+	require.NoError(tb, err)
+	require.NoError(tb, c.Refresh(context.Background()))
+	if w != nil {
+		c.AttachActive(catalog.Main, w)
+	}
+	return c
 }

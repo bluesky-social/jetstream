@@ -20,14 +20,14 @@ func newColdShareFixture(t *testing.T) *ColdReader {
 	mustWriteColdReaderSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), coldReaderSealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	m := mustOpenColdReaderManifest(t, segDir)
+	cat := mustColdReaderCatalog(t, segDir)
 	st, w := openColdReaderWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
 
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
 	return NewColdReader(ColdReaderConfig{
-		Manifest: m, WriterRef: &writerPtr, BlockCacheBytes: 1 << 20,
+		Catalog: cat, Fetcher: cat.Fetcher(), WriterRef: &writerPtr, BlockCacheBytes: 1 << 20,
 	})
 }
 
@@ -111,7 +111,7 @@ func TestColdReader_MemoGrowthTriggersEviction(t *testing.T) {
 	mustWriteColdReaderSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), coldReaderSealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	m := mustOpenColdReaderManifest(t, segDir)
+	cat := mustColdReaderCatalog(t, segDir)
 	st, w := openColdReaderWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
 
@@ -120,7 +120,7 @@ func TestColdReader_MemoGrowthTriggersEviction(t *testing.T) {
 
 	// Learn the raw block's accounted size with an unconstrained cache.
 	probe := NewColdReader(ColdReaderConfig{
-		Manifest: m, WriterRef: &writerPtr, BlockCacheBytes: 1 << 20,
+		Catalog: cat, Fetcher: cat.Fetcher(), WriterRef: &writerPtr, BlockCacheBytes: 1 << 20,
 	})
 	_, _, err := probe.Read(context.Background(), 0, 10)
 	require.NoError(t, err)
@@ -129,7 +129,7 @@ func TestColdReader_MemoGrowthTriggersEviction(t *testing.T) {
 
 	// Budget = raw block + 1: insert fits, any memo growth overflows.
 	rd := NewColdReader(ColdReaderConfig{
-		Manifest: m, WriterRef: &writerPtr, BlockCacheBytes: rawBytes + 1,
+		Catalog: cat, Fetcher: cat.Fetcher(), WriterRef: &writerPtr, BlockCacheBytes: rawBytes + 1,
 	})
 	batch, _, err := rd.Read(context.Background(), 0, 10)
 	require.NoError(t, err)

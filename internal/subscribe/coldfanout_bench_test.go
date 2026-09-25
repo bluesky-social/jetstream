@@ -132,13 +132,13 @@ func newBenchColdReader(b *testing.B, eventCount int) *ColdReader {
 		b.Fatal(err)
 	}
 
-	m := mustOpenColdReaderManifest(b, segDir)
+	cat := mustColdReaderCatalog(b, segDir)
 	st, iw := openColdReaderWriterAtTip(b, dir, uint64(eventCount))
 	b.Cleanup(func() { _ = iw.Close(); _ = st.Close() })
 
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(iw)
 	return NewColdReader(ColdReaderConfig{
-		Manifest: m, WriterRef: &writerPtr, BlockCacheBytes: 64 << 20,
+		Catalog: cat, Fetcher: cat.Fetcher(), WriterRef: &writerPtr, BlockCacheBytes: 64 << 20,
 	})
 }

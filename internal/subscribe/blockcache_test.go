@@ -5,9 +5,19 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
+
+// testKey is a cache key for block 0 of segment seg.
+func testKey(seg uint64) blockKey {
+	return blockKey{id: localBlockID{ns: catalog.Main, seg: seg}, seg: seg}
+}
+
+func testRef(seg, gen uint64) catalog.BlockRef {
+	return catalog.BlockRef{Namespace: catalog.Main, Segment: seg, Generation: gen}
+}
 
 func decodedFixture(seqs ...uint64) []segment.Event {
 	out := make([]segment.Event, len(seqs))
@@ -32,7 +42,7 @@ func TestBlockCache_GetOrDecode_RunsDecodeOnce(t *testing.T) {
 	for range N {
 		go func() {
 			defer wg.Done()
-			evs, err := c.getOrDecode(blockKey{segIdx: 0, blockIdx: 0}, decode)
+			evs, err := c.getOrDecode(testKey(0), decode)
 			require.NoError(t, err)
 			require.Len(t, evs, 3)
 		}()
@@ -48,14 +58,14 @@ func TestBlockCache_EvictsByByteBudget(t *testing.T) {
 		return func() ([]segment.Event, error) { return decodedFixture(seg*10, seg*10+1, seg*10+2), nil }
 	}
 	for seg := range uint64(10) {
-		_, err := c.getOrDecode(blockKey{segIdx: seg, blockIdx: 0}, mk(seg))
+		_, err := c.getOrDecode(testKey(seg), mk(seg))
 		require.NoError(t, err)
 	}
 	require.LessOrEqual(t, c.bytes(), 200, "cache must respect byte budget")
 
 	// The earliest key was evicted: a re-get re-decodes.
 	var redecoded atomic.Bool
-	_, err := c.getOrDecode(blockKey{segIdx: 0, blockIdx: 0}, func() ([]segment.Event, error) {
+	_, err := c.getOrDecode(testKey(0), func() ([]segment.Event, error) {
 		redecoded.Store(true)
 		return decodedFixture(0, 1, 2), nil
 	})
@@ -66,7 +76,7 @@ func TestBlockCache_EvictsByByteBudget(t *testing.T) {
 func TestBlockCache_InvalidateSegmentForcesRedecode(t *testing.T) {
 	t.Parallel()
 	c := newBlockCache(1 << 20)
-	key := c.keyForBlock(7, 11, 0)
+	key := c.keyForRef(testRef(7, 11))
 
 	var calls atomic.Int64
 	evs, err := c.getOrDecode(key, func() ([]segment.Event, error) {
@@ -78,7 +88,7 @@ func TestBlockCache_InvalidateSegmentForcesRedecode(t *testing.T) {
 
 	c.invalidateSegment(7)
 
-	key = c.keyForBlock(7, 11, 0)
+	key = c.keyForRef(testRef(7, 11))
 	evs, err = c.getOrDecode(key, func() ([]segment.Event, error) {
 		calls.Add(1)
 		return decodedFixture(2), nil
@@ -91,7 +101,7 @@ func TestBlockCache_InvalidateSegmentForcesRedecode(t *testing.T) {
 func TestBlockCache_InvalidateSegmentPreventsInflightInsert(t *testing.T) {
 	t.Parallel()
 	c := newBlockCache(1 << 20)
-	key := c.keyForBlock(9, 22, 0)
+	key := c.keyForRef(testRef(9, 22))
 	oldKey := key
 
 	started := make(chan struct{})
@@ -118,7 +128,7 @@ func TestBlockCache_InvalidateSegmentPreventsInflightInsert(t *testing.T) {
 	c.mu.Unlock()
 	require.False(t, staleInserted, "old in-flight decode must not populate the resident cache")
 
-	key = c.keyForBlock(9, 22, 0)
+	key = c.keyForRef(testRef(9, 22))
 	var fresh atomic.Bool
 	evs, err := c.getOrDecode(key, func() ([]segment.Event, error) {
 		fresh.Store(true)
@@ -132,12 +142,12 @@ func TestBlockCache_InvalidateSegmentPreventsInflightInsert(t *testing.T) {
 func TestBlockCache_DecodeErrorNotCached(t *testing.T) {
 	t.Parallel()
 	c := newBlockCache(1 << 20)
-	_, err := c.getOrDecode(blockKey{segIdx: 1, blockIdx: 0}, func() ([]segment.Event, error) {
+	_, err := c.getOrDecode(testKey(1), func() ([]segment.Event, error) {
 		return nil, assertErr
 	})
 	require.ErrorIs(t, err, assertErr)
 	// A decode error must not poison the slot.
-	evs, err := c.getOrDecode(blockKey{segIdx: 1, blockIdx: 0}, func() ([]segment.Event, error) {
+	evs, err := c.getOrDecode(testKey(1), func() ([]segment.Event, error) {
 		return decodedFixture(5), nil
 	})
 	require.NoError(t, err)

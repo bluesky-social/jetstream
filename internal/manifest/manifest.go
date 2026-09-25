@@ -1,10 +1,12 @@
 package manifest
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -289,12 +291,18 @@ type metadataLoadResult struct {
 func loadSealedMetadata(ctx context.Context, fs vfs.FS, files []ingest.SegmentFile, concurrency int, metrics *Metrics) ([]SegmentMetadata, error) {
 	results, err := gt.ConcurrentN(ctx, files, concurrency, func(f ingest.SegmentFile) (metadataLoadResult, error) {
 		start := time.Now()
-		meta, ok, err := readSealedMetadata(fs, f.Idx, f.Path, false)
+		parts, ok, err := ReadSegmentParts(fs, f.Path)
 		if err != nil {
 			return metadataLoadResult{}, fmt.Errorf("manifest: read segment %s: %w", f.Path, err)
 		}
 		if !ok {
 			return metadataLoadResult{}, nil
+		}
+		// Startup skips the header/footer checksum to keep a full-archive
+		// load cheap; ApplySegment verifies every later publication.
+		meta, err := parseSealedMetadata(f.Idx, f.Path, parts, false)
+		if err != nil {
+			return metadataLoadResult{}, fmt.Errorf("manifest: read segment %s: %w", f.Path, err)
 		}
 		if metrics != nil {
 			metrics.BlockIndexLoadSeconds.Observe(time.Since(start).Seconds())
@@ -505,42 +513,107 @@ func (m *Manifest) SegmentStats() SegmentTreeStats {
 	return stats
 }
 
-// readSealedMetadata opens path with the segment Reader. The bool is
-// false (with nil error) iff the file is an active (unsealed) segment.
-func readSealedMetadata(fs vfs.FS, idx uint64, path string, verifyChecksum bool) (SegmentMetadata, bool, error) {
-	sfs := fs
-	if sfs == nil {
-		sfs = vfs.Default
+// SegmentParts is a sealed segment's metadata as bytes: what ApplySegment
+// consumes. Local mode reads it from the segment file; disaggregated mode
+// fetches the footer from the object store.
+type SegmentParts struct {
+	// Generation is the segment's generation; the header checksum.
+	Generation uint64
+	// Header is the 256-byte finalized header.
+	Header []byte
+	// Footer is every byte from the header's FooterOffset to the end of the
+	// segment.
+	Footer []byte
+	// CreatedAt is when this generation was written.
+	CreatedAt time.Time
+	// Size is the segment's total length: FooterOffset plus len(Footer).
+	Size int64
+}
+
+// ReadSegmentParts reads a local segment file's header and footer. The bool
+// is false (with nil error) iff the file is an active (unsealed) segment.
+func ReadSegmentParts(fs vfs.FS, path string) (SegmentParts, bool, error) {
+	if fs == nil {
+		fs = vfs.Default
 	}
-	info, err := sfs.Stat(path)
+	info, err := fs.Stat(path)
 	if err != nil {
-		return SegmentMetadata{}, false, fmt.Errorf("stat: %w", err)
+		return SegmentParts{}, false, fmt.Errorf("stat: %w", err)
 	}
-	// SkipChecksum=true on the startup/seal paths keeps cost bounded;
-	// the compacted-refresh path verifies (OnSegmentCompacted) and
-	// operators who want full integrity checks run inspect-segment.
-	r, err := segment.Open(segment.ReaderConfig{Path: path, FS: fs, SkipChecksum: !verifyChecksum})
+	f, err := fs.Open(path)
+	if err != nil {
+		return SegmentParts{}, false, err
+	}
+	defer func() { _ = f.Close() }()
+
+	size := info.Size()
+	if size < int64(segment.ReservedHeaderBytes) {
+		return SegmentParts{}, false, fmt.Errorf("%w: %s is %d bytes", segment.ErrCorruptSegment, path, size)
+	}
+	header := make([]byte, segment.ReservedHeaderBytes)
+	if _, err := f.ReadAt(header, 0); err != nil {
+		return SegmentParts{}, false, fmt.Errorf("read header: %w", err)
+	}
+	h, err := segment.ReadSealedHeader(bytes.NewReader(header))
 	if err != nil {
 		if isActiveSegmentSentinel(err) {
-			return SegmentMetadata{}, false, nil
+			return SegmentParts{}, false, nil
 		}
-		return SegmentMetadata{}, false, err
+		return SegmentParts{}, false, err
+	}
+	if h.FooterOffset < uint64(segment.ReservedHeaderBytes) || h.FooterOffset > uint64(size) {
+		return SegmentParts{}, false, fmt.Errorf("%w: %s footer_offset %d outside %d-byte file",
+			segment.ErrInvalidFooter, path, h.FooterOffset, size)
+	}
+	footer := make([]byte, uint64(size)-h.FooterOffset)
+	if _, err := f.ReadAt(footer, int64(h.FooterOffset)); err != nil {
+		return SegmentParts{}, false, fmt.Errorf("read footer: %w", err)
+	}
+	return SegmentParts{
+		Generation: h.Checksum,
+		Header:     header,
+		Footer:     footer,
+		CreatedAt:  info.ModTime(),
+		Size:       size,
+	}, true, nil
+}
+
+// parseSealedMetadata builds a segment's resident metadata from its header
+// and footer bytes alone; block frames are never read.
+func parseSealedMetadata(idx uint64, path string, p SegmentParts, verifyChecksum bool) (SegmentMetadata, error) {
+	noBlocks := func(i int) ([]byte, error) {
+		return nil, fmt.Errorf("manifest: block %d of segment %d read while parsing metadata", i, idx)
+	}
+	r, err := segment.OpenReaderParts(p.Header, p.Footer, noBlocks, segment.ReaderOptions{
+		SkipChecksum: !verifyChecksum,
+		Name:         path,
+	})
+	if err != nil {
+		return SegmentMetadata{}, err
 	}
 	defer func() { _ = r.Close() }()
 
 	h := r.Header()
+	if h.Checksum != p.Generation {
+		return SegmentMetadata{}, fmt.Errorf("%w: segment %d header checksum %#x is not generation %#x",
+			segment.ErrCorruptSegment, idx, h.Checksum, p.Generation)
+	}
+	if want := int64(h.FooterOffset) + int64(len(p.Footer)); p.Size != want {
+		return SegmentMetadata{}, fmt.Errorf("%w: segment %d size %d, header and footer describe %d",
+			segment.ErrCorruptSegment, idx, p.Size, want)
+	}
 	blocks := r.Blocks()
 	blockCollections := make([][]uint32, len(blocks))
 	for i := range blocks {
 		ids, err := r.BlockCollections(i)
 		if err != nil {
-			return SegmentMetadata{}, false, err
+			return SegmentMetadata{}, err
 		}
 		blockCollections[i] = ids
 	}
 	blockBlooms, err := r.LoadAllBlockBlooms()
 	if err != nil {
-		return SegmentMetadata{}, false, err
+		return SegmentMetadata{}, err
 	}
 
 	return SegmentMetadata{
@@ -552,8 +625,8 @@ func readSealedMetadata(fs vfs.FS, idx uint64, path string, verifyChecksum bool)
 			MinWitnessedAt: h.MinWitnessedAt,
 			MaxWitnessedAt: h.MaxWitnessedAt,
 		},
-		FileSize:              info.Size(),
-		ModTime:               info.ModTime(),
+		FileSize:              p.Size,
+		ModTime:               p.CreatedAt,
 		Header:                h,
 		Blocks:                blocks,
 		SegmentBloom:          r.SegmentBloom(),
@@ -561,7 +634,7 @@ func readSealedMetadata(fs vfs.FS, idx uint64, path string, verifyChecksum bool)
 		Collections:           r.Collections(),
 		CollectionEventCounts: r.CollectionEventCounts(),
 		BlockCollections:      blockCollections,
-	}, true, nil
+	}, nil
 }
 
 // isActiveSegmentSentinel checks whether the error from segment.Open
@@ -667,21 +740,38 @@ func (m *Manifest) LookbackFloor(lookback time.Duration) (uint64, int64) {
 	return m.segments[i].MinSeq, m.segments[i].MinWitnessedAt
 }
 
-// OnSegmentSealed publishes a freshly-sealed segment into the manifest.
-// Wired through internal/ingest.Writer.Config.OnAfterSeal. Re-publishing
-// an existing idx replaces the entry in place (idempotent for repeated
-// callbacks; the on-disk state is authoritative).
-func (m *Manifest) OnSegmentSealed(idx uint64, path string) error {
-	return m.refreshSegment(idx, path, false)
+// ApplySegment publishes one sealed segment generation: a fresh seal, or a
+// compaction rewrite of an existing idx, which replaces the entry in place.
+// It parses the metadata from the header and footer bytes and verifies their
+// checksum (the xxh3 covers header and footer, not block data) before the
+// metadata reaches serving paths. Re-applying the resident generation is
+// idempotent.
+func (m *Manifest) ApplySegment(idx, gen uint64, header, footer []byte, createdAt time.Time, size int64) error {
+	if err := m.waitReady(); err != nil {
+		return err
+	}
+	start := time.Now()
+	path := filepath.Join(m.opts.SegmentsDir, ingest.SegmentFilename(idx))
+	meta, err := parseSealedMetadata(idx, path, SegmentParts{
+		Generation: gen, Header: header, Footer: footer, CreatedAt: createdAt, Size: size,
+	}, true)
+	if err != nil {
+		return fmt.Errorf("manifest: apply segment %d: %w", idx, err)
+	}
+	return m.commitSegment(meta, start)
 }
 
-// OnSegmentCompacted re-publishes a sealed segment after a compaction
-// rewrite. Unlike OnSegmentSealed it verifies the file's header/footer
-// checksum (cheap — the xxh3 covers header+footer bytes, not block
-// data) as an integrity gate on the just-rewritten file before its
-// metadata reaches serving paths.
-func (m *Manifest) OnSegmentCompacted(idx uint64, path string) error {
-	return m.refreshSegment(idx, path, true)
+// ApplySegmentFile is ApplySegment for a local segment file: the local-mode
+// feed for seals and compaction rewrites.
+func ApplySegmentFile(m *Manifest, fs vfs.FS, idx uint64, path string) error {
+	p, ok, err := ReadSegmentParts(fs, path)
+	if err != nil {
+		return fmt.Errorf("manifest: apply segment %d: %w", idx, err)
+	}
+	if !ok {
+		return fmt.Errorf("manifest: apply segment %d: %s appears active (zero checksum)", idx, path)
+	}
+	return m.ApplySegment(idx, p.Generation, p.Header, p.Footer, p.CreatedAt, p.Size)
 }
 
 // SegmentChecksums returns the resident header checksum of every
@@ -701,19 +791,8 @@ func (m *Manifest) SegmentChecksums() map[uint64]uint64 {
 	return out
 }
 
-func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) error {
-	if err := m.waitReady(); err != nil {
-		return err
-	}
-	start := time.Now()
-	meta, ok, err := readSealedMetadata(m.opts.FS, idx, path, verifyChecksum)
-	if err != nil {
-		return fmt.Errorf("manifest: refresh segment: %w", err)
-	}
-	if !ok {
-		return fmt.Errorf("manifest: refresh segment: %s appears active (zero checksum)", path)
-	}
-
+func (m *Manifest) commitSegment(meta SegmentMetadata, start time.Time) error {
+	idx := meta.Idx
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -763,8 +842,7 @@ func (m *Manifest) refreshSegment(idx uint64, path string, verifyChecksum bool) 
 
 // Generation returns a monotonic counter that strictly increases on every
 // mutation of the resident sealed-segment set that could change which
-// segments or blocks a DID resolves to: initial load, OnSegmentSealed, and
-// OnSegmentCompacted. Read-only queries never advance it.
+// segments or blocks a DID resolves to: initial load and ApplySegment. Read-only queries never advance it.
 //
 // It exists for consumers that cache a manifest-derived selection and need a
 // cheap staleness check without diffing the segment set: tag each cached
@@ -895,7 +973,7 @@ func (m *Manifest) SelectBlocksForDID(did string) ([]SegmentBlockSelection, erro
 
 // ActiveSegmentPaths returns the paths of seg_*.jss files in SegmentsDir
 // that are NOT resident in the manifest -- i.e. the active (unsealed)
-// segment, plus any segment sealed so recently that OnSegmentSealed has
+// segment, plus any segment sealed so recently that ApplySegment has
 // not yet refreshed the manifest. The manifest only gains a segment's
 // blooms at seal time, so its flushed-but-unsealed blocks are invisible
 // to SelectBlocksForDID; callers that need a complete view (repo

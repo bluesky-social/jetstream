@@ -16,12 +16,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble/vfs"
 	"github.com/coder/websocket"
 )
 
@@ -44,7 +44,11 @@ type Subscription struct {
 	Store    metastore.Store
 	Manifest *manifest.Manifest // optional; required for cursor replay
 	Writer   *ingest.Writer     // optional; required for cursor replay
-	FS       vfs.FS
+	// Catalog and Fetcher resolve timestamp cursors to a seq inside the
+	// manifest's candidate segment. Optional; without them a timestamp
+	// cursor starts at its candidate segment's first seq.
+	Catalog catalog.Catalog
+	Fetcher catalog.Fetcher
 	// WriterRef, when non-nil, supersedes Writer. Resolved at request
 	// time; supports cmd/jetstream's deferred-writer-publication
 	// pattern where the orchestrator publishes the writer pointer
@@ -263,7 +267,8 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		resolveStart := time.Now()
 		plan, err := ResolveCursor(rawCursor, CursorEnv{
 			Manifest:         deps.Manifest,
-			FS:               deps.FS,
+			Catalog:          deps.Catalog,
+			Fetcher:          deps.Fetcher,
 			NextSeq:          writer.NextSeq(),
 			Gaps:             writer.SeqGaps(),
 			Lookback:         deps.Lookback,

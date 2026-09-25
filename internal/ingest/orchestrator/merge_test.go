@@ -124,7 +124,9 @@ func TestMerge_PublishesTerminalSealToManifest(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, mft.SegmentCount(), "manifest starts before merge seals any destination segment")
 
-	fix.cfg.Catalog = manifestCatalog(t, fix.cfg.DataDir, mft.OnSegmentSealed)
+	fix.cfg.Catalog = manifestCatalog(t, fix.cfg.DataDir, func(idx uint64, path string) error {
+		return manifest.ApplySegmentFile(mft, nil, idx, path)
+	})
 	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)

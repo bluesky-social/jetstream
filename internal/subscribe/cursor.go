@@ -1,16 +1,16 @@
 package subscribe
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
-	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble/vfs"
 )
 
 // CursorSeqMaxThreshold splits the v2 seq cursor namespace from the
@@ -80,9 +80,14 @@ type CursorEnv struct {
 	// mode falls through to the active segment.
 	Manifest *manifest.Manifest
 
-	// FS is the filesystem used for segment I/O. Nil uses the host OS
-	// filesystem.
-	FS vfs.FS
+	// Catalog and Fetcher read the candidate block for timestamp-mode
+	// resolution. The manifest picks the segment by witnessed range; the
+	// catalog supplies its block index and bytes. nil, or a catalog that
+	// does not hold the manifest's candidate yet, resolves to the
+	// candidate's MinSeq: coarser but lossless, because the subscriber loop
+	// drops rows witnessed before the requested timestamp.
+	Catalog catalog.Catalog
+	Fetcher catalog.Fetcher
 
 	// NextSeq is the writer's next-to-be-allocated seq value. A
 	// requested cursor >= NextSeq drops into ModeLive (future cursor).
@@ -328,41 +333,65 @@ func translateTimeUSToSeq(env CursorEnv, timeUS int64) (uint64, bool, error) {
 		return first.MinSeq, true, nil
 	}
 
-	blocks, err := env.Manifest.BlockIndex(candidate.Idx)
-	if err != nil {
-		return 0, false, fmt.Errorf("load block index for seg %d: %w", candidate.Idx, err)
-	}
+	return seqInCandidate(env, candidate, timeUS)
+}
 
-	// Binary-search blocks by MaxWitnessedAt: the first block whose
-	// MaxWitnessedAt >= timeUS is the candidate.
-	blockI := sort.Search(len(blocks), func(i int) bool {
-		return blocks[i].MaxWitnessedAt >= timeUS
-	})
-	if blockI == len(blocks) {
-		// Per manifest contract, candidate.MaxWitnessedAt >= timeUS,
-		// so this branch is reachable only on internally-inconsistent
-		// metadata. Fall back to the candidate's MinSeq so the replay
-		// walks the whole segment.
+// seqInCandidate resolves timeUS inside the manifest's candidate segment
+// through the catalog: a binary search over the segment's block index, then
+// the first row of the chosen block witnessed at or after timeUS.
+func seqInCandidate(env CursorEnv, candidate manifest.SegmentBounds, timeUS int64) (uint64, bool, error) {
+	if env.Catalog == nil || env.Fetcher == nil {
 		return candidate.MinSeq, false, nil
 	}
-
-	r, err := segment.Open(segment.ReaderConfig{Path: candidate.Path, FS: env.FS, SkipChecksum: true})
-	if err != nil {
-		return 0, false, fmt.Errorf("open seg %d: %w", candidate.Idx, err)
-	}
-	defer func() { _ = r.Close() }()
-
-	events, err := r.DecodeBlock(blockI)
-	if err != nil {
-		return 0, false, fmt.Errorf("decode seg %d block %d: %w", candidate.Idx, blockI, err)
-	}
-	for _, ev := range events {
-		if ev.WitnessedAt >= timeUS {
-			return ev.Seq, false, nil
+	for stale := 0; ; stale++ {
+		ref, ok := candidateBlock(env.Catalog.Snapshot(), candidate.Idx, timeUS)
+		if !ok {
+			return candidate.MinSeq, false, nil
 		}
+		events, err := catalog.DecodeRef(context.Background(), env.Fetcher, ref)
+		if errors.Is(err, catalog.ErrStaleRef) && stale < maxStaleRetries {
+			// A compaction rewrote the segment between the snapshot and
+			// the fetch. Block topology survives a rewrite, so a fresh
+			// view resolves to the same position.
+			continue
+		}
+		if err != nil {
+			return 0, false, fmt.Errorf("decode seg %d block %d: %w", ref.Segment, ref.Block, err)
+		}
+		for _, ev := range events {
+			if ev.WitnessedAt >= timeUS {
+				return ev.Seq, false, nil
+			}
+		}
+		// Every surviving row is older than timeUS, though the block's
+		// envelope says MaxWitnessedAt >= timeUS: compaction dropped the
+		// rows that reached it. Starting at the block's MaxSeq stays
+		// lossless; the subscriber loop drops the older rows.
+		return ref.MaxSeq, false, nil
 	}
-	// All events in this block are older than timeUS, but manifest
-	// said the block's MaxWitnessedAt >= timeUS — implies a single-event
-	// block whose witnessed_at == timeUS. Use the block's MaxSeq.
-	return blocks[blockI].MaxSeq, false, nil
+}
+
+// candidateBlock returns the ref of the first block of segment idx whose
+// MaxWitnessedAt reaches timeUS. It reports false when the view does not
+// hold idx or no block reaches timeUS; the manifest guarantees the latter
+// cannot happen for its candidate, so either means the view and the
+// manifest disagree and the caller falls back to the segment's MinSeq.
+func candidateBlock(view catalog.CatalogView, idx uint64, timeUS int64) (catalog.BlockRef, bool) {
+	segs := view.Segments(catalog.Main)
+	i := sort.Search(len(segs), func(i int) bool { return segs[i].Index >= idx })
+	if i == len(segs) || segs[i].Index != idx {
+		return catalog.BlockRef{}, false
+	}
+	blocks := segs[i].Blocks
+	b := sort.Search(len(blocks), func(i int) bool { return blocks[i].MaxWitnessedAt >= timeUS })
+	if b == len(blocks) {
+		return catalog.BlockRef{}, false
+	}
+	for ref := range view.RefsFrom(catalog.Main, blocks[b].MinSeq) {
+		if ref.Segment == idx && ref.Block == b {
+			return ref, true
+		}
+		break
+	}
+	return catalog.BlockRef{}, false
 }

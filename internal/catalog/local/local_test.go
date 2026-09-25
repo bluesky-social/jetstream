@@ -286,3 +286,61 @@ func TestLocal_SealActiveAndCloseLeavesNoActive(t *testing.T) {
 	cat.DropNamespace(catalog.BootstrapLive)
 	require.Empty(t, cat.Snapshot().Segments(catalog.BootstrapLive))
 }
+
+// listHookFS runs hook once, after taking a directory listing and before
+// returning it, so a test can change the directory behind a scan.
+type listHookFS struct {
+	vfs.FS
+	hook func()
+}
+
+func (f *listHookFS) List(dir string) ([]string, error) {
+	names, err := f.FS.List(dir)
+	if hook := f.hook; hook != nil && dir == segDir {
+		f.hook = nil
+		hook()
+	}
+	return names, err
+}
+
+// TestLocal_RefreshKeepsSegmentsSealedDuringScan is the startup race: the
+// runtime refreshes the catalog in the background while writers already
+// publish seals, and a seal that lands after the scan listed the directory
+// must survive the scan's result.
+func TestLocal_RefreshKeepsSegmentsSealedDuringScan(t *testing.T) {
+	t.Parallel()
+
+	s := newSwarm(t, 7)
+	for len(s.sealed) == 0 {
+		s.step()
+	}
+	hfs := &listHookFS{FS: s.fs}
+	cat, err := local.New(local.Config{FS: hfs, Dirs: map[catalog.Namespace]string{catalog.Main: segDir}})
+	require.NoError(t, err)
+
+	hfs.hook = func() {
+		before := len(s.sealed)
+		for len(s.sealed) < before+2 {
+			s.step()
+		}
+		// The writer publishes to s.cat; forward its seals the way a writer
+		// attached to cat would.
+		for _, v := range s.sealed[before:] {
+			require.NoError(t, cat.Sealed(v))
+		}
+	}
+	require.NoError(t, cat.Refresh(t.Context()))
+	require.Nil(t, hfs.hook, "the hook should have run")
+
+	got := cat.Snapshot().Segments(catalog.Main)
+	require.NotEmpty(t, got)
+	last := s.sealed[len(s.sealed)-1]
+	require.Equal(t, last.Index, got[len(got)-1].Index, "a segment sealed during the scan was dropped")
+	for _, v := range s.sealed {
+		found := false
+		for _, g := range got {
+			found = found || g.Index == v.Index
+		}
+		require.True(t, found, "sealed segment %d missing", v.Index)
+	}
+}

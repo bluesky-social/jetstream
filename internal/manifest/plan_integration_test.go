@@ -465,7 +465,7 @@ func TestPlanSnapshot_ConcurrentWithCompactionSwap(t *testing.T) {
 			}
 			// Re-publish segment 0 from its (unchanged) file. This drives the
 			// m.mu.Lock() swap path concurrently with planning.
-			require.NoError(t, m.OnSegmentCompacted(0, filepath.Join(dir, ingest.SegmentFilename(0))))
+			require.NoError(t, manifest.ApplySegmentFile(m, nil, 0, filepath.Join(dir, ingest.SegmentFilename(0))))
 		}
 	})
 

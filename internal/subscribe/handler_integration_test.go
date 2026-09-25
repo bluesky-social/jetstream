@@ -43,10 +43,12 @@ func TestHandler_ReplaysFromCursor(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
 	makeSteadyState(t, st)
 
+	cat := mustCatalog(t, segDir, w)
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
 	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        m,
+		Catalog:         cat,
+		Fetcher:         cat.Fetcher(),
 		WriterRef:       &writerPtr,
 		BlockCacheBytes: 1 << 20,
 	})
@@ -310,10 +312,12 @@ func newActiveTimestampServer(t *testing.T, v2 bool, blockSize int) (*httptest.S
 	m := mustOpenManifest(t, segDir)
 	makeSteadyState(t, st)
 
+	cat := mustCatalog(t, segDir, w)
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
 	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        m,
+		Catalog:         cat,
+		Fetcher:         cat.Fetcher(),
 		WriterRef:       &writerPtr,
 		BlockCacheBytes: 1 << 20,
 	})

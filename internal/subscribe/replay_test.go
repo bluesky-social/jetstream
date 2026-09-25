@@ -23,16 +23,16 @@ func TestWalkFromCursor_SingleSealedSegment(t *testing.T) {
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	m := mustOpenManifest(t, segDir)
 
 	st, w := openWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	var got []uint64
 	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 5,
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil
@@ -48,10 +48,10 @@ func TestWalkFromCursor_SealedThenActive(t *testing.T) {
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	m := mustOpenManifest(t, segDir)
 
 	st, w := openWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	// 5 events appended into the active segment and flushed so cold replay can
 	// serve them from the active file without reading pending memory.
@@ -66,8 +66,8 @@ func TestWalkFromCursor_SealedThenActive(t *testing.T) {
 	var got []uint64
 	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 8,
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil
@@ -83,16 +83,16 @@ func TestWalkFromCursor_HaltsOnCallbackError(t *testing.T) {
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	stop := errors.New("stop")
 	count := 0
 	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 0,
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		count++
 		if count == 3 {
@@ -161,14 +161,14 @@ func TestWalkFromCursor_CompactedTrailingGapTerminates(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.Rewritten)
 
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 20)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	// Walk across the gap.
 	var got []uint64
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
-		StartSeq: 0, Manifest: m, Writer: w,
+		StartSeq: 0, Catalog: cat, Fetcher: cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil
@@ -179,7 +179,7 @@ func TestWalkFromCursor_CompactedTrailingGapTerminates(t *testing.T) {
 	// Cursor landing inside the trailing gap.
 	got = got[:0]
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
-		StartSeq: 9, Manifest: m, Writer: w,
+		StartSeq: 9, Catalog: cat, Fetcher: cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil
@@ -203,13 +203,13 @@ func TestWalkFromCursor_FullyEmptiedSegmentTerminates(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.Rewritten)
 
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 20)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	var got []uint64
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
-		StartSeq: 0, Manifest: m, Writer: w,
+		StartSeq: 0, Catalog: cat, Fetcher: cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil
