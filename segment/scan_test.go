@@ -208,3 +208,56 @@ func TestScanMaxSeq_IgnoresTornTail(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, uint64(1), maxSeq)
 }
+
+// TestActiveBlocksFS_MatchesWriterAndSeal: the read-only block index equals
+// the writer's, ignores a torn tail the way New would truncate it, and the
+// sealed metadata Seal reports parses to the same blocks.
+func TestActiveBlocksFS_MatchesWriterAndSeal(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "seg.jss")
+	w, err := New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	for seq := uint64(1); seq <= 7; seq++ {
+		full, err := w.Append(Event{Seq: seq, WitnessedAt: int64(seq), Kind: KindCreate, DID: "did:plc:blocks"})
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, w.Flush())
+		}
+	}
+	want := w.Blocks()
+	require.Len(t, want, 3)
+
+	got, err := ActiveBlocksFS(nil, path)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	// A torn frame: a prefix promising more bytes than follow.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	require.NoError(t, err)
+	_, err = f.Write([]byte{0xff, 0, 0, 0, 0, 0, 0, 0, 1, 2})
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	got, err = ActiveBlocksFS(nil, path)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	// New truncates the torn tail; Seal then indexes the pending block too.
+	require.NoError(t, w.Close())
+	w, err = New(Config{Path: path, MaxEventsPerBlock: 2})
+	require.NoError(t, err)
+	res, err := w.Seal()
+	require.NoError(t, err)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, data[:ReservedHeaderBytes], res.HeaderBytes)
+	require.Equal(t, data[res.FooterOffset:], res.Footer)
+	require.Equal(t, res.Checksum, res.Header.Checksum)
+
+	r, err := OpenReaderParts(res.HeaderBytes, res.Footer, func(int) ([]byte, error) { return nil, os.ErrNotExist }, ReaderOptions{})
+	require.NoError(t, err)
+	require.Len(t, r.Blocks(), 4)
+	require.Equal(t, want, r.Blocks()[:3])
+
+	_, err = ActiveBlocksFS(nil, path)
+	require.ErrorIs(t, err, ErrSegmentSealed)
+}

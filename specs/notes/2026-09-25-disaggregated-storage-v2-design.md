@@ -937,16 +937,28 @@ through one type:
 
 ```go
 type BlockRef struct {
-    MinSeq, MaxSeq         uint64
+    MinSeq, MaxSeq                 uint64
     MinWitnessedUS, MaxWitnessedUS int64
-    // Exactly one of:
-    ObjectID uint64 // sealed block, active block, or pointer hot batch
-    Frame    []byte // inline hot batch
+    Segment uint64 // position in the namespace; stable across compaction
+    Block   int
+    Loc     Locator // closed sum type, see below
 }
+
+// Exactly one of:
+type FileBlock struct{ Path string; Generation, Offset uint64; Length uint32 } // local mode
+type ObjectBlock struct{ ObjectID uint64 } // sealed block, active block, or pointer hot batch
+type InlineBlock struct{ Frame []byte }    // inline hot batch
 ```
 
-The mirror exposes `RefsFrom(seq uint64) []BlockRef`: every ref from the one
-containing `seq` up to the tip, in order.
+A `Fetcher` turns a ref into its zstd frame. It returns `ErrStaleRef` when the
+ref's generation is no longer current (a compaction published a new one), so
+the caller takes a fresh snapshot and retries. Local mode's `FileBlock` pins
+the header checksum as its generation.
+
+The mirror exposes `RefsFrom(ns, seq) iter.Seq[BlockRef]`: every ref from the
+one containing `seq` up to the tip, in order. It is a lazy iterator, so a
+cold reader that stops early does not materialize the rest of the archive's
+refs.
 
 ### 11.3 Manifest and footers
 
@@ -1476,7 +1488,7 @@ type Catalog interface {
 type CatalogView interface {
     Revision() uint64
     Segments(ns Namespace) []SegmentView
-    RefsFrom(ns Namespace, seq uint64) []BlockRef
+    RefsFrom(ns Namespace, seq uint64) iter.Seq[BlockRef]
     TipSeq(ns Namespace) uint64
 }
 ```

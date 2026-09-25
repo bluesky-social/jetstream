@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
@@ -122,7 +124,7 @@ func TestMerge_PublishesTerminalSealToManifest(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, mft.SegmentCount(), "manifest starts before merge seals any destination segment")
 
-	fix.cfg.IngestOnAfterSeal = mft.OnSegmentSealed
+	fix.cfg.Catalog = manifestCatalog(t, fix.cfg.DataDir, mft.OnSegmentSealed)
 	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
@@ -588,4 +590,17 @@ func TestMerge_DiscoveryHostErrorExhaustsAndCutoverContinues(t *testing.T) {
 	// retry the durable exhausted roster row.
 	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill", "live_segments"))
 	require.True(t, os.IsNotExist(err))
+}
+
+// manifestCatalog builds the local catalog the runtime wires, feeding
+// main-namespace seals to onSealed.
+func manifestCatalog(t *testing.T, dataDir string, onSealed func(idx uint64, path string) error) *localcatalog.Catalog {
+	t.Helper()
+	c, err := localcatalog.New(localcatalog.Config{Dirs: map[catalog.Namespace]string{
+		catalog.Main:          filepath.Join(dataDir, "segments"),
+		catalog.BootstrapLive: filepath.Join(dataDir, "backfill", "live_segments"),
+	}})
+	require.NoError(t, err)
+	c.OnSealed(catalog.Main, func(v catalog.SegmentView, path string) error { return onSealed(v.Index, path) })
+	return c
 }

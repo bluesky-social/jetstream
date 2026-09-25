@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/metastore"
@@ -165,10 +166,10 @@ type Config struct {
 	// not trigger this hook.
 	OnUpstreamEventSeen func(time.Time)
 
-	// OnAfterSeal is forwarded to the inner ingest.Writer's
-	// Config.OnAfterSeal. See internal/ingest.Config.OnAfterSeal for
-	// the full contract. Optional.
-	OnAfterSeal func(idx uint64, path string) error
+	// Catalog and Namespace are forwarded to the inner ingest.Writer. See
+	// internal/ingest.Config.Catalog for the contract. Optional.
+	Catalog   ingest.SegmentCatalog
+	Namespace catalog.Namespace
 
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time

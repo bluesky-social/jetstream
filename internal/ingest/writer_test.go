@@ -1405,7 +1405,7 @@ func TestSealActiveAndClose_OnAfterSealFiresOnce(t *testing.T) {
 		MaxEventsPerBlock: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			calls++
 			gotIdx = idx
 			gotPath = path
@@ -1415,7 +1415,7 @@ func TestSealActiveAndClose_OnAfterSealFiresOnce(t *testing.T) {
 			require.True(t, ins.Sealed, "callback must observe a sealed segment")
 			require.Equal(t, uint64(1), ins.TotalEvents)
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -1446,10 +1446,10 @@ func TestSealActiveAndClose_OnAfterSealErrorPropagatesAfterDurableSeal(t *testin
 		MaxEventsPerBlock: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: func(uint64, string) error {
+		Catalog: SealedPathFunc(segDir, func(uint64, string) error {
 			calls++
 			return wantErr
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -1888,11 +1888,11 @@ func TestForceRotate_FiresOnAfterSeal(t *testing.T) {
 		MaxEventsPerBlock: 64,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			calls++
 			gotIdx = idx
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -2022,12 +2022,12 @@ func TestWriter_OnAfterSeal_FiresOnRotation(t *testing.T) {
 		MaxEventsPerBlock: 1,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			gotMu.Lock()
 			defer gotMu.Unlock()
 			got = append(got, sealedEvent{idx: idx, path: path})
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -2066,7 +2066,7 @@ func TestWriter_OnAfterSeal_ErrorPropagates(t *testing.T) {
 		MaxEventsPerBlock: 1,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal:       func(idx uint64, path string) error { return wantErr },
+		Catalog:           SealedPathFunc(segDir, func(idx uint64, path string) error { return wantErr }),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -2116,10 +2116,10 @@ func TestAppend_OnAppendFiresBeforeSealVisibility(t *testing.T) {
 			observed = append(observed, ev.Seq)
 			return nil
 		},
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			observedAtSeal = append([]uint64(nil), observed...)
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -2515,10 +2515,10 @@ func TestAppendBatch_OnAppendFiresBeforeSealVisibility(t *testing.T) {
 			observed = append(observed, ev.Seq)
 			return nil
 		},
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			observedAtSeal = append([]uint64(nil), observed...)
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })

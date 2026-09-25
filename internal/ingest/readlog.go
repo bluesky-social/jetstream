@@ -3,8 +3,8 @@ package ingest
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -14,53 +14,8 @@ import (
 const DefaultReadLogRetentionBytes int64 = 256 << 20
 
 // ReadLogEntry is one stable event handle held by the writer-owned readable
-// log. Subscribe stores its encode-once memo in the opaque slot so ingest stays
-// wire-format agnostic.
-type ReadLogEntry struct {
-	event segment.Event
-	bytes int64
-	memo  atomic.Pointer[any]
-}
-
-// Event returns the resident event. Callers must treat it as immutable.
-func (e *ReadLogEntry) Event() *segment.Event {
-	if e == nil {
-		return nil
-	}
-	return &e.event
-}
-
-// ApproxBytes returns the entry's retention-budget estimate.
-func (e *ReadLogEntry) ApproxBytes() int64 {
-	if e == nil {
-		return 0
-	}
-	return e.bytes
-}
-
-// LoadMemo returns the opaque memo stored by another package.
-func (e *ReadLogEntry) LoadMemo() any {
-	if e == nil {
-		return nil
-	}
-	p := e.memo.Load()
-	if p == nil {
-		return nil
-	}
-	return *p
-}
-
-// LoadOrStoreMemo stores memo exactly once and returns the winning value.
-func (e *ReadLogEntry) LoadOrStoreMemo(memo any) any {
-	if e == nil || memo == nil {
-		return nil
-	}
-	p := &memo
-	if e.memo.CompareAndSwap(nil, p) {
-		return memo
-	}
-	return e.LoadMemo()
-}
+// log.
+type ReadLogEntry = catalog.LogEntry
 
 // ReadableLog is the writer-owned ordered log of appended events. Entries are
 // present from seq allocation until eviction, and eviction never advances the
@@ -105,7 +60,7 @@ func (l *ReadableLog) append(ev *segment.Event) {
 	if l == nil {
 		return
 	}
-	entry := newReadLogEntry(ev)
+	entry := catalog.NewLogEntry(ev)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -114,22 +69,15 @@ func (l *ReadableLog) append(ev *segment.Event) {
 	}
 	l.entries = append(l.entries, entry)
 	l.tipSeq++
-	l.curBytes += entry.bytes
+	l.curBytes += entry.ApproxBytes()
 	// A freshly appended entry has Seq == old tipSeq >= durable, so it is
 	// pinned until a later advanceDurable moves past it.
-	l.pinnedBytes += entry.bytes
+	l.pinnedBytes += entry.ApproxBytes()
 	l.evictLocked()
 	old := l.notify
 	l.notify = make(chan struct{})
 	l.publishMetricsLocked()
 	close(old)
-}
-
-func newReadLogEntry(ev *segment.Event) *ReadLogEntry {
-	cp := *ev
-	cp.Payload = append([]byte(nil), ev.Payload...)
-	bytes := int64(len(cp.Payload) + len(cp.DID) + len(cp.Collection) + len(cp.Rkey) + len(cp.Rev) + 128)
-	return &ReadLogEntry{event: cp, bytes: bytes}
 }
 
 func (l *ReadableLog) advanceDurable(nextSeq uint64) {
@@ -153,7 +101,7 @@ func (l *ReadableLog) advanceDurable(nextSeq uint64) {
 		}
 		idx := seq - l.baseSeq
 		if idx < uint64(len(l.entries)) {
-			l.pinnedBytes -= l.entries[idx].bytes
+			l.pinnedBytes -= l.entries[idx].ApproxBytes()
 		}
 	}
 	l.durable = nextSeq
@@ -164,7 +112,7 @@ func (l *ReadableLog) advanceDurable(nextSeq uint64) {
 func (l *ReadableLog) evictLocked() {
 	for len(l.entries) > 0 && l.baseSeq < l.durable && l.curBytes > l.maxBytes {
 		evicted := l.entries[0]
-		l.curBytes -= evicted.bytes
+		l.curBytes -= evicted.ApproxBytes()
 		l.entries[0] = nil
 		l.entries = l.entries[1:]
 		l.baseSeq++
@@ -273,3 +221,5 @@ func maxInt64(a, b int64) int64 {
 	}
 	return b
 }
+
+var _ catalog.HotLog = (*ReadableLog)(nil)

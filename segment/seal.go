@@ -24,6 +24,14 @@ type SealResult struct {
 	Checksum       uint64
 	FooterOffset   uint64
 	FileSize       int64
+
+	// Header is the finalized header, and HeaderBytes and Footer are the
+	// exact metadata bytes written to the file. A caller that publishes the
+	// segment elsewhere (a catalog, a manifest) parses them with
+	// OpenReaderParts instead of re-reading the file it just sealed.
+	Header      Header
+	HeaderBytes []byte
+	Footer      []byte
 }
 
 // Seal flushes pending events, indexes on-disk blocks, writes the footer and
@@ -183,6 +191,9 @@ func (w *Writer) sealAfterFlush() (SealResult, error) {
 		Checksum:       checksum,
 		FooterOffset:   header.FooterOffset,
 		FileSize:       stat,
+		Header:         header,
+		HeaderBytes:    headerBytes,
+		Footer:         footerBytes,
 	}, nil
 }
 

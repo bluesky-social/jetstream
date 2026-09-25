@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/bluesky-social/gttp"
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	identcache "github.com/bluesky-social/jetstream/internal/identity"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
@@ -212,6 +214,22 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.manifest = mft
 
+	// The local catalog hears about every seal from the ingest writers and
+	// feeds main-namespace seals to the manifest.
+	segCatalog, err := localcatalog.New(localcatalog.Config{
+		FS: opts.StorageFS,
+		Dirs: map[catalog.Namespace]string{
+			catalog.Main:          segmentsDir,
+			catalog.BootstrapLive: filepath.Join(opts.DataDir, "backfill", "live_segments"),
+		},
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build segment catalog: %w", err))
+	}
+	segCatalog.OnSealed(catalog.Main, func(v catalog.SegmentView, path string) error {
+		return mft.OnSegmentSealed(v.Index, path)
+	})
+
 	// writerPtr is published by the orchestrator once the steady-state
 	// live consumer opens its ingest.Writer; the cursor handler reads it
 	// atomically. Before steady-state the lifecycle.IsSteadyState gate
@@ -316,6 +334,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		if err := mft.OnSegmentCompacted(idx, path); err != nil {
 			return err
 		}
+		if err := segCatalog.Reload(catalog.Main, idx); err != nil {
+			return err
+		}
 		coldRd.InvalidateSegment(idx)
 		return nil
 	}
@@ -374,7 +395,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		FailedRepoRetryMaxDelay:        opts.FailedRepoRetryMaxDelay,
 		LiveReconnectBackoff:           opts.LiveReconnectBackoff,
 		LiveDial:                       opts.LiveDial,
-		IngestOnAfterSeal:              mft.OnSegmentSealed,
+		Catalog:                        segCatalog,
 		OnSegmentCompacted:             onSegmentCompacted,
 		SegmentManifestChecksums:       mft.SegmentChecksums,
 		CompactionInterval:             opts.CompactionInterval,

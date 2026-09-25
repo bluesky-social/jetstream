@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
@@ -27,7 +28,8 @@ const seqNextKey = "seq/next"
 // Writer owns the active segment file and the seq counter. It is
 // safe for concurrent use.
 type Writer struct {
-	cfg Config
+	cfg    Config
+	commit blockCommitter
 
 	// drainMu is an admission barrier for appends and explicit flushes. Acquire
 	// it before mu, and hold it through async job submission so DrainDurability
@@ -43,6 +45,9 @@ type Writer struct {
 	gaps           *seqspace.Gaps
 	readLog        *ReadableLog
 	closed         bool
+	// closedActive is the active segment's view as Close left it; nil
+	// before Close and after SealActiveAndClose. See ActiveSegment.
+	closedActive *catalog.SegmentView
 
 	async            *asyncFlushPipeline
 	asyncJobs        sync.WaitGroup
@@ -70,33 +75,24 @@ func Open(cfg Config) (*Writer, error) {
 	}
 
 	w := &Writer{cfg: cfg, activeIdx: idx}
+	w.commit = localCommitter{cfg: &w.cfg}
+	commit := w.commit
 
 	var maxSeq uint64
 	var foundEvents bool
 
-	// Segment paths use filepath.Join, not cfg.FS's PathJoin, even when a
-	// vfs.FS is injected. The two agree on every '/'-separated filesystem
-	// (all our prod targets and the strict-mem oracle FS, which uses
-	// path.Join); they diverge only on Windows separators, which we do not
-	// support. Keeping filepath.Join here matches the rest of the package.
 	if hasExisting {
 		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(idx))
-		seg, segErr := segment.New(segment.Config{
-			Path:              path,
-			FS:                cfg.FS,
-			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
-			Metrics:           cfg.SegmentMetrics,
-			IOFaultInjector:   cfg.SegmentIOFaultInjector,
-		})
+		seg, segErr := commit.openSegment(idx)
 		switch {
 		case segErr == nil:
 			w.active = seg
-			info, statErr := statFS(cfg.FS, path)
+			activeBytes, statErr := commit.segmentBytes(idx)
 			if statErr != nil {
 				_ = seg.Close()
 				return nil, fmt.Errorf("ingest: stat %s: %w", path, statErr)
 			}
-			w.activeBytes = info.Size() - int64(segment.ReservedHeaderBytes)
+			w.activeBytes = activeBytes
 
 			maxSeq, foundEvents, err = segment.ScanMaxSeqFS(cfg.FS, path)
 			if err != nil {
@@ -133,13 +129,7 @@ func Open(cfg Config) (*Writer, error) {
 
 			w.activeIdx = idx + 1
 			path = filepath.Join(cfg.SegmentsDir, SegmentFilename(w.activeIdx))
-			seg, segErr = segment.New(segment.Config{
-				Path:              path,
-				FS:                cfg.FS,
-				MaxEventsPerBlock: cfg.MaxEventsPerBlock,
-				Metrics:           cfg.SegmentMetrics,
-				IOFaultInjector:   cfg.SegmentIOFaultInjector,
-			})
+			seg, segErr = commit.openSegment(w.activeIdx)
 			if segErr != nil {
 				return nil, cfg.wrapSegmentPersistenceError("opening next active segment", fmt.Errorf("ingest: open next segment %s: %w", path, segErr))
 			}
@@ -150,13 +140,7 @@ func Open(cfg Config) (*Writer, error) {
 		}
 	} else {
 		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(0))
-		seg, segErr := segment.New(segment.Config{
-			Path:              path,
-			FS:                cfg.FS,
-			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
-			Metrics:           cfg.SegmentMetrics,
-			IOFaultInjector:   cfg.SegmentIOFaultInjector,
-		})
+		seg, segErr := commit.openSegment(0)
 		if segErr != nil {
 			return nil, cfg.wrapSegmentPersistenceError("creating active segment", fmt.Errorf("ingest: create %s: %w", path, segErr))
 		}
@@ -255,6 +239,9 @@ func Open(cfg Config) (*Writer, error) {
 	if cfg.AsyncFlushWorkers > 0 {
 		w.async = newAsyncFlushPipeline(w, cfg.AsyncFlushWorkers)
 	}
+	if cfg.Catalog != nil {
+		cfg.Catalog.AttachActive(cfg.Namespace, w)
+	}
 
 	w.cfg.Logger.Info("opened",
 		"segments_dir", cfg.SegmentsDir,
@@ -291,7 +278,7 @@ func (w *Writer) Close() error {
 	if w.active == nil {
 		return nil
 	}
-	if err := w.active.Close(); err != nil {
+	if err := w.closeActiveLocked(); err != nil {
 		return w.wrapSegmentPersistenceError("closing active segment", fmt.Errorf("ingest: close active segment: %w", err))
 	}
 	if err := w.commitTerminalDurableBatchLocked(); err != nil {
@@ -302,7 +289,8 @@ func (w *Writer) Close() error {
 
 // SealActiveAndClose flushes any pending block, seals the active
 // segment file (writes the variable-length footer and finalizes the
-// 256-byte fixed header), persists nextSeq, publishes OnAfterSeal,
+// 256-byte fixed header), persists nextSeq, publishes the sealed segment
+// to Config.Catalog,
 // and closes the writer. Idempotent.
 //
 // Used by the orchestrator at cutover time to finalize the
@@ -335,7 +323,8 @@ func (w *Writer) SealActiveAndClose() error {
 	// fsyncs first, then we pebble.Sync nextSeq. A crash between the
 	// two leaves nextSeq lagging at most one block, which Open's
 	// ScanMaxSeq reconciles on next start.
-	if _, err := w.active.Seal(); err != nil {
+	res, err := w.active.Seal()
+	if err != nil {
 		if cerr := w.active.Close(); cerr != nil {
 			w.cfg.Logger.Warn("close after failed seal", "err", cerr)
 		}
@@ -344,12 +333,7 @@ func (w *Writer) SealActiveAndClose() error {
 	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
 	}
-	sealedIdx := w.activeIdx
-	sealedPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(sealedIdx))
-	if err := w.onAfterSealLocked(sealedIdx, sealedPath); err != nil {
-		return err
-	}
-	return nil
+	return w.commit.sealed(w.activeIdx, res)
 }
 
 // Append writes one event into the active segment. On success,
@@ -613,12 +597,11 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 			return err
 		}
 
-		path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))
-		info, statErr := statFS(w.cfg.FS, path)
+		activeBytes, statErr := w.commit.segmentBytes(w.activeIdx)
 		if statErr != nil {
 			return fmt.Errorf("ingest: stat active segment: %w", statErr)
 		}
-		w.activeBytes = info.Size() - int64(segment.ReservedHeaderBytes)
+		w.activeBytes = activeBytes
 		w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
 
 		if w.activeBytes < w.cfg.MaxSegmentBytes {
@@ -682,12 +665,15 @@ func (w *Writer) ForceRotate(ctx context.Context) error {
 func (w *Writer) rotateLocked(ctx context.Context) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
 		sealedIdx := w.activeIdx
-		sealedPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(sealedIdx))
-		if _, err := w.active.Seal(); err != nil {
+		res, err := w.active.Seal()
+		if err != nil {
 			return w.wrapSegmentPersistenceError("sealing active segment", fmt.Errorf("ingest: seal segment %d: %w", sealedIdx, err))
 		}
 
-		if err := w.onAfterSealLocked(sealedIdx, sealedPath); err != nil {
+		// Publishing before activeIdx moves keeps catalog snapshots
+		// coherent: one that samples the active source after this point
+		// sees the next index, and the sealed list already holds this one.
+		if err := w.commit.sealed(sealedIdx, res); err != nil {
 			return err
 		}
 
@@ -695,13 +681,7 @@ func (w *Writer) rotateLocked(ctx context.Context) error {
 		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("active_idx", int64(w.activeIdx)))
 
 		nextPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))
-		next, err := segment.New(segment.Config{
-			Path:              nextPath,
-			FS:                w.cfg.FS,
-			MaxEventsPerBlock: w.cfg.MaxEventsPerBlock,
-			Metrics:           w.cfg.SegmentMetrics,
-			IOFaultInjector:   w.cfg.SegmentIOFaultInjector,
-		})
+		next, err := w.commit.openSegment(w.activeIdx)
 		if err != nil {
 			return w.wrapSegmentPersistenceError("opening new active segment", fmt.Errorf("ingest: open new active segment %s: %w", nextPath, err))
 		}
@@ -713,18 +693,6 @@ func (w *Writer) rotateLocked(ctx context.Context) error {
 		w.cfg.Logger.InfoContext(ctx, "rotated segment", "new_index", w.activeIdx)
 		return nil
 	})
-}
-
-// onAfterSealLocked publishes a newly sealed segment. The caller MUST
-// hold w.mu; hooks must not call back into Writer.
-func (w *Writer) onAfterSealLocked(idx uint64, path string) error {
-	if w.cfg.OnAfterSeal == nil {
-		return nil
-	}
-	if err := w.cfg.OnAfterSeal(idx, path); err != nil {
-		return fmt.Errorf("ingest: on_after_seal: %w", err)
-	}
-	return nil
 }
 
 // NextSeq returns the next seq value the writer will allocate.
@@ -1021,7 +989,7 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 		}
 	}()
 
-	commitErr = b.Commit(ctx)
+	commitErr = w.commit.commitBatch(ctx, b)
 	if commitErr != nil {
 		return w.wrapSegmentPersistenceError("committing durable metadata batch", fmt.Errorf("ingest: commit durable batch: %w", commitErr))
 	}

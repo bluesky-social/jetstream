@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
@@ -87,7 +88,8 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			Logger:                     o.cfg.Logger,
 			Metrics:                    o.cfg.IngestMetrics,
 			SegmentMetrics:             o.cfg.SegmentMetrics,
-			OnAfterSeal:                o.cfg.IngestOnAfterSeal,
+			Catalog:                    o.cfg.Catalog,
+			Namespace:                  catalog.Main,
 			SegmentIOFaultInjector:     o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {

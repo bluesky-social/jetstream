@@ -202,10 +202,11 @@ type Config struct {
 	// nil; deterministic harnesses feed the firehose in-memory.
 	LiveDial streaming.DialFunc
 
-	// IngestOnAfterSeal is forwarded to every writer that appends to
-	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's
-	// OnSegmentSealed callback. Optional.
-	IngestOnAfterSeal func(idx uint64, path string) error
+	// Catalog is forwarded to every ingest writer, each with its namespace:
+	// catalog.Main for <DataDir>/segments and catalog.BootstrapLive for
+	// <DataDir>/backfill/live_segments. cmd/jetstream wires the local
+	// catalog, which feeds the manifest. Optional.
+	Catalog ingest.SegmentCatalog
 
 	// OnSegmentCompacted refreshes serving metadata after a sealed segment is
 	// rewritten by compaction. cmd/jetstream wires this to the manifest refresh

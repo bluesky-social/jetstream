@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/obs"
@@ -76,7 +77,8 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			ReadLogRetentionBytes: o.cfg.ReadLogRetentionBytes,
 			OnEvent:               o.cfg.OnEvent,
 			OnUpstreamEventSeen:   o.cfg.LiveMetrics.NoteLastSeenUpstreamEvent,
-			OnAfterSeal:           o.cfg.IngestOnAfterSeal,
+			Catalog:               o.cfg.Catalog,
+			Namespace:             catalog.Main,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,
 			Dial:                  o.cfg.LiveDial,
 

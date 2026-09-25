@@ -139,7 +139,8 @@ func Open(cfg Config) (*Consumer, error) {
 		Metrics:                  cfg.WriterMetrics,
 		DurableBatchPrepareValue: c.cursorValueForDurableBatch,
 		OnDurableBatch:           c.onDurableBatch,
-		OnAfterSeal:              cfg.OnAfterSeal,
+		Catalog:                  cfg.Catalog,
+		Namespace:                cfg.Namespace,
 		SegmentMetrics:           cfg.SegmentMetrics,
 		SegmentIOFaultInjector:   cfg.SegmentIOFaultInjector,
 	})

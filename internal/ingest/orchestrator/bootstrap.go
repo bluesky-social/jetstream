@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
@@ -40,7 +41,8 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			Metrics:                o.cfg.IngestMetrics,
 			SegmentMetrics:         o.cfg.SegmentMetrics,
 			AsyncFlushWorkers:      o.cfg.BackfillAsyncFlushWorkers,
-			OnAfterSeal:            o.cfg.IngestOnAfterSeal,
+			Catalog:                o.cfg.Catalog,
+			Namespace:              catalog.Main,
 			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
@@ -64,6 +66,8 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 			MaxSegmentBytes:   o.cfg.BootstrapLiveMaxSegmentBytes,
 			MaxEventsPerBlock: o.cfg.BootstrapLiveMaxEventsPerBlock,
 			SegmentMetrics:    o.cfg.SegmentMetrics,
+			Catalog:           o.cfg.Catalog,
+			Namespace:         catalog.BootstrapLive,
 			OnEvent:           o.cfg.OnBootstrapLiveEvent,
 			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
 			Dial:              o.cfg.LiveDial,

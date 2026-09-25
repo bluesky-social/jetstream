@@ -139,7 +139,7 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 		Store:       st,
 		Logger:      logger,
 		Metrics:     ingest.NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: m.OnSegmentSealed,
+		Catalog:     ingest.SealedPathFunc(segDir, m.OnSegmentSealed),
 	})
 	require.NoError(t, err)
 	s.writer = w

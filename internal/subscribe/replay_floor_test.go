@@ -50,7 +50,7 @@ func openFloorReplayFixture(t *testing.T, onSeal func(*manifest.Manifest) func(u
 		MaxSegmentBytes:       512,
 		Logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:               ingest.NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal:           sealHook,
+		Catalog:               ingest.SealedPathFunc(segDir, sealHook),
 		ReadLogRetentionBytes: 0,
 	})
 	require.NoError(t, err)

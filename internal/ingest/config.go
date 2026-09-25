@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
@@ -110,23 +111,22 @@ type Config struct {
 	// methods.
 	OnAppend func(ev *segment.Event) error
 
-	// OnAfterSeal, if non-nil, runs after a successful segment seal
-	// during rotation or SealActiveAndClose: segment.Writer.Seal has
-	// fsynced the footer and finalized the fixed header before this
-	// hook fires. The hook receives the just-sealed segment's numeric
-	// index and on-disk path. Errors propagate up through the caller;
-	// the segment file is sealed and closed by Seal before this hook
-	// runs, so a hook failure leaves the writer with no usable active
-	// segment. Callers that want to recover should Close the writer
-	// and reopen.
+	// Catalog, if non-nil, is attached to the active segment at Open and
+	// receives each sealed segment's view after segment.Writer.Seal has
+	// fsynced its footer and finalized header. A publish error propagates
+	// up through the caller; the segment is already sealed and closed, so
+	// the writer has no usable active segment and callers that want to
+	// recover should Close and reopen.
 	//
-	// Used by internal/manifest to publish the newly-sealed segment
-	// into its in-memory bounds slice without polling the directory.
-	//
-	// Hooks must not call back into the Writer (that would deadlock
-	// on the writer mutex) or perform unbounded I/O (that would stall
-	// every Append in the active worker pool).
-	OnAfterSeal func(idx uint64, path string) error
+	// catalog/local implements it for the serving catalog and the manifest.
+	// Implementations must not call back into the Writer (that would
+	// deadlock on the writer mutex) or perform unbounded I/O (that would
+	// stall every Append).
+	Catalog SegmentCatalog
+
+	// Namespace labels this writer's segments in Catalog. Default
+	// catalog.Main.
+	Namespace catalog.Namespace
 
 	// Logger is required (no sensible default for an ingestion
 	// component whose failure modes need visibility).
@@ -175,6 +175,9 @@ func (c *Config) validate() error {
 	if c.UnreservedSeqsUnobservable && !c.ReserveClientVisibleSeqs {
 		return fmt.Errorf("%w: UnreservedSeqsUnobservable requires ReserveClientVisibleSeqs", ErrInvalidConfig)
 	}
+	if c.Namespace != "" && !c.Namespace.Valid() {
+		return fmt.Errorf("%w: unknown Namespace %q", ErrInvalidConfig, c.Namespace)
+	}
 	if c.ReadLogRetentionBytes < 0 {
 		return fmt.Errorf("%w: ReadLogRetentionBytes must be >= 0 (got %d)",
 			ErrInvalidConfig, c.ReadLogRetentionBytes)
@@ -191,5 +194,8 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SeqKey == "" {
 		c.SeqKey = "seq/next"
+	}
+	if c.Namespace == "" {
+		c.Namespace = catalog.Main
 	}
 }

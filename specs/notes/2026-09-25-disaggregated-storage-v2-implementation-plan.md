@@ -485,7 +485,7 @@ refreshed STALE mutants.
 
 ### Catalog and read seams
 
-- [ ] **S1.9 `Catalog`, `CatalogView`, `HotLog`, and `BlockRef`; local impl**
+- [x] **S1.9 `Catalog`, `CatalogView`, `HotLog`, and `BlockRef`; local impl**
   (L). Deps: S1.2, S1.7.
   - `internal/catalog`: types from design §11.2 and §19.1. Adjust the names to
     fit the code:
@@ -1223,6 +1223,51 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S1.9 (2026-09-25): catalog, HotLog, local catalog, block committer.**
+  - `internal/catalog` imports only `segment`. `RefsFrom` returns
+    `iter.Seq[BlockRef]`, not a slice, so a reader that stops early does not
+    build every ref. `BlockRef` carries `Segment`/`Block` (stable across
+    compaction) and a closed `Locator` sum type (`FileBlock`, `ObjectBlock`,
+    `InlineBlock`) in place of the `ObjectID|Frame` pair. `FileBlock` is the
+    plan's "(path, block index) handle", pinned to the header checksum as
+    its generation. A `Fetcher` returns `ErrStaleRef` on a generation
+    mismatch or a missing file. The design (§11.2, §19.1) is updated.
+  - The writer-side `Catalog` methods (`CommitHotBatch`, `CommitBlock`,
+    `Seal`, ...) are not declared yet. They land with their first
+    implementation in S2.6. `LogEntry` moved from `ingest` to `catalog`,
+    since `HotLog` hands entries out. `PendingForDID` is documented as
+    local-only.
+  - The block committer is unexported (`blockCommitter`, with
+    `localCommitter` its only implementation). S2.8 exports it when the
+    object-store committer arrives. The m049/m057/m060 target text in
+    `writer.go` is unchanged, and every mutant still applies.
+  - `ingest.Config.OnAfterSeal(idx, path)` is replaced by
+    `Config.Catalog` (a `SegmentCatalog`: `AttachActive` plus
+    `Sealed(SegmentView)`) and `Config.Namespace`. `SegmentsDir` stays,
+    because it is the local committer's directory. `SealResult` now returns
+    the header and footer bytes Seal wrote, so the sealed view is parsed
+    with `OpenReaderParts` and not re-read from disk. `ingest.SealedPathFunc`
+    adapts the old `(idx, path)` callbacks.
+  - Behavior change: bootstrap_live seals now reach the catalog too. The
+    manifest hook is still registered only for `catalog.Main`, so the
+    manifest sees exactly the seals it saw before.
+  - `segment.ActiveBlocksFS` is new. It lists an unsealed file's flushed
+    blocks, ignoring a torn tail as `segment.New` does, so a catalog with no
+    attached writer can still serve the active tail.
+    `Writer.ActiveSegment` keeps reporting the durable blocks after
+    `Close`.
+  - Snapshot coherence during rotation: the writer publishes the seal
+    before advancing `activeIdx`. `Snapshot` samples active sources before
+    the sealed list, and drops an active view whose index is not above the
+    last sealed one. An overlapping view panics, because it can only mean
+    internal corruption.
+  - The local fetcher opens the file on every fetch. S1.10's block cache
+    sits in front of it.
+  - The runtime builds the local catalog and hands it to the orchestrator,
+    and compaction calls `Reload`. `Refresh` is not called at startup yet,
+    because nothing reads through the catalog until S1.10.
+  - Bench: segment and ingest writer benchmarks are at parity with 80f1d00.
 
 - **S1.7 (2026-09-25): segment refactors.** New `segment` API:
   `BlockBuilder` (`NewBlockBuilder`, `Append`, `Len`, `Cap`, `Snapshot`,

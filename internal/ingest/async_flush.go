@@ -263,7 +263,7 @@ func (w *Writer) closeAsync() error {
 	if w.active == nil {
 		return flushErr
 	}
-	closeErr := w.active.Close()
+	closeErr := w.closeActiveLocked()
 	if flushErr != nil {
 		return flushErr
 	}
@@ -294,7 +294,8 @@ func (w *Writer) sealActiveAndCloseAsync() error {
 	if w.active == nil {
 		return nil
 	}
-	if _, err := w.active.Seal(); err != nil {
+	res, err := w.active.Seal()
+	if err != nil {
 		if cerr := w.active.Close(); cerr != nil {
 			w.cfg.Logger.Warn("close after failed seal", "err", cerr)
 		}
@@ -303,10 +304,5 @@ func (w *Writer) sealActiveAndCloseAsync() error {
 	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
 	}
-	sealedIdx := w.activeIdx
-	sealedPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(sealedIdx))
-	if err := w.onAfterSealLocked(sealedIdx, sealedPath); err != nil {
-		return err
-	}
-	return nil
+	return w.commit.sealed(w.activeIdx, res)
 }
