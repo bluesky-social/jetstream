@@ -22,3 +22,9 @@ func fatal(err error) error {
 	}
 	return fmt.Errorf("%w: %w", ErrFatal, err)
 }
+
+// ErrCursorClamped is yielded (recoverable) under WithCursorMode(CursorTime)
+// when a server reports that a witnessed-time resume started later than
+// requested because the cursor predates its retention window: events between
+// the cursor and the retention floor may have been missed.
+var ErrCursorClamped = errors.New("jetstream: timestamp cursor clamped to server retention floor")

@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/bluesky-social/jetstream/internal/subscribe"
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
 
@@ -127,4 +129,41 @@ func toWS(t *testing.T, httpURL string) string {
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 	u.Path = "/xrpc/" + subscribeNSID
 	return u.String()
+}
+
+func TestBootIDHeaderMatchesServer(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, subscribe.BootIDHeader, bootIDHeader,
+		"client and server must agree on the boot ID header name")
+}
+
+// TestDialWebsocketCarriesBootID pins that the production dialer surfaces the
+// boot ID on both a successful upgrade and a typed pre-upgrade rejection.
+func TestDialWebsocketCarriesBootID(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(bootIDHeader, "boot-a")
+		if r.URL.Query().Get("cursor") == "1" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(xrpcErrorBody("CursorTooOld", "floor 5")))
+			return
+		}
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = c.Close(websocket.StatusNormalClosure, "")
+	}))
+	t.Cleanup(srv.Close)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	conn, err := dialWebsocket(context.Background(), wsURL+"/?cursor=9", nil)
+	require.NoError(t, err)
+	require.Equal(t, "boot-a", connBootID(conn))
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+
+	_, err = dialWebsocket(context.Background(), wsURL+"/?cursor=1", nil)
+	require.ErrorIs(t, err, errLiveCursorTooOld)
+	require.Equal(t, "boot-a", errBootID(err))
 }

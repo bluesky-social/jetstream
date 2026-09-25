@@ -305,7 +305,7 @@ func observedEventFromClient(t *testing.T, ev jetstream.Event) ObservedEvent {
 	t.Helper()
 	oe := ObservedEvent{
 		Seq:         ev.Seq,
-		WitnessedAt: ev.TimeUS,
+		WitnessedAt: ev.WitnessedAtUS,
 		DID:         ev.DID,
 	}
 	switch ev.Kind {

@@ -68,6 +68,10 @@ Accepted (Jim, 2026-07-08): the operator re-submits the same CSV, exactly as for
 
 ---
 
+### Timestamp-cursor failover is approximate and at-least-once
+
+Under the client's `CursorTime` mode, a resume on a different instance (or the same instance after a restart) uses `witnessedAt - rewind`. Each instance stamps `witnessed_at` with its own clock when it sees an event, so the same event has slightly different times on different hosts. The rewind (default 5s) is a skew allowance, not a guarantee: skew larger than the rewind can skip events, and everything inside the rewind is re-delivered with no way to dedup across seq namespaces. Callers in this mode must be idempotent. The server's `Jetstream-Boot-Id` is per process on purpose: a persisted ID would be copied by a backup restore, and two restored instances whose seqs have diverged would then look like the same namespace. The price is one timestamp resume (and its duplicates) after every server restart. Area: `live.go` (`planSession`, `adoptSession`), `internal/subscribe/handler.go` (`NewBootID`).
+
 ## Lessons
 
 ### There are several copies of the "is this just cancellation?" classifier — grep them all

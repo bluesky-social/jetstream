@@ -133,7 +133,7 @@ func TestLiveConsumerZstd_DictRotationRefetches(t *testing.T) {
 
 	events, errs := runConsumer(t, liveConfig{
 		host: "https://h", dial: dial, fromTip: true, zstdDict: oldDict,
-		refetchDict: func(context.Context) []byte { return newDict },
+		refetchDict: func(context.Context, string) []byte { return newDict },
 	}, 1)
 	require.Equal(t, []uint64{1}, seqs(events), "the rotated-dictionary frame must decode after refetch")
 	require.NotEmpty(t, errs, "the rejected dial must surface as a reconnect error")

@@ -334,7 +334,7 @@ Compressed block (single ZSTD frame):
 
 The `event_count` field is required because record deletions may mean we have fewer than the configured max number of events per block.
 
-Each event carries two timestamps. `witnessed_at` is when this jetstream instance first saw the event; we assign it at ingestion and never change it, and it stays monotonic with the sequence number (our range scans and the `?cursor=<timestamp>` lookback rely on that). `indexed_at` is the "display" timestamp we hand to clients as `time_us`; it defaults to `witnessed_at` and a value of `0` means "not set, fall back to `witnessed_at`". Only a timestamp import (Section 8) writes `indexed_at`. Both are unix microseconds. This is the same two-column layout as before — the columns were previously named `indexed_at` and `rendered_at` — so the block bytes and the segment `version` are unchanged.
+Each event carries two timestamps. `witnessed_at` is when this jetstream instance first saw the event; we assign it at ingestion and never change it, and it stays monotonic with the sequence number (our range scans and the `?cursor=<timestamp>` lookback rely on that). `indexed_at` is the "display" timestamp we hand to clients as `time_us` (v2: `time`); it defaults to `witnessed_at` and a value of `0` means "not set, fall back to `witnessed_at`". Only a timestamp import (Section 8) writes `indexed_at`. Both are unix microseconds. The v2 stream also sends `witnessed_at` itself (`witnessedAt`), because it is the only correct unit for a timestamp resume cursor. This is the same two-column layout as before — the columns were previously named `indexed_at` and `rendered_at` — so the block bytes and the segment `version` are unchanged.
 
 The `kind` column is a `uint8` discriminator that identifies which firehose event type each row represents:
 
@@ -659,6 +659,7 @@ Every frame is exactly one self-describing JSON object. A **message** frame wrap
     "seq": 12345,
     "did": "did:plc:eygmaihciaxprqvxpfvl6flk",
     "time": "2024-09-09T19:46:02.329308Z",
+    "witnessedAt": "2024-09-09T19:46:02.329308Z",
     "rev": "3l3qo2vutsw2b",
     "operation": "create",
     "collection": "app.bsky.feed.like",
@@ -679,7 +680,9 @@ The message union has five variants:
 
 An **error** frame (`{"$type":"error","error":"ConsumerTooSlow","message":"..."}`) is terminal: the connection closes immediately after. Pre-upgrade rejections are standard XRPC JSON error envelopes (`{"error": "CursorTooOld", "message": "..."}`); clients match the structured error name.
 
-Every event message (`#info` excepted — it is seq-less and time-less) carries jetstream's `seq` (the stream cursor) and `time` — the display timestamp as an RFC 3339 datetime with exactly six fractional digits (microsecond precision, UTC): the `indexed_at` value if a timestamp import set one, otherwise the `witnessed_at` time jetstream first saw the event (Section 8). Timestamp cursors translate against `witnessed_at` (Section 5.1), so after an import a frame's `time` is not necessarily a faithful resume position; `seq` always is.
+Every event message (`#info` excepted — it is seq-less and time-less) carries jetstream's `seq` (the stream cursor) and `time` — the display timestamp as an RFC 3339 datetime with exactly six fractional digits (microsecond precision, UTC): the `indexed_at` value if a timestamp import set one, otherwise the `witnessed_at` time jetstream first saw the event (Section 8). Timestamp cursors translate against `witnessed_at` (Section 5.1), so after an import a frame's `time` is not necessarily a faithful resume position. Event messages therefore also carry `witnessedAt` in the same format, the value `?cursor=<unix-µs>` resolves against. It is optional in the lexicon so clients tolerate older servers. `seq` is the exact resume position on the instance that assigned it; `witnessedAt` is the portable one, approximate across instances because each witnesses events on its own clock.
+
+Every response from the endpoint, including pre-upgrade 400s, carries a `Jetstream-Boot-Id` header: a random ID generated once per server process. A client resuming by `seq` compares it with the ID of the connection that delivered that seq; a different ID means the seq may belong to another namespace (a different instance behind the same name, or a restore), so the client resumes by `witnessedAt` instead. It is per process rather than persisted, so two instances restored from the same backup can never share one; the cost is one timestamp resume after each restart.
 
 Filtering is three orthogonal, AND-composed query parameters — each match-all when omitted, so no parameters means the full stream:
 

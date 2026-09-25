@@ -187,6 +187,29 @@ func TestDecodeLiveFrameErrorFrame(t *testing.T) {
 	require.NotErrorAs(t, err, &streamErr)
 }
 
+func TestDecodeLiveFrameWitnessedAt(t *testing.T) {
+	t.Parallel()
+	frame := func(witnessed string) []byte {
+		return []byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#identity"` +
+			`,"seq":3,"did":"did:plc:a","time":"` + testWireTime + `"` + witnessed +
+			`,"identity":{"did":"did:plc:a","seq":3,"time":"2026-05-25T00:00:00Z"}}}`)
+	}
+
+	ev, _, err := decodeLiveFrame(frame(`,"witnessedAt":"2026-05-25T00:00:00.123456Z"`), recordDecodeMode{})
+	require.NoError(t, err)
+	require.Equal(t, int64(1779667200123456), ev.WitnessedAtUS)
+	require.Equal(t, int64(1), ev.TimeUS, "time stays the display time")
+
+	// Older servers omit it; 0 means "unknown", not an error.
+	ev, _, err = decodeLiveFrame(frame(""), recordDecodeMode{})
+	require.NoError(t, err)
+	require.Zero(t, ev.WitnessedAtUS)
+
+	_, _, err = decodeLiveFrame(frame(`,"witnessedAt":"yesterday"`), recordDecodeMode{})
+	require.Error(t, err)
+	require.NotErrorIs(t, err, errSkipFrame)
+}
+
 func TestDecodeLiveFrameMalformed(t *testing.T) {
 	t.Parallel()
 	for name, frame := range map[string]string{

@@ -10,6 +10,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/jcalabro/atmos/cbor"
+	"github.com/jcalabro/gt"
 )
 
 // errSkipFrame signals a frame that is valid but carries no caller-visible
@@ -149,12 +150,12 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		if v.DID == "" || v.Identity.DID == "" {
 			return Event{}, nil, errors.New("jetstream: live identity frame missing required DID or identity payload")
 		}
-		seq, timeUS, err := liveEnvelopeFields(v.Seq, v.Time)
+		seq, timeUS, witnessedUS, err := liveEnvelopeFields(v.Seq, v.Time, v.WitnessedAt)
 		if err != nil {
 			return Event{}, nil, err
 		}
 		return Event{
-			DID: v.DID, Seq: seq, TimeUS: timeUS, Kind: KindIdentity,
+			DID: v.DID, Seq: seq, TimeUS: timeUS, WitnessedAtUS: witnessedUS, Kind: KindIdentity,
 			Identity: &Identity{
 				DID:    orDID(v.Identity.DID, v.DID),
 				Handle: v.Identity.Handle.ValOr(""),
@@ -168,12 +169,12 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		if v.DID == "" || v.Account.DID == "" {
 			return Event{}, nil, errors.New("jetstream: live account frame missing required DID or account payload")
 		}
-		seq, timeUS, err := liveEnvelopeFields(v.Seq, v.Time)
+		seq, timeUS, witnessedUS, err := liveEnvelopeFields(v.Seq, v.Time, v.WitnessedAt)
 		if err != nil {
 			return Event{}, nil, err
 		}
 		return Event{
-			DID: v.DID, Seq: seq, TimeUS: timeUS, Kind: KindAccount,
+			DID: v.DID, Seq: seq, TimeUS: timeUS, WitnessedAtUS: witnessedUS, Kind: KindAccount,
 			Account: &Account{
 				DID:    orDID(v.Account.DID, v.DID),
 				Active: v.Account.Active,
@@ -191,12 +192,12 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 		if v.DID == "" || v.Sync.DID == "" {
 			return Event{}, nil, errors.New("jetstream: live sync frame missing required DID or sync payload")
 		}
-		seq, timeUS, err := liveEnvelopeFields(v.Seq, v.Time)
+		seq, timeUS, witnessedUS, err := liveEnvelopeFields(v.Seq, v.Time, v.WitnessedAt)
 		if err != nil {
 			return Event{}, nil, err
 		}
 		return Event{
-			DID: v.DID, Seq: seq, TimeUS: timeUS, Kind: KindSync,
+			DID: v.DID, Seq: seq, TimeUS: timeUS, WitnessedAtUS: witnessedUS, Kind: KindSync,
 			Sync: &Sync{
 				DID:  orDID(v.Sync.DID, v.DID),
 				Rev:  v.Sync.Rev,
@@ -227,26 +228,35 @@ func decodeLiveFrame(data []byte, mode recordDecodeMode) (Event, *liveInfo, erro
 
 // liveEnvelopeFields validates the jetstream envelope fields shared by
 // every message kind: seq (int64 on the wire, uint64 internally) and the
-// canonical datetime, parsed back to unix-µs (the engine's clock domain
-// and the timestamp-cursor unit).
-func liveEnvelopeFields(seq int64, timeStr string) (uint64, int64, error) {
+// canonical datetime, parsed back to unix-µs (the engine's clock domain).
+// witnessedAt is the optional witnessed time (the timestamp-cursor unit); a
+// server predating the field omits it and it decodes as 0.
+func liveEnvelopeFields(seq int64, timeStr string, witnessedAt gt.Option[string]) (uint64, int64, int64, error) {
 	// Seqs are 1-based on the wire (seq 0 is the server's never-allocated
 	// sentinel), so 0 here means the required field was absent — the
 	// generated decoder does not enforce lexicon `required`. Accepting it
 	// would hand session() an event the `ev.Seq <= lastSeq` dedup silently
 	// swallows; error instead so the malformed frame is surfaced.
 	if seq <= 0 {
-		return 0, 0, fmt.Errorf("jetstream: live frame with invalid seq %d", seq)
+		return 0, 0, 0, fmt.Errorf("jetstream: live frame with invalid seq %d", seq)
 	}
 	ts, err := time.Parse(time.RFC3339Nano, timeStr)
 	if err != nil {
-		return 0, 0, fmt.Errorf("jetstream: live frame time %q: %w", timeStr, err)
+		return 0, 0, 0, fmt.Errorf("jetstream: live frame time %q: %w", timeStr, err)
 	}
-	return uint64(seq), ts.UnixMicro(), nil
+	var witnessedUS int64
+	if witnessedAt.HasVal() {
+		wt, err := time.Parse(time.RFC3339Nano, witnessedAt.Val())
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("jetstream: live frame witnessedAt %q: %w", witnessedAt.Val(), err)
+		}
+		witnessedUS = wt.UnixMicro()
+	}
+	return uint64(seq), ts.UnixMicro(), witnessedUS, nil
 }
 
 func liveCommitToEvent(c *jetstream.JetstreamSubscribeEvents_Commit, mode recordDecodeMode) (Event, *liveInfo, error) {
-	seq, timeUS, err := liveEnvelopeFields(c.Seq, c.Time)
+	seq, timeUS, witnessedUS, err := liveEnvelopeFields(c.Seq, c.Time, c.WitnessedAt)
 	if err != nil {
 		return Event{}, nil, err
 	}
@@ -287,7 +297,7 @@ func liveCommitToEvent(c *jetstream.JetstreamSubscribeEvents_Commit, mode record
 	default:
 		return Event{}, nil, fmt.Errorf("jetstream: unknown live commit operation %q", c.Operation)
 	}
-	return Event{DID: c.DID, Seq: seq, TimeUS: timeUS, Kind: KindCommit, Commit: commit}, nil, nil
+	return Event{DID: c.DID, Seq: seq, TimeUS: timeUS, WitnessedAtUS: witnessedUS, Kind: KindCommit, Commit: commit}, nil, nil
 }
 
 // decodeLiveRecord validates an atproto JSON record and produces both client

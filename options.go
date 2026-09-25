@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime"
+	"time"
 )
 
 // Option configures a Client. Options are applied in order by Subscribe.
@@ -49,6 +50,14 @@ type config struct {
 	// zstdCompression controls the live tail's default dict-zstd scheme
 	// (see WithZstdCompression).
 	zstdCompression bool
+	// cursorMode selects the resume-cursor style (see WithCursorMode).
+	cursorMode CursorMode
+	// failoverHosts are the raw live-tail fallbacks from WithFailoverHosts;
+	// validateConfig normalizes them.
+	failoverHosts []string
+	// failoverRewind is the margin subtracted from a witnessed-time cursor
+	// whenever the client cannot prove it is resuming on the same instance.
+	failoverRewind time.Duration
 }
 
 // Defaults applied when an option is not supplied.
@@ -65,6 +74,12 @@ const (
 	// minAutoDownloadConc keeps small machines from dropping to a near-serial
 	// backfill: even a 2-core box should overlap a couple of downloads/decodes.
 	minAutoDownloadConc = 4
+	// defaultFailoverRewind is how far a witnessed-time resume rewinds. Two
+	// instances witness the same event at different instants (upstream
+	// delivery skew plus clock skew, typically well under a second), so a
+	// timestamp taken from one instance must be pulled back before it is
+	// replayed against another or events near the seam are lost.
+	defaultFailoverRewind = 5 * time.Second
 )
 
 // defaultDownloadConc auto-sizes download/decode concurrency to the machine:
@@ -89,6 +104,7 @@ func defaultConfig() config {
 		batchSize:       defaultBatchSize,
 		downloadConc:    defaultDownloadConc(),
 		zstdCompression: true,
+		failoverRewind:  defaultFailoverRewind,
 	}
 }
 
@@ -187,7 +203,10 @@ func WithSnapshotOnly() Option {
 //
 // Timestamp resumes are at-least-once. They may re-deliver an event at the
 // boundary and must not be deduplicated by Event.TimeUS, which can be an
-// imported display timestamp rather than the witnessed time used for seeking.
+// imported display timestamp rather than the witnessed time used for seeking;
+// save Event.WitnessedAtUS (Batch.LastCursor under CursorTime) instead. Under
+// CursorTime a timestamp is rewound by WithFailoverRewind before dialing, since
+// it may have been witnessed by a different instance.
 // Ignored when an archive replay is requested, since that workflow computes its
 // own live cutover cursor.
 func WithLiveCursor(seq uint64) Option {
@@ -351,4 +370,55 @@ func WithRawRecordCIDs() Option {
 // archive segment compression is unaffected.
 func WithZstdCompression(enabled bool) Option {
 	return func(c *config) { c.zstdCompression = enabled }
+}
+
+// CursorMode selects which of an event's two resume positions a Client treats
+// as its cursor. See WithCursorMode.
+type CursorMode int
+
+const (
+	// CursorSeq (the default) resumes by Event.Seq. Seqs are exact and
+	// gapless, but only meaningful on the instance that assigned them.
+	CursorSeq CursorMode = iota
+	// CursorTime resumes by Event.WitnessedAtUS, a unix-microsecond timestamp
+	// every Jetstream instance can seek to, trading exactness for portability.
+	CursorTime
+)
+
+// WithCursorMode selects the resume-cursor style.
+//
+// Under CursorTime, Batch.LastCursor returns the highest Event.WitnessedAtUS
+// in the batch instead of the highest Seq; feed it back through
+// WithLiveCursor to resume on any instance. The live tail keeps resuming by
+// seq while it can prove (via the server's boot ID) that it reconnected to the
+// same instance, and otherwise resumes from the last witnessed time minus
+// WithFailoverRewind, re-delivering the overlap. Delivery is therefore
+// at-least-once across a host change; consumers must be idempotent. It also
+// enables WithFailoverHosts.
+//
+// Timestamp resumes cover the server's live lookback window only: a cursor
+// older than that (for example one saved mid-way through a deep archive
+// replay) starts at the oldest retained event, and the client yields a
+// recoverable ErrCursorClamped. Archive replay (WithAfterSeq) is always
+// seq-addressed on the primary host.
+func WithCursorMode(m CursorMode) Option {
+	return func(c *config) { c.cursorMode = m }
+}
+
+// WithFailoverHosts adds live-tail fallback hosts, tried round-robin after the
+// primary host passed to Subscribe when a connection attempt fails. Each entry
+// accepts the same forms as Subscribe's host. Requires
+// WithCursorMode(CursorTime): a seq cursor from one instance is meaningless on
+// another. Archive replay always uses the primary host.
+func WithFailoverHosts(hosts ...string) Option {
+	return func(c *config) { c.failoverHosts = append(c.failoverHosts, hosts...) }
+}
+
+// WithFailoverRewind sets how far a CursorTime resume rewinds a witnessed-time
+// cursor when the client cannot prove it is on the same instance (a host
+// change, a server restart, or a caller-supplied WithLiveCursor timestamp).
+// Larger values tolerate more cross-instance skew at the cost of more
+// re-delivered events. Must be >= 0; default 5s.
+func WithFailoverRewind(d time.Duration) Option {
+	return func(c *config) { c.failoverRewind = d }
 }

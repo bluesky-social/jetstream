@@ -630,6 +630,16 @@ func TestEncode_TimeUSResolvesDisplayValue(t *testing.T) {
 		return ts.UnixMicro()
 	}
 
+	v2WitnessedUSOf := func(t *testing.T, body []byte) int64 {
+		t.Helper()
+		payload := unwrapV2Frame(t, body)
+		s, ok := payload["witnessedAt"].(string)
+		require.True(t, ok, "witnessedAt not a string in %s", body)
+		ts, err := time.Parse(wireTimeLayout, s)
+		require.NoError(t, err)
+		return ts.UnixMicro()
+	}
+
 	// v1 Encode: commit, identity, account (sync has no v1 form).
 	for _, kind := range []segment.Kind{segment.KindCreate, segment.KindIdentity, segment.KindAccount} {
 		t.Run("v1_unimported_"+string(rune('0'+int(kind))), func(t *testing.T) {
@@ -659,6 +669,9 @@ func TestEncode_TimeUSResolvesDisplayValue(t *testing.T) {
 			body, err := EncodeV2(event(kind, witnessed, imported))
 			require.NoError(t, err)
 			require.Equal(t, imported, v2TimeUSOf(t, body), "imported display value must win")
+			// witnessedAt is the resume-cursor unit and must never take the
+			// imported display value.
+			require.Equal(t, witnessed, v2WitnessedUSOf(t, body), "witnessedAt must stay the witnessed time")
 		})
 	}
 }

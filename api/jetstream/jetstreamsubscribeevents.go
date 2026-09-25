@@ -19,7 +19,8 @@ type JetstreamSubscribeEvents_Account struct {
 	Account       comatproto.SyncSubscribeRepos_Account `json:"account"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
 	DID           string                                `json:"did"`
 	Seq           int64                                 `json:"seq"`
-	Time          string                                `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
+	Time          string                                `json:"time"`                 // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
+	WitnessedAt   gt.Option[string]                     `json:"witnessedAt,omitzero"` // When this Jetstream instance witnessed the event, microsecond precision. Never altered by timesta...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -32,6 +33,7 @@ var (
 	cborKey_JetstreamSubscribeEvents_Account_time        = cbor.AppendTextKey(nil, "time")
 	cborKey_JetstreamSubscribeEvents_Account_dollar_type = cbor.AppendTextKey(nil, "$type")
 	cborKey_JetstreamSubscribeEvents_Account_account     = cbor.AppendTextKey(nil, "account")
+	cborKey_JetstreamSubscribeEvents_Account_witnessedAt = cbor.AppendTextKey(nil, "witnessedAt")
 )
 
 func (s *JetstreamSubscribeEvents_Account) MarshalCBOR() ([]byte, error) {
@@ -41,6 +43,9 @@ func (s *JetstreamSubscribeEvents_Account) MarshalCBOR() ([]byte, error) {
 func (s *JetstreamSubscribeEvents_Account) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.WitnessedAt.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -69,6 +74,11 @@ func (s *JetstreamSubscribeEvents_Account) AppendCBOR(buf []byte) ([]byte, error
 				return nil, err
 			}
 		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "witnessedAt", buf)
+		if s.WitnessedAt.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_witnessedAt...)
+			buf = cbor.AppendText(buf, s.WitnessedAt.Val())
+		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_did...)
@@ -88,6 +98,10 @@ func (s *JetstreamSubscribeEvents_Account) AppendCBOR(buf []byte) ([]byte, error
 			if err != nil {
 				return nil, err
 			}
+		}
+		if s.WitnessedAt.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_witnessedAt...)
+			buf = cbor.AppendText(buf, s.WitnessedAt.Val())
 		}
 	}
 	return buf, nil
@@ -184,6 +198,26 @@ func (s *JetstreamSubscribeEvents_Account) UnmarshalCBORAt(data []byte, pos int)
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
+		case 11:
+			if string(data[keyStart:keyEnd]) == "witnessedAt" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.WitnessedAt = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipValue(data, pos)
@@ -203,6 +237,7 @@ var (
 	jsonKey_JetstreamSubscribeEvents_Account_did         = []byte("\"did\":")
 	jsonKey_JetstreamSubscribeEvents_Account_seq         = []byte("\"seq\":")
 	jsonKey_JetstreamSubscribeEvents_Account_time        = []byte("\"time\":")
+	jsonKey_JetstreamSubscribeEvents_Account_witnessedAt = []byte("\"witnessedAt\":")
 )
 
 func (s *JetstreamSubscribeEvents_Account) MarshalJSON() ([]byte, error) {
@@ -250,6 +285,14 @@ func (s *JetstreamSubscribeEvents_Account) AppendJSON(buf []byte) ([]byte, error
 	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Account_time...)
 	buf = cbor.AppendJSONString(buf, s.Time)
 	first = false
+	if s.WitnessedAt.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Account_witnessedAt...)
+		buf = cbor.AppendJSONString(buf, s.WitnessedAt.Val())
+		first = false
+	}
 	for _, ef := range s.extra {
 		if ef.Encoding != extraEncodingJSON {
 			continue
@@ -315,6 +358,20 @@ func (s *JetstreamSubscribeEvents_Account) UnmarshalJSONAt(data []byte, pos int)
 			if err != nil {
 				return 0, err
 			}
+		case "witnessedAt":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.WitnessedAt = gt.Some(v)
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipJSONValue(data, pos)
@@ -336,11 +393,12 @@ type JetstreamSubscribeEvents_Commit struct {
 	Collection    string            `json:"collection"`   // Collection NSID of the record.
 	DID           string            `json:"did"`
 	Operation     string            `json:"operation"`
-	Record        json.RawMessage   `json:"record,omitempty"` // The record decoded to JSON. Absent for deletes.
-	Rev           string            `json:"rev"`              // The repo rev of the commit that produced this op.
-	Rkey          string            `json:"rkey"`             // Record key.
-	Seq           int64             `json:"seq"`              // Jetstream's monotonic per-event sequence number; the stream cursor.
-	Time          string            `json:"time"`             // The event's display timestamp, microsecond precision: when Jetstream witnessed the event, unless ...
+	Record        json.RawMessage   `json:"record,omitempty"`     // The record decoded to JSON. Absent for deletes.
+	Rev           string            `json:"rev"`                  // The repo rev of the commit that produced this op.
+	Rkey          string            `json:"rkey"`                 // Record key.
+	Seq           int64             `json:"seq"`                  // Jetstream's monotonic per-event sequence number; the stream cursor.
+	Time          string            `json:"time"`                 // The event's display timestamp, microsecond precision: when Jetstream witnessed the event, unless ...
+	WitnessedAt   gt.Option[string] `json:"witnessedAt,omitzero"` // When this Jetstream instance witnessed the event, microsecond precision. Never altered by timesta...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -358,6 +416,7 @@ var (
 	cborKey_JetstreamSubscribeEvents_Commit_record      = cbor.AppendTextKey(nil, "record")
 	cborKey_JetstreamSubscribeEvents_Commit_operation   = cbor.AppendTextKey(nil, "operation")
 	cborKey_JetstreamSubscribeEvents_Commit_collection  = cbor.AppendTextKey(nil, "collection")
+	cborKey_JetstreamSubscribeEvents_Commit_witnessedAt = cbor.AppendTextKey(nil, "witnessedAt")
 )
 
 func (s *JetstreamSubscribeEvents_Commit) MarshalCBOR() ([]byte, error) {
@@ -373,6 +432,9 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 		n++
 	}
 	if s.Record != nil {
+		n++
+	}
+	if s.WitnessedAt.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -414,6 +476,11 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "collection", buf)
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_collection...)
 		buf = cbor.AppendText(buf, s.Collection)
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "witnessedAt", buf)
+		if s.WitnessedAt.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_witnessedAt...)
+			buf = cbor.AppendText(buf, s.WitnessedAt.Val())
+		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		if s.CID.HasVal() {
@@ -442,6 +509,10 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 		buf = cbor.AppendText(buf, s.Operation)
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_collection...)
 		buf = cbor.AppendText(buf, s.Collection)
+		if s.WitnessedAt.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_witnessedAt...)
+			buf = cbor.AppendText(buf, s.WitnessedAt.Val())
+		}
 	}
 	return buf, nil
 }
@@ -586,6 +657,26 @@ func (s *JetstreamSubscribeEvents_Commit) UnmarshalCBORAt(data []byte, pos int) 
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
+		case 11:
+			if string(data[keyStart:keyEnd]) == "witnessedAt" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.WitnessedAt = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipValue(data, pos)
@@ -610,6 +701,7 @@ var (
 	jsonKey_JetstreamSubscribeEvents_Commit_rkey        = []byte("\"rkey\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_seq         = []byte("\"seq\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_time        = []byte("\"time\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_witnessedAt = []byte("\"witnessedAt\":")
 )
 
 func (s *JetstreamSubscribeEvents_Commit) MarshalJSON() ([]byte, error) {
@@ -685,6 +777,14 @@ func (s *JetstreamSubscribeEvents_Commit) AppendJSON(buf []byte) ([]byte, error)
 	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_time...)
 	buf = cbor.AppendJSONString(buf, s.Time)
 	first = false
+	if s.WitnessedAt.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_witnessedAt...)
+		buf = cbor.AppendJSONString(buf, s.WitnessedAt.Val())
+		first = false
+	}
 	for _, ef := range s.extra {
 		if ef.Encoding != extraEncodingJSON {
 			continue
@@ -788,6 +888,20 @@ func (s *JetstreamSubscribeEvents_Commit) UnmarshalJSONAt(data []byte, pos int) 
 			if err != nil {
 				return 0, err
 			}
+		case "witnessedAt":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.WitnessedAt = gt.Some(v)
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipJSONValue(data, pos)
@@ -808,7 +922,8 @@ type JetstreamSubscribeEvents_Identity struct {
 	DID           string                                 `json:"did"`
 	Identity      comatproto.SyncSubscribeRepos_Identity `json:"identity"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
 	Seq           int64                                  `json:"seq"`
-	Time          string                                 `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
+	Time          string                                 `json:"time"`                 // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
+	WitnessedAt   gt.Option[string]                      `json:"witnessedAt,omitzero"` // When this Jetstream instance witnessed the event, microsecond precision. Never altered by timesta...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -821,6 +936,7 @@ var (
 	cborKey_JetstreamSubscribeEvents_Identity_time        = cbor.AppendTextKey(nil, "time")
 	cborKey_JetstreamSubscribeEvents_Identity_dollar_type = cbor.AppendTextKey(nil, "$type")
 	cborKey_JetstreamSubscribeEvents_Identity_identity    = cbor.AppendTextKey(nil, "identity")
+	cborKey_JetstreamSubscribeEvents_Identity_witnessedAt = cbor.AppendTextKey(nil, "witnessedAt")
 )
 
 func (s *JetstreamSubscribeEvents_Identity) MarshalCBOR() ([]byte, error) {
@@ -830,6 +946,9 @@ func (s *JetstreamSubscribeEvents_Identity) MarshalCBOR() ([]byte, error) {
 func (s *JetstreamSubscribeEvents_Identity) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.WitnessedAt.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -858,6 +977,11 @@ func (s *JetstreamSubscribeEvents_Identity) AppendCBOR(buf []byte) ([]byte, erro
 				return nil, err
 			}
 		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "witnessedAt", buf)
+		if s.WitnessedAt.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_witnessedAt...)
+			buf = cbor.AppendText(buf, s.WitnessedAt.Val())
+		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_did...)
@@ -877,6 +1001,10 @@ func (s *JetstreamSubscribeEvents_Identity) AppendCBOR(buf []byte) ([]byte, erro
 			if err != nil {
 				return nil, err
 			}
+		}
+		if s.WitnessedAt.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_witnessedAt...)
+			buf = cbor.AppendText(buf, s.WitnessedAt.Val())
 		}
 	}
 	return buf, nil
@@ -973,6 +1101,26 @@ func (s *JetstreamSubscribeEvents_Identity) UnmarshalCBORAt(data []byte, pos int
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
+		case 11:
+			if string(data[keyStart:keyEnd]) == "witnessedAt" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.WitnessedAt = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipValue(data, pos)
@@ -992,6 +1140,7 @@ var (
 	jsonKey_JetstreamSubscribeEvents_Identity_identity    = []byte("\"identity\":")
 	jsonKey_JetstreamSubscribeEvents_Identity_seq         = []byte("\"seq\":")
 	jsonKey_JetstreamSubscribeEvents_Identity_time        = []byte("\"time\":")
+	jsonKey_JetstreamSubscribeEvents_Identity_witnessedAt = []byte("\"witnessedAt\":")
 )
 
 func (s *JetstreamSubscribeEvents_Identity) MarshalJSON() ([]byte, error) {
@@ -1039,6 +1188,14 @@ func (s *JetstreamSubscribeEvents_Identity) AppendJSON(buf []byte) ([]byte, erro
 	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Identity_time...)
 	buf = cbor.AppendJSONString(buf, s.Time)
 	first = false
+	if s.WitnessedAt.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Identity_witnessedAt...)
+		buf = cbor.AppendJSONString(buf, s.WitnessedAt.Val())
+		first = false
+	}
 	for _, ef := range s.extra {
 		if ef.Encoding != extraEncodingJSON {
 			continue
@@ -1103,6 +1260,20 @@ func (s *JetstreamSubscribeEvents_Identity) UnmarshalJSONAt(data []byte, pos int
 			s.Time, pos, err = cbor.ReadJSONString(data, pos)
 			if err != nil {
 				return 0, err
+			}
+		case "witnessedAt":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.WitnessedAt = gt.Some(v)
 			}
 		default:
 			valueStart := pos
@@ -1602,8 +1773,9 @@ type JetstreamSubscribeEvents_Sync struct {
 	LexiconTypeID string                             `json:"$type,omitempty"`
 	DID           string                             `json:"did"`
 	Seq           int64                              `json:"seq"`
-	Sync          comatproto.SyncSubscribeRepos_Sync `json:"sync"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
-	Time          string                             `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
+	Sync          comatproto.SyncSubscribeRepos_Sync `json:"sync"`                 // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
+	Time          string                             `json:"time"`                 // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
+	WitnessedAt   gt.Option[string]                  `json:"witnessedAt,omitzero"` // When this Jetstream instance witnessed the event, microsecond precision. Never altered by timesta...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -1616,6 +1788,7 @@ var (
 	cborKey_JetstreamSubscribeEvents_Sync_sync        = cbor.AppendTextKey(nil, "sync")
 	cborKey_JetstreamSubscribeEvents_Sync_time        = cbor.AppendTextKey(nil, "time")
 	cborKey_JetstreamSubscribeEvents_Sync_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_Sync_witnessedAt = cbor.AppendTextKey(nil, "witnessedAt")
 )
 
 func (s *JetstreamSubscribeEvents_Sync) MarshalCBOR() ([]byte, error) {
@@ -1625,6 +1798,9 @@ func (s *JetstreamSubscribeEvents_Sync) MarshalCBOR() ([]byte, error) {
 func (s *JetstreamSubscribeEvents_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.WitnessedAt.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -1653,6 +1829,11 @@ func (s *JetstreamSubscribeEvents_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "witnessedAt", buf)
+		if s.WitnessedAt.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_witnessedAt...)
+			buf = cbor.AppendText(buf, s.WitnessedAt.Val())
+		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_did...)
@@ -1672,6 +1853,10 @@ func (s *JetstreamSubscribeEvents_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 		if s.LexiconTypeID != "" {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		if s.WitnessedAt.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_witnessedAt...)
+			buf = cbor.AppendText(buf, s.WitnessedAt.Val())
 		}
 	}
 	return buf, nil
@@ -1759,6 +1944,26 @@ func (s *JetstreamSubscribeEvents_Sync) UnmarshalCBORAt(data []byte, pos int) (i
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
+		case 11:
+			if string(data[keyStart:keyEnd]) == "witnessedAt" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.WitnessedAt = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipValue(data, pos)
@@ -1778,6 +1983,7 @@ var (
 	jsonKey_JetstreamSubscribeEvents_Sync_seq         = []byte("\"seq\":")
 	jsonKey_JetstreamSubscribeEvents_Sync_sync        = []byte("\"sync\":")
 	jsonKey_JetstreamSubscribeEvents_Sync_time        = []byte("\"time\":")
+	jsonKey_JetstreamSubscribeEvents_Sync_witnessedAt = []byte("\"witnessedAt\":")
 )
 
 func (s *JetstreamSubscribeEvents_Sync) MarshalJSON() ([]byte, error) {
@@ -1825,6 +2031,14 @@ func (s *JetstreamSubscribeEvents_Sync) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Sync_time...)
 	buf = cbor.AppendJSONString(buf, s.Time)
 	first = false
+	if s.WitnessedAt.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Sync_witnessedAt...)
+		buf = cbor.AppendJSONString(buf, s.WitnessedAt.Val())
+		first = false
+	}
 	for _, ef := range s.extra {
 		if ef.Encoding != extraEncodingJSON {
 			continue
@@ -1889,6 +2103,20 @@ func (s *JetstreamSubscribeEvents_Sync) UnmarshalJSONAt(data []byte, pos int) (i
 			s.Time, pos, err = cbor.ReadJSONString(data, pos)
 			if err != nil {
 				return 0, err
+			}
+		case "witnessedAt":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.WitnessedAt = gt.Some(v)
 			}
 		default:
 			valueStart := pos
