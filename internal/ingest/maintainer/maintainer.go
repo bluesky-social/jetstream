@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/objstore/objcache"
@@ -58,6 +59,8 @@ type Config struct {
 
 	Logger  *slog.Logger
 	Metrics *Metrics
+	// Crash is the test-only crash seam injector. Nil in production.
+	Crash crashpoint.Injector
 	// OnFailure is called once with the error that stopped the maintainer.
 	// The session has already ended. It runs on the maintainer goroutine and
 	// must not call Close; the owner closes the writer (which releases any
@@ -367,6 +370,9 @@ func (m *Maintainer) fold(ctx context.Context, b *ingest.ClosedBlock) error {
 		if len(refs) != 1 {
 			return fmt.Errorf("maintainer: upload block [%d,%d]: got %d refs", b.FirstSeq, b.LastSeq, len(refs))
 		}
+		if err := m.crash(ctx, crashpoint.AfterFoldUploadBeforeCommit); err != nil {
+			return err
+		}
 		res, err := m.cfg.Session.Fold(ctx, catalog.Block{Namespace: catalog.Main, Info: info, Object: refs[0]})
 		if err != nil {
 			return fmt.Errorf("maintainer: fold block [%d,%d]: %w", b.FirstSeq, b.LastSeq, err)
@@ -387,6 +393,13 @@ func (m *Maintainer) fold(ctx context.Context, b *ingest.ClosedBlock) error {
 		m.cfg.Metrics.observeFold(!refs[0].Pending, time.Since(start))
 		return nil
 	})
+}
+
+func (m *Maintainer) crash(ctx context.Context, p crashpoint.Point) error {
+	if m.cfg.Crash == nil {
+		return nil
+	}
+	return m.cfg.Crash.SimulateCrash(ctx, p)
 }
 
 // encode builds the block's frame with the encoder the hot writer uses for
@@ -432,6 +445,9 @@ func (m *Maintainer) seal(ctx context.Context) error {
 		}
 		if len(refs) != 1 {
 			return fmt.Errorf("maintainer: upload footer of segment %d: got %d refs", m.segment, len(refs))
+		}
+		if err := m.crash(ctx, crashpoint.AfterSealFooterUploadBeforeCommit); err != nil {
+			return err
 		}
 		_, err = m.cfg.Session.Seal(ctx, catalog.Seal{
 			Namespace: catalog.Main,

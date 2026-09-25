@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 
 	"github.com/bluesky-social/jetstream/internal/metastore"
@@ -27,8 +28,8 @@ const (
 // rows are appended and fsynced.
 //
 // The live consumer promotes state after appending every row of its event.
-// StageFlush adds promoted entries to the synced relay/cursor batch after
-// segment fsync. A crash during resync therefore leaves the old verifier
+// Each durable batch snapshots the promoted entries when it samples its relay
+// cursor and stages them into the relay/cursor batch after segment fsync. A crash during resync therefore leaves the old verifier
 // state, allowing redelivery or a chain break to archive the full replacement
 // set.
 //
@@ -349,37 +350,62 @@ func (p *StateStore) PromoteHosting(did atmos.DID, maxSeq int64) {
 	delete(p.pendingHosting, did)
 }
 
-// StageFlush adds all PROMOTED verifier state writes to b and records
-// the staged values so CommitStaged can clear exactly them. Pending
-// (not yet promoted) entries are never flushed — their event rows are
-// not durable yet.
-func (p *StateStore) StageFlush(b metastore.Batch) {
+// Snapshot is the promoted state at one instant, for a later StageSnapshot.
+type Snapshot struct {
+	chain, hosting map[atmos.DID][]byte
+	ident, account map[atmos.DID]int64
+}
+
+// Snapshot captures the promoted state now. A durable batch whose writes
+// are prepared before they commit (async flush, pipelined hot batches) must
+// snapshot when it samples its relay cursor, under the writer mutex: an
+// entry promoted later can belong to an event whose rows are in a later
+// batch, and persisting it with this one lets a crash between the two
+// commits leave state newer than the archive, so the verifier drops the
+// redelivered event as a rev replay.
+func (p *StateStore) Snapshot() *Snapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.capturedChain = make(map[atmos.DID][]byte, len(p.promotedChain))
-	p.capturedHosting = make(map[atmos.DID][]byte, len(p.promotedHosting))
-	p.capturedIdent = make(map[atmos.DID]int64, len(p.promotedIdent))
-	p.capturedAccount = make(map[atmos.DID]int64, len(p.promotedAccount))
-	for did, val := range p.promotedChain {
+	// Values are never mutated after promotion, so the copies share them.
+	return &Snapshot{
+		chain:   maps.Clone(p.promotedChain),
+		hosting: maps.Clone(p.promotedHosting),
+		ident:   maps.Clone(p.promotedIdent),
+		account: maps.Clone(p.promotedAccount),
+	}
+}
+
+// StageFlush stages the state promoted now; see StageSnapshot.
+func (p *StateStore) StageFlush(b metastore.Batch) {
+	p.StageSnapshot(b, p.Snapshot())
+}
+
+// StageSnapshot adds snap's verifier state writes to b and records them so
+// CommitStaged can clear exactly them. Pending (not yet promoted) entries
+// are never flushed: their event rows are not durable yet.
+func (p *StateStore) StageSnapshot(b metastore.Batch, snap *Snapshot) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.capturedChain = snap.chain
+	p.capturedHosting = snap.hosting
+	p.capturedIdent = snap.ident
+	p.capturedAccount = snap.account
+	for did, val := range snap.chain {
 		b.Set(chainKey(did), val)
-		p.capturedChain[did] = val
 	}
-	for did, val := range p.promotedHosting {
+	for did, val := range snap.hosting {
 		b.Set(hostKey(did), val)
-		p.capturedHosting[did] = val
 	}
-	for did, seq := range p.promotedIdent {
+	for did, seq := range snap.ident {
 		b.Set(identKey(did), encodeIdentitySeq(seq))
-		p.capturedIdent[did] = seq
 	}
-	for did, seq := range p.promotedAccount {
+	for did, seq := range snap.account {
 		b.Set(acctKey(did), encodeIdentitySeq(seq))
-		p.capturedAccount[did] = seq
 	}
 }
 
 // CommitStaged clears the promoted entries captured by the most recent
-// StageFlush after that batch commits successfully. Entries promoted
+// StageSnapshot after that batch commits successfully. Entries promoted
 // (or re-saved) after the capture are left in place for the next flush
 // — clearing the whole map here would silently discard a write that
 // was never in the batch.

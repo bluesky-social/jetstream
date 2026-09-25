@@ -3,6 +3,7 @@ package storagefake
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -24,6 +25,7 @@ import (
 // and it keeps the fake's serialization argument trivial.
 type tx struct {
 	db       *DB
+	cl       *Client
 	kind     catalog.TxKind
 	connLost *Fault
 
@@ -45,7 +47,10 @@ func (t *tx) stmt(ctx context.Context, name string, write bool) error {
 	if t.aborted != nil {
 		return fmt.Errorf("%w: %w", ErrTxAborted, t.aborted)
 	}
-	if err := t.db.yield(ctx, "stmt/"+name); err != nil {
+	if err := t.db.yield(ctx, t.cl, "stmt/"+name); err != nil {
+		if errors.Is(err, ErrKilled) {
+			t.release()
+		}
 		return t.abort(err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -522,7 +527,7 @@ func (t *tx) Commit(ctx context.Context) error {
 		t.finish()
 		return fmt.Errorf("storagefake: commit rolled back: %w", t.aborted)
 	}
-	if err := t.db.yield(ctx, "commit/"+string(t.kind)); err != nil {
+	if err := t.db.yield(ctx, t.cl, "commit/"+string(t.kind)); err != nil {
 		t.finish()
 		return err
 	}

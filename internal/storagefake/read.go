@@ -12,6 +12,7 @@ import (
 // state for its whole life.
 type readTx struct {
 	db     *DB
+	cl     *Client
 	s      *state
 	seam   bool // yield to the scheduler; false for the fake's own checks
 	closed bool
@@ -24,7 +25,7 @@ func (r *readTx) stmt(ctx context.Context, name string) error {
 		return ErrTxDone
 	}
 	if r.seam {
-		if err := r.db.yield(ctx, "read/"+name); err != nil {
+		if err := r.db.yield(ctx, r.cl, "read/"+name); err != nil {
 			return err
 		}
 	}

@@ -15,7 +15,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/objstore/protocol"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
-	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -26,6 +25,10 @@ import (
 // follower. The layer 3 oracle (S2.18) adds pods and faults on top.
 func TestDisagg_RuntimeSteadyState(t *testing.T) {
 	t.Parallel()
+	runDisaggHappyPath(t)
+}
+
+func runDisaggHappyPath(t *testing.T) {
 	const liveAfter = 24
 
 	w := newRestartWorld(t, Config{
@@ -57,51 +60,18 @@ func TestDisagg_RuntimeSteadyState(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, lease.Release(t.Context()))
 
-	const simURL = "http://sim.invalid"
 	simLn := newPipeListener()
-	simSrv := &http.Server{Handler: simhttp.NewHandlerWithOptions(w, simURL, simhttp.HandlerOptions{})}
+	simSrv := &http.Server{Handler: simhttp.NewHandlerWithOptions(w, disaggSimURL, simhttp.HandlerOptions{})}
 	go func() { _ = simSrv.Serve(simLn) }()
 	t.Cleanup(func() { _ = simSrv.Close() })
-	simClient := simLn.httpClient()
 
-	storage := jetstreamd.DefaultStorageConfig()
-	storage.Mode = jetstreamd.StorageDisaggregated
-	storage.Leader.AcquireInterval = 10 * time.Millisecond
-	storage.Hot.BatchMaxAge = 5 * time.Millisecond
-	storage.CatalogPollInterval = 10 * time.Millisecond
 	publicLn := newPipeListener()
 	sessions := make(chan uint64, 4)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
-		Storage:                        storage,
-		StorageBackend:                 fake.Backend,
-		MemoryLimit:                    8 << 30,
-		RelayURL:                       simURL,
-		PLCURL:                         simURL,
-		OTelServiceName:                "jetstream-oracle",
-		LogLevel:                       "warn",
-		LogFormat:                      "text",
-		LogOutput:                      testWriter{t: t},
-		ShutdownTimeout:                5 * time.Second,
-		ClientDrainTimeout:             time.Second,
-		PublicListener:                 publicLn,
-		LiveDial:                       subscribeReposDial(simClient),
-		HTTPTransport:                  simClient.Transport,
-		CursorLookback:                 36 * time.Hour,
-		PlanMaxDIDs:                    xrpcapi.DefaultPlanMaxDIDs,
-		PlanMaxCollections:             xrpcapi.DefaultPlanMaxCollections,
-		PlanMaxEntries:                 xrpcapi.DefaultPlanMaxEntries,
-		PlanWholeSegmentThreshold:      xrpcapi.DefaultPlanWholeSegmentThreshold,
-		SubscribeReadLogRetentionBytes: 16 << 20,
-		SubscribeBlockCacheBytes:       16 << 20,
-		SubscribeReadBatch:             1024,
-		SubscribeSlowWindow:            time.Second,
-		SubscribeSlowMinRate:           1,
-		CursorBlockIndexCacheSize:      32,
-		SteadyMaxEventsPerBlock:        seedTestBlock,
-		OnSessionStart:                 func(epoch uint64) { sessions <- epoch },
-	})
+	opts := disaggPodOptions(fake.Backend, publicLn, simLn.httpClient(), testWriter{t: t})
+	opts.OnSessionStart = func(epoch uint64) { sessions <- epoch }
+	rt, err := jetstreamd.Build(ctx, opts)
 	require.NoError(t, err)
 	done := make(chan error, 1)
 	go func() { done <- rt.Run(ctx) }()

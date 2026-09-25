@@ -564,9 +564,11 @@ func (r *Runtime) hotSession(ctx context.Context, epoch uint64, sess *catalog.Se
 		Objects:           d.objects,
 		Cache:             d.cache,
 		MaxEventsPerBlock: r.opts.SteadyMaxEventsPerBlock,
+		MaxSegmentBytes:   r.opts.SteadyMaxSegmentBytes,
 		ReadConcurrency:   st.S3.ReadConcurrency,
 		Logger:            r.processLogger,
 		Metrics:           d.maintMetrics,
+		Crash:             r.opts.CrashInjector,
 		OnFailure:         onFailure,
 	})
 	if err != nil {
@@ -599,6 +601,7 @@ func (r *Runtime) hotSession(ctx context.Context, epoch uint64, sess *catalog.Se
 		// The doorbell makes this pod's own readers see a commit without
 		// waiting for NOTIFY or the poll.
 		OnCommit:  func(uint64) { d.follower.Doorbell() },
+		Crash:     r.opts.CrashInjector,
 		OnFailure: onFailure,
 	})
 	if err != nil {

@@ -91,6 +91,32 @@ const (
 	// the parent dir. The replacement is durable; callers must still tolerate
 	// receiving an error at this checkpoint.
 	AfterSegmentRewriteDirSynced Point = Point(segment.CrashPointRewriteDirSynced)
+
+	// The disaggregated leader's seams (design §10). A crash at any of them
+	// may leave an uploaded object no catalog row references, or a committed
+	// row whose acks never ran; the next leader must neither lose nor repeat
+	// an event.
+
+	// AfterHotBatchCutBeforeUpload fires after a pointer batch is encoded
+	// but before its upload starts.
+	AfterHotBatchCutBeforeUpload Point = "after-hot-batch-cut-before-upload"
+
+	// AfterHotBatchUploadBeforeCommit fires after a pointer batch's object
+	// is uploaded but before the hot batch transaction.
+	AfterHotBatchUploadBeforeCommit Point = "after-hot-batch-upload-before-commit"
+
+	// AfterHotBatchCommitBeforeAck fires after a hot batch commits but
+	// before the writer releases its acks and advances the relay cursor it
+	// reports upstream.
+	AfterHotBatchCommitBeforeAck Point = "after-hot-batch-commit-before-ack"
+
+	// AfterFoldUploadBeforeCommit fires after a folded block is uploaded but
+	// before the fold transaction replaces its hot batches.
+	AfterFoldUploadBeforeCommit Point = "after-fold-upload-before-commit"
+
+	// AfterSealFooterUploadBeforeCommit fires after a seal's footer is
+	// uploaded but before the seal transaction.
+	AfterSealFooterUploadBeforeCommit Point = "after-seal-footer-upload-before-commit"
 )
 
 // AllPoints is the single source of truth for the set of declared
@@ -111,6 +137,11 @@ var AllPoints = []Point{
 	AfterSegmentRewriteTempSynced,
 	AfterSegmentRewriteRenamed,
 	AfterSegmentRewriteDirSynced,
+	AfterHotBatchCutBeforeUpload,
+	AfterHotBatchUploadBeforeCommit,
+	AfterHotBatchCommitBeforeAck,
+	AfterFoldUploadBeforeCommit,
+	AfterSealFooterUploadBeforeCommit,
 }
 
 var knownPoints = func() map[Point]struct{} {

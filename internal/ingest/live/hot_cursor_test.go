@@ -18,6 +18,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/maintainer"
+	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/objstore/memblob"
 	"github.com/bluesky-social/jetstream/internal/objstore/protocol"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
@@ -376,4 +377,103 @@ func testSplitCommitRelayCursor(t *testing.T, kind storagefake.FaultKind) {
 	}
 	require.Greater(t, len(got), len(rows1)+len(upstream[3]), "the split commit was redelivered")
 	require.NoError(t, db.Violation())
+}
+
+// TestConsumer_Hot_ChainStateCommitsWithLastRow pins the verifier state
+// half of design §10.4: the hot batch holding an upstream commit's last row
+// commits that commit's chain state too. The session ends at the next
+// batch, so the relay cursor still sits before the commit; its redelivery
+// must meet the new chain state and be dropped as a replay. Promoting after
+// Append returned would leave all three rows durable under the old chain
+// state, and the replay would archive the whole commit a second time.
+func TestConsumer_Hot_ChainStateCommitsWithLastRow(t *testing.T) {
+	t.Parallel()
+	did := atmos.DID("did:plc:chainwithrow")
+	key, err := crypto.GenerateP256()
+	require.NoError(t, err)
+	mstore := mst.NewMemBlockStore()
+	repo := &atmosrepo.Repo{DID: did, Clock: atmos.NewTIDClock(0), Store: mstore, Tree: mst.NewTree(mstore)}
+	emptyRoot, err := repo.Tree.WriteBlocks(repo.Store)
+	require.NoError(t, err)
+
+	commit, commitRows := buildMultiOpCommit(t, repo, key, emptyRoot, "app.bsky.feed.post", "a", "b", "c")
+	commit.Seq = 1
+	commitBody, err := commit.MarshalCBOR()
+	require.NoError(t, err)
+	id := &comatproto.SyncSubscribeRepos_Identity{DID: string(did), Handle: gt.Some("h.test"), Seq: 2, Time: "2026-09-25T00:00:00Z"}
+	idBody, err := id.MarshalCBOR()
+	require.NoError(t, err)
+	f := &cursorFirehose{
+		t:      t,
+		seqs:   []int64{1, 2},
+		frames: [][]byte{encodeFrame(t, "#commit", commitBody), encodeFrame(t, "#identity", idBody)},
+	}
+	srv := httptest.NewServer(f.handler())
+	t.Cleanup(srv.Close)
+
+	db := storagefake.New(storagefake.Config{})
+	// Batches: one per op of the commit, then the identity row's.
+	fault := &storagefake.Fault{Kind: storagefake.FaultCommitFails, TxKind: catalog.TxHotBatch, Ordinal: 4}
+	db.InjectFaults(fault)
+	lease := db.NewLease()
+	require.NoError(t, lease.Acquire(t.Context(), time.Hour))
+	s := catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: lease.Epoch()})
+	_, err = s.InitNamespace(t.Context(), catalog.Main, nil)
+	require.NoError(t, err)
+	up, err := protocol.NewUploader(protocol.UploaderConfig{Blob: memblob.New(), ArchiveID: db.Archive().ArchiveID, GCDelay: time.Hour, OrphanAge: time.Hour})
+	require.NoError(t, err)
+
+	ms := db.MetaStore(nil)
+	ss := syncstate.New(ms)
+	v, err := atmossync.NewVerifier(atmossync.VerifierOptions{
+		Directory:  &identity.Directory{Resolver: &stubResolver{docs: map[atmos.DID]*identity.DIDDocument{did: buildDIDDoc(did, key.PublicKey())}}},
+		StateStore: ss,
+		Policy:     gt.Some(atmossync.PolicyError),
+		SyncClient: gt.Some(atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{Host: "http://example.invalid"}})),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = v.Close() })
+
+	failed := make(chan error, 1)
+	c, err := Open(Config{
+		Store:             ms,
+		SeqKey:            catalog.MainSeqKey,
+		CursorKey:         catalog.RelayCursorKey,
+		RelayURL:          srv.URL,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:          v,
+		SyncStateStore:    ss,
+		MaxEventsPerBlock: 16,
+		Hot: &ingest.HotConfig{
+			Session:        s,
+			Uploader:       up,
+			BatchMaxEvents: 1,
+			BatchMaxAge:    time.Hour,
+			BlockMaxAge:    time.Hour,
+			OnFailure:      func(err error) { failed <- err },
+		},
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- c.Run(ctx) }()
+	select {
+	case err := <-failed:
+		require.ErrorIs(t, err, catalog.ErrSessionEnded)
+	case <-ctx.Done():
+		t.Fatal("the session never failed")
+	}
+	cancel()
+	<-errc
+	_ = c.Close()
+	require.True(t, fault.Fired())
+
+	snap, err := db.Snapshot()
+	require.NoError(t, err)
+	require.Len(t, snap.HotBatches, len(commitRows), "every row of the commit committed")
+	chain, err := syncstate.New(db.MetaStore(nil)).LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.NotNil(t, chain, "the commit's rows are durable without its chain state")
+	require.Equal(t, commit.Rev, chain.Rev)
 }

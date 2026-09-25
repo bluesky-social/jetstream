@@ -916,7 +916,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
 
 ### Testing
 
-- [ ] **S2.18 Layer 3 oracle: steady state with failover** (L). Deps: S2.16,
+- [x] **S2.18 Layer 3 oracle: steady state with failover** (L). Deps: S2.16,
   S2.17.
   - A new oracle configuration (`internal/oracle`, file prefix `disagg_`):
     storagefake + memblob, a seeded scheduler (D4), and a single synctest
@@ -1223,6 +1223,72 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.18 (2026-09-25): layer 3 oracle, steady state with failover.**
+  - `internal/oracle/disagg_oracle_test.go`:
+    - Real `jetstreamd` pods (readers plus leader-capable pods) share one
+      storagefake catalog and one memblob store in a synctest bubble.
+    - One bubble per process, so `TestDisagg_Oracle` re-execs the test
+      binary once per seed (`TestDisagg_OracleChild`).
+    - Each pod gets its own `storagefake.Client`. The scheduler labels
+      calls by pod, and `Client.Kill` cuts a killed pod off at once, as
+      SIGKILL does.
+  - Faults, one per wave, seeded, and each proven fired:
+    - kills at five new crashpoints: hot batch cut/upload/commit-before-ack,
+      fold upload, and seal footer upload;
+    - a commit applied but reported failed;
+    - lease loss (`DB.ExpireLease`);
+    - a fenced stale leader;
+    - S3 PUT error, PUT wrong bytes, GET wrong bytes;
+    - lost NOTIFY;
+    - a slow reader.
+  - Checks:
+    - catalog invariants after every commit;
+    - every reader's v2 and v1 stream against the model, with dense seqs
+      and per-DID order;
+    - exact agreement across readers;
+    - archive download by the real client from every live pod.
+  - Duplicates rule: design §10.4 lets a leader change re-archive a committed
+    prefix of the upstream commit in progress. `disaggCover` allows exactly
+    that, at most once per session change. Any other duplicate fails.
+  - Determinism (D4 fallback): per-pod arrival order depends on Go's
+    scheduler, so the interleaving is not replayable. `TestDisagg_Determinism`
+    compares the seeded plan and the faults fired, and logs the streams and
+    traces. Recorded in design §20 and `specs/oracle.md`.
+  - Tiers:
+    - `-short` runs one small seed in about 0.15s.
+    - The default runs seeds 1,2,3 in full mode.
+    - `just oracle-disagg SEEDS` and `just oracle-disagg-sweep COUNT RACE`
+      (random seeds).
+    - Under `-race` the disagg tests take about 11s, within the CI budget
+      (finding 12).
+  - Production bug found and fixed (local mode too): verifier sync state
+    crossed a durable batch boundary.
+    - It was staged at commit time instead of cut time, so rows were lost.
+    - It was promoted after `Append` returned, so events were duplicated.
+    - Fix: `durablePrepare` snapshots promoted state with the cursor, and
+      promotion runs in the writer's `OnAppend` for the event's last kept
+      row (`Consumer.promoteAt`).
+    - Diary: `specs/oracle/2026-09-25-disagg-syncstate-batch-boundary.md`.
+      Lesson in `specs/gotchas.md`.
+  - The fix exposed a harness assumption: frames above the durable cursor
+    can already be archived.
+    - Under parallel verification, a frame on another DID can commit with
+      its state before the session ends. Its redelivery is then dropped as
+      a replay.
+    - The in-process session-restart gates now inherit the previous
+      session's observed frames (`cutoverDeliveryGate.inherit`).
+  - Harness limitation: storagefake meta reads (`metaStore.Get`/`NewIter`) no
+    longer yield. The atmos verifier holds a per-DID mutex across its
+    StateStore loads, and a yield under a mutex wedges the synctest scheduler.
+    - Diary: `specs/oracle/2026-09-25-disagg-scheduler-wedged-by-verifier-mutex.md`.
+  - Verified:
+    - full seeds 1-20;
+    - 40 random seeds, plus a 1200-seed hang hunt;
+    - `TestOracle_SessionRestartInProcess` 40 of 40;
+    - `just test-long ./internal/oracle`;
+    - `just oracle-sweep`;
+    - `just`.
 
 - **S2.16 (2026-09-25): runtime wiring for disaggregated mode.**
   - `jetstreamd.Build` branches to `buildDisaggregated` (`disagg.go`) in

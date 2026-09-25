@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -640,7 +641,11 @@ func (i *oracleCrashInjector) SimulateCrash(ctx context.Context, point crashpoin
 //
 // A fresh child observes 1..tip. A recovering child starts after persisted
 // cursor C; earlier frames are already durable. Checking contiguity from the
-// lowest observed seq therefore works for both.
+// lowest observed seq therefore works for both. Frames above C can be durable
+// too: C is the parallel verifier's watermark, and a later frame on another
+// DID can commit with its verifier state before the session ends, so its
+// redelivery is dropped as a replay. A gate in the same process can inherit
+// such frames from the previous session's gates.
 type cutoverDeliveryGate struct {
 	relayURL string
 	timeout  time.Duration
@@ -665,6 +670,23 @@ func (g *cutoverDeliveryGate) observe(ev *segment.Event) {
 	g.mu.Lock()
 	g.seen[ev.UpstreamRelayCursor] = struct{}{}
 	g.mu.Unlock()
+}
+
+// inherit records every frame the prev gates observed. Each was observed
+// after its append returned, so it is durable or will be redelivered; a frame
+// that is neither is a lost event, and the final model check catches that.
+func (g *cutoverDeliveryGate) inherit(prev ...*cutoverDeliveryGate) {
+	for _, p := range prev {
+		if p == nil {
+			continue
+		}
+		p.mu.Lock()
+		seen := maps.Clone(p.seen)
+		p.mu.Unlock()
+		g.mu.Lock()
+		maps.Copy(g.seen, seen)
+		g.mu.Unlock()
+	}
 }
 
 // waitDelivered samples the relay firehose tip and blocks until every frame

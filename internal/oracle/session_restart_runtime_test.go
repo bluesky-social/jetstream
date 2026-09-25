@@ -193,8 +193,16 @@ func runSessionRestartCase(t *testing.T, tc sessionRestartCase, seedIdx int) {
 			}
 		},
 		OnSessionStart: func(uint64) {
-			cutoverGate.Store(newCutoverDeliveryGate(srv.URL, 30*time.Second))
-			steadyGate.Store(newCutoverDeliveryGate(srv.URL, 30*time.Second))
+			// The first session can leave a frame above its durable
+			// cursor archived for good; the second session never
+			// sees it again.
+			prevCutover, prevSteady := cutoverGate.Load(), steadyGate.Load()
+			cutover := newCutoverDeliveryGate(srv.URL, 30*time.Second)
+			cutover.inherit(prevCutover, prevSteady)
+			steady := newCutoverDeliveryGate(srv.URL, 30*time.Second)
+			steady.inherit(prevCutover, prevSteady)
+			cutoverGate.Store(cutover)
+			steadyGate.Store(steady)
 			if sessions.Add(1) == 2 {
 				close(restarted)
 			}

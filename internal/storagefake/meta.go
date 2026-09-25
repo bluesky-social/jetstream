@@ -19,11 +19,20 @@ func (db *DB) MetaStore(commit func(ctx context.Context, ops []metastore.Op) err
 
 type metaStore struct {
 	db     *DB
+	cl     *Client
 	commit func(ctx context.Context, ops []metastore.Op) error
 }
 
-func (m *metaStore) Get(ctx context.Context, key []byte) ([]byte, error) {
-	if err := m.db.yield(ctx, "meta/get"); err != nil {
+// Get and NewIter check the client but take no scheduler turn. A meta read
+// holds no catalog lock and sees one published state, so where it lands
+// among other calls does not matter to it. Callers do hold their own locks
+// across meta reads: the atmos verifier keeps a per-DID sync.Mutex through
+// its syncstate loads. synctest does not count a goroutine waiting on a
+// sync.Mutex as durably blocked, so a read parked in Seeded while another
+// goroutine waits for that mutex would stop Seeded's synctest.Wait from
+// ever returning.
+func (m *metaStore) Get(_ context.Context, key []byte) ([]byte, error) {
+	if err := m.cl.alive(); err != nil {
 		return nil, err
 	}
 	v, ok := m.db.current().meta.get(string(key))
@@ -59,8 +68,8 @@ func (m *metaStore) Delete(ctx context.Context, key []byte) error {
 
 // NewIter reads the range from one committed state, which is stronger than
 // the interface promises.
-func (m *metaStore) NewIter(ctx context.Context, lower, upper []byte) (metastore.Iterator, error) {
-	if err := m.db.yield(ctx, "meta/iter"); err != nil {
+func (m *metaStore) NewIter(_ context.Context, lower, upper []byte) (metastore.Iterator, error) {
+	if err := m.cl.alive(); err != nil {
 		return nil, err
 	}
 	s := m.db.current()

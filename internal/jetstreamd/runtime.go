@@ -107,6 +107,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.SessionRestartDelay < 0 {
 		return nil, fmt.Errorf("serve: SessionRestartDelay must be >= 0, got %s", opts.SessionRestartDelay)
 	}
+	if opts.SteadyMaxSegmentBytes < 0 {
+		return nil, fmt.Errorf("serve: SteadyMaxSegmentBytes must be >= 0, got %d", opts.SteadyMaxSegmentBytes)
+	}
 	if opts.SteadyMaxEventsPerBlock < 0 {
 		return nil, fmt.Errorf("serve: SteadyMaxEventsPerBlock must be >= 0, got %d", opts.SteadyMaxEventsPerBlock)
 	}

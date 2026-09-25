@@ -303,27 +303,47 @@ func (db *DB) Snapshot() (*catalog.Snapshot, error) {
 	return catalog.LoadSnapshot(context.Background(), &readTx{db: db, s: db.current()})
 }
 
-func (db *DB) yield(ctx context.Context, point string) error {
+// yield announces a storage call by cl (nil for the DB's own handle) to
+// the scheduler. A killed client's calls fail before and after the wait, so
+// nothing a dead process does reaches the catalog.
+func (db *DB) yield(ctx context.Context, cl *Client, point string) error {
+	if err := cl.alive(); err != nil {
+		return err
+	}
 	if db.cfg.Scheduler == nil {
 		return nil
 	}
-	return db.cfg.Scheduler.Yield(ctx, point)
+	if cl != nil {
+		ctx = WithActor(ctx, cl.label(Actor(ctx)))
+	}
+	if err := db.cfg.Scheduler.Yield(ctx, point); err != nil {
+		return err
+	}
+	return cl.alive()
 }
 
 // Begin implements catalog.DB.
 func (db *DB) Begin(ctx context.Context, kind catalog.TxKind) (catalog.Tx, error) {
-	if err := db.yield(ctx, "begin/"+string(kind)); err != nil {
+	return db.begin(ctx, nil, kind)
+}
+
+func (db *DB) begin(ctx context.Context, cl *Client, kind catalog.TxKind) (catalog.Tx, error) {
+	if err := db.yield(ctx, cl, "begin/"+string(kind)); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &tx{db: db, kind: kind, connLost: db.armConnLost(kind)}, nil
+	return &tx{db: db, cl: cl, kind: kind, connLost: db.armConnLost(kind)}, nil
 }
 
 // BeginRead implements catalog.DB.
 func (db *DB) BeginRead(ctx context.Context) (catalog.ReadTx, error) {
-	if err := db.yield(ctx, "begin_read"); err != nil {
+	return db.beginRead(ctx, nil)
+}
+
+func (db *DB) beginRead(ctx context.Context, cl *Client) (catalog.ReadTx, error) {
+	if err := db.yield(ctx, cl, "begin_read"); err != nil {
 		return nil, err
 	}
 	if d := db.slowRead(); d > 0 {
@@ -338,7 +358,7 @@ func (db *DB) BeginRead(ctx context.Context) (catalog.ReadTx, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &readTx{db: db, s: db.current(), seam: true}, nil
+	return &readTx{db: db, cl: cl, s: db.current(), seam: true}, nil
 }
 
 // Listen implements catalog.Listener. Notifications to a listener that is

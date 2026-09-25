@@ -760,6 +760,18 @@ no seq is reused, and the duplicates are exactly that committed prefix.
 `live/hot_cursor_test.go` pins this for both a failed and an unknown-result
 commit.
 
+The verifier state that drops replays must follow the same rule (S2.18). Its
+chain and hosting state, and the applied `#identity`/`#account` seqs, must
+become durable in exactly the batch that holds the event's last row. Earlier
+loses the row, because its replay is dropped. Later archives the whole event
+twice, because its replay is accepted. So `prepareValue` also carries a
+snapshot of the promoted sync state, taken when the batch freezes, and the
+hook stages that snapshot rather than whatever has been promoted by the time
+the batch commits. The consumer promotes an event's state in the writer's
+`OnAppend` hook for its last row, under the writer lock. The layer 3 oracle
+found both halves. With them fixed, the committed prefix is the only
+duplicate it sees (`specs/oracle/2026-09-25-disagg-syncstate-batch-boundary.md`).
+
 **Metadata batch size.** At 3,000 events/s, a batch carries up to about 256
 `repo/<did>` upserts. They are applied as one multi-row upsert (§12.3), not one
 statement per key.
@@ -1764,14 +1776,31 @@ object store. The fakes:
 
 - implement the fence, revisions, `seq/next` checks, reference checks, and
   object states exactly;
-- run in one process with a seeded scheduler, so runs replay exactly;
+- run in one process with a seeded scheduler. Only the fault schedule
+  replays exactly (the D4 fallback, S2.18). Pipe I/O and pod goroutines run
+  outside the scheduler, so where a batch cut lands relative to a crash can
+  differ between runs of one seed, and so can which commit prefixes are
+  re-archived. The fake's meta reads take no scheduler turn: the atmos
+  verifier holds a per-DID mutex across them, and synctest cannot see past a
+  mutex wait;
 - inject: leader kill at every crashpoint seam (before upload, after upload
   before commit, commit applied but reported failed, after commit before acks),
   lease loss, a stale leader writing after its successor, S3 PUT failure, S3
   returning wrong bytes, a lost `NOTIFY`, and a slow follower;
 - check the catalog invariants (§9.3) after every transaction;
 - run two or more reader pods whose delivered streams the oracle compares to the
-  model: no missing event, no seq reuse, per-DID order kept.
+  model: no missing event, no seq reuse, per-DID order kept. Readers must
+  agree exactly. The only duplicate allowed is §10.4's re-archived commit
+  prefix, at most one per leader change.
+
+The oracle's crash seams are five crashpoints in `internal/crashpoint`: after
+a hot batch is cut, after its upload, after its commit, after a fold's
+upload, and after a seal's footer upload. A pod's `CrashInjector` kills its
+`storagefake.Client` and blob handle at the seam, like SIGKILL, and a fresh
+pod replaces it. `storagefake.DB.ExpireLease` models lease loss without
+touching the holder's process. `Options.SteadyMaxSegmentBytes` shrinks
+segments so seals happen within a short run. What the tier does not prove,
+and why, is in `specs/oracle.md` ("Disaggregated Storage Tier").
 
 `internal/storagefake` (S2.7) differs from PostgreSQL in these deliberate ways.
 None of them weakens a check:

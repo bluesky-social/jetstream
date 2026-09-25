@@ -75,7 +75,8 @@ type Options struct {
 	BackfillAsyncFlushWorkers      int
 	BootstrapLiveMaxSegmentBytes   int64
 	BootstrapLiveMaxEventsPerBlock int
-	SteadyMaxEventsPerBlock        int // test-only; zero is the ingest default
+	SteadyMaxEventsPerBlock        int   // test-only; zero is the ingest default
+	SteadyMaxSegmentBytes          int64 // test-only, disaggregated mode; zero is the maintainer default
 	BackfillRepos                  []atmos.DID
 	SkipMergeDiscovery             bool
 	FailedRepoRetryInterval        time.Duration

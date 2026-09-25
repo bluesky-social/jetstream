@@ -328,6 +328,32 @@ oracle-sweep SEEDS="10" RACE="" FIXED_SEED="":
         echo "::endgroup::"
     done
 
+# Runs the disaggregated-storage oracle (layer 3, specs/oracle.md): leader
+# and reader pods over storagefake + memblob under the seeded scheduler, with
+# the full fault mix. SEEDS is a comma-separated list; each seed is its own
+# child process, and the parent runs them in parallel.
+oracle-disagg SEEDS="1,2,3":
+    JETSTREAM_ORACLE_DISAGG_SEEDS="{{SEEDS}}" gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 ./internal/oracle -run '^TestDisagg_(Oracle|Determinism)$'
+
+# Runs the disaggregated-storage oracle over COUNT fresh random seeds. The
+# seed fixes the fault plan and the traffic; the interleaving is not
+# replayable (the D4 fallback), so rerun a failing seed a few times. RACE
+# enables the race detector.
+oracle-disagg-sweep COUNT="20" RACE="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seeds=()
+    for _ in $(seq 1 "{{COUNT}}"); do
+        seeds+=("$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')")
+    done
+    list="$(IFS=,; echo "${seeds[*]}")"
+    echo "oracle-disagg-sweep: seeds ${list}"
+    race_flag=()
+    if [[ -n "{{RACE}}" ]]; then
+        race_flag=(-race)
+    fi
+    JETSTREAM_ORACLE_DISAGG_SEEDS="${list}" gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -timeout 30m "${race_flag[@]}" ./internal/oracle -run '^TestDisagg_Oracle$'
+
 # Runs the oracle mutation campaign: applies each curated mutant patch in
 # testing/mutation/mutants one at a time and verifies the oracle kills it.
 # Pass a mutant id to run one (e.g. `just mutation-campaign m019`), or

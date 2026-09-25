@@ -43,3 +43,15 @@ naming the failure mode (not the test).
   timer-sleeping goroutine as quiescent, so the counters were scraped before
   the lie was dropped. Fixed by polling the counters under fake time up to a
   deadline.
+- [2026-09-25 — verifier sync state crosses a durable batch boundary](2026-09-25-disagg-syncstate-batch-boundary.md):
+  the layer 3 oracle's first production bug. Chain state was staged when a
+  batch committed, not when it was cut, so a replay after a crash was
+  dropped and a row was lost. Promotion also ran after `Append`, outside the
+  writer mutex, so a whole event could be archived twice. Fixed with a
+  snapshot taken at cut time, and promotion in `OnAppend` on the event's last
+  row.
+- [2026-09-25 — seeded scheduler wedged by a mutex held across a meta read](2026-09-25-disagg-scheduler-wedged-by-verifier-mutex.md):
+  the atmos verifier holds a per-DID `sync.Mutex` across syncstate loads. A
+  load parked in `storagefake.Seeded` kept `synctest.Wait` from returning,
+  and the child hung. Fixed by making the fake's meta reads skip the
+  scheduler.

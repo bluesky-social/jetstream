@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/segment"
@@ -63,8 +64,17 @@ type Consumer struct {
 	// processBatch in isolation.
 	client atomic.Pointer[streaming.Client]
 
+	// promoteAt names the row whose append promotes its upstream event's
+	// verifier state; see promoteSyncState.
+	promoteAt atomic.Pointer[promoteMark]
+
 	closeMu sync.Mutex
 	closed  bool
+}
+
+type promoteMark struct {
+	row   *segment.Event
+	group []segment.Event
 }
 
 // Open initializes the consumer's writer and validates config.
@@ -112,6 +122,9 @@ func Open(cfg Config) (*Consumer, error) {
 					ss.RecordAccountSeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
 				case segment.KindIdentity:
 					ss.RecordIdentitySeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+				}
+				if m := c.promoteAt.Load(); m != nil && m.row == ev {
+					c.promoteSyncState(m.group)
 				}
 			}
 			return nil
@@ -181,6 +194,15 @@ func (c *Consumer) Close() error {
 // event is redelivered (or the next commit chain-breaks and triggers a
 // fresh resync), and a durable KindSync tombstone can never sit above
 // a partially-archived replacement set (compaction spec §2.2).
+//
+// It runs from the OnAppend hook of the group's last row, under the
+// writer mutex, so the promotion lands in exactly the durable batch that
+// holds that row: each batch snapshots promoted state when it is cut
+// (durablePrepare). Promoting after Append returned would let a cut fall
+// between the two, and a crash before the next batch commits would leave
+// the event's rows durable without its state; its redelivery (its seq can
+// be past a watermark held back by a slower parallel event) would then be
+// archived twice.
 func (c *Consumer) promoteSyncState(segEvts []segment.Event) {
 	if c.cfg.SyncStateStore == nil || len(segEvts) == 0 {
 		return
@@ -321,8 +343,26 @@ func (c *Consumer) cursorValue() int64 {
 	return c.lastUpstream.Load()
 }
 
+// durablePrepare is what one durable batch persists besides its rows,
+// sampled together under the writer mutex when the batch is cut. The
+// cursor comes first: every event at or below it was promoted before
+// returning, so the snapshot covers it, and every promotion in the
+// snapshot is for rows already in this batch or an earlier one.
+type durablePrepare struct {
+	cursor int64
+	sync   *syncstate.Snapshot
+}
+
 func (c *Consumer) cursorValueForDurableBatch() any {
-	return c.cursorValue()
+	return c.prepareDurable(c.cursorValue())
+}
+
+func (c *Consumer) prepareDurable(cur int64) durablePrepare {
+	p := durablePrepare{cursor: cur}
+	if c.cfg.SyncStateStore != nil {
+		p.sync = c.cfg.SyncStateStore.Snapshot()
+	}
+	return p
 }
 
 // LastUpstreamSeq returns the highest upstream seq whose ops have
@@ -336,14 +376,15 @@ func (c *Consumer) LastUpstreamSeq() int64 {
 }
 
 // onDurableBatch stages the block-specific relay cursor and verifier sync
-// state into the writer's seq/next durable batch. cur is sampled before the
-// block is detached/flushed, so async commits cannot persist a cursor that
-// covers events in a later, not-yet-durable prepared block.
+// state into the writer's seq/next durable batch. Both are sampled when the
+// block is cut, so async commits cannot persist a cursor or verifier state
+// that covers events in a later, not-yet-durable prepared block.
 func (c *Consumer) onDurableBatch(ctx context.Context, b metastore.Batch, _ uint64, _ bool, prepareValue any) (func(), func(error), error) {
-	cur, ok := prepareValue.(int64)
+	prep, ok := prepareValue.(durablePrepare)
 	if !ok {
-		return nil, nil, fmt.Errorf("livestream: durable batch cursor sample has type %T", prepareValue)
+		return nil, nil, fmt.Errorf("livestream: durable batch prepare sample has type %T", prepareValue)
 	}
+	cur := prep.cursor
 	if cur < 0 {
 		return nil, nil, fmt.Errorf("livestream: refuse to save negative cursor %d to %s", cur, c.cfg.CursorKey)
 	}
@@ -355,15 +396,15 @@ func (c *Consumer) onDurableBatch(ctx context.Context, b metastore.Batch, _ uint
 		// recorded by OnAppend for rows in the block just fsynced —
 		// can already exist. Persist it on its own so a crash here
 		// can't leave a durable identity row unguarded (#234).
-		if c.cfg.SyncStateStore != nil {
-			c.cfg.SyncStateStore.StageFlush(b)
+		if prep.sync != nil {
+			c.cfg.SyncStateStore.StageSnapshot(b, prep.sync)
 			return func() { c.cfg.SyncStateStore.CommitStaged() }, nil, nil
 		}
 		return nil, nil, nil
 	}
 	b.Set([]byte(c.cfg.CursorKey), metastore.EncodeVersionedUint64LE(cursorV1, uint64(cur)))
-	if c.cfg.SyncStateStore != nil {
-		c.cfg.SyncStateStore.StageFlush(b)
+	if prep.sync != nil {
+		c.cfg.SyncStateStore.StageSnapshot(b, prep.sync)
 	}
 	return func() {
 		if c.cfg.SyncStateStore != nil {
@@ -378,7 +419,7 @@ func (c *Consumer) saveCursorAndSyncState(cur int64) error {
 		return fmt.Errorf("livestream: refuse to save negative cursor %d to %s", cur, c.cfg.CursorKey)
 	}
 	b := c.cfg.Store.NewBatch()
-	afterCommit, _, err := c.onDurableBatch(context.Background(), b, 0, true, cur)
+	afterCommit, _, err := c.onDurableBatch(context.Background(), b, 0, true, c.prepareDurable(cur))
 	if err != nil {
 		return err
 	}
@@ -657,6 +698,13 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				continue
 			}
 
+			// The last row that will be appended carries the promotion.
+			lastKept := -1
+			for i := range segEvts {
+				if segment.ValidateEvent(segEvts[i]) == nil {
+					lastKept = i
+				}
+			}
 			for i := range segEvts {
 				if err := segment.ValidateEvent(segEvts[i]); err != nil {
 					if errors.Is(err, segment.ErrFieldTooLong) {
@@ -683,7 +731,14 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				}
 				// Append runs the tombstone Observe hook internally
 				// (ingest.Config.OnAppend) before any flush/seal.
-				if err := c.writer.Append(ctx, &segEvts[i]); err != nil {
+				if i == lastKept {
+					c.promoteAt.Store(&promoteMark{row: &segEvts[i], group: segEvts})
+				}
+				err := c.writer.Append(ctx, &segEvts[i])
+				if i == lastKept {
+					c.promoteAt.Store(nil)
+				}
+				if err != nil {
 					return fmt.Errorf("livestream: append: %w", err)
 				}
 				c.maybeTriggerCompaction()
@@ -695,7 +750,11 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				}
 			}
 
-			c.promoteSyncState(segEvts)
+			if lastKept < 0 {
+				// No row to carry it: nothing of this event can be
+				// durable, so the promotion's timing does not matter.
+				c.promoteSyncState(segEvts)
+			}
 
 			// Track the highest seq we've witnessed. Under
 			// Parallelism>1 the seqs in this batch are in

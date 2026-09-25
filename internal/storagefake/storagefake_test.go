@@ -395,3 +395,84 @@ func TestSeededDeterminism(t *testing.T) {
 	}
 	require.Greater(t, len(distinct), 1, "different seeds explore different interleavings")
 }
+
+// A killed client reaches the catalog no more: a transaction in flight
+// rolls back and frees the archive row lock, later calls fail, and its
+// LISTEN channel closes. The other clients carry on.
+func TestClientKill(t *testing.T) {
+	t.Parallel()
+	db := storagefake.New(storagefake.Config{})
+	ctx := t.Context()
+	pod := db.Client("pod-1")
+	lease := pod.NewLease()
+	require.NoError(t, lease.Acquire(ctx, time.Hour))
+	s := catalog.NewSession(catalog.SessionConfig{DB: pod, Epoch: lease.Epoch()})
+	require.NoError(t, setMeta(ctx, s, "k", "before"))
+	notes, err := pod.Listen(ctx)
+	require.NoError(t, err)
+
+	tx, err := pod.Begin(ctx, catalog.TxMetadata)
+	require.NoError(t, err)
+	_, ok, err := tx.FenceBump(ctx, lease.Epoch())
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("k"), Value: []byte("in flight")}}))
+
+	pod.Kill()
+	require.True(t, pod.Killed())
+	require.ErrorIs(t, tx.Commit(ctx), storagefake.ErrKilled)
+	v, _ := metaValue(t, db, "k")
+	require.Equal(t, "before", v)
+	_, open := <-notes
+	require.False(t, open, "a killed client's LISTEN channel closes")
+
+	_, err = pod.Begin(ctx, catalog.TxMetadata)
+	require.ErrorIs(t, err, storagefake.ErrKilled)
+	_, err = pod.BeginRead(ctx)
+	require.ErrorIs(t, err, storagefake.ErrKilled)
+	_, err = pod.Listen(ctx)
+	require.ErrorIs(t, err, storagefake.ErrKilled)
+	_, err = pod.MetaStore(nil).Get(ctx, []byte("k"))
+	require.ErrorIs(t, err, storagefake.ErrKilled)
+	require.ErrorIs(t, lease.Renew(ctx, time.Hour), storagefake.ErrKilled)
+
+	// The lock is free and the lease still stands until it expires.
+	other := db.Client("pod-2").NewLease()
+	require.ErrorIs(t, other.Acquire(ctx, time.Hour), streaming.ErrLockHeld)
+	require.NoError(t, db.ExpireLease(ctx))
+	require.NoError(t, other.Acquire(ctx, time.Hour))
+	require.Greater(t, other.Epoch(), lease.Epoch())
+}
+
+// ExpireLease ends a live holder's lease: its next renew reports the loss.
+func TestExpireLease(t *testing.T) {
+	t.Parallel()
+	db := storagefake.New(storagefake.Config{})
+	ctx := t.Context()
+	lease := db.NewLease()
+	require.NoError(t, lease.Acquire(ctx, time.Hour))
+	require.NoError(t, db.ExpireLease(ctx))
+	require.ErrorIs(t, lease.Renew(ctx, time.Hour), streaming.ErrNotHolder)
+}
+
+// A client's calls reach the scheduler under its actor label, prefixed to
+// any label the caller's context carries.
+func TestClientActorLabel(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		sched := storagefake.NewSeeded(1)
+		db := storagefake.New(storagefake.Config{Scheduler: sched})
+		ctx, cancel := context.WithCancel(t.Context())
+		schedDone := make(chan struct{})
+		go func() { defer close(schedDone); sched.Run(ctx) }()
+		pod := db.Client("pod-1")
+		r, err := pod.BeginRead(storagefake.WithActor(ctx, "follower"))
+		require.NoError(t, err)
+		_, err = r.Archive(ctx)
+		require.NoError(t, err)
+		require.NoError(t, r.Close(ctx))
+		cancel()
+		<-schedDone
+		require.Equal(t, []string{"pod-1/follower begin_read", "pod-1 read/archive"}, sched.Trace())
+	})
+}

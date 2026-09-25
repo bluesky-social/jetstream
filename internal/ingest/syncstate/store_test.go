@@ -206,6 +206,39 @@ func TestStateStore_CommitStagedKeepsLatePromotions(t *testing.T) {
 	require.Equal(t, "3lrev2", durable.Rev, "promotion landing between StageFlush and CommitStaged must survive")
 }
 
+// A pipelined durable batch persists the state promoted when it was cut,
+// not when it commits. A promotion in between belongs to rows in a later
+// batch; persisting it early lets a crash before that batch commits leave
+// verifier state newer than the archive, and the verifier then drops the
+// redelivered event as a rev replay (found by the layer 3 oracle).
+func TestStateStore_StageSnapshotExcludesLaterPromotions(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:hhhhhhhhhhhhhhhhhhhhhhhh")
+
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev1", Data: fixedCID(t)}))
+	s.PromoteChain(did, "3lrev1")
+	cut := s.Snapshot()
+
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev2", Data: fixedCID(t)}))
+	s.PromoteChain(did, "3lrev2")
+
+	b := raw.NewBatch()
+	s.StageSnapshot(b, cut)
+	require.NoError(t, b.Commit(t.Context()))
+	s.CommitStaged()
+	durable, err := New(raw).LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.NotNil(t, durable)
+	require.Equal(t, "3lrev1", durable.Rev, "the batch persists only what was promoted when it was cut")
+
+	require.NoError(t, flush(t, s))
+	durable, err = New(raw).LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3lrev2", durable.Rev, "the later promotion flushes with the next batch")
+}
+
 func TestStateStore_DistinctKeyspaces(t *testing.T) {
 	t.Parallel()
 	s := New(newTestStore(t))

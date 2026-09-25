@@ -235,6 +235,32 @@ The segment package pins every seam consult with an exhaustive
 the pre-existing #262 data-loss bug; its deterministic repro is the skipped
 `write-shortwrite-first-flush` case.
 
+### Disaggregated Storage Tier
+
+Layer 3 of the disaggregated-storage design (`specs/notes/2026-09-25-disaggregated-storage-v2-design.md` §20). It lives in `internal/oracle/disagg_oracle_test.go`. It runs several real `jetstreamd` runtimes in disaggregated mode, on in-process pipe listeners, against one `storagefake` catalog and one `memblob` store. Leader pods compete for the lease. Reader pods never acquire it and serve v1 and v2 websockets and archive downloads. Every storage and blob call passes through the seeded scheduler (`storagefake.Seeded`). Each pod has its own `storagefake.Client`, so a killed pod's connections die at once. The whole run lives in the process's one synctest bubble, so each seed runs as a re-executed child of `TestDisagg_Oracle`.
+
+The run starts from a seeded catalog (`SeedCatalog`), because Stage 2 has no backfill in this mode. Then it plays waves of simulator traffic. Each wave arms one fault from the seed's plan: a leader killed at one of five crash seams (after cut, after upload, after commit, after fold upload, after seal footer upload), commit applied but reported failed, lease expiry, a stale leader writing after its successor, an S3 PUT error, S3 PUT or GET returning wrong bytes, a lost NOTIFY, or a slow reader. A fault must be proven to have fired. A wave that has not fired its fault gets extra traffic, bounded, and then fails. A crashed leader is replaced by a fresh pod. The catalog invariants run after every transaction, and any recorded violation fails the run.
+
+Checks, after each wave converges and again at the end:
+
+- The first reader's v2 stream is checked against the model. Seqs are dense from 1. Each DID's events are exactly the model's, in order. The stream also passes `CheckInvariants`, and its reconstruction matches `GroundTruthFromWorld`.
+- Every other reader's v2 stream must equal it exactly, payloads included, because all readers serve one catalog. Every v1 stream must equal its v1 projection.
+- A fresh client downloads each live pod's whole archive, and it must match the stream.
+- Two leader sessions with the same or decreasing epoch fail the run.
+
+Two rules shape the model check:
+
+- **Per-DID order only.** Live ingest processes DIDs in parallel, so the archive promises order per DID and no global order (docs/README.md §2). The model's global order is the simulator's generation order, which a successor's replay does not reproduce.
+- **Commit-prefix re-archival.** Design §10.4 makes the relay cursor at least once. A hot batch can be cut between two rows of one upstream commit. If the leader dies after that batch commits, the commit's prefix is durable but the cursor and verifier state still sit before it, so the successor archives the whole commit again. `disaggCover` allows exactly this: a DID's stream may restart the upstream commit in progress from its first row, at most once per leader change. Anything else fails: a lost row, a reorder, or a whole event archived twice.
+
+Determinism follows the D4 fallback. The seed fixes the pod counts, the fault plan, the traffic, and the order in which faults fire, and `TestDisagg_Determinism` checks those. The interleaving is not replayable. Pipe I/O and pod goroutines run outside the scheduler, so where a batch cut falls relative to a crash, and so which commit prefixes get re-archived, varies between runs of one seed. The scheduler trace and the stream digest are logged, not compared. Reproduce a failure by rerunning its seed a few times (see `TestDisagg_OracleChild`).
+
+This tier does not prove real PostgreSQL or S3 semantics: isolation levels, `COMMIT`-result loss on a real connection, LISTEN/NOTIFY delivery, S3 consistency, or 403-versus-404 responses. `storagefake` models the catalog contract, and layer 4 (the `pgtest`/`s3test` contract suites under `just test-storage`) checks the real services against the same contract. Compaction is off in disaggregated mode until Stage 4 (D5), so the model is uncompacted.
+
+Recipes: `-short` runs one small seed (2 readers, 2 leaders, 2 faults). `just oracle-disagg` runs the full fault mix on seeds 1-3 plus the determinism test. `just oracle-disagg-sweep COUNT` runs fresh random seeds.
+
+The tier's first runs found a production bug, now fixed: verifier sync state did not become durable in the same batch as its rows. See `specs/oracle/2026-09-25-disagg-syncstate-batch-boundary.md`.
+
 ### Simulator Fidelity Tier
 
 This tier expands upstream behavior beyond polite happy paths: identity events, account statuses, unknown lexicons, Unicode, near-limit records, oversized fields, malformed bounded frames, missing CAR blocks, sequence gaps, duplicates, and reconnect/resume edge cases.

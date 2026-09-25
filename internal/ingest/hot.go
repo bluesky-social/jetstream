@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
@@ -175,6 +176,8 @@ type HotConfig struct {
 	// the acks it releases: the local follower's doorbell. It must not
 	// block.
 	OnCommit func(rev uint64)
+	// Crash is the test-only crash seam injector. Nil in production.
+	Crash crashpoint.Injector
 	// OnFailure is called once with the error that ended the writer. The
 	// session has already ended; the owner closes the writer and starts a
 	// new session. It may run in the committer goroutine, so it must not
@@ -721,6 +724,10 @@ func (h *hotWriter) prepare(b *hotBatch) {
 	if !b.pointer {
 		return
 	}
+	if err := h.crash(crashpoint.AfterHotBatchCutBeforeUpload); err != nil {
+		b.err = err
+		return
+	}
 	select {
 	case h.uploads <- struct{}{}:
 	case <-h.ctx.Done():
@@ -794,6 +801,11 @@ func (h *hotWriter) commitBatch(b *hotBatch) error {
 	if b.err != nil {
 		return b.err
 	}
+	if b.pointer {
+		if err := h.crash(crashpoint.AfterHotBatchUploadBeforeCommit); err != nil {
+			return err
+		}
+	}
 	return obs.Span(h.ctx, func(ctx context.Context) error {
 		trace.SpanFromContext(ctx).SetAttributes(
 			attribute.Int64("first_seq", int64(b.first)),
@@ -832,6 +844,9 @@ func (h *hotWriter) commitBatch(b *hotBatch) error {
 			return fmt.Errorf("ingest: commit hot batch [%d,%d]: %w", b.first, b.last(), err)
 		}
 		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("revision", int64(res.Revision)))
+		if err := h.crash(crashpoint.AfterHotBatchCommitBeforeAck); err != nil {
+			return err
+		}
 		b.objectID = res.ObjectID
 		h.committed(b)
 		h.readLog.advanceDurable(next)
@@ -895,6 +910,13 @@ func (h *hotWriter) deliver(blk *hotBlock) {
 		cb.Batches[i] = HotBatchInfo{FirstSeq: b.first, LastSeq: b.last(), Class: b.class, ObjectID: b.objectID}
 	}
 	h.hot.Sink.BlockClosed(cb)
+}
+
+func (h *hotWriter) crash(p crashpoint.Point) error {
+	if h.hot.Crash == nil {
+		return nil
+	}
+	return h.hot.Crash.SimulateCrash(h.ctx, p)
 }
 
 func (h *hotWriter) failure() error {

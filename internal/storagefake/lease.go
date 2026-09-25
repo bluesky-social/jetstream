@@ -15,6 +15,7 @@ import (
 // later fence by the old epoch fails.
 type Lease struct {
 	db     *DB
+	cl     *Client
 	holder [16]byte
 	epoch  uint64
 }
@@ -23,8 +24,10 @@ var _ leader.Locker = (*Lease)(nil)
 
 // NewLease returns a lease with a random holder ID, as each process picks
 // one at startup.
-func (db *DB) NewLease() *Lease {
-	l := &Lease{db: db}
+func (db *DB) NewLease() *Lease { return db.newLease(nil) }
+
+func (db *DB) newLease(cl *Client) *Lease {
+	l := &Lease{db: db, cl: cl}
 	_, _ = rand.Read(l.holder[:])
 	return l
 }
@@ -38,7 +41,7 @@ func (l *Lease) Epoch() uint64 { return l.epoch }
 // update runs one autocommit lease statement. apply mutates the archive row
 // and reports whether a row matched.
 func (l *Lease) update(ctx context.Context, name string, apply func(s *state, now time.Time) bool) (bool, error) {
-	if err := l.db.yield(ctx, "lease/"+name); err != nil {
+	if err := l.db.yield(ctx, l.cl, "lease/"+name); err != nil {
 		return false, err
 	}
 	if err := l.db.lockArchive(ctx); err != nil {
