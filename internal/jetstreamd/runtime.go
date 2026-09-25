@@ -431,16 +431,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.orchestrator = orch
 
-	// Status and repo verification read segments through the catalog, which
-	// only hears about seals made by this process; the first reader loads
-	// what was already on disk.
-	loadCatalog := sync.OnceValue(func() error { return segCatalog.Refresh(manifestCtx) })
-	catalogReady := func(context.Context) error { return loadCatalog() }
+	// Status and repo verification read segments through the catalog, so
+	// they wait for its background load like the cold reader does.
 	statusCollector, err := status.New(status.Options{
 		Store:                 metaKV,
 		DataDir:               opts.DataDir,
 		Archive:               segCatalog,
-		ArchiveReady:          catalogReady,
+		ArchiveReady:          catalogLoad.Wait,
 		Manifest:              mft,
 		CursorLookback:        opts.CursorLookback,
 		IdentityResolver:      resolver,
@@ -456,7 +453,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Catalog:  segCatalog,
 		Fetcher:  segCatalog.Fetcher(),
 		Selector: repoexport.FooterSelector{Source: segCatalog, Primary: newManifestSelector(mft)},
-		Ready:    catalogReady,
+		Ready:    catalogLoad.Wait,
 	}
 	statusHandler, err := web.New(web.Options{
 		Snapshotter:                statusCollector,
