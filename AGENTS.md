@@ -125,6 +125,8 @@ Use the package-level metrics/tracer rather than rolling your own. `obs.Tracer("
     - `go.opentelemetry.io/otel` and related
     - `github.com/puzpuzpuz/xsync`
     - anything under `golang.org/x`
+    - `github.com/jackc/pgx/v5` (only `internal/pgstore`, `internal/metastore/pg`, `internal/catalog/pg`, `internal/leader`; enforced by `TestStorageDriverImportBoundary`)
+    - `github.com/aws/aws-sdk-go-v2` core, `config`, `credentials`, `service/s3` (only `internal/objstore/s3`; same test)
 - **Follow existing conventions.** Don't introduce new patterns when the codebase already has one for code style, error handling, or logging.
 - **Comments explain why, not what.** Exported symbols and packages get a high-level docstring; otherwise comment only when the reasoning isn't obvious from the code.
 - **Never crash, and never corrupt data.** The process is a mission-critical, long-lived server daemon. Add observability in the case of incorrect/adversarial user input, but don't crash.

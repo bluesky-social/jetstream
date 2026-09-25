@@ -1,6 +1,6 @@
 # Disaggregated storage v2: implementation plan
 
-**Status: Stage 0 done (2026-09-25); Stage 1 done (2026-09-25).** This is the work tracker for
+**Status: Stage 0 done (2026-09-25); Stage 1 done (2026-09-25); Stage 2 in progress.** This is the work tracker for
 `specs/notes/2026-09-25-disaggregated-storage-v2-design.md` (the "design"). It
 breaks the design's delivery stages (§26) into PR-sized tasks with file
 references, dependencies, checks, mutants, and exit criteria. The design says
@@ -33,7 +33,7 @@ Prerequisite already landed: the ephemeral dev environment (`just up` /
 |---|---|---|
 | 0 | Remove timestamp import (design §21) | done |
 | 1 | Storage interfaces; local mode moved onto them with no behavior change | done |
-| 2 | Steady state in disaggregated mode on fakes and real storage | not started |
+| 2 | Steady state in disaggregated mode on fakes and real storage | in progress |
 | 3 | Bootstrap, merge, `storage init` | not started |
 | 4 | Sparse compaction and GC | not started |
 | 5 | `storage new-identity`, memory budgets, dashboards, 24h soak | not started |
@@ -629,7 +629,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
 
 ### Foundations
 
-- [ ] **S2.1 Dependencies and import boundary** (S).
+- [x] **S2.1 Dependencies and import boundary** (S).
   - Add `github.com/jackc/pgx/v5` and `github.com/aws/aws-sdk-go-v2` (core,
     `config`, `credentials`, `service/s3`). Update the AGENTS.md whitelist.
   - Add an import-boundary test: only the allowed packages import `pgx`/`aws`
@@ -1223,6 +1223,19 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.1 (2026-09-25): dependencies and import boundary.**
+  - pgx v5.11.0 and aws-sdk-go-v2 (`config` v1.33.6, `credentials` v1.20.6,
+    `service/s3` v1.113.4) are required, and AGENTS.md whitelists both.
+    `TestStorageDriverImportBoundary` (in `internal/pgstore`) walks every
+    package with `go/parser` and fails on a pgx or aws import outside the
+    ground rule 2 list.
+  - `JETSTREAM_TEST_` is a known foreign prefix, so the test harness
+    variables never trip the unknown-key check.
+  - `just vuln` exits clean: no reachable vulnerability. It reports
+    pre-existing unreachable advisories in `golang.org/x/crypto` v0.55.0
+    and `google.golang.org/grpc` v1.83.1, which the new modules did not
+    bring in.
 
 - **Stage 1 exit (2026-09-25).**
   - Checks at `537ab1c` plus the S1.15 docs: `just`, `just test-long

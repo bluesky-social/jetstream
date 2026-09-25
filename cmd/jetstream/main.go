@@ -80,6 +80,9 @@ var knownForeignJetstreamEnvPrefixes = []string{
 
 	// client api keys, which might just be set ambiently in dev environments perhaps
 	"JETSTREAM_API_KEY",
+
+	// test harnesses (just test-storage: PG URL, S3 endpoints)
+	"JETSTREAM_TEST_",
 }
 
 func main() {

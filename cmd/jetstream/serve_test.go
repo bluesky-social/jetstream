@@ -165,6 +165,7 @@ func TestUnknownJetstreamEnvVars_SortedAndDedupesKnownFlags(t *testing.T) {
 		"JETSTREAM_ADDR=127.0.0.1:0",
 		"JETSTREAM_APP_INSTANCE=jetstream-0",
 		"JETSTREAM_SIM_DATA_DIR=./data-sim",
+		"JETSTREAM_TEST_PG_URL=postgres://127.0.0.1:15432/jetstream",
 		"OTEL_SERVICE_NAME=jetstream-test",
 		"JETSTREAM_AAA=value=with=equals",
 	})
