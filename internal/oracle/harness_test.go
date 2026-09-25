@@ -865,7 +865,10 @@ func bisectServedCompactedFailure(
 	// in-flight rewrite that a completed-only bracket would miss (#106).
 	completedBefore := compaction.Count()
 	startedBefore := compaction.StartedCount()
-	disk, err := ObserveSegments(dataDir)
+	// The server is still running, so the scan uses the live observer: its
+	// catalog/path cross-check tolerates appends, seals, and a racing
+	// rewrite, which passesDuringScan accounts for below.
+	disk, err := observeSegmentsLive(dataDir)
 	require.NoErrorf(t, err, "bisect: observe on-disk segments mode=%s seed=%d watermark=%d", cfg.Mode, cfg.Seed, watermark)
 	disk = EventsSortedBySeq(disk)
 	passesDuringScan := max(compaction.Count()-completedBefore, compaction.StartedCount()-startedBefore)

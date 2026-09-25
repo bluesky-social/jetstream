@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/errors/oserror"
@@ -13,7 +14,9 @@ import (
 )
 
 // ObserveSegments reads every event from the primary segment directory under
-// dataDir in physical order.
+// dataDir in physical order. It reads through the storage-neutral catalog
+// (see observeNamespaceFS) and cross-checks the result against a direct walk
+// of the segment files.
 func ObserveSegments(dataDir string) ([]ObservedEvent, error) {
 	return ObserveSegmentsFS(nil, dataDir)
 }
@@ -21,7 +24,14 @@ func ObserveSegments(dataDir string) ([]ObservedEvent, error) {
 // ObserveSegmentsFS is ObserveSegments against fs. Nil uses the host OS
 // filesystem.
 func ObserveSegmentsFS(fs vfs.FS, dataDir string) ([]ObservedEvent, error) {
-	return observeSegmentDirFS(fs, oracleFS(fs).PathJoin(dataDir, "segments"), false)
+	return observeNamespaceFS(fs, dataDir, catalog.Main, observeOptions{})
+}
+
+// observeSegmentsLive is ObserveSegments for a caller whose server is still
+// running, so the writer may append, seal, and compact between the catalog
+// read and the path cross-check. See observeOptions.live.
+func observeSegmentsLive(dataDir string) ([]ObservedEvent, error) {
+	return observeNamespaceFS(nil, dataDir, catalog.Main, observeOptions{live: true, compactionMayRace: true})
 }
 
 // ObserveSealedSegments reads every event from the primary segment directory
@@ -29,7 +39,7 @@ func ObserveSegmentsFS(fs vfs.FS, dataDir string) ([]ObservedEvent, error) {
 // for snapshots taken while ingestion is live (e.g. a mid-run compaction hook):
 // reading the active segment would race concurrent appends, and the active
 // segment only holds rows above the latest sealed watermark, which such callers
-// filter out anyway.
+// filter out anyway. The caller must not run concurrently with compaction.
 func ObserveSealedSegments(dataDir string) ([]ObservedEvent, error) {
 	return ObserveSealedSegmentsFS(nil, dataDir)
 }
@@ -37,7 +47,7 @@ func ObserveSealedSegments(dataDir string) ([]ObservedEvent, error) {
 // ObserveSealedSegmentsFS is ObserveSealedSegments against fs. Nil uses the
 // host OS filesystem.
 func ObserveSealedSegmentsFS(fs vfs.FS, dataDir string) ([]ObservedEvent, error) {
-	return observeSegmentDirFS(fs, oracleFS(fs).PathJoin(dataDir, "segments"), true)
+	return observeNamespaceFS(fs, dataDir, catalog.Main, observeOptions{sealedOnly: true, live: true})
 }
 
 // ObserveBootstrapSegments reads the primary segments followed by the bootstrap
@@ -50,8 +60,7 @@ func ObserveBootstrapSegments(dataDir string) ([]ObservedEvent, error) {
 // ObserveBootstrapSegmentsFS is ObserveBootstrapSegments against fs. Nil uses
 // the host OS filesystem.
 func ObserveBootstrapSegmentsFS(fs vfs.FS, dataDir string) ([]ObservedEvent, error) {
-	sfs := oracleFS(fs)
-	primary, err := observeSegmentDirFS(fs, sfs.PathJoin(dataDir, "segments"), false)
+	primary, err := observeNamespaceFS(fs, dataDir, catalog.Main, observeOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -59,14 +68,10 @@ func ObserveBootstrapSegmentsFS(fs vfs.FS, dataDir string) ([]ObservedEvent, err
 		return nil, fmt.Errorf("primary segments: %w", err)
 	}
 
-	live, err := observeSegmentDirFS(fs, sfs.PathJoin(dataDir, "backfill", "live_segments"), false)
+	live, err := observeNamespaceFS(fs, dataDir, catalog.BootstrapLive, observeOptions{allowMissing: true})
 	if err != nil {
-		if isOracleNotExist(err) {
-			return EventsSortedBySeq(primary), nil
-		}
 		return nil, err
 	}
-
 	if err := CheckInvariants(live); err != nil {
 		return nil, fmt.Errorf("bootstrap live segments: %w", err)
 	}
@@ -76,17 +81,29 @@ func ObserveBootstrapSegmentsFS(fs vfs.FS, dataDir string) ([]ObservedEvent, err
 	return out, nil
 }
 
-func observeSegmentDirFS(fs vfs.FS, dir string, sealedOnly bool) ([]ObservedEvent, error) {
+// namespaceDir is where local mode keeps ns under dataDir.
+func namespaceDir(fs vfs.FS, dataDir string, ns catalog.Namespace) string {
+	sfs := oracleFS(fs)
+	if ns == catalog.BootstrapLive {
+		return sfs.PathJoin(dataDir, "backfill", "live_segments")
+	}
+	return sfs.PathJoin(dataDir, "segments")
+}
+
+// observeSegmentDirFS is the path observer: it walks every segment file in
+// dir, verifying each sealed segment's structure and footer metadata, and
+// walking unsealed files frame by frame.
+func observeSegmentDirFS(fs vfs.FS, dir string, sealedOnly bool) ([]observedSegment, error) {
 	files, err := ingest.SegmentFilesFS(fs, dir)
 	if err != nil {
 		return nil, err
 	}
 
-	var out []ObservedEvent
+	out := make([]observedSegment, 0, len(files))
 	for _, file := range files {
 		events, err := observeSealedSegmentFS(fs, file.Path)
 		if err == nil {
-			out = append(out, events...)
+			out = append(out, observedSegment{Index: file.Idx, Sealed: true, Events: events})
 			continue
 		}
 		if !errors.Is(err, segment.ErrActiveSegment) {
@@ -100,7 +117,7 @@ func observeSegmentDirFS(fs vfs.FS, dir string, sealedOnly bool) ([]ObservedEven
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, events...)
+		out = append(out, observedSegment{Index: file.Idx, Events: events})
 	}
 
 	return out, nil

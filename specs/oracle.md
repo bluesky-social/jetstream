@@ -98,7 +98,7 @@ The driver uses phase gates, durable append callbacks, sequence acknowledgers, a
 
 Observers collect what Jetstream produced through different surfaces:
 
-- filesystem segment observer: reads active and sealed segment files directly;
+- storage segment observer (`internal/oracle/segments.go`, `catalog_observer.go`): reads each namespace through the storage-neutral read path — a fresh `catalog/local` catalog, `CatalogView.RefsFrom`, and its `Fetcher` — and cross-checks the result against a direct path walk of the segment files, which also runs the sealed structure and footer-metadata checks. In local mode the two must agree segment by segment; a disagreement fails the observation rather than picking one side. Observations taken while the server runs (the over-drop recorder's sealed-only scans, the compaction bisection) use a live cross-check that allows only what a running writer explains: newer segments, a grown or newly sealed tail, and, where a compaction pass may race the scan, rows removed from a sealed segment;
 - event-log recorder: captures lifecycle hook events keyed by upstream relay cursor;
 - `/subscribe` replay observer: reads public websocket replay and live-tail behavior;
 - XRPC segment observer: downloads public archive segments and decodes bytes as a client would;
@@ -285,6 +285,12 @@ segment fault injection, proof that injected faults fired, and mutation-backed
 detection of applicable failure modes. Shared-code refactors must not weaken
 those assertions, skip local tiers, or make local tests require PostgreSQL,
 S3, or cloud credentials.
+
+`durable_order_test.go` stays local-only by design: it checks fsync and
+rename ordering against `vfs.WithLogging` operations and metastore commit
+boundaries, which are local committer rules. Its backend-neutral form (a block
+is durable before the metadata batch describing it is visible) needs its own
+observation of remote commits and cannot be proven with a local filesystem.
 
 Disaggregated coverage is additional. Reuse simulator scenarios, independent
 models, checkers, and public observers where practical, and follow the same
