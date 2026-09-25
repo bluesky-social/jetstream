@@ -11,10 +11,12 @@
 package catalog
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"iter"
+	"slices"
 	"sort"
 
 	"github.com/bluesky-social/jetstream/segment"
@@ -113,10 +115,16 @@ type BlockRef struct {
 	MinSeq, MaxSeq                 uint64
 	MinWitnessedUS, MaxWitnessedUS int64
 
-	// Segment and Block are the block's position in its namespace. They stay
+	// Namespace, Segment, and Block are the block's position. They stay
 	// stable across compaction, which preserves block topology.
-	Segment uint64
-	Block   int
+	Namespace Namespace
+	Segment   uint64
+	Block     int
+
+	// Generation is the segment generation the ref was built from (see
+	// SegmentView.Generation). Together with the position it names the
+	// block's bytes exactly, which is what a decoded-block cache keys on.
+	Generation uint64
 
 	// Loc says where the block's zstd frame lives. Fetchers type-switch on
 	// it; a Fetcher that does not understand a Locator returns an error.
@@ -129,13 +137,13 @@ type Locator interface {
 	locator()
 }
 
-// FileBlock is a block inside a local segment file. It is a (path, block
-// index) handle pinned to a generation: the fetcher checks the file's header
-// checksum against Generation before trusting Offset and Length, because a
-// compaction rewrite moves blocks within the file.
+// FileBlock is a block inside a local segment file. With the ref's
+// position it is a (path, block index) handle pinned to the ref's
+// Generation: the fetcher checks the file's header checksum against it
+// before trusting Offset and Length, because a compaction rewrite moves
+// blocks within the file.
 type FileBlock struct {
-	Path       string
-	Generation uint64
+	Path string
 	// Offset is the file offset of the block's 8-byte length prefix.
 	Offset uint64
 	// Length is the zstd frame length, excluding the prefix.
@@ -215,84 +223,225 @@ type ActiveSource interface {
 // order, so no ref ordering could be exact.
 var ErrOverlap = errors.New("catalog: segment seq envelopes overlap")
 
-// View is the plain CatalogView implementation shared by catalog backends:
-// per-namespace segment lists plus a locator function.
-type View struct {
-	rev    uint64
-	segs   map[Namespace][]SegmentView
-	locate func(SegmentView, int) Locator
-	// nonEmpty holds, per namespace, the positions in segs of segments with
-	// at least one block. Their envelopes are strictly increasing, which is
-	// what RefsFrom's binary search needs; an empty segment has no envelope.
-	nonEmpty map[Namespace][]int
+// SegmentList is one namespace's segments in index order, validated to have
+// increasing, non-overlapping block seq envelopes. It is immutable: Put and
+// Delete return a new list and leave the receiver, and any view built from
+// it, untouched. Backends keep their sealed segments in a SegmentList so a
+// snapshot shares it instead of re-validating the whole archive.
+type SegmentList struct {
+	segs []SegmentView
+	// nonEmpty holds the positions in segs of segments with at least one
+	// block. Their envelopes are strictly increasing, which is what
+	// RefsFrom's binary search needs; an empty segment has no envelope.
+	nonEmpty []int
 }
 
-// NewView builds a view from per-namespace segments, which must be in index
-// order with increasing, non-overlapping block seq envelopes. locate builds
-// the Locator for block i of a segment.
-func NewView(rev uint64, segs map[Namespace][]SegmentView, locate func(SegmentView, int) Locator) (*View, error) {
-	nonEmpty := make(map[Namespace][]int, len(segs))
-	for ns, list := range segs {
-		var prevMax uint64
-		var havePrev bool
-		for i := range list {
-			if i > 0 && list[i].Index <= list[i-1].Index {
-				return nil, fmt.Errorf("%w: %s segment %d follows %d", ErrOverlap, ns, list[i].Index, list[i-1].Index)
-			}
-			for _, b := range list[i].Blocks {
-				if b.MaxSeq < b.MinSeq || (havePrev && b.MinSeq <= prevMax) {
-					return nil, fmt.Errorf("%w: %s segment %d block [%d,%d] after seq %d",
-						ErrOverlap, ns, list[i].Index, b.MinSeq, b.MaxSeq, prevMax)
-				}
-				prevMax, havePrev = b.MaxSeq, true
-			}
-			if len(list[i].Blocks) > 0 {
-				nonEmpty[ns] = append(nonEmpty[ns], i)
-			}
+// NewSegmentList validates segs and returns them as a list. It takes
+// ownership of segs.
+func NewSegmentList(segs []SegmentView) (SegmentList, error) {
+	for i := range segs {
+		if err := checkBlocks(segs[i]); err != nil {
+			return SegmentList{}, err
 		}
 	}
-	return &View{rev: rev, segs: segs, locate: locate, nonEmpty: nonEmpty}, nil
+	return buildList(segs)
+}
+
+// checkBlocks checks that v's own block envelopes are increasing.
+func checkBlocks(v SegmentView) error {
+	for i, b := range v.Blocks {
+		if b.MaxSeq < b.MinSeq || (i > 0 && b.MinSeq <= v.Blocks[i-1].MaxSeq) {
+			return fmt.Errorf("%w: %s segment %d block %d [%d,%d]", ErrOverlap, v.Namespace, v.Index, i, b.MinSeq, b.MaxSeq)
+		}
+	}
+	return nil
+}
+
+// buildList checks index order and segment envelopes, given segments whose
+// blocks already passed checkBlocks.
+func buildList(segs []SegmentView) (SegmentList, error) {
+	var nonEmpty []int
+	for i := range segs {
+		if i > 0 && segs[i].Index <= segs[i-1].Index {
+			return SegmentList{}, fmt.Errorf("%w: %s segment %d follows %d", ErrOverlap, segs[i].Namespace, segs[i].Index, segs[i-1].Index)
+		}
+		if len(segs[i].Blocks) == 0 {
+			continue
+		}
+		if n := len(nonEmpty); n > 0 {
+			if prev := segs[nonEmpty[n-1]]; segs[i].MinSeq() <= prev.MaxSeq() {
+				return SegmentList{}, fmt.Errorf("%w: %s segment %d starts at seq %d, segment %d ends at %d",
+					ErrOverlap, segs[i].Namespace, segs[i].Index, segs[i].MinSeq(), prev.Index, prev.MaxSeq())
+			}
+		}
+		nonEmpty = append(nonEmpty, i)
+	}
+	return SegmentList{segs: segs, nonEmpty: nonEmpty}, nil
+}
+
+// Segments returns the list's segments. The slice is shared and must not be
+// modified.
+func (l SegmentList) Segments() []SegmentView { return l.segs }
+
+// Len returns the number of segments.
+func (l SegmentList) Len() int { return len(l.segs) }
+
+// Last returns the segment with the highest index.
+func (l SegmentList) Last() (SegmentView, bool) {
+	if len(l.segs) == 0 {
+		return SegmentView{}, false
+	}
+	return l.segs[len(l.segs)-1], true
+}
+
+func (l SegmentList) find(idx uint64) (int, bool) {
+	return sort.Find(len(l.segs), func(i int) int { return cmp.Compare(idx, l.segs[i].Index) })
+}
+
+// Get returns segment idx.
+func (l SegmentList) Get(idx uint64) (SegmentView, bool) {
+	if i, ok := l.find(idx); ok {
+		return l.segs[i], true
+	}
+	return SegmentView{}, false
+}
+
+// Put returns a list with v inserted, or replacing the segment with v's
+// index. It checks v's blocks and the envelopes around it, not the whole
+// list again.
+func (l SegmentList) Put(v SegmentView) (SegmentList, error) {
+	if err := checkBlocks(v); err != nil {
+		return SegmentList{}, err
+	}
+	i, found := l.find(v.Index)
+	segs := make([]SegmentView, 0, len(l.segs)+1)
+	segs = append(segs, l.segs[:i]...)
+	segs = append(segs, v)
+	if found {
+		i++
+	}
+	segs = append(segs, l.segs[i:]...)
+	return buildList(segs)
+}
+
+// Delete returns a list without segment idx.
+func (l SegmentList) Delete(idx uint64) SegmentList {
+	i, found := l.find(idx)
+	if !found {
+		return l
+	}
+	out, err := buildList(slices.Delete(slices.Clone(l.segs), i, i+1))
+	if err != nil {
+		// Removing a segment cannot create an overlap.
+		panic(fmt.Sprintf("catalog: %v", err))
+	}
+	return out
+}
+
+// View is the plain CatalogView implementation shared by catalog backends:
+// per namespace, a sealed SegmentList and optionally the active segment
+// after it, plus a locator function.
+type View struct {
+	rev    uint64
+	ns     map[Namespace]nsView
+	locate func(SegmentView, int) Locator
+}
+
+type nsView struct {
+	sealed  SegmentList
+	tail    SegmentView
+	hasTail bool
+}
+
+// NewView builds a view from per-namespace segment lists and optional tail
+// segments (each namespace's active segment). A tail must have a higher
+// index than its list's last segment and blocks above the list's last
+// block. Building a view validates only the tails, so its cost does not grow
+// with the archive. locate builds the Locator for block i of a segment.
+func NewView(rev uint64, lists map[Namespace]SegmentList, tails map[Namespace]SegmentView, locate func(SegmentView, int) Locator) (*View, error) {
+	out := make(map[Namespace]nsView, len(lists)+len(tails))
+	for ns, l := range lists {
+		out[ns] = nsView{sealed: l}
+	}
+	for ns, tail := range tails {
+		if err := checkBlocks(tail); err != nil {
+			return nil, err
+		}
+		nv := out[ns]
+		if last, ok := nv.sealed.Last(); ok && tail.Index <= last.Index {
+			return nil, fmt.Errorf("%w: %s tail segment %d follows %d", ErrOverlap, ns, tail.Index, last.Index)
+		}
+		if n := len(nv.sealed.nonEmpty); n > 0 && len(tail.Blocks) > 0 {
+			if prev := nv.sealed.segs[nv.sealed.nonEmpty[n-1]]; tail.MinSeq() <= prev.MaxSeq() {
+				return nil, fmt.Errorf("%w: %s tail segment %d starts at seq %d, segment %d ends at %d",
+					ErrOverlap, ns, tail.Index, tail.MinSeq(), prev.Index, prev.MaxSeq())
+			}
+		}
+		nv.tail, nv.hasTail = tail, true
+		out[ns] = nv
+	}
+	return &View{rev: rev, ns: out, locate: locate}, nil
 }
 
 func (v *View) Revision() uint64 { return v.rev }
 
 func (v *View) Segments(ns Namespace) []SegmentView {
-	list := v.segs[ns]
-	out := make([]SegmentView, len(list))
-	copy(out, list)
+	nv := v.ns[ns]
+	out := make([]SegmentView, 0, nv.sealed.Len()+1)
+	out = append(out, nv.sealed.segs...)
+	if nv.hasTail {
+		out = append(out, nv.tail)
+	}
 	return out
 }
 
 func (v *View) RefsFrom(ns Namespace, seq uint64) iter.Seq[BlockRef] {
 	return func(yield func(BlockRef) bool) {
-		list, idx := v.segs[ns], v.nonEmpty[ns]
+		nv := v.ns[ns]
+		list, idx := nv.sealed.segs, nv.sealed.nonEmpty
 		start := sort.Search(len(idx), func(i int) bool { return list[idx[i]].MaxSeq() >= seq })
 		for _, pos := range idx[start:] {
-			s := list[pos]
-			first := sort.Search(len(s.Blocks), func(i int) bool { return s.Blocks[i].MaxSeq >= seq })
-			for i := first; i < len(s.Blocks); i++ {
-				b := s.Blocks[i]
-				ref := BlockRef{
-					MinSeq:         b.MinSeq,
-					MaxSeq:         b.MaxSeq,
-					MinWitnessedUS: b.MinWitnessedAt,
-					MaxWitnessedUS: b.MaxWitnessedAt,
-					Segment:        s.Index,
-					Block:          i,
-					Loc:            v.locate(s, i),
-				}
-				if !yield(ref) {
-					return
-				}
+			if !v.yieldFrom(list[pos], seq, yield) {
+				return
 			}
+		}
+		if nv.hasTail {
+			v.yieldFrom(nv.tail, seq, yield)
 		}
 	}
 }
 
-func (v *View) TipSeq(ns Namespace) uint64 {
-	idx := v.nonEmpty[ns]
-	if len(idx) == 0 {
-		return 0
+// yieldFrom yields s's refs from the first block reaching seq, and reports
+// whether the consumer wants more.
+func (v *View) yieldFrom(s SegmentView, seq uint64, yield func(BlockRef) bool) bool {
+	first := sort.Search(len(s.Blocks), func(i int) bool { return s.Blocks[i].MaxSeq >= seq })
+	for i := first; i < len(s.Blocks); i++ {
+		b := s.Blocks[i]
+		ref := BlockRef{
+			MinSeq:         b.MinSeq,
+			MaxSeq:         b.MaxSeq,
+			MinWitnessedUS: b.MinWitnessedAt,
+			MaxWitnessedUS: b.MaxWitnessedAt,
+			Namespace:      s.Namespace,
+			Segment:        s.Index,
+			Generation:     s.Generation,
+			Block:          i,
+			Loc:            v.locate(s, i),
+		}
+		if !yield(ref) {
+			return false
+		}
 	}
-	return v.segs[ns][idx[len(idx)-1]].MaxSeq() + 1
+	return true
+}
+
+func (v *View) TipSeq(ns Namespace) uint64 {
+	nv := v.ns[ns]
+	if nv.hasTail && len(nv.tail.Blocks) > 0 {
+		return nv.tail.MaxSeq() + 1
+	}
+	if n := len(nv.sealed.nonEmpty); n > 0 {
+		return nv.sealed.segs[nv.sealed.nonEmpty[n-1]].MaxSeq() + 1
+	}
+	return 0
 }

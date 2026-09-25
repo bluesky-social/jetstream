@@ -210,8 +210,8 @@ func TestLocal_SwarmMatchesWriter(t *testing.T) {
 }
 
 // TestLocal_CompactionMakesRefsStale checks the generation pin: a ref taken
-// before a rewrite fails with ErrStaleRef, and after Reload the new view's
-// refs read the rewritten blocks.
+// before a rewrite fails with ErrStaleRef, and the next view's refs read the
+// rewritten blocks.
 func TestLocal_CompactionMakesRefsStale(t *testing.T) {
 	t.Parallel()
 
@@ -242,12 +242,16 @@ func TestLocal_CompactionMakesRefsStale(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.Rewritten)
 
+	// The stale fetch reloads the segment, so a reader's retry sees the new
+	// generation before the compactor gets around to Reload.
 	_, err = s.cat.Fetcher().Fetch(t.Context(), stale)
 	require.ErrorIs(t, err, catalog.ErrStaleRef)
-
-	require.NoError(t, s.cat.Reload(catalog.Main, target.Index))
 	after := s.cat.Snapshot()
 	require.Greater(t, after.Revision(), before.Revision())
+
+	// The compactor's own Reload of the same generation changes nothing.
+	require.NoError(t, s.cat.Reload(catalog.Main, target.Index))
+	require.Equal(t, after.Revision(), s.cat.Snapshot().Revision())
 	got := refsEvents(t, after, s.cat.Fetcher(), 0)
 	require.Equal(t, eventSeqs(s.durable[1:]), eventSeqs(got))
 

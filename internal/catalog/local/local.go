@@ -10,7 +10,6 @@
 package local
 
 import (
-	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -51,8 +50,8 @@ type Catalog struct {
 
 	mu  sync.Mutex
 	rev uint64
-	// sealed holds each namespace's sealed segments in index order.
-	sealed map[catalog.Namespace][]catalog.SegmentView
+	// sealed holds each namespace's sealed segments.
+	sealed map[catalog.Namespace]catalog.SegmentList
 	// active is each namespace's attached writer.
 	active map[catalog.Namespace]catalog.ActiveSource
 	// scannedActive is each namespace's unsealed tail as Refresh read it
@@ -82,7 +81,7 @@ func New(cfg Config) (*Catalog, error) {
 	return &Catalog{
 		fs:            fs,
 		dirs:          maps(cfg.Dirs),
-		sealed:        map[catalog.Namespace][]catalog.SegmentView{},
+		sealed:        map[catalog.Namespace]catalog.SegmentList{},
 		active:        map[catalog.Namespace]catalog.ActiveSource{},
 		scannedActive: map[catalog.Namespace]catalog.SegmentView{},
 		hooks:         map[catalog.Namespace][]SealedHook{},
@@ -130,9 +129,12 @@ func (c *Catalog) Sealed(v catalog.SegmentView) error {
 		return fmt.Errorf("catalog/local: sealed segment %d in namespace %q with no directory", v.Index, v.Namespace)
 	}
 	c.mu.Lock()
-	c.putSealedLocked(v)
+	err := c.putSealedLocked(v)
 	hooks := slices.Clone(c.hooks[v.Namespace])
 	c.mu.Unlock()
+	if err != nil {
+		return err
+	}
 
 	path := c.Path(v.Namespace, v.Index)
 	for _, fn := range hooks {
@@ -144,23 +146,24 @@ func (c *Catalog) Sealed(v catalog.SegmentView) error {
 }
 
 // putSealedLocked inserts or replaces v in its namespace's sealed list and
-// bumps the revision.
-func (c *Catalog) putSealedLocked(v catalog.SegmentView) {
+// bumps the revision. Putting a generation the list already holds is a
+// no-op, so a Reload racing the writer's own publish does not churn the
+// revision.
+func (c *Catalog) putSealedLocked(v catalog.SegmentView) error {
 	list := c.sealed[v.Namespace]
-	i, found := slices.BinarySearchFunc(list, v.Index, func(s catalog.SegmentView, idx uint64) int {
-		return cmp.Compare(s.Index, idx)
-	})
-	if found {
-		list = slices.Clone(list)
-		list[i] = v
-	} else {
-		list = slices.Insert(slices.Clip(list), i, v)
+	if cur, ok := list.Get(v.Index); ok && cur.State == catalog.Sealed && cur.Generation == v.Generation {
+		return nil
 	}
-	c.sealed[v.Namespace] = list
+	next, err := list.Put(v)
+	if err != nil {
+		return fmt.Errorf("catalog/local: publish segment %d: %w", v.Index, err)
+	}
+	c.sealed[v.Namespace] = next
 	if sa, ok := c.scannedActive[v.Namespace]; ok && sa.Index <= v.Index {
 		delete(c.scannedActive, v.Namespace)
 	}
 	c.rev++
+	return nil
 }
 
 // Reload re-reads sealed segment idx of ns from disk, for a caller that
@@ -183,19 +186,15 @@ func (c *Catalog) Reload(ns catalog.Namespace, idx uint64) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.putSealedLocked(v)
-	return nil
+	return c.putSealedLocked(v)
 }
 
 func (c *Catalog) dropSealedLocked(ns catalog.Namespace, idx uint64) {
 	list := c.sealed[ns]
-	i, found := slices.BinarySearchFunc(list, idx, func(s catalog.SegmentView, idx uint64) int {
-		return cmp.Compare(s.Index, idx)
-	})
-	if !found {
+	if _, ok := list.Get(idx); !ok {
 		return
 	}
-	c.sealed[ns] = slices.Delete(slices.Clone(list), i, i+1)
+	c.sealed[ns] = list.Delete(idx)
 	c.rev++
 }
 
@@ -232,8 +231,8 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 	}
 
 	c.mu.Lock()
-	known := make(map[uint64]catalog.SegmentView, len(c.sealed[ns]))
-	for _, v := range c.sealed[ns] {
+	known := make(map[uint64]catalog.SegmentView, c.sealed[ns].Len())
+	for _, v := range c.sealed[ns].Segments() {
 		known[v.Index] = v
 	}
 	c.mu.Unlock()
@@ -270,10 +269,14 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 		sealed = append(sealed, v)
 	}
 
+	list, err := catalog.NewSegmentList(sealed)
+	if err != nil {
+		return fmt.Errorf("catalog/local: %s: %w", dir, err)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !slices.EqualFunc(sealed, c.sealed[ns], sameGeneration) {
-		c.sealed[ns] = sealed
+	if !slices.EqualFunc(sealed, c.sealed[ns].Segments(), sameGeneration) {
+		c.sealed[ns] = list
 		c.rev++
 	}
 	if hasTail {
@@ -293,7 +296,7 @@ func sameGeneration(a, b catalog.SegmentView) bool {
 func (c *Catalog) DropNamespace(ns catalog.Namespace) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.sealed[ns]) > 0 {
+	if c.sealed[ns].Len() > 0 {
 		c.rev++
 	}
 	delete(c.sealed, ns)
@@ -321,35 +324,27 @@ func (c *Catalog) Snapshot() catalog.CatalogView {
 
 	c.mu.Lock()
 	rev := c.rev
-	segs := make(map[catalog.Namespace][]catalog.SegmentView, len(c.dirs))
+	lists := make(map[catalog.Namespace]catalog.SegmentList, len(c.dirs))
+	tails := make(map[catalog.Namespace]catalog.SegmentView, len(c.dirs))
 	for ns := range c.dirs {
 		list := c.sealed[ns]
+		lists[ns] = list
 		av, ok := actives[ns]
 		if _, attached := srcs[ns]; !attached {
 			av, ok = c.scannedActive[ns]
 		}
-		if ok && (len(list) == 0 || av.Index > list[len(list)-1].Index) {
-			list = append(slices.Clip(list), av)
+		if last, sealed := list.Last(); ok && (!sealed || av.Index > last.Index) {
+			tails[ns] = av
 		}
-		segs[ns] = list
 	}
 	c.mu.Unlock()
 
-	paths := make(map[catalog.Namespace]map[uint64]string, len(segs))
-	for ns, list := range segs {
-		m := make(map[uint64]string, len(list))
-		for _, v := range list {
-			m[v.Index] = c.Path(ns, v.Index)
-		}
-		paths[ns] = m
-	}
-	view, err := catalog.NewView(rev, segs, func(v catalog.SegmentView, i int) catalog.Locator {
+	view, err := catalog.NewView(rev, lists, tails, func(v catalog.SegmentView, i int) catalog.Locator {
 		b := v.Blocks[i]
 		return catalog.FileBlock{
-			Path:       paths[v.Namespace][v.Index],
-			Generation: v.Generation,
-			Offset:     b.Offset,
-			Length:     b.CompressedSize,
+			Path:   c.Path(v.Namespace, v.Index),
+			Offset: b.Offset,
+			Length: b.CompressedSize,
 		}
 	})
 	if err != nil {
@@ -399,22 +394,38 @@ func readGeneration(fs vfs.FS, path string) (uint64, error) {
 }
 
 // Fetcher returns the Fetcher for FileBlock refs.
-func (c *Catalog) Fetcher() catalog.Fetcher { return fetcher{fs: c.fs} }
+func (c *Catalog) Fetcher() catalog.Fetcher { return fetcher{c: c} }
 
 type fetcher struct {
-	fs vfs.FS
+	c *Catalog
 }
 
 // Fetch reads a FileBlock's frame after checking that the file still holds
 // the ref's generation. A compaction rewrite or a seal changes the header
 // checksum, and a merge cleanup removes the file; both mean the ref's
 // offsets no longer describe the file, so Fetch reports ErrStaleRef.
-func (f fetcher) Fetch(_ context.Context, ref catalog.BlockRef) ([]byte, error) {
+//
+// A stale sealed ref also reloads its segment. The compactor tells the
+// catalog about a rewrite only after the rename, so without this a reader
+// in that window would retry against the same stale view. A stale active
+// ref needs no reload: the writer publishes the seal before it releases the
+// lock a fresh Snapshot waits on.
+func (f fetcher) Fetch(ctx context.Context, ref catalog.BlockRef) ([]byte, error) {
+	frame, err := f.fetch(ref)
+	if errors.Is(err, catalog.ErrStaleRef) && ref.Generation != 0 {
+		if rerr := f.c.Reload(ref.Namespace, ref.Segment); rerr != nil {
+			return nil, errors.Join(err, rerr)
+		}
+	}
+	return frame, err
+}
+
+func (f fetcher) fetch(ref catalog.BlockRef) ([]byte, error) {
 	loc, ok := ref.Loc.(catalog.FileBlock)
 	if !ok {
 		return nil, fmt.Errorf("catalog/local: unsupported locator %T", ref.Loc)
 	}
-	file, err := f.fs.Open(loc.Path)
+	file, err := f.c.fs.Open(loc.Path)
 	if oserror.IsNotExist(err) {
 		return nil, fmt.Errorf("%w: %s is gone", catalog.ErrStaleRef, loc.Path)
 	}
@@ -427,8 +438,8 @@ func (f fetcher) Fetch(_ context.Context, ref catalog.BlockRef) ([]byte, error) 
 	if _, err := file.ReadAt(head[:], 0); err != nil {
 		return nil, fmt.Errorf("catalog/local: read header %s: %w", loc.Path, err)
 	}
-	if gen := binary.LittleEndian.Uint64(head[4:12]); gen != loc.Generation {
-		return nil, fmt.Errorf("%w: %s generation %x, ref %x", catalog.ErrStaleRef, loc.Path, gen, loc.Generation)
+	if gen := binary.LittleEndian.Uint64(head[4:12]); gen != ref.Generation {
+		return nil, fmt.Errorf("%w: %s generation %x, ref %x", catalog.ErrStaleRef, loc.Path, gen, ref.Generation)
 	}
 	buf := make([]byte, 8+int(loc.Length))
 	if _, err := file.ReadAt(buf, int64(loc.Offset)); err != nil {

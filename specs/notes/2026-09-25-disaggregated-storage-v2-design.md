@@ -939,21 +939,24 @@ through one type:
 type BlockRef struct {
     MinSeq, MaxSeq                 uint64
     MinWitnessedUS, MaxWitnessedUS int64
-    Segment uint64 // position in the namespace; stable across compaction
-    Block   int
-    Loc     Locator // closed sum type, see below
+    Namespace  Namespace // position; stable across compaction
+    Segment    uint64
+    Block      int
+    Generation uint64  // the segment generation the ref was built from
+    Loc        Locator // closed sum type, see below
 }
 
 // Exactly one of:
-type FileBlock struct{ Path string; Generation, Offset uint64; Length uint32 } // local mode
+type FileBlock struct{ Path string; Offset uint64; Length uint32 } // local mode
 type ObjectBlock struct{ ObjectID uint64 } // sealed block, active block, or pointer hot batch
 type InlineBlock struct{ Frame []byte }    // inline hot batch
 ```
 
 A `Fetcher` turns a ref into its zstd frame. It returns `ErrStaleRef` when the
 ref's generation is no longer current (a compaction published a new one), so
-the caller takes a fresh snapshot and retries. Local mode's `FileBlock` pins
-the header checksum as its generation.
+the caller takes a fresh snapshot and retries. Local mode uses the header
+checksum as the generation. Decoded-block caches key on (namespace, segment,
+block, generation).
 
 The mirror exposes `RefsFrom(ns, seq) iter.Seq[BlockRef]`: every ref from the
 one containing `seq` up to the tip, in order. It is a lazy iterator, so a
