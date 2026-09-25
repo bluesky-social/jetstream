@@ -991,7 +991,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
     - `just up`, `just test-storage`, and `just down` under `if: always()`;
     - confirm the `docker compose` plugin resolves inside `nix develop` on
       ubuntu-24.04.
-- [ ] **S2.21 Fuzz targets** (S). Deps: S2.6, S2.13.
+- [x] **S2.21 Fuzz targets** (S). Deps: S2.6, S2.13.
   - A hot-batch row decoder (descriptor plus frame) and a footer object parser
     fed with arbitrary bytes as they come from storage (design §20). Add both
     to the `ci-scheduled.yml` fuzz matrix and to `testing/ci/workflows_test.go`.
@@ -1224,6 +1224,30 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S2.21 (2026-09-25): fuzz targets.**
+  - Hot-batch decoding moved into `catalog.DecodeHotBatch(row, frame)`, which
+    the maintainer's rebuild calls, so the fuzz target runs the production
+    path rather than a copy. Every failure is `CorruptionError{hot_batch}`.
+  - The row is checked before its frame is decoded: first seq at least 1,
+    first no greater than last, the range within `maxBatchEvents`, and the
+    count matching the range. This closes a uint64 wrap in the old count
+    check (`[0, MaxUint64]` computed a count of 0).
+  - `FuzzDecodeHotBatch` (`./internal/catalog`) takes the row's first seq,
+    last seq, event count, and frame. On success the events must be exactly
+    the row's count, contiguous from its first seq.
+  - `FuzzOpenReaderParts` (`./segment`) takes a header and footer the way
+    the follower's `loadGeneration` loads them (`ReadSealedHeader`, then
+    `OpenReaderParts`). A `fixChecksum` flag recomputes xxh3 so mutations
+    reach the block-index, bloom, and collection-index parsers, and an open
+    reader runs every query, including `DecodeBlock` on fetched frames. The
+    seed is checked to open, so the target cannot fuzz only rejections. The
+    follower's pointer-batch path is `DecodeBlockFrame`, which
+    `FuzzDecodeBlockFromCompressed` already covers.
+  - No panics found; `segment/` is unchanged. Both targets are in the
+    `ci-scheduled.yml` matrix, which `TestFuzzWorkflowShardsEveryTarget`
+    enforces (the workflows test finds `Fuzz*` targets itself).
+  - Built by a parallel agent on S2.12 and cherry-picked; 30s fuzz runs of
+    both packages passed.
 - **S2.12 (2026-09-25): live consumer per-batch relay cursor.**
   - No sampling change was needed. The hot writer already samples
     `DurableBatchPrepareValue` per batch at freeze time (S2.8), and atmos
