@@ -103,6 +103,20 @@ type ClosedBlock struct {
 	Folded func()
 }
 
+// OpenBlock is an open block that session start rebuilt from an earlier
+// session's hot batches (design §10.9 step 6): committed events that neither
+// filled a block nor reached the block max age. The hot writer continues it.
+type OpenBlock struct {
+	// Events are the block's events in seq order. The writer owns them.
+	Events []segment.Event
+	// Batches are the hot batches that hold Events, in seq order. The
+	// catalog does not record a batch's class, so rebuilt batches report
+	// ClassLive.
+	Batches []HotBatchInfo
+	// OpenedAt starts the block's age cut.
+	OpenedAt time.Time
+}
+
 // BlockSink is the maintainer side of hot mode.
 type BlockSink interface {
 	// BlockClosed receives each closed block, in seq order, from the
@@ -123,6 +137,11 @@ type HotConfig struct {
 	Uploader ObjectUploader
 	// Sink receives closed blocks. Nil drops them.
 	Sink BlockSink
+	// Resume is the open block the maintainer's session-start rebuild
+	// returned (design §10.9). It must hold exactly the hot batches in the
+	// catalog: the writer refuses to open over hot batches that were not
+	// rebuilt, because it would never fold them.
+	Resume *OpenBlock
 
 	BatchMaxEvents int
 	BatchMaxBytes  int64
@@ -357,9 +376,17 @@ func openHot(cfg Config) (*Writer, error) {
 	cfg.Hot = &hc
 	cfg.Logger = cfg.Logger.With(slog.String("component", "ingest/writer"), slog.String("mode", "hot"))
 
-	next, unfoldedFrom, err := readHotState(context.Background(), hc.Session.DB())
+	next, rows, err := readHotState(context.Background(), hc.Session.DB())
 	if err != nil {
 		return nil, err
+	}
+	block, err := resumeBlock(hc.Resume, rows, next, cfg.MaxEventsPerBlock)
+	if err != nil {
+		return nil, err
+	}
+	unfoldedFrom := next
+	if block != nil {
+		unfoldedFrom = block.first
 	}
 
 	w := &Writer{cfg: cfg, nextSeq: next, durableNextSeq: next}
@@ -380,6 +407,7 @@ func openHot(cfg Config) (*Writer, error) {
 		done:     make(chan struct{}),
 		agerDone: make(chan struct{}),
 		nextSeq:  next,
+		block:    block,
 
 		changed:       make(chan struct{}),
 		committedNext: next,
@@ -397,36 +425,85 @@ func openHot(cfg Config) (*Writer, error) {
 	return w, nil
 }
 
-// readHotState reads seq/next at session start (design §10.2), and the
-// first seq still in hot_batches, which starts the unfolded count (§10.5
-// rule 9). seq/next is the committed value: whatever an earlier session
-// assigned but never committed is reassigned.
-func readHotState(ctx context.Context, db catalog.DB) (next, unfoldedFrom uint64, err error) {
+// readHotState reads seq/next at session start (design §10.2) and the hot
+// batches still unfolded (§10.5 rule 9). seq/next is the committed value:
+// whatever an earlier session assigned but never committed is reassigned.
+func readHotState(ctx context.Context, db catalog.DB) (next uint64, rows []catalog.HotBatchRow, err error) {
 	tx, err := db.BeginRead(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
+		return 0, nil, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
 	}
 	defer func() { _ = tx.Close(ctx) }()
 	vals, err := tx.MetaGet(ctx, [][]byte{[]byte(catalog.MainSeqKey)})
 	if err != nil {
-		return 0, 0, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
+		return 0, nil, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
 	}
 	v, found := vals[catalog.MainSeqKey]
 	if next, err = catalog.DecodeSeq(catalog.MainSeqKey, v, found); err != nil {
-		return 0, 0, err
+		return 0, nil, err
 	}
-	rows, err := tx.HotBatches(ctx, math.MaxUint64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("ingest: read hot batches: %w", err)
+	if rows, err = tx.HotBatches(ctx, math.MaxUint64); err != nil {
+		return 0, nil, fmt.Errorf("ingest: read hot batches: %w", err)
 	}
-	unfoldedFrom = next
-	if len(rows) > 0 {
-		unfoldedFrom = rows[0].FirstSeq
+	if len(rows) > 0 && rows[len(rows)-1].LastSeq+1 != next {
+		return 0, nil, catalog.Corruptf(catalog.SourceHotBatch, "hot batches end at seq %d, but %s is %d",
+			rows[len(rows)-1].LastSeq, catalog.MainSeqKey, next)
 	}
-	if unfoldedFrom > next {
-		return 0, 0, catalog.Corruptf(catalog.SourceHotBatch, "hot batch at seq %d is past %s %d", unfoldedFrom, catalog.MainSeqKey, next)
+	return next, rows, nil
+}
+
+// resumeBlock turns r into the open block after checking that it holds
+// exactly the hot batches in rows, which end at next.
+func resumeBlock(r *OpenBlock, rows []catalog.HotBatchRow, next uint64, maxEvents int) (*hotBlock, error) {
+	switch {
+	case r == nil && len(rows) == 0:
+		return nil, nil
+	case r == nil:
+		return nil, fmt.Errorf("%w: hot batches [%d,%d] were not rebuilt into Hot.Resume (design §10.9)",
+			ErrInvalidConfig, rows[0].FirstSeq, rows[len(rows)-1].LastSeq)
+	case len(r.Batches) != len(rows):
+		return nil, fmt.Errorf("%w: Hot.Resume has %d batches; the catalog has %d hot batches", ErrInvalidConfig, len(r.Batches), len(rows))
+	case len(r.Events) == 0 || len(r.Events) >= maxEvents:
+		// A full block should have been folded.
+		return nil, fmt.Errorf("%w: Hot.Resume has %d events; want 1 to %d", ErrInvalidConfig, len(r.Events), maxEvents-1)
 	}
-	return next, unfoldedFrom, nil
+	first := rows[0].FirstSeq
+	if uint64(len(r.Events)) != next-first {
+		return nil, fmt.Errorf("%w: Hot.Resume has %d events; the hot batches hold [%d,%d)", ErrInvalidConfig, len(r.Events), first, next)
+	}
+	blk := &hotBlock{
+		first:    first,
+		events:   make([]segment.Event, 0, maxEvents),
+		openedAt: r.OpenedAt,
+	}
+	for i := range r.Events {
+		if want := first + uint64(i); r.Events[i].Seq != want {
+			return nil, fmt.Errorf("%w: Hot.Resume has seq %d where %d belongs", ErrInvalidConfig, r.Events[i].Seq, want)
+		}
+	}
+	blk.events = append(blk.events, r.Events...)
+	want := first
+	for i, b := range r.Batches {
+		row := rows[i]
+		if b.FirstSeq != row.FirstSeq || b.LastSeq != row.LastSeq || b.ObjectID != row.ObjectID {
+			return nil, fmt.Errorf("%w: Hot.Resume batch %d is [%d,%d] object %d; the catalog has [%d,%d] object %d",
+				ErrInvalidConfig, i, b.FirstSeq, b.LastSeq, b.ObjectID, row.FirstSeq, row.LastSeq, row.ObjectID)
+		}
+		if b.FirstSeq != want || b.LastSeq < b.FirstSeq || b.LastSeq >= next {
+			return nil, catalog.Corruptf(catalog.SourceHotBatch, "hot batch [%d,%d] does not continue at seq %d", b.FirstSeq, b.LastSeq, want)
+		}
+		want = b.LastSeq + 1
+		start, n := int(b.FirstSeq-first), int(b.LastSeq-b.FirstSeq+1)
+		blk.batches = append(blk.batches, &hotBatch{
+			first:    b.FirstSeq,
+			start:    start,
+			n:        n,
+			class:    b.Class,
+			events:   blk.events[start : start+n : start+n],
+			objectID: b.ObjectID,
+		})
+	}
+	return blk, nil
 }
 
 // rawEventBytes is the batch byte cut's measure of an event: its variable

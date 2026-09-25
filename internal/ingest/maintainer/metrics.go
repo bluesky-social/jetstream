@@ -15,6 +15,7 @@ type Metrics struct {
 	SealDuration       prometheus.Histogram
 	QueuedBlocks       prometheus.Gauge
 	ActiveSegmentBytes prometheus.Gauge
+	RebuildDuration    prometheus.Histogram
 }
 
 // NewMetrics registers the maintainer metrics against reg. Construct it once
@@ -48,8 +49,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Subsystem: sub, Name: "active_segment_bytes",
 			Help: "Framed bytes of the main active segment's folded blocks, the rotation rule's input.",
 		}),
+		RebuildDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: ns, Subsystem: sub, Name: "rebuild_duration_seconds",
+			Help:    "Time for session start to check the catalog, read the hot batches, and fold and seal what it can.",
+			Buckets: prometheus.ExponentialBuckets(0.01, 2, 14),
+		}),
 	}
-	reg.MustRegister(m.Folds, m.FoldDuration, m.Seals, m.SealDuration, m.QueuedBlocks, m.ActiveSegmentBytes)
+	reg.MustRegister(m.Folds, m.FoldDuration, m.Seals, m.SealDuration, m.QueuedBlocks, m.ActiveSegmentBytes, m.RebuildDuration)
 	return m
 }
 
@@ -82,5 +88,11 @@ func (m *Metrics) setQueued(n int) {
 func (m *Metrics) setActiveBytes(n int64) {
 	if m != nil {
 		m.ActiveSegmentBytes.Set(float64(n))
+	}
+}
+
+func (m *Metrics) observeRebuild(d time.Duration) {
+	if m != nil {
+		m.RebuildDuration.Observe(d.Seconds())
 	}
 }

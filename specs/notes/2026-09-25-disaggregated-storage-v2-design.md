@@ -953,19 +953,38 @@ from the footer's uploading row, which GC reclaims. Hot batches keep committing 
 ### 10.9 Session start in hot mode
 
 1. Acquire the lease and read the metadata the orchestrator needs.
-2. Load the `main` active segment and its active blocks.
+2. Load the catalog snapshot and run the cheap `CheckInvariants` subset (§9.3)
+   against it, with `relay/cursor` validation (invariant 7). A violation is
+   corruption: the session ends and nothing is folded.
 3. Load all `hot_batches` in seq order. Decode inline frames. Fetch and verify
-   pointer objects.
+   pointer objects. Every batch must decode to exactly its recorded seq range.
 4. Group the batches greedily, in order, into groups of at most 4096 events,
    never splitting a batch. The rows came from earlier sessions whose block
-   boundaries may differ, so do not assume old boundaries.
-5. Fold every group that is full (4096 events) or whose first event is older than
-   the block max age. Seal whenever the rotation rule fires.
-6. The remaining group, if any, becomes the new open block. Its committed events
-   are kept in memory. New appends continue at `seq/next`, and the batch cap uses
-   the block's remaining capacity.
-7. Rebuild the tombstone set (§12.5).
-8. Start the live consumer at `relay/cursor`.
+   boundaries may differ, so do not assume old boundaries. A batch larger than
+   a block is corruption.
+5. Fold every group except the last: none of them can grow. Fold the last group
+   too if it is full, or if its first batch's `committed_at` (the database
+   clock, clamped to now) is at least the block max age old. Apply the rotation
+   rule before and after every fold, so a segment an earlier session left at the
+   threshold (its fold committed, its seal lost) is sealed before anything is
+   folded onto it. Sealed output stays byte-identical to local mode.
+6. The remaining group, if any, becomes the new open block
+   (`ingest.HotConfig.Resume`). Its committed events are kept in memory and its
+   age cut runs from the first batch's `committed_at`. New appends continue at
+   `seq/next`, and the batch cap uses the block's remaining capacity. The writer
+   refuses to open over hot batches that were not rebuilt, and checks that the
+   resumed block matches the catalog's hot batches exactly. Resumed events are
+   not in the in-memory read log, which starts at `seq/next`; readers get them
+   from the catalog (§11). Rebuilt batches report class `live`, because the
+   catalog does not record a batch's class.
+7. Rebuild the tombstone set (§12.5), through the existing orchestrator path.
+8. Start the live consumer at `relay/cursor`, through the existing orchestrator
+   path.
+
+`maintainer.Rebuild` runs steps 2 to 6 and returns the open block. Steps 7 and
+8 are unchanged orchestrator code, pointed at the disaggregated catalog and the
+fenced metastore by the runtime wiring (S2.16). The rebuild's cost includes the
+invariant check, which is O(archive); S2.22 measures it.
 
 ### 10.10 Lifecycle phases
 
@@ -1856,7 +1875,8 @@ All metrics use the existing `obs` package. Names:
   `jetstream_maintainer_seals_total`,
   `jetstream_maintainer_seal_duration_seconds`,
   `jetstream_maintainer_queued_blocks` (gauge),
-  `jetstream_maintainer_active_segment_bytes` (gauge: the rotation rule's input)
+  `jetstream_maintainer_active_segment_bytes` (gauge: the rotation rule's input),
+  `jetstream_maintainer_rebuild_duration_seconds`
 - `jetstream_s3_requests_total{op, result}`,
   `jetstream_s3_request_duration_seconds{op}`,
   `jetstream_s3_bytes_total{op}`, `jetstream_s3_verify_failures_total{path=upload|read}`

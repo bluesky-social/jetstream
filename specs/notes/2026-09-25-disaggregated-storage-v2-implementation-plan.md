@@ -809,7 +809,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
       seal of the same events;
     - fold dedup reuses a whole-block pointer batch;
     - a seal crash between upload and commit leaves the catalog unchanged.
-- [ ] **S2.11 Session start rebuild** (M). Deps: S2.10.
+- [x] **S2.11 Session start rebuild** (M). Deps: S2.10.
   - The §10.9 steps: load the active segment and its blocks, load all hot
     batches, group greedily into ≤4096 without splitting a batch, fold full or
     aged groups, seal on rotation, and keep the remainder as the open block.
@@ -1223,6 +1223,43 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.11 (2026-09-25): session start rebuild.**
+  - `Maintainer.Rebuild(ctx, RebuildConfig)` runs §10.9 steps 2 to 6 and
+    returns an `*ingest.OpenBlock`, which the hot writer takes as
+    `HotConfig.Resume`. The session order is `maintainer.Open`, `Rebuild`,
+    `ingest.Open` with the resumed block, then the live consumer (S2.16 wires
+    it).
+  - The rebuild starts with the cheap `CheckInvariants` subset on one read
+    snapshot, with `RebuildConfig.RelayCursor` for invariant 7 (S2.12 supplies
+    it). A violation ends the session before anything is folded. The check is
+    O(archive); S2.22 measures it.
+  - Every group but the last folds, since none can grow. The last folds if it
+    is full, or if its first batch's `committed_at` (database clock, clamped to
+    now) is at least `BlockMaxAge` old. Otherwise it is the open block, and its
+    age cut runs from that same `committed_at`.
+  - The rotation rule now also runs before each fold and on `Sync`/`Rotate`
+    requests, not only after a fold. An earlier session whose fold committed
+    but whose seal was lost leaves a segment at the threshold; this seals it
+    before folding onto it, so output stays byte-identical to local mode.
+  - The writer refuses to open over hot batches it was not given, and checks
+    `Resume` against the catalog exactly (batch count, ranges, object ids,
+    event seqs, and the block being non-empty and not full). A mismatch is
+    `ErrInvalidConfig`; a gap in the catalog rows is corruption.
+  - Resumed events are not added to the in-memory read log, which starts at
+    `seq/next`; readers get them from the catalog. Rebuilt batches report class
+    `live`, because the catalog does not record class.
+  - Steps 7 and 8 (tombstone rebuild, live consumer at `relay/cursor`) are the
+    existing orchestrator paths (`rebuildLiveTombstones`, `live.Open`). S2.16
+    points them at the disaggregated catalog and fenced metastore.
+  - New metric `jetstream_maintainer_rebuild_duration_seconds`.
+  - The property test runs 40 seeds of 3 to 7 prior sessions each, with random
+    batch sizes, bulk pointer batches, block ages, segment thresholds, sinks
+    that drop some or all closed blocks, and one-shot commit failures and lost
+    commits on hot batch, fold, and seal transactions. After a final clean
+    session, the sealed and active archive must equal the model exactly.
+    Six hand mutants of the grouping, age, full, rotation, and invariant logic
+    were all killed.
 
 - **S2.10 (2026-09-25): maintainer fold and seal.**
   - New package `internal/ingest/maintainer`. `Maintainer` implements

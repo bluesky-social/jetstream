@@ -68,9 +68,10 @@ type Config struct {
 // Maintainer folds and seals main's active segment for one leader session.
 // It implements ingest.BlockSink.
 type Maintainer struct {
-	cfg Config
-	ctx context.Context
-	bb  *segment.BlockBuilder
+	cfg       Config
+	ctx       context.Context
+	maxEvents int
+	bb        *segment.BlockBuilder // owned by the run goroutine
 
 	mu     sync.Mutex
 	queue  []item
@@ -115,11 +116,12 @@ func Open(ctx context.Context, cfg Config) (*Maintainer, error) {
 		return nil, fmt.Errorf("maintainer: %w", err)
 	}
 	m := &Maintainer{
-		cfg:  cfg,
-		ctx:  ctx,
-		bb:   bb,
-		wake: make(chan struct{}, 1),
-		done: make(chan struct{}),
+		cfg:       cfg,
+		ctx:       ctx,
+		maxEvents: bb.Cap(),
+		bb:        bb,
+		wake:      make(chan struct{}, 1),
+		done:      make(chan struct{}),
 	}
 	if err := m.load(ctx); err != nil {
 		return nil, err
@@ -192,7 +194,7 @@ func (m *Maintainer) Rotate(ctx context.Context) error {
 }
 
 // Sync waits until every block queued before it is folded, and any seal
-// those folds triggered has committed.
+// the rotation rule called for has committed.
 func (m *Maintainer) Sync(ctx context.Context) error {
 	return m.request(ctx, false)
 }
@@ -301,17 +303,27 @@ func (m *Maintainer) dequeue() (item, bool) {
 	}
 }
 
+// handle applies the rotation rule after every fold, and before one too:
+// an earlier session may have committed the fold that crossed the threshold
+// and ended before its seal.
 func (m *Maintainer) handle(it item) error {
 	if it.block != nil {
+		if err := m.rotateIfFull(); err != nil {
+			return err
+		}
 		if err := m.fold(m.ctx, it.block); err != nil {
 			return err
 		}
-		if m.framed >= m.cfg.MaxSegmentBytes {
-			return m.seal(m.ctx)
-		}
-		return nil
+		return m.rotateIfFull()
 	}
 	if it.seal && len(m.blocks) > 0 {
+		return m.seal(m.ctx)
+	}
+	return m.rotateIfFull()
+}
+
+func (m *Maintainer) rotateIfFull() error {
+	if len(m.blocks) > 0 && m.framed >= m.cfg.MaxSegmentBytes {
 		return m.seal(m.ctx)
 	}
 	return nil

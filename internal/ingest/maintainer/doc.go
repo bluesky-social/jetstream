@@ -11,4 +11,8 @@
 // Every failure ends the session. Nothing is retried: the next session
 // rebuilds from what committed (§10.9). Blocks still queued when the
 // maintainer stops are left as hot batches for that rebuild.
+//
+// Rebuild is that session-start step. It checks the catalog, folds and seals
+// every hot batch that can no longer grow into a block, and returns the rest
+// as the open block the next hot writer resumes (ingest.HotConfig.Resume).
 package maintainer

@@ -20,6 +20,8 @@ import (
 	"github.com/bluesky-social/jetstream/internal/objstore/protocol"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -108,6 +110,22 @@ func (e *hotEnv) frameEvents(row catalog.HotBatchRow) []segment.Event {
 	evs, err := segment.DecodeBlockFrame(frame)
 	require.NoError(e.t, err)
 	return evs
+}
+
+// resume builds the open block that session start would rebuild when every
+// hot batch fits in one block: what a maintainer's rebuild hands a writer.
+func (e *hotEnv) resume() *OpenBlock {
+	e.t.Helper()
+	rows := e.rows()
+	if len(rows) == 0 {
+		return nil
+	}
+	r := &OpenBlock{OpenedAt: rows[0].CommittedAt}
+	for _, row := range rows {
+		r.Events = append(r.Events, e.frameEvents(row)...)
+		r.Batches = append(r.Batches, HotBatchInfo{FirstSeq: row.FirstSeq, LastSeq: row.LastSeq, ObjectID: row.ObjectID})
+	}
+	return r
 }
 
 // requireTiles checks the committed rows cover [1, next) with no gap or
@@ -563,7 +581,7 @@ func TestHot_CommitFailure(t *testing.T) {
 				require.Less(t, w.ReadLog().DurableSeq(), uint64(16))
 
 				env.newSession()
-				w2 := env.open(Config{Hot: &HotConfig{BatchMaxEvents: 5}})
+				w2 := env.open(Config{Hot: &HotConfig{BatchMaxEvents: 5, Resume: env.resume()}})
 				require.Equal(t, want, w2.NextSeq())
 				ev2 := testEvent(rng, 0)
 				require.NoError(t, w2.Append(t.Context(), &ev2))
@@ -594,6 +612,124 @@ func TestHot_HookFailure(t *testing.T) {
 		require.ErrorIs(t, env.s.Err(), catalog.ErrSessionEnded)
 		require.ErrorIs(t, w.Close(), boom)
 		require.Empty(t, env.rows())
+	})
+}
+
+// A writer resumed over a rebuilt open block keeps filling it, and the
+// closed block carries the earlier session's batches and events.
+func TestHot_ResumeContinuesOpenBlock(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		env := newHotEnv(t)
+		rng := rand.New(rand.NewPCG(7, 7))
+		var evs []segment.Event
+		appendN := func(w *Writer, ctx context.Context, n int) {
+			for range n {
+				ev := testEvent(rng, 0)
+				require.NoError(t, w.Append(ctx, &ev))
+				evs = append(evs, ev)
+			}
+		}
+		w := env.open(Config{MaxEventsPerBlock: 16, Hot: &HotConfig{Uploader: env.up, BatchMaxEvents: 3}})
+		appendN(w, t.Context(), 4)
+		appendN(w, WithClass(t.Context(), ClassBulk), 2)
+		require.NoError(t, w.Close())
+		prior := env.rows()
+		require.Len(t, prior, 3)
+		require.NotZero(t, prior[2].ObjectID, "a pointer batch resumes with its object")
+
+		env.newSession()
+		time.Sleep(time.Second)
+		m := NewMetrics(prometheus.NewRegistry())
+		sink := &recSink{}
+		resume := env.resume()
+		w2 := env.open(Config{MaxEventsPerBlock: 16, Metrics: m, Hot: &HotConfig{
+			Sink: sink, BatchMaxEvents: 3, BlockMaxAge: time.Hour, MaxUnfoldedEvents: 16, Resume: resume,
+		}})
+		require.Equal(t, 6.0, testutil.ToFloat64(m.HotUnfoldedEvents), "resumed events count as unfolded")
+		require.Equal(t, uint64(7), w2.ReadLog().FloorSeq(), "resumed events are already readable from the catalog")
+		appendN(w2, t.Context(), 10)
+		require.NoError(t, w2.Flush(t.Context()))
+		synctest.Wait()
+		blocks, _ := sink.snapshot()
+		require.Len(t, blocks, 1)
+		b := blocks[0]
+		require.Equal(t, uint64(1), b.FirstSeq)
+		require.Equal(t, uint64(16), b.LastSeq)
+		require.Equal(t, resume.OpenedAt, b.OpenedAt, "the block's age runs from the rebuilt open block")
+		require.Len(t, b.Events, 16)
+		for i := range evs {
+			requireSameEvent(t, evs[i], b.Events[i])
+		}
+		for i, row := range prior {
+			require.Equal(t, HotBatchInfo{FirstSeq: row.FirstSeq, LastSeq: row.LastSeq, ObjectID: row.ObjectID}, b.Batches[i])
+		}
+		require.Equal(t, uint64(7), b.Batches[len(prior)].FirstSeq)
+		require.NoError(t, w2.Close())
+	})
+}
+
+// The resumed block's age cut runs from its OpenedAt, not from the open.
+func TestHot_ResumeAgeCut(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		env := newHotEnv(t)
+		w := env.open(Config{})
+		ev := testEvent(rand.New(rand.NewPCG(8, 8)), 0)
+		require.NoError(t, w.Append(t.Context(), &ev))
+		require.NoError(t, w.Close())
+
+		env.newSession()
+		time.Sleep(60 * time.Millisecond)
+		sink := &recSink{}
+		w2 := env.open(Config{Hot: &HotConfig{Sink: sink, BlockMaxAge: 100 * time.Millisecond, Resume: env.resume()}})
+		defer func() { require.NoError(t, w2.Close()) }()
+		time.Sleep(39 * time.Millisecond)
+		synctest.Wait()
+		blocks, _ := sink.snapshot()
+		require.Empty(t, blocks)
+		time.Sleep(time.Millisecond)
+		synctest.Wait()
+		blocks, _ = sink.snapshot()
+		require.Len(t, blocks, 1)
+		require.Equal(t, uint64(1), blocks[0].LastSeq)
+	})
+}
+
+// The writer refuses to open over hot batches it was not handed exactly.
+func TestHot_ResumeValidation(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		env := newHotEnv(t)
+		w := env.open(Config{Hot: &HotConfig{BatchMaxEvents: 2}})
+		rng := rand.New(rand.NewPCG(9, 9))
+		for range 5 {
+			ev := testEvent(rng, 0)
+			require.NoError(t, w.Append(t.Context(), &ev))
+		}
+		require.NoError(t, w.Close())
+		env.newSession()
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+		cases := map[string]func(r *OpenBlock) (*OpenBlock, int){
+			"missing":        func(*OpenBlock) (*OpenBlock, int) { return nil, 0 },
+			"batch count":    func(r *OpenBlock) (*OpenBlock, int) { r.Batches = r.Batches[1:]; return r, 0 },
+			"batch range":    func(r *OpenBlock) (*OpenBlock, int) { r.Batches[1].LastSeq++; return r, 0 },
+			"batch object":   func(r *OpenBlock) (*OpenBlock, int) { r.Batches[2].ObjectID = 9; return r, 0 },
+			"event count":    func(r *OpenBlock) (*OpenBlock, int) { r.Events = r.Events[:4]; return r, 0 },
+			"event seq":      func(r *OpenBlock) (*OpenBlock, int) { r.Events[3].Seq = 9; return r, 0 },
+			"full block":     func(r *OpenBlock) (*OpenBlock, int) { return r, 5 },
+			"empty":          func(r *OpenBlock) (*OpenBlock, int) { r.Events = nil; return r, 0 },
+			"over the block": func(r *OpenBlock) (*OpenBlock, int) { return r, 4 },
+		}
+		for name, mutate := range cases {
+			r, maxEvents := mutate(env.resume())
+			_, err := Open(Config{Logger: logger, MaxEventsPerBlock: maxEvents, Hot: &HotConfig{Session: env.s, Resume: r}})
+			require.ErrorIs(t, err, ErrInvalidConfig, name)
+		}
+		w2, err := Open(Config{Logger: logger, Hot: &HotConfig{Session: env.s, Resume: env.resume()}})
+		require.NoError(t, err)
+		require.NoError(t, w2.Close())
 	})
 }
 
