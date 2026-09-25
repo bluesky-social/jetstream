@@ -4,10 +4,6 @@ set dotenv-load
 # Runs the linter and tests
 default: lint test
 
-# Enters the pinned Nix development shell.
-dev *ARGS="":
-    exec ./dev.sh {{ARGS}}
-
 # Lints the code
 lint:
     golangci-lint run --timeout 5m ./...

@@ -22,26 +22,14 @@ See the original [RFD](https://github.com/bluesky-social/jetstream/blob/main/doc
 
 ## Examples
 
-See [examples](https://github.com/bluesky-social/jetstream/tree/main/examples) for minimal clients.
-
-Run an example:
-
-```sh
-# start the nix environment (see below)
-just dev
-
-# run any of the examples by name
-just run-example live-tail
-```
+See [examples](https://github.com/bluesky-social/jetstream/tree/main/examples) for a few minimal jetstream usage programs.
 
 ## Developing Locally
 
-Jetstream development uses Nix for a pinned Go and toolchain environment. Install Nix, then enter the dev shell with either:
+Jetstream development uses Nix for a pinned Go and toolchain environment. Install the [Nix package manager](https://nixos.org/download/) and [direnv](https://direnv.net/), then allow your system to automatically launch the dev env with:
 
 ```sh
-./dev.sh
-# or
-just dev
+direnv allow
 ```
 
 To develop against the production network with a limited backfill:
