@@ -907,7 +907,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
   - `jetstreamd.Options` gains an injectable storage bundle (catalog Tx
     factory, blob, lease, clock), so tests can pass storagefake + memblob
     without env vars.
-- [ ] **S2.17 Seeded-catalog test fixture** (M). Deps: S2.10.
+- [x] **S2.17 Seeded-catalog test fixture** (M). Deps: S2.10.
   - Build a catalog that is already in `steady_state` (sealed segments, an
     active segment with blocks, a `relay/cursor`, and `repo/` rows) from a
     simulator world. The easiest correct route is running local-mode bootstrap
@@ -1223,6 +1223,33 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.17 (2026-09-25): seeded-catalog test fixture.**
+  - `oracle.SeedCatalog` builds a `steady_state` main catalog from a
+    simulator world through `catalog.Session` scripts and an
+    `ingest.ObjectUploader` only, so it runs on storagefake + memblob and on
+    PG + S3 alike. It returns the expected event list, `NextSeq`,
+    `LiveStartCursor`, and `RelayCursor`, and is deterministic for a seed.
+  - It models local bootstrap and merge instead of running them: the
+    bootstrap harness lives in `_test` files, needs the process's single
+    synctest bubble (which S2.18 needs), and is slow. Backfill rows take the
+    backfill handler's shape (one create per record in MST walk order, one
+    rev and witnessed_at per repo); live rows come from the oracle's own
+    firehose derivation. A test proves every sealed generation is
+    byte-identical to local mode's `segment.Writer` file for the same rows.
+  - `relay/cursor` rides each `CommitBlock` as the last upstream seq whose
+    rows are all archived. Segments rotate on the maintainer's size rule and
+    the last block never seals, so the active segment holds blocks. A hot
+    writer plus `maintainer.Rebuild` resumes on top cleanly (tested).
+  - It lives in package `oracle`: it needs the oracle's unexported frame
+    derivation, and S2.18's in-package tests could not import a package that
+    imports `oracle`.
+  - Not modeled: backfill overlapping live traffic; `host/`, `handle/`,
+    `pdshost/`, the `sync/identity/` cache, and `relay/list_repos_cursor`
+    (repo rows have empty PDS and host); chain state for DIDs no live commit
+    touched. Worlds with adversarial ledger entries or `#account` frames are
+    refused. Seeded rows sit in blocks, not hot batches, so a `RelayWatch`
+    may only `Expect` upstream seqs after `RelayCursor`.
 
 - **S2.21 (2026-09-25): fuzz targets.**
   - Hot-batch decoding moved into `catalog.DecodeHotBatch(row, frame)`, which
