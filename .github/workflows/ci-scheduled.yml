@@ -59,7 +59,7 @@ jobs:
           github-token: ""
 
       - name: govulncheck
-        run: ./dev.sh --command just vuln
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just vuln
 
   fuzz:
     name: fuzz (${{ matrix.target }})
@@ -132,7 +132,7 @@ jobs:
         env:
           FUZZ_PACKAGE: ${{ matrix.package }}
           FUZZ_TARGET: ${{ matrix.target }}
-        run: ./dev.sh --command just fuzz-target 300s "$FUZZ_PACKAGE" "$FUZZ_TARGET"
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just fuzz-target 300s "$FUZZ_PACKAGE" "$FUZZ_TARGET"
 
       - name: Upload fuzz artifacts
         if: failure()

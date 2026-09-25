@@ -121,7 +121,7 @@ jobs:
           github-token: ""
 
       - name: Oracle seed
-        run: ./dev.sh --command just oracle-sweep 1 "" "$ORACLE_SEED"
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just oracle-sweep 1 "" "$ORACLE_SEED"
 
       - name: Upload diagnostic artifacts
         if: failure()
@@ -191,7 +191,7 @@ jobs:
           github-token: ""
 
       - name: Oracle seed (race detector)
-        run: ./dev.sh --command just oracle-sweep 1 race "$ORACLE_SEED"
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just oracle-sweep 1 race "$ORACLE_SEED"
 
       - name: Upload diagnostic artifacts
         if: failure()

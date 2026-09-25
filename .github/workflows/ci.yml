@@ -136,14 +136,14 @@ jobs:
           github-token: ""
 
       - name: Lint
-        run: ./dev.sh --command just lint
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just lint
 
       # Fail if the committed generated XRPC code in api/ has drifted from
       # the lexicons in ./lexicons. Regenerating must be a no-op; if it
       # isn't, someone edited a lexicon without running `just lexgen`.
       - name: Verify lexicon codegen is up to date
         run: |
-          ./dev.sh --command just lexgen
+          nix --extra-experimental-features 'nix-command flakes' develop --command just lexgen
           git diff --exit-code -- api/
 
   test:
@@ -189,7 +189,7 @@ jobs:
       - name: Test (race detector)
         env:
           RACE_ARTIFACT_DIR: ${{ github.workspace }}/race-artifacts
-        run: ./dev.sh --command just test-race-ci
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just test-race-ci
 
       - name: Upload race diagnostics
         # The race detector report is the actionable evidence for #308. Capture
@@ -238,7 +238,7 @@ jobs:
           github-token: ""
 
       - name: Build Docker image
-        run: ./dev.sh --command just docker-build
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just docker-build
 
       - name: Verify Docker build stamp
         run: |
