@@ -133,3 +133,23 @@ func OpenURL(t testing.TB, u string, metrics *pgstore.Metrics) *pgstore.Store {
 	t.Cleanup(s.Close)
 	return s
 }
+
+// ReaderURL returns u logged in as ReaderRole, whose password in the dev
+// environment is its name. It skips the test when the role does not exist.
+func ReaderURL(t testing.TB, u string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := pgx.Connect(ctx, u)
+	require.NoError(t, err)
+	defer func() { _ = c.Close(context.Background()) }()
+	var exists bool
+	require.NoError(t, c.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)", ReaderRole).Scan(&exists))
+	if !exists {
+		t.Skipf("role %s does not exist", ReaderRole)
+	}
+	p, err := url.Parse(u)
+	require.NoError(t, err)
+	p.User = url.UserPassword(ReaderRole, ReaderRole)
+	return p.String()
+}

@@ -1300,7 +1300,10 @@ Implementations:
 - `metastore/pebble`: wraps the existing `internal/store`. Commit uses
   `store.SyncWrites`, as today. The identity cache's `NoSync` writes stay local
   to local mode.
-- `metastore/pg`: backed by `metadata_kv`.
+- `metastore/pg`: backed by `metadata_kv`. Reads are autocommit; commits go
+  through the leader session's fenced `CommitMeta`, and a nil commit path is a
+  reader pod's read-only view. The SQL lives in `pgstore` (`MetaGet`,
+  `MetaScan`, `MetaBatch`), so this package imports no driver.
 
 All 56 `NewBatch`, 12 `NewIter`, and 5 `DeleteRange` call sites move to this
 interface. `DurableBatchHook` takes `metastore.Batch`.
@@ -1733,7 +1736,8 @@ All metrics use the existing `obs` package. Names:
   lease_lost, shutdown, or restart), `jetstream_leader_session_starts_total`,
   `jetstream_leader_fence_failures_total`
 - `jetstream_pg_txn_duration_seconds{kind}` (hot_batch, block, fold, seal,
-  compaction, gc, metadata), `jetstream_pg_txn_errors_total{kind}`
+  compaction, gc, metadata, plus read for catalog snapshots and meta_read for
+  metastore reads), `jetstream_pg_txn_errors_total{kind}`
 - `jetstream_hot_batches_total{class, storage=inline|pointer}`,
   `jetstream_hot_batch_events` (histogram),
   `jetstream_hot_unfolded_events` (gauge), `jetstream_hot_pending_bytes{class}`

@@ -677,7 +677,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
     - the old epoch's fence fails once a new holder acquires.
   - Metrics: `jetstream_leader_is_leader`, `_epoch`,
     `_sessions_total{result}`, and `_fence_failures_total`.
-- [ ] **S2.4 `metastore/pg`** (M). Deps: S2.2.
+- [x] **S2.4 `metastore/pg`** (M). Deps: S2.2.
   - Get, and ordered batch apply with coalescing (consecutive Sets become one
     upsert, last write wins; consecutive Deletes become `= ANY`; `DeleteRange`
     ends a run). Keyset-paged iterator with 10,000-row pages. Read-only mode
@@ -1223,6 +1223,29 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.4 (2026-09-25): metastore/pg.**
+  - `internal/metastore/pg` (package `pg`; import it as `metapg`) mirrors
+    storagefake's `MetaStore`: `Config{DB, Commit, PageSize}`. Commits go
+    through `Commit`, the leader session's `CommitMeta`, so every metadata
+    write is fenced and coalesced by `pgstore.MetaBatch` (S2.2) inside
+    `Tx.ApplyMeta`. A nil `Commit` is the reader pod's store: every commit,
+    even an empty one, returns `metastore.ErrReadOnly`, as storagefake does.
+  - The SQL stays in pgstore: `Store.MetaGet` and `Store.MetaScan(lower,
+    upper, limit)` are autocommit reads with spans `pg.meta_get` and
+    `pg.meta_scan`, and metric kind `meta_read`, separate from catalog
+    snapshots' `read`. So metastore/pg imports no driver.
+  - The iterator pages by key: 10,000 rows (`DefaultPageSize`), with the
+    next lower bound set to the last key plus a zero byte, which is the
+    smallest key after it under bytea's memcmp order. It holds no
+    transaction between pages, which is all the interface promises. The
+    first page is fetched in `NewIter`, so an error surfaces there.
+  - Tests under `just test-storage`: storetest with a page size of 2, so
+    every multi-key scan crosses pages; page boundaries on zero- and
+    0xff-suffixed keys; a 25,000-op mixed batch scanned with the default
+    page; the read-only store over a real `jetstream_reader` connection
+    (`pgtest.ReaderURL`); and a fenced-out pod's writes failing with
+    `ErrFenced` and then `ErrSessionEnded`.
 
 - **S2.3 (2026-09-25): locker contract suite and leader metrics.**
   - The PG lease shipped in S2.2 as `pgstore.Lease` (import cycle, see the
