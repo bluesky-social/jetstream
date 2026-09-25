@@ -68,6 +68,10 @@ Accepted (Jim, 2026-07-08): the operator re-submits the same CSV, exactly as for
 
 ---
 
+### Timestamp-cursor failover is approximate and at-least-once
+
+Under the client's `CursorTime` mode, a resume on a different host uses `witnessedAt - rewind`. Each instance stamps `witnessed_at` with its own clock when it sees an event, so the same event has slightly different times on different hosts. The rewind (default 5s) is a skew allowance, not a guarantee: skew larger than the rewind can skip events, and everything inside the rewind is re-delivered with no way to dedup across seq namespaces. Callers in this mode must be idempotent. The client identifies a seq namespace by the configured hostname alone: a reconnect to the same name always resumes by seq. So each hostname given to `WithHost`/`WithFailoverHosts` must address exactly one instance; a name that load-balances across instances (or is repointed at a different instance) gets a foreign seq and can skip or replay events. Area: `live.go` (`planSession`, `adoptNamespace`).
+
 ## Lessons
 
 ### There are several copies of the "is this just cancellation?" classifier — grep them all

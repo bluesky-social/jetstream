@@ -99,6 +99,15 @@ type engineConfig struct {
 	// with ?zstdDictionary=<id>. Fetch failure degrades to an uncompressed
 	// tail (logged), never a startup failure.
 	ZstdCompression bool
+	// CursorMode selects Batch.LastCursor semantics and, under CursorTime,
+	// the live tail's host failover by witnessed time (live.go).
+	CursorMode CursorMode
+	// FailoverHosts are normalized live-tail fallbacks tried after Host
+	// (CursorTime only). Archive replay never uses them.
+	FailoverHosts []string
+	// FailoverRewind is subtracted from witnessed-time resumes that cannot be
+	// proven to land on the same instance.
+	FailoverRewind time.Duration
 }
 
 // recordDecodeMode captures how commit records are materialized, derived from
@@ -310,12 +319,20 @@ func (e *replayEngine) runLiveOnly(ctx context.Context, emitBatch func([]Event) 
 	// instance-local seqs the caller has delivered. Start its dedup floor at zero
 	// and let the first translated event establish the seq resume point.
 	dedupFloor := liveCursorDedupFloor(e.cfg.LiveCursor)
+	cursor := e.cfg.LiveCursor
+	if e.cfg.CursorMode == CursorTime && cursor >= seqspace.CursorSeqMaxThreshold {
+		// A saved witnessed time may come from another instance: rewind it.
+		cursor = rewindTimeCursor(cursor, e.cfg.FailoverRewind)
+	}
 	consumer := newLiveConsumer(liveConfig{
-		host:        e.cfg.Host,
-		zstdDict:    e.fetchZstdDict(liveCtx),
-		refetchDict: e.fetchZstdDict,
-		cursor:      e.cfg.LiveCursor,
-		fromTip:     e.cfg.LiveCursor == 0,
+		host:          e.cfg.Host,
+		failoverHosts: e.cfg.FailoverHosts,
+		timeMode:      e.cfg.CursorMode == CursorTime,
+		rewind:        e.cfg.FailoverRewind,
+		zstdDict:      e.fetchZstdDict(liveCtx, e.cfg.Host),
+		refetchDict:   e.fetchZstdDict,
+		cursor:        cursor,
+		fromTip:       e.cfg.LiveCursor == 0,
 		// Pure-live seq resume: a saved seq means the caller already holds events
 		// through it. Timestamp resumes use the zero floor computed above.
 		dedupFloor: dedupFloor,
@@ -608,7 +625,7 @@ func (e *replayEngine) runBackfillThenLive(ctx context.Context, emitBatch func([
 		// the dedup floor and resume) monotonic non-decreasing, so the matcher-floor
 		// invariant below (resume >= cutover >= prior floor) actually holds.
 		cutover := max(sealedTip, cursor)
-		resume, tailErr := e.tailLiveFromCutover(loopCtx, b, cutover)
+		resume, tailErr := e.tailLiveFromCutover(loopCtx, b, cutover, dl.witnessedFloor())
 		if tailErr == nil {
 			// Clean stop: ctx cancelled or the consumer broke the iterator.
 			break
@@ -678,21 +695,29 @@ func (e *replayEngine) runBackfillThenLive(ctx context.Context, emitBatch func([
 // so the server's inclusive replay of cutover itself is deduped, and the first
 // genuinely-new live event (seq > cutover) passes. No rewind margin is needed —
 // the consumer's seq dedup makes the seam at-least-once with no gap (design §13).
-func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover uint64) (resume uint64, err error) {
+//
+// witnessedFloor is the backfill's highest witnessed_at: under CursorTime it is
+// the resume point if the tail must fail over before delivering anything.
+func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cutover uint64, witnessedFloor int64) (resume uint64, err error) {
 	consumer := newLiveConsumer(liveConfig{
-		host:        e.cfg.Host,
-		zstdDict:    e.fetchZstdDict(ctx),
-		refetchDict: e.fetchZstdDict,
-		cursor:      cutover,
-		dedupFloor:  cutover,
-		collections: e.cfg.Request.Collections,
-		kinds:       e.cfg.Request.Kinds,
-		dids:        e.cfg.Request.DIDs,
-		dial:        e.cfg.Dial,
-		httpClient:  e.cfg.LiveHTTPClient,
-		logger:      e.logger,
-		backoffMin:  e.cfg.LiveBackoffMin,
-		mode:        e.cfg.recordMode(),
+		host:           e.cfg.Host,
+		failoverHosts:  e.cfg.FailoverHosts,
+		timeMode:       e.cfg.CursorMode == CursorTime,
+		rewind:         e.cfg.FailoverRewind,
+		witnessedFloor: witnessedFloor,
+		archiveNS:      true,
+		zstdDict:       e.fetchZstdDict(ctx, e.cfg.Host),
+		refetchDict:    e.fetchZstdDict,
+		cursor:         cutover,
+		dedupFloor:     cutover,
+		collections:    e.cfg.Request.Collections,
+		kinds:          e.cfg.Request.Kinds,
+		dids:           e.cfg.Request.DIDs,
+		dial:           e.cfg.Dial,
+		httpClient:     e.cfg.LiveHTTPClient,
+		logger:         e.logger,
+		backoffMin:     e.cfg.LiveBackoffMin,
+		mode:           e.cfg.recordMode(),
 	})
 	err = consumer.Run(ctx, func(ev *Event, cerr error) bool {
 		if cerr != nil {
@@ -713,14 +738,32 @@ func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cuto
 // when the opt-in is off or the fetch fails: compression is an optimization,
 // so a fetch failure degrades to an uncompressed tail (logged) rather than
 // failing the stream.
-func (e *replayEngine) fetchZstdDict(ctx context.Context) []byte {
+//
+// host selects the instance to ask: dictionaries are per instance, so a live
+// tail that failed over must refetch from the host it is now dialing.
+func (e *replayEngine) fetchZstdDict(ctx context.Context, host string) []byte {
 	if !e.cfg.ZstdCompression {
 		return nil
 	}
-	dict, err := jetstream.JetstreamGetZstdDictionary(ctx, e.cfg.publicClient(), 0)
+	xc := e.cfg.publicClient()
+	if host != e.cfg.Host {
+		pub := xc
+		xc = &xrpc.Client{Host: host, HTTPClient: pub.HTTPClient, UserAgent: pub.UserAgent, Retry: pub.Retry}
+	}
+	dict, err := jetstream.JetstreamGetZstdDictionary(ctx, xc, 0)
 	if err != nil {
-		e.logger.Warn("getZstdDictionary failed; live tail will be uncompressed", "err", err)
+		e.logger.Warn("getZstdDictionary failed; live tail will be uncompressed", "host", host, "err", err)
 		return nil
 	}
 	return dict
+}
+
+// rewindTimeCursor pulls a unix-microsecond cursor back by d without letting
+// it fall into the seq namespace, where the server would misread it.
+func rewindTimeCursor(cursor uint64, d time.Duration) uint64 {
+	back := uint64(d.Microseconds())
+	if cursor < seqspace.CursorSeqMaxThreshold+back {
+		return seqspace.CursorSeqMaxThreshold
+	}
+	return cursor - back
 }

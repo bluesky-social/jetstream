@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
@@ -57,6 +58,23 @@ type downloader struct {
 	segPartSize    int64
 	segStripes     int
 	partRetryDelay time.Duration
+	// maxWitnessed is the highest witnessed_at among decoded blocks, filtered
+	// rows included. Every row at or below the sweep's sealed tip was witnessed
+	// no later than it, so it is a safe witnessed-time resume point for a
+	// CursorTime cutover that has to fail over before any live delivery.
+	maxWitnessed atomic.Int64
+}
+
+// witnessedFloor returns the highest witnessed_at decoded so far (0 if none).
+func (d *downloader) witnessedFloor() int64 { return d.maxWitnessed.Load() }
+
+func (d *downloader) observeWitnessed(us int64) {
+	for {
+		cur := d.maxWitnessed.Load()
+		if us <= cur || d.maxWitnessed.CompareAndSwap(cur, us) {
+			return
+		}
+	}
 }
 
 // setTransform installs the per-block worker-side transform (see downloader.transform).
@@ -644,6 +662,8 @@ func (d *downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]
 	if len(rows) == 0 {
 		return nil, nil
 	}
+	// witnessed_at is monotonic with seq, so the last row carries the block max.
+	d.observeWitnessed(rows[len(rows)-1].WitnessedAt)
 
 	// One Commit slab + one Event slab for the whole block, instead of a separate
 	// *Commit heap allocation per commit row. Each surviving commit takes the next

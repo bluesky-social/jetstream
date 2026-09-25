@@ -10,6 +10,7 @@ func FuzzDecodeLiveFrame(f *testing.F) {
 	// Seed with valid and adversarial shapes.
 	const t0 = "1970-01-01T00:00:00.000001Z"
 	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":1,"did":"did:plc:a","time":"` + t0 + `","rev":"r","operation":"create","collection":"c","rkey":"r","record":{"$type":"app.bsky.feed.post","text":"hi"}}}`))
+	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":1,"did":"did:plc:a","time":"` + t0 + `","witnessedAt":"` + t0 + `","rev":"r","operation":"delete","collection":"c","rkey":"r"}}`))
 	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#info","name":"OutdatedCursor"}}`))
 	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#futureKind","seq":9}}`))
 	f.Add([]byte(`{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","operation":"create","record":{"bad":{"$bytes":"!!"}}}}`))

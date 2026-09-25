@@ -28,6 +28,7 @@ type TypedEvent[T any] struct {
 // TypedBatch is a batch of TypedEvents, mirroring Batch.
 type TypedBatch[T any] struct {
 	events []TypedEvent[T]
+	mode   CursorMode
 }
 
 // Events returns the typed events in this batch. The slice — and any non-nil
@@ -36,16 +37,9 @@ type TypedBatch[T any] struct {
 // on TypedEvents).
 func (b *TypedBatch[T]) Events() []TypedEvent[T] { return b.events }
 
-// LastCursor returns the highest Seq in the batch, suitable for persisting as a
-// resume point. Returns 0 for an empty batch.
+// LastCursor returns the batch's resume point, mirroring Batch.LastCursor.
 func (b *TypedBatch[T]) LastCursor() uint64 {
-	var maxSeq uint64
-	for i := range b.events {
-		if b.events[i].Event.Seq > maxSeq {
-			maxSeq = b.events[i].Event.Seq
-		}
-	}
-	return maxSeq
+	return lastCursor(b.events, b.mode, func(ev *TypedEvent[T]) *Event { return &ev.Event })
 }
 
 // TypedEvents decodes a Client's records as T through PT.UnmarshalCBOR. T is
@@ -100,7 +94,7 @@ func TypedEvents[T any, PT interface {
 				}
 				continue
 			}
-			if !yield(assembleTyped[T, PT](batch.Events(), collection), nil) {
+			if !yield(assembleTyped[T, PT](batch.Events(), collection, batch.mode), nil) {
 				return
 			}
 		}
@@ -127,6 +121,7 @@ func typedRun[T any, PT interface {
 	// before refactoring.
 	stopped := false
 	size := max(re.cfg.BatchSize, 1)
+	mode := re.cfg.CursorMode
 	bf := backfillSink{
 		transform: func(_ int, evs []Event) any {
 			if len(evs) == 0 {
@@ -136,7 +131,7 @@ func typedRun[T any, PT interface {
 			// expose BatchSize-bounded views over that backing storage. Building each
 			// chunk independently would allocate two slabs per chunk (commonly 64
 			// times per block), which is visible in GC and throughput at archive scale.
-			block := assembleTyped[T, PT](evs, collection)
+			block := assembleTyped[T, PT](evs, collection, mode)
 			// Ceiling division written overflow-safe: len(evs) >= 1 here, and
 			// (len(evs)+size-1) would wrap negative for a huge WithBatchSize,
 			// panicking make (recovered into a dropped block).
@@ -146,7 +141,7 @@ func typedRun[T any, PT interface {
 				// Three-index slice: chunks share the block slab and Events() hands
 				// the slice to the consumer, so cap must not extend into the next
 				// batch's events (an append would overwrite them).
-				batches = append(batches, TypedBatch[T]{events: block.events[i:end:end]})
+				batches = append(batches, TypedBatch[T]{events: block.events[i:end:end], mode: mode})
 			}
 			return batches
 		},
@@ -173,7 +168,7 @@ func typedRun[T any, PT interface {
 		if stopped {
 			return false
 		}
-		if !yield(assembleTyped[T, PT](batch, collection), nil) {
+		if !yield(assembleTyped[T, PT](batch, collection, mode), nil) {
 			stopped = true
 			return false
 		}
@@ -199,7 +194,7 @@ func typedRun[T any, PT interface {
 func assembleTyped[T any, PT interface {
 	*T
 	UnmarshalCBOR([]byte) error
-}](src []Event, collection string) *TypedBatch[T] {
+}](src []Event, collection string, mode CursorMode) *TypedBatch[T] {
 	out := make([]TypedEvent[T], len(src))
 	// One records slab per batch, presized and indexed by a counter so the
 	// &records[i] handed to each TypedEvent stays stable (never grown). It is
@@ -222,7 +217,7 @@ func assembleTyped[T any, PT interface {
 		}
 		out[i] = te
 	}
-	return &TypedBatch[T]{events: out}
+	return &TypedBatch[T]{events: out, mode: mode}
 }
 
 // decodable reports whether ev is a create/update commit of the requested

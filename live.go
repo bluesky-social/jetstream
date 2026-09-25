@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/internal/zstddict"
 	"github.com/coder/websocket"
 	"github.com/klauspost/compress/zstd"
@@ -43,6 +44,23 @@ type dialFunc func(ctx context.Context, url string) (wsConn, error)
 // liveConfig configures a liveConsumer.
 type liveConfig struct {
 	host string // normalized base URL, e.g. "https://host"
+	// failoverHosts are normalized fallbacks tried round-robin after host when
+	// a dial fails. Honored only under timeMode: a seq cursor means nothing on
+	// another instance.
+	failoverHosts []string
+	// timeMode enables witnessed-time resume across seq namespaces: a seq
+	// cursor is only valid on the host that assigned it, so a reconnect that
+	// fails over to another host resumes at lastWitnessed-rewind instead of
+	// lastSeq.
+	timeMode bool
+	rewind   time.Duration
+	// witnessedFloor seeds lastWitnessed: the highest witnessed_at the caller
+	// already holds (the backfill's), so a failover before the first live
+	// delivery still has a time to resume from.
+	witnessedFloor int64
+	// archiveNS marks dedupFloor as a seq in the primary's archive namespace,
+	// the only namespace a CursorTooOld may send back to a re-backfill.
+	archiveNS bool
 	// cursor is the initial WIRE resume point sent as ?cursor= on the first
 	// connection: either a seq or a legacy unix-microsecond timestamp. cursor=0
 	// means "replay from the beginning" (everything, since the first real event
@@ -88,9 +106,10 @@ type liveConfig struct {
 	// refetchDict, when non-nil, re-fetches the server's CURRENT dictionary
 	// after the server rejects the pinned ID (a dictionary rotation: retrain
 	// + redeploy changes DictionaryV2ID while this consumer holds the old
-	// blob). nil disables in-place recovery; the consumer then degrades to
+	// blob). host is the instance being dialed, since dictionaries are per
+	// instance. nil disables in-place recovery; the consumer then degrades to
 	// an uncompressed tail on rejection. See refreshDict.
-	refetchDict func(ctx context.Context) []byte
+	refetchDict func(ctx context.Context, host string) []byte
 }
 
 func (c liveConfig) minBackoff() time.Duration {
@@ -122,6 +141,22 @@ type liveConsumer struct {
 	// replay-from-0 start.
 	lastSeq uint64
 	seenAny bool
+	// delivered counts emitted events; a change across a session means it made
+	// progress (lastSeq cannot say so once a failover resets it).
+	delivered uint64
+
+	// Failover state, used only under cfg.timeMode. hosts[0] is cfg.host.
+	// hasSeqPos means lastSeq (or the configured seq start) is a usable
+	// position in the namespace of hosts[nsHost]. lastWitnessed is the
+	// witnessed_at of the latest delivery, the resume point once the
+	// namespace is abandoned.
+	hosts         []string
+	hostIdx       int
+	hasSeqPos     bool
+	nsHost        int
+	archiveNS     bool
+	lastWitnessed int64
+	warnedStuck   bool
 
 	// zstd decompression state, set only when cfg.zstdDict is non-nil.
 	zstdDictID  uint32
@@ -176,7 +211,16 @@ func newLiveConsumer(cfg liveConfig) *liveConsumer {
 	// through seq) drops the at-least-once re-delivery of seq itself. seenAny
 	// stays false until the first delivery so reconnect knows whether to omit the
 	// wire cursor (from-tip) or resume. See liveConfig.dedupFloor.
-	return &liveConsumer{cfg: cfg, lastSeq: cfg.dedupFloor, zstdDictID: dictID, zstdDecoder: dec}
+	return &liveConsumer{
+		cfg:           cfg,
+		lastSeq:       cfg.dedupFloor,
+		zstdDictID:    dictID,
+		zstdDecoder:   dec,
+		hosts:         append([]string{cfg.host}, cfg.failoverHosts...),
+		hasSeqPos:     !cfg.fromTip && cfg.cursor < seqspace.CursorSeqMaxThreshold,
+		archiveNS:     cfg.archiveNS,
+		lastWitnessed: cfg.witnessedFloor,
+	}
 }
 
 // Run tails the live stream until ctx is cancelled, invoking emit for each
@@ -200,7 +244,7 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) e
 		if ctx.Err() != nil {
 			return nil //nolint:nilerr // context cancellation is a clean shutdown, not an error
 		}
-		seqBefore := c.lastSeq
+		deliveredBefore := c.delivered
 		err := c.session(ctx, emit)
 		if ctx.Err() != nil {
 			return nil //nolint:nilerr // ctx cancelled mid-session: clean shutdown, the session err is incidental
@@ -214,8 +258,19 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) e
 		// durably-processed seq (design §14 client side) instead of churning
 		// reconnects against a cursor the server will keep rejecting. This covers
 		// both the terminal handoff connect and a mid-stream fell-off-live drop.
-		if errors.Is(err, errLiveCursorTooOld) || errors.Is(err, errLiveInvalidRequest) {
+		//
+		// Off the archive namespace (time mode) a re-backfill would sweep from a
+		// foreign seq, so leaveTooOldNamespace switches to a witnessed-time
+		// resume instead and the loop reconnects.
+		tooOld := errors.Is(err, errLiveCursorTooOld)
+		if tooOld && c.leaveTooOldNamespace() {
+			err = fmt.Errorf("%w; resuming by witnessed time", err)
+		} else if tooOld || errors.Is(err, errLiveInvalidRequest) {
 			return err
+		}
+		var dialErr *liveDialError
+		if errors.As(err, &dialErr) && !errors.Is(err, errLiveDictRejected) && !tooOld {
+			c.rotateHost()
 		}
 		// A dict-rejected pre-upgrade 400 means the server rotated its
 		// dictionary out from under us. Unlike a too-old
@@ -227,10 +282,8 @@ func (c *liveConsumer) Run(ctx context.Context, emit func(*Event, error) bool) e
 		}
 		// A session that made progress (delivered new events) is healthy; reset
 		// backoff so a long-lived connection that finally drops reconnects
-		// promptly rather than at the accumulated max. lastSeq advances
-		// monotonically (strictly increasing on each delivery), so any change
-		// means the session delivered at least one new event.
-		if c.lastSeq != seqBefore {
+		// promptly rather than at the accumulated max.
+		if c.delivered != deliveredBefore {
 			backoff = minB
 		}
 		// Report the disconnect and back off before reconnecting.
@@ -250,12 +303,16 @@ var errEmitStop = errors.New("jetstream: live emit stop")
 // session runs one connection: dial, read-decode-emit until an error or stop.
 // A successful read resets the caller's backoff via the return path (nil err).
 func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) bool) error {
-	conn, err := c.cfg.dial(ctx, c.subscribeURL())
+	rawURL, seqResume := c.planSession()
+	conn, err := c.cfg.dial(ctx, rawURL)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return &liveDialError{err: err}
 	}
 	conn.SetReadLimit(c.cfg.readLimit)
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "client closing") }()
+	if c.cfg.timeMode && !seqResume {
+		c.adoptNamespace()
+	}
 
 	for {
 		typ, data, err := conn.Read(ctx)
@@ -285,6 +342,13 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 				// resume, or a future advisory). Not an event: no seq, no
 				// cursor advance. Operator-relevant, so log it.
 				c.cfg.logger.Info("live stream info frame", "name", info.Name, "message", info.Message)
+				// A clamped time resume may have skipped events; a time-mode
+				// caller relies on that resume being gapless, so tell it.
+				if c.cfg.timeMode && info.Name == infoNameOutdatedCursor {
+					if !emit(nil, fmt.Errorf("%w: %s", ErrCursorClamped, info.Message)) {
+						return errEmitStop
+					}
+				}
 			}
 			continue
 		}
@@ -313,6 +377,11 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 		}
 		c.lastSeq = ev.Seq
 		c.seenAny = true
+		c.delivered++
+		c.hasSeqPos = true
+		if ev.WitnessedAtUS > 0 {
+			c.lastWitnessed = ev.WitnessedAtUS
+		}
 		evCopy := ev
 		if !emit(&evCopy, nil) {
 			return errEmitStop
@@ -346,7 +415,7 @@ func (c *liveConsumer) refreshDict(ctx context.Context) {
 	}
 	rejected := c.zstdDictID
 	if c.cfg.refetchDict != nil {
-		if blob := c.cfg.refetchDict(ctx); blob != nil {
+		if blob := c.cfg.refetchDict(ctx, c.hosts[c.hostIdx]); blob != nil {
 			if id, perr := zstddict.ParseID(blob); perr == nil && id != rejected {
 				if d, derr := newZstdDecoder(blob, c.cfg.readLimit); derr == nil {
 					c.zstdDecoder.Close()
@@ -366,8 +435,107 @@ func (c *liveConsumer) refreshDict(ctx context.Context) {
 		"rejected_id", rejected)
 }
 
+// planSession picks the URL for the next session. seqResume reports that it
+// resumes the current seq namespace (the host that assigned lastSeq).
+func (c *liveConsumer) planSession() (rawURL string, seqResume bool) {
+	if !c.cfg.timeMode {
+		return c.subscribeURL(), false
+	}
+	ts, omit, canLeave := c.resumeTS()
+	if c.hasSeqPos && c.hostIdx != c.nsHost && !canLeave {
+		// Nothing to resume from elsewhere; the seq position is all we have.
+		c.hostIdx = c.nsHost
+	}
+	if (c.hasSeqPos && c.hostIdx == c.nsHost) || !canLeave {
+		return c.subscribeURL(), true
+	}
+	return c.buildURL(c.hosts[c.hostIdx], ts, !omit), false
+}
+
+// resumeTS returns the wire cursor for a session that leaves the current seq
+// namespace, or ok=false if there is no position to leave with (nothing
+// delivered carried witnessedAt, e.g. an older server). omit means "start at
+// the live tip" for a from-tip start that has delivered nothing.
+func (c *liveConsumer) resumeTS() (cursor uint64, omit, ok bool) {
+	switch {
+	case c.lastWitnessed > 0:
+		// Instances witness independently, so the same event's witnessed_at
+		// differs across hosts; the rewind absorbs that skew.
+		return rewindTimeCursor(uint64(c.lastWitnessed), c.cfg.rewind), false, true
+	case !c.seenAny && c.cfg.fromTip:
+		return 0, true, true
+	case !c.seenAny && c.cfg.cursor >= seqspace.CursorSeqMaxThreshold:
+		return c.cfg.cursor, false, true // already rewound by the engine
+	}
+	return 0, false, false
+}
+
+// adoptNamespace makes the current host's seq namespace the consumer's after
+// a witnessed-time resume. The overlap from the rewind is re-delivered
+// (at-least-once): the old lastSeq is meaningless here and would drop events
+// if this host's seqs are lower.
+func (c *liveConsumer) adoptNamespace() {
+	c.nsHost = c.hostIdx
+	c.archiveNS = false
+	c.lastSeq = 0
+}
+
+// leaveTooOldNamespace reports whether a CursorTooOld should be answered by a
+// witnessed-time resume rather than returned for a re-backfill. Re-backfill
+// is only valid when the rejected seq is in the archive's namespace.
+func (c *liveConsumer) leaveTooOldNamespace() bool {
+	if !c.cfg.timeMode || c.archiveNS {
+		return false
+	}
+	if _, _, ok := c.resumeTS(); !ok {
+		return false
+	}
+	c.hasSeqPos = false
+	return true
+}
+
+// rotateHost moves to the next host after a failed dial, if leaving the
+// current seq namespace is possible.
+func (c *liveConsumer) rotateHost() {
+	if !c.cfg.timeMode || len(c.hosts) < 2 {
+		return
+	}
+	if _, _, ok := c.resumeTS(); c.hasSeqPos && !ok {
+		c.warnStuck("live tail cannot fail over: no witnessed time to resume from yet")
+		return
+	}
+	c.hostIdx = (c.hostIdx + 1) % len(c.hosts)
+}
+
+func (c *liveConsumer) warnStuck(msg string) {
+	if c.warnedStuck {
+		return
+	}
+	c.warnedStuck = true
+	c.cfg.logger.Warn(msg, "host", c.hosts[c.hostIdx])
+}
+
+// subscribeURL builds the seq-resume URL for the current host.
 func (c *liveConsumer) subscribeURL() string {
-	u, _ := url.Parse(c.cfg.host) // host is pre-normalized by the caller
+	// Wire cursor: once any event has been delivered, resume each new session at
+	// lastSeq (the highest seq delivered). subscribeURL is rebuilt on every
+	// reconnect, so anchoring at lastSeq is what keeps a stream from re-anchoring
+	// at the reconnect-time tip and silently dropping events produced while
+	// disconnected. Before any delivery we use the configured start: omit the
+	// param when fromTip (the WithLiveCursor(0) "live from tip" contract),
+	// otherwise send cursor=cfg.cursor (cursor=0 replays from the beginning).
+	host := c.hosts[c.hostIdx]
+	switch {
+	case c.seenAny:
+		return c.buildURL(host, c.lastSeq, true)
+	case !c.cfg.fromTip:
+		return c.buildURL(host, c.cfg.cursor, true)
+	}
+	return c.buildURL(host, 0, false)
+}
+
+func (c *liveConsumer) buildURL(host string, cursor uint64, withCursor bool) string {
+	u, _ := url.Parse(host) // hosts are pre-normalized by the caller
 	switch u.Scheme {
 	case "http":
 		u.Scheme = "ws"
@@ -376,18 +544,8 @@ func (c *liveConsumer) subscribeURL() string {
 	}
 	u.Path = "/xrpc/" + subscribeNSID
 	q := url.Values{}
-	// Wire cursor: once any event has been delivered, resume each new session at
-	// lastSeq (the highest seq delivered). subscribeURL is rebuilt on every
-	// reconnect, so anchoring at lastSeq is what keeps a stream from re-anchoring
-	// at the reconnect-time tip and silently dropping events produced while
-	// disconnected. Before any delivery we use the configured start: omit the
-	// param when fromTip (the WithLiveCursor(0) "live from tip" contract),
-	// otherwise send cursor=cfg.cursor (cursor=0 replays from the beginning).
-	switch {
-	case c.seenAny:
-		q.Set("cursor", strconv.FormatUint(c.lastSeq, 10))
-	case !c.cfg.fromTip:
-		q.Set("cursor", strconv.FormatUint(c.cfg.cursor, 10))
+	if withCursor {
+		q.Set("cursor", strconv.FormatUint(cursor, 10))
 	}
 	// Forward the caller's filters server-side. The server reads each
 	// collection/DID as its own repeated param, so append (not Set) one
@@ -466,10 +624,18 @@ var errLiveDictRejected = errors.New("jetstream: live zstd dictionary rejected")
 // cross-package contract test (live_subscribe_contract_test.go) pins the
 // two ends against the real handler so a drift fails CI.
 const (
+	infoNameOutdatedCursor = "OutdatedCursor"
 	errNameCursorTooOld    = "CursorTooOld"
 	errNameUnknownZstdDict = "UnknownZstdDictionary"
 	errNameInvalidRequest  = "InvalidRequest"
 )
+
+// liveDialError marks a session that failed before a connection existed, the
+// only failure that moves the consumer to the next failover host.
+type liveDialError struct{ err error }
+
+func (e *liveDialError) Error() string { return "dial: " + e.err.Error() }
+func (e *liveDialError) Unwrap() error { return e.err }
 
 // dialWebsocket is the production dialer. hc, when non-nil, routes the HTTP/1.1
 // upgrade through a custom transport (e.g. an in-process pipe); nil uses the

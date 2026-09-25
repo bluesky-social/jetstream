@@ -34,9 +34,10 @@ func decodeSegmentEvent(ev *segment.Event) (Event, error) {
 // mode is forwarded to decodeCommitInto (raw vs. map record materialization).
 func decodeSegmentEventInto(ev *segment.Event, commit *Commit, mode recordDecodeMode) (Event, error) {
 	out := Event{
-		DID:    ev.DID,
-		Seq:    ev.Seq,
-		TimeUS: ev.DisplayTimeUS(),
+		DID:           ev.DID,
+		Seq:           ev.Seq,
+		TimeUS:        ev.DisplayTimeUS(),
+		WitnessedAtUS: ev.WitnessedAt,
 	}
 	switch ev.Kind {
 	case segment.KindCreate, segment.KindUpdate, segment.KindDelete, segment.KindCreateResync:

@@ -45,8 +45,17 @@ type Event struct {
 	// epoch: the operator-imported indexed_at value if one was set, otherwise
 	// the witnessed_at time Jetstream first saw the event. It is not the
 	// record's client-supplied createdAt. Absent any timestamp import, this
-	// is simply the server's ingest (witnessed) time.
+	// is simply the server's ingest (witnessed) time. Do not use it as a
+	// resume cursor; use WitnessedAtUS.
 	TimeUS int64 `json:"time_us"`
+
+	// WitnessedAtUS is when the serving Jetstream instance first saw the
+	// event, microseconds since the Unix epoch. It is never altered by
+	// timestamp imports and is monotonic with Seq on one instance, so it is
+	// the value a timestamp cursor resumes from (see WithCursorMode). Across
+	// instances it is approximate: each instance witnesses events on its own
+	// clock. Zero when the server predates the field.
+	WitnessedAtUS int64 `json:"witnessed_at_us,omitempty"`
 
 	// Kind selects which of the payload pointers below is populated.
 	Kind Kind `json:"kind"`

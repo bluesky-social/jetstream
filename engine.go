@@ -58,6 +58,9 @@ func newEngine(host string, cfg config) engine {
 		RawRecordsCopied: cfg.rawRecordsCopied,
 		RawRecordCIDs:    cfg.rawRecordCIDs,
 		ZstdCompression:  cfg.zstdCompression,
+		CursorMode:       cfg.cursorMode,
+		FailoverHosts:    cfg.failoverHosts,
+		FailoverRewind:   cfg.failoverRewind,
 	}
 	return newReplayEngine(ec)
 }
@@ -126,6 +129,7 @@ func (e *replayEngine) run(ctx context.Context, yield func(*Batch, error) bool) 
 	// backfill Emit. Transform never touches stopped. If these phases
 	// overlap in future, stopped must become atomic.
 	size := max(e.cfg.BatchSize, 1)
+	mode := e.cfg.CursorMode
 	bf := backfillSink{
 		transform: func(_ int, evs []Event) any {
 			if len(evs) == 0 {
@@ -144,7 +148,7 @@ func (e *replayEngine) run(ctx context.Context, yield func(*Batch, error) bool) 
 				// Three-index slice: batches share the block's backing array, and
 				// Events() hands the slice to the consumer, so cap must not extend
 				// into the next batch's events (an append would overwrite them).
-				batches = append(batches, &Batch{events: evs[i:end:end]})
+				batches = append(batches, &Batch{events: evs[i:end:end], mode: mode})
 			}
 			return batches
 		},
@@ -176,7 +180,7 @@ func (e *replayEngine) run(ctx context.Context, yield func(*Batch, error) bool) 
 			if stopped {
 				return false
 			}
-			b := &Batch{events: batch}
+			b := &Batch{events: batch, mode: mode}
 			if !yield(b, nil) {
 				stopped = true
 				return false

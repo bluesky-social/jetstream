@@ -161,7 +161,8 @@ the client matcher remains the correctness backstop),
 **Reconnect resume**: after any delivery, reconnects send
 `cursor=lastSeq` (re-anchoring at the tip would gap); `seenAny`
 disambiguates "from-tip, nothing yet" (keep omitting the cursor) from a
-real resume.
+real resume. Under `CursorTime` a reconnect to a different host replaces
+the seq resume with a witnessed-time resume; see "Cursor modes & failover".
 
 **Too-old cursor (§14)**: a seq cursor below the server's lookback floor
 is a pre-upgrade HTTP 400 whose XRPC error envelope names `CursorTooOld`
@@ -187,6 +188,47 @@ that split for one reason: a seq cursor is also the initial dedup floor, while a
 timestamp is only a server-side seek position and starts with no seq dedup
 floor. Once the first timestamp-resumed event arrives, reconnects use its real
 seq. Clients must not fabricate cursors near the namespace boundary.
+
+## Cursor modes & failover
+
+A seq only means something on the instance that assigned it. Callers that
+want to move between instances choose `WithCursorMode(CursorTime)`:
+`Batch.LastCursor` then returns the max `Event.WitnessedAtUS` (the
+`witnessedAt` frame field, or the segment's `witnessed_at` on backfill)
+instead of the max seq, and `WithFailoverHosts` becomes legal (it is
+rejected under `CursorSeq`). Backfill (`planSnapshot`/`getSegment`) stays
+seq-only and primary-only; the mode only changes the live tail.
+
+A seq namespace is identified by the configured hostname that assigned it.
+The consumer (`live.go`) tracks which host `lastSeq` came from (`nsHost`)
+and the latest delivered `lastWitnessed` (seeded from the backfill's max
+witnessed_at at cutover):
+
+- **Same host**: resume by `cursor=lastSeq`, exact, seq-deduped.
+- **Different host** (only reached by failover): resume at
+  `lastWitnessed - WithFailoverRewind` (default 5s), and that host becomes
+  the namespace (`adoptNamespace`). `lastSeq` resets to 0 because the new
+  namespace's seqs may be lower; the rewind overlap is re-delivered
+  (at-least-once, no dedup is possible across namespaces). Failing back to
+  the primary is also a time resume.
+- **Dial failure** (transport/5xx, not a classified 400): rotate round-robin
+  to the next host. A read error after a connected session retries the same
+  host.
+- **No witnessed time** (nothing delivered carried `witnessedAt`, e.g. an
+  old server, and the start was a seq): leaving is impossible, so the
+  consumer stays on its seq namespace and warns once.
+- **CursorTooOld** re-enters backfill only while `lastSeq` is provably in the
+  archive's namespace (`archiveNS`: the seq came from the primary's archive
+  and the consumer has never failed away); otherwise it resumes by witnessed
+  time. A foreign seq must never
+  drive an archive sweep.
+- A time resume that the server clamps (`#info OutdatedCursor`) surfaces as
+  the recoverable `ErrCursorClamped`: the caller may have a gap.
+
+Failover by time is approximate: instances witness the same event at
+slightly different times, so the rewind must cover the skew between them.
+Hostname matching assumes each configured host is one instance; a name that
+load-balances across instances breaks seq resume (see `specs/gotchas.md`).
 
 ## Compression (dict-zstd)
 
@@ -246,7 +288,9 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
   `WithSnapshotOnly` — a live tail with an upper bound would silently
   drop every later live event). Pure live: `WithLiveCursor` (0 = from
   the current tip; values below `1e15` are saved seqs; values at or above it
-  are legacy unix-microsecond timestamp seek positions).
+  are legacy unix-microsecond timestamp seek positions). Cursor style:
+  `WithCursorMode` (`CursorSeq` default, `CursorTime` for portable
+  witnessed-time cursors), `WithFailoverHosts`, `WithFailoverRewind`.
 - Filters: `WithKinds`, `WithCollections` (exact or `ns.*`), `WithDIDs`.
   Subscribe validates, deduplicates, and canonicalizes all three axes once,
   then forwards the same immutable predicate to every plan page and live
@@ -270,7 +314,8 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
 ## Events
 
 One `Event` struct regardless of origin (archive or live): `Seq`, `DID`,
-`TimeUS`, `Kind` (`commit`/`identity`/`account`/`sync`), with the matching
+`TimeUS` (display time; never a cursor), `WitnessedAtUS` (the portable
+timestamp cursor; 0 from servers that predate `witnessedAt`), `Kind` (`commit`/`identity`/`account`/`sync`), with the matching
 sub-struct populated. Commits carry `Record` (generic map; nil in raw
 mode), `RecordCBOR` (segment bytes on backfill; canonical DRISL encoding
 reconstructed from JSON on live), and `CID`. `#sync` events are delivered

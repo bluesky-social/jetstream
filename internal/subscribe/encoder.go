@@ -81,10 +81,11 @@ func EncodeV2(evt *segment.Event) ([]byte, error) {
 			return nil, fmt.Errorf("subscribe: decode identity: %w", err)
 		}
 		msg.JetstreamSubscribeEvents_Identity = gt.SomeRef(jetstream.JetstreamSubscribeEvents_Identity{
-			Seq:      int64(evt.Seq),
-			DID:      evt.DID,
-			Time:     wireTime(evt.DisplayTimeUS()),
-			Identity: id,
+			Seq:         int64(evt.Seq),
+			DID:         evt.DID,
+			Time:        wireTime(evt.DisplayTimeUS()),
+			WitnessedAt: gt.Some(wireTime(evt.WitnessedAt)),
+			Identity:    id,
 		})
 	case segment.KindAccount:
 		var acct comatproto.SyncSubscribeRepos_Account
@@ -92,10 +93,11 @@ func EncodeV2(evt *segment.Event) ([]byte, error) {
 			return nil, fmt.Errorf("subscribe: decode account: %w", err)
 		}
 		msg.JetstreamSubscribeEvents_Account = gt.SomeRef(jetstream.JetstreamSubscribeEvents_Account{
-			Seq:     int64(evt.Seq),
-			DID:     evt.DID,
-			Time:    wireTime(evt.DisplayTimeUS()),
-			Account: acct,
+			Seq:         int64(evt.Seq),
+			DID:         evt.DID,
+			Time:        wireTime(evt.DisplayTimeUS()),
+			WitnessedAt: gt.Some(wireTime(evt.WitnessedAt)),
+			Account:     acct,
 		})
 	case segment.KindSync:
 		var sync comatproto.SyncSubscribeRepos_Sync
@@ -103,10 +105,11 @@ func EncodeV2(evt *segment.Event) ([]byte, error) {
 			return nil, fmt.Errorf("subscribe: decode sync: %w", err)
 		}
 		msg.JetstreamSubscribeEvents_Sync = gt.SomeRef(jetstream.JetstreamSubscribeEvents_Sync{
-			Seq:  int64(evt.Seq),
-			DID:  evt.DID,
-			Time: wireTime(evt.DisplayTimeUS()),
-			Sync: sync,
+			Seq:         int64(evt.Seq),
+			DID:         evt.DID,
+			Time:        wireTime(evt.DisplayTimeUS()),
+			WitnessedAt: gt.Some(wireTime(evt.WitnessedAt)),
+			Sync:        sync,
 		})
 	default:
 		return nil, fmt.Errorf("subscribe: unknown event kind %d", evt.Kind)
@@ -124,13 +127,14 @@ func EncodeV2(evt *segment.Event) ([]byte, error) {
 // v2Commit builds the generated #commit payload from a commit-kind event.
 func v2Commit(evt *segment.Event) (jetstream.JetstreamSubscribeEvents_Commit, error) {
 	commit := jetstream.JetstreamSubscribeEvents_Commit{
-		Seq:        int64(evt.Seq),
-		DID:        evt.DID,
-		Time:       wireTime(evt.DisplayTimeUS()),
-		Rev:        evt.Rev,
-		Operation:  commitOpString(evt.Kind),
-		Collection: evt.Collection,
-		Rkey:       evt.Rkey,
+		Seq:         int64(evt.Seq),
+		DID:         evt.DID,
+		Time:        wireTime(evt.DisplayTimeUS()),
+		WitnessedAt: gt.Some(wireTime(evt.WitnessedAt)),
+		Rev:         evt.Rev,
+		Operation:   commitOpString(evt.Kind),
+		Collection:  evt.Collection,
+		Rkey:        evt.Rkey,
 	}
 
 	if evt.Kind != segment.KindDelete {

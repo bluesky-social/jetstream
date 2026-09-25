@@ -34,6 +34,7 @@ type Client struct {
 // batch, then save LastCursor to your database of choice once.
 type Batch struct {
 	events []Event
+	mode   CursorMode
 }
 
 // Events returns the events in this batch. The slice is owned by the caller
@@ -41,16 +42,26 @@ type Batch struct {
 // iteration without copying.
 func (b *Batch) Events() []Event { return b.events }
 
-// LastCursor returns the highest Seq in the batch, suitable for persisting as
-// a resume point. Returns 0 for an empty batch.
+// LastCursor returns the batch's resume point, suitable for persisting and
+// passing back via WithLiveCursor (or WithAfterSeq in seq mode): the highest
+// Seq, or under WithCursorMode(CursorTime) the highest WitnessedAtUS. Returns 0
+// for an empty batch.
 func (b *Batch) LastCursor() uint64 {
-	var max uint64
-	for i := range b.events {
-		if b.events[i].Seq > max {
-			max = b.events[i].Seq
+	return lastCursor(b.events, b.mode, func(ev *Event) *Event { return ev })
+}
+
+// lastCursor is the shared LastCursor body for Batch and TypedBatch.
+func lastCursor[E any](events []E, mode CursorMode, event func(*E) *Event) uint64 {
+	var hi uint64
+	for i := range events {
+		ev := event(&events[i])
+		v := ev.Seq
+		if mode == CursorTime {
+			v = uint64(max(ev.WitnessedAtUS, 0))
 		}
+		hi = max(hi, v)
 	}
-	return max
+	return hi
 }
 
 // Stats is a point-in-time snapshot of replay-loop progress, returned by
@@ -273,6 +284,24 @@ func validateConfig(c *config) error {
 	// inclusive beforeSeq. The live cutover tail reuses that same matcher, so a
 	// A live tail with beforeSeq would keep running while filtering every
 	// newer event. Require a bounded snapshot instead.
+	switch c.cursorMode {
+	case CursorSeq, CursorTime:
+	default:
+		return fmt.Errorf("jetstream: invalid cursor mode %d", c.cursorMode)
+	}
+	if c.failoverRewind < 0 {
+		return fmt.Errorf("jetstream: failover rewind must be >= 0, got %s", c.failoverRewind)
+	}
+	if len(c.failoverHosts) > 0 && c.cursorMode != CursorTime {
+		return fmt.Errorf("jetstream: WithFailoverHosts requires WithCursorMode(CursorTime) (seq cursors are instance-local)")
+	}
+	for i, h := range c.failoverHosts {
+		norm, err := normalizeHost(h)
+		if err != nil {
+			return fmt.Errorf("jetstream: failover host %q: %w", h, err)
+		}
+		c.failoverHosts[i] = norm
+	}
 	if c.hasBeforeSeq && !c.snapshotOnly {
 		return fmt.Errorf("jetstream: WithBeforeSeq requires WithSnapshotOnly (beforeSeq is an archive-snapshot upper bound; on a replay that continues live it would silently drop every later event)")
 	}
