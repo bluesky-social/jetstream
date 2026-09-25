@@ -55,6 +55,17 @@ just run serve
 
 The simulator and production recipes use separate data directories.
 
+The disaggregated storage backend (in development) needs PostgreSQL and an S3-compatible object store. `just up` starts PostgreSQL, SeaweedFS, and MinIO in Docker (see `compose.yaml`), waits until they are healthy, and prints connection details:
+
+```sh
+just up       # start (idempotent); prints URLs and dev credentials
+just psql     # psql on the dev database
+just down     # stop and delete everything
+just down up  # reset to empty
+```
+
+The environment keeps no state. All data lives in tmpfs, so `just down` discards every table and object. Ports bind to `127.0.0.1` only (Postgres 15432, SeaweedFS 18333, MinIO 19000, MinIO console 19001). To remap them, use a gitignored `compose.override.yaml`. The app credentials only have PutObject, GetObject, and DeleteObject on the `jetstream` bucket, which is all production grants. `just up` verifies this on every run.
+
 To fully reset your local environment (warning: destructive action!):
 
 ```sh

@@ -75,6 +75,43 @@ clean:
     rm -rf bin
     rm -rf data*
 
+# Start the local dev dependencies (PostgreSQL, SeaweedFS, MinIO; see
+# compose.yaml) and wait until they are healthy and provisioned. Idempotent.
+# All state lives in tmpfs, so `just down` discards it; `just down up` resets.
+up:
+    docker compose up --detach --wait --wait-timeout 120 --remove-orphans --quiet-pull postgres seaweedfs minio
+    @# One-shot provisioning runs via `run` so its exit status gates this
+    @# recipe; `up --wait` does not wait for or check one-shot containers.
+    docker compose run --rm --quiet-pull s3-init
+    @echo
+    @echo "postgres   postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable"
+    @echo "           read-only: postgres://jetstream_reader:jetstream_reader@127.0.0.1:15432/jetstream?sslmode=disable"
+    @echo "seaweedfs  http://127.0.0.1:18333 (path-style)"
+    @echo "minio      http://127.0.0.1:19000 (path-style); console http://127.0.0.1:19001 (admin / admin-dev-secret)"
+    @echo "s3         bucket=jetstream AWS_ACCESS_KEY_ID=jetstream AWS_SECRET_ACCESS_KEY=jetstream-dev-secret AWS_REGION=us-east-1"
+
+# Stop the local dev dependencies and delete their containers, networks, and
+# volumes. Fails if anything from the compose project survives.
+down:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Every data dir is a tmpfs, so there is nothing to shut down gracefully.
+    docker compose down --volumes --remove-orphans --timeout 1
+    # Must match `name:` in compose.yaml.
+    filter="label=com.docker.compose.project=jetstream-dev"
+    leftover="$(docker ps -aq --filter "${filter}"; docker volume ls -q --filter "${filter}"; docker network ls -q --filter "${filter}")"
+    if [[ -n "${leftover}" ]]; then
+        echo "down: resources survived docker compose down:" >&2
+        echo "${leftover}" >&2
+        exit 1
+    fi
+
+# Open psql on the dev database as the application role (`just up` first).
+# Arguments pass through, e.g. `just psql -c 'select 1'`.
+[positional-arguments]
+psql *ARGS:
+    docker compose exec postgres psql -U jetstream -d jetstream "$@"
+
 # Run jetstream against the local simulator (default).
 # Picks up JETSTREAM_RELAY_URL and JETSTREAM_PLC_URL from .env.
 run *ARGS:

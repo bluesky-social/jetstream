@@ -54,3 +54,7 @@ oracle-artifacts/
 
 # direnv
 .direnv/
+
+# Personal overrides for compose.yaml (for example remapped ports). Compose
+# merges this file automatically.
+/compose.override.yaml

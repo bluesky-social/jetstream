@@ -1,0 +1,114 @@
+# Local development dependencies for disaggregated storage: PostgreSQL plus
+# two S3-compatible object stores (SeaweedFS and MinIO). Use `just up` and
+# `just down` rather than invoking compose directly.
+#
+# The environment is ephemeral by design. Every data directory is a tmpfs, so
+# `just down` (or a Docker restart) discards all state, and the next `just up`
+# starts from an empty cluster and empty buckets. Nothing here may use a named
+# volume or a writable bind mount.
+#
+# Credentials below are fixed dev-only values, not secrets. Ports are bound to
+# 127.0.0.1 only. To remap a port locally, put overrides in the gitignored
+# compose.override.yaml, which compose merges automatically.
+#
+# Images are pinned by digest. MinIO no longer publishes community images; the
+# pgsty/minio fork is a drop-in build of the same server.
+
+# The justfile's `down` recipe checks for leftovers by this project name.
+name: jetstream-dev
+
+services:
+  postgres:
+    image: postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - track_io_timing=on
+      - -c
+      - log_lock_waits=on
+    ports:
+      - 127.0.0.1:15432:5432
+    tmpfs:
+      - /var/lib/postgresql:size=4g
+    shm_size: 256m
+    volumes:
+      - ./testing/devenv/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      # -h forces TCP. During first-boot init the entrypoint runs a temporary
+      # server on the unix socket only, so this passes only once the real
+      # server (with init.sql applied) is accepting connections.
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, jetstream, -d, jetstream]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    command:
+      - server
+      - -dir=/data
+      - -ip=seaweedfs
+      - -ip.bind=0.0.0.0
+      - -s3
+      - -s3.config=/etc/seaweedfs/s3.json
+      # Small volumes so the store fits its tmpfs. The default 30GB limit
+      # makes the master think a small disk has room for zero volumes.
+      - -master.volumeSizeLimitMB=128
+      - -volume.max=24
+    ports:
+      - 127.0.0.1:18333:8333
+    tmpfs:
+      - /data:size=4g
+    volumes:
+      - ./testing/devenv/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: [CMD, curl, -fsS, -o, /dev/null, http://127.0.0.1:8333/healthz]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    command: [server, /data, --console-address, ":9001"]
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin-dev-secret
+    ports:
+      - 127.0.0.1:19000:9000
+      - 127.0.0.1:19001:9001
+    tmpfs:
+      - /data:size=4g
+    healthcheck:
+      test: [CMD, curl, -fsS, -o, /dev/null, http://127.0.0.1:9000/minio/health/ready]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # One-shot: creates the buckets and the MinIO app user, then verifies the
+  # app credentials' permissions on both stores. Reuses the MinIO image for
+  # its bundled mc and curl.
+  s3-init:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    entrypoint: [sh, /devenv/s3-init.sh]
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin-dev-secret
+    tmpfs:
+      # The image declares VOLUME /data. Without this, every run of the init
+      # container would leave an anonymous volume behind.
+      - /data
+    volumes:
+      - ./testing/devenv:/devenv:ro
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+      minio:
+        condition: service_healthy

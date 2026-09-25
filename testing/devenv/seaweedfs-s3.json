@@ -1,0 +1,18 @@
+{
+  "identities": [
+    {
+      "name": "admin",
+      "credentials": [
+        { "accessKey": "admin", "secretKey": "admin-dev-secret" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    },
+    {
+      "name": "jetstream",
+      "credentials": [
+        { "accessKey": "jetstream", "secretKey": "jetstream-dev-secret" }
+      ],
+      "actions": ["Read:jetstream", "Write:jetstream"]
+    }
+  ]
+}

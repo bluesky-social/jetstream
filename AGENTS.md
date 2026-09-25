@@ -74,7 +74,10 @@ just test ./segment -run TestX  # one test (gotestsum forwards args after `--`)
 just bench ./segment            # benchmarks
 just fuzz 30s ./segment         # fuzz every Fuzz* target for 30s each
 just modernize                  # apply gopls modernize rewrites
+just up / just down             # ephemeral Postgres + SeaweedFS + MinIO (compose.yaml, testing/devenv/)
 ```
+
+The `just up` environment must stay stateless: tmpfs for every data dir, no named volumes, no writable bind mounts. `just down` fails if anything from the `jetstream-dev` compose project survives. Its S3 app credentials deliberately lack ListBucket. SeaweedFS and MinIO still return 404 for a missing key, but real AWS S3 returns 403 in that case, so object-store code must not rely on 404 alone to mean "missing".
 
 Oracle tests live in `internal/oracle` and compare Jetstream's durable output against a simulator model. Run them after changes to ingest, segment persistence, lifecycle/orchestrator phases, cursor handling, or restart recovery:
 
