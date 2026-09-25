@@ -67,6 +67,15 @@ The oracle restart child's cutover delivery gate (`cutoverDeliveryGate` in the r
 
 klauspost/compress encoders create an internal worker channel lazily on the first `EncodeAll`. A channel created inside a `testing/synctest` bubble fatals the whole test binary ("receive on synctest channel from outside bubble") when the encoder is later used outside it — and vice versa. `segment.WarmEncoder` and `subscribe.WarmEncoder` exist to force that creation at `TestMain`, outside any bubble; the oracle calls both. This is also why `subscribe`'s encoder pools (`encoderpool.go`, #295) are channel free lists and NOT `sync.Pool`: `WarmEncoder` pre-creates every pooled encoder to the cap so in-bubble compressions only ever draw bubble-safe encoders, whereas `sync.Pool`'s GC eviction would drop warmed encoders and lazily rebuild them in-bubble. Residual edge: more than pool-cap concurrent in-bubble compressions would build a fresh in-bubble encoder; no current test approaches that. If you add a new package-global encoder (or another lazily-channel-creating global), give it a warm hook and call it from the oracle's `TestMain`. Area: `internal/subscribe/encoderpool.go`, `internal/subscribe/compress.go` (`WarmEncoder`), `segment/zstd.go`, `internal/oracle/main_test.go`.
 
+### Per-process readers must survive a writer-session change
+
+The subscribe tail, cold reader, status, and cursor resolution outlive writer sessions (`internal/jetstreamd/session.go`). Two mistakes here are easy to make and hard to spot:
+
+- Do not clear the published writer when a session ends. A subscriber that already passed the handler's writer check would anchor at `Tip()` 0 and replay the whole archive. Keep the closed writer until the next session publishes; the seq lease keeps the new writer's seqs above the old tip.
+- A reader parked at the tip waits on the old log's notify channel, and that log never grows again. Replacing the source with `Tail.SetReadLogSource` must wake it, which is why the park also selects on the tail's own notify channel (`TestTail_SetReadLogSourceWakesReaderParkedOnOldLog`).
+
+Anything per-session that a per-process component reads (tombstone gauges, the compaction deadline) goes through an indirection that the session swaps in and out. Area: `internal/jetstreamd`, `internal/subscribe/tail.go`.
+
 ### The mutation campaign needs a clean git working tree
 
 `just mutation-campaign` / `mutation-gate` apply and revert mutant patches with `git apply`. If the working tree is dirty, a revert can fail, and the driver crashes loud rather than trust a corrupted tree (`FATAL: ... working tree is DIRTY — aborting`). Commit or stash your work before running the campaign. Also: never apply the mutant patches by hand outside the driver, and never "fix" production code to match a mutant — they are deliberate bugs. Area: `testing/mutation/run.sh` (`revert_current`), `AGENTS.md`.

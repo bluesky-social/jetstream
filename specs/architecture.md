@@ -36,6 +36,27 @@ Two places hold state:
 
 The durability ordering between these two is the invariant that keeps a crash safe: segment fsync first, pebble commit second. See `specs/invariants.md`.
 
+#### Storage seams
+
+Core packages (ingest, orchestrator, subscribe, xrpcapi, repoexport, status, manifest) reach storage only through interfaces, so a disaggregated backend (S3 plus PostgreSQL, `specs/notes/2026-09-25-disaggregated-storage-v2-design.md`) can replace the local one without touching call sites. Only local mode exists today.
+
+| Interface | Package | Local implementation |
+|---|---|---|
+| `metastore.Store` (keys, batches, iterators) | `internal/metastore` | `metastore/pebblestore`; `metastore/memstore` for tests |
+| `Catalog` / `CatalogView` / `BlockRef` / `Fetcher` | `internal/catalog` | `catalog/local`: the segment directory scan, with writers publishing seals and active-block progress |
+| `HotLog` | `internal/catalog` | the writer's `ingest.ReadableLog` |
+| block committer | `internal/ingest` (`committer.go`) | segment fsync, then the Pebble batch |
+| `Locker` | `internal/leader` | `leader.Local` (always held, epoch 1) |
+| `objstore.Blob` / `objstore.Store` | `internal/objstore` | not used locally; `memblob` for tests |
+
+`TestOnlyPebblestoreImportsStore` stops any package other than `pebblestore` from importing `internal/store`. Read paths address blocks by `BlockRef` and fetch bytes through the catalog's `Fetcher`, never by path. Local-only filesystem work (tmp cleanup, namespace delete, directory fsyncs) lives behind `catalog/local`.
+
+#### Writer sessions
+
+`internal/jetstreamd` splits the runtime into per-process and per-session state (design §6.3, §6.5). `Build` constructs the per-process side once: logger, registries, metastore handle, manifest, catalog, cold reader, subscribe tail, identity, status, web, server, xrpcapi, and metrics. `Run` drives `leader.Run`. Each session acquires the writer lock, then builds a fresh orchestrator (writers, compactor, retry runners), syncstate store, tombstone set, verifier, and compaction schedule from durable state alone. The session tears all of that down before the next one starts or the metastore closes.
+
+A session error that wraps `leader.ErrRestartSession` starts a new session in-process. Any other error is fatal, which keeps the crash-loud rule. The readers follow sessions through `writerSlot`, which holds the current steady writer; the slot keeps the old writer until the next one publishes. `internal/jetstreamd/session.go` explains why.
+
 ### Serve — getting data out
 
 - **Subscribe websockets** (`internal/subscribe`): pull-based fan-out behind two endpoints — `/subscribe` (legacy v1 wire, frozen for backwards compatibility with the original https://github.com/bluesky-social/jetstream-legacy system; deliberate compatibility quirks are listed in `internal/subscribe/doc.go`) and `/xrpc/network.bsky.jetstream.subscribeEvents` (v2, atproto proposal-0015 xrpc.v1.json framing declared by `lexicons/network/bsky/jetstream/subscribeEvents.json`, server-push only, three orthogonal kinds/dids/collections filters). Every subscriber runs the same pull loop and is served from wherever its cursor points — the writer's readable log (the hot tail) for recent events, or the cold reader (a bounded disk walk over sealed segments through a shared block cache) for older cursors. There's no per-client outbound queue, so a slow reader can't blow up server memory. Compression is endpoint-specific: v1 keeps its frozen contract (legacy zstd dictionary + permessage-deflate), while v2's only scheme is dict-zstd negotiated by dictionary ID — deflate is never negotiated on v2. `internal/subscribe/doc.go` has the server-side contract; `specs/client.md` the client side; `specs/notes/2026-07-09-subscribe-compression-cpu-analysis.md` the measured rationale.
@@ -62,6 +83,8 @@ The test rig checks storage and delivery across the full lifecycle.
 | Accepted limitations / past mistakes | `specs/gotchas.md` |
 | The on-disk segment format | `segment/doc.go`, `docs/README.md` §3.1–§3.2 |
 | The metadata store keys | `internal/metastore`, `docs/README.md` §3.5 |
+| Storage interfaces (metastore, catalog, HotLog, objstore) | `internal/catalog/catalog.go`, `internal/metastore`, `internal/objstore/doc.go` |
+| Writer sessions / leader loop | `internal/leader`, `internal/jetstreamd/session.go` |
 | The ingest lifecycle / cutover | `internal/ingest/orchestrator/doc.go`, `docs/README.md` §4 |
 | Initial backfill | `internal/ingest/backfill/doc.go`, `docs/README.md` §4.1 |
 | The live firehose consumer | `internal/ingest/live/doc.go`, `docs/README.md` §4.1, §4.3 |

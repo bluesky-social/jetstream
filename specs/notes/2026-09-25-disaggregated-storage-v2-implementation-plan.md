@@ -1,6 +1,6 @@
 # Disaggregated storage v2: implementation plan
 
-**Status: Stage 0 done (2026-09-25); Stage 1 in progress.** This is the work tracker for
+**Status: Stage 0 done (2026-09-25); Stage 1 done (2026-09-25).** This is the work tracker for
 `specs/notes/2026-09-25-disaggregated-storage-v2-design.md` (the "design"). It
 breaks the design's delivery stages (§26) into PR-sized tasks with file
 references, dependencies, checks, mutants, and exit criteria. The design says
@@ -32,7 +32,7 @@ Prerequisite already landed: the ephemeral dev environment (`just up` /
 | Stage | Goal | Status |
 |---|---|---|
 | 0 | Remove timestamp import (design §21) | done |
-| 1 | Storage interfaces; local mode moved onto them with no behavior change | in progress |
+| 1 | Storage interfaces; local mode moved onto them with no behavior change | done |
 | 2 | Steady state in disaggregated mode on fakes and real storage | not started |
 | 3 | Bootstrap, merge, `storage init` | not started |
 | 4 | Sparse compaction and GC | not started |
@@ -602,7 +602,7 @@ refreshed STALE mutants.
   - Explain why pop1 shows 7 (design §22 stage 1). Likely the unflushed
     partial block, since there are no age cuts (finding 3), but confirm with a
     test or trace. Record the explanation in the design.
-- [ ] **S1.15 Docs** (S). Deps: S1.12.
+- [x] **S1.15 Docs** (S). Deps: S1.12.
   - `specs/architecture.md`: storage interfaces, local impl, and the session
     split.
   - `specs/invariants.md`: phrase "fsync segment before Pebble commit" as a
@@ -1223,6 +1223,26 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **Stage 1 exit (2026-09-25).**
+  - Checks at `537ab1c` plus the S1.15 docs: `just`, `just test-long
+    ./internal/oracle`, `just oracle-sweep`, and `just fuzz 30s ./segment`
+    (7 targets) all pass. `just mutation-gate` on a clean tree: 52 mutants
+    match the baseline.
+  - `just bench ./segment` against `main`, 3 runs each: Append, SteadyFlush,
+    FlushToTmpfs, Seal, ReaderOpen, DecodeBlockSealed, and EncodeBlock are
+    all within run-to-run noise. Allocations are unchanged.
+  - No core package imports `internal/store` or Pebble for metadata. Only
+    `metastore/pebblestore` imports `internal/store`, and
+    `TestOnlyPebblestoreImportsStore` enforces it. Core packages import only
+    `pebble/vfs`, the filesystem abstraction. `simulator/world` uses Pebble
+    for its own model state, not Jetstream metadata.
+  - The S1.14 measurement is recorded in design §22.1.
+  - S1.15: `specs/architecture.md` gains storage-seam and writer-session
+    sections. `specs/invariants.md` states the backend-neutral durability
+    rule, with the Pebble ordering as the local committer rule, and adds the
+    session invariant. `specs/gotchas.md` records the reader/session lessons.
+    `docs/README.md` gets only internal notes.
 
 - **S1.12 (2026-09-25): leader loop and per-session runtime split.**
   - `internal/leader.Run(ctx, Config, SessionFunc)`. `leader.Local` embeds

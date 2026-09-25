@@ -406,6 +406,8 @@ data/
 
 Segments are named with a counter as a 10-digit zero-padded base-36 string. Segment files and seq ranges sort lexicographically in creation order. This means that all events in segment file 0 have witnessed at timestamps before all events in segment file 1.
 
+Internally, code outside the storage layer does not read these directories by path. It lists segments and fetches block bytes through a catalog (`internal/catalog`), and `catalog/local` implements it over the tree above. This is groundwork for a future disaggregated backend and does not change the layout or any behavior described here.
+
 ### 3.5 Metadata Store
 
 All structured metadata that isn't derivable by cheaply rescanning segment files lives in a single pebble database at `data/meta.pebble/`. We picked pebble because it's pure Go, handles tens of millions of keys comfortably, and gives us atomic multi-key batch writes for free, which matters for the durability ordering described below.
@@ -488,6 +490,8 @@ terminal callback; Jetstream then stages that cursor into the writer's synced
 Pebble batch only when all covered completion rows are eligible for the same
 durable batch. A crash can therefore make a cursor lag and repeat work, but it
 cannot make a cursor lead segment durability and silently skip data.
+
+Code outside the storage layer reaches this store through the `internal/metastore` interface; `metastore/pebblestore` is its only production implementation.
 
 The per-block durability ordering is: append and fsync the block into the active segment first, then commit a single pebble batch with `sync=true` that advances `relay/cursor` and updates `repo/<did>.Rev` and other fields for every DID present in the block. Only after both steps complete do we treat the block as durable. Because the pebble batch always follows the segment fsync, a crash between the two leaves `relay/cursor` pointing at or before the last durable event, so if we do crash, we'll just replay some relatively small number of events.
 
