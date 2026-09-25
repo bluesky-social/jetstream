@@ -142,9 +142,18 @@ type Config struct {
 	// SegmentIOFaultInjector is a test-only seam forwarded to segment.Writer.
 	// Nil in production.
 	SegmentIOFaultInjector segment.IOFaultInjector
+
+	// Hot, if non-nil, opens the writer in disaggregated hot mode (design
+	// §10.3): events commit to the catalog as hot batches instead of going to
+	// a local segment file. SegmentsDir, FS, Store, MaxSegmentBytes,
+	// AsyncFlushWorkers, and Catalog are unused, and the seq lease is off.
+	Hot *HotConfig
 }
 
 func (c *Config) validate() error {
+	if c.Hot != nil {
+		return c.validateHot()
+	}
 	if c.SegmentsDir == "" {
 		return fmt.Errorf("%w: SegmentsDir is required", ErrInvalidConfig)
 	}

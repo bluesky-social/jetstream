@@ -755,7 +755,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
 
 ### Write path
 
-- [ ] **S2.8 Writer hot mode: batching and committer** (L). Deps: S1.9, S2.6.
+- [x] **S2.8 Writer hot mode: batching and committer** (L). Deps: S1.9, S2.6.
   - Batch cuts (§10.3): `min(256, block remaining)` events, 256KiB raw, 15ms
     age, block close, or class change. Block cuts: 4096 events or 30s age
     (new, finding 3), using an injectable clock.
@@ -1223,6 +1223,80 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.8 (2026-09-25): writer hot mode.**
+  - Hot mode lives inside `ingest.Writer` behind `Config.Hot` (`HotConfig`):
+    every public method dispatches to `hotWriter` (`internal/ingest/hot.go`)
+    the way the async pipeline already does, so the live consumer, backfill,
+    and orchestrator keep their `*Writer`. Hot mode refuses the seq lease,
+    `AsyncFlushWorkers`, `Catalog`, and any namespace or seq key but `main`.
+    It does not use `Store` or `SegmentsDir`: seq/next is read through a
+    catalog read transaction at open (§10.2).
+  - The admission class travels in the context (`ingest.WithClass`,
+    untagged = live), so producers sharing one Writer need no new Append
+    variants. S2.9 tags the producers.
+  - "Injectable clock" is the synctest bubble: the writer uses `time.Now` and
+    timers, and the tests run inside `synctest.Test`, like the oracle. The
+    package gained a `TestMain` that calls `segment.WarmEncoder` so the shared
+    zstd encoder is not bound to the first bubble.
+  - Freeze (under the lock) detaches the batch's events and samples
+    `DurableBatchPrepareValue`. Encoding, and for a pointer batch the upload,
+    run in a per-batch goroutine. The committer waits for each batch in seq
+    order. Pointer batches use `Uploader.Upload`'s pending refs, so the hot
+    batch transaction also makes the object available (§7.3 step 6).
+  - As in local sync mode, `Append`/`AppendBatch` return once seqs are
+    assigned, without waiting for commit. The acks are `Flush` and
+    `DrainDurability` (barriers behind every earlier freeze), the read log's
+    durable watermark, and the hook's `afterCommit`. Backpressure comes from
+    S2.9's caps; until then the queue of frozen batches is unbounded.
+  - S2.8 makes bulk batches pointers whenever an uploader is set, and live
+    batches always inline. S2.9 adds the token bucket, overflow, permits, and
+    caps.
+  - A hook error ends the writer and the session. In local mode the error
+    only returns to the caller, but in hot mode the hook runs in the
+    committer and there is no caller to return it to (§9.1). `OnFailure` is
+    called once; it must not call back into the Writer.
+  - `DrainDurability` and `Close` commit the hook's output with
+    `Session.CommitMeta`, and skip the transaction when the hook stages
+    nothing.
+  - `Close` commits every appended event but does not close the open block:
+    the next session rebuilds it (§10.9, S2.11). `ForceRotate` closes the
+    open block, waits for its commit, then calls `BlockSink.Rotate`, which
+    seals once the maintainer has folded (S2.10). `SealActiveAndClose` is
+    `ForceRotate` plus `Close`.
+  - Closed blocks go to `BlockSink.BlockClosed` from the committer, in order,
+    after their last batch commits. Each carries its events and a
+    `HotBatchInfo` per batch (class, resolved object ID). After a failure,
+    blocks are dropped: the next session rebuilds from what committed.
+  - The open block and the read log share one copy of each event
+    (`ReadableLog.appendEntry`).
+  - Hot mode's `ActiveTimeFloorSeq` returns `NextSeq`: time lookups move to
+    the catalog (S2.13). `ActiveSegment` reports false and `ActiveIndex` 0.
+  - `jetstream_hot_batches_total{class,storage}` and
+    `jetstream_hot_batch_events` landed here, not in S2.9, since the
+    committer is where they are counted.
+  - Tests (`hot_test.go`, storagefake + memblob + the real `protocol`
+    uploader and reader):
+    - a swarm over random block, batch, byte, and age limits with 1–3
+      concurrent producers and random class changes, checking:
+      - committed rows tile `[1, seq/next)`;
+      - frames decode to the appended events;
+      - one class per batch, pointer iff bulk;
+      - the hook runs once per batch with the freeze-time prepare value;
+      - neither the read log nor `afterCommit` runs ahead of the commit;
+      - `Flush` acks cover the producer's appends;
+      - closed blocks tile whole batches;
+      - no batch crosses a block;
+    - batch and block age cuts;
+    - class change and `ForceRotate`;
+    - `FaultCommitFails`/`FaultCommitLost` end the writer and session, and
+      the next session resumes at the committed seq/next and reassigns the
+      dropped seqs;
+    - a hook failure;
+    - config validation.
+  - Hand-made mutants (7 of them: block close without a freeze, no durable
+    advance, no class cut, dropped barrier, wrong prepare value, no pointers,
+    `Close` dropping the tail) were all caught.
 
 - **S2.5 (2026-09-25): objstore S3 blob, upload/read protocol, object cache.**
   - `objstore.Store` is read-only (`Get`, `GetRange`). Uploads go through

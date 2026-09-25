@@ -60,12 +60,16 @@ func (l *ReadableLog) append(ev *segment.Event) {
 	if l == nil {
 		return
 	}
-	entry := catalog.NewLogEntry(ev)
+	l.appendEntry(catalog.NewLogEntry(ev))
+}
 
+// appendEntry is append for a caller that already copied the event, so hot
+// mode's open block can share the entry's copy instead of making another.
+func (l *ReadableLog) appendEntry(entry *ReadLogEntry) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if ev.Seq != l.tipSeq {
-		panic(fmt.Sprintf("ingest: readable log append seq %d, want %d", ev.Seq, l.tipSeq))
+	if seq := entry.Event().Seq; seq != l.tipSeq {
+		panic(fmt.Sprintf("ingest: readable log append seq %d, want %d", seq, l.tipSeq))
 	}
 	l.entries = append(l.entries, entry)
 	l.tipSeq++

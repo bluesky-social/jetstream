@@ -30,6 +30,10 @@ type Metrics struct {
 	SeqGapWidth               prometheus.Gauge
 	SeqGapsRegistered         prometheus.Counter
 	SeqGapValuesRegistered    prometheus.Counter
+	// HotBatches and HotBatchEvents are hot mode's committed batches (design
+	// §23), labelled by admission class and inline or pointer storage.
+	HotBatches     *prometheus.CounterVec
+	HotBatchEvents prometheus.Histogram
 }
 
 // NewMetrics registers the ingest counters/gauges against reg.
@@ -122,6 +126,17 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "seq_gap_values_registered_total",
 			Help: "Number of sequence values newly registered as vacant by this process at startup.",
 		}),
+		HotBatches: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name: "batches_total",
+			Help: "Number of hot batches committed, by admission class and storage (inline or pointer).",
+		}, []string{"class", "storage"}),
+		HotBatchEvents: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name:    "batch_events",
+			Help:    "Events per committed hot batch.",
+			Buckets: []float64{1, 4, 16, 64, 128, 256, 512, 1024, 4096},
+		}),
 	}
 	reg.MustRegister(
 		m.EventsAppended, m.BlocksFlushed, m.SegmentsRotated,
@@ -131,6 +146,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.SeqReservedEnd, m.SeqReservationHeadroom,
 		m.SeqGapCount, m.SeqGapWidth,
 		m.SeqGapsRegistered, m.SeqGapValuesRegistered,
+		m.HotBatches, m.HotBatchEvents,
 	)
 	return m
 }
@@ -234,4 +250,16 @@ func (m *Metrics) setReadLogDurableSeq(v uint64) {
 	if m != nil {
 		m.ReadLogDurableSeq.Set(float64(v))
 	}
+}
+
+func (m *Metrics) observeHotBatch(class Class, pointer bool, events int) {
+	if m == nil {
+		return
+	}
+	storage := "inline"
+	if pointer {
+		storage = "pointer"
+	}
+	m.HotBatches.WithLabelValues(class.String(), storage).Inc()
+	m.HotBatchEvents.Observe(float64(events))
 }

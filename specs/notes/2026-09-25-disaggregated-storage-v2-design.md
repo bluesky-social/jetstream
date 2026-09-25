@@ -619,7 +619,10 @@ behind a block flush. In disaggregated mode it has two modes:
 | hot | `main` namespace in steady state | hot batch |
 | direct | `main` during bootstrap backfill, `bootstrap_live` during bootstrap, `main` during merge | block |
 
-The orchestrator chooses the mode when it opens a writer. The seq write-ahead
+The orchestrator chooses the mode when it opens a writer: `ingest.Config.Hot`
+selects hot mode, and every Writer method dispatches to it, so producers keep
+their `*Writer`. An append's class (§10.5) travels in its context
+(`ingest.WithClass`); untagged appends are live. The seq write-ahead
 lease (`ReserveClientVisibleSeqs`, `seq/max_reserved`, `seq/gap/*`) is disabled
 in disaggregated mode, because a seq is never visible before it commits.
 
@@ -665,6 +668,17 @@ When a batch is cut, it is **frozen**:
    watermark). The sample is tied to this batch.
 3. Queue it for commit.
 
+Steps 2 and 3 run under the append lock. Step 1, and a pointer batch's upload,
+run off the lock in a goroutine per batch. The committer waits for each one in
+turn.
+
+`Append` and `AppendBatch` return once seqs are assigned, as local sync mode's
+do. They do not wait for the commit; admission control (§10.5) supplies the
+backpressure. `Flush` and `DrainDurability` wait for every batch frozen before
+them. `Close` commits everything appended but leaves the open block for the
+next session to rebuild (§10.9). `ForceRotate` closes the open block and waits
+for its commit, then asks the maintainer to seal.
+
 Frozen batches commit strictly in seq order, one transaction at a time, from one
 committer goroutine. Inline batches need no upload, so they commit as soon as
 the previous batch has committed. Pointer batches upload concurrently and commit
@@ -694,7 +708,10 @@ After the commit succeeds:
   `Flush` waits on today);
 - ring the local follower's in-process doorbell.
 
-On failure: run `afterDone(err)` and end the session.
+On failure: run `afterDone(err)` and end the session. A hook that returns an
+error also ends the session, because it runs in the committer with no caller to
+return the error to. `DrainDurability` and `Close` commit hook output with no
+events as a metadata transaction, and skip it when the hook stages nothing.
 
 **DurableBatchHook.** It keeps its current two-phase contract. The only change
 is the batch type, which becomes `metastore.Batch` instead of `*pebble.Batch`

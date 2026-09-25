@@ -52,6 +52,9 @@ type Writer struct {
 	async            *asyncFlushPipeline
 	asyncJobs        sync.WaitGroup
 	nextAsyncFlushID uint64
+
+	// hot is non-nil in hot mode; every public method dispatches to it.
+	hot *hotWriter
 }
 
 // Open scans cfg.SegmentsDir, resumes or creates the active segment,
@@ -61,6 +64,9 @@ type Writer struct {
 func Open(cfg Config) (*Writer, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
+	}
+	if cfg.Hot != nil {
+		return openHot(cfg)
 	}
 	cfg.applyDefaults()
 	cfg.Logger = cfg.Logger.With(slog.String("component", "ingest/writer"))
@@ -265,6 +271,9 @@ func Open(cfg Config) (*Writer, error) {
 // ScanMaxSeq reconciliation will recover the correct nextSeq on
 // next start.
 func (w *Writer) Close() error {
+	if w.hot != nil {
+		return w.hot.close()
+	}
 	if w.async != nil {
 		return w.closeAsync()
 	}
@@ -300,6 +309,9 @@ func (w *Writer) Close() error {
 // instead — sealing during normal operation is a rotation-time
 // concern handled inside flushAndRotateLocked.
 func (w *Writer) SealActiveAndClose() error {
+	if w.hot != nil {
+		return w.hot.sealActiveAndClose()
+	}
 	if w.async != nil {
 		return w.sealActiveAndCloseAsync()
 	}
@@ -341,6 +353,9 @@ func (w *Writer) SealActiveAndClose() error {
 // is left untouched so callers can safely retry without observing
 // a phantom allocation. Goroutine-safe.
 func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
+	if w.hot != nil {
+		return w.hot.append(ctx, ev)
+	}
 	if w.async != nil {
 		w.drainMu.Lock()
 		w.mu.Lock()
@@ -381,6 +396,9 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error {
 	if len(events) == 0 {
 		return nil
+	}
+	if w.hot != nil {
+		return w.hot.appendBatch(ctx, events)
 	}
 
 	w.drainMu.Lock()
@@ -471,6 +489,9 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 //
 // A no-op when nothing is buffered.
 func (w *Writer) Flush(ctx context.Context) error {
+	if w.hot != nil {
+		return w.hot.flush(ctx)
+	}
 	if w.async != nil {
 		w.drainMu.Lock()
 		job, err := w.prepareAsyncFlushForFlush()
@@ -552,6 +573,9 @@ func (w *Writer) drainSync(ctx context.Context) error {
 // DrainDurability forces pending event-backed metadata to its block durability
 // point and commits metadata-only durable hooks even when no events are pending.
 func (w *Writer) DrainDurability(ctx context.Context) error {
+	if w.hot != nil {
+		return w.hot.drainDurability(ctx)
+	}
 	w.drainMu.Lock()
 	defer w.drainMu.Unlock()
 
@@ -566,6 +590,10 @@ func (w *Writer) DrainDurability(ctx context.Context) error {
 // backfill writer and intentionally replaces any prior hook. Callers should
 // wire this before starting producers.
 func (w *Writer) SetDurableBatchHook(h DurableBatchHook) {
+	if w.hot != nil {
+		w.hot.setHook(h)
+		return
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.cfg.OnDurableBatch = h
@@ -637,6 +665,9 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
 // upstream relay is down) for no compliance benefit. Goroutine-safe;
 // concurrent Appends serialize against the rotation on w.mu.
 func (w *Writer) ForceRotate(ctx context.Context) error {
+	if w.hot != nil {
+		return w.hot.forceRotate(ctx)
+	}
 	w.drainMu.Lock()
 	defer w.drainMu.Unlock()
 
@@ -699,6 +730,9 @@ func (w *Writer) rotateLocked(ctx context.Context) error {
 // Exposed for tests and observability; production callers should
 // not rely on this value being stable across goroutines.
 func (w *Writer) NextSeq() uint64 {
+	if w.hot != nil {
+		return w.hot.next()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.nextSeq
@@ -714,6 +748,10 @@ func (w *Writer) NextSeq() uint64 {
 // manifest after this snapshot, because an earlier active generation may have
 // become sealed immediately before it.
 func (w *Writer) ActiveTimeFloorSeq(timeUS int64) uint64 {
+	if w.hot != nil {
+		// Hot mode serves time lookups from the catalog, not the writer.
+		return w.hot.next()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed || w.active == nil {
