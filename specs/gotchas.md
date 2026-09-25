@@ -51,6 +51,12 @@ atproto record keys can be up to ~1023 bytes, but our segment format caps the rk
 
 Under the client's `CursorTime` mode, a resume on a different host uses `witnessedAt - rewind`. Each instance stamps `witnessed_at` with its own clock when it sees an event, so the same event has slightly different times on different hosts. The rewind (default 5s) is a skew allowance, not a guarantee: skew larger than the rewind can skip events, and everything inside the rewind is re-delivered with no way to dedup across seq namespaces. Callers in this mode must be idempotent. The client identifies a seq namespace by the configured hostname alone: a reconnect to the same name always resumes by seq. So each hostname given to `WithHost`/`WithFailoverHosts` must address exactly one instance; a name that load-balances across instances (or is repointed at a different instance) gets a foreign seq and can skip or replay events. Area: `live.go` (`planSession`, `adoptNamespace`).
 
+---
+
+### The local catalog sees only the newest unsealed file in a namespace
+
+`catalog/local` treats the highest-index unsealed file as the namespace's active segment and skips any unsealed file below it. The writer cannot produce such a file: `rotateLocked` finishes the seal before it creates the next file, and `ingest.Open` resumes the highest index. A stranded older unsealed file therefore means external damage. Cold replay then fails loud on the unregistered hole rather than skipping it. The oracle's catalog observer cross-checks against the path walk, so a quiescent directory with such a file fails the observation (`TestObserveSegments_CrossCheckCatchesStrandedActive`). Area: `internal/catalog/local`, `internal/oracle/catalog_observer.go`.
+
 ## Lessons
 
 ### A restart-tier recovery child hangs if the relay is quiet — generate traffic between children

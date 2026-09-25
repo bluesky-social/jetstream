@@ -514,7 +514,7 @@ refreshed STALE mutants.
     - `catalog/local` against real segment dirs built by the writer (swarm:
       random block sizes, rotation, reopen).
     - `RefsFrom(seq)` covers `[seq, tip]` exactly once in order (property).
-- [ ] **S1.10 Read-path seams** (L). Deps: S1.9.
+- [x] **S1.10 Read-path seams** (L). Deps: S1.9.
   - Cold reader (`subscribe/replay.go` `walkSealedSegment` `:352-425`,
     `walkActiveRegion` `:242-317`, `decodeSealedBlock` `:327-343`, and
     `ColdReader.Read` `:484-530`): read through `CatalogView.RefsFrom` and a
@@ -588,7 +588,7 @@ refreshed STALE mutants.
 
 ### Oracle and measurement
 
-- [ ] **S1.13 Storage-neutral oracle observers** (M). Deps: S1.9.
+- [x] **S1.13 Storage-neutral oracle observers** (M). Deps: S1.9.
   - `internal/oracle/segments.go` `ObserveSegments`/`ObserveSealedSegments`/
     `ObserveBootstrapSegments` read through `CatalogView` + fetcher instead of
     directories. Local mode keeps a path-based observer as a cross-check. The
@@ -1224,6 +1224,117 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S1.13 (2026-09-25): catalog-based oracle observers.**
+  - `ObserveSegments`, `ObserveSealedSegments`, and `ObserveBootstrapSegments`
+    read each namespace through a fresh `catalog/local` catalog (`Refresh`,
+    `RefsFrom`, `Fetcher`). They cross-check against the path walk, which
+    keeps the sealed-structure and footer checks and reports its errors
+    first, so existing messages are unchanged. With the directory quiescent,
+    the two must match segment by segment.
+  - Observations taken while the server runs (the over-drop recorder, the
+    compaction bisection) use a live cross-check. It allows only newer
+    segments, a grown or newly sealed tail, and rows missing where a
+    compaction may race the scan (a subsequence, never new rows).
+  - The observer turns `local.Catalog.Snapshot`'s overlap panic into an
+    error.
+  - The cross-check shows that the local catalog skips an unsealed file
+    below the newest one. The writer cannot produce one; `specs/gotchas.md`
+    records it and a test pins the observer failing on it.
+  - `durable_order_test.go` stays local-only (fsync ordering), and
+    `specs/oracle.md` says why. The single-file probe in
+    `restart_crash_chain_test.go` also stays path-based.
+  - `just mutation-gate`: 52 mutants match the baseline; the new cross-check
+    was never the killing check.
+
+- **S1.10 (2026-09-25): read-path seams.**
+  - Cold replay walks `CatalogView.RefsFrom(Main, seq)` and decodes through
+    the catalog's `Fetcher`.
+    - The old rotation-seam retry is gone. The writer publishes each seal
+      before advancing `activeIdx`, so a view taken after the floor is read
+      covers every seq below it.
+    - The only retry is `ErrStaleRef`: an active segment sealed mid-walk, or
+      a sealed one rewritten. Eight consecutive stale views without progress
+      fail the read loudly (`maxStaleRetries`).
+    - A bounded walk now fails loud with "unregistered sequence hole [a,b)
+      before segment S block B" on any hole before a ref, whether in one
+      segment or across segments. A view that ends below the floor fails
+      with "cold replay reached the end of the catalog ... before
+      readable-log floor". Registered gaps are still jumped.
+    - m059 and m061 are refreshed as context diffs against these two sites.
+      Both are KILLED at the seqlease tier with the driver.
+  - Block cache: the key is `blockKey{id any, seg, epoch}`. Local mode uses
+    `localBlockID{ns, seg, block, generation}`, and the generation is the
+    header checksum. Only sealed refs (generation != 0) are cached; active
+    blocks are decoded per walk, since a seal changes their generation.
+    `InvalidateSegment` stays local-only.
+  - `catalog/local` `Refresh` fix: it samples the known segments before
+    listing the directory, then merges seals and reloads that landed during
+    the scan. Before this, a segment sealed mid-scan was dropped from the
+    catalog (`TestLocal_RefreshKeepsSegmentsSealedDuringScan`).
+  - The runtime loads the catalog in the background, like the manifest. The
+    cold reader, status, and repo verification all wait on it
+    (`backgroundLoad.Wait`). Refresh is now called at startup, replacing the
+    S1.9 note.
+  - Timestamp cursors: the manifest picks the segment by witnessed range,
+    and the catalog view supplies its block index and block bytes. If the
+    view does not hold the segment (the catalog is still loading), or no
+    catalog is configured, resolution falls back to the segment's MinSeq.
+    That is lossless, because the subscriber loop drops rows witnessed
+    before the cursor. `CursorEnv.FS` and `Subscription.FS` are replaced by
+    `Catalog` and `Fetcher`. The resolve-failure test now corrupts a block
+    frame: a removed file is a legitimate "segment gone" catalog state that
+    falls back, not a read fault.
+  - Manifest feed: `ApplySegment(idx, gen, header, footer, createdAt, size)`
+    replaces `OnSegmentSealed` and `OnSegmentCompacted`. The metadata parser
+    runs `segment.OpenReaderParts` over the bytes, so it never touches the
+    block region. Behavior change: seals are now checksum-verified too (only
+    rewrites were before). The startup scan still skips verification.
+    `ApplySegmentFile` is the local-mode adapter. `Manifest.BlockIndex`
+    stays, for the manifest's own readers.
+  - `Writer.ActiveFlushedRange` and `Writer.SegmentsDir` are removed; the
+    catalog's `ActiveSegment` view replaced them. Its test is now
+    `TestActiveSegmentExcludesPendingAndAdvancesByBlock`.
+  - xrpcapi (`SegmentOpener`):
+    - `FileOpener` reads the manifest, so it agrees with
+      `listSegments`/`planSnapshot`.
+    - The ETag and the bytes come from one opened `SegmentFile`.
+    - The three 500 messages are unified into "failed to open segment".
+    - `TestFileOpener_ByteIdentity` checks the virtual file against the
+      on-disk file for random segments.
+    - `CompactionDeadlineSource` is the existing
+      `xrpcapi.CompactionDeadline`; it needed no code.
+  - Readiness: `lifecycle.Readiness`, `ReadinessFunc`, `SteadyState`,
+    `AllReady`, and `ErrBootstrapInProgress`. These replace
+    `IsSteadyState` in `Subscription.Ready` and xrpcapi `Config.Ready`.
+    Response text is unchanged.
+  - repoexport:
+    - Reconstruction replays each namespace (Main, then BootstrapLive)
+      through `RefsFrom` and `DecodeRef`, with no directory scans.
+    - Pruning is a per-namespace `Selection`: segment index to candidate
+      blocks, where an absent segment is decoded in full. The manifest
+      adapter takes `SegmentChecksums()` before `SelectBlocksForDID`, so a
+      segment absorbed between the two calls is decoded in full.
+    - `FooterSelector` reads footer blooms through
+      `local.Catalog.SealedMetadata` for segments the manifest does not hold.
+      That makes bootstrap_live pruned for the first time.
+    - On `ErrStaleRef`, a pass resumes from the first seq it had not
+      replayed, so no block is replayed twice.
+    - Known and unchanged: a merge's `DropNamespace(BootstrapLive)` can land
+      between the two namespace passes.
+  - status:
+    - Segment trees come from one catalog view: main's sealed stats from the
+      manifest, main's active tail and all of bootstrap_live from the view.
+    - File mtimes are not in a view, so they are left zero.
+    - Error handling: the newest segment in a namespace fails silently,
+      older failures become warnings, and a stale segment is skipped.
+    - `InspectAll` stays only for the offline CLI. A seeded parity test pins
+      the view-based aggregate equal to `InspectAll`, apart from mtimes.
+    - status has no diskspace dependency, and the data-dir free-bytes gauge
+      is skipped when there is no data dir.
+  - Tests: repoexport runs in about 1.7s, over the 1s target. The unchanged
+    baseline is about 1.6s, because of the existing
+    `TestVerify_HTTPFailureReturnsError`.
+
 - **S1.9 (2026-09-25): catalog, HotLog, local catalog, block committer.**
   - `internal/catalog` imports only `segment`. `RefsFrom` returns
     `iter.Seq[BlockRef]`, not a slice, so a reader that stops early does not
@@ -1268,6 +1379,12 @@ the PR that made them.
     and compaction calls `Reload`. `Refresh` is not called at startup yet,
     because nothing reads through the catalog until S1.10.
   - Bench: segment and ingest writer benchmarks are at parity with 80f1d00.
+  - Follow-up (60555ed): each namespace's sealed segments live in an
+    immutable, pre-validated `SegmentList`, updated copy-on-write, so
+    `Snapshot` validates only the active tail rather than every block in the
+    archive. `BlockRef` gained `Namespace` and `Generation`. A stale sealed
+    fetch calls `Reload` on the segment, so a reader's retry converges
+    without waiting for the compactor to report the rewrite.
 
 - **S1.7 (2026-09-25): segment refactors.** New `segment` API:
   `BlockBuilder` (`NewBlockBuilder`, `Append`, `Len`, `Cap`, `Snapshot`,

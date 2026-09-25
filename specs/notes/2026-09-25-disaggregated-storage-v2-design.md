@@ -971,8 +971,10 @@ collection index in memory, as today. In disaggregated mode:
 - At pod start, fetch every current generation's footer from S3 (bounded
   concurrency, `JETSTREAM_S3_READ_CONCURRENCY`, default 32) before becoming
   ready. Pop1 has about 7,000 segments. Measure start time (§22).
-- `OnSegmentSealed` and `OnSegmentCompacted` are called by the follower, not by
-  the writer.
+- The manifest takes seals and compaction rewrites through one call,
+  `ApplySegment(idx, gen, header, footer, createdAt, size)`, which parses and
+  checksum-verifies the metadata from bytes. The follower calls it, not the
+  writer. Local mode reads the bytes from the file (`ApplySegmentFile`).
 - Footers stay in memory, as the manifest already requires. There is no separate
   footer cache.
 
@@ -986,22 +988,36 @@ cold reader's source:
 - active blocks: the same;
 - hot batches: decode the inline frame or fetch the pointer object.
 
-The decoded block cache (`internal/subscribe/blockcache.go`) is keyed by object
-SHA-256 in disaggregated mode, instead of `(segIdx, checksum, blockIdx)`. Hits
+The decoded block cache (`internal/subscribe/blockcache.go`) takes an opaque
+comparable key: `(namespace, segIdx, blockIdx, generation)` in local mode, and
+object SHA-256 in disaggregated mode. Only sealed blocks are cached; active
+blocks are decoded per read. Hits
 therefore survive compaction for unchanged blocks and survive folds that dedup.
 Inline hot frames are keyed by `first_seq` plus the frame's SHA-256.
 
 When a cold read reaches the tip of its refs, it hands off to the readable log.
 The readable log holds everything above its floor, so there is no gap. If the
-refs the reader held are gone (fold or compaction), it asks the mirror again
-with `RefsFrom(nextSeq)`.
+refs the reader held are gone (fold, compaction, or the seal of the active
+segment), the fetch fails with `ErrStaleRef` and the reader asks for a fresh
+view with `RefsFrom(nextSeq)`. Eight consecutive stale views without progress
+fail the read loudly.
+
+The reader samples the floor before it takes a view, so the view covers every
+seq below the floor. A cold read bounded by the floor therefore fails loudly
+on any hole a durable gap record does not explain: a hole before the next ref,
+or a view that ends below the floor. (This replaced the local reader's
+rotation-seam retry, which the coherent snapshot made unnecessary.)
 
 ### 11.5 Cursor resolution
 
 Cursor rules do not change (`docs/README.md` §2, §5). v1 time cursors resolve
 through witnessed ranges: sealed segments via the manifest, then active blocks
 and hot batches via the mirror. v2 seq cursors use `RefsFrom`. The lookback
-floor is computed as today.
+floor is computed as today. Inside a manifest-chosen segment, the block index
+and bytes come from the catalog view. If the view does not hold that segment
+yet, resolution falls back to the segment's first seq. That start is coarser
+but loses nothing, because the subscriber drops rows witnessed before the
+requested time.
 
 ### 11.6 Freshness
 
