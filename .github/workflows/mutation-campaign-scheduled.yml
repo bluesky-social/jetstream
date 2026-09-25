@@ -78,7 +78,7 @@ jobs:
           github-token: ""
 
       - name: Mutation campaign + baseline gate
-        run: ./dev.sh --command just mutation-gate
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just mutation-gate
 
       - name: Upload campaign result
         # The machine-readable result is the evidence for the gate's verdict;
