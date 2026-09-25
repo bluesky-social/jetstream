@@ -440,7 +440,7 @@ refreshed STALE mutants.
 
 ### Segment and writer
 
-- [ ] **S1.7 Segment refactors for block sources** (L). Deps: S0.
+- [x] **S1.7 Segment refactors for block sources** (L). Deps: S0.
   - **Seal from a frame source.** Extract a pure
     `segment.BuildSealed(src FrameSource) (header, footer []byte, Header, error)`
     from `seal.go` `sealAfterFlush`/`walkActiveFrames` (`:93-397`). It computes
@@ -1224,6 +1224,34 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S1.7 (2026-09-25): segment refactors.** New `segment` API:
+  `BlockBuilder` (`NewBlockBuilder`, `Append`, `Len`, `Cap`, `Snapshot`,
+  `PendingBounds`, `Encode`), `FrameSource`, `SliceFrameSource`,
+  `BuildSealed`, `ReaderOptions`, `BlockFetcher`, `OpenReaderAt`, and
+  `OpenReaderParts`. `Open` now uses the same parser as the byte readers.
+  - Empty-block break: in `BuildSealed`, the first zero-event frame stops
+    indexing, but later frames are still read so the footer offset counts
+    every frame. That matches the file seal, whose footer sits at end of
+    file. `TestBuildSealedEmptyBlockEndsIndex` pins it. The file seal now
+    also fails with `ErrCorruptSegment` if `BuildSealed`'s footer offset is
+    not the active file size.
+  - `OpenReaderParts` takes all metadata, blooms included, from the footer.
+    `fetch` is only called by `DecodeBlock`, and a fetched frame whose
+    length disagrees with the index is `ErrCorruptSegment`. Byte readers do
+    not own their source, so `Close` leaves `src` open.
+  - `computeRewrite` takes a `*Reader` (from any of the three constructors),
+    not raw frames, and does not use `BuildSealed`. A rewrite keeps emptied
+    blocks with their original seq and witnessed bounds, but `BuildSealed`
+    would stop indexing at the first empty block.
+  - Bench: at parity with f463e6f on every segment benchmark. Seal makes one
+    more allocation per call (116→117), because the file frame source
+    escapes through the interface.
+  - Mutants: m011, m047, and m044 are refreshed; all nine touched mutants
+    are KILLED at their baseline tiers. The old zero-context m044 still
+    passed `git apply --check`, but it landed on an identical line in
+    `commitPreparedFlushLocked` and survived. It is now a context diff, and
+    `specs/gotchas.md` has the lesson. `FuzzBuildSealed` is in the
+    `ci-scheduled.yml` fuzz matrix.
 - **S1.6 (2026-09-25): `internal/store` shrink.**
   - The audit is recorded in design §14.2. Six metadata call sites all
     tolerate a non-snapshot scan. The rest of the "12" were tests or the
