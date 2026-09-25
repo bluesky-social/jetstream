@@ -26,9 +26,14 @@ expected-tier: segmentfault
 tiers: segmentfault
 
 diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
-index 97d3860..4900b3e 100644
 --- a/internal/ingest/orchestrator/compact_deletes.go
 +++ b/internal/ingest/orchestrator/compact_deletes.go
-@@ -382 +382 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
+@@ -359,7 +359,7 @@
+ 					IOFaultInjector: o.cfg.SegmentIOFaultInjector,
+ 					CandidateDIDs:   candidateDIDs,
+ 				})
 -				if err != nil {
 +				if err == nil {
+ 					return ingest.WrapDiskFull(o.cfg.DataDir, "rewriting segment during compaction",
+ 						fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err))
+ 				}

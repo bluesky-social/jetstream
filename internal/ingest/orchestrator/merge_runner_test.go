@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/stretchr/testify/require"
@@ -33,7 +34,7 @@ func TestMergeRunner_EmptySourceDir(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dst.Close() })
 
-	r := newMergeRunner(dst, st, srcDir, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	r := newMergeRunner(dst, st, refreshedCatalog(t, dataDir), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 
 	require.NoError(t, r.run(t.Context()))
 
@@ -84,7 +85,7 @@ func TestMergeRunner_SourceIndexGap(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dst.Close() })
 
-	r := newMergeRunner(dst, st, srcDir, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	r := newMergeRunner(dst, st, refreshedCatalog(t, dataDir), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 	err = r.run(t.Context())
 	require.ErrorContains(t, err, "source index gap")
 }
@@ -109,7 +110,7 @@ func TestMergeRunner_DiscoveryEmptyRoster(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dst.Close() })
 
-	r := newMergeRunner(dst, st, srcDir, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	r := newMergeRunner(dst, st, refreshedCatalog(t, dataDir), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		require.Equal(t, "/xrpc/com.atproto.sync.listHosts", req.URL.Path)
@@ -117,4 +118,14 @@ func TestMergeRunner_DiscoveryEmptyRoster(t *testing.T) {
 	}))
 	t.Cleanup(relay.Close)
 	require.NoError(t, r.runDiscovery(t.Context(), relay.URL, relay.Client()))
+}
+
+// refreshedCatalog is a local catalog over dataDir with what is on disk
+// loaded.
+func refreshedCatalog(t *testing.T, dataDir string) *localcatalog.Catalog {
+	t.Helper()
+	c, err := localcatalog.New(localcatalog.DataDirConfig(nil, dataDir))
+	require.NoError(t, err)
+	require.NoError(t, c.Refresh(t.Context()))
+	return c
 }

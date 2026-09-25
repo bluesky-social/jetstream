@@ -202,11 +202,13 @@ type Config struct {
 	// nil; deterministic harnesses feed the firehose in-memory.
 	LiveDial streaming.DialFunc
 
-	// Catalog is forwarded to every ingest writer, each with its namespace:
-	// catalog.Main for <DataDir>/segments and catalog.BootstrapLive for
-	// <DataDir>/backfill/live_segments. cmd/jetstream wires the local
-	// catalog, which feeds the manifest. Optional.
-	Catalog ingest.SegmentCatalog
+	// Catalog holds the archive: every ingest writer publishes to it, each
+	// with its namespace (catalog.Main for <DataDir>/segments and
+	// catalog.BootstrapLive for <DataDir>/backfill/live_segments), and merge
+	// and compaction read and rewrite segments through it. It must describe
+	// DataDir. cmd/jetstream wires the local catalog, which feeds the
+	// manifest. Nil uses a private local catalog over DataDir.
+	Catalog SegmentCatalog
 
 	// OnSegmentCompacted refreshes serving metadata after a sealed segment is
 	// rewritten by compaction. cmd/jetstream wires this to the manifest refresh

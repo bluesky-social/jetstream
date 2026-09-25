@@ -224,6 +224,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			catalog.Main:          segmentsDir,
 			catalog.BootstrapLive: filepath.Join(opts.DataDir, "backfill", "live_segments"),
 		},
+		// Merge cleanup removes the whole backfill tree.
+		Roots: map[catalog.Namespace]string{catalog.BootstrapLive: filepath.Join(opts.DataDir, "backfill")},
 	})
 	if err != nil {
 		return fail(fmt.Errorf("serve: build segment catalog: %w", err))

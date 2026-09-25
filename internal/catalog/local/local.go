@@ -36,6 +36,27 @@ type Config struct {
 	// without a directory holds no segments. A directory that does not
 	// exist yet is empty.
 	Dirs map[catalog.Namespace]string
+
+	// Roots maps a namespace to the tree DeleteNamespace removes, when that
+	// is more than its directory. Defaults to the namespace's directory.
+	Roots map[catalog.Namespace]string
+}
+
+// DataDirConfig is the layout under a Jetstream data directory: main
+// segments in <dataDir>/segments, and the bootstrap-time live capture in
+// <dataDir>/backfill/live_segments, whose namespace owns all of
+// <dataDir>/backfill.
+func DataDirConfig(fs vfs.FS, dataDir string) Config {
+	return Config{
+		FS: fs,
+		Dirs: map[catalog.Namespace]string{
+			catalog.Main:          filepath.Join(dataDir, "segments"),
+			catalog.BootstrapLive: filepath.Join(dataDir, "backfill", "live_segments"),
+		},
+		Roots: map[catalog.Namespace]string{
+			catalog.BootstrapLive: filepath.Join(dataDir, "backfill"),
+		},
+	}
 }
 
 // SealedHook hears about each sealed segment the catalog learns of from a
@@ -45,8 +66,9 @@ type SealedHook func(v catalog.SegmentView, path string) error
 
 // Catalog is the local catalog. It is safe for concurrent use.
 type Catalog struct {
-	fs   vfs.FS
-	dirs map[catalog.Namespace]string
+	fs    vfs.FS
+	dirs  map[catalog.Namespace]string
+	roots map[catalog.Namespace]string
 
 	mu  sync.Mutex
 	rev uint64
@@ -74,6 +96,13 @@ func New(cfg Config) (*Catalog, error) {
 			return nil, fmt.Errorf("catalog/local: unknown namespace %q", ns)
 		}
 	}
+	roots := maps(cfg.Dirs)
+	for ns, root := range cfg.Roots {
+		if _, ok := cfg.Dirs[ns]; !ok {
+			return nil, fmt.Errorf("catalog/local: root for namespace %q with no directory", ns)
+		}
+		roots[ns] = root
+	}
 	fs := cfg.FS
 	if fs == nil {
 		fs = vfs.Default
@@ -81,6 +110,7 @@ func New(cfg Config) (*Catalog, error) {
 	return &Catalog{
 		fs:            fs,
 		dirs:          maps(cfg.Dirs),
+		roots:         roots,
 		sealed:        map[catalog.Namespace]catalog.SegmentList{},
 		active:        map[catalog.Namespace]catalog.ActiveSource{},
 		scannedActive: map[catalog.Namespace]catalog.SegmentView{},
@@ -170,23 +200,30 @@ func (c *Catalog) putSealedLocked(v catalog.SegmentView) error {
 // rewrote it (compaction) and wants the next Snapshot to see the new
 // generation without a full Refresh. A missing file drops the segment.
 func (c *Catalog) Reload(ns catalog.Namespace, idx uint64) error {
+	_, _, err := c.reload(ns, idx)
+	return err
+}
+
+// reload is Reload, also returning the segment's view and whether it is
+// still on disk.
+func (c *Catalog) reload(ns catalog.Namespace, idx uint64) (catalog.SegmentView, bool, error) {
 	path := c.Path(ns, idx)
 	if path == "" {
-		return fmt.Errorf("catalog/local: reload segment %d in namespace %q with no directory", idx, ns)
+		return catalog.SegmentView{}, false, fmt.Errorf("catalog/local: reload segment %d in namespace %q with no directory", idx, ns)
 	}
 	v, err := loadSealed(c.fs, ns, idx, path)
 	if oserror.IsNotExist(err) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.dropSealedLocked(ns, idx)
-		return nil
+		return catalog.SegmentView{}, false, nil
 	}
 	if err != nil {
-		return err
+		return catalog.SegmentView{}, false, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.putSealedLocked(v)
+	return v, true, c.putSealedLocked(v)
 }
 
 func (c *Catalog) dropSealedLocked(ns catalog.Namespace, idx uint64) {
@@ -224,6 +261,7 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 	// What the catalog knows is sampled before the directory is listed, so
 	// every change that lands during the scan is newer than this sample.
 	c.mu.Lock()
+	_, attached := c.active[ns]
 	known := make(map[uint64]catalog.SegmentView, c.sealed[ns].Len())
 	for _, v := range c.sealed[ns].Segments() {
 		known[v.Index] = v
@@ -250,7 +288,9 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 			return fmt.Errorf("catalog/local: %s: %w", f.Path, err)
 		}
 		if gen == 0 {
-			if i != len(files)-1 {
+			// Snapshot reads an attached writer's tail from the writer, so
+			// only scan the file when nobody is writing it.
+			if i != len(files)-1 || attached {
 				continue
 			}
 			blocks, err := segment.ActiveBlocksFS(c.fs, f.Path)
@@ -295,7 +335,9 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 		c.sealed[ns] = list
 		c.rev++
 	}
-	if hasTail {
+	// A tail the scan read as active may have sealed since; the sealed view
+	// above supersedes it.
+	if n := len(sealed); hasTail && (n == 0 || sealed[n-1].Index < tail.Index) {
 		c.scannedActive[ns] = tail
 	} else {
 		delete(c.scannedActive, ns)
@@ -312,7 +354,9 @@ func sameGeneration(a, b catalog.SegmentView) bool {
 func (c *Catalog) DropNamespace(ns catalog.Namespace) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.sealed[ns].Len() > 0 {
+	_, active := c.active[ns]
+	_, scanned := c.scannedActive[ns]
+	if c.sealed[ns].Len() > 0 || active || scanned {
 		c.rev++
 	}
 	delete(c.sealed, ns)

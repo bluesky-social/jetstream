@@ -199,6 +199,12 @@ func newMergeFixture(t *testing.T, sources [][]segment.Event, repoRevs map[strin
 
 	liveDir := filepath.Join(dataDir, "backfill", "live_segments")
 	require.NoError(t, os.MkdirAll(liveDir, 0o755))
+	if len(sources) == 0 {
+		// The bootstrap-live writer creates a segment when it opens, so a
+		// capture with no events is one empty sealed segment. An empty
+		// namespace is the restart-after-cleanup guard's signal.
+		sources = [][]segment.Event{nil}
+	}
 	for _, evs := range sources {
 		w, err := ingest.Open(ingest.Config{
 			SegmentsDir: liveDir,

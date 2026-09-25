@@ -77,7 +77,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			ReadLogRetentionBytes: o.cfg.ReadLogRetentionBytes,
 			OnEvent:               o.cfg.OnEvent,
 			OnUpstreamEventSeen:   o.cfg.LiveMetrics.NoteLastSeenUpstreamEvent,
-			Catalog:               o.cfg.Catalog,
+			Catalog:               o.segments(),
 			Namespace:             catalog.Main,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,
 			Dial:                  o.cfg.LiveDial,

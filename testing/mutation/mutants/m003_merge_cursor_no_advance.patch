@@ -15,15 +15,14 @@ expected-tier: restart-multisource
 tiers: restart-multisource
 
 diff --git a/internal/ingest/orchestrator/merge_runner.go b/internal/ingest/orchestrator/merge_runner.go
-index 6118c4c..54f4981 100644
 --- a/internal/ingest/orchestrator/merge_runner.go
 +++ b/internal/ingest/orchestrator/merge_runner.go
-@@ -86,7 +86,7 @@ func (r *mergeRunner) run(ctx context.Context) error {
+@@ -92,7 +92,7 @@
  			if err := r.simulateCrash(ctx, crashpoint.AfterMergeDstFlushBeforeSourceCommit); err != nil {
  				return err
  			}
--			if err := commitSourceComplete(r.store, r.cache, sf.Idx+1, perDID, r.now()); err != nil {
-+			if err := commitSourceComplete(r.store, r.cache, sf.Idx, perDID, r.now()); err != nil {
+-			if err := commitSourceComplete(r.store, r.cache, sf.Index+1, perDID, r.now()); err != nil {
++			if err := commitSourceComplete(r.store, r.cache, sf.Index, perDID, r.now()); err != nil {
  				return err
  			}
  			r.metrics.incMergeSegmentsConsumed()
