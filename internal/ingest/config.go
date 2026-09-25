@@ -5,17 +5,16 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
-// DurableBatchHook stages block-specific metadata into the same synced Pebble
+// DurableBatchHook stages block-specific metadata into the same metadata
 // batch that persists the writer's next sequence after a segment block is
 // durable. prepareValue is the value sampled by DurableBatchPrepareValue before
 // the block was detached/flushed.
-type DurableBatchHook func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool, prepareValue any) (afterCommit func(), afterDone func(error), err error)
+type DurableBatchHook func(ctx context.Context, b metastore.Batch, nextSeq uint64, force bool, prepareValue any) (afterCommit func(), afterDone func(error), err error)
 
 // defaultMaxSegmentBytes is the rotation threshold. docs/README.md §3.1.1
 // names ~256MB as the target sealed-segment size. Operator-tunable
@@ -40,8 +39,13 @@ type Config struct {
 	// filesystem.
 	FS vfs.FS
 
-	// Store is the shared metadata pebble db. Required.
-	Store *store.Store
+	// Store is the shared metadata store. Required.
+	//
+	// The writer also keeps its sequence lease here (seq/max_reserved and the
+	// seq/gap/ registry, docs/README.md §10.1). The lease is a local-mode
+	// mechanism: it assumes this process is the only writer of SeqKey, which
+	// disaggregated mode guarantees differently (fenced leader epochs).
+	Store metastore.Store
 
 	// MaxSegmentBytes is the rotation threshold in compressed bytes
 	// after the 256-byte reserved header. Default 256<<20 when zero.

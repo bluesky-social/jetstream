@@ -17,11 +17,9 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 )
@@ -56,28 +54,28 @@ func collectProcess(now time.Time, startedAt time.Time) ProcessInfo {
 	}
 }
 
-func collectPhase(s *store.Store) (PhaseInfo, error) {
-	p, err := lifecycle.ReadPhase(context.Background(), pebblestore.New(s, ""))
+func collectPhase(s metastore.Store) (PhaseInfo, error) {
+	p, err := lifecycle.ReadPhase(context.Background(), s)
 	if err != nil {
 		return PhaseInfo{}, err
 	}
-	at, err := lifecycle.ReadPhaseEnteredAt(context.Background(), pebblestore.New(s, ""))
+	at, err := lifecycle.ReadPhaseEnteredAt(context.Background(), s)
 	if err != nil {
 		return PhaseInfo{}, err
 	}
 	return PhaseInfo{Phase: p, PhaseEnteredAt: at}, nil
 }
 
-func collectLive(s *store.Store, now time.Time, lastSeen func() time.Time, writer func() *ingest.Writer) (LiveStats, error) {
+func collectLive(s metastore.Store, now time.Time, lastSeen func() time.Time, writer func() *ingest.Writer) (LiveStats, error) {
 	cur, err := live.LoadUpstreamCursor(s, live.CursorKey)
 	if err != nil {
 		return LiveStats{}, err
 	}
-	nextSeq, _, err := s.GetUint64LE(live.SteadySeqKey)
+	nextSeq, _, err := metastore.GetUint64LE(context.Background(), s, live.SteadySeqKey)
 	if err != nil {
 		return LiveStats{}, err
 	}
-	bootSeq, _, err := s.GetUint64LE(live.BootstrapSeqKey)
+	bootSeq, _, err := metastore.GetUint64LE(context.Background(), s, live.BootstrapSeqKey)
 	if err != nil {
 		return LiveStats{}, err
 	}
@@ -100,7 +98,7 @@ func collectLive(s *store.Store, now time.Time, lastSeen func() time.Time, write
 	return stats, nil
 }
 
-func collectBackfill(s *store.Store) (BackfillStats, error) {
+func collectBackfill(s metastore.Store) (BackfillStats, error) {
 	counts, err := backfill.CountStatuses(s)
 	if err != nil {
 		return BackfillStats{}, err
@@ -109,7 +107,7 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 	if err != nil {
 		return BackfillStats{}, err
 	}
-	timing, err := lifecycle.ReadBackfillTiming(context.Background(), pebblestore.New(s, ""))
+	timing, err := lifecycle.ReadBackfillTiming(context.Background(), s)
 	if err != nil {
 		return BackfillStats{}, err
 	}
@@ -135,12 +133,12 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 	}, nil
 }
 
-func collectBackfillFast(s *store.Store) (BackfillStats, error) {
+func collectBackfillFast(s metastore.Store) (BackfillStats, error) {
 	fleet, err := collectBackfillFleet(s)
 	if err != nil {
 		return BackfillStats{}, err
 	}
-	timing, err := lifecycle.ReadBackfillTiming(context.Background(), pebblestore.New(s, ""))
+	timing, err := lifecycle.ReadBackfillTiming(context.Background(), s)
 	if err != nil {
 		return BackfillStats{}, err
 	}
@@ -175,7 +173,7 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 
 const backfillTopRemainingHosts = 10
 
-func collectBackfillFleet(s *store.Store) (BackfillStats, error) {
+func collectBackfillFleet(s metastore.Store) (BackfillStats, error) {
 	hosts, err := backfill.ListPDSHosts(s)
 	if err != nil {
 		return BackfillStats{}, err
@@ -262,7 +260,7 @@ func normalizeRequest(req Request) Request {
 	return req
 }
 
-func collectHosts(s *store.Store, sortBy string) (HostDiagnostics, error) {
+func collectHosts(s metastore.Store, sortBy string) (HostDiagnostics, error) {
 	statuses, err := backfill.ListHostStatuses(s)
 	if err != nil {
 		return HostDiagnostics{}, err
@@ -336,7 +334,7 @@ func hostRowFromBackfill(hs *backfill.HostStatus) HostRow {
 	return row
 }
 
-func collectAccount(ctx context.Context, s *store.Store, resolver identity.Resolver, req Request) AccountLookup {
+func collectAccount(ctx context.Context, s metastore.Store, resolver identity.Resolver, req Request) AccountLookup {
 	acct := AccountLookup{}
 	var did atmos.DID
 	var ok bool
@@ -616,29 +614,16 @@ func mergeTree(dst *TreeAggregate, src TreeAggregate) {
 	}
 }
 
-func collectPebble(s *store.Store, dataDir string) (PebbleStats, error) {
+func collectPebble(s metastore.Store) (PebbleStats, error) {
 	stats := PebbleStats{KeyspaceCounts: make(map[string]uint64, len(keyspacePrefixes))}
 
-	// On-disk size of meta.pebble/.
-	pebbleDir := filepath.Join(dataDir, store.PebbleSubdir)
-	if err := filepath.WalkDir(pebbleDir, func(_ string, d fs.DirEntry, err error) error {
+	// On-disk size of meta.pebble/; zero for stores without a local footprint.
+	if d, ok := metastore.DiskStatsOf(s); ok {
+		n, err := d.DiskBytes()
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return fs.SkipAll
-			}
-			return err
+			return PebbleStats{}, fmt.Errorf("status: metadata disk bytes: %w", err)
 		}
-		if d.IsDir() {
-			return nil
-		}
-		fi, err := d.Info()
-		if err != nil {
-			return err
-		}
-		stats.DiskBytes += fi.Size()
-		return nil
-	}); err != nil {
-		return PebbleStats{}, fmt.Errorf("status: walk %s: %w", pebbleDir, err)
+		stats.DiskBytes = n
 	}
 
 	// Per-prefix key counts.
@@ -656,24 +641,19 @@ func collectPebbleFast() PebbleStats {
 	return PebbleStats{KeyspaceCounts: make(map[string]uint64, len(keyspacePrefixes))}
 }
 
-func countKeysWithPrefix(s *store.Store, prefix string) (uint64, error) {
+func countKeysWithPrefix(s metastore.Store, prefix string) (uint64, error) {
 	lower := []byte(prefix)
-	upper := store.PrefixUpperBound(lower)
-
-	it, err := s.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
+	it, err := s.NewIter(context.Background(), lower, metastore.PrefixUpperBound(lower))
 	if err != nil {
 		return 0, fmt.Errorf("status: open iter %q: %w", prefix, err)
 	}
 	defer func() { _ = it.Close() }()
 
 	var n uint64
-	for it.First(); it.Valid(); it.Next() {
+	for it.Next() {
 		n++
 	}
-	if err := it.Error(); err != nil {
+	if err := it.Err(); err != nil {
 		return 0, fmt.Errorf("status: iter %q: %w", prefix, err)
 	}
 	return n, nil
@@ -733,7 +713,7 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		if err != nil {
 			return nil, err
 		}
-		pdb, err = collectPebble(opts.Store, opts.DataDir)
+		pdb, err = collectPebble(opts.Store)
 		if err != nil {
 			return nil, err
 		}

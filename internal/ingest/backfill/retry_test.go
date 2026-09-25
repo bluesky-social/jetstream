@@ -18,9 +18,8 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	metastore "github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	atmossync "github.com/jcalabro/atmos/sync"
@@ -29,10 +28,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newRetryTestWriter(t *testing.T) (*metastore.Store, *ingest.Writer, string) {
+func newRetryTestWriter(t *testing.T) (*pebblestore.Store, *ingest.Writer, string) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := metastore.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -104,7 +103,7 @@ func TestRetryRunner_ScanDueFiltersCandidates(t *testing.T) {
 func TestRetryRunner_RoutesStampedReposDirectAndCachesClient(t *testing.T) {
 	t.Parallel()
 	st, writer, _ := newRetryTestWriter(t)
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	pdsHostname := "pds.direct.example"
 	dids := []atmos.DID{"did:plc:direct-one", "did:plc:direct-two"}
@@ -150,7 +149,7 @@ func TestRetryRunner_RoutesStampedReposDirectAndCachesClient(t *testing.T) {
 func TestRetryRunner_ScanDueRejectsCorruptRows(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
-	require.NoError(t, s.db.Set(repoKey("did:plc:corrupt"), []byte("not json"), pebble.Sync))
+	require.NoError(t, s.db.Set(context.Background(), repoKey("did:plc:corrupt"), []byte("not json")))
 
 	r := &retryRunner{cfg: RetryConfig{Store: s.db}}
 	err := r.scanDue(context.Background(), time.Now(), func(retryCandidate) error { return nil })
@@ -196,7 +195,7 @@ func TestRetryRunner_ScanDueSkipsLegacyPending(t *testing.T) {
 func TestRunPendingRepoRetryPassProcessesOnlyPending(t *testing.T) {
 	t.Parallel()
 	st, w, segmentsDir := newRetryTestWriter(t)
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	pending := atmos.DID("did:plc:pending-only")
 	failed := atmos.DID("did:plc:failed-skip")
@@ -250,7 +249,7 @@ func TestRunPendingRepoRetryPassProcessesOnlyPending(t *testing.T) {
 func TestRunPendingRepoRetryPassReschedulesOnConfiguredInterval(t *testing.T) {
 	t.Parallel()
 	st, w, _ := newRetryTestWriter(t)
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	did := atmos.DID("did:plc:pending-transient-fail")
 	now := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -293,7 +292,7 @@ func TestRunPendingRepoRetryPassReschedulesOnConfiguredInterval(t *testing.T) {
 func TestRetryRunner_SuccessAppendsResyncAndCompletes(t *testing.T) {
 	t.Parallel()
 	st, w, segmentsDir := newRetryTestWriter(t)
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	did := atmos.DID("did:plc:retryok")
 	fixture := buildRepoFixture(t, did)
@@ -344,7 +343,7 @@ func TestRetryRunner_SuccessAppendsResyncAndCompletes(t *testing.T) {
 func TestRetryRunner_StalePDSFallsBackToRelayAndRestamps(t *testing.T) {
 	t.Parallel()
 	st, w, _ := newRetryTestWriter(t)
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	did := atmos.DID("did:plc:migrated")
 	fixture := buildRepoFixture(t, did)
@@ -399,7 +398,7 @@ func TestRetryRunner_StalePDSFallsBackToRelayAndRestamps(t *testing.T) {
 func TestRetryRunner_DIDMismatchedCARFailsRetry(t *testing.T) {
 	t.Parallel()
 	st, w, segmentsDir := newRetryTestWriter(t)
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	victim := atmos.DID("did:plc:retryvictim")
 	imposter := buildRepoFixture(t, atmos.DID("did:plc:retryimposter"))
@@ -440,7 +439,7 @@ func TestRetryRunner_DIDMismatchedCARFailsRetry(t *testing.T) {
 func TestRetryRunner_RateLimitParksHost(t *testing.T) {
 	t.Parallel()
 	st, w, _ := newRetryTestWriter(t)
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	reset := now.Add(2 * time.Hour)
@@ -500,7 +499,7 @@ func TestRetryRunner_RateLimitParksHost(t *testing.T) {
 func TestRetryRunner_DirectRateLimitParksRosterHostname(t *testing.T) {
 	t.Parallel()
 	st, writer, _ := newRetryTestWriter(t)
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	reset := now.Add(time.Hour)
@@ -585,7 +584,7 @@ func mustURLHost(t *testing.T, raw string) string {
 func TestRetryRunner_DownloadTimeoutBoundsStalledFetch(t *testing.T) {
 	t.Parallel()
 	st, w, _ := newRetryTestWriter(t)
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	did := atmos.DID("did:plc:retrystall")
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)

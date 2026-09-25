@@ -196,7 +196,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(err)
 	}
 	rt.metaStore = metaStore
-	// Transitional (S1.3): packages already on metastore share the one raw
+	// Transitional until S1.6: packages already on metastore share the one raw
 	// store, so its fault injector still fires exactly once per write.
 	metaKV := pebblestore.New(metaStore, opts.DataDir)
 
@@ -336,7 +336,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	orch, err := orchestrator.New(orchestrator.Config{
 		DataDir:        opts.DataDir,
 		FS:             opts.StorageFS,
-		Store:          metaStore,
+		Store:          metaKV,
 		RelayURL:       opts.RelayURL,
 		HTTPClient:     xrpcClient.HTTPClient.Val(),
 		Directory:      directory,
@@ -405,7 +405,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.orchestrator = orch
 
 	statusCollector, err := status.New(status.Options{
-		Store:                 metaStore,
+		Store:                 metaKV,
 		DataDir:               opts.DataDir,
 		Manifest:              mft,
 		CursorLookback:        opts.CursorLookback,
@@ -442,7 +442,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// nil-pointer reads are harmless.
 	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
-		Store:     metaStore,
+		Store:     metaKV,
 		Manifest:  mft,
 		FS:        opts.StorageFS,
 		WriterRef: &writerPtr,
@@ -456,7 +456,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// handler owns this one NSID while atmos xrpcserver keeps the rest.
 	srv.RegisterPublicRoute("GET /xrpc/network.bsky.jetstream.subscribeEvents", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
-		Store:     metaStore,
+		Store:     metaKV,
 		Manifest:  mft,
 		FS:        opts.StorageFS,
 		WriterRef: &writerPtr,

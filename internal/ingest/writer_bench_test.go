@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -29,7 +29,7 @@ func benchEvent(payload []byte) segment.Event {
 func newBenchWriter(b *testing.B, root string, asyncWorkers int) *Writer {
 	b.Helper()
 	segDir := filepath.Join(root, "segments")
-	st, err := store.Open(filepath.Join(root, "meta"), nil)
+	st, err := pebblestore.Open(filepath.Join(root, "meta"), nil)
 	if err != nil {
 		b.Fatal(err)
 	}

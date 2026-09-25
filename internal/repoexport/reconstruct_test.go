@@ -10,7 +10,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/mst"
@@ -427,16 +427,16 @@ func TestReconstruct_ValidatesConfig(t *testing.T) {
 	require.ErrorContains(t, err, "Selector is required")
 }
 
-func newTestDataDir(t *testing.T) (string, *store.Store) {
+func newTestDataDir(t *testing.T) (string, *pebblestore.Store) {
 	t.Helper()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	return dataDir, st
 }
 
-func writeSegmentTree(t *testing.T, st *store.Store, segmentsDir string, events []segment.Event) {
+func writeSegmentTree(t *testing.T, st *pebblestore.Store, segmentsDir string, events []segment.Event) {
 	t.Helper()
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       segmentsDir,
@@ -454,7 +454,7 @@ func writeSegmentTree(t *testing.T, st *store.Store, segmentsDir string, events 
 	require.NoError(t, w.SealActiveAndClose())
 }
 
-func writeActiveSegmentTree(t *testing.T, st *store.Store, segmentsDir string, events []segment.Event) {
+func writeActiveSegmentTree(t *testing.T, st *pebblestore.Store, segmentsDir string, events []segment.Event) {
 	t.Helper()
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:       segmentsDir,

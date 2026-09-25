@@ -9,7 +9,6 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
-	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/obs"
 )
 
@@ -50,13 +49,13 @@ func New(cfg Config) (*Orchestrator, error) {
 // subsystems. This matches the previous cmd/jetstream behavior.
 func (o *Orchestrator) Run(ctx context.Context) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
-		phase, err := lifecycle.ReadPhase(ctx, pebblestore.New(o.cfg.Store, o.cfg.DataDir))
+		phase, err := lifecycle.ReadPhase(ctx, o.cfg.Store)
 		if err != nil {
 			return fmt.Errorf("orchestrator: read phase: %w", err)
 		}
 		if phase == "" {
 			phase = lifecycle.PhaseBootstrap
-			if err := lifecycle.WritePhase(ctx, pebblestore.New(o.cfg.Store, o.cfg.DataDir), phase, time.Now().UTC()); err != nil {
+			if err := lifecycle.WritePhase(ctx, o.cfg.Store, phase, time.Now().UTC()); err != nil {
 				return fmt.Errorf("orchestrator: write initial phase: %w", err)
 			}
 		}

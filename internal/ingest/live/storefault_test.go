@@ -4,7 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,15 +26,16 @@ func TestConsumer_SaveCursorFailsLoudOnStoreFault(t *testing.T) {
 
 	const cursorKey = "relay/cursor"
 	injected := errors.New("injected: relay cursor commit failed")
-	fault := &store.KeyPrefixFault{
+	fault := &metastore.KeyPrefixFault{
 		Prefix:  []byte(cursorKey),
-		Op:      store.WriteOpBatchCommit,
+		Op:      metastore.WriteOpBatchCommit,
 		Ordinal: 1,
 		Err:     injected,
 	}
-	st, err := store.Open(t.TempDir(), nil, store.WithFaultInjector(fault))
+	stRaw, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = stRaw.Close() })
+	st := metastore.WithFaults(stRaw, fault)
 
 	// Minimal consumer: saveCursorAndSyncState only needs Store + CursorKey
 	// (SyncStateStore nil → cursor-only batch, exactly the relay/cursor write).

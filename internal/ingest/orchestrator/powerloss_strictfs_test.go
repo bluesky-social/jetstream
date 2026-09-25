@@ -14,7 +14,8 @@ import (
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/errors/oserror"
@@ -106,8 +107,8 @@ func runStrictMemCompactionPowerLossCase(t *testing.T, point crashpoint.Point) {
 
 // TestRunMerge_StrictMemPowerLossCleanupComplete pins the durability
 // ordering between the backfill-subtree removal and the SyncWrites merge
-// cursor deletes at the tail of merge cleanup. deleteMergeCursor commits with
-// store.SyncWrites, so if the RemoveAll of data/backfill is not fsynced before
+// cursor deletes at the tail of merge cleanup. deleteMergeCursor commits
+// durably, so if the RemoveAll of data/backfill is not fsynced before
 // those deletes, a power cut at AfterMergeCleanupComplete rolls back the dirent
 // removal while keeping the cursor deletion durable. On restart the phase is
 // still PhaseMerging, live_segments reappears, the restart-after-cleanup guard
@@ -204,7 +205,7 @@ func TestRunMerge_StrictMemPowerLossCleanupGuard(t *testing.T) {
 	st := openStrictMemStore(t, fs, dataDir)
 	seedStrictMemBackfillRev(t, st, survivorDID, "3l5")
 	// The prior drain advanced the cursor past the single source segment.
-	require.NoError(t, st.SetVersionedUint64LE(mergeNextSourceIdxKey, mergeCursorV1, 1))
+	require.NoError(t, metastore.SetVersionedUint64LE(context.Background(), st, mergeNextSourceIdxKey, mergeCursorV1, 1))
 	fs.ResetToSyncedState()
 	fs.SetIgnoreSyncs(false)
 
@@ -243,7 +244,7 @@ func TestRunMerge_StrictMemPowerLossCleanupGuard(t *testing.T) {
 func newStrictMemMergeOrchestrator(
 	dataDir string,
 	fs *vfs.MemFS,
-	st *store.Store,
+	st *pebblestore.Store,
 	inj crashpoint.Injector,
 ) *Orchestrator {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -263,7 +264,7 @@ func newStrictMemMergeOrchestrator(
 	}
 }
 
-func seedStrictMemBackfillRev(t *testing.T, st *store.Store, did, rev string) {
+func seedStrictMemBackfillRev(t *testing.T, st *pebblestore.Store, did, rev string) {
 	t.Helper()
 	rs := &backfill.RepoStatus{
 		Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete, Rev: rev},
@@ -271,7 +272,7 @@ func seedStrictMemBackfillRev(t *testing.T, st *store.Store, did, rev string) {
 	}
 	enc, err := backfill.EncodeRepoStatus(rs)
 	require.NoError(t, err)
-	require.NoError(t, st.Set(backfill.RepoKey(did), enc, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), backfill.RepoKey(did), enc))
 }
 
 func readAllStrictMemSegments(t *testing.T, fs *vfs.MemFS, segmentsDir string) []segment.Event {
@@ -305,7 +306,7 @@ func (i *strictFSPowerLossPointInjector) SimulateCrash(_ context.Context, point 
 func newStrictMemCompactionOrchestrator(
 	dataDir string,
 	fs *vfs.MemFS,
-	st *store.Store,
+	st *pebblestore.Store,
 	liveSet *tombstone.Set,
 	inj crashpoint.Injector,
 ) *Orchestrator {
@@ -325,9 +326,9 @@ func newStrictMemCompactionOrchestrator(
 	}
 }
 
-func openStrictMemStore(t *testing.T, fs *vfs.MemFS, dataDir string) *store.Store {
+func openStrictMemStore(t *testing.T, fs *vfs.MemFS, dataDir string) *pebblestore.Store {
 	t.Helper()
-	st, err := store.Open(dataDir, nil, store.WithFS(fs))
+	st, err := pebblestore.Open(dataDir, nil, pebblestore.WithFS(fs))
 	require.NoError(t, err)
 	return st
 }

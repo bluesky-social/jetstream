@@ -3,11 +3,13 @@ package backfill
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/cockroachdb/pebble"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/memstore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/repo"
@@ -23,10 +25,19 @@ import (
 // Store with no metrics.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	return NewStore(db, nil)
+	return newSeededStore(t, db, nil)
+}
+
+// newSeededStore is NewStore plus the SeedCounts call every production entry
+// point makes before its first write.
+func newSeededStore(t testing.TB, db metastore.Store, metrics *Metrics) *Store {
+	t.Helper()
+	s := NewStore(db, metrics)
+	require.NoError(t, s.SeedCounts(t.Context()))
+	return s
 }
 
 // TestStore_Lookup_Missing covers the StateUnknown path: a fresh
@@ -111,7 +122,7 @@ func TestStore_Lookup_CorruptRow(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	did := atmos.DID("did:plc:abc")
-	require.NoError(t, s.db.Set(repoKey(did), []byte("not json"), pebble.Sync))
+	require.NoError(t, s.db.Set(context.Background(), repoKey(did), []byte("not json")))
 
 	_, err := s.Lookup(context.Background(), did)
 	require.ErrorContains(t, err, "decode RepoStatus")
@@ -251,12 +262,12 @@ func TestStore_OnComplete_WritesComplete(t *testing.T) {
 func TestStore_OnCompleteQueuesWhenBatcherConfigured(t *testing.T) {
 	t.Parallel()
 
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	metrics := NewMetrics(prometheus.NewRegistry())
-	s := NewStore(st, metrics)
+	s := newSeededStore(t, st, metrics)
 	cb := NewCompletionBatcher(s, metrics)
 	s.SetCompletionBatcher(cb)
 
@@ -285,14 +296,13 @@ func TestStore_OnCompleteQueuesWhenBatcherConfigured(t *testing.T) {
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
 	}
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 
 	requireLookupState(t, s, did, atmosbackfill.StateComplete)
 	require.True(t, hookRan)
@@ -321,7 +331,7 @@ func TestStore_OnCompleteRunsHookAfterDurableRow(t *testing.T) {
 	t.Parallel()
 
 	db := newTestStore(t).db
-	s := NewStore(db, nil)
+	s := newSeededStore(t, db, nil)
 
 	ctx := context.Background()
 	did := atmos.DID("did:plc:hooked")
@@ -330,9 +340,8 @@ func TestStore_OnCompleteRunsHookAfterDurableRow(t *testing.T) {
 	var hookSawComplete bool
 	s.afterComplete = func(ctx context.Context, got atmos.DID) error {
 		require.Equal(t, did, got)
-		val, closer, err := db.Get(RepoKey(string(got)))
+		val, err := db.Get(context.Background(), RepoKey(string(got)))
 		require.NoError(t, err)
-		defer func() { _ = closer.Close() }()
 
 		rs, err := DecodeRepoStatus(val)
 		require.NoError(t, err)
@@ -705,33 +714,64 @@ func TestStore_MaintainsCounts(t *testing.T) {
 	require.Equal(t, Counts{Total: 3, Complete: 2, Failed: 1}, counts)
 }
 
+// A data dir with repo/ rows but no backfill/counts row (one that predates
+// the counts key) gets its counts from a full tally at session start, and
+// maintains them incrementally from there.
 func TestStore_SeedsMissingCountsFromRows(t *testing.T) {
 	t.Parallel()
-	s := newTestStore(t)
-	ctx := context.Background()
+	db := memstore.New()
+	ctx := t.Context()
 
-	existing := atmos.DID("did:plc:existing")
-	require.NoError(t, s.putRepoStatus(existing, &RepoStatus{
-		Backfill: RepoBackfillStatus{Status: StatusComplete},
-		Active:   true,
-	}))
+	raw := NewStore(db, nil)
+	statuses := []Status{StatusNotStarted, StatusPending, StatusComplete, StatusComplete, StatusFailed, StatusUnavailable}
+	for i, st := range statuses {
+		did := atmos.DID(fmt.Sprintf("did:plc:seed%02d", i))
+		require.NoError(t, raw.putRepoStatus(did, &RepoStatus{Backfill: RepoBackfillStatus{Status: st}, Active: true}))
+	}
+	_, ok, err := LoadCounts(db)
+	require.NoError(t, err)
+	require.False(t, ok, "precondition: counts row absent")
 
-	next := atmos.DID("did:plc:next")
-	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: next, Active: true}))
-
-	counts, ok, err := LoadCounts(s.db)
+	s := NewStore(db, nil)
+	require.NoError(t, s.SeedCounts(ctx))
+	want, err := CountStatuses(db)
+	require.NoError(t, err)
+	got, ok, err := LoadCounts(db)
 	require.NoError(t, err)
 	require.True(t, ok)
-	require.Equal(t, Counts{Total: 2, Discovered: 1, Complete: 1}, counts)
+	require.Equal(t, want, got)
+	require.Equal(t, Counts{Total: 6, Discovered: 1, Pending: 1, Complete: 2, Failed: 1, Unavailable: 1}, got)
+
+	// Idempotent: a second seed does not re-tally over incremental counts.
+	require.NoError(t, s.OnDiscover(ctx, atmossync.ListReposEntry{DID: "did:plc:next", Active: true}))
+	require.NoError(t, s.SeedCounts(ctx))
+	got, _, err = LoadCounts(db)
+	require.NoError(t, err)
+	want.Total++
+	want.Discovered++
+	require.Equal(t, want, got)
+}
+
+// A counts-maintaining write before SeedCounts is an internal error; it must
+// not quietly tally a possibly torn repo/ scan.
+func TestStore_WriteBeforeSeedCountsFails(t *testing.T) {
+	t.Parallel()
+	db := memstore.New()
+	s := NewStore(db, nil)
+	err := s.OnDiscover(t.Context(), atmossync.ListReposEntry{DID: "did:plc:early", Active: true})
+	require.ErrorIs(t, err, errCountsNotSeeded)
+	_, found, err := LoadRepoStatus(db, "did:plc:early")
+	require.NoError(t, err)
+	require.False(t, found, "the failed write must not land its repo row")
 }
 
 func TestStore_HostAggregates_FailThenComplete(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	did := atmos.DID("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
 	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
@@ -765,11 +805,11 @@ func TestStore_HostAggregates_FailThenComplete(t *testing.T) {
 
 func TestStore_HostAggregates_ActiveFlip(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	did := atmos.DID("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
 	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
@@ -789,11 +829,11 @@ func TestStore_HostAggregates_ActiveFlip(t *testing.T) {
 func TestStore_StaleActiveFlipCannotRegressCompletedStatus(t *testing.T) {
 	t.Parallel()
 
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ctx := context.Background()
 	did := atmos.DID("did:plc:staleactiveflip")
 	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: did, Active: true}))
@@ -807,14 +847,13 @@ func TestStore_StaleActiveFlipCannotRegressCompletedStatus(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
 	}
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 
 	require.NoError(t, bs.updateRepoActive(did, false))
 

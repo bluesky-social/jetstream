@@ -14,7 +14,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
@@ -31,9 +30,9 @@ func TestServe_GracefulShutdownClosesSubscriber(t *testing.T) {
 
 	dataDir := t.TempDir()
 	{
-		s, err := store.Open(dataDir, nil)
+		s, err := pebblestore.Open(dataDir, nil)
 		require.NoError(t, err)
-		require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(s, dataDir), lifecycle.PhaseSteadyState, time.Now().UTC()))
+		require.NoError(t, lifecycle.WritePhase(t.Context(), s, lifecycle.PhaseSteadyState, time.Now().UTC()))
 		require.NoError(t, s.Close())
 	}
 

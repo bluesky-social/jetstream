@@ -23,10 +23,10 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -467,7 +467,7 @@ func restartBootstrapLiveLimitsFromEnv(t *testing.T) (int64, int) {
 // crash/predicate tiers). The fault fails the Ordinal-th batch_commit that
 // touches a key under the configured prefix — the merge source-cursor commit
 // rides merge/next_source_idx, the boundary m006 swallows.
-func newOracleStoreFaultFromEnv(t *testing.T) store.FaultInjector {
+func newOracleStoreFaultFromEnv(t *testing.T) metastore.FaultInjector {
 	t.Helper()
 
 	prefix := os.Getenv(envRestartStoreFaultPrefix)
@@ -479,9 +479,9 @@ func newOracleStoreFaultFromEnv(t *testing.T) store.FaultInjector {
 		require.NoError(t, parseIntEnv(os.LookupEnv, envRestartStoreFaultOrdinal, &ordinal))
 		require.Greaterf(t, ordinal, 0, "%s must be >= 1", envRestartStoreFaultOrdinal)
 	}
-	return &store.KeyPrefixFault{
+	return &metastore.KeyPrefixFault{
 		Prefix:  []byte(prefix),
-		Op:      store.WriteOpBatchCommit,
+		Op:      metastore.WriteOpBatchCommit,
 		Ordinal: ordinal,
 		Err:     errStoreFaultInjected,
 	}

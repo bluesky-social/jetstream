@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"errors"
 	"math/rand/v2"
 	"strconv"
@@ -10,8 +11,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
-	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -148,7 +148,7 @@ func runSwarmIteration(t *testing.T, rng *rand.Rand) {
 	s := generateScenario(rng)
 	fix := newMergeFixture(t, s.sourceEvents, s.backfillRevs)
 
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 
 	// 30% chance of a kill-point injection on the flush-before-commit path.
 	// On crash, restart and run merge to completion.
@@ -202,13 +202,12 @@ func runSwarmIteration(t *testing.T, rng *rand.Rand) {
 
 	// Invariant 5+6: per-DID Rev advanced; Backfill.Rev unchanged.
 	for did, lastRev := range s.lastSrcRev {
-		val, closer, err := fix.store.Get(backfill.RepoKey(did))
-		if errors.Is(err, store.ErrNotFound) {
+		val, err := fix.store.Get(context.Background(), backfill.RepoKey(did))
+		if errors.Is(err, metastore.ErrNotFound) {
 			continue
 		}
 		require.NoError(t, err)
 		rs, err := backfill.DecodeRepoStatus(val)
-		_ = closer.Close()
 		require.NoError(t, err)
 		if origBF, ok := s.backfillRevs[did]; ok {
 			require.Equal(t, origBF, rs.Backfill.Rev, "Backfill.Rev mutated for %s", did)

@@ -19,7 +19,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/status"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
@@ -60,7 +59,7 @@ func (r *fakeIdentityResolver) ResolveHandle(_ context.Context, handle atmos.Han
 func TestCollect_FreshDataDir(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -91,7 +90,7 @@ func TestCollect_FreshDataDir(t *testing.T) {
 func TestCollect_BuildsFreshSnapshotEachCall(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -121,7 +120,7 @@ func TestCollect_BuildsFreshSnapshotEachCall(t *testing.T) {
 func TestCollect_LiveLastSeenUpstreamEvent(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -146,12 +145,12 @@ func TestCollect_LiveLastSeenUpstreamEvent(t *testing.T) {
 func TestCollect_PhaseAndEnteredAt(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	enteredAt := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, dataDir), lifecycle.PhaseSteadyState, enteredAt))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseSteadyState, enteredAt))
 
 	c, err := status.New(status.Options{
 		Store:   st,
@@ -169,13 +168,13 @@ func TestCollect_PhaseAndEnteredAt(t *testing.T) {
 func TestCollect_BackfillTiming(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	startedAt := time.Date(2026, 5, 1, 1, 0, 0, 0, time.UTC)
 	completedAt := startedAt.Add(3*24*time.Hour + 7*time.Hour)
-	require.NoError(t, lifecycle.WriteBackfillTiming(t.Context(), pebblestore.New(st, dataDir), startedAt, completedAt))
+	require.NoError(t, lifecycle.WriteBackfillTiming(t.Context(), st, startedAt, completedAt))
 	require.NoError(t, backfill.SaveCounts(st, backfill.Counts{Total: 10, Discovered: 10, Complete: 10}))
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
@@ -191,12 +190,13 @@ func TestCollect_BackfillTiming(t *testing.T) {
 func TestCollect_BackfillCounts(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	bs := backfill.NewStore(st, nil)
 	ctx := context.Background()
+	require.NoError(t, bs.SeedCounts(ctx))
 
 	for i := range 5 {
 		did := atmos.DID("did:plc:disc" + string(rune('a'+i)))
@@ -231,7 +231,7 @@ func TestCollect_BackfillCounts(t *testing.T) {
 func TestCollect_HostDiagnosticsFromAggregates(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -254,7 +254,7 @@ func TestCollect_HostDiagnosticsFromAggregates(t *testing.T) {
 	}
 	enc, err := backfill.EncodeHostStatus(hs)
 	require.NoError(t, err)
-	require.NoError(t, st.Set([]byte("host/pds.example.com"), enc, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("host/pds.example.com"), enc))
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
 	require.NoError(t, err)
@@ -277,7 +277,7 @@ func TestCollect_HostDiagnosticsFromAggregates(t *testing.T) {
 func TestCollect_HostDiagnosticsTopFailingIsBounded(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -287,13 +287,13 @@ func TestCollect_HostDiagnosticsTopFailingIsBounded(t *testing.T) {
 			Host: host, Total: 20, Failed: uint64(12 - i),
 		})
 		require.NoError(t, err)
-		require.NoError(t, st.Set([]byte("host/"+host), enc, store.SyncWrites))
+		require.NoError(t, st.Set(context.Background(), []byte("host/"+host), enc))
 	}
 	healthy, err := backfill.EncodeHostStatus(&backfill.HostStatus{
 		Host: "healthy.example.com", Total: 100, Complete: 100,
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.Set([]byte("host/healthy.example.com"), healthy, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("host/healthy.example.com"), healthy))
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
 	require.NoError(t, err)
@@ -315,7 +315,7 @@ func TestCollect_HostDiagnosticsTopFailingIsBounded(t *testing.T) {
 func TestCollect_HostDiagnosticsDefaultsToLargestHosts(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -326,7 +326,7 @@ func TestCollect_HostDiagnosticsDefaultsToLargestHosts(t *testing.T) {
 	} {
 		enc, err := backfill.EncodeHostStatus(hs)
 		require.NoError(t, err)
-		require.NoError(t, st.Set([]byte("host/"+hs.Host), enc, store.SyncWrites))
+		require.NoError(t, st.Set(context.Background(), []byte("host/"+hs.Host), enc))
 	}
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
@@ -344,7 +344,7 @@ func TestCollect_HostDiagnosticsDefaultsToLargestHosts(t *testing.T) {
 func TestCollect_AccountLookupByHandle(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -368,14 +368,14 @@ func TestCollect_AccountLookupByHandle(t *testing.T) {
 	}
 	enc, err := backfill.EncodeRepoStatus(rs)
 	require.NoError(t, err)
-	require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
-	require.NoError(t, st.Set([]byte("handle/alice.test"), []byte(did), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), backfill.RepoKey(string(did)), enc))
+	require.NoError(t, st.Set(context.Background(), []byte("handle/alice.test"), []byte(did)))
 
 	hostEnc, err := backfill.EncodeHostStatus(&backfill.HostStatus{
 		Host: "pds.example.com", Total: 5, Active: 4, Complete: 3, Failed: 2,
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.Set([]byte("host/pds.example.com"), hostEnc, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("host/pds.example.com"), hostEnc))
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
 	require.NoError(t, err)
@@ -402,7 +402,7 @@ func TestCollect_AccountLookupByHandle(t *testing.T) {
 func TestCollect_AccountLookupByHandleResolverFallback(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -413,7 +413,7 @@ func TestCollect_AccountLookupByHandleResolverFallback(t *testing.T) {
 		Active:   true,
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), backfill.RepoKey(string(did)), enc))
 
 	c, err := status.New(status.Options{
 		Store:   st,
@@ -437,7 +437,7 @@ func TestCollect_AccountLookupByHandleResolverFallback(t *testing.T) {
 func TestCollect_AccountLookupDIDHydratesMissingHandleFromResolver(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -448,7 +448,7 @@ func TestCollect_AccountLookupDIDHydratesMissingHandleFromResolver(t *testing.T)
 		Active:   true,
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), backfill.RepoKey(string(did)), enc))
 
 	c, err := status.New(status.Options{
 		Store:   st,
@@ -478,7 +478,7 @@ func TestCollect_AccountLookupDIDHydratesMissingHandleFromResolver(t *testing.T)
 func TestCollect_AccountLookupByHandlePrefersResolverOverLocalIndex(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -490,9 +490,9 @@ func TestCollect_AccountLookupByHandlePrefersResolverOverLocalIndex(t *testing.T
 			Active:   true,
 		})
 		require.NoError(t, err)
-		require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
+		require.NoError(t, st.Set(context.Background(), backfill.RepoKey(string(did)), enc))
 	}
-	require.NoError(t, st.Set([]byte("handle/alice.test"), []byte(staleDID), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("handle/alice.test"), []byte(staleDID)))
 
 	c, err := status.New(status.Options{
 		Store:   st,
@@ -512,7 +512,7 @@ func TestCollect_AccountLookupByHandlePrefersResolverOverLocalIndex(t *testing.T
 func TestCollect_AccountLookupResolvedHandleWithMissingLocalMetadata(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -537,7 +537,7 @@ func TestCollect_AccountLookupResolvedHandleWithMissingLocalMetadata(t *testing.
 func TestCollect_LiveCursors(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -545,9 +545,9 @@ func TestCollect_LiveCursors(t *testing.T) {
 
 	var seqBuf [8]byte
 	binary.LittleEndian.PutUint64(seqBuf[:], 4242)
-	require.NoError(t, st.Set([]byte(live.SteadySeqKey), seqBuf[:], store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte(live.SteadySeqKey), seqBuf[:]))
 	binary.LittleEndian.PutUint64(seqBuf[:], 1111)
-	require.NoError(t, st.Set([]byte(live.BootstrapSeqKey), seqBuf[:], store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte(live.BootstrapSeqKey), seqBuf[:]))
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
 	require.NoError(t, err)
@@ -562,7 +562,7 @@ func TestCollect_LiveCursors(t *testing.T) {
 func TestCollect_SequenceLeaseStatus(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	cfg := ingest.Config{
@@ -599,17 +599,17 @@ func TestCollect_SequenceLeaseStatus(t *testing.T) {
 func TestCollect_PebbleKeyspaces(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, st.Set([]byte("repo/a"), []byte("x"), store.SyncWrites))
-	require.NoError(t, st.Set([]byte("repo/b"), []byte("x"), store.SyncWrites))
-	require.NoError(t, st.Set([]byte("pdshost/pds.example.com"), []byte(`{"hostname":"pds.example.com","enumerated":false}`), store.SyncWrites))
-	require.NoError(t, st.Set([]byte("sync/chain/a"), []byte("x"), store.SyncWrites))
-	require.NoError(t, st.Set([]byte("sync/host/a"), []byte("x"), store.SyncWrites))
-	require.NoError(t, st.Set([]byte("relay/other"), []byte("x"), store.SyncWrites))
-	require.NoError(t, st.Set([]byte("sync/identity/a"), []byte("x"), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("repo/a"), []byte("x")))
+	require.NoError(t, st.Set(context.Background(), []byte("repo/b"), []byte("x")))
+	require.NoError(t, st.Set(context.Background(), []byte("pdshost/pds.example.com"), []byte(`{"hostname":"pds.example.com","enumerated":false}`)))
+	require.NoError(t, st.Set(context.Background(), []byte("sync/chain/a"), []byte("x")))
+	require.NoError(t, st.Set(context.Background(), []byte("sync/host/a"), []byte("x")))
+	require.NoError(t, st.Set(context.Background(), []byte("relay/other"), []byte("x")))
+	require.NoError(t, st.Set(context.Background(), []byte("sync/identity/a"), []byte("x")))
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
 	require.NoError(t, err)
@@ -628,7 +628,7 @@ func TestCollect_PebbleKeyspaces(t *testing.T) {
 func TestCollect_WithManifestSkipsRepoScan(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -642,7 +642,7 @@ func TestCollect_WithManifestSkipsRepoScan(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, st.Set([]byte("repo/did:plc:corrupt"), []byte("not json"), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("repo/did:plc:corrupt"), []byte("not json")))
 	require.NoError(t, backfill.SaveCounts(st, backfill.Counts{
 		Total: 10, Discovered: 3, Complete: 6, Failed: 1,
 	}))
@@ -667,11 +667,11 @@ func TestCollect_WithManifestSkipsRepoScan(t *testing.T) {
 func TestCollect_DefaultSnapshotDoesNotScanHostAggregates(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, st.Set([]byte("host/corrupt.example.com"), []byte("not json"), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("host/corrupt.example.com"), []byte("not json")))
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
 	require.NoError(t, err)
@@ -687,7 +687,7 @@ func TestCollect_DefaultSnapshotDoesNotScanHostAggregates(t *testing.T) {
 func TestCollect_SnapshotForRequestSingleflightKeyDoesNotCollide(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -699,7 +699,7 @@ func TestCollect_SnapshotForRequestSingleflightKeyDoesNotCollide(t *testing.T) {
 			Handle:   string(did),
 		})
 		require.NoError(t, err)
-		require.NoError(t, st.Set(backfill.RepoKey(string(did)), enc, store.SyncWrites))
+		require.NoError(t, st.Set(context.Background(), backfill.RepoKey(string(did)), enc))
 	}
 
 	c, err := status.New(status.Options{Store: st, DataDir: dataDir})
@@ -716,7 +716,7 @@ func TestCollect_SnapshotForRequestSingleflightKeyDoesNotCollide(t *testing.T) {
 func TestCollect_WithManifestIncludesWritableTails(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -768,7 +768,7 @@ func TestCollect_WithManifestIncludesWritableTails(t *testing.T) {
 func TestCollect_CursorLookback_NoManifest(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -816,7 +816,7 @@ func makeSealedStatusSegment(path string) error {
 func TestCollect_CursorLookback_Disabled(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

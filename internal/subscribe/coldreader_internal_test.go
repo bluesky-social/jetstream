@@ -11,7 +11,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
@@ -88,11 +88,11 @@ func mustOpenColdReaderManifest(tb testing.TB, dir string) *manifest.Manifest {
 	return m
 }
 
-func openColdReaderWriterAtTip(t testing.TB, dir string, nextSeq uint64) (*store.Store, *ingest.Writer) {
+func openColdReaderWriterAtTip(t testing.TB, dir string, nextSeq uint64) (*pebblestore.Store, *ingest.Writer) {
 	t.Helper()
-	st, err := store.Open(dir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
-	require.NoError(t, st.Set([]byte("seq/next"), coldReaderEncodeUint64LE(nextSeq), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("seq/next"), coldReaderEncodeUint64LE(nextSeq)))
 
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir: filepath.Join(dir, "segments"),

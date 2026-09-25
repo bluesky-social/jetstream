@@ -12,13 +12,12 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/prometheus/client_golang/prometheus"
-
-	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/stretchr/testify/require"
 )
 
@@ -202,10 +201,10 @@ func BenchmarkColdReadActiveRange(b *testing.B) {
 	}
 }
 
-func openActiveColdReader(tb testing.TB, blocks, perBlock int) (*store.Store, *ingest.Writer, *subscribe.ColdReader, *recordingFS) {
+func openActiveColdReader(tb testing.TB, blocks, perBlock int) (*pebblestore.Store, *ingest.Writer, *subscribe.ColdReader, *recordingFS) {
 	tb.Helper()
 	dir := tb.TempDir()
-	st, err := store.Open(dir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(tb, err)
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:           filepath.Join(dir, "segments"),

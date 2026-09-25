@@ -16,10 +16,9 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 	"github.com/jcalabro/gt"
@@ -338,7 +337,7 @@ func (c *Consumer) LastUpstreamSeq() int64 {
 // state into the writer's seq/next durable batch. cur is sampled before the
 // block is detached/flushed, so async commits cannot persist a cursor that
 // covers events in a later, not-yet-durable prepared block.
-func (c *Consumer) onDurableBatch(ctx context.Context, b *pebble.Batch, _ uint64, _ bool, prepareValue any) (func(), func(error), error) {
+func (c *Consumer) onDurableBatch(ctx context.Context, b metastore.Batch, _ uint64, _ bool, prepareValue any) (func(), func(error), error) {
 	cur, ok := prepareValue.(int64)
 	if !ok {
 		return nil, nil, fmt.Errorf("livestream: durable batch cursor sample has type %T", prepareValue)
@@ -355,20 +354,14 @@ func (c *Consumer) onDurableBatch(ctx context.Context, b *pebble.Batch, _ uint64
 		// can already exist. Persist it on its own so a crash here
 		// can't leave a durable identity row unguarded (#234).
 		if c.cfg.SyncStateStore != nil {
-			if err := stageSyncState(c.cfg.SyncStateStore, b); err != nil {
-				return nil, nil, err
-			}
+			c.cfg.SyncStateStore.StageFlush(b)
 			return func() { c.cfg.SyncStateStore.CommitStaged() }, nil, nil
 		}
 		return nil, nil, nil
 	}
-	if err := b.Set([]byte(c.cfg.CursorKey), store.EncodeVersionedUint64LE(cursorV1, uint64(cur)), nil); err != nil {
-		return nil, nil, fmt.Errorf("livestream: stage %s: %w", c.cfg.CursorKey, err)
-	}
+	b.Set([]byte(c.cfg.CursorKey), metastore.EncodeVersionedUint64LE(cursorV1, uint64(cur)))
 	if c.cfg.SyncStateStore != nil {
-		if err := stageSyncState(c.cfg.SyncStateStore, b); err != nil {
-			return nil, nil, err
-		}
+		c.cfg.SyncStateStore.StageFlush(b)
 	}
 	return func() {
 		if c.cfg.SyncStateStore != nil {
@@ -383,12 +376,11 @@ func (c *Consumer) saveCursorAndSyncState(cur int64) error {
 		return fmt.Errorf("livestream: refuse to save negative cursor %d to %s", cur, c.cfg.CursorKey)
 	}
 	b := c.cfg.Store.NewBatch()
-	defer func() { _ = b.Close() }()
 	afterCommit, _, err := c.onDurableBatch(context.Background(), b, 0, true, cur)
 	if err != nil {
 		return err
 	}
-	if err := c.cfg.Store.Commit(b, store.SyncWrites); err != nil {
+	if err := b.Commit(context.Background()); err != nil {
 		return fmt.Errorf("livestream: save %s: %w", c.cfg.CursorKey, err)
 	}
 	if afterCommit != nil {

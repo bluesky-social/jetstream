@@ -21,7 +21,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
@@ -96,7 +95,7 @@ func TestOracle_ObservedSeqIsNotReusedAfterSIGKILL(t *testing.T) {
 	require.True(t, wasSIGKILL(err), "child should die by SIGKILL: %v\n%s", err, output.String())
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st, err := store.Open(dataDir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dataDir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	w, err := ingest.Open(ingest.Config{
@@ -125,7 +124,7 @@ func runSeqLeaseSubscriberChild() {
 		os.Exit(2)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st, err := store.Open(dataDir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dataDir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	if err != nil {
 		fail(err)
 	}
@@ -139,7 +138,7 @@ func runSeqLeaseSubscriberChild() {
 	if err != nil {
 		fail(err)
 	}
-	if err := lifecycle.WritePhase(context.Background(), pebblestore.New(st, dataDir), lifecycle.PhaseSteadyState, time.Now().UTC()); err != nil {
+	if err := lifecycle.WritePhase(context.Background(), st, lifecycle.PhaseSteadyState, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 

@@ -13,8 +13,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/cockroachdb/pebble"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	atmosrepo "github.com/jcalabro/atmos/repo"
@@ -34,7 +33,7 @@ const (
 )
 
 type RetryConfig struct {
-	Store         *store.Store
+	Store         metastore.Store
 	Writer        *ingest.Writer
 	HTTPClient    *http.Client
 	RelayURL      string
@@ -100,6 +99,9 @@ func RunFailedRepoRetry(ctx context.Context, cfg RetryConfig) error {
 	if err != nil {
 		return err
 	}
+	if err := r.store.SeedCounts(ctx); err != nil {
+		return err
+	}
 	if r.cfg.Interval == 0 {
 		<-ctx.Done()
 		return nil
@@ -130,6 +132,9 @@ func RunPendingRepoRetryPass(ctx context.Context, cfg RetryConfig) error {
 	cfg.eligibleStatus = func(st Status) bool { return st == StatusPending }
 	r, err := newRetryRunner(cfg)
 	if err != nil {
+		return err
+	}
+	if err := r.store.SeedCounts(ctx); err != nil {
 		return err
 	}
 	return r.runPass(ctx)
@@ -248,23 +253,17 @@ func (r *retryRunner) runPass(ctx context.Context) error {
 
 func (r *retryRunner) scanDue(ctx context.Context, now time.Time, yield func(retryCandidate) error) error {
 	prefix := []byte(repoKeyPrefix)
-	it, err := r.cfg.Store.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: store.PrefixUpperBound(prefix),
-	})
+	it, err := r.cfg.Store.NewIter(ctx, prefix, metastore.PrefixUpperBound(prefix))
 	if err != nil {
 		return fmt.Errorf("backfill: retry: open repo iter: %w", err)
 	}
 	defer func() { _ = it.Close() }()
 
-	for it.First(); it.Valid(); it.Next() {
+	for it.Next() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		val, err := it.ValueAndErr()
-		if err != nil {
-			return fmt.Errorf("backfill: retry: read repo value: %w", err)
-		}
+		val := it.Value()
 		rs, err := decodeRepoStatus(val)
 		if err != nil {
 			return err
@@ -298,7 +297,7 @@ func (r *retryRunner) scanDue(ctx context.Context, now time.Time, yield func(ret
 			return err
 		}
 	}
-	if err := it.Error(); err != nil {
+	if err := it.Err(); err != nil {
 		return fmt.Errorf("backfill: retry: iter repo: %w", err)
 	}
 	return nil

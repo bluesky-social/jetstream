@@ -12,7 +12,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
@@ -48,7 +48,7 @@ type Config struct {
 	FS vfs.FS
 
 	// Store is the shared metadata pebble db. Required.
-	Store *store.Store
+	Store metastore.Store
 
 	// RelayURL is the upstream relay base URL (https or wss).
 	RelayURL string

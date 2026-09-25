@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
@@ -19,7 +19,7 @@ import (
 func validBaseConfig(t *testing.T) Config {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

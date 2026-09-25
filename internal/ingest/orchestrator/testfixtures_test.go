@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -16,7 +17,8 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/identity"
@@ -143,9 +145,9 @@ func testIdentityDirectory() *identity.Directory {
 	return identity.NewInMemoryDirectory()
 }
 
-func newOrchestratorTestStore(t *testing.T) *store.Store {
+func newOrchestratorTestStore(t *testing.T) *pebblestore.Store {
 	t.Helper()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	return st
@@ -165,7 +167,7 @@ func mustEncodeStatus(t *testing.T, rs *backfill.RepoStatus) []byte {
 // orchestrator Config wired to a fakeRelay.
 type mergeFixture struct {
 	dataDir string
-	store   *store.Store
+	store   metastore.Store
 	cfg     Config
 	relay   *fakeRelay
 }
@@ -176,19 +178,23 @@ type mergeFixture struct {
 // the pre-merge per-DID Backfill.Rev (also pre-populates the top-level
 // Rev to that same value, mirroring what the real OnComplete callback
 // does). Both arguments may be nil/empty.
-func newMergeFixture(t *testing.T, sources [][]segment.Event, repoRevs map[string]string, storeOpts ...store.Option) *mergeFixture {
+func newMergeFixture(t *testing.T, sources [][]segment.Event, repoRevs map[string]string, faults ...metastore.FaultInjector) *mergeFixture {
 	t.Helper()
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil, storeOpts...)
+	raw, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = raw.Close() })
+	var st metastore.Store = raw
+	for _, f := range faults {
+		st = metastore.WithFaults(st, f)
+	}
 
 	for did, rev := range repoRevs {
 		rs := &backfill.RepoStatus{
 			Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete, Rev: rev},
 			Rev:      rev,
 		}
-		require.NoError(t, st.Set(backfill.RepoKey(did), mustEncodeStatus(t, rs), store.SyncWrites))
+		require.NoError(t, st.Set(context.Background(), backfill.RepoKey(did), mustEncodeStatus(t, rs)))
 	}
 
 	liveDir := filepath.Join(dataDir, "backfill", "live_segments")

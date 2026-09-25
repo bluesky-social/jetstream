@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
@@ -21,7 +21,7 @@ func TestOracle_PowerLossStrictMemDropsUnsyncedState(t *testing.T) {
 	require.NoError(t, fs.MkdirAll(dataDir, 0o755))
 	syncStrictOracleDir(t, fs, "/")
 
-	st, err := store.Open(dataDir, nil, store.WithFS(fs))
+	st, err := pebblestore.Open(dataDir, nil, pebblestore.WithFS(fs))
 	require.NoError(t, err)
 	w, err := ingest.Open(ingest.Config{
 		DataDir:           dataDir,
@@ -59,7 +59,7 @@ func TestOracle_PowerLossStrictMemDropsUnsyncedState(t *testing.T) {
 	fs.ResetToSyncedState()
 	fs.SetIgnoreSyncs(false)
 
-	st, err = store.Open(dataDir, nil, store.WithFS(fs))
+	st, err = pebblestore.Open(dataDir, nil, pebblestore.WithFS(fs))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	w, err = ingest.Open(ingest.Config{

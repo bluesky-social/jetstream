@@ -8,8 +8,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -111,7 +111,7 @@ func TestPendingGaugeIsPartialBlockSawtooth(t *testing.T) {
 		MaxSegmentBytes:          1 << 30,
 		Logger:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:                  m,
-		OnDurableBatch: func(_ context.Context, _ *pebble.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, _ metastore.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
 			atCommit = append(atCommit, pending())
 			return nil, nil, nil
 		},

@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -8,9 +9,9 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
@@ -33,15 +34,16 @@ func TestWriter_DurableBatchFailsLoudOnStoreFault(t *testing.T) {
 	t.Parallel()
 
 	injected := errors.New("injected: seq/next durable commit failed")
-	fault := &store.KeyPrefixFault{
+	fault := &metastore.KeyPrefixFault{
 		Prefix:  []byte(seqNextKey),
-		Op:      store.WriteOpBatchCommit,
+		Op:      metastore.WriteOpBatchCommit,
 		Ordinal: 1,
 		Err:     injected,
 	}
-	st, err := store.Open(t.TempDir(), nil, store.WithFaultInjector(fault))
+	stRaw, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = stRaw.Close() })
+	st := metastore.WithFaults(stRaw, fault)
 
 	const blockSize = 4
 	w, err := Open(Config{
@@ -69,8 +71,8 @@ func TestWriter_DurableBatchFailsLoudOnStoreFault(t *testing.T) {
 	require.ErrorIs(t, appendErr, injected)
 
 	// No silent advance: seq/next never became durable.
-	_, _, getErr := st.Get([]byte(seqNextKey))
-	require.ErrorIs(t, getErr, pebble.ErrNotFound,
+	_, getErr := st.Get(context.Background(), []byte(seqNextKey))
+	require.ErrorIs(t, getErr, metastore.ErrNotFound,
 		"seq/next must not be durable when its commit failed")
 }
 
@@ -81,16 +83,17 @@ func TestWriter_DurableBatchFailsLoudOnStoreFault(t *testing.T) {
 func TestWriter_DurableBatchENOSPCReturnsFatalOperatorMessage(t *testing.T) {
 	t.Parallel()
 
-	fault := &store.KeyPrefixFault{
+	fault := &metastore.KeyPrefixFault{
 		Prefix:  []byte(seqNextKey),
-		Op:      store.WriteOpBatchCommit,
+		Op:      metastore.WriteOpBatchCommit,
 		Ordinal: 1,
 		Err:     syscall.ENOSPC,
 	}
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil, store.WithFaultInjector(fault))
+	stRaw, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = stRaw.Close() })
+	st := metastore.WithFaults(stRaw, fault)
 
 	const blockSize = 4
 	w, err := Open(Config{

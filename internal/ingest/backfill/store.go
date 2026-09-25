@@ -1,9 +1,9 @@
 // store.go implements the atmos backfill.Store
-// interface against pebble. Keys live at repo/<did>; values are the
+// interface against the metadata store. Keys live at repo/<did>; values are the
 // JSON-encoded RepoStatus from status.go.
 //
 // All callbacks the engine fires (OnDiscover, OnUpdate, OnComplete,
-// OnFail) write with pebble.Sync to satisfy atmos's durability
+// OnFail) commit durably to satisfy atmos's durability
 // contract: the engine treats a successful return as durable.
 //
 // Whole-row read-modify-write paths preserve fields a future PR may
@@ -21,18 +21,17 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/cockroachdb/pebble"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
 
-// Store implements atmosbackfill.Store against the shared pebble
-// metadata store. Construct via NewStore.
+// Store implements atmosbackfill.Store against the shared metadata
+// store. Construct via NewStore.
 type Store struct {
-	db                 *store.Store
+	db                 metastore.Store
 	metrics            *Metrics
 	afterComplete      func(context.Context, atmos.DID) error
 	afterCompleteError func(error)
@@ -58,10 +57,53 @@ var _ atmosbackfill.Store = atmosStoreAdapter{}
 
 func (s *Store) AtmosStore() atmosbackfill.Store { return atmosStoreAdapter{s} }
 
-// NewStore constructs a Store backed by the shared metadata pebble db.
-// metrics may be nil; callbacks are no-ops in that case.
-func NewStore(db *store.Store, metrics *Metrics) *Store {
+// NewStore constructs a Store backed by the shared metadata store.
+// metrics may be nil; callbacks are no-ops in that case. Call SeedCounts
+// before the first write.
+func NewStore(db metastore.Store, metrics *Metrics) *Store {
 	return &Store{db: db, metrics: metrics}
+}
+
+// errCountsNotSeeded means a counts-maintaining write ran before SeedCounts.
+// It is an internal error, not a condition to repair in place: tallying repo/
+// mid-run races writers in other Store instances, and the metadata iterator
+// is not a snapshot, so the tally could be torn and would then be saved
+// permanently.
+var errCountsNotSeeded = errors.New("backfill: internal error: backfill/counts missing; SeedCounts must run before any repo/ write")
+
+// SeedCounts writes backfill/counts from a full repo/ tally when the row is
+// missing (a data dir that predates the counts row). Every entry point that
+// writes repo/ rows calls it before its first writer starts, so the tally
+// sees a quiescent keyspace. Idempotent: once the row exists it is only
+// maintained incrementally.
+func (s *Store) SeedCounts(ctx context.Context) error {
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+	_, ok, err := LoadCounts(s.db)
+	if err != nil || ok {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	counts, err := CountStatuses(s.db)
+	if err != nil {
+		return err
+	}
+	return SaveCounts(s.db, counts)
+}
+
+// loadCountsLocked reads backfill/counts for an incremental update. The
+// caller holds countsMu.
+func (s *Store) loadCountsLocked() (Counts, error) {
+	counts, ok, err := LoadCounts(s.db)
+	if err != nil {
+		return Counts{}, err
+	}
+	if !ok {
+		return Counts{}, errCountsNotSeeded
+	}
+	return counts, nil
 }
 
 // SetCompletionBatcher defers OnComplete writes into writer durable metadata
@@ -75,14 +117,13 @@ func (s *Store) SetCompletionBatcher(b *completionBatcher) {
 // atmos's StoreEntry shape. A missing row returns StateUnknown — that's
 // how atmos tells the engine to fire OnDiscover.
 func (s *Store) Lookup(ctx context.Context, did atmos.DID) (atmosbackfill.StoreEntry, error) {
-	val, closer, err := s.db.Get(repoKey(did))
-	if errors.Is(err, store.ErrNotFound) {
+	val, err := s.db.Get(context.Background(), repoKey(did))
+	if errors.Is(err, metastore.ErrNotFound) {
 		return atmosbackfill.StoreEntry{State: atmosbackfill.StateUnknown}, nil
 	}
 	if err != nil {
 		return atmosbackfill.StoreEntry{}, fmt.Errorf("backfill: lookup %s: %w", did, err)
 	}
-	defer func() { _ = closer.Close() }()
 
 	rs, err := decodeRepoStatus(val)
 	if err != nil {
@@ -173,7 +214,7 @@ func (s *Store) putRepoStatus(did atmos.DID, rs *RepoStatus) error {
 	if err != nil {
 		return err
 	}
-	if err := s.db.Set(repoKey(did), enc, store.SyncWrites); err != nil {
+	if err := s.db.Set(context.Background(), repoKey(did), enc); err != nil {
 		return fmt.Errorf("backfill: write repo/%s: %w", did, err)
 	}
 	return nil
@@ -209,15 +250,9 @@ func (s *Store) putRepoStatusAndCountsLocked(
 		return err
 	}
 
-	counts, ok, err := LoadCounts(s.db)
+	counts, err := s.loadCountsLocked()
 	if err != nil {
 		return err
-	}
-	if !ok {
-		counts, err = CountStatuses(s.db)
-		if err != nil {
-			return err
-		}
 	}
 	applyCountTransition(&counts, hadRow, old, rs.Backfill.Status)
 	countsEnc, err := encodeCounts(counts)
@@ -226,13 +261,8 @@ func (s *Store) putRepoStatusAndCountsLocked(
 	}
 
 	batch := s.db.NewBatch()
-	defer func() { _ = batch.Close() }()
-	if err := batch.Set(repoKey(did), enc, nil); err != nil {
-		return fmt.Errorf("backfill: stage repo/%s: %w", did, err)
-	}
-	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
-		return fmt.Errorf("backfill: stage counts: %w", err)
-	}
+	batch.Set(repoKey(did), enc)
+	batch.Set([]byte(countsKey), countsEnc)
 	if rs.Host != "" {
 		hs, _, err := loadHostStatus(s.db, rs.Host)
 		if err != nil {
@@ -260,11 +290,9 @@ func (s *Store) putRepoStatusAndCountsLocked(
 		if err != nil {
 			return err
 		}
-		if err := batch.Set(pdsHostKey(rosterHostname), rosterEnc, nil); err != nil {
-			return fmt.Errorf("backfill: stage pdshost/%s: %w", rosterHostname, err)
-		}
+		batch.Set(pdsHostKey(rosterHostname), rosterEnc)
 	}
-	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+	if err := batch.Commit(context.Background()); err != nil {
 		return fmt.Errorf("backfill: write repo/%s and counts: %w", did, err)
 	}
 	return nil
@@ -297,15 +325,9 @@ func (s *Store) updateRepoStatusAndCounts(
 		return err
 	}
 
-	counts, ok, err := LoadCounts(s.db)
+	counts, err := s.loadCountsLocked()
 	if err != nil {
 		return err
-	}
-	if !ok {
-		counts, err = CountStatuses(s.db)
-		if err != nil {
-			return err
-		}
 	}
 	applyCountTransition(&counts, hadRow, old, rs.Backfill.Status)
 	countsEnc, err := encodeCounts(counts)
@@ -318,13 +340,8 @@ func (s *Store) updateRepoStatusAndCounts(
 	}
 
 	batch := s.db.NewBatch()
-	defer func() { _ = batch.Close() }()
-	if err := batch.Set(repoKey(did), enc, nil); err != nil {
-		return fmt.Errorf("backfill: stage repo/%s: %w", did, err)
-	}
-	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
-		return fmt.Errorf("backfill: stage counts: %w", err)
-	}
+	batch.Set(repoKey(did), enc)
+	batch.Set([]byte(countsKey), countsEnc)
 	// A steady-state retry can re-attribute a DID to a different host than
 	// its prior terminal transition recorded (the relay can 302 to a
 	// different PDS on a later attempt). When that happens we must decrement
@@ -361,13 +378,13 @@ func (s *Store) updateRepoStatusAndCounts(
 			return err
 		}
 	}
-	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+	if err := batch.Commit(context.Background()); err != nil {
 		return fmt.Errorf("backfill: write repo/%s and counts: %w", did, err)
 	}
 	return nil
 }
 
-func (s *Store) stageDurableBatch(ctx context.Context, batch *pebble.Batch, completions []queuedCompletion, cursors []queuedHostCursor) (func(error), error) {
+func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, completions []queuedCompletion, cursors []queuedHostCursor) (func(error), error) {
 	s.countsMu.Lock()
 	s.rosterMu.Lock()
 	locked := true
@@ -391,15 +408,9 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch *pebble.Batch, comp
 		return nil, nil
 	}
 
-	counts, ok, err := LoadCounts(s.db)
+	counts, err := s.loadCountsLocked()
 	if err != nil {
 		return fail(err)
-	}
-	if !ok {
-		counts, err = CountStatuses(s.db)
-		if err != nil {
-			return fail(err)
-		}
 	}
 
 	type stagedRepoStatus struct {
@@ -479,9 +490,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch *pebble.Batch, comp
 		if err != nil {
 			return fail(err)
 		}
-		if err := batch.Set(repoKey(c.did), enc, nil); err != nil {
-			return fail(fmt.Errorf("backfill: stage repo/%s: %w", c.did, err))
-		}
+		batch.Set(repoKey(c.did), enc)
 		repoCache[c.did] = stagedRepoStatus{status: rs, hadRow: true}
 		if rs.Host != "" {
 			hs := hostCache[rs.Host]
@@ -542,17 +551,13 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch *pebble.Batch, comp
 		if err != nil {
 			return fail(err)
 		}
-		if err := batch.Set(pdsHostKey(cursor.host), enc, nil); err != nil {
-			return fail(fmt.Errorf("backfill: stage pdshost/%s cursor: %w", cursor.host, err))
-		}
+		batch.Set(pdsHostKey(cursor.host), enc)
 	}
 	countsEnc, err := encodeCounts(counts)
 	if err != nil {
 		return fail(err)
 	}
-	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
-		return fail(fmt.Errorf("backfill: stage counts: %w", err))
-	}
+	batch.Set([]byte(countsKey), countsEnc)
 	return func(commitErr error) {
 		unlock(commitErr)
 		if commitErr != nil {
@@ -685,14 +690,13 @@ func applyHostActiveTransition(h *HostStatus, oldActive, nextActive bool) {
 // It returns (nil, nil) when the row doesn't exist so callers can
 // decide whether absence is an error in their context.
 func (s *Store) readRepoStatus(did atmos.DID) (*RepoStatus, error) {
-	val, closer, err := s.db.Get(repoKey(did))
-	if errors.Is(err, store.ErrNotFound) {
+	val, err := s.db.Get(context.Background(), repoKey(did))
+	if errors.Is(err, metastore.ErrNotFound) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("backfill: read repo/%s: %w", did, err)
 	}
-	defer func() { _ = closer.Close() }()
 	return decodeRepoStatus(val)
 }
 
@@ -726,10 +730,7 @@ func (s *Store) updateRepoHostActive(did atmos.DID, pds string, active bool) err
 	}
 
 	batch := s.db.NewBatch()
-	defer func() { _ = batch.Close() }()
-	if err := batch.Set(repoKey(did), enc, nil); err != nil {
-		return fmt.Errorf("backfill: stage repo/%s: %w", did, err)
-	}
+	batch.Set(repoKey(did), enc)
 	if oldHost != "" && oldHost != rs.Host {
 		hs, _, err := loadHostStatus(s.db, oldHost)
 		if err != nil {
@@ -764,7 +765,7 @@ func (s *Store) updateRepoHostActive(did atmos.DID, pds string, active bool) err
 			return err
 		}
 	}
-	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+	if err := batch.Commit(context.Background()); err != nil {
 		return fmt.Errorf("backfill: write repo/%s and host active: %w", did, err)
 	}
 	return nil
@@ -815,15 +816,9 @@ func (s *Store) recordIdentityResolution(_ context.Context, did atmos.DID, resol
 
 	var countsEnc []byte
 	if !hadRow {
-		counts, ok, err := LoadCounts(s.db)
+		counts, err := s.loadCountsLocked()
 		if err != nil {
 			return err
-		}
-		if !ok {
-			counts, err = CountStatuses(s.db)
-			if err != nil {
-				return err
-			}
 		}
 		applyCountTransition(&counts, false, "", rs.Backfill.Status)
 		countsEnc, err = encodeCounts(counts)
@@ -833,14 +828,9 @@ func (s *Store) recordIdentityResolution(_ context.Context, did atmos.DID, resol
 	}
 
 	batch := s.db.NewBatch()
-	defer func() { _ = batch.Close() }()
-	if err := batch.Set(repoKey(did), enc, nil); err != nil {
-		return fmt.Errorf("backfill: stage repo/%s: %w", did, err)
-	}
+	batch.Set(repoKey(did), enc)
 	if len(countsEnc) > 0 {
-		if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
-			return fmt.Errorf("backfill: stage counts: %w", err)
-		}
+		batch.Set([]byte(countsKey), countsEnc)
 	}
 	if handleIndexChanged(oldHandle, resolution.Handle) {
 		if err := stageHandleIndexDeleteIfMatches(s.db, batch, oldHandle, did); err != nil {
@@ -881,7 +871,7 @@ func (s *Store) recordIdentityResolution(_ context.Context, did atmos.DID, resol
 			return err
 		}
 	}
-	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+	if err := batch.Commit(context.Background()); err != nil {
 		return fmt.Errorf("backfill: write identity resolution %s: %w", did, err)
 	}
 	return nil
@@ -968,14 +958,13 @@ func (s *Store) OnUpdate(ctx context.Context, entry atmossync.ListReposEntry) er
 }
 
 func (s *Store) loadPDSHost(hostname string) (*PDSHost, bool, error) {
-	val, closer, err := s.db.Get(pdsHostKey(hostname))
-	if errors.Is(err, store.ErrNotFound) {
+	val, err := s.db.Get(context.Background(), pdsHostKey(hostname))
+	if errors.Is(err, metastore.ErrNotFound) {
 		return &PDSHost{Hostname: hostname}, false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("backfill: load pdshost/%s: %w", hostname, err)
 	}
-	defer func() { _ = closer.Close() }()
 	host, err := decodePDSHost(val)
 	if err != nil {
 		return nil, false, fmt.Errorf("backfill: load pdshost/%s: %w", hostname, err)
@@ -988,7 +977,7 @@ func (s *Store) savePDSHost(host *PDSHost) error {
 	if err != nil {
 		return err
 	}
-	if err := s.db.Set(pdsHostKey(host.Hostname), enc, store.SyncWrites); err != nil {
+	if err := s.db.Set(context.Background(), pdsHostKey(host.Hostname), enc); err != nil {
 		return fmt.Errorf("backfill: write pdshost/%s: %w", host.Hostname, err)
 	}
 	return nil
@@ -1093,15 +1082,9 @@ func (s *Store) updateHostStateDirect(ctx context.Context, hostname string, muta
 	host.State = string(nextState)
 	host.UpdatedAt = timeNow()
 
-	counts, ok, err := LoadCounts(s.db)
+	counts, err := s.loadCountsLocked()
 	if err != nil {
 		return err
-	}
-	if !ok {
-		counts, err = CountStatuses(s.db)
-		if err != nil {
-			return err
-		}
 	}
 	applyHostCountTransition(&counts, oldState, nextState)
 	hostEnc, err := encodePDSHost(host)
@@ -1113,14 +1096,9 @@ func (s *Store) updateHostStateDirect(ctx context.Context, hostname string, muta
 		return err
 	}
 	batch := s.db.NewBatch()
-	defer func() { _ = batch.Close() }()
-	if err := batch.Set(pdsHostKey(hostname), hostEnc, nil); err != nil {
-		return fmt.Errorf("backfill: stage pdshost/%s state: %w", hostname, err)
-	}
-	if err := batch.Set([]byte(countsKey), countsEnc, nil); err != nil {
-		return fmt.Errorf("backfill: stage counts: %w", err)
-	}
-	if err := s.db.Commit(batch, store.SyncWrites); err != nil {
+	batch.Set(pdsHostKey(hostname), hostEnc)
+	batch.Set([]byte(countsKey), countsEnc)
+	if err := batch.Commit(context.Background()); err != nil {
 		return fmt.Errorf("backfill: commit pdshost/%s state: %w", hostname, err)
 	}
 	return nil
@@ -1384,7 +1362,7 @@ func (s *Store) DeferRetryAttempt(ctx context.Context, did atmos.DID, nextAttemp
 	if err != nil {
 		return err
 	}
-	if err := s.db.Set(repoKey(did), enc, store.SyncWrites); err != nil {
+	if err := s.db.Set(context.Background(), repoKey(did), enc); err != nil {
 		return fmt.Errorf("backfill: defer retry repo/%s: %w", did, err)
 	}
 	return nil

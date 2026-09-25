@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
-	metastore "github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -141,7 +141,7 @@ func assertAccountStatusLifecycleArchived(t *testing.T, cfg Config, steady *even
 func assertUnavailableRepoStatuses(t *testing.T, dataDir string, w *world.World, cfg Config) {
 	t.Helper()
 
-	st, err := metastore.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoErrorf(t, err, "open metadata store for unavailable repo assertions: mode=%s seed=%d", cfg.Mode, cfg.Seed)
 	defer func() { require.NoError(t, st.Close()) }()
 

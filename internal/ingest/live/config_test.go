@@ -1,6 +1,7 @@
 package live
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -8,8 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/cockroachdb/pebble"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/streaming"
@@ -42,9 +42,6 @@ func newTestVerifier(t *testing.T) *atmossync.Verifier {
 func TestConfig_Validate(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	// Ensure store is imported
-	_ = (*store.Store)(nil)
 
 	st := newTestStore(t)
 	good := Config{
@@ -79,7 +76,7 @@ func TestConfig_Validate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := good
-			c.Store = st // share, since *store.Store is fine across tests
+			c.Store = st // share, since the store is fine across tests
 			tc.mutate(&c)
 			err := c.validate()
 			require.Error(t, err)
@@ -122,14 +119,13 @@ func TestOpen_UsesConfiguredSeqKey(t *testing.T) {
 	require.NoError(t, c.Close())
 
 	// Custom key persisted; default key NOT touched.
-	val, closer, err := st.Get([]byte(customKey))
+	val, err := st.Get(context.Background(), []byte(customKey))
 	require.NoError(t, err)
-	defer func() { _ = closer.Close() }()
 	require.Equal(t, uint64(2), binary.LittleEndian.Uint64(val),
 		"custom SeqKey must hold the writer's persisted nextSeq")
 
-	_, _, err = st.Get([]byte("seq/next"))
-	require.ErrorIs(t, err, pebble.ErrNotFound,
+	_, err = st.Get(context.Background(), []byte("seq/next"))
+	require.ErrorIs(t, err, metastore.ErrNotFound,
 		"default SeqKey must NOT be written when a custom one is configured")
 
 	// Sanity: segment dir actually got a segment file.
@@ -173,8 +169,8 @@ func TestClose_Idempotent_AndPersistsCursor(t *testing.T) {
 	}))
 
 	// Pre-Close, cursor must NOT yet be persisted (no flush happened).
-	_, _, err = st.Get([]byte("relay/cursor"))
-	require.ErrorIs(t, err, pebble.ErrNotFound,
+	_, err = st.Get(context.Background(), []byte("relay/cursor"))
+	require.ErrorIs(t, err, metastore.ErrNotFound,
 		"no flush has fired yet, so no cursor durable batch should have run")
 
 	require.NoError(t, c.Close())

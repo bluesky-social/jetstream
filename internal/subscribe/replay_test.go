@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
@@ -107,14 +107,14 @@ func TestWalkFromCursor_HaltsOnCallbackError(t *testing.T) {
 // openWriterAtTip is a test helper that opens a fresh ingest.Writer
 // with seq/next preset to the given value (so the next Append starts
 // allocating from there).
-func openWriterAtTip(t *testing.T, dir string, nextSeq uint64) (*store.Store, *ingest.Writer) {
+func openWriterAtTip(t *testing.T, dir string, nextSeq uint64) (*pebblestore.Store, *ingest.Writer) {
 	t.Helper()
-	st, err := store.Open(dir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
 
 	// Seed seq/next BEFORE opening the writer; ingest.Open reads it
 	// during its reconciliation pass.
-	require.NoError(t, st.Set([]byte("seq/next"), encodeUint64LE(nextSeq), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("seq/next"), encodeUint64LE(nextSeq)))
 
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir: filepath.Join(dir, "segments"),

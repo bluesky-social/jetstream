@@ -371,7 +371,7 @@ refreshed STALE mutants.
     - Commit error surfacing.
   - Tests: the contract suite against pebble and memstore. Fuzz the ordered
     batch semantics: pebble and memstore must agree on random op sequences.
-- [ ] **S1.2 Move `internal/ingest` and `live` onto metastore** (M). Deps: S1.1.
+- [x] **S1.2 Move `internal/ingest` and `live` onto metastore** (M). Deps: S1.1.
   - `config.go`: `Store metastore.Store`. `DurableBatchHook` takes
     `metastore.Batch` (`config.go:18`).
   - `writer.go`: `loadNextSeq`/`saveNextSeq`/`stageNextSeq` and
@@ -385,7 +385,7 @@ refreshed STALE mutants.
   - Port `storefault_test.go` and `writer_test.go` store usage. Keep
     `TestWriterFlushOrdersSegmentSyncBeforeStoreCommit` green; it pins the
     fsync-before-commit invariant.
-- [ ] **S1.3 Move `syncstate`, `lifecycle`, and `identity` onto metastore**
+- [x] **S1.3 Move `syncstate`, `lifecycle`, and `identity` onto metastore**
   (S). Deps: S1.1.
   - `syncstate/store.go`: `StageFlush(metastore.Batch)` and the Gets.
     Remove `Flush`/`Delete` if they still have no production callers (survey:
@@ -396,7 +396,7 @@ refreshed STALE mutants.
   - `identity/cache.go`: introduce `identity.KV` (Get/Set/Delete, best
     effort). Local impl: Pebble with NoSync. Disaggregated impl: a bounded LRU
     (S2.16). See finding 8.
-- [ ] **S1.4 Move `internal/ingest/backfill` onto metastore** (L). Deps: S1.2.
+- [x] **S1.4 Move `internal/ingest/backfill` onto metastore** (L). Deps: S1.2.
   - `store.go`: all Gets, Sets, and batches (`:78-1387`), and
     `stageDurableBatch(metastore.Batch)`. Also `completion_batcher.go:158`,
     `counts.go`, `status.go`, `diagnostics.go`, `cursor.go`, and `retry.go`
@@ -410,7 +410,7 @@ refreshed STALE mutants.
   - Port the heavy test files: `completion_batcher_test.go` (36 direct batch
     uses), `store_test.go`, `diagnostics_test.go`, `retry_test.go`, and
     `run_test.go`.
-- [ ] **S1.5 Move the orchestrator and status onto metastore** (M). Deps: S1.2,
+- [x] **S1.5 Move the orchestrator and status onto metastore** (M). Deps: S1.2,
   S1.3.
   - `merge_cursor.go`, `merge_filter.go`, `compaction_watermark.go`, and
     `states.go`.
@@ -1224,6 +1224,50 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S1.2, S1.4, S1.5 (2026-09-25): one commit, not three.** The
+  `DurableBatchHook` signature and the `ingest.Config.Store` type reach backfill,
+  the orchestrator, status, and jetstreamd, so porting ingest alone would
+  have needed throwaway shims in each of them. The three tasks landed together
+  instead. `subscribe.Subscription.Store` also moved to `metastore.Store`.
+  After this commit only `jetstreamd` and `pebblestore` import
+  `internal/store`, so S1.6 is left with the shrink, the enforcing test, and
+  the fault bridge.
+  - Counts seed (finding 2): `backfill.(*Store).SeedCounts(ctx)` tallies once
+    under `countsMu` when `backfill/counts` is missing, and is idempotent.
+    Three entry points call it before any `repo/` write: `Run`,
+    `RunFailedRepoRetry`/`RunPendingRepoRetryPass`, and merge discovery
+    (`merge_discovery.go`), since each builds its own `Store` with its own
+    `countsMu`. A missing counts row on a later write returns
+    `errCountsNotSeeded`. It used to trigger a fresh full tally, which is
+    racy now that the metastore iterator is not a snapshot.
+  - Backfill helpers that have no ctx pass `context.Background()` to the
+    store. Only the retry scan (`scanDue`) threads its caller's ctx. Adding
+    ctx to the rest is left for the S2 call sites that actually cancel.
+  - `ListPDSHosts` no longer treats `ErrNotFound` from the iterator as
+    benign. The metastore iterator never returns it, so it is just an error.
+  - `status` reads the `meta.pebble` size through `metastore.DiskStatsOf`,
+    and stores without a local footprint report 0. `Options.DataDir` is
+    kept for the other panels.
+  - Tests that wrote through `backfill.NewStore` directly
+    (`cmd/jetstream/serve_test.go`, `status/collect_test.go`) now call
+    `SeedCounts` first, the same as production.
+  - `newMergeFixture` takes `...metastore.FaultInjector` instead of
+    `...store.Option`, and wraps the store with `metastore.WithFaults`.
+- **S1.3 (2026-09-25): syncstate, lifecycle, identity.**
+  - `syncstate.Delete` stays. atmos's `sync.StateStore` interface requires
+    it, and jetstreamd hands the store to the verifier as that interface.
+    `Flush` is removed.
+  - `StageFlush(metastore.Batch)` returns nothing, because
+    `metastore.Batch.Set` cannot fail.
+  - Renames: `PebbleStateStore` → `StateStore` and `PebbleCache` →
+    `identity.Cache`, since neither is Pebble-specific now.
+    `identity.NewPebbleKV(*pebblestore.Store)` writes with
+    `SetNoSync`/`DeleteNoSync`.
+  - Every lifecycle function takes `ctx` first. `IsSteadyState(ctx, s)` is
+    the local adapter until S1.10's `Readiness`.
+  - The mutation driver reports BUILD-BROKEN when run from a git worktree,
+    because VCS stamping fails there. Run it with `GOFLAGS=-buildvcs=false`
+    in that case.
 - **S1.14 (2026-09-25): measurement recorded in design §22.1.** The 7 was
   one instantaneous sample of a 0–4096 sawtooth: the events in the unflushed
   partial block. A 6h pop1 range query gave a mean of 2,132, a minimum of 5,

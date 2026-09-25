@@ -1,21 +1,22 @@
 package orchestrator
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/stretchr/testify/require"
 )
 
 func TestMergeCursor_RoundTripViaCommit(t *testing.T) {
 	t.Parallel()
 	st := newOrchestratorTestStore(t)
-	require.NoError(t, st.Set(backfill.RepoKey("did:plc:a"), mustEncodeStatus(t, &backfill.RepoStatus{
+	require.NoError(t, st.Set(context.Background(), backfill.RepoKey("did:plc:a"), mustEncodeStatus(t, &backfill.RepoStatus{
 		Backfill: backfill.RepoBackfillStatus{Status: backfill.StatusComplete, Rev: "rev-old"},
 		Rev:      "rev-old",
-	}), store.SyncWrites))
+	})))
 
 	cache := newRepoStatusLookup(st, nil)
 	_, err := cache.get("did:plc:a")
@@ -28,9 +29,8 @@ func TestMergeCursor_RoundTripViaCommit(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(5), got)
 
-	val, closer, err := st.Get(backfill.RepoKey("did:plc:a"))
+	val, err := st.Get(context.Background(), backfill.RepoKey("did:plc:a"))
 	require.NoError(t, err)
-	defer func() { _ = closer.Close() }()
 	rs2, err := backfill.DecodeRepoStatus(val)
 	require.NoError(t, err)
 	require.Equal(t, "rev-new", rs2.Rev)
@@ -91,6 +91,6 @@ func TestMergeCursor_SkipsRevUpdateForUnknownDID(t *testing.T) {
 
 	// repo/<did> row was NOT written for the unknown DID. (Writing
 	// would have produced Backfill.Status="" — a corrupt row.)
-	_, _, err = st.Get(backfill.RepoKey("did:plc:unknown"))
-	require.ErrorIs(t, err, store.ErrNotFound)
+	_, err = st.Get(context.Background(), backfill.RepoKey("did:plc:unknown"))
+	require.ErrorIs(t, err, metastore.ErrNotFound)
 }

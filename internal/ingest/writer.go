@@ -10,11 +10,10 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -934,43 +933,39 @@ func scanSegmentsDir(fs vfs.FS, dir string) (idx uint64, has bool, err error) {
 // fresh data dir (absent key). The caller floors nextSeq to 1 either way, so the
 // first-ever event is seq 1 and seq 0 stays a pure "nothing yet" sentinel
 // (design §R8); the absent-vs-zero distinction is therefore irrelevant here.
-func loadNextSeq(st *store.Store, key string) (val uint64, err error) {
+func loadNextSeq(st metastore.Store, key string) (val uint64, err error) {
 	v, _, err := loadNextSeqFound(st, key)
 	return v, err
 }
 
-func loadNextSeqFound(st *store.Store, key string) (val uint64, found bool, err error) {
-	v, closer, err := st.Get([]byte(key))
-	if errors.Is(err, pebble.ErrNotFound) {
+func loadNextSeqFound(st metastore.Store, key string) (val uint64, found bool, err error) {
+	v, err := st.Get(context.Background(), []byte(key))
+	if errors.Is(err, metastore.ErrNotFound) {
 		return 0, false, nil
 	}
 	if err != nil {
 		return 0, false, fmt.Errorf("ingest: load %s: %w", key, err)
 	}
-	defer func() { _ = closer.Close() }()
 	if len(v) != 8 {
 		return 0, false, fmt.Errorf("ingest: load %s: expected 8 bytes, got %d", key, len(v))
 	}
 	return binary.LittleEndian.Uint64(v), true, nil
 }
 
-// saveNextSeq durably persists the seq counter for key via pebble.Sync.
-func saveNextSeq(st *store.Store, key string, v uint64) error {
+// saveNextSeq durably persists the seq counter for key.
+func saveNextSeq(st metastore.Store, key string, v uint64) error {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], v)
-	if err := st.Set([]byte(key), buf[:], store.SyncWrites); err != nil {
+	if err := st.Set(context.Background(), []byte(key), buf[:]); err != nil {
 		return fmt.Errorf("ingest: save %s: %w", key, err)
 	}
 	return nil
 }
 
-func stageNextSeq(b *pebble.Batch, key string, v uint64) error {
+func stageNextSeq(b metastore.Batch, key string, v uint64) {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], v)
-	if err := b.Set([]byte(key), buf[:], nil); err != nil {
-		return fmt.Errorf("ingest: stage %s: %w", key, err)
-	}
-	return nil
+	b.Set([]byte(key), buf[:])
 }
 
 func (w *Writer) sampleDurableBatchPrepareValueLocked() any {
@@ -993,11 +988,7 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 	ctx = context.WithoutCancel(ctx)
 
 	b := w.cfg.Store.NewBatch()
-	defer func() { _ = b.Close() }()
-
-	if err := stageNextSeq(b, w.cfg.SeqKey, nextSeq); err != nil {
-		return err
-	}
+	stageNextSeq(b, w.cfg.SeqKey, nextSeq)
 	reservedEnd := w.reservedEnd
 	if w.cfg.ReserveClientVisibleSeqs {
 		// Renew allocation from the writer's current frontier. This remains the
@@ -1011,9 +1002,7 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 				return err
 			}
 		}
-		if err := stageNextSeq(b, seqReservedKey, reservedEnd); err != nil {
-			return err
-		}
+		stageNextSeq(b, seqReservedKey, reservedEnd)
 	}
 	var afterCommit func()
 	var afterDone func(error)
@@ -1032,7 +1021,7 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 		}
 	}()
 
-	commitErr = w.cfg.Store.Commit(b, store.SyncWrites)
+	commitErr = b.Commit(ctx)
 	if commitErr != nil {
 		return w.wrapSegmentPersistenceError("committing durable metadata batch", fmt.Errorf("ingest: commit durable batch: %w", commitErr))
 	}

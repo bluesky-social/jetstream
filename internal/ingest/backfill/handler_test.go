@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -28,7 +28,7 @@ import (
 func newTestIngest(t *testing.T) *ingest.Writer {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -116,10 +116,10 @@ func TestSegmentHandler_HandleRepoQueuesCompletionWithoutFlush(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 
 	segmentsDir := filepath.Join(dir, "segments")
 	cb := NewCompletionBatcher(bs, nil)
@@ -170,10 +170,10 @@ func TestSegmentHandler_MultiBlockRepoCompletesOnlyWithFinalBlock(t *testing.T) 
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	cb := NewCompletionBatcher(bs, nil)
 
 	const perBlock = 2
@@ -229,10 +229,10 @@ func TestSegmentHandler_HandleEmptyRepoRecordsEmptyWatermark(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	cb := NewCompletionBatcher(bs, nil)
 
 	w, err := ingest.Open(ingest.Config{
@@ -272,10 +272,10 @@ func TestSegmentHandler_QueuedCompletionBecomesDurableOnWriterClose(t *testing.T
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	cb := NewCompletionBatcher(bs, nil)
 
 	w, err := ingest.Open(ingest.Config{

@@ -1,14 +1,14 @@
 package ingest
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 )
 
 const (
@@ -80,23 +80,18 @@ func initializeSeqLease(cfg Config, w *Writer, durableNext uint64, seqFound, had
 	}
 
 	b := cfg.Store.NewBatch()
-	defer func() { _ = b.Close() }()
 	// Every value below nextSeq is now durably covered by either a segment
 	// event or the gap registry staged in this same batch. Advance the durable
 	// coverage frontier atomically with that registry.
-	if err := stageNextSeq(b, cfg.SeqKey, nextSeq); err != nil {
-		return initializedSeqLease{}, err
-	}
-	if err := stageNextSeq(b, seqReservedKey, reservedEnd); err != nil {
-		return initializedSeqLease{}, err
-	}
+	stageNextSeq(b, cfg.SeqKey, nextSeq)
+	stageNextSeq(b, seqReservedKey, reservedEnd)
 	// Canonicalize the registry in the same startup transaction even when no
 	// new gap was created. Older/manual records may be valid but adjacent; one
 	// normalized representation bounds startup reads and status cardinality.
 	if err := stageSeqGaps(b, gaps); err != nil {
 		return initializedSeqLease{}, err
 	}
-	if err := cfg.Store.Commit(b, store.SyncWrites); err != nil {
+	if err := b.Commit(context.Background()); err != nil {
 		return initializedSeqLease{}, cfg.wrapSegmentPersistenceError("initializing sequence lease", err)
 	}
 	if createdGap {
@@ -106,15 +101,15 @@ func initializeSeqLease(cfg Config, w *Writer, durableNext uint64, seqFound, had
 	return initializedSeqLease{nextSeq: nextSeq, reservedEnd: reservedEnd, gaps: gaps}, nil
 }
 
-func loadSeqGaps(st *store.Store) (*seqspace.Gaps, error) {
+func loadSeqGaps(st metastore.Store) (*seqspace.Gaps, error) {
 	prefix := []byte(seqGapPrefix)
-	it, err := st.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	it, err := st.NewIter(context.Background(), prefix, metastore.PrefixUpperBound(prefix))
 	if err != nil {
 		return nil, fmt.Errorf("ingest: iterate seq gaps: %w", err)
 	}
 	defer func() { _ = it.Close() }()
 	var gaps []seqspace.Gap
-	for it.First(); it.Valid(); it.Next() {
+	for it.Next() {
 		key, val := it.Key(), it.Value()
 		if len(key) != len(prefix)+8 || len(val) != 10 || val[0] != gapVersion || val[1] != gapReasonCrash {
 			return nil, fmt.Errorf("ingest: malformed seq gap record key_len=%d value_len=%d", len(key), len(val))
@@ -124,17 +119,15 @@ func loadSeqGaps(st *store.Store) (*seqspace.Gaps, error) {
 			End:   binary.BigEndian.Uint64(val[2:]),
 		})
 	}
-	if err := it.Error(); err != nil {
+	if err := it.Err(); err != nil {
 		return nil, fmt.Errorf("ingest: iterate seq gaps: %w", err)
 	}
 	return seqspace.NewGaps(gaps)
 }
 
-func stageSeqGaps(b *pebble.Batch, gaps *seqspace.Gaps) error {
+func stageSeqGaps(b metastore.Batch, gaps *seqspace.Gaps) error {
 	prefix := []byte(seqGapPrefix)
-	if err := b.DeleteRange(prefix, store.PrefixUpperBound(prefix), nil); err != nil {
-		return fmt.Errorf("ingest: clear seq gaps: %w", err)
-	}
+	b.DeleteRange(prefix, metastore.PrefixUpperBound(prefix))
 	for _, gap := range gaps.Ranges() {
 		key := make([]byte, len(prefix)+8)
 		copy(key, prefix)
@@ -142,9 +135,7 @@ func stageSeqGaps(b *pebble.Batch, gaps *seqspace.Gaps) error {
 		val := make([]byte, 10)
 		val[0], val[1] = gapVersion, gapReasonCrash
 		binary.BigEndian.PutUint64(val[2:], gap.End)
-		if err := b.Set(key, val, nil); err != nil {
-			return fmt.Errorf("ingest: stage seq gap: %w", err)
-		}
+		b.Set(key, val)
 	}
 	return nil
 }

@@ -7,7 +7,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
@@ -53,10 +53,10 @@ type Config struct {
 	// filesystem.
 	FS vfs.FS
 
-	// Store is the shared metadata pebble db.
-	Store *store.Store
+	// Store is the shared metadata store.
+	Store metastore.Store
 
-	// SeqKey is the pebble key used by the underlying ingest.Writer
+	// SeqKey is the metadata key used by the underlying ingest.Writer
 	// for its seq counter. Bootstrap uses "live_segments/seq/next";
 	// steady state uses "seq/next".
 	SeqKey string
@@ -65,7 +65,7 @@ type Config struct {
 	// lease. Bootstrap live_segments leaves it false because serving is gated.
 	ReserveClientVisibleSeqs bool
 
-	// CursorKey is the pebble key for the upstream relay cursor.
+	// CursorKey is the metadata key for the upstream relay cursor.
 	// Both phases use "relay/cursor" (the merge step will hand
 	// cursor ownership over without renaming the key).
 	CursorKey string

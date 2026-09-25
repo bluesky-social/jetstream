@@ -65,6 +65,9 @@ func (r *mergeRunner) runDiscoveryWithClient(ctx context.Context, relayURL strin
 			newHostClient = jsbackfill.NewHostClientBuilder(relayURL, httpClient)
 		}
 		base := jsbackfill.NewStore(r.store, nil)
+		if err := base.SeedCounts(ctx); err != nil {
+			return err
+		}
 		store := discoveryStore{Store: base.AtmosStore(), base: base, runner: r}
 		opts := atmosbackfill.Options{
 			Relay: relay, NewHostClient: gt.Some(newHostClient), Store: store,

@@ -8,8 +8,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
-	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -22,18 +21,18 @@ import (
 func TestMerge_StoreFaultOnCursorCommit_FailsLoudNoSilentAdvance(t *testing.T) {
 	t.Parallel()
 	injected := errors.New("injected: merge cursor commit failed")
-	fault := &store.KeyPrefixFault{
+	fault := &metastore.KeyPrefixFault{
 		Prefix:  []byte(mergeNextSourceIdxKey),
-		Op:      store.WriteOpBatchCommit,
+		Op:      metastore.WriteOpBatchCommit,
 		Ordinal: 1,
 		Err:     injected,
 	}
 
 	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs},
-		map[string]string{"did:plc:a": "3l5"}, store.WithFaultInjector(fault))
+		map[string]string{"did:plc:a": "3l5"}, fault)
 
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 
@@ -89,7 +88,7 @@ func TestMerge_MultiSourceDrainsAllSources(t *testing.T) {
 	src3 := []segment.Event{ev("did:plc:c", "3l8", segment.KindCreate, 1002)}
 	fix := newMergeFixture(t, [][]segment.Event{src1, src2, src3}, nil)
 
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))

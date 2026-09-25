@@ -15,7 +15,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
@@ -28,7 +28,7 @@ func openFloorReplayFixture(t *testing.T, onSeal func(*manifest.Manifest) func(u
 	segDir := filepath.Join(dir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	st, err := store.Open(dir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

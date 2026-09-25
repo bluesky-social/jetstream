@@ -11,7 +11,6 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,12 +23,12 @@ func TestRunBootstrap_DrainsAndAdvancesPhase(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	bootstrapStartedAt := time.Now().UTC().Add(-2 * time.Hour)
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, dataDir), lifecycle.PhaseBootstrap, bootstrapStartedAt))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseBootstrap, bootstrapStartedAt))
 
 	relay := newFakeRelay(t, nil) // empty repo list => backfill drains immediately
 	verifier := newTestVerifier(t, relay.URL())
@@ -51,11 +50,11 @@ func TestRunBootstrap_DrainsAndAdvancesPhase(t *testing.T) {
 	require.NoError(t, o.runBootstrap(ctx))
 
 	// Phase must have advanced to merging.
-	got, err := lifecycle.ReadPhase(t.Context(), pebblestore.New(st, dataDir))
+	got, err := lifecycle.ReadPhase(t.Context(), st)
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseMerging, got)
 
-	timing, err := lifecycle.ReadBackfillTiming(t.Context(), pebblestore.New(st, dataDir))
+	timing, err := lifecycle.ReadBackfillTiming(t.Context(), st)
 	require.NoError(t, err)
 	require.True(t, timing.StartedAt.Equal(bootstrapStartedAt), "got %s, want %s", timing.StartedAt, bootstrapStartedAt)
 	require.False(t, timing.CompletedAt.IsZero())
@@ -79,11 +78,11 @@ func TestRunBootstrap_BackfillErrorPropagates(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, dataDir), lifecycle.PhaseBootstrap, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseBootstrap, time.Now().UTC()))
 
 	// Point at a closed listener so listRepos fails fast.
 	const unreachable = "http://127.0.0.1:1" // port 1 is reserved/unused
@@ -110,7 +109,7 @@ func TestRunBootstrap_BackfillErrorPropagates(t *testing.T) {
 		"the engine error, not the test safety deadline, must stop bootstrap")
 
 	// Phase must still be PhaseBootstrap — no cutover happened.
-	got, err := lifecycle.ReadPhase(t.Context(), pebblestore.New(st, dataDir))
+	got, err := lifecycle.ReadPhase(t.Context(), st)
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseBootstrap, got)
 }

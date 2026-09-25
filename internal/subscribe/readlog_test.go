@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
@@ -18,7 +18,7 @@ var testTailWriters sync.Map
 
 func newReadLogTail(t *testing.T, retentionBytes int64, cold coldReader) (*Tail, *ingest.Writer) {
 	t.Helper()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -52,7 +52,7 @@ func writerForTail(t *testing.T, tl *Tail) *ingest.Writer {
 		w, _ := got.(*ingest.Writer)
 		return w
 	}
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	w, err := ingest.Open(ingest.Config{

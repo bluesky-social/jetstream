@@ -12,7 +12,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/cbor"
@@ -86,7 +86,7 @@ func TestCorpusCARBackfill(t *testing.T) {
 	require.Equal(t, did, commit.DID, "CAR commit DID vs goat inspect")
 	require.Equal(t, rev, commit.Rev, "CAR commit rev vs goat inspect")
 
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

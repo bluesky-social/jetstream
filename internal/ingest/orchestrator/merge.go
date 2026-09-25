@@ -170,7 +170,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return fmt.Errorf("orchestrator: merge: remove backfill dir: %w", err)
 		}
 		// Make the backfill-subtree removal durable before deleting the merge
-		// cursors. deleteMergeCursor commits with store.SyncWrites, so without
+		// cursors. deleteMergeCursor commits durably, so without
 		// this fsync a power loss could leave the cursor deletion durable while
 		// the data/backfill dirent removal is not. On restart the phase is
 		// still PhaseMerging, live_segments would reappear, the

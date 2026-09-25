@@ -19,7 +19,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream/segment"
@@ -56,7 +55,7 @@ type pagedCutoverServer struct {
 	dataDir  string
 	segDir   string
 	manifest *manifest.Manifest
-	store    *store.Store
+	store    *pebblestore.Store
 	writer   *ingest.Writer
 	tail     *subscribe.Tail
 
@@ -130,9 +129,9 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 	require.NoError(t, m.Wait(context.Background()))
 	s.manifest = m
 
-	st, err := store.Open(dataDir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dataDir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
-	require.NoError(t, st.Set([]byte("seq/next"), encodeUint64LEOracle(nextSeq), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("seq/next"), encodeUint64LEOracle(nextSeq)))
 	s.store = st
 
 	w, err := ingest.Open(ingest.Config{
@@ -145,7 +144,7 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 	require.NoError(t, err)
 	s.writer = w
 
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, dataDir), lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseSteadyState, time.Now().UTC()))
 
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)

@@ -17,7 +17,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
@@ -27,9 +26,9 @@ import (
 
 // makeSteadyState writes the steady_state phase marker so the handler's
 // IsSteadyState gate passes.
-func makeSteadyState(t *testing.T, st *store.Store) {
+func makeSteadyState(t *testing.T, st *pebblestore.Store) {
 	t.Helper()
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, ""), lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseSteadyState, time.Now().UTC()))
 }
 
 func TestHandler_ReplaysFromCursor(t *testing.T) {
@@ -93,7 +92,7 @@ func TestHandler_ReplaysFromCursor(t *testing.T) {
 func TestHandler_CursorDuringWarmupReturns503(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	makeSteadyState(t, st)
@@ -295,7 +294,7 @@ func TestHandler_RejectsInvalidCursor(t *testing.T) {
 func newActiveTimestampServer(t *testing.T, v2 bool, blockSize int) (*httptest.Server, *ingest.Writer) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
 	segDir := filepath.Join(dir, "segments")
 	w, err := ingest.Open(ingest.Config{

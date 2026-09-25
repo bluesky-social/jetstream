@@ -14,7 +14,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -25,7 +25,7 @@ func TestRunDeleteCompactionCallsPassHook(t *testing.T) {
 
 	dataDir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dataDir, "segments"), 0o755))
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -58,7 +58,7 @@ func TestRunDeleteCompaction_SealsActiveSegmentBeforeSteadyPass(t *testing.T) {
 	dataDir := t.TempDir()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -195,7 +195,7 @@ func TestRunDeleteCompaction_RewriteBeforeWatermarkCrashIsIdempotent(t *testing.
 	dataDir := t.TempDir()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -265,7 +265,7 @@ func TestRunDeleteCompaction_CancelMidChunkDoesNotAdvanceWatermark(t *testing.T)
 	dataDir := t.TempDir()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -327,7 +327,7 @@ func TestRunDeleteCompaction_ManifestRefreshFailureReconcilesOnRetry(t *testing.
 	dataDir := t.TempDir()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -383,7 +383,7 @@ func TestRunDeleteCompaction_ChunkWatermarkCrashResumesAtNextChunk(t *testing.T)
 	dataDir := t.TempDir()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -481,7 +481,7 @@ func BenchmarkDeleteCompactionSyntheticArchive(b *testing.B) {
 		if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
 			b.Fatal(err)
 		}
-		st, err := store.Open(dataDir, nil)
+		st, err := pebblestore.Open(dataDir, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -534,12 +534,12 @@ func BenchmarkDeleteCompactionSyntheticArchive(b *testing.B) {
 	}
 }
 
-func newCompactionDataDir(t *testing.T, events []segment.Event) (string, *store.Store, string) {
+func newCompactionDataDir(t *testing.T, events []segment.Event) (string, *pebblestore.Store, string) {
 	t.Helper()
 	dataDir := t.TempDir()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	path := writeCompactionSegment(t, segmentsDir, 0, events)
@@ -651,7 +651,7 @@ func TestRunSteadyCompactor_PassErrorDoesNotExit(t *testing.T) {
 	// Make every pass fail: "segments" is a file, so the pass's
 	// directory listing errors.
 	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "segments"), []byte("not a dir"), 0o644))
-	st, err := store.Open(filepath.Join(dataDir, "meta"), nil)
+	st, err := pebblestore.Open(filepath.Join(dataDir, "meta"), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -707,7 +707,7 @@ func TestRebuildLiveTombstones_BoundedByWatermark(t *testing.T) {
 	dataDir := t.TempDir()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	writeCompactionSegment(t, segmentsDir, 0, segA)
@@ -746,7 +746,7 @@ func TestRebuildLiveTombstones_DisabledWhenCompactionOff(t *testing.T) {
 	dataDir := t.TempDir()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	writeCompactionSegment(t, segmentsDir, 0, []segment.Event{

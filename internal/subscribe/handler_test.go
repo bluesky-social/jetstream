@@ -16,7 +16,6 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
@@ -27,12 +26,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newSteadyStateStore(t *testing.T) *store.Store {
+func newSteadyStateStore(t *testing.T) *pebblestore.Store {
 	t.Helper()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, ""), lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseSteadyState, time.Now().UTC()))
 	return st
 }
 
@@ -68,10 +67,10 @@ func waitForOptionsUpdates(t *testing.T, m *Metrics, want float64) {
 func TestHandler_RejectsWhenNotSteadyState(t *testing.T) {
 	t.Parallel()
 
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(st, ""), lifecycle.PhaseBootstrap, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseBootstrap, time.Now().UTC()))
 
 	b, _ := newReadLogTail(t, 1<<20, noCold)
 

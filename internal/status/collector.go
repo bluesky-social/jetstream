@@ -8,14 +8,14 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jcalabro/atmos/identity"
 	"golang.org/x/sync/singleflight"
 )
 
 // Options configures a Collector. Store and DataDir are required.
 type Options struct {
-	Store   *store.Store
+	Store   metastore.Store
 	DataDir string
 
 	// Now overrides the wall clock; tests pin it for determinism.

@@ -9,7 +9,6 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
-	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -58,7 +57,7 @@ func TestMerge_FirstInitWatermarkFloor_BoundarySeqCompacts(t *testing.T) {
 	require.NoError(t, bw.SealActiveAndClose())
 	require.Equal(t, uint64(1), create.Seq, "precondition: bootstrap create at seq 1")
 
-	require.NoError(t, lifecycle.WritePhase(t.Context(), pebblestore.New(fix.store, fix.dataDir), lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))

@@ -12,15 +12,15 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
 type mergeRunner struct {
 	dst           *ingest.Writer
-	store         *store.Store
+	store         metastore.Store
 	sourceDir     string
 	fs            vfs.FS
 	logger        *slog.Logger
@@ -34,7 +34,7 @@ type mergeRunner struct {
 // simulator (crashpoint.Injector); production callers thread
 // o.cfg.CrashInjector, which is nil in production, making every
 // simulateCrash checkpoint a no-op. Pass nil to disable injection.
-func newMergeRunner(dst *ingest.Writer, st *store.Store, sourceDir string, fs vfs.FS, logger *slog.Logger, m *Metrics, injector crashpoint.Injector) *mergeRunner {
+func newMergeRunner(dst *ingest.Writer, st metastore.Store, sourceDir string, fs vfs.FS, logger *slog.Logger, m *Metrics, injector crashpoint.Injector) *mergeRunner {
 	r := &mergeRunner{
 		dst:           dst,
 		store:         st,
