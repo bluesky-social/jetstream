@@ -240,9 +240,16 @@ loop until process shutdown:
     err = runSession(sessionCtx, epoch)   // blocks until the session ends
     cancel(); wait for every session goroutine to exit
     locker.Release(ctx with 5s timeout)   // best effort
-    if err is a corruption error: exit the process non-zero
+    if err is fatal: exit the process non-zero
     sleep acquireInterval
 ```
+
+"Fatal" is the default: a session error is restartable only if it wraps
+`leader.ErrRestartSession` (lease loss, a fence failure, an unknown commit
+result, an S3 failure retries cannot fix). An error nobody classified ends the
+process, which keeps the crash-loud rule for corruption. A cancellation error
+is benign only when the loop cancelled the session. Each `Renew` call is
+bounded by `lastOK + lease`, so a hung call cannot outlive the lease.
 
 Lease timing only affects how fast failover happens. Safety comes only from the
 epoch fence (§6.4). A paused or partitioned old leader can keep running for any

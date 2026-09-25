@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/gttp"
@@ -20,7 +19,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
-	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream/internal/leader"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
@@ -30,12 +29,10 @@ import (
 	"github.com/bluesky-social/jetstream/internal/server"
 	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
-	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/bluesky-social/jetstream/internal/web"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
@@ -43,7 +40,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Runtime is one fully constructed jetstream daemon instance.
+// Runtime is one fully constructed jetstream daemon instance. Build
+// constructs the per-process graph; Run drives writer sessions under the
+// leader loop (see session.go).
 type Runtime struct {
 	opts Options
 
@@ -56,9 +55,15 @@ type Runtime struct {
 	manifest       *manifest.Manifest
 	catalogLoad    *backgroundLoad
 	tail           *subscribe.Tail
-	verifier       *atmossync.Verifier
-	orchestrator   *orchestrator.Orchestrator
 	server         *server.Server
+
+	sessions      *sessionFactory
+	orchMetrics   *orchestrator.Metrics
+	leaderMetrics *leader.Metrics
+	deadline      *compactionDeadline
+	// pending is the first session, built by Build so invalid options fail
+	// there. Guarded by closeMu.
+	pending *writerSession
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
@@ -95,6 +100,12 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	if opts.BootstrapLiveMaxEventsPerBlock < 0 {
 		return nil, fmt.Errorf("serve: BootstrapLiveMaxEventsPerBlock must be >= 0, got %d", opts.BootstrapLiveMaxEventsPerBlock)
+	}
+	if opts.SessionRestartDelay < 0 {
+		return nil, fmt.Errorf("serve: SessionRestartDelay must be >= 0, got %s", opts.SessionRestartDelay)
+	}
+	if opts.SteadyMaxEventsPerBlock < 0 {
+		return nil, fmt.Errorf("serve: SteadyMaxEventsPerBlock must be >= 0, got %d", opts.SteadyMaxEventsPerBlock)
 	}
 	if opts.FailedRepoRetryInterval < 0 {
 		return nil, fmt.Errorf("serve: --failed-repo-retry-interval must be >= 0 (FailedRepoRetryInterval must be >= 0), got %s", opts.FailedRepoRetryInterval)
@@ -239,17 +250,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	catalogLoad := startBackgroundLoad(manifestCtx, segCatalog.Refresh)
 	rt.catalogLoad = catalogLoad
 
-	// writerPtr is published by the orchestrator once the steady-state
-	// live consumer opens its ingest.Writer; the cursor handler reads it
-	// atomically. Before steady-state the lifecycle.IsSteadyState gate
-	// returns 503, so the nil-pointer window is harmless.
-	var writerPtr atomic.Pointer[ingest.Writer]
+	// The slot is published by each session's orchestrator once the
+	// steady-state live consumer opens its ingest.Writer; the cursor handler
+	// reads it atomically. Before steady-state the lifecycle.IsSteadyState
+	// gate returns 503, so the nil-pointer window is harmless.
+	slot := &writerSlot{}
+	writerPtr := &slot.ptr
 
-	// Verifier setup (shared across phases). The verifier itself is
-	// owned by the orchestrator's per-phase live consumers, but we
-	// construct it here because its async-error drain is a sibling
-	// goroutine in the top-level errgroup -- it's a process-wide
-	// observability concern.
 	relayHTTPURL, err := live.DeriveRelayHTTPURL(opts.RelayURL)
 	if err != nil {
 		return fail(fmt.Errorf("serve: derive relay HTTP URL: %w", err))
@@ -275,19 +282,19 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		SkipHandleVerification: true,
 	}
 
-	stateStore := syncstate.New(metaKV)
-	tombstones := tombstone.New()
-	// This state is owned and updated by the orchestrator, but xrpcapi sees
-	// only its read-only deadline surface. It starts unknown, so archive
-	// responses remain no-cache until steady-state scheduling is live.
-	compactionSchedule := orchestrator.NewCompactionScheduleState()
+	// Each session's orchestrator owns and updates its compaction schedule;
+	// xrpcapi sees only this read-only deadline surface. It starts unknown,
+	// so archive responses remain no-cache until steady-state scheduling is
+	// live.
+	deadline := &compactionDeadline{}
+	rt.deadline = deadline
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
 		Catalog:         segCatalog,
 		Fetcher:         segCatalog.Fetcher(),
 		Ready:           catalogLoad.Wait,
-		WriterRef:       &writerPtr,
+		WriterRef:       writerPtr,
 		BlockCacheBytes: opts.SubscribeBlockCacheBytes,
 		Metrics:         subscribeMetrics,
 	})
@@ -297,43 +304,23 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		ReadBatch:   opts.SubscribeReadBatch,
 		SlowWindow:  opts.SubscribeSlowWindow,
 		SlowMinRate: opts.SubscribeSlowMinRate,
-	}, coldRd.Read, func() uint64 {
-		if w := writerPtr.Load(); w != nil {
-			return w.NextSeq()
-		}
-		return 0
-	})
+	}, coldRd.Read, slot.nextSeq)
 	if err != nil {
 		return fail(fmt.Errorf("serve: build subscribe tail: %w", err))
 	}
 	rt.tail = tail
+	slot.tail = tail
+	tail.SetReadLogSource(slot.readLog)
 
-	verifierLogger := processLogger.With(slog.String("component", "verifier"))
-	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
-		Directory:  directory,
-		StateStore: stateStore,
-		SyncClient: gt.Some(syncClient),
-		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
-			verifierMetrics.IncFailure(obs.Classify(vErr))
-			verifierLogger.Warn("verification failure",
-				"did", did,
-				"err", vErr,
-			)
-		}),
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build verifier: %w", err))
-	}
-	rt.verifier = verifier
-
-	// The orchestrator owns all ingestion-lifecycle subsystems
-	// (backfill engine, bootstrap-time live consumer, steady-state
-	// live consumer). The runtime is no longer phase-aware.
+	// Each session's orchestrator owns all ingestion-lifecycle subsystems
+	// (backfill engine, bootstrap-time live consumer, steady-state live
+	// consumer). The runtime is not phase-aware.
 	//
-	// The /subscribe tail reads the steady writer's readable log (wired in
-	// OnSteadyStateWriter below), not the live consumer's OnEvent hook: every
-	// producer sharing the steady writer — the live consumer AND the failed-repo
-	// retry runner — must become visible through the writer-owned seq stream.
+	// The /subscribe tail reads the steady writer's readable log (published
+	// through the writer slot by OnSteadyStateWriter below), not the live
+	// consumer's OnEvent hook: every producer sharing the steady writer — the
+	// live consumer AND the failed-repo retry runner — must become visible
+	// through the writer-owned seq stream.
 	// OnEvent remains the live-consumer-only observation hook for tests/oracle.
 	onSteadyStateEvent := func(ev *segment.Event) {
 		if opts.OnSteadyStateEvent != nil {
@@ -362,76 +349,78 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			return atmossync.NewClient(atmossync.Options{Client: xc}), nil
 		}
 	}
-	orch, err := orchestrator.New(orchestrator.Config{
-		DataDir:        opts.DataDir,
-		FS:             opts.StorageFS,
-		Store:          metaKV,
-		RelayURL:       opts.RelayURL,
-		HTTPClient:     xrpcClient.HTTPClient.Val(),
-		Directory:      directory,
-		Verifier:       verifier,
-		SyncStateStore: stateStore,
-		Tombstones:     tombstones,
-		// Bare logger; orchestrator.New attaches component=orchestrator
-		// itself, and its children (live, ingest, backfill) attach
-		// their own component on top of the bare parent.
-		Logger:                         processLogger,
-		Metrics:                        orchestrator.NewMetrics(metrics.Registry, tombstones),
-		IngestMetrics:                  ingest.NewMetrics(metrics.Registry),
-		LiveMetrics:                    liveMetrics,
-		DropMetrics:                    ingest.NewDropMetrics(metrics.Registry),
-		BackfillMetrics:                backfillMetrics,
-		SegmentMetrics:                 segmentMetrics,
-		OnEvent:                        onSteadyStateEvent,
-		OnBootstrapLiveEvent:           opts.OnBootstrapLiveEvent,
-		MaxBackfillRepos:               opts.MaxBackfillRepos,
-		BackfillGlobalDownloads:        opts.effectiveBackfillGlobalDownloads(),
-		BackfillHostWorkers:            opts.effectiveBackfillHostWorkers(),
-		BackfillMaxActiveHosts:         opts.effectiveBackfillMaxActiveHosts(),
-		BackfillMaxHosts:               opts.effectiveBackfillMaxHosts(),
-		BackfillWorkers:                opts.BackfillWorkers,
-		BackfillNewHostClient:          backfillNewHostClient,
-		BackfillBatchSize:              opts.effectiveBackfillBatchSize(),
-		BackfillAsyncFlushWorkers:      opts.BackfillAsyncFlushWorkers,
-		ReadLogRetentionBytes:          int64(opts.effectiveSubscribeReadLogRetentionBytes()),
-		BootstrapLiveMaxSegmentBytes:   opts.BootstrapLiveMaxSegmentBytes,
-		BootstrapLiveMaxEventsPerBlock: opts.BootstrapLiveMaxEventsPerBlock,
-		BackfillRepos:                  opts.BackfillRepos,
-		SkipMergeDiscovery:             opts.SkipMergeDiscovery,
-		BackfillRetryBaseDelay:         opts.BackfillRetryBaseDelay,
-		FailedRepoRetryInterval:        opts.FailedRepoRetryInterval,
-		FailedRepoRetryWorkers:         opts.FailedRepoRetryWorkers,
-		FailedRepoRetryHostWorkers:     opts.FailedRepoRetryHostWorkers,
-		FailedRepoRetryMaxDelay:        opts.FailedRepoRetryMaxDelay,
-		LiveReconnectBackoff:           opts.LiveReconnectBackoff,
-		LiveDial:                       opts.LiveDial,
-		Catalog:                        segCatalog,
-		OnSegmentCompacted:             onSegmentCompacted,
-		SegmentManifestChecksums:       mft.SegmentChecksums,
-		CompactionInterval:             opts.CompactionInterval,
-		CompactionSchedule:             compactionSchedule,
-		CompactionTombstoneCap:         opts.CompactionTombstoneCap,
-		CompactionRewriteWorkers:       opts.CompactionRewriteWorkers,
-		OnCompactionPass:               onCompactionPass,
-		OnBeforeCompactionPass:         opts.OnBeforeCompactionPass,
-		BarrierBeforeCutover:           phaseBarrier(opts.BarrierBeforeCutover),
-		BarrierAfterBootstrap:          phaseBarrier(opts.BarrierAfterBootstrap),
-		BarrierAfterMerge:              phaseBarrier(opts.BarrierAfterMerge),
-		AfterRepoComplete:              opts.AfterRepoComplete,
-		CrashInjector:                  opts.CrashInjector,
-		SegmentIOFaultInjector:         opts.SegmentIOFaultInjector,
-		OnSteadyStateWriter: func(w *ingest.Writer) {
-			// Fires after the steady writer opens and before any producer
-			// (live consumer, retry runner, compactor) starts, so subscribers
-			// read the writer-owned log from its first event.
-			tail.SetReadLogSource(func() *ingest.ReadableLog { return w.ReadLog() })
-			writerPtr.Store(w)
+	rt.orchMetrics = orchestrator.NewMetrics(metrics.Registry)
+	rt.leaderMetrics = leader.NewMetrics(metrics.Registry)
+	// Store, Verifier, SyncStateStore, Tombstones, and CompactionSchedule are
+	// per-session; sessionFactory.build fills them in.
+	rt.sessions = &sessionFactory{
+		store:           metaKV,
+		directory:       directory,
+		syncClient:      syncClient,
+		verifierMetrics: verifierMetrics,
+		logger:          processLogger,
+		orch: orchestrator.Config{
+			DataDir:    opts.DataDir,
+			FS:         opts.StorageFS,
+			RelayURL:   opts.RelayURL,
+			HTTPClient: xrpcClient.HTTPClient.Val(),
+			Directory:  directory,
+			// Bare logger; orchestrator.New attaches component=orchestrator
+			// itself, and its children (live, ingest, backfill) attach
+			// their own component on top of the bare parent.
+			Logger:                         processLogger,
+			Metrics:                        rt.orchMetrics,
+			IngestMetrics:                  ingest.NewMetrics(metrics.Registry),
+			LiveMetrics:                    liveMetrics,
+			DropMetrics:                    ingest.NewDropMetrics(metrics.Registry),
+			BackfillMetrics:                backfillMetrics,
+			SegmentMetrics:                 segmentMetrics,
+			OnEvent:                        onSteadyStateEvent,
+			OnBootstrapLiveEvent:           opts.OnBootstrapLiveEvent,
+			MaxBackfillRepos:               opts.MaxBackfillRepos,
+			BackfillGlobalDownloads:        opts.effectiveBackfillGlobalDownloads(),
+			BackfillHostWorkers:            opts.effectiveBackfillHostWorkers(),
+			BackfillMaxActiveHosts:         opts.effectiveBackfillMaxActiveHosts(),
+			BackfillMaxHosts:               opts.effectiveBackfillMaxHosts(),
+			BackfillWorkers:                opts.BackfillWorkers,
+			BackfillNewHostClient:          backfillNewHostClient,
+			BackfillBatchSize:              opts.effectiveBackfillBatchSize(),
+			BackfillAsyncFlushWorkers:      opts.BackfillAsyncFlushWorkers,
+			ReadLogRetentionBytes:          int64(opts.effectiveSubscribeReadLogRetentionBytes()),
+			BootstrapLiveMaxSegmentBytes:   opts.BootstrapLiveMaxSegmentBytes,
+			BootstrapLiveMaxEventsPerBlock: opts.BootstrapLiveMaxEventsPerBlock,
+			SteadyMaxEventsPerBlock:        opts.SteadyMaxEventsPerBlock,
+			BackfillRepos:                  opts.BackfillRepos,
+			SkipMergeDiscovery:             opts.SkipMergeDiscovery,
+			BackfillRetryBaseDelay:         opts.BackfillRetryBaseDelay,
+			FailedRepoRetryInterval:        opts.FailedRepoRetryInterval,
+			FailedRepoRetryWorkers:         opts.FailedRepoRetryWorkers,
+			FailedRepoRetryHostWorkers:     opts.FailedRepoRetryHostWorkers,
+			FailedRepoRetryMaxDelay:        opts.FailedRepoRetryMaxDelay,
+			LiveReconnectBackoff:           opts.LiveReconnectBackoff,
+			LiveDial:                       opts.LiveDial,
+			Catalog:                        segCatalog,
+			OnSegmentCompacted:             onSegmentCompacted,
+			SegmentManifestChecksums:       mft.SegmentChecksums,
+			CompactionInterval:             opts.CompactionInterval,
+			CompactionTombstoneCap:         opts.CompactionTombstoneCap,
+			CompactionRewriteWorkers:       opts.CompactionRewriteWorkers,
+			OnCompactionPass:               onCompactionPass,
+			OnBeforeCompactionPass:         opts.OnBeforeCompactionPass,
+			BarrierBeforeCutover:           phaseBarrier(opts.BarrierBeforeCutover),
+			BarrierAfterBootstrap:          phaseBarrier(opts.BarrierAfterBootstrap),
+			BarrierAfterMerge:              phaseBarrier(opts.BarrierAfterMerge),
+			AfterRepoComplete:              opts.AfterRepoComplete,
+			CrashInjector:                  opts.CrashInjector,
+			SegmentIOFaultInjector:         opts.SegmentIOFaultInjector,
+			OnSteadyStateWriter:            slot.publish,
 		},
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build orchestrator: %w", err))
 	}
-	rt.orchestrator = orch
+	pending, err := rt.sessions.build()
+	if err != nil {
+		return fail(err)
+	}
+	rt.pending = pending
 
 	// Status and repo verification read segments through the catalog, so
 	// they wait for its background load like the cold reader does.
@@ -444,9 +433,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CursorLookback:        opts.CursorLookback,
 		IdentityResolver:      resolver,
 		LastSeenUpstreamEvent: liveMetrics.LastSeenUpstreamEvent,
-		Writer: func() *ingest.Writer {
-			return writerPtr.Load()
-		},
+		Writer:                writerPtr.Load,
 	})
 	if err != nil {
 		return fail(fmt.Errorf("serve: build status collector: %w", err))
@@ -459,7 +446,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	statusHandler, err := web.New(web.Options{
 		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(repoArchive, resolver, pendingEventsForDID(&writerPtr)),
+		RepoActions:                web.NewRepoActions(repoArchive, resolver, pendingEventsForDID(writerPtr)),
 		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
 		Logger:                     processLogger,
 	})
@@ -486,7 +473,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Manifest:  mft,
 		Catalog:   segCatalog,
 		Fetcher:   segCatalog.Fetcher(),
-		WriterRef: &writerPtr,
+		WriterRef: writerPtr,
 		Logger:    processLogger,
 		Metrics:   subscribeMetrics,
 		Lookback:  opts.CursorLookback,
@@ -501,7 +488,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		Manifest:  mft,
 		Catalog:   segCatalog,
 		Fetcher:   segCatalog.Fetcher(),
-		WriterRef: &writerPtr,
+		WriterRef: writerPtr,
 		Logger:    processLogger,
 		Metrics:   subscribeMetrics,
 		Lookback:  opts.CursorLookback,
@@ -523,7 +510,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			return nil
 		})),
 		CompactionCacheGrace: opts.CompactionCacheGrace,
-		CompactionDeadline:   compactionSchedule,
+		CompactionDeadline:   deadline,
 		Plan: xrpcapi.PlanConfig{
 			MaxDIDs:               opts.PlanMaxDIDs,
 			MaxCollections:        opts.PlanMaxCollections,
@@ -636,8 +623,16 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		}))
 	}
 
-	g.Go(r.goroutineRoot("orchestrator", func() error {
-		return r.orchestrator.Run(gctx)
+	// Local mode always holds the lock, so the loop runs one session at a
+	// time until shutdown or a fatal error. A session error wrapping
+	// leader.ErrRestartSession starts a fresh session in-process instead.
+	g.Go(r.goroutineRoot("writer_sessions", func() error {
+		return leader.Run(gctx, leader.Config{
+			Locker:          leader.Local{},
+			AcquireInterval: r.opts.SessionRestartDelay,
+			Logger:          r.processLogger.With(slog.String("component", "leader")),
+			Metrics:         r.leaderMetrics,
+		}, r.runSession)
 	}))
 
 	// Graceful client drain. Live websocket subscribers are hijacked
@@ -660,29 +655,8 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		return nil
 	}))
 
-	verifierLogger := r.processLogger.With(slog.String("component", "verifier"))
-	// Verifier async-error drain. Verification failures are
-	// diagnostic, not fatal -- they typically reflect adversarial or
-	// malformed PDS input, which is invalid user data, not a
-	// jetstream bug. We warn-log and the OnVerificationFailure hook
-	// fires for operator visibility, but never crash.
-	g.Go(r.goroutineRoot("verifier_async_errors", func() error {
-		for {
-			select {
-			case <-gctx.Done():
-				return nil
-			case err, ok := <-r.verifier.AsyncErrors():
-				if !ok {
-					return nil
-				}
-				verifierLogger.Warn("async error", "err", err)
-			}
-		}
-	}))
-
 	// Graceful shutdown surfaces as context.Canceled from the errgroup: the
-	// orchestrator's steady-state consumer and the HTTP server both return
-	// ctx.Err(). Suppress cancellation only when it came from the runtime's run
+	// HTTP server returns ctx.Err(). Suppress cancellation only when it came from the runtime's run
 	// context, either caller cancellation or Runtime.Close.
 	runErr = g.Wait()
 	if errors.Is(runErr, context.Canceled) && runCtx.Err() != nil {
@@ -735,20 +709,20 @@ func (r *Runtime) Close(ctx context.Context) error {
 	r.closeMu.Lock()
 	defer r.closeMu.Unlock()
 
-	if r.verifier != nil && runDrained {
-		if err := r.verifier.Close(); err != nil {
+	// A session that ran closed its own verifier before Run drained. The
+	// first session is still pending when Run never started.
+	if r.pending != nil && runDrained {
+		if err := r.pending.verifier.Close(); err != nil {
 			r.logger.Error("verifier close", "err", err)
 			errs = append(errs, fmt.Errorf("verifier close: %w", err))
 		}
-		r.verifier = nil
+		r.pending = nil
 	}
 	// Note: promoted sync state is NOT flushed here. The consumer's own
 	// Close flushes it after its writer has durably fsynced every
 	// appended row; flushing from Runtime.Close would commit promoted
 	// state even when the consumer's writer.Close failed, letting
-	// verifier state run ahead of the archive. Pending (unpromoted)
-	// entries are deliberately dropped — their events' rows were never
-	// archived and redelivery re-verifies them.
+	// verifier state run ahead of the archive.
 	if r.metaStore != nil && runDrained {
 		if err := r.metaStore.Close(); err != nil {
 			r.logger.Error("close metadata store", "err", err)

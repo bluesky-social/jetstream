@@ -72,6 +72,7 @@ type Options struct {
 	BackfillAsyncFlushWorkers      int
 	BootstrapLiveMaxSegmentBytes   int64
 	BootstrapLiveMaxEventsPerBlock int
+	SteadyMaxEventsPerBlock        int // test-only; zero is the ingest default
 	BackfillRepos                  []atmos.DID
 	SkipMergeDiscovery             bool
 	FailedRepoRetryInterval        time.Duration
@@ -158,6 +159,12 @@ type Options struct {
 	SegmentIOFaultInjector segment.IOFaultInjector
 	OnBootstrapLiveEvent   func(*segment.Event)
 	OnSteadyStateEvent     func(*segment.Event)
+	// SessionRestartDelay is how long the leader loop waits between writer
+	// sessions. Zero is leader.DefaultAcquireInterval; tests shorten it.
+	SessionRestartDelay time.Duration
+	// OnSessionStart, if non-nil, is a test hook that fires as each writer
+	// session starts, before its orchestrator runs.
+	OnSessionStart func(epoch uint64)
 }
 
 func (o Options) effectiveBackfillGlobalDownloads() int {

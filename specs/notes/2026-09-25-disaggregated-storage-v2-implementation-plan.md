@@ -548,7 +548,7 @@ refreshed STALE mutants.
   - Tests: the existing subscribe, xrpcapi, and repoexport suites pass
     unchanged. Add a byte-identity test: the `getSegment` virtual file equals
     the on-disk sealed file for random segments.
-- [ ] **S1.11 Orchestrator seams** (L). Deps: S1.9.
+- [x] **S1.11 Orchestrator seams** (L). Deps: S1.9.
   - `merge.go`/`merge_runner.go`: list and read merge sources through the
     catalog (`namespace = bootstrap_live`) and a block fetcher, instead of
     `SegmentFilesFS` + `segment.Open` (`merge_runner.go:63,117`,
@@ -563,7 +563,7 @@ refreshed STALE mutants.
     the local catalog's namespace-delete and startup-cleanup methods.
   - Crashpoints stay in the same logical places. `specs/oracle.md` crash tier
     coverage is unchanged.
-- [ ] **S1.12 Leader skeleton and per-session runtime split (local mode)** (L).
+- [x] **S1.12 Leader skeleton and per-session runtime split (local mode)** (L).
   Deps: S1.10, S1.11.
   - `internal/leader`: `Locker` (the atmos `streaming.DistributedLocker` plus
     `Epoch() uint64`) and the election loop from design §6.3, with an
@@ -1223,6 +1223,72 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S1.12 (2026-09-25): leader loop and per-session runtime split.**
+  - `internal/leader.Run(ctx, Config, SessionFunc)`. `leader.Local` embeds
+    `streaming.NoopLock`, has epoch 1, and skips the renew ticker. The loop
+    sleeps `AcquireInterval` between sessions.
+  - Error classification: a session error is fatal unless it wraps
+    `leader.ErrRestartSession` (`Config.Fatal` overrides). An unclassified
+    error keeps the crash-loud rule, so local mode behaves as before. A
+    cancellation error is benign only when the loop cancelled the session.
+    A fatal error wins over lease loss and shutdown.
+  - No injectable clock: the loop tests run under `testing/synctest`. Each
+    `Renew` call is bounded by the deadline `lastOK + Lease`, where `lastOK`
+    is the start of the last successful call, so a hung renew cannot keep a
+    session alive past its lease.
+  - Per-process: logger, registries, metastore handle, manifest, catalog,
+    cold reader, tail, identity, status, web, server, xrpcapi, and the
+    orchestrator and leader metrics. Per-session: orchestrator (writer,
+    compactor, retry runners), syncstate store, tombstone set, verifier and
+    its async-error drain, and the compaction schedule. The local metastore
+    write handle is the process handle: a local data directory has one
+    writer.
+  - `HotLog`/`Readiness` plumbing: a `writerSlot` holds the current steady
+    writer. It feeds the tail, cold reader, status, cursor resolution, and
+    repo actions. The slot keeps the last writer after its session ends
+    instead of clearing it. Clearing would let a subscriber that passed the
+    handler's writer check anchor at `Tip()` 0 and replay the archive. The
+    seq lease keeps the next writer's seqs above the old tip. Readiness
+    needed no change: it reads the persisted phase.
+  - Tail fix: a reader parked at the tip now also wakes on the tail's own
+    notify channel, so `SetReadLogSource` with a new log wakes readers
+    parked on the old one. `TestTail_SetReadLogSourceWakesReaderParkedOnOldLog`
+    pins it.
+  - The tombstone gauges read through `Metrics.SetTombstones`. xrpcapi reads
+    the compaction deadline through an indirection that is unknown (no
+    caching) between sessions. The catalog does not detach a closed writer;
+    the next writer's attach replaces it.
+  - `Build` builds the first session up front, so invalid orchestrator or
+    verifier config still fails in `Build`. `Close` closes it if `Run` never
+    took it.
+  - "Follower" is implicit in local mode: the per-process readers follow the
+    slot.
+  - New test-only `Options`: `OnSessionStart`, `SteadyMaxEventsPerBlock` (the
+    steady writer only fsyncs on a full block), and `SessionRestartDelay`.
+  - `TestOracle_SessionRestartInProcess` ends session 1 with a restartable
+    error in five places: four crashpoints across bootstrap-live seal, merge,
+    and steady entry, plus a steady segment fsync fault after the steady
+    writer has published. It asserts exactly two sessions and that the
+    oracle matches.
+
+- **S1.11 (2026-09-25): orchestrator seams.**
+  - The orchestrator reads segments through a `SegmentCatalog`. When
+    `Config.Catalog` is nil, it builds a private lazy `catalog/local`
+    catalog. The catalog is refreshed at four points: merge start, each
+    compaction pass (after the forced rotate), the merge-to-steady manifest
+    reconcile, and the live-tombstone rebuild.
+  - The merge restart guard is now "`bootstrap_live` has no segments". The
+    merge runner checks that sources are contiguous and merges only sealed
+    segments.
+  - `RewriteSegment` reloads the new generation. `DeleteNamespace` fsyncs the
+    parent directory even when the tree is already gone. Stale-tmp cleanup
+    errors are prefixed `catalog/local:`.
+  - Refresh race: the merge kept HEAD's sample-then-merge `Refresh` (S1.10)
+    plus the attached-writer skip and a stale-tail guard. It did not take a
+    rev-retry loop.
+  - Mutants: m051 is retargeted to `DeleteNamespace` in `catalog/local`.
+    m003, m006, m024, m034, m045, and m051 are refreshed.
 
 - **S1.13 (2026-09-25): catalog-based oracle observers.**
   - `ObserveSegments`, `ObserveSealedSegments`, and `ObserveBootstrapSegments`

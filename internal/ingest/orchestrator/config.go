@@ -161,6 +161,12 @@ type Config struct {
 	BootstrapLiveMaxSegmentBytes   int64
 	BootstrapLiveMaxEventsPerBlock int
 
+	// SteadyMaxEventsPerBlock forwards to the steady-state writer. Zero
+	// leaves the ingest default. Production leaves it unset; oracle tests
+	// use a tiny limit to make the steady writer fsync without thousands of
+	// events.
+	SteadyMaxEventsPerBlock int
+
 	// BackfillRepos, when non-empty, replaces bootstrap listRepos
 	// discovery with this explicit DID list. Debug-only knob for
 	// targeted production smoke tests; leave empty in production.
@@ -334,6 +340,9 @@ func (c *Config) validate() error {
 	}
 	if c.BootstrapLiveMaxEventsPerBlock < 0 {
 		return fmt.Errorf("%w: BootstrapLiveMaxEventsPerBlock must be >= 0", ErrInvalidConfig)
+	}
+	if c.SteadyMaxEventsPerBlock < 0 {
+		return fmt.Errorf("%w: SteadyMaxEventsPerBlock must be >= 0", ErrInvalidConfig)
 	}
 	if c.FailedRepoRetryInterval < 0 {
 		return fmt.Errorf("%w: FailedRepoRetryInterval must be >= 0", ErrInvalidConfig)

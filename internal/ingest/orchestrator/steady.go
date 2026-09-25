@@ -75,6 +75,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			CompactionTrigger:     o.compactionTrigger,
 			SegmentMetrics:        o.cfg.SegmentMetrics,
 			ReadLogRetentionBytes: o.cfg.ReadLogRetentionBytes,
+			MaxEventsPerBlock:     o.cfg.SteadyMaxEventsPerBlock,
 			OnEvent:               o.cfg.OnEvent,
 			OnUpstreamEventSeen:   o.cfg.LiveMetrics.NoteLastSeenUpstreamEvent,
 			Catalog:               o.segments(),

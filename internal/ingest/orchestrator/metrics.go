@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
@@ -60,15 +61,15 @@ type Metrics struct {
 	CompactionBytesRewritten    prometheus.Counter
 	CompactionWatermarkSeq      prometheus.Gauge
 	CompactionWatermarkLag      prometheus.Gauge
+
+	// tombstones is the set the tombstone gauges read. Metrics live for the
+	// process but each writer session builds its own set.
+	tombstones atomic.Pointer[tombstone.Set]
 }
 
 // NewMetrics registers the orchestrator counters/gauges against reg.
+// The optional tombstone set is bound as if by SetTombstones.
 func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metrics {
-	var ts *tombstone.Set
-	if len(tombstones) > 0 {
-		ts = tombstones[0]
-	}
-
 	m := &Metrics{
 		Phase: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -148,6 +149,7 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		Name: "tombstone_set_entries",
 		Help: "Current number of entries in the live in-memory tombstone set.",
 	}, func() float64 {
+		ts := m.tombstones.Load()
 		if ts == nil {
 			return 0
 		}
@@ -158,6 +160,7 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		Name: "tombstone_set_bytes",
 		Help: "Estimated bytes held by the live in-memory tombstone set.",
 	}, func() float64 {
+		ts := m.tombstones.Load()
 		if ts == nil {
 			return 0
 		}
@@ -229,7 +232,17 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		m.CompactionWatermarkSeq,
 		m.CompactionWatermarkLag,
 	)
+	if len(tombstones) > 0 {
+		m.SetTombstones(tombstones[0])
+	}
 	return m
+}
+
+// SetTombstones points the tombstone gauges at ts. Nil reads as empty.
+func (m *Metrics) SetTombstones(ts *tombstone.Set) {
+	if m != nil {
+		m.tombstones.Store(ts)
+	}
 }
 
 func (m *Metrics) setPhase(v float64) {

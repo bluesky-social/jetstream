@@ -2,6 +2,7 @@ package subscribe
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -217,5 +218,38 @@ func TestTail_SetReadLogSourceWakesBlockedReader(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("blocked reader did not wake when read log was installed")
+	}
+}
+
+// A new writer session replaces the tail's log. A reader parked at the old
+// log's tip must move to the new one, because the old log never appends
+// again.
+func TestTail_SetReadLogSourceWakesReaderParkedOnOldLog(t *testing.T) {
+	t.Parallel()
+	tl, oldW := newReadLogTail(t, 1<<20, noCold)
+	appendToWriter(t, oldW, &segment.Event{Kind: segment.KindCreate, DID: "did:plc:x", Payload: []byte{0xa0}})
+	cursor := oldW.ReadLog().TipSeq()
+
+	done := make(chan error, 1)
+	go func() {
+		entries, _, err := tl.ReadFrom(context.Background(), cursor, 8)
+		if err == nil && (len(entries) == 0 || entries[0].Event.Seq < cursor) {
+			err = fmt.Errorf("got %d entries from cursor %d", len(entries), cursor)
+		}
+		done <- err
+	}()
+	waitTailBlocked(t, tl)
+
+	_, newW := newReadLogTail(t, 1<<20, noCold)
+	for newW.ReadLog().TipSeq() <= cursor {
+		appendToWriter(t, newW, &segment.Event{Kind: segment.KindCreate, DID: "did:plc:y", Payload: []byte{0xa0}})
+	}
+	tl.SetReadLogSource(func() *ingest.ReadableLog { return newW.ReadLog() })
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader parked on the old log did not move to the new one")
 	}
 }

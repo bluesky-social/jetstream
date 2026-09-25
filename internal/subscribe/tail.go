@@ -39,7 +39,7 @@ type tailConfig struct {
 // the injected coldReader. Replaces the old push-based fanout.
 type Tail struct {
 	mu      sync.Mutex
-	notify  chan struct{} // closed when a read-log source is installed
+	notify  chan struct{} // closed when a read-log source is installed or replaced
 	blocked chan uint64   // nonblocking test/diagnostic signal when a reader parks at the tip
 	cold    coldReader
 	nextSeq func() uint64
@@ -106,7 +106,9 @@ func newTail(cfg tailConfig) *Tail {
 }
 
 // SetReadLogSource points the tail at the writer-owned readable log. Wire it
-// before publishing the steady-state writer to subscribers.
+// before publishing the steady-state writer to subscribers. Call it again
+// whenever the log fn returns changes, such as a new writer session, so
+// readers parked on the old log re-resolve it.
 func (t *Tail) SetReadLogSource(fn func() *ingest.ReadableLog) {
 	t.mu.Lock()
 	old := t.notify
@@ -132,7 +134,7 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 		t.mu.Unlock()
 		if readLog != nil {
 			if log := readLog(); log != nil {
-				entries, notify, ok, atTip := log.ReadFrom(cursor, max)
+				entries, logNotify, ok, atTip := log.ReadFrom(cursor, max)
 				if ok {
 					out := make([]*Entry, len(entries))
 					for i := range entries {
@@ -150,9 +152,14 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 				case t.blocked <- cursor:
 				default:
 				}
+				// notify also wakes a reader parked on a log that a new
+				// session's writer has replaced; the old log never appends
+				// again.
 				select {
 				case <-ctx.Done():
 					return nil, cursor, ctx.Err()
+				case <-logNotify:
+					continue
 				case <-notify:
 					continue
 				}
