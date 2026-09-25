@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
@@ -25,11 +26,6 @@ type SegmentSource interface {
 	PlanSnapshot(manifest.PlanSnapshotRequest) (manifest.PlanSnapshotResult, error)
 }
 
-// ReadyFunc is called at the start of every XRPC request. Return an error
-// when the archive is not safe to expose yet, for example during bootstrap
-// or manifest startup.
-type ReadyFunc func(context.Context) error
-
 // Server builds the XRPC handler tree for the jetstream lexicons.
 type Server struct {
 	src    SegmentSource
@@ -38,14 +34,19 @@ type Server struct {
 }
 
 // Config holds the dependencies for the XRPC server. Zero values are valid:
-// a nil Logger defaults to slog.Default(); a nil Ready disables the readiness
-// gate; an unknown or disabled CompactionDeadline disables caching; nil
-// Metrics/Tracer make getBlock observability no-ops. Plan must be populated for
-// planSnapshot to accept non-empty filters.
+// a nil Logger defaults to slog.Default(); a nil Opener serves segment files
+// from the paths Src reports; a nil Ready disables the readiness gate; an
+// unknown or disabled CompactionDeadline disables caching; nil Metrics/Tracer
+// make getBlock observability no-ops. Plan must be populated for planSnapshot
+// to accept non-empty filters.
+//
+// Ready runs at the start of every archive request and turns an error into a
+// 503, for example during bootstrap or manifest startup.
 type Config struct {
 	Src                  SegmentSource
+	Opener               SegmentOpener
 	Logger               *slog.Logger
-	Ready                ReadyFunc
+	Ready                lifecycle.Readiness
 	CompactionCacheGrace time.Duration
 	CompactionDeadline   CompactionDeadline
 	Plan                 PlanConfig
@@ -63,13 +64,17 @@ func New(cfg Config) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	opener := cfg.Opener
+	if opener == nil {
+		opener = FileOpener{Src: cfg.Src}
+	}
 	s := &Server{src: cfg.Src, logger: logger, xrpc: &xrpcserver.Server{}}
 	s.xrpc.HandleQuery(getSegmentNSID, withReady(cfg.Ready, &getSegmentHandler{
-		src: cfg.Src, logger: logger,
+		opener: opener, logger: logger,
 		compactionCacheGrace: cfg.CompactionCacheGrace, compactionDeadline: cfg.CompactionDeadline,
 	}))
 	s.xrpc.HandleQuery(getBlockNSID, withReady(cfg.Ready, &getBlockHandler{
-		src: cfg.Src, logger: logger,
+		opener: opener, logger: logger,
 		compactionCacheGrace: cfg.CompactionCacheGrace, compactionDeadline: cfg.CompactionDeadline,
 		metrics: cfg.Metrics, tracer: cfg.Tracer,
 	}))
@@ -93,12 +98,12 @@ func (s *Server) Handler() http.Handler {
 	return s.xrpc
 }
 
-func withReady(ready ReadyFunc, h xrpcserver.Handler) xrpcserver.Handler {
+func withReady(ready lifecycle.Readiness, h xrpcserver.Handler) xrpcserver.Handler {
 	if ready == nil {
 		return h
 	}
 	return xrpcserver.HandlerFunc(func(ctx context.Context, w http.ResponseWriter, r *xrpcserver.Request) error {
-		if err := ready(ctx); err != nil {
+		if err := ready.Ready(ctx); err != nil {
 			return &xrpc.Error{
 				StatusCode: http.StatusServiceUnavailable,
 				Name:       "ServiceUnavailable",

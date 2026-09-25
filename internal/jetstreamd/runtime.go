@@ -457,11 +457,12 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}, processLogger, metrics)
 
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
-	// before steady-state, lifecycle.IsSteadyState gates with 503 so
+	// before steady-state, the phase readiness gate answers 503 so
 	// nil-pointer reads are harmless.
+	phaseReady := lifecycle.SteadyState(metaKV)
 	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
-		Store:     metaKV,
+		Ready:     phaseReady,
 		Manifest:  mft,
 		FS:        opts.StorageFS,
 		WriterRef: &writerPtr,
@@ -475,7 +476,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// handler owns this one NSID while atmos xrpcserver keeps the rest.
 	srv.RegisterPublicRoute("GET /xrpc/network.bsky.jetstream.subscribeEvents", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
-		Store:     metaKV,
+		Ready:     phaseReady,
 		Manifest:  mft,
 		FS:        opts.StorageFS,
 		WriterRef: &writerPtr,
@@ -493,15 +494,12 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	xrpcSrv := xrpcapi.New(xrpcapi.Config{
 		Src:    mft,
 		Logger: processLogger,
-		Ready: func(ctx context.Context) error {
-			if !lifecycle.IsSteadyState(ctx, metaKV) {
-				return errors.New("bootstrap in progress")
-			}
+		Ready: lifecycle.AllReady(phaseReady, lifecycle.ReadinessFunc(func(ctx context.Context) error {
 			if err := mft.Wait(ctx); err != nil {
 				return fmt.Errorf("manifest warming up: %w", err)
 			}
 			return nil
-		},
+		})),
 		CompactionCacheGrace: opts.CompactionCacheGrace,
 		CompactionDeadline:   compactionSchedule,
 		Plan: xrpcapi.PlanConfig{

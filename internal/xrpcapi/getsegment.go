@@ -2,15 +2,14 @@ package xrpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
 )
@@ -20,7 +19,7 @@ import (
 // needs the underlying *http.Request to drive http.ServeContent's Range and
 // conditional-request handling.
 type getSegmentHandler struct {
-	src                  SegmentSource
+	opener               SegmentOpener
 	logger               *slog.Logger
 	compactionCacheGrace time.Duration
 	compactionDeadline   CompactionDeadline
@@ -37,45 +36,27 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 		return xrpcserver.InvalidRequest("malformed segment name")
 	}
 
-	ref, ok := h.src.SegmentByIdx(idx)
-	if !ok {
+	// Open BEFORE writing anything, so failures become XRPC error envelopes
+	// rather than a corrupt partial 200 response. Download validators come
+	// from the file we actually serve, never the manifest: during a
+	// compaction rename→refresh window the manifest ETag is stale, and an
+	// If-Range match against it would let a resuming client splice two file
+	// generations together.
+	f, err := h.opener.OpenSegment(ctx, idx)
+	if errors.Is(err, ErrSegmentNotFound) {
 		// Error name must match the lexicon's declared SegmentNotFound, not
 		// the generic NotFound, so clients matching on the published name work.
 		return &xrpc.Error{StatusCode: http.StatusNotFound, Name: "SegmentNotFound", Message: "segment not found"}
 	}
-
-	// Open and stat BEFORE writing anything, so failures become XRPC error
-	// envelopes rather than a corrupt partial 200 response.
-	f, err := os.Open(ref.Path)
 	if err != nil {
-		// Manifest believes this segment exists but we cannot open it: a
-		// real inconsistency (rotation/deletion race). Surface it loudly.
+		// The segment exists but cannot be opened: a real inconsistency
+		// (rotation/deletion race, corrupt header). Surface it loudly.
 		h.logger.Error("getSegment: open sealed file failed",
-			slog.String("name", name), slog.String("path", ref.Path),
-			slog.Any("err", err))
+			slog.String("name", name), slog.Any("err", err))
 		return xrpcserver.InternalError("failed to open segment")
 	}
 	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		h.logger.Error("getSegment: stat sealed file failed",
-			slog.String("name", name), slog.String("path", ref.Path),
-			slog.Any("err", err))
-		return xrpcserver.InternalError("failed to stat segment")
-	}
-	// Download validators come from the fd we actually serve, never the
-	// manifest: during a compaction rename→refresh window the manifest
-	// ETag is stale, and an If-Range match against it would let a
-	// resuming client splice two file generations together.
-	// ReadSealedHeader validates magic/version, so a corrupt or
-	// foreign file errors instead of serving a confident strong ETag.
-	hdr, err := segment.ReadSealedHeader(f)
-	if err != nil {
-		h.logger.Error("getSegment: read sealed header failed",
-			slog.String("name", name), slog.String("path", ref.Path),
-			slog.Any("err", err))
-		return xrpcserver.InternalError("failed to read segment header")
-	}
+	hdr := f.Header()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// A strong ETag is the value wrapped in double quotes per RFC 9110.
@@ -89,7 +70,7 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 	// statusRecorder.ReadFrom delegation. Per the xrpcserver.Handler contract
 	// we MUST return nil after this point: the response may already be
 	// partially written, so an error envelope is no longer possible.
-	http.ServeContent(w, contentRequest(r.HTTPReq), name, info.ModTime(), f)
+	http.ServeContent(w, contentRequest(r.HTTPReq), name, f.ModTime(), f.Content())
 	return nil
 }
 

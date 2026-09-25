@@ -1,6 +1,8 @@
 package lifecycle
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -159,4 +161,19 @@ func TestPhase_SurvivesReopen(t *testing.T) {
 	timing, err := ReadBackfillTiming(t.Context(), st)
 	require.NoError(t, err)
 	require.Equal(t, BackfillTiming{StartedAt: startedAt, CompletedAt: enteredAt}, timing)
+}
+
+func TestSteadyStateReadiness(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	ready := SteadyState(st)
+	require.ErrorIs(t, ready.Ready(t.Context()), ErrBootstrapInProgress)
+
+	warm := errors.New("warming")
+	gated := AllReady(ready, ReadinessFunc(func(context.Context) error { return warm }))
+	require.ErrorIs(t, gated.Ready(t.Context()), ErrBootstrapInProgress, "the phase gate reports first")
+
+	require.NoError(t, WritePhase(t.Context(), st, PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, ready.Ready(t.Context()))
+	require.ErrorIs(t, gated.Ready(t.Context()), warm)
 }

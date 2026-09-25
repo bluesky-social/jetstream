@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -539,9 +540,9 @@ func TestPlanSnapshot_ReadinessGate(t *testing.T) {
 		Src:    s.src,
 		Logger: s.logger,
 		Plan:   defaultPlanTestConfig(),
-		Ready: func(_ context.Context) error {
+		Ready: lifecycle.ReadinessFunc(func(_ context.Context) error {
 			return errors.New("bootstrap in progress")
-		},
+		}),
 	})
 	ts := httptest.NewServer(gated.Handler())
 	t.Cleanup(ts.Close)
