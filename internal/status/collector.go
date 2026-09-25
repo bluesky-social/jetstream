@@ -13,10 +13,21 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// Options configures a Collector. Store and DataDir are required.
+// Options configures a Collector. Store is required.
 type Options struct {
-	Store   metastore.Store
+	Store metastore.Store
+
+	// DataDir labels the segment trees with their local directories.
+	// Optional; with no local data dir the trees are labeled by namespace.
 	DataDir string
+
+	// Archive is the segment catalog the segment trees are read through.
+	// Optional; when nil the trees hold only what Manifest reports.
+	Archive Archive
+
+	// ArchiveReady, when set, blocks until Archive has loaded, so an early
+	// snapshot does not render a partial archive as the whole of it.
+	ArchiveReady func(context.Context) error
 
 	// Now overrides the wall clock; tests pin it for determinism.
 	// Default time.Now.
@@ -57,9 +68,6 @@ type Collector struct {
 func New(opts Options) (*Collector, error) {
 	if opts.Store == nil {
 		return nil, fmt.Errorf("status: Options.Store is required")
-	}
-	if opts.DataDir == "" {
-		return nil, fmt.Errorf("status: Options.DataDir is required")
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now

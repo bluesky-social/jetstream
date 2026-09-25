@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
@@ -25,26 +27,28 @@ const testDID = "did:plc:repoexport"
 // real resident blooms -> real segment decode -> real MST root.
 type manifestSelector struct{ m *manifest.Manifest }
 
-func (s manifestSelector) SelectBlocksForDID(did string) ([]BlockSelection, error) {
-	sel, err := s.m.SelectBlocksForDID(did)
+func (s manifestSelector) SelectBlocksForDID(ns catalog.Namespace, did string) (Selection, error) {
+	if ns != catalog.Main {
+		return nil, nil
+	}
+	sel := Selection{}
+	for idx := range s.m.SegmentChecksums() {
+		sel[idx] = nil
+	}
+	picks, err := s.m.SelectBlocksForDID(did)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]BlockSelection, len(sel))
-	for i := range sel {
-		out[i] = BlockSelection{Path: sel[i].Path, Blocks: sel[i].Blocks}
+	for _, p := range picks {
+		sel[p.Idx] = p.Blocks
 	}
-	return out, nil
+	return sel, nil
 }
 
-func (s manifestSelector) ActiveSegmentPaths() ([]string, error) {
-	return s.m.ActiveSegmentPaths()
-}
-
-// openSelector opens a manifest over dataDir/segments and returns it adapted
-// to repoexport.Selector. The manifest is the single in-memory cache the
-// production /status path uses; reconstruction never re-scans segments/.
-func openSelector(t *testing.T, dataDir string) Selector {
+// openArchive opens the archive under dataDir the way the runtime does: a
+// local catalog over both namespaces, the manifest's resident blooms for
+// main, and footer blooms for whatever the manifest does not hold.
+func openArchive(t *testing.T, dataDir string) Archive {
 	t.Helper()
 	segmentsDir := filepath.Join(dataDir, "segments")
 	// Production MkdirAll's the segments dir before opening the manifest
@@ -56,7 +60,17 @@ func openSelector(t *testing.T, dataDir string) Selector {
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	require.NoError(t, err)
-	return manifestSelector{m: m}
+	cat, err := localcatalog.New(localcatalog.Config{Dirs: map[catalog.Namespace]string{
+		catalog.Main:          segmentsDir,
+		catalog.BootstrapLive: filepath.Join(dataDir, "backfill", "live_segments"),
+	}})
+	require.NoError(t, err)
+	require.NoError(t, cat.Refresh(t.Context()))
+	return Archive{
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
+		Selector: FooterSelector{Source: cat, Primary: manifestSelector{m: m}},
+	}
 }
 
 // TestReconstruct_CoversSealedActiveAndPending is the central correctness
@@ -109,9 +123,8 @@ func TestReconstruct_CoversSealedActiveAndPending(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, []segment.Event{r1, r2, r3})
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:       dataDir,
+		Archive:       openArchive(t, dataDir),
 		DID:           testDID,
-		Selector:      openSelector(t, dataDir),
 		PendingEvents: []segment.Event{r3},
 	})
 	require.NoError(t, err)
@@ -135,9 +148,8 @@ func TestReconstruct_CreateOnlyBuildsExpectedRoot(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, append(archive, live...))
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:  dataDir,
-		DID:      testDID,
-		Selector: openSelector(t, dataDir),
+		Archive: openArchive(t, dataDir),
+		DID:     testDID,
 	})
 	require.NoError(t, err)
 	require.Equal(t, testDID, got.DID)
@@ -166,9 +178,8 @@ func TestReconstruct_LiveSegmentsSkipEventsAtOrBeforePrimaryWatermark(t *testing
 	}
 	wantRoot, wantCount := expectedRoot(t, wantEvents)
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:  dataDir,
-		DID:      testDID,
-		Selector: openSelector(t, dataDir),
+		Archive: openArchive(t, dataDir),
+		DID:     testDID,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "3l6", got.LatestRev)
@@ -199,9 +210,8 @@ func TestReconstruct_UpdateReplacesRecordCID(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, events)
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:  dataDir,
-		DID:      testDID,
-		Selector: openSelector(t, dataDir),
+		Archive: openArchive(t, dataDir),
+		DID:     testDID,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "rev2", got.LatestRev)
@@ -233,9 +243,8 @@ func TestReconstruct_BlocksExcludeStaleRecordPayloads(t *testing.T) {
 	writeSegmentTree(t, st, filepath.Join(dataDir, "segments"), events)
 
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:  dataDir,
-		DID:      testDID,
-		Selector: openSelector(t, dataDir),
+		Archive: openArchive(t, dataDir),
+		DID:     testDID,
 	})
 	require.NoError(t, err)
 
@@ -266,9 +275,8 @@ func TestReconstruct_DeleteRemovesRecord(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, events)
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:  dataDir,
-		DID:      testDID,
-		Selector: openSelector(t, dataDir),
+		Archive: openArchive(t, dataDir),
+		DID:     testDID,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "rev3", got.LatestRev)
@@ -293,9 +301,8 @@ func TestReconstruct_IgnoresOtherDIDsAndNonCommitEvents(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, []segment.Event{matching})
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:  dataDir,
-		DID:      testDID,
-		Selector: openSelector(t, dataDir),
+		Archive: openArchive(t, dataDir),
+		DID:     testDID,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "rev1", got.LatestRev)
@@ -312,17 +319,15 @@ func TestReconstruct_MissingDIDReturnsErrNoLocalRepo(t *testing.T) {
 	})
 
 	_, err := Reconstruct(context.Background(), Config{
-		DataDir:  dataDir,
-		DID:      testDID,
-		Selector: openSelector(t, dataDir),
+		Archive: openArchive(t, dataDir),
+		DID:     testDID,
 	})
 	require.ErrorIs(t, err, ErrNoLocalRepo)
 
 	emptyDir := t.TempDir()
 	_, err = Reconstruct(context.Background(), Config{
-		DataDir:  emptyDir,
-		DID:      testDID,
-		Selector: openSelector(t, emptyDir),
+		Archive: openArchive(t, emptyDir),
+		DID:     testDID,
 	})
 	require.ErrorIs(t, err, ErrNoLocalRepo)
 }
@@ -338,9 +343,8 @@ func TestReconstruct_ActiveSegmentUsesWalkActive(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, events)
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:  dataDir,
-		DID:      testDID,
-		Selector: openSelector(t, dataDir),
+		Archive: openArchive(t, dataDir),
+		DID:     testDID,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "rev1", got.LatestRev)
@@ -368,9 +372,8 @@ func TestReconstruct_IncludesPendingWriterEvents(t *testing.T) {
 
 	wantRoot, wantCount := expectedRoot(t, append(append([]segment.Event(nil), disk...), pending...))
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:       dataDir,
+		Archive:       openArchive(t, dataDir),
 		DID:           testDID,
-		Selector:      openSelector(t, dataDir),
 		PendingEvents: pending,
 	})
 	require.NoError(t, err)
@@ -403,9 +406,8 @@ func TestReconstruct_PendingEventsFilterByDIDAndKind(t *testing.T) {
 	}
 	wantRoot, wantCount := expectedRoot(t, wantEvents)
 	got, err := Reconstruct(context.Background(), Config{
-		DataDir:       dataDir,
+		Archive:       openArchive(t, dataDir),
 		DID:           testDID,
-		Selector:      openSelector(t, dataDir),
 		PendingEvents: pending,
 	})
 	require.NoError(t, err)
@@ -418,12 +420,14 @@ func TestReconstruct_ValidatesConfig(t *testing.T) {
 	t.Parallel()
 
 	_, err := Reconstruct(context.Background(), Config{DID: testDID})
-	require.ErrorContains(t, err, "DataDir is required")
+	require.ErrorContains(t, err, "Catalog is required")
 
-	_, err = Reconstruct(context.Background(), Config{DataDir: t.TempDir()})
+	archive := openArchive(t, t.TempDir())
+	_, err = Reconstruct(context.Background(), Config{Archive: archive})
 	require.ErrorContains(t, err, "DID is required")
 
-	_, err = Reconstruct(context.Background(), Config{DataDir: t.TempDir(), DID: testDID})
+	archive.Selector = nil
+	_, err = Reconstruct(context.Background(), Config{Archive: archive, DID: testDID})
 	require.ErrorContains(t, err, "Selector is required")
 }
 

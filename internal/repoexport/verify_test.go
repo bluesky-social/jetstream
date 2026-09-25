@@ -33,10 +33,9 @@ func TestVerify_MatchingRoots(t *testing.T) {
 	writeSegmentTree(t, st, filepath.Join(dataDir, "segments"), events)
 
 	report, err := Verify(t.Context(), VerifyConfig{
-		DataDir:          dataDir,
+		Archive:          openArchive(t, dataDir),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
-		Selector:         openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, VerifyReport{
@@ -70,10 +69,9 @@ func TestVerify_PendingEventsMatchAuthoritativeRoot(t *testing.T) {
 	pending := authoritativeEvents[1:]
 
 	report, err := Verify(t.Context(), VerifyConfig{
-		DataDir:          dataDir,
+		Archive:          openArchive(t, dataDir),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
-		Selector:         openSelector(t, dataDir),
 		PendingEvents:    pending,
 	})
 	require.NoError(t, err)
@@ -101,10 +99,9 @@ func TestVerify_MismatchingRootsReturnsReport(t *testing.T) {
 	writeSegmentTree(t, st, filepath.Join(dataDir, "segments"), localEvents)
 
 	report, err := Verify(t.Context(), VerifyConfig{
-		DataDir:          dataDir,
+		Archive:          openArchive(t, dataDir),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
-		Selector:         openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, VerifyReport{
@@ -130,10 +127,9 @@ func TestVerify_MissingLocalRepoReturnsMismatchReport(t *testing.T) {
 
 	emptyDir := t.TempDir()
 	report, err := Verify(t.Context(), VerifyConfig{
-		DataDir:          emptyDir,
+		Archive:          openArchive(t, emptyDir),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
-		Selector:         openSelector(t, emptyDir),
 	})
 	require.NoError(t, err)
 	require.Equal(t, testDID, report.DID)
@@ -152,7 +148,7 @@ func TestVerify_MalformedLatestCommitCIDReturnsError(t *testing.T) {
 	relay := newMalformedLatestCommitServer(t, testDID)
 
 	_, err := Verify(t.Context(), VerifyConfig{
-		DataDir:          t.TempDir(),
+		Archive:          openArchive(t, t.TempDir()),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
 	})
@@ -169,7 +165,7 @@ func TestVerify_MissingAuthoritativeCommitBlockReturnsError(t *testing.T) {
 
 	relay := newCommitBlockServer(t, testDID, testAuthoritativeRev, commitCID, otherCAR)
 	_, err := Verify(t.Context(), VerifyConfig{
-		DataDir:          t.TempDir(),
+		Archive:          openArchive(t, t.TempDir()),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
 	})
@@ -184,7 +180,7 @@ func TestVerify_AuthoritativeCommitDIDMismatchReturnsError(t *testing.T) {
 	relay := newCommitBlockServer(t, testDID, testAuthoritativeRev, commitCID, commitCAR)
 
 	_, err := Verify(t.Context(), VerifyConfig{
-		DataDir:          t.TempDir(),
+		Archive:          openArchive(t, t.TempDir()),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
 	})
@@ -199,7 +195,7 @@ func TestVerify_AuthoritativeCommitRevMismatchReturnsError(t *testing.T) {
 	relay := newCommitBlockServer(t, testDID, testAuthoritativeRev, commitCID, commitCAR)
 
 	_, err := Verify(t.Context(), VerifyConfig{
-		DataDir:          t.TempDir(),
+		Archive:          openArchive(t, t.TempDir()),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
 	})
@@ -212,7 +208,7 @@ func TestVerify_HTTPFailureReturnsError(t *testing.T) {
 	relay := newGetLatestCommitErrorServer(t, http.StatusInternalServerError)
 
 	_, err := Verify(t.Context(), VerifyConfig{
-		DataDir:          t.TempDir(),
+		Archive:          openArchive(t, t.TempDir()),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
 	})
@@ -223,9 +219,9 @@ func TestVerify_ValidatesConfig(t *testing.T) {
 	t.Parallel()
 
 	_, err := Verify(t.Context(), VerifyConfig{DID: testDID})
-	require.ErrorContains(t, err, "DataDir is required")
+	require.ErrorContains(t, err, "Catalog is required")
 
-	_, err = Verify(t.Context(), VerifyConfig{DataDir: t.TempDir()})
+	_, err = Verify(t.Context(), VerifyConfig{Archive: openArchive(t, t.TempDir())})
 	require.ErrorContains(t, err, "DID is required")
 }
 

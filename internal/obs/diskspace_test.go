@@ -30,3 +30,14 @@ func TestRegisterDataDirFreeBytesCollectsGauge(t *testing.T) {
 	require.Len(t, found.GetMetric(), 1)
 	require.Greater(t, found.GetMetric()[0].GetGauge().GetValue(), float64(0))
 }
+
+func TestRegisterDataDirFreeBytesSkipsEmptyDataDir(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	obs.RegisterDataDirFreeBytes(reg, "")
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	require.Empty(t, mfs)
+}

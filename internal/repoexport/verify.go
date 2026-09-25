@@ -29,16 +29,12 @@ const (
 
 // VerifyConfig controls authoritative-vs-local repo root verification.
 type VerifyConfig struct {
-	DataDir string
+	Archive Archive
 	DID     string
 
 	// IdentityResolver resolves DID documents so verification can query the
 	// account's PDS for PDS-only sync endpoints. Nil uses identity.DefaultResolver.
 	IdentityResolver identity.Resolver
-
-	// Selector prunes which segments/blocks reconstruction decodes via the
-	// in-memory manifest blooms. Required; see Config.Selector.
-	Selector Selector
 
 	// PendingEvents are the live writer's not-yet-flushed events, folded
 	// into the local reconstruction so a record created moments ago is
@@ -62,8 +58,8 @@ type VerifyReport struct {
 // Verify compares cfg.DID's authoritative commit root against a locally
 // reconstructed snapshot.
 func Verify(ctx context.Context, cfg VerifyConfig) (VerifyReport, error) {
-	if cfg.DataDir == "" {
-		return VerifyReport{}, errors.New("repoexport: DataDir is required")
+	if cfg.Archive.Catalog == nil {
+		return VerifyReport{}, errors.New("repoexport: Archive.Catalog is required")
 	}
 	if cfg.DID == "" {
 		return VerifyReport{}, errors.New("repoexport: DID is required")
@@ -84,9 +80,8 @@ func Verify(ctx context.Context, cfg VerifyConfig) (VerifyReport, error) {
 	}
 
 	snap, err := Reconstruct(ctx, Config{
-		DataDir:       cfg.DataDir,
+		Archive:       cfg.Archive,
 		DID:           cfg.DID,
-		Selector:      cfg.Selector,
 		PendingEvents: cfg.PendingEvents,
 	})
 	if err != nil {

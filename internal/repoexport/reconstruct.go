@@ -1,17 +1,15 @@
 // Package repoexport reconstructs local atproto repo snapshots from
-// Jetstream segment files.
+// Jetstream's segment archive.
 package repoexport
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/mst"
@@ -21,43 +19,60 @@ import (
 // events exist for the requested DID.
 var ErrNoLocalRepo = errors.New("repoexport: no local commit events for DID")
 
-// BlockSelection identifies, for one sealed segment, the blocks that may
-// contain the requested DID. Path locates the file; Blocks holds ascending
-// block indices into the segment's on-disk block array.
-type BlockSelection struct {
-	Path   string
-	Blocks []int
+// maxStaleRetries bounds how many fresh catalog snapshots one namespace pass
+// takes after catalog.ErrStaleRef. Each retry needs a concurrent seal or
+// compaction rewrite of a block the pass had not reached yet, so hitting the
+// bound means something rewrites the archive faster than we can read it.
+const maxStaleRetries = 8
+
+// Selection maps a segment index to the ascending indices of its blocks
+// that may hold the requested DID. A segment present with no blocks was
+// checked and holds nothing for the DID; a segment absent from the
+// selection was not checked, and Reconstruct decodes all of its blocks.
+type Selection map[uint64][]int
+
+// Selector prunes a namespace's segments to the blocks that may hold a DID,
+// using DID blooms. The interface keeps reconstruction independent of the
+// manifest implementation.
+type Selector interface {
+	// SelectBlocksForDID returns the candidate blocks of the segments in ns
+	// the selector can check. One-sided contract: no false negatives,
+	// possible false positives. Block indices stay valid across compaction,
+	// which preserves block topology and only drops rows, so a selection
+	// read from any generation of a segment prunes every other generation.
+	SelectBlocksForDID(ns catalog.Namespace, did string) (Selection, error)
 }
 
-// Selector prunes sealed segments using resident DID blooms and identifies
-// active files needing a scan. The interface keeps reconstruction independent
-// of the manifest implementation.
-type Selector interface {
-	// SelectBlocksForDID returns, for every sealed segment that may hold
-	// did, the candidate blocks within it. One-sided contract: no false
-	// negatives, possible false positives. Ascending by segment index.
-	SelectBlocksForDID(did string) ([]BlockSelection, error)
+// Archive is where reconstruction reads segment data: a catalog snapshot per
+// pass, a fetcher for the blocks it names, and the bloom selector that
+// prunes them.
+type Archive struct {
+	Catalog  catalog.Catalog
+	Fetcher  catalog.Fetcher
+	Selector Selector
 
-	// ActiveSegmentPaths returns the seg_*.jss files not yet resident in
-	// the manifest -- the active (unsealed) segment plus any just-sealed
-	// file the manifest has not absorbed. Their flushed blocks are
-	// invisible to SelectBlocksForDID, so reconstruction scans them
-	// directly. Callers MUST query this BEFORE SelectBlocksForDID so a
-	// segment sealing mid-call is double-covered, never missed.
-	ActiveSegmentPaths() ([]string, error)
+	// Ready, when set, blocks until Catalog has loaded the archive, so a
+	// reconstruction racing startup does not read a partial catalog and
+	// report a missing history as a root mismatch.
+	Ready func(context.Context) error
+}
+
+func (a Archive) validate() error {
+	switch {
+	case a.Catalog == nil:
+		return errors.New("repoexport: Archive.Catalog is required")
+	case a.Fetcher == nil:
+		return errors.New("repoexport: Archive.Fetcher is required")
+	case a.Selector == nil:
+		return errors.New("repoexport: Archive.Selector is required")
+	}
+	return nil
 }
 
 // Config controls local repo reconstruction.
 type Config struct {
-	DataDir string
+	Archive Archive
 	DID     string
-
-	// Selector prunes which sealed segments/blocks to decode via the
-	// in-memory manifest blooms, and reports the active (unsealed)
-	// segment files that need a direct scan. Required: reconstruction is
-	// only invoked from the live /status path, which always has a
-	// manifest.
-	Selector Selector
 
 	// PendingEvents are events buffered in the live writer's in-memory
 	// pending block that have not yet been flushed to a segment file on
@@ -81,28 +96,27 @@ type Snapshot struct {
 
 // Reconstruct rebuilds cfg.DID's current repo snapshot from local storage.
 //
-// It replays, in seq/index-ascending order so the last-writer-wins rev
-// tracking matches a full scan:
-//  1. sealed segments, pruned to candidate blocks via cfg.Selector's
-//     in-memory manifest blooms (only the few segments the DID touches are
-//     opened and decoded);
-//  2. the active (unsealed) segment files, scanned directly because their
-//     flushed blocks are not yet resident in the manifest;
-//  3. backfill/live_segments, scanned directly (bootstrap-only; absent at
-//     steady state);
-//  4. the live writer's in-memory pending block (cfg.PendingEvents).
+// It replays, in seq order within each namespace so the last-writer-wins
+// rev tracking matches a full scan:
+//  1. the main namespace, sealed and active segments alike, decoding only
+//     the blocks cfg.Archive.Selector's blooms name for the DID;
+//  2. the bootstrap_live namespace (bootstrap-only; empty at steady
+//     state), skipping events at or below the newest rev main held;
+//  3. the live writer's in-memory pending block (cfg.PendingEvents).
 func Reconstruct(ctx context.Context, cfg Config) (Snapshot, error) {
-	if cfg.DataDir == "" {
-		return Snapshot{}, errors.New("repoexport: DataDir is required")
+	if err := cfg.Archive.validate(); err != nil {
+		return Snapshot{}, err
 	}
 	if cfg.DID == "" {
 		return Snapshot{}, errors.New("repoexport: DID is required")
 	}
-	if cfg.Selector == nil {
-		return Snapshot{}, errors.New("repoexport: Selector is required")
-	}
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
+	}
+	if cfg.Archive.Ready != nil {
+		if err := cfg.Archive.Ready(ctx); err != nil {
+			return Snapshot{}, fmt.Errorf("repoexport: wait for archive: %w", err)
+		}
 	}
 
 	state := replayState{
@@ -110,39 +124,11 @@ func Reconstruct(ctx context.Context, cfg Config) (Snapshot, error) {
 		records: make(map[string][]byte),
 	}
 
-	// Snapshot the active (unsealed) paths BEFORE asking the selector for
-	// sealed blocks. If a segment seals in the gap between the two calls it
-	// is then both reported active here AND resident in the selection --
-	// idempotent double-coverage. The reverse order could miss it in both,
-	// dropping records (the spurious-mismatch bug class).
-	activePaths, err := cfg.Selector.ActiveSegmentPaths()
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("repoexport: list active segments: %w", err)
+	if err := replayNamespace(ctx, cfg.Archive, catalog.Main, "", &state); err != nil {
+		return Snapshot{}, err
 	}
-
-	selections, err := cfg.Selector.SelectBlocksForDID(cfg.DID)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("repoexport: select blocks: %w", err)
-	}
-	for _, sel := range selections {
-		if err := replaySelectedBlocks(ctx, sel, &state); err != nil {
-			return Snapshot{}, err
-		}
-	}
-
-	// Active segment files carry the newest sealed-tree revs; scan them
-	// after the sealed selection so ascending order is preserved.
-	for _, path := range activePaths {
-		if err := ctx.Err(); err != nil {
-			return Snapshot{}, err
-		}
-		if err := replayFile(ctx, path, "", &state); err != nil {
-			return Snapshot{}, err
-		}
-	}
-
 	primaryWatermark := state.latestRev
-	if err := replayDir(ctx, filepath.Join(cfg.DataDir, "backfill", "live_segments"), primaryWatermark, &state); err != nil {
+	if err := replayNamespace(ctx, cfg.Archive, catalog.BootstrapLive, primaryWatermark, &state); err != nil {
 		return Snapshot{}, err
 	}
 
@@ -172,44 +158,148 @@ func Reconstruct(ctx context.Context, cfg Config) (Snapshot, error) {
 	}, nil
 }
 
-// replaySelectedBlocks decodes only the selector-chosen blocks of one
-// sealed segment. The segment may have been compacted (and thus rewritten)
-// since the manifest snapshot, but compaction preserves block count and is
-// purely subtractive, so a stored block index never points past the file
-// and never yields a false negative for the DID.
-func replaySelectedBlocks(ctx context.Context, sel BlockSelection, state *replayState) error {
-	if len(sel.Blocks) == 0 {
-		return nil
-	}
-	reader, err := segment.Open(segment.ReaderConfig{Path: sel.Path})
-	if err != nil {
-		// A segment selected from the manifest can race a seal/compaction
-		// rename. ErrActiveSegment means it is mid-rotation; the active-path
-		// scan covers it, so skip rather than fail the whole reconstruction.
-		if errors.Is(err, segment.ErrActiveSegment) {
-			return nil
+// replayNamespace replays ns's selected blocks in seq order. A fetch that
+// fails with catalog.ErrStaleRef (a seal or compaction rewrite since the
+// snapshot) takes a fresh snapshot and selection and resumes from the first
+// seq not yet replayed, so no event is applied twice.
+func replayNamespace(ctx context.Context, a Archive, ns catalog.Namespace, watermark string, state *replayState) error {
+	var next uint64
+	for attempt := 0; ; attempt++ {
+		// Snapshot before selecting: a segment that seals in between is
+		// active in the view and still covered, by its selection if the
+		// selector saw it sealed or by a full decode if not.
+		view := a.Catalog.Snapshot()
+		sel, err := a.Selector.SelectBlocksForDID(ns, state.did)
+		if err != nil {
+			return fmt.Errorf("repoexport: select %s blocks: %w", ns, err)
 		}
-		return fmt.Errorf("repoexport: open segment %s: %w", sel.Path, err)
-	}
-	defer func() { _ = reader.Close() }()
-
-	blockCount := len(reader.Blocks())
-	for _, i := range sel.Blocks {
-		if err := ctx.Err(); err != nil {
+		err = replayView(ctx, view, a.Fetcher, ns, sel, watermark, state, &next)
+		if !errors.Is(err, catalog.ErrStaleRef) {
 			return err
 		}
-		if i < 0 || i >= blockCount {
+		if attempt == maxStaleRetries {
+			return fmt.Errorf("repoexport: %s still stale after %d fresh snapshots: %w", ns, attempt, err)
+		}
+	}
+}
+
+// replayView replays ns's blocks in view from seq *next on, advancing *next
+// past each block it replays or prunes.
+func replayView(ctx context.Context, view catalog.CatalogView, f catalog.Fetcher, ns catalog.Namespace, sel Selection, watermark string, state *replayState, next *uint64) error {
+	for _, v := range view.Segments(ns) {
+		if len(v.Blocks) == 0 || v.MaxSeq() < *next {
 			continue
 		}
-		events, err := reader.DecodeBlock(i)
-		if err != nil {
-			return fmt.Errorf("repoexport: decode block %d in %s: %w", i, sel.Path, err)
+		blocks, checked := sel[v.Index]
+		if !checked {
+			for ref := range view.RefsFrom(ns, max(*next, v.MinSeq())) {
+				if ref.Segment != v.Index {
+					break
+				}
+				if err := replayRef(ctx, f, ref, watermark, state); err != nil {
+					return err
+				}
+				*next = ref.MaxSeq + 1
+			}
+			continue
 		}
-		if err := replayEvents(ctx, events, "", state); err != nil {
-			return err
+		for _, i := range blocks {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			// Topology is stable across generations, so an index past the
+			// end only comes from a selector bug; skipping it matches the
+			// one-sided contract rather than failing the page.
+			if i < 0 || i >= len(v.Blocks) || v.Blocks[i].MaxSeq < *next {
+				continue
+			}
+			ref, ok := refAt(view, ns, v.Blocks[i].MinSeq)
+			if !ok || ref.Segment != v.Index || ref.Block != i {
+				return fmt.Errorf("repoexport: %s segment %d block %d: view has no ref for its envelope", ns, v.Index, i)
+			}
+			if err := replayRef(ctx, f, ref, watermark, state); err != nil {
+				return err
+			}
+			*next = ref.MaxSeq + 1
 		}
+		*next = max(*next, v.MaxSeq()+1)
 	}
 	return nil
+}
+
+// refAt returns the ref of the block whose envelope holds seq, or the first
+// block after it.
+func refAt(view catalog.CatalogView, ns catalog.Namespace, seq uint64) (catalog.BlockRef, bool) {
+	for ref := range view.RefsFrom(ns, seq) {
+		return ref, true
+	}
+	return catalog.BlockRef{}, false
+}
+
+func replayRef(ctx context.Context, f catalog.Fetcher, ref catalog.BlockRef, watermark string, state *replayState) error {
+	events, err := catalog.DecodeRef(ctx, f, ref)
+	if err != nil {
+		return fmt.Errorf("repoexport: decode %s segment %d block %d: %w", ref.Namespace, ref.Segment, ref.Block, err)
+	}
+	return replayEvents(ctx, events, watermark, state)
+}
+
+// FooterSelector prunes by the DID blooms in each sealed segment's footer,
+// read through Source. Primary, when set, is asked first (e.g. the
+// manifest's resident blooms), and footers are read only for the sealed
+// segments it did not check. Active segments are left unchecked: their
+// blooms are not written until seal.
+type FooterSelector struct {
+	Source interface {
+		Snapshot() catalog.CatalogView
+		SealedMetadata(v catalog.SegmentView) (*segment.Reader, error)
+	}
+	Primary Selector
+}
+
+// SelectBlocksForDID implements Selector.
+func (s FooterSelector) SelectBlocksForDID(ns catalog.Namespace, did string) (Selection, error) {
+	sel := Selection{}
+	if s.Primary != nil {
+		primary, err := s.Primary.SelectBlocksForDID(ns, did)
+		if err != nil {
+			return nil, err
+		}
+		for idx, blocks := range primary {
+			sel[idx] = blocks
+		}
+	}
+	for _, v := range s.Source.Snapshot().Segments(ns) {
+		if _, ok := sel[v.Index]; ok || v.State != catalog.Sealed {
+			continue
+		}
+		blocks, err := footerBlocks(s.Source, v, did)
+		if errors.Is(err, catalog.ErrStaleRef) {
+			// Rewritten or removed since the snapshot: leave it unchecked
+			// and let the reader's own view decide what to decode.
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		sel[v.Index] = blocks
+	}
+	return sel, nil
+}
+
+func footerBlocks(src interface {
+	SealedMetadata(v catalog.SegmentView) (*segment.Reader, error)
+}, v catalog.SegmentView, did string) ([]int, error) {
+	r, err := src.SealedMetadata(v)
+	if err != nil {
+		return nil, fmt.Errorf("repoexport: open %s segment %d metadata: %w", v.Namespace, v.Index, err)
+	}
+	defer func() { _ = r.Close() }()
+	blocks, err := r.BlocksContainingDID(did)
+	if err != nil {
+		return nil, fmt.Errorf("repoexport: select blocks in %s segment %d: %w", v.Namespace, v.Index, err)
+	}
+	return blocks, nil
 }
 
 type replayState struct {
@@ -217,80 +307,6 @@ type replayState struct {
 	records    map[string][]byte
 	latestRev  string
 	seenCommit bool
-}
-
-func replayDir(ctx context.Context, dir, watermark string, state *replayState) error {
-	files, err := ingest.SegmentFiles(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("repoexport: list segments in %s: %w", dir, err)
-	}
-	for _, file := range files {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := replayFile(ctx, file.Path, watermark, state); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func replayFile(ctx context.Context, path, watermark string, state *replayState) error {
-	reader, err := segment.Open(segment.ReaderConfig{Path: path})
-	if err != nil {
-		if errors.Is(err, segment.ErrActiveSegment) {
-			return replayActive(ctx, path, watermark, state)
-		}
-		return fmt.Errorf("repoexport: open segment %s: %w", path, err)
-	}
-
-	closeReader := true
-	defer func() {
-		if closeReader {
-			_ = reader.Close()
-		}
-	}()
-
-	// Prune by DID before decoding. A full-network segment holds events
-	// for every DID on the network; without this, reconstructing one
-	// account would zstd-decompress and decode the entire archive and
-	// then discard nearly every event in replayEvent's DID filter. The
-	// bloom-backed selection has no false negatives, so every block that
-	// actually holds state.did is still decoded.
-	selected, err := reader.BlocksContainingDID(state.did)
-	if err != nil {
-		return fmt.Errorf("repoexport: select blocks in %s: %w", path, err)
-	}
-	for _, i := range selected {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		events, err := reader.DecodeBlock(i)
-		if err != nil {
-			return fmt.Errorf("repoexport: decode block %d in %s: %w", i, path, err)
-		}
-		if err := replayEvents(ctx, events, watermark, state); err != nil {
-			return err
-		}
-	}
-
-	closeReader = false
-	if err := reader.Close(); err != nil {
-		return fmt.Errorf("repoexport: close segment %s: %w", path, err)
-	}
-	return nil
-}
-
-func replayActive(ctx context.Context, path, watermark string, state *replayState) error {
-	if err := segment.WalkActive(path, func(events []segment.Event) error {
-		return replayEvents(ctx, events, watermark, state)
-	}); err != nil {
-		return fmt.Errorf("repoexport: walk active segment %s: %w", path, err)
-	}
-	return nil
 }
 
 func replayEvents(ctx context.Context, events []segment.Event, watermark string, state *replayState) error {

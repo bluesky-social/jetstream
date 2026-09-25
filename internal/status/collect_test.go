@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
@@ -741,7 +743,7 @@ func TestCollect_WithManifestIncludesWritableTails(t *testing.T) {
 
 	require.NoError(t, backfill.SaveCounts(st, backfill.Counts{Total: 10, Discovered: 10, Complete: 8}))
 
-	c, err := status.New(status.Options{Store: st, DataDir: dataDir, Manifest: mft})
+	c, err := status.New(status.Options{Store: st, DataDir: dataDir, Manifest: mft, Archive: openArchive(t, dataDir)})
 	require.NoError(t, err)
 	snap, err := c.Snapshot(context.Background())
 	require.NoError(t, err)
@@ -763,6 +765,19 @@ func TestCollect_WithManifestIncludesWritableTails(t *testing.T) {
 	require.Equal(t, 2, snap.SegmentAggregate.Network.ActiveSegments)
 	require.Equal(t, uint64(4), snap.SegmentAggregate.Network.Events)
 	require.Equal(t, 3, snap.SegmentAggregate.Network.Collections)
+}
+
+// openArchive opens a local catalog over dataDir's two segment namespaces,
+// the way the runtime wires status.
+func openArchive(t *testing.T, dataDir string) *localcatalog.Catalog {
+	t.Helper()
+	cat, err := localcatalog.New(localcatalog.Config{Dirs: map[catalog.Namespace]string{
+		catalog.Main:          filepath.Join(dataDir, "segments"),
+		catalog.BootstrapLive: filepath.Join(dataDir, "backfill", "live_segments"),
+	}})
+	require.NoError(t, err)
+	require.NoError(t, cat.Refresh(t.Context()))
+	return cat
 }
 
 func TestCollect_CursorLookback_NoManifest(t *testing.T) {
