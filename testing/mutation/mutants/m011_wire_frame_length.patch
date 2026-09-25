@@ -13,13 +13,13 @@ expected-tier: stress
 tiers: default,stress,restart
 
 diff --git a/segment/writer.go b/segment/writer.go
-index 1bba456..084a262 100644
+index 123c818..5c5aac0 100644
 --- a/segment/writer.go
 +++ b/segment/writer.go
-@@ -548,7 +548,7 @@ func (w *Writer) flushLocked() error {
- 	// the second-buffer-plus-memcpy the previous design needed.
+@@ -393,7 +393,7 @@ func (w *Writer) flushLocked() error {
  	w.wireScratch = append(w.wireScratch[:0], 0, 0, 0, 0, 0, 0, 0, 0)
- 	w.wireScratch = blockEncoder.EncodeAll(w.bodyScratch, w.wireScratch)
+ 	var info BlockInfo
+ 	w.wireScratch, info = w.pending.appendFrame(w.wireScratch)
 -	binary.LittleEndian.PutUint64(w.wireScratch[:8], uint64(len(w.wireScratch)-8))
 +	binary.LittleEndian.PutUint64(w.wireScratch[:8], uint64(len(w.wireScratch)))
  

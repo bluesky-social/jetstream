@@ -15,16 +15,16 @@ expected-tier: segmentfault
 tiers: segmentfault,default
 
 diff --git a/segment/rewrite.go b/segment/rewrite.go
-index 610d7d4..a0ff2fe 100644
+index a001b89..4560fc7 100644
 --- a/segment/rewrite.go
 +++ b/segment/rewrite.go
-@@ -226,9 +226,6 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions)
+@@ -278,9 +278,6 @@ func writeRewriteFile(path string, plan rewritePlan, opts RewriteOptions) error
  	if err := simulateRewriteCrash(opts, CrashPointRewriteRenamed); err != nil {
- 		return RewriteResult{}, err
+ 		return err
  	}
 -	if err := syncParentDirFS(opts.FS, path, opts.IOFaultInjector); err != nil {
--		return RewriteResult{}, err
+-		return err
 -	}
  	if err := simulateRewriteCrash(opts, CrashPointRewriteDirSynced); err != nil {
- 		return RewriteResult{}, err
+ 		return err
  	}
