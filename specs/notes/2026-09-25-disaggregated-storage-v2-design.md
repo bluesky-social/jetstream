@@ -887,11 +887,30 @@ eventually removes it.
 A reader that was about to read deleted hot batches finds the active block in
 the next mirror refresh. See §11.4 for how readers switch.
 
+The maintainer (`internal/ingest/maintainer`) is the writer's `BlockSink`.
+`BlockClosed` only queues the block, and the maintainer goroutine takes the
+queue in order. The writer delivers a block only after its last batch
+commits, so no separate wait is needed. The fold encodes with the same
+encoder and block size as the writer's pointer batches, which is what makes
+step 2's dedup hit. The maintainer keeps the active segment's index, block
+list, and framed size in memory, loaded at session start. If a fold commits
+at a segment or ordinal other than the one memory predicts, that is
+corruption: the seal's block list is built from memory. Each folded frame goes
+into the object cache, so a seal usually reads nothing from S3. Any failure
+ends the session and stops the maintainer. The blocks still queued, and the
+ones queued during `Close`, stay hot batches for the next session's rebuild
+(§10.9). A `Sync` request waits until everything queued before it has folded.
+The rebuild uses it.
+
 ### 10.8 Seal
 
-The rotation rule is the existing one: the active segment's virtual file size
-(`256 + Σ(8 + compressed_length)`) reaches `MaxSegmentBytes` (256MiB). Seal also
-runs on `ForceRotate` and `SealActiveAndClose`.
+The rotation rule is the existing one: after a fold, the active segment's
+framed bytes (`Σ(8 + compressed_length)`, the virtual file size minus the
+256-byte header, which is what local mode compares) reach `MaxSegmentBytes`
+(256MiB). Seal also runs on `ForceRotate` and `SealActiveAndClose`, after
+every block closed before them has folded. It does nothing when the active
+segment has no blocks, as in local mode. With the same event stream and the
+same block boundaries, both modes therefore seal byte-identical files.
 
 1. Build the footer and header with the existing sealer code (`segment/seal.go`:
    block walk plus `buildFooter`), driven by a block source instead of a file.
@@ -923,7 +942,12 @@ carry their own zstd content checksums. `docs/README.md` §3.1.2 says the checks
 covers the blocks. The code is authoritative, and the README should be fixed.
 
 Seal fetches up to 256MiB of blocks, most of them usually still in the object
-cache. Hot batches keep committing during a seal. Folds wait. The unfolded cap
+cache. A cache miss goes through the §7.5 read protocol, with at most
+`ReadConcurrency` (8) block reads in flight ahead of the builder. A block
+whose length disagrees with its catalog row is corruption. After the seal
+commits, the footer goes into the object cache for readers. A seal that fails
+between the footer upload and the commit leaves the catalog unchanged, apart
+from the footer's uploading row, which GC reclaims. Hot batches keep committing during a seal. Folds wait. The unfolded cap
 (§10.5) bounds how far behind they get.
 
 ### 10.9 Session start in hot mode
@@ -1827,6 +1851,12 @@ All metrics use the existing `obs` package. Names:
   `jetstream_hot_unfolded_events` (gauge), `jetstream_hot_pending_bytes{class}`
 - `jetstream_admission_wait_seconds{class}`,
   `jetstream_hot_inline_tokens` (gauge)
+- `jetstream_maintainer_folds_total{result=uploaded|dedup}`,
+  `jetstream_maintainer_fold_duration_seconds`,
+  `jetstream_maintainer_seals_total`,
+  `jetstream_maintainer_seal_duration_seconds`,
+  `jetstream_maintainer_queued_blocks` (gauge),
+  `jetstream_maintainer_active_segment_bytes` (gauge: the rotation rule's input)
 - `jetstream_s3_requests_total{op, result}`,
   `jetstream_s3_request_duration_seconds{op}`,
   `jetstream_s3_bytes_total{op}`, `jetstream_s3_verify_failures_total{path=upload|read}`

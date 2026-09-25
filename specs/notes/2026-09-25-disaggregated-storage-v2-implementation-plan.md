@@ -793,7 +793,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
       a bulk flood runs;
     - each cap blocks and unblocks;
     - a class change always cuts the batch.
-- [ ] **S2.10 Maintainer: fold and seal** (L). Deps: S2.8, S1.7.
+- [x] **S2.10 Maintainer: fold and seal** (L). Deps: S2.8, S1.7.
   - One goroutine that runs fold and seal in order, never concurrently.
   - Fold (§10.7): encode the block from memory, upload (dedup may hit), then
     commit with the exact-coverage delete.
@@ -1224,6 +1224,34 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S2.10 (2026-09-25): maintainer fold and seal.**
+  - New package `internal/ingest/maintainer`. `Maintainer` implements
+    `ingest.BlockSink`, and one goroutine per session runs its queue in order.
+    `Open(ctx, cfg)` loads main's active segment and blocks from one read
+    snapshot. ctx bounds every fold and seal, so pass the session's context.
+  - The rotation rule compares `Σ(8 + compressed_length)` without the
+    256-byte header. That is local mode's `activeBytes`, and design §10.8 is
+    corrected to say so. It means both modes seal byte-identical files from
+    the same events and block boundaries, which the tests check.
+  - `Rotate` seals only when the active segment has blocks, the same no-op as
+    local `ForceRotate`. `Sync` waits for everything queued before it to fold,
+    for S2.11's rebuild.
+  - A fold that commits at a segment or ordinal other than the one memory
+    predicts is corruption, because the seal's block list comes from memory.
+    Each fold adds its frame to the object cache, and each seal adds its
+    footer. A seal reads blocks through `objstore.Store`, with
+    `ReadConcurrency` (default 8) reads in flight.
+  - Any failure ends the session, and `OnFailure` runs once. The owner then
+    closes the writer, which releases appends blocked on the unfolded cap,
+    and then the maintainer. `Close` finishes the fold or seal in progress
+    and leaves queued blocks as hot batches for the rebuild. Requests still
+    queued return `maintainer.ErrClosed`.
+  - The seal-crash test uses storagefake's `FaultCommitFails` and
+    `FaultCommitLost` on `TxSeal`, not a new crashpoint. After the fault, the
+    next session seals the right file either way.
+  - Metrics: `jetstream_maintainer_{folds_total{result},
+    fold_duration_seconds, seals_total, seal_duration_seconds, queued_blocks,
+    active_segment_bytes}`. S2.16 registers them.
 - **S2.9 (2026-09-25): hot mode admission control.**
   - The token bucket charges a live batch its raw bytes at freeze and settles
     to the frame's size after `prepare` encodes it off the lock. The rate
