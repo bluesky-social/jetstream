@@ -879,7 +879,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
 
 ### Wiring
 
-- [ ] **S2.15 Configuration and CLI** (M). Deps: S2.2, S2.5.
+- [x] **S2.15 Configuration and CLI** (M). Deps: S2.2, S2.5.
   - Flags with env sources for every design §18 variable, on `serve` (and on
     `storage` where relevant): `JETSTREAM_STORAGE`, `JETSTREAM_PG_*`,
     `JETSTREAM_S3_*`, `JETSTREAM_LEADER_*`, `JETSTREAM_HOT_*`,
@@ -963,7 +963,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
   - `testing/mutation/run.sh`: add a `disagg` tier case (layer 3, no
     containers). Bank the results with `just mutation-baseline`, and add a
     dated `RESULTS.md` section plus the catalog line.
-- [ ] **S2.20 Layer 4 contract suites and `just test-storage`** (L). Deps:
+- [x] **S2.20 Layer 4 contract suites and `just test-storage`** (L). Deps:
   S2.2-S2.5, S2.7.
   - justfile `test-storage`: requires a running `just up` (or starts it and
     tears it down: decide in the PR, and document). It sets
@@ -1224,6 +1224,79 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S2.20 (2026-09-25): layer 4 storage suites and `just test-storage`.**
+  - `test-storage` requires a running `just up`. It exits early with a clear
+    message if postgres, seaweedfs, or minio is not running, and it never
+    starts or stops the environment, so a failed run can be inspected.
+  - The package list comes from `go list`: every package whose tests import
+    `pgtest` or `s3test`, so a new suite cannot be left out. Pass 1 runs all
+    of them on PostgreSQL plus SeaweedFS. Pass 2 runs the `s3test` importers
+    on MinIO. Arguments pass through to go test.
+  - The catalog script tests run on both storagefake and PostgreSQL. A
+    `catalog.DB` wrapper runs `LoadSnapshot` plus `CheckInvariants` after
+    every commit on both. The two tests that expect a violation pass on PG,
+    so the check does fire there. Each PG script test creates a scratch
+    database (about 0.18s); plain `just` skips them.
+  - New `TestReaderRole`: a follower on `jetstream_reader` can LISTEN, run
+    CheckVersions, load a snapshot, and read hot-batch frames. It fails on
+    the fence, lease acquire, and raw UPDATE/INSERT/DELETE/TRUNCATE (SQLSTATE
+    42501).
+  - The other required suites and faults already existed and now run under
+    the recipe: catalogtest, the locker contract, proxy kill and
+    COMMIT-result loss (pgstore), metastore/pg with a reader-role test, S3
+    wrong bytes plus 5xx/timeout/truncation on both stores, and racing
+    lockers and a stale holder in lockertest on PG.
+  - CI job `test-storage`: harden-runner (standard allowlist plus the 4
+    Docker Hub hosts), `docker compose version`, `just up`, `just
+    test-storage`, compose logs on failure, and `just down` under `if:
+    always()`. The flake ships only the Docker CLI; compose resolves from
+    `/usr/libexec/docker/cli-plugins`, as the `docker-build` job's buildx
+    does. `testing/ci` pins the order, the hosts, the recipe's env vars, and
+    that plain `just test` sets no `JETSTREAM_TEST_*`.
+  - Open: the CI job has not run yet. If Docker Hub serves layers from
+    another CDN host, `just up` will be blocked and the host needs adding.
+    The recipe's not-running check was not exercised, because `just up` is
+    shared across worktrees.
+  - `just test-storage` (and with `-race`) passes locally: 300 tests on
+    PG + SeaweedFS, 99 on PG + MinIO, none skipped. Design §20 layer 4
+    records the recipe's contract.
+- **S2.15 (2026-09-25): storage configuration, CLI flags, PG URL redaction.**
+  - `jetstreamd.Options.Storage` (`StorageConfig`, `internal/jetstreamd/
+    storage.go`) holds every §18 variable; the zero value is local mode.
+    `DefaultStorageConfig` gathers the defaults from the packages' `Default*`
+    constants. `Validate` names variables, never values, and checks: known
+    mode, `DataDir` empty and `CompactionInterval` 0 in disaggregated mode,
+    PG URL and S3 region/bucket present, every number and duration > 0,
+    `RenewInterval < Lease`, and `CatalogPollInterval < MaxViewAge`.
+  - `Build` validates and logs `storage_mode`. In disaggregated mode it logs
+    the redacted config and returns `errDisaggregatedUnavailable` until S2.16
+    wires the runtime. Local mode with storage settings present logs a
+    redacted warning.
+  - No `JETSTREAM_S3_*` credential flags: S3 keys come only from the AWS SDK
+    chain (design §18, §24).
+  - The data-dir refusal checks whether `--data-dir`/`JETSTREAM_DATA_DIR` is
+    set, not its value. `.env` sets it, so the README runs the binary with
+    `env -u JETSTREAM_DATA_DIR` rather than `just run`.
+  - Redaction: `pgstore.RedactURL` handles the URL and libpq keyword forms,
+    keeps an allowlist of parameters, and replaces anything it cannot parse
+    whole. `String`, `GoString`, and `LogValue` redact on `StorageConfig`,
+    `PGConfig`, and `pgstore.Config`. `--pg-url` hides its default in help.
+    `FuzzRedactURL` found four leaks (fragments, `?` in the host,
+    `sslpassword`, `://` inside keyword values), all fixed and kept as
+    regression inputs; it is in the scheduled fuzz matrix.
+  - Leak tests (ground rule 7): the password never appears in JSON or text
+    startup logs in disaggregated mode, in `/status`, `/metrics`, or logs in
+    local mode, or in `serve --help`. Pointing `PGConfig.LogValue` at the raw
+    URL fails them. CLI tests that read env clear `JETSTREAM_*` first,
+    because `just` loads `.env`.
+  - Byte-size flags use `IntFlag`, converted to int64.
+  - Handed to S2.16: the GOMEMLIMIT and budget-sum check (§17); setting both
+    the Uploader's and the Blob's upload concurrency from
+    `JETSTREAM_S3_UPLOAD_CONCURRENCY`; the startup canary PUT/GET/DELETE;
+    passing `GC.Delay` and `GC.OrphanAge` into `protocol.UploaderConfig`.
+  - S2.15 and S2.20 ran in a forked worktree off S2.5 and were
+    cherry-picked after S2.8 without conflicts. Design §18 and §24 record
+    the data-dir, credential, and redaction rules.
 - **S2.8 (2026-09-25): writer hot mode.**
   - Hot mode lives inside `ingest.Writer` behind `Config.Hot` (`HotConfig`):
     every public method dispatches to `hotWriter` (`internal/ingest/hot.go`)

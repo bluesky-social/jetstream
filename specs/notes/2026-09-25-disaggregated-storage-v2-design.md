@@ -1491,7 +1491,13 @@ Rules:
 
 Disaggregated mode is on when `JETSTREAM_STORAGE=disaggregated`. The default is
 `local`. In disaggregated mode `JETSTREAM_DATA_DIR` must be unset. Startup
-refuses if it is set, so no code path writes to local disk by accident.
+refuses if it is set at all (flag or env, whatever the value), so no code path
+writes to local disk by accident. It also refuses
+`JETSTREAM_COMPACTION_INTERVAL > 0` until S4.
+
+S3 credentials are not Jetstream settings. They come from the AWS SDK default
+chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, web
+identity, instance role). There is no `JETSTREAM_S3_*` credential variable.
 
 | Env var | Default | Meaning |
 |---|---|---|
@@ -1666,7 +1672,11 @@ One test suite per interface, run against every implementation:
 
 - fakes and local (always, in `just test`);
 - real PostgreSQL plus SeaweedFS, and real PostgreSQL plus MinIO, through a new
-  `just test-storage` recipe that starts them in containers.
+  `just test-storage` recipe. It requires a running `just up` and does not
+  manage the environment's lifecycle, so a failed run can be inspected. It
+  runs every package whose tests import `pgtest` or `s3test` with
+  `JETSTREAM_TEST_STORAGE_REQUIRED=1`, once against SeaweedFS, and runs the
+  object-store packages again against MinIO.
 
 Each suite includes fault injection (connection kill mid-transaction,
 `COMMIT`-result loss, S3 5xx and timeouts) and concurrency tests (two lockers
@@ -1804,6 +1814,11 @@ revision and object ID as attributes: `objstore.Upload`, `objstore.Get`, and
 
 - PostgreSQL and S3 credentials come from the environment or the AWS SDK chain.
   They are never logged, never put in `.env`, and never shown on `/status`.
+  Connection strings are logged only through `pgstore.RedactURL`. It masks the
+  userinfo password and every parameter value outside a fixed allowlist (host,
+  port, dbname, user, ssl* paths and modes, application_name, connect_timeout,
+  target_session_attrs, pool_*), and replaces any string it cannot fully parse
+  with `<unparsable connection string>`.
 - Use TLS for PostgreSQL (`sslmode=verify-full` recommended) and HTTPS for S3
   unless the operator sets a plain `http://` endpoint for an on-prem store.
 - Object keys are random UUIDs and never contain user data.
