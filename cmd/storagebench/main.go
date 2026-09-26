@@ -1,8 +1,10 @@
 // Command storagebench measures disaggregated storage (design §22) against
 // real PostgreSQL and S3, normally the `just up` environment: `just
-// storagebench write` drives the hot writer at production rates, and `just
+// storagebench write` drives the hot writer at production rates, `just
 // storagebench footers` times a pod start over a pop1-sized synthetic
-// catalog. Each run creates a scratch database and a fresh object prefix,
+// catalog, `just storagebench bootstrap` drives a bootstrapping leader's
+// writers and reports fenced transactions per second, and `just storagebench
+// retryscan` times the failed-repo retry pass's scan of metadata_kv. Each run creates a scratch database and a fresh object prefix,
 // and drops the database when it finishes.
 //
 // The PostgreSQL URL holds a password, so it is only ever printed through
@@ -92,7 +94,9 @@ func newApp() *cli.Command {
 			stopProfile()
 			return nil
 		},
-		Commands: []*cli.Command{writeCommand(), footersCommand(), calibrateCommand()},
+		Commands: []*cli.Command{
+			writeCommand(), footersCommand(), calibrateCommand(), bootstrapCommand(), retryScanCommand(),
+		},
 	}
 }
 

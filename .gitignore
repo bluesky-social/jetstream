@@ -58,3 +58,7 @@ oracle-artifacts/
 # Personal overrides for compose.yaml (for example remapped ports). Compose
 # merges this file automatically.
 /compose.override.yaml
+
+# storagebench builds (`go build ./cmd/storagebench`)
+/storagebench
+/cmd/storagebench/storagebench

@@ -1094,7 +1094,7 @@ Design §10.6, §10.10, §15.1, and §26 stage 3.
     (`harness_test.go:370-392`), against the uncompacted model (D5).
   - Mutants (recommended): the direct commit skips the seq-key check, and the
     final merge transaction leaves `live_segments/seq/next` behind.
-- [ ] **S3.6 Stage 3 measurements** (M). Deps: S3.3.
+- [x] **S3.6 Stage 3 measurements** (M). Deps: S3.3.
   - Fenced transactions per second during bootstrap (block commits plus
     metadata writes).
   - Retry-scan cost against `metadata_kv` (the 9GB-per-pass estimate).
@@ -1224,6 +1224,20 @@ Design §15.4, §17, §20 layer 5, and §26 stage 5.
     generation), and `specs/gotchas.md` (403 vs 404, accepted S3 orphan leak,
     compaction was disabled before S4).
   - `specs/client.md`: confirm no wire changes; `Last-Modified` semantics.
+- [ ] **S5.6 Discovery below one fenced transaction per DID** (M). Found by
+  S3.6 (design §22.3).
+  - Bootstrap discovery writes each DID's `repo/` row and the counts in its
+    own fenced metadata transaction (`backfill.Store.OnDiscover`). On a
+    disk-backed PostgreSQL that is about 171 DIDs/s and 77% of the fence, so
+    a pop1 bootstrap spends about 65h discovering and block commits get what
+    is left.
+  - Options: group commit concurrent `OnDiscover` writes into one fenced
+    transaction, as `Session.BeginUploads` does (S2.23), with the counts
+    section no longer spanning the commit; or one transaction per listRepos
+    page, if atmos can hand the Store a page.
+  - Check: `just storagebench bootstrap` against a disk-backed server, and the
+    layer 3 lifecycle oracle.
+  - Must land before a pop instance bootstraps in disaggregated mode.
 
 **Exit:** a 24h soak passes the end-state oracle check, and the measurements
 are reported. Only after this: deploy the new pop instance in disaggregated
@@ -1241,13 +1255,39 @@ mode.
 | The storagefake drifts from PostgreSQL | D1, D3 | One primitive contract suite runs against both in CI (`test-storage`) |
 | CI Docker egress breaks `test-storage` | S2.20 | Pin images by digest (already done); allowlist from the `release.yml` precedent; retry workflow if runner-loss becomes common |
 | Stage 2 performance misses the 20-40ms live latency target | S2.8, S2.9 | S2.22 measured it and S2.23 closed the gap: 33.5–35.4ms p99 live beside 30k paced bulk events/s on a disk-backed PG. Bulk beyond about 30k/s paced needs fewer transactions per event. Batch age and token bucket are config |
-| The metadata write path is slower on PG than Pebble at bootstrap rates | S3 | S3.6 measures fenced transactions per second before stage 3 exits |
+| The metadata write path is slower on PG than Pebble at bootstrap rates | S3 | S3.6 measured it (design §22.3): on disk the fence saturates at about 222 transactions/s, and discovery's one transaction per DID takes 77% of them, about 65h for pop1. S5.6 batches discovery before a pop instance bootstraps |
 
 ## Decisions log
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S3.6 (2026-09-26): Stage 3 measurements.**
+  - Two new `cmd/storagebench` commands, results in design §22.3:
+    - `bootstrap` runs a bootstrapping leader's discovery, download, and live
+      writers in one catalog session and reports each transaction kind, fenced
+      transactions per second, and a lower bound on fence occupancy.
+    - `retryscan` loads `repo/` rows shaped like a steady-state store and
+      times the retry pass's full scan, raw and decoded.
+  - Fenced transactions: on the disk server the fence saturates at about 222
+    per second. Discovery writes one fenced transaction per DID, 171/s, which
+    is 77% of them. A pop1 bootstrap would spend about 65h discovering, and
+    block commits get 26/s. On tmpfs the backfill counts section, not the
+    fence, limits discovery, at 1,354 DIDs/s. The fix is S5.6, added to stage
+    5, which must land before a pop instance bootstraps.
+  - Retry scan: about 367 bytes of key and value per row, not 225, so a pop1
+    pass reads about 13.7GB from a table of about 22GB and takes at least
+    about 2.5 minutes, mostly decoding. Every 4h that is accepted; design
+    §14.3 now says so.
+  - Production bug found and fixed (`b436a79`): direct mode's
+    `DrainDurability` let appends run while its forced checkpoint waited
+    behind earlier blocks. Backfill's periodic 30s drain raced downloads,
+    and the completion batcher failed the writer ("forced durable batch …
+    excludes appended completion"). Appends now wait until the checkpoint
+    runs, as local mode's `drainMu` makes them. `TestDirect_DrainHoldsAppends`
+    pins it, and the direct swarm's hook now asserts that every forced
+    checkpoint covers every appended event. No oracle run lasts 30s.
+  - Ignored both storagebench build outputs.
 - **S3.5 (2026-09-26): Layer 3 covers the whole lifecycle.**
   - The full-mode disaggregated oracle (`internal/oracle/disagg_lifecycle_test.go`)
     starts every seed from a catalog `storage init` just created, and runs

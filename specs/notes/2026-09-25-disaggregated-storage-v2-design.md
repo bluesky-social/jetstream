@@ -902,7 +902,9 @@ Direct mode is local mode's block flush, pointed at S3 and PostgreSQL:
    encode it and sample `DurableBatchPrepareValue`.
 2. Upload it (§7.3). Uploads run concurrently (`JETSTREAM_S3_UPLOAD_CONCURRENCY`),
    so bootstrap can sustain about 100–200 blocks/s. Pop2 recovery measured 173
-   blocks/s at about 740 events per block.
+   blocks/s at about 740 events per block. On a disk-backed PostgreSQL the
+   fence leaves bootstrap far less than that, because discovery takes most of
+   the leader's transactions (§22.3).
 3. Commit blocks strictly in order, one transaction each:
 
 ```
@@ -945,6 +947,14 @@ As built (S3.1, `internal/ingest/direct.go`):
   rule fires, as in local mode. ForceRotate and SealActiveAndClose seal the
   active segment. Close leaves it active: the next direct writer, or the hot
   writer after merge, continues it.
+- DrainDurability's checkpoint (the hook's output with force set, committed
+  after the blocks queued ahead of it) holds appends from the freeze until it
+  runs, as local mode's `drainMu` does. Its nextSeq therefore covers every
+  appended event. The backfill completion batcher fails the writer when a
+  forced checkpoint leaves out an appended completion. The S3.6 bootstrap
+  benchmark hit that with the first version, which let appends run on: the
+  periodic 30s backfill drain raced concurrent downloads. No oracle run lasts
+  30s. `TestDirect_DrainHoldsAppends` and the direct swarm pin it.
 - Session start refuses to open `main` over hot batches (a corruption error):
   direct mode only precedes hot mode.
 - Crash seams: `AfterDirectBlockCutBeforeUpload`,
@@ -1606,8 +1616,12 @@ that is about 67 multi-row upserts/s touching about 3,000 rows/s, plus the inlin
 frames (about 0.5MiB/s). Measure p99 commit latency under this load (§22).
 
 The failed-repo retry scan reads all `repo/` rows every 4h
-(`DefaultFailedRepoRetryInterval`). That is about 9GB per pass on pop1-sized
-data. This is accepted for now and must be measured.
+(`DefaultFailedRepoRetryInterval`). S3.6 measured it (§22.3): rows average
+about 367 bytes of key and value, not the 225 the 9GB estimate assumed, so a
+pop1 pass reads about 13.7GB from a table of about 22GB. It takes about 2.5
+minutes, most of it decoding, which averages about 1MB/s over the interval.
+This is accepted. If the scan's cache pressure on a shared server becomes a
+problem, keep the due failed repos under their own key prefix.
 
 ## 15. Startup, failover, restore
 
@@ -1990,12 +2004,12 @@ this document.
 |---|---|---|
 | PostgreSQL p50/p99 commit latency at 3,000 events/s with repo upserts, on RDS and self-hosted | latency budget; fenced-transaction throughput | 2 |
 | Live event latency, end to end, idle and during bulk recovery | 20–40ms target | 2 |
-| Fenced transactions/s during bootstrap (block commits plus metadata writes) | fence serializes all leader writes | 3 |
+| Fenced transactions/s during bootstrap (block commits plus metadata writes) | fence serializes all leader writes | 3 (done, §22.3) |
 | Seal duration | fold backlog during seal | 2 |
 | Fraction of blocks fetched per compaction pass | selective compaction benefit | 4 |
 | Pod start: footer load time and manifest memory at pop1 size | readiness time; memory budget | 2 |
 | Tombstone rebuild time on session start | failover time | 4 |
-| Retry-scan cost against `metadata_kv` | 9GB-per-pass estimate | 3 |
+| Retry-scan cost against `metadata_kv` | 9GB-per-pass estimate | 3 (done, §22.3) |
 | PostgreSQL WAL volume per day | sizing | 2 |
 | `next_seq - readable_log_durable_seq` in local mode (pop1 shows 7) | looks wrong; explain before relying on the readable log | 1 (done, below) |
 
@@ -2211,6 +2225,103 @@ per 4,096 events.
 - pop1's real mix of the two profiles is not known here. 7,000 backfill-shaped
   segments are the floor. Each live-shaped segment adds about 9.75MiB of heap
   plus 9.2MiB of cache churn.
+
+### 22.3 Stage 3 results
+
+Measured 2026-09-26 with `cmd/storagebench` (`just storagebench bootstrap`,
+`retryscan`) on the §22.2 workstation, against the `just up` SeaweedFS and the
+same two PostgreSQL 18.6 servers: **tmpfs** (commits about free) and **disk**
+(a commit is about 4ms, the self-hosted estimate). Read the disk rows as the
+production case.
+
+**Fenced transactions during bootstrap.** `bootstrap` runs a bootstrapping
+leader's three writers in one catalog session, so they share the fence:
+
+- discovery: 8 host crawls, each calling the backfill `Store`'s `Lookup` and
+  `OnDiscover` for every listed DID, as the atmos engine does. `OnDiscover`
+  writes the `repo/` row and the counts in one metadata transaction per DID.
+- downloads: 16 workers append each discovered repo to `main` in direct mode
+  and complete it through the completion batcher, so completions ride in
+  block commits. Downloads are local and unpaced: the run finds the rate the
+  fence allows, not the rate a network would deliver.
+- live: 330 events/s (pop1) into `bootstrap_live` in direct mode, each block
+  commit carrying the relay cursor.
+
+| | disk, 60s | tmpfs, 20s |
+|---|---|---|
+| DIDs discovered | 10,242 (171/s) | 27,078 (1,354/s) |
+| Discovery per DID, p50/p99 | 43.0/58.5ms | 4.0/6.1ms |
+| Repos appended | 10,186 (170/s) | 27,022 (1,351/s) |
+| Bulk events | 6.37M (106k/s) | 16.88M (844k/s) |
+| Block txn/s, total p50 (commit p50) | 25.7, 4.6ms (3.9ms) | 205, 0.8ms |
+| Metadata txn/s, total p50/p90 | 170.6, 4.1/8.0ms | 1,354, 0.2ms |
+| Objects txn/s, total p50 | 25.9, 7.9ms | 206, 0.4ms |
+| Seal txns | 1 at 22.7ms | 4 at about 19.7ms |
+| Fenced txns | 13,343 (222.3/s) | 35,314 (1,765/s) |
+| Fence held by commits | at least 89% | at least 6% |
+| WAL | 23.5MiB (0.4MiB/s) | 62.7MiB (3.1MiB/s) |
+| pop1 discovery (40M repos) at this rate | 65h | 8.2h |
+
+"Fence held" sums commit durations, a lower bound: a transaction's total time
+also includes waiting for the fence row. The disk run committed 1,559 `main`
+blocks and 6 `bootstrap_live` blocks. An earlier run on each server agreed:
+169 DIDs/s and 220 fenced transactions/s on disk, 1,464 DIDs/s on tmpfs.
+
+- **The fence saturates on the disk server at about 222 transactions per
+  second**, one 4ms WAL flush each, as §22.2 found for hot mode.
+- **Discovery takes 77% of them.** It costs one fenced transaction per DID,
+  so it runs at about 171 DIDs/s, and a pop1 bootstrap would spend about 65h
+  discovering. Downloads can only complete what discovery has written, and
+  the block commits get the remaining 26 transactions/s: 106k bulk events/s
+  in full 4,096-event blocks. That is far below §10.6's 100–200 blocks/s.
+- On tmpfs the limit is the backfill `Store`'s serialized counts section, at
+  about 0.74ms per DID, not the fence.
+- Every other bootstrap write is cheap. Completions ride in block commits,
+  the live writer commits a block about every 10s at pop1's rate, and object
+  registrations run at about one per block.
+- **Follow-up before a pop instance bootstraps** (plan S5.6): make discovery
+  cost less than one fenced transaction per DID, for example by group
+  committing concurrent `OnDiscover` writes as `BeginUploads` does (S2.23), or
+  by writing one transaction per listRepos page.
+
+**Bug found and fixed first (`b436a79`).** The first disk run crashed with
+"forced durable batch … excludes appended completion". Direct mode's
+`DrainDurability` froze the open block and queued a forced checkpoint, but let
+appends continue while the checkpoint waited behind earlier blocks. Backfill
+runs a periodic 30s drain beside its downloads, so a completion could be
+appended between the freeze and the checkpoint, and the completion batcher
+refused the forced batch that left it out. Appends now wait until the
+checkpoint runs (§10.6). No oracle run lasts 30s, which is why only the
+benchmark hit it.
+
+**Retry-scan cost.** `retryscan` loads `repo/` rows shaped as a steady-state
+store holds them (complete rows with rev, timestamps and PDS; 2% failed rows
+with a retry schedule and an error) through the leader's fenced metadata
+store. Then it times two full scans through the metastore, as
+`retryRunner.scanDue` does: a raw iteration, and the same iteration decoding
+every row (`backfill.CountStatuses`). The scans run right after the load, so
+the rows are warm in PostgreSQL's and the kernel's caches: treat the times as
+a floor, and the bytes as the measure.
+
+| | tmpfs, 2M rows | disk, 2M rows |
+|---|---|---|
+| Load | 18.0s (111k rows/s) | 20.8s (96k rows/s) |
+| Key and value bytes | 699MiB (367/row) | same |
+| Database growth | 1,139MiB (597/row) | same |
+| First raw scan | 8.2s | 14.1s |
+| Later raw scans | 3.85s (520k rows/s) | 3.6s (553k rows/s) |
+| Decode scans | 7.3s (274k rows/s) | 7.2–7.3s (about 275k rows/s) |
+
+At pop1's 40M rows:
+
+- A pass reads about 13.7GB of keys and values, from a table of about 22GB
+  including index and page overhead. §14.3's 9GB assumed 225 bytes per row.
+- It takes at least about 2.5 minutes, set by decoding (about 1.75µs of CPU
+  per row). The raw read alone takes about 1m15s warm.
+- The per-row raw cost at 2M rows was 2.8 times that at 200k, because 1.1GB
+  exceeds PostgreSQL's default 128MB `shared_buffers`. A cold pop1 pass reads
+  from disk.
+- Every 4h, that averages about 1MB/s: accepted (§14.3).
 
 ## 23. Metrics
 

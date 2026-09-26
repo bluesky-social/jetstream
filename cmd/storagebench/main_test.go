@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/json"
+	"math/rand/v2"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/metastore/memstore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -39,4 +43,27 @@ func TestGeneratorLiveAndBulkAreDistinguishable(t *testing.T) {
 		require.NoError(t, segment.ValidateEvent(ev))
 		require.False(t, isLive(&ev), ev.DID)
 	}
+}
+
+// The retry-scan timing is only scanDue's cost if every synthetic row decodes
+// as the status it was built as.
+func TestRepoRowsDecode(t *testing.T) {
+	t.Parallel()
+	meta := memstore.New()
+	rng := rand.New(rand.NewPCG(1, 2))
+	now := time.Now().UTC()
+	var failed uint64
+	for n := range 1000 {
+		rs := repoRow(rng, now, 0.1)
+		if rs.Backfill.Status == backfill.StatusFailed {
+			failed++
+		}
+		v, err := json.Marshal(rs)
+		require.NoError(t, err)
+		require.NoError(t, meta.Set(t.Context(), []byte("repo/"+didFor(uint64(n))), v))
+	}
+	c, err := backfill.CountStatuses(meta)
+	require.NoError(t, err)
+	require.Equal(t, backfill.Counts{Total: 1000, Complete: 1000 - failed, Failed: failed}, c)
+	require.NotZero(t, failed)
 }
