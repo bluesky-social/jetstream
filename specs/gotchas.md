@@ -57,6 +57,10 @@ Under the client's `CursorTime` mode, a resume on a different host uses `witness
 
 `catalog/local` treats the highest-index unsealed file as the namespace's active segment and skips any unsealed file below it. The writer cannot produce such a file: `rotateLocked` finishes the seal before it creates the next file, and `ingest.Open` resumes the highest index. A stranded older unsealed file therefore means external damage. Cold replay then fails loud on the unregistered hole rather than skipping it. The oracle's catalog observer cross-checks against the path walk, so a quiescent directory with such a file fails the observation (`TestObserveSegments_CrossCheckCatchesStrandedActive`). Area: `internal/catalog/local`, `internal/oracle/catalog_observer.go`.
 
+### Compaction reads every live-history block, every pass
+
+Compaction selects blocks by DID (segment and per-block DID blooms). A backfill block holds a few repos, so it narrows well. A live block holds about 3,700 distinct DIDs, so at any pass's tombstone volume nearly every live block has a tombstoned DID and a matching collection, and the rewrite reads it even when it drops nothing. A pass therefore reads the whole live-shaped archive, and that cost grows with the archive's age. Local mode does the same from disk. In disaggregated mode it is object GETs: about 650GiB per pass after 30 days of 3,000 events/s. Measured in S4.6 (design §22.4). A record-level filter or a tiered schedule is open as plan S5.7. Don't read a high `jetstream_compaction_blocks_fetched_total` ratio as a bug. Area: `segment/sparse.go` (`candidates`), `internal/ingest/orchestrator/compact_disagg.go`.
+
 ## Lessons
 
 ### A restart-tier recovery child hangs if the relay is quiet — generate traffic between children

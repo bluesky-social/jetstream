@@ -1,6 +1,6 @@
 # Disaggregated storage v2: implementation plan
 
-**Status: Stage 0 done (2026-09-25); Stage 1 done (2026-09-25); Stage 2 done (2026-09-25); Stage 3 done (2026-09-26).** This is the work tracker for
+**Status: Stage 0 done (2026-09-25); Stage 1 done (2026-09-25); Stage 2 done (2026-09-25); Stage 3 done (2026-09-26); Stage 4 done (2026-09-26).** This is the work tracker for
 `specs/notes/2026-09-25-disaggregated-storage-v2-design.md` (the "design"). It
 breaks the design's delivery stages (§26) into PR-sized tasks with file
 references, dependencies, checks, mutants, and exit criteria. The design says
@@ -35,7 +35,7 @@ Prerequisite already landed: the ephemeral dev environment (`just up` /
 | 1 | Storage interfaces; local mode moved onto them with no behavior change | done |
 | 2 | Steady state in disaggregated mode on fakes and real storage | done |
 | 3 | Bootstrap, merge, `storage init` | done |
-| 4 | Sparse compaction and GC | not started |
+| 4 | Sparse compaction and GC | done |
 | 5 | `storage new-identity`, memory budgets, dashboards, 24h soak | not started |
 
 ```
@@ -1286,6 +1286,39 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **Stage 4 exit (2026-09-26).**
+  - Checks at `5c054d2`, all passing:
+    - `just`, and `just test-storage` against PG, SeaweedFS, and MinIO.
+    - `just oracle-disagg`, `just oracle-disagg-sweep` (20 seeds), and the
+      sweep under the race detector (10 seeds).
+    - `just test-long ./internal/oracle` and `just oracle-sweep`.
+    - `just fuzz 30s ./segment` (at `4effd3f`; `segment/` has not changed
+      since), including `FuzzSparseRewrite`.
+    - `just mutation-gate` on a clean worktree: all 68 mutants match the baseline,
+      m073–m077 KILLED in the `disagg` tier.
+  - No `just bench ./segment`: stage 4 added `segment/sparse.go` and did not
+    change the writer or sealer.
+  - The first run of the checks found two races outside stage 4's code,
+    both fixed:
+    - `just oracle-sweep` failed a restart child: local mode's background
+      catalog load listed `backfill/live_segments` before the session's
+      writer created it, then statted it and failed startup (`246c5b9`,
+      `specs/oracle/2026-09-26-catalog-load-races-directory-creation.md`).
+    - `just test-storage` failed `TestReaderRole`'s cleanup: the forced
+      drop of the scratch database raced an exiting reader-role backend
+      that the owner role may not terminate (`5c054d2`, test harness only).
+  - Exit criteria: the equivalence property test passes
+    (`TestSparseRewriteMatchesRewrite`, `FuzzSparseRewrite`); the
+    compaction and GC mutants m073–m077 are KILLED, and m024, m028 and m045
+    were refreshed for the rewriter split (S4.5); stage 4 measurements are in
+    design §22.4 (S4.6).
+  - Carried forward: S5.7, compaction reads of live history, to decide
+    before a disaggregated pop instance's archive is weeks old. S5.6 still
+    must land before a pop instance bootstraps.
+  - `specs/gotchas.md` records the live-history read cost as an accepted
+    limitation.
+  - The branch is not yet pushed, so CI's `test-storage` job has not run on
+    these commits.
 - **S4.6 (2026-09-26): Stage 4 measurements.**
   - New `cmd/storagebench compaction`, results in design §22.4. It seals
     backfill-profile and live-profile history below the watermark and a
