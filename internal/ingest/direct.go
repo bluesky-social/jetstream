@@ -119,15 +119,16 @@ type directWriter struct {
 	wake     chan struct{} // committer: queue grew
 	done     chan struct{} // committer exited
 
-	mu      sync.Mutex
-	nextSeq uint64
-	block   *directBlock
-	queue   []directItem
-	pending int // blocks frozen and not yet committed
-	waiters int
-	changed chan struct{} // closed and replaced when pending drops
-	closed  bool
-	err     error // sticky failure
+	mu       sync.Mutex
+	nextSeq  uint64
+	block    *directBlock
+	queue    []directItem
+	pending  int // blocks frozen and not yet committed
+	checkpts int // metadata-only commits queued and not yet run
+	waiters  int
+	changed  chan struct{} // closed and replaced when pending or checkpts drops
+	closed   bool
+	err      error // sticky failure
 }
 
 type directBlock struct {
@@ -238,13 +239,14 @@ func (d *directWriter) appendBatch(ctx context.Context, events []segment.Event) 
 	return d.appendN(ctx, len(events), func(i int) *segment.Event { return &events[i] })
 }
 
-// appendN waits for room below MaxPendingBlocks, then appends all n events
-// under one hold of mu, so a batch's seqs are contiguous as in local mode.
+// appendN waits for room below MaxPendingBlocks and for queued checkpoints
+// (see drainDurability), then appends all n events under one hold of mu, so a
+// batch's seqs are contiguous as in local mode.
 func (d *directWriter) appendN(ctx context.Context, n int, at func(int) *segment.Event) (err error) {
 	d.mu.Lock()
 	defer d.endIfFailed(&err)
 	defer d.mu.Unlock()
-	for d.pending >= d.direct.MaxPendingBlocks {
+	for d.pending >= d.direct.MaxPendingBlocks || d.checkpts > 0 {
 		if err := d.usableLocked(); err != nil {
 			d.cfg.Metrics.incAppendErrors()
 			return err
@@ -399,6 +401,12 @@ func (d *directWriter) commitLoop() {
 			if err := d.direct.Sealer.Seal(d.ctx); err != nil {
 				d.fail(err)
 			}
+		}
+		if it.meta != nil {
+			d.mu.Lock()
+			d.checkpts--
+			d.signalLocked()
+			d.mu.Unlock()
 		}
 	}
 }
@@ -629,6 +637,13 @@ func (d *directWriter) flush(ctx context.Context) error {
 	return d.barrier(ctx, d.freezeLocked)
 }
 
+// drainDurability commits the open block, then a checkpoint: the hook's
+// output with force set and nextSeq at the freeze. Appends wait from the
+// freeze until the checkpoint runs, as they wait on local mode's drainMu, so
+// the checkpoint's nextSeq covers every appended event. The backfill
+// completion batcher relies on that: an appended completion a forced
+// checkpoint leaves out fails the writer. The wait lasts as long as the
+// blocks queued ahead of the checkpoint take to commit.
 func (d *directWriter) drainDurability(ctx context.Context) error {
 	return d.barrier(ctx, func() {
 		d.freezeLocked()
@@ -644,6 +659,7 @@ func (d *directWriter) enqueueMetaLocked() {
 	if d.cfg.DurableBatchPrepareValue != nil {
 		m.prepareValue = d.cfg.DurableBatchPrepareValue()
 	}
+	d.checkpts++
 	d.enqueueLocked(directItem{meta: m})
 }
 

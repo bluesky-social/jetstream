@@ -11,7 +11,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
@@ -155,6 +157,8 @@ func (h *directHook) hook(_ context.Context, b metastore.Batch, nextSeq uint64, 
 	if force {
 		h.forces++
 		require.GreaterOrEqual(h.t, nextSeq, h.last)
+		// assert, not require: this runs on the committer goroutine.
+		assert.Less(h.t, h.lastApp.Load(), nextSeq, "a forced checkpoint covers every appended event")
 	} else {
 		h.blocks++
 		require.Greater(h.t, nextSeq, h.last)
@@ -307,6 +311,59 @@ func runDirectSwarm(t *testing.T, rng *rand.Rand) {
 	if ns == catalog.BootstrapLive {
 		require.Equal(t, uint64(1), e.seqKey(catalog.Main), "main is untouched")
 	}
+}
+
+// DrainDurability's checkpoint covers every event appended before it commits,
+// as local mode's does: appends wait while the checkpoint is queued behind
+// earlier blocks. The backfill completion batcher relies on this, and fails
+// the writer when a forced checkpoint leaves out an appended completion.
+func TestDirect_DrainHoldsAppends(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	rng := rand.New(rand.NewPCG(7, 7))
+	var lastApp atomic.Uint64
+	blockHeld := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	var held atomic.Bool
+	var forced atomic.Bool
+	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{
+		OnAppend: func(ev *segment.Event) error { lastApp.Store(ev.Seq); return nil },
+		OnDurableBatch: func(_ context.Context, _ metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+			if force {
+				forced.Store(true)
+				assert.Less(t, lastApp.Load(), nextSeq, "the checkpoint covers every appended event")
+				return nil, nil, nil
+			}
+			if held.CompareAndSwap(false, true) {
+				close(blockHeld)
+				<-release
+			}
+			return nil, nil, nil
+		},
+	}, ingest.DirectConfig{})
+
+	evs := testEvents(rng, 2)
+	require.NoError(t, w.Append(t.Context(), &evs[0]))
+	drained := make(chan error, 1)
+	go func() { drained <- w.DrainDurability(t.Context()) }()
+	<-blockHeld // the drain froze the open block; its checkpoint waits behind it
+	appended := make(chan error, 1)
+	go func() { appended <- w.Append(t.Context(), &evs[1]) }()
+	select {
+	case err := <-appended:
+		unblock()
+		t.Fatalf("append finished while a checkpoint was queued (err=%v)", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	unblock()
+	require.NoError(t, <-drained)
+	require.NoError(t, <-appended)
+	require.True(t, forced.Load())
+	require.NoError(t, w.Close())
+	require.Len(t, e.directState(catalog.Main).events(), 2)
 }
 
 // A failed block commit ends the writer and the session. The next session
